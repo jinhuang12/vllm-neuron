@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Acceptance test for ``inc-glm53f-031`` -- WP7: MoE-288 expert plumbing and
+"""Acceptance test for WP7: MoE-288 expert plumbing and
 the TP freeze.
 
 The declared acceptance (increment plan revision 29, L898), verbatim:
@@ -17,14 +17,14 @@ refuses that same split, because covering every expert and giving every rank the
 same count are two different properties and only the first one holds at 64.
 
 THIS FILE IS CO-AUTHORED, AND THE PARTITION IS A RULE, NOT AN ETIQUETTE.
-``inc-glm53f-031`` owns every item ``-k sharding`` collects; ``inc-glm53f-033``
+This increment owns every item ``-k sharding`` collects; the shared half
 (unlanded) owns the items ``-k shared`` will collect when it extends this file
 (plan L912/L915). The two acceptance commands therefore cannot collect each
 other's items, so neither counted predicate can be satisfied or broken by the
 other increment's tests. **Every item below carries ``sharding`` in its name and
 none carries the other selector's token**, which is what makes the partition
 mechanical rather than a promise. The reciprocal declaration lives on
-``-033``'s plan block; ``-031``'s block does not carry it, and that narrow plan
+the shared half's plan block; this increment's block does not carry it, and that narrow plan
 defect is on the lead's revision list rather than this seat's to repair.
 
 TP=64 IS CITED, NEVER RE-DERIVED. The registration is
@@ -115,7 +115,7 @@ def _impl():
     ``test_factory.py`` (``e`` < ``f``), so a module-level import here would
     populate ``sys.modules`` for every later item in the package. That is
     legitimate behaviour and ``test_factory.py``'s C03 no longer measures the
-    session (``inc-glm53f-031`` repaired it to a subprocess), but keeping the
+    session (this increment repaired it to a subprocess), but keeping the
     footprint minimal costs four lines and keeps this package's convention
     uniform.
     """
@@ -250,7 +250,7 @@ def test_sharding_at_288_over_64_raises_a_named_error_rather_than_padding():
     )
 
     message = str(gate.value)
-    # RE-PINNED BY ``inc-glm53f-087``. The five NUMERIC tokens are byte-identical:
+    # RE-PINNED HERE. The five NUMERIC tokens are byte-identical:
     # they are functions of (288, degree) and this call still passes 64 outright.
     # ``"G4"`` LEAVES the required set and *"expert-parallel degree"* joins it,
     # because the raise is no longer evidence of a gap the freeze creates.
@@ -268,7 +268,7 @@ def test_sharding_at_288_over_64_raises_a_named_error_rather_than_padding():
     for token in ("G4", "tensor-parallel degree"):
         assert token not in message, f"{token!r} must not appear in the raise"
 
-    # RE-PINNED BY ``inc-glm53f-087``. The arch member's default degree is no
+    # RE-PINNED HERE. The arch member's default degree is no
     # longer the freeze: it resolves the expert-parallel degree, which is 1 when
     # expert parallelism was never initialised, so the default now BUILDS a
     # uniform plan. Its 1/1 refusal MOVES to an explicit ragged degree.
@@ -312,7 +312,7 @@ def test_sharding_at_288_over_64_raises_a_named_error_rather_than_padding():
         s02_error_type=type(gate.value).__name__,
         s02_error=message,
         s02_arch_member_raised=f"{arch_raised}/1",
-        # RE-PINNED BY ``inc-glm53f-087``: the parameter is renamed and its
+        # RE-PINNED HERE: the parameter is renamed and its
         # default is ``None``, resolved to the live expert-parallel degree.
         s02_arch_member_default_degree=inspect.signature(
             fmod.Glm5NextForConditionalGeneration.expert_sharding_plan
@@ -436,7 +436,7 @@ def test_sharding_plan_is_consumed_by_the_routed_expert_bank_in_model_fp8():
     assert default_bank.tp_degree == impl._resolve_world_size() == 1
     assert default_bank.num_local_experts == TOTAL_ROUTED_EXPERTS
 
-    # RE-PINNED BY ``inc-glm53f-087``. These two constructions used to be the
+    # RE-PINNED HERE. These two constructions used to be the
     # freeze's refusal reaching the model level. The tensor-parallel degree is not
     # the expert divisor, so at the freeze they now BUILD: the expert-parallel
     # degree resolves to 1 and all 288 experts are local on every rank.
@@ -478,7 +478,7 @@ def test_sharding_plan_is_consumed_by_the_routed_expert_bank_in_model_fp8():
         s04_moeblock_num_local_experts=block.experts.num_local_experts,
         s04_default_tp_degree=default_bank.tp_degree,
         s04_default_num_local_experts=default_bank.num_local_experts,
-        # RE-PINNED BY ``inc-glm53f-087``: the bank no longer refuses at the
+        # RE-PINNED HERE: the bank no longer refuses at the
         # tensor-parallel freeze, because that degree was never the expert
         # divisor. The refusal moved to an explicit ragged expert-parallel degree.
         s04_raises_at_the_freeze=False,
@@ -516,7 +516,7 @@ def test_sharding_config_validation_rejects_out_of_range_expert_counts():
       ``factory.py::Glm5NextForConditionalGeneration.expert_sharding_plan``.
 
     WHY THE SPLIT IS REAL AND NOT A CONVENIENCE. Asking the router question at
-    construction time rejected ``inc-glm53f-011``'s landed ``mini_config``
+    construction time rejected the landed ``mini_config``
     fixture (``test_weight_loaders.py:335-336``): a 4-expert bank inheriting the
     checkpoint's top-8 default, i.e. a structural key-mapping fixture that never
     routes a token. That is a latent incoherence in a landed fixture, routed to
@@ -580,7 +580,7 @@ def test_sharding_config_validation_rejects_out_of_range_expert_counts():
     assert checkpoint.n_routed_experts == TOTAL_ROUTED_EXPERTS
     assert checkpoint.num_experts_per_tok == EXPERTS_PER_TOK
 
-    # BOUNDARY REGRESSION GUARD: ``inc-glm53f-011``'s landed fixture shape must
+    # BOUNDARY REGRESSION GUARD: the landed fixture shape must
     # still CONSTRUCT. If a later hand moves the router question back into
     # ``__post_init__``, this arm goes red before that increment's acceptance
     # does.
@@ -628,8 +628,8 @@ def test_sharding_config_validation_rejects_out_of_range_expert_counts():
 def test_sharding_members_are_a_pure_addition_to_the_co_authored_factory():
     """``factory.py`` is co-authored; this increment adds BESIDE, never edits.
 
-    ``inc-glm53f-009`` owns the class plus ``from_configs`` /
-    ``_select_implementation``; ``inc-glm53f-074`` owns the trailing
+    One increment owns the class plus ``from_configs`` /
+    ``_select_implementation``; another owns the trailing
     ``**kwargs`` on ``__init__`` plus ``embed_input_ids`` / ``compute_logits``.
     Modifying any of their signatures would be ``evidence_contradicts_design``,
     so this item measures that none moved -- the expected strings are the ones
@@ -645,7 +645,7 @@ def test_sharding_members_are_a_pure_addition_to_the_co_authored_factory():
         observed = str(inspect.signature(getattr(cls, member)))
         assert observed == expected, f"{member} signature moved:\n{observed}"
 
-    # ``-074``'s two boundary members still raise, unchanged in contract.
+    # The registration's two boundary members still raise, unchanged in contract.
     for member in ("embed_input_ids", "compute_logits"):
         assert callable(getattr(cls, member))
     with pytest.raises(NotImplementedError):
@@ -703,7 +703,7 @@ def test_sharding_members_are_a_pure_addition_to_the_co_authored_factory():
 
 
 def test_sharding_adds_no_vendor_quantisation_enum_reference():
-    """Plan section 11 constraint B.6, kept at the 0 ``inc-glm53f-023`` landed.
+    """Plan section 11 constraint B.6, kept at the 0 an earlier increment landed.
 
     D1.4 certifying component: an ``ast`` walk over every ``.py`` file in
     ``vllm_neuron/model/glm5_next/``, counting ``Name`` / ``Attribute`` /
@@ -763,7 +763,7 @@ def test_sharding_tp_degree_freeze_is_the_registered_value_and_not_configurable(
     """
     assert fmod.TP_DEGREE_FREEZE == DECLARED_TP_DEGREE == 64
 
-    # RE-PINNED BY ``inc-glm53f-087``: the member's degree parameter is renamed
+    # RE-PINNED HERE: the member's degree parameter is renamed
     # and re-defaulted. Its default is no longer the freeze -- it is ``None``,
     # meaning "resolve the live expert-parallel degree". The freeze itself is
     # unmoved and is still asserted above as a non-configurable module literal.
@@ -815,7 +815,7 @@ def test_sharding_tp_degree_freeze_is_the_registered_value_and_not_configurable(
     )
     assert "group_size == 64" in pg_line
 
-    # D1.5 CONTROL -- REPLACED BY ``inc-glm53f-087``. The landed control
+    # D1.5 CONTROL -- REPLACED HERE. The landed control
     # discriminated by the DEFAULT raising, and the default no longer raises, so
     # that shape would have become vacuous. This one discriminates on three arms
     # through the same member and reads 1 / 0 / 0: an explicit ragged degree
@@ -917,10 +917,10 @@ def test_sharding_report_the_measured_readings(capsys):
 
 
 # ===========================================================================
-# ``inc-glm53f-033`` -- WP7: the shared expert. THE OTHER HALF OF THIS
+# WP7: the shared expert. THE OTHER HALF OF THIS
 # CO-AUTHORED FILE.
 #
-# THE PARTITION IS A RULE, NOT AN ETIQUETTE (plan L940). ``-031`` owns every
+# THE PARTITION IS A RULE, NOT AN ETIQUETTE (plan L940). The sharding half owns every
 # item ``-k sharding`` collects and this increment owns every item ``-k shared``
 # collects. Every item below carries ``shared`` in its name and NONE carries the
 # token ``sharding``, so the two acceptance commands cannot collect each other's
@@ -928,11 +928,11 @@ def test_sharding_report_the_measured_readings(capsys):
 # increment's tests. Both counts are MEASURED by dedicated ``--collect-only -q``
 # runs and recorded in ``increments/evidence-033.md``, never declared here.
 #
-# EVERYTHING BELOW IS ADDED, NOTHING ABOVE IS TOUCHED. ``-031``'s items are
+# EVERYTHING BELOW IS ADDED, NOTHING ABOVE IS TOUCHED. The sharding half's items are
 # LANDED and its recorded acceptance asserts them, so a modification of any line
 # above this banner is ``evidence_contradicts_design`` rather than a repair
 # (plan L940). This section therefore appends, keeps its own readings dict rather
-# than writing ``-031``'s ``_READINGS``, and takes every import inside a function
+# than writing the sharding half's ``_READINGS``, and takes every import inside a function
 # body -- the file's own ``_impl()`` idiom, kept so no line of the landed import
 # block moves either.
 #
@@ -943,7 +943,7 @@ def test_sharding_report_the_measured_readings(capsys):
 #     case reproduces the routed-only output at **atol 1e-5**, proving the shared
 #     contribution is added exactly once rather than twice."
 #
-# THE DECLARED ROUTE PREDICATE (plan L934-935, revision 33): ``-026``'s dispatch
+# THE DECLARED ROUTE PREDICATE (plan L934-935, revision 33): the dense half's dispatch
 # counter reads EXACTLY 3 -- one per projection site -- per shared-expert call,
 # and its torch-fallback counter reads 0. The count was re-derived at revision 33
 # from this seat's attempt-1 measurement (``increments/evidence-033.md``); the
@@ -954,7 +954,7 @@ def test_sharding_report_the_measured_readings(capsys):
 
 # --------------------------------------------------------------------------- #
 # Declared values. The tolerances and the count are the plan's; the tiny-config  #
-# extents are chosen to ADMIT ``-026``'s kernel, which is a fixture decision.    #
+# extents are chosen to ADMIT the dense half's kernel, a fixture decision.       #
 # --------------------------------------------------------------------------- #
 
 #: The plan's tolerance pair for conjunct 1, and its atol for conjunct 2.
@@ -964,7 +964,7 @@ SHARED_ATOL = 1e-5
 #: The plan's route-predicate count (L934-935): one seam entry per projection.
 SHARED_DECLARED_SEAM_ENTRIES = 3
 
-#: Tiny config. Every extent is forced by ``-026``'s own admission gates
+#: Tiny config. Every extent is forced by the dense half's own admission gates
 #: (``blockwise_fp8_mm.py::_require_blocked``), read off that source rather than
 #: guessed, and chosen to ADMIT because a geometry the kernel REFUSES raises --
 #: it does not fall back -- and a refused shape would leave the counter at 0.
@@ -973,7 +973,7 @@ SHARED_DECLARED_SEAM_ENTRIES = 3
 #:   I % SCALE_BLOCK_SIZE == 0  (``:272`` -- N likewise)
 #: THE GATE READS THE DENSE CONSUMER'S CONSTANT, NOT THE ROUTED BANK'S. Those three
 #: lines used to name ``BLOCK_QUANT_SIZE``, which is the MoE retile's 256. The kernel
-#: has always read its own ``SCALE_BLOCK_SIZE``, and ``inc-glm53f-112`` makes that
+#: has always read its own ``SCALE_BLOCK_SIZE``, and the module now makes that
 #: 128 (``blockwise_fp8_mm.py:109``), so the name and all three line cites are
 #: corrected here. No extent moves: 512 was admissible at 256 and is admissible at
 #: 128, and step 13 of the counted run read 24 of 24 items green either way.
@@ -1012,9 +1012,9 @@ SHARED_DOWN_EXPONENTS = ((0, 2), (-1, 1))
 # their landed values, and every new arm is an addition.                         #
 # --------------------------------------------------------------------------- #
 
-#: `-078` lands `fixtures/hf-config.json` as a byte-identical copy of the
+#: One block lands `fixtures/hf-config.json` as a byte-identical copy of the
 #: published GLM-5.3-Flash config and pins it by this digest in its own conjunct;
-#: `-080`'s landed `test_config.py` reads the same file the same way. This
+#: the landed `test_config.py` reads the same file the same way. This
 #: section READS it and never writes it. Reading the bound from here rather than
 #: typing `10.0` is what makes the clamp the CHECKPOINT'S bound: the finding asks
 #: for the value to be sourced from the checkpoint, and a literal in this file
@@ -1026,7 +1026,7 @@ SHARED_DOWN_EXPONENTS = ((0, 2), (-1, 1))
 #: config read apart from a default. ``7.5`` is a value the checkpoint does NOT
 #: carry, which is what makes the read path falsifiable. It is not a comparator
 #: and nothing is measured against it: it is an input pushed through the adapter.
-#: The same device ``inc-glm53f-080`` uses for its epsilon
+#: The same device used for the epsilon
 #: (``test_config.py``'s ``C080_NON_DEFAULT_RMS_NORM_EPS = 3e-05``).
 R01_NON_DEFAULT_BOUND = 7.5
 
@@ -1045,7 +1045,7 @@ SHARED_VENDOR_CONFIG_SHA256 = (
 #: `0.000000e+00` between kernel and oracle. Both readings and the full scan over
 #: divisors 1 to 32 are in `increments/probe-R7-straddle-and-sensitivity.out`.
 #: A POWER OF TWO, so every bf16 hidden value stays exactly representable and
-#: `-026`'s F1 losslessness precondition is untouched -- the weights, the block
+#: the dense half's F1 losslessness precondition is untouched -- the weights, the block
 #: scales and every extent stay the landed fixture's own.
 SHARED_STRADDLE_DIVISOR = 8
 
@@ -1076,7 +1076,7 @@ _SHARED_READINGS: dict[str, object] = {}
 def _shared_record(**readings: object) -> None:
     """Collect a reading for the reporting item.
 
-    Writes this increment's OWN dict. ``-031``'s ``_READINGS`` and its
+    Writes this increment's OWN dict. The sharding half's ``_READINGS`` and its
     ``len(_READINGS) >= 40`` floor are landed and are not touched, so neither
     increment's reporting item can be moved by the other's readings.
     """
@@ -1092,7 +1092,7 @@ def _shared_record(**readings: object) -> None:
 class _SharedSimulatorCounter:
     """Counts real ``nki.simulator.simulate_kernel`` calls for the duration.
 
-    Structure carried verbatim from ``-026``'s landed
+    Structure carried verbatim from the dense half's landed
     ``test_blockwise_fp8_mm.py::_SimulatorCounter``; the import is function-local
     for this file's reasons rather than that file's.
     """
@@ -1107,7 +1107,7 @@ class _SharedSimulatorCounter:
         # ``nki.simulator`` is a SUBMODULE, so ``import nki`` alone leaves
         # ``nki.simulator`` unbound and attribute access raises
         # ``AttributeError: module 'nki' has no attribute 'simulator'``. This is
-        # ``-026``'s landed pair (``test_blockwise_fp8_mm.py`` imports ``nki``
+        # the dense half's landed pair (``test_blockwise_fp8_mm.py`` imports ``nki``
         # and ``nki.simulator`` on consecutive lines) and it is repeated here for
         # the same reason rather than trusted to import order elsewhere.
         import nki
@@ -1129,11 +1129,11 @@ class _SharedSimulatorCounter:
 
 
 def _shared_seam():
-    """``-026``'s module, re-acquired through ``importlib``.
+    """The dense half's module, re-acquired through ``importlib``.
 
     THIS IS THE R-2 FORM AND THE MECHANISM IS THE POINT. The counted seam is
-    ``-026``'s, not this increment's, so this module resets and reads counters it
-    does not own, across a module boundary, exactly as ``-026``'s own
+    the dense half's, not this increment's, so this module resets and reads counters it
+    does not own, across a module boundary, exactly as the dense half's own
     ``test_dispatch_counters_are_module_level_state_reachable_from_elsewhere``
     proved was possible. Re-acquiring by ``importlib`` rather than binding the
     functions once makes the module-level state visible as shared state.
@@ -1166,14 +1166,14 @@ def _assert_shared_route(
     print(reading)
     if nki_dispatch != expected_entries:
         raise SharedRouteInstrumentError(
-            f"{label}: -026's seam dispatch counter read {nki_dispatch}, declared "
+            f"{label}: the seam dispatch counter read {nki_dispatch}, declared "
             f"{expected_entries} (one per projection site: gate, up, down). A "
             f"bypassed projection reads fewer and is exactly what this counts. "
             f"{reading}"
         )
     if torch_fallback != 0:
         raise SharedRouteInstrumentError(
-            f"{label}: -026's torch-fallback counter read {torch_fallback}, "
+            f"{label}: the torch-fallback counter read {torch_fallback}, "
             f"declared exactly 0 -- a fallback pass would compare torch against "
             f"torch and is this campaign's F1 false green. {reading}"
         )
@@ -1196,7 +1196,7 @@ def _assert_shared_route(
 def _shared_pow2_scales(exponents, rows: int, cols: int):
     """The PUBLIC ``[rows//256, cols//256]`` block-scale grid, every entry pow2.
 
-    F1, AND WHY IT IS HERE RATHER THAN INHERITED. ``-026``'s kernel accumulates
+    F1, AND WHY IT IS HERE RATHER THAN INHERITED. The dense half's kernel accumulates
     the two ``128``-wide contraction tiles of one ``256`` block in PSUM and
     applies the block scale AFTER that accumulation
     (``blockwise_fp8_mm.py:203-220``, and its module docstring states the order
@@ -1205,7 +1205,7 @@ def _shared_pow2_scales(exponents, rows: int, cols: int):
     one. So a non-pow2 fixture would make ``rtol=3e-2`` certify remapping error
     on top of this increment's plumbing, and the tolerance would no longer mean
     what it says. The tolerance is UNCHANGED; only the world it is measured in is
-    narrowed -- exactly what the plan's own F1 clause does for ``-025``/``-026``.
+    narrowed -- exactly what the plan's own F1 clause does for both halves.
     """
     import torch
 
@@ -1222,7 +1222,7 @@ def _shared_pow2_scales(exponents, rows: int, cols: int):
 def _shared_fp8_grid(seed: int, *shape: int, signed: bool = False):
     """Values already on the fp8-e4m3 grid, so every cast in the fixture is exact.
 
-    ``signed=False`` IS A CONDITIONING CHOICE CARRIED FROM ``-025`` ATTEMPT 1,
+    ``signed=False`` IS A CONDITIONING CHOICE CARRIED FROM ATTEMPT 1,
     which read ``max_rel_error=8.32e+01`` against this same ``rtol=3e-2`` from
     catastrophic cancellation in a SIGNED fixture over a 512-wide contraction --
     not from a kernel defect. With signed values the reference lands arbitrarily
@@ -1281,7 +1281,7 @@ def _shared_block_quant_config():
 
     The pinned fixture is digest-verified before it is parsed, so the
     quantisation policy this call site routes on is the campaign's registered one
-    and not a value this test invented. Idiom and digest carried from ``-027``'s
+    and not a value this test invented. Idiom and digest carried from the MoE half's
     landed ``test_moe_path.py:363-390``.
     """
     import hashlib
@@ -1309,9 +1309,9 @@ def _shared_block_quant_config():
 def _shared_build_block():
     """A ``Glm5NextMoEBlock`` whose shared expert exists, at the tiny config.
 
-    ``world_size=1`` keeps ``-031``'s uniformity gate satisfied at this tiny
+    ``world_size=1`` keeps the sharding half's uniformity gate satisfied at this tiny
     expert count; the routed bank is built but never driven here, because the
-    routed path is ``-027``'s landed and separately-accepted surface.
+    routed path is the MoE half's landed and separately-accepted surface.
 
     THE SWIGLU BOUND IS PASSED EXPLICITLY, since ``B22-M1`` repair round 2. The
     shared expert now reads ``text_config.swiglu_limit`` at construction, and the
@@ -1392,7 +1392,7 @@ def _shared_swiglu_formula(case: dict, gate, up, *, clamp: bool, limit: float):
 
 
 def _shared_oracle_projections(case: dict):
-    """``gate`` and ``up`` as ``-026``'s torch oracle computes them, pre-clamp."""
+    """``gate`` and ``up`` as the dense half's torch oracle computes them, pre-clamp."""
     from vllm_neuron.functional.blockwise_fp8_mm import blockwise_fp8_mm_torch_oracle
 
     hidden = case["hidden_states"]
@@ -1417,7 +1417,7 @@ def _shared_expert_torch_reference(case: dict):
     """The independent torch formulation of ``down(silu(gate(x)) * up(x))``.
 
     WHY THIS IS A REAL COMPARISON AND NOT A RESTATEMENT. Each projection goes
-    through ``-026``'s ``blockwise_fp8_mm_torch_oracle``, which dequantises the
+    through the dense half's ``blockwise_fp8_mm_torch_oracle``, which dequantises the
     whole weight FIRST and contracts in one fp32 matmul, where the kernel
     contracts per ``256`` block and applies the block scale BETWEEN blocks and
     never consults ``flat_scale_index`` on this side. The two therefore disagree
@@ -1446,8 +1446,8 @@ def _shared_routed_stand_in(shared_reference):
     """A conditioned ``[T, H]`` routed contribution, at the shared half's scale.
 
     WHY THE ROUTED HALF IS A FIXTURE AND NOT A CALL. The routed path is
-    ``-027``'s ``block_quant_expert_mm``, LANDED and separately accepted against
-    its own criteria. Driving it here would (i) import ``-025``'s five admission
+    the MoE half's ``block_quant_expert_mm``, LANDED and separately accepted against
+    its own criteria. Driving it here would (i) import the kernel's five admission
     gates into this increment's acceptance, so a refusal there would read as a
     failure here, and (ii) put another increment's seam inside this increment's
     counter window. This increment's surface is the shared-expert path and the
@@ -1482,7 +1482,7 @@ def _shared_call_layer(block, case: dict, quant_config, routed):
     rather than letting a dataclass default stand in for it.
     """
     seam = _shared_seam()
-    # `inc-glm53f-090` repair round 6. The three kernel scale operands are built
+    # This is repair round 6. The three kernel scale operands are built
     # once at load time now, and ``shared_expert_mm`` REFUSES to build them inside
     # a forward step -- that refusal is what makes "never per forward step"
     # checkable, so it is not softened here. A caller that drives the layer has to
@@ -1722,7 +1722,7 @@ def test_shared_expert_double_add_is_refused_by_the_declared_tolerance():
 
 
 def test_shared_expert_seam_entries_are_one_per_projection_site():
-    """``-026``'s counter reads 3 per shared-expert call, and 3 is per-call.
+    """The dense half's counter reads 3 per shared-expert call, and 3 is per-call.
 
     BOTH READINGS ARE RECORDED, which is the reviewer's round-26 item N2: the
     PER-CALL value (3) and the PER-CASE total with the case's call multiplicity
@@ -1736,7 +1736,7 @@ def test_shared_expert_seam_entries_are_one_per_projection_site():
     routed = _shared_routed_stand_in(_shared_expert_torch_reference(case))
     seam = _shared_seam()
 
-    # `inc-glm53f-090` repair round 6. This item drives
+    # This is repair round 6. This item drives
     # ``combine_routed_and_shared`` DIRECTLY, twice, rather than through
     # :func:`_shared_call_layer`, so it needs its own preparation -- the helper's
     # call cannot reach it. Once, before the reset, for the two calls below: the
@@ -1753,7 +1753,7 @@ def test_shared_expert_seam_entries_are_one_per_projection_site():
     )
     seam.reset_dispatch_counters()
     assert seam.dispatch_counters() == (0, 0), (
-        "the reset did not zero -026's counters, so every reading below would be "
+        "the reset did not zero the seam's counters, so every reading below would be "
         "cumulative and none of them would mean what it says"
     )
 
@@ -1780,12 +1780,12 @@ def test_shared_expert_seam_entries_are_one_per_projection_site():
     per_call = [readings[0][0], readings[1][0] - readings[0][0]]
     if readings[0] != (SHARED_DECLARED_SEAM_ENTRIES, 0):
         raise SharedRouteInstrumentError(
-            f"after one shared-expert call -026's counters read {readings[0]}, "
+            f"after one shared-expert call the seam's counters read {readings[0]}, "
             f"declared ({SHARED_DECLARED_SEAM_ENTRIES}, 0)"
         )
     if readings[1] != (2 * SHARED_DECLARED_SEAM_ENTRIES, 0):
         raise SharedRouteInstrumentError(
-            f"after two calls -026's counters read {readings[1]}, expected "
+            f"after two calls the seam's counters read {readings[1]}, expected "
             f"({2 * SHARED_DECLARED_SEAM_ENTRIES}, 0). The declared 3 is a "
             f"PER-CALL delta; a counter that cannot advance is not an instrument."
         )
@@ -1984,11 +1984,11 @@ def test_shared_expert_section_imports_neither_scale_layout_helper():
 def test_shared_expert_f1_precondition_block_scales_are_pow2():
     """All three projections' block scales are exact pow2, over N/N blocks.
 
-    Why this belongs in this file: ``-026``'s kernel applies the block scale AFTER
+    Why this belongs in this file: the dense half's kernel applies the block scale AFTER
     accumulating the two contraction tiles of a block, and
     ``increments/evidence-071.md`` F1 measured 720 fp32 ulp of remapping error
     under a non-pow2 block scale against 0 under a pow2 one. Asserted HERE rather
-    than inherited from ``-026``'s test, because it is this file's fixture that
+    than inherited from the dense half's test, because it is this file's fixture that
     the declared tolerance is measured on.
     """
     from vllm_neuron.functional.moe.blockwise_fp8_retile import is_pow2_exact
@@ -2077,11 +2077,11 @@ def test_shared_expert_refuses_a_non_block_quant_config_by_name():
     )
 
     # B.6, over this increment's own two methods. The walk counts ``Name`` /
-    # ``Attribute`` / ``ImportFrom`` nodes ONLY -- ``-031``'s landed
+    # ``Attribute`` / ``ImportFrom`` nodes ONLY -- the sharding half's landed
     # ``test_sharding_adds_no_vendor_quantisation_enum_reference`` is the
     # authority for that scoping and the reason is load-bearing here: this
     # section NAMES the enum in prose, in the refusal message that explains which
-    # default-by-omission it exists to block (``-027``'s landed raise carries the
+    # default-by-omission it exists to block (a landed raise carries the
     # same sentence). A raw-text count would score that prose as a violation and
     # would pressure the message to be made less clear to satisfy the scan, which
     # inverts what B.6 is for. A CODE reference is what B.6 forbids.
@@ -2147,7 +2147,7 @@ def test_shared_expert_signed_fixture_agrees_in_norm_under_cancellation():
     """A signed fixture, compared in a cancellation-robust norm at the same tolerances.
 
     The declared arms run on a positive fixture, and
-    :func:`_shared_fp8_grid` records why: ``-025`` attempt 1 died to catastrophic
+    :func:`_shared_fp8_grid` records why: attempt 1 died to catastrophic
     cancellation at this same ``rtol``, and this increment chains THREE
     contractions so cancellation compounds. Dropping signed coverage entirely
     would leave the sign path unexercised, so it is kept here and compared in a
@@ -2717,9 +2717,9 @@ def test_shared_expert_two_sided_lower_bound_is_reached_and_changes_the_answer()
 def test_shared_expert_report_the_measured_readings(capsys):
     """Prints every reading this increment's evidence record quotes.
 
-    Mirrors ``-031``'s landed reporting convention and reads this increment's OWN
+    Mirrors the sharding half's landed reporting convention and reads this increment's OWN
     dict, so neither increment's reporting item depends on the other's items
-    having run. Last by declaration order, for the same reason ``-031``'s is.
+    having run. Last by declaration order, for the same reason the other's is.
     """
     with capsys.disabled():
         print()

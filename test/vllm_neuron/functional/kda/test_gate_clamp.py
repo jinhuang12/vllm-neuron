@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Acceptance for `inc-glm53f-084` -- the KDA gate in the reference's own form.
+"""Acceptance for the KDA gate in the reference's own form.
 
 **Two items, one per declared case, and no ``parametrize`` decorator in this file**
 (D1.2). Each item names the component whose behaviour it certifies (D1.4). The
@@ -17,7 +17,7 @@ THE COMPARATOR IS THE BLOCK'S OWN AND IS CITED, NOT CHOSEN HERE. The block's
 Acceptance bullet (increment plan rev 60, line 549) reads
 ``assert_close(rtol=1e-2, atol=1e-5)`` over **2/2** declared cases with the worst
 error reported as a number, and it states that the pair is copied byte-for-byte
-from ``inc-glm53f-046``'s Acceptance bullet (plan line 663) so that no new
+from the registered Acceptance bullet (plan line 663) so that no new
 tolerance value is minted (P9). This file therefore calls
 ``torch.testing.assert_close`` with exactly that pair and mints nothing.
 
@@ -28,7 +28,7 @@ test carries no torch oracle any more, so there is only one spelling of the
 reference and the two cannot drift apart.
 
 WHY THE PRE-REWRITE GATE FAILS THESE TWO ITEMS. The landed
-``inc-glm53f-037`` gate computed ``clamp(-exp(A_log) * softplus(g + bias),
+gate computed ``clamp(-exp(A_log) * softplus(g + bias),
 min=-5.0)``, which is a DIFFERENT function from the reference's
 ``-5.0 * sigmoid(exp(A_log) * (g + bias))``. The two disagree most at
 ``g = ln 4``, and they disagree at ``g = 0`` for every ``A_log`` except a narrow

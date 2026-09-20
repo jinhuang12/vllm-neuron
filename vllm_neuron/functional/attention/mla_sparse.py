@@ -7,7 +7,7 @@ existing public seam uses 512 and streaming; callers and tensor layouts do not
 change. ``STREAM_KV=False`` retains full-cache staging for explicit comparison.
 Dimensions come from input shapes. The existing geometry gate still applies.
 
-`inc-glm53f-040`. Per query, over the topk-selected cache rows::
+Per query, over the topk-selected cache rows::
 
     c_g     = c_kv[topk_indices[q]]                  # [K, L], gathered
     scores  = q_lift[q] @ c_g.T   (+ RoPE limb)      # [H, K]
@@ -63,7 +63,7 @@ unconditionally MX. This campaign does not use that consumer and is not MX-gated
 reproducing the permute here would add an untested coupling to a kernel nothing
 calls, and would put MX vocabulary on this increment's added lines where the
 changeset scan requires none. The output is therefore NATURAL row-major `[S, H, L]`.
-The consumer that reads it is the fork's own decode path at `inc-glm53f-042`.
+The consumer that reads it is the fork's own decode path.
 
 WHY THE LATENT RIDES THE PARTITION AXIS. `nc_matmul` contracts the PARTITION axis, so
 MM1 (which contracts the latent) needs both `q_lift` and the gathered cache latent
@@ -137,8 +137,8 @@ DGE_TRANSPOSE_ROWS = 16
 
 #: Moving free-axis extent, ``nl.tile_size.gemm_moving_fmax``. K rides the moving
 #: operand in MM1 and the latent rides it in MM2, so this bounds both -- and BOTH are
-#: now TILED to it rather than bounded by it: the latent by `inc-glm53f-041` and the
-#: selected-row count K by `inc-glm53f-093`. So this is the TILE WIDTH of each of those
+#: now TILED to it rather than bounded by it: the latent and the
+#: selected-row count K. So this is the TILE WIDTH of each of those
 #: two paths, not a ceiling on either axis. It remains a ceiling on nothing at all,
 #: which is why no refusal quotes it as one any more.
 MOVING_MAX = 512
@@ -159,7 +159,7 @@ TARGET_LATENT_RANK = 512
 TARGET_ROPE_WIDTH = 0
 
 #: The VALUE the indexer writes for a selected-row column that carries no token, and the
-#: only negative index this seam admits (`inc-glm53f-098`). The producer's constant, not
+#: only negative index this seam admits. The producer's constant, not
 #: this module's invention: `functional/dsa/index_expand.py` emits it and says every
 #: consumer must mask on it. This module is that consumer.
 SENTINEL_INDEX = -1
@@ -379,14 +379,14 @@ def _sbuf_u32(*shape: int):
     return nl.ndarray(tuple(shape), dtype=nl.uint32, buffer=nl.sbuf)
 
 
-# Its own NAME for the reason recorded above the uint32 one. `inc-glm53f-098` needs the
+# Its own NAME for the reason recorded above the uint32 one. The mask needs the
 # SIGNED tile because -1 read as uint32 is 4,294,967,295, which no comparison sees.
 def _sbuf_i32(*shape: int):
     return nl.ndarray(tuple(shape), dtype=nl.int32, buffer=nl.sbuf)
 
 
 def _sentinel_scratch(parts, width, heads):
-    """`inc-glm53f-098`'s sentinel working set. All three bodies allocate through here.
+    """The sentinel working set. All three bodies allocate through here.
 
     Returns, in order: the -1 comparand, the signed index tile, the 0/1 valid tile, the
     clamped index tile, the valid mask in float, the additive score bias, the masked
@@ -412,12 +412,12 @@ def _mask_sentinel(topk_hbm, offset, width, heads, sentinel_bias, sen, idx_sb):
     ``-1 < index`` is 1 for a real cache row and 0 for the sentinel, and the clamp is
     that mask TIMES the index -- so a sentinel column's offset becomes 0 and the gather
     stays inside the cache. What it gathers is then irrelevant, because its probability
-    is forced to zero; all that matters here is that the load is legal. `-040` loaded
+    is forced to zero; all that matters is that the load is legal. The untiled body loaded
     straight to uint32, and that form cannot see the sentinel at all.
 
     The bias is ``(valid - 1) * sentinel_bias``: exactly 0.0 where a token lives and
     ``-sentinel_bias`` where none does, by two scalar ops against PYTHON constants --
-    ``tensor_scalar``'s ``operand0`` must be a python scalar and never a tile (`-045`).
+    ``tensor_scalar``'s ``operand0`` must be a python scalar and never a tile.
     """
     nisa.tensor_copy(
         dst=sen[1][:, 0:width],
@@ -453,7 +453,7 @@ def _attention_body(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
     zero-extent SBUF tile is not a thing this image allocates, so a kernel that tried
     to keep the limb and size it 0 would not trace at all.
 
-    THE SENTINEL IS MASKED, NOT REFUSED (`inc-glm53f-098`). A column of ``topk_hbm``
+    THE SENTINEL IS MASKED, NOT REFUSED. A column of ``topk_hbm``
     holding :data:`SENTINEL_INDEX` carries no token: it is gathered from cache row 0 so
     the load is legal, and then given exactly zero probability, so it moves nothing. A
     query whose every column is the sentinel produces exactly zeros.
@@ -517,7 +517,7 @@ def _attention_body(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
     q_pe_stage = _stage(q_pe_hbm, rope, block) if rope > 0 else None
     k_pe_g = _sbuf(rope, topk) if rope > 0 else None
 
-    # `inc-glm53f-098`'s sentinel working set. In EXPONENT units divided by the scale,
+    # The sentinel working set. In EXPONENT units divided by the scale,
     # because `activation` below computes ``exp(scale * data + bias)``; `softmax_scale`
     # is a Python float inside a traced body -- which is exactly why `tensor_scalar` can
     # take it as `operand0` -- so this division happens at trace time and emits nothing.
@@ -583,7 +583,7 @@ def _attention_body(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
                     )
 
             # ---- the sentinel columns leave the softmax, BEFORE the max -------------
-            # `-098`, and the ORDER is the content. On the RAW scores because
+            # The ORDER is the content. On the RAW scores because
             # `activation` scales its data, which is what caps a masked column's exponent at
             # -`_SENTINEL_EXP_FLOOR` whatever scale the caller passed; and BEFORE the max,
             # because a max taken over unmasked scores could be a sentinel column's and would
@@ -679,17 +679,17 @@ def mla_sparse_attention_rope_kernel(q_lift_hbm, q_pe_hbm, c_kv_hbm, k_pe_hbm,
 
 
 # --------------------------------------------------------------------------- #
-# `inc-glm53f-041` -- the tiling path for a latent rank that does not fit one tile.
+# The tiling path for a latent rank that does not fit one tile.
 #
 # EVERYTHING THIS INCREMENT ADDS IS IN THIS ONE CONTIGUOUS BLOCK, on purpose. Two
 # increments write this file and the plan partitions them by concern (§11.A):
-# `-040` owns the kernel above, the seam and the seam's own counter; `-041` owns the
+# The kernel above, the seam and the seam's own counter are landed; this block owns the
 # tiling path behind that seam and its own counter. Keeping the block contiguous
-# means `-040`'s body is provably untouched -- the acceptance digests
+# means the landed body is provably untouched -- the acceptance digests
 # `_attention_body`'s own source and requires the value the landed commit had -- and
 # a reviewer can read this increment as one unit instead of hunting for it.
 #
-# WHAT WAS BOUNDED AND IS NOT ANY MORE. `-040` required the latent rank to be a
+# WHAT WAS BOUNDED AND IS NOT ANY MORE. The body above required the latent rank to be a
 # positive multiple of 128 AND to fit one MM2 moving tile of 512, because it tiled
 # neither axis. Both bounds are now tiled instead of asserted:
 #
@@ -717,10 +717,10 @@ def mla_sparse_attention_rope_kernel(q_lift_hbm, q_pe_hbm, c_kv_hbm, k_pe_hbm,
 class _MlaSparseTiledDispatchCounters:
     """How the TILED path was reached, per process.
 
-    A separate object from `-040`'s, because the plan gives each increment its own
+    A separate object from the landed one, because the plan gives each increment its own
     counted value and has neither read the other's. This one is ADDITIVE and not
-    exclusive: a tiled call increments `-040`'s seam counter as well, since that
-    counter counts every dispatch through the seam whatever body runs. `-042`'s decode
+    exclusive: a tiled call increments the seam counter as well, since that
+    counter counts every dispatch through the seam whatever body runs. The decode
     predicate reads both, so the two must compose rather than partition the traffic.
     """
 
@@ -732,7 +732,7 @@ _MLA_SPARSE_TILED_COUNTERS = _MlaSparseTiledDispatchCounters()
 
 
 def reset_mla_sparse_tiled_dispatch_counters() -> None:
-    """Zero the TILED counters. `-040`'s reset does not touch these and vice versa."""
+    """Zero the TILED counters. The landed reset does not touch these and vice versa."""
     _MLA_SPARSE_TILED_COUNTERS.nki_dispatch = 0
     _MLA_SPARSE_TILED_COUNTERS.torch_fallback = 0
 
@@ -740,7 +740,7 @@ def reset_mla_sparse_tiled_dispatch_counters() -> None:
 def mla_sparse_tiled_dispatch_counters() -> tuple[int, int]:
     """``(nki_dispatch, torch_fallback)`` for the TILED path since its last reset.
 
-    ``torch_fallback`` can only read ``0`` for the same reason `-040`'s can: there is
+    ``torch_fallback`` can only read ``0`` for the same reason the seam's can: there is
     no torch attention route in this module to increment it, an inadmissible geometry
     raises (P13), and the counter exists so a test can STATE the zero rather than
     assume it.
@@ -761,7 +761,7 @@ def _latent_tiles(latent: int) -> tuple[tuple[int, int], ...]:
     """``(offset, extent)`` per PARTITION-axis latent tile. The last one may be ragged.
 
     Derived from the latent rank rather than assumed uniform, which is the whole
-    difference from `-040`: at 2,051 this returns 17 tiles, the last of extent 3.
+    difference from the untiled body: at 2,051 this returns 17 tiles, the last of extent 3.
     """
     tiles = []
     offset = 0
@@ -790,12 +790,12 @@ def _attention_body_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm
                           q_pe_hbm=None, k_pe_hbm=None):
     """Trace sparse latent attention with the latent axis TILED on both its axes.
 
-    Same arithmetic as `-040`'s body and the same RoPE elision at trace time; the
+    Same arithmetic as the untiled body and the same RoPE elision at trace time; the
     difference is that every latent-indexed buffer is a LIST of tiles whose last
     member may be ragged, instead of one uniform 3-D buffer. A ragged tile cannot live
     in a uniform buffer, which is why the shape changes and not just the loop bound.
 
-    Shapes are `-040`'s, with the latent rank now unconstrained above 1:
+    Shapes are the untiled body's, with the latent rank now unconstrained above 1:
         q_lift_hbm  [S, H, L]      the absorbed Q latent, per head
         c_kv_hbm    [S_kv, L]      the latent KV cache
         topk_hbm    [S, K] int32   the selected cache rows, per query
@@ -812,7 +812,7 @@ def _attention_body_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm
     out_tiles = _output_tiles(latent)
 
     # ---- the cache, transposed onto partitions ONCE for the whole call ----------
-    # One staged transpose per latent tile, exactly as `-040`, except the last tile's
+    # One staged transpose per latent tile, exactly as before, except the last tile's
     # extent is the remainder. The tail transpose was measured on its own before this
     # was written, because it was the reading least likely to be legal.
     #
@@ -871,7 +871,7 @@ def _attention_body_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm
     q_pe_stage = _stage(q_pe_hbm, rope, block) if rope > 0 else None
     k_pe_g = _sbuf(rope, topk) if rope > 0 else None
 
-    # `inc-glm53f-098`'s sentinel working set, `-040`'s exactly and for a reason: the
+    # The sentinel working set is the untiled body's exactly, and for a reason: the
     # mask is a fact about the SELECTED-ROW axis, which is not the axis this body tiles.
     # The index tile stays the full 128 partitions and each gather slices it, so one
     # clamp serves every latent tile including the ragged one.
@@ -945,7 +945,7 @@ def _attention_body_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm
 
             # ---- softmax over K, per head row --------------------------------------
             # Untouched by the tiling: the scores tile is [H, K] whatever the latent rank
-            # was, so this is `-040`'s chain verbatim -- including `-098`'s two masking
+            # was, so this is the untiled chain verbatim -- including the two masking
             # steps, which are also facts about K and not about the latent.
             nisa.tensor_tensor(dst=scores_m, data1=scores_ps, data2=mask_bias, op=nl.add)
             nisa.tensor_reduce(dst=neg_row_max, op=nl.maximum, data=scores_m, axis=1,
@@ -965,10 +965,10 @@ def _attention_body_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm
                 nisa.nc_transpose(dst=p_t_ps, data=p_m[:, ks:ks + KEY_CHUNK])
                 nisa.tensor_copy(dst=p_t[:, ck, 0:heads], src=p_t_ps)
 
-            # THE SECOND TILING, and the one `-040`'s bound was really about: the latent
+            # THE SECOND TILING, and the one the bound was really about: the latent
             # is MM2's moving free axis, so the output is produced 512 columns at a time
             # and the last tile is 3 wide. The denominator is applied per output tile, for
-            # `-040`'s reason -- one pass over [H, L] rather than one over [H, K].
+            # the same reason -- one pass over [H, L] rather than one over [H, K].
             # A simple target plus subscripts, the smaller of the two measured repairs: the
             # iteration survives and only the unpacking goes. This one carries no
             # `enumerate`, so it needs no index. Evidence: probe-096-loop-host.out arm H4.
@@ -1009,7 +1009,7 @@ def mla_sparse_attention_rope_tiled_kernel(q_lift_hbm, q_pe_hbm, c_kv_hbm, k_pe_
                                            topk_hbm, softmax_scale):
     """The tiled R > 0 entry point.
 
-    KEPT FOR `-040`'S REASON, which applies with more force here: this increment
+    KEPT FOR THE LANDED REASON, which applies with more force here: this increment
     removes a latent-width bound, and serving the wide latent only when there is no
     RoPE half would have swapped one refused geometry for another. The alternative was
     to refuse the tiled RoPE geometry, which would have minted a refusal message
@@ -1026,22 +1026,22 @@ def mla_sparse_attention_rope_tiled_kernel(q_lift_hbm, q_pe_hbm, c_kv_hbm, k_pe_
 
 
 # --------------------------------------------------------------------------- #
-# `inc-glm53f-093` -- the SELECTED-ROW tiling: `topk` past one MM1 moving tile.
+# The SELECTED-ROW tiling: `topk` past one MM1 moving tile.
 #
-# EVERYTHING THIS INCREMENT ADDS IS IN THIS ONE CONTIGUOUS BLOCK, for `-041`'s reason.
+# EVERYTHING THIS INCREMENT ADDS IS IN THIS ONE CONTIGUOUS BLOCK, for the same reason.
 # Three increments write this file and the plan partitions them by concern (§11.A.1):
-# `-040` owns the kernel and the seam, `-041` owns the LATENT tiling, and this block
-# owns the SELECTED-ROW tiling. `-040`'s `_attention_body` and `-041`'s
+# The landed pair owns the kernel, the seam and the LATENT tiling, and this block
+# owns the SELECTED-ROW tiling. `_attention_body` and
 # `_attention_body_tiled` are untouched, and the acceptance digests both bodies over
 # spans found by symbol and requires the values they had at this block's base commit.
 #
 # WHAT WAS BOUNDED AND IS NOT ANY MORE. This checkpoint's selector picks 2,048 cache
-# rows per query (`index_topk`). `-040` bounded K at one MM1 moving tile of 512 because
+# rows per query (`index_topk`). The landed body bounded K at one MM1 moving tile of 512 because
 # it tiled the axis not at all, so the production row count was refused by the gate and
 # no block read the kernel at the width the decode path passes. K is now TILED:
 #
 #   * MM1's MOVING free axis, in tiles of 512. At 2,048 that is four score tiles.
-#   * MM2's PARTITION axis, in chunks of 128, accumulating -- which `-040` already did
+#   * MM2's PARTITION axis, in chunks of 128, accumulating -- which the landed body did
 #     within one tile and this block does within each tile, four chunks per tile.
 #
 # THE SOFTMAX IS THE WHOLE CONTENT, and it is why this is kernel-class work rather than
@@ -1071,10 +1071,10 @@ def mla_sparse_attention_rope_tiled_kernel(q_lift_hbm, q_pe_hbm, c_kv_hbm, k_pe_
 class _MlaSparseRowTiledDispatchCounters:
     """How the ROW-TILED path was reached, per process.
 
-    A third counter object, on `-041`'s form and for its reason: the plan gives each
+    A third counter object, on the same form and for its reason: the plan gives each
     increment its own counted value and has none read another's. ADDITIVE, not
-    exclusive: a row-tiled call increments `-040`'s seam counter as well, because that
-    counter counts every dispatch through the seam whatever body runs. `-042`'s decode
+    exclusive: a row-tiled call increments the seam counter as well, because that
+    counter counts every dispatch through the seam whatever body runs. The decode
     predicate reads all three, so they must compose rather than partition the traffic.
     """
 
@@ -1113,7 +1113,7 @@ def _count_row_tiled_nki_dispatch() -> None:
 def _score_tiles(topk: int, block_n: int = MOVING_MAX) -> tuple[tuple[int, int], ...]:
     """``(offset, extent)`` per MM1 MOVING-axis score tile. At 2,048 this is 4 x 512.
 
-    A LAST TILE MAY BE NARROWER, and it is never ragged in the sense `-041`'s tail is:
+    A LAST TILE MAY BE NARROWER, and it is never ragged in the sense the latent tail is:
     the gate admits only a multiple of :data:`KEY_CHUNK`, and ``block_n`` must
     also be a multiple of it. Each extent is therefore a whole number of MM2 key
     chunks. At the default width, `topk=640` returns tiles of 512 and 128. That invariant is what lets the
@@ -1201,7 +1201,7 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
 
     # ---- the working set, sized to ONE SCORE TILE and reused by every tile -------
     # This is the point of tiling rather than widening: every buffer below is the size
-    # `-040`'s was at `topk == MOVING_MAX`, whatever K the caller passes.
+    # the untiled body used at `topk == MOVING_MAX`, whatever K the caller passes.
     qpb = _queries_per_block(seq, heads)
     block = qpb * heads
     idx_sb = _sbuf_u32(LATENT_TILE, tile_max)
@@ -1226,7 +1226,7 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
     # ---- the running state carried ACROSS score tiles ----------------------------
     # `run_pos` holds `softmax_scale * (running row max)` -- the POSITIVE form, because
     # merging two maxima needs `maximum` and this image's landed kernels use
-    # `tensor_tensor(op=nl.maximum)`. `-040`'s chain produces the NEGATED max, so this
+    # `tensor_tensor(op=nl.maximum)`. The landed chain produces the NEGATED max, so this
     # block negates it once per tile with a scalar multiply.
     run_pos = _scalar(heads)
     run_sum = _scalar(heads)
@@ -1246,7 +1246,7 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
     pv_added = _sbuf(heads, latent)
     acc_new = _sbuf(heads, latent)
 
-    # `inc-glm53f-098`'s sentinel working set, sized to ONE SCORE TILE like every other
+    # The sentinel working set, sized to ONE SCORE TILE like every other
     # buffer here and sliced per tile the same way, because the mask is a fact about the
     # very axis this body tiles.
     #
@@ -1291,9 +1291,9 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
                 n_chunks = extent // KEY_CHUNK
 
                 # ---- THIS TILE's selected rows, replicated to every partition --------
-                # The offset is where the tiling shows: `-040` loaded all K rows of the
+                # The offset is where the tiling shows: the landed body loaded all K rows of the
                 # query, this loads the tile's slice of them.
-                # Loaded SIGNED and clamped before the gather reads it, per `-098`. The
+                # Loaded SIGNED and clamped before the gather reads it. The
                 # offset carries the tile's `ks` for the same reason the load below it does.
                 _mask_sentinel(topk_hbm, q_idx * topk + ks, extent, heads, sentinel_bias,
                                sen, idx_sb)
@@ -1350,10 +1350,10 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
                                 src=c_g_t_ps,
                             )
 
-                # ---- softmax over THIS TILE's keys -- `-040`'s chain, verbatim -------
+                # ---- softmax over THIS TILE's keys -- the landed chain, verbatim -----
                 # Against the TILE's own max, which is the only max available yet. The
-                # merge below is what makes that legitimate. `-098`'s two masking steps sit
-                # exactly where they sit in `-040`: the bias before the tile's max, the
+                # merge below is what makes that legitimate. The two masking steps sit
+                # exactly where they sit above: the bias before the tile's max, the
                 # zeroing before the tile's MM2.
                 nisa.tensor_tensor(dst=scores_m[:, 0:extent], data1=scores_ps,
                                    data2=mask_bias[:, 0:extent], op=nl.add)
@@ -1383,7 +1383,7 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
                 # ---- THE MERGE ------------------------------------------------------
                 if single:
                     # ONE TILE: no merge is emitted at all. This arm is what makes the
-                    # acceptance's bit-identity claim against `-040` a claim about the same
+                    # acceptance's bit-identity claim against the landed body a claim about the same
                     # arithmetic rather than about two implementations that agree closely.
                     nisa.tensor_copy(dst=acc, src=pv_ps)
                     nisa.tensor_copy(dst=run_sum, src=tile_sum)
@@ -1421,7 +1421,7 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
                                    op=nl.add)
 
                 # The output accumulator, rebased the same way. The denominator is applied
-                # ONCE after the last tile, not per tile -- `-040`'s reason, one pass over
+                # ONCE after the last tile, not per tile -- the same reason, one pass over
                 # [H, L] instead of one over [H, K], and here it also keeps the accumulator
                 # in the numerator's scale so a rescale is a single multiply.
                 nisa.tensor_scalar(dst=acc_kept, data=acc, op0=nl.multiply, operand0=c_acc,
@@ -1484,7 +1484,7 @@ def _require_admissible(seq: int, heads: int, latent: int, rope: int, topk: int,
 
     EVERY BOUND HERE THAT NAMES A HARDWARE AXIS SAYS WHICH ONE; the remaining bounds
     are plain positivity, which is all that is left of an axis once it is TILED rather
-    than bounded -- the latent rank is that case, under `inc-glm53f-041`. There is
+    than bounded -- the latent rank is that case. There is
     deliberately NO bound on the RoPE width being positive
     -- that absence is the increment. There is deliberately no bound on S or S_kv
     either: the query loop and the cache free axis both walk whatever they are given.
@@ -1501,7 +1501,7 @@ def _require_admissible(seq: int, heads: int, latent: int, rope: int, topk: int,
         )
     if latent < 1:
         raise MlaSparseAttentionError(
-            f"the latent rank must be positive; got latent={latent}. inc-glm53f-041 "
+            f"the latent rank must be positive; got latent={latent}. The kernel "
             f"TILES both axes this used to be bounded on -- the partition axis in "
             f"tiles of {LATENT_TILE} with a ragged tail, and MM2's moving free axis in "
             f"tiles of {MOVING_MAX} ({_TILE_PROVENANCE}) -- so neither a multiple-of "
@@ -1730,7 +1730,7 @@ def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
     # instruction's own out-of-bound behaviour is documented as undefined -- so it is
     # refused here, where the message can name the offending value.
     #
-    # THE LOWER BOUND ADMITS -1 AND NOTHING ELSE BELOW ZERO (`inc-glm53f-098`). -1 is
+    # THE LOWER BOUND ADMITS -1 AND NOTHING ELSE BELOW ZERO. -1 is
     # the indexer's own sentinel for a selected-row column that carries no token
     # (:data:`SENTINEL_INDEX`), and the kernels MASK it rather than reading it, so
     # refusing it here would refuse the producer's normal output. -2 and below are still
@@ -1756,13 +1756,13 @@ def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
 
     _count_nki_dispatch()
 
-    # `inc-glm53f-041`'s branch. The seam decides from the WIDTH ALONE: an exact-fit
-    # latent keeps `-040`'s body and anything ragged or wider than one MM2 moving tile
+    # The latent-tiled branch. The seam decides from the WIDTH ALONE: an exact-fit
+    # latent keeps the untiled body and anything ragged or wider than one MM2 moving tile
     # takes the tiled one. No caller passes a flag, so no caller can pick the wrong
     # path, and `can_run_mla_sparse_attention` needs no second question.
     #
     # THE COUNTER ABOVE IS DELIBERATELY NOT MADE CONDITIONAL. It counts every dispatch
-    # through this seam whichever body runs, which is what `inc-glm53f-042`'s decode
+    # through this seam whichever body runs, which is what the decode
     # predicate reads. The tiled counter here is ADDITIVE rather than exclusive, so a
     # tiled call is counted twice over -- once as a seam dispatch and once as a tiled
     # dispatch -- and an exact-fit call increments only the seam counter. That
@@ -1771,14 +1771,14 @@ def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
     if tiled:
         _count_tiled_nki_dispatch()
 
-    # `inc-glm53f-093`'s branch, added beside `-041`'s and on the same terms. The seam
+    # The row-tiled branch, added beside the latent one and on the same terms. The seam
     # decides from the SELECTED-ROW COUNT alone: a count wider than one MM1 moving tile
     # takes the row-tiled body. The two conditions cannot both hold, because the gate
     # above refuses the combination -- so these are three exclusive bodies and not a
     # matrix of four.
     #
-    # THIS COUNTER IS ADDITIVE TOO, for the reason `-041`'s is: `-040`'s seam counter
-    # above already counted this dispatch, and `-042`'s decode predicate reads all three
+    # THIS COUNTER IS ADDITIVE TOO, for the reason the tiled one's is: the seam counter
+    # above already counted this dispatch, and the decode predicate reads all three
     # counters per step and needs them to compose. A row-tiled call therefore reads 1 on
     # the seam counter and 1 here; an exact-fit, narrow call reads 1 and 0.
     rows_tiled = topk > MOVING_MAX
@@ -1832,7 +1832,7 @@ def mla_sparse_attention_torch_oracle(q_lift: Tensor, c_kv: Tensor,
     for a torch attention path. It is not a fallback and nothing dispatches to it:
     the seam above never calls it, so no input can reach it except a test's.
 
-    IT CARRIES `inc-glm53f-098`'s SENTINEL SEMANTICS, because an oracle that did not
+    IT CARRIES THE SENTINEL SEMANTICS, because an oracle that did not
     would disagree with the kernels on the producer's ordinary output. The clamp is
     load-bearing rather than defensive: torch reads a negative index as a wrap-around,
     so an unclamped -1 would silently attend the LAST cache row.

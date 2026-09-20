@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tier N acceptance for `inc-glm53f-043` -- the DSA indexer top-k WRAP.
+"""Tier N acceptance for the DSA indexer top-k WRAP.
 
 Declared command (D1 Tier N, the block's shorthand expanded to the tier's byte form)::
 
@@ -253,12 +253,12 @@ def test_kernel_identity_is_derived_through_the_seam() -> None:
 
 
 # ---------------------------------------------------------------------------------------------
-# `inc-glm53f-103`, rev 268 (`design-20260909-bh`). SECOND WRITER on this file, partitioned by
-# REGION: everything above is `-043`'s landed acceptance and is byte-unchanged; this section is
-# `-103`'s and adds one item.
+# Rev 268. SECOND WRITER on this file, partitioned by
+# REGION: everything above is the landed acceptance and is byte-unchanged; this section is
+# the causal bound's and adds one item.
 # ---------------------------------------------------------------------------------------------
 
-#: An ODD row count, which is the whole point of the item below. `-043`'s acceptance runs
+#: An ODD row count, which is the whole point of the item below. The landed acceptance runs
 #: `ROWS = 4`, and 4 splits evenly across the seam's two programs, so no program ever receives a
 #: partial tile. 5 does not, and a partial tile was the defect.
 ROWS_ODD = 5

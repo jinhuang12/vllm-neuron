@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tier N acceptance for `inc-glm53f-045` -- the DSA ragged pack, an AUTHORED bf16 NKI kernel pair.
+"""Tier N acceptance for the DSA ragged pack, an AUTHORED bf16 NKI kernel pair.
 
 Declared command (D1 Tier N, the block's shorthand expanded to the tier's byte form)::
 

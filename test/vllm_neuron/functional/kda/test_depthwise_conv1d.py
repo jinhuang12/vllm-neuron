@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tier N acceptance for `inc-glm53f-034` -- the KDA prefill depthwise conv1d WRAP.
+"""Tier N acceptance for the KDA prefill depthwise conv1d WRAP.
 
-Acceptance command (plan block ``#### inc-glm53f-034``, Tier N harness "as
-`-025`")::
+Acceptance command (Tier N harness "as
+landed")::
 
     VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1 NKI_PRECISE_FP=1 \
     NEURON_PLATFORM_TARGET_OVERRIDE=trn2 \
@@ -196,7 +196,7 @@ def _image(seed: int = 34) -> torch.Tensor:
     fp32 rather than bf16 because the declared ``atol`` is ``1e-5`` and bf16's
     ~3 decimal digits could not express a difference at that scale at all --
     the comparison would measure the storage format instead of the kernel. This
-    is the `inc-glm53f-025` conditioning lesson applied: a tolerance must be
+    is the conditioning lesson applied: a tolerance must be
     measurable in the dtype it is measured in.
 
     Centred on zero so the convolution's sum is not dominated by a DC term,
@@ -563,7 +563,7 @@ def test_reference_is_the_substrates_own_and_not_authored_here() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# The counters are MODULE-LEVEL state, on -026's and -028's landed placement.    #
+# The counters are MODULE-LEVEL state, on two siblings' landed placement.        #
 # --------------------------------------------------------------------------- #
 def test_dispatch_counters_are_module_level_state_reachable_from_elsewhere() -> None:
     """Another module can zero and read these counters, and they accumulate.

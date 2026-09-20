@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """MLA low-rank projections: a tiled matmul, authored in NKI.
 
-`inc-glm53f-039a`. This module computes one low-rank projection of the MLA
+This module computes one low-rank projection of the MLA
 attention half::
 
     y[S, O] = x[S, I] @ w[I, O]
@@ -10,7 +10,7 @@ and it exists because the substrate members that would otherwise have served the
 projections REFUSE this checkpoint's geometry. The authority for that refusal is
 `../../../artifacts/campaigns/glm-5.3-flash-port/increments/evidence-072.md`, whose
 verdict table reports BOTH rows REFUSE, 2/2 decided, 0 unknown, and the increment
-plan's own `inc-glm53f-039a` block, which carries every deciding bound with its
+plan's own block, which carries every deciding bound with its
 file and line. NEITHER IS RESTATED HERE, and no symbol of either refused member is
 named in this file -- the acceptance screens this module's source for exactly that,
 so naming one would be a defect rather than a courtesy to the reader.
@@ -45,7 +45,7 @@ rather than 512 and so quadruples the matmul count -- or a host-side copy of up 
 64 MB on every call. Both are real costs paid per call, whereas a projection weight
 is CONSTANT: transposing it once when it is loaded costs nothing per call. So the
 seam declares the orientation it can serve for free and the caller supplies it.
-THE CONSEQUENCE IS DECLARED RATHER THAN ABSORBED: `inc-glm53f-039b`, which wires
+THE CONSEQUENCE IS DECLARED RATHER THAN ABSORBED: the model side, which wires
 these five sites, transposes each weight ONCE at load time and never per call.
 
 THERE IS NO BIAS PARAMETER, and the absence is deliberate. This checkpoint's

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """DSA indexer top-k selection, as a WRAP of the tested rotational NKI top-k kernel.
 
-`inc-glm53f-043`. The DSA indexer scores every candidate context position for a query
+The DSA indexer scores every candidate context position for a query
 token and then keeps only the highest-scoring ones; this module is that selection. It
 takes a score tensor whose last axis is the candidate axis and returns the selected
 values and their indices, highest first::

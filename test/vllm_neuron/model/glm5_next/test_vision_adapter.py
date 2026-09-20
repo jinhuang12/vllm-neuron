@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the GLM-5.3-Flash vision patch-merge adapter (``inc-glm53f-104``).
+"""Tests for the GLM-5.3-Flash vision patch-merge adapter.
 
 WHAT IS MEASURED. Three things, and the third is the reason the first two can be trusted.
 

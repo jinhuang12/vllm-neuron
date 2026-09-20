@@ -34,17 +34,17 @@ What is NOT here, and where it lands
 ------------------------------------
 llama3's ``resolve_attention_mlp_classes`` has no counterpart yet: it dispatches
 onto ``model_static_fp8`` / ``model_mx_fp8`` module classes, and this package's
-modeling file (``model_fp8.py``) is ``inc-glm53f-013``. Adding a dispatcher
+modeling file (``model_fp8.py``) is not authored yet. Adding a dispatcher
 against modules that do not exist would be a stub asserting nothing, so the
 class dispatch lands with the module tree it dispatches to.
 
-<-- ``inc-glm53f-023`` (WP6) adds the QUANT-METHOD half of that dispatch, and
+<-- This file (WP6) adds the QUANT-METHOD half of that dispatch, and
 only that half: :class:`BlockFp8QuantMethod` and :func:`resolve_quant_method`
 below turn a parsed :class:`QuantizationSpec` into the *method* a call site
 consults, while the module-class dispatch above stays absent. The distinction is
 load-bearing -- parsing a ``weight_block_size`` into a spec (which this file
 already did) is NOT the same as resolving a method for it, and until
-``inc-glm53f-023`` a spec carrying ``(128, 128)`` resolved to nothing at all.
+method resolution a spec carrying ``(128, 128)`` resolved to nothing at all.
 
 Why a SUPPORTED SET rather than "any two positive ints"
 -------------------------------------------------------
@@ -59,8 +59,8 @@ each cited rather than re-derived:
   line 50, measured at ``increments/evidence-007.md``) -- it is structural and
   this campaign cannot change it;
 * a 256-granular block is therefore exactly **four** ``[128, 128]`` checkpoint
-  blocks (2 H-tiles x 2 I-tiles), which is the mapping ``inc-glm53f-024``
-  authors and ``inc-glm53f-025`` consumes.
+  blocks (2 H-tiles x 2 I-tiles), which is the mapping the retile producer
+  authors and the block-FP8 kernel consumes.
 
 So a well-formed block shape that is not ``(128, 128)`` has no authored path.
 It is refused HERE, at method resolution, with a named error -- not silently
@@ -69,7 +69,7 @@ carried into a retile and a kernel that cannot represent it.
 :meth:`QuantizationSpec.from_hf_quantization_config` deliberately stays
 PERMISSIVE (any two positive ints still parse into a spec). Narrowing the parser
 would move a refusal that belongs to this arch's authored kernel path onto the
-platform's config-time admission, which ``inc-glm53f-019`` owns and which this
+platform's config-time admission, which another module owns and which this
 increment does not touch.
 """
 
@@ -149,7 +149,7 @@ class UnsupportedWeightBlockSize(ValueError):
 
 
 # ---------------------------------------------------------------------------
-# The BF16 skip-list predicate -- ``inc-glm53f-079``
+# The BF16 skip-list predicate
 # ---------------------------------------------------------------------------
 def keeps_bf16(name: str, skip: Sequence[str] | None) -> bool:
     """True when ``name`` is one the checkpoint keeps in BF16.
@@ -193,7 +193,7 @@ class QuantizationSpec:
 
             MIXED PRECISION IS NO LONGER A TODO HERE, and the decision moved
             where the TODO said it would: :meth:`get_scheme` answers per module
-            off the checkpoint's own skip list (``inc-glm53f-079``). This field
+            off the checkpoint's own skip list. This field
             stays one scheme because the checkpoint declares one, so **a call
             site that reads ``linear_scheme`` directly now bypasses the skip
             list and will call a BF16 module block-FP8.** Query
@@ -212,7 +212,7 @@ class QuantizationSpec:
         modules_to_not_convert:
             The checkpoint's own list of module names to KEEP in BF16, taken
             verbatim off ``quantization_config.modules_to_not_convert``
-            (``inc-glm53f-079``). Empty means "quantize everything the scheme
+            by the parser. Empty means "quantize everything the scheme
             supports", which is what this class assumed before that increment.
             Stored as a tuple rather than the config's list so the frozen
             dataclass stays hashable, the same reason
@@ -235,7 +235,7 @@ class QuantizationSpec:
     ) -> QuantScheme:
         """Return the scheme applied to the module at ``(layer_index, prefix)``.
 
-        The answer is the checkpoint's own, since ``inc-glm53f-079``: a module
+        The answer is the checkpoint's own: a module
         named by :attr:`modules_to_not_convert` keeps BF16 and gets
         :attr:`QuantScheme.NONE`; everything else gets :attr:`linear_scheme`.
         Before that increment this returned :attr:`linear_scheme`
@@ -332,7 +332,7 @@ class QuantizationSpec:
         a one-way dependency (``config`` -> nothing, this module -> ``config``),
         and the attribute names are the whole contract.
 
-        ``inc-glm53f-079`` added the fourth name. A bridge that forwarded three
+        The skip list is the fourth name. A bridge that forwarded three
         of four would hand back a spec whose skip list is empty, and an empty
         skip list quantizes everything -- the exact defect this increment
         repairs, reintroduced one layer up.
@@ -432,7 +432,7 @@ def _parse_fp8_block(quantization_config: dict[str, Any]) -> QuantizationSpec:
             )
         block_size = (int(raw_block[0]), int(raw_block[1]))
 
-    # inc-glm53f-079: the checkpoint's BF16 skip list, carried verbatim and
+    # The checkpoint's BF16 skip list, carried verbatim and
     # only shape-checked. A list of non-strings would match nothing and would do
     # it silently, so it raises instead.
     raw_skip = quantization_config.get("modules_to_not_convert") or ()
@@ -457,14 +457,14 @@ def _parse_fp8_block(quantization_config: dict[str, Any]) -> QuantizationSpec:
 
 
 # ---------------------------------------------------------------------------
-# Quant-method resolution -- ``inc-glm53f-023``
+# Quant-method resolution
 #
 # A SPEC says what the checkpoint declares. A METHOD says what this arch will
 # actually do about it. The two are separate objects because they answer to
 # different authorities: the spec answers to the checkpoint's
 # ``quantization_config``, the method answers to the block-fp8 path this
-# campaign authors (``inc-glm53f-024`` retile, ``-025``/``-026`` kernels,
-# ``-027`` call site).
+# campaign authors (the retile, the two kernels,
+# the call site).
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class BlockFp8QuantMethod:
@@ -536,7 +536,7 @@ def resolve_quant_method(
 ) -> BlockFp8QuantMethod | None:
     """Return the quantisation method for the module at ``(layer_index, prefix)``.
 
-    This is the dispatcher gap ``inc-glm53f-023`` closes: before it, a parsed
+    This is the dispatcher gap this module closes: before it, a parsed
     spec carrying ``weight_block_size (128, 128)`` reached no method at all.
 
     The route is deliberately NOT the vendor ``quantization_type=`` keyword.

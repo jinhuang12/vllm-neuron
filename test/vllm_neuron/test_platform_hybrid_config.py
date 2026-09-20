@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""``platform.py`` hybrid-cache configuration (``inc-glm53f-020``).
+"""``platform.py`` hybrid-cache configuration.
 
 Subject: the hybrid branch of ``NeuronPlatform.check_and_update_config``
 (``vllm_neuron/vllm/platform.py``). The increment block declares the range
 **308-443** against the PIN; at the parent ``7ca17aa4`` the same method reads
 ``@classmethod`` **316** / ``def`` **317**, bound ``validate_request`` **453**
-(the ``+8`` that ``-075``/``-074`` landed above it). The shift is NOT uniform
-across the block's four declared ranges -- ``-019``'s hunk landed between the
+(the ``+8`` that two other items landed above it). The shift is NOT uniform
+across the block's four declared ranges -- another hunk landed between the
 pairs, so ``get_attn_backend_cls`` and ``support_hybrid_kv_cache`` read at
 ``+52``. Every cite here was re-measured at the parent rather than shifted by a
 single constant.
@@ -36,21 +36,21 @@ to the criterion it was measured against.
   one in each direction, with the D1.5 control that drops the validation and
   moves arm A's raise count to ``0/1``.
 
-**``inc-glm53f-081`` ADDS FOUR ITEMS AT THE END OF THIS FILE, one per NEW arm,
-so the derivable collected count for this file is now NINE.** `-020`'s five
+**FOUR ITEMS WERE ADDED AT THE END OF THIS FILE, one per NEW arm,
+so the derivable collected count for this file is now NINE.** The five
 items above, the helpers they call and the constants they read are **re-run
-whole and not edited** -- they are `-081`'s own acceptance, so `-081` cannot
+whole and not edited** -- they are the engagement block's own acceptance, so it cannot
 redden one without reddening itself. The four new items are conjunct **(a)** the
 automatic engagement at the registered TP degree, conjunct **(b) arm 2** the
 bfloat16 guard reached on the DEFAULT path, and conjuncts **(d2)** and **(d3)**
 the quiet-and-unchanged and the audible halves of the same non-engagement. They
 bring their own level-aware log context because ``_RecordingHandler`` above
 keeps messages without their level and ``(d3)`` counts records BY LEVEL.
-`-081`'s subject is the decision ABOVE the limb -- whether to enter it -- so it
+The engagement block's subject is the decision ABOVE the limb -- whether to enter it -- so it
 moves no registered value, no guard, no message and no derivation, and it adds
 no ``parametrize``.
 
-**THE ``inc-glm53f-081`` REPAIR (finding ``F-B29-01``) ADDS A TENTH ITEM at the
+**THE REPAIR (finding ``F-B29-01``) ADDS A TENTH ITEM at the
 end, so the derivable collected count for this file is now TEN.** ``(d3)`` above
 reads the page out of the landed method, but every config in this file supplied
 no block size, so it only ever read the unlatched half of the domain -- and the
@@ -169,7 +169,7 @@ GRANULARITY_REFUSAL_ANCHOR = "is not a multiple of the "
 
 HYBRID_MARKER = "Hybrid KDA/DSA KV cache enabled"
 
-# The campaign's pinned checkpoint config, landed by inc-glm53f-008. Resolved
+# The campaign's pinned checkpoint config. Resolved
 # off __file__ so the read cannot depend on the invocation's cwd.
 FIXTURE_CONFIG = (
     Path(__file__).resolve().parent / "model" / "glm5_next" / "fixtures" / "config.json"
@@ -693,9 +693,9 @@ def test_operator_override_is_honoured_only_within_registered_constraints() -> N
 
 
 # =========================================================================
-# inc-glm53f-081 -- the platform ENGAGES the limb above for this architecture
+# The platform ENGAGES the limb above for this architecture
 # =========================================================================
-# Four items, one per NEW arm, appended so that not one byte of `-020` above is
+# Four items, one per NEW arm, appended so that not one byte of the five above is
 # edited. The subject is the three-question decision immediately above the limb
 # in ``check_and_update_config``, never the limb itself.
 
@@ -709,7 +709,7 @@ CAMPAIGN_ARCH = "Glm5NextForConditionalGeneration"
 
 # Conjunct (b) arm 2's match: the substring the RENDERED landed message carries,
 # quoted from HEAD 3e53891c and edited nowhere. Arm 1's counterpart substring is
-# NOT declared here -- arm 1 is `-020`'s landed item, which this file re-runs
+# NOT declared here -- arm 1 is a landed item above, which this file re-runs
 # whole, and its rendered message is read off the transcript's own recording
 # rather than re-asserted by a constant no item would use.
 BF16_REFUSAL_SUBSTRING = "registered ONLY for a bfloat16 KV cache"
@@ -730,7 +730,7 @@ class _LevelRecordingHandler(logging.Handler):
 def _capture_platform_records():
     """``_capture_platform_log``'s shape, level-aware.
 
-    A separate context rather than an edit to `-020`'s helper, for `-020`'s own
+    A separate context rather than an edit to the landed helper, for its own
     reason -- the handler attaches to ``platform.logger`` directly, never
     through ``caplog`` -- and because the five landed items are this block's
     acceptance and are left byte-identical.
@@ -813,7 +813,7 @@ def test_bfloat16_guard_is_reached_on_the_default_path() -> None:
     Why this arm is not vacuous: the bfloat16 precondition is deliberately left
     INSIDE the limb rather than pre-checked by the decision above it, so a
     DEFAULT run at the registered degree with a non-bf16 KV cache must still
-    reach `-020`'s loud guard. Arm 1 of this conjunct is `-020`'s landed
+    reach the landed loud guard. Arm 1 of this conjunct is the landed
     operator-explicit item, re-run by this file and not duplicated here.
     """
     cfg = _build_config(model_dtype=OFF_VALUE_MODEL_DTYPE)
@@ -979,7 +979,7 @@ def test_default_run_at_off_value_tp_warns_exactly_once() -> None:
 
     # THIRD CONTROL -- an operator who set the knob is not lectured: question 2
     # ends the decision before the warning. Explicit False is measured here;
-    # explicit True at this degree is `-020`'s landed arm 1, which raises inside
+    # explicit True at this degree is the landed arm 1, which raises inside
     # the limb and so never reaches this warning either.
     explicit_cfg = _build_config(
         neuron_config={"enable_hybrid_kv_cache": False}, tp=OFF_VALUE_TP_DEGREE
@@ -1000,7 +1000,7 @@ OPERATOR_LATCHED_BLOCK_SIZE = 64
 def test_off_warning_reports_the_page_a_latched_run_actually_gets() -> None:
     """The declined engagement names the OPERATOR's page, not the default.
 
-    ADDED BY THE `inc-glm53f-081` REPAIR, for finding `F-B29-01`. The item above
+    ADDED BY THE REPAIR, for finding `F-B29-01`. The item above
     establishes that the sentence matches the delivered page, and it does so in
     one half of the domain: every config it builds supplies no block size, so
     ``user_specified_block_size`` is ``False`` throughout and the delivered page

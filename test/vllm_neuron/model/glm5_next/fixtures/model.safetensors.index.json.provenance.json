@@ -11,9 +11,8 @@
   "bytes": 8406613,
   "holds_weights": false,
   "contents": "one weight_map object (76108 checkpoint-key-to-shard entries over 62 shards) and one metadata.total_size field",
-  "landed_whole_because": "inc-glm53f-078's acceptance is a k/N over the complete key set, so any trim would need its own trimming rule verified before the coverage number meant anything",
+  "landed_whole_because": "the acceptance is a k/N over the complete key set, so any trim would need its own trimming rule verified before the coverage number meant anything",
   "note": "ZERO network access was used to build this file; it was copied from the run's own review artifact.",
-  "landed_by": "inc-glm53f-078",
   "design_entry_id": "design-20260902-h",
-  "pinned_by": "inc-glm53f-078 acceptance conjunct (h) -- the sha256 and byte count above are read off this file in the test and compared to the vendor's own numbers, so a later hand cannot quietly edit this fixture to make a comparison pass"
+  "pinned_by": "acceptance conjunct (h) -- the sha256 and byte count above are read off this file in the test and compared to the vendor's own numbers, so a later hand cannot quietly edit this fixture to make a comparison pass"
 }

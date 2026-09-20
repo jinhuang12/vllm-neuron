@@ -316,7 +316,7 @@ def load_time_shard_size(
 ) -> int:
     """One rank's extent along a dimension whose full width arrived at load time.
 
-    ``inc-glm53f-101``. Extracted so the two callers that need it -- the loader
+    Extracted so the two callers that need it -- the loader
     below, which slices a checkpoint slice, and a caller slicing an already
     materialised tensor -- compute the same number from the same code. Two copies
     of a ceiling division is how a weight and its scale grid come to disagree
@@ -362,7 +362,7 @@ def shard_tensor_at_load_time(
 ) -> torch.Tensor:
     """One rank's shard of an ALREADY MATERIALISED tensor, padded the same way.
 
-    ``inc-glm53f-101``. The sibling of :func:`tensor_width_sharding_loader` for a
+    The sibling of :func:`tensor_width_sharding_loader` for a
     caller that no longer holds a checkpoint slice. The routed expert bank's scale
     grids are the case: each grid is compensated WHOLE first
     (``compensate_block_scales``, whose arithmetic a pre-sliced grid would change),
@@ -399,7 +399,7 @@ def tensor_width_sharding_loader(
 ) -> SafetensorsWeightLoader:
     """Shard a tensor whose FULL WIDTH is not known until the tensor arrives.
 
-    ``inc-glm53f-101``. The two loaders above take ``shard_size`` as a
+    The two loaders above take ``shard_size`` as a
     construction-time number. This one reads the width off the checkpoint slice at
     load time and divides it here, which is the only way to serve a family whose
     owning module does not carry its own width.
@@ -1063,7 +1063,7 @@ def pad_to_shape(
         tensor: Input tensor (possibly smaller than target on some dims)
         target_shape: Expected shape after padding
         pad_value: what the added elements hold. The default 0.0 is what every
-            caller before ``inc-glm53f-101`` got from ``F.pad``, so no landed
+            caller before these loaders got from ``F.pad``, so no landed
             call site changes. A caller padding a RECIPROCAL quantity passes 1.0
             instead: a block-FP8 scale grid multiplies its weight block, so a
             zero there would scale real rows to nothing while a one leaves the

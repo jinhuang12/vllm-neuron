@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """DSA paged gather: collect token rows out of paged storage, as an ADAPTED NKI kernel.
 
-`inc-glm53f-044`. Paged attention keeps a sequence's context in fixed-size pages that are
+Paged attention keeps a sequence's context in fixed-size pages that are
 not contiguous, so reading the rows for a batch of tokens means following a page table.
 This module is that read: given the paged storage and, per output token, which physical
 page and which slot inside it, it returns one gathered row per token::
@@ -9,7 +9,7 @@ page and which slot inside it, it returns one gathered row per token::
     gathered = dsa_paged_gather(pages, page_indices, slot_indices, page_size)
 
 WHAT THIS MODULE AUTHORS. A NKI kernel, a seam, a gate and a torch oracle. Unlike
-`inc-glm53f-043`, which WRAPPED a kernel the fork already vendors, this increment ADAPTS:
+the top-k WRAP, which wrapped a kernel the fork already vendors, this increment ADAPTS:
 the kernel arithmetic below is written here, composing substrate primitives
 (``nisa.tensor_scalar``, ``nisa.tensor_tensor``, ``nisa.dma_copy`` with
 ``vector_select``) rather than calling a finished paged gather, because the substrate does
@@ -34,7 +34,7 @@ than opinions:
 
 The choice was RULED, not taken here. A substrate reclassification is a design decision and
 not an implementation one, so the measurement above was handed to the design owner and the
-increment plan's `-044` substrate ruling settled it as ADAPT on four grounds, the shard
+increment plan's substrate ruling settled it as ADAPT on four grounds, the shard
 refusal above being the first: a substrate that rejects one of the three layouts the
 acceptance asserts over is disqualified before design quality is weighed. Both routes would
 have satisfied P13, because both are NKI. The vendor member remains an ORACLE -- a second

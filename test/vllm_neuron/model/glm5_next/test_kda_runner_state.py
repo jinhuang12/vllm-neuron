@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""``inc-glm53f-038b`` acceptance -- WP3: KDA runner state plumbing.
+"""Acceptance -- WP3: KDA runner state plumbing.
 
-THE DECLARED ACCEPTANCE, the block's Tier N harness as ``inc-glm53f-025``:
+THE DECLARED ACCEPTANCE, the block's Tier N harness:
 
     VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1 \\
       NEURON_PLATFORM_TARGET_OVERRIDE=trn2 python -m pytest \\
@@ -57,7 +57,7 @@ THE FIVE ITEMS
 
 WHY THIS IS THE RUNNER HALF, AND WHY IT IS A DIFFERENT FILE
 ----------------------------------------------------------
-``inc-glm53f-038a``'s landed ``test_kda_layer.py`` drives the layer directly, one
+The landed ``test_kda_layer.py`` drives the layer directly, one
 bank tensor per call. This file never hands a layer a bank tensor: every
 ``conv_state``, ``recurrent_state`` and ``is_prefill`` a layer receives here comes
 out of ``NeuronModelRunner._glm5next_model_kwargs``, which is the code this block
@@ -67,7 +67,7 @@ neither half's counted predicate can be satisfied by the other half's items.
 WHAT IS IMPORTED FROM THE LAYER HALF, AND WHY
 --------------------------------------------
 The reference, the seam counters and the declared values are imported from
-``test_kda_layer`` rather than copied. The comparator is the retired ``-038``
+``test_kda_layer`` rather than copied. The comparator is the retired block's
 Acceptance line's own pair carried byte-for-byte (P9), so importing it makes the
 carry literal: a copy could drift from the value the plan registered while still
 looking right. A test-to-test import is this campaign's landed idiom

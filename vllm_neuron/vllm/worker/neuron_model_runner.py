@@ -4848,7 +4848,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             logits_indices=logits_indices,
         )
 
-    # ── GLM-5.3-Flash carrier threading (inc-glm53f-054b) ────────────────
+    # ── GLM-5.3-Flash carrier threading ──────────────────────────────────
     # This family takes its caches as forward ARGUMENTS -- one mapping per layer,
     # splatted at `model_fp8.py:7024` and refused on a count mismatch at `:7009` --
     # while every other family in this tree reads them off attributes. The helpers
@@ -4935,7 +4935,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         ``seq_lens`` IS PER TOKEN, NOT PER REQUEST -- "one per PACKED row", guarded
         at ``model_fp8.py:6179`` and documented at ``:6095`` -- and it is the causal
-        bound ``inc-glm53f-103`` consumes (``model_fp8.py:5533``). Row ``i`` of a chunk
+        bound the indexer consumes (``model_fp8.py:5533``). Row ``i`` of a chunk
         that starts at ``start_position`` sees ``start_position + i + 1`` tokens
         including itself.
         The landed tiny operand is ``arange(1, tokens + 1)``
@@ -5733,7 +5733,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 f"time, so a decode step carries exactly one token per request; this "
                 f"step carries {int(tokens)} token(s) for {int(requests)} request(s), "
                 f"and threading a multi-token decode, which is speculative decoding's "
-                f"verify step, is not inc-glm53f-054b's work"
+                f"verify step, is not this path's work"
             )
         real = int(tokens) if real_tokens is None else int(real_tokens)
         if real <= 0 or real > int(tokens):
@@ -6075,7 +6075,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         (``model_fp8.py:1775-1780``). A KV page size is a different number entirely --
         4 in the tiny fixture -- so handing it over raises
         ``Glm5NextBlockQuantRouteError`` on the first routed layer. Left unset, the
-        bank uses its own declared block, which is the value ``inc-glm53f-054a``'s
+        bank uses its own declared block, which is the value the
         landed acceptance asserts the root forwards to its stack
         (``test_tiny_glm5next_forward.py:5392-5393``). The KV page reaches the layers
         where it belongs, on each carrier's ``page_size``.
@@ -6642,7 +6642,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # past the last complete pool exist only inside the prefill branch
             # (`model_fp8.py:5486-5500`), so that branch writes them into the ring this
             # converter binds -- `prefill_tail` with `prefill_end_position` -- using
-            # `seed_tail` (`model_fp8.py:4631-4638`). Commit 6 of `inc-glm53f-054b`, on
+            # `seed_tail` (`model_fp8.py:4631-4638`), on
             # the lead's ruling; item 11 of the tiny end-to-end file measures it.
             # THE RING AND ITS OWNER ARE CLEARED TOGETHER, AND BOTH BEFORE THE CARRIERS
             # ARE BUILT. Commit 1 zeroed the ring here and opened the cursor only after
@@ -6681,7 +6681,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             #
             # WHY THIS IS A REFUSAL AND NOT A REPAIR. Reaching it needs a fresh request
             # admitted at a non-zero cached length, which is what an automatic
-            # prefix-cache hit produces. `inc-glm53f-054b`'s acceptance runs one
+            # prefix-cache hit produces. The acceptance runs one
             # sequence and cannot reach it, so the honest move is to refuse the step
             # this half does not implement instead of guessing which rows are whose.
             # WHAT THE SLOT AXIS ALREADY CLOSED, so this refusal is NARROWER than the
@@ -10650,7 +10650,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # THE PAGE COMES FROM THE SPEC, never from a number derived here:
             # `page_size_bytes` is the sum over the declared carriers, so
             # `num_blocks` and every stride below are functions of what the spec
-            # reports. `inc-glm53f-086` now passes `page_size_padded`, so this
+            # reports. The spec now passes `page_size_padded`, so this
             # reads the padded DSA page, not that sum; strides scale with it.
             elif isinstance(kv_cache_spec, MambaSpec):
                 for layer_name in group.layer_names:
@@ -10779,7 +10779,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 # Dtypes come from the MODEL, per state -- the global KV cache
                 # dtype describes a key/value cache and would mistype an fp32
                 # recurrent state. page_size_padded IS now passed, below the
-                # loop (`inc-glm53f-086`): it reverses this comment's premise so
+                # loop: it reverses this comment's premise so
                 # the KDA page matches the DSA page this same call builds.
                 spec = MambaSpec(
                     block_size=block_size,
@@ -10851,7 +10851,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             all_kv_cache_specs[layer_name] = spec
 
         # THE PADDED PAGE IS SET HERE, AFTER THE LOOP, NOT IN THE ARM ABOVE.
-        # `inc-glm53f-086`. The KDA arm builds its `MambaSpec` inside the loop,
+        # The KDA arm builds its `MambaSpec` inside the loop,
         # before any attention layer has necessarily been seen, so the attention
         # page is not yet known there. Both pages are known only once every layer
         # has a spec, which is here.
@@ -10860,7 +10860,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # `MambaSpec` whose page neither divides the largest page nor belongs to
         # an attention spec it can pad. Setting the field at construction makes
         # that unification succeed on its own terms, so nothing downstream has to
-        # widen anything. `inc-glm53f-018`'s patch stays in place and goes inert
+        # widen anything. The earlier patch stays in place and goes inert
         # on this path, because it only ever fills the field when it is None.
         #
         # Scoped to the layers this loop built. The drafter's spec set below is

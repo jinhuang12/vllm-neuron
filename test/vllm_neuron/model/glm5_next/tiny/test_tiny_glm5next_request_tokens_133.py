@@ -42,7 +42,7 @@ import torch._dynamo
 from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
 
 # The landed tiny stack's dials and the sibling file's runner-shaped fixture, imported
-# rather than re-implemented, as `test_tiny_glm5next_e2e.py:57-60` imports `-054a`'s.
+# rather than re-implemented, as `test_tiny_glm5next_e2e.py:57-60` imports the landed stack's.
 from test.vllm_neuron.model.glm5_next.tiny import test_tiny_glm5next_e2e as e2e
 from test.vllm_neuron.model.glm5_next.tiny import test_tiny_glm5next_forward as item
 

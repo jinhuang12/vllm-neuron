@@ -1,14 +1,14 @@
-"""`inc-glm53f-085` — the blockwise-FP8 dequant path for the four scaled MLA projections.
+"""The blockwise-FP8 dequant path for the four scaled MLA projections.
 
 THE QUESTION THIS FILE ANSWERS. The checkpoint stores four of the five MLA
 projections as blockwise-FP8 bytes with one scale per 128x128 tile.
-`inc-glm53f-039b` prepared all five as ``weight.to(torch.float32).t()`` and
+The call site prepared all five as ``weight.to(torch.float32).t()`` and
 never applied those scales, so four projections computed the WRONG FUNCTION at
 exactly the right shapes. The shapes are unchanged by the defect, so only a
 numeric acceptance can see it.
 
 THE THREE CASES, decided by the weight's dtype and never by a config flag: a
-real dtype passes through as `-039b` landed it; fp8 bytes with their scale are
+real dtype passes through as the call site landed it; fp8 bytes with their scale are
 dequantised in the checkpoint's ``[out_features, in_features]`` orientation
 BEFORE the transpose; fp8 bytes with NO scale raise, naming site and parameter.
 
@@ -24,7 +24,7 @@ serve: its dimensions are all multiples of 128, so no partial tile exists, and
 its weights reach 16384x1536. Hence ``FLOOR_OVERRIDES``, measured to put all
 four scaled sites on a ``[2, 2]`` grid with BOTH axes partial.
 
-Conjunct 6 runs at `-039b`'s ``TINY_OVERRIDES``, BELOW that floor, by design:
+Conjunct 6 runs at the call site's ``TINY_OVERRIDES``, BELOW that floor, by design:
 it certifies plumbing, and the arithmetic's non-vacuity is carried at the floor
 fixture by conjuncts 1-4.
 
@@ -59,7 +59,7 @@ _FP8_MAX = float(torch.finfo(_FP8).max)
 #: mechanical drift hit.
 BLOCK = (128, 128)
 
-#: Token count, the same value `-039b`'s landed acceptance uses.
+#: Token count, the same value the call site's landed acceptance uses.
 DECLARED_SEQ = 128
 
 #: The floor fixture. Chosen so all four scaled sites land on a ``[2, 2]`` grid
@@ -75,7 +75,7 @@ FLOOR_OVERRIDES = {
     "v_head_dim": 40,
 }
 
-#: `-039b`'s landed tiny geometry, copied so conjunct 6 runs where that
+#: The call site's landed tiny geometry, copied so conjunct 6 runs where that
 #: increment's own numeric conjunct runs (``test_mla_projections.py:96-104``).
 TINY_OVERRIDES = {
     "hidden_size": 256,
@@ -87,7 +87,7 @@ TINY_OVERRIDES = {
     "v_head_dim": 16,
 }
 
-#: The standing block-dequant comparator, `### 3L.1`'s for `inc-glm53f-026`.
+#: The standing block-dequant comparator, `### 3L.1`'s for the dense half.
 BLOCK_DEQUANT_RTOL, BLOCK_DEQUANT_ATOL = 3e-2, 1e-5
 
 #: The exact-scale arm, in the form B42 elected: one declared scalar on both
@@ -309,7 +309,7 @@ def test_conjunct_1_scale_grids_resolve_at_five_sites_above_the_floor() -> None:
     (``model_fp8.py:128-143``, called from ``Glm5NextMLAAttention.__init__``) and
     ``DSA_SCALED_PROJECTIONS``.
 
-    RE-ANCHORED BY ``inc-glm53f-091b`` (D2.3, comment-only). That increment
+    RE-ANCHORED (D2.3, comment-only). That increment
     inserted a helper between this span's old first line and the function it
     names, so the old span ``:105-120`` had no byte-equal target to shift to:
     it began five lines inside ``_is_fp8_dtype``'s docstring. The span above is
@@ -389,7 +389,7 @@ def test_conjunct_2_prepared_weight_is_the_dequantised_weight() -> None:
     THIS IS THE DEFECT'S OWN TEST. Before this increment the prepared tensor was
     raw fp8 bytes cast to fp32 and transposed — right shape, wrong numbers.
 
-    ``kv_b_proj`` is checked BYTE-IDENTICAL to `-039b`'s landed formula, which
+    ``kv_b_proj`` is checked BYTE-IDENTICAL to the call site's landed formula, which
     shows the repair is confined to the scaled sites.
     """
     say("C2_CERTIFYING_COMPONENT=prepare_projection_weights and "
@@ -424,7 +424,7 @@ def test_conjunct_2_prepared_weight_is_the_dequantised_weight() -> None:
             say(f"C2_SITE {name} BYTE_IDENTICAL_TO_039B_TRANSPOSE={identical}")
             assert identical, (
                 f"{name} is not scaled in this checkpoint, so its prepared "
-                f"tensor must be exactly what inc-glm53f-039b produced"
+                f"tensor must be exactly what the call site produced"
             )
 
     say(f"C2_SCALED_SITES_CHECKED={scaled_checked}")
@@ -486,7 +486,7 @@ def test_conjunct_4_positive_control_the_unscaled_formula_fails() -> None:
     failing.
 
     A pass means nothing until the same predicate is shown to FAIL on the defect
-    it catches. The identical fixture is run through `-039b`'s landed formula —
+    it catches. The identical fixture is run through the call site's landed formula —
     cast and transpose, no scale — and conjunct 2's comparison must reject it,
     with the worst relative error recorded as a number above ``3e-2``.
 
@@ -501,7 +501,7 @@ def test_conjunct_4_positive_control_the_unscaled_formula_fails() -> None:
     for name in DSA_SCALED_PROJECTIONS:
         raw = getattr(module, f"{name}_weight")
         assert raw.dtype is _FP8, f"{name} must hold fp8 bytes for this control"
-        # inc-glm53f-039b's landed formula, verbatim: cast and transpose, no scale.
+        # The call site's landed formula, verbatim: cast and transpose, no scale.
         unscaled = raw.to(torch.float32).t().contiguous()
         want = reference[name].t().contiguous()
         worst = worst_relative_error(unscaled, want)
@@ -586,7 +586,7 @@ def test_conjunct_6_end_to_end_through_the_seam_matches_a_torch_oracle() -> None
     right tensor is what the seam actually multiplies with — a repair that fixed
     the weight and then failed to reach it would satisfy every conjunct above.
 
-    Run at `-039b`'s ``TINY_OVERRIDES``, whose grids are ``[1, 2]``, ``[1, 1]``,
+    Run at the call site's ``TINY_OVERRIDES``, whose grids are ``[1, 2]``, ``[1, 1]``,
     ``[1, 2]`` and ``[2, 1]`` and so sit BELOW conjunct 1's floor. Permitted, and
     the plan says why: this conjunct certifies plumbing, and the arithmetic's
     non-vacuity is already carried at the floor fixture above.
@@ -669,7 +669,7 @@ def test_conjunct_6_end_to_end_through_the_seam_matches_a_torch_oracle() -> None
 def test_conjunct_7_route_predicate_r2_five_dispatches_with_a_control() -> None:
     """CONJUNCT 7 of 7 — the route predicate's counted values (D13 form R-2).
 
-    CERTIFYING COMPONENT: the seam `inc-glm53f-039a` authors in
+    CERTIFYING COMPONENT: the seam the kernel increment authors in
     ``vllm_neuron/functional/attention/mla_projections.py``. This block authors
     no seam, which is D13's own ownership trigger.
 
@@ -694,7 +694,7 @@ def test_conjunct_7_route_predicate_r2_five_dispatches_with_a_control() -> None:
     carries no non-vacuity weight; the 5-dispatch count and its control do.
     """
     say("C7_CERTIFYING_COMPONENT=the mla_projections seam authored by "
-        "inc-glm53f-039a")
+        "the kernel increment")
     MP = _seam()
     cfg = tiny_config()
     module, _reference = build_fp8_attention(cfg, seed=850394)

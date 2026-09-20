@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Vision patch embedding: a thin WRAP of the substrate's NKI ``conv3d``.
 
-`inc-glm53f-057`. This is WP10's first kernel-class increment -- the per-patch
+This is WP10's first kernel-class increment -- the per-patch
 convolution the GLM-5.3-Flash vision tower applies to cut an image into patch
 vectors before the tower's attention blocks run.
 
@@ -59,7 +59,7 @@ Four things, and nothing else:
    torch reference returns ``{"out": tensor}``. Both paths through this module
    return a plain tensor, so a caller and a test compare like with like. (The
    key is ``"out"``, read off this kernel's own reference -- the conv1d
-   reference `inc-glm53f-034` wraps uses ``"output"``, and assuming one from the
+   reference the depthwise conv1d wraps uses ``"output"``, and assuming one from the
    other would be a defect.)
 
 What this module does NOT do, and why that matters
@@ -67,7 +67,7 @@ What this module does NOT do, and why that matters
 It computes **no vision patch grid**. The rule that turns an image size into a
 patch grid is transformers' and the fork re-derives it nowhere (design ruling
 ``design-20260905-aq`` (iii)); the fork's single consumer of that rule is
-`inc-glm53f-056`'s ``vision_preprocessing`` module. This module is not that
+the ``vision_preprocessing`` module. This module is not that
 consumer and does not import it: no module under ``vllm_neuron/functional/``
 imports ``vllm_neuron.model`` (measured, 0 of them, while 11 model modules
 import ``vllm_neuron.functional``), so reaching across that boundary here would
@@ -75,17 +75,17 @@ invert the tree's dependency direction and pull vLLM's multimodal registry into
 a ``functional/`` import. The arithmetic in this file is the SUBSTRATE's
 convolution output formula and nothing else, stated once in
 :func:`output_extents` and cited to the kernel's own docstring. Joining a patch
-grid to this seam is the model-side consumer's job (`inc-glm53f-060`).
+grid to this seam is the model-side consumer's job.
 
 Route
 -----
 Acceptance is Tier N: the NKI simulator, reached through this module's own
 :func:`patch_embed` seam (``wrap_nki -> NKIHOPCaller -> HOP -> DispatchKey.CPU
--> nki.simulator.simulate_kernel``), on the harness form `inc-glm53f-025`
-declared and `inc-glm53f-034` landed. The seam counts its dispatches, and the
+-> nki.simulator.simulate_kernel``), on the harness form already
+declared and landed for the depthwise conv1d. The seam counts its dispatches, and the
 counters are module-level state with module-level reset and read functions,
-mirroring `inc-glm53f-026`'s landed placement
-(``functional/blockwise_fp8_mm.py``) and `inc-glm53f-034`'s
+mirroring the landed placements at
+(``functional/blockwise_fp8_mm.py``) and at
 (``functional/kda/depthwise_conv1d.py``) so that every seam a later route
 predicate reads presents one shape.
 
@@ -98,7 +98,7 @@ How this kernel states its constraints, and why the gate is written from it
 **Read, not assumed:** this kernel carries **zero** ``assert`` statements. It
 documents an *Intended Usage Range* instead, and it takes LNC sharding as an
 opt-in argument (``lnc_shard``, default ``False``) rather than imposing a shard
-divisibility rule. So the channel-divisibility refusal `inc-glm53f-034` needs
+divisibility rule. So the channel-divisibility refusal the conv1d needs
 for the substrate's depthwise conv1d **does not transfer to this kernel**, and
 copying it here would refuse geometry the substrate serves. The refusals below
 are this kernel's documented ranges, each named beside the extent it bounds.
@@ -244,7 +244,7 @@ def output_extents(
 
     **This is the SUBSTRATE's convolution formula, not a vision patch grid.** The
     rule that turns an image size into a patch grid belongs to transformers and
-    is consumed in the fork in exactly one place (`inc-glm53f-056`); this
+    is consumed in the fork in exactly one place; this
     function knows nothing about images, canvases, merge sizes or token budgets.
 
     Args:
@@ -441,7 +441,7 @@ class _DispatchCounters:
         self.torch_fallback = 0
 
 
-#: MODULE-LEVEL, on `inc-glm53f-026`'s and `inc-glm53f-034`'s landed placement:
+#: MODULE-LEVEL, on the landed placements named above:
 #: a route predicate taken over this seam from another increment's test module
 #: must be able to zero and read these counters from outside this file. A
 #: test-local counter would satisfy this increment and break that one.
@@ -573,7 +573,7 @@ def patch_embed_torch_reference(
     plain tensor.
 
     The dictionary key is ``"out"``, read off THIS kernel's reference. The
-    conv1d reference `inc-glm53f-034` wraps returns ``"output"``; the two
+    conv1d reference the substrate wraps returns ``"output"``; the two
     vendor references disagree, so the key is read rather than carried over.
 
     This is the acceptance's comparison target and the constraint-violation

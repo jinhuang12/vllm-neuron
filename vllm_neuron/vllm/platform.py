@@ -371,7 +371,7 @@ class NeuronPlatform(Platform):
         cls._enable_structured_outputs = enable_structured_outputs
 
         # ---- Does THIS architecture get the hybrid KDA/DSA KV cache? --------
-        # inc-glm53f-081. The knob's own comment in
+        # The knob's own comment in
         # vllm_neuron/model/neuron_config.py promises "the platform turns it on
         # for the archs that need it"; this is that decision. It is taken HERE,
         # above the limb below, so that not one byte of section 6's registered

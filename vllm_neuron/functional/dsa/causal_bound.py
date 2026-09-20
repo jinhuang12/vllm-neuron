@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The DSA indexer's selecting-regime causal bound -- ``inc-glm53f-103``.
+"""The DSA indexer's selecting-regime causal bound.
 
 WHAT THIS MODULE IS FOR, in one sentence: a query row must not select a key pool that finishes
 after the row's own position, so the scores of every such pool are pushed to a fill value below
@@ -14,13 +14,13 @@ bytes in ``increments/contradiction-103-selector-pad-6874a0f5.md``; the repair t
 (``approvals/LEAD-LOG.md`` §752) is :data:`BOUND_FILL` plus the marker's second arm on the index.
 
 WHY THE GAP EXISTED. The landed chain ``dsa_score_gemm`` -> ``dsa_topk_select`` ->
-``dsa_index_expand`` carries no per-row bound anywhere. ``inc-glm53f-046`` said so in the code it
+``dsa_index_expand`` carries no per-row bound anywhere. The score GEMM said so in the code it
 landed -- "No masking and no ``-inf`` fill. Upstream applies its causal and window mask AFTER this
 op ... the mask stage is a separate increment" (``score_gemm.py:71-72``) -- and no increment was
-ever minted for that stage. ``inc-glm53f-099`` owns the SHORT regime only: below the selection
+ever minted for that stage. The causal fill owns the SHORT regime only: below the selection
 bound every candidate would be selected anyway, so it fills exact causal rows and never selects.
 Above that bound the selector runs, and until this module landed it could pick a pool whose tokens
-the row must not see. That breaks ``inc-glm53f-048``'s declared caller precondition -- "every
+the row must not see. That breaks the expansion's declared caller precondition -- "every
 non-negative pool id satisfies 0 <= pool_ids[row, g] < seq_len[row] // pool_size"
 (``index_expand.py:48``, and ``:51`` "a pool id past the row's last pool expands to token indices
 past ``seq_len``").
@@ -64,17 +64,17 @@ that is NaN rather than zero -- so the zeros the kernels produce for it are writ
 (``mla_sparse.py:1494-1496``). Nothing here masks, clamps or compacts; this module only writes.
 
 WHY THIS IS KERNEL-CLASS AND LANDS IN NKI (P13). Both outputs are device tensors produced for the
-device kernels that consume them, which is ``inc-glm53f-048``'s precedent exactly. A torch mask on
+device kernels that consume them, which is the expansion's precedent exactly. A torch mask on
 the host would be a fallback for kernel-class work AND one host round trip per step, on the
 per-forward path.
 
-THE QUERY-TOKEN AXIS IS TILED, AND THAT IS ``inc-glm53f-103b``. Both kernel bodies used to bind the
+THE QUERY-TOKEN AXIS IS TILED. Both kernel bodies used to bind the
 query-token count to dim 0 of ONE SBUF tile, and SBUF's partition axis holds at most
 :data:`PARTITION_MAX` rows. A prefill above that did not refuse by name -- nothing in this module
 counts rows, so ``_validate_bound`` and ``can_run_dsa_causal_bound`` both pass it -- it dispatched
 and died inside the vendor's own assert: ``AssertionError: dma_copy dst partition dimension 132
 exceeds maximum 128``, raised at ``nki/isa/_copy.py:152`` by way of ``nki/isa/_validation.py:261``.
-``inc-glm53f-103``'s whole acceptance ran at 5 rows, so the ceiling was never exercised, while the
+The first acceptance ran at 5 rows, so the ceiling was never exercised, while the
 registered envelope is 2,048 tokens per request (``acceptance-preregistration.md`` A-5).
 
 Both bodies now walk :func:`row_tiles`, and TILING IS PURE LAYOUT HERE: row ``i``'s output reads
@@ -87,7 +87,7 @@ sliced: hoisting them would save one ``iota`` and one ``memset`` per tile and wo
 structural form of that bit-identity claim, and per-tile allocation inside an unrolled token-tile
 loop is this directory's landed form already (``score_gemm.py:254-297``). ``out`` stays a single
 ``shared_hbm`` tensor of the caller's shape, so no signature, no seam, no validator and no call site
-moves. The tile arithmetic is `inc-glm53f-028b`'s, adapted: ``mhc/sinkhorn.py`` rounds its tile
+moves. The tile arithmetic is the Sinkhorn kernel's, adapted: ``mhc/sinkhorn.py`` rounds its tile
 height down to one token's block height, and here there is no block to round to.
 
 CONSTRUCTS, AND THE SCREENING FOR EACH. Since the ``103r5`` repair made the fill finite, EVERY
@@ -105,7 +105,7 @@ and its old text is kept as the last bullet because the reason it is gone is wor
   * A PER-ROW VALUE REACHES ``tensor_scalar`` AS A ``(rows, 1)`` COLUMN OPERAND and is broadcast
     along the free axis (``causal_fill.py:220-224`` is the landed call, and its dtype note records
     why the operand tile must be float32: the ISA requires it and the MLIR verifier refuses an
-    int32 operand there). A ``(1, N)`` row operand is refused in that position -- the ``-045``
+    int32 operand there). A ``(1, N)`` row operand is refused in that position -- the landed
     finding at ``score_gemm.py:84-88``.
   * THE COMPARE PRODUCES AN INTEGER PREDICATE, which is the landed shape at
     ``moe/topk_reduce.py:351-355``: ``tensor_scalar`` with ``op0=nl.greater`` into an integer
@@ -123,7 +123,7 @@ and its old text is kept as the last bullet because the reason it is gone is wor
     rather than fork-authored, ``nisa.nc_match_replace8(imm=float("-inf"))``
     (``vendored_kernels/rotational_topk/rotational_topk_utils.py:1065``, ``:1109``, ``:1116``). Two
     risks came with that: the MLIR verifier stage, which the NKI simulator DOES NOT RUN
-    (``causal_fill.py:189-196`` records that trap costing ``-099`` four green items, so a green
+    (``causal_fill.py:189-196`` records that trap costing the bypass four green items, so a green
     Tier N run would not have cleared it), and the arithmetic risk this bullet's own last line
     already named -- ``0 * -inf`` is NaN -- which is what the selector's permutation matmul does to
     a bounded value. :data:`BOUND_FILL` is finite, so this memset is now one of the 37 and both
@@ -147,7 +147,7 @@ from vllm_neuron.utils.neuron_utils import can_run_kernel
 logger = logging.getLogger(__name__)
 
 SENTINEL = -1
-"""What a selection that reaches no valid pool holds. ``inc-glm53f-098``'s value, written here and
+"""What a selection that reaches no valid pool holds. The producer's value, written here and
 masked there. Upstream writes the same ``-1`` for a candidate-less slot (``sampler.cu:405``)."""
 
 BOUND_FILL = -1.0e30
@@ -203,10 +203,10 @@ keeps the selector's output in the dtype its consumer reads."""
 PARTITION_MAX = 128
 """Query rows ONE SBUF tile can hold: the partition-axis bound, ``nl.tile_size.pmax``.
 
-This bounds one ROW TILE and not the call. `inc-glm53f-103b` walks the query-token axis in tiles of
+This bounds one ROW TILE and not the call. The kernel walks the query-token axis in tiles of
 at most this height, so a prefill with more tokens than this is SERVED rather than trapped in the
 vendor assert the module docstring quotes. Written as a module constant so both kernels, the tile
-arithmetic and the acceptance read one number -- `inc-glm53f-028b`'s form at ``mhc/sinkhorn.py:217``.
+arithmetic and the acceptance read one number -- the form at ``mhc/sinkhorn.py:217``.
 """
 
 
@@ -320,7 +320,7 @@ def _kernel_identity_of(kernel) -> tuple[str, str]:
 def _row_tiles_unchecked(rows: int) -> list[tuple[int, int]]:
     """The ``(start, height)`` query-token tiles, in order, with no refusal in the arithmetic.
 
-    THE FORMS THIS LOOP AVOIDS ARE NOT TASTE, THEY WERE PAID FOR. `inc-glm53f-028b` landed the same
+    THE FORMS THIS LOOP AVOIDS ARE NOT TASTE, THEY WERE PAID FOR. The Sinkhorn kernel landed the same
     tiling in ``mhc/sinkhorn.py``, and commit ``543d793`` had to strip a list comprehension and a
     ``min`` out of it because the tracer refused them where the kernel bodies reach
     (``sinkhorn.py:353-386`` records what the compiler said, and that it never settled which of the
@@ -411,7 +411,7 @@ def _causal_bound_nki(scores_hbm, causal_len_hbm, pool_size):
     bits unchanged -- no add of 0.0, no multiply by 1.0, and therefore no ``-0.0`` to ``+0.0``
     rewrite and no ``0 * -inf`` NaN.
 
-    THE QUERY-TOKEN AXIS IS WALKED IN TILES OF AT MOST :data:`PARTITION_MAX` ROWS (`inc-glm53f-103b`).
+    THE QUERY-TOKEN AXIS IS WALKED IN TILES OF AT MOST :data:`PARTITION_MAX` ROWS.
     Every tile below is the untiled body's own tile at its own height, in the untiled body's own
     order, and each tile reads only its own rows of both inputs -- so ``rows <= PARTITION_MAX`` is one
     tile and is the old program exactly, and a taller call is that program run once per tile. The
@@ -446,7 +446,7 @@ def _causal_bound_nki(scores_hbm, causal_len_hbm, pool_size):
         # over from the first tile: `causal_len` is per-row, so a walk that hoisted this column would
         # bound every tile by the first tile's rows and would still read correct at
         # `rows <= PARTITION_MAX`. float32 because the ISA requires a `tensor_scalar` operand tile to
-        # be float32 and the MLIR verifier refuses int32 there -- the reading `-099` paid for,
+        # be float32 and the MLIR verifier refuses int32 there -- the reading the bypass paid for,
         # recorded at `causal_fill.py:189-196`. Exact: a causal length is a whole number far below
         # 2**24.
         clen = nl.ndarray((height, 1), dtype=nl.float32, buffer=nl.sbuf)
@@ -537,7 +537,7 @@ def _causal_sentinel_nki(values_hbm, indices_hbm, width):
     (``moe/topk_reduce.py:351-355``), ``memset`` with the int32 sentinel (``mla_sparse.py:236``), and
     ``tensor_copy_predicated`` as the select (``moe/topk_reduce.py:309``, ``:360``).
 
-    THE QUERY-TOKEN AXIS IS WALKED IN TILES OF AT MOST :data:`PARTITION_MAX` ROWS (`inc-glm53f-103b`),
+    THE QUERY-TOKEN AXIS IS WALKED IN TILES OF AT MOST :data:`PARTITION_MAX` ROWS,
     exactly as :func:`_causal_bound_nki` walks it and for the same reason: this kernel is the bound's
     other half, called back to back with it at one seam, so tiling only one of the two would move the
     trap from the bound's first load to this kernel's at the same query-token count. Both arms are

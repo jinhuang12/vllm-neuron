@@ -13,7 +13,7 @@ from nkilib.core.utils.common_types import RouterActFnType
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
-# --- inc-glm53f-032 additions. Pure additions: no line above is edited. ---
+# --- Pure additions: no line above is edited. ---
 from dataclasses import dataclass
 
 import nki.isa as nisa
@@ -28,7 +28,7 @@ from nkilib.core.utils.common_types import QuantizationType
 # decide its `T_local`/`T_offset` (`router_topk.py:217`). Imported rather than
 # reimplemented so the authored stage below and the vendor producer cannot
 # disagree about which core owns which tokens. Repair round 1 of
-# `inc-glm53f-032`, finding `M-B20-1`.
+# the router below, finding `M-B20-1`.
 from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 
 from vllm_neuron.functional.moe.rmsnorm_router_topk_tkg import (
@@ -37,7 +37,7 @@ from vllm_neuron.functional.moe.rmsnorm_router_topk_tkg import (
 from vllm_neuron.functional.moe.rmsnorm_router_topk_tkg import (
     _validate_inputs as _substrate_validate_inputs,
 )
-# --- end inc-glm53f-032 import additions ---
+# --- end import additions ---
 
 router_topk_jit = nki.jit(router_topk)
 
@@ -892,7 +892,7 @@ def _can_use_kernel(
 
 
 # ===========================================================================
-# inc-glm53f-032 -- WP7 router: top-8 sigmoid with `noaux_tc`.
+# WP7 router: top-8 sigmoid with `noaux_tc`.
 #
 # EVERYTHING BELOW THIS BANNER IS A PURE ADDITION. No line above it is edited:
 # `router()`, `_can_use_kernel()`, `_nki_router_impl()`, `_torch_router_impl()`
@@ -980,7 +980,7 @@ class NoauxTcRouterError(ValueError):
     RAISE, so that outcome is unreachable rather than merely unlikely.
 
     THE EXAMPLE USED TO BE `T % 256`, and it is `E > 512` now because the token
-    extent is no longer refused here at all: `inc-glm53f-088` pads the token axis
+    extent is no longer refused here at all: this module pads the token axis
     at each entry point instead (`_noaux_tc_pad_target` below). The argument is
     unchanged and the substrate still returns a silent `False` on `E`, so the
     class keeps its warrant with a clause that is still live.
@@ -1002,7 +1002,7 @@ class _NoauxTcCounters:
 
 
 #: MODULE-LEVEL, and that is a contract rather than an implementation detail:
-#: the `-025`/`-026` precedent is that a sibling increment counts this seam from
+#: the landed precedent is that a sibling increment counts this seam from
 #: its OWN test module (form R-2), so the counter must be resettable and
 #: readable from outside this module and outside this increment's test.
 _NOAUX_TC_COUNTERS = _NoauxTcCounters()
@@ -1038,7 +1038,7 @@ def _require_noaux_tc_extents(num_experts: int, top_k: int) -> None:
     actionable and a future extent change can be checked against its source
     rather than against this function's memory of it.
 
-    THE TOKEN EXTENT IS NOT ONE OF THEM, since `inc-glm53f-088`. It used to be:
+    THE TOKEN EXTENT IS NOT ONE OF THEM. It used to be:
     a fourth clause refused any `T` that was not a multiple of 256. The two
     public entry points now pad the token axis to their own tile multiple and
     slice the outputs back, so every `T >= 1` is servable and there is nothing
@@ -1079,7 +1079,7 @@ def can_run_noaux_tc_router(
     This function does NOT consult the pin's ``_can_use_kernel`` above, whose
     first statement is an unconditional ``return False``.
 
-    ``num_tokens`` left this signature with `inc-glm53f-088`, for the reason
+    ``num_tokens`` left this signature, for the reason
     given in ``_require_noaux_tc_extents``: the token extent no longer bears on
     the answer, and an argument that does not bear on the answer would advertise
     a screen that is not here.
@@ -1168,7 +1168,7 @@ def _noaux_tc_shard_range(num_tokens: int, n_prgs: int, prg_id: int):
     case and the only case the standalone entry point ever sees.
 
     ``t_local`` is always a whole number of ``NOAUX_TC_TILE`` rows here, and that
-    is not an assumption -- but since `inc-glm53f-088` the guarantee comes from
+    is not an assumption -- but the guarantee comes from
     the CALLER rather than from a refusal. Each public entry point pads
     ``num_tokens`` up to its own multiple before it launches
     (``_noaux_tc_pad_target``): 128 for the unsharded correct-only entry, 256 for
@@ -1359,7 +1359,7 @@ def _noaux_tc_correct_nki(
     a torch recomputation of the router matmul instead would measure the
     substrate's bf16 matmul precision, not this increment's numerics, and a
     single flipped near-tie would fail the arm for a reason that is not the
-    implementation's. The `-025` conditioning carry is the same lesson one level
+    implementation's. The conditioning carry is the same lesson one level
     up.
     """
     t_extent, e_extent = router_logits.shape

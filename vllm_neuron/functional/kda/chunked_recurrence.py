@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """KDA chunked recurrence, intra-chunk half: an NKI kernel authored here.
 
-`inc-glm53f-035a`. This is WP3's intra-chunk half of the Kimi Delta Attention
+This is WP3's intra-chunk half of the Kimi Delta Attention
 recurrence -- upstream's **stages 1 to 3** and no more: the gate cumulative sum,
 the L2-normalisation of ``q`` and ``k``, the two chunk-local products ``A`` and
 ``Aqk``, the inverse ``(I + A)**-1``, and the WY representation ``w`` / ``u``
 together with the gated key ``kg``. The state carried **across** chunks and the
-output are `inc-glm53f-035b`'s and are not computed here.
+output are the inter-chunk half's and are not computed here.
 
 It is **kernel-class** under P13 and it is **ADAPT**: the substrate ships
 structurally related scans (``nkilib.experimental.scan.ssd``,
@@ -60,8 +60,8 @@ Read from the same pinned source, for one chunk of ``C`` tokens, key width
 object is ``(I + A)`` and never ``A`` -- upstream says so in its own words at
 ``solve_tril.py:514-529`` ("Compute the inverse of the matrix I + A. A should be
 strictly lower triangular"). ``Aqk`` is produced here although nothing here
-consumes it: `-035b` needs it for the intra-chunk half of the output and has no
-other producer. ``kg`` likewise -- `-035b` declares it as a seam input and has
+consumes it: the inter-chunk half needs it for the intra-chunk half of the output
+and has no other producer. ``kg`` likewise -- it is a seam input there and has
 no raw ``k`` to derive it from.
 
 Why the inverse has no token loop, and how it is formed
@@ -183,7 +183,7 @@ class IntraChunkOutputs(NamedTuple):
     """Stages 1 to 3, one field per value the next increment or a test reads.
 
     ``a_inv`` and ``aqk`` are side outputs here: nothing in this module consumes
-    them, and both exist because `-035b` has no other producer for them.
+    them, and both exist because the inter-chunk half has no other producer for them.
     """
 
     w: Tensor
@@ -230,7 +230,7 @@ class _DispatchCounters:
 
 
 #: MODULE-LEVEL so a test outside this module can reset and read it, on the
-#: `inc-glm53f-028` precedent. `-035b` authors its own separate counters.
+#: ``sinkhorn.py`` precedent. The inter-chunk half authors its own counters.
 _COUNTERS = _DispatchCounters()
 
 
@@ -482,7 +482,7 @@ def kda_intra_chunk_kernel(
     The chunk loop is ``nl.affine_range`` because stages 1 to 3 are entirely
     chunk-local -- there is no carry between chunks, and choosing the parallel
     range over the sequential one asserts exactly that. Stage 4's carry is
-    `-035b`'s, and it is the reason that block will need a different range.
+    the inter-chunk half's, and it is why that block will need a different range.
     """
     n_chunks, chunk, kdim = q_hbm.shape
     vdim = v_hbm.shape[2]
@@ -871,7 +871,7 @@ def stage3_kernel_identity() -> tuple[str, str]:
 
 
 # =========================================================================== #
-# `inc-glm53f-035b` -- upstream's stages 4 and 5: the state carried ACROSS
+# Upstream's stages 4 and 5: the state carried ACROSS
 # chunks, and the output.
 #
 # Everything below is PURELY ADDITIVE. Not one line above it moves, which is
@@ -882,7 +882,7 @@ def stage3_kernel_identity() -> tuple[str, str]:
 # The two increments share this file and share the emitting helpers above, and
 # they share NOTHING ELSE. Separate kernel entries, separate seams, separate
 # counters, separate constants, separate admissibility checks -- on the
-# `-040`/`-041` precedent, where each increment's counted value is its own and
+# a landed precedent, where each increment's counted value is its own and
 # neither reads the other's.
 #
 # THE OUTPUT THIS KERNEL PRODUCES IS NOT ``o = H q``. That is the sequential
@@ -935,7 +935,7 @@ class InterChunkConstants(NamedTuple):
 
 @dataclass
 class _InterDispatchCounters:
-    """This increment's OWN counted route reading. It never reads `-035a`'s.
+    """This increment's OWN counted route reading, never the intra-chunk pair's.
 
     Same two-counter shape and same per-dispatch rule as the intra-chunk pair
     above -- ``nki_dispatch`` counts ``wrap_nki`` dispatches, ``torch_fallback``

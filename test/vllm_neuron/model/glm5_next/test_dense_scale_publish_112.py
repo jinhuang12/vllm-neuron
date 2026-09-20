@@ -1,4 +1,4 @@
-"""`inc-glm53f-112`: the REAL dense load path publishes the checkpoint's own 128 grid.
+"""The REAL dense load path publishes the checkpoint's own 128 grid.
 
 WHY THIS FILE EXISTS. Round 1's review found that every existing miniature of this path uses
 extents that are NOT whole ``256`` blocks, so they all took the skip arm of
@@ -155,7 +155,7 @@ def test_a_whole_256_checkpoint_publishes_at_128_and_the_prep_accepts_it() -> No
             f"the extents it was given"
         )
         assert record["retiled"] is False, (
-            f"{leaf} reports a retile. Since `inc-glm53f-112` the dense path coarsens nothing: a "
+            f"{leaf} reports a retile. The dense path coarsens nothing: a "
             f"True here means the 256 coarsening came back"
         )
         assert tuple(record["public_grid"]) == tuple(record["checkpoint_grid"]), (

@@ -1,6 +1,6 @@
 """GLM-5.3-Flash multi-token-prediction (MTP) draft head.
 
-``inc-glm53f-063``, WP9. This module is the whole source Surface of that
+WP9. This module is the whole source Surface of that
 increment: the draft head that proposes speculative tokens, and nothing else.
 
 WHAT THIS MODULE OWNS. The four MTP tensors the checkpoint ships at
@@ -17,7 +17,7 @@ WHAT THIS MODULE DELIBERATELY DOES NOT OWN, AND WHY THAT IS NOT A GAP.
 * **The decoder block.** The head takes its block as a constructor argument
   rather than building one, so this module imports no model tree at all. The
   checkpoint's MTP layer is ``deepseek_sparse_attention``-typed, which is
-  ``Glm5NextDSALayer`` -- ``inc-glm53f-051``'s D14 section. D14 tells an
+  ``Glm5NextDSALayer`` -- the DSA layer's D14 section. D14 tells an
   implementer whose increment would have to touch a class outside its own
   section to raise the widening rather than take it
   (``model_fp8.py:4632-4640`` states the same rule for a shared norm body), so
@@ -29,7 +29,7 @@ WHAT THIS MODULE DELIBERATELY DOES NOT OWN, AND WHY THAT IS NOT A GAP.
 * **Config plumbing and weight loading.** ``num_nextn_predict_layers`` is a
   constructor argument because ``Glm5NextTextConfig`` declares no such field at
   this base and the weight map carries no MTP key. Both land with
-  ``inc-glm53f-064`` as a recorded Surface rider; hard-coding the count here
+  a recorded Surface rider; hard-coding the count here
   would type geometry the checkpoint declares, which this fork's house form
   argues against in terms.
 

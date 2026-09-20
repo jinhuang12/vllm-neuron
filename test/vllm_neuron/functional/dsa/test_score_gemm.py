@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tier N acceptance for ``inc-glm53f-046`` -- the DSA indexer's score GEMM.
+"""Tier N acceptance for the DSA indexer's score GEMM.
 
 WHAT THIS FILE MEASURES, and the shape of the argument it makes.
 

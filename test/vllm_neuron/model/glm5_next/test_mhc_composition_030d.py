@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""``inc-glm53f-030d``: the mHC four-stream composition, one commit at a time.
+"""The mHC four-stream composition, one commit at a time.
 
-WHAT THIS FILE IS FOR. ``inc-glm53f-030`` landed the mHC layer and measured its
-arithmetic; ``inc-glm53f-030c`` corrected that arithmetic against the checkpoint's
+WHAT THIS FILE IS FOR. An earlier increment landed the mHC layer and measured its
+arithmetic; a later increment corrected that arithmetic against the checkpoint's
 own model file. Neither of them wired the layer into the decoder: the class was
-bound to no layer at all. ``-030d`` does the wiring, in four commits, and this
+bound to no layer at all. This increment does the wiring, in four commits, and this
 file grows with the first three of them.
 
 TWO COMMITS ARE IN THIS FILE SO FAR, and the items are grouped in that order.
@@ -180,7 +180,7 @@ class _StubAttention(nn.Module):
         self.seen: list[tuple[int, ...]] = []
         # The dtype is recorded BESIDE the shape rather than inside it, because the
         # landed items compare `seen` to a list of shapes and this commit does not
-        # move their readings (`inc-glm53f-030d` commit 4, the cast points).
+        # move their readings (commit 4, the cast points).
         self.seen_dtypes: list[torch.dtype] = []
         self._half = half
 
@@ -802,7 +802,7 @@ def test_030d_the_framework_overrides_reach_both_sites() -> None:
 def test_030d_the_post_gate_multiplier_is_the_targets_own_two() -> None:
     """Every bound site takes the target's factor, and the citation is READ.
 
-    ``inc-glm53f-030c`` moved this class's default from ``1.0`` to ``2.0`` because
+    A correction moved this class's default from ``1.0`` to ``2.0`` because
     the target computes ``post = 2 * torch.sigmoid(...)``. The bind must not pass a
     number of its own, so the reading is the bound instance's value; where the
     campaign's reference copy is reachable, the cited line is read off it rather
@@ -1056,8 +1056,8 @@ def test_030d_the_streams_route_runs_the_pair_around_the_same_attention_half(
     1. the attention half is entered exactly ONCE, on the collapsed ``[T, H]``
        single stream -- so the pair runs AROUND the sublayer, not beside it;
     2. the return is ``[T, S, H]``, the streams the carrier will keep;
-    3. ``inc-glm53f-028``'s Sinkhorn seam is entered once per layer call;
-    4. ``inc-glm53f-029``'s combine seam is entered once per layer call;
+    3. the Sinkhorn seam is entered once per layer call;
+    4. the combine seam is entered once per layer call;
     5. both torch-fallback counters stay at ZERO -- a fallback would mean the
        reading measured torch against torch (P13, and the route predicate this
        block declares in form R-2: it reads the counters the two seams own).
@@ -1142,7 +1142,7 @@ class _StubSite:
         produced = sublayer(collapsed)
         self.returned.append(produced)
         # FP32 OUT, as the landed combine seam does on purpose
-        # (``inc-glm53f-030``): the carrier decides what to cast back to, and an
+        # -- the carrier decides what to cast back to, and an
         # item that ran everything in one dtype could not read that decision.
         result = (residual.to(torch.float32) + produced.unsqueeze(1).to(torch.float32) * 0.5)
         self.results.append(result)
@@ -1419,7 +1419,7 @@ def test_030d_the_ffn_site_runs_over_ffn_halfs_unchanged_return() -> None:
 
     ``reference:1321-1327`` runs ``ffn_hc`` around ``mlp``: collapse, feed forward,
     mix. In this tree the feed-forward half is ``Glm5NextModel._ffn_half``
-    (``inc-glm53f-054a``), so the site composes in the carrier and the call itself is
+    so the site composes in the carrier and the call itself is
     unchanged -- same ``layer`` object, same ``[T, H]`` shape, same five forwarded
     keywords, and the object it returns is the object the site mixes.
 
@@ -2047,7 +2047,7 @@ def test_030d_the_cast_points_are_the_references_own() -> None:
     So this item runs the stack on a **bfloat16** table and reads the dtype at every
     one of those points, and then runs it again on an fp32 table: the cast PRESERVES
     the carrier's dtype rather than naming one, which is what the reference does
-    (``:1291``) and what keeps ``-030``'s landed fp32 readings true
+    (``:1291``) and what keeps the landed fp32 readings true
     (``test_mhc_layer.py:578``).
     """
     text_config = _text_config()
@@ -2081,7 +2081,7 @@ def test_030d_the_cast_points_are_the_references_own() -> None:
         )
     say("casts", f"fp32_return_preserved={seen['fp32'][1]}",
         f"bf16_return_preserved={seen['bf16'][1]}",
-        "-030's landed fp32 reading (test_mhc_layer.py:578) stays true")
+        "the landed fp32 reading (test_mhc_layer.py:578) stays true")
     assert seen["fp32"][1] is torch.float32 and seen["bf16"][1] is torch.bfloat16
 
 

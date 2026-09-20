@@ -1,4 +1,4 @@
-"""``inc-glm53f-006`` -- G15 closure: the instrument's multimodal-input path.
+"""G15 closure: the instrument's multimodal-input path.
 
 The increment measures a pair of counts, and the pair selects one of three
 declared outcomes -- so the branches are distinguished by numbers, not narrative.

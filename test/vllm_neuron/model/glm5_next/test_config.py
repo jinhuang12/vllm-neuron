@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-`inc-glm53f-008` acceptance — GLM-5.3-Flash model config.
+GLM-5.3-Flash model config acceptance.
 
 THE DECLARED PREDICATE (increment plan revision 10, block L3170-3176): parsing
 the pinned checkpoint's `config.json` yields **exactly** ten exact equalities,
@@ -21,11 +21,11 @@ pinned revision `04c4e9e95c5da8862dced7e5056455116f83a7e0` at fetch time (that
 artifact's L28 and L45). This file performs ZERO network access; the fixture's
 bytes are pinned by digest below, so a silent edit fails loudly.
 
-`inc-glm53f-080` re-transcribed the fixture's `text_config` from the in-repo
-copy of that same vendor config, `fixtures/hf-config.json`, which `inc-glm53f-078`
+The fixture's `text_config` was re-transcribed from the in-repo
+copy of that same vendor config, `fixtures/hf-config.json`, which another block
 lands and pins by its own digest. The pin below therefore moved; the ten
 equalities above did not, because every value they read is unchanged. The
-`-080` section at the end of this file carries that increment's four conjuncts.
+WP1/WP7 repair section at the end of this file carries that block's four conjuncts.
 
 FALSIFIABILITY: every counted or compared reading here carries an arm that
 would fail if the reading were vacuous. The ten equalities each get a mutation
@@ -57,7 +57,7 @@ from vllm_neuron.model.glm5_next.config import (
 FIXTURE_PATH = Path(__file__).resolve().parent / "fixtures" / "config.json"
 
 # Pinned so an edit to the fixture cannot silently move a declared value.
-# Moved by `inc-glm53f-080`, which re-transcribed the fixture's `text_config`
+# Moved when the fixture's `text_config` was re-transcribed
 # from the in-repo vendor copy; the previous pin was
 # f3d8790f18a18ffc95015dcc8869ac25c8d49129a383ccd3e0b4d07183bd6802.
 FIXTURE_SHA256 = "5ed24d23a3e14a038352e1bdc21fd25fc90ff2291d3f6a310acf5d4036665a1d"
@@ -339,14 +339,14 @@ def test_no_weights_are_referenced_by_the_fixture(raw):
 
 
 # ===========================================================================
-# `inc-glm53f-080` acceptance -- WP1/WP7 repair.
+# WP1/WP7 repair acceptance.
 #
 # THE DEFECT, in one sentence: the real text config carries 58 keys, the fork's
 # dataclass modelled only some of them, and the adapter dropped every other key
 # without a word -- one of the dropped keys was the model's own RMSNorm epsilon.
 #
 # THE MODELLED AND DROPPED COUNTS ARE NOT WRITTEN IN THIS PROSE, since
-# `inc-glm53f-033` repair round 2. They used to be, as "modelled 30 ... dropped
+# repair round 2. They used to be, as "modelled 30 ... dropped
 # the other 28", which cannot be right about both halves at once next to a pinned
 # count of 26: 58 minus 30 is 28. Conjunct (c) below DERIVES the dropped set from
 # the vendor config and the dataclass, so the count has one home and this prose
@@ -358,7 +358,7 @@ def test_no_weights_are_referenced_by_the_fixture(raw):
 # so the two cannot drift apart silently.
 # ===========================================================================
 
-# `inc-glm53f-078` lands this byte-identical copy of the vendor config and pins
+# One block lands this byte-identical copy of the vendor config and pins
 # it by this digest in its own conjunct (h). This section READS it and never
 # writes it: it is the only side of the comparison that speaks for the vendor.
 REAL_CONFIG_PATH = FIXTURE_PATH.parent / "hf-config.json"
@@ -376,18 +376,18 @@ C080_QUANT_CONFIG_KEYS = 4
 # THIS FILE's reading of the COMPLEMENT -- the vendor's keys that
 # `Glm5NextTextConfig` does not declare -- so it moves whenever the dataclass
 # models one more of the checkpoint's keys. It is NOT a figure the plan declares:
-# the plan's `-080` row registers that the adapter "lifts the checkpoint's
+# the plan's own row registers that the adapter "lifts the checkpoint's
 # `rms_norm_eps` and names every key it drops", and carries no dropped-key count
 # at all. Conjunct (c) derives the set and this constant pins the count beside the
 # derivation, which is the only reason to keep it.
 #
-# 26 -> 25 AT `inc-glm53f-033` REPAIR ROUND 2, BECAUSE THAT ROUND MODELLED ONE
+# 26 -> 25 AT REPAIR ROUND 2, BECAUSE THAT ROUND MODELLED ONE
 # MORE KEY: it added `swiglu_limit` to `Glm5NextTextConfig`, the bound the
 # checkpoint clamps both shared-expert projections with. The count is the constant
 # below and conjunct (c)'s derivation, not a third copy in this prose -- and
 # `swiglu_limit` is now absent from the log, which conjunct (c) asserts BY NAME.
 #
-# 25 -> 18 AT `inc-glm53f-051`, BECAUSE THAT BLOCK MODELLED SEVEN MORE KEYS: the
+# 25 -> 18 BECAUSE A BLOCK MODELLED SEVEN MORE KEYS: the
 # indexer's dials at `config.py:204-210` -- `index_topk`, `index_n_heads`,
 # `index_head_dim`, `index_kpool`, `index_kpool_compress`,
 # `index_kpool_always_select_tail` and `index_share_for_mtp_iteration`. All seven
@@ -408,7 +408,7 @@ C080_QUANT_CONFIG_KEYS = 4
 # and leave nothing watching the derivation.
 C080_DROPPED_KEYS = 18
 
-#: The seven keys `inc-glm53f-051` moved out of the drop log, asserted BY NAME below
+#: The seven keys that block moved out of the drop log, asserted BY NAME below
 #: for the reason conjunct (c)'s own docstring gives: a count cannot say WHICH key
 #: left, and a dataclass that dropped one field while adding another would keep the
 #: count and break the model.
@@ -577,8 +577,8 @@ def test_c080_c_the_filter_names_every_key_it_drops():
     fails this item.
 
     TWO KEYS ARE ASSERTED BY NAME, one per repair that modelled them:
-    `rms_norm_eps` (`inc-glm53f-080`, this block's own) and `swiglu_limit`
-    (`inc-glm53f-033` repair round 2, the SwiGLU bound the shared expert clamps
+    `rms_norm_eps` (this block's own) and `swiglu_limit`
+    (repair round 2, the SwiGLU bound the shared expert clamps
     with). Both must be declared fields and neither may appear in the log. The
     by-name half matters because the count alone cannot say WHICH key left: a
     dataclass that dropped one field and added another would keep the count and
@@ -628,7 +628,7 @@ def test_c080_c_the_filter_names_every_key_it_drops():
     assert "dtype" not in logged
     # The two lifted keys: the vendor declares both, the dataclass models both,
     # and neither is dropped. `rms_norm_eps` is this block's own repair;
-    # `swiglu_limit` is `inc-glm53f-033` repair round 2's. Both are movements of
+    # `swiglu_limit` is repair round 2's. Both are movements of
     # C080_DROPPED_KEYS, and that constant's own comment carries each movement with
     # the keys that caused it rather than leaving a reader to subtract.
     assert in_vendor == sorted(lifted), (
@@ -642,7 +642,7 @@ def test_c080_c_the_filter_names_every_key_it_drops():
     assert "swiglu_limit" not in logged
     assert "swiglu_limit" in field_names
 
-    # THE SEVEN `inc-glm53f-051` KEYS, THE SAME THREE WAYS. This is the by-name half
+    # THE SEVEN KEYS, THE SAME THREE WAYS. This is the by-name half
     # of the 25 -> 18 movement: the count above says seven keys left the log, and
     # these say WHICH seven. Without them a later block could model one indexer dial,
     # drop another, and keep 18 -- the exact failure this conjunct's docstring warns
@@ -650,9 +650,9 @@ def test_c080_c_the_filter_names_every_key_it_drops():
     by_051_in_vendor = sorted(k for k in C080_MODELLED_BY_051 if k in real)
     by_051_in_fields = sorted(k for k in C080_MODELLED_BY_051 if k in field_names)
     by_051_in_log = sorted(k for k in C080_MODELLED_BY_051 if k in logged)
-    print(f"[C080-c] -051 keys the vendor declares={len(by_051_in_vendor)} {by_051_in_vendor}")
-    print(f"[C080-c] -051 keys the dataclass models={len(by_051_in_fields)} {by_051_in_fields}")
-    print(f"[C080-c] -051 keys still in the drop log={by_051_in_log}")
+    print(f"[C080-c] the seven keys the vendor declares={len(by_051_in_vendor)} {by_051_in_vendor}")
+    print(f"[C080-c] the seven keys the dataclass models={len(by_051_in_fields)} {by_051_in_fields}")
+    print(f"[C080-c] the seven keys still in the drop log={by_051_in_log}")
     assert len(C080_MODELLED_BY_051) == 7, C080_MODELLED_BY_051
     assert by_051_in_vendor == sorted(C080_MODELLED_BY_051), (
         f"the vendor config does not declare "
@@ -691,7 +691,7 @@ def test_c080_d_the_seam_receives_the_config_epsilon(raw, cfg, monkeypatch):
 
     Reading 2 -- the explicit-override control (D1.5): `eps=1e-6` is still
     delivered unchanged. This is what proves the resolution honours a caller,
-    and it is what keeps `inc-glm53f-032`'s landed call honoured.
+    and it is what keeps the landed call honoured.
 
     Both values are read back from the RECORDED call, never from the signature
     default. No kernel runs and no accelerator is reached.
@@ -712,7 +712,7 @@ def test_c080_d_the_seam_receives_the_config_epsilon(raw, cfg, monkeypatch):
     hidden, gamma = object(), object()
 
     # Reading 1: the production call shape -- no `eps` argument at all. This is
-    # byte-for-byte the shape `-032`'s landed test calls with.
+    # byte-for-byte the shape the seam's landed test calls with.
     Glm5NextRoutedExperts.route_tokens(bank, hidden, gamma, non_default_text)
     # Reading 2: the explicit override.
     Glm5NextRoutedExperts.route_tokens(

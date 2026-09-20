@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""``inc-glm53f-015`` acceptance -- WP2: ``LayerSpec`` KDA state-field widening.
+"""Acceptance -- WP2: ``LayerSpec`` KDA state-field widening.
 
 THE DECLARED ACCEPTANCE, command (A) of the plan block, verbatim:
 
@@ -41,12 +41,12 @@ transposition-invariant by construction. C03 is the only orientation guard.
 
 WHY THIS FILE IMPORTS NO OTHER TEST MODULE
 ------------------------------------------
-The two geometry constants ``-013`` landed
+The two landed geometry constants
 (``glm5_next/test_kv_spec.py:135-137``) cite ``linear_attn_config`` as their own
 origin, so this file reads that origin directly instead of importing them: the
-``-013`` module truncates a results file at import time, and importing a test
+landed module truncates a results file at import time, and importing a test
 module for its constants would fire that side effect from a foreign session.
-Heavy imports stay inside test bodies, which is also ``-013``'s convention for
+Heavy imports stay inside test bodies, which is also that module's convention for
 keeping ``model_fp8`` out of ``sys.modules`` during collection.
 """
 
@@ -347,17 +347,17 @@ def test_kv_cache_spec_c04_state_page_bytes_reconcile_with_zero_discrepancy() ->
     assert swapped_bytes != RECORDED_KDA_STATE_PAGE_BYTES
 
 # ===========================================================================
-# ``inc-glm53f-086`` -- WP2 page-size unification. Five counted conjuncts, one
+# WP2 page-size unification. Five counted conjuncts, one
 # collected item each, selected by ``-k unification``, no ``parametrize`` added.
 #
 # APPENDED BELOW EVERY EXISTING ITEM ON PURPOSE. Three live citations pin lines
 # of this file BY NUMBER: ``model_fp8.py:2098`` pins ``:31-40``, the increment
 # plan pins ``:98`` and ``:322-327``, and ``test_kda_layer.py:99`` pins ``:94``.
 # An insertion above any of them would move bytes another file names, which is
-# the drift ``inc-glm53f-085`` had to repair. Every constant this section needs
+# the drift an earlier increment had to repair. Every constant this section needs
 # therefore sits HERE and not in the file's top block.
 #
-# RE-ANCHORED BY ``inc-glm53f-091b`` (D2.3, comment-only), and the old number
+# RE-ANCHORED LATER (D2.3, comment-only), and the old number
 # was ALREADY WRONG before that increment: ``model_fp8.py:2047`` was a BLANK
 # LINE at ``4b705cdf`` (the base), so it pinned nothing, while the line that
 # really carries the citation sat at ``:2082`` there. Recovered by content --
@@ -416,7 +416,7 @@ UNIFICATION_FIXTURE_SHA256 = (
 
 
 def _record_unification(**readings: object) -> None:
-    """Put a reading in the ``-q`` transcript, ``inc-glm53f-075``'s convention."""
+    """Put a reading in the ``-q`` transcript, the suite's convention."""
     import warnings
 
     for key, value in readings.items():
@@ -697,7 +697,7 @@ def test_kv_cache_spec_c086_unification_padding_is_in_the_spec_not_a_patch() -> 
     assert padded_values == {MEASURED_DSA_PAGE_BYTES}
 
     # THE CONTROL FOR "NOT IN A PATCH", and the reason this calls the ORIGINAL.
-    # Importing the module attribute would reach ``inc-glm53f-018``'s wrapper,
+    # Importing the module attribute would reach the patch's wrapper,
     # which pads by itself -- so this conjunct would pass with the source change
     # reverted, which is the one thing it exists to rule out. The pre-patch
     # original is the function object the wrapper captured, so calling it is a
@@ -795,7 +795,7 @@ def test_kv_cache_spec_c086_unification_fork_window_differs_in_zero_cases() -> N
     assert window["concurrency_raw"] > 0
     assert window["fork_window"] > 0
 
-    # This zero is what retires inc-glm53f-021's premise on an instrument. A
+    # This zero is what retires the earlier premise on an instrument. A
     # NONZERO reading is evidence_contradicts_design and routes to the lead; it
     # is never a silent revival of that increment.
     assert len(differing) == 0

@@ -22,11 +22,11 @@ from vllm_neuron.model.neuron_config import NeuronConfig, VisionNeuronConfig
 from .config import Glm5NextExpertConfigError
 
 # ---------------------------------------------------------------------------
-# Expert-sharding members -- ``inc-glm53f-031`` (WP7, M2 Lane B position 2).
+# Expert-sharding members (WP7, M2 Lane B position 2).
 #
-# These are a PURE ADDITION BY MEMBER to a co-authored file: ``inc-glm53f-009``
+# These are a PURE ADDITION BY MEMBER to a co-authored file: one co-author
 # owns the class plus ``from_configs`` / ``_select_implementation``, and
-# ``inc-glm53f-074`` owns the trailing ``**kwargs`` on ``__init__`` plus
+# the other co-author owns the trailing ``**kwargs`` on ``__init__`` plus
 # ``embed_input_ids`` / ``compute_logits``. No member of either is written
 # here, and none of their signatures is modified -- that partition is the plan's
 # section 11.A.1 register, and modifying a landed co-author's signature would be
@@ -58,7 +58,7 @@ class RaggedExpertPartitionError(ValueError):
     at all (``gpt_oss/model_bf16.py:1072``), which is the behaviour this named
     raise exists to refuse.
 
-    **THE SUBJECT IS THE EXPERT-PARALLEL DEGREE — ``inc-glm53f-087``.** The
+    **THE SUBJECT IS THE EXPERT-PARALLEL DEGREE.** The
     earlier wording of this docstring named the tensor-parallel degree and the
     campaign's G4 gap, and that was the premise that produced the defect: it is
     not the tensor-parallel degree that divides an expert bank. With expert
@@ -85,7 +85,7 @@ class ExpertPartition:
 
     **THE ``tp_degree`` FIELD HOLDS WHATEVER DEGREE THE CALLER PARTITIONS OVER,
     and that is the EXPERT-PARALLEL degree on every path in this module
-    (``inc-glm53f-087``).** The field keeps its landed name deliberately: renaming
+    ITSELF.** The field keeps its landed name deliberately: renaming
     a frozen-dataclass field cascades through every reader of the returned plan
     and buys no falsifiability, so this docstring carries the correction instead.
     Read it as "ranks partitioned over", never as "the tensor-parallel degree".
@@ -181,7 +181,7 @@ def require_routable_expert_counts(num_experts: int, experts_per_tok: int) -> No
     because it is a **cross-field** question about routing, not
     well-formedness of one field -- and because a config dataclass that asks it
     at construction time refuses a structural key-mapping fixture that never
-    routes a token (``inc-glm53f-011``'s ``mini_config``: a 4-expert bank
+    routes a token (``mini_config``: a 4-expert bank
     inheriting the checkpoint's top-8 default). ``config.py``'s
     ``_validate_expert_counts`` docstring is the single authority for that
     boundary; this function is the half it names.
@@ -202,7 +202,7 @@ def require_routable_expert_counts(num_experts: int, experts_per_tok: int) -> No
 
 
 def _resolve_ep_degree(ep_degree: int | None) -> int:
-    """The expert-parallel degree to divide the bank by (``inc-glm53f-087``).
+    """The expert-parallel degree to divide the bank by.
 
     ``None`` means "ask the process group", which answers ``1`` when expert
     parallelism was never initialised -- the production route for this campaign
@@ -235,7 +235,7 @@ def require_uniform_expert_partition(
     one both change the model: padding invents experts, flooring drops them.
 
     ``ep_degree`` IS THE EXPERT-PARALLEL DEGREE and was named ``tp_degree`` until
-    ``inc-glm53f-087``. The rename is the point rather than tidying: a parameter
+    this rename. The rename is the point rather than tidying: a parameter
     named for the tensor-parallel degree is the premise that produced the defect
     this gate had, which was to refuse a bank the fork itself admits. Every one
     of this function's call sites passes the degree positionally, so the rename
@@ -350,10 +350,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
             vision_neuron_config=vision_neuron_config,
         )
 
-    # ── expert sharding (``inc-glm53f-031``) ─────────────────────────────
+    # ── expert sharding ──────────────────────────────────────────────────
     # Appended after the landed members rather than woven between them, so the
-    # co-authorship partition is readable in the diff: no line of ``-009``'s or
-    # ``-074``'s members moves.
+    # co-authorship partition is readable in the diff: no line of the landed
+    # members moves.
 
     @classmethod
     def expert_sharding_plan(
@@ -367,7 +367,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         typed, so this member adds no import to a co-authored file and cannot
         create an import cycle with the modeling module.
 
-        **``inc-glm53f-087`` RENAMED THIS PARAMETER AND RE-DEFAULTED IT.** It was
+        **THIS PARAMETER WAS RENAMED AND RE-DEFAULTED.** It was
         ``tp_degree`` defaulting to :data:`TP_DEGREE_FREEZE`, so the default
         RAISED on this checkpoint's 288 routed experts -- one member of this
         module refusing a partition the expert bank beside it builds, which is

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Acceptance test for ``inc-glm53f-087`` -- WP7 REPAIR: the expert partition is
+"""Acceptance test for the WP7 REPAIR: the expert partition is
 keyed on the expert-parallel degree, not on world size.
 
-WHAT WAS WRONG. Landed ``inc-glm53f-031`` divided this checkpoint's 288 routed
+WHAT WAS WRONG. The landed config divided this checkpoint's 288 routed
 experts by the tensor-parallel world size and raised
 ``RaggedExpertPartitionError`` when the division was inexact. At the campaign's
 registered TP = 64, ``divmod(288, 64) == (4, 32)``, so THE MODEL REFUSED TO BUILD
@@ -18,7 +18,7 @@ initialised (``neuron_parallel_state.py:1195-1198``).
 
 THE ROUTE PARTITION. Every conjunct here reads the RESOLVED degree -- ``ep_degree``
 is left ``None`` and the getter answers, which is the production route. The
-EXPLICIT-degree readings belong to ``-031``'s re-pinned items in
+EXPLICIT-degree readings belong to the re-pinned items in
 ``test_experts.py`` and are deliberately not re-taken here, so nothing is
 certified twice.
 
@@ -134,7 +134,7 @@ def test_ep_on_at_a_degree_that_divides_288_yields_nine_local_experts():
     """EP on still divides, by the degree the getter reports.
 
     The getter is PATCHED rather than a degree passed, so this reads the
-    resolution seam. The explicit-degree reading at this same 32 is ``-031``'s
+    resolution seam. The explicit-degree reading at this same 32 is the landed
     re-pinned S04 item and is not re-taken here.
 
     D1.4 certifying component: ``factory.py::_resolve_ep_degree`` reading
@@ -183,7 +183,7 @@ def test_ep_on_at_a_ragged_degree_raises_naming_the_expert_parallel_degree():
     """The raggedness gate survives the repair, with its subject corrected.
 
     Reached through the SAME patched getter as C2, so this is the arithmetic
-    ``-031`` already refused at, re-subjected rather than re-derived.
+    the landed item already refused at, re-subjected rather than re-derived.
 
     D1.4 certifying component:
     ``factory.py::require_uniform_expert_partition`` raising

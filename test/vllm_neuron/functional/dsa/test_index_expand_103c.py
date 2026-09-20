@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Acceptance for the query-row tiling of the index expansion -- ``inc-glm53f-103c``.
+"""Acceptance for the query-row tiling of the index expansion.
 
 WHAT IS BEING ASSERTED. ``_index_expand_nki`` used to bind the selected-row count to dim 0 of twelve
 SBUF tiles, and SBUF's partition axis holds 128 rows at most, so a selecting-regime prefill above that
@@ -11,7 +11,7 @@ FIVE ITEMS, ONE PER CONJUNCT, NO ``parametrize``, every name carrying ``tiled`` 
 selects exactly them and the declared count is derivable from this file. Two failing controls live
 INSIDE the items whose readings they protect (``design-20260905`` §63: a strengthening under the same id
 never moves a declared count). A NEW FILE rather than an extension, because the landed
-``test_index_expand.py`` is ``-048``'s acceptance at 44 items in 1,237 L; re-running those 44 on the new
+``test_index_expand.py`` is the acceptance at 44 items in 1,237 L; re-running those 44 on the new
 body is a second step of the acceptance run, not a reading this file takes.
 
 NO TOLERANCE IS AUTHORED HERE, and none may be. Tiling moves rows and computes no new number; every
@@ -72,7 +72,7 @@ from vllm_neuron.functional.dsa.index_expand import (
     _row_tiles_unchecked,
 )
 
-# `-048`'s OWN precondition reader, imported and never re-implemented: re-spelling the rule here would
+# The landed acceptance's OWN precondition reader, imported and never re-implemented: re-spelling it would
 # let this file pass against its own idea of it.
 from test.vllm_neuron.functional.dsa.test_index_expand import (
     _precondition_violations,
@@ -120,7 +120,7 @@ CHAIN_WIDTH = 32
 """Candidate columns for the chain's selector, which needs ``0 < k < width`` strictly for ``k`` 8."""
 
 SEQ_FLOOR = N_GROUPS * POOL_SIZE
-"""The shortest fixture sequence: just enough complete pools that every planted id is legal for -048."""
+"""The shortest fixture sequence: just enough complete pools that every planted id is legal."""
 
 SEQ_PERIOD = 17
 """Row ``i``'s length is ``SEQ_FLOOR + i % SEQ_PERIOD``, and 17 does not divide 128 -- so every tile
@@ -140,7 +140,7 @@ vendor's assert fires in ``nki/isa/_copy.py:152`` by way of ``nki/isa/_validatio
 VENDOR_PARTITION_NUMBERS = r"partition dimension (\d+) exceeds maximum (\d+)"
 """WHAT THE CONTROL ASSERTS ON. The claim is "132 rows exceeded the 128-row partition axis" and it lives
 in the two NUMBERS; the words around them are the vendor's to change. Asserting the sentence would
-redden a correct candidate on a rewording -- ``-103b`` commit 3's repair. The wording is still printed,
+redden a correct candidate on a rewording -- the tiled bound's repair. The wording is still printed,
 so a drift shows up in the transcript as a fact."""
 
 
@@ -160,8 +160,8 @@ def _seq_lens(rows: int) -> torch.Tensor:
 
 def _pool_ids(rows: int) -> torch.Tensor:
     """``[rows, N_GROUPS]`` int32 pool ids, ``-1`` planted on a coprime stride. Every non-negative id
-    is ``(g + i) % N_GROUPS``, below ``SEQ_FLOOR // POOL_SIZE``, so the fixture satisfies ``-048``'s
-    caller precondition -- which item 3 reads with ``-048``'s own reader."""
+    is ``(g + i) % N_GROUPS``, below ``SEQ_FLOOR // POOL_SIZE``, so the fixture satisfies the landed
+    caller precondition -- which item 3 reads with the landed acceptance's own reader."""
     return torch.tensor(
         [
             [-1 if (i + g) % PID_SENTINEL_STRIDE == 0 else (g + i) % N_GROUPS
@@ -486,7 +486,7 @@ def test_tiled_matches_the_torch_oracle_at_every_declared_extent() -> None:
     The oracle is upstream's ``where`` form and the kernel is a closed form in max and min, so this is two
     mechanisms arriving at the same bytes. The SENTINEL PADDING past the raw width is read separately as
     all ``-1``, so the pad region cannot pass by being compared only with itself, and the fixture's
-    legality is read with ``-048``'s own reader. Certifying component (D1.4): ``_index_expand_nki``
+    legality is read with the landed reader. Certifying component (D1.4): ``_index_expand_nki``
     against ``index_expand._dsa_index_expand_torch``.
     """
     raw_cols = index_expand_raw_width(N_GROUPS, POOL_SIZE)
@@ -607,11 +607,11 @@ def test_tiled_route_is_one_dispatch_standalone_and_along_the_device_chain() -> 
     seam. A host-side loop over 128-row slices would serve the same shapes and read ``len(tiles)``
     dispatches, which is the design P13 excludes and the number that tells the two apart.
 
-    ALONG THE CHAIN IS WHERE ``-103b``'S RECORDED GAP CLOSES: it fed its sentinel from a host
+    ALONG THE CHAIN IS WHERE THE TILED BOUND'S RECORDED GAP CLOSES: it fed its sentinel from a host
     ``torch.topk`` on purpose and recorded that no reading had run the DEVICE selector above 128 rows.
     Here the four stages run in order -- bound, select, sentinel, expand -- at 132 and 256 rows, and
     EVERY ONE of them is asserted to have taken its kernel: one dispatch, no fallback, per stage per
-    extent. That is only askable because commit 3 merged ``-103b``'s tiled bound and sentinel onto this
+    extent. That is only askable because commit 3 merged the tiled bound and sentinel onto this
     tree; before it, the chain trapped in its first seam. Nothing here substitutes a torch reference for
     a kernel that refused -- a guarded chain would be a hollow chain, and a stage that cannot serve these
     extents is a finding about THAT kernel. Certifying component (D1.4): the four seams' own counters and
@@ -682,7 +682,7 @@ def test_tiled_route_is_one_dispatch_standalone_and_along_the_device_chain() -> 
         assert tuple(expanded.shape) == (chain_rows, index_expand_width(N_GROUPS, POOL_SIZE))
         assert expanded.dtype is torch.int32, expanded.dtype
 
-        # The chain's own ids must satisfy -048's precondition, read with -048's reader.
+        # The chain's own ids must satisfy the landed precondition, read with the landed reader.
         violations = _precondition_violations(marked.tolist(), seq.tolist(), POOL_SIZE)
         assert violations == [], violations[:8]
         want = mod._dsa_index_expand_torch(marked, seq, POOL_SIZE)
@@ -698,4 +698,4 @@ def test_tiled_route_is_one_dispatch_standalone_and_along_the_device_chain() -> 
     assert selector_on_device == len(CHAIN_LADDER), selector_on_device
     _emit("I5_CHAIN_CASES", extents=CHAIN_LADDER, stages=4, of=len(CHAIN_LADDER),
           device_selector_above_128=selector_on_device,
-          gap="-103b's gap is closed: the device selector ran above 128 rows at every extent")
+          gap="the tiled bound's gap is closed: the device selector ran above 128 rows at every extent")

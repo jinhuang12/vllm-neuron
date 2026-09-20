@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Acceptance test for ``inc-glm53f-009`` -- WP1: factory + registry registration.
+"""Acceptance test for WP1: factory + registry registration.
 
 The declared acceptance (increment plan revision 10, L3179), verbatim:
 
@@ -77,7 +77,7 @@ FACTORY_MODULE = "vllm_neuron.model.glm5_next.factory"
 def declared_env(monkeypatch):
     """The declared environment: the synthetic-model gate explicitly OFF.
 
-    Controlled, not inherited (the -001/-004 child-env pattern), so the
+    Controlled, not inherited (the landed child-env pattern), so the
     declared 6 cannot pass or fail on an ambient variable.
     """
     monkeypatch.delenv(SYNTHETIC_ENV, raising=False)
@@ -287,14 +287,14 @@ def test_c03_the_implementation_module_is_not_imported_at_module_level():
     became a SESSION-GLOBAL invariant instead, which any earlier-sorting file in
     this package falsifies by legitimately importing the implementation inside a
     test body -- and three declared files sort before ``test_factory.py``:
-    ``test_block_quant_recognition.py`` (``inc-glm53f-023``),
-    ``test_experts.py`` (``inc-glm53f-031``) and ``test_dsa_layer.py``
-    (``inc-glm53f-051``). A subprocess measures the true property and is immune
+    ``test_block_quant_recognition.py``,
+    ``test_experts.py`` and ``test_dsa_layer.py``.
+    A subprocess measures the true property and is immune
     to session pollution.
 
-    Repaired by ``inc-glm53f-031`` under the lead's ruling on
+    Repaired under the lead's ruling on
     ``evidence-023.md`` routed item 1. **The property is unchanged and is not
-    weakened**, ``inc-glm53f-009``'s declared counts do not move, and no other
+    weakened**, the declared counts do not move, and no other
     item in this file changes. Per-file ``sys.modules`` displacement stays
     prohibited (D15) and is not used here.
     """

@@ -84,9 +84,9 @@ at the production width, which round 4 measured at 8.0x the emit cost of this fo
 The strided destination slice is measured, not assumed -- see the refusal census below.
 
 WHAT THIS MODULE DELIBERATELY DOES NOT DO.
-  * No gather. Turning these indices into keys is the landed ``dsa_paged_gather`` (the ``-044`` ledger
+  * No gather. Turning these indices into keys is the landed ``dsa_paged_gather`` (its own ledger
     row), which this feeds.
-  * No selection. The pool ids arrive from the landed ``dsa_topk_select`` (the ``-043`` row), which is
+  * No selection. The pool ids arrive from the landed ``dsa_topk_select`` (its own row), which is
     pool-granular on this checkpoint (``sparse_attn_indexer_kpool.py:551-554``).
   * No clamping of an index to the row's sequence, and no masking of the sentinel. Both belong to the
     consumer, and inventing either here would silently diverge from upstream.
@@ -267,18 +267,18 @@ def index_expand_raw_width(n_groups: int, pool_size: int) -> int:
 PARTITION_MAX = 128
 """Query rows ONE SBUF tile can hold: the partition-axis bound, ``nl.tile_size.pmax``.
 
-This bounds one ROW TILE and not the call. `inc-glm53f-103c` walks the query-token axis in tiles of at
+This bounds one ROW TILE and not the call. The kernel walks the query-token axis in tiles of at
 most this height, so a prefill with more selected rows than this is SERVED rather than trapped in the
 vendor's own ``dma_copy`` assert. Written as a module constant so the kernel, the tile arithmetic and
-the acceptance read one number -- `inc-glm53f-028b`'s form at ``mhc/sinkhorn.py:217``, as
-`inc-glm53f-103b` adapted it at ``dsa/causal_bound.py``.
+the acceptance read one number -- the form at ``mhc/sinkhorn.py:217``, as
+the causal bound adapted it at ``dsa/causal_bound.py``.
 """
 
 
 def _row_tiles_unchecked(rows: int) -> list[tuple[int, int]]:
     """The ``(start, height)`` query-row tiles, in order, with no refusal in the arithmetic.
 
-    THE FORMS THIS LOOP AVOIDS ARE NOT TASTE, THEY WERE PAID FOR. `inc-glm53f-028b` landed the same
+    THE FORMS THIS LOOP AVOIDS ARE NOT TASTE, THEY WERE PAID FOR. The Sinkhorn kernel landed the same
     tiling in ``mhc/sinkhorn.py`` and commit ``543d793`` had to strip a list comprehension and a ``min``
     out of it because the tracer refused them where the kernel bodies reach (``sinkhorn.py:353-386``
     records what the compiler said). This loop therefore uses only ``for`` over ``range``, ``append``, a
@@ -286,7 +286,7 @@ def _row_tiles_unchecked(rows: int) -> list[tuple[int, int]]:
 
     ``mhc/sinkhorn.py`` rounds its tile height DOWN to a multiple of one token's block, because a block
     spans several rows there. Here one query row is one token, so nothing can be split and the height is
-    :data:`PARTITION_MAX` itself. This is byte-for-byte the helper `inc-glm53f-103b` landed in
+    :data:`PARTITION_MAX` itself. This is byte-for-byte the helper the causal bound landed in
     ``dsa/causal_bound.py``; the two are separate because each block's declared surface is its own file,
     and putting one copy in a shared module is a design decision rather than an implementer's.
     """
@@ -366,7 +366,7 @@ def _index_expand_nki(pool_ids_hbm, seq_lens_hbm, pool_size, pool_mask):
         pool_ids_hbm: ``[rows, n_groups]`` int32 -- the selected pool ids, ``-1`` where no pool was
             selected.
         seq_lens_hbm: ``[rows, 1]`` int32 -- the per-row sequence length, ALREADY a column. A ``(1, N)``
-            row is refused by the MLIR verifier for a ``tensor_scalar`` operand (the ``-045`` finding,
+            row is refused by the MLIR verifier for a ``tensor_scalar`` operand (a landed finding,
             recorded at ``score_gemm.py:84-88``), and every per-row value here is a scalar operand.
         pool_size: python int, a power of two -- how many tokens one pool covers.
         pool_mask: python int, ``pool_size - 1``. Handed over separately so this body performs no
@@ -391,7 +391,7 @@ def _index_expand_nki(pool_ids_hbm, seq_lens_hbm, pool_size, pool_mask):
     kernel body, and not as a torch concatenation after the call: the width is kernel-class work under
     P13 and a torch pad would be a fallback for it.
 
-    THE QUERY-ROW AXIS IS WALKED IN TILES OF AT MOST :data:`PARTITION_MAX` ROWS (`inc-glm53f-103c`).
+    THE QUERY-ROW AXIS IS WALKED IN TILES OF AT MOST :data:`PARTITION_MAX` ROWS.
     Every tile below is this body's own former tile at its own height, in its own order, and each tile
     reads only its own rows of both inputs -- so ``rows <= PARTITION_MAX`` is one tile and is the old
     program exactly, and a taller call is that program run once per tile. THE TWO LOOPS THAT WERE

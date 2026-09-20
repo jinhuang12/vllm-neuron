@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """KDA prefill depthwise conv1d: a thin WRAP of the substrate's NKI kernel.
 
-`inc-glm53f-034`. This is WP3's first increment -- the per-token depthwise
+This is WP3's first increment -- the per-token depthwise
 convolution the KDA prefill path applies along the sequence axis before the
 delta rule runs.
 
@@ -45,10 +45,10 @@ Route
 Acceptance is Tier N: the NKI simulator, reached through this module's own
 :func:`depthwise_conv1d` seam (``wrap_nki -> NKIHOPCaller -> HOP ->
 DispatchKey.CPU -> nki.simulator.simulate_kernel``), on the harness form
-`inc-glm53f-025` landed. The seam counts its dispatches, and the counters are
+already landed. The seam counts its dispatches, and the counters are
 module-level state with module-level reset and read functions, mirroring
-`inc-glm53f-026`'s landed placement
-(``functional/blockwise_fp8_mm.py:368-372``) and `inc-glm53f-028`'s
+the landed placements at
+(``functional/blockwise_fp8_mm.py:368-372``) and at
 (``functional/mhc/sinkhorn.py``) so that every seam a later route predicate
 reads presents one shape.
 
@@ -299,7 +299,7 @@ class _DispatchCounters:
         self.torch_fallback = 0
 
 
-#: MODULE-LEVEL, on `inc-glm53f-026`'s and `inc-glm53f-028`'s landed placement:
+#: MODULE-LEVEL, on the landed placements named above:
 #: a route predicate taken over this seam from another increment's test module
 #: must be able to zero and read these counters from outside this file. A
 #: test-local counter would satisfy this increment and break that one.

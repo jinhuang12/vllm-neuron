@@ -1,6 +1,6 @@
 """Does each seam's first-hop identity function name the kernel it really dispatched?
 
-Increment ``inc-glm53f-092``, plan revision 94.
+Plan revision 94.
 
 THE QUESTION THIS FILE ANSWERS
 ------------------------------
@@ -32,7 +32,7 @@ own diagram at ``vllm_neuron/functional/moe/moe_blockwise_fp8.py:545-547`` shows
 seam no product path reaches: the routed bank calls the three limbs, and commit ``3e5fc86``
 retired the seam's own test fixture for exactly that reason. An entry driving it would ask
 which kernel ran on a hop nothing dispatches, so the question is asked of the two hops that
-do run. Increment ``-077`` certifies that seam's second hop.
+do run. A later increment certifies that seam's second hop.
 
 THE THREE INSTRUMENTS, AND WHY THREE
 ------------------------------------

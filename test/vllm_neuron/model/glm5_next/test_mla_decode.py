@@ -1,22 +1,22 @@
-"""`inc-glm53f-042` -- the MLA decode path.
+"""The MLA decode path.
 
 WHAT THIS BLOCK BUILT. One method, ``Glm5NextMLAAttention.attend``, that turns hidden
 states into this layer's attention output through the ABSORBED chain: project the query
 and the KV latent, write the latent to its cache slot, lift the query into the latent
-rank with ``inc-glm53f-097``'s absorb seam, run ``inc-glm53f-093``'s row-tiled sparse
+rank with the absorb seam, run the row-tiled sparse
 attention, bring the result back down to the head width with the same absorb seam, and
 project out. The expansion of ``kv_b_proj`` from a 512 latent to 32,768 per token --
 which is what absorption exists to avoid -- never happens on this path.
 
 THE ACCEPTANCE ITEMS, and where their wording comes from. All are the plan block
-``#### `inc-glm53f-042``'s, and item (b) is the RE-REGISTERED form recorded at design
+the plan block's, and item (b) is the RE-REGISTERED form recorded at design
 entry ``design-20260905-q`` / ``DECISIONS.md`` §16 after the first attempt measured the
 original tolerance unachievable. The block is cited BY ANCHOR and not by line number,
 per D-18 and review item B72-N6: the line span moved twice while this file was being
 written, and a number folded today is stale at the next lap.
 
   (iv-a)  the weight split is EXACT for all 64 heads, bit-identical.
-  (iv-b)  the split reproduces ``-039b``'s landed dense expansion, per head, at
+  (iv-b)  the split reproduces the landed dense expansion, per head, at
           ``assert_close(rtol=1e-2, atol=1e-5)``.
           -- (iv-a)/(iv-b) per DECISIONS §15a.5 --
   (b-i)   a decode step matches the prefill run's corresponding slice, 3/3 steps.
@@ -69,13 +69,13 @@ import torch
 # numbers may not be shrunk for speed.
 DECLARED_HEADS = 64
 LATENT_RANK = 512          # kv_lora_rank. An EXACT fit: 512 % 128 == 0 and 512 <= 512,
-                           # which is what makes `-041`'s tiled counter read 0.
+                           # which is what makes the tiled counter read 0.
 NOPE_WIDTH = 256           # qk_nope_head_dim
 V_WIDTH = 256              # v_head_dim
 ROPE_WIDTH = 0             # qk_rope_head_dim on this checkpoint
 CONTEXT_ROWS = 2048        # prior tokens already in the cache
 SELECTED_ROWS = 2048       # the production top-k count. > 512, which is what makes
-                           # `-093`'s row-tiled counter read 1.
+                           # the row-tiled counter read 1.
 DECODE_STEPS = 3
 BATCH = 1
 
@@ -174,8 +174,8 @@ def reset_counters() -> None:
 def read_counters() -> dict[str, int]:
     """The five readings the route predicate names, each from its owning module.
 
-    The owners are cross-referenced rather than restated: `-040` owns the seam counter,
-    `-041` the tiled one, `-093` the row-tiled one, `-097` the absorb one. The fifth is
+    The owners are cross-referenced rather than restated: the sparse seam owns the seam counter,
+    the tiling the tiled one, the row tiling the row-tiled one, the absorb seam the absorb one. The fifth is
     the torch-fallback total, which is what makes "no torch path ran" a measurement
     rather than a claim about the source.
     """
@@ -464,7 +464,7 @@ def test_item_iv_a_the_absorb_split_is_exact_for_all_heads() -> None:
 
 # --------------------------------------------------------------------------- #
 def test_item_iv_b_the_split_reproduces_the_landed_dense_expansion() -> None:
-    """Per head, the absorbed operands reproduce `-039b`'s expanded key and value.
+    """Per head, the absorbed operands reproduce the landed expansion's key and value.
 
     -- (iv-a)/(iv-b) per DECISIONS §15a.5 --
 
@@ -871,9 +871,9 @@ def test_item_d_route_predicate_five_counter_readings_on_every_arm() -> None:
     establish which path it is. These counters can.
 
     The values are the plan block's, cross-referenced to their owning increments rather
-    than redefined here: `-040`'s seam counter fires on every dispatch, `-041`'s tiled
-    counter only on a tiled latent body, `-093`'s row-tiled counter only when the
-    selected-row count exceeds the moving maximum, `-097`'s absorb counter once per
+    than redefined here: the seam counter fires on every dispatch, the tiled
+    counter only on a tiled latent body, the row-tiled counter only when the
+    selected-row count exceeds the moving maximum, the absorb counter once per
     absorb call site. The two zeros are load-bearing and each owns a firing control.
     """
     sparse, _ = _counter_modules()
@@ -918,7 +918,7 @@ def test_item_d_route_predicate_five_counter_readings_on_every_arm() -> None:
         "torch_fallback": 0,
     }
 
-    # THE FIRING CONTROL FOR `-041`'s COUNTED ZERO. A latent that is NOT an exact fit
+    # THE FIRING CONTROL FOR THE TILED COUNTER'S COUNTED ZERO. A latent that is NOT an exact fit
     # must make the tiled counter read 1. Without this, a tiled counter that never
     # increments for any reason would produce the same zero as a correct exact-fit
     # route. Run directly on the seam at a small geometry, because the point is the
@@ -951,7 +951,7 @@ def test_item_d_route_predicate_five_counter_readings_on_every_arm() -> None:
     assert ragged_counts["tiled_041"] == 1
     assert ragged_counts["torch_fallback"] == 0
 
-    # THE FIRING CONTROL FOR `-093`'s READING, the other direction: a selection at or
+    # THE FIRING CONTROL FOR THE ROW-TILED COUNTER'S READING, the other direction: a selection at or
     # below the moving maximum must leave the row-tiled counter at 0, so the 1 above is
     # a response to the production row count and not a constant.
     reset_counters()
@@ -990,7 +990,7 @@ def test_item_d_route_predicate_five_counter_readings_on_every_arm() -> None:
 
 
 # =========================================================================== #
-# `inc-glm53f-100` -- MLA PER-RANK HEAD PARTITIONING. Three items, one per
+# MLA PER-RANK HEAD PARTITIONING. Three items, one per
 # conjunct of the plan block, added to THIS file because all three read the same
 # geometry, the same module builder and the same registered comparison pair the
 # items above already use.
@@ -1024,7 +1024,7 @@ PERRANK_UNEVEN_WORLD = 3
 def _patch_world(monkeypatch, world_size: int) -> None:
     """Run the module at a synthetic world size, at the resolver the code reads.
 
-    The same injection point `-094`'s load items use
+    The same injection point the shard geometry's load items use
     (``test_load_weights.py:3180``), so this file adds no second way to say
     "pretend there are two ranks".
     """
@@ -1102,7 +1102,7 @@ def _reset_projection_counters() -> None:
     THIS FILE DID NOT READ THEM BEFORE. `read_counters` above covers the sparse and
     absorb seams, which is what items (b) and (d) need; the PROJECTION seam's pair is
     what this increment's route predicate names, so it is taken explicitly here rather
-    than inherited. That gap is the one recorded against `-051` as §87 M1.
+    than inherited. That gap is the one recorded against an earlier increment as §87 M1.
     """
     from vllm_neuron.functional.attention import mla_projections
 
@@ -1219,7 +1219,7 @@ def test_perrank_widths_only_the_head_bearing_projections_narrow(monkeypatch) ->
     def widths() -> dict[str, tuple[int, int]]:
         return {name: (idim, odim) for name, idim, odim in module.projection_widths()}
 
-    # -- world size 1: byte-identical to what this file measured before -100.
+    # -- world size 1: byte-identical to what this file measured before this block.
     assert module._heads_per_rank() == DECLARED_HEADS
     at_one = widths()
     expected_one = {

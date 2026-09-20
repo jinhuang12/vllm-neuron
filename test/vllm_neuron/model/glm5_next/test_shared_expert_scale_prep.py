@@ -1,22 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Acceptance for `inc-glm53f-090` -- the kernel scale operand is built once.
+"""Acceptance for the kernel scale operand built once.
 
 **Five items, one per declared conjunct, and no ``parametrize`` decorator in this
 file** (campaign rule D1.2). Each item names the component whose behaviour it
 certifies (D1.4).
 
-WHY THIS FILE EXISTS. `inc-glm53f-026`'s dense bridge,
+WHY THIS FILE EXISTS. The dense bridge,
 ``to_kernel_scale_layout``, allocates and then scatters ONE ELEMENT AT A TIME
-(``blockwise_fp8_mm.py:340-342`` and ``:343-347``), and `-026`'s seam called it on
+(``blockwise_fp8_mm.py:340-342`` and ``:343-347``), and the dense seam called it on
 every entry. The shared-expert path enters that seam three times per call, so at
 this campaign's dense geometry the operand was rebuilt by hundreds of one-element
 device writes per shared-expert call, on every layer that takes the route, every
 forward step -- review finding B26-M2. A block scale never changes after a
-checkpoint load, so `-090` builds the operand once, at load time, and hands it to
+checkpoint load, so this increment builds the operand once, at load time, and hands it to
 the seam by keyword.
 
 THE READINGS ARE PIPE-DELIMITED AND PREFIXED ``SCALEPREP|``. That prefix is this
-file's own: `-088`'s readings are bracketed (``[label]``) and `-089`'s carry
+file's own: the landed readings are bracketed (``[label]``) or carry
 ``PRODUCTION|``, and an extractor written for either would read zero here and a
 round that predicted zero would pass while proving nothing.
 
@@ -73,7 +73,7 @@ def _impl():
 
     This package's uniform convention (``test_experts.py:110-120``,
     ``test_kv_spec.py:157-161``). ``test_factory.py``'s C03 no longer measures the
-    session -- `inc-glm53f-031` repaired it to a subprocess -- so a module-level
+    session -- a repair moved it to a subprocess -- so a module-level
     import here would break nothing; the convention is kept because it costs four
     lines and a file that departs from it reads like an oversight. The functional
     imports above are NOT this module and stay at the top.
@@ -91,7 +91,7 @@ def _impl():
 # times per case inside the declared 60-second timeout. The production geometry
 # is recorded as a READING instead (the scatter count it implies), so the record
 # carries what the repair is worth without the test paying for it.
-# `inc-glm53f-112` narrowed SCALE_BLOCK_SIZE from 256 to 128. The extent is held
+# A later round narrowed SCALE_BLOCK_SIZE from 256 to 128. The extent is held
 # at 512 on purpose, so this file keeps testing the same geometry it did at 256;
 # `4 * SCALE_BLOCK_SIZE` is derived rather than typed.
 HIDDEN = 4 * SCALE_BLOCK_SIZE  # H = 512, four whole 128 blocks
@@ -99,7 +99,7 @@ INTERMEDIATE = 4 * SCALE_BLOCK_SIZE  # I = 512, four whole 128 blocks
 TOKENS = TILE_SIZE  # T = 128, a whole number of TILE_SIZE rows
 FP8 = torch.float8_e4m3fn
 
-#: The dense geometry the review priced, from `-022` part 1's shape 1
+#: The dense geometry the review priced, from part 1's shape 1
 #: `moe288-top8` (``increments/evidence-022-part1.md:105``). Used ONLY to record
 #: how many one-element scatters the repair removes per shared-expert call.
 PRODUCTION_HIDDEN = 4096
@@ -130,7 +130,7 @@ def _fixture(seed: int = 0):
 
     The SwiGLU bound is left at the config's own default deliberately: no reading
     in this file measures it, and both arms of every differential below share
-    whatever it is, so the bound cannot influence a single comparison. `-033`
+    whatever it is, so the bound cannot influence a single comparison. The shared-expert path
     owns that value and its provenance test.
     """
     from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
@@ -199,7 +199,7 @@ def _withhold_at_the_seam(monkeypatch: pytest.MonkeyPatch) -> None:
     THE CONTROL, and its shape is the point. ``shared_expert_mm`` imports the
     seam function-locally, so replacing the module attribute replaces what the
     three call sites reach. The replacement forwards every argument EXCEPT
-    ``prebuilt_scale_t``, which is exactly the pre-`-090` call form -- so the
+    ``prebuilt_scale_t``, which is exactly the call form before this increment -- so the
     control exercises the same three dispatches over the same operands and
     differs in one thing only: who builds the scale operand.
 
@@ -230,7 +230,7 @@ def test_the_seam_builds_no_scale_operand_per_forward_step(
 ) -> None:
     """B26-M2 remedy (i): count layout builds per forward step.
 
-    Certifies (D1.4): ``to_kernel_scale_layout`` and `-090`'s build counter.
+    Certifies (D1.4): ``to_kernel_scale_layout`` and its build counter.
     """
     print(
         "SCALEPREP|conjunct1_per_forward_build_count"
@@ -410,12 +410,12 @@ def test_both_named_refusals_fire_by_name() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# CONJUNCT 4 -- `-026`'s landed acceptance, re-run whole and unchanged.        #
+# CONJUNCT 4 -- the landed dense acceptance, re-run whole and unchanged.       #
 # --------------------------------------------------------------------------- #
 def test_the_landed_dense_seam_acceptance_still_passes_whole() -> None:
-    """The default path is unchanged, so `-026`'s own suite needs no edit.
+    """The default path is unchanged, so the dense half's own suite needs no edit.
 
-    Certifies (D1.4): `-026`'s landed acceptance, ``test_blockwise_fp8_mm.py``.
+    Certifies (D1.4): the dense half's landed acceptance, ``test_blockwise_fp8_mm.py``.
 
     The item count is READ from the run and printed, never restated here: a
     number written into this file could agree with a suite that had silently
@@ -423,7 +423,7 @@ def test_the_landed_dense_seam_acceptance_still_passes_whole() -> None:
     """
     print(
         "SCALEPREP|conjunct4_landed_suite"
-        "|certifies=inc-glm53f-026's landed acceptance, re-run whole"
+        "|certifies=the dense half's landed acceptance, re-run whole"
     )
     target = (
         Path(__file__).resolve().parents[3]
@@ -466,11 +466,11 @@ def test_the_route_predicate_counts_one_dispatch_and_no_fallback_per_call() -> N
     """An operand moved to load time that stopped reaching the kernel would
     satisfy every exact reading above. This is the reading that would break.
 
-    Certifies (D1.4): the ``wrap_nki`` seam `-026` authors.
+    Certifies (D1.4): the ``wrap_nki`` seam the dense half authors.
     """
     print(
         "SCALEPREP|conjunct5_route_predicate"
-        "|certifies=the wrap_nki seam inc-glm53f-026 authors"
+        "|certifies=the wrap_nki seam the dense half authors"
     )
     module, operands = _fixture()
     module.prepare_scale_operands(

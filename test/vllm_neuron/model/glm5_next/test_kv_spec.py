@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""``inc-glm53f-013`` acceptance -- WP1: model skeleton and ``KVSpec``.
+"""Acceptance -- WP1: model skeleton and ``KVSpec``.
 
 THE DECLARED ACCEPTANCE (increment plan revision 12, L3589), verbatim:
 
@@ -37,17 +37,17 @@ and by C01's total the count is arithmetic. So the 34 entries are certified as
 They are still **not** certified as describing a correct KDA cache. That
 conclusion is unchanged; only its ground has moved. When this file landed the
 ground was that the pin's ``LayerSpec`` had no vocabulary for a recurrent state
-at all -- **history now**, true at ``-013`` and ended by ``inc-glm53f-015``,
+at all -- **history now**, ended by the pin-widening,
 which appended the four KDA state fields. The ground today is that the
 vocabulary exists but **nothing in this file populates or certifies its
-contents**: filling those fields per layer is ``-016``'s and ``-017``'s work,
+contents**: filling those fields per layer is the runner's work,
 so the coverage limit survives the widening instead of evaporating with it.
 C03's **34** does not move -- the widening is additive with ``None`` defaults,
 so no entry's geometry split, ``head_size`` or ``dtype`` changes.
 
 :func:`test_kv_spec_the_pin_dataclass_is_not_widened` is **superseded** by that
 increment and now measures the opposite of its own name: the pin's six survive
-as an in-order PREFIX at arity ten, with ``-015``'s four declared fields as the
+as an in-order PREFIX at arity ten, with the widening's four declared fields as the
 tail. The name is kept byte-unchanged because it is the item id this file's
 landed acceptance collects.
 
@@ -64,11 +64,11 @@ asserts that derivation as an exact set equality against
 fail. That is not an acceptance conjunct -- C01-C04 are unchanged -- it is the
 ruling's derivation made mechanical.
 
-``inc-glm53f-082`` is the THIRD writer here (after ``-013``'s creation and
-``-015``'s pin-widening guard), declared in the plan's ``§9`` row for this file.
+The family-map change is the THIRD writer here (after this file's creation and
+the pin-widening guard), declared in the plan's ``§9`` row for this file.
 It adds four counted items -- one per declared parameter-name family -- and
 repairs one attribute access onto the stable ``.attention`` property. It owns no
-KV-geometry census item, and ``-013``'s four counted values (45 / 11 / 34 / 0)
+KV-geometry census item, and the file's four counted values (45 / 11 / 34 / 0)
 do not move.
 
 FALSIFIABILITY
@@ -149,9 +149,9 @@ PIN_LAYER_SPEC_FIELDS = (
     "chunk_size",
 )
 
-#: The six fused KDA names ``inc-glm53f-078`` retired, listed so ``-082``'s
+#: The six fused KDA names a later reading retired, listed so this file's
 #: KDA item can count SURVIVALS of them rather than assert a bare absence.
-#: These are the ONLY literal names ``-082`` types on an expectation side; every
+#: These are the ONLY literal names the family-map change types on an expectation side; every
 #: count below is derived from the landed map inside the test body.
 RETIRED_KDA_FUSED_NAMES = (
     "in_proj_qkvz_weight",
@@ -162,11 +162,11 @@ RETIRED_KDA_FUSED_NAMES = (
     "conv1d_bias",
 )
 
-#: The provisional DSA indexer name ``-078`` retired for ``wq_b_weight``.
+#: The provisional DSA indexer name a later reading retired for ``wq_b_weight``.
 RETIRED_DSA_INDEXER_NAME = "wq_weight"
 
-#: ``-013``'s two layer-level names, read here only to ISOLATE the mHC leaves
-#: from the map's layer-level set. Their count is not a ``-082`` reading.
+#: The two landed layer-level names, read here only to ISOLATE the mHC leaves
+#: from the map's layer-level set. Their count is not a family-map reading.
 LANDED_LAYER_LEVEL_LAYERNORMS = (
     "input_layernorm_weight",
     "post_attention_layernorm_weight",
@@ -247,7 +247,7 @@ def _kda_entries(spec: KVSpec) -> list[LayerSpec]:
 def _map_leaves(names: set[str], prefix: str) -> set[str]:
     """Leaf names in ``names`` sitting DIRECTLY under ``prefix``, no deeper.
 
-    ``inc-glm53f-082``'s helper. The "no deeper" rule is what separates an
+    The "no deeper" rule is what separates an
     attention module's own leaves from its ``indexer`` submodule's, so the two
     families can be counted independently out of one map.
     """
@@ -291,23 +291,23 @@ def test_kv_spec_fixture_is_the_pinned_forty_five_layer_config(raw: dict) -> Non
 
 
 def test_kv_spec_the_pin_dataclass_is_not_widened() -> None:
-    """SUPERSEDED by ``inc-glm53f-015``: the pin's SIX survive as a PREFIX.
+    """SUPERSEDED: the pin's SIX survive as a PREFIX.
 
     This guard's landed docstring named its own retirer -- *"it proves this
-    increment did not widen ``LayerSpec``, which is ``inc-glm53f-015``'s
+    increment did not widen ``LayerSpec``, which is the next increment's
     declared surface at M1"* -- and that increment has now landed, so it
     retires the guard inside its own changeset rather than leave a landed test
     red. What the guard exists to catch is KEPT and gains a count: a rename, a
     reorder or a removal of the pin's six still fails the prefix assertion.
     The other half of the old reading -- *"there is no recurrent-state field
-    for a KDA entry to fill"* -- is what ``-015`` makes false BY DESIGN, so it
+    for a KDA entry to fill"* -- is what the widening makes false BY DESIGN, so it
     is INVERTED into two positive counted statements (arity ten, and the four
     declared KDA state fields as the tail in order) rather than deleted. The
-    6-argument construction below is ``-015``'s own "0 signature breaks"
+    6-argument construction below is the widening's own "0 signature breaks"
     conjunct, preserved here as landed bytes.
 
     The function NAME is deliberately byte-unchanged: it is the item id this
-    file's landed ``-013`` acceptance command collects, and renaming it would
+    file's landed acceptance command collects, and renaming it would
     silently change that collected set to buy a more accurate label.
 
     The arity reading is eleven since a fifth field was appended, the latent
@@ -479,7 +479,7 @@ def test_kv_spec_the_counts_follow_the_schedule_and_not_a_constant(raw: dict) ->
 def test_kv_spec_every_entry_name_is_unique_and_family_tagged(spec: KVSpec) -> None:
     """45 distinct names, each carrying its family's module path.
 
-    ``inc-glm53f-016`` (M1) has to split the runner's spec dict **34 KDA / 11
+    The runner (M1) has to split its spec dict **34 KDA / 11
     DSA** by *"the model's layer names"*, so the names must distinguish the
     families rather than merely being unique.
     """
@@ -689,35 +689,35 @@ def _stub_markers(source: str) -> tuple[list[int], list[int]]:
 def test_kv_spec_every_compute_site_is_a_stub(model) -> None:
     """Every compute site COMPUTES -- the census this node id names has inverted.
 
-    ``inc-glm53f-054a`` implemented the last seven raising forwards in
+    A later increment implemented the last seven raising forwards in
     ``model_fp8.py``, so the property this test measured no longer exists to
     measure. The reading is inverted rather than deleted: the same eleven forwards
-    are still walked, in ``inc-glm53f-051``'s source-reading form, and each must now
+    are still walked, in the same source-reading form, and each must now
     carry NO stub sentence and raise no ``NotImplementedError``; the module-wide
     sentence count must be 0. All three readings are taken off the parse tree, so a
     comment or a docstring that NAMES either marker cannot fail them (:func:`_stub_markers`).
 
     THE NODE ID IS KEPT ON PURPOSE, though the name now reads backwards. 108 files
-    in this campaign's records join on this node id -- the increment plan, ``-013``'s
-    own acceptance transcripts and the ``-051``, ``-056``, ``-057`` and ``-101``
+    in this campaign's records join on this node id -- the increment plan, this file's
+    own acceptance transcripts and four later increments'
     acceptance runs among them -- and renaming it would break every one of those
     joins to buy a truer sentence. The docstring carries the correction instead.
 
-    ``inc-glm53f-013``'S SUBSTRATE GROUND NO LONGER HOLDS, disclosed here and not
+    THE LANDED SUBSTRATE GROUND NO LONGER HOLDS, disclosed here and not
     quietly dropped. ``evidence-013.md:30`` grounds that block's NON-KERNEL-CLASS
     declaration on the rationale *"module tree and cache-spec declaration; every
     compute site is a stub"*, and after this increment not one of the seven is.
-    ``-013``'s landed record is NOT re-opened -- a later increment does not edit a
-    landed acceptance -- and ``-054a`` carries its own NON-KERNEL-CLASS declaration
+    The landed record is NOT re-opened -- a later increment does not edit a
+    landed acceptance -- and that increment carries its own NON-KERNEL-CLASS declaration
     on its own rationale: it composes numeric paths each separately declared at
-    ``-025``...``-050`` and writes no kernel of its own.
+    earlier increments and writes no kernel of its own.
     """
     impl = _impl()
     # ---- THE WALK. The same eleven forwards this census has always reached, in the
-    # same access form. Seven were implemented by ``inc-glm53f-054a`` and four by
-    # ``inc-glm53f-038a`` and ``inc-glm53f-051`` before it, and the walk keeps them
+    # same access form. Seven were implemented by a later increment and four by
+    # earlier increments before it, and the walk keeps them
     # together because the reading is now the same for all eleven. ``.attention``
-    # rather than a family attribute name: ``inc-glm53f-082`` moved the KDA module
+    # rather than a family attribute name: the KDA module has moved
     # onto the map's ``self_attn`` path, and the property is the access that survives
     # such a move.
     walked = [
@@ -736,7 +736,7 @@ def test_kv_spec_every_compute_site_is_a_stub(model) -> None:
     assert len(walked) == 11, f"the walk drifted to {len(walked)} modules"
 
     # ---- THE SEVEN ARE NAMED, and the names are checked against the tree rather
-    # than trusted. This is the plan's own Surface census for ``inc-glm53f-054a``
+    # than trusted. This is the plan's own Surface census for the seven
     # (increment plan, the block's Surface bullet), and the tree is what has to
     # produce them: a class the tree stopped instantiating would leave this list
     # unread and the census silently narrower.
@@ -753,12 +753,12 @@ def test_kv_spec_every_compute_site_is_a_stub(model) -> None:
     missing = sorted(set(seven) - reached)
     assert not missing, (
         f"this fixture's tree instantiates none of {missing}, so the census cannot "
-        f"read the forwards inc-glm53f-054a implemented"
+        f"read the forwards that were implemented"
     )
 
-    # ---- THE READING, in ``inc-glm53f-051``'s form: an implemented forward carries
+    # ---- THE READING, in the same source-reading form: an implemented forward carries
     # no stub sentence and raises no ``NotImplementedError`` anywhere in its body.
-    # Read off the SOURCE rather than by calling, for the reason ``-051`` recorded:
+    # Read off the SOURCE rather than by calling, for the reason already recorded:
     # this fixture's model is an unmaterialised skeleton whose parameters are all
     # ``None``, so a real call cannot reach the numerics, and a ``TypeError`` from a
     # missing argument is equally true of a working forward and of a stub whose
@@ -799,7 +799,7 @@ def test_kv_spec_every_compute_site_is_a_stub(model) -> None:
     _, module_sentence_lines = _stub_markers(inspect.getsource(impl))
     sentences = len(module_sentence_lines)
     _record(stub_sentences_in_module=sentences)
-    # The two keys ``inc-glm53f-013``'s acceptance script reads out of this item's
+    # The two keys the acceptance script reads out of this item's
     # JSON sink (``accept-013-r1-host.sh:84``) are still written, so that record's
     # join survives the inversion; both now report the emptied census.
     _record(stub_forwards_asserted=0)
@@ -859,7 +859,7 @@ def test_kv_spec_every_compute_site_is_a_stub(model) -> None:
 def test_kv_spec_the_tree_carries_every_d14_section_name(model) -> None:
     """D14's table names the sections later increments scope against.
 
-    ``-013`` is the creator of a coordinated merge point, so every name in
+    This increment is the creator of a coordinated merge point, so every name in
     that table must exist when this increment lands, or eleven later
     increments have no declared scope to write into.
     """
@@ -877,7 +877,7 @@ def test_kv_spec_the_tree_carries_every_d14_section_name(model) -> None:
     assert isinstance(model.model.layers[0], impl.Glm5NextKDALayer)
     assert isinstance(model.model.layers[3], impl.Glm5NextDSALayer)
     assert isinstance(model.model.layers[3].self_attn, impl.Glm5NextMLAAttention)
-    # THE INDEXER'S PATH IS HELD HERE because `inc-glm53f-051` retired its stub arm
+    # THE INDEXER'S PATH IS HELD HERE because the DSA layer retired its stub arm
     # from the census above, and that arm was the only place in this file that reached
     # it. Asserted rather than merely mentioned: an attribute path no test resolves is
     # a path a later refactor can rename for free.
@@ -939,7 +939,7 @@ def test_kv_spec_the_map_comparison_is_proved_live(model) -> None:
 
 
 def test_kv_spec_the_quantised_flag_does_not_move_the_param_name_side(model) -> None:
-    """AMENDED by ``inc-glm53f-085``: the flag ADDS exactly the 44 scale names.
+    """AMENDED: the flag ADDS exactly the 44 scale names.
 
     THE NAME IS KEPT BYTE-UNCHANGED because it is the item id this file's landed
     acceptance collects -- the same reason
@@ -951,7 +951,7 @@ def test_kv_spec_the_quantised_flag_does_not_move_the_param_name_side(model) -> 
     projection were bound to ONE weight parameter, so 44 DSA weight parameters
     carried a two-key list and the parameter side could not move with the flag.
     The loader's default refuses more than one slice, so as landed the scale
-    reached no arithmetic -- that binding is the defect ``inc-glm53f-085``
+    reached no arithmetic -- that binding is the defect this amendment
     repairs, and once each scale key has its own parameter the flag necessarily
     ADDS exactly the 44 scale-parameter names.
 
@@ -1043,7 +1043,7 @@ def test_kv_spec_the_tied_head_condition_mirrors_the_map(raw: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# ``inc-glm53f-082``: one counted item per declared parameter-name family.
+# One counted item per declared parameter-name family.
 #
 # The set equality above is the BINDING reading and it is family-blind -- it
 # passes or fails on the whole map at once. These four say WHICH family moved,
@@ -1057,7 +1057,7 @@ def test_kv_spec_the_tied_head_condition_mirrors_the_map(raw: dict) -> None:
 def test_kv_spec_kda_attention_declares_the_maps_fifteen_leaf_names(model) -> None:
     """The KDA half's declared names ARE the map's, per module and per path.
 
-    ``inc-glm53f-078`` measured fifteen ``self_attn.*`` leaves off the published
+    A later reading measured fifteen ``self_attn.*`` leaves off the published
     checkpoint index where the skeleton had eight fused ones. This reads the
     leaf set out of the map's own keys, so the expectation cannot drift from the
     authority it is quoting.
@@ -1215,7 +1215,7 @@ def test_kv_spec_both_layer_classes_declare_the_maps_mhc_names_flat(model) -> No
 def test_kv_spec_mla_attention_names_are_unchanged_and_match_the_map(model) -> None:
     """A MEASURED NEGATIVE: the MLA names already agreed and still do.
 
-    ``inc-glm53f-082`` writes no line in this class. The item exists so "the
+    The family-map change writes no line in this class. The item exists so "the
     fourth family needed nothing" is a reading off the instrument rather than a
     claim in a record.
     """

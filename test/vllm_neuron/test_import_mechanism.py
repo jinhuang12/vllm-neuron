@@ -1,4 +1,4 @@
-"""Arm 2 of ``inc-glm53f-001``: D15's test-import mechanism, measured at the pin.
+"""Arm 2: D15's test-import mechanism, measured at the pin.
 
 Read-and-record under D1.3. Every reading is taken inside this collected body, in
 the pytest process itself -- no subprocess and no ``sys.modules`` manipulation --
@@ -21,7 +21,7 @@ from typing import Any
 
 import pytest
 
-#: D3's literal -- the same one ``inc-glm53f-005`` item 5 guards.
+#: D3's literal -- the same one the registry's item 5 guards.
 DECLARED_TOLERANCE_MAP = {
     "5": (1e-5, 0.011),
     "50": (1e-5, 0.02),

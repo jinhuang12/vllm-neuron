@@ -44,7 +44,7 @@ than demanded. Each target lives only in its own constructed child dict: none is
 exported to a shell and none reaches a compiling run, which would point the
 compiler at the wrong architecture.
 
-REPAIRED BY ``inc-glm53f-014``'s R2 ROUND, for finding
+REPAIRED BY THE R2 ROUND, for finding
 ``B07-M1-014-import-time-coverage-unmeasured``. The review's point was that the two
 original readings gave the same answer whether the clamp resolves once at import
 or on every access, so the file claimed a coverage it did not measure. Three things
@@ -60,10 +60,10 @@ changed:
   a ``trn3`` child in the same arm and asserts the two differ, so the pin is
   falsified by a pair the arm builds rather than by an inherited value. The old form
   asserted the parent carried ``trn2`` and therefore could not run at all on a trn3
-  machine -- which blocked ``inc-glm53f-001``'s trn3 reading.
+  machine -- which blocked the trn3 reading.
 * **The conftest mechanism is now asserted** (arm 4). The finding's second half
   recorded that nothing in the tree exercised ``test/conftest.py``'s pre-collection
-  check. It is exercised here, in its post-``-001`` form: the two variables are
+  check. It is exercised here, in its form after the first arm: the two variables are
   DEFAULTED when unset, a caller's value is kept, and one explicit contradiction is
   refused.
 * **The recorded origin is asserted too**, on the lead's design call N7. Defaulting
@@ -259,7 +259,7 @@ def test_override_trn3_resolves_clamp_to_448(pytestconfig: pytest.Config) -> Non
 
     The parent's resolved target is RECORDED, not demanded. The old form asserted
     the parent carried ``trn2`` and so reddened this whole file on a trn3 machine,
-    which is the reading ``inc-glm53f-001`` needed and could not take. Both children
+    which is the reading the first arm needed and could not take. Both children
     are built here, so the arm's claim -- that the clamp moves with the target -- is
     settled by a comparison it makes itself and does not depend on what invoked it.
     """
@@ -348,7 +348,7 @@ def test_conftest_defaults_the_two_variables_and_refuses_one_contradiction(
     Nothing in this tree asserted ``test/conftest.py``'s pre-collection check. Three
     child collections cover the three things it does (``test/conftest.py:83-105``):
     default an unset variable, keep a supplied one, and refuse ``VLLM_NEURON_CPU_MODE``
-    set to anything but ``1``. The middle case is the one the pre-``inc-glm53f-001``
+    set to anything but ``1``. The middle case is the one the earlier
     gate refused outright, so it is asserted to SUCCEED.
 
     AND IT ASSERTS THE RECORDED ORIGIN, not just the value. Once the two variables are

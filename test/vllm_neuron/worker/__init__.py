@@ -11,6 +11,6 @@ instead of the 0-byte ``test/vllm_neuron/__init__.py`` overlay.
 
 Remove this file and the walk stops at ``test/`` instead, which puts the overlay
 first on ``sys.path`` and makes every ``vllm_neuron.vllm.worker`` import here
-fail. ``inc-glm53f-016`` is the first increment on this import path, so the
+fail. This is the first increment on this import path, so the
 chain cost is owed and paid here.
 """

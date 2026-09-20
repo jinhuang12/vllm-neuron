@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Acceptance test for ``inc-glm53f-011`` -- WP1: the weight-loader skeleton.
+"""Acceptance test for WP1: the weight-loader skeleton.
 
 The declared acceptance (increment plan revision 10, L3194), verbatim:
 
     "against a synthetic 3-shard fake index built with ``hf_state_to_fake_slices``
-    (``inc-glm53f-002``), the loader maps **100% of HF keys with 0 unmatched and
+    (the fake-index helper), the loader maps **100% of HF keys with 0 unmatched and
     0 duplicated**, and reports a per-shard count summing exactly to the
     fixture's key count."
 
@@ -20,7 +20,7 @@ cosmetic: the declared invocation filters with ``-k skeleton``, and a ``-k``
 expression that matches *some* tests exits 0 while silently shrinking the run --
 a total miss exits 5 and is caught, a partial miss is not. The two collected-item
 counts (filtered and unfiltered) are recorded in this increment's evidence record
-so a dropped conjunct cannot hide. ``inc-glm53f-012`` later adds this file's
+so a dropped conjunct cannot hide. A later section adds this file's
 numerics partition, selected by its own ``-k`` expression; no *test name* here
 contains that expression, so the two partitions stay disjoint. (``-k`` matches
 item keywords -- module, class, function and marker names -- not docstrings, so
@@ -161,7 +161,7 @@ def _hf_keys_for_layer(
     keys = ["input_layernorm.weight", "post_attention_layernorm.weight"]
 
     # Multi-hyper-connections: six bare tensors on every layer of the real stack.
-    # inc-glm53f-078 -- declared ABSENT before the real index was on disk.
+    # Declared ABSENT before the real index was on disk.
     keys += [
         "hc_attn_base",
         "hc_attn_fn",
@@ -172,7 +172,7 @@ def _hf_keys_for_layer(
     ]
 
     if is_dsa:
-        # inc-glm53f-078: only these four carry a scale companion.
+        # Only these four carry a scale companion.
         for leaf in ("q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "o_proj"):
             keys += [f"self_attn.{leaf}.weight", f"self_attn.{leaf}.{SCALE_SUFFIX}"]
         keys += [
@@ -180,7 +180,7 @@ def _hf_keys_for_layer(
             "self_attn.q_a_layernorm.weight",
             "self_attn.kv_a_layernorm.weight",
         ]
-        # inc-glm53f-078: wq_b not wq, no indexer scales, plus the three leaves
+        # wq_b not wq, no indexer scales, plus the three leaves
         # nothing mapped before.
         keys += [
             "self_attn.indexer.wq_b.weight",
@@ -192,7 +192,7 @@ def _hf_keys_for_layer(
             "self_attn.indexer.index_kpool_compress_gate",
         ]
     else:
-        # inc-glm53f-078: the KDA family is 15 self_attn leaves and no scales,
+        # The KDA family is 15 self_attn leaves and no scales,
         # not the qwen3_next linear_attn convention this file first guessed.
         for leaf in (
             "q_proj",
@@ -242,7 +242,7 @@ def _non_layer_hf_keys(*, tie_word_embeddings: bool) -> list[str]:
 
 
 #: The module-tree prefix ``hf_state_to_fake_slices`` applies, and the
-#: checkpoint prefix the real index actually uses (``inc-glm53f-078``).
+#: checkpoint prefix the real index actually uses.
 MODULE_PREFIX = "model."
 CKPT_PREFIX = "model.language_model."
 
@@ -300,7 +300,7 @@ def _build_slice_map(cfg: Glm5NextTextConfig) -> dict[str, FakeSafeSlice]:
             n_shared=cfg.n_shared_experts,
         )
         raw.update(hf_state_to_fake_slices(_fake_state(layer_keys), layer_id))
-    # inc-glm53f-078: the helper qualifies into the module namespace, the real
+    # The helper qualifies into the module namespace, the real
     # checkpoint is one namespace over. Rewriting is injective on this key set
     # (asserted), so the count cannot change under it.
     slice_map = {_into_checkpoint_namespace(key): sl for key, sl in raw.items()}
@@ -439,7 +439,7 @@ def test_skeleton_unmatched_counters_can_report_nonzero(
     all_keys = list(slice_map)
 
     # (a) drop one checkpoint key the mapping asks for -> unmatched parameter.
-    # inc-glm53f-078 re-namespaced the checkpoint side; the parameter name below
+    # The real index re-namespaced the checkpoint side; the parameter name below
     # is unchanged, which is exactly the split this literal now demonstrates.
     dropped = "model.language_model.layers.3.mlp.shared_experts.down_proj.weight"
     assert dropped in slice_map, "fixture no longer holds the key this arm drops"
@@ -499,7 +499,7 @@ def test_skeleton_duplicate_is_certified_by_the_loader_not_the_fixture(
     Leg 2: the pin's own flattened ``{key: file}`` dict silently loses it.
     Leg 3: the loader reports it, and raises under ``strict``.
     """
-    # inc-glm53f-078: layer 0 is KDA, and the KDA family's real output projection
+    # Layer 0 is KDA, and the KDA family's real output projection
     # is ``self_attn.o_proj`` in the checkpoint namespace.
     duplicated = "model.language_model.layers.0.self_attn.o_proj.weight"
     assert duplicated in slice_map
@@ -594,12 +594,12 @@ def test_skeleton_key_families_are_all_tagged() -> None:
     """Every declared family carries a provenance tag, and absences are named."""
     assert KEY_FAMILY_PROVENANCE
     assert set(KEY_FAMILY_PROVENANCE.values()) <= {GROUNDED, PROVISIONAL}
-    # inc-glm53f-078 re-tagged both: each leaf is now a name the published index
+    # Both were re-tagged: each leaf is now a name the published index
     # itself carries, measured rather than guessed from a sibling architecture.
     assert {"dsa_indexer", "kda_linear_attention"} <= {
         name for name, tag in KEY_FAMILY_PROVENANCE.items() if tag == GROUNDED
     }
-    # inc-glm53f-078 removed multi_hyper_connections: the family is present in
+    # multi_hyper_connections was removed: the family is present in
     # the index and is now mapped, so declaring it absent would be false.
     assert set(ABSENT_KEY_FAMILIES) == {"vision_tower"}
     assert all(reason.strip() for reason in ABSENT_KEY_FAMILIES.values())
@@ -664,23 +664,23 @@ def test_skeleton_reports_the_measured_readings(coverage, shard_index, slice_map
 
 
 # =========================================================================== #
-# inc-glm53f-078 -- WP1 REPAIR: the real checkpoint index and config as fixtures
+# WP1 REPAIR: the real checkpoint index and config as fixtures
 # =========================================================================== #
 #
 # WHY THESE ITEMS ARE HERE AND NOT IN A NEW FILE
 # ----------------------------------------------
-# `inc-glm53f-078` is a SECOND WRITER on `inc-glm53f-011`'s `-k skeleton` side
-# (plan section 11 row A.1, partitioned by concern: `-011` owns the shard index
-# and the key map's shape, `-078` owns the checkpoint-key namespace and the
+# The real index is a SECOND WRITER on the skeleton items' `-k skeleton` side
+# (plan section 11 row A.1, partitioned by concern: the skeleton items own the shard index
+# and the key map's shape, the real index owns the checkpoint-key namespace and the
 # family names). Every item below carries `skeleton` and none carries
-# `fp8_downscale`, so `inc-glm53f-012`'s selection cannot collect them.
+# `fp8_downscale`, so a later section's selection cannot collect them.
 #
 # WHAT IS DIFFERENT ABOUT THEM
 # ----------------------------
 # Everything above runs on a 4-layer miniature this file authors. These eight
 # run on the REAL published checkpoint index -- 76,108 keys over 62 shards --
 # landed as `fixtures/model.safetensors.index.json`. That is the whole point of
-# the increment: `-011` wrote the key map against no checkpoint at all.
+# the increment: the skeleton items wrote the key map against no checkpoint at all.
 #
 # EIGHT ITEMS, ONE PER COUNTED CONJUNCT, NO PARAMETRIZE (section 6 rule 6), and
 # every denominator is DERIVED from the fixture rather than typed in, so a
@@ -1154,19 +1154,19 @@ def test_skeleton_real_fixtures_are_pinned_by_digest() -> None:
 
 
 # =========================================================================== #
-# inc-glm53f-012 -- WP1: block-fp8 scale loading with the 240-max downscale
+# WP1: block-fp8 scale loading with the 240-max downscale
 # =========================================================================== #
 #
 # THE `-k` PARTITION, AND WHY THIS SECTION IS APPENDED
 # ---------------------------------------------------
-# `inc-glm53f-011` owns `-k skeleton` above; this increment owns
+# The skeleton items own `-k skeleton` above; this increment owns
 # `-k fp8_downscale` below. Neither selection can collect the other's items, so
 # neither increment's counted predicate can be satisfied or broken by the other's
 # tests. Every test name below carries `fp8_downscale` and none carries
 # `skeleton`. The section -- imports included -- is appended rather than merged
 # into the header block for the same reason the module under test appends its own
 # half: the plan declares this increment's change a PURE ADDITION, and an insert
-# into the header moves every `-011` line below it.
+# into the header moves every landed line below it.
 #
 # THE DECLARED ACCEPTANCE (increment plan revision 12, L3582), verbatim:
 #
@@ -1191,7 +1191,7 @@ def test_skeleton_real_fixtures_are_pinned_by_digest() -> None:
 # block -- rather than a per-element relative comparison.
 #
 # It was also the only reading the tolerance could carry while the squeeze was the
-# range ratio, and that is worth keeping on the record because `inc-glm53f-054e`
+# range ratio, and that is worth keeping on the record because the exact-power-of-two squeeze
 # changed it. At 240/448 a squeezed byte cost up to 6.25% of its own magnitude
 # (e4m3 keeps three mantissa bits, so half the grid spacing is 1/16), so a
 # per-element reading was breached by construction: `byte 256.0 -> 144.0 -> 268.8`
@@ -1256,14 +1256,14 @@ FP8_DECLARED_CLAMP = 240.0
 #: (`dtype_utils.py:19`).
 FP8_OCP_MAX = 448.0
 
-#: `inc-glm53f-054e`'s factor pair: the largest power of two that fits 448 inside
+#: The squeeze factor pair: the largest power of two that fits 448 inside
 #: 240, and its exact inverse. PINNED here as literals rather than read from the
 #: module, so this file states the value the load path must hold instead of
 #: restating whatever it happens to hold. `weight_loaders_fp8.py:927,934`.
 FP8_054E_DOWNSCALE = 0.5
 FP8_054E_COMPENSATION = 2.0
 
-#: The pre-`-054e` factor, kept for TWO purposes, both controls: the failing control
+#: The superseded factor, kept for TWO purposes, both controls: the failing control
 #: that shows the exactness count discriminates between the two factors, and C1's
 #: two-way residual control.
 FP8_054E_RANGE_RATIO = FP8_DECLARED_CLAMP / FP8_OCP_MAX
@@ -1288,7 +1288,7 @@ FP8_ATOL = 1e-5
 FP8_BLOCK_SCALES = ((2.5e-3, 7.5e-4), (1.25e-2, 4.0e-4))
 
 #: The regression case's deliberately tiny scale, four orders below `MINVAL`
-#: even after the compensation has multiplied it up (`x 2` since `-054e`, and it
+#: even after the compensation has multiplied it up (`x 2` since the power-of-two squeeze, and it
 #: was four orders below at `x 448/240` too -- the case does not depend on which).
 FP8_TINY_SCALE = 1e-9
 
@@ -1299,7 +1299,7 @@ _FP8_RESULTS_PATH = Path(
     os.environ.get("VLLM_NEURON_INC012_RESULTS_JSON")
     or Path(tempfile.gettempdir()) / "vllm_neuron_inc012_predicates.json"
 )
-#: This partition's own results file, kept separate from `-011`'s so a reader of
+#: This partition's own results file, kept separate from the skeleton items' so a reader of
 #: either record cannot mistake one increment's measurements for the other's.
 #: Written lazily on the first record -- no import-time side effect -- and the
 #: first write replaces the whole file, so a stale value from an earlier run
@@ -1363,7 +1363,7 @@ def _054e_squeeze_and_restore(
 def _fp8_full_range_tile(variant: int) -> torch.Tensor:
     """One `[128,128]` fp32 tile holding EVERY representable OCP e4m3fn magnitude.
 
-    REBUILT BY ``inc-glm53f-012``'s r1 ROUND (batch R3), for finding
+    REBUILT BY A LATER SECTION'S r1 ROUND (batch R3), for finding
     ``B08-F2-fixture-misses-low-end-grid-understates-disclosed-error``. It used to be
     `torch.linspace(-448, +448, 16384)` cast to fp8, and its docstring claimed the
     cast collapsed those samples onto "essentially every representable magnitude".
@@ -1470,7 +1470,7 @@ def test_fp8_downscale_gate_follows_the_resolved_platform_clamp() -> None:
     measured with the gate TRUE rather than measured through a gate nobody
     checked.
 
-    The ruling's words are quoted as issued and are NOT edited here: `inc-glm53f-054e`
+    The ruling's words are quoted as issued and are NOT edited here: the load path
     later moved the factor from 240/448 to an exact `x 1/2`, so read "240/448" above
     as the factor at the time of the ruling. What the ruling settled -- that the
     squeeze is conditional on the resolved clamp -- is unchanged by that move, and
@@ -1504,7 +1504,7 @@ def test_fp8_downscale_fixture_is_full_range_and_block_shaped(
 
     Property 1: every tile's absolute maximum is the top of the OCP range. It used
     to be C1's -- block-normalised agreement was sensitive to it, a tile topping out
-    at 416 measuring 0.0308 against a 0.0300 tolerance. `inc-glm53f-054e` ended that
+    at 416 measuring 0.0308 against a 0.0300 tolerance. The power-of-two factor ended that
     sensitivity: at an exact `x 1/2` squeeze every block normalises to 0.0000044
     whatever its maximum. THE ASSERTION STAYS, and it is now Property 2's, one step
     stronger: 448 is not merely above 240, it is the furthest above, so the
@@ -1578,7 +1578,7 @@ def test_fp8_downscale_fixture_is_full_range_and_block_shaped(
     assert subnormals_present == subnormals.numel(), (
         f"only {subnormals_present} of {subnormals.numel()} subnormals are present; "
         f"the smallest subnormal is where the squeeze is worst per element, and since "
-        f"inc-glm53f-054e it is where the squeeze is TOTAL -- 2**-9 halves onto a tie "
+        f"the factor is an exact power of two it is where the squeeze is TOTAL -- 2**-9 halves onto a tie "
         f"and round-to-nearest-even sends it to zero, a 100% element error that only "
         f"a fixture holding that subnormal can ever disclose"
     )
@@ -1626,7 +1626,7 @@ def test_fp8_downscale_c1_dequantisation_agrees_per_block(
         for r in failed
     )
 
-    # NON-VACUITY, RE-ARGUED BY `inc-glm53f-054e`. The landed guard asserted
+    # NON-VACUITY, RE-ARGUED AT THE EXACT POWER OF TWO. The landed guard asserted
     # `max_abs_diff > atol` on every block: atol alone must not carry a block, or the
     # rtol term is not what passes them. That guard was right at 240/448 and it
     # INVERTS at an exact `x 1/2`, because the squeeze becomes exact and the residual
@@ -1766,7 +1766,7 @@ def test_fp8_downscale_c2_every_stored_byte_is_within_240(
     assert squeeze.max_abs_stored <= FP8_DECLARED_CLAMP
 
     # The stored maximum is EXACTLY 448 x the factor, so a squeeze that quietly
-    # over-shrank the bytes still shows up here. Until `-054e` that product was 240
+    # over-shrank the bytes still shows up here. Before the power-of-two squeeze that product was 240
     # and this line read "the bound is reached, not merely respected"; at an exact
     # `x 1/2` it is 224 and the bound is deliberately NOT reached -- 16 counts of
     # headroom under the clamp, which `assert ... <= FP8_DECLARED_CLAMP` above
@@ -1805,7 +1805,7 @@ def test_fp8_downscale_c3_no_scale_falls_below_minval(
 
     # The compensation is the exact inverse of the byte squeeze, and it is
     # applied to every tile -- not just to the tiles that needed clamping. Since
-    # `-054e` both halves are powers of two, so `x 0.5` then `x 2` is exact in fp32
+    # the squeeze is exact, both halves are powers of two, so `x 0.5` then `x 2` is exact in fp32
     # and this equality needs no tolerance at all.
     expected = fp8_downscale_scales * FP8_054E_COMPENSATION
     assert torch.equal(squeeze.scale_inv, expected)
@@ -2028,7 +2028,7 @@ def test_fp8_downscale_scale_loader_compensates_through_a_fake_slice(
     assert torch.equal(loaded, compensate_block_scales(fp8_downscale_scales).scale_inv)
     # The second reading is deliberately NOT function-derived -- it names the factor
     # independently, so a change to the module shows up here as a failure instead of
-    # following along silently. `-054e` moved it from `448/240` to an exact `x 2`.
+    # following along silently. The power-of-two squeeze moved it from `448/240` to an exact `x 2`.
     assert torch.equal(loaded, fp8_downscale_scales * FP8_054E_COMPENSATION)
     _record_fp8(loader_scale_grid=loaded.flatten().tolist())
 
@@ -2048,7 +2048,7 @@ def test_fp8_downscale_weight_loader_squeezes_through_a_fake_slice(
     assert loaded.dtype is torch.float8_e4m3fn
     assert tuple(loaded.shape) == FP8_WEIGHT_SHAPE
     dense = loaded.to(torch.float32)
-    # The squeezed maximum is 448 x the factor, which `-054e` moved from exactly 240
+    # The squeezed maximum is 448 x the factor, which the power-of-two squeeze moved from exactly 240
     # to 224. It is asserted against the DERIVED value and separately against the
     # bound, because "inside 240" and "equal to 240" stopped being the same claim:
     # the squeeze now leaves 16 counts of headroom under the clamp.
@@ -2088,7 +2088,7 @@ def test_fp8_downscale_quantization_spec_parses_the_block_config() -> None:
     assert spec.is_block_quantized
     # The lookup is uniform over both call shapes, in-block and outside.
     #
-    # `inc-glm53f-079` SUPERSEDED the two assertions that stood here. They said
+    # The checkpoint's skip list SUPERSEDED the two assertions that stood here. They said
     # `get_scheme(0, "linear_attn.out_proj")` and `get_scheme(None, "lm_head")`
     # were both block-FP8. Both are false against the real checkpoint --
     # `lm_head` is skip-listed and has no scale key, and `linear_attn.out_proj`
@@ -2150,15 +2150,15 @@ def test_fp8_downscale_reports_the_measured_readings(
 
 
 # =========================================================================== #
-# inc-glm53f-079 -- WP6 REPAIR: the checkpoint's FP8 skip list is honoured
+# WP6 REPAIR: the checkpoint's FP8 skip list is honoured
 # =========================================================================== #
 #
 # WHY THIS SECTION IS APPENDED AT THE END
 # ---------------------------------------
-# `inc-glm53f-079` is the FOURTH writer on this file (plan section 11 row A.1,
-# partitioned by pytest selection and by concern: `-011` owns the shard index and
-# the key map's shape, `-078` the checkpoint-key namespace and the family names,
-# `-012` the `-k fp8_downscale` numerics, and this increment whether a family asks
+# The checkpoint's skip list is the FOURTH writer on this file (plan section 11 row A.1,
+# partitioned by pytest selection and by concern: the skeleton items own the shard index and
+# the key map's shape, the real index the checkpoint-key namespace and the family names,
+# the later section the `-k fp8_downscale` numerics, and this increment whether a family asks
 # for a scale companion AT ALL). It appends rather than inserts, so it moves no
 # landed line of the three sections above it. Every item below carries `skeleton`
 # and none carries `fp8_downscale`, so the two selections stay disjoint.
@@ -2179,10 +2179,10 @@ def test_fp8_downscale_reports_the_measured_readings(
 # in `hf-config.json` -- against the checkpoint's ACTUAL scale keys -- presence
 # or absence of a `weight_scale_inv` companion in the 76,108-key index. Neither
 # side is computed from the other, both are vendor files this directory pins by
-# digest (`-078` conjunct (h)), and a predicate that answered one way for
+# digest (the real index's conjunct (h)), and a predicate that answered one way for
 # everything fails on one arm or the other.
 #
-# THE TWO NAMESPACES (`-078`)
+# THE TWO NAMESPACES
 # ---------------------------
 # The skip entries are MODULE-namespace (`model.layers.0.self_attn.q_proj`); the
 # index keys are CHECKPOINT-namespace (`model.language_model.layers.0...`). The
@@ -2225,7 +2225,7 @@ C079_DECLARED_SYNTHETIC_DROP = 126
 
 @pytest.fixture(scope="module")
 def real_raw_config() -> dict[str, Any]:
-    """The published config, parsed. `-078` landed the file; this reads it."""
+    """The published config, parsed. The file is a landed fixture; this reads it."""
     return json.loads(REAL_CONFIG_PATH.read_text())
 
 
@@ -2342,7 +2342,7 @@ def test_skeleton_config_lifts_the_skip_list_and_the_fp8_format(
     entry count is `len()` of the fixture's own list, and the format string is
     the fixture's own value. The declared numbers are asserted beside them as a
     cross-check that this is the file the plan measured -- legitimate only
-    because `-078` pins the fixture by the vendor's digest.
+    because this directory pins the fixture by the vendor's digest.
     """
     assert sorted(real_quant_config) == [
         "activation_scheme",
@@ -2507,7 +2507,7 @@ def test_skeleton_no_scale_companion_is_requested_for_a_bf16_tensor(
     measured with a token the real list does not carry, `shared_experts`, and the
     count it removes is derived from the config: one scale request per shared
     expert leaf on each MoE layer. Against the real list alone the counter cannot
-    fire, because `-078` already made every BF16 family structurally unquantised
+    fire, because an earlier section already made every BF16 family structurally unquantised
     in this builder -- so switching the real list off changes no request, and a
     control resting on it would prove nothing about this increment's predicate.
     """
@@ -2563,7 +2563,7 @@ def test_skeleton_no_scale_companion_is_requested_for_a_bf16_tensor(
 
 
 # =========================================================================== #
-# inc-glm53f-054e -- the squeeze factor is an EXACT POWER OF TWO
+# The squeeze factor is an EXACT POWER OF TWO
 # =========================================================================== #
 #
 # WHAT IT SETTLES. The load path squeezes fp8 bytes by 1/2 and multiplies the
@@ -2571,8 +2571,8 @@ def test_skeleton_no_scale_companion_is_requested_for_a_bf16_tensor(
 # counted number is the reason: `value -> squeeze -> fp8 -> compensate` is
 # BIT-EXACT for 118 of the 126 positive magnitudes at 1/2 and for 14 at the ratio.
 #
-# `-054e` is this file's FIFTH writer and it APPENDS, so it moves no landed line
-# above. Its one item carries `fp8_downscale` and not `skeleton`, joining `-012`'s
+# The power-of-two squeeze is this file's FIFTH writer and it APPENDS, so it moves no landed line
+# above. Its one item carries `fp8_downscale` and not `skeleton`, joining the later section's
 # numerics selection on purpose -- the factor is that partition's own subject, so
 # a `-k fp8_downscale` run that skipped it would read the numerics with the
 # premise missing.

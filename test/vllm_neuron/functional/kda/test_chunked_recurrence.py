@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Acceptance for `inc-glm53f-035a` -- the KDA intra-chunk NKI kernel.
+"""Acceptance for the KDA intra-chunk NKI kernel.
 
 **Four items under the ``-k intra`` selection, one per declared conjunct, and no
 ``parametrize`` decorator in this file** (D1.2). Each item names the component
-whose behaviour it certifies (D1.4). `-035b` extends this file under ``-k
+whose behaviour it certifies (D1.4). The inter-chunk section extends this file under ``-k
 inter``; the two selections are disjoint, so neither block's counted items can be
 satisfied or broken by the other's.
 
@@ -63,8 +63,8 @@ from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
 #: The declared case set, as the plan block's Acceptance bullet writes it:
 #: "chunk sizes ``{32, 64, 128}``, three cases". Cited rather than chosen here --
-#: the block is the single place those numbers are declared, and `-035b` and
-#: `-052` cite the same bullet instead of restating it.
+#: the block is the single place those numbers are declared, and later items
+#: cite the same bullet instead of restating it.
 CHUNK_SIZES = (32, 64, 128)
 
 #: The frozen comparator pair, from the plan block's conjunct 1: "at
@@ -134,7 +134,7 @@ def test_intra_chunk_kernel_matches_the_torch_intra_chunk_reference():
     ``Aqk`` -- against a torch reference that computes stages 1 to 3 and nothing
     downstream of them, at the frozen comparator, over 3/3 declared chunk sizes.
 
-    ``kg`` is asserted here as well although conjunct 1 names four values: `-035b`
+    ``kg`` is asserted here as well although conjunct 1 names four values: the inter-chunk section
     declares ``kg`` as a seam input, this is the only place it is measured, and
     an assertion can only fail if the kernel is wrong.
     """
@@ -306,7 +306,7 @@ def test_intra_chunk_route_predicate_reads_one_dispatch_per_declared_case():
 
 
 # =========================================================================== #
-# Acceptance for `inc-glm53f-035b` -- the KDA inter-chunk state carry and output.
+# Acceptance for the KDA inter-chunk state carry and output.
 #
 # **Three items under the ``-k inter`` selection, one per declared conjunct, and
 # still no ``parametrize`` decorator in this file** (D1.2). Each item names the
@@ -318,7 +318,7 @@ def test_intra_chunk_route_predicate_reads_one_dispatch_per_declared_case():
 # exactly the four items above and ``-k inter`` selects exactly the three below.
 #
 # Everything below is PURELY ADDITIVE. The module docstring is left alone because
-# it scopes itself to `-035a` in its own first sentence and already forecasts this
+# it scopes itself to the intra-chunk kernel in its own first sentence and already forecasts this
 # extension, and because the intra-chunk increment's evidence record cites this
 # file by line.
 #
@@ -609,13 +609,13 @@ def test_inter_chunk_state_responds_to_the_w_and_u_it_is_handed():
 
 
 # =========================================================================== #
-# Acceptance for `inc-glm53f-089` -- the geometry production actually resolves.
+# Acceptance for this: the geometry production actually resolves.
 #
 # **Four items under the ``-k production_geometry`` selection, one per declared
 # conjunct, and still no ``parametrize`` decorator in this file** (D1.2). Each
 # item names the component whose behaviour it certifies (D1.4).
 #
-# WHY THIS SECTION EXISTS. `-035a` measures at head width 64 over chunk sizes
+# WHY THIS SECTION EXISTS. The intra-chunk section measures at head width 64 over chunk sizes
 # ``{32, 64, 128}``. The landed KDA layer enters this seam at ``kdim = vdim =
 # 128`` and resolves chunk width **8**, so the one geometry production actually
 # runs was measured by nothing. This section adds that reading and CHANGES NO
@@ -623,16 +623,16 @@ def test_inter_chunk_state_responds_to_the_w_and_u_it_is_handed():
 # production values, so nothing was broken -- only unmeasured.
 #
 # THIS IS THE THIRD SECTION IN THIS FILE, AND THE SELECTION INVARIANT NOW HAS
-# THREE PARTS RATHER THAN TWO. `-035b`'s banner above states the invariant for
+# THREE PARTS RATHER THAN TWO. The inter-chunk banner above states the invariant for
 # the two sections that existed when it was written -- "every name below
 # contains ``inter``" -- and a third section appended after it makes that
 # sentence read wider than it was scoped. Its LOAD-BEARING claim is untouched
 # and is restated here for all three: no name in this section contains the
 # substring ``intra`` or the substring ``inter``, so ``-k intra`` still collects
-# exactly `-035a`'s four items, ``-k inter`` still collects exactly `-035b`'s
+# exactly the intra-chunk four items, ``-k inter`` still collects exactly the inter-chunk
 # three, and ``-k production_geometry`` collects exactly the four below. That is
 # checked by the acceptance harness, which reads all three counts, rather than
-# by this comment. `-035b`'s landed text is left alone deliberately: the
+# by this comment. The inter-chunk section's landed text is left alone deliberately: the
 # disjointness it protects still holds, and rewriting another block's comment is
 # a wider surface than adding a scoping paragraph to this one.
 #
@@ -654,7 +654,7 @@ def test_inter_chunk_state_responds_to_the_w_and_u_it_is_handed():
 # 4. the doubling-stage count at chunk 8 is 3 -- a count no graded run has read.
 #
 # NO COMPARATOR, TOLERANCE OR THRESHOLD IS INTRODUCED HERE (P9). Conjunct 2 uses
-# ``RTOL`` / ``ATOL`` above, which are `-035a`'s own landed pair; conjuncts 1, 3
+# ``RTOL`` / ``ATOL`` above, which are the intra-chunk section's own landed pair; conjuncts 1, 3
 # and 4 are exact readings with no tolerance at all.
 # =========================================================================== #
 
@@ -827,13 +827,13 @@ def test_production_geometry_values_are_read_from_the_fork_not_assumed():
 
 
 def test_production_geometry_numerics_match_the_chunk_local_reference():
-    """Conjunct 2, and the route predicate (D13 form R-2). Certifying component: the ``wrap_nki`` seam `-035a` authors.
+    """Conjunct 2, and the route predicate (D13 form R-2). Certifying component: the ``wrap_nki`` seam this increment authors.
 
     The seam's five returned values at the READ production geometry against the
-    torch chunk-local reference this file already carries, at `-035a`'s own frozen
+    torch chunk-local reference this file already carries, at the file's own frozen
     comparator. No new tolerance (P9).
 
-    THE ROUTE READING IS TAKEN AROUND THE SEAM CALL AND NOWHERE ELSE, on `-035b`'s
+    THE ROUTE READING IS TAKEN AROUND THE SEAM CALL AND NOWHERE ELSE, on the inter-chunk
     per-call convention: the reset happens immediately before the call and the read
     immediately after, before the reference is computed, so the reading belongs to
     this call. It must read exactly ``1`` dispatch -- :data:`N_CHUNKS` would mean a
@@ -900,7 +900,7 @@ def test_production_geometry_gate_bound_is_measured_against_the_declared_limit()
     * over the exact WORST CASE the checkpoint can produce -- every gate entry at
       ``gate_lower_bound`` -- which is where the derivation's number comes from.
 
-    Landed `-084` changed the gate to ``gate_lower_bound * sigmoid(...)`` and so
+    A landed item changed the gate to ``gate_lower_bound * sigmoid(...)`` and so
     raised the TYPICAL magnitude without moving the bound, which is exactly why
     this conjunct measures instead of assuming.
 

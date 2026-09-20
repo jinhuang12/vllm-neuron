@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""`inc-glm53f-023` acceptance — WP6 block-fp8 recognition (the dispatcher gap).
+"""Acceptance — WP6 block-fp8 recognition (the dispatcher gap).
 
-THE DECLARED PREDICATE (increment plan revision 29, block `#### inc-glm53f-023`),
+THE DECLARED PREDICATE (increment plan revision 29, this file's own block),
 quoted so nothing here can drift from it:
 
     the model resolves a block-fp8 method from `weight_block_size [128,128]` in
@@ -39,7 +39,7 @@ conjunct: each item drives a control that MOVES the reading when the property
 under test is false, and prints both sides.
 
 FIXTURE PROVENANCE: `fixtures/config.json`, the trimmed real checkpoint config
-pinned by `inc-glm53f-008` and digest-pinned again here, derives from
+pinned once and digest-pinned again here, derives from
 HuggingFace `zai-org/GLM-5.3-Flash` revision `04c4e9e9…`. Its
 `quantization_config` is the checkpoint's own — `quant_method "fp8"`,
 `activation_scheme "dynamic"`, `weight_block_size [128, 128]`. This file
@@ -91,7 +91,7 @@ REPO_ROOT = Path(__file__).resolve().parents[4]
 
 FIXTURE_PATH = Path(__file__).resolve().parent / "fixtures" / "config.json"
 
-#: Pinned by `inc-glm53f-008`; repeated so a silent fixture edit fails loudly
+#: Pinned with the fixture; repeated so a silent fixture edit fails loudly
 #: here too rather than moving a declared value.
 FIXTURE_SHA256 = "5ed24d23a3e14a038352e1bdc21fd25fc90ff2291d3f6a310acf5d4036665a1d"
 
@@ -438,7 +438,7 @@ def _vendor_enum_code_refs(source: str) -> int:
     """Count real CODE references to the vendor quantisation enum.
 
     AST-based, so a comment or docstring naming the prohibition is not a hit —
-    the `inc-glm53f-021` lesson, where a raw grep reported 2 hits that were both
+    the earlier lesson, where a raw grep reported 2 hits that were both
     prose. Counts `Name` loads of the enum and attribute chains rooted at it.
     """
     hits = 0

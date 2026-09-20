@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""DSA ragged pack and unpack -- an AUTHORED bf16 NKI kernel pair (`inc-glm53f-045`).
+"""DSA ragged pack and unpack -- an AUTHORED bf16 NKI kernel pair.
 
 WHAT THIS DOES. A ragged batch arrives padded: ``[batch, max_len, width]``, where sequence ``b``
 occupies only its first ``lengths[b]`` rows and the rest is padding. ``dsa_ragged_pack`` moves the
@@ -76,8 +76,8 @@ force a fresh trace per composition. This is the same compile-stability argument
 measured claim -- this increment's declared case set has no two patterns sharing a bucket, so it
 does not measure trace reuse and this file does not claim it.
 
-WHAT `-051` LATER SETTLED ABOUT THAT BUCKET, and it is a clarification of the sentence above rather
-than a new claim by this file. `-051` read the runner and found the bound is ``len(num_seqs_buckets)``
+WHAT A LATER READ SETTLED ABOUT THAT BUCKET, and it is a clarification of the sentence above rather
+than a new claim by this file. It read the runner and found the bound is ``len(num_seqs_buckets)``
 traces -- ONE PER SEQUENCE BUCKET, not one per batch composition -- because every request contributes
 the same number of tokens per decode step: one without speculative decoding
 (``vllm_neuron/vllm/worker/neuron_model_runner.py:3301``) and the same ``k`` with it, under the
@@ -87,12 +87,12 @@ buckets. Two consequences worth writing down. First, the compile-stability argum
 than it claimed: there is nothing left to bucket that the runner does not already bucket. Second,
 NOTHING IN THE FORK CAN PRESENT A NON-UNIFORM DECODE BATCH TODAY -- ``requires_padding``, upstream's
 own trigger for packing at all, appears in this fork only in two ``model_fp8.py`` docstrings and zero
-times in the runner. So this seam has no production caller yet, and `-051` recorded that as a
+times in the runner. So this seam has no production caller yet, and that read recorded it as a
 disclosure rather than writing a caller to make a landed seam look live. Evidence:
 ``increments/watch-item-051-trace-bound.md`` with ``probe-051-watch-item-trace-bound-r2.out``.
 
 WHY THE POSITION IOTA COMES IN AS A TENSOR. This NKI image has no ``nl.arange``, no ``nl.mgrid``
-and no ``nl.iota`` -- a fact `-044` measured on this pin. So a per-row position vector cannot be
+and no ``nl.iota`` -- a fact the landed gather measured on this pin. So a per-row position vector cannot be
 generated on device and is handed in. It is metadata, not payload.
 
 WHY ``bfloat16`` ONLY. It is the dtype this increment's substrate declaration names and the only
@@ -273,7 +273,7 @@ def _row_index(rows: int, pos, len_bc, inside, outside):
     broadcast form at both sizes.
 
     ``1 - valid`` is built as ``valid * -1 + 1`` rather than with a reverse-subtract op, because
-    ``nl.multiply`` and ``nl.add`` are both proven on this image by `-044`'s own kernel and a
+    ``nl.multiply`` and ``nl.add`` are both proven on this image by the landed gather's own kernel and a
     reverse-subtract is not. Two cheap proven ops beat one unproven one.
     """
     valid = nl.ndarray((rows, 1), dtype=nl.int32, buffer=nl.sbuf)
@@ -348,7 +348,7 @@ def _ragged_pack_nki(padded_hbm, pos_hbm, lengths_hbm, offsets_hbm, packed_len):
     # Zero the DENSE region before anything is scattered into it. Every one of its rows is written
     # exactly once by construction, so this is not needed for correctness -- it is needed so that
     # an indexing bug shows up as a zero row rather than as whatever the buffer happened to hold
-    # and might coincidentally match. `-044`'s kernel zeroes for the same reason. The trash region
+    # and might coincidentally match. The landed gather's kernel zeroes for the same reason. The trash region
     # is deliberately NOT zeroed: it is never read, and zeroing it would cost a pass over as much
     # memory again for no reading.
     n_dense_tiles = (packed_len + pmax - 1) // pmax
@@ -517,7 +517,7 @@ def _record_nki_dispatch(
     ``nki.framework.kernel.Kernel``, a FROZEN DATACLASS, and Dynamo refuses to reconstruct one --
     ``NotImplementedError: currently can't reconstruct arbitrary frozen dataclass instances``,
     raised in the installed ``torch/_dynamo/variables/user_defined.py`` at line 2096 and measured
-    on this image by `-044`'s capture probe, which saw it wrapped in
+    on this image by the landed gather's capture probe, which saw it wrapped in
     ``torch._dynamo.exc.InternalTorchDynamoError``. So neither kernel is a parameter here: the
     direction arrives as a ``str`` and the kernel is read as a module global, the same object the
     call site hands to ``wrap_nki`` on the line after this call. The fork's own fold obeys the same

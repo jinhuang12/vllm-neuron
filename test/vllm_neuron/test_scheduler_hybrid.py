@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""``inc-glm53f-021`` acceptance -- WP2: scheduler support for the hybrid window.
+"""Acceptance -- WP2: scheduler support for the hybrid window.
 
 THE DECLARED ACCEPTANCE, composed in full (Tier T, D1/D2):
 
@@ -17,7 +17,7 @@ fixture asserts a conv extent and the term would pin nothing.
 THREE COUNTED CONJUNCTS, one item each, no ``parametrize`` (section 6 rule 6).
 The block predates the D1.4/D1.5 declaration form, so each conjunct SUPPLIES its
 certifying component and a non-vacuity control that MOVES -- the accepted
-``-017``/``-019``/``-020`` precedent.
+precedent.
 
   1. **0 of 4 requests starved** over a 4-request ramp. PARENT: **3** starved
      (1 of 4 admitted). Certifying component: the Step 1.5 hybrid window plus
@@ -47,9 +47,9 @@ read ``page_size_padded`` / the mamba page size, whose mechanism and prohibition
 belong to the KV-spec increment that owns that field. This file asserts nothing
 about either, and asserts no page size.
 
-NOT SELF-REFERENTIAL. The 45 real specs come from the LANDED ``inc-glm53f-016``
+NOT SELF-REFERENTIAL. The 45 real specs come from the LANDED spec
 acceptance module's own helpers, so this file's construction and that
-increment's construction are the same one (the ``-017`` precedent). No spec
+increment's construction are the same one (the accepted precedent). No spec
 geometry is hand-written here.
 
 FALSE-PASS DOOR, CLOSED. Admission is read AT THE DELEGATE BOUNDARY, never from
@@ -128,13 +128,13 @@ LEGACY_KV_WINDOW = 4
 
 
 def _record(**readings: object) -> None:
-    """Put a reading in the ``-q`` transcript (``-075``'s convention)."""
+    """Put a reading in the ``-q`` transcript (the landed convention)."""
     for key, value in readings.items():
         warnings.warn(f"RECORDED {key}={value!r}", UserWarning, stacklevel=2)
 
 
 def _specs() -> dict:
-    """The 45 real specs, from ``-016``'s landed helpers."""
+    """The 45 real specs, from the landed spec module's helpers."""
     return _call(_fake_layers(_raw_fixture()))
 
 

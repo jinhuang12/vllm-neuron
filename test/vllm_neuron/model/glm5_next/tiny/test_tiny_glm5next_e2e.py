@@ -1,6 +1,6 @@
-"""``inc-glm53f-054b``: the runner's caches reach the layers, and eight tokens match a reference.
+"""The runner's caches reach the layers, and eight tokens match a reference.
 
-WHAT THIS FILE MEASURES. This half of ``inc-glm53f-054`` threads the runner's allocated caches
+WHAT THIS FILE MEASURES. This half of the pair threads the runner's allocated caches
 into the per-layer carriers this model family takes as forward ARGUMENTS, and then measures the
 block's registered acceptance over that thread:
 
@@ -14,7 +14,7 @@ block's registered acceptance over that thread:
      sites go through. It must read EACH layer's own KV-cache group and must not hand the root
      a KV page size where the root declares an FP8 weight-quant block.
   4. The registered acceptance itself: eight generated tokens whose logits match a torch
-     reference composed from ``-054a``'s landed oracles, at the registered tolerance.
+     reference composed from the forward item's landed oracles, at the registered tolerance.
   5. The paging itself: a request whose pages sit in a different ORDER and in different
      places in the bank produces the same logits, bit for bit, as one whose pages are a
      single ascending run at its front. That is the property the block table exists for,
@@ -31,7 +31,7 @@ forward and one token per decode step: a batch of more than one request and a mu
 (speculative decoding's verify step) both refuse by name rather than being threaded, so this file
 measures the refusal and not the feature. One rank: the reference is single-rank and reads the
 fixture's own per-rank operands, so it neither reduces FFN partial sums across ranks nor
-compensates a scale grid -- the two defects ``inc-glm53f-054c`` and ``-054d`` own stay visible
+compensates a scale grid -- the two defects the later increments own stay visible
 through it. No hardware: the CPU lane is the whole scope here, and a real Neuron compile is
 stage 7's. The recurrent (KDA) arms are measured on specs this file substitutes rather than on a
 KDA layer, because the landed tiny stack is sparse-attention on every layer
@@ -40,7 +40,7 @@ mapper and the converter read no layer module, so the substitution exercises the
 runner drives.
 
 HOW TO RUN IT, and both variables must be in the environment rather than set from a fixture
-(``inc-glm53f-051``'s obligation 4):
+(the interface record's obligation 4):
 
     VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1 \\
         python -m pytest -s -rA test/vllm_neuron/model/glm5_next/tiny/test_tiny_glm5next_e2e.py
@@ -59,7 +59,7 @@ import torch
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
 
-# `-054a`'s OWN fixture, dials and landed prefill operands. Imported, never re-implemented:
+# The forward item's OWN fixture, dials and landed prefill operands. Imported, never re-implemented:
 # this file measures the runner against what that item's acceptance ran, and the import order
 # follows the landed convention (`test/vllm_neuron/functional/dsa/test_causal_bound.py:99-110`).
 from test.vllm_neuron.model.glm5_next.tiny import test_tiny_glm5next_forward as item
@@ -136,9 +136,9 @@ E2E_SCOPE_MAX_NUM_SEQS = 2
 
 
 def _fixture(**overrides):
-    """`-054a`'s root fixture, with the ONE dial the registered constraint set names.
+    """The forward item's root fixture, with the ONE dial the registered constraint set names.
 
-    THE OVERRIDE IS `num_key_value_heads = 2`, and it is here rather than in `-054a`'s file
+    THE OVERRIDE IS `num_key_value_heads = 2`, and it is here rather than in that item's file
     for two reasons that both bind: the acceptance this block carries names that value in its
     constraint set (plan `:1183`), and the plan's Tests bullet says the two halves write
     different files in one directory and neither edits the other's. `_root_config` takes
@@ -219,7 +219,7 @@ def _runner_shaped_caches(root) -> dict[str, list[torch.Tensor]]:
 def _assert_config_matches_landed_dials(text_config) -> None:
     """The tree that ran must carry the two index dials the landed operands were built from.
 
-    ``inc-glm53f-054a``'s fixture puts them into the config it builds
+    The forward file's fixture puts them into the config it builds
     (``test_tiny_glm5next_forward.py:2653-2654``) and this file's derivations read them back
     off the built config, so a fixture that stopped passing them would make every operand
     comparison below compare two different geometries and still look green.
@@ -536,7 +536,7 @@ def test_derived_carrier_operands_equal_the_landed_tiny_operands():
     """The runner's ``slot_mapping`` and ``seq_lens`` are the landed item's, value for value.
 
     The landed stack item builds both operands from the indexer's stated rules
-    (``test_tiny_glm5next_forward.py:2853-2872``) and ``inc-glm53f-054a``'s acceptance ran
+    (``test_tiny_glm5next_forward.py:2853-2872``) and that file's acceptance ran
     against them. The runner now derives the same two, so equality here is a cross-check
     against a landed reference rather than against this file's own arithmetic.
 
@@ -649,7 +649,7 @@ def test_runner_built_carriers_drive_the_root_and_write_the_runners_own_cache():
     two un-specced side caches and assemble the mappings, and the root is called with those.
 
     THE KEY SETS ARE CHECKED AGAINST THE LANDED PREFILL CARRIER, not against a list typed
-    here: ``inc-glm53f-054a``'s stack item builds the carrier its forward accepted
+    here: the landed stack item builds the carrier its forward accepted
     (``test_tiny_glm5next_forward.py:3831-3843``), so a runner mapping that grew or lost a
     key fails against the shape the landed acceptance ran.
 
@@ -921,7 +921,7 @@ def _model_kwargs(runner, *, input_ids, cached: int, sampling_row: int) -> dict:
 
 
 def _reference_attention_half(layer, raw, gains, hidden, cfg, *, tokens: int):
-    """`-054a`'s `_stack_attention_half` with its length taken from an argument.
+    """The forward item's `_stack_attention_half` with its length taken from an argument.
 
     IT IS THAT FUNCTION, five lines of it re-composed here for ONE reason: the landed one
     fixes its three cache operands at `STACK_TOKENS` (`test_tiny_glm5next_forward.py:3875-3886`)
@@ -964,7 +964,7 @@ def _reference_attention_half(layer, raw, gains, hidden, cfg, *, tokens: int):
 def _reference_logits(fixture, token_ids) -> torch.Tensor:
     """The torch reference model's logits for the LAST row of this token sequence.
 
-    THE COMPOSITION IS `-054a` ITEM 6's, EQUATION FOR EQUATION: the embedding is the table
+    THE COMPOSITION IS THE FORWARD FILE'S ITEM 6, EQUATION FOR EQUATION: the embedding is the table
     index, each layer adds its attention half to the tensor it received
     (`test_tiny_glm5next_forward.py:4644`), then adds its FFN half to that
     (`:4706`), and the stack ends in the final norm (`:4796`); the head projection is item
@@ -977,7 +977,7 @@ def _reference_logits(fixture, token_ids) -> torch.Tensor:
 
     IT IS SINGLE-RANK BY CONSTRUCTION. `_root_fixture` refuses a world size other than 1
     (`:5178`), and this reference reads the fixture's own per-rank operands, so it neither
-    reduces across ranks nor compensates a scale grid -- the two defects `-054c` and `-054d`
+    reduces across ranks nor compensates a scale grid -- the two defects the later increments
     own are left visible rather than papered over.
     """
     cfg, layers = fixture["cfg"], fixture["layers"]
@@ -1010,14 +1010,14 @@ def _assert_route_predicate_r3(label: str, before: dict, after: dict) -> None:
        `NKI_SIMULATOR` flag, so a run launched without the simulator is refused here instead
        of passing on the torch oracle.
     2. the aggregate torch-fallback counter across every seam this campaign owns reads exactly
-       0 over the generation. "Every seam" is made complete by `-054a`'s two registry checks,
+       0 over the generation. "Every seam" is made complete by that item's two registry checks,
        which are called below rather than re-implemented: one requires every counter family in
        every registered module to be claimed by a row, the other requires no counter family
        anywhere in `vllm_neuron.functional` to be unregistered.
     3. the SET of seam counters that fired is reported and asserted non-empty -- the conjunct
        that tells this campaign's kernels from `torch` composed end to end.
 
-    IT IS NOT `-054a`'s HELPER. That one takes an expected dispatch count per seam, which is
+    IT IS NOT THAT ITEM'S HELPER. That one takes an expected dispatch count per seam, which is
     form R-1; this block registered R-3, whose value is which path was taken and not how many
     times, so predicting counts here would assert something the register does not.
     """
@@ -1074,7 +1074,7 @@ def test_the_generation_is_eight_tokens_and_every_step_matches_the_reference():
     translation.
 
     THE FIRST COMPARISON IS THE CONTROL FOR THE OTHER SEVEN. Step 0 is the 128-token prompt,
-    which is the composition `-054a`'s items 6 and 7 already measured and whose acceptance
+    which is the composition items 6 and 7 already measured and whose acceptance
     passed on hardware. A defect in this file's reference reddens that comparison before any
     decode-leg claim rests on it.
     """
@@ -1221,7 +1221,7 @@ def test_the_converter_reads_each_layers_own_kv_cache_group(monkeypatch):
     runner builds one table per KV-CACHE GROUP (`neuron_model_runner.py:4115-4121`) and a
     GLM-5.3-Flash stack is hybrid, so the sparse layers and the recurrent layers land in
     different groups with different tables. One entry for the whole stack therefore slices one
-    family out of the other family's table, and `inc-glm53f-051`'s interface record says
+    family out of the other family's table, and the interface record says
     nothing below this point detects it. Review r1 of commit 1 found it.
 
     THE CONTROL IS THE OLD BEHAVIOUR, RUN. The last block calls the same converter with the
@@ -1374,7 +1374,7 @@ def test_the_converter_does_not_hand_the_root_a_kv_page_as_its_quant_block():
     multiple of `BLOCK_QUANT_SIZE` (`model_fp8.py:1775-1780`). The KV page size is a different
     number -- 4 in this fixture -- so passing it would raise `Glm5NextBlockQuantRouteError` on
     the first routed layer. Unset, the bank uses its own declared block, which is the value
-    `-054a`'s landed acceptance asserts the root forwards to its stack
+    the landed acceptance asserts the root forwards to its stack
     (`test_tiny_glm5next_forward.py:5392-5393`).
 
     THE CONTROL IS THE ARITHMETIC, and it is the same constant the model's own guard imports:
@@ -1602,7 +1602,7 @@ def test_the_side_caches_live_across_steps_and_a_fresh_sequence_clears_the_ring(
 #: boundary. Both are DERIVED from the landed dials, so a change to either moves them.
 #:
 #: BOTH FIT THROUGH THE DSA PATH IN ONE LEG, which is why they sit BELOW the stack's token
-#: count rather than above it. The `-103` causal-bound kernel binds the query-token axis to one
+#: count rather than above it. The landed causal-bound kernel binds the query-token axis to one
 #: partition tile, so a prefill of more than `DSA_TOKENS_PER_CALL` tokens raises inside the
 #: kernel (`dma_copy dst partition dimension 132 exceeds maximum 128`, measured on the host and
 #: read back in `054b-r4-accept-20260909T210355Z.out:623`). Widening either dial is not this
@@ -1955,7 +1955,7 @@ def test_the_prefill_remainder_is_seeded_and_the_next_pool_completes_whole():
 
 
 # ══════════════════════════════════════════════════════════════════════════════════════
-# ITEMS 12-17 (`inc-glm53f-054f`). THE THREE REFUSALS THAT HAD NO TEST ARM, AND THE
+# ITEMS 12-17. THE THREE REFUSALS THAT HAD NO TEST ARM, AND THE
 # POSITION CURSOR THAT GIVES THE LIVE RING A SEQUENCE IDENTITY.
 #
 # ITEMS 16 AND 17 ARE THE CARVE-OUT AND ITS EDGE. Warmup is part of serving: the decode
@@ -1964,7 +1964,7 @@ def test_the_prefill_remainder_is_seeded_and_the_next_pool_completes_whole():
 # one, and item 17 proves the exemption stops at position 0 rather than admitting any
 # unowned continuation.
 #
-# WHY THESE FOUR ARE HERE AND NOT IN `-054b`. The three refusals were written by `-054b`
+# WHY THESE FOUR ARE HERE AND NOT IN THE LANDED HALF. The three refusals were written there
 # and nothing measured them, so nothing would have noticed if one stopped firing. The
 # cursor is new: the side caches are keyed by absolute position and carry no sequence
 # identity, so a fresh request admitted at a non-zero cached length -- an automatic

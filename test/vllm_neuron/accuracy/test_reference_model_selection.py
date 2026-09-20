@@ -1,4 +1,4 @@
-"""``inc-glm53f-005`` item 1 and extraction-fidelity guard A.
+"""Item 1 of the tolerance registry, and extraction-fidelity guard A.
 
 Item 1 is a single equality: for the architecture string
 ``Glm5NextForConditionalGeneration`` the reference-model selector returns the

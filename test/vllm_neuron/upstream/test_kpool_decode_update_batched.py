@@ -31,7 +31,7 @@ import torch
 from vllm.platforms import current_platform
 
 # ---------------------------------------------------------------------------------------------
-# PORT ADAPTER -- fork-owned. `inc-glm53f-053`, design entry `design-20260905-u`.
+# PORT ADAPTER -- fork-owned. Design entry `design-20260905-u`.
 # ---------------------------------------------------------------------------------------------
 # THIS BLOCK REPLACES THE ORIGIN'S IMPORT BRANCH (origin L33-L44), and nothing else in the file
 # is changed. The origin bound the three symbols below from ``vllm.models.glm5next``, a package

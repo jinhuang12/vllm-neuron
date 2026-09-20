@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""``inc-glm53f-016`` acceptance -- WP2: runner ``get_kv_cache_spec``, hybrid stack.
+"""Acceptance -- WP2: runner ``get_kv_cache_spec``, hybrid stack.
 
 THE DECLARED ACCEPTANCE, the plan block's command, verbatim:
 
@@ -14,7 +14,7 @@ checkable rather than hoped: C01 split **34 MambaSpec / 11 FullAttentionSpec / 0
 other** (parent **0/45/0**, control name-blind); C02 **0 of 45** entries whose
 returned dtype carrier differs from what the MODEL reports for that state
 (parent **34**, control reverts this increment's own per-entry assignment to the
-global, **0 -> 34**); C03 the four ``inc-glm53f-015`` fields ARE READ, **34**
+global, **0 -> 34**); C03 the four ``LayerSpec`` state fields ARE READ, **34**
 engaged / **0** engaged (parent **0/0**); C04 the KDA page reconciles to the
 recorded state page, discrepancy **0 B**, READ off the instrument and RECORDED
 (parent **65,536 B**), with readings **(a)** ``page_size_padded is None`` on
@@ -24,7 +24,7 @@ every constructed object and **(b)** ``len(shapes) == len(dtypes) == 2`` on all
 SCOPE. This certifies the runner's TRANSLATION -- ``LayerSpec`` in, spec-dict out
 -- and nothing about the producer of the values. The vehicle is a fake model
 exposing only ``get_kv_spec()``, and that fake IS the specification
-``inc-glm53f-038`` must satisfy; real field values are M3's.
+the producer must satisfy; real field values are M3's.
 
 NOT SELF-REFERENTIAL. Every KDA field value is DERIVED by calling the vendor
 authorities at the registered geometry, never hand-written: shapes from
@@ -32,11 +32,11 @@ authorities at the registered geometry, never hand-written: shapes from
 ``MambaStateDtypeCalculator.kda_state_dtype`` -- **two separate classes**,
 conflating them raises ``AttributeError``. The roster, family schedule and
 per-layer geometry come from the digest-pinned 45-layer fixture through the
-landed ``inc-glm53f-013`` skeleton. This is ``-015`` conjunct 3's pattern.
+landed model skeleton. This is the landed conjunct 3's pattern.
 
 ORIENTATION. The command pins the conv layout for DETERMINISM of the derived
 fake. The resolved layout is RECORDED, not asserted: every count here is a
-product of extents and so transposition-invariant, and ``-015``'s conjunct 3
+product of extents and so transposition-invariant, and the landed conjunct 3
 remains the campaign's only orientation guard.
 
 WHAT C02'S ZERO DOES NOT COVER. Its DSA half agrees because the registered cache
@@ -89,7 +89,7 @@ PARENT_ENGAGED_ENTRIES = 0
 
 
 def _record(**readings: object) -> None:
-    """Put a reading in the ``-q`` transcript (``-075``'s convention)."""
+    """Put a reading in the ``-q`` transcript (the suite's convention)."""
     for key, value in readings.items():
         warnings.warn(f"RECORDED {key}={value!r}", UserWarning, stacklevel=2)
 
@@ -136,7 +136,7 @@ def _fake_layers(
     """The fake model's 45 layers, derived end to end.
 
     ``populate_kda=False`` CLEARS the four fields to ``None`` (C03's other half) --
-    it clears rather than inherits, because since ``inc-glm53f-038a`` the real
+    it clears rather than inherits, because the real
     model's own spec carries real values on the 34 linear-attention layers;
     ``name_blind=True`` strips every family suffix (C01's control) -- which is
     why the family is read off the fixture's own schedule and never off a name.
@@ -168,7 +168,7 @@ def _fake_layers(
                 )
             )
         else:
-            # CLEARED EXPLICITLY, never inherited. `inc-glm53f-038a` filled these
+            # CLEARED EXPLICITLY, never inherited. A later increment filled these
             # four fields on the real model's own spec, so a bare
             # `replace(layer, name=name)` started PRESERVING real values on the 34
             # linear-attention layers -- and C03's "fields are unset" control below
@@ -333,7 +333,7 @@ def test_get_kv_cache_spec_c02_zero_of_forty_five_dtypes_differ_from_the_model(
     assert reverted_kda == DECLARED_KDA_ENTRIES
 
 
-# C03 -- the four -015 fields are READ: 34 engaged / 0 engaged.
+# C03 -- the four landed fields are READ: 34 engaged / 0 engaged.
 def test_get_kv_cache_spec_c03_the_four_state_fields_are_read() -> None:
     """A counted differential on the four landed fields: 34 engaged, 0 engaged."""
     from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
@@ -359,7 +359,7 @@ def test_get_kv_cache_spec_c03_the_four_state_fields_are_read() -> None:
     not_engaged = sum(1 for spec in emptied.values() if isinstance(spec, MambaSpec))
 
     # WHY THE CONTROL HAS TO CLEAR RATHER THAN INHERIT, read off the real model.
-    # This number was 0 before `inc-glm53f-038a` and is 34 after it. The arm used
+    # This number was 0 before that change and is 34 after it. The arm used
     # to inherit these fields and assume they were absent, which is exactly the
     # regression `B36-F2` found; recording the number here means a future change
     # to it is visible in the transcript instead of turning the control hollow.
@@ -393,7 +393,7 @@ def test_get_kv_cache_spec_c04_kda_page_reconciles_with_zero_discrepancy() -> No
 
     specs = _call(_fake_layers(_raw_fixture()))
     _, _, resolved_layout = _authority_state_shapes()
-    # RECORDED, not asserted: the counts are transposition-invariant and -015's
+    # RECORDED, not asserted: the counts are transposition-invariant and the landed
     # conjunct 3 is the campaign's only orientation guard.
     _record(c04_resolved_conv_state_layout=resolved_layout)
 
@@ -412,7 +412,7 @@ def test_get_kv_cache_spec_c04_kda_page_reconciles_with_zero_discrepancy() -> No
     assert sorted(_natural_state_pages(kda_specs)) == [RECORDED_KDA_STATE_PAGE_BYTES]
 
     # READING (a) -- page_size_padded now carries the unified page on the 34 KDA
-    # entries and stays None on the 11 attention ones (`inc-glm53f-086`).
+    # entries and stays None on the 11 attention ones.
     padded = {name: spec.page_size_padded for name, spec in specs.items()}
     _record(
         c04_reading_a_non_none=sorted(n for n, v in padded.items() if v is not None)
@@ -426,7 +426,7 @@ def test_get_kv_cache_spec_c04_kda_page_reconciles_with_zero_discrepancy() -> No
     _record(c04_reading_b_arities=sorted(arities))
     assert arities == {(2, 2)}
 
-    # -086's READINGS, recorded and adding no criterion: the two pages side by
+    # The re-pin's READINGS, recorded and adding no criterion: the two pages side by
     # side, so the natural-page assert above cannot be read as a tautology.
     _record(
         c086_kda_natural_page_bytes=sorted(_natural_state_pages(kda_specs)),
@@ -440,7 +440,7 @@ def test_get_kv_cache_spec_c04_kda_page_reconciles_with_zero_discrepancy() -> No
 
 
 # ===========================================================================
-# `inc-glm53f-086` HELPERS. They sit BELOW the tests on purpose. Every pin
+# PAGE-SIZE UNIFICATION HELPERS. They sit BELOW the tests on purpose. Every pin
 # into this file cites a line above C04, and a name defined down here still
 # resolves inside a test body, because that body runs after the module is
 # imported. So the two re-pins above cost zero line movement.
@@ -458,7 +458,7 @@ MEASURED_PADDED_PAGE_BYTES = 131_072
 def _natural_state_pages(kda_specs: list) -> set:
     """The bytes each recurrent state's OWN geometry occupies.
 
-    ``page_size_bytes`` stopped answering this question at ``-086``, which pads
+    ``page_size_bytes`` stopped answering this question at the re-pin, which pads
     it up to the attention page, so the state's own size is summed from the
     shapes and dtypes the spec carries. The product is spelt out rather than
     imported from ``math``, because a new import at the top of this file would

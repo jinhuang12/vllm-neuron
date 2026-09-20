@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tier N acceptance for ``inc-glm53f-027`` -- WP6, the block-quant MoE call site.
+"""Tier N acceptance for WP6, the block-quant MoE call site.
 
 The declared acceptance (increment plan revision 32,
 ``bfb7199ef72039a66dca7bfefdf47c116cc733ac44aabe1e74ea38dea4d9c1e4``, L884),
@@ -20,10 +20,10 @@ load-bearing::
       --timeout 60 -v -s
 
 THE ROUTE PREDICATE (D13 form R-2, plan L885). This increment owns NO seam: it
-is glue that selects and feeds ``inc-glm53f-025``'s kernel. So the predicate is
+is glue that selects and feeds the block-quant kernel. So the predicate is
 the R-2 form -- simulator dispatches counted on the F1 chain (``wrap_nki`` ->
 ``NKIHOPCaller`` -> HOP -> ``DispatchKey.CPU`` -> ``nki.simulator.simulate_kernel``)
-THROUGH A SEAM THIS INCREMENT DOES NOT OWN, namely ``-025``'s
+THROUGH A SEAM THIS INCREMENT DOES NOT OWN, namely
 ``functional/moe/moe_blockwise_fp8.py``. Four instruments per declared case,
 each reported as a number:
 
@@ -32,7 +32,7 @@ each reported as a number:
    composition does not enter that seam;
 3. ``can_run_kernel()`` -- ``True``;
 4. real ``nki.simulator.simulate_kernel`` entries -- ``1``, and ATTRIBUTED: the
-   Python frame chain at each entry is walked for ``-025``'s seam module, so the
+   Python frame chain at each entry is walked for the block-quant seam module, so the
    reading distinguishes "a kernel ran" from "*that* kernel ran". Instrument 4
    is the vendor's own entry point, so a bug in instruments 1-3, all of which
    are this campaign's bookkeeping, cannot fake it.
@@ -40,9 +40,9 @@ each reported as a number:
 Instrument 4's counted value IS the acceptance bullet's counter clause; it is
 cited here, not restated as a second criterion.
 
-WHY THE ATTRIBUTION LEG EXISTS AND WHAT IT IS NOT. ``-026``'s dense seam
+WHY THE ATTRIBUTION LEG EXISTS AND WHAT IT IS NOT. The dense seam
 (``functional/blockwise_fp8_mm.py``) is NOT on this call site's path -- it is the
-dense half, counted downstream by ``inc-glm53f-033`` (plan L933) -- and this
+dense half, counted downstream by a later increment (plan L933) -- and this
 test adds no dense-half dispatch conjunct. The attribution leg is here because
 the call site also calls ``build_blockwise_mapping``, which HAS a NKI flow, and
 a total-only count could not say which component produced the dispatches.
@@ -53,7 +53,7 @@ and :func:`_assert_route` then requires the identity
 discrimination is armed against a REAL foreign dispatch in
 :func:`test_moe_path_attribution_control_reads_a_foreign_seam_as_elsewhere`.
 
-F1: WHY THE NUMERIC ARM ALONE IS A FALSE GREEN WAITING TO HAPPEN. ``-025``'s
+F1: WHY THE NUMERIC ARM ALONE IS A FALSE GREEN WAITING TO HAPPEN. The block-quant
 seam falls back to the VENDOR'S OWN TORCH REFERENCE when ``can_run_kernel()`` is
 false. That reference computes the same function, so the numeric comparison
 below passes on the fallback path too --
@@ -71,8 +71,8 @@ runs the vendor's own reference over the same case and requires agreement AT THE
 SAME DECLARED TOLERANCES. So a shared misreading of the scale layout would have
 to be shared with ``nkilib``'s reference too.
 
-FIXTURE CONDITIONING (the plan's carry #7, and ``-025``'s lesson at the layer
-below). ``-025`` attempt 1 died to catastrophic cancellation in a SIGNED random
+FIXTURE CONDITIONING (the plan's carry #7, and the kernel's lesson at the layer
+below). Its attempt 1 died to catastrophic cancellation in a SIGNED random
 fixture at this same ``rtol=3e-2``: over an ``H=512`` contraction, signed terms
 of magnitude ~1e4 sum to elements ~1e-1, and no correct bf16-accumulating kernel
 can satisfy a pointwise relative tolerance dominated by cancellation. This
@@ -137,7 +137,7 @@ from vllm_neuron.functional.moe.moe_blockwise_fp8 import (
 )
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
-#: ``-025``'s seam module. The attribution target of instrument 4, resolved as a
+#: The block-quant seam module. The attribution target of instrument 4, resolved as a
 #: FILE PATH off the imported module rather than spelled as a string, so a moved
 #: module fails the import instead of silently making the attribution unmatchable.
 import vllm_neuron.functional.moe.moe_blockwise_fp8 as _seam_module
@@ -148,11 +148,11 @@ _SEAM_FILE = _seam_module.__file__
 # The tiny config. Every extent is forced, and by what is cited next to it.
 # ---------------------------------------------------------------------------
 
-#: ``H`` and ``I_TP`` are the SMALLEST pair ``-025``'s five admission gates
+#: ``H`` and ``I_TP`` are the SMALLEST pair the seam's five admission gates
 #: accept (``moe_blockwise_fp8.py:_require_blocked``): ``H % 256 == 0``,
 #: ``512 <= H <= 8192``, ``H % PSUM_SIZE(512) == 0``, ``I_TP % 256 == 0`` and
 #: ``I_TP % (256 * NUM_SHARDS) == 0``. Chosen to ADMIT the kernel, which is
-#: ``-025``'s landed carry: a geometry it refuses raises rather than falling
+#: the seam's landed carry: a geometry it refuses raises rather than falling
 #: back, so an inadmissible tiny config would measure the refusal path.
 H = 512
 I_TP = 512
@@ -221,7 +221,7 @@ _FP8 = torch.float8_e4m3fn
 #: The campaign's pinned checkpoint config, and its digest. The quantisation
 #: policy this call site routes on is read through the REAL recognition path
 #: from this file, not hand-fed: ``config.json`` -> ``Glm5NextConfig`` ->
-#: ``QuantizationSpec`` -> ``BlockFp8QuantMethod``. ``inc-glm53f-023``'s test
+#: ``QuantizationSpec`` -> ``BlockFp8QuantMethod``. The config test
 #: pins the same digest; a divergence here means one of the two is stale.
 FIXTURE_PATH = Path(__file__).resolve().parent / "fixtures" / "config.json"
 FIXTURE_SHA256 = "5ed24d23a3e14a038352e1bdc21fd25fc90ff2291d3f6a310acf5d4036665a1d"
@@ -294,7 +294,7 @@ class _AttributedSimulatorCounter:
     frame chain contains a frame executing in ``seam_file``; ``elsewhere`` is
     the remainder.
 
-    The frame walk is what makes the R-2 predicate say "through ``-025``'s
+    The frame walk is what makes the R-2 predicate say "through the block-quant
     seam" rather than merely "something dispatched". It works across the
     ``wrap_nki`` -> HOP -> ``DispatchKey.CPU`` hop because CPython links each new
     Python frame to the interpreter's current top frame regardless of
@@ -430,7 +430,7 @@ def _assert_route(
     if sim.total != sim.through_seam + mapping_count:
         raise RouteInstrumentError(
             f"{label}: {sim.total} simulator entries do not add up. "
-            f"{sim.through_seam} attributed to -025's seam plus "
+            f"{sim.through_seam} attributed to the block-quant seam plus "
             f"{mapping_count} measured for the token-block mapping alone is "
             f"{sim.through_seam + mapping_count}. Either some component nobody "
             f"measured dispatched, or the call site handed the mapping an extent "
@@ -452,13 +452,13 @@ def _run_mapping(expert_affinities: torch.Tensor, label: str) -> dict:
     """Run the token-block mapping ALONE under the file's own counter.
 
     Returns the mapping's four outputs and its measured simulator entry count.
-    The call site calls exactly two components that can dispatch -- ``-025``'s
+    The call site calls exactly two components that can dispatch -- the block-quant
     seam and ``build_blockwise_mapping`` -- so the mapping's own share, measured
     on its own, is what makes :func:`_assert_route`'s attribution identity
     complete rather than a subtraction.
 
     The mapping's entries must land in ``elsewhere``, never in ``through_seam``:
-    the mapping lives in ``functional/moe/moe_blockwise.py`` and ``-025``'s seam
+    the mapping lives in ``functional/moe/moe_blockwise.py`` and the block-quant seam
     is a different file. That is asserted here, so adding ``mapping_count`` to
     ``through_seam`` provably double-counts nothing.
     """
@@ -490,7 +490,7 @@ def _run_mapping(expert_affinities: torch.Tensor, label: str) -> dict:
         raise RouteInstrumentError(
             f"mapping-{label}: {mapping_sim.through_seam} of "
             f"{mapping_sim.total} entries produced by the token-block mapping "
-            f"were attributed to -025's seam ({_SEAM_FILE}). The mapping is a "
+            f"were attributed to the block-quant seam ({_SEAM_FILE}). The mapping is a "
             f"different file, so this reading would make the attribution "
             f"identity double-count."
         )
@@ -548,7 +548,7 @@ def _block_quant_config():
     ``"vllm_neuron.model.glm5_next.model_fp8" not in sys.modules``, which is
     what certifies ``factory.py``'s lazy import; a module-level import here
     would populate ``sys.modules`` for the whole directory run. This is
-    ``inc-glm53f-023``'s and ``-032``'s landed idiom in this directory, adopted
+    the landed idiom in this directory, adopted
     for the same reason.
     """
     from vllm_neuron.model.glm5_next.config import Glm5NextConfig
@@ -581,7 +581,7 @@ def _build_bank():
 
 
 # ---------------------------------------------------------------------------
-# The fixture. Built THROUGH ``inc-glm53f-024``'s retile producer, so the
+# The fixture. Built THROUGH the retile producer, so the
 # producer is exercised rather than mimicked, and the scales the comparator
 # reads are the ones the kernel is handed.
 # ---------------------------------------------------------------------------
@@ -612,7 +612,7 @@ def _fp8_grid_values(seed: int, *shape: int) -> torch.Tensor:
     near-cancelling sum, so reference elements land arbitrarily close to zero
     while the terms that built them are ~1e4; a pointwise RELATIVE tolerance is
     then dominated by cancellation rather than by kernel error, and no correct
-    bf16-accumulating kernel can satisfy it. ``-025`` measured exactly that one
+    bf16-accumulating kernel can satisfy it. This was measured exactly that one
     layer down. Every value here is also exact in bf16, so the call site's cast
     of the affinities and the hidden states introduces nothing.
     """
@@ -851,7 +851,7 @@ def torch_reference_moe(
     """A pure-torch block-quant MoE. No NKI, no mapping, no vendor code.
 
     THE AUTHORITY IS THE MODEL, NOT THE KERNEL, and repair batch R6 of
-    ``inc-glm53f-054a`` moved it there. Until R6 this reference was transcribed
+    this increment moved it there. Until R6 this reference was transcribed
     from the vendor KERNEL's torch reference
     (``nkilib/core/moe/moe_cte/moe_cte_torch.py:193``) and therefore computed the
     kernel's DEFAULTS, while the product call site deliberately overrides both of
@@ -1953,14 +1953,14 @@ def test_moe_path_f1_numeric_arm_alone_cannot_discriminate(
 def test_moe_path_attribution_control_reads_a_foreign_seam_as_elsewhere() -> None:
     """INSTRUMENT CONTROL for the attribution leg. NOT an acceptance conjunct.
 
-    A dispatch through ``inc-glm53f-026``'s DENSE seam
+    A dispatch through the DENSE seam
     (``functional/blockwise_fp8_mm.py``) must read ``total == 1`` and
-    ``through_seam == 0`` on a counter attributed to ``-025``'s seam. Without
+    ``through_seam == 0`` on a counter attributed to the block-quant seam. Without
     this arm, ``through_seam == total`` in the acceptance could be a frame walk
     that matches everything.
 
-    This is emphatically NOT a dense-half dispatch conjunct: ``-026``'s seam is
-    not on this call site's path, and ``inc-glm53f-033`` counts it downstream
+    This is emphatically NOT a dense-half dispatch conjunct: the dense seam is
+    not on this call site's path, and a later increment counts it downstream
     (plan L933). It appears here only as a known-foreign dispatch to arm the
     instrument.
     """
@@ -1987,8 +1987,8 @@ def test_moe_path_attribution_control_reads_a_foreign_seam_as_elsewhere() -> Non
             "cannot show that the attribution discriminates"
         )
     assert sim.through_seam == 0, (
-        f"{sim.through_seam} of {sim.total} entries produced by -026's dense "
-        f"seam were attributed to -025's seam; the frame walk is matching "
+        f"{sim.through_seam} of {sim.total} entries produced by the dense "
+        f"seam were attributed to the block-quant seam; the frame walk is matching "
         f"frames it should not, which would make the acceptance's "
         f"through_seam reading meaningless"
     )
@@ -2004,7 +2004,7 @@ def test_moe_path_call_site_maps_before_padding_and_dispatches_nki() -> None:
     1. The tensor the call site hands ``build_blockwise_mapping`` has ``T`` rows,
        not ``T + 1``. The padding slot is appended AFTER the mapping.
     2. During that mapping call the simulator was entered a NONZERO number of
-       times, and none of those entries were attributed to ``-025``'s seam.
+       times, and none of those entries were attributed to the block-quant seam.
 
     Reading 2 is the point. Both of the mapping's kernel gates turn on the extent
     being even -- ``chunk_size % 128 == 0`` (``moe_blockwise.py:520``) and
@@ -2086,7 +2086,7 @@ def test_moe_path_call_site_maps_before_padding_and_dispatches_nki() -> None:
     )
     assert inner.through_seam == 0, (
         f"{inner.through_seam} of the mapping's {inner.total} entries were "
-        f"attributed to -025's seam, so the attribution sum double-counts"
+        f"attributed to the block-quant seam, so the attribution sum double-counts"
     )
     assert outer.through_seam == sum(
         dispatches for dispatches, _fallback in DECLARED_LIMB_DISPATCHES
@@ -2366,19 +2366,19 @@ def test_moe_path_exports_resolve_to_their_own_modules() -> None:
 
     if functional.blockwise_fp8_moe is not blockwise_fp8_moe:
         raise ExportSurfaceError(
-            "vllm_neuron.functional.blockwise_fp8_moe is not -025's seam object"
+            "vllm_neuron.functional.blockwise_fp8_moe is not the block-quant seam object"
         )
     if functional.blockwise_fp8_mm is not dense_seam:
         raise ExportSurfaceError(
-            "vllm_neuron.functional.blockwise_fp8_mm is not -026's seam object"
+            "vllm_neuron.functional.blockwise_fp8_mm is not the dense seam object"
         )
     if functional_moe.blockwise_fp8_moe is not blockwise_fp8_moe:
         raise ExportSurfaceError(
-            "vllm_neuron.functional.moe.blockwise_fp8_moe is not -025's seam"
+            "vllm_neuron.functional.moe.blockwise_fp8_moe is not the block-quant seam"
         )
     if functional_moe.retile_block_scales is not retile_producer:
         raise ExportSurfaceError(
-            "vllm_neuron.functional.moe.retile_block_scales is not -024's producer"
+            "vllm_neuron.functional.moe.retile_block_scales is not the retile producer"
         )
     for name in ("blockwise_fp8_mm", "blockwise_fp8_moe"):
         if name not in functional.__all__:
@@ -2497,7 +2497,7 @@ def test_moe_path_fixture_conditioning_is_measured_not_assumed() -> None:
             f"gate_up_min={gup_min}, down_min={down_min}); the declared "
             f"pointwise rtol={RTOL} is then dominated by catastrophic "
             f"cancellation over the H={H} contraction rather than by kernel "
-            f"error, which is how -025 attempt 1 failed"
+            f"error, which is how the block-quant kernel's attempt 1 failed"
         )
     if affinity_roundtrip != 0.0 or hidden_roundtrip != 0.0:
         raise FixtureConditioningError(
@@ -2639,7 +2639,7 @@ def test_moe_path_expert_count_disagreement_raises_by_name() -> None:
 
 
 def test_moe_path_landed_sections_are_untouched() -> None:
-    """``-031``'s, ``-032``'s and ``-013``'s members still resolve, unchanged.
+    """The landed members still resolve, unchanged.
 
     This increment's D14 section is a PURE INSERTION into a coordinated merge
     point. The three landed members whose acceptances are already recorded must
@@ -2655,13 +2655,13 @@ def test_moe_path_landed_sections_are_untouched() -> None:
     assert int(bank.num_routed_experts) == E
     assert int(bank.num_experts_per_tok) == K
     assert int(text_config.n_routed_experts) == E
-    # ``inc-glm53f-054a`` REMOVED THE STUB ARM THAT STOOD HERE. It asserted that
+    # REMOVED: THE STUB ARM THAT STOOD HERE. It asserted that
     # ``Glm5NextRoutedExperts.forward`` raises ``NotImplementedError`` naming
-    # ``inc-glm53f-013``; that forward now computes, so the arm was a false
+    # the increment that owns it; that forward now computes, so the arm was a false
     # statement about the tree rather than a check of it. Nothing replaces it here:
     # what the forward does is certified by
     # ``tiny/test_tiny_glm5next_forward.py``'s item 2, and this test's own claim --
-    # that ``-031``'s, ``-032``'s and ``-013``'s members still resolve unchanged --
+    # that the landed members still resolve unchanged --
     # is carried by the assertions above and below.
     print(
         f"[landed] num_routed_experts={bank.num_routed_experts} "
@@ -2743,7 +2743,7 @@ def _build_ep_bank():
     extent, rather than taken from the campaign's registered TP freeze of 64,
     because 288 experts do not divide 64 ways.
 
-    CORRECTED BY ``inc-glm53f-087``: this docstring used to call that 64-way
+    CORRECTED: this docstring used to call that 64-way
     refusal campaign gap G4 and the lead's to dispose. It is neither. An expert
     bank divides by the EXPERT-PARALLEL degree, so at the freeze with expert
     parallelism off the degree is 1, every expert is local and nothing raises.
@@ -2774,7 +2774,7 @@ def _build_ep_bank():
             "the global and local expert counts coincide, so this bank is the "
             "degree-1 case again and the dispatch step would be a no-op"
         )
-    # ``-031``'s partition, checked as a PARTITION before this arm indexes with
+    # The landed partition, checked as a PARTITION before this arm indexes with
     # it. If it did not cover every global column exactly once, the per-rank
     # column comparisons below would be against the wrong reference.
     seen: list[int] = []
@@ -2829,7 +2829,7 @@ class _MappingAffinitySpy:
 
     The call site imports the mapping FUNCTION-LOCALLY from
     ``vllm_neuron.functional`` (``model_fp8.py:1099``, re-anchored by
-    ``inc-glm53f-091b`` from ``:1078``, same bytes), so replacing the
+    a later increment from ``:1078``, same bytes), so replacing the
     attribute on that module is what a call actually resolves. The real mapping
     still runs and its result is still used, so the kernel below is measured on
     the real path rather than on a stub.
@@ -3012,7 +3012,7 @@ def test_moe_path_dispatch_refuses_a_caller_sliced_local_form_above_degree_one()
 
     "With no slicing done by the caller" is a two-sided claim and this is the
     other side. A caller that does the slice itself is the outcome
-    ``inc-glm53f-032``'s landed note exists to prevent -- two owners for one
+    the landed note exists to prevent -- two owners for one
     behaviour -- and it now fails by name instead of quietly computing on a
     slice this site did not make.
 

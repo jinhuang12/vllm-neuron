@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""``inc-glm53f-017`` acceptance -- WP2: runner ``initialize_kv_cache``, hybrid.
+"""Acceptance -- WP2: runner ``initialize_kv_cache``, hybrid.
 
 THE DECLARED ACCEPTANCE, the plan block's command, verbatim:
 
@@ -18,7 +18,7 @@ so each arm's discrimination is a transcript and not a code reading:
   ...MambaSpec...")`` raised at ``neuron_model_runner.py:8600``, **0** KDA
   buffers allocated -- the count is not reachable at all at the parent.
 * C02 -- the **34** KDA entries allocate BOTH state buffers, the element counts
-  being PRODUCTS of ``inc-glm53f-015``'s two landed shape fields' extents.
+  being PRODUCTS of the two landed shape fields' extents.
   PARENT: no conv buffer is allocated at all, the parent allocating from a
   single-tensor attention spec class.
 * C03 -- the **11** DSA entries allocate ``head_size == 512``, measured against
@@ -38,10 +38,10 @@ value. The one external literal is ``DECISIONS.md`` section 6's
 recorded KDA state page, CITED and neither restated nor re-derived (P9).
 
 VEHICLE, and why it is shared rather than rebuilt. The 45 ``LayerSpec`` objects,
-the fake model and the spec dict come from the LANDED ``inc-glm53f-016``
+the fake model and the spec dict come from the LANDED ``get_kv_cache_spec``
 acceptance module's own helpers. Rebuilding them here would create a SECOND
-construction of the fake, free to drift from the one ``inc-glm53f-016`` declares
-as ``inc-glm53f-038``'s specification; importing them keeps one construction,
+construction of the fake, free to drift from the one that module declares
+as the producer's specification; importing them keeps one construction,
 and with it the property that every KDA field value is DERIVED by calling the
 vendor authorities (``MambaStateShapeCalculator.kda_state_shape`` and the
 SEPARATE ``MambaStateDtypeCalculator.kda_state_dtype``) at the registered
@@ -57,11 +57,11 @@ so nothing needs substituting, and counting is what C04 needs from it.
 ORIENTATION. The command pins the conv layout for DETERMINISM of the derived
 fixture. The resolved layout is RECORDED, not asserted: every count here is a
 byte total or a product of extents, hence transposition-invariant, and
-``inc-glm53f-015``'s conjunct 3 remains the campaign's only orientation guard.
+``test_kv_cache_spec.py``'s conjunct 3 remains the campaign's only orientation guard.
 This file asserts no conv EXTENT.
 
 WHAT THIS DOES NOT CERTIFY. Not the producer of the field values (that is
-``inc-glm53f-038``, at M3), not the model-side consumption of the returned state
+the model's own spec, at M3), not the model-side consumption of the returned state
 buffers, and no hardware behaviour: this is a CPU-mode, host-side allocation
 certificate.
 """
@@ -108,7 +108,7 @@ PARENT_DSA_ALLOCATED_HEAD_SIZE = 512
 
 
 def _record(**readings: object) -> None:
-    """Put a reading in the ``-q`` transcript (``-075``'s convention)."""
+    """Put a reading in the ``-q`` transcript (the suite's convention)."""
     for key, value in readings.items():
         warnings.warn(f"RECORDED {key}={value!r}", UserWarning, stacklevel=2)
 
@@ -233,7 +233,7 @@ def _allocated_bytes(caches: dict) -> int:
 
 
 def _model_reported_head_size(raw: dict) -> int:
-    """``kv_lora_rank + qk_rope_head_dim`` off the fixture -- ``-013``'s surface."""
+    """``kv_lora_rank + qk_rope_head_dim`` off the fixture -- the landed surface."""
     text = raw["text_config"]
     return int(text["kv_lora_rank"]) + int(text["qk_rope_head_dim"])
 
@@ -314,7 +314,7 @@ def test_initialize_kv_cache_c01_forty_five_entries_for_the_elected_class(
     assert PARENT_RAISE_MESSAGE_FRAGMENT in str(raised.value)
 
 
-# C02 -- the 34 KDA entries allocate BOTH state buffers, counts from -015's fields.
+# C02 -- the 34 KDA entries allocate BOTH state buffers, counts from the landed fields.
 def test_initialize_kv_cache_c02_both_state_buffers_with_declared_element_counts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -340,7 +340,7 @@ def test_initialize_kv_cache_c02_both_state_buffers_with_declared_element_counts
 
     for name in tiny_kda:
         layer = by_name[name]
-        # The referents: -015's two landed SHAPE fields, whose values were
+        # The referents: the two landed SHAPE fields, whose values were
         # derived from the shape authority. Counts are PRODUCTS of extents, so
         # nothing here reads an orientation.
         conv_elements = math.prod(layer.kda_conv_state_shape)
@@ -501,7 +501,7 @@ def test_initialize_kv_cache_c04_total_bytes_reconcile_with_zero_discrepancy(
     caches = _drive(_config(specs, NUM_BLOCKS_FULL), layers, monkeypatch)
 
     # The RAW referent: page_size_bytes off the spec objects get_kv_cache_spec
-    # constructs, times the blocks. -086 pads it, so this is the padded span.
+    # constructs, times the blocks. The re-pin pads it, so this is the padded span.
     expected_bytes = sum(
         spec.page_size_bytes * NUM_BLOCKS_FULL for spec in specs.values()
     )
@@ -523,7 +523,7 @@ def test_initialize_kv_cache_c04_total_bytes_reconcile_with_zero_discrepancy(
     assert allocated - _addressable_bytes(specs, NUM_BLOCKS_FULL) == 0
 
     # The KDA page's own referent stays DECISIONS section 6's recorded page (P9).
-    # -086 pads page_size_bytes, so the state's own geometry answers this now.
+    # The re-pin pads page_size_bytes, so the state's own geometry answers this now.
     assert _kda_natural_pages(specs, kda_names) == [RECORDED_KDA_STATE_PAGE_BYTES]
 
     # Per entry too, so a compensating pair of errors cannot net to zero.
@@ -539,13 +539,13 @@ def test_initialize_kv_cache_c04_total_bytes_reconcile_with_zero_discrepancy(
     )
     assert set(per_entry.values()) == {0}
 
-    # UNMOVED BY -086. Both sides read page_size_bytes: this file's config sizes
+    # UNMOVED BY THE RE-PIN. Both sides read page_size_bytes: this file's config sizes
     # each raw tensor from that page, and the counting mock records what was
     # asked for, so padding raises the two together. The buffers the allocator
     # RETURNED span less, which is why the addressable zero above re-pinned.
     assert sum(requested) == expected_bytes
 
-    # READINGS inherited from inc-glm53f-016's construction, RECORDED here and
+    # READINGS inherited from the shared construction, RECORDED here and
     # adding no criterion: (a) which entries now carry page_size_padded, (b) both
     # carriers are present, so the vendor's non-strict pairing cannot have
     # truncated the sum this arm reconciles against.
@@ -563,11 +563,11 @@ def test_initialize_kv_cache_c04_total_bytes_reconcile_with_zero_discrepancy(
     assert arities == {(2, 2)}
 
     # No conv EXTENT is asserted anywhere above, so the layout term is RECORDED
-    # and -015's conjunct 3 stays the campaign's orientation guard.
+    # and ``test_kv_cache_spec.py``'s conjunct 3 stays the campaign's orientation guard.
     _record(c04_resolved_conv_state_layout=get_conv_state_layout())
 
     # ------------------------------------------------------------------
-    # `inc-glm53f-086`: the readings the pad makes measurable, and the two
+    # The readings the pad makes measurable, and the two
     # D1.5 controls for the zeros this increment re-pinned. All of it sits
     # BELOW every line this file is pinned from, so the re-pins above moved
     # nothing.
@@ -611,7 +611,7 @@ def test_initialize_kv_cache_c04_total_bytes_reconcile_with_zero_discrepancy(
 
 
 # ===========================================================================
-# `inc-glm53f-086` HELPERS, placed BELOW the tests deliberately. Three places
+# PAGE-SIZE UNIFICATION HELPERS, placed BELOW the tests deliberately. Three places
 # pin the reading block at the tail of C04 by line number, and a name defined
 # down here still resolves inside a test body, because that body runs after
 # this module is imported. So the four re-pins above cost zero line movement.
@@ -632,7 +632,7 @@ MEASURED_PADDED_PAGE_BYTES = 131_072
 def _addressable_page_bytes(spec) -> int:
     """Bytes of one page that an allocated buffer can actually reach.
 
-    A recurrent state occupies only its own geometry, and ``-086`` pads the page
+    A recurrent state occupies only its own geometry, and the re-pin pads the page
     it REPORTS up to the attention page. The allocation arm packs both states at
     the front of the page and makes the block stride the whole page, so a
     returned view spans the geometry and never the pad. An attention page has no

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""``inc-glm53f-018`` acceptance -- WP2: the campaign's ONE new vLLM patch.
+"""Acceptance -- WP2: the campaign's ONE new vLLM patch.
 
 THE DECLARED ACCEPTANCE (increment plan revision 32, L753), verbatim:
 
@@ -37,7 +37,7 @@ The spec objects below are constructed locally with arithmetic-chosen sizes.
 They are shaped like the campaign's hybrid set -- a recurrent-state
 ``MambaSpec`` beside an attention spec, the recurrent page smaller than and not
 a divisor of the attention page -- but they assert **nothing** about the real
-model's geometry, which is ``-013``/``-016``'s subject and not this file's. What
+model's geometry, which is the KV-spec items' subject and not this file's. What
 they exercise is upstream's branch structure, which is what this patch touches.
 
 ONE UPSTREAM FINDING, RECORDED HERE AND ROUTED, NOT FIXED HERE
@@ -594,7 +594,7 @@ def test_e04_evidence_production_import_order_keeps_the_plugin_loadable():
     isolates that mechanism reading with a firing control.
 
     Import order is process-global, so this is measured in a CHILD PROCESS, on
-    ``-014``'s two-subprocess precedent. Four assertions, all from the child's
+    this campaign's two-subprocess precedent. Four assertions, all from the child's
     own stdout: the plugin loaded, the attribute is the wrapper, the wrapper's
     ``__wrapped__`` is upstream's function, and the patch is both wired and
     bound. ``DEFERRED`` is RECORDED, never asserted: it says which of the two

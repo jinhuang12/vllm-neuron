@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """KDA decode state carry -- one token, on device, in NKI.
 
-`inc-glm53f-036`. Prefill groups tokens into chunks and is served by
+Prefill groups tokens into chunks and is served by
 :mod:`vllm_neuron.functional.kda.chunked_recurrence`. Decode has one token and no
 chunk to group it with, so it needs its own entry: take the state the prefill
 left, advance it by exactly one token, and return both the advanced state and
@@ -13,7 +13,7 @@ would move it off device and back on every token, and a decode loop runs one ste
 per generated token, so the substrate has to advance it in place. The substrate
 provides no KDA state step, so this module writes one.
 
-THE STATE CONTRACT IS THE ONE `-035b` LANDED, NOT A NEW ONE. Its
+THE STATE CONTRACT IS THE ONE THE PREFILL MODULE LANDED, NOT A NEW ONE. Its
 ``final_state`` is stored ``[V, K]``, so that is what this module accepts and what
 it returns. Feeding a prefill's ``final_state`` straight into
 :func:`kda_decode_step` needs no reshape and no transpose on the caller's side.
@@ -33,7 +33,7 @@ state, and the output reads the state after the update. Getting the last one wro
 produces a state that matches and an output that does not, which is why the
 acceptance measures both.
 
-INTERNALLY THE STATE IS HELD TRANSPOSED, as ``[K, V]``, for the reason `-035b`
+INTERNALLY THE STATE IS HELD TRANSPOSED, as ``[K, V]``, for the reason prefill
 records for its own carry: the per-key-channel decay then becomes a ``[K, 1]``
 operand broadcast along the FREE axis, which is exactly what
 ``nisa.tensor_scalar`` does, and a ``[V, K]`` layout would need a partition-axis
@@ -131,7 +131,7 @@ class _DecodeDispatchCounters:
 
 
 #: MODULE-LEVEL so a test outside this module can reset and read it, on the
-#: `inc-glm53f-028` precedent that `-035a` and `-035b` both follow.
+#: precedent that this module and the prefill module both follow.
 _DECODE_COUNTERS = _DecodeDispatchCounters()
 
 
@@ -298,7 +298,7 @@ def kda_decode_step(
 
     Args:
         state: ``[V, K]`` fp32 -- the incoming state, in the orientation
-            `-035b`'s ``final_state`` is stored in.
+            a prefill's ``final_state`` is stored in.
         q: ``[1, K]`` fp32, raw. Normalised and scaled inside the kernel.
         k: ``[1, K]`` fp32, raw. Normalised inside the kernel.
         v: ``[1, V]`` fp32.

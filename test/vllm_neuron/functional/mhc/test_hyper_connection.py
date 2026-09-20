@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tier N acceptance for `inc-glm53f-029` -- the mHC combine kernel, `hc_mult 4`.
+"""Tier N acceptance for the mHC combine kernel, `hc_mult 4`.
 
-Acceptance command (plan block ``#### inc-glm53f-029``, Tier N harness "as
-`-025`")::
+Acceptance command (Tier N harness "as
+an earlier increment")::
 
     VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1 NKI_PRECISE_FP=1 \
     NEURON_PLATFORM_TARGET_OVERRIDE=trn2 \
@@ -24,7 +24,7 @@ mistake were made in the kernel and in the oracle, case 1 passes green. Case 2 h
 no authored reference at all: with ``comb_res_mix = I`` and ``post_layer_mix = 0``
 the expected output **is the input tensor**, so any mis-indexing shows up against
 a bit-exact expectation that no mistake of this file's could move. That is the
-same structural property `-028`'s arm 2 has, and it is why the two cases arm each
+same structural property the Sinkhorn seam's arm 2 has, and it is why the two cases arm each
 other rather than repeating each other:
 
 * case 2 alone would be satisfied by a kernel that ignored both weight tensors
@@ -59,9 +59,9 @@ shows instrument 1 reading ``(0, 1)`` and instrument 3 reading ``0`` on the
 fallback path; :func:`test_route_control_simulator_is_load_bearing` shows the
 chain RAISING rather than quietly computing torch when the simulator is off.
 
-The counters are also shown INDEPENDENT of `-028`'s
+The counters are also shown INDEPENDENT of the Sinkhorn seam's
 (:func:`test_counters_are_independent_of_the_sinkhorn_seam`), because
-`inc-glm53f-030` reads both seams per layer call and needs two numbers, not one.
+the layer forward reads both seams per layer call and needs two numbers, not one.
 """
 
 from __future__ import annotations
@@ -126,7 +126,7 @@ class VacuousControlError(AssertionError):
 
 # --------------------------------------------------------------------------- #
 # Route instrumentation. Counts the VENDOR entry point, so it is independent of  #
-# the seam counter it cross-checks. Same shape as `-028`'s.                      #
+# the seam counter it cross-checks. Same shape as the Sinkhorn seam's.           #
 # --------------------------------------------------------------------------- #
 class _SimulatorCounter:
     """Counts real ``nki.simulator.simulate_kernel`` calls for the duration."""
@@ -486,8 +486,8 @@ def test_fixture_mix_is_asymmetric_and_row_stochastic() -> None:
 def test_stream_count_matches_the_target_hc_mult() -> None:
     """``MHC_STREAMS`` is the target's ``hc_mult``, and it is imported, not restated.
 
-    The constant lives in `-028`'s module, which records that this increment and
-    `-030` are sized by the same number. Reading it through THIS module's
+    The constant lives in the Sinkhorn seam's module, which records that this increment and
+    the layer forward are sized by the same number. Reading it through THIS module's
     namespace is what proves the import is in place rather than a second copy.
     """
     sinkhorn = importlib.import_module(_SINKHORN_MODULE)
@@ -612,20 +612,20 @@ def test_route_control_simulator_is_load_bearing() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# The counters are MODULE-LEVEL and INDEPENDENT -- `-030` depends on both.        #
+# The counters are MODULE-LEVEL and INDEPENDENT -- the layer depends on both.     #
 # --------------------------------------------------------------------------- #
 def test_dispatch_counters_are_module_level_state_reachable_from_elsewhere() -> None:
-    """Another module can zero and read these counters. `-030` needs exactly this.
+    """Another module can zero and read these counters. The layer forward needs exactly this.
 
-    `inc-glm53f-030`'s route predicate is form R-2 over THIS seam together with
-    `-028`'s: its own test module resets and reads the counters this module owns,
+    The layer forward's route predicate is form R-2 over THIS seam together with
+    the Sinkhorn seam's: its own test module resets and reads the counters this module owns,
     per layer call. A test-local counter, or one only this file could reset, would
     pass this increment and break that one.
 
     Measured rather than asserted by inspection: the module is re-acquired through
     ``importlib`` -- the same mechanism another test module's import uses -- one
     reference RESETS, the seam is driven, and the OTHER reference READS. Then the
-    counter is shown to ACCUMULATE across calls, because `-030` reads a
+    counter is shown to ACCUMULATE across calls, because the layer reads a
     per-layer-call total and a counter saturating at 1 could not supply one.
     """
     foreign = importlib.import_module(_MODULE)
@@ -638,7 +638,7 @@ def test_dispatch_counters_are_module_level_state_reachable_from_elsewhere() -> 
     foreign.reset_dispatch_counters()
     assert dispatch_counters() == (0, 0), (
         "a reset through the foreign reference did not zero the counters this "
-        "test reads, so the state is not shared and -030's R-2 predicate cannot "
+        "test reads, so the state is not shared and the layer's R-2 predicate cannot "
         "be taken over this seam"
     )
     with _SimulatorCounter() as sim:
@@ -654,7 +654,7 @@ def test_dispatch_counters_are_module_level_state_reachable_from_elsewhere() -> 
     assert after_one == (1, 0), f"expected (1, 0) after one dispatch, got {after_one}"
     assert after_two == (2, 0), (
         f"expected (2, 0) after two dispatches, got {after_two}; the counter does "
-        f"not accumulate across calls, so it cannot supply -030's per-layer-call "
+        f"not accumulate across calls, so it cannot supply the layer's per-layer-call "
         f"total"
     )
     foreign.reset_dispatch_counters()
@@ -662,12 +662,12 @@ def test_dispatch_counters_are_module_level_state_reachable_from_elsewhere() -> 
 
 
 def test_counters_are_independent_of_the_sinkhorn_seam() -> None:
-    """This seam's counter and `-028`'s must be two numbers, not one.
+    """This seam's counter and the Sinkhorn seam's must be two numbers, not one.
 
-    `inc-glm53f-030`'s R-2 predicate reads BOTH seams per layer call and asserts
+    The layer forward's R-2 predicate reads BOTH seams per layer call and asserts
     each was entered exactly once. If the two modules shared a counter object --
     or if either reset cleared both -- that predicate would be unable to tell "both
-    kernels ran once" from "one kernel ran twice", and `-030` would be built on a
+    kernels ran once" from "one kernel ran twice", and the layer would be built on a
     reading that cannot discriminate.
 
     Measured in BOTH directions on one fixture.
@@ -676,7 +676,7 @@ def test_counters_are_independent_of_the_sinkhorn_seam() -> None:
     combine = importlib.import_module(_MODULE)
 
     assert combine._COUNTERS is not sinkhorn._COUNTERS, (
-        "the two seams share one counter object, so -030 cannot read two numbers"
+        "the two seams share one counter object, so the layer cannot read two numbers"
     )
 
     x, residual, post_layer_mix, comb_res_mix = _inputs(rows=8, hidden=32)
@@ -695,7 +695,7 @@ def test_counters_are_independent_of_the_sinkhorn_seam() -> None:
         )
     after_combine = (combine.dispatch_counters(), sinkhorn.dispatch_counters())
 
-    # Drive `-028`'s seam only.
+    # Drive the Sinkhorn seam only.
     with _SimulatorCounter():
         sinkhorn.sinkhorn_normalise(affinity)
     after_sinkhorn = (combine.dispatch_counters(), sinkhorn.dispatch_counters())
@@ -710,14 +710,14 @@ def test_counters_are_independent_of_the_sinkhorn_seam() -> None:
         f"after combine reset={after_reset}"
     )
     assert after_combine == ((1, 0), (0, 0)), (
-        f"driving this seam moved -028's counter: {after_combine}"
+        f"driving this seam moved the Sinkhorn seam's counter: {after_combine}"
     )
     assert after_sinkhorn == ((1, 0), (1, 0)), (
-        f"driving -028's seam moved this one, or did not move its own: "
+        f"driving the Sinkhorn seam moved this one, or did not move its own: "
         f"{after_sinkhorn}"
     )
     assert after_reset == ((0, 0), (1, 0)), (
-        f"resetting this seam cleared -028's counter too: {after_reset}"
+        f"resetting this seam cleared the Sinkhorn seam's counter too: {after_reset}"
     )
     sinkhorn.reset_dispatch_counters()
 
@@ -745,7 +745,7 @@ def test_seam_dispatches_to_the_kernel_this_increment_authors() -> None:
 
 #: ``rows_over_max`` WAS the first case here, expecting
 #: ``exceeds PARTITION_MAX={PARTITION_MAX}`` at ``PARTITION_MAX + 1``. It was
-#: retargeted by `inc-glm53f-029b`, which tiles the token axis inside the kernel:
+#: retargeted by the tiling, which tiles the token axis inside the kernel:
 #: that extent is now ADMITTED, so the refusal it asserted would be a false
 #: refusal. The admission is asserted instead, by name, in
 #: :func:`test_admits_the_extent_the_old_ceiling_refused` below. Every remaining
@@ -794,7 +794,7 @@ def test_refuses_inadmissible_geometry_by_name(mutate: str, needle: str) -> None
 def test_admits_the_extent_the_old_ceiling_refused() -> None:
     """``PARTITION_MAX + 1`` tokens are ADMITTED, and the numbers are right.
 
-    RETARGETED by `inc-glm53f-029b`. This was the ``rows_over_max`` case of
+    RETARGETED by the tiling. This was the ``rows_over_max`` case of
     :func:`test_refuses_inadmissible_geometry_by_name`, which asserted the gate
     helper refused this extent by name. The kernel now walks the token axis in
     tiles of ``nl.tile_size.pmax``, so the extent is served and the refusal it
@@ -819,7 +819,7 @@ def test_admits_the_extent_the_old_ceiling_refused() -> None:
     )
     assert rows > PARTITION_MAX, rows
     assert admitted is True, (
-        f"the gate refused {rows} tokens, but -029b tiles the token axis, so this "
+        f"the gate refused {rows} tokens, but the kernel tiles the token axis, so this "
         f"extent is served"
     )
 
@@ -844,7 +844,7 @@ def test_admits_the_extent_the_old_ceiling_refused() -> None:
 def test_seam_admits_over_the_old_ceiling_and_the_kernel_does_not_trap() -> None:
     """The SEAM serves the same extent, not just the gate helper.
 
-    RETARGETED by `inc-glm53f-029b`; this was
+    RETARGETED by the tiling; this was
     ``test_seam_refuses_before_the_kernel_traps``. The measurement shape is kept:
     it still reads whether the seam consults the gate BEFORE it reaches the
     kernel. What changed is the answer the gate gives at this extent, so the

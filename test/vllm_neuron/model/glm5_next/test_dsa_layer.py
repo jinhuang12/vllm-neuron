@@ -1,13 +1,13 @@
-"""``inc-glm53f-051`` -- the DSA decoder layer, its indexer chain and its runner integration.
+"""The DSA decoder layer, its indexer chain and its runner integration.
 
 WHAT THIS BLOCK BUILDS. One decoder layer on the ``deepseek_sparse_attention`` half that turns
 hidden states into attention output through the DSA indexer: score every candidate against the
 indexer query, select the highest-scoring POOLS, expand those pool ids into token indices, gather
-the selected rows, and hand the result to ``inc-glm53f-042``'s ``attend`` as its ``topk_indices``.
+the selected rows, and hand the result to ``attend`` as its ``topk_indices``.
 Nine landed NKI seams do the work; this layer is the orchestration around them.
 
 THE ACCEPTANCE ITEMS, cited BY ANCHOR and never by line number -- the plan block
-``#### `inc-glm53f-051``` moved twice while this file was being written, and a folded line number is
+for this layer moved twice while this file was being written, and a folded line number is
 stale at the next lap (D-18, review item B72-N6).
 
   (1)   layer numerics: a 3-layer DSA stack matches a torch reference at
@@ -21,7 +21,7 @@ stale at the next lap (D-18, review item B72-N6).
         1-layer stack reads exactly one third of every family. The predicate reads EIGHT of nine,
         not nine, because ``dsa_ragged_unpack`` has no admissible payload on either case -- ruled
         at design entry ``design-20260905-aj`` (plan revision 218, DECISIONS §52) on this seat's
-        finding F11. Its declared zero is covered by ``inc-glm53f-045``'s LANDED bit-identical
+        finding F11. Its declared zero is covered by the LANDED bit-identical
         round-trip item, so the direction is tested; it is tested there and not here.
   (P2)  parts 2 and 3 of the predicate: the tiling seam's dispatch count equals each arm's reported
         tile count.
@@ -64,7 +64,7 @@ not available at any price a design may pay. And nothing on the arm needs the pa
 rank (``mla_sparse.py:1345-1347``), so a padded rank-3 tensor would be REFUSED by the consumer. So
 one pack, one counter moved for the family, no unpack. This seat raised the collision as F11 and
 chose no route; the lead ruled route (b) and refused both a bf16 round trip taken to move a counter
-and a declared torch fallback. The unpack direction's own coverage is ``inc-glm53f-045``'s landed
+and a declared torch fallback. The unpack direction's own coverage is the landed
 bit-identical round-trip item, cited above.
 
 WHY A CALL SPY AS WELL AS THE COUNTERS. A shared counter reading 9 cannot say which of its two entry
@@ -214,7 +214,7 @@ BATCH = 1
 #     one and a ceiling, no multiple-of rule; heads ride the matmul stationary free axis as a full
 #     width, so there is no head-tiling granularity to satisfy. ``mla_absorb.py:260`` likewise.
 #   * ``kv_lora_rank``: ``mla_sparse.py:1278`` is ``latent < 1``, and its message says why the old
-#     bounds are gone ("inc-glm53f-041 TILES both axes this used to be bounded on"). 128 is chosen
+#     bounds are gone ("The kernel TILES both axes this used to be bounded on"). 128 is chosen
 #     over a ragged value ON PURPOSE: ``latent % 128 == 0`` selects the UNTILED body
 #     (``mla_sparse.py:1420``), the same body production's 512 takes, so the tiled counters
 #     (``mla_sparse.py:1421-1422``) stay at the zero this file's table declares. A ragged latent would move a
@@ -329,7 +329,7 @@ DECLARED_PER_LAYER_RAGGED_ARM: dict[str, tuple[int, int]] = {
     "dsa_hadamard128": (0, 1),          # the query is still rotated
     "dsa_paged_gather": (0, 1),
     "dsa_ragged_pack": (0, 1),          # the query ALONE: the fp32 weights cannot pack
-    "dsa_ragged_unpack": (0, 0),        # DECLARED ZERO per F11 route (b); covered by -045
+    "dsa_ragged_unpack": (0, 0),        # DECLARED ZERO per F11 route (b); the round-trip item covers it
     "dsa_score_gemm": (0, 1),
     "dsa_topk_select": (0, 1),
     "dsa_index_expand": (0, 1),
@@ -891,7 +891,7 @@ def test_the_declared_table_is_internally_consistent() -> None:
             "design-20260905-aj / plan revision 218 / DECISIONS §52, route (b): no admissible "
             "payload -- the fp32 gate weights cannot enter a bf16-only pack, and "
             "mla_sparse_attention refuses a rank-3 index tensor by name. The direction's own "
-            "coverage is inc-glm53f-045's LANDED bit-identical round-trip item"
+            "coverage is the LANDED bit-identical round-trip item"
         )
     }
     unreached = sorted(
@@ -1145,11 +1145,11 @@ def test_a_false_compress_dial_is_refused_by_name_before_anything_dispatches(
     assert "glm5_next.py:118-126" in message, "and cite the upstream refusal it mirrors"
 
 
-# THE F10 LENGTH REFUSAL RETIRED HERE AT ``inc-glm53f-099``, and its two items retired with it.
+# THE F10 LENGTH REFUSAL RETIRED HERE, and its two items retired with it.
 #
 # What stood here was ``test_a_sequence_too_short_to_select_is_refused_by_name_and_routed_to_099``,
 # parametrised over both entry points, asserting that below the strict selection bound the indexer
-# REFUSES by name rather than clamping ``k``. The refusal named ``inc-glm53f-099`` as the route it
+# REFUSES by name rather than clamping ``k``. The refusal named the bypass route it
 # was standing in for. That route is now built, so there is nothing left to refuse and no test can
 # assert a refusal that no longer exists. The two items are replaced by the three SERVED-regime
 # items in the bypass section at the end of this file, and the guarantee they protected --
@@ -1157,7 +1157,7 @@ def test_a_false_compress_dial_is_refused_by_name_before_anything_dispatches(
 # ``topk_select``'s counter as a zero on the bypass case.
 #
 # ``_refuses`` STAYS. It has a third caller, the dial item above, which is four items of
-# ``inc-glm53f-051``'s; retiring the helper would break them. Ruled at DECISIONS §97 (i) on this
+# this file's; retiring the helper would break them. Ruled at DECISIONS §97 (i) on this
 # seat's finding F1.
 
 
@@ -1169,9 +1169,9 @@ def test_the_two_entry_points_refuse_in_the_SAME_order() -> None:
     point reported the other fault instead, the two paths would have drifted and a reader
     could not predict which refusal a bad config produces.
 
-    RE-POINTED AT THE TRASH-ROW REFUSAL AT ``inc-glm53f-099``, ruled at DECISIONS §97 (i) on
+    RE-POINTED AT THE TRASH-ROW REFUSAL, ruled at DECISIONS §97 (i) on
     this seat's finding F2. The second fault used to be the F10 length, and that refusal is
-    gone -- so ``"inc-glm53f-099" not in message`` had become TRIVIALLY true and the item
+    gone -- so asserting its name is not in the message had become TRIVIALLY true and the item
     would have gone on looking like an ordering test while asserting nothing. The trash-row
     refusal (``model_fp8.py:3547-3552``) is the live replacement: it also fires inside
     ``_require_serviceable``, it also fires before any dispatch, and its message cannot be
@@ -1188,7 +1188,7 @@ def test_the_two_entry_points_refuse_in_the_SAME_order() -> None:
     long_enough = PREFILL_TOKENS
     assert long_enough // POOL_SIZE > TOPK_POOLS, (
         "the ordering case must sit above the strict selection bound, or the indexer would take "
-        "inc-glm53f-099's bypass and never reach the trash-row check at all"
+        "the bypass and never reach the trash-row check at all"
     )
     # Fewer pool_cache rows than there are addressable candidate pools, so `candidates > trash`.
     starved_rows = 2
@@ -1312,7 +1312,7 @@ def test_rider_B71_N3_the_indexer_hands_the_pooling_seam_bf16_keys() -> None:
 def test_rider_B67_N4_the_ragged_pack_admits_bf16_only_and_preserves_it() -> None:
     """B67-N4: the pack's output dtype is its input's, and bf16 is the only dtype it admits.
 
-    THE FINDING: ``-045``'s own tests never read the packed output's dtype, so this is a genuine
+    THE FINDING: the landed tests never read the packed output's dtype, so this is a genuine
     addition rather than a duplicate. The module declares ``_SUPPORTED_DTYPES = (torch.bfloat16,)``
     (``ragged_pack.py:136``) and both kernels allocate their output in the INPUT's dtype
     (``ragged_pack.py:334``, ``ragged_pack.py:450``), so a dtype change would be visible here and nowhere else in the suite.
@@ -1519,7 +1519,7 @@ def _ref_score(q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor) -> torch
 def _ref_score_per_head(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
     """The per-head scores BEFORE the ReLU and before the head weights.
 
-    Split out at `-103`'s r7 read so the tie diagnostic can print the four per-head numbers behind a
+    Split out at the r7 read so the tie diagnostic can print the four per-head numbers behind a
     tied row without a SECOND spelling of the einsum. The arithmetic above is unchanged: it now calls
     this instead of inlining the same call.
     """
@@ -1532,7 +1532,7 @@ def _ref_topk(scores: torch.Tensor, k: int) -> torch.Tensor:
 
 
 # --------------------------------------------------------------------------- #
-# THE CAUSAL BOUND, IN THE REFERENCE. `inc-glm53f-103`, declared as an amendment to a LANDED test
+# THE CAUSAL BOUND, IN THE REFERENCE. Declared as an amendment to a LANDED test
 # in the block's Surface bullet at plan revision 260 -- not discovered at review.
 #
 # WHY THE REFERENCE HAD TO CHANGE AT ALL. `_ref_indexer` below selects pools from unbounded scores,
@@ -1647,7 +1647,7 @@ def _ref_canonical_sentinel_order(pool_ids: torch.Tensor) -> torch.Tensor:
     Mirrors ``Glm5NextDSAIndexer._canonical_sentinel_order``. It exists in the reference for the
     same reason it exists in the implementation: the selector promises "highest first" and promises
     NOTHING about the order among EQUAL values (``topk_select.py:312``), and the bound manufactures
-    equal values in bulk at ``BOUND_FILL`` -- a FINITE ``-1e30`` since ``-103``, not the ``-inf``
+    equal values in bulk at ``BOUND_FILL`` -- a FINITE ``-1e30`` since the bound landed, not the ``-inf``
     this line said until rev 268. Without this the two sides would differ on the PLACES of
     identical contents, which is not a numeric disagreement and would read like one.
 
@@ -1669,7 +1669,7 @@ def _ref_expand(pool_ids: torch.Tensor, seq_lens: torch.Tensor, pool_size: int) 
     (``index_expand.py:525-546``). That is deliberate: a loop and a gather-and-mask are different
     enough that a transcription slip in either shows up as a mismatch rather than as a shared bug.
 
-    THIS REFERENCE RETURNS THE RAW WIDTH, AND THAT IS THE FIXED CHOICE. ``-102`` landed two widths.
+    THIS REFERENCE RETURNS THE RAW WIDTH, AND THAT IS THE FIXED CHOICE. The seam landed two widths.
     ``index_expand_raw_width`` is ``n_groups * pool_size + pool_size - 1``
     (``index_expand.py:242-252``) and covers the columns that CARRY MEANING; ``index_expand_width``
     rounds that up to a whole number of ``KEY_CHUNK`` (``index_expand.py:255-267``) and is what the
@@ -1707,10 +1707,10 @@ def _ref_sparse_attention(
 ) -> torch.Tensor:
     """Sparse attention over each row's NON-SENTINEL columns only.
 
-    HAND-WRITTEN RATHER THAN THE SEAM'S OWN ORACLE, AND THE REASON CHANGED WHEN ``-098`` LANDED.
+    HAND-WRITTEN RATHER THAN THE SEAM'S OWN ORACLE, AND THE REASON CHANGED WHEN A LATER INCREMENT LANDED.
     It used to be that the seam's oracle was simply wrong here: it gathered with ``cache[idx[s]]``,
     and a ``-1`` does not skip a column in torch -- it WRAPS onto the last cache row and silently
-    attends a real key. ``-098`` fixed that inside the oracle itself. It now builds
+    attends a real key. The later increment fixed it inside the oracle itself. It now builds
     ``keep = idx >= 0`` (``mla_sparse.py:1483``), clamps ``-1`` to row 0 (``mla_sparse.py:1484``), gathers
     on the clamped rows (``mla_sparse.py:1488``), masks the sentinel columns to ``-inf``
     (``mla_sparse.py:1493``), and replaces the NaN a wholly-sentinel row's softmax would otherwise
@@ -1721,7 +1721,7 @@ def _ref_sparse_attention(
     independent transcription of a gather-and-mask, so a slip in either shows up as a mismatch
     instead of as a shared bug. The design ruled this reference's semantics at design entry
     ``design-20260905-af`` (plan revision 215), and the lead settled the oracle question separately
-    -- the module oracle masks, and the only gap was coverage, which ``-098`` carries.
+    -- the module oracle masks, and the only gap was coverage, which that increment carries.
 
     DUPLICATES ARE KEPT. A selected pool can cover the tail region, so an expanded row can name the
     same token twice, and the kernel does not de-duplicate -- its softmax normalises over the columns
@@ -1896,12 +1896,12 @@ def _ref_indexer(
     # finite `BOUND_FILL`.)
     if probe is not None:
         probe.append(scores.detach())
-    # `-103` r7 READ 2. Recomputed rather than captured inside `_ref_score`, so the value path above
+    # r7 READ 2. Recomputed rather than captured inside `_ref_score`, so the value path above
     # is not touched by a diagnostic. Same inputs, same function, so it cannot disagree with the
     # scores the tie control reads.
     if probe_per_head is not None:
         probe_per_head.append(_ref_score_per_head(query, candidate_keys).detach())
-    # inc-glm53f-103: bound, select, sentinelise, then pin the sentinel places -- the same four steps
+    # Bound, select, sentinelise, then pin the sentinel places -- the same four steps
     # in the same order as `Glm5NextDSAIndexer.select_bounded_pools` in `model_fp8.py` -- named by the
     # method rather than by a line, because this increment's own docstrings pushed those line numbers
     # twice already -- transcribed rather than
@@ -2073,7 +2073,7 @@ def _ref_layer(
 #: moved when this changed, because :func:`_reference` applies the SAME scale to the torch reference
 #: as the kernel receives (``:1577``) -- which is why the mis-derivation survived landing and why no
 #: existing item can be pointed at as evidence that either value is right. Corrected under
-#: ``inc-glm53f-109`` (DECISIONS section 362, open question ``oq-051-softmax-scale-sqrt2``).
+#: DECISIONS section 362, open question ``oq-051-softmax-scale-sqrt2``.
 #:
 #: ``attend`` still takes the scale as a caller's argument on purpose and its own comment says why --
 #: "no block registers a value for it ... deriving one here would mint a registered value this
@@ -2116,7 +2116,7 @@ def _materialise_indexer(indexer, gen: torch.Generator) -> None:
 def build_layer_stack(*, layers: int = LAYERS, seed: int = 51_051_051, **cfg_overrides):
     """A stack of :class:`Glm5NextDSALayer` at the tiny geometry, every leaf materialised.
 
-    The weight scaling mirrors the ``-042`` sibling's fixture (``test_mla_decode.py:139-143``):
+    The weight scaling mirrors the sibling's fixture (``test_mla_decode.py:139-143``):
     ``randn * in_features ** -0.5``, so activations stay order one through a 3-layer chain instead of
     growing and turning a tolerance comparison into a test of overflow.
 
@@ -2379,7 +2379,7 @@ def check_tie_equivalent_selection(
 def say_tie_diagnostics(
     scores: torch.Tensor, k: int, label: str, per_head: torch.Tensor | None = None
 ) -> None:
-    """`-103` r7 READ 2. Disclose the row that DECIDES the k-th-place gap, before any assertion.
+    """r7 READ 2. Disclose the row that DECIDES the k-th-place gap, before any assertion.
 
     The r7 run read `prefill-layer2 kth_place_gap_min = 0.000e+00`, and an exact zero is not a near
     miss: `_ref_score` applies a ReLU (``clamp(min=0.0)``) before the head weights, so every candidate
@@ -2654,7 +2654,7 @@ def test_run_1_a_dsa_stack_matches_the_torch_reference_and_moves_every_seam(
         ref_before = read_projection_counter()
         ref_hidden = step_hidden
         probe: list[torch.Tensor] = []
-        # `-103` r7 READ 2 collects the per-head scores beside the weighted ones, so a tied row can be
+        # r7 READ 2 collects the per-head scores beside the weighted ones, so a tied row can be
         # read at the place the ReLU floor is actually reached.
         probe_per_head: list[torch.Tensor] = []
         for idx, (layer, caches) in enumerate(zip(stack, ref_caches)):
@@ -2978,7 +2978,7 @@ def test_run_2_the_ragged_arm_packs_and_each_request_matches_itself_run_alone(
     )
     spy.report("arm")
 
-    # THE EXPANSION IS THREE CLAIMS, NOT ONE. `-051` round 2 asserted a single shape equality against a
+    # THE EXPANSION IS THREE CLAIMS, NOT ONE. This file's round 2 asserted a single shape equality against a
     # reference that had the raw width TYPED into it, so a claim about the EMITTED width was settled by a
     # number nobody measured. The three below fail for three different reasons and say so separately:
     # the emitted width is the seam's own allocation rule, the meaningful columns are the content, and
@@ -3069,14 +3069,14 @@ def test_run_2_the_ragged_arm_packs_and_each_request_matches_itself_run_alone(
 
 
 # =========================================================================== #
-# THE SHORT-SEQUENCE CAUSAL BYPASS -- inc-glm53f-099's dispatch half.
+# THE SHORT-SEQUENCE CAUSAL BYPASS -- the dispatch half.
 #
 # WHAT THE BYPASS IS, in one sentence. When a request is short enough that selecting the top
 # select_k pools would take every candidate there is, there is nothing to select, so the indexer
 # returns the plain causal index rows instead of running the score/select/expand chain -- which is
 # what upstream does in the same regime (`sparse_attn_indexer_kpool.py:203-217`).
 #
-# WHAT USED TO BE HERE. `inc-glm53f-098` refused this regime by name and cited this increment as the
+# WHAT USED TO BE HERE. The indexer once refused this regime by name and cited this increment as the
 # owner of the route. That refusal and its two items are gone; the retirement note is in the refusal
 # section above. The guarantee the refusal protected -- `dsa_topk_select` never sees `k == width`,
 # because its gate returns False rather than raising (`topk_select.py:294`) and would take the torch
@@ -3537,7 +3537,7 @@ def test_the_two_entry_points_read_the_SAME_bypass_governed_families(
 
 
 # =========================================================================== #
-# inc-glm53f-109. THE SOFTMAX SCALE, AGAINST THE REFERENCE'S OWN DERIVATION.
+# THE SOFTMAX SCALE, AGAINST THE REFERENCE'S OWN DERIVATION.
 #
 # Why these two items exist when no landed result moved. :func:`_reference` at
 # ``:1577`` applies the SAME scale to the torch reference as ``attend`` receives, so
@@ -3597,7 +3597,7 @@ def test_softmaxscale_control_the_retired_latent_rank_value_fails_that_item() ->
 
 
 # =============================================================================================== #
-# THE SELECTING-REGIME CAUSAL BOUND -- inc-glm53f-103's dispatch half.
+# THE SELECTING-REGIME CAUSAL BOUND -- the dispatch half.
 #
 # WHAT THE BOUND IS, in one sentence. Above the bypass bound the selector runs, and a query row must
 # not select a key pool whose tokens finish AFTER the row's own position -- so every such pool's
@@ -3662,7 +3662,7 @@ MAX8_LANES = 8
 SELECTING_SEQ_LEN = POOL_SIZE * max(MAX8_LANES, TOPK_POOLS + 1)
 
 #: The families the SELECTING decision governs, each owing exactly one dispatch on one prefill leg.
-#: `causal_fill` is deliberately NOT here: it is inc-glm53f-099's bypass seam and owes a ZERO on
+#: `causal_fill` is deliberately NOT here: it is the bypass seam and owes a ZERO on
 #: this case, which is a different claim and is read as such below.
 SELECTING_ONE_FAMILIES: tuple[str, ...] = (
     "paged_gather", "score_gemm", "topk_select", "index_expand",
@@ -3670,7 +3670,7 @@ SELECTING_ONE_FAMILIES: tuple[str, ...] = (
 
 
 def _causal_bound_apis():
-    """``{"bound": (reset, read), "sentinel": (reset, read)}`` for inc-glm53f-103's two seams.
+    """``{"bound": (reset, read), "sentinel": (reset, read)}`` for the causal bound's two seams.
 
     A SIBLING OF :func:`_discover_counter_api`, NOT A SECOND CONVENTION. Same suffix rule, same
     `reset_` prefix rule; the only difference is the arity it admits. It exists because
@@ -3761,7 +3761,7 @@ def test_forward_BOUNDS_the_selecting_regime_to_each_rows_own_position(
          the same function and asserted to DISAGREE, naming the rows where it differs -- so a
          regression to it fails here instead of passing.
       4. THE ROUTE RAN IN NKI. Each of this block's two entry points reads exactly one dispatch and
-         no fallback, `-047`'s selector reads exactly one, and `-099`'s bypass seam reads ZERO --
+         no fallback, the landed selector reads exactly one, and the bypass seam reads ZERO --
          which is what says the two regimes are exclusive rather than both firing.
 
     Certifying component (D1.4): `Glm5NextDSAIndexer.select_bounded_pools`, composing
@@ -3877,7 +3877,7 @@ def test_forward_BOUNDS_the_selecting_regime_to_each_rows_own_position(
     )
     assert per_row[-1] == 0 and (SELECTING_SEQ_LEN - 1) in zeros, (per_row[-1], zeros)
 
-    # EVERY NON-SENTINEL POOL ID IS ONE THE ROW COMPLETES, which is inc-glm53f-048's precondition
+    # EVERY NON-SENTINEL POOL ID IS ONE THE ROW COMPLETES, which is the expansion's precondition
     # restated per row -- the property the whole increment exists to restore, read directly.
     complete = [min(int(s) // pool, candidates) for s in ops["seq_lens"]]
     illegal = [
@@ -3919,7 +3919,7 @@ def test_forward_BOUNDS_the_selecting_regime_to_each_rows_own_position(
         f"the sentinel seam read {sentinel_count} and owes exactly one NKI dispatch with no fallback"
     )
     assert fill_count == (0, 0), (
-        f"inc-glm53f-099's bypass seam read {fill_count} on a SELECTING case; the two regimes are "
+        f"the bypass seam read {fill_count} on a SELECTING case; the two regimes are "
         f"exclusive and a non-zero here means both fired"
     )
     for family in SELECTING_ONE_FAMILIES:
@@ -4262,7 +4262,7 @@ def test_forward_at_a_striking_select_k_sentinelises_every_pad_the_selector_retu
         f"the sentinel seam read {sentinel_count} and owes exactly one NKI dispatch with no fallback"
     )
     assert fill_count == (0, 0), (
-        f"inc-glm53f-099's bypass seam read {fill_count} on a SELECTING case"
+        f"the bypass seam read {fill_count} on a SELECTING case"
     )
     for family in SELECTING_ONE_FAMILIES:
         assert readings[family] == (1, 0), (

@@ -1,6 +1,6 @@
-"""``inc-glm53f-073`` -- G15 / M5: the multimodal-to-``AssertCloseResult`` join.
+"""G15 / M5: the multimodal-to-``AssertCloseResult`` join.
 
-``inc-glm53f-006`` measured its pair of counts as **(A >= 1, B == 0/1)** -- the
+The instrument measured its pair of counts as **(A >= 1, B == 0/1)** -- the
 multimodal path exists and accepts an image-bearing input, but driving one
 synthetic sample through it yields ``builtins.bool``, not an
 ``AssertCloseResult``. That is outcome 2, *"PATH PRESENT, COMPARISON DOES NOT
@@ -18,9 +18,9 @@ no-tolerance boundary mechanical rather than a promise.
 item count is derivable before the run rather than guessed: **5**.
 
 1. The join returns the right family, by class identity, not by name string.
-2. ``inc-glm53f-006``'s own predicate B flips to ``1/1`` **through the join**,
+2. The landed predicate B flips to ``1/1`` **through the join**,
    while the **direct** path's ``builtins.bool`` reading stays exactly as
-   ``-006`` measured it.
+   the landed screen measured it.
 3. A counted **negative control**: the existing return contract is unchanged.
    The gap was closed by *adding* an adapter, never by widening a union every
    caller unpacks.
@@ -31,7 +31,7 @@ item count is derivable before the run rather than guessed: **5**.
 
 Nothing loads a checkpoint, opens a socket, or touches a device: the synthetic
 image-bearing sample is built in-test and driven through a caller-supplied
-``generate_fn`` fake, exactly as ``-006``'s landed screen does. No module here
+``generate_fn`` fake, exactly as the landed screen does. No module here
 is imported for its side effects, and nothing outside ``accuracy/`` is imported
 at all.
 """
@@ -67,7 +67,7 @@ SAMPLE_INDEX = 0
 def _synthetic_image_bearing_sample() -> Dict[str, torch.Tensor]:
     """One synthetic image-bearing sample. Zero checkpoints, zero network.
 
-    Deliberately the same shape ``-006``'s landed screen uses, so conjunct 2 is
+    Deliberately the same shape the landed screen uses, so conjunct 2 is
     re-evaluating *the same predicate over the same sample*, not a friendlier
     one.
     """
@@ -192,14 +192,14 @@ def test_c1_the_join_returns_the_assertcloseresult_family() -> None:
 def test_c2_predicate_b_flips_to_one_of_one_through_the_join() -> None:
     """Conjunct 2 -- ``1/1``. The increment's reason for existing.
 
-    ``-006`` measured B as ``0/1`` on the **direct** path. This re-evaluates the
+    The landed screen measured B as ``0/1`` on the **direct** path. This re-evaluates the
     same predicate -- *"the count of synthetic multimodal samples for which the
     instrument returns an ``AssertCloseResult``"* -- **through the join**, and it
     must now read ``1/1``.
 
     The direct reading is asserted to be **unchanged** in the same breath. Both
     hold at once, and that is the point: the join is a new path, not a mutation
-    of the measured one. ``-006``'s landed screen pins the direct reading in a
+    of the measured one. The landed screen pins the direct reading in a
     file this increment does not touch, and this conjunct agrees with it here.
     """
     reading = _drive_one_sample_through_the_join()
@@ -234,7 +234,7 @@ def test_c2_predicate_b_flips_to_one_of_one_through_the_join() -> None:
     )
     assert reading["returned_type"] == "builtins.bool", (
         "the DIRECT path's captured signature moved: it returned "
-        f"{reading['returned_type']}, not the builtins.bool -006 measured. The "
+        f"{reading['returned_type']}, not the builtins.bool the screen measured. The "
         "join must add a path, never mutate the measured one"
     )
 

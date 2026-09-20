@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tier N acceptance for ``inc-glm53f-026b`` -- PAD-TO-128 and slice-back at the seam.
+"""Tier N acceptance for PAD-TO-128 and slice-back at the seam.
 
-Acceptance command (plan block ``#### inc-glm53f-026b``, taken AS WRITTEN)::
+Acceptance command (from the plan block, taken AS WRITTEN)::
 
     VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1 \
     python -m pytest test/vllm_neuron/model/glm5_next/test_dense_pad_026b.py \
@@ -60,7 +60,7 @@ counters the design review struck at revision 282 could not.
 
 THE TOLERANCE IS THE CAMPAIGN'S REGISTERED fp8 PAIR AND IS NOT RE-REGISTERED:
 ``rtol=3e-2, atol=1e-5``, order named inline per design law D3, the pair
-``inc-glm53f-005`` registered. The predicate is spelled out here rather than
+the pair the registry registered. The predicate is spelled out here rather than
 delegated, because ``_DEFAULT_DTYPE_TOLERANCE`` has NO fp8 entry and an omitted
 pair silently inherits the bf16 one (PIT-13). The worst relative error is REPORTED
 as a number either way.
@@ -84,7 +84,7 @@ import torch
 #: Asked of the one definition rather than retyped: the seam re-exports both.
 from vllm_neuron.functional.blockwise_fp8_mm import SCALE_BLOCK_SIZE, TILE_SIZE
 
-#: ``H`` and ``I``: four whole ``SCALE_BLOCK_SIZE`` columns each. `inc-glm53f-112`
+#: ``H`` and ``I``: four whole ``SCALE_BLOCK_SIZE`` columns each. The dense path
 #: narrowed the granularity from 256 to 128, so this is no longer the smallest
 #: legal geometry -- the extent is held at 512 on purpose, so this padding test
 #: keeps the geometry it was written for.

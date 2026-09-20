@@ -1,4 +1,4 @@
-"""`inc-glm53f-112` acceptance: the dense GEMM consumes the checkpoint's `[128,128]` grid.
+"""Acceptance: the dense GEMM consumes the checkpoint's `[128,128]` grid.
 
 WHAT THIS FILE MEASURES, and why it is exact rather than toleranced. The kernel used to index its
 scales by ``256`` blocks, so the checkpoint's own ``128`` scales had to be retiled up to ``256``
@@ -33,7 +33,7 @@ Tensor Engine is handed an operand dtype it accepts, is a device-side reading a 
 take. So the default is PRINTED as a non-control row with that reason instead of being falsified
 here, and the device-side claim is carried as debt ``D-112-UPCAST-DEVICE-ACCEPTANCE``.
 
-Nothing here runs on hardware: the NKI simulator executes the kernel, as ``-026``'s landed
+Nothing here runs on hardware: the NKI simulator executes the kernel, as the dense half's landed
 acceptance does.
 """
 
@@ -579,7 +579,7 @@ def test_each_kept_kernel_default_is_load_bearing(default_name, variant) -> None
 def test_the_route_is_the_nki_seam_once_per_call() -> None:
     """Every number above came through the NKI seam, once per call, with no torch fallback.
 
-    Form R-1, `-026`'s, unmoved: the counters are the module's own (incremented at the seam), not a
+    Form R-1, the dense half's, unmoved: the counters are the module's own (incremented at the seam), not a
     test spy, and ``can_run_kernel()`` is read from the real gate.
     """
     case = _case()

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tier T acceptance for ``inc-glm53f-054d`` -- ONE row-parallel reduction at the FFN site.
+"""Tier T acceptance for ONE row-parallel reduction at the FFN site.
 
-Acceptance command (plan block ``#### inc-glm53f-054d``, CPU mode)::
+Acceptance command (from the plan block, CPU mode)::
 
     VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1 NKI_PRECISE_FP=1 \
     NEURON_PLATFORM_TARGET_OVERRIDE=trn2 \
@@ -28,12 +28,12 @@ THE TWO ITEMS, AND WHY THERE ARE TWO
 
 THE TOLERANCE IS THE CAMPAIGN'S REGISTERED fp8 PAIR AND IS NOT RE-REGISTERED:
 ``rtol=3e-2, atol=1e-5``, order named inline per design law D3, the pair
-``inc-glm53f-005`` registered and ``-025`` and ``-071`` already compare at. The
+the campaign registered and other readings already compare at. The
 predicate is spelled out here rather than delegated, because
 ``_DEFAULT_DTYPE_TOLERANCE`` has NO fp8 entry and an omitted pair silently inherits
 the bf16 one (PIT-13). The worst relative error is REPORTED as a number either way.
 
-THE GROUP CONVENTION IS ``inc-glm53f-100``'s, cited and re-authored rather than
+THE GROUP CONVENTION IS THE HEAD-WIDTH SHARDING'S, cited and re-authored rather than
 imported: ``test_mla_decode.py:1086``'s ``_CountedTwoRankGroup`` records rank 0's
 partial and adds it back on rank 1, so two ranks meeting in one process reproduce
 what the collective does on hardware. That file is another block's surface and is
@@ -50,9 +50,9 @@ import torch
 
 from vllm_neuron.functional.blockwise_fp8_mm import SCALE_BLOCK_SIZE
 
-#: THE DENSE CONSUMER'S BLOCK, IMPORTED (``inc-glm53f-112`` round 2, ruling 2). This
+#: THE DENSE CONSUMER'S BLOCK, IMPORTED (round 2, ruling 2). This
 #: file used to type ``BLOCK_QUANT_SIZE = 256`` and build its grids at that number,
-#: which the dense seam refuses since `-112`: the kernel indexes the checkpoint's own
+#: which the dense seam refuses since the block-size change: the kernel indexes the checkpoint's own
 #: tiles. It is imported rather than re-typed as 128 so this fixture follows the
 #: kernel the next time that number moves, instead of going stale beside it.
 DENSE_BLOCK = SCALE_BLOCK_SIZE
@@ -68,7 +68,7 @@ HIDDEN_SIZE = 256
 INTERMEDIATE_SIZE = 512
 #: A whole number of ``TILE_SIZE`` rows. The dense seam does not pad, so a
 #: non-multiple would exercise its refusal instead of these numerics -- the gap
-#: ``inc-glm53f-026b`` owns, and not this item's subject.
+#: the dense pad owns, and not this item's subject.
 TOKENS = 128
 WORLD = 2
 SHARD_INTERMEDIATE = INTERMEDIATE_SIZE // WORLD
@@ -157,7 +157,7 @@ _BLOCKS_PER_REGIME = SHARD_INTERMEDIATE // DENSE_BLOCK
 def _per_regime(regimes: tuple[int, ...]) -> tuple[int, ...]:
     """Each declared regime repeated over the dense blocks it covers.
 
-    WHY THE REGIMES REPEAT RATHER THAN MULTIPLY (``inc-glm53f-112`` round 2). Moving
+    WHY THE REGIMES REPEAT RATHER THAN MULTIPLY (round 2). Moving
     the grids from the producer's 256 to the dense kernel's 128 doubles the number of
     scale entries. Giving each new entry its own exponent would change the effective
     matrix and every reference number in this file with it; repeating the regime the
@@ -281,7 +281,7 @@ def _run_half(carrier, layer, hidden: torch.Tensor) -> torch.Tensor:
 class _CountedTwoRankGroup:
     """The injected coordinator: it COUNTS, and it really sums.
 
-    ``inc-glm53f-100``'s object, re-authored here rather than imported from
+    the sharding's object, re-authored here rather than imported from
     ``test_mla_decode.py``, so that file keeps its single writer. On the FIRST pass
     it records each partial and leaves the tensor alone; on the SECOND it adds the
     recorded partial back IN PLACE. Rank 1's returned value is therefore the fully

@@ -1,4 +1,4 @@
-"""``inc-glm53f-005`` items 0 and 2-7, and extraction-fidelity guard B.
+"""Items 0 and 2-7 of the tolerance registry, and extraction-fidelity guard B.
 
 **Why this file parses a fixture instead of asserting literals.** The registered
 values live in the campaign's frozen acceptance registration, which is outside

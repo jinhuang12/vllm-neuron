@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Acceptance for `inc-glm53f-039a` -- the MLA low-rank projection kernel.
+"""Acceptance for the MLA low-rank projection kernel.
 
-FIVE tests, one per counted conjunct of the increment plan's `inc-glm53f-039a`
+FIVE tests, one per counted conjunct of the increment plan's
 Acceptance bullet, and NO `parametrize` decorator in this file: the plan requires
 exactly 5 collected items, and a parametrized case would collect as several items
 for one conjunct, so the count would stop meaning what it says. Each test prints
 its counted value and names the component whose behaviour it certifies.
 
 THIS FILE ANSWERS "DOES THE KERNEL COMPUTE THE PROJECTION?" AND NOTHING ELSE.
-Whether the model is wired to the kernel is `inc-glm53f-039b`'s question, asked in
+Whether the model is wired to the kernel is a separate question, asked in
 its own separate file. The plan keeps them apart deliberately: in one file either
 increment's counted predicate could be satisfied by the other increment's items.
 
@@ -35,7 +35,7 @@ import torch
 
 from vllm_neuron.functional.attention import mla_projections as MP
 
-#: The five projection sites and their widths, from the plan's `inc-glm53f-039a`
+#: The five projection sites and their widths, from the plan's
 #: geometry bullets. `S = 128` on every one of them, which the plan declares and
 #: conjunct 2 then measures against the sub-kernel-selection threshold.
 #:
@@ -388,7 +388,7 @@ def test_conjunct_2_every_declared_case_forces_the_cte_regime() -> None:
 def test_conjunct_3_counted_zero_on_the_refusing_vendor_seams() -> None:
     """CONJUNCT 3 of 5 -- zero references AND zero dispatches to either member.
 
-    CERTIFYING COMPONENT: the two substrate members `inc-glm53f-072`'s verdict
+    CERTIFYING COMPONENT: the two substrate members the verdict
     table names -- the fused QKV projection and the attention output projection.
 
     TWO READINGS, DELIBERATELY, because either alone is passable by a wrong
@@ -431,7 +431,7 @@ def test_conjunct_3_counted_zero_on_the_refusing_vendor_seams() -> None:
     conjunct's zero would say nothing about a vendor call made from inside the
     kernel, so the pair is what gives the zero its scope.
     """
-    say("C3_CERTIFYING_COMPONENT=the two substrate members inc-glm53f-072 refused "
+    say("C3_CERTIFYING_COMPONENT=the two substrate members refused "
         "(the fused QKV projection and the attention output projection)")
 
     src = module_source()

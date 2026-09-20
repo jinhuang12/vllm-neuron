@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Acceptance for ``dsa_causal_fill``: exact causal index rows, bit-identically -- ``inc-glm53f-099``.
+"""Acceptance for ``dsa_causal_fill``: exact causal index rows, bit-identically.
 
 WHAT IS BEING ASSERTED, and what each reading is worth. The fill is INTEGER INDEX ARITHMETIC, so
 there is no tolerance to spend and none is authored: the kernel is either exactly equal to the
@@ -54,7 +54,7 @@ WIDTH = 16
 
 Small on purpose and NOT a multiple of ``KEY_CHUNK``: the kernel admits any positive width, and the
 admissibility ceiling belongs to the CALLER (``index_expand.index_expand_width``). Asserting the
-ceiling here would be asserting ``inc-glm53f-102``'s claim in ``inc-glm53f-099``'s file."""
+ceiling here would be asserting the caller's claim in this file."""
 
 POSITIONS = [0, 3, 7, 15, 15]
 """The declared positions -- the block's own set, and every one of them earns its place.
@@ -92,7 +92,7 @@ def _positions(values: list[int]) -> torch.Tensor:
 def _assert_module_under_test_is_the_candidate() -> str:
     """Assert the module being measured is the candidate tree, and return where it resolved.
 
-    §78.1's obligation, in the form ``inc-glm53f-056``'s repair settled (DECISIONS §88, §91 i): when
+    §78.1's obligation, in the form an earlier repair settled (DECISIONS §88, §91 i): when
     ``GLM53F_CANDIDATE_ROOT`` is set the declared-root arm binds, and when it is UNSET the root is
     derived from this file's OWN tree instead of failing. A test that requires the campaign harness's
     environment variable is red by construction on every plain ``pytest`` run of the fork, which is
@@ -205,7 +205,7 @@ def test_the_kernel_rows_equal_the_oracle_exactly_and_a_doctored_oracle_fails() 
     # file's deliberately small shape, so the exactness is not exact merely because five rows and
     # sixteen columns are tiny. A position in the bypass regime is at most
     # ``select_k * index_kpool + index_kpool - 2``. The largest COLUMN magnitude is the caller's
-    # admissible width, which is ``index_expand_width``'s declared invariant and `inc-glm53f-102`'s
+    # admissible width, which is ``index_expand_width``'s declared invariant and its own
     # claim, so it is deliberately not asserted here -- the same scope line this file's WIDTH
     # docstring draws.
     index_topk, index_kpool = _fixture_dials()

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Acceptance for `inc-glm53f-036` -- the KDA decode state carry NKI kernel.
+"""Acceptance for the KDA decode state carry NKI kernel.
 
 **Three items, one per declared case, and no ``parametrize`` decorator in this
 file** (D1.2). Each item names the component whose behaviour it certifies (D1.4).
@@ -22,7 +22,7 @@ KERNEL, and the choice is load-bearing for three reasons. First, it serves
 ``k = 1``: the chunked path requires ``chunk >= 2``, so it cannot produce a
 one-token prefill at all. Second, it shares no formula with the decode kernel --
 it is torch walking tokens, the kernel is NKI advancing one -- so agreement is a
-real claim rather than a kernel checked against a kernel. Third, `-035b`'s
+real claim rather than a kernel checked against a kernel. Third, the chunked path's
 conjunct 1 already tied the landed chunked prefill to THIS SAME oracle at
 ``5.960e-07``, so the statement "decode agrees with the landed prefill" is
 already measured and citable and does not need re-deriving here.
@@ -145,7 +145,7 @@ def _run_case(steps: int) -> None:
 
     assert tuple(state.shape) == (VDIM, KDIM), (
         f"the advanced state must come back in the [V, K] orientation "
-        f"{(VDIM, KDIM)} that `-035b`'s final_state is stored in, got "
+        f"{(VDIM, KDIM)} that the chunked path's final_state is stored in, got "
         f"{tuple(state.shape)}"
     )
 

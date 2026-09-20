@@ -1,19 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tier N acceptance for `inc-glm53f-029b` -- tiling the mHC combine's token axis.
+"""Tier N acceptance for tiling the mHC combine's token axis.
 
-Acceptance command (the same harness `-029` declares, this file substituted)::
+Acceptance command (the same harness the parent declares, this file substituted)::
 
     VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1 NKI_PRECISE_FP=1 \
     NEURON_PLATFORM_TARGET_OVERRIDE=trn2 \
     python -m pytest test/vllm_neuron/functional/mhc/test_hyper_connection_029b.py \
       --timeout 60 -p no:cacheprovider -s -rA
 
-What `-029b` changed, and what therefore has to be measured
+What changed, and what therefore has to be measured
 -----------------------------------------------------------
-`-029` allocated every sbuf tile in the kernel body at the FULL token count, so a
+The parent allocated every sbuf tile in the kernel body at the FULL token count, so a
 token extent above the partition limit could not be expressed: measured then,
 ``T = 128`` ran and ``T = 129`` trapped inside NKI with ``dma_copy dst partition
-dimension 129 exceeds maximum 128``. `-029b` walks the token axis in tiles of
+dimension 129 exceeds maximum 128``. The tiling walks the token axis in tiles of
 ``nl.tile_size.pmax`` instead, so the extent is served.
 
 Six items, NO ``parametrize``, so the collected count is derivable from the file
@@ -26,7 +26,7 @@ before it runs:
 3. TWO OR MORE tiles -- ``T = 300`` (2 whole tiles and a 44-row remainder) and
    ``T = 2048`` (16 whole tiles, the extent the WP11 rungs need);
 4. BIT-EXACTNESS below the old ceiling against an UNTILED reference kernel -- the
-   pre-`-029b` body, copied in verbatim because the tree no longer holds it;
+   untiled body, copied in verbatim because the tree no longer holds it;
 5. THE TRAP CONTROL, both directions: the untiled reference must trap at
    ``PARTITION_MAX + 1`` with the extent and the maximum EXTRACTED from the
    vendor's message, and the tiled kernel must serve the same shape. Without the
@@ -40,7 +40,7 @@ replaced code is here. The copy is TEST-ONLY, is imported by nothing shipped, an
 is deliberately left untiled so item 5 can drive it into the vendor's partition
 check.
 
-Tolerances are the pair `-029` already registered (``test_hyper_connection.py``
+Tolerances are the pair the parent already registered (``test_hyper_connection.py``
 ``:102-103``): ``rtol=1e-2`` with ``atol=1e-5``. No tolerance is authored, widened
 or narrowed here, and the tiled-versus-untiled arm carries no tolerance at all --
 tiling reorders nothing WITHIN a row, so the comparison is ``torch.equal``.
@@ -74,7 +74,7 @@ from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 S = MHC_STREAMS  # 4, the target's `hc_mult`, read off the module rather than typed
 
-#: The pair `-029` registered. Cited, not re-authored (P9).
+#: The pair the parent registered. Cited, not re-authored (P9).
 RTOL = 1e-2
 ATOL = 1e-5
 
@@ -82,7 +82,7 @@ ATOL = 1e-5
 #: is the whole point of the set: exactly one tile; one tile plus a single row;
 #: two tiles plus a short remainder; and many whole tiles.
 FULL_TILE = PARTITION_MAX  # 128
-SHORT_LAST_TILE = PARTITION_MAX + 1  # 129 -- the extent `-029` trapped on
+SHORT_LAST_TILE = PARTITION_MAX + 1  # 129 -- the extent the parent trapped on
 MULTI_TILE_REMAINDER = 300  # 2 * 128 + 44
 MULTI_TILE_WHOLE = 2048  # 16 * 128, the WP11 prefill extent
 
@@ -103,7 +103,7 @@ def _emit(tag: str, **values: object) -> None:
 class _SimulatorCounter:
     """Counts real ``nki.simulator.simulate_kernel`` calls for the duration.
 
-    The second route instrument, in the shape `-029`'s acceptance already uses. It
+    The second route instrument, in the shape the parent's acceptance already uses. It
     counts the VENDOR entry point, so a bug in the seam's own counter cannot fake
     it -- which is what makes "a kernel ran" a reading rather than an inference
     (F1). Under a torch fallback both sides of a numeric comparison would be
@@ -130,16 +130,16 @@ class _SimulatorCounter:
 
 
 # --------------------------------------------------------------------------- #
-# The UNTILED reference kernel -- `-029`'s body, copied verbatim.                #
+# The UNTILED reference kernel -- the parent's body, copied verbatim.            #
 # TEST-ONLY. Nothing shipped imports this, and it is left untiled ON PURPOSE so   #
 # item 5 can drive it into the vendor's partition check.                         #
 # --------------------------------------------------------------------------- #
 @nki.jit
 def _untiled_reference_kernel(x, residual, post_layer_mix, comb_res_mix):
-    """`-029`'s mHC combine body, before `-029b` tiled the token axis.
+    """The parent's mHC combine body, before the token axis was tiled.
 
     Every sbuf tile here is allocated at the FULL token count, which is exactly
-    the limitation `-029b` removed.
+    the limitation the tiling removed.
     """
     t_extent, s_extent, h_extent = residual.shape
 
@@ -179,7 +179,7 @@ def _untiled_reference_kernel(x, residual, post_layer_mix, comb_res_mix):
 def _inputs(rows: int, hidden: int, seed: int = 29):
     """The four tensors, fp32, deterministic by seed.
 
-    Same shape and construction as `-029`'s fixture: ``comb_res_mix`` is
+    Same shape and construction as the parent's fixture: ``comb_res_mix`` is
     row-stochastic (what a Sinkhorn stage hands the combine) and asymmetric (so an
     ``i``/``j`` transpose is visible), and ``x``/``residual`` are signed so a sign
     error shows.
@@ -293,7 +293,7 @@ def _serve(rows: int, hidden: int, tag: str):
 def test_a_full_tile_runs_and_matches_the_reference() -> None:
     """``T = PARTITION_MAX`` exactly: one tile, no remainder.
 
-    This is the extent `-029` already served, and it is here because tiling must
+    This is the extent the parent already served, and it is here because tiling must
     not break it: at exactly the tile height the loop runs once and the narrowing
     ``min`` must pick the full height rather than a short one.
     """
@@ -303,7 +303,7 @@ def test_a_full_tile_runs_and_matches_the_reference() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# ITEM 2 -- a genuinely short last tile, the extent `-029` trapped on.           #
+# ITEM 2 -- a genuinely short last tile, the extent the parent trapped on.       #
 # --------------------------------------------------------------------------- #
 def test_a_short_last_tile_runs_and_is_bit_exact_under_the_identity_pattern() -> None:
     """``T = PARTITION_MAX + 1``: the last tile holds ONE row.

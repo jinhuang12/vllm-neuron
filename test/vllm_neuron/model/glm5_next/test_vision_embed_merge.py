@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Acceptance for ``inc-glm53f-060``: the vision tower and the embed merge.
+"""Acceptance for the vision tower and the embed merge.
 
 WHAT EACH ITEM SETTLES, and which registered expectation it answers.
 
@@ -38,7 +38,7 @@ only the attributes those methods read. That is the form
 ``test/vllm_neuron/worker/test_get_kv_cache_spec_hybrid.py:206-224`` already
 uses on this branch, and it is deliberate here: the only production caller of
 ``_snapshot_encoder_entries`` sits inside ``execute_model``, which on this
-branch still reaches ``inc-glm53f-013``'s raising stub. Driven through
+branch still reaches a raising stub. Driven through
 ``execute_model`` these items would fail on that raise instead of on an
 assertion, which would say nothing about the cache.
 

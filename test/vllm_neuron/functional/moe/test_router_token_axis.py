@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Acceptance test for ``inc-glm53f-088`` -- the router seam serves ANY token extent.
+"""Acceptance test: the router seam serves ANY token extent.
 
 What the increment does, in one sentence: the ``noaux_tc`` seam used to REFUSE any
 token count that was not a multiple of 256, and it now pads the token axis at each
@@ -31,7 +31,7 @@ load-bearing:
       --timeout 60 -v -s
 
 THE COMPARATOR IS NOT NEW (P9). ``assert_close(rtol=1e-2, atol=1e-5)`` and index
-SET equality are the ``inc-glm53f-032`` seam's own declared readings, restated
+SET equality are the seam's own declared readings, restated
 here at new extents. Nothing is widened and no new tolerance is introduced.
 
 REPAIR ROUND 2 (2026-09-04), and what it changed and did not. Review B56 found one
@@ -105,7 +105,7 @@ TINY_H = 256
 #: The fused entry's pad multiple, read from the seam rather than written as 256.
 FUSED_MULTIPLE = seam._NOAUX_TC_T_MULTIPLE
 
-# Fixture conditioning, carried from ``inc-glm53f-032``'s own construction.
+# Fixture conditioning, carried from the seam's own construction.
 WINNER_HI, WINNER_LO = 0.785, 0.750
 LOSER_HI, LOSER_LO = 0.700, 0.100
 BIAS_AMP = 0.040
@@ -113,7 +113,7 @@ FIXTURE_SEED = 88
 
 
 def build_logits(tokens: int, seed: int = FIXTURE_SEED):
-    """The ``-032`` conditioned ladder at an arbitrary token count.
+    """The seam's conditioned ladder at an arbitrary token count.
 
     The CORRECTED score is what is constructed, because ``noaux_tc`` selects on
     ``sigmoid(logits) + bias``: the top-8 sit in ``[0.750, 0.785]`` and the rest
@@ -159,7 +159,7 @@ def build_hidden(tokens: int, seed: int = FIXTURE_SEED):
 
 
 # ---------------------------------------------------------------------------
-# The route instruments. Same four readings as ``inc-glm53f-032``'s test module,
+# The route instruments. Same four readings as the seam's test module,
 # rebuilt here for the reason given in the module docstring.
 # ---------------------------------------------------------------------------
 

@@ -1,10 +1,10 @@
-"""``inc-glm53f-030c``: the mHC layer's arithmetic corrections, against the model.
+"""The mHC layer's arithmetic corrections, against the model.
 
 WHAT THIS FILE MEASURES, and why it is a new file rather than more items in
-``test_mhc_layer.py``. ``inc-glm53f-030`` landed :class:`Glm5NextHyperConnection`
+``test_mhc_layer.py``. An earlier increment landed :class:`Glm5NextHyperConnection`
 and measured it against the **pinned base's** two spellings of ``mhc_pre``. That
 comparison cannot see a place where the base and the TARGET MODEL disagree,
-because both sides of it are the base. ``-030c`` compares the layer against the
+because both sides of it are the base. This file compares the layer against the
 checkpoint's own model file instead, and two disagreements fall out:
 
 * **the post gate's multiplier.** The target computes
@@ -21,11 +21,11 @@ checkpoint's own model file instead, and two disagreements fall out:
   epsilons are unaffected: the target adds ``hc_eps`` after the pre sigmoid
   (``:283``) and after the comb softmax (``:286``), which is what the layer does.
 
-A NEW FILE AND NOT AN EXTENSION, for a measured reason. ``inc-glm53f-028b-tn``
+A NEW FILE AND NOT AN EXTENSION, for a measured reason. The tiled Sinkhorn arm
 declares ``test_mhc_layer.py``'s collection as **exactly 28** items with **28**
 ``PASSED`` lines. Adding items there would falsify both of that block's counted
-values, so this increment authors its own file and leaves every value ``-028b-tn``
-recorded untouched. That is also what ``inc-glm53f-054d`` did, landing its proof
+values, so this increment authors its own file and leaves every value that arm
+recorded untouched. That is also what the FFN reduction did, landing its proof
 in a new ``test_ffn_reduction_054d.py``.
 
 THE REFERENCE IS TRANSCRIBED, WITH ITS LINES CITED, and the transcription is
@@ -71,7 +71,7 @@ from vllm_neuron.utils.neuron_utils import can_run_kernel
 # --------------------------------------------------------------------------- #
 #: Tokens. Well inside every seam bound, so no item here is also a boundary case.
 T = 8
-#: Streams. ``-028``'s own constant for the target's ``hc_mult 4``, imported.
+#: Streams. The Sinkhorn seam's own constant for the target's ``hc_mult 4``, imported.
 S = MHC_STREAMS
 #: Hidden.
 H = 64
@@ -89,7 +89,7 @@ REFERENCE_LINES = {
 }
 #: The target's post multiplier, read off ``reference:284``.
 REFERENCE_POST_MULT = 2.0
-#: The value ``-030`` defaulted to. Kept ONLY as the failing control's input.
+#: The value the layer defaulted to. Kept ONLY as the failing control's input.
 OLD_POST_MULT = 1.0
 
 
@@ -162,7 +162,7 @@ def _layer(post_mult_value: float | None = None, hidden: int = H):
     """The layer under test. ``post_mult_value`` is LEFT DEFAULT unless given.
 
     Every item but the failing control takes the default on purpose: the default
-    is the thing ``-030c`` corrects, so a test that always passed the value
+    is the thing this file corrects, so a test that always passed the value
     explicitly could not see the correction at all -- which is exactly why
     ``test_mhc_layer.py`` cannot: it passes ``POST_ALPHA`` at its line 375.
     """
@@ -257,7 +257,7 @@ def _reference_path() -> str | None:
 def _route_reading(label: str, calls: int) -> str:
     """Print and CHECK the Sinkhorn route, so no reading here is a torch pass.
 
-    ``mhc_pre`` enters ``-028``'s seam exactly once per call. A run whose
+    ``mhc_pre`` enters the Sinkhorn seam exactly once per call. A run whose
     ``torch_fallback`` moved would be comparing torch against torch, which would
     make every number in this file meaningless rather than merely wrong.
     """
@@ -271,7 +271,7 @@ def _route_reading(label: str, calls: int) -> str:
     print(reading)
     if nki_dispatch != calls:
         raise RouteInstrumentError(
-            f"{label}: -028's dispatch counter read {nki_dispatch} over {calls} "
+            f"{label}: the Sinkhorn dispatch counter read {nki_dispatch} over {calls} "
             f"mhc_pre call(s); exactly ONE per call is declared. {reading}"
         )
     if torch_fallback != 0:
@@ -300,7 +300,7 @@ def test_030c_post_gate_matches_the_reference_two_sigmoid() -> None:
     """The layer's ``post_mix`` equals ``reference:284`` on ``N/N`` cases.
 
     Taken on the DEFAULT ``post_mult_value``, because the default is what
-    ``-030c`` corrects.
+    this file corrects.
     """
     rtol, atol = _cited_tolerances()
     fn, hc_scale, hc_base, residual = _fixture()
@@ -338,7 +338,7 @@ def test_030c_the_default_post_multiplier_is_the_targets_two() -> None:
 
     ``test_mhc_layer.py`` cannot make this reading: it constructs with
     ``post_mult_value=POST_ALPHA`` at its line 375, so the default never reaches
-    it. That is why the defect survived ``-030``'s landed acceptance.
+    it. That is why the defect survived the layer's landed acceptance.
     """
     layer, _ = _layer()
     print(
@@ -474,7 +474,7 @@ def test_030c_rms_epsilon_site_is_load_bearing_and_the_old_value_moves_it() -> N
     _load(layer, fn, hc_scale, hc_base)
 
     eps_new = float(layer.rms_eps)  # the corrected constant, `config.rms_norm_eps`
-    eps_old = float(layer.hc_eps)  # what `-030` wrongly read at this site
+    eps_old = float(layer.hc_eps)  # what the layer wrongly read at this site
     if eps_new == eps_old:
         raise VacuousControlError(
             f"rms_eps and hc_eps are both {eps_new}, so swapping one for the "
@@ -952,7 +952,7 @@ def test_030c_each_normalised_block_hits_the_seams_declared_targets() -> None:
 
     This is the plan's row for correction (iii), and it is a reading about the
     SEAM SWAP rather than about arithmetic the layer authors: ``mhc_pre`` now
-    hands ``-028b``'s batched kernel the ``T`` blocks directly, so every one of
+    hands the Sinkhorn batched kernel the ``T`` blocks directly, so every one of
     the ``T`` blocks -- not their average -- must come back on target.
 
     The two targets are IMPORTED from the seam, never restated here
@@ -964,7 +964,7 @@ def test_030c_each_normalised_block_hits_the_seams_declared_targets() -> None:
     ``test_mhc_layer.py``, used per axis the way that file's own landed item uses
     them on this same quantity at this same case: the seam ends on a COLUMN pass,
     so the column axis is the exact one (``atol``) and the row axis is the one
-    left one half-step behind (``rtol``). ``-028``'s own declared per-axis
+    left one half-step behind (``rtol``). The seam's own declared per-axis
     expected result, "within ``1e-3`` of *its* target"
     (``sinkhorn.py:267-268``), is printed beside them so a reader can see all
     three numbers rather than trust one.

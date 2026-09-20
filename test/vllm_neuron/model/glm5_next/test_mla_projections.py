@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Acceptance for `inc-glm53f-039b` — the MLA projection CALL SITE.
+"""Acceptance for the MLA projection CALL SITE.
 
-FIVE tests, one per counted conjunct of the increment plan's `inc-glm53f-039b`
+FIVE tests, one per counted conjunct of the increment plan's
 Acceptance bullet, and NO `parametrize` decorator in this file: the plan requires
 exactly 5 collected items, and a parametrized case collects as several items for
 one conjunct, so the count would stop meaning what it says.
 
 THIS FILE ASKS "IS THE MODEL WIRED TO THE KERNEL?" AND NOTHING ELSE. Whether the
-kernel computes a projection correctly is `inc-glm53f-039a`'s question, asked in
+kernel computes a projection correctly is a separate question, asked in
 its own separate file under `test/vllm_neuron/functional/attention/`. The plan
 keeps the two apart on purpose: in one file either increment's counted predicate
 could be satisfied by the other increment's items.
@@ -36,7 +36,7 @@ import pytest
 import torch
 
 #: The five projection sites and their widths, transcribed from the plan's
-#: `inc-glm53f-039a` geometry bullets as they are carried in `### 3L.1`. They are
+#: geometry bullets as they are carried in `### 3L.1`. They are
 #: transcribed so that the closed form the code computes is compared against a
 #: number from the plan, not against itself.
 DECLARED_SITES = (
@@ -59,7 +59,7 @@ DECLARED_SITES = (
 #: that file grows above the field -- and this assertion firing is the drift
 #: being noticed on time, which is the whole point of pinning it.
 #:
-#: RE-PINNED AT `inc-glm53f-033` REPAIR ROUND 2. Not one value moved: all nine
+#: RE-PINNED AT REPAIR ROUND 2. Not one value moved: all nine
 #: were re-read from the AST and all nine matched. Every line moved, in two
 #: groups with two different causes. The first eight moved `+13`, because that
 #: round rewrote prose above the class declaration (`Glm5NextTextConfig` went
@@ -68,7 +68,7 @@ DECLARED_SITES = (
 #: it. `13 + 20 = 33`, and the file grew by exactly 33 lines, so the two causes
 #: account for the whole drift with nothing left over.
 #:
-#: RE-PINNED AT `inc-glm53f-051`. Again not one VALUE moved, and this time eight of
+#: RE-PINNED AGAIN. Not one VALUE moved, and this time eight of
 #: the nine LINES did not move either: `rms_norm_eps` alone went `221 -> 256`, which
 #: is `+35`. This block inserted the DSA indexer's section between `mla_use_nope`
 #: and it -- `config.py:184-218`, the seven dials and their prose -- and that
@@ -96,7 +96,7 @@ DECLARED_CONFIG_FIELDS = (
 )
 
 #: The sequence length every case runs at. Above the sub-kernel-selection
-#: threshold `-039a`'s conjunct 2 reads from its defining line, which closes the
+#: threshold the kernel's conjunct 2 reads from its defining line, which closes the
 #: same dodge here: a shorter sequence would route to the sub-kernel that carries
 #: no width bound at all, so it would prove nothing about the refusal.
 DECLARED_SEQ = 128
@@ -119,7 +119,7 @@ TINY_OVERRIDES = {
     "v_head_dim": 16,
 }
 
-#: Path fragments naming the two members `inc-glm53f-072` measured as REFUSING.
+#: Path fragments naming the two members measured as REFUSING.
 #: Resolved from the installed distribution rather than guessed.
 VENDOR_PATH_FRAGMENTS = ("core/qkv/", "core/output_projection/")
 
@@ -253,7 +253,7 @@ def trace_projection(module, hidden, attn_out):
     THE HOOK IS REGISTERED TWICE, and that is not redundancy. The simulator runs
     a kernel body on a worker thread and a profile hook is per-thread, so
     `sys.setprofile` alone sees the call site and misses everything the kernel
-    reached. `inc-glm53f-039a` measured that: with one hook the kernel body read
+    reached. The kernel's own acceptance measured that: with one hook the kernel body read
     0 frames, and adding the threading hook brought it to a non-zero count. Both
     registrations are what give conjunct 5's zero its scope.
     """
@@ -517,7 +517,7 @@ def test_conjunct_3_numeric_agreement_against_a_torch_oracle() -> None:
     `project_qkv` and `project_output`.
 
     S = 128 IS ABOVE 96 AND THAT IS THE POINT, not an arbitrary size. It closes
-    the same dodge `-039a`'s conjunct 2 closes: below the sub-kernel-selection
+    the same dodge the kernel's conjunct 2 closes: below the sub-kernel-selection
     threshold the dispatch would route to the sub-kernel that carries no width
     bound, so the case would pass while proving nothing about the refusal the
     kernel exists to clear.
@@ -605,7 +605,7 @@ def test_conjunct_4_route_predicate_r2_five_simulator_dispatches() -> None:
     """CONJUNCT 4 of 5 — route predicate D13 form R-2: 5 dispatches, 0 fallbacks.
 
     CERTIFYING COMPONENT: the F1 chain from this call site through
-    `inc-glm53f-039a`'s `mla_projections.py` seam — a seam this increment does
+    the `mla_projections.py` seam — a seam this increment does
     NOT author, which is what makes the form R-2 and not R-1.
 
     A PURE-TORCH CALL SITE READS 0 HERE AND THEREFORE CANNOT PASS. That is the
@@ -624,7 +624,7 @@ def test_conjunct_4_route_predicate_r2_five_simulator_dispatches() -> None:
     dispatches four times and the output projection once.
     """
     say("C4_CERTIFYING_COMPONENT=the F1 chain from this call site through "
-        "inc-glm53f-039a's mla_projections.py seam (a seam this increment does "
+        "the mla_projections.py seam (a seam this increment does "
         "not author)")
 
     from vllm_neuron.functional.attention import mla_projections as MP
@@ -695,7 +695,7 @@ def test_conjunct_4_route_predicate_r2_five_simulator_dispatches() -> None:
 def test_conjunct_5_counted_zeros_on_vendor_seams_and_torch_matmul() -> None:
     """CONJUNCT 5 of 5 — two counted zeros: no refused member, no torch matmul.
 
-    CERTIFYING COMPONENT: the two members `inc-glm53f-072` refused, and the
+    CERTIFYING COMPONENT: the two members the verdict refused, and the
     source of the `Glm5NextMLAAttention` class.
 
     THIS CONJUNCT EXISTS TO CATCH A CALL SITE THAT FALLS BACK, and the plan says
@@ -716,7 +716,7 @@ def test_conjunct_5_counted_zeros_on_vendor_seams_and_torch_matmul() -> None:
     THE DISPATCH SCREEN IS THE SAME FRAME TRACE conjunct 4 uses, so the two
     readings come from one run and cannot disagree about what happened.
     """
-    say("C5_CERTIFYING_COMPONENT=the two members inc-glm53f-072 refused, and "
+    say("C5_CERTIFYING_COMPONENT=the two members refused, and "
         f"the source of {OWNED_CLASS}")
 
     cfg = tiny_config()

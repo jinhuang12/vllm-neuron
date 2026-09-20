@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Sinkhorn normalisation for mHC: a SCRATCH NKI kernel, authored here.
 
-`inc-glm53f-028`. This is WP8's normalisation half -- the iterative row/column
+This is WP8's normalisation half -- the iterative row/column
 rescaling that turns a raw mHC affinity matrix into a doubly stochastic one
-before `inc-glm53f-029`'s combine kernel mixes the hyper-connection streams.
+before the combine kernel mixes the hyper-connection streams.
 
 It is **kernel-class** under P13, and it is **SCRATCH with ZERO precedent**:
 the plan's substrate bullet records that ``nkilib`` has **0** hits for
@@ -73,7 +73,7 @@ considered and rejected: it costs 40 ``nc_transpose`` ops for the same answer.
 
 Serving more rows than one partition tile holds
 -----------------------------------------------
-`inc-glm53f-028b`. ``M`` is the token axis, and serving needs prefill extents of
+``M`` is the token axis, and serving needs prefill extents of
 2048 tokens and more, so ``M`` runs to ``2048 * hc_mult`` and far past the 128
 partitions one tile has. The kernel therefore walks ``M`` in tiles **inside the
 kernel**. Nothing about the answer changes: the row pass is per row and so is
@@ -110,7 +110,7 @@ a wrong answer.
 
 Taking the blocks instead of the block-diagonal matrix
 -----------------------------------------------------
-`inc-glm53f-028b`, second form. The square matrix above is **block-diagonal**, and
+The square matrix above is **block-diagonal**, and
 a block-diagonal matrix's row sums and column sums ARE its blocks' row sums and
 column sums -- every off-diagonal entry is zero, and a zero stays zero under any
 row or column scaling. So the global normalisation of ``block_diag(B_1..B_T)`` is
@@ -129,7 +129,7 @@ compared block-for-block against this module's own square kernel run on
 
 Both kernels stay. The square one is the general ``[M, N]`` normalisation and the
 acceptance case the plan declares; the batched one is what the mHC layer will
-call once `inc-glm53f-030b` switches it over. They share the targets, the
+call once the wiring switches it over. They share the targets, the
 denominator guard, the oracle and the dispatch counters, so no reading drifts
 between them.
 
@@ -165,12 +165,12 @@ Acceptance is Tier N: the NKI simulator, reached through this module's own
 :func:`sinkhorn_normalise` seam (``wrap_nki -> NKIHOPCaller -> HOP ->
 DispatchKey.CPU -> nki.simulator.simulate_kernel``). The seam counts its
 dispatches, and the counters are module-level state with module-level reset and
-read functions **on purpose**: `inc-glm53f-030`'s route predicate is form R-2
-over *this* seam together with `inc-glm53f-029`'s, so a later increment's own
+read functions **on purpose**: the layer's route predicate is form R-2
+over *this* seam together with the combine kernel's, so a later increment's own
 test must be able to zero and read these counters from another module. A
 test-local counter would satisfy this increment and break that one. This mirrors
-`inc-glm53f-026`'s landed placement (``functional/blockwise_fp8_mm.py:368-372``)
-deliberately, so the two seams `inc-glm53f-030` reads present one shape.
+the landed placement in ``functional/blockwise_fp8_mm.py:368-372``
+deliberately, so the two seams the layer reads present one shape.
 
 Under F1 a numeric comparison alone cannot prove a kernel ran -- a torch
 fallback would put torch on both sides of the comparison and pass green -- so
@@ -197,7 +197,7 @@ logger = logging.getLogger(__name__)
 
 #: The target's mHC stream count (``hc_mult 4``), and therefore the affinity
 #: matrix's column extent. Recorded as a named constant because
-#: `inc-glm53f-029`'s combine kernel and `inc-glm53f-030`'s layer wiring are
+#: the combine kernel and the layer wiring are
 #: sized by the same number; the kernel itself does not hardcode it.
 MHC_STREAMS = 4
 
@@ -210,7 +210,7 @@ SINKHORN_ITERS = 20
 SINKHORN_DENOM_EPS = 1e-30
 
 #: Partition-axis bound, from ``nl.tile_size.pmax``. This bounds ONE ROW TILE,
-#: not ``M``: `inc-glm53f-028b` walks ``M`` in tiles of at most this height, so a
+#: not ``M``: the kernel walks ``M`` in tiles of at most this height, so a
 #: matrix with more rows than this is served rather than refused. Written as a
 #: module constant so the tile arithmetic, the refusals below and any consumer
 #: read one number.
@@ -263,7 +263,7 @@ def row_target() -> float:
     """Every row's target sum: ``1.0``.
 
     A function rather than a bare constant so that the kernel, the oracle, the
-    acceptance's doubly-stochastic reading and `inc-glm53f-030` all take the
+    acceptance's doubly-stochastic reading and the layer all take the
     number from one place. The plan's expected result is stated per axis
     ("within 1e-3 of *its* target"), so the two targets must not drift apart.
     """
@@ -445,7 +445,7 @@ def sinkhorn_kernel(affinity, iters: int = SINKHORN_ITERS, block: int = MHC_STRE
         block: the mHC stream count ``S``, a **trace-time** constant. It sets the
             tile height through :func:`row_tile_extent` so that no token's
             ``S x S`` block is split across two tiles. Defaults to
-            :data:`MHC_STREAMS`; `inc-glm53f-030b`'s layer passes its own
+            :data:`MHC_STREAMS`; the mHC layer passes its own
             ``hc_mult`` rather than relying on the default.
 
     Returns:
@@ -756,7 +756,7 @@ def _require_admissible(rows: int, cols: int, block: int = MHC_STREAMS) -> None:
 
     ``M`` HAS NO UPPER BOUND HERE, and the absence is deliberate: the kernel walks
     ``M`` in row tiles, so re-imposing a partition-axis ceiling would refuse the
-    extents `inc-glm53f-028b` exists to serve. ``mla_projections.py:216-224``
+    extents the tiling exists to serve. ``mla_projections.py:216-224``
     records the same reading for its own tiled axes. What is still checked is that
     a token's block fits inside one tile, because the tiling is only correct if it
     cuts on block boundaries.
@@ -843,10 +843,10 @@ class _DispatchCounters:
 
 
 #: MODULE-LEVEL, and that is a contract rather than an implementation detail:
-#: `inc-glm53f-030` counts this seam's dispatches from its OWN test module (form
-#: R-2, together with `inc-glm53f-029`'s seam), so the counter must be
+#: the layer counts this seam's dispatches from its OWN test module (form
+#: R-2, together with the combine kernel's seam), so the counter must be
 #: resettable and readable from outside this module and outside this increment's
-#: test. `inc-glm53f-026` placed its counters this way for the same reason.
+#: test. The landed seam placed its counters this way for the same reason.
 _COUNTERS = _DispatchCounters()
 
 
@@ -904,7 +904,7 @@ def can_run_sinkhorn_blocks(
 
     The same two independent conditions as :func:`can_run_sinkhorn`, over
     :func:`_require_blocks_admissible`. Extents are taken as arguments rather than
-    read off the tensor so that a caller -- `inc-glm53f-030b`'s layer -- can ask
+    read off the tensor so that a caller -- the mHC layer -- can ask
     whether ``T`` tokens are servable BEFORE it builds the blocks.
 
     Args:
@@ -934,7 +934,7 @@ def sinkhorn_normalise(
             tiles are cut on multiples of it, so no token's ``S x S`` block is
             split. One call still means one dispatch however many tiles the row
             extent needs -- the tiling is inside the kernel, which is what
-            `inc-glm53f-028b` requires and what the route predicate measures.
+            the tiling requires and what the route predicate measures.
 
     Returns:
         ``[M, N]`` fp32, row sums :func:`row_target` and column sums
@@ -971,7 +971,7 @@ def sinkhorn_normalise(
 def sinkhorn_normalise_blocks(
     affinity_blocks: Tensor, iters: int = SINKHORN_ITERS
 ) -> Tensor:
-    """Normalise ``[T, S, S]`` blocks. The seam `inc-glm53f-030b` will call.
+    """Normalise ``[T, S, S]`` blocks. The seam the mHC layer will call.
 
     THIS SEAM HAS NO TORCH PATH AT ALL, and the difference from
     :func:`sinkhorn_normalise` is deliberate rather than an oversight. That seam

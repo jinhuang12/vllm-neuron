@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Acceptance test for ``inc-glm53f-032`` -- WP7 router: top-8 sigmoid with
+"""Acceptance test for WP7 router: top-8 sigmoid with
 ``noaux_tc``.
 
 The declared acceptance (increment plan revision 32,
@@ -46,8 +46,8 @@ routing included, against this module's reduced reference. The reduction is
 legitimate only because ``n_group == 1``, which is read from the campaign's own
 pinned ``fixtures/config.json`` rather than assumed.
 
-FIXTURE CONDITIONING (the plan's carry #7, and ``-025``'s lesson one level up).
-``-025`` attempt 1 died to catastrophic cancellation in a signed random fixture.
+FIXTURE CONDITIONING (the plan's carry #7, and a sibling's lesson one level up).
+That increment's attempt 1 died to catastrophic cancellation in a signed random fixture.
 The hazard here is different and discrete: a TIE AT THE SELECTION BOUNDARY. If a
 row's 8th and 9th largest corrected scores sit within fp32 round-off, torch's
 ``topk`` and the kernel's ``nisa.max8`` may pick different experts and the set
@@ -118,7 +118,7 @@ from vllm_neuron.functional.moe.router import (
     noaux_tc_correct_torch_oracle,
     noaux_tc_dispatch_counters,
     noaux_tc_rmsnorm_router_topk,
-    # The module's fused torch reference. Repair round 1 of `inc-glm53f-032`
+    # The module's fused torch reference. Repair round 1 of this file
     # imports it, because finding `M-B20-3` is that NO test did: it is the only
     # reference here that computes the normalisation and the router matmul
     # INDEPENDENTLY of the kernel, and it shipped with no execution coverage.
@@ -768,7 +768,7 @@ def test_route_control_simulator_is_load_bearing(monkeypatch) -> None:
 def test_dispatch_counters_are_module_level_state_reachable_from_elsewhere() -> None:
     """The counters must be resettable and readable across a module boundary.
 
-    The ``-025``/``-026`` precedent: a sibling increment counts this seam from
+    The landed precedent: a sibling increment counts this seam from
     its own test module (form R-2), so the counter's identity is a contract.
     """
     foreign = importlib.import_module(_ROUTER_MODULE)
@@ -818,7 +818,7 @@ def test_refused_extents_raise_by_name(tokens, experts, top_k, needle) -> None:
     torch oracle and passed green with zero kernel dispatches. On this seam it
     raises, so that outcome is unreachable.
 
-    THIS LIST LOST TWO ROWS AT ``inc-glm53f-088``, and where they went matters.
+    THIS LIST LOST TWO ROWS, and where they went matters.
     ``T = 128`` and ``T = 384`` were refused here for ``T % 256 != 0``; that
     clause is gone and the seam now pads the token axis instead. The two extents
     are not dropped -- they are re-pinned as the two admitted readings below,
@@ -841,7 +841,7 @@ def logits_at_token_extent(tokens: int):
     """The conditioned fixture, re-indexed to ``tokens`` rows.
 
     ``build_designed_logits`` hardcodes ``DECLARED_T`` and takes no token count,
-    and it is a LANDED fixture ``inc-glm53f-088`` does not touch. Re-indexing it
+    and it is a LANDED fixture this increment does not touch. Re-indexing it
     is sound because its conditioning is a per-ROW property: each row is its own
     ``randperm`` of one ladder (``:216-219``), so the 8/9 boundary gap holds row
     by row and a repeated row is a repeated CONDITIONED row. ``% DECLARED_T``
@@ -899,7 +899,7 @@ def _assert_admitted_token_extent(tokens: int) -> None:
 
 
 def test_token_extent_128_is_admitted_and_matches_the_reference() -> None:
-    """``inc-glm53f-088``: ``T = 128`` was a named refusal here and now runs.
+    """``T = 128`` was a named refusal here and now runs.
 
     Re-pin 1 of the two rows removed from ``test_refused_extents_raise_by_name``
     above. 128 is BELOW the old multiple of 256, which is the half of that clause
@@ -909,7 +909,7 @@ def test_token_extent_128_is_admitted_and_matches_the_reference() -> None:
 
 
 def test_token_extent_384_is_admitted_and_matches_the_reference() -> None:
-    """``inc-glm53f-088``: ``T = 384`` -- re-pin 2, ABOVE the old multiple.
+    """``T = 384`` -- re-pin 2, ABOVE the old multiple.
 
     128 sits below 256 and 384 above it without being a multiple, so the two
     re-pins cover both ways the removed clause could refuse.
@@ -1189,7 +1189,7 @@ def test_pin_router_gate_is_untouched() -> None:
 # was imported by no test. The arms below compare against that reference, built
 # independently from the same inputs, and execute the fallback path.
 #
-# NOT touched here: the multiple-of-256 refusal (`M-B20-2`) is the `-088`
+# NOT touched here: the multiple-of-256 refusal (`M-B20-2`) is the open
 # token-policy question and belongs to the lead. No tolerance, extent or
 # comparator moves in this round.
 # ===========================================================================

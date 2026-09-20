@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """CONFIG-TIME quantisation allowlist, so an ``fp8`` checkpoint reaches the
-fork's OWN validator (``inc-glm53f-075``).
+fork's OWN validator.
 
 Four items, one per declared conjunct, **no** ``parametrize`` -- the declared
 count is 4 test-function definitions and stays derivable before the run by
@@ -17,7 +17,7 @@ nor ``_cpu_dequant_quantizations``.
 
 **NO ITEM CONSTRUCTS AN ENGINE.** Every reading is taken at the class object or
 at the pinned fixture bytes, so this acceptance can never depend on
-``inc-glm53f-074`` and the two blocks cannot deadlock. No network, no
+The registration and the two blocks cannot deadlock. No network, no
 checkpoint, no device. Nothing under any compile cache or ``VLLM_CACHE_ROOT``
 is read, written, deleted or relocated (P2).
 """
@@ -42,7 +42,7 @@ DECLARED_MEMBERS = PIN_MEMBERS + (ADMITTED,)
 REFUSED = "awq"
 
 # The campaign's pinned checkpoint config -- blob
-# 5d54bb5de98074e0ff8db6a455cb87adcf85501d, landed by inc-glm53f-008. Resolved
+# 5d54bb5de98074e0ff8db6a455cb87adcf85501d. Resolved
 # off ``__file__`` so the read cannot depend on the invocation's cwd.
 FIXTURE_CONFIG = (
     Path(__file__).resolve().parent / "model" / "glm5_next" / "fixtures" / "config.json"
@@ -64,7 +64,7 @@ def test_fp8_is_admitted_by_the_platform_allowlist() -> None:
     """Item 1 -- the gate evidence-074 measured raising now admits ``fp8``."""
     try:
         returned = NeuronPlatform.verify_quantization(ADMITTED)
-    except ValueError as exc:  # the L828-830 guard, i.e. the -074 blocker
+    except ValueError as exc:  # the L828-830 guard, i.e. the registration blocker
         pytest.fail(f"{ADMITTED!r} is still refused by the allowlist: {exc}")
 
     # "Returns None and raises nothing": the raise would have failed above.

@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 from .argsort_unstable import argsort_unstable
 
-# ``inc-glm53f-027``: the dense half of WP6's block-quant path
-# (`inc-glm53f-026`). Only the SEAM is re-exported; its module-level helpers
+# The dense half of WP6's block-quant path.
+# Only the SEAM is re-exported; its module-level helpers
 # share names with the MoE half at different arities and stay at their own
 # module path -- see ``moe/__init__.py`` for the measured collision set.
 from .blockwise_fp8_mm import blockwise_fp8_mm
@@ -39,8 +39,8 @@ from .moe.hierarchical_all2all_dispatch_permute import (
 )
 from .moe.moe_blockwise import build_blockwise_mapping
 
-# ``inc-glm53f-027``: the MoE half of WP6's block-quant path
-# (`inc-glm53f-025`), re-exported under the same one-name-per-module pattern the
+# The MoE half of WP6's block-quant path,
+# re-exported under the same one-name-per-module pattern the
 # line above uses.
 from .moe.moe_blockwise_fp8 import blockwise_fp8_moe
 from .moe.moe_block_tkg import moe_block_tkg

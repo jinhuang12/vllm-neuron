@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Dense blockwise-fp8 GEMM: a SCRATCH NKI kernel, authored here.
 
-`inc-glm53f-026`. This module is the dense half of the campaign's block-quant
+This module is the dense half of the campaign's block-quant
 path -- the projections outside the MoE expert banks. It is **kernel-class**
 under P13, and unlike its MoE sibling it is **SCRATCH rather than ADAPT**: G1
 found no blockwise member in the substrate's ``QuantizationType`` (static and
@@ -20,7 +20,7 @@ carrying one fp32 scale per ``128 x 128`` block of ``(K, N)``::
     dequantise(weight)[k, n] = weight[k, n] * weight_scale[k // 128, n // 128]
 
 That is the granularity the CHECKPOINT stores, and reading it directly is
-`inc-glm53f-112`. The kernel formerly indexed by ``256`` blocks, which meant the
+the re-pin. The kernel formerly indexed by ``256`` blocks, which meant the
 checkpoint's scales had to be retiled up to ``256`` before this kernel could use
 them -- four scales replaced by one, which is arithmetic on a scale and is
 exactly what the retile's error was.
@@ -68,7 +68,7 @@ Acceptance is Tier N: the NKI simulator, reached through this module's own
 :func:`blockwise_fp8_mm` seam (``wrap_nki -> NKIHOPCaller -> HOP ->
 DispatchKey.CPU -> nki.simulator.simulate_kernel``). The seam counts its
 dispatches, and the counters are module-level state with module-level reset and
-read functions **on purpose**: `inc-glm53f-033`'s route predicate is form R-2
+read functions **on purpose**: the route predicate is form R-2
 over *this* seam, so a later increment's own test must be able to zero and read
 these counters from another module. A test-local counter would satisfy this
 increment and break that one.
@@ -101,7 +101,7 @@ logger = logging.getLogger(__name__)
 #: The scale-block extent this module indexes by: the granularity the CHECKPOINT
 #: stores, one fp32 scale per ``128 x 128`` block of the weight.
 #:
-#: `inc-glm53f-112`. It is declared here and equals ``TILE_SIZE`` rather than
+#: It is declared here and equals ``TILE_SIZE`` rather than
 #: being imported from ``blockwise_fp8_retile``, whose ``BLOCK_QUANT_SIZE`` is
 #: the MoE consumer's ``256`` and is not this kernel's business. Two names for
 #: one granularity is the drift D17.1 exists to prevent, so this module carries
@@ -386,7 +386,7 @@ class _DispatchCounters:
 
 
 #: MODULE-LEVEL, and that is a contract rather than an implementation detail:
-#: `inc-glm53f-033` counts this seam's dispatches from its OWN test module (form
+#: the route predicate counts this seam's dispatches from its OWN test module (form
 #: R-2), so the counter must be resettable and readable from outside this
 #: module and outside this increment's test.
 _COUNTERS = _DispatchCounters()
@@ -434,7 +434,7 @@ def can_run_blockwise_fp8_mm(x: Tensor, rows: int, cols: int, tokens: int) -> bo
 def _checked_prebuilt_scale(prebuilt: Tensor, rows: int, cols: int) -> Tensor:
     """A caller-supplied kernel scale operand, or a refusal naming the shape.
 
-    `inc-glm53f-090`. When the operand is built once at load time the bridge
+    When the operand is built once at load time the bridge
     does not run, so the bridge's own checks do not run either. This is the net
     that replaces them at the seam.
 
@@ -482,7 +482,7 @@ def blockwise_fp8_mm(
             :func:`to_kernel_scale_layout` would have built, already built --
             shape :func:`kernel_scale_shape`, fp32. Supply it and the bridge is
             not entered on this call; omit it and this function behaves exactly
-            as it did before `inc-glm53f-090`, which is why `-026`'s landed
+            as it did before this keyword was added, which is why the landed
             acceptance needs no edit. ``weight_scale`` is still required either
             way: the torch-oracle fallback consumes the PUBLIC grid, so a
             prebuilt operand cannot stand in for it.
@@ -512,7 +512,7 @@ def blockwise_fp8_mm(
         return blockwise_fp8_mm_torch_oracle(x, weight, weight_scale)
 
     _count_nki_dispatch()
-    # `inc-glm53f-090`: the operand's ARRIVAL FORM, and the one build site.
+    # The operand's ARRIVAL FORM, and the one build site.
     # The counter increments only on the branch that actually builds, so a
     # reading of 0 over a forward step means the bridge did not run on it --
     # which is the whole claim. The count is folded off the traced graph: a
@@ -575,7 +575,7 @@ def kernel_identity() -> tuple[str, str]:
 
 
 # --------------------------------------------------------------------------- #
-# `inc-glm53f-090` OWNS EVERYTHING BELOW THIS LINE, AND IT SITS AT THE END OF   #
+# THE BUILD COUNTER OWNS EVERYTHING BELOW THIS LINE, AND IT SITS AT THE END OF  #
 # THE FILE ON PURPOSE. Six other files cite this module by line -- eleven cites #
 # in all -- and every one of them targets a line above `blockwise_fp8_mm`.      #
 # Defining these three names further up would have shifted all of them by the   #
@@ -587,7 +587,7 @@ def kernel_identity() -> tuple[str, str]:
 # which nothing in this campaign uses.                                          #
 # --------------------------------------------------------------------------- #
 # --------------------------------------------------------------------------- #
-# The scale-operand BUILD counter. `inc-glm53f-090` owns this and the operand's #
+# The scale-operand BUILD counter. It owns this and the operand's               #
 # arrival form below, and nothing else in this file.                            #
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -595,10 +595,10 @@ class _BuildCounters:
     """How many kernel scale operands the seam built itself.
 
     SEPARATE from ``_DispatchCounters`` deliberately. That dataclass, its reset
-    and its two-tuple reader are `inc-glm53f-026`'s, and `-026`'s landed
+    and its two-tuple reader are already landed, and that landed
     acceptance reads ``dispatch_counters()`` as a two-tuple -- a third field
-    would either change that shape or force an edit inside `-026`'s reset. A
-    separate counter leaves `-026`'s surface untouched.
+    would either change that shape or force an edit inside its reset. A
+    separate counter leaves that surface untouched.
 
     WHAT IT COUNTS, stated so a reading cannot be over-read: builds THE SEAM
     performs, at the one site in :func:`blockwise_fp8_mm`. A direct call to
@@ -612,7 +612,7 @@ class _BuildCounters:
 
 
 #: MODULE-LEVEL for the same reason ``_COUNTERS`` is, and it is the same
-#: contract: `inc-glm53f-090` reads this counter from its OWN test module, so it
+#: contract: the acceptance reads this counter from its OWN test module, so it
 #: must be resettable and readable from outside this module.
 _BUILD_COUNTERS = _BuildCounters()
 

@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Acceptance for `inc-glm53f-040` and `inc-glm53f-041` -- the sparse MLA latent
+"""Acceptance for the sparse MLA latent
 attention kernel and its tiling path.
 
 FOURTEEN tests and NO `parametrize` decorator in this file. Four carry `geometry` in
-their name and are `-040`'s DECLARED acceptance selection; eight carry `width` and are
-`-041`'s; two carry neither, and screen the module rather than measure the kernel. Each
+their name and are the landed seam's DECLARED acceptance selection; eight carry `width` and are
+the tiling's; two carry neither, and screen the module rather than measure the kernel. Each
 test prints its counted value and names the component whose behaviour it certifies.
 
 The declared command, and the only one whose result the plan block quotes::
@@ -22,8 +22,8 @@ RoPE half at all, and the route predicate is read over that one case.
 
 WHAT THIS FILE ANSWERS AND WHAT IT DOES NOT. It answers "does the kernel compute
 sparse latent attention at a geometry the substrate refuses". Whether the decode path
-is wired to it is `inc-glm53f-042`'s question, in its own file. Whether an arbitrary
-latent width tiles correctly is `inc-glm53f-041`'s, also in this file but as its own
+is wired to it is the decode path's question, in its own file. Whether an arbitrary
+latent width tiles correctly is the tiling's, also in this file but as its own
 items -- the `width` selection at the end of this file, added by that increment.
 """
 
@@ -223,7 +223,7 @@ def test_geometry_the_no_rope_declared_case_matches_the_torch_oracle() -> None:
         "vllm_neuron/functional/attention/mla_sparse.py")
     say(f"G1_TOLERANCE rtol={RTOL} atol={ATOL} (plan section 3, quoted not authored)")
     say("G1_DECLARED_CASE " + " ".join(f"{k}={v}" for k, v in case.items()))
-    # inc-glm53f-109 corrects THIS MESSAGE and nothing else in this file. The value is
+    # A later round corrects THIS MESSAGE and nothing else in this file. The value is
     # right for what this test does -- one scale applied identically to the kernel and
     # the reference, so agreement is measured at whatever scale is chosen -- but the old
     # text named the latent rank as "the" derivation, and a reader who took that as the
@@ -735,14 +735,14 @@ def test_the_kernel_entry_points_are_authored_here_and_not_imported() -> None:
             f"{qualname} reports module {module_name}, not {MS.__name__}: the kernel "
             f"under test is not authored in this module"
         )
-    # THE COUNT MOVED, AND `inc-glm53f-093` IS THE WRITER THAT MOVED IT. This is the one
-    # second-writer touch of `-040`'s items that block makes, and its plan block's
+    # THE COUNT MOVED, AND THIS BLOCK IS THE WRITER THAT MOVED IT. This is the one
+    # second-writer touch of the landed seam's items that block makes, and its plan block's
     # Surface bullet authorises it by name: "the enumerator/K1 count if it authors entry
-    # points (disclosed)". `-093` authors the row-tiled pair, so the enumerator returns
+    # points (disclosed)". This block authors the row-tiled pair, so the enumerator returns
     # six and this number follows it. Nothing else in this item changes.
     assert len(identities) == 6, (
         f"this module authors six entry points -- the NoPE one, the RoPE one, "
-        f"inc-glm53f-041's tiled pair and inc-glm53f-093's row-tiled pair; the identity "
+        f"the tiled pair and the row-tiled pair; the identity "
         f"reading returned {len(identities)}"
     )
     naive = MS.mla_sparse_attention_nope_kernel.__module__
@@ -751,33 +751,33 @@ def test_the_kernel_entry_points_are_authored_here_and_not_imported() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# `inc-glm53f-041` -- the eight `width` items. THE SELECTION IS PARTITIONED BY NAME:
+# The eight `width` items. THE SELECTION IS PARTITIONED BY NAME:
 # every item below carries `width` and none carries `geometry`, so `-k width` runs
-# this increment's acceptance and `-k geometry` still runs `-040`'s four unchanged.
-# The constants live here rather than beside `-040`'s so this increment reads as one
+# this increment's acceptance and `-k geometry` still runs the landed four unchanged.
+# The constants live here rather than beside the landed seam's so this increment reads as one
 # block, the same reason its kernel code is contiguous in the module.
 # --------------------------------------------------------------------------- #
 
 #: THIS INCREMENT'S DECLARED CASE. The width 2,051 is the plan block's own number,
 #: quoted and not chosen here: it violates `% 128` (2,051 = 16 x 128 + 3) and `% 16`
 #: alike, so it exercises a ragged tail on BOTH axes the kernel now tiles. Every other
-#: field is `-040`'s declared case unchanged, so the only moving part is the width.
+#: field is the landed seam's declared case unchanged, so the only moving part is the width.
 WIDTH_CASE = dict(seq=1, heads=64, latent=2051, topk=128, s_kv=256, rope=0)
 
 #: The exact-fit width the bit-identity claim compares against: 17 x 128 = 2,176, the
-#: next multiple of the partition tile above 2,051. It is NOT a width `-040` can serve
+#: next multiple of the partition tile above 2,051. It is NOT a width the untiled body can serve
 #: -- its landed seam refuses it for exceeding one MM2 moving tile -- so this is an
 #: internal-consistency claim between two widths on THIS increment's path, and the
-#: item's own docstring says so, in case a reader takes it for a comparison with `-040`.
+#: item's own docstring says so, in case a reader takes it for a comparison with the untiled body.
 REFERENCE_WIDTH = 2176
 
-#: The exact-fit control geometry, declared by the design lap out of `-040`'s review:
+#: The exact-fit control geometry, declared by the design lap out of the landed seam's review:
 #: `seq=2` and `topk=512` walk the per-query loop and the four-chunk MM2 loop that
-#: `-040`'s own 1/1 case never entered, at a latent that takes the UNTILED body.
+#: the landed seam's own 1/1 case never entered, at a latent that takes the UNTILED body.
 EXACT_FIT_CONTROL_CASE = dict(seq=2, heads=64, latent=512, topk=512, s_kv=1024, rope=0)
 
 #: A minimal tiled geometry, used where an item needs a tiled dispatch cheaply. Its
-#: width is `LATENT_TILE + 1`, which is the EXACT value `-040`'s G4 table used to
+#: width is `LATENT_TILE + 1`, which is the EXACT value the landed seam's G4 table used to
 #: assert was refused -- so its serving is the evidence for that row's deletion.
 MINIMAL_TILED_CASE = dict(seq=1, heads=8, latent=129, topk=128, s_kv=256, rope=0)
 
@@ -794,7 +794,7 @@ def case_scale(case: dict) -> float:
 
     Derived per case for `declared_scale`'s reason -- so the scale and the width
     cannot drift apart. Not a registered comparator value; this increment authors no
-    tolerance and quotes `RTOL`/`ATOL` from the plan like `-040` does.
+    tolerance and quotes `RTOL`/`ATOL` from the plan like the landed acceptance does.
     """
     return float(case["latent"]) ** -0.5
 
@@ -804,7 +804,7 @@ def both_counters() -> tuple[int, int, int, int]:
 
     Read as one tuple because the two counters COMPOSE rather than partition: the
     seam counter counts every dispatch whichever body ran, and the tiled counter
-    additionally counts the tiled ones. `-042` reads both, so both are stated together.
+    additionally counts the tiled ones. The decode path reads both, so both are stated together.
     """
     seam_nki, seam_fallback = MS.mla_sparse_dispatch_counters()
     tiled_nki, tiled_fallback = MS.mla_sparse_tiled_dispatch_counters()
@@ -823,7 +823,7 @@ def test_width_the_ragged_latent_matches_the_torch_oracle() -> None:
     CERTIFYING COMPONENT: `MS._attention_body_tiled`, reached through the seam's
     width branch.
 
-    THE ROUTE READINGS ARE PRINTED BEFORE THE NUMERIC COMPARE, because `-040`'s round
+    THE ROUTE READINGS ARE PRINTED BEFORE THE NUMERIC COMPARE, because the landed seam's round
     one learned that the other order loses them on a red run: a failing assertion took
     the dispatch lines with it and the mutation rows could not tell "the arithmetic
     broke" from "the kernel was never reached".
@@ -859,7 +859,7 @@ def test_width_the_ragged_latent_matches_the_torch_oracle() -> None:
     torch.testing.assert_close(got, want, rtol=RTOL, atol=ATOL)
     say("W1_CASES_AGREED=1/1")
 
-    # THE CONTROL, and it is `-040`'s -- the one already measured able to fire. One
+    # THE CONTROL, and it is the landed seam's -- the one already measured able to fire. One
     # selected row out of `topk` is replaced by a cache row the selection does not
     # hold, so the SET changes rather than its order, and the comparison must fail.
     substituted = idx.clone()
@@ -884,8 +884,8 @@ def test_width_the_zero_extended_reference_is_bit_identical() -> None:
     partition axis and MM2's moving axis.
 
     WHAT THE TWO SIDES ARE, because the plan block's wording can be read as a
-    comparison against `-040` and it cannot be one. BOTH sides run on THIS
-    increment's tiled path: `-040`'s landed seam refuses 2,051 (not a multiple of 128)
+    comparison against the untiled body and it cannot be one. BOTH sides run on THIS
+    increment's tiled path: the landed seam refuses 2,051 (not a multiple of 128)
     and refuses 2,176 as well (wider than one MM2 moving tile), so no width exists
     that both bodies serve. The unpadded side is the real 2,051. The padded side is
     the SAME inputs zero-extended BY THE CALLER to 17 x 128, sliced back to the real
@@ -1003,10 +1003,10 @@ def test_width_the_tiled_seam_counts_its_own_dispatch() -> None:
     CERTIFYING COMPONENT: the width branch in `MS.mla_sparse_attention` and
     `MS._MLA_SPARSE_TILED_COUNTERS`.
 
-    THE TWO COUNTERS COMPOSE AND THE ITEM MEASURES BOTH. `-040`'s seam counter counts
+    THE TWO COUNTERS COMPOSE AND THE ITEM MEASURES BOTH. The seam counter counts
     every dispatch through the seam whichever body runs; this increment's counter
     additionally counts the tiled ones. So a tiled call reads 1 and 1. That is the
-    reading `-042`'s decode predicate cites, and this block is its authority: it is
+    reading the decode predicate cites, and this block is its authority: it is
     stated here, per call, rather than inferred there.
 
     A pure-torch implementation reads 0 on both and cannot pass.
@@ -1096,16 +1096,16 @@ def test_width_an_exact_fit_call_leaves_the_tiled_counter_at_zero() -> None:
     """WIDTH 5 of 8 -- the exact-fit control: the tiled counter stays 0, the seam's reads 1.
 
     CERTIFYING COMPONENT: the width branch's FALSE arm -- an exact-fit latent must keep
-    `-040`'s untiled body.
+    the untiled body.
 
     THIS IS THE COUNTED ZERO THAT MAKES "ITS OWN COUNTED VALUE" A MEASUREMENT. Item 3
     shows both counters read 1 on a tiled call; this one shows the tiled counter reads
     0 when the width fits, and then fires it to 1 on a minimal tiled call in the same
     process, so the zero is a discrimination and not a counter that never moves.
 
-    THE GEOMETRY IS THE ONE `-040`'S REVIEW ASKED FOR: `seq=2` walks the per-query
-    loop and `topk=512` walks MM2's four-chunk loop, neither of which `-040`'s single
-    1/1 case entered. So this item also carries `-040`'s body into a corner its own
+    THE GEOMETRY IS THE ONE THE LANDED SEAM'S REVIEW ASKED FOR: `seq=2` walks the per-query
+    loop and `topk=512` walks MM2's four-chunk loop, neither of which the landed seam's single
+    1/1 case entered. So this item also carries the untiled body into a corner its own
     acceptance left unmeasured, at the plan's registered tolerance pair.
     """
     say("W5_CERTIFYING_COMPONENT=MS.mla_sparse_attention width branch, FALSE arm")
@@ -1132,7 +1132,7 @@ def test_width_an_exact_fit_call_leaves_the_tiled_counter_at_zero() -> None:
     say(f"W5_CASES_AGREED=1/1 over queries={case['seq']}")
 
     # THE CONTROL FOR THE ZERO: a minimal tiled call in the same process must move the
-    # tiled counter off 0. Its width is 129, which is exactly the value `-040`'s G4
+    # tiled counter off 0. Its width is 129, which is exactly the value the landed seam's G4
     # table used to assert was REFUSED.
     tiled_case = dict(MINIMAL_TILED_CASE)
     tq, tc, tidx, _, _ = make_case(**tiled_case, seed=43)
@@ -1148,9 +1148,9 @@ def test_width_the_shipped_oracle_agrees_with_the_independent_reference() -> Non
 
     CERTIFYING COMPONENT: `MS.mla_sparse_attention_torch_oracle`.
 
-    WHY THIS EXISTS, and it is a review finding on `-040` rather than a new idea. The
+    WHY THIS EXISTS, and it is a review finding on the landed seam rather than a new idea. The
     module ships that oracle as section 4's clause (a) -- the only torch arithmetic the
-    module is allowed -- and its presence is what `-040`'s P13 screen excludes BY NAME.
+    module is allowed -- and its presence is what the landed P13 screen excludes BY NAME.
     But no test called it, so the exclusion named a function nobody had checked. One
     agreement assert fixes that: the shipped oracle and this file's independently
     written float64 reference must agree at the tolerance pair the plan registers.
@@ -1182,7 +1182,7 @@ def test_width_the_two_widths_g4_used_to_refuse_are_now_served() -> None:
 
     CERTIFYING COMPONENT: the two relaxed latent bounds in `MS._require_admissible`.
 
-    THIS ITEM IS THE EVIDENCE FOR AN EDIT IN `-040`'S OWN ACCEPTANCE. `-040`'s G4 table
+    THIS ITEM IS THE EVIDENCE FOR AN EDIT IN THE LANDED SEAM'S OWN ACCEPTANCE. Its G4 table
     asserted refusals at `LATENT_TILE + 1` and `MOVING_MAX + LATENT_TILE`; this
     increment serves both widths, so those two rows were removed from G4 under the
     lead's ruling and their positive counterparts are asserted HERE instead. The two
@@ -1226,7 +1226,7 @@ def test_width_the_ragged_tail_tile_carries_signal_the_output_depends_on() -> No
 
     WHY THIS ITEM EXISTS, and it is a measured gap rather than an idea. Round 1's
     mutation row F deleted the ragged tail tile from MM1 -- a real defect in exactly the
-    arithmetic this increment adds -- and W1 PASSED: with `-040`'s random inputs the 3
+    arithmetic this increment adds -- and W1 PASSED: with the landed seam's random inputs the 3
     tail components move the output by 8.996e-06, under the plan's registered `atol` of
     1e-5. Only W2 caught it, and only by its control going inert. An acceptance that
     catches a deleted tail tile solely through an inert control is not certifying this
@@ -1345,10 +1345,10 @@ def test_width_the_ragged_tail_tile_carries_signal_the_output_depends_on() -> No
 
 
 # --------------------------------------------------------------------------- #
-# `inc-glm53f-093` -- the four `rows` items. THE SELECTION IS PARTITIONED BY NAME, on
-# `-041`'s form: every item below carries `rows` and no item above does, so `-k rows`
-# runs this increment's acceptance, `-k width` still runs `-041`'s eight and
-# `-k geometry` still runs `-040`'s four. At the parent commit `-k rows` collects NOTHING
+# The four `rows` items. THE SELECTION IS PARTITIONED BY NAME, on
+# the tiling's form: every item below carries `rows` and no item above does, so `-k rows`
+# runs this increment's acceptance, `-k width` still runs the tiling's eight and
+# `-k geometry` still runs the landed four. At the parent commit `-k rows` collects NOTHING
 # -- that is the selector's population control and it is read in the driver, not here.
 # --------------------------------------------------------------------------- #
 
@@ -1359,15 +1359,15 @@ def test_width_the_ragged_tail_tile_carries_signal_the_output_depends_on() -> No
 ROWS_CASE = dict(seq=2, heads=64, latent=512, topk=2048, s_kv=4096, rope=0)
 
 #: The split-invariance case: ONE score tile, where the row-tiled body must reproduce
-#: `-040`'s body exactly. `topk == MS.MOVING_MAX` is the widest count `-040` serves.
+#: the untiled body exactly. `topk == MS.MOVING_MAX` is the widest count it serves.
 SPLIT_CASE = dict(seq=2, heads=64, latent=512, topk=512, s_kv=1024, rope=0)
 
 #: A cheap two-tile geometry, for the item that has to move the row-tiled counter off
 #: zero after reading the zero.
 MINIMAL_ROW_TILED_CASE = dict(seq=1, heads=8, latent=128, topk=1024, s_kv=2048, rope=0)
 
-#: The combination D59-N6 keeps refused: a latent that needs `-041`'s tiling AND a row
-#: count that needs this block's. 2,051 is `-041`'s own declared width.
+#: The combination D59-N6 keeps refused: a latent that needs the latent tiling AND a row
+#: count that needs this block's. 2,051 is the tiling's own declared width.
 COMBINATION_LATENT = 2051
 
 #: Where the highest-scoring selected row is placed, and it is placed rather than left to
@@ -1381,7 +1381,7 @@ def all_counters() -> tuple[int, int, int, int, int, int]:
 
     Read as one tuple because all three COMPOSE rather than partition: the seam counter
     counts every dispatch whichever body ran, and each tiling counter additionally counts
-    its own. `-042` reads all three per decode step, so all three are stated together.
+    its own. The decode path reads all three per decode step, so all three are stated together.
     """
     seam_nki, seam_fb = MS.mla_sparse_dispatch_counters()
     tiled_nki, tiled_fb = MS.mla_sparse_tiled_dispatch_counters()
@@ -1414,7 +1414,7 @@ def order_rows_so_the_peak_lands_in_tile_one(q_lift, c_kv, idx):
     So the peak is PLACED in a middle tile, which makes both rescales do work. Reordering
     the selection is legitimate and is the disclosure this docstring exists for: a
     softmax-weighted sum over a SET does not depend on the order the set is listed in --
-    `-040` measured that when its first control could not fire (`investigation-040.md`,
+    the landed acceptance measured that when its first control could not fire (`investigation-040.md`,
     FOUND 1) -- so this changes WHICH arm of the kernel runs and not the expected value.
     """
     ordered = idx.clone()
@@ -1467,15 +1467,15 @@ def test_rows_the_production_selected_row_count_matches_the_torch_oracle() -> No
     CERTIFYING COMPONENT: `MS._attention_body_row_tiled`, reached through the seam's
     selected-row branch.
 
-    THIS IS THE READING THE BLOCK EXISTS FOR. `-043` landed the selector at this
-    checkpoint's `index_topk` of 2,048 and `-040`'s gate refused every count past 512, so
+    THIS IS THE READING THE BLOCK EXISTS FOR. The selector landed at this
+    checkpoint's `index_topk` of 2,048 and the landed gate refused every count past 512, so
     until this item ran, no test had read the kernel at the width the decode path passes.
 
-    THE ROUTE READINGS ARE PRINTED BEFORE THE NUMERIC COMPARE, `-040`'s and `-041`'s
+    THE ROUTE READINGS ARE PRINTED BEFORE THE NUMERIC COMPARE, the landed seam's and the tiling's
     lesson: a failing assertion takes the dispatch lines with it, and then a mutation row
     cannot tell "the arithmetic broke" from "the kernel was never reached".
 
-    THE COMPARISON'S CONTROL IS `-040`'S, the one already measured able to fire: one
+    THE COMPARISON'S CONTROL IS THE LANDED SEAM'S, the one already measured able to fire: one
     selected row is replaced by a cache row the selection does not hold, so the SET
     changes. A row PERMUTATION is NOT a control here and is not used as one -- the answer
     is order-invariant, which is the property this item's own row ordering relies on.
@@ -1584,27 +1584,27 @@ def test_rows_the_production_selected_row_count_matches_the_torch_oracle() -> No
 
 
 def test_rows_one_score_tile_is_bit_identical_to_the_untiled_body() -> None:
-    """ROWS 2 of 4 -- at one score tile the row-tiled body IS `-040`'s body, exactly.
+    """ROWS 2 of 4 -- at one score tile the row-tiled body IS the untiled body, exactly.
 
     CERTIFYING COMPONENT: `MS._attention_body_row_tiled`'s single-tile arm, against
     `MS._attention_body`.
 
     WHAT THE TWO SIDES ARE. Both entry points are called DIRECTLY rather than through the
-    seam, because the seam routes `topk=512` to `-040`'s body by design -- so the
-    row-tiled path has to be FORCED to be compared at a width `-040` also serves. That
-    is the whole reason this comparison is possible at all: unlike `-041`, which had no
+    seam, because the seam routes `topk=512` to the untiled body by design -- so the
+    row-tiled path has to be FORCED to be compared at a width the untiled body also serves. That
+    is the whole reason this comparison is possible at all: unlike the latent tiling, which had no
     width both bodies serve, the selected-row axis has an overlap at exactly
     `MS.MOVING_MAX`.
 
     WHY EXACT AND NOT `assert_close`. At one tile the merge emits NOTHING: the rescale
     block is behind a trace-time branch on the tile count, so the traced instruction
-    sequence is `-040`'s, with the Q transpose hoisted above a single-iteration loop and
+    sequence is the untiled body's, with the Q transpose hoisted above a single-iteration loop and
     one fp32 copy of the accumulator added. An fp32 copy does not change a value. The
     same claim was measured on the algebra before the kernel was written
     (`probe-093-merge-algebra.out` reading 1, bit-identical in Python floats).
 
     A NONZERO READING HERE IS `evidence_contradicts_design`. It would mean the single
-    tile arm is not `-040`'s arithmetic, and the answer is to report that, not to loosen
+    tile arm is not the untiled body's arithmetic, and the answer is to report that, not to loosen
     this line to a tolerance.
     """
     say("R2_CERTIFYING_COMPONENT=MS._attention_body_row_tiled single-tile arm vs "
@@ -1639,7 +1639,7 @@ def test_rows_one_score_tile_is_bit_identical_to_the_untiled_body() -> None:
     say(f"R2_BIT_IDENTICAL={int(diff == 0.0)}")
     assert compared == case["seq"] * case["heads"] * case["latent"]
     assert diff == 0.0, (
-        f"the forced row-tiled body disagrees with -040's body by {diff} at ONE score "
+        f"the forced row-tiled body disagrees with the untiled body by {diff} at ONE score "
         f"tile, where it emits no merge at all. That is evidence_contradicts_design: "
         f"report it, do not widen this line to a tolerance"
     )
@@ -1679,8 +1679,8 @@ def test_rows_the_gate_serves_the_production_count_and_still_refuses_by_name() -
     owes is the other side of that diff, printed the same way.
 
     THE CONTROL: the declared admissible case passes the same check, so "2,048 is served"
-    is not a check that stopped refusing anything. And `-041`'s own tiled width is still
-    served at a narrow row count, so the combination refusal below did not take `-041`'s
+    is not a check that stopped refusing anything. And the tiling's own tiled width is still
+    served at a narrow row count, so the combination refusal below did not take the tiling's
     path with it.
     """
     say("R3_CERTIFYING_COMPONENT=MS._require_admissible, the two relaxed topk clauses")
@@ -1704,11 +1704,11 @@ def test_rows_the_gate_serves_the_production_count_and_still_refuses_by_name() -
     chunk_message = " ".join(str(caught.value).split())
     say(f"R3_TOPK_130_MESSAGE_VERBATIM={chunk_message}")
     say(f"R3_IT_STILL_NAMES_ITS_OWN_AXIS={int('multiple of it' in chunk_message)}")
-    say(f"R3_IT_NO_LONGER_NAMES_041={int('inc-glm53f-041' not in chunk_message)}")
+    say(f"R3_IT_PROMISES_NO_INCREMENT={int('no increment is promised' in chunk_message)}")
     assert "multiple of it" in chunk_message
-    assert "inc-glm53f-041" not in chunk_message, (
-        "the chunk refusal still promises inc-glm53f-041's padding increment, which this "
-        "block was to remove"
+    assert "no increment is promised" in chunk_message, (
+        "the chunk refusal no longer states that no increment is promised, so it may be "
+        "promising one again, which this block was to rule out"
     )
 
     # STILL REFUSED, BY NAME: both tilings in one call (D59-N6). The message names both
@@ -1723,7 +1723,7 @@ def test_rows_the_gate_serves_the_production_count_and_still_refuses_by_name() -
         assert fragment in both_message, (
             f"the combination refusal does not name {fragment!r}: {both_message!r}"
         )
-    promises = [term for term in ("inc-glm53f-041", "inc-glm53f-093", "increment")
+    promises = [term for term in ("increment",)
                 if term in both_message]
     say(f"R3_THE_COMBINATION_REFUSAL_PROMISES_NOTHING={int(not promises)} "
         f"TERMS_FOUND={promises}")
@@ -1748,11 +1748,11 @@ def test_rows_the_row_tiled_seam_counts_its_own_dispatch() -> None:
     CERTIFYING COMPONENT: the selected-row branch in `MS.mla_sparse_attention` and
     `MS._MLA_SPARSE_ROW_TILED_COUNTERS`.
 
-    THE THREE COUNTERS COMPOSE AND THIS ITEM MEASURES ALL THREE. `-040`'s seam counter
-    counts every dispatch whichever body runs; `-041`'s counts the latent-tiled ones;
+    THE THREE COUNTERS COMPOSE AND THIS ITEM MEASURES ALL THREE. The seam counter
+    counts every dispatch whichever body runs; the tiling's counts the latent-tiled ones;
     this block's counts the row-tiled ones. At this checkpoint's geometry -- latent 512,
     an EXACT FIT, and 2,048 selected rows -- the reading is 1, 0, 1. That is the tuple
-    `-042`'s decode predicate cites per step, and this block is its authority: it is
+    the decode predicate cites per step, and this block is its authority: it is
     stated here, per call, rather than inferred there.
 
     A pure-torch implementation reads 0 for the row-tiled counter and cannot pass.
@@ -1811,7 +1811,7 @@ def test_rows_the_row_tiled_seam_counts_its_own_dispatch() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# `inc-glm53f-098` -- the SIX `sentinel` items. The kernel MASKS a `-1` selected-row
+# The SIX `sentinel` items. The kernel MASKS a `-1` selected-row
 # column instead of refusing it. Four are the block's four conjuncts at one untiled
 # shape; two repeat the sentinel readings on the other two bodies, because all three
 # read the index tensor and all three therefore carry the mask.

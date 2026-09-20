@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Exact causal index rows for the DSA indexer's short-sequence regime -- ``inc-glm53f-099``.
+"""Exact causal index rows for the DSA indexer's short-sequence regime.
 
 WHAT THIS KERNEL IS FOR, in one sentence: below the selection bound every candidate pool would be
 selected anyway, so there is nothing to select and the right answer is each query row's own causal
@@ -24,14 +24,14 @@ THE RULE, AND IT IS UPSTREAM'S SPELLED AS A CLOSED FORM::
 Upstream writes the same thing in two torch statements -- ``rows[:] = causal_range[None, :]`` then
 ``rows[causal_range[None, :] > positions[:, None]] = -1`` (``sparse_attn_indexer_kpool.py:196-201``).
 
-THE ``-1`` IS ``inc-glm53f-098``'s SENTINEL AND THIS MODULE ONLY WRITES IT. It means *"this column
+THE ``-1`` IS THE SENTINEL AND THIS MODULE ONLY WRITES IT. It means *"this column
 selects no token"* and is a VALUE, not an out-of-bounds index. The masking is the consumer's:
 ``mla_sparse_attention`` masks ``-1`` columns before the row max and sum and admits ``lo >= -1``
 (``mla_sparse.py:1262-1267``). Nothing here masks, clamps, compacts or fills, exactly as entry
 ``design-20260905-af`` route (a) ruled for the whole chain.
 
 THE WIDTH IS THE CALLER'S, AND IT IS THE ADMISSIBLE ONE. ``width`` is the expanded width
-``inc-glm53f-102`` emits -- a positive multiple of ``KEY_CHUNK``, from
+the expansion emits -- a positive multiple of ``KEY_CHUNK``, from
 ``index_expand.index_expand_width`` -- never the raw ``pool_size * (n_groups + 1) - 1``. This
 kernel fills ``-1`` beyond a row's causal columns exactly as that padding does, so the bypass path
 and the selecting path hand ``mla_sparse_attention`` the same shape and the same sentinel
@@ -39,7 +39,7 @@ convention. The width is NOT recomputed here: a second spelling of that ceiling 
 thing to keep in step.
 
 WHY THIS IS KERNEL-CLASS AND LANDS IN NKI (P13). The output is an index tensor produced on device
-for the device kernel that consumes it -- ``inc-glm53f-048``'s precedent exactly. A torch fill on
+for the device kernel that consumes it -- the expansion's precedent exactly. A torch fill on
 the host would be a fallback for kernel-class work AND one host round trip per decode step, on the
 step-by-step path that runs for the first two thousand steps of every request.
 
@@ -67,7 +67,7 @@ landed kernel; nothing here is a new spelling.
   * A PER-ROW VALUE REACHES ``tensor_scalar`` AS A ``(rows, 1)`` COLUMN OPERAND, broadcast along
     the free axis (``moe/router.py:1291`` states the broadcast; ``moe/topk_reduce.py:262`` is the
     landed call). A ``(1, N)`` row operand is refused by the MLIR verifier for this position -- the
-    ``-045`` finding, recorded at ``score_gemm.py:84-88`` -- so the reshape happens once on the
+    finding, recorded at ``score_gemm.py:84-88`` -- so the reshape happens once on the
     host.
   * A CHAIN MIXING A TILE OPERAND AND AN INT OPERAND IN ONE ``tensor_scalar`` IS NOT USED, because
     no landed call site screens it. Two-int chains are screened (``index_expand.py:361``) and
@@ -93,7 +93,7 @@ from vllm_neuron.utils.neuron_utils import can_run_kernel
 logger = logging.getLogger(__name__)
 
 SENTINEL = -1
-"""What a column that selects no token holds. ``inc-glm53f-098``'s value, written here, masked there."""
+"""What a column that selects no token holds. The producer's value, written here, masked there."""
 
 _SUPPORTED_DTYPES = (torch.int32,)
 """Position dtypes that take the NKI route. int32 is what the indexer carries and what the consumer
@@ -193,7 +193,7 @@ def _causal_fill_nki(positions_hbm, width):
     written twice -- the failure mode ``index_expand.py:297-303`` had to partition three regions to
     avoid. The column ramp is one iota and the rule is one closed form over it.
 
-    THE ROW AXIS IS TILED AT ``nl.tile_size.pmax`` (``inc-glm53f-103d``). It used to say "there is
+    THE ROW AXIS IS TILED AT ``nl.tile_size.pmax``. It used to say "there is
     no loop here at all", and that sentence was the defect: a row is a PARTITION, the partition axis
     serves 128, and this kernel bound every one of its nine tiles to the full row count. Any prefill
     above 128 tokens therefore died inside the vendor's own check --
@@ -392,7 +392,7 @@ def dsa_causal_fill(positions: Tensor, width: int) -> Tensor:
     Returns:
         ``[rows, width]`` int32. Column ``c`` of row ``i`` holds ``c`` when ``c <= positions[i]``
         and :data:`SENTINEL` otherwise. The sentinel is a VALUE that the sparse attention kernel
-        masks (``inc-glm53f-098``); this function never masks it.
+        masks; this function never masks it.
 
     Raises:
         DsaCausalFillError: for a malformed call -- a non-int ``width``, a ``width`` below 1, a

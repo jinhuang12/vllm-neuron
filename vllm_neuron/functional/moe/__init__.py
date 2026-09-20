@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Public exports for the MoE functional subpackage.
 
-``inc-glm53f-027``. This file was 0 bytes at the pin: every consumer of
+This file was 0 bytes at the pin: every consumer of
 ``vllm_neuron.functional.moe.*`` reached its module by full dotted path, and the
 parent package re-exported single names through that path
 (``functional/__init__.py:34`` -- ``from .moe.moe_blockwise import

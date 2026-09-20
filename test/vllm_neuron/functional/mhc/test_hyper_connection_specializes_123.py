@@ -23,7 +23,7 @@ file before it runs:
 
 1. SPECIALISATION at the seam, under a META FORWARD of the tiny stack -- the
    venue that refused the pre-change body on this host, reported per capture leg.
-   The -119 meta-forward item's own helpers are imported and used: they build the
+   The meta-forward item's own helpers are imported and used: they build the
    tiny root and its runner on ``meta`` and drive the two capture entry points
    with nothing stood down, so the seam dispatches for real and the vendor's
    frontend is asked to specialise this kernel.
@@ -204,7 +204,7 @@ SEAM_MODULE = "functional/mhc/hyper_connection.py"
 def test_the_kernel_specialises_under_the_capture_regime() -> None:
     """One row per leg, off the venue that refused the body this change replaced.
 
-    THE VENUE IS THE SEAM UNDER A META FORWARD, and it is the landed one: the -119
+    THE VENUE IS THE SEAM UNDER A META FORWARD, and it is the landed one: the
     meta-forward item's own helpers build the tiny root and its runner on ``meta``
     and drive the two capture entry points, with nothing stood down, so the seam
     dispatches for real and the vendor's frontend is asked to specialise this

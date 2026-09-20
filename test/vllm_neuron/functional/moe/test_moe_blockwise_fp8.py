@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tier N acceptance for `inc-glm53f-025` -- the MoE-half block-quant kernel.
+"""Tier N acceptance for the MoE-half block-quant kernel.
 
-Acceptance command (plan block, `#### inc-glm53f-025`)::
+Acceptance command (plan block)::
 
     VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1 NKI_PRECISE_FP=1 \
     NEURON_PLATFORM_TARGET_OVERRIDE=trn2 \
@@ -342,7 +342,7 @@ def test_cte_kernel_scale_shape_matches_the_producer_element_count() -> None:
 
 
 # ===========================================================================
-# `inc-glm53f-113a` -- the campaign's OWN gate/up kernel, at [128, 128].
+# The campaign's OWN gate/up kernel, at [128, 128].
 # ===========================================================================
 #
 # WHAT IS COMPARED, AND WHY IT IS AN EQUALITY RATHER THAN A TOLERANCE. The
@@ -376,7 +376,7 @@ def test_cte_kernel_scale_shape_matches_the_producer_element_count() -> None:
 # increment produced.
 
 #: Extents. `B` tokens per expert block, `H` contraction, `I` per fusion half --
-#: the same numbers the `-025` case above uses, so nothing here invents a shape.
+#: the same numbers the block-quant case above uses, so nothing here invents a shape.
 G128_TOKENS = B
 G128_H = H
 G128_I = I_TP
@@ -503,7 +503,7 @@ def _g128_scale_grid() -> torch.Tensor:
 def _g128_fp8_values(seed: int, *shape: int) -> torch.Tensor:
     """``k/8`` for ``k`` in ``1..7``: on the fp8-e4m3 grid, so every cast is exact.
 
-    Unsigned, for the reason `inc-glm53f-025`'s own fixture records at ``:205``:
+    Unsigned, for the reason this file's own fixture records at ``:205``:
     over a 512-long contraction a signed fixture cancels, and this item reads an
     EQUALITY rather than a relative tolerance, so cancellation would make the
     reading fragile for a reason that has nothing to do with the kernel.
@@ -634,7 +634,7 @@ def _assert_gate_up_route_128(
 
 
 # --------------------------------------------------------------------------- #
-# THE DECLARED ACCEPTANCE CASE for `inc-glm53f-113a`.                           #
+# THE DECLARED ACCEPTANCE CASE for the gate/up kernel.                          #
 # --------------------------------------------------------------------------- #
 def test_cte_128_gate_up_matches_the_model_reference_per_expert_block() -> None:
     """Pre-activation gate/up output equals the model-derived reference, bit for bit.
@@ -1398,7 +1398,7 @@ def _variant_128_untransposed_kernel(hidden, fused_weight, scale_operand):
 def test_cte_128_the_activation_transpose_is_load_bearing() -> None:
     """Without the DMA-side transpose the kernel computes a different function.
 
-    THREE OUTCOMES, NOT TWO, which is `inc-glm53f-112`'s form: a finite non-zero
+    THREE OUTCOMES, NOT TWO, which is the landed form: a finite non-zero
     ``max_abs_diff`` falsifies the choice, a zero means it bought nothing, and a
     ``nan`` means the variant itself is broken -- reported as such rather than
     counted as a falsification.
@@ -1436,11 +1436,11 @@ def test_cte_128_the_activation_transpose_is_load_bearing() -> None:
 
 
 # ===========================================================================
-# `inc-glm53f-113b` -- the activation and the down projection, both in NKI.
+# The activation and the down projection, both in NKI.
 # ===========================================================================
 #
 # WHAT EACH READING SETTLES. The down projection carries the same EXACT equality
-# `-113a` does, on the same kind of fixture, and it carries it in two arms: with
+# the gate/up kernel does, on the same kind of fixture, and it carries it in two arms: with
 # every affinity at `1.0`, where the compared tensor is literally the plan's pinned
 # pre-affinity matmul output, and with exactly-representable affinities, where the
 # affinity multiply is inside the equality and cannot hide. The activation cannot
@@ -1548,7 +1548,7 @@ def _down_precondition(case: dict, expert: int) -> tuple[bool, float, bool]:
 
 
 def _assert_limb_route_128(counters, sim, expected_dispatches: int, label: str) -> str:
-    """The three declared route values for one `-113b` limb, each read as a number."""
+    """The three declared route values for one limb, each read as a number."""
     nki_dispatch, torch_fallback = counters()
     gate = can_run_kernel(torch.zeros(1))
     reading = (

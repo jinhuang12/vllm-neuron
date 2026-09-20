@@ -3,9 +3,9 @@
 GLM-5.3-Flash (Glm5Next) weight loading -- shard index and checkpoint key map
 ============================================================================
 
-**Landed in two halves; this is the SKELETON half** (``inc-glm53f-011``): the
+**Landed in two halves; this is the SKELETON half**: the
 shard index, the ``{param_name: checkpoint_key}`` mapping builder, and the
-coverage reconciliation over the two. The NUMERICS half (``inc-glm53f-012``)
+coverage reconciliation over the two. The NUMERICS half
 adds the blockwise-FP8 scale loaders below the seam marked at the foot of this
 module. Nothing here reads a tensor value; this half is host-side key routing.
 
@@ -54,15 +54,15 @@ SHARD_INDEX_FILENAME = "model.safetensors.index.json"
 #: checkpoint is accompanied by ``<name>.weight_scale_inv`` holding the per-block
 #: reciprocal scales (``weight_block_size = [128, 128]``,
 #: ``activation_scheme = "dynamic"``). The suffix is mapped here; the numerics
-#: that consume it are ``inc-glm53f-012``'s half.
+#: that consume it are the numerics half.
 FP8_SCALE_SUFFIX = "weight_scale_inv"
 
 #: The checkpoint's own prefix for the whole text model. **Two namespaces, not
 #: one:** every text-model tensor in this checkpoint is named
-#: ``model.language_model.<...>`` while the module tree ``inc-glm53f-013`` landed
+#: ``model.language_model.<...>`` while the module tree on this branch
 #: is named ``model.<...>``, so a mapping needs both strings and they are not
 #: interchangeable. ``lm_head.weight`` is outside both and is spelled the same on
-#: each side. Measured off the real index at ``inc-glm53f-078``; before that this
+#: each side. Measured off the real index; before that this
 #: module had never seen a checkpoint.
 CKPT_TEXT_PREFIX = "model.language_model"
 
@@ -81,11 +81,11 @@ KEY_FAMILY_PROVENANCE: dict[str, str] = {
     "embeddings_and_head": GROUNDED,
     "layer_norms": GROUNDED,
     "mla_dsa_attention": GROUNDED,
-    # Both were PROVISIONAL until inc-glm53f-078 read the real index: each leaf
+    # Both were PROVISIONAL until the real index was read: each leaf
     # below is now a name the checkpoint itself carries, not a convention guess.
     "dsa_indexer": GROUNDED,
     "kda_linear_attention": GROUNDED,
-    # Declared ABSENT until inc-glm53f-078 found all 270 keys in the index.
+    # Declared ABSENT until all 270 keys were found in the index.
     "multi_hyper_connections": GROUNDED,
     "dense_mlp": GROUNDED,
     "moe_router": GROUNDED,
@@ -97,7 +97,7 @@ KEY_FAMILY_PROVENANCE: dict[str, str] = {
 #: map, and why. Declared rather than omitted: an absent family that nobody
 #: wrote down is indistinguishable from one that was forgotten.
 #:
-#: ``multi_hyper_connections`` was here until ``inc-glm53f-078``. The declaration
+#: ``multi_hyper_connections`` was here until the index was read. The declaration
 #: was honest and it was wrong: the real index carries ``hc_attn_{base,fn,scale}``
 #: and ``hc_ffn_{base,fn,scale}`` on every one of layers 0-44, so the leaf names
 #: were settled all along and the family is mapped off the file rather than
@@ -281,7 +281,7 @@ def _quantised(
     have to be referenced or the scale key shows up as unmatched. Norms, biases
     and embeddings are not quantised in this checkpoint and contribute one.
 
-    **THE SCALE-SUPPRESSION PREDICATE** (``inc-glm53f-079``). ``skip`` is the
+    **THE SCALE-SUPPRESSION PREDICATE**. ``skip`` is the
     checkpoint's own ``modules_to_not_convert``, and a tensor it names gets NO
     scale companion however ``quantised`` is set: the checkpoint keeps that
     tensor in BF16, so no scale key exists to ask for and asking makes the
@@ -335,18 +335,18 @@ def build_weight_mappings(
     by **equality**, never substring: ``"attention"`` is a substring of both
     family names (``config.py:36-40``).
 
-    **TWO PREFIXES, NOT ONE** (``inc-glm53f-078``). Each layer builds a
+    **TWO PREFIXES, NOT ONE**. Each layer builds a
     ``ckpt_prefix`` in the checkpoint's namespace and a ``param_prefix`` in the
     module tree's, and both are threaded into every family adder. The parameter
-    side is unchanged from ``inc-glm53f-011``; the checkpoint side gained
+    side is unchanged from the skeleton half; the checkpoint side gained
     ``language_model.`` because that is what the published index says. Keeping
     one string for both is the defect this increment repairs.
 
     **THE CHECKPOINT'S SKIP LIST DECIDES WHICH PROJECTIONS CARRY A SCALE**
-    (``inc-glm53f-079``). Pass ``modules_to_not_convert`` and no tensor the
+    Pass ``modules_to_not_convert`` and no tensor the
     checkpoint keeps in BF16 gets a ``weight_scale_inv`` companion asked for.
     The families that carry no scale at all are still declared structurally by
-    their own adders, which ``inc-glm53f-078`` measured off the index; the two
+    their own adders, which were measured off the index; the two
     agree on this checkpoint, and each is a check on the other.
 
     Args:
@@ -361,7 +361,7 @@ def build_weight_mappings(
 
     Returns:
         The mapping. Parameter names are this half's declaration and settle
-        when ``model_fp8.py`` lands (``inc-glm53f-013``); the checkpoint-key
+        when ``model_fp8.py`` lands; the checkpoint-key
         side is what this increment's coverage measures.
     """
     mappings: dict[str, str | list[str]] = {}
@@ -498,7 +498,7 @@ def _add_mhc(
     ckpt_prefix: str,
     param_prefix: str,
 ) -> None:
-    """The multi-hyper-connection leaves (GROUNDED at ``inc-glm53f-078``).
+    """The multi-hyper-connection leaves (GROUNDED against the real index).
 
     Six bare tensors per layer, hanging off the layer and not off the attention
     or the MLP -- they are the layer's own residual-mixing state. Every one of
@@ -528,7 +528,7 @@ def _add_dsa_attention(
     assumes a RoPE split would ask for keys this checkpoint does not have.
 
     **18 checkpoint keys per layer: 14 tensors, 4 of which carry a scale.**
-    Three corrections ``inc-glm53f-078`` measured off the real index:
+    Three corrections measured off the real index:
     ``indexer.wq`` is really ``indexer.wq_b``; ``kv_b_proj`` and both indexer
     projections carry NO scale companion, so only the four in
     ``DSA_SCALED_PROJECTIONS`` ask for one; and ``indexer.k_norm.bias`` plus
@@ -594,7 +594,7 @@ def _add_kda_attention(
     """The ``linear_attention`` (KDA, gated-delta) half.
 
     **15 checkpoint keys per layer and not one scale companion.** The family was
-    wholly misnamed before ``inc-glm53f-078``: it was mapped as
+    wholly misnamed before the real index was read: it was mapped as
     ``linear_attn.{in_proj_qkvz, in_proj_ba, out_proj, conv1d, norm}`` on the
     ``qwen3_next`` gated-delta convention, and the checkpoint carries 15 distinct
     ``self_attn.*`` leaves instead -- eight separate projections, three separate
@@ -606,9 +606,9 @@ def _add_kda_attention(
     the skip list to suppress here. The parameters keep the arguments so the four
     adders share one call shape. **The two declarations agree and neither is
     redundant:** this one is structural and was measured off the index by
-    ``inc-glm53f-078``, and the skip list says the same thing independently --
+    this half, and the skip list says the same thing independently --
     every one of these 15 leaves is named in ``modules_to_not_convert``, which
-    ``inc-glm53f-079``'s conjunct (b) counts through ``get_scheme``.
+    the skip-list conjunct (b) counts through ``get_scheme``.
     """
     del quantised  # this family is unquantised in the checkpoint, at any setting
     del skip  # nothing to suppress: no leaf here asks for a scale companion
@@ -832,26 +832,26 @@ def check_key_coverage(
 def scale_keys(keys: Iterable[str]) -> tuple[str, ...]:
     """The blockwise-FP8 scale companions among ``keys``, in order.
 
-    The seam onto ``inc-glm53f-012``: this half decides which keys are scales,
+    The seam onto the numerics half: this half decides which keys are scales,
     that half decides what to do with the numbers inside them.
     """
     return tuple(key for key in keys if key.endswith(f".{FP8_SCALE_SUFFIX}"))
 
 
 # --------------------------------------------------------------------------- #
-# SEAM -- inc-glm53f-012 (numerics half) lands below this line:
+# SEAM -- the numerics half lands below this line:
 # the blockwise-FP8 scale loaders and the 240-max downscale-and-compensate.
 # Nothing above this line reads a tensor value.
 # --------------------------------------------------------------------------- #
 
 # ===========================================================================
-# inc-glm53f-012 -- WP1: block-fp8 scale loading with the 240-max downscale
+# WP1: block-fp8 scale loading with the 240-max downscale
 # ===========================================================================
 #
 # WHY THE IMPORTS FOR THIS HALF ARE HERE AND NOT AT THE TOP OF THE MODULE
 # ----------------------------------------------------------------------
 # The increment plan declares this increment's change to this file a **pure
-# addition** -- "no line ``inc-glm53f-011`` landed moves" -- and inserting an
+# addition** -- "no line that landed moves" -- and inserting an
 # import into the module's header block moves every one of the 628 lines below
 # it. Python resolves module-level imports wherever they appear, so the
 # constraint and the language agree here: this half's imports live in this
@@ -891,7 +891,7 @@ _FLOORED_BLOCKS_NAMED_IN_WARNING = 8
 # compensation as ``model/llama3/weight_loaders_static_fp8.py:51-110``, moved
 # from per-parameter to per-block granularity.
 #
-# THE FACTOR IS AN EXACT POWER OF TWO, NOT THE RANGE RATIO (``-054e``)
+# THE FACTOR IS AN EXACT POWER OF TWO, NOT THE RANGE RATIO
 # -------------------------------------------------------------------
 # It is the largest power of two that fits 448 into 240, and both halves of that
 # sentence are load-bearing. **A power of two** shifts an fp8 exponent and leaves
@@ -905,7 +905,7 @@ _FLOORED_BLOCKS_NAMED_IN_WARNING = 8
 # wrongly said none did. ``test_weight_loaders.py``'s C2 asserted
 # ``max_abs_stored == 240`` and its weight-loader item asserted the same of the
 # stored dense maximum -- both because 448 * 240/448 IS 240, so "inside the bound"
-# and "at the bound" were one claim. They are two claims at 1/2, so ``-054e``
+# and "at the bound" were one claim. They are two claims at 1/2, so this increment
 # re-argued both onto the DERIVED product ``448 * factor`` = 224 and asserted the
 # strictly-inside-the-clamp part separately. No reading assumes the squeezed range
 # fills 240 NOW; two did before this increment.
@@ -972,7 +972,7 @@ _FP8_SCALE_COMPENSATION = 2.0
 #: finite. The floor is reported per block rather than applied silently: the census is
 #: on :class:`BlockScaleCompensation.floored_blocks`, and on the checkpoint load path
 #: :func:`report_floored_blocks` warns when it engaged, naming the parameter and the
-#: tiles. Until ``inc-glm53f-012``'s r1 round (batch R3) that second half was
+#: tiles. Until the r1 round (batch R3) that second half was
 #: missing and this sentence was false of the loader that ships -- ``B08-F1``.
 MINVAL = 1e-5
 
@@ -991,7 +991,7 @@ def resolved_fp8_clamp_max() -> float:
     import time (``dtype_utils.py:41``).
 
     The import is **lazy** on purpose. ``dtype_utils`` imports
-    ``libtorch_neuronx_lite`` at module scope, and ``inc-glm53f-011``'s half of
+    ``libtorch_neuronx_lite`` at module scope, and the skeleton half of
     this file -- with its own passing tests -- must keep importing on a host
     where that vendor package is unavailable. A module-scope import here would
     make the skeleton half's importability depend on the numerics half's
@@ -1013,7 +1013,7 @@ def needs_240_downscale() -> bool:
     corrupt correct weights"*. The condition is expressed against the vendor's
     own resolution rather than a second platform query of this module's own.
 
-    The ruling is quoted as issued and NOT edited: ``inc-glm53f-054e`` later moved
+    The ruling is quoted as issued and NOT edited: a later increment moved
     the squeeze from 240/448 to an exact ``1/2``, so read "240/448" above as the
     factor at the time of the ruling. What it settled -- that the squeeze is
     conditional on the resolved clamp -- is what this function still implements.
@@ -1215,7 +1215,7 @@ def report_floored_blocks(
 
     WHY THIS EXISTS. :data:`MINVAL`'s own note says the floor is "reported per block
     rather than applied silently", and :class:`BlockScaleCompensation` does carry the
-    report -- but until ``inc-glm53f-012``'s r1 round (batch R3) the loader that
+    report -- but until the r1 round (batch R3) the loader that
     ships, :func:`blockwise_scale_loader`, returned ``.scale_inv`` and dropped it.
     Nothing outside the test suite could see that a tile had been floored. A floored
     tile is not a cosmetic event: a stored scale of ``1e-6`` is raised to ``1e-5``, so
@@ -1261,7 +1261,7 @@ def downscale_fp8_weight_bytes(weight: torch.Tensor) -> torch.Tensor:
     """Squeeze fp8 weight bytes into the 240 range, or return them unchanged.
 
     Conditional on :func:`needs_240_downscale`. The ``clamp`` is defensive and
-    since ``-054e`` it has 16 counts of slack rather than none: the largest OCP
+    and now has 16 counts of slack rather than none: the largest OCP
     magnitude, 448, maps to 224, and the bound stays at 240 because 240 is what
     the trn2 kernel reads, not what this squeeze produces. So no in-range input
     can reach the bound, let alone exceed it. It is kept because a checkpoint
@@ -1457,7 +1457,7 @@ def blockwise_scale_loader(param_name: str | None = None) -> SafetensorsWeightLo
     orders of magnitude smaller than the weight and needs no sharding of its own
     at this increment. A sharded scale grid follows the weight's own shard
     geometry and lands with the module that declares that geometry
-    (``model_fp8.py``, ``inc-glm53f-013``).
+    (``model_fp8.py``).
 
     An engaged floor is REPORTED, not discarded (:func:`report_floored_blocks`), which
     is finding ``B08-F1``'s repair. This transform used to return
@@ -1481,7 +1481,7 @@ def blockwise_scale_loader(param_name: str | None = None) -> SafetensorsWeightLo
 
 
 # --------------------------------------------------------------------------- #
-# SEAM -- inc-glm53f-091 (which loader serves which mapped key) lands below
+# SEAM -- the loader choice (which loader serves which mapped key) lands below
 # this line.
 #
 # This increment's WHOLE hand on this file: given one map entry's checkpoint
@@ -1499,7 +1499,7 @@ MAPPED_KEY_QUANTISED_WEIGHT = "quantised_weight"
 
 #: A map entry naming a whole bank of quantised experts -- one weight and one
 #: scale grid per expert, interleaved weight-then-scale in checkpoint order.
-#: ``inc-glm53f-095``'s fourth kind. It is a SEPARATE kind from
+#: The fourth kind. It is a SEPARATE kind from
 #: :data:`MAPPED_KEY_QUANTISED_WEIGHT` because the two need different loaders,
 #: and both of this classifier's consumers have to know which one they hold --
 #: see :func:`classify_mapped_keys` on why the second consumer is the reason
@@ -1513,7 +1513,7 @@ MAPPED_KEY_PLAIN = "plain"
 class Glm5NextExpertBankNotLoadableError(Glm5NextWeightMapError):
     """One map entry names a whole expert bank, which no loader here can stack.
 
-    ``inc-glm53f-091a``, raised on the increment's own measured finding rather
+    Raised on the increment's own measured finding rather
     than on a review comment. Subclassing :class:`Glm5NextWeightMapError` is
     this file's shipped form for a named map refusal --
     :class:`DuplicateShardKeyError` (``:117``) is the other one -- so a caller
@@ -1543,7 +1543,7 @@ def _as_key_list(checkpoint_keys: str | Sequence[str]) -> list[str]:
 def classify_mapped_keys(checkpoint_keys: str | Sequence[str]) -> str:
     """Which of the four kinds one map entry's checkpoint key(s) describe.
 
-    ``inc-glm53f-091``. **ONE classifier with two consumers** -- the loader
+    **ONE classifier with two consumers** -- the loader
     :func:`loader_for_mapped_keys` picks below, and the placeholder dtype
     ``model_fp8.py`` gives the parameter before the load. Deliberately one
     function rather than two: the pipelined loader reads its target dtype off
@@ -1562,7 +1562,7 @@ def classify_mapped_keys(checkpoint_keys: str | Sequence[str]) -> str:
     list holds no scale key, or exactly one alongside something else, or is a
     lone scale key, or holds more than one.
 
-    AN EXPERT BANK IS THE FOURTH KIND, AND ``inc-glm53f-095`` IS WHERE IT
+    AN EXPERT BANK IS THE FOURTH KIND, AND THIS IS WHERE IT
     BECAME ONE. An entry carrying MORE THAN ONE scale key is a whole bank of
     quantised experts, and it now says so -- :data:`MAPPED_KEY_STACKED_BANK` --
     because it has its own loader (:func:`stacked_expert_bank_loader`) and
@@ -1596,7 +1596,7 @@ def classify_mapped_keys(checkpoint_keys: str | Sequence[str]) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# inc-glm53f-094 -- the tensor-parallel shard geometry, as an INPUT.
+# The tensor-parallel shard geometry, as an INPUT.
 #
 # WHAT THIS SECTION IS FOR. The model declares per-rank geometry
 # (``_per_rank()`` ``model_fp8.py:213-215``, ``num_kv_heads_per_rank``
@@ -1608,7 +1608,7 @@ def classify_mapped_keys(checkpoint_keys: str | Sequence[str]) -> str:
 #
 # IT IS AN INPUT AND NOT A SECOND CLASSIFIER, which is the Surface's wording and
 # the reason the shape below is a plain value object. :func:`classify_mapped_keys`
-# still decides WHICH KIND a map entry is, exactly as ``-091`` left it, and the
+# still decides WHICH KIND a map entry is, exactly as the weight-loading increment left it, and the
 # geometry only decides whether that kind's loader shards. A geometry that
 # classified anything would be a second opinion about the same entry, and two
 # opinions is one too many.
@@ -1625,7 +1625,7 @@ def classify_mapped_keys(checkpoint_keys: str | Sequence[str]) -> str:
 class ShardGeometry:
     """One parameter family's tensor-parallel shard, fully resolved.
 
-    ``inc-glm53f-094``. Three plain integers, because the caller has already done
+    Three plain integers, because the caller has already done
     every division: ``shard_dim`` is the dimension in the FINAL PARAMETER shape
     (``utils/weight_loader.py:150``), ``shard_size`` is THIS RANK's extent along
     it, and ``num_shards`` is the world size the extent was divided by.
@@ -1663,7 +1663,7 @@ class ShardGeometry:
 class DeferredShardGeometry:
     """One family's shard when its FULL WIDTH is only known at load time.
 
-    ``inc-glm53f-101``. Same two ideas as :class:`ShardGeometry` -- a dimension
+    Same two ideas as :class:`ShardGeometry` -- a dimension
     and a rank count -- with the third one MISSING on purpose: there is no
     ``shard_size``, because the tensor that answers it has not arrived yet.
 
@@ -1681,7 +1681,7 @@ class DeferredShardGeometry:
     ``num_shards * pad_to_multiple_of``, so every rank's shard is a whole number
     of consumer blocks and the padded tail is zeros (weight) or ones (grid). This
     is what makes a 12288-wide dense intermediate loadable at 64 ranks, where
-    12288 // 64 == 192 is a whole number of neither -- and since `inc-glm53f-112`
+    12288 // 64 == 192 is a whole number of neither -- and now
     the two are the same 128 rows, so 192 clears neither on the same arithmetic.
     Ruled at design entry ``design-20260905-ap``, remedy part 2.
     """
@@ -1702,7 +1702,7 @@ class DeferredShardGeometry:
     #: ``accept-101-r8-host.out``. Only the bank sets this above 1.
     expert_parallel_degree: int = 1
     #: The extent one rank's shard must ALREADY be a whole multiple of, when this
-    #: geometry pads nothing. ``inc-glm53f-106``, and it exists because dropping
+    #: geometry pads nothing. It exists because dropping
     #: ``pad_to_consumer_block`` from the routed bank re-armed no refusal: the only
     #: no-pad check on the load path is EVEN DIVISION
     #: (``utils/weight_loader.py:330-345``), so a bank at expert-parallel degree 1 on
@@ -1767,7 +1767,7 @@ AnyShardGeometry = ShardGeometry | DeferredShardGeometry
 def dense_consumer_block_quant_size() -> int:
     """The block extent the DENSE block-FP8 kernel will accept, from that kernel.
 
-    ``inc-glm53f-101``, remedy part 1, re-aimed by `inc-glm53f-112`. IMPORTED
+    Remedy part 1, re-aimed later. IMPORTED
     rather than re-typed, and that is the whole point of the function:
     ``blockwise_fp8_mm.scale_grid_shape`` refuses any weight extent that is not a
     whole number of ``SCALE_BLOCK_SIZE`` blocks. A literal here would be a second
@@ -1775,7 +1775,7 @@ def dense_consumer_block_quant_size() -> int:
 
     THIS IS THE NUMBER FOR THE DENSE MLP, THE SHARED EXPERT AND EVERY MLA
     PROJECTION -- every family whose weight is dequantised by ``blockwise_fp8_mm``.
-    Since `-112` that kernel indexes its scales by the ``128``-row blocks the
+    That kernel now indexes its scales by the ``128``-row blocks the
     checkpoint itself stores, so this answers 128 where it used to answer 256.
 
     The import is function-local, which is this file's own precedent (``:2131``):
@@ -1791,18 +1791,18 @@ def dense_consumer_block_quant_size() -> int:
 def routed_bank_consumer_block_quant_size() -> int:
     """The block extent the ROUTED EXPERT BANK will accept, from its own producer.
 
-    ``inc-glm53f-112`` round 2, finding 1. ONE BLOCK CONSTANT PER CONSUMER, each
+    Round 2, finding 1. ONE BLOCK CONSTANT PER CONSUMER, each
     read from the producer that enforces it. The bank does not go through
     ``blockwise_fp8_mm``: its scale operands are built by the MoE retile, which
     refuses any extent that is not a whole ``BLOCK_QUANT_SIZE`` block, and that
-    number did not move at `-112`.
+    number did not move.
 
     WHY THE TWO CANNOT SHARE ONE FUNCTION ANY MORE. They did share one while both
-    consumers used 256. `-112` moved the dense kernel to 128 and, for one commit
+    consumers used 256. A later increment moved the dense kernel to 128 and, for one commit
     range, the bank's own load-time shard rule read the dense number with it --
     which admitted a 384-row bank shard the bank's producer then refused inside the
     prep, exactly the "later, on the kernel rather than on the load" failure
-    ``inc-glm53f-106`` exists to prevent. Naming the consumer at every call site is
+    the load-time check exists to prevent. Naming the consumer at every call site is
     what keeps that from happening again silently.
     """
     from vllm_neuron.functional.moe.blockwise_fp8_retile import BLOCK_QUANT_SIZE
@@ -1813,9 +1813,9 @@ def routed_bank_consumer_block_quant_size() -> int:
 def consumer_block_quant_size() -> int:
     """The ROUTED BANK's block, under the name the landed callers use.
 
-    KEPT NAME, NARROWED MEANING (`inc-glm53f-112` round 2). This is the name
-    ``inc-glm53f-101`` and ``inc-glm53f-106`` were written against, when there was
-    one consumer granularity in the package and it was 256. Two landed `-106`
+    KEPT NAME, NARROWED MEANING (a later increment, round 2). This is the name
+    the landed callers were written against, when there was
+    one consumer granularity in the package and it was 256. Two landed
     acceptance items call it by this name and mean the bank's number, so the name
     keeps answering the bank's number and it forwards rather than holding a second
     copy of it.
@@ -1839,7 +1839,7 @@ def refuse_inadmissible_shard_extent(
 ) -> None:
     """Refuse a per-rank extent the geometry's own requirement does not admit.
 
-    ``inc-glm53f-106``, and it is the arming that dropping the routed bank's pad did
+    This is the arming that dropping the routed bank's pad did
     not do. A deferred geometry that pads gets its whole-multiple property by
     construction; one that declares :attr:`DeferredShardGeometry.require_multiple_of`
     instead has to be CHECKED, and the only place the number exists is here, after
@@ -1910,7 +1910,7 @@ def shard_geometry_for_grid(
 ) -> AnyShardGeometry:
     """The scale grid's geometry for a weight sharded by ``geometry``.
 
-    ``inc-glm53f-094``, and the whole of conjunct (3). A grid holds one fp32
+    The whole of conjunct (3). A grid holds one fp32
     value per weight tile, so a weight sharded into ``shard_size`` rows takes
     ``shard_size // block_rows`` grid rows -- on the SAME dimension, because the
     grid's axes correspond to the weight's.
@@ -1922,7 +1922,7 @@ def shard_geometry_for_grid(
     whole 128-row band. So it is REFUSED BY NAME, with the parameter and the
     boundary in the message.
 
-    WHEN THE REFUSAL HAPPENS, CORRECTED (``B84-N3``, ``inc-glm53f-101``). The
+    WHEN THE REFUSAL HAPPENS, CORRECTED (``B84-N3``). The
     landed text said "at construction time … before any parameter is registered",
     and that is wrong for the only production caller: the scale-grid read at
     ``model_fp8.py:4152-4157`` runs AFTER the tree is materialised, so this refusal
@@ -1930,14 +1930,14 @@ def shard_geometry_for_grid(
     file do hold that property (``:2098-2103``); this one does not, and the
     difference is recorded rather than assumed.
 
-    TWO BOUNDARIES THAT NOW COINCIDE (``inc-glm53f-101`` remedy part 1, re-pinned
-    by `inc-glm53f-112` under D17.1). The checkpoint's tile is 128 rows, and since
-    `-112` the dense CONSUMER's block
+    TWO BOUNDARIES THAT NOW COINCIDE (remedy part 1, re-pinned
+    by a later increment under D17.1). The checkpoint's tile is 128 rows, and since
+    that increment the dense CONSUMER's block
     (:func:`dense_consumer_block_quant_size`) is the
     same 128 rows, so any shard that clears the tile rule now clears the block
     rule as well -- 12288 // 32 == 384 is three whole tiles AND three whole
     blocks, where under the ``256`` grid it was one and a half blocks and was
-    refused here. The second check is KEPT rather than deleted: it is `-101`'s
+    refused here. The second check is KEPT rather than deleted: it is a later increment's
     remedy, not this block's to remove, and it becomes load-bearing again the
     moment either granularity moves. Both are checked here, tile first so the
     landed refusal keeps its landed message, and the consumer's second with its
@@ -1958,7 +1958,7 @@ def shard_geometry_for_grid(
         extent = block_size[0] if geometry.shard_dim == 0 else block_size[1]
         pad = geometry.pad_to_multiple_of
         # ``expert_parallel_degree`` IS CARRIED THROUGH BOTH RETURNS BELOW, and
-        # ``inc-glm53f-106`` adds it because dropping it was a silent hole rather than
+        # it is kept because dropping it was a silent hole rather than
         # a choice. The field exists for one reason (``:1592-1600``): the EP-TP group
         # only exists above degree 1, so the column reader consults the group when the
         # geometry says the degree is above 1 and short-circuits to ``rank %
@@ -2016,7 +2016,7 @@ def shard_geometry_for_grid(
             f"sizes are {(geometry.shard_size // extent) * extent} and "
             f"{((geometry.shard_size // extent) + 1) * extent}.",
         )
-    # THE DENSE CONSUMER'S, NAMED (`inc-glm53f-112` round 2). Every family that
+    # THE DENSE CONSUMER'S, NAMED. Every family that
     # reaches this branch carries a RESOLVED width -- the MLA projections and KDA --
     # and every one of them is dequantised by ``blockwise_fp8_mm``. The routed bank
     # is deferred and never arrives here, so reading the bank's 256 in this place
@@ -2063,7 +2063,7 @@ def _sharding_loader(
     ``True`` because ITS checkpoint stores those weights transposed; copying that
     flag here would slice the wrong dimension of every family.
 
-    THE DISPATCH IS ON WHICH GEOMETRY ARRIVED (``inc-glm53f-101``), not on a flag:
+    THE DISPATCH IS ON WHICH GEOMETRY ARRIVED, not on a flag:
     a resolved geometry already carries its per-rank extent and takes the pin's
     own ``sharding_weight_loader``, and a deferred one takes
     ``tensor_width_sharding_loader``, which reads the extent off the checkpoint
@@ -2083,10 +2083,10 @@ def _sharding_loader(
             # Untouched when nothing is declared, and that is the property the
             # acceptance's second reading falsifies: a deferred family that declares
             # no requirement still loads an unaligned extent exactly as it did before
-            # ``inc-glm53f-106``. Returning the inner loader itself, rather than a
+            # this check. Returning the inner loader itself, rather than a
             # wrapper that always says yes, keeps that literally true.
             return inner
-        # ``inc-glm53f-106``: the requirement is checked on the LOADED extent, which is
+        # The requirement is checked on the LOADED extent, which is
         # the first moment it exists -- the width arrives with the tensor, which is why
         # this geometry is deferred at all. Wrapping rather than editing
         # ``tensor_width_sharding_loader``: that function lives in a shared utility
@@ -2120,7 +2120,7 @@ def _weight_slice_only(
 ) -> SafetensorsWeightLoader:
     """Give a ONE-SLICE transform the weight slice of a multi-key map entry.
 
-    ``inc-glm53f-094``. The pin's sharding transform asserts ``len(slices) == 1``
+    The pin's sharding transform asserts ``len(slices) == 1``
     (``utils/weight_loader.py:195-197``), and a blockwise-FP8 projection is TWO
     checkpoint keys -- the weight and its scale companion (:func:`_quantised`) --
     which the reader passes as two slices -- ``_process_param`` builds one slice
@@ -2185,7 +2185,7 @@ def _grid_spans_more_blocks_whole_than_per_rank(
 ) -> bool:
     """Whether this weight's grid actually has rows to divide between ranks.
 
-    ``inc-glm53f-105``. A grid holds one value per weight TILE, so a weight can be
+    A grid holds one value per weight TILE, so a weight can be
     sharded while its grid is not: when the whole weight fits inside one block
     along the shard dimension, both ranks' rows live in the same tile and the
     whole grid ALREADY describes each rank's shard exactly. ``_require_grid``
@@ -2209,13 +2209,13 @@ def compensating_sharded_scale_grid_loader(
 ) -> SafetensorsWeightLoader:
     """This rank's rows of a DECLARED scale grid, compensated as the landed loader is.
 
-    ``inc-glm53f-105``, and it is the loader ``inc-glm53f-094`` deleted rather than
+    This is the loader an earlier increment deleted rather than
     a new idea. That increment wrote a compensating sharded-grid loader on the
     ``MAPPED_KEY_SCALE_GRID`` branch of :func:`loader_for_mapped_keys`, measured
     that no geometry could reach the branch -- "the only scale grids declared as
-    parameters are ``Glm5NextMLAAttention``'s four, deferred to ``-100``" -- and
+    parameters are ``Glm5NextMLAAttention``'s four, deferred to a later increment" -- and
     removed it as dead code (``increments/shard-table-094.md`` Part 7).
-    ``inc-glm53f-100`` declared the MLA head-width three sharded, which is what
+    A later increment declared the MLA head-width three sharded, which is what
     makes a geometry arrive here, so the branch needs its loader back.
 
     IT COMPENSATES, AND :func:`sharded_scale_grid_loader` DOES NOT. That is not an
@@ -2230,7 +2230,7 @@ def compensating_sharded_scale_grid_loader(
     if not _grid_spans_more_blocks_whole_than_per_rank(geometry):
         return blockwise_scale_loader(param_name)
     # THE NAME IS PASSED ON, and it has to be passed explicitly. ``_sharding_loader``
-    # gained a second parameter in ``inc-glm53f-101``; it is optional, so this call
+    # gained a second parameter; it is optional, so this call
     # compiled without it and lost the name silently. The name is not decoration on
     # this path: ``shard_geometry_for_grid`` can return a ``DeferredShardGeometry``
     # (two of its three returns do), which is the ONE branch of
@@ -2263,7 +2263,7 @@ def sharded_scale_grid_loader(
 ) -> SafetensorsWeightLoader:
     """This rank's ROWS of a sharded weight's scale grid, and nothing else.
 
-    ``inc-glm53f-094``. Takes the WEIGHT's geometry and converts it to the grid's
+    Takes the WEIGHT's geometry and converts it to the grid's
     with :func:`shard_geometry_for_grid`, so the caller never divides by the
     block extent itself.
 
@@ -2280,11 +2280,11 @@ def sharded_scale_grid_loader(
     ``MAPPED_KEY_SCALE_GRID`` branch of :func:`loader_for_mapped_keys`. It was
     removed as unreachable, for the same reason the bank-shard code was: the only
     scale grids DECLARED as parameters are ``Glm5NextMLAAttention``'s four, whose
-    geometry is deferred to ``inc-glm53f-100``, so no geometry ever reached that
+    geometry is deferred to a later increment, so no geometry ever reached that
     branch. Recorded in ``increments/shard-table-094.md`` Part 7.
 
     ``block_size`` IS THE CHECKPOINT'S OWN, threaded by the caller
-    (``inc-glm53f-101``, remedy part 1). Before this increment the conversion took
+    (remedy part 1). Before this increment the conversion took
     the parser's fallback ``DEFAULT_WEIGHT_BLOCK_SIZE``, which is right for this
     checkpoint and would silently be wrong for the next one; the caller now reads
     ``quantization_config.weight_block_size`` and hands it over. The default is
@@ -2304,15 +2304,15 @@ def loader_for_mapped_keys(
 ) -> SafetensorsWeightLoader | None:
     """The loader that serves one mapped parameter, or ``None`` for the default.
 
-    ``inc-glm53f-091``, extended by ``inc-glm53f-095`` and ``inc-glm53f-094``.
+    Extended by the expert-bank kind and the shard geometry.
 
     ``geometry`` IS THIS PARAMETER'S TENSOR-PARALLEL SHARD, ALREADY RESOLVED, or
     ``None`` for a family the model declares replicated. It is an input to each
-    kind's loader and never a fifth kind: ``-094`` adds no branch to
+    kind's loader and never a fifth kind: the shard-table increment adds no branch to
     :func:`classify_mapped_keys` and no case below, it only decides whether the
     case's loader shards. Passing ``None`` reproduces this function's behaviour
-    before ``-094`` byte for byte, which is what keeps every replicated family --
-    the majority of them -- on exactly the path ``-091`` measured.
+    before the shard-table increment byte for byte, which is what keeps every replicated family --
+    the majority of them -- on exactly the path the weight-loading increment measured.
 
     ONE LEAF IS ANSWERED BY NAME AND BEFORE THE KINDS, and it is the only one:
     :data:`TRANSPOSED_AT_LOAD_LEAF`, whose consumer's operand layout is the
@@ -2331,8 +2331,8 @@ def loader_for_mapped_keys(
       the grid for the trn2 range and reports a floored block by name. Passing
       ``param_name`` is what lets that report say which parameter floored. A
       GEOMETRY never arrives here at this increment -- the only declared grid
-      parameters are the MLA four, deferred to ``inc-glm53f-100`` -- so this case
-      is unchanged by ``-094``; a SHARDED weight's grid is sharded by
+      parameters are the MLA four, deferred to a later increment -- so this case
+      is unchanged by the shard-table increment; a SHARDED weight's grid is sharded by
       :func:`sharded_scale_grid_loader` in the out-of-band reader instead.
     * a quantised weight with ONE scale companion gets
       :func:`wrap_with_blockwise_fp8_downscale` over the default loader -- or,
@@ -2351,7 +2351,7 @@ def loader_for_mapped_keys(
       rows and taking this rank's rows of the squeezed tensor give the same
       bytes, and the wrapper stays outside.
     * an EXPERT BANK -- more than one scale key -- gets
-      :func:`stacked_expert_bank_loader`, which is what ``inc-glm53f-095``
+      :func:`stacked_expert_bank_loader`, which this file
       adds. ``owner`` is the module that declares the parameter, and the bank
       loader needs it: the expert geometry lives there and nowhere else.
     * a PLAIN entry naming MORE THAN ONE weight key is refused by name. It is
@@ -2365,7 +2365,7 @@ def loader_for_mapped_keys(
       back to the identity loader when a parameter carries none
       (``utils/weight_loader.py:102``), so attaching one here would be a second
       way of saying the same thing, and two ways is one too many. EVERY
-      REPLICATED FAMILY STILL LANDS HERE, which is why ``-094`` changes nothing
+      REPLICATED FAMILY STILL LANDS HERE, which is why the shard-table increment changes nothing
       for the majority of the surface.
 
     THE BANK LOADER IS THE ONLY ONE HERE THAT CONSULTS ``rank``, and it consults
@@ -2416,37 +2416,37 @@ def loader_for_mapped_keys(
             )
         return transposed_weight_loader()
     if kind == MAPPED_KEY_SCALE_GRID:
-        # A GEOMETRY REACHES THIS BRANCH FROM ``inc-glm53f-100`` ON, and that is
-        # ``inc-glm53f-105``'s change here. The reading this replaces was true when
+        # A GEOMETRY REACHES THIS BRANCH NOW, and that is
+        # the change here. The reading this replaces was true when
         # it was written: "NO GEOMETRY REACHES THIS BRANCH AT THIS INCREMENT
         # EITHER ... The only scale grids this package DECLARES as parameters are
         # ``Glm5NextMLAAttention``'s four, and their geometry is deferred to
-        # ``inc-glm53f-100``." ``-100`` declared the head-width three sharded, so
+        # a later increment." That increment declared the head-width three sharded, so
         # two of those four grids -- ``q_b_proj``'s and ``o_proj``'s, the two of
-        # the DSA scaled projections that ``-100`` shards -- now belong to a
+        # the DSA scaled projections that increment shards -- now belong to a
         # sharded weight and arrive here with its geometry.
         #
         # WITHOUT THIS the weight is this rank's half and its grid still describes
         # the whole tensor, so ``_require_grid`` refuses the load at real widths --
         # measured, and kept as this increment's falsifier. ``None`` still means a
         # replicated grid or world size 1 and still takes the landed whole-grid
-        # loader, so every path ``-091`` measured is unchanged.
+        # loader, so every path the weight-loading increment measured is unchanged.
         if geometry is None:
             return blockwise_scale_loader(param_name)
         return compensating_sharded_scale_grid_loader(geometry, param_name)
     if kind == MAPPED_KEY_STACKED_BANK:
-        # THE BANK'S GEOMETRY REACHES IT SINCE ``inc-glm53f-101``, which is what
-        # ``-094``'s note here handed forward by name. It is a
+        # THE BANK'S GEOMETRY REACHES IT NOW, which is what
+        # the shard-table increment's note here handed forward by name. It is a
         # ``DeferredShardGeometry``: the width comes off the checkpoint tensor,
         # because ``Glm5NextRoutedExperts`` holds counts and degrees only. Its rank
         # count is ``tp_per_ep`` and not the world size, since the experts are
         # already divided across the expert-parallel groups. AT EXPERT-PARALLEL
-        # DEGREE 1 THE BANK IS STILL SHARDED, corrected by ``inc-glm53f-106`` (review
+        # DEGREE 1 THE BANK IS STILL SHARDED, corrected later (review
         # B90-101, finding B1): at degree 1 ``tp_per_ep`` equals the WORLD, so the
         # reader hands back a ``DeferredShardGeometry`` and this branch divides the
         # bank's intermediate width across every rank. ``None`` comes back only when
         # one rank holds each group whole -- world size equal to the degree, or world
-        # size 1 -- and that is the unsharded path ``-095`` measured. The earlier
+        # size 1 -- and that is the unsharded path an earlier increment measured. The earlier
         # wording had it backwards and would have told a reader the production default
         # loads the bank whole.
         return stacked_expert_bank_loader(
@@ -2482,7 +2482,7 @@ def loader_for_mapped_keys(
 
 
 # --------------------------------------------------------------------------- #
-# inc-glm53f-095 -- the expert-stacked loader.
+# The expert-stacked loader.
 #
 # One map entry holds a routed expert bank: E weights and E scale grids,
 # interleaved weight-then-scale in checkpoint order. This section turns that
@@ -2522,7 +2522,7 @@ def _refuse(param_name: str | None, tail: str) -> None:
     """Raise the bank refusal, always naming the parameter first.
 
     Every refusal in this section goes through here for one reason: ``B65-N1``
-    and the ``-091a`` measurement both turned on a failure that did not name its
+    and an earlier measurement both turned on a failure that did not name its
     parameter, so the name is not left to each call site to remember.
     """
     raise Glm5NextExpertBankNotLoadableError(
@@ -2535,7 +2535,7 @@ def bank_layout(
 ) -> BankLayout:
     """Read one bank entry's expert layout, or REFUSE it by name.
 
-    ``inc-glm53f-095``. The entry must alternate strictly weight-then-scale, one
+    The entry must alternate strictly weight-then-scale, one
     pair per expert, which is the layout ``_add_moe_mlp`` builds (``:679``,
     through ``_quantised``) and the layout
     ``expert_parallel_interleaved_loader`` documents at K = 2.
@@ -2586,7 +2586,7 @@ def bank_layout(
 def _expert_parallel_rank_map(owner: object | None, param_name: str | None):
     """The map from the load's GLOBAL rank to the bank partition's rank.
 
-    ``inc-glm53f-101``, repairing the rank confusion ``-094``'s fourth item
+    A later increment's repair of the rank confusion the shard-table increment's fourth item
     measured and handed here by name (``test_load_weights.py:3694-3729``, design
     entry ``design-20260905-r`` ruling 3).
 
@@ -2598,7 +2598,7 @@ def _expert_parallel_rank_map(owner: object | None, param_name: str | None):
     global rank above 0 was refused (``factory.py:132-137``) -- 63 of 64 ranks on the
     target host. Read "this partition" strictly: it is the partition over
     ``ep_degree``, the EXPERT axis. It is not the bank's intermediate width, which at
-    degree 1 is sharded across the whole world -- ``inc-glm53f-106`` corrects three
+    degree 1 is sharded across the whole world -- a later round corrects three
     sibling comments that ran the two together and concluded the bank loads whole at
     degree 1 (review B90-101, finding B1).
 
@@ -2611,7 +2611,7 @@ def _expert_parallel_rank_map(owner: object | None, param_name: str | None):
     (``factory.py:260-264``). So the whole bank is local on every rank.
 
     ABOVE DEGREE 1 THE INDEX IS READ FROM THE GROUP AND NEVER DIVIDED OUT OF THE
-    GLOBAL RANK (``inc-glm53f-101``, remedy part 3(a), which REPLACED this
+    GLOBAL RANK (remedy part 3(a), which REPLACED this
     function's earlier refusal). ``_build_ep_group_ranks``
     (``parallel/neuron_parallel_state.py:218-232``) lays the ranks out through
     ``_build_2d_mesh``, which substitutes ``_TRN2_MESH`` (``:118-127``) whenever
@@ -2669,7 +2669,7 @@ def _expert_parallel_shard_column(
 ) -> int:
     """This process's column inside its expert-parallel TP group, checked twice.
 
-    ``inc-glm53f-101``, remedy part 3(b) plus the lead's addition at DECISIONS
+    Remedy part 3(b) plus the lead's addition at DECISIONS
     §78. Two independent answers to "which columns of each expert are mine" exist
     in this repository and they do not always agree:
 
@@ -2700,7 +2700,7 @@ def _expert_parallel_shard_column(
     rank's own place in it. The first version of this function asked the group
     before it asked the degree, and refused every degree-1 bank load with a message
     claiming the module "declares an expert-parallel degree above 1" when it
-    declared 1. That broke ``inc-glm53f-094``'s landed conjunct (4)
+    declared 1. That broke the landed conjunct (4)
     (``accept-101-r8-host.out``, ``rank = 0, tp_per_ep = 2``) and it is the same
     defect this seat keeps making: a predicate that does not read the thing it
     names.
@@ -2755,17 +2755,17 @@ def _bank_expert_indices(
 ):
     """The owning module's local-expert resolver, or REFUSE by name.
 
-    ``inc-glm53f-095``. The expert geometry is declared in exactly one place --
+    The expert geometry is declared in exactly one place --
     ``Glm5NextRoutedExperts`` (``model_fp8.py:964``, geometry set at
     ``:1032-1037``), authored by
-    ``inc-glm53f-031`` -- and it is read there rather than derived a second time
+    the expert-sharding member -- and it is read there rather than derived a second time
     from the key count, so there is one partition and not two that can disagree.
 
     A bank whose owner declares no geometry cannot be placed: there is no answer
     to "which experts are mine", so stacking would be a guess. This refusal is
     also conjunct (1)'s CONTROL THAT MOVES -- the same bank, in one run, loads
     E/E experts with the geometry declared and refuses by name without it --
-    which is why reading (ii) of ``-091``'s first item was re-anchored onto it
+    which is why reading (ii) of the weight-loading increment's first item was re-anchored onto it
     (design entry ``design-20260905-r``).
     """
     resolve = getattr(owner, "local_expert_indices", None)
@@ -2797,7 +2797,7 @@ def _bank_expert_indices(
             f"module disagree about how many experts exist, so stacking would "
             f"silently drop or invent one; refused instead.",
         )
-    # ``inc-glm53f-101``. What is returned takes the GLOBAL rank the load supplies,
+    # What is returned takes the GLOBAL rank the load supplies,
     # maps it to the rank the bank's partition was actually built over, and only
     # then asks the owner which experts are local -- so the owner's two degrees are
     # no longer confused for each other. The map is built HERE, at construction,
@@ -2849,7 +2849,7 @@ def _column_of_each_expert(
 ):
     """Wrap a bank stacker so each expert contributes only THIS column's slice.
 
-    ``inc-glm53f-101``, remedy part 3. The bank's experts are already divided
+    Remedy part 3. The bank's experts are already divided
     across the expert-parallel groups; what one group still divides is each
     expert's intermediate width, among its ``geometry.num_shards`` = ``tp_per_ep``
     members. So this takes the stacker that reads whole experts and gives it a
@@ -2895,7 +2895,7 @@ def _column_of_each_expert(
             geometry.pad_value,
             param_name,
         )
-        # ``inc-glm53f-106``: the bank's own arrival site for the declared requirement.
+        # The bank's own arrival site for the declared requirement.
         # It is checked HERE and not in ``_sharding_loader`` because the bank never
         # reaches that function -- ``loader_for_mapped_keys`` sends a stacked bank to
         # ``stacked_expert_bank_loader``, which comes straight here -- so a check
@@ -2949,7 +2949,7 @@ def _stacked_bank_transform(
     arithmetic where it is owned; the alternative would put a rank into every
     loader in this file for the sake of one case.
 
-    The import is FUNCTION-LOCAL, following the landed ``inc-glm53f-023``
+    The import is FUNCTION-LOCAL, following the landed
     precedent (``model_fp8.py:1011-1014``): this file's import blocks are earlier
     increments' D14 sections.
     """
@@ -2986,12 +2986,12 @@ def stacked_expert_bank_loader(
 ) -> SafetensorsWeightLoader:
     """Load a routed expert bank's WEIGHTS as one stacked tensor.
 
-    ``inc-glm53f-095``, and the answer to ``-091a``'s refusal. Returns a loader
+    The answer to an earlier refusal. Returns a loader
     whose transform, for the rank it is called with, selects that rank's experts
     and stacks their weight slices on a new LEADING axis in checkpoint order --
     so element ``[e]`` of the result is expert ``local[e]``'s weight, and the
     result's element count is the sum of its own slices' counts rather than one
-    expert's (which is what ``-091a`` measured going wrong:
+    expert's (which is what an earlier measurement found going wrong:
     ``LOADED_NUMEL=16384`` of ``65536``).
 
     IT IS COMPOSED UNDER :func:`wrap_with_blockwise_fp8_downscale`, and that
@@ -3001,7 +3001,7 @@ def stacked_expert_bank_loader(
     stack costs one pass instead of E, and on a platform needing no squeeze the
     wrapper returns this loader untouched.
 
-    EVERY REFUSAL HAPPENS AT CONSTRUCTION, NOT AT LOAD, and ``-091``'s two-pass
+    EVERY REFUSAL HAPPENS AT CONSTRUCTION, NOT AT LOAD, and the weight-loading increment's two-pass
     materialiser depends on it: ``_materialise_declared_parameters`` chooses
     every loader BEFORE registering any parameter, so a refusal raised now leaves
     the tree byte-for-byte as it arrived and ``named_parameters()`` still reads
@@ -3010,8 +3010,8 @@ def stacked_expert_bank_loader(
     """
     layout = bank_layout(checkpoint_keys, param_name=param_name)
     resolve = _bank_expert_indices(owner, layout, param_name)
-    # ``inc-glm53f-101``, remedy part 3, with the degree-1 claim corrected by
-    # ``inc-glm53f-106`` (review B90-101, finding B1). ``None`` is the landed path for
+    # Remedy part 3, with the degree-1 claim corrected by
+    # a later round (review B90-101, finding B1). ``None`` is the landed path for
     # a load that shards nothing, and expert-parallel degree 1 is NOT that load: at
     # degree 1 ``tp_per_ep`` is the whole world, so the table's reader hands back a
     # ``DeferredShardGeometry`` and the column path below runs. The old wording said
@@ -3039,7 +3039,7 @@ def stacked_expert_scale_loader(
 ) -> SafetensorsWeightLoader:
     """Load a routed expert bank's SCALE GRIDS as one stacked tensor.
 
-    ``inc-glm53f-095``. The mirror of :func:`stacked_expert_bank_loader` over
+    The mirror of :func:`stacked_expert_bank_loader` over
     the odd positions: this rank's experts, their grids compensated one expert at
     a time by :func:`compensate_block_scales`, stacked on the same leading axis
     in the same order. So row ``[e]`` of this result belongs to the weight at
@@ -3060,12 +3060,12 @@ def stacked_expert_scale_loader(
     exists to be CALLED -- by conjunct (2), against the checkpoint's own grids --
     rather than attached. Declaring and mapping that parameter is outside this
     increment's surface; the kernel-side consumption of E grids is
-    ``inc-glm53f-095b``. Both are recorded in ``increments/evidence-095.md``.
+    a later increment's. Both are recorded in ``increments/evidence-095.md``.
     """
     layout = bank_layout(checkpoint_keys, param_name=param_name)
     resolve = _bank_expert_indices(owner, layout, param_name)
-    # ``inc-glm53f-101``. A SHARDED BANK'S GRIDS ARE SHARDED WITH ITS WEIGHTS, for
-    # the reason ``-094`` recorded for the dense MLP: a whole grid beside a column
+    # A SHARDED BANK'S GRIDS ARE SHARDED WITH ITS WEIGHTS, for
+    # the reason the shard-table increment recorded for the dense MLP: a whole grid beside a column
     # of weights describes the wrong blocks, and the dequantisation would scale
     # real rows by another column's scale. The weight geometry is converted to the
     # grid's by the one function that does that conversion, so the block boundary

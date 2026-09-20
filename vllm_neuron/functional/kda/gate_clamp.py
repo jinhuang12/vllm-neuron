@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """KDA gate: a bounded sigmoid, in NKI.
 
-`inc-glm53f-084`. The KDA gate turns a projected pre-gate tensor into the
+The KDA gate turns a projected pre-gate tensor into the
 per-key-channel log-decay that the recurrence consumes. This module computes that
 gate as one device op::
 
@@ -14,11 +14,11 @@ NOTE, NOT THIS DOCSTRING: ``pin-feasibility-note-lap-0903b.md`` S2 holds the
 reference function, every reference line it cites, and the closed-form comparison
 against what this module used to compute. Nothing of it is restated here.
 
-WHY THIS FILE WAS REWRITTEN. `inc-glm53f-037` landed a different function in this
+WHY THIS FILE WAS REWRITTEN. An earlier increment landed a different function in this
 file -- an unbounded softplus floored at the bound -- and the campaign's declared
 correctness reference multiplies a saturating sigmoid BY the bound instead. The two
 are different functions, not two spellings of one, and the screen note prices the
-gap. `inc-glm53f-037`'s history is not re-opened; this block is a second writer
+gap. That history is not re-opened; this block is a second writer
 into the same file and the co-authorship is declared on both sides in the plan's
 own register.
 
@@ -29,7 +29,7 @@ construction. There is nothing left for a floor to do, and an op that can never
 change a value is dead weight in a kernel-class chain.
 
 THE FILE AND FUNCTION NAMES ARE HISTORY, NOT DESCRIPTION. ``gate_clamp`` and
-``kda_gate_clamp`` are `inc-glm53f-037`'s names, kept on purpose so that the
+``kda_gate_clamp`` are the earlier names, kept on purpose so that the
 rewrite is one diff in one file rather than a rename fanning out across call sites
 and records. The function no longer clamps anything. A reader who trusts the name
 over this paragraph will be wrong about the arithmetic.

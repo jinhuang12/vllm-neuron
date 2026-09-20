@@ -8,14 +8,14 @@ owns three of them and delegates the rest to parts already on this branch:
 ===========================================  ==================================
 reference stage                               where it lives here
 ===========================================  ==================================
-``patch_embed`` (``:1799``)                   ``inc-glm53f-057``'s NKI seam
-``rotary_pos_emb`` + ``cos``/``sin``          ``inc-glm53f-059b``'s CPU rope
+``patch_embed`` (``:1799``)                   the NKI patch-embed seam
+``rotary_pos_emb`` + ``cos``/``sin``          the CPU rope
    (``:1800-1802``)
 ``blocks`` loop (``:1804-1810``)              THIS module
-``post_layernorm`` (``:1812``)                ``inc-glm53f-104``'s adapter
-``view``/``permute``/``downsample``           ``inc-glm53f-104``'s adapter
+``post_layernorm`` (``:1812``)                the vision adapter
+``view``/``permute``/``downsample``           the vision adapter
    (``:1814-1818``)
-``merger`` (``:1820``)                        ``inc-glm53f-104``'s adapter
+``merger`` (``:1820``)                        the vision adapter
 ===========================================  ==================================
 
 So :meth:`Glm5NextVisionEncoder.forward` returns the reference's
@@ -33,13 +33,13 @@ each is what makes the delegation above exact:
    The reference's ``nn.Conv3d`` over kernel depth ``temporal_patch_size``
    therefore computes ``sum_t W[:, :, t] * x_0``, which equals a single depth-1
    convolution whose weight is ``W`` summed over ``t``. That is exactly the
-   degeneration ``-057``'s seam wires and refuses to be used outside
+   degeneration the patch-embed seam wires and refuses to be used outside
    (``patch_embed.py:325-337``), so :func:`patch_embed_filters_from_conv3d`
    performs the sum and the tower feeds one temporal slice.
 2. **Attention is bidirectional within one frame.** The reference reaches
    ``get_vision_cu_seqlens`` with ``merge_temporal=False``
    (``modeling_glm5_next.py:1797``; ``vision_utils.py:42-66``), so each frame is
-   its own attention segment of ``h * w`` tokens. ``-058`` was retired because
+   its own attention segment of ``h * w`` tokens. An increment was retired because
    the pin already wraps that operator: ``NF.flash_attention`` with
    ``causal_mask=False`` and per-segment ``bound_min``/``bound_max``, called as
    ``qwen3_vl/vision_encoder_bf16.py:333`` calls it.
@@ -48,12 +48,12 @@ each is what makes the delegation above exact:
    permute, ``patches.permute(0, 2, 5, 3, 6, 1, 4, 7)``
    (``image_processing_glm5_next.py:205``), orders the flattened token axis as
    merge-block row, merge-block column, then row and column *within* the block.
-   That is what lets ``-104``'s adapter treat every ``spatial_merge_size**2``
-   consecutive tokens as one merge block, and it is the order ``-059b``'s
+   That is what lets the vision adapter treat every ``spatial_merge_size**2``
+   consecutive tokens as one merge block, and it is the order the CPU rope's
    position ids already use.
 
 **Parallelism:** this tower is single-rank, matching its landed siblings.
-``-104``'s adapter and ``-059b``'s rope are both unsharded, this block declares
+The vision adapter and the CPU rope are both unsharded, this block declares
 no weight-loader or tensor-parallel surface, and the reference is the acceptance
 oracle -- so a sharded tower would have nothing to compare against here. Tensor
 parallelism is a later block's work and the split points are the reference's own
@@ -98,7 +98,7 @@ def patch_embed_filters_from_conv3d(conv_weight: torch.Tensor) -> torch.Tensor:
     """Convert the reference's patch-embed convolution to the seam's layout.
 
     The reference holds ``[C_out, C_in, temporal_patch_size, P, P]``
-    (``modeling_glm5_next.py:1721``); ``-057``'s seam takes
+    (``modeling_glm5_next.py:1721``); the patch-embed seam takes
     ``[K_d, K_h, K_w, C_in, C_out]`` with ``K_d == 1``
     (``patch_embed.py:310-337``). Summing over the temporal axis is exact, not an
     approximation, because the input's temporal slices are identical copies --
@@ -450,7 +450,7 @@ class Glm5NextVisionEncoder(nn.Module):
         self.adapter = Glm5NextVisionAdapter(config, dtype=dtype)
 
     def patch_embed(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        """Embed flat patch rows through ``-057``'s NKI seam.
+        """Embed flat patch rows through the NKI patch-embed seam.
 
         Args:
             pixel_values: ``[total_patches, patch_dim]`` where ``patch_dim`` is

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fused kpool compression and Hadamard-128 rotation for the sparse-attention indexer.
 
-``inc-glm53f-047``. This is WP4's key-pooling half: it takes ``index_kpool`` consecutive
+This is WP4's key-pooling half: it takes ``index_kpool`` consecutive
 tokens' indexer keys and compresses them into ONE key per pool, then rotates that key by the
 Hadamard-128 transform. One kernel does both, which is the increment's whole purpose -- the
 pooled vector never leaves the on-chip tile between the reduction and the rotation.
@@ -41,7 +41,7 @@ whole-vector softmax over the 128 channels is a plausible-looking DIFFERENT kern
 post-pool step; the gate arrives already evaluated as ``slot_score``. The checkpoint tensors
 ``indexer.index_kpool_compress_ape`` and ``...index_kpool_compress_gate`` are what PRODUCE these
 two inputs upstream of this kernel, and that production belongs to the indexer forward
-(``inc-glm53f-051``), not here.
+(the indexer forward), not here.
 
 The rotation is the reference's **7-stage FWHT butterfly** (``kpool_compress.py:27-45``) with
 ``(groups, stride)`` running ``(64,1) (32,2) (16,4) (8,8) (4,16) (2,32) (1,64)``, followed by a
@@ -55,13 +55,13 @@ Four things the upstream reference does in the same breath are OWNED ELSEWHERE, 
 out is a design decision recorded in the plan rather than an omission:
 
 * **fp8 quantisation and the ue8m0 scale** (``kpool_compress.py:112-125``). This kernel returns
-  bf16 and no scale. ``inc-glm53f-053``'s adapter owns that half.
+  bf16 and no scale. The adapter owns that half.
 * **the cache write** at ``loc``. Nothing here touches a KV cache.
 * **pool formation, the sliding window, ``write_mask`` and slot mapping**
   (``sparse_attn_indexer_kpool.py:54-99``). This kernel is handed COMPLETE pools; the reference
-  asserts the same shape at ``kpool_compress.py:281-285``. ``inc-glm53f-051`` owns the integration.
+  asserts the same shape at ``kpool_compress.py:281-285``. The indexer owns the integration.
 * **the raw tail cache** for a request's incomplete trailing pool
-  (``kpool_compress.py:411``). ``inc-glm53f-049`` owns it.
+  (``kpool_compress.py:411``). The tail update owns it.
 
 Consequently this kernel NEVER SEES A PARTIAL POOL, which is why its declared case set varies
 ``n_pools`` and not the token count.
@@ -145,7 +145,7 @@ correct kernel -- which is what happened when this module's test was first draft
 """
 
 _SUPPORTED_DTYPES = (torch.bfloat16,)
-"""``slot_k`` dtypes that take the NKI route. bf16 is the indexer path's dtype (as ``-045``/``-046``)."""
+"""``slot_k`` dtypes that take the NKI route. bf16 is the indexer path's dtype (as the landed pair)."""
 
 
 class KpoolHadamardError(ValueError):
@@ -533,7 +533,7 @@ def dsa_kpool_hadamard(slot_k: Tensor, slot_score: Tensor, ape: Tensor) -> Tenso
 
     Returns:
         ``[n_pools, head_dim]`` in ``slot_k``'s dtype: the pooled, rotated key per pool. No fp8
-        output and no scale -- ``inc-glm53f-053``'s adapter owns that half.
+        output and no scale -- the adapter owns that half.
 
     Raises:
         KpoolHadamardError: for a malformed call -- a non-3D ``slot_k``, a ``slot_score`` that does

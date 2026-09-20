@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """MoE-half block-quantised fp8 matmul: the ADAPT of ``nkilib``'s ``bwmm_shard_on_I``.
 
-`inc-glm53f-025`. This module is the campaign's block-quant MoE path. It is
+This module is the campaign's block-quant MoE path. It is
 **kernel-class** under P13: the per-token expert matmul with block
 dequantisation folded in is the model's dominant FLOP path, so the arithmetic
 runs in NKI. The torch code here is the CPU oracle and the
@@ -18,14 +18,14 @@ whose ``is_block_quant=True`` path is the only block-quant member of the
 ``increments/wp6-scale-consumer-geometry.md``). GLM-5.3-Flash ships
 ``[128, 128]`` checkpoint scales, so the granularity gap is bridged on the
 host by :mod:`vllm_neuron.functional.moe.blockwise_fp8_retile`
-(`inc-glm53f-024`), and this module adapts the vendor kernel to the retiled
-layout through a seam this repository owns. **That is the `-025` limb, and on
+and this module adapts the vendor kernel to the retiled
+layout through a seam this repository owns. **That is the vendor limb, and on
 it nothing re-authors kernel numerics: the NKI member is called, not
-replaced.** `inc-glm53f-113a` adds a SECOND, INDEPENDENT limb that does author
+replaced.** A SECOND, INDEPENDENT limb below does author
 its own kernel, at the checkpoint's own granularity; the section that carries
 it says why, and the two limbs share this module without sharing a route.
 
-The `-113a` gate/up limb, in one paragraph
+The gate/up limb, in one paragraph
 -----------------------------------------
 This limb authors the campaign's own NKI kernel for the gate/up projection of
 one expert's token block, indexing the checkpoint's ``128 x 128`` scales
@@ -157,11 +157,11 @@ MAX_HIDDEN = 8192
 #: assignment of ``PSUM_SIZE``.
 PSUM_SIZE = 512
 
-#: The `-113a` limb's scale-block extent: the granularity the CHECKPOINT itself
+#: The gate/up limb's scale-block extent: the granularity the CHECKPOINT itself
 #: stores, one fp32 scale per ``128 x 128`` block of the weight. It is declared
 #: as ``TILE_SIZE`` rather than as a literal ``128`` and it is deliberately NOT
 #: ``BLOCK_QUANT_SIZE``: that ``256`` is the vendor limb's consumer granularity
-#: and is not this kernel's business. `inc-glm53f-026`'s dense module carries the
+#: and is not this kernel's business. The dense module carries the
 #: same declaration for the same reason (``blockwise_fp8_mm.py:109``).
 GATE_UP_SCALE_BLOCK = TILE_SIZE
 
@@ -629,7 +629,7 @@ def blockwise_fp8_moe_torch_oracle(
 
 
 # --------------------------------------------------------------------------- #
-# `inc-glm53f-113a`: THIS CAMPAIGN'S OWN gate/up kernel, at [128, 128].         #
+# THIS CAMPAIGN'S OWN gate/up kernel, at [128, 128].                            #
 # --------------------------------------------------------------------------- #
 # WHAT THIS LIMB IS. One expert's gate/up projection over one block of tokens::
 #
@@ -649,14 +649,14 @@ def blockwise_fp8_moe_torch_oracle(
 # remedy. The reference this limb is measured against lives in the acceptance
 # test, not here.
 #
-# WHY IT HAS ITS OWN BODY AND DOES NOT CALL `inc-glm53f-026`'S DENSE KERNEL. At
+# WHY IT HAS ITS OWN BODY AND DOES NOT CALL THE DENSE KERNEL. At
 # ``[128,128]`` the two arithmetics coincide -- one blocked fp8 matmul -- and that
 # is stated here rather than left for a reader to notice. Three properties this
 # body has and a call to the dense kernel could not give:
 #
 #   1. THE TWO HALVES ARE LIVE TOGETHER. Gate and up tiles for the same
 #      ``i_block`` sit in two accumulators at once, which is what lets
-#      `inc-glm53f-113b` apply ``SiLU(gate) * up`` inside this kernel instead of
+#      the activation limb apply ``SiLU(gate) * up`` inside this kernel instead of
 #      writing both halves to HBM and reading them back. Two dense calls cannot
 #      be fused after the fact.
 #   2. ONE ACTIVATION TILE FEEDS BOTH MATMULS. The transposed hidden tile is
@@ -670,15 +670,15 @@ def blockwise_fp8_moe_torch_oracle(
 # through ``token_position_to_id`` and the block-to-expert dispatch are NOT here:
 # they need an indirect DMA this campaign has not measured on this image, and the
 # seam that would need them is the block seam above. The activation and the
-# expert-affinity scaling are `inc-glm53f-113b`. The down projection is
-# `inc-glm53f-113b`. So this commit adds a limb and changes no route: a caller
+# expert-affinity scaling are a later limb's. The down projection is
+# that later limb's too. So this commit adds a limb and changes no route: a caller
 # reaches it only by name.
 #
 # THE THREE TILE BOUNDS ARE THIS IMAGE'S. A ``nc_matmul`` contracts the PARTITION
 # axis, so both operands present the contraction extent there: ``nl.tile_size.pmax``
 # = 128 on the partition axis, ``gemm_stationary_fmax`` = 128 on the stationary
 # free axis, ``gemm_moving_fmax`` = 512 on the moving free axis. Each was measured
-# by refusal on this image at `inc-glm53f-039a` (``probe-039a-matmul.out``), and
+# by refusal on this image (``probe-039a-matmul.out``), and
 # every tile below sits at or inside them.
 #
 # NO VENDOR CONSTANT IS INHERITED, AND THAT IS THE POINT. ``NUM_SHARDS``,
@@ -831,7 +831,7 @@ def _bank_rows(rows: int, expert, iota, stride: int, offset: int, step: int):
     contraction rows (``expert * H + h``), never in 128-wide column blocks.
 
     THE PER-BLOCK DEVICE SCALAR AS A WEIGHT-BUFFER OFFSET -- the mechanism arm 4 of
-    the `-113` probe read MATCH on (run 229). The expert never becomes a Python int,
+    the expert-index probe read MATCH on (run 229). The expert never becomes a Python int,
     so no host read stands between the mapping and the weight this kernel reads, and
     no expert slab is ever copied to make one contiguous.
 
@@ -854,7 +854,7 @@ def _affinity_rows(rows: int, resolved, expert, n_experts: int):
     The mapping returns its affinities flattened token-major -- ``[T * E_local, 1]``,
     a ``view(-1, 1)`` of ``[T, E_local]`` (``moe/blockwise.py:103-105``) -- so one
     token's expert entry is one row of that flat tensor and this is its address. Arm
-    3 of the `-113` probe measured exactly this: an index vector computed on device
+    3 of the expert-index probe measured exactly this: an index vector computed on device
     out of a device scalar.
     """
     scaled = _column(rows)
@@ -869,12 +869,12 @@ def _gathered(
 ):
     """``rows`` by ``width`` of an ``[n, row_width]`` HBM tensor, addressed by a device index tile.
 
-    `-045`'s landed indirect-DMA form (``dsa/ragged_pack.py:384-392``,
+    The landed indirect-DMA form (``dsa/ragged_pack.py:384-392``,
     ``:466-474``): the access pattern's partition dimension is replaced by one
     address per partition, taken from ``index``, in whole rows of the tensor.
     ``column`` is the static element offset of the tile inside its row, so one
     call reads one column block of a row wider than the tile; ``row_width`` is
-    the tensor's own row and defaults to ``width``. Arm 1 of the `-113` probe
+    the tensor's own row and defaults to ``width``. Arm 1 of the expert-index probe
     read this exact shape MATCH under lease event 229.
     """
     tile = nl.ndarray((rows, _padded(width)), dtype=dtype, buffer=nl.sbuf)[:, 0:width]
@@ -1055,7 +1055,7 @@ class _GateUpDispatchCounters:
     A SECOND counter pair in this module, which the campaign's own convention
     admits when one summed pair could not tell two entry points apart: the landed
     ``functional/dsa/causal_bound.py`` carries two pairs for exactly that reason
-    (``test_dsa_layer.py:3665``). ``-027``'s three readers --
+    (``test_dsa_layer.py:3665``). The landed seam's three readers --
     :data:`_COUNTERS`, :func:`reset_dispatch_counters` and
     :func:`dispatch_counters` -- keep their names, shapes and module, and this
     pair is disjoint from them.
@@ -1336,9 +1336,9 @@ def moe_gate_up_blockwise_fp8_kernel(
 
 
 # --------------------------------------------------------------------------- #
-# `inc-glm53f-113b`: the activation and the down projection, both in NKI.        #
+# The activation and the down projection, both in NKI.                           #
 # --------------------------------------------------------------------------- #
-# WHAT THESE TWO LIMBS ARE. Together with `-113a` they complete the block's
+# WHAT THESE TWO LIMBS ARE. Together with the gate/up limb they complete the block's
 # arithmetic: ``SiLU(gate) * up`` on the gate/up result, then the down projection
 # with its own ``128 x 128`` block dequantisation folded in, then the expert
 # affinity on the down result -- which is where the plan block puts it. No torch
@@ -1365,7 +1365,7 @@ def moe_gate_up_blockwise_fp8_kernel(
 # WHY ``nisa.tensor_tensor`` IS NOWHERE HERE. An elementwise tensor-times-tensor
 # is what the activation needs twice, and this image's parameter names for that
 # member are not measured by this campaign. The three-operand form IS measured --
-# `-113a` folds a scale with it -- so it is used with ``1.0`` as the identity
+# the gate/up limb folds a scale with it -- so it is used with ``1.0`` as the identity
 # scalar. That is one wasted multiply and a construct this seat can check, which
 # is the trade an unmeasured API does not deserve.
 #
@@ -1904,7 +1904,7 @@ def moe_down_blockwise_fp8_kernel(
         caller's one ``index_add``, for the reason the module section records.
 
     THE AFFINITY INDEX IS COMPUTED ON DEVICE -- ``row * E_local + expert``, from the
-    block's own expert scalar. That is arm 3 of the `-113` probe, which read MATCH at
+    block's own expert scalar. That is arm 3 of the expert-index probe, which read MATCH at
     this shape, and it is why one affinity gather replaces a torch advanced-index
     over two tensors.
 
@@ -2136,7 +2136,7 @@ def moe_down_blockwise_fp8(
 # --------------------------------------------------------------------------- #
 # The two identity readings, DERIVED THROUGH THE SEAM.                          #
 # --------------------------------------------------------------------------- #
-# WHAT WAS WRONG (`B26-M1`, repaired at `inc-glm53f-077`). This function used to
+# WHAT WAS WRONG (`B26-M1`, now repaired). This function used to
 # read the MODULE-LEVEL import at the top of this file:
 #
 #     func = getattr(blockwise_mm_baseline_shard_intermediate, "func", None)
@@ -2296,7 +2296,7 @@ def kernel_identity() -> tuple[str, str]:
 
 
 # --------------------------------------------------------------------------- #
-# `inc-glm53f-113a`'s identity reading, derived through ITS OWN seam.            #
+# The gate/up limb's identity reading, derived through ITS OWN seam.             #
 # --------------------------------------------------------------------------- #
 # WHY A SECOND DERIVATION AND NOT A PARAMETER ON THE FIRST. `_seam_wrapped_object`
 # above is read BY NAME and called with no arguments by a landed acceptance item,

@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Acceptance test for ``inc-glm53f-061`` -- WP10: the video path.
+"""Acceptance test for WP10: the video path.
 
 THE REGISTERED CRITERION, VERBATIM. Copied from ``design/increment-plan.md`` line 1334 at plan
 revision 262, whose bytes are
 ``c71ff306583ed57b7e92e50b14350b9b2edc8e1d7a7e1e6b2caec414e7dc9249``. No criteria pin was minted
-for ``-061``, so the plan digest is the pin this file cites; the acceptance driver greps the quote
+for this increment, so the plan digest is the pin this file cites; the acceptance driver greps the quote
 below as a fixed string. Markdown emphasis, arrows and all -- a transliteration would let the quote
 drift from the criterion while still reading correctly:
 
@@ -17,7 +17,7 @@ V04E (the band case); (4) the 5/5 oracle-parity cases and the 1/1 lowered-ceilin
 (5) the 2/2 controls are V05A (three frames are not bit-identical) and V05B (the band case's real
 pixels). V06 exercises the guards and V07 reports every reading, so no number here is silent.
 
-WHY THIS CRITERION REPLACED THE ONE ``-061`` WAS FIRST GIVEN, AND WHY THAT IS A FINDING RATHER THAN
+WHY THIS CRITERION REPLACED THE ONE THIS INCREMENT WAS FIRST GIVEN, AND WHY THAT IS A FINDING RATHER THAN
 A RETREAT. Revision 260 asked for a 1-frame video to be bit-identical to the same still image at
 every clamp bound. It was measured under grant 105 and 4 of 23 items went red
 (``run-061-r11.out``). The reading that mattered is that the failing comparison had no fork code in
@@ -29,8 +29,8 @@ with upstream -- which is the opposite of what this campaign is for.
 
 THIS INCREMENT IS TEST-ONLY, AND ``vision_preprocessing.py`` MUST NOT CHANGE. The ruling that
 scoped it refused a packer with no caller and a video branch that would duplicate handling already
-landed: ``video_grid_spec`` landed with ``-056`` and per-frame ``compute_attention_bounds`` landed
-with ``-060``. Revision 262 adds the stronger statement: the module is FAITHFUL to upstream on both
+landed: ``video_grid_spec`` landed with the preprocessing item and per-frame ``compute_attention_bounds`` landed
+with a sibling item. Revision 262 adds the stronger statement: the module is FAITHFUL to upstream on both
 raw-frame-count reads and on both token ceilings, so an edit there would be the defect and not the
 fix. Nothing is authored here to give a file surface a body.
 
@@ -82,7 +82,7 @@ reached the attribute before it measures anything, because a kwarg that was sile
 leave the test measuring the default ceiling and reporting a pass.
 
 WHAT IS CONSUMED AND WHAT IS UNDER TEST. Ruling ``design-20260905-aq`` (iii) forbids re-deriving
-the grid in a test. So the SPATIAL factors are consumed from ``-056``'s landed module and never
+the grid in a test. So the SPATIAL factors are consumed from the landed preprocessing module and never
 recomputed here; the one quantity this file states as a closed form is the FRAME factor, which is
 the increment's own subject. The form is the plan rider's grid form ``grid_t = (F + (-F % tps)) //
 tps``, with ``tps`` read off the processor and never typed as 2. Every threshold -- the floor
@@ -103,12 +103,12 @@ WHERE THE FRAME-COUNT REFERENCES COME FROM, AND WHY F=8's IS DIFFERENT. Five ``g
 read from the real processor on the leased host and filed as ``read-056-r3-closedform.out`` lines
 68-76, whose bytes are
 ``c5603c91f0e091b7386e95b4851588873977b7cc1a52a245140f93780a261700``. F=8 is not among them: its
-reference is ``-056``'s landed ``B05_eight_frames`` row, itself pinned to the real video processor
+reference is the landed ``B05_eight_frames`` row, itself pinned to the real video processor
 by ``test_c02_video_grid_matches_oracle_and_closed_form``. Both sources are named per frame count in
 ``RECORDED_GRID_T_SOURCE`` and V02 prints them, so no reference is anonymous and none is recomputed
 here.
 
-THE SEVEN CASES ARE ``-056``'s R2 SET, NOW PARTITIONED RATHER THAN NARROWED. Their sizes and regimes
+THE SEVEN CASES ARE THE LANDED R2 SET, NOW PARTITIONED RATHER THAN NARROWED. Their sizes and regimes
 are quoted from ``test_vision_preprocessing.py``, which read every integer from
 ``derive-056r2-divergence.out``. Revision 262 splits them: four are part (2)'s equality cases and
 three are part (3)'s divergences. V04B asserts the partition is a partition -- every case in exactly
@@ -189,19 +189,19 @@ REGISTERED_GRID_T_VALUES = {1, 2, 4, 9}
 
 #: The counts where the budget form and the grid form MUST agree, and the counts where they must
 #: differ, with both answers named. F=17's pair is the module's own docstring and the plan; F=5's is
-#: ``design-061-plan-rev-r1-findings.md`` and ``-056``'s ``test_m05``, which sweeps F=5 against the
+#: ``design-061-plan-rev-r1-findings.md`` and the sibling file's ``test_m05``, which sweeps F=5 against the
 #: real video processor and so pins the grid form's 3 in the world.
 DECOY_AGREEMENT_FRAME_COUNTS = (1, 2, 3, 8)
 DECOY_DISAGREEMENT_FRAME_COUNTS = {5: (2, 3), 17: (8, 9)}  # F -> (budget form, grid form)
 
 #: The frame-count arm's item size. 112x112 is regime A on this checkpoint, so its canvas does not
-#: move with the frame count and the arm reads the frame factor alone. It is the size ``-056``'s
+#: move with the frame count and the arm reads the frame factor alone. It is the size the sibling file's
 #: own registered video cases use.
 FRAME_ARM_HEIGHT = 112
 FRAME_ARM_WIDTH = 112
 
 # ---------------------------------------------------------------------------
-# The seven cases, from ``-056``'s R2 set, partitioned by revision 262.
+# The seven cases, from the sibling file's R2 set, partitioned by revision 262.
 # (name, height, width, regime)
 # ---------------------------------------------------------------------------
 R2_CASES = (
@@ -225,7 +225,7 @@ UNCLAMPED_EQUALITY_CASE_NAMES = (
 
 #: The three clamped cases of the seven, which diverge and are asserted by counterfactual. This is NOT
 #: part (3)'s registered count: part (3) is 4/4, because its fourth divergence is the band case, which is
-#: 130x130 and is not one of ``-056``'s seven.
+#: 130x130 and is not one of the sibling file's seven.
 CLAMPED_DIVERGENCE_CASE_NAMES = ("tiny_floor_bound", "tiny_square", "huge_ceiling_bound")
 
 #: Part (3) cases 1 and 2. (name, h, w, image canvas, video canvas at F=1). The counterfactual is
@@ -262,7 +262,7 @@ SHAPE_CONTROL_IMAGE_ROWS = 1024
 SHAPE_CONTROL_VIDEO_ROWS = 2048
 
 # ---------------------------------------------------------------------------
-# Part (4): oracle parity over ``-056``'s registered video cases, plus the lowered-ceiling pair.
+# Part (4): oracle parity over the sibling file's registered video cases, plus the lowered-ceiling pair.
 # ---------------------------------------------------------------------------
 #: The sibling file that OWNS the registered video case table. Revision 262 widened it from 2 rows
 #: to 5 as part of this increment, and this file reads it rather than restating it, so the five
@@ -272,7 +272,7 @@ CASES_OWNER_SYMBOL = "REGISTERED_VIDEO_CASES"
 
 
 def _read_registered_video_cases():
-    """Read ``-056``'s registered video case table out of its source, without importing it.
+    """Read the sibling file's registered video case table out of its source, without importing it.
 
     An AST read rather than an import for two reasons: importing another test module to borrow a
     constant makes this file's collection depend on that file's collection, and the table is a plain
@@ -317,7 +317,7 @@ LOWERED_CEILING_CANVAS = (224, 224)
 LOWERED_CEILING_GRID_HW = (16, 16)
 LOWERED_CEILING_PATCH_ROWS = 256
 
-#: The one case whose REAL-PIXEL arm is skipped, for the reason ``-056`` skipped it: an 8000x6000
+#: The one case whose REAL-PIXEL arm is skipped, for the reason the sibling file skipped it: an 8000x6000
 #: uint8 image is 144 million pixels and resampling it twice on CPU costs more than the reading is
 #: worth. Its ARITHMETIC arm still runs, so the case is not dropped from the seven.
 R2_TOO_BIG_FOR_REAL_PIXELS = "huge_ceiling_bound"
@@ -368,7 +368,7 @@ def _case(name):
     for row in R2_CASES:
         if row[0] == name:
             return row
-    raise AssertionError(f"{name} is not one of -056's seven R2 cases")
+    raise AssertionError(f"{name} is not one of the seven R2 cases")
 
 
 def _run_image_oracle(oracle, height, width, value=CONTENT_VALUE_A):
@@ -439,7 +439,7 @@ def _paths_report(image_spec, video_spec, image_record, video_record, num_frames
 
 
 def _both_specs(image_consts, video_consts, height, width, num_frames):
-    """The two paths' grids and resample records for one size, all four consumed from ``-056``."""
+    """The two paths' grids and resample records for one size, all four consumed from the landed module."""
     image_spec = image_grid_spec(image_consts, height, width)
     video_spec = video_grid_spec(video_consts, num_frames, height, width)
     image_record = describe_resample(
@@ -570,7 +570,7 @@ def test_v02_the_recorded_points_agree_with_the_closed_form(video_consts):
 
 
 def test_v02_f8s_reference_is_the_landed_row_it_claims_to_be():
-    """F=8's recorded ``grid_t`` must be the one ``-056``'s landed table actually holds.
+    """F=8's recorded ``grid_t`` must be the one the sibling file's landed table actually holds.
 
     This is the check that keeps ``RECORDED_GRID_T_SOURCE`` honest for the one point whose source is
     another file: if B05's row ever changed, F=8 would still read 4 here and the source string would
@@ -732,7 +732,7 @@ def test_v04_the_seven_cases_are_partitioned_and_none_was_dropped():
     divergence = set(CLAMPED_DIVERGENCE_CASE_NAMES)
     _record("v04_partition", "seven", len(all_names), "equality", len(equality),
             "divergence", len(divergence))
-    assert len(R2_CASES) == 7, f"expected -056's seven-case set, got {len(R2_CASES)}"
+    assert len(R2_CASES) == 7, f"expected the seven-case set, got {len(R2_CASES)}"
     assert not equality & divergence, (
         f"these cases are in both halves of the partition: {sorted(equality & divergence)}"
     )
@@ -1133,7 +1133,7 @@ def test_v06_a_zero_frame_video_is_not_silently_one(video_consts):
     The end-to-end call is REPORTED and not asserted. It reaches transformers' ``smart_resize``
     with ``num_frames=0``, and what that does is in no record this lane holds -- an empty video is
     not part of any registered criterion, so an exception there would turn a green acceptance red
-    for a question -061 never asked. The reading is printed either way, which is what makes the
+    for a question this increment never asked. The reading is printed either way, which is what makes the
     behaviour known for the next increment that needs it.
     """
     assert _closed_form_grid_t(0, video_consts.temporal_patch_size) == 0, (
@@ -1168,7 +1168,7 @@ def test_v06_the_temporal_patch_size_is_read_and_not_assumed(video_consts):
 # V08 -- part (4): per-modality oracle parity, 5/5 registered cases plus the 1/1 ceiling pair.
 # ---------------------------------------------------------------------------
 def test_v08_the_registered_case_table_is_the_five_this_increment_registered():
-    """The drift guard on the table this file reads from ``-056``.
+    """The drift guard on the table this file reads from the sibling file.
 
     Part (4) registers five named cases. This file reads them from the file that owns them rather
     than restating them, so this is the check that the owner still holds exactly those five: a row
@@ -1353,7 +1353,7 @@ def test_v07_report_the_measured_readings(
     tps = video_consts.temporal_patch_size
     lines = [
         "",
-        "inc-glm53f-061 -- video path readings (increment-plan revision 262)",
+        "video path readings (increment-plan revision 262)",
         f"  module resolved from   {vllm_neuron.__file__}",
         f"  transformers reference {transformers.__version__}",
         f"  temporal_patch_size {tps}, merge_length {video_consts.merge_length}, "

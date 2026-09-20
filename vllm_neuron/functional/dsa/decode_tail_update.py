@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Decode-step tail update for the sparse-attention indexer's k-pool.
 
-``inc-glm53f-049``. WP4 pools ``index_kpool`` consecutive tokens into one indexer key. Prefill
-sees whole pools and is served by :mod:`vllm_neuron.functional.dsa.kpool_hadamard` (``-047``).
+WP4 pools ``index_kpool`` consecutive tokens into one indexer key. Prefill
+sees whole pools and is served by :mod:`vllm_neuron.functional.dsa.kpool_hadamard`.
 Decode sees ONE token at a time, so a pool is completed across several steps: the tokens that do
 not complete a pool are kept RAW in a small per-request ring, and the step that completes a pool
 reads that ring plus the current token and compresses them.
 
-This module owns that ring and that step. ``-047``'s own docstring names it: *"the raw tail cache
-for a request's incomplete trailing pool (``kpool_compress.py:411``). ``inc-glm53f-049`` owns it."*
+This module owns that ring and that step. The prefill docstring names it: *"the raw tail cache
+for a request's incomplete trailing pool (``kpool_compress.py:411``). This module owns it."*
 
 It is **kernel-class** under P13, and it is **SCRATCH**. The state is a device tensor that lives
 between decode steps, and a decode loop runs one step per generated token; a torch-level step would
@@ -18,7 +18,7 @@ substrate register admits (``design/increment-plan.md`` section 4) -- and never 
 implementation.
 
 THE PRECEDENT FOR THE SHAPE OF THIS MODULE IS LANDED, not invented here:
-:mod:`vllm_neuron.functional.kda.decode_state` (``inc-glm53f-036``) is the same problem one layer
+:mod:`vllm_neuron.functional.kda.decode_state` is the same problem one layer
 down -- take the state a prefill left, advance it by exactly one token, return the advanced state
 and that token's output. Its rule about the one-token shape is this module's rule too: *"THE
 ONE-TOKEN SHAPE IS NOT AN INEFFICIENCY TO BE BATCHED AWAY. It is the contract: the route predicate
@@ -39,7 +39,7 @@ Per decode token, with ``slot = position % pool_size``:
 1. **The completion read runs FIRST.** If ``slot == pool_size - 1`` this token completes a pool.
    The pool's ``pool_size`` members are the ring's prior stashes for every slot except this one,
    and the CURRENT token for this one (``:526`` ``is_current``, ``:533`` and ``:564`` select on it).
-   They are compressed exactly as ``-047`` compresses a prefill pool::
+   They are compressed exactly as the prefill kernel compresses a pool::
 
        w[s, d] = softmax_over_s( score[s, d] + ape[s, d] )
        pooled[d] = sum_s w[s, d] * key[s, d]
@@ -63,9 +63,9 @@ The two bf16 round trips are the reference's, not this module's taste
 --------------------------------------------------------------------
 Upstream rounds to bf16 TWICE inside the completion: once on the pooled vector before the rotation
 and once on the rotated vector after it (``:567-568`` -- ``x = (acc / denom).to(tl.bfloat16)`` then
-``x = _hadamard128(x).to(tl.bfloat16)``). ``-047``'s prefill kernel does NOT do the first one: it
+``x = _hadamard128(x).to(tl.bfloat16)``). The prefill kernel does NOT do the first one: it
 carries fp32 into the butterfly and casts once at the end. So this module's output is not
-bit-identical to ``-047``'s on the same pool, and that is FAITHFUL rather than a defect. Both round
+bit-identical to prefill's on the same pool, and that is FAITHFUL rather than a defect. Both round
 trips are reproduced, and the module's own torch reference reproduces them too, so the acceptance
 compares like with like.
 
@@ -83,20 +83,20 @@ What this module deliberately does NOT do
 Each of these is owned elsewhere, and leaving it out is a recorded decision rather than an omission:
 
 * **fp8 quantisation and the ue8m0 scale** (``:570-577``). This module returns bf16 and no scale.
-  ``inc-glm53f-053``'s adapter owns that half, exactly as it does for ``-047``.
+  The fp8 adapter owns that half, exactly as it does for the prefill kernel.
 * **the indexer cache write at ``loc``** (``:579-593``). Nothing here touches a KV cache.
 * **paging of the ring.** Upstream addresses the ring through ``tail_slot_mapping`` and a block
   base (``:498-500``). This module takes the ring for ONE request as a plain tensor; resolving a
-  request to its block is the indexer integration's job (``inc-glm53f-051``).
+  request to its block is the indexer integration's job.
 * **batching several requests, or several verify tokens, per call.** Upstream's kernel is one
   program per request over ``next_n`` tokens in position order (``:467-477``). Here one call is one
-  token, for the route-predicate reason ``-036`` records above. A batched call would also need a
+  token, for the route-predicate reason recorded above. A batched call would also need a
   per-request slot, which is a data-dependent address, and ``slot`` here is a trace-time constant.
 
 Why the kernel's ``slot`` is a python int, and why a caller need not have one
 ----------------------------------------------------------------------------
 ``slot`` selects which ring row is read as the current token and which row is written, so inside the
-kernel it is an ADDRESS and it stays a python int -- the same reason ``-047`` gives for its
+kernel it is an ADDRESS and it stays a python int -- the same reason prefill gives for its
 ``n_pools`` and ``pool_size``. What follows from that is what this module used to state as a rule for
 its callers, and it was wrong as a rule: the compiled graph specialises on
 ``(pool_size, slot, head_dim, dtype)``, so a caller that derives ``slot`` from a decode step's real
@@ -247,7 +247,7 @@ def _row_pattern(rows: int, head_dim: int) -> list[list[int]]:
     """The access pattern for ``rows`` CONTIGUOUS rows of a 2-D buffer of width ``head_dim``.
 
     One spelling, used by every read and every write in this kernel, so a stride mistake is one
-    mistake in one place instead of six chances to make it. Same shape as ``-047``'s reads and
+    mistake in one place instead of six chances to make it. Same shape as prefill's reads and
     stores, with the row stride equal to the row width because nothing here is strided over pools.
     """
     return [[head_dim, rows], [1, head_dim]]
@@ -282,10 +282,10 @@ def _load_rows_fp32(hbm, rows: int, head_dim: int, first_row: int):
     (``mla_sparse.py:350`` ``p_t[:, ck, :]``, ``permute_routed_tokens.py:591``
     ``deduped_free[:, 0:1]``), and the one landed partition-range operand is a ``dma_copy``
     DESTINATION in HBM (``permute_routed_tokens.py:507``). Reading each row separately uses only
-    the access-pattern form ``-047`` already ships.
+    the access-pattern form prefill already ships.
 
     NO BROADCAST IS NEEDED ANYWHERE IN THIS MODULE, which is the one simplification the one-token
-    shape buys over ``-047``: that kernel replicates an ``ape`` row across up to 128 pool partitions
+    shape buys over prefill: that kernel replicates an ``ape`` row across up to 128 pool partitions
     with a zero partition stride, and here every tile has exactly one row, so an ``ape`` row is just
     a one-row read at its own offset.
     """
@@ -295,7 +295,7 @@ def _load_rows_fp32(hbm, rows: int, head_dim: int, first_row: int):
 
 
 def _cast_row(src, head_dim: int, dtype):
-    """One ``(1, head_dim)`` tile, cast to ``dtype``. A whole-tile ``tensor_copy``, as ``-047``."""
+    """One ``(1, head_dim)`` tile, cast to ``dtype``. A whole-tile ``tensor_copy``, as prefill."""
     out = nl.ndarray((1, head_dim), dtype=dtype, buffer=nl.sbuf)
     nisa.tensor_copy(dst=out, src=src)
     return out
@@ -338,7 +338,7 @@ def _decode_tail_update_nki(tail_hbm, key_hbm, score_hbm, ape_hbm, pool_size, sl
     checkpoint that is 8 rows of 128 bf16 elements -- 2 KiB in and 2 KiB out per token -- which is
     small beside the attention step it sits inside. Upstream avoids the copy by writing the ring in
     place through a paged mapping (``:600-607``); adopting that here needs the paged addressing this
-    increment excludes, so the copy is the price of the narrower scope and ``inc-glm53f-051`` is
+    increment excludes, so the copy is the price of the narrower scope and the integration is
     where it can be revisited.
 
     THE COMPLETION BRANCH IS RESOLVED AT TRACE TIME, so a non-completing step traces no softmax at
@@ -397,7 +397,7 @@ def _decode_tail_update_nki(tail_hbm, key_hbm, score_hbm, ape_hbm, pool_size, sl
             nisa.tensor_tensor(dst=weighted, data1=weight, data2=key_src, op=nl.multiply)
             nisa.tensor_tensor(dst=acc, data1=acc, data2=weighted, op=nl.add)
 
-        # Reciprocal-then-multiply, not a divide: the form the ISA exposes directly (as ``-047``).
+        # Reciprocal-then-multiply, not a divide: the form the ISA exposes directly (as prefill).
         inv = nl.ndarray((1, head_dim), dtype=nl.float32, buffer=nl.sbuf)
         nisa.reciprocal(dst=inv, data=denom)
         pooled = nl.ndarray((1, head_dim), dtype=nl.float32, buffer=nl.sbuf)
@@ -429,7 +429,7 @@ def _decode_tail_update_nki(tail_hbm, key_hbm, score_hbm, ape_hbm, pool_size, sl
 
     # ---- 2. THE STASH, SECOND, and for THIS token whether or not a pool ended. -------------- #
     # EVERY OUTPUT ROW IS WRITTEN EXACTLY ONCE, and each write is a whole-tile store through the
-    # access-pattern form ``-047`` ships. Two rows come from this token and the rest are carried
+    # access-pattern form prefill ships. Two rows come from this token and the rest are carried
     # across in their own dtype. Writing the prior ring wholesale and then overwriting two of its
     # rows would put two writes on the same addresses inside one kernel, and the ordering of those
     # two is not something this file should have to assume.
@@ -724,7 +724,7 @@ def _compress_pool_torch(pool_key: Tensor, pool_score: Tensor, ape: Tensor) -> T
     ``[1, head_dim]`` in ``pool_key``'s dtype.
 
     BOTH bf16 ROUND TRIPS ARE HERE (``:567-568``), and they are the reason this is not simply
-    ``-047``'s oracle with a different input: that one keeps fp32 all the way to the output cast.
+    prefill's oracle with a different input: that one keeps fp32 all the way to the output cast.
     ``dim=0`` is the SLOT axis, which is what makes the softmax per ``(slot, channel)``; a ``dim=-1``
     here would be a whole-vector softmax, which is a different kernel, and the test carries a case
     whose only job is to tell the two apart.

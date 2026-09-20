@@ -59,7 +59,7 @@ accumulates in fp32; the upstream contract returns fp32 (``rocm_aiter_mla_sparse
 scores to 1,025 distinct values, which would destroy the ranking the next stage exists to compute.
 
 WHAT THE bf16 IN THE INCREMENT TITLE MEANS. It names this campaign's bf16 NKI route, which is the
-same wording correction the ``-044`` and ``-045`` ledger rows already carry. It does NOT mean an MX
+same wording correction the landed ledger rows already carry. It does NOT mean an MX
 form was re-derived here. The design trace's own score stage is ALREADY bf16: its docstring reads
 "Q/K/W projections still use ``nc_matmul_mx`` for speed, but the score matmul uses bf16 nc_matmul (no
 Q/K quantization, no Hadamard rotation)", and its pseudocode names the stage
@@ -83,7 +83,7 @@ WHAT THIS MODULE DELIBERATELY DOES NOT DO.
   * No masking and no ``-inf`` fill. Upstream applies its causal and window mask AFTER this op
     (``rocm_aiter_mla_sparse.py:734``); the mask stage is a separate increment.
   * No top-k. The scores are pool-granular, and selecting over them belongs to the landed
-    ``dsa_topk_select`` (the ``-043`` ledger row; see ``evidence-043.md``), which this feeds.
+    ``dsa_topk_select`` (its ledger row; see ``evidence-043.md``), which this feeds.
   * No head padding. Upstream pads the head count to 32 or 64 because the DeepGEMM kernels demand it
     (``attention.py:382-390``); a NKI head loop has no such constraint, so the padding does not port.
 
@@ -96,7 +96,7 @@ the simulator; the transcripts are ``probe-046-mechanism-capture-host.out`` and
   * A ``nisa.tensor_scalar`` per-token scale takes a ``(P, 1)`` COLUMN and refuses a ``(1, N)`` ROW.
     The probe's control arm was refused with ``Generated MLIR failed verification`` naming
     ``nisa.tensor_scalar_arith`` with ``operand0_static_tile_shape = array<i64: 1, 8>`` against
-    ``dst_static_tile_shape = array<i64: 6, 8>``. This is the ``-045`` finding, re-read on the image
+    ``dst_static_tile_shape = array<i64: 6, 8>``. This is the recorded finding, re-read on the image
     that will compile this file. The column form below is the one that passed.
   * ``nc_matmul`` refuses an int32 operand (``nc_matmul stationary dtype int32 not supported``,
     recorded at ``vllm_neuron/functional/dsa/paged_gather.py:65-68``). The bf16 round used exactly

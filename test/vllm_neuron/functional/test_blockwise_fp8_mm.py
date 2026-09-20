@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tier N acceptance for `inc-glm53f-026` -- the dense-half blockwise fp8 GEMM.
+"""Tier N acceptance for the dense-half blockwise fp8 GEMM.
 
-Acceptance command (plan block ``#### inc-glm53f-026``, with D1's Tier N env)::
+Acceptance command (from the plan block, with D1's Tier N env)::
 
     VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1 NKI_PRECISE_FP=1 \
     NEURON_PLATFORM_TARGET_OVERRIDE=trn2 \
@@ -63,7 +63,7 @@ chain RAISING rather than quietly computing torch when the simulator is off.
 
 Why the numeric comparison here IS a check on the scale mapping
 --------------------------------------------------------------
-Unlike `inc-glm53f-025`, whose kernel and vendor oracle read the scale tensor
+Unlike the MoE half, whose kernel and vendor oracle read the scale tensor
 through the same convention, the oracle below dequantises **first** and never
 consults :func:`~vllm_neuron.functional.blockwise_fp8_mm.flat_scale_index`. With
 distinct per-block scales a transposed flattening therefore shows up as a numeric
@@ -113,7 +113,7 @@ K = 512   # contraction; a whole number of SCALE_BLOCK_SIZE scale blocks
 N = 512   # output width; a whole number of SCALE_BLOCK_SIZE scale blocks
 
 M_TILES = M // TILE_SIZE            # 2
-# RE-PINNED by `inc-glm53f-112` (D17.1). The kernel's scale grid IS the
+# RE-PINNED (D17.1). The kernel's scale grid IS the
 # checkpoint's, so these are the 128-block counts. The vendor matmul's ``256``
 # grid keeps its own names below, because the fixture's scale CONDITIONING is
 # stated on that grid -- one name for both would be exactly the drift the re-pin
@@ -122,7 +122,7 @@ K_BLOCKS = K // SCALE_BLOCK_SIZE    # 4
 N_BLOCKS = N // SCALE_BLOCK_SIZE    # 4
 OUTPUT_TILES = M_TILES * N_BLOCKS   # 8 -- the "per output tile" population
 
-#: `inc-glm53f-112`. 384 was inadmissible at the producer's old 256 granularity
+#: 384 was inadmissible at the producer's old 256 granularity
 #: but is a whole number of 128 blocks (384 % 128 == 0), so it stopped raising
 #: when the kernel's own granularity narrowed. DERIVED from SCALE_BLOCK_SIZE
 #: rather than typed: it must stay a non-multiple of SCALE_BLOCK_SIZE or this row
@@ -145,7 +145,7 @@ ATOL = 1e-5
 #: written as a second literal, because ``ATOL`` already IS the plan's 1e-5.
 #: Nothing new is introduced here and nothing existing moves: this name only
 #: routes the plan's own figure to the arm whose bullet declares it.
-#: Added by ``inc-glm53f-026``'s repair for finding ``B19-026`` (repair batch R4).
+#: Added by the repair for finding ``B19-026`` (repair batch R4).
 SINGLE_OP_TOL = ATOL
 
 _FP8 = torch.float8_e4m3fn
@@ -267,7 +267,7 @@ def _pow2_checkpoint_scales(uniform_one: bool = False) -> torch.Tensor:
     exponents = torch.zeros(grid[1:], dtype=torch.int64)
     # The quad structure is the VENDOR matmul's: one 256 block spans a
     # TILES_PER_VENDOR_BLOCK square of 128 checkpoint tiles. Driven by those
-    # counts since `inc-glm53f-112`, because the kernel's own block count is no
+    # counts since the re-pin, because the kernel's own block count is no
     # longer 2 and this loop was never about the kernel.
     for k_block in range(VENDOR_K_BLOCKS):
         for n_block in range(VENDOR_N_BLOCKS):
@@ -287,7 +287,7 @@ def _fp8_grid(seed: int, *shape: int, signed: bool = False) -> torch.Tensor:
     """Values already on the fp8-e4m3 grid, so every cast in the fixture is exact.
 
     ``signed=False`` is the default and it is a CONDITIONING choice carried from
-    `inc-glm53f-025`, whose attempt 1 read ``max_rel_error=8.32e+01`` against
+    the MoE half, whose attempt 1 read ``max_rel_error=8.32e+01`` against
     ``rtol=3e-2`` from catastrophic cancellation in a SIGNED fixture over a
     512-wide contraction -- not from a kernel defect. With signed values the
     reference lands arbitrarily close to zero while the terms that built it are
@@ -311,7 +311,7 @@ def _fp8_grid(seed: int, *shape: int, signed: bool = False) -> torch.Tensor:
 def _build_case(uniform_one: bool = False, signed: bool = False) -> dict:
     """The tiny config the kernel consumes: the checkpoint's own pair.
 
-    RE-PINNED by `inc-glm53f-112` (D17.1), and this is the increment in one
+    RE-PINNED (D17.1), and this is the increment in one
     function. The kernel used to be handed a RETILED pair -- weights
     re-expressed against ``256``-granular scales -- because it indexed its
     scales by ``256`` blocks. It now indexes by the ``128`` blocks the
@@ -695,7 +695,7 @@ def test_signed_fixture_agrees_in_norm_under_cancellation() -> None:
     """Signed weights and activations, compared in per-tile relative L2.
 
     Kept so sign handling stays covered after the declared arms moved to a
-    well-conditioned fixture (the `inc-glm53f-025` carry). Over a 512-wide
+    well-conditioned fixture (the MoE-half carry). Over a 512-wide
     contraction a signed fixture cancels, so this arm applies the SAME declared
     ``RTOL`` to a per-tile relative L2 norm, which cancellation does not distort.
     No new tolerance number is introduced: the bound is ``RTOL``.
@@ -809,12 +809,12 @@ def test_route_control_simulator_is_load_bearing() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# The counters are MODULE-LEVEL state -- `inc-glm53f-033` depends on it.        #
+# The counters are MODULE-LEVEL state -- the route predicate depends on it.     #
 # --------------------------------------------------------------------------- #
 def test_dispatch_counters_are_module_level_state_reachable_from_elsewhere() -> None:
-    """Another module can zero and read these counters. `-033` needs exactly this.
+    """Another module can zero and read these counters. The consumer needs exactly this.
 
-    `inc-glm53f-033`'s route predicate is form R-2 over THIS seam: its own test
+    The consumer's route predicate is form R-2 over THIS seam: its own test
     module resets and reads the counters this module owns. A test-local counter,
     or one only this file could reset, would pass this increment and break that
     one.
@@ -835,7 +835,7 @@ def test_dispatch_counters_are_module_level_state_reachable_from_elsewhere() -> 
     foreign.reset_dispatch_counters()
     assert dispatch_counters() == (0, 0), (
         "a reset through the foreign reference did not zero the counters this "
-        "test reads, so the state is not shared and -033's R-2 predicate cannot "
+        "test reads, so the state is not shared and the consumer's R-2 predicate cannot "
         "be taken over this seam"
     )
     with _SimulatorCounter() as sim:
@@ -866,7 +866,7 @@ def test_seam_dispatches_to_the_kernel_this_increment_authors() -> None:
 
     SCRATCH is checkable here: the kernel's module is this repository's, not
     ``nkilib``'s, which is the difference between this increment and
-    `inc-glm53f-025`.
+    the MoE half.
     """
     module, qualname = kernel_identity()
     print(f"[identity] kernel={module}.{qualname}")

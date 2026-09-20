@@ -71,7 +71,7 @@ CPU_MODE = "VLLM_NEURON_CPU_MODE"
 #: leave the identical value in the environment. The design's D2 invocation rule
 #: says which one a given run is, so the origin has to be a fact a test can read,
 #: not something inferred from a value that is now the same in both cases. Landed by
-#: ``inc-glm53f-014``'s R2 round on the lead's design call N7.
+#: The R2 round on the lead's design call N7.
 SUPPLIED = "supplied"
 DEFAULTED = "defaulted"
 RESOLUTION_ORIGIN: dict[str, str] = {}

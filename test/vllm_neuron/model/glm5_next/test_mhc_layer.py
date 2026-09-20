@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tier N acceptance for ``inc-glm53f-030`` -- WP8, the mHC layer orchestration.
+"""Tier N acceptance for WP8, the mHC layer orchestration.
 
 The declared acceptance (increment plan revision 35,
 ``16c1ed71f5872b3af81ab59bdba1dd2ef999cd5daa6ecdba98d2b99fe28b54fc``, L958),
@@ -8,9 +8,9 @@ verbatim on both of the things it declares:
     "the mHC layer's output matches a torch reference layer with
     ``assert_close(rtol=1e-2, atol=1e-5)`` in 1/1 tiny case, **and** the seam
     counters show the Sinkhorn and combine kernels were each entered **exactly
-    once per layer call** (silent-fallback guard, as ``-027``)."
+    once per layer call** (silent-fallback guard, as the MoE block)."
 
-Tier N, so the command is the harness this block inherits from ``-025``
+Tier N, so the command is the harness this block inherits
 (plan L913, with revision 33's ``-p no:cacheprovider``)::
 
     VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1 NKI_PRECISE_FP=1 \\
@@ -19,22 +19,22 @@ Tier N, so the command is the harness this block inherits from ``-025``
       --timeout 60 -v -s -p no:cacheprovider
 
 THE ROUTE PREDICATE (D13 form R-2, plan L959). This increment authors NO seam:
-it is the layer wiring that selects and feeds ``-028``'s Sinkhorn kernel and
-``-029``'s combine kernel. So the predicate is the R-2 form -- simulator
+it is the layer wiring that selects and feeds the Sinkhorn kernel and
+the combine kernel. So the predicate is the R-2 form -- simulator
 dispatches counted on the F1 chain (``wrap_nki`` -> ``NKIHOPCaller`` -> HOP ->
 ``DispatchKey.CPU`` -> ``nki.simulator.simulate_kernel``) through **two** seams
 this increment does not own. Five instruments per declared case, each reported
 as a number:
 
-1. ``-028``'s seam dispatch counter -- ``nki_dispatch == 1`` per layer call;
-2. ``-029``'s seam dispatch counter -- ``nki_dispatch == 1`` per layer call;
+1. the Sinkhorn seam's dispatch counter -- ``nki_dispatch == 1`` per layer call;
+2. the combine seam's dispatch counter -- ``nki_dispatch == 1`` per layer call;
 3. both modules' torch-fallback counters -- exactly ``0``;
 4. ``can_run_kernel()`` -- ``True``;
 5. real ``nki.simulator.simulate_kernel`` entries -- ``2`` per layer call, and
    **ATTRIBUTED PER SEAM**, because a total of two proves nothing on its own: it
    is satisfied by two entries into one kernel. The Python frame chain at each
    entry is walked for each seam's own file, so the reading distinguishes "two
-   kernels ran" from "one kernel ran twice". This is ``-027``'s attribution
+   kernels ran" from "one kernel ran twice". This is the MoE block's attribution
    instrument (``test_moe_path.py:271-311``) generalised from one seam to two,
    which is what having two counted seams requires.
 
@@ -65,14 +65,14 @@ operation in **two independent spellings**, and both are transcribed here:
 
 :func:`test_mhc_layer_the_two_upstream_spellings_agree` requires them to agree,
 so the comparator does not rest on one reading of one file. This is the
-discipline ``-029`` set (``evidence-029.md`` section 2.1).
+discipline the combine seam set (``evidence-029.md`` section 2.1).
 
-THE COMPOSITION THE LAYER HAD TO AUTHOR -- RE-GROUNDED BY ``inc-glm53f-030c``.
-The problem was real: ``-028``'s square seam normalises ONE ``[M, N]`` matrix,
+THE COMPOSITION THE LAYER HAD TO AUTHOR -- RE-GROUNDED.
+The problem was real: the square seam normalises ONE ``[M, N]`` matrix,
 the target needs ``T`` independent ``[S, S]`` ones, and the predicate above
-declares ONE Sinkhorn dispatch per layer call. ``-030`` reconciled them with a
-**block-diagonal embedding**. ``-030c`` removed that reconciliation: ``mhc_pre``
-now calls ``-028b``'s BATCHED entry, which takes ``[T, S, S]`` directly, so this
+declares ONE Sinkhorn dispatch per layer call. This file reconciled them with a
+**block-diagonal embedding**. The correction removed that reconciliation: ``mhc_pre``
+now calls the BATCHED entry, which takes ``[T, S, S]`` directly, so this
 layer builds no square matrix and calls ``torch.block_diag`` nowhere. The
 dispatch count is unchanged at one per layer call.
 
@@ -85,16 +85,16 @@ stated rather than left to the reader:
   it, and the rejected flat ``[T*S, S]`` reshape -- measured at ``4.68e-01`` in
   ``probe-030-composition-algebra.out`` -- would still fail it loudly.
 * :func:`test_mhc_layer_off_block_entries_stay_zero` now reads TWO different
-  things: the layer's own ``comb_mix`` row and column sums against ``-028``'s
+  things: the layer's own ``comb_mix`` row and column sums against the seam's
   targets, which is a live reading of the batched seam; and an off-block maximum
   taken by calling the SQUARE seam directly from the test, which is now a
-  property of ``-028``'s square kernel rather than of this layer's composition.
-  ``-030c`` leaves that item byte-unchanged and reports it, so the split is a
+  property of the square kernel rather than of this layer's composition.
+  The correction leaves that item byte-unchanged and reports it, so the split is a
   ruling rather than a seat's edit (LEAD-LOG §988).
 
 TWO DIVERGENCES FROM THE BASE THAT THIS INCREMENT CANNOT REMOVE, and both are
-inside ``-028``'s LANDED kernel, so both are measured rather than repaired: the
-base adds ``hc_sinkhorn_eps`` to every Sinkhorn denominator while ``-028`` adds
+inside the LANDED Sinkhorn kernel, so both are measured rather than repaired: the
+base adds ``hc_sinkhorn_eps`` to every Sinkhorn denominator while the seam adds
 an inert ``1e-30``, and the two iteration schedules differ by a leading
 half-step. Sinkhorn-Knopp has one fixed point, so the gap is small at the
 target's ``20`` iterations -- and how small is a number the acceptance reports
@@ -113,7 +113,7 @@ THE MODELING MODULE IS IMPORTED INSIDE TEST BODIES, never at module scope.
 ``test_factory.py``'s C03 asserts ``model_fp8`` is absent from ``sys.modules``,
 pytest imports every collected module before running any test, and this file
 sorts after ``test_factory.py`` -- so a module-level import here would break a
-landed assertion. ``-023`` and ``-013`` both record this; :func:`_impl` is the
+landed assertion. Two landed items both record this; :func:`_impl` is the
 form they use.
 """
 
@@ -144,8 +144,8 @@ from vllm_neuron.utils.neuron_utils import can_run_kernel
 # --------------------------------------------------------------------------- #
 # The declared tiny case.                                                     #
 # --------------------------------------------------------------------------- #
-#: Tokens. RE-GROUNDED BY `inc-glm53f-030c`: the ceiling used to be the square
-#: embedding's, ``T * S <= MOVING_FMAX``. Since LANDED ``inc-glm53f-029b`` NO
+#: Tokens. RE-GROUNDED: the ceiling used to be the square
+#: embedding's, ``T * S <= MOVING_FMAX``. Since the LANDED combine kernel NO
 #: upper extent bound is left on this path at all; see
 #: :func:`test_mhc_layer_serves_above_the_combines_old_ceiling`. ``mhc_pre`` enters
 #: the batched
@@ -153,7 +153,7 @@ from vllm_neuron.utils.neuron_utils import can_run_kernel
 #: kernel's ``T <= PARTITION_MAX`` = ``128``. ``8`` sits far inside it, so the
 #: declared case is not also a boundary case. The boundary is a separate arm.
 T = 8
-#: Streams. ``MHC_STREAMS`` is ``-028``'s named constant for the target's
+#: Streams. ``MHC_STREAMS`` is the Sinkhorn seam's named constant for the target's
 #: ``hc_mult 4``; it is imported rather than restated, which is what
 #: ``sinkhorn.py:136-139`` asks of this increment by name.
 S = MHC_STREAMS
@@ -208,7 +208,7 @@ class _AttributedSimulatorCounter:
     subsets whose Python frame chain contains a frame executing in the
     respective seam file; ``elsewhere`` is the remainder.
 
-    Why the split matters here and did not for ``-027``: this layer calls TWO
+    Why the split matters here and did not for the MoE block: this layer calls TWO
     seams, so ``total == 2`` is satisfied by one kernel running twice. Only the
     per-seam attribution says the Sinkhorn ran once AND the combine ran once.
 
@@ -280,13 +280,13 @@ def _assert_route(
         sim: the attributed simulator counter, entered around the layer calls.
         calls: how many LAYER CALLS happened inside the read window. The plan
             declares the counts PER LAYER CALL, so the per-case expectation is
-            that value times this multiplicity -- the conversion ``-033``'s
+            that value times this multiplicity -- the conversion the plan's own
             block states (per-call value x the case's own call multiplicity),
             recorded with the case rather than assumed to be one.
         label: the case name, printed with the reading.
 
     The certifying component of each conjunct is named in the failure message
-    (D1.4): conjuncts 1-3 are ``-028``'s and ``-029``'s module-level counters,
+    (D1.4): conjuncts 1-3 are the two seams' module-level counters,
     conjunct 4 is ``vllm_neuron.utils.neuron_utils.can_run_kernel``, conjunct 5
     is ``nki.simulator.simulate_kernel`` itself.
     """
@@ -307,13 +307,13 @@ def _assert_route(
 
     if sink_nki != calls:
         raise RouteInstrumentError(
-            f"{label}: -028's seam dispatch counter read {sink_nki} over {calls} "
+            f"{label}: the Sinkhorn seam's dispatch counter read {sink_nki} over {calls} "
             f"layer call(s); the plan declares exactly ONE per layer call, so "
             f"{calls} was expected. {reading}"
         )
     if comb_nki != calls:
         raise RouteInstrumentError(
-            f"{label}: -029's seam dispatch counter read {comb_nki} over {calls} "
+            f"{label}: the combine seam's dispatch counter read {comb_nki} over {calls} "
             f"layer call(s); the plan declares exactly ONE per layer call, so "
             f"{calls} was expected. {reading}"
         )
@@ -330,8 +330,8 @@ def _assert_route(
     if sim.sinkhorn != calls or sim.combine != calls:
         raise RouteInstrumentError(
             f"{label}: the vendor's simulator entry point attributed "
-            f"{sim.sinkhorn} entries to -028's seam and {sim.combine} to "
-            f"-029's; {calls} each was expected. A total that is right while "
+            f"{sim.sinkhorn} entries to the Sinkhorn seam and {sim.combine} to "
+            f"the combine's; {calls} each was expected. A total that is right while "
             f"the split is wrong means one kernel ran twice. {reading}"
         )
     if sim.elsewhere != 0:
@@ -426,8 +426,8 @@ def _sinkhorn_normalize_tilelang(
 def _reference_pre_torch(fn, hc_scale, hc_base, residual, eps, alpha, repeat):
     """``mhc_pre_torch``, ``vllm/model_executor/kernels/mhc/torch.py``.
 
-    Kept in fp32 throughout rather than the base's bf16, for ``-028``'s and
-    ``-029``'s recorded reason: the declared ``atol`` is ``1e-5`` and bf16's ~3
+    Kept in fp32 throughout rather than the base's bf16, for the two seams'
+    recorded reason: the declared ``atol`` is ``1e-5`` and bf16's ~3
     decimal digits cannot express that difference, so a bf16 comparator would
     put quantisation noise between the two sides of the check. The base's own
     looser ``atol=5e-2`` is an artefact of its output dtype.
@@ -558,7 +558,7 @@ def test_mhc_layer_output_matches_the_torch_reference_layer_tiny_case() -> None:
     """Plan L958, both halves: the numbers AND the two per-layer-call counters.
 
     One layer call, so the per-case totals equal the per-call values: call
-    multiplicity ``1``. Recorded with the case, per ``-033``'s convention.
+    multiplicity ``1``. Recorded with the case, per the plan's convention.
     """
     fn, hc_scale, hc_base, residual = _fixture()
     layer = _layer()
@@ -656,12 +656,12 @@ def test_mhc_layer_counters_read_one_per_layer_call_across_two_calls() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# THE COMPOSITION CONTROLS -- per-token independence, re-grounded by -030c.     #
+# THE COMPOSITION CONTROLS -- per-token independence, re-grounded.              #
 # --------------------------------------------------------------------------- #
 def test_mhc_layer_tokens_are_independent_of_each_other() -> None:
     """Perturb ONE token; every OTHER token's output must be BIT-IDENTICAL.
 
-    This is the arm that guards the layer's composition. ``-028``'s seam
+    This is the arm that guards the layer's composition. The Sinkhorn seam
     normalises one matrix, and the rejected way to feed it ``T`` per-token
     matrices -- a flat ``[T*S, S]`` reshape -- makes its column pass sum ACROSS
     tokens, so every token's result would move when one token's input moved.
@@ -698,7 +698,7 @@ def test_mhc_layer_tokens_are_independent_of_each_other() -> None:
     assert others_delta == 0.0, (
         f"perturbing token 0 moved other tokens by {others_delta:.6e}; the "
         f"per-token composition is leaking across tokens, which is exactly "
-        f"what a flat [T*S, S] reshape into -028's seam would do"
+        f"what a flat [T*S, S] reshape into the Sinkhorn seam would do"
     )
 
 
@@ -709,7 +709,7 @@ def test_mhc_layer_off_block_entries_stay_zero() -> None:
     embedding is only equivalent to ``T`` independent problems if multiplicative
     rescaling leaves the off-block zeros at zero, so the off-block maximum is
     measured, and each token's row and column sums are read against
-    ``row_target()`` and ``column_target(S, S)`` -- ``-028``'s own two numbers,
+    ``row_target()`` and ``column_target(S, S)`` -- the seam's own two numbers,
     imported rather than restated.
     """
     from vllm_neuron.functional.mhc.sinkhorn import sinkhorn_normalise
@@ -751,7 +751,7 @@ def test_mhc_layer_off_block_entries_stay_zero() -> None:
     assert off_block_max == 0.0, off_block_max
     assert tuple(comb_mix.shape) == (T, S, S)
     # The base's own Sinkhorn leaves the LAST-applied axis exact and the other
-    # near-exact, and `-028` ends on a column pass too, so the column reading is
+    # near-exact, and the seam ends on a column pass too, so the column reading is
     # the tight one. Both are read; neither number is a declared criterion.
     assert col_dev < 1e-5, col_dev
     assert row_dev < 1e-2, row_dev
@@ -869,11 +869,11 @@ def test_mhc_layer_folds_the_streams_as_the_base_does() -> None:
 def test_mhc_layer_route_control_fallback_counters_discriminate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """RE-GROUNDED BY ``inc-glm53f-030c``. The LAYER refuses; the COMBINE still counts.
+    """RE-GROUNDED. The LAYER refuses; the COMBINE still counts.
 
     This item used to call the layer with the simulator off and read ``(0, 1)``
-    on BOTH seams, because both had a torch path. ``-030c``'s correction (iii)
-    moved ``mhc_pre`` onto ``-028b``'s batched entry, which ships **no torch path
+    on BOTH seams, because both had a torch path. Correction (iii)
+    moved ``mhc_pre`` onto the batched entry, which ships **no torch path
     at all** and raises instead (``sinkhorn.py:952-1002``), so the old reading is
     now unreachable: nothing is computed and neither counter moves.
 
@@ -935,10 +935,10 @@ def test_mhc_layer_route_control_fallback_counters_discriminate(
 def test_mhc_layer_f1_numeric_arm_alone_cannot_discriminate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """RE-GROUNDED BY ``inc-glm53f-030c``. F1's hazard, closed at one seam and live at the other.
+    """RE-GROUNDED. F1's hazard, closed at one seam and live at the other.
 
     F1's hazard is that a green numeric arm is not evidence a kernel ran. After
-    ``-030c``'s correction (iii) the hazard is closed at the Sinkhorn seam **by
+    correction (iii) the hazard is closed at the Sinkhorn seam **by
     construction** -- with the route gone there is no number to compare, because
     the batched entry raises rather than returning an oracle -- and it is STILL
     LIVE at the combine, whose torch path computes the same function as its
@@ -1103,7 +1103,7 @@ def test_mhc_layer_attribution_control_separates_the_two_seams() -> None:
 def test_mhc_layer_the_two_seam_counters_are_independent() -> None:
     """Resetting one seam's counter must not touch the other's.
 
-    ``-030`` reads two numbers, so the two seams must not share one counter
+    This file reads two numbers, so the two seams must not share one counter
     object. Both source modules declare this on their own side
     (``sinkhorn.py:362-367``, ``hyper_connection.py:328-335``); this is the
     reading from the consumer that depends on it.
@@ -1129,14 +1129,14 @@ def test_mhc_layer_the_two_seam_counters_are_independent() -> None:
 
 # --------------------------------------------------------------------------- #
 # THE TOKEN EXTENTS -- what the layer serves, and where the refusal now sits.   #
-# `inc-glm53f-028b` tiles the Sinkhorn's row axis inside the kernel, so the      #
+# The Sinkhorn's row axis is tiled inside the kernel, so the                     #
 # refusal moved from the row axis to the column axis and these cases were        #
 # re-grounded onto what the code does now rather than deleted.                   #
 # --------------------------------------------------------------------------- #
 def test_mhc_layer_runs_at_the_old_row_axis_ceiling() -> None:
     """``T = PARTITION_MAX // S`` runs, and both counters still read one each.
 
-    This was the ceiling before `inc-glm53f-028b`, and it is kept as a serving
+    This was the ceiling before the tiling, and it is kept as a serving
     case because the extents above it now have to be compared against something
     known good BELOW the old bound. It is no longer a boundary: the two cases
     after it serve 33 and 64 tokens on the same reference.
@@ -1165,7 +1165,7 @@ def test_mhc_layer_runs_at_the_old_row_axis_ceiling() -> None:
 def test_mhc_layer_serves_above_the_old_ceiling(tokens: int) -> None:
     """Token counts that used to be refused are SERVED, and match the oracle.
 
-    RE-GROUNDED BY `inc-glm53f-028b`, which tiles the Sinkhorn's row axis inside
+    RE-GROUNDED BY THE TILING, which tiles the Sinkhorn's row axis inside
     the kernel and removed the ``M > PARTITION_MAX`` refusal these two cases used
     to assert. A test whose subject a later increment deletes has to be
     re-grounded onto what the code now does, not deleted quietly: the interesting
@@ -1205,18 +1205,18 @@ def test_mhc_layer_serves_above_the_old_ceiling(tokens: int) -> None:
 def test_mhc_layer_serves_above_the_combines_old_ceiling(tokens: int) -> None:
     """129 and 200 tokens are SERVED and match the oracle. No bound is left to cross.
 
-    RE-GROUNDED BY `inc-glm53f-030c` commit 10, and this is the THIRD time these two
+    RE-GROUNDED AT commit 10, and this is the THIRD time these two
     cases have changed subject, so the history is the note. They first asserted
-    `-028`'s row-axis refusal on ``M``; `inc-glm53f-028b` tiled that axis away and
-    they moved onto the square matrix's ``N``; `-030c` stopped building a square
-    matrix at all and they moved onto `-029`'s combine kernel, ``T <= PARTITION_MAX``.
-    Commit 9 then merged the campaign tip, which carries LANDED `inc-glm53f-029b`,
+    the SQUARE seam's row-axis refusal on ``M``; the tiling removed that axis and
+    they moved onto the square matrix's ``N``; the correction stopped building a square
+    matrix at all and they moved onto the combine kernel's ``T <= PARTITION_MAX``.
+    Commit 9 then merged the campaign tip, which carries a LANDED increment,
     and that increment TILES the combine's token axis and deletes the refusal --
     ``hyper_connection.py`` now says ``T`` is unbounded and ``PARTITION_MAX`` is the
     tile height. Grant 199 measured the consequence directly: both cases raised
     ``Failed: DID NOT RAISE HyperConnectionError`` because the layer served them.
 
-    So they re-ground the way `-028b`'s
+    So they re-ground the way the tiling's
     :func:`test_mhc_layer_serves_above_the_old_ceiling` did, onto the same reading at
     the same registered tolerances: the extent is SERVED and the output matches the
     torch reference. ``129`` is one token past the old ceiling and needs a ragged
@@ -1236,7 +1236,7 @@ def test_mhc_layer_serves_above_the_combines_old_ceiling(tokens: int) -> None:
       no upper bound and the block rides two free axes;
     * ``PARTITION_MAX`` and ``MOVING_FMAX`` still gate
       :func:`_require_admissible` in ``sinkhorn.py``, but that is the SQUARE
-      kernel's entry, which `-030c` no longer calls.
+      kernel's entry, which this layer no longer calls.
 
     The named-refusal readings this file still owes are therefore the agreements
     rather than the ceilings, and they are already covered:
@@ -1352,7 +1352,7 @@ def test_mhc_layer_refuses_a_non_positive_iteration_count() -> None:
 def test_mhc_layer_neuron_config_overrides_win() -> None:
     """``NeuronConfig``'s two mHC overrides take precedence when set.
 
-    ``-013``'s section note for this class states that contract, so it is
+    The landed section note for this class states that contract, so it is
     measured rather than left to the reader.
     """
     from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
@@ -1376,9 +1376,9 @@ def test_mhc_layer_neuron_config_overrides_win() -> None:
 
 
 def test_mhc_layer_stream_count_matches_the_target_hc_mult() -> None:
-    """``S`` is the checkpoint's ``hc_mult``, imported from ``-028``, not chosen.
+    """``S`` is the checkpoint's ``hc_mult``, imported from the seam, not chosen.
 
-    Three readings of one number must agree: this file's ``S``, ``-028``'s
+    Three readings of one number must agree: this file's ``S``, the seam's
     ``MHC_STREAMS``, and the checkpoint config's ``hc_mult`` default.
     """
     from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
@@ -1419,7 +1419,7 @@ def test_mhc_layer_parameters_are_real_and_sized_from_the_config() -> None:
 
 
 def test_mhc_layer_combine_seam_refusals_reach_the_caller() -> None:
-    """``-029``'s own refusal is not swallowed by this layer either.
+    """The combine seam's own refusal is not swallowed by this layer either.
 
     Driven by handing :meth:`mhc_post` a mismatched ``x``, which is the one
     combine argument the layer does not build itself.

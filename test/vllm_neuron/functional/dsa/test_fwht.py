@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tier N acceptance for ``inc-glm53f-050`` -- the Q-side FWHT, as COVERAGE on a landed seam.
+"""Tier N acceptance for the Q-side FWHT, as COVERAGE on a landed seam.
 
 WHAT THIS FILE IS, AND WHY IT AUTHORS NO KERNEL:
 
 The Q-side transform of the origin's ``fwht128_quant_fp8`` is the SAME 128-point butterfly with the
-SAME exact ``1/sqrt(128)`` scale as the K side. ``inc-glm53f-047`` already landed that transform as a
+SAME exact ``1/sqrt(128)`` scale as the K side. The K side already landed that transform as a
 complete public seam -- ``dsa_hadamard128``, its gate, its ``@nki.jit`` kernel, its counters and its
 torch oracle. So there is no kernel-class work left here: writing one would be a second copy of
 identical math. This increment is NON-KERNEL-CLASS by design ruling (entry s), and P13 is untouched

@@ -32,7 +32,7 @@ ONE ITEM PER COUNTED CONJUNCT and no ``parametrize`` (plan section 6, rules 4b a
 the conjunct that failed. Counters are reset at the START of each declared case (section 4b), and the
 supplementary case runs in its OWN reset window and is excluded from the declared total of 4.
 
-**THE WIDTH THIS FILE ASSERTS MOVED AT ``inc-glm53f-102``, and the reason is one sentence.** The
+**THE WIDTH THIS FILE ASSERTS MOVED, and the reason is one sentence.** The
 expansion used to emit the RAW width -- ``n_groups * pool_size + pool_size - 1``, the history columns plus
 the forced tail -- and that width is never a whole number of ``KEY_CHUNK`` columns for any ``pool_size``
 above one, so the sparse attention kernel that consumes it refused every width this module could produce.
@@ -95,7 +95,7 @@ since 2 tokens over a pool of 4 is half a group. ``probe-102-tiny-geometry.out``
 
 SEQ_TINY = 12
 """The tiny geometry's sequence length: three complete pools at pool 4, so selecting 2 is meaningful.
-This is ``-051``'s declared minimum and it corroborates the group reading independently."""
+This is a sibling increment's declared minimum and it corroborates the group reading independently."""
 
 SEQS_TINY = [SEQ_TINY, SEQ_TINY + 3]
 """The tiny geometry's two rows, and the SECOND ROW IS THREE TOKENS LONGER ON PURPOSE.
@@ -234,7 +234,7 @@ def test_declared_case_1_bit_identical():
     worst = _diff(got, want)
     _emit("CASE1_BITIDENTICAL", rows=len(C1_SEQS), n_groups=N_GROUPS_SMALL, pool_size=POOL_SIZE,
           seq_lens=C1_SEQS, max_abs_diff=worst, population=got.numel())
-    # RE-DECLARED at `-102` from the raw width to the emitted one, and asked of the module rather than
+    # RE-DECLARED HERE from the raw width to the emitted one, and asked of the module rather than
     # spelled here. The old expectation was `N_GROUPS_SMALL * POOL_SIZE + POOL_SIZE - 1` = 35 columns,
     # which `mla_sparse_attention` refuses; the admissibility items below show that refusal.
     assert got.shape == (len(C1_SEQS), index_expand_width(N_GROUPS_SMALL, POOL_SIZE))
@@ -414,7 +414,7 @@ def test_declared_case_4_bit_identical_at_production_width():
     This is the width that ships. The history loop is ``pool_size`` iterations here exactly as it is in
     case 1 -- that independence from the pool count is why this case costs what case 1 costs.
 
-    THE DECLARED WIDTH MOVED AT ``-102``, from 2051 to 2176. The 2051 columns still carry every
+    THE DECLARED WIDTH MOVED, from 2051 to 2176. The 2051 columns still carry every
     meaningful value; the 125 after them are the ``-1`` padding that makes the width a whole number of
     ``KEY_CHUNK`` columns so ``mla_sparse_attention`` admits it. Upstream allocates the identical 2176
     (``models/glm5next/nvidia/model.py:594-599``), which the parity item below asserts.
@@ -427,7 +427,7 @@ def test_declared_case_4_bit_identical_at_production_width():
     _emit("CASE4_BITIDENTICAL", rows=len(C4_SEQS), n_groups=N_GROUPS_C4, seq_lens=C4_SEQS,
           raw_cols=index_expand_raw_width(N_GROUPS_C4, POOL_SIZE),
           out_cols=int(got.shape[1]), max_abs_diff=worst, population=got.numel())
-    # RE-DECLARED at `-102`: the formula spelling asks the module, and the literal moves 2051 -> 2176.
+    # RE-DECLARED HERE: the formula spelling asks the module, and the literal moves 2051 -> 2176.
     # Both spellings are kept on purpose -- the derived one catches a change in the rule, the literal
     # catches a change in the rule that happens to leave the derivation self-consistent.
     assert got.shape == (2, index_expand_width(N_GROUPS_C4, POOL_SIZE))
@@ -439,7 +439,7 @@ def test_declared_case_4_bit_identical_at_production_width():
 def test_declared_case_4_every_entry_is_sentinel_or_in_range():
     """DECLARED CASE 4's in-range reading: 0 out of bounds over two rows of the padded width.
 
-    RE-DECLARED at ``-102`` alongside the three declarations in the test above. This reading counted
+    RE-DECLARED alongside the three declarations in the test above. This reading counted
     its own entries by writing the total down, and the total is two rows of the emitted width -- so
     it moved when the emitted width moved, and the counted run is what found it. The count now asks
     the module for the width instead of naming a number, which is the same treatment the other
@@ -788,9 +788,9 @@ def test_control_the_mx_reader_fires_on_a_planted_call():
 
 
 # ---------------------------------------------------------------------------------------------
-# `inc-glm53f-102` -- EXPANSION WIDTH ADMISSIBILITY. Selected with `-k admissible`, five items.
+# EXPANSION WIDTH ADMISSIBILITY. Selected with `-k admissible`, five items.
 #
-# WHY THESE EXIST. Every width this module could emit before `-102` was refused by the kernel that
+# WHY THESE EXIST. Every width this module could emit before this increment was refused by the kernel that
 # consumes it: the raw width is `pool_size - 1` mod `pool_size`, so it is never a whole number of
 # `KEY_CHUNK` columns for any `pool_size >= 2`, and `mla_sparse_attention` refuses a selected-row count
 # that is not (`mla_sparse.py:1162-1168`). The module now emits the raw width rounded up, padded with the
@@ -934,18 +934,18 @@ _SPARSE_TEST = pathlib.Path(__file__).resolve().parents[1] / "attention" / "test
 
 
 def _cited_from_098(*names: str) -> dict:
-    """The named definitions from ``-098``'s landed test file, taken from disk and never retyped.
+    """The named definitions from the sparse kernel's landed test file, taken from disk, never retyped.
 
-    THE BLOCK REQUIRES ``-098``'S PAIR TO BE CITED AND NOT RESTATED, and this is that citation made
+    THE BLOCK REQUIRES THE KERNEL'S PAIR TO BE CITED AND NOT RESTATED, and this is that citation made
     mechanical. The tolerance pair, the float64 live-columns reference, its attending control, the case
-    builder and the geometry all arrive as ``-098``'s own bytes. Retyping any of them would create a
+    builder and the geometry all arrive as that kernel's own bytes. Retyping any of them would create a
     second spelling that can drift from the first -- and a tolerance retyped is a tolerance that can be
-    nudged to reach green, which ``-098`` forbids in its own words in the comment above ``RTOL``.
+    nudged to reach green, which that file forbids in its own words in the comment above ``RTOL``.
 
     READING A SIBLING TEST FILE THROUGH THE PARSER RATHER THAN IMPORTING IT IS DELIBERATE. An import
     would depend on how pytest inserts two sibling directories onto ``sys.path``, and it would drag in
     that file's module-level ``nki`` imports and committed digests for no reading here. Parsing a source
-    file to read what it declares is landed precedent in this repo, including in ``-098``'s own file,
+    file to read what it declares is landed precedent in this repo, including in the cited file,
     which imports ``ast`` and ``inspect`` to do it.
 
     The namespace holds ``torch`` and nothing else, so an extracted definition that quietly depended on
@@ -968,23 +968,23 @@ def _cited_from_098(*names: str) -> dict:
 
 def test_admissible_padded_rows_through_the_sparse_kernel_match_a_float64_reference():
     """ITEM 3: the padded rows this module now emits, fed through ``mla_sparse_attention``, equal a
-    float64 reference over their non-sentinel columns at ``-098``'s tolerance pair -- the integration
+    float64 reference over their non-sentinel columns at the kernel's tolerance pair -- the integration
     this increment exists for.
 
     WHY THE GEOMETRY NEEDED NO INVENTING, and it is the cleanest evidence that the two increments meet.
-    The tiny geometry's EMITTED width is 128, and 128 is exactly the selected-row count ``-098``'s own
+    The tiny geometry's EMITTED width is 128, and 128 is exactly the selected-row count the kernel's own
     item (1) already runs at (``SENTINEL_UNTILED``). So the padded output of this module is a drop-in for
     the index tensor that item already exercises; the only difference is where the ``-1`` columns come
     from. Here they come from padding a real expansion instead of being sown into a random selection.
     The first assertion below states that equality rather than assuming it.
 
     WHAT WOULD MAKE THIS ITEM RED, ordered by what it would mean. If the kernel attended a padded column
-    the reference dropped, the agreement fails -- and that is ``-098``'s mask failing on rows this module
+    the reference dropped, the agreement fails -- that is the kernel's mask failing on rows this module
     produced, which is a finding about the pair and not about either one alone. If the CONTROL stops
     firing, the item is blind and says so instead of passing.
 
     ONE READING I AM NOT MAKING. Every row here has at least one live column, so the wholly-sentinel row
-    never occurs and its exact-zeros rule is not exercised. That rule is ``-098``'s item (2) and it is
+    never occurs and its exact-zeros rule is not exercised. That rule is the kernel's item (2) and it is
     already read there; manufacturing a second reading of it here would add no reading.
     """
     cited = _cited_from_098("RTOL", "ATOL", "SENTINEL_UNTILED", "case_scale", "make_case",
@@ -992,11 +992,11 @@ def test_admissible_padded_rows_through_the_sparse_kernel_match_a_float64_refere
     case = dict(cited["SENTINEL_UNTILED"])
     rtol, atol = cited["RTOL"], cited["ATOL"]
 
-    # THE JOIN, ASSERTED: this module's emitted width IS the selected-row count -098 already runs at.
+    # THE JOIN, ASSERTED: this module's emitted width IS the selected-row count the sparse kernel runs at.
     emitted = index_expand_width(N_GROUPS_TINY, POOL_SIZE)
     assert emitted == case["topk"]
 
-    # -098's inputs, from -098's builder. Its index tensor is DISCARDED on purpose -- the whole point of
+    # The kernel's inputs, from its builder. Its index tensor is DISCARDED on purpose -- the point of
     # this item is that the index rows come from this module's padded expansion instead.
     q_lift, c_kv, _discarded_idx, q_pe, k_pe = cited["make_case"](**case, seed=102)
     assert q_pe is None and k_pe is None, "the sentinel geometry is at rope width 0"
@@ -1040,9 +1040,9 @@ def test_admissible_padded_rows_through_the_sparse_kernel_match_a_float64_refere
     )
     # the padding is real and is most of the width, which is what makes this a padded-row reading
     assert int((idx < 0).sum().item()) == idx.numel() - sum(live_per_row)
-    assert min(live_per_row) > 0, "no row is wholly sentinel here -- that rule is -098's item (2)"
+    assert min(live_per_row) > 0, "no row is wholly sentinel here -- that rule is the kernel's item (2)"
     assert sum(live_per_row) < idx.numel()
-    # THE AGREEMENT, at -098's quoted pair. Neither number is authored here.
+    # THE AGREEMENT, at the sparse kernel's quoted pair. Neither number is authored here.
     torch.testing.assert_close(got, ref, rtol=rtol, atol=atol)
     # THE CONTROL: a reference that ATTENDS the padded columns as cache row 0 must disagree, or this
     # item cannot see whether they were masked at all.

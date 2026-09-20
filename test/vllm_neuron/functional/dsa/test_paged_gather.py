@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tier N acceptance for `inc-glm53f-044` -- the DSA paged gather, an ADAPTED NKI kernel.
+"""Tier N acceptance for the DSA paged gather, an ADAPTED NKI kernel.
 
 Declared command (D1 Tier N, the block's shorthand expanded to the tier's byte form)::
 
@@ -369,7 +369,7 @@ def test_kernel_identity_is_derived_through_the_seam() -> None:
     kernel after one.
 
     This item is also the increment's SUBSTRATE evidence, and it is where ADAPT differs from
-    the WRAP of ``inc-glm53f-043``: the kernel the seam dispatches is defined in this
+    the WRAP of the selection module: the kernel the seam dispatches is defined in this
     increment's own module, not in a vendored one, which is what the ADAPT declaration claims.
     """
     reset_paged_gather_dispatch_counters()

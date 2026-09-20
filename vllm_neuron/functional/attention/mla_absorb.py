@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """MLA absorb: one head-batched matmul, authored in NKI.
 
-`inc-glm53f-097`. This module computes one per-head batched matmul::
+This module computes one per-head batched matmul::
 
     out[s, h, :] = x[s, h, :] @ w[h]
 
 for `x [S, H, K]` and `w [H, K, N]`, and it exists because nothing on disk bridges
-two spaces this model's attention chain needs bridged. `-039b`'s `project_qkv`
+two spaces this model's attention chain needs bridged. The landed `project_qkv`
 returns `query [S, H, 256]` at the head width, `project_output` consumes the same
 width, and the sparse seam `mla_sparse_attention` works entirely in the LATENT rank
 512 -- it consumes `q_lift [S, H, 512]` and returns `[S, H, 512]`. The two
@@ -21,7 +21,7 @@ control that is shown to fire. It is NOT restated here.
 WHAT THIS MODULE DOES NOT DO, and the boundary is load-bearing. It does not split
 `kv_b_proj` into `W_UK` and `W_UV`, it does not view a checkpoint weight per head,
 and it knows nothing about where its operands come from. Preparing the two weights
-once, off the per-forward path, is `inc-glm53f-042`'s work. This module is one seam
+once, off the per-forward path, is the decode path's work. This module is one seam
 that multiplies what it is handed, which is why its gate checks geometry and never
 provenance.
 
@@ -52,7 +52,7 @@ therefore an ADAPT of the landed `mla_projections.mla_projection_kernel` with a
 head axis added, and it is deliberately the same shape as that kernel so the two
 read as one technique applied twice.
 
-THE OUTPUT LAYOUT WAS MEASURED, NOT ASSUMED. `-039a` loads and stores rank-2 tiles
+THE OUTPUT LAYOUT WAS MEASURED, NOT ASSUMED. The projection kernel loads and stores rank-2 tiles
 only, so nothing landed said whether this image accepts a rank-3 HBM tensor or a
 MIDDLE scalar index in a store -- and the answer decides whether this seam returns
 `[S, H, N]` directly or has to permute on the host on every single call. Four

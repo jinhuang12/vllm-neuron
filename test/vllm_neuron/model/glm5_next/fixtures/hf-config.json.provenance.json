@@ -11,11 +11,10 @@
   "bytes": 69416,
   "holds_weights": false,
   "contents": "the whole published config: text_config (45-entry layer_types, 288 routed experts), vision_config, and quantization_config with all five keys including the 1509-entry modules_to_not_convert skip list",
-  "landed_whole_because": "inc-glm53f-079 compares against the 1509-entry skip list and inc-glm53f-080 against the real text_config; both are counted equalities over the complete object, and the fork's existing trimmed fixtures/config.json (4796 B) carries neither",
-  "relationship_to_the_trimmed_fixture": "fixtures/config.json stays the trimmed transcription inc-glm53f-008 landed and inc-glm53f-080 re-transcribes; this file is the only in-repo copy of the skip list",
+  "landed_whole_because": "the fork compares against the 1509-entry skip list and against the real text_config; both are counted equalities over the complete object, and the fork's existing trimmed fixtures/config.json (4796 B) carries neither",
+  "relationship_to_the_trimmed_fixture": "fixtures/config.json stays the trimmed transcription that landed first and was re-transcribed later; this file is the only in-repo copy of the skip list",
   "note": "ZERO network access was used to build this file; it was copied from this run's own review artifact `artifacts/run/external-review-20260902/hf-config.json`.",
-  "why_a_sidecar_and_not_an_in-file_block": "inc-glm53f-008's fixtures/config.json is a trimmed transcription, so its provenance has to travel inside it; this file is a byte-identical copy, so a key added inside it would change the very bytes the provenance claims",
-  "landed_by": "inc-glm53f-078",
+  "why_a_sidecar_and_not_an_in-file_block": "the trimmed fixtures/config.json is a transcription, so its provenance has to travel inside it; this file is a byte-identical copy, so a key added inside it would change the very bytes the provenance claims",
   "design_entry_id": "design-20260902-h",
-  "pinned_by": "inc-glm53f-078 acceptance conjunct (h) -- the sha256 and byte count above are read off this file in the test and compared to the vendor's own numbers, so a later hand cannot quietly edit this fixture to make a comparison pass"
+  "pinned_by": "acceptance conjunct (h) -- the sha256 and byte count above are read off this file in the test and compared to the vendor's own numbers, so a later hand cannot quietly edit this fixture to make a comparison pass"
 }

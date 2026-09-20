@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tier N acceptance for ``inc-glm53f-047`` -- fused kpool compression + Hadamard-128.
+"""Tier N acceptance for fused kpool compression + Hadamard-128.
 
 WHAT THIS FILE MEASURES, and the shape of the argument it makes:
 

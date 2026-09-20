@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Acceptance test for ``inc-glm53f-056`` -- WP10: vision config and preprocessing.
+"""Acceptance test for WP10: vision config and preprocessing.
 
 The declared acceptance (increment plan revision 245, design-entry ruling ``design-20260905-aq`` (iv)),
 in its own words:
@@ -23,7 +23,7 @@ WHY THE QUOTE ABOVE STILL SAYS 2/2 AND THIS FILE MEASURES 5/5. The block above i
 ``design-20260905-aq`` (iv) in its own words at plan revision 245, and it is left exactly as the ruling wrote
 it -- editing a quotation to match a later count would make the file report that the ruling said something it
 did not. Increment-plan revision 262 raised this table's registered count to 5/5 as part of
-``inc-glm53f-061``: three rows were added to ``REGISTERED_VIDEO_CASES`` (F=1 and F=2 at 112x112, and F=1 at
+A later increment: three rows were added to ``REGISTERED_VIDEO_CASES`` (F=1 and F=2 at 112x112, and F=1 at
 60x40 below the floor), so C02 now runs five cases over four distinct frame counts instead of two cases over
 two. The ruling's other numbers did not move. Everything below this line is this file's own prose and counts
 the cases as they now stand.
@@ -90,10 +90,10 @@ REGISTERED_IMAGE_CASES = (
 
 # (num_frames, height, width, grid_thw, patch rows, merged tokens)
 #
-# B07-B09 were added by ``inc-glm53f-061`` at increment-plan revision 262, which raised this table's
+# B07-B09 were added at increment-plan revision 262, which raised this table's
 # registered count from 2/2 to 5/5. B04 and B05 are unchanged. The reason for the widening: with only two
 # three-frames-or-more rows at one size, the video path was oracle-pinned at no clamp bound and at neither
-# F=1 nor F=2 -- and F=1 is the exact frame count ``-061``'s cross-modality reading depends on. Every value
+# F=1 nor F=2 -- and F=1 is the exact frame count the cross-modality reading depends on. Every value
 # in the three new rows was computed from upstream's own ``smart_resize`` text and printed in
 # ``derive-061-registered-values-r1.out`` part 4, whose bytes are
 # ``cc3b82bdcc9bc53198a17b2292e2b6a8cf92df53e8cca43ccf24af90da59afa6``; B04 and B05 are reproduced by that
@@ -492,7 +492,7 @@ def test_c05_image_limits_are_open_and_video_is_not_offered_yet():
 # ---------------------------------------------------------------------------
 def test_c06_report_the_measured_readings(image_consts, video_consts, image_oracle, capsys):
     lines = [
-        "READINGS for inc-glm53f-056, all read off the constructed processors:",
+        "READINGS for the preprocessing, all read off the constructed processors:",
         f"  image  patch_size={image_consts.patch_size} merge_size={image_consts.merge_size} "
         f"temporal_patch_size={image_consts.temporal_patch_size} "
         f"patch_expand_factor={image_consts.patch_expand_factor}",

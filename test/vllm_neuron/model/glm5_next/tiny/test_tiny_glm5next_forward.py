@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Acceptance for `inc-glm53f-054a` -- the seven forwards of the 45-layer text model.
+"""Acceptance for the seven forwards of the 45-layer text model.
 
 **SEVEN ITEMS, ONE PER REPLACED ``forward``, and no ``parametrize`` decorator in this
 file** (campaign rule D1.2). Each item runs one forward once on the tiny config and
@@ -9,7 +9,7 @@ names the component whose behaviour it certifies (D1.4).
 TWO BANDS, EACH ADOPTED AND NEITHER MINTED HERE (P9). ``rtol=1e-2, atol=1e-5`` is the
 end-to-end criterion's own pair and governs every comparison whose value crossed no
 eight-expert sum. ``rtol=3e-2, atol=1e-5`` -- ``MOE_RTOL``/``MOE_ATOL`` below -- governs
-the MoE-seam comparisons, and is the pair ``inc-glm53f-027`` already landed on this same
+the MoE-seam comparisons, and is the pair already landed on this same
 layer (``test_moe_path.py:181-182``). Each site's band is named at the site, and the
 constraint set below is the end-to-end criterion's, carried unchanged.
 
@@ -18,7 +18,7 @@ its item passes inside, so a control left on the tighter band under a wider acce
 would certify less than the acceptance requires.
 
 THE READINGS ARE PIPE-DELIMITED AND PREFIXED ``TINYFWD|``. That prefix is this file's
-own: `-088`'s readings are bracketed, `-089`'s carry ``PRODUCTION|`` and `-090`'s carry
+own: the router item's readings are bracketed, the geometry item's carry ``PRODUCTION|`` and the prep item's carry
 ``SCALEPREP|``, so an extractor written for any of those reads zero here and a round
 that predicted zero would pass while proving nothing.
 
@@ -33,7 +33,7 @@ multiples of ``1/8``, which are exact in fp8-e4m3 and in bf16, and the block sca
 exact powers of two. With signed weights every dot product over the contraction is a
 near-cancelling sum, so reference elements land arbitrarily close to zero while the
 terms that built them are large, and a pointwise RELATIVE tolerance is then dominated
-by cancellation rather than by kernel error -- ``inc-glm53f-025`` measured exactly that.
+by cancellation rather than by kernel error -- an earlier item measured exactly that.
 The one deliberate exception is documented at :func:`_dense_operands`: a single weight
 block is negated so the SwiGLU's lower clamp is exercised, and it is a WHOLE block, so
 every term in the affected columns shares a sign and nothing cancels.
@@ -100,12 +100,12 @@ from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
     downscale_fp8_weight_bytes,
 )
 
-#: THE DENSE AND SHARED-EXPERT CONSUMER'S BLOCK, IMPORTED (``inc-glm53f-112`` round 2,
+#: THE DENSE AND SHARED-EXPERT CONSUMER'S BLOCK, IMPORTED (round 2,
 #: ruling 2). Two block constants live in this file now and each belongs to one
 #: consumer: ``DENSE_BLOCK`` for every grid bound onto a ``Glm5NextDenseMLP`` or a
 #: ``Glm5NextSharedExperts``, which ``blockwise_fp8_mm`` dequantises, and
 #: ``BLOCK_QUANT_SIZE`` for the ROUTED BANK, whose own producer still builds its
-#: operands at 256. Building a dense grid at the bank's number is what `-112` made a
+#: operands at 256. Building a dense grid at the bank's number is what the dense-block change made a
 #: refusal, and it is why this file was red before this change.
 DENSE_BLOCK = SCALE_BLOCK_SIZE
 #: How many dense blocks fit in one declared scale regime. The fixtures below declare
@@ -190,7 +190,7 @@ RTOL = 1e-2
 ATOL = 1e-5
 
 #: The MoE-seam pair, for the comparisons whose value carries an EIGHT-EXPERT SUM.
-#: A LANDED PRECEDENT, NOT A NUMBER MINTED HERE: ``inc-glm53f-027`` compares this same
+#: A LANDED PRECEDENT, NOT A NUMBER MINTED HERE: a landed item compares this same
 #: MoE layer against a pure-torch reference at exactly this pair -- see
 #: ``test/vllm_neuron/model/glm5_next/test_moe_path.py:181-182`` and the plan's ``:1553``.
 #: Order named inline, per design law D3: the pin holds two tolerance maps in OPPOSITE
@@ -253,13 +253,13 @@ def _impl():
 #: read is worth more than a zero that is not looked at.
 #:
 #: EVERY ACCESSOR IS NAMED -- READ AND RESET BOTH -- AND NOTHING IS DERIVED, and
-#: that changed on a counterexample rather than on taste (``inc-glm53f-054a``,
+#: that changed on a counterexample rather than on taste (this file's
 #: repair R; ``probe-054a-counter-population-r1``, 21 modules and 24 families read
-#: from the package's own source). ``inc-glm53f-054e`` c6 re-read the same source
+#: from the package's own source). Commit c6 re-read the same source
 #: with the control's own regex and found 22 modules and 26 families: the extra two
-#: are ``inc-glm53f-103``'s causal bound and causal sentinel, and grant 181's run
+#: are the causal bound and causal sentinel, and grant 181's run
 #: names them itself (``TINYFWD|counter_population|found=26|claimed=24``).
-#: ``inc-glm53f-113`` c3 then registered three more in a module already named -- the
+#: Commit c3 then registered three more in a module already named -- the
 #: MoE gate/up projection, the SwiGLU activation and the down projection -- so the
 #: same regex now finds 22 modules and 29 families. The MODULE count did not move,
 #: because all three live in ``functional/moe/moe_blockwise_fp8``, which a row
@@ -290,8 +290,8 @@ def _impl():
 #: ``_dispatch_counters`` suffix and asserts exactly one pair per module, which is
 #: true of every module below EXCEPT ``mla_sparse`` (three families),
 #: ``kda/chunked_recurrence`` (two), ``dsa/causal_bound`` (two) since
-#: ``inc-glm53f-054e`` c6 registered it, and ``functional/moe/moe_blockwise_fp8``
-#: (three) since ``inc-glm53f-113`` c3 -- three rather than four, because that
+#: c6 registered it, and ``functional/moe/moe_blockwise_fp8``
+#: (three) since c3 -- three rather than four, because that
 #: module's oldest accessor is ``dispatch_counters`` with NO leading underscore, so
 #: this rule's suffix has never matched it: the list under-counted that module
 #: before c3 as well as after. That file already knows it: its own
@@ -307,10 +307,10 @@ _SEAM_REGISTRY = {
     "blockwise_fp8_moe": (
         "vllm_neuron.functional.moe.moe_blockwise_fp8",
         "dispatch_counters", "reset_dispatch_counters"),
-    # ``inc-glm53f-113`` c3: the three families ``-113a`` and ``-113b`` added to the
+    # Commit 3: the three families the earlier commits added to the
     # module the row above already names -- the gate/up projection, the SwiGLU
     # activation and the down projection, each an authored NKI limb with its own
-    # seam. The two coverage controls below read the gap themselves at ``-113b``'s
+    # seam. The two coverage controls below read the gap themselves at that commit's
     # tip: ``found=29`` against ``claimed=26``
     # (``probe-113-landed-discovery-controls-r1``), which is the same reading that
     # refused grant 181 with 26 against 24. One row per family, because the three
@@ -377,7 +377,7 @@ _SEAM_REGISTRY = {
     "dsa_causal_fill": (
         "vllm_neuron.functional.dsa.causal_fill",
         "causal_fill_dispatch_counters", "reset_causal_fill_dispatch_counters"),
-    # ``inc-glm53f-054e`` c6: the two families ``inc-glm53f-103`` added, which no row
+    # c6: the two families the causal-bound module added, which no row
     # claimed. Grant 181's run read them as the gap itself --
     # ``TINYFWD|counter_population|found=26|claimed=24`` -- and refused all seven
     # items before any forward ran. One row per family, because this module holds
@@ -441,7 +441,7 @@ def _seam_modules() -> dict:
     not depend on the plugin being importable.
 
     WHY ``import_module`` AND NOT A FROM-IMPORT -- load-bearing, not stylistic
-    (``inc-glm53f-054a``, review finding M1). ``functional/__init__.py:8`` reads
+    (review finding M1). ``functional/__init__.py:8`` reads
     ``from .blockwise_fp8_mm import blockwise_fp8_mm``: it re-exports the seam
     FUNCTION under the name of the submodule that defines it. The import
     machinery sets that submodule as an attribute of the package first, and the
@@ -504,7 +504,7 @@ def _assert_every_counter_family_is_registered() -> None:
     assumed: across all twenty-two modules that define a family, no name ending in
     the suffix is imported or assigned, only defined
     (``probe-054a-counter-names-r1``, ``probe-054a-counter-population-r1``, and for
-    the twenty-second ``inc-glm53f-054e`` c6 re-read ``dsa/causal_bound.py``, which
+    the twenty-second, c6 re-read ``dsa/causal_bound.py``, which
     defines four such names at column 0 and imports none).
 
     THIS CONTROL CANNOT SEE A MODULE NO ROW NAMES, which is what let ten families
@@ -554,7 +554,7 @@ def _assert_no_unregistered_counter_family() -> None:
     nothing reads is the failure mode this control exists for; a seam this campaign
     does NOT own would be an exclusion with a reason, and there is none today --
     every one of the twenty-two modules is named in this campaign's plan, the
-    twenty-second being ``inc-glm53f-103``'s ``dsa/causal_bound``. This control did
+    twenty-second being ``dsa/causal_bound``. This control did
     its job once for real: it is what refused grant 181's run rather than letting
     seven forwards read two of this campaign's own seams as if they did not exist.
 
@@ -589,7 +589,7 @@ def _assert_no_unregistered_counter_family() -> None:
 
 
 def _declare_bound_and_sentinel(expected: dict) -> None:
-    """Declare ``-103``'s two causal families at the SELECTOR's count, not at a number.
+    """Declare the two causal families at the SELECTOR's count, not at a number.
 
     ``Glm5NextDSAIndexer.select_bounded_pools`` composes the three seams in one
     straight-line method with no branch between them (``model_fp8.py::Glm5NextDSAIndexer.select_bounded_pools``):
@@ -762,13 +762,13 @@ def _dequantise(weight_fp8: torch.Tensor, block_scale: torch.Tensor) -> torch.Te
     disagree with a correct product by that factor, and one that applied only the
     squeeze would disagree by the same factor the other way. Both halves come from
     the loader's own functions, never a constant copied into this file, so a change
-    to the factor moves this reference with it: ``inc-glm53f-054e`` moved it from
+    to the factor moves this reference with it: another item moved it from
     ``240/448`` to an exact ``1/2`` and not a line here changed. On a platform where the
     clamp is 448 both calls are no-ops and this is the arithmetic it always was.
 
     WHAT IT DELIBERATELY DOES NOT MEASURE. The squeeze re-quantises through fp8,
     so this states the CHECKPOINT-to-stored invariant and not the fidelity of the
-    stored weight to the raw HF value. That fidelity is ``inc-glm53f-054e``'s
+    stored weight to the raw HF value. That fidelity is another item's
     acceptance, not this file's.
     """
     if weight_fp8.dim() != 2 or block_scale.dim() != 2:
@@ -777,7 +777,7 @@ def _dequantise(weight_fp8: torch.Tensor, block_scale: torch.Tensor) -> torch.Te
             f"{tuple(weight_fp8.shape)} and {tuple(block_scale.shape)}"
         )
     rows, cols = weight_fp8.shape
-    # THE GRANULARITY IS DERIVED FROM THE PAIR (``inc-glm53f-112`` round 2), because
+    # THE GRANULARITY IS DERIVED FROM THE PAIR (round 2), because
     # this reference now serves two consumers: a dense or shared-expert grid at
     # ``DENSE_BLOCK`` and a routed-bank grid at ``BLOCK_QUANT_SIZE``. A constant here
     # would be right for one of them and silently wrong for the other, and a grid that
@@ -837,7 +837,7 @@ def _attach(
     binding the checkpoint's own bytes beside the checkpoint's own grid is not a load
     at all -- it is half of one, and a forward built on it disagrees with a correct
     product by that factor. The bytes are therefore always squeezed here. The factor
-    itself is never named in this file, which is why ``inc-glm53f-054e`` moving it to
+    itself is never named in this file, which is why moving it to
     an exact ``1/2`` left this argument untouched.
 
     ``prep_will_compensate`` IS ABOUT WHERE THE OTHER HALF COMES FROM, NOT WHETHER.
@@ -940,7 +940,7 @@ def _dense_operands() -> dict:
     up_w[:, -BLOCK_QUANT_SIZE:] = -up_w[:, -BLOCK_QUANT_SIZE:]
     down_w = _fp8_grid_values(SEED_DOWN, INTERMEDIATE_SIZE, HIDDEN_SIZE)
 
-    # THE DENSE CONSUMER'S BLOCK (``inc-glm53f-112`` round 2). The regimes above are
+    # THE DENSE CONSUMER'S BLOCK (round 2). The regimes above are
     # declared one per ``BLOCK_QUANT_SIZE`` column, so they are repeated over the dense
     # blocks each one covers and every dequantised number stays what it was.
     k_blocks_parallel = HIDDEN_SIZE // DENSE_BLOCK
@@ -1034,7 +1034,7 @@ def _dense_output(
 def test_tiny_dense_mlp_forward_matches_the_reference() -> None:
     """The dense MLP on one layer, against the reference's clamped SwiGLU.
 
-    ``inc-glm53f-054a`` item 1 of 7. THREE dispatches: gate, up, down.
+    Item 1 of 7. THREE dispatches: gate, up, down.
     """
     model_fp8 = _impl()
     text_config = _tiny_text_config()
@@ -1164,7 +1164,7 @@ def test_tiny_dense_mlp_forward_matches_the_reference() -> None:
     # below rather than assumed, and the comparison that decides the item is the
     # forward's output.
     #
-    # SINCE ``inc-glm53f-112`` THE FACTOR IS 1 and this repeat is an identity: the
+    # THE FACTOR IS 1 and this repeat is an identity: the
     # dense consumer's block IS the checkpoint tile, so the grid the loader delivers is
     # the grid the module publishes. It is DERIVED rather than deleted, so the
     # conjunct still manufactures the loader's own input the day either number moves.
@@ -1245,12 +1245,12 @@ def test_tiny_dense_mlp_forward_matches_the_reference() -> None:
     )
 
     # ---- CONTROL: THE PAIR, WRONG IN EITHER DIRECTION, IS REFUSED BY NAME.
-    # ``inc-glm53f-054c`` makes the load-path prep compensate the grid, so from here
+    # A landed item makes the load-path prep compensate the grid, so from here
     # there are exactly two ways to hold the pair wrong: one compensation too few,
     # which is un-squeezed bytes under a compensated grid, and one too many, which
     # is a grid this file compensated and the prep compensated again. The conjunct
     # above cannot see either, because it would pass unchanged if the reference and
-    # the product moved together -- which is the fault ``-054c`` found in
+    # the product moved together -- which is the fault that landed item found in
     # ``test_load_weights.py``'s own reference. So both are built and refused here.
     #
     # THE READINGS ARE ON THE PUBLISHED GRID, NOT THE FORWARD. The SwiGLU clamp
@@ -1626,7 +1626,7 @@ def _routed_output(
     up_w, up_grid = operands["up_proj_weight"]
     down_w, down_grid = operands["down_proj_weight"]
     # EVERY EXTENT IS READ OFF THE OPERANDS, not off this section's constants, and
-    # that changed in ``inc-glm53f-054a`` item 6 rather than at item 2. The four
+    # that changed in item 6 rather than at item 2. The four
     # values are the same numbers at items 2 and 4 -- their operands are built from
     # those constants -- so no landed reading moves. Item 6 runs a bank at a
     # narrower ``I`` inside a residual stack, and one reference read by three items
@@ -1702,7 +1702,7 @@ def _routed_text_config():
 def test_tiny_routed_experts_forward_matches_the_reference() -> None:
     """The routed bank on one MoE layer, against the checkpoint's POST_SCALE reference.
 
-    ``inc-glm53f-054a`` item 2 of 7. ONE dispatch on the MoE seam and nothing on the
+    Item 2 of 7. ONE dispatch on the MoE seam and nothing on the
     dense one.
 
     FIVE CONTROLS, not item 1's three. The four clamp branches, plus the SCALING POINT
@@ -1911,7 +1911,7 @@ def test_tiny_routed_experts_forward_matches_the_reference() -> None:
 def test_tiny_shared_experts_forward_matches_the_reference() -> None:
     """The always-on shared expert on one MoE layer, against the same reference.
 
-    ``inc-glm53f-054a`` item 3 of 7. THREE dispatches: gate, up, down.
+    Item 3 of 7. THREE dispatches: gate, up, down.
     """
     model_fp8 = _impl()
     text_config = _tiny_text_config()
@@ -2052,7 +2052,7 @@ def test_tiny_shared_experts_forward_matches_the_reference() -> None:
     # THE DENSE CONSUMER'S BLOCK, for the reason the dense conjunct above records: the
     # shared expert is dequantised by the same kernel, so its checkpoint grid repeats
     # the published one over ``DENSE_BLOCK // TILE_SIZE`` tiles -- 1 since
-    # ``inc-glm53f-112``, which makes this manufacture an identity and moves no number.
+    # the dense-block change, which makes this manufacture an identity and moves no number.
     tiles_per_block = DENSE_BLOCK // TILE_SIZE
     loaded = model_fp8.Glm5NextSharedExperts(text_config)
     for leaf in leaves:
@@ -2203,7 +2203,7 @@ def _shared_at_routed_operands(
 
     The shared route consumes the grid at ``DENSE_BLOCK`` -- that is what
     ``prepare_scale_operands`` takes and what the load-path publish delivers, since
-    `inc-glm53f-112` the checkpoint's own granularity -- so unlike the bank's fixture
+    the dense-block change, the checkpoint's own granularity -- so unlike the bank's fixture
     this one supplies no coarser grid and nothing is retiled. Only the EXTENTS here
     are the bank's; the block this grid is on is the dense consumer's. Item 1's
     builder is untouched: it is 256 wide by its own declared reading and this item
@@ -2242,7 +2242,7 @@ def _shared_at_routed_operands(
     up_w[:, columns] = -up_w[:, columns]
     down_w = _fp8_grid_values(SEED_SHARED_DOWN + seed_offset, i, h)
 
-    # THE DENSE CONSUMER'S BLOCK (``inc-glm53f-112`` round 2). The regimes are declared
+    # THE DENSE CONSUMER'S BLOCK (round 2). The regimes are declared
     # one per ``BLOCK_QUANT_SIZE`` column, so they are repeated over the dense blocks
     # each one covers and every dequantised number stays what it was.
     h_blocks = h // DENSE_BLOCK
@@ -2302,7 +2302,7 @@ def _ffn_norm(hidden: torch.Tensor, gamma: torch.Tensor, eps: float) -> torch.Te
 # than imitated, so the form the call site consumes is the form the producer    #
 # actually emits"). Its affinities are an INPUT to the reference. Re-deriving   #
 # them here would put this item in the business of certifying the router, which #
-# ``inc-glm53f-032``'s own acceptance owns, and would make the comparison       #
+# another item's own acceptance owns, and would make the comparison             #
 # hostage to a near-tie flipping one token's expert set.                        #
 #                                                                              #
 # THE ROUTER'S OWN SEAM IS COUNTED, and this paragraph used to say the opposite. #
@@ -2311,7 +2311,7 @@ def _ffn_norm(hidden: torch.Tensor, gamma: torch.Tensor, eps: float) -> torch.Te
 # ``route_tokens`` is what this forward enters -- so the earlier claim that the #
 # seam "carries no dispatch counters" was false of the tree and this item's     #
 # fallback aggregate omitted the one seam its own control D argues about.       #
-# Repaired in ``inc-glm53f-054a`` repair R; the predicate below now reads it.   #
+# Repaired in repair R; the predicate below now reads it.                       #
 # A router fallback on this fixture could not pass quietly even before that,    #
 # and that is measured rather than hoped: its torch oracle selects              #
 # ``NOAUX_TC_K`` = 8 columns regardless of the caller's ``top_k``               #
@@ -2321,7 +2321,7 @@ def _ffn_norm(hidden: torch.Tensor, gamma: torch.Tensor, eps: float) -> torch.Te
 def test_tiny_moe_block_forward_matches_the_reference() -> None:
     """One sparse layer's MLP: route, run the experts, add the shared expert once.
 
-    ``inc-glm53f-054a`` item 4 of 7. ONE dispatch on the MoE seam for the bank and
+    Item 4 of 7. ONE dispatch on the MoE seam for the bank and
     THREE on the dense seam for the shared expert.
     """
     model_fp8 = _impl()
@@ -2886,7 +2886,7 @@ MLA_PAGES = 8
 #: candidate width lands on 8, the granularity ``nisa.max8`` emits
 #: (``test_dsa_layer.py:135-166`` records the whole derivation and the risk it
 #: bounds). This item runs the PREFILL leg once; the decode leg is
-#: ``inc-glm53f-042``'s and ``inc-glm53f-051``'s and both are landed.
+#: two other items' and both are landed.
 MLA_TOKENS = 35
 
 #: One generator, drawn in ``projection_widths()`` order. Successive draws from one
@@ -2898,13 +2898,13 @@ SEED_MLA = 5431
 
 #: THE REGISTERED SOFTMAX SCALE, and it is the plan's value rather than this
 #: file's: ``(qk_nope_head_dim + qk_rope_head_dim) ** -0.5``, registered at the
-#: increment plan's ``inc-glm53f-054a`` block on the reference implementation's own
+#: increment plan's block on the reference implementation's own
 #: derivation (``modeling_glm5_next.py:1128`` with ``:1087``, applied once at
 #: ``:1052``). It is ``0.125`` at this geometry and ``0.0625`` at the checkpoint's.
 #:
 #: THE NEAREST LANDED CONSTANT IS NOT ADOPTED, deliberately: two landed test files
 #: compute this scale as ``kv_lora_rank ** -0.5``, which is the same number times
-#: ``sqrt(2)`` on both fixture geometries, and ``inc-glm53f-109`` repairs them. A
+#: ``sqrt(2)`` on both fixture geometries, and a later item repairs them. A
 #: control below recomputes this item's reference at that retired derivation and
 #: requires it to fall OUTSIDE the tolerance, so this item is measurably sensitive
 #: to which of the two it uses.
@@ -3196,7 +3196,7 @@ def _mla_latent_cache(attention, *, tokens: int = MLA_TOKENS) -> torch.Tensor:
     would round both sides identically and prove nothing extra while spending a
     tenth of the tolerance. The landed DSA fixture makes the same choice
     (``test_dsa_layer.py:1984-1986``); the bf16 spec dtype is exercised by
-    ``inc-glm53f-042``'s own items.
+    the decode leg's own items.
     """
     return torch.zeros(
         -(-int(tokens) // MLA_PAGE_SIZE) * MLA_PAGE_SIZE,
@@ -3330,7 +3330,7 @@ def _mla_outside_tolerance(label: str, moved: torch.Tensor, base: torch.Tensor) 
 # and compares against a DENSE MLA reference built from the same raw weights --  #
 # the form the reference implementation itself computes, which the absorbed     #
 # path is an exact rewrite of. Nothing here re-certifies a callee: the absorb    #
-# split is ``inc-glm53f-042``'s, the selection chain ``inc-glm53f-051``'s.       #
+# split is the MLA item's, the selection chain the indexer item's.               #
 #                                                                              #
 # THE INDEXER IS EXECUTED RATHER THAN IMITATED, item 4's convention on the      #
 # router applied to the other selector: its indices are an INPUT to the         #
@@ -3341,12 +3341,12 @@ def _mla_outside_tolerance(label: str, moved: torch.Tensor, base: torch.Tensor) 
 # forward makes a THIRD call and the reference stands on the first.              #
 #                                                                              #
 # THE PREFILL LEG ONLY, once, which is what the acceptance asks for: one        #
-# forward, one call. The decode leg's tail ring is ``inc-glm53f-042``'s and      #
-# ``inc-glm53f-051``'s and both are landed with their own items.                 #
+# forward, one call. The decode leg's tail ring is one other item's and          #
+# another's and both are landed with their own items.                            #
 #                                                                              #
 # CAUSALITY IS NOT MEASURED HERE, disclosed rather than implied: a query's       #
 # selected pools may sit past its own position, because bounding them is the     #
-# indexer's business and ``inc-glm53f-051``'s acceptance owns it. Both sides of  #
+# indexer's business and its own acceptance owns it. Both sides of               #
 # this comparison read the same indices, so the composition is what is measured. #
 # --------------------------------------------------------------------------- #
 def test_tiny_mla_attention_forward_matches_the_reference() -> None:
@@ -3450,7 +3450,7 @@ def test_tiny_mla_attention_forward_matches_the_reference() -> None:
     # latent is an exact 128 fit and 128 selected rows is inside one moving tile --
     # so they are registered and read rather than left out of the population.
     #
-    # -054e c6: the causal bound and the causal sentinel are NOT zeros here. This
+    # Commit c6: the causal bound and the causal sentinel are NOT zeros here. This
     # item's fixture refuses the bypass regime by name (see the candidate-count
     # guard above), so the indexer selects, and the selecting path dispatches all
     # three of bound, selector and sentinel once each. Their counts are therefore
@@ -3607,7 +3607,7 @@ STACK_HIDDEN_SIZE = ROUTED_HIDDEN_SIZE
 #: measures an ORDER: with two, a stack that ran its layers backwards is the same
 #: multiset, and with one there is no order at all. The checkpoint's 45-layer 3:1
 #: hybrid schedule is NOT reproduced here, and that is a declared exclusion with a
-#: cost: the linear-attention family's own state is ``inc-glm53f-038``'s, its fixture
+#: cost: the linear-attention family's own state is another item's, its fixture
 #: declares fifteen parameters and two vLLM state calculators, and none of that is
 #: this item's to certify. What this item certifies is that the loop is FAMILY-BLIND
 #: -- it hands each layer its own mapping and holds no per-family branch -- and a
@@ -3719,7 +3719,7 @@ SEED_STACK_BANK_GATE = 5461
 SEED_STACK_BANK_UP = 5462
 SEED_STACK_BANK_DOWN = 5463
 SEED_STACK_ROUTER = 5464
-#: The mHC leaves' base seed, one draw per layer (``inc-glm53f-030d`` commit 4c). A
+#: The mHC leaves' base seed, one draw per layer (commit 4c). A
 #: BASE plus the layer index, for the same reason the attention seed is: two layers
 #: sharing one draw of the six leaves would make "each layer mixed with its own
 #: carrier weights" unmeasurable.
@@ -4004,7 +4004,7 @@ def _stack_load_the_six(layer, cfg, *, seed: int) -> dict:
     RMS-normalised projection of the folded streams, so a large ``hc_scale`` saturates
     the sigmoid and every stream is then weighted by the same constant -- which is the
     four-stream analogue of the clamp saturation this item's BLOCK D guards refuse.
-    ``0.1`` keeps both gates in their linear region; ``inc-glm53f-030c`` commit 7
+    ``0.1`` keeps both gates in their linear region; commit 7
     measured a real draw at ``hc_scale = [0.110834, -0.083877, -0.030093]``, so this is
     the magnitude that increment's own control is written against.
 
@@ -4094,7 +4094,7 @@ def _stack_fixture(model=None) -> dict:
     model.norm_weight = torch.nn.Parameter(final_gain, requires_grad=False)
 
     # ---- THE FOUR-STREAM CARRIER'S OWN WEIGHTS, and why they are here at all.
-    # ``inc-glm53f-030d`` part (a) made ``Glm5NextModel.forward`` pass streams
+    # The mHC part (a) made ``Glm5NextModel.forward`` pass streams
     # UNCONDITIONALLY (``model_fp8.py::Glm5NextModel.forward``), and ``_mhc_site`` refuses a streams call
     # on a layer that carries none of the six mHC leaves (``:7719-7723``). So a stack
     # whose layers hold no mHC weight can no longer be run at all: this fixture loads
@@ -4303,7 +4303,7 @@ def _stack_mhc_pre(site, streams, label: str):
     THE SITE'S PRE IS EXECUTED, NOT RECOMPUTED, and that is this file's own convention
     rather than a shortcut. :func:`_stack_attention_half` executes the indexer for the
     same reason: the mHC pre carries a Sinkhorn dispatch whose arithmetic
-    ``inc-glm53f-028b`` owns and whose per-token normalisation ``test_mhc_layer.py``
+    another item owns and whose per-token normalisation ``test_mhc_layer.py``
     certifies at this campaign's registered pair, so recomputing it here would measure
     that kernel a second time instead of measuring what THIS item is named for -- that
     the stack mixes each half with the streams it was handed, at the site whose weights
@@ -4340,7 +4340,7 @@ def _stack_mhc_post(site, half, streams, post_mix, comb_mix):
     """The mixed streams in FLOAT32, from the site's own combine.
 
     ``streams`` is handed over as float32 ON PURPOSE. :meth:`mhc_post` returns in its
-    residual argument's dtype (``model_fp8.py::Glm5NextHyperConnection.mhc_post``, the cast ``inc-glm53f-030d``
+    residual argument's dtype (``model_fp8.py::Glm5NextHyperConnection.mhc_post``, the cast
     commit 4 put there), so a bfloat16 residual would round the REFERENCE as well as
     the forward and this item's whole precision argument is that each comparison
     carries the forward's own roundings and none of its own.
@@ -4488,7 +4488,7 @@ def _stack_peak_band(expected: torch.Tensor, label: str) -> tuple:
 def _stack_argmin_cell(values: torch.Tensor) -> tuple:
     """The cell holding the smallest ``|value|``, as a FULL-SHAPE index tuple.
 
-    RANK-AGNOSTIC, AND THAT IS THE WHOLE POINT (``inc-glm53f-030d`` commit 4e, round-3
+    RANK-AGNOSTIC, AND THAT IS THE WHOLE POINT (commit 4e, round-3
     finding 1). The band control used to address its cell with ``row, col =
     divmod(argmin, expected.shape[-1])``, which is a two-dimensional address. Commit 4c
     started handing it three-dimensional ``[T, S, H]`` streams, and on those the two
@@ -4667,16 +4667,16 @@ def _stack_outside_tolerance(label: str, moved: torch.Tensor,
 #                                                                              #
 # THE STACK IS ONE FAMILY AND ONE PHASE, disclosed rather than implied. Every   #
 # layer is ``deepseek_sparse_attention`` and every carrier is a prefill         #
-# carrier; the linear-attention family is ``inc-glm53f-038``'s and the decode   #
-# leg is ``inc-glm53f-042``'s and ``inc-glm53f-051``'s. What this item measures #
+# carrier; the linear-attention family is another item's and the decode         #
+# leg is two other items'. What this item measures                              #
 # about the loop -- that it holds no per-family branch and hands each layer its #
 # own mapping -- is measured exactly as well by one family as by two.           #
 #                                                                              #
 # THE ONE-STREAM EXCLUSION THAT STOOD HERE IS RETIRED, AND THIS ITEM IS NOW    #
-# RE-POINTED AT THE FOUR-STREAM CARRIER (``inc-glm53f-030d`` commit 4c, ruled   #
+# RE-POINTED AT THE FOUR-STREAM CARRIER (commit 4c, ruled                       #
 # at §943 Q5). It used to say the inter-layer carrier was a ``[T, H]`` add and  #
-# that the checkpoint's 4-stream mHC carrier was ``inc-glm53f-030b``'s.         #
-# ``inc-glm53f-030d`` part (a) built that carrier in                            #
+# that the checkpoint's 4-stream mHC carrier was another item's.                #
+# The mHC part (a) built that carrier in                                        #
 # ``Glm5NextModel.forward``: the embedding is expanded across the stream axis   #
 # (``modeling_glm5_next.py:1477``), both per-layer sites mix                    #
 # (``:1316-1318``, ``:1325-1327``) and an unweighted mean collapses the streams #
@@ -4736,7 +4736,7 @@ def _row_spread_stats(rows: "torch.Tensor") -> tuple:
 def test_tiny_model_forward_matches_the_reference() -> None:
     """The decoder stack equals its torch composition, layer boundary by boundary.
 
-    ``inc-glm53f-054a`` item 6 of 7. D1.4 certifying component:
+    Item 6 of 7. D1.4 certifying component:
     ``Glm5NextModel.forward`` with ``_ffn_half`` and ``_rms_norm`` -- the embedding
     index, the per-layer loop and its two residual adds, the FFN branch and its gain,
     and the final norm.
@@ -4822,7 +4822,7 @@ def test_tiny_model_forward_matches_the_reference() -> None:
         "blockwise_fp8_mm": 3 * STACK_DENSE_LAYERS,
         "moe_fused": 1 * STACK_MOE_LAYERS,
         "noaux_tc_router": 1 * STACK_MOE_LAYERS,
-        # ---- THE TWO mHC SEAMS, ``inc-glm53f-030d`` commit 4c. TWO SITES PER LAYER,
+        # ---- THE TWO mHC SEAMS, commit 4c. TWO SITES PER LAYER,
         # and each site's one call is one Sinkhorn and one combine: the attention half's
         # site runs inside the layer (``model_fp8.py::Glm5NextDSALayer.forward``) and the feed-forward half's
         # runs in the stack loop (``:7265``), both through
@@ -4889,7 +4889,7 @@ def test_tiny_model_forward_matches_the_reference() -> None:
         from vllm_neuron.functional.blockwise_fp8_mm import blockwise_fp8_mm as _bmm
 
         _L0 = 0
-        # RE-POINTED BY ``inc-glm53f-030d`` commit 4c. ``recorded_out[0][1]`` is now the
+        # RE-POINTED BY commit 4c. ``recorded_out[0][1]`` is now the
         # four STREAMS, and the MLP is handed the single stream the feed-forward site
         # collapses them into (``model_fp8.py::Glm5NextModel.forward``). So every row below
         # re-runs the seam's pieces on THAT tensor, which is still the object the stack
@@ -5022,7 +5022,7 @@ def test_tiny_model_forward_matches_the_reference() -> None:
 
     _old_dense_ops = {}
     for _di, _dense_index in enumerate(fixture["dense_at"]):
-        # RE-POINTED BY ``inc-glm53f-030d`` commit 4c, exactly as BLOCK C is: the layer
+        # RE-POINTED BY commit 4c, exactly as BLOCK C is: the layer
         # returns the four STREAMS and the dense MLP is handed the single stream its
         # feed-forward site collapses them into. The guards below are about that half's
         # numerics, so they run on the tensor the half actually gets.
@@ -5064,7 +5064,7 @@ def test_tiny_model_forward_matches_the_reference() -> None:
                 _row_spread_stats(_act)[1],
                 float((_sum.float() == _half_only.float()).float().mean()),
                 _row_spread_stats(_sum)[1],
-                # GUARD (iii)'S TENSOR, ADDED BY ``inc-glm53f-030d`` COMMIT 4e (round-3
+                # GUARD (iii)'S TENSOR, ADDED BY COMMIT 4e (round-3
                 # finding 2). The collapse grant 127 read is a collapse of THIS tensor --
                 # the dense half's own output rows -- and it is the same recompute both
                 # scales already run here, so the guard costs nothing new.
@@ -5117,7 +5117,7 @@ def test_tiny_model_forward_matches_the_reference() -> None:
                 f"to the streams it was supposed to mix"
             )
         # GUARD (iii): THE DENSE HALF MUST NOT COLLAPSE EVERY TOKEN INTO ONE ROW. This
-        # is the guard grant 127 earned, and ``inc-glm53f-030d`` commit 4e moved it onto
+        # is the guard grant 127 earned, and commit 4e moved it onto
         # the tensor that collapse actually flattens -- the dense half's OWN output rows,
         # `half["out"]` -- for the reason round-3 finding 2 gives. It used to read the
         # per-layer STREAMS below layer 0, and under mHC that reading cannot fail: the
@@ -5244,7 +5244,7 @@ def test_tiny_model_forward_matches_the_reference() -> None:
             # SwiGLU clamps into one constant activated row, and a constant row through a
             # linear down-projection is a constant row, so this half's rows must read a
             # spread of EXACTLY zero. That is grant 127's number, on grant 127's tensor.
-            # ``inc-glm53f-030d`` commit 4e replaced a control that rebuilt the next
+            # Commit 4e replaced a control that rebuilt the next
             # layer's input THROUGH the mix and demanded zero of it: the mix's per-token
             # gate makes those rows differ by construction, so the old control raised on
             # a correct product (round-3 finding 2).
@@ -5257,7 +5257,7 @@ def test_tiny_model_forward_matches_the_reference() -> None:
                     f"not what this recompute reproduced"
                 )
 
-    # ---- THE PER-STAGE ROW SPREADS, READINGS AND NOT A GATE (``inc-glm53f-030d``
+    # ---- THE PER-STAGE ROW SPREADS, READINGS AND NOT A GATE (
     # commit 4e, round-3 finding 2). Grant 127 read `layer1_in`, `layer1_out`,
     # `layer2_in` and `layer2_out` at a row spread of EXACTLY ZERO, which is why these
     # four numbers are printed and why they were once the gate. They cannot BE the gate
@@ -5282,7 +5282,7 @@ def test_tiny_model_forward_matches_the_reference() -> None:
     # ---- CONJUNCT 1: THE EMBEDDING IS AN INDEX, EXPANDED ACROSS THE STREAM AXIS.
     # Exact equality, not a tolerance: the lookup copies rows, the expand copies them
     # again and neither computes anything, so a difference of any size is a different
-    # function. RE-POINTED BY ``inc-glm53f-030d`` commit 4c: the first layer is now
+    # function. RE-POINTED BY commit 4c: the first layer is now
     # handed ``[T, S, H]`` rather than ``[T, H]``, and the claim is a conjunction --
     # the table is still indexed, and every stream starts as the SAME token vector
     # (``reference:1477``, ``model_fp8.py::Glm5NextModel.forward``). Comparing only the expanded tensor
@@ -5320,7 +5320,7 @@ def test_tiny_model_forward_matches_the_reference() -> None:
     # carrier built for another layer -- another layer's latent cache above all -- fails
     # it.
     #
-    # RE-POINTED BY ``inc-glm53f-030d`` commit 4c. The stack now passes ONE MORE
+    # RE-POINTED BY commit 4c. The stack now passes ONE MORE
     # KEYWORD, ``streams``, and passes the SAME OBJECT positionally
     # (``model_fp8.py::Glm5NextModel.forward``): the keyword is the route selector and
     # the positional is the one-stream route's operand, which a bound layer refuses to
@@ -5358,7 +5358,7 @@ def test_tiny_model_forward_matches_the_reference() -> None:
     # ---- CONJUNCT 3: THE ATTENTION HALF AND ITS mHC MIX, per layer. The reference
     # reads the recorded input, so its selection is that layer's own.
     #
-    # RE-POINTED BY ``inc-glm53f-030d`` commit 4c, and the old form is stated so the
+    # RE-POINTED BY commit 4c, and the old form is stated so the
     # change is legible: this conjunct used to compare ``hidden + attended`` against the
     # layer's return, which was the one-stream residual add. The layer no longer does
     # that add. It runs its ``hc_attn_*`` site around the same attention half
@@ -5467,7 +5467,7 @@ def test_tiny_model_forward_matches_the_reference() -> None:
                     f"large opposing terms, so every reading here is inflated by "
                     f"a vanishing denominator"
                 )
-        # RE-POINTED BY ``inc-glm53f-030d`` commit 4c: the residual add is gone and the
+        # RE-POINTED BY commit 4c: the residual add is gone and the
         # site's post takes its place, over the same streams the half was collapsed from.
         expected = _stack_mhc_post(site, half["out"], hidden, post_mix, comb_mix)
         if index + 1 < len(layers):
@@ -5558,7 +5558,7 @@ def test_tiny_model_forward_matches_the_reference() -> None:
             f"cell by cell and adds one of them to the residual, so a shape "
             f"disagreement is a refusal and not a skip"
         )
-    # RE-POINTED BY ``inc-glm53f-030d`` commit 4c. The chain the final norm closes is now
+    # RE-POINTED BY commit 4c. The chain the final norm closes is now
     # four steps, not two: the last layer's FFN site mixes the product's own half back
     # into the streams, an UNWEIGHTED MEAN collapses the stream axis, the collapse is cast
     # to the embedding table's dtype and the norm runs on that
@@ -6073,9 +6073,9 @@ def _root_reference(hidden: torch.Tensor, head: torch.Tensor,
 #                                                                              #
 # THE ONE-STREAM EXCLUSION THAT STOOD HERE IS RETIRED, AND THIS ITEM IS NOW      #
 # RE-POINTED, on the same terms as the model-forward item above                   #
-# (``inc-glm53f-030d`` commit 4c). It used to say the logits came from a          #
-# one-stream carrier and that the four-stream carrier was ``inc-glm53f-030b``'s;  #
-# ``inc-glm53f-030d`` part (a) built that carrier in ``Glm5NextModel.forward``,   #
+# (commit 4c). It used to say the logits came from a                              #
+# one-stream carrier and that the four-stream carrier was another item's;         #
+# The mHC part (a) built that carrier in ``Glm5NextModel.forward``,               #
 # which now collapses the streams with an unweighted mean before the final norm   #
 # (``modeling_glm5_next.py:1493``, ``:302``). The ``[T, H]`` the root projects is #
 # therefore the reference's own post-collapse tensor and the exclusion has        #
@@ -6095,7 +6095,7 @@ def _root_reference(hidden: torch.Tensor, head: torch.Tensor,
 # ``logit_mask`` and ``spec_decode_metadata`` are runner keys this tree          #
 # implements nowhere, and control D measures that the forward REFUSES them by    #
 # name rather than swallowing them. Threading the runner's own dicts into this    #
-# signature is ``inc-glm53f-054b``'s work.                                       #
+# signature is the end-to-end file's work.                                       #
 #                                                                              #
 # NOTHING BELOW HAS BEEN RUN. Every expected count and every tolerance claim in  #
 # this section is a prediction the first counted run adjudicates.                #
@@ -6103,7 +6103,7 @@ def _root_reference(hidden: torch.Tensor, head: torch.Tensor,
 def test_tiny_root_forward_matches_the_reference() -> None:
     """The root equals the head projection of the rows it was asked to sample.
 
-    ``inc-glm53f-054a`` item 7 of 7. D1.4 certifying component:
+    Item 7 of 7. D1.4 certifying component:
     ``Glm5NextForConditionalGeneration.forward`` with ``_head_weight`` -- the policy
     resolution, the single stack call, the row selection before the projection, and
     the tied/untied head arm.

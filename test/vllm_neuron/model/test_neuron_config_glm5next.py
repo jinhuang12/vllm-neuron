@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """`NeuronConfig` knobs for the GLM-5.3-Flash (Glm5Next) hybrid stack.
 
-Covers the knobs `inc-glm53f-010` adds across three families -- hybrid
+Covers the knobs the fork adds across three families -- hybrid
 KDA/DSA, mHC, and blockwise FP8.
 
 Two things about this file are deliberate and load-bearing:

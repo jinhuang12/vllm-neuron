@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tier N acceptance for `inc-glm53f-028` -- the mHC Sinkhorn normalisation kernel.
+"""Tier N acceptance for the mHC Sinkhorn normalisation kernel.
 
-Acceptance command (plan block ``#### inc-glm53f-028``, Tier N harness "as
-`-025`")::
+Acceptance command (Tier N harness "as
+landed")::
 
     VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1 NKI_PRECISE_FP=1 \
     NEURON_PLATFORM_TARGET_OVERRIDE=trn2 \
@@ -24,7 +24,7 @@ column -- which are properties of the algorithm's definition, not of any
 reference implementation. If the oracle below were wrong, arm 1 would go red and
 arm 2 would not move.
 
-`inc-glm53f-028b` -- the same two arms at serving row extents
+The same two arms at serving row extents
 ------------------------------------------------------------
 The kernel now walks ``M`` in row tiles, so both arms run again at
 :data:`TILED_ROWS` -- ``129``, ``256``, ``512 * hc_mult`` and ``2048 * hc_mult``
@@ -83,7 +83,7 @@ being loose.
 
 The batched ``[T, S, S]`` form, and how it is checked
 ----------------------------------------------------
-`inc-glm53f-028b`, second form. ``sinkhorn_normalise_blocks`` normalises one
+Second form. ``sinkhorn_normalise_blocks`` normalises one
 square block per token instead of the ``block_diag`` matrix of them. Its
 correctness is checked in the way that leaves nothing to a claim: at ``T`` in
 ``{1, 3, 33}`` its output is compared BLOCK FOR BLOCK against this module's own
@@ -147,7 +147,7 @@ from vllm_neuron.utils.neuron_utils import can_run_kernel
 M = 64
 N = MHC_STREAMS  # 4
 
-#: `inc-glm53f-028b`'s declared row extents, the ones serving needs. 129 is the
+#: The declared row extents, the ones serving needs. 129 is the
 #: first row count that does not fit one partition tile, and it is deliberately
 #: NOT a whole number of blocks -- 129 = 32 blocks and one row -- so the tiling
 #: is measured on a ragged extent as well as on exact ones. The two largest are
@@ -272,10 +272,10 @@ def _affinity(seed: int = 21) -> torch.Tensor:
 
     The ``[-1, 1]`` exponent range keeps the dynamic range at ``e**2 ~ 7.4``, so
     the row sums are well conditioned and no term dominates its row. That is the
-    `inc-glm53f-025` attempt-1 conditioning lesson applied: a relative tolerance
+    attempt-1 conditioning lesson applied: a relative tolerance
     over a badly conditioned reduction measures cancellation, not the kernel.
 
-    ``inc-glm53f-028b`` moved the draw into :func:`_affinity_rows` so the tiled
+    A later round moved the draw into :func:`_affinity_rows` so the tiled
     row extents use this same construction at their own heights. The ``[64, 4]``
     fixture and every property claimed for it above are unchanged.
     """
@@ -374,7 +374,7 @@ def _report_stochasticity(result: torch.Tensor, label: str) -> tuple[float, floa
 
 
 # --------------------------------------------------------------------------- #
-# `inc-glm53f-028b` -- the BATCHED `[T, S, S]` fixture, oracle and readings.     #
+# The BATCHED `[T, S, S]` fixture, oracle and readings.                          #
 # --------------------------------------------------------------------------- #
 def _affinity_blocks(tokens: int, seed: int = 21) -> torch.Tensor:
     """``[T, S, S]`` strictly positive affinities, one square block per token.
@@ -737,7 +737,7 @@ def test_module_oracle_agrees_with_the_test_authored_oracle() -> None:
     evidence about the reference; agreement between one formulation and itself
     would be nothing.
 
-    This is also what lets `inc-glm53f-030` rely on the module's oracle: it is
+    This is also what lets the layer rely on the module's oracle: it is
     exercised here rather than shipped unmeasured.
     """
     affinity = _affinity()
@@ -843,20 +843,20 @@ def test_route_control_simulator_is_load_bearing() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# The counters are MODULE-LEVEL state -- `inc-glm53f-030` depends on it.         #
+# The counters are MODULE-LEVEL state -- the layer depends on it.                #
 # --------------------------------------------------------------------------- #
 def test_dispatch_counters_are_module_level_state_reachable_from_elsewhere() -> None:
-    """Another module can zero and read these counters. `-030` needs exactly this.
+    """Another module can zero and read these counters. The layer needs exactly this.
 
-    `inc-glm53f-030`'s route predicate is form R-2 over THIS seam together with
-    `inc-glm53f-029`'s: its own test module resets and reads the counters this
+    The layer forward's route predicate is form R-2 over THIS seam together with
+    the combine kernel's: its own test module resets and reads the counters this
     module owns, per layer call. A test-local counter, or one only this file
     could reset, would pass this increment and break that one.
 
     Measured rather than asserted by inspection: the module is re-acquired
     through ``importlib`` -- the same mechanism another test module's import uses
     -- one reference RESETS, the seam is driven, and the OTHER reference READS.
-    Then the counter is shown to ACCUMULATE across calls, because `-030` reads a
+    Then the counter is shown to ACCUMULATE across calls, because the layer reads a
     per-layer-call total and a counter that saturated at 1 could not supply one.
     """
     foreign = importlib.import_module(_MODULE)
@@ -869,7 +869,7 @@ def test_dispatch_counters_are_module_level_state_reachable_from_elsewhere() -> 
     foreign.reset_dispatch_counters()
     assert dispatch_counters() == (0, 0), (
         "a reset through the foreign reference did not zero the counters this "
-        "test reads, so the state is not shared and -030's R-2 predicate cannot "
+        "test reads, so the state is not shared and the layer's R-2 predicate cannot "
         "be taken over this seam"
     )
     with _SimulatorCounter() as sim:
@@ -885,7 +885,7 @@ def test_dispatch_counters_are_module_level_state_reachable_from_elsewhere() -> 
     assert after_one == (1, 0), f"expected (1, 0) after one dispatch, got {after_one}"
     assert after_two == (2, 0), (
         f"expected (2, 0) after two dispatches, got {after_two}; the counter "
-        f"does not accumulate across calls, so it cannot supply -030's "
+        f"does not accumulate across calls, so it cannot supply the layer's "
         f"per-layer-call total"
     )
     foreign.reset_dispatch_counters()
@@ -915,7 +915,7 @@ def test_seam_dispatches_to_the_kernel_this_increment_authors() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# `inc-glm53f-028b` -- ROW EXTENTS PAST ONE PARTITION TILE.                     #
+# ROW EXTENTS PAST ONE PARTITION TILE.                                          #
 #                                                                               #
 # RUNTIME NOTE, not a criterion: the largest declared case is 8192 rows, which   #
 # the kernel walks as 64 row tiles of 128, and every one of the 20 iterations    #
@@ -930,7 +930,7 @@ def test_tiled_rows_match_the_oracle_and_stay_doubly_stochastic(rows: int) -> No
 
     ONE dispatch per case, whatever the tile count: the tiling is inside the
     kernel, so the route instruments read exactly what they read for the 64-row
-    case. That is the property `inc-glm53f-028b` had to preserve -- a host-side
+    case. That is the property the tiling had to preserve -- a host-side
     loop over 128-row slices would compute the same numbers and read one dispatch
     per slice.
 
@@ -1059,7 +1059,7 @@ def test_the_moved_bound_admits_the_serving_extent() -> None:
     admission, and it is measured at the largest declared extent rather than just
     above the old ceiling. ``can_run_kernel`` decides the route; this test only
     requires that the GEOMETRY check raises nothing, which is the half
-    `inc-glm53f-028b` changed.
+    the tiled form changed.
     """
     for rows in (PARTITION_MAX + 1,) + TILED_ROWS:
         verdict = can_run_sinkhorn(torch.zeros(1), rows, N)
@@ -1122,7 +1122,7 @@ def test_seam_refuses_non_2d_and_non_positive_iters() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# `inc-glm53f-028b` -- THE BATCHED `[T, S, S]` FORM.                            #
+# THE BATCHED `[T, S, S]` FORM.                                                 #
 #                                                                               #
 # RUNTIME NOTE, not a criterion: the largest case is 2048 blocks, walked as 16   #
 # token tiles of 128 with 20 iterations over all of them. As with the tiled      #
@@ -1139,7 +1139,7 @@ def test_blocks_kernel_equals_the_square_kernel_on_the_block_diagonal(
     ``T`` blocks independently equals normalising ``block_diag`` of them, because
     a block-diagonal matrix's row and column sums are its blocks' row and column
     sums and a zero stays zero under any rescaling. If that were false, the mHC
-    layer would compute a different attention mix after `inc-glm53f-030b` switches
+    layer would compute a different attention mix after the wiring switches
     it over, and no per-block reading of the batched output alone could tell.
 
     So both kernels run here, on the SAME blocks, in one case: the batched one on

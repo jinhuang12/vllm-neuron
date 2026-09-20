@@ -49,7 +49,7 @@ _DSA_PHASE = 3
 class Glm5NextExpertConfigError(ValueError):
     """An expert-count field the routed-MoE stack cannot be built from.
 
-    ``inc-glm53f-031``. Named rather than a bare ``ValueError`` for the same
+    Named rather than a bare ``ValueError`` for the same
     reason ``RaggedExpertPartitionError`` is: the expert-count path has two
     distinct failure classes -- a count that is out of range (here) and a count
     that is in range but does not shard uniformly (``factory.py``) -- and a
@@ -72,7 +72,7 @@ def _from_hf_sub_config(cls, hf_sub_config, neuron_config=None):
     the dtype string, and attaches the neuron_config. Same shape as the
     sibling arch packages use, so the two read alike.
 
-    EVERY DROPPED KEY IS NAMED AT ``WARNING`` (``inc-glm53f-080``). The filter
+    EVERY DROPPED KEY IS NAMED AT ``WARNING``. The filter
     below keeps only declared fields, and it used to drop the rest without a
     word: the real checkpoint's ``text_config`` carries 58 keys, so every key
     this dataclass family does not declare reached nothing and a reader had no
@@ -83,7 +83,7 @@ def _from_hf_sub_config(cls, hf_sub_config, neuron_config=None):
     THE COUNT IS NOT WRITTEN HERE ANY MORE, and that is deliberate. This
     docstring used to say the family "models 30 of them, so 26 real keys reached
     nothing", which cannot be right about both halves at once: 58 minus 30 is
-    28. The measured decomposition at ``inc-glm53f-033`` repair round 2 was 33
+    28. The measured decomposition at repair round 2 was 33
     declared fields, 31 of them keys the vendor config also carries, plus the one
     key the ``dtype`` remap consumes, so the log read 32 modelled and 26 dropped.
     That round then added ``swiglu_limit``, which moved both figures again. A
@@ -183,7 +183,7 @@ class Glm5NextTextConfig:
 
     # -- The DSA sparse indexer --------------------------------------------
     #
-    # ``inc-glm53f-051``, authorised at design entry ``design-20260905-ad``.
+    # Authorised at design entry ``design-20260905-ad``.
     # These seven keys are in every checkpoint this campaign targets and were
     # DROPPED by the adapter until now, because the adapter keeps only declared
     # fields. That was harmless while nothing read them and is not harmless any
@@ -233,10 +233,10 @@ class Glm5NextTextConfig:
     # (``modeling_glm5_next.py:102-104``). The checkpoint declares it in
     # ``text_config`` AND in ``vision_config``, both at ``10.0``, and
     # ``Glm5NextVisionConfig`` below has carried the field since
-    # ``inc-glm53f-032``; the text config did not, so the counting pass dropped
+    # the vision adapter landed; the text config did not, so the counting pass dropped
     # the key and the shared expert had no checkpoint value to clamp with. That
     # is the second surface of ``B22-M1-shared-expert-swiglu-clamp-omitted``,
-    # lifted by ``inc-glm53f-033`` repair round 2.
+    # lifted by repair round 2.
     #
     # THE DEFAULT IS THE CHECKPOINT'S OWN, for the same reason
     # ``rms_norm_eps``'s is: a config that omits the key then resolves to the
@@ -252,7 +252,7 @@ class Glm5NextTextConfig:
     # 1e-06), so collapsing them onto one field would change what every
     # RMSNorm computes. The default here is the checkpoint's own 1e-05, so a
     # config that omits the key resolves to the target's number rather than to
-    # whatever a kernel happens to default to (``inc-glm53f-080``).
+    # whatever a kernel happens to default to.
     rms_norm_eps: float = 1e-05
 
     # -- Multi-hyper-connections (mHC) -------------------------------------
@@ -273,7 +273,7 @@ class Glm5NextTextConfig:
     def _validate_expert_counts(self) -> None:
         """The expert-count fields the MoE-288 stack is built from, PER FIELD.
 
-        ``inc-glm53f-031``. Loud rather than defaulted, for the same reason
+        Loud rather than defaulted, for the same reason
         :meth:`_validate_layer_types` is: an out-of-range count produces a
         routed-expert bank whose shard arithmetic is wrong in a way no
         downstream shape assertion could attribute back to here.
@@ -299,7 +299,7 @@ class Glm5NextTextConfig:
           :func:`~vllm_neuron.model.glm5_next.factory.require_uniform_expert_partition`.
 
         **The boundary is not a convenience, and it was measured.** Asking the
-        router question at construction time rejected ``inc-glm53f-011``'s
+        router question at construction time rejected the
         landed ``mini_config`` fixture, which declares a 4-expert bank while
         inheriting the checkpoint's top-8 default -- a structural key-mapping
         fixture that never routes a token. That fixture's latent incoherence is
@@ -391,7 +391,7 @@ class Glm5NextVisionConfig:
     # patch row: ``patch_dim = in_channels * temporal_patch_size *
     # patch_size ** 2``. It is declared here rather than assumed because the
     # tower computes that width and refuses a row that disagrees. Added by
-    # ``inc-glm53f-060``, the first block that needs it, under the block's own
+    # the first block that needs it, under the block's own
     # revision-231 rider.
     in_channels: int = 3
 
@@ -417,7 +417,7 @@ class Glm5NextVisionConfig:
     # give the right number today -- which is exactly why the field is declared
     # here by its own line rather than borrowed from the text config, where a
     # later checkpoint that moves one of the two would silently change what the
-    # tower computes. Added by ``inc-glm53f-104``.
+    # tower computes.
     rms_norm_eps: float = 1e-05
 
     neuron_config: VisionNeuronConfig | None = None
@@ -444,7 +444,7 @@ class Glm5NextConfig:
     tie_word_embeddings: bool = False
 
     # -- Blockwise-FP8 fields lifted from quantization_config ---------------
-    # ALL FIVE of them since ``inc-glm53f-079``. The quantization SPEC (scheme
+    # ALL FIVE of them. The quantization SPEC (scheme
     # resolution, per-module policy) is still deliberately NOT modelled here;
     # this dataclass only carries what the checkpoint declares.
     quant_method: str | None = "fp8"
@@ -454,7 +454,7 @@ class Glm5NextConfig:
     #: Substring-match list of module names the checkpoint keeps in BF16, taken
     #: verbatim off ``quantization_config.modules_to_not_convert``. The real
     #: checkpoint ships 1,509 entries and this adapter read NONE of them before
-    #: ``inc-glm53f-079``, so every BF16 family was treated as block-FP8. The
+    #: this field landed, so every BF16 family was treated as block-FP8. The
     #: matching rule is the fork's own and is not restated here
     #: (``neuron_config.py``'s ``modules_to_not_convert``, consumed by
     #: ``qwen3_vl/model_mxfp8.py``'s ``_keep_bf16``): a module keeps BF16 when
@@ -518,7 +518,7 @@ class Glm5NextConfig:
             quant_method=quant_cfg.get("quant_method"),
             activation_scheme=quant_cfg.get("activation_scheme"),
             weight_block_size=quant_cfg.get("weight_block_size"),
-            # inc-glm53f-079: the two fields this adapter used to drop on the
+            # The two fields this adapter used to drop on the
             # floor. The skip list is the checkpoint's own quantisation policy,
             # so leaving it unread meant the policy could not be honoured.
             modules_to_not_convert=quant_cfg.get("modules_to_not_convert"),

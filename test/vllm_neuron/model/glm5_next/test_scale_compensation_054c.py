@@ -1,10 +1,10 @@
-"""``inc-glm53f-054c``: the dense and shared scale grids are compensated exactly once.
+"""The dense and shared scale grids are compensated exactly once.
 
 WHAT THIS MEASURES, AND WHY IT STARTS FROM CHECKPOINT BYTES. The trn2 load is a matched pair -- squeeze
 the weight BYTES into the 240 range, multiply the per-block scale grid by the inverse factor -- and before
 this increment only the first half ran for the dense MLP and the shared expert. Their grids are attached
 out-of-band and raw, so the product the kernel multiplied was the SQUEEZE FACTOR times the checkpoint's
-numbers -- ``240/448`` when this file was written, an exact ``1/2`` since ``inc-glm53f-054e``.
+numbers -- ``240/448`` when this file was written, an exact ``1/2`` since a later round.
 A test that hands the seam PREPARED operands cannot see that, because the defect lives in the step that
 turns checkpoint-format tensors into prepared ones. So every reading here starts from fp8-e4m3fn bytes and
 a ``128``-tile grid and drives the real loader and the real prep.
@@ -15,7 +15,7 @@ squeeze to its own reference, which makes both sides carry the factor and agrees
 one is corrected under this increment, and this file states the convention it should have had.
 
 THE CONTROL RUNS IN BOTH DIRECTIONS, and each arm asserts the NUMBER it expects. A missing multiply reads
-``0.5`` per projection since ``-054e`` (it was ``240/448 = 0.5357143``); a doubled one reads ``2.0``. An
+``0.5`` per projection since a later round (it was ``240/448 = 0.5357143``); a doubled one reads ``2.0``. An
 arm that only required "some
 failure" would be satisfied by an unrelated breakage.
 
@@ -56,7 +56,7 @@ FP8_E4M3FN_MAX = 448.0
 
 #: What a MISSING compensation costs, per projection and through one MLP.
 #:
-#: ``inc-glm53f-054e`` made the squeeze the largest POWER OF TWO that fits 448 inside 240
+#: A later round made the squeeze the largest POWER OF TWO that fits 448 inside 240
 #: rather than the ratio of the two, so this is 0.5 and not 240/448. It is written as the
 #: literal it is: the ratio would be the wrong relation, and the load path's own constant is
 #: pinned against the same literal in ``test_weight_loaders.py``.
@@ -75,7 +75,7 @@ MLP_SQUEEZE = SQUEEZE**3                          # 0.125, was 0.153744533527696
 #: The PRODUCER's block, kept only to size the extents below in whole 256 blocks so
 #: this file's geometry does not move. Nothing dequantises at it any more.
 BLOCK = 256
-#: THE CHECKPOINT'S TILE, AND SINCE ``inc-glm53f-112`` THE GRID THE MODULE CARRIES.
+#: THE CHECKPOINT'S TILE, AND THE GRID THE MODULE CARRIES.
 #: IMPORTED from the dense kernel rather than typed: the publish now hands the
 #: checkpoint's own grid to ``blockwise_fp8_mm``, which indexes at
 #: ``SCALE_BLOCK_SIZE``, so a literal here would be a second place for that number to
@@ -212,7 +212,7 @@ def _effective_matrix(module, weight_name: str, grid_name: str) -> torch.Tensor:
     The prep leaves the weight and its grid transposed into the kernel's frame, so both
     are transposed back here and nothing else is touched.
 
-    THE GRANULARITY IS THE CHECKPOINT'S OWN, RE-PINNED BY ``inc-glm53f-112``. The prep
+    THE GRANULARITY IS THE CHECKPOINT'S OWN, RE-PINNED. The prep
     used to coarsen the 128 grid onto a public 256 one, so this rebuild ran at 256. It
     publishes the checkpoint's grid unchanged now, so the rebuild runs at ``TILE`` --
     which is the dense kernel's ``SCALE_BLOCK_SIZE``, imported. Nothing else about this

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tier N acceptance for ``inc-glm53f-049`` -- the decode-step k-pool tail update.
+"""Tier N acceptance for the decode-step k-pool tail update.
 
 WHAT THIS FILE MEASURES, and the shape of the argument it makes:
 
@@ -557,7 +557,7 @@ def test_per_slot_channel_softmax_is_distinguishable_from_a_whole_vector_softmax
     """A softmax over the 128 channels instead of the 4 slots is a DIFFERENT kernel, and this
     file's inputs can tell them apart.
 
-    The same discriminator ``-047`` carries, taken again here because this module has its own
+    The same discriminator the k-pool kernel carries, taken again here because this module has its own
     softmax and a wrong axis in it would be invisible to that increment's tests.
     """
     tail0, keys, scores, ape = _inputs(1, seed=409)

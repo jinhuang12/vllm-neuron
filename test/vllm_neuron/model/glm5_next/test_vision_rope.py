@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Acceptance test for ``inc-glm53f-059b`` -- WP10: the vision tower's 2-D rope.
+"""Acceptance test for WP10: the vision tower's 2-D rope.
 
 THE REGISTERED CRITERION, VERBATIM. These are the plan's own 163 bytes, copied from
 ``design/increment-plan.md`` at criteria pin
@@ -13,7 +13,7 @@ WHAT THE RULING CHANGED, AND WHAT IT DID NOT. Design entry ``design-20260906-av`
 re-ruled the invariance SCOPE to the FULL head, on this seat's own withdrawn rider. ``1e-5`` is
 unchanged, ``rtol=1e-2, atol=1e-5`` is unchanged, and no number above moved -- a criterion
 change would be the lead's and the user's, never this seat's. The grid is CONSUMED from
-``-056``'s landed ``vision_preprocessing.py`` and never re-derived (``design-20260905-aq``
+the landed ``vision_preprocessing.py`` and never re-derived (``design-20260905-aq``
 (iii)).
 
 The conjuncts are measured as R01 (the reference comparison, 3/3 grids) and R03 (the norm
@@ -71,7 +71,7 @@ NORM_BOUND = 1e-5
 HEAD_DIM = 64
 MERGE_SIZE = 2
 
-#: Item sizes handed to ``-056``'s grid functions. The grids themselves are never typed here.
+#: Item sizes handed to the landed grid functions. The grids themselves are never typed here.
 IMAGE_SIZES = (("A01_regime_A", 784, 1036), ("A02_regime_B", 29, 29))
 VIDEO_SIZES = (("A03_video_three_frames", 3, 112, 112),)
 
@@ -96,7 +96,7 @@ def hf():
 
 @pytest.fixture(scope="module")
 def grids():
-    """Every grid under test, CONSUMED from ``-056``'s landed module.
+    """Every grid under test, CONSUMED from the landed module.
 
     ``GridConstants`` reads the six patch numbers off the transformers processor, so nothing
     about the grid is stated in this file -- only the pixel size of the item.
@@ -337,7 +337,7 @@ def test_r07_report_the_measured_readings(hf, grids, capsys):
     )
     lines = [
         "",
-        "inc-glm53f-059b -- vision rope readings",
+        "vision rope readings",
         f"  module resolved from   {vllm_neuron.__file__}",
         f"  transformers reference {hf['version']}",
         f"  head_dim {HEAD_DIM}, merge {MERGE_SIZE}, theta {DEFAULT_VISION_ROPE_THETA}",

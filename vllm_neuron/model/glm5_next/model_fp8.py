@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """GLM-5.3-Flash (``glm5_next``) blockwise-FP8 modeling skeleton.
 
-``inc-glm53f-013`` -- WP1: model skeleton and ``KVSpec``. This module is the
+WP1: model skeleton and ``KVSpec``. This module is the
 file D14 declares a **coordinated merge point, rank-1-equivalent for the
 duration of the campaign**: this increment creates the module header, the
 imports, the ``Glm5NextForConditionalGeneration`` tree, ``get_kv_spec``, and
@@ -34,14 +34,14 @@ allocation that shape would otherwise imply.
 
 WHERE THE PARAMETER NAMES COME FROM -- THEY ARE NOT CHOSEN HERE
 ---------------------------------------------------------------
-Per the lead ruling *"-013's skeleton parameter names: the LANDED weight map's
+Per the lead ruling *"the skeleton's parameter names: the LANDED weight map's
 param-name side is the authority"* -- recorded at
 ``artifacts/campaigns/glm-5.3-flash-port/increments/evidence-013.md`` L212,
 since the original ``approvals/lead-ruling-013-param-name-authority.md`` was
 deleted in the 2026-08-31 residue purge -- every parameter
 attribute path below is **derived from**
 :func:`~vllm_neuron.model.glm5_next.weight_loaders_fp8.build_weight_mappings`
-as landed by ``inc-glm53f-011`` / ``inc-glm53f-012``, measured off the bytes at
+as landed by the weight-loader increments, measured off the bytes at
 HEAD -- never invented and never "improved". The derivation is asserted
 mechanically in ``test/vllm_neuron/model/glm5_next/test_kv_spec.py``, so the
 map-versus-skeleton equality is checkable by reading code rather than by
@@ -52,12 +52,12 @@ map's own convention, which follows the fork's MoE precedent
 
 WHAT IS DELIBERATELY ABSENT
 ---------------------------
-The quant-method dispatcher is ``inc-glm53f-023``'s (D14, M2) and is **not**
+The quant-method dispatcher is a later increment's (D14, M2) and is **not**
 here: ``quantization.py:33-39`` states that sequencing fact, not an assignment
 to this increment. Sharded scale loading is later work
 (``weight_loaders_fp8.py:1107-1114`` states the same kind of fact).
 ``vllm_neuron/model/kv_cache.py`` is **untouched**: widening ``LayerSpec`` with
-KDA recurrent-state fields is ``inc-glm53f-015``'s declared surface at M1, and
+KDA recurrent-state fields is the cache-spec increment's declared surface at M1, and
 its acceptance asserts that the pin's 6-field construction still works with
 zero signature breaks. This skeleton builds pin-shaped ``LayerSpec`` values on
 the six fields that exist.
@@ -108,7 +108,7 @@ from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 from vllm_neuron.utils.weight_loader import set_weight_loader
 
 if TYPE_CHECKING:
-    # -- inc-glm53f-100 -- ANNOTATION ONLY, and that is the whole point. This
+    # -- ANNOTATION ONLY, and that is the whole point. This
     #    module imports no vllm symbol at runtime and this block keeps it that
     #    way: the guard is false at import time, so nothing here can make the
     #    module fail to import on a lane without vllm, while the return type of
@@ -284,7 +284,7 @@ def _resolve_world_size() -> int:
 def _resolve_rank() -> int:
     """This process's rank in the tensor-parallel group, or 0 when not distributed.
 
-    ``inc-glm53f-091``. The twin of :func:`_resolve_world_size` above, and
+    The twin of :func:`_resolve_world_size` above, and
     deliberately the same shape -- same source, same two exception types, same
     "absence is not an error" reading -- because the two values are read together
     and a pair that disagreed about what "not distributed" means would shard
@@ -295,13 +295,13 @@ def _resolve_rank() -> int:
     ``self.tp_group.rank_in_group`` (``qwen3/model.py:974``), which is not
     available here: ``Glm5NextForConditionalGeneration`` declares no ``tp_group``
     member, only ``world_size`` (``:3031``). Reading the process group directly is
-    what ``-013`` already chose for the world size, so this keeps one convention
+    what the skeleton already chose for the world size, so this keeps one convention
     in the file rather than importing a second one.
 
     D14 BOUNDARY, recorded because this is a new module-level helper: it sits in
-    the module-level helper block that ``inc-glm53f-013`` owns, immediately after
+    the module-level helper block that the skeleton owns, immediately after
     its twin and before ``_per_rank``. It adds no import -- ``torch`` is already
-    the module's own -- and no ``-013`` helper is edited.
+    the module's own -- and no skeleton helper is edited.
     """
     try:
         return torch.distributed.get_rank()
@@ -323,7 +323,7 @@ def _resolve_tp_group() -> GroupCoordinator | None:
     size 1 nothing about this increment may change the path a landed single-rank
     test takes.
 
-    ``inc-glm53f-100``. The third of the module's ``_resolve_*`` twins and
+    The third of the module's ``_resolve_*`` twins and
     deliberately their shape: read the process state, treat its absence as "not
     distributed" rather than as an error, and be the ONE place in the file that
     knows how. Tests already inject world size by monkeypatching
@@ -338,7 +338,7 @@ def _resolve_tp_group() -> GroupCoordinator | None:
     ``qwen3/model.py:170`` and ``:535-537``, the convention written down at
     ``parallel/DESIGN.md:149-151``. This package's classes are built before any
     world size is known (``_declare_parameters`` / ``_materialise_declared_
-    parameters``, the reason ``-094``'s geometry is a table rather than a line in
+    parameters``, the reason the shard geometry is a table rather than a line in
     each ``__init__``), so the group is resolved at the call site instead of
     bound in a constructor. Same group, same call, later lookup.
 
@@ -353,7 +353,7 @@ def _resolve_tp_group() -> GroupCoordinator | None:
     would span.
 
     D14 BOUNDARY, recorded because this is a new module-level helper: it sits in
-    the module-level helper block ``inc-glm53f-013`` owns, after its twins and
+    the module-level helper block the skeleton owns, after its twins and
     after ``_per_rank`` -- AFTER on purpose, so ``_per_rank`` keeps the lines
     ``weight_loaders_fp8.py:1499`` cites it by. It adds no runtime import; the
     annotation's ``GroupCoordinator`` arrives through the ``TYPE_CHECKING`` block
@@ -368,7 +368,7 @@ def _resolve_tp_group() -> GroupCoordinator | None:
 
 
 # --------------------------------------------------------------------------- #
-# inc-glm53f-094 -- WHICH PARAMETER FAMILIES ARE SHARDED, AND ON WHICH DIM.
+# WHICH PARAMETER FAMILIES ARE SHARDED, AND ON WHICH DIM.
 #
 # WHY THIS IS A TABLE AND NOT A LINE IN EACH __init__. The shipped precedent
 # (qwen3 ``model.py:224``) attaches a shard loader to a parameter object inside
@@ -404,7 +404,7 @@ class _DeclaredShard:
     """One family's declared shard: the dim, and this rank's extent along it.
 
     ``width`` IS ``None`` FOR A FAMILY WHOSE WIDTH ARRIVES WITH THE TENSOR
-    (``inc-glm53f-101``). Two cases need it and both are readings rather than
+    Two cases need it and both are readings rather than
     conveniences: ``Glm5NextSharedExperts`` carries no width at all
     (``:1520-1535`` -- ``num_shared_experts`` and ``swiglu_limit``), and the dense
     MLP's three are moved onto the same route so ONE rule pads both, because
@@ -416,7 +416,7 @@ class _DeclaredShard:
     rank's shard is a whole consumer block. It is a FLAG and not the number, because
     the number lives in the consumer and is imported at attachment time rather than at
     import time -- which is why narrowing that number to ``128`` in
-    ``inc-glm53f-112`` moved this pad without touching this class. The DENSE
+    the consumer moved this pad without touching this class. The DENSE
     consumer's is the one this flag reads: the families that declare it are the dense
     MLP and the shared expert, and ``blockwise_fp8_mm`` is what dequantises both --
     see
@@ -439,7 +439,7 @@ class _DeclaredShard:
     #: numbers. Ruled at design entry ``design-20260905-ap``, remedy part 3(a).
     shards_within_expert_parallel_group: bool = False
     #: This family's per-rank shard must ALREADY be a whole consumer block, and the
-    #: load REFUSES BY NAME when it is not. ``inc-glm53f-106``, and it is the other
+    #: load REFUSES BY NAME when it is not. This flag is the other
     #: half of dropping ``pad_to_consumer_block`` from the routed bank: the two flags
     #: are the two answers to one question -- an inadmissible width is either PADDED
     #: up to admissibility or REFUSED -- and the bank's answer is refuse, because its
@@ -456,7 +456,7 @@ class _DeclaredShard:
 
 #: The value a pad row carries, and no activation on either dense path does.
 #:
-#: `inc-glm53f-026b`. The seam tiles ``M`` over the PSUM partition axis and does
+#: The seam tiles ``M`` over the PSUM partition axis and does
 #: not pad, so it refuses any token count that is not a whole number of
 #: ``TILE_SIZE`` rows and says in its own message that padding is the caller's
 #: (``functional/blockwise_fp8_mm.py:239-245``). A one-token decode step is
@@ -467,7 +467,7 @@ class _DeclaredShard:
 #:
 #: ``-2 ** 15`` is exact in ``bfloat16`` and orders of magnitude outside the
 #: widest pre-activation this path has produced -- ``[67.94, 184.89]`` at
-#: `-033`'s fixture (``increments/probe-R7-clamp-and-config-lift.out``) -- so a
+#: the shared-expert path's fixture (``increments/probe-R7-clamp-and-config-lift.out``) -- so a
 #: pad row is identifiable by EQUALITY rather than by a tolerance. The value
 #: never reaches a caller: the slice removes every pad row at the single return,
 #: and the acceptance counts that.
@@ -525,7 +525,7 @@ def _kda_head_count(module: nn.Module, world_size: int) -> int:
     return int(module.num_kv_heads_per_rank)
 
 
-# THE DENSE MLP'S WIDTH FUNCTION IS GONE (``inc-glm53f-101``), and its removal is
+# THE DENSE MLP'S WIDTH FUNCTION IS GONE, and its removal is
 # the fix rather than a tidy-up. It read ``_per_rank(module.intermediate_size,
 # world_size)``, which FLOORS: at the registered TP=64 the real 12288 gave 192 rows
 # per rank, and 192 was neither a whole 128-row checkpoint tile nor a whole
@@ -537,7 +537,7 @@ def _kda_head_count(module: nn.Module, world_size: int) -> int:
 # ``world_size * dense_consumer_block_quant_size()``. Ruled at design entry
 # ``design-20260905-ap``, remedy part 2.
 #
-# THE PAD SHRANK IN ``inc-glm53f-112`` and nothing here changed to make it: the
+# THE PAD SHRANK and nothing here changed to make it: the
 # consumer block narrowed from 256 to 128, so the multiple is now
 # ``world_size * 128``. The padded widths that follow are 16384 at 64 ranks, and
 # 12288 UNCHANGED at 32 or fewer -- where the 256 block had padded 32 ranks up to
@@ -548,7 +548,7 @@ def _kda_head_count(module: nn.Module, world_size: int) -> int:
 # first finding.
 
 
-# -- inc-glm53f-100 -- the MLA families' three widths. ---------------------- #
+# -- the MLA families' three widths. ---------------------- #
 #
 # WHICH PATTERN THESE FOLLOW, and why it is NOT the KDA's.
 # ``Glm5NextMLAAttention`` keeps ``num_attention_heads`` as the MODEL's head
@@ -558,7 +558,7 @@ def _kda_head_count(module: nn.Module, world_size: int) -> int:
 # already per-rank.
 #
 # THE DENSE MLP WAS THIS COMMENT'S EXAMPLE AND IS NO LONGER ONE. Its width
-# function was deleted by ``inc-glm53f-101`` -- the reason is recorded a few
+# function was deleted -- the reason is recorded a few
 # lines above this table -- and its three leaves now declare ``width=None`` and
 # let the loader read the extent off the checkpoint tensor. So of the five
 # declaring families, three defer and only KDA and MLA resolve a width in this
@@ -621,7 +621,7 @@ def _mla_o_proj_width(module: nn.Module, world_size: int) -> int:
     and the cross-rank sum is the consumer's business -- here that consumer is
     :meth:`Glm5NextMLAAttention.project_output`, which performs it, unlike the KDA
     sibling's ``o_proj`` (a gap this increment does not close; it is recorded as
-    ``inc-glm53f-094`` debt against ``inc-glm53f-054``'s design read).
+    debt against the layer forward's design read).
     """
     return _mla_head_count(module, world_size) * int(module.v_head_dim)
 
@@ -659,7 +659,7 @@ _SHARD_GEOMETRY: dict[str, dict[str, _DeclaredShard]] = {
             0, _kda_head_width, "one bias per channel -- the forward slices it per head width"
         ),
     },
-    # -- inc-glm53f-100 -- the MLA families the ratified table defers to it
+    # -- the MLA families the ratified table defers to a later increment
     #    (``increments/shard-table-094.md`` Part 5, Group B). THREE leaves, one per
     #    projection whose declared width carries the head count; the two latent
     #    projections are absent because they are replicated, which Part 5 records
@@ -695,7 +695,7 @@ _SHARD_GEOMETRY: dict[str, dict[str, _DeclaredShard]] = {
             1, None, "row-parallel -- the intermediate width is its input", True
         ),
     },
-    # inc-glm53f-101. The shared expert's three, on the same route as the dense
+    # The shared expert's three, on the same route as the dense
     # three above and for the stronger version of the same reason: this class holds
     # NO width to divide, so there is nothing at the attachment site to resolve.
     # It is NOT an expert-parallel entity -- it runs on every token, so it shards
@@ -715,7 +715,7 @@ _SHARD_GEOMETRY: dict[str, dict[str, _DeclaredShard]] = {
             1, None, "row-parallel -- the intermediate width is its input", True
         ),
     },
-    # inc-glm53f-101, remedy part 3. The routed bank's three, and the ONE family
+    # Under remedy part 3. The routed bank's three, and the ONE family
     # whose divisor is not the world size. Its experts are already divided across
     # the expert-parallel groups, so what remains to divide inside a group is the
     # intermediate width, by tp_per_ep.
@@ -729,7 +729,7 @@ _SHARD_GEOMETRY: dict[str, dict[str, _DeclaredShard]] = {
     # (``weight_loaders_fp8.py``'s ``_stack_local_expert_weights``), so a dim
     # counted in the stacked shape would slice the wrong axis of every expert.
     # THE THREE ROWS BELOW SPELL THEIR FLAGS AS KEYWORDS, and that is deliberate
-    # rather than a style preference (``inc-glm53f-106``). They used to pass
+    # rather than a style preference. They used to pass
     # ``True, True`` positionally for the pad and the EP divisor; dropping the pad
     # would have shifted the SECOND ``True`` into the pad's place and defaulted
     # ``shards_within_expert_parallel_group`` to False, which divides the bank by the
@@ -768,7 +768,7 @@ def _shard_geometry_for(
 ) -> ShardGeometry | DeferredShardGeometry | None:
     """This parameter's resolved shard, or ``None`` when it is replicated.
 
-    ``inc-glm53f-094``. The single reader of :data:`_SHARD_GEOMETRY`, called from
+    The single reader of :data:`_SHARD_GEOMETRY`, called from
     ``_materialise_declared_parameters`` for every declared parameter.
 
     AT WORLD SIZE 1 IT RETURNS ``None`` FOR EVERYTHING, deliberately. A one-rank
@@ -778,7 +778,7 @@ def _shard_geometry_for(
     conjunct (1)'s ``world_size=1`` reading a real control rather than a
     restatement.
 
-    TWO KINDS COME BACK SINCE ``inc-glm53f-101``. A family that declares a width
+    TWO KINDS COME BACK. A family that declares a width
     function gets its extent resolved here, exactly as before. A family declaring
     ``width=None`` gets a :class:`DeferredShardGeometry` instead, which carries the
     dim, the rank count and the pad multiple and leaves the extent to the loader
@@ -791,14 +791,14 @@ def _shard_geometry_for(
     ``tp_per_ep = world_size // ep_degree``. At ``tp_per_ep == 1`` the bank is
     whole inside its group and ``None`` comes back -- and that happens when the world
     size EQUALS the degree, one rank per group, NOT at degree 1. Corrected by
-    ``inc-glm53f-106`` (review B90-101, finding B1): at degree 1 with a world above 1,
+    a repair (review B90-101, finding B1): at degree 1 with a world above 1,
     ``tp_per_ep`` is the whole world, so a deferred geometry comes back and the bank's
     intermediate width is sharded across every rank. The old sentence named degree 1
     as the case that returns ``None``, which is the opposite of what the branch below
     computes.
 
     A SCALE GRID ANSWERS WITH ITS WEIGHT'S GEOMETRY, and that is
-    ``inc-glm53f-105``'s addition. A blockwise grid holds one value per weight
+    a later addition. A blockwise grid holds one value per weight
     tile, so it has no shard of its own to declare -- it is sharded if and only if
     its weight is, on the same dimension. The table therefore keeps one row per
     WEIGHT and a grid leaf is resolved back to it, rather than the table carrying
@@ -842,11 +842,11 @@ def _shard_geometry_for(
             return None
     if declared.width is None:
         # The two flags mean opposite things about an inadmissible width -- pad it up,
-        # or refuse it -- and since `inc-glm53f-112` round 2 they read TWO DIFFERENT
+        # or refuse it -- and since repair round 2 they read TWO DIFFERENT
         # NUMBERS, each from the producer that enforces it. The pad belongs to the
         # dense MLP and the shared expert, whose weights ``blockwise_fp8_mm``
         # dequantises at ``SCALE_BLOCK_SIZE``; the requirement belongs to the routed
-        # bank alone (``inc-glm53f-106``), whose scale operands the MoE retile builds
+        # bank alone, whose scale operands the MoE retile builds
         # at ``BLOCK_QUANT_SIZE``. Reading one number for both admitted a bank shard
         # the bank itself refuses later, inside its prep. Both are imported, never
         # typed here.
@@ -957,7 +957,7 @@ def _resolve_mla_head_size(text_config: Glm5NextTextConfig) -> int:
 
 # ---------------------------------------------------------------------------
 # ``Glm5NextQuantConfig`` / quant-method selection -- D14 owner:
-# ``inc-glm53f-023`` (M2, Lane B 1st). LANDED HERE.
+# the quant-config increment (M2, Lane B 1st). LANDED HERE.
 #
 # THE DISPATCHER GAP THIS CLOSES. ``quantization.py`` already parsed the
 # checkpoint's ``quantization_config`` into a ``QuantizationSpec`` carrying
@@ -970,15 +970,15 @@ def _resolve_mla_head_size(text_config: Glm5NextTextConfig) -> int:
 #
 # WHAT THIS SECTION DOES NOT DO, deliberately:
 #   * it does NOT attach itself to ``Glm5NextForConditionalGeneration`` -- that
-#     tree is ``-013``'s / ``-054``'s D14 section;
-#   * it does NOT reach a kernel; the MoE block-quant call site is ``-027``'s;
+#     tree is the skeleton's / the layer forward's D14 section;
+#   * it does NOT reach a kernel; the MoE block-quant call site is another increment's;
 #   * it does NOT name or import the vendor quantisation enum. There is no
 #     blockwise member in it at this pin and adding one is forbidden to this
 #     campaign (plan section 11, constraint B.6), so the route is D5(b)'s direct
 #     inner-kernel call and this class carries a plugin-side method object.
 #
 # Imports are FUNCTION-LOCAL rather than added to the module import block, for
-# two reasons: the import block is ``-013``'s D14 section and this increment
+# two reasons: the import block is the skeleton's D14 section and this increment
 # does not widen its surface into it; and it is the file family's own idiom --
 # ``llama3/quantization.py`` imports its modeling module inside
 # ``resolve_attention_mlp_classes`` for the same reason.
@@ -1068,30 +1068,30 @@ class Glm5NextQuantConfig:
 
 
 # ---------------------------------------------------------------------------
-# ``Glm5NextHyperConnection`` -- mHC wiring. D14 owner: ``inc-glm53f-030``
+# ``Glm5NextHyperConnection`` -- mHC wiring. D14 owner: the mHC increment
 # (M2, Lane B 6th, and Lane B's last).
 #
 # WHAT LANDS HERE, AND WHAT DELIBERATELY DOES NOT
 # -----------------------------------------------
-# The whole mHC layer: the pre block, ONE entry into ``inc-glm53f-028``'s
-# Sinkhorn seam, ONE entry into ``inc-glm53f-029``'s combine seam, and the
+# The whole mHC layer: the pre block, ONE entry into the
+# Sinkhorn seam, ONE entry into the combine seam, and the
 # residual plumbing between them. **Calling this layer from the decoder is NOT
 # here.** ``Glm5NextKDALayer`` and ``Glm5NextDSALayer`` are other increments'
-# D14 sections (``-038``, ``-051``), and D14's rule is to raise rather than
+# D14 sections, and D14's rule is to raise rather than
 # widen, so this increment stops at its own section boundary and the decoder
 # call site is left to those owners. :meth:`Glm5NextHyperConnection.forward` is
 # shaped as the seam they will call.
 #
 # NO WEIGHT-MAP FAMILY IS ADDED, and that is a lead ruling rather than an
 # omission. ``weight_loaders_fp8.py:88-89`` declared ``multi_hyper_connections``
-# absent here -- no settled leaf names -- until ``inc-glm53f-078`` read the real
+# absent here -- no settled leaf names -- until the map read the real
 # shard index and grounded it. This increment's acceptance is a synthetic
 # tiny case that builds these parameters in-test, so the map is not on its
 # route, and the checkpoint-leaf question stays a lead-owned open question for a
 # later design revision. ``weight_loaders_fp8.py`` is untouched.
 #
 # NO TOKEN TILING IS AUTHORED HERE, also a lead ruling, and after commit 5 none is
-# needed: the merged kernels tile the token axis themselves. ``-028``'s SQUARE kernel
+# needed: the merged kernels tile the token axis themselves. The SQUARE kernel
 # refused its ``M`` above ``PARTITION_MAX``; that path is not the one taken here,
 # ``sinkhorn.py:321-330`` is now the tile-height helper, and the only ``PARTITION_MAX``
 # refusal left is on ``block`` (``sinkhorn.py:344-349``). A host-side tiling loop and a
@@ -1107,7 +1107,7 @@ class Glm5NextHyperConnectionError(ValueError):
     here. Each seam already refuses its own extents by name
     (``sinkhorn.py:312-342``, ``hyper_connection.py:238-308``), and restating
     those bounds would create a second authority that can drift from the first
-    -- the same reason ``-033``'s route error checks only its own call site.
+    -- the same reason the shared-expert path's route error checks only its own call site.
     """
 
 
@@ -1122,9 +1122,9 @@ class Glm5NextHyperConnection(nn.Module):
        scale, and split the result into three heads: ``pre_mix`` (which folds
        the streams into the sub-block's single input), ``post_mix``, and the
        ``[S, S]`` per-token stream-mixing matrix. The mixing matrix is then
-       Sinkhorn-normalised by **``inc-glm53f-028``'s kernel**.
+       Sinkhorn-normalised by **the Sinkhorn kernel**.
     2. the caller's sub-block runs on the folded input.
-    3. **post** -- mix the streams back out by **``inc-glm53f-029``'s kernel**.
+    3. **post** -- mix the streams back out by **the combine kernel**.
 
     WHERE THE ARITHMETIC COMES FROM -- IT IS NOT CHOSEN HERE
     -------------------------------------------------------
@@ -1140,30 +1140,30 @@ class Glm5NextHyperConnection(nn.Module):
     THE ONE COMPOSITION QUESTION THIS SECTION HAD TO ANSWER, AND WHY IT NO
     LONGER NEEDS AN ANSWER HERE
     ----------------------------------------------------------------------
-    RE-GROUNDED BY ``inc-glm53f-030c``. The question was real and the answer
+    RE-GROUNDED BY A LANDED INCREMENT. The question was real and the answer
     below is kept as the record of it, not as a description of what this class
-    now does. ``-028``'s square seam normalises **one** ``[M, N]`` matrix while
+    now does. The square seam normalises **one** ``[M, N]`` matrix while
     the target needs **``T`` independent** ``[S, S]`` ones, and the route
     predicate declares the Sinkhorn seam is entered **exactly once per layer
-    call**. ``inc-glm53f-030`` reconciled the two with a **block-diagonal
+    call**. This section once reconciled the two with a **block-diagonal
     embedding**: the ``T`` little matrices scattered onto the diagonal of one
-    ``[T*S, T*S]`` matrix, so ``-028``'s column target ``M / N`` was exactly
+    ``[T*S, T*S]`` matrix, so the square seam's column target ``M / N`` was exactly
     ``1`` -- the target's own column target -- and the off-diagonal zeros stayed
     zero under multiplicative rescaling, which made every row sum and every
     column sum range over exactly one token's block.
 
     **THE MEASUREMENT THAT CHOSE IT STANDS, and it is why the record is kept
-    rather than deleted:** a flat ``[T*S, S]`` reshape lets ``-028``'s column
+    rather than deleted:** a flat ``[T*S, S]`` reshape lets the square seam's column
     pass sum ACROSS tokens, and ``probe-030-composition-algebra.out`` reads
     ``max_abs`` up to ``4.68e-01`` against the target for it, while the
     block-diagonal embedding reads ``8.99e-07`` with the off-block maximum
     exactly ``0.0``. Any future seam that flattens the token axis into the
     normalised matrix meets that ``4.68e-01`` again.
 
-    **WHAT ``inc-glm53f-028b`` THEN MADE UNNECESSARY.** It landed a second,
+    **WHAT THE SEAM'S NEXT ROUND THEN MADE UNNECESSARY.** It landed a second,
     BATCHED form of the seam, ``sinkhorn_normalise_blocks``, which takes
     ``[T, S, S]`` directly. So the reconciliation is no longer needed at all:
-    ``-030c`` calls that form from :meth:`mhc_pre`, and the embedding, the
+    this class calls that form from :meth:`mhc_pre`, and the embedding, the
     extraction and the ``[T*S, T*S]`` matrix are all gone. The route predicate
     is unchanged -- still exactly one dispatch per layer call -- and it now costs
     ``T * S * S`` values instead of ``(T*S)^2``: 128 KB of fp32 at 2048 tokens
@@ -1172,29 +1172,29 @@ class Glm5NextHyperConnection(nn.Module):
     written"*, is quoted rather than asserted: this class no longer calls it.
 
     Both the old form and the new one keep all of the Sinkhorn arithmetic inside
-    ``-028``'s kernels, so neither was ever authored numerics here.
+    the square seam's kernels, so neither was ever authored numerics here.
 
     TWO DIVERGENCES FROM THE BASE THAT THIS LAYER CANNOT REMOVE
     ----------------------------------------------------------
-    Both live inside ``-028``'s landed kernel, so both are recorded rather than
+    Both live inside the square seam's landed kernel, so both are recorded rather than
     repaired: the base adds ``hc_sinkhorn_eps`` to every Sinkhorn denominator
-    while ``-028`` adds an inert ``1e-30`` (``sinkhorn.py:148``), and the base's
+    while the square seam adds an inert ``1e-30`` (``sinkhorn.py:148``), and the base's
     schedule is ``softmax`` then one column pass then ``(R-1)`` row/column pairs
-    while ``-028``'s is ``R`` pairs starting with a row pass. Sinkhorn-Knopp has
+    while the square seam's is ``R`` pairs starting with a row pass. Sinkhorn-Knopp has
     one fixed point, so at the target's ``20`` iterations the gap is small --
     ``probe-030-layer-delta.out`` measures it using at most **3.2 %** of the
     declared tolerance budget, in exact double precision so the reading is the
     schedule-and-eps gap alone. The acceptance measures it again through the
     real kernels.
 
-    PRECISION: fp32 IN AND OUT, following ``-028`` and ``-029``
+    PRECISION: fp32 IN AND OUT, following both seams
     ---------------------------------------------------------
     The base's mHC takes bf16 and its own kernel test therefore compares at
     ``atol=5e-2``; this increment is declared at ``atol=1e-5``, three orders
     tighter, and bf16's ~3 decimal digits cannot express that difference. Both
     seams are fp32 in and fp32 out for exactly this reason, so this layer keeps
     fp32 across them and returns the seam's own dtype. Casting the result to the
-    decoder's residual dtype is the decoder's business, as ``-027`` and ``-033``
+    decoder's residual dtype is the decoder's business, as the block-quant call site and the shared-expert path
     both left it.
     """
 
@@ -1211,11 +1211,11 @@ class Glm5NextHyperConnection(nn.Module):
                 ``hc_eps`` (``config.py:225-227``).
             neuron_config: framework overrides. ``mhc_sinkhorn_iters`` and
                 ``mhc_eps`` (``neuron_config.py:194,197``) win when not
-                ``None``, which is the override contract ``-013``'s section note
+                ``None``, which is the override contract the skeleton's section note
                 for this class already stated.
             post_mult_value: the multiplier on the post gate. **Its default is
                 ``2.0``, which is the target model's own number**, and that is
-                ``inc-glm53f-030c`` correcting ``inc-glm53f-030``:
+                a later correction of this layer:
                 ``Glm5NextTextHyperConnection.forward`` computes
                 ``post = 2 * torch.sigmoid(post_w * post_scale + post_b)``
                 (``design/reference/modeling_glm5_next.py:284``, sha256
@@ -1228,7 +1228,7 @@ class Glm5NextHyperConnection(nn.Module):
                 layer produced was HALF the target's. No fork config field
                 carries the multiplier, so it stays a constructor argument
                 rather than an invented config default, and passing ``1.0``
-                explicitly is how ``-030c``'s failing control reproduces the
+                explicitly is how a later increment's failing control reproduces the
                 defect.
 
         TWO EPSILONS, EACH AT THE SITE THE TARGET MODEL PLACES IT. The pinned
@@ -1247,7 +1247,7 @@ class Glm5NextHyperConnection(nn.Module):
           the same config object (``config.py:256``, beside ``hc_eps`` at
           ``:262``).
 
-        WHAT ``inc-glm53f-030c`` CORRECTS HERE, and it is a correction of a
+        WHAT IS CORRECTED HERE, and it is a correction of a
         recorded claim rather than a re-opening. The bullet this replaces said
         of ``rms_eps``: "It reaches no mHC line: ``self.hc_eps`` and the three
         sites that consume it below are unchanged." **The target model
@@ -1306,7 +1306,7 @@ class Glm5NextHyperConnection(nn.Module):
         # `mhc_pre`'s RMS denominator. Read off the same config object as
         # `hc_eps` and deliberately NOT overridable by `neuron_config.mhc_eps`,
         # because it is the model's RMSNorm constant rather than an mHC dial
-        # (`reference:257`, `reference:216`; `inc-glm53f-030c`).
+        # (`reference:257`, `reference:216`).
         self.rms_eps = float(text_config.rms_norm_eps)
         self.post_mult_value = float(post_mult_value)
 
@@ -1320,16 +1320,16 @@ class Glm5NextHyperConnection(nn.Module):
         # that is the lead's ruling for this section: the declared acceptance is
         # a synthetic case whose test SETS these tensors. The three names are
         # the base's own ``mhc_pre`` argument names, taken rather than chosen,
-        # exactly as ``-029`` took its seam's signature -- they are THIS CLASS'S
+        # exactly as ``mhc_post`` took its seam's signature -- they are THIS CLASS'S
         # OWN SIGNATURE AND NOT MAP NAMES.
         #
-        # RE-GROUNDED BY ``inc-glm53f-082``. This note used to add "the weight
+        # RE-GROUNDED. This note used to add "the weight
         # map declares this family absent, so there is no map name to reserve",
-        # which ``inc-glm53f-078`` falsified: the map now emits six mHC names
+        # which the weight map falsified: the map now emits six mHC names
         # per layer (``MHC_LEAVES``). Those six are reserved FLAT ON THE LAYER
         # by ``Glm5NextKDALayer`` and ``Glm5NextDSALayer``, not here.
         #
-        # RE-GROUNDED AGAIN BY ``inc-glm53f-030d``. This note used to end "because
+        # RE-GROUNDED AGAIN. This note used to end "because
         # this class is not bound into a layer anywhere in this tree", and that
         # sentence is now false: :func:`_bind_hyper_connection_sites` builds two
         # instances per layer after the load and hands each one three of the six
@@ -1360,7 +1360,7 @@ class Glm5NextHyperConnection(nn.Module):
     def mhc_pre(
         self, residual: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """The base's ``mhc_pre``, with its Sinkhorn on ``-028b``'s BATCHED kernel.
+        """The base's ``mhc_pre``, with its Sinkhorn on the BATCHED kernel.
 
         Args:
             residual: ``[T, S, H]`` -- the ``S = hc_mult`` residual streams.
@@ -1373,24 +1373,24 @@ class Glm5NextHyperConnection(nn.Module):
             return ends ``layer_input.to(residual.dtype)``, the reference's
             form at ``reference:294``, so a bfloat16 carrier is handed
             bfloat16 and an fp32 fixture still gets fp32. The comment above
-            that line has said so since ``inc-glm53f-030``; only this
-            ``Returns`` was left behind, and ``inc-glm53f-030d`` commit 4f
+            that line has said so since the layer landed; only this
+            ``Returns`` was left behind, and a later commit 4f
             is where it caught up. ``comb_mix[t, i, j]`` weights input
             stream ``i`` into output stream ``j``, the base's convention and
-            the one ``-029``'s kernel reads.
+            the one the combine kernel reads.
 
-        THE TOKEN CEILING, AND WHICH SEAM NOW SETS IT. ``inc-glm53f-030c``
+        THE TOKEN CEILING, AND WHICH SEAM NOW SETS IT. A later increment
         replaced the note that stood here. It said the block-diagonal embedding
-        put ``T * S`` on the Sinkhorn's ``M``, that ``-028`` refused
+        put ``T * S`` on the Sinkhorn's ``M``, that the square kernel refused
         ``M > PARTITION_MAX``, and that this layer therefore served **32**
         tokens at ``hc_mult 4``. **Every clause of that is now false**, in two
-        steps: ``inc-glm53f-028b`` tiled the row axis and removed the ``M``
+        steps: the batched seam tiled the row axis and removed the ``M``
         refusal, which moved the bound to the square matrix's ``N``; and this
         increment stops building a square matrix at all. The Sinkhorn is called
         on ``[T, S, S]`` blocks, where ``N`` per block is ``S`` and
         :func:`_require_blocks_admissible` carries **no token bound**.
 
-        SO NO TOKEN CEILING IS LEFT ON THIS BRANCH. ``inc-glm53f-029b`` lifted
+        SO NO TOKEN CEILING IS LEFT ON THIS BRANCH. The combine kernel later lifted
         the last one and commit 5 of this increment merged it in, so the combine
         kernel bounds no token extent: tokens ride the PARTITION axis and the
         body walks that axis in tiles of ``nl.tile_size.pmax``, which makes
@@ -1429,7 +1429,7 @@ class Glm5NextHyperConnection(nn.Module):
         # ``mhc_pre_torch``, ``fn.shape[-1]`` in ``mhc_pre_ref`` -- and those are
         # the same number.
         # THE EPSILON HERE IS THE MODEL'S RMSNorm EPSILON, not the mHC one, and
-        # that is `inc-glm53f-030c` correcting `inc-glm53f-030`. The target builds
+        # that is a later correction of this layer. The target builds
         # this norm as `Glm5NextTextUnweightedRMSNorm(eps=config.rms_norm_eps)`
         # (`reference:257`) and applies it to the folded input before the
         # projection (`reference:278`); `self.rms_eps` is that constant. The
@@ -1446,7 +1446,7 @@ class Glm5NextHyperConnection(nn.Module):
         # the target's own asymmetry rather than an omission here:
         # `pre = torch.sigmoid(...) + self.hc_eps` (`reference:283`) against
         # `post = 2 * torch.sigmoid(...)` (`reference:284`), with no epsilon on
-        # the post term. `-030c`'s epsilon control reads that asymmetry directly:
+        # the post term. A later increment's epsilon control reads that asymmetry directly:
         # moving `hc_eps` must move `layer_input` and `comb_mix` and must leave
         # `post_mix` bit-identical.
         pre_mix = (
@@ -1471,14 +1471,14 @@ class Glm5NextHyperConnection(nn.Module):
         # line for line: ``comb = torch.softmax(comb_logits, dim=-1) +
         # self.hc_eps`` (``reference:286``), so this is the SECOND of the two
         # sites ``hc_eps`` belongs at. They sit OUTSIDE the seam because
-        # ``-028``'s kernel starts from an affinity matrix. This is elementwise
+        # The Sinkhorn kernel starts from an affinity matrix. This is elementwise
         # glue, which P13 leaves to torch.
         comb_start = torch.softmax(comb_logits, dim=-1) + self.hc_eps
 
-        # ---- ENTRY 1 of 1 into ``-028b``'s BATCHED Sinkhorn seam. -------- #
+        # ---- ENTRY 1 of 1 into the BATCHED Sinkhorn seam. ---------------- #
         # The counted dispatch, still exactly one for all ``T`` tokens.
         #
-        # `inc-glm53f-030c` moved this off the square form. It used to embed the
+        # This call was moved off the square form. It used to embed the
         # ``T`` blocks down the diagonal of a ``[T*S, T*S]`` matrix, normalise
         # that, and extract the diagonal blocks back out. The off-diagonal of
         # that matrix is all zero and a zero stays zero under row and column
@@ -1507,8 +1507,8 @@ class Glm5NextHyperConnection(nn.Module):
         # that is what the reference does (`:1291` reads `dtype = hidden_states.dtype`):
         # a bfloat16 carrier gets bfloat16 here and an fp32 fixture still gets fp32.
         #
-        # RE-GROUNDED BY ``inc-glm53f-030d`` (part (a), cast points; lead ruling §1060).
-        # This line is ``inc-glm53f-030``'s and the cast is the ONE byte of it this
+        # RE-GROUNDED (part (a), cast points; lead ruling §1060).
+        # This line is the layer's original and the cast is the ONE byte of it this
         # block changes, which the block's record states as a Surface widening rather
         # than leaving the next reader to find.
         layer_input = (pre_mix.unsqueeze(-1) * residual.to(torch.float32)).sum(dim=1)
@@ -1526,7 +1526,7 @@ class Glm5NextHyperConnection(nn.Module):
         post_layer_mix: torch.Tensor,
         comb_res_mix: torch.Tensor,
     ) -> torch.Tensor:
-        """The base's ``mhc_post``, on ``-029``'s kernel.
+        """The base's ``mhc_post``, on the combine seam's kernel.
 
         Args:
             x: ``[T, H]`` -- the sub-block's single-stream output.
@@ -1551,12 +1551,12 @@ class Glm5NextHyperConnection(nn.Module):
             hyper_connection_combine,
         )
 
-        # ---- ENTRY 1 of 1 into ``-029``'s combine seam. ------------------ #
+        # ---- ENTRY 1 of 1 into the combine seam. ------------------------- #
         # Argument names and order are the seam's, which are the base's, so this
         # is a call rather than a translation -- ``hyper_connection.py:375-376``
         # asks for exactly that.
         #
-        # RE-GROUNDED BY ``inc-glm53f-030d`` (cast points, lead ruling §1060). The
+        # RE-GROUNDED (cast points, lead ruling §1060). The
         # docstring used to say "fp32 -- the seam's own return dtype, not re-cast",
         # and leaving it that way is what put fp32 activations in front of a
         # bfloat16 kernel contract. The seam still takes fp32 in and still computes
@@ -1581,7 +1581,7 @@ class Glm5NextHyperConnection(nn.Module):
             residual: ``[T, S, H]`` residual streams.
             sublayer: the wrapped sub-block, a callable ``[T, H] -> [T, H]``.
                 Annotated ``object`` rather than ``Callable`` on purpose -- the
-                module-level import block is ``-013``'s D14 section, and ``-023``
+                module-level import block is the skeleton's D14 section, and the dispatcher
                 set the precedent that a later section adds nothing to it, so
                 every import in this section is function-local.
 
@@ -1589,7 +1589,7 @@ class Glm5NextHyperConnection(nn.Module):
             ``[T, S, H]`` IN THE STREAMS' OWN DTYPE -- the re-mixed streams.
             The "fp32" that stood here was stale for the same reason
             :meth:`mhc_pre`'s was. This method returns whatever
-            :meth:`mhc_post` returns, and ``inc-glm53f-030d`` commit 4 moved
+            :meth:`mhc_post` returns, and a later commit 4 moved
             that cast: :meth:`mhc_post` computes the mix in fp32 and returns
             ``mixed.to(residual.dtype)``, which its own ``Returns`` states.
 
@@ -1649,8 +1649,8 @@ class Glm5NextHyperConnection(nn.Module):
 
 # ---------------------------------------------------------------------------
 # ``Glm5NextMoEBlock`` and its two expert containers. D14 owners:
-# ``inc-glm53f-031`` (expert partitioning), ``-032`` (router call site),
-# ``-027`` (block-quant kernel call site), ``-033`` (shared-expert path) --
+# the expert-partitioning increment, the router call site,
+# the block-quant kernel call site, the shared-expert path --
 # all M2 Lane B, serialized because they share one class.
 # ---------------------------------------------------------------------------
 
@@ -1667,7 +1667,7 @@ class Glm5NextRoutedExperts(nn.Module):
     ``topk_method == "noaux_tc"`` (``weight_loaders_fp8.py:654-655``).
     """
 
-    # ── expert partitioning -- D14 owner: ``inc-glm53f-031`` ─────────────
+    # ── expert partitioning -- D14 section ─────────────
     #
     # WHAT THIS SECTION CLOSES. At the unmodified parent ``031535b`` this bank
     # reported ``num_routed_experts == 288`` and nothing else: it carried no
@@ -1680,12 +1680,12 @@ class Glm5NextRoutedExperts(nn.Module):
     # WHY THE ARITHMETIC IS IMPORTED RATHER THAN WRITTEN HERE. It lives in
     # ``factory.py``, which nothing on the arch-lookup path pulls the modeling
     # module into. The import is FUNCTION-LOCAL, following the landed
-    # ``inc-glm53f-023`` precedent in this file and for the same two reasons:
-    # this file's module import block is ``-013``'s D14 section, and the
+    # precedent in this file and for the same two reasons:
+    # this file's module import block is the skeleton's D14 section, and the
     # file family's own idiom is a local import at the consuming member.
     #
     # THE 288/64 REFUSAL IS GONE, AND IT WAS NEVER THE FORK'S RULE --
-    # ``inc-glm53f-087``. This paragraph used to say the refusal at the registered
+    # This paragraph used to say the refusal at the registered
     # tensor-parallel degree freeze of 64 was deliberate and visible, and that it
     # was campaign gap G4 surfaced where the model is built. That was wrong on the
     # only point that mattered: an expert bank divides by the EXPERT-PARALLEL
@@ -1712,13 +1712,13 @@ class Glm5NextRoutedExperts(nn.Module):
 
         self.num_routed_experts = int(text_config.n_routed_experts)
         self.num_experts_per_tok = int(text_config.num_experts_per_tok)
-        # ``_resolve_world_size()`` is ``-013``'s helper, called rather than
+        # ``_resolve_world_size()`` is the skeleton's helper, called rather than
         # edited: an explicit ``world_size`` is what a caller with a degree
         # supplies, and ``None`` means "read the process group", which is 1 when
         # this stack is built undistributed.
         #
         # ``tp_degree`` KEEPS ITS NAME AND ITS MEANING and simply stopped being
-        # the divisor (``inc-glm53f-087``): it is the tensor-parallel world size,
+        # the divisor: it is the tensor-parallel world size,
         # which is what shards the intermediate dimension.
         self.tp_degree = (
             _resolve_world_size() if world_size is None else int(world_size)
@@ -1732,7 +1732,7 @@ class Glm5NextRoutedExperts(nn.Module):
         # Uniform by the gate above, so rank 0's count is every rank's count.
         self.num_local_experts = self.expert_partition.counts[0]
         # THE CHECKPOINT'S SwiGLU BOUND -- hand-off item (v), ruled in scope for
-        # ``inc-glm53f-054a`` at DECISIONS 409.
+        # this bank at DECISIONS 409.
         #
         # The reference clamps the ROUTED bank, not only the MLP: its
         # ``Glm5NextTextExperts`` stores this bound at
@@ -1745,7 +1745,7 @@ class Glm5NextRoutedExperts(nn.Module):
         # bound of ``10.0`` and 42 MoE layers, with no shape moving and nothing
         # raising: the routed half of
         # ``B22-M1-shared-expert-swiglu-clamp-omitted``, whose SHARED half
-        # ``inc-glm53f-033`` repaired. Measured in
+        # is already repaired. Measured in
         # ``../../../artifacts/campaigns/glm-5.3-flash-port/increments/probe-054a-swiglu-clamp-r2.out``.
         #
         # IT REFUSES RATHER THAN DEFAULTING. A literal here would be a bound this
@@ -1782,15 +1782,15 @@ class Glm5NextRoutedExperts(nn.Module):
         """
         return self.expert_partition.local_expert_indices(rank)
 
-    # ── router call site -- D14 owner: ``inc-glm53f-032`` ────────────────
+    # ── router call site -- D14 section ────────────────
     #
     # SCOPE. This section adds ONE method and edits no line above it.
-    # ``__init__`` and ``local_expert_indices`` are ``inc-glm53f-031``'s landed
-    # code and ``forward`` is ``inc-glm53f-013``'s stub; all three stay
-    # byte-identical, so nothing ``-031``'s recorded acceptance asserts can move.
+    # ``__init__`` and ``local_expert_indices`` are the expert partitioning's landed
+    # code and ``forward`` is the skeleton's stub; all three stay
+    # byte-identical, so nothing its recorded acceptance asserts can move.
     #
     # WHY THE CONFIG IS AN ARGUMENT RATHER THAN STATE. The routing
-    # hyperparameters live on ``Glm5NextTextConfig``, and ``-031``'s ``__init__``
+    # hyperparameters live on ``Glm5NextTextConfig``, and the expert partitioning's ``__init__``
     # does not retain it. Adding a field would edit that landed ``__init__``, so
     # the config is threaded in at the call instead -- the smaller change, and
     # the one D14's section-ownership rule permits.
@@ -1798,8 +1798,8 @@ class Glm5NextRoutedExperts(nn.Module):
     # WHAT THIS SITE DOES NOT DO. It returns GLOBAL expert indices over all
     # ``n_routed_experts``, exactly as the checkpoint's router does. Mapping
     # those onto this rank's ``expert_partition`` slice is the DISPATCH step,
-    # and it belongs to the block-quant call site (``-027``) and the
-    # shared-expert path (``-033``). Doing it here would put two owners on one
+    # and it belongs to the block-quant call site and the
+    # shared-expert path. Doing it here would put two owners on one
     # behaviour.
     #
     # ``rms_norm_eps`` IS THE CONFIG'S, MEASURED NOT ASSUMED. The earlier note
@@ -1808,7 +1808,7 @@ class Glm5NextRoutedExperts(nn.Module):
     # ``fixtures/config.json`` carried an ``rms_norm_eps`` -- but the conclusion
     # drawn from them, that the substrate's own ``eps=1e-6`` was the only value
     # available, is refuted by the checkpoint: its ``text_config`` carries
-    # ``rms_norm_eps = 1e-05``. ``inc-glm53f-080`` adds the field and
+    # ``rms_norm_eps = 1e-05``. The config change adds the field and
     # re-transcribes the fixture, so this method resolves the epsilon from the
     # config it already receives and hands THAT number to the seam. ``eps``
     # stays a parameter so a caller can still override it; a caller that passes
@@ -1852,9 +1852,9 @@ class Glm5NextRoutedExperts(nn.Module):
         if eps is None:
             eps = float(text_config.rms_norm_eps)
 
-        # Function-local import, following the landed ``inc-glm53f-023`` and
-        # ``-031`` precedent in this file: this file's module import block is
-        # ``-013``'s D14 section.
+        # Function-local import, following the landed
+        # precedent in this file: this file's module import block is
+        # the skeleton's D14 section.
         from vllm_neuron.functional.moe.router import (
             noaux_tc_rmsnorm_router_topk,
         )
@@ -1873,15 +1873,15 @@ class Glm5NextRoutedExperts(nn.Module):
         )
         return logits, expert_index, expert_affinities
 
-    # ── block-quant kernel call site -- D14 owner: ``inc-glm53f-027`` ─────
+    # ── block-quant kernel call site -- D14 section ─────
     #
     # SCOPE. This section adds ONE method and edits no line above or below it.
-    # ``__init__`` and ``local_expert_indices`` are ``inc-glm53f-031``'s landed
-    # code, ``route_tokens`` is ``inc-glm53f-032``'s, and ``forward`` is
-    # ``inc-glm53f-013``'s stub; all four stay byte-identical, so nothing any
+    # ``__init__`` and ``local_expert_indices`` are the partitioning section's landed
+    # code, ``route_tokens`` is the router section's, and ``forward`` is
+    # the skeleton's stub; all four stay byte-identical, so nothing any
     # of those three recorded acceptances asserts can move. The method sits on
     # ``Glm5NextRoutedExperts`` rather than on ``Glm5NextMoEBlock`` under D14's
-    # sub-class rule -- the same reading ``-032`` landed for the sibling
+    # sub-class rule -- the same reading the router call site landed for the sibling
     # router-call-site row, and for the same reason: the routed bank is where
     # the expert weights and the partition live.
     #
@@ -1891,7 +1891,7 @@ class Glm5NextRoutedExperts(nn.Module):
     # Both routes consume the same device mapping and emit FP32 contributions.
     #
     # NO QUANTISATION ENUM MEMBER IS NAMED OR ADDED (plan section 11 constraint
-    # B.6, and the ``-023`` section above already declares the same negative).
+    # B.6, and the dispatcher section above already declares the same negative).
     # The route is selected by WHICH FUNCTION IS CALLED, and the not-block-quant
     # branch RAISES BY NAME rather than falling through to the substrate's
     # ``QuantizationType.NONE`` default (``functional/mlp.py:81``, ``:249`` --
@@ -1900,29 +1900,29 @@ class Glm5NextRoutedExperts(nn.Module):
     # exclude exactly that silent fallback; the raise makes it IMPOSSIBLE rather
     # than merely detectable.
     #
-    # WHY THE WEIGHTS, SCALES AND CONFIG ARE ARGUMENTS. ``-031``'s ``__init__``
+    # WHY THE WEIGHTS, SCALES AND CONFIG ARE ARGUMENTS. The expert partitioning's ``__init__``
     # declares ``gate_proj_weight`` / ``up_proj_weight`` / ``down_proj_weight``
     # by ``register_parameter(name, None)`` and NO scale parameter, and it
     # retains no config. So there is no landed layout to read: the fused
     # ``[E, H, 2, I_TP]`` gate/up tensor the kernel needs is not the
     # checkpoint's per-projection storage, and turning one into the other is the
     # weight loader's step, not this section's. Adding fields to that landed
-    # ``__init__`` would edit ``-031``'s code, which D14's section-ownership
+    # ``__init__`` would edit the expert partitioning's code, which D14's section-ownership
     # rule does not permit here, so everything this site consumes is threaded in
-    # at the call -- the smaller change, and ``-032``'s own precedent for the
+    # at the call -- the smaller change, and the router call site's own precedent for the
     # config argument. What IS read off ``self`` is the partition
-    # (``num_local_experts``, ``num_experts_per_tok``), which is what ``-031``
+    # (``num_local_experts``, ``num_experts_per_tok``), which is what the expert partitioning
     # landed this bank to carry.
     #
     # WHAT THIS SITE DOES NOT DO, deliberately: it does not touch the shared
-    # expert (``-033``), it authors no numerics of its own (``-025``'s kernel and
-    # ``-024``'s retile producer own those), it does not fuse or transpose
+    # expert, it authors no numerics of its own (the block-quant kernel and
+    # the retile producer own those), it does not fuse or transpose
     # checkpoint tensors, and it does not assemble the layer forward
-    # (``-013`` / ``-054``). It reuses ``build_blockwise_mapping`` (F9) for the
+    # (another increment's). It reuses ``build_blockwise_mapping`` (F9) for the
     # token-block mapping rather than re-deriving one.
     #
-    # Imports are FUNCTION-LOCAL, following the landed ``-023``, ``-031`` and
-    # ``-032`` precedent in this file: the module import block is ``-013``'s D14
+    # Imports are FUNCTION-LOCAL, following the landed
+    # precedent in this file: the module import block is the skeleton's D14
     # section. The two ``to_kernel_scale_layout`` helpers in this campaign have
     # THE SAME NAME AND DIFFERENT SIGNATURES
     # (``functional/blockwise_fp8_mm.py:309`` takes ``(weight_scale, rows,
@@ -1966,7 +1966,7 @@ class Glm5NextRoutedExperts(nn.Module):
                 returns: the gate weight at each selected expert's column and
                 zero elsewhere. THIS SITE DOES THE GLOBAL-TO-LOCAL MAPPING, so
                 the caller hands the router's output straight through and slices
-                nothing. ``inc-glm53f-032``'s landed note above assigns the step
+                nothing. The router's landed note above assigns the step
                 here in those words. Until repair batch R5 this parameter was
                 documented as ``[T, E_local]`` and the extent check enforced
                 that, which no caller could satisfy from ``route_tokens`` at any
@@ -1976,7 +1976,7 @@ class Glm5NextRoutedExperts(nn.Module):
                 over, makes the slice an INPUT of the captured graph, so every
                 rank shares one graph; a python int keeps it a constant of the
                 trace, and either form is selected by name. It is an argument rather
-                than an attribute because ``__init__`` is ``inc-glm53f-031``'s
+                than an attribute because ``__init__`` is already
                 landed code and this section edits no line above itself. The
                 default 0 is the only rank that exists at degree 1.
             gate_up_proj_weight: ``[E_local, H, 2, I_TP]`` fp8-e4m3, the
@@ -2009,7 +2009,7 @@ class Glm5NextRoutedExperts(nn.Module):
             ``[T, H]`` -- the padding-token row is sliced off. The dtype is the
             seam's own (``bfloat16`` on the NKI route) and is not re-cast here:
             the layer forward decides the residual dtype and that is
-            ``inc-glm53f-054``'s section.
+            the layer forward's section.
 
         Raises:
             Glm5NextBlockQuantRouteError: when ``quant_config`` resolved no
@@ -2130,9 +2130,9 @@ class Glm5NextRoutedExperts(nn.Module):
                 f"{tuple(down_proj_weight.shape)}"
             )
         # ---- THE DISPATCH STEP. Global router columns -> this rank's slice.  #
-        # ``inc-glm53f-032``'s landed note above says in its own words that
+        # The router call site's landed note above says in its own words that
         # mapping global expert indices onto this rank's ``expert_partition``
-        # slice "belongs to the block-quant call site (``-027``)". Until repair
+        # slice "belongs to the block-quant call site". Until repair
         # batch R5 this site did the opposite: it REFUSED the global form, so
         # nothing could feed it from ``route_tokens`` above degree 1 and the MoE
         # path could not run on more than one rank. Finding ``B21-027``.
@@ -2341,7 +2341,7 @@ class Glm5NextRoutedExperts(nn.Module):
         # padded positions computed, and no real token indexes it.
         return accumulated[:tokens].to(hidden_states.dtype)
 
-    # ── load-time operand prep -- hand-off item (i) of ``inc-glm53f-054a`` ──
+    # ── load-time operand prep -- hand-off item (i) ──
     #
     # ``block_quant_expert_mm`` consumes one packed weight bank and one packed
     # scale bank. The checkpoint supplies three weights and three matching
@@ -2488,7 +2488,7 @@ class Glm5NextRoutedExperts(nn.Module):
             )
         return prepared[name]
 
-    # ── the bank's forward -- ``inc-glm53f-054a`` item 2 of 7 ────────────
+    # ── the bank's forward -- item 2 of 7 ────────────
     #
     # WHAT THIS METHOD IS: the composition, and nothing else. Every piece it
     # needs is already landed. ``block_quant_expert_mm`` above does the route
@@ -2502,7 +2502,7 @@ class Glm5NextRoutedExperts(nn.Module):
     #
     # WHY THE AFFINITIES ARE AN ARGUMENT RATHER THAN ROUTED HERE. ``route_tokens``
     # above returns the GLOBAL router columns and needs the router norm's gamma
-    # and the text config, neither of which this bank retains -- ``-032``'s own
+    # and the text config, neither of which this bank retains -- the router call site's own
     # section note records that the config is threaded in at the call for exactly
     # that reason. Routing inside this method would make it need both and would
     # put the router's call site in two places. The MoE block's forward is where
@@ -2566,7 +2566,7 @@ class Glm5NextRoutedExperts(nn.Module):
         )
 
 
-# ``inc-glm53f-027``'s named refusal, at module level because an exception a
+# The block-quant route's named refusal, at module level because an exception a
 # caller catches belongs in the module namespace and not nested in the class
 # that raises it. It is the second and last hunk of this increment in this file,
 # and it is a pure insertion: no line of ``Glm5NextRoutedExperts`` above it or
@@ -2591,11 +2591,11 @@ class Glm5NextSharedExperts(nn.Module):
         super().__init__()
         self.num_shared_experts = int(text_config.n_shared_experts)
         # The checkpoint's SwiGLU bound, resolved HERE and not at the call.
-        # ``inc-glm53f-033`` repair round 2. The reference clamps both MLP
+        # Since repair round 2. The reference clamps both MLP
         # projections with this value before their product
         # (``modeling_glm5_next.py:102-104``), so the bound is a model value like
         # any other and belongs on the object the config builds. This is the same
-        # construction-time read ``inc-glm53f-080`` made for the decoder's
+        # construction-time read the config change made for the decoder's
         # epsilon in ``Glm5NextKDAAttention.__init__``, on the same kind of
         # scalar, one line below the read this method already made for
         # ``n_shared_experts``.
@@ -2604,9 +2604,9 @@ class Glm5NextSharedExperts(nn.Module):
             self, "gate_proj_weight", "up_proj_weight", "down_proj_weight"
         )
 
-    # ── shared-expert path -- D14 owner: ``inc-glm53f-033`` ───────────────
+    # ── shared-expert path -- D14 section ───────────────
     #
-    # SCOPE. This section adds ONE method, and ``forward`` below is ``-013``'s
+    # SCOPE. This section adds ONE method, and ``forward`` below is the skeleton's
     # stub and stays byte-identical.
     #
     # ``__init__`` ABOVE IS NO LONGER BYTE-IDENTICAL, and the reason is recorded
@@ -2625,20 +2625,20 @@ class Glm5NextSharedExperts(nn.Module):
     # and neither child owns the other.
     #
     # THE COUNT IS 3, AND IT IS WHY THE STRUCTURE BELOW IS THREE CALLS. The
-    # route predicate (plan L934-935, revision 33) reads ``-026``'s dispatch
+    # route predicate (plan L934-935, revision 33) reads the block-quant seam's dispatch
     # counter as EXACTLY 3 -- one per projection site -- per shared-expert call.
     # Three sequential entries into ``blockwise_fp8_mm`` is therefore the
     # criterion and not an implementation convenience: a reading of 3 proves all
     # three projections crossed the block-quant seam, so no projection can
     # silently reach the substrate's non-blockwise MLP path and ignore the block
-    # scales, and a bypassed projection reads 2 and fails. ``-033`` attempt 1
+    # scales, and a bypassed projection reads 2 and fails. The first attempt
     # measured why the earlier declared ``1`` was structurally unreachable
     # (``increments/evidence-033.md``): ``silu`` is non-linear, so ``down``
     # cannot fold into either predecessor, and ``blockwise_fp8_mm`` takes a 2-D
     # weight and adds exactly ``+1`` per invocation at a single unlooped site.
     #
     # NO FUSION IS AUTHORED (plan L938 and the Substrate bullet's own words).
-    # ``-013`` landed ``gate_proj_weight``, ``up_proj_weight`` and
+    # The skeleton landed ``gate_proj_weight``, ``up_proj_weight`` and
     # ``down_proj_weight`` as THREE UNFUSED parameters, matching the weight map
     # (``weight_loaders_fp8.py:481-489``) and the fork's own dense precedent
     # (``Glm5NextDenseMLP`` below: "Gate and up stay **separate** parameters").
@@ -2646,17 +2646,17 @@ class Glm5NextSharedExperts(nn.Module):
     # scale-grid concatenation this increment may not author, and it would read
     # 2 rather than the declared 3.
     #
-    # WHY THE WEIGHTS AND SCALES ARE ARGUMENTS -- ``-027``'s measured shape
+    # WHY THE WEIGHTS AND SCALES ARE ARGUMENTS -- the block-quant call site's measured shape
     # contract (``increments/evidence-027.md`` §2.3), inherited rather than
-    # re-litigated. ``-013``'s ``__init__`` declares the three projections by
+    # re-litigated. The skeleton's ``__init__`` declares the three projections by
     # ``register_parameter(name, None)`` and NO scale parameter. Producing the
     # block scales is the weight loader's step, not this section's, so every
     # WEIGHT-LOADER PRODUCT this site consumes is threaded in at the call --
-    # ``-032``'s and ``-027``'s precedent for the quant-config argument.
-    # **`inc-glm53f-090` NARROWS THE SENTENCE ABOVE and does not delete it: the
+    # the router and block-quant call sites' precedent for the quant-config argument.
+    # **THE LOAD-TIME OPERAND STEP NARROWS THE SENTENCE ABOVE and does not delete it: the
     # public grids are still threaded in at a call, but the DERIVED KERNEL
     # OPERAND is built from them once and held on this module. See the
-    # `-090` paragraph below, which states the new rule in full.**
+    # load-time prep paragraph below, which states the new rule in full.**
     #
     # THE SWIGLU BOUND IS NOT ONE OF THOSE, and the distinction is the whole
     # reason it moved in round 2. A block scale is produced per checkpoint load
@@ -2673,16 +2673,16 @@ class Glm5NextSharedExperts(nn.Module):
     # takes ``(consumer_scales, num_experts, rows, cols, projection)``).
     # ``blockwise_fp8_mm`` applies the dense one ITSELF at
     # ``blockwise_fp8_mm.py:491``, so this site passes the public
-    # ``[K//128, N//128]`` grid -- the checkpoint's own, since ``inc-glm53f-112`` --
+    # ``[K//128, N//128]`` grid -- the checkpoint's own, since the block narrowed --
     # and imports neither: the disambiguation hazard is removed rather than
     # navigated.
-    # **`inc-glm53f-090` REVERSES THE PARAGRAPH ABOVE. The dense helper IS now
+    # **``prepare_scale_operands`` REVERSES THE PARAGRAPH ABOVE. The dense helper IS now
     # imported here, by ``prepare_scale_operands`` below, and the seam applies it
     # itself ONLY when no prebuilt operand arrives. The disambiguation hazard is
     # therefore navigated rather than removed, and it is navigated explicitly:
     # the import names its module in full and sits next to this note.**
     #
-    # ── `inc-glm53f-090`: WHERE THE SCALE OPERAND IS BUILT ────────────────────
+    # ── WHERE THE SCALE OPERAND IS BUILT ────────────────────
     #
     # WHY IT MOVED, measured rather than preferred. ``to_kernel_scale_layout``
     # allocates and then scatters ONE ELEMENT AT A TIME
@@ -2702,7 +2702,7 @@ class Glm5NextSharedExperts(nn.Module):
     # operand cannot stand in for it.
     #
     # WHY A CACHE INSIDE THE BRIDGE WAS NOT THE REMEDY, and this is measured too:
-    # ``-076`` r1 tried exactly that and the capture route refused it -- a dict
+    # An earlier attempt tried exactly that and the capture route refused it -- a dict
     # keyed on a traced tensor is not expressible on the traced path, and the
     # capture route feeds ``meta`` tensors, which carry no values to key on
     # (``increments/evidence-076-r1.md`` §3). The operand has to arrive as a graph
@@ -2716,9 +2716,9 @@ class Glm5NextSharedExperts(nn.Module):
     # still compared against ``(rows, cols)`` before it is ever flattened, once
     # per load instead of once per forward step.
     #
-    # Imports are FUNCTION-LOCAL, following the landed ``-023``, ``-031``,
-    # ``-032`` and ``-027`` precedent in this file: the module import block is
-    # ``-013``'s D14 section.
+    # Imports are FUNCTION-LOCAL, following the landed
+    # precedent in this file: the module import block is
+    # the skeleton's D14 section.
 
     #: Where :meth:`prepare_scale_operands` leaves its three operands. A class
     #: attribute for the same reason ``PREPARED_WEIGHTS_ATTR`` is one on the
@@ -2733,24 +2733,24 @@ class Glm5NextSharedExperts(nn.Module):
 
     #: Where :meth:`retile_checkpoint_scale_grids` records what it published per
     #: projection, and which projections it left alone. It recorded what the
-    #: coarsening cost until ``inc-glm53f-112`` removed the coarsening; the three
+    #: coarsening cost until the block narrowing removed the coarsening; the three
     #: producer counters remain in the record, reading zero by absence. This
     #: block's acceptance reads it; no consumer does.
     SHARED_RETILE_HEALTH_ATTR = "_shared_expert_retile_health"
 
-    # ── the load-path grid publish -- ``inc-glm53f-054a`` hand-off item (iv),
-    #    and the retile it used to be, removed by ``inc-glm53f-112`` ─────
+    # ── the load-path grid publish -- hand-off item (iv),
+    #    and the retile it used to be, removed by the block narrowing ─────
     #
     # WHAT IT FIXED, AND WHY THE FIX IS NOW SMALLER. The checkpoint stores one scale
     # per ``128 x 128`` tile. :meth:`prepare_scale_operands` above used to consume a
     # PUBLIC grid of one scale per ``256 x 256`` block, because that is what the
     # dense kernel indexed, and nothing on this module's load path bridged the two:
     # a real load reached the prep with a ``(4, 2)`` grid where it wanted ``(2, 1)``
-    # and refused. ``inc-glm53f-101`` attempt 2 recorded that refusal by name
+    # and refused. The second load attempt recorded that refusal by name
     # (``BlockwiseFp8MmError: weight_scale has shape (4, 2), expected (2, 1) for a
     # [K=512, N=256] weight``) and DECISIONS §84 placed the bridge here.
     #
-    # ``inc-glm53f-112`` REMOVED THE GAP RATHER THAN THE BRIDGE'S ARITHMETIC. The
+    # THE BLOCK NARROWING REMOVED THE GAP RATHER THAN THE BRIDGE'S ARITHMETIC. The
     # kernel now indexes the ``128`` tiles the checkpoint already stores, so the
     # grid the loader delivers is the grid the prep wants and there is nothing to
     # coarsen. The step below publishes it and transposes it; it rescales no weight.
@@ -2771,7 +2771,7 @@ class Glm5NextSharedExperts(nn.Module):
     # ``n_shared_experts=0`` (``_stacked_config``, ``_shard_config``,
     # ``_grid_shard_config`` -- ``_shard_config``'s docstring records why) or is
     # all-dense and so builds no MoE block at all (``_dense_config``). The two
-    # fixtures that DO build this module both refuse today, and ``-101``'s records
+    # fixtures that DO build this module both refuse today, and a later increment records
     # the flip in its own words. So no green load changes what it reports.
     #
     # THE SKIP IS RECORDED, NEVER SILENT. A weight whose extents are not whole
@@ -2782,14 +2782,14 @@ class Glm5NextSharedExperts(nn.Module):
     def retile_checkpoint_scale_grids(self) -> int:
         """Publish this module's grids at the kernel's granularity and set the frame.
 
-        ``inc-glm53f-054a`` repair round 1 moved the body into
+        The first repair round moved the body into
         :func:`_publish_compute_frame_operands`, which the dense MLP now shares,
         and added a second step there: each weight and its grid are transposed ONCE
         into the frame ``blockwise_fp8_mm`` multiplies in. Before that repair this
         method left the loader's own frame in place and :meth:`shared_expert_mm`
         refused it at layer 0 of a real load.
 
-        THE NAME IS NOW A MISNOMER, KEPT ON PURPOSE. Since ``inc-glm53f-112`` the
+        THE NAME IS NOW A MISNOMER, KEPT ON PURPOSE. Since the block narrowing the
         dense kernel indexes the checkpoint's own ``128``-tile grid, so nothing is
         coarsened here and no weight byte is rescaled: the step publishes what the
         loader delivered. The method name is landed API -- five landed test call
@@ -2823,7 +2823,7 @@ class Glm5NextSharedExperts(nn.Module):
     ) -> int:
         """Build the three kernel scale operands ONCE. Returns how many.
 
-        `inc-glm53f-090`. The seam's bridge scatters one element at a time, so
+        The seam's bridge scatters one element at a time, so
         building the operand inside the per-forward path costs 128 device writes
         per projection at this campaign's dense geometry. A block scale is a
         weight-loader product that never changes after a load, so the operand it
@@ -2838,7 +2838,7 @@ class Glm5NextSharedExperts(nn.Module):
             up_proj_weight: ``[H, I]`` fp8-e4m3.
             down_proj_weight: ``[I, H]`` fp8-e4m3.
             gate_proj_scale: ``[H//128, I//128]`` fp32 -- the checkpoint's own grid,
-                which since ``inc-glm53f-112`` is the grid the kernel indexes.
+                which is now the grid the kernel indexes.
             up_proj_scale: the same, for ``up_proj_weight``.
             down_proj_scale: ``[I//128, H//128]`` fp32, for ``down_proj_weight``.
 
@@ -2922,7 +2922,7 @@ class Glm5NextSharedExperts(nn.Module):
         down_proj_scale: torch.Tensor,
         quant_config: Glm5NextQuantConfig,
     ) -> torch.Tensor:
-        """Run the always-on shared expert through ``-026``'s dense block GEMM.
+        """Run the always-on shared expert through the dense block GEMM.
 
         The SwiGLU the checkpoint stores, **and it clamps both projections before
         the product**: ``down(silu(min(gate(x), L)) * clip(up(x), -L, L))``, where
@@ -2940,7 +2940,7 @@ class Glm5NextSharedExperts(nn.Module):
                 positive count: the seam tiles ``M`` over the PSUM partition axis
                 and does not pad (``blockwise_fp8_mm.py:239-245``), so THIS
                 METHOD pads to a whole ``TILE_SIZE`` and slices the result back
-                before returning (`inc-glm53f-026b`). A ``T`` that is already a
+                before returning. A ``T`` that is already a
                 whole tile is not copied.
             gate_proj_weight: ``[H, I]`` fp8-e4m3, expressed against
                 ``gate_proj_scale``.
@@ -2949,7 +2949,7 @@ class Glm5NextSharedExperts(nn.Module):
             gate_proj_scale: ``[H//128, I//128]`` fp32, the block-scale grid
                 :func:`~vllm_neuron.functional.blockwise_fp8_mm.scale_grid_shape`
                 declares -- one scale per ``128 x 128`` weight block, which since
-                ``inc-glm53f-112`` is the checkpoint's own grid.
+                the block narrowing is the checkpoint's own grid.
             up_proj_scale: the same, for ``up_proj_weight``.
             down_proj_scale: ``[I//128, H//128]`` fp32, for ``down_proj_weight``.
             quant_config: the resolved per-model quantisation policy, and the
@@ -2967,7 +2967,7 @@ class Glm5NextSharedExperts(nn.Module):
         Returns:
             ``[T, H]`` **fp32** -- the seam's own return dtype, not re-cast here.
             The layer forward decides the residual dtype and that is
-            ``inc-glm53f-054``'s section, exactly as ``-027`` left it.
+            a later increment's section, exactly as the block-quant call site left it.
 
         Raises:
             Glm5NextSharedExpertRouteError: when ``quant_config`` resolved no
@@ -2982,7 +2982,7 @@ class Glm5NextSharedExperts(nn.Module):
         from vllm_neuron.functional.moe.blockwise_fp8_retile import TILE_SIZE
 
         # ---- ROUTE SELECTION. The certifying component (D1.4). ----------- #
-        # Same shape as ``-027``'s: the route is selected by WHICH FUNCTION IS
+        # Same shape as the block-quant call site's: the route is selected by WHICH FUNCTION IS
         # CALLED and the not-block-quant branch RAISES BY NAME, so it cannot
         # fall through to the substrate's ``QuantizationType.NONE`` default
         # (``functional/mlp.py:81``, ``:249`` -- a default reached by OMISSION).
@@ -3002,7 +3002,7 @@ class Glm5NextSharedExperts(nn.Module):
             raise Glm5NextSharedExpertRouteError(
                 f"quant_config declares weight_block_size={block_shape!r}; this "
                 f"route consumes the checkpoint's own ({TILE_SIZE}, {TILE_SIZE}) "
-                f"blocks directly -- since inc-glm53f-112 the dense kernel "
+                f"blocks directly -- the dense kernel "
                 f"indexes at that granularity and nothing is retiled -- and has "
                 f"no path for any other checkpoint block shape."
             )
@@ -3015,7 +3015,7 @@ class Glm5NextSharedExperts(nn.Module):
         # (``_require_blocked``), and repeating those would create a second
         # authority that can drift from the first.
         #
-        # `inc-glm53f-090` CORRECTED THE K-MISMATCH CITE, and it was already
+        # THIS INCREMENT CORRECTED THE K-MISMATCH CITE, and it was already
         # wrong before this increment: it read line 420, which at `0880c8f` was
         # the docstring's closing quotes and not a refusal at all -- the check
         # has always been two lines below. This increment's insert then moved
@@ -3049,7 +3049,7 @@ class Glm5NextSharedExperts(nn.Module):
                 f"shape {tuple(down_proj_weight.shape)}"
             )
 
-        # ---- PAD TO A WHOLE TILE. `inc-glm53f-026b`. ---------------------- #
+        # ---- PAD TO A WHOLE TILE. ---------------------- #
         # The pad is created here, consumed by the three dispatches below and
         # removed at the single return, so it never leaves this call: nothing
         # outside can observe it and no state can be advanced by it. The extent
@@ -3059,7 +3059,7 @@ class Glm5NextSharedExperts(nn.Module):
 
         # ---- The three projection sites. The counted seam entries. ------- #
         # Each passes the operand ``prepare_scale_operands`` built at load time,
-        # by keyword (`inc-glm53f-090`). The public grid is still passed too: the
+        # by keyword. The public grid is still passed too: the
         # seam's torch-oracle fallback consumes it, and the prebuilt operand
         # cannot stand in for it. The dispatch count is untouched at 3 -- this
         # changes what each entry CARRIES, not how many entries there are.
@@ -3110,7 +3110,7 @@ class Glm5NextSharedExperts(nn.Module):
         # required argument because `Glm5NextTextConfig` did not model the key at
         # all; round 2 lifted the field (`config.py`'s `swiglu_limit`, defaulting
         # to the checkpoint's own `10.0`) and moved the read to construction, so a
-        # production caller resolves nothing and `inc-glm53f-054` will find this
+        # production caller resolves nothing and the layer forward will find this
         # method needing only its operands. Reading it off `self` also removes the
         # last way a caller could hand this path a bound the checkpoint never
         # declared. See `increments/evidence-033-r2.md`.
@@ -3130,7 +3130,7 @@ class Glm5NextSharedExperts(nn.Module):
         # cast back to the activation dtype. The cast is named rather than
         # implicit because it is a real precision step and the acceptance's torch
         # reference mirrors it at the same point.
-        # ENTRY 3 of 3 -- down. The slice back is `-026b`'s, and it is the last
+        # ENTRY 3 of 3 -- down. The slice back is the dense pad increment's, and it is the last
         # thing that happens: the caller receives its own row count, never the
         # padded one.
         return _unpad_rows(
@@ -3143,7 +3143,7 @@ class Glm5NextSharedExperts(nn.Module):
             tokens,
         )
 
-    # ── the shared expert's forward -- ``inc-glm53f-054a`` item 3 of 7 ────
+    # ── the shared expert's forward -- item 3 of 7 ────
     #
     # WHAT THIS METHOD IS: the operand lookup, and nothing else.
     # :meth:`shared_expert_mm` above is the whole compute path and is landed and
@@ -3211,7 +3211,7 @@ class Glm5NextSharedExperts(nn.Module):
     def scale_route_operands(self) -> tuple[torch.Tensor, ...]:
         """The six operands the shared route takes: three weights, then three grids.
 
-        ``inc-glm53f-054a``. ONE definition of the lookup, because two callers
+        ONE definition of the lookup, because two callers
         need it: this module's own :meth:`forward` above, and
         :meth:`Glm5NextMoEBlock.forward`, which must hand the same six to the
         landed :meth:`Glm5NextMoEBlock.combine_routed_and_shared` -- the single
@@ -3250,7 +3250,7 @@ class Glm5NextSharedExperts(nn.Module):
                     f"each declared weight, and this route consumes the grid at "
                     f"blockwise_fp8_mm.SCALE_BLOCK_SIZE granularity that "
                     f"retile_checkpoint_scale_grids publishes -- the checkpoint's "
-                    f"own, since `inc-glm53f-112`, and NOT the routed bank's "
+                    f"own, and NOT the routed bank's "
                     f"larger block. Refusing rather "
                     f"than running an unscaled matmul, which returns plausible "
                     f"numbers."
@@ -3260,8 +3260,8 @@ class Glm5NextSharedExperts(nn.Module):
         return (*weights, *grids)
 
 
-# ``inc-glm53f-033``'s named refusal, at module level for the same reason
-# ``-027``'s is: an exception a caller catches belongs in the module namespace
+# The shared-expert path's named refusal, at module level for the same reason
+# the block-quant call site's is: an exception a caller catches belongs in the module namespace
 # and not nested in the class that raises it. It is a pure insertion between two
 # classes -- no line of ``Glm5NextSharedExperts`` above it or
 # ``Glm5NextMoEBlock`` below it moves.
@@ -3288,11 +3288,11 @@ class Glm5NextMoEBlock(nn.Module):
         ep_degree: int | None = None,
     ) -> None:
         super().__init__()
-        # ``world_size`` is a trailing optional addition by ``inc-glm53f-031``,
+        # ``world_size`` is a trailing optional addition,
         # threaded to the routed bank only. ``_build_mlp``'s call site is
         # unchanged and stays outside this increment's surface.
         #
-        # ``ep_degree`` is the same shape, added by ``inc-glm53f-087``: also
+        # ``ep_degree`` is the same shape, added later: also
         # trailing, also optional, also threaded to the routed bank only. It is
         # the EXPERT-PARALLEL degree the bank divides by; ``world_size`` stays the
         # tensor-parallel one. ``_build_mlp``'s signature still does not move.
@@ -3302,10 +3302,10 @@ class Glm5NextMoEBlock(nn.Module):
         if text_config.n_shared_experts:
             self.shared_experts = Glm5NextSharedExperts(text_config)
 
-    # ── the residual add -- D14 owner: ``inc-glm53f-033`` ─────────────────
+    # ── the residual add -- D14 section ─────────────────
     #
     # SCOPE. This section adds ONE method and edits no line above or below it.
-    # ``__init__`` above and ``forward`` below are ``inc-glm53f-013``'s landed
+    # ``__init__`` above and ``forward`` below are the skeleton's landed
     # code and stay byte-identical.
     #
     # WHY THE ADD LIVES HERE AND NOT ON EITHER CHILD. It needs the routed half
@@ -3313,7 +3313,7 @@ class Glm5NextMoEBlock(nn.Module):
     # ``Glm5NextSharedExperts`` owns the other. ``Glm5NextMoEBlock`` holds both
     # (``__init__`` above), so it is the one place the two halves meet. D14's
     # sub-class rule sends the compute to the child that owns the weights --
-    # which is why ``-027`` put the routed matmul on the routed bank and this
+    # which is why the block-quant call site put the routed matmul on the routed bank and this
     # increment put the shared matmul on the shared bank -- and it sends the
     # combination to their parent.
     #
@@ -3327,7 +3327,7 @@ class Glm5NextMoEBlock(nn.Module):
     # rather than incidental.
     #
     # WHAT THIS SECTION DOES NOT DO, deliberately: it does not assemble the layer
-    # forward (``-013`` / ``-054``), it does not call the routed path (``-027``'s
+    # forward, it does not call the routed path (the block-quant call site's
     # ``block_quant_expert_mm``, landed and separately accepted), and it authors
     # no numerics. ``routed_output`` arrives as an argument precisely so this
     # method composes the two halves without owning either.
@@ -3349,7 +3349,7 @@ class Glm5NextMoEBlock(nn.Module):
 
         Args:
             routed_output: ``[T, H]`` the routed experts' contribution, as
-                ``inc-glm53f-027``'s ``block_quant_expert_mm`` returns it. Passed
+                the bank's ``block_quant_expert_mm`` returns it. Passed
                 in rather than computed here; see the section note above.
             hidden_states: ``[T, H]`` the shared expert's own input -- the same
                 pre-norm activations the routed half consumed.
@@ -3368,13 +3368,13 @@ class Glm5NextMoEBlock(nn.Module):
         The SwiGLU bound is not an argument here either, and it is not forwarded.
         The shared expert this block built holds it
         (:meth:`Glm5NextSharedExperts.__init__`), so the bound reaches the clamp
-        without passing through this method at all. ``inc-glm53f-033`` repair
+        without passing through this method at all. This is repair
         round 2; round 1 forwarded a required argument because the config did not
         model the key yet.
 
         Returns:
             ``[T, H]`` fp32 -- the sum, in the shared half's fp32 seam dtype.
-            The residual dtype for the decoder layer is ``inc-glm53f-054``'s.
+            The residual dtype for the decoder layer is the layer forward's.
 
         Raises:
             Glm5NextSharedExpertRouteError: when this block declares no shared
@@ -3383,7 +3383,7 @@ class Glm5NextMoEBlock(nn.Module):
                 refuses: ``[T, H] + [1, H]`` and ``[T, H] + [T, 1]`` both
                 broadcast without error and both compute a different layer.
         """
-        # ``n_shared_experts == 0`` leaves the attribute undeclared -- ``-013``'s
+        # ``n_shared_experts == 0`` leaves the attribute undeclared -- the skeleton's
         # ``__init__`` mirrors the weight map's own condition
         # (``weight_loaders_fp8.py:481``). Checked rather than assumed, because
         # ``getattr`` on a missing module would raise ``AttributeError`` from
@@ -3426,7 +3426,7 @@ class Glm5NextMoEBlock(nn.Module):
         # nowhere else in this file.
         return routed_output + shared_output
 
-    # ── the sparse MLP's forward -- ``inc-glm53f-054a`` item 4 of 7 ───────
+    # ── the sparse MLP's forward -- item 4 of 7 ───────
     #
     # WHAT THIS METHOD IS: the three landed pieces in the reference's own order,
     # and nothing else. The router is ``route_tokens`` on the bank, the routed
@@ -3440,7 +3440,7 @@ class Glm5NextMoEBlock(nn.Module):
     # both expert halves (``modeling_glm5_next.py:200-207``: ``self.gate(hidden_states)``
     # and ``self.experts(...)`` and ``self.shared_experts(residuals)``, where
     # ``residuals`` is this block's own input). This fork's router is FUSED: the
-    # RMSNorm is inside ``inc-glm53f-032``'s kernel, so ``route_tokens`` must be
+    # RMSNorm is inside the router kernel, so ``route_tokens`` must be
     # handed the PRE-norm activations together with the norm's gain
     # (``route_tokens``'s own signature and docstring). Handing it the normalised
     # tensor would normalise twice and compute a different router; computing the
@@ -3455,8 +3455,8 @@ class Glm5NextMoEBlock(nn.Module):
     # fused kernel needs belongs to the layer, which is where this block's caller
     # sits.
     #
-    # WHY ``text_config`` ARRIVES AT THE CALL. ``-031``'s ``__init__`` retains no
-    # config and ``route_tokens`` needs the routing hyperparameters, so ``-032``
+    # WHY ``text_config`` ARRIVES AT THE CALL. The expert partitioning's ``__init__`` retains no
+    # config and ``route_tokens`` needs the routing hyperparameters, so the router call site
     # threads it in at the call; this method is a caller and follows that.
     #
     # THE NO-SHARED-EXPERT BRANCH IS THE LANDED METHOD'S OWN WORDS. A block built
@@ -3564,7 +3564,7 @@ class Glm5NextDenseMLP(nn.Module):
         super().__init__()
         self.intermediate_size = int(text_config.intermediate_size)
         # The checkpoint's SwiGLU bound, resolved HERE and not at the call --
-        # the same construction-time read ``inc-glm53f-033`` repair round 2 made
+        # the same construction-time read the shared expert's repair round 2 made
         # for :class:`Glm5NextSharedExperts` (``:1857``), on the same scalar,
         # from the same config field.
         #
@@ -3579,7 +3579,7 @@ class Glm5NextDenseMLP(nn.Module):
         # the digest this campaign pins, 56 of 56 checks, in
         # ``../../../artifacts/campaigns/glm-5.3-flash-port/increments/probe-054a-swiglu-clamp-r2.out``.
         #
-        # AN UNCLAMPED DENSE MLP WOULD BE THE ``-033`` DEFECT AGAIN. That repair
+        # AN UNCLAMPED DENSE MLP WOULD BE THE SHARED-EXPERT DEFECT AGAIN. That repair
         # (``B22-M1-shared-expert-swiglu-clamp-omitted``) was for a path that
         # computed a different function from the checkpoint's on every token
         # leaving the bound's box, with no shape moving and nothing raising.
@@ -3598,7 +3598,7 @@ class Glm5NextDenseMLP(nn.Module):
     def retile_checkpoint_scale_grids(self) -> int:
         """Publish this module's grids at the kernel's granularity and set the frame.
 
-        ``inc-glm53f-054a`` repair round 1. THE OPT-IN THIS CLASS TAKES, and the
+        Since repair round 1. THE OPT-IN THIS CLASS TAKES, and the
         reason it must. The loader delivers the checkpoint's own layout -- gate and
         up as ``[I, H]``, down as ``[H, I]`` (shard table ``:503-513``) -- at the
         checkpoint's ``128``-tile scale granularity, and :meth:`forward` consumes
@@ -3608,9 +3608,9 @@ class Glm5NextDenseMLP(nn.Module):
         layers of GLM-5.3-Flash and the tiny fixture could not see it: that fixture
         binds hand-drawn compute-frame weights and their grids straight onto the
         module, which is the loader's job and not the fixture's. Those grids were
-        ``256`` until ``inc-glm53f-112`` narrowed the kernel to the checkpoint's own
+        ``256`` until a later increment narrowed the kernel to the checkpoint's own
         ``128``. THAT FIXTURE DID NOT FOLLOW ON ITS OWN, and the sentence here used to
-        claim it did: it built its grids from the MoE producer's constant, so `-112`
+        claim it did: it built its grids from the MoE producer's constant, so that increment's
         round 2 had to re-pin it, and three sibling suites with it, to
         ``blockwise_fp8_mm.SCALE_BLOCK_SIZE``. Any new fixture for this class reads
         that name.
@@ -3621,7 +3621,7 @@ class Glm5NextDenseMLP(nn.Module):
         ``hasattr``, so declaring the method is the whole enrolment.
 
         Returns how many projections were PUBLISHED: ``3`` when the extents are
-        whole ``128`` blocks, ``0`` when they are not. Since ``inc-glm53f-112``
+        whole ``128`` blocks, ``0`` when they are not. Since the block narrowing
         nothing is coarsened here -- the kernel indexes the checkpoint's own grid, so
         the step publishes what the loader delivered and the method name is a
         misnomer kept because it is landed API. The transpose is not conditional on
@@ -3636,7 +3636,7 @@ class Glm5NextDenseMLP(nn.Module):
             self, Glm5NextDenseMLPRouteError, self.DENSE_RETILE_HEALTH_ATTR
         )
 
-    # ── the dense-MLP compute path -- D14 owner: ``inc-glm53f-054a`` ───────
+    # ── the dense-MLP compute path -- D14 section ───────
     #
     # SCOPE. This section replaces ``forward`` below, adds the one ``__init__``
     # line above, and -- since repair round 1 -- adds
@@ -3651,8 +3651,8 @@ class Glm5NextDenseMLP(nn.Module):
     #
     # WHY NO PREBUILT SCALE OPERAND HERE. ``blockwise_fp8_mm``'s
     # ``prebuilt_scale_t`` is optional and keyword-only, and omitting it makes
-    # the call behave exactly as it did before ``inc-glm53f-090``
-    # (``blockwise_fp8_mm.py:441``, ``:449-456``). ``-090``'s load-time prep is
+    # the call behave exactly as it did before the load-time prep landed
+    # (``blockwise_fp8_mm.py:441``, ``:449-456``). The load-time prep is
     # reached by ``_run_load_time_preps`` through
     # ``hasattr(type(module), "prepare_scale_operands")`` (``:8179``), which is
     # a per-class opt-in this class does not take. Adding that prep is a
@@ -3680,7 +3680,7 @@ class Glm5NextDenseMLP(nn.Module):
                 and does not pad (``blockwise_fp8_mm.py:239-245``), so THIS
                 METHOD pads to a whole ``TILE_SIZE`` and slices the result back
                 before returning, exactly as the shared expert does
-                (`inc-glm53f-026b`).
+                (see :meth:`Glm5NextSharedExperts.shared_expert_mm`).
             quant_config: the resolved per-model quantisation policy, and the
                 route selector. An ARGUMENT rather than a field, because that is
                 what all three landed methods of this family do (``:1539``,
@@ -3695,7 +3695,7 @@ class Glm5NextDenseMLP(nn.Module):
         consumes the frame the kernel multiplies in -- gate and up ``[H, I]``, down
         ``[I, H]``, each with the ``128`` grid beside it. That is NOT the frame the
         loader delivers: the checkpoint's own layout is the transpose of it, at the
-        same ``128`` granularity since ``inc-glm53f-112``, so what is left to bridge
+        same ``128`` granularity since the block narrowing, so what is left to bridge
         is the FRAME and no longer the granularity.
         :meth:`retile_checkpoint_scale_grids`
         bridges it once, on the load path, and this method refuses the
@@ -3732,7 +3732,7 @@ class Glm5NextDenseMLP(nn.Module):
             raise Glm5NextDenseMLPRouteError(
                 f"quant_config declares weight_block_size={block_shape!r}; this "
                 f"route consumes the checkpoint's own ({TILE_SIZE}, {TILE_SIZE}) "
-                f"blocks directly -- since inc-glm53f-112 the dense kernel "
+                f"blocks directly -- the dense kernel "
                 f"indexes at that granularity and nothing is retiled -- and has "
                 f"no path for any other checkpoint block shape."
             )
@@ -3786,7 +3786,7 @@ class Glm5NextDenseMLP(nn.Module):
                 f"shape {tuple(down_proj_weight.shape)}"
             )
 
-        # ---- PAD TO A WHOLE TILE. `inc-glm53f-026b`, the same two lines as the
+        # ---- PAD TO A WHOLE TILE. The same two lines as the
         # shared expert's and for the same reason: the seam refuses a token count
         # that is not a whole tile and does not pad, so a one-token decode step
         # pads here and is sliced back at the single return below.
@@ -3819,7 +3819,7 @@ class Glm5NextDenseMLP(nn.Module):
         # ---- THE DOWN PROJECTION re-enters the seam, whose declared input
         # dtype is ``bfloat16`` (``blockwise_fp8_mm.py:446``), so the fp32
         # intermediate is cast back to the caller's activation dtype here. The
-        # slice back is `-026b`'s and it is the last thing that happens.
+        # slice back is the dense pad increment's and it is the last thing that happens.
         return _unpad_rows(
             blockwise_fp8_mm(
                 activated.to(hidden_states.dtype),
@@ -3833,10 +3833,10 @@ class Glm5NextDenseMLP(nn.Module):
 class Glm5NextDenseMLPRouteError(ValueError):
     """A dense-MLP call this route refuses, named rather than coerced.
 
-    ``inc-glm53f-054a``. At module level, and not nested in the class that
+    At module level, and not nested in the class that
     raises it, because an exception a caller catches belongs in the module
-    namespace -- the shape ``inc-glm53f-027`` set for
-    :class:`Glm5NextBlockQuantRouteError` and ``-033`` for
+    namespace -- the shape the block-quant call site set for
+    :class:`Glm5NextBlockQuantRouteError` and the shared-expert path for
     :class:`Glm5NextSharedExpertRouteError`.
 
     Raised in preference to continuing, because each failure it closes returns
@@ -3859,12 +3859,12 @@ def _build_mlp(text_config: Glm5NextTextConfig, layer_idx: int) -> nn.Module:
 
 
 # ---------------------------------------------------------------------------
-# The KDA (``linear_attention``) half. D14 owner: ``inc-glm53f-038`` (M3),
+# The KDA (``linear_attention``) half. D14 owner: the KDA increment (M3),
 # whose acceptance runs "a 3-layer KDA stack" -- so ``Glm5NextKDALayer`` is
 # the decoder layer, and the gated-delta module it holds sits at the map's
-# ``self_attn`` path. RE-GROUNDED BY ``inc-glm53f-082``: this header used to
+# ``self_attn`` path. RE-GROUNDED: this header used to
 # call ``linear_attn`` the map's path, which it stopped being when
-# ``inc-glm53f-078`` measured the family off the published checkpoint index.
+# the weight map measured the family off the published checkpoint index.
 # ``linear_attn`` survives below only as ``CACHE_NAME_SUFFIX``, which names
 # the KV-cache entry and is not a module path.
 # ---------------------------------------------------------------------------
@@ -3919,7 +3919,7 @@ class Glm5NextKDAAttention(nn.Module):
     ``KDA_BARE_LEAVES``, as ``weight_loaders_fp8.py``'s ``_add_kda_attention``
     emits them: thirteen ``<leaf>_weight`` names and the two bare state tensors
     ``A_log`` and ``dt_bias``, **fifteen in all and not one scale companion**.
-    RE-GROUNDED BY ``inc-glm53f-082``: ``inc-glm53f-078`` measured that set off
+    RE-GROUNDED: the weight map measured that set off
     the published checkpoint index and retired the six fused ``linear_attn.*``
     names this class used to declare. ``conv1d_bias`` is gone with them because
     the index carries no conv1d bias of any spelling. Cites here name symbols
@@ -3928,7 +3928,7 @@ class Glm5NextKDAAttention(nn.Module):
     THE CACHE GEOMETRY THIS CARRIES, STATED EXACTLY. A linear-attention layer
     holds a **recurrent state**, not a key/value history. The pin's
     ``LayerSpec`` has no vocabulary for that state -- adding it is
-    ``inc-glm53f-015``'s declared surface at M1 -- so the spec this layer
+    the cache-spec increment's declared surface at M1 -- so the spec this layer
     reports describes its per-head state extent in the pin's existing fields
     and asserts nothing about recurrent-state layout. That limit is recorded
     rather than papered over.
@@ -3959,7 +3959,7 @@ class Glm5NextKDAAttention(nn.Module):
             _linear_attn_field(text_config, "gate_lower_bound")
         )
         # The decoder's RMSNorm epsilon, from the config rather than from a local
-        # default, on ``inc-glm53f-080``'s precedent at line 889 of this file.
+        # default, on the precedent at line 889 of this file.
         self.rms_norm_eps = float(text_config.rms_norm_eps)
         # ``NeuronConfig.kda_state_chunk_size`` is declared a tuning dial with
         # "None = let the layer choose" (``neuron_config.py:185-188``), and
@@ -3970,9 +3970,9 @@ class Glm5NextKDAAttention(nn.Module):
         )
 
         # The four recurrent-state values ``get_kv_spec`` reports for this
-        # family. ``inc-glm53f-015`` declared the four field names and
-        # ``inc-glm53f-016`` certified the runner's translation of them; D14
-        # gives the VALUES to ``inc-glm53f-038``, because they come from this
+        # family. The cache spec declared the four field names and
+        # the runner increment certified the runner's translation of them; D14
+        # gives the VALUES to this layer, because they come from this
         # layer's own state geometry.
         #
         # BOTH PAIRS ARE DERIVED FROM vLLM's OWN CALCULATORS AND NEITHER IS
@@ -4111,10 +4111,10 @@ class Glm5NextKDAAttention(nn.Module):
         """One KDA layer's gated-delta linear attention over ``[T, hidden]``.
 
         The five landed seams are entered in this order, and each entry is one
-        counted dispatch: the short convolution (``inc-glm53f-034``), the gate
-        clamp (``inc-glm53f-084``'s re-authored form), then either the two
-        chunked seams (``inc-glm53f-035a`` and ``-035b``) or the single-token
-        decode seam (``inc-glm53f-036``). This function composes them; it
+        counted dispatch: the short convolution, the gate
+        clamp (in its re-authored form), then either the two
+        chunked seams or the single-token
+        decode seam. This function composes them; it
         implements none of their arithmetic, which is why its substrate class is
         non-kernel-class.
 
@@ -4126,8 +4126,8 @@ class Glm5NextKDAAttention(nn.Module):
                 convolution and WRITTEN IN PLACE with the new tail.
             recurrent_state: this layer's recurrent carrier from the runner
                 bank, ``[heads, V, K]``. Index 1 is the VALUE extent and index 2
-                the KEY extent -- the orientation ``-035b``'s ``final_state``
-                and ``-036``'s ``state`` both use. ``V == K == head_dim`` here,
+                the KEY extent -- the orientation the chunked seam's ``final_state``
+                and the decode seam's ``state`` both use. ``V == K == head_dim`` here,
                 so that choice cannot be read off the shape and is stated rather
                 than implied. Written in place.
             is_prefill: whether this call is a prefill. It selects the
@@ -4560,14 +4560,14 @@ class Glm5NextKDAAttention(nn.Module):
 class Glm5NextKDALayer(nn.Module):
     """Decoder layer on the ``linear_attention`` half of the hybrid stack.
 
-    Section reserved for ``inc-glm53f-038`` (KDA layer + runner state
+    Section reserved for the KDA increment (KDA layer + runner state
     plumbing).
     """
 
     #: Attribute the family's attention module is bound to -- the map's own
     #: module path, which ``weight_loaders_fp8.py``'s ``_add_kda_attention``
     #: builds as ``f"{param_prefix}.self_attn"``. RE-GROUNDED BY
-    #: ``inc-glm53f-082``, which moved this off ``linear_attn`` because
+    #: the weight map, which moved this off ``linear_attn`` because
     #: ``declared_parameter_names`` builds its paths from ``named_modules()``.
     #: **NOT the same string as ``Glm5NextKDAAttention.CACHE_NAME_SUFFIX``**,
     #: which stays ``linear_attn`` and names a KV-cache entry, not a module.
@@ -4588,7 +4588,7 @@ class Glm5NextKDALayer(nn.Module):
             # unconditional ``_add_mhc`` as ``f"{param_prefix}.{leaf}"`` -- no
             # ``.weight`` leaf, no scale companion, no submodule.
             #
-            # ``inc-glm53f-030d`` IS THE INCREMENT THIS NOTE RESERVED, and it
+            # THE mHC BINDING IS THE INCREMENT THIS NOTE RESERVED, and it
             # keeps them here: :meth:`bind_hyper_connection_sites` hands the six
             # loaded tensors to two ``Glm5NextHyperConnection`` instances after
             # the load and holds those instances in a plain dict, so no leaf
@@ -4610,7 +4610,7 @@ class Glm5NextKDALayer(nn.Module):
     ) -> int:
         """Give this layer's two mHC sites the six tensors the load brought.
 
-        ``inc-glm53f-030d``. ONE BODY FOR BOTH LAYER FAMILIES, in
+        ONE BODY FOR BOTH LAYER FAMILIES, in
         :func:`_bind_hyper_connection_sites`, on the precedent
         :func:`_publish_compute_frame_operands` sets: the rule lives once and the
         two families call it, so the linear-attention and sparse-attention halves
@@ -4631,7 +4631,7 @@ class Glm5NextKDALayer(nn.Module):
         A method rather than a module-level helper, because this file's
         module-level region is another increment's D14 section. The epsilon is
         the checkpoint's ``rms_norm_eps``, resolved at construction on the same
-        ground ``inc-glm53f-080`` states at line 889.
+        ground line 889 states.
         """
         x = hidden_states.to(torch.float32)
         variance = x.pow(2).mean(dim=-1, keepdim=True)
@@ -4655,10 +4655,10 @@ class Glm5NextKDALayer(nn.Module):
     ) -> torch.Tensor:
         """The linear-attention half, mixed either by mHC or by a plain add.
 
-        TWO ROUTES, AND THE KEYWORD PICKS ONE (``inc-glm53f-030d``, route R3).
+        TWO ROUTES, AND THE KEYWORD PICKS ONE (route R3).
 
         * ``streams`` ABSENT: pre-norm, attention, plain residual add -- the same
-          computation this method did before ``inc-glm53f-030d``, on the same
+          computation this method did before the mHC binding, on the same
           operands. The draft head needs this route (``mtp.py:158`` hands this
           class a one-stream ``[T, H]``), and so does every landed direct caller.
         * ``streams`` PRESENT: the four-stream mHC pair runs around the same
@@ -4675,8 +4675,8 @@ class Glm5NextKDALayer(nn.Module):
 
         WHAT THIS FORWARD STILL DOES NOT DO. ``self.mlp`` is not called here: the
         feed-forward half is ``Glm5NextModel._ffn_half``'s
-        (``inc-glm53f-054a``), and the FFN mHC site is composed there by
-        ``inc-glm53f-030d`` part (a). The six mHC weights sit flat on this layer
+        and the FFN mHC site is composed there by
+        the mHC binding, part (a). The six mHC weights sit flat on this layer
         and the two sites are bound to it after the load, by
         :meth:`bind_hyper_connection_sites`.
 
@@ -4726,20 +4726,20 @@ class Glm5NextKDALayer(nn.Module):
 
 # ---------------------------------------------------------------------------
 # The DSA (``deepseek_sparse_attention``) half. D14 owners:
-# ``inc-glm53f-039`` (MLA projections) and ``-042`` (MLA decode path) inside
-# ``Glm5NextMLAAttention``; ``-051`` for ``Glm5NextDSALayer``, whose acceptance
+# the projections increment and the decode increment inside
+# ``Glm5NextMLAAttention``; the DSA layer increment for ``Glm5NextDSALayer``, whose acceptance
 # runs "a 3-layer DSA stack" -- so that class is the decoder layer and the MLA
 # module sits at ``self_attn``.
 #
 # THIS COMMENT USED TO SAY "layer + sequence tiling", and the second half was
 # wrong rather than merely stale: there is NO DSA sequence-tiling seam in this
 # fork to integrate. Removed at design entry ``design-20260905-am`` (plan
-# revision 223), which cut ``-051``'s acceptance from eight counted runs to
-# two. The tiling question belongs to ``-052``'s untiled-S ladder.
+# revision 223), which cut the DSA layer's acceptance from eight counted runs to
+# two. The tiling question belongs to the untiled-S ladder.
 #
-# THE RUNNER HALF IS ALSO NOT ``-051``'s, as of design entry
-# ``design-20260905-an`` (plan revision 224): ``-051`` DECLARES the layer-side
-# interface and ``-054`` threads it, because two ``-054``-owned stubs sit
+# THE RUNNER HALF IS ALSO NOT THE DSA LAYER'S, as of design entry
+# ``design-20260905-an`` (plan revision 224): the DSA layer DECLARES the layer-side
+# interface and the layer forward threads it, because two stubs it owns sit
 # between the runner and ``Glm5NextDSALayer.forward``.
 # ---------------------------------------------------------------------------
 
@@ -4747,7 +4747,7 @@ class Glm5NextKDALayer(nn.Module):
 class Glm5NextDSAIndexerError(ValueError):
     """Raised when the DSA indexer is asked for something it cannot serve.
 
-    ``inc-glm53f-051``. Declared beside the class that raises it, the convention
+    Declared beside the class that raises it, the convention
     every sibling route error in this file already follows. NO COUNT OF THOSE
     SIBLINGS IS WRITTEN HERE ON PURPOSE: ``Glm5NextMLADecodeError`` below says
     "the three sibling route errors" and there are more than three now, which is
@@ -4767,13 +4767,13 @@ class Glm5NextDSAIndexer(nn.Module):
 
     LEAF NAMES PROVISIONAL AT THIS INCREMENT, and not any more: the map now
     records ``dsa_indexer`` as GROUNDED (``weight_loaders_fp8.py:84-86``) because
-    ``inc-glm53f-078`` read the real shard index. The dials it is sized from,
+    the weight map read the real shard index. The dials it is sized from,
     ``index_n_heads`` / ``index_head_dim``, USED to live only in the fixtures and
-    never in fork Python; ``inc-glm53f-051`` made all seven ``index_*`` keys typed
+    never in fork Python; the indexer increment made all seven ``index_*`` keys typed
     ``Glm5NextTextConfig`` fields (entry ``design-20260905-ad``), so this class
     reads them from the config like every other width in this file.
 
-    WHAT THIS CLASS OWNS, since it now owns arithmetic. ``inc-glm53f-051`` gives it
+    WHAT THIS CLASS OWNS, since it now owns arithmetic. The indexer increment gives it
     the four projections of the indexer chain, its key normalisation and its
     forward. The four projections run on the landed ``mla_projection`` seam and
     their weights are prepared ONCE per instance, which is the same division of
@@ -4821,7 +4821,7 @@ class Glm5NextDSAIndexer(nn.Module):
     def __init__(self, text_config: Glm5NextTextConfig) -> None:
         super().__init__()
         # The four dials this class computes with, each read from the config
-        # rather than transcribed. ``inc-glm53f-051`` added them as fields; before
+        # rather than transcribed. The indexer increment added them as fields; before
         # that the adapter dropped them and there was nothing to read.
         self.hidden_size = int(text_config.hidden_size)
         self.q_lora_rank = int(text_config.q_lora_rank)
@@ -4839,7 +4839,7 @@ class Glm5NextDSAIndexer(nn.Module):
 
         # The map's seven, in the map's own order: the four scaled projections,
         # then ``k_norm_bias``, then the two bare compress tensors.
-        # ``inc-glm53f-082`` replaced the provisional ``wq_weight`` with the
+        # The weight map replaced the provisional ``wq_weight`` with the
         # ``wq_b_weight`` the checkpoint actually carries.
         _declare_parameters(
             self,
@@ -5177,7 +5177,7 @@ class Glm5NextDSAIndexer(nn.Module):
         than a convention: ``dsa_kpool_hadamard`` asserts complete pools, so
         this method masks every non-completion and pools nothing partial. The
         remainder belongs to the DECODE RING, and :meth:`seed_tail` writes it
-        there on this same leg (``inc-glm53f-054b`` commit 6, on the lead's
+        there on this same leg (commit 6, on the lead's
         ruling). The plan's rev-169 wording put the remainder on "the caller";
         that wording is retired, because no caller can do it -- the key and the
         gate for those positions exist only inside this class's forward.
@@ -5646,9 +5646,9 @@ class Glm5NextDSAIndexer(nn.Module):
         SILENTLY, unlike the loud raise at ``k > width`` (``:320-323``). That is
         finding F10, and both entry points ROUTE the regime away before a score
         exists -- ``_require_serviceable`` reports ``selects=False`` and they
-        return ``inc-glm53f-099``'s causal bypass -- so the bound already holds
+        return the causal bypass -- so the bound already holds
         by the time this runs. Checking it in two places would let the two
-        disagree. Until ``inc-glm53f-099`` the same guarantee came from a refusal
+        disagree. Until the bypass landed the same guarantee came from a refusal
         here rather than a route; the guarantee is the same one and this method
         is unchanged by the swap.
 
@@ -5667,7 +5667,7 @@ class Glm5NextDSAIndexer(nn.Module):
     def select_bounded_pools(
         self, scores: torch.Tensor, seq_lens: torch.Tensor
     ) -> torch.Tensor:
-        """``inc-glm53f-103``. Bound each row to its own position, select, sentinelise.
+        """Bound each row to its own position, select, sentinelise.
 
         THE ONE DISPATCH SITE FOR THE CAUSAL BOUND, and both entry points route through
         it for the reason :meth:`_require_serviceable` gives for itself: ``forward`` and
@@ -5746,7 +5746,7 @@ class Glm5NextDSAIndexer(nn.Module):
     def _canonical_sentinel_order(pool_ids: torch.Tensor) -> torch.Tensor:
         """Sentinels to the trailing columns; real ids keep their relative order.
 
-        ``inc-glm53f-103``, REPAIR ROUND (label ``103r2``). This exists because the
+        REPAIR ROUND (label ``103r2``). This exists because the
         composition above is otherwise NOT A FUNCTION OF ITS INPUTS ALONE, and
         ``test_run_2`` caught it: the packed ragged arm and the same requests run alone
         disagreed on ``276 of 572`` meaningful expanded indices while every seam counter
@@ -5874,7 +5874,7 @@ class Glm5NextDSAIndexer(nn.Module):
 
         THE ``-1`` LEAVES THIS CLASS UNTOUCHED, which is a ruling and not a
         preference. Entry ``design-20260905-af`` took route (a): the mask goes
-        INSIDE the kernel, where ``inc-glm53f-098`` masks ``-1`` in
+        INSIDE the kernel, which masks ``-1`` in
         ``mla_sparse_attention`` and narrows its gate to ``lo < -1``. So this
         class applies no filler, no compaction, no clamp and no mask, and hands
         the sentinel-bearing tensor to ``attend()`` unchanged.
@@ -5918,7 +5918,7 @@ class Glm5NextDSAIndexer(nn.Module):
         ONE IMPLEMENTATION FOR BOTH ENTRY POINTS, which is the point of extracting it:
         :meth:`forward` and :meth:`forward_ragged` must agree about what is serviceable,
         and two copies of a refusal are two things that can drift apart. F10's earlier
-        laps were about exactly this class of divergence. ``inc-glm53f-099`` keeps that
+        laps were about exactly this class of divergence. The bypass keeps that
         property and adds one answer to it: ``selects`` is the ONE decision, and the two
         entry points make two calls on it.
 
@@ -5929,10 +5929,10 @@ class Glm5NextDSAIndexer(nn.Module):
         ``k > width`` (``:320-323``). ``width`` is the WIDEST row's complete-pool count,
         because that row sizes the shared candidate axis.
 
-        WHY THIS REPORTS WHERE IT USED TO REFUSE (``inc-glm53f-099``, entry
+        WHY THIS REPORTS WHERE IT USED TO REFUSE (entry
         ``design-20260906-as``). Below the strict bound there is nothing to select from,
         and upstream does not clamp ``k`` there -- it bypasses selection entirely and
-        attends causally (``sparse_attn_indexer_kpool.py:203-217``). ``inc-glm53f-098``'s
+        attends causally (``sparse_attn_indexer_kpool.py:203-217``). The sparse kernel's
         landed refusal named that route and left it unbuilt; it is built now, so the
         regime is SERVED rather than refused and this method reports which of the two
         answers the caller owes. The refusal is gone from here and no refusal replaced it,
@@ -5993,7 +5993,7 @@ class Glm5NextDSAIndexer(nn.Module):
         ONE DISPATCH, called from both entry points, so the two cannot answer the short
         regime differently. Row ``i`` holds ``0 .. seq_lens[i] - 1`` and then ``-1``, which
         is what "attend causally, select nothing" means as an index tensor; the ``-1`` is
-        the sentinel ``inc-glm53f-098``'s sparse kernel masks.
+        the sentinel the sparse kernel masks.
 
         EVERY CAUSAL COLUMN FITS, with no clamp, and that is arithmetic rather than luck:
         the bypass holds only while ``max_seq_len // pool <= select_k``, so the largest
@@ -6052,7 +6052,7 @@ class Glm5NextDSAIndexer(nn.Module):
         """The whole indexer chain. Returns ``topk_indices`` and NOTHING ELSE.
 
         INDICES ALONE IS A RULING. Entry ``design-20260905-af`` route (a) keeps
-        the ``-1`` mask inside ``inc-glm53f-098``'s kernel, so no per-row valid
+        the ``-1`` mask inside the sparse kernel, so no per-row valid
         length leaves this class -- returning one would give a caller a second,
         contradictory way to bound the same kernel. :meth:`expand_indices` states
         the finding behind it.
@@ -6113,7 +6113,7 @@ class Glm5NextDSAIndexer(nn.Module):
         with a bool mask produces a DATA-DEPENDENT shape, which is the same graph
         break in another costume. So every position writes, and the positions
         that completed no pool are redirected to ``pool_cache``'s last row. That
-        is ``inc-glm53f-045``'s own measured pattern -- it *"sends every padding
+        is the pack module's own measured pattern -- it *"sends every padding
         row to a REAL in-range trash row"* rather than masking by going out of
         bounds. Duplicate trash destinations resolve in unspecified order and
         that is harmless: the row is never addressed as a candidate. BOTH LEGS
@@ -6207,7 +6207,7 @@ class Glm5NextDSAIndexer(nn.Module):
             if prefill_tail is not None:
                 # The remainder is this leg's to persist: the pooled store took
                 # the complete pools above, and the open pool's rows exist only
-                # here. `inc-glm53f-054b` commit 6.
+                # here (commit 6).
                 self.seed_tail(
                     prefill_tail,
                     key,
@@ -6217,14 +6217,14 @@ class Glm5NextDSAIndexer(nn.Module):
                 )
 
         if not selects:
-            # inc-glm53f-099. The write stage above has already landed -- the pool row is
+            # The write stage above has already landed -- the pool row is
             # stored and, on the decode leg, the ring has advanced -- so returning here
             # loses nothing. Below the strict bound there is nothing to select from.
             return self._bypass_indices(seq_lens)
 
         candidate_keys = self._gather_candidates(pool_cache, candidates, int(page_size))
         scores = self.score_pools(query, candidate_keys, weights)
-        # inc-glm53f-103: the causal bound and the sentinel, one dispatch site.
+        # The causal bound and the sentinel, one dispatch site.
         pool_ids = self.select_bounded_pools(scores, seq_lens)
         return self.expand_indices(pool_ids, seq_lens)
 
@@ -6262,7 +6262,7 @@ class Glm5NextDSAIndexer(nn.Module):
 
         AND NOTHING IS UNPACKED, which is a ruling. Entry ``design-20260905-aj`` route (b)
         makes ``dsa_ragged_unpack``'s reading on this arm a DECLARED 0, covered by
-        ``inc-glm53f-045``'s own landed bit-identical round-trip item. The arm's result is
+        the pack module's own landed bit-identical round-trip item. The arm's result is
         int32 by ``dsa_index_expand``'s contract, the pack module admits bf16 only, and the
         consumer wants the DENSE form anyway: ``mla_sparse_attention`` gates
         ``topk_indices.ndim != 2`` and raises by name (``mla_sparse.py:1214``, ``:1216``),
@@ -6304,7 +6304,7 @@ class Glm5NextDSAIndexer(nn.Module):
         instead, which read as a claim about the pooling. Nine named readings, no family
         shorthand, so ``probe-051-arm-authored`` can compare each one to a measurement.
 
-        THOSE NINE ARE THE SELECTING PATH'S, and ``inc-glm53f-099`` added a second path
+        THOSE NINE ARE THE SELECTING PATH'S, and the bypass added a second path
         that reads differently. On the SHORT regime this arm returns the causal bypass
         after the pack, so ``dsa_paged_gather``, ``dsa_score_gemm``, ``dsa_topk_select``
         and ``dsa_index_expand`` all read 0 and ``dsa_causal_fill`` reads one NKI dispatch
@@ -6397,7 +6397,7 @@ class Glm5NextDSAIndexer(nn.Module):
         packed_weights = weights.index_select(0, keep)
 
         if not selects:
-            # inc-glm53f-099, placed AFTER the pack rather than before it, deliberately.
+            # The bypass, placed AFTER the pack rather than before it, deliberately.
             # This arm has no write stage to protect, so the only thing the placement
             # decides is the pack's counter reading -- and the pack is this arm's whole
             # reason for existing (design-20260905-aa's seventh family). Bypassing before
@@ -6408,7 +6408,7 @@ class Glm5NextDSAIndexer(nn.Module):
 
         candidate_keys = self._gather_candidates(pool_cache, candidates, int(page_size))
         scores = self.score_pools(packed_query, candidate_keys, packed_weights)
-        # inc-glm53f-103: the causal bound and the sentinel, one dispatch site.
+        # The causal bound and the sentinel, one dispatch site.
         pool_ids = self.select_bounded_pools(scores, seq_lens)
         return self.expand_indices(pool_ids, seq_lens)
 
@@ -6416,7 +6416,7 @@ class Glm5NextDSAIndexer(nn.Module):
 class Glm5NextMLADecodeError(ValueError):
     """Raised when the MLA decode path is asked for something it cannot serve.
 
-    ``inc-glm53f-042``. Declared beside the class that raises it, the convention
+    Declared beside the class that raises it, the convention
     the three sibling route errors in this file already follow.
 
     A DISTINCT TYPE RATHER THAN A BARE ``ValueError``, for one reason the
@@ -6464,7 +6464,7 @@ class Glm5NextMLAAttention(nn.Module):
         self.qk_rope_head_dim = int(text_config.qk_rope_head_dim)
         self.v_head_dim = int(text_config.v_head_dim)
         self.mla_use_nope = bool(text_config.mla_use_nope)
-        # ``inc-glm53f-039b`` adds these two scalars, because the projections
+        # These two scalars are added because the projections
         # section below needs them and neither existed on the skeleton. The
         # hidden size is the input width of two of the five sites and the output
         # width of a third; the epsilon is the checkpoint's, read through the
@@ -6488,9 +6488,9 @@ class Glm5NextMLAAttention(nn.Module):
             "q_a_layernorm_weight",
             "kv_a_layernorm_weight",
         )
-        # -- inc-glm53f-085 (WP5 repair) declares the four blockwise-FP8 scale
+        # -- the WP5 repair declares the four blockwise-FP8 scale
         #    parameters, in its OWN call so the seven names above stay exactly as
-        #    ``inc-glm53f-039b`` and ``inc-glm53f-013`` landed them.
+        #    the projections section and the skeleton landed them.
         #
         #    DERIVED FROM THE MAP'S OWN LIST, never a second literal: the four
         #    leaves come from ``DSA_SCALED_PROJECTIONS`` and the suffix from
@@ -6499,7 +6499,7 @@ class Glm5NextMLAAttention(nn.Module):
         #    to drift apart -- the bijection ``test_kv_spec.py`` asserts.
         #
         #    ``kv_b_proj`` is absent BECAUSE it is absent from that list: this
-        #    checkpoint keeps it in BF16 (``inc-glm53f-078``), so it carries no
+        #    checkpoint keeps it in BF16, so it carries no
         #    scale companion and takes no dequant.
         _declare_parameters(
             self,
@@ -6507,7 +6507,7 @@ class Glm5NextMLAAttention(nn.Module):
         )
         self.indexer = Glm5NextDSAIndexer(text_config)
 
-    # -- inc-glm53f-100 -- THE ONE PLACE THIS CLASS TURNS HEADS INTO ITS HEADS.
+    # -- THE ONE PLACE THIS CLASS TURNS HEADS INTO ITS HEADS.
     #
     # It sits here, in the class preamble ahead of both section banners, because
     # both sections below read it: the projections' widths and the absorb
@@ -6550,11 +6550,11 @@ class Glm5NextMLAAttention(nn.Module):
         """
         return _per_rank(self.num_attention_heads, _resolve_world_size())
 
-    # -- the PROJECTIONS section -- D14 owner: ``inc-glm53f-039b`` (M3) -------
+    # -- the PROJECTIONS section -- D14 owner: the projections increment (M3) -------
     #
     # WHAT THIS SECTION IS FOR. The five low-rank projections had no substrate
-    # member left to call: ``inc-glm53f-072`` measured both candidates and both
-    # REFUSE this checkpoint's widths. ``inc-glm53f-039a`` therefore wrote the
+    # member left to call: a probe measured both candidates and both
+    # REFUSE this checkpoint's widths. The seam increment therefore wrote the
     # projection as a NKI kernel, and this section is the call site that reaches
     # it. Every number below is computed from the config; not one is read from a
     # weight's shape, so a mis-shaped checkpoint is caught rather than adopted.
@@ -6568,8 +6568,8 @@ class Glm5NextMLAAttention(nn.Module):
     #
     # WHAT THIS SECTION DOES NOT DO, deliberately:
     #   * it does NOT implement ``forward`` -- D14 gives the forward stubs to
-    #     ``inc-glm53f-013`` and then to ``inc-glm53f-054``, and the decode path
-    #     that would call these methods to ``inc-glm53f-042``. Both methods below
+    #     the skeleton and then to the layer forward, and the decode path
+    #     that would call these methods to the decode section. Both methods below
     #     are entry points those increments call; neither runs on its own.
     #   * it allocates NO rotary parameter and computes no rotary slice, because
     #     ``qk_rope_head_dim`` is 0 on this checkpoint and that 0 is a value
@@ -6606,7 +6606,7 @@ class Glm5NextMLAAttention(nn.Module):
         bare value would be short by exactly that slice, which is the same
         reason ``_resolve_mla_head_size`` sums rather than takes the rank.
 
-        THE HEAD COUNT IS THIS RANK'S (``inc-glm53f-100``), so these are the five
+        THE HEAD COUNT IS THIS RANK'S, so these are the five
         widths of the weights THIS rank holds, which is what they have to be: a
         checkpoint's projection is sliced to the rank's heads at load time, and
         this method is what ``prepare_projection_weights`` checks the loaded weight
@@ -6666,11 +6666,11 @@ class Glm5NextMLAAttention(nn.Module):
                     f"closed form is [out_features, in_features] = "
                     f"{(odim, idim)}"
                 )
-            # -- inc-glm53f-085 owns THIS ONE STEP and nothing else here. The
+            # -- The WP5 repair owns THIS ONE STEP and nothing else here. The
             #    dequant runs in the checkpoint's own [out_features, in_features]
             #    orientation, where the scale grid matches by construction, and
             #    only THEN is the weight transposed by the line below -- so
-            #    ``inc-glm53f-039b``'s one-time transpose keeps both its position
+            #    the one-time transpose keeps both its position
             #    and its ground.
             # THE HOP TO THE HOST COMES FIRST, BEFORE THE DEQUANT AND NOT AFTER IT.
             # The dequant is not a cheap read: it upcasts the weight to fp32 and
@@ -6707,14 +6707,14 @@ class Glm5NextMLAAttention(nn.Module):
         per 128x128 tile. Before this method the bytes were transposed and used
         as if they were real numbers, so those four projections computed the
         wrong function at exactly the right shapes -- a defect no shape check
-        can see. ``inc-glm53f-085`` repairs it.
+        can see. This method repairs it.
 
         THE TEST IS THE DTYPE, NEVER A CONFIG FLAG. A quantisation flag can be
         wrong, absent, or stale, and a weight that is fp8 bytes is fp8 bytes
         whatever a flag says. So the three cases are decided by what actually
         arrived:
 
-        * a real dtype is returned UNCHANGED, exactly as ``inc-glm53f-039b``
+        * a real dtype is returned UNCHANGED, exactly as the projections section
           landed it -- this method adds nothing to that path;
         * fp8 bytes with their scale materialised are dequantised;
         * fp8 bytes with NO scale materialised RAISE, naming the site and the
@@ -6766,24 +6766,24 @@ class Glm5NextMLAAttention(nn.Module):
             )
         return prepared[name]
 
-    # -- the ABSORB section -- D14 owner: ``inc-glm53f-042`` -------------------
+    # -- the ABSORB section -- D14 owner: the decode increment -------------------
     #
     # WHAT THIS SECTION IS FOR. The projections above work in the HEAD width 256;
     # the sparse attention seam works in the LATENT rank 512. Two per-head
-    # matmuls cross between them, and ``inc-glm53f-097`` authored the NKI seam
+    # matmuls cross between them, and a sibling increment authored the NKI seam
     # that computes them. This section prepares that seam's two weight operands
     # once, at load time, and does nothing else.
     #
     # WHERE THE OPERANDS COME FROM, and why no new weight is read. Both are
     # halves of ONE weight this class already prepares, ``kv_b_proj``: it expands
-    # a latent into a per-head key and value pair, and ``inc-glm53f-039b``
+    # a latent into a per-head key and value pair, and the projections section
     # already splits its OUTPUT on that boundary (``key_value[..., :256]`` and
     # ``[..., 256:]``). This section splits the WEIGHT on the same boundary
     # instead, which is what lets the two matmuls be absorbed into the query and
     # into the attention output. No second projection is read, no new parameter
     # is declared, and no checkpoint tensor is touched.
     #
-    # WHY ONCE AND NOT PER CALL. ``inc-glm53f-039b``'s one-time transpose exists
+    # WHY ONCE AND NOT PER CALL. The one-time transpose exists
     # because copying a projection weight per call costs up to 64 MB every call.
     # The same argument applies with more force here: the split reshapes, slices
     # and permutes a 512 x 32,768 weight, and it never changes. So it runs at
@@ -6816,7 +6816,7 @@ class Glm5NextMLAAttention(nn.Module):
         mis-shaped checkpoint is caught rather than adopted -- the rule
         ``projection_widths`` states for the five projections, applied here.
 
-        THE HEAD COUNT IS THIS RANK'S (``inc-glm53f-100``, a second writer in this
+        THE HEAD COUNT IS THIS RANK'S (a second writer in this
         section BY CONCERN: it moves widths and touches no absorb algebra and no
         numeric). It has to be, and not as a convenience: both operands are split
         from the prepared ``kv_b_proj``, which under tensor parallelism holds only
@@ -6841,12 +6841,12 @@ class Glm5NextMLAAttention(nn.Module):
 
         THE INPUT IS THE PREPARED WEIGHT, NOT THE CHECKPOINT PARAMETER, and the
         difference is load-bearing. ``_prepared_weight`` returns ``kv_b_proj``
-        after ``inc-glm53f-085``'s dequantisation chain and
-        ``inc-glm53f-039b``'s one-time transpose, so it is
+        after the dequantisation chain and
+        the one-time transpose, so it is
         ``[kv_lora_rank, heads * (nope + v)]`` in a real dtype. Splitting the raw
         parameter instead would, on a checkpoint that stored this weight as fp8
         bytes, split bytes rather than numbers and compute the wrong function at
-        exactly the right shapes -- the defect class ``-085`` was raised to fix.
+        exactly the right shapes -- the defect class the WP5 repair was raised to fix.
 
         THE SPLIT IS A REARRANGEMENT AND NOTHING ELSE. Every element of both
         operands is an element of the prepared weight, in the prepared weight's
@@ -6856,7 +6856,7 @@ class Glm5NextMLAAttention(nn.Module):
         "the split picks the right bytes for the right head" a measurement
         instead of a claim.
 
-        ``inc-glm53f-100`` MOVES ONE BINDING AND NOTHING ELSE IN THIS METHOD: the
+        TENSOR PARALLELISM MOVES ONE BINDING AND NOTHING ELSE IN THIS METHOD: the
         head count below is now this rank's. Every line after it is untouched --
         the closed form, the reshape, the two permutes, the width comparison -- and
         that is the point: the split is per head, so once "heads" means this rank's
@@ -6954,9 +6954,9 @@ class Glm5NextMLAAttention(nn.Module):
         come out of ONE expansion and are split, which is why this is four
         dispatches and not five.
 
-        THE HEAD COUNT IS THIS RANK'S (``inc-glm53f-100``). This method has no
+        THE HEAD COUNT IS THIS RANK'S. This method has no
         production caller -- it is the DENSE path, kept as the oracle the absorbed
-        decode path is compared against, which is why ``inc-glm53f-042`` wrote a
+        decode path is compared against, which is why the decode section wrote a
         sibling rather than reuse it -- so it needs no reduction and gets no
         acceptance item of its own. The binding still moves, for two reasons that
         are not tidiness: it reads ``projection_widths`` two lines above, so a
@@ -6998,7 +6998,7 @@ class Glm5NextMLAAttention(nn.Module):
             value.contiguous().to(out_dtype),
         )
 
-    # -- RIDER on the projections section above -- ``inc-glm53f-042``, design
+    # -- RIDER on the projections section above -- the decode increment, design
     #    entry ``design-20260905-p`` ruling (iii). DISCLOSED, not silent.
     #
     #    WHAT THE RIDER IS. The absorbed decode path needs the NORMALISED LATENT
@@ -7016,7 +7016,7 @@ class Glm5NextMLAAttention(nn.Module):
     #
     #    WHAT IT COSTS. The three dispatches below repeat ``project_qkv``'s first
     #    three lines rather than being factored out of them. Factoring would edit
-    #    a landed method's body, and ``-039b``'s acceptance asserts that body's
+    #    a landed method's body, and the projections increment's acceptance asserts that body's
     #    behaviour; a behaviour-identical refactor is still a rewrite of code
     #    another increment's items stand on. Repetition that is visible beats a
     #    refactor that is invisible, so ``project_qkv`` above is untouched --
@@ -7025,14 +7025,14 @@ class Glm5NextMLAAttention(nn.Module):
     def project_query_latent(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """The NORMALISED query latent. ONE dispatch. ``[tokens, q_lora_rank]``, float32.
 
-        ADDITIVE, AND THAT IS THE WHOLE OF IT. ``inc-glm53f-051`` needs this exact
+        ADDITIVE, AND THAT IS THE WHOLE OF IT. The DSA indexer needs this exact
         value and no caller could obtain it: the sibling below computed it as its
         first two statements and returned only the query and the KV latent. This
         method is those two statements, named, and the sibling now calls it -- so
         the value has one producer instead of two copies, and the sibling's
         signature, returns and dispatch count are all unchanged. Authorised at
         design entry ``design-20260905-ad``; the D14 owner of this section is
-        ``inc-glm53f-039b`` and this is the only line of it that moves.
+        the projections increment and this is the only line of it that moves.
 
         WHO NEEDS IT AND WHY IT IS NOT AN INTERNAL. The DSA indexer's ``wq_b``
         projection contracts ``q_lora_rank``, so the indexer's input IS this
@@ -7052,7 +7052,7 @@ class Glm5NextMLAAttention(nn.Module):
         recomputes this latent inside ``project_query_and_latent``, so a DSA layer
         that calls the indexer and then ``attend()`` computes it twice. Threading
         the latent into ``attend()`` changes a landed signature with its own
-        callers, which is ``inc-glm53f-054``'s to do when it writes the 45-layer
+        callers, which is the layer forward's to do when it writes the 45-layer
         forward. The cost is one dispatch of a ``[tokens, 4096] x [4096, 1536]``
         projection per layer per phase, and it is declared in this increment's
         predictions rather than absorbed.
@@ -7088,13 +7088,13 @@ class Glm5NextMLAAttention(nn.Module):
         norm on the writer.
 
         THE FIRST TWO STATEMENTS NOW LIVE IN :meth:`project_query_latent`, and
-        nothing else about this method moved (``inc-glm53f-051``, entry
+        nothing else about this method moved (entry
         ``design-20260905-ad``). Same signature, same two returns, same THREE
         dispatches -- the extracted method performs the first of the three. The
         extraction exists because the DSA indexer needs that intermediate value
         and no caller could reach it while it was a local here.
 
-        THE HEAD COUNT IS THIS RANK'S (``inc-glm53f-100``), so the returned query
+        THE HEAD COUNT IS THIS RANK'S, so the returned query
         is ``[tokens, heads_on_this_rank, qk_nope_head_dim]``. This was the one
         site in the class where a full-count head reshape would NOT have raised:
         the reshape below divides the projection's own output width by the head
@@ -7139,7 +7139,7 @@ class Glm5NextMLAAttention(nn.Module):
         that calls this is another increment's and its layout is its own choice,
         not something this section should dictate.
 
-        THIS IS THE ROW-PARALLEL SITE, AND IT REDUCES (``inc-glm53f-100``). Under
+        THIS IS THE ROW-PARALLEL SITE, AND IT REDUCES. Under
         tensor parallelism the head width is this projection's INPUT, so each rank
         holds a slice of the weight's columns, contracts it against its own heads,
         and produces a PARTIAL SUM at the full output width -- every rank's result
@@ -7198,7 +7198,7 @@ class Glm5NextMLAAttention(nn.Module):
             collector.append(whole)
         return whole
 
-    # -- the DECODE section -- D14 owner: ``inc-glm53f-042`` -------------------
+    # -- the DECODE section -- D14 owner: the decode increment -------------------
     #
     # WHAT THIS SECTION IS FOR. It is the chain that turns hidden states into
     # attention output for this layer, and it is ONE method rather than a prefill
@@ -7212,10 +7212,10 @@ class Glm5NextMLAAttention(nn.Module):
     #   project_query_and_latent  three dispatches, this increment's rider
     #   the cache write           this increment
     #   the cache read            this increment
-    #   absorb-in                 ``inc-glm53f-097``'s seam, W_UK
-    #   sparse attention          ``inc-glm53f-040``/``-041``/``-093``'s seam
-    #   absorb-out                ``inc-glm53f-097``'s seam, W_UV
-    #   project_output            ``inc-glm53f-039b``'s method, called unchanged
+    #   absorb-in                 the NKI seam, W_UK
+    #   sparse attention          the landed sparse-attention seam
+    #   absorb-out                the NKI seam, W_UV
+    #   project_output            the projections increment's method, called unchanged
     #
     # WHY THE EXPANSION NEVER HAPPENS HERE. ``kv_b_proj`` expands a 512 latent to
     # 32,768 per token. The absorbed chain multiplies the QUERY by ``W_UK``
@@ -7225,7 +7225,7 @@ class Glm5NextMLAAttention(nn.Module):
     #
     # WHAT THIS SECTION DOES NOT OWN, and both absences are the design's:
     #   * TOP-K SELECTION. The sparse seam requires ``topk_indices`` and no block
-    #     on the plan produces them -- the DSA indexer is a ``-013`` stub that
+    #     on the plan produces them -- the DSA indexer is a skeleton stub that
     #     raises. So the indices are a caller's argument here. Recorded as a plan
     #     gap by the lead rather than improvised into this method.
     #   * THE SOFTMAX SCALE. No block registers a value for it, so it is a
@@ -7539,7 +7539,7 @@ class Glm5NextMLAAttention(nn.Module):
         disagree.
 
         THE INDICES PASS THROUGH UNCHANGED. Entry ``design-20260905-af`` route
-        (a) puts the ``-1`` mask inside ``inc-glm53f-098``'s kernel, so no filler,
+        (a) puts the ``-1`` mask inside the sparse kernel, so no filler,
         compaction, clamp or mask is applied between the indexer and ``attend()``
         -- this hands over exactly what the indexer returned. The sibling layer's
         forward states the same ruling, and this method is now the one place that
@@ -7550,7 +7550,7 @@ class Glm5NextMLAAttention(nn.Module):
         method computes for the indexer is computed a second time -- one
         ``[tokens, hidden_size] x [hidden_size, q_lora_rank]`` dispatch per layer
         per phase. :meth:`project_query_latent` declares that debt and names
-        ``inc-glm53f-054`` as its payer; paying it means threading the latent into
+        the layer forward as its payer; paying it means threading the latent into
         ``attend()``, which changes a landed signature whose own acceptance items
         call it positionally. That is a widening this block does not take, so the
         debt is carried forward and declared rather than absorbed in silence.
@@ -7612,14 +7612,14 @@ class Glm5NextMLAAttention(nn.Module):
 class Glm5NextDSALayer(nn.Module):
     """Decoder layer on the ``deepseek_sparse_attention`` half.
 
-    Section reserved for ``inc-glm53f-051`` (DSA runner integration and
+    Section reserved for the DSA increment (DSA runner integration and
     sequence tiling).
     """
 
     #: Attribute the family's attention module is bound to -- the map's own
     #: module path, which ``weight_loaders_fp8.py``'s ``_add_dsa_attention``
     #: builds as ``f"{param_prefix}.self_attn"``. RE-GROUNDED BY
-    #: ``inc-glm53f-082``: the old cite pointed at a line that is now the
+    #: the weight map: the old cite pointed at a line that is now the
     #: post-attention-layernorm mapping. The value itself does not move.
     ATTENTION_ATTR = "self_attn"
 
@@ -7653,7 +7653,7 @@ class Glm5NextDSALayer(nn.Module):
     ) -> int:
         """Give this layer's two mHC sites the six tensors the load brought.
 
-        ``inc-glm53f-030d``. THE SAME ONE-LINE DELEGATION AS THE KDA SIBLING, and
+        THE SAME ONE-LINE DELEGATION AS THE KDA SIBLING, and
         for once the duplication is only the signature: the rule itself lives once
         in :func:`_bind_hyper_connection_sites`, so the two halves cannot drift
         apart. ``_run_load_time_preps`` is the single production caller.
@@ -7706,9 +7706,9 @@ class Glm5NextDSALayer(nn.Module):
     ) -> torch.Tensor:
         """The sparse-attention half, mixed either by mHC or by a plain add.
 
-        THE ATTENTION HALF IS ONE CALL NOW (``inc-glm53f-054a``, a declared
+        THE ATTENTION HALF IS ONE CALL NOW (the layer forward, a declared
         second writer in this section by the invitation two paragraphs down: the
-        landed text names ``inc-glm53f-054`` as the increment that joins this
+        landed text names the 45-layer forward as the increment that joins this
         layer's halves). The three calls this method used to inline -- the query
         latent, the indexer, ``attend()`` -- are
         :meth:`Glm5NextMLAAttention.forward`'s body, unchanged in order,
@@ -7722,13 +7722,13 @@ class Glm5NextDSALayer(nn.Module):
 
         THE INDICES PASS THROUGH UNCHANGED, which is the ruling and the whole
         point of the shape. Entry ``design-20260905-af`` route (a) puts
-        the ``-1`` mask inside ``inc-glm53f-098``'s kernel, so no filler, no
+        the ``-1`` mask inside the sparse kernel, so no filler, no
         compaction, no clamp and no mask is applied between the indexer and
         ``attend()`` -- exactly what the indexer returned is handed over. The
         callee states the same ruling, and it is now the one place that realises
         it.
 
-        TWO ROUTES, AND THE KEYWORD PICKS ONE (``inc-glm53f-030d``, route R3). The
+        TWO ROUTES, AND THE KEYWORD PICKS ONE (route R3). The
         KDA sibling records the whole rule and this half behaves identically:
         ``streams`` absent is the plain residual add this method did before, and
         ``streams`` present runs the four-stream mHC pair around the same sparse
@@ -7737,8 +7737,8 @@ class Glm5NextDSALayer(nn.Module):
         ``attention_half`` so the two routes cannot disagree about what they wrap.
 
         WHAT THIS FORWARD STILL DOES NOT DO. ``self.mlp`` is not called here: the
-        feed-forward half is ``Glm5NextModel._ffn_half``'s (``inc-glm53f-054a``)
-        and its mHC site is composed there by ``inc-glm53f-030d`` part (a). The
+        feed-forward half is ``Glm5NextModel._ffn_half``'s (the 45-layer forward's)
+        and its mHC site is composed there by the mHC binding, part (a). The
         six mHC weights sit flat on this layer and its two sites are bound after
         the load, by :meth:`bind_hyper_connection_sites`.
 
@@ -7752,7 +7752,7 @@ class Glm5NextDSALayer(nn.Module):
         ``None``; the return is ``[T, H]`` in the input dtype on the one-stream
         route and ``[T, S, H]`` in the STREAMS' OWN DTYPE on the streams route.
 
-        THAT DTYPE CLAIM WAS STALE AND ``inc-glm53f-030d`` COMMIT 4 IS WHY. It said
+        THAT DTYPE CLAIM WAS STALE AND THE mHC BINDING'S COMMIT 4 IS WHY. It said
         fp32, "the combine seam's own return dtype". Commit 4 moved the cast:
         :meth:`Glm5NextHyperConnection.mhc_post` computes the mix in fp32 and
         returns ``mixed.to(residual.dtype)`` (``model_fp8.py:1414``), and its own
@@ -7825,8 +7825,8 @@ def _build_layer(
 
 
 # ---------------------------------------------------------------------------
-# The tree. D14 owner for this section: ``inc-glm53f-013`` (creator), then
-# ``inc-glm53f-054`` at M4, which replaces the stubs with the full 45-layer
+# The tree. D14 owner for this section: the skeleton (creator), then
+# the layer forward at M4, which replaces the stubs with the full 45-layer
 # forward.
 # ---------------------------------------------------------------------------
 
@@ -7942,7 +7942,7 @@ class Glm5NextModel(nn.Module):
             ]
         )
 
-    # ── forward (``inc-glm53f-054a``, item 6 of 7) ────────────────────────
+    # ── forward (item 6 of 7) ────────────────────────
 
     def _rms_norm(self, hidden_states: torch.Tensor, gain: torch.Tensor) -> torch.Tensor:
         """``x / sqrt(mean(x**2) + eps) * gain``, computed in fp32 and cast back.
@@ -7987,7 +7987,7 @@ class Glm5NextModel(nn.Module):
 
         WHY THIS LIVES HERE AND NOT IN THE LAYER FORWARDS. Both landed layer
         forwards end at the attention half and both say why in the same words --
-        *"this forward stops at the attention half and ``inc-glm53f-054`` joins the
+        *"this forward stops at the attention half and the model forward joins the
         halves when it writes the 45-layer forward"*. This is that 45-layer forward,
         and joining the halves here keeps both landed signatures byte-unchanged. It
         is not a stylistic preference: five landed call sites in three other
@@ -7995,7 +7995,7 @@ class Glm5NextModel(nn.Module):
         alone (measured, ``probe-054a-layer-callsites-r1``), and a required
         ``quant_config`` on either signature would redden all five. THE COST,
         DISCLOSED: ``Glm5NextDSALayer.forward`` and its KDA sibling stay
-        attention-half-only, so ``inc-glm53f-063``'s reference still mirrors them
+        attention-half-only, so the reference still mirrors them
         exactly and the revision-238 rider's re-derivation over the full layer is
         NOT triggered by this block.
 
@@ -8054,8 +8054,8 @@ class Glm5NextModel(nn.Module):
                 f"this forward has no route for anything else"
             )
 
-        # ---- THE ONE ROW-PARALLEL REDUCTION AT THE FFN SITE. ``inc-glm53f-054d``,
-        # and the rider ``inc-glm53f-054a`` left here: the routed bank's, the shared
+        # ---- THE ONE ROW-PARALLEL REDUCTION AT THE FFN SITE. A later addition,
+        # and the rider the layer forward left here: the routed bank's, the shared
         # expert's and the dense MLP's partial sums combine in ONE reduction.
         #
         # WHY ALL THREE MEET AT THIS LINE. Every FFN weight family that is declared
@@ -8077,7 +8077,7 @@ class Glm5NextModel(nn.Module):
         # ``functional/moe/moe_blockwise_fp8.py`` performs no collective at all. What
         # crosses the wire on the routed path is per-expert token COUNTS, not values.
         #
-        # THE GROUP, THE FORM AND THE PLACE ARE ``inc-glm53f-100``'s, not a second
+        # THE GROUP, THE FORM AND THE PLACE ARE ``_resolve_tp_group``'s, not a second
         # convention: :func:`_resolve_tp_group` returns ``None`` at world size 1, so a
         # single-rank run takes exactly the path it took before this increment -- no
         # collective and no vllm import -- and ``all_reduce`` is called as a statement
@@ -8118,7 +8118,7 @@ class Glm5NextModel(nn.Module):
         order, collapse, final norm.
 
         THE INTER-LAYER CARRIER IS ``[T, hc_mult, H]`` -- the checkpoint's four
-        parallel residual streams, not one. ``inc-glm53f-030d`` part (a) put it here,
+        parallel residual streams, not one. The mHC binding, part (a), put it here,
         and each of the three steps is the target model's own, cited rather than
         invented:
 
@@ -8143,7 +8143,7 @@ class Glm5NextModel(nn.Module):
         unaffected: it calls the layer class directly (``mtp.py:158``), never this
         method.
 
-        THE STACK IS FAMILY-BLIND, which is the property ``inc-glm53f-013`` built
+        THE STACK IS FAMILY-BLIND, which is the property the skeleton built
         ``get_kv_spec``'s one loop for and the reason this signature takes carriers
         as a SEQUENCE OF MAPPINGS rather than named cache arguments. The two
         families need different state -- the linear-attention layers take
@@ -8152,8 +8152,8 @@ class Glm5NextModel(nn.Module):
         both landed layer forwards declare their own. Each layer is handed its own
         mapping with ``**``, so this method holds no per-family branch at all and a
         new family costs it nothing. Building each mapping from the runner's caches
-        is ``inc-glm53f-054b``'s threading job, which is exactly the division the
-        plan records: ``-051`` declares the layer-side interface and ``-054``
+        is a later increment's threading job, which is exactly the division the
+        plan records: the DSA layer declares the layer-side interface and the layer forward
         threads it.
 
         THE SOFTMAX SCALE IS THE CALLER'S, NOT THIS METHOD'S. Each sparse-attention
@@ -8266,7 +8266,7 @@ class Glm5NextModel(nn.Module):
                 **({"collector": taps} if index in tap_layers else {}),
             )
             # THE FEED-FORWARD SITE, ``reference:1321-1327``. ``_ffn_half`` is
-            # ``inc-glm53f-054a``'s and is CALLED, never edited: the site collapses
+            # the 45-layer forward's and is CALLED, never edited: the site collapses
             # the streams, hands it the single ``[T, H]`` stream it has always taken,
             # and mixes its unchanged return back. ``streams`` is never ``None``
             # here, so this is a site or a refusal, never the plain add.
@@ -8306,10 +8306,10 @@ class Glm5NextModel(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# ``inc-glm53f-091`` -- weight loading support.
+# Weight loading support.
 #
 # D14: this constant and ``load_weights`` plus its two private helpers on the
-# class below are ``inc-glm53f-091``'s. ``inc-glm53f-054`` owns the 45-layer
+# class below are this section's. The layer forward owns the 45-layer
 # forward and every stub it replaces; nothing here touches one.
 # ---------------------------------------------------------------------------
 
@@ -8326,7 +8326,7 @@ class Glm5NextModel(nn.Module):
 _FP8_DTYPE = torch.float8_e4m3fn
 
 #: The leaf suffix every weight parameter in this tree carries, so a scale grid
-#: can be named from its weight. ``inc-glm53f-011``'s naming convention, read
+#: can be named from its weight. The weight map's naming convention, read
 #: rather than restated: the map's own parameter names end in it
 #: (``weight_loaders_fp8.py:295-298``).
 _WEIGHT_LEAF_SUFFIX = "_weight"
@@ -8335,7 +8335,7 @@ _WEIGHT_LEAF_SUFFIX = "_weight"
 def _scale_prep_leaves(module: nn.Module) -> list[str]:
     """The declared weight leaves whose scale grid is actually ON the module.
 
-    ``inc-glm53f-095b``. Factored out of
+    Factored out of
     :meth:`Glm5NextForConditionalGeneration._run_load_time_preps`, where the same
     derivation read the declaration tuple and nothing else.
 
@@ -8379,13 +8379,13 @@ def _publish_compute_frame_operands(
 ) -> int:
     """Put one module's dense-route weights in the frame the kernel multiplies in.
 
-    ``inc-glm53f-054a`` repair round 1, one definition for the dense MLP and the
+    Since repair round 1, one definition for the dense MLP and the
     shared expert, which load the same three projections onto the same seam.
     Returns how many projections were PUBLISHED at the granularity the dense kernel
     indexes -- the number the landed readings of this step already count. The
     transpose count and both frames go into the health record on ``health_attr``.
 
-    STEP 2 NO LONGER RETILES (``inc-glm53f-112``). It used to coarsen the
+    STEP 2 NO LONGER RETILES. It used to coarsen the
     checkpoint's ``128`` grid onto a ``256`` public grid and requantise the weight
     bytes with it, because the dense kernel indexed its scales by ``256`` blocks.
     The kernel now indexes the ``128`` blocks the checkpoint itself stores, so the
@@ -8397,10 +8397,10 @@ def _publish_compute_frame_operands(
     THREE STEPS, INDEPENDENT, IN THIS ORDER.
 
     1. Compensate the checkpoint's scale grid by the compensation factor, once
-       (``inc-glm53f-054c``). The loader squeezed the weight BYTES into the 240
+       (once only). The loader squeezed the weight BYTES into the 240
        range and attached these grids RAW, so without this step the product
        reaching the kernel is the SQUEEZE FACTOR times the checkpoint's -- ``240/448``
-       when this step was written, an exact ``1/2`` since ``inc-glm53f-054e``. The
+       when this step was written, an exact ``1/2`` since the factor moved. The
        factor is read from ``compensate_block_scales``, never written here. NEVER
        skipped and
        never conditional on extents -- the compensator's own platform gate decides
@@ -8427,13 +8427,13 @@ def _publish_compute_frame_operands(
     shard table shards gate and up on dim 0, "the intermediate width", ``:503-513``
     and ``:523-533``) -- while ``blockwise_fp8_mm`` reads its weight as ``[K, N]``
     with ``K`` the contraction extent (``blockwise_fp8_mm.scale_grid_shape``, whose
-    grid is ``(K // 128, N // 128)`` since ``inc-glm53f-112``). The two frames are
+    grid is ``(K // 128, N // 128)`` since the block narrowing). The two frames are
     opposite, so somebody must transpose.
 
     This package's recorded rule is that every consumer transposes at COMPUTE time
     (``weight_loaders_fp8.py:1764``), and this step deliberately does not follow
     it. The reason is not taste. :meth:`Glm5NextSharedExperts.prepare_scale_operands`
-    (``inc-glm53f-090``) builds the kernel scale operand ONCE at load, from the
+    builds the kernel scale operand ONCE at load, from the
     STORED weight's own extents, and ``_run_load_time_preps`` hands it the stored
     tensors. A forward that transposed would then multiply a transposed weight
     against an operand built from the other frame: the shapes agree, the numbers
@@ -8441,7 +8441,7 @@ def _publish_compute_frame_operands(
     reads the module keeps ONE frame authority for the whole load path, and costs
     one copy per projection per LOAD rather than one per token on the served path.
 
-    THE TRANSPOSE RUNS AFTER THE PUBLISH, and since ``inc-glm53f-112`` there is no
+    THE TRANSPOSE RUNS AFTER THE PUBLISH, and since the block narrowing there is no
     arithmetic between them to disturb: the publish attaches the grid the loader
     delivered and the transpose relabels two axes. A ``128`` block of the transposed
     weight is the transpose of the matching block of the original, so the scale that
@@ -8463,7 +8463,7 @@ def _publish_compute_frame_operands(
             different consumer, and no shape check downstream would object.
     """
     # ``SCALE_BLOCK_SIZE`` is the DENSE kernel's own declaration of the grid it
-    # indexes (128 since `inc-glm53f-112`); ``TILE_SIZE`` is the checkpoint's
+    # indexes (128 since the block narrowing); ``TILE_SIZE`` is the checkpoint's
     # tiling. They are equal today and are still read from their own modules, so
     # the day one moves this step follows the one that moved.
     from vllm_neuron.functional.blockwise_fp8_mm import SCALE_BLOCK_SIZE
@@ -8485,13 +8485,13 @@ def _publish_compute_frame_operands(
         rows, cols = int(weight.shape[0]), int(weight.shape[1])
         record: dict[str, object] = {"loader_frame": (rows, cols)}
 
-        # ---- THE SCALE COMPENSATION, EXACTLY ONCE PER GRID (``inc-glm53f-054c``).
+        # ---- THE SCALE COMPENSATION, EXACTLY ONCE PER GRID.
         # The weight BYTES arrive already squeezed into the 240 range by the loader
         # (``weight_loaders_fp8.py:2250`` -> ``:1346`` -> ``:1174``), while this file
         # attached their scale GRIDS raw (``:7734``/``:7743``). Only half a matched pair
         # ran, so the product the kernel multiplied was the squeeze factor times the
         # checkpoint's -- 240/448 = 53.5714% when this was written, an exact 50% since
-        # ``inc-glm53f-054e``. The loader's own module header states the pair -- squeeze the
+        # the factor moved. The loader's own module header states the pair -- squeeze the
         # bytes AND compensate the per-block scale by the inverse factor -- and
         # ``sharded_scale_grid_loader``'s docstring names THIS prep as the consumer that
         # owes the second half. Nothing did it: the file held zero calls to it.
@@ -8550,11 +8550,11 @@ def _publish_compute_frame_operands(
                     f"{grid_name} has shape {tuple(grid.shape)}; this step "
                     f"publishes the checkpoint's own {TILE_SIZE}-tile grid "
                     f"{checkpoint_grid} for a [{rows},{cols}] weight, which since "
-                    f"`inc-glm53f-112` is the grid the dense kernel indexes. A "
+                    f"the block narrowed is the grid the dense kernel indexes. A "
                     f"grid at any other granularity is refused rather than "
                     f"reshaped: it was built for a different consumer."
                 )
-            # NO RETILE, AND THAT IS THIS INCREMENT (`inc-glm53f-112`). This arm
+            # NO RETILE, AND THAT IS THIS INCREMENT. This arm
             # used to call ``retile_block_scales`` to coarsen the checkpoint's 128
             # grid onto a 256 public grid AND requantise the weight bytes against
             # the retained scale, because the dense kernel indexed its scales by
@@ -8573,7 +8573,7 @@ def _publish_compute_frame_operands(
                     "retiled": False,
                     "published": True,
                     "reason": (
-                        f"since `inc-glm53f-112` the dense kernel indexes the "
+                        f"the dense kernel now indexes the "
                         f"checkpoint's own {TILE_SIZE}-tile grid, so this "
                         f"projection is published as loaded and no retile runs"
                     ),
@@ -8605,13 +8605,13 @@ def _publish_compute_frame_operands(
         health[leaf] = record
     setattr(module, health_attr, health)
     # THE COUNT is how many projections left this step with a grid the dense kernel
-    # can index. Before `inc-glm53f-112` that meant "retiled onto the 256 public
+    # can index. Before the block narrowing that meant "retiled onto the 256 public
     # grid"; it now means "published at the checkpoint's own 128 grid".
     #
     # The set only GREW, and in one direction. Every whole-256 extent is a whole-128
     # extent, so nothing that counted before stops counting and the landed readings
     # that expect 3 still read 3. What is new is that an extent which is a whole 128
-    # block but not a whole 256 one -- 384, the width `inc-glm53f-101` recorded as
+    # block but not a whole 256 one -- 384, the width a load attempt recorded as
     # refused -- now counts instead of being skipped. That widening IS this
     # increment, and the landed items that asserted the narrower set are re-pinned
     # in this same commit.
@@ -8619,7 +8619,7 @@ def _publish_compute_frame_operands(
 
 
 # ---------------------------------------------------------------------------
-# The mHC bind -- ``inc-glm53f-030d`` part (c). One rule, called by both decoder
+# The mHC bind -- part (c). One rule, called by both decoder
 # layer families, run once per layer on the load path.
 # ---------------------------------------------------------------------------
 
@@ -8704,7 +8704,7 @@ def _mhc_site(
     Returns the named mHC site of ``module`` when the call carries streams, and
     ``None`` when the plain residual add is the right thing to do.
 
-    ONE RULE, TWO SITES (``inc-glm53f-030d`` part (a) generalised part (b)'s rule).
+    ONE RULE, TWO SITES (part (a) generalised part (b)'s rule).
     The attention half asks for ``MHC_ATTENTION_SITE`` from inside each layer
     forward; the feed-forward half asks for ``MHC_FFN_SITE`` from the carrier, which
     is where ``_ffn_half`` is called. Both ask the same question -- does this
@@ -8713,7 +8713,7 @@ def _mhc_site(
     :func:`_mhc_attention_site` and :func:`_mhc_ffn_site` are the two names, and
     they add nothing but the site.
 
-    ``inc-glm53f-030d`` part (b), route R3. The keyword is optional because two
+    Part (b), route R3. The keyword is optional because two
     callers need it absent -- the draft head hands this same sparse-attention class
     a one-stream ``[T, H]`` (``mtp.py:158``) and the checkpoint gives its layer
     none of the six mHC leaves -- and optional-with-a-default is exactly how a
@@ -8779,7 +8779,7 @@ def _mhc_ffn_site(
     """The feed-forward half's site, or ``None`` for the plain add.
 
     Asked by the carrier rather than by a layer, because ``_ffn_half`` is
-    ``Glm5NextModel``'s (``inc-glm53f-054a``) and the site therefore composes where
+    ``Glm5NextModel``'s and the site therefore composes where
     that call is made (``reference:1321-1327`` runs ``ffn_hc`` around ``mlp``).
     See :func:`_mhc_site` for the three answers.
     """
@@ -8966,7 +8966,7 @@ def _bind_hyper_connection_sites(
 class Glm5NextWeightLoadError(ValueError):
     """A checkpoint could not be read onto this model tree.
 
-    ``inc-glm53f-091``. A ``ValueError`` subclass to match the three named
+    A ``ValueError`` subclass to match the three named
     errors this file already raises (``Glm5NextHyperConnectionError``,
     ``Glm5NextBlockQuantRouteError``, ``Glm5NextSharedExpertRouteError``) rather
     than to make a claim about the failure being a file-system one -- the
@@ -9137,12 +9137,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 released[f"{module_path}.{leaf}" if module_path else leaf] = record
         return released
 
-    # ── weight loading (``inc-glm53f-091``) ──────────────────────────────
+    # ── weight loading ──────────────────────────────
 
     def _checkpoint_block_size(self) -> tuple[int, int]:
         """The quantisation block shape THIS CHECKPOINT declares, as two ints.
 
-        ``inc-glm53f-101``, remedy part 1. Read off
+        Under remedy part 1. Read off
         ``quantization_config.weight_block_size``, which ``config.py:458`` already
         lifts verbatim, so the rule that converts a weight shard into grid rows is
         told the checkpoint's own tile instead of taking the parser's fallback
@@ -9189,21 +9189,21 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
         A STACKED EXPERT BANK IS FP8 FOR THE SAME REASON A LONE QUANTISED WEIGHT
         IS, and is NAMED in the arm below rather than left to fall through.
-        ``inc-glm53f-095`` made a bank its own classifier kind; a kind this
+        The bank loader made a bank its own classifier kind; a kind this
         method did not name would fall past the ``quantised_weight`` arm, miss the
         sibling clause (a bank has no sibling scale ENTRY -- its scales are
         interleaved inside its own) and reach ``text_config.torch_dtype``. All 126
         bank placeholders on the real configuration would then be bf16 while
         their loader delivers fp8, and the reader warns on exactly that mismatch
         (``utils/checkpoints.py:437``, ``:570-575``). Settled from source before
-        the fourth kind was added, not after -- ``inc-glm53f-095``'s
+        the fourth kind was added, not after -- the bank loader's
         refusal-collision reading, recorded with that increment.
         This is the second consumer in "one classifier, two consumers", and it
         moves whenever the classifier gains a kind.
 
         THE SIBLING CLAUSE, AND THE DEFECT IT REPAIRS. A quantised weight whose
         scale travels in the SAME map entry classifies ``quantised_weight`` and
-        takes fp8 from the case above. But ``inc-glm53f-085`` gave each of the
+        takes fp8 from the case above. But the WP5 repair gave each of the
         four scaled MLA projections its own scale-grid entry, which left each of
         those weights ALONE in its entry -- and a lone weight key classifies
         ``plain``. Without the clause below they took the config dtype, the
@@ -9212,7 +9212,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         real dtype and returned the weight UNCHANGED. The dequant did nothing,
         silently, on every scaled projection of every sparse-attention layer,
         and the transpose that follows it operated on narrowed bytes -- exactly
-        the defect ``inc-glm53f-085`` exists to repair, arriving through the
+        the defect the dequant exists to repair, arriving through the
         placeholder dtype instead of through the transpose. Measured before this
         clause was written, with the dense-MLP two-key entry as the control that
         still reached the dequant:
@@ -9315,7 +9315,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         WHY IT IS TWO PASSES AND NOT ONE. Choosing a loader can REFUSE -- an
         expert bank has no loader in this package yet
         (:class:`~vllm_neuron.model.glm5_next.weight_loaders_fp8.Glm5NextExpertBankNotLoadableError`),
-        and ``inc-glm53f-095`` is where it gains one. A single pass that
+        and the bank loader is where it gains one. A single pass that
         registered as it went would leave every parameter before the refusing one
         registered and every one after it declared, which is a tree no later load
         can tell apart from a fresh one. So nothing is registered until every
@@ -9338,18 +9338,18 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 # May RAISE. Deliberately before the first registration below.
                 #
                 # ``owner`` is the module that DECLARED this parameter, and only
-                # ``inc-glm53f-095``'s expert-bank loader reads it: the expert
-                # geometry lives on ``Glm5NextRoutedExperts`` (``-031``) and
+                # the expert-bank loader reads it: the expert
+                # geometry lives on ``Glm5NextRoutedExperts`` and
                 # nowhere else, so the loader is handed the declaring module
                 # rather than deriving a second partition from the key count.
                 #
-                # ``geometry`` is ``inc-glm53f-094``'s addition and is THIS site's
+                # ``geometry`` is the shard table's addition and is THIS site's
                 # to resolve, because this is the only place that holds both
                 # halves: the declaring module, which knows its own widths, and
                 # ``self.world_size``, which no declaring class but two is told.
                 # It is ``None`` for every replicated family and at world size 1,
                 # so the path every landed test exercises is byte-for-byte the one
-                # ``inc-glm53f-091`` measured.
+                # the loader's acceptance measured.
                 loader = loader_for_mapped_keys(
                     checkpoint_keys,
                     param_name=name,
@@ -9417,7 +9417,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         ``None``, this method opens the real checkpoint on the line it always
         opened it.
 
-        ``inc-glm53f-091``. This method is what the runner already calls:
+        This method is what the runner already calls:
         ``neuron_model_runner.py:1299`` invokes ``self.model.load_weights(...)``
         with these three arguments and nothing guards it, so before this
         increment any non-CPU-compile run of this architecture raised
@@ -9440,7 +9440,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
            reader built, and the probe records that ``assign=False`` raises on a
            lazy placeholder.
 
-        SHARDING LANDS WITH ``inc-glm53f-094``, named here rather than left as a
+        SHARDING LANDS WITH THE SHARD TABLE, named here rather than left as a
         surprise. The rank resolved here reaches no loader that uses it: neither
         loader this package defines shards, and ``blockwise_scale_loader``'s own
         docstring records that a sharded scale grid "follows the weight's own
@@ -9448,7 +9448,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         So at a world size above one every rank reads the WHOLE tensor, while
         this file's modules already describe per-rank geometry (``_per_rank``
         above). That gap is the landed position of this package, inherited here
-        rather than introduced, and ``inc-glm53f-094`` closes it by attaching the
+        rather than introduced, and the shard table closes it by attaching the
         per-module shard loaders the pin already ships
         (``utils/weight_loader.py:139-146`` and ``:105-130``, which is how
         ``qwen3`` shards). The rank is resolved and passed now because the
@@ -9456,7 +9456,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         that increment needs no change here.
 
         A ROUTED EXPERT BANK NOW LOADS, AND WHAT STILL REFUSES IS NAMED
-        (``inc-glm53f-095``). Step 3 used to raise
+        (the bank loader). Step 3 used to raise
         :class:`~vllm_neuron.model.glm5_next.weight_loaders_fp8.Glm5NextExpertBankNotLoadableError`
         on EVERY map entry carrying more than one scale key, because every loader
         this package defined kept ``slices[0][:]`` and dropped 287 of 288 experts
@@ -9490,7 +9490,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
         # The two quantisation settings sit on the TOP-LEVEL config, not on the
         # text config: ``config.py:400`` and ``:408`` are members of
-        # ``Glm5NextConfig`` because ``inc-glm53f-079`` lifted them from the
+        # ``Glm5NextConfig`` because the config adapter lifted them from the
         # checkpoint's top-level ``quantization_config``. ``torch_dtype`` is the
         # text config's own (``:159``). Reading either off the wrong object
         # raises ``AttributeError`` rather than defaulting, which is why this
@@ -9526,7 +9526,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         self.load_state_dict(rank_sharded, strict=False, assign=True)
 
         # Everything below runs AFTER the line above, and that is the whole
-        # ordering contract of ``inc-glm53f-091b``: the line above is what turns
+        # ordering contract of this method: the line above is what turns
         # a shape-free placeholder into a real on-device tensor, so a scale read
         # or a prep placed before it would work on placeholders. The acceptance
         # reads the three source positions rather than trusting this comment.
@@ -9550,7 +9550,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         (``weight_loaders_fp8.py:1342``) -- it keeps the WEIGHT slice and drops
         the companion, so the scale reaches nothing through the reader.
         Widening the map so each of those scales became its own parameter would
-        move ``inc-glm53f-085``'s asserted difference set
+        move the WP5 repair's asserted difference set
         (``test/vllm_neuron/model/glm5_next/test_kv_spec.py:840-848``), and that
         is a lead call this block does not take. So the scales are read here
         instead, on the fork's own landed precedent for exactly this problem:
@@ -9581,17 +9581,17 @@ class Glm5NextForConditionalGeneration(nn.Module):
         name to ``named_parameters()`` that the map does not carry, which is the
         map widening this method exists to avoid.
 
-        AND A ROUTED EXPERT BANK IS READ HERE TOO, added by ``inc-glm53f-095b``.
+        AND A ROUTED EXPERT BANK IS READ HERE TOO, added with the bank loader.
         A bank's E scale grids are interleaved with its E weight keys inside ONE
         map entry, so the lone-grid path below cannot see them: it wants a single
         companion scale and finds E. The bank branch asks the landed classifier
-        whether an entry is a bank, hands the whole key list to ``-095``'s
+        whether an entry is a bank, hands the whole key list to the landed
         stacking loader, and stores the result under the SAME plain-attribute
         name -- so the bank gains three attributes per layer while
         ``named_parameters()``, ``build_weight_mappings`` and
-        ``inc-glm53f-085``'s asserted set stay where they landed. The
+        the WP5 repair's asserted set stay where they landed. The
         kernel-side consumption of those grids is
-        ``inc-glm53f-054``: no module in this file declares a
+        later work: no module in this file declares a
         ``prepare_scale_operands`` for a bank yet, so the prep loop does not
         visit one.
 
@@ -9612,7 +9612,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             key_list = [keys] if isinstance(keys, str) else list(keys)
             scales = scale_keys(key_list)
             if classify_mapped_keys(key_list) == MAPPED_KEY_STACKED_BANK:
-                # ``inc-glm53f-095b``. A BANK DOES REACH HERE, and it is the one
+                # A BANK DOES REACH HERE, and it is the one
                 # entry shape the lone-grid path below cannot serve: its E scale
                 # grids travel interleaved with its E weight keys inside this one
                 # entry, so there is no companion entry to read and no single
@@ -9650,7 +9650,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                         f"would use the bytes as if they were numbers"
                     )
                 module = self.get_submodule(module_path) if module_path else self
-                # ``-095``'s landed loader is what de-interleaves and stacks
+                # The bank's landed loader is what de-interleaves and stacks
                 # these grids -- this rank's experts through
                 # ``local_expert_indices``, each grid compensated by
                 # ``compensate_block_scales``, stacked on the leading axis in
@@ -9658,7 +9658,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 # ``[e]``. It was landed "to be CALLED rather than attached"
                 # (``weight_loaders_fp8.py:2136-2143``) and this is that caller.
                 #
-                # ``inc-glm53f-101``. The bank's geometry now reaches this call, so
+                # The bank's geometry now reaches this call, so
                 # a column-sharded bank gets column-sharded grids. ``None`` at
                 # expert-parallel degree 1 and at world size 1, which is every
                 # landed reading of this branch.
@@ -9701,7 +9701,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     f"they were numbers"
                 )
             module = self.get_submodule(module_path) if module_path else self
-            # ``inc-glm53f-094``. A SHARDED WEIGHT'S GRID IS SHARDED WITH IT, and
+            # A SHARDED WEIGHT'S GRID IS SHARDED WITH IT, and
             # this is the only route such a grid travels. The grid of a dense-MLP
             # projection is not a declared parameter -- it arrives in the same map
             # entry as its weight (``weight_loaders_fp8.py:628-633`` pairs them
@@ -9720,7 +9720,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 grid = checkpoint._get_slice(scales[0])[:]
             else:
                 # The block shape is THIS CHECKPOINT'S, threaded rather than
-                # defaulted (``inc-glm53f-101``, remedy part 1). Read here, inside
+                # defaulted (remedy part 1). Read here, inside
                 # the branch that already found a scale grid, so a checkpoint with
                 # no grids never has to declare one.
                 grid = sharded_scale_grid_loader(
@@ -9759,7 +9759,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         (``PLAIN_DICT_IS_LEFT_BEHIND=True``). Neither prep checks a device: the
         ``.device`` count inside ``prepare_scale_operands`` is 0 and inside
         ``to_kernel_scale_layout`` is 0. The refusal therefore has to live on the
-        caller's side, and ``inc-glm53f-090``'s method and this file's
+        caller's side, and the ``prepare_scale_operands`` method and this file's
         shared-expert section stay byte-frozen.
         """
         projection_calls = 0
@@ -9770,7 +9770,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 self._require_prep_operands_on_device(path, module, names, device)
                 module.prepare_projection_weights()
                 projection_calls += 1
-                # ``inc-glm53f-042``. The absorb split reads the PREPARED
+                # The absorb split reads the PREPARED
                 # ``kv_b_proj``, so it has to run after the prep that builds it
                 # -- here, immediately after, behind the same device pre-flight
                 # and inside the same single production call site. A module that
@@ -9779,17 +9779,17 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 # expert path is untouched.
                 #
                 # IT ADDS NO RETURN VALUE ON PURPOSE. This method returns
-                # ``(projection calls, scale calls)`` and ``inc-glm53f-091``'s
+                # ``(projection calls, scale calls)`` and the loader's
                 # items read that pair; a third element would change a landed
                 # contract for a count the acceptance can read straight off the
                 # module. So the signature stays exactly as it landed.
                 if hasattr(type(module), "prepare_absorb_weights"):
                     module.prepare_absorb_weights()
-            # ``inc-glm53f-054a`` hand-off item (iv). The checkpoint's grids are at
+            # Hand-off item (iv). The checkpoint's grids are at
             # 128-tile granularity and arrive in the loader's frame, so the bridge
             # runs HERE -- on the load path, after the shards are attached and
             # BEFORE the prep reads the grid two branches below. It used to bridge
-            # the GRANULARITY too, onto a 256 public grid; since ``inc-glm53f-112``
+            # the GRANULARITY too, onto a 256 public grid; since the block narrowing
             # the prep consumes the checkpoint's own 128 grid and only the FRAME is
             # bridged. Gated by the same ``hasattr`` test this loop already
             # uses on the preps, so a module that declares no retile is skipped and
@@ -9797,7 +9797,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             #
             # IT ADDS NO RETURN VALUE, on the precedent recorded for
             # ``prepare_absorb_weights`` above: this method returns
-            # ``(projection calls, scale calls)`` and ``inc-glm53f-091``'s items
+            # ``(projection calls, scale calls)`` and the loader's items
             # read that pair, so the signature stays exactly as it landed. What the
             # retile did is on the module, in its own health record.
             if hasattr(type(module), "retile_checkpoint_scale_grids"):
@@ -9810,7 +9810,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             if hasattr(type(module), "prepare_scale_operands"):
                 # The projection names come off the module's OWN declaration
                 # tuple, so this call cannot ask for a projection the shared
-                # expert does not have -- and, since ``inc-glm53f-095b`` factored
+                # expert does not have -- and, since the bank loader factored
                 # the derivation into ``_scale_prep_leaves``, only for one whose
                 # scale grid is present to be read two lines below. Passed by
                 # KEYWORD: the prep takes six positional operands and a silent
@@ -9836,7 +9836,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             released = getattr(type(module), "RELEASED_AFTER_PREP", ())
             if released:
                 _release_replaced_parameters(module, *released)
-            # ``inc-glm53f-030d`` part (c), THE mHC BIND, on the same
+            # Part (c), THE mHC BIND, on the same
             # ``hasattr`` gate the three steps above use. It fires on the two
             # decoder layer classes, and those two declare none of the three
             # preps, so this branch adds a step to the walk without reordering
@@ -9845,7 +9845,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             # IT ADDS NO RETURN VALUE, on the precedent recorded for
             # ``prepare_absorb_weights`` and the retile above: this method
             # returns ``(projection calls, scale calls)`` and
-            # ``inc-glm53f-091``'s items read that pair. What the bind did is on
+            # the loader's items read that pair. What the bind did is on
             # the layer, in its own record.
             #
             # ``self.text_config`` is passed because both site instances are
@@ -9925,14 +9925,14 @@ class Glm5NextForConditionalGeneration(nn.Module):
         THE FOUR RECURRENT-STATE FIELDS ARE FILLED BY THE SAME UNIFORM READ.
         A linear-attention layer holds a short-convolution state and a
         recurrent state instead of a key/value history, and reports the two on
-        ``LayerSpec``'s four ``kda_*`` fields (``inc-glm53f-015``'s declared
+        ``LayerSpec``'s four ``kda_*`` fields (the cache spec's declared
         interface). ``Glm5NextKDAAttention`` derives all four from vLLM's own
         state calculators at its own rank geometry; ``Glm5NextMLAAttention``
         declares none of them. So the read is a DEFAULTING one -- a family that
         carries no recurrent state reports ``None`` on all four by carrying no
         attribute, rather than by this method testing which family it is
         looking at. That keeps the one loop family-blind, which is the property
-        ``inc-glm53f-013`` built it for, and it is why the runner recognises the
+        the skeleton built it for, and it is why the runner recognises the
         two halves BY THE FIELDS THEY CARRY (``neuron_model_runner.py``
         ``:9193-9199``) rather than by a layer name.
 
@@ -9977,7 +9977,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         (``neuron_model_runner.py:9142``, inside ``initialize_kv_cache`` ``:8930``,
         which the worker runs at ``neuron_worker.py:1101``). Five of the six shipped
         model families define it; this one did not, so a GLM-5.3-Flash serve raised
-        ``AttributeError`` there before any forward ran. ``inc-glm53f-054b`` adds it
+        ``AttributeError`` there before any forward ran. The runner integration adds it
         at plan revision 276.
 
         IT IS A MAPPER AND NOTHING ELSE: it allocates no tensor, copies no tensor,
@@ -10021,10 +10021,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
         needs is already on the spec the model itself produced, so the loop walks
         the spec and the stack length is checked against it; that keeps this method
         a mapping of the runner's dict and leaves every per-layer authority where
-        ``inc-glm53f-013`` put it.
+        the skeleton put it.
 
         The records land on ``glm5next_layer_banks``, in stack order, one mapping
-        per layer. ``inc-glm53f-054b``'s runner side reads that attribute and builds
+        per layer. The runner side reads that attribute and builds
         each layer's carrier from it; nothing else in this tree reads it, and no
         forward line of this file moves for it. A plain tuple of plain dicts is
         deliberate: ``nn.Module.__setattr__`` leaves it alone, so ``_apply`` never
@@ -10163,7 +10163,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         WHICH ARM IS PRODUCTION, MEASURED RATHER THAN ASSUMED. The real
         checkpoint declares ``tie_word_embeddings`` **false**
         (``test/vllm_neuron/model/glm5_next/fixtures/hf-config.json``, the
-        byte-identical copy ``inc-glm53f-078`` landed), so the untied arm is the
+        byte-identical copy the weight map landed), so the untied arm is the
         one this campaign's gates run and the tied arm exists because the config
         admits it -- ``config.py:494-497`` lifts the flag from the checkpoint's
         top level, and ``__init__`` above declares ``lm_head_weight`` only when
@@ -10208,9 +10208,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Logits for the rows the caller wants sampled: stack, select, project.
 
-        THE EXCLUSION THAT STOOD HERE IS RETIRED BY ``inc-glm53f-030d``. This note
+        THE EXCLUSION THAT STOOD HERE IS RETIRED BY THE mHC BINDING. This note
         used to say the inter-layer carrier was a one-stream ``[T, H]`` add, that
-        the checkpoint's four-stream mHC carrier was ``inc-glm53f-030b``'s, and
+        the checkpoint's four-stream mHC carrier was later work, and
         that the tensor this method projects was therefore not the reference's at
         ``hc_mult`` > 1. **All three clauses are now false.**
         :meth:`Glm5NextModel.forward` expands the embedding across the stream axis
@@ -10264,7 +10264,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         sampler on this class and no ``on_device_sampling_config``. A sink would
         accept those three silently and return unsampled logits while reporting
         success. Naming the parameters instead makes an unconsumed key a
-        ``TypeError`` at the call, which is what ``inc-glm53f-054b`` needs while
+        ``TypeError`` at the call, which is what the runner integration needs while
         it converts those dicts. Turning the sampling keys into behaviour is NOT
         this half's work and is not smuggled in here.
 
@@ -10292,7 +10292,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             layer_carriers: one mapping per layer, in stack order, forwarded
                 unread to :meth:`Glm5NextModel.forward`, which refuses a count
                 that disagrees with the stack. Building them from the runner's
-                caches is ``inc-glm53f-054b``'s job.
+                caches is the runner integration's job.
             sampling_positions: row indices into the stack output to project,
                 the runner's ``logits_indices``.
             block_size: tokens per block, forwarded to the expert bank unread.

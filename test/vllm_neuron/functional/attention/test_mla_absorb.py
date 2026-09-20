@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Acceptance for `inc-glm53f-097` -- the MLA absorb kernel.
+"""Acceptance for the MLA absorb kernel.
 
-THREE tests, one per counted conjunct of the increment plan's `inc-glm53f-097`
+THREE tests, one per counted conjunct of the increment plan's
 Acceptance bullet, and NO `parametrize` decorator in this file: the plan requires
 exactly 3 collected items, and a parametrized case would collect as several items
 for one conjunct, so the count would stop meaning what it says. Each conjunct's
@@ -10,7 +10,7 @@ value. Conjunct 3 asserts the absence of `parametrize` by reading this file's ow
 source, so the count cannot drift without a test going red.
 
 THIS FILE ANSWERS "DOES THE KERNEL COMPUTE THE PER-HEAD BATCHED MATMUL?" AND
-NOTHING ELSE. Whether anything is wired to the seam is `inc-glm53f-042`'s question,
+NOTHING ELSE. Whether anything is wired to the seam is the decode path's question,
 asked in its own file, and so is where `W_UK` and `W_UV` come from. Keeping them
 apart is deliberate: in one file either increment's counted predicate could be
 satisfied by the other increment's items.
@@ -66,7 +66,7 @@ ABSORB_OUT_K, ABSORB_OUT_N = 512, 256
 
 #: THE TOLERANCE IS READ FROM THE PLAN AND NOT AUTHORED HERE. This increment's
 #: boundary states it authors no criterion or tolerance; both numbers are the
-#: `inc-glm53f-097` Acceptance bullet's, verbatim, and the argument order the bullet
+#: The Acceptance bullet's, verbatim, and the argument order the bullet
 #: fixes is kernel first, oracle second.
 RTOL = 1e-2
 ATOL = 1e-5
@@ -81,7 +81,7 @@ ATOL = 1e-5
 #: axes: `K` is 256 or 512, whole multiples of the 128-wide contraction tile, and
 #: `N` is 512 or 256 against a 512-wide output tile. So the three declared cases
 #: CANNOT FAIL if the ragged contraction or output tail is broken, and the sibling
-#: increment `-039a` shipped with exactly that hole -- review finding
+#: increment shipped with exactly that hole -- review finding
 #: `B37-M1-ragged-tail-uncovered-by-acceptance`, where a dropped ragged tail
 #: returned never-written memory and its suite still read all green. Repeating a
 #: finding this campaign has already paid for would be the avoidable kind.

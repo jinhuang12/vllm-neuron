@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""``inc-glm53f-091`` -- the end-to-end weight LOADING entry point.
+"""``load_weights`` -- the end-to-end weight LOADING entry point.
 
 THIRTEEN counted items and no ``parametrize`` decorator anywhere in this file
-(D1.2). The first four are ``inc-glm53f-091a``'s, one per conjunct. The next five
-are ``inc-glm53f-091b``'s: the fp32 scale grids, the orphan call-site count, the
+(D1.2). The first four are the entry point's, one per conjunct. The next five
+are the second group's: the fp32 scale grids, the orphan call-site count, the
 loader arity contract, the prep ordering, and the placeholder dtype of a scaled
-MLA weight. The last four are ``inc-glm53f-095``'s stacked expert bank, one per
+MLA weight. The last four are the stacked expert bank's, one per
 conjunct, and the count moved from NINE to THIRTEEN there. Each group is kept in
 the order it landed and every item names the conjunct it reads, so no group's
 items can be satisfied by another group's work.
@@ -23,7 +23,7 @@ index, which holds no tensors at all.
 WHY TWO MINIATURE CONFIGURATIONS AND NOT ONE. A routed expert bank arrives as
 ONE map entry holding every expert's key, and no loader in this package stacks
 experts yet, so ``load_weights`` REFUSES such an entry by name and
-``inc-glm53f-095`` is where it stops refusing. A configuration whose layers are
+the stacked-bank loader is where it stops refusing. A configuration whose layers are
 all dense therefore loads, and a configuration with a routed bank refuses --
 both are readings of conjunct 1 rather than one working case and one skipped
 one. :func:`_dense_config` and :func:`_routed_config` are those two, and the
@@ -99,7 +99,7 @@ from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 # --------------------------------------------------------------------------- #
 # The real published fixtures, and the two exclusion prefixes.
 #
-# Both constants are ``inc-glm53f-078``'s, named here exactly as that increment
+# Both constants are the coverage item's, named here exactly as its increment
 # named them so conjunct 2's population is the same partition its landed items
 # assert rather than a second one that happens to agree today.
 # --------------------------------------------------------------------------- #
@@ -111,7 +111,7 @@ REAL_CONFIG_PATH = FIXTURES_DIR / "hf-config.json"
 MTP_LAYER_PREFIX = "model.language_model.layers.45."
 VISION_PREFIX = "model.visual."
 
-#: ``inc-glm53f-078``'s counts off the published index, and the subtraction that
+#: The coverage item's counts off the published index, and the subtraction that
 #: produces the in-scope population conjunct 2 is measured over.
 REAL_INDEX_TOTAL_KEYS = 76_108
 REAL_INDEX_MTP_KEYS = 1_760
@@ -182,10 +182,10 @@ FLOAT32_MIX_CHECKPOINT_LEAVES = tuple(
 #: and the shape reader below cannot disagree about where it is.
 MINI_CHECKPOINT_FILE = "model.safetensors"
 
-#: The five MLA widths, shrunk by ``inc-glm53f-091b`` so the sparse-attention
+#: The five MLA widths, shrunk so the sparse-attention
 #: layer's projections can be written at their REAL closed-form shapes.
 #:
-#: WHY THEY MOVED. ``-091b`` calls ``prepare_projection_weights`` at the end of
+#: WHY THEY MOVED. The second group calls ``prepare_projection_weights`` at the end of
 #: the load, and that method checks each weight against
 #: ``projection_widths()``'s closed form. At the config's own widths the closed
 #: forms run to ``(16384, 1536)``, so a checkpoint holding them is hundreds of
@@ -294,7 +294,7 @@ def _mla_key_overrides(
 ) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
     """The MLA family's real shapes and dtypes, per checkpoint key.
 
-    ``inc-glm53f-091b``. Every other key in the miniature checkpoint is written
+    Every other key in the miniature checkpoint is written
     at an arbitrary shape, because nothing reads one. The sparse-attention
     projections are the exception: ``prepare_projection_weights`` checks each of
     them against ``projection_widths()``, so a ``(4,)`` placeholder shape makes
@@ -307,7 +307,7 @@ def _mla_key_overrides(
     naming convention that could drift from the one the loader reads.
 
     THE PARAMETER NAME NOW COMES FROM THE MODULE TOO, and that is this function's
-    ``inc-glm53f-051`` repair rather than a refinement. Appending ``_weight`` to a
+    repair rather than a refinement. Appending ``_weight`` to a
     site name WAS the second naming convention the paragraph above warns about,
     and it drifted the moment a projection site arrived whose parameter is a bare
     checkpoint tensor: ``Glm5NextDSAIndexer``'s ``index_kpool_compress_gate`` has
@@ -386,7 +386,7 @@ def _write_miniature_checkpoint(
     ``prepare_projection_weights`` checks it. Nothing here asserts a shape.
 
     ``extra_overrides`` SUPPLIES WHOLE TENSORS, not shapes, and it is
-    ``inc-glm53f-094``'s one change here. Every tensor this writer builds itself is
+    the shard geometry's one change here. Every tensor this writer builds itself is
     CONSTANT (``torch.ones``, ``torch.full``), which is enough for a reading that
     counts tensors and wrong for a reading that asks WHICH ROWS a rank got: against
     a constant, any slice passes for any other. A caller that measures indexing
@@ -397,7 +397,7 @@ def _write_miniature_checkpoint(
     for keys in mappings.values():
         key_list = [keys] if isinstance(keys, str) else list(keys)
         # A BANK IS QUANTISED TOO, and saying so here is not a new behaviour --
-        # it is how this writer already behaved before ``inc-glm53f-095`` gave a
+        # it is how this writer already behaved before the stacked-bank load gave a
         # bank its own classifier kind. Until then a bank answered
         # ``MAPPED_KEY_QUANTISED_WEIGHT`` and its weight keys were written as
         # fp8 at ``MINI_WEIGHT_SHAPE``; with the fourth kind and this line
@@ -462,7 +462,7 @@ def _implied_numels(
       :func:`blockwise_scale_loader`, which compensates the grid and returns it
       at its own shape. So that key is the population.
     * an EXPERT BANK is loaded by :func:`stacked_expert_bank_loader`
-      (``inc-glm53f-095``), which stacks one rank's expert weights and leaves
+      which stacks one rank's expert weights and leaves
       their scales to their own loader. So the population is again the weight
       keys, and at expert-parallel degree 1 -- every configuration in this file
       -- one rank owns every expert, so the sum below is the whole bank. The
@@ -644,9 +644,9 @@ def test_every_declared_parameter_is_materialised_and_loaded(
     and 0 materialised placeholders. The refusal IS the reading here. A skipped
     parameter would not be.
 
-    RE-ANCHORED BY ``inc-glm53f-095`` (design entry ``design-20260905-r``). This
+    RE-ANCHORED BY THE STACKED-BANK LOAD (design entry ``design-20260905-r``). This
     reading used to exercise the refusal on a WELL-FORMED bank, which was correct
-    while no loader in the package could stack one. ``-095`` gives that case a
+    while no loader in the package could stack one. The stacked-bank load gives that case a
     loader, so the old form asserted a refusal the package no longer owes --
     measured before a line of it was written, in
     ``increments/probe-095-refusal-collision-host-r2.out``: the nine items here
@@ -654,7 +654,7 @@ def test_every_declared_parameter_is_materialised_and_loaded(
     monkeypatched away, this item being one of the two. What the reading
     CERTIFIES is unchanged -- that a refusal on the load path leaves the tree
     byte-for-byte as it arrived -- so it moved to the bank shape that still
-    refuses rather than being deleted. It doubles as ``-095`` conjunct (1)'s
+    refuses rather than being deleted. It doubles as the stacked bank's conjunct (1)'s
     control, where the same bank WITH its geometry declared loads E/E experts.
 
     (iii) On the dense configuration, every mapped parameter's loaded element
@@ -668,7 +668,7 @@ def test_every_declared_parameter_is_materialised_and_loaded(
     DISCLOSED SCOPE OF (iii), so no reader over-reads it. On the dense
     population every entry has exactly ONE weight key, and the run prints that
     count. So (iii) cannot fire on the dropped-slice class HERE; reading (ii) is
-    what holds that class at this increment, and ``inc-glm53f-095``'s first
+    what holds that class at this increment, and the stacked bank's first
     conjunct is (iii) again on a bank, which is where it becomes that detector.
     What (iii) certifies here is the whole transform chain: a compensation, a
     downscale or a future shard that changed an element count reddens it.
@@ -826,7 +826,7 @@ def test_the_map_load_weights_hands_over_covers_the_in_scope_index(
 
     Certifies the INTEGRATION -- that ``load_weights`` did not drop, rename or
     double-claim a family on the way to the reader. ``build_weight_mappings`` in
-    isolation is already certified by ``inc-glm53f-078``'s
+    isolation is already certified by its own
     ``test_skeleton_real_index_coverage_is_one_hundred_percent``; this is a
     different claim about a different subject.
 
@@ -839,7 +839,7 @@ def test_the_map_load_weights_hands_over_covers_the_in_scope_index(
 
     HOW: THE CAPTURE IS AT THE HAND-OVER ITSELF. RE-ANCHORED by plan revision 182
     ruling (b) and by the B65r2 rider (revision 161), which said this observer
-    moves to the reader call when ``inc-glm53f-095`` lands. It could not before: a
+    moves to the reader call when the stacked-bank load lands. It could not before: a
     routed expert bank refused inside step 3, so no run reached the reader and the
     observer sat one step earlier, on ``_materialise_declared_parameters``, with a
     7-line window after it in which an in-place mutation of ``mappings`` would
@@ -853,7 +853,7 @@ def test_the_map_load_weights_hands_over_covers_the_in_scope_index(
     keeps this run off the process group that reader's default store needs. The
     earlier form ended on a bank refusal that belongs to conjunct 1 of
     ``test_every_declared_parameter_is_materialised_and_loaded``, and
-    ``inc-glm53f-095`` was about to remove it.
+    the stacked-bank load was about to remove it.
 
     TWO READINGS RE-EXPRESSED, NONE LOST. The 576 and 288 key counts came out of
     the refusal message; they are readings on the captured bank entries now, one
@@ -867,7 +867,7 @@ def test_the_map_load_weights_hands_over_covers_the_in_scope_index(
     exists for the reader's default-store call inside ``load_sharded_pipelined``,
     which ``_MapCaptured`` guarantees this run never reaches.
 
-    The population is ``inc-glm53f-078``'s in-scope partition of the published
+    The population is the coverage item's in-scope partition of the published
     index, re-derived here from the fixture rather than restated: a count over
     the raw 76,108 keys would read 2,107 unclaimed and would be the WRONG
     population, because layer 45 is the multi-token-prediction layer and the
@@ -1091,12 +1091,12 @@ def test_an_absent_checkpoint_refuses_by_name_and_leaves_the_tree_alone(
 
 
 # --------------------------------------------------------------------------- #
-# ``inc-glm53f-091b`` -- conjuncts 4, 5, 6 and 8, plus the placeholder-dtype
+# The second half -- conjuncts 4, 5, 6 and 8, plus the placeholder-dtype
 # item the rev 165 ruling added.
 #
 # FIVE more counted items, one per conjunct and one for the ruling, which took
 # this file to NINE with no ``parametrize`` decorator anywhere in it (D1.2).
-# ``inc-glm53f-095``'s four take it to THIRTEEN, below. The helpers below belong to
+# The stacked bank's four take it to THIRTEEN, below. The helpers below belong to
 # this half and are kept together so a reader can see which half owns what.
 # --------------------------------------------------------------------------- #
 
@@ -1139,7 +1139,7 @@ def _scale_attribute_of(param_name: str) -> tuple[str, str]:
 
 
 def _derived_dsa_scale_names(config: Glm5NextConfig) -> set[str]:
-    """``inc-glm53f-085``'s difference set, DERIVED and never typed as 44.
+    """The sparse-attention scale-grid difference set, DERIVED and never typed as 44.
 
     B65-N3's ask. The size comes from the sparse-attention layer set the config
     declares times the landed projection tuple, so a config with a different
@@ -1248,7 +1248,7 @@ def _statement_positions(method, *, calls: tuple[str, ...], anchor: str):
 
     EARLIEST FOR A CALL, LATEST FOR THE ANCHOR, with every position found
     printed. RE-ANCHORED by rider B69r2-N3 (plan revision 180) at
-    ``inc-glm53f-095``, the first increment to touch this file since. An earlier
+    the stacked-bank load, the first increment to touch this file since. An earlier
     form kept ONE position per callee and overwrote it, so a SECOND, EARLY call to
     the same callee moved neither of conjunct 8's ordering reads: the misplaced
     call was invisible to both, and only the miniature's dynamic pre-flight could
@@ -1402,7 +1402,7 @@ def test_the_scale_grids_stay_fp32(
     (i) every dropped scale arrives fp32 on the target device; (ii) every scale
     grid that DOES travel through the map arrives fp32 too; (iii) the load emits
     no dtype-override line, with a control that makes that zero mean something;
-    (iv) ``inc-glm53f-085``'s difference set is what this file DERIVES it to be
+    (iv) the scale-grid difference set is what this file DERIVES it to be
     rather than the literal 44 (B65-N3); (v) an ABSENT scale key refuses by
     name instead of reading a default of 1.0.
 
@@ -1468,7 +1468,7 @@ def test_the_scale_grids_stay_fp32(
         "the zero above is vacuous"
     )
 
-    # (iv) B65-N3: -085's difference set, derived here rather than assumed.
+    # (iv) B65-N3: the scale-grid difference set, derived here rather than assumed.
     quantised = set(build_weight_mappings(model.text_config, quantised=True))
     plain = set(build_weight_mappings(model.text_config, quantised=False))
     derived = _derived_dsa_scale_names(_dense_config())
@@ -1752,7 +1752,7 @@ def test_the_load_time_preps_run_after_the_device_by_name(
     assert on_disk == module_source, "the mutation reached the file on disk"
 
     # Case A: the prep's own refusal when a scale was never materialised. It is
-    # -090's landed message at
+    # the landed message at
     # ``model_fp8.py::Glm5NextSharedExperts.prepare_scale_operands``, and NOT
     # ``::Glm5NextSharedExperts._prepared_scale_operand``, which is a different
     # method's never-ran refusal.
@@ -1856,7 +1856,7 @@ def test_the_scaled_mla_weights_reach_the_dequant_as_fp8(
 
     CERTIFYING COMPONENT (D1.4): ``_placeholder_dtype``'s sibling clause.
 
-    WHY THIS ITEM EXISTS. ``inc-glm53f-085`` gave each of the four scaled MLA
+    WHY THIS ITEM EXISTS. The scale-grid split gave each of the four scaled MLA
     projections its own scale-grid entry, which left each of those weights alone
     in its entry -- and a lone weight key classifies ``plain``. Under the rule as
     first designed those weights took the config dtype, the reader narrowed the
@@ -1972,7 +1972,7 @@ def test_the_scaled_mla_weights_reach_the_dequant_as_fp8(
 
 
 # --------------------------------------------------------------------------- #
-# inc-glm53f-095 -- the expert-stacked load. Four items, selected by ``-k
+# The expert-stacked load. Four items, selected by ``-k
 # stacked``, one per conjunct.
 #
 # WHY THESE ITEMS BRING THEIR OWN CONFIGURATION. The landed ``_routed_config``
@@ -1980,7 +1980,7 @@ def test_the_scaled_mla_weights_reach_the_dequant_as_fp8(
 # load that completes runs one thing that configuration was never asked to
 # survive: ``Glm5NextSharedExperts.prepare_scale_operands``, which reaches
 # ``scale_grid_shape`` and demanded extents divisible by the 256 block it then read
-# (since ``inc-glm53f-112`` the shared prep reads ``SCALE_BLOCK_SIZE`` = 128, so the
+# (the shared prep now reads ``SCALE_BLOCK_SIZE`` = 128, so the
 # constraint below is weaker than when these items were written -- they keep their own
 # configuration because the reason above still stands, not because of this number).
 # The miniature is 128, so the routed load died in the SHARED-expert prep
@@ -1994,7 +1994,7 @@ def test_the_scaled_mla_weights_reach_the_dequant_as_fp8(
 # So these items set ``n_shared_experts=0``, which ``model_fp8.py`` reads as "build
 # no shared-expert module", and the routed load completes on the bank's own path.
 #
-# ``inc-glm53f-054a`` CHANGED THE SECOND HALF OF THIS PARAGRAPH, which used to read
+# THE BANK'S OWN SCALE PREP CHANGED THE SECOND HALF OF THIS PARAGRAPH, which used to read
 # "The bank does not need that prep. ``Glm5NextRoutedExperts`` defines NEITHER
 # load-time prep ... so ``_run_load_time_preps``'s ``hasattr(type(module), ...)``
 # gate never visits a bank at all." Item (i) gave the bank its own
@@ -2015,7 +2015,7 @@ STACKED_EXPERTS_PER_RANK = MINI_ROUTED_EXPERTS // STACKED_EP_DEGREE
 
 
 #: The bank's widths for the items whose load now RUNS the bank's scale prep --
-#: ``inc-glm53f-054a``'s migration of the five items that reached it.
+#: the bank scale prep's migration of the five items that reached it.
 #:
 #: A NEW NAME, NOT A REBINDING, on the precedent :data:`DEFERRED_NARROW` states
 #: for the same situation. :data:`MINI_WEIGHT_SHAPE` stays ``(128, 128)`` and stays
@@ -2254,7 +2254,7 @@ def test_the_stacked_bank_delivers_every_expert_or_refuses_by_name(
     bank parameter's element count equals the SUM of the element counts its OWN
     checkpoint weight slices imply -- derived from the file by
     :func:`_implied_numels`, never from a shape constant -- and its leading axis
-    is E, so E/E experts are present. This is the reading ``-091a`` failed
+    is E, so E/E experts are present. This is the reading the first group failed
     silently: it loaded 16,384 elements where its slices implied 65,536 and
     reported success, because nothing between the loader and the parameter
     validates a shape.
@@ -2264,7 +2264,7 @@ def test_the_stacked_bank_delivers_every_expert_or_refuses_by_name(
     parameter, its key count and the missing declaration. That is what makes (i)
     a measurement instead of an observation: one thing changes, the geometry
     declaration, and the answer moves from "E/E loaded" to "refused by name". A
-    reading that cannot move is not a reading, which is why ``-091``'s own
+    reading that cannot move is not a reading, which is why the entry point's own
     refusal reading was re-anchored onto this one when this increment made the
     well-formed bank loadable (design entry ``design-20260905-r``).
     """
@@ -2631,24 +2631,24 @@ def test_the_stacked_bank_refusal_is_gone_for_this_case_only(tmp_path) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# inc-glm53f-095b -- the bank's scale grids reach the module, and the prep
+# The bank's scale grids reach the module, and the prep
 # loop's leaf derivation reads PRESENCE. Three items, selected by ``-k
 # bankscale``, one per conjunct.
 #
 # WHY THE BANK'S OWN SCALE PREP IS NOT HERE. It was designed here and moved to
-# ``inc-glm53f-054`` at design entry ``design-20260905-x``, on a reading this
+# its own increment at design entry ``design-20260905-x``, on a reading this
 # seat took first: the miniature every load in this file reads is 128 x 128 with
 # (1, 1) grids, the bank's ``BLOCK_QUANT_SIZE`` is 256, and ``retile_block_scales``
 # refuses an extent that is not a multiple of it -- as did ``scale_grid_shape``, at
-# the same 256, until ``inc-glm53f-112`` narrowed the DENSE side to 128. The
+# the same 256, until the block-size change narrowed the DENSE side to 128. The
 # prep loop's gate is a TYPE test, so a prep on the bank would fire inside
-# ``-095``'s own conjunct-1 load -- the one completing load in this file that
+# the stacked bank's own conjunct-1 load -- the one completing load in this file that
 # carries a bank -- and break it. Measured in
-# ``increments/probe-095b-geometry-r3.out``; ``-054``'s configuration already
+# ``increments/probe-095b-geometry-r3.out``; the prep's own configuration already
 # requires ``hidden_size % 256 == 0``, so the prep belongs there.
 #
 # So these three items read the two halves that DO belong here: the grids
-# arriving, and the derivation that will hand them over when ``-054`` adds the
+# arriving, and the derivation that will hand them over when a later increment adds the
 # prep. Every configuration and constant is the landed one, reused rather than
 # copied.
 # --------------------------------------------------------------------------- #
@@ -2722,7 +2722,7 @@ def test_bankscale_grids_arrive_on_the_bank_as_plain_attributes(
     :meth:`Glm5NextForConditionalGeneration._load_out_of_band_scales` as
     ``load_weights`` reaches it. FOUR readings and each has its own control.
 
-    (i) After a completing load of ``-095``'s miniature bank, every bank module
+    (i) After a completing load of the stacked miniature bank, every bank module
     carries ``gate_proj_weight_scale_inv``, ``up_proj_weight_scale_inv`` and
     ``down_proj_weight_scale_inv``, and NONE of those names is in
     ``named_parameters()`` -- asserted by name, because that is the whole design
@@ -2907,7 +2907,7 @@ def test_bankscale_leaf_derivation_reads_presence_not_declaration(
 ) -> None:
     """(2) THE DERIVATION READS PRESENCE, and the bank is where that shows.
 
-    Certifies :func:`_scale_prep_leaves`, the helper ``inc-glm53f-095b`` factored
+    Certifies :func:`_scale_prep_leaves`, the helper that was factored
     out of ``_run_load_time_preps``. TWO readings and TWO controls, all four in
     this one run.
 
@@ -3005,7 +3005,7 @@ def test_bankscale_prep_loop_visits_exactly_what_it_did_before(
 
     Certifies ``_run_load_time_preps``'s visit, read from its RETURN VALUE.
 
-    ``inc-glm53f-054a`` MOVED THIS ITEM'S SCALE COUNT, and the increment plan said
+    THE BANK'S SCALE PREP MOVED THIS ITEM'S SCALE COUNT, and the increment plan said
     it would: "the prep's arrival makes ``_run_load_time_preps`` visit the bank
     (its scale-call count rises by the bank count) -- read it here". Before item
     (i) the bank declared no ``prepare_scale_operands`` and the count was zero.
@@ -3065,7 +3065,7 @@ def test_bankscale_prep_loop_visits_exactly_what_it_did_before(
         f"gates select ({expected_projection}, {expected_scale}) modules, so it "
         f"visited something other than what it tests for"
     )
-    # ``inc-glm53f-054a``. THIS COUNT MOVED, from 0 to the number of bank modules,
+    # THIS COUNT MOVED, from 0 to the number of bank modules,
     # and the increment plan's hand-off bullet says so in advance: "the prep's
     # arrival makes ``_run_load_time_preps`` visit the bank (its scale-call count
     # rises by the bank count) -- read it here". The bank declares
@@ -3081,7 +3081,7 @@ def test_bankscale_prep_loop_visits_exactly_what_it_did_before(
 
     # ── the same reading on the DENSE configuration ──────────────────────────
     # Most of the completing loads in this file build ``_dense_model()`` -- six of
-    # the seven that existed before ``inc-glm53f-054a`` item (iii) added one -- and
+    # the seven that existed before the bank scale prep's item (iii) added one -- and
     # the STOP condition of this increment's block is that none of their readings
     # moves. The bank branch cannot reach this tree -- an all-dense config has no
     # sparse layer and so no bank entry -- and the pair is read here to say so
@@ -3118,7 +3118,7 @@ def test_bankscale_prep_loop_visits_exactly_what_it_did_before(
     )
 
     # ── the stub arm: read the SIX OPERANDS the loop hands the bank's prep ────
-    # ``inc-glm53f-054a`` re-purposed this arm rather than deleting it. It was the
+    # The bank's scale prep re-purposed this arm rather than deleting it. It was the
     # control that made a zero a reading; the zero is a bank count now and the
     # all-dense arm above is what brackets it. What the stub still shows, and
     # nothing else does, is WHICH operands the loop collects and hands over -- the
@@ -3157,11 +3157,11 @@ def test_bankscale_prep_loop_visits_exactly_what_it_did_before(
 
 
 # --------------------------------------------------------------------------- #
-# inc-glm53f-094 -- the tensor-parallel WEIGHT SHARD geometry.
+# The tensor-parallel WEIGHT SHARD geometry.
 #
 # FOUR counted items, one per conjunct, and no ``parametrize`` decorator (D1.2).
 # The file header at ``:4`` still says THIRTEEN: it stopped being updated at
-# ``inc-glm53f-095b``, which added three, and this section adds four, so the file
+# the bank-scale section, which added three, and this section adds four, so the file
 # holds TWENTY. Correcting that header is a rider for the owner of the next
 # section here, not this increment's surface.
 #
@@ -3184,7 +3184,7 @@ def test_bankscale_prep_loop_visits_exactly_what_it_did_before(
 _MODEL_FP8 = vllm_neuron.model.glm5_next.model_fp8
 _WL_FP8 = vllm_neuron.model.glm5_next.weight_loaders_fp8
 
-# ``inc-glm53f-101``. Two more modules reached by NAME rather than by a re-import,
+# Two more modules reached by NAME rather than by a re-import,
 # because the code under test imports them FUNCTION-LOCALLY -- the expert-parallel
 # getters inside ``weight_loaders_fp8`` and ``_resolve_ep_degree`` inside
 # ``Glm5NextRoutedExperts.__init__``. A function-local import resolves the attribute
@@ -3209,7 +3209,7 @@ SHARD_LINEAR_ATTN = {
 #: The dense MLP's intermediate width, 512 for the same reason it used to be 256:
 #: 256 per rank is one whole CONSUMER block. Shrunk for size, not for correctness.
 #:
-#: IT MOVED AT ``inc-glm53f-101`` (plan revision 232, DECISIONS section 80(a)), and
+#: IT MOVED AT THE EXPERT-PARALLEL SHARDING (plan revision 232, DECISIONS section 80(a)), and
 #: the reason is a boundary that got wider rather than a convenience. The number
 #: that has to divide is no longer the checkpoint's 128-row tile but the consumer's
 #: 256-row block: ``blockwise_fp8_mm.scale_grid_shape`` refuses any weight extent
@@ -3218,7 +3218,7 @@ SHARD_LINEAR_ATTN = {
 #: (1) and conjunct (2) read a shape no rank was meant to hold. At 512 the pad is a
 #: no-op at world size 2, which is what every item using this width needs.
 #:
-#: IT STOPPED PADDING AT WORLD 4 WHEN ``inc-glm53f-112`` NARROWED THE DENSE
+#: IT STOPPED PADDING AT WORLD 4 WHEN THE BLOCK-SIZE CHANGE NARROWED THE DENSE
 #: CONSUMER'S BLOCK to 128: 512 divides evenly over four ranks at 128, so the pad
 #: this width used to construct is gone. The item whose subject IS that pad now
 #: carries its own width, :data:`PAD_DENSE_INTERMEDIATE`, and this sentence is the
@@ -3256,19 +3256,19 @@ _MLA_KV_B_FULL = _MLA_HEADS * (
 _MLA_O_PROJ_FULL = _MLA_HEADS * MINI_MLA_WIDTHS["v_head_dim"]
 
 #: ``(declaring class, declared leaf) -> (shard dim, full extent on that dim)``.
-#: The EIGHTEEN families the ratified table calls sharded once ``inc-glm53f-100``
+#: The EIGHTEEN families the ratified table calls sharded once the MLA head-width sharding
 #: has landed: twelve on ``Glm5NextKDAAttention``, three on ``Glm5NextDenseMLP``
 #: and the MLA head-width three. The six still deferred -- the shared expert's
-#: three and the routed bank's three, both to ``inc-glm53f-101`` -- are absent
+#: three and the routed bank's three, both to the expert-parallel sharding -- are absent
 #: here exactly as they are absent from the code's table, which is what conjunct
 #: (4) counts.
 #:
-#: THE MLA THREE ARE ``inc-glm53f-100``'s ADDITION, and this is the deferral
+#: THE MLA THREE ARE THE HEAD-WIDTH SHARDING'S ADDITION, and this is the deferral
 #: above being kept rather than a new claim. The text this replaces read: "The
 #: FIFTEEN families the ratified table calls sharded at this increment: twelve on
 #: ``Glm5NextKDAAttention`` and three on ``Glm5NextDenseMLP``. The nine deferred
-#: families -- the MLA head-width three to ``inc-glm53f-100``, the shared
-#: expert's three and the routed bank's three to ``inc-glm53f-101`` -- are absent
+#: families -- the MLA head-width three to their own increment, the shared
+#: expert's three and the routed bank's three to the expert-parallel sharding -- are absent
 #: here exactly as they are absent from the code's table, which is what conjunct
 #: (4) counts."
 SHARD_FAMILIES: dict[tuple[str, str], tuple[int, int]] = {
@@ -3346,14 +3346,14 @@ def _shard_config(first_k_dense: int) -> Glm5NextConfig:
     ``n_shared_experts=0`` is carried over from :func:`_stacked_config` and is not
     a convenience. No completing load on THIS fixture has a shared-expert module,
     because the landed shared-expert scale prep cannot run on a 128-block
-    miniature (``inc-glm53f-095b``, which hands that fixture to ``-054``). So the
+    miniature (the bank-scale section, which hands that fixture on). So the
     shared expert's three deferred families cannot be observed by a real load
     here at all, and conjunct (4) prints that rather than quietly counting six
     deferred families where the table names nine.
 
     THE FILE-WIDE CLAIM THIS SENTENCE USED TO MAKE IS NO LONGER TRUE, and it is
     narrowed rather than deleted so the reason survives. It read "No completing
-    load in this file has a shared-expert module". ``inc-glm53f-054a`` item (iii)
+    load in this file has a shared-expert module". The bank scale prep's item (iii)
     added one -- ``test_blocked_the_shared_expert_prep_completes_a_load_and_the_
     retile_ran``, on the 256-blocked checkpoint, where the prep can run because
     the extents are whole blocks and the load-path retile publishes the grid it
@@ -3369,7 +3369,7 @@ def _shard_config(first_k_dense: int) -> Glm5NextConfig:
       campaign's production expert-parallel degree is 1 (``factory.py:204-211``),
       so at tensor-parallel world size 2 the bank is replicated and every rank's
       expert-parallel rank is 0 -- but the loader passes the GLOBAL rank, so rank
-      1 is refused. That refusal is `inc-glm53f-101`'s to answer, not this
+      1 is refused. That refusal is the expert-parallel sharding's to answer, not this
       increment's, and conjunct (4) measures it rather than describing it.
     * ``MINI_FIRST_K_DENSE`` keeps the bank, and conjunct (4) needs it: the bank's
       three families are part of the replicated set that conjunct counts. It loads
@@ -3425,7 +3425,7 @@ def _shard_pattern(
     THE BYTE RANGE IS 8 TO 126, AND BOTH ENDS ARE CHOSEN. Bytes 1 to 7 are
     subnormal, where the squeeze rounds distinct bytes onto one value and weakens
     what conjunct (2) can detect -- at 240/448 that was several of them, and at the
-    exact ``x 1/2`` of ``inc-glm53f-054e`` it is worse for the smallest, which
+    exact ``x 1/2`` factor it is worse for the smallest, which
     halves onto a tie and lands on zero; bytes 127 and 255 are ``NaN``
     in ``e4m3fn``, which no equality comparison survives. That leaves 119 values,
     so index ``i`` and ``i + 119`` share one -- the single aliasing this pattern
@@ -3454,7 +3454,7 @@ def _shard_pattern(
 #: distinctness is the stronger position reading. The families whose LOAD PATH still
 #: coarsens a 128 grid onto a 256 one.
 #:
-#: NARROWED TO ONE BY ``inc-glm53f-112``, and the narrowing is the increment. The two
+#: NARROWED TO ONE BY THE BLOCK-SIZE CHANGE, and the narrowing is the increment. The two
 #: dense families used to coarsen inside ``_publish_compute_frame_operands``; that
 #: step now publishes the checkpoint's own 128 grid and rescales no weight, so a
 #: fixture that kept writing them quad-structured grids would be preparing for
@@ -3476,7 +3476,7 @@ def _tiles_per_producer_block() -> int:
     Derived from the producer's own block size and the checkpoint's, never typed:
     a fixture that hardcoded 2 would keep writing 2 the day either side moved.
 
-    RE-AIMED FROM THE CONSUMER TO THE PRODUCER by ``inc-glm53f-112``. It used to read
+    RE-AIMED FROM THE CONSUMER TO THE PRODUCER by the block-size narrowing. It used to read
     the one consumer-block function this package had, back when that number was 256
     and equalled the producer's. The DENSE consumer's number
     (``dense_consumer_block_quant_size()``) is now 128 -- the dense kernel indexes the
@@ -3503,7 +3503,7 @@ def _tiles_per_producer_block() -> int:
 def _pow2_block_grid_pattern(shape: tuple[int, ...], dim: int) -> torch.Tensor:
     """A ``128``-tile scale grid the ``256`` coarsening reproduces BIT-EXACTLY.
 
-    ``inc-glm53f-054a`` repair batch R6 item R-T2 wrote this, on a measurement
+    The bank scale prep's repair batch R6 item R-T2 wrote this, on a measurement
     rather than a preference. The coarsening keeps ONE scale per 256 block and
     rescales the block's other three 128 tiles into it
     (``blockwise_fp8_retile.py:443-480``), so on :func:`_shard_pattern`'s fp32 ramp
@@ -3524,7 +3524,7 @@ def _pow2_block_grid_pattern(shape: tuple[int, ...], dim: int) -> torch.Tensor:
 
     Every value is an exact power of two, so the dequantisations these items
     compare stay exact in fp32 and the retained scale satisfies the complete
-    losslessness condition ``inc-glm53f-024`` part 5 states. Each 256 BLOCK along
+    losslessness condition the design's part 5 states. Each 256 BLOCK along
     ``dim`` gets its own value, so "did this rank get the right blocks" is still
     answerable -- and a rank boundary is always a whole block here, because the
     consumer refuses any other shard.
@@ -3560,7 +3560,7 @@ def _shard_key_overrides(
     scale key, not from a list of family names kept here.
 
     A SPLIT MAP ENTRY IS ASKED THAT QUESTION A SECOND WAY, and that is
-    ``inc-glm53f-100``'s change here. The DSA half's scaled projections carry the
+    the head-width sharding's change here. The DSA half's scaled projections carry the
     grid as a mapped parameter of their OWN -- ``weight_loaders_fp8.py:529-540``
     adds ``<leaf>_weight`` and ``<leaf>_weight_scale_inv`` as two entries -- so for
     them a one-key entry does NOT mean unquantised. Asking only about the entry's
@@ -3570,7 +3570,7 @@ def _shard_key_overrides(
     the map carries its sibling grid, by the same name rule the reader uses
     (``model_fp8.py``'s ``_sibling_scale_grid_name``). ``kv_b_proj`` has no
     sibling in this checkpoint and stays bf16, which is the reading
-    ``inc-glm53f-078`` recorded.
+    the coverage item recorded.
     """
     overrides: dict[str, torch.Tensor] = {}
     for path, module in model.named_modules():
@@ -3662,8 +3662,8 @@ def _shard_checkpoint(
     mappings = _mappings_for(config)
     reference = Glm5NextForConditionalGeneration(config)
     overrides = _shard_key_overrides(reference, mappings)
-    # ``inc-glm53f-054a``'s migration. This fixture's own narrow width is
-    # :data:`SHARD_NARROW`, which is 8 and stays 8 -- it is ``-094``'s constant and
+    # The bank scale prep's migration. This fixture's own narrow width is
+    # :data:`SHARD_NARROW`, which is 8 and stays 8 -- it is the shard geometry's constant and
     # every family here except the bank is measured against it. The bank is the one
     # family whose load now runs a scale prep, and that prep retiles, and the retile
     # refuses an extent that is not a whole 256 block. So the bank alone takes
@@ -3717,7 +3717,7 @@ def _max_abs_diff(left: torch.Tensor, right: torch.Tensor) -> float:
 
 
 #: The two classes whose loaded tensors are REPUBLISHED before any forward sees them.
-#: ``inc-glm53f-054a`` repair round 1: their load path now transposes each weight and
+#: The bank scale prep's repair round 1: their load path now transposes each weight and
 #: its scale grid once, into the frame ``blockwise_fp8_mm`` multiplies in, because the
 #: checkpoint's own layout is the transpose of it and the kernel scale operand is built
 #: at load from the stored extents (so a per-forward transpose would agree on shape and
@@ -3731,7 +3731,7 @@ def _as_the_loader_left_it(
 ) -> torch.Tensor:
     """One loaded tensor put back in the frame the LOADER delivered it in.
 
-    ``inc-glm53f-054a`` repair round 1. Every reading below that is about the
+    The bank scale prep's repair round 1. Every reading below that is about the
     LOADER's own work -- which dim a family shards on, what a per-rank slice is,
     whether two ranks reassemble the whole tensor -- asks its question of the
     checkpoint's layout, and the load path no longer leaves the two republished
@@ -3740,7 +3740,7 @@ def _as_the_loader_left_it(
     bit-exact reassembly are all still asserted against the same numbers this file
     always asserted them against.
 
-    THE UNDO IS A TRANSPOSE AND NOTHING ELSE, AND SINCE ``inc-glm53f-112`` SO IS THE
+    THE UNDO IS A TRANSPOSE AND NOTHING ELSE, AND SINCE THE BLOCK-SIZE NARROWING SO IS THE
     PUBLISH. The step used to have a second half -- coarsening a ``128``-tile grid onto
     a ``256`` public one -- which this helper never undid and could not, because it
     requantises. That half is gone on this path: the dense step now publishes the
@@ -3989,8 +3989,8 @@ def test_shard_the_scale_grid_follows_its_weight_and_refuses_misalignment(
     THE DENSE MLPS' THREE GRIDS EACH ARE THE WHOLE POPULATION HERE -- twelve on
     this fixture, whose four layers are all dense. ``Glm5NextKDAAttention``'s
     twelve families are UNQUANTISED in this checkpoint, so they have no grid to
-    follow, and every other quantised sharded family is deferred to ``-100`` or
-    ``-101``. The count is read off the tree rather than written down, so the
+    follow, and every other quantised sharded family is deferred to the head-width
+    sharding or the expert-parallel one. The count is read off the tree rather than written down, so the
     number moves with the fixture instead of going stale beside it.
 
     THE GRID IS NOT A PARAMETER. It travels in its weight's own map entry and is
@@ -4108,9 +4108,9 @@ def test_shard_the_scale_grid_follows_its_weight_and_refuses_misalignment(
     # A BLOCK-MISALIGNED SHARD REFUSES BY NAME. The aligned case beside it is what
     # makes the refusal a boundary rather than a blanket. The exception class is
     # the one ``_refuse`` raises for every refusal in that section, bank or not.
-    # ``inc-glm53f-101`` (DECISIONS section 80(b)): the aligned case is 256 rows, which
+    # The expert-parallel sharding (DECISIONS section 80(b)): the aligned case is 256 rows, which
     # is two checkpoint tiles -- one whole CONSUMER block while that block was 256, and
-    # TWO of them since `inc-glm53f-112` narrowed it. Either way it is aligned for both
+    # TWO of them since the block-size change narrowed it. Either way it is aligned for both
     # rules, which is all this reading needs; the width is left where it was so this
     # arm's grid-row count stays the number the item registered.
     aligned = _WL_FP8.shard_geometry_for_grid(
@@ -4144,11 +4144,11 @@ def test_shard_the_scale_grid_follows_its_weight_and_refuses_misalignment(
     )
 
     # THE THIRD CONTROL, and the one the consumer's gate exists for
-    # (``inc-glm53f-101``, DECISIONS section 80(b)). The gate refuses a shard that
+    # (the expert-parallel sharding, DECISIONS section 80(b)). The gate refuses a shard that
     # CLEARS the checkpoint tile and is still not a whole CONSUMER block, so it can
     # only be read by a width that fails THAT rule and no other.
     #
-    # WHY THIS CONTROL MOVES THE GRANULARITY (`inc-glm53f-112` round 2, ruling 3).
+    # WHY THIS CONTROL MOVES THE GRANULARITY (block-size narrowing round 2, ruling 3).
     # The dense consumer's block is now the checkpoint tile, so at the production
     # numbers no width fails one of the two rules alone -- every multiple of 128 is a
     # multiple of 128. The previous shape of this control fell back to 192, which
@@ -4251,11 +4251,11 @@ def test_shard_the_unsharded_families_are_untouched_both_directions(
     )
     print(f"CONJUNCT4_PARAMETERS_COMPARED={len(left)}")
 
-    # ``inc-glm53f-101``, the FIFTH moved number (DECISIONS §83 ruling 2). The
+    # THE EXPERT-PARALLEL SHARDING, the FIFTH moved number (DECISIONS §83 ruling 2). The
     # routed bank's three families join the declared-sharded set here. They were
-    # counted in the REPLICATED set at ``-094`` -- "replicated-in-effect,
-    # attachment deferred to inc-glm53f-101" in the ratified table's own words --
-    # and this reading ends that count, because `-101` attached them: at world 2
+    # counted in the REPLICATED set at the shard geometry -- "replicated-in-effect,
+    # attachment deferred to the expert-parallel sharding" in the ratified table's own words --
+    # and this reading ends that count, because the sharding attached them: at world 2
     # with expert-parallel degree 1 the bank's experts are all local and its
     # intermediate width divides across the whole world, so every one of its
     # leaves differs between the two world sizes. Measured before the edit:
@@ -4309,10 +4309,10 @@ def test_shard_the_unsharded_families_are_untouched_both_directions(
     print(f"CONJUNCT4_MLA_LEAVES_REPLICATED_IN_EFFECT={mla}")
     print(f"CONJUNCT4_ROUTED_LEAVES_REPLICATED_IN_EFFECT={routed}")
     print(f"CONJUNCT4_SHARED_EXPERT_LEAVES_PRESENT={shared}")
-    # ``inc-glm53f-100`` REVISED THIS CLAUSE, and the old text is kept beside the
+    # THE HEAD-WIDTH SHARDING REVISED THIS CLAUSE, and the old text is kept beside the
     # new because the reading changed rather than the code drifting. It read: "no
     # MLA parameter stayed identical, so the three families deferred to
-    # inc-glm53f-100 cannot be counted replicated-in-effect here". The three
+    # the head-width sharding cannot be counted replicated-in-effect here". The three
     # head-width families are no longer deferred -- they are declared above and
     # they MOVE, counted by ``moved == declared``. What stays identical on this
     # module is the LATENT side: ``q_a_proj``, ``kv_a_proj_with_mqa``, the two
@@ -4321,20 +4321,20 @@ def test_shard_the_unsharded_families_are_untouched_both_directions(
     # there is no head axis to split them on -- and the clause now holds them.
     assert mla, (
         "no MLA parameter stayed identical. The head-width three are sharded from "
-        "inc-glm53f-100 on, but the LATENT projections and layernorms have no head "
+        "now on, but the LATENT projections and layernorms have no head "
         "axis to shard and must still be replicated, so an empty list here means "
         "something sharded that this architecture cannot shard"
     )
-    # ── THE ROUTED CLAUSE, INVERTED BY ``inc-glm53f-101`` ─────────────────────
+    # ── THE ROUTED CLAUSE, INVERTED BY THE EXPERT-PARALLEL SHARDING ───────────
     # DECISIONS §83 ruling 2. The clause this replaces read, in these words:
     #
     #     assert routed, (
     #         "no routed-expert parameter stayed identical, so the families
-    #         deferred to inc-glm53f-101 cannot be counted replicated-in-effect
+    #         deferred to the expert-parallel sharding cannot be counted replicated-in-effect
     #         here")
     #
     # It asserted the bank stayed REPLICATED, and the message named this
-    # increment as the one that would end that reading. `-101` attached the
+    # increment as the one that would end that reading. The sharding attached the
     # bank's three families, so the assertion now says the opposite of what it
     # said, and the old text is quoted rather than deleted so the reversal is
     # legible -- the form the (v) replacement below already uses.
@@ -4360,7 +4360,7 @@ def test_shard_the_unsharded_families_are_untouched_both_directions(
     print(f"CONJUNCT4_ROUTERS_STILL_REPLICATED={routers_still_replicated}")
     assert projections_still_replicated == [], (
         f"a routed-expert PROJECTION stayed identical across the two world sizes: "
-        f"{projections_still_replicated}. inc-glm53f-101 attached the bank's three "
+        f"{projections_still_replicated}. The expert-parallel sharding attached the bank's three "
         f"families, so at world 2 with expert-parallel degree 1 every one of them "
         f"must differ -- the experts are all local and the intermediate width "
         f"divides across the whole world. A leaf that did not move is a family the "
@@ -4372,22 +4372,22 @@ def test_shard_the_unsharded_families_are_untouched_both_directions(
         f"the three bank projections did not all move: moved "
         f"{sorted(set(routed_that_moved) & bank_projections)} of "
         f"{sorted(bank_projections)}. An empty replicated reading above would then "
-        f"mean this configuration built no bank rather than that -101 attached it"
+        f"mean this configuration built no bank rather than that the sharding attached it"
     )
     assert routers_still_replicated, (
         "no router stayed identical. The ratified table freezes both routers "
         "REPLICATED (§54 Part 3), so the inversion above has widened past the "
-        "three families inc-glm53f-101 attached"
+        "three families the expert-parallel sharding attached"
     )
     assert shared == [], (
         "this fixture built a shared-expert module. The load is only known to "
-        "complete without one (inc-glm53f-095b), so if one is present the "
+        "complete without one, so if one is present the "
         "disclosure in _shard_config is stale and the shared expert's three "
         "deferred families should be counted here rather than named as absent"
     )
 
     # ── RIDER N4: the firing control for a counted ZERO, in this item because ──
-    # this item's instrument is the same one. ``inc-glm53f-095b``'s bankscale
+    # this item's instrument is the same one. The bankscale
     # scan prints ``BANKSCALE1_GRIDS_IN_NAMED_PARAMETERS`` and asserts the list
     # is EMPTY (``:2608``), and a membership test against
     # ``named_parameters()`` that never fires reads empty for two different
@@ -4425,12 +4425,12 @@ def test_shard_the_unsharded_families_are_untouched_both_directions(
     )
 
     # ── THE ROUTED BANK NOW LOADS AT RANK 1, AND THE MAP IS WHAT MOVED ────────
-    # ``inc-glm53f-101``, replacing the reading ``-094`` left here. That reading
+    # THE EXPERT-PARALLEL SHARDING, replacing the reading the shard geometry left here. That reading
     # asserted the OPPOSITE -- a rank-1 load of the routed fixture refused with
     # "outside the partition" -- and named this increment as the owner of its
     # revision in its own words: "If it now completes, the bank's rank derivation
     # was fixed and this reading ... should be revisited together with
-    # inc-glm53f-101". This is that revision. The behaviour changed, so the reading
+    # the expert-parallel sharding". This is that revision. The behaviour changed, so the reading
     # changed with it; the old text is quoted here so the repair is legible rather
     # than silently absent.
     #
@@ -4518,11 +4518,11 @@ def test_shard_the_unsharded_families_are_untouched_both_directions(
 
 
 # --------------------------------------------------------------------------- #
-# inc-glm53f-101 -- THE SIX DEFERRED FAMILIES, sharded from the checkpoint's own
+# THE SIX DEFERRED FAMILIES, sharded from the checkpoint's own
 # width. Plan revision 232, design entry ``design-20260905-ap`` as amended at
 # DECISIONS section 80. Five items, one per conjunct, no ``parametrize``.
 #
-# WHY THESE SIX NEEDED A BLOCK OF THEIR OWN. ``inc-glm53f-094`` shards a family by
+# WHY THESE SIX NEEDED A BLOCK OF THEIR OWN. The shard geometry shards a family by
 # resolving its per-rank extent when the loader is attached. Neither the shared
 # expert nor the routed bank can be served that way: ``Glm5NextSharedExperts``
 # holds ``num_shared_experts`` and ``swiglu_limit`` and no width, and
@@ -4586,7 +4586,7 @@ DEFERRED_EP_GROUP_CLASSES = ("Glm5NextRoutedExperts",)
 #: smallest width the consumer admits, ruled at DECISIONS §83 ruling 1.
 #:
 #: A NEW NAME, NOT A REBINDING. :data:`SHARD_NARROW` stays 8 and stays
-#: ``inc-glm53f-094``'s constant; that fixture has no shared expert and needs no
+#: the shard geometry's constant; that fixture has no shared expert and needs no
 #: consumer-valid width. Two fixtures, two widths, each stated where it is used.
 DEFERRED_NARROW = 256
 
@@ -4594,7 +4594,7 @@ DEFERRED_NARROW = 256
 #: THE PAD ITEM'S OWN DENSE WIDTH, and why it is not :data:`SHARD_INTERMEDIATE`.
 #: Conjunct (3) reads a rank that holds NO real row, so its fixture has to be a
 #: width the loader must pad at the shipped block. At world 4 the loader rounds a
-#: dense width up to a multiple of ``4 x block``; ``inc-glm53f-112`` narrows the
+#: dense width up to a multiple of ``4 x block``; the block-size change narrows the
 #: dense consumer's block from 256 to 128, so 512 -- which needed rounding to 1024
 #: at block 256 -- now divides evenly over four ranks and pads nothing. The counted
 #: grant-205 run read that as ``assert 4 < 4``: the item's own vacuity guard, doing
@@ -4670,7 +4670,7 @@ def _deferred_config(
     """:func:`_shard_config`'s fixture with the shared expert switched ON.
 
     ``n_shared_experts`` is 1 here where :func:`_shard_config` sets 0, and that is
-    the whole difference. ``-094`` set it to 0 because the shared expert's three
+    the whole difference. The shard geometry set it to 0 because the shared expert's three
     families were REPLICATED-IN-EFFECT at that increment and its own conjunct (4)
     said so; this block attaches them, so they have to be observed by a real load.
 
@@ -4704,7 +4704,7 @@ def _deferred_key_overrides(
     ramp_grids: bool = False,
     dense_intermediate: int = SHARD_INTERMEDIATE,
 ) -> dict[str, torch.Tensor]:
-    """FULL tensors for the six deferred families, plus ``-094``'s fifteen.
+    """FULL tensors for the six deferred families, plus the shard geometry's fifteen.
 
     A SCALE GRID A RETILED FAMILY WILL LOAD IS WRITTEN POW2 PER 256 BLOCK. This is a
     FIXTURE choice, not a load behaviour: every family in
@@ -4728,12 +4728,12 @@ def _deferred_key_overrides(
     :func:`_shard_key_overrides` follows.
 
     EVERY FAMILY THIS FIXTURE WRITES TAKES :data:`DEFERRED_NARROW` UNLESS
-    :data:`SHARD_OTHER_EXTENT` DECLARES ITS OWN. ``inc-glm53f-107`` added the three
+    :data:`SHARD_OTHER_EXTENT` DECLARES ITS OWN. A later increment added the three
     MLA rows there -- ``q_b_proj_weight``, ``kv_b_proj_weight`` and
     ``o_proj_weight``, at their own declared extents rather than the 256 fallback --
     so the older sentence, that every family takes ONE narrow width, stopped being
     true at that commit and is corrected here. The reason the OTHER families still
-    share one width is unchanged: ``inc-glm53f-094``'s writer is not reused for the
+    share one width is unchanged: the shard geometry's writer is not reused for the
     fifteen, because a fixture holding two narrow widths for families whose refusal
     must stay legible would give the consumer's grid check a different answer per
     family and the reason for a refusal would stop being readable. The
@@ -4853,10 +4853,10 @@ class _DeferredLoad(NamedTuple):
     that carries no shared expert. Both are readings; neither is a failure of this
     file.
 
-    ``inc-glm53f-054a`` REPLACED THE FIELD THIS TUPLE CARRIED, and the replacement
+    THE BANK'S SCALE PREP REPLACED THE FIELD THIS TUPLE CARRIED, and the replacement
     was named in advance. It was ``refusal``: the ``BlockwiseFp8MmError`` text from
     a prep that could not read a checkpoint-tile grid, because nothing retiled it.
-    :func:`_load_at_ep`'s own comment said that when ``-054`` landed the retile
+    :func:`_load_at_ep`'s own comment said that when a later increment landed the retile
     this reading would flip to "the prep built 3" and the capture would become a
     completing load. Item (iv) landed it, so it did.
     """
@@ -4917,10 +4917,10 @@ def _load_at_ep(
         return _DeferredLoad(model, None)
 
     # THE GAP IS CLOSED, AND THE SAME ARITHMETIC READS IT EITHER WAY. Until
-    # ``inc-glm53f-054a`` item (iv), nothing on the shared expert's load path
+    # the bank scale prep's item (iv), nothing on the shared expert's load path
     # retiled its scale grid from the checkpoint's ``(128, 128)`` tiles onto the
     # 256-granularity PUBLIC grid the landed ``prepare_scale_operands`` demanded at
-    # the time -- since ``inc-glm53f-112`` it demands the checkpoint's own 128 grid -- so
+    # the time -- since the block-size narrowing it demands the checkpoint's own 128 grid -- so
     # this load attached every shard and then refused inside the prep. DECISIONS §84
     # placed that retile in this block; the comment that stood here named the flip
     # in advance -- "the prep built 3", and the capture becomes a completing load.
@@ -4960,7 +4960,7 @@ def _load_at_ep(
         built.add(len(prepared))
         health = getattr(module, Glm5NextSharedExperts.SHARED_RETILE_HEALTH_ATTR)
         record = health["gate_proj_weight"]
-        # RE-PINNED BY ``inc-glm53f-112``: the step publishes the checkpoint's own grid
+        # RE-PINNED BY THE BLOCK-SIZE NARROWING: the step publishes the checkpoint's own grid
         # and coarsens nothing, so ``published`` is the flag that says it ran and
         # ``retiled`` is now always False on this path. Both are asserted, so the day
         # the 256 coarsening came back this reading would say so.
@@ -4970,7 +4970,7 @@ def _load_at_ep(
             f"here means the step could not read the extents it was given"
         )
         assert record["retiled"] is False, (
-            f"{path}.gate_proj_weight reports a retile; since `inc-glm53f-112` the "
+            f"{path}.gate_proj_weight reports a retile; since the block-size narrowing the "
             f"dense load path coarsens nothing"
         )
         assert tuple(record["checkpoint_grid"]) == tile_grid, (
@@ -4982,7 +4982,7 @@ def _load_at_ep(
             f"grid {public_grid} the prep demands at [K={rows}, N={cols}]"
         )
         # WHAT THE MODULE ARRIVES AT IS THE PUBLIC GRID TRANSPOSED, and this is the
-        # one reading in this helper that ``inc-glm53f-054a`` repair round 1 moved.
+        # one reading in this helper that the bank scale prep's repair round 1 moved.
         # The retile still publishes ``public_grid`` -- that is asserted three lines
         # up, off its own health record -- and the republish that FOLLOWS the retile
         # then turns the weight and its grid together into the frame
@@ -5013,7 +5013,7 @@ def _load_at_ep(
     )
 
     # THE DENSE MLP IS ENROLLED IN THE SAME REPUBLISH, and a REAL load is the only
-    # place that can say so. ``inc-glm53f-054a`` repair round 1 gave that class the
+    # place that can say so. The bank scale prep's repair round 1 gave that class the
     # method, and ``_run_load_time_preps`` finds it by
     # ``hasattr(type(module), "retile_checkpoint_scale_grids")`` -- so the health
     # record below exists only if the enrolment fired on this load. A conjunct that
@@ -5097,7 +5097,7 @@ def test_sharedshard_every_deferred_family_lands_at_its_declared_per_rank_shape(
     }
     # THE PREP'S OWN COUNT is read on every rank before anything else: each load
     # attached its shards, the load-path retile published the public grid, and the
-    # -054a-owned prep built three operands. :func:`_load_at_ep` checks that grid
+    # bank scale prep built three operands. :func:`_load_at_ep` checks that grid
     # against this file's arithmetic; here the count is only counted, so an item
     # cannot read shards from a load that took some other path to completing.
     models = {rank: load.model for rank, load in loads.items()}
@@ -5158,7 +5158,7 @@ def test_sharedshard_every_deferred_family_lands_at_its_declared_per_rank_shape(
                 # A bank carries a LEADING expert axis, so its declared dim moves
                 # one place right and the leading extent is this EP rank's experts.
                 #
-                # THE BANK PADS NOTHING AS OF ``inc-glm53f-106``. Its three routed
+                # THE BANK PADS NOTHING NOW. Its three routed
                 # rows declare ``require_consumer_block`` instead of
                 # ``pad_to_consumer_block``, so the per-rank extent is a plain
                 # division and an inadmissible one is REFUSED rather than rounded
@@ -5167,12 +5167,12 @@ def test_sharedshard_every_deferred_family_lands_at_its_declared_per_rank_shape(
                 # second writer of the same number -- which is the defect class
                 # review B90-101 opened.
                 #
-                # THE ``family`` ARGUMENT BELOW IS ``inc-glm53f-107``'s AND IS
-                # CARRIED THROUGH THIS REBASE DELIBERATELY. ``-107`` gave
+                # THE ``family`` ARGUMENT BELOW IS A LATER INCREMENT'S AND IS
+                # CARRIED THROUGH THIS REBASE DELIBERATELY. That increment gave
                 # :func:`_deferred_full_shape` a leading ``family`` parameter
                 # because a leaf name alone does not identify a family, and this
                 # increment's own edit sits on the lines either side of that call.
-                # The two changes are orthogonal -- ``-107`` fixes WHICH other
+                # The two changes are orthogonal -- that increment fixes WHICH other
                 # extent the fixture reads, this increment fixes WHETHER the bank
                 # pads -- so both survive, and dropping the argument would
                 # ``TypeError`` rather than fail an assertion.
@@ -5351,7 +5351,7 @@ def test_sharedshard_the_group_reassembles_every_deferred_family_bit_identically
     }
     # THE PREP'S OWN COUNT is read on every rank before anything else: each load
     # attached its shards, the load-path retile published the public grid, and the
-    # -054a-owned prep built three operands. :func:`_load_at_ep` checks that grid
+    # bank scale prep built three operands. :func:`_load_at_ep` checks that grid
     # against this file's arithmetic; here the count is only counted, so an item
     # cannot read shards from a load that took some other path to completing.
     models = {rank: load.model for rank, load in loads.items()}
@@ -5391,12 +5391,12 @@ def test_sharedshard_the_group_reassembles_every_deferred_family_bit_identically
             # republished classes no longer store that layout, so a cat on the
             # stored dim would join along the wrong axis.
             #
-            # THE FRAME IS ALL THIS UNDOES, AND SINCE ``inc-glm53f-112`` THE FRAME IS
+            # THE FRAME IS ALL THIS UNDOES, AND SINCE THE BLOCK-SIZE NARROWING THE FRAME IS
             # ALL THE STEP DID. The step used to requantise a 128-tile grid onto a 256
             # public one for any weight whose extents were whole blocks, so this
             # bit-exact comparison also depended on that coarsening being lossless on
             # THIS fixture's grids -- a property of the fixture rather than of the
-            # loader, which ``inc-glm53f-054a`` handed forward rather than weakening the
+            # loader, which the bank scale prep handed forward rather than weakening the
             # equality to hide it. The dense path no longer coarsens, so the dependency
             # is gone and the equality now rests on the loader alone.
             got = torch.cat(
@@ -5447,10 +5447,10 @@ def test_sharedshard_the_group_reassembles_every_deferred_family_bit_identically
     # REFUSAL TWO -- an intermediate shard the CONSUMER cannot take.
     #
     # THE GRANULARITY MOVES, NOT THE WIDTH, and it moves through the product's own
-    # reader for this arm alone. This is the form the two ``inc-glm53f-101`` controls
+    # reader for this arm alone. This is the form the two expert-parallel sharding controls
     # use. The arm used to build its width as "one consumer block plus one checkpoint
     # tile", which was only "not a whole block" while those two numbers differed;
-    # ``inc-glm53f-112`` makes both of them 128, so that sum IS a whole block and the
+    # the block-size narrowing makes both of them 128, so that sum IS a whole block and the
     # arm's own guard fired before the product was ever called (the counted grant-205
     # run read ``assert (256 % 128) != 0``). Moving the CONSUMER's number instead
     # keeps the subject: the tile rule stays cleared, and the only rule that can
@@ -5510,9 +5510,9 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
     the pad changes no number the model would compute.
 
     "ONES" IN THE NAME IS THE CHECKPOINT'S PAD VALUE, NOT THE STORED ONE. The pad
-    grid is written as 1.0 and ``inc-glm53f-054c`` makes the load path compensate
+    grid is written as 1.0 and the compensation makes the load path compensate
     every block by the compensation factor -- ``448/240`` then, an exact ``2.0`` since
-    ``inc-glm53f-054e`` -- so the stored reading is that factor and 1.0 is now the
+    the factor moved -- so the stored reading is that factor and 1.0 is now the
     control. The name is kept because filed records cite it. TWICE the factor (3.4844
     then, 4.0 now) would mean the sharded route compensated a grid that a loader had
     already compensated, so this line is also that double's only reader. Neither number
@@ -5525,7 +5525,7 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
     pad at this world, and that absence is read here too, so "the pad happened" and
     "the pad did not happen" are both measurements rather than one assumption.
 
-    THE WIDTH IS THIS ITEM'S OWN SINCE ``inc-glm53f-112``, and the narrowing is why:
+    THE WIDTH IS THIS ITEM'S OWN SINCE THE BLOCK-SIZE NARROWING, and the narrowing is why:
     :data:`PAD_DENSE_INTERMEDIATE` carries the arithmetic. The shared 512 stopped
     padding when the dense consumer's block became 128, and the counted grant-205 run
     read that as ``assert 4 < 4`` -- this item's own vacuity guard refusing to report
@@ -5537,12 +5537,12 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
     padded emulation must equal the unpadded reference at max abs diff 0.0 and no
     numeric pair is authored.
 
-    ``inc-glm53f-054a`` REPAIR ROUND 1 CHANGED HOW THE MODULE SIDE IS READ, and not
+    THE BANK SCALE PREP'S REPAIR ROUND 1 CHANGED HOW THE MODULE SIDE IS READ, and not
     what is claimed (DECISIONS §706-§707). The claim above is frozen. What moved is
     one assertion that had described the pre-republish design -- that the module's
     grid IS the checkpoint's own rows -- which the republish makes false by design,
     because it turns that grid together with its weight -- and, until
-    ``inc-glm53f-112`` removed the coarsening from this path, coarsened it onto the
+    the block-size narrowing removed the coarsening from this path, coarsened it onto the
     consumer's 256 as well. The module side is now dequantised at the grid the module
     actually
     carries, in the loader's frame, and the reference stays the checkpoint's own
@@ -5572,7 +5572,7 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
     }
     # THE PREP'S OWN COUNT is read on every rank before anything else: each load
     # attached its shards, the load-path retile published the public grid, and the
-    # -054a-owned prep built three operands. :func:`_load_at_ep` checks that grid
+    # bank scale prep built three operands. :func:`_load_at_ep` checks that grid
     # against this file's arithmetic; here the count is only counted, so an item
     # cannot read shards from a load that took some other path to completing.
     models = {rank: load.model for rank, load in loads.items()}
@@ -5644,7 +5644,7 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
                     f"{grid.max().item()}. Twice that value means the grid was "
                     f"compensated twice"
                 )
-                # PRE-``-054c`` CONTROL. Raw 1.0 is exactly what this line asserted
+                # PRE-COMPENSATION CONTROL. Raw 1.0 is exactly what this line asserted
                 # while the load path was missing its half of the pair, so where the
                 # compensation applies the old reading has to be refused now.
                 if pad.applied:
@@ -5686,7 +5686,7 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
     # (DECISIONS §706-§707). This block used to assert that the module's grid IS the
     # checkpoint's own rows. That described the pre-republish design and is now false
     # BY DESIGN: the republish turns the checkpoint's 128-tile grid together with its
-    # weight into the compute frame, and until ``inc-glm53f-112`` it also coarsened it
+    # weight into the compute frame, and until the block-size narrowing it also coarsened it
     # onto the consumer's 256. So the layout is REPORTED
     # here, at both frames and with the block size it implies, and the thing the old
     # equality existed to protect -- that the module's NUMBERS are the checkpoint's
@@ -5723,13 +5723,13 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
     # measurement: the coarsening kept one scale per 256 block and rescaled the other
     # three 128 tiles into it, exact only where each ratio was a power of two, and the
     # counter was the step's own report of how often it was not. Since
-    # ``inc-glm53f-112`` the dense step rescales nothing, so on this path the zero is
+    # the block-size narrowing the dense step rescales nothing, so on this path the zero is
     # true BY ABSENCE rather than by arithmetic -- and the assertion is kept exactly as
     # it was, because it is what would speak first if the rescaling ever came back.
     # A red run therefore still names the CAUSE and not only the moved number, and it
     # is a finding on the landed step rather than a tolerance to widen.
     inexact: dict[tuple[int, str], int] = {}
-    #: The set that must stay EMPTY since ``inc-glm53f-112``: dense projections whose
+    #: The set that must stay EMPTY since the block-size narrowing: dense projections whose
     #: health record still reports a coarsening.
     coarsened: dict[tuple[int, str], int] = {}
     for rank in range(SHARD_EP_WORLD):
@@ -5740,7 +5740,7 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
             f"load, so the load-time prep loop never reached Glm5NextDenseMLP"
         )
         for leaf, record in health.items():
-            # RE-PINNED BY ``inc-glm53f-112``, AND THE CONTROL IS INVERTED (§1191). The
+            # RE-PINNED BY THE BLOCK-SIZE NARROWING, AND THE CONTROL IS INVERTED (§1191). The
             # dense step no longer coarsens anything, so the interesting set is now the
             # EMPTY one: a coarsened dense projection appearing here is the 256 retile
             # coming back, which is red. The published set carries the vacuity guard
@@ -5756,7 +5756,7 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
     print(f"CONJUNCT3D_RETILE_INEXACT_RESCALES={sorted(inexact.values())}")
     assert not coarsened, (
         f"{len(coarsened)} dense projections report a COARSENING: {sorted(coarsened)}. "
-        f"Since `inc-glm53f-112` the dense load path publishes the checkpoint's own "
+        f"Since the block-size narrowing the dense load path publishes the checkpoint's own "
         f"grid and coarsens nothing, so a non-empty set here means the 256 retile is "
         f"back on this path and the exactness below is measuring something else"
     )
@@ -5781,7 +5781,7 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
         constant. It was derived because the republish used to leave a whole-block
         weight at the consumer's 256 granularity and any other extent at the
         checkpoint's 128, so a constant would have been right for one and silently
-        wrong for the other. Since ``inc-glm53f-112`` every dense grid comes back at the
+        wrong for the other. Since the block-size narrowing every dense grid comes back at the
         checkpoint's 128, and the derivation is KEPT: it reads what the module actually
         carries, so a grid at some other granularity is refused by
         ``dequantise_blockwise`` itself instead of being assumed away here.
@@ -5820,17 +5820,17 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
     def _reference(leaf: str, *, uncompensated: bool = False) -> torch.Tensor:
         """The same three tensors whole, with BOTH halves of the trn2 pair applied.
 
-        CORRECTED BY ``inc-glm53f-054c``, and the correction is one word: the grid is
+        CORRECTED BY THE COMPENSATION, and the correction is one word: the grid is
         now compensated on the reference side, because the load path compensates it.
         The trn2 encoding is a matched pair -- the weight bytes are squeezed into the
         240 range and the per-block grid is multiplied by the inverse factor -- and
         ``_publish_compute_frame_operands`` applies the second half at
-        ``model_fp8.py::_publish_compute_frame_operands``. Before ``-054c`` NOTHING applied it for these two
+        ``model_fp8.py::_publish_compute_frame_operands``. Before the compensation NOTHING applied it for these two
         classes, so a reference carrying only the squeeze agreed with the product, and
         this reading passed while the effective matrix stood at ``240/448`` of the
         checkpoint's magnitude.
 
-        ``uncompensated=True`` IS NOW THE CONTROL ARM: it is the pre-``-054c`` value,
+        ``uncompensated=True`` IS NOW THE CONTROL ARM: it is the pre-compensation value,
         the one that half-applied pair produced. It must NOT match, and if it does then
         the compensation is not reaching the grid and this reading cannot tell the fixed
         load path from the broken one (DECISIONS §706-§707).
@@ -5840,7 +5840,7 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
         re-quantise. At 240/448 it re-quantised nearly every byte, so the squeezed bytes
         were not ``w * 240/448`` exactly and a raw-checkpoint reference was unreachable
         at the EXACT equality this reading asserts.
-        ``inc-glm53f-054e`` NARROWED THAT TO FOUR BYTES AND DID NOT REMOVE IT: an exact
+        THE EXACT FACTOR NARROWED THAT TO FOUR BYTES AND DID NOT REMOVE IT: an exact
         ``x 1/2`` is a pure exponent shift, so of the 119 bytes this fixture uses only
         bytes 9, 11, 13 and 15 -- the odd multiples of ``2**-9`` above the subnormals --
         still re-quantise. Four is enough: a raw-checkpoint reference would break on
@@ -5874,8 +5874,8 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
     # (DECISIONS §706-§707). Each padded stack's real rows -- real columns, for the
     # down projection -- are compared against the checkpoint's own tensor with BOTH
     # halves of the trn2 pair applied, which must agree exactly, and against the
-    # pre-``-054c`` half-applied form, which must NOT: if both agreed, neither reading
-    # could tell the conventions apart. The two arms SWAPPED at ``-054c`` because the
+    # pre-compensation half-applied form, which must NOT: if both agreed, neither reading
+    # could tell the conventions apart. The two arms SWAPPED when the compensation landed because the
     # load path changed, not because the reading did -- the grid is compensated now.
     # This is per projection so that a red run names which one moved.
     stacks = {
@@ -5901,13 +5901,13 @@ def test_sharedshard_the_pad_is_zeros_and_ones_and_dequantises_exactly(
         assert uncompensated_diff != 0.0, (
             f"{leaf} matches the UNCOMPENSATED form as well as the paired one, so the "
             f"compensation is not reaching this grid and this item cannot tell "
-            f"the fixed load path from the pre-inc-glm53f-054c one"
+            f"the fixed load path from the uncompensated one"
         )
         assert raw_diff == 0.0, (
             f"{leaf}'s real rows differ from the checkpoint's own tensor by "
             f"{raw_diff} at the checkpoint's own convention. The load path is meant "
             f"to change this tensor's LAYOUT and not its numbers, so a non-zero "
-            f"reading here is a finding against the republish. Since `inc-glm53f-112` "
+            f"reading here is a finding against the republish. Since the block-size narrowing "
             f"the dense step publishes the checkpoint's own grid, so check first "
             f"whether a 256 coarsening is back on this path -- the set above "
             f"reads empty when it is not. It is never a tolerance to widen and never a "
@@ -5967,8 +5967,8 @@ def test_sharedshard_the_six_families_left_the_replicated_set_both_directions(
 ) -> None:
     """Conjunct (4) re-read at this candidate, both directions and both non-empty.
 
-    ``inc-glm53f-094``'s own conjunct (4) counted these six IN the replicated set
-    and said in those words that ``inc-glm53f-101`` would consume them. This is that
+    The shard geometry's own conjunct (4) counted these six IN the replicated set
+    and said in those words that the expert-parallel sharding would consume them. This is that
     consumption, measured the same way: the set of families that changed between two
     ranks is compared against the set this file declares sharded, in both
     directions, so neither a family that stayed replicated nor one that shards
@@ -6219,7 +6219,7 @@ def test_sharedshard_the_column_comes_from_the_group_and_refuses_a_disagreement(
 
 
 # =========================================================================== #
-# inc-glm53f-105 -- WP7: the sharded projections' FP8 scale grids shard too.
+# WP7: the sharded projections' FP8 scale grids shard too.
 #
 # WHY THIS NEEDS ITS OWN WIDTHS. Everything above runs on MINI_MLA_WIDTHS, whose
 # q_b_proj is 64 rows -- less than one 128-row quantisation block. A grid of one
@@ -6238,11 +6238,11 @@ def test_sharedshard_the_column_comes_from_the_group_and_refuses_a_disagreement(
 #: * ``DEFAULT_WEIGHT_BLOCK_SIZE`` is the 128-row CHECKPOINT tile. It fixes how
 #:   many entries a grid holds, so it is what gives a grid anything to divide.
 #: * ``dense_consumer_block_quant_size()`` reads ``SCALE_BLOCK_SIZE``, the block the
-#:   DENSE block-FP8 kernel indexes its scales by -- 256 rows until ``inc-glm53f-112``
+#:   DENSE block-FP8 kernel indexes its scales by -- 256 rows until the block-size narrowing
 #:   narrowed it to the checkpoint's own 128, so the two bullets now name ONE
 #:   number and the second refusal can no longer fire alone at the production
 #:   granularity. The ROUTED BANK's block is a third number, still 256, read from its
-#:   own producer and not this rule's subject. ``inc-glm53f-101``
+#:   own producer and not this rule's subject. The expert-parallel sharding
 #:   already refuses a shard that is not a whole number of THOSE, and that
 #:   refusal is upstream of everything this item measures.
 #:
@@ -6270,7 +6270,7 @@ GRID_SHARD_MLA_WIDTHS = dict(
     kv_lora_rank=32,
 )
 
-#: The two DSA scaled projections ``inc-glm53f-100`` shards. ``q_a_proj`` and
+#: The two DSA scaled projections the head-width sharding shards. ``q_a_proj`` and
 #: ``kv_a_proj_with_mqa`` are latent-side and replicated; ``kv_b_proj`` is bf16 in
 #: this checkpoint and carries no grid at all.
 GRID_SHARD_LEAVES = ("q_b_proj", "o_proj")
@@ -6522,9 +6522,9 @@ def _mla_grids(
 def test_gridshard_a_sharded_projections_scale_grid_shards_with_its_weight(
     keep_the_loaded_tensors, tmp_path: Path, monkeypatch, single_rank_process_group
 ) -> None:
-    """inc-glm53f-105. A sharded FP8 weight's grid describes THIS RANK's blocks.
+    """A sharded FP8 weight's grid describes THIS RANK's blocks.
 
-    ``inc-glm53f-100`` shards ``q_b_proj`` and ``o_proj``, both of which carry a
+    The head-width sharding shards ``q_b_proj`` and ``o_proj``, both of which carry a
     ``weight_scale_inv`` grid. Left whole, such a grid describes the unsharded
     tensor while the weight is this rank's half, so ``dequantise_blockwise``
     refuses the pair and the load fails at real widths. That is the defect this
@@ -6553,7 +6553,7 @@ def test_gridshard_a_sharded_projections_scale_grid_shards_with_its_weight(
     demonstrate the instrument firing, because the only way to fire it here would
     be to dispatch the tiled NKI matmul inside a load test, a dependency this item
     does not otherwise carry. The same accessor is read NONZERO, at world size 2,
-    by ``test_mla_decode.py``'s ``inc-glm53f-100`` route-predicate item, which
+    by ``test_mla_decode.py``'s head-width route-predicate item, which
     lands in the SAME changeset; a reviewer wanting the firing half of this
     reading should read it there. Note also WHY the zero holds, which is checkable
     without running anything: ``model_fp8`` imports the seam lazily, inside the
@@ -6641,7 +6641,7 @@ def test_gridshard_a_sharded_projections_scale_grid_shards_with_its_weight(
     )
 
     # ── THE CONTROL. Resolve a GRID leaf's geometry back to None -- what
-    # ``_shard_geometry_for`` did before inc-glm53f-105 -- and leave the weights'
+    # ``_shard_geometry_for`` did before the grid sharding -- and leave the weights'
     # geometry alone, so the ONLY difference is the thing this increment added.
     landed = _MODEL_FP8._shard_geometry_for
 
@@ -6671,12 +6671,12 @@ def test_gridshard_a_sharded_projections_scale_grid_shards_with_its_weight(
 
 
 # =========================================================================== #
-# inc-glm53f-105b -- the condition that lets inc-glm53f-105 decline to pad.
+# The condition that lets the grid sharding decline to pad.
 #
-# WHY THIS ITEM EXISTS. inc-glm53f-101 added ``_DeclaredShard.pad_to_consumer_block``,
+# WHY THIS ITEM EXISTS. The expert-parallel sharding added ``_DeclaredShard.pad_to_consumer_block``,
 # which rounds a family's full width UP to a multiple of ``world_size`` times the
 # consumer's block extent so that every rank's shard is a whole block. The MLA
-# entries inc-glm53f-100 declares do NOT set it, and that is a decision rather than
+# entries the head-width sharding declares do NOT set it, and that is a decision rather than
 # an omission: the axis those three projections shard carries WHOLE HEADS, so padding
 # it would add columns belonging to no head, which is the thing head partitioning
 # exists to prevent. The dense MLP's intermediate width has no such structure, which
@@ -6696,11 +6696,11 @@ def test_gridshard_a_sharded_projections_scale_grid_shards_with_its_weight(
 
 
 def test_gridshard_b_every_sharded_mla_head_width_is_a_whole_quant_block() -> None:
-    """inc-glm53f-105b. Why -105 does not pad, and the gate that expires the reason.
+    """Why the grid sharding does not pad, and the gate that expires the reason.
 
     Four readings: two subjects, and a control for each.
 
-    1. every MLA head width that inc-glm53f-100 shards is a whole number of the
+    1. every MLA head width that is sharded is a whole number of the
        CHECKPOINT TILE, ``DEFAULT_WEIGHT_BLOCK_SIZE``, measured on the dimension
        each family is actually sharded on -- dim 0 for the two column-parallel
        projections, dim 1 for the row-parallel one, because a tile is not square in
@@ -6709,7 +6709,7 @@ def test_gridshard_b_every_sharded_mla_head_width_is_a_whole_quant_block() -> No
        ``dense_consumer_block_quant_size()``. These are TWO SEPARATE REFUSALS in
        ``shard_geometry_for_grid`` -- one on the tile, one on the consumer's block --
        and while the two granularities differed a width could clear the first and
-       still stop the load at the second. Since ``inc-glm53f-112`` the consumer's
+       still stop the load at the second. Since the block-size narrowing the consumer's
        block IS the tile, so the two refusals coincide and neither can fire alone;
        both readings are kept because either granularity moving parts them again;
     3. reading 1's control, a DeepSeek-style split that is not a whole tile;
@@ -6819,7 +6819,7 @@ def test_gridshard_b_every_sharded_mla_head_width_is_a_whole_quant_block() -> No
     # the load at the consumer boundary: the refused-load-nobody-predicted this gate
     # exists to catch. ``shard_geometry_for_grid``'s own docstring names this width.
     #
-    # THE CONTROL RUNS AT A MOVED GRANULARITY (`inc-glm53f-112` round 2, ruling 3).
+    # THE CONTROL RUNS AT A MOVED GRANULARITY (block-size narrowing round 2, ruling 3).
     # At the production numbers the dense consumer's block IS the checkpoint tile, so
     # no width fails one rule alone and a control that took a width failing BOTH -- as
     # this one briefly did, at 192 -- reads a green that belongs to the tile rule. So
@@ -6866,10 +6866,10 @@ def test_gridshard_b_every_sharded_mla_head_width_is_a_whole_quant_block() -> No
     assert offenders == {}, (
         f"an MLA head width is not a whole number of quantisation blocks: "
         f"{offenders}, against a block size of {DEFAULT_WEIGHT_BLOCK_SIZE}. "
-        f"inc-glm53f-100 shards these three on whole heads, so a head that leaves "
+        f"The head-width sharding shards these three on whole heads, so a head that leaves "
         f"a part tile means some rank's shard ends inside a block whose single "
         f"scale cannot be divided between two ranks, and "
-        f"``shard_geometry_for_grid`` refuses the load. inc-glm53f-105 declines "
+        f"``shard_geometry_for_grid`` refuses the load. The grid sharding declines "
         f"``pad_to_consumer_block`` because padding a head-bearing axis invents "
         f"columns belonging to no head; that decision rested on this condition, so "
         f"this failure means the decision needs revisiting rather than the widths "
@@ -6882,18 +6882,18 @@ def test_gridshard_b_every_sharded_mla_head_width_is_a_whole_quant_block() -> No
         f"from ``dense_consumer_block_quant_size()``. Such a width can clear the "
         f"{DEFAULT_WEIGHT_BLOCK_SIZE} checkpoint tile and still be refused, because "
         f"``shard_geometry_for_grid`` makes TWO refusals and this is the second one. "
-        f"inc-glm53f-105 declines ``pad_to_consumer_block`` on a head-bearing axis, "
+        f"The grid sharding declines ``pad_to_consumer_block`` on a head-bearing axis, "
         f"and that decision rested on BOTH boundaries holding, so this failure means "
         f"the decision needs revisiting rather than the widths being wrong"
     )
 
 
 # ---------------------------------------------------------------------------
-# inc-glm53f-105b, second premise: the one reachable block size
+# Second premise: the one reachable block size
 # ---------------------------------------------------------------------------
-# WHY THIS ITEM EXISTS. ``inc-glm53f-101`` gave its ``sharded_scale_grid_loader`` a
+# WHY THIS ITEM EXISTS. The expert-parallel sharding gave its ``sharded_scale_grid_loader`` a
 # third parameter, ``block_size``, and forwards it into ``shard_geometry_for_grid``.
-# ``inc-glm53f-105``'s compensating sibling takes no such parameter, so it always
+# The grid sharding's compensating sibling takes no such parameter, so it always
 # uses the default. That asymmetry is safe for ONE reason and it is a reason that
 # can stop being true: the build supports exactly one block size, and the default
 # IS that value. ``block_size`` is not a label -- inside
@@ -6944,16 +6944,16 @@ def test_gridshard_b_one_reachable_block_size_is_why_105_omits_the_parameter() -
 
     assert len(supported) == 1 and supported == frozenset({default}), (
         f"this build now supports {sorted(supported)} rather than exactly "
-        f"[{default}]. inc-glm53f-105's compensating_sharded_scale_grid_loader "
+        f"[{default}]. The grid sharding's compensating_sharded_scale_grid_loader "
         f"takes no block_size parameter and so always uses the default; that was "
         f"safe only while the default was the one reachable value. Give it the "
         f"parameter and forward it into shard_geometry_for_grid, the way "
-        f"inc-glm53f-101's sharded_scale_grid_loader already does, before a "
+        f"sharded_scale_grid_loader already does, before a "
         f"checkpoint with another shape can reach this path"
     )
     assert geom_default == default, (
         f"shard_geometry_for_grid defaults block_size to {geom_default}, not "
-        f"{default}. inc-glm53f-105 omits the argument, so the default is what its "
+        f"{default}. The compensating loader omits the argument, so the default is what its "
         f"path actually uses; a default that is not the supported shape means the "
         f"omission now picks the wrong divisor"
     )
@@ -6966,10 +6966,10 @@ def test_gridshard_b_one_reachable_block_size_is_why_105_omits_the_parameter() -
 
 
 # --------------------------------------------------------------------------- #
-# inc-glm53f-106 -- the routed bank REFUSES an inadmissible shard instead of
+# The routed bank REFUSES an inadmissible shard instead of
 # padding one, and the grid conversion keeps the expert-parallel degree.
 #
-# WHY THESE FOUR ITEMS EXIST. Review B90-101 found that `-101`'s acceptance passed
+# WHY THESE FOUR ITEMS EXIST. Review B90-101 found that the sharding's acceptance passed
 # 25/25 with two defects present, and it passed because the registered fixture made
 # both defects invisible: BANK_INTERMEDIATE=512 at tp_per_ep=2 makes the pad a no-op,
 # so the ruled behaviour (refuse) and the landed behaviour (pad) produced the SAME
@@ -7347,7 +7347,7 @@ def test_bankpad_the_grid_conversion_carries_the_degree_through_both_returns() -
 
 
 # --------------------------------------------------------------------------- #
-# ``inc-glm53f-054a`` hand-off item (iii): the first COMPLETING load in this file
+# The bank scale prep's hand-off item (iii): the first COMPLETING load in this file
 # that carries a shared-expert module.
 #
 # WHY IT IS NEEDED. The landed shared-expert scale prep had never run through
@@ -7371,15 +7371,15 @@ def test_bankpad_the_grid_conversion_carries_the_degree_through_both_returns() -
 #
 # THE 128-BLOCK GRID IS THE POINT, not an accident of the fixture. The checkpoint
 # holds one scale per 128-tile, exactly as the published one does, and since
-# ``inc-glm53f-112`` the prep consumes that same 128 grid. So a completing load here
-# is evidence that the load-path PUBLISH ran; without it this same load is ``-101``'s
+# the block-size change, the prep consumes that same 128 grid. So a completing load here
+# is evidence that the load-path PUBLISH ran; without it this same load is the sharding's
 # recorded refusal. It was evidence that the coarsening ran until the coarsening was
 # removed, and the load it certifies is the same load either way.
 # --------------------------------------------------------------------------- #
 
 #: World size 1 and expert-parallel degree 1, so every family loads whole and no
 #: padding or column arithmetic stands between the checkpoint and the prep. The
-#: sharded readings are ``-094``'s and ``-101``'s and are not repeated here.
+#: sharded readings belong to the two sharded sets and are not repeated here.
 BLOCKED_WORLD = 1
 BLOCKED_EP_DEGREE = 1
 
@@ -7442,7 +7442,7 @@ def test_blocked_the_shared_expert_prep_completes_a_load_and_the_publish_ran(
     Five conjuncts, and the firing control that makes them readings.
 
     (1) The load completes. Until the load-path retile landed, this same
-        checkpoint refused inside the prep, and ``-101`` attempt 2 recorded the
+        checkpoint refused inside the prep, and the sharding's attempt 2 recorded the
         refusal by name -- so completion is the evidence the retile ran, not a
         restatement of it.
     (2) Every shared-expert module carries three prepared scale operands, read
@@ -7454,7 +7454,7 @@ def test_blocked_the_shared_expert_prep_completes_a_load_and_the_publish_ran(
     (4) Both losslessness counters read zero on this fixture. They are counters,
         not assertions: the grid writes a distinct value per 256 BLOCK along the
         shard dim, so a layout that dropped or invented a scale would move them.
-        R6 item R-T2 changed that granularity from ``-095b``'s per-128-tile ramp
+        R6 item R-T2 changed that granularity from the bank-scale section's per-128-tile ramp
         and corrected this sentence with it -- on the ramp the coarsening rescales
         weight bytes, which is what these counters were reporting. Nothing rescales
         a byte any more, so nothing can overflow and there is no refusal to arm;
@@ -7498,7 +7498,7 @@ def test_blocked_the_shared_expert_prep_completes_a_load_and_the_publish_ran(
         )
         for leaf in leaves:
             record = health[leaf]
-            # RE-PINNED BY ``inc-glm53f-112``. This item's NAME still says "the retile
+            # RE-PINNED BY THE BLOCK-SIZE NARROWING. This item's NAME still says "the retile
             # ran"; what runs now is the publish, and the rename is recorded as an open
             # disposition in `112-c3`'s record rather than taken here, because changing
             # a landed item id is a re-registration and not a repair.
@@ -7508,7 +7508,7 @@ def test_blocked_the_shared_expert_prep_completes_a_load_and_the_publish_ran(
                 f"here means the step could not read the extents it was given"
             )
             assert record["retiled"] is False, (
-                f"{path}.{leaf} reports a retile; since `inc-glm53f-112` the dense "
+                f"{path}.{leaf} reports a retile; since the block-size narrowing the dense "
                 f"load path publishes the checkpoint's own grid and coarsens nothing"
             )
             weight = getattr(module, leaf)
@@ -7520,11 +7520,11 @@ def test_blocked_the_shared_expert_prep_completes_a_load_and_the_publish_ran(
                 f"{path}.{grid_name} is {tuple(grid.shape)} after the load; a "
                 f"[{rows},{cols}] weight implies the public grid {implied} at "
                 f"the consumer's {block}-block granularity. A grid that survived "
-                f"at checkpoint granularity is the refusal -101 recorded"
+                f"at checkpoint granularity is the refusal the sharding recorded"
             )
             assert grid.dtype is torch.float32, (
                 f"{path}.{grid_name} is {grid.dtype}; the scale grids stay fp32 "
-                f"through the retile, which is what -091's own item pins"
+                f"through the retile, which is what the entry point's own item pins"
             )
 
             # (4) the two counters, which can move.
@@ -7721,7 +7721,7 @@ def test_blocked_a_ramp_scale_grid_loads_and_publishes_only_finite_values(
 def test_blocked_a_ramp_scale_grid_loads_and_dequantises_exactly_through_the_publish(
     tmp_path, monkeypatch, single_rank_process_group
 ) -> None:
-    """``inc-glm53f-112``: on the DENSE path the ramp hazard is gone, and it is SHOWN.
+    """On the DENSE path the ramp hazard is gone, and it is SHOWN.
 
     WHAT THIS ITEM ADDS TO THE ITEM ABOVE. That one reads a ramping grid for
     FINITENESS: the load must complete and publish no ``NaN``. It once guarded a
@@ -7769,7 +7769,7 @@ def test_blocked_a_ramp_scale_grid_loads_and_dequantises_exactly_through_the_pub
     for path, module in loaded.named_modules():
         # THE BANK IS OUT OF SCOPE HERE BY NAME, not by a shape filter: its record is
         # a dict of TUPLES and its checkpoint keys are one per expert, which is a
-        # different reading, and its coarsening is the one -112 leaves alone.
+        # different reading, and its coarsening is the one the block-size change leaves alone.
         if type(module).__name__ not in _REPUBLISHED_CLASSES:
             continue
         for attribute_name in (
@@ -7847,7 +7847,7 @@ def test_blocked_a_ramp_scale_grid_loads_and_dequantises_exactly_through_the_pub
                 assert block == tuple(DEFAULT_WEIGHT_BLOCK_SIZE), (
                     f"{dotted} carries a grid at {block} granularity, not the "
                     f"checkpoint's own {tuple(DEFAULT_WEIGHT_BLOCK_SIZE)}. This is the "
-                    f"whole of `inc-glm53f-112` read at the module: a 256 block here "
+                    f"whole of the block-size narrowing read at the module: a 256 block here "
                     f"means the coarsening is back"
                 )
                 assert real.shape == reference.shape, (

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Acceptance for `inc-glm53f-062` -- token-generation attention when more than one
+"""Acceptance for token-generation attention when more than one
 new token is decoded at once.
 
 WHAT THIS FILE MEASURES, in one sentence: that `attention_decode` computes the same

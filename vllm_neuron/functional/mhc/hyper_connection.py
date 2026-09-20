@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """mHC combine (the hyper-connection "post" block): a SCRATCH NKI kernel.
 
-`inc-glm53f-029`, WP8's second half. `inc-glm53f-028` normalises the mixing
+WP8's second half. The Sinkhorn kernel normalises the mixing
 scores; this module spends them. Given the ``hc_mult`` residual streams and the
 sub-block's single-stream output, it mixes the streams back into ``hc_mult``
 streams -- one NKI dispatch, on device, per layer call.
 
 It is **kernel-class** under P13, and it is **SCRATCH**: the plan's substrate
-bullet gives the same rationale as `-028`'s -- a per-token device mixing
+bullet gives the same rationale as ``sinkhorn.py``'s -- a per-token device mixing
 operation with no substrate member. Contract §5.2 declares WP8 new in-tree NKI
 authorship with **ZERO precedent**, and the ``vendored_kernels/`` precedent
 covers version-lag vendoring only. **No "vendoring precedent" claim is available
@@ -55,7 +55,7 @@ expressing this as one matmul would need a block-diagonal ``[T*S, T*S]`` matrix
 built out of ``T`` different ``4 x 4`` blocks. What the operation actually is, in
 that layout, is ``S * S`` per-token scalar broadcasts along the free axis -- which
 is precisely ``nisa.tensor_scalar`` with an ``[T, 1]`` ``operand0``, the member
-``functional/moe/router.py:1222-1236`` uses and `-028` reuses at
+``functional/moe/router.py:1222-1236`` uses and Sinkhorn reuses at
 ``sinkhorn.py:276-281``. So the kernel is 16 scalar-engine multiplies, 16 adds
 and 4 post terms, all on ``[T, H]`` tiles, and every primitive is attested at a
 landed line.
@@ -66,7 +66,7 @@ The base's ``mhc_post`` takes bf16 ``x``/``residual`` and returns
 ``residual.dtype``; its own kernel test therefore compares at ``atol=5e-2``. This
 module is **fp32 in and fp32 out**, deliberately, because the plan declares this
 increment's acceptance at ``atol=1e-5`` -- three orders tighter -- and bf16's ~3
-decimal digits cannot express that difference at all. This is `-028`'s landed
+decimal digits cannot express that difference at all. This is the landed
 choice for the same reason (``sinkhorn.py`` "Precision, stated rather than
 implied"). Casting the result is the caller's business; throwing precision away
 inside a kernel whose acceptance measures precision is not. The base's looser
@@ -74,7 +74,7 @@ tolerance is an artefact of its output dtype and is recorded here, not adopted.
 
 The extents this kernel serves, measured rather than assumed
 ------------------------------------------------------------
-* ``T`` is **unbounded** (``inc-glm53f-029b``). Tokens occupy the partition axis,
+* ``T`` is **unbounded**. Tokens occupy the partition axis,
   which is capped at ``nl.tile_size.pmax``, so the kernel body WALKS that axis in
   tiles of that size. ``PARTITION_MAX`` is therefore the tile height, not a token
   ceiling.
@@ -84,18 +84,18 @@ The extents this kernel serves, measured rather than assumed
   at the boundary then, ``T = 128`` ran and ``T = 129`` trapped inside NKI with
   ``dma_copy dst partition dimension 129 exceeds maximum 128``
   (``probe-029-shape-ceiling.out``). That reading is kept because
-  `inc-glm53f-029b`'s acceptance REPRODUCES it against an untiled reference copy
+  this module's acceptance REPRODUCES it against an untiled reference copy
   of the pre-tiling body, in the same test that shows the tiled kernel admitting
-  the same shape. `-028` still carries the single-tile bound on its own token
+  the same shape. Sinkhorn still carries the single-tile bound on its own token
   axis; tiling its half is a separate question and is NOT answered here.
 * ``H`` needs **no** tiling at the target's real hidden sizes. Measured:
   ``H = 4096`` and ``H = 7168`` -- the base's own test shapes -- both run in one
   tile, at ``T = 128``, in 0.22 s and 0.27 s of simulator time. Recorded because
-  it is the question a reader coming from `-028`'s ``M > 128`` refusal will ask
+  it is the question a reader coming from Sinkhorn's ``M > 128`` refusal will ask
   next, and the answer here is the reassuring one. ``H`` lands on the FREE axis,
   which has no partition cap, so tiling ``T`` did not change this.
 
-Both readings are in ``probe-029-shape-ceiling.out`` beside `-029`'s evidence
+Both readings are in ``probe-029-shape-ceiling.out`` beside the evidence
 record; they are cited rather than restated, and the constants below are the
 single place the tile height is written.
 
@@ -105,11 +105,11 @@ Acceptance is Tier N: the NKI simulator, through this module's own
 :func:`hyper_connection_combine` seam (``wrap_nki -> NKIHOPCaller -> HOP ->
 DispatchKey.CPU -> nki.simulator.simulate_kernel``). The seam counts its
 dispatches, and the counters are **module-level** state with module-level reset
-and read functions **on purpose**: `inc-glm53f-030`'s route predicate is form R-2
-over *this* seam together with `-028`'s, read per layer call, so a later
+and read functions **on purpose**: the layer wiring's route predicate is form R-2
+over *this* seam together with Sinkhorn's, read per layer call, so a later
 increment's own test must be able to zero and read these counters from another
-module. The names match `-028`'s exactly -- :func:`reset_dispatch_counters` and
-:func:`dispatch_counters` -- so the two seams `-030` reads present one shape.
+module. The names match Sinkhorn's exactly -- :func:`reset_dispatch_counters` and
+:func:`dispatch_counters` -- so the two seams it reads present one shape.
 
 Under F1 a numeric comparison alone cannot prove a kernel ran: a torch fallback
 would put torch on both sides and pass green. The counters below are therefore
@@ -136,9 +136,9 @@ from vllm_neuron.utils.neuron_utils import can_run_kernel
 logger = logging.getLogger(__name__)
 
 # `MHC_STREAMS` (the target's `hc_mult 4`) and `PARTITION_MAX` are IMPORTED from
-# `-028`'s module rather than restated here, and that is what `-028` asked for:
+# `sinkhorn.py` rather than restated here, and that is what it asked for:
 # `sinkhorn.py:136-139` records `MHC_STREAMS` as "a named constant because
-# `inc-glm53f-029`'s combine kernel and `inc-glm53f-030`'s layer wiring are sized
+# the combine kernel and the layer wiring are sized
 # by the same number". `PARTITION_MAX` is the same physical bound on the same
 # axis -- tokens on the partition axis -- so a second copy would be a second
 # thing that can drift. Neither is redefined below.
@@ -323,10 +323,10 @@ def _require_admissible(
         )
     rows, streams, hidden = (int(v) for v in residual.shape)
 
-    # THERE IS NO UPPER BOUND ON T ANY MORE (`inc-glm53f-029b`). The token axis is
+    # THERE IS NO UPPER BOUND ON T ANY MORE. The token axis is
     # walked in `nl.tile_size.pmax` tiles inside the kernel, so `PARTITION_MAX` is
     # the TILE HEIGHT rather than the token ceiling. `PARTITION_MAX` is still
-    # imported from `-028`'s module and still 128: it is the same physical bound on
+    # imported from `sinkhorn.py` and still 128: it is the same physical bound on
     # the same axis, and the constant did not move -- only what this kernel does
     # when the token count exceeds it. What refused before was a real limitation of
     # the body; the body no longer has it, so the refusal would now be false.
@@ -390,11 +390,11 @@ class _DispatchCounters:
 
 
 #: MODULE-LEVEL, and that is a contract rather than an implementation detail:
-#: `inc-glm53f-030` counts this seam's dispatches from its OWN test module (form
-#: R-2, together with `-028`'s seam), per layer call, so the counter must be
+#: the layer wiring counts this seam's dispatches from its OWN test module (form
+#: R-2, together with the Sinkhorn seam), per layer call, so the counter must be
 #: resettable and readable from outside this module and outside this increment's
-#: test. `-026` and `-028` placed their counters this way for the same reason,
-#: and this object is DISTINCT from `-028`'s: `-030` reads two numbers, so the
+#: test. The landed seams placed their counters this way for the same reason,
+#: and this object is DISTINCT from Sinkhorn's: two numbers are read, so the
 #: two seams must not share one counter.
 _COUNTERS = _DispatchCounters()
 
@@ -449,7 +449,7 @@ def hyper_connection_combine(
     """The mHC combine. The seam the route predicate counts.
 
     Argument names and order are the pinned base's ``mhc_post`` exactly, so
-    `inc-glm53f-030` wires a call rather than a translation.
+    the layer wires a call rather than a translation.
 
     Args:
         x: ``[T, H]`` -- the sub-block's single-stream output.

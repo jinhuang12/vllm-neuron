@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""``platform.py`` accepts a block-fp8 quantisation config (``inc-glm53f-019``).
+"""``platform.py`` accepts a block-fp8 quantisation config.
 
 Subject: ``NeuronPlatform._validate_quantization_config``
 (``vllm_neuron/vllm/platform.py``, the declared surface -- ``@classmethod`` at
 L495 and ``def`` at L496 at worktree HEAD ``ea633e8a``, the pin-anchored L487/488
-of the increment block shifted by the uniform +8 that ``-075``/``-074`` landed
+of the increment block shifted by the uniform +8 that two later increments landed
 above L487).
 
 **Three items, one per declared conjunct, no ``parametrize``** (test-layout rule
@@ -40,7 +40,7 @@ rejected.
 a method that is currently accepted would violate conjunct 3. All **4** mx-named
 methods in the instrument's registry are **already REFUSED** by
 ``Platform.verify_quantization`` against ``NeuronPlatform.supported_quantization``
-(``-075``'s surface), so none of them is in the platform's currently-accepted
+(the landed surface), so none of them is in the platform's currently-accepted
 population, and **0** allowlisted method contains ``"mx"``. Item 2 measures both
 halves on the instrument instead of asserting the reconciliation.
 
@@ -62,8 +62,8 @@ import pytest
 from vllm_neuron.vllm import platform as platform_module
 from vllm_neuron.vllm.platform import NeuronPlatform
 
-# The campaign's pinned checkpoint config, landed by inc-glm53f-008 and already
-# the join ``-075`` item 4 asserts against. Resolved off ``__file__`` so the read
+# The pinned checkpoint config, landed earlier and already
+# the join the landed item 4 asserts against. Resolved off ``__file__`` so the read
 # cannot depend on the invocation's cwd.
 FIXTURE_CONFIG = (
     Path(__file__).resolve().parent / "model" / "glm5_next" / "fixtures" / "config.json"

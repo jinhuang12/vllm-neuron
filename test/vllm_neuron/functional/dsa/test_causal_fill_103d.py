@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Acceptance for the TILED causal fill -- ``inc-glm53f-103d``.
+"""Acceptance for the TILED causal fill.
 
 WHAT THIS FILE ASSERTS. ``_causal_fill_nki`` used to bind all nine of its SBUF tiles to the full
 query-row count in a single tile. A row is a hardware partition and the partition axis serves 128,
@@ -9,14 +9,14 @@ now served in tiles, that nothing else moved, and that a wrong tiling is caught.
 THERE IS NO TOLERANCE HERE AND NONE IS AUTHORED. The fill is integer index arithmetic and the change
 is LAYOUT, not arithmetic -- ``prove-103d-c1-ops-ast-r1.out`` reads the parent's and the candidate's
 device-call sequences as equal ordered lists. So every comparison is ``torch.equal`` on int32, and
-the bar is the one ``inc-glm53f-103`` already registered: bit equality. P9 is untouched.
+the bar is the one the untiled bound already registered: bit equality. P9 is untouched.
 
 FIVE ITEMS, ONE PER COUNTED CONJUNCT, NO ``parametrize``, so the declared count is derivable before a
 line runs. Controls live INSIDE the item whose comparison they protect, on the ``design-20260905``
 §63 precedent this suite already follows: a strengthening under the same id never moves the count.
 
 THE TWO CONTROLS, AND WHY EACH IS NEEDED.
-  * CONTROL (i), inside item 2 -- the UNTILED reference kernel below is the pre-``-103d`` body, and
+  * CONTROL (i), inside item 2 -- the UNTILED reference kernel below is the pre-tiling body, and
     at 132 rows it must raise the vendor assert, printed verbatim. Without it, item 1 could be
     satisfied by a kernel that tiles nothing while the ceiling had quietly moved elsewhere.
   * CONTROL (ii), inside item 3 -- the HOISTED reference kernel below tiles the rows but loads the
@@ -61,7 +61,7 @@ prints ``nl.tile_size.pmax`` from the installed nki so a vendor change moves the
 WIDTH = 16
 """The declared narrow width, inherited from ``test_causal_fill.py``'s own small shape.
 
-The ROW axis is what ``-103d`` changed, so the ladder varies rows and holds width fixed. Width rides
+The ROW axis is what the tiling changed, so the ladder varies rows and holds width fixed. Width rides
 a free axis with no partition bound, which is why one production-width case is enough to show the
 change is width-blind."""
 
@@ -120,7 +120,7 @@ def _positions(rows: int) -> torch.Tensor:
 
 @nki.jit
 def _untiled_reference_nki(positions_hbm, width):
-    """The pre-``-103d`` body, verbatim: nine tiles, all bound to the full row count, no loop.
+    """The pre-tiling body, verbatim: nine tiles, all bound to the full row count, no loop.
 
     TEST-ONLY. It exists so item 2 can compare against the OLD code and control (i) can drive the old
     ceiling on purpose."""

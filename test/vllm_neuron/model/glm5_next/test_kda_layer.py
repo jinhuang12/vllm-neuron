@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""``inc-glm53f-038a`` acceptance -- WP3: the KDA layer and its state carriers.
+"""Acceptance for WP3: the KDA layer and its state carriers.
 
-THE DECLARED ACCEPTANCE, the block's Tier N harness as ``inc-glm53f-025``:
+THE DECLARED ACCEPTANCE, the block's Tier N harness:
 
     VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1 NKI_PRECISE_FP=1 \\
       NEURON_PLATFORM_TARGET_OVERRIDE=trn2 python -m pytest \\
@@ -9,7 +9,7 @@ THE DECLARED ACCEPTANCE, the block's Tier N harness as ``inc-glm53f-025``:
       -p no:cacheprovider
 
 Six arms, one test item each, no ``parametrize``. A01 to A04 read ONE tiny
-17-token case; A05 and A06 were added by ``inc-glm53f-038a`` repair round 1 and
+17-token case; A05 and A06 were added by repair round 1 and
 read a second case that crosses the gate seam's token bound, because an arm that
 stays under that bound is blind to it:
 
@@ -60,12 +60,12 @@ the one that models the carriers the design declares.
 
 The reference is independent of the layer under test on every step that has an
 arithmetic choice in it: it forms its own convolution by an explicit tap sum, its
-own gate in ``inc-glm53f-084``'s landed bounded-sigmoid form, and its own
+own gate in the landed bounded-sigmoid form, and its own
 recurrence one token at a time. It never groups tokens into chunks, so agreement
 on the prefill arm is a statement that the layer's chunk-plus-remainder split is
 associativity-correct.
 
-CONVENTIONS THIS FILE FOLLOWS, ALL FOUR OF THEM ``inc-glm53f-013``'s
+CONVENTIONS THIS FILE FOLLOWS, ALL FOUR OF THEM
 -------------------------------------------------------------------
 ``model_fp8`` is never imported at module level -- ``test_factory.py:318-319``
 is a landed assertion that it stays out of ``sys.modules`` -- so every import of
@@ -146,7 +146,7 @@ DECLARED_ATOL = 1e-5
 REGISTERED_HYBRID_BLOCK_SIZE = 128
 
 #: The four field names, in ``LayerSpec``'s declared order
-#: (``vllm_neuron/model/kv_cache.py:41-44``). ``inc-glm53f-015`` chose them; they
+#: (``vllm_neuron/model/kv_cache.py:41-44``). That declaration chose them; they
 #: are read from there and never re-spelled.
 KDA_STATE_FIELDS = (
     "kda_conv_state_shape",
@@ -305,7 +305,7 @@ def _reference_layer(
     dt_bias = weights["dt_bias"].reshape(-1)
     for head in range(heads):
         span = slice(head * head_dim, (head + 1) * head_dim)
-        # inc-glm53f-084's landed gate: lower * sigmoid(exp(A_log) * (g + bias)).
+        # The landed gate: lower * sigmoid(exp(A_log) * (g + bias)).
         gate = DECLARED_GATE_LOWER_BOUND * torch.sigmoid(
             torch.exp(a_log[head]) * (raw_gate[:, span] + dt_bias[span].reshape(1, -1))
         )
@@ -651,14 +651,14 @@ def _attention_spec_class(layer):
 def _runner_block_size(resolved, cache_dtype) -> SimpleNamespace:
     """The block size to drive the runner at, DERIVED FROM THIS PROCESS'S DEGREE.
 
-    WHY THIS EXISTS -- ``B62-M1``, a repair under ``inc-glm53f-086``. This arm used
+    WHY THIS EXISTS -- ``B62-M1``, a repair under the page-size refusal. This arm used
     to drive the runner at ``REGISTERED_HYBRID_BLOCK_SIZE``, which ``DECISIONS`` §6
     registers *together with* ``TP=64``. But this file builds the real model in an
     undistributed process, where the model's own ``_resolve_world_size()`` returns
     1, so applying that 128 here combined a registered block size with a degree §6
     rejects. The two pages move differently: the recurrent-state page scales as
     ``1/tp`` while the attention page does not depend on tp at all. So at world
-    size 1 the state page is the LARGER of the two, and ``inc-glm53f-086``'s
+    size 1 the state page is the LARGER of the two, and the page-size
     refusal arm fires -- correctly, on a geometry that is not the campaign's. The
     constant is left exactly as it was, for the callers that really are at TP=64.
 
@@ -766,7 +766,7 @@ def _drive_runner_translation(model) -> tuple[dict, SimpleNamespace]:
     """Drive the runner's UNBOUND ``get_kv_cache_spec`` over a real model.
 
     The fake self carries only what that method reads, which is
-    ``inc-glm53f-016``'s landed harness at ``test_get_kv_cache_spec_hybrid.py``
+    the landed harness at ``test_get_kv_cache_spec_hybrid.py``
     ``:189-201``. The MODEL is the real one, because this arm's whole subject is
     the real ``get_kv_spec``'s output.
 
@@ -811,7 +811,7 @@ def test_kda_layer_a03_the_four_state_fields_are_reported_on_the_kda_half(
 
     The instrument is the real unmutated method: no fake model, no
     ``dataclasses.replace``, no hand-written ``LayerSpec``. This is
-    ``inc-glm53f-016``'s declared wait discharged -- it certified the runner's
+    the declared wait discharged -- it certified the runner's
     translation at M1 against field values derived from the vendor calculators,
     and said the real values wait for M3.
     """
@@ -881,7 +881,7 @@ def test_kda_layer_a03_the_four_state_fields_are_reported_on_the_kda_half(
     mamba = len(mamba_specs)
     other = len(attention_specs)
     # The degree and the block size are RECORDED BESIDE THE CENSUS, not asserted.
-    # ``inc-glm53f-022``'s block requires exactly that of a resolved world size --
+    # The requirement is exactly that of a resolved world size --
     # evidence, never a criterion -- and the reason is that this process's degree is
     # a property of how the test is run, so pinning it would pin the runner rather
     # than the code. What IS asserted is the page relation it implies.
@@ -899,7 +899,7 @@ def test_kda_layer_a03_the_four_state_fields_are_reported_on_the_kda_half(
     # THE PAD BRANCH IS THE ONE PRODUCTION TAKES, and this is where that is read.
     # ``B62-M1``: before this repair the arm drove the runner at a block size whose
     # attention page was SMALLER than the world-size-1 state page, so
-    # ``inc-glm53f-086``'s refusal fired and the arm went red. The block size is now
+    # the page-size refusal fired and the arm went red. The block size is now
     # derived from this process's own degree, so the ordering is the production one
     # and these three readings say so.
     padded = sorted({entry.page_size_padded for entry in mamba_specs})
@@ -910,8 +910,8 @@ def test_kda_layer_a03_the_four_state_fields_are_reported_on_the_kda_half(
     )
     # 1. Every recurrent-state page was raised to the attention page.
     assert padded == [geometry.attention_page]
-    # 2. No attention page was padded -- the direction ``inc-glm53f-086``'s re-pin
-    #    at ``test_kv_cache_spec.py`` also requires, and the one ``inc-glm53f-017``'s
+    # 2. No attention page was padded -- the direction the re-pin
+    #    at ``test_kv_cache_spec.py`` also requires, and the one the
     #    allocation arm depends on, because it sizes its view from the real page.
     assert all(entry.page_size_padded is None for entry in attention_specs)
     # 3. The point of the whole exercise: ALL 45 entries now report one page. This
@@ -955,7 +955,7 @@ def test_kda_layer_a04_the_pairing_guard_is_live_when_one_field_is_cleared(
 
 
 # ---------------------------------------------------------------------------
-# A05 and A06 -- the token wall. ``inc-glm53f-038a`` repair round 1, for
+# A05 and A06 -- the token wall. Repair round 1, for
 # ``B36-F1-gate-seam-token-wall``.
 #
 # The four arms above all run at 17 tokens, which never reaches the gate seam's

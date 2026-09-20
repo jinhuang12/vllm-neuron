@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CONFIG-TIME architecture registration for ``Glm5Next`` (``inc-glm53f-074``).
+"""CONFIG-TIME architecture registration for ``Glm5Next``.
 
 Four items, one per declared case, **no** ``parametrize`` -- the declared
 collected count is 4 and stays derivable before the run.

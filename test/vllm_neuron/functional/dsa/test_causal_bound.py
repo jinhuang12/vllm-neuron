@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Acceptance for the selecting-regime causal bound -- ``inc-glm53f-103``.
+"""Acceptance for the selecting-regime causal bound.
 
 WHAT IS BEING ASSERTED. A query row must select only key pools that are COMPLETE at or before its
 own position, and a selection that reached no such pool must read the ``-1`` sentinel. The bound
@@ -17,15 +17,15 @@ WHAT EACH READING IS WORTH, AND WHERE A TOLERANCE IS AND IS NOT SPENT.
     through ``.view(torch.int32)`` -- the RAW BITS -- because ``==`` on floats cannot tell ``-0.0``
     from ``+0.0`` and an arithmetic mask would silently rewrite exactly that.
   * Item 3's LAST reading is the only one with a tolerance, because it runs a float attention kernel.
-    That pair is NOT authored here: ``RTOL`` and ``ATOL`` are IMPORTED from ``inc-glm53f-098``'s
-    acceptance file, which is what "the pair ``-098``'s item (1) carries (cited, not restated)"
+    That pair is NOT authored here: ``RTOL`` and ``ATOL`` are IMPORTED from the float kernel's
+    acceptance file, which is what "the pair its item (1) carries (cited, not restated)"
     asks for. A second spelling of a registered comparator value is a place for it to drift (P9).
 
 TWO REFERENCES ARE IMPORTED RATHER THAN RE-IMPLEMENTED, and the block names both.
-  * ``_precondition_violations`` from ``inc-glm53f-048``'s acceptance file, which is the reader that
+  * ``_precondition_violations`` from the landed expansion's acceptance file, which is the reader that
     DEFINES the precondition this block exists to restore. Re-spelling it here would let this file
-    pass against its own idea of ``-048``'s rule instead of against ``-048``'s rule.
-  * ``sentinel_reference`` and the ``RTOL``/``ATOL`` pair from ``inc-glm53f-098``'s acceptance file.
+    pass against its own idea of the expansion's rule instead of against the expansion's rule.
+  * ``sentinel_reference`` and the ``RTOL``/``ATOL`` pair from the float kernel's acceptance file.
 
 THE ZEROS AND THE COMPARISONS OWN FIRING CONTROLS.
   * item 1's bit equality is shown able to FAIL by a doctored oracle off by one at each row's LAST
@@ -53,8 +53,8 @@ index at or past the real ``width``, which is how a pad column the selector inve
 reason is recorded with its bytes in
 ``increments/contradiction-103-selector-pad-6874a0f5.md``.
 
-``inc-glm53f-103b`` ADDS SIX ITEMS AT THE BOTTOM OF THIS FILE AND CHANGES NOTHING ABOVE THEM.
-``-103``'s four items keep their ids, their dials and their readings; the six new ones all carry
+THE TILED SECTION ADDS SIX ITEMS AT THE BOTTOM OF THIS FILE AND CHANGES NOTHING ABOVE THEM.
+The four items above keep their ids, their dials and their readings; the six new ones all carry
 ``tiled`` in their names, so ``pytest -k tiled`` selects exactly them and the declared count is
 derivable from the file rather than typed into a runner. They exist because every reading above runs
 at 5 query rows: the two kernels used to bind the query-token count to one on-chip tile, which holds
@@ -62,7 +62,7 @@ at 5 query rows: the two kernels used to bind the query-token count to one on-ch
 here could see it. That section carries its own dials, its own emit prefix (``B103|``), a re-spelling
 of the PARENT kernel bodies so the pre-``103b`` result is still measurable, and the two failing
 controls the block declares. No tolerance is authored there either: tiling moves rows between tiles
-and computes no new number, and ``-103b`` is registered at exact bit equality.
+and computes no new number, and the tiled section is registered at exact bit equality.
 """
 
 import os
@@ -105,7 +105,7 @@ from vllm_neuron.functional.dsa.causal_bound import (
     row_tiles,
 )
 
-# `inc-glm53f-103b`'s two UNCHECKED tiling helpers. Imported for the WRONG-WALK control kernel only,
+# The two UNCHECKED tiling helpers. Imported for the WRONG-WALK control kernel only,
 # so that the control differs from the candidate in exactly one thing -- the hoist -- and not in its
 # tile arithmetic. The checked `row_tiles`/`row_tile_count` above are what the items read.
 from vllm_neuron.functional.dsa.causal_bound import (
@@ -127,7 +127,7 @@ from vllm_neuron.functional.dsa.topk_select import (
 )
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
-# `-048`'s OWN precondition reader and `-098`'s OWN reference and tolerance pair. Imported, never
+# The expansion's precondition reader, and the float kernel's reference and tolerance pair. Never
 # re-implemented -- see this file's docstring.
 from test.vllm_neuron.functional.attention.test_mla_sparse import (
     ATOL,
@@ -195,7 +195,7 @@ MULTIFOLD_CAUSAL_LENS = [64, 36, 20, 12, 4]
 row and fewer on the other four.
 
 A row completing fewer pools than ``k`` is the whole point: the selector must fill the remaining
-slots from an all-fill buffer (``BOUND_FILL``, a finite ``-1e30`` since ``-103``; the earlier
+slots from an all-fill buffer (``BOUND_FILL``, a finite ``-1e30`` since the bound landed; the earlier
 wording here said ``-inf`` and was stale), which is where the strike substitution happens. The
 first row completes exactly ``k`` pools and must show ZERO sentinels, so a case that sentinelised
 unconditionally could not pass.
@@ -222,7 +222,7 @@ The case READS that number off the config rather than assuming it, so a factory 
 here reddens with a dial finding instead of passing vacuously."""
 
 MLA_CASE = dict(seq=ROWS, heads=4, latent=128, topk=128, s_kv=256, rope=0)
-"""The geometry item 3's chain ends in, taken from ``-098``'s own declared sentinel family.
+"""The geometry item 3's chain ends in, taken from the float kernel's own declared sentinel family.
 
 ``topk=128`` is not a free choice: it is ``index_expand_width(SELECT_K, POOL_SIZE)``, which item 3
 ASSERTS rather than assumes, so this dict cannot drift from what the chain actually emits. ``s_kv``
@@ -249,7 +249,7 @@ def _scores(seed: int) -> torch.Tensor:
     """One case's scores at the declared shape: ``[ROWS, POOL_COLUMNS]`` float32.
 
     Seeded from the caller so a failure reproduces from its own item. Scaled small for the same
-    reason ``-098``'s fixture is: it feeds a softmax in item 3.
+    reason the float kernel's fixture is: it feeds a softmax in item 3.
     """
     gen = torch.Generator().manual_seed(seed)
     return torch.randn(ROWS, POOL_COLUMNS, generator=gen, dtype=torch.float32) * 0.05
@@ -272,7 +272,7 @@ def _complete_pools() -> list[int]:
 def _assert_module_under_test_is_the_candidate() -> str:
     """Assert the module being measured is the candidate tree, and return where it resolved.
 
-    §78.1's obligation in the form ``inc-glm53f-056``'s repair settled (DECISIONS §88, §91 i): the
+    §78.1's obligation in the form an earlier repair settled (DECISIONS §88, §91 i): the
     declared-root arm binds when ``GLM53F_CANDIDATE_ROOT`` is set, and the root is DERIVED from this
     file's own tree when it is not. A test that requires the campaign harness's environment variable
     is red by construction on every plain ``pytest`` run of the fork, which is the landed defect
@@ -525,7 +525,7 @@ def test_the_sentinel_marks_every_bounded_selection_and_no_other_index() -> None
           kept_positions=int(kept.sum()), kept_unchanged=1)
 
     # THE WHOLLY-BOUNDED ROW. Row 0 has no complete pool, so both of its selections are sentinels --
-    # the case `-098`'s consumer settles as exact zeros, and the one a formula that assumed at least
+    # the case the float kernel settles as exact zeros, and the one a formula that assumed at least
     # one live column would get wrong.
     assert complete[0] == 0, complete[0]
     assert int(per_row[0]) == SELECT_K, int(per_row[0])
@@ -670,7 +670,7 @@ def test_the_sentinel_marks_every_bounded_selection_and_no_other_index() -> None
     mf_filled = (mf_values <= BOUND_FILL_MARK) | torch.isnan(mf_values)
     mf_per_row = (mf_got == SENTINEL).sum(dim=1).to(torch.int64)
 
-    # THE PER-ROW READING, PRINTED BEFORE ANY ASSERTION CAN ABORT THE CASE. It began as `-103`'s r7
+    # THE PER-ROW READING, PRINTED BEFORE ANY ASSERTION CAN ABORT THE CASE. It began as the r7
     # diagnostic and is kept as a regression reading, but its ORIGINAL INTERPRETATION IS WITHDRAWN
     # (rev 268). The r7 run read 16 marks holding NaN on rows 3 and 4 and this block called that a
     # cliff at the selector's per-stage cap, because those were the rows whose completed-pool counts
@@ -935,11 +935,11 @@ def test_the_sentinel_marks_every_bounded_selection_and_no_other_index() -> None
 
 
 def test_the_sentinelised_ids_are_legal_for_048_and_the_chain_matches_the_reference() -> None:
-    """Conjunct 3. The chain's pool ids satisfy ``-048``'s precondition, and attention agrees.
+    """Conjunct 3. The chain's pool ids satisfy the expansion's precondition, and attention agrees.
 
-    THIS IS THE ITEM THE WHOLE BLOCK EXISTS FOR. ``-048``'s expansion declares a caller
+    THIS IS THE ITEM THE WHOLE BLOCK EXISTS FOR. The landed expansion declares a caller
     precondition -- every non-negative pool id is below ``seq_len // pool_size`` -- and the landed
-    chain had nothing that enforced it. So the reading is taken with ``-048``'s OWN reader, imported
+    chain had nothing that enforced it. So the reading is taken with the expansion's reader, imported
     rather than re-spelled, on the bounded chain and then on the UNBOUNDED chain as the control. If
     the control did not violate, this block would be enforcing a precondition nothing broke.
 
@@ -958,12 +958,12 @@ def test_the_sentinelised_ids_are_legal_for_048_and_the_chain_matches_the_refere
     values, indices = dsa_topk_select(bounded, SELECT_K)
     pool_ids = dsa_causal_sentinel(values, indices.to(torch.int32), POOL_COLUMNS)
 
-    # `-048`'S OWN READER, on `-048`'s own argument shapes (python lists). ZERO violations.
+    # THE EXPANSION'S OWN READER, on its own argument shapes (python lists). ZERO violations.
     violations = _precondition_violations(pool_ids.tolist(), CAUSAL_LENS, POOL_SIZE)
     _emit("C3_PRECONDITION", violations=len(violations), detail=violations,
           rows=ROWS, population=pool_ids.numel())
     assert violations == [], (
-        f"the bounded chain still breaks -048's precondition at {violations}"
+        f"the bounded chain still breaks the expansion's precondition at {violations}"
     )
     legal_rows = ROWS - len({r for r, _ in violations})
     assert legal_rows == ROWS, legal_rows
@@ -977,13 +977,13 @@ def test_the_sentinelised_ids_are_legal_for_048_and_the_chain_matches_the_refere
     _emit("C3_UNBOUNDED_CONTROL", violations=len(control), detail=control,
           fires=int(len(control) >= 1))
     assert len(control) >= 1, (
-        "the UNBOUNDED chain satisfied -048's precondition on these inputs, so this item cannot "
+        "the UNBOUNDED chain satisfied the landed precondition on these inputs, so this item cannot "
         "see whether the bound did anything. Choose inputs the unbounded chain breaks"
     )
     assert any(r == 0 for r, _ in control), control
     assert bool((raw_values > BOUND_FILL_MARK).all()), "the control must run on unbounded scores"
 
-    # THE EMITTED WIDTH COMES FROM `-048`'s OWN FUNCTION, never typed. This is what pins MLA_CASE.
+    # THE EMITTED WIDTH COMES FROM THE EXPANSION'S FUNCTION, never typed. This is what pins MLA_CASE.
     width = index_expand_width(SELECT_K, POOL_SIZE)
     assert width == MLA_CASE["topk"], (width, MLA_CASE["topk"])
     _emit("C3_WIDTH", derived=width, mla_case_topk=MLA_CASE["topk"], n_groups=SELECT_K,
@@ -1011,9 +1011,9 @@ def test_the_sentinelised_ids_are_legal_for_048_and_the_chain_matches_the_refere
     assert int(token_idx.max()) < MLA_CASE["s_kv"], int(token_idx.max())
     assert int(row_of.max()) == ROWS - 1
 
-    # AND THE CHAIN'S TAIL: `-098`'s consumer, against `-098`'s own float64 reference at `-098`'s
+    # AND THE CHAIN'S TAIL: the float kernel's consumer, against its own float64 reference at its
     # own tolerance pair, both IMPORTED. The scale is derived from the case's latent rank, the way
-    # `-098`'s `case_scale` derives it, so it cannot drift from the width.
+    # the float kernel's `case_scale` derives it, so it cannot drift from the width.
     q_lift, c_kv, _discarded_idx, q_pe, k_pe = make_case(**MLA_CASE, seed=403)
     assert q_pe is None and k_pe is None, "the declared geometry is at R == 0"
     scale = float(MLA_CASE["latent"]) ** -0.5
@@ -1025,7 +1025,7 @@ def test_the_sentinelised_ids_are_legal_for_048_and_the_chain_matches_the_refere
     ref = sentinel_reference(q_lift, c_kv, token_idx, scale)
     err = float((out - ref).abs().max())
     _emit("C3_ATTENTION_MAXABS_VS_IMPORTED_REFERENCE", err=f"{err:.3e}", rtol=RTOL, atol=ATOL,
-          pair_source="test_mla_sparse.py (inc-glm53f-098), imported not authored")
+          pair_source="test_mla_sparse.py, imported not authored")
     assert bool(torch.isfinite(out).all()), (
         "the chain produced a non-finite value -- what a filled column reaching the softmax "
         "unmasked looks like"
@@ -1173,7 +1173,7 @@ def test_three_malformed_bound_calls_are_refused_by_name_and_the_fallback_can_fi
 
 
 # =========================================================================== #
-# inc-glm53f-103b -- THE QUERY-TOKEN TILING                                    #
+# THE QUERY-TOKEN TILING                                                       #
 # SIX COUNTED ITEMS, no `parametrize`, every name carries `tiled`.             #
 # Run: VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1 pytest <this file> -k tiled -s -rA
 # =========================================================================== #
@@ -1242,10 +1242,10 @@ a different offset inside every tile and the item's own reading asserts they spa
 
 
 def _emit_tiled(item: str, **values: object) -> None:
-    """Print one machine-readable reading line for the ``-103b`` items.
+    """Print one machine-readable reading line for the tiled items.
 
     A DIFFERENT PREFIX from :func:`_emit`'s ``S103|``, on purpose: a launcher counting this
-    increment's readings must not have to tell them apart from ``-103``'s by tag spelling. Same
+    increment's readings must not have to tell them apart from the landed ones by tag spelling. Same
     warning as :func:`_emit` about pytest's progress marker -- match with ``grep -o``, never with a
     ``^`` anchor.
     """
@@ -1254,7 +1254,7 @@ def _emit_tiled(item: str, **values: object) -> None:
 
 
 def _tiled_scores(rows: int, seed: int) -> torch.Tensor:
-    """``[rows, POOL_COLUMNS]`` float32 scores at ``-103``'s declared width. Same scale as
+    """``[rows, POOL_COLUMNS]`` float32 scores at the declared width. Same scale as
     :func:`_scores`, seeded from the caller so a failure reproduces from its own item."""
     gen = torch.Generator().manual_seed(seed)
     return torch.randn(rows, POOL_COLUMNS, generator=gen, dtype=torch.float32) * 0.05
@@ -1289,9 +1289,9 @@ def _selection_of(bounded: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Te
 
     WHY THE HOST AND NOT ``dsa_topk_select``. This increment's claim is about the query-token axis of
     two kernels, and the landed chain reading through the real selector is already taken by conjunct 2
-    and conjunct 3 above at ``-103``'s own extents. Driving the vendored selector at 2,048 rows would
+    and conjunct 3 above at the landed extents. Driving the vendored selector at 2,048 rows would
     put someone else's kernel inside this increment's readings, where a finding about it would arrive
-    as a red on ``-103b``. The sweep that minted this increment already adjudicated that selector as
+    as a red on this section. The sweep that minted this increment already adjudicated that selector as
     tiling its own row axis
     (``increments/scope-lap-token-axis-partition-ceiling-lane-dsa2-s2.md`` section (a)), so the gap
     this pair leaves is recorded rather than covered here.
@@ -1607,7 +1607,7 @@ def test_tiled_admits_the_registered_envelope_where_the_parent_trapped() -> None
 
 
 # =========================================================================== #
-# TILED ITEM 2 -- BIT EQUALITY ON EVERY EXTENT `-103` ALREADY SERVES           #
+# TILED ITEM 2 -- BIT EQUALITY ON EVERY EXTENT THE PARENT ALREADY SERVES       #
 # =========================================================================== #
 
 
@@ -1619,7 +1619,7 @@ def test_tiled_is_bit_identical_to_the_parent_kernel_and_the_oracles_below_the_c
     int32 view rather than on ``==`` -- the same reason conjunct 1 gives, that ``==`` on floats cannot
     tell ``-0.0`` from ``+0.0``.
 
-    ``-103``'s own declared shape is one of the cases, with ``-103``'s own dials and seed, so this
+    The landed increment's own declared shape is one of the cases, with its own dials and seed, so this
     item also says the landed increment's readings still hold on the new bodies.
 
     THE CONTROL IS IN THIS ITEM, and it points the opposite way from item 1's: a walk that HOISTS the
@@ -1632,7 +1632,7 @@ def test_tiled_is_bit_identical_to_the_parent_kernel_and_the_oracles_below_the_c
     """
     _assert_module_under_test_is_the_candidate()
 
-    # `-103`'s own case first, with its own dials, then the ladder up to the ceiling.
+    # The landed case first, with its own dials, then the ladder up to the ceiling.
     cases = [(ROWS, _scores(103), _causal_len())]
     for rows in (1, PARTITION_MAX - 1, PARTITION_MAX):
         cases.append((rows, _tiled_scores(rows, 2000 + rows), _tiled_causal_len(rows)))
@@ -1916,8 +1916,8 @@ def test_tiled_sentinel_marks_exactly_the_bounded_slots_with_both_arms_live() ->
 def test_tiled_route_is_one_nki_dispatch_per_entry_point_at_the_envelope() -> None:
     """Item 6. Route predicate form R-1 at 2,048 rows: 1 NKI dispatch per entry point, 0 fallbacks.
 
-    ``-103``'s landed route reading is re-satisfied by construction -- the counters, the resets, the
-    accessors and the identity helpers did not move -- and this item takes it at the extent ``-103``
+    The landed route reading is re-satisfied by construction -- the counters, the resets, the
+    accessors and the identity helpers did not move -- and this item takes it at the extent the parent
     could not reach. The reading that matters here is the PAIR: many tiles, one dispatch. A host-side
     loop over 128-row slices would serve the same shapes and read ``len(tiles)`` dispatches, which is
     the design P13 excludes and the number that tells the two apart.

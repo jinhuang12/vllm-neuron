@@ -1,4 +1,4 @@
-"""Acceptance for the GLM-5.3-Flash MTP draft head -- ``inc-glm53f-063``, WP9.
+"""Acceptance for the GLM-5.3-Flash MTP draft head -- WP9.
 
 THE TWO COUNTED CONJUNCTS, in the plan block's own words: the draft head emits
 exactly one draft token per step (``nextn = 1``) over 4/4 steps, and its logits
@@ -20,7 +20,7 @@ WHAT DRIVES THE HEAD. The checkpoint's MTP layer is layer index 45 --
 blocks are built from ONE seed, so their weights are identical, and each side
 gets its own cache set: the pool cache, the latent cache and the tail ring are
 all mutated in place, so sharing them would compare a run against itself. That
-is ``inc-glm53f-051``'s own discipline (``test_dsa_layer.py:1704-1710``), and the
+is the DSA layer's own discipline (``test_dsa_layer.py:1704-1710``), and the
 fixture recipe below is re-derived from that file rather than imported from it --
 it carries a live repair, and a cross-test import would couple this acceptance to
 another increment's open work.
@@ -30,16 +30,16 @@ TWO RECORDED COVERAGE LIMITS, both declared rather than discovered later.
 1. **The block is half a layer at this base, and the reference mirrors the same
    half.** ``Glm5NextDSALayer.forward`` is pre-norm, the sparse attention half
    and the residual add; ``self.mlp`` raises, because both MLP forwards are still
-   ``inc-glm53f-013`` stubs (``model_fp8.py:2127``, ``:2149`` -- the second says
-   the dense path lands with ``inc-glm53f-054``'s forward). So THE FEED-FORWARD
+   stubs (``model_fp8.py:2127``, ``:2149`` -- the second says
+   the dense path lands with the dense forward). So THE FEED-FORWARD
    HALF IS ABSENT from the logits path these items read, and neither conjunct
-   reads an FFN. ``inc-glm53f-054`` re-derives both conjuncts over the full layer
+   reads an FFN. The dense increment re-derives both conjuncts over the full layer
    when it joins the halves. Ruled as a recorded limit, not a gap.
 2. **The reference shares the block's code, though not its state.** This
    increment owns composition -- the two input norms, the fused projection, the
    position-zero mask, the step resolution, the shared-head norm and the logits
    matmul -- and it owns no attention numerics, which are
-   ``inc-glm53f-051``'s and are measured by that increment's own test. So the
+   the DSA layer's and are measured by that increment's own test. So the
    reference re-derives exactly what this increment owns and calls the same layer
    class for the rest. That makes the value comparison a test of ORDER AND
    WIRING rather than of attention arithmetic, which is why the reversed-concat
@@ -47,7 +47,7 @@ TWO RECORDED COVERAGE LIMITS, both declared rather than discovered later.
 
 Everything the head needs that this base does not yet supply --
 ``num_nextn_predict_layers`` as a config field, and the MTP keys in the weight
-map -- is ``inc-glm53f-064``'s recorded Surface rider. The count is therefore
+map -- is a recorded Surface rider. The count is therefore
 DERIVED HERE from the digest-pinned checkpoint config rather than typed.
 """
 
@@ -124,7 +124,7 @@ TINY_HEAD_SIZE = TINY_GEOMETRY["kv_lora_rank"] + TINY_GEOMETRY["qk_rope_head_dim
 #: ``kv_lora_rank ** -0.5``, which is the CONTRACTION width the absorbed score GEMM
 #: uses and not the width the reference scales by; ``kv_lora_rank`` is twice
 #: ``qk_nope_head_dim`` on this geometry, so that value was low by exactly
-#: ``sqrt(2)``. Corrected under ``inc-glm53f-109`` (DECISIONS section 362).
+#: ``sqrt(2)``. Corrected later (DECISIONS section 362).
 #:
 #: :data:`TINY_HEAD_SIZE` above legitimately keeps ``kv_lora_rank``: it is the
 #: absorbed head_size the implementation derives at ``model_fp8.py:407-416``, a
@@ -993,7 +993,7 @@ def test_the_head_threads_exactly_the_blocks_own_keyword_arguments() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# inc-glm53f-109. THE SOFTMAX SCALE, AGAINST THE REFERENCE'S OWN DERIVATION.
+# THE SOFTMAX SCALE, AGAINST THE REFERENCE'S OWN DERIVATION.
 
 
 def test_softmaxscale_is_the_reference_derivation_and_NOT_the_latent_rank() -> None:

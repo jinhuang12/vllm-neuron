@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tier N acceptance for `inc-glm53f-054g` -- the indexed-flatten predicate answers below 16 tokens.
+"""Tier N acceptance: the indexed-flatten predicate answers below 16 tokens.
 
-Acceptance command (plan block, ``#### inc-glm53f-054g``)::
+Acceptance command (plan block)::
 
     VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1 NEURON_PLATFORM_TARGET_OVERRIDE=trn2 \
     pytest test/vllm_neuron/functional/moe/test_moe_blockwise_small_t_054g.py -s -rA
@@ -13,7 +13,7 @@ WHAT WENT WRONG, AND WHERE
 so that expression is ``0``, and the routing predicate
 ``_can_use_indexed_flatten_kernel`` then evaluates ``T % f_len`` (``:536`` before this increment) and
 raises ``ZeroDivisionError`` instead of answering. It was measured on a leased host, not guessed:
-`increments/launch-054b-r5-trn2-1-20260909T230709Z.out`, where two items of the `-054b` acceptance
+`increments/launch-054b-r5-trn2-1-20260909T230709Z.out`, where two items of that acceptance
 die on that line inside a decode step's MoE layer.
 
 The sibling predicate already answers at that size -- ``_can_use_find_nonzero_indices_kernel``

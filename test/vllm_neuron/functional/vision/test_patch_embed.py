@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tier N acceptance for `inc-glm53f-057` -- the WP10 vision patch embed WRAP.
+"""Tier N acceptance for the WP10 vision patch embed WRAP.
 
-Acceptance command (plan block ``#### inc-glm53f-057``, Tier N harness "as
-`-025`")::
+Acceptance command (Tier N harness "as
+the plan block declares")::
 
     VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1 NKI_PRECISE_FP=1 \
     NEURON_PLATFORM_TARGET_OVERRIDE=trn2 \
@@ -66,7 +66,7 @@ chain RAISING rather than quietly computing torch when the simulator is off; and
 :func:`test_stride_derivation_is_load_bearing` shows the substrate's DEFAULT
 stride returning a different, overlapping-window extent on the same inputs, so
 the seam's derivation of that argument is measured rather than assumed. (This
-kernel carries no ``assert`` statements, so unlike `inc-glm53f-034`'s conv1d
+kernel carries no ``assert`` statements, so unlike the conv1d
 there is no vendor refusal to record here -- the wrong argument is silently
 wrong, which is why the control measures the extent instead of an exception.)
 
@@ -74,7 +74,7 @@ Why fp32 and not the tower's bf16
 ---------------------------------
 The declared ``atol`` is ``1e-5``, which bf16's ~3 decimal digits cannot express
 at all, so a bf16 comparison would measure the storage format instead of the
-kernel (the `inc-glm53f-025` conditioning lesson, applied as `inc-glm53f-034`
+kernel (the conditioning lesson, applied as the conv1d
 landed it). The block's rev-231 rider records that the real tower's inputs are
 bf16; :func:`test_bf16_tower_dtype_is_admitted_by_the_seam` ties that rider to
 this code as a STRUCTURAL reading -- the gate admits bf16 and the seam
@@ -571,7 +571,7 @@ def test_route_control_simulator_is_load_bearing() -> None:
 def test_stride_derivation_is_load_bearing() -> None:
     """The substrate's DEFAULT stride computes a different, overlapping answer.
 
-    This kernel carries no ``assert`` statements, so unlike `inc-glm53f-034`'s
+    This kernel carries no ``assert`` statements, so unlike the conv1d's
     conv1d there is no vendor refusal to record: the substrate default
     ``stride = (1, 1, 1)`` succeeds and returns a LARGER extent, because the
     patch windows then overlap at every pixel offset. That silent wrongness is
@@ -664,7 +664,7 @@ def test_reference_is_the_substrates_own_and_not_authored_here() -> None:
 def test_dispatch_counters_are_module_level_state_reachable_from_elsewhere() -> None:
     """Another increment's test module can zero and read these counters.
 
-    The placement `inc-glm53f-026` and `inc-glm53f-034` landed. A test-local
+    The placement the dense half and the conv1d landed. A test-local
     counter would satisfy this increment and break the next one that reads this
     seam.
     """
