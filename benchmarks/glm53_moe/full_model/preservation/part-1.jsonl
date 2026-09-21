@@ -1,0 +1,10 @@
+{"prompt": "The largest planet in our solar system is", "output_tokens": 32}
+{"prompt": "The largest planet in our solar system is", "output_tokens": 32}
+{"prompt": "Summarize in one sentence: A library replaced its paper checkout cards with an online catalog. Readers can now reserve books from home.", "output_tokens": 32}
+{"prompt": "Translate 'The window is open' into Spanish.", "output_tokens": 32}
+{"prompt": "Complete this SQL query to count all rows in the orders table: SELECT", "output_tokens": 32}
+{"prompt": "Rewrite this sentence in the past tense: I walk to the station every morning.", "output_tokens": 32}
+{"prompt": "Rewrite this sentence in the past tense: I walk to the station every morning.", "output_tokens": 32}
+{"prompt": "Name two differences between a compiler and an interpreter.", "output_tokens": 32}
+{"prompt": "In Python, write a function that returns the smaller of two numbers.", "output_tokens": 32}
+{"prompt": "Write a short email asking to move a meeting from Tuesday to Wednesday.", "output_tokens": 32}

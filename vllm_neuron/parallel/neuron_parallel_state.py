@@ -1597,6 +1597,25 @@ def tp_barrier(timeout: timedelta | None = None):
         group.cpu_group.barrier().wait(timeout=timeout)
 
 
+def tp_sum_int(value: int, timeout: timedelta | None = None) -> int:
+    """Sum one integer across the TP group and return the total, synchronizing as it does."""
+    import torch
+    import torch.distributed as dist
+
+    from vllm.distributed.parallel_state import get_tp_group
+
+    timeout = timeout or _default_barrier_timeout()
+    group = get_tp_group()
+    if group.world_size <= 1:
+        return value
+    # An all-reduce every rank must reach is a barrier that also carries a value, so a caller
+    # gets the group's answer instead of only the fact that everyone arrived.
+    total = torch.tensor([value], dtype=torch.int64)
+    group.cpu_group.set_timeout(timeout)
+    dist.all_reduce(total, group=group.cpu_group)
+    return int(total.item())
+
+
 def _default_barrier_timeout() -> timedelta:
     """Barrier timeout from env, read lazily (reflects call-time env, not import)."""
     from vllm_neuron import envs
