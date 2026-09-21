@@ -1,0 +1,24 @@
+{
+  "fixture": "weight_index.py",
+  "describes": "model.safetensors.index.json of zai-org/GLM-5.3-Flash",
+  "fixture_form": "rebuilt from the layer schedule in hf-config.json",
+  "source_url": "https://huggingface.co/zai-org/GLM-5.3-Flash/raw/main/model.safetensors.index.json",
+  "upstream_repo": "zai-org/GLM-5.3-Flash",
+  "upstream_revision": "04c4e9e95c5da8862dced7e5056455116f83a7e0",
+  "upstream_revision_caveat": "the fetch used the ref 'main' rather than the sha, so the sha above is what main resolved to at fetch time, corroborated by the published file's byte count (8406613) only",
+  "published_file_sha256": "3c3f40366a53c3fd7974b4eab7881a365a98c2a4329150befebab99fe7c18b05",
+  "published_file_bytes": 8406613,
+  "keys": 76108,
+  "shards": 62,
+  "key_set_sha256": "7baf28d0d672c695e66ac4c68f3a8bcf054e52b2f364a566e6f30fcfaa4cef2d",
+  "weight_map_sha256": "7a80a5171d8176c7928f53a97b54a1a63982b55caddacf89ec509b160b51a7fc",
+  "digest_definitions": {
+    "key_set_sha256": "sha256 of the sorted checkpoint keys, newline joined",
+    "weight_map_sha256": "sha256 of the sorted 'key shard' lines, newline joined"
+  },
+  "holds_weights": false,
+  "contents": "one weight_map object (76108 checkpoint-key-to-shard entries over 62 shards) and one metadata.total_size field",
+  "rebuilt_because": "the published file is 8.4 MB of JSON in which the 76108 keys repeat eight per-layer leaf sets over the schedule already in hf-config.json; weight_index.py rebuilds the same {key: shard} pairs from those patterns, so the tree carries the schedule rather than a megabyte of its expansion",
+  "faithfulness": "the rebuild yields exactly the published pairs; only iteration order differs, because the published file lists keys in checkpoint write order and the rebuild yields them sorted. The two digests above were taken from the published file before it was removed, and test_weight_loaders.py::test_rebuilt_weight_index_matches_the_published_digests recomputes both from the rebuild, so a drift in the generator fails a test instead of passing quietly.",
+  "shard_assignment": "not derivable from the key names, so weight_index._SHARD_RUNS carries it as 65 (shard number, key count) runs over the sorted key order"
+}

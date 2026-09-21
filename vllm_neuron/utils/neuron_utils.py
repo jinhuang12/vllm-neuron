@@ -6,6 +6,8 @@ import os
 from typing import TYPE_CHECKING
 
 import torch
+from torch._guards import TracingContext
+from torch._subclasses.fake_tensor import FakeTensor
 
 from vllm_neuron import envs
 
@@ -21,6 +23,22 @@ def can_run_kernel(device: torch.Tensor | str = "") -> bool:
         return os.environ.get("NKI_SIMULATOR") == "1"
     device_str = str(device.device) if isinstance(device, torch.Tensor) else device
     return device_str != "cpu"
+
+
+def values_are_readable(tensor: torch.Tensor) -> bool:
+    """Check if a value can be read off ``tensor`` on the host.
+
+    Guards host-side reads of tensor *data*, which are only valid outside graph
+    construction. Each clause covers a different construction path: under Dynamo
+    the tensor is a real device tensor, so only the tracing state reveals the
+    trace -- and reading a value there creates an unbacked symbol that torch then
+    cannot guard on -- while a fake-tensor pass and a ``meta`` graph build open no
+    tracing context and are caught by the tensor checks instead. Shape and dtype
+    reads stay valid on all three paths and need no guard.
+    """
+    if torch.compiler.is_compiling() or TracingContext.try_get() is not None:
+        return False
+    return not isinstance(tensor, FakeTensor) and tensor.device.type != "meta"
 
 
 def model_forward_context(

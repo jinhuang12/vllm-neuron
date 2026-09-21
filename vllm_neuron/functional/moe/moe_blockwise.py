@@ -3,6 +3,7 @@ import math
 import torch
 import torch.distributed as dist
 from torch import Tensor
+from torch._subclasses.fake_tensor import FakeTensor
 from typing import TYPE_CHECKING, Optional
 import logging
 
@@ -124,7 +125,24 @@ def build_blockwise_mapping(
         tensor=expert_mask,
         f_len=f_len,
     )
-    use_kernel_flow = can_use_find_nonzero_kernel and can_use_indexed_flatten_kernel
+    # The nkilib subkernels are not eligible under graph capture: both reach the
+    # device through the HOP wrapper, whose non-tensor arguments are replaced with
+    # ``None`` once the graph is captured, so a traced prefill dies inside a
+    # subkernel. The torch construction below is static-shape instead -- every
+    # extent is a trace-time int and every write a fixed-shape index_put -- so it
+    # is safe to capture. All three tests are needed: dynamo folds an
+    # ``isinstance`` against a tensor class to a trace-time constant, so the
+    # fake-tensor test alone reads False under capture; it still catches a fake
+    # propagation raised outside dynamo, and the meta-device test catches a
+    # shape-only pass. Eager answers all three False and keeps the subkernels.
+    capturing = (
+        torch.compiler.is_compiling()
+        or isinstance(expert_mask, FakeTensor)
+        or expert_mask.device.type == "meta"
+    )
+    use_kernel_flow = (
+        can_use_find_nonzero_kernel and can_use_indexed_flatten_kernel and not capturing
+    )
 
     if use_kernel_flow:
         token_position_to_id, block_to_expert, num_blocks = (
@@ -530,6 +548,10 @@ def _can_use_indexed_flatten_kernel(
 ) -> bool:
     """Check if indexed_flatten kernel can be used."""
     if not can_run_kernel(tensor):
+        return False
+
+    # T < 16 leaves f_len at 0, which the divisibility checks below cannot divide by.
+    if f_len < 1:
         return False
 
     # T must be divisible by f_len

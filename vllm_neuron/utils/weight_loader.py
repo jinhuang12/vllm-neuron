@@ -306,6 +306,181 @@ def sharding_weight_loader_with_padding(
     return SafetensorsWeightLoader(transform=transform)
 
 
+def load_time_shard_size(
+    full: int,
+    num_shards: int,
+    pad_to_multiple_of: int | None = None,
+    *,
+    who: str = "<unnamed parameter>",
+    shard_dim: int = 0,
+) -> int:
+    """Compute one rank's extent along a dimension measured at load time.
+
+    Shared by :func:`shard_tensor_at_load_time` and
+    :func:`tensor_width_sharding_loader` so that a weight and its block-scale
+    grid agree on where a shard ends.
+
+    Args:
+        full: Full width of the dimension, as read off the tensor.
+        num_shards: Number of shards the dimension is divided into.
+        pad_to_multiple_of: When given, ``full`` is first rounded up to the
+            smallest multiple of ``num_shards * pad_to_multiple_of``, so every
+            rank's extent is a whole multiple of this number. When None, the
+            width must divide evenly.
+        who: Parameter name to report in an error message.
+        shard_dim: Dimension index, reported in an error message.
+
+    Returns:
+        The per-rank extent along the dimension.
+
+    Raises:
+        ValueError: If num_shards or pad_to_multiple_of is below 1, or if the
+            width does not divide evenly and no padding was asked for. An uneven
+            width is refused rather than floored, because a floored shard drops
+            rows that no rank would then hold; the error names the remainder and
+            the two nearest widths that do divide evenly.
+    """
+    if num_shards < 1:
+        raise ValueError(f"{who}: num_shards must be >= 1, got {num_shards}")
+    if pad_to_multiple_of is None:
+        remainder = full % num_shards
+        if remainder:
+            raise ValueError(
+                f"{who}: the checkpoint tensor is {full} wide on dim "
+                f"{shard_dim} and {num_shards} ranks divide it, leaving a "
+                f"remainder of {remainder}. The nearest widths that divide "
+                f"evenly are {full - remainder} and "
+                f"{full + num_shards - remainder}. Refusing rather than "
+                f"flooring: a floored shard drops {remainder} rows that no "
+                f"rank would then hold"
+            )
+        return full // num_shards
+    if pad_to_multiple_of < 1:
+        raise ValueError(
+            f"{who}: pad_to_multiple_of must be >= 1, got {pad_to_multiple_of}"
+        )
+    step = num_shards * pad_to_multiple_of
+    return (-(-full // step) * step) // num_shards
+
+
+def shard_tensor_at_load_time(
+    tensor: torch.Tensor,
+    shard_dim: int,
+    num_shards: int,
+    rank: int,
+    pad_to_multiple_of: int | None = None,
+    pad_value: float = 0.0,
+    param_name: str | None = None,
+) -> torch.Tensor:
+    """Take one rank's shard of an already materialised tensor, with padding.
+
+    The counterpart of :func:`tensor_width_sharding_loader` for a caller that no
+    longer holds a checkpoint slice. A routed expert bank's block-scale grids are
+    the case: each grid is compensated whole by ``compensate_block_scales``, whose
+    arithmetic a pre-sliced grid would change, so the grid is a materialised
+    tensor by the time its shard is taken. The extent comes from
+    :func:`load_time_shard_size`, the same as on the checkpoint path, so a bank's
+    weight columns and its scale rows end in the same place.
+
+    Args:
+        tensor: Tensor to shard.
+        shard_dim: Dimension to shard along.
+        num_shards: Number of shards the dimension is divided into.
+        rank: Shard index to return.
+        pad_to_multiple_of: See :func:`load_time_shard_size`.
+        pad_value: Value the padded elements hold.
+        param_name: Parameter name to report in an error message.
+
+    Returns:
+        This rank's shard, padded to the per-rank extent.
+    """
+    who = param_name or "<unnamed parameter>"
+    if shard_dim >= tensor.dim():
+        raise ValueError(
+            f"{who}: shard_dim {shard_dim} is outside the tensor's "
+            f"{tensor.dim()} dimensions {tuple(tensor.shape)}"
+        )
+    full = int(tensor.shape[shard_dim])
+    shard_size = load_time_shard_size(
+        full, num_shards, pad_to_multiple_of, who=who, shard_dim=shard_dim
+    )
+    start_idx = (rank % num_shards) * shard_size
+    sl = [slice(None)] * tensor.dim()
+    sl[shard_dim] = slice(start_idx, start_idx + shard_size)
+    result = tensor[tuple(sl)]
+    target = list(result.shape)
+    target[shard_dim] = shard_size
+    return pad_to_shape(result, tuple(target), pad_value)
+
+
+def tensor_width_sharding_loader(
+    shard_dim: int,
+    num_shards: int,
+    pad_to_multiple_of: int | None = None,
+    pad_value: float = 0.0,
+    param_name: str | None = None,
+) -> SafetensorsWeightLoader:
+    """Create a SafetensorsWeightLoader that shards a tensor by its own width.
+
+    The loaders above take ``shard_size`` as a construction-time number, computed
+    from a dimension the declaring module knows. This one instead reads the width
+    off the checkpoint slice at load time, which is what a parameter whose module
+    does not carry its own width needs: the site that attaches weight loaders holds
+    the module and the world size but not the checkpoint, so no tensor shape is
+    available there.
+
+    Args:
+        shard_dim: Dimension to shard along in the final parameter shape.
+        num_shards: Number of shards the dimension is divided into.
+        pad_to_multiple_of: When given, the width is first rounded up to the
+            smallest multiple of ``num_shards * pad_to_multiple_of`` and short
+            slices are padded, so every rank's shard is a whole multiple of this
+            number. This is how a consumer's block granularity is met by a width
+            the checkpoint does not divide evenly -- pass the consumer's own block
+            size. When None the width must divide evenly.
+        pad_value: Value the padded elements hold, passed to :func:`pad_to_shape`.
+            0.0 for a weight; 1.0 for a reciprocal block scale, whose padded
+            entries multiply padded weight rows.
+        param_name: Parameter name to report in an error message.
+
+    Returns:
+        SafetensorsWeightLoader whose transform reads the width, then shards.
+    """
+
+    def transform(slices: list["PySafeSlice"], rank: int) -> torch.Tensor:
+        who = param_name or "<unnamed parameter>"
+        if len(slices) != 1:
+            raise ValueError(
+                f"{who}: tensor_width_sharding_loader() takes ONE tensor and was "
+                f"handed {len(slices)}; a width read off the wrong slice would "
+                f"shard a different tensor than the one being loaded"
+            )
+        slice_obj = slices[0]
+        shape = list(slice_obj.get_shape())
+        if shard_dim >= len(shape):
+            raise ValueError(
+                f"{who}: shard_dim {shard_dim} is outside the checkpoint tensor's "
+                f"{len(shape)} dimensions {tuple(shape)}"
+            )
+        full = int(shape[shard_dim])
+        shard_size = load_time_shard_size(
+            full, num_shards, pad_to_multiple_of, who=who, shard_dim=shard_dim
+        )
+        start_idx = (rank % num_shards) * shard_size
+        sl = [slice(None)] * len(shape)
+        sl[shard_dim] = slice(start_idx, start_idx + shard_size)
+        result = slice_obj[tuple(sl)]
+
+        # A rank whose whole shard sits past the last real row reads an empty
+        # slice; the pad below fills it. pad_to_shape returns the tensor untouched
+        # when it is already the full width.
+        target = list(result.shape)
+        target[shard_dim] = shard_size
+        return pad_to_shape(result, tuple(target), pad_value)
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
 def last_dim_padding_weight_loader(padded_size: int) -> SafetensorsWeightLoader:
     """Create a SafetensorsWeightLoader that pads a tensor's last dimension.
 
@@ -892,12 +1067,21 @@ def get_shard_deinterleaved(
     return gate_shard, up_shard
 
 
-def pad_to_shape(tensor: torch.Tensor, target_shape: tuple[int, ...]) -> torch.Tensor:
+def pad_to_shape(
+    tensor: torch.Tensor,
+    target_shape: tuple[int, ...],
+    pad_value: float = 0.0,
+) -> torch.Tensor:
     """Pad tensor to target shape. Pads at the end of each dimension.
 
     Args:
         tensor: Input tensor (possibly smaller than target on some dims)
         target_shape: Expected shape after padding
+        pad_value: Value the added elements hold. Defaults to 0.0, which is what
+            ``F.pad`` pads with. A caller padding a reciprocal quantity passes 1.0
+            instead: a block-FP8 scale grid multiplies its weight block, so a zero
+            there would scale real rows to nothing, while a one leaves the padded
+            (zero) rows exactly zero.
 
     Returns:
         Tensor padded to target_shape, or original if no padding needed.
@@ -914,4 +1098,4 @@ def pad_to_shape(tensor: torch.Tensor, target_shape: tuple[int, ...]) -> torch.T
     for actual, target in zip(reversed(tensor.shape), reversed(target_shape)):
         pad.extend([0, target - actual])
 
-    return torch.nn.functional.pad(tensor, pad)
+    return torch.nn.functional.pad(tensor, pad, value=pad_value)

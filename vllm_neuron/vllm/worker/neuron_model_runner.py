@@ -33,6 +33,8 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MLAAttentionSpec,
+    MambaSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -204,6 +206,9 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
                     return self.model_runner_output
 
                 # First call: materialize device future to CPU.
+                _refuse_non_integer_future(
+                    sampled_token_ids, self.model_runner_output.req_ids
+                )
                 if sampled_token_ids.ndim == 2 and sampled_token_ids.shape[1] > 1:
                     # Spec decode: rejection sampler output [bs, num_spec+1]
                     # with -1 padding for rejected positions. Strip -1s to
@@ -264,6 +269,22 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
 
         # Logprobs are computed in _sample() when on-device logits are available
         return self.model_runner_output
+
+
+def _refuse_non_integer_future(sampled_token_ids: torch.Tensor, req_ids: list[str]) -> None:
+    """Raise if the sampled-token future holds logits instead of integer token ids.
+
+    On-device sampling returns an integer tensor. A floating tensor here means the
+    model returned logits, which no branch below can read as tokens.
+    """
+    if sampled_token_ids.is_floating_point() or sampled_token_ids.is_complex():
+        raise TypeError(
+            f"the async sampled_token_ids future for requests {list(req_ids)} is "
+            f"{sampled_token_ids.dtype} with shape {tuple(sampled_token_ids.shape)}, not an "
+            "integer token tensor: the model returned logits where on-device sampling was "
+            "expected to return token ids; serve it with on_device_sampling_config: null and "
+            "synchronous scheduling, or give the model an on-device sampler"
+        )
 
 
 def _reinterpret_uint32_as_int32(
@@ -331,6 +352,37 @@ def _compute_slot_mapping_cpu(
             block_offsets,
             out=slot_mapping_np[: len(positions)],
         )
+
+
+def kv_cache_allocations(
+    kv_cache_config: KVCacheConfig,
+) -> list[tuple[int, list[str]]]:
+    """Return the raw buffers to allocate for a KV cache config, as (bytes, layer names) pairs.
+
+    Layers that share a ``KVCacheTensor`` share one buffer, except recurrent
+    (``MambaSpec``) layers: their state is addressed by request slot rather than by
+    block, so two of them on one buffer would overwrite each other's state, and a
+    recurrent slot would overlay the same-numbered block of a latent layer sharing
+    the buffer. Each recurrent layer gets its own buffer of the shared size.
+    """
+    spec_of = {
+        name: group.kv_cache_spec
+        for group in kv_cache_config.kv_cache_groups
+        for name in group.layer_names
+    }
+    allocations: list[tuple[int, list[str]]] = []
+    for tensor in kv_cache_config.kv_cache_tensors:
+        recurrent = [
+            name
+            for name in tensor.shared_by
+            if isinstance(spec_of.get(name), MambaSpec)
+        ]
+        shared = [name for name in tensor.shared_by if name not in recurrent]
+        if shared:
+            allocations.append((tensor.size, shared))
+        for name in recurrent:
+            allocations.append((tensor.size, [name]))
+    return allocations
 
 
 def build_sampling_params_tensor(
@@ -491,6 +543,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self._on_device_logits: torch.Tensor | None = None
         self._debug_logits_dir: str | None = self.neuron_config.debug_logits_dir
         self._debug_logits_step_counter: int = 0
+        # Read the per-layer stream dump flag once: it decides which signature the
+        # model traces, so a later read could disagree with the captured graph.
+        self._layer_stream_dump_dir: str | None = self._layer_stream_dump_dir_from_env()
+        self._layer_streams_dumped: bool = False
         self._tensor_replacer = None
 
         # Context parallelism: DCP rank for KV cache sharding.
@@ -618,6 +674,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 validate_kv_segment_size_buckets(
                     buckets,
                     explicit_num_batched_tokens_buckets,
+                    allow_independent_query_buckets=(
+                        self.neuron_config._model_supports_independent_prefill_buckets
+                    ),
                 )
             )
             kv_segment_size = self.neuron_config.kv_segment_size_buckets[0]
@@ -659,6 +718,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 validate_kv_segment_size_buckets(
                     auto_kv_segment_size_buckets,
                     explicit_num_batched_tokens_buckets,
+                    allow_independent_query_buckets=(
+                        self.neuron_config._model_supports_independent_prefill_buckets
+                    ),
                 )
             )
             logger.info(
@@ -705,7 +767,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if self.use_async_scheduling:
             if not self.on_device_sampling:
                 raise RuntimeError(
-                    "On-device sampling must be enabled for async execution"
+                    "On-device sampling must be enabled for async execution: "
+                    f"{list(vllm_config.model_config.architectures)} runs without an "
+                    "on-device sampler, so serve it with synchronous scheduling"
                 )
             # The buffer to facilitate async execution.
             self.async_execution_buffer = dict()
@@ -1926,6 +1990,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+        # Free per-request cache state only on the scheduler's finished set: a live
+        # request that was not scheduled this step also leaves the persistent batch
+        # below, and it keeps its state.
+        self._glm5next_note_finished_requests(scheduler_output.finished_req_ids)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -2768,6 +2836,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # _pool() (called from sample_tokens) needs them to build the pooling
         # cursor's gather indices over the flattened [T, H] buffer.
         self._pooling_num_scheduled_tokens_per_seq = actual_num_tokens
+        # Per-request real token counts for the GLM-5.3-Flash carrier builder: the
+        # tensors it receives are padded to the bucket, so the real lengths cannot
+        # be recovered from them and travel as their own array.
+        self._glm5next_request_tokens = self._glm5next_request_token_counts(
+            req_ids, scheduler_output.num_scheduled_tokens
+        )
 
         logger.debug(
             "Token counts: scheduled=%s, actual=%s",
@@ -4232,6 +4306,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     padded_num_reqs, dtype=torch.int32, device=self.device
                 )
 
+            # Host-side copies of the block table and cached lengths, for geometry
+            # decided before the traced call. Only ``num_reqs`` rows: a padding row
+            # names no request and its cached length is a previous occupant's. Both
+            # are CPU tensors rather than numpy views because this mapping is a
+            # compiled-model input for the other model families: a tensor guards on
+            # dtype and shape, while a plain value that changes every step would
+            # guard on its contents and recompile.
+            num_reqs = self.input_batch.num_reqs
+            host_block_table = blk_table.get_cpu_tensor()[:num_reqs]
+            host_num_computed_tokens = self.input_batch.num_computed_tokens_cpu_tensor[
+                :num_reqs
+            ]
+
             attn_metadata_i = {
                 "block_table_tensor": blk_table_tensor,
                 "slot_mapping": slot_mapping,
@@ -4240,6 +4327,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 "max_blocks_per_seq": blk_table_tensor.shape[1],
                 "decode_token_threshold": decode_token_threshold,
                 "cached_seq_len": cached_seq_len_tensor,
+                "host_block_table": host_block_table,
+                "host_num_computed_tokens": host_num_computed_tokens,
                 "kv_segment_size": kv_segment_size,
                 # Full (untrimmed) block_table_tensor for use cases that
                 # need to compute slot indices into the *full* KV cache,
@@ -4256,6 +4345,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 attn_metadata[layer_name] = attn_metadata_i
 
         return attn_metadata
+
+    def _aligned_table_width(self, *, context_length: int, block_size: int) -> int:
+        """Return the block-table width a KV group of ``block_size`` uses for a context length.
+
+        Whole blocks for the context, divided across the context-parallel ranks, then
+        rounded up to a multiple of ``128 // block_size`` to match upstream's InputBatch
+        width. Warmup and the sparse-attention carrier both pad to this width, so a
+        captured prefill graph and the tables it is fed always agree.
+        """
+        dcp_block_size = int(block_size) * max(self._dcp_size, 1)
+        blocks = -(-int(context_length) // dcp_block_size)
+        alignment = 128 // int(block_size) if int(block_size) <= 128 else 1
+        return -(-blocks // alignment) * alignment
 
     def _build_warmup_attention_metadata(
         self,
@@ -4313,16 +4415,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 ctx_bucket if ctx_bucket is not None else self.max_model_len
             )
             dcp_block_size = block_size * max(self._dcp_size, 1)
-            max_num_blocks_per_req = (
-                ctx_for_blocks + dcp_block_size - 1
-            ) // dcp_block_size
             # Match upstream's TRTLLM alignment (vLLM PR #39324): InputBatch
             # block_table width is rounded up to a multiple of 128/block_size.
             # Prefill doesn't trim at runtime so warmup must use the aligned
             # width. Decode with ctx-length buckets trims back below.
-            alignment = 128 // block_size if block_size <= 128 else 1
-            max_num_blocks_per_req = (
-                (max_num_blocks_per_req + alignment - 1) // alignment * alignment
+            max_num_blocks_per_req = self._aligned_table_width(
+                context_length=ctx_for_blocks, block_size=block_size
             )
             # Untrimmed block-table seq dim — used by the on-device
             # ``correct_spec_decode_positions_and_slot_mapping`` correction
@@ -4413,6 +4511,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             if self.neuron_config.kv_segment_size_buckets is not None:
                 kv_segment_size = self.neuron_config.kv_segment_size_buckets[0]
 
+            # Host-side geometry in the same form the serving builder produces, so
+            # capture needs no special case: this bucket's blocks and the declared
+            # cached length.
+            host_block_table = (
+                torch.arange(max_num_blocks_per_req, dtype=torch.int32)
+                .unsqueeze(0)
+                .expand(num_reqs, -1)
+                .contiguous()
+            )
+            host_num_computed_tokens = torch.full(
+                (num_reqs,), int(cached_seq_len), dtype=torch.int32
+            )
+
             attn_metadata_i = {
                 "block_table_tensor": block_table_tensor,
                 "slot_mapping": slot_mapping,
@@ -4423,6 +4534,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 "cached_seq_len": torch.tensor(
                     [[cached_seq_len]], dtype=torch.int32, device=device
                 ),
+                "host_block_table": host_block_table,
+                "host_num_computed_tokens": host_num_computed_tokens,
                 "kv_segment_size": kv_segment_size,
                 "full_block_table_tensor": full_block_table_tensor,
             }
@@ -4570,7 +4683,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             bucket_size, kv_segment_size, device=device
         )
         try:
-            _ = self.capture_backend_model(**kwargs)
+            # ``kwargs`` stays bound to the generic mapping: the drafter branch
+            # below reads its attention metadata after this call returns.
+            _ = self.capture_backend_model(**self._glm5next_model_kwargs(kwargs))
         except CaptureComplete:
             logger.debug(
                 "Graph capture for prefill completed: bucket_size=%s, kv_segment_size=%s",
@@ -4642,7 +4757,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             set_active_context(
                 self._tensor_replacer.warmup_context(bucket_size, self.device)
             )
-        model_output = self.model(**warmup_kwargs)
+        model_output = self.model(**self._glm5next_model_kwargs(warmup_kwargs))
         if self.use_async_scheduling:
             self._materialize_warmup_output(model_output)
         if self._tensor_replacer is not None:
@@ -4732,6 +4847,1361 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             bonus_logits_indices=bonus_logits_indices,
             logits_indices=logits_indices,
         )
+
+    # ── GLM-5.3-Flash layer carriers ──────────────────────────────────────
+    # This model family takes its caches as forward arguments, one mapping per
+    # layer, while every other family reads them off attributes. The helpers
+    # below build those mappings from the banks ``bind_kv_cache`` kept. Only
+    # ``_glm5next_model_kwargs`` is called from a model call site, and it returns
+    # its argument unchanged when the model kept no banks, so the other families
+    # are unaffected.
+
+    @classmethod
+    def _glm5next_pool_slot_mapping(
+        cls,
+        *,
+        tokens: int,
+        start_position: int,
+        index_kpool: int,
+        device,
+        real_tokens: int | None = None,
+    ) -> torch.Tensor:
+        """Return ``[tokens]`` int32: the pool id where a pool completes, ``-1`` elsewhere.
+
+        Only the last token of each complete pool carries a non-negative slot; the id
+        is ``position // index_kpool``, the pool number the decode leg writes with.
+        ``start_position`` makes the position absolute: a later chunk of a chunked
+        prefill pools on the sequence's boundaries, not the chunk's. ``real_tokens``
+        is the chunk's real length inside a padded width; no pool completes past it,
+        since a padded row carries no token. ``None`` means every row is real.
+
+        Built on the host in int32 and moved once: the eager Neuron backend refuses a
+        dtype-converting copy of a tensor that already lives on the device.
+        """
+        return cls._glm5next_pool_slot_mapping_host(
+            tokens=int(tokens),
+            start_position=int(start_position),
+            index_kpool=int(index_kpool),
+            real_tokens=real_tokens,
+        ).to(device)
+
+    @staticmethod
+    def _glm5next_pool_slot_mapping_host(
+        *,
+        tokens: int,
+        start_position: int,
+        index_kpool: int,
+        real_tokens: int | None = None,
+    ) -> torch.Tensor:
+        """Host-side form of ``_glm5next_pool_slot_mapping``.
+
+        Same rule and arithmetic without the device move, so a batch can concatenate
+        several of these and move once.
+        """
+        pool = int(index_kpool)
+        if pool <= 0:
+            raise ValueError(f"index_kpool must be positive; got {index_kpool!r}")
+        real = int(tokens) if real_tokens is None else int(real_tokens)
+        rows = torch.arange(int(tokens), dtype=torch.int32)
+        positions = rows + int(start_position)
+        completes = (((positions + 1) % pool) == 0) & (rows < real)
+        return torch.where(
+            completes, positions // pool, torch.full_like(positions, -1)
+        )
+
+    @classmethod
+    def _glm5next_row_seq_lens(
+        cls, *, tokens: int, start_position: int, device
+    ) -> torch.Tensor:
+        """Return ``[tokens]`` int32: each score row's own causal length.
+
+        ``seq_lens`` is per packed token, not per request; it is the causal bound the
+        indexer consumes. Row ``i`` of a chunk starting at ``start_position`` sees
+        ``start_position + i + 1`` tokens including itself. Built on the host in int32
+        and moved once, like the pool mapping.
+        """
+        return cls._glm5next_row_seq_lens_host(
+            tokens=int(tokens), start_position=int(start_position)
+        ).to(device)
+
+    @staticmethod
+    def _glm5next_row_seq_lens_host(*, tokens: int, start_position: int) -> torch.Tensor:
+        """Host-side form of ``_glm5next_row_seq_lens``.
+
+        A batch concatenates several of these first and moves the result once.
+        """
+        return torch.arange(int(tokens), dtype=torch.int32) + int(start_position) + 1
+
+    @staticmethod
+    def _glm5next_latent_slot_mapping(
+        *, rows, starts, tokens: int, block_size: int, padded_rows: int = 0,
+        reals=None, device
+    ) -> torch.Tensor:
+        """Return ``[sum(tokens) + padded_rows]`` int64: each token's physical latent slot.
+
+        A slot is ``block_number * block_size + block_offset``, the same formula as the
+        runner's ``slot_mapping`` and also the row index of the bank's flattened view,
+        so the layer's persisting write consumes it directly and a request's pages may
+        sit anywhere in the bank.
+
+        ``reals`` clamps a chunk's padded rows to its last real token instead of
+        masking them: the layer already repeats the last real latent into those rows,
+        so writing the same value to the same slot again changes nothing, while a
+        sentinel would need a masked write an indexed copy cannot express.
+        ``padded_rows`` are whole rows past the batch's requests; they get
+        ``PAD_SLOT_ID`` rather than ``NULL_BLOCK_ID``, because the latter is zero,
+        which is a real slot (block 0, offset 0), and a padded decode row's latent
+        would land in a slot a live request can own.
+        """
+        slots: list[int] = []
+        table = [list(row) for row in rows]
+        limits = (
+            [int(tokens)] * len(table) if reals is None else [int(one) for one in reals]
+        )
+        for row, start, real in zip(table, starts, limits):
+            for offset in range(int(tokens)):
+                position = int(start) + min(offset, max(real - 1, 0))
+                page = position // int(block_size)
+                if page >= len(row):
+                    raise ValueError(
+                        f"position {position} falls in block {page} of a table row that "
+                        f"names {len(row)} block(s); the row and the position come from "
+                        f"one step and a position outside the row has no slot"
+                    )
+                block = int(row[page])
+                slots.append(block * int(block_size) + position % int(block_size))
+        slots.extend([PAD_SLOT_ID] * int(padded_rows))
+        # Built on the host and moved once; int64 matches the runner's own
+        # ``slot_mapping`` dtype.
+        return torch.tensor(slots, dtype=torch.int64).to(device)
+
+    @classmethod
+    def _glm5next_batch_row_seq_lens(cls, requests, *, device) -> torch.Tensor:
+        """Return ``[sum(tokens)]`` int32: every token's causal length, in batch order.
+
+        Derived per request and concatenated: a token's causal length is a fact about
+        its own sequence, so deriving a whole batch from one start position would give
+        the second request the first one's positions. ``requests`` must be in the
+        order the block tables are indexed in. Built on the host and moved once.
+        """
+        return torch.cat(
+            [
+                cls._glm5next_row_seq_lens_host(
+                    tokens=int(tokens), start_position=int(start)
+                )
+                for tokens, start in requests
+            ]
+        ).to(device)
+
+    @classmethod
+    def _glm5next_batch_pool_slot_mapping(
+        cls, requests, *, index_kpool: int, device, real_tokens=None
+    ) -> torch.Tensor:
+        """Return ``[sum(tokens)]`` int32: the pool id where a pool completes, in batch order.
+
+        Derived per request because a pool completes on the sequence's own boundaries,
+        not the batch's. ``real_tokens`` is per request (one entry per row of
+        ``requests``) or ``None`` when every row carries a token. Concatenated on the
+        host and moved once.
+        """
+        rows = list(requests)
+        lengths = [None] * len(rows) if real_tokens is None else list(real_tokens)
+        if len(lengths) != len(rows):
+            raise ValueError(
+                f"this batch names {len(rows)} request(s) and carries {len(lengths)} "
+                f"real length(s); the real length belongs to one request, so a count "
+                f"that disagrees would cut another request's pools short"
+            )
+        return torch.cat(
+            [
+                cls._glm5next_pool_slot_mapping_host(
+                    tokens=int(tokens),
+                    start_position=int(start),
+                    index_kpool=int(index_kpool),
+                    real_tokens=real,
+                )
+                for (tokens, start), real in zip(rows, lengths)
+            ]
+        ).to(device)
+
+    @staticmethod
+    def _glm5next_start_position(position: int, device) -> torch.Tensor:
+        """Wrap a host position as an int32 device tensor for the traced boundary.
+
+        A Python int reaching a traced region is baked into the captured graph and
+        pins it to that position. The runner keeps the int for its own arithmetic and
+        hands the layers this tensor.
+        """
+        return torch.tensor(int(position), dtype=torch.int32, device=device)
+
+    @staticmethod
+    def _glm5next_real_row_extent(
+        tokens: int, real_tokens: int, device
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return a step's real length and its row mask, both from one host number.
+
+        A padded step's operands keep the bucket's width, so the recurrent layers need
+        to know which rows carry a real token. Both operands are built in one call so
+        they cannot disagree.
+        """
+        rows = [1.0] * int(real_tokens) + [0.0] * (int(tokens) - int(real_tokens))
+        return (
+            torch.tensor([int(real_tokens)], dtype=torch.int32, device=device),
+            torch.tensor(rows, dtype=torch.float32, device=device).reshape(-1, 1),
+        )
+
+    @staticmethod
+    def _glm5next_host_geometry(metadata: dict, key: str, name: str) -> list:
+        """Return one metadata entry's host-side geometry as plain Python values.
+
+        This runs before the traced call, so a device or ``meta`` tensor is refused
+        rather than read: its value would cost a ``Tensor.item()`` that graph capture
+        cannot perform.
+        """
+        if key not in metadata:
+            raise ValueError(
+                f"KV layer '{name}' has no '{key}' entry; the runner writes the "
+                f"host-side geometry beside the device tensors of every KV-cache "
+                f"group, and this call site handed {sorted(metadata)}"
+            )
+        value = metadata[key]
+        if torch.is_tensor(value) and value.device.type != "cpu":
+            raise ValueError(
+                f"KV layer '{name}'s '{key}' is a {value.device.type} tensor; the "
+                f"geometry of a step is decided on the host, so it comes from the "
+                f"runner's own host arrays and never from a device or meta tensor"
+            )
+        return value.tolist() if hasattr(value, "tolist") else list(value)
+
+    @staticmethod
+    def _glm5next_start_positions(positions, device) -> torch.Tensor:
+        """Return ``[requests]`` int32: every request's own position, one row each.
+
+        One tensor rather than a tuple of Python ints, because an int reaching a
+        traced region is baked into the captured graph. Built on the host in int32
+        and moved once.
+        """
+        return torch.tensor(
+            [int(position) for position in positions], dtype=torch.int32
+        ).to(device)
+
+    @staticmethod
+    def _glm5next_request_token_counts(
+        req_ids, num_scheduled_tokens: dict
+    ) -> np.ndarray:
+        """Return each request's real token count for this step as int32, in batch order."""
+        return np.array(
+            [int(num_scheduled_tokens[req_id]) for req_id in req_ids], dtype=np.int32
+        )
+
+    def _glm5next_take_request_tokens(self) -> tuple[int, ...]:
+        """Take (not just read) each request's real token count for this step.
+
+        The array describes one step, so it is consumed: warmup and capture steps are
+        built without one, and for them the operand width is the real length. Leaving
+        a used array in place would hand the next such step a stale length, so an
+        unprepared step gets an empty tuple and the caller divides the width instead.
+        """
+        counts = getattr(self, "_glm5next_request_tokens", None)
+        self._glm5next_request_tokens = None
+        if counts is None:
+            return ()
+        return tuple(int(value) for value in counts)
+
+    @staticmethod
+    def _glm5next_resolve_request_tokens(
+        real_counts, requests: int, tokens: int, *, name: str = "this step"
+    ) -> list[int]:
+        """Return each request's real token count, in batch order.
+
+        An unprepared step (warmup or capture) left no array and carries no padding,
+        so its rows divide evenly among its requests. A count that disagrees with the
+        block tables is refused: a length matched to the wrong request would page
+        another sequence's blocks.
+        """
+        if requests <= 0:
+            raise ValueError(f"{name} serves no request; there is nothing to size")
+        if not real_counts:
+            return [max(1, int(tokens) // requests)] * requests
+        if len(real_counts) != requests:
+            raise ValueError(
+                f"{name} carries {requests} block-table row(s) and the input builder "
+                f"left {len(real_counts)} real length(s); both are the batch's own "
+                f"rows, so there is one of each per request"
+            )
+        return [int(value) for value in real_counts]
+
+    @staticmethod
+    def _glm5next_side_caches(
+        banks,
+        *,
+        index_kpool: int,
+        index_head_dim: int,
+        max_seq_len: int,
+        request_slots: int,
+    ) -> list[dict]:
+        """Allocate the two indexer caches no ``LayerSpec`` declares, one set per sparse layer.
+
+        A sparse-attention (DSA) layer needs a pooled-key store and a decode tail ring
+        besides its latent cache. ``get_kv_spec`` reports neither, because a
+        ``LayerSpec`` carries one ``num_kv_heads``/``head_size``/``dtype`` triple and
+        both of these have the indexer's width, ``index_head_dim``, so the cache
+        manager never sees them and the runner allocates them here.
+
+        Both carry a leading request-slot axis because each holds one sequence's
+        indexer state; sharing them across requests lets a second request read the
+        first one's rows. The axis is the concurrency bound (``request_slots``), not
+        the block space: sizing a per-sequence cache by KV blocks would allocate
+        gigabytes per layer outside the engine's KV budget. One slot number addresses
+        the recurrent banks and these caches alike, so the caller checks that the banks
+        hold at least ``request_slots`` slots.
+
+        ``pool_cache`` is ``[slots, max_seq_len // index_kpool + 1, index_head_dim]``:
+        the indexer needs one spare row above every addressable candidate pool, and
+        ``max_seq_len`` is the engine's bound so the count is one constant per process
+        rather than a per-step int that would need its own captured graph. ``tail`` is
+        ``[slots, 2, index_kpool, index_head_dim]``, half 0 keys and half 1 gate
+        scores. Both live across steps (the decode leg advances the ring in place and
+        the pooled store accumulates), so the caller allocates once and keeps them.
+        The dtype is the latent bank's; the layer casts on write.
+        """
+        pool = int(index_kpool)
+        width = int(index_head_dim)
+        if pool <= 0 or width <= 0:
+            raise ValueError(
+                f"index_kpool and index_head_dim must be positive; got "
+                f"{index_kpool!r} and {index_head_dim!r}"
+            )
+        if int(max_seq_len) <= 0:
+            raise ValueError(f"max_seq_len must be positive; got {max_seq_len!r}")
+        slots = int(request_slots)
+        if slots <= 0:
+            raise ValueError(
+                f"the side caches are allocated one set per request slot, so the "
+                f"slot count must be positive; got {request_slots!r}"
+            )
+        rows = int(max_seq_len) // pool + 1
+        side: list[dict] = []
+        for bank in banks:
+            if bank["family"] != "self_attn":
+                side.append({})
+                continue
+            reference = bank["latent_cache"]
+            side.append(
+                {
+                    "pool_cache": torch.zeros(
+                        (slots, rows, width),
+                        dtype=reference.dtype,
+                        device=reference.device,
+                    ),
+                    "tail": torch.zeros(
+                        (slots, 2, pool, width),
+                        dtype=reference.dtype,
+                        device=reference.device,
+                    ),
+                }
+            )
+        return side
+
+    def _glm5next_live_side_caches(self, banks) -> list[dict]:
+        """Return this process's one live set of side caches, allocated on first use.
+
+        The allocation bound is ``max_model_len``, the same bound the carrier passes as
+        ``max_seq_len``, so the two agree on how many candidate pools the indexer may
+        address. Because the set lives for the process, a new sequence would otherwise
+        start on the previous sequence's partial pool; ``_glm5next_position_arm``
+        empties a request's ring when its prefill starts at position 0.
+        """
+        live = getattr(self, "_glm5next_side_cache_set", None)
+        if live is not None and len(live) == len(banks):
+            return live
+        text_config = self.model.text_config
+        live = self._glm5next_side_caches(
+            banks,
+            index_kpool=int(text_config.index_kpool),
+            index_head_dim=int(text_config.index_head_dim),
+            max_seq_len=int(self.max_model_len),
+            request_slots=self._glm5next_request_slot_capacity(banks),
+        )
+        self._glm5next_side_cache_set = live
+        # A fresh set is owned by nobody: the slot table and position record refer
+        # to rows that no longer exist, so both are cleared with it.
+        self._glm5next_request_slot_table = {}
+        self._glm5next_side_cache_positions = {}
+        return live
+
+    def _glm5next_batch_request_ids(self) -> list:
+        """Return the engine's request ids for this step, in the runner's batch order."""
+        batch = getattr(self, "input_batch", None)
+        return list(getattr(batch, "req_ids", None) or ())
+
+    def _glm5next_request_identities(self, *, synthetic: bool) -> list:
+        """Return the request ids this step serves, in the block tables' batch order.
+
+        ``req_ids`` and the block-table rows are appended by the same request index,
+        so identity and paging come from one ordering. A synthetic step (warmup, the
+        idle data-parallel dummy step) has no request and returns ``[None]``. A real
+        step whose batch names no request is refused: it would continue a sequence
+        without knowing whose it is.
+        """
+        if synthetic:
+            # A step with a scheduled request can never be synthetic. Serving one
+            # that way would read and write slot 0's state, destroying whichever
+            # request holds slot 0 and answering this request from its state.
+            named = self._glm5next_batch_request_ids()
+            if named:
+                raise ValueError(
+                    f"this step was classified as having no request and the engine's "
+                    f"input batch names {len(named)} of them ({named[0]!r} first); a "
+                    f"scheduled request served without its identity would read and "
+                    f"write the state of whichever request holds slot 0"
+                )
+            return [None]
+        request_ids = self._glm5next_batch_request_ids()
+        if not request_ids:
+            raise ValueError(
+                "a GLM-5.3-Flash step needs the engine's request ids to key its "
+                "per-request cache state, and this runner's input batch carries "
+                "none; a real step served without an identity would read whichever "
+                "state the last request left"
+            )
+        return request_ids
+
+    def _glm5next_state_slot_count(self, banks) -> int:
+        """Return the recurrent state slot count shared by every linear layer's bank.
+
+        One request's states across the stack live at one slot number, so banks that
+        disagree on their slot count have no single slot to hand a request.
+        """
+        counts = {
+            int(bank["state_slots"])
+            for bank in banks
+            if bank["family"] != "self_attn"
+        }
+        if not counts:
+            return 0
+        if len(counts) != 1:
+            raise ValueError(
+                f"the recurrent banks of one stack report {sorted(counts)} state "
+                f"slot(s); a request's states across the stack live at one slot "
+                f"number, so a disagreement has no slot to hand it"
+            )
+        return counts.pop()
+
+    def _glm5next_request_slot_capacity(self, banks) -> int:
+        """Return how many sequences may hold cache state at once: ``max_num_seqs``.
+
+        A slot holds one sequence's state, so its axis is the scheduler's concurrency
+        limit, not the banks' leading dimension (which counts KV blocks). One slot
+        number addresses the recurrent banks and the indexer caches alike, so
+        recurrent banks holding fewer slots than the engine admits sequences are
+        refused here rather than at a silent overwrite. A stack with no recurrent bank
+        has nothing to check; the bound still sizes the indexer caches.
+        """
+        capacity = int(self.max_num_reqs)
+        if capacity <= 0:
+            raise ValueError(
+                f"the request slot axis is the engine's concurrent-sequence bound, "
+                f"so it must be positive; this runner reports {self.max_num_reqs!r}"
+            )
+        banked = self._glm5next_state_slot_count(banks)
+        if banked and banked < capacity:
+            raise ValueError(
+                f"the recurrent banks of this stack hold {banked} state slot(s) while "
+                f"the engine admits {capacity} concurrent sequence(s); one slot number "
+                f"addresses the recurrent banks and the indexer's caches together, so "
+                f"there is no slot to hand the last sequence"
+            )
+        return capacity
+
+    def _glm5next_note_finished_requests(self, finished_req_ids) -> None:
+        """Record the scheduler's finished request ids so the slot table can free them.
+
+        Absence from a batch does not mean finished: the runner also drops a live
+        request from the persistent batch when it gets no tokens in a step, and that
+        request keeps its state. Only the engine's own finished set releases a slot.
+        """
+        noted = getattr(self, "_glm5next_finished_request_ids", None)
+        if noted is None:
+            noted = set()
+            self._glm5next_finished_request_ids = noted
+        noted.update(finished_req_ids or ())
+
+    @staticmethod
+    def _glm5next_emptied_at_slot(held: torch.Tensor, slot: int) -> torch.Tensor:
+        """Return a copy of ``held`` with row ``slot`` zeroed and every other row unchanged.
+
+        A copy rather than an in-place zero: every cache tensor here is a view of one
+        allocation, and the eager Neuron backend refuses an in-place write on shared
+        storage ("Can't call ReserveSpace on shared storage"). The mask is built on
+        the host and moved once, and the caller replaces its entry with the result
+        before the carriers are built. Only one row is emptied so a concurrent
+        request's row is untouched; a select (not a product) keeps a stale non-finite
+        value from surviving.
+
+        The recurrent and convolution states are instead zeroed where they are read,
+        since their reader is handed the position. The indexer's ring is consumed
+        inside kernels that get neither the position nor a per-request predicate, so
+        its freshness has to be a rebuilt input.
+        """
+        keep = torch.ones(
+            (int(held.shape[0]),) + (1,) * (held.dim() - 1), dtype=torch.bool
+        )
+        keep[int(slot)] = False
+        return torch.where(keep.to(held.device), held, torch.zeros_like(held))
+
+    def _glm5next_request_slots(
+        self, banks, request_ids, *, synthetic: bool, side_caches=None
+    ):
+        """Return one recurrent-state slot per request, keyed by the request's own id.
+
+        A block id is a paging artefact that says nothing about whose state a row
+        holds; this table is the identity, so a step is served from the slot its own
+        request owns or from none. A slot is zeroed when handed out, because the banks
+        live for the process and a freed slot still holds its last owner's
+        recurrence. Zeroing at hand-out rather than at release means a crash between
+        the two cannot leave a dirty slot looking clean.
+
+        Only ids the scheduler reported finished release a slot; a running request
+        that gets no tokens in a step leaves the batch but keeps its state. A
+        synthetic step (warmup, idle dummy step) is served from slot 0 without reading
+        or writing the table, so a warmup between two real steps of one sequence
+        cannot evict it.
+        """
+        # A synthetic step takes slot 0 and no claim; the capacity bound is read
+        # only where a claim is about to be taken.
+        if synthetic:
+            return [0 for _ in request_ids]
+        slots = self._glm5next_request_slot_capacity(banks)
+        table = getattr(self, "_glm5next_request_slot_table", None)
+        if table is None:
+            table = {}
+            self._glm5next_request_slot_table = table
+        positions = getattr(self, "_glm5next_side_cache_positions", None)
+        if positions is None:
+            positions = {}
+            self._glm5next_side_cache_positions = positions
+        noted = getattr(self, "_glm5next_finished_request_ids", None)
+        if noted:
+            for finished in [key for key in table if key in noted]:
+                positions.pop(table[finished], None)
+                del table[finished]
+            # A finished id that never held a slot has nothing to release; the
+            # record is emptied whole so it cannot grow for the process's life.
+            noted.clear()
+        for request_id in request_ids:
+            if request_id in table:
+                continue
+            taken = set(table.values())
+            free = next(
+                (slot for slot in range(slots) if slot not in taken), None
+            )
+            if free is None:
+                raise ValueError(
+                    f"this stack keys {slots} concurrent sequence(s) and all of "
+                    f"those slots are owned by live requests, so request "
+                    f"{request_id!r} has no free slot; the engine admitted more "
+                    f"concurrent requests than the cache was allocated for"
+                )
+            # The recurrent banks are not written here: they are the engine's cache
+            # tensors, each a view of one allocation, and an eager write on shared
+            # storage is refused by the runtime. Their freshness is served where
+            # they are read: an opening prefill selects a zero state for both the
+            # convolution history and the recurrent state.
+            # The indexer's two caches are runner-allocated and their readers take
+            # no position, so they are emptied here, together (a half-fresh slot
+            # would pool the previous owner's ring members) and by rebuild rather
+            # than in place, for the reason ``_glm5next_emptied_at_slot`` gives.
+            for side in side_caches or ():
+                if not side:
+                    continue
+                for key in ("pool_cache", "tail"):
+                    side[key] = self._glm5next_emptied_at_slot(side[key], free)
+            positions.pop(free, None)
+            table[request_id] = free
+        return [table[request_id] for request_id in request_ids]
+
+    @classmethod
+    def _glm5next_layer_carriers(
+        cls,
+        banks,
+        side_caches,
+        *,
+        geometries,
+        is_prefill: bool,
+        tokens: int,
+        start_position: int,
+        softmax_scale: float,
+        max_seq_len: int,
+        index_kpool: int,
+        requests: int = 1,
+        request_starts=None,
+        real_tokens: int | None = None,
+        request_real_tokens=None,
+        active_mla_query_rows: int | None = None,
+    ) -> list[dict]:
+        """Build one kwargs mapping per layer, in stack order, holding that layer's own state.
+
+        ``Glm5NextModel.forward`` splats these and refuses a count that disagrees with
+        the stack, so this walks the banks ``bind_kv_cache`` kept (the spec's layer
+        order) and never names a layer.
+
+        A sparse-attention (DSA) layer takes ``latent_cache``, ``pool_cache``,
+        ``seq_lens``, ``start_position``, ``softmax_scale``, ``max_seq_len``,
+        ``page_size``, ``block_table_row`` and ``latent_slots``, plus
+        ``slot_mapping``, ``prefill_tail`` and ``prefill_end_position`` on the prefill
+        leg or ``tail`` and ``position`` on the decode leg. The bank travels whole;
+        ``block_table_row`` is the request's block table as a ``[pages, 1]`` int32
+        column padded with ``-1`` to the bucket's width, and the kernel gathers the
+        pages it names, so the allocator may place them anywhere. One table names one
+        request's window, so this family serves one sequence per forward.
+
+        A linear-attention (KDA) layer takes ``conv_state``, ``recurrent_state``,
+        ``is_prefill``, ``start_position``, ``real_tokens`` and ``row_mask``, one
+        entry per request in batch order. The states are tuples of bank views, never
+        stacked: the recurrence advances in place and a copy would leave the bank
+        stale. The positions are one int32 tensor and the row operands one tensor
+        each on a leading request axis, because a Python int at this boundary is
+        baked into the graph. The same forms are used at one request, so the single
+        and concurrent shapes share one derivation.
+
+        Args:
+            geometries: One entry per bank, positionally paired, carrying that
+                layer's ``block_ids``, ``state_slot``/``state_slots``, ``page_size``
+                and ``window_blocks``. The runner builds one block table per KV-cache
+                group and a hybrid stack has two groups, so a stack-wide row would
+                slice one family out of the other's table. Each sparse bank's page is
+                cross-checked against its group's, since the two are sourced
+                independently.
+            is_prefill: Which leg is running, read from the batch by the caller.
+            tokens: Operand width, padded to the bucket the graph was compiled for.
+            start_position: Tokens already computed. A chunked prefill continues the
+                state an earlier chunk wrote, and both families need to know how much.
+            softmax_scale: ``(qk_nope_head_dim + qk_rope_head_dim) ** -0.5``, passed
+                by the caller so this function holds no copy of the constant.
+            real_tokens: The chunk's real length inside ``tokens``. The slots held,
+                the end position and the pools completed are read from it; ``None``
+                means the whole chunk is real (warmup, capture). The sparse layers
+                read this one, which is the first request's.
+            request_real_tokens: Each request's real length, for the recurrent
+                layers' row masks: an unmasked padding row would decay and update the
+                state with a row that carries no token.
+        """
+        if len(banks) != len(side_caches) or len(banks) != len(geometries):
+            raise ValueError(
+                f"{len(banks)} bank(s) against {len(side_caches)} side-cache "
+                f"entry(ies) and {len(geometries)} geometry(ies); the three come "
+                f"from one walk and must pair"
+            )
+        if not is_prefill and int(tokens) != int(requests):
+            # A decode step carries one token per request: the ring advances one
+            # position per sequence, its kernel taking a single key row and a single
+            # position. A step with more tokens than requests is speculative
+            # decoding's verify step, which this path does not implement.
+            raise ValueError(
+                f"the decode leg advances each sequence's tail ring one position at a "
+                f"time, so a decode step carries exactly one token per request; this "
+                f"step carries {int(tokens)} token(s) for {int(requests)} request(s), "
+                f"and threading a multi-token decode, which is speculative decoding's "
+                f"verify step, is not this path's work"
+            )
+        real = int(tokens) if real_tokens is None else int(real_tokens)
+        if real <= 0 or real > int(tokens):
+            raise ValueError(
+                f"this step's operands are {int(tokens)} row(s) wide and its chunk was "
+                f"handed {real} real token(s); the real length is at least one token "
+                f"and never more than the width it was padded into"
+            )
+
+        # Requests are (slot, position) pairs; the singular arguments are the
+        # one-request case. A geometry may carry ``state_slots`` for a batch or only
+        # ``state_slot`` for one request, and ``request_starts`` defaults to the one
+        # position passed, so both forms share this derivation.
+        starts = (
+            [int(value) for value in request_starts]
+            if request_starts is not None
+            else [int(start_position)]
+        )
+        if request_starts is not None and len(starts) != int(requests):
+            raise ValueError(
+                f"this call declares {int(requests)} request(s) and hands "
+                f"{len(starts)} cached length(s); the count and the per-request "
+                f"positions come from one batch and must agree"
+            )
+        # Each request's own real length and operand width. One request brings the
+        # whole padded step; several bring one row each, since a decode step carries
+        # one token per request. A prefill of several requests packs their tokens
+        # into one row set with no per-request width, and the sparse layer refuses
+        # such a call by name below, so the operands stay the batch's there.
+        # ``request_real_tokens`` comes from the block tables rather than from this
+        # derivation, so the two are sourced independently and checked below.
+        if bool(is_prefill) and len(starts) > 1:
+            reals = [real]
+            request_width = int(tokens)
+        else:
+            request_width = int(tokens) if len(starts) == 1 else 1
+            if request_real_tokens is not None:
+                reals = [int(value) for value in request_real_tokens]
+            elif len(starts) == 1:
+                reals = [real]
+            else:
+                reals = [1] * len(starts)
+            if len(reals) != len(starts):
+                raise ValueError(
+                    f"this step carries {len(starts)} request(s) and hands {len(reals)} "
+                    f"real token count(s); the positions and the per-request lengths come "
+                    f"from one batch and must describe the same requests"
+                )
+        for index, one_real in enumerate(reals):
+            if one_real <= 0 or one_real > request_width:
+                raise ValueError(
+                    f"request {index} of this step was handed {one_real} real token(s) "
+                    f"against operands {request_width} row(s) wide; a request holds at "
+                    f"least one token and never more than the width it was padded into"
+                )
+        carriers: list[dict] = []
+        for bank, side, geometry in zip(banks, side_caches, geometries):
+            state_slots = [
+                int(value)
+                for value in geometry.get("state_slots", [geometry["state_slot"]])
+            ]
+            state_slot = state_slots[0]
+            if len(state_slots) != len(starts):
+                raise ValueError(
+                    f"KV layer '{bank['name']}' was handed {len(state_slots)} state "
+                    f"slot(s) against {len(starts)} cached length(s); each request "
+                    f"contributes one of each, so a disagreement pairs one request's "
+                    f"state with another's position"
+                )
+            if bank["family"] != "self_attn":
+                slots = int(bank["state_slots"])
+                for one_slot in state_slots:
+                    if not 0 <= int(one_slot) < slots:
+                        raise ValueError(
+                            f"KV layer '{bank['name']}' holds {slots} recurrent state "
+                            f"slot(s) and this request was given slot "
+                            f"{int(one_slot)}"
+                        )
+                # One pair per request, stacked on a leading request axis:
+                # ``[requests, 1]`` and ``[requests, width, 1]``. The layer splits
+                # them beside the states; each entry has the one-sequence shape.
+                extents = [
+                    cls._glm5next_real_row_extent(
+                        request_width, one_real, bank["recurrent_state"].device
+                    )
+                    for one_real in reals
+                ]
+                # One entry per request. Two requests' states are two rows of one
+                # bank, so they travel as a tuple of views, never a copy: the
+                # recurrence advances in place. The positions are one tensor so no
+                # host number reaches the graph (see ``_glm5next_start_positions``).
+                carriers.append(
+                    {
+                        "conv_state": tuple(
+                            bank["conv_state"][one_slot] for one_slot in state_slots
+                        ),
+                        "recurrent_state": tuple(
+                            bank["recurrent_state"][one_slot]
+                            for one_slot in state_slots
+                        ),
+                        "is_prefill": bool(is_prefill),
+                        "start_position": cls._glm5next_start_positions(
+                            starts, bank["recurrent_state"].device
+                        ),
+                        "real_tokens": torch.stack([part[0] for part in extents]),
+                        "row_mask": torch.stack([part[1] for part in extents]),
+                    }
+                )
+                continue
+            if len(state_slots) != 1:
+                # The sparse family serves one sequence per forward: the kernel
+                # gathers pages by the block table it is handed, but one table names
+                # one request's window and the kernel assembles one window per
+                # dispatch. Lifting this needs a table axis through the kernel.
+                raise ValueError(
+                    f"KV layer '{bank['name']}' is a sparse-attention layer and one "
+                    f"block table names one request's window, so it serves one sequence "
+                    f"per forward; this call carries {len(state_slots)} request(s). A "
+                    f"table axis through the kernel is what lifts this, not the runner"
+                )
+            ids = [int(value) for value in geometry["block_ids"]]
+            if not ids:
+                raise ValueError(
+                    f"KV layer '{bank['name']}' was handed an empty block-table row; "
+                    f"a GLM-5.3-Flash request needs at least one KV block"
+                )
+            block_size = int(bank["block_size"])
+            if int(geometry["page_size"]) != block_size:
+                raise ValueError(
+                    f"KV layer '{bank['name']}'s bank is paged {block_size} slot(s) to "
+                    f"the block and the KV-cache group it belongs to reports page "
+                    f"{int(geometry['page_size'])}; the slice and the layer's own page "
+                    f"are one number or the slice is wrong"
+                )
+            # The side caches are indexed by the same slot as the recurrent states;
+            # refuse an out-of-range slot by name rather than with a bare IndexError.
+            side_slots = int(side["pool_cache"].shape[0])
+            if not 0 <= state_slot < side_slots:
+                raise ValueError(
+                    f"KV layer '{bank['name']}' holds {side_slots} indexer side-cache "
+                    f"slot(s) and this request was given slot {state_slot}; a "
+                    f"request's recurrent state and its indexer state live at one "
+                    f"slot number"
+                )
+            # The write must land in the request's own pages, and this is the last
+            # place that can be checked: past here the position is a tensor whose
+            # value a captured graph cannot read. The layer resolves window positions
+            # through the block table, whose padded ``-1`` entries read as page 0, so
+            # a write past the request's last page would land on another sequence's
+            # rows in silence.
+            own_slots = len(ids) * block_size
+            if int(start_position) < 0 or int(start_position) + real > own_slots:
+                raise ValueError(
+                    f"KV layer '{bank['name']}' was handed {real} real token(s) at "
+                    f"position {int(start_position)} against {len(ids)} block(s) of "
+                    f"{block_size} slot(s), which is {own_slots} slot(s) of this "
+                    f"request's own pages; a write outside them would land on the rows "
+                    f"a padded table entry resolves to, which are another sequence's"
+                )
+            # The table's width is the bucket's, not this request's, so one captured
+            # graph serves every length: the request's pages come first and the rest
+            # of the row is ``-1``.
+            if "window_blocks" not in geometry:
+                raise ValueError(
+                    f"KV layer '{bank['name']}' was handed a geometry with no "
+                    f"'window_blocks'; the block table this layer reads has a width that "
+                    f"is fixed for the bucket, and a caller that does not state that "
+                    f"width cannot be given a table one captured graph can serve"
+                )
+            window_blocks = int(geometry["window_blocks"])
+            if len(ids) > window_blocks:
+                raise ValueError(
+                    f"KV layer '{bank['name']}' was handed {len(ids)} block(s) for one "
+                    f"sequence and the bucket's block table holds {window_blocks} per "
+                    f"sequence; a request longer than its bucket cannot be served by "
+                    f"this window"
+                )
+            # The bank itself, no slice and no copy: the pages this request holds are
+            # named by the table beside it and gathered inside the kernel, so the
+            # bank needs no spare blocks.
+            latent = bank["latent_cache"]
+            device = latent.device
+            carrier = {
+                "latent_cache": latent,
+                # The block table as a ``[pages, 1]`` int32 column padded with
+                # ``-1`` to the bucket's width; built on the host and moved once.
+                "block_table_row": torch.tensor(
+                    [[one] for one in ids]
+                    + [[-1]] * (window_blocks - len(ids)),
+                    dtype=torch.int32,
+                ).to(device),
+                # Each token's physical bank row. A chunk's padded rows repeat the
+                # last real token's slot, matching the clamp the layer applies to the
+                # values it writes, so the repeat is idempotent.
+                "latent_slots": cls._glm5next_latent_slot_mapping(
+                    rows=[ids],
+                    starts=[start_position],
+                    tokens=int(tokens),
+                    block_size=block_size,
+                    reals=[real],
+                    device=device,
+                ),
+                # This request's own row of each side cache, so two requests in one
+                # batch reach disjoint views.
+                "pool_cache": side["pool_cache"][state_slot],
+                # The batch form even at one request, so both paths share one
+                # derivation.
+                "seq_lens": cls._glm5next_batch_row_seq_lens(
+                    [(tokens, start_position)], device=device
+                ),
+                "start_position": cls._glm5next_start_position(start_position, device),
+                "softmax_scale": float(softmax_scale),
+                "max_seq_len": int(max_seq_len),
+                "page_size": int(geometry["page_size"]),
+            }
+            if active_mla_query_rows is not None:
+                carrier["active_mla_query_rows"] = active_mla_query_rows
+            if is_prefill:
+                carrier["slot_mapping"] = cls._glm5next_batch_pool_slot_mapping(
+                    [(tokens, start_position)],
+                    index_kpool=index_kpool,
+                    device=device,
+                    real_tokens=[real],
+                )
+                # The prefill leg seeds this chunk's remainder into the ring
+                # (``seed_tail``): the keys for those positions exist only inside
+                # that forward. The end position is passed as a tensor rather than
+                # inferred from ``max_seq_len`` (the batch's longest sequence) or
+                # baked in as an int, which would pin the graph to this chunk's
+                # length. It is the chunk's real end, not its padded width: ring
+                # slots past it hold no token of this sequence. A negative end is
+                # already rejected above, while the position is still a number.
+                carrier["prefill_tail"] = side["tail"][state_slot]
+                carrier["prefill_end_position"] = cls._glm5next_start_position(
+                    int(start_position) + real, device
+                )
+            else:
+                # The decode position chooses the ring slot this token's key is
+                # written to, so it rides as a tensor for the same reason.
+                carrier["tail"] = side["tail"][state_slot]
+                carrier["position"] = cls._glm5next_start_position(
+                    start_position, device
+                )
+            carriers.append(carrier)
+        return carriers
+
+    def _glm5next_model_kwargs(self, kwargs: dict) -> dict:
+        """Translate the generic model kwargs for the carrier-passing GLM-5.3-Flash family.
+
+        Returns ``kwargs`` unchanged unless the loaded model kept cache banks, which
+        only ``Glm5NextForConditionalGeneration.bind_kv_cache`` does; every model
+        call site (warmup, capture, execute, the idle dummy step) goes through here.
+
+        The root forward declares ``input_ids``, ``layer_carriers``,
+        ``sampling_positions`` and three parallelism arguments, so the generic
+        ``positions``, ``sampling_params``, ``spec_decode_metadata``, ``rank``,
+        ``logit_mask`` and ``rotary_position_ids`` are dropped once the batch
+        geometry has been read out of ``attn_metadata``. ``block_size`` is not passed
+        either: the root's parameter of that name is the FP8 weight-quant block, not
+        the KV page, which reaches the layers on each carrier's ``page_size``.
+        ``moe_group``, ``tp_degree`` and ``expert_parallel_rank`` are supplied on
+        every call because the root defaults them to the unsharded values.
+
+        Geometry (cached lengths, block-table rows) is read from the host arrays
+        ``host_num_computed_tokens`` and ``host_block_table``. Reading a device tensor
+        would need ``Tensor.item()``, which graph capture cannot do and which has no
+        value on ``meta`` under ``VLLM_NEURON_CPU_COMPILE``. Metadata is looked up
+        per layer name because a hybrid stack has two KV-cache groups and two block
+        tables. The leg is ``max_query_len > decode_token_threshold``, the runner's
+        own decode test, read per group; groups that disagree are refused because the
+        layers of one forward are stepped together.
+
+        Each request's block run and end position come from its real token count (the
+        input builder pads a prefill to its bucket after the scheduler allocated
+        blocks for the real count), while every traced operand keeps the padded width
+        the graph was compiled for.
+        """
+        banks = getattr(self.model, "glm5next_layer_banks", None)
+        if not banks:
+            return kwargs
+        missing = [
+            key
+            for key in ("input_ids", "attn_metadata", "sampling_positions")
+            if key not in kwargs
+        ]
+        if missing:
+            raise ValueError(
+                f"a GLM-5.3-Flash forward needs {missing} to build its per-layer "
+                f"carriers; this call site handed {sorted(kwargs)}"
+            )
+        metadata_map = kwargs["attn_metadata"]
+        if not metadata_map:
+            raise ValueError(
+                "a GLM-5.3-Flash forward needs attention metadata to slice its "
+                "paged latent cache, and this call site handed none"
+            )
+        input_ids = kwargs["input_ids"]
+        selected_query_rows = int(input_ids.shape[0])
+        active_mla_query_rows = None
+        query_buckets = getattr(
+            getattr(self, "neuron_config", None), "num_batched_tokens_buckets", None
+        )
+        operator_rows = max(query_buckets or [selected_query_rows])
+        bank_metadata = {
+            bank["name"]: metadata_map[bank["name"]]
+            for bank in banks if bank["name"] in metadata_map
+        }
+        if (
+            operator_rows > selected_query_rows
+            and any(bank["family"] == "self_attn" for bank in banks)
+            and all(
+                int(metadata["max_query_len"])
+                > int(metadata["decode_token_threshold"])
+                and len(
+                    self._glm5next_host_geometry(
+                        metadata, "host_num_computed_tokens", name
+                    )
+                ) == 1
+                for name, metadata in bank_metadata.items()
+            )
+        ):
+            # Keep model operators at the largest configured width. Only sparse
+            # MLA uses the selected prefix; real lengths still use that prefix.
+            input_ids = torch.cat(
+                [input_ids, input_ids.new_zeros(operator_rows - selected_query_rows)]
+            )
+            metadata_map = dict(metadata_map)
+            for name, metadata in bank_metadata.items():
+                metadata_map[name] = dict(metadata, max_query_len=operator_rows)
+            active_mla_query_rows = selected_query_rows
+        tokens = int(input_ids.shape[0])
+        # Two numbers: every tensor below is as wide as the bucket this step was
+        # padded to, while the pages each request holds and the position it reaches
+        # are its real length, one per request in batch order.
+        real_counts = self._glm5next_take_request_tokens()
+        geometries: list[dict] = []
+        legs: set[bool] = set()
+        # Cached lengths travel as one tuple per group, one entry per request in row
+        # order, and the groups must agree on that tuple: two requests at different
+        # points of their sequences is the ordinary concurrent case, but the layers
+        # of one forward are stepped together.
+        starts: set[tuple] = set()
+        for bank in banks:
+            name = bank["name"]
+            if name not in metadata_map:
+                raise ValueError(
+                    f"KV layer '{name}' has no attention-metadata entry; the runner "
+                    f"writes one entry per layer of every KV-cache group "
+                    f"(:4256-4257) and this call site handed {sorted(metadata_map)}"
+                )
+            metadata = metadata_map[name]
+            block_size = int(metadata["block_size"])
+            rows = self._glm5next_host_geometry(metadata, "host_block_table", name)
+            positions = self._glm5next_host_geometry(
+                metadata, "host_num_computed_tokens", name
+            )
+            if len(rows) != len(positions):
+                raise ValueError(
+                    f"KV layer '{name}' was handed {len(rows)} block-table row(s) "
+                    f"against {len(positions)} cached length(s); both are the "
+                    f"batch's own rows, so there is one of each per request"
+                )
+            if not rows:
+                raise ValueError(
+                    f"KV layer '{name}' was handed no block-table row at all; every "
+                    f"step this converter serves carries at least one request"
+                )
+            # One row and one cached length per request, in batch order. Each request
+            # advances by its own real tokens: a step arrives padded to its bucket,
+            # so dividing the padded width would page blocks the scheduler never
+            # allocated. The width is still what every operand carries.
+            request_rows = [[int(value) for value in row] for row in rows]
+            request_starts = [int(value) for value in positions]
+            request_tokens = self._glm5next_resolve_request_tokens(
+                real_counts, len(request_rows), selected_query_rows,
+                name=f"KV layer '{name}'",
+            )
+            if (
+                active_mla_query_rows is not None
+                and request_tokens[0] > active_mla_query_rows
+            ):
+                raise ValueError(
+                    f"KV layer '{name}' was handed {request_tokens[0]} real token(s) "
+                    f"for an active MLA prefix of {active_mla_query_rows} row(s)"
+                )
+            for index, row in enumerate(request_rows):
+                if not row:
+                    raise ValueError(
+                        f"KV layer '{name}' was handed an empty block-table row for "
+                        f"request {index}; a row names either the pages a paged bank "
+                        f"steps through or the one slot a recurrent bank keeps its "
+                        f"state in, and an empty row names neither"
+                    )
+            blocks_used = [
+                -(-(start + count) // block_size)
+                for start, count in zip(request_starts, request_tokens)
+            ]
+            # A paged row addresses pages; a recurrent row names one slot. Both
+            # tables are as wide (a recurrent group's spec carries the attention
+            # block size), but only a paged layer walks the pages its step covers,
+            # so only its rows are checked, and every request's row, since each
+            # request stands at its own position.
+            if bank["family"] == "self_attn":
+                for index, row in enumerate(request_rows):
+                    if blocks_used[index] > len(row):
+                        raise ValueError(
+                            f"KV layer '{name}' holds "
+                            f"{request_starts[index] + request_tokens[index]} slot(s) of "
+                            f"request {index}'s sequence, which occupy "
+                            f"{blocks_used[index]} page(s), and that request's "
+                            f"block-table row is {len(row)} entry(ies) wide; a row that "
+                            f"cannot address the step would slice another sequence's pages"
+                        )
+            # A recurrent row's width belongs to its table; its one slot is the row's
+            # first entry and is checked where the view is taken.
+            # The window handed to the layer is the leg's bucket span, not this
+            # step's span (which would change every decode step and pin the graph)
+            # and not the row's width (which falls back to ``max_model_len`` on the
+            # prefill leg when a group has no context bucket). The kernel stages
+            # every page the table names, one transfer per page, so the width is
+            # paid on every dispatch. Both numbers below are Python ints the metadata
+            # already carries, so the window is constant per captured graph.
+            # ``max_blocks_per_seq`` is the block-table dim the graph was compiled
+            # with; the host row arrives at its group's full padded width and is the
+            # addressability ceiling, since a declared width past its end would name
+            # entries the row does not carry.
+            table_width = int(metadata.get("max_blocks_per_seq", len(request_rows[0])))
+            for index, row in enumerate(request_rows):
+                if table_width > len(row):
+                    raise ValueError(
+                        f"KV layer '{name}' declares {table_width} block(s) per sequence "
+                        f"against request {index}'s host block-table row {len(row)} "
+                        f"entry(ies) wide; the window handed to the layer is read out of "
+                        f"that row, so a width past its end names blocks this step "
+                        f"cannot address"
+                    )
+            leg_is_prefill = int(metadata["max_query_len"]) > int(
+                metadata["decode_token_threshold"]
+            )
+            segment = int(metadata.get("kv_segment_size", 0))
+            if not leg_is_prefill:
+                # A decode group's table is its context bucket, chosen so the
+                # longest sequence in it fits, so the whole table is the span.
+                span_blocks = table_width
+            elif segment > 0:
+                span_blocks = -(
+                    -(segment + int(metadata["max_query_len"])) // block_size
+                )
+            else:
+                # No segment bucket says how much context this chunk may carry, so
+                # the table's width is the only ceiling left; on this leg that is
+                # the ``max_model_len`` fallback and the expensive case.
+                span_blocks = table_width
+            window_blocks = min(table_width, max(1, span_blocks))
+            geometries.append(
+                {
+                    # The first request's pages: the sparse family names one request's
+                    # window and refuses a second request in the carrier builder.
+                    "block_ids": request_rows[0][: blocks_used[0]],
+                    "state_slot": request_rows[0][0],
+                    "page_size": block_size,
+                    "window_blocks": window_blocks,
+                }
+            )
+            # One reading of the leg per group, the one the window was sized from.
+            legs.add(leg_is_prefill)
+            # One tuple per group; the groups must agree about the same requests.
+            starts.add(tuple(request_starts))
+        if len(legs) != 1 or len(starts) != 1:
+            raise ValueError(
+                f"the layers of one forward are stepped together, so their KV-cache "
+                f"groups must agree on the leg and the cached length, which is one "
+                f"length per request in the batch's own row order; this call site's "
+                f"entries carry prefill flags {sorted(legs)} and cached lengths "
+                f"{sorted(starts)}"
+            )
+        is_prefill = legs.pop()
+        request_starts = list(starts.pop())
+        # The scalar is the first request's, which is all the sparse family reads:
+        # it serves one sequence per forward and refuses a second in the carrier
+        # builder.
+        start_position = request_starts[0]
+        # Re-derived from the agreed cached lengths rather than from whichever group
+        # the walk ended on; the derivation is a pure function of the builder's
+        # array and the batch's width, so it agrees with every group's.
+        request_tokens = self._glm5next_resolve_request_tokens(
+            real_counts, len(request_starts), selected_query_rows
+        )
+        text_config = self.model.text_config
+        side_caches = self._glm5next_live_side_caches(banks)
+        # A step the engine scheduled nothing for is not a sequence step. The decode
+        # and prefill warmups and the idle data-parallel dummy step all reach here
+        # with ``cached_seq_len = 0`` and an input batch that names no request; they
+        # are served from slot 0 with the slot table neither read nor written.
+        # The classification is the computed length and the identity, never the
+        # leg: a one-token prompt computes its whole prompt in a step that does not
+        # exceed the decode threshold, and a preempted request resumes from computed
+        # length 0 whatever it is given. Both are real requests and take their own
+        # slot. The absent identity is only read at position 0: a step at a cached
+        # length above zero continues a sequence and is refused below if no request
+        # names it.
+        synthetic_step = all(
+            int(position) == 0 for position in request_starts
+        ) and not self._glm5next_batch_request_ids()
+        # The slot is settled here, not in the walk above, because whether the step
+        # is synthetic is only known once the leg and the position are read.
+        request_ids = self._glm5next_request_identities(synthetic=synthetic_step)
+        state_slots = self._glm5next_request_slots(
+            banks, request_ids, synthetic=synthetic_step, side_caches=side_caches
+        )
+        # One slot per request; the singular key stays because the sparse carrier
+        # reads it.
+        for geometry in geometries:
+            geometry["state_slot"] = int(state_slots[0])
+            geometry["state_slots"] = [int(value) for value in state_slots]
+        # Identity and paging must describe the same requests: slots come from the
+        # engine's request ids and positions from the block tables. A padded decode
+        # row has no request, so fewer identities than cached lengths is refused
+        # rather than given a "write nowhere" arm: a recurrent state's carrier is a
+        # bank row, and a row nobody owns has no harmless one to hand. Where padding
+        # is an address (``_glm5next_latent_slot_mapping``) it is masked instead.
+        if not synthetic_step and len(state_slots) != len(request_starts):
+            raise ValueError(
+                f"this step names {len(state_slots)} request(s) and its block tables "
+                f"carry {len(request_starts)} cached length(s); identity and paging "
+                f"come from one batch and must describe the same requests"
+            )
+        if synthetic_step:
+            # A synthetic step opens nothing, so it closes nothing. Clearing slot 0's
+            # ring on a request-less prefill would destroy the ring of whichever
+            # request owns that slot; at start-up the rows are fresh zeros anyway.
+            pass
+        else:
+            # Each request is classified on its own position: one may be opening
+            # while another continues.
+            for one_slot, one_start in zip(state_slots, request_starts):
+                self._glm5next_position_arm(
+                    int(one_slot),
+                    int(one_start),
+                    side_caches=side_caches,
+                    is_prefill=is_prefill,
+                )
+        carriers = self._glm5next_layer_carriers(
+            banks,
+            side_caches,
+            geometries=geometries,
+            is_prefill=is_prefill,
+            tokens=tokens,
+            start_position=start_position,
+            softmax_scale=float(
+                (
+                    int(text_config.qk_nope_head_dim)
+                    + int(text_config.qk_rope_head_dim)
+                )
+                ** -0.5
+            ),
+            # The indexer's bound is the engine's longest sequence, not this step's
+            # end. It is a Python int (``int(seq_lens.max())`` would be a host read
+            # inside the traced region), so it is baked into the graph; a per-step
+            # end would need a graph per step, while this value is constant. Nothing
+            # beyond the sequence becomes visible: each row is bounded to its own
+            # length by ``seq_lens`` before selection. The pooled store is allocated
+            # from this same number.
+            max_seq_len=int(self.max_model_len),
+            index_kpool=int(text_config.index_kpool),
+            requests=len(state_slots),
+            request_starts=request_starts,
+            # The first request's real length, for the sparse family: its ring and
+            # pool mask stop where the sequence stops, not where the bucket does.
+            real_tokens=request_tokens[0],
+            # Every request's own length, for the recurrent family's per-row masks.
+            request_real_tokens=request_tokens,
+            active_mla_query_rows=active_mla_query_rows,
+        )
+        # The cursor advances only once the carriers exist: the call above can still
+        # refuse (multi-token decode, paging disagreement, slot out of range), and a
+        # refused step must leave no trace. A synthetic step takes no claim. Each
+        # request advances by its own real tokens, not the batch's total or the
+        # bucket's width.
+        if not synthetic_step:
+            for one_slot, one_start, one_count in zip(
+                state_slots, request_starts, request_tokens
+            ):
+                self._glm5next_side_cache_positions[int(one_slot)] = (
+                    int(one_start) + one_count
+                )
+            # The sparse family's own cursor, from the same number: it serves one
+            # sequence per forward, so this is the first request's position.
+            self._glm5next_side_cache_cursor = (
+                int(request_starts[0]) + request_tokens[0]
+            )
+        return {
+            "input_ids": input_ids,
+            "layer_carriers": carriers,
+            "sampling_positions": kwargs["sampling_positions"],
+            **self._glm5next_parallel_kwargs(device=input_ids.device),
+            # The dump keyword goes through this one function for every call site,
+            # so captured and served graphs share a signature. Absent unless a dump
+            # directory is configured.
+            **self._layer_stream_kwargs(),
+        }
+
+    def _glm5next_parallel_kwargs(self, device: torch.device | None = None) -> dict:
+        """Return the root's three parallelism arguments, read from the parallel state.
+
+        The root forward leaves ``moe_group``, ``tp_degree`` and
+        ``expert_parallel_rank`` to its caller and defaults them to the unsharded
+        values: the rank selects which expert slice this rank's bank holds, and the
+        degree and group name the ranks that shard each expert's intermediate width.
+        Below expert-parallel degree 2 the defaults are passed explicitly, so every
+        call site passes the same keys.
+
+        The rank travels as an int64 ``[1]`` tensor on ``device`` (``meta`` under a
+        CPU capture), built outside the trace, so it is a graph input and one graph
+        serves every expert group; a Python int would compile one graph per group.
+        The first call logs one row per rank naming the expert group it read.
+        """
+        from vllm_neuron.parallel import neuron_parallel_state as parallel_state
+
+        ep_degree = int(parallel_state.get_neuron_ep_degree())
+        if ep_degree < 2:
+            moe_group, tp_degree, ep_rank = None, 1, 0
+        else:
+            moe_group = parallel_state.get_neuron_ep_tp_group()
+            tp_degree = int(moe_group.world_size)
+            ep_rank = int(parallel_state.get_neuron_ep_rank())
+        if not getattr(self, "_glm5next_parallel_reported", False):
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            logger.info(
+                "glm5next parallel arguments rank=%d ep_rank=%d ep_degree=%d tp_degree=%d",
+                rank, ep_rank, ep_degree, tp_degree,
+            )
+            self._glm5next_parallel_reported = True
+        return {
+            "moe_group": moe_group,
+            "tp_degree": tp_degree,
+            "expert_parallel_rank": torch.full((1,), ep_rank, dtype=torch.int64, device=device),
+        }
+
+    def _glm5next_position_arm(
+        self, slot: int, start_position: int, *, side_caches, is_prefill: bool
+    ) -> None:
+        """Open one request's ring at position 0, or require it to continue its sequence.
+
+        Which arm a request takes is its computed length, never the leg: a request
+        that has computed nothing is opening whatever number of tokens it was given,
+        so a one-token prompt and a resumed request open here like any other. The leg
+        is only used to name the refusal.
+        """
+        if int(start_position) == 0:
+            # A fresh sequence must not inherit the previous owner's partial pool:
+            # the side caches live for the process and every real token stashes
+            # into the ring, so its next completion would pool stale members. Only
+            # this request's row is emptied, by rebuild rather than in place (see
+            # ``_glm5next_emptied_at_slot``).
+            # The pooled store is left alone: the candidate gather is bounded by
+            # ``max_seq_len`` and every complete pool below that bound is written by
+            # this prefill, so a stale row above it is unreachable.
+            # The prefill's remainder is seeded by the model (``seed_tail``), since
+            # the positions past the last complete pool exist only inside the
+            # prefill forward.
+            # The ring and its owner are cleared together, before the carriers are
+            # built: if the builder then refuses this opening, the ring belongs to
+            # nobody and the next non-opening step is refused by name instead of
+            # being served from emptied rows.
+            self._glm5next_side_cache_positions.pop(int(slot), None)
+            # The sparse family's single cursor is cleared with them, for the same
+            # reason.
+            self._glm5next_side_cache_cursor = None
+            for side in side_caches:
+                if "tail" in side:
+                    side["tail"] = self._glm5next_emptied_at_slot(side["tail"], slot)
+        else:
+            # Every other step must continue the sequence the ring already holds.
+            # The ring is keyed by absolute position and carries no sequence
+            # identity, so a step that does not continue it would be served from
+            # another point of it with no shape disagreeing. Reaching this needs a
+            # request admitted at a non-zero cached length, which is what an
+            # automatic prefix-cache hit produces; that case is refused rather than
+            # guessed.
+            leg = "prefill" if is_prefill else "decode"
+            stood_at = self._glm5next_side_cache_positions.get(int(slot))
+            if stood_at is None:
+                raise ValueError(
+                    f"slot {slot}'s indexer ring holds no sequence cursor, so this "
+                    f"step has no sequence to continue; a step at position 0 opens "
+                    f"one, and this step is a {leg} at position "
+                    f"{int(start_position)}. Serving it would read whatever the "
+                    f"previous owner of this slot left in the ring"
+                )
+            if int(start_position) != int(stood_at):
+                raise ValueError(
+                    f"this step is a {leg} at position {int(start_position)} and slot "
+                    f"{slot}'s indexer ring stands at position {int(stood_at)}; the "
+                    f"rows carry no position of their own, so serving a step that does "
+                    f"not continue this slot's sequence would read another point of it "
+                    f"silently"
+                )
 
     def _build_decode_synthetic_inputs(
         self,
@@ -4916,7 +6386,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             compiled_graph_input=True,
         )
         try:
-            _ = self.capture_backend_model(**kwargs)
+            _ = self.capture_backend_model(**self._glm5next_model_kwargs(kwargs))
         except CaptureComplete:
             logger.debug(
                 "Graph capture for decode completed: batch size=%s", batch_size
@@ -4938,7 +6408,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 compiled_graph_input=True,
             )
             try:
-                _ = self.capture_backend_model(**kwargs)
+                _ = self.capture_backend_model(**self._glm5next_model_kwargs(kwargs))
             except CaptureComplete:
                 logger.debug(
                     "Graph capture for target model decode completed: batch size=%s",
@@ -5012,7 +6482,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     kwargs["input_ids"].shape[0], self.device
                 )
             )
-        model_output = self.model(**kwargs)
+        model_output = self.model(**self._glm5next_model_kwargs(kwargs))
         if self.use_async_scheduling:
             self._materialize_warmup_output(model_output)
         if self._tensor_replacer is not None:
@@ -5056,7 +6526,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         kwargs["input_ids"].shape[0], self.device
                     )
                 )
-            model_output = self.model(**kwargs)
+            model_output = self.model(**self._glm5next_model_kwargs(kwargs))
             if self.use_async_scheduling:
                 self._materialize_warmup_output(model_output)
             if self._tensor_replacer is not None:
@@ -5362,22 +6832,20 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 composition_changed = (
                     prev_req_ids is None or curr_req_ids != prev_req_ids
                 )
-                # Detect spec→non-spec transition: previous step had spec
-                # decode (prev future is [bs, num_spec+1]), current step is
-                # non-spec (no scheduled_spec_decode_tokens). In async mode
-                # the transition creates a CPU position mismatch because
-                # scheduler's num_computed_tokens_cpu reflects the previous
-                # spec step's optimistic advance but not its rejections —
-                # reading token_ids_cpu at that optimistic position gives
-                # garbage. Force a sync at this boundary by materializing
-                # and reconciling num_computed_tokens_cpu.
-                prev_future = self.async_execution_buffer.get(
-                    "futures_sampled_token_ids"
-                )
-                prev_was_spec = (
-                    isinstance(prev_future, torch.Tensor)
-                    and prev_future.ndim == 2
-                    and prev_future.shape[1] > 1
+                # Detect spec→non-spec transition: the previous real step ran
+                # the rejection sampler (recorded by sample_tokens as
+                # ``prev_step_was_spec``), current step is non-spec (no
+                # scheduled_spec_decode_tokens). In async mode the transition
+                # creates a CPU position mismatch because scheduler's
+                # num_computed_tokens_cpu reflects the previous spec step's
+                # optimistic advance but not its rejections — reading
+                # token_ids_cpu at that optimistic position gives garbage.
+                # Force a sync at this boundary by materializing and
+                # reconciling num_computed_tokens_cpu. The fact is read, never
+                # inferred from the future's shape: a model that returns
+                # logits also returns a 2-D tensor.
+                prev_was_spec = self.speculative_config is not None and bool(
+                    self.async_execution_buffer.get("prev_step_was_spec", False)
                 )
                 curr_is_nonspec = not bool(
                     scheduler_output.scheduled_spec_decode_tokens
@@ -6051,6 +7519,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             ),
         )
         self.async_execution_buffer["async_output"] = async_output
+        # Recorded for the next step's spec-to-non-spec transition check.
+        self.async_execution_buffer["prev_step_was_spec"] = (
+            spec_decode_metadata is not None
+        )
         return async_output
 
     def _maybe_swap_async_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -7122,7 +8594,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         with self._snapshot_capture_context(positions, spec_decode_metadata):
             with model_forward_context(self.vllm_config):
-                model_output = self.model(**model_kwargs)
+                model_output = self.model(**self._glm5next_model_kwargs(model_kwargs))
         if self._tensor_replacer is not None:
             set_active_context(None)
         if self._target_tensor_capture is not None:
@@ -7163,6 +8635,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             model_name=self.vllm_config.model_config.model,
             bucket_name=neff_bucket_name,
         ).inc()
+
+        # Strip the per-layer stream dump from the output first: every branch below
+        # expects the shape the model returns with no dump configured.
+        model_output = self._take_layer_stream_dump(
+            model_output, is_prefill=is_prefill
+        )
 
         # Parse model output based on on-device sampling and spec decode configuration
         self._on_device_logits = None
@@ -7359,7 +8837,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             (observed on GPT-OSS-120B `tp8 dp8 ep64` DI: garbage `\\n`
             repeated from the first decode token).
 
-        Four per-step inputs vary per rank and feed shape decisions; all
+        Four per-step inputs vary per rank and feed shape choices; all
         must be reconciled to a single value across the DP group (the last two,
         the spec flag and the spec/non-spec vote, are what fix the DI
         dp4tp8ep32 Eagle3 crash — ranks fall out of phase as KV transfers
@@ -7401,7 +8879,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         coordination.
 
         Why CPU-side reduce: all four values are host-side dispatch
-        decisions (they pick which compiled NEFF to call) and must
+        choices (they pick which compiled NEFF to call) and must
         materialize as Python ints before any device op is issued. A
         device-side reduce would force a device→host sync that defeats
         the purpose.
@@ -7446,7 +8924,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # Why: vLLM has built-in DP coordination via forward_context.py that could replace/enhance this logic
         # See vllm/forward_context.py:
         # - DPMetadata.num_tokens_across_dp() for token count synchronization via all_reduce
-        # - DPMetadata.should_ubatch_across_dp() for coordinated microbatching decisions for PP cases
+        # - DPMetadata.should_ubatch_across_dp() for coordinated microbatching choices for PP cases
         # - Automatic integration via set_forward_context() when parallel_config.data_parallel_size > 1
         if not self._dp_collectives_active():
             return 0, local_max_decode_ctx_len, False, local_force_nonspec
@@ -7805,7 +9283,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # Execute model forward pass directly (same as warmup_decode) to
         # match the exact traced graph signature including all kwargs.
         with model_forward_context(self.vllm_config):
-            model_output = self.model(**decode_kwargs)
+            model_output = self.model(**self._glm5next_model_kwargs(decode_kwargs))
         if self.use_async_scheduling:
             # The dummy batch produces no token consumed by anyone; its only
             # purpose is to make this idle DP rank participate in the
@@ -8181,14 +9659,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
     def _update_states_after_model_execute(
         self,
-        scheduler_output: "SchedulerOutput",
         sampled_token_ids: list[list[int]],
+        scheduler_output: "SchedulerOutput",
     ) -> None:
         """Update the cached states after model execution.
 
         On GPU this handles MTP/EAGLE for hybrid models (linear attention
         state shifting). Neuron does not support hybrid models yet, so this
         is a no-op.
+
+        The parameter order matches the caller, which passes
+        ``(sampled_token_ids, scheduler_output)`` positionally, as upstream does.
         """
         pass
 
@@ -8499,12 +9980,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             is_pooling_model=self.is_pooling_model,
         )
 
-        # Initialize the KV Cache tensors
+        # Each recurrent layer gets its own buffer (see ``kv_cache_allocations``).
+        # A latent bank is exactly the scheduler's blocks: the layer reads the pages
+        # its block table names, so nothing is read past a request's own blocks and
+        # no spare window is needed.
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
-        for tensor in kv_cache_config.kv_cache_tensors:
-            raw_tensor = torch.zeros(tensor.size, dtype=torch.int8, device=self.device)
-            # Case where the KV cache is shared across layers
-            for layer_name in tensor.shared_by:
+        for size, owners in kv_cache_allocations(kv_cache_config):
+            raw_tensor = torch.zeros(size, dtype=torch.int8, device=self.device)
+            for layer_name in owners:
                 kv_cache_raw_tensors[layer_name] = raw_tensor
 
         # Cache raw.view(dtype) per (raw_tensor, dtype) so layers pooled onto one
@@ -8535,6 +10018,36 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     block_size = kv_cache_spec.block_size
                     num_kv_heads = kv_cache_spec.num_kv_heads
                     head_size = kv_cache_spec.head_size
+
+                    # A latent cache holds one compressed vector per token and no
+                    # value half, so it gets one buffer and the whole page is it;
+                    # the spec class already budgeted the page that way, and a
+                    # K/V pair would leave half of every page dead.
+                    if isinstance(kv_cache_spec, MLAAttentionSpec):
+                        if self._kv_cache_is_fp8_packed(kv_cache_spec.dtype):
+                            raise NotImplementedError(
+                                f"KV layer '{layer_name}' has a latent cache and "
+                                "an FP8-packed key layout; the swizzle is defined "
+                                "for a key/value pair, so this refuses rather "
+                                "than guessing a packed latent layout"
+                            )
+                        latent_shape = (
+                            num_blocks,
+                            num_kv_heads,
+                            block_size,
+                            head_size,
+                        )
+                        kv_caches[layer_name] = [
+                            _shared_dtype_view(
+                                raw_tensor, kv_cache_spec.dtype
+                            ).view(latent_shape)
+                        ]
+                        # Not registered in ``_kv_cache_full_tensors``: that dict
+                        # feeds the KV-transfer connector's (2, num_blocks, ...)
+                        # K/V view, and a latent cache has no K/V pair. The
+                        # connector's MLA branch takes this layout, and the
+                        # registration helper falls back to the per-layer dict.
+                        continue
 
                     # Packed FP8 K cache: store K swizzled as
                     # [num_blocks, num_kv_heads, block_size // 2, head_size, 2]
@@ -8595,6 +10108,65 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     kv_caches[layer_name] = [typed_tensor[0], typed_tensor[1]]  # [k, v]
                     self._kv_cache_full_tensors[layer_name] = typed_tensor
 
+            # A linear-attention (KDA) layer holds a short-convolution state and a
+            # recurrent state instead of a key/value pair. Its spec reports both
+            # on two positional carriers, shapes[0]/dtypes[0] the conv state and
+            # shapes[1]/dtypes[1] the recurrent state, in the order
+            # ``get_kv_cache_spec`` constructs them and upstream's page formula
+            # pairs them, so the allocation walks the carriers rather than naming
+            # a state. The page comes from the spec: ``page_size_bytes`` honours
+            # ``page_size_padded``, so ``num_blocks`` and every stride below
+            # follow the padded page.
+            elif isinstance(kv_cache_spec, MambaSpec):
+                for layer_name in group.layer_names:
+                    raw_tensor = kv_cache_raw_tensors[layer_name]
+                    page_size_bytes = kv_cache_spec.page_size_bytes
+                    assert raw_tensor.numel() % page_size_bytes == 0
+
+                    num_blocks = raw_tensor.numel() // page_size_bytes
+
+                    # Both states live side by side inside each page, so each
+                    # state is a block-strided view of the same raw buffer: the
+                    # block stride is the whole page and the within-block
+                    # strides are contiguous for that state's own shape.
+                    # ``strict=True`` because upstream pairs the two carriers
+                    # with a non-strict zip, so a short ``dtypes`` tuple would
+                    # silently under-allocate the page.
+                    state_tensors = []
+                    state_offset_bytes = 0
+                    for shape, dtype in zip(
+                        kv_cache_spec.shapes, kv_cache_spec.dtypes, strict=True
+                    ):
+                        dtype_size = dtype.itemsize
+                        # The page must be a whole number of this state's
+                        # elements, or the block stride below would truncate.
+                        assert page_size_bytes % dtype_size == 0
+                        target_shape = (num_blocks, *shape)
+                        # Contiguous strides for the target shape, read off a
+                        # meta tensor: correct by construction and allocating
+                        # no storage for a reading used only as arithmetic.
+                        contiguous = torch.empty(target_shape, device="meta").stride()
+                        assert state_offset_bytes % dtype_size == 0
+                        state_tensors.append(
+                            torch.as_strided(
+                                _shared_dtype_view(raw_tensor, dtype),
+                                size=target_shape,
+                                stride=(
+                                    page_size_bytes // dtype_size,
+                                    *contiguous[1:],
+                                ),
+                                storage_offset=state_offset_bytes // dtype_size,
+                            )
+                        )
+                        # Advance by this state's own per-block footprint, so the
+                        # next carrier starts where this one ends inside a page.
+                        state_offset_bytes += contiguous[0] * dtype_size
+
+                    kv_caches[layer_name] = state_tensors
+                    # Not registered in ``_kv_cache_full_tensors``: that dict
+                    # feeds the KV-transfer connector's (2, num_blocks, ...) K/V
+                    # view, and a recurrent state has no K/V pair.
+
             else:
                 raise NotImplementedError(
                     f"Unsupported Attention spec type: {type(kv_cache_spec)}"
@@ -8648,10 +10220,72 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         target_kv_spec = self.model.get_kv_spec()
         for layer in target_kv_spec.layers:
             layer_name = layer.name
+            # A linear-attention (KDA) layer holds a short-convolution state and a
+            # recurrent state instead of a key/value history, reported on
+            # LayerSpec's four recurrent-state fields. It is recognised by the
+            # fields it carries, not by its name.
+            recurrent_state = (
+                layer.kda_conv_state_shape,
+                layer.kda_recurrent_state_shape,
+                layer.kda_conv_state_dtype,
+                layer.kda_recurrent_state_dtype,
+            )
+            if any(value is not None for value in recurrent_state):
+                if None in recurrent_state:
+                    raise ValueError(
+                        f"KV layer '{layer_name}' declares recurrent-state "
+                        "geometry but leaves part of it unset; the conv and "
+                        "recurrent carriers are paired positionally, so a "
+                        "missing member would shorten the reported page."
+                    )
+                # Position 0 conv, position 1 recurrent: the order upstream's page
+                # formula pairs them in. Dtypes come from the model, per state;
+                # the global KV cache dtype describes a key/value cache and would
+                # mistype an fp32 recurrent state. ``page_size_padded`` is set
+                # after the loop, once the attention page is known.
+                spec = MambaSpec(
+                    block_size=block_size,
+                    shapes=(
+                        tuple(layer.kda_conv_state_shape),
+                        tuple(layer.kda_recurrent_state_shape),
+                    ),
+                    dtypes=(
+                        layer.kda_conv_state_dtype,
+                        layer.kda_recurrent_state_dtype,
+                    ),
+                )
+            # A latent-attention layer caches one compressed vector per token and
+            # has no value half, so its page carries one buffer. ``MLAAttentionSpec``
+            # is upstream's name for that page: its ``real_page_size_bytes`` has no
+            # factor 2 for a key/value pair. Reporting ``FullAttentionSpec`` here
+            # would buy every latent layer a second buffer nothing reads and halve
+            # the blocks a byte budget holds, and ``page_size_padded`` only ever
+            # pads a page up, so it could not be corrected downstream. The layer
+            # declares this through ``latent_kv``, not a name test.
+            # ``MLAAttentionSpec`` is a ``FullAttentionSpec`` subclass, so the
+            # allocation branch and the page unification below admit it unchanged.
+            elif layer.latent_kv:
+                # A windowed latent cache is refused rather than silently stripped
+                # of its window: this branch runs before the sliding-window one.
+                if layer.sliding_window_size is not None:
+                    raise NotImplementedError(
+                        f"KV layer '{layer_name}' declares a latent cache and a "
+                        f"sliding window of {layer.sliding_window_size}; no "
+                        "windowed latent page is implemented, so this refuses "
+                        "rather than dropping the window"
+                    )
+                spec = MLAAttentionSpec(
+                    block_size=block_size,
+                    num_kv_heads=layer.num_kv_heads,
+                    head_size=layer.head_size,
+                    dtype=kv_cache_dtype,
+                    sliding_window=None,
+                    attention_chunk_size=layer.chunk_size,
+                )
             # Use SlidingWindowSpec for SWA layers so HMA can create separate
             # KV cache groups. When --no-disable-hybrid-kv-cache-manager is set,
             # this enables block clipping in the NiXL connector.
-            if layer.sliding_window_size is None:
+            elif layer.sliding_window_size is None:
                 spec = FullAttentionSpec(
                     block_size=block_size,
                     num_kv_heads=layer.num_kv_heads,
@@ -8669,6 +10303,59 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     sliding_window=layer.sliding_window_size,
                 )
             all_kv_cache_specs[layer_name] = spec
+
+        # The padded page is set after the loop: the KDA arm builds its
+        # ``MambaSpec`` before every attention layer has been seen, so the
+        # attention page is not known there. Setting ``page_size_padded`` at
+        # construction lets upstream's page unification succeed on its own terms;
+        # it refuses a ``MambaSpec`` whose page neither divides the largest page
+        # nor belongs to an attention spec it can pad. The existing unification
+        # patch stays in place and goes inert here, since it only fills the field
+        # when it is None. The drafter's spec set below is deliberately not padded.
+        # The spec classes are re-imported from their own module rather than read
+        # off this module's globals, so a test that patches this module's
+        # ``MambaSpec`` name with a factory function does not break ``isinstance``.
+        from dataclasses import replace
+
+        from vllm.v1.kv_cache_interface import (
+            FullAttentionSpec as _FullAttnSpec,
+        )
+        from vllm.v1.kv_cache_interface import MambaSpec as _MambaSpec
+        from vllm.v1.kv_cache_interface import (
+            SlidingWindowSpec as _SlidingWindowSpec,
+        )
+
+        kda_specs = {
+            name: spec
+            for name, spec in all_kv_cache_specs.items()
+            if isinstance(spec, _MambaSpec)
+        }
+        attention_specs = {
+            name: spec
+            for name, spec in all_kv_cache_specs.items()
+            if isinstance(spec, (_FullAttnSpec, _SlidingWindowSpec))
+        }
+        if kda_specs and attention_specs:
+            kda_page = max(spec.page_size_bytes for spec in kda_specs.values())
+            attention_page = max(
+                spec.page_size_bytes for spec in attention_specs.values()
+            )
+            if attention_page < kda_page:
+                # Refused rather than padded downward: upstream's hook only ever
+                # raises the attention page to meet the state page, because a page
+                # smaller than the state it must hold cannot describe that state.
+                raise ValueError(
+                    "Cannot unify KV cache pages: the attention page is "
+                    f"{attention_page} B and the recurrent-state page is "
+                    f"{kda_page} B. Padding a recurrent state down to a "
+                    "smaller page would report a page its own geometry does "
+                    "not fit, so this refuses instead of narrowing it."
+                )
+            if attention_page > kda_page:
+                for name, spec in kda_specs.items():
+                    all_kv_cache_specs[name] = replace(
+                        spec, page_size_padded=attention_page
+                    )
 
         if self.speculative_config and self.speculative_config.use_eagle():
             assert isinstance(self.drafter, EagleProposer)
@@ -9034,6 +10721,94 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             tensors[layer_name] = torch.load(buf, weights_only=True)
 
         torch.save(tensors, str(save_path))
+
+    # ------------------------------------------------------------------------
+    # PER-LAYER RESIDUAL STREAM DUMP
+    # ------------------------------------------------------------------------
+    # Enabled by VLLM_NEURON_DUMP_LAYER_STREAMS=<dir>. The tensors live inside the
+    # model, so the stack returns them as extra graph outputs and the save happens
+    # here, after the forward returns: a save, log or environment read inside the
+    # trace would be a graph break. With the variable unset the model is handed no
+    # keyword and traces its ordinary signature.
+
+    @staticmethod
+    def _layer_stream_dump_dir_from_env() -> str | None:
+        """The directory VLLM_NEURON_DUMP_LAYER_STREAMS names, or None when it is unset."""
+        return os.environ.get("VLLM_NEURON_DUMP_LAYER_STREAMS") or None
+
+    def _layer_stream_kwargs(self) -> dict:
+        """Return the model's collection keyword, empty unless a dump directory is set.
+
+        The directory is read through ``getattr`` because the carrier helpers are also
+        exercised on runners built without ``__init__``.
+        """
+        if not getattr(self, "_layer_stream_dump_dir", None):
+            return {}
+        return {"collect_layer_streams": True}
+
+    def _take_layer_stream_dump(self, model_output: Any, *, is_prefill: bool) -> Any:
+        """Save a collecting forward's per-layer streams and return its logits alone.
+
+        Every step goes through here while the dump is configured, because every graph
+        captured under it carries the extra outputs; only the FIRST prefill is written.
+        """
+        if not self._layer_stream_dump_dir:
+            return model_output
+        if not isinstance(model_output, tuple):
+            logger.warning(
+                "layer stream dump: %s is set but the model returned %s rather than "
+                "a tuple, so no per-layer stream reached this step",
+                "VLLM_NEURON_DUMP_LAYER_STREAMS",
+                type(model_output).__name__,
+            )
+            return model_output
+        logits, streams = model_output[0], model_output[1:]
+        if not is_prefill or self._layer_streams_dumped:
+            return logits
+        self._layer_streams_dumped = True
+        rank = int(self.rank_tensor.item())
+        if rank != 0:
+            return logits
+        import pathlib
+
+        save_dir = pathlib.Path(self._layer_stream_dump_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        names = self._layer_stream_names(len(streams))
+        for name, stream in zip(names, streams):
+            # A tensor needs a contiguous copy before the host move; an async step
+            # hands this method futures instead, which resolve through ``cpu()``.
+            if torch.is_tensor(stream):
+                host = stream.contiguous().to("cpu")
+            else:
+                host = stream.cpu()
+            # Widen floating tensors to fp32 for comparison; an integer tensor such
+            # as an expert index stays integer.
+            saved = host.float() if host.is_floating_point() else host
+            torch.save(saved, str(save_dir / f"{name}.pt"))
+        logger.info(
+            "layer stream dump: wrote %d tensors under %s",
+            len(streams),
+            save_dir,
+        )
+        return logits
+
+    def _layer_stream_names(self, count: int) -> tuple[str, ...]:
+        """The dump's file names, taken from the model that produced the tensors."""
+        from vllm_neuron.model.glm5_next.model_fp8 import layer_dump_names
+
+        model = getattr(self, "model", None)
+        names = layer_dump_names(model) if model is not None else ()
+        if len(names) == count:
+            return names
+        # The model and the graph disagree, so fall back to positional names; a
+        # diagnostic never fails a serve over its own labels.
+        logger.warning(
+            "layer stream dump: the model names %d tensors and the graph returned %d, "
+            "so the files are numbered instead",
+            len(names),
+            count,
+        )
+        return tuple(f"dump_{index}" for index in range(count))
 
     # ------------------------------------------------------------------------
     # TENSOR CAPTURE

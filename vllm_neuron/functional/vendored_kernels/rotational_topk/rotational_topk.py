@@ -32,6 +32,7 @@ from .rotational_topk_utils import (
     HW_PARAMS,
     RotationalTopkConfig,
     TopkConfig,
+    _get_dtype_min,
     build_rotation_matrix,
     build_stage_offsets,
     insert,
@@ -339,6 +340,14 @@ def _topk_rotated_core(
     values = nl.ndarray(
         (total_partition_dim, concatenated_stage_free_dim), dtype=inp.dtype
     )
+
+    # `predicated_folded_load` writes only `batch_bound` of the `n_stages * tile_size`
+    # partitions, so a ragged tile leaves whole partitions uninitialised. `rotate`'s
+    # `nisa.nc_matmul` then contracts the partition axis with 0/1 weights, so one
+    # non-finite word in an unwritten partition turns every output partition into NaN
+    # (`0.0 * inf`). The scanning path guards the same case in `rotational_topk_utils`.
+    if (batch_end - batch_start) < BxS_size:
+        nisa.memset(values, value=_get_dtype_min(inp.dtype))
 
     predicated_folded_load(
         data_hbm=inp,
