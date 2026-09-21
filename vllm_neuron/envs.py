@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     VLLM_NEURON_SWITCH_CC: bool = False
     VLLM_NEURON_MIN_KV_BUDGET_GIB: float = 1.0
     VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION: float = 0.30
+    VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB: float = 5.0
     VLLM_NEURON_WORKER_TERMINATION_TIMEOUT: int = 5
     VLLM_NEURON_MLP_FORCE_TKG: bool = False
     VLLM_NEURON_DISABLE_NKI_KERNELS: bool = False
@@ -44,6 +45,18 @@ if TYPE_CHECKING:
     VLLM_NEURON_SKIP_DECODE_WARMUP: bool = False
     VLLM_NEURON_SKIP_PREFILL_DECODE_WARMUP: bool = False
     VLLM_NEURON_SKIP_ENCODER_WARMUP: bool = False
+    # Ranks that load their compiled graph at the same time. A load holds far more
+    # host memory than the execution after it, so the group goes through the
+    # loader in waves of this many ranks. A value at or above the world size, or
+    # an unset signal directory, loads every rank at once.
+    VLLM_NEURON_NEFF_LOAD_WAVE_SIZE: int = 8
+    # Directory the ranks signal each other through while they load in waves. Each
+    # rank writes one flag file after its own load and never reads a later wave's.
+    VLLM_NEURON_NEFF_LOAD_SIGNAL_DIR: str = ""
+    # Seconds a wave waits for the wave before it. On expiry it logs and
+    # proceeds, because a load that hangs the group is worse than one that
+    # overlaps another.
+    VLLM_NEURON_NEFF_LOAD_WAIT_TIMEOUT: int = 3600
     # Force the STATIC FP8 (non-MX) attention path on TRN3 even when STATIC_MX
     # kernels are available. Used by FP8 model factories as an escape hatch.
     VLLM_NEURON_FORCE_STATIC_FP8: bool = False
@@ -119,6 +132,22 @@ def maybe_convert_float(value: str | None) -> float | None:
     return float(value)
 
 
+#: Device memory a compiled graph keeps on one physical NeuronCore, in GiB.
+#:
+#: A logical NeuronCore is two physical cores, and the Neuron runtime allocates
+#: and accounts memory on each physical core separately. A staged graph puts its
+#: shared scratchpad and most of its code on one of the pair, so the KV cache
+#: budget has to leave that much room on a single physical core rather than on
+#: the logical pair.
+#:
+#: The default is a measured figure rounded up for margin: on trn2, a
+#: GLM-5.3-Flash prefill graph at bucket 1024 held 4.567 GiB on the even
+#: physical core of every rank (3.875 GiB of shared scratchpad plus 705 MiB of
+#: graph) against 159.9 MiB on the odd one. Another model, another bucket or
+#: another compiler release moves it, which is what the override is for.
+DEFAULT_DEVICE_GRAPH_RESERVE_GIB = 5.0
+
+
 environment_variables: dict[str, Callable[[], Any]] = {
     # ================== Core System Variables ==================
     # Enable CPU fallback mode instead of using Neuron accelerators
@@ -161,6 +190,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         maybe_convert_float(os.getenv("VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION"))
         if os.getenv("VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION") is not None
         else 0.30
+    ),
+    # Graph reserve (GiB) held back on each physical NeuronCore when the KV
+    # cache budget is computed. See DEFAULT_DEVICE_GRAPH_RESERVE_GIB above for
+    # where the default comes from.
+    "VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB": lambda: (
+        maybe_convert_float(os.getenv("VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB"))
+        if os.getenv("VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB") is not None
+        else DEFAULT_DEVICE_GRAPH_RESERVE_GIB
     ),
     # Local cache directory for model checkpoints
     "VLLM_NEURON_CHECKPOINT_CACHE": lambda: os.getenv(
@@ -208,6 +245,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # EPD language-only (PD) pools, which have no vision encoder.
     "VLLM_NEURON_SKIP_ENCODER_WARMUP": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_SKIP_ENCODER_WARMUP")) or False
+    ),
+    # Ranks that load their compiled graph at the same time.
+    # A value at or above the world size loads every rank at once, and zero turns the
+    # staging off, so the default applies only when the variable is unset.
+    "VLLM_NEURON_NEFF_LOAD_WAVE_SIZE": lambda: (
+        8
+        if os.getenv("VLLM_NEURON_NEFF_LOAD_WAVE_SIZE") is None
+        else maybe_convert_int(os.getenv("VLLM_NEURON_NEFF_LOAD_WAVE_SIZE"))
+    ),
+    # Directory the ranks signal each other through while they load in waves.
+    # Empty means no staging: every rank loads as soon as it reaches the loader.
+    "VLLM_NEURON_NEFF_LOAD_SIGNAL_DIR": lambda: os.getenv(
+        "VLLM_NEURON_NEFF_LOAD_SIGNAL_DIR", ""
+    ),
+    # Seconds a wave waits for the wave before it, defaulting to the barrier timeout.
+    # Zero waits for nothing, so the fall-through applies only when the variable is unset.
+    "VLLM_NEURON_NEFF_LOAD_WAIT_TIMEOUT": lambda: (
+        maybe_convert_int(os.getenv("VLLM_NEURON_NEFF_LOAD_WAIT_TIMEOUT"))
+        if os.getenv("VLLM_NEURON_NEFF_LOAD_WAIT_TIMEOUT") is not None
+        else (maybe_convert_int(os.getenv("VLLM_NEURON_BARRIER_TIMEOUT")) or 3600)
     ),
     # Skip decode warmup/compilation without requiring kv-transfer-config.
     # Useful for prefill-only profiling workflows.

@@ -43,7 +43,8 @@ from vllm_neuron.utils.hardware_config import (
     parse_range_list,
 )
 from vllm.utils.network_utils import get_open_port
-from vllm_neuron.parallel.neuron_parallel_state import tp_barrier
+from vllm_neuron.parallel.neuron_parallel_state import tp_barrier, tp_sum_int
+from vllm_neuron.vllm.patches.staged_neff_load import forget_this_load, name_this_load
 from vllm_neuron.vllm.platform import NeuronPlatform
 from vllm_neuron.vllm.worker.neuron_profiler import (
     NeuronProfilerConfig,
@@ -53,6 +54,50 @@ from vllm_neuron.vllm.worker.neuron_profiler import (
 logger = logging.getLogger(__name__)
 
 _LOOPBACK_ADDRS = (None, "", "127.0.0.1", "localhost", "::1")
+
+#: Prefix of the module attributes a model leaves a prepared kernel operand on.
+#: Such an operand is device-resident but is neither a parameter nor a buffer, so
+#: only a walk of the attributes themselves finds it.
+PREPARED_OPERAND_ATTR_PREFIX = "_prepared_"
+
+#: Physical NeuronCores behind the logical core the runtime reports stats for.
+#: ``Runtime.get_vnc_memory_stats`` reports the logical core, while the runtime
+#: allocates and accounts device memory on each physical core of the pair.
+PHYSICAL_CORES_PER_LOGICAL_CORE = 2
+
+
+def _tensor_identity(tensor: torch.Tensor) -> Any:
+    """Return a key that is equal for two tensors sharing the same memory.
+
+    A zero pointer is not an identity. A meta-device tensor holds no memory and
+    an empty tensor has no address, and both report zero from either reader
+    rather than raising, so keying on that value would collapse every such tensor
+    onto one key and make all but the first look already counted. Those tensors
+    fall back to their own object identity, which cannot recognise two views of
+    one meta tensor: that double-counts bytes rather than dropping them, the safe
+    direction for a memory bound.
+    """
+    for reader in (lambda: tensor.untyped_storage().data_ptr(), tensor.data_ptr):
+        try:
+            pointer = reader()
+        except Exception:
+            continue  # a device tensor may expose no storage and no address
+        if pointer:
+            return ("address", pointer)
+    return ("object", id(tensor))
+
+
+def _tensors_in(value: Any) -> list[torch.Tensor]:
+    """Return the tensors an attribute holds, directly or in one container."""
+    if isinstance(value, torch.Tensor):
+        return [value]
+    if isinstance(value, dict):
+        candidates = value.values()
+    elif isinstance(value, (list, tuple, set)):
+        candidates = value
+    else:
+        return []
+    return [item for item in candidates if isinstance(item, torch.Tensor)]
 
 
 def validate_cross_node_master_addr(
@@ -315,6 +360,76 @@ class _SuppressModelRegistryOverwrite(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         """Return False to suppress matching messages, True to allow them through."""
         return not self._PATTERN.search(record.getMessage())
+
+
+def _exchange_warmup_status(phase: str, bucket: str, where: str, failure) -> None:
+    """Sum the failed-rank count across the TP group, then raise if any rank failed."""
+    # The exchange doubles as the barrier and carries how many ranks failed. A bare barrier
+    # would leave every other rank waiting out the barrier timeout for a rank that had already
+    # raised, and the real fault would be reported as a timeout.
+    failed_total = tp_sum_int(1 if failure is not None else 0)
+    if failure is not None:
+        raise failure
+    if failed_total:
+        raise RuntimeError(
+            f"warmup {phase} bucket={bucket} {where}: {failed_total} rank(s) failed"
+        )
+
+
+def _rss_kib() -> int:
+    """Read this process's resident size in KiB, or zero where /proc is not readable."""
+    try:
+        with open("/proc/self/status", encoding="utf-8") as status:
+            for line in status:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+    except OSError:
+        return 0
+    return 0
+
+
+def run_warmup_on_all_ranks(phase: str, bucket: str, work) -> None:
+    """Run ``work`` on every rank of the TP group at once, then exchange status.
+
+    A warmup call executes the model, and the model's forward carries collectives over the
+    whole TP group, so a subset of the ranks cannot run it: the ranks left out would wait in
+    the status exchange while the ranks inside waited for them in the collective.
+
+    The graph itself is compiled or loaded inside this call, before the forward. The loader is
+    told which call the load belongs to, because it stages loads in waves and labels each one
+    with the graph it loaded. The label is dropped again on the way out, so a graph compiled
+    outside a warmup call is never staged.
+    """
+    rank = get_tp_group().rank_in_group
+    name_this_load(phase, bucket)
+    tp_barrier()
+    # One line per rank on each side of the call. The compiled graph is loaded inside this call,
+    # so an observer watching the process from outside cannot tell whether resident size grew
+    # in the load or in the execution; a reading on each side of the call can.
+    logger.info(
+        "warmup_execution_entered|phase=%s|bucket=%s|rank=%s|rss_kib=%s",
+        phase,
+        bucket,
+        rank,
+        _rss_kib(),
+    )
+    started = time.perf_counter()
+    failure = None
+    try:
+        work()
+    except Exception as exc:  # the group is told before this rank re-raises
+        failure = exc
+    finally:
+        forget_this_load()
+    logger.info(
+        "warmup_execution_left|phase=%s|bucket=%s|rank=%s|rss_kib=%s|elapsed_s=%.1f",
+        phase,
+        bucket,
+        rank,
+        _rss_kib(),
+        time.perf_counter() - started,
+    )
+    _exchange_warmup_status(phase, bucket, "all ranks", failure)
 
 
 class NeuronWorker(WorkerBase):
@@ -918,6 +1033,179 @@ class NeuronWorker(WorkerBase):
             )
         return cap_fraction
 
+    def _get_graph_reserve_bytes(self) -> int:
+        """Return the validated per-physical-core graph reserve in bytes."""
+        try:
+            reserve_gib = float(envs.VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB must be a number of GiB. "
+                f"Got {os.getenv('VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB')!r}."
+            ) from exc
+        if not reserve_gib > 0 or reserve_gib == float("inf"):
+            raise RuntimeError(
+                "VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB must be a finite, "
+                f"positive number of GiB. Got {reserve_gib}."
+            )
+        return int(reserve_gib * (1024**3))
+
+    def _prepared_operand_bytes(self) -> int:
+        """Return the bytes held by prepared kernel operands.
+
+        A model that relayouts a weight into kernel orientation keeps the result
+        on a module attribute rather than as a parameter or a buffer, so
+        :meth:`_get_byte_used_from_model` does not see it although the device
+        holds it. Attributes whose names start with
+        :data:`PREPARED_OPERAND_ATTR_PREFIX` follow that convention, for example
+        ``_prepared_kernel_operands``, ``_prepared_scale_operands`` and
+        ``_prepared_indexer_weights`` in
+        ``vllm_neuron/model/glm5_next/model_fp8.py``.
+
+        A tensor already counted as a parameter or a buffer, or one sharing
+        storage with such a tensor, is counted once. The result feeds the
+        physical-core bound only and never the returned budget, so a device that
+        exposes no storage identity, and so forces a coarser comparison, cannot
+        change the KV cache shape.
+        """
+        models = [self.model_runner.model]
+        if self.model_runner.drafter is not None:
+            models.append(self.model_runner.drafter.model)
+
+        counted: set[Any] = set()
+        for model in models:
+            for module in model.modules():
+                for tensor in module.parameters(recurse=False):
+                    counted.add(_tensor_identity(tensor))
+                for tensor in module.buffers(recurse=False):
+                    counted.add(_tensor_identity(tensor))
+
+        total = 0
+        for model in models:
+            for module in model.modules():
+                for name, value in vars(module).items():
+                    if not name.startswith(PREPARED_OPERAND_ATTR_PREFIX):
+                        continue
+                    for tensor in _tensors_in(value):
+                        identity = _tensor_identity(tensor)
+                        if identity in counted:
+                            continue
+                        counted.add(identity)
+                        total += tensor.nbytes
+        return total
+
+    def _physical_core_kv_bound(self, total_hbm_bytes: int, bytes_used: int) -> int:
+        """Return the KV bytes that still leave the graph its reserve.
+
+        The runtime spreads a rank's tensors over the two physical cores of its
+        logical core but stages a graph's scratchpad on one of them, so the bound
+        has two terms: the cache may exceed neither what a single physical core
+        has left beside the reserve, nor what the pair has left once the model's
+        own tensors are charged against both reserves.
+
+        Args:
+            total_hbm_bytes: HBM the runtime reports for the logical core.
+            bytes_used: Bytes the model already holds on that logical core.
+        """
+        reserve_bytes = self._get_graph_reserve_bytes()
+        per_core_bytes = total_hbm_bytes // PHYSICAL_CORES_PER_LOGICAL_CORE
+        room_per_core = max(per_core_bytes - reserve_bytes, 0)
+        room_shared = max(
+            room_per_core * PHYSICAL_CORES_PER_LOGICAL_CORE - bytes_used, 0
+        )
+        return min(room_per_core, room_shared)
+
+    def _kv_cache_need_bytes(self) -> int | None:
+        """Return the bytes the KV cache needs to serve the configured load.
+
+        The need follows the served workload rather than the free memory:
+        ``max_model_len`` tokens for each of ``max_num_seqs`` sequences, rounded
+        up to whole blocks. Block size, page size and the group layout all come
+        from the runner's own KV cache specs through vLLM's grouping, so a hybrid
+        recurrent/attention cache is measured the way it will be allocated.
+
+        Returns:
+            The bytes needed, or None when the model reports no cache to size,
+            which leaves the memory heuristic to stand on its own.
+        """
+        from vllm.utils.math_utils import cdiv
+        from vllm.v1.core.kv_cache_utils import (
+            get_kv_cache_groups,
+            get_uniform_page_size,
+        )
+
+        kv_cache_spec = self.model_runner.get_kv_cache_spec()
+        if not kv_cache_spec:
+            return None
+        groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
+        if not groups:
+            return None
+
+        page_size = get_uniform_page_size([group.kv_cache_spec for group in groups])
+        # One pool per layer of the largest group; every group draws its blocks
+        # from the same pool, which is why the group count multiplies the blocks
+        # a request needs and the layer count multiplies their cost.
+        layers_per_pool = max(len(group.layer_names) for group in groups)
+        max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
+        max_model_len = self.vllm_config.model_config.max_model_len
+        # Every group is priced the way the allocator prices it: one block per
+        # ``block_size`` tokens of the sequence, for a recurrent group as much as
+        # for an attention one. The specs' own ``max_memory_usage_bytes`` prices a
+        # recurrent group at a single block, which holds only where a recurrent
+        # block spans a whole sequence. With short recurrent blocks the allocator
+        # hands out one block per page instead, and a pool sized on the
+        # single-block premise would then be too small for a request vLLM's
+        # admission arithmetic said would fit. Where a recurrent block does span
+        # the sequence this expression reads one block, so it is right either way.
+        # Context parallelism would let a rank keep fewer tokens; no discount is
+        # taken for it here.
+        blocks_per_request = sum(
+            cdiv(max_model_len, group.kv_cache_spec.block_size) for group in groups
+        )
+        # Plus the pool's null block, which no request can be given.
+        num_blocks = blocks_per_request * max_num_seqs + 1
+        need_bytes = num_blocks * page_size * layers_per_pool
+
+        logger.info(
+            "KV cache need: %.3f GiB for %d sequence(s) of %d tokens "
+            "(%d blocks of %d B, %d allocator block(s) per request, %d group(s), "
+            "%d layer(s) per pool)",
+            need_bytes / (1024**3),
+            max_num_seqs,
+            max_model_len,
+            num_blocks,
+            page_size,
+            blocks_per_request,
+            len(groups),
+            layers_per_pool,
+        )
+        return need_bytes
+
+    def _kv_cache_footprint_bytes(self, need_bytes: int) -> int:
+        """Return the bytes the runner allocates for a KV cache budgeted at ``need_bytes``.
+
+        vLLM shares one tensor across the same-index layer of every group and
+        sizes its blocks from ``need_bytes``; the runner then gives each recurrent
+        layer its own buffer of that tensor's size, because a recurrent bank is
+        addressed by request slot rather than by block. This total, not
+        ``need_bytes``, is what has to fit the device. No bank is grown beyond it:
+        a latent layer reads only the pages its block table names, so nothing
+        reads past the blocks the scheduler handed out.
+        """
+        from vllm.v1.core.kv_cache_utils import (
+            get_kv_cache_config_from_groups,
+            get_kv_cache_groups,
+        )
+
+        from .neuron_model_runner import kv_cache_allocations
+
+        groups = get_kv_cache_groups(
+            self.vllm_config, self.model_runner.get_kv_cache_spec()
+        )
+        kv_cache_config = get_kv_cache_config_from_groups(
+            self.vllm_config, groups, need_bytes
+        )
+        return sum(size for size, _owners in kv_cache_allocations(kv_cache_config))
+
     def _determine_available_memory_cpu(self, gpu_mem_util: float) -> int:
         """Compute CPU-mode KV memory budget from fair-share host memory."""
         bytes_free = self._query_host_runtime_memory()
@@ -943,8 +1231,13 @@ class NeuronWorker(WorkerBase):
     ) -> int:
         """Shared KV cache budget logic for both estimate and runtime paths.
 
-        Applies gpu_memory_utilization, cap-fraction guardrail, and min-KV
-        threshold check, then returns the available bytes for KV cache.
+        Applies gpu_memory_utilization, cap-fraction guardrail, the
+        physical-core graph reserve, and the min-KV threshold check, then returns
+        the available bytes for KV cache. :meth:`determine_available_memory` caps
+        this figure by the served need, and deliberately does not repeat the
+        min-KV check there: that floor exists to catch a collapsed memory
+        heuristic, and a cache sized to the served need can sit below it
+        legitimately.
         """
         total_budget = int(total_hbm_bytes * gpu_mem_util)
         # Preserve vLLM semantics: GMU applies to total device memory first.
@@ -954,19 +1247,31 @@ class NeuronWorker(WorkerBase):
         # TODO: Replace this cap with a cleaner solution later.
         cap_fraction = self._get_kv_cap_fraction()
         heuristic_cap = int(total_budget * cap_fraction)
-        available = max(min(user_budget, heuristic_cap), 0)
+        # The graph reserve is a hardware bound on one physical core, so it is
+        # taken against total HBM rather than against the GMU-scaled budget; GMU
+        # stays the operator's knob in the two terms above. The bound counts the
+        # prepared operands too, because the device holds them and the parameter
+        # sum above does not see them.
+        resident_bytes = bytes_used + self._prepared_operand_bytes()
+        core_bound = self._physical_core_kv_bound(total_hbm_bytes, resident_bytes)
+        available = max(min(user_budget, heuristic_cap, core_bound), 0)
 
-        logger.debug(
-            "KV cache heuristic: user_budget=%.2f GiB, cap=%.2f GiB "
+        logger.info(
+            "KV cache heuristic: user_budget=%.2f GiB, cap=%.2f GiB, "
+            "physical_core_bound=%.2f GiB "
             "(total_budget=%.2f GiB, total_hbm=%.2f GiB, bytes_used=%.2f GiB, "
-            "cap_fraction=%.2f), "
+            "resident=%.2f GiB, cap_fraction=%.2f, "
+            "graph_reserve=%.2f GiB per physical core), "
             "effective=%.2f GiB",
             user_budget / (1024**3),
             max(heuristic_cap, 0) / (1024**3),
+            core_bound / (1024**3),
             total_budget / (1024**3),
             total_hbm_bytes / (1024**3),
             bytes_used / (1024**3),
+            resident_bytes / (1024**3),
             cap_fraction,
+            self._get_graph_reserve_bytes() / (1024**3),
             available / (1024**3),
         )
 
@@ -1049,6 +1354,19 @@ class NeuronWorker(WorkerBase):
         local worker process. On Neuron device, queries runtime free HBM and
         applies gpu_memory_utilization.
 
+        Whichever heuristic runs, the result is capped by the bytes the served
+        configuration needs: a cache larger than the configured sequences can
+        fill buys nothing and costs device memory the compiled graph needs. That
+        need depends only on the configuration and the model's own KV cache
+        specs, so every mode computes the same number and the KV cache block
+        count is identical between CPU compilation and execution, which the
+        compilation cache requires.
+
+        A heuristic below the need raises instead of serving the smaller figure:
+        the returned value would otherwise depend on measured memory, the KV
+        cache tensors would take a shape the compiled graph does not have, and
+        the compilation cache would miss.
+
         Note: In vLLM v1, gpu_memory_utilization is applied inside the worker
         (not by vLLM core). The GPU worker does the same pattern.
 
@@ -1057,10 +1375,57 @@ class NeuronWorker(WorkerBase):
         """
         gpu_mem_util = self.cache_config.gpu_memory_utilization
         if envs.VLLM_NEURON_CPU_COMPILE:
-            return self._estimate_available_memory_neuron(gpu_mem_util)
-        if envs.VLLM_NEURON_CPU_MODE:
-            return self._determine_available_memory_cpu(gpu_mem_util)
-        return self._determine_available_memory_neuron(gpu_mem_util)
+            mode = "cpu-compile"
+            heuristic_bytes = self._estimate_available_memory_neuron(gpu_mem_util)
+        elif envs.VLLM_NEURON_CPU_MODE:
+            mode = "cpu"
+            heuristic_bytes = self._determine_available_memory_cpu(gpu_mem_util)
+        else:
+            mode = "neuron"
+            heuristic_bytes = self._determine_available_memory_neuron(gpu_mem_util)
+
+        need_bytes = self._kv_cache_need_bytes()
+        if need_bytes is None:
+            logger.warning(
+                "KV cache need unknown in %s mode: the model reports no KV cache "
+                "to size, so the memory heuristic stands at %.2f GiB",
+                mode,
+                heuristic_bytes / (1024**3),
+            )
+            return heuristic_bytes
+
+        footprint_bytes = self._kv_cache_footprint_bytes(need_bytes)
+        if footprint_bytes > heuristic_bytes:
+            raise RuntimeError(
+                f"The KV cache the served configuration needs does not fit the "
+                f"memory budget in {mode} mode. Need "
+                f"{need_bytes / (1024**3):.3f} GiB for "
+                f"{self.vllm_config.scheduler_config.max_num_seqs} sequence(s) of "
+                f"{self.vllm_config.model_config.max_model_len} tokens, allocated "
+                f"as {footprint_bytes / (1024**3):.3f} GiB once every recurrent "
+                f"layer holds its own state bank; budget "
+                f"{heuristic_bytes / (1024**3):.3f} GiB, of which the graph "
+                f"reserve holds back "
+                f"{self._get_graph_reserve_bytes() / (1024**3):.2f} GiB on each "
+                f"physical NeuronCore. Serving the smaller figure is refused "
+                f"because the KV cache tensors would take a shape the compiled "
+                f"graph does not have. Lower max_num_seqs or max_model_len, raise "
+                f"gpu_memory_utilization or "
+                f"VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION, or lower "
+                f"VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB if the graph is smaller "
+                f"than its default reserve."
+            )
+
+        logger.info(
+            "KV cache budget in %s mode: need=%.3f GiB, allocated=%.3f GiB, "
+            "heuristic=%.2f GiB, available=%.3f GiB",
+            mode,
+            need_bytes / (1024**3),
+            footprint_bytes / (1024**3),
+            heuristic_bytes / (1024**3),
+            need_bytes / (1024**3),
+        )
+        return need_bytes
 
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
         """
@@ -1737,7 +2102,13 @@ class NeuronWorker(WorkerBase):
                     kv_seg_size,
                 )
                 try:
-                    self.model_runner.warmup_prefill(bucket_size, kv_seg_size)
+                    run_warmup_on_all_ranks(
+                        "prefill",
+                        f"{bucket_size}/kv{kv_seg_size}",
+                        lambda: self.model_runner.warmup_prefill(
+                            bucket_size, kv_seg_size
+                        ),
+                    )
                     logger.info(
                         "  Successfully warmed up for prefill bucket %s "
                         "with kv_segment_size %s",
@@ -1875,7 +2246,13 @@ class NeuronWorker(WorkerBase):
                 ctx_bucket,
             )
             try:
-                self.model_runner.warmup_decode(batch_size, ctx_bucket=ctx_bucket)
+                run_warmup_on_all_ranks(
+                    "decode",
+                    f"b{batch_size}/s{ctx_bucket}",
+                    lambda: self.model_runner.warmup_decode(
+                        batch_size, ctx_bucket=ctx_bucket
+                    ),
+                )
                 logger.info(
                     "  Warmed up decode (batch=%s, seq=%s)",
                     batch_size,

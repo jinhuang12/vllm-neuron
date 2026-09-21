@@ -114,8 +114,20 @@ def _init_backend():
     from libtorch_neuronx_lite.compile.backend import compile
     from libtorch_neuronx_lite.compile.capture_backend import capture
 
-    if "neuron_libtorch" not in registry.list_backends():
-        registry.register_backend(compiler_fn=compile, name="neuron_libtorch")
+    # The compiler is registered inside the load stager: compiling a graph loads
+    # it into host memory, and a whole tensor-parallel group loading at one
+    # instant exhausts the host. Staging is a pass-through until a caller names
+    # the load it is about to run. The install takes the name whether lite's own
+    # import already holds it or not, wrapping what it finds, because a stager
+    # that loses the name stages nothing. The run is named here, before this
+    # process starts any worker, so every rank signals in one directory.
+    from vllm_neuron.vllm.patches.staged_neff_load import (
+        install_staged_compiler,
+        pin_this_run,
+    )
+
+    pin_this_run()
+    install_staged_compiler(registry, "neuron_libtorch", compile)
 
     if "neuron_libtorch_graph_capture" not in registry.list_backends():
         registry.register_backend(
@@ -239,3 +251,13 @@ apply_port_hold_patch()
 from vllm_neuron.vllm.patches.pin_memory_patch import apply_pin_memory_patch
 
 apply_pin_memory_patch()
+
+# A hybrid model whose linear-attention layers report a recurrent-state spec
+# cannot share one KV page size with its attention layers: vLLM's page-size
+# unification offers its padding branch only to AttentionSpec, and MambaSpec is
+# not one, so engine start raises. The widening has to be live in the EngineCore
+# subprocess, which never calls check_and_update_config, so it is applied here at
+# import time. See the patch module docstring.
+from vllm_neuron.vllm.patches.kv_spec_patch import apply_kv_spec_patch
+
+apply_kv_spec_patch()

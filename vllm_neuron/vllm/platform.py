@@ -129,6 +129,7 @@ class NeuronPlatform(Platform):
         "neuron_quant",
         "compressed-tensors",
         "modelopt",
+        "fp8",
     ]
     # Neuron quantization paths that CPU-dequant compressed-tensors weights to
     # BF16 on the loader thread. On these paths the device only ever sees BF16
@@ -162,13 +163,48 @@ class NeuronPlatform(Platform):
         """Register Neuron model architectures before ModelConfig validation."""
         import os
 
-        if os.environ.get("VLLM_NEURON_SYNTHETIC_MODEL") == "1":
-            from vllm.model_executor.models.registry import ModelRegistry
+        from vllm.model_executor.models.registry import ModelRegistry
 
+        # Registered as an import string rather than a class: this hook runs
+        # before ModelConfig validation, so it must not import the model
+        # package. The string resolves through the package re-export.
+        ModelRegistry.register_model(
+            "Glm5NextForConditionalGeneration",
+            "vllm_neuron.model.glm5_next:Glm5NextForConditionalGeneration",
+        )
+
+        if os.environ.get("VLLM_NEURON_SYNTHETIC_MODEL") == "1":
             ModelRegistry.register_model(
                 "SyntheticNeuronModel",
                 "vllm_neuron.model.synthetic:SyntheticNeuronModel",
             )
+
+    #: KV-cache page size this platform defaults to when the operator supplies
+    #: none.
+    UNIFORM_NEURON_PAGE = 32
+
+    @classmethod
+    def resolved_uniform_page(cls, vllm_config: "VllmConfig") -> int:
+        """Return the page size a uniform-page run will allocate with.
+
+        The default applies only when the operator supplied no block size:
+        ``--block-size 64`` latches ``user_specified_block_size``, and
+        ``update_block_size_for_backend`` then leaves the page alone. Callers
+        may use this before that method has run, so a caller that only needs to
+        report the page does not have to assume the default.
+
+        Args:
+            vllm_config: Config whose ``cache_config`` holds the operator's
+                block size, when one was given.
+
+        Returns:
+            The operator's block size if one was supplied, else
+            :attr:`UNIFORM_NEURON_PAGE`.
+        """
+        cache_config = vllm_config.cache_config
+        if cache_config.user_specified_block_size:
+            return int(cache_config.block_size)
+        return cls.UNIFORM_NEURON_PAGE
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: "VllmConfig") -> None:
@@ -176,7 +212,7 @@ class NeuronPlatform(Platform):
         cache_config = vllm_config.cache_config
         if cache_config.user_specified_block_size:
             return
-        cache_config.block_size = 32
+        cache_config.block_size = cls.UNIFORM_NEURON_PAGE
 
     @classmethod
     def apply_config_platform_defaults(cls, vllm_config: "VllmConfig") -> None:
@@ -337,6 +373,171 @@ class NeuronPlatform(Platform):
             )
         cls._enable_structured_outputs = enable_structured_outputs
 
+        # ---- Which architectures get the hybrid KDA/DSA KV cache ------------
+        # enable_hybrid_kv_cache (vllm_neuron/model/neuron_config.py) is the
+        # platform's to set for the architectures that need it. Deciding it here,
+        # above the block-size resolution below, keeps that resolution unaware of
+        # how the flag was reached.
+        #
+        # The tensor-parallel degree is checked before turning the flag on,
+        # because the block size below is only valid at that degree. The
+        # bfloat16 KV-cache requirement is deliberately not pre-checked: a run
+        # at the right degree with another KV dtype should hit the explicit
+        # error below instead of falling out of this opt-in unremarked.
+        HYBRID_KV_REGISTERED_TP_DEGREE = 64
+        architectures = getattr(model_config.hf_config, "architectures", None) or ()
+        if (
+            # The same architecture string pre_register_and_update registers
+            # above; the config-side spelling glm5_next is not a second test.
+            "Glm5NextForConditionalGeneration" in architectures
+            # Presence, not truthiness: an explicit False is an operator choice
+            # to honour, and an explicit True passes through untouched.
+            and "enable_hybrid_kv_cache" not in neuron_config
+        ):
+            resolved_tp_size = vllm_config.parallel_config.tensor_parallel_size
+            if resolved_tp_size == HYBRID_KV_REGISTERED_TP_DEGREE:
+                # Store the mapping back under additional_config: the .get above
+                # hands back a fresh {} when the key is absent, so without this
+                # a later NeuronConfig would not see the flag.
+                neuron_config["enable_hybrid_kv_cache"] = True
+                vllm_config.additional_config["neuron_config"] = neuron_config
+            else:
+                # Warn rather than fail: the run is valid, it just keeps the
+                # uniform page. None of the checks below run, so without the
+                # warning this is indistinguishable from a hybrid cache.
+                #
+                # The page is read, not assumed to be the default: an operator
+                # block size latches user_specified_block_size,
+                # update_block_size_for_backend then returns without touching
+                # the page, and the run allocates the operator's value. Anyone
+                # sizing KV memory off this warning needs the page that will
+                # really be used, and where it came from.
+                uniform_page = cls.resolved_uniform_page(vllm_config)
+                page_origin = (
+                    "the block size supplied on the command line"
+                    if vllm_config.cache_config.user_specified_block_size
+                    else "the default update_block_size_for_backend sets"
+                )
+                logger.warning(
+                    "Hybrid KDA/DSA KV cache left OFF for "
+                    "Glm5NextForConditionalGeneration: the default block "
+                    "size is valid only at tensor_parallel_size=%d and this "
+                    "run resolved tensor_parallel_size=%d, so the KV cache "
+                    "keeps the uniform %d-token page -- %s. To enable it at "
+                    "this degree, derive a block size for that degree and set "
+                    "enable_hybrid_kv_cache explicitly.",
+                    HYBRID_KV_REGISTERED_TP_DEGREE,
+                    resolved_tp_size,
+                    uniform_page,
+                    page_origin,
+                )
+
+        # ---- Hybrid KDA/DSA KV-cache block size -----------------------------
+        # Resolved here, before _validate_dcp_config reads
+        # cache_config.block_size for its ownership stride, so a hybrid run
+        # validates DCP against the block size it will actually allocate with.
+        #
+        # The 128-token page is valid only at tensor-parallel degree 64 with a
+        # bfloat16 KV cache: it comes from the per-rank KDA recurrent-state page
+        # at that degree and dtype, so any other combination needs its own
+        # derivation. Both conditions are checked below. The DSA indexer holds a
+        # separate cache whose page size this value does not describe.
+        #
+        # Each check raises rather than warns. Nothing downstream on Neuron
+        # catches an under-sized page: update_block_size_for_backend hard-sets
+        # 32 and never calls Platform._align_hybrid_block_size, so a warning
+        # would leave the run on a page too small for the KDA recurrent state,
+        # which surfaces as corrupt output far from its cause.
+        if neuron_config.get("enable_hybrid_kv_cache", False):
+            cache_config = vllm_config.cache_config
+
+            # hybrid_kv_block_size is documented as an override, so an operator
+            # value is honoured once it clears both constraints the 128-token
+            # default was derived against: the KDA state page needs at least
+            # HYBRID_BLOCK_SIZE_FLOOR_TOKENS tokens, and the DSA indexer kernel
+            # addresses the page in multiples of HYBRID_BLOCK_SIZE_GRANULARITY.
+            #
+            # `is None`, not falsiness: an operator 0 has to be reported, never
+            # silently replaced by the default.
+            HYBRID_BLOCK_SIZE_FLOOR_TOKENS = 67  # smallest page the KDA state fits
+            HYBRID_BLOCK_SIZE_GRANULARITY = 64  # DSA indexer kernel granularity
+            operator_block_size = neuron_config.get("hybrid_kv_block_size")
+            if operator_block_size is None:
+                hybrid_block_size = 128
+            else:
+                hybrid_block_size = operator_block_size
+                if hybrid_block_size < HYBRID_BLOCK_SIZE_FLOOR_TOKENS:
+                    raise ValueError(
+                        f"The operator-supplied hybrid KDA/DSA KV-cache block "
+                        f"size {hybrid_block_size} is below the KDA "
+                        f"state-page floor of "
+                        f"{HYBRID_BLOCK_SIZE_FLOOR_TOKENS} tokens. A shorter "
+                        f"page cannot hold the KDA recurrent state, and nothing "
+                        f"downstream on Neuron catches an under-sized page. "
+                        f"Supply a value at or above the floor, or unset "
+                        f"hybrid_kv_block_size to use the default."
+                    )
+                if hybrid_block_size % HYBRID_BLOCK_SIZE_GRANULARITY:
+                    raise ValueError(
+                        f"The operator-supplied hybrid KDA/DSA KV-cache block "
+                        f"size {hybrid_block_size} is not a multiple of the "
+                        f"DSA indexer kernel granularity "
+                        f"{HYBRID_BLOCK_SIZE_GRANULARITY}. Supply a "
+                        f"multiple of that granularity, or unset "
+                        f"hybrid_kv_block_size to use the default."
+                    )
+
+            tp_size = vllm_config.parallel_config.tensor_parallel_size
+            if tp_size != 64:
+                raise ValueError(
+                    f"The hybrid KDA/DSA KV-cache block size "
+                    f"{hybrid_block_size} is supported only at "
+                    f"tensor_parallel_size=64; got tensor_parallel_size="
+                    f"{tp_size}. The value is derived from the per-rank KDA "
+                    f"recurrent-state page at TP=64, so another TP degree "
+                    f"invalidates it. Derive a block size for this TP "
+                    f"degree before enabling enable_hybrid_kv_cache."
+                )
+
+            # Resolve the KV cache dtype the same way vLLM's own hybrid
+            # alignment does (vllm/platforms/interface.py): "auto" follows the
+            # model dtype, anything else maps through STR_DTYPE_TO_TORCH_DTYPE.
+            # An unmapped spelling resolves to None and so fails the check below
+            # instead of passing unexamined.
+            from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+
+            if cache_config.cache_dtype == "auto":
+                kv_cache_dtype = model_config.dtype
+            else:
+                kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE.get(cache_config.cache_dtype)
+            if kv_cache_dtype is not torch.bfloat16:
+                raise ValueError(
+                    f"The hybrid KDA/DSA KV-cache block size "
+                    f"{hybrid_block_size} is supported only with a bfloat16 KV "
+                    f"cache; the resolved KV cache dtype is {kv_cache_dtype} "
+                    f"(cache_dtype={cache_config.cache_dtype!r}). The value is "
+                    f"derived from the bf16 per-token page, so another KV dtype "
+                    f"invalidates it and needs its own derivation."
+                )
+
+            # Both conditions hold, so publish the block size. The KV-cache
+            # specs derive their page sizes from shapes and dtypes, so nothing
+            # here touches cache_config.mamba_page_size_padded or calls
+            # Platform._align_hybrid_block_size.
+            cache_config.block_size = hybrid_block_size
+            # update_block_size_for_backend runs later, from the executor rather
+            # than from VllmConfig.__post_init__, and hard-sets 32 unless this
+            # latch is set -- which would undo the line above before a single
+            # block is allocated.
+            cache_config.user_specified_block_size = True
+            logger.info(
+                "Hybrid KDA/DSA KV cache enabled: block_size=%d "
+                "(tensor_parallel_size=%d, kv_cache_dtype=%s)",
+                hybrid_block_size,
+                tp_size,
+                kv_cache_dtype,
+            )
+
         # Component DP on dense models needs the MoE/DP engine path to
         # preserve data_parallel_size across engine core subprocesses.
         if cls._has_neuron_component_dp(vllm_config):
@@ -402,6 +603,8 @@ class NeuronPlatform(Platform):
                 merge_factor = get_vision_token_merge_factor(model_config.hf_config)
                 cls._max_embeds_per_image = max(buckets) // max(merge_factor, 1)
 
+        cls._resolve_sampling_from_the_model_class(vllm_config)
+
         if envs.VLLM_NEURON_RUNTIME_INPUT_SNAPSHOT_ENABLE:
             # Capture copies a forward's inputs to host via a standalone op run
             # just before a plain execute. Under async scheduling the input
@@ -440,6 +643,55 @@ class NeuronPlatform(Platform):
                 "scheduler_cls already set to non-default: %s, "
                 "NOT overriding with custom Neuron scheduler",
                 scheduler_config.scheduler_cls,
+            )
+
+    @classmethod
+    def _resolve_sampling_from_the_model_class(cls, vllm_config: "VllmConfig") -> None:
+        """Record model capabilities and turn off sampling the model cannot do.
+
+        A model class that sets ``supports_on_device_sampling = False`` returns
+        logits, not token ids, so the async runner has nothing to read back from
+        the device. On such a model an explicit on-device sampling config is
+        refused and async scheduling is turned off. vLLM resolves the
+        async-scheduling default before this hook runs, so an explicit
+        ``--async-scheduling`` cannot be told apart from the default here; both
+        are turned off, and the runner refuses the combination as a backstop.
+        """
+        from vllm.model_executor.models.registry import ModelRegistry
+
+        model_config = vllm_config.model_config
+        model_cls, arch = ModelRegistry.resolve_model_cls(
+            model_config.architectures, model_config=model_config
+        )
+        # Recorded for every model, device sampler or not, and overwriting any
+        # caller value: a caller must not be able to claim a bucketing mode the
+        # model's kernels do not support.
+        neuron_config = vllm_config.additional_config.setdefault("neuron_config", {})
+        neuron_config["_model_supports_independent_prefill_buckets"] = bool(
+            getattr(model_cls, "supports_independent_prefill_buckets", False)
+        )
+        if getattr(model_cls, "supports_on_device_sampling", True):
+            return
+        if neuron_config.get("on_device_sampling_config") is not None:
+            raise ValueError(
+                f"{arch} has no on-device sampler: additional_config.neuron_config."
+                "on_device_sampling_config must be null or absent, got "
+                f"{neuron_config['on_device_sampling_config']!r}"
+            )
+        neuron_config["on_device_sampling_config"] = None
+        vllm_config.additional_config["neuron_config"] = neuron_config
+        logger.info(
+            "On-device sampling is off: %s has no on-device sampler; the vLLM Sampler "
+            "on the host samples its logits",
+            arch,
+        )
+        scheduler_config = vllm_config.scheduler_config
+        if scheduler_config.async_scheduling:
+            scheduler_config.async_scheduling = False
+            logger.info(
+                "Async scheduling is off: %s has no on-device sampler, and the async "
+                "runner reads token ids from the device; NeuronScheduler runs synchronously",
+                arch,
             )
 
     @classmethod
@@ -489,13 +741,54 @@ class NeuronPlatform(Platform):
         """Validate quantization config. Only KV cache quantization
         (q_scale/k_scale/v_scale) is supported for compressed-tensors, except on
         Neuron CPU-dequant paths (e.g. quantization="mxfp8") where the device
-        never sees on-device weight/activation quant."""
+        never sees on-device weight/activation quant.
+
+        Two further branches sit between the CPU-dequant exemption and the
+        compressed-tensors check. Both read the checkpoint's own
+        ``quant_method``, not what the operator asked for:
+
+        * Block-scaled fp8 is admitted, and the admission is logged. A
+          ``quant_method="fp8"`` checkpoint carrying ``weight_block_size`` is
+          what this platform's block-fp8 path consumes. The log is the only way
+          to tell an examined, admitted checkpoint from one that merely fell
+          past the compressed-tensors check unexamined.
+        * MX quantization methods are refused. The compile target is trn2
+          (gen3), whose matmul substrate has no MX path, so an MX checkpoint
+          must fail at config time with a readable message rather than reach a
+          kernel. The refusal runs after the CPU-dequant exemption, which is
+          keyed on ``neuron_config["quantization"]``, so CPU-dequant
+          configurations keep working.
+        """
         neuron_config = vllm_config.additional_config.get("neuron_config", {})
         if neuron_config.get("quantization") in cls._cpu_dequant_quantizations:
             return
         model_config = vllm_config.model_config
         quant_cfg = getattr(model_config.hf_config, "quantization_config", None)
-        if not quant_cfg or quant_cfg.get("quant_method") != "compressed-tensors":
+        if not quant_cfg:
+            return
+        quant_method = quant_cfg.get("quant_method")
+        # Substring, not prefix: the MX family is spelled both ways in vLLM's
+        # own registry ("mxfp8" and "modelopt_mxfp8"), so a prefix test would
+        # admit half of it. No method this platform allowlists contains "mx".
+        if isinstance(quant_method, str) and "mx" in quant_method.lower():
+            raise ValueError(
+                f"Neuron does not support MX quantization: quant_method="
+                f"{quant_method!r}. The compile target is trn2 (gen3), whose "
+                f"matmul substrate has no MX path. Use one of "
+                f"{cls.supported_quantization}, or select a Neuron CPU-dequant "
+                f"path with additional_config['neuron_config']['quantization']."
+            )
+        if quant_method == "fp8":
+            weight_block_size = quant_cfg.get("weight_block_size")
+            if weight_block_size:
+                logger.info(
+                    "Admitting block-scaled fp8 checkpoint: "
+                    "weight_block_size=%s, activation_scheme=%s",
+                    weight_block_size,
+                    quant_cfg.get("activation_scheme"),
+                )
+            return
+        if quant_method != "compressed-tensors":
             return
         for group_name, group in quant_cfg.get("config_groups", {}).items():
             if group.get("weights"):

@@ -12,8 +12,10 @@ vllm==0.24.0
 # Pin <0.137: 0.137's `_IncludedRouter` breaks prometheus-fastapi-instrumentator
 fastapi[standard]>=0.115.0,<0.137
 
-# Force transformers v5 upgrade
-transformers>=5.5.1,<6.0.0
+# Force transformers v5 upgrade. The floor is 5.16.1 because that is the first release with the
+# glm5_next image, video and processor classes the GLM-5.3-Flash vision path uses. vllm==0.24.0 asks
+# only for transformers>=5.5.3, so this floor cannot conflict with the pinned vLLM.
+transformers>=5.16.1,<6.0.0
 
 # Prometheus metrics
 prometheus_client
