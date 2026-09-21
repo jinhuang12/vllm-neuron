@@ -1,0 +1,110 @@
+# SPDX-License-Identifier: Apache-2.0
+"""The sentinel ordering, spelled without a sort."""
+
+import ast
+import inspect
+import pathlib
+import textwrap
+
+import pytest
+import torch
+
+pytestmark = [pytest.mark.fast, pytest.mark.forked]
+
+
+#: The method under test, located by name so a moved line changes nothing here.
+METHOD = "_canonical_sentinel_order"
+
+#: The method calls this target lowers none of, read as METHOD calls so the free
+#: ``cumsum`` this package ships in place of ``torch.cumsum`` is not caught with them.
+FORBIDDEN_METHODS = ("sort", "argsort", "msort", "topk", "cumsum")
+
+#: The row counts the two refused graphs carried, plus a small one a reader can check by
+#: hand. 2048 is prefill's token count and 1 is decode's.
+ROWS = (1, 7, 2048)
+
+#: The widths: the refused graphs' 512, and a small one whose rows fit in a message.
+WIDTHS = (8, 512)
+
+
+def argsort_reference(pool_ids):
+    """The ordering an argsort spells out, kept here as the oracle."""
+    k = int(pool_ids.shape[1])
+    position = torch.arange(k, device=pool_ids.device, dtype=torch.int64)
+    key = (pool_ids < 0).to(torch.int64) * k + position
+    return pool_ids.gather(1, key.argsort(dim=1))
+
+
+def patterns(rows, k):
+    """``(name, pool_ids)`` per sentinel layout worth separating."""
+    generator = torch.Generator().manual_seed(rows * 1000 + k)
+    ids = torch.randint(0, 1 << 20, (rows, k), generator=generator, dtype=torch.int32)
+    mixed = ids.clone()
+    mixed[torch.rand(rows, k, generator=generator) < 0.4] = -1
+    alternating = ids.clone()
+    alternating[:, ::2] = -1
+    single_real = torch.full((rows, k), -1, dtype=torch.int32)
+    single_real[:, k // 2] = ids[:, k // 2]
+    return (
+        ("mixed", mixed),
+        ("all_sentinel", torch.full((rows, k), -1, dtype=torch.int32)),
+        ("no_sentinel", ids.clone()),
+        ("single_real", single_real),
+        ("alternating", alternating),
+    )
+
+
+@pytest.fixture(scope="module")
+def ordering():
+    """The ordering under test, taken off the indexer rather than re-implemented."""
+    from vllm_neuron.model.glm5_next.model_fp8 import Glm5NextDSAIndexer
+
+    return getattr(Glm5NextDSAIndexer, METHOD)
+
+
+def test_a_the_counted_order_equals_the_argsort_order(ordering) -> None:
+    """Every shape and every sentinel layout gives the argsort form's own answer."""
+    for rows in ROWS:
+        for k in WIDTHS:
+            for name, pool_ids in patterns(rows, k):
+                got = ordering(pool_ids)
+                want = argsort_reference(pool_ids)
+                assert torch.equal(got, want), (
+                    f"rows={rows} k={k} {name}: the counted order differs from the "
+                    f"argsort order it replaces"
+                )
+
+
+def test_b_the_result_keeps_the_inputs_dtype_and_shape(ordering) -> None:
+    """The ordering permutes and does not cast: the sentinel stage hands int32. """
+    for dtype in (torch.int32, torch.int64):
+        pool_ids = torch.tensor([[5, -1, 7, -1]], dtype=dtype)
+        got = ordering(pool_ids)
+        assert got.dtype == dtype, f"input {dtype} came back as {got.dtype}"
+        assert tuple(got.shape) == tuple(pool_ids.shape)
+
+
+def test_c_the_method_body_calls_no_unsupported_operation(ordering) -> None:
+    """Both refused operations are absent, and the body hands the ordering to its kernel
+    seam once.
+    """
+    source = textwrap.dedent(inspect.getsource(ordering))
+    methods, names = [], []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Attribute):
+            methods.append(node.func.attr)
+        elif isinstance(node.func, ast.Name):
+            names.append(node.func.id)
+    refused = [m for m in methods if m in FORBIDDEN_METHODS]
+    assert not refused, (
+        f"{METHOD} still calls {refused} as a method; this target lowers none of them"
+    )
+    assert names.count("cumsum") == 0, (
+        f"{METHOD} makes {names.count('cumsum')} free cumsum calls; the counts run inside "
+        f"the kernel seam, and a host cumsum here hands the compiler a layout to choose"
+    )
+    assert names.count("dsa_sentinel_order") == 1, (
+        f"{METHOD} calls dsa_sentinel_order {names.count('dsa_sentinel_order')} times, not once"
+    )

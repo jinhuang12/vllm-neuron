@@ -1,0 +1,16 @@
+{
+  "fixture": "hf-config.json",
+  "fixture_form": "byte-identical copy",
+  "source_url": "https://huggingface.co/zai-org/GLM-5.3-Flash/raw/main/config.json",
+  "upstream_repo": "zai-org/GLM-5.3-Flash",
+  "upstream_revision": "04c4e9e95c5da8862dced7e5056455116f83a7e0",
+  "upstream_revision_caveat": "the fetch used the ref 'main' rather than the sha, so the sha above is what main resolved to at fetch time, corroborated by the published file's byte count (69416) only",
+  "sha256": "bb8f01c42cb92a52ca72e65afb4d5bd8d11aef083cd210e8de25dfb904f23e9f",
+  "bytes": 69416,
+  "holds_weights": false,
+  "contents": "the whole published config: text_config (45-entry layer_types, 288 routed experts), vision_config, and quantization_config with all five keys including the 1509-entry modules_to_not_convert skip list",
+  "kept_whole_because": "the port compares against the 1509-entry skip list and against the real text_config, and the trimmed fixtures/config.json carries neither",
+  "relationship_to_the_trimmed_fixture": "fixtures/config.json is a trimmed transcription of the architecture fields; this file is the only copy of the skip list in the repository",
+  "why_a_sidecar_and_not_an_in_file_block": "this file is a byte-identical copy, so a provenance key added inside it would change the very bytes the provenance claims",
+  "pinned_by": "test_weight_loaders.py::test_real_config_fixture_is_pinned_by_digest reads the sha256 and byte count off this file and compares them to the values above, so an edit to the fixture fails a test"
+}

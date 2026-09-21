@@ -167,6 +167,42 @@ class NeuronConfig:
     # for the packed layout (currently GPT-OSS and Llama3, incl. Eagle3) support
     # it; left off by default so other models keep the standard 4-D FP8 cache.
     fp8_packed_kv: bool = False
+    # Opt-in to the hybrid KV cache, for a stack whose layers do not share one
+    # cache geometry: linear-attention (KDA) layers carry a recurrent state and
+    # sparse-attention (DSA) layers carry an MLA latent. The platform enables it
+    # for the architectures that need it; left off by default so other models
+    # keep the uniform cache.
+    enable_hybrid_kv_cache: bool = False
+    # Cache block size to use when the hybrid cache is enabled. None = no
+    # override, so the backend default stands.
+    hybrid_kv_block_size: int | None = None
+    # dtype for the KDA recurrent-state buffers, held as a torch dtype NAME (e.g.
+    # "bfloat16") so it survives a JSON additional_config round-trip.
+    # None = follow the model's own dtype.
+    kda_state_dtype: str | None = None
+    # Chunk length for the KDA chunked-recurrence path. The recurrence is exact
+    # at any chunk length, so this is a tuning dial and not a correctness input.
+    # None = let the layer choose.
+    kda_state_chunk_size: int | None = None
+    # Sinkhorn iteration count for the multi-hyper-connection (mHC)
+    # normalization, trading device time against how tightly the normalized
+    # matrix converges to doubly-stochastic. None = use the checkpoint's value.
+    mhc_sinkhorn_iters: int | None = None
+    # Numerical-stability epsilon for the same normalization; a lower-precision
+    # device path may need it raised. None = use the checkpoint's value.
+    mhc_eps: float | None = None
+    # Opt-in to blockwise (2-D block-scaled) FP8 weights, as distinct from the
+    # per-tensor FP8 and MX paths this plugin already carries. The
+    # quantization-recognition path enables it from the checkpoint.
+    blockwise_fp8: bool = False
+    # Floor applied to a block scale before it is stored, so a denormal scale
+    # cannot collapse a whole block. None = use the load path's floor constant.
+    block_quant_scale_min: float | None = None
+    # Whether the model's kernels accept KV segment buckets independent of the
+    # query buckets. Resolved by the platform from the model class rather than
+    # taken from the caller, who must not be able to claim a bucketing mode the
+    # kernels do not support.
+    _model_supports_independent_prefill_buckets: bool = False
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> "NeuronConfig":
@@ -244,6 +280,17 @@ class NeuronConfig:
                 "enable_structured_outputs", False
             ),
             fp8_packed_kv=config_dict.get("fp8_packed_kv", False),
+            enable_hybrid_kv_cache=config_dict.get("enable_hybrid_kv_cache", False),
+            hybrid_kv_block_size=config_dict.get("hybrid_kv_block_size"),
+            kda_state_dtype=config_dict.get("kda_state_dtype"),
+            kda_state_chunk_size=config_dict.get("kda_state_chunk_size"),
+            mhc_sinkhorn_iters=config_dict.get("mhc_sinkhorn_iters"),
+            mhc_eps=config_dict.get("mhc_eps"),
+            blockwise_fp8=config_dict.get("blockwise_fp8", False),
+            block_quant_scale_min=config_dict.get("block_quant_scale_min"),
+            _model_supports_independent_prefill_buckets=config_dict.get(
+                "_model_supports_independent_prefill_buckets", False
+            ),
         )
 
     def __post_init__(self):

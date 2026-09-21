@@ -1,0 +1,761 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Tests for the GLM-5.3-Flash vision preprocessing bridge.
+
+Every grid, row count and token count is measured against the transformers processors
+themselves, constructed with no arguments, so nothing here needs a checkpoint or a network.
+Three image sizes cover the three canvas regimes -- plain, below the floor (upscaled) and above
+the ceiling (cut down by the processor's search) -- and five video cases cover the frame
+padding with ``do_sample_frames`` pinned False.
+
+Whether the pixels were scaled or merely padded is not in the processor's output, so the
+resample tests run the same geometry twice over two different constant inputs: elements the two
+runs agree on are padding, because padding does not depend on the content, and elements they
+differ on are content. That count is an integer and needs no tolerance.
+"""
+
+from __future__ import annotations
+
+import math
+
+import pytest
+import torch
+
+from vllm_neuron.model.glm5_next.utils.vision_preprocessing import (
+    REGIME_ABOVE_CEILING,
+    REGIME_BELOW_FLOOR,
+    REGIME_PLAIN,
+    SMART_RESIZE_MODULE,
+    SMART_RESIZE_NAME,
+    Glm5NextDummyInputsBuilder,
+    Glm5NextMultiModalProcessor,
+    Glm5NextProcessingInfo,
+    GridConstants,
+    build_mm_fields_config,
+    describe_resample,
+    image_grid_spec,
+    require_transformers_smart_resize,
+    resolve_canvas,
+    video_grid_spec,
+)
+
+# (name, height, width, regime, grid_thw, patch rows, merged tokens, resampled)
+#
+# Regime B's answer is 8 and not 4 or 12 for two reasons: the image path tells the resizer there
+# are ``temporal_patch_size`` frames rather than one, and the below-floor scale for 29x29 is
+# ``sqrt(25088 / (2 * 29 * 29)) = 112 / 29`` exactly.
+IMAGE_CASES = (
+    ("regime_a_plain", 784, 1036, REGIME_PLAIN, (1, 56, 74), 4144, 1036, False),
+    ("regime_b_below_floor", 29, 29, REGIME_BELOW_FLOOR, (1, 8, 8), 64, 16, True),
+    ("regime_c_above_ceiling", 2800, 2800, REGIME_ABOVE_CEILING, (1, 178, 178), 31684, 7921, True),
+)
+
+# (name, num_frames, height, width, grid_thw, patch rows, merged tokens)
+VIDEO_CASES = (
+    ("three_frames", 3, 112, 112, (2, 8, 8), 128, 32),
+    ("eight_frames", 8, 112, 112, (4, 8, 8), 256, 64),
+    ("one_frame", 1, 112, 112, (1, 8, 8), 64, 16),
+    ("two_frames", 2, 112, 112, (1, 8, 8), 64, 16),
+    ("one_frame_below_floor", 1, 60, 40, (1, 14, 10), 140, 35),
+)
+
+# All three image sizes above are multiples of the 28-pixel canvas alignment, so all three pad
+# by zero. This one does not, which is what gives the pad count something to find.
+PADDING_CONTROL = ("padding_control", 800, 1000)
+
+# The two constant pixel values the resample tests run the same geometry over. Any two distinct
+# values work; these are mid-range so neither can be confused with the zero padding.
+CONTENT_VALUE_A = 200
+CONTENT_VALUE_B = 100
+
+# (case name, height, width, regime, patch count at patch_expand_factor 1, count at 2,
+# transformers' public counter). The public counter appears once because it drops
+# ``patch_expand_factor``: it answers the same number whatever the factor is.
+PATCH_COUNT_CASES = (
+    ("aligned_to_both_factors", 448, 448, REGIME_PLAIN, 1024, 1024, 1024),
+    ("aligned_to_28_only", 420, 336, REGIME_PLAIN, 720, 768, 720),
+    ("tiny_floor_bound", 60, 40, REGIME_BELOW_FLOOR, 80, 320, 80),
+    ("tiny_square", 32, 32, REGIME_BELOW_FLOOR, 64, 256, 64),
+    ("odd_mid_size", 500, 333, REGIME_PLAIN, 864, 864, 864),
+    ("huge_ceiling_bound", 8000, 6000, REGIME_ABOVE_CEILING, 31724, 126896, 31724),
+    ("wide_strip", 1400, 56, REGIME_PLAIN, 400, 400, 400),
+)
+
+# The one case whose real-pixel arm is skipped: an 8000x6000 uint8 image is 144 million pixels
+# and resampling it on CPU costs more than the reading is worth. Its arithmetic arm still runs,
+# and regime C is measured against the real processor at 2800x2800.
+TOO_BIG_FOR_REAL_PIXELS = "huge_ceiling_bound"
+
+
+@pytest.fixture(scope="module")
+def glm5_next_pkg():
+    import transformers.models.glm5_next as pkg
+
+    return pkg
+
+
+@pytest.fixture(scope="module")
+def image_oracle(glm5_next_pkg):
+    return glm5_next_pkg.Glm5NextImageProcessor()
+
+
+@pytest.fixture(scope="module")
+def video_oracle(glm5_next_pkg):
+    return glm5_next_pkg.Glm5NextVideoProcessor()
+
+
+@pytest.fixture(scope="module")
+def image_consts(image_oracle):
+    return GridConstants.from_processor(image_oracle)
+
+
+@pytest.fixture(scope="module")
+def video_consts(video_oracle):
+    return GridConstants.from_processor(video_oracle)
+
+
+def _run_image_oracle(oracle, height, width, value=CONTENT_VALUE_A):
+    image = torch.full((3, height, width), value, dtype=torch.uint8)
+    return oracle(images=[image], return_tensors="pt")
+
+
+def _run_video_oracle(oracle, num_frames, height, width, value=CONTENT_VALUE_A):
+    video = torch.full((num_frames, 3, height, width), value, dtype=torch.uint8)
+    return oracle(videos=[video], do_sample_frames=False, return_tensors="pt")
+
+
+@pytest.mark.parametrize(
+    "name,height,width,regime,grid,rows,tokens,resampled", IMAGE_CASES,
+    ids=[c[0] for c in IMAGE_CASES],
+)
+def test_image_grid_matches_oracle_and_closed_form(
+    image_oracle, image_consts, name, height, width, regime, grid, rows, tokens, resampled
+):
+    """The bridge's grid, the processor's own grid and the expected numbers all agree."""
+    spec = image_grid_spec(image_consts, height, width)
+    out = _run_image_oracle(image_oracle, height, width)
+
+    oracle_grid = tuple(int(v) for v in out["image_grid_thw"][0].tolist())
+    oracle_rows = int(out["pixel_values"].shape[0])
+
+    assert spec.thw == grid, f"{name}: the bridge's grid {spec.thw} is not the expected {grid}"
+    assert oracle_grid == grid, f"{name}: the oracle's grid {oracle_grid} is not {grid}"
+    assert spec.num_patch_rows == rows
+    assert oracle_rows == rows, f"{name}: the oracle produced {oracle_rows} rows, expected {rows}"
+    assert spec.num_merged_tokens == tokens
+    assert spec.regime == regime, f"{name}: the bridge calls it regime {spec.regime}, not {regime}"
+
+    record = describe_resample(
+        image_consts, modality="image", num_frames=image_consts.temporal_patch_size,
+        height=height, width=width,
+    )
+    assert record.resampled is resampled, f"{name}: {record.describe()}"
+
+
+def test_the_image_cases_are_three_different_regimes():
+    """Three sizes that took the same branch would be one case measured three times."""
+    regimes = {case[3] for case in IMAGE_CASES}
+    assert regimes == {REGIME_PLAIN, REGIME_BELOW_FLOOR, REGIME_ABOVE_CEILING}, regimes
+    grids = {case[4] for case in IMAGE_CASES}
+    assert len(grids) == len(IMAGE_CASES), f"two image cases share a grid: {grids}"
+
+
+def test_regime_b_is_not_the_plain_answer(image_consts):
+    """29x29 must not produce the 4x4 a plain reading of ceil(29/28) gives, nor the 12x12 a
+    one-frame reading of the below-floor branch gives. Both wrong answers are named so the
+    right one is not a coincidence."""
+    spec = image_grid_spec(image_consts, 29, 29)
+    assert spec.grid_h == 8 and spec.grid_w == 8
+    assert (spec.grid_h, spec.grid_w) != (4, 4)
+    assert (spec.grid_h, spec.grid_w) != (12, 12)
+
+
+def test_regime_c_honours_the_ceiling_it_was_cut_to(image_consts):
+    """The cut-down canvas must sit under the token ceiling, and one alignment step more must not."""
+    spec = image_grid_spec(image_consts, 2800, 2800)
+    assert spec.num_merged_tokens <= image_consts.max_image_tokens
+    one_step_more = spec.canvas_height + image_consts.factor
+    refused = image_consts.temporal_patch_size * one_step_more * one_step_more
+    assert refused > image_consts.ceiling_pixels
+
+
+@pytest.mark.parametrize(
+    "name,num_frames,height,width,grid,rows,tokens", VIDEO_CASES,
+    ids=[c[0] for c in VIDEO_CASES],
+)
+def test_video_grid_matches_oracle_and_closed_form(
+    video_oracle, video_consts, name, num_frames, height, width, grid, rows, tokens
+):
+    """The bridge's video grid, the video processor's own grid and the expected numbers agree."""
+    spec = video_grid_spec(video_consts, num_frames, height, width)
+    out = _run_video_oracle(video_oracle, num_frames, height, width)
+
+    oracle_grid = tuple(int(v) for v in out["video_grid_thw"][0].tolist())
+    oracle_rows = int(out["pixel_values_videos"].shape[0])
+
+    assert spec.thw == grid, f"{name}: the bridge's grid {spec.thw} is not the expected {grid}"
+    assert oracle_grid == grid, f"{name}: the oracle's grid {oracle_grid} is not {grid}"
+    assert spec.num_patch_rows == rows
+    assert oracle_rows == rows
+    assert spec.num_merged_tokens == tokens
+
+
+def test_the_temporal_element_is_padded_frame_pairs(video_consts):
+    """grid_t is ceil(F / temporal_patch_size), so an odd frame count rounds up rather than down."""
+    for num_frames in (1, 2, 3, 4, 7, 8):
+        spec = video_grid_spec(video_consts, num_frames, 112, 112)
+        assert spec.grid_t == math.ceil(num_frames / video_consts.temporal_patch_size)
+    assert video_grid_spec(video_consts, 3, 112, 112).grid_t != 3
+
+
+def test_the_video_ceiling_differs_from_the_image_ceiling(image_consts, video_consts):
+    """The two processors declare different token ceilings, so neither may be read for the other."""
+    assert video_consts.max_image_tokens != image_consts.max_image_tokens
+    assert video_consts.temporal_patch_size == image_consts.temporal_patch_size
+
+
+def _pad_and_content_elements(run_a, run_b, key):
+    """Elements the two runs agree on are padding; the rest is content."""
+    a, b = run_a[key], run_b[key]
+    assert a.shape == b.shape, "the two runs must share their geometry"
+    agree = int(torch.eq(a, b).sum())
+    differ = int(a.numel() - agree)
+    return agree, differ
+
+
+@pytest.mark.parametrize(
+    "name,height,width",
+    [(c[0], c[1], c[2]) for c in IMAGE_CASES] + [PADDING_CONTROL],
+    ids=[c[0] for c in IMAGE_CASES] + [PADDING_CONTROL[0]],
+)
+def test_every_image_resample_is_reported(image_oracle, image_consts, name, height, width):
+    """The record's content and canvas areas account for every element the processor produced."""
+    record = describe_resample(
+        image_consts, modality="image", num_frames=image_consts.temporal_patch_size,
+        height=height, width=width,
+    )
+    run_a = _run_image_oracle(image_oracle, height, width, CONTENT_VALUE_A)
+    run_b = _run_image_oracle(image_oracle, height, width, CONTENT_VALUE_B)
+    pad_elements, content_elements = _pad_and_content_elements(run_a, run_b, "pixel_values")
+
+    per_pixel = 3 * image_consts.temporal_patch_size
+    canvas_area = record.canvas_height * record.canvas_width
+    content_area = record.content_height * record.content_width
+
+    assert content_elements == content_area * per_pixel, (
+        f"{name}: the oracle's content covers {content_elements // per_pixel} pixels but the record says "
+        f"{content_area}. {record.describe()}"
+    )
+    assert pad_elements == (canvas_area - content_area) * per_pixel, f"{name}: {record.describe()}"
+
+
+@pytest.mark.parametrize(
+    "name,num_frames,height,width",
+    [(c[0], c[1], c[2], c[3]) for c in VIDEO_CASES],
+    ids=[c[0] for c in VIDEO_CASES],
+)
+def test_every_video_resample_is_reported(
+    video_oracle, video_consts, name, num_frames, height, width
+):
+    """The same accounting on the video path, over the padded frame count."""
+    record = describe_resample(
+        video_consts, modality="video", num_frames=num_frames, height=height, width=width
+    )
+    spec = video_grid_spec(video_consts, num_frames, height, width)
+    run_a = _run_video_oracle(video_oracle, num_frames, height, width, CONTENT_VALUE_A)
+    run_b = _run_video_oracle(video_oracle, num_frames, height, width, CONTENT_VALUE_B)
+    pad_elements, content_elements = _pad_and_content_elements(run_a, run_b, "pixel_values_videos")
+
+    padded_frames = spec.grid_t * video_consts.temporal_patch_size
+    per_pixel = 3 * padded_frames
+    canvas_area = record.canvas_height * record.canvas_width
+    content_area = record.content_height * record.content_width
+
+    assert content_elements == content_area * per_pixel, f"{name}: {record.describe()}"
+    assert pad_elements == (canvas_area - content_area) * per_pixel, f"{name}: {record.describe()}"
+
+
+def test_the_reporter_says_true_and_false_and_padding_is_detectable(image_oracle, image_consts):
+    """The resample flag is True for regimes B and C and False for regime A.
+
+    The padding size at 800x1000 is then read both ways: the record says there is padding, and
+    the two-run comparison finds a non-zero pad count for it.
+    """
+    flags = {}
+    for name, height, width, _regime, _grid, _rows, _tokens, _resampled in IMAGE_CASES:
+        flags[name] = describe_resample(
+            image_consts, modality="image", num_frames=image_consts.temporal_patch_size,
+            height=height, width=width,
+        ).resampled
+    assert sorted(flags.values()) == [False, True, True], flags
+
+    _name, height, width = PADDING_CONTROL
+    record = describe_resample(
+        image_consts, modality="image", num_frames=image_consts.temporal_patch_size,
+        height=height, width=width,
+    )
+    assert record.resampled is False
+    assert record.pad_bottom > 0 and record.pad_right > 0
+    run_a = _run_image_oracle(image_oracle, height, width, CONTENT_VALUE_A)
+    run_b = _run_image_oracle(image_oracle, height, width, CONTENT_VALUE_B)
+    pad_elements, _content = _pad_and_content_elements(run_a, run_b, "pixel_values")
+    assert pad_elements > 0, "no padding was found at a size the record says is padded"
+
+
+def test_the_model_class_carries_the_processor_factories():
+    """A missing registration is silent: vLLM catches the unregistered-processor error, logs
+    once and serves the model text-only with images dropped. So this asserts the attribute is
+    present and that its three factories are this module's own classes, by identity."""
+    from vllm_neuron.model.glm5_next import Glm5NextForConditionalGeneration
+
+    factories = getattr(Glm5NextForConditionalGeneration, "_processor_factory", None)
+    assert factories is not None, (
+        "Glm5NextForConditionalGeneration carries no _processor_factory, so vLLM would treat this "
+        "architecture as text-only and drop every image without raising."
+    )
+    assert factories.processor is Glm5NextMultiModalProcessor
+    assert factories.info is Glm5NextProcessingInfo
+    assert factories.dummy_inputs is Glm5NextDummyInputsBuilder
+
+
+def test_the_field_config_sizes_match_the_oracle_row_counts(image_oracle, image_consts):
+    """The field config slices the processor's real output row for row."""
+    out = _run_image_oracle(image_oracle, 784, 1036)
+    fields = build_mm_fields_config(out, image_consts.merge_size)
+
+    assert set(fields) == {
+        "pixel_values",
+        "image_embeds",
+        "image_grid_thw",
+        "pixel_values_videos",
+        "video_embeds",
+        "video_grid_thw",
+    }
+    grid = out["image_grid_thw"]
+    rows = int(grid.prod(-1).sum())
+    assert rows == int(out["pixel_values"].shape[0])
+    assert int((grid.prod(-1) // image_consts.merge_length).sum()) == rows // image_consts.merge_length
+
+
+def test_an_absent_modality_sizes_to_nothing(image_consts):
+    """A text-only or image-only batch must not make the video fields claim rows that do not exist."""
+    fields = build_mm_fields_config({}, image_consts.merge_size)
+    assert set(fields) >= {"pixel_values", "video_grid_thw"}
+
+
+def test_the_processor_declares_the_two_hooks_vllm_requires():
+    """Both are abstract on vLLM's base, so a triple missing either could not be instantiated."""
+    for name in ("_get_mm_fields_config", "_get_prompt_updates"):
+        assert name in vars(Glm5NextMultiModalProcessor), f"{name} is not overridden"
+
+
+def test_image_limits_are_open_and_video_is_not_offered_yet():
+    """The limits this bridge declares, stated as a test so a later change is deliberate.
+
+    Called unbound with ``None`` for ``self`` on purpose: the method reads nothing off the
+    instance, so the declaration can be checked without a vLLM processing context.
+    """
+    limits = Glm5NextProcessingInfo.get_supported_mm_limits(None)
+    assert limits["image"] is None
+    assert "video" not in limits
+
+
+@pytest.fixture(scope="module")
+def offline_tokenizer():
+    """A real tokenizer, built in memory, because the HF processor refuses a duck type.
+
+    ``Glm5NextProcessor.__init__`` type-checks its tokenizer argument and rejects anything that
+    is not a ``PreTrainedTokenizerBase``, so the bridge cannot be exercised with a stub. This
+    builds the smallest real fast tokenizer that round-trips the tokens the bridge cares about,
+    with no checkpoint and no network.
+    """
+    from tokenizers import Regex, Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
+    words = [
+        "text",
+        "<|image|>",
+        "<|video|>",
+        "<|begin_of_video|>",
+        "<|end_of_video|>",
+        "<|begin_of_image|>",
+        "<|end_of_image|>",
+    ]
+    vocab = {word: index for index, word in enumerate(words)}
+    backend = Tokenizer(models.WordLevel(vocab=vocab, unk_token="text"))
+    backend.pre_tokenizer = pre_tokenizers.Split(
+        pattern=Regex(r"<\|[a-z_]+\|>|[a-z]+"), behavior="isolated"
+    )
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token="text")
+    tokenizer.add_special_tokens(
+        {"additional_special_tokens": [word for word in words if word.startswith("<|")]}
+    )
+    tokenizer.image_token = "<|image|>"
+    tokenizer.image_token_id = vocab["<|image|>"]
+    tokenizer.video_token = "<|video|>"
+    tokenizer.video_token_id = vocab["<|video|>"]
+    return tokenizer
+
+
+@pytest.fixture(scope="module")
+def hf_processor(glm5_next_pkg, offline_tokenizer):
+    """The real transformers processor, holding the real image and video sub-processors."""
+    return glm5_next_pkg.Glm5NextProcessor(
+        image_processor=glm5_next_pkg.Glm5NextImageProcessor(),
+        tokenizer=offline_tokenizer,
+        video_processor=glm5_next_pkg.Glm5NextVideoProcessor(),
+    )
+
+
+@pytest.fixture
+def bridge(hf_processor, offline_tokenizer, monkeypatch):
+    """The bridge under test, wired to the real transformers processor.
+
+    vLLM resolves an HF processor from a model config and a checkpoint on disk, which these
+    tests do not have. The one seam is therefore vLLM's own
+    ``BaseProcessingInfo.get_hf_processor``, replaced by the real processor above. No fork
+    method is replaced: the bridge methods below run their own code, and every grid they read is
+    produced by transformers.
+    """
+    from vllm.config.multimodal import MultiModalConfig
+    from vllm.multimodal.processing import context as vllm_context
+
+    multimodal_config = MultiModalConfig()
+
+    class _OfflineModelConfig:
+        model = "glm5-next-offline-fixture"
+        tokenizer = model
+        trust_remote_code = False
+        hf_config = None
+        dtype = torch.float32
+
+        def get_multimodal_config(self):
+            return multimodal_config
+
+    _OfflineModelConfig.multimodal_config = multimodal_config
+    monkeypatch.setattr(
+        vllm_context.BaseProcessingInfo,
+        "get_hf_processor",
+        lambda self, **kwargs: hf_processor,
+    )
+    ctx = vllm_context.InputProcessingContext(_OfflineModelConfig(), offline_tokenizer)
+    info = Glm5NextProcessingInfo(ctx)
+    return info, Glm5NextMultiModalProcessor(info, Glm5NextDummyInputsBuilder(info))
+
+
+def test_the_consumed_canvas_function_resolves_and_refuses_by_name(glm5_next_pkg, monkeypatch):
+    """The canvas arithmetic is imported from transformers, and the import is guarded.
+
+    The function is not on the package surface, which is why the fork names a private submodule.
+    The guarded import turns a moved private name into a message naming the module, the symbol
+    and the remedy, instead of an ``AttributeError`` from inside a grid computation. Deleting the
+    symbol here checks that the refusal actually fires.
+    """
+    import importlib
+
+    assert not hasattr(glm5_next_pkg, SMART_RESIZE_NAME), (
+        f"transformers.models.glm5_next now exposes {SMART_RESIZE_NAME} on its package surface. The fork can "
+        "stop naming the private submodule -- update the helper and delete this assertion's reason."
+    )
+
+    module = importlib.import_module(SMART_RESIZE_MODULE)
+    resolved = require_transformers_smart_resize()
+    assert resolved is getattr(module, SMART_RESIZE_NAME)
+    assert callable(resolved)
+
+    monkeypatch.delattr(module, SMART_RESIZE_NAME)
+    with pytest.raises(RuntimeError) as excinfo:
+        require_transformers_smart_resize()
+    message = str(excinfo.value)
+    assert SMART_RESIZE_MODULE in message and SMART_RESIZE_NAME in message, message
+
+
+@pytest.mark.parametrize("case", PATCH_COUNT_CASES, ids=[case[0] for case in PATCH_COUNT_CASES])
+def test_the_consumed_canvas_and_the_fork_count_agree_with_transformers(
+    image_oracle, image_consts, case
+):
+    """At this checkpoint's factor the fork's patch count equals transformers' own.
+
+    Two oracles, because they answer different questions. ``get_number_of_image_patches`` is
+    arithmetic and runs on every case including the huge one. The real processor is pixels, and
+    its ``image_grid_thw`` and row count are what the served path actually produces.
+    """
+    name, height, width, _regime, count_at_factor_1, _count_at_factor_2, hf_count = case
+    assert image_consts.patch_expand_factor == 1, (
+        "this comparison states the agreeing case, which is patch_expand_factor 1"
+    )
+
+    spec = image_grid_spec(image_consts, height, width)
+    assert spec.grid_h * spec.grid_w == count_at_factor_1, (
+        f"{name}: the fork counts {spec.grid_h * spec.grid_w} patches where {count_at_factor_1} "
+        f"is expected."
+    )
+    assert image_oracle.get_number_of_image_patches(height, width, {}) == hf_count
+    assert spec.grid_h * spec.grid_w == image_oracle.get_number_of_image_patches(height, width, {})
+
+    if name != TOO_BIG_FOR_REAL_PIXELS:
+        out = _run_image_oracle(image_oracle, height, width)
+        assert out["image_grid_thw"].tolist() == [list(spec.thw)], name
+        assert int(out["pixel_values"].shape[0]) == spec.num_patch_rows, name
+
+
+def test_the_fork_count_keeps_patch_expand_factor_where_transformers_drops_it(
+    image_oracle, image_consts
+):
+    """The divergence at patch_expand_factor 2, case by case.
+
+    Transformers' public counter computes its alignment as ``patch_size * merge_size`` while its
+    own preprocessing path multiplies by ``patch_expand_factor``. Consuming that counter would
+    import the inconsistency, so the fork divides over the consumed canvas instead. At factor 2
+    the counter answers as though the factor were 1 -- it is handed the factor and ignores it --
+    and four of the seven cases move while three do not. Both lists are asserted, so neither
+    "they always differ" nor "they always agree" can satisfy this test.
+
+    Each case's regime is read back from the fork's own answer rather than trusted from the
+    table: a case that quietly changed regime would keep its integers and slide between the two
+    lists unnoticed.
+    """
+    doubled = GridConstants(
+        patch_size=image_consts.patch_size,
+        merge_size=image_consts.merge_size,
+        temporal_patch_size=image_consts.temporal_patch_size,
+        patch_expand_factor=2,
+        min_image_tokens=image_consts.min_image_tokens,
+        max_image_tokens=image_consts.max_image_tokens,
+    )
+    differing, agreeing = [], []
+    for name, height, width, regime, _count_1, count_at_factor_2, hf_count in PATCH_COUNT_CASES:
+        spec = image_grid_spec(doubled, height, width)
+        assert spec.regime == regime, (
+            f"{name}: regime {regime} is expected at patch_expand_factor 2 and the fork now "
+            f"answers {spec.regime}. A case that changed regime is not the case pinned here."
+        )
+        assert spec.grid_h * spec.grid_w == count_at_factor_2, (
+            f"{name} (regime {regime}): at patch_expand_factor 2 the fork counts "
+            f"{spec.grid_h * spec.grid_w} where {count_at_factor_2} is expected."
+        )
+        assert (
+            image_oracle.get_number_of_image_patches(height, width, {"patch_expand_factor": 2}) == hf_count
+        ), (
+            f"{name} (regime {regime}): transformers' counter changed its answer when handed the factor it "
+            "used to ignore."
+        )
+        (differing if count_at_factor_2 != hf_count else agreeing).append((name, regime))
+
+    assert differing == [
+        ("aligned_to_28_only", REGIME_PLAIN),
+        ("tiny_floor_bound", REGIME_BELOW_FLOOR),
+        ("tiny_square", REGIME_BELOW_FLOOR),
+        ("huge_ceiling_bound", REGIME_ABOVE_CEILING),
+    ], differing
+    assert agreeing == [
+        ("aligned_to_both_factors", REGIME_PLAIN),
+        ("odd_mid_size", REGIME_PLAIN),
+        ("wide_strip", REGIME_PLAIN),
+    ], agreeing
+
+
+@pytest.mark.parametrize("case", PATCH_COUNT_CASES, ids=[case[0] for case in PATCH_COUNT_CASES])
+def test_the_regime_label_names_the_branch_transformers_would_take(image_consts, case):
+    """The label the fork owns, checked against a second statement of the rule.
+
+    ``smart_resize`` returns a canvas and never says which branch produced it, so the label
+    cannot be consumed. The expected value is computed here from the plainly aligned canvas and
+    the two budgets -- which is what transformers compares -- rather than from the code that
+    produces the label.
+    """
+    name, height, width, regime, *_rest = case
+    factor = image_consts.factor
+
+    def rounded_up(value: int) -> int:
+        return -(-value // factor) * factor
+
+    plain_budget = image_consts.temporal_patch_size * rounded_up(height) * rounded_up(width)
+    if plain_budget < image_consts.floor_pixels:
+        expected = REGIME_BELOW_FLOOR
+    elif plain_budget > image_consts.ceiling_pixels:
+        expected = REGIME_ABOVE_CEILING
+    else:
+        expected = REGIME_PLAIN
+
+    _canvas_height, _canvas_width, got = resolve_canvas(
+        image_consts, num_frames=image_consts.temporal_patch_size, height=height, width=width
+    )
+    assert got == expected, f"{name}: plain budget {plain_budget} says {expected}, the fork says {got}"
+    assert got == regime, f"{name}: the table says {regime}"
+
+
+@pytest.mark.parametrize("num_frames", [1, 2, 3, 4, 5, 7, 8])
+def test_the_video_grid_frame_count_is_the_padding_transformers_patchifies(
+    video_oracle, video_consts, num_frames
+):
+    """The video grid stays the fork's arithmetic, because transformers exposes no video counter,
+    so it is pinned against the real video processor's own ``video_grid_thw`` across a sweep."""
+    spec = video_grid_spec(video_consts, num_frames, 112, 112)
+    out = _run_video_oracle(video_oracle, num_frames, 112, 112)
+    assert out["video_grid_thw"].tolist() == [list(spec.thw)], f"F={num_frames}"
+
+
+def test_the_budget_rounding_and_the_grid_padding_are_different_rules(video_consts):
+    """The two frame roundings must not be one function.
+
+    The pixel budget rounds to the nearest whole temporal patch, as ``smart_resize`` does; the
+    grid pads up, as ``patchify`` does. At five frames they disagree.
+    """
+    padded = video_grid_spec(video_consts, 5, 112, 112).grid_t * video_consts.temporal_patch_size
+    assert padded == 6
+    assert video_consts.aligned_frames(5) == 4
+    assert video_consts.aligned_frames(5) != padded
+
+
+def test_the_bridge_token_count_equals_the_processors_own_grid(bridge, image_oracle):
+    """``get_num_image_tokens`` against the real processor's grid, which is what vLLM budgets against.
+
+    A count that is too small truncates the placeholder run and the image is silently cropped;
+    too large and vLLM raises on the mismatch.
+    """
+    info, _processor = bridge
+    merge_length = image_oracle.merge_size**2
+    for name, height, width, _regime, *_rest in PATCH_COUNT_CASES:
+        if name == TOO_BIG_FOR_REAL_PIXELS:
+            continue
+        out = _run_image_oracle(image_oracle, height, width)
+        expected = int(out["image_grid_thw"].prod()) // merge_length
+        assert info.get_num_image_tokens(image_width=width, image_height=height) == expected, name
+
+
+def test_the_profiling_size_reaches_the_token_ceiling(bridge, image_oracle):
+    """``get_image_size_with_most_features`` must reach the token ceiling exactly.
+
+    vLLM profiles memory with this size and then refuses any request needing more tokens than
+    the profiled run reserved for, so a size that falls short does not merely waste a little
+    memory: the server rejects requests it has the capacity to serve.
+
+    No shape rule is asserted. The ceiling bounds the token grid's area, and a square grid's
+    area is a perfect square, so a ceiling that is not one is unreachable by any square
+    whatsoever -- at this pin the ceiling is 8000 and the best square is 89 by 89, which leaves
+    79 tokens unreachable. The shape is whatever reaching the ceiling requires.
+
+    Every expected value is read off the processor's own attributes and its own
+    ``image_grid_thw``; the answer under test comes from the fork, so the two sides can disagree.
+    """
+    info, _processor = bridge
+    consts = info.get_grid_constants()
+    frames = consts.temporal_patch_size
+    merge_length = image_oracle.merge_size**2
+    ceiling_tokens = image_oracle.max_image_tokens
+    patch = image_oracle.patch_size
+
+    size = info.get_image_size_with_most_features()
+
+    def grid_of(height, width):
+        return tuple(int(v) for v in _run_image_oracle(image_oracle, height, width)["image_grid_thw"][0])
+
+    def grid_the_size_implies(height, width):
+        return (1, height // patch, width // patch)
+
+    # Maximality, read off the processor's own grid rather than any arithmetic in this repository.
+    grid = grid_of(size.height, size.width)
+    assert (grid[0] * grid[1] * grid[2]) // merge_length == ceiling_tokens, (
+        f"the profiling size reaches {(grid[0] * grid[1] * grid[2]) // merge_length} tokens "
+        f"but the ceiling admits {ceiling_tokens}, so the server would refuse requests it could serve"
+    )
+
+    # And the fork's own counter, which is what vLLM budgets against, reads the same ceiling.
+    assert info.get_num_image_tokens(image_width=size.width, image_height=size.height) == ceiling_tokens, (
+        "the bridge's own token count for the profiling size disagrees with the ceiling"
+    )
+
+    # The equality boundary, as an accepted-and-cut pair. This size's pixel budget lands exactly
+    # on the ceiling, and the processor cuts only when the budget is strictly greater. So the
+    # size must come back as the canvas it declared, and the next legal step must come back cut.
+    # Compared as grids, never as token counts: one step wider is cut back to this very canvas,
+    # so its token count is the ceiling too and a count comparison would measure nothing.
+    assert grid == grid_the_size_implies(size.height, size.width), (
+        f"the processor returned {grid} for a size implying "
+        f"{grid_the_size_implies(size.height, size.width)}, so the profiled canvas is not the declared one"
+    )
+    wider = size.width + consts.factor
+    assert grid_of(size.height, wider) != grid_the_size_implies(size.height, wider), (
+        "the step past the profiling size was accepted whole, so the size below it is not at "
+        "the ceiling's boundary"
+    )
+
+    # The inherited pixel bounds and the alignment. Both are algebraically implied by maximality
+    # at this pin, because patch_expand_factor is 1 there and that makes factor equal the token
+    # unit, which in turn makes the pixel budget a fixed multiple of the token count. They are
+    # kept because that coincidence is a property of the pinned checkpoint and not of this code:
+    # where the expand factor is not 1, the pixel bound carries something the token bound does not.
+    assert frames * size.height * size.width <= consts.ceiling_pixels, (
+        "the profiling size is over the pixel budget"
+    )
+    assert (
+        frames * (size.height + consts.factor) * (size.width + consts.factor) > consts.ceiling_pixels
+    ), "one more alignment step still fits, so this is not the largest size"
+    assert size.height % consts.factor == 0 and size.width % consts.factor == 0
+
+
+def test_the_placeholder_replacement_is_the_items_own_token_count(bridge, image_oracle):
+    """``_get_prompt_updates`` builds one replacement per image, sized by that image's own grid.
+
+    The replacement callable is driven with the grid the real processor produced for one item. A
+    wrong merge length or a grid read off the wrong item changes the length, and the length is
+    asserted exactly.
+    """
+    from vllm.multimodal.parse import MultiModalDataParser
+
+    info, processor = bridge
+    height, width = 784, 1036
+    out = _run_image_oracle(image_oracle, height, width)
+    grid = out["image_grid_thw"]
+    expected = int(grid.prod()) // image_oracle.merge_size**2
+
+    class _Item:
+        data = grid[0]
+
+    mm_items = MultiModalDataParser().parse_mm_data(
+        {"image": [torch.full((3, height, width), CONTENT_VALUE_A, dtype=torch.uint8)]}
+    )
+    updates = processor._get_prompt_updates(mm_items, {}, {"image": [{"image_grid_thw": _Item()}]})
+    assert len(updates) == 1
+    replacement = updates[0].replacement(0)
+    assert len(replacement) == expected
+    assert set(replacement) == {info.get_hf_processor().image_token_id}
+    assert len(replacement) != int(grid.prod()), (
+        "the replacement is as long as the patch count, so the 2x2 merge was never applied"
+    )
+
+
+def test_apply_expands_one_image_to_its_own_token_run(bridge, image_oracle):
+    """vLLM's own ``apply`` end to end, which is the path a served request takes.
+
+    The fork overrides only the field config and the prompt updates, so this shows the two of
+    them compose correctly inside the base implementation: one image, one placeholder in the
+    prompt, and a token run exactly as long as the grid says.
+    """
+    from vllm.multimodal.parse import MultiModalDataParser
+    from vllm.multimodal.processing.context import TimingContext
+    from vllm.multimodal.processing.inputs import ProcessorInputs
+
+    info, processor = bridge
+    height, width = 784, 1036
+    image = torch.full((3, height, width), CONTENT_VALUE_A, dtype=torch.uint8)
+    image_token = info.get_hf_processor().image_token
+    image_token_id = info.get_hf_processor().image_token_id
+
+    out = processor.apply(
+        ProcessorInputs(
+            prompt=f"text {image_token} text",
+            mm_data_items=MultiModalDataParser().parse_mm_data({"image": [image]}),
+            mm_uuid_items=None,
+            hf_processor_mm_kwargs={},
+            tokenization_kwargs={},
+        ),
+        TimingContext(),
+    )
+
+    oracle_grid = _run_image_oracle(image_oracle, height, width)["image_grid_thw"]
+    expected_tokens = int(oracle_grid.prod()) // image_oracle.merge_size**2
+    ids = out["prompt_token_ids"]
+    assert sum(1 for token_id in ids if token_id == image_token_id) == expected_tokens
+    assert out["mm_kwargs"]["image"][0]["image_grid_thw"].data.tolist() == oracle_grid[0].tolist()
+    assert len(ids) > expected_tokens, "the text around the placeholder was dropped"
