@@ -49,6 +49,61 @@ _DEFAULT_DTYPE_TOLERANCE = {
     torch.float32: (1.3e-6, 1e-5),
 }
 
+# Tolerances for a dtype with no entry in the map above.
+_FALLTHROUGH_DTYPE_TOLERANCE = (1.6e-2, 1e-5)
+
+# fp8 tolerances, in _DEFAULT_DTYPE_TOLERANCE's (rtol, atol) order -- the reverse
+# of vllm_neuron.accuracy.constants.DEFAULT_TOLERANCE_MAP's (atol, rtol). Do not
+# normalise one order to the other: swapping the two here would set the fp8 rtol
+# to 1e-5 and its atol to 3e-2, a three-orders-of-magnitude loosening.
+#
+# The rtol is the 1e-2 used for bf16 module comparisons, loosened 3x because an
+# fp8 tensor carries a per-block dequantization step on top of bf16 rounding.
+FP8_DTYPE_TOLERANCE = (3e-2, 1e-5)
+
+
+def _exposed_fp8_dtypes() -> tuple:
+    """Return every distinct fp8 dtype the installed ``torch`` exposes.
+
+    Attributes are classified, not name-matched: a value qualifies when it is a
+    ``torch.dtype`` instance with a 1-byte ``itemsize`` whose ``str()`` names
+    ``float8``, de-duplicated by identity so two names for one dtype count once.
+    Which fp8 dtypes exist depends on the installed ``torch``, so a hard-coded
+    name list would raise ``AttributeError`` at import on a build that lacks one
+    and would miss any dtype a newer build adds.
+    """
+    found: list = []
+    for value in vars(torch).values():
+        if not isinstance(value, torch.dtype):
+            continue
+        if getattr(value, "itemsize", None) != 1 or "float8" not in str(value):
+            continue
+        if any(value is seen for seen in found):
+            continue
+        found.append(value)
+    return tuple(found)
+
+
+# Give every fp8 dtype an entry of its own: without one, an fp8 comparison would
+# silently inherit bf16's tolerances through the fallback pair above.
+_DEFAULT_DTYPE_TOLERANCE.update(
+    {dtype: FP8_DTYPE_TOLERANCE for dtype in _exposed_fp8_dtypes()}
+)
+
+
+def resolve_dtype_tolerance(dtype: torch.dtype) -> tuple:
+    """Resolve the ``(rtol, atol)`` pair to compare tensors of ``dtype`` with.
+
+    Args:
+        dtype: The dtype of the tensor being compared.
+
+    Returns:
+        The ``(rtol, atol)`` pair for ``dtype``, or
+        ``_FALLTHROUGH_DTYPE_TOLERANCE`` when the dtype has no entry. Note the
+        order: ``[0]`` is rtol and ``[1]`` is atol, as both callers below expect.
+    """
+    return _DEFAULT_DTYPE_TOLERANCE.get(dtype, _FALLTHROUGH_DTYPE_TOLERANCE)
+
 
 @dataclass
 class AssertCloseResult:
@@ -193,7 +248,7 @@ def _neuron_allclose(
         )
 
     if rtol is None or atol is None:
-        default = _DEFAULT_DTYPE_TOLERANCE.get(expected.dtype, (1.6e-2, 1e-5))
+        default = resolve_dtype_tolerance(expected.dtype)
         rtol = rtol if rtol is not None else default[0]
         atol = atol if atol is not None else default[1]
 
@@ -295,7 +350,7 @@ def assert_close(
 
         # Resolve effective tolerances for the diagnostic report (matches
         # _neuron_allclose default-resolution logic).
-        default = _DEFAULT_DTYPE_TOLERANCE.get(exp.dtype, (1.6e-2, 1e-5))
+        default = resolve_dtype_tolerance(exp.dtype)
         eff_rtol = rtol if rtol is not None else default[0]
         eff_atol = atol if atol is not None else default[1]
 
@@ -696,3 +751,79 @@ def _flatten_tensor_pairs(actual, expected, prefix=""):
             pairs.extend(_flatten_tensor_pairs(a, e, f"{prefix}[{i}]"))
         return pairs
     raise TypeError(f"Type mismatch: {type(actual)} vs {type(expected)}")
+
+
+# Prefix on every failure raised for a pair that cannot be compared at all, so a
+# caller can match on it instead of on the message body.
+_UNCOMPARABLE_LOGIT_PAIR = "uncomparable logit pair"
+
+
+def assert_close_logit_pair(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    rtol: float = None,
+    atol: float = None,
+    equal_nan_inf: bool = False,
+    name: str = "logit_pair",
+) -> AssertCloseResult:
+    """Compare one aligned logit pair and return an ``AssertCloseResult``.
+
+    The entry points in :mod:`vllm_neuron.accuracy.logit_validation` compare
+    logits internally and report a pass/fail summary rather than a result object.
+    Given the aligned pair they hand out (see
+    ``logit_validation(..., logit_pair_sink=...)``), this returns the same
+    ``AssertCloseResult`` as the other comparators in this module. It works at
+    tensor level only and knows nothing about how the pair was produced.
+
+    Args:
+        actual: Target logits, any shape, aligned elementwise with ``expected``.
+        expected: Reference logits of the same shape and dtype.
+        rtol: Relative tolerance. Defaults to the value for ``expected.dtype``
+            from :func:`resolve_dtype_tolerance`.
+        atol: Absolute tolerance. Defaults the same way.
+        equal_nan_inf: If True, matching NaN and matching same-sign infinities
+            compare equal -- useful for logits carrying masked ``-inf`` entries.
+        name: Label carried in failure messages.
+
+    Returns:
+        The ``AssertCloseResult`` for the pair, pass or fail; the caller reads
+        ``allclose``.
+
+    Raises:
+        TypeError: If either side is not a ``torch.Tensor``.
+        ValueError: If the two sides disagree in shape or in dtype.
+
+        Both messages start with ``uncomparable logit pair`` and name the
+        offending type. A pair that cannot be compared raises instead of
+        returning a result, whose ``allclose=False`` would be indistinguishable
+        from a real numeric mismatch.
+    """
+    for side, tensor in (("actual", actual), ("expected", expected)):
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(
+                f"{_UNCOMPARABLE_LOGIT_PAIR}: {name}: {side} is not a torch.Tensor; "
+                f"offending_type={type(tensor)!r}"
+            )
+
+    if actual.shape != expected.shape:
+        raise ValueError(
+            f"{_UNCOMPARABLE_LOGIT_PAIR}: {name}: shape mismatch "
+            f"actual={tuple(actual.shape)} expected={tuple(expected.shape)}; "
+            f"offending_type={type(actual)!r} dtype={actual.dtype}"
+        )
+
+    if actual.dtype != expected.dtype:
+        raise ValueError(
+            f"{_UNCOMPARABLE_LOGIT_PAIR}: {name}: dtype mismatch "
+            f"actual={actual.dtype} expected={expected.dtype}; "
+            f"offending_type={type(actual)!r} dtype={actual.dtype}"
+        )
+
+    if rtol is None or atol is None:
+        registered_rtol, registered_atol = resolve_dtype_tolerance(expected.dtype)
+        rtol = rtol if rtol is not None else registered_rtol
+        atol = atol if atol is not None else registered_atol
+
+    return _neuron_allclose(
+        actual, expected, rtol=rtol, atol=atol, equal_nan_inf=equal_nan_inf
+    )

@@ -66,8 +66,18 @@ VLLM_NEURON_CPU_MODE=1 pytest test/unit -v --timeout=300
 ### 4. Run functional tests in CPU mode
 
 ```bash
-VLLM_NEURON_CPU_MODE=1 pytest test/vllm_neuron/functional/ -v --timeout=60
+VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1 pytest test/vllm_neuron/functional/ -v --timeout=60
 ```
+
+`NKI_SIMULATOR=1` is required for this command. CPU mode alone falls back to
+PyTorch by design (see above), and without the flag `can_run_kernel` returns
+`False`, so every NKI kernel takes that fallback. 41 of the 158 tests in this
+directory check that a kernel actually runs through the simulator instead of
+the fallback, and each one fails when the fallback is taken instead — through
+a dispatch counter that stays at zero, a route-availability assertion, or an
+explicit error naming this flag. Without `NKI_SIMULATOR=1`, expect 41 failed
+and 117 passed; with it, all 158 tests pass. To exercise the fallback path on
+purpose, drop the flag; the same 41 tests will fail.
 
 ### 5. Use the NKI CPU simulator (optional)
 
