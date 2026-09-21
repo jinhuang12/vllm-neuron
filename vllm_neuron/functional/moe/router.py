@@ -13,6 +13,27 @@ from nkilib.core.utils.common_types import RouterActFnType
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
+from dataclasses import dataclass
+
+import nki.isa as nisa
+import nki.language as nl
+
+from nkilib.core.moe_block.moe_block_tkg_utils import _pmax
+from nkilib.core.router_topk.router_topk import XSBLayout_tp102__0
+from nkilib.core.router_topk.router_topk import router_topk as _substrate_router_topk
+from nkilib.core.subkernels.rmsnorm_tkg import _rmsnorm_tkg_dloc
+from nkilib.core.utils.common_types import QuantizationType
+# The same sharding query nkilib's router uses to choose its token split, so the
+# `noaux_tc` stage and the router cannot disagree about which core owns which rows.
+from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
+
+from vllm_neuron.functional.moe.rmsnorm_router_topk_tkg import (
+    _can_use_kernel as _substrate_can_use_kernel,
+)
+from vllm_neuron.functional.moe.rmsnorm_router_topk_tkg import (
+    _validate_inputs as _substrate_validate_inputs,
+)
+
 router_topk_jit = nki.jit(router_topk)
 
 
@@ -863,3 +884,650 @@ def _can_use_kernel(
         return False
 
     return True
+
+
+#: Tokens per tile: `nisa.max8`/`nisa.nc_find_index8` work one token per partition.
+NOAUX_TC_TILE = 128
+
+#: `nisa.max8` emits, and `nisa.nc_find_index8` consumes, exactly 8 values per token.
+NOAUX_TC_K = 8
+
+#: Guard term in the L1 denominator, verbatim from the reference implementation.
+NOAUX_TC_DENOM_EPS = 1e-20
+
+#: nkilib's router caps E at its gemm moving free-dim maximum.
+_NOAUX_TC_F_MAX = 512
+
+#: Token multiple for the fused two-core launch: a whole 128-row tile per core.
+_NOAUX_TC_T_MULTIPLE = 256
+
+_NOAUX_TC_TORCH_TO_NKI_DTYPE = {
+    torch.bfloat16: nl.bfloat16,
+    torch.float16: nl.float16,
+    torch.float32: nl.float32,
+}
+
+
+class NoauxTcRouterError(ValueError):
+    """Raised for a `top_k` or expert count the NKI `noaux_tc` stage cannot serve.
+
+    Raised rather than returned as `False`: nkilib's admission gate answers `E > 512`
+    with `False` and its caller then takes the torch path, so a bad extent would run
+    torch silently. Here the same case raises, and the kernel path cannot be skipped
+    by accident.
+    """
+
+
+@dataclass
+class _NoauxTcCounters:
+    """Entries into the NKI path and into the torch fallback, counted separately."""
+
+    nki_dispatch: int = 0
+    torch_fallback: int = 0
+
+
+_NOAUX_TC_COUNTERS = _NoauxTcCounters()
+
+
+def reset_noaux_tc_counters() -> None:
+    """Zero both dispatch counters."""
+    _NOAUX_TC_COUNTERS.nki_dispatch = 0
+    _NOAUX_TC_COUNTERS.torch_fallback = 0
+
+
+def noaux_tc_dispatch_counters() -> Tuple[int, int]:
+    """Return ``(nki_dispatch, torch_fallback)`` since the last reset."""
+    return _NOAUX_TC_COUNTERS.nki_dispatch, _NOAUX_TC_COUNTERS.torch_fallback
+
+
+@torch._dynamo.assume_constant_result
+def _count_nki_dispatch() -> None:
+    """Count one kernel dispatch outside the trace, so the store is not a guard."""
+    _NOAUX_TC_COUNTERS.nki_dispatch += 1
+
+
+@torch._dynamo.assume_constant_result
+def _count_torch_fallback() -> None:
+    """Count one torch-path entry outside the trace."""
+    _NOAUX_TC_COUNTERS.torch_fallback += 1
+
+
+def _require_noaux_tc_extents(num_experts: int, top_k: int) -> None:
+    """Raise `NoauxTcRouterError` for a `top_k` or `E` the ISA top-k path cannot serve.
+
+    The token extent is not checked here: both entry points pad it to a whole tile.
+    """
+    if top_k != NOAUX_TC_K:
+        raise NoauxTcRouterError(
+            f"top_k must be exactly {NOAUX_TC_K}: `nisa.max8` emits 8 values "
+            f"per partition and `nisa.nc_find_index8` consumes exactly 8, and "
+            f"nkilib refuses k > 8 (router_topk.py:582-583). got top_k={top_k}"
+        )
+    if num_experts < NOAUX_TC_K:
+        raise NoauxTcRouterError(
+            f"E must be >= {NOAUX_TC_K} for the ISA top-K members "
+            f"(router_topk.py:312 pads E to at least 8). got E={num_experts}"
+        )
+    if num_experts > _NOAUX_TC_F_MAX:
+        raise NoauxTcRouterError(
+            f"E must be <= {_NOAUX_TC_F_MAX}, the gemm moving free-dim cap the "
+            f"substrate applies at rmsnorm_router_topk_tkg.py:201,206. "
+            f"got E={num_experts}"
+        )
+
+
+def can_run_noaux_tc_router(
+    reference: Tensor, num_experts: int, top_k: int
+) -> bool:
+    """True when a Neuron device or simulator can run the kernel for `reference`.
+
+    Extents are checked first and a bad `top_k` or `E` raises `NoauxTcRouterError`;
+    only the absence of a device sends this path to the torch reference. Independent
+    of `_can_use_kernel` above, which currently returns False unconditionally.
+    """
+    _require_noaux_tc_extents(num_experts, top_k)
+    return can_run_kernel(reference)
+
+
+def _noaux_tc_pad_target(num_tokens: int, multiple: int) -> int:
+    """Round `num_tokens` up to a whole `multiple`.
+
+    Each entry point passes its own multiple: 128 (one tile) for `noaux_tc_correct`,
+    which launches without a grid, and 256 for the `[2]`-launched fused entry, whose
+    two cores each need a whole 128-row tile. With 128 there, a core could receive
+    64 rows, the tile loop would run zero times, and the kernel would return its
+    uninitialised output buffers.
+    """
+    return -(-num_tokens // multiple) * multiple
+
+
+def _noaux_tc_pad_tokens(x: Tensor, t_pad: int) -> Tensor:
+    """Pad the token axis (`dim=-2`) of `x` to `t_pad` rows; always contiguous.
+
+    The pad repeats the last real row instead of writing zeros. Pad rows cannot reach
+    the real ones (the stage never reduces across tokens), but an all-zero row gives
+    `sigmoid(0) == 0.5` at every expert: an exact 8-way tie for `nisa.max8` and
+    `nisa.nc_find_index8` that real rows never produce. Contiguous because the kernel
+    reads the buffer from HBM, and a non-contiguous view is not the same bytes.
+    """
+    t_real = x.shape[-2]
+    if t_pad == t_real:
+        return x.contiguous()
+    last = x.narrow(-2, t_real - 1, 1)
+    reps = [1] * x.dim()
+    reps[-2] = t_pad - t_real
+    return torch.cat([x, last.repeat(*reps)], dim=-2).contiguous()
+
+
+def _noaux_tc_shard_range(num_tokens: int, n_prgs: int, prg_id: int):
+    """Return `(t_offset, t_local)`: the token rows program `prg_id` owns.
+
+    Same split as nkilib's `router_topk`: `T // n_prgs` rows to program 0 and the
+    remainder to program 1, so this stage reads exactly the logit rows the router
+    wrote on the same core. Only two programs are defined, as
+    `get_verified_program_sharding_info(..., (0, 1), 2)` admits; `n_prgs == 1`
+    returns the whole range. Callers pad `num_tokens` so `t_local` is a whole number
+    of `NOAUX_TC_TILE` rows; an unpadded extent would floor-divide to too few tiles.
+    """
+    t_first = num_tokens // n_prgs
+    if prg_id == 0:
+        return 0, t_first
+    return t_first, num_tokens - t_first
+
+
+def _noaux_tc_stage(
+    router_logits_hbm,
+    correction_bias_hbm,
+    expert_index_hbm,
+    expert_affinities_hbm,
+    num_tokens: int,
+    num_experts: int,
+    norm_topk_prob: bool,
+    routed_scaling_factor: float,
+    shard_on_tokens: bool,
+):
+    """The `noaux_tc` numerics in NKI: a plain subkernel both jit entry points inline.
+
+    Reads `[T, E]` logits and a `[1, E]` correction bias from HBM; writes the `[T, K]`
+    selected indices and the `[T, E]` scattered gate weights. Per token, following
+    `Glm5NextTextTopkRouter.forward`::
+
+        scores            = sigmoid(logits)
+        scores_for_choice = scores + correction_bias
+        topk_indices      = topk(scores_for_choice, k)   # nisa.max8 + nc_find_index8
+        topk_weights      = scores[topk_indices]         # one-hot mask, below
+        if norm_topk_prob:
+            topk_weights /= topk_weights.sum() + 1e-20
+        topk_weights     *= routed_scaling_factor
+
+    The gather is a one-hot mask over the selected indices, not a DMA gather: the MoE
+    block consumes the scattered `[T, E]` form anyway, and an index mask selects
+    exactly the eight reported columns where a value-equality mask against the top-8
+    values would select nine when two experts tie on the corrected score.
+
+    When `shard_on_tokens` is true the launch has two programs and this program
+    covers only the token rows the nkilib router wrote on this core; when false one
+    program covers the whole extent.
+    """
+    bias_sb = nl.load(correction_bias_hbm)  # [1, E]
+
+    # Cover only the token rows the nkilib router wrote on this core. The router
+    # shards its stores by this same query, so no cross-core read remains and no
+    # barrier is needed. `shard_on_tokens` is passed in, not inferred from the grid:
+    # the router shards only when asked (never at T == 1), and the two must agree.
+    if shard_on_tokens:
+        _grid_ndim, n_prgs, prg_id = get_verified_program_sharding_info(
+            "noaux_tc_stage", (0, 1), 2
+        )
+    else:
+        n_prgs, prg_id = 1, 0
+    t_offset, t_local = _noaux_tc_shard_range(num_tokens, n_prgs, prg_id)
+
+    for t_tile in range(t_local // NOAUX_TC_TILE):
+        t0 = t_offset + t_tile * NOAUX_TC_TILE
+        rows = NOAUX_TC_TILE
+
+        logits_sb = nl.load(
+            router_logits_hbm[t0 : t0 + rows, :], dtype=nl.float32
+        )
+
+        # fp32 throughout: the selection is discrete, and a bf16 score would decide
+        # near-tie experts by round-off rather than by value.
+        scores = nl.sigmoid(logits_sb, dtype=nl.float32)
+
+        # The bias broadcast is along the partition axis; `nl.broadcast_to` does
+        # that, `tensor_scalar` does not.
+        choice = nl.ndarray((rows, num_experts), dtype=nl.float32, buffer=nl.sbuf)
+        bias_b = nl.broadcast_to(bias_sb, (rows, num_experts))
+        nisa.tensor_tensor(dst=choice, data1=scores, data2=bias_b, op=nl.add)
+
+        # Top-k on the corrected score, with the same two ISA instructions nkilib's
+        # router uses.
+        top8 = nl.ndarray((rows, NOAUX_TC_K), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.max8(dst=top8, src=choice)
+        idx8 = nl.ndarray((rows, NOAUX_TC_K), dtype=nl.uint32, buffer=nl.sbuf)
+        nisa.nc_find_index8(dst=idx8, data=choice, vals=top8)
+
+        # One-hot over the selected indices; the indices are cast to fp32 to compare
+        # against the fp32 iota.
+        idx_f32 = nl.ndarray((rows, NOAUX_TC_K), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=idx_f32, src=idx8)
+        col = nl.ndarray((rows, num_experts), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.iota(dst=col, pattern=[[1, num_experts]], offset=0, channel_multiplier=0)
+
+        mask = nl.ndarray((rows, num_experts), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.memset(dst=mask, value=0.0)
+        hit = nl.ndarray((rows, num_experts), dtype=nl.float32, buffer=nl.sbuf)
+        for k in range(NOAUX_TC_K):
+            # `tensor_scalar` broadcasts a [par, 1] operand along the free dim.
+            nisa.tensor_scalar(
+                dst=hit, data=col, op0=nl.equal, operand0=idx_f32[:, k : k + 1]
+            )
+            nisa.tensor_tensor(dst=mask, data1=mask, data2=hit, op=nl.add)
+
+        # Gate weights from the unbiased scores, masked to the selected experts.
+        sel = nl.ndarray((rows, num_experts), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=sel, data1=scores, data2=mask, op=nl.multiply)
+
+        out = nl.ndarray((rows, num_experts), dtype=nl.float32, buffer=nl.sbuf)
+        if norm_topk_prob:
+            # Normalise, then scale, in one pass.
+            row_sum = nl.sum(sel, axis=1, keepdims=True, dtype=nl.float32)
+            denom = nl.ndarray((rows, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_scalar(
+                dst=denom, data=row_sum, op0=nl.add, operand0=NOAUX_TC_DENOM_EPS
+            )
+            recip = nl.ndarray((rows, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.reciprocal(dst=recip, data=denom)
+            nisa.tensor_scalar(
+                dst=out,
+                data=sel,
+                op0=nl.multiply,
+                operand0=recip,
+                op1=nl.multiply,
+                operand1=float(routed_scaling_factor),
+            )
+        else:
+            # Scale only.
+            nisa.tensor_scalar(
+                dst=out,
+                data=sel,
+                op0=nl.multiply,
+                operand0=float(routed_scaling_factor),
+            )
+
+        nl.store(expert_affinities_hbm[t0 : t0 + rows, :], value=out)
+        nl.store(expert_index_hbm[t0 : t0 + rows, :], value=idx8)
+
+
+@nki.jit
+def _noaux_tc_correct_nki(
+    router_logits,
+    correction_bias,
+    norm_topk_prob: bool = True,
+    routed_scaling_factor: float = 1.0,
+):
+    """Run the `noaux_tc` stage alone: `[T, E]` logits in, indices and weights out."""
+    t_extent, e_extent = router_logits.shape
+    expert_index = nl.ndarray(
+        (t_extent, NOAUX_TC_K), dtype=nl.uint32, buffer=nl.shared_hbm
+    )
+    expert_affinities = nl.ndarray(
+        (t_extent, e_extent), dtype=nl.float32, buffer=nl.shared_hbm
+    )
+    _noaux_tc_stage(
+        router_logits_hbm=router_logits,
+        correction_bias_hbm=correction_bias,
+        expert_index_hbm=expert_index,
+        expert_affinities_hbm=expert_affinities,
+        num_tokens=t_extent,
+        num_experts=e_extent,
+        norm_topk_prob=norm_topk_prob,
+        routed_scaling_factor=routed_scaling_factor,
+        # Launched without a grid: one program owns every token.
+        shard_on_tokens=False,
+    )
+    return expert_index, expert_affinities
+
+
+@nki.jit
+def _noaux_tc_rmsnorm_router_topk_nki(
+    hidden_states,
+    gamma,
+    router_weights,
+    correction_bias,
+    eps: float = 1e-6,
+    norm_topk_prob: bool = True,
+    routed_scaling_factor: float = 1.0,
+    router_mm_dtype=nl.bfloat16,
+):
+    """RMSNorm, router matmul and the `noaux_tc` stage in one kernel.
+
+    Follows `rmsnorm_router_topk_tkg._rmsnorm_router_topk_tkg_nki` with two changes:
+    the router logits are stored (the `noaux_tc` stage consumes them, and they are
+    returned), and that stage runs after `_router_topk` in the same kernel body.
+
+    The nkilib router's own uncorrected top-k (`substrate_index`) is returned too.
+    `noaux_tc` differs from it exactly by the correction bias, so the two selections
+    should differ on some rows; identical selections mean the bias was ignored.
+
+    `shard_on_tokens` is decided once and handed to both the nkilib router and the
+    `noaux_tc` stage, so they agree on which core owns which token rows.
+    """
+    b_extent, s_extent, h_extent = hidden_states.shape
+    t_extent = b_extent * s_extent
+    _, e_extent = router_weights.shape
+    h_free = h_extent // _pmax
+
+    # One shard decision for the router and the `noaux_tc` stage.
+    shard_on_tokens = t_extent > 1
+
+    router_logits = nl.ndarray((t_extent, e_extent), dtype=nl.float32,
+                               buffer=nl.shared_hbm)
+    norm_output = nl.ndarray((t_extent, h_extent), dtype=router_mm_dtype,
+                             buffer=nl.shared_hbm)
+    # The nkilib router's own uncorrected outputs.
+    substrate_index = nl.ndarray((t_extent, NOAUX_TC_K), dtype=nl.int32,
+                                 buffer=nl.shared_hbm)
+    substrate_affinities = nl.ndarray((t_extent, e_extent), dtype=nl.bfloat16,
+                                      buffer=nl.shared_hbm)
+    # The corrected outputs.
+    expert_index = nl.ndarray((t_extent, NOAUX_TC_K), dtype=nl.uint32,
+                              buffer=nl.shared_hbm)
+    expert_affinities = nl.ndarray((t_extent, e_extent), dtype=nl.float32,
+                                   buffer=nl.shared_hbm)
+
+    norm_sb = nl.ndarray((_pmax, t_extent, h_free), dtype=router_mm_dtype,
+                         buffer=nl.sbuf)
+
+    # Stage 1: RMSNorm, as `rmsnorm_router_topk_tkg` calls it.
+    _rmsnorm_tkg_dloc(
+        input_hbm=hidden_states,
+        gamma=gamma,
+        output_hbm=norm_output,
+        output_sb=norm_sb,
+        eps=eps,
+        hidden_actual=None,
+        sync_output=True,
+    )
+
+    # Stage 2: router matmul and its own top-k, with `router_logits` stored.
+    # `w_bias=None`: the correction bias is not a projection bias and must not be
+    # added to the logits; it enters the selection score after the sigmoid.
+    _substrate_router_topk(
+        x=norm_sb,
+        w=router_weights,
+        w_bias=None,
+        router_logits=router_logits,
+        expert_affinities=substrate_affinities,
+        expert_index=substrate_index,
+        act_fn=RouterActFnType.SIGMOID,
+        k=NOAUX_TC_K,
+        x_hbm_layout=0,
+        x_sb_layout=XSBLayout_tp102__0,
+        router_pre_norm=False,
+        norm_topk_prob=False,
+        use_column_tiling=True,
+        use_indirect_dma_scatter=True,
+        use_PE_broadcast_w_bias=True,
+        shard_on_tokens=shard_on_tokens,
+        skip_store_expert_index=False,
+        skip_store_router_logits=False,
+    )
+
+    # Stage 3: the `noaux_tc` split, in the same kernel.
+    _noaux_tc_stage(
+        router_logits_hbm=router_logits,
+        correction_bias_hbm=correction_bias,
+        expert_index_hbm=expert_index,
+        expert_affinities_hbm=expert_affinities,
+        num_tokens=t_extent,
+        num_experts=e_extent,
+        norm_topk_prob=norm_topk_prob,
+        routed_scaling_factor=routed_scaling_factor,
+        # Same shard decision as the router above.
+        shard_on_tokens=shard_on_tokens,
+    )
+
+    return router_logits, expert_index, expert_affinities, substrate_index
+
+
+def noaux_tc_correct(
+    router_logits: Tensor,
+    correction_bias: Tensor,
+    top_k: int = NOAUX_TC_K,
+    norm_topk_prob: bool = True,
+    routed_scaling_factor: float = 1.0,
+) -> Tuple[Tensor, Tensor]:
+    """`noaux_tc` selection and gate weights from precomputed router logits.
+
+    Args:
+        router_logits: `[T, E]` raw router logits, any `T >= 1`; the token axis is
+            padded to a whole tile before the launch and the outputs sliced back.
+        correction_bias: `[E]` or `[1, E]` `e_score_correction_bias`.
+        top_k: must equal `NOAUX_TC_K`; a mismatch raises rather than reshapes.
+        norm_topk_prob: L1-normalise the selected weights.
+        routed_scaling_factor: final multiplier on the weights.
+
+    Returns:
+        `(expert_index [T, K] int32, expert_affinities [T, E] float32)`.
+        `expert_affinities` is scattered: the gate weight at each selected expert's
+        column, zero elsewhere.
+
+    Raises:
+        NoauxTcRouterError: for a `top_k` or `E` the NKI stage cannot serve.
+    """
+    if router_logits.dim() != 2:
+        raise NoauxTcRouterError(
+            f"router_logits must be 2D [T, E], got shape {tuple(router_logits.shape)}"
+        )
+    num_tokens, num_experts = router_logits.shape
+    bias = _legalize_correction_bias(correction_bias, num_experts)
+
+    if not can_run_noaux_tc_router(router_logits, num_experts, top_k):
+        _count_torch_fallback()
+        return noaux_tc_correct_torch_oracle(
+            router_logits, bias, norm_topk_prob, routed_scaling_factor
+        )
+
+    # Launched without a grid: one program owns every token, so one 128-row tile
+    # is the pad unit (the fused entry needs 256).
+    t_pad = _noaux_tc_pad_target(num_tokens, NOAUX_TC_TILE)
+
+    _count_nki_dispatch()
+    index, affinities = wrap_nki(_noaux_tc_correct_nki)(
+        router_logits=_noaux_tc_pad_tokens(router_logits.to(torch.float32), t_pad),
+        correction_bias=bias,
+        norm_topk_prob=norm_topk_prob,
+        routed_scaling_factor=float(routed_scaling_factor),
+    )
+    # Drop the pad rows; nothing in the stage reduces across tokens.
+    return index[:num_tokens].to(torch.int32), affinities[:num_tokens]
+
+
+def noaux_tc_rmsnorm_router_topk(
+    hidden_states: Tensor,
+    gamma: Tensor,
+    router_weights: Tensor,
+    correction_bias: Tensor,
+    top_k: int = NOAUX_TC_K,
+    eps: float = 1e-6,
+    norm_topk_prob: bool = True,
+    routed_scaling_factor: float = 1.0,
+    router_mm_dtype: torch.dtype = torch.bfloat16,
+    quantization_type: QuantizationType = QuantizationType.NONE,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Fused RMSNorm, router matmul and `noaux_tc` top-8 in one dispatch.
+
+    This is the form the MoE block calls. Args mirror `rmsnorm_router_topk_tkg`, with
+    `correction_bias` in place of `router_bias`: a projection bias is added to the
+    logits, while `e_score_correction_bias` is added to the sigmoid scores for
+    selection only.
+
+    Returns:
+        `(router_logits [T, E], expert_index [T, K] int32,
+          expert_affinities [T, E] float32, substrate_index [T, K] int32)`.
+        `substrate_index` is the nkilib router's own uncorrected selection.
+
+    Raises:
+        AssertionError: from nkilib's `_validate_inputs`, run first on the caller's
+            real shapes, so a wrong `H` raises on the NKI and torch routes alike.
+        NoauxTcRouterError: for a `top_k` or `E` the NKI stage cannot serve.
+    """
+    # nkilib's own validation first; `gamma` is legalised to [1, H] as nkilib does.
+    if gamma.ndim == 1:
+        gamma = gamma.unsqueeze(0)
+    _substrate_validate_inputs(
+        hidden_states,
+        gamma,
+        router_weights,
+        None,
+        top_k,
+        None,
+        quantization_type,
+        RouterActFnType.SIGMOID,
+    )
+
+    b_extent, s_extent, h_extent = hidden_states.shape
+    num_tokens = b_extent * s_extent
+    num_experts = router_weights.shape[1]
+    bias = _legalize_correction_bias(correction_bias, num_experts)
+
+    # Pad to a multiple of 256: the `[2]` launch splits the tokens and each core
+    # needs a whole 128-row tile. Padding runs after validation (which must see the
+    # caller's real shapes) and before the admission gate below (which returns
+    # False on a token extent that is not a multiple of 256). Reshaping to
+    # `[1, T, H]` first puts the pad rows after all real tokens, so one slice
+    # recovers them; padding `S` per batch would interleave them.
+    t_pad = _noaux_tc_pad_target(num_tokens, _NOAUX_TC_T_MULTIPLE)
+    hidden_padded = _noaux_tc_pad_tokens(
+        hidden_states.reshape(1, num_tokens, h_extent), t_pad
+    )
+
+    # Both gates read the padded tensor. nkilib's gate returns False on anything it
+    # would refuse; this module's gate raises on the same extents, so nothing can
+    # be admitted here and refused there.
+    substrate_admits = _substrate_can_use_kernel(
+        hidden_padded, router_weights, router_mm_dtype, quantization_type
+    )
+    seam_admits = can_run_noaux_tc_router(hidden_padded, num_experts, top_k)
+    if not (substrate_admits and seam_admits):
+        _count_torch_fallback()
+        return noaux_tc_rmsnorm_router_topk_torch_oracle(
+            hidden_states,
+            gamma,
+            router_weights,
+            bias,
+            eps,
+            norm_topk_prob,
+            routed_scaling_factor,
+            router_mm_dtype,
+        )
+
+    _count_nki_dispatch()
+    # `[2]` is the SPMD launch grid: the nkilib subkernels shard over two logical
+    # cores (LNC=2).
+    wrapped = wrap_nki(_noaux_tc_rmsnorm_router_topk_nki)
+    logits, index, affinities, substrate_index = wrapped[2](
+        hidden_states=hidden_padded,
+        gamma=gamma,
+        router_weights=router_weights,
+        correction_bias=bias,
+        eps=eps,
+        norm_topk_prob=norm_topk_prob,
+        routed_scaling_factor=float(routed_scaling_factor),
+        router_mm_dtype=_NOAUX_TC_TORCH_TO_NKI_DTYPE[router_mm_dtype],
+    )
+    # All four outputs are `[t_pad, ...]`; slice every one back to the caller's
+    # extent.
+    return (
+        logits[:num_tokens],
+        index[:num_tokens].to(torch.int32),
+        affinities[:num_tokens],
+        substrate_index[:num_tokens].to(torch.int32),
+    )
+
+
+def _legalize_correction_bias(correction_bias: Tensor, num_experts: int) -> Tensor:
+    """Accept `[E]` or `[1, E]`; return a contiguous fp32 `[1, E]`.
+
+    fp32, not the model dtype: the bias decides a discrete selection, and a bf16 bias
+    would quantise the correction to about three decimal digits and merge experts the
+    checkpoint separates.
+    """
+    if correction_bias.dim() == 1:
+        correction_bias = correction_bias.unsqueeze(0)
+    if correction_bias.shape != (1, num_experts):
+        raise NoauxTcRouterError(
+            f"correction_bias must be [E] or [1, E] with E={num_experts}, "
+            f"got shape {tuple(correction_bias.shape)}"
+        )
+    return correction_bias.to(torch.float32).contiguous()
+
+
+def noaux_tc_correct_torch_oracle(
+    router_logits: Tensor,
+    correction_bias: Tensor,
+    norm_topk_prob: bool = True,
+    routed_scaling_factor: float = 1.0,
+) -> Tuple[Tensor, Tensor]:
+    """Torch reference for `noaux_tc`; used only when no Neuron device is available.
+
+    Follows `transformers` 5.16.1 `Glm5NextTextTopkRouter.forward`. Its group-routing
+    stage is omitted: the model has `n_group == 1`, which makes that stage an
+    identity.
+    """
+    logits = router_logits.to(torch.float32)
+    bias = correction_bias.to(torch.float32).reshape(-1)
+    scores = logits.sigmoid()
+    scores_for_choice = scores + bias
+    topk_indices = torch.topk(
+        scores_for_choice, k=NOAUX_TC_K, dim=-1, sorted=False
+    )[1]
+    topk_weights = scores.gather(1, topk_indices)
+    if norm_topk_prob:
+        denominator = topk_weights.sum(dim=-1, keepdim=True) + NOAUX_TC_DENOM_EPS
+        topk_weights = topk_weights / denominator
+    topk_weights = topk_weights * routed_scaling_factor
+
+    affinities = torch.zeros_like(scores)
+    affinities.scatter_(1, topk_indices, topk_weights)
+    return topk_indices.to(torch.int32), affinities
+
+
+def noaux_tc_rmsnorm_router_topk_torch_oracle(
+    hidden_states: Tensor,
+    gamma: Tensor,
+    router_weights: Tensor,
+    correction_bias: Tensor,
+    eps: float = 1e-6,
+    norm_topk_prob: bool = True,
+    routed_scaling_factor: float = 1.0,
+    router_mm_dtype: torch.dtype = torch.bfloat16,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Torch reference for the fused form; used only when no Neuron device is available.
+
+    RMSNorm and matmul follow `rmsnorm_router_topk_tkg._torch_impl`: operands cast to
+    `router_mm_dtype`, accumulation in fp32, matching the tensor engine. A true
+    bf16-accumulation matmul over H flips near-tie expert selections.
+    """
+    b_extent, s_extent, h_extent = hidden_states.shape
+    num_tokens = b_extent * s_extent
+
+    hidden_f32 = hidden_states.to(torch.float32).reshape(num_tokens, h_extent)
+    gamma_f32 = gamma.to(torch.float32)
+    inv_rms = torch.rsqrt(
+        torch.mean(hidden_f32**2, dim=-1, keepdim=True) + eps
+    )
+    norm = (hidden_f32 * inv_rms * gamma_f32).to(router_mm_dtype)
+
+    logits = norm.to(router_mm_dtype).float() @ router_weights.to(
+        router_mm_dtype
+    ).float()
+
+    index, affinities = noaux_tc_correct_torch_oracle(
+        logits, correction_bias, norm_topk_prob, routed_scaling_factor
+    )
+    # The nkilib router's uncorrected selection: top-k on the raw logits.
+    substrate_index = torch.topk(logits, k=NOAUX_TC_K, dim=-1)[1].to(torch.int32)
+    return logits, index, affinities, substrate_index
