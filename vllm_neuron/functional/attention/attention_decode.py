@@ -561,10 +561,10 @@ def scatter_packed_k(
 
     Avoids the whole-cache unswizzle → scatter → reswizzle round-trip on the
     prefill KV-cache write. The packed slot ``[d_head, 2]`` interleaves two
-    adjacent token positions ``(2k, 2k+1)`` into the trailing size-2 dim (lane 0
-    = position 2k, lane 1 = position 2k+1; see :func:`_swizzle_packed_k`).
+    adjacent token positions ``(2k, 2k+1)`` into the trailing size-2 dim (index 0
+    = position 2k, index 1 = position 2k+1; see :func:`_swizzle_packed_k`).
 
-    Rather than a per-token single-lane write — ``k_cache[.., :, p % 2] = ...`` —
+    Rather than a per-token single-entry write — ``k_cache[.., :, p % 2] = ...`` —
     which needs a tensor-valued inner index and a stride-2 partial store that
     does NOT lower on the Neuron backend, we write whole PAIRS: reshape the new
     K rows into ``[num_pairs, d_head, 2]`` and ``index_put_`` on the three
@@ -575,7 +575,7 @@ def scatter_packed_k(
 
     Precondition (holds for prefill, which fills each block contiguously from an
     even position): the rows are pair-aligned — ``k_flat`` is ordered so that
-    consecutive rows ``(2k, 2k+1)`` are the two lanes of one slot, and the token
+    consecutive rows ``(2k, 2k+1)`` are the two entries of one slot, and the token
     count is even. ``k_flat`` is head-major ``[Nkh * tokens, d_head]`` with an
     even ``tokens`` per head, so grouping consecutive rows never crosses a head
     boundary.
@@ -590,16 +590,15 @@ def scatter_packed_k(
     """
     num_rows, d_head = k_flat.shape
 
-    # Precondition: even, pair-aligned row count (rows 2k/2k+1 are the two lanes
-    # of one packed slot). Eager-only: under torch.compile ``num_rows % 2``
-    # branches on a SymInt (GuardOnDataDependentSymNode) and crashes the prefill
-    # compile, so gate on FakeTensor (Dynamo traces with fake inputs;
-    # torch.compiler.is_compiling() is unreliable on the Neuron backend). The
-    # check still runs in eager mode and in test_scatter_packed_k_* with real
-    # tensors. The reshape below uses -1, so it does not need num_rows at trace
-    # time. The rest of the pair-alignment contract (each block filled
-    # contiguously from an even position) is guaranteed by the caller's
-    # slot_mapping.
+    # Precondition: even, pair-aligned row count (rows 2k/2k+1 are the two
+    # entries of one packed slot). Eager-only: under torch.compile
+    # ``num_rows % 2`` branches on a SymInt (GuardOnDataDependentSymNode) and
+    # crashes the prefill compile, so gate on FakeTensor, which is what the
+    # fake-tensor pass hands this function. The check still runs in eager mode
+    # and in test_scatter_packed_k_* with real tensors. The reshape below uses -1,
+    # so it does not need num_rows at trace time. The rest of the pair-alignment
+    # contract (each block filled contiguously from an even position) is
+    # guaranteed by the caller's slot_mapping.
     if not isinstance(k_flat, FakeTensor):
         assert num_rows % 2 == 0, (
             f"scatter_packed_k requires an even, pair-aligned row count (even "
@@ -607,7 +606,7 @@ def scatter_packed_k(
         )
 
     # Group consecutive rows (2k, 2k+1) into packed slots [num_pairs, d_head, 2]:
-    # lane 0 = row 2k, lane 1 = row 2k+1 — matching _swizzle_packed_k.
+    # index 0 = row 2k, index 1 = row 2k+1 — matching _swizzle_packed_k.
     # .contiguous() mirrors _swizzle_packed_k (contiguous after its own transpose):
     # the Neuron index_put_ lowering requires a contiguous value tensor for the
     # dense [d_head, 2] payload (a non-contiguous view passes on CPU but is
