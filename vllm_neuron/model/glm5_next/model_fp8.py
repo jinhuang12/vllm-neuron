@@ -1651,6 +1651,20 @@ class Glm5NextRoutedExperts(nn.Module):
         #
         # Accumulate every expert contribution in token order with one device
         # ``index_add``, in fp32, before restoring the input dtype.
+        # The captured Torch mapping gives each real token at most one row
+        # per block. Preserve block order and the existing final dtype cast.
+        if using_packed and torch.compiler.is_compiling() and tokens > 1:
+            from vllm_neuron.functional.moe.ordered_combine import ordered_combine
+
+            block_h = 512
+            for tile in (2048, 1024):
+                if contribution.shape[1] % (2 * tile) == 0:
+                    block_h = tile
+                    break
+            return ordered_combine(
+                contribution, kernel_row_ids, tokens, BLOCK_H=block_h
+            ).to(hidden_states.dtype)
+
         wanted = torch.where(
             token_position_to_id < 0,
             torch.full_like(token_position_to_id, tokens),
