@@ -1184,19 +1184,21 @@ class NeuronWorker(WorkerBase):
         """Return the bytes the runner allocates for a KV cache budgeted at ``need_bytes``.
 
         vLLM shares one tensor across the same-index layer of every group and
-        sizes its blocks from ``need_bytes``; the runner then gives each recurrent
-        layer its own buffer of that tensor's size, because a recurrent bank is
-        addressed by request slot rather than by block. This total, not
-        ``need_bytes``, is what has to fit the device. No bank is grown beyond it:
-        a latent layer reads only the pages its block table names, so nothing
-        reads past the blocks the scheduler handed out.
+        sizes its blocks from ``need_bytes``. The runner gives each recurrent
+        layer a private buffer. Opted-in KDA layers need only the admitted
+        request slots, with their existing padded page stride; other recurrent
+        layers keep the token pool's size. This physical total must fit the
+        device, while scheduler specs and latent attention pools stay intact.
         """
         from vllm.v1.core.kv_cache_utils import (
             get_kv_cache_config_from_groups,
             get_kv_cache_groups,
         )
 
-        from .neuron_model_runner import kv_cache_allocations
+        from .neuron_model_runner import (
+            kv_cache_allocations,
+            request_indexed_kda_capacities,
+        )
 
         groups = get_kv_cache_groups(
             self.vllm_config, self.model_runner.get_kv_cache_spec()
@@ -1204,7 +1206,15 @@ class NeuronWorker(WorkerBase):
         kv_cache_config = get_kv_cache_config_from_groups(
             self.vllm_config, groups, need_bytes
         )
-        return sum(size for size, _owners in kv_cache_allocations(kv_cache_config))
+        capacities = request_indexed_kda_capacities(
+            self.model_runner.model, self.vllm_config.scheduler_config.max_num_seqs
+        )
+        return sum(
+            size
+            for size, _owners in kv_cache_allocations(
+                kv_cache_config, request_state_capacities=capacities
+            )
+        )
 
     def _determine_available_memory_cpu(self, gpu_mem_util: float) -> int:
         """Compute CPU-mode KV memory budget from fair-share host memory."""

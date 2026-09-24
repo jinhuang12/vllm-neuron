@@ -69,8 +69,7 @@ DECLARED_CACHED_LENGTHS = (7, 19)
 
 #: The two requests' block rows. Neither is a prefix of the other and the second
 #: is deliberately not one ascending run continuing the first, so no single slice of
-#: the bank can serve both; the sparse carrier names one request's pages instead and
-#: refuses the second request, which is the arm the slot tests read.
+#: the bank can serve both; each sparse carrier must keep its own request's pages.
 DECLARED_SPARSE_ROWS = ((0, 1), (4, 5))
 
 #: A row whose pages are neither adjacent nor ascending, which is the shape the
@@ -558,53 +557,63 @@ def test_a1_a_two_request_linear_batch_is_served_through_the_converter() -> None
         )
 
 
-def test_a1_the_sparse_family_refuses_a_second_request_by_name() -> None:
-    """One block table names one request's window, so the carrier says so instead of
-    guessing.
-    """
+def test_a1_the_sparse_family_preserves_each_requests_pages_and_state() -> None:
+    """Concurrent decode keeps each request's table, position, and state view."""
     _require_cpu_mode()
     banks = _banks()
     side = _side_caches(banks)
+    rows = ((4, 1), (6, 2))
+    starts = (DECLARED_PAGE_SIZE + 1, 19)
+    slots = (0, 2)
     geometries = [
         {
-            "block_ids": [int(value) for value in DECLARED_SPARSE_ROWS[0]],
-            "state_slot": 0,
-            "state_slots": [0, 2],
+            "block_ids": list(rows[0]),
+            "block_id_rows": [list(row) for row in rows],
+            "state_slot": slots[0],
+            "state_slots": list(slots),
             "page_size": DECLARED_PAGE_SIZE,
+            "window_blocks": 2,
         }
         for _ in banks
     ]
+    carriers = NeuronModelRunner._glm5next_layer_carriers(
+        banks, side, geometries=geometries, is_prefill=False,
+        tokens=DECLARED_REQUESTS, start_position=starts[0],
+        softmax_scale=float(DECLARED_HEAD_SIZE) ** -0.5,
+        max_seq_len=max(starts) + 1, index_kpool=DECLARED_INDEX_KPOOL,
+        requests=DECLARED_REQUESTS, request_starts=starts,
+    )
+    sparse = carriers[0]
+    assert sparse["latent_cache"] is banks[0]["latent_cache"]
+    for index, (slot, start, row) in enumerate(zip(slots, starts, rows)):
+        assert sparse["block_table_row"][index].flatten().tolist() == list(row)
+        assert sparse["latent_slots"][index].tolist() == [
+            row[start // DECLARED_PAGE_SIZE] * DECLARED_PAGE_SIZE
+            + start % DECLARED_PAGE_SIZE
+        ]
+        assert sparse["seq_lens"][index].tolist() == [start + 1]
+        assert sparse["position"][index].item() == start
+        assert sparse["pool_cache"][index].data_ptr() == side[0]["pool_cache"][slot].data_ptr()
+        assert sparse["tail"][index].data_ptr() == side[0]["tail"][slot].data_ptr()
 
-    with pytest.raises(ValueError, match="one block table names one request's window"):
-        NeuronModelRunner._glm5next_layer_carriers(
-            banks,
-            side,
-            geometries=geometries,
-            is_prefill=False,
-            tokens=DECLARED_REQUESTS,
-            start_position=DECLARED_CACHED_LENGTHS[0],
-            softmax_scale=float(DECLARED_HEAD_SIZE) ** -0.5,
-            max_seq_len=max(DECLARED_CACHED_LENGTHS) + 1,
-            index_kpool=DECLARED_INDEX_KPOOL,
-            requests=DECLARED_REQUESTS,
-            request_starts=list(DECLARED_CACHED_LENGTHS),
-        )
 
-
-def test_a1_the_converter_hands_a_two_request_batch_to_the_sparse_refusal() -> None:
-    """On a hybrid stack the batch is admitted, walked, and refused where the limit is.
-    """
+def test_a1_the_converter_preserves_all_sparse_decode_rows() -> None:
+    """The real converter retains the second request's page and write address."""
     _require_cpu_mode()
     banks = _banks()
     runner = _runner(banks)
-
-    with pytest.raises(ValueError, match="one block table names one request's window"):
-        _two_request_step(
-            runner,
-            banks,
-            tokens=DECLARED_CACHED_LENGTHS[0] * DECLARED_REQUESTS,
-            cached=(0, 0),
-        )
+    metadata = _metadata(
+        banks, tokens=1, sparse_rows=DECLARED_SPARSE_ROWS,
+        state_rows=DECLARED_SPARSE_ROWS, cached=(0, 0),
+    )
+    converted = runner._glm5next_model_kwargs(_generic(tokens=2, metadata=metadata))
+    sparse = converted["layer_carriers"][0]
+    for index, row in enumerate(DECLARED_SPARSE_ROWS):
+        assert sparse["block_table_row"][index].flatten().tolist() == [row[0], -1]
+        assert sparse["latent_slots"][index].tolist() == [row[0] * DECLARED_PAGE_SIZE]
+        assert sparse["seq_lens"][index].tolist() == [1]
+    assert sparse["pool_cache"][0].data_ptr() != sparse["pool_cache"][1].data_ptr()
+    assert sparse["tail"][0].data_ptr() != sparse["tail"][1].data_ptr()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -836,22 +845,16 @@ def test_a2_a_request_skipped_for_one_step_keeps_its_slot_and_state() -> None:
     )
 
 
-def test_a2_a_synthetic_step_takes_no_claim() -> None:
-    """Warmup is served without an identity and leaves the table untouched. """
+def test_a2_a_synthetic_step_refuses_live_owners_without_changing_claims() -> None:
+    """Startup warmup cannot borrow the state of a live request."""
     _require_cpu_mode()
     banks = _banks()
-    runner = _runner(banks)
+    runner = _runner(banks, request_ids=[])
     runner._glm5next_request_slots(banks, ["req-0"], synthetic=False)
     before = dict(runner._glm5next_request_slot_table)
-
-    served = runner._glm5next_request_slots(banks, [None], synthetic=True)
-
-    after = dict(runner._glm5next_request_slot_table)
-    assert served == [0], f"a synthetic step was served slots {served}"
-    assert after == before, (
-        f"a synthetic step changed the slot table from {before} to {after}; warmup "
-        f"is not a sequence step and must take no claim"
-    )
+    with pytest.raises(ValueError, match="startup without live requests"):
+        runner._glm5next_request_slots(banks, [None], synthetic=True)
+    assert runner._glm5next_request_slot_table == before
 
 
 def test_a2_the_prefill_warmups_own_shape_is_served_and_takes_no_claim() -> None:
@@ -1347,3 +1350,16 @@ def test_a8_a_scattered_block_table_is_served_and_named_in_order() -> None:
             f"a sorted row addresses the same rows {if_sorted}, so this test does not "
             f"measure that the table's order was kept"
         )
+
+
+def test_concurrent_sparse_prefill_refuses_before_state_changes() -> None:
+    """The decode bridge does not admit prefill or reset an existing ring."""
+    _require_cpu_mode()
+    banks = _banks()
+    runner = _runner(banks)
+    side = runner._glm5next_live_side_caches(banks)
+    side[0]["tail"].fill_(7)
+    before = side[0]["tail"].clone()
+    with pytest.raises(ValueError, match="concurrent sparse prefill"):
+        _two_request_step(runner, banks, tokens=14, cached=(0, 0))
+    assert torch.equal(side[0]["tail"], before)

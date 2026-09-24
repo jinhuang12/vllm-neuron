@@ -259,6 +259,20 @@ def test_sparse_prefix_keeps_model_width_and_real_request_extent(real_tokens, ca
     if real_tokens is None:
         runner._glm5next_request_slot_table = {"other-request": 1}
         runner._glm5next_side_cache_positions = {1: 17}
+        side = runner._glm5next_side_cache_set
+        side[0]["tail"].fill_(7)
+        before = side[0]["tail"].clone()
+        pointer = side[0]["tail"].data_ptr()
+        with pytest.raises(ValueError, match="startup without live requests"):
+            runner._glm5next_model_kwargs(kwargs)
+        assert runner._glm5next_request_slot_table == {"other-request": 1}
+        assert runner._glm5next_side_cache_positions == {1: 17}
+        assert runner._glm5next_side_cache_set is side
+        assert side[0]["tail"].data_ptr() == pointer
+        assert torch.equal(side[0]["tail"], before)
+        assert kwargs["input_ids"] is input_ids
+        assert torch.equal(input_ids, original_ids)
+        return
 
     converted = runner._glm5next_model_kwargs(kwargs)
 
@@ -291,13 +305,26 @@ def test_sparse_prefix_keeps_model_width_and_real_request_extent(real_tokens, ca
     assert linear["row_mask"].shape == (1, 1024, 1)
     assert torch.all(linear["row_mask"][:, :real])
     assert not torch.any(linear["row_mask"][:, real:])
-    if real_tokens is None:
-        assert runner._glm5next_request_slot_table == {"other-request": 1}
-        assert runner._glm5next_side_cache_positions == {1: 17}
-        assert not hasattr(runner, "_glm5next_side_cache_cursor")
-    else:
-        assert runner._glm5next_side_cache_positions == {0: cached + real}
-        assert runner._glm5next_side_cache_cursor == cached + real
+    assert runner._glm5next_side_cache_positions == {0: cached + real}
+    assert runner._glm5next_side_cache_cursor == cached + real
+
+
+def test_sparse_startup_prefix_keeps_model_width_without_claiming_state():
+    runner, kwargs = _carrier_step(real_tokens=None)
+    converted = runner._glm5next_model_kwargs(kwargs)
+    sparse, linear = converted["layer_carriers"]
+    assert converted["input_ids"].shape == (1024,)
+    assert torch.equal(converted["input_ids"][:128], kwargs["input_ids"])
+    assert torch.count_nonzero(converted["input_ids"][128:]) == 0
+    assert sparse["active_mla_query_rows"] == 128
+    assert sparse["latent_slots"].shape == (1024,)
+    assert int(sparse["prefill_end_position"]) == 128
+    assert linear["row_mask"].shape == (1, 1024, 1)
+    assert torch.all(linear["row_mask"][:, :128])
+    assert not torch.any(linear["row_mask"][:, 128:])
+    assert runner._glm5next_request_slot_table == {}
+    assert runner._glm5next_side_cache_positions == {}
+    assert not hasattr(runner, "_glm5next_side_cache_cursor")
 
 
 def test_sparse_prefix_conversion_uses_host_metadata_during_capture():
@@ -380,7 +407,7 @@ def test_sparse_prefix_rejects_real_count_beyond_selected_width():
 
 def test_sparse_prefill_still_refuses_multiple_requests():
     runner, kwargs = _carrier_step(real_tokens=64, requests=2)
-    with pytest.raises(ValueError, match="serves one sequence per forward"):
+    with pytest.raises(ValueError, match="concurrent sparse prefill"):
         runner._glm5next_model_kwargs(kwargs)
     assert kwargs["input_ids"].shape == (128,)
     assert runner._glm5next_side_cache_positions == {}

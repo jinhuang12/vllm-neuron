@@ -226,6 +226,41 @@ def _resolve_tp_group() -> GroupCoordinator | None:
     return group if group.world_size > 1 else None
 
 
+def _reduce_tp_rows(
+    partials: torch.Tensor, *, num_requests: int = 1
+) -> torch.Tensor:
+    """Sum TP partials with concurrent requests on the contiguous minor axis.
+
+    Interleaving matches singleton sums in the validated TP64 B2 control.
+    Single-request decode and prefill keep their original in-place collective.
+    The caller owns the final dtype cast.
+    """
+    if type(num_requests) is not int or num_requests < 1:
+        raise ValueError("num_requests must be a positive plain integer")
+    if num_requests > 1 and (
+        partials.ndim != 2
+        or int(partials.shape[0]) != num_requests
+        or int(partials.shape[1]) < 1
+        or partials.dtype != torch.float32
+    ):
+        raise ValueError(
+            "concurrent TP reduction requires FP32 [num_requests, hidden] partials"
+        )
+    group = _resolve_tp_group()
+    if group is None:
+        return partials
+    if num_requests == 1:
+        group.all_reduce(partials)
+        return partials
+    # XLA can retain the original physical layout for transpose().contiguous().
+    # Stack makes the request axis explicit in the collective's input layout.
+    packed = torch.stack(
+        tuple(partials[row].reshape(-1) for row in range(num_requests)), dim=1
+    ).contiguous()
+    group.all_reduce(packed)
+    return packed.transpose(0, 1).contiguous()
+
+
 # --------------------------------------------------------------------------- #
 # which parameter families are sharded, and on which dim.
 #
@@ -902,12 +937,15 @@ class Glm5NextHyperConnection(nn.Module):
 
     # ── mHC pre: the folded input, and one Sinkhorn call ──────────────────
     def mhc_pre(
-        self, residual: torch.Tensor
+        self, residual: torch.Tensor, *, num_requests: int = 1
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """The base's ``mhc_pre``, with its Sinkhorn on the batched kernel.
+        """The base's ``mhc_pre``, preserving singleton arithmetic for decode.
 
         Args:
             residual: ``[T, S, H]`` -- the ``S = hc_mult`` residual streams.
+            num_requests: concurrent decode requests, with one row per request.
+                Each request uses the original preparation and Sinkhorn call.
+                The default retains the original batched path for every token count.
 
         Returns:
             ``(post_mix, comb_mix, layer_input)`` -- ``[T, S, 1]``,
@@ -935,6 +973,31 @@ class Glm5NextHyperConnection(nn.Module):
         from vllm_neuron.functional.mhc.sinkhorn import sinkhorn_normalise_blocks
 
         tokens, streams, hidden = self._require_streams(residual)
+        if type(num_requests) is not int or num_requests < 1:
+            raise Glm5NextHyperConnectionError(
+                "num_requests must be a positive integer"
+            )
+        if num_requests > 1 and num_requests != tokens:
+            raise Glm5NextHyperConnectionError(
+                "concurrent decode requires one stream row per request; "
+                f"got {tokens} rows for {num_requests} requests"
+            )
+        if num_requests > 1:
+            # Preserve the complete singleton preparation, including elementwise
+            # operations whose rounding can change with the batch geometry.
+            rows = [
+                self.mhc_pre(residual[row : row + 1])
+                for row in range(num_requests)
+            ]
+            layer_inputs = [row[2] for row in rows]
+            if residual.dtype == torch.bfloat16:
+                # Join in FP32 so the compiled norm retains singleton rounding.
+                # Restore the existing BF16 contract before the sublayer.
+                layer_inputs = [value.to(torch.float32) for value in layer_inputs]
+            return tuple(
+                torch.cat([row[field] for row in rows], dim=0)
+                for field in range(2)
+            ) + (torch.cat(layer_inputs, dim=0).to(residual.dtype),)
 
         flat = residual.reshape(tokens, streams * hidden).to(torch.float32)
         mixes = flat @ self.fn.to(torch.float32).t()
@@ -1045,7 +1108,9 @@ class Glm5NextHyperConnection(nn.Module):
         return mixed.to(residual.dtype)
 
     # ── one layer call ────────────────────────────────────────────────────
-    def forward(self, residual: torch.Tensor, sublayer: object) -> torch.Tensor:
+    def forward(
+        self, residual: torch.Tensor, sublayer: object, *, num_requests: int = 1
+    ) -> torch.Tensor:
         """One mHC layer call: pre, then the sub-block, then post.
 
         Args:
@@ -1053,6 +1118,7 @@ class Glm5NextHyperConnection(nn.Module):
             sublayer: the wrapped sub-block, a callable ``[T, H] -> [T, H]``.
                 Annotated ``object`` rather than ``Callable`` because every
                 import in this section is function-local.
+            num_requests: concurrent decode requests, forwarded to ``mhc_pre``.
 
         Returns:
             ``[T, S, H]`` in the streams' own dtype -- the re-mixed streams,
@@ -1067,7 +1133,12 @@ class Glm5NextHyperConnection(nn.Module):
                 f"sublayer must be a callable [T, H] -> [T, H], got "
                 f"{type(sublayer).__name__}"
             )
-        post_mix, comb_mix, layer_input = self.mhc_pre(residual)
+        if type(num_requests) is not int or num_requests != 1:
+            post_mix, comb_mix, layer_input = self.mhc_pre(
+                residual, num_requests=num_requests
+            )
+        else:
+            post_mix, comb_mix, layer_input = self.mhc_pre(residual)
         x = sublayer(layer_input)
         if not isinstance(x, torch.Tensor) or tuple(x.shape) != tuple(
             layer_input.shape
@@ -3118,6 +3189,7 @@ class Glm5NextKDAAttention(nn.Module):
         chunk_size: int | None = None,
         real_tokens: torch.Tensor | int | None = None,
         row_mask: torch.Tensor | None = None,
+        _return_fp32_partial: bool = False,
     ) -> torch.Tensor:
         """One KDA layer's gated-delta linear attention over ``[T, hidden]``.
 
@@ -3152,6 +3224,10 @@ class Glm5NextKDAAttention(nn.Module):
                 zero for a padding row -- or ``[requests, T, 1]``, one mask per
                 request. Passed together with ``real_tokens``, or neither is
                 passed.
+
+        Concurrent decode keeps per-request arithmetic and combines FP32 output
+        partials for one TP reduction. Concurrent prefill remains unsupported.
+        ``_return_fp32_partial`` defers the reduction and cast to the outer call.
 
         Returns:
             ``[T, hidden]`` at the input dtype.
@@ -3210,16 +3286,8 @@ class Glm5NextKDAAttention(nn.Module):
                 f"hidden_states must be [tokens, hidden]; got shape "
                 f"{tuple(hidden_states.shape)}"
             )
-        # One carrier per request, and the loop is the dispatch. Concurrent requests
-        # hold their states at different slots of one bank, so what arrives here is
-        # a tuple of views -- one per request, in the batch's own order -- rather
-        # than one sequence's state. The views are not copied, which is what makes
-        # the loop correct at all: the recurrence advances its state in place, so
-        # each request's write has to land in the bank row its own view names. The
-        # cost is one dispatch per request per layer, taken deliberately, because
-        # batching the requests would need the kernels to carry a request axis,
-        # which is not this layer's to decide.
-        #
+        # Each request carries views of its own bank slot. Recursion writes
+        # directly to those views and returns its unreduced FP32 output.
         # The position arrives as one int32 tensor with a row per request, and its
         # rows are taken with ``unbind``, a tensor operation: reading the value here
         # to split it would be a host read of tensor data inside a traced region,
@@ -3271,23 +3339,29 @@ class Glm5NextKDAAttention(nn.Module):
         reals = rows[0] if rows[0] is not None else (None,) * requests
         masks = rows[1] if rows[1] is not None else (None,) * requests
         if requests > 1:
-            return torch.cat(
-                [
-                    self.forward(
-                        hidden_states[index : index + 1],
-                        conv_state=conv,
-                        recurrent_state=recurrent,
-                        is_prefill=is_prefill,
-                        start_position=position,
-                        chunk_size=chunk_size,
-                        real_tokens=real,
-                        row_mask=mask,
-                    )
-                    for index, (conv, recurrent, position, real, mask) in enumerate(
-                        zip(*states, reals, masks)
-                    )
-                ],
-                dim=0,
+            # Keep every request's arithmetic shape and state views unchanged.
+            # Only the output collective shares a request dimension.
+            partials = [
+                self.forward(
+                    hidden_states[index : index + 1],
+                    conv_state=conv,
+                    recurrent_state=recurrent,
+                    is_prefill=False,
+                    start_position=position,
+                    chunk_size=chunk_size,
+                    real_tokens=real,
+                    row_mask=mask,
+                    _return_fp32_partial=True,
+                )
+                for index, (conv, recurrent, position, real, mask) in enumerate(
+                    zip(*states, reals, masks)
+                )
+            ]
+            attn_out = torch.cat(partials, dim=0)
+            if _return_fp32_partial:
+                return attn_out
+            return self._finish_output(
+                attn_out, hidden_states.dtype, num_requests=requests
             )
         conv_state, recurrent_state, start_position = (part[0] for part in states)
         real_tokens, row_mask = reals[0], masks[0]
@@ -3527,16 +3601,16 @@ class Glm5NextKDAAttention(nn.Module):
         attn_out = shaped.reshape(tokens, width) @ (
             self.o_proj_weight.to(torch.float32).t()
         )
-        # ``o_proj_weight`` is row-parallel, so this is one rank's partial sum.
-        # Reduce it in fp32, before the cast below: partials add at the width they
-        # were computed in, and reducing after the cast would round each rank's
-        # fraction to the caller's dtype and add the rounded parts instead of
-        # rounding the whole. In place is safe -- ``attn_out`` is a fresh matmul
-        # result, not a view of a cached weight or of the caller's residual.
-        group = _resolve_tp_group()
-        if group is not None:
-            group.all_reduce(attn_out)
-        return attn_out.to(hidden_states.dtype)
+        if _return_fp32_partial:
+            return attn_out
+        return self._finish_output(attn_out, hidden_states.dtype)
+
+    def _finish_output(
+        self, attn_out: torch.Tensor, output_dtype: torch.dtype, *, num_requests: int = 1
+    ) -> torch.Tensor:
+        """Reduce fresh row-parallel partials in FP32, then restore the input dtype."""
+        attn_out = _reduce_tp_rows(attn_out, num_requests=num_requests)
+        return attn_out.to(output_dtype)
 
 
 class Glm5NextKDALayer(nn.Module):
@@ -3665,9 +3739,30 @@ class Glm5NextKDALayer(nn.Module):
                 on a geometry they cannot serve.
         """
 
+        num_requests = (
+            len(conv_state) if not is_prefill and isinstance(conv_state, tuple) else 1
+        )
+
         def attention_half(single_stream: torch.Tensor) -> torch.Tensor:
+            if num_requests > 1 and single_stream.dtype == torch.bfloat16:
+                if single_stream.dim() != 2 or single_stream.shape[0] != num_requests:
+                    raise ValueError(
+                        "concurrent BF16 KDA input norm requires "
+                        "[num_requests, hidden] rows"
+                    )
+                # Per-row norm and the FP32 join preserve the singleton BF16
+                # boundary in compiled decode, as the captured-state replay verified.
+                normed = torch.cat(
+                    [
+                        self._input_norm(single_stream[row : row + 1]).to(torch.float32)
+                        for row in range(num_requests)
+                    ],
+                    dim=0,
+                ).to(single_stream.dtype)
+            else:
+                normed = self._input_norm(single_stream)
             attended = self.attention(
-                self._input_norm(single_stream),
+                normed,
                 conv_state=conv_state,
                 recurrent_state=recurrent_state,
                 is_prefill=is_prefill,
@@ -3683,6 +3778,8 @@ class Glm5NextKDALayer(nn.Module):
         site = _mhc_attention_site(self, streams)
         if site is None:
             return hidden_states + attention_half(hidden_states)
+        if num_requests > 1:
+            return site.forward(streams, attention_half, num_requests=num_requests)
         return site.forward(streams, attention_half)
 
 
@@ -5983,9 +6080,9 @@ class Glm5NextMLAAttention(nn.Module):
         # One cast, used twice, so the value that persists and the value this step
         # reads back cannot differ.
         written = kv_latent.to(latent_cache.dtype)
-        # The persisting write, through the window view into the caller's bank, for
-        # the steps that come after this one.
-        latent_cache[:, 0, :].index_copy_(0, rows, written)
+        # Keep the update shape equal to the input so the compiler chains all
+        # request writes to this bank. Recreated 2D views lose earlier updates.
+        latent_cache.index_copy_(0, rows, written.unsqueeze(1))
 
         # The cache read. The whole bank, as a view, with the block table beside it.
         # The kernel assembles the window the table names and no copy of it is made
@@ -6072,17 +6169,17 @@ class Glm5NextMLAAttention(nn.Module):
         normed_hidden_states: torch.Tensor,
         *,
         latent_cache: torch.Tensor,
-        pool_cache: torch.Tensor,
-        seq_lens: torch.Tensor,
-        start_position: torch.Tensor | int,
+        pool_cache: torch.Tensor | tuple[torch.Tensor, ...],
+        seq_lens: torch.Tensor | tuple[torch.Tensor, ...],
+        start_position: torch.Tensor | int | tuple[torch.Tensor | int, ...],
         softmax_scale: float,
         max_seq_len: int,
         page_size: int,
-        block_table_row: torch.Tensor,
-        latent_slots: torch.Tensor,
+        block_table_row: torch.Tensor | tuple[torch.Tensor, ...],
+        latent_slots: torch.Tensor | tuple[torch.Tensor, ...],
         slot_mapping: torch.Tensor | None = None,
-        tail: torch.Tensor | None = None,
-        position: torch.Tensor | int | None = None,
+        tail: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
+        position: torch.Tensor | int | tuple[torch.Tensor | int, ...] | None = None,
         prefill_tail: torch.Tensor | None = None,
         prefill_end_position: torch.Tensor | int | None = None,
         collector: list[torch.Tensor] | None = None,
@@ -6098,12 +6195,10 @@ class Glm5NextMLAAttention(nn.Module):
         between them. All three consume the same normalised tensor, which is why one
         argument carries it rather than three.
 
-        The three calls are the composition and this method adds nothing to them:
-        the query latent the indexer's ``wq_b`` contracts, the indexer that turns it
-        into selected rows, and :meth:`attend`, which ends in
-        :meth:`project_output`. No numeric is authored here and no refusal is added:
-        every extent and every dial is checked by the callee that owns it, and a
-        second check here is how two authorities on one extent come to disagree.
+        Singleton execution composes the query latent, the indexer, and
+        :meth:`attend`. Concurrent decode dispatches one singleton call per
+        request. The latent bank is shared; page tables and side-cache views
+        belong to each request. Concurrent prefill is refused before writes.
 
         The indices pass through unchanged. The ``-1`` mask lives inside the sparse
         kernel, so no filler, compaction, clamp or mask is applied between the
@@ -6131,6 +6226,58 @@ class Glm5NextMLAAttention(nn.Module):
         number for both readers -- the indexer's pool pages and the latent bank's
         blocks are one page size, which the runner refuses to let disagree.
         """
+        request_operands = {
+            "pool_cache": pool_cache,
+            "seq_lens": seq_lens,
+            "start_position": start_position,
+            "block_table_row": block_table_row,
+            "latent_slots": latent_slots,
+            "tail": tail,
+            "position": position,
+        }
+        if any(isinstance(value, tuple) for value in request_operands.values()):
+            if (
+                slot_mapping is not None
+                or prefill_tail is not None
+                or prefill_end_position is not None
+            ):
+                raise ValueError("concurrent sparse prefill is not supported")
+            if not all(isinstance(value, tuple) for value in request_operands.values()):
+                raise ValueError("concurrent sparse decode needs tuples for all request operands")
+            requests = len(pool_cache)
+            if requests == 0 or any(
+                len(value) != requests for value in request_operands.values()
+            ):
+                raise ValueError("concurrent sparse decode request operand counts must agree")
+            if (
+                normed_hidden_states.ndim != 2
+                or normed_hidden_states.shape[0] != requests
+            ):
+                raise ValueError("concurrent sparse decode needs exactly one hidden row per request")
+            if any(value is None for value in tail) or any(
+                value is None for value in position
+            ):
+                raise ValueError("concurrent sparse decode needs each request's tail and position")
+            if active_mla_query_rows is not None:
+                raise ValueError("concurrent sparse decode does not accept an active prefill prefix")
+            # The sparse/indexer kernels remain singleton kernels. Each call sees
+            # its own pages, physical write slots, and views into its side caches.
+            # Validate the whole batch above before the first in-place write.
+            return torch.cat(
+                [
+                    self.forward(
+                        normed_hidden_states[index:index + 1],
+                        latent_cache=latent_cache,
+                        softmax_scale=softmax_scale,
+                        max_seq_len=max_seq_len,
+                        page_size=page_size,
+                        collector=collector,
+                        **{key: value[index] for key, value in request_operands.items()},
+                    )
+                    for index in range(requests)
+                ],
+                dim=0,
+            )
         q_latent = self.project_query_latent(normed_hidden_states)
         topk_indices = self.indexer(
             normed_hidden_states,
@@ -6237,17 +6384,17 @@ class Glm5NextDSALayer(nn.Module):
         hidden_states: torch.Tensor,
         *,
         latent_cache: torch.Tensor,
-        pool_cache: torch.Tensor,
-        seq_lens: torch.Tensor,
-        start_position: torch.Tensor | int,
+        pool_cache: torch.Tensor | tuple[torch.Tensor, ...],
+        seq_lens: torch.Tensor | tuple[torch.Tensor, ...],
+        start_position: torch.Tensor | int | tuple[torch.Tensor | int, ...],
         softmax_scale: float,
         max_seq_len: int,
         page_size: int,
-        block_table_row: torch.Tensor,
-        latent_slots: torch.Tensor,
+        block_table_row: torch.Tensor | tuple[torch.Tensor, ...],
+        latent_slots: torch.Tensor | tuple[torch.Tensor, ...],
         slot_mapping: torch.Tensor | None = None,
-        tail: torch.Tensor | None = None,
-        position: torch.Tensor | int | None = None,
+        tail: torch.Tensor | tuple[torch.Tensor, ...] | None = None,
+        position: torch.Tensor | int | tuple[torch.Tensor | int, ...] | None = None,
         prefill_tail: torch.Tensor | None = None,
         prefill_end_position: torch.Tensor | int | None = None,
         streams: torch.Tensor | None = None,
@@ -6331,6 +6478,9 @@ class Glm5NextDSALayer(nn.Module):
         site = _mhc_attention_site(self, streams)
         if site is None:
             return hidden_states + attention_half(hidden_states)
+        num_requests = len(pool_cache) if isinstance(pool_cache, tuple) else 1
+        if num_requests > 1:
+            return site.forward(streams, attention_half, num_requests=num_requests)
         return site.forward(streams, attention_half)
 
 
@@ -6496,6 +6646,7 @@ class Glm5NextModel(nn.Module):
         tp_degree: int,
         expert_parallel_rank: int | torch.Tensor,
         collector: list[torch.Tensor] | None = None,
+        num_requests: int = 1,
     ) -> torch.Tensor:
         """One layer's feed-forward contribution, without its residual add.
 
@@ -6595,9 +6746,7 @@ class Glm5NextModel(nn.Module):
         # In place is safe against aliasing for the same reason it is at
         # ``project_output``: both branches return a freshly allocated tensor, so
         # neither is a view of a cached weight or of the residual the caller holds.
-        group = _resolve_tp_group()
-        if group is not None:
-            group.all_reduce(out)
+        out = _reduce_tp_rows(out, num_requests=num_requests)
         mixed = out.to(hidden_states.dtype)
         if collector is not None:
             collector.append(mixed)
@@ -6745,9 +6894,16 @@ class Glm5NextModel(nn.Module):
             # always taken, and mixes its unchanged return back. ``streams`` is never
             # ``None`` here, so this is a site or a refusal, never the plain add.
             site = _mhc_ffn_site(layer, streams)
+            request_states = carrier.get("conv_state", carrier.get("pool_cache"))
+            num_requests = (
+                len(request_states)
+                if isinstance(request_states, tuple)
+                and not carrier.get("is_prefill", False)
+                else 1
+            )
             streams = site.forward(
                 streams,
-                lambda single_stream, layer=layer, collector=(
+                lambda single_stream, layer=layer, num_requests=num_requests, collector=(
                     taps if index in tap_layers else None
                 ): self._ffn_half(
                     layer,
@@ -6758,7 +6914,9 @@ class Glm5NextModel(nn.Module):
                     tp_degree=tp_degree,
                     expert_parallel_rank=expert_parallel_rank,
                     collector=collector,
+                    **({"num_requests": num_requests} if num_requests > 1 else {}),
                 ),
+                **({"num_requests": num_requests} if num_requests > 1 else {}),
             )
             if collect_layer_streams and index < DUMP_STREAM_LAYERS:
                 collected.append(streams)
@@ -7450,6 +7608,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
     convention, the same pair ``llama3/factory.py`` uses -- so neither side is
     renamed here.
     """
+
+    # KDA banks are indexed by live request slots, independently of token pages.
+    request_indexed_kda_state = True
 
     def __init__(self, config: Glm5NextConfig) -> None:
         super().__init__()
