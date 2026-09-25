@@ -6263,6 +6263,7 @@ class Glm5NextMLAAttention(nn.Module):
             # The sparse/indexer kernels remain singleton kernels. Each call sees
             # its own pages, physical write slots, and views into its side caches.
             # Validate the whole batch above before the first in-place write.
+            # Join in FP32 to preserve the singleton cast path before MHC post.
             return torch.cat(
                 [
                     self.forward(
@@ -6273,11 +6274,11 @@ class Glm5NextMLAAttention(nn.Module):
                         page_size=page_size,
                         collector=collector,
                         **{key: value[index] for key, value in request_operands.items()},
-                    )
+                    ).to(torch.float32)
                     for index in range(requests)
                 ],
                 dim=0,
-            )
+            ).to(normed_hidden_states.dtype)
         q_latent = self.project_query_latent(normed_hidden_states)
         topk_indices = self.indexer(
             normed_hidden_states,
@@ -6439,8 +6440,21 @@ class Glm5NextDSALayer(nn.Module):
         unchanged.
         """
 
+        num_requests = len(pool_cache) if isinstance(pool_cache, tuple) else 1
+
         def attention_half(single_stream: torch.Tensor) -> torch.Tensor:
-            normed = self._input_norm(single_stream)
+            if num_requests > 1 and single_stream.dtype == torch.bfloat16:
+                if single_stream.dim() != 2 or single_stream.shape[0] != num_requests:
+                    raise ValueError("DSA decode rows must match request carriers")
+                normed = torch.cat(
+                    [
+                        self._input_norm(single_stream[row : row + 1]).to(torch.float32)
+                        for row in range(num_requests)
+                    ],
+                    dim=0,
+                ).to(single_stream.dtype)
+            else:
+                normed = self._input_norm(single_stream)
             if collector is not None:
                 # What the attention half was actually handed: the stream the
                 # hyper-connection site collapsed, and that stream normalised. The
@@ -6478,7 +6492,6 @@ class Glm5NextDSALayer(nn.Module):
         site = _mhc_attention_site(self, streams)
         if site is None:
             return hidden_states + attention_half(hidden_states)
-        num_requests = len(pool_cache) if isinstance(pool_cache, tuple) else 1
         if num_requests > 1:
             return site.forward(streams, attention_half, num_requests=num_requests)
         return site.forward(streams, attention_half)
