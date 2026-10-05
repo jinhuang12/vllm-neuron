@@ -873,6 +873,8 @@ def test_the_six_families_differ_between_ranks_and_nothing_else_does(
         f"{path}.{leaf}"
         for path, _module, leaf, _dim, _full in _sharded_leaves(rank0)
     }
+    # The root head is vocab-parallel: model_fp8._SHARD_GEOMETRY["Glm5NextForConditionalGeneration"].
+    declared_sharded |= {"lm_head_weight"}
     assert declared_sharded, "this file declares no sharded family"
 
     left = dict(rank0.named_parameters())

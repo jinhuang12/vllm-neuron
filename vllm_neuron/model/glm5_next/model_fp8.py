@@ -7678,6 +7678,22 @@ class _MetaShapeCheckpoint(SafetensorsCheckpoint):
             cached_files_store.add(file_name, 1)
 
 
+def _lm_head_vocab_shard_width(module: nn.Module, world_size: int) -> int:
+    from vllm_neuron.functional.lm_head import vocab_shard_width
+
+    return vocab_shard_width(module, world_size)
+
+
+# The vocab-parallel head: each rank loads its 154880 / 64 = 2420 rows and the
+# logits site all-gathers them back to [B, vocab] (``functional/lm_head.py``).
+# Registered beside the class that declares the leaf rather than inside the table.
+_SHARD_GEOMETRY["Glm5NextForConditionalGeneration"] = {
+    "lm_head_weight": _DeclaredShard(
+        0, _lm_head_vocab_shard_width, "vocab-parallel -- the logits are all-gathered"
+    ),
+}
+
+
 class Glm5NextForConditionalGeneration(nn.Module):
     """The blockwise-FP8 glm-5.3-Flash implementation.
 
@@ -8800,7 +8816,16 @@ class Glm5NextForConditionalGeneration(nn.Module):
         else:
             hidden_states, layer_streams = stack_output, ()
         rows = torch.index_select(hidden_states, dim=0, index=sampling_positions)
-        logits = torch.nn.functional.linear(rows, head)
+        from vllm_neuron.functional.lm_head import vocab_parallel_logits
+
+        # A vocab-shard head projects this rank's rows and all-gathers on device,
+        # so every rank still returns the full [B, vocab] logits.
+        logits = vocab_parallel_logits(
+            rows,
+            head,
+            vocab_size=int(self.text_config.vocab_size),
+            group=_resolve_tp_group(),
+        )
         if device_sampling_params is not None:
             logits = sample_full_vocab(
                 logits, device_sampling_params, sampling_config, device_logit_mask
