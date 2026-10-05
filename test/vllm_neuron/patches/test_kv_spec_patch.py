@@ -9,7 +9,8 @@ patch, applying it twice leaves exactly one wrapper layer, the wrapped original
 stays reachable and returns upstream's own result on input upstream already
 unifies, the widening pads a recurrent-state page, a non-recurrent refusal still
 raises, upstream really reaches the wrapped call site, and the plugin still loads
-when ``vllm`` is imported first.
+when ``vllm`` is imported first. Also covered: the two recurrent-geometry helpers
+the module exports, the unpadded slot size and the recurrent spec's block size.
 
 The spec objects are built here with arithmetic-chosen sizes. They are shaped
 like a hybrid set -- a recurrent-state ``MambaSpec`` beside an attention spec,
@@ -462,3 +463,69 @@ def test_plugin_loads_when_vllm_is_imported_first():
         "the patch was wired but never bound in the production order, so the "
         f"widening is inert there and engine start would still raise: {readings}"
     )
+
+
+def test_a_recurrent_slot_is_the_state_geometry_not_the_padded_page():
+    """A slot is every carrier's bytes, rounded up to the alignment, pad ignored."""
+    from dataclasses import replace
+
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    from vllm_neuron.vllm.patches.kv_spec_patch import (
+        RECURRENT_SLOT_ALIGN_BYTES,
+        recurrent_state_slot_bytes,
+    )
+
+    assert RECURRENT_SLOT_ALIGN_BYTES == 256
+    widened = _recurrent_spec(NON_DIVIDING_SHAPES)
+    padded = replace(widened, page_size_padded=_attention_spec().page_size_bytes)
+    # 16384 * 4 + 32768 * 4 = 196608 B, already a multiple of 256.
+    assert padded.page_size_bytes == 262144
+    assert recurrent_state_slot_bytes(padded) == 196608, (
+        "the slot followed the padded page, so a bank would hold the pad"
+    )
+    # 3 * 4 + 5 * 4 = 32 B rounds up to one 256 B alignment unit.
+    assert recurrent_state_slot_bytes(_recurrent_spec(((3,), (5,)))) == 256
+    # The GLM-5.3-Flash layer at TP=64: bf16 conv (3, 384) and fp32 (1, 128, 128).
+    glm = MambaSpec(
+        block_size=128,
+        shapes=((3, 384), (1, 128, 128)),
+        dtypes=(torch.bfloat16, torch.float32),
+    )
+    assert recurrent_state_slot_bytes(glm) == 3 * 384 * 2 + 128 * 128 * 4 == 67840
+
+
+@pytest.mark.parametrize(
+    ("mamba_block_size", "prefix_caching", "expected"),
+    [
+        ("absent", True, 128),
+        (None, True, 128),
+        (128, True, 128),
+        (8192, False, 8192),
+    ],
+)
+def test_the_recurrent_block_size_is_mamba_block_size_when_set(
+    mamba_block_size, prefix_caching, expected
+):
+    """Unset or equal reads as the attention block; a set value is reported as is."""
+    from types import SimpleNamespace
+
+    from vllm_neuron.vllm.patches.kv_spec_patch import recurrent_spec_block_size
+
+    cache_config = SimpleNamespace(block_size=128, enable_prefix_caching=prefix_caching)
+    if mamba_block_size != "absent":
+        cache_config.mamba_block_size = mamba_block_size
+    assert recurrent_spec_block_size(cache_config) == expected
+
+
+def test_a_recurrent_block_size_with_prefix_caching_on_is_refused_by_name():
+    """vLLM's coordinator would assert at engine start; the refusal names the fix."""
+    from types import SimpleNamespace
+
+    from vllm_neuron.vllm.patches.kv_spec_patch import recurrent_spec_block_size
+
+    cache_config = SimpleNamespace(
+        block_size=128, mamba_block_size=8192, enable_prefix_caching=True
+    )
+    with pytest.raises(ValueError, match="--no-enable-prefix-caching"):
+        recurrent_spec_block_size(cache_config)

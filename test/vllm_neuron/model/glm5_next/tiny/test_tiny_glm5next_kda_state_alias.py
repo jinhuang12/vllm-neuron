@@ -200,11 +200,21 @@ def _reference_states(world: SimpleNamespace, rows: torch.Tensor) -> list[torch.
     return [torch.stack(state) for state in carried]
 
 
-def test_two_steps_leave_each_recurrent_sharer_its_own_state(tmp_path, monkeypatch):
-    """A prefill and one decode leave each sharer its own state, equal to its solo run."""
+@pytest.mark.parametrize("sequence_long_recurrent_block", [False, True])
+def test_two_steps_leave_each_recurrent_sharer_its_own_state(
+    tmp_path, monkeypatch, sequence_long_recurrent_block
+):
+    """A prefill and one decode leave each sharer its own state, equal to its solo run.
+
+    Run twice: at the attention block size, and with ``--mamba-block-size`` set to
+    ``max_model_len`` (the gate's serve line), where the recurrent group's block spans
+    the sequence and its block table is one entry wide.
+    """
     e2e._require_cpu_mode()
     world = _recurrent_layers(RECURRENT_LAYERS)
     config = first._engine_config()
+    if sequence_long_recurrent_block:
+        config.cache_config.mamba_block_size = config.model_config.max_model_len
     root = e2e._fixture()["root"]
     spec = _spec_with_real_recurrent_layers(root, world.layers, int(config.cache_config.block_size))
     monkeypatch.setattr(root, "get_kv_spec", lambda: spec)
@@ -228,12 +238,30 @@ def test_two_steps_leave_each_recurrent_sharer_its_own_state(tmp_path, monkeypat
             f"every recurrent layer must share the first raw tensor, or nothing here can "
             f"alias: {sharers}"
         )
+        recurrent_block = {
+            spec.block_size for spec in specs.values() if isinstance(spec, MambaSpec)
+        }
+        if sequence_long_recurrent_block:
+            assert recurrent_block == {config.model_config.max_model_len}
+        else:
+            assert recurrent_block == {int(config.cache_config.block_size)}
+        # One slot per concurrent sequence, not one per pool block.
+        assert {int(bank["state_slots"]) for bank in recurrent} == {
+            int(config.scheduler_config.max_num_seqs)
+        }
+        (state_block_size,) = recurrent_block
 
         def step(tokens: int, cached: int) -> list[dict]:
             metadata = e2e._grouped_metadata(
                 banks, tokens=tokens, sparse_row=blocks, state_row=[blocks[0]],
                 sparse_cached=cached, state_cached=cached,
             )
+            # The recurrent group's own entry, at its own block size.
+            state = e2e._entry(
+                row=[blocks[0]], tokens=tokens, cached=cached, threshold=1,
+                block_size=state_block_size,
+            )
+            metadata.update({bank["name"]: state for bank in recurrent})
             kwargs = runner._glm5next_model_kwargs(
                 e2e._generic(tokens=tokens, metadata=metadata, sampling_row=tokens - 1)
             )

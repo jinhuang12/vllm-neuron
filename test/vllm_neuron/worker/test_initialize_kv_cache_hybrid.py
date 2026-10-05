@@ -58,6 +58,12 @@ NUM_BLOCKS_TINY = 3
 #: The longest sequence the fake runner admits, handed to ``InputBatch``.
 MAX_MODEL_LEN = 256
 
+#: The fake runner's concurrent-sequence bound, ``max_num_reqs``. A recurrent bank
+#: holds one slot per concurrent sequence, so this, not the block count, is its
+#: leading extent. Different from both block counts above, so a bank sized by
+#: blocks cannot pass as one sized by slots.
+STATE_SLOTS = 4
+
 #: What the allocator raises for a spec class it has no branch for.
 UNSUPPORTED_SPEC_MESSAGE = "Unsupported Attention spec type"
 
@@ -99,7 +105,7 @@ def _drive(kv_cache_config, layers, monkeypatch: pytest.MonkeyPatch) -> dict:
         speculative_config=None,
         drafter=None,
         device=torch.device("cpu"),
-        max_num_reqs=4,
+        max_num_reqs=STATE_SLOTS,
         max_model_len=MAX_MODEL_LEN,
         max_num_batched_tokens=256,
         vocab_size=128,
@@ -183,13 +189,13 @@ def _model_reported_head_size(raw: dict) -> int:
 
 
 def _addressable_page_bytes(spec) -> int:
-    """Bytes of one page that an allocated buffer can actually reach.
+    """Bytes of one page (attention) or one slot (recurrent) a buffer can reach.
 
-    A recurrent state occupies only its own geometry while the page it reports is
-    padded up to the attention page. The allocator packs both states at the front
-    of the page and makes the block stride the whole page, so a returned view
-    spans the geometry and never the pad. An attention page has no pad, so
-    ``page_size_bytes`` is already the addressable answer there.
+    A recurrent state occupies only its own geometry while the page it reports to
+    vLLM is padded up to the attention page. The allocator gives each recurrent
+    layer one slot per concurrent sequence of exactly that geometry, so a returned
+    view spans the geometry and there is no pad to skip. An attention page has no
+    pad, so ``page_size_bytes`` is already the addressable answer there.
     """
     from vllm.v1.kv_cache_interface import MambaSpec
 
@@ -201,9 +207,19 @@ def _addressable_page_bytes(spec) -> int:
     )
 
 
+def _entries_per_buffer(spec, num_blocks: int) -> int:
+    """Pages (attention) or slots (recurrent) one entry's buffer holds."""
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    return STATE_SLOTS if isinstance(spec, MambaSpec) else num_blocks
+
+
 def _addressable_bytes(specs: dict, num_blocks: int) -> int:
-    """Every entry's addressable page, times the blocks per entry."""
-    return sum(_addressable_page_bytes(spec) * num_blocks for spec in specs.values())
+    """Every entry's addressable page or slot, times the pages or slots it holds."""
+    return sum(
+        _addressable_page_bytes(spec) * _entries_per_buffer(spec, num_blocks)
+        for spec in specs.values()
+    )
 
 
 def _kda_natural_pages(specs: dict, kda_names: list) -> list:
@@ -285,12 +301,12 @@ def test_recurrent_entries_allocate_both_state_buffers(
         recurrent_elements = math.prod(layer.kda_recurrent_state_shape)
         assert len(tiny[name]) == 2
         conv_buffer, recurrent_buffer = tiny[name]
-        assert conv_buffer.numel() == NUM_BLOCKS_TINY * conv_elements
-        assert recurrent_buffer.numel() == NUM_BLOCKS_TINY * recurrent_elements
+        assert conv_buffer.numel() == STATE_SLOTS * conv_elements
+        assert recurrent_buffer.numel() == STATE_SLOTS * recurrent_elements
         assert conv_buffer.dtype is layer.kda_conv_state_dtype
         assert recurrent_buffer.dtype is layer.kda_recurrent_state_dtype
-        assert conv_buffer.shape[0] == NUM_BLOCKS_TINY
-        assert recurrent_buffer.shape[0] == NUM_BLOCKS_TINY
+        assert conv_buffer.shape[0] == STATE_SLOTS
+        assert recurrent_buffer.shape[0] == STATE_SLOTS
 
     # The two states must not overlap inside the page: write one, read the other
     # back. A wrong storage offset shows here as a corrupted read.
@@ -299,11 +315,13 @@ def test_recurrent_entries_allocate_both_state_buffers(
     recurrent_buffer.fill_(2)
     assert torch.all(conv_buffer == 1)
     assert torch.all(recurrent_buffer == 2)
-    # Distinct blocks are distinct storage, so a collapsed block stride shows.
-    for block in range(NUM_BLOCKS_TINY):
-        conv_buffer[block].fill_(block + 3)
-    per_block = [float(conv_buffer[b].flatten()[0]) for b in range(NUM_BLOCKS_TINY)]
-    assert per_block == [float(b + 3) for b in range(NUM_BLOCKS_TINY)]
+    # Distinct slots are distinct storage, so a collapsed slot stride shows.
+    for slot in range(STATE_SLOTS):
+        conv_buffer[slot].fill_(slot + 3)
+    per_slot = [float(conv_buffer[b].flatten()[0]) for b in range(STATE_SLOTS)]
+    assert per_slot == [float(b + 3) for b in range(STATE_SLOTS)]
+    # And the recurrent state of every slot survived the conv writes untouched.
+    assert torch.all(recurrent_buffer == 2)
 
     # ---- Stage 2: the same assertions at 45 layers, allocation counted. ------
     layers = _fake_layers(raw)
@@ -315,8 +333,8 @@ def test_recurrent_entries_allocate_both_state_buffers(
     two_buffer_entries = [name for name in kda_names if len(caches[name]) == 2]
     element_counts = {
         (
-            caches[n][0].numel() // NUM_BLOCKS_FULL,
-            caches[n][1].numel() // NUM_BLOCKS_FULL,
+            caches[n][0].numel() // STATE_SLOTS,
+            caches[n][1].numel() // STATE_SLOTS,
         )
         for n in kda_names
     }
@@ -399,10 +417,17 @@ def test_the_allocated_bytes_reconcile_with_the_pages_the_specs_report(
     requested = _counting_zeros(monkeypatch)
     caches = _drive(_config(specs, NUM_BLOCKS_FULL), layers, monkeypatch)
 
-    # page_size_bytes read off the spec objects, times the blocks. That page is
-    # padded, so this is the requested span rather than the addressable one.
+    # What the allocator was asked for: the latent pages vLLM's config sized, and
+    # one slot per concurrent sequence for each recurrent layer.
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    from vllm_neuron.vllm.patches.kv_spec_patch import recurrent_state_slot_bytes
+
     expected_bytes = sum(
-        spec.page_size_bytes * NUM_BLOCKS_FULL for spec in specs.values()
+        recurrent_state_slot_bytes(spec) * STATE_SLOTS
+        if isinstance(spec, MambaSpec)
+        else spec.page_size_bytes * NUM_BLOCKS_FULL
+        for spec in specs.values()
     )
     allocated = _allocated_bytes(caches)
 
@@ -413,17 +438,22 @@ def test_the_allocated_bytes_reconcile_with_the_pages_the_specs_report(
     # Per entry too, so a compensating pair of errors cannot net to zero.
     per_entry = {
         name: sum(b.numel() * b.element_size() for b in buffers)
-        - _addressable_page_bytes(specs[name]) * NUM_BLOCKS_FULL
+        - _addressable_page_bytes(specs[name])
+        * _entries_per_buffer(specs[name], NUM_BLOCKS_FULL)
         for name, buffers in caches.items()
     }
     assert set(per_entry.values()) == {0}
 
-    # Both sides of this one read page_size_bytes: the config sizes each raw
-    # tensor from that page and the counter records what was asked for, so the pad
-    # raises the two together. The buffers handed back span less, which is what
-    # the addressable zero above reads.
+    # The counter records what was asked for: no recurrent pad is requested, so
+    # the buffers handed back span exactly what was allocated. The recurrent spec
+    # still reports the padded attention page to vLLM's pool; one recurrent slot
+    # is smaller than that page.
     assert sum(requested) == expected_bytes
-    assert allocated - expected_bytes != 0
+    assert allocated == expected_bytes
+    assert all(
+        recurrent_state_slot_bytes(specs[n]) < specs[n].page_size_bytes
+        for n in kda_names
+    )
 
     # page_size_padded is set on the recurrent entries only, and both carriers are
     # present, so the vendor's pairing cannot have truncated the sum above.

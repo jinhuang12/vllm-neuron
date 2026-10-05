@@ -61,12 +61,18 @@ BLOCKS_PER_GROUP_PER_SEQUENCE = -(-MAX_MODEL_LEN // BLOCK_SIZE_TOKENS)
 BLOCKS_PER_REQUEST = TOTAL_GROUPS * BLOCKS_PER_GROUP_PER_SEQUENCE
 EXPECTED_BLOCKS = BLOCKS_PER_REQUEST * MAX_NUM_SEQS + 1
 EXPECTED_NEED_BYTES = EXPECTED_BLOCKS * PAGE_SIZE_BYTES * LAYERS_PER_POOL
+# One request slot of one recurrent layer at this degree: the bf16 short-conv
+# state (kernel - 1 = 3 rows of 3 x 128 channels for the one head per rank) and
+# the fp32 128 x 128 recurrent state. 67840 bytes, already a multiple of the
+# runner's 256-byte slot alignment.
+RECURRENT_SLOT_BYTES = 3 * 3 * 128 * BF16_BYTES + 128 * 128 * 4
 # What the runner allocates once vLLM has sized the blocks from that need: the
-# latent pools as vLLM laid them out, plus one bank of the same size for every
-# recurrent layer, because a recurrent bank is addressed by request slot and
-# cannot share a tensor with any other layer.
+# latent pools as vLLM laid them out, plus, for every recurrent layer, its own
+# bank of one slot per concurrent sequence, because a recurrent bank is
+# addressed by request slot and cannot share a tensor with any other layer.
 EXPECTED_FOOTPRINT_BYTES = (
-    EXPECTED_BLOCKS * PAGE_SIZE_BYTES * (LAYERS_PER_POOL + RECURRENT_LAYERS)
+    EXPECTED_BLOCKS * PAGE_SIZE_BYTES * LAYERS_PER_POOL
+    + RECURRENT_LAYERS * MAX_NUM_SEQS * RECURRENT_SLOT_BYTES
 )
 
 # A pool priced at one block per recurrent group: the allocator refuses a
