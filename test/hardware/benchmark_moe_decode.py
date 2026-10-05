@@ -180,9 +180,26 @@ def scenario_hits(tokens: int, pattern, layer: int):
 # ---- Graphs ----------------------------------------------------------------- #
 
 
+#: The served model's neuronx-cc arguments (``neuron_model_runner`` at -O1, fp8
+#: on trn2). The model build turns the BIR verifier off; with it on, the 5938748
+#: ``compact_decode_kernel`` does not compile (its dynamic SBUF read takes an
+#: int32 offset where the verifier wants uint32). ``NEURON_CC_FLAGS`` overrides.
+MODEL_COMPILER_ARGS = [
+    "--auto-cast=none",
+    "-O1",
+    "--internal-hlo2tensorizer-options=--modular-flow-mac-threshold=10 "
+    "--experimental-unsafe-fp8e4m3fn-as-fp8e4m3",
+    "--internal-backend-options=--enable-verifier=false --enable-nested-dynamic-loop",
+]
+
+
+def compiler_args():
+    return os.environ.get("NEURON_CC_FLAGS") or MODEL_COMPILER_ARGS
+
+
 def compile_fn(fn):
     return torch.compile(fn, backend="neuron_libtorch", fullgraph=True, dynamic=False,
-                         options={"compiler_args": os.environ.get("NEURON_CC_FLAGS", "")})
+                         options={"compiler_args": compiler_args()})
 
 
 def router_graph(variant: str, layers: int, baseline):
@@ -455,6 +472,7 @@ def main() -> None:
         "environment": {k: os.environ.get(k) for k in (
             "NEURON_RT_VISIBLE_CORES", "NEURON_LOGICAL_NC_CONFIG", "NEURON_CC_FLAGS",
             "NEURON_PLATFORM_TARGET_OVERRIDE", "NEURON_LIBTORCH_CACHE_ROOT")},
+        "compiler_args": compiler_args(),
         "baseline_module": str(args.baseline_module.resolve()),
         "method": __doc__.split("Method.")[1].strip(),
         "programs": {
