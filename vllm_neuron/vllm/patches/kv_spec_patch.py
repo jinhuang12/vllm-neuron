@@ -42,10 +42,16 @@ site is a module-global lookup inside the target module itself, and no other
 module under ``vllm/`` holds a ``from ... import`` copy of the symbol.
 
 Binding cannot always happen at import time; see :func:`_install_deferred`.
+
+The padded page is only what vLLM's block pool sees. The runner keeps each
+recurrent layer's state in its own bank addressed by request slot, so
+:func:`recurrent_state_slot_bytes` gives the runner and the worker the bytes one
+request slot really holds.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import fields as dataclass_fields
 from dataclasses import replace
 
@@ -296,3 +302,25 @@ def apply_kv_spec_patch() -> None:
         return
 
     _install(kv_cache_utils)
+
+
+#: Alignment of one request slot in a recurrent-state bank. Every state dtype's
+#: size divides it, and the GLM-5.3-Flash slot at TP=64 (67840 B) is already a
+#: multiple, so there it adds no padding.
+RECURRENT_SLOT_ALIGN_BYTES = 256
+
+
+def recurrent_state_slot_bytes(spec) -> int:
+    """Return the bytes one request slot of a recurrent-state bank occupies.
+
+    This is the state's own geometry (every carrier's shape times its dtype size),
+    rounded up to :data:`RECURRENT_SLOT_ALIGN_BYTES`. It is not
+    ``spec.page_size_bytes``: this patch pads that page up to the attention page so
+    that vLLM's single block pool sees one page size, and the pad holds nothing.
+    """
+    state_bytes = sum(
+        math.prod(shape) * dtype.itemsize
+        for shape, dtype in zip(spec.shapes, spec.dtypes, strict=True)
+    )
+    align = RECURRENT_SLOT_ALIGN_BYTES
+    return -(-state_bytes // align) * align

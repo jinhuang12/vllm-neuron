@@ -58,6 +58,7 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import (
 from contextlib import contextmanager
 
 from vllm_neuron import envs
+from vllm_neuron.vllm.patches.kv_spec_patch import recurrent_state_slot_bytes
 from vllm_neuron.utils.neuron_utils import model_forward_context
 from vllm_neuron.vllm.worker.neuron_ec_connector_model_runner_mixin import (
     ECLoadFailure,
@@ -356,6 +357,8 @@ def _compute_slot_mapping_cpu(
 
 def kv_cache_allocations(
     kv_cache_config: KVCacheConfig,
+    *,
+    state_slots: int,
 ) -> list[tuple[int, list[str]]]:
     """Return the raw buffers to allocate for a KV cache config, as (bytes, layer names) pairs.
 
@@ -363,8 +366,17 @@ def kv_cache_allocations(
     (``MambaSpec``) layers: their state is addressed by request slot rather than by
     block, so two of them on one buffer would overwrite each other's state, and a
     recurrent slot would overlay the same-numbered block of a latent layer sharing
-    the buffer. Each recurrent layer gets its own buffer of the shared size.
+    the buffer. Each recurrent layer gets its own buffer of ``state_slots`` request
+    slots, one :func:`recurrent_state_slot_bytes` each. ``state_slots`` is the
+    engine's concurrent-sequence bound (``max_num_seqs``): the slot table hands out
+    slots ``0 .. state_slots - 1`` and never a block id, so a bank as long as the
+    shared block pool would hold rows no request can reach.
     """
+    if int(state_slots) <= 0:
+        raise ValueError(
+            f"a recurrent-state bank holds one slot per concurrent sequence, so "
+            f"state_slots must be positive; got {state_slots!r}"
+        )
     spec_of = {
         name: group.kv_cache_spec
         for group in kv_cache_config.kv_cache_groups
@@ -381,7 +393,8 @@ def kv_cache_allocations(
         if shared:
             allocations.append((tensor.size, shared))
         for name in recurrent:
-            allocations.append((tensor.size, [name]))
+            slot_bytes = recurrent_state_slot_bytes(spec_of[name])
+            allocations.append((int(state_slots) * slot_bytes, [name]))
     return allocations
 
 
@@ -10005,12 +10018,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             is_pooling_model=self.is_pooling_model,
         )
 
-        # Each recurrent layer gets its own buffer (see ``kv_cache_allocations``).
-        # A latent bank is exactly the scheduler's blocks: the layer reads the pages
-        # its block table names, so nothing is read past a request's own blocks and
-        # no spare window is needed.
+        # Each recurrent layer gets its own buffer of one slot per concurrent
+        # sequence (see ``kv_cache_allocations``). A latent bank is exactly the
+        # scheduler's blocks: the layer reads the pages its block table names, so
+        # nothing is read past a request's own blocks and no spare window is needed.
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
-        for size, owners in kv_cache_allocations(kv_cache_config):
+        for size, owners in kv_cache_allocations(
+            kv_cache_config, state_slots=self.max_num_reqs
+        ):
             raw_tensor = torch.zeros(size, dtype=torch.int8, device=self.device)
             for layer_name in owners:
                 kv_cache_raw_tensors[layer_name] = raw_tensor
@@ -10139,34 +10154,36 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # shapes[1]/dtypes[1] the recurrent state, in the order
             # ``get_kv_cache_spec`` constructs them and upstream's page formula
             # pairs them, so the allocation walks the carriers rather than naming
-            # a state. The page comes from the spec: ``page_size_bytes`` honours
-            # ``page_size_padded``, so ``num_blocks`` and every stride below
-            # follow the padded page.
+            # a state. The bank is addressed by request slot, so its leading axis
+            # is the slot count ``kv_cache_allocations`` sized it for and its
+            # stride is one slot, ``recurrent_state_slot_bytes``: the state's own
+            # geometry, not the attention-sized ``page_size_bytes`` the spec
+            # reports to vLLM's block pool.
             elif isinstance(kv_cache_spec, MambaSpec):
                 for layer_name in group.layer_names:
                     raw_tensor = kv_cache_raw_tensors[layer_name]
-                    page_size_bytes = kv_cache_spec.page_size_bytes
-                    assert raw_tensor.numel() % page_size_bytes == 0
+                    slot_bytes = recurrent_state_slot_bytes(kv_cache_spec)
+                    assert raw_tensor.numel() % slot_bytes == 0
 
-                    num_blocks = raw_tensor.numel() // page_size_bytes
+                    num_slots = raw_tensor.numel() // slot_bytes
 
-                    # Both states live side by side inside each page, so each
-                    # state is a block-strided view of the same raw buffer: the
-                    # block stride is the whole page and the within-block
+                    # Both states live side by side inside each slot, so each
+                    # state is a slot-strided view of the same raw buffer: the
+                    # slot stride is the whole slot and the within-slot
                     # strides are contiguous for that state's own shape.
                     # ``strict=True`` because upstream pairs the two carriers
                     # with a non-strict zip, so a short ``dtypes`` tuple would
-                    # silently under-allocate the page.
+                    # silently under-allocate the slot.
                     state_tensors = []
                     state_offset_bytes = 0
                     for shape, dtype in zip(
                         kv_cache_spec.shapes, kv_cache_spec.dtypes, strict=True
                     ):
                         dtype_size = dtype.itemsize
-                        # The page must be a whole number of this state's
-                        # elements, or the block stride below would truncate.
-                        assert page_size_bytes % dtype_size == 0
-                        target_shape = (num_blocks, *shape)
+                        # The slot must be a whole number of this state's
+                        # elements, or the slot stride below would truncate.
+                        assert slot_bytes % dtype_size == 0
+                        target_shape = (num_slots, *shape)
                         # Contiguous strides for the target shape, read off a
                         # meta tensor: correct by construction and allocating
                         # no storage for a reading used only as arithmetic.
@@ -10177,14 +10194,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                                 _shared_dtype_view(raw_tensor, dtype),
                                 size=target_shape,
                                 stride=(
-                                    page_size_bytes // dtype_size,
+                                    slot_bytes // dtype_size,
                                     *contiguous[1:],
                                 ),
                                 storage_offset=state_offset_bytes // dtype_size,
                             )
                         )
-                        # Advance by this state's own per-block footprint, so the
-                        # next carrier starts where this one ends inside a page.
+                        # Advance by this state's own per-slot footprint, so the
+                        # next carrier starts where this one ends inside a slot.
                         state_offset_bytes += contiguous[0] * dtype_size
 
                     kv_caches[layer_name] = state_tensors

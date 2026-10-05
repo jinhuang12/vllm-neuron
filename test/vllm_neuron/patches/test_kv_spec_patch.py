@@ -9,7 +9,8 @@ patch, applying it twice leaves exactly one wrapper layer, the wrapped original
 stays reachable and returns upstream's own result on input upstream already
 unifies, the widening pads a recurrent-state page, a non-recurrent refusal still
 raises, upstream really reaches the wrapped call site, and the plugin still loads
-when ``vllm`` is imported first.
+when ``vllm`` is imported first. Also covered: the unpadded recurrent slot size
+the module exports.
 
 The spec objects are built here with arithmetic-chosen sizes. They are shaped
 like a hybrid set -- a recurrent-state ``MambaSpec`` beside an attention spec,
@@ -462,3 +463,33 @@ def test_plugin_loads_when_vllm_is_imported_first():
         "the patch was wired but never bound in the production order, so the "
         f"widening is inert there and engine start would still raise: {readings}"
     )
+
+
+def test_a_recurrent_slot_is_the_state_geometry_not_the_padded_page():
+    """A slot is every carrier's bytes, rounded up to the alignment, pad ignored."""
+    from dataclasses import replace
+
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    from vllm_neuron.vllm.patches.kv_spec_patch import (
+        RECURRENT_SLOT_ALIGN_BYTES,
+        recurrent_state_slot_bytes,
+    )
+
+    assert RECURRENT_SLOT_ALIGN_BYTES == 256
+    widened = _recurrent_spec(NON_DIVIDING_SHAPES)
+    padded = replace(widened, page_size_padded=_attention_spec().page_size_bytes)
+    # 16384 * 4 + 32768 * 4 = 196608 B, already a multiple of 256.
+    assert padded.page_size_bytes == 262144
+    assert recurrent_state_slot_bytes(padded) == 196608, (
+        "the slot followed the padded page, so a bank would hold the pad"
+    )
+    # 3 * 4 + 5 * 4 = 32 B rounds up to one 256 B alignment unit.
+    assert recurrent_state_slot_bytes(_recurrent_spec(((3,), (5,)))) == 256
+    # The GLM-5.3-Flash layer at TP=64: bf16 conv (3, 384) and fp32 (1, 128, 128).
+    glm = MambaSpec(
+        block_size=128,
+        shapes=((3, 384), (1, 128, 128)),
+        dtypes=(torch.bfloat16, torch.float32),
+    )
+    assert recurrent_state_slot_bytes(glm) == 3 * 384 * 2 + 128 * 128 * 4 == 67840

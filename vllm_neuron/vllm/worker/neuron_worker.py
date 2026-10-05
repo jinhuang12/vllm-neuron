@@ -1185,8 +1185,9 @@ class NeuronWorker(WorkerBase):
 
         vLLM shares one tensor across the same-index layer of every group and
         sizes its blocks from ``need_bytes``; the runner then gives each recurrent
-        layer its own buffer of that tensor's size, because a recurrent bank is
-        addressed by request slot rather than by block. This total, not
+        layer its own bank of one request slot per concurrent sequence
+        (``max_num_seqs``), because a recurrent bank is addressed by request slot
+        rather than by block. This total, not
         ``need_bytes``, is what has to fit the device. No bank is grown beyond it:
         a latent layer reads only the pages its block table names, so nothing
         reads past the blocks the scheduler handed out.
@@ -1204,7 +1205,13 @@ class NeuronWorker(WorkerBase):
         kv_cache_config = get_kv_cache_config_from_groups(
             self.vllm_config, groups, need_bytes
         )
-        return sum(size for size, _owners in kv_cache_allocations(kv_cache_config))
+        return sum(
+            size
+            for size, _owners in kv_cache_allocations(
+                kv_cache_config,
+                state_slots=self.vllm_config.scheduler_config.max_num_seqs,
+            )
+        )
 
     def _determine_available_memory_cpu(self, gpu_mem_util: float) -> int:
         """Compute CPU-mode KV memory budget from fair-share host memory."""
