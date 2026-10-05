@@ -179,7 +179,8 @@ def expert_decode_kernel(hidden, affinity, rank, weights, scales, bounds,
     per_bank = max(1, _BANK // tokens)  # product slots of T fp32 columns per bank
 
     def visit_expert(slot):
-        expert_sb = _tile(1, 1, nl.int32)
+        # uint32: the hardware's dynamic SBUF reads take an unsigned offset.
+        expert_sb = _tile(1, 1, nl.uint32)
         nisa.tensor_copy(dst=expert_sb, src=visit.ap(
             pattern=[[max(experts + 1, 8), 1], [1, 1]],
             scalar_offset=slot, indirect_dim=1))
