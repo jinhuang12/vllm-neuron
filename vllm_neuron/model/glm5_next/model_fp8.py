@@ -3342,6 +3342,10 @@ class Glm5NextKDAAttention(nn.Module):
         )
         from vllm_neuron.functional.kda.decode_state import kda_decode_step
         from vllm_neuron.functional.kda.depthwise_conv1d import depthwise_conv1d
+        from vllm_neuron.functional.kda.fused_decode import (
+            fused_decode_enabled,
+            kda_fused_decode,
+        )
         from vllm_neuron.functional.kda.gate_clamp import (
             MAX_TILE as GATE_MAX_TILE,
             kda_gate_clamp,
@@ -3500,6 +3504,35 @@ class Glm5NextKDAAttention(nn.Module):
         # owner's history.
         opening = _start_is_zero(start_position, conv_state.device)
 
+        # A one-token decode step takes the fused kernel: the conv, the gate and the
+        # state step in one launch, which selects zero history and state for an
+        # opening request from the same position. Its carriers come back as new
+        # tensors and are written through the bank views here, as stages 1 and 5
+        # below write them. VLLM_NEURON_KDA_FUSED_DECODE=0 restores the stages.
+        if not is_prefill and tokens == 1 and fused_decode_enabled():
+            fused = kda_fused_decode(
+                q_in,
+                k_in,
+                v_in,
+                raw_gate,
+                raw_beta,
+                conv_state=conv_state.unsqueeze(0),
+                recurrent_state=recurrent_state.unsqueeze(0),
+                q_conv1d_weight=self.q_conv1d_weight,
+                k_conv1d_weight=self.k_conv1d_weight,
+                v_conv1d_weight=self.v_conv1d_weight,
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                gate_lower_bound=self.gate_lower_bound,
+                conv_state_dim_first=self.kda_conv_state_dim_first,
+                start_position=start_position,
+                real_tokens=real_tokens,
+                row_mask=row_mask,
+            )
+            conv_state.copy_(fused.conv_state[0])
+            recurrent_state.copy_(fused.recurrent_state[0])
+            return self._gated_output(fused.core, out_gate, hidden_states)
+
         # --- 1: the short convolution, one call for q, k and v ---------------
         # The three streams are convolved together as one channel block, which is
         # the same channel extent the state calculator reports
@@ -3653,6 +3686,16 @@ class Glm5NextKDAAttention(nn.Module):
 
             recurrent_state[h] = state.to(recurrent_state.dtype)
 
+        return self._gated_output(core, out_gate, hidden_states)
+
+    def _gated_output(
+        self, core: torch.Tensor, out_gate: torch.Tensor, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        """The attention output from ``core`` (``[tokens, H*K]`` float32)."""
+        tokens = int(core.shape[0])
+        heads = int(self.num_kv_heads_per_rank)
+        kdim = int(self.head_dim)
+        width = heads * kdim
         # --- gated output norm, then the output projection -------------------
         # ``rmsnorm(core) * sigmoid(out_gate)``, normalised over the head extent
         # because the norm gain is one value per key channel. The reference
