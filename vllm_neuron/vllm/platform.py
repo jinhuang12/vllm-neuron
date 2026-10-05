@@ -737,6 +737,17 @@ class NeuronPlatform(Platform):
             "configured",
             arch,
         )
+        from vllm_neuron.model.neuron_config import OnDeviceSamplingConfig
+
+        if not OnDeviceSamplingConfig(**dict(sampler_config)).all_greedy:
+            # Measured on trn2 by test/hardware/benchmark_sampler_decode.py.
+            logger.warning(
+                "%s uses the full on-device sampler: its top-k over the full vocabulary "
+                "costs about 16-18 ms per decode step on trn2 at any batch, against "
+                "about 0.14 ms for argmax at B=1. Set on_device_sampling_config."
+                "all_greedy=true when every request is greedy",
+                arch,
+            )
         return True
 
     @classmethod

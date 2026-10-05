@@ -85,6 +85,43 @@ def test_knob_on_refuses_data_parallel_sampling(knob_on):
         ).create_engine_config()
 
 
+def _with_sampler(sampler: dict):
+    return fr.EngineArgs(
+        model=str(fr.FIXTURE), skip_tokenizer_init=True, max_model_len=e2e.E2E_MAX_SEQ_LEN,
+        max_num_seqs=1, max_num_batched_tokens=e2e.E2E_MAX_SEQ_LEN,
+        block_size=tiny.MLA_PAGE_SIZE, enforce_eager=True, enable_prefix_caching=False,
+        additional_config={"neuron_config": {
+            "num_batched_tokens_buckets": [fr.PREFILL_BUCKET, e2e.E2E_MAX_SEQ_LEN],
+            "num_seqs_buckets": [1],
+            "on_device_sampling_config": sampler,
+        }},
+    ).create_engine_config()
+
+
+SLOW_ROW = "top-k over the full vocabulary"
+
+
+@pytest.mark.parametrize("sampler", [{}, {"all_greedy": False}, None])
+def test_knob_on_warns_that_the_full_sampler_is_slow(knob_on, sampler):
+    """trn2 measured ``torch.topk`` over all 154,880 entries at ~16 ms per call at any B
+    (test/hardware/benchmark_sampler_decode.py); argmax alone is ~0.14 ms at B=1. An
+    absent key (``None`` here) means NeuronConfig's default, which is the full sampler."""
+    with fr._platform_rows() as rows:
+        if sampler is None:
+            fr._engine_config(async_scheduling=False)
+        else:
+            _with_sampler(sampler)
+    assert any(SLOW_ROW in row and "all_greedy" in row for row in rows), rows
+
+
+@pytest.mark.parametrize("sampler", [{"all_greedy": True}, {"all_greedy": "true"}])
+def test_knob_on_with_a_greedy_only_sampler_does_not_warn(knob_on, sampler):
+    with fr._platform_rows() as rows:
+        _with_sampler(sampler)
+    assert not any(SLOW_ROW in row for row in rows), rows
+    assert any("On-device sampling is on" in row for row in rows), rows
+
+
 def test_knob_off_still_refuses_an_explicit_sampler_config(monkeypatch):
     monkeypatch.delenv(KNOB, raising=False)
     with pytest.raises(ValueError, match="no on-device sampler"):
