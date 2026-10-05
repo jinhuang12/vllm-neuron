@@ -5032,7 +5032,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         pins it to that position. The runner keeps the int for its own arithmetic and
         hands the layers this tensor.
         """
-        return torch.tensor(int(position), dtype=torch.int32, device=device)
+        return torch.tensor(int(position), dtype=torch.int32).to(device)
 
     @staticmethod
     def _glm5next_real_row_extent(
@@ -5559,6 +5559,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     f"against operands {request_width} row(s) wide; a request holds at "
                     f"least one token and never more than the width it was padded into"
                 )
+        # These operands describe the step, not a layer's state. Assemble the
+        # request axis on the host and upload once per device; torch.stack on
+        # already-uploaded operands adds an eager device operation per layer.
+        # Keep the caches local to this call so positions and masks cannot survive
+        # into a later request or a synthetic capture step.
+        linear_step_operands: dict = {}
+        sparse_step_operands: dict = {}
         carriers: list[dict] = []
         for bank, side, geometry in zip(banks, side_caches, geometries):
             state_slots = [
@@ -5582,15 +5589,22 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                             f"slot(s) and this request was given slot "
                             f"{int(one_slot)}"
                         )
-                # One pair per request, stacked on a leading request axis:
-                # ``[requests, 1]`` and ``[requests, width, 1]``. The layer splits
-                # them beside the states; each entry has the one-sequence shape.
-                extents = [
-                    cls._glm5next_real_row_extent(
-                        request_width, one_real, bank["recurrent_state"].device
-                    )
-                    for one_real in reals
-                ]
+                device = bank["recurrent_state"].device
+                if device not in linear_step_operands:
+                    linear_step_operands[device] = {
+                        "start_position": cls._glm5next_start_positions(starts, device),
+                        "real_tokens": torch.tensor(
+                            [[one_real] for one_real in reals], dtype=torch.int32
+                        ).to(device),
+                        "row_mask": torch.tensor(
+                            [
+                                [[1.0]] * one_real
+                                + [[0.0]] * (request_width - one_real)
+                                for one_real in reals
+                            ],
+                            dtype=torch.float32,
+                        ).to(device),
+                    }
                 # One entry per request. Two requests' states are two rows of one
                 # bank, so they travel as a tuple of views, never a copy: the
                 # recurrence advances in place. The positions are one tensor so no
@@ -5605,11 +5619,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                             for one_slot in state_slots
                         ),
                         "is_prefill": bool(is_prefill),
-                        "start_position": cls._glm5next_start_positions(
-                            starts, bank["recurrent_state"].device
-                        ),
-                        "real_tokens": torch.stack([part[0] for part in extents]),
-                        "row_mask": torch.stack([part[1] for part in extents]),
+                        **linear_step_operands[device],
                     }
                 )
                 continue
@@ -5686,6 +5696,30 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # bank needs no spare blocks.
             latent = bank["latent_cache"]
             device = latent.device
+            if device not in sparse_step_operands:
+                shared = {
+                    "seq_lens": cls._glm5next_batch_row_seq_lens(
+                        [(tokens, start_position)], device=device
+                    ),
+                    "start_position": cls._glm5next_start_position(
+                        start_position, device
+                    ),
+                }
+                if is_prefill:
+                    shared["slot_mapping"] = cls._glm5next_batch_pool_slot_mapping(
+                        [(tokens, start_position)],
+                        index_kpool=index_kpool,
+                        device=device,
+                        real_tokens=[real],
+                    )
+                    shared["prefill_end_position"] = cls._glm5next_start_position(
+                        int(start_position) + real, device
+                    )
+                else:
+                    shared["position"] = cls._glm5next_start_position(
+                        start_position, device
+                    )
+                sparse_step_operands[device] = shared
             carrier = {
                 "latent_cache": latent,
                 # The block table as a ``[pages, 1]`` int32 column padded with
@@ -5709,12 +5743,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 # This request's own row of each side cache, so two requests in one
                 # batch reach disjoint views.
                 "pool_cache": side["pool_cache"][state_slot],
-                # The batch form even at one request, so both paths share one
-                # derivation.
-                "seq_lens": cls._glm5next_batch_row_seq_lens(
-                    [(tokens, start_position)], device=device
-                ),
-                "start_position": cls._glm5next_start_position(start_position, device),
+                **sparse_step_operands[device],
                 "softmax_scale": float(softmax_scale),
                 "max_seq_len": int(max_seq_len),
                 "page_size": int(geometry["page_size"]),
@@ -5722,12 +5751,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             if active_mla_query_rows is not None:
                 carrier["active_mla_query_rows"] = active_mla_query_rows
             if is_prefill:
-                carrier["slot_mapping"] = cls._glm5next_batch_pool_slot_mapping(
-                    [(tokens, start_position)],
-                    index_kpool=index_kpool,
-                    device=device,
-                    real_tokens=[real],
-                )
                 # The prefill leg seeds this chunk's remainder into the ring
                 # (``seed_tail``): the keys for those positions exist only inside
                 # that forward. The end position is passed as a tensor rather than
@@ -5737,16 +5760,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 # slots past it hold no token of this sequence. A negative end is
                 # already rejected above, while the position is still a number.
                 carrier["prefill_tail"] = side["tail"][state_slot]
-                carrier["prefill_end_position"] = cls._glm5next_start_position(
-                    int(start_position) + real, device
-                )
             else:
                 # The decode position chooses the ring slot this token's key is
                 # written to, so it rides as a tensor for the same reason.
                 carrier["tail"] = side["tail"][state_slot]
-                carrier["position"] = cls._glm5next_start_position(
-                    start_position, device
-                )
             carriers.append(carrier)
         return carriers
 
@@ -6137,10 +6154,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 rank, ep_rank, ep_degree, tp_degree,
             )
             self._glm5next_parallel_reported = True
+        rank_operands = getattr(self, "_glm5next_ep_rank_operands", None)
+        if rank_operands is None:
+            rank_operands = self._glm5next_ep_rank_operands = {}
+        rank_key = (device, ep_rank)
+        if rank_key not in rank_operands:
+            rank_operands[rank_key] = torch.full(
+                (1,), ep_rank, dtype=torch.int64, device=device
+            )
         return {
             "moe_group": moe_group,
             "tp_degree": tp_degree,
-            "expert_parallel_rank": torch.full((1,), ep_rank, dtype=torch.int64, device=device),
+            "expert_parallel_rank": rank_operands[rank_key],
         }
 
     def _glm5next_position_arm(

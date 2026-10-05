@@ -645,13 +645,13 @@ def test_the_indexer_bound_is_one_number_at_two_consecutive_steps() -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 # check 12. The runner hands both ring positions down as tensors.
 # ══════════════════════════════════════════════════════════════════════════════
-def test_the_runner_hands_both_ring_positions_down_as_tensors() -> None:
+@pytest.mark.parametrize("device", ["cpu", "meta"])
+def test_the_runner_hands_both_ring_positions_down_as_tensors(device) -> None:
     """The two keys the ring seams are fed by: a tensor on both legs, at two positions.
     """
     _require_cpu_mode()
-    meta = torch.device("meta")
     text_config = Glm5NextTextConfig()
-    bank = _bank(DECLARED_HEAD_SIZE, device=meta)
+    bank = _bank(DECLARED_HEAD_SIZE, device=device)
     legs = (
         ("prefill", True, DECLARED_PREFILL_TOKENS, "prefill_end_position"),
         ("decode", False, DECLARED_TOKENS, "position"),
@@ -672,7 +672,10 @@ def test_the_runner_hands_both_ring_positions_down_as_tensors() -> None:
                 f"which a captured graph turns into the constant it was captured with"
             )
             assert value.dtype == torch.int32
-            assert value.device.type == "meta"
+            assert value.device.type == device
+            if device == "cpu":
+                expected = position + tokens if is_prefill else position
+                assert value.item() == expected
             forms.setdefault(name, []).append({
                 held: tuple(item.shape) for held, item in carrier.items()
                 if torch.is_tensor(item)
@@ -688,31 +691,3 @@ def test_the_runner_hands_both_ring_positions_down_as_tensors() -> None:
     assert (len(_geometry(position=0, tokens=DECLARED_TOKENS)["block_ids"])
             != len(_geometry(position=DECLARED_SEGMENT,
                             tokens=DECLARED_TOKENS)["block_ids"]))
-
-    # And the source side of the same sentence, by ``ast`` over the builder: each key is
-    # assigned once, and from the helper that makes a tensor -- not from an ``int``.
-    # The builder's own host arithmetic stays an int on purpose; what this counts is the
-    # value that leaves for the traced region.
-    tree = ast.parse(textwrap.dedent(
-        inspect.getsource(NeuronModelRunner._glm5next_layer_carriers)
-    ))
-    made: dict[str, list[str]] = {"position": [], "prefill_end_position": []}
-    for node in ast.walk(tree):
-        target = node.targets[0] if isinstance(node, ast.Assign) else None
-        if not isinstance(target, ast.Subscript):
-            continue
-        held = getattr(target.slice, "value", None)
-        if getattr(target.value, "id", None) == "carrier" and held in made:
-            value = node.value
-            made[held].append(
-                getattr(value.func, "attr", None) or getattr(value.func, "id", "?")
-                if isinstance(value, ast.Call) else type(value).__name__
-            )
-
-    for held, spelled in made.items():
-        # One equality carries both halves: assigned once, and from the tensor helper.
-        assert spelled == ["_glm5next_start_position"], (
-            f"'{held}' is assigned {len(spelled)} time(s) in the builder and the last is "
-            f"{spelled[-1] if spelled else 'nothing'}; the one value that leaves for the "
-            f"traced region has to be the tensor the helper makes"
-        )

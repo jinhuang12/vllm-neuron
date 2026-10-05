@@ -29,6 +29,7 @@ options. There is no torch attention fallback; an inadmissible geometry raises.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 
 import torch
@@ -944,7 +945,7 @@ def _score_tiles(topk: int, block_n: int = MOVING_MAX) -> tuple[tuple[int, int],
 
 
 def _load_selected_rows(dst, cache_hbm, indices_hbm, offset, width):
-    """Gather one 128-row tile from HBM, widening to FP32 on the DMA.
+    """Gather one 128-row tile from HBM in the destination's dtype.
 
     The signed clamp makes every DMA address valid before the attention mask
     removes sentinel columns. The gather preserves index order and duplicates.
@@ -968,10 +969,11 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
     ``KEY_CHUNK`` and fit the matmul moving axis. Changing it changes the softmax
     merge grouping; the default keeps the untiled body's arithmetic order.
 
-    Streaming gathers ``[KEY_CHUNK, latent]`` FP32 rows straight from HBM. One
-    transpose supplies MM1, and MM2 reuses the gathered rows. Staging instead loads
-    the full cache once and gathers from SBUF. Both preserve duplicate indices and
-    mask -1.
+    Streaming prefill gathers ``[KEY_CHUNK, latent]`` rows in the cache's stored
+    dtype. One native-dtype transpose supplies MM1's FP32 operands, and MM2
+    widens each gathered chunk after MM1 has finished. A single-query call keeps
+    DMA widening, avoiding MM2's extra copy on decode. Staging instead loads the
+    full cache once and gathers from SBUF. Both preserve duplicates and mask -1.
 
     The geometry gate restricts this body to exact latent tiles that fit one MM2
     moving tile; other latent shapes take the other bodies.
@@ -1023,7 +1025,16 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
         q_stage.append(_stage(q_lift_hbm, LATENT_TILE, block))
     q_lift_t = _sbuf(LATENT_TILE, n_latent, _aligned(block))
     c_g = _sbuf(LATENT_TILE, n_latent, tile_max)
-    c_g_t = _sbuf(KEY_CHUNK, chunk_max, latent)
+    native_kv = STREAM_KV and seq > 1 and c_kv_hbm.dtype != nl.float32
+    if native_kv:
+        c_g_t = nl.ndarray((KEY_CHUNK, chunk_max, latent),
+                          dtype=c_kv_hbm.dtype, buffer=nl.sbuf)
+    else:
+        c_g_t = _sbuf(KEY_CHUNK, chunk_max, latent)
+    # MM1 no longer reads c_g once scores_ps is complete. Its first latent-wide
+    # slice can then hold MM2's FP32 moving chunk, so native KV storage does not
+    # need a second FP32 cache-shaped allocation. Matmul operands remain FP32.
+    c_mm2 = c_g.reshape((LATENT_TILE, n_latent * tile_max))[:, 0:latent]
     p_t = _sbuf(KEY_CHUNK, chunk_max, _aligned(heads))
     p = _sbuf(heads, tile_max)
     neg_row_max = _scalar(heads)
@@ -1034,7 +1045,13 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
     q_pe_t = _sbuf(rope, _aligned(block)) if rope > 0 else None
     q_pe_stage = _stage(q_pe_hbm, rope, block) if rope > 0 else None
     k_pe_g = _sbuf(rope, tile_max) if rope > 0 else None
-    k_pe_rows = _sbuf(KEY_CHUNK, _aligned(rope))[:, 0:rope] if rope > 0 and STREAM_KV else None
+    k_pe_rows = None
+    if rope > 0 and STREAM_KV:
+        if native_kv:
+            k_pe_rows = nl.ndarray((KEY_CHUNK, _aligned(rope, STAGE_ALIGN)),
+                                   dtype=k_pe_hbm.dtype, buffer=nl.sbuf)[:, 0:rope]
+        else:
+            k_pe_rows = _sbuf(KEY_CHUNK, _aligned(rope))[:, 0:rope]
 
     # ---- the running state carried across score tiles ----------------------------
     # `run_pos` holds `softmax_scale * (running row max)` in positive form, because
@@ -1078,7 +1095,12 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
     # ---- the queries, in blocks whose Q rows fill one 16-row transpose ----------
     # One transpose per latent tile lands the block's Q rows in the source dtype and
     # one copy widens them; each query then reads its own columns of the block tile.
-    for qb in nl.affine_range(seq // qpb):
+    # A two-program grid partitions independent query blocks across the two PNCs
+    # of one LNC2 core. Each program owns its SBUF and optional private-HBM window,
+    # and writes disjoint query rows into the entry's shared-HBM output.
+    n_prgs = nl.num_programs(axes=0)
+    prg_id = nl.program_id(0)
+    for qb in nl.affine_range(prg_id, seq // qpb, n_prgs):
         q0 = qb * qpb
         for li in range(n_latent):
             _transpose_rows(q_stage[li], q_lift_hbm, latent, block, LATENT_TILE,
@@ -1111,7 +1133,13 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
                         _load_selected_rows(c_g_t[:, ck, :], c_kv_hbm, topk_hbm,
                                             q_idx * topk + ks + cs, latent)
                         for li in range(n_latent):
-                            gathered_ps = _psum(LATENT_TILE, KEY_CHUNK)
+                            # Transposition is data movement: BF16/FP16 cache
+                            # values remain exact when widened afterwards. A
+                            # native transpose avoids FP32's wider working set
+                            # and FP32 Tensor Engine transpose instructions.
+                            gathered_ps = nl.ndarray(
+                                (LATENT_TILE, KEY_CHUNK),
+                                dtype=c_g_t.dtype, buffer=nl.psum)
                             nisa.nc_transpose(dst=gathered_ps, data=c_g_t[
                                 :, ck, li * LATENT_TILE:(li + 1) * LATENT_TILE])
                             nisa.tensor_copy(dst=c_g[:, li, cs:cs + KEY_CHUNK],
@@ -1119,7 +1147,8 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
                         if rope > 0:
                             _load_selected_rows(k_pe_rows, k_pe_hbm, topk_hbm,
                                                 q_idx * topk + ks + cs, rope)
-                            rope_ps = _psum(rope, KEY_CHUNK)
+                            rope_ps = nl.ndarray((rope, KEY_CHUNK),
+                                                  dtype=k_pe_rows.dtype, buffer=nl.psum)
                             nisa.nc_transpose(dst=rope_ps, data=k_pe_rows)
                             nisa.tensor_copy(dst=k_pe_g[:, cs:cs + KEY_CHUNK], src=rope_ps)
                 else:
@@ -1182,8 +1211,13 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
                     nisa.tensor_copy(dst=p_t[:, ck, 0:heads], src=p_t_ps)
                 pv_ps = _psum(heads, latent)
                 for ck in range(n_chunks):
-                    nisa.nc_matmul(dst=pv_ps, stationary=p_t[:, ck, 0:heads],
-                                   moving=c_g_t[:, ck, :], accumulate=(ck > 0))
+                    if native_kv:
+                        nisa.tensor_copy(dst=c_mm2, src=c_g_t[:, ck, :])
+                        nisa.nc_matmul(dst=pv_ps, stationary=p_t[:, ck, 0:heads],
+                                       moving=c_mm2, accumulate=(ck > 0))
+                    else:
+                        nisa.nc_matmul(dst=pv_ps, stationary=p_t[:, ck, 0:heads],
+                                       moving=c_g_t[:, ck, :], accumulate=(ck > 0))
 
                 # ---- the merge ------------------------------------------------------
                 if single:
@@ -1585,18 +1619,31 @@ def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
     q_lift_in = _kernel_operand(q_lift)
     c_kv_in = _kernel_operand(c_kv)
     topk_i32 = topk_indices.contiguous().to(torch.int32)
+    nope_call = wrap_nki(nope_entry)
+    # Only the measured production geometry uses both physical halves. Requiring
+    # explicit LNC2 preserves single-PNC launches in LNC1 or unspecified sessions;
+    # a single query block keeps its original launch and arithmetic order.
+    if (
+        os.environ.get("NEURON_LOGICAL_NC_CONFIG") == "2"
+        and rows_tiled
+        and rope == 0
+        and heads == 1
+        and latent == TARGET_LATENT_RANK
+        and seq // _queries_per_block(seq, heads) >= 2
+    ):
+        nope_call = nope_call[2]
     if block_table_row is not None:
         # A step that writes nothing hands no overlay operands rather than empty ones: the
         # kernel front end builds one tile per tensor operand and refuses a zero-extent shape.
         overlaid = written is not None and int(written.shape[0]) > 0
         rows = _kernel_operand(written) if overlaid else None
         at = write_offset.contiguous().to(torch.int32) if overlaid else None
-        return wrap_nki(nope_entry)(
+        return nope_call(
             q_lift_in, c_kv_in, topk_i32, float(softmax_scale),
             block_table_row.contiguous().to(torch.int32), rows, at, int(page_size)
         )
     if rope == 0:
-        return wrap_nki(nope_entry)(
+        return nope_call(
             q_lift_in, c_kv_in, topk_i32, float(softmax_scale)
         )
     return wrap_nki(rope_entry)(

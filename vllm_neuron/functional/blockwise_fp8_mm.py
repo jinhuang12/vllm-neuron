@@ -14,6 +14,10 @@ fp8 weight tiles are upcast to bf16 on the load DMA. The upcast is bit-exact
 the accumulator and the returned tensor are fp32; casting the result down is the
 caller's choice.
 
+Short matrices with fewer than 128 tokens use an unpadded GEMV-oriented kernel:
+the weights are stationary and real tokens form the streamed free dimension.
+Whole-token tiles retain the existing prefill kernel and arithmetic.
+
 :func:`blockwise_fp8_mm_torch_oracle` is the torch reference for the same product,
 and the fallback taken when no Neuron device or simulator is available.
 """
@@ -32,6 +36,8 @@ import nki.isa as nisa
 import nki.language as nl
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+from nkilib.core.utils.allocator import SbufManager
+from nkilib.core.utils.kernel_assert import kernel_assert
 
 from vllm_neuron.functional.moe.blockwise_fp8_retile import TILE_SIZE
 from vllm_neuron.utils.neuron_utils import can_run_kernel
@@ -59,6 +65,7 @@ __all__ = [
     "BlockwiseFp8MmError",
     "blockwise_fp8_mm",
     "blockwise_fp8_mm_kernel",
+    "blockwise_fp8_mm_small_m_kernel",
     "blockwise_fp8_mm_torch_oracle",
     "can_run_blockwise_fp8_mm",
     "dispatch_counters",
@@ -78,6 +85,142 @@ class BlockwiseFp8MmError(ValueError):
     offending extent, and no extent is silently truncated into a different
     function than the one requested.
     """
+
+
+@nki.jit
+def blockwise_fp8_mm_small_m_kernel(x, weight, weight_scale_t):
+    """Multiply a short activation matrix without padding its token dimension.
+
+    Args:
+        x: ``[M, K]`` bf16 activations, ``1 <= M < TILE_SIZE``.
+        weight: ``[K, N]`` fp8-e4m3 weights, with K and N blocked by 128.
+        weight_scale_t: The existing replicated checkpoint scale operand,
+            ``[128, (K // 128) * (N // 128)]`` fp32.
+
+    Returns:
+        ``[M, N]`` fp32, with each 128-wide contraction partial scaled
+        independently before accumulation.
+
+    Notes:
+        Weights are stationary and the short activation tile is moving.
+        Thus the Tensor Engine's streamed free dimension is M, rather than
+        128 output columns or 128 padded tokens. Output columns occupy all
+        128 partitions while scaling. Tiles transpose into a contiguous result
+        in SBUF, which is stored in one DMA to avoid short strided HBM writes.
+        No checkpoint scales are merged, and no activation is quantized.
+    """
+    m_extent, k_extent = x.shape
+    _, n_extent = weight.shape
+    kernel_assert(0 < m_extent < TILE_SIZE, "small-M GEMM needs 1 <= M < 128")
+    kernel_assert(k_extent % SCALE_BLOCK_SIZE == 0, "K must be blocked by 128")
+    kernel_assert(n_extent % SCALE_BLOCK_SIZE == 0, "N must be blocked by 128")
+    kernel_assert(weight.shape[0] == k_extent, "activation and weight K must agree")
+
+    n_n_blocks = n_extent // SCALE_BLOCK_SIZE
+    n_k_blocks = k_extent // SCALE_BLOCK_SIZE
+    out = nl.ndarray((m_extent, n_extent), dtype=nl.float32, buffer=nl.shared_hbm)
+    sbm = SbufManager(0, nl.tile_size.sbuf_fmax_bytes, use_auto_alloc=True)
+    sbm.open_scope(name="small_m")
+    scale_sb = sbm.alloc(weight_scale_t.shape, dtype=nl.float32)
+    nisa.dma_copy(dst=scale_sb, src=weight_scale_t)
+    result_sb = sbm.alloc((m_extent, n_extent), dtype=nl.float32)
+    # Load the whole short activation once. The partition axis is K modulo
+    # 128; the free axes select the contraction block and real token.
+    # Small per-block HBM loads otherwise spend more time in DMA setup than
+    # the Tensor Engine saves by avoiding padded token rows.
+    if n_k_blocks % 16 == 0:
+        # Reinterpret each checkpoint K chunk as an HBM row. DMA transpose
+        # then has a 16-aligned first dimension even when there is one token.
+        x_cache = sbm.alloc(
+            (TILE_SIZE, m_extent * n_k_blocks), dtype=x.dtype
+        )
+        nisa.dma_transpose(
+            dst=x_cache,
+            src=x.ap(
+                pattern=[
+                    [TILE_SIZE, m_extent * n_k_blocks],
+                    [1, TILE_SIZE],
+                ]
+            ),
+        )
+    else:
+        x_cache = sbm.alloc(
+            (TILE_SIZE, n_k_blocks, m_extent), dtype=x.dtype
+        )
+        nisa.dma_copy(
+            dst=x_cache,
+            src=x.ap(
+                pattern=[
+                    [1, TILE_SIZE],
+                    [TILE_SIZE, n_k_blocks],
+                    [k_extent, m_extent],
+                ]
+            ),
+        )
+
+    for n_block in nl.affine_range(n_n_blocks):
+        sbm.open_scope(name="output_block")
+        n0 = n_block * SCALE_BLOCK_SIZE
+        acc = sbm.alloc((SCALE_BLOCK_SIZE, m_extent), dtype=nl.float32)
+        for k_block in nl.affine_range(n_k_blocks):
+            sbm.open_scope(name="contraction_block")
+            k0 = k_block * SCALE_BLOCK_SIZE
+            x_t = sbm.alloc((TILE_SIZE, m_extent), dtype=x.dtype)
+            if n_k_blocks % 16 == 0:
+                nisa.tensor_copy(
+                    dst=x_t,
+                    src=x_cache.ap(
+                        pattern=[
+                            [m_extent * n_k_blocks, TILE_SIZE],
+                            [n_k_blocks, m_extent],
+                        ],
+                        offset=k_block,
+                    ),
+                )
+            else:
+                nisa.tensor_copy(dst=x_t, src=x_cache[:, k_block, :])
+            w_tile = sbm.alloc(
+                (TILE_SIZE, SCALE_BLOCK_SIZE), dtype=nl.bfloat16
+            )
+            nisa.dma_copy(
+                dst=w_tile,
+                src=weight[k0:k0 + TILE_SIZE, n0:n0 + SCALE_BLOCK_SIZE],
+            )
+            partial = nl.ndarray(
+                (SCALE_BLOCK_SIZE, m_extent), dtype=nl.float32, buffer=nl.psum
+            )
+            nisa.nc_matmul(
+                dst=partial, stationary=w_tile, moving=x_t, accumulate=False
+            )
+            flat = k_block * n_n_blocks + n_block
+            if k_block == 0:
+                nisa.tensor_scalar(
+                    dst=acc,
+                    data=partial,
+                    op0=nl.multiply,
+                    operand0=scale_sb[0:SCALE_BLOCK_SIZE, flat:flat + 1],
+                )
+            else:
+                nisa.scalar_tensor_tensor(
+                    dst=acc,
+                    data=partial,
+                    op0=nl.multiply,
+                    operand0=scale_sb[0:SCALE_BLOCK_SIZE, flat:flat + 1],
+                    op1=nl.add,
+                    operand1=acc,
+                )
+            sbm.close_scope()
+        transposed = nl.ndarray(
+            (m_extent, SCALE_BLOCK_SIZE), dtype=nl.float32, buffer=nl.psum
+        )
+        nisa.nc_transpose(dst=transposed, data=acc)
+        nisa.tensor_copy(
+            dst=result_sb[:, n0:n0 + SCALE_BLOCK_SIZE], src=transposed
+        )
+        sbm.close_scope()
+    nisa.dma_copy(dst=out, src=result_sb)
+    sbm.close_scope()
+    return out
 
 
 @nki.jit
@@ -181,12 +324,11 @@ def _require_blocked(rows: int, cols: int, tokens: int) -> None:
         BlockwiseFp8MmError: naming every condition that failed.
     """
     problems: list[str] = []
-    if tokens <= 0 or tokens % TILE_SIZE:
+    if tokens <= 0 or (tokens > TILE_SIZE and tokens % TILE_SIZE):
         problems.append(
             f"M={tokens} is not a positive multiple of TILE_SIZE={TILE_SIZE}; "
-            f"the kernel tiles M over the PSUM partition axis and does not pad. "
-            f"Padding tokens to a whole tile is the caller's, exactly as the MoE "
-            f"consumer pads to block_size"
+            f"short matrices with 1 <= M < {TILE_SIZE} use the unpadded "
+            f"small-M kernel; larger matrices require whole token tiles"
         )
     if rows <= 0 or rows % SCALE_BLOCK_SIZE:
         problems.append(
@@ -388,7 +530,8 @@ def blockwise_fp8_mm(
     """Dense blockwise-fp8 GEMM: NKI kernel when available, torch otherwise.
 
     Args:
-        x: ``[M, K]`` activations, bf16.
+        x: ``[M, K]`` activations, bf16. Short ``1 <= M < 128`` matrices run
+            without padding; larger M must be a positive multiple of 128.
         weight: ``[K, N]`` fp8-e4m3, expressed against ``weight_scale``.
         weight_scale: ``[K//128, N//128]`` fp32, one scale per weight block.
         prebuilt_scale_t: Optional, keyword-only. The kernel operand
@@ -428,7 +571,12 @@ def blockwise_fp8_mm(
         scale_t = to_kernel_scale_layout(weight_scale, rows, cols)
     else:
         scale_t = _checked_prebuilt_scale(prebuilt_scale_t, rows, cols)
-    return wrap_nki(blockwise_fp8_mm_kernel)(
+    kernel = (
+        blockwise_fp8_mm_small_m_kernel
+        if tokens < TILE_SIZE
+        else blockwise_fp8_mm_kernel
+    )
+    return wrap_nki(kernel)(
         x=x, weight=weight, weight_scale_t=scale_t
     )
 

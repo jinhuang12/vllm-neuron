@@ -1,9 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Pad to 128 rows and slice back at the dense kernel call site.
-
-The pad never leaves the call, and the kernel still refuses a short token count on
-its own.
-"""
+"""Short dense steps run unpadded; larger partial tiles keep their padding."""
 
 from __future__ import annotations
 
@@ -25,9 +21,7 @@ from vllm_neuron.functional.blockwise_fp8_mm import SCALE_BLOCK_SIZE, TILE_SIZE
 HIDDEN = 4 * SCALE_BLOCK_SIZE
 INTERMEDIATE = 4 * SCALE_BLOCK_SIZE
 
-#: The count under test, and the count the oracle runs. ``1`` is the decode step
-#: the seam refused; ``TILE_SIZE`` is the smallest count it ever accepted, so the
-#: oracle is the shipped path on the shape it already ran.
+#: Compare the new single-token route with the existing whole-tile route.
 ONE_TOKEN = 1
 ORACLE_TOKENS = TILE_SIZE
 
@@ -198,7 +192,7 @@ def _one_item(
     seam = _seam_module()
     sentinel = float(getattr(model_fp8, SENTINEL_ATTRIBUTE))
 
-    # ---- the unpadded oracle: the shipped path on the only count it ever ran.
+    # ---- The existing whole-tile path remains the comparison oracle.
     oracle_rows = hidden.repeat(ORACLE_TOKENS, 1)
     seam.reset_dispatch_counters()
     oracle = run(module, oracle_rows)
@@ -214,16 +208,15 @@ def _one_item(
     got = run(module, hidden)
     dispatches, fallbacks = seam.dispatch_counters()
 
-    if log["rows"] != [ORACLE_TOKENS] * 3:
+    if log["rows"] != [ONE_TOKEN] * 3:
         raise AssertionError(
-            f"the seam saw {log['rows']} rows per dispatch; the pad must make "
-            f"every one of the three a whole tile of {ORACLE_TOKENS}"
+            f"the seam saw {log['rows']} rows per dispatch; all three short "
+            f"projections must run on {ONE_TOKEN} real row"
         )
-    if log["sentinel_rows"][:2] != [ORACLE_TOKENS - ONE_TOKEN] * 2:
+    if log["sentinel_rows"][:2] != [0, 0]:
         raise AssertionError(
             f"the two projections that consume the caller's activation saw "
-            f"{log['sentinel_rows'][:2]} sentinel rows, not "
-            f"{[ORACLE_TOKENS - ONE_TOKEN] * 2}"
+            f"{log['sentinel_rows'][:2]} sentinel rows; short steps must not pad"
         )
     if log["sentinel_rows"][2] != 0:
         raise AssertionError(
@@ -232,8 +225,7 @@ def _one_item(
             f"{log['sentinel_rows'][2]}"
         )
 
-    # ---- reading: no pad row survives into the result, and none is derived from
-    # one -- the return is the seam's own output restricted to the caller's rows.
+    # ---- No hidden padded output was computed or sliced away.
     raw = log["outputs"][-1]
     survivors = int(raw.shape[0]) - int(got.shape[0])
     identical = bool(torch.equal(got, raw[: int(got.shape[0])]))
@@ -250,13 +242,15 @@ def _one_item(
             f"the returned rows are not the seam's own first {ONE_TOKEN} rows; "
             f"sentinel_derived_elements={sentinel_derived}"
         )
+    if survivors != 0:
+        raise AssertionError(f"the short kernel still computed {survivors} padded rows")
 
     # ---- reading: the criterion.
     _worst, outside = _worst_relative_error(got[0], oracle[0])
     if outside != 0:
         raise AssertionError(
-            f"{outside} elements of the padded one-token result differ from the "
-            f"unpadded oracle's first row by more than atol + rtol * |want| "
+            f"{outside} elements of the unpadded one-token result differ from the "
+            f"whole-tile oracle's first row by more than atol + rtol * |want| "
             f"(rtol={RTOL}, atol={ATOL})"
         )
 
@@ -266,19 +260,34 @@ def _one_item(
             f"torch_fallback={fallbacks}); this call declares (3, 0)"
         )
 
-    # ---- the control: remove the slice-back and nothing else.
+    # ---- Larger partial prefill tiles still pad. Check their sentinel rows
+    # and retain a non-vacuous slice-back control on that route.
+    partial_tokens = TILE_SIZE + ONE_TOKEN
+    partial_hidden = hidden.repeat(partial_tokens, 1)
+    log["rows"].clear()
+    log["sentinel_rows"].clear()
+    partial = run(module, partial_hidden)
+    if log["rows"] != [2 * TILE_SIZE] * 3:
+        raise AssertionError(f"the partial prefill did not pad: {log['rows']}")
+    if log["sentinel_rows"][:2] != [TILE_SIZE - ONE_TOKEN] * 2:
+        raise AssertionError(
+            f"the partial prefill lost its sentinel rows: {log['sentinel_rows']}"
+        )
+    if tuple(partial.shape) != (partial_tokens, HIDDEN):
+        raise AssertionError(f"the partial prefill returned padded rows: {partial.shape}")
+    torch.testing.assert_close(partial[0], oracle[0], rtol=RTOL, atol=ATOL)
     monkeypatch.setattr(model_fp8, "_unpad_rows", lambda out, tokens: out)
-    unsliced = run(module, hidden)
-    pad_rows_returned = int(unsliced.shape[0]) - ONE_TOKEN
-    if tuple(unsliced.shape) == (ONE_TOKEN, HIDDEN):
+    unsliced = run(module, partial_hidden)
+    pad_rows_returned = int(unsliced.shape[0]) - partial_tokens
+    if tuple(unsliced.shape) == (partial_tokens, HIDDEN):
         raise VacuousControlError(
             "removing the slice-back changed nothing the caller can see; the "
             "control cannot fail and this test would be meaningless"
         )
-    if pad_rows_returned != ORACLE_TOKENS - ONE_TOKEN:
+    if pad_rows_returned != TILE_SIZE - ONE_TOKEN:
         raise VacuousControlError(
             f"the control returned {pad_rows_returned} extra rows, not "
-            f"{ORACLE_TOKENS - ONE_TOKEN}; it is not the pad that survived"
+            f"{TILE_SIZE - ONE_TOKEN}; it is not the pad that survived"
         )
 
 
@@ -288,7 +297,7 @@ def _one_item(
 def test_the_dense_mlp_runs_a_one_token_step_and_returns_one_row(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """One token through the dense MLP: padded at entry, sliced at the return."""
+    """Dense decode runs one real row; partial prefill retains padding."""
     operands = _operands()
     _one_item(monkeypatch, "DENSE", _run_dense, _dense_module(operands),
               operands["row"])
@@ -311,18 +320,17 @@ def test_the_shared_expert_runs_a_one_token_step_and_returns_one_row(
 
 
 # --------------------------------------------------------------------------- #
-# check 3 of 3 -- the seam's refusal is untouched.                               #
+# check 3 of 3 -- the seam now accepts a single token directly.                  #
 # --------------------------------------------------------------------------- #
-def test_the_seam_still_refuses_a_short_token_count_by_itself() -> None:
-    """The pad is the caller's and the kernel's refusal stays unconditional."""
+def test_the_seam_accepts_a_short_token_count_by_itself() -> None:
+    """Direct single-token dispatch matches an independent CPU oracle."""
     seam = _seam_module()
     operands = _operands()
     row = operands["row"]
     weight, grid = operands["gate_proj_weight"]
-    with pytest.raises(seam.BlockwiseFp8MmError) as caught:
-        seam.blockwise_fp8_mm(row, weight, grid)
-    message = str(caught.value)
-    if f"M={int(row.shape[0])}" not in message:
-        raise AssertionError(
-            f"the seam refused but not on the token count: {message!r}"
-        )
+    seam.reset_dispatch_counters()
+    got = seam.blockwise_fp8_mm(row, weight, grid)
+    expected = seam.blockwise_fp8_mm_torch_oracle(row, weight, grid)
+    assert got.shape == (ONE_TOKEN, INTERMEDIATE)
+    assert seam.dispatch_counters() == (1, 0)
+    torch.testing.assert_close(got, expected, rtol=RTOL, atol=ATOL)

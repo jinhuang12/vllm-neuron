@@ -279,10 +279,9 @@ class _DeclaredShard:
 
 #: The value a pad row carries, and no activation on either dense path does.
 #:
-#: ``blockwise_fp8_mm`` tiles ``M`` over the PSUM partition axis and does not
-#: pad, so it refuses any token count that is not a whole number of
-#: ``TILE_SIZE`` rows -- a one-token decode step is exactly that case. Both
-#: dense paths pad here and slice the result back inside the same call.
+#: The small-M projection path consumes fewer than ``TILE_SIZE`` rows without
+#: padding. Larger ragged token counts still need whole tiles; both dense
+#: paths pad those here and slice the result back inside the same call.
 #:
 #: ``-2 ** 15`` is exact in ``bfloat16`` and orders of magnitude outside the
 #: widest pre-activation either dense path produces, so a pad row is
@@ -2205,12 +2204,11 @@ class Glm5NextSharedExperts(nn.Module):
                 f"shape {tuple(down_proj_weight.shape)}"
             )
 
-        # ---- Pad to a whole tile ------------------------------------------ #
-        # the pad is created here, consumed by the three calls below and removed at
-        # the single return, so it never leaves this call: nothing outside can
-        # observe it. The extent checks above ran on the caller's own tensor, so a
-        # mis-shaped operand still fails on what the caller passed.
-        hidden_states, tokens = _pad_tokens_to_tile(hidden_states, TILE_SIZE)
+        # The small-M projection kernel consumes fewer than 128 rows directly.
+        # Larger ragged prefills still pad to whole tiles and are sliced at return.
+        tokens = int(hidden_states.shape[0])
+        if not 0 < tokens < TILE_SIZE:
+            hidden_states, tokens = _pad_tokens_to_tile(hidden_states, TILE_SIZE)
 
         # ---- The three projection sites ----------------------------------- #
         # each passes the operand ``prepare_scale_operands`` built at load time, by
@@ -2811,11 +2809,11 @@ class Glm5NextDenseMLP(nn.Module):
                 f"shape {tuple(down_proj_weight.shape)}"
             )
 
-        # ---- Pad to a whole tile, the same two lines as the shared expert's and
-        # for the same reason: the kernel refuses a token count that is not a whole
-        # tile and does not pad, so a one-token decode step pads here and is sliced
-        # back at the single return below.
-        hidden_states, tokens = _pad_tokens_to_tile(hidden_states, TILE_SIZE)
+        # Small decode batches use the unpadded projection path. Larger ragged
+        # prefills retain whole-tile padding and the final slice below.
+        tokens = int(hidden_states.shape[0])
+        if not 0 < tokens < TILE_SIZE:
+            hidden_states, tokens = _pad_tokens_to_tile(hidden_states, TILE_SIZE)
 
         # ---- The two parallel projections.
         gate = blockwise_fp8_mm(

@@ -29,6 +29,7 @@ A refused geometry raises; it never routes to the torch reference.
 from __future__ import annotations
 
 import logging
+import os
 
 import torch
 from torch import Tensor
@@ -342,7 +343,16 @@ def depthwise_conv1d(
         )
 
     _count_nki_dispatch()
-    return wrap_nki(depthwise_conv1d_implicit_gemm)(
+    call = wrap_nki(depthwise_conv1d_implicit_gemm)
+    if (
+        os.environ.get("NEURON_LOGICAL_NC_CONFIG") == "2"
+        and tuple(img.shape[:3]) == (1, 384, 1)
+        and tuple(filt.shape) == (384, 1, 1, 4)
+        and img.dtype == torch.float32
+        and stride == UNIT_STRIDE
+    ):
+        call = call[2]
+    return call(
         img_ref=img,
         filter_ref=filt,
         padding=padding,

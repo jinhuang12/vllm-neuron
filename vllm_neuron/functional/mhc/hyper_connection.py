@@ -46,8 +46,8 @@ agreement than that. Casting the result is the caller's business.
 ``T`` is unbounded: tokens occupy the partition axis, which is capped at
 ``nl.tile_size.pmax``, so the kernel walks that axis in tiles of that size and
 :data:`PARTITION_MAX` is the tile height rather than a token ceiling. ``H`` lands
-on the free axis, which has no partition cap, and needs no tiling at the target's
-real hidden sizes: ``H = 4096`` and ``H = 7168`` both run in one tile.
+on the free axis and is tiled so the four residual streams and combine scratch
+fit on chip even at the target's ``H = 4096`` and ``H = 7168``.
 """
 
 from __future__ import annotations
@@ -68,6 +68,10 @@ from vllm_neuron.functional.mhc.sinkhorn import MHC_STREAMS, PARTITION_MAX
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 logger = logging.getLogger(__name__)
+
+# Seven FP32 tiles occupy 56 KiB per SBUF partition at this width, leaving
+# room for coefficients and overlapping the next token tile's transfers.
+HIDDEN_TILE = 2048
 
 # `MHC_STREAMS` (the target's `hc_mult`) and `PARTITION_MAX` are imported from
 # `sinkhorn.py` rather than restated: both name the same quantity for both halves
@@ -151,47 +155,53 @@ def hyper_connection_kernel(x, residual, post_layer_mix, comb_res_mix):
         else:
             rows = PARTITION_MAX
 
-        # The single-stream layer output, loaded once per tile: every output
-        # stream of this tile reads it.
-        x_tile = nl.load(x[off : off + rows, 0:h_extent], dtype=nl.float32)
+        # A whole coefficient row is at least one 32-byte SBUF line. These two
+        # DMAs are independent of hidden width and serve every hidden slice.
+        post_all = nl.ndarray((rows, 8), dtype=nl.float32, buffer=nl.sbuf)
+        comb_all = nl.ndarray(
+            (rows, s_extent, s_extent), dtype=nl.float32, buffer=nl.sbuf
+        )
+        nisa.dma_copy(
+            dst=post_all[:, 0:s_extent],
+            src=post_layer_mix[off:off + rows, 0:s_extent, 0],
+        )
+        nisa.dma_copy(
+            dst=comb_all,
+            src=comb_res_mix[off:off + rows, 0:s_extent, 0:s_extent],
+        )
 
-        # All S streams loaded once each rather than once per output stream: S * S
-        # loads of the same data would be S * (S - 1) redundant DMAs.
-        streams = []
-        for i in range(s_extent):
-            stream = nl.load(
-                residual[off : off + rows, i, 0:h_extent], dtype=nl.float32
-            )
-            streams.append(stream)
+        # Keep residuals and combine scratch in a bounded hidden slice.
+        # Hidden columns are independent, so tiling them changes neither the
+        # stream accumulation order nor the rounding of any output element.
+        for h0 in range(0, h_extent, HIDDEN_TILE):
+            width = min(HIDDEN_TILE, h_extent - h0)
+            x_tile = nl.ndarray((rows, width), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=x_tile, src=x[off:off + rows, h0:h0 + width])
 
-        # Two scratch tiles, allocated once per row tile and reused across that
-        # tile's S output streams.
-        acc = nl.ndarray((rows, h_extent), dtype=nl.float32, buffer=nl.sbuf)
-        term = nl.ndarray((rows, h_extent), dtype=nl.float32, buffer=nl.sbuf)
-
-        for j in range(s_extent):
-            # The post term initialises the accumulator, so there is no separate
-            # memset pass: `tensor_scalar` writes `dst` rather than adding into it.
-            # It also makes `post_layer_mix = 0` an exact zero start.
-            post_j = nl.load(
-                post_layer_mix[off : off + rows, j, 0:1], dtype=nl.float32
-            )
-            nisa.tensor_scalar(dst=acc, data=x_tile, op0=nl.multiply, operand0=post_j)
-
+            # Each residual slice is loaded once for all output streams.
+            streams = []
             for i in range(s_extent):
-                # In `comb_res_mix[t, i, j]`, i is the input stream being summed
-                # and j the output stream being written. The [rows, 1] slice is a
-                # per-token scalar that `tensor_scalar` broadcasts along the free
-                # (hidden) axis.
-                w_ij = nl.load(
-                    comb_res_mix[off : off + rows, i, j : j + 1], dtype=nl.float32
+                stream = nl.ndarray((rows, width), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.dma_copy(
+                    dst=stream, src=residual[off:off + rows, i, h0:h0 + width]
                 )
-                nisa.tensor_scalar(
-                    dst=term, data=streams[i], op0=nl.multiply, operand0=w_ij
-                )
-                nisa.tensor_tensor(dst=acc, data1=acc, data2=term, op=nl.add)
+                streams.append(stream)
 
-            nl.store(out[off : off + rows, j, 0:h_extent], value=acc)
+            acc = nl.ndarray((rows, width), dtype=nl.float32, buffer=nl.sbuf)
+            term = nl.ndarray((rows, width), dtype=nl.float32, buffer=nl.sbuf)
+            for j in range(s_extent):
+                nisa.tensor_scalar(
+                    dst=acc, data=x_tile, op0=nl.multiply,
+                    operand0=post_all[:, j:j + 1],
+                )
+                for i in range(s_extent):
+                    nisa.tensor_scalar(
+                        dst=term, data=streams[i], op0=nl.multiply,
+                        operand0=comb_all[:, i, j:j + 1],
+                    )
+                    nisa.tensor_tensor(dst=acc, data1=acc, data2=term, op=nl.add)
+
+                nisa.dma_copy(dst=out[off:off + rows, j, h0:h0 + width], src=acc)
 
     return out
 

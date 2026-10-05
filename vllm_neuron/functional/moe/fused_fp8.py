@@ -6,10 +6,13 @@ device routing for one compiled row bucket and performs the usual FP32 combine
 of the returned expert contributions.
 """
 
+import os
+
 import torch
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
 from .moe_fused_fp8 import moe_fused_fp8_kernel
+from .moe_fused_fp8_decode import compact_decode_kernel
 
 from .fused_fp8_pack import PackedExperts, pack_experts
 from .fused_fp8_config import select_tiles
@@ -17,6 +20,7 @@ from .fused_fp8_config import select_tiles
 __all__ = ["PackedExperts", "pack_experts", "fused_fp8_experts"]
 
 _FUSED_EXPERTS = wrap_nki(moe_fused_fp8_kernel)[2]
+_FUSED_DECODE_EXPERTS = wrap_nki(compact_decode_kernel)[2]
 _DISPATCH_COUNT = 0
 
 
@@ -83,6 +87,19 @@ def fused_fp8_experts(hidden, packed, row_ids, expert_ids, affinity, bounds,
         if not tensor.is_contiguous() or tensor.device != hidden.device:
             raise ValueError("All operands must be contiguous and on the same device")
     _count_nki_dispatch()
+    if (
+        os.environ.get("NEURON_LOGICAL_NC_CONFIG") == "2"
+        and tuple(hidden.shape) == (2, 4096)
+        and tuple(row_ids.shape) == (8, 1)
+        and experts == 18
+        and intermediate == 512
+        and (tile_m, tile_n, tile_k) == (1, 4096, 4096)
+    ):
+        return _FUSED_DECODE_EXPERTS(
+            hidden, packed.weights, packed.scales, row_ids, expert_ids,
+            affinity.reshape(-1, 1), bounds,
+            BLOCK_N=tile_n, BLOCK_K=tile_k,
+        ).reshape(-1, hidden.shape[1])
     return _FUSED_EXPERTS(
         hidden, packed.weights, packed.scales, row_ids, expert_ids,
         affinity.reshape(-1, 1), bounds,
