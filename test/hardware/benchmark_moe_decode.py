@@ -18,12 +18,18 @@ What is timed. Two families, each per decoder layer:
 
 Method. Host launch and sync cost far more than one layer, so each variant is
 compiled twice into one graph: 1 layer and ``L`` layers (distinct inputs and
-distinct weight copies per layer; each layer's output is summed into one small
-tensor so no layer is dead code). The per-layer cost is the slope:
-``(t_L - median(t_1)) / (L - 1)`` per timed ``t_L`` sample, whose median and p90
-are reported. The sum adds one ``[T, E]`` or ``[T, H]`` add per layer to both
-variants alike. Expert scenarios fix the number of distinct local experts per
+distinct weight copies per layer). Layer ``l`` reads layer ``l-1``'s output, as
+in the model: the expert input is ``x_l + 2^-8 * y_{l-1}``; the router's
+correction bias is ``b_l + 2^-8 * sum(affinity_{l-1})`` (a constant shift: the
+selection is unchanged). Without a dependency the compiler overlaps the
+independent layers' kernels and the slope undercounts (measured: 1.2 us per
+router layer). The router is also timed with the dependency through its
+activation, ``x_l + 2^-8 * rowsum(affinity_{l-1})`` (``*_hidden_chain``).
+The per-layer cost is the slope: ``(t_L - median(t_1)) / (L - 1)`` per timed
+``t_L`` sample, whose median and p90 are reported. It includes the one small chaining op per layer, the same in
+both variants. Expert scenarios fix the number of distinct local experts per
 layer, so the hit count is a controlled input rather than a routing accident.
+The device checks compare the 1-layer graph (no chaining) with the torch oracle.
 """
 
 from __future__ import annotations
@@ -37,6 +43,12 @@ from pathlib import Path
 import statistics
 import sys
 import time
+
+# Import this worktree's vllm_neuron, not the venv's editable install: the
+# acceptance command runs the script without PYTHONPATH.
+REPO = Path(__file__).resolve().parents[2]
+if sys.path[:1] != [str(REPO)]:
+    sys.path.insert(0, str(REPO))
 
 import torch
 
@@ -202,39 +214,53 @@ def compile_fn(fn):
                          options={"compiler_args": compiler_args()})
 
 
-def router_graph(variant: str, layers: int, baseline):
+#: Weight of the previous layer's output in the next layer's input. Small, so the
+#: chained inputs stay in the fixtures' range; nonzero, so it is a real dependency.
+CHAIN = 2.0 ** -8
+
+
+def router_graph(variant: str, layers: int, baseline, chain: str = "bias"):
+    """``chain="bias"``: layer l's correction bias reads layer l-1's affinities (a
+    constant shift, so the selection is unchanged); the activation stays a graph
+    input. ``chain="hidden"``: its activation reads them instead."""
     def chained(xs, weights, biases, gammas):
-        total = None
+        aff = None
         for layer in range(layers):
+            x, bias = xs[layer], biases[layer]
+            if aff is not None and chain == "hidden":
+                x = (x + CHAIN * aff.sum(-1, keepdim=True)).to(torch.bfloat16)
+            elif aff is not None:
+                bias = bias + CHAIN * aff.sum()
             if variant == "before":
                 _, _, aff = baseline.route_tokens(
-                    xs[layer].unsqueeze(0), gammas[layer], weights[layer], biases[layer],
+                    x.unsqueeze(0), gammas[layer], weights[layer], bias,
                     top_k=TOP_K, eps=EPS, norm_topk_prob=True,
                     routed_scaling_factor=SCALING)
             else:
                 _, _, aff = noaux_tc_router_decode(
-                    xs[layer], gammas[layer], weights[layer], biases[layer], top_k=TOP_K,
+                    x, gammas[layer], weights[layer], bias, top_k=TOP_K,
                     eps=EPS, norm_topk_prob=True, routed_scaling_factor=SCALING)
-            total = aff if total is None else total + aff
-        return total
+        return aff
 
     return compile_fn(chained)
 
 
 def expert_graph(variant: str, layers: int, baseline, bounds, weight_fp8=False):
     def chained(xs, affs, weights, scales, rank):
-        total = None
+        y = None
         for layer in range(layers):
+            x = xs[layer]
+            if y is not None:  # layer l reads layer l-1's output, as in the model
+                x = (x + CHAIN * y).to(torch.bfloat16)
             if variant == "before":
                 y = baseline.routed_experts(
-                    xs[layer], affs[layer], weights[layer], scales[layer], rank,
+                    x, affs[layer], weights[layer], scales[layer], rank,
                     top_k=TOP_K, swiglu_limit=SWIGLU_LIMIT)
             else:
                 y = fused_fp8_decode_experts(
-                    xs[layer], affs[layer], PackedExperts(weights[layer], scales[layer]),
+                    x, affs[layer], PackedExperts(weights[layer], scales[layer]),
                     bounds, rank, weight_fp8=weight_fp8)
-            total = y if total is None else total + y
-        return total
+        return y
 
     return compile_fn(chained)
 
@@ -319,6 +345,12 @@ def router_case(tokens, variants, baseline, args):
         case[variant] = timed(one, many, inputs[1], inputs[layers], layers, args)
         case[variant]["profile_dir"] = profile(f"router_T{tokens}_{variant}",
                                                [(one, inputs[1])], args)
+        # Secondary: the dependency through the [T, H] activation. Ahead of the
+        # 5938748 pad to 256 rows that XLA op makes the compiler insert stream
+        # transposes at T=4 (profiled: ~2.4 ms over 8 layers), absent at T=1.
+        many_hidden = router_graph(variant, layers, baseline, chain="hidden")
+        case[f"{variant}_hidden_chain"] = timed(one, many_hidden, inputs[1],
+                                                inputs[layers], layers, args)
     # Correctness on device: the layer-0 affinities against the torch oracle.
     w, b, g = params[0]
     _, ref_index, ref_aff = router_decode_torch_oracle(
@@ -337,6 +369,8 @@ def router_case(tokens, variants, baseline, args):
     case["checks"] = checks
     if "before" in case and "after" in case:
         case["speedup_median"] = case["before"]["median_us"] / case["after"]["median_us"]
+        case["speedup_median_hidden_chain"] = (case["before_hidden_chain"]["median_us"]
+                                               / case["after_hidden_chain"]["median_us"])
     return case
 
 
@@ -431,6 +465,12 @@ def summarize(report):
             row["meets_0_6"] = row["after_over_before"] <= 0.6
             row["gain_us_per_layer"] = row["before_median_us"] - row["after_median_us"]
             row["bounded_e2e_ms_per_step_42_layers"] = row["gain_us_per_layer"] * 42 / 1000
+            # The same totals with the router chained through its activation.
+            before_h = router["before_hidden_chain"]["median_us"] + case["before"]["median_us"]
+            after_h = router["after_hidden_chain"]["median_us"] + case["after"]["median_us"]
+            row["hidden_chain_before_median_us"] = before_h
+            row["hidden_chain_after_median_us"] = after_h
+            row["hidden_chain_after_over_before"] = after_h / before_h
         rows.append(row)
     return rows
 
@@ -458,6 +498,8 @@ def main() -> None:
         raise ValueError("Run under devlease.py, which pins NEURON_RT_VISIBLE_CORES")
     if any(t not in SCENARIOS for t in args.tokens) or args.layers < 2:
         raise ValueError(f"tokens must be in {sorted(SCENARIOS)} and layers >= 2")
+    if not Path(vllm_neuron.__file__).resolve().is_relative_to(REPO):
+        raise RuntimeError(f"imported {vllm_neuron.__file__}, not this tree ({REPO})")
     baseline = load_baseline(args.baseline_module.resolve())
     args.output = args.output.resolve()
     if args.profile_dir is not None:
@@ -473,6 +515,7 @@ def main() -> None:
             "NEURON_RT_VISIBLE_CORES", "NEURON_LOGICAL_NC_CONFIG", "NEURON_CC_FLAGS",
             "NEURON_PLATFORM_TARGET_OVERRIDE", "NEURON_LIBTORCH_CACHE_ROOT")},
         "compiler_args": compiler_args(),
+        "vllm_neuron": str(Path(vllm_neuron.__file__).resolve().parent),
         "baseline_module": str(args.baseline_module.resolve()),
         "method": __doc__.split("Method.")[1].strip(),
         "programs": {
