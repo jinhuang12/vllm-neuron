@@ -161,8 +161,9 @@ MOVING_FMAX = 512
 #: The largest token count :func:`sinkhorn_blocks_kernel` serves with the
 #: scaling-vector form (also bounded by ``T * S <= PARTITION_MAX``). Its matmuls
 #: grow with ``T`` while the tokens-on-partitions form stays flat. Measured on
-#: trn2, device us per call (scaling vectors vs tokens on partitions): 23.0 vs
-#: 101.0 at T = 1, 25.6 vs 27.2 at 4, 32.9 vs 28.5 at 16, 43.4 vs 28.5 at 32.
+#: trn2, device us per call (scaling vectors vs tokens on partitions): 23.1 vs
+#: 27.3 at T = 1, 24.3 vs 27.2 at 2, 25.6 vs 27.2 at 4, 27.7 vs 28.3 at 8,
+#: 32.9 vs 28.5 at 16, 43.4 vs 28.5 at 32.
 SCALING_VECTORS_MAX_TOKENS = 8
 
 __all__ = [
