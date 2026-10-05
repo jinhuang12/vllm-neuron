@@ -161,6 +161,20 @@ TOKENS_PER_EXPERT = T * K // E
 # Named errors. A failure must say which instrument disagreed; a bare
 # ``AssertionError`` from three different causes is one message for three bugs.
 # ---------------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def _nki_simulator_on():
+    """Enable the NKI CPU simulator these cases assert on.
+
+    ``can_run_kernel`` and ``wrap_nki`` both read ``NKI_SIMULATOR`` at call time and
+    ``test/conftest.py`` does not pin it, so without this every seam takes its torch
+    path. A private ``MonkeyPatch`` survives a case's own ``monkeypatch.undo()``; a
+    case that sets ``NKI_SIMULATOR=0`` itself still wins inside its own body.
+    """
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("NKI_SIMULATOR", "1")
+        yield
+
+
 class RouteInstrumentError(AssertionError):
     """A route reading that is not what this file declares."""
 
