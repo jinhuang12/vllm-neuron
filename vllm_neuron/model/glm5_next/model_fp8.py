@@ -1110,6 +1110,58 @@ class Glm5NextHyperConnection(nn.Module):
         return tokens, streams, hidden
 
 
+def _token_gather_combine(
+    contribution: torch.Tensor,
+    expert_affinities: torch.Tensor,
+    block: int,
+    rows: int,
+    top_k: int,
+) -> torch.Tensor:
+    """Sum each token's rows of the fused expert emission, in fp32.
+
+    The emission ``[blocks * rows, H]`` holds expert ``e``'s tokens in token order
+    from row ``first_block[e] * rows``, which is the layout ``build_blockwise_mapping``
+    hands the kernel once each block is cut to its first ``rows`` rows. A token
+    selects at most ``top_k`` of this rank's experts, so its rows follow from the
+    routing mask alone and are gathered into ``top_k`` slots in expert order, the
+    order the scatter-add met them in.
+
+    Args:
+        contribution: ``[blocks * rows, H]`` fp32 kernel emission.
+        expert_affinities: ``[T, E_local]`` local router scores, zero where unselected.
+        block: tokens per block in the mapping.
+        rows: rows the kernel keeps per block, ``min(T, block)``.
+        top_k: experts each token selects.
+
+    Returns:
+        ``[T, H]`` fp32.
+    """
+    from vllm_neuron.functional.moe.moe_blockwise import _cumsum_matmul
+    from vllm_neuron.functional.moe.token_gather_combine import token_gather_combine
+
+    tokens, experts = expert_affinities.shape
+    device = expert_affinities.device
+    mask = (expert_affinities != 0).to(torch.float32)  # [T, E]
+    # Token t's place among expert e's tokens, and the first block expert e owns.
+    place = _cumsum_matmul(mask) - 1.0
+    blocks = torch.ceil(mask.sum(dim=0) / block)
+    first_block = _cumsum_matmul(blocks.unsqueeze(1)).squeeze(1) - blocks
+    row = first_block.unsqueeze(0) * rows + place  # [T, E], exact in fp32
+    # Token t's j-th selected expert, one-hot over E for each slot j.
+    upper = torch.triu(
+        torch.ones(experts, experts, dtype=torch.float32, device=device)
+    )
+    rank = torch.matmul(mask, upper) - 1.0  # [T, E]
+    slots = min(top_k, experts)
+    slot_ids = torch.arange(slots, dtype=torch.float32, device=device)
+    pick = mask.unsqueeze(2) * (rank.unsqueeze(2) == slot_ids).to(torch.float32)
+    valid = pick.sum(dim=1)  # [T, k], 0/1
+    # An invalid slot reads row 0 and weighs it 0; row 0 is a real or a zero padding
+    # row, so it is finite.
+    index = (pick * row.unsqueeze(2)).sum(dim=1).to(torch.int32)  # [T, k]
+    return token_gather_combine(contribution, index, valid)
+
+
 # ---------------------------------------------------------------------------
 # ``Glm5NextMoEBlock`` and its two expert containers
 # ---------------------------------------------------------------------------
@@ -1618,6 +1670,17 @@ class Glm5NextRoutedExperts(nn.Module):
                     self.swiglu_limit, self.swiglu_limit, hidden_states.device
                 ),
             )
+            # Back to token order by gathering each token's rows rather than by
+            # scatter-adding every emitted row: the emission is sized for the worst
+            # case and is mostly padding, and a device ``index_add`` over it runs as a
+            # serial GpSimd accumulate.
+            return _token_gather_combine(
+                contribution,
+                expert_affinities,
+                block,
+                rows,
+                int(self.num_experts_per_tok),
+            ).to(hidden_states.dtype)
         else:
             # Preserve the direct-call interface for the existing chain.
             pre_activation = moe_gate_up_blockwise_fp8(

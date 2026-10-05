@@ -14,6 +14,7 @@ from nkilib.core.subkernels.indexed_flatten import indexed_flatten
 if TYPE_CHECKING:
     from vllm.distributed.parallel_state import GroupCoordinator
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+from vllm_neuron import envs
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 from vllm.distributed.parallel_state import get_world_group
 from vllm_neuron.parallel.neuron_parallel_state import rank_to_col
@@ -140,8 +141,16 @@ def build_blockwise_mapping(
         or isinstance(expert_mask, FakeTensor)
         or expert_mask.device.type == "meta"
     )
+    # Only the wrapper's CPU-simulator dispatch drops the non-tensor arguments
+    # (``nki_hop._cpu_impl`` rebuilds them from the kernel defaults); the device
+    # dispatch reads them back from the constant registry. So only a captured
+    # CPU-mode graph needs the torch construction, and a device capture keeps the
+    # subkernels.
+    simulated_capture = capturing and envs.VLLM_NEURON_CPU_MODE
     use_kernel_flow = (
-        can_use_find_nonzero_kernel and can_use_indexed_flatten_kernel and not capturing
+        can_use_find_nonzero_kernel
+        and can_use_indexed_flatten_kernel
+        and not simulated_capture
     )
 
     if use_kernel_flow:
