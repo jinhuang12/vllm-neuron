@@ -637,47 +637,72 @@ def test_the_two_kernel_identities_are_distinct() -> None:
     assert blocks_kernel_identity() != kernel_identity()
 
 
-def test_the_explicit_vector_engine_is_only_the_single_token_branch() -> None:
-    """``block_scalar_engine`` picks the Vector engine at ``T == 1`` and defaults above.
+def _iteration_calls(fn: ast.FunctionDef) -> list[str]:
+    """The ``nisa``/``nl`` calls inside ``fn``'s one loop over ``iters``, in order."""
+    loops = [
+        node
+        for node in ast.walk(fn)
+        if isinstance(node, ast.For)
+        and isinstance(node.iter, ast.Call)
+        and node.iter.args
+        and ast.unparse(node.iter.args[0]) == "iters"
+    ]
+    assert len(loops) == 1, f"{fn.name}: expected one iteration loop, found {len(loops)}"
+    calls = []
+    for stmt in loops[0].body:
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.Call) and ast.unparse(node.func).startswith(
+                ("nisa.", "nl.")
+            ):
+                calls.append(ast.unparse(node.func))
+    return calls
 
-    Larger token batches must keep the SDK's own engine choice, so prefill and
-    boundary shapes do not inherit a decode-only decision. Read off the source
-    because simulator numerics cannot observe engine placement.
+
+def test_the_batched_kernel_iteration_is_four_engine_instructions() -> None:
+    """At decode sizes the batched kernel's iteration issues exactly four ``nisa`` calls.
+
+    Read off the source, as a complement to the simulated op census in
+    ``test_mhc_vs_5938748.py``. Up to ``SCALING_VECTORS_MAX_TOKENS`` tokens (decode)
+    the kernel takes the scaling-vector form: per pass one matrix-vector product on
+    the Tensor engine and one reciprocal. Above that,
+    the tokens-on-partitions form pays a reduce, a reciprocal and a multiply per
+    pass, because the Vector engine has no divide. Each instruction covers every
+    token at once, so neither count grows with ``T``. 5938748 issued 31.
     """
     module = importlib.import_module(_MODULE)
     tree = ast.parse(pathlib.Path(module.__file__).read_text())
-    [fn] = [
+    functions = {
+        node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)
+    }
+    [branch] = [
         node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "sinkhorn_blocks_kernel"
+        for node in ast.walk(functions["sinkhorn_blocks_kernel"])
+        if isinstance(node, ast.If)
     ]
-    assignments = [
-        node
-        for node in ast.walk(fn)
-        if isinstance(node, ast.Assign)
-        and any(
-            isinstance(target, ast.Name) and target.id == "block_scalar_engine"
-            for target in node.targets
-        )
+    assert ast.unparse(branch.test) == (
+        "t_extent <= SCALING_VECTORS_MAX_TOKENS "
+        "and t_extent * rows_per_block <= PARTITION_MAX"
+    )
+    assert [ast.unparse(stmt) for stmt in branch.body] == [
+        "_blocks_by_scaling_vectors(affinity_blocks, out, iters)"
     ]
-    assert len(assignments) == 1
-    value = assignments[0].value
-    assert isinstance(value, ast.IfExp)
-    assert ast.unparse(value.test) == "int(t_extent) == 1"
-    assert ast.unparse(value.body) == "nisa.vector_engine"
-    assert ast.unparse(value.orelse) == "nisa.unknown_engine"
-
-    engine_sites = []
-    for node in ast.walk(fn):
-        if not (
-            isinstance(node, ast.Call)
-            and ast.unparse(node.func) == "nisa.tensor_scalar"
-        ):
-            continue
-        for keyword in node.keywords:
-            if keyword.arg == "engine":
-                engine_sites.append(ast.unparse(keyword.value))
-    assert engine_sites == ["block_scalar_engine"] * 5
+    assert [ast.unparse(stmt) for stmt in branch.orelse] == [
+        "_blocks_by_token_partitions(affinity_blocks, out, iters)"
+    ]
+    assert _iteration_calls(functions["_blocks_by_scaling_vectors"]) == [
+        "nisa.nc_matmul",
+        "nisa.reciprocal",
+        "nisa.nc_matmul",
+        "nisa.reciprocal",
+    ]
+    assert _iteration_calls(functions["_blocks_by_token_partitions"]) == [
+        "nisa.tensor_reduce",
+        "nisa.reciprocal",
+        "nisa.tensor_tensor",
+        "nisa.tensor_reduce",
+        "nisa.reciprocal",
+        "nisa.tensor_tensor",
+    ]
 
 
 @pytest.mark.parametrize(

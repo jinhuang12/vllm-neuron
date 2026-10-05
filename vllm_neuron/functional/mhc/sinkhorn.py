@@ -83,9 +83,14 @@ information the blocks do not.
 It does carry cost. ``(T*S)^2`` fp32 values is 256 MB at 2048 tokens with
 ``S = 4``, against 128 KB for the blocks, and ``N = T * S`` rides the tensor
 engine's moving free axis, which caps ``T`` at ``MOVING_FMAX // S``, or 128
-tokens. :func:`sinkhorn_blocks_kernel` therefore takes ``[T, S, S]`` directly:
-``T`` rides the partition axis in tiles walked inside the one dispatch, the
-block's two axes are both free, and no extent bound on ``T`` remains.
+tokens. :func:`sinkhorn_blocks_kernel` therefore takes ``[T, S, S]`` directly,
+with no extent bound on ``T``. Up to :data:`SCALING_VECTORS_MAX_TOKENS` tokens
+(decode) it carries the iteration as Sinkhorn's two scaling vectors, four
+instructions per iteration: two matrix-vector products on the Tensor engine,
+against the blocks laid on one diagonal, and two reciprocals. Above that, tokens
+ride the partition axis (``ceil(T / 128)`` per partition),
+the block's two axes are both free, and an iteration is six Vector-engine
+instructions on the whole tile. See the kernel's docstring.
 
 Both kernels stay. The square one is the general ``[M, N]`` normalisation; the
 batched one is what the mHC layer calls. They share the targets, the denominator
@@ -107,7 +112,10 @@ is 23 orders below fp32's resolution -- and it is applied identically in the
 kernel and in the oracle, so it cannot manufacture a disagreement between them.
 Callers are expected to supply strictly positive affinities; the guard turns an
 undefined result into a finite one rather than pretending a zero row is
-meaningful.
+meaningful. The batched kernel applies the same constant once to the entries
+before its loop instead of to every denominator (neither of its forms has a free
+slot for it in the iteration); an entry above ~1e-23 is unchanged by that add in
+fp32, so for the layer's inputs (entries >= ``hc_eps``) the two placements agree.
 """
 
 from __future__ import annotations
@@ -150,11 +158,19 @@ PARTITION_MAX = 128
 #: column-sum matmul carries ``N`` on the moving free axis.
 MOVING_FMAX = 512
 
+#: The largest token count :func:`sinkhorn_blocks_kernel` serves with the
+#: scaling-vector form (also bounded by ``T * S <= PARTITION_MAX``). Its matmuls
+#: grow with ``T`` while the tokens-on-partitions form stays flat. Measured on
+#: trn2, device us per call (scaling vectors vs tokens on partitions): 23.0 vs
+#: 101.0 at T = 1, 25.6 vs 27.2 at 4, 32.9 vs 28.5 at 16, 43.4 vs 28.5 at 32.
+SCALING_VECTORS_MAX_TOKENS = 8
+
 __all__ = [
     "MHC_STREAMS",
     "MOVING_FMAX",
     "PARTITION_MAX",
     "SINKHORN_DENOM_EPS",
+    "SCALING_VECTORS_MAX_TOKENS",
     "SINKHORN_ITERS",
     "SinkhornError",
     "blocks_kernel_identity",
@@ -464,17 +480,51 @@ def sinkhorn_blocks_kernel(affinity_blocks, iters: int = SINKHORN_ITERS):
     of it is zero, and a zero stays zero under row and column scaling, so the
     global normalisation is the ``T`` per-block normalisations.
 
-    It also removes the last extent bound. In the square form ``N = T * S`` rides
-    the tensor engine's moving free axis, capping ``T`` at ``MOVING_FMAX // S``.
-    Here ``T`` rides the partition axis in tiles of at most :data:`PARTITION_MAX`
-    tokens, walked inside this one dispatch, and the block's two axes are both
-    free, so both normalisations are free-axis reductions: no ones-vector matmul,
-    no partition-axis broadcast, and no bound on ``T``.
+    Two forms, picked at trace time from ``T``. Both compute the same iteration;
+    they differ in how the sums and the scales reach the engines. The switch,
+    :data:`SCALING_VECTORS_MAX_TOKENS`, is where their measured times cross.
+
+    **Scaling vectors on the Tensor engine, ``T <= SCALING_VECTORS_MAX_TOKENS``
+    (decode).** Sinkhorn's iterate is ``diag(u) K diag(v)`` for the
+    input ``K``, with ``u = 1 / (K v)`` (the row pass) and ``v = 1 / (K^T u)``
+    (the column pass), starting from ``v = 1``. Every block row ``(t, i)`` is one
+    partition. The ``T`` blocks are laid on the diagonal of one
+    ``[T*S, T*S]`` matrix (``kd``, zeros elsewhere) and its transpose (``kdt``),
+    built once, so each pass is one matrix-vector product over all tokens at
+    once. One iteration is four engine instructions. Each pass needs a sum and a
+    reciprocal, and no instruction on this hardware does both (the Vector engine
+    has no divide ALU op), so two per pass is the floor:
+
+    1. ``nc_matmul`` -- ``K v`` into PSUM (``kdt`` stationary, ``v`` moving).
+    2. ``reciprocal`` -- ``u = 1 / (K v)``, read from PSUM.
+    3. ``nc_matmul`` -- ``K^T u`` (``kd`` stationary, ``u`` moving).
+    4. ``reciprocal`` -- ``v = 1 / (K^T u)``.
+
+    After the loop the entries are assembled once as ``u_i K_ij v_j``. This is the
+    row-then-column normalisation of :func:`sinkhorn_kernel` reordered: after
+    ``n`` iterations both give ``diag(u_n) K diag(v_n)``, so they differ only in
+    fp32 rounding (operands fp32, Tensor engine accumulation fp32; 6e-8 from
+    5938748 on trn2 at ``T = 1``).
+
+    **Tokens on the partitions, larger ``T``.** ``ceil(T / 128)`` consecutive
+    tokens per partition, each partition holding its tokens' whole ``S x S``
+    blocks on the free axes, so both sums are free-axis reductions and the op
+    count does not grow with ``T``. One iteration is six instructions on the
+    whole tile: per pass a ``tensor_reduce``, a ``reciprocal`` and a
+    ``tensor_tensor`` multiply by the stride-0 broadcast of the reciprocal.
+
+    5938748 issued 31 per iteration (one ``[T, S]`` tile per block row, a
+    reciprocal and two multiplies per pass), 624 for the 20 iterations.
+
+    :data:`SINKHORN_DENOM_EPS` moves from the denominators to one add on the
+    entries before the loop: an exact zero entry becomes ``eps``, so no sum can
+    be zero, and every entry above ~1e-23 is unchanged in fp32, so for the
+    layer's inputs (entries >= ``hc_eps``) both placements give the same numbers.
 
     Args:
         affinity_blocks: ``[T, S, S]`` strictly positive affinities in HBM.
-        iters: normalisation iterations, a trace-time constant as in
-            :func:`sinkhorn_kernel`. The loop stays inside this dispatch.
+        iters: normalisation iterations, a trace-time constant. The loop is
+            unrolled inside this dispatch.
 
     Returns:
         ``[T, S, S]`` fp32. Every block has row sums :func:`row_target` and column
@@ -485,130 +535,233 @@ def sinkhorn_blocks_kernel(affinity_blocks, iters: int = SINKHORN_ITERS):
     # The unchecked core, for the tracer reason written on it.
     # `_require_blocks_admissible` is what refuses a bad shape.
     col_goal = _column_target_unchecked(int(rows_per_block), int(cols_per_block))
-    # Decode uses one token block per call. Keep larger token batches on the
-    # SDK default so prefill and boundary shapes retain the compiler-selected
-    # engine placement that existing coverage exercises.
-    block_scalar_engine = (
-        nisa.vector_engine if int(t_extent) == 1 else nisa.unknown_engine
-    )
+    # Dividing by the sum lands every row and column on 1, which is both targets
+    # for the square blocks `_require_blocks_admissible` admits, so no scale op.
+    assert row_goal == 1.0 and col_goal == 1.0, "blocks must be square"
 
     out = nl.ndarray(
         (t_extent, rows_per_block, cols_per_block),
         dtype=nl.float32,
         buffer=nl.shared_hbm,
     )
-
-    # The token tiles. `block=1` is not a special case: with the S x S block held
-    # in the two free axes, a token is one partition row, so no alignment is needed
-    # and the tile is the whole partition extent. The arithmetic is `row_tiles`'s,
-    # so both kernels tile the partition axis one way.
-    tiles = _row_tiles_unchecked(int(t_extent), 1)
-    # The loop bound, as a plain name, for the reason written on the square
-    # kernel's own bound.
-    tile_count = _row_tile_count_unchecked(int(t_extent), 1)
-
-    # Per token tile: one working tile per block ROW, plus that row's own
-    # denominator and scale, plus one column accumulator for the whole tile. All
-    # allocated before the iteration loop, because the iteration is loop-carried.
-    work: list[list] = []
-    row_den: list[list] = []
-    row_scale: list[list] = []
-    col_sum = []
-    col_scale = []
-    for idx in range(tile_count):
-        tile_geom = tiles[idx]
-        start = tile_geom[0]
-        height = tile_geom[1]
-        tile_rows = []
-        den_rows = []
-        scale_rows = []
-        for i in range(rows_per_block):
-            tile = nl.ndarray(
-                (height, cols_per_block), dtype=nl.float32, buffer=nl.sbuf
-            )
-            nisa.tensor_copy(
-                dst=tile,
-                src=nl.load(
-                    affinity_blocks[start:start + height, i, 0:cols_per_block],
-                    dtype=nl.float32,
-                ),
-            )
-            tile_rows.append(tile)
-            den_rows.append(
-                nl.ndarray((height, 1), dtype=nl.float32, buffer=nl.sbuf)
-            )
-            scale_rows.append(
-                nl.ndarray((height, 1), dtype=nl.float32, buffer=nl.sbuf)
-            )
-        work.append(tile_rows)
-        row_den.append(den_rows)
-        row_scale.append(scale_rows)
-        col_sum.append(
-            nl.ndarray((height, cols_per_block), dtype=nl.float32, buffer=nl.sbuf)
-        )
-        col_scale.append(
-            nl.ndarray((height, cols_per_block), dtype=nl.float32, buffer=nl.sbuf)
-        )
-
-    for _ in nl.sequential_range(iters):
-        for idx in range(tile_count):
-            # Row pass. Block row i of every token in this tile is one [tokens, S]
-            # tile, so its row sum is a free-axis reduction and the reciprocal
-            # broadcasts back along the free axis, as in the square kernel.
-            for i in range(rows_per_block):
-                r_sum = nl.sum(
-                    work[idx][i], axis=1, keepdims=True, dtype=nl.float32
-                )
-                nisa.tensor_scalar(
-                    dst=row_den[idx][i], data=r_sum, op0=nl.add,
-                    operand0=SINKHORN_DENOM_EPS, engine=block_scalar_engine,
-                )
-                nisa.reciprocal(dst=row_scale[idx][i], data=row_den[idx][i])
-                nisa.tensor_scalar(
-                    dst=row_scale[idx][i], data=row_scale[idx][i],
-                    op0=nl.multiply, operand0=float(row_goal),
-                    engine=block_scalar_engine,
-                )
-                nisa.tensor_scalar(
-                    dst=work[idx][i], data=work[idx][i], op0=nl.multiply,
-                    operand0=row_scale[idx][i], engine=block_scalar_engine,
-                )
-
-            # Column pass. A block's column sum runs over its rows, which here are
-            # separate tiles, so it is an elementwise add of the S tiles rather than
-            # a reduction along any axis: entry j of the accumulator is column j's
-            # sum. The first row initialises the accumulator, so no memset pass is
-            # needed.
-            nisa.tensor_copy(dst=col_sum[idx], src=work[idx][0])
-            for i in range(1, rows_per_block):
-                nisa.tensor_tensor(
-                    dst=col_sum[idx], data1=col_sum[idx], data2=work[idx][i],
-                    op=nl.add,
-                )
-            nisa.tensor_scalar(
-                dst=col_sum[idx], data=col_sum[idx], op0=nl.add,
-                operand0=SINKHORN_DENOM_EPS, engine=block_scalar_engine,
-            )
-            nisa.reciprocal(dst=col_scale[idx], data=col_sum[idx])
-            nisa.tensor_scalar(
-                dst=col_scale[idx], data=col_scale[idx], op0=nl.multiply,
-                operand0=float(col_goal), engine=block_scalar_engine,
-            )
-            for i in range(rows_per_block):
-                nisa.tensor_tensor(
-                    dst=work[idx][i], data1=work[idx][i], data2=col_scale[idx],
-                    op=nl.multiply,
-                )
-
-    for idx in range(tile_count):
-        tile_geom = tiles[idx]
-        start = tile_geom[0]
-        height = tile_geom[1]
-        for i in range(rows_per_block):
-            nl.store(
-                out[start:start + height, i, 0:cols_per_block], value=work[idx][i]
-            )
+    if (
+        t_extent <= SCALING_VECTORS_MAX_TOKENS
+        and t_extent * rows_per_block <= PARTITION_MAX
+    ):
+        _blocks_by_scaling_vectors(affinity_blocks, out, iters)
+    else:
+        _blocks_by_token_partitions(affinity_blocks, out, iters)
     return out
+
+
+def _blocks_by_scaling_vectors(affinity_blocks, out, iters: int) -> None:
+    """:func:`sinkhorn_blocks_kernel` at decode: ``u``/``v`` on the Tensor engine.
+
+    Traced inside the kernel. Writes ``out``.
+    """
+    t_extent, rows_per_block, cols_per_block = affinity_blocks.shape
+    block_rows = t_extent * rows_per_block
+    # k_rows[t*S + i, j] = K[t, i, j]: one block row per partition, one
+    # contiguous HBM run. Upcast to fp32 on the load.
+    k_rows = nl.ndarray((block_rows, cols_per_block), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(
+        dst=k_rows, src=affinity_blocks.reshape((block_rows, cols_per_block))
+    )
+    # The divide-by-zero guard, once on the entries (see the docstring).
+    nisa.tensor_scalar(
+        dst=k_rows, data=k_rows, op0=nl.add, operand0=SINKHORN_DENOM_EPS
+    )
+    # kd[t*S + i, t2*S + j] = K[t, i, j] when t2 == t, else 0: the block row
+    # broadcast across every token's column slot (stride 0), kept where
+    # 0 <= p - S*t2 <= S-1, i.e. on the partition's own token. The second
+    # bound is written as (S-1) - p + S*t2 >= 0, the comparison the engine has.
+    kd = nl.ndarray((block_rows, block_rows), dtype=nl.float32, buffer=nl.sbuf)
+    kd_blocks = kd.reshape((block_rows, t_extent, cols_per_block))
+    nisa.affine_select(
+        dst=kd_blocks,
+        pattern=[[-rows_per_block, t_extent], [0, cols_per_block]],
+        channel_multiplier=1,
+        on_true_tile=k_rows.expand_dim(1).broadcast(1, t_extent),
+        on_false_value=0.0,
+        cmp_op=nl.greater_equal,
+        offset=0,
+    )
+    nisa.affine_select(
+        dst=kd_blocks,
+        pattern=[[rows_per_block, t_extent], [0, cols_per_block]],
+        channel_multiplier=-1,
+        on_true_tile=kd_blocks,
+        on_false_value=0.0,
+        cmp_op=nl.greater_equal,
+        offset=rows_per_block - 1,
+    )
+    # kdt = kd^T (the Tensor engine transpose is bit exact), in SBUF, where a
+    # stationary operand must live.
+    kdt_psum = nl.ndarray((block_rows, block_rows), dtype=nl.float32, buffer=nl.psum)
+    nisa.nc_transpose(dst=kdt_psum, data=kd)
+    kdt = nl.ndarray((block_rows, block_rows), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=kdt, src=kdt_psum)
+
+    # u on partitions (t, i), v on partitions (t, j).
+    row_scale = nl.ndarray((block_rows, 1), dtype=nl.float32, buffer=nl.sbuf)
+    col_scale = nl.ndarray((block_rows, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.memset(dst=row_scale, value=1.0)
+    nisa.memset(dst=col_scale, value=1.0)
+    row_sum = nl.ndarray((block_rows, 1), dtype=nl.float32, buffer=nl.psum)
+    col_sum = nl.ndarray((block_rows, 1), dtype=nl.float32, buffer=nl.psum)
+
+    # Unrolled at trace time: a straight 4 * iters instruction chain.
+    for _ in range(iters):
+        nisa.nc_matmul(
+            dst=row_sum, stationary=kdt, moving=col_scale, accumulate=False
+        )
+        nisa.reciprocal(dst=row_scale, data=row_sum)
+        nisa.nc_matmul(
+            dst=col_sum, stationary=kd, moving=row_scale, accumulate=False
+        )
+        nisa.reciprocal(dst=col_scale, data=col_sum)
+
+    # Entries u_i K_ij v_j. v scales the rows of kdt (partition (t, j)); the
+    # transpose brings each block row back to its partition (t, i) with the
+    # other tokens' slots exactly zero, so summing over the token slots picks
+    # the block out exactly; u then scales the partition.
+    scaled = nl.ndarray((block_rows, block_rows), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(
+        dst=scaled, data=kdt, op0=nl.multiply, operand0=col_scale
+    )
+    scaled_t = nl.ndarray((block_rows, block_rows), dtype=nl.float32, buffer=nl.psum)
+    nisa.nc_transpose(dst=scaled_t, data=scaled)
+    result = nl.ndarray((block_rows, cols_per_block), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_reduce(
+        dst=result,
+        op=nl.add,
+        data=scaled_t.reshape((block_rows, t_extent, cols_per_block)).permute(
+            (0, 2, 1)
+        ),
+        axis=(2,),
+    )
+    nisa.tensor_scalar(
+        dst=result, data=result, op0=nl.multiply, operand0=row_scale
+    )
+    nisa.dma_copy(
+        dst=out.reshape((block_rows, cols_per_block)), src=result
+    )
+
+
+def _blocks_by_token_partitions(affinity_blocks, out, iters: int) -> None:
+    """:func:`sinkhorn_blocks_kernel` above decode sizes: tokens on the partitions.
+
+    Traced inside the kernel. Writes ``out``.
+    """
+    t_extent, rows_per_block, cols_per_block = affinity_blocks.shape
+    block_elems = rows_per_block * cols_per_block
+    per_part = (t_extent + PARTITION_MAX - 1) // PARTITION_MAX
+    full_parts = t_extent // per_part
+    tail = t_extent - full_parts * per_part
+    parts = full_parts
+    if tail > 0:
+        parts = full_parts + 1
+    run = per_part * block_elems
+
+    work = nl.ndarray(
+        (parts, per_part, rows_per_block, cols_per_block),
+        dtype=nl.float32,
+        buffer=nl.sbuf,
+    )
+    # Row sums and their reciprocals, one per block row of every token on the
+    # partition; column sums and theirs, one per block column.
+    row_sum_v = nl.ndarray(
+        (parts, per_part * rows_per_block), dtype=nl.float32, buffer=nl.sbuf
+    )
+    row_inv = nl.ndarray(
+        (parts, per_part * rows_per_block), dtype=nl.float32, buffer=nl.sbuf
+    )
+    col_sum_v = nl.ndarray(
+        (parts, per_part, cols_per_block), dtype=nl.float32, buffer=nl.sbuf
+    )
+    col_inv = nl.ndarray(
+        (parts, per_part, cols_per_block), dtype=nl.float32, buffer=nl.sbuf
+    )
+
+    if tail > 0:
+        # The last partition is part filled: set the tile to 1.0 first so the
+        # unused blocks normalise harmlessly; only real tokens load and store.
+        nisa.memset(dst=work, value=1.0)
+    # One contiguous run of `run` values per partition.
+    nisa.dma_copy(
+        dst=work[0:full_parts, 0:per_part, 0:rows_per_block, 0:cols_per_block],
+        src=affinity_blocks.ap(
+            pattern=[
+                [run, full_parts],
+                [block_elems, per_part],
+                [cols_per_block, rows_per_block],
+                [1, cols_per_block],
+            ],
+            offset=0,
+        ),
+    )
+    if tail > 0:
+        nisa.dma_copy(
+            dst=work[full_parts:parts, 0:tail, 0:rows_per_block, 0:cols_per_block],
+            src=affinity_blocks.ap(
+                pattern=[
+                    [run, 1],
+                    [block_elems, tail],
+                    [cols_per_block, rows_per_block],
+                    [1, cols_per_block],
+                ],
+                offset=full_parts * run,
+            ),
+        )
+    # The divide-by-zero guard, once on the entries (see the docstring).
+    nisa.tensor_scalar(
+        dst=work, data=work, op0=nl.add, operand0=SINKHORN_DENOM_EPS
+    )
+
+    # Views, no copies: every block row of the partition as one axis for the row
+    # pass, column j as the innermost axis for the column sum, and each
+    # reciprocal broadcast along the axis it scales by a stride-0 view.
+    work_rows = work.reshape((parts, per_part * rows_per_block, cols_per_block))
+    row_scale_v = row_inv.expand_dim(2).broadcast(2, cols_per_block)
+    work_by_col = work.permute((0, 1, 3, 2))
+    col_scale_v = col_inv.expand_dim(2).broadcast(2, rows_per_block)
+
+    # Unrolled at trace time: a straight 6 * iters instruction chain.
+    for _ in range(iters):
+        nisa.tensor_reduce(dst=row_sum_v, op=nl.add, data=work_rows, axis=(2,))
+        nisa.reciprocal(dst=row_inv, data=row_sum_v)
+        nisa.tensor_tensor(
+            dst=work_rows, data1=work_rows, data2=row_scale_v, op=nl.multiply
+        )
+        nisa.tensor_reduce(dst=col_sum_v, op=nl.add, data=work_by_col, axis=(3,))
+        nisa.reciprocal(dst=col_inv, data=col_sum_v)
+        nisa.tensor_tensor(dst=work, data1=work, data2=col_scale_v, op=nl.multiply)
+
+    nisa.dma_copy(
+        dst=out.ap(
+            pattern=[
+                [run, full_parts],
+                [block_elems, per_part],
+                [cols_per_block, rows_per_block],
+                [1, cols_per_block],
+            ],
+            offset=0,
+        ),
+        src=work[0:full_parts, 0:per_part, 0:rows_per_block, 0:cols_per_block],
+    )
+    if tail > 0:
+        nisa.dma_copy(
+            dst=out.ap(
+                pattern=[
+                    [run, 1],
+                    [block_elems, tail],
+                    [cols_per_block, rows_per_block],
+                    [1, cols_per_block],
+                ],
+                offset=full_parts * run,
+            ),
+            src=work[full_parts:parts, 0:tail, 0:rows_per_block, 0:cols_per_block],
+        )
 
 
 def _require_admissible(rows: int, cols: int, block: int = MHC_STREAMS) -> None:
