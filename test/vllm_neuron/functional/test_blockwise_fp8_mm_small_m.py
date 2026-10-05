@@ -17,6 +17,18 @@ from vllm_neuron.functional.blockwise_fp8_mm import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _nki_simulator(monkeypatch, tmp_path):
+    """Route kernel calls to the NKI simulator, as this file's tests assume.
+
+    ``can_run_kernel`` reads ``NKI_SIMULATOR`` under ``VLLM_NEURON_CPU_MODE``;
+    without it every dispatch counter reads the torch fallback. The NKI driver
+    writes compile artifacts into the working directory, so run from tmp_path.
+    """
+    monkeypatch.setenv("NKI_SIMULATOR", "1")
+    monkeypatch.chdir(tmp_path)
+
+
 def _case(tokens: int, rows: int = 256, cols: int = 384):
     generator = torch.Generator().manual_seed(941)
     x = torch.randint(1, 8, (tokens, rows), generator=generator).to(torch.bfloat16)
