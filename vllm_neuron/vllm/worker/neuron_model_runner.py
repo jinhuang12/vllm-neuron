@@ -93,6 +93,7 @@ from vllm_neuron.accuracy.tensor_replacement import (
     TensorReplacer,
     set_active_context,
 )
+from vllm_neuron.functional.full_vocab_sampling import device_sampling_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -6132,6 +6133,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             "input_ids": input_ids,
             "layer_carriers": carriers,
             "sampling_positions": kwargs["sampling_positions"],
+            # Present only when the runner and the root both sample on device.
+            **device_sampling_kwargs(
+                kwargs,
+                runner_samples_on_device=getattr(self, "on_device_sampling", False),
+                model=self.model,
+            ),
             **self._glm5next_parallel_kwargs(device=input_ids.device),
             # The dump keyword goes through this one function for every call site,
             # so captured and served graphs share a signature. Absent unless a dump

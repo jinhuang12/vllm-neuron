@@ -38,6 +38,11 @@ SO_DISABLED_MESSAGE = (
     "request without structured_outputs."
 )
 
+#: Model classes that declare no on-device sampler by default but whose root can hand
+#: full-vocabulary logits to ``functional/full_vocab_sampling.py`` when
+#: ``VLLM_NEURON_GLM5NEXT_ON_DEVICE_SAMPLING`` is set.
+FULL_VOCAB_SAMPLER_ARCHS = ("Glm5NextForConditionalGeneration",)
+
 
 # Relax DCP config validation for prefill-side DCP where TP <= num_kv_heads.
 # Upstream asserts TP > num_kv_heads when DCP is enabled, but prefill DCP
@@ -672,6 +677,8 @@ class NeuronPlatform(Platform):
         )
         if getattr(model_cls, "supports_on_device_sampling", True):
             return
+        if cls._full_vocab_sampler_opted_in(arch, neuron_config):
+            return
         if neuron_config.get("on_device_sampling_config") is not None:
             raise ValueError(
                 f"{arch} has no on-device sampler: additional_config.neuron_config."
@@ -693,6 +700,44 @@ class NeuronPlatform(Platform):
                 "runner reads token ids from the device; NeuronScheduler runs synchronously",
                 arch,
             )
+
+    @classmethod
+    def _full_vocab_sampler_opted_in(cls, arch: str, neuron_config: dict) -> bool:
+        """True when this class samples its full-vocabulary logits on device.
+
+        The gate below exists because the class returns logits, which the async runner
+        cannot feed back as token ids. A class in ``FULL_VOCAB_SAMPLER_ARCHS`` can hand
+        those logits to the full-vocabulary sampler instead, and returns int32 token
+        ids. ``VLLM_NEURON_GLM5NEXT_ON_DEVICE_SAMPLING`` opts in; unset, nothing
+        changes. An explicit ``on_device_sampling_config: null`` keeps the host
+        sampler, and the gate below then turns async scheduling off as before.
+        Data-parallel sampling is refused: it shards the batch across a sampling
+        group, and this sampler reads no process group.
+        """
+        if arch not in FULL_VOCAB_SAMPLER_ARCHS:
+            return False
+        if not envs.VLLM_NEURON_GLM5NEXT_ON_DEVICE_SAMPLING:
+            return False
+        if (
+            "on_device_sampling_config" in neuron_config
+            and neuron_config["on_device_sampling_config"] is None
+        ):
+            return False
+        sampler_config = neuron_config.get("on_device_sampling_config") or {}
+        if int(sampler_config.get("sampling_dp_degree", 1)) != 1:
+            raise ValueError(
+                f"{arch} samples full-vocabulary logits on every rank and reads no "
+                f"process group, so data-parallel sampling cannot apply: "
+                f"on_device_sampling_config.sampling_dp_degree must be 1, got "
+                f"{sampler_config['sampling_dp_degree']!r}"
+            )
+        logger.info(
+            "On-device sampling is on: %s samples its full-vocabulary logits on device "
+            "(VLLM_NEURON_GLM5NEXT_ON_DEVICE_SAMPLING); async scheduling is left as "
+            "configured",
+            arch,
+        )
+        return True
 
     @classmethod
     def validate_request(
