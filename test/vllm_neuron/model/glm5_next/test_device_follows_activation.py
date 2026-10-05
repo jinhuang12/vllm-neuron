@@ -77,9 +77,10 @@ def _held(shape, device) -> torch.Tensor:
 
 
 def _hold_the_kernel_seams(monkeypatch, entries: dict[str, int]) -> None:
-    """Hold the five kernel dispatches; none of them is measured here. """
+    """Hold the six kernel dispatches; none of them is measured here. """
     from vllm_neuron.functional.kda import chunked_recurrence as chunked
     from vllm_neuron.functional.kda import decode_state, depthwise_conv1d, gate_clamp
+    from vllm_neuron.functional.kda import fused_decode
 
     def conv(img, filt, *rest, **options):
         assert not rest and not options, "the hold serves the seam's plain call only"
@@ -124,6 +125,17 @@ def _hold_the_kernel_seams(monkeypatch, entries: dict[str, int]) -> None:
     monkeypatch.setattr(chunked, "kda_intra_chunk", intra)
     monkeypatch.setattr(chunked, "kda_inter_chunk", inter)
     monkeypatch.setattr(decode_state, "kda_decode_step", decode)
+
+    def fused(q_in, k_in, v_in, raw_gate, raw_beta, *, conv_state, recurrent_state,
+              **operands):
+        entries["fused"] += 1
+        return fused_decode.FusedDecodeOutputs(
+            core=_held(q_in.shape, q_in.device),
+            conv_state=_held(conv_state.shape, conv_state.device),
+            recurrent_state=_held(recurrent_state.shape, recurrent_state.device),
+        )
+
+    monkeypatch.setattr(fused_decode, "kda_fused_decode", fused)
 
 
 def _drive(config, hidden: int, heads: int, tokens: int, is_prefill: bool, start: int):
@@ -176,7 +188,9 @@ def test_the_forward_runs_where_its_inputs_live(monkeypatch) -> None:
     hidden = int(config.hidden_size)
     heads = kda_half.KDA_NUM_HEADS // kda_half.TP_WORLD_SIZE
     for leg, tokens, is_prefill, start in LEGS:
-        entries = dict.fromkeys(("conv", "gate", "intra", "inter", "decode"), 0)
+        entries = dict.fromkeys(
+            ("conv", "gate", "intra", "inter", "decode", "fused"), 0
+        )
         _hold_the_kernel_seams(monkeypatch, entries)
         returned, error = None, None
         try:
@@ -187,9 +201,7 @@ def test_the_forward_runs_where_its_inputs_live(monkeypatch) -> None:
         stopped = f"; it stopped at {_site_of(error)}: {text}" if error else ""
         # Read before the outcome: the drive reached the recurrence. A run that stopped
         # earlier proves nothing about either allocation.
-        for seam in ("conv", "gate") + (
-            ("intra", "inter") if is_prefill else ("decode",)
-        ):
+        for seam in ("conv", "gate", "intra", "inter") if is_prefill else ("fused",):
             assert entries[seam] >= 1, (
                 f"the {leg} drive never reached the {seam} seam, so it never reached the "
                 f"allocations under test{stopped}"
