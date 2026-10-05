@@ -1300,6 +1300,25 @@ class Glm5NextRoutedExperts(nn.Module):
         if eps is None:
             eps = float(text_config.rms_norm_eps)
 
+        # Decode (T <= 64): RMSNorm, router GEMM and noaux_tc top-8 in one launch
+        # on the real rows, no pad to 256 (router_decode.py). Same three outputs,
+        # same seam counters; any other call keeps the router below.
+        from vllm_neuron.functional.moe import router_decode
+
+        if router_decode.decode_route_admits(
+            hidden_states, self.router_weight, int(text_config.num_experts_per_tok)
+        ):
+            return router_decode.noaux_tc_router_decode(
+                hidden_states,
+                gamma,
+                self.router_weight,
+                self.router_bias,
+                top_k=int(text_config.num_experts_per_tok),
+                eps=eps,
+                norm_topk_prob=bool(text_config.norm_topk_prob),
+                routed_scaling_factor=float(text_config.routed_scaling_factor),
+            )
+
         from vllm_neuron.functional.moe.router import (
             noaux_tc_rmsnorm_router_topk,
         )
@@ -1543,6 +1562,46 @@ class Glm5NextRoutedExperts(nn.Module):
                 f"what this site maps onto this rank's {num_experts} experts -- "
                 f"got shape {tuple(expert_affinities.shape)}"
             )
+        # ---- Decode route: T <= 64 on the packed bank, one kernel launch. -- #
+        # fused_fp8_decode_experts reads the GLOBAL affinities and the rank
+        # operand itself and visits each distinct local expert once: no local
+        # gather, mapping, padding row or combine. Not taken when the mapping
+        # below would shard experts over TP ranks or a collector wants its
+        # token positions; those keep the mapping route.
+        if (
+            using_packed
+            and collector is None
+            and not (tp_degree > 1 and num_experts % tp_degree == 0)
+            and (routed == num_experts or num_experts == int(self.num_local_experts))
+            and not (
+                isinstance(expert_parallel_rank, int)
+                and routed != num_experts
+                and not 0 <= expert_parallel_rank < int(self.ep_degree)
+            )
+        ):
+            from vllm_neuron.functional.moe.expert_decode import can_run_expert_decode
+            from vllm_neuron.functional.moe.fused_fp8 import (
+                PackedExperts,
+                fused_fp8_decode_experts,
+            )
+            from vllm_neuron.functional.moe.moe_blockwise_fp8 import (
+                _swiglu_bound_operand,
+            )
+
+            packed = PackedExperts(packed_weights, packed_scales)
+            decode_hidden = hidden_states.to(torch.bfloat16)
+            if can_run_expert_decode(decode_hidden, expert_affinities, packed):
+                return fused_fp8_decode_experts(
+                    decode_hidden,
+                    expert_affinities,
+                    packed,
+                    _swiglu_bound_operand(
+                        self.swiglu_limit, self.swiglu_limit, hidden_states.device
+                    ),
+                    expert_parallel_rank if routed != num_experts else 0,
+                    out_dtype=(torch.float32 if hidden_states.dtype == torch.float32
+                               else torch.bfloat16),
+                ).to(hidden_states.dtype)
         if routed != num_experts:
             # The rank arrives as a device tensor, so the slice it selects is an
             # input of the captured graph and every rank shares one graph; a python
