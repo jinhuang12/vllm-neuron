@@ -44,9 +44,11 @@ module under ``vllm/`` holds a ``from ... import`` copy of the symbol.
 Binding cannot always happen at import time; see :func:`_install_deferred`.
 
 The padded page is only what vLLM's block pool sees. The runner keeps each
-recurrent layer's state in its own bank addressed by request slot, so
-:func:`recurrent_state_slot_bytes` gives the runner and the worker the bytes one
-request slot really holds.
+recurrent layer's state in its own bank addressed by request slot, so two helpers
+here give the runner and the worker the recurrent geometry that is not padded:
+:func:`recurrent_state_slot_bytes`, the bytes one request slot really holds, and
+:func:`recurrent_spec_block_size`, the block size a recurrent spec reports to the
+pool.
 """
 
 from __future__ import annotations
@@ -324,3 +326,40 @@ def recurrent_state_slot_bytes(spec) -> int:
     )
     align = RECURRENT_SLOT_ALIGN_BYTES
     return -(-state_bytes // align) * align
+
+
+def recurrent_spec_block_size(cache_config) -> int:
+    """Return the block size a recurrent-state (KDA) ``MambaSpec`` reports to vLLM.
+
+    vLLM's own knob, ``cache_config.mamba_block_size`` (``--mamba-block-size``),
+    when the operator sets it; otherwise the attention block size, as before.
+
+    The value decides only how many blocks of vLLM's shared pool a request holds in
+    each recurrent group. The runner keeps a request's state in a bank addressed by
+    request slot, so those blocks carry no data. In vLLM's mamba "none" mode a
+    recurrent group reserves ``cdiv(tokens, block_size)`` blocks at admission, so at
+    the 128-token attention block four recurrent groups at 8192 tokens reserve
+    4 x 64 attention-sized pages per request. ``--mamba-block-size <max_model_len>``
+    (upstream's default for this mode) makes it one block per group.
+
+    With prefix caching on, vLLM's hybrid coordinator needs every group's block size
+    to be a multiple of the hash block, and a recurrent block size other than the
+    attention block size makes the hash block their LCM. That combination fails at
+    engine start with a bare assertion, so it is refused here by name.
+    """
+    block_size = int(cache_config.block_size)
+    # A cache config that carries no ``mamba_block_size`` reads as unset, the same
+    # as upstream's default of None.
+    mamba_block_size = getattr(cache_config, "mamba_block_size", None)
+    if mamba_block_size is None or int(mamba_block_size) == block_size:
+        return block_size
+    if cache_config.enable_prefix_caching:
+        raise ValueError(
+            f"mamba_block_size={int(mamba_block_size)} differs from the attention "
+            f"block size {block_size} while prefix caching is on; vLLM's hybrid KV "
+            f"cache coordinator then needs every group's block size to be a "
+            f"multiple of their LCM and refuses at engine start. Serve with "
+            f"--no-enable-prefix-caching (this runner refuses a prefix-cache hit on "
+            f"a recurrent stack anyway), or unset --mamba-block-size."
+        )
+    return int(mamba_block_size)

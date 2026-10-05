@@ -58,7 +58,10 @@ from vllm.v1.worker.kv_connector_model_runner_mixin import (
 from contextlib import contextmanager
 
 from vllm_neuron import envs
-from vllm_neuron.vllm.patches.kv_spec_patch import recurrent_state_slot_bytes
+from vllm_neuron.vllm.patches.kv_spec_patch import (
+    recurrent_spec_block_size,
+    recurrent_state_slot_bytes,
+)
 from vllm_neuron.utils.neuron_utils import model_forward_context
 from vllm_neuron.vllm.worker.neuron_ec_connector_model_runner_mixin import (
     ECLoadFailure,
@@ -10258,6 +10261,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         kv_cache_dtype = kv_cache_dtype_str_to_dtype(
             self.vllm_config.cache_config.cache_dtype, self.vllm_config.model_config
         )
+        recurrent_block_size = recurrent_spec_block_size(self.vllm_config.cache_config)
 
         target_kv_spec = self.model.get_kv_spec()
         for layer in target_kv_spec.layers:
@@ -10286,7 +10290,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 # mistype an fp32 recurrent state. ``page_size_padded`` is set
                 # after the loop, once the attention page is known.
                 spec = MambaSpec(
-                    block_size=block_size,
+                    block_size=recurrent_block_size,
                     shapes=(
                         tuple(layer.kda_conv_state_shape),
                         tuple(layer.kda_recurrent_state_shape),
