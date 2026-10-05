@@ -444,7 +444,9 @@ def build_sampling_params_tensor(
         temperature = sampling_metadata.temperature.to(device)
 
     result = torch.stack([top_k, top_p, temperature], dim=1)
-    logger.debug("On-device sampling params (top_k, top_p, temp): %s", result.tolist())
+    # .tolist() reads the device back; only pay that when the line is emitted.
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug("On-device sampling params (top_k, top_p, temp): %s", result.tolist())
     return result
 
 
