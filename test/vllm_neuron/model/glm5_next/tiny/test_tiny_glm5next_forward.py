@@ -105,6 +105,9 @@ _SEAM_REGISTRY = {
     "mla_absorb": (
         "vllm_neuron.functional.attention.mla_absorb",
         "mla_absorb_dispatch_counters", "reset_mla_absorb_dispatch_counters"),
+    "mla_decode": (
+        "vllm_neuron.functional.attention.mla_decode",
+        "mla_decode_dispatch_counters", "reset_mla_decode_dispatch_counters"),
     "mla_sparse": (
         "vllm_neuron.functional.attention.mla_sparse",
         "mla_sparse_dispatch_counters", "reset_mla_sparse_dispatch_counters"),
