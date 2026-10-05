@@ -135,3 +135,69 @@ def tie_rows(logits: torch.Tensor, bias: torch.Tensor, margin: float) -> torch.T
 def index_sets_equal(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """Per-row set equality of two ``[T, K]`` index tensors."""
     return (a.sort(dim=-1).values == b.sort(dim=-1).values).all(dim=-1)
+
+
+# ---- Routed-expert fixtures ------------------------------------------------ #
+
+#: The EP group the expert tests compute: any of the 16 works; 5 keeps the rank
+#: offset (5 * 18 = 90) away from zero so a dropped offset reads the wrong slice.
+RANK = 5
+
+
+def packed_expert_bank(experts: int = LOCAL_EXPERTS, hidden: int = HIDDEN,
+                       intermediate: int = LOCAL_INTERMEDIATE, seed: int = 23):
+    """A packed fp8 bank with decoder-like magnitudes.
+
+    Stored weights are Gaussian fp8 inside the Trn2 range; block scales put the
+    gate/up pre-activations at a standard deviation near 3 for unit activations,
+    so the +-10 SwiGLU clamps engage on a few channels, and the down projection
+    at unit scale.
+    """
+    from vllm_neuron.functional.moe.fused_fp8_pack import pack_experts
+
+    gen = torch.Generator().manual_seed(seed)
+    nh, ni = hidden // 128, intermediate // 128
+
+    def fp8(*shape):
+        return (torch.randn(*shape, generator=gen) * 48).clamp(-240, 240).to(
+            torch.float8_e4m3fn)
+
+    gate_up = fp8(experts, hidden, 2 * intermediate)
+    down = fp8(experts, intermediate, hidden)
+    gate_up_scales = (0.5 + torch.rand(experts, nh, 2, ni, generator=gen)) * (
+        3.0 / (48 * hidden ** 0.5))
+    down_scales = (0.5 + torch.rand(experts, ni, nh, generator=gen)) * (
+        1.0 / (48 * intermediate ** 0.5))
+    return pack_experts(gate_up, down, gate_up_scales, down_scales)
+
+
+def decode_hidden(tokens: int, hidden: int = HIDDEN, seed: int = 29):
+    """Post-norm expert inputs: unit Gaussian, bf16."""
+    gen = torch.Generator().manual_seed(seed)
+    return torch.randn(tokens, hidden, generator=gen).to(torch.bfloat16)
+
+
+def routed_affinities(local_hits, *, experts: int = EXPERTS,
+                      local_experts: int = LOCAL_EXPERTS, rank: int = RANK,
+                      top_k: int = TOP_K, seed: int = 31):
+    """Scattered ``[T, E]`` router output with chosen hits on ``rank``'s slice.
+
+    ``local_hits[t]`` lists the local expert ids token ``t`` selects in this
+    rank's group; the rest of its ``top_k`` picks land on other groups. Each row
+    has ``top_k`` positive weights that sum to ``SCALING``, as ``route_tokens``
+    emits with ``norm_topk_prob`` and ``routed_scaling_factor``.
+    """
+    gen = torch.Generator().manual_seed(seed)
+    first = rank * local_experts
+    others = [e for e in range(experts) if not first <= e < first + local_experts]
+    rows = []
+    for hits in local_hits:
+        assert len(set(hits)) == len(hits) <= top_k
+        picks = [first + h for h in hits]
+        rest = torch.randperm(len(others), generator=gen)[: top_k - len(picks)]
+        picks += [others[i] for i in rest.tolist()]
+        weight = torch.rand(top_k, generator=gen) + 0.1
+        row = torch.zeros(experts)
+        row[torch.tensor(picks)] = weight / weight.sum() * SCALING
+        rows.append(row)
+    return torch.stack(rows).to(torch.float32)

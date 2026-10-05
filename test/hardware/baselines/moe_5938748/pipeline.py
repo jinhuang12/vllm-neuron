@@ -67,11 +67,13 @@ def _token_gather_combine(contribution, expert_affinities, block, rows, top_k):
 
 def routed_experts(hidden_states, expert_affinities, packed_weights, packed_scales,
                    expert_parallel_rank, *, top_k=8, swiglu_limit=10.0,
-                   tp_degree=1, moe_group=None):
+                   tp_degree=1, moe_group=None, out_dtype=None):
     """The packed branch of ``block_quant_expert_mm`` at 5938748.
 
     ``hidden_states`` is ``[T, H]``, ``expert_affinities`` the global ``[T, E]``
-    router output; returns ``[T, H]`` in ``hidden_states.dtype``.
+    router output; returns ``[T, H]`` in ``hidden_states.dtype``, as the model
+    did. ``out_dtype=torch.float32`` returns the fp32 combine before that cast
+    (a test-side tap; the model never asked for it).
     """
     tokens, hidden = (int(extent) for extent in hidden_states.shape)
     num_experts = int(packed_weights.shape[0])
@@ -120,6 +122,7 @@ def routed_experts(hidden_states, expert_affinities, packed_weights, packed_scal
         expert_affinities_masked.reshape(tokens + 1, num_experts),
         _swiglu_bound_operand(swiglu_limit, swiglu_limit, hidden_states.device),
     )
-    return _token_gather_combine(
+    combined = _token_gather_combine(
         contribution, expert_affinities, block, rows, int(top_k),
-    ).to(hidden_states.dtype)
+    )
+    return combined.to(hidden_states.dtype if out_dtype is None else out_dtype)
