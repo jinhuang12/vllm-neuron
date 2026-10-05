@@ -444,7 +444,7 @@ def main() -> int:
     repo = script.parents[2]
     head = subprocess.run(["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
                           check=True, capture_output=True, text=True).stdout.strip()
-    dirty = bool(subprocess.run(["git", "-C", str(repo), "status", "--short"],
+    dirty = bool(subprocess.run(["git", "-C", str(repo), "status", "--short", "--untracked-files=no"],
                                 check=True, capture_output=True, text=True).stdout.strip())
     report: dict = {
         "what": "median per-decode-step host time, CPU mode, root forward stubbed and "
