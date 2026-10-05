@@ -2304,9 +2304,7 @@ class Glm5NextSharedExperts(nn.Module):
                 other. Named rather than coerced, so a mis-wired call site fails
                 where it is wrong instead of computing a different function.
         """
-        from torch.nn.functional import silu
-
-        from vllm_neuron.functional.blockwise_fp8_mm import blockwise_fp8_mm
+        from vllm_neuron.functional.blockwise_fp8_mm import blockwise_fp8_mlp
         from vllm_neuron.functional.moe.blockwise_fp8_retile import TILE_SIZE
 
         # ---- Route selection ---------------------------------------------- #
@@ -2368,62 +2366,27 @@ class Glm5NextSharedExperts(nn.Module):
         if not 0 < tokens < TILE_SIZE:
             hidden_states, tokens = _pad_tokens_to_tile(hidden_states, TILE_SIZE)
 
-        # ---- The three projection sites ----------------------------------- #
-        # each passes the operand ``prepare_scale_operands`` built at load time, by
-        # keyword. The public grid is still passed too: the kernel's torch-oracle
-        # fallback consumes it, and the prebuilt operand cannot stand in for it.
-        gate = blockwise_fp8_mm(
-            hidden_states,
-            gate_proj_weight,
-            gate_proj_scale,
-            prebuilt_scale_t=self._prepared_scale_operand("gate_proj"),
-        )
-        up = blockwise_fp8_mm(
-            hidden_states,
-            up_proj_weight,
-            up_proj_scale,
-            prebuilt_scale_t=self._prepared_scale_operand("up_proj"),
-        )
-
-        # ---- The checkpoint's two clamps ---------------------------------- #
-        # the correctness reference -- transformers v5.16.1,
-        # ``Glm5NextTextMLP.forward``, which is also what builds
-        # ``Glm5NextTextMoE.shared_experts`` -- bounds the gate above and the up
-        # operand on both sides before multiplying:
-        #
-        #     gate = gate.clamp(min=None, max=self.swiglu_limit)
-        #     up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
-        #
-        # The two lines below are that transliteration, ``min=None`` on the gate
-        # included: the gate's bound is one-sided in the reference, and copying it
-        # as a two-sided clamp would be a second wrong function rather than a
-        # tidier one. Unclamped, every token whose pre-activations leave the
-        # checkpoint's ``[-10, 10]`` box enters the residual stream wrong, with no
-        # shape moving and nothing raising.
-        #
-        # The bound is ``self.swiglu_limit``, resolved from
-        # ``text_config.swiglu_limit`` in ``__init__``, so no caller can hand this
-        # path a bound the checkpoint never declared.
-        gate = gate.clamp(min=None, max=self.swiglu_limit)
-        up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
-
-        # The SwiGLU wiring: ``silu`` is torch's own, the product is elementwise,
-        # and both run in the kernel's fp32 return dtype so no precision is thrown
-        # away between the projections. ``silu`` is also why ``down`` cannot fold
-        # into either predecessor -- the product must be materialised here.
-        activated = silu(gate) * up
-
-        # The down projection re-enters the kernel, whose declared input dtype is
-        # ``bfloat16``, so the fp32 intermediate is cast back to the activation
-        # dtype. The cast is named rather than implicit because it is a real
-        # precision step. The slice back is the last thing that happens: the caller
-        # receives its own row count, never the padded one.
+        # ---- One fused call: gate, up, the checkpoint's two clamps, SwiGLU and
+        # down. The clamp bound is ``self.swiglu_limit`` (``text_config``), the
+        # gate clamped above only and up on both sides, as the reference does; the
+        # SwiGLU product is cast to the activation dtype before down, as before.
+        # ``1 <= T < 128`` runs one small-M NKI kernel; whole-tile prefill keeps
+        # the three ``blockwise_fp8_mm`` calls, which take the prebuilt operands.
         return _unpad_rows(
-            blockwise_fp8_mm(
-                activated.to(hidden_states.dtype),
+            blockwise_fp8_mlp(
+                hidden_states,
+                gate_proj_weight,
+                up_proj_weight,
                 down_proj_weight,
+                gate_proj_scale,
+                up_proj_scale,
                 down_proj_scale,
-                prebuilt_scale_t=self._prepared_scale_operand("down_proj"),
+                swiglu_limit=self.swiglu_limit,
+                prebuilt_scale_t=(
+                    self._prepared_scale_operand("gate_proj"),
+                    self._prepared_scale_operand("up_proj"),
+                    self._prepared_scale_operand("down_proj"),
+                ),
             ),
             tokens,
         )
@@ -2893,9 +2856,7 @@ class Glm5NextDenseMLP(nn.Module):
                 Named rather than coerced, so a mis-wired call site fails where it
                 is wrong instead of computing a different function.
         """
-        from torch.nn.functional import silu
-
-        from vllm_neuron.functional.blockwise_fp8_mm import blockwise_fp8_mm
+        from vllm_neuron.functional.blockwise_fp8_mm import blockwise_fp8_mlp
         from vllm_neuron.functional.moe.blockwise_fp8_retile import TILE_SIZE
 
         # ---- Route selection, the same two refusals the shared expert makes. --
@@ -2973,35 +2934,20 @@ class Glm5NextDenseMLP(nn.Module):
         if not 0 < tokens < TILE_SIZE:
             hidden_states, tokens = _pad_tokens_to_tile(hidden_states, TILE_SIZE)
 
-        # ---- The two parallel projections.
-        gate = blockwise_fp8_mm(
-            hidden_states, gate_proj_weight, scale_grid("gate_proj_weight")
-        )
-        up = blockwise_fp8_mm(
-            hidden_states, up_proj_weight, scale_grid("up_proj_weight")
-        )
-
-        # ---- The clamp: the checkpoint's, not a guard this code invented. The
-        # reference clamps gate from above only and up on both sides, and only then
-        # multiplies them. The asymmetry is the reference's, and copying it as a
-        # two-sided clamp on both would be a second wrong function.
-        gate = gate.clamp(min=None, max=self.swiglu_limit)
-        up = up.clamp(min=-self.swiglu_limit, max=self.swiglu_limit)
-
-        # ---- The SwiGLU wiring: ``silu`` is torch's own, the product is
-        # elementwise, and both run in the kernel's fp32 return dtype so no
-        # precision is thrown away between the projections. ``silu`` is also why
-        # ``down`` folds into neither predecessor.
-        activated = silu(gate) * up
-
-        # ---- The down projection re-enters the kernel, whose declared input dtype
-        # is ``bfloat16``, so the fp32 intermediate is cast back to the caller's
-        # activation dtype here. The slice back is the last thing that happens.
+        # ---- One fused call: gate, up, the checkpoint's clamps (gate above only,
+        # up on both sides), SwiGLU, the bf16 cast and down. ``1 <= T < 128`` runs
+        # one small-M NKI kernel; whole-tile prefill keeps the three
+        # ``blockwise_fp8_mm`` calls. The slice back is the last thing that happens.
         return _unpad_rows(
-            blockwise_fp8_mm(
-                activated.to(hidden_states.dtype),
+            blockwise_fp8_mlp(
+                hidden_states,
+                gate_proj_weight,
+                up_proj_weight,
                 down_proj_weight,
+                scale_grid("gate_proj_weight"),
+                scale_grid("up_proj_weight"),
                 scale_grid("down_proj_weight"),
+                swiglu_limit=self.swiglu_limit,
             ),
             tokens,
         )
