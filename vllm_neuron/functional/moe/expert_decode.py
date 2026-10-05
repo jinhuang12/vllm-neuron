@@ -37,8 +37,6 @@ cast), so results agree to fp32 round-off and, rarely, one bf16 activation step.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
-from typing import Tuple
 
 import torch
 from torch import Tensor
@@ -48,7 +46,6 @@ import nki.isa as nisa
 import nki.language as nl
 from nkilib.core.utils.kernel_assert import kernel_assert
 
-from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 from .fused_fp8_pack import PackedExperts
@@ -58,35 +55,6 @@ EXPERT_DECODE_MAX_TOKENS = 64
 
 #: fp32 columns in one 2 KiB PSUM bank.
 _BANK = 512
-
-
-@dataclass
-class _Counters:
-    nki_dispatch: int = 0
-    torch_fallback: int = 0
-
-
-_COUNTERS = _Counters()
-
-
-def reset_expert_decode_counters() -> None:
-    _COUNTERS.nki_dispatch = 0
-    _COUNTERS.torch_fallback = 0
-
-
-def expert_decode_dispatch_counters() -> Tuple[int, int]:
-    """``(nki_dispatch, torch_fallback)`` since the last reset."""
-    return _COUNTERS.nki_dispatch, _COUNTERS.torch_fallback
-
-
-@torch._dynamo.assume_constant_result
-def _count_nki_dispatch() -> None:
-    _COUNTERS.nki_dispatch += 1
-
-
-@torch._dynamo.assume_constant_result
-def _count_torch_fallback() -> None:
-    _COUNTERS.torch_fallback += 1
 
 
 def _tile(rows, cols, dtype=nl.float32):
@@ -108,12 +76,6 @@ def _weight_panel(weights, expert, panel, fp8):
         ),
     )
     return tile
-
-
-def _slot_groups(slots, tokens):
-    """Split ``slots`` product slots of ``tokens`` fp32 columns into PSUM banks."""
-    per_bank = max(1, _BANK // tokens)
-    return [(s0, min(per_bank, slots - s0)) for s0 in range(0, slots, per_bank)]
 
 
 @nki.jit
@@ -159,8 +121,14 @@ def expert_decode_kernel(hidden, affinity, rank, weights, scales, bounds,
     # ---- Prologue: rank, local affinities, the visited-expert list. --------- #
     rank_sb = _tile(1, 1, nl.int32)
     nisa.dma_copy(dst=rank_sb, src=rank)
+    # Clamp to [0, G): a rank operand outside the router's groups must not move
+    # the affinity read out of bounds. A valid rank is unchanged; the call site
+    # refuses an out-of-range python-int rank before it gets here.
+    group = _tile(1, 1, nl.int32)
+    nisa.tensor_scalar(dst=group, data=rank_sb, op0=nl.maximum, operand0=0,
+                       op1=nl.minimum, operand1=groups - 1)
     rank_reg = nisa.register_alloc()
-    nisa.register_load(dst=rank_reg, src=rank_sb)
+    nisa.register_load(dst=rank_reg, src=group)
     # Partition 0: this group's [T, E] slice, token-major.
     local = nl.ndarray((1, tokens, experts), dtype=nl.float32, buffer=nl.sbuf)
     nisa.dma_copy(dst=local, src=affinity.ap(
@@ -208,6 +176,7 @@ def expert_decode_kernel(hidden, affinity, rank, weights, scales, bounds,
 
     gate_up_slots = 2 * nic * nh
     down_slots = nh * nic
+    per_bank = max(1, _BANK // tokens)  # product slots of T fp32 columns per bank
 
     def visit_expert(slot):
         expert_sb = _tile(1, 1, nl.int32)
@@ -228,8 +197,9 @@ def expert_decode_kernel(hidden, affinity, rank, weights, scales, bounds,
             for k in range(nic):
                 stationaries.append(
                     _weight_panel(weights, expert, kind * ni + i0 + k, WEIGHT_FP8))
-        down = [_weight_panel(weights, expert, 2 * ni + i0 + k, WEIGHT_FP8)
-                for k in range(nic)]
+        down = []
+        for k in range(nic):
+            down.append(_weight_panel(weights, expert, 2 * ni + i0 + k, WEIGHT_FP8))
         gate = nl.ndarray((128, tokens), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=gate, src=gates.ap(
             pattern=[[tokens * experts, 128], [experts, tokens]],
@@ -238,10 +208,12 @@ def expert_decode_kernel(hidden, affinity, rank, weights, scales, bounds,
         # Gate/up: slot s = panel * nh + hb, product [128 (I), T] per slot.
         scaled = nl.ndarray((128, gate_up_slots, tokens), dtype=nl.float32,
                             buffer=nl.sbuf)
-        for s0, sn in _slot_groups(gate_up_slots, tokens):
+        for s0 in range(0, gate_up_slots, per_bank):
+            sn = min(per_bank, gate_up_slots - s0)
             bank = nl.ndarray((128, sn, tokens), dtype=nl.float32, buffer=nl.psum)
             for j in range(sn):
-                panel, hb = divmod(s0 + j, nh)
+                panel = (s0 + j) // nh
+                hb = (s0 + j) % nh
                 nisa.nc_matmul(dst=bank[:, j, :], stationary=stationaries[panel][:, hb, :],
                                moving=xt[:, hb, :], accumulate=False)
             nisa.tensor_tensor(
@@ -279,10 +251,12 @@ def expert_decode_kernel(hidden, affinity, rank, weights, scales, bounds,
             op=nl.multiply)
         flat_weight = weight.reshape((128, down_slots, tokens))
         terms = nl.ndarray((128, down_slots, tokens), dtype=nl.float32, buffer=nl.sbuf)
-        for s0, sn in _slot_groups(down_slots, tokens):
+        for s0 in range(0, down_slots, per_bank):
+            sn = min(per_bank, down_slots - s0)
             bank = nl.ndarray((128, sn, tokens), dtype=nl.float32, buffer=nl.psum)
             for j in range(sn):
-                hb, k = divmod(s0 + j, nic)
+                hb = (s0 + j) // nic
+                k = (s0 + j) % nic
                 nisa.nc_matmul(dst=bank[:, j, :], stationary=down[k][:, hb, :],
                                moving=act[:, k, :], accumulate=False)
             nisa.tensor_tensor(dst=terms[:, s0:s0 + sn, :], data1=bank,
@@ -321,11 +295,13 @@ def expert_decode_kernel(hidden, affinity, rank, weights, scales, bounds,
 
 
 # ---------------------------------------------------------------------------- #
-# Host wrapper
+# Admission, operands and the torch reference. The public entry point is
+# ``fused_fp8.fused_fp8_decode_experts``, which counts into the fused seam.
 # ---------------------------------------------------------------------------- #
 
 
-def _geometry(packed: PackedExperts):
+def geometry(packed: PackedExperts):
+    """``(experts, I/128, H/128)`` of a packed bank."""
     experts, panels, contraction, nh, channels = packed.weights.shape
     return experts, panels // 3, nh
 
@@ -335,7 +311,7 @@ def can_run_expert_decode(hidden_states: Tensor, expert_affinities: Tensor,
     """True when the decode kernel serves this call on an NKI device or simulator."""
     if packed.weights.ndim != 5 or hidden_states.ndim != 2:
         return False
-    experts, ni, nh = _geometry(packed)
+    experts, ni, nh = geometry(packed)
     tokens, hidden = hidden_states.shape
     routed = expert_affinities.shape[-1]
     return (
@@ -353,13 +329,15 @@ def can_run_expert_decode(hidden_states: Tensor, expert_affinities: Tensor,
     )
 
 
-def _default_programs(ni: int, nh: int) -> int:
+def default_programs(ni: int, nh: int) -> int:
+    """2 programs (both LNC2 cores) when the runtime is LNC2 and I, H split evenly."""
     if os.environ.get("NEURON_LOGICAL_NC_CONFIG") == "2" and ni % 2 == 0 and nh % 2 == 0:
         return 2
     return 1
 
 
-def _rank_operand(rank, device) -> Tensor:
+def rank_operand(rank, device) -> Tensor:
+    """The EP group as the kernel's ``[1, 1]`` int32 operand."""
     if isinstance(rank, Tensor):
         return rank.reshape(1, 1).to(device=device, dtype=torch.int32)
     return torch.full((1, 1), int(rank), dtype=torch.int32, device=device)
@@ -367,11 +345,11 @@ def _rank_operand(rank, device) -> Tensor:
 
 def expert_decode_torch_oracle(hidden_states, expert_affinities, packed, bounds,
                                expert_parallel_rank, out_dtype=None):
-    """Torch reference with the kernel's arithmetic; used when no device is present."""
+    """Torch reference of the kernel's arithmetic, for tests and benchmark checks."""
     from .fused_fp8_pack import unpack_experts
 
     out_dtype = hidden_states.dtype if out_dtype is None else out_dtype
-    experts, ni, nh = _geometry(packed)
+    experts, ni, nh = geometry(packed)
     tokens, hidden = hidden_states.shape
     rank = int(expert_parallel_rank.reshape(-1)[0]) if isinstance(
         expert_parallel_rank, Tensor) else int(expert_parallel_rank)
@@ -395,63 +373,3 @@ def expert_decode_torch_oracle(hidden_states, expert_affinities, packed, bounds,
         weight = down_scale[e][None, :, :, None] * local[:, e][:, None, None, None]
         out += (dpart * weight).sum(dim=1).reshape(tokens, hidden)
     return out.to(out_dtype)
-
-
-def fused_fp8_decode_experts(
-    hidden_states: Tensor,
-    expert_affinities: Tensor,
-    packed: PackedExperts,
-    bounds: Tensor,
-    expert_parallel_rank: int | Tensor = 0,
-    *,
-    programs: int | None = None,
-    out_dtype: torch.dtype | None = None,
-    weight_fp8: bool = False,
-) -> Tensor:
-    """This rank's routed-expert output for ``T <= 64`` decode tokens, one launch.
-
-    Args:
-        hidden_states: ``[T, H]`` bf16 expert inputs (real tokens only, no pad row).
-        expert_affinities: ``[T, E_global]`` fp32 scattered router output, the
-            form ``route_tokens`` returns; ``E_global`` is a multiple of the
-            bank's expert count.
-        packed: the packed fp8 bank of this rank's experts.
-        bounds: ``[128, 3]`` fp32 SwiGLU bounds (``_swiglu_bound_operand``).
-        expert_parallel_rank: this bank's group: an int, or an int tensor of one
-            element (the runner's device operand, so every rank shares a graph).
-        programs: 1 or 2 programs; default 2 under ``NEURON_LOGICAL_NC_CONFIG=2``.
-        out_dtype: ``torch.bfloat16`` (default: ``hidden_states.dtype``) or
-            ``torch.float32``.
-        weight_fp8: fp8 stationaries instead of a bf16 DMA cast (same products).
-
-    Returns:
-        ``[T, H]`` in ``out_dtype``: ``sum_e affinity[t, e] * expert_e(x_t)`` over
-        this bank's experts, accumulated in fp32.
-    """
-    out_dtype = hidden_states.dtype if out_dtype is None else out_dtype
-    if out_dtype not in (torch.bfloat16, torch.float32):
-        raise ValueError(f"out_dtype must be bf16 or fp32, got {out_dtype}")
-    if tuple(bounds.shape) != (128, 3) or bounds.dtype != torch.float32:
-        raise ValueError("bounds must be fp32 [128, 3]")
-    experts, ni, nh = _geometry(packed)
-    tokens = hidden_states.shape[0]
-    if not can_run_expert_decode(hidden_states, expert_affinities, packed):
-        _count_torch_fallback()
-        return expert_decode_torch_oracle(hidden_states, expert_affinities, packed,
-                                          bounds, expert_parallel_rank, out_dtype)
-    programs = _default_programs(ni, nh) if programs is None else int(programs)
-    _count_nki_dispatch()
-    kernel = wrap_nki(expert_decode_kernel)
-    if programs != 1:
-        kernel = kernel[programs]
-    return kernel(
-        hidden=hidden_states.contiguous(),
-        affinity=expert_affinities.to(torch.float32).reshape(
-            tokens, -1, experts).contiguous(),
-        rank=_rank_operand(expert_parallel_rank, hidden_states.device),
-        weights=packed.weights,
-        scales=packed.scales,
-        bounds=bounds.contiguous(),
-        OUT_FP32=out_dtype == torch.float32,
-        WEIGHT_FP8=bool(weight_fp8),
-    )

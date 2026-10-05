@@ -27,7 +27,6 @@ the matmuls.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Tuple
 
 import torch
@@ -40,6 +39,11 @@ from nkilib.core.utils.kernel_assert import kernel_assert
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 from vllm_neuron.utils.neuron_utils import can_run_kernel
+
+# The decode router is the noaux_tc router seam's decode route, so it reports
+# into that seam's counter family (``router.noaux_tc_dispatch_counters``) rather
+# than opening a family no route check reads.
+from . import router as _router_seam
 
 #: Largest token count one launch serves: one token per partition in the noaux stage.
 ROUTER_DECODE_MAX_TOKENS = 128
@@ -56,35 +60,6 @@ _SELECTED = -3.0e38
 
 #: The nkilib router's moving free-dim cap, which bounds E for one PSUM bank.
 _MAX_EXPERTS = 512
-
-
-@dataclass
-class _Counters:
-    nki_dispatch: int = 0
-    torch_fallback: int = 0
-
-
-_COUNTERS = _Counters()
-
-
-def reset_router_decode_counters() -> None:
-    _COUNTERS.nki_dispatch = 0
-    _COUNTERS.torch_fallback = 0
-
-
-def router_decode_dispatch_counters() -> Tuple[int, int]:
-    """``(nki_dispatch, torch_fallback)`` since the last reset."""
-    return _COUNTERS.nki_dispatch, _COUNTERS.torch_fallback
-
-
-@torch._dynamo.assume_constant_result
-def _count_nki_dispatch() -> None:
-    _COUNTERS.nki_dispatch += 1
-
-
-@torch._dynamo.assume_constant_result
-def _count_torch_fallback() -> None:
-    _COUNTERS.torch_fallback += 1
 
 
 @nki.jit
@@ -203,6 +178,22 @@ def noaux_router_decode_kernel(
     return logits_hbm, index_hbm, aff_hbm
 
 
+#: The model call site's envelope: decode batches. Larger token counts (prefill)
+#: keep the prefill router, whose layout serves them.
+DECODE_ROUTE_MAX_TOKENS = 64
+
+
+def decode_route_admits(hidden_states, router_weights, top_k: int) -> bool:
+    """True when ``route_tokens`` takes this router instead of the prefill one."""
+    if not isinstance(hidden_states, Tensor) or not isinstance(router_weights, Tensor):
+        return False
+    if hidden_states.dim() < 2:
+        return False
+    tokens = hidden_states.numel() // hidden_states.shape[-1]
+    return tokens <= DECODE_ROUTE_MAX_TOKENS and can_run_router_decode(
+        hidden_states, router_weights, top_k)
+
+
 def can_run_router_decode(hidden_states: Tensor, router_weights: Tensor,
                           top_k: int) -> bool:
     """True when the decode kernel serves this call on an NKI device or simulator."""
@@ -273,10 +264,10 @@ def noaux_tc_router_decode(
     if not can_run_router_decode(x, router_weights, top_k):
         if top_k != ROUTER_DECODE_K:
             raise ValueError(f"top_k must be {ROUTER_DECODE_K}, got {top_k}")
-        _count_torch_fallback()
+        _router_seam._count_torch_fallback()
         return router_decode_torch_oracle(x, gamma, router_weights, bias, eps,
                                           norm_topk_prob, routed_scaling_factor)
-    _count_nki_dispatch()
+    _router_seam._count_nki_dispatch()
     return wrap_nki(noaux_router_decode_kernel)(
         hidden=x.contiguous(),
         gamma=gamma.contiguous(),

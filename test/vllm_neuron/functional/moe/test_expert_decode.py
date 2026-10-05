@@ -5,7 +5,7 @@ Old side: the 5938748 packed branch of ``block_quant_expert_mm`` (local gather,
 ``build_blockwise_mapping``, ``fused_fp8_experts`` -- the compact kernel at
 T=1 under LNC=2, the general kernel at T=4 -- and the fp32 token-gather
 combine), from the snapshot under ``test/hardware/baselines/moe_5938748``.
-New side: ``expert_decode.fused_fp8_decode_experts`` on the global router
+New side: ``fused_fp8.fused_fp8_decode_experts`` on the global router
 output, one launch, no mapping and no combine.
 
 Declared tolerances, on the fp32 combined output ``[T, H]``:
@@ -28,11 +28,11 @@ import pytest
 import torch
 
 from vllm_neuron.functional.moe import expert_decode
-from vllm_neuron.functional.moe.expert_decode import (
-    EXPERT_DECODE_MAX_TOKENS,
-    expert_decode_dispatch_counters,
+from vllm_neuron.functional.moe.expert_decode import EXPERT_DECODE_MAX_TOKENS
+from vllm_neuron.functional.moe.fused_fp8 import (
+    fused_dispatch_counters,
     fused_fp8_decode_experts,
-    reset_expert_decode_counters,
+    reset_fused_dispatch_counters,
 )
 from vllm_neuron.functional.moe.moe_blockwise_fp8 import _swiglu_bound_operand
 
@@ -72,12 +72,13 @@ def _bounds():
 
 
 def _new(x, aff, bank, *, rank=RANK, programs=2, out_dtype=torch.float32):
-    reset_expert_decode_counters()
+    """The decode route, asserting one fused-seam NKI entry ran the new kernel."""
+    reset_fused_dispatch_counters()
     with SimulatorCounter() as sim:
         out = fused_fp8_decode_experts(
             x, aff, bank, _bounds(), rank, programs=programs, out_dtype=out_dtype,
         )
-    assert expert_decode_dispatch_counters() == (1, 0), "the NKI route was not taken"
+    assert fused_dispatch_counters() == (1, 0), "the NKI route was not taken"
     assert sim.kernels == [NEW_KERNEL], f"simulated {sim.kernels}"
     return out
 
@@ -163,6 +164,15 @@ def test_expert_decode_reads_the_rank_slice_it_is_given():
     assert torch.equal(other, torch.zeros_like(other))  # no hit on group 6
 
 
+def test_expert_decode_clamps_a_rank_outside_the_groups():
+    """A rank operand past the last group reads the last group, never past the
+    router output (shape inference runs the kernel on ones-filled operands)."""
+    bank, x, aff = _small_case(2, [[1], [0, 3]])
+    last = fused_fp8_decode_experts(x, aff, bank, _bounds(), 1, out_dtype=torch.float32)
+    beyond = fused_fp8_decode_experts(x, aff, bank, _bounds(), 7, out_dtype=torch.float32)
+    assert torch.equal(beyond, last) and bool(last.abs().max() > 0)
+
+
 def _small_case(tokens, hits, seed=61):
     """H=256, I=256, 4 local experts in 2 groups: fast, every hit pattern."""
     bank = packed_expert_bank(experts=4, hidden=256, intermediate=256, seed=seed)
@@ -180,11 +190,11 @@ def _small_case(tokens, hits, seed=61):
 )
 def test_expert_decode_small_shapes_match_the_torch_oracle(hits, programs):
     bank, x, aff = _small_case(len(hits), hits)
-    reset_expert_decode_counters()
+    reset_fused_dispatch_counters()
     with SimulatorCounter() as sim:
         out = fused_fp8_decode_experts(x, aff, bank, _bounds(), 1,
                                        programs=programs, out_dtype=torch.float32)
-    assert expert_decode_dispatch_counters() == (1, 0)
+    assert fused_dispatch_counters() == (1, 0)
     assert sim.kernels == [NEW_KERNEL]
     ref = expert_decode.expert_decode_torch_oracle(
         x, aff, bank, _bounds(), 1, out_dtype=torch.float32)
@@ -197,7 +207,7 @@ def test_expert_decode_token_axis_at_64_rows():
     hits = [sorted(torch.randperm(4, generator=gen)[: int(n)].tolist())
             for n in torch.randint(0, 3, (EXPERT_DECODE_MAX_TOKENS,), generator=gen)]
     bank, x, aff = _small_case(EXPERT_DECODE_MAX_TOKENS, hits)
-    reset_expert_decode_counters()
+    reset_fused_dispatch_counters()
     batch = fused_fp8_decode_experts(x, aff, bank, _bounds(), 1, programs=2,
                                      out_dtype=torch.float32)
     ref = expert_decode.expert_decode_torch_oracle(
@@ -207,22 +217,31 @@ def test_expert_decode_token_axis_at_64_rows():
         alone = fused_fp8_decode_experts(x[t:t + 1], aff[t:t + 1], bank, _bounds(), 1,
                                          programs=2, out_dtype=torch.float32)
         torch.testing.assert_close(alone[0], batch[t], rtol=1e-6, atol=1e-6)
-    assert expert_decode_dispatch_counters() == (4, 0)
+    assert fused_dispatch_counters() == (4, 0)
 
 
-def test_expert_decode_takes_the_torch_oracle_without_a_device(monkeypatch):
-    """No device: the oracle runs, is counted, and still matches 5938748."""
+def test_expert_decode_refuses_without_a_device(monkeypatch):
+    """Like ``fused_fp8_experts`` the seam has no torch fallback: it refuses by name."""
+    bank = _bank()
+    x = decode_hidden(1)
+    aff = routed_affinities(HITS[1])
+    monkeypatch.setenv("NKI_SIMULATOR", "0")
+    reset_fused_dispatch_counters()
+    with pytest.raises(ValueError, match="fused_fp8_decode_experts serves"):
+        fused_fp8_decode_experts(x, aff, bank, _bounds(), RANK)
+    assert fused_dispatch_counters() == (0, 0)
+
+
+def test_expert_decode_torch_oracle_matches_5938748(monkeypatch):
+    """The reference the small-shape and T=64 cases use agrees with 5938748."""
     monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", "2")
     bank = _bank()
     x = decode_hidden(4)
     aff = routed_affinities(HITS[4])
-    old = _old(x, aff, bank, torch.float32)  # simulated 5938748 kernels
-    monkeypatch.setenv("NKI_SIMULATOR", "0")
-    reset_expert_decode_counters()
-    out = fused_fp8_decode_experts(x, aff, bank, _bounds(), RANK,
-                                   out_dtype=torch.float32)
-    assert expert_decode_dispatch_counters() == (0, 1)
-    _assert_close_fp32(out, old, ORACLE_RTOL, ORACLE_ATOL_REL)
+    old = _old(x, aff, bank, torch.float32)
+    ref = expert_decode.expert_decode_torch_oracle(x, aff, bank, _bounds(), RANK,
+                                                   out_dtype=torch.float32)
+    _assert_close_fp32(ref, old, ORACLE_RTOL, ORACLE_ATOL_REL)
 
 
 def test_expert_decode_admits_only_its_envelope():

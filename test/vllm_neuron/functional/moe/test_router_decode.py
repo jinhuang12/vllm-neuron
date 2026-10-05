@@ -17,11 +17,13 @@ import pytest
 import torch
 
 from vllm_neuron.functional.moe import router_decode
+from vllm_neuron.functional.moe.router import (
+    noaux_tc_dispatch_counters,
+    reset_noaux_tc_counters,
+)
 from vllm_neuron.functional.moe.router_decode import (
     ROUTER_DECODE_MAX_TOKENS,
     noaux_tc_router_decode,
-    reset_router_decode_counters,
-    router_decode_dispatch_counters,
 )
 
 from .decode_fixtures import (
@@ -43,13 +45,18 @@ NEW_KERNEL = "noaux_router_decode_kernel"
 
 
 def _new(x, gamma, weights, bias):
-    reset_router_decode_counters()
+    """The decode router, asserting it took its NKI route and ran the new kernel.
+
+    It counts into the noaux_tc router seam's family; the simulated kernel name
+    tells it apart from the 5938748 router, which counts there too.
+    """
+    reset_noaux_tc_counters()
     with SimulatorCounter() as sim:
         out = noaux_tc_router_decode(
             x, gamma, weights, bias, top_k=TOP_K, eps=EPS,
             norm_topk_prob=True, routed_scaling_factor=SCALING,
         )
-    assert router_decode_dispatch_counters() == (1, 0), "the NKI route was not taken"
+    assert noaux_tc_dispatch_counters() == (1, 0), "the NKI route was not taken"
     assert sim.kernels == [NEW_KERNEL], f"simulated {sim.kernels}"
     return out
 
@@ -127,12 +134,12 @@ def test_decode_router_takes_the_torch_oracle_without_a_device(monkeypatch):
     x, gamma, weights, bias = random_router_inputs(2)
     old = _old(x, gamma, weights, bias)  # the 5938748 kernel, simulated
     monkeypatch.setenv("NKI_SIMULATOR", "0")
-    reset_router_decode_counters()
+    reset_noaux_tc_counters()
     logits, index, aff = noaux_tc_router_decode(
         x, gamma, weights, bias, top_k=TOP_K, eps=EPS,
         norm_topk_prob=True, routed_scaling_factor=SCALING,
     )
-    assert router_decode_dispatch_counters() == (0, 1)
+    assert noaux_tc_dispatch_counters() == (0, 1)
     _compare(old, (logits, index, aff), bias)
 
 
