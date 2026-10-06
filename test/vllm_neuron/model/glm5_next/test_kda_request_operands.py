@@ -225,7 +225,14 @@ def test_a_single_request_decode_with_the_row_operands_is_still_served(one_layer
 def test_per_request_operands_equal_the_single_request_decodes_they_are_made_of(
     one_layer,
 ):
-    """One request's answer is the answer that request gets on its own, to the bit."""
+    """One request's answer is the answer that request gets on its own.
+
+    The batch is one stacked call, so its projections are a [B, hidden] GEMM where the
+    request alone takes a [1, hidden] GEMV, and torch's CPU kernels round those apart in
+    the last fp32 bit (and a bf16 conv row by one rounding). The gaps are therefore held
+    to that rounding, not zero; bit equality on exactly representable operands is
+    test_tiny_glm5next_batch_kda.py's.
+    """
     layer = one_layer.layer
     operands = _per_request_operands(layer, [1] * DECLARED_REQUESTS)
     assert operands, "the tree carries the row operands and the runner's builder"
@@ -243,7 +250,14 @@ def test_per_request_operands_equal_the_single_request_decodes_they_are_made_of(
             float((together.conv[index] - alone.conv[0]).abs().max()),
             float((together.recurrent[index] - alone.recurrent[0]).abs().max()),
         )
-        assert gaps == (0.0, 0.0, 0.0), (
+        # fp32 reassociation for the fp32 output and recurrent state; one bf16
+        # rounding for the bf16 conv history, whose rows store the projected values.
+        limits = (
+            1e-5 * float(alone.out.abs().max()) + 1e-6,
+            2.0**-7 * float(alone.conv[0].float().abs().max()),
+            1e-5 * float(alone.recurrent[0].abs().max()) + 1e-6,
+        )
+        assert all(gap <= limit for gap, limit in zip(gaps, limits)), (
             f"request {index} was served differently in the batch than on its own: "
             f"output, conv and recurrent gaps {gaps}. Each request's recursion carries "
             f"its own operands, so nothing about the batch may reach its arithmetic"

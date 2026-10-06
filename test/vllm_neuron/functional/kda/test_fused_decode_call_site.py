@@ -10,8 +10,8 @@ decode-state kernels this change replaced. Both runs must write the same bank
 rows and return the same output, and each must have dispatched only its own
 kernels.
 
-Wave 1 keeps the per-request loop in the model, so ``B`` requests are ``B``
-fused dispatches per layer here, not one.
+Wave 2 stacks the requests' carriers, so ``B`` requests are one fused dispatch
+per layer here, not ``B``.
 """
 
 from __future__ import annotations
@@ -146,7 +146,7 @@ def test_model_decode_takes_the_fused_kernel_and_matches_the_stages(
     )
 
     assert new_counts == {
-        "fused": (batch, 0), "conv": (0, 0), "gate": (0, 0), "decode": (0, 0),
+        "fused": (1, 0), "conv": (0, 0), "gate": (0, 0), "decode": (0, 0),
     }, f"the fused decode must serve every request on the NKI route: {new_counts}"
     assert old_counts == {
         "fused": (0, 0), "conv": (batch, 0), "gate": (batch, 0),
@@ -155,9 +155,19 @@ def test_model_decode_takes_the_fused_kernel_and_matches_the_stages(
 
     assert torch.isfinite(new_out).all()
     torch.testing.assert_close(new_out, old_out, rtol=OUT_RTOL, atol=OUT_ATOL)
-    assert torch.equal(
-        new_conv.contiguous().view(torch.uint8), old_conv.contiguous().view(torch.uint8)
-    ), "the conv bank must agree bit for bit"
+    if batch == 1:
+        assert torch.equal(
+            new_conv.contiguous().view(torch.uint8),
+            old_conv.contiguous().view(torch.uint8),
+        ), "the conv bank must agree bit for bit"
+    else:
+        # The stacked call projects [B, hidden] rows where the switched-off control
+        # projects B [1, hidden] rows, and torch's CPU GEMM and GEMV round apart in the
+        # last bit, so the bf16 history rows agree to one rounding. Bit equality on
+        # exactly representable operands is test_tiny_glm5next_batch_kda.py's check.
+        torch.testing.assert_close(
+            new_conv.float(), old_conv.float(), rtol=2.0**-7, atol=2.0**-7
+        )
     torch.testing.assert_close(
         new_rec, old_rec, rtol=STATE_RTOL, atol=STATE_ATOL, equal_nan=True
     )
