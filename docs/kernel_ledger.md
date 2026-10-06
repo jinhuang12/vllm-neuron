@@ -93,6 +93,10 @@ the kernel of the branch.
   gate measured. A BLOCKED or REJECT candidate never counts for a commit with no gate
   record.
 
+Team-lead ruling: `--tip` is ancestry-based, and the ledger computes the kernels of a
+commit from git ancestry (`git merge-base --is-ancestor`): the merged ancestors, plus
+the gated branch for a gate commit.
+
 The gate run of a tip is the newest gate run that measured that tree. If there is no
 such run, it is the newest MERGE run of a candidate in the tree.
 
