@@ -8,13 +8,15 @@ select cores. For each context (4096 and 8192, ``max_seq_len`` equal to it, so 1
 * ``before`` -- 75090b9's ``Glm5NextMLAAttention.forward``, once per request: the
   one-request indexer chain (ring step, candidate gather, score GEMM, causal bound,
   top-k, sentinel, order, expand) and ``mla_sparse_attention``. This is how 75090b9
-  serves ``B`` requests, and what the wave-2 batch carrier still does for the indexer.
+  serves ``B`` requests, and what the wave-2 batch carrier did for the indexer before
+  this branch.
 * ``after`` -- this tree's batched layer (``dsa_batch_case.batched_layer``): the
   projections once on ``B`` rows, ``Glm5NextDSAIndexer.forward_requests`` (one ring-step
   launch and one score launch for all requests, then the existing top-k, sentinel,
   order and expand at ``B`` rows) and ``mla_decode_attention`` for all requests.
 * ``after_per_request`` (``B = 1`` only) -- this tree's ``forward`` at one request, the
-  route a one-request decode step still takes.
+  route a one-request decode step takes: ``forward_requests`` at one request, then the
+  one-request attention (``attend`` at ``batch_size`` 1, ``mla_sparse_attention``).
 
 The geometry is the per-rank TP=64 shape (``dsa_decode_case.decode_config``). Request
 ``b`` is at length ``ctx - b % 4``, so positions mix pool completions and open pools, in

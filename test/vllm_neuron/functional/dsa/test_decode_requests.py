@@ -2,9 +2,11 @@
 """``Glm5NextDSAIndexer.forward_requests``: one DSA/MLA layer's decode step for ``B``
 requests at once, against the wave-1 layer run once per request.
 
-The reference is ``Glm5NextMLAAttention.forward`` -- the one-request indexer chain and
-``mla_sparse_attention`` -- on each request's own views of the same banks
-(``dsa_batch_case.per_request_layer``). The batched layer is the projections once on
+The reference is 75090b9's ``Glm5NextMLAAttention.forward`` (the git-show snapshot in
+``test/hardware/baselines/dsa_75090b9``, same weights) -- the one-request indexer chain
+and ``mla_sparse_attention`` -- on each request's own views of the same banks
+(``dsa_batch_case.per_request_layer``). The live tree's own one-request decode is the
+batch-of-one case of the batched step, so it cannot be its own reference. The batched layer is the projections once on
 ``B`` rows, ``forward_requests`` and ``mla_decode_attention``
 (``dsa_batch_case.batched_layer``). Lengths are unequal and straddle the selection
 bound, pool completions and page edges; ``max_seq_len`` is 8192, so 2048 candidate
@@ -38,6 +40,7 @@ import pytest
 import torch
 
 import vllm_neuron.model.glm5_next.model_fp8 as model_fp8
+from test.hardware.baselines.dsa_75090b9 import load as load_75090b9
 from test.vllm_neuron.functional.dsa import dsa_batch_case as C
 from test.vllm_neuron.functional.dsa.dsa_decode_case import (
     PAGE,
@@ -47,6 +50,7 @@ from test.vllm_neuron.functional.dsa.dsa_decode_case import (
 from vllm_neuron.functional.attention import mla_decode as MD
 from vllm_neuron.functional.dsa import decode_batch as DB
 from vllm_neuron.functional.dsa.index_expand import index_expand_dispatch_counters
+from vllm_neuron.functional.dsa.score_gemm import score_gemm_dispatch_counters
 from vllm_neuron.functional.dsa.topk_select import topk_select_dispatch_counters
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
@@ -67,8 +71,26 @@ def _module():
     return build_attention(model_fp8, decode_config(hidden_size=512, q_lora_rank=256))
 
 
+@functools.lru_cache(maxsize=1)
+def _reference():
+    """75090b9's layer with the same weights: the wave-1 one-request decode."""
+    return build_attention(load_75090b9().model_fp8,
+                           decode_config(hidden_size=512, q_lora_rank=256))
+
+
 def _cfg():
     return _module().indexer
+
+
+def _per_request(ops, taps, projected=None):
+    """The reference layer once per request; asserts it scored once per request."""
+    before = score_gemm_dispatch_counters()
+    want = C.per_request_layer(_reference(), ops, taps=taps, projected=projected)
+    after = score_gemm_dispatch_counters()
+    selects = int(ops["max_seq_len"]) // int(_cfg().index_kpool) > _cfg().select_k()
+    assert after[0] - before[0] == (int(ops["hidden"].shape[0]) if selects else 0)
+    assert after[1] == before[1]
+    return want
 
 
 def _ops(lengths, seed=7):
@@ -117,7 +139,7 @@ def _paired(batch: int):
     taps["expand"] = tuple(a - b for a, b in zip(index_expand_dispatch_counters(),
                                                  expand_before))
     want_taps: dict = {}
-    want = C.per_request_layer(_module(), ref, taps=want_taps, projected=taps["projected"])
+    want = _per_request(ref, want_taps, projected=taps["projected"])
     return ops, mine, ref, out, taps, want, want_taps
 
 
@@ -152,15 +174,16 @@ def test_batched_layer_output_equals_the_per_request_output(batch):
     assert float((out.float() - want.float()).abs().max()) <= ulp
 
 
-def test_the_reference_on_its_own_projections_selects_the_same_tokens():
+@pytest.mark.parametrize("batch", [4, 8])
+def test_the_reference_on_its_own_projections_selects_the_same_tokens(batch):
     """Without sharing the projections the selections still agree for these lengths."""
-    ops = _ops(LENGTHS[4], seed=8)
+    ops = _ops(LENGTHS[batch], seed=8)
     mine, ref = C.cloned(ops), C.cloned(ops)
     out, taps = _counted_batched(mine)
     _assert_batched_route(taps)
     want_taps: dict = {}
-    want = C.per_request_layer(_module(), ref, taps=want_taps)
-    for b in range(4):
+    want = _per_request(ref, want_taps)
+    for b in range(batch):
         assert torch.equal(taps["indices"][b].sort().values,
                            want_taps["indices"][b][0].sort().values)
     ulp = BF16_ULP * float(want.float().abs().max())
@@ -253,7 +276,7 @@ def test_the_bypass_regime_writes_the_same_banks_and_attends_the_same_prefix():
     assert taps["decode_batch"] == (1, 0) and taps["routes"][:2] == (1, 0)
     assert taps["mla_decode"][0] == 1
     want_taps: dict = {}
-    want = C.per_request_layer(_module(), ref, taps=want_taps, projected=taps["projected"])
+    want = _per_request(ref, want_taps, projected=taps["projected"])
     assert torch.equal(mine["tail_bank"], ref["tail_bank"])
     _assert_pool_banks_agree(mine["pool_bank"], ref["pool_bank"])
     ulp = BF16_ULP * float(want.float().abs().max())
@@ -283,3 +306,52 @@ def test_forward_requests_refuses_mismatched_banks():
         call(slots=ops["state_slots"][:2])
     with pytest.raises(model_fp8.Glm5NextDSAIndexerError, match="trash"):
         call(pool_bank=ops["pool_bank"][:, :MAX_SEQ_LEN // 4])
+
+
+def _views(ops):
+    """The runner's carrier form: one view per request of each bank, in request order."""
+    slots = ops["state_slots"].tolist()
+    return (tuple(ops["pool_bank"][s] for s in slots),
+            tuple(ops["tail_bank"][s] for s in slots))
+
+
+@pytest.mark.parametrize("batch", [1, 4])
+def test_the_carrier_form_selects_and_writes_as_the_bank_form(batch):
+    """Views in, writes into the views: the same indices and the same banks as slots in."""
+    module = _module()
+    indexer = module.indexer
+    ops = _ops(LENGTHS[batch], seed=12)
+    q_latent = module.project_query_latent(ops["hidden"])
+    projected = indexer.project_stage(ops["hidden"], q_latent)
+    by_bank, by_view = C.cloned(ops), C.cloned(ops)
+    DB.reset_decode_batch_dispatch_counters()
+    want = indexer.forward_requests(
+        ops["hidden"], q_latent, by_bank["pool_bank"], by_bank["tail_bank"],
+        by_bank["state_slots"], ops["seq_lens"], ops["position"],
+        max_seq_len=MAX_SEQ_LEN, projected=projected)
+    pools, tails = _views(by_view)
+    got = indexer.forward_requests(
+        ops["hidden"], q_latent, pools, tails, None, ops["seq_lens"], ops["position"],
+        max_seq_len=MAX_SEQ_LEN, projected=projected)
+    assert DB.decode_batch_dispatch_counters() == (4, 0)
+    assert torch.equal(got, want)
+    assert torch.equal(by_view["tail_bank"], by_bank["tail_bank"])
+    assert torch.equal(by_view["pool_bank"], by_bank["pool_bank"])
+    # Something was written, so the equality is not two untouched copies.
+    assert not torch.equal(by_view["tail_bank"], ops["tail_bank"])
+
+
+def test_forward_requests_refuses_a_position_that_is_not_the_last_token():
+    module = _module()
+    ops = _ops(LENGTHS[4])
+    q_latent = module.project_query_latent(ops["hidden"])
+    with pytest.raises(model_fp8.Glm5NextDSAIndexerError, match="seq_lens - 1"):
+        module.indexer.forward_requests(
+            ops["hidden"], q_latent, ops["pool_bank"], ops["tail_bank"],
+            ops["state_slots"], ops["seq_lens"], ops["position"] - 1,
+            max_seq_len=MAX_SEQ_LEN)
+    with pytest.raises(model_fp8.Glm5NextDSAIndexerError, match="distinct"):
+        module.indexer.forward_requests(
+            ops["hidden"], q_latent, ops["pool_bank"], ops["tail_bank"],
+            ops["state_slots"][[0, 0, 1, 2]], ops["seq_lens"], ops["position"],
+            max_seq_len=MAX_SEQ_LEN)

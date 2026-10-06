@@ -10,11 +10,13 @@ the same composition.
   keys ``[slots, rows, 128]`` and the rings ``[slots, 2, 4, 128]``.
 * :func:`batched_layer` is the layer at ``B``: the projections once on ``B`` rows,
   ``Glm5NextDSAIndexer.forward_requests`` for every request's selection, and
-  ``mla_decode_attention`` for every request's attention. It is wave 2's decode
-  composition (``Glm5NextMLAAttention._attend_requests``) with the per-request indexer
-  loop replaced by the batched one.
-* :func:`per_request_layer` is the wave-1 layer, ``Glm5NextMLAAttention.forward``, once
-  per request on that request's own bank views, as the runner serves ``B = 1``.
+  ``mla_decode_attention`` for every request's attention. It is
+  ``Glm5NextMLAAttention._forward_requests`` at ``B > 1`` written out step by step, so
+  the tests can tap the projections, the indices and the attention output.
+* :func:`per_request_layer` is a module's ``Glm5NextMLAAttention.forward`` once per
+  request on that request's own bank views. Given 75090b9's module (the git-show
+  snapshot) it is the wave-1 one-request decode; this tree's one-request decode is the
+  batch-of-one case of the batched step.
 """
 
 from __future__ import annotations
@@ -138,7 +140,7 @@ def batched_layer(module, ops: dict, *, taps: dict | None = None) -> torch.Tenso
 
 def per_request_layer(module, ops: dict, *, taps: dict | None = None,
                       projected: tuple | None = None) -> torch.Tensor:
-    """The wave-1 layer once per request, on its own bank views. ``[B, hidden_size]``.
+    """``module``'s layer once per request, on its own bank views. ``[B, hidden_size]``.
 
     ``taps``, when given, receives ``indices`` (one ``[1, width]`` row per request) and
     ``attended`` (one ``[1, 1, latent]`` row per request), read from each forward's own
