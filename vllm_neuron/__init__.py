@@ -67,6 +67,12 @@ def _init_backend():
         import libtorch_neuronx_lite  # noqa: F401
         import torch._dynamo.backends.registry as registry
 
+        # Fold the kernel-source digest into Lite's compile cache keys, so a
+        # kernel edit misses a warm cache root (vllm_neuron/compile_cache_key.py).
+        from vllm_neuron.compile_cache_key import install_at_startup
+
+        install_at_startup()
+
         # Lite skips its own backend registration during vllm_neuron import,
         # so register the FX-to-HLO capture backend here.
         from libtorch_neuronx_lite.compile.capture_backend import capture
@@ -113,6 +119,12 @@ def _init_backend():
 
     from libtorch_neuronx_lite.compile.backend import compile
     from libtorch_neuronx_lite.compile.capture_backend import capture
+
+    # Fold the kernel-source digest into Lite's compile cache keys, so a kernel
+    # edit misses a warm cache root (vllm_neuron/compile_cache_key.py).
+    from vllm_neuron.compile_cache_key import install_at_startup
+
+    install_at_startup()
 
     # The compiler is registered inside the load stager: compiling a graph loads
     # it into host memory, and a whole tensor-parallel group loading at one
