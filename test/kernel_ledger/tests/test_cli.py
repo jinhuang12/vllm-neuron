@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The command line: the three acceptance invocations and the shape emitter."""
+"""The command line: the acceptance invocations (as restated by team-lead) and the shape emitter."""
 
 from __future__ import annotations
 
 import json
 import re
 import shutil
+
+import pytest
 
 from test.kernel_ledger.cli import main, run
 from test.kernel_ledger.models.glm53f.configs import BS1_CTX1K, BS64_CTX8K
@@ -18,22 +20,71 @@ def _bucket_row(text, bucket):
     return float(m.group(1))
 
 
-def test_5938748_prints_buckets_reconciliation_and_the_residual_against_77_36():
-    out = run("5938748", BS1_CTX1K)
+@pytest.fixture(scope="module")
+def base_run(tmp_path_factory):
+    path = tmp_path_factory.mktemp("j") / "base.json"
+    return run("5938748", BS1_CTX1K, json_path=path), json.loads(path.read_text())
+
+
+def test_5938748_prints_every_bucket(base_run):
+    out, _ = base_run
     for b in ("mHC", "KDA", "DSA/MLA", "MoE", "dense", "lm_head", "collectives"):
         assert _bucket_row(out, b) > 0
-    assert "Reconciliation with DECODE_BREAKDOWN.md" in out
-    assert re.search(r"DECODE_BREAKDOWN.md \(quiet host\): step 77.36 ms -> residual 16\.\d\d ms", out)
-    assert "gate_baseline.json (tree 5938748): step 82.57 ms" in out
+
+
+def test_5938748_reconciliation_verdicts_follow_the_ruling(base_run):
+    out, doc = base_run
+    verdicts = {r["bucket"]: r["verdict"] for r in doc["reconciliation"]["rows"]}
+    assert verdicts == {"mHC": "PASS", "KDA": "PASS", "DSA/MLA": "PASS", "lm_head": "PASS",
+                        "MoE": "FAIL", "dense": "FAIL", "collectives": "FAIL"}
+    for r in doc["reconciliation"]["rows"]:
+        assert (r["verdict"] == "FAIL") == r["cause"].startswith("scope:")
+        assert abs(r["delta_pct"]) <= 15.0 or r["verdict"] == "FAIL"
+    assert "PASS 4 of 7; every verdict as expected" in out
+    assert out.count("FAIL cause: scope:") == 3
+
+
+def test_5938748_residual_against_both_steps_with_labels(base_run):
+    out, _ = base_run
+    assert re.search(r"breakdown, full host \(DECODE_BREAKDOWN.md\): step 77.36 ms -> residual \d+\.\d\d ms vs "
+                     r"calibrated \(\d+\.\d%\); 16\.\d\d ms vs raw", out)
+    assert re.search(r"gate baseline, CPU split \(gate_baseline.json, tree 5938748\): step 82.57 ms", out)
+
+
+def test_sum_line_is_calibrated_and_the_raw_sum_is_shown(base_run):
+    out, doc = base_run
+    m = re.search(r"^sum of measured kernels \+ collectives, calibrated \(PREDICTOR, not a test\): ([\d.]+) ms", out, re.M)
+    r = re.search(r"^sum of measured kernels \+ collectives, raw benchmark medians: ([\d.]+) ms", out, re.M)
+    assert m and r
+    assert float(m.group(1)) == pytest.approx(doc["calibrated_ms"], abs=0.006)
+    assert float(r.group(1)) == pytest.approx(doc["raw_ms"], abs=0.006)
+    assert "scope gap raw - calibrated" in out
 
 
 def test_current_uses_after_medians_and_prints_the_predicted_step():
     out = run("current", BS1_CTX1K)
     assert "every wave-1 kernel" in out
     assert re.search(r"^mhc_pre_attn_sinkhorn .* 23\.30 .* after ", out, re.M)
-    assert "predicted device step" in out
-    assert re.search(r"^latest gate run: gate_\S+\.json \(tree [0-9a-f]{7}\): device step [\d.]+ ms", out, re.M)
-    assert re.search(r"^  ledger at tree [0-9a-f]{7} \([\d.]+ ms\): step [\d.]+ ms -> residual", out, re.M)
+    assert re.search(r"^latest gate run: gate_\S+\.json \(tree [0-9a-f]{7}[^)]*\): device step [\d.]+ ms", out, re.M)
+    assert re.search(r"^ledger at tree [0-9a-f]{7}: calibrated [\d.]+ ms, raw [\d.]+ ms", out, re.M)
+    assert "predicted device step for current" in out
+
+
+def test_current_predicts_with_the_calibrated_sum_plus_a_residual():
+    out = run("current", BS1_CTX1K)
+    s = re.search(r"^sum of measured kernels \+ collectives, calibrated \(PREDICTOR, not a test\): ([\d.]+) ms", out, re.M)
+    for label in ("the latest gate run's residual", "the 5938748 residual vs 77.36 ms (breakdown, full host)",
+                  "the 5938748 residual vs 82.57 ms (gate baseline, CPU split)"):
+        m = re.search(rf"^  ([\d.]+) ms with {re.escape(label)}[^:]*: ([\d.]+) ms", out, re.M)
+        assert m, label
+        assert abs(float(m.group(1)) - float(s.group(1)) - float(m.group(2))) < 0.011  # 2-decimal rounding
+
+
+def test_merged_tip_shows_the_measured_profile_next_to_the_predictor():
+    out = run("594d425", BS1_CTX1K)
+    assert "Measured in-model per bucket (gate_host.json profile, tree 2fd8161)" in out
+    m = re.search(r"^mHC\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([+-][\d.]+)", out.split("Measured in-model")[1], re.M)
+    assert m and float(m.group(3)) == pytest.approx(16.766, abs=0.001)
 
 
 def test_bs64_prints_a_roofline_row_for_every_node_with_the_expert_term(tmp_path):
@@ -71,11 +122,3 @@ def test_not_wired_note_only_when_its_family_is_merged():
     assert "not wired" in run("current", BS1_CTX1K).splitlines()[1]
     head = run("594d425", BS1_CTX1K).splitlines()[1]
     assert "for host;" in head and "not wired" not in head
-
-
-def test_current_also_predicts_with_the_latest_gate_residual():
-    out = run("current", BS1_CTX1K)
-    m = re.search(r"^  ([\d.]+) ms with the latest gate run's residual ([\d.]+) ms", out, re.M)
-    s = re.search(r"^sum of measured kernels \+ collectives: ([\d.]+) ms", out, re.M)
-    assert m and s
-    assert abs(float(m.group(1)) - float(s.group(1)) - float(m.group(2))) < 0.011  # 2-decimal rounding

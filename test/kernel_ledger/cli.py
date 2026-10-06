@@ -16,9 +16,11 @@ import json
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from .models.glm53f.calibration import Calibration, calibrate, calibrated_buckets, calibrated_ms
 from .models.glm53f.configs import BASELINE, BS1_CTX1K, BS64_CTX8K, FAMILY_OF, NOT_WIRED, DecodePoint, point_for
 from .models.glm53f.ledger import Ledger, build_ledger
-from .models.glm53f.references import RECONCILED, REFERENCES, STEP_5938748, TOLERANCE
+from .models.glm53f.profile import profile_buckets
+from .models.glm53f.references import GATE_BASELINE_LABEL, RECONCILED, REFERENCES, STEP_5938748, TOLERANCE
 from .models.glm53f.shapes import emit_shapes
 from .models.glm53f.tips import Tip, resolve_tip
 from .readers.gate import GateStep, read_gates
@@ -26,6 +28,7 @@ from .readers.micro import MICRO_FILES, REPORTS_DIR, load_micro_results, missing
 
 #: The point every gate run serves: one request, context about 1k, max_model_len 4096.
 GATE_POINT = BS1_CTX1K
+PREDICTOR = "PREDICTOR, not a test"
 
 
 def _num(x: Optional[float], fmt: str = "{:.2f}") -> str:
@@ -66,70 +69,105 @@ def node_table(led: Ledger) -> List[str]:
     return out
 
 
-def bucket_table(led: Ledger) -> List[str]:
-    out = ["Per bucket (ms per step)",
-           f"{'bucket':<12} {'measured':>9} {'roofline':>9} {'unmeasured':>11}  units without a benchmark at this shape"]
+def bucket_table(led: Ledger, cal: Optional[Calibration]) -> List[str]:
+    cb = calibrated_buckets(led, cal) if cal else {}
+    head = f"{'bucket':<12} {'raw':>8} {'roofline':>9} {'unmeasured':>11}"
+    if cal:
+        head += f" {'k':>6} {'calibrated':>11}"
+    out = ["Per bucket (ms per step; raw = benchmark medians x count"
+           + (f"; calibrated = k x raw: {PREDICTOR})" if cal else ")"),
+           head + "  units without a benchmark at this shape"]
     for b, t in led.buckets().items():
-        out.append(f"{b:<12} {t.measured_ms:>9.3f} {t.roofline_ms:>9.3f} {t.unmeasured_roofline_ms:>11.3f}  "
-                   f"{', '.join(t.missing) or '-'}")
-    out.append(f"{'total':<12} {led.measured_ms:>9.3f} {led.roofline_ms:>9.3f} {led.unmeasured_roofline_ms:>11.3f}")
+        line = f"{b:<12} {t.measured_ms:>8.3f} {t.roofline_ms:>9.3f} {t.unmeasured_roofline_ms:>11.3f}"
+        if cal:
+            line += f" {_num(cal.k.get(b), '{:.3f}') if b in cal.k else '1':>6} {cb[b]:>11.3f}"
+        out.append(line + f"  {', '.join(t.missing) or '-'}")
+    total = f"{'total':<12} {led.measured_ms:>8.3f} {led.roofline_ms:>9.3f} {led.unmeasured_roofline_ms:>11.3f}"
+    if cal:
+        total += f" {'':>6} {calibrated_ms(led, cal):>11.3f}"
+    out.append(total)
     out.append("(unmeasured = roofline of compiler ops and DSA members fused into mla_sparse: no time of their own "
-               "in 'measured')")
+               "in 'raw')")
+    if cal:
+        src = Path(cal.gate.file).name if cal.gate else "no gate run"
+        out.append(f"(k = in-model ms at 5938748 / raw 'before' ms; in-model = the {src} profile buckets, else the "
+                   "breakdown reference; k = 1 where no in-model number exists)")
     return out
 
 
-def reconciliation(led: Ledger) -> Dict:
+def reconciliation(led: Ledger, cal: Optional[Calibration]) -> Dict:
     buckets = led.buckets()
     rows = []
     for b in RECONCILED:
         ref = REFERENCES[b]
         got = buckets[b].measured_ms
-        row = {"bucket": b, "ledger_ms": got, "scope": ref.scope,
-               "as_built_ms": ref.as_built_ms, "as_built_delta_pct": _pct(got, ref.as_built_ms),
-               "as_built_terms": [{"ms": t.ms, "label": t.label, "file": t.file.name} for t in ref.as_built]}
-        row["as_built_ok"] = abs(row["as_built_delta_pct"]) <= TOLERANCE * 100
-        if ref.in_model_wall:
-            row.update(wall_ms=ref.in_model_wall_ms, wall_delta_pct=_pct(got, ref.in_model_wall_ms),
-                       wall_terms=[{"ms": t.ms, "label": t.label, "file": t.file.name} for t in ref.in_model_wall])
-            row["wall_ok"] = abs(row["wall_delta_pct"]) <= TOLERANCE * 100
-        rows.append(row)
+        delta = _pct(got, ref.reference_ms)
+        verdict = "PASS" if abs(delta) <= TOLERANCE * 100 else "FAIL"
+        rows.append({
+            "bucket": b, "ledger_ms": got, "scope": ref.scope,
+            "reference_ms": ref.reference_ms, "reference_kind": ref.reference_kind, "delta_pct": delta,
+            "verdict": verdict, "expected": ref.expect, "cause": ref.cause if verdict == "FAIL" else "",
+            "note": ref.note, "engine_active_ms": ref.engine_active_ms,
+            "k": cal.k.get(b) if cal else None, "k_source": cal.source.get(b) if cal else None,
+            "reference_terms": [{"ms": t.ms, "label": t.label, "file": t.file.name} for t in ref.reference],
+            "engine_active_terms": [{"ms": t.ms, "label": t.label, "file": t.file.name} for t in ref.engine_active],
+        })
     return {"tolerance_pct": TOLERANCE * 100, "rows": rows}
 
 
 def reconciliation_table(rec: Dict) -> List[str]:
     tol = rec["tolerance_pct"]
-    out = [f"Reconciliation with DECODE_BREAKDOWN.md (5938748, bs=1, ctx about 1070, rank 0), within {tol:.0f}%?",
-           f"{'bucket':<12} {'ledger':>7} {'as-built':>9} {'delta':>8} {'ok':>3}  {'in-model wall':>13} {'delta':>8} "
-           f"{'ok':>3}"]
+    out = [f"Reconciliation (5938748, bs=1, ctx about 1070, rank 0): raw ledger vs the same-scope in-model "
+           f"reference, PASS within {tol:.0f}%",
+           f"{'bucket':<12} {'ledger':>7} {'reference':>9} {'delta':>8} {'verdict':<7} {'engine-active':>13} {'k':>6}"]
     for r in rec["rows"]:
-        wall = (f"{r['wall_ms']:>13.2f} {r['wall_delta_pct']:>+7.1f}% {'yes' if r['wall_ok'] else 'NO':>3}"
-                if "wall_ms" in r else f"{'-':>13} {'-':>8} {'-':>3}")
-        out.append(f"{r['bucket']:<12} {r['ledger_ms']:>7.2f} {r['as_built_ms']:>9.2f} {r['as_built_delta_pct']:>+7.1f}% "
-                   f"{'yes' if r['as_built_ok'] else 'NO':>3}  {wall}")
-    n_ab = sum(r["as_built_ok"] for r in rec["rows"])
-    n_w = sum(r.get("wall_ok", False) for r in rec["rows"])
-    out.append(f"within {tol:.0f}%: {n_ab} of {len(rec['rows'])} against as-built, {n_w} of {len(rec['rows'])} "
-               "against in-model wall")
-    out.append("as-built = master-table rows, engine-active time (waits are a separate bucket there); in-model wall = "
-               "call spans / kernel wall. Benchmark medians are wall times of a kernel in its own graph.")
+        flag = "" if r["verdict"] == r["expected"] else f" (expected {r['expected']})"
+        out.append(f"{r['bucket']:<12} {r['ledger_ms']:>7.2f} {r['reference_ms']:>9.2f} {r['delta_pct']:>+7.1f}% "
+                   f"{r['verdict']:<7} {r['engine_active_ms']:>13.2f} {_num(r['k'], '{:.3f}'):>6}{flag}")
+    n = sum(r["verdict"] == "PASS" for r in rec["rows"])
+    unexpected = [r["bucket"] for r in rec["rows"] if r["verdict"] != r["expected"]]
+    out.append(f"PASS {n} of {len(rec['rows'])}; "
+               + (f"UNEXPECTED: {', '.join(unexpected)}" if unexpected else "every verdict as expected"))
+    out.append("reference = same-scope in-model time (wall where the breakdown gives one); engine-active = the "
+               "DECODE_BREAKDOWN.md master-table rows; k = in-model / raw, the calibration of the PREDICTOR")
     for r in rec["rows"]:
         out.append(f"  {r['bucket']}: {r['scope']}")
-        out.append("    as-built: " + " + ".join(f"{t['ms']:.3f} {t['label']} ({t['file']})" for t in r["as_built_terms"]))
-        if "wall_terms" in r:
-            out.append("    wall: " + " + ".join(f"{t['ms']:.3f} {t['label']} ({t['file']})" for t in r["wall_terms"]))
+        out.append(f"    reference ({r['reference_kind']}): "
+                   + " + ".join(f"{t['ms']:.3f} {t['label']} ({t['file']})" for t in r["reference_terms"]))
+        if r["verdict"] == "FAIL":
+            out.append(f"    FAIL cause: {r['cause']}")
+        if r["note"]:
+            out.append(f"    note: {r['note']}")
+        if r["k_source"]:
+            out.append(f"    k source: {r['k_source']}")
     return out
 
 
-def _gate_label(g: GateStep) -> str:
-    head = (g.head or "?")[:7]
-    return f"{Path(g.file).name} (tree {head})"
+def profile_table(led: Ledger, cal: Calibration, gate: GateStep) -> List[str]:
+    """The gate's measured in-model ms per bucket next to the calibrated PREDICTOR."""
+    prof = profile_buckets(gate.buckets_ms)
+    cb = calibrated_buckets(led, cal)
+    out = [f"Measured in-model per bucket ({Path(gate.file).name} profile, tree {(gate.head or '?')[:7]}) vs "
+           f"calibrated ({PREDICTOR})",
+           f"{'bucket':<12} {'raw':>8} {'calibrated':>11} {'measured':>9} {'calib-meas':>11}"]
+    for b in RECONCILED:
+        meas = prof.by_bucket.get(b)
+        diff = None if meas is None else cb[b] - meas
+        out.append(f"{b:<12} {led.buckets()[b].measured_ms:>8.3f} {cb[b]:>11.3f} {_num(meas, '{:.3f}'):>9} "
+                   f"{_num(diff, '{:+.3f}'):>11}")
+    out.append(f"profile glue + waits (unnamed compiler ops, waits, DMA issue, idle): {prof.residual_ms:.2f} ms"
+               + (f"; UNMAPPED kernel sources (in the residual): {', '.join(prof.unmapped)}" if prof.unmapped else ""))
+    return out
 
 
-def residual_lines(led: Ledger, steps: List[tuple]) -> List[str]:
+def residual_lines(steps: List[tuple], calibrated: Optional[float], raw: float, led: Ledger) -> List[str]:
     out = []
     for label, step in steps:
-        res = led.residual_ms(step)
-        out.append(f"  {label}: step {step:.2f} ms -> residual {res:.2f} ms ({res / step * 100:.1f}% of the step)")
+        line = f"  {label}: step {step:.2f} ms -> "
+        if calibrated is not None:
+            line += f"residual {step - calibrated:.2f} ms vs calibrated ({(step - calibrated) / step * 100:.1f}%); "
+        line += f"{step - raw:.2f} ms vs raw"
+        out.append(line)
     out.append(f"  residual = compiler glue (roofline of the unmeasured ops alone: {led.unmeasured_roofline_ms:.2f} ms), "
                "waits between kernels, launch skew")
     if not led.complete:
@@ -143,27 +181,39 @@ def run(tip_name: str, point: DecodePoint, reports_dir: Path = REPORTS_DIR,
     gates = read_gates(reports_dir)
     tip = resolve_tip(tip_name, gates)
     led = build_ledger(point, tip.kernel_set, results)
+    base_tip = resolve_tip("5938748", gates)
+    cal = calibrate(build_ledger(point, BASELINE, results), base_tip.gate) if point == GATE_POINT else None
     lines = [f"GLM-5.3-Flash decode ledger | tip {tip.name} | {point.label} (max_model_len {point.max_model_len}) "
              f"| TP=64 EP=16, one rank",
              _kernel_set_line(tip),
              f"reports: {reports_dir} ({len(MICRO_FILES) - len(missing_micro_files(reports_dir))} of {len(MICRO_FILES)} "
              f"microbenchmark files; missing: {', '.join(missing_micro_files(reports_dir)) or 'none'})",
              ""]
-    lines += node_table(led) + [""] + bucket_table(led) + [""]
+    lines += node_table(led) + [""] + bucket_table(led, cal) + [""]
     doc = {"tip": tip.name, "sha": tip.sha, "kernel_set": {"name": tip.kernel_set.name,
                                                              "after": sorted(tip.kernel_set.after)},
            "branches": list(tip.branches), "point": vars(point),
            "rows": [dict(vars(r), roofline_ms=r.roofline_ms, measured_ms=r.measured_ms) for r in led.rows],
            "buckets": {b: vars(t) for b, t in led.buckets().items()},
-           "kernels_ms": led.kernels_ms, "collectives_ms": led.collectives_ms, "measured_ms": led.measured_ms,
+           "kernels_ms": led.kernels_ms, "collectives_ms": led.collectives_ms, "raw_ms": led.measured_ms,
            "host_ms": led.host_ms, "roofline_ms": led.roofline_ms, "unmeasured_roofline_ms": led.unmeasured_roofline_ms,
            "missing": led.missing}
 
     units = [r for r in led.rows if r.kind in ("measured", "missing")]
     partial = "" if led.complete else (f" PARTIAL: {len(units) - len(led.missing)} of {len(units)} measured units "
                                        "have a benchmark at this shape")
-    lines.append(f"sum of measured kernels + collectives: {led.measured_ms:.2f} ms "
+    cal_sum = calibrated_ms(led, cal) if cal else None
+    if cal:
+        doc["calibration"] = {"gate": cal.gate.file if cal.gate else None, "k": cal.k, "in_model_ms": cal.in_model_ms,
+                              "micro_before_ms": cal.micro_before_ms, "source": cal.source}
+        doc["calibrated_buckets"] = calibrated_buckets(led, cal)
+        doc["calibrated_ms"] = cal_sum
+        lines.append(f"sum of measured kernels + collectives, calibrated ({PREDICTOR}): {cal_sum:.2f} ms")
+    lines.append(f"sum of measured kernels + collectives, raw benchmark medians: {led.measured_ms:.2f} ms "
                  f"(kernels {led.kernels_ms:.2f} + collectives {led.collectives_ms:.2f}){partial}")
+    if cal:
+        lines.append(f"scope gap raw - calibrated: {led.measured_ms - cal_sum:+.2f} ms (standalone call wall vs "
+                     "in-model time)")
     lines.append(f"roofline of the whole step (every node + collectives): {led.roofline_ms:.2f} ms")
     if led.host_ms:
         lines.append(f"host time outside the device step (measured on the host): {led.host_ms:.2f} ms")
@@ -172,53 +222,60 @@ def run(tip_name: str, point: DecodePoint, reports_dir: Path = REPORTS_DIR,
                      "(roofline only; not in the sum)")
 
     if point != GATE_POINT:
-        lines.append(f"no gate run serves {point.label}: no measured step, no residual (gates serve {GATE_POINT.label})")
+        lines.append(f"no gate run serves {point.label}: no measured step, no residual and no calibration "
+                     f"(gates serve {GATE_POINT.label})")
     elif tip.name == "current":
         base = build_ledger(point, BASELINE, results)
-        base_gate = resolve_tip("5938748", gates).gate
-        res_bd = base.residual_ms(STEP_5938748.ms)
-        pred = {"quiet_host": led.measured_ms + res_bd}
-        lines.append("predicted device step = sum above + a measured residual (glue, waits, launch skew):")
-        lines.append(f"  {pred['quiet_host']:.2f} ms with the DECODE_BREAKDOWN.md residual {res_bd:.2f} ms "
-                     f"(step {STEP_5938748.ms:.2f}, quiet host)")
-        if base_gate is not None:
-            res_g = base.residual_ms(base_gate.device_step_ms)
-            pred["gate_placement"] = led.measured_ms + res_g
-            lines.append(f"  {pred['gate_placement']:.2f} ms with the {Path(base_gate.file).name} residual {res_g:.2f} ms "
-                         f"(step {base_gate.device_step_ms:.2f}, the gate's CPU placement)")
-        doc["predicted_step_ms"] = pred
-        if tip.gate is not None:
+        res = {"breakdown_full_host": STEP_5938748.ms - calibrated_ms(base, cal)}
+        if base_tip.gate is not None:
+            res["gate_baseline_cpu_split"] = base_tip.gate.device_step_ms - calibrated_ms(base, cal)
+        if tip.gate is not None and tip.gate_tip is not None:
             gt = tip.gate_tip
-            lines.append(f"latest gate run: {_gate_label(tip.gate)}: device step {tip.gate.device_step_ms:.2f} ms")
-            if gt is not None:
-                at = build_ledger(point, gt.kernel_set, results)
-                verdict = f" (gate verdict {tip.gate.verdict})" if tip.gate.verdict else ""
-                lines.append(f"  gated branches in that tree: {', '.join(gt.branches) or 'none'}{verdict}; "
-                             f"wave-1 kernels in it: {', '.join(sorted(gt.kernel_set.after)) or 'none'}")
-                lines += residual_lines(at, [(f"ledger at tree {gt.sha[:7]} ({at.measured_ms:.2f} ms)",
-                                              tip.gate.device_step_ms)])
-                res_l = at.residual_ms(tip.gate.device_step_ms)
-                pred["latest_gate_residual"] = led.measured_ms + res_l
-                lines.append(f"  {pred['latest_gate_residual']:.2f} ms with the latest gate run's residual {res_l:.2f} ms "
-                             "(predicted current step at today's glue, waits and host path)")
-                doc["latest_gate"] = {"file": tip.gate.file, "step_ms": tip.gate.device_step_ms,
-                                      "tree": gt.sha, "branches": list(gt.branches),
-                                      "verdict": tip.gate.verdict,
-                                      "ledger_measured_ms": at.measured_ms,
-                                      "residual_ms": at.residual_ms(tip.gate.device_step_ms)}
+            at = build_ledger(point, gt.kernel_set, results)
+            verdict = f", gate verdict {tip.gate.verdict}" if tip.gate.verdict else ""
+            lines += ["", f"latest gate run: {Path(tip.gate.file).name} (tree {gt.sha[:7]}{verdict}): device step "
+                          f"{tip.gate.device_step_ms:.2f} ms; gated branches in that tree: "
+                          f"{', '.join(gt.branches) or 'none'}; wave-1 kernels in it: "
+                          f"{', '.join(sorted(gt.kernel_set.after)) or 'none'}"]
+            if tip.gate.buckets_ms:
+                lines += profile_table(at, cal, tip.gate)
+            lines.append(f"ledger at tree {gt.sha[:7]}: calibrated {calibrated_ms(at, cal):.2f} ms, "
+                         f"raw {at.measured_ms:.2f} ms")
+            lines += residual_lines([(Path(tip.gate.file).name, tip.gate.device_step_ms)],
+                                    calibrated_ms(at, cal), at.measured_ms, at)
+            res["latest_gate"] = tip.gate.device_step_ms - calibrated_ms(at, cal)
+            doc["latest_gate"] = {"file": tip.gate.file, "step_ms": tip.gate.device_step_ms, "tree": gt.sha,
+                                  "branches": list(gt.branches), "verdict": tip.gate.verdict,
+                                  "calibrated_ms": calibrated_ms(at, cal), "raw_ms": at.measured_ms,
+                                  "residual_ms": res["latest_gate"]}
+        labels = {"latest_gate": "the latest gate run's residual (today's glue, waits and host path)",
+                  "breakdown_full_host": f"the 5938748 residual vs {STEP_5938748.ms:.2f} ms ({STEP_5938748.label})",
+                  "gate_baseline_cpu_split": (f"the 5938748 residual vs {base_tip.gate.device_step_ms:.2f} ms "
+                                              f"({GATE_BASELINE_LABEL})") if base_tip.gate else ""}
+        pred = {k: cal_sum + v for k, v in res.items()}
+        lines += ["", f"predicted device step for current = {cal_sum:.2f} ms calibrated ({PREDICTOR}) + a measured residual:"]
+        for k in ("latest_gate", "breakdown_full_host", "gate_baseline_cpu_split"):
+            if k in pred:
+                lines.append(f"  {pred[k]:.2f} ms with {labels[k]}: {res[k]:.2f} ms")
+        doc["residual_ms"], doc["predicted_step_ms"] = res, pred
     else:
         steps = []
         if not tip.kernel_set.after and tip.sha and tip.sha.startswith("5938748"):
-            steps.append((f"DECODE_BREAKDOWN.md (quiet host)", STEP_5938748.ms))
-            rec = reconciliation(led)
+            steps.append((f"{STEP_5938748.label} (DECODE_BREAKDOWN.md)", STEP_5938748.ms))
+            rec = reconciliation(led, cal)
             doc["reconciliation"] = rec
-            lines += [""] + reconciliation_table(rec) + [""]
+            lines += [""] + reconciliation_table(rec)
         if tip.gate is not None:
-            steps.append((_gate_label(tip.gate), tip.gate.device_step_ms))
+            label = GATE_BASELINE_LABEL if tip.gate is base_tip.gate else "gate run"
+            steps.append((f"{label} ({Path(tip.gate.file).name}, tree {(tip.gate.head or '?')[:7]})",
+                          tip.gate.device_step_ms))
+            if tip.gate.buckets_ms:
+                lines += [""] + profile_table(led, cal, tip.gate)
         if steps:
-            lines.append("measured device step vs sum of measured kernels + collectives:")
-            lines += residual_lines(led, steps)
-            doc["residual_ms"] = {label: led.residual_ms(step) for label, step in steps}
+            lines += ["", "measured device step vs sum of measured kernels + collectives:"]
+            lines += residual_lines(steps, cal_sum, led.measured_ms, led)
+            doc["residual_ms"] = {label: step - cal_sum for label, step in steps}
+            doc["residual_raw_ms"] = {label: step - led.measured_ms for label, step in steps}
         else:
             lines.append(f"no gate run measured tip {tip.name}: no residual")
 

@@ -86,3 +86,17 @@ def test_candidate_tree_runs_its_own_family_whatever_the_verdict(gate_dir, tmp_p
 def test_unknown_tip_is_refused(gates):
     with pytest.raises(ValueError):
         resolve_tip("notasha", gates)
+
+
+def test_a_non_merged_candidate_does_not_count_below_its_own_tree(gate_dir, tmp_path):
+    # ruling: "after" only for MERGE verdicts whose candidate is an ancestor; a REJECTed
+    # candidate counts only for its own gated tree
+    for f in gate_dir.iterdir():
+        shutil.copy2(f, tmp_path / f.name)
+    rej = tmp_path / "gate_dsa.json"
+    host_sha = resolve_tip("594d425", read_gates(gate_dir)).gate.gate_sha  # 2fd8161, an ancestor of 594d425
+    rej.write_text(json.dumps({"name": "dsa", "verdict": "REJECT", "gate_sha": host_sha,
+                               "after": {"device_step_ms": {"mean": 70.0}, "environment": {"head": host_sha}}}))
+    gates = read_gates(tmp_path)
+    assert "dsa" not in resolve_tip("594d425", gates).kernel_set.after
+    assert "dsa" in resolve_tip(host_sha, gates).kernel_set.after
