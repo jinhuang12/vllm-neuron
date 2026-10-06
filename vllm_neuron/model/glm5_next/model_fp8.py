@@ -4792,15 +4792,22 @@ class Glm5NextDSAIndexer(nn.Module):
         ``width`` is read off the bounded tensor rather than from a config field, so
         it cannot disagree with what the selector was actually given.
         """
-        from vllm_neuron.functional.dsa.causal_bound import (
-            dsa_causal_bound,
-            dsa_causal_sentinel,
-        )
-        from vllm_neuron.functional.dsa.topk_select import dsa_topk_select
+        from vllm_neuron.functional.dsa.causal_bound import dsa_causal_bound
 
         bounded = dsa_causal_bound(
             scores, seq_lens.to(torch.int32).reshape(-1, 1), self.index_kpool
         )
+        return self._select_bounded(bounded)
+
+    def _select_bounded(self, bounded: torch.Tensor) -> torch.Tensor:
+        """Select on scores the causal bound has already filled, sentinelise, order.
+
+        The tail of :meth:`select_bounded_pools`, shared with :meth:`forward_requests`,
+        whose score kernel applies each request's bound itself.
+        """
+        from vllm_neuron.functional.dsa.causal_bound import dsa_causal_sentinel
+        from vllm_neuron.functional.dsa.topk_select import dsa_topk_select
+
         values, indices = dsa_topk_select(bounded, self.select_k())
         pool_ids = indices.to(torch.int32)
         sentinelised = dsa_causal_sentinel(values, pool_ids, int(bounded.shape[1]))
@@ -5231,6 +5238,151 @@ class Glm5NextDSAIndexer(nn.Module):
         # The causal bound and the sentinel, at one site.
         pool_ids = self.select_bounded_pools(scores, seq_lens)
         return self.expand_indices(pool_ids, seq_lens)
+
+    def forward_requests(
+        self,
+        hidden_states: torch.Tensor,
+        q_latent: torch.Tensor,
+        pool_bank,
+        tail_bank,
+        slots: torch.Tensor | None,
+        seq_lens: torch.Tensor,
+        position: torch.Tensor,
+        *,
+        max_seq_len: int,
+        indices_wanted: bool = True,
+        projected: tuple | None = None,
+    ) -> torch.Tensor | None:
+        """:meth:`forward`'s decode leg for ``B`` requests, one token each, in one pass.
+
+        Request ``b`` is row ``b`` of ``hidden_states`` and ``q_latent`` and entry
+        ``b`` of ``seq_lens`` and ``position``. Returns ``[B, width]`` token indices,
+        the same rows :meth:`forward` returns one request at a time, or None (or the
+        causal fill) when ``max_seq_len`` does not select. The kernels serve every
+        request in one launch per stage, each on its own ring and pooled store, so no
+        request can read another's rows.
+
+        The stores arrive in one of two forms:
+
+        * whole banks and a slot per request: ``pool_bank`` ``[slots, rows,
+          index_head_dim]``, ``tail_bank`` ``[slots, 2, index_kpool,
+          index_head_dim]``, ``slots`` ``[B]`` int, distinct. Written in place on the
+          banks.
+        * the runner's carrier: ``pool_bank`` and ``tail_bank`` are tuples of one view
+          per request (``[rows, index_head_dim]`` and ``[2, index_kpool,
+          index_head_dim]``, disjoint, which the runner guarantees, padding rows
+          included) and ``slots`` is None. The kernels read a bank, so ``B > 1`` views
+          are stacked (one read of each store) and ``B = 1`` is its view with a leading
+          axis (no copy); the writes land in each view, the forms the one-request leg
+          writes with.
+
+        ``rows > max_seq_len // index_kpool`` either way: the last row of a store is
+        its write trash. ``position`` must be ``seq_lens - 1``: the bound reads the
+        length and this step's stand-in pool reads the position. Both rules, and
+        distinct bank slots, are checked where the values are readable (eager); in a
+        traced step they are the runner's, which builds both from one start.
+
+        The score kernel takes this step's completed pool from the ring step's output
+        rather than from the store, so the selection does not depend on when the
+        store write lands.
+        """
+        from vllm_neuron.functional.dsa.decode_batch import (
+            decode_pool_destinations,
+            dsa_decode_ring_step,
+            dsa_decode_scores,
+        )
+        from vllm_neuron.utils.neuron_utils import values_are_readable
+
+        self.require_dials()
+        pool, dim = self.index_kpool, self.index_head_dim
+        batch = int(hidden_states.shape[0])
+        views = isinstance(pool_bank, (tuple, list))
+        if views:
+            pool_views, tail_views = tuple(pool_bank), tuple(tail_bank)
+            if slots is not None or len(pool_views) != batch or len(tail_views) != batch:
+                raise Glm5NextDSAIndexerError(
+                    f"the carrier form takes one pooled store and one ring per request "
+                    f"and no slots; got {len(pool_views)} store(s), {len(tail_views)} "
+                    f"ring(s) and slots={slots!r} for {batch} row(s)"
+                )
+            pool_bank = (pool_views[0].unsqueeze(0) if batch == 1
+                         else torch.stack(pool_views))
+            tail_bank = (tail_views[0].unsqueeze(0) if batch == 1
+                         else torch.stack(tail_views))
+            slots = torch.arange(batch, dtype=torch.int32, device=pool_bank.device)
+        if pool_bank.ndim != 3 or int(pool_bank.shape[2]) != dim:
+            raise Glm5NextDSAIndexerError(
+                f"pool_bank must be [slots, rows, {dim}]; got {tuple(pool_bank.shape)}"
+            )
+        # The per-slot store is contiguous, so the shared rule reads it at one row
+        # per page.
+        candidates, _trash, selects = self._require_serviceable(
+            int(max_seq_len), 1, pool_bank[0]
+        )
+        want_tail = (int(pool_bank.shape[0]), 2, pool, dim)
+        if tuple(tail_bank.shape) != want_tail:
+            raise Glm5NextDSAIndexerError(
+                f"tail_bank must be [slots, 2, index_kpool, index_head_dim] = "
+                f"{want_tail}, one ring per pool_bank slot; got {tuple(tail_bank.shape)}"
+            )
+        for name, value in (("slots", slots), ("seq_lens", seq_lens), ("position", position)):
+            if not torch.is_tensor(value) or tuple(value.shape) != (batch,):
+                raise Glm5NextDSAIndexerError(
+                    f"{name} must be a [{batch}] tensor, one entry per request; got "
+                    f"{value!r}"
+                )
+        if values_are_readable(position) and values_are_readable(seq_lens):
+            if not torch.equal(position.to(torch.int64), seq_lens.to(torch.int64) - 1):
+                raise Glm5NextDSAIndexerError(
+                    f"position must be seq_lens - 1 for a decode step of one token per "
+                    f"request; got position {position.tolist()} and seq_lens "
+                    f"{seq_lens.tolist()}"
+                )
+        if not views and values_are_readable(slots):
+            if int(torch.unique(slots).numel()) != batch:
+                raise Glm5NextDSAIndexerError(
+                    f"slots must be distinct, one store per request; got {slots.tolist()}"
+                )
+        ape = self.index_kpool_compress_ape
+        if ape is None or tuple(ape.shape) != (pool, dim):
+            raise Glm5NextDSAIndexerError(
+                f"index_kpool_compress_ape must be materialised and shaped "
+                f"{(pool, dim)}; got {None if ape is None else tuple(ape.shape)}"
+            )
+        if projected is None:
+            projected = self.project_stage(
+                hidden_states, q_latent, query_side=selects or indices_wanted
+            )
+        query, key, weights, gate_score = projected
+
+        pooled, rings = dsa_decode_ring_step(
+            tail_bank, slots, key, gate_score, ape.to(torch.float32), position
+        )
+        slot_index, row = decode_pool_destinations(
+            slots, position, rows=int(pool_bank.shape[1]), pool_size=pool
+        )
+        bounded = None
+        if selects:
+            bounded = dsa_decode_scores(
+                query, weights, pool_bank, slots, seq_lens, position, pooled,
+                candidates=candidates, pool_size=pool,
+            )
+        # The writes after the read: the kernel stands this step's pool in itself,
+        # and the store rows it reads are the pools before this step.
+        if views:
+            for b in range(batch):
+                tail_views[b].copy_(rings[b].to(tail_views[b].dtype))
+                pool_views[b].index_copy_(
+                    0, row[b:b + 1], pooled[b:b + 1].to(pool_views[b].dtype)
+                )
+        else:
+            tail_bank.index_copy_(0, slot_index, rings.to(tail_bank.dtype))
+            pool_bank.index_put_((slot_index, row), pooled.to(pool_bank.dtype))
+        if bounded is None:
+            if not indices_wanted:
+                return None
+            return self._bypass_indices(seq_lens)
+        return self.expand_indices(self._select_bounded(bounded), seq_lens)
 
     def forward_ragged(
         self,
@@ -6537,10 +6689,11 @@ class Glm5NextMLAAttention(nn.Module):
         ``tail`` and ``pool_cache`` are one bank view per request and ``seq_lens``,
         ``start_position`` and ``position`` are ``[batch]``. The query latent and the
         indexer's four projections run once on all rows. The indexer's write stage
-        and selection run per request, on that request's own ring and pooled store:
-        the candidate set is a request's own pooled keys, so there is no shared
-        candidate axis to batch over. :meth:`attend` then serves every request in one
-        batched call.
+        and selection run in one :meth:`Glm5NextDSAIndexer.forward_requests` pass,
+        each request on its own ring and pooled store. :meth:`attend` then serves
+        every request in one batched call. A one-request decode step is the
+        ``batch = 1`` case of this method (see :meth:`forward`); there :meth:`attend`
+        serves ``batch_size`` 1 with its one-request attention.
         """
         from vllm_neuron.functional.dsa.decode_bypass import (
             selection_bound,
@@ -6571,26 +6724,20 @@ class Glm5NextMLAAttention(nn.Module):
         projected = self.indexer.project_stage(
             normed_hidden_states, q_latent, query_side=not dense
         )
-        selected = []
-        for b in range(batch):
-            rows = slice(b, b + 1)
-            selected.append(
-                self.indexer(
-                    normed_hidden_states[rows],
-                    q_latent[rows],
-                    pools[b],
-                    seq_lens[rows],
-                    max_seq_len=bound if dense else int(max_seq_len),
-                    page_size=int(page_size),
-                    indices_wanted=not dense,
-                    tail=tail[b],
-                    position=position[b],
-                    projected=tuple(
-                        None if part is None else part[rows] for part in projected
-                    ),
-                )
-            )
-        topk_indices = None if dense else torch.cat(selected)
+        # Every request's ring step, write and selection in one indexer pass: one
+        # launch per stage for the whole batch, each request on its own views.
+        topk_indices = self.indexer.forward_requests(
+            normed_hidden_states,
+            q_latent,
+            pools,
+            tuple(tail),
+            None,
+            seq_lens,
+            position,
+            max_seq_len=bound if dense else int(max_seq_len),
+            indices_wanted=not dense,
+            projected=projected,
+        )
         if collector is not None:
             collector.append(
                 (self.indexer._bypass_indices(seq_lens) if dense else topk_indices)[:5]
@@ -6705,6 +6852,39 @@ class Glm5NextMLAAttention(nn.Module):
                 latent_slots=latent_slots,
                 tail=tail,
                 position=position,
+                collector=collector,
+            )
+
+        if (
+            tail is not None
+            and position is not None
+            and int(normed_hidden_states.shape[0]) == 1
+            and slot_mapping is None
+            and prefill_tail is None
+            and prefill_end_position is None
+            and active_mla_query_rows is None
+            and normed_hidden_states.dtype == latent_cache.dtype
+            and latent_cache.dtype in (torch.bfloat16, torch.float16)
+        ):
+            # A one-request decode step is the batch-of-one case of the batched step:
+            # its indexer is forward_requests on its own views (a leading request
+            # axis, no copy), and attend at batch_size 1 keeps the one-request
+            # attention. A float32 or mixed-dtype step keeps the route below: the
+            # batched indexer kernels take bf16 and would fall back to torch.
+            device = latent_cache.device
+            return self._forward_requests(
+                normed_hidden_states,
+                latent_cache=latent_cache,
+                pool_cache=(pool_cache,),
+                seq_lens=seq_lens.reshape(1),
+                start_position=_int64_scalar(start_position, device).reshape(1),
+                softmax_scale=softmax_scale,
+                max_seq_len=max_seq_len,
+                page_size=page_size,
+                block_table_row=block_table_row,
+                latent_slots=latent_slots,
+                tail=(tail,),
+                position=_int64_scalar(position, device).reshape(1),
                 collector=collector,
             )
 
