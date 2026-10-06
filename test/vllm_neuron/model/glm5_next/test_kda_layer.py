@@ -57,6 +57,9 @@ DECLARED_PREFILL_TOKENS = 2 * DECLARED_CHUNK + 1
 DECLARED_PREFILL_DISPATCHES = 3
 DECLARED_DECODE_DISPATCHES = 6
 DECLARED_CHUNKED_DISPATCHES_ON_DECODE = 0
+#: A single-token decode step takes the fused seam, so the three it replaced
+#: read zero on the decode arm.
+DECLARED_STAGED_DISPATCHES_ON_DECODE = 0
 DECLARED_FALLBACKS = 0
 
 #: The stack census ``test_kv_spec.py`` pins.
@@ -116,6 +119,12 @@ def _seams():
     return chunked_recurrence, decode_state, depthwise_conv1d, gate_clamp
 
 
+def _fused_seam():
+    from vllm_neuron.functional.kda import fused_decode
+
+    return fused_decode
+
+
 def _reset_counters() -> None:
     chunked, decode, conv, gate = _seams()
     conv.reset_dispatch_counters()
@@ -125,6 +134,7 @@ def _reset_counters() -> None:
     chunked.reset_dispatch_counters()
     chunked.reset_inter_dispatch_counters()
     decode.reset_decode_dispatch_counters()
+    _fused_seam().reset_fused_decode_dispatch_counters()
 
 
 def _read_counters() -> dict[str, tuple[int, int]]:
@@ -135,6 +145,7 @@ def _read_counters() -> dict[str, tuple[int, int]]:
         "intra": chunked.dispatch_counters(),
         "inter": chunked.inter_dispatch_counters(),
         "decode": decode.decode_dispatch_counters(),
+        "fused": _fused_seam().fused_decode_dispatch_counters(),
     }
 
 
@@ -442,13 +453,19 @@ def test_prefill_matches_the_reference_at_three_per_seam(
 def test_decode_carries_state_and_never_enters_a_chunked_seam(
     case: SimpleNamespace,
 ) -> None:
-    """Two steps, six dispatches through three seams, zero through two. """
+    """Two steps, six dispatches through the fused seam, zero through five. """
     counts = case.decode_counts
+    dispatches, fallbacks = counts["fused"]
+    assert dispatches == DECLARED_DECODE_DISPATCHES, (
+        f"fused read {dispatches}, expected {DECLARED_DECODE_DISPATCHES} -- "
+        f"{DECLARED_STACK_LAYERS} per step over {DECLARED_DECODE_STEPS} steps"
+    )
+    assert fallbacks == DECLARED_FALLBACKS
     for seam in ("conv", "gate", "decode"):
         dispatches, fallbacks = counts[seam]
-        assert dispatches == DECLARED_DECODE_DISPATCHES, (
-            f"{seam} read {dispatches}, expected {DECLARED_DECODE_DISPATCHES} -- "
-            f"{DECLARED_STACK_LAYERS} per step over {DECLARED_DECODE_STEPS} steps"
+        assert dispatches == DECLARED_STAGED_DISPATCHES_ON_DECODE, (
+            f"{seam} read {dispatches} dispatches on a decode arm; the fused seam "
+            f"serves a single-token decode step"
         )
         assert fallbacks == DECLARED_FALLBACKS
     for seam in ("intra", "inter"):

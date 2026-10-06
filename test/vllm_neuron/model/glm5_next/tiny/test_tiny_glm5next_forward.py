@@ -179,6 +179,9 @@ _SEAM_REGISTRY = {
     "vision_patch_embed": (
         "vllm_neuron.functional.vision.patch_embed",
         "dispatch_counters", "reset_dispatch_counters"),
+    "kda_fused_decode": (
+        "vllm_neuron.functional.kda.fused_decode",
+        "fused_decode_dispatch_counters", "reset_fused_decode_dispatch_counters"),
 }
 _SEAMS = tuple(_SEAM_REGISTRY)
 

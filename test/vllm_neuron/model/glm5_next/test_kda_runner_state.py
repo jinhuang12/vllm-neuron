@@ -68,6 +68,7 @@ DECLARED_CHUNKED_DISPATCHES_ON_DECODE = (
     layer_half.DECLARED_CHUNKED_DISPATCHES_ON_DECODE
 )
 DECLARED_FALLBACKS = layer_half.DECLARED_FALLBACKS
+DECLARED_STAGED_DISPATCHES_ON_DECODE = layer_half.DECLARED_STAGED_DISPATCHES_ON_DECODE
 DECLARED_RTOL = layer_half.DECLARED_RTOL
 DECLARED_ATOL = layer_half.DECLARED_ATOL
 TP_WORLD_SIZE = layer_half.TP_WORLD_SIZE
@@ -502,15 +503,21 @@ def test_the_decode_arm_reads_the_declared_seam_counts(
 ) -> None:
     """The decode arm takes the kernel route, over two steps."""
     counts = run.decode_counts
+    dispatches, fallbacks = counts["fused"]
+    assert dispatches == DECLARED_DECODE_DISPATCHES, (
+        f"fused read {dispatches}, expected {DECLARED_DECODE_DISPATCHES} -- "
+        f"{DECLARED_STACK_LAYERS} per step over {DECLARED_DECODE_STEPS} steps"
+    )
+    assert fallbacks == DECLARED_FALLBACKS, (
+        f"fused reported {fallbacks} torch fallback(s); the kernel route admits none"
+    )
     for seam in ("conv", "gate", "decode"):
         dispatches, fallbacks = counts[seam]
-        assert dispatches == DECLARED_DECODE_DISPATCHES, (
-            f"{seam} read {dispatches}, expected {DECLARED_DECODE_DISPATCHES} -- "
-            f"{DECLARED_STACK_LAYERS} per step over {DECLARED_DECODE_STEPS} steps"
+        assert dispatches == DECLARED_STAGED_DISPATCHES_ON_DECODE, (
+            f"{seam} read {dispatches} dispatch(es) on a decode arm; the fused seam "
+            f"serves a single-token decode step"
         )
-        assert fallbacks == DECLARED_FALLBACKS, (
-            f"{seam} reported {fallbacks} torch fallback(s); the kernel route admits none"
-        )
+        assert fallbacks == DECLARED_FALLBACKS
     for seam in ("intra", "inter"):
         dispatches, fallbacks = counts[seam]
         assert dispatches == DECLARED_CHUNKED_DISPATCHES_ON_DECODE, (
