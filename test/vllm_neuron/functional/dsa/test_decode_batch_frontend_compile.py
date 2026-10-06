@@ -5,7 +5,8 @@ The simulator runs a kernel body as plain Python, so it cannot see a call form t
 compiler's front end refuses. This compiles ``dsa_decode_ring_step_kernel`` at B in
 {1, 16, 64, 130} (130 spans two partition tiles) and ``dsa_decode_scores_kernel`` at
 ctx 4096 and 8192 (1024 and 2048 candidates) and a ragged 300, at B in {1, 16}, on one
-and two programs, inside a child process that pins the platform target, opens no device
+and two programs, and both at B=1 on a one-slot bank (the one-request carrier's view,
+read statically), inside a child process that pins the platform target, opens no device
 node, and proves it parsed bodies by refusing one that reads an undefined name. The
 pattern is ``test_mla_decode_frontend_compile.py``'s.
 """
@@ -31,6 +32,8 @@ HEADS, DIM, POOL, SLOTS = 32, 128, 4, 140
 RING_BATCHES = (1, 16, 64, 130)
 SCORE_CANDIDATES = (1024, 2048, 300)
 SCORE_BATCHES = (1, 16)
+#: Candidate counts read from a one-slot bank: whole tiles, and a ragged last tile.
+ONE_SLOT_CANDIDATES = (1024, 300)
 
 
 @nki.jit
@@ -81,6 +84,16 @@ def _compile_each_entry() -> None:
                                   fake((SLOTS, c + 1, DIM), bf), fake((b, 1), i32),
                                   fake((b, 1), i32), fake((b, 1), i32), fake((b, DIM), bf),
                                   c, POOL, DB.SOURCE_DIGEST)))
+    built.append(("ring_b1_one_slot", lambda: wrap_nki(DB.dsa_decode_ring_step_kernel)(
+        fake((1, 2 * POOL * DIM), bf), fake((1, 1), i32), fake((1, DIM), bf),
+        fake((1, DIM), bf), fake((POOL, DIM), f32), fake((1, 1), i32), POOL,
+        DB.SOURCE_DIGEST)))
+    for cands in ONE_SLOT_CANDIDATES:
+        built.append((f"scores_c{cands}_b1_one_slot", lambda c=cands: wrap_nki(
+            DB.dsa_decode_scores_kernel)(
+            fake((1, HEADS, DIM), bf), fake((1, HEADS), f32), fake((1, c + 1, DIM), bf),
+            fake((1, 1), i32), fake((1, 1), i32), fake((1, 1), i32), fake((1, DIM), bf),
+            c, POOL, DB.SOURCE_DIGEST)))
     built.append(("undefined_name_body", lambda: wrap_nki(body_that_reads_an_undefined_name)(
         fake((1, 128), torch.float32))))
     print(ROW + "|tree|module=" + DB.__file__, flush=True)
@@ -126,7 +139,8 @@ def test_the_front_end_accepts_both_batched_kernels_at_the_served_shapes() -> No
     assert control and control[0]["refused"] == "True", (
         f"the child accepted a body that reads an undefined name, so it parsed none: {control}")
     entries = [row for row in rows if row["entry"] != "undefined_name_body"]
-    assert len(entries) == len(RING_BATCHES) + len(SCORE_CANDIDATES) * len(SCORE_BATCHES) * 2
+    assert len(entries) == (len(RING_BATCHES) + len(SCORE_CANDIDATES) * len(SCORE_BATCHES) * 2
+                            + 1 + len(ONE_SLOT_CANDIDATES))
     refused = [f"{row['entry']}: {row['diagnostic']}" for row in entries
                if row["refused"] != "False"]
     assert not refused, refused

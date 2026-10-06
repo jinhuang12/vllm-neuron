@@ -109,6 +109,45 @@ def test_ring_step_torch_oracle_agrees():
                                rtol=1e-2, atol=1e-2)
 
 
+def _one_slot_calls():
+    """The ring step and the scores of request 0, its bank narrowed by ``slot_of``."""
+    ring = _ring_case(1, seed=29)
+    score = _score_case(1, seed=31, candidates=300, heads=4)
+
+    def calls(ring_bank, score_bank, ring_slots, score_slots):
+        bank, _slots, key, gate, ape, position = ring
+        query, weights, _bank, _s, seq_lens, score_pos, pooled = score
+        pooled_out, rings = DB.dsa_decode_ring_step(ring_bank, ring_slots, key, gate, ape,
+                                                    position)
+        scores = DB.dsa_decode_scores(query, weights, score_bank, score_slots, seq_lens,
+                                      score_pos, pooled, candidates=300, pool_size=POOL)
+        return pooled_out, rings, scores
+
+    whole = (ring[0], score[2], ring[1], score[3])
+    narrowed = (ring[0][ring[1].long()], score[2][score[3].long()],
+                torch.zeros(1, dtype=torch.int32), torch.zeros(1, dtype=torch.int32))
+    return calls, whole, narrowed
+
+
+def test_a_one_slot_bank_gives_what_its_slot_gives_in_the_whole_bank():
+    """A one-request carrier's view is a one-slot bank; the kernels read it statically."""
+    calls, whole, narrowed = _one_slot_calls()
+    want = calls(*whole)
+    got = calls(*narrowed)
+    for a, b in zip(got, want):
+        assert torch.equal(a, b)
+
+
+def test_a_one_slot_bank_traces():
+    """Tracing in CPU simulation runs each kernel on ones (slot 1), past a one-slot bank."""
+    calls, _whole, narrowed = _one_slot_calls()
+    want = calls(*narrowed)
+    torch._dynamo.reset()
+    got = torch.compile(calls, backend="eager", fullgraph=True)(*narrowed)
+    for a, b in zip(got, want):
+        assert torch.equal(a, b)
+
+
 # --- scores ------------------------------------------------------------------------
 
 

@@ -197,11 +197,16 @@ def dsa_decode_ring_step_kernel(tail_hbm, slots_hbm, key_hbm, score_hbm, ape_hbm
     rings_hbm = nl.ndarray((batch, width), dtype=tail_hbm.dtype, buffer=nl.shared_hbm)
     for r0 in range(0, batch, PARTITIONS):
         h = min(PARTITIONS, batch - r0)
-        slot_t = _col(h, nl.int32)
-        nisa.dma_copy(dst=slot_t, src=slots_hbm.ap(pattern=[[1, h], [1, 1]], offset=r0))
         ring = _sb((h, width), tail_hbm.dtype)
-        nisa.dma_copy(dst=ring, src=tail_hbm.ap(pattern=[[width, h], [1, width]],
-                                                vector_offset=slot_t, indirect_dim=0))
+        if tail_hbm.shape[0] == 1:
+            # One slot: the only valid slot is 0, so the read is static. (Tracing in CPU
+            # simulation fills int operands with ones, and slot 1 is past this bank.)
+            nisa.dma_copy(dst=ring, src=tail_hbm.ap(pattern=[[0, h], [1, width]], offset=0))
+        else:
+            slot_t = _col(h, nl.int32)
+            nisa.dma_copy(dst=slot_t, src=slots_hbm.ap(pattern=[[1, h], [1, 1]], offset=r0))
+            nisa.dma_copy(dst=ring, src=tail_hbm.ap(pattern=[[width, h], [1, width]],
+                                                    vector_offset=slot_t, indirect_dim=0))
         key_bf = _sb((h, head_dim), key_hbm.dtype)
         nisa.dma_copy(dst=key_bf, src=key_hbm.ap(pattern=[[head_dim, h], [1, head_dim]],
                                                  offset=r0 * head_dim))
@@ -343,6 +348,7 @@ def dsa_decode_scores_kernel(q_hbm, w_hbm, bank_hbm, slots_hbm, lens_hbm, pos_hb
         per_bank = n_all
     shift = _log2(pool_size)
     kv_dtype = bank_hbm.dtype
+    one_slot = bank_hbm.shape[0] == 1
 
     # Request-independent: candidate index and the first token past its pool.
     cand_f = _sb((PARTITIONS, n_tiles), nl.float32)
@@ -387,20 +393,35 @@ def dsa_decode_scores_kernel(q_hbm, w_hbm, bank_hbm, slots_hbm, lens_hbm, pos_hb
         nisa.tensor_scalar(dst=at_f, data=at_f, op0=nl.add, operand0=-1.0)
 
         # ---- the keys of this request's slot, and this step's pool as one more tile ---
+        # One slot: the only valid slot is 0, so the reads are static. (Tracing in CPU
+        # simulation fills int operands with ones, and slot 1 is past this bank.)
         k_rows = _sb((PARTITIONS, n_all, head_dim), kv_dtype)
         if full > 0:
-            nisa.dma_copy(
-                dst=k_rows[:, 0:full, :],
-                src=bank_hbm.ap(pattern=[[head_dim, PARTITIONS], [PARTITIONS * head_dim, full],
-                                         [1, head_dim]],
-                                offset=0, scalar_offset=slot_t[0:1, 0:1], indirect_dim=0))
+            if one_slot:
+                nisa.dma_copy(
+                    dst=k_rows[:, 0:full, :],
+                    src=bank_hbm.ap(pattern=[[head_dim, PARTITIONS],
+                                             [PARTITIONS * head_dim, full], [1, head_dim]],
+                                    offset=0))
+            else:
+                nisa.dma_copy(
+                    dst=k_rows[:, 0:full, :],
+                    src=bank_hbm.ap(pattern=[[head_dim, PARTITIONS],
+                                             [PARTITIONS * head_dim, full], [1, head_dim]],
+                                    offset=0, scalar_offset=slot_t[0:1, 0:1], indirect_dim=0))
         if rem > 0:
             nisa.memset(dst=k_rows[:, full, :], value=0.0)
-            nisa.dma_copy(
-                dst=k_rows[0:rem, full, :],
-                src=bank_hbm.ap(pattern=[[head_dim, rem], [1, head_dim]],
-                                offset=full * PARTITIONS * head_dim,
-                                scalar_offset=slot_t[0:1, 0:1], indirect_dim=0))
+            if one_slot:
+                nisa.dma_copy(
+                    dst=k_rows[0:rem, full, :],
+                    src=bank_hbm.ap(pattern=[[head_dim, rem], [1, head_dim]],
+                                    offset=full * PARTITIONS * head_dim))
+            else:
+                nisa.dma_copy(
+                    dst=k_rows[0:rem, full, :],
+                    src=bank_hbm.ap(pattern=[[head_dim, rem], [1, head_dim]],
+                                    offset=full * PARTITIONS * head_dim,
+                                    scalar_offset=slot_t[0:1, 0:1], indirect_dim=0))
         nisa.dma_copy(dst=k_rows[:, virt, :],
                       src=pooled_hbm.ap(pattern=[[0, PARTITIONS], [1, head_dim]],
                                         offset=b * head_dim))
