@@ -32,6 +32,10 @@ Options:
 | `--json PATH` | none | also write the ledger as JSON |
 | `--reports-dir DIR` | `/home/ubuntu/glm53f-wt/reports` | read the JSON files from DIR |
 
+The tests do not read the live reports directory. They read frozen copies in
+`test/kernel_ledger/fixtures/reports/` (see `tests/frozen_reports.py`). Thus a new gate
+run in `reports/` does not change a test result.
+
 ## 2. Data flow
 
 ```
@@ -213,13 +217,15 @@ for it in `KERNEL_RULES`.
 | `readers/micro.py`, `readers/gate.py` | new: benchmark and gate readers |
 | `cli.py`, `__main__.py` | new: the command line |
 | `tests/` | new: one test file per module |
+| `tests/frozen_reports.py`, `tests/conftest.py` | new: the frozen reports and the `reports_dir` fixture |
+| `fixtures/reports/` | copies (2026-10-06) of the reports the tests read: benchmarks, `moe-t.md`, gate runs to 594d425 |
 
 To add a benchmark family:
 
 1. Add its kernel to `KernelName` (`engine/node.py`) and to `FAMILY_OF` (`configs.py`).
 2. Add its match keys to `MATCH_KEYS` and a reader to `_READERS` (`readers/micro.py`).
 3. Give the node a `shape_record()` with the same keys.
-4. Add a test in `tests/test_shapes.py` that compares the emitted shape with the
-   benchmark JSON.
+4. Copy the benchmark JSON into `fixtures/reports/`. Add a test in `tests/test_shapes.py`
+   that compares the emitted shape with that copy.
 5. If the gate profile shows the new kernel source as UNMAPPED, add a rule to
    `KERNEL_RULES` (`models/glm53f/profile.py`).

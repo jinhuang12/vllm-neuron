@@ -14,11 +14,11 @@ import pytest
 
 from test.kernel_ledger.models.glm53f.configs import BS1_CTX1K, BS64_CTX8K, DecodePoint
 from test.kernel_ledger.models.glm53f.shapes import emit_shapes
-from test.kernel_ledger.readers.micro import REPORTS_DIR
+from test.kernel_ledger.tests.frozen_reports import FIXTURE_REPORTS
 
 
 def _json(name):
-    return json.loads((REPORTS_DIR / name).read_text())
+    return json.loads((FIXTURE_REPORTS / name).read_text())
 
 
 def _entries(point, kernel, kernel_set=None):

@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """``--tip``: which wave-1 kernels a tip runs, and which gate measured it.
 
-The gate files are copied (mtimes kept) into a temporary directory, so new gate runs
-in ``reports/`` do not move the "latest gate" these tests pin.
+The gate files are copied (mtimes kept) from the frozen reports (``frozen_reports.py``)
+into a temporary directory, so new gate runs in ``reports/`` do not move the "latest gate"
+these tests pin.
 """
 
 from __future__ import annotations
@@ -16,7 +17,6 @@ import pytest
 from test.kernel_ledger.models.glm53f.configs import BASELINE, CURRENT
 from test.kernel_ledger.models.glm53f.tips import resolve_tip
 from test.kernel_ledger.readers.gate import read_gates
-from test.kernel_ledger.readers.micro import REPORTS_DIR
 
 #: The gate runs up to and including the wt/host merge (594d425).
 UP_TO_HOST = ("gate_baseline.json", "gate_kv.json", "gate_tip-a9f86ba.json", "gate_host.json")
@@ -24,10 +24,10 @@ MHC_CANDIDATE = "f083375ac3622f5288dfab695fdaea533c59a9c0"  # wt/mhc rebased on 
 
 
 @pytest.fixture(scope="module")
-def gate_dir(tmp_path_factory):
+def gate_dir(tmp_path_factory, reports_dir):
     d = tmp_path_factory.mktemp("gates")
     for name in UP_TO_HOST:
-        shutil.copy2(REPORTS_DIR / name, d / name)
+        shutil.copy2(reports_dir / name, d / name)
     return d
 
 

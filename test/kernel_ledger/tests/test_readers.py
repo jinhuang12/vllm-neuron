@@ -9,16 +9,16 @@ import pytest
 
 from test.kernel_ledger.readers.gate import latest_gate, read_gate_step, read_gates
 from test.kernel_ledger.readers.micro import (
-    REPORTS_DIR,
     config_name,
     load_micro_results,
     parse_carrier,
 )
+from test.kernel_ledger.tests.frozen_reports import FIXTURE_REPORTS
 
 
 @pytest.fixture(scope="module")
 def results():
-    return load_micro_results(REPORTS_DIR)
+    return load_micro_results(FIXTURE_REPORTS)
 
 
 def _get(results, kernel, variant, **record):
@@ -102,10 +102,10 @@ def test_missing_reports_dir_is_refused(tmp_path):
 
 
 def test_gate_reader_handles_both_schemas():
-    base = read_gate_step(REPORTS_DIR / "gate_baseline.json")
+    base = read_gate_step(FIXTURE_REPORTS / "gate_baseline.json")
     assert base.device_step_ms == pytest.approx(82.56535485714285)
     assert base.head.startswith("5938748")
-    host = read_gate_step(REPORTS_DIR / "gate_host.json")
+    host = read_gate_step(FIXTURE_REPORTS / "gate_host.json")
     assert host.device_step_ms == pytest.approx(74.119792)
     assert (host.name, host.verdict) == ("host", "MERGE")
     assert host.gate_sha.startswith("2fd8161")
@@ -124,8 +124,8 @@ def test_latest_gate_is_the_newest_file(tmp_path):
 
 @pytest.mark.parametrize("name", ["gate_baseline.json", "gate_kv.json"])
 def test_gate_reader_keeps_the_profile_buckets(name):
-    g = read_gate_step(REPORTS_DIR / name)
-    d = json.loads((REPORTS_DIR / name).read_text())
+    g = read_gate_step(FIXTURE_REPORTS / name)
+    d = json.loads((FIXTURE_REPORTS / name).read_text())
     raw = (d.get("after") or d)["device_step_ms"]["buckets_ms"]
     assert g.buckets_ms == raw
     # attribute_decode.py splits the whole step: the buckets add up to the mean step
@@ -133,8 +133,8 @@ def test_gate_reader_keeps_the_profile_buckets(name):
 
 
 def test_gate_profile_values():
-    base = read_gate_step(REPORTS_DIR / "gate_baseline.json")
-    kv = read_gate_step(REPORTS_DIR / "gate_kv.json")
+    base = read_gate_step(FIXTURE_REPORTS / "gate_baseline.json")
+    kv = read_gate_step(FIXTURE_REPORTS / "gate_kv.json")
     assert base.buckets_ms["mhc/hyper_connection.py"] == pytest.approx(9.658, abs=1e-3)
     assert kv.buckets_ms["wait: collective"] == pytest.approx(2.9534285714285713)
 

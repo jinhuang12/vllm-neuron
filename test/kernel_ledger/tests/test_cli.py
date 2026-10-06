@@ -11,7 +11,6 @@ import pytest
 
 from test.kernel_ledger.cli import main, run
 from test.kernel_ledger.models.glm53f.configs import BS1_CTX1K, BS64_CTX8K
-from test.kernel_ledger.readers.micro import REPORTS_DIR
 
 
 def _bucket_row(text, bucket):
@@ -21,9 +20,9 @@ def _bucket_row(text, bucket):
 
 
 @pytest.fixture(scope="module")
-def base_run(tmp_path_factory):
+def base_run(tmp_path_factory, reports_dir):
     path = tmp_path_factory.mktemp("j") / "base.json"
-    return run("5938748", BS1_CTX1K, json_path=path), json.loads(path.read_text())
+    return run("5938748", BS1_CTX1K, reports_dir, json_path=path), json.loads(path.read_text())
 
 
 def test_5938748_prints_every_bucket(base_run):
@@ -78,8 +77,8 @@ def test_sum_line_is_calibrated_and_the_raw_sum_is_shown(base_run):
     assert "scope gap raw - calibrated" in out
 
 
-def test_current_uses_after_medians_and_prints_the_predicted_step():
-    out = run("current", BS1_CTX1K)
+def test_current_uses_after_medians_and_prints_the_predicted_step(reports_dir):
+    out = run("current", BS1_CTX1K, reports_dir)
     assert "every wave-1 kernel" in out
     assert re.search(r"^mhc_pre_attn_sinkhorn .* 23\.30 .* after ", out, re.M)
     assert re.search(r"^latest gate run: gate_\S+\.json \(tree [0-9a-f]{7}[^)]*\): device step [\d.]+ ms", out, re.M)
@@ -87,8 +86,8 @@ def test_current_uses_after_medians_and_prints_the_predicted_step():
     assert "predicted device step for current" in out
 
 
-def test_current_predicts_with_the_calibrated_sum_plus_a_residual():
-    out = run("current", BS1_CTX1K)
+def test_current_predicts_with_the_calibrated_sum_plus_a_residual(reports_dir):
+    out = run("current", BS1_CTX1K, reports_dir)
     s = re.search(r"^sum of measured kernels \+ collectives, calibrated \(PREDICTOR, not a test\): ([\d.]+) ms", out, re.M)
     for label in ("the latest gate run's residual", "the 5938748 residual vs 77.36 ms (breakdown, full host)",
                   "the 5938748 residual vs 82.57 ms (gate baseline, CPU split)"):
@@ -97,16 +96,16 @@ def test_current_predicts_with_the_calibrated_sum_plus_a_residual():
         assert abs(float(m.group(1)) - float(s.group(1)) - float(m.group(2))) < 0.011  # 2-decimal rounding
 
 
-def test_merged_tip_shows_the_measured_profile_next_to_the_predictor():
-    out = run("594d425", BS1_CTX1K)
+def test_merged_tip_shows_the_measured_profile_next_to_the_predictor(reports_dir):
+    out = run("594d425", BS1_CTX1K, reports_dir)
     assert "Measured in-model per bucket (gate_host.json profile, tree 2fd8161)" in out
     m = re.search(r"^mHC\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([+-][\d.]+)", out.split("Measured in-model")[1], re.M)
     assert m and float(m.group(3)) == pytest.approx(16.766, abs=0.001)
 
 
-def test_bs64_prints_a_roofline_row_for_every_node_with_the_expert_term(tmp_path):
+def test_bs64_prints_a_roofline_row_for_every_node_with_the_expert_term(tmp_path, reports_dir):
     path = tmp_path / "l.json"
-    out = run("current", BS64_CTX8K, json_path=path)
+    out = run("current", BS64_CTX8K, reports_dir, json_path=path)
     doc = json.loads(path.read_text())
     table = out.split("Per bucket")[0]
     for row in doc["rows"]:
@@ -117,16 +116,16 @@ def test_bs64_prints_a_roofline_row_for_every_node_with_the_expert_term(tmp_path
     assert "+ mHC batch files: mhc_micro_mid.json, mhc_micro_large.json" in out
 
 
-def test_emit_shapes_writes_the_file(tmp_path, capsys):
+def test_emit_shapes_writes_the_file(tmp_path, capsys, reports_dir):
     path = tmp_path / "ledger_shapes.json"
-    assert main(["--emit-shapes", str(path), "--tip", "5938748"]) == 0
+    assert main(["--emit-shapes", str(path), "--tip", "5938748", "--reports-dir", str(reports_dir)]) == 0
     doc = json.loads(path.read_text())
     assert [p["point"]["bs"] for p in doc["points"]] == [1, 64]
     assert f"wrote {path}" in capsys.readouterr().out
 
 
-def test_reports_dir_without_a_family_file_leaves_its_units_unmeasured(tmp_path):
-    for f in REPORTS_DIR.glob("*.json"):
+def test_reports_dir_without_a_family_file_leaves_its_units_unmeasured(tmp_path, reports_dir):
+    for f in reports_dir.glob("*.json"):
         if f.name != "kda_micro.json":
             shutil.copy2(f, tmp_path / f.name)
     out = run("5938748", BS1_CTX1K, reports_dir=tmp_path)
@@ -136,7 +135,7 @@ def test_reports_dir_without_a_family_file_leaves_its_units_unmeasured(tmp_path)
     assert "the sum is partial" in out
 
 
-def test_not_wired_note_only_when_its_family_is_merged():
-    assert "not wired" in run("current", BS1_CTX1K).splitlines()[1]
-    head = run("594d425", BS1_CTX1K).splitlines()[1]
+def test_not_wired_note_only_when_its_family_is_merged(reports_dir):
+    assert "not wired" in run("current", BS1_CTX1K, reports_dir).splitlines()[1]
+    head = run("594d425", BS1_CTX1K, reports_dir).splitlines()[1]
     assert "for host;" in head and "not wired" not in head

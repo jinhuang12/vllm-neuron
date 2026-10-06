@@ -7,17 +7,17 @@ import pytest
 
 from test.kernel_ledger.models.glm53f.profile import profile_buckets
 from test.kernel_ledger.readers.gate import read_gate_step
-from test.kernel_ledger.readers.micro import REPORTS_DIR
+from test.kernel_ledger.tests.frozen_reports import FIXTURE_REPORTS
 
 
 @pytest.fixture(scope="module")
 def base():
-    return read_gate_step(REPORTS_DIR / "gate_baseline.json")
+    return read_gate_step(FIXTURE_REPORTS / "gate_baseline.json")
 
 
 @pytest.fixture(scope="module")
 def kv():
-    return read_gate_step(REPORTS_DIR / "gate_kv.json")
+    return read_gate_step(FIXTURE_REPORTS / "gate_kv.json")
 
 
 def test_baseline_profile_maps_every_named_kernel(base):

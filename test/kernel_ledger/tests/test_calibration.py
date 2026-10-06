@@ -11,12 +11,13 @@ from test.kernel_ledger.models.glm53f.ledger import build_ledger
 from test.kernel_ledger.models.glm53f.profile import profile_buckets
 from test.kernel_ledger.models.glm53f.references import REFERENCES
 from test.kernel_ledger.readers.gate import read_gate_step
-from test.kernel_ledger.readers.micro import REPORTS_DIR, load_micro_results
+from test.kernel_ledger.readers.micro import load_micro_results
+from test.kernel_ledger.tests.frozen_reports import FIXTURE_REPORTS
 
 
 @pytest.fixture(scope="module")
 def results():
-    return load_micro_results(REPORTS_DIR)
+    return load_micro_results(FIXTURE_REPORTS)
 
 
 @pytest.fixture(scope="module")
@@ -31,7 +32,7 @@ def cur(results):
 
 @pytest.fixture(scope="module")
 def gate():
-    return read_gate_step(REPORTS_DIR / "gate_baseline.json")
+    return read_gate_step(FIXTURE_REPORTS / "gate_baseline.json")
 
 
 @pytest.fixture(scope="module")

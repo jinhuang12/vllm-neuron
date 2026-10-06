@@ -7,6 +7,7 @@ import pytest
 
 from test.kernel_ledger.models.glm53f.decode import BUCKETS
 from test.kernel_ledger.models.glm53f.references import RECONCILED, REFERENCES, STEP_5938748
+from test.kernel_ledger.tests.frozen_reports import frozen
 
 _TERMS = [STEP_5938748] + [t for r in REFERENCES.values() for t in r.reference + r.engine_active + r.evidence
                             + tuple(x for a in r.alternatives for x in a.terms) + r.unmodeled]
@@ -14,7 +15,8 @@ _TERMS = [STEP_5938748] + [t for r in REFERENCES.values() for t in r.reference +
 
 @pytest.mark.parametrize("term", _TERMS, ids=lambda t: t.label[:40])
 def test_cited_snippet_is_in_the_source(term):
-    assert term.snippet in term.file.read_text(), f"{term.file.name}: {term.snippet!r}"
+    # a file of the live reports directory is read from its frozen copy
+    assert term.snippet in frozen(term.file).read_text(), f"{term.file.name}: {term.snippet!r}"
 
 
 def test_every_reconciled_bucket_is_a_ledger_bucket_with_a_reference():

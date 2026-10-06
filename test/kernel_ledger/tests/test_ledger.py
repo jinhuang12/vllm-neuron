@@ -8,14 +8,15 @@ import pytest
 from test.kernel_ledger.engine.collectives import ConstantCollectiveModel
 from test.kernel_ledger.models.glm53f.configs import BS1_CTX1K, BS64_CTX8K, BASELINE, CURRENT, KernelSet
 from test.kernel_ledger.models.glm53f.ledger import build_ledger, interpolate_points
-from test.kernel_ledger.readers.micro import REPORTS_DIR, load_micro_results
+from test.kernel_ledger.readers.micro import load_micro_results
+from test.kernel_ledger.tests.frozen_reports import FIXTURE_REPORTS
 
 AR_US = 17.5 + 16384 / 100e9 * 1e6  # one fp32 [1, 4096] all-reduce
 
 
 @pytest.fixture(scope="module")
 def results():
-    return load_micro_results(REPORTS_DIR)
+    return load_micro_results(FIXTURE_REPORTS)
 
 
 @pytest.fixture(scope="module")
