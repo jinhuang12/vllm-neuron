@@ -17,10 +17,13 @@ exact ``0.0`` are both lossless. It catches an indexing error a tolerance would
 absorb, but being symmetric it cannot see a transpose, which is why the two cases
 are both here.
 
-The kernel walks the token axis in tiles of ``nl.tile_size.pmax``, so the extents
-below are chosen for their relationship to that tile height: shorter than one
-tile, exactly one tile, one tile plus a single row, two tiles plus a remainder,
-and many whole tiles.
+The kernel picks its layout from the token count. Above
+``HIDDEN_ON_PARTITIONS_MAX_TOKENS`` it walks the token axis in tiles of
+``nl.tile_size.pmax``, and the extents below keep the relationship to that tile
+height they were chosen for: exactly one tile, one tile plus a single row, two
+tiles plus a remainder, and many whole tiles. At or below it (the short extents
+here) the hidden axis lies on the partitions, so the same extents cover hidden
+widths 128 does not divide, which leave a short last partition.
 
 Comparing simulated output against a torch reference would measure nothing if the
 module took its torch path, because both sides would then be torch. So the numeric

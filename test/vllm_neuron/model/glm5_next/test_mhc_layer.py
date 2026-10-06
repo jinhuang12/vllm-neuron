@@ -63,6 +63,18 @@ _SINKHORN_FILE = os.path.realpath(sinkhorn_mod.__file__)
 _COMBINE_FILE = os.path.realpath(combine_mod.__file__)
 
 
+@pytest.fixture(autouse=True)
+def _nki_simulator_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Enable the NKI CPU simulator these cases assert on.
+
+    ``can_run_kernel`` and ``wrap_nki`` both read ``NKI_SIMULATOR`` at call time and
+    ``test/conftest.py`` does not pin it, so without this every seam takes its torch
+    path (or, for the Sinkhorn seam, raises). A case that sets ``NKI_SIMULATOR=0``
+    itself still wins inside its own body.
+    """
+    monkeypatch.setenv("NKI_SIMULATOR", "1")
+
+
 class RouteInstrumentError(AssertionError):
     """A route reading that is not what this file declares."""
 
