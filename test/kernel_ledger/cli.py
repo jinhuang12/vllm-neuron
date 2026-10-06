@@ -16,7 +16,7 @@ import json
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from .models.glm53f.configs import BASELINE, BS1_CTX1K, BS64_CTX8K, NOT_WIRED, DecodePoint, point_for
+from .models.glm53f.configs import BASELINE, BS1_CTX1K, BS64_CTX8K, FAMILY_OF, NOT_WIRED, DecodePoint, point_for
 from .models.glm53f.ledger import Ledger, build_ledger
 from .models.glm53f.references import RECONCILED, REFERENCES, STEP_5938748, TOLERANCE
 from .models.glm53f.shapes import emit_shapes
@@ -45,9 +45,9 @@ def _kernel_set_line(tip: Tip) -> str:
     else:
         what = f'wave-1 kernels ("after") for {", ".join(sorted(ks.after))}; 5938748 ("before") for the rest'
     line = f"kernel set {ks.name}: {what}"
-    if tip.merged:
-        line += f"; merged gates at this tip: {', '.join(tip.merged)}"
-    wired = [k for k in NOT_WIRED if ks.after]
+    if tip.branches:
+        line += f"; gated branches in this tree: {', '.join(tip.branches)}"
+    wired = [k for k in NOT_WIRED if ks.is_after(FAMILY_OF[k])]
     if wired:
         line += f"; not wired, stays 5938748: {', '.join(wired)}"
     return line
@@ -152,7 +152,7 @@ def run(tip_name: str, point: DecodePoint, reports_dir: Path = REPORTS_DIR,
     lines += node_table(led) + [""] + bucket_table(led) + [""]
     doc = {"tip": tip.name, "sha": tip.sha, "kernel_set": {"name": tip.kernel_set.name,
                                                              "after": sorted(tip.kernel_set.after)},
-           "merged": list(tip.merged), "point": vars(point),
+           "branches": list(tip.branches), "point": vars(point),
            "rows": [dict(vars(r), roofline_ms=r.roofline_ms, measured_ms=r.measured_ms) for r in led.rows],
            "buckets": {b: vars(t) for b, t in led.buckets().items()},
            "kernels_ms": led.kernels_ms, "collectives_ms": led.collectives_ms, "measured_ms": led.measured_ms,
@@ -178,7 +178,7 @@ def run(tip_name: str, point: DecodePoint, reports_dir: Path = REPORTS_DIR,
         base_gate = resolve_tip("5938748", gates).gate
         res_bd = base.residual_ms(STEP_5938748.ms)
         pred = {"quiet_host": led.measured_ms + res_bd}
-        lines.append("predicted device step = sum above + the 5938748 residual (glue and waits as at 5938748):")
+        lines.append("predicted device step = sum above + a measured residual (glue, waits, launch skew):")
         lines.append(f"  {pred['quiet_host']:.2f} ms with the DECODE_BREAKDOWN.md residual {res_bd:.2f} ms "
                      f"(step {STEP_5938748.ms:.2f}, quiet host)")
         if base_gate is not None:
@@ -192,12 +192,18 @@ def run(tip_name: str, point: DecodePoint, reports_dir: Path = REPORTS_DIR,
             lines.append(f"latest gate run: {_gate_label(tip.gate)}: device step {tip.gate.device_step_ms:.2f} ms")
             if gt is not None:
                 at = build_ledger(point, gt.kernel_set, results)
-                lines.append(f"  that tree merged {', '.join(gt.merged) or 'nothing'}; wave-1 kernels in it: "
-                             f"{', '.join(sorted(gt.kernel_set.after)) or 'none'}")
+                verdict = f" (gate verdict {tip.gate.verdict})" if tip.gate.verdict else ""
+                lines.append(f"  gated branches in that tree: {', '.join(gt.branches) or 'none'}{verdict}; "
+                             f"wave-1 kernels in it: {', '.join(sorted(gt.kernel_set.after)) or 'none'}")
                 lines += residual_lines(at, [(f"ledger at tree {gt.sha[:7]} ({at.measured_ms:.2f} ms)",
                                               tip.gate.device_step_ms)])
+                res_l = at.residual_ms(tip.gate.device_step_ms)
+                pred["latest_gate_residual"] = led.measured_ms + res_l
+                lines.append(f"  {pred['latest_gate_residual']:.2f} ms with the latest gate run's residual {res_l:.2f} ms "
+                             "(predicted current step at today's glue, waits and host path)")
                 doc["latest_gate"] = {"file": tip.gate.file, "step_ms": tip.gate.device_step_ms,
-                                      "tree": gt.sha, "merged": list(gt.merged),
+                                      "tree": gt.sha, "branches": list(gt.branches),
+                                      "verdict": tip.gate.verdict,
                                       "ledger_measured_ms": at.measured_ms,
                                       "residual_ms": at.residual_ms(tip.gate.device_step_ms)}
     else:

@@ -32,7 +32,8 @@ def test_current_uses_after_medians_and_prints_the_predicted_step():
     assert "every wave-1 kernel" in out
     assert re.search(r"^mhc_pre_attn_sinkhorn .* 23\.30 .* after ", out, re.M)
     assert "predicted device step" in out
-    assert "latest gate run: gate_host.json" in out
+    assert re.search(r"^latest gate run: gate_\S+\.json \(tree [0-9a-f]{7}\): device step [\d.]+ ms", out, re.M)
+    assert re.search(r"^  ledger at tree [0-9a-f]{7} \([\d.]+ ms\): step [\d.]+ ms -> residual", out, re.M)
 
 
 def test_bs64_prints_a_roofline_row_for_every_node_with_the_expert_term(tmp_path):
@@ -64,3 +65,17 @@ def test_reports_dir_without_a_family_file_leaves_its_units_unmeasured(tmp_path)
     assert re.search(r"^kda_step\s+KDA\s+missing\s", out, re.M)
     assert "PARTIAL: 14 of 15 measured units" in out
     assert "the sum is partial" in out
+
+
+def test_not_wired_note_only_when_its_family_is_merged():
+    assert "not wired" in run("current", BS1_CTX1K).splitlines()[1]
+    head = run("594d425", BS1_CTX1K).splitlines()[1]
+    assert "for host;" in head and "not wired" not in head
+
+
+def test_current_also_predicts_with_the_latest_gate_residual():
+    out = run("current", BS1_CTX1K)
+    m = re.search(r"^  ([\d.]+) ms with the latest gate run's residual ([\d.]+) ms", out, re.M)
+    s = re.search(r"^sum of measured kernels \+ collectives: ([\d.]+) ms", out, re.M)
+    assert m and s
+    assert abs(float(m.group(1)) - float(s.group(1)) - float(m.group(2))) < 0.011  # 2-decimal rounding
