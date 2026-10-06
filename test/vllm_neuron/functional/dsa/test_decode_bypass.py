@@ -8,7 +8,7 @@ and query-latent widths narrowed for the simulator) through
 
 * **bypass** -- this tree, ``max_seq_len = context``: the bound proves selection is a
   no-op, so ``mla_decode_attention`` attends the prefix and the indexer's query side,
-  score GEMM and top-k never run.
+  scores and top-k never run.
 * **forced selection** -- this tree, ``max_seq_len = 4096`` over a 4096-row window: the
   indexer scores and selects exactly as before; its selected set is read and must be the
   whole causal prefix, and the layer output must equal the bypass output.
@@ -28,7 +28,7 @@ import torch
 from test.hardware.baselines.dsa_5938748 import load as load_5938748
 from test.vllm_neuron.functional.dsa import dsa_decode_case as case
 from vllm_neuron.functional.attention import mla_decode, mla_projections, mla_sparse
-from vllm_neuron.functional.dsa import kpool_hadamard, score_gemm, topk_select
+from vllm_neuron.functional.dsa import decode_batch, kpool_hadamard, score_gemm, topk_select
 from vllm_neuron.functional.dsa.decode_bypass import (
     bypass_max_context,
     selection_bound,
@@ -61,6 +61,7 @@ def _reset():
     mla_decode.reset_mla_decode_dispatch_counters()
     mla_sparse.reset_mla_sparse_dispatch_counters()
     score_gemm.reset_score_gemm_dispatch_counters()
+    decode_batch.reset_decode_batch_dispatch_counters()
     topk_select.reset_topk_select_dispatch_counters()
     kpool_hadamard.reset_kpool_hadamard_dispatch_counters()
     mla_projections.reset_mla_projection_lowp_counts()
@@ -72,6 +73,8 @@ def _counts():
         "dense": mla_decode.mla_decode_route_counts()[0],
         "sparse": mla_sparse.mla_sparse_dispatch_counters()[0],
         "score_gemm": score_gemm.score_gemm_dispatch_counters()[0],
+        # A one-request decode step scores through the batched kernel, as a batch of one.
+        "batch_scores": decode_batch.decode_batch_route_counts()[1],
         "topk": topk[0] + topk[1],
         "hadamard": kpool_hadamard.kpool_hadamard_dispatch_counters()[0],
         "lowp": mla_projections.mla_projection_lowp_counts()[0],
@@ -135,7 +138,8 @@ def test_the_bypass_is_exact_and_skips_selection(layers, context):
                                                      **short)
     assert dense_counts["dense"] == 1, dense_counts
     assert dense_counts["sparse"] == 0, dense_counts
-    assert dense_counts["score_gemm"] == 0 and dense_counts["topk"] == 0, dense_counts
+    assert dense_counts["score_gemm"] == 0 and dense_counts["batch_scores"] == 0, dense_counts
+    assert dense_counts["topk"] == 0, dense_counts
     # The query rotation is skipped with the query; the four sites the step still reads
     # (q_a twice, q_b, kv_a, o_proj, wk, gate) all took the fp8/bf16 route.
     assert dense_counts["hadamard"] == 0, dense_counts
@@ -143,7 +147,8 @@ def test_the_bypass_is_exact_and_skips_selection(layers, context):
 
     chosen, chosen_col, chosen_counts, chosen_ops = _run(live, operands)
     assert chosen_counts["dense"] == 0 and chosen_counts["sparse"] == 1, chosen_counts
-    assert chosen_counts["score_gemm"] == 1 and chosen_counts["topk"] == 1, chosen_counts
+    assert chosen_counts["batch_scores"] == 1 and chosen_counts["score_gemm"] == 0, chosen_counts
+    assert chosen_counts["topk"] == 1, chosen_counts
     # Selection is a no-op here: the set it picks is the whole causal prefix.
     assert _selected_set(chosen_col[0][0]) == set(range(context))
     # The dump's index entry is the same tensor either way.
@@ -167,7 +172,8 @@ def test_2052_tokens_still_select_and_drop_one_pool(layers):
 
     out, col, counts, _ = _run(live, operands)
     assert counts["dense"] == 0 and counts["sparse"] == 1, counts
-    assert counts["score_gemm"] == 1 and counts["topk"] == 1, counts
+    assert counts["batch_scores"] == 1 and counts["score_gemm"] == 0, counts
+    assert counts["topk"] == 1, counts
     assert counts["hadamard"] == 1, counts
     picked = _selected_set(col[0][0])
     # 513 complete pools, 512 kept, no open tail at 2052 = 513 * 4: four tokens dropped.
