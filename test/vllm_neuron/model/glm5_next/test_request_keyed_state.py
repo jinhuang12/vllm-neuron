@@ -559,8 +559,9 @@ def test_a1_a_two_request_linear_batch_is_served_through_the_converter() -> None
 
 
 def test_a1_the_sparse_family_refuses_a_second_request_by_name() -> None:
-    """One block table names one request's window, so the carrier says so instead of
-    guessing.
+    """Two decode requests reach the batched sparse carrier, which needs each request's
+    own table at the bucket's width; a geometry that states no width is refused by name
+    instead of guessed.
     """
     _require_cpu_mode()
     banks = _banks()
@@ -575,7 +576,7 @@ def test_a1_the_sparse_family_refuses_a_second_request_by_name() -> None:
         for _ in banks
     ]
 
-    with pytest.raises(ValueError, match="one block table names one request's window"):
+    with pytest.raises(ValueError, match="was handed a geometry with no 'window_blocks'"):
         NeuronModelRunner._glm5next_layer_carriers(
             banks,
             side,
@@ -598,7 +599,9 @@ def test_a1_the_converter_hands_a_two_request_batch_to_the_sparse_refusal() -> N
     banks = _banks()
     runner = _runner(banks)
 
-    with pytest.raises(ValueError, match="one block table names one request's window"):
+    # A two-request PREFILL: the scheduler schedules one prefill per step, and the sparse
+    # family's prefill refuses a packed second request by name.
+    with pytest.raises(ValueError, match="serves one sequence per forward"):
         _two_request_step(
             runner,
             banks,
