@@ -118,3 +118,20 @@ def test_latest_gate_is_the_newest_file(tmp_path):
         os.utime(p, (mtime, mtime))
     gates = read_gates(tmp_path)
     assert latest_gate(gates).device_step_ms == 70.0
+
+
+@pytest.mark.parametrize("name", ["gate_baseline.json", "gate_kv.json"])
+def test_gate_reader_keeps_the_profile_buckets(name):
+    g = read_gate_step(REPORTS_DIR / name)
+    d = json.loads((REPORTS_DIR / name).read_text())
+    raw = (d.get("after") or d)["device_step_ms"]["buckets_ms"]
+    assert g.buckets_ms == raw
+    # attribute_decode.py splits the whole step: the buckets add up to the mean step
+    assert sum(g.buckets_ms.values()) == pytest.approx(g.device_step_ms, rel=1e-4)
+
+
+def test_gate_profile_values():
+    base = read_gate_step(REPORTS_DIR / "gate_baseline.json")
+    kv = read_gate_step(REPORTS_DIR / "gate_kv.json")
+    assert base.buckets_ms["mhc/hyper_connection.py"] == pytest.approx(9.658, abs=1e-3)
+    assert kv.buckets_ms["wait: collective"] == pytest.approx(2.9534285714285713)

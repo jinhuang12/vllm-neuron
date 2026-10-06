@@ -8,14 +8,17 @@ Two schemas exist:
     ``gate_sha`` (the rebased candidate that was merged), and the candidate's launch
     under ``after``.
 ``device_step_ms`` is the rank-0 decode step from the device profile, mean of 7 steps.
+``device_step_ms.buckets_ms`` is that step split by ``gate/attribute_decode.py``:
+engine-active ms per kernel source file, plus the wait, DMA-issue, idle and unnamed
+compiler-op buckets. The buckets add up to the step.
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from .micro import REPORTS_DIR
 
@@ -33,6 +36,7 @@ class GateStep:
     host_gap_ms: Optional[float]
     itl_ms: Optional[float]
     mtime: float
+    buckets_ms: Optional[Dict[str, float]] = field(default=None, compare=False, hash=False)
 
 
 def _mean(block) -> Optional[float]:
@@ -66,6 +70,7 @@ def read_gate_step(path: Path) -> GateStep:
         host_gap_ms=launch.get("host_gap_ms"),
         itl_ms=_median(launch.get("itl_ms")),
         mtime=path.stat().st_mtime,
+        buckets_ms=launch["device_step_ms"].get("buckets_ms") if isinstance(launch["device_step_ms"], dict) else None,
     )
 
 
