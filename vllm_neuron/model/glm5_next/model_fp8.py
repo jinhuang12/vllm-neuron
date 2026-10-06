@@ -3302,15 +3302,13 @@ class Glm5NextKDAAttention(nn.Module):
                 f"hidden_states must be [tokens, hidden]; got shape "
                 f"{tuple(hidden_states.shape)}"
             )
-        # One carrier per request, and the loop is the dispatch. Concurrent requests
-        # hold their states at different slots of one bank, so what arrives here is
-        # a tuple of views -- one per request, in the batch's own order -- rather
-        # than one sequence's state. The views are not copied, which is what makes
-        # the loop correct at all: the recurrence advances its state in place, so
-        # each request's write has to land in the bank row its own view names. The
-        # cost is one dispatch per request per layer, taken deliberately, because
-        # batching the requests would need the kernels to carry a request axis,
-        # which is not this layer's to decide.
+        # One carrier per request. Concurrent requests hold their states at
+        # different slots of one bank, so what arrives here is a tuple of views --
+        # one per request, in the batch's own order -- rather than one sequence's
+        # state. A concurrent decode stacks the rows into one fused launch and
+        # copies each request's advanced rows back through its own view (whole-view
+        # ``copy_``, the write-back the backend keeps); the switched-off stage path
+        # still serves the requests one at a time.
         #
         # The position arrives as one int32 tensor with a row per request, and its
         # rows are taken with ``unbind``, a tensor operation: reading the value here
@@ -3362,6 +3360,15 @@ class Glm5NextKDAAttention(nn.Module):
                 )
         reals = rows[0] if rows[0] is not None else (None,) * requests
         masks = rows[1] if rows[1] is not None else (None,) * requests
+        if requests > 1 and fused_decode_enabled():
+            return self._fused_decode_requests(
+                hidden_states,
+                convs=states[0],
+                recurrents=states[1],
+                start_position=start_position,
+                real_tokens=real_tokens,
+                row_mask=row_mask,
+            )
         if requests > 1:
             return torch.cat(
                 [
@@ -3633,6 +3640,96 @@ class Glm5NextKDAAttention(nn.Module):
             recurrent_state[h] = state.to(recurrent_state.dtype)
 
         return self._gated_output(core, out_gate, hidden_states)
+
+    def _fused_decode_requests(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        convs: tuple[torch.Tensor, ...],
+        recurrents: tuple[torch.Tensor, ...],
+        start_position: torch.Tensor,
+        real_tokens: torch.Tensor | None,
+        row_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """A concurrent decode, one token per request, in one ``kda_fused_decode`` launch.
+
+        The bank views are stacked into the kernel's ``[B, ...]`` carriers (it serves
+        32 requests per pass at one head per rank), and each request's advanced rows
+        are copied back through its own view. ``start_position`` is ``[B]``,
+        ``real_tokens`` ``[B, 1]`` and ``row_mask`` ``[B, 1, 1]``, as the runner builds
+        them; a padding row (``real_tokens`` 0, mask 0, a non-zero start) gets its
+        carriers back unchanged.
+        """
+        from vllm_neuron.functional.kda.fused_decode import kda_fused_decode
+
+        requests = len(convs)
+        heads = int(self.num_kv_heads_per_rank)
+        kdim = int(self.head_dim)
+        for conv, recurrent in zip(convs, recurrents):
+            if tuple(recurrent.shape) != (heads, kdim, kdim):
+                raise ValueError(
+                    f"recurrent_state {tuple(recurrent.shape)} must be "
+                    f"{(heads, kdim, kdim)} for this rank's geometry"
+                )
+            if tuple(conv.shape) != tuple(self.kda_conv_state_shape):
+                raise ValueError(
+                    f"conv_state {tuple(conv.shape)} must be the shape get_kv_spec "
+                    f"reports, {tuple(self.kda_conv_state_shape)}"
+                )
+        if (row_mask is None) != (real_tokens is None):
+            raise ValueError(
+                "real_tokens and row_mask are one fact in two operands -- which rows "
+                "carry a token -- and this call passed one of them"
+            )
+        if row_mask is not None and int(row_mask.numel()) != requests:
+            raise ValueError(
+                f"row_mask carries {int(row_mask.numel())} value(s) for {requests} "
+                f"one-token request(s)"
+            )
+        if isinstance(start_position, (tuple, list)):
+            # One entry per request; a number is factory-built so a trace keeps it fake.
+            start_position = torch.stack(
+                [
+                    one.reshape(()).to(torch.int32)
+                    if torch.is_tensor(one)
+                    else hidden_states.new_full((), int(one), dtype=torch.int32)
+                    for one in start_position
+                ]
+            )
+        x = hidden_states.to(torch.float32)
+
+        def project(weight: torch.Tensor) -> torch.Tensor:
+            return x @ weight.to(torch.float32).t()
+
+        raw_gate = (x @ self.f_a_proj_weight.to(torch.float32).t()) @ (
+            self.f_b_proj_weight.to(torch.float32).t()
+        )
+        out_gate = (x @ self.g_a_proj_weight.to(torch.float32).t()) @ (
+            self.g_b_proj_weight.to(torch.float32).t()
+        )
+        fused = kda_fused_decode(
+            project(self.q_proj_weight),
+            project(self.k_proj_weight),
+            project(self.v_proj_weight),
+            raw_gate,
+            project(self.b_proj_weight),
+            conv_state=torch.stack(convs),
+            recurrent_state=torch.stack(recurrents),
+            q_conv1d_weight=self.q_conv1d_weight,
+            k_conv1d_weight=self.k_conv1d_weight,
+            v_conv1d_weight=self.v_conv1d_weight,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            gate_lower_bound=self.gate_lower_bound,
+            conv_state_dim_first=self.kda_conv_state_dim_first,
+            start_position=start_position,
+            real_tokens=real_tokens,
+            row_mask=row_mask,
+        )
+        for index in range(requests):
+            convs[index].copy_(fused.conv_state[index])
+            recurrents[index].copy_(fused.recurrent_state[index])
+        return self._gated_output(fused.core, out_gate, hidden_states)
 
     def _gated_output(
         self, core: torch.Tensor, out_gate: torch.Tensor, hidden_states: torch.Tensor
@@ -4954,8 +5051,14 @@ class Glm5NextDSAIndexer(nn.Module):
         prefill_end_position: torch.Tensor | int | None = None,
         prefill_start_position: torch.Tensor | int | None = None,
         indices_wanted: bool = True,
+        projected: tuple | None = None,
     ) -> torch.Tensor | None:
         """The whole indexer chain. Returns ``topk_indices`` and nothing else.
+
+        ``projected`` is :meth:`project_stage`'s four outputs for these rows, computed
+        by the caller: a decode step of several requests projects them all in one
+        call and hands each request its own row, since every request's write stage
+        and selection read its own caches. Absent, the projection runs here.
 
         ``indices_wanted=False`` is the caller saying it attends the causal prefix
         itself when selection is a no-op: the write stage still runs, the query side
@@ -5057,9 +5160,11 @@ class Glm5NextDSAIndexer(nn.Module):
                 "seeding the ring needs the sequence length after this chunk; got "
                 "a prefill_tail with no prefill_end_position"
             )
-        query, key, weights, gate_score = self.project_stage(
-            hidden_states, q_latent, query_side=selects or indices_wanted
-        )
+        if projected is None:
+            projected = self.project_stage(
+                hidden_states, q_latent, query_side=selects or indices_wanted
+            )
+        query, key, weights, gate_score = projected
 
         if is_decode:
             pooled, new_tail = self.tail_step(tail, key, gate_score, position)
@@ -6063,19 +6168,31 @@ class Glm5NextMLAAttention(nn.Module):
         row this bound exists to exclude. A caller that hands indices outside the
         context is the one error this method cannot catch.
 
-        ``batch_size`` is a parameter rather than inferred because
-        ``block_table_row`` is one request's row and the kernel assembles one window
-        per call, so a caller serving more than one sequence would have to loop. The
-        named refusal below says so rather than attending one request's window with
-        another request's queries.
+        ``batch_size`` is a parameter rather than inferred because one decode token
+        of each of ``batch_size`` requests and one request's prefill chunk of as many
+        tokens have the same ``hidden_states`` shape. ``batch_size > 1`` is a decode
+        step of that many requests, one token each, served by :meth:`_attend_requests`.
         """
-        if int(batch_size) != 1:
+        if int(batch_size) < 1:
             raise Glm5NextMLADecodeError(
-                f"the MLA decode path serves one sequence at a time "
-                f"(batch_size == 1); got batch_size={batch_size}. One block "
-                f"table names one request's window, and the kernel assembles one "
-                f"window per dispatch, so a larger batch would attend one "
-                f"request's rows with another request's queries"
+                f"batch_size counts the requests of this step and must be at least "
+                f"one; got batch_size={batch_size}"
+            )
+        if int(batch_size) > 1:
+            return self._attend_requests(
+                hidden_states,
+                latent_cache,
+                start_position,
+                topk_indices,
+                softmax_scale,
+                int(batch_size),
+                prefill_end_position=prefill_end_position,
+                collector=collector,
+                active_mla_query_rows=active_mla_query_rows,
+                block_table_row=block_table_row,
+                latent_slots=latent_slots,
+                page_size=page_size,
+                dense=dense,
             )
         if hidden_states.ndim != 2 or int(hidden_states.shape[1]) != self.hidden_size:
             raise Glm5NextMLADecodeError(
@@ -6279,6 +6396,219 @@ class Glm5NextMLAAttention(nn.Module):
         )
         return self.project_output(reduced, collector)
 
+    def _attend_requests(
+        self,
+        hidden_states: torch.Tensor,
+        latent_cache: torch.Tensor,
+        start_position: torch.Tensor,
+        topk_indices: torch.Tensor | None,
+        softmax_scale: float,
+        batch: int,
+        *,
+        prefill_end_position,
+        collector: list[torch.Tensor] | None,
+        active_mla_query_rows: int | None,
+        block_table_row: torch.Tensor,
+        latent_slots: torch.Tensor,
+        page_size: int,
+        dense: bool,
+    ) -> torch.Tensor:
+        """:meth:`attend` for a decode step of ``batch`` requests, one token each.
+
+        Request ``b`` is row ``b`` of ``hidden_states``, column ``b`` of
+        ``block_table_row`` (``[pages, batch]``, ``-1`` past its pages), entry ``b``
+        of ``latent_slots`` and of ``start_position`` (``[batch]``), and row ``b``
+        of ``topk_indices`` -- window rows of its own window -- unless ``dense``.
+        The projections, the cache write, both absorbs and the output projection are
+        the one-request chain on ``batch`` rows. The attention is
+        ``mla_decode_attention``, which reads each request's window through its own
+        table column and stands each request's ``written`` row in at its position,
+        so the result does not depend on when the cache write lands.
+        """
+        from vllm_neuron.functional.attention.mla_absorb import mla_absorb
+        from vllm_neuron.functional.attention.mla_decode import mla_decode_attention
+
+        if prefill_end_position is not None or active_mla_query_rows is not None:
+            raise Glm5NextMLADecodeError(
+                f"batch_size={batch} is a decode step of {batch} requests, one token "
+                f"each; a prefill chunk (prefill_end_position) and an active query "
+                f"prefix (active_mla_query_rows) belong to one request's prefill"
+            )
+        if tuple(hidden_states.shape) != (batch, self.hidden_size):
+            raise Glm5NextMLADecodeError(
+                f"hidden_states must be [batch_size, {self.hidden_size}] = "
+                f"[{batch}, {self.hidden_size}], one decode row per request; got "
+                f"{tuple(hidden_states.shape)}"
+            )
+        want_cache = (self.NUM_LATENT_KV_HEADS, self.head_size)
+        if latent_cache.ndim != 3 or tuple(latent_cache.shape[1:]) != want_cache:
+            raise Glm5NextMLADecodeError(
+                f"latent_cache must be [slots, {self.NUM_LATENT_KV_HEADS}, "
+                f"{self.head_size}] -- this layer's own declared cache spec; got "
+                f"{tuple(latent_cache.shape)}"
+            )
+        if hidden_states.dtype != latent_cache.dtype or latent_cache.dtype not in (
+            torch.bfloat16, torch.float16,
+        ):
+            raise Glm5NextMLADecodeError(
+                f"a decode step of batch_size={batch} attends through the batched "
+                f"decode kernel, which takes a 2-byte float query and bank of one "
+                f"dtype; got hidden {hidden_states.dtype} and bank {latent_cache.dtype}"
+            )
+        page = int(page_size)
+        if block_table_row.ndim != 2 or int(block_table_row.shape[1]) != batch:
+            raise Glm5NextMLADecodeError(
+                f"block_table_row must be [pages, batch_size={batch}], one column per "
+                f"request; got {tuple(block_table_row.shape)}"
+            )
+        if tuple(latent_slots.shape) != (batch,):
+            raise Glm5NextMLADecodeError(
+                f"latent_slots must carry one physical bank row per request, "
+                f"[{batch}]; got {tuple(latent_slots.shape)}"
+            )
+        if not torch.is_tensor(start_position) or tuple(start_position.shape) != (batch,):
+            raise Glm5NextMLADecodeError(
+                f"start_position must be a [batch_size={batch}] tensor, each request's "
+                f"own position; got {start_position!r}"
+            )
+        if not dense and (
+            topk_indices is None
+            or topk_indices.ndim != 2
+            or int(topk_indices.shape[0]) != batch
+        ):
+            raise Glm5NextMLADecodeError(
+                f"a selecting decode step of batch_size={batch} needs "
+                f"[{batch}, width] topk_indices; got "
+                f"{None if topk_indices is None else tuple(topk_indices.shape)}"
+            )
+
+        query, kv_latent = self.project_query_and_latent(hidden_states)
+        rows = latent_slots
+        if collector is not None:
+            collector.extend([kv_latent, rows.to(torch.int32)])
+        written = kv_latent.to(latent_cache.dtype)
+        latent_cache[:, 0, :].index_copy_(0, rows, written)
+        c_kv = latent_cache[:, 0, :]
+        if collector is not None:
+            collector.append(c_kv.detach().clone())
+
+        q_lift = mla_absorb(query, self._absorb_weight("W_UK"))
+        if int(q_lift.shape[2]) != self.kv_lora_rank:
+            raise Glm5NextMLADecodeError(
+                f"absorb-in produced a width of {int(q_lift.shape[2])}; the decode "
+                f"kernel contracts {self.kv_lora_rank}"
+            )
+        attended = mla_decode_attention(
+            q_lift,
+            c_kv,
+            block_table_row.t(),
+            start_position,
+            written,
+            softmax_scale,
+            page,
+            topk_indices=None if dense else topk_indices,
+        )
+        if collector is not None:
+            collector.extend([attended, q_lift])
+        reduced = mla_absorb(
+            attended.to(hidden_states.dtype), self._absorb_weight("W_UV")
+        )
+        return self.project_output(reduced, collector)
+
+    def _forward_requests(
+        self,
+        normed_hidden_states: torch.Tensor,
+        *,
+        latent_cache: torch.Tensor,
+        pool_cache,
+        seq_lens: torch.Tensor,
+        start_position: torch.Tensor,
+        softmax_scale: float,
+        max_seq_len: int,
+        page_size: int,
+        block_table_row: torch.Tensor,
+        latent_slots: torch.Tensor,
+        tail,
+        position: torch.Tensor,
+        collector: list[torch.Tensor] | None,
+    ) -> torch.Tensor:
+        """:meth:`forward` for a decode step of ``len(tail)`` requests, one row each.
+
+        ``tail`` and ``pool_cache`` are one bank view per request and ``seq_lens``,
+        ``start_position`` and ``position`` are ``[batch]``. The query latent and the
+        indexer's four projections run once on all rows. The indexer's write stage
+        and selection run per request, on that request's own ring and pooled store:
+        the candidate set is a request's own pooled keys, so there is no shared
+        candidate axis to batch over. :meth:`attend` then serves every request in one
+        batched call.
+        """
+        from vllm_neuron.functional.dsa.decode_bypass import (
+            selection_bound,
+            selection_is_a_no_op,
+        )
+
+        batch = len(tail)
+        pools = tuple(pool_cache) if isinstance(pool_cache, (tuple, list)) else ()
+        if len(pools) != batch or int(normed_hidden_states.shape[0]) != batch:
+            raise Glm5NextMLADecodeError(
+                f"a decode step of {batch} request ring(s) needs one pooled store per "
+                f"request and one row per request; got {len(pools)} store(s) and "
+                f"{int(normed_hidden_states.shape[0])} row(s)"
+            )
+        for name, value in (("seq_lens", seq_lens), ("position", position)):
+            if not torch.is_tensor(value) or tuple(value.shape) != (batch,):
+                raise Glm5NextMLADecodeError(
+                    f"{name} must be a [{batch}] tensor, one entry per request; got "
+                    f"{value!r}"
+                )
+        bound = selection_bound(
+            int(max_seq_len), int(block_table_row.shape[0]) * int(page_size)
+        )
+        dense = selection_is_a_no_op(
+            bound, self.indexer.index_topk, self.indexer.index_kpool
+        )
+        q_latent = self.project_query_latent(normed_hidden_states)
+        projected = self.indexer.project_stage(
+            normed_hidden_states, q_latent, query_side=not dense
+        )
+        selected = []
+        for b in range(batch):
+            rows = slice(b, b + 1)
+            selected.append(
+                self.indexer(
+                    normed_hidden_states[rows],
+                    q_latent[rows],
+                    pools[b],
+                    seq_lens[rows],
+                    max_seq_len=bound if dense else int(max_seq_len),
+                    page_size=int(page_size),
+                    indices_wanted=not dense,
+                    tail=tail[b],
+                    position=position[b],
+                    projected=tuple(
+                        None if part is None else part[rows] for part in projected
+                    ),
+                )
+            )
+        topk_indices = None if dense else torch.cat(selected)
+        if collector is not None:
+            collector.append(
+                (self.indexer._bypass_indices(seq_lens) if dense else topk_indices)[:5]
+            )
+        return self.attend(
+            normed_hidden_states,
+            latent_cache,
+            start_position,
+            topk_indices,
+            float(softmax_scale),
+            batch_size=batch,
+            collector=collector,
+            block_table_row=block_table_row,
+            latent_slots=latent_slots,
+            page_size=int(page_size),
+            dense=dense,
+        )
+
     def forward(
         self,
         normed_hidden_states: torch.Tensor,
@@ -6347,6 +6677,36 @@ class Glm5NextMLAAttention(nn.Module):
             selection_bound,
             selection_is_a_no_op,
         )
+
+        if isinstance(tail, (tuple, list)):
+            # A decode step of several requests: one ring per request.
+            if (
+                slot_mapping is not None
+                or prefill_tail is not None
+                or prefill_end_position is not None
+                or active_mla_query_rows is not None
+            ):
+                raise Glm5NextMLADecodeError(
+                    "a tuple of rings is a decode step of several requests; the "
+                    "prefill operands (slot_mapping, prefill_tail, "
+                    "prefill_end_position, active_mla_query_rows) belong to one "
+                    "request's prefill"
+                )
+            return self._forward_requests(
+                normed_hidden_states,
+                latent_cache=latent_cache,
+                pool_cache=pool_cache,
+                seq_lens=seq_lens,
+                start_position=start_position,
+                softmax_scale=softmax_scale,
+                max_seq_len=max_seq_len,
+                page_size=page_size,
+                block_table_row=block_table_row,
+                latent_slots=latent_slots,
+                tail=tail,
+                position=position,
+                collector=collector,
+            )
 
         # The decode step whose selection is a no-op attends the causal prefix
         # densely. The bound is what this graph can prove from its own shapes: the

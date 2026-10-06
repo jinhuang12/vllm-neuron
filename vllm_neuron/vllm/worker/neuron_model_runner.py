@@ -5235,6 +5235,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         scores. Both live across steps (the decode leg advances the ring in place and
         the pooled store accumulates), so the caller allocates once and keeps them.
         The dtype is the latent bank's; the layer casts on write.
+
+        ``pad_tail`` is a scratch ring of the same shape. A decode step padded to its
+        batch bucket serves each padding row from it, so a padding row's ring write
+        never lands in a ring a request owns.
         """
         pool = int(index_kpool)
         width = int(index_head_dim)
@@ -5266,6 +5270,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         device=reference.device,
                     ),
                     "tail": torch.zeros(
+                        (slots, 2, pool, width),
+                        dtype=reference.dtype,
+                        device=reference.device,
+                    ),
+                    "pad_tail": torch.zeros(
                         (slots, 2, pool, width),
                         dtype=reference.dtype,
                         device=reference.device,
@@ -5306,14 +5315,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         batch = getattr(self, "input_batch", None)
         return list(getattr(batch, "req_ids", None) or ())
 
-    def _glm5next_request_identities(self, *, synthetic: bool) -> list:
+    def _glm5next_request_identities(self, *, synthetic: bool, requests: int = 1) -> list:
         """Return the request ids this step serves, in the block tables' batch order.
 
         ``req_ids`` and the block-table rows are appended by the same request index,
         so identity and paging come from one ordering. A synthetic step (warmup, the
-        idle data-parallel dummy step) has no request and returns ``[None]``. A real
-        step whose batch names no request is refused: it would continue a sequence
-        without knowing whose it is.
+        idle data-parallel dummy step) has no request and returns one ``None`` per
+        block-table row (``requests``), so a decode warmup of a batch bucket gets one
+        row per sequence it stands in for. A real step whose batch names no request
+        is refused: it would continue a sequence without knowing whose it is.
         """
         if synthetic:
             # A step with a scheduled request can never be synthetic. Serving one
@@ -5327,7 +5337,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     f"scheduled request served without its identity would read and "
                     f"write the state of whichever request holds slot 0"
                 )
-            return [None]
+            return [None] * max(1, int(requests))
         request_ids = self._glm5next_batch_request_ids()
         if not request_ids:
             raise ValueError(
@@ -5437,12 +5447,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         that gets no tokens in a step leaves the batch but keeps its state. A
         synthetic step (warmup, idle dummy step) is served from slot 0 without reading
         or writing the table, so a warmup between two real steps of one sequence
-        cannot evict it.
+        cannot evict it. A synthetic step of several rows (a decode warmup of a batch
+        bucket) takes that many distinct slots, slots no request owns first, so the
+        captured graph sees the disjoint per-request views a served batch hands it.
         """
         # A synthetic step takes slot 0 and no claim; the capacity bound is read
         # only where a claim is about to be taken.
         if synthetic:
-            return [0 for _ in request_ids]
+            if len(request_ids) <= 1:
+                return [0 for _ in request_ids]
+            return self._glm5next_idle_slots(banks, (), len(request_ids))
         slots = self._glm5next_request_slot_capacity(banks)
         table = getattr(self, "_glm5next_request_slot_table", None)
         if table is None:
@@ -5492,6 +5506,180 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             table[request_id] = free
         return [table[request_id] for request_id in request_ids]
 
+    def _glm5next_idle_slots(self, banks, busy, count: int) -> list[int]:
+        """Return ``count`` distinct slots outside ``busy``: unowned slots first, ascending.
+
+        A decode step padded to its batch bucket carries rows no request holds, and
+        each row still needs its own bank views: the views of one step must stay
+        disjoint, or the captured graph's inputs would alias where the warmup's did
+        not. A slot no live request owns holds nothing anyone reads; a slot owned by
+        a request this step does not schedule comes last, and the row it serves
+        carries no token (the recurrence leaves it unchanged, see
+        ``_glm5next_layer_carriers``).
+        """
+        capacity = self._glm5next_request_slot_capacity(banks)
+        taken = {int(slot) for slot in busy}
+        owned = set(
+            int(slot)
+            for slot in (getattr(self, "_glm5next_request_slot_table", None) or {}).values()
+        )
+        order = [slot for slot in range(capacity) if slot not in taken and slot not in owned]
+        order += [slot for slot in range(capacity) if slot not in taken and slot in owned]
+        if len(order) < int(count):
+            raise ValueError(
+                f"this step needs {int(count)} slot(s) beside the {len(taken)} its "
+                f"requests hold and this stack keys {capacity}; a batch bucket wider "
+                f"than the engine's concurrency bound has no disjoint slot to pad with"
+            )
+        return order[: int(count)]
+
+    @classmethod
+    def _glm5next_sparse_batch_carrier(
+        cls,
+        bank,
+        side,
+        geometry,
+        *,
+        is_prefill: bool,
+        state_slots,
+        starts,
+        reals,
+        padding: int,
+        softmax_scale: float,
+        max_seq_len: int,
+        index_kpool: int,
+        operands: dict,
+    ) -> dict:
+        """One sparse (DSA) layer's carrier for a decode step of ``B > 1`` requests.
+
+        Request ``b`` is column ``b`` of every operand: its block-table column, its
+        latent slot, its position and seq len, and its own views of the indexer's
+        pooled store and ring. The checks are the one-request carrier's, per request.
+
+        A padding request (the last ``padding``) is a sequence of one token in the
+        null block: position 0, a table column naming block ``NULL_BLOCK_ID`` and
+        nothing else, its latent written to that block (the runner's own write-side
+        padding convention), and its ring the scratch ``pad_tail``. At position 0 no
+        pool completes, so its pooled write lands on its view's trash row, which no
+        candidate gather reads.
+        """
+        name = bank["name"]
+        if is_prefill:
+            raise ValueError(
+                f"KV layer '{name}' was handed a prefill of {len(state_slots)} "
+                f"request(s); the sparse family's prefill serves one sequence per "
+                f"forward (it pools and seeds one request's chunk, and the scheduler "
+                f"schedules one prefill per step), so a packed multi-request prefill "
+                f"is not served"
+            )
+        if padding and int(index_kpool) < 2:
+            raise ValueError(
+                f"KV layer '{name}' pools every {int(index_kpool)} key(s), so a padding "
+                f"request at position 0 would complete a pool and write a real row of "
+                f"another slot's pooled store; padding needs a pool of at least two"
+            )
+        block_size = int(bank["block_size"])
+        if int(geometry["page_size"]) != block_size:
+            raise ValueError(
+                f"KV layer '{name}'s bank is paged {block_size} slot(s) to the block "
+                f"and the KV-cache group it belongs to reports page "
+                f"{int(geometry['page_size'])}; the slice and the layer's own page are "
+                f"one number or the slice is wrong"
+            )
+        side_slots = int(side["pool_cache"].shape[0])
+        for one_slot in state_slots:
+            if not 0 <= int(one_slot) < side_slots:
+                raise ValueError(
+                    f"KV layer '{name}' holds {side_slots} indexer side-cache slot(s) "
+                    f"and a request of this step was given slot {int(one_slot)}; a "
+                    f"request's recurrent state and its indexer state live at one slot "
+                    f"number"
+                )
+        if "window_blocks" not in geometry:
+            raise ValueError(
+                f"KV layer '{name}' was handed a geometry with no 'window_blocks'; the "
+                f"block table this layer reads has a width that is fixed for the "
+                f"bucket, and a caller that does not state that width cannot be given "
+                f"a table one captured graph can serve"
+            )
+        window_blocks = int(geometry["window_blocks"])
+        real_requests = len(state_slots) - int(padding)
+        tables = [
+            [int(value) for value in row]
+            for row in geometry.get("request_block_ids", ())
+        ]
+        if len(tables) != real_requests:
+            raise ValueError(
+                f"KV layer '{name}' serves {real_requests} request(s) in this step and "
+                f"its geometry names {len(tables)} block-table row(s) "
+                f"('request_block_ids'); each request reads its own window"
+            )
+        for index, ids in enumerate(tables):
+            if not ids:
+                raise ValueError(
+                    f"KV layer '{name}' was handed an empty block-table row for request "
+                    f"{index}; a GLM-5.3-Flash request needs at least one KV block"
+                )
+            own_slots = len(ids) * block_size
+            if int(starts[index]) < 0 or int(starts[index]) + 1 > own_slots:
+                raise ValueError(
+                    f"KV layer '{name}' was handed request {index}'s token at position "
+                    f"{int(starts[index])} against {len(ids)} block(s) of {block_size} "
+                    f"slot(s); a write outside the request's own pages would land on "
+                    f"another sequence's rows"
+                )
+            if len(ids) > window_blocks:
+                raise ValueError(
+                    f"KV layer '{name}' was handed {len(ids)} block(s) for request "
+                    f"{index} and the bucket's block table holds {window_blocks} per "
+                    f"sequence; a request longer than its bucket cannot be served by "
+                    f"this window"
+                )
+        tables += [[NULL_BLOCK_ID]] * int(padding)
+        latent = bank["latent_cache"]
+        device = latent.device
+        if device not in operands:
+            positions = cls._glm5next_start_positions(starts, device)
+            operands[device] = {
+                "seq_lens": cls._glm5next_batch_row_seq_lens(
+                    [(1, start) for start in starts], device=device
+                ),
+                "start_position": positions,
+                "position": positions,
+            }
+        carrier = {
+            "latent_cache": latent,
+            # One column per request, ``-1`` past its pages, built on the host and
+            # moved once.
+            "block_table_row": torch.tensor(
+                [
+                    [ids[page] if page < len(ids) else -1 for ids in tables]
+                    for page in range(window_blocks)
+                ],
+                dtype=torch.int32,
+            ).to(device),
+            # One physical bank row per request: its own token's slot.
+            "latent_slots": cls._glm5next_latent_slot_mapping(
+                rows=tables,
+                starts=starts,
+                tokens=1,
+                block_size=block_size,
+                reals=[max(1, int(one)) for one in reals],
+                device=device,
+            ),
+            # Disjoint views, one per request, so each advances in place.
+            "pool_cache": tuple(side["pool_cache"][int(slot)] for slot in state_slots),
+            "tail": tuple(
+                side["tail"][int(slot)] for slot in state_slots[:real_requests]
+            )
+            + tuple(side["pad_tail"][index] for index in range(int(padding))),
+            **operands[device],
+            "softmax_scale": float(softmax_scale),
+            "max_seq_len": int(max_seq_len),
+            "page_size": int(geometry["page_size"]),
+        }
+        return carrier
+
     @classmethod
     def _glm5next_layer_carriers(
         cls,
@@ -5510,6 +5698,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         real_tokens: int | None = None,
         request_real_tokens=None,
         active_mla_query_rows: int | None = None,
+        padded_requests: int = 0,
     ) -> list[dict]:
         """Build one kwargs mapping per layer, in stack order, holding that layer's own state.
 
@@ -5524,8 +5713,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         leg or ``tail`` and ``position`` on the decode leg. The bank travels whole;
         ``block_table_row`` is the request's block table as a ``[pages, 1]`` int32
         column padded with ``-1`` to the bucket's width, and the kernel gathers the
-        pages it names, so the allocator may place them anywhere. One table names one
-        request's window, so this family serves one sequence per forward.
+        pages it names, so the allocator may place them anywhere. A decode step of
+        ``B > 1`` requests hands one column per request (``[pages, B]``), one bank
+        view per request for ``pool_cache`` and ``tail`` (tuples, so each ring
+        advances in place), and ``[B]`` int32 positions, seq lens and latent slots;
+        a prefill serves one request per forward (the scheduler schedules one).
+
+        ``padded_requests`` counts the trailing requests that are a batch bucket's
+        padding: they carry no token (real length 0), hold a slot no request in the
+        step holds, keep their recurrent state (position 1, masked rows) and, on the
+        sparse family, read and write only the null block and a scratch ring.
 
         A linear-attention (KDA) layer takes ``conv_state``, ``recurrent_state``,
         ``is_prefill``, ``start_position``, ``real_tokens`` and ``row_mask``, one
@@ -5623,13 +5820,33 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     f"real token count(s); the positions and the per-request lengths come "
                     f"from one batch and must describe the same requests"
                 )
+        padding = int(padded_requests)
+        if padding < 0 or (padding and (bool(is_prefill) or padding >= len(starts))):
+            raise ValueError(
+                f"this step declares {padding} padding request(s) beside "
+                f"{len(starts)} request(s) on the {'prefill' if is_prefill else 'decode'} "
+                f"leg; only a decode step is padded to its batch bucket, and at least "
+                f"one of its requests is real"
+            )
         for index, one_real in enumerate(reals):
+            if index >= len(reals) - padding:
+                # A padding request carries no token by definition.
+                if one_real != 0:
+                    raise ValueError(
+                        f"request {index} of this step is a batch bucket's padding and "
+                        f"was handed {one_real} real token(s); padding carries none"
+                    )
+                continue
             if one_real <= 0 or one_real > request_width:
                 raise ValueError(
                     f"request {index} of this step was handed {one_real} real token(s) "
                     f"against operands {request_width} row(s) wide; a request holds at "
                     f"least one token and never more than the width it was padded into"
                 )
+        real_requests = len(starts) - padding
+        # A padding request keeps its slot's recurrent state: position 1 (a position
+        # of zero opens the sequence and zeroes it) with no real row.
+        linear_starts = starts[:real_requests] + [1] * padding
         # These operands describe the step, not a layer's state. Assemble the
         # request axis on the host and upload once per device; torch.stack on
         # already-uploaded operands adds an eager device operation per layer.
@@ -5663,7 +5880,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 device = bank["recurrent_state"].device
                 if device not in linear_step_operands:
                     linear_step_operands[device] = {
-                        "start_position": cls._glm5next_start_positions(starts, device),
+                        "start_position": cls._glm5next_start_positions(
+                            linear_starts, device
+                        ),
                         "real_tokens": torch.tensor(
                             [[one_real] for one_real in reals], dtype=torch.int32
                         ).to(device),
@@ -5694,17 +5913,24 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     }
                 )
                 continue
-            if len(state_slots) != 1:
-                # The sparse family serves one sequence per forward: the kernel
-                # gathers pages by the block table it is handed, but one table names
-                # one request's window and the kernel assembles one window per
-                # dispatch. Lifting this needs a table axis through the kernel.
-                raise ValueError(
-                    f"KV layer '{bank['name']}' is a sparse-attention layer and one "
-                    f"block table names one request's window, so it serves one sequence "
-                    f"per forward; this call carries {len(state_slots)} request(s). A "
-                    f"table axis through the kernel is what lifts this, not the runner"
+            if len(state_slots) > 1:
+                carriers.append(
+                    cls._glm5next_sparse_batch_carrier(
+                        bank,
+                        side,
+                        geometry,
+                        is_prefill=bool(is_prefill),
+                        state_slots=state_slots,
+                        starts=starts[:real_requests] + [0] * padding,
+                        reals=reals,
+                        padding=padding,
+                        softmax_scale=softmax_scale,
+                        max_seq_len=max_seq_len,
+                        index_kpool=index_kpool,
+                        operands=sparse_step_operands,
+                    )
                 )
+                continue
             ids = [int(value) for value in geometry["block_ids"]]
             if not ids:
                 raise ValueError(
@@ -6048,9 +6274,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             window_blocks = min(table_width, max(1, span_blocks))
             geometries.append(
                 {
-                    # The first request's pages: the sparse family names one request's
-                    # window and refuses a second request in the carrier builder.
+                    # The first request's pages, which a one-request step reads, and
+                    # every request's own, which a decode step of several reads.
                     "block_ids": request_rows[0][: blocks_used[0]],
+                    "request_block_ids": [
+                        row[:used] for row, used in zip(request_rows, blocks_used)
+                    ],
                     "state_slot": request_rows[0][0],
                     "page_size": block_size,
                     "window_blocks": window_blocks,
@@ -6070,9 +6299,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             )
         is_prefill = legs.pop()
         request_starts = list(starts.pop())
-        # The scalar is the first request's, which is all the sparse family reads:
-        # it serves one sequence per forward and refuses a second in the carrier
-        # builder.
+        # The scalar is the first request's, which is what a one-request step's
+        # sparse carrier reads; a decode step of several reads ``request_starts``.
         start_position = request_starts[0]
         # Re-derived from the agreed cached lengths rather than from whichever group
         # the walk ended on; the derivation is a pure function of the builder's
@@ -6098,15 +6326,35 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         ) and not self._glm5next_batch_request_ids()
         # The slot is settled here, not in the walk above, because whether the step
         # is synthetic is only known once the leg and the position are read.
-        request_ids = self._glm5next_request_identities(synthetic=synthetic_step)
+        request_ids = self._glm5next_request_identities(
+            synthetic=synthetic_step, requests=len(request_starts)
+        )
         state_slots = self._glm5next_request_slots(
             banks, request_ids, synthetic=synthetic_step, side_caches=side_caches
         )
-        # One slot per request; the singular key stays because the sparse carrier
-        # reads it.
+        # A decode step padded to its batch bucket: the input builder pads the token
+        # rows to the bucket while the block tables keep one row per request, so the
+        # rows past the requests are padding, one token each and no request's. Each
+        # gets a slot no request in this step holds, so every view stays disjoint.
+        # A decode with more than one token per request is not padding; it reaches
+        # the carrier builder's multi-token refusal unchanged.
+        padding = 0
+        if (
+            not is_prefill
+            and tokens > len(request_starts)
+            and all(int(count) == 1 for count in request_tokens)
+        ):
+            padding = tokens - len(request_starts)
+        padding_slots = (
+            self._glm5next_idle_slots(banks, state_slots, padding) if padding else []
+        )
+        # One slot per request, padding last; the singular key stays because the
+        # one-request sparse carrier reads it.
         for geometry in geometries:
             geometry["state_slot"] = int(state_slots[0])
-            geometry["state_slots"] = [int(value) for value in state_slots]
+            geometry["state_slots"] = [
+                int(value) for value in list(state_slots) + padding_slots
+            ]
         # Identity and paging must describe the same requests: slots come from the
         # engine's request ids and positions from the block tables. A padded decode
         # row has no request, so fewer identities than cached lengths is refused
@@ -6157,14 +6405,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # from this same number.
             max_seq_len=int(self.max_model_len),
             index_kpool=int(text_config.index_kpool),
-            requests=len(state_slots),
-            request_starts=request_starts,
+            requests=len(state_slots) + padding,
+            request_starts=list(request_starts) + [0] * padding,
             # The first request's real length, for the sparse family: its ring and
             # pool mask stop where the sequence stops, not where the bucket does.
             real_tokens=request_tokens[0],
-            # Every request's own length, for the recurrent family's per-row masks.
-            request_real_tokens=request_tokens,
+            # Every request's own length, for the per-row masks; padding has none.
+            request_real_tokens=list(request_tokens) + [0] * padding,
             active_mla_query_rows=active_mla_query_rows,
+            padded_requests=padding,
         )
         # The cursor advances only once the carriers exist: the call above can still
         # refuse (multi-token decode, paging disagreement, slot out of range), and a
@@ -6178,8 +6427,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 self._glm5next_side_cache_positions[int(one_slot)] = (
                     int(one_start) + one_count
                 )
-            # The sparse family's own cursor, from the same number: it serves one
-            # sequence per forward, so this is the first request's position.
+            # The first request's cursor, from the same number; every request's own
+            # stands in ``_glm5next_side_cache_positions`` above.
             self._glm5next_side_cache_cursor = (
                 int(request_starts[0]) + request_tokens[0]
             )
