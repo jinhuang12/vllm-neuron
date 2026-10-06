@@ -55,6 +55,10 @@ from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
     stacked_expert_scale_loader,
 )
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
+from vllm_neuron.functional.full_vocab_sampling import (
+    device_sampling_config,
+    sample_full_vocab,
+)
 from vllm_neuron.model.neuron_config import NeuronConfig, VisionNeuronConfig
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 from vllm_neuron.utils.weight_loader import set_weight_loader
@@ -8493,6 +8497,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
         tp_degree: int = 1,
         expert_parallel_rank: int | torch.Tensor = 0,
         collect_layer_streams: bool = False,
+        device_sampling_params: torch.Tensor | None = None,
+        device_logit_mask: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Logits for the rows the caller wants sampled: stack, select, project.
 
@@ -8529,7 +8535,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
         implements nowhere: there is no sampler on this class and no
         ``on_device_sampling_config``. A sink would accept those three silently and
         return unsampled logits while reporting success. Naming the parameters instead
-        makes an unconsumed key a ``TypeError`` at the call.
+        makes an unconsumed key a ``TypeError`` at the call. On-device sampling arrives
+        under this root's own names, ``device_sampling_params`` and
+        ``device_logit_mask``, which the runner sets only for a root built with an
+        ``on_device_sampling_config``; the logits then go to
+        :func:`~vllm_neuron.functional.full_vocab_sampling.sample_full_vocab` and the
+        root returns ``[len(sampling_positions)]`` int32 token ids instead.
 
         The quantisation policy is resolved here, once per call, and threaded down as
         an argument -- the convention every compute method in this file follows. It is
@@ -8579,6 +8590,11 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 the stack refuses its own inputs.
         """
         head = self._head_weight()
+        sampling_config = (
+            None
+            if device_sampling_params is None
+            else device_sampling_config(self.text_config)
+        )
         quant_config = Glm5NextQuantConfig.from_model_config(self.config)
         # The keyword is added, not passed as False, so an ordinary forward hands its
         # stack the six keywords it always handed over and no seventh.
@@ -8599,6 +8615,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
             hidden_states, layer_streams = stack_output, ()
         rows = torch.index_select(hidden_states, dim=0, index=sampling_positions)
         logits = torch.nn.functional.linear(rows, head)
+        if device_sampling_params is not None:
+            logits = sample_full_vocab(
+                logits, device_sampling_params, sampling_config, device_logit_mask
+            )
         if collect_layer_streams:
             return (logits, *layer_streams)
         return logits

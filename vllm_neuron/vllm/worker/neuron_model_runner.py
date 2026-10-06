@@ -93,6 +93,7 @@ from vllm_neuron.accuracy.tensor_replacement import (
     TensorReplacer,
     set_active_context,
 )
+from vllm_neuron.functional.full_vocab_sampling import device_sampling_kwargs
 
 logger = logging.getLogger(__name__)
 
@@ -443,7 +444,9 @@ def build_sampling_params_tensor(
         temperature = sampling_metadata.temperature.to(device)
 
     result = torch.stack([top_k, top_p, temperature], dim=1)
-    logger.debug("On-device sampling params (top_k, top_p, temp): %s", result.tolist())
+    # .tolist() reads the device back; only pay that when the line is emitted.
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug("On-device sampling params (top_k, top_p, temp): %s", result.tolist())
     return result
 
 
@@ -2348,6 +2351,38 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         return prev_sampled
 
+    def _glm5next_host_only_metadata(self) -> bool:
+        """True when this step's attention metadata stays on the host.
+
+        The GLM-5.3-Flash translator (``_glm5next_model_kwargs``) builds every carrier
+        from ``host_block_table`` and ``host_num_computed_tokens`` and hands the root
+        no attention metadata, so the per-step device block tables, slot mappings and
+        cached lengths reach no graph. Opt-in through
+        ``VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA``, and only where nothing else reads
+        those device tensors: speculative decoding, KV transfer, KV / runtime-input
+        snapshots, tensor replacement or capture, and context parallelism all do.
+        """
+        if not envs.VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA:
+            return False
+        if not getattr(getattr(self, "model", None), "glm5next_layer_banks", None):
+            return False
+        return (
+            getattr(self, "speculative_config", None) is None
+            and self.vllm_config.kv_transfer_config is None
+            and not getattr(self, "_kv_snapshot_enabled", False)
+            and getattr(self, "_tensor_replacer", None) is None
+            and getattr(self, "_target_tensor_capture", None) is None
+            and not envs.VLLM_NEURON_RUNTIME_INPUT_SNAPSHOT_ENABLE
+            and getattr(self, "cp_world_size", 1) == 1
+            # A sliding-window decode trims the device table; none in this family.
+            and not any(
+                isinstance(group.kv_cache_spec, SlidingWindowSpec)
+                for group in getattr(
+                    getattr(self, "kv_cache_config", None), "kv_cache_groups", ()
+                )
+            )
+        )
+
     def _save_block_table_to_device(self) -> None:
         """
         To avoid data dependencies that block async execution, we should store the
@@ -2806,7 +2841,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         # OPTIMIZATION: Start copying the block table to neuron first.
         # This way, we can overlap the copy with the following CPU operations.
-        self._save_block_table_to_device()
+        # A host-only GLM-5.3-Flash step reads no device block table, so it copies none.
+        host_only_metadata = self._glm5next_host_only_metadata()
+        if not host_only_metadata:
+            self._save_block_table_to_device()
 
         logger.debug(
             "Starting vectorized model input preparation for %s requests, %s tokens",
@@ -2994,7 +3032,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             max_num_scheduled_tokens_padded,
         )
 
-        self._save_slot_mapping_to_device()
+        if not host_only_metadata:
+            self._save_slot_mapping_to_device()
 
         # Compute cached_seq_len for segmented prefill
         cached_seq_len = self._compute_cached_seq_len()
@@ -3007,6 +3046,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             max_num_draft_tokens,
             cached_seq_len,
             max_decode_ctx_len=max_decode_ctx_len,
+            host_only=host_only_metadata,
         )
 
         # Spec decoding
@@ -4179,6 +4219,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         max_num_draft_tokens: int,
         cached_seq_len: int = 0,
         max_decode_ctx_len: int = 0,
+        host_only: bool = False,
     ) -> AttentionMetadata | None:
         """
         Build attention metadata for KV cache and attention computation.
@@ -4193,11 +4234,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 slots (already MAX-reduced via `_get_dp_padding`). Drives the
                 `decode_context_length_buckets` pick for non-SWA decode
                 groups; ignored when bucketing is unset or the group is SWA.
+            host_only: Keep every per-step tensor on the host
+                (``_glm5next_host_only_metadata``): the block table is the host
+                table's padded rows, not the sentinel-remapped device copy, and no
+                clone, slot-mapping or cached-length tensor is uploaded. Shapes match
+                the device path.
 
         Returns:
             AttentionMetadata object or None for simplified cases
         """
         attn_metadata = {}
+        step_device = torch.device("cpu") if host_only else self.device
         decode_token_threshold = 1 + max_num_draft_tokens
         is_decode = max_query_len <= decode_token_threshold
 
@@ -4207,15 +4254,23 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             spec = kv_cache_group_spec.kv_cache_spec
             block_size = spec.block_size
             blk_table = self.input_batch.block_table[kv_cache_group_id]
-            blk_table_tensor = blk_table.get_device_tensor(padded_num_reqs)
+            blk_table_tensor = (
+                blk_table.get_cpu_tensor()[:padded_num_reqs]
+                if host_only
+                else blk_table.get_device_tensor(padded_num_reqs)
+            )
             # Clone so ``full_blk_table_tensor`` is a distinct tensor object
             # from ``blk_table_tensor``. Required because torch.compile's
             # input guards reject duplicate tensor identities, and warmup
             # always traces with two distinct tensors. For SWA models, the
             # clone is also necessary because ``blk_table_tensor`` gets
             # reassigned to a trimmed view below.
-            full_blk_table_tensor = blk_table_tensor.clone()
-            slot_mapping = blk_table.slot_mapping.gpu[:total_num_scheduled_tokens]
+            full_blk_table_tensor = (
+                blk_table_tensor if host_only else blk_table_tensor.clone()
+            )
+            slot_mapping = (
+                blk_table.slot_mapping.cpu if host_only else blk_table.slot_mapping.gpu
+            )[:total_num_scheduled_tokens]
             # DCP prefill: prefill now uses the same scheme as decode — it
             # writes only this rank's interleaved token shard (S/DCP) to the
             # per-rank cache. Extract slot_mapping entries at owned positions
@@ -4244,7 +4299,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     .to(self.device)
                 )
             cached_seq_len_tensor = torch.tensor(
-                [[cached_seq_len]], dtype=torch.int32, device=self.device
+                [[cached_seq_len]], dtype=torch.int32, device=step_device
             )
 
             # Note there are more data available in self.input_batch you can
@@ -4314,12 +4369,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     # The extra device-side copy is asynchronous and
                     # overlaps with the prior decode forward, so it costs
                     # no extra wall time.
-                    bucket_idx = torch.arange(bucket_blocks, device=self.device)
+                    bucket_idx = torch.arange(bucket_blocks, device=step_device)
                     blk_table_tensor = torch.index_select(
                         blk_table_tensor, 1, bucket_idx
                     )
                 swa_kv_pos_offset = torch.zeros(
-                    padded_num_reqs, dtype=torch.int32, device=self.device
+                    padded_num_reqs, dtype=torch.int32, device=step_device
                 )
 
             # Host-side copies of the block table and cached lengths, for geometry
@@ -6132,6 +6187,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             "input_ids": input_ids,
             "layer_carriers": carriers,
             "sampling_positions": kwargs["sampling_positions"],
+            # Present only when the runner and the root both sample on device.
+            **device_sampling_kwargs(
+                kwargs,
+                runner_samples_on_device=getattr(self, "on_device_sampling", False),
+                model=self.model,
+            ),
             **self._glm5next_parallel_kwargs(device=input_ids.device),
             # The dump keyword goes through this one function for every call site,
             # so captured and served graphs share a signature. Absent unless a dump

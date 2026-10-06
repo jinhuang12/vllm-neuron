@@ -69,6 +69,13 @@ if TYPE_CHECKING:
     VLLM_NEURON_RUNTIME_INPUT_SNAPSHOT_RANKS: Optional[str] = None
     VLLM_NEURON_RUNTIME_INPUT_SNAPSHOT_FORMAT: str = "pt"
     VLLM_NEURON_EFA_INSTANCE_FAMILY: str = ""
+    # GLM-5.3-Flash host path. Both default off, which is the as-built serve.
+    # Let GLM-5.3-Flash sample its full-vocabulary logits on device, which also lets
+    # async scheduling stay on.
+    VLLM_NEURON_GLM5NEXT_ON_DEVICE_SAMPLING: bool = False
+    # Build the GLM-5.3-Flash step's attention metadata on the host only: no per-step
+    # block-table / slot-mapping uploads that its graph never reads.
+    VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA: bool = False
 
 
 def maybe_convert_bool(value: str | None) -> bool | None:
@@ -323,6 +330,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (which defaults any trn3* to trn3pds and any trn2* to trn2).
     "VLLM_NEURON_EFA_INSTANCE_FAMILY": lambda: os.getenv(
         "VLLM_NEURON_EFA_INSTANCE_FAMILY", ""
+    ),
+    # ================== GLM-5.3-Flash Host Path ==================
+    # Accept an on-device sampling config for GLM-5.3-Flash: its root hands the
+    # full-vocabulary logits to ``functional/full_vocab_sampling.py`` and returns
+    # token ids, so async scheduling is no longer turned off. Off by default.
+    "VLLM_NEURON_GLM5NEXT_ON_DEVICE_SAMPLING": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_GLM5NEXT_ON_DEVICE_SAMPLING"))
+        or False
+    ),
+    # Skip the per-step device copies of block tables, slot mappings and cached
+    # lengths for GLM-5.3-Flash, whose graph reads only host geometry. Off by default.
+    "VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA"))
+        or False
     ),
 }
 
