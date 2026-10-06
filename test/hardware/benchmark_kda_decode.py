@@ -124,6 +124,16 @@ WEIGHT_KEYS = ("q_conv1d_weight", "k_conv1d_weight", "v_conv1d_weight", "A_log",
 
 
 def build_variants(loader, kernels, layers: int, batch: int):
+    """Graphs that return ``(core, conv, rec)``, the carriers advanced.
+
+    The advanced carriers leave each graph as outputs, and nothing is written
+    into a view: the backend turns an in-place write into a new tensor that
+    replaces the written node, so a write into a slice of a larger tensor never
+    reaches that tensor. The old region writes its carriers in place, so it is
+    handed one standalone copy per layer and request, whose later uses do see
+    the write. The fused kernel returns its carriers as new tensors already.
+    """
+
     def unpack(args):
         step = dict(zip(STEP_KEYS, args[0:5]))
         conv, rec, position = args[5], args[6], args[7]
@@ -132,27 +142,37 @@ def build_variants(loader, kernels, layers: int, batch: int):
 
     def before(*args):
         step, conv, rec, position, weights = unpack(args)
-        cores = []
+        cores, convs, recs = [], [], []
         for layer in range(layers):
-            per_request = [
-                loader.old_decode_core(
-                    kernels,
-                    *(step[key][layer, b : b + 1] for key in STEP_KEYS),
-                    conv_state=conv[layer, b],
-                    recurrent_state=rec[layer, b],
-                    gate_lower_bound=LOWER,
-                    conv_state_dim_first=False,
-                    start_position=position[b],
-                    **weights,
+            per_request = []
+            for b in range(batch):
+                conv_state = conv[layer, b].clone()
+                recurrent_state = rec[layer, b].clone()
+                per_request.append(
+                    loader.old_decode_core(
+                        kernels,
+                        *(step[key][layer, b : b + 1] for key in STEP_KEYS),
+                        conv_state=conv_state,
+                        recurrent_state=recurrent_state,
+                        gate_lower_bound=LOWER,
+                        conv_state_dim_first=False,
+                        start_position=position[b],
+                        **weights,
+                    )
                 )
-                for b in range(batch)
-            ]
+                convs.append(conv_state)
+                recs.append(recurrent_state)
             cores.append(torch.cat(per_request, dim=0))
-        return torch.stack(cores)
+        shape = (layers, batch)
+        return (
+            torch.stack(cores),
+            torch.stack(convs).reshape(*shape, *conv.shape[2:]),
+            torch.stack(recs).reshape(*shape, *rec.shape[2:]),
+        )
 
     def after(*args):
         step, conv, rec, position, weights = unpack(args)
-        cores = []
+        cores, convs, recs = [], [], []
         for layer in range(layers):
             out = kda_fused_decode(
                 *(step[key][layer] for key in STEP_KEYS),
@@ -163,14 +183,14 @@ def build_variants(loader, kernels, layers: int, batch: int):
                 start_position=position,
                 **weights,
             )
-            conv[layer].copy_(out.conv_state)
-            rec[layer].copy_(out.recurrent_state)
             cores.append(out.core)
-        return torch.stack(cores)
+            convs.append(out.conv_state)
+            recs.append(out.recurrent_state)
+        return torch.stack(cores), torch.stack(convs), torch.stack(recs)
 
     def after_loop(*args):
         step, conv, rec, position, weights = unpack(args)
-        cores = []
+        cores, convs, recs = [], [], []
         for layer in range(layers):
             per_request = []
             for b in range(batch):
@@ -183,16 +203,21 @@ def build_variants(loader, kernels, layers: int, batch: int):
                     start_position=position[b : b + 1],
                     **weights,
                 )
-                conv[layer, b].copy_(out.conv_state[0])
-                rec[layer, b].copy_(out.recurrent_state[0])
                 per_request.append(out.core)
+                convs.append(out.conv_state[0])
+                recs.append(out.recurrent_state[0])
             cores.append(torch.cat(per_request, dim=0))
-        return torch.stack(cores)
+        shape = (layers, batch)
+        return (
+            torch.stack(cores),
+            torch.stack(convs).reshape(*shape, *conv.shape[2:]),
+            torch.stack(recs).reshape(*shape, *rec.shape[2:]),
+        )
 
     def floor(*args):
-        # The same inputs and the same output shape, no layer: the launch and
+        # The same inputs and outputs, no layer: the launch, carrier copy and
         # synchronisation cost every variant's graph time contains.
-        return args[0] + 0.0
+        return args[0] + 0.0, args[5].clone(), args[6].clone()
 
     variants = {"before": before, "after": after, "floor": floor}
     if batch > 1:
@@ -233,11 +258,11 @@ def device_inputs(case: dict, device: str) -> tuple:
 
 def measure(model, inputs, warmup: int, iterations: int, layers: int) -> dict:
     for _ in range(warmup):
-        model(*inputs).to("cpu")
+        model(*inputs)[0].to("cpu")
     samples = []
     for _ in range(iterations):
         started = time.perf_counter_ns()
-        model(*inputs).to("cpu")
+        model(*inputs)[0].to("cpu")
         samples.append((time.perf_counter_ns() - started) / 1_000)
     samples.sort()
     p90 = samples[min(len(samples) - 1, int(0.9 * len(samples)))]
@@ -274,10 +299,11 @@ def run_case(batch: int, layers: int, loader, kernels, args) -> dict:
     for name, model in compiled.items():
         inputs = device_inputs(case, "neuron:0")
         started = time.perf_counter()
-        core = model(*inputs).to("cpu")
+        returned = model(*inputs)
+        core = returned[0].to("cpu")
         first_call_s = time.perf_counter() - started
-        conv = inputs[5].to("cpu")
-        rec = inputs[6].to("cpu")
+        conv = returned[1].to("cpu")
+        rec = returned[2].to("cpu")
         if not torch.isfinite(core).all() or not torch.isfinite(rec).all():
             raise AssertionError(f"{name} returned non-finite values")
         outputs[name] = {"core": core, "conv": conv, "rec": rec}
@@ -292,6 +318,15 @@ def run_case(batch: int, layers: int, loader, kernels, args) -> dict:
                 "conv_state": metrics(conv, reference["conv"]),
             },
         }
+        # The reference advanced the carriers, so a variant that returned them
+        # unadvanced reads a relative L2 near 1 here, not near 0.
+        for key, label in (("core", "core"), ("recurrent_state", "rec"),
+                           ("conv_state", "conv")):
+            rel = result["variants"][name]["vs_cpu_reference"][key]["relative_l2"]
+            if rel > 1e-3:
+                raise AssertionError(
+                    f"{name} {label} differs from the CPU reference: rel_l2 {rel}"
+                )
     for name in compiled:
         if name in ("before", "floor"):
             continue
@@ -299,7 +334,7 @@ def run_case(batch: int, layers: int, loader, kernels, args) -> dict:
             key: metrics(outputs[name][key], outputs["before"][key])
             for key in ("core", "rec", "conv")
         }
-        for key in ("core", "rec"):
+        for key in ("core", "rec", "conv"):
             rel = result["variants"][name]["vs_before"][key]["relative_l2"]
             if rel > 1e-3:
                 raise AssertionError(f"{name} {key} differs from before: rel_l2 {rel}")
@@ -385,7 +420,7 @@ def profile(compiled, case, layers, batch, args) -> str:
     try:
         for _ in range(args.profile_iterations):
             for name, model in compiled.items():
-                model(*inputs[name]).to("cpu")
+                model(*inputs[name])[0].to("cpu")
     finally:
         runtime.stop_profiling()
     return str(directory)
@@ -454,7 +489,8 @@ def main() -> None:
         },
         "timing_unit": (
             "microseconds per layer step = host wall time of one graph launch "
-            "plus its core copy to CPU, divided by the graph's layer count"
+            "plus its core copy to CPU, divided by the graph's layer count; the "
+            "advanced carriers are graph outputs left on device"
         ),
         "baseline_module": str(args.baseline_module),
         "compiler_workdir": str(workdir),
