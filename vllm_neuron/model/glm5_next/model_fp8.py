@@ -170,6 +170,38 @@ def _relaid_out_on_the_host(
     return dense
 
 
+def _lowp_projection_operands(
+    weights: dict[str, torch.Tensor | None], scales: dict[str, torch.Tensor | None]
+) -> dict[str, tuple[torch.Tensor, torch.Tensor | None]]:
+    """Each ``[out, in]`` weight the checkpoint stored as fp8-e4m3 (with its scale
+    grid) or bf16, as the low-precision projection route's operands, built on the
+    host and moved back. A weight the kernel does not serve is left to the fp32 route.
+    """
+    from vllm_neuron.functional.attention.mla_projections import (
+        lowp_projection_admits,
+        prepare_lowp_projection,
+    )
+
+    operands: dict[str, tuple[torch.Tensor, torch.Tensor | None]] = {}
+    for name, weight in weights.items():
+        if weight is None:
+            continue
+        scale = scales.get(name) if weight.dtype == torch.float8_e4m3fn else None
+        if not lowp_projection_admits(weight, scale):
+            continue
+        # Both operands hop to the host before the relayout, which transposes.
+        host_scale = None
+        if scale is None:
+            (host_weight,) = _on_the_host(weight)
+        else:
+            host_weight, host_scale = _on_the_host(weight, scale)
+        laid_weight, laid_scale = prepare_lowp_projection(host_weight, host_scale)
+        (w,) = _on_the_device(weight.device, laid_weight)
+        s = None if laid_scale is None else _on_the_device(weight.device, laid_scale)[0]
+        operands[name] = (w, s)
+    return operands
+
+
 def _transposed_on_the_host(tensor: torch.Tensor, dim0: int, dim1: int) -> torch.Tensor:
     """``tensor`` with two axes swapped, dense, and never transposed on the device."""
     # The common shape of the rule above, spelled once so twelve call sites do not each
@@ -3830,6 +3862,11 @@ class Glm5NextDSAIndexer(nn.Module):
     #: weight in a saved checkpoint.
     PREPARED_WEIGHTS_ATTR = "_prepared_indexer_weights"
 
+    #: Attribute the low-precision route's operands are cached on: each site's
+    #: weight as the checkpoint stored it (bf16 or fp8), contraction-major. Built
+    #: only for a weight that arrived in such a dtype; see ``mla_projection_prepared``.
+    LOWP_WEIGHTS_ATTR = "_prepared_indexer_lowp_weights"
+
     #: Site name -> the parameter attribute that site's weight arrives on.
     #:
     #: Three of the four follow the ``f"{name}_weight"`` convention and the fourth
@@ -3966,7 +4003,14 @@ class Glm5NextDSAIndexer(nn.Module):
                 weight, lambda host: host.to(torch.float32).t()
             )
         setattr(self, self.PREPARED_WEIGHTS_ATTR, prepared)
+        setattr(self, self.LOWP_WEIGHTS_ATTR, _lowp_projection_operands(
+            {name: getattr(self, self.PROJECTION_PARAMETERS[name])
+             for name, _, _ in self.projection_widths()}, {}))
         return len(prepared)
+
+    def _lowp_operand(self, name: str):
+        """``(weight, scale)`` for the low-precision route, or None for the fp32 one."""
+        return getattr(self, self.LOWP_WEIGHTS_ATTR, {}).get(name)
 
     def _prepared_weight(self, name: str) -> torch.Tensor:
         """One prepared weight, or a refusal naming what was not done.
@@ -4056,7 +4100,8 @@ class Glm5NextDSAIndexer(nn.Module):
         return float(self.index_head_dim**-0.5) * float(self.index_n_heads**-0.5)
 
     def project_stage(
-        self, hidden_states: torch.Tensor, q_latent: torch.Tensor
+        self, hidden_states: torch.Tensor, q_latent: torch.Tensor,
+        query_side: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """The indexer's four projections, its key norm and its query rotation.
 
@@ -4093,8 +4138,15 @@ class Glm5NextDSAIndexer(nn.Module):
         # ``functional/`` kernel and not a package-level one: the DSA package's
         # ``__init__.py`` is empty, so a package-level import of a kernel name would
         # raise ``ImportError`` at the first call.
-        from vllm_neuron.functional.attention.mla_projections import mla_projection
+        from vllm_neuron.functional.attention.mla_projections import (
+            mla_projection_prepared,
+        )
         from vllm_neuron.functional.dsa.kpool_hadamard import dsa_hadamard128
+
+        def project(x: torch.Tensor, name: str) -> torch.Tensor:
+            return mla_projection_prepared(
+                x, self._prepared_weight(name), self._lowp_operand(name)
+            )
 
         if hidden_states.ndim != 2 or int(hidden_states.shape[1]) != self.hidden_size:
             raise Glm5NextDSAIndexerError(
@@ -4109,40 +4161,40 @@ class Glm5NextDSAIndexer(nn.Module):
                 f"states; got {tuple(q_latent.shape)}"
             )
 
-        hidden_f32 = hidden_states.to(torch.float32)
-
         # 1. The query. Upstream views the projection to ``[-1, n_head, head_dim]``;
         #    the rotation kernel takes a 2-D ``[rows, 128]``, so the view is flat
-        #    for the call and restored after it.
-        query = mla_projection(q_latent.to(torch.float32), self._prepared_weight("wq_b"))
-        query = dsa_hadamard128(
-            query.reshape(tokens * self.index_n_heads, self.index_head_dim).to(
-                torch.bfloat16
-            )
-        ).reshape(tokens, self.index_n_heads, self.index_head_dim)
+        #    for the call and restored after it. ``query_side=False`` is the decode
+        #    step whose selection is a no-op: nothing reads the query or the weights.
+        query = weights = None
+        if query_side:
+            query = project(q_latent, "wq_b")
+            query = dsa_hadamard128(
+                query.reshape(tokens * self.index_n_heads, self.index_head_dim).to(
+                    torch.bfloat16
+                )
+            ).reshape(tokens, self.index_n_heads, self.index_head_dim)
 
         # 2. The key, then its LayerNorm. The cast to bf16 happens before the norm
         #    so the norm's own cast-back lands on bf16, which is upstream's order:
         #    its ``k`` leaves a bf16 linear and its fused key norm normalises in
         #    float32 and casts back.
         key = self._key_norm(
-            mla_projection(hidden_f32, self._prepared_weight("wk")).to(torch.bfloat16),
+            project(hidden_states, "wk").to(torch.bfloat16),
             self.k_norm_weight,
             self.k_norm_bias,
         )
 
         # 3. The weights, with the single constant folded in. float32 all the way:
         #    ``dsa_score_gemm`` requires it and applies no scale of its own.
-        weights = mla_projection(
-            hidden_f32, self._prepared_weight("weights_proj")
-        ) * self.projection_scale()
+        if query_side:
+            weights = project(hidden_states, "weights_proj") * self.projection_scale()
 
         # 4. The kpool gate: upstream's
         #    ``F.linear(hidden_states, index_kpool_compress_gate)``, which is why
         #    ``projection_widths`` carries this site as a projection.
-        gate_score = mla_projection(
-            hidden_f32, self._prepared_weight("index_kpool_compress_gate")
-        ).to(torch.bfloat16)
+        gate_score = project(hidden_states, "index_kpool_compress_gate").to(
+            torch.bfloat16
+        )
 
         return query, key, weights, gate_score
 
@@ -4912,8 +4964,14 @@ class Glm5NextDSAIndexer(nn.Module):
         prefill_tail: torch.Tensor | None = None,
         prefill_end_position: torch.Tensor | int | None = None,
         prefill_start_position: torch.Tensor | int | None = None,
-    ) -> torch.Tensor:
+        indices_wanted: bool = True,
+    ) -> torch.Tensor | None:
         """The whole indexer chain. Returns ``topk_indices`` and nothing else.
+
+        ``indices_wanted=False`` is the caller saying it attends the causal prefix
+        itself when selection is a no-op: the write stage still runs, the query side
+        is skipped, and None is returned instead of the causal fill. It changes
+        nothing while ``max_seq_len`` selects.
 
         Indices alone is deliberate: the ``-1`` mask stays inside the sparse
         kernel, so no per-row valid length leaves this class -- returning one would
@@ -5010,7 +5068,9 @@ class Glm5NextDSAIndexer(nn.Module):
                 "seeding the ring needs the sequence length after this chunk; got "
                 "a prefill_tail with no prefill_end_position"
             )
-        query, key, weights, gate_score = self.project_stage(hidden_states, q_latent)
+        query, key, weights, gate_score = self.project_stage(
+            hidden_states, q_latent, query_side=selects or indices_wanted
+        )
 
         if is_decode:
             pooled, new_tail = self.tail_step(tail, key, gate_score, position)
@@ -5068,6 +5128,8 @@ class Glm5NextDSAIndexer(nn.Module):
             # The write stage above has already landed -- the pool row is stored
             # and, on the decode leg, the ring has advanced -- so returning here
             # loses nothing. Below the strict bound there is nothing to select from.
+            if not indices_wanted:
+                return None
             return self._bypass_indices(seq_lens)
 
         candidate_keys = self._gather_candidates(pool_cache, candidates, int(page_size))
@@ -5368,6 +5430,15 @@ class Glm5NextMLAAttention(nn.Module):
     #: double every projection weight in a saved checkpoint.
     PREPARED_WEIGHTS_ATTR = "_prepared_projection_weights"
 
+    #: Attribute the low-precision route's operands are cached on: the four
+    #: projections the per-token path reads, each as the checkpoint stored it
+    #: (fp8-e4m3 bytes with their scale grid, or bf16), contraction-major.
+    #: ``kv_b_proj`` is not among them: only the absorb split reads it.
+    LOWP_WEIGHTS_ATTR = "_prepared_projection_lowp_weights"
+    LOWP_SITES: tuple[str, ...] = (
+        "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "o_proj",
+    )
+
     #: The checkpoint tensors the forward stops reading once
     #: :meth:`prepare_projection_weights` has transposed them: the five
     #: projection weights and the four scale grids of the quantised ones
@@ -5474,7 +5545,16 @@ class Glm5NextMLAAttention(nn.Module):
             )
             prepared[name] = operand
         setattr(self, self.PREPARED_WEIGHTS_ATTR, prepared)
+        setattr(self, self.LOWP_WEIGHTS_ATTR, _lowp_projection_operands(
+            {name: getattr(self, f"{name}_weight", None) for name in self.LOWP_SITES},
+            {name: getattr(self, f"{name}_{FP8_SCALE_SUFFIX}", None)
+             for name in self.LOWP_SITES},
+        ))
         return len(prepared)
+
+    def _lowp_operand(self, name: str):
+        """``(weight, scale)`` for the low-precision route, or None for the fp32 one."""
+        return getattr(self, self.LOWP_WEIGHTS_ATTR, {}).get(name)
 
     def _dequantised_projection_weight(
         self, name: str, weight: torch.Tensor
@@ -5773,15 +5853,19 @@ class Glm5NextMLAAttention(nn.Module):
         ``[tokens, 4096] x [4096, 1536]`` projection per layer per phase. Threading
         the latent into ``attend()`` would change a signature with its own callers.
         """
-        from vllm_neuron.functional.attention.mla_projections import mla_projection
+        from vllm_neuron.functional.attention.mla_projections import (
+            mla_projection_prepared,
+        )
 
-        x = hidden_states.to(torch.float32)
+        x = hidden_states
         if x.ndim != 2 or int(x.shape[1]) != self.hidden_size:
             raise Glm5NextMLADecodeError(
                 f"hidden_states must be [tokens, {self.hidden_size}]; got "
                 f"{tuple(hidden_states.shape)}"
             )
-        q_latent = mla_projection(x, self._prepared_weight("q_a_proj"))
+        q_latent = mla_projection_prepared(
+            x, self._prepared_weight("q_a_proj"), self._lowp_operand("q_a_proj")
+        )
         return self._latent_norm(q_latent, self.q_a_layernorm_weight)
 
     def project_query_and_latent(
@@ -5812,10 +5896,12 @@ class Glm5NextMLAAttention(nn.Module):
         element count, wrong heads, no error, and a head width of 128 the config
         never mentions.
         """
-        from vllm_neuron.functional.attention.mla_projections import mla_projection
+        from vllm_neuron.functional.attention.mla_projections import (
+            mla_projection_prepared,
+        )
 
         widths = {name: (idim, odim) for name, idim, odim in self.projection_widths()}
-        x = hidden_states.to(torch.float32)
+        x = hidden_states
         if x.ndim != 2 or int(x.shape[1]) != self.hidden_size:
             raise Glm5NextMLADecodeError(
                 f"hidden_states must be [tokens, {self.hidden_size}]; got "
@@ -5825,10 +5911,15 @@ class Glm5NextMLAAttention(nn.Module):
         heads = self._heads_per_rank()
 
         q_latent = self.project_query_latent(hidden_states)
-        query = mla_projection(q_latent, self._prepared_weight("q_b_proj"))
+        query = mla_projection_prepared(
+            q_latent, self._prepared_weight("q_b_proj"), self._lowp_operand("q_b_proj")
+        )
         query = query.reshape(tokens, heads, widths["q_b_proj"][1] // heads)
 
-        kv_latent = mla_projection(x, self._prepared_weight("kv_a_proj_with_mqa"))
+        kv_latent = mla_projection_prepared(
+            x, self._prepared_weight("kv_a_proj_with_mqa"),
+            self._lowp_operand("kv_a_proj_with_mqa"),
+        )
         kv_latent = self._latent_norm(kv_latent, self.kv_a_layernorm_weight)
 
         out_dtype = hidden_states.dtype
@@ -5868,11 +5959,14 @@ class Glm5NextMLAAttention(nn.Module):
         input dtype, because rounding each rank's fraction to bfloat16 first and
         adding after would round the parts instead of the whole.
         """
-        from vllm_neuron.functional.attention.mla_projections import mla_projection
+        from vllm_neuron.functional.attention.mla_projections import (
+            mla_projection_prepared,
+        )
 
         heads = self._heads_per_rank()
         expected_width = heads * self.v_head_dim
-        x = attn_out.to(torch.float32)
+        lowp = self._lowp_operand("o_proj")
+        x = attn_out if lowp is not None else attn_out.to(torch.float32)
         if x.ndim == 3:
             x = x.reshape(int(x.shape[0]), -1)
         if x.ndim != 2 or int(x.shape[1]) != expected_width:
@@ -5881,12 +5975,14 @@ class Glm5NextMLAAttention(nn.Module):
                 f"{self.v_head_dim}] or [tokens, {expected_width}]; got "
                 f"{tuple(attn_out.shape)}"
             )
-        projected = mla_projection(x.contiguous(), self._prepared_weight("o_proj"))
+        projected = mla_projection_prepared(
+            x.contiguous(), self._prepared_weight("o_proj"), lowp
+        )
         if collector is not None:
             # The partial is cloned and the input is not. The reduction below writes
             # through its argument, so a tap holding ``projected`` would come back
             # holding the sum instead of this rank's share.
-            collector += [x, projected.clone()]
+            collector += [x.to(torch.float32), projected.clone()]
         # Sum this rank's partial with every other rank's. ``None`` means one
         # rank, where the partial already is the whole sum.
         group = _resolve_tp_group()
@@ -5932,8 +6028,13 @@ class Glm5NextMLAAttention(nn.Module):
         block_table_row: torch.Tensor,
         latent_slots: torch.Tensor,
         page_size: int,
+        dense: bool = False,
     ) -> torch.Tensor:
         """One layer's MLA attention. Returns ``[tokens, hidden_size]``.
+
+        ``dense=True`` is a decode step whose selection keeps every token: the
+        causal prefix ``0 .. start_position`` is attended directly by
+        ``mla_decode_attention`` and ``topk_indices`` is not read (pass None).
 
         ``hidden_states`` is ``[tokens, hidden_size]``: a prefill passes all its
         tokens at once and a decode step passes one. ``latent_cache`` is the whole
@@ -6130,7 +6231,19 @@ class Glm5NextMLAAttention(nn.Module):
                 f"sparse seam contracts {latent}"
             )
 
-        if active_mla_query_rows is None or active_mla_query_rows == tokens:
+        if dense:
+            from vllm_neuron.functional.attention.mla_decode import mla_decode_attention
+
+            if tokens != 1 or prefill_end_position is not None:
+                raise Glm5NextMLADecodeError(
+                    f"the dense route attends one decode token's causal prefix; got "
+                    f"{tokens} token(s), prefill_end_position={prefill_end_position!r}"
+                )
+            attended = mla_decode_attention(
+                q_lift, c_kv, block_table_row.reshape(1, -1), start.reshape(1),
+                written, softmax_scale, page,
+            )
+        elif active_mla_query_rows is None or active_mla_query_rows == tokens:
             attended = mla_sparse_attention(
                 q_lift,
                 c_kv,
@@ -6241,14 +6354,36 @@ class Glm5NextMLAAttention(nn.Module):
         number for both readers -- the indexer's pool pages and the latent bank's
         blocks are one page size, which the runner refuses to let disagree.
         """
+        from vllm_neuron.functional.dsa.decode_bypass import (
+            selection_bound,
+            selection_is_a_no_op,
+        )
+
+        # The decode step whose selection is a no-op attends the causal prefix
+        # densely. The bound is what this graph can prove from its own shapes: the
+        # model length and the window its block table names.
+        bound = selection_bound(
+            int(max_seq_len), int(block_table_row.shape[0]) * int(page_size)
+        )
+        dense = (
+            tail is not None
+            and int(normed_hidden_states.shape[0]) == 1
+            and active_mla_query_rows is None
+            and normed_hidden_states.dtype == latent_cache.dtype
+            and latent_cache.dtype in (torch.bfloat16, torch.float16)
+            and selection_is_a_no_op(
+                bound, self.indexer.index_topk, self.indexer.index_kpool
+            )
+        )
         q_latent = self.project_query_latent(normed_hidden_states)
         topk_indices = self.indexer(
             normed_hidden_states,
             q_latent,
             pool_cache,
             seq_lens,
-            max_seq_len=int(max_seq_len),
+            max_seq_len=bound if dense else int(max_seq_len),
             page_size=int(page_size),
+            indices_wanted=not dense,
             slot_mapping=slot_mapping,
             tail=tail,
             position=position,
@@ -6262,7 +6397,9 @@ class Glm5NextMLAAttention(nn.Module):
                 # The first five rows only, and as the indexer emitted them: a static
                 # slice inside the trace, no cast, so a -1 stays the sentinel it is
                 # rather than becoming a float. A shorter batch yields the rows it has.
-            collector.append(topk_indices[:5])
+            collector.append(
+                (self.indexer._bypass_indices(seq_lens) if dense else topk_indices)[:5]
+            )
         return self.attend(
             normed_hidden_states,
             latent_cache,
@@ -6274,6 +6411,7 @@ class Glm5NextMLAAttention(nn.Module):
             block_table_row=block_table_row,
             latent_slots=latent_slots,
             page_size=int(page_size),
+            dense=dense,
             **(
                 {"active_mla_query_rows": active_mla_query_rows}
                 if active_mla_query_rows is not None else {}
