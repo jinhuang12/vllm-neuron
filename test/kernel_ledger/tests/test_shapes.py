@@ -35,9 +35,11 @@ def _one(point, kernel, kernel_set=None):
     return found[0]["shape"]
 
 
-@pytest.mark.parametrize("b", [1, 4])
-def test_mhc_shapes_match_mhc_micro(b):
-    case = next(c for c in _json("mhc_micro.json")["cases"] if c["B"] == b)
+@pytest.mark.parametrize("fname,b", [("mhc_micro.json", 1), ("mhc_micro.json", 4), ("mhc_micro_mid.json", 8),
+                                     ("mhc_micro_mid.json", 16), ("mhc_micro_mid.json", 32),
+                                     ("mhc_micro_large.json", 64), ("mhc_micro_large.json", 128)])
+def test_mhc_shapes_match_mhc_micro(fname, b):
+    case = next(c for c in _json(fname)["cases"] if c["B"] == b)
     pt = DecodePoint(bs=b, ctx=1024, max_model_len=4096)
     for kernel in ("mhc_sinkhorn_tkg", "mhc_combine_tkg"):
         shape = _one(pt, kernel)

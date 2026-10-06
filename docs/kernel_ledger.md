@@ -45,7 +45,8 @@ gate_*.json  --> [7. tip + gate run] --> [8. gate profile per bucket] --> [9. k,
 2. `models/glm53f/decode.py` builds one decode step at TP=64, EP=16 as a layer
    template. Each node has `layer_count`: the number of times one step runs it.
 3. Each node gives its shapes in the words of its benchmark (`shape_record`).
-4. `readers/micro.py` reads the six `*_micro.json` files. `readers/gate.py` reads the
+4. `readers/micro.py` reads the six `*_micro.json` files and the two mHC batch files
+   (`mhc_micro_mid.json`, `mhc_micro_large.json`). `readers/gate.py` reads the
    `gate_*.json` files, with the profile buckets (`device_step_ms.buckets_ms`).
 5. A node gets a measured time only when its shape record is the same as the shape
    that the benchmark recorded. If a shape changes, the node shows "missing".
@@ -80,12 +81,17 @@ the kernel of the branch.
 - `5938748`: all families use "before".
 - `current`: all families use "after". Exception: the NKI RMSNorm. `dense.md` measures
   it but does not wire it, so the norms use "before".
-- A commit: a family uses "after" when a gate run of its branch has the verdict MERGE
-  and its gated candidate (`gate_sha`) is an ancestor of the commit.
-- Extension: the tree that a gate run measured also uses the family of that run, for
-  all verdicts. The code of the candidate is in that tree. The latest gate run is
-  frequently such a candidate. A BLOCKED or REJECTED candidate does not count for a
-  different commit.
+- A commit with no gate record: a family uses "after" when a gate run of its branch
+  has the verdict MERGE and its gated candidate (`gate_sha`) is an ancestor of the
+  commit.
+- A commit with a gate record (a gate run measured that tree), for all verdicts (MERGE,
+  REJECT, BLOCKED): the ledger uses the kernels of that tree. A family uses "after" when
+  its gated candidate is the commit or an ancestor of the commit, for all verdicts. The
+  latest gate run is frequently such a tree (`gate_mhc.json`, BLOCKED, tree f083375).
+- Team-lead ruling (round 2): the MERGE-only rule applies to `current` and to commits
+  with no gate record. A commit with a gate record uses the kernels of the tree that the
+  gate measured. A BLOCKED or REJECT candidate never counts for a commit with no gate
+  record.
 
 The gate run of a tip is the newest gate run that measured that tree. If there is no
 such run, it is the newest MERGE run of a candidate in the tree.
@@ -115,19 +121,26 @@ PASS when the difference is 15% or less.
 | bucket | reference | expected |
 |---|---|---|
 | mHC | mHC total 16.61 ms | PASS |
-| KDA | conv call span 348 us x 34 + KDA rest 0.64 ms | PASS |
+| KDA | as-built KDA bound 12.3 ms (`attention.md`); two other readings printed | PASS |
 | DSA/MLA | DSA layer span 1254 us x 11 | PASS |
 | lm_head | lm_head GEMV 1.826 + 0.335 ms (seam 5) | PASS |
 | MoE | router call 42.3 us x 42 + MoE glue 3.982 + expert kernel wall 3.17 ms | FAIL |
 | dense | blockwise_fp8_mm 1.705 + norms 0.082 + dense glue 0.129 ms (engine-active) | FAIL |
 | collectives | AR transfer 0.83 + late-rank wait 2.07 ms | FAIL |
 
-For KDA, the breakdown does not decide the scope. It does not split the KDA-layer glue
-(0.975 ms) between the benchmarked region and the KDA projections. The "before" graph
-runs its own glue, so part of the 0.975 ms is in the benchmark scope. The ledger prints
-two cited alternatives with their delta and verdict, and a "scope-dependent verdict"
-line: PASS at 12.30 and 12.47 ms, FAIL at 13.45 ms. The PASS is a scope call for
-team-lead to accept.
+KDA (team-lead ruling, round 2): the verdict uses the as-built KDA bound of the
+breakdown, 12.3 ms (`attention.md`). The ledger also prints the two other readings with
+their delta and verdict. No reference is removed from the output:
+
+| KDA reference | ms | verdict |
+|---|---|---|
+| as-built KDA bound (the verdict) | 12.30 | PASS |
+| layer span without glue: conv span 348 us x 34 + KDA rest | 12.47 | PASS |
+| layer span with the KDA-layer glue | 13.45 | FAIL |
+
+A "scope-dependent verdict" line shows this range. The KDA-layer glue (0.975 ms, ACT and
+DVE) is in-model time that the benchmark does not model. The ledger lists it as an
+"un-modeled" term, and the residual lines state that the residual holds it.
 
 The expected FAIL results have a scope cause. The ledger prints the cause. A benchmark
 median is the wall time of a call in its own graph: it includes the DMA waits of the
@@ -173,15 +186,17 @@ for it in `KERNEL_RULES`.
    gap than the 5938748 kernel.
 3. The roofline uses the TP=64 design graph (vocabulary-parallel lm_head) for all
    kernel sets.
-4. At bs=64 ctx 8192, only the router, the experts and the sampler have benchmarks.
-   The other units show roofline only. No gate run serves this point, so the ledger
+4. At bs=64 ctx 8192, only the mHC kernels, the router, the experts and the sampler
+   have benchmarks (7 of 15 units). The other units show roofline only. No gate run serves this point, so the ledger
    gives no residual and no calibration there.
 5. The collective model is the fastest traced all-reduce. The late-rank waits are in
    the residual of the raw sum.
-6. The reader does not read `mhc_micro_mid.json` and `mhc_micro_large.json`. Thus at
-   bs=64 the mHC rows show "no benchmark", although these files have B=64 records.
-7. A row that matches more than one benchmark case uses the mean of the cases. Its
-   source starts with "mean of N cases" (the DSA "after" layer at bs=1).
+6. A row that matches more than one benchmark case uses the mean of the cases. Its
+   source starts with "mean of N cases". Exception: a case that only repeats another
+   case is not used. The row note shows it as "repeat not used". The DSA
+   `bypass_vs_default_window` case times "before" at the 4096-row window; its "after"
+   repeats the `bypass` case (the dsa.md headline, 286.6 us). See `DSA_REPEATS` in
+   `readers/micro.py`.
 
 ## 10. Files
 

@@ -43,6 +43,14 @@ MICRO_FILES = {
     "sampler": "host_sampler_micro.json",
 }
 
+#: More mHC batches (B=8, 16, 32 and B=64, 128), same method as ``mhc_micro.json``; read if present.
+MHC_BATCH_FILES = ("mhc_micro_mid.json", "mhc_micro_large.json")
+
+
+def mhc_batch_files(reports_dir: Path = REPORTS_DIR) -> List[str]:
+    return [f for f in MHC_BATCH_FILES if (Path(reports_dir) / f).is_file()]
+
+
 #: Shape fields that identify a measured config, per kernel (KernelName values).
 MATCH_KEYS: Dict[str, Tuple[str, ...]] = {
     "mhc_sinkhorn_tkg": ("B", "hidden", "streams", "iters"),
@@ -83,22 +91,25 @@ def parse_carrier(text: str, batch: int) -> Dict:
 
 
 class _Collector:
-    """Gathers samples per ``(config_name, variant)``; duplicates are averaged."""
+    """Gathers samples per ``(config_name, variant)``. Cases of one config are averaged,
+    except cases marked ``repeat``: those are kept in ``repeats`` and not used (unless no
+    other case exists)."""
 
     def __init__(self):
         self._rows: Dict[Tuple[str, str], List[dict]] = defaultdict(list)
 
     def add(self, kernel: str, variant: str, record: Dict, median: float, *, p90: Optional[float],
-            iterations: Optional[int], source: str, location: str = "device", points=None):
+            iterations: Optional[int], source: str, location: str = "device", points=None, repeat: bool = False):
         name = config_name(kernel, record)
         self._rows[(name, variant)].append(dict(
             kernel=kernel, record=record, median=median, p90=p90, iterations=iterations,
-            source=source, location=location, points=points,
+            source=source, location=location, points=points, repeat=repeat,
         ))
 
     def results(self) -> Dict[Tuple[str, str], KernelResult]:
         out = {}
-        for (name, variant), rows in self._rows.items():
+        for (name, variant), all_rows in self._rows.items():
+            rows = [r for r in all_rows if not r["repeat"]] or all_rows
             first = rows[0]
             if any(r["location"] != first["location"] for r in rows):
                 raise ValueError(f"{name}/{variant}: cases disagree on location")
@@ -116,6 +127,7 @@ class _Collector:
                 record=first["record"],
                 points=first["points"],
                 sources=tuple(r["source"] for r in rows),
+                repeats=tuple((r["source"], r["median"]) for r in all_rows if r not in rows),
             )
         return out
 
@@ -151,6 +163,13 @@ def _read_kda(path: Path, c: _Collector):
                   iterations=its.get(v), source=f"{path.name}#summary/{key}/L{layers}")
 
 
+#: (case, variant) of the DSA layer table that repeat another case at the same config. The
+#: bypass_vs_default_window case times "before" at the 5938748 window (4096 rows); its
+#: "after" (2048 rows) repeats the "bypass" case, the one dsa.md uses for its headline
+#: (286.6 us) and its savings.
+DSA_REPEATS = {("bypass_vs_default_window", "after")}
+
+
 def _read_dsa(path: Path, c: _Collector):
     for case in json.loads(path.read_text())["cases"]:
         if case.get("table") != "layer":
@@ -160,7 +179,8 @@ def _read_dsa(path: Path, c: _Collector):
                    "window_rows": case["window_rows"][v]}
             med, p90, its = _stat(case[v])
             c.add("dsa_mla_layer_tkg", v, rec, med, p90=p90, iterations=its,
-                  source=f"{path.name}#layer/{case['case']}/B{case['batch']}")
+                  source=f"{path.name}#layer/{case['case']}/B{case['batch']}",
+                  repeat=(case["case"], v) in DSA_REPEATS)
 
 
 def _read_moe(path: Path, c: _Collector):
@@ -241,4 +261,6 @@ def load_micro_results(reports_dir: Path = REPORTS_DIR) -> Dict[Tuple[str, str],
         path = reports_dir / fname
         if path.is_file():
             _READERS[family](path, c)
+    for fname in mhc_batch_files(reports_dir):
+        _read_mhc(reports_dir / fname, c)
     return c.results()

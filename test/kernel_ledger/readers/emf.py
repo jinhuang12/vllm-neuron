@@ -47,3 +47,5 @@ class KernelResult:
     record: Dict = field(default_factory=dict, compare=False, hash=False)
     points: Optional[Tuple[Tuple[int, float], ...]] = None
     sources: Tuple[str, ...] = ()
+    #: other cases at the same config that repeat a measurement: (source, median us); not used
+    repeats: Tuple[Tuple[str, float], ...] = ()

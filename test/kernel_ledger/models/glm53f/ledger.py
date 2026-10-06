@@ -184,6 +184,7 @@ def _measure(node: KernelNode, ks: KernelSet, results: Dict[Tuple[str, str], Ker
         notes.insert(0, f"window {record['window_rows']} rows")
     if hit is None:
         return None, None, variant, "; ".join(notes)
+    notes += [f"repeat not used: {src} {us:.2f} us" for src, us in hit.repeats]
     return hit.latency_us, hit, variant, "; ".join(notes)
 
 

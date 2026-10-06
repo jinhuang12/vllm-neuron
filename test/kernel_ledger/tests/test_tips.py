@@ -100,3 +100,20 @@ def test_a_non_merged_candidate_does_not_count_below_its_own_tree(gate_dir, tmp_
     gates = read_gates(tmp_path)
     assert "dsa" not in resolve_tip("594d425", gates).kernel_set.after
     assert "dsa" in resolve_tip(host_sha, gates).kernel_set.after
+
+
+def test_a_gated_tree_runs_every_candidate_in_it_whatever_the_verdict(gate_dir, tmp_path):
+    # team-lead ruling, round 2: a sha with a gate record of any verdict uses the kernels of the
+    # tree that gate measured; the MERGE-only ancestry rule is for "current" and ungated shas
+    for f in gate_dir.iterdir():
+        shutil.copy2(f, tmp_path / f.name)
+    host_sha = resolve_tip("594d425", read_gates(gate_dir)).gate.gate_sha  # 2fd8161, below f083375
+    (tmp_path / "gate_dsa.json").write_text(json.dumps(
+        {"name": "dsa", "verdict": "REJECT", "gate_sha": host_sha,
+         "after": {"device_step_ms": {"mean": 70.0}, "environment": {"head": host_sha}}}))
+    (tmp_path / "gate_mhc.json").write_text(json.dumps(
+        {"name": "mhc", "verdict": "BLOCKED", "gate_sha": MHC_CANDIDATE,
+         "after": {"device_step_ms": {"mean": 60.0}, "environment": {"head": MHC_CANDIDATE}}}))
+    gates = read_gates(tmp_path)
+    assert resolve_tip(MHC_CANDIDATE[:7], gates).kernel_set.after == frozenset({"host", "mhc", "dsa"})
+    assert resolve_tip("594d425", gates).kernel_set.after == frozenset({"host"})  # no gate record of its own

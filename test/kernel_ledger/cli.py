@@ -24,7 +24,7 @@ from .models.glm53f.references import GATE_BASELINE_LABEL, RECONCILED, REFERENCE
 from .models.glm53f.shapes import emit_shapes
 from .models.glm53f.tips import Tip, resolve_tip
 from .readers.gate import GateStep, read_gates
-from .readers.micro import MICRO_FILES, REPORTS_DIR, load_micro_results, missing_micro_files
+from .readers.micro import MICRO_FILES, REPORTS_DIR, load_micro_results, mhc_batch_files, missing_micro_files
 
 #: The point every gate run serves: one request, context about 1k, max_model_len 4096.
 GATE_POINT = BS1_CTX1K
@@ -119,6 +119,8 @@ def reconciliation(led: Ledger, cal: Optional[Calibration]) -> Dict:
                               "verdict": _verdict(_pct(got, a.ms)),
                               "terms": [{"ms": t.ms, "label": t.label, "file": t.file.name} for t in a.terms]}
                              for a in ref.alternatives],
+            "unmodeled": [{"ms": t.ms, "label": t.label, "file": t.file.name} for t in ref.unmodeled],
+            "unmodeled_ms": ref.unmodeled_ms,
         })
     return {"tolerance_pct": TOLERANCE * 100, "rows": rows}
 
@@ -151,6 +153,8 @@ def reconciliation_table(rec: Dict) -> List[str]:
         for a in r["alternatives"]:
             out.append(f"    alternative reference: {a['reference_ms']:.2f} ms {a['label']}: {a['delta_pct']:+.1f}% "
                        f"{a['verdict']}")
+        for t in r["unmodeled"]:
+            out.append(f"    un-modeled (lands in the residual): {t['ms']:.3f} ms {t['label']} ({t['file']})")
         if r["verdict"] == "FAIL":
             out.append(f"    FAIL cause: {r['cause']}")
         if r["note"]:
@@ -177,7 +181,8 @@ def profile_table(led: Ledger, cal: Calibration, gate: GateStep) -> List[str]:
     return out
 
 
-def residual_lines(steps: List[tuple], calibrated: Optional[float], raw: float, led: Ledger) -> List[str]:
+def residual_lines(steps: List[tuple], calibrated: Optional[float], raw: float, led: Ledger,
+                   rec: Optional[Dict] = None) -> List[str]:
     out = []
     for label, step in steps:
         line = f"  {label}: step {step:.2f} ms -> "
@@ -187,6 +192,10 @@ def residual_lines(steps: List[tuple], calibrated: Optional[float], raw: float, 
         out.append(line)
     out.append(f"  residual = compiler glue (roofline of the unmeasured ops alone: {led.unmeasured_roofline_ms:.2f} ms), "
                "waits between kernels, launch skew")
+    terms = [(r["bucket"], t) for r in (rec or {}).get("rows", ()) for t in r["unmodeled"]]
+    if terms:
+        out.append(f"  residual holds the listed un-modeled in-model terms: {sum(t['ms'] for _, t in terms):.3f} ms ("
+                   + "; ".join(f"{b}: {t['label']} {t['ms']:.3f}" for b, t in terms) + ")")
     if not led.complete:
         out.append(f"  the sum is partial: the residual also holds {', '.join(led.missing)} (no benchmark at this shape)")
     return out
@@ -204,7 +213,8 @@ def run(tip_name: str, point: DecodePoint, reports_dir: Path = REPORTS_DIR,
              f"| TP=64 EP=16, one rank",
              _kernel_set_line(tip),
              f"reports: {reports_dir} ({len(MICRO_FILES) - len(missing_micro_files(reports_dir))} of {len(MICRO_FILES)} "
-             f"microbenchmark files; missing: {', '.join(missing_micro_files(reports_dir)) or 'none'})",
+             f"microbenchmark files; missing: {', '.join(missing_micro_files(reports_dir)) or 'none'})"
+             + (f" + mHC batch files: {', '.join(mhc_batch_files(reports_dir))}" if mhc_batch_files(reports_dir) else ""),
              ""]
     lines += node_table(led) + [""] + bucket_table(led, cal) + [""]
     doc = {"tip": tip.name, "sha": tip.sha, "kernel_set": {"name": tip.kernel_set.name,
@@ -276,7 +286,7 @@ def run(tip_name: str, point: DecodePoint, reports_dir: Path = REPORTS_DIR,
                 lines.append(f"  {pred[k]:.2f} ms with {labels[k]}: {res[k]:.2f} ms")
         doc["residual_ms"], doc["predicted_step_ms"] = res, pred
     else:
-        steps = []
+        steps, rec = [], None
         if not tip.kernel_set.after and tip.sha and tip.sha.startswith("5938748"):
             steps.append((f"{STEP_5938748.label} (DECODE_BREAKDOWN.md)", STEP_5938748.ms))
             rec = reconciliation(led, cal)
@@ -290,7 +300,7 @@ def run(tip_name: str, point: DecodePoint, reports_dir: Path = REPORTS_DIR,
                 lines += [""] + profile_table(led, cal, tip.gate)
         if steps:
             lines += ["", "measured device step vs sum of measured kernels + collectives:"]
-            lines += residual_lines(steps, cal_sum, led.measured_ms, led)
+            lines += residual_lines(steps, cal_sum, led.measured_ms, led, rec)
             doc["residual_ms"] = {label: step - cal_sum for label, step in steps}
             doc["residual_raw_ms"] = {label: step - led.measured_ms for label, step in steps}
         else:

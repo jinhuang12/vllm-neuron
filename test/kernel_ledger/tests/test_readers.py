@@ -59,10 +59,12 @@ def test_dsa_reader_keys_each_variant_by_its_window(results):
     common = dict(batch=1, ctx=1024, max_seq_len=4096)
     served = _get(results, "dsa_mla_layer_tkg", "before", window_rows=4096, **common)
     assert served.latency_us == pytest.approx(1160.477409090909)
-    # two cases time the after code at window 2048: their medians are averaged
+    # two cases time the after code at window 2048: the bypass case is the value (the dsa.md
+    # headline); the bypass_vs_default_window case repeats it and is kept as a repeat only
     after = _get(results, "dsa_mla_layer_tkg", "after", window_rows=2048, **common)
-    assert after.latency_us == pytest.approx((286.63827272727275 + 301.07877272727274) / 2)
-    assert len(after.sources) == 2
+    assert after.latency_us == pytest.approx(286.63827272727275)
+    assert after.sources == ("dsa_micro.json#layer/bypass/B1",)
+    assert after.repeats == (("dsa_micro.json#layer/bypass_vs_default_window/B1", pytest.approx(301.07877272727274)),)
     bucketed = _get(results, "dsa_mla_layer_tkg", "before", window_rows=2048, **common)
     assert bucketed.latency_us == pytest.approx(1112.3295)
 
@@ -135,3 +137,22 @@ def test_gate_profile_values():
     kv = read_gate_step(REPORTS_DIR / "gate_kv.json")
     assert base.buckets_ms["mhc/hyper_connection.py"] == pytest.approx(9.658, abs=1e-3)
     assert kv.buckets_ms["wait: collective"] == pytest.approx(2.9534285714285713)
+
+
+def test_cases_of_one_config_are_averaged_unless_marked_as_repeats():
+    from test.kernel_ledger.readers.micro import _Collector
+    rec = dict(B=1, hidden=4096, streams=4, iters=20)
+    c = _Collector()
+    c.add("mhc_sinkhorn_tkg", "after", rec, 10.0, p90=None, iterations=5, source="a#1")
+    c.add("mhc_sinkhorn_tkg", "after", rec, 20.0, p90=None, iterations=5, source="b#1")
+    c.add("mhc_sinkhorn_tkg", "after", rec, 99.0, p90=None, iterations=5, source="c#1", repeat=True)
+    (hit,) = c.results().values()
+    assert hit.latency_us == 15.0 and hit.sources == ("a#1", "b#1") and hit.repeats == (("c#1", 99.0),)
+
+
+def test_mhc_batch_files_are_read(results):
+    rec = dict(hidden=4096, streams=4, iters=20)
+    for b, f in ((8, "mhc_micro_mid.json"), (32, "mhc_micro_mid.json"), (64, "mhc_micro_large.json")):
+        hit = _get(results, "mhc_sinkhorn_tkg", "after", B=b, **rec)
+        assert hit.sources == (f"{f}#B{b}/sinkhorn",)
+    assert _get(results, "mhc_sinkhorn_tkg", "before", B=64, **rec).latency_us == pytest.approx(124.18975)

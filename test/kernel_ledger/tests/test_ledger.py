@@ -37,11 +37,19 @@ def test_interpolation_is_linear_inside_and_nearest_within_half_a_hit():
     assert interpolate_points(pts, 3.0) is None
 
 
-def test_a_row_from_several_benchmark_cases_says_it_is_their_mean(cur):
-    # da-2 round 1 note 4: the DSA "after" row at bs=1 averages two layer cases
+def test_a_repeat_case_is_shown_but_not_used(cur):
+    # team-lead round 2: no duplicate averaging for DSA; the repeat stays visible in the note
     row = cur.row("mla_sparse")
-    assert row.source.startswith("mean of 2 cases: dsa_micro.json#layer/bypass/B1 + ")
-    assert not cur.row("kda_step").source.startswith("mean of")
+    assert row.source == "dsa_micro.json#layer/bypass/B1"
+    assert row.measured_us == pytest.approx(286.63827272727275)
+    assert "repeat not used: dsa_micro.json#layer/bypass_vs_default_window/B1 301.08 us" in row.note
+
+
+def test_a_row_from_several_cases_says_it_is_their_mean():
+    from test.kernel_ledger.models.glm53f.ledger import _sources
+    from test.kernel_ledger.readers.emf import KernelResult
+    hit = KernelResult(config_name="x", kernel_api="k", latency_us=1.0, test_name="a", sources=("a#1", "b#1"))
+    assert _sources(hit) == "mean of 2 cases: a#1 + b#1"
 
 
 def test_kernel_set_variants():
@@ -60,7 +68,7 @@ def test_mhc_bucket_is_ninety_sinkhorns_plus_ninety_combines(base):
 def test_kda_and_dsa_rows_take_their_kernel_set_window(base, cur):
     assert base.row("kda_step").measured_us == pytest.approx(324.09398529411766)
     assert base.row("mla_sparse").measured_us == pytest.approx(1160.477409090909)  # served 4096-row window
-    assert cur.row("mla_sparse").measured_us == pytest.approx((286.63827272727275 + 301.07877272727274) / 2)
+    assert cur.row("mla_sparse").measured_us == pytest.approx(286.63827272727275)  # the bypass case; its repeat is not used
     assert cur.row("mla_sparse").layer_count == 11
 
 
@@ -143,6 +151,9 @@ def test_bs64_point_is_roofline_for_every_node_with_the_expert_term(results):
     assert led.row("mla_sparse").measured_us is None and led.row("mla_sparse").kind == "missing"
     assert not led.complete and "mla_sparse" in led.missing
     assert led.row("dsa_indexer").note.startswith("selected")
+    # mhc_micro_large.json has B=64: the four mHC rows are measured
+    for n in ("mhc_pre_attn_sinkhorn", "mhc_post_attn", "mhc_pre_mlp_sinkhorn", "mhc_post_mlp"):
+        assert led.row(n).kind == "measured" and led.row(n).source.startswith("mhc_micro_large.json#B64/"), n
 
 
 def test_roofline_total_equals_the_ported_engine_rollup(cur):

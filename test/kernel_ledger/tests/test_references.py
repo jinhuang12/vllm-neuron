@@ -9,7 +9,7 @@ from test.kernel_ledger.models.glm53f.decode import BUCKETS
 from test.kernel_ledger.models.glm53f.references import RECONCILED, REFERENCES, STEP_5938748
 
 _TERMS = [STEP_5938748] + [t for r in REFERENCES.values() for t in r.reference + r.engine_active + r.evidence
-                            + tuple(x for a in r.alternatives for x in a.terms)]
+                            + tuple(x for a in r.alternatives for x in a.terms) + r.unmodeled]
 
 
 @pytest.mark.parametrize("term", _TERMS, ids=lambda t: t.label[:40])
@@ -32,7 +32,7 @@ def test_expected_failures_carry_their_cause():
 
 def test_reference_sums():
     assert REFERENCES["mHC"].reference_ms == pytest.approx(16.61)
-    assert REFERENCES["KDA"].reference_ms == pytest.approx(11.832 + 0.64)
+    assert REFERENCES["KDA"].reference_ms == pytest.approx(12.3)  # the breakdown's as-built KDA bound
     assert REFERENCES["KDA"].engine_active_ms == pytest.approx(5.47)
     assert REFERENCES["DSA/MLA"].reference_ms == pytest.approx(13.794)
     assert REFERENCES["MoE"].reference_ms == pytest.approx(1.7766 + 3.982 + 3.17)
@@ -41,8 +41,10 @@ def test_reference_sums():
     assert REFERENCES["collectives"].reference_ms == pytest.approx(2.90)
 
 
-def test_kda_alternatives_span_the_glue_scope():
-    # the breakdown does not split the 0.975 ms KDA-layer glue; both ends are cited
-    alts = REFERENCES["KDA"].alternatives
-    assert [round(a.ms, 3) for a in alts] == [12.3, 13.447]
-    assert all(not r.alternatives for b, r in REFERENCES.items() if b != "KDA")
+def test_kda_is_judged_on_the_breakdown_bound_and_keeps_every_other_reading():
+    # team-lead ruling, round 2: PASS/FAIL against the 12.3 ms bound; no reference is dropped;
+    # the 0.975 ms KDA-layer glue is an un-modeled term that lands in the residual
+    kda = REFERENCES["KDA"]
+    assert [round(a.ms, 3) for a in kda.alternatives] == [12.472, 13.447]
+    assert [(t.ms, t.label) for t in kda.unmodeled] == [(0.975, "KDA-layer glue (ACT, DVE)")]
+    assert all(not r.alternatives and not r.unmodeled for b, r in REFERENCES.items() if b != "KDA")

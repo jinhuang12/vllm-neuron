@@ -48,13 +48,17 @@ def test_kda_verdict_prints_its_scope_range(base_run):
     # da-2 round 1 #1: the KDA PASS depends on how much KDA-layer glue is in scope
     out, doc = base_run
     kda = next(r for r in doc["reconciliation"]["rows"] if r["bucket"] == "KDA")
+    assert (round(kda["reference_ms"], 2), round(kda["delta_pct"], 1), kda["verdict"]) == (12.3, -10.4, "PASS")
     alts = {round(a["reference_ms"], 2): a["verdict"] for a in kda["alternatives"]}
-    assert alts == {12.3: "PASS", 13.45: "FAIL"}
+    assert alts == {12.47: "PASS", 13.45: "FAIL"}
     assert all(abs(a["delta_pct"] - (kda["ledger_ms"] / a["reference_ms"] - 1) * 100) < 1e-9
                for a in kda["alternatives"])
     assert re.search(r"alternative reference: 13\.45 ms .*: -18\.1% FAIL", out)
     assert "scope-dependent verdict: KDA (PASS at 12.30, 12.47 ms; FAIL at 13.45 ms)" in out
-    assert "scope call" in kda["note"]
+    assert "un-modeled (lands in the residual): 0.975 ms KDA-layer glue (ACT, DVE) (DECODE_BREAKDOWN.md)" in out
+    assert kda["unmodeled_ms"] == pytest.approx(0.975)
+    # the residual lines name it
+    assert re.search(r"residual holds the listed un-modeled in-model terms: 0\.975 ms \(KDA: KDA-layer glue", out)
 
 
 def test_5938748_residual_against_both_steps_with_labels(base_run):
@@ -109,7 +113,8 @@ def test_bs64_prints_a_roofline_row_for_every_node_with_the_expert_term(tmp_path
         assert re.search(rf"^{re.escape(row['node'])}\s", table, re.M), row["node"]
         assert row["roofline_us"] > 0
     assert "E[distinct local]=15.03 of 18" in out
-    assert "PARTIAL" in out and "no gate run serves bs=64 ctx=8192" in out
+    assert "PARTIAL: 7 of 15 measured units" in out and "no gate run serves bs=64 ctx=8192" in out
+    assert "+ mHC batch files: mhc_micro_mid.json, mhc_micro_large.json" in out
 
 
 def test_emit_shapes_writes_the_file(tmp_path, capsys):
