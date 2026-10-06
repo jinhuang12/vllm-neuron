@@ -188,6 +188,10 @@ _SEAM_REGISTRY = {
     "dense_rms_norm": (
         "vllm_neuron.functional.norm",
         "norm_dispatch_counters", "reset_norm_dispatch_counters"),
+    "dsa_decode_batch": (
+        "vllm_neuron.functional.dsa.decode_batch",
+        "decode_batch_dispatch_counters",
+        "reset_decode_batch_dispatch_counters"),
 }
 _SEAMS = tuple(_SEAM_REGISTRY)
 
