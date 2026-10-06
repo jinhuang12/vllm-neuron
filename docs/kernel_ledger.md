@@ -37,8 +37,8 @@ Options:
 ```
 config.json --> [1. arch] --> [2. decode graph] --> [3. shapes per node] --> ledger_shapes.json
                                      |                      |
-*_micro.json --> [4. readers] --> [5. match by shape and kernel set] --> [6. rollup per bucket]
-gate_*.json  --> [7. tip: kernel set + gate step] ------------------------------> [8. residual]
+*_micro.json --> [4. readers] --> [5. match by shape and kernel set] --> [6. raw rollup per bucket]
+gate_*.json  --> [7. tip + gate run] --> [8. gate profile per bucket] --> [9. k, calibrated] --> [10. residual]
 ```
 
 1. `models/glm53f/arch.py` reads the checkpoint `config.json`.
@@ -46,17 +46,20 @@ gate_*.json  --> [7. tip: kernel set + gate step] ------------------------------
    template. Each node has `layer_count`: the number of times one step runs it.
 3. Each node gives its shapes in the words of its benchmark (`shape_record`).
 4. `readers/micro.py` reads the six `*_micro.json` files. `readers/gate.py` reads the
-   `gate_*.json` files.
+   `gate_*.json` files, with the profile buckets (`device_step_ms.buckets_ms`).
 5. A node gets a measured time only when its shape record is the same as the shape
    that the benchmark recorded. If a shape changes, the node shows "missing".
-6. `models/glm53f/ledger.py` adds the times per bucket.
+6. `models/glm53f/ledger.py` adds the raw benchmark times per bucket.
 7. `models/glm53f/tips.py` finds the kernels in the tree of a tip and the gate run of
    that tree.
-8. Residual = gate device step - (sum of measured kernels + collectives).
+8. `models/glm53f/profile.py` maps the gate profile onto the ledger buckets.
+9. `models/glm53f/calibration.py` calculates k per bucket and the calibrated column.
+10. Residual = gate device step - calibrated sum. The ledger also shows the residual
+    against the raw sum.
 
 ## 3. Node kinds
 
-| kind | meaning | time in the sum |
+| kind | meaning | time in the raw sum |
 |---|---|---|
 | measured | a benchmark exists at this shape | the benchmark median x count |
 | missing | the node has a benchmark kernel, but not at this shape | none (roofline only) |
@@ -77,9 +80,12 @@ the kernel of the branch.
 - `5938748`: all families use "before".
 - `current`: all families use "after". Exception: the NKI RMSNorm. `dense.md` measures
   it but does not wire it, so the norms use "before".
-- A commit: a family uses "after" when a gate run of its branch gated a candidate that
-  is an ancestor of the commit. The verdict does not change this. Ancestry shows that
-  the code of the candidate is in the tree.
+- A commit: a family uses "after" when a gate run of its branch has the verdict MERGE
+  and its gated candidate (`gate_sha`) is an ancestor of the commit.
+- Extension: the tree that a gate run measured also uses the family of that run, for
+  all verdicts. The code of the candidate is in that tree. The latest gate run is
+  frequently such a candidate. A BLOCKED or REJECTED candidate does not count for a
+  different commit.
 
 The gate run of a tip is the newest gate run that measured that tree. If there is no
 such run, it is the newest MERGE run of a candidate in the tree.
@@ -101,40 +107,82 @@ such run, it is the newest MERGE run of a candidate in the tree.
 
 ## 6. Reconciliation (5938748 only)
 
-At `--tip 5938748 --bs 1 --ctx 1024`, the ledger compares each bucket with two
-references from the wave-1 breakdown (`models/glm53f/references.py`):
+At `--tip 5938748 --bs 1 --ctx 1024`, the ledger compares the raw sum of each bucket
+with one same-scope in-model reference (`models/glm53f/references.py`). The reference
+is a wall time (call span, kernel wall) when the breakdown gives one. The result is
+PASS when the difference is 15% or less.
 
-- as-built: the DECODE_BREAKDOWN.md master-table rows for the same work. These are
-  engine-active times. The waits are a different bucket in that report.
-- in-model wall: the wall time of the same work in the model (call spans, kernel wall),
-  if the breakdown gives one.
+| bucket | reference | expected |
+|---|---|---|
+| mHC | mHC total 16.61 ms | PASS |
+| KDA | conv call span 348 us x 34 + KDA rest 0.64 ms | PASS |
+| DSA/MLA | DSA layer span 1254 us x 11 | PASS |
+| lm_head | lm_head GEMV 1.826 + 0.335 ms (seam 5) | PASS |
+| MoE | router call 42.3 us x 42 + MoE glue 3.982 + expert kernel wall 3.17 ms | FAIL |
+| dense | blockwise_fp8_mm 1.705 + norms 0.082 + dense glue 0.129 ms (engine-active) | FAIL |
+| collectives | AR transfer 0.83 + late-rank wait 2.07 ms | FAIL |
 
-A benchmark median is a wall time of a kernel in its own graph. Thus the in-model wall
-is the better reference. A test makes sure that each cited text is in its source file.
+The expected FAIL results have a scope cause. The ledger prints the cause. A benchmark
+median is the wall time of a call in its own graph: it includes the DMA waits of the
+call and its standalone glue. The DECODE_BREAKDOWN master table gives engine-active
+time. A test makes sure that each cited text is in its source file.
 
-## 7. Limits
+## 7. Calibrated column (PREDICTOR, not a test)
+
+```
+k_bucket          = in-model ms at 5938748 / raw ms at 5938748
+calibrated_bucket = k_bucket x raw ms of the kernel set
+```
+
+The in-model value is the bucket in the profile of the 5938748 gate run
+(`gate_baseline.json`). If the profile does not name the bucket, the ledger uses the
+breakdown reference (lm_head). For a bucket with no in-model value (sampler,
+embed/tail), k is 1.
+
+The sum line of the ledger uses the calibrated column. The ledger also prints the raw
+sum, so the scope gap is visible.
+
+k moves the scope gap of the 5938748 kernel to its wave-1 replacement. This is an
+assumption. For each gated tree, the ledger prints the measured profile of the gate
+run next to the calibrated value. Use this table to check the assumption for each
+merge.
+
+## 8. Gate profile mapping
+
+`gate/attribute_decode.py` divides the rank-0 device step into engine-active ms per
+kernel source file, plus wait, DMA-issue, idle and unnamed compiler-op buckets.
+`models/glm53f/profile.py` maps a source file to a ledger bucket by its path prefix
+(`mhc/`, `kda/`, `dsa/`, `attention/mla_`, `moe/`, ...). The router RMSNorm files
+(`nkilib/core/subkernels/{rmsnorm_tkg,norm_tkg_utils}.py`) go to MoE. The lm_head GEMV
+is an unnamed compiler op, so the profile has no lm_head value. If a new kernel source
+has no rule, the ledger shows it as UNMAPPED and keeps it in the residual. Add a rule
+for it in `KERNEL_RULES`.
+
+## 9. Limits
 
 1. A benchmark times a kernel in its own graph. In the model, the kernel waits for
-   other cores, DMA queues and ranks. Thus the measured sum is not the device step.
-2. The roofline uses the TP=64 design graph (vocabulary-parallel lm_head) for all
+   other cores, DMA queues and ranks. Thus the raw sum is not the device step.
+2. The calibrated column is a predictor. A wave-1 kernel can have a different scope
+   gap than the 5938748 kernel.
+3. The roofline uses the TP=64 design graph (vocabulary-parallel lm_head) for all
    kernel sets.
-3. At bs=64 ctx 8192, only the router, the experts and the sampler have benchmarks.
+4. At bs=64 ctx 8192, only the router, the experts and the sampler have benchmarks.
    The other units show roofline only. No gate run serves this point, so the ledger
-   gives no residual there.
-4. The collective model is the fastest traced all-reduce. The late-rank waits are in
-   the residual.
+   gives no residual and no calibration there.
+5. The collective model is the fastest traced all-reduce. The late-rank waits are in
+   the residual of the raw sum.
 
-## 8. Files
+## 10. Files
 
 | path | origin |
 |---|---|
 | `engine/node.py`, `engine/graph.py` | ported from `model_config_gen/engine` (Apache header kept) |
 | `engine/collectives.py`, `readers/emf.py` | ported interface from `kernel_to_model_benchmarking` |
 | `engine/decode_nodes.py` | new: GLM decode node types |
-| `models/glm53f/*.py` | new: architecture, graph, shapes, ledger, references, tips |
+| `models/glm53f/*.py` | new: architecture, graph, shapes, ledger, references, tips, profile, calibration |
 | `readers/micro.py`, `readers/gate.py` | new: benchmark and gate readers |
 | `cli.py`, `__main__.py` | new: the command line |
-| `tests/` | new: engine, nodes, graph, readers, shapes, ledger, references, tips, CLI |
+| `tests/` | new: one test file per module |
 
 To add a benchmark family:
 
@@ -143,3 +191,5 @@ To add a benchmark family:
 3. Give the node a `shape_record()` with the same keys.
 4. Add a test in `tests/test_shapes.py` that compares the emitted shape with the
    benchmark JSON.
+5. If the gate profile shows the new kernel source as UNMAPPED, add a rule to
+   `KERNEL_RULES` (`models/glm53f/profile.py`).
