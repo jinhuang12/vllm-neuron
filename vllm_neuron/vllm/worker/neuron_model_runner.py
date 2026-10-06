@@ -5019,10 +5019,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         masking them: the layer already repeats the last real latent into those rows,
         so writing the same value to the same slot again changes nothing, while a
         sentinel would need a masked write an indexed copy cannot express.
-        ``padded_rows`` are whole rows past the batch's requests; they get
-        ``PAD_SLOT_ID`` rather than ``NULL_BLOCK_ID``, because the latter is zero,
-        which is a real slot (block 0, offset 0), and a padded decode row's latent
-        would land in a slot a live request can own.
+        ``padded_rows`` appends that many ``PAD_SLOT_ID`` (-1) entries, a value no bank
+        row has. No carrier builder passes it. The batch carrier
+        (``_glm5next_sparse_batch_carrier``) hands each padding request a ``rows``
+        entry of ``[NULL_BLOCK_ID]`` and start 0 instead, so a padding row's latent
+        lands in slot 0 (block 0, offset 0). Block 0 is vLLM's reserved null block
+        (``BlockPool.null_block``), which the allocator never gives to a request, and
+        it is the runner's own target for padding writes (padded ``slot_mapping``
+        entries are ``NULL_BLOCK_ID``). So that write reaches no live request's latent.
         """
         slots: list[int] = []
         table = [list(row) for row in rows]
