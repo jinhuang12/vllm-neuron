@@ -95,6 +95,10 @@ def bucket_table(led: Ledger, cal: Optional[Calibration]) -> List[str]:
     return out
 
 
+def _verdict(delta_pct: float) -> str:
+    return "PASS" if abs(delta_pct) <= TOLERANCE * 100 else "FAIL"
+
+
 def reconciliation(led: Ledger, cal: Optional[Calibration]) -> Dict:
     buckets = led.buckets()
     rows = []
@@ -102,7 +106,7 @@ def reconciliation(led: Ledger, cal: Optional[Calibration]) -> Dict:
         ref = REFERENCES[b]
         got = buckets[b].measured_ms
         delta = _pct(got, ref.reference_ms)
-        verdict = "PASS" if abs(delta) <= TOLERANCE * 100 else "FAIL"
+        verdict = _verdict(delta)
         rows.append({
             "bucket": b, "ledger_ms": got, "scope": ref.scope,
             "reference_ms": ref.reference_ms, "reference_kind": ref.reference_kind, "delta_pct": delta,
@@ -111,6 +115,10 @@ def reconciliation(led: Ledger, cal: Optional[Calibration]) -> Dict:
             "k": cal.k.get(b) if cal else None, "k_source": cal.source.get(b) if cal else None,
             "reference_terms": [{"ms": t.ms, "label": t.label, "file": t.file.name} for t in ref.reference],
             "engine_active_terms": [{"ms": t.ms, "label": t.label, "file": t.file.name} for t in ref.engine_active],
+            "alternatives": [{"label": a.label, "reference_ms": a.ms, "delta_pct": _pct(got, a.ms),
+                              "verdict": _verdict(_pct(got, a.ms)),
+                              "terms": [{"ms": t.ms, "label": t.label, "file": t.file.name} for t in a.terms]}
+                             for a in ref.alternatives],
         })
     return {"tolerance_pct": TOLERANCE * 100, "rows": rows}
 
@@ -128,12 +136,21 @@ def reconciliation_table(rec: Dict) -> List[str]:
     unexpected = [r["bucket"] for r in rec["rows"] if r["verdict"] != r["expected"]]
     out.append(f"PASS {n} of {len(rec['rows'])}; "
                + (f"UNEXPECTED: {', '.join(unexpected)}" if unexpected else "every verdict as expected"))
+    for r in rec["rows"]:
+        readings = [(r["reference_ms"], r["verdict"])] + [(a["reference_ms"], a["verdict"]) for a in r["alternatives"]]
+        if len({v for _, v in readings}) > 1:
+            by = {v: ", ".join(f"{ms:.2f}" for ms, vv in sorted(readings) if vv == v) for v in ("PASS", "FAIL")}
+            out.append(f"scope-dependent verdict: {r['bucket']} (PASS at {by['PASS']} ms; FAIL at {by['FAIL']} ms); "
+                       "see its alternatives below")
     out.append("reference = same-scope in-model time (wall where the breakdown gives one); engine-active = the "
                "DECODE_BREAKDOWN.md master-table rows; k = in-model / raw, the calibration of the PREDICTOR")
     for r in rec["rows"]:
         out.append(f"  {r['bucket']}: {r['scope']}")
         out.append(f"    reference ({r['reference_kind']}): "
                    + " + ".join(f"{t['ms']:.3f} {t['label']} ({t['file']})" for t in r["reference_terms"]))
+        for a in r["alternatives"]:
+            out.append(f"    alternative reference: {a['reference_ms']:.2f} ms {a['label']}: {a['delta_pct']:+.1f}% "
+                       f"{a['verdict']}")
         if r["verdict"] == "FAIL":
             out.append(f"    FAIL cause: {r['cause']}")
         if r["note"]:

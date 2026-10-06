@@ -122,6 +122,13 @@ PASS when the difference is 15% or less.
 | dense | blockwise_fp8_mm 1.705 + norms 0.082 + dense glue 0.129 ms (engine-active) | FAIL |
 | collectives | AR transfer 0.83 + late-rank wait 2.07 ms | FAIL |
 
+For KDA, the breakdown does not decide the scope. It does not split the KDA-layer glue
+(0.975 ms) between the benchmarked region and the KDA projections. The "before" graph
+runs its own glue, so part of the 0.975 ms is in the benchmark scope. The ledger prints
+two cited alternatives with their delta and verdict, and a "scope-dependent verdict"
+line: PASS at 12.30 and 12.47 ms, FAIL at 13.45 ms. The PASS is a scope call for
+team-lead to accept.
+
 The expected FAIL results have a scope cause. The ledger prints the cause. A benchmark
 median is the wall time of a call in its own graph: it includes the DMA waits of the
 call and its standalone glue. The DECODE_BREAKDOWN master table gives engine-active
@@ -171,6 +178,10 @@ for it in `KERNEL_RULES`.
    gives no residual and no calibration there.
 5. The collective model is the fastest traced all-reduce. The late-rank waits are in
    the residual of the raw sum.
+6. The reader does not read `mhc_micro_mid.json` and `mhc_micro_large.json`. Thus at
+   bs=64 the mHC rows show "no benchmark", although these files have B=64 records.
+7. A row that matches more than one benchmark case uses the mean of the cases. Its
+   source starts with "mean of N cases" (the DSA "after" layer at bs=1).
 
 ## 10. Files
 

@@ -8,7 +8,8 @@ import pytest
 from test.kernel_ledger.models.glm53f.decode import BUCKETS
 from test.kernel_ledger.models.glm53f.references import RECONCILED, REFERENCES, STEP_5938748
 
-_TERMS = [STEP_5938748] + [t for r in REFERENCES.values() for t in r.reference + r.engine_active + r.evidence]
+_TERMS = [STEP_5938748] + [t for r in REFERENCES.values() for t in r.reference + r.engine_active + r.evidence
+                            + tuple(x for a in r.alternatives for x in a.terms)]
 
 
 @pytest.mark.parametrize("term", _TERMS, ids=lambda t: t.label[:40])
@@ -38,3 +39,10 @@ def test_reference_sums():
     assert REFERENCES["dense"].reference_ms == pytest.approx(1.916)
     assert REFERENCES["lm_head"].reference_ms == pytest.approx(2.161)
     assert REFERENCES["collectives"].reference_ms == pytest.approx(2.90)
+
+
+def test_kda_alternatives_span_the_glue_scope():
+    # the breakdown does not split the 0.975 ms KDA-layer glue; both ends are cited
+    alts = REFERENCES["KDA"].alternatives
+    assert [round(a.ms, 3) for a in alts] == [12.3, 13.447]
+    assert all(not r.alternatives for b, r in REFERENCES.items() if b != "KDA")

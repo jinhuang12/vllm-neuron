@@ -2,7 +2,8 @@
 """Emitted per-kernel shapes match the shapes the hardware benchmarks recorded.
 
 The expected values are read straight from the benchmark JSONs (not via the ledger's
-readers), field by field, at every batch the benchmarks ran.
+readers), field by field, at the decode batches the ledger uses (1 and 4; T=64 for the
+experts). The other batches and fields are not checked here.
 """
 
 from __future__ import annotations

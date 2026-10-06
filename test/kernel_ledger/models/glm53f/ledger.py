@@ -52,6 +52,11 @@ def interpolate_points(points: Sequence[Tuple[float, float]], x: float,
     return nearest[1] if abs(nearest[0] - x) <= tol else None
 
 
+def _sources(hit: KernelResult) -> str:
+    joined = " + ".join(hit.sources)
+    return f"mean of {len(hit.sources)} cases: {joined}" if len(hit.sources) > 1 else joined
+
+
 @dataclass
 class LedgerRow:
     node: str
@@ -217,6 +222,6 @@ def build_ledger(point: DecodePoint, kernel_set: KernelSet, results: Dict[Tuple[
                                       source="no benchmark at this shape", note=note, **base))
             else:
                 rows.append(LedgerRow(kind="measured", kernel=node.kernel_name.value, measured_us=us,
-                                      variant=variant, location=hit.location, source=" + ".join(hit.sources),
+                                      variant=variant, location=hit.location, source=_sources(hit),
                                       note=note, **base))
     return Ledger(point, kernel_set, rows)

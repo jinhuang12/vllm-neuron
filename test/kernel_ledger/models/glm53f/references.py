@@ -31,6 +31,7 @@ DENSE_BD = BREAKDOWN_DIR / "dense.md"
 MOE_HOST = BREAKDOWN_DIR / "moe_host.md"
 WAITS = BREAKDOWN_DIR / "waits.md"
 MOE_T = Path("/home/ubuntu/glm53f-wt/reports/moe-t.md")
+KDA_MD = Path("/home/ubuntu/glm53f-wt/reports/kda.md")
 DENSE_MICRO = Path("/home/ubuntu/glm53f-wt/reports/dense_micro.json")
 
 
@@ -40,6 +41,17 @@ class Term:
     label: str
     file: Path
     snippet: str
+
+
+@dataclass(frozen=True)
+class Alternative:
+    """Another cited reading of the same scope; the ledger prints its delta and verdict."""
+    label: str
+    terms: Tuple[Term, ...]
+
+    @property
+    def ms(self) -> float:
+        return sum(t.ms for t in self.terms)
 
 
 @dataclass(frozen=True)
@@ -54,6 +66,8 @@ class BucketReference:
     note: str = ""
     #: extra cited terms that back ``cause`` / ``note``
     evidence: Tuple[Term, ...] = ()
+    #: other readings of the scope where the breakdown does not decide it
+    alternatives: Tuple[Alternative, ...] = ()
 
     @property
     def reference_ms(self) -> float:
@@ -76,6 +90,8 @@ _KDA_REST = Term(0.64, "KDA rest (gate_clamp, decode_state) x34", DECODE_BREAKDO
                  "| KDA rest (gate_clamp, decode_state) | KDA x34 | 0.64 |")
 _KDA_GLUE = Term(0.975, "KDA-layer glue (ACT, DVE)", DECODE_BREAKDOWN,
                  "| KDA-layer other glue (ACT, DVE) | sub-block: KDA | 0.975 |")
+_KDA_CONV_SPAN = Term(34 * 0.348, "conv call wall span 348 us x 34 (holds about 7 ms of in-span waits)", ATTENTION,
+                      "34 KDA layers: one conv call per layer, median span 348 us")
 _MOE_GLUE = Term(3.982, "MoE-layer glue (pad, map, combine)", DECODE_BREAKDOWN,
                  "| MoE-layer glue (ACT, DVE, POOL) | sub-block: MoE | 3.982 |")
 _BLOCKWISE = Term(1.705, "blockwise_fp8_mm (shared expert x42, dense MLP x3)", DECODE_BREAKDOWN,
@@ -99,16 +115,23 @@ REFERENCES: Dict[str, BucketReference] = {r.bucket: r for r in (
     ),
     BucketReference(
         "KDA", "kda_step x34: conv + gate clamp + state step, request by request (kda.md)",
-        reference=(
-            Term(34 * 0.348, "conv call wall span 348 us x 34 (holds about 7 ms of in-span waits)", ATTENTION,
-                 "34 KDA layers: one conv call per layer, median span 348 us"),
-            _KDA_REST,
-        ),
+        reference=(_KDA_CONV_SPAN, _KDA_REST),
         reference_kind="in-model wall",
         engine_active=(_KDA_CONV, _KDA_REST),
-        note="KDA-layer glue 0.975 ms (ACT, DVE; dense.md #4) is not in the reference: the breakdown does not "
-             "split it between this region and the KDA projections. With it, the reference is 13.45 ms.",
-        evidence=(_KDA_GLUE,),
+        note="scope call (for team-lead to accept): the KDA-layer glue 0.975 ms (ACT COPY 0.235, ACTIVATE 0.210, "
+             "ACT_TABLE_LOAD 0.164 ms; dense.md #4) is not in this reference. The breakdown does not split it between "
+             "this region and the KDA projections. The 'before' graph runs its own glue (kda.md: 'decode step, and "
+             "glue'; the benchmark docstring lists silu and the carrier copies), so part of the 0.975 ms is in the "
+             "benchmark scope. The alternatives give both ends.",
+        evidence=(_KDA_GLUE,
+                  Term(0.0, "KDA glue opcodes", DENSE_BD, "KDA glue: ACT COPY 0.235, ACTIVATE 0.210, ACT_TABLE_LOAD 0.164 ms"),
+                  Term(0.0, "kda.md: the before variant holds its glue", KDA_MD, "decode step, and glue)")),
+        alternatives=(
+            Alternative("fused-KDA upper bound for conv + gate + state step (attention.md attention_3)",
+                        (Term(12.3, "fused-KDA upper bound (conv span 348 us x 34)", ATTENTION,
+                              "12.3 ms upper bound (conv span 348 us x 34)"),)),
+            Alternative("this reference + all KDA-layer glue", (_KDA_CONV_SPAN, _KDA_REST, _KDA_GLUE)),
+        ),
     ),
     BucketReference(
         "DSA/MLA", "mla_sparse x11: one whole Glm5NextMLAAttention.forward (projections, indexer, attention, o_proj)",

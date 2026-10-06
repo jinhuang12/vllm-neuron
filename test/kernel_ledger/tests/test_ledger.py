@@ -37,6 +37,13 @@ def test_interpolation_is_linear_inside_and_nearest_within_half_a_hit():
     assert interpolate_points(pts, 3.0) is None
 
 
+def test_a_row_from_several_benchmark_cases_says_it_is_their_mean(cur):
+    # da-2 round 1 note 4: the DSA "after" row at bs=1 averages two layer cases
+    row = cur.row("mla_sparse")
+    assert row.source.startswith("mean of 2 cases: dsa_micro.json#layer/bypass/B1 + ")
+    assert not cur.row("kda_step").source.startswith("mean of")
+
+
 def test_kernel_set_variants():
     assert BASELINE.variant("mhc_sinkhorn_tkg") == "before"
     assert CURRENT.variant("mhc_sinkhorn_tkg") == "after"

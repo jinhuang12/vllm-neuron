@@ -44,6 +44,19 @@ def test_5938748_reconciliation_verdicts_follow_the_ruling(base_run):
     assert out.count("FAIL cause: scope:") == 3
 
 
+def test_kda_verdict_prints_its_scope_range(base_run):
+    # da-2 round 1 #1: the KDA PASS depends on how much KDA-layer glue is in scope
+    out, doc = base_run
+    kda = next(r for r in doc["reconciliation"]["rows"] if r["bucket"] == "KDA")
+    alts = {round(a["reference_ms"], 2): a["verdict"] for a in kda["alternatives"]}
+    assert alts == {12.3: "PASS", 13.45: "FAIL"}
+    assert all(abs(a["delta_pct"] - (kda["ledger_ms"] / a["reference_ms"] - 1) * 100) < 1e-9
+               for a in kda["alternatives"])
+    assert re.search(r"alternative reference: 13\.45 ms .*: -18\.1% FAIL", out)
+    assert "scope-dependent verdict: KDA (PASS at 12.30, 12.47 ms; FAIL at 13.45 ms)" in out
+    assert "scope call" in kda["note"]
+
+
 def test_5938748_residual_against_both_steps_with_labels(base_run):
     out, _ = base_run
     assert re.search(r"breakdown, full host \(DECODE_BREAKDOWN.md\): step 77.36 ms -> residual \d+\.\d\d ms vs "
