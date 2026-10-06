@@ -1,10 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Decode GLM expert contributions: blocks of ``1 <= q <= 64`` token rows.
+"""Single-token GLM expert contributions for the measured production geometry.
 
 The public wrapper selects this entry only for its exact shape/tile contract.
-Each active block's ``q`` rows form one m-block, so every product streams the
-whole token axis (``moving = [128, q]``), as the general kernel does with
-``BLOCK_M = q``; ``q == 1`` is the original single-token schedule, unchanged.
 Stable active compaction retains original output slots and scaled-product order.
 The original compiler-assigned ``nl.ndarray`` allocations are preserved together
 with the verified arithmetic: changing allocator lifetimes would require new
@@ -46,7 +43,7 @@ def _compute_block(hidden, weights, scales, row_ids, expert_ids, affinity, out, 
     q = row_ids.shape[1]
     experts = weights.shape[0]
     panels, nh = weights.shape[1], weights.shape[3]
-    h, ni, BLOCK_M = hidden.shape[1], panels // 3, q
+    h, ni, BLOCK_M = hidden.shape[1], panels // 3, 1
     expert = _tile(1, 1, nl.int32)
     nisa.dma_copy(dst=expert, src=expert_ids.ap(pattern=[[1, 1], [1, 1]], scalar_offset=block, indirect_dim=0))
     expert_reg = nisa.register_alloc()
@@ -134,7 +131,7 @@ def _compute_block(hidden, weights, scales, row_ids, expert_ids, affinity, out, 
 
 
 def _active_order(row_ids):
-    blocks, q = row_ids.shape
+    blocks = row_ids.shape[0]
     ids = nl.ndarray((1, max(blocks, 8)), nl.int32, buffer=nl.sbuf)[:, :blocks]
     active = nl.ndarray((1, max(blocks, 8)), nl.int32, buffer=nl.sbuf)[:, :blocks]
     inactive = nl.ndarray((1, max(blocks, 8)), nl.int32, buffer=nl.sbuf)[:, :blocks]
@@ -146,8 +143,7 @@ def _active_order(row_ids):
     inactive_pos = nl.ndarray((1, max(blocks, 8)), nl.int32, buffer=nl.sbuf)[:, :blocks]
     total = nl.ndarray((1, 8), nl.float32, buffer=nl.sbuf)[:, :1]
     order = nl.ndarray((1, max(blocks, 8)), nl.int32, buffer=nl.sbuf)
-    # A block is active when its first row is a real token (real rows come first).
-    nisa.dma_copy(dst=ids, src=row_ids.ap(pattern=[[blocks * q, 1], [q, blocks]]))
+    nisa.dma_copy(dst=ids, src=row_ids.reshape((1, blocks)))
     nisa.tensor_scalar(dst=active, data=ids, op0=nl.greater_equal, operand0=0)
     nisa.tensor_scalar(dst=inactive, data=ids, op0=nl.less, operand0=0)
     nisa.memset(dst=ones, value=1)
@@ -176,17 +172,17 @@ def _active_order(row_ids):
 def compact_decode_kernel(hidden, weights, scales, row_ids, expert_ids,
                           affinity, bounds, BLOCK_N=4096, BLOCK_K=4096):
     blocks, q = row_ids.shape
-    assert 1 <= q <= 64 and blocks > 0, "1 <= q <= 64 token rows per block"
+    assert q == 1 and blocks > 0
     assert nl.num_programs(0) in (1, 2)
     assert BLOCK_N > 0 and BLOCK_N % 128 == 0
     assert BLOCK_K > 0 and BLOCK_K % 128 == 0
     program, programs = nl.program_id(0), nl.num_programs(0)
     h = hidden.shape[1]
-    out = nl.ndarray((blocks, q, h), dtype=nl.float32, buffer=nl.shared_hbm)
+    out = nl.ndarray((blocks, 1, h), dtype=nl.float32, buffer=nl.shared_hbm)
     clamp = nl.ndarray((128, 3), dtype=nl.float32, buffer=nl.sbuf)
     nisa.dma_copy(dst=clamp, src=bounds)
     order, total = _active_order(row_ids)
-    zeros = nl.ndarray((q, h), dtype=nl.float32, buffer=nl.sbuf)
+    zeros = nl.ndarray((1, h), dtype=nl.float32, buffer=nl.sbuf)
     nisa.memset(dst=zeros, value=0.0)
 
     # Every permutation position has one zero owner. The same program computes
@@ -194,7 +190,7 @@ def compact_decode_kernel(hidden, weights, scales, row_ids, expert_ids,
     for position in range(program, blocks, programs):
         block = nisa.register_alloc()
         nisa.register_load(dst=block, src=order[:, position:position + 1])
-        nisa.dma_copy(dst=out.ap(pattern=[[h, q], [1, h]],
+        nisa.dma_copy(dst=out.ap(pattern=[[h, 1], [1, h]],
                                 scalar_offset=block, indirect_dim=0), src=zeros)
 
     pair_count = nl.ndarray((1, 8), nl.float32, buffer=nl.sbuf)[:, :1]

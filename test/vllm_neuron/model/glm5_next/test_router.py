@@ -131,6 +131,20 @@ def build_hidden_states(seed: int = FIXTURE_SEED, hidden: int = TINY_H):
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _nki_simulator_on():
+    """Enable the NKI CPU simulator these cases assert on.
+
+    ``can_run_kernel`` and ``wrap_nki`` both read ``NKI_SIMULATOR`` at call time and
+    ``test/conftest.py`` does not pin it, so without this every seam takes its torch
+    path. A private ``MonkeyPatch`` survives a case's own ``monkeypatch.undo()``; a
+    case that sets ``NKI_SIMULATOR=0`` itself still wins inside its own body.
+    """
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("NKI_SIMULATOR", "1")
+        yield
+
+
 class RouteInstrumentError(AssertionError):
     """A route reading that contradicts the declared predicate. """
 
@@ -1104,3 +1118,70 @@ def test_fused_torch_fallback_executes_and_is_the_cpu_oracle(monkeypatch) -> Non
         rtol=RTOL,
         atol=ATOL,
     )
+
+
+# ---------------------------------------------------------------------------
+# The decode route of the call site: T <= 64 takes the one-launch decode router.
+# ---------------------------------------------------------------------------
+
+
+def _decode_call_site(tokens: int, seed: int):
+    """A real-width bank (H=4096, E=288) and ``[1, T, H]`` decode activations."""
+    from test.vllm_neuron.functional.moe.decode_fixtures import realistic_router_inputs
+    from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
+    from vllm_neuron.model.glm5_next.model_fp8 import Glm5NextRoutedExperts
+
+    x, gamma, weights, bias = realistic_router_inputs(tokens, seed=seed)
+    text_config = Glm5NextTextConfig(hidden_size=x.shape[1])
+    bank = Glm5NextRoutedExperts(text_config, world_size=16, ep_degree=16)
+    bank.router_weight = nn.Parameter(weights, requires_grad=False)
+    bank.router_bias = nn.Parameter(bias, requires_grad=False)
+    return bank, text_config, x.unsqueeze(0), gamma
+
+
+@pytest.mark.parametrize("tokens", [1, 4])
+def test_model_call_site_takes_the_decode_router_at_decode_token_counts(tokens) -> None:
+    """``route_tokens`` at T in {1, 4}: one launch of the decode router kernel,
+    counted in this seam's family, and the 5938748 router's selection."""
+    from test.vllm_neuron.functional.moe.decode_fixtures import (
+        SimulatorCounter,
+        index_sets_equal,
+        tie_rows,
+    )
+
+    bank, text_config, hidden, gamma = _decode_call_site(tokens, seed=71 + tokens)
+    reset_noaux_tc_counters()
+    with SimulatorCounter() as sim:
+        logits, index, affinities = bank.route_tokens(hidden, gamma, text_config)
+    assert noaux_tc_dispatch_counters() == (1, 0)
+    assert sim.kernels == ["noaux_router_decode_kernel"], sim.kernels
+
+    reset_noaux_tc_counters()
+    with SimulatorCounter() as old_sim:
+        old_logits, old_index, old_aff, _sub = noaux_tc_rmsnorm_router_topk(
+            hidden_states=hidden, gamma=gamma, router_weights=bank.router_weight,
+            correction_bias=bank.router_bias, top_k=DECLARED_TOP_K,
+            eps=float(text_config.rms_norm_eps),
+            norm_topk_prob=DECLARED_NORM_TOPK_PROB,
+            routed_scaling_factor=DECLARED_ROUTED_SCALING_FACTOR,
+        )
+    assert "noaux_router_decode_kernel" not in old_sim.kernels
+    # Ties aside: rows whose 8th/9th corrected scores are within 1e-4 may swap
+    # the last pick on a last-bit logit difference; every other row is exact.
+    ties = tie_rows(old_logits, bank.router_bias.detach(), 1e-4)
+    assert int(ties.sum()) <= 1
+    assert bool(index_sets_equal(index, old_index)[~ties].all())
+    torch.testing.assert_close(affinities[~ties], old_aff[~ties], rtol=1e-4, atol=1e-6)
+    torch.testing.assert_close(logits, old_logits, rtol=2e-3, atol=2e-3)
+
+
+def test_model_call_site_keeps_the_prefill_router_above_64_tokens() -> None:
+    """65 rows is not a decode batch: the call site keeps the prefill router."""
+    from test.vllm_neuron.functional.moe.decode_fixtures import SimulatorCounter
+
+    bank, text_config, hidden, gamma = _decode_call_site(65, seed=79)
+    reset_noaux_tc_counters()
+    with SimulatorCounter() as sim:
+        bank.route_tokens(hidden, gamma, text_config)
+    assert noaux_tc_dispatch_counters() == (1, 0)
+    assert "noaux_router_decode_kernel" not in sim.kernels and sim.kernels, sim.kernels

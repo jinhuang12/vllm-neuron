@@ -13,25 +13,14 @@ from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
 from .moe_fused_fp8 import moe_fused_fp8_kernel
 from .moe_fused_fp8_decode import compact_decode_kernel
-from .expert_decode import (
-    EXPERT_DECODE_MAX_TOKENS,
-    can_run_expert_decode,
-    default_programs,
-    expert_decode_kernel,
-    geometry,
-    rank_operand,
-)
 
 from .fused_fp8_pack import PackedExperts, pack_experts
 from .fused_fp8_config import select_tiles
 
-__all__ = ["PackedExperts", "pack_experts", "fused_fp8_experts",
-           "fused_fp8_decode_experts"]
+__all__ = ["PackedExperts", "pack_experts", "fused_fp8_experts"]
 
 _FUSED_EXPERTS = wrap_nki(moe_fused_fp8_kernel)[2]
 _FUSED_DECODE_EXPERTS = wrap_nki(compact_decode_kernel)[2]
-_TOKEN_DECODE_EXPERTS = {1: wrap_nki(expert_decode_kernel),
-                         2: wrap_nki(expert_decode_kernel)[2]}
 _DISPATCH_COUNT = 0
 
 
@@ -116,58 +105,3 @@ def fused_fp8_experts(hidden, packed, row_ids, expert_ids, affinity, bounds,
         affinity.reshape(-1, 1), bounds,
         BLOCK_M=tile_m, BLOCK_N=tile_n, BLOCK_K=tile_k,
     ).reshape(-1, hidden.shape[1])
-
-
-def fused_fp8_decode_experts(hidden, expert_affinities, packed, bounds,
-                             expert_parallel_rank=0, *, programs=None,
-                             out_dtype=None, weight_fp8=False):
-    """This rank's routed-expert output for ``T <= 64`` decode tokens, one launch.
-
-    The decode route of this seam: no mapping, no padding row, no combine. The
-    kernel reads the router's global scattered ``[T, E_global]`` affinities and
-    the rank's group id itself, visits each distinct local expert with a routed
-    token once, and returns the fp32-accumulated sum in ``out_dtype``.
-
-    Args:
-        hidden: ``[T, H]`` bf16 expert inputs, real tokens only.
-        expert_affinities: ``[T, E_global]`` fp32, as ``route_tokens`` returns;
-            ``E_global`` is a multiple of the bank's expert count.
-        packed: this rank's ``PackedExperts``.
-        bounds: ``[128, 3]`` fp32 SwiGLU bounds, as for ``fused_fp8_experts``.
-        expert_parallel_rank: the bank's group, an int or a one-element int
-            tensor (the runner's device operand).
-        programs: 1 or 2; default 2 under ``NEURON_LOGICAL_NC_CONFIG=2``.
-        out_dtype: ``torch.bfloat16`` (default: ``hidden.dtype``) or fp32.
-        weight_fp8: feed fp8 tiles to the PE instead of a bf16 DMA cast.
-
-    Raises:
-        ValueError: outside the kernel's envelope (see ``can_run_expert_decode``);
-            like ``fused_fp8_experts`` this seam has no torch fallback.
-    """
-    out_dtype = hidden.dtype if out_dtype is None else out_dtype
-    if out_dtype not in (torch.bfloat16, torch.float32):
-        raise ValueError(f"out_dtype must be bf16 or fp32, got {out_dtype}")
-    if tuple(bounds.shape) != (128, 3) or bounds.dtype != torch.float32:
-        raise ValueError("bounds must be FP32 [128,3]")
-    if not can_run_expert_decode(hidden, expert_affinities, packed):
-        raise ValueError(
-            f"fused_fp8_decode_experts serves 1..{EXPERT_DECODE_MAX_TOKENS} bf16 "
-            f"tokens of a packed bank on an NKI device or simulator; got hidden "
-            f"{tuple(hidden.shape)} {hidden.dtype}, affinities "
-            f"{tuple(expert_affinities.shape)}")
-    experts, ni, nh = geometry(packed)
-    programs = default_programs(ni, nh) if programs is None else int(programs)
-    if programs not in _TOKEN_DECODE_EXPERTS:
-        raise ValueError(f"programs must be 1 or 2, got {programs}")
-    _count_nki_dispatch()
-    return _TOKEN_DECODE_EXPERTS[programs](
-        hidden=hidden.contiguous(),
-        affinity=expert_affinities.to(torch.float32).reshape(
-            hidden.shape[0], -1, experts).contiguous(),
-        rank=rank_operand(expert_parallel_rank, hidden.device),
-        weights=packed.weights,
-        scales=packed.scales,
-        bounds=bounds.contiguous(),
-        OUT_FP32=out_dtype == torch.float32,
-        WEIGHT_FP8=bool(weight_fp8),
-    )

@@ -161,6 +161,20 @@ TOKENS_PER_EXPERT = T * K // E
 # Named errors. A failure must say which instrument disagreed; a bare
 # ``AssertionError`` from three different causes is one message for three bugs.
 # ---------------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def _nki_simulator_on():
+    """Enable the NKI CPU simulator these cases assert on.
+
+    ``can_run_kernel`` and ``wrap_nki`` both read ``NKI_SIMULATOR`` at call time and
+    ``test/conftest.py`` does not pin it, so without this every seam takes its torch
+    path. A private ``MonkeyPatch`` survives a case's own ``monkeypatch.undo()``; a
+    case that sets ``NKI_SIMULATOR=0`` itself still wins inside its own body.
+    """
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("NKI_SIMULATOR", "1")
+        yield
+
+
 class RouteInstrumentError(AssertionError):
     """A route reading that is not what this file declares."""
 
@@ -2198,3 +2212,108 @@ def test_moe_path_dispatch_refuses_a_caller_sliced_local_form_above_degree_one()
     assert counters == NO_LIMB_DISPATCHES, (
         "the refusal must happen before the block-quant kernel is entered"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# The decode route: T <= 64 tokens on the packed bank take one kernel launch.
+# ══════════════════════════════════════════════════════════════════════════════
+
+#: Distinct-expert patterns on rank 5's 18 experts (see decode_fixtures.RANK).
+DECODE_ROUTE_HITS = {1: [[3, 11]], 4: [[3, 11], [11], [], [0, 3, 17]]}
+
+
+def _decode_route_bank():
+    """A GLM-width bank at EP=16, TP=64: 18 local experts, I_TP = 512."""
+    from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
+    from vllm_neuron.model.glm5_next.model_fp8 import Glm5NextRoutedExperts
+
+    text_config = Glm5NextTextConfig()
+    bank = Glm5NextRoutedExperts(text_config, world_size=64, ep_degree=16)
+    if int(bank.num_local_experts) != 18 or int(bank.num_routed_experts) != 288:
+        raise VacuousControlError(
+            f"the decode-route bank holds {bank.num_local_experts} of "
+            f"{bank.num_routed_experts} experts, not GLM's 18 of 288")
+    return bank
+
+
+def _decode_route_call(bank, packed, hidden, affinities, rank, collector=None):
+    return bank.block_quant_expert_mm(
+        hidden_states=hidden,
+        expert_affinities=affinities,
+        gate_up_proj_weight=None,
+        down_proj_weight=None,
+        gate_up_scale_operands=None,
+        down_scale_operands=None,
+        quant_config=_block_quant_config(),
+        expert_parallel_rank=rank,
+        packed_weights=packed.weights,
+        packed_scales=packed.scales,
+        **({"collector": collector} if collector is not None else {}),
+    )
+
+
+@pytest.mark.parametrize("tokens", [1, 4])
+def test_moe_path_decode_route_is_one_launch_matching_5938748(tokens, monkeypatch) -> None:
+    """T in {1, 4}: the call site enters the fused seam once, runs only the
+    token-axis decode kernel (no mapping, no combine kernel), and returns the
+    5938748 packed branch's output to one bf16 rounding step."""
+    from test.vllm_neuron.functional.moe.decode_fixtures import (
+        RANK,
+        SimulatorCounter,
+        baseline,
+        decode_hidden,
+        packed_expert_bank,
+        routed_affinities,
+    )
+    from vllm_neuron.functional.moe.fused_fp8 import (
+        fused_dispatch_counters,
+        reset_fused_dispatch_counters,
+    )
+
+    monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", "2")
+    bank = _decode_route_bank()
+    packed = packed_expert_bank()
+    hidden = decode_hidden(tokens)
+    affinities = routed_affinities(DECODE_ROUTE_HITS[tokens])
+    rank = torch.tensor([RANK], dtype=torch.int64)
+    reset_fused_dispatch_counters()
+    with SimulatorCounter() as sim:
+        got = _decode_route_call(bank, packed, hidden, affinities, rank)
+    assert fused_dispatch_counters() == (1, 0)
+    assert sim.kernels == ["expert_decode_kernel"], sim.kernels
+    want = baseline().routed_experts(
+        hidden, affinities, packed.weights, packed.scales, rank,
+        swiglu_limit=bank.swiglu_limit)
+    assert got.dtype == want.dtype == torch.bfloat16 and got.shape == want.shape
+    torch.testing.assert_close(got.float(), want.float(), rtol=2.0 ** -7,
+                               atol=1e-6 * float(want.float().abs().max()))
+
+
+def test_moe_path_decode_route_steps_aside_for_a_collector_and_wide_batches(
+    monkeypatch,
+) -> None:
+    """A collector wants the mapping's token positions, and 65 rows is not a
+    decode batch: both keep the mapping route and its kernels."""
+    from test.vllm_neuron.functional.moe.decode_fixtures import (
+        RANK,
+        SimulatorCounter,
+        decode_hidden,
+        packed_expert_bank,
+        routed_affinities,
+    )
+
+    monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", "2")
+    bank = _decode_route_bank()
+    packed = packed_expert_bank()
+    rank = torch.tensor([RANK], dtype=torch.int64)
+    hidden = decode_hidden(1)
+    affinities = routed_affinities(DECODE_ROUTE_HITS[1])
+    collector: list = []
+    with SimulatorCounter() as sim:
+        _decode_route_call(bank, packed, hidden, affinities, rank, collector=collector)
+    assert "expert_decode_kernel" not in sim.kernels and len(collector) == 1
+    wide_hits = [[t % 18] if t % 13 == 0 else [] for t in range(65)]
+    with SimulatorCounter() as sim:
+        _decode_route_call(bank, packed, decode_hidden(65), routed_affinities(wide_hits),
+                           rank)
+    assert "expert_decode_kernel" not in sim.kernels and sim.kernels, sim.kernels
