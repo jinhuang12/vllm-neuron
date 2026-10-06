@@ -1,0 +1,214 @@
+{
+  "environment": {
+    "NEURON_RT_VISIBLE_CORES": "8-11",
+    "NEURON_LOGICAL_NC_CONFIG": "2",
+    "NEURON_CC_FLAGS": null,
+    "NEURON_PLATFORM_TARGET_OVERRIDE": "trn2",
+    "NEURON_LIBTORCH_CACHE_ROOT": "/home/ubuntu/glm53f-wt/dsa-cache"
+  },
+  "tree": "/home/ubuntu/glm53f-wt/dsa",
+  "baseline": {
+    "commit": "5938748",
+    "directory": "/tmp/dsa_5938748_wngfhadt/dsa_5938748_snapshot",
+    "loader": "/home/ubuntu/glm53f-wt/dsa/test/hardware/baselines/dsa_5938748"
+  },
+  "args": {
+    "layers": 11,
+    "kernel_chain": 8,
+    "warmup": 10,
+    "iterations": 50,
+    "batch": [
+      1,
+      4
+    ],
+    "prefill_rows": [
+      1024
+    ],
+    "tables": [
+      "layer"
+    ],
+    "layer_cases": [
+      "bypass",
+      "selected",
+      "bypass_vs_default_window"
+    ]
+  },
+  "synchronization": "graph output copied to CPU on every timed call",
+  "cases": [
+    {
+      "table": "layer",
+      "case": "bypass",
+      "ctx": 1024,
+      "window_rows": {
+        "before": 2048,
+        "after": 2048
+      },
+      "max_seq_len": 4096,
+      "batch": 1,
+      "layers_chained": 11,
+      "unit": "one layer's decode step for all `batch` requests",
+      "after_vs_before_relative_l2": 0.007312873152153347,
+      "agreement_asserted": true,
+      "before": {
+        "iterations": 50,
+        "units_per_sample": 11,
+        "median_us": 1112.3295,
+        "p90_us": 1133.4757272727272,
+        "min_us": 1105.7623636363637,
+        "max_us": 1211.380090909091,
+        "first_call_s": 11.630449467804283
+      },
+      "after": {
+        "iterations": 50,
+        "units_per_sample": 11,
+        "median_us": 286.63827272727275,
+        "p90_us": 297.9739090909091,
+        "min_us": 271.8738181818182,
+        "max_us": 399.38900000000007,
+        "first_call_s": 8.384382490999997
+      },
+      "median_speedup": 3.880603554495831,
+      "after_over_before_median": 0.25769187343073496
+    },
+    {
+      "table": "layer",
+      "case": "bypass",
+      "ctx": 1024,
+      "window_rows": {
+        "before": 2048,
+        "after": 2048
+      },
+      "max_seq_len": 4096,
+      "batch": 4,
+      "layers_chained": 11,
+      "unit": "one layer's decode step for all `batch` requests",
+      "after_vs_before_relative_l2": 0.006813118546519705,
+      "agreement_asserted": true,
+      "before": {
+        "iterations": 50,
+        "units_per_sample": 11,
+        "median_us": 4251.188909090909,
+        "p90_us": 4316.985636363636,
+        "min_us": 4222.732090909091,
+        "max_us": 4438.349181818182,
+        "first_call_s": 42.21710150875151
+      },
+      "after": {
+        "iterations": 50,
+        "units_per_sample": 11,
+        "median_us": 1033.2185,
+        "p90_us": 1096.176,
+        "min_us": 998.8998181818181,
+        "max_us": 1196.6076363636364,
+        "first_call_s": 28.84828567272052
+      },
+      "median_speedup": 4.114511024619584,
+      "after_over_before_median": 0.24304224585045492
+    },
+    {
+      "table": "layer",
+      "case": "selected",
+      "ctx": 4096,
+      "window_rows": {
+        "before": 4096,
+        "after": 4096
+      },
+      "max_seq_len": 4096,
+      "batch": 1,
+      "layers_chained": 11,
+      "unit": "one layer's decode step for all `batch` requests",
+      "after_vs_before_relative_l2": 0.8956166883969942,
+      "agreement_asserted": false,
+      "before": {
+        "iterations": 50,
+        "units_per_sample": 11,
+        "median_us": 1147.3571818181817,
+        "p90_us": 1161.9783636363636,
+        "min_us": 1131.6496363636363,
+        "max_us": 1181.5847272727274,
+        "first_call_s": 10.591101415921003
+      },
+      "after": {
+        "iterations": 50,
+        "units_per_sample": 11,
+        "median_us": 894.2491818181818,
+        "p90_us": 922.6252727272728,
+        "min_us": 874.6391818181819,
+        "max_us": 1115.7402727272727,
+        "first_call_s": 13.582378678955138
+      },
+      "median_speedup": 1.2830396774704143,
+      "after_over_before_median": 0.7793991234718142
+    },
+    {
+      "table": "layer",
+      "case": "selected",
+      "ctx": 4096,
+      "window_rows": {
+        "before": 4096,
+        "after": 4096
+      },
+      "max_seq_len": 4096,
+      "batch": 4,
+      "layers_chained": 11,
+      "unit": "one layer's decode step for all `batch` requests",
+      "after_vs_before_relative_l2": 0.9607236982041479,
+      "agreement_asserted": false,
+      "before": {
+        "iterations": 50,
+        "units_per_sample": 11,
+        "median_us": 4399.433772727273,
+        "p90_us": 4579.329272727273,
+        "min_us": 4364.710909090909,
+        "max_us": 4795.163727272728,
+        "first_call_s": 41.700919695198536
+      },
+      "after": {
+        "iterations": 50,
+        "units_per_sample": 11,
+        "median_us": 3355.188681818182,
+        "p90_us": 3388.324090909091,
+        "min_us": 3324.876090909091,
+        "max_us": 3565.3732727272727,
+        "first_call_s": 47.92687644204125
+      },
+      "median_speedup": 1.3112328962504765,
+      "after_over_before_median": 0.7626410249922347
+    },
+    {
+      "table": "layer",
+      "case": "bypass_vs_default_window",
+      "ctx": 1024,
+      "window_rows": {
+        "before": 4096,
+        "after": 2048
+      },
+      "max_seq_len": 4096,
+      "batch": 1,
+      "layers_chained": 11,
+      "unit": "one layer's decode step for all `batch` requests",
+      "after_vs_before_relative_l2": 0.006903330623734138,
+      "agreement_asserted": true,
+      "before": {
+        "iterations": 50,
+        "units_per_sample": 11,
+        "median_us": 1160.477409090909,
+        "p90_us": 1183.7644545454546,
+        "min_us": 1137.2362727272728,
+        "max_us": 1340.6204545454545,
+        "first_call_s": 10.524848216678947
+      },
+      "after": {
+        "iterations": 50,
+        "units_per_sample": 11,
+        "median_us": 301.07877272727274,
+        "p90_us": 315.72436363636365,
+        "min_us": 280.78027272727275,
+        "max_us": 427.95445454545455,
+        "first_call_s": 7.448428358882666
+      },
+      "median_speedup": 3.8543979656184812,
+      "after_over_before_median": 0.2594438895308878
+    }
+  ]
+}

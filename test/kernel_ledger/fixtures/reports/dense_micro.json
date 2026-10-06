@@ -1,0 +1,259 @@
+{
+  "environment": {
+    "NEURON_RT_VISIBLE_CORES": "16-19",
+    "NEURON_LOGICAL_NC_CONFIG": "2",
+    "NEURON_PLATFORM_TARGET_OVERRIDE": "trn2",
+    "NEURON_CC_FLAGS": null
+  },
+  "cores": "graphs run on neuron:0 = 1 logical core (LNC2: 2 physical cores) of the 4-core slice",
+  "baseline_module": "/home/ubuntu/glm53f-wt/dense/test/hardware/baselines/dense_5938748",
+  "vllm_neuron": "/home/ubuntu/glm53f-wt/dense/vllm_neuron",
+  "timing": "per-site = (graph - null graph) / repeat; median/p90 over iterations of host-timed graph executions incl. output sync",
+  "cases": [
+    {
+      "case": "shared_mlp_b1",
+      "M": 1,
+      "H": 4096,
+      "I": 128,
+      "before_route": "5938748: 3 x blockwise_fp8_mm small-M kernel + torch clamp/silu/mul/bf16 cast (load-time scale operands)",
+      "after_route": "blockwise_fp8_mlp -> blockwise_fp8_mlp_small_m_kernel",
+      "null_graph_median_us": 126.91749999999999,
+      "before": {
+        "iterations": 50,
+        "repeat_per_graph": 16,
+        "graph_median_us": 1934.739,
+        "graph_p90_us": 2055.75,
+        "per_site_median_us": 112.98884375,
+        "per_site_p90_us": 120.55203125
+      },
+      "after": {
+        "iterations": 50,
+        "repeat_per_graph": 16,
+        "graph_median_us": 491.7505,
+        "graph_p90_us": 754.968,
+        "per_site_median_us": 22.802062499999998,
+        "per_site_p90_us": 39.253156249999996
+      },
+      "speedup_median": 4.9552027914141545,
+      "after_over_before_median": 0.20180808780070375,
+      "after_over_before_p90": 0.3256117366334298,
+      "correctness_rel_l2_bound": 0.01,
+      "before_vs_cpu_reference": {
+        "max_abs_diff": 2.6226043701171875e-06,
+        "max_abs_ref": 9.973221778869629,
+        "relative_l2": 1.5353550963936868e-07,
+        "cosine": 0.9999997615814209
+      },
+      "after_vs_cpu_reference": {
+        "max_abs_diff": 0.0016705989837646484,
+        "max_abs_ref": 9.973221778869629,
+        "relative_l2": 0.00015692207671236247,
+        "cosine": 0.9999998211860657
+      },
+      "after_vs_before": {
+        "max_abs_diff": 0.0016703605651855469,
+        "max_abs_ref": 9.973220825195312,
+        "relative_l2": 0.00015692540910094976,
+        "cosine": 0.9999998211860657
+      }
+    },
+    {
+      "case": "shared_mlp_b4",
+      "M": 4,
+      "H": 4096,
+      "I": 128,
+      "before_route": "5938748: 3 x blockwise_fp8_mm small-M kernel + torch clamp/silu/mul/bf16 cast (load-time scale operands)",
+      "after_route": "blockwise_fp8_mlp -> blockwise_fp8_mlp_small_m_kernel",
+      "null_graph_median_us": 138.0285,
+      "before": {
+        "iterations": 50,
+        "repeat_per_graph": 16,
+        "graph_median_us": 1839.8465,
+        "graph_p90_us": 1905.775,
+        "per_site_median_us": 106.363625,
+        "per_site_p90_us": 110.48415625000001
+      },
+      "after": {
+        "iterations": 50,
+        "repeat_per_graph": 16,
+        "graph_median_us": 521.2295,
+        "graph_p90_us": 544.721,
+        "per_site_median_us": 23.9500625,
+        "per_site_p90_us": 25.41828125
+      },
+      "speedup_median": 4.44105834796882,
+      "after_over_before_median": 0.22517155183456752,
+      "after_over_before_p90": 0.23006268149873296,
+      "correctness_rel_l2_bound": 0.01,
+      "before_vs_cpu_reference": {
+        "max_abs_diff": 3.814697265625e-06,
+        "max_abs_ref": 15.1039400100708,
+        "relative_l2": 2.0428949198958435e-07,
+        "cosine": 1.000000238418579
+      },
+      "after_vs_cpu_reference": {
+        "max_abs_diff": 0.006237506866455078,
+        "max_abs_ref": 15.1039400100708,
+        "relative_l2": 0.00028537987964227796,
+        "cosine": 1.000000238418579
+      },
+      "after_vs_before": {
+        "max_abs_diff": 0.006237506866455078,
+        "max_abs_ref": 15.103939056396484,
+        "relative_l2": 0.00028537496109493077,
+        "cosine": 1.000000238418579
+      }
+    },
+    {
+      "case": "dense_mlp_b1",
+      "M": 1,
+      "H": 4096,
+      "I": 256,
+      "before_route": "5938748: 3 x blockwise_fp8_mm small-M kernel + torch clamp/silu/mul/bf16 cast (load-time scale operands)",
+      "after_route": "blockwise_fp8_mlp -> blockwise_fp8_mlp_small_m_kernel",
+      "null_graph_median_us": 126.8065,
+      "before": {
+        "iterations": 50,
+        "repeat_per_graph": 16,
+        "graph_median_us": 2433.9795000000004,
+        "graph_p90_us": 2492.889,
+        "per_site_median_us": 144.1983125,
+        "per_site_p90_us": 147.88015625
+      },
+      "after": {
+        "iterations": 50,
+        "repeat_per_graph": 16,
+        "graph_median_us": 610.9935,
+        "graph_p90_us": 652.979,
+        "per_site_median_us": 30.261687499999997,
+        "per_site_p90_us": 32.88578125
+      },
+      "speedup_median": 4.7650453233977785,
+      "after_over_before_median": 0.20986159252037018,
+      "after_over_before_p90": 0.22238129904599693,
+      "correctness_rel_l2_bound": 0.01,
+      "before_vs_cpu_reference": {
+        "max_abs_diff": 6.67572021484375e-06,
+        "max_abs_ref": 17.201860427856445,
+        "relative_l2": 2.21807056277612e-07,
+        "cosine": 1.0
+      },
+      "after_vs_cpu_reference": {
+        "max_abs_diff": 6.413459777832031e-05,
+        "max_abs_ref": 17.201860427856445,
+        "relative_l2": 3.3130645533674397e-06,
+        "cosine": 0.9999999403953552
+      },
+      "after_vs_before": {
+        "max_abs_diff": 6.365776062011719e-05,
+        "max_abs_ref": 17.201858520507812,
+        "relative_l2": 3.301398237454123e-06,
+        "cosine": 0.9999999403953552
+      }
+    },
+    {
+      "case": "lm_head_b1",
+      "M": 1,
+      "H": 4096,
+      "vocab": 154880,
+      "shard_rows": 2420,
+      "before_route": "5938748: replicated [154880, 4096] bf16 GEMV",
+      "after_route": "local [2420, 4096] bf16 shard GEMV (all-gather excluded)",
+      "null_graph_median_us": 122.89500000000001,
+      "before": {
+        "iterations": 50,
+        "repeat_per_graph": 1,
+        "graph_median_us": 2319.845,
+        "graph_p90_us": 5877.593,
+        "per_site_median_us": 2196.95,
+        "per_site_p90_us": 5754.697999999999
+      },
+      "after": {
+        "iterations": 50,
+        "repeat_per_graph": 8,
+        "graph_median_us": 420.02049999999997,
+        "graph_p90_us": 2973.066,
+        "per_site_median_us": 37.1406875,
+        "per_site_p90_us": 356.271375
+      },
+      "speedup_median": 59.15210912560517,
+      "after_over_before_median": 0.016905567946471245,
+      "after_over_before_p90": 0.06190965624955472,
+      "correctness_rel_l2_bound": 0.01,
+      "before_vs_cpu_reference": {
+        "max_abs_diff": 0.01467752456665039,
+        "max_abs_ref": 4.596531867980957,
+        "relative_l2": 0.0016214502975344658,
+        "cosine": 0.999998927116394
+      },
+      "after_vs_cpu_reference": {
+        "max_abs_diff": 0.01467752456665039,
+        "max_abs_ref": 4.596531867980957,
+        "relative_l2": 0.0016214502975344658,
+        "cosine": 0.999998927116394
+      },
+      "after_vs_before": {
+        "max_abs_diff": 0.0,
+        "max_abs_ref": 4.59375,
+        "relative_l2": 0.0,
+        "cosine": 1.0000004768371582
+      },
+      "all_gather_entitlement": {
+        "bytes_received_per_rank_per_token": 304920,
+        "basis": "bf16 [1, 154880] logits; each rank receives 63/64 of them",
+        "bandwidth_term_us_at_100GBps": 3.0492,
+        "latency_term_us": 44.2,
+        "latency_basis": "measured 64-rank 16 KB all-reduce (dense.md), taken as the fixed cost of one 64-rank collective",
+        "estimated_us": 47.2492
+      },
+      "after_plus_gather_median_us": 84.3898875,
+      "saving_per_step_us": 2112.5601125
+    },
+    {
+      "case": "norm_b1",
+      "M": 1,
+      "H": 4096,
+      "before_route": "5938748: torch fp32 RMSNorm (upcast, pow, mean, rsqrt, 2 mul, downcast) lowered by the compiler",
+      "after_route": "vllm_neuron.functional.norm.rms_norm_kernel",
+      "null_graph_median_us": 127.47900000000001,
+      "before": {
+        "iterations": 50,
+        "repeat_per_graph": 16,
+        "graph_median_us": 212.578,
+        "graph_p90_us": 357.633,
+        "per_site_median_us": 5.318687499999999,
+        "per_site_p90_us": 14.384624999999998
+      },
+      "after": {
+        "iterations": 50,
+        "repeat_per_graph": 16,
+        "graph_median_us": 235.87,
+        "graph_p90_us": 306.369,
+        "per_site_median_us": 6.7744374999999994,
+        "per_site_p90_us": 11.180625000000001
+      },
+      "speedup_median": 0.7851113099796109,
+      "after_over_before_median": 1.273704743886532,
+      "after_over_before_p90": 0.7772621809744781,
+      "correctness_rel_l2_bound": 0.01,
+      "before_vs_cpu_reference": {
+        "max_abs_diff": 0.0,
+        "max_abs_ref": 5.1875,
+        "relative_l2": 0.0,
+        "cosine": 1.0000008344650269
+      },
+      "after_vs_cpu_reference": {
+        "max_abs_diff": 0.0,
+        "max_abs_ref": 5.1875,
+        "relative_l2": 0.0,
+        "cosine": 1.0000008344650269
+      },
+      "after_vs_before": {
+        "max_abs_diff": 0.0,
+        "max_abs_ref": 5.1875,
+        "relative_l2": 0.0,
+        "cosine": 1.0000008344650269
+      }
+    }
+  ]
+}

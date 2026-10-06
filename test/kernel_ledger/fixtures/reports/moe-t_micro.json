@@ -1,0 +1,599 @@
+{
+  "environment": {
+    "NEURON_RT_VISIBLE_CORES": "12-15",
+    "NEURON_LOGICAL_NC_CONFIG": "2",
+    "NEURON_CC_FLAGS": null,
+    "NEURON_PLATFORM_TARGET_OVERRIDE": "trn2",
+    "NEURON_LIBTORCH_CACHE_ROOT": "/home/ubuntu/glm53f-wt/moe-t-cache"
+  },
+  "compiler_args": [
+    "--auto-cast=none",
+    "-O1",
+    "--internal-hlo2tensorizer-options=--modular-flow-mac-threshold=10 --experimental-unsafe-fp8e4m3fn-as-fp8e4m3",
+    "--internal-backend-options=--enable-verifier=false --enable-nested-dynamic-loop"
+  ],
+  "vllm_neuron": "/home/ubuntu/glm53f-wt/moe-t/vllm_neuron",
+  "baseline_module": "/home/ubuntu/glm53f-wt/moe-t-cache/benchmark_workdir/test/hardware/baselines/moe_5938748",
+  "method": "Host launch and sync cost far more than one layer, so each variant is\ncompiled twice into one graph: 1 layer and ``L`` layers (distinct inputs and\ndistinct weight copies per layer). Layer ``l`` reads layer ``l-1``'s output, as\nin the model: the expert input is ``x_l + 2^-8 * y_{l-1}``; the router's\ncorrection bias is ``b_l + 2^-8 * sum(affinity_{l-1})`` (a constant shift: the\nselection is unchanged). Without a dependency the compiler overlaps the\nindependent layers' kernels and the slope undercounts (measured: 1.2 us per\nrouter layer). The router is also timed with the dependency through its\nactivation, ``x_l + 2^-8 * rowsum(affinity_{l-1})`` (``*_hidden_chain``).\nThe per-layer cost is the slope: ``(t_L - median(t_1)) / (L - 1)`` per timed\n``t_L`` sample, whose median and p90 are reported. It includes the one small chaining op per layer, the same in\nboth variants. Expert scenarios fix the number of distinct local experts per\nlayer, so the hit count is a controlled input rather than a routing accident.\nThe device checks compare the 1-layer graph (no chaining) with the torch oracle.",
+  "programs": {
+    "router_after": 1,
+    "experts_after": 2,
+    "experts_before": "compact_decode_kernel / moe_fused_fp8_kernel, grid [2]",
+    "router_before": "noaux_tc_rmsnorm_router_topk, both programs (128 rows each)"
+  },
+  "shapes": {
+    "H": 4096,
+    "E_global": 288,
+    "top_k": 8,
+    "E_local": 18,
+    "I_local": 512,
+    "rank": 5
+  },
+  "cases": [
+    {
+      "family": "router",
+      "T": 1,
+      "layers": 8,
+      "router_weights": "checkpoint layers 3..",
+      "before": {
+        "median_us": 78.88364285714286,
+        "p90_us": 84.15464285714287,
+        "min_us": 74.14407142857142,
+        "one_layer_call_median_ms": 0.2344805,
+        "8_layer_call_median_ms": 0.786666,
+        "iterations": 50,
+        "warmup": 10,
+        "profile_dir": null
+      },
+      "before_hidden_chain": {
+        "median_us": 115.35335714285713,
+        "p90_us": 141.05392857142857,
+        "min_us": 83.06335714285714,
+        "one_layer_call_median_ms": 0.2404655,
+        "8_layer_call_median_ms": 1.047939,
+        "iterations": 50,
+        "warmup": 10
+      },
+      "after": {
+        "median_us": 22.86114285714286,
+        "p90_us": 47.91478571428571,
+        "min_us": 19.041357142857144,
+        "one_layer_call_median_ms": 0.1599025,
+        "8_layer_call_median_ms": 0.3199305,
+        "iterations": 50,
+        "warmup": 10,
+        "profile_dir": null
+      },
+      "after_hidden_chain": {
+        "median_us": 32.44835714285715,
+        "p90_us": 81.91807142857142,
+        "min_us": 28.997785714285715,
+        "one_layer_call_median_ms": 0.1583525,
+        "8_layer_call_median_ms": 0.38549100000000003,
+        "iterations": 50,
+        "warmup": 10
+      },
+      "checks": {
+        "before": {
+          "index_sets_equal_oracle": true,
+          "max_abs_affinity_vs_oracle": 5.960464477539063e-08
+        },
+        "after": {
+          "index_sets_equal_oracle": true,
+          "max_abs_affinity_vs_oracle": 5.960464477539063e-08
+        }
+      },
+      "speedup_median": 3.450555527782638,
+      "speedup_median_hidden_chain": 3.5549829729438196
+    },
+    {
+      "family": "experts",
+      "T": 1,
+      "scenario": "0_hits",
+      "layers": 8,
+      "distinct_local_experts_per_layer": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "token_expert_pairs_per_layer": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "before": {
+        "median_us": 131.85414285714288,
+        "p90_us": 134.68949999999998,
+        "min_us": 127.20935714285714,
+        "one_layer_call_median_ms": 0.3236325,
+        "8_layer_call_median_ms": 1.2466115,
+        "iterations": 50,
+        "warmup": 10,
+        "profile_dir": null
+      },
+      "after": {
+        "median_us": 35.41585714285714,
+        "p90_us": 41.74942857142857,
+        "min_us": 30.569142857142857,
+        "one_layer_call_median_ms": 0.178892,
+        "8_layer_call_median_ms": 0.426803,
+        "iterations": 50,
+        "warmup": 10,
+        "profile_dir": null
+      },
+      "checks": {
+        "before": {
+          "max_abs_vs_oracle": 0.0,
+          "max_abs_ref": 0.0
+        },
+        "after": {
+          "max_abs_vs_oracle": 0.0,
+          "max_abs_ref": 0.0
+        }
+      },
+      "speedup_median": 3.7230256019297254
+    },
+    {
+      "family": "experts",
+      "T": 1,
+      "scenario": "1_hit",
+      "layers": 8,
+      "distinct_local_experts_per_layer": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "token_expert_pairs_per_layer": [
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1,
+        1
+      ],
+      "before": {
+        "median_us": 229.0562142857143,
+        "p90_us": 237.68807142857145,
+        "min_us": 227.69764285714285,
+        "one_layer_call_median_ms": 0.4195075,
+        "8_layer_call_median_ms": 2.022901,
+        "iterations": 50,
+        "warmup": 10,
+        "profile_dir": null
+      },
+      "after": {
+        "median_us": 58.88735714285714,
+        "p90_us": 63.31021428571429,
+        "min_us": 57.01478571428572,
+        "one_layer_call_median_ms": 0.2113035,
+        "8_layer_call_median_ms": 0.623515,
+        "iterations": 50,
+        "warmup": 10,
+        "profile_dir": null
+      },
+      "checks": {
+        "before": {
+          "max_abs_vs_oracle": 0.02848052978515625,
+          "max_abs_ref": 13.451618194580078
+        },
+        "after": {
+          "max_abs_vs_oracle": 0.02848052978515625,
+          "max_abs_ref": 13.451618194580078
+        }
+      },
+      "speedup_median": 3.8897350025411717
+    },
+    {
+      "family": "experts",
+      "T": 1,
+      "scenario": "2_hits",
+      "layers": 8,
+      "distinct_local_experts_per_layer": [
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2
+      ],
+      "token_expert_pairs_per_layer": [
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2
+      ],
+      "before": {
+        "median_us": 228.39635714285714,
+        "p90_us": 272.7907142857143,
+        "min_us": 226.4301428571429,
+        "one_layer_call_median_ms": 0.42006699999999997,
+        "8_layer_call_median_ms": 2.0188414999999997,
+        "iterations": 50,
+        "warmup": 10,
+        "profile_dir": null
+      },
+      "after": {
+        "median_us": 82.48692857142858,
+        "p90_us": 89.98957142857144,
+        "min_us": 79.91185714285713,
+        "one_layer_call_median_ms": 0.239298,
+        "8_layer_call_median_ms": 0.8167065,
+        "iterations": 50,
+        "warmup": 10,
+        "profile_dir": null
+      },
+      "checks": {
+        "before": {
+          "max_abs_vs_oracle": 0.031229019165039062,
+          "max_abs_ref": 15.920209884643555
+        },
+        "after": {
+          "max_abs_vs_oracle": 0.031229019165039062,
+          "max_abs_ref": 15.920209884643555
+        }
+      },
+      "speedup_median": 2.768879398207681
+    },
+    {
+      "family": "router",
+      "T": 4,
+      "layers": 8,
+      "router_weights": "checkpoint layers 3..",
+      "before": {
+        "median_us": 76.88499999999999,
+        "p90_us": 81.74921428571429,
+        "min_us": 70.72778571428572,
+        "one_layer_call_median_ms": 0.2451895,
+        "8_layer_call_median_ms": 0.7833844999999999,
+        "iterations": 50,
+        "warmup": 10,
+        "profile_dir": null
+      },
+      "before_hidden_chain": {
+        "median_us": 468.35835714285713,
+        "p90_us": 491.53100000000006,
+        "min_us": 460.3222857142857,
+        "one_layer_call_median_ms": 0.260636,
+        "8_layer_call_median_ms": 3.5391445,
+        "iterations": 50,
+        "warmup": 10
+      },
+      "after": {
+        "median_us": 23.6515,
+        "p90_us": 40.8755,
+        "min_us": 18.93778571428571,
+        "one_layer_call_median_ms": 0.1679315,
+        "8_layer_call_median_ms": 0.333492,
+        "iterations": 50,
+        "warmup": 10,
+        "profile_dir": null
+      },
+      "after_hidden_chain": {
+        "median_us": 31.646285714285714,
+        "p90_us": 39.298,
+        "min_us": 28.215428571428575,
+        "one_layer_call_median_ms": 0.162501,
+        "8_layer_call_median_ms": 0.384025,
+        "iterations": 50,
+        "warmup": 10
+      },
+      "checks": {
+        "before": {
+          "index_sets_equal_oracle": true,
+          "max_abs_affinity_vs_oracle": 5.960464477539063e-08
+        },
+        "after": {
+          "index_sets_equal_oracle": true,
+          "max_abs_affinity_vs_oracle": 5.960464477539063e-08
+        }
+      },
+      "speedup_median": 3.2507451958649556,
+      "speedup_median_hidden_chain": 14.799789187627525
+    },
+    {
+      "family": "experts",
+      "T": 4,
+      "scenario": "2_distinct",
+      "layers": 8,
+      "distinct_local_experts_per_layer": [
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2
+      ],
+      "token_expert_pairs_per_layer": [
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4
+      ],
+      "before": {
+        "median_us": 332.77735714285717,
+        "p90_us": 341.154,
+        "min_us": 307.9954285714286,
+        "one_layer_call_median_ms": 0.5379659999999999,
+        "8_layer_call_median_ms": 2.8674075,
+        "iterations": 50,
+        "warmup": 10,
+        "profile_dir": null
+      },
+      "after": {
+        "median_us": 88.37542857142857,
+        "p90_us": 96.89242857142857,
+        "min_us": 84.01128571428572,
+        "one_layer_call_median_ms": 0.254116,
+        "8_layer_call_median_ms": 0.872744,
+        "iterations": 50,
+        "warmup": 10,
+        "profile_dir": null
+      },
+      "checks": {
+        "before": {
+          "max_abs_vs_oracle": 0.030989646911621094,
+          "max_abs_ref": 13.644536972045898
+        },
+        "after": {
+          "max_abs_vs_oracle": 0.030989646911621094,
+          "max_abs_ref": 13.644536972045898
+        }
+      },
+      "speedup_median": 3.76549638878292
+    },
+    {
+      "family": "experts",
+      "T": 4,
+      "scenario": "4_distinct",
+      "layers": 8,
+      "distinct_local_experts_per_layer": [
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4,
+        4
+      ],
+      "token_expert_pairs_per_layer": [
+        6,
+        6,
+        6,
+        6,
+        6,
+        6,
+        6,
+        6
+      ],
+      "before": {
+        "median_us": 412.6524285714286,
+        "p90_us": 415.36071428571427,
+        "min_us": 407.6332857142857,
+        "one_layer_call_median_ms": 0.6259220000000001,
+        "8_layer_call_median_ms": 3.514489,
+        "iterations": 50,
+        "warmup": 10,
+        "profile_dir": null
+      },
+      "after": {
+        "median_us": 140.4822857142857,
+        "p90_us": 173.68307142857145,
+        "min_us": 138.14435714285713,
+        "one_layer_call_median_ms": 0.2846305,
+        "8_layer_call_median_ms": 1.2680065,
+        "iterations": 50,
+        "warmup": 10,
+        "profile_dir": null
+      },
+      "checks": {
+        "before": {
+          "max_abs_vs_oracle": 0.03122997283935547,
+          "max_abs_ref": 15.920210838317871
+        },
+        "after": {
+          "max_abs_vs_oracle": 0.03122997283935547,
+          "max_abs_ref": 15.920210838317871
+        }
+      },
+      "speedup_median": 2.93739830949708
+    },
+    {
+      "family": "router",
+      "T": 64,
+      "layers": 8,
+      "router_weights": "checkpoint layers 3..",
+      "after": {
+        "median_us": 33.669,
+        "p90_us": 38.84307142857143,
+        "min_us": 28.8695,
+        "one_layer_call_median_ms": 0.17869849999999998,
+        "8_layer_call_median_ms": 0.41438149999999996,
+        "iterations": 50,
+        "warmup": 10,
+        "profile_dir": null
+      },
+      "after_hidden_chain": {
+        "median_us": 45.642071428571434,
+        "p90_us": 48.27035714285715,
+        "min_us": 42.19035714285714,
+        "one_layer_call_median_ms": 0.1804325,
+        "8_layer_call_median_ms": 0.499927,
+        "iterations": 50,
+        "warmup": 10
+      },
+      "checks": {
+        "after": {
+          "index_sets_equal_oracle": true,
+          "max_abs_affinity_vs_oracle": 3.2961368560791016e-05
+        }
+      }
+    },
+    {
+      "family": "experts",
+      "T": 64,
+      "scenario": "15_distinct",
+      "layers": 8,
+      "distinct_local_experts_per_layer": [
+        15,
+        15,
+        15,
+        15,
+        15,
+        15,
+        15,
+        15
+      ],
+      "token_expert_pairs_per_layer": [
+        37,
+        36,
+        37,
+        36,
+        37,
+        37,
+        36,
+        37
+      ],
+      "after": {
+        "median_us": 874.7079285714286,
+        "p90_us": 900.1246428571429,
+        "min_us": 868.2412142857142,
+        "one_layer_call_median_ms": 1.0771225,
+        "8_layer_call_median_ms": 7.2000779999999995,
+        "iterations": 50,
+        "warmup": 10,
+        "profile_dir": null
+      },
+      "checks": {
+        "after": {
+          "max_abs_vs_oracle": 0.055805206298828125,
+          "max_abs_ref": 18.970483779907227
+        }
+      }
+    }
+  ],
+  "router_plus_experts_per_layer": [
+    {
+      "T": 1,
+      "scenario": "0_hits",
+      "before_median_us": 210.73778571428574,
+      "before_p90_us": 218.84414285714286,
+      "after_median_us": 58.277,
+      "after_p90_us": 89.66421428571428,
+      "after_over_before": 0.27653797254475687,
+      "meets_0_6": true,
+      "gain_us_per_layer": 152.46078571428575,
+      "bounded_e2e_ms_per_step_42_layers": 6.403353000000001,
+      "hidden_chain_before_median_us": 247.2075,
+      "hidden_chain_after_median_us": 67.8642142857143,
+      "hidden_chain_after_over_before": 0.27452328220508804
+    },
+    {
+      "T": 1,
+      "scenario": "1_hit",
+      "before_median_us": 307.93985714285714,
+      "before_p90_us": 321.84271428571435,
+      "after_median_us": 81.7485,
+      "after_p90_us": 111.225,
+      "after_over_before": 0.2654690456717198,
+      "meets_0_6": true,
+      "gain_us_per_layer": 226.19135714285713,
+      "bounded_e2e_ms_per_step_42_layers": 9.500037,
+      "hidden_chain_before_median_us": 344.40957142857144,
+      "hidden_chain_after_median_us": 91.33571428571429,
+      "hidden_chain_after_over_before": 0.2651950522363946
+    },
+    {
+      "T": 1,
+      "scenario": "2_hits",
+      "before_median_us": 307.28,
+      "before_p90_us": 356.9453571428571,
+      "after_median_us": 105.34807142857144,
+      "after_p90_us": 137.90435714285715,
+      "after_over_before": 0.34284063859857933,
+      "meets_0_6": true,
+      "gain_us_per_layer": 201.93192857142853,
+      "bounded_e2e_ms_per_step_42_layers": 8.481140999999997,
+      "hidden_chain_before_median_us": 343.7497142857143,
+      "hidden_chain_after_median_us": 114.93528571428573,
+      "hidden_chain_after_over_before": 0.33435747271270466
+    },
+    {
+      "T": 4,
+      "scenario": "2_distinct",
+      "before_median_us": 409.66235714285716,
+      "before_p90_us": 422.9032142857143,
+      "after_median_us": 112.02692857142857,
+      "after_p90_us": 137.76792857142857,
+      "after_over_before": 0.27346161202788427,
+      "meets_0_6": true,
+      "gain_us_per_layer": 297.6354285714286,
+      "bounded_e2e_ms_per_step_42_layers": 12.500688,
+      "hidden_chain_before_median_us": 801.1357142857144,
+      "hidden_chain_after_median_us": 120.02171428571428,
+      "hidden_chain_after_over_before": 0.14981445982934938
+    },
+    {
+      "T": 4,
+      "scenario": "4_distinct",
+      "before_median_us": 489.53742857142856,
+      "before_p90_us": 497.10992857142855,
+      "after_median_us": 164.1337857142857,
+      "after_p90_us": 214.55857142857144,
+      "after_over_before": 0.3352834249942073,
+      "meets_0_6": true,
+      "gain_us_per_layer": 325.40364285714287,
+      "bounded_e2e_ms_per_step_42_layers": 13.666953000000001,
+      "hidden_chain_before_median_us": 881.0107857142857,
+      "hidden_chain_after_median_us": 172.1285714285714,
+      "hidden_chain_after_over_before": 0.19537623627276815
+    },
+    {
+      "T": 64,
+      "scenario": "15_distinct",
+      "after_median_us": 908.3769285714286,
+      "after_p90_us": 938.9677142857144
+    }
+  ],
+  "expert_cost_per_hit_T1": {
+    "before": {
+      "zero_hit_layer_us": 131.85414285714288,
+      "first_hit_us": 97.20207142857143,
+      "second_hit_us": -0.6598571428571631
+    },
+    "after": {
+      "zero_hit_layer_us": 35.41585714285714,
+      "first_hit_us": 23.4715,
+      "second_hit_us": 23.599571428571437
+    }
+  }
+}

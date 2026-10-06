@@ -1,0 +1,316 @@
+{
+  "environment": {
+    "NEURON_RT_VISIBLE_CORES": "0-3",
+    "NEURON_LOGICAL_NC_CONFIG": "2",
+    "NEURON_CC_FLAGS": null,
+    "NEURON_PLATFORM_TARGET_OVERRIDE": "trn2",
+    "NEURON_LIBTORCH_CACHE_ROOT": "/home/ubuntu/glm53f-wt/mhc-cache",
+    "NEURON_LIBTORCH_DISABLE_COMPILE_CACHE": "1"
+  },
+  "device": "neuron:0 (one logical core = 2 physical cores at LNC2)",
+  "after_modules": [
+    "/home/ubuntu/glm53f-wt/mhc/vllm_neuron/functional/mhc/sinkhorn.py",
+    "/home/ubuntu/glm53f-wt/mhc/vllm_neuron/functional/mhc/hyper_connection.py"
+  ],
+  "compile_cache": "disabled",
+  "baseline_module": "/home/ubuntu/glm53f-wt/mhc/test/hardware/baselines/mhc_5938748",
+  "method": "per-call device time = slope between a K-long and a 1-long dependency chain of the kernel in one compiled graph, from the runtime system trace; per site = sinkhorn + combine",
+  "cases": [
+    {
+      "B": 64,
+      "hidden": 4096,
+      "streams": 4,
+      "iters": 20,
+      "chain_length": 9,
+      "checks": {
+        "before": {
+          "sinkhorn_max_abs_vs_cpu": 1.1920928955078125e-07,
+          "combine_max_abs_vs_cpu": 3.0517578125e-05
+        },
+        "after": {
+          "sinkhorn_max_abs_vs_cpu": 1.1920928955078125e-07,
+          "combine_max_abs_vs_cpu": 3.0517578125e-05
+        }
+      },
+      "equivalence": {
+        "sinkhorn_max_abs_after_vs_before": 0.0,
+        "combine_max_abs_after_vs_before": 0.0
+      },
+      "before": {
+        "sinkhorn": {
+          "device_per_call": {
+            "iterations": 50,
+            "median_us": 124.18975,
+            "mean_us": 124.04805,
+            "p90_us": 124.37175,
+            "min_us": 122.86250000000001,
+            "max_us": 124.465375
+          },
+          "device_single_call_graph": {
+            "iterations": 50,
+            "median_us": 132.5965,
+            "mean_us": 133.87838,
+            "p90_us": 142.09199999999998,
+            "min_us": 132.33100000000002,
+            "max_us": 143.338
+          },
+          "host_single_call_graph": {
+            "iterations": 50,
+            "median_us": 345.90999999999997,
+            "mean_us": 388.23756,
+            "p90_us": 501.93699999999995,
+            "min_us": 317.498,
+            "max_us": 921.608
+          }
+        },
+        "combine": {
+          "device_per_call": {
+            "iterations": 50,
+            "median_us": 95.737,
+            "mean_us": 95.895705,
+            "p90_us": 97.226125,
+            "min_us": 94.773,
+            "max_us": 97.587375
+          },
+          "device_single_call_graph": {
+            "iterations": 50,
+            "median_us": 110.9125,
+            "mean_us": 111.13748,
+            "p90_us": 111.315,
+            "min_us": 110.506,
+            "max_us": 118.518
+          },
+          "host_single_call_graph": {
+            "iterations": 50,
+            "median_us": 623.306,
+            "mean_us": 672.61562,
+            "p90_us": 907.9789999999999,
+            "min_us": 585.665,
+            "max_us": 1380.512
+          }
+        },
+        "site": {
+          "iterations": 50,
+          "median_us": 219.9193125,
+          "mean_us": 219.943755,
+          "p90_us": 221.48312500000003,
+          "min_us": 218.43762499999997,
+          "max_us": 221.809
+        }
+      },
+      "after": {
+        "sinkhorn": {
+          "device_per_call": {
+            "iterations": 50,
+            "median_us": 27.5874375,
+            "mean_us": 27.73908,
+            "p90_us": 28.873625,
+            "min_us": 27.230874999999997,
+            "max_us": 29.201000000000004
+          },
+          "device_single_call_graph": {
+            "iterations": 50,
+            "median_us": 48.6665,
+            "mean_us": 48.58544,
+            "p90_us": 50.31,
+            "min_us": 38.879,
+            "max_us": 50.879
+          },
+          "host_single_call_graph": {
+            "iterations": 50,
+            "median_us": 254.7665,
+            "mean_us": 365.65478,
+            "p90_us": 444.363,
+            "min_us": 215.492,
+            "max_us": 2153.294
+          }
+        },
+        "combine": {
+          "device_per_call": {
+            "iterations": 50,
+            "median_us": 53.265,
+            "mean_us": 53.18057,
+            "p90_us": 54.597500000000004,
+            "min_us": 51.08262500000001,
+            "max_us": 55.04725
+          },
+          "device_single_call_graph": {
+            "iterations": 50,
+            "median_us": 83.52199999999999,
+            "mean_us": 82.6104,
+            "p90_us": 84.996,
+            "min_us": 69.018,
+            "max_us": 99.407
+          },
+          "host_single_call_graph": {
+            "iterations": 50,
+            "median_us": 605.1295,
+            "mean_us": 671.61808,
+            "p90_us": 747.3290000000001,
+            "min_us": 554.783,
+            "max_us": 2188.5699999999997
+          }
+        },
+        "site": {
+          "iterations": 50,
+          "median_us": 80.852125,
+          "mean_us": 80.91965,
+          "p90_us": 82.371125,
+          "min_us": 78.4205,
+          "max_us": 83.519625
+        }
+      },
+      "site_median_speedup": 2.720018954356487,
+      "site_after_over_before": 0.3676444968879211,
+      "bounded_step_saving_ms": 12.516046874999999
+    },
+    {
+      "B": 128,
+      "hidden": 4096,
+      "streams": 4,
+      "iters": 20,
+      "chain_length": 9,
+      "checks": {
+        "before": {
+          "sinkhorn_max_abs_vs_cpu": 1.1920928955078125e-07,
+          "combine_max_abs_vs_cpu": 3.0517578125e-05
+        },
+        "after": {
+          "sinkhorn_max_abs_vs_cpu": 1.1920928955078125e-07,
+          "combine_max_abs_vs_cpu": 3.0517578125e-05
+        }
+      },
+      "equivalence": {
+        "sinkhorn_max_abs_after_vs_before": 0.0,
+        "combine_max_abs_after_vs_before": 0.0
+      },
+      "before": {
+        "sinkhorn": {
+          "device_per_call": {
+            "iterations": 50,
+            "median_us": 93.8605625,
+            "mean_us": 93.711525,
+            "p90_us": 94.13037499999999,
+            "min_us": 92.517875,
+            "max_us": 94.54024999999999
+          },
+          "device_single_call_graph": {
+            "iterations": 50,
+            "median_us": 103.2295,
+            "mean_us": 104.85746,
+            "p90_us": 112.388,
+            "min_us": 102.794,
+            "max_us": 114.868
+          },
+          "host_single_call_graph": {
+            "iterations": 50,
+            "median_us": 334.6345,
+            "mean_us": 373.88844,
+            "p90_us": 411.934,
+            "min_us": 299.417,
+            "max_us": 1362.153
+          }
+        },
+        "combine": {
+          "device_per_call": {
+            "iterations": 50,
+            "median_us": 103.70218750000001,
+            "mean_us": 103.825795,
+            "p90_us": 105.10749999999999,
+            "min_us": 102.21674999999999,
+            "max_us": 105.4785
+          },
+          "device_single_call_graph": {
+            "iterations": 50,
+            "median_us": 117.9365,
+            "mean_us": 118.58834,
+            "p90_us": 118.615,
+            "min_us": 117.49900000000001,
+            "max_us": 129.765
+          },
+          "host_single_call_graph": {
+            "iterations": 50,
+            "median_us": 925.3775,
+            "mean_us": 960.28554,
+            "p90_us": 980.891,
+            "min_us": 886.232,
+            "max_us": 1658.559
+          }
+        },
+        "site": {
+          "iterations": 50,
+          "median_us": 197.6141875,
+          "mean_us": 197.53732,
+          "p90_us": 198.83450000000002,
+          "min_us": 195.266,
+          "max_us": 199.53912499999998
+        }
+      },
+      "after": {
+        "sinkhorn": {
+          "device_per_call": {
+            "iterations": 50,
+            "median_us": 28.493437500000002,
+            "mean_us": 28.6421725,
+            "p90_us": 29.833749999999995,
+            "min_us": 28.08625,
+            "max_us": 29.992125
+          },
+          "device_single_call_graph": {
+            "iterations": 50,
+            "median_us": 49.1665,
+            "mean_us": 49.07478,
+            "p90_us": 50.405,
+            "min_us": 46.517999999999994,
+            "max_us": 50.962
+          },
+          "host_single_call_graph": {
+            "iterations": 50,
+            "median_us": 275.837,
+            "mean_us": 359.64302,
+            "p90_us": 405.252,
+            "min_us": 229.669,
+            "max_us": 1990.2359999999999
+          }
+        },
+        "combine": {
+          "device_per_call": {
+            "iterations": 50,
+            "median_us": 59.5565,
+            "mean_us": 59.5264725,
+            "p90_us": 60.837624999999996,
+            "min_us": 57.18662500000001,
+            "max_us": 61.40862500000001
+          },
+          "device_single_call_graph": {
+            "iterations": 50,
+            "median_us": 92.08250000000001,
+            "mean_us": 90.98942,
+            "p90_us": 94.098,
+            "min_us": 78.731,
+            "max_us": 95.155
+          },
+          "host_single_call_graph": {
+            "iterations": 50,
+            "median_us": 914.0215,
+            "mean_us": 965.19082,
+            "p90_us": 976.921,
+            "min_us": 871.158,
+            "max_us": 2325.919
+          }
+        },
+        "site": {
+          "iterations": 50,
+          "median_us": 88.06887499999999,
+          "mean_us": 88.168645,
+          "p90_us": 89.58462499999999,
+          "min_us": 85.588,
+          "max_us": 90.28637499999999
+        }
+      },
+      "site_median_speedup": 2.2438595644602026,
+      "site_after_over_before": 0.44566068921544405,
+      "bounded_step_saving_ms": 9.859078125000002
+    }
+  ]
+}
