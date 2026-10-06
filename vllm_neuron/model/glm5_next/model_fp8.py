@@ -4792,15 +4792,22 @@ class Glm5NextDSAIndexer(nn.Module):
         ``width`` is read off the bounded tensor rather than from a config field, so
         it cannot disagree with what the selector was actually given.
         """
-        from vllm_neuron.functional.dsa.causal_bound import (
-            dsa_causal_bound,
-            dsa_causal_sentinel,
-        )
-        from vllm_neuron.functional.dsa.topk_select import dsa_topk_select
+        from vllm_neuron.functional.dsa.causal_bound import dsa_causal_bound
 
         bounded = dsa_causal_bound(
             scores, seq_lens.to(torch.int32).reshape(-1, 1), self.index_kpool
         )
+        return self._select_bounded(bounded)
+
+    def _select_bounded(self, bounded: torch.Tensor) -> torch.Tensor:
+        """Select on scores the causal bound has already filled, sentinelise, order.
+
+        The tail of :meth:`select_bounded_pools`, shared with :meth:`forward_requests`,
+        whose score kernel applies each request's bound itself.
+        """
+        from vllm_neuron.functional.dsa.causal_bound import dsa_causal_sentinel
+        from vllm_neuron.functional.dsa.topk_select import dsa_topk_select
+
         values, indices = dsa_topk_select(bounded, self.select_k())
         pool_ids = indices.to(torch.int32)
         sentinelised = dsa_causal_sentinel(values, pool_ids, int(bounded.shape[1]))
@@ -5231,6 +5238,111 @@ class Glm5NextDSAIndexer(nn.Module):
         # The causal bound and the sentinel, at one site.
         pool_ids = self.select_bounded_pools(scores, seq_lens)
         return self.expand_indices(pool_ids, seq_lens)
+
+    def forward_requests(
+        self,
+        hidden_states: torch.Tensor,
+        q_latent: torch.Tensor,
+        pool_bank: torch.Tensor,
+        tail_bank: torch.Tensor,
+        slots: torch.Tensor,
+        seq_lens: torch.Tensor,
+        position: torch.Tensor,
+        *,
+        max_seq_len: int,
+        indices_wanted: bool = True,
+        projected: tuple | None = None,
+    ) -> torch.Tensor | None:
+        """:meth:`forward`'s decode leg for ``B`` requests, one token each, in one pass.
+
+        Request ``b`` is row ``b`` of ``hidden_states`` and ``q_latent`` and entry
+        ``b`` of ``slots``, ``seq_lens`` and ``position``; its ring is
+        ``tail_bank[slots[b]]`` and its pooled-key store ``pool_bank[slots[b]]``. The
+        banks are the runner's whole side caches, not per-request views: the kernels
+        address them by slot, so one launch per stage serves every request and no
+        request can read another's rows. Returns ``[B, width]`` token indices, the
+        same rows :meth:`forward` returns one request at a time, or None (or the
+        causal fill) when ``max_seq_len`` does not select.
+
+        Args:
+            pool_bank: ``[slots, rows, index_head_dim]`` bf16, ``rows > max_seq_len //
+                index_kpool``; row ``rows - 1`` of each slot is its write trash.
+            tail_bank: ``[slots, 2, index_kpool, index_head_dim]`` bf16 rings.
+            slots: ``[B]`` int, distinct.
+            seq_lens: ``[B]`` int32, each request's length with this step's token.
+            position: ``[B]`` int, each request's absolute position (``seq_lens - 1``).
+            projected: :meth:`project_stage`'s four outputs for these ``B`` rows, when
+                the caller already ran it.
+
+        Both banks are written in place on their base tensors (the advanced rings,
+        and each completed pool at its row or the trash row). The score kernel takes
+        this step's completed pool from the ring step's output rather than from the
+        bank, so the selection does not depend on when the bank write lands.
+        """
+        from vllm_neuron.functional.dsa.decode_batch import (
+            decode_pool_destinations,
+            dsa_decode_ring_step,
+            dsa_decode_scores,
+        )
+
+        self.require_dials()
+        pool, dim = self.index_kpool, self.index_head_dim
+        if pool_bank.ndim != 3 or int(pool_bank.shape[2]) != dim:
+            raise Glm5NextDSAIndexerError(
+                f"pool_bank must be [slots, rows, {dim}]; got {tuple(pool_bank.shape)}"
+            )
+        # The per-slot store is contiguous, so the shared rule reads it at one row
+        # per page.
+        candidates, _trash, selects = self._require_serviceable(
+            int(max_seq_len), 1, pool_bank[0]
+        )
+        want_tail = (int(pool_bank.shape[0]), 2, pool, dim)
+        if tuple(tail_bank.shape) != want_tail:
+            raise Glm5NextDSAIndexerError(
+                f"tail_bank must be [slots, 2, index_kpool, index_head_dim] = "
+                f"{want_tail}, one ring per pool_bank slot; got {tuple(tail_bank.shape)}"
+            )
+        batch = int(hidden_states.shape[0])
+        for name, value in (("slots", slots), ("seq_lens", seq_lens), ("position", position)):
+            if not torch.is_tensor(value) or tuple(value.shape) != (batch,):
+                raise Glm5NextDSAIndexerError(
+                    f"{name} must be a [{batch}] tensor, one entry per request; got "
+                    f"{value!r}"
+                )
+        ape = self.index_kpool_compress_ape
+        if ape is None or tuple(ape.shape) != (pool, dim):
+            raise Glm5NextDSAIndexerError(
+                f"index_kpool_compress_ape must be materialised and shaped "
+                f"{(pool, dim)}; got {None if ape is None else tuple(ape.shape)}"
+            )
+        if projected is None:
+            projected = self.project_stage(
+                hidden_states, q_latent, query_side=selects or indices_wanted
+            )
+        query, key, weights, gate_score = projected
+
+        pooled, rings = dsa_decode_ring_step(
+            tail_bank, slots, key, gate_score, ape.to(torch.float32), position
+        )
+        slot_index, row = decode_pool_destinations(
+            slots, position, rows=int(pool_bank.shape[1]), pool_size=pool
+        )
+        if not selects:
+            tail_bank.index_copy_(0, slot_index, rings.to(tail_bank.dtype))
+            pool_bank.index_put_((slot_index, row), pooled.to(pool_bank.dtype))
+            if not indices_wanted:
+                return None
+            return self._bypass_indices(seq_lens)
+
+        bounded = dsa_decode_scores(
+            query, weights, pool_bank, slots, seq_lens, position, pooled,
+            candidates=candidates, pool_size=pool,
+        )
+        # The writes after the read: the kernel stands this step's pool in itself,
+        # and the bank rows it reads are the pools before this step.
+        tail_bank.index_copy_(0, slot_index, rings.to(tail_bank.dtype))
+        pool_bank.index_put_((slot_index, row), pooled.to(pool_bank.dtype))
+        return self.expand_indices(self._select_bounded(bounded), seq_lens)
 
     def forward_ragged(
         self,
