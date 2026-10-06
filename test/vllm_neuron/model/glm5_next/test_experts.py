@@ -1131,11 +1131,18 @@ def test_shared_expert_seam_entries_are_one_per_projection_site():
     assert per_call == [SHARED_DECLARED_SEAM_ENTRIES, SHARED_DECLARED_SEAM_ENTRIES]
     assert sim.calls == 2 * SHARED_DECLARED_SEAM_ENTRIES
 
-    # The structural reading behind the number: three call sites in the source.
+    # The structural reading behind the number: shared_expert_mm makes one fused
+    # MLP call, whose whole-tile route holds the three projection call sites.
     method = _shared_source_method("Glm5NextSharedExperts", "shared_expert_mm")
-    source_entries = _shared_count_calls(method, "blockwise_fp8_mm")
+    fused_calls = _shared_count_calls(method, "blockwise_fp8_mlp")
+    assert fused_calls == 1, (
+        f"shared_expert_mm contains {fused_calls} calls to blockwise_fp8_mlp, "
+        f"declared 1"
+    )
+    fused = ast.parse(inspect.getsource(seam.blockwise_fp8_mlp))
+    source_entries = _shared_count_calls(fused, "blockwise_fp8_mm")
     assert source_entries == SHARED_DECLARED_SEAM_ENTRIES, (
-        f"shared_expert_mm contains {source_entries} calls to blockwise_fp8_mm, "
+        f"blockwise_fp8_mlp contains {source_entries} calls to blockwise_fp8_mm, "
         f"declared {SHARED_DECLARED_SEAM_ENTRIES} (gate, up, down)"
     )
 
@@ -1445,10 +1452,19 @@ def test_shared_expert_swiglu_bound_is_the_checkpoints_and_no_literal_governs_it
         )
         signatures[method] = parameter
 
-    # Reading 4: the clamp calls, read off the shipped source.
+    # Reading 4: the clamp calls, read off the shipped source. shared_expert_mm
+    # hands its bound to the fused MLP, whose torch route holds the clamps.
     method_ast = _shared_source_method("Glm5NextSharedExperts", "shared_expert_mm")
+    handed = {
+        kw.arg: ast.unparse(kw.value)
+        for node in ast.walk(method_ast)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "id", None) == "blockwise_fp8_mlp"
+        for kw in node.keywords
+    }
+    fused_ast = ast.parse(inspect.getsource(_shared_seam().blockwise_fp8_mlp))
     clamps = {}
-    for node in ast.walk(method_ast):
+    for node in ast.walk(fused_ast):
         if not isinstance(node, ast.Call):
             continue
         if not (isinstance(node.func, ast.Attribute) and node.func.attr == "clamp"):
@@ -1505,13 +1521,17 @@ def test_shared_expert_swiglu_bound_is_the_checkpoints_and_no_literal_governs_it
             f"construction, so a caller cannot supply a different one."
         )
     # Reading 4.
-    assert clamps.get("gate") == {"min": "None", "max": "self.swiglu_limit"}, (
+    assert handed.get("swiglu_limit") == "self.swiglu_limit", (
+        f"shared_expert_mm hands the fused MLP swiglu_limit="
+        f"{handed.get('swiglu_limit')}; the bound must be the config's"
+    )
+    assert clamps.get("gate") == {"min": "None", "max": "swiglu_limit"}, (
         f"the shipped gate clamp reads {clamps.get('gate')}; the reference bounds "
         f"the gate ABOVE ONLY (modeling_glm5_next.py) with the config's bound"
     )
     assert clamps.get("up") == {
-        "min": "-self.swiglu_limit",
-        "max": "self.swiglu_limit",
+        "min": "-swiglu_limit",
+        "max": "swiglu_limit",
     }, (
         f"the shipped up clamp reads {clamps.get('up')}; the reference bounds the "
         f"up operand on BOTH sides (modeling_glm5_next.py)"

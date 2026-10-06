@@ -182,6 +182,12 @@ _SEAM_REGISTRY = {
     "kda_fused_decode": (
         "vllm_neuron.functional.kda.fused_decode",
         "fused_decode_dispatch_counters", "reset_fused_decode_dispatch_counters"),
+    "dense_mlp_fused": (
+        "vllm_neuron.functional.blockwise_fp8_mm",
+        "mlp_dispatch_counters", "reset_mlp_dispatch_counters"),
+    "dense_rms_norm": (
+        "vllm_neuron.functional.norm",
+        "norm_dispatch_counters", "reset_norm_dispatch_counters"),
 }
 _SEAMS = tuple(_SEAM_REGISTRY)
 

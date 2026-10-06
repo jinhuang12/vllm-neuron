@@ -174,6 +174,23 @@ def _record_the_seam(monkeypatch: pytest.MonkeyPatch, sentinel: float) -> dict:
     return log
 
 
+def _record_the_fused_seam(monkeypatch: pytest.MonkeyPatch, sentinel: float) -> dict:
+    """The same watch on the fused MLP call short steps now make. """
+    seam = _seam_module()
+    real = seam.blockwise_fp8_mlp
+    log: dict = {"rows": [], "sentinel_rows": [], "outputs": []}
+
+    def watcher(x, *args, **kwargs):
+        log["rows"].append(int(x.shape[0]))
+        log["sentinel_rows"].append(int((x == sentinel).all(dim=1).sum()))
+        out = real(x, *args, **kwargs)
+        log["outputs"].append(out)
+        return out
+
+    monkeypatch.setattr(seam, "blockwise_fp8_mlp", watcher)
+    return log
+
+
 def _worst_relative_error(got: torch.Tensor, want: torch.Tensor) -> tuple[float, int]:
     """``(worst ratio, elements outside)`` against ``atol + rtol * |want|``. """
     a = got.to(torch.float32)
@@ -202,31 +219,34 @@ def _one_item(
             f"({ORACLE_TOKENS}, {HIDDEN}); there would be no reference row"
         )
 
-    # ---- one token through the same path, watched.
+    # ---- one token through the same path, watched. Short steps now make one
+    # fused MLP call (gate, up, SwiGLU, down in one kernel), so the watch is on
+    # that call; the three-call seam must not be entered at all.
     log = _record_the_seam(monkeypatch, sentinel)
+    fused = _record_the_fused_seam(monkeypatch, sentinel)
     seam.reset_dispatch_counters()
+    seam.reset_mlp_dispatch_counters()
     got = run(module, hidden)
-    dispatches, fallbacks = seam.dispatch_counters()
+    dispatches, fallbacks = seam.mlp_dispatch_counters()
 
-    if log["rows"] != [ONE_TOKEN] * 3:
+    if log["rows"] != []:
         raise AssertionError(
-            f"the seam saw {log['rows']} rows per dispatch; all three short "
-            f"projections must run on {ONE_TOKEN} real row"
+            f"the three-call seam saw {log['rows']} rows; a short step must take "
+            f"the fused call"
         )
-    if log["sentinel_rows"][:2] != [0, 0]:
+    if fused["rows"] != [ONE_TOKEN]:
         raise AssertionError(
-            f"the two projections that consume the caller's activation saw "
-            f"{log['sentinel_rows'][:2]} sentinel rows; short steps must not pad"
+            f"the fused seam saw {fused['rows']} rows per dispatch; the short "
+            f"MLP must run on {ONE_TOKEN} real row"
         )
-    if log["sentinel_rows"][2] != 0:
+    if fused["sentinel_rows"] != [0]:
         raise AssertionError(
-            "the down projection consumes the SwiGLU intermediate, whose pad rows "
-            f"are the math's own; it must see 0 sentinel rows, saw "
-            f"{log['sentinel_rows'][2]}"
+            f"the fused call that consumes the caller's activation saw "
+            f"{fused['sentinel_rows']} sentinel rows; short steps must not pad"
         )
 
     # ---- No hidden padded output was computed or sliced away.
-    raw = log["outputs"][-1]
+    raw = fused["outputs"][-1]
     survivors = int(raw.shape[0]) - int(got.shape[0])
     identical = bool(torch.equal(got, raw[: int(got.shape[0])]))
     sentinel_derived = 0 if (identical and tuple(got.shape) == (ONE_TOKEN, HIDDEN)) else (
@@ -254,10 +274,11 @@ def _one_item(
             f"(rtol={RTOL}, atol={ATOL})"
         )
 
-    if (dispatches, fallbacks) != (3, 0):
+    if (dispatches, fallbacks) != (1, 0) or seam.dispatch_counters() != (0, 0):
         raise AssertionError(
-            f"the route predicate reads (nki_dispatch={dispatches}, "
-            f"torch_fallback={fallbacks}); this call declares (3, 0)"
+            f"the route predicate reads fused (nki_dispatch={dispatches}, "
+            f"torch_fallback={fallbacks}) and three-call "
+            f"{seam.dispatch_counters()}; this call declares (1, 0) and (0, 0)"
         )
 
     # ---- Larger partial prefill tiles still pad. Check their sentinel rows
