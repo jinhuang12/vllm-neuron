@@ -15,10 +15,18 @@ no per-physical-core bound: the runtime accounts every tensor of a rank on the
 even physical core (14.46 GiB on ND 0 NC 0 at tip-b64-C, more than half the
 logical core's 24 GiB), so the logical core is the only capacity there is.
 
-The served figures are the bs=64 @ 8k gate line at b17526a,
-``/home/ubuntu/glm53f-wt2/gate/runs/tip-b64-C/server.log`` (every rank):
-"Neuron HBM: 7.06 GiB used, 16.94 GiB free", parameters 1.63 GiB, resident 6.79
-GiB, need 5.845 GiB, allocated 6.329 GiB (side caches 0.347 GiB).
+The served figures are the bs=64 @ 8k gate line at b17526a, gate run tip-b64-C
+server log (every rank): "Neuron HBM: 7.06 GiB used, 16.94 GiB free", parameters
+1.63 GiB, resident 6.79 GiB, need 5.845 GiB, allocated 6.329 GiB (side caches
+0.347 GiB).
+
+A warm compile cache is built in a temporary directory from the recorded decode
+graph of that line (``fixtures/glm53f_bs64x8k_decode_b1_ctx2048.neff``, see
+``test_neff_memory.py``). One test reads the line's real 15-graph cache; it runs
+only when the test-only variable ``VLLM_NEURON_TEST_COMPILE_CACHE_ROOT`` names the
+tip-b64-C compile cache (its ``neuron/compile_cache`` directory) and is skipped when
+it is unset. It is a test knob, not a serving knob, so it is not registered in
+``vllm_neuron/envs.py``.
 
 Run with ``VLLM_NEURON_CPU_MODE=1`` (``test/conftest.py`` pins it); the tests clear
 it where they drive the device path.
@@ -27,11 +35,16 @@ it where they drive the device path.
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 
 import pytest
 
 from test.vllm_neuron.worker import test_kv_budget_glm53f as kv
+from test.vllm_neuron.worker.test_neff_memory import (
+    _cache_entry,
+    _fixture_entry,
+    compile_cache_root,
+    needs_compile_cache,
+)
 from vllm_neuron.vllm.worker import neff_memory
 
 GIB = 1024**3
@@ -49,7 +62,6 @@ TIP_NEED_BYTES = 6276120576
 OLD_CAP_BYTES = int(int(kv.TOTAL_HBM_BYTES * kv.GPU_MEMORY_UTILIZATION) * 0.30)
 OLD_CORE_BOUND_BYTES = kv.TOTAL_HBM_BYTES // 2 - 5 * GIB
 
-TIP_B64_CACHE = Path("/home/ubuntu/glm53f-wt2/gate-cache-tip-b64/neuron/compile_cache")
 #: The bs=64 line warms 15 graphs: 1 prefill bucket x 1 segment, 7 batch x 2 ctx decode.
 TIP_B64_GRAPHS = 15
 
@@ -144,11 +156,15 @@ def test_the_cap_fraction_caps_only_when_set(model_specs, monkeypatch) -> None:
     assert budget.available_bytes == OLD_CAP_BYTES
 
 
-def test_the_graph_reserve_override_replaces_the_measured_need(model_specs, monkeypatch) -> None:
-    monkeypatch.setenv("VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB", "2.5")
-    # A warm cache is present; the override still wins.
-    worker = _tip_worker(model_specs, graph_cache_dir=TIP_B64_CACHE)
+def test_the_graph_reserve_override_replaces_the_measured_need(
+    model_specs, monkeypatch, tmp_path
+) -> None:
+    """A warm cache is present (its one graph supplies the need); the override wins."""
+    _fixture_entry(tmp_path, "decode")
+    worker = _tip_worker(model_specs, graph_cache_dir=tmp_path, expected_graphs=1)
+    assert "1 compiled graphs" in worker._graph_need(worker._kv_cache_need_bytes()).source
 
+    monkeypatch.setenv("VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB", "2.5")
     budget = worker._determine_available_memory_neuron(kv.GPU_MEMORY_UTILIZATION)
 
     assert budget.graph.bytes == int(2.5 * GIB)
@@ -190,8 +206,6 @@ def test_a_cold_cache_assumes_the_reserve_and_says_so(model_specs, tmp_path) -> 
 
 def test_a_partly_compiled_cache_assumes_the_reserve(model_specs, tmp_path) -> None:
     """Graphs of this configuration in the cache, but fewer than warmup will load."""
-    from test.vllm_neuron.worker.test_neff_memory import _cache_entry
-
     worker = _tip_worker(model_specs, graph_cache_dir=tmp_path)
     pool_bytes = worker._kv_cache_largest_tensor_bytes(worker._kv_cache_need_bytes())
     for key in ("aaa", "bbb"):
@@ -204,8 +218,6 @@ def test_a_partly_compiled_cache_assumes_the_reserve(model_specs, tmp_path) -> N
 
 
 def test_a_warm_cache_supplies_the_need_from_its_graphs(model_specs, tmp_path) -> None:
-    from test.vllm_neuron.worker.test_neff_memory import _cache_entry
-
     worker = _tip_worker(model_specs, graph_cache_dir=tmp_path, expected_graphs=2)
     pool_bytes = worker._kv_cache_largest_tensor_bytes(worker._kv_cache_need_bytes())
     for key in ("aaa", "bbb"):
@@ -244,10 +256,10 @@ def test_the_kv_tensor_that_ties_graphs_is_the_latent_pool_layer(model_specs) ->
     assert worker._kv_cache_largest_tensor_bytes(TIP_NEED_BYTES) == 4353 * 131072
 
 
-@pytest.mark.skipif(not TIP_B64_CACHE.is_dir(), reason="gate compile cache not on this host")
+@needs_compile_cache
 def test_the_bs64_line_cache_gives_the_measured_need(model_specs) -> None:
     """The 15 graphs of the warm bs=64 cache: about 1.3 GiB, not 5 GiB."""
-    worker = _tip_worker(model_specs, graph_cache_dir=TIP_B64_CACHE)
+    worker = _tip_worker(model_specs, graph_cache_dir=compile_cache_root())
 
     budget = worker._determine_available_memory_neuron(kv.GPU_MEMORY_UTILIZATION)
 

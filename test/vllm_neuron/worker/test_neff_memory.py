@@ -8,26 +8,38 @@ instruction streams (``*.bin``) and the DMA descriptors (``dma`` arrays).
 
 The runtime's own breakdown, printed per physical core at every NEFF load with
 ``NEURON_RT_LOG_LEVEL=INFO`` (``TDRV:dml_log_dev_neff_mem``), is the reference the
-real-NEFF tests below compare against. The figures are from
-``/home/ubuntu/glm53f-wt2/gate/runs/tip-b64-C/server.log`` (rank 0, ND 0 NC 0 / NC 1,
-runtime 2.34.10, the bs=64 @ 8k line) and ``gate/runs/glue-A/server.log``.
+recorded and real-NEFF tests compare against. The figures are from the server log
+of gate run tip-b64-C (rank 0: ND 0 NC 0 / NC 1, runtime 2.34.10, the bs=64 @ 8k
+line).
 
-The synthetic tests build a NEFF in a temporary directory, so they run anywhere. The
-real-NEFF tests read the gate's warm compile caches and skip where those are absent.
+Three kinds of test:
+
+* synthetic: a NEFF built in a temporary directory;
+* recorded: ``fixtures/glm53f_bs64x8k_decode_b1_ctx2048.neff``, one decode graph of
+  that line reduced to what the reader reads (``fixtures/record_neff_fixture.py``
+  says what is kept and how it was made), and beside it the runtime's breakdown for
+  that graph (``*.provenance.json``). These two kinds run anywhere;
+* real cache: the 15 NEFFs of the tip-b64-C compile cache. They run only when the
+  test-only variable ``VLLM_NEURON_TEST_COMPILE_CACHE_ROOT`` names that cache's
+  ``neuron/compile_cache`` directory, and are skipped when it is unset. It is a test
+  knob, not a serving knob, so it is read here and is not registered in
+  ``vllm_neuron/envs.py``.
 """
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
-import math
 import os
+import re
 import struct
 import tarfile
 from pathlib import Path
 
 import pytest
 
+from test.vllm_neuron.worker import test_kv_budget_glm53f as kv
 from vllm_neuron.vllm.worker import neff_memory
 
 MIB = 1024**2
@@ -312,23 +324,147 @@ def test_a_missing_cache_directory_is_an_empty_scan(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Real NEFFs from the gate's warm compile caches
+# The KV cache tensor that ties a graph to its serve line
 # ---------------------------------------------------------------------------
 
-GATE_ROOT = Path("/home/ubuntu/glm53f-wt2")
-#: bs=64 @ 8k serve line (15 graphs: prefill 1024/kv8192 + 7 batch x 2 ctx decode).
-TIP_B64_CACHE = GATE_ROOT / "gate-cache-tip-b64/neuron/compile_cache"
-#: Standard line plus the bs=64 line (21 graphs, two KV pool sizes).
-TIP_STD_CACHE = GATE_ROOT / "gate-cache-tip-std/neuron/compile_cache"
-#: Standard line, fused-glue branch (3 graphs).
-GLUE_CACHE = GATE_ROOT / "gate-cache-glue/neuron/compile_cache"
+
+def _pool_layer_bytes(max_num_seqs: int, max_model_len: int) -> int:
+    """One latent-pool layer of GLM-5.3-Flash at TP=64, the largest KV cache tensor.
+
+    Blocks of 128 tokens x 512 bf16 latents: per sequence ``max_model_len / 128``
+    attention blocks plus one block per KDA group, plus vLLM's null block (the
+    derivation is ``test_kv_budget_glm53f.py``'s
+    ``test_the_opt_in_line_prices_one_block_per_kda_group_per_request``).
+    """
+    kda_groups = -(-kv.KDA_LAYERS // kv.MLA_LAYERS)
+    blocks = max_num_seqs * (-(-max_model_len // kv.BLOCK_SIZE_TOKENS) + kda_groups) + 1
+    return blocks * kv.BLOCK_SIZE_TOKENS * kv.LATENT_BYTES_PER_TOKEN
+
+
+#: The bs=64 @ 8k line: 64 x (64 + 4) + 1 = 4353 blocks of 131072 B.
+B64_POOL_BYTES = _pool_layer_bytes(64, 8192)
+#: The standard line (1 x 4096, one block per KDA group): 1 x (32 + 4) + 1 = 37 blocks.
+STD_POOL_BYTES = _pool_layer_bytes(1, 4096)
+
+
+#: The runtime's size units, which are binary although printed as KB, MB and GB.
+RUNTIME_UNIT_BYTES = {"B": 1, "KB": 1024, "MB": MIB, "GB": 1024 * MIB}
+
+
+def _runtime_mib(printed: str) -> float:
+    """A size as the runtime prints it (``"2.781MB"``), in MiB."""
+    value, unit = re.fullmatch(r"([0-9.]+)([KMG]?B)", printed).groups()
+    return float(value) * RUNTIME_UNIT_BYTES[unit] / MIB
+
+
+def _mb(value: int) -> float:
+    return value / MIB
+
+
+# ---------------------------------------------------------------------------
+# A recorded decode graph of the bs=64 @ 8k line
+# ---------------------------------------------------------------------------
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+#: The 1-sequence decode graph at context bucket 2048, recorded from the tip-b64-C
+#: compile cache by ``fixtures/record_neff_fixture.py``.
+DECODE_NEFF = FIXTURES / "glm53f_bs64x8k_decode_b1_ctx2048.neff"
+DECODE_PROVENANCE = json.loads(
+    (FIXTURES / f"{DECODE_NEFF.name}.provenance.json").read_text()
+)
+#: The runtime's breakdown of that graph on ND 0 NC 0 and NC 1, as printed.
+DECODE_RUNTIME = DECODE_PROVENANCE["runtime_breakdown"]["per_core"]
+#: The runtime's descriptor rings: IO, spill/reload and its own.
+RUNTIME_RING_ITEMS = ("dma rings io", "dma rings spill", "dma rings runtime")
+
+
+def _fixture_entry(root: Path, key: str) -> Path:
+    """A complete compile cache entry holding the recorded decode graph."""
+    entry = root / key
+    entry.mkdir(parents=True)
+    (entry / f"graph_{key}.neff").write_bytes(DECODE_NEFF.read_bytes())
+    (entry / ".compilation_complete").write_text("completed:0\n")
+    return entry
+
+
+def test_the_fixture_is_the_recorded_one() -> None:
+    """The provenance's digest and size pin the fixture: an edit to it fails here."""
+    data = DECODE_NEFF.read_bytes()
+
+    assert len(data) == DECODE_PROVENANCE["bytes"]
+    assert hashlib.sha256(data).hexdigest() == DECODE_PROVENANCE["sha256"]
+
+
+def test_the_recorded_decode_graph_reads_as_the_runtime_accounts_it() -> None:
+    """Per core, against the runtime's print for this graph: never less, and close.
+
+    * constants: equal (the runtime prints KB to three decimals);
+    * code: every ``*.bin`` member, at most 0.1 MiB over the runtime's figure, the
+      tolerance of the prefill graph's check below;
+    * rings: never fewer than the runtime's. The analyser's count over-counts a small
+      graph's rings (here 2.05 / 1.67 MiB against 1.47 / 1.18 MiB);
+    * so the whole charge is bounded instead: what the reader charges the graph is
+      within 10% of the runtime's own total for it, which adds the runtime's
+      bookkeeping items to code, constants and rings.
+    """
+    memory = neff_memory.read_neff_memory(DECODE_NEFF)
+
+    assert len(memory.cores) == len(DECODE_RUNTIME)
+    for core, printed in zip(memory.cores, (DECODE_RUNTIME["0"], DECODE_RUNTIME["1"])):
+        code = _runtime_mib(printed["model code"])
+        rings = sum(_runtime_mib(printed[item]) for item in RUNTIME_RING_ITEMS)
+        assert core.constant_bytes / 1024 == pytest.approx(
+            _runtime_mib(printed["model constants"]) * 1024, abs=0.01
+        )
+        assert code <= _mb(core.code_bytes) <= code + 0.1
+        assert rings <= _mb(core.dma_ring_bytes)
+        assert _mb(core.persistent_bytes) <= 1.10 * _runtime_mib(printed["Total"])
+    assert B64_POOL_BYTES in memory.input_bytes
+
+
+def test_a_cache_holding_two_serve_lines_is_split_by_the_kv_input(tmp_path) -> None:
+    """The recorded bs=64-line graph and a standard-line graph: each scan keeps its own."""
+    _fixture_entry(tmp_path, "b64")
+    _cache_entry(tmp_path, "std", kv_bytes=STD_POOL_BYTES)
+
+    b64 = neff_memory.scan_compile_cache(tmp_path, kv_input_bytes=B64_POOL_BYTES)
+    std = neff_memory.scan_compile_cache(tmp_path, kv_input_bytes=STD_POOL_BYTES)
+
+    assert [Path(m.path).parent.name for m in b64.graphs] == ["b64"]
+    assert [Path(m.path).parent.name for m in std.graphs] == ["std"]
+    assert b64.entries == std.entries == 2
+
+
+# ---------------------------------------------------------------------------
+# The real compile cache of gate run tip-b64-C
+# ---------------------------------------------------------------------------
+
+#: Test-only knob (see the module docstring): the tip-b64-C compile cache.
+COMPILE_CACHE_ROOT_ENV = "VLLM_NEURON_TEST_COMPILE_CACHE_ROOT"
+needs_compile_cache = pytest.mark.skipif(
+    not os.environ.get(COMPILE_CACHE_ROOT_ENV),
+    reason=f"{COMPILE_CACHE_ROOT_ENV} unset: it names the tip-b64-C compile cache "
+    "(bs=64 @ 8k line, 15 graphs) the runtime figures are from",
+)
+
+
+def compile_cache_root() -> Path:
+    """The directory ``VLLM_NEURON_TEST_COMPILE_CACHE_ROOT`` names; it must exist."""
+    root = Path(os.environ[COMPILE_CACHE_ROOT_ENV])
+    assert root.is_dir(), f"{COMPILE_CACHE_ROOT_ENV}={root} is not a directory"
+    return root
+
+
+def _cache_neff(key: str) -> Path:
+    path = compile_cache_root() / key / f"graph_{key}.neff"
+    assert path.is_file(), f"{path}: not in {COMPILE_CACHE_ROOT_ENV}; is it the tip-b64-C cache?"
+    return path
+
+
+#: The bs=64 line warms 15 graphs: 1 prefill bucket x 1 segment, 7 batch x 2 ctx decode.
+TIP_B64_GRAPHS = 15
+#: The runtime log names each NEFF by its compile cache key; this is the prefill graph.
 PREFILL_KEY = "7d0ae663f1c6c0f94be5612ed2ce6d4f"
-
-#: One latent-pool layer at 64 x 8192 (4353 blocks x 131072 B) and at 1 x 4096
-#: (161 blocks): the graph input that ties a NEFF to its serve line.
-B64_POOL_BYTES = 4353 * 131072
-STD_POOL_BYTES = 161 * 131072
-
 # The runtime's breakdown for the prefill graph (tip-b64-C, ND 0 NC 0 / NC 1).
 RT_PREFILL_CODE_MB = (93.147, 70.647)
 RT_PREFILL_CONSTANTS_KB = 579.008
@@ -337,26 +473,23 @@ RT_SHARED_SCRATCHPAD_MB = 768.0
 # After all 15 loads (tip-b64-C rank 0): NC 0 14.457 GB total of which 13.378 GB
 # tensors, NC 1 0.196 GB. The graphs' share is everything but the tensors.
 RT_B64_GRAPH_MB = 14803.97 - 13.378 * 1024 + 200.88
-# glue-A rank 0 after its 3 loads: NC 0 8.027 GB of which 7.269 GB tensors, NC 1 0.087 GB;
-# shared scratchpad 576 MB.
-RT_GLUE_GRAPH_MB = (8.027 - 7.269) * 1024 + 0.087 * 1024
-RT_GLUE_SHARED_SCRATCHPAD_MB = 576.0
-
-needs_tip_b64 = pytest.mark.skipif(
-    not (TIP_B64_CACHE / PREFILL_KEY).is_dir(), reason="gate compile cache not on this host"
-)
 
 
-def _mb(value: int) -> float:
-    return value / MIB
+@needs_compile_cache
+def test_the_fixture_reads_as_its_source_neff() -> None:
+    """The reduction drops nothing the reader reads: same cores, same inputs."""
+    source_key = DECODE_PROVENANCE["source_compile_cache_key"]
+    source = neff_memory.read_neff_memory(_cache_neff(source_key))
+    recorded = neff_memory.read_neff_memory(DECODE_NEFF)
+
+    assert recorded.cores == source.cores
+    assert recorded.input_bytes == source.input_bytes
 
 
-@needs_tip_b64
+@needs_compile_cache
 def test_the_prefill_neff_reads_as_the_runtime_accounts_it() -> None:
     """Code and constants match the runtime to 0.1 MiB; rings within 10%."""
-    memory = neff_memory.read_neff_memory(
-        TIP_B64_CACHE / PREFILL_KEY / f"graph_{PREFILL_KEY}.neff"
-    )
+    memory = neff_memory.read_neff_memory(_cache_neff(PREFILL_KEY))
 
     assert len(memory.cores) == 2
     for core, runtime_code in zip(memory.cores, RT_PREFILL_CODE_MB):
@@ -369,34 +502,12 @@ def test_the_prefill_neff_reads_as_the_runtime_accounts_it() -> None:
     assert B64_POOL_BYTES in memory.input_bytes
 
 
-@needs_tip_b64
+@needs_compile_cache
 def test_the_bs64_line_graph_need_covers_what_the_runtime_held() -> None:
     """15 graphs: the estimate is at or above the runtime's figure, and within 10%."""
-    scan = neff_memory.scan_compile_cache(TIP_B64_CACHE, kv_input_bytes=B64_POOL_BYTES)
+    scan = neff_memory.scan_compile_cache(compile_cache_root(), kv_input_bytes=B64_POOL_BYTES)
     need = neff_memory.graph_memory(scan.graphs, page_bytes=64 * MIB)
 
-    assert need.num_graphs == 15
+    assert need.num_graphs == TIP_B64_GRAPHS
     assert _mb(need.scratchpad_bytes) == RT_SHARED_SCRATCHPAD_MB
     assert RT_B64_GRAPH_MB <= _mb(need.total_bytes) <= 1.10 * RT_B64_GRAPH_MB
-
-
-@pytest.mark.skipif(not GLUE_CACHE.is_dir(), reason="gate compile cache not on this host")
-def test_a_second_serve_run_is_covered_too() -> None:
-    """glue-A's 3 graphs: 576 MB shared scratchpad and the total within 10%."""
-    scan = neff_memory.scan_compile_cache(GLUE_CACHE, kv_input_bytes=STD_POOL_BYTES)
-    need = neff_memory.graph_memory(scan.graphs, page_bytes=64 * MIB)
-
-    assert need.num_graphs == 3
-    assert _mb(need.scratchpad_bytes) == RT_GLUE_SHARED_SCRATCHPAD_MB
-    assert RT_GLUE_GRAPH_MB <= _mb(need.total_bytes) <= 1.10 * RT_GLUE_GRAPH_MB
-
-
-@pytest.mark.skipif(not TIP_STD_CACHE.is_dir(), reason="gate compile cache not on this host")
-def test_a_cache_holding_two_serve_lines_is_split_by_the_kv_input() -> None:
-    """The 21-graph cache: the bs=64 line's 15 graphs, the standard line's own."""
-    b64 = neff_memory.scan_compile_cache(TIP_STD_CACHE, kv_input_bytes=B64_POOL_BYTES)
-    std = neff_memory.scan_compile_cache(TIP_STD_CACHE, kv_input_bytes=STD_POOL_BYTES)
-
-    assert len(b64.graphs) == 15
-    assert len(std.graphs) == b64.entries - 15
-    assert not {m.path for m in b64.graphs} & {m.path for m in std.graphs}

@@ -16,7 +16,7 @@ the gate's serve line (``--no-enable-prefix-caching --mamba-block-size 8192``):
 * side caches: 11 x 64 x (2049 x 128 + 2 x (2 x 4 x 128)) x 2 B = 372162560 B
 * footprint: 6795902976 B = 6.3292 GiB (6.0 GiB = 6423740416 B without the side caches)
 
-The same numbers are in ``/home/ubuntu/glm53f-wt2/reports/kvseg_budget.json``.
+The same numbers are in the kvseg-footprint gate report's budget table (``kvseg_budget.json``).
 
 Run with ``VLLM_NEURON_CPU_MODE=1`` (``test/conftest.py`` pins it).
 """

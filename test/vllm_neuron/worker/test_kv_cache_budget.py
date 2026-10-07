@@ -255,7 +255,7 @@ def test_the_physical_core_bound_is_retired_for_the_logical_core(monkeypatch) ->
     The bound assumed the runtime splits a rank's tensors over the two physical
     cores and stages a graph on one of them, so the cache had to leave a 5 GiB
     reserve inside 12 GiB. The runtime's own accounting says otherwise. At
-    tip-b64-C (``/home/ubuntu/glm53f-wt2/gate/runs/tip-b64-C/server.log``,
+    gate run tip-b64-C (server log,
     ``TDRV:dml_log_dev_neff_mem``, after each rank's 15 NEFF loads; the runtime
     prints binary units as GB): ``:529036`` ND 0 NC 0 holds 14.457 GiB = 13.378
     GiB of tensors + 0.75 GiB of shared scratchpad + the graphs' code, constants

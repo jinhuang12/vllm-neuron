@@ -9,7 +9,7 @@ the real ``kv_cache_allocations``. Nothing on the "after" side is a hand formula
 
 The "before" side is the pricing at commit 5938748, kept here as
 :func:`before_fix_footprint_bytes`. It is anchored to the serve log of that commit
-(``/home/ubuntu/glm53f-moefix-20261005T115338Z/server_decode.log``: "KV cache need:
+(the 2026-10-05 moefix serve run, ``server_decode.log``: "KV cache need:
 0.216 GiB for 1 sequence(s) of 4096 tokens (161 blocks of 131072 B, ...)" and
 "allocated=0.884 GiB").
 
