@@ -61,12 +61,28 @@ KERNELS = {
 DRAFT_DEFAULT_US = {"head_block_measured_or_estimated": None}
 
 
-def expected_accepted(k: int, alpha: float) -> float:
-    return (1 - alpha ** (k + 1)) / (1 - alpha)
+def expected_accepted(k: int, alpha: float, decay: float = 1.0) -> float:
+    """Expected tokens per verify step with k drafts.
+
+    Constant acceptance ``alpha``: N = (1 - alpha^(k+1)) / (1 - alpha). With ``decay`` < 1 the
+    acceptance at draft position i is ``alpha * decay**(i-1)`` (the per-position decay GPU
+    users see), and N = 1 + sum_j prod_{i<=j} alpha_i.
+    """
+    if decay == 1.0:
+        return (1.0 - alpha ** (k + 1)) / (1.0 - alpha) if alpha < 1.0 else float(k + 1)
+    n, run = 1.0, 1.0
+    for i in range(1, k + 1):
+        run *= alpha * decay ** (i - 1)
+        n += run
+    return n
 
 
 def verify_bound_ii(T: int) -> dict:
-    """Kernel-by-kernel step at T tokens per request, ms, from the B=1 -> B=4 micro slopes."""
+    """Kernel-by-kernel step at T tokens per request, ms, from the B=1 -> B=4 micro slopes.
+
+    T <= 4 interpolates each kernel between its B=1 and B=4 medians; T > 4 (k=5 -> T=6) extrapolates
+    the same per-row slope, i.e. assumes the per-request-serial forms keep their B=1..4 slope.
+    """
     rows = {}
     kernel_total = 0.0
     for name, (count, b1, b4, _src) in KERNELS.items():
@@ -93,31 +109,46 @@ def main() -> None:
                         help="one draft step at B=1, us (device, incl. its own launch)")
     parser.add_argument("--draft-launch-us", type=float, default=0.0,
                         help="extra per-draft-step overhead (host dispatch, hidden-state hand-off), us")
+    parser.add_argument("--draft-fixed-us", type=float, default=0.0,
+                        help="per-VERIFY-step draft overhead paid once whatever k (the launch of one fused draft graph "
+                             "that unrolls the k iterations), us")
+    parser.add_argument("--alpha-decay", type=float, default=1.0,
+                        help="per-position acceptance decay: alpha_i = alpha * decay**(i-1) (1.0 = constant alpha)")
+    parser.add_argument("--ks", type=int, nargs="+", default=[1, 2, 3, 5])
+    parser.add_argument("--kda-sequential", action="store_true",
+                        help="bound (ii): the KDA recurrence takes the T verify tokens one after another (34 layers x "
+                             "the fused one-token step x (T-1)) instead of the batched B=1->B=4 slope the micro numbers give")
     parser.add_argument("--verify-overhead-us", type=float, default=0.0,
                         help="extra per-verify-step overhead (rejection sampling, k+1 rows, extra graph inputs), us")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
 
-    ks = (1, 2, 3)
+    ks = tuple(args.ks)
     alphas = (0.6, 0.7, 0.8, 0.9)
     # calibrate bound (ii) so that its T=1 reproduces today's device period: the micro numbers are
     # standalone medians, the in-model numbers are smaller (the ledger's k); use the RATIO at T>1 vs T=1.
     ii_1 = verify_bound_ii(1)["step_ms"]
     table = {"inputs": {"itl_today_ms": ITL_TODAY_MS, "device_step_ms": DEVICE_STEP_MS, "host_slack_ms": round(HOST_SLACK_MS, 3),
                         "draft_us": args.draft_us, "draft_launch_us": args.draft_launch_us,
+                        "draft_fixed_us": args.draft_fixed_us, "alpha_decay": args.alpha_decay,
+                        "kda_sequential": bool(args.kda_sequential),
                         "verify_overhead_us": args.verify_overhead_us,
                         "bound_ii_raw_T1_ms": round(ii_1, 3)},
              "bound_ii": {}, "rows": [], "break_even_alpha": {}, "best_case_alpha_0_8": {}}
     for k in ks:
         bii = verify_bound_ii(k + 1)
+        if args.kda_sequential:
+            count, kda_b1, _b4, _src = KERNELS["kda fused step"]
+            extra = count * kda_b1 * k / 1000.0          # (T - 1) = k extra sequential tokens
+            bii = bii | {"step_ms": bii["step_ms"] + extra, "kda_sequential_extra_ms": round(extra, 3)}
         ratio = bii["step_ms"] / ii_1
         verify_i = ITL_TODAY_MS                       # (i) today's graph, T=k+1 free
         verify_ii = ITL_TODAY_MS * ratio              # (ii) kernel-by-kernel scaling applied to today's ITL
         table["bound_ii"][str(k + 1)] = bii | {"ratio_vs_T1": round(ratio, 4), "verify_ms_i": verify_i,
                                                "verify_ms_ii": round(verify_ii, 3)}
-        draft_total_ms = k * (args.draft_us + args.draft_launch_us) / 1000.0
+        draft_total_ms = (k * (args.draft_us + args.draft_launch_us) + args.draft_fixed_us) / 1000.0
         for alpha in alphas:
-            n = expected_accepted(k, alpha)
+            n = expected_accepted(k, alpha, args.alpha_decay)
             for bound, verify in (("i", verify_i), ("ii", verify_ii)):
                 itl = (draft_total_ms + verify + args.verify_overhead_us / 1000.0) / n
                 table["rows"].append({"k": k, "alpha": alpha, "bound": bound, "N": round(n, 4),
@@ -127,12 +158,12 @@ def main() -> None:
         for bound, verify in (("i", verify_i), ("ii", verify_ii)):
             target_n = (draft_total_ms + verify + args.verify_overhead_us / 1000.0) / ITL_TODAY_MS
             lo, hi = 0.0, 0.999999
-            if expected_accepted(k, hi) < target_n:
+            if expected_accepted(k, hi, args.alpha_decay) < target_n:
                 table["break_even_alpha"][f"k{k}_{bound}"] = None   # never breaks even
                 continue
             for _ in range(60):
                 mid = (lo + hi) / 2
-                if expected_accepted(k, mid) < target_n:
+                if expected_accepted(k, mid, args.alpha_decay) < target_n:
                     lo = mid
                 else:
                     hi = mid
@@ -143,7 +174,8 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(table, indent=1))
     # human table
-    print(f"draft {args.draft_us:.0f} us + launch {args.draft_launch_us:.0f} us per step; verify overhead {args.verify_overhead_us:.0f} us; ITL today {ITL_TODAY_MS} ms")
+    print(f"draft {args.draft_us:.0f} us + launch {args.draft_launch_us:.0f} us per draft iteration, + {args.draft_fixed_us:.0f} us per verify step; "
+          f"verify overhead {args.verify_overhead_us:.0f} us; alpha decay {args.alpha_decay}; ITL today {ITL_TODAY_MS} ms")
     print("k  alpha  N      verify(i)  ITL(i)   x(i)    verify(ii)  ITL(ii)  x(ii)")
     for k in ks:
         for alpha in alphas:
