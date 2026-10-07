@@ -72,6 +72,8 @@ TOKEN_AXIS_MAX = 16
 #: Tokens of one expert per grouped work item: the moving width of every
 #: product, so the vector work per expert scales with this, not with T.
 GROUP_TOKENS = 16
+GROUP_SHIFT = GROUP_TOKENS.bit_length() - 1
+assert 1 << GROUP_SHIFT == GROUP_TOKENS, "GROUP_TOKENS is a power of two"
 
 #: This file's content digest, a trace-time int default of the kernel. The
 #: compile caches key on a kernel's own source and its arguments; the kernel's
@@ -137,7 +139,7 @@ def _expert_operands(weights, scales, expert, i0, nic, fp8):
 
 
 def _expert_contribution(moving, gate, stationaries, down, flat_scale, clamp,
-                         nh, nic, columns):
+                         nh, nic, columns, out=None):
     """``gate * expert(x)`` of ``columns`` token columns: ``[128, H/128, columns]``.
 
     ``moving`` is ``x^T`` as ``[128 (h mod 128), H/128, columns]`` bf16 and
@@ -146,6 +148,7 @@ def _expert_contribution(moving, gate, stationaries, down, flat_scale, clamp,
     128x128 products, block scales applied per PSUM bank, hidden blocks summed
     in one reduce, the clamped SwiGLU in bf16, the down projection's scale
     multiplied by the gate weight, intermediate blocks summed in one reduce.
+    ``out``, if given, is the ``[128, H/128, columns]`` fp32 tile to write.
     """
     gate_up_slots = 2 * nic * nh
     down_slots = nh * nic
@@ -207,7 +210,9 @@ def _expert_contribution(moving, gate, stationaries, down, flat_scale, clamp,
                            moving=act[:, k, :], accumulate=False)
         nisa.tensor_tensor(dst=terms[:, s0:s0 + sn, :], data1=bank,
                            data2=flat_weight[:, s0:s0 + sn, :], op=nl.multiply)
-    contribution = nl.ndarray((128, nh, columns), dtype=nl.float32, buffer=nl.sbuf)
+    contribution = out
+    if contribution is None:
+        contribution = nl.ndarray((128, nh, columns), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_reduce(dst=contribution, data=terms.ap(pattern=[
         [down_slots * columns, 128], [nic * columns, nh], [1, columns],
         [columns, nic]]), op=nl.add, axis=(3,))
@@ -341,14 +346,45 @@ def _grouped_experts(hidden, affinity, rank_reg, local, weights, scales, clamp, 
     item_group = nl.ndarray((1, max(items, 8)), dtype=nl.int32, buffer=nl.sbuf)
     nisa.tensor_scalar(dst=item_group[:, 0:items], data=work[:, 0:items],
                        op0=nl.bitwise_and, operand0=slots - 1)
+    # The item's first column among its expert's tokens: group * G.
+    item_first = nl.ndarray((1, max(items, 8)), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=item_first[:, 0:items], data=item_group[:, 0:items],
+                       op0=nl.left_shift, operand0=GROUP_SHIFT)
 
-    # Constants: K=1 ones (row broadcast), K=T ones (gate broadcast), positions.
-    ones_row = _tile(1, tokens)
-    nisa.memset(dst=ones_row, value=1.0)
+    # Each token's rank among the tokens of each expert, token on the partition
+    # axis: ranks[t, e] = #{t' <= t routed to e} - 1, and -1 where t did not
+    # choose e. The prefix count is one PE product with an upper-triangular ones
+    # matrix (integer sums of at most 64 ones: exact). No compaction runs inside
+    # the item loop (the backend does not accept one there).
+    mask_t = _tile(tokens, experts)
+    nisa.tensor_scalar(dst=mask_t, data=aff_t[:, 0:experts], op0=nl.not_equal,
+                       operand0=0.0)
+    upper = nl.ndarray((tokens, tokens), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.iota(dst=upper, pattern=[[1, tokens]], offset=0, channel_multiplier=-1)
+    nisa.tensor_scalar(dst=upper, data=upper, op0=nl.greater_equal, operand0=0.0)
+    prefix = nl.ndarray((tokens, wide), dtype=nl.float32, buffer=nl.psum)
+    nisa.nc_matmul(dst=prefix[:, 0:experts], stationary=upper, moving=mask_t)
+    ranks = nl.ndarray((tokens, wide), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=ranks[:, 0:experts], data1=prefix[:, 0:experts],
+                       data2=mask_t, op=nl.multiply)
+    nisa.tensor_scalar(dst=ranks[:, 0:experts], data=ranks[:, 0:experts],
+                       op0=nl.subtract, operand0=1.0)
+    # Column ids of every group on every token row: columns[t, g, j] = g * G + j.
+    columns = nl.ndarray((tokens, width), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.iota(dst=columns, pattern=[[1, width]], offset=0, channel_multiplier=0)
+    # Each partition's token id (bf16: exact below 256), to read the picks back.
+    token_f = _tile(tokens, 1)
+    nisa.iota(dst=token_f, pattern=[[0, 1]], offset=0, channel_multiplier=1)
+    token_id = _tile(tokens, 1, nl.bfloat16)
+    nisa.tensor_copy(dst=token_id, src=token_f)
+    # K=T ones: broadcasts the selected gate weights to every partition.
     ones_col = nl.ndarray((tokens, 128), dtype=nl.float32, buffer=nl.sbuf)
     nisa.memset(dst=ones_col, value=1.0)
-    position = _tile(tokens, 1)
-    nisa.iota(dst=position, pattern=[[0, 1]], offset=0, channel_multiplier=1)
+
+    # Tiles an item writes and then reads at a dynamic offset (column): defined
+    # outside the item loop, as the backend requires.
+    picked = nl.ndarray((1, group), dtype=nl.int32, buffer=nl.sbuf)
+    contribution = nl.ndarray((128, nh, group), dtype=nl.float32, buffer=nl.sbuf)
 
     def visit_item(slot):
         expert_sb = _tile(1, 1, nl.uint32)
@@ -356,49 +392,44 @@ def _grouped_experts(hidden, affinity, rank_reg, local, weights, scales, clamp, 
             pattern=[[max(items, 8), 1], [1, 1]], scalar_offset=slot, indirect_dim=1))
         expert = nisa.register_alloc()
         nisa.register_load(dst=expert, src=expert_sb)
-        group_sb = _tile(1, 1, nl.uint32)
-        nisa.tensor_copy(dst=group_sb, src=item_group.ap(
+        first_sb = _tile(1, 1, nl.uint32)
+        nisa.tensor_copy(dst=first_sb, src=item_first.ap(
             pattern=[[max(items, 8), 1], [1, 1]], scalar_offset=slot, indirect_dim=1))
-        which = nisa.register_alloc()
-        nisa.register_load(dst=which, src=group_sb)
+        first_column = nisa.register_alloc()
+        nisa.register_load(dst=first_column, src=first_sb)
         stationaries, down, flat_scale = _expert_operands(
             weights, scales, expert, i0, nic, fp8)
 
-        # This expert's token positions, ascending, padded with T (no token).
-        row = _tile(1, width)
-        nisa.tensor_copy(dst=row, src=mask.ap(
-            pattern=[[experts * width, 1], [1, width]], scalar_offset=expert,
-            indirect_dim=1))
-        positions = nl.ndarray((1, slots + 1, group), dtype=nl.int32, buffer=nl.sbuf)
-        nisa.nonzero_with_count(
-            dst=positions.reshape((1, (slots + 1) * group))[:, 0:width + 1], src=row,
-            index_offset=0, padding_val=tokens)
-        picked = _tile(1, group, nl.int32)
-        nisa.tensor_copy(dst=picked, src=positions.ap(
-            pattern=[[(slots + 1) * group, 1], [1, group]], scalar_offset=which,
-            indirect_dim=1))
         # Real columns of this item: min(count_e - g * G, G).
         held = _tile(1, 1)
         nisa.tensor_copy(dst=held, src=counts.ap(
             pattern=[[wide, 1], [1, 1]], scalar_offset=expert, indirect_dim=1))
         first = _tile(1, 1)
-        nisa.tensor_copy(dst=first, src=group_sb)
+        nisa.tensor_copy(dst=first, src=first_sb)
         left = _tile(1, 1)
-        nisa.tensor_scalar(dst=left, data=first, op0=nl.multiply,
-                           operand0=-float(group), op1=nl.add, operand1=held)
+        nisa.tensor_tensor(dst=left, data1=held, data2=first, op=nl.subtract)
         live_sb = _tile(1, 1, nl.uint32)
         nisa.tensor_scalar(dst=live_sb, data=left, op0=nl.minimum,
                            operand0=float(group))
         live = nisa.register_alloc()
         nisa.register_load(dst=live, src=live_sb)
 
-        # One-hot selection [T, G]: column j is 1 at token picked[j] (no row for T).
-        picked_f = _tile(1, group)
-        nisa.tensor_copy(dst=picked_f, src=picked)
-        spread = nl.ndarray((tokens, group), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_matmul(dst=spread, stationary=ones_row, moving=picked_f)
+        # One-hot selection [T, G]: column j of group g is the token of rank
+        # g * G + j among this expert's tokens (ascending token order).
+        token_rank = _tile(tokens, 1)
+        nisa.tensor_copy(dst=token_rank, src=ranks.ap(
+            pattern=[[wide, tokens], [1, 1]], scalar_offset=expert, indirect_dim=1))
         select = nl.ndarray((tokens, group), dtype=nl.bfloat16, buffer=nl.sbuf)
-        nisa.tensor_scalar(dst=select, data=spread, op0=nl.equal, operand0=position)
+        wanted_rank = nl.ndarray((tokens, group), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=wanted_rank, src=columns.ap(
+            pattern=[[width, tokens], [1, group]], scalar_offset=first_column,
+            indirect_dim=1))
+        nisa.tensor_scalar(dst=select, data=wanted_rank, op0=nl.equal,
+                           operand0=token_rank)
+        # The selected token ids [1, G] (one nonzero term per real column: exact).
+        chosen = nl.ndarray((1, group), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(dst=chosen, stationary=token_id, moving=select)
+        nisa.tensor_copy(dst=picked, src=chosen)
         # The selected tokens' gate weights on every partition, [128, G] (one
         # nonzero term per column: exact in the fp32 PE path).
         column_aff = _tile(tokens, 1)
@@ -420,9 +451,12 @@ def _grouped_experts(hidden, affinity, rank_reg, local, weights, scales, clamp, 
         moving = nl.ndarray((128, nh, group), dtype=nl.bfloat16, buffer=nl.sbuf)
         nisa.tensor_copy(dst=moving, src=gathered)
 
-        contribution = _expert_contribution(moving, gate, stationaries, down,
-                                            flat_scale, clamp, nh, nic, group)
+        _expert_contribution(moving, gate, stationaries, down, flat_scale, clamp,
+                             nh, nic, group, out=contribution)
 
+        # Add column j into its token's acc column. On the device only
+        # tensor_copy takes a register-offset access pattern, so the add reads
+        # both columns into fixed tiles and writes the sum back.
         def scatter(j):
             at_sb = _tile(1, 1, nl.uint32)
             nisa.tensor_copy(dst=at_sb, src=picked.ap(
@@ -431,9 +465,15 @@ def _grouped_experts(hidden, affinity, rank_reg, local, weights, scales, clamp, 
             nisa.register_load(dst=at, src=at_sb)
             column = acc.ap(pattern=[[nh * tokens, 128], [tokens, nh], [1, 1]],
                             scalar_offset=at, indirect_dim=2)
-            nisa.tensor_tensor(dst=column, data1=column, data2=contribution.ap(
+            held_column = nl.ndarray((128, nh, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=held_column, src=column)
+            term = nl.ndarray((128, nh, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=term, src=contribution.ap(
                 pattern=[[nh * group, 128], [group, nh], [1, 1]], scalar_offset=j,
-                indirect_dim=2), op=nl.add)
+                indirect_dim=2))
+            added = nl.ndarray((128, nh, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=added, data1=held_column, data2=term, op=nl.add)
+            nisa.tensor_copy(dst=column, src=added)
 
         nl.fori_loop(0, live, scatter)
 
