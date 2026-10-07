@@ -325,9 +325,9 @@ def _token_axis_experts(hidden, local, weights, scales, clamp, acc, i0, nic, fp8
     nl.fori_loop(0, count, visit_expert)
 
 
-def _pair_entry(table, pairs, p):
-    """``table[p]`` (``p`` a register) in a register and a ``[1, 1]`` tile."""
-    held_sb = _tile(1, 1, nl.uint32)
+def _pair_entry(table, pairs, p, held_sb):
+    """``table[p]`` (``p`` a register) in a register, through the ``[1, 1]``
+    uint32 tile ``held_sb``."""
     nisa.tensor_copy(dst=held_sb, src=table.ap(
         pattern=[[pairs, 1], [1, 1]], scalar_offset=p, indirect_dim=1))
     value = nisa.register_alloc()
@@ -335,9 +335,15 @@ def _pair_entry(table, pairs, p):
     return value, held_sb
 
 
-def _grouped_load(weights, scales, table, pairs, p, i0, nic, tiles):
-    """DMA the operands of the item at ``table[p]`` into ``tiles``."""
-    expert, _ = _pair_entry(table, pairs, p)
+def _grouped_load(weights, scales, table, pairs, p, i0, nic, tiles, held_sb):
+    """DMA the operands of the item at ``table[p]`` into ``tiles``.
+
+    ``held_sb`` is this load's own ``[1, 1]`` tile, allocated before the loop:
+    the DMA trigger engine rereads it while the DMAs issue, so a tile shared
+    with the other load of the pair would stall that load's write until
+    these DMAs have issued.
+    """
+    expert, _ = _pair_entry(table, pairs, p, held_sb)
     _load_operands(weights, scales, expert, i0, nic, tiles)
 
 
@@ -374,7 +380,9 @@ def _grouped_compute(state, tables, p, operands):
                        stationary=x_rows[:, hb * 128:(hb + 1) * 128],
                        moving=select, accumulate=False)
     moving = nl.ndarray((128, nh, group), dtype=nl.bfloat16, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=moving, src=gathered)
+    # The plain copies of the item run on the Scalar engine, which is otherwise
+    # idle; the values are bf16-exact, so the cast is exact on either engine.
+    nisa.tensor_copy(dst=moving, src=gathered, engine=nisa.engine.scalar)
 
     contribution = _expert_contribution(moving, gate, stationaries, down, flat_scale,
                                         clamp, nh, nic, group)
@@ -384,7 +392,7 @@ def _grouped_compute(state, tables, p, operands):
     # one-hot product), masked to the block diagonal.
     tiled = nl.ndarray((tokens, hb_blk, group), dtype=nl.bfloat16, buffer=nl.sbuf)
     nisa.tensor_copy(dst=tiled, src=select.ap(
-        pattern=[[group, tokens], [0, hb_blk], [1, group]]))
+        pattern=[[group, tokens], [0, hb_blk], [1, group]]), engine=nisa.engine.scalar)
     spread = nl.ndarray((rows, tokens), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_matmul(dst=spread, stationary=tiled.reshape((tokens, rows)), moving=ident)
     scatter = nl.ndarray((rows, hb_blk, tokens), dtype=nl.float32, buffer=nl.sbuf)
@@ -404,7 +412,7 @@ def _grouped_compute(state, tables, p, operands):
             nisa.nc_transpose(dst=flipped[:, c, :], data=contribution.ap(
                 pattern=[[nh * group, 128], [1, rows]], offset=(c0 + c) * rows))
         held = nl.ndarray((rows, cn, 128), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=held, src=flipped)
+        nisa.tensor_copy(dst=held, src=flipped, engine=nisa.engine.scalar)
         for c in range(cn):
             h0 = (c0 + c) * hb_blk
             added = nl.ndarray((128, hb_blk * tokens), dtype=nl.float32, buffer=nl.psum)
@@ -416,7 +424,7 @@ def _grouped_compute(state, tables, p, operands):
                                data2=added.reshape((128, hb_blk, tokens)), op=nl.add)
 
 
-def _grouped_tables(aff_t, ranks, ones_col, by_pair, geometry):
+def _grouped_tables(aff_t, ranks, by_pair, constants, geometry):
     """Each item's selection and gate weights, in the loop's pair layout.
 
     Item ``i`` (expert ``e_i``, first column ``f_i``): ``select[t, j] = 1`` when
@@ -426,6 +434,7 @@ def _grouped_tables(aff_t, ranks, ones_col, by_pair, geometry):
     fp32)`` of items ``2p + q``. All products are one-hot (exact).
     """
     tokens, experts, pairs = geometry
+    ones_e, expert_id, column_id, ones_col = constants
     group = GROUP_TOKENS
     both = 2 * pairs
     # Item expert ids and first columns as fp32 rows [1, (q, p)].
@@ -436,13 +445,9 @@ def _grouped_tables(aff_t, ranks, ones_col, by_pair, geometry):
         nisa.tensor_copy(dst=item_first[:, q * pairs:(q + 1) * pairs], src=by_pair[q][1])
     # One-hot [E, items]: onehot[e, i] = (e_i == e). The ids reach every
     # partition through a K=1 ones product.
-    ones_e = _tile(1, max(experts, tokens))
-    nisa.memset(dst=ones_e, value=1.0)
     spread_e = nl.ndarray((experts, both), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_matmul(dst=spread_e, stationary=ones_e[:, 0:experts], moving=item_expert,
                    is_stationary_onezero=True)
-    expert_id = _tile(experts, 1)
-    nisa.iota(dst=expert_id, pattern=[[0, 1]], offset=0, channel_multiplier=1)
     onehot = nl.ndarray((experts, both), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_scalar(dst=onehot, data=spread_e, op0=nl.equal, operand0=expert_id)
     # Affinities and ranks with the expert on the partition axis (bit-accurate
@@ -463,8 +468,7 @@ def _grouped_tables(aff_t, ranks, ones_col, by_pair, geometry):
                    is_stationary_onezero=True)
     # wanted[t, i, j] = f_i + j; select = (rank of t in e_i == wanted).
     wanted = nl.ndarray((tokens, both, group), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.iota(dst=wanted, pattern=[[0, both], [1, group]], offset=0, channel_multiplier=0)
-    nisa.tensor_tensor(dst=wanted, data1=wanted, data2=first_t.ap(
+    nisa.tensor_tensor(dst=wanted, data1=column_id, data2=first_t.ap(
         pattern=[[both, tokens], [1, both], [0, group]]), op=nl.add)
     select = nl.ndarray((tokens, both, group), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_tensor(dst=select, data1=wanted, data2=item_rank.ap(
@@ -520,6 +524,11 @@ def _grouped_experts(hidden, affinity, rank_reg, local, weights, scales, clamp, 
     while nh % hb_blk:
         hb_blk = hb_blk - 1
     kernel_assert(hb_blk * tokens <= _BANK, "scatter product fits one PSUM bank")
+    rows = hb_blk * group
+    # Items run in pairs (2p, 2p + 1), see below; pairs covers the work list
+    # plus the prefetch past its end.
+    pairs = items // 2 + 2
+    kernel_assert(2 * pairs <= _BANK, "item tables fit one PSUM bank")
 
     # Token-major hidden rows (the gather's stationaries) and this group's
     # affinities with the token on the partition axis.
@@ -529,6 +538,35 @@ def _grouped_experts(hidden, affinity, rank_reg, local, weights, scales, clamp, 
     nisa.dma_copy(dst=aff_t[:, 0:experts], src=affinity.ap(
         pattern=[[groups * experts, tokens], [1, experts]],
         scalar_offset=rank_reg, indirect_dim=1))
+
+    # Constants, built first: their iotas run on the engine that triggers the
+    # weight DMAs, and built after the work list they delay item 0's DMA.
+    upper = nl.ndarray((tokens, tokens), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.iota(dst=upper, pattern=[[1, tokens]], offset=0, channel_multiplier=-1)
+    # The scatter's T x T identity (bf16) and block mask [(b, j), b', t] =
+    # (b == b'), i.e. 0 <= (b, j) - b' * G < G.
+    ident = nl.ndarray((tokens, tokens), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=ident, data=upper, op0=nl.equal, operand0=0.0)
+    nisa.tensor_scalar(dst=upper, data=upper, op0=nl.greater_equal, operand0=0.0)
+    offset = nl.ndarray((rows, hb_blk, tokens), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.iota(dst=offset, pattern=[[-group, hb_blk], [0, tokens]], offset=0,
+              channel_multiplier=1)
+    low = nl.ndarray((rows, hb_blk, tokens), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=low, data=offset, op0=nl.greater_equal, operand0=0.0)
+    blockmask = nl.ndarray((rows, hb_blk, tokens), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=blockmask, data=offset, op0=nl.less, operand0=float(group))
+    nisa.tensor_tensor(dst=blockmask, data1=blockmask, data2=low, op=nl.multiply)
+    # The item tables' constants: ones rows and columns, expert and column ids.
+    ones_e = _tile(1, max(experts, tokens))
+    nisa.memset(dst=ones_e, value=1.0)
+    expert_id = _tile(experts, 1)
+    nisa.iota(dst=expert_id, pattern=[[0, 1]], offset=0, channel_multiplier=1)
+    column_id = nl.ndarray((tokens, 2 * pairs, group), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.iota(dst=column_id, pattern=[[0, 2 * pairs], [1, group]], offset=0,
+              channel_multiplier=0)
+    # K=T ones: broadcasts the selected gate weights to every partition.
+    ones_col = nl.ndarray((tokens, 128), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.memset(dst=ones_col, value=1.0)
 
     # Expert-major token mask [1, E, width], zero past T; tokens per expert.
     mask = nl.ndarray((1, experts, width), dtype=nl.float32, buffer=nl.sbuf)
@@ -563,9 +601,7 @@ def _grouped_experts(hidden, affinity, rank_reg, local, weights, scales, clamp, 
     # operand buffers, swapped statically. by_pair[q][p] is item 2p + q's
     # expert or first column (q = 0, 1, 2); entries past the work list are 0
     # (expert 0, loaded but never computed).
-    pairs = items // 2 + 2
     padded = 2 * pairs + 2
-    kernel_assert(2 * pairs <= _BANK, "item tables fit one PSUM bank")
     flat_expert = nl.ndarray((1, padded), dtype=nl.int32, buffer=nl.sbuf)
     flat_first = nl.ndarray((1, padded), dtype=nl.int32, buffer=nl.sbuf)
     nisa.memset(dst=flat_expert, value=0)
@@ -613,9 +649,6 @@ def _grouped_experts(hidden, affinity, rank_reg, local, weights, scales, clamp, 
     mask_t = _tile(tokens, experts)
     nisa.tensor_scalar(dst=mask_t, data=aff_t[:, 0:experts], op0=nl.not_equal,
                        operand0=0.0)
-    upper = nl.ndarray((tokens, tokens), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.iota(dst=upper, pattern=[[1, tokens]], offset=0, channel_multiplier=-1)
-    nisa.tensor_scalar(dst=upper, data=upper, op0=nl.greater_equal, operand0=0.0)
     prefix = nl.ndarray((tokens, wide), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_matmul(dst=prefix[:, 0:experts], stationary=upper, moving=mask_t)
     ranks = nl.ndarray((tokens, wide), dtype=nl.float32, buffer=nl.sbuf)
@@ -623,33 +656,20 @@ def _grouped_experts(hidden, affinity, rank_reg, local, weights, scales, clamp, 
                        data2=mask_t, op=nl.multiply)
     nisa.tensor_scalar(dst=ranks[:, 0:experts], data=ranks[:, 0:experts],
                        op0=nl.subtract, operand0=1.0)
-    # K=T ones: broadcasts the selected gate weights to every partition.
-    ones_col = nl.ndarray((tokens, 128), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.memset(dst=ones_col, value=1.0)
-    tables = _grouped_tables(aff_t, ranks, ones_col, by_pair, (tokens, experts, pairs))
-
-    # The scatter's constants: the T x T identity (bf16) and the block mask
-    # [(b, j), b', t] = (b == b'), i.e. 0 <= (b, j) - b' * G < G.
-    ident = nl.ndarray((tokens, tokens), dtype=nl.bfloat16, buffer=nl.sbuf)
-    diagonal = nl.ndarray((tokens, tokens), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.iota(dst=diagonal, pattern=[[1, tokens]], offset=0, channel_multiplier=-1)
-    nisa.tensor_scalar(dst=ident, data=diagonal, op0=nl.equal, operand0=0.0)
-    rows = hb_blk * group
-    offset = nl.ndarray((rows, hb_blk, tokens), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.iota(dst=offset, pattern=[[-group, hb_blk], [0, tokens]], offset=0,
-              channel_multiplier=1)
-    low = nl.ndarray((rows, hb_blk, tokens), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_scalar(dst=low, data=offset, op0=nl.greater_equal, operand0=0.0)
-    blockmask = nl.ndarray((rows, hb_blk, tokens), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_scalar(dst=blockmask, data=offset, op0=nl.less, operand0=float(group))
-    nisa.tensor_tensor(dst=blockmask, data1=blockmask, data2=low, op=nl.multiply)
+    tables = _grouped_tables(aff_t, ranks, by_pair,
+                             (ones_e, expert_id, column_id, ones_col),
+                             (tokens, experts, pairs))
 
     state = (x_rows, ident, blockmask, acc, clamp, (tokens, nh, nic, pairs, hb_blk))
 
+    held = [_tile(1, 1, nl.uint32), _tile(1, 1, nl.uint32)]
+
     def run_pair(p):
-        _grouped_load(weights, scales, by_pair[1][0], pairs, p, i0, nic, buffers[1])
+        _grouped_load(weights, scales, by_pair[1][0], pairs, p, i0, nic, buffers[1],
+                      held[1])
         _grouped_compute(state, tables[0], p, operand_views[0])
-        _grouped_load(weights, scales, by_pair[2][0], pairs, p, i0, nic, buffers[0])
+        _grouped_load(weights, scales, by_pair[2][0], pairs, p, i0, nic, buffers[0],
+                      held[0])
         _grouped_compute(state, tables[1], p, operand_views[1])
 
     nl.fori_loop(0, full_pairs, run_pair)
