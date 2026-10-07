@@ -17,8 +17,9 @@ Declared tolerance, on the fp32 output ``[T, H]``:
 128x128 products, the same per-block scale multiply and hidden-block reduce, the
 same SwiGLU sequence and bf16 activation; the grouped path (T > 16) gathers
 each expert's token columns and gate weights with one-hot PE products (exact
-copies) and adds each column into its token's accumulator in ascending expert
-order, so the bound only allows for fp32 round-off. On the bf16 output: one bf16 step
+copies) and adds each column into its token's accumulator with a one-hot PE
+product (one nonzero term: exact), in ascending expert order, so the bound
+only allows for fp32 round-off. On the bf16 output: one bf16 step
 (``rtol = 2**-7``) plus the same floor. Tokens with no local expert are exactly
 zero on both sides.
 """

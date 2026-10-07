@@ -23,7 +23,8 @@ and weight copies per layer). Layer ``l`` reads layer ``l-1``'s output, as in th
 model: the expert input is ``x_l + 2^-8 * y_{l-1}``. The per-layer cost is the
 slope ``(t_L - median(t_1)) / (L - 1)`` per timed ``t_L`` sample; median and p90
 over the samples are reported. The device checks compare each variant's 1-layer
-graph with the torch oracle, and after with before.
+graph with the torch oracle, and after with before (bf16 output, and the fp32
+output of 1-layer fp32 graphs: ``checks.after_vs_before_fp32``).
 """
 
 from __future__ import annotations
@@ -115,7 +116,7 @@ def compile_fn(fn):
                          options={"compiler_args": compiler_args()})
 
 
-def expert_graph(variant: str, layers: int, baseline, bounds):
+def expert_graph(variant: str, layers: int, baseline, bounds, out_dtype=torch.bfloat16):
     def chained(xs, affs, weights, scales, rank):
         y = None
         for layer in range(layers):
@@ -125,10 +126,10 @@ def expert_graph(variant: str, layers: int, baseline, bounds):
             packed = PackedExperts(weights[layer], scales[layer])
             if variant == "before":
                 y = baseline.decode_experts(x, affs[layer], packed, bounds, rank,
-                                            out_dtype=torch.bfloat16)
+                                            out_dtype=out_dtype)
             else:
                 y = fused_fp8_decode_experts(x, affs[layer], packed, bounds, rank,
-                                             out_dtype=torch.bfloat16)
+                                             out_dtype=out_dtype)
         return y
 
     return compile_fn(chained)
@@ -191,6 +192,8 @@ def cases_for(tokens, baseline, args):
                       ).to(torch.bfloat16) for l in range(layers)]
     graphs = {v: (expert_graph(v, 1, baseline, bounds), expert_graph(v, layers, baseline, bounds))
               for v in args.variants}
+    # fp32-output 1-layer graphs: after vs before before the bf16 cast.
+    graphs32 = {v: expert_graph(v, 1, baseline, bounds, torch.float32) for v in args.variants}
     out = []
     for name, tables in scenarios(tokens, layers).items():
         affs = [routed_affinities(tables[l], seed=300 + l) for l in range(layers)]
@@ -229,6 +232,17 @@ def cases_for(tokens, baseline, args):
         if "before" in results and "after" in results:
             diff = (results["after"] - results["before"]).abs()
             case["checks"]["after_vs_before_max_abs"] = float(diff.max())
+            old32 = graphs32["before"](*inputs[1]).to("cpu")
+            new32 = graphs32["after"](*inputs[1]).to("cpu")
+            diff32 = (new32 - old32).abs()
+            case["checks"]["after_vs_before_fp32"] = {
+                "max_abs": float(diff32.max()),
+                "max_abs_old": float(old32.abs().max()),
+                "elements_differing": int(torch.count_nonzero(diff32)),
+                "max_rel_where_old_nonzero": float(
+                    (diff32[old32 != 0] / old32[old32 != 0].abs()).max())
+                if bool((old32 != 0).any()) else 0.0,
+            }
             case["speedup_median"] = case["before"]["median_us"] / case["after"]["median_us"]
             case["after_over_before_median"] = (case["after"]["median_us"]
                                                 / case["before"]["median_us"])
