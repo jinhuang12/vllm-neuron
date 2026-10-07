@@ -73,6 +73,10 @@ if TYPE_CHECKING:
     # Let GLM-5.3-Flash sample its full-vocabulary logits on device, which also lets
     # async scheduling stay on.
     VLLM_NEURON_GLM5NEXT_ON_DEVICE_SAMPLING: bool = False
+    # GLM-5.3-Flash shadow draft (MTP stage A): run the layer-45 draft head k times
+    # per decode step beside the trunk and return the k draft ids; 0 = off. The
+    # sampled tokens never read the draft. Read through ``mtp.shadow_draft_k()``.
+    VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT: int = 0
     # Build the GLM-5.3-Flash step's attention metadata on the host only: no per-step
     # block-table / slot-mapping uploads that its graph never reads.
     VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA: bool = False
@@ -341,6 +345,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NEURON_GLM5NEXT_ON_DEVICE_SAMPLING": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_GLM5NEXT_ON_DEVICE_SAMPLING"))
         or False
+    ),
+    # The GLM-5.3-Flash shadow draft's iteration count k (MTP stage A); 0 = off.
+    # The one definition of the knob: everything else calls ``mtp.shadow_draft_k()``,
+    # which bounds the value, rather than reading the environment itself.
+    "VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT": lambda: (
+        maybe_convert_int(os.getenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT")) or 0
     ),
     # Skip the per-step device copies of block tables, slot mappings and cached
     # lengths for GLM-5.3-Flash, whose graph reads only host geometry. Off by default.

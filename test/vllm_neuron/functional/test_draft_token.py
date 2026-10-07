@@ -11,6 +11,8 @@ global id as ``rank * shard_rows + local_index`` of the rank holding the largest
 The reference is the replicated head's ``argmax`` over the full vocabulary, which is
 what every rank must return. Ties resolve to the lowest id, the same convention as
 ``torch.argmax`` on the full logits, so the two agree bit for bit on tied rows too.
+The logits are taken in the head's dtype (bf16, as the trunk's ``vocab_parallel_logits``
+takes them) on both sides, so the comparison reads the id recovery, not a rounding.
 
 The group is simulated in two rounds, the pattern of
 ``test_tiny_glm5next_vocab_parallel_sampling.py``: round one records each rank's local
@@ -84,14 +86,29 @@ def _every_rank(rows: torch.Tensor, head: torch.Tensor) -> tuple[list[torch.Tens
     return results, group
 
 
+def _full_logits(rows: torch.Tensor, head: torch.Tensor) -> torch.Tensor:
+    """``[B, VOCAB]`` fp32: the head's logits in the head's own dtype, shard by shard.
+
+    Computed the way the route under test computes each shard (``F.linear`` in the
+    head's dtype, as ``vocab_parallel_logits`` computes the trunk's) and concatenated
+    in rank order, so the reference is the replicated head's greedy token over the
+    SAME logits every rank sees; what the test reads is the recovery of the global id,
+    not the rounding of a 154880-wide bf16 GEMV."""
+    shards = head.reshape(TP, SHARD_ROWS, HIDDEN)
+    return torch.cat(
+        [torch.nn.functional.linear(rows, shards[r]).to(torch.float32) for r in range(TP)],
+        dim=-1,
+    )
+
+
 def _reference(rows: torch.Tensor, head: torch.Tensor) -> torch.Tensor:
-    """The replicated head's greedy token, over the full vocabulary, in fp32."""
-    return (rows.to(torch.float32) @ head.to(torch.float32).t()).argmax(dim=-1)
+    """The replicated head's greedy token over the full vocabulary."""
+    return _full_logits(rows, head).argmax(dim=-1)
 
 
 @pytest.mark.parametrize("batch", [1, 3, 5])
 def test_every_rank_recovers_the_global_greedy_token(batch: int) -> None:
-    rows, head = _rows(7_001 + batch, batch), _head(7_002)
+    rows, head = _rows(7_101 + batch, batch), _head(7_002)
     want = _reference(rows, head)
     assert int(want.min()) >= SHARD_ROWS, (
         "the reference's tokens all sit in shard 0, where a local argmax is already "
@@ -134,7 +151,7 @@ def test_a_tie_across_shards_resolves_to_the_lowest_id_like_argmax() -> None:
     head[high] = head[low]
     want = _reference(rows, head)
     assert int(want[0]) == low, f"the reference must pick the lower tied id {low}, got {int(want[0])}"
-    full = rows.to(torch.float32) @ head.to(torch.float32).t()
+    full = _full_logits(rows, head)
     assert torch.equal(full[0, low], full[0, high]), "the two rows must tie exactly"
     results, _ = _every_rank(rows, head)
     for rank, got in enumerate(results):

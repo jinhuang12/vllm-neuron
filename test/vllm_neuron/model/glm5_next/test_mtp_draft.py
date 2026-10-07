@@ -7,7 +7,7 @@ half through a twin ``Glm5NextDSALayer`` built from the same seed on its own cac
 (the production attention, which ``mtp.py`` does not own); the MoE half through the
 tiny MoE fixture's torch reference (``_routed_output`` + ``_dense_output`` on the
 router oracle's affinities); the residual adds and the shared-head norm in torch; the
-greedy token as the fp32 ``argmax`` over the whole tiny vocabulary.
+greedy token as the ``argmax`` over the whole tiny vocabulary's bf16 logits.
 
 Pinned by the tests below (mtp.md H1, H2, H4, H8, H9 and the Stage A contract):
 
@@ -444,7 +444,9 @@ class _Reference:
         attended = self.twin.forward(x, **block_kwargs)
         y = self.ffn(attended)
         hidden = _rms(y, self.w["shared_head_norm_weight"], self.eps)
-        logits = hidden.to(torch.float32) @ self.w["lm_head_weight"].to(torch.float32).t()
+        # The head's dtype (bf16), as the trunk's ``vocab_parallel_logits`` takes the
+        # sampler's logits; the margin guard below keeps a bf16 tie out of the reading.
+        logits = torch.nn.functional.linear(hidden, self.w["lm_head_weight"]).to(torch.float32)
         return hidden, logits, y
 
     def populate(self, hidden_rows, next_ids, positions, block_kwargs: dict, *, mask: bool = True) -> None:
