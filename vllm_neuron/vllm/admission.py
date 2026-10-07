@@ -130,7 +130,11 @@ def resolve_prefill_buckets(
     auto_segments = auto_queries = None
     if not user_segments:
         auto_segments, auto_queries = resolve_segmented_prefill_config(
-            budget, max_model_len
+            budget,
+            max_model_len,
+            windowed_prefill=bool(
+                neuron_config.get("_model_supports_windowed_prefill", False)
+            ),
         )
     queries = resolve_num_batched_tokens_buckets(
         budget,

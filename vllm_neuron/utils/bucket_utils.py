@@ -321,17 +321,23 @@ def validate_num_seqs_buckets(
 
 
 # Segment sizes currently supported by the segmented attention NKI kernel.
+# A windowed-prefill model (``windowed_prefill=True`` below; GLM-5.3-Flash) does
+# not run that kernel: it reads a prefill chunk's prior KV through a gathered
+# block-table window whose width the segment only sizes, so this set, the chunk
+# set and the single-shot bound below do not apply to it.
 SUPPORTED_KV_SEGMENT_SIZES = {512, 1024, 2048, 4096, 8192}
 
 # Upper bound on max_model_len for which single-shot prefill
 # (max_num_batched_tokens == max_model_len) is permitted. Above this,
-# chunked / segmented prefill is required.
+# chunked / segmented prefill is required. Segmented-kernel families only.
 MAX_MODEL_LEN_SINGLE_SHOT = 16 * 1024
 
 
 def resolve_segmented_prefill_config(
     max_num_batched_tokens: int,
     max_model_len: int,
+    *,
+    windowed_prefill: bool = False,
 ) -> tuple[list[int] | None, list[int] | None]:
     """Decide whether to enable segmented prefill by default.
 
@@ -351,12 +357,16 @@ def resolve_segmented_prefill_config(
       segmented prefill and should fall back to its own defaults for
       ``num_batched_tokens_buckets`` (e.g. power-of-2 buckets).
 
+    ``windowed_prefill``: the model reads a chunk's prior KV through a gathered
+    window of any width, not the segmented attention kernel, so neither the chunk
+    set nor the single-shot bound applies; the outcomes are the same otherwise.
+
     Raises:
         ValueError: On unsupported combinations of ``max_model_len`` and
             ``max_num_batched_tokens``.
     """
     if max_num_batched_tokens >= max_model_len:
-        if max_model_len > MAX_MODEL_LEN_SINGLE_SHOT:
+        if max_model_len > MAX_MODEL_LEN_SINGLE_SHOT and not windowed_prefill:
             raise ValueError(
                 f"Single-shot prefill (max_num_batched_tokens="
                 f"{max_num_batched_tokens} >= max_model_len="
@@ -368,7 +378,7 @@ def resolve_segmented_prefill_config(
             )
         return (None, None)
 
-    if max_num_batched_tokens not in SUPPORTED_KV_SEGMENT_SIZES:
+    if max_num_batched_tokens not in SUPPORTED_KV_SEGMENT_SIZES and not windowed_prefill:
         supported_sorted = sorted(SUPPORTED_KV_SEGMENT_SIZES)
         msg = (
             f"max_num_batched_tokens={max_num_batched_tokens} is not a "
@@ -391,6 +401,7 @@ def validate_kv_segment_size_buckets(
     num_batched_tokens_buckets: list[int] | None,
     *,
     allow_independent_query_buckets: bool = False,
+    windowed_prefill: bool = False,
 ) -> list[int]:
     """Validate kv_segment_size_buckets configuration for segmented prefill.
 
@@ -398,7 +409,9 @@ def validate_kv_segment_size_buckets(
         1. Bucket list is a non-empty list of integers.
         2. Buckets must be in strictly ascending order.
         3. Each value must be one of the sizes supported by the segmented
-           attention NKI kernel (see ``SUPPORTED_KV_SEGMENT_SIZES``).
+           attention NKI kernel (see ``SUPPORTED_KV_SEGMENT_SIZES``). A
+           windowed-prefill model takes any positive size instead: its segment
+           only sizes the gathered KV window a prefill chunk reads.
 
     Current kernel limitations (will be relaxed in the future):
         4. Only one segment size is supported (len == 1).
@@ -415,6 +428,9 @@ def validate_kv_segment_size_buckets(
         allow_independent_query_buckets: True when the model's segmented kernel
             takes a prefill bucket length that differs from the segment size.
             Relaxes constraint 5 only; constraints 1-4 still apply.
+        windowed_prefill: True when the model reads a chunk's prior KV through a
+            gathered block-table window rather than the segmented attention
+            kernel. Relaxes constraint 3 to "positive"; 1, 2, 4 and 5 still apply.
 
     Returns:
         The validated bucket list.
@@ -447,8 +463,13 @@ def validate_kv_segment_size_buckets(
                 f"{param_name} must be in strictly ascending order, got {buckets}"
             )
 
-    # 3. Each value must be a kernel-supported segment size
+    # 3. Each value must be a kernel-supported segment size (any positive size
+    # for a windowed-prefill model, which does not run the segmented kernel)
     for i, s in enumerate(buckets):
+        if windowed_prefill:
+            if s <= 0:
+                raise ValueError(f"{param_name}[{i}] must be positive, got {s}")
+            continue
         if s not in SUPPORTED_KV_SEGMENT_SIZES:
             raise ValueError(
                 f"{param_name}[{i}] = {s} is not a supported segment size. "

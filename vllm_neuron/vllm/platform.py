@@ -689,6 +689,9 @@ class NeuronPlatform(Platform):
         neuron_config["_model_supports_independent_prefill_buckets"] = bool(
             getattr(model_cls, "supports_independent_prefill_buckets", False)
         )
+        neuron_config["_model_supports_windowed_prefill"] = bool(
+            getattr(model_cls, "supports_windowed_prefill", False)
+        )
         if getattr(model_cls, "supports_on_device_sampling", True):
             return
         if cls._full_vocab_sampler_opted_in(arch, neuron_config):

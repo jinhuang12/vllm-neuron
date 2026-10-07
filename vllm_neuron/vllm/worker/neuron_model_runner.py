@@ -655,7 +655,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 auto_kv_segment_size_buckets,
                 auto_num_batched_tokens_buckets,
             ) = resolve_segmented_prefill_config(
-                self.max_num_batched_tokens, self.max_model_len
+                self.max_num_batched_tokens,
+                self.max_model_len,
+                windowed_prefill=self.neuron_config._model_supports_windowed_prefill,
             )
 
         dcp_stride = (
@@ -740,6 +742,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     allow_independent_query_buckets=(
                         self.neuron_config._model_supports_independent_prefill_buckets
                     ),
+                    windowed_prefill=self.neuron_config._model_supports_windowed_prefill,
                 )
             )
             kv_segment_size = self.neuron_config.kv_segment_size_buckets[0]
@@ -784,6 +787,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     allow_independent_query_buckets=(
                         self.neuron_config._model_supports_independent_prefill_buckets
                     ),
+                    windowed_prefill=self.neuron_config._model_supports_windowed_prefill,
                 )
             )
             logger.info(
