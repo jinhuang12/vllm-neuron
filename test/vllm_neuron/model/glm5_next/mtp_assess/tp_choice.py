@@ -13,6 +13,8 @@ constants per LOGICAL core (LNC2): 24 GiB HBM, 716 GB/s. For TP in {8, 16, 32, 6
   latent per token shared by all heads, so it is replicated at every TP (planner rule: the KV
   divisor is min(TP, n_kv) with n_kv = 1); the indexer side caches likewise; the KDA recurrent
   state is per sequence and shards by head (64 heads -> 1 head/rank at TP=64);
+* KV budget per rank = min(user budget = 0.9 x HBM - weights, cap = 0.9 x HBM x 0.30, core bound = HBM - 5 GiB
+  graph reserve - weights), the worker's own formula (``neuron_worker.py:1273-1286``);
 * ITL byte term = active bytes / 716 GB/s; the fixed part of the step (collectives, launch, glue)
   is taken from today's measured 16.96 ms at TP=64 and held constant, which is what makes the
   comparison an entitlement, not a prediction.
@@ -34,7 +36,8 @@ import json
 from pathlib import Path
 
 GIB = 2**30
-HBM_PER_LOGICAL_CORE = 24 * GIB          # trn2, LNC2 (planner trn2_constants.json)
+HBM_PER_LOGICAL_CORE = int(24.53 * GIB)  # trn2, LNC2, as the worker reports it: kv_budget.json budget 6.624 GiB = total x 0.9 x 0.30
+GPU_MEM_UTIL = 0.9                       # vLLM gpu_memory_utilization default; the KV cap applies AFTER it (neuron_worker.py:1273-1279)
 HBM_BW = 716e9                           # bytes/s per logical core
 GRAPH_RESERVE = 5 * GIB                  # envs.py VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB default
 KV_CAP_FRACTION = 0.30                   # envs.py VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION default
@@ -77,8 +80,11 @@ def main() -> None:
             continue
         w_trunk = t_sh / tp + t_rep
         w_mtp = m_sh / tp + m_rep
-        free = HBM_PER_LOGICAL_CORE - GRAPH_RESERVE - w_trunk - w_mtp
-        kv_budget = min(max(free, 0), KV_CAP_FRACTION * HBM_PER_LOGICAL_CORE)
+        free = HBM_PER_LOGICAL_CORE - GRAPH_RESERVE - w_trunk - w_mtp          # = the worker's core bound
+        user_budget = GPU_MEM_UTIL * HBM_PER_LOGICAL_CORE - w_trunk - w_mtp
+        cap = GPU_MEM_UTIL * HBM_PER_LOGICAL_CORE * KV_CAP_FRACTION
+        kv_budget = max(min(user_budget, cap, free), 0)
+        verdict = "no" if free <= 0 else ("marginal (bs=1 only)" if free < 2 * GIB else "yes")
         kda_state_per_seq = (KDA_HEADS / tp) * KDA_HEAD_DIM * KDA_HEAD_DIM * 4 * N_KDA
         kv_tokens_1seq = max(kv_budget - kda_state_per_seq, 0) / kv_token
         active = t_act / tp
@@ -88,7 +94,7 @@ def main() -> None:
             "TP": tp, "EP_options_dividing_288_and_TP": [e for e in (1, 2, 4, 8, 16, 32) if e <= tp and tp % e == 0 and N_EXPERTS % e == 0],
             "weights_per_rank_GiB": round(w_trunk / GIB, 2), "mtp_layer_per_rank_GiB": round(w_mtp / GIB, 3),
             "free_after_graph_reserve_GiB": round(free / GIB, 2), "kv_budget_GiB (<= 0.30 cap)": round(kv_budget / GIB, 2),
-            "fits": free > 0,
+            "kv_cap_GiB": round(cap / GIB, 2), "fits": verdict,
             "kda_state_per_seq_MiB": round(kda_state_per_seq / 2**20, 1),
             "kv_tokens_one_sequence": int(kv_tokens_1seq),
             "active_bytes_per_step_MiB": round(active / 2**20, 1), "itl_byte_term_ms": round(byte_ms, 3),
@@ -100,7 +106,7 @@ def main() -> None:
         "inputs": {"total_checkpoint_GiB": round(sum(by.values()) / GIB, 2), "trunk_sharded_GiB": round(t_sh / GIB, 2),
                    "trunk_replicated_GiB": round(t_rep / GIB, 4), "trunk_active_per_step_GiB": round(t_act / GIB, 2),
                    "mtp_layer_GiB": round((m_sh + m_rep) / GIB, 3), "mtp_active_per_iteration_GiB": round(m_act / GIB, 3),
-                   "kv_bytes_per_token_per_rank_replicated": round(kv_token), "hbm_per_logical_core_GiB": 24,
+                   "kv_bytes_per_token_per_rank_replicated": round(kv_token), "hbm_per_logical_core_GiB": 24.53, "gpu_mem_util": GPU_MEM_UTIL,
                    "graph_reserve_GiB": 5, "kv_cap_fraction": KV_CAP_FRACTION, "hbm_bw_GBps": 716, "itl_today_ms": ITL_TODAY_MS,
                    "tp_ceiling_query_heads": MLA_HEADS},
         "rows": rows,
