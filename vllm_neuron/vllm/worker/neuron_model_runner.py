@@ -6718,7 +6718,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # directory is configured.
             **self._layer_stream_kwargs(),
             # Shadow draft (MTP stage A): the prefill leg's boundary id; {} with the knob off.
-            **self._glm5next_shadow_kwargs(is_prefill=is_prefill, request_ids=request_ids, request_starts=request_starts, request_tokens=request_tokens, synthetic=synthetic_step, device=input_ids.device),
+            **self._glm5next_shadow_kwargs(
+                is_prefill=is_prefill,
+                request_ids=request_ids,
+                request_starts=request_starts,
+                request_tokens=request_tokens,
+                synthetic=synthetic_step,
+                device=input_ids.device,
+                sampling_rows=int(kwargs["sampling_positions"].shape[0]),
+            ),
         }
 
     def _glm5next_parallel_kwargs(self, device: torch.device | None = None) -> dict:
@@ -11500,7 +11508,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
     # ------------------------------------------------------------------------
 
     def _glm5next_shadow_k(self) -> int:
-        """The shadow-draft knob ``k`` (0 = off), read through the head's own reader."""
+        """The number of shadow drafts per step for the model this runner serves.
+
+        ``0`` unless the served root built its draft head (``model.mtp``, stage A
+        contract C2: the GLM-5.3-Flash root builds it at construction exactly when
+        ``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT`` is above 0). The knob is GLM-specific and
+        this runner is not, so the hooks key on the head, never on the environment
+        alone: another model's tuple output is left untouched whatever the knob says.
+        """
+        if getattr(getattr(self, "model", None), "mtp", None) is None:
+            return 0
         from vllm_neuron.model.glm5_next import mtp as mtp_module
 
         reader = getattr(mtp_module, "shadow_draft_k", None)
@@ -11511,7 +11528,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         return int(raw) if raw.strip() else 0
 
     def _glm5next_shadow_log_path(self) -> str:
-        return str(getattr(envs, "VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG", "") or "")
+        """``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG``: the JSONL path, "" = no log."""
+        return str(envs.VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG or "")
 
     def _glm5next_shadow_rank(self) -> int:
         cached = getattr(self, "_glm5next_shadow_rank_cache", None)
@@ -11543,25 +11561,41 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         request_tokens,
         synthetic: bool,
         device,
+        sampling_rows: int,
     ) -> dict:
         """The root keyword the shadow draft needs this step, and the step's bookkeeping.
 
-        The prefill leg populates layer 45 at every row of the chunk with the id that
-        row's draft consumes: the next prompt token, which the graph has for every row
-        but the last. The last row's id is handed in as ``shadow_boundary_ids``, one per
-        request: the first token of the next chunk when more of the prompt follows, or
-        ``-1`` when this chunk is the prompt's last, in which case the graph substitutes
-        the token it samples. The decode leg needs nothing: the sampled token is in the
-        graph. The step's request ids, leg and positions are stashed for the output
-        side (``_glm5next_shadow_observe``); a synthetic step (warmup, capture, the idle
-        dummy step) stashes nothing. Returns ``{}`` with the knob off, so the traced
+        The prefill leg populates the draft layer at every row of the chunk with the id
+        that row's draft consumes: the next prompt token, which the graph has for every
+        row but the last. The last row's id is handed in as ``shadow_boundary_ids``, an
+        int32 tensor with one entry per SAMPLING ROW (``sampling_rows`` = the length of
+        ``sampling_positions``): the first token of the next chunk when more of the
+        prompt follows, or ``-1`` when this chunk is the prompt's last, in which case the
+        graph substitutes the token it samples. The input builder pads the sampling rows
+        to the request bucket by repeating the last real row's index, so the padding
+        entries repeat the last real request's id: duplicate indices then write one
+        value. The decode leg needs nothing: the sampled token is in the graph. The
+        step's request ids, leg and positions are stashed for the output side
+        (``_glm5next_shadow_observe``); a synthetic step (warmup, capture, the idle dummy
+        step) stashes nothing. Returns ``{}`` with the draft off, so the traced
         signature is unchanged.
+
+        Raises:
+            ValueError: fewer sampling rows than requests (a geometry the translator
+                never produces; a boundary tensor could not cover every request).
         """
         self._glm5next_shadow_step = None
         if self._glm5next_shadow_k() <= 0:
             return {}
         starts = [int(value) for value in request_starts]
         counts = [int(value) for value in request_tokens]
+        rows = int(sampling_rows)
+        if rows < len(starts):
+            raise ValueError(
+                f"the shadow draft needs one boundary id per sampling row and this "
+                f"step has {rows} sampling row(s) for {len(starts)} request(s); a "
+                f"prefill samples at least one row per request"
+            )
         requests = getattr(self, "requests", None) or {}
         finals: list[bool] = []
         boundaries: list[int] = []
@@ -11588,6 +11622,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             }
         if not is_prefill:
             return {}
+        # Padding rows repeat the last real row's index (``_pad_to_compiled_shapes``),
+        # so they repeat its id.
+        boundaries += [boundaries[-1]] * (rows - len(boundaries))
         return {
             "shadow_boundary_ids": torch.tensor(boundaries, dtype=torch.int32).to(device)
         }

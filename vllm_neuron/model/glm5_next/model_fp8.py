@@ -9537,6 +9537,14 @@ class Glm5NextForConditionalGeneration(nn.Module):
             logits if device_sampling_params is not None else torch.argmax(logits, dim=-1)
         ).to(torch.int32)
         rows_out = int(sampled_ids.shape[0])
+        if "prefill_tail" not in draft_carrier and "position" not in draft_carrier:
+            raise ValueError(
+                "the shadow draft reads its leg off the draft layer's carrier: "
+                "'prefill_tail' on the prefill leg, 'position' on the decode leg; this "
+                f"carrier has neither (keys {sorted(draft_carrier)}), so the runner's "
+                "carrier walk and this forward disagree about the sparse layer's "
+                "operands"
+            )
         if "prefill_tail" in draft_carrier:
             # Prefill leg: populate every row of the chunk. Row t pairs with the next
             # row's id; the sampled rows (the chunk's last real row) pair with the
@@ -9555,6 +9563,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 boundary = shadow_boundary_ids.to(
                     device=sampled_ids.device, dtype=torch.int32
                 ).reshape(-1)
+                if int(boundary.shape[0]) != rows_out:
+                    raise ValueError(
+                        f"shadow_boundary_ids holds {int(boundary.shape[0])} id(s) and "
+                        f"this forward samples {rows_out} row(s); the prefill leg pairs "
+                        f"each sampling row with one boundary id"
+                    )
             fill = torch.where(boundary < 0, sampled_ids, boundary)
             next_ids = next_ids.index_copy(0, sampling_positions, fill)
             draft_head.populate(hidden_states, next_ids, positions, **draft_carrier)

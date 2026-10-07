@@ -125,11 +125,13 @@ def _world(*, max_model_len: int = tiny.STACK_TOKENS + 8, prompt: list[int] = PR
 
 
 def _step(world, input_ids, *, cached: int, sampling: list[int], seen: list | None = None,
-          layer45: bool = True):
+          layer45: bool = True, mutate=None):
     """One step through the converter and the root with device sampling.
 
     ``layer45``: append a stand-in carrier for layer 45 (a copy of the last DSA layer's), the
-    entry worker-40's carrier walk adds when the knob is on. Returns the root's output.
+    entry worker-40's carrier walk adds when the knob is on. ``mutate``: a callable applied to
+    the converted kwargs before the forward (to hand the root a malformed operand). Returns
+    the root's output.
     """
     runner = world.runner
     runner.input_batch.req_ids = list(world.req_ids)
@@ -149,6 +151,8 @@ def _step(world, input_ids, *, cached: int, sampling: list[int], seen: list | No
         converted["layer_carriers"] = list(converted["layer_carriers"]) + [dict(converted["layer_carriers"][-1])]
     if seen is not None:
         seen.append(converted)
+    if mutate is not None:
+        mutate(converted)
     return world.root.forward(**converted)
 
 
@@ -299,3 +303,34 @@ def test_the_sampled_ids_do_not_depend_on_the_draft(monkeypatch):
     on, stub_on = run(K)
     assert on == off
     assert len(stub_on.of("draft")) == 2 and len(stub_on.of("populate")) == 1
+
+
+def test_the_root_refuses_a_draft_carrier_that_names_no_leg(monkeypatch):
+    """The leg is read off the draft carrier (``prefill_tail`` = prefill, ``position`` =
+    decode); a carrier with neither is a protocol disagreement with the runner's carrier walk
+    and is refused by name, not by a KeyError."""
+    monkeypatch.setenv(KNOB, str(K))
+    world = _world()
+    world.root.mtp = RecordingStubHead(tiny.STACK_VOCAB_SIZE)
+
+    def strip_leg(converted):
+        carrier = converted["layer_carriers"][-1]
+        for key in ("prefill_tail", "tail", "position", "prefill_end_position"):
+            carrier.pop(key, None)
+
+    with pytest.raises(ValueError, match="prefill_tail.*position|position.*prefill_tail"):
+        _step(world, PROMPT, cached=0, sampling=[3], mutate=strip_leg)
+
+
+def test_the_root_refuses_a_boundary_tensor_that_does_not_match_the_sampling_rows(monkeypatch):
+    """One boundary id per sampling row: a count mismatch would make ``index_copy`` fail
+    deep inside the trace, or silently pair rows with the wrong id."""
+    monkeypatch.setenv(KNOB, str(K))
+    world = _world()
+    world.root.mtp = RecordingStubHead(tiny.STACK_VOCAB_SIZE)
+
+    def two_boundaries(converted):
+        converted["shadow_boundary_ids"] = torch.tensor([-1, -1], dtype=torch.int32)
+
+    with pytest.raises(ValueError, match="sampling"):
+        _step(world, PROMPT, cached=0, sampling=[3], mutate=two_boundaries)

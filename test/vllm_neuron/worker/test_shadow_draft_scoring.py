@@ -67,11 +67,13 @@ def _alphas(records: list[dict], k: int) -> tuple[list[float], list[float]]:
     return conditional, cumulative
 
 
-def _runner_shell(*, k: int = K, req_ids=None, rank: int = 0):
+def _runner_shell(*, k: int = K, req_ids=None, rank: int = 0, head: bool = True):
+    """A runner with the state the shadow hooks read; ``head`` = the served root built ``mtp``."""
     runner = NeuronModelRunner.__new__(NeuronModelRunner)
     runner.input_batch = SimpleNamespace(req_ids=list(req_ids or []))
     runner.requests = {}
     runner.rank_tensor = torch.tensor(rank, dtype=torch.int32)
+    runner.model = SimpleNamespace(mtp=object() if head else None)
     return runner
 
 
@@ -213,7 +215,7 @@ def _observe_step(runner, req_ids, *, sampled, drafts, is_prefill=False, final=N
     counts = list(counts) if counts is not None else [1] * n
     runner._glm5next_shadow_kwargs(
         is_prefill=is_prefill, request_ids=list(req_ids), request_starts=starts,
-        request_tokens=counts, synthetic=False, device=torch.device("cpu"),
+        request_tokens=counts, synthetic=False, device=torch.device("cpu"), sampling_rows=n,
     )
     sampled_t = torch.tensor(sampled, dtype=torch.int32)
     drafts_t = None if drafts is None else torch.tensor(drafts, dtype=torch.int32)
@@ -345,27 +347,27 @@ def test_the_prefill_boundary_id_is_the_next_prompt_token_or_the_sampled_sentine
     # Chunk 1 covers prompt[0:4]; the row at position 3 pairs with prompt[4] = 15.
     out = runner._glm5next_shadow_kwargs(
         is_prefill=True, request_ids=["p"], request_starts=[0], request_tokens=[4],
-        synthetic=False, device=torch.device("cpu"),
+        synthetic=False, device=torch.device("cpu"), sampling_rows=1,
     )
     assert out["shadow_boundary_ids"].tolist() == [15]
     assert out["shadow_boundary_ids"].dtype == torch.int32
     # Chunk 2 covers prompt[4:7]: final, so the last row takes the in-graph sampled id.
     out = runner._glm5next_shadow_kwargs(
         is_prefill=True, request_ids=["p"], request_starts=[4], request_tokens=[3],
-        synthetic=False, device=torch.device("cpu"),
+        synthetic=False, device=torch.device("cpu"), sampling_rows=1,
     )
     assert out["shadow_boundary_ids"].tolist() == [-1]
     # A warmup/capture step has no request: the sentinel, and no step is stashed.
     out = runner._glm5next_shadow_kwargs(
         is_prefill=True, request_ids=[None], request_starts=[0], request_tokens=[8],
-        synthetic=True, device=torch.device("cpu"),
+        synthetic=True, device=torch.device("cpu"), sampling_rows=1,
     )
     assert out["shadow_boundary_ids"].tolist() == [-1]
     assert runner._glm5next_shadow_step is None
     # The decode leg carries no boundary.
     out = runner._glm5next_shadow_kwargs(
         is_prefill=False, request_ids=["p"], request_starts=[7], request_tokens=[1],
-        synthetic=False, device=torch.device("cpu"),
+        synthetic=False, device=torch.device("cpu"), sampling_rows=1,
     )
     assert out == {}
     assert runner._glm5next_shadow_step is not None
@@ -376,7 +378,7 @@ def test_with_the_knob_off_the_hook_adds_nothing_and_the_output_passes_through(m
     runner = _runner_shell()
     out = runner._glm5next_shadow_kwargs(
         is_prefill=True, request_ids=["p"], request_starts=[0], request_tokens=[4],
-        synthetic=False, device=torch.device("cpu"),
+        synthetic=False, device=torch.device("cpu"), sampling_rows=1,
     )
     assert out == {}
     ids = torch.tensor([1, 2, 3])
@@ -384,6 +386,45 @@ def test_with_the_knob_off_the_hook_adds_nothing_and_the_output_passes_through(m
     pair = (ids, torch.tensor([[1.0]]))
     taken, drafts = runner._glm5next_shadow_take_output(pair), None
     assert taken is pair
+
+
+def test_the_hook_engages_only_when_the_served_model_built_a_draft_head(monkeypatch):
+    """The knob is GLM-specific; a model without ``mtp`` (another model, or the GLM root with
+    the knob off at construction) must see its output untouched and no keyword added."""
+    monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT", "2")
+    runner = _runner_shell(k=2, head=False)
+    assert runner._glm5next_shadow_k() == 0
+    pair = (torch.tensor([1, 2]), torch.tensor([[3, 4], [5, 6]]))
+    assert runner._glm5next_shadow_take_output(pair) is pair
+    out = runner._glm5next_shadow_kwargs(
+        is_prefill=True, request_ids=["p"], request_starts=[0], request_tokens=[4],
+        synthetic=False, device=torch.device("cpu"), sampling_rows=1,
+    )
+    assert out == {}
+    assert not runner._glm5next_shadow_active()
+
+
+def test_the_boundary_ids_cover_every_sampling_row_of_a_padded_prefill(monkeypatch):
+    """The input builder pads ``sampling_positions`` to the request bucket by repeating the
+    last real index; the boundary tensor is one entry per sampling row, padding rows taking
+    the last real request's value, so duplicate indices write one value."""
+    monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT", "3")
+    runner = _runner_shell(k=3)
+    runner.requests = {"p": SimpleNamespace(prompt_token_ids=[11, 12, 13, 14, 15, 16, 17],
+                                            num_prompt_tokens=7)}
+    runner.input_batch.req_ids = ["p"]
+    out = runner._glm5next_shadow_kwargs(
+        is_prefill=True, request_ids=["p"], request_starts=[0], request_tokens=[4],
+        synthetic=False, device=torch.device("cpu"), sampling_rows=3,
+    )
+    assert out["shadow_boundary_ids"].tolist() == [15, 15, 15]
+    # Fewer sampling rows than requests is a geometry the translator never produces.
+    with pytest.raises(ValueError, match="sampling row"):
+        runner._glm5next_shadow_kwargs(
+            is_prefill=True, request_ids=["p", "q"], request_starts=[0, 0],
+            request_tokens=[4, 4], synthetic=False, device=torch.device("cpu"),
+            sampling_rows=1,
+        )
 
 
 def test_take_output_peels_the_draft_ids_off_the_graph_output(monkeypatch):
@@ -442,13 +483,15 @@ def test_execute_model_forward_peels_the_drafts_and_observes_the_step(monkeypatc
         seen_kwargs.append(kwargs)
         # The real converter stashes the step through _glm5next_shadow_kwargs; do the same.
         runner._glm5next_shadow_kwargs(is_prefill=False, request_ids=["u"], request_starts=[7],
-                                       request_tokens=[1], synthetic=False, device=torch.device("cpu"))
+                                       request_tokens=[1], synthetic=False, device=torch.device("cpu"),
+                                       sampling_rows=1)
         return kwargs
 
     monkeypatch.setattr(runner, "_glm5next_model_kwargs", converter)
     sampled = torch.tensor([42], dtype=torch.int32)
     drafts = torch.tensor([[43, 44]], dtype=torch.int32)
     runner.model = lambda **kwargs: (sampled, drafts)
+    runner.model.mtp = object()          # the served root built its draft head
     metadata = {"layer": {"max_query_len": 1, "decode_token_threshold": 1,
                           "block_table_tensor": torch.zeros(1, 4, dtype=torch.int32)}}
 
