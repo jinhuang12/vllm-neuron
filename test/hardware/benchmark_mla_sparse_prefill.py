@@ -254,6 +254,21 @@ def run_case(tokens: int, ctx: int, base, live, args) -> dict:
     }
 
 
+def merged_case(earlier: dict, latest: dict) -> dict:
+    """One case's rows across runs: the latest run's variants over the earlier ones, the
+    speedups re-read against whichever ``before`` row the merge holds."""
+    row = dict(latest)
+    row["variants"] = {**earlier.get("variants", {}), **latest.get("variants", {})}
+    row["accuracy"] = {**earlier.get("accuracy", {}), **latest.get("accuracy", {})}
+    if latest.get("profile_dir") is None:
+        row["profile_dir"] = earlier.get("profile_dir")
+    ref = row["variants"].get("before", {}).get("median_us")
+    for one in row["variants"].values():
+        one["speedup_vs_before"] = None if ref is None else ref / one["median_us"]
+        one["after_over_before"] = None if ref is None else one["median_us"] / ref
+    return row
+
+
 # ---- cores: CPU only, on an ingested profile ----------------------------------------- #
 
 def cores(explorer_global: Path, name: str, source: str = "mla_sparse.py") -> list[dict]:
@@ -357,7 +372,10 @@ def main() -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     for tokens, ctx in cases:
         row = run_case(tokens, ctx, base, live, args)
+        earlier = [c for c in report["cases"] if (c["tokens"], c["ctx"]) == (tokens, ctx)]
         report["cases"] = [c for c in report["cases"] if (c["tokens"], c["ctx"]) != (tokens, ctx)]
+        if earlier:
+            row = merged_case(earlier[0], row)
         report["cases"].append(row)
         output.write_text(json.dumps(report, indent=2) + "\n")
         print(json.dumps({"tokens": tokens, "ctx": ctx,
