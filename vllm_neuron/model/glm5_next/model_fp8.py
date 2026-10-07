@@ -245,6 +245,24 @@ def _per_rank(count: int, world_size: int) -> int:
     return max(1, count // max(world_size, 1))
 
 
+def _shadow_draft_k() -> int:
+    """The shadow-draft knob ``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT`` (MTP stage A, 0 = off).
+
+    Read through the head module's own reader, ``mtp.shadow_draft_k`` (stage A contract
+    C1), so the knob has one owner; until that reader lands the environment is read here
+    directly, which is the stub the integration replaces.
+    """
+    from vllm_neuron.model.glm5_next import mtp as mtp_module
+
+    reader = getattr(mtp_module, "shadow_draft_k", None)
+    if reader is not None:
+        return int(reader())
+    import os
+
+    raw = os.environ.get("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT", "")
+    return int(raw) if raw.strip() else 0
+
+
 def _resolve_tp_group() -> GroupCoordinator | None:
     """The tensor-parallel group to reduce a row-parallel partial across.
 
@@ -9342,6 +9360,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         collect_layer_streams: bool = False,
         device_sampling_params: torch.Tensor | None = None,
         device_logit_mask: torch.Tensor | None = None,
+        shadow_boundary_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Logits for the rows the caller wants sampled: stack, select, project.
 
@@ -9422,11 +9441,28 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 is flat because these are graph outputs: a nested tuple is one output
                 to a caller and a structure the capture has to flatten.
 
+            shadow_boundary_ids: shadow draft (MTP stage A), prefill leg only: one
+                int32 per sampled row, the id the chunk's last row pairs with when the
+                draft layer is populated -- the next prompt token when more of the
+                prompt follows, ``-1`` when this chunk ends the prompt, in which case
+                the token sampled in this graph is taken. ``None`` means ``-1``.
+
+        Shadow draft (``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT=k``, ``self.mtp`` built):
+        ``layer_carriers`` then holds one more mapping than the stack has layers, the
+        draft layer's (index ``num_hidden_layers``, built by the runner's carrier walk
+        like a sparse layer's); it is taken off before the stack runs. On the prefill
+        leg the draft is populated at every row of the chunk from the post-final-norm
+        hidden rows and the shifted ids (row ``t`` pairs with ``x_{t+1}``), and the
+        draft output is a ``[rows, k]`` row of ``-1``. On the decode leg the draft runs
+        ``k`` unrolled iterations from the selected rows and the sampled ids and the
+        output is ``[rows, k]`` global token ids. The sampled ids never read the draft.
+
         Returns:
             ``[len(sampling_positions), vocab_size]`` logits, in the dtype the head
             weight and the stack output share -- or, under ``collect_layer_streams``,
             that tensor first and then one ``[T, hc_mult, H]`` carrier per layer of the
-            stack.
+            stack. With the shadow draft on, the ``[rows, k]`` int32 draft ids follow
+            the logits (or sampled ids) and precede the layer streams.
 
         Raises:
             ValueError: when the head tensor this call needs was never loaded, or when
@@ -9442,6 +9478,24 @@ class Glm5NextForConditionalGeneration(nn.Module):
         # The keyword is added, not passed as False, so an ordinary forward hands its
         # stack the six keywords it always handed over and no seventh.
         collecting = {"collect_layer_streams": True} if collect_layer_streams else {}
+        # Shadow draft: the draft layer's carrier rides at the end of the list and the
+        # stack must not see it (it refuses a count that disagrees with its layers).
+        draft_head = getattr(self, "mtp", None)
+        shadow_k = _shadow_draft_k() if draft_head is not None else 0
+        draft_carrier: dict | None = None
+        if shadow_k > 0:
+            stack_depth = len(self.model.layers)
+            carriers = list(layer_carriers)
+            if len(carriers) != stack_depth + 1:
+                raise ValueError(
+                    f"the shadow draft is on (k={shadow_k}) and this forward received "
+                    f"{len(carriers)} per-layer carrier mapping(s) for a stack of "
+                    f"{stack_depth} layers plus the draft layer; the runner's carrier walk "
+                    f"adds the draft layer's mapping (index {stack_depth}) when the knob "
+                    f"is on, and without it the draft would run on a trunk layer's state"
+                )
+            draft_carrier = carriers[stack_depth]
+            layer_carriers = carriers[:stack_depth]
         stack_output = self.model(
             input_ids,
             layer_carriers=layer_carriers,
@@ -9471,6 +9525,53 @@ class Glm5NextForConditionalGeneration(nn.Module):
             logits = sample_full_vocab(
                 logits, device_sampling_params, sampling_config, device_logit_mask
             )
+        if shadow_k <= 0:
+            if collect_layer_streams:
+                return (logits, *layer_streams)
+            return logits
+        # ── shadow draft ─────────────────────────────────────────────────────
+        # Alignment: the draft at position t consumes the trunk's post-final-norm row
+        # h_t and the embedding of x_{t+1}. The sampled ids are read, never written.
+        assert draft_carrier is not None
+        sampled_ids = (
+            logits if device_sampling_params is not None else torch.argmax(logits, dim=-1)
+        ).to(torch.int32)
+        rows_out = int(sampled_ids.shape[0])
+        if "prefill_tail" in draft_carrier:
+            # Prefill leg: populate every row of the chunk. Row t pairs with the next
+            # row's id; the sampled rows (the chunk's last real row) pair with the
+            # boundary id, or with the id sampled here when the boundary is -1.
+            tokens = int(input_ids.shape[0])
+            start = torch.as_tensor(
+                draft_carrier["start_position"], device=input_ids.device
+            ).reshape(-1)[0].to(torch.int32)
+            positions = start + torch.arange(
+                tokens, dtype=torch.int32, device=input_ids.device
+            )
+            next_ids = torch.cat([input_ids[1:], input_ids[:1] * 0]).to(torch.int32)
+            if shadow_boundary_ids is None:
+                boundary = torch.full_like(sampled_ids, -1)
+            else:
+                boundary = shadow_boundary_ids.to(
+                    device=sampled_ids.device, dtype=torch.int32
+                ).reshape(-1)
+            fill = torch.where(boundary < 0, sampled_ids, boundary)
+            next_ids = next_ids.index_copy(0, sampling_positions, fill)
+            draft_head.populate(hidden_states, next_ids, positions, **draft_carrier)
+            draft_ids = torch.full(
+                (rows_out, shadow_k), -1, dtype=torch.int32, device=input_ids.device
+            )
+        else:
+            # Decode leg: the selected rows are one per request, at the request's
+            # position; iteration 0 of the draft populates the draft layer there.
+            positions = torch.as_tensor(
+                draft_carrier["position"], device=input_ids.device
+            ).reshape(-1).to(torch.int32)
+            if positions.numel() == 1 and rows_out > 1:
+                positions = positions.expand(rows_out)
+            draft_ids = draft_head.draft_tokens(
+                rows, sampled_ids, positions, shadow_k, **draft_carrier
+            )
         if collect_layer_streams:
-            return (logits, *layer_streams)
-        return logits
+            return (logits, draft_ids, *layer_streams)
+        return logits, draft_ids

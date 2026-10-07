@@ -397,3 +397,72 @@ def test_take_output_peels_the_draft_ids_off_the_graph_output(monkeypatch):
     stream = torch.zeros(2, 3)
     out = runner._glm5next_shadow_take_output((ids, drafts, stream))
     assert isinstance(out, tuple) and out[0] is ids and out[1] is stream
+
+
+# ── the unpack site: _execute_model_forward peels the drafts and observes the step ──
+
+
+def test_execute_model_forward_peels_the_drafts_and_observes_the_step(monkeypatch, tmp_path):
+    """With the knob on the GLM root returns ``(sampled_ids, draft_ids)``; the unpack hands the
+    sampled ids on unchanged and queues the step for scoring, so the next step's observe can
+    resolve it. Everything around the model call is a shell: this reads the two hunks only."""
+    import contextlib
+
+    from vllm_neuron.vllm.worker import neuron_model_runner as module
+
+    log = tmp_path / "shadow.jsonl"
+    monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT", "2")
+    monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG", str(log))
+    runner = _runner_shell(k=2, req_ids=["u"])
+    runner.use_async_scheduling = False
+    runner.device = torch.device("cpu")
+    runner.on_device_sampling = True
+    runner.is_eagle3_spec = False
+    runner.drafter = None
+    runner._debug_logits_dir = None
+    runner._layer_stream_dump_dir = None
+    runner._target_tensor_capture = None
+    runner._tensor_replacer = None
+    runner.enable_prompt_embeds = False
+    runner.supports_mm_inputs = False
+    runner.input_batch.num_reqs = 1
+    runner.input_batch.sampling_metadata = object()
+    runner.vllm_config = SimpleNamespace(model_config=SimpleNamespace(model="tiny"))
+    monkeypatch.setattr(module, "model_forward_context", lambda config: contextlib.nullcontext())
+    monkeypatch.setattr(module, "build_sampling_params_tensor",
+                        lambda metadata, num_reqs, device: torch.zeros(num_reqs, 3))
+    monkeypatch.setattr(NeuronModelRunner, "_snapshot_capture_context",
+                        lambda self, positions, spec: contextlib.nullcontext())
+    monkeypatch.setattr(NeuronModelRunner, "_model_is_async_spec_decoded", lambda self: False)
+    monkeypatch.setattr(NeuronModelRunner, "_maybe_replicate_for_spec_decode",
+                        lambda self, params, spec: params)
+    seen_kwargs: list[dict] = []
+
+    def converter(kwargs):
+        seen_kwargs.append(kwargs)
+        # The real converter stashes the step through _glm5next_shadow_kwargs; do the same.
+        runner._glm5next_shadow_kwargs(is_prefill=False, request_ids=["u"], request_starts=[7],
+                                       request_tokens=[1], synthetic=False, device=torch.device("cpu"))
+        return kwargs
+
+    monkeypatch.setattr(runner, "_glm5next_model_kwargs", converter)
+    sampled = torch.tensor([42], dtype=torch.int32)
+    drafts = torch.tensor([[43, 44]], dtype=torch.int32)
+    runner.model = lambda **kwargs: (sampled, drafts)
+    metadata = {"layer": {"max_query_len": 1, "decode_token_threshold": 1,
+                          "block_table_tensor": torch.zeros(1, 4, dtype=torch.int32)}}
+
+    out, aux, last = runner._execute_model_forward(
+        torch.tensor([41]), torch.tensor([7]), torch.tensor([0]), metadata, None,
+    )
+    assert aux is None and last is None
+    assert torch.equal(out, sampled), "the sampled ids pass through unchanged"
+    assert len(runner._glm5next_shadow_pending) == 1
+    step_no, step, queued_sampled, queued_drafts = runner._glm5next_shadow_pending[0]
+    assert step["request_ids"] == ["u"] and step["positions"] == [7]
+    assert torch.equal(queued_sampled, sampled) and torch.equal(queued_drafts, drafts)
+    # The next step resolves it; with 'u' gone, the record is flushed with nothing scored.
+    runner.input_batch.req_ids = []
+    runner._glm5next_shadow_observe(torch.tensor([], dtype=torch.int32), None, is_prefill=False)
+    written = _read_log(log)
+    assert [(r["req_id"], r["step"], r["position"], r["drafts"]) for r in written] == [("u", 0, 7, [43, 44])]

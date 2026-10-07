@@ -6717,6 +6717,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # so captured and served graphs share a signature. Absent unless a dump
             # directory is configured.
             **self._layer_stream_kwargs(),
+            # Shadow draft (MTP stage A): the prefill leg's boundary id; {} with the knob off.
+            **self._glm5next_shadow_kwargs(is_prefill=is_prefill, request_ids=request_ids, request_starts=request_starts, request_tokens=request_tokens, synthetic=synthetic_step, device=input_ids.device),
         }
 
     def _glm5next_parallel_kwargs(self, device: torch.device | None = None) -> dict:
@@ -9258,6 +9260,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             bucket_name=neff_bucket_name,
         ).inc()
 
+        # Shadow draft (MTP stage A): the GLM root's draft ids ride second in its
+        # output; take them off before anything reads the output's shape.
+        model_output = self._glm5next_shadow_take_output(model_output)
         # Strip the per-layer stream dump from the output first: every branch below
         # expects the shape the model returns with no dump configured.
         model_output = self._take_layer_stream_dump(
@@ -9309,6 +9314,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # Store logits for debug logits writing in non-ODS mode
             if self._debug_logits_dir:
                 self._on_device_logits = model_output_tensor
+
+        # Shadow draft: queue this step's sampled ids and drafts for scoring (no-op
+        # with the knob off; resolved one step later, so no readback here).
+        self._glm5next_shadow_observe(
+            model_output_tensor,
+            getattr(self, "_glm5next_shadow_last_drafts", None),
+            is_prefill=is_prefill,
+        )
 
         # Move model_output_tensor (logits or sampled token ids) back to CPU
         if not self.use_async_scheduling:
