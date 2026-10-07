@@ -312,33 +312,6 @@ def test_the_compile_estimate_charges_the_resident_operands(model_specs, monkeyp
 
 
 # ---------------------------------------------------------------------------
-# No length ceiling outside the kernels' own contracts
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("length", [16384, 32768, 131072])
-def test_single_shot_prefill_is_not_capped_at_16k(length) -> None:
-    """``max_num_batched_tokens >= max_model_len`` is single-shot prefill at any length.
-
-    The 16k ceiling (``MAX_MODEL_LEN_SINGLE_SHOT``) named no kernel limit; whether a
-    long point fits is the KV budget's question.
-    """
-    from vllm_neuron.utils import bucket_utils
-
-    assert bucket_utils.resolve_segmented_prefill_config(length, length) == (None, None)
-    assert not hasattr(bucket_utils, "MAX_MODEL_LEN_SINGLE_SHOT")
-
-
-def test_an_unsupported_chunk_offers_single_shot_at_any_length() -> None:
-    from vllm_neuron.utils import bucket_utils
-
-    with pytest.raises(ValueError) as refusal:
-        bucket_utils.resolve_segmented_prefill_config(3000, 32768)
-
-    assert "set max_num_batched_tokens=32768" in str(refusal.value)
-
-
-# ---------------------------------------------------------------------------
 # Derived defaults
 # ---------------------------------------------------------------------------
 

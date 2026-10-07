@@ -323,6 +323,11 @@ def validate_num_seqs_buckets(
 # Segment sizes currently supported by the segmented attention NKI kernel.
 SUPPORTED_KV_SEGMENT_SIZES = {512, 1024, 2048, 4096, 8192}
 
+# Upper bound on max_model_len for which single-shot prefill
+# (max_num_batched_tokens == max_model_len) is permitted. Above this,
+# chunked / segmented prefill is required.
+MAX_MODEL_LEN_SINGLE_SHOT = 16 * 1024
+
 
 def resolve_segmented_prefill_config(
     max_num_batched_tokens: int,
@@ -340,28 +345,43 @@ def resolve_segmented_prefill_config(
       ``SUPPORTED_KV_SEGMENT_SIZES``. Returns
       ``([max_num_batched_tokens], [max_num_batched_tokens])`` — the
       caller should auto-enable segmented prefill with these buckets.
-    - Single-shot prefill (``max_num_batched_tokens >= max_model_len``),
-      at any ``max_model_len``: whether the served point fits the device is
-      the worker's KV budget check. Returns ``(None, None)`` — the caller
-      should not configure segmented prefill and should fall back to its own
-      defaults for ``num_batched_tokens_buckets`` (e.g. power-of-2 buckets).
+    - Single-shot prefill (``max_num_batched_tokens >= max_model_len``):
+      allowed only when ``max_model_len <= MAX_MODEL_LEN_SINGLE_SHOT``.
+      Returns ``(None, None)`` — the caller should not configure
+      segmented prefill and should fall back to its own defaults for
+      ``num_batched_tokens_buckets`` (e.g. power-of-2 buckets).
 
     Raises:
         ValueError: On unsupported combinations of ``max_model_len`` and
             ``max_num_batched_tokens``.
     """
     if max_num_batched_tokens >= max_model_len:
+        if max_model_len > MAX_MODEL_LEN_SINGLE_SHOT:
+            raise ValueError(
+                f"Single-shot prefill (max_num_batched_tokens="
+                f"{max_num_batched_tokens} >= max_model_len="
+                f"{max_model_len}) is only supported when max_model_len "
+                f"<= {MAX_MODEL_LEN_SINGLE_SHOT}. Set "
+                f"max_num_batched_tokens to one of "
+                f"{sorted(SUPPORTED_KV_SEGMENT_SIZES)} to enable "
+                f"chunked prefill."
+            )
         return (None, None)
 
     if max_num_batched_tokens not in SUPPORTED_KV_SEGMENT_SIZES:
         supported_sorted = sorted(SUPPORTED_KV_SEGMENT_SIZES)
-        raise ValueError(
+        msg = (
             f"max_num_batched_tokens={max_num_batched_tokens} is not a "
             f"supported chunked prefill size on Neuron. Supported values: "
-            f"{supported_sorted}. Alternatively, set max_num_batched_tokens="
-            f"{max_model_len} (equal to max_model_len) to disable "
-            f"chunked prefill."
+            f"{supported_sorted}."
         )
+        if max_model_len <= MAX_MODEL_LEN_SINGLE_SHOT:
+            msg += (
+                f" Alternatively, set max_num_batched_tokens="
+                f"{max_model_len} (equal to max_model_len) to disable "
+                f"chunked prefill."
+            )
+        raise ValueError(msg)
 
     return ([max_num_batched_tokens], [max_num_batched_tokens])
 
