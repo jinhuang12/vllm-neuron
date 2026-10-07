@@ -8,8 +8,9 @@ standard line: 1024 + 1024 at max_model_len 4096). These tests pin the rules tha
 the cap:
 
 1. ``kv_segment_size_buckets`` may hold several values (for a model whose kernel takes the
-   query length independently of the cached length), each still a supported size, strictly
-   ascending, with explicit ``num_batched_tokens_buckets``.
+   query length independently of the cached length), any positive size for a
+   windowed-prefill model (the segmented kernel's sizes otherwise), strictly ascending,
+   with explicit ``num_batched_tokens_buckets``.
 2. The largest segment must cover ``max_model_len``: ``prefill_window_tokens`` of the
    list is at least ``max_model_len``, else the list is refused at startup naming the
    segment to add. Without the rule a prompt longer than the window stops the engine.
@@ -74,6 +75,9 @@ def test_the_prefill_window_is_the_largest_segment_plus_the_largest_query_bucket
         ([1024], [1024], 2048),  # the old standard line at a max_model_len it covers
         ([512, 1024, 2048, 4096, 8192], [1024], 8192),  # every supported size at once
         (STANDARD, [128, 1024], 4096),  # several query buckets too
+        ([1024, 3072], [1024], 4096),  # a windowed model: any positive size
+        ([65536], [8192], 65536),  # the long line: one segment of max_model_len
+        ([1024, 65536], [8192], 65536),
     ],
 )
 def test_multi_valued_lists_whose_window_covers_max_model_len_are_accepted(
@@ -83,6 +87,7 @@ def test_multi_valued_lists_whose_window_covers_max_model_len_are_accepted(
         segments,
         queries,
         allow_independent_query_buckets=True,
+        windowed_prefill=True,
         block_size=PAGE,
         max_model_len=max_model_len,
     ) == segments
@@ -91,7 +96,8 @@ def test_multi_valued_lists_whose_window_covers_max_model_len_are_accepted(
 def test_without_max_model_len_the_coverage_rule_is_not_applied():
     """A caller that does not say the model length cannot be held to a window."""
     assert validate_kv_segment_size_buckets(
-        [1024], [1024], allow_independent_query_buckets=True, block_size=PAGE
+        [1024], [1024], allow_independent_query_buckets=True, windowed_prefill=True,
+        block_size=PAGE,
     ) == [1024]
 
 
@@ -106,6 +112,7 @@ def test_the_old_standard_line_is_refused_naming_the_window_and_the_segment_to_a
             [1024],
             [1024],
             allow_independent_query_buckets=True,
+            windowed_prefill=True,
             block_size=PAGE,
             max_model_len=4096,
         )
@@ -132,6 +139,7 @@ def test_a_list_whose_window_falls_short_is_refused(segments, queries, max_model
             segments,
             queries,
             allow_independent_query_buckets=True,
+            windowed_prefill=True,
             block_size=PAGE,
             max_model_len=max_model_len,
         )
@@ -140,23 +148,36 @@ def test_a_list_whose_window_falls_short_is_refused(segments, queries, max_model
     assert f"at least {needed} tokens" in message, message
 
 
-def test_a_window_no_supported_segment_covers_is_refused_naming_the_longest_window():
-    """8192 + 1024 = 9216 is the longest window the supported segments give."""
+def test_a_window_past_the_segmented_kernel_sizes_is_refused_naming_a_max_model_len_segment():
+    """8192 + 1024 = 9216 is the longest window the segmented kernel's sizes give; a
+    windowed model takes any size, so the remedy names a segment of max_model_len."""
     with pytest.raises(ValueError, match="9216") as refused:
         validate_kv_segment_size_buckets(
             [8192],
             [1024],
             allow_independent_query_buckets=True,
+            windowed_prefill=True,
             block_size=PAGE,
             max_model_len=32768,
         )
-    assert "32768" in str(refused.value)
+    message = str(refused.value)
+    assert "32768" in message, message
+    assert "at least 31744 tokens" in message, message
+    assert "[8192, 32768]" in message, message
 
 
 def test_the_generic_kernel_has_no_window_so_no_coverage_rule():
     """The generic segmented kernel walks prior KV one segment at a time."""
     assert validate_kv_segment_size_buckets(
         [1024], [1024], block_size=PAGE, max_model_len=4096
+    ) == [1024]
+
+
+def test_independent_query_buckets_alone_bring_no_window_rule():
+    """The window is a property of windowed prefill, not of the bucket pairing."""
+    assert validate_kv_segment_size_buckets(
+        [1024], [1024], allow_independent_query_buckets=True, block_size=PAGE,
+        max_model_len=4096,
     ) == [1024]
 
 
@@ -188,13 +209,41 @@ def test_nonsense_lists_are_refused(segments, queries, match):
         )
 
 
+@pytest.mark.parametrize(
+    "segments, queries, match",
+    [
+        (None, [1024], "non-empty list"),
+        ([0, 1024], [1024], "must be positive"),
+        ([-512], [1024], "must be positive"),
+        ([2048, 1024], [1024], "strictly ascending"),
+        ([1024, 1024.0], [1024], "must be an integer"),
+    ],
+)
+def test_a_windowed_model_refuses_the_same_nonsense_but_takes_any_positive_size(
+    segments, queries, match
+):
+    with pytest.raises(ValueError, match=match):
+        validate_kv_segment_size_buckets(
+            segments,
+            queries,
+            allow_independent_query_buckets=True,
+            windowed_prefill=True,
+            block_size=PAGE,
+            max_model_len=4096,
+        )
+    assert validate_kv_segment_size_buckets(
+        [1000, 2048, 4096], [1024], allow_independent_query_buckets=True,
+        windowed_prefill=True, block_size=PAGE, max_model_len=4096,
+    ) == [1000, 2048, 4096]
+
+
 def test_several_segments_need_explicit_query_buckets():
     """Left unset, the query buckets copy the segments and the runner would compile every
     (query, segment) pair and run every chunk at the largest width."""
     with pytest.raises(ValueError, match="num_batched_tokens_buckets"):
         validate_kv_segment_size_buckets(
-            STANDARD, None, allow_independent_query_buckets=True, block_size=PAGE,
-            max_model_len=4096,
+            STANDARD, None, allow_independent_query_buckets=True, windowed_prefill=True,
+            block_size=PAGE, max_model_len=4096,
         )
 
 
@@ -266,6 +315,24 @@ def test_the_covering_segment_is_a_supported_size():
 
 
 @pytest.mark.parametrize(
+    "max_model_len, max_query, segment",
+    [
+        (4096, 1024, 4096),  # a supported size covers: it is preferred
+        (9216, 1024, 8192),
+        (9217, 1024, 9217),  # past the segmented kernel's sizes: max_model_len itself
+        (32768, 1024, 32768),
+        (65536, 8192, 65536),
+    ],
+)
+def test_a_windowed_model_without_a_supported_cover_takes_a_segment_of_max_model_len(
+    max_model_len, max_query, segment
+):
+    assert covering_kv_segment_size(
+        max_model_len, max_query, PAGE, windowed_prefill=True
+    ) == segment
+
+
+@pytest.mark.parametrize(
     "segments, queries, max_model_len, completed",
     [
         ([1024], [1024], 4096, [1024, 4096]),  # the auto path at the standard line
@@ -288,9 +355,18 @@ def test_completion_refuses_a_model_length_no_supported_segment_covers():
     assert "32768" in str(refused.value)
 
 
+def test_a_windowed_model_is_completed_with_a_segment_of_max_model_len_past_the_sizes():
+    assert complete_kv_segment_cover(
+        [8192], [8192], 65536, PAGE, windowed_prefill=True
+    ) == [8192, 65536]
+    assert complete_kv_segment_cover(
+        [1024], [1024], 4096, PAGE, windowed_prefill=True
+    ) == [1024, 4096]
+
+
 def test_a_completed_list_passes_the_validator():
-    completed = complete_kv_segment_cover([1024], [1024], 4096, PAGE)
+    completed = complete_kv_segment_cover([1024], [1024], 4096, PAGE, windowed_prefill=True)
     assert validate_kv_segment_size_buckets(
-        completed, [1024], allow_independent_query_buckets=True, block_size=PAGE,
-        max_model_len=4096,
+        completed, [1024], allow_independent_query_buckets=True, windowed_prefill=True,
+        block_size=PAGE, max_model_len=4096,
     ) == completed

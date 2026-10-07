@@ -656,7 +656,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 auto_kv_segment_size_buckets,
                 auto_num_batched_tokens_buckets,
             ) = resolve_segmented_prefill_config(
-                self.max_num_batched_tokens, self.max_model_len
+                self.max_num_batched_tokens,
+                self.max_model_len,
+                windowed_prefill=self.neuron_config._model_supports_windowed_prefill,
             )
 
         dcp_stride = (
@@ -734,9 +736,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 if user_set_num_batched_tokens_buckets
                 else None
             )
-            # A windowed model (independent query buckets) reads a prefill chunk's KV
-            # through a window of segment + query bucket tokens, so the list's largest
-            # segment must cover max_model_len; the validator refuses one that does not.
+            # A windowed-prefill model reads a prefill chunk's KV through a window of
+            # segment + query bucket tokens, so the list's largest segment must cover
+            # max_model_len; the validator refuses one that does not.
             self.neuron_config.kv_segment_size_buckets = (
                 validate_kv_segment_size_buckets(
                     buckets,
@@ -744,6 +746,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     allow_independent_query_buckets=(
                         self.neuron_config._model_supports_independent_prefill_buckets
                     ),
+                    windowed_prefill=self.neuron_config._model_supports_windowed_prefill,
                     block_size=getattr(vllm_config.cache_config, "block_size", None),
                     max_model_len=self.max_model_len,
                 )
@@ -775,18 +778,25 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 self.neuron_config.kv_segment_size_buckets,
             )
         elif auto_kv_segment_size_buckets is not None:
-            windowed = self.neuron_config._model_supports_independent_prefill_buckets
+            # A windowed-prefill model whose kernel takes the query length
+            # independently of the cached length can hold several segments.
+            windowed = (
+                self.neuron_config._model_supports_windowed_prefill
+                and self.neuron_config._model_supports_independent_prefill_buckets
+            )
             block_size = getattr(vllm_config.cache_config, "block_size", None)
             if windowed:
                 # The resolver picks one segment equal to the token budget, a window
                 # of twice the budget; a windowed model with a longer max_model_len
-                # gets the smallest supported segment that covers it appended, so a
-                # user who set no list is not capped below max_model_len.
+                # gets the smallest supported segment that covers it appended (or one
+                # of max_model_len), so a user who set no list is not capped below
+                # max_model_len.
                 completed = complete_kv_segment_cover(
                     auto_kv_segment_size_buckets,
                     self.neuron_config.num_batched_tokens_buckets,
                     self.max_model_len,
                     block_size,
+                    windowed_prefill=True,
                 )
                 if completed != auto_kv_segment_size_buckets:
                     logger.info(
@@ -811,7 +821,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 validate_kv_segment_size_buckets(
                     auto_kv_segment_size_buckets,
                     explicit_num_batched_tokens_buckets,
-                    allow_independent_query_buckets=windowed,
+                    allow_independent_query_buckets=(
+                        self.neuron_config._model_supports_independent_prefill_buckets
+                    ),
+                    windowed_prefill=self.neuron_config._model_supports_windowed_prefill,
                     block_size=block_size,
                     max_model_len=self.max_model_len,
                 )

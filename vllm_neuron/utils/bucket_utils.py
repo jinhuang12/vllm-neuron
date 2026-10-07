@@ -321,17 +321,23 @@ def validate_num_seqs_buckets(
 
 
 # Segment sizes currently supported by the segmented attention NKI kernel.
+# A windowed-prefill model (``windowed_prefill=True`` below; GLM-5.3-Flash) does
+# not run that kernel: it reads a prefill chunk's prior KV through a gathered
+# block-table window whose width the segment only sizes, so this set, the chunk
+# set and the single-shot bound below do not apply to it.
 SUPPORTED_KV_SEGMENT_SIZES = {512, 1024, 2048, 4096, 8192}
 
 # Upper bound on max_model_len for which single-shot prefill
 # (max_num_batched_tokens == max_model_len) is permitted. Above this,
-# chunked / segmented prefill is required.
+# chunked / segmented prefill is required. Segmented-kernel families only.
 MAX_MODEL_LEN_SINGLE_SHOT = 16 * 1024
 
 
 def resolve_segmented_prefill_config(
     max_num_batched_tokens: int,
     max_model_len: int,
+    *,
+    windowed_prefill: bool = False,
 ) -> tuple[list[int] | None, list[int] | None]:
     """Decide whether to enable segmented prefill by default.
 
@@ -351,12 +357,16 @@ def resolve_segmented_prefill_config(
       segmented prefill and should fall back to its own defaults for
       ``num_batched_tokens_buckets`` (e.g. power-of-2 buckets).
 
+    ``windowed_prefill``: the model reads a chunk's prior KV through a gathered
+    window of any width, not the segmented attention kernel, so neither the chunk
+    set nor the single-shot bound applies; the outcomes are the same otherwise.
+
     Raises:
         ValueError: On unsupported combinations of ``max_model_len`` and
             ``max_num_batched_tokens``.
     """
     if max_num_batched_tokens >= max_model_len:
-        if max_model_len > MAX_MODEL_LEN_SINGLE_SHOT:
+        if max_model_len > MAX_MODEL_LEN_SINGLE_SHOT and not windowed_prefill:
             raise ValueError(
                 f"Single-shot prefill (max_num_batched_tokens="
                 f"{max_num_batched_tokens} >= max_model_len="
@@ -368,7 +378,7 @@ def resolve_segmented_prefill_config(
             )
         return (None, None)
 
-    if max_num_batched_tokens not in SUPPORTED_KV_SEGMENT_SIZES:
+    if max_num_batched_tokens not in SUPPORTED_KV_SEGMENT_SIZES and not windowed_prefill:
         supported_sorted = sorted(SUPPORTED_KV_SEGMENT_SIZES)
         msg = (
             f"max_num_batched_tokens={max_num_batched_tokens} is not a "
@@ -428,11 +438,18 @@ def select_kv_segment_size(buckets: list[int], tokens: int) -> int:
 
 
 def covering_kv_segment_size(
-    max_model_len: int, max_query_tokens: int, block_size: int | None = None
+    max_model_len: int,
+    max_query_tokens: int,
+    block_size: int | None = None,
+    *,
+    windowed_prefill: bool = False,
 ) -> int | None:
     """Return the smallest supported segment whose window covers ``max_model_len``.
 
-    ``None`` when no supported size does: the longest window is then
+    A windowed-prefill model takes any positive segment (its segment only sizes the
+    gathered window), so when no size of ``SUPPORTED_KV_SEGMENT_SIZES`` covers, a
+    segment of ``max_model_len`` is returned for it: its window is the whole table.
+    ``None`` otherwise: the longest window is then
     ``prefill_window_tokens([max(SUPPORTED_KV_SEGMENT_SIZES)], [max_query_tokens])``.
     """
     for segment in sorted(SUPPORTED_KV_SEGMENT_SIZES):
@@ -440,6 +457,8 @@ def covering_kv_segment_size(
             max_model_len
         ):
             return int(segment)
+    if windowed_prefill:
+        return int(max_model_len)
     return None
 
 
@@ -448,6 +467,8 @@ def complete_kv_segment_cover(
     num_batched_tokens_buckets: list[int],
     max_model_len: int,
     block_size: int | None = None,
+    *,
+    windowed_prefill: bool = False,
 ) -> list[int]:
     """Return the segment list with the covering segment appended when it falls short.
 
@@ -455,10 +476,12 @@ def complete_kv_segment_cover(
     the resolver picks is one segment equal to the token budget, whose window is twice
     the budget. A windowed model with ``max_model_len`` above that would refuse every
     longer prompt, so the smallest supported segment whose window covers
-    ``max_model_len`` is appended. A list that covers already is returned unchanged.
+    ``max_model_len`` is appended (a segment of ``max_model_len`` itself for a
+    windowed-prefill model when no supported size covers). A list that covers already
+    is returned unchanged.
 
     Raises:
-        ValueError: no supported segment covers ``max_model_len``.
+        ValueError: no supported segment covers ``max_model_len`` (not windowed).
     """
     segments = [int(value) for value in kv_segment_size_buckets]
     if prefill_window_tokens(segments, num_batched_tokens_buckets, block_size) >= int(
@@ -466,7 +489,9 @@ def complete_kv_segment_cover(
     ):
         return segments
     query = max(int(value) for value in num_batched_tokens_buckets)
-    cover = covering_kv_segment_size(max_model_len, query, block_size)
+    cover = covering_kv_segment_size(
+        max_model_len, query, block_size, windowed_prefill=windowed_prefill
+    )
     if cover is None:
         longest = prefill_window_tokens(
             [max(SUPPORTED_KV_SEGMENT_SIZES)], [query], block_size
@@ -486,6 +511,7 @@ def validate_kv_segment_size_buckets(
     num_batched_tokens_buckets: list[int] | None,
     *,
     allow_independent_query_buckets: bool = False,
+    windowed_prefill: bool = False,
     block_size: int | None = None,
     max_model_len: int | None = None,
 ) -> list[int]:
@@ -501,7 +527,9 @@ def validate_kv_segment_size_buckets(
         2. Buckets must be in strictly ascending order, so the first segment that
            holds a request is the smallest.
         3. Each value must be one of the sizes supported by the segmented
-           attention NKI kernel (see ``SUPPORTED_KV_SEGMENT_SIZES``).
+           attention NKI kernel (see ``SUPPORTED_KV_SEGMENT_SIZES``). A
+           windowed-prefill model takes any positive size instead: its segment
+           only sizes the gathered KV window a prefill chunk reads.
 
     Current kernel limitations:
         4. Several segment sizes need a model whose kernel takes the prefill bucket
@@ -530,8 +558,11 @@ def validate_kv_segment_size_buckets(
             or None if not set by user (they then copy the segment list).
         allow_independent_query_buckets: True when the model's segmented kernel
             takes a prefill bucket length that differs from the segment size.
-            Allows several segments (constraint 4), relaxes constraint 5 and
-            enables the window rule (constraint 6).
+            Allows several segments (constraint 4) and relaxes constraint 5.
+        windowed_prefill: True when the model reads a chunk's prior KV through a
+            gathered block-table window rather than the segmented attention
+            kernel. Relaxes constraint 3 to "positive" and enables the window
+            rule (constraint 6); 1, 2, 4 and 5 still apply.
         block_size: The KV cache block size in tokens, for the window rule's page
             rounding; None for the exact sum.
         max_model_len: The model length the window must cover; None skips rule 6.
@@ -570,8 +601,13 @@ def validate_kv_segment_size_buckets(
                 f"{param_name} must be in strictly ascending order, got {buckets}"
             )
 
-    # 3. Each value must be a kernel-supported segment size
+    # 3. Each value must be a kernel-supported segment size (any positive size
+    # for a windowed-prefill model, which does not run the segmented kernel)
     for i, s in enumerate(buckets):
+        if windowed_prefill:
+            if s <= 0:
+                raise ValueError(f"{param_name}[{i}] must be positive, got {s}")
+            continue
         if s not in SUPPORTED_KV_SEGMENT_SIZES:
             raise ValueError(
                 f"{param_name}[{i}] = {s} is not a supported segment size. "
@@ -620,7 +656,8 @@ def validate_kv_segment_size_buckets(
     # --- The prefill window of a windowed model ---
 
     # 6. The largest segment plus the largest query bucket must cover max_model_len
-    if allow_independent_query_buckets and max_model_len is not None:
+    # (a windowed-prefill model: its prefill chunk reads that window and no more)
+    if windowed_prefill and max_model_len is not None:
         queries = (
             num_batched_tokens_buckets
             if num_batched_tokens_buckets is not None
@@ -630,23 +667,14 @@ def validate_kv_segment_size_buckets(
         if window < int(max_model_len):
             query = max(int(value) for value in queries)
             needed = int(max_model_len) - query
-            cover = covering_kv_segment_size(max_model_len, query, block_size)
-            if cover is None:
-                longest = prefill_window_tokens(
-                    [max(SUPPORTED_KV_SEGMENT_SIZES)], [query], block_size
-                )
-                remedy = (
-                    f"No supported segment size {sorted(SUPPORTED_KV_SEGMENT_SIZES)} "
-                    f"covers it: the longest window is {longest} tokens (segment "
-                    f"{max(SUPPORTED_KV_SEGMENT_SIZES)} + query bucket {query}); lower "
-                    f"max_model_len to {longest} or raise max_num_batched_tokens"
-                )
-            else:
-                remedy = (
-                    f"Add a segment of at least {needed} tokens (supported: {cover}), "
-                    f"for example {param_name}={sorted(set(buckets) | {cover})}, or "
-                    f"lower max_model_len to {window}"
-                )
+            cover = covering_kv_segment_size(
+                max_model_len, query, block_size, windowed_prefill=True
+            )
+            remedy = (
+                f"Add a segment of at least {needed} tokens, for example "
+                f"{param_name}={sorted(set(buckets) | {cover})}, or lower "
+                f"max_model_len to {window}"
+            )
             raise ValueError(
                 f"{param_name}={buckets} with num_batched_tokens_buckets={list(queries)} "
                 f"serve a prefill window of {window} tokens (largest segment "
