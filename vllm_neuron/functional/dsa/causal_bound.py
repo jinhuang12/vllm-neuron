@@ -32,7 +32,7 @@ import nki.language as nl
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
-from vllm_neuron.utils.neuron_utils import SBUF_BYTES_PER_PARTITION, can_run_kernel
+from vllm_neuron.utils.neuron_utils import SBUF_BYTES_PER_PARTITION, SBUF_PARTITIONS, can_run_kernel
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +75,7 @@ _INDEX_DTYPES = (torch.int32,)
 """Index dtypes that take the NKI route. ``dsa_index_expand`` admits int32, so the sentinel writer
 keeps the selector's output in the dtype its consumer reads."""
 
-PARTITION_MAX = 128
+PARTITION_MAX = SBUF_PARTITIONS
 """Query rows one SBUF tile can hold: the partition-axis bound, ``nl.tile_size.pmax``.
 
 This bounds one row tile, not the call. The kernel walks the query-token axis in tiles of at

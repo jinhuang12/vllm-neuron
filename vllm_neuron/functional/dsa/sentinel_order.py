@@ -31,11 +31,12 @@ import nki.isa as nisa
 import nki.language as nl
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
-from vllm_neuron.utils.neuron_utils import SBUF_BYTES_PER_PARTITION, can_run_kernel
+from vllm_neuron.utils.neuron_utils import SBUF_BYTES_PER_PARTITION, SBUF_PARTITIONS, can_run_kernel
 
 logger = logging.getLogger(__name__)
 
-PARTITION_MAX = 128
+#: Rows one tile of the kernel holds: one per SBUF partition.
+PARTITION_MAX = SBUF_PARTITIONS
 SEARCH_WIDTH = 8
 _SUPPORTED_DTYPES = (torch.int32,)
 

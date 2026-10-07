@@ -14,6 +14,9 @@ from vllm_neuron import envs
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
+#: Partitions of one SBUF tile: the partition-axis bound, ``nl.tile_size.pmax`` inside a kernel.
+#: Host-side tile arithmetic reads this one number.
+SBUF_PARTITIONS = 128
 #: SBUF bytes per partition on trn2, before the runtime's reservations.
 SBUF_TOTAL_BYTES_PER_PARTITION = 224 * 1024
 #: The dynamic-DMA scratch region nkilib names ``DynamicDMAScratchLoc``.
