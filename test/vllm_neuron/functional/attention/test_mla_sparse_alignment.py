@@ -384,22 +384,22 @@ def test_bit_identical_at_1152_rows_with_a_narrower_last_tile():
 
 
 def test_two_byte_operands_bit_identical_at_the_prefill_geometry(monkeypatch):
-    monkeypatch.setenv("VLLM_NEURON_MLA_SPARSE_FP32", "1")
     """The seam hands bfloat16 through; latent 512 and 2,048 rows, at each head count."""
+    monkeypatch.setenv("VLLM_NEURON_MLA_SPARSE_FP32", "1")
     for heads in _HEADS:
         _assert_bit_identical_two_byte(*_GEOMETRIES[0], heads)
 
 
 def test_two_byte_operands_bit_identical_at_640_rows_with_a_narrower_last_tile(monkeypatch):
-    monkeypatch.setenv("VLLM_NEURON_MLA_SPARSE_FP32", "1")
     """The seam hands bfloat16 through; two score tiles, at each head count."""
+    monkeypatch.setenv("VLLM_NEURON_MLA_SPARSE_FP32", "1")
     for heads in _HEADS:
         _assert_bit_identical_two_byte(*_GEOMETRIES[1], heads)
 
 
 def test_two_byte_operands_bit_identical_at_1152_rows_with_a_narrower_last_tile(monkeypatch):
-    monkeypatch.setenv("VLLM_NEURON_MLA_SPARSE_FP32", "1")
     """The seam hands bfloat16 through; three score tiles, at each head count."""
+    monkeypatch.setenv("VLLM_NEURON_MLA_SPARSE_FP32", "1")
     for heads in _HEADS:
         _assert_bit_identical_two_byte(*_GEOMETRIES[2], heads)
 

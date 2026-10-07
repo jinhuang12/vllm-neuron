@@ -234,6 +234,11 @@ def run_case(tokens: int, ctx: int, base, live, args) -> dict:
                 fns["after"][0](*inputs).to("cpu")
         finally:
             runtime.stop_profiling()
+    if "after" in accuracy and accuracy["after"].get("vs_before_rel_l2") is not None:
+        # The positive control: the default path is a different arithmetic, so a row that
+        # equals 8aa22fa bitwise is the fp32 fallback wearing the wrong name.
+        assert accuracy["after"]["vs_before_rel_l2"] > 0.0, \
+            "the default path reproduced 8aa22fa bitwise: the low-precision body did not run"
     ref = timings.get("before", {}).get("median_us")
     rows = {}
     for name, timing in timings.items():
@@ -283,22 +288,41 @@ def cores(explorer_global: Path, name: str, source: str = "mla_sparse.py") -> li
     for session in found:
         instr = session / "Instruction.parquet"
         execs = session / "ExecutionInfo.parquet"
+        # Instructions on one engine overlap (the Tensor engine's weight loads run under its
+        # matmuls), so the busy time is the union of the intervals, not their sum: an
+        # island starts where an instruction begins after every earlier one has ended.
         query = f"""
             with e as (select execution_index, execution_start_ts s0, execution_end_ts e0
                        from read_parquet('{execs}')),
                  i as (select pcore_idx, engine, start_ts, end_ts, nki_source_location nsl
-                       from read_parquet('{instr}') where nki_source_location like '%{source}%')
-            select e.execution_index,
-                   case when i.nsl like '%baselines/mla_sparse_8aa22fa/%' then 'before' else 'after' end,
-                   i.pcore_idx, i.engine, count(*), min(i.start_ts), max(i.end_ts), sum(i.end_ts - i.start_ts)
-            from e join i on i.start_ts >= e.s0 and i.end_ts <= e.e0
-            group by all order by 1, 2, 3, 4"""
-        for index, variant, pcore, engine, count, first, last, busy in duckdb.sql(query).fetchall():
+                       from read_parquet('{instr}') where nki_source_location like '%{source}%'),
+                 j as (select e.execution_index ex,
+                              case when i.nsl like '%baselines/mla_sparse_8aa22fa/%'
+                                   then 'before' else 'after' end variant,
+                              i.pcore_idx pcore, i.engine, i.start_ts, i.end_ts
+                       from e join i on i.start_ts >= e.s0 and i.end_ts <= e.e0),
+                 k as (select *, max(end_ts) over (partition by ex, variant, pcore, engine
+                                                   order by start_ts, end_ts
+                                                   rows between unbounded preceding and 1 preceding) reach
+                       from j),
+                 m as (select *, sum(case when reach is null or start_ts > reach then 1 else 0 end)
+                                 over (partition by ex, variant, pcore, engine order by start_ts, end_ts
+                                       rows unbounded preceding) island
+                       from k),
+                 u as (select ex, variant, pcore, engine, island, min(start_ts) a, max(end_ts) b
+                       from m group by all)
+            select j.ex, j.variant, j.pcore, j.engine, count(*), min(j.start_ts), max(j.end_ts),
+                   sum(j.end_ts - j.start_ts),
+                   (select sum(b - a) from u where u.ex = j.ex and u.variant = j.variant
+                                              and u.pcore = j.pcore and u.engine = j.engine)
+            from j group by all order by 1, 2, 3, 4"""
+        for index, variant, pcore, engine, count, first, last, raw, busy in duckdb.sql(query).fetchall():
             rows.append({"session": session.name, "execution": int(index),
                          "variant": variant, "pcore": int(pcore), "engine": engine,
                          "instructions": int(count), "first_ts": int(first),
                          "last_ts": int(last), "span_us": (last - first) / 1000.0,
-                         "instruction_time_us": busy / 1000.0})
+                         "busy_us": busy / 1000.0,
+                         "instruction_time_us": raw / 1000.0})
     return rows
 
 
