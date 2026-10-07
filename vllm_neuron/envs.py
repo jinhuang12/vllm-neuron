@@ -76,6 +76,9 @@ if TYPE_CHECKING:
     # Build the GLM-5.3-Flash step's attention metadata on the host only: no per-step
     # block-table / slot-mapping uploads that its graph never reads.
     VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA: bool = False
+    # Divide the GLM-5.3-Flash DSA prefill selection's query rows over the
+    # tensor-parallel ranks. On by default; 0 restores the replicated selection.
+    VLLM_NEURON_DSA_INDEXER_SHARD: bool = True
 
 
 def maybe_convert_bool(value: str | None) -> bool | None:
@@ -344,6 +347,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA"))
         or False
+    ),
+    # ================== GLM-5.3-Flash DSA Indexer ==================
+    # Shard the DSA prefill selection (score GEMM, causal bound, top-k, sentinel
+    # order) by query rows over the TP ranks, with one all-gather of the pool ids
+    # per DSA layer (``functional/dsa/indexer_shard.py``). Read at trace time, so
+    # a compiled graph keeps the value it was traced with. On by default; 0 runs
+    # the replicated selection on every rank.
+    "VLLM_NEURON_DSA_INDEXER_SHARD": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_DSA_INDEXER_SHARD", "1"))
     ),
 }
 

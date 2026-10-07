@@ -4911,32 +4911,6 @@ class Glm5NextDSAIndexer(nn.Module):
         sentinelised = dsa_causal_sentinel(values, pool_ids, int(bounded.shape[1]))
         return self._canonical_sentinel_order(sentinelised)
 
-    def local_pool_ids(
-        self,
-        query: torch.Tensor,
-        candidate_keys: torch.Tensor,
-        weights: torch.Tensor,
-        seq_lens: torch.Tensor,
-        shard,
-        rank: torch.Tensor | int,
-    ) -> torch.Tensor:
-        """One rank's share of the prefill selection: ``[R, select_k]`` int32 pool ids.
-
-        The rows are ``shard``'s rows for ``rank``
-        (:func:`~vllm_neuron.functional.dsa.indexer_shard.local_row_index`), and each runs
-        the chain :meth:`score_pools` then :meth:`select_bounded_pools` runs for it in the
-        replicated path, against the same whole candidate axis. Every stage of that chain
-        works row by row, so a row's pool ids do not depend on which other rows share the
-        call. ``rank`` is the bound rank operand on the traced path, or an int.
-        """
-        from vllm_neuron.functional.dsa.indexer_shard import local_row_index, take_rows
-
-        rows = local_row_index(shard, rank, query.device)
-        scores = self.score_pools(
-            take_rows(query, rows), candidate_keys, take_rows(weights, rows)
-        )
-        return self.select_bounded_pools(scores, take_rows(seq_lens, rows))
-
     def _select_pool_ids(
         self,
         query: torch.Tensor,
@@ -4948,28 +4922,34 @@ class Glm5NextDSAIndexer(nn.Module):
     ) -> torch.Tensor:
         """``[T, select_k]`` int32 pool ids for a selecting call: replicated or row-sharded.
 
-        Sharded when the call may shard (the prefill leg of :meth:`forward`), a rank operand
-        is bound, a tensor-parallel group exists and
-        :func:`~vllm_neuron.functional.dsa.indexer_shard.shard_degree` says the chunk spans
-        more than one row tile with the switch on. Each rank then selects its own rows and
-        one all-gather returns every row to every rank; otherwise every rank selects every
-        row, as built.
+        Every row runs :meth:`score_pools` then :meth:`select_bounded_pools` against the
+        whole candidate axis. Sharded when the call may shard (the prefill leg of
+        :meth:`forward`), a rank operand is bound, a tensor-parallel group exists and
+        :func:`~vllm_neuron.functional.dsa.indexer_shard.shard_degree` says the chunk
+        spans more than one row tile with the switch on: each rank then runs that chain on
+        its own rows (:func:`~vllm_neuron.functional.dsa.indexer_shard.select_local_rows`)
+        and one all-gather returns every row to every rank. Otherwise every rank selects
+        every row, as built.
         """
         from vllm_neuron.functional.dsa.indexer_shard import (
             gather_rows,
             row_shard,
+            select_local_rows,
             shard_degree,
         )
+
+        def select(rows_query, rows_weights, rows_seq_lens):
+            scores = self.score_pools(rows_query, candidate_keys, rows_weights)
+            return self.select_bounded_pools(scores, rows_seq_lens)
 
         tokens = int(query.shape[0])
         rank = getattr(self, self.SHARD_RANK_ATTR, None)
         group = _resolve_tp_group() if shardable and rank is not None else None
         degree = 1 if group is None else shard_degree(tokens, int(group.world_size))
         if degree <= 1:
-            scores = self.score_pools(query, candidate_keys, weights)
-            return self.select_bounded_pools(scores, seq_lens)
+            return select(query, weights, seq_lens)
         shard = row_shard(tokens, degree)
-        local = self.local_pool_ids(query, candidate_keys, weights, seq_lens, shard, rank)
+        local = select_local_rows(select, query, weights, seq_lens, shard, rank)
         return gather_rows(local, group, shard, id_bound=int(candidate_keys.shape[0]))
 
     @staticmethod

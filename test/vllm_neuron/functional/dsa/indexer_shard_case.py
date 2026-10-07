@@ -18,35 +18,38 @@ import os
 
 import torch
 
-#: The production indexer dials: 32 heads of 128 features, pools of 4 tokens, a
-#: 2048-token budget, so ``select_k`` is 512. ``Glm5NextTextConfig()``'s own defaults.
-PRODUCTION_TOPK = 2048
+#: At a candidate count at or below the production ``select_k`` the call is the bypass
+#: regime (``_require_serviceable``: ``selects = cands > select_k``), so no selection runs
+#: there in production. A case at such a width runs a quarter of the production token
+#: budget instead, so the sharded selection itself is exercised at the narrowest width too.
+NARROW_BUDGET_DIVISOR = 4
 
-#: At ``cands == 512`` the production ``select_k`` equals the candidate count, which is the
-#: bypass regime (``_require_serviceable``: ``selects = cands > select_k``), so no selection
-#: runs there in production. The chain-level case at that width runs a 128-pool budget
-#: instead, so the sharded selection itself is exercised at the narrowest width too.
-NARROW_TOPK = 512
 
-#: Weight scale for the synthetic gate: the order of ``projection_scale()`` at production
-#: dials (``128 ** -0.5 * 32 ** -0.5 = 0.0156``) times a unit projection.
-WEIGHT_SCALE = 0.05
+
+def production_config():
+    """``Glm5NextTextConfig()``: the production indexer dials (heads, head width, pool
+    size, token budget)."""
+    from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
+
+    return Glm5NextTextConfig()
 
 
 def index_topk_for(cands: int) -> int:
     """The token budget a case runs at: production's, unless that is the bypass regime."""
-    return PRODUCTION_TOPK if cands > PRODUCTION_TOPK // 4 else NARROW_TOPK
+    cfg = production_config()
+    topk = int(cfg.index_topk)
+    if cands > topk // int(cfg.index_kpool):
+        return topk
+    return topk // NARROW_BUDGET_DIVISOR
 
 
 def make_indexer(cands: int):
     """A ``Glm5NextDSAIndexer`` at production dials; selection needs no weights."""
     from dataclasses import replace
 
-    from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
     from vllm_neuron.model.glm5_next.model_fp8 import Glm5NextDSAIndexer
 
-    config = replace(Glm5NextTextConfig(), index_topk=index_topk_for(cands))
-    return Glm5NextDSAIndexer(config)
+    return Glm5NextDSAIndexer(replace(production_config(), index_topk=index_topk_for(cands)))
 
 
 def chunk_start(tokens: int, cands: int, select_k: int, pool: int = 4) -> int:
@@ -63,10 +66,12 @@ def chunk_start(tokens: int, cands: int, select_k: int, pool: int = 4) -> int:
 def case_operands(tokens: int, cands: int, seed: int):
     """``(query, keys, weights, seq_lens)`` for one case, rebuilt identically anywhere."""
     gen = torch.Generator().manual_seed(int(seed) * 1_000_003 + tokens * 7919 + cands)
-    query = torch.randn(tokens, 32, 128, generator=gen).to(torch.bfloat16)
-    keys = torch.randn(cands, 128, generator=gen).to(torch.bfloat16)
-    weights = torch.randn(tokens, 32, generator=gen) * WEIGHT_SCALE
     indexer = make_indexer(cands)
+    heads, dim = indexer.index_n_heads, indexer.index_head_dim
+    query = torch.randn(tokens, heads, dim, generator=gen).to(torch.bfloat16)
+    keys = torch.randn(cands, dim, generator=gen).to(torch.bfloat16)
+    # The gate as the model scales it: a unit projection times ``projection_scale()``.
+    weights = torch.randn(tokens, heads, generator=gen) * indexer.projection_scale()
     start = chunk_start(tokens, cands, indexer.select_k(), indexer.index_kpool)
     seq_lens = torch.arange(start + 1, start + tokens + 1, dtype=torch.int32)
     return query, keys, weights, seq_lens
@@ -119,15 +124,20 @@ def replicated_task(tokens: int, cands: int, seed: int):
 
 
 def rank_task(tokens: int, cands: int, degree: int, rank: int, seed: int):
-    """Rank ``rank`` of ``degree``: its ``[R, k]`` pool ids from the production local path."""
-    from vllm_neuron.functional.dsa.indexer_shard import row_shard
+    """Rank ``rank`` of ``degree``: its ``[R, k]`` pool ids through the production row cut
+    (``select_local_rows``) and the indexer's own two selection stages."""
+    from vllm_neuron.functional.dsa.indexer_shard import row_shard, select_local_rows
 
     torch.set_num_threads(1)
     query, keys, weights, seq_lens = case_operands(tokens, cands, seed)
     indexer = make_indexer(cands)
-    shard = row_shard(tokens, degree)
+
+    def select(rows_query, rows_weights, rows_seq_lens):
+        scores = indexer.score_pools(rows_query, keys, rows_weights)
+        return indexer.select_bounded_pools(scores, rows_seq_lens)
+
     _reset_counters()
-    local = indexer.local_pool_ids(query, keys, weights, seq_lens, shard, rank)
+    local = select_local_rows(select, query, weights, seq_lens, row_shard(tokens, degree), rank)
     return local, _counters()
 
 

@@ -36,7 +36,10 @@ TOKENS = 256
 #: A select_k of 16 pools out of 64 candidates: the selecting regime with real choices.
 INDEX_TOPK = 64
 PAGE_SIZE = 4
-POOL_ROWS = TOKENS // POOL_SIZE + 8
+#: The pooled store: one row per complete pool of the chunk, plus spare rows the chunk
+#: does not fill, so the store is not sized to the chunk exactly.
+POOL_SPARE_ROWS = 8
+POOL_ROWS = TOKENS // POOL_SIZE + POOL_SPARE_ROWS
 
 
 @pytest.fixture(autouse=True)
@@ -130,7 +133,7 @@ def _bind(monkeypatch, model_fp8, indexer, group, rank: int) -> None:
     """Bind ``rank`` as the indexer's rank operand, the way preparation does in a worker."""
     group.rank_in_group = rank
     monkeypatch.setattr(model_fp8, "_resolve_tp_group", lambda: group)
-    assert indexer.prepare_projection_weights() == 4
+    assert indexer.prepare_projection_weights() == len(indexer.projection_widths())
     operand = getattr(indexer, indexer.SHARD_RANK_ATTR)
     assert operand.dtype == torch.int32 and operand.tolist() == [rank]
 
@@ -139,7 +142,7 @@ def test_preparation_binds_this_ranks_operand_and_none_at_one_rank(monkeypatch):
     model_fp8 = _impl()
     indexer, _cfg = _indexer()
     monkeypatch.setattr(model_fp8, "_resolve_tp_group", lambda: None)
-    assert indexer.prepare_projection_weights() == 4
+    assert indexer.prepare_projection_weights() == len(indexer.projection_widths())
     assert getattr(indexer, indexer.SHARD_RANK_ATTR) is None
 
     group = _SimulatedGroup(8)
@@ -159,7 +162,7 @@ def test_every_rank_returns_the_replicated_selection(world, monkeypatch):
     ops = _operands(cfg)
 
     monkeypatch.setattr(model_fp8, "_resolve_tp_group", lambda: None)
-    assert indexer.prepare_projection_weights() == 4
+    assert indexer.prepare_projection_weights() == len(indexer.projection_widths())
     want, want_state = _prefill(indexer, ops)
     assert want.dtype == torch.int32 and int(want.shape[0]) == TOKENS
 
@@ -189,7 +192,7 @@ def test_a_rank_hands_the_gather_exactly_its_own_rows(monkeypatch):
     indexer, cfg = _indexer()
     ops = _operands(cfg)
     monkeypatch.setattr(model_fp8, "_resolve_tp_group", lambda: None)
-    assert indexer.prepare_projection_weights() == 4
+    assert indexer.prepare_projection_weights() == len(indexer.projection_widths())
 
     seen = []
     real = indexer.expand_indices
@@ -224,7 +227,7 @@ def _gathers_with(monkeypatch, *, tokens=TOKENS, max_seq_len=None, decode=False,
         _bind(monkeypatch, model_fp8, indexer, group, 1)
     else:
         monkeypatch.setattr(model_fp8, "_resolve_tp_group", lambda: None)
-        assert indexer.prepare_projection_weights() == 4
+        assert indexer.prepare_projection_weights() == len(indexer.projection_widths())
         monkeypatch.setattr(model_fp8, "_resolve_tp_group", lambda: group)
     if env is not None:
         monkeypatch.setenv("VLLM_NEURON_DSA_INDEXER_SHARD", env)
@@ -273,7 +276,7 @@ def test_an_unbound_rank_operand_stays_replicated(monkeypatch):
 
 def test_the_rank_operand_is_a_graph_input(monkeypatch):
     """A compile reads the bound operand at run time: one graph, each rank's own rows."""
-    from vllm_neuron.functional.dsa.indexer_shard import local_row_index, row_shard, take_rows
+    from vllm_neuron.functional.dsa.indexer_shard import local_row_index, row_shard
 
     model_fp8 = _impl()
     indexer, _cfg = _indexer()
@@ -288,7 +291,7 @@ def test_the_rank_operand_is_a_graph_input(monkeypatch):
 
         def forward(self, x):
             rank = getattr(self.inner, self.inner.SHARD_RANK_ATTR)
-            return take_rows(x, local_row_index(shard, rank, x.device))
+            return x.index_select(0, local_row_index(shard, rank, x.device))
 
     graphs = []
 

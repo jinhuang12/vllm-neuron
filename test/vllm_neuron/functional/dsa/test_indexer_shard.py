@@ -14,7 +14,7 @@ What this file pins:
    pool-id SET as the replicated path, the sentinels sit in the same trailing columns in
    the same number, and the expanded token indices agree per row. Ties are counted, not
    assumed away (see :func:`test_the_tie_census_is_recorded`).
-3. The kill switch reads ``0`` as off and anything else as on.
+3. The kill switch (``envs.VLLM_NEURON_DSA_INDEXER_SHARD``) is on unless set to ``0``.
 
 The model-level wiring (the rank operand, the gate, the gather at the indexer's forward)
 is pinned by ``test/vllm_neuron/model/glm5_next/test_indexer_shard_forward.py``.
@@ -36,6 +36,7 @@ CANDS = (512, 2048, 16384)
 DEGREES = (1, 8, 64)
 SEED = 20261007
 CASES = [(t, c, d) for t in TOKENS for c in CANDS for d in DEGREES]
+SHARD_ENV = "VLLM_NEURON_DSA_INDEXER_SHARD"
 
 
 # ---------------------------------------------------------------------------------------
@@ -76,6 +77,44 @@ def test_a_rank_takes_its_own_rows_and_padding_repeats_the_last_real_row():
     assert all(t.dtype == torch.int64 for t in as_tensor)
 
 
+@pytest.mark.parametrize("rank", [torch.tensor([1, 2], dtype=torch.int32),
+                                  torch.tensor([1.0])])
+def test_a_rank_operand_that_is_not_one_integer_is_refused(rank):
+    from vllm_neuron.functional.dsa.indexer_shard import (
+        IndexerShardError,
+        local_row_index,
+        row_shard,
+    )
+
+    with pytest.raises(IndexerShardError):
+        local_row_index(row_shard(10, 4), rank, torch.device("cpu"))
+
+
+def test_a_rank_selects_its_own_rows_of_every_operand():
+    from vllm_neuron.functional.dsa.indexer_shard import (
+        IndexerShardError,
+        row_shard,
+        select_local_rows,
+    )
+
+    shard = row_shard(10, 4)
+    query = torch.arange(10 * 3, dtype=torch.float32).reshape(10, 3)
+    weights = torch.arange(10 * 2, dtype=torch.float32).reshape(10, 2) + 100
+    seq_lens = torch.arange(10, dtype=torch.int32) + 1000
+    seen = []
+
+    def select(q, w, s):
+        seen.append((q, w, s))
+        return s.reshape(-1, 1)
+
+    out = select_local_rows(select, query, weights, seq_lens, shard, torch.tensor([3]))
+    q, w, s = seen[0]
+    assert torch.equal(q, query[[9, 9, 9]]) and torch.equal(w, weights[[9, 9, 9]])
+    assert torch.equal(out.flatten(), seq_lens[[9, 9, 9]])
+    with pytest.raises(IndexerShardError):  # an operand cut for another chunk
+        select_local_rows(select, query[:9], weights, seq_lens, shard, 0)
+
+
 class _ConcatGroup:
     """A ``world``-rank group whose all-gather concatenates prepared per-rank operands.
 
@@ -114,20 +153,38 @@ def test_the_gather_restores_row_order_trims_padding_and_keeps_int32():
 
 
 def test_the_gather_refuses_ids_float32_cannot_carry_exactly():
-    from vllm_neuron.functional.dsa.indexer_shard import IndexerShardError, gather_rows, row_shard
+    from vllm_neuron.functional.dsa.indexer_shard import (
+        FP32_EXACT_INT,
+        IndexerShardError,
+        gather_rows,
+        row_shard,
+    )
 
     shard = row_shard(4, 2)
     local = torch.zeros(2, 3, dtype=torch.int32)
+    # The largest id float32 still carries exactly crosses; one past it is refused.
+    edge = torch.full((2, 3), FP32_EXACT_INT - 1, dtype=torch.int32)
+    out = gather_rows(edge, _ConcatGroup([edge, edge], 0), shard, id_bound=FP32_EXACT_INT)
+    assert torch.equal(out, torch.cat([edge, edge]))
     with pytest.raises(IndexerShardError):
-        gather_rows(local, _ConcatGroup([local, local], 0), shard, id_bound=2**24 + 1)
+        gather_rows(local, _ConcatGroup([local, local], 0), shard, id_bound=FP32_EXACT_INT + 1)
 
 
-@pytest.mark.parametrize("value,enabled", [(None, True), ("1", True), ("0", False),
-                                           ("yes", True), ("", True)])
-def test_the_kill_switch_reads_zero_as_off(value, enabled, monkeypatch):
-    from vllm_neuron.functional.dsa.indexer_shard import SHARD_ENV, indexer_shard_enabled
+def test_the_gather_refuses_a_block_of_the_wrong_height():
+    from vllm_neuron.functional.dsa.indexer_shard import IndexerShardError, gather_rows, row_shard
 
-    assert SHARD_ENV == "VLLM_NEURON_DSA_INDEXER_SHARD"
+    shard = row_shard(4, 2)
+    wrong = torch.zeros(3, 3, dtype=torch.int32)
+    with pytest.raises(IndexerShardError):
+        gather_rows(wrong, _ConcatGroup([wrong, wrong], 0), shard, id_bound=8)
+
+
+@pytest.mark.parametrize("value,enabled", [(None, True), ("1", True), ("0", False)])
+def test_the_kill_switch_is_on_unless_zero(value, enabled, monkeypatch):
+    from vllm_neuron import envs
+    from vllm_neuron.functional.dsa.indexer_shard import indexer_shard_enabled
+
+    assert SHARD_ENV in dir(envs)  # registered, so it is read through envs only
     if value is None:
         monkeypatch.delenv(SHARD_ENV, raising=False)
     else:
@@ -135,17 +192,29 @@ def test_the_kill_switch_reads_zero_as_off(value, enabled, monkeypatch):
     assert indexer_shard_enabled() is enabled
 
 
+def test_the_kill_switch_refuses_a_value_that_is_not_a_number(monkeypatch):
+    """The ``envs`` boolean convention: ``0`` / ``1``; anything else is an error."""
+    from vllm_neuron.functional.dsa.indexer_shard import indexer_shard_enabled
+
+    monkeypatch.setenv(SHARD_ENV, "yes")
+    with pytest.raises(ValueError):
+        indexer_shard_enabled()
+
+
 @pytest.mark.parametrize("tokens,world,switch,want", [
     (1024, 64, "1", 64), (2048, 64, "1", 64), (1024, 16, "1", 16), (1024, 64, "0", 1),
-    (1024, 1, "1", 1), (128, 64, "1", 1), (129, 64, "1", 64), (1, 64, "1", 1),
+    (1024, 1, "1", 1), (1, 64, "1", 1),
 ])
 def test_the_degree_is_the_world_above_one_row_tile_and_one_otherwise(
     tokens, world, switch, want, monkeypatch
 ):
-    from vllm_neuron.functional.dsa.indexer_shard import SHARD_ENV, shard_degree
+    from vllm_neuron.functional.dsa.indexer_shard import ROW_TILE, shard_degree
 
     monkeypatch.setenv(SHARD_ENV, switch)
     assert shard_degree(tokens, world) == want
+    # One row tile stays replicated; one row more shards.
+    assert shard_degree(ROW_TILE, world) == 1
+    assert shard_degree(ROW_TILE + 1, world) == (world if switch == "1" else 1)
 
 
 def test_the_score_kernel_is_row_independent_bit_for_bit():
@@ -154,13 +223,15 @@ def test_the_score_kernel_is_row_independent_bit_for_bit():
 
     query, keys, weights, _ = case.case_operands(384, 2048, SEED)
     indexer = case.make_indexer(2048)
+    slices = ((0, 16), (16, 32), (200, 328), (370, 384))
     score_gemm.reset_score_gemm_dispatch_counters()
     whole = indexer.score_pools(query, keys, weights)
-    for lo, hi in ((0, 16), (16, 32), (200, 328), (370, 384)):
+    for lo, hi in slices:
         part = indexer.score_pools(query[lo:hi], keys, weights[lo:hi])
         assert torch.equal(part, whole[lo:hi]), (lo, hi)
     nki, fallback = score_gemm.score_gemm_dispatch_counters()
-    assert (nki, fallback) == (5, 0), "every call must take the NKI route on the simulator"
+    # One call for the whole chunk and one per slice, all on the NKI route.
+    assert (nki, fallback) == (1 + len(slices), 0), "a call left the NKI route"
 
 
 # ---------------------------------------------------------------------------------------
@@ -326,5 +397,4 @@ def test_the_tie_census_is_recorded(matrix, record_property):
             census[f"T{tokens}-C{cands}-d{degree}"] = {
                 "rows": tokens, "tied_rows": len(tied), "positional_equal_rows": exact}
     record_property("tie_census", census)
-    print("tie census:", census)
     assert all(v["tied_rows"] == 0 for v in census.values()), census

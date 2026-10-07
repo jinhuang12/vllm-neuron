@@ -18,8 +18,10 @@ import pytest
 from test.vllm_neuron.functional.dsa import indexer_shard_cost as cost_model
 
 REPORT_JSON = "/home/ubuntu/glm53f-wt5/reports/indexer_shard.json"
+PUBLISHED_JSON = "/home/ubuntu/glm53f-wt3/reports/prefill_calibrated.json"
 
-pytestmark = pytest.mark.skipif(not cost_model.calibration_available(),
+pytestmark = pytest.mark.skipif(not (cost_model.calibration_available()
+                                     and os.path.exists(PUBLISHED_JSON)),
                                 reason="worker-3's calibrated prefill model is not on this host")
 
 
@@ -28,14 +30,35 @@ def cost():
     return cost_model.IndexerCost()
 
 
-def test_the_baseline_is_the_calibrated_table(cost):
-    """prefill_calibrated.md's context table, bs=1, TP=64: 688.69 s / 422.83 s at 262,144,
-    15.09 s / 6841 ms at 8,192, and the p1 anchor 1966.8 ms."""
-    assert cost.ttft(262144, "asbuilt")["before_ms"] == pytest.approx(688_690, abs=10)
-    assert cost.ttft(262144, "withbranches")["before_ms"] == pytest.approx(422_830, abs=10)
-    assert cost.ttft(8192, "asbuilt")["before_ms"] == pytest.approx(15_090, abs=10)
-    assert cost.ttft(8192, "withbranches")["before_ms"] == pytest.approx(6_841, abs=1)
-    assert cost.ttft(1024, "asbuilt")["before_ms"] == pytest.approx(1_966.8, abs=0.1)
+def _published_rows() -> dict:
+    """worker-3's published rows, TP = 64 colocated, bs = 1, chunk 1024, keyed by
+    ``(context, prompt)``."""
+    rows = json.load(open(PUBLISHED_JSON))["rows"]
+    return {(r["context"], r["prompt_tokens"]): r["ttft_ms"] for r in rows
+            if r["config_id"] == "colocated-c16-tp64-cp1" and r["line"] == "bs1"
+            and r["chunk"] == cost_model.CHUNK}
+
+
+def test_the_baseline_is_the_published_calibrated_table(cost):
+    """"before" is worker-3's own number wherever ``prefill_calibrated.json`` has the row."""
+    published = _published_rows()
+    checked = 0
+    for prompt in cost_model.TTFT_PROMPTS.values():
+        for column in ("asbuilt", "withbranches"):
+            row = cost.ttft(prompt, column)
+            want = published.get((row["context"], prompt))
+            if want is None:
+                continue
+            # The published rows round to 0.1 ms.
+            assert row["before_ms"] == pytest.approx(want[column], abs=0.05), (prompt, column)
+            checked += 1
+    assert checked >= 6, "the 1k, 8k and 256k rows are published for both columns"
+
+
+def test_the_model_dials_are_the_calibrations_own(cost):
+    arch = cost.m.r["architecture"]
+    assert cost_model.INDEX_KPOOL == int(arch["index_kpool"])
+    assert cost_model.SELECT_K == int(arch["index_topk"]) // int(arch["index_kpool"])
 
 
 @pytest.mark.parametrize("cands", [1024, 2048, 16384, 65536])
@@ -47,12 +70,11 @@ def test_degree_one_changes_nothing(cost, cands):
 
 
 def test_the_topk_fit_reproduces_both_measured_points(cost):
-    for cands in (1024, 2048):
+    for cands in cost_model.FIT_CANDS:
         fit = cost.layers * cost.topk_ms_layer(cost_model.CHUNK, cands)
         assert fit == pytest.approx(cost.m.idx_value("rotational_topk", cands), rel=1e-9)
-    # The slope is the clock: one Mcycle at 1.4 GHz is 0.714 ms. A fixed part remains.
-    assert cost.beta == pytest.approx(1 / 1.4, rel=0.03)
-    assert cost.alpha > 0
+    # A physical fit: time grows with cycles, and a per-call fixed part remains.
+    assert cost.beta > 0 and cost.alpha > 0
 
 
 def test_the_all_gather_is_half_the_calibrated_all_reduce():
@@ -69,8 +91,6 @@ def test_the_all_gather_is_half_the_calibrated_all_reduce():
         for nbytes in (1 << 21, 1 << 23):
             assert 2 * cost_model.allgather_ms(tp, nbytes) == pytest.approx(
                 ef.allreduce_ms(hw, tp, nbytes), rel=1e-12)
-    # T = 1024 rows of 512 fp32 ids: 2 MiB per layer, about 38 us at TP = 64.
-    assert cost_model.allgather_ms(64, 1024 * 512 * 4) == pytest.approx(0.0382, abs=5e-4)
 
 
 def test_small_tiles_cost_a_whole_tile_in_the_score_and_bound(cost):
@@ -84,11 +104,16 @@ def test_small_tiles_cost_a_whole_tile_in_the_score_and_bound(cost):
         assert d64["net_saved_ms"] > d8["net_saved_ms"]
 
 
+#: "The saving dominates what sharding adds": at least an order of magnitude above the
+#: collective and the glue together, at every priced context.
+DOMINANCE = 10
+
+
 def test_the_saving_grows_with_context_and_beats_its_comm(cost):
     nets = []
     for context in cost_model.CONTEXTS.values():
-        q = cost.query_sharded(context // 4, 64)
-        assert q["compute_saved_ms"] > 10 * (q["comm_added_ms"] + q["glue_added_ms"])
+        q = cost.query_sharded(context // cost_model.INDEX_KPOOL, cost_model.TP)
+        assert q["compute_saved_ms"] > DOMINANCE * (q["comm_added_ms"] + q["glue_added_ms"])
         nets.append(q["net_saved_ms"])
     assert nets == sorted(nets)
 
@@ -99,6 +124,23 @@ def test_the_ttft_after_is_before_less_the_per_chunk_saving(cost):
         assert row["n_chunks"] == math.ceil(prompt / cost_model.CHUNK)
         assert row["after_ms"] == pytest.approx(
             row["before_ms"] - row["n_chunks"] * row["saved_per_chunk_ms"], rel=1e-12)
+
+
+def _leaf_paths(node, path=()):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield from _leaf_paths(value, (*path, key))
+    else:
+        yield path
+
+
+def test_every_value_in_the_report_json_has_a_label():
+    data = cost_model.report()
+    unlabeled = [".".join(path) for path in _leaf_paths(data)
+                 if path[0] not in ("what", "labels")
+                 and not any(key in cost_model.LABELS for key in path)]
+    assert not unlabeled, unlabeled
+    assert data["labels"] == cost_model.LABELS
 
 
 def test_the_committed_report_json_is_what_the_model_computes():

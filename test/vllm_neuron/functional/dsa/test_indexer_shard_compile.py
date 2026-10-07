@@ -35,12 +35,23 @@ _DROP = ("NKI_SIMULATOR", "NKI_PRECISE_FP", "VLLM_NEURON_CPU_MODE", "NEURON_RT_V
 _PIN = {"VLLM_NEURON_CPU_COMPILE": "1", "NEURON_PLATFORM_TARGET_OVERRIDE": "trn2",
         "PYTHONDONTWRITEBYTECODE": "1"}
 
-#: ``max_model_len // index_kpool`` at a 262,144-token context.
-CANDS = 65536
-SELECT_K = 512
-#: ``ceil(1024 / 64)`` and ``ceil(1024 / 8)``: the two designs the report compares.
-ROWS = (16, 128)
+#: The longest context the report prices (``max_model_len``) and the prefill chunk.
+CONTEXT = 262144
+CHUNK = 1024
+#: The two designs the report compares: every TP rank, and groups of 8.
+DEGREES = (64, 8)
+ROWS = tuple(-(-CHUNK // d) for d in DEGREES)
 ENTRIES = [("score", r) for r in ROWS] + [("topk", r) for r in ROWS] + [("control", 1)]
+
+
+def _dials() -> tuple[int, int, int, int]:
+    """``(heads, head_dim, cands, select_k)`` at production dials and :data:`CONTEXT`."""
+    from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
+
+    cfg = Glm5NextTextConfig()
+    pool = int(cfg.index_kpool)
+    return (int(cfg.index_n_heads), int(cfg.index_head_dim), CONTEXT // pool,
+            int(cfg.index_topk) // pool)
 
 
 def _open_device_nodes() -> int:
@@ -60,19 +71,20 @@ def _compile_one(kind: str, rows: int, work: str) -> None:
     from nki.compiler.frontend import resolve_frontend_cls
     from nki.framework.compiled import CompileKernel, compile_kernel_to_nir
 
+    heads, dim, cands, select_k = _dials()
     if kind == "score":
         from vllm_neuron.functional.dsa import score_gemm as module
 
         kernel = module._score_gemm_nki
-        inputs = {"q_hbm": np.zeros((rows, 32, 128), dtype=ml_dtypes.bfloat16),
-                  "k_hbm": np.zeros((CANDS, 128), dtype=ml_dtypes.bfloat16),
-                  "w_hbm": np.zeros((rows, 32), dtype=np.float32)}
+        inputs = {"q_hbm": np.zeros((rows, heads, dim), dtype=ml_dtypes.bfloat16),
+                  "k_hbm": np.zeros((cands, dim), dtype=ml_dtypes.bfloat16),
+                  "w_hbm": np.zeros((rows, heads), dtype=np.float32)}
     elif kind == "topk":
         from vllm_neuron.functional.dsa import topk_select as module
 
-        config = module._nki_config(rows, CANDS, SELECT_K, nl.float32)
+        config = module._nki_config(rows, cands, select_k, nl.float32)
         kernel = module.rotational_topk[config.n_prgs]
-        inputs = {"inp": np.zeros((rows, CANDS), dtype=np.float32), "config": config}
+        inputs = {"inp": np.zeros((rows, cands), dtype=np.float32), "config": config}
     else:
         @nki.jit
         def body_that_reads_an_undefined_name(x_hbm):
@@ -141,7 +153,7 @@ def _rows() -> list[dict[str, str]]:
     return rows
 
 
-def test_neuronx_cc_builds_the_per_rank_kernels_at_65536_candidates(record_property) -> None:
+def test_neuronx_cc_builds_the_per_rank_kernels_at_the_longest_context(record_property) -> None:
     rows = {row["entry"]: row for row in _rows()}
     assert set(rows) == {f"{kind}_r{count}" for kind, count in ENTRIES}, sorted(rows)
     assert {row["neuron_fds"] for row in rows.values()} == {"0"}, rows
@@ -154,11 +166,13 @@ def test_neuronx_cc_builds_the_per_rank_kernels_at_65536_candidates(record_prope
     assert not refused, refused
     for name, row in rows.items():
         assert int(row["neff_bytes"]) > 0, (name, row)
-    assert rows["topk_r16"]["lnc"] == rows["topk_r128"]["lnc"] == "2"  # the seam's two programs
+    from vllm_neuron.functional.dsa.topk_select import _NUM_PROGRAMS
+
+    # The top-k builds at the seam's own program count.
+    assert {rows[f"topk_r{r}"]["lnc"] for r in ROWS} == {str(_NUM_PROGRAMS)}
     seconds = {name: {"trace_s": float(row["trace_s"]), "neuronx_cc_s": float(row["ncc_s"]),
                       "neff_bytes": int(row["neff_bytes"])} for name, row in rows.items()}
     record_property("compile_seconds", seconds)
-    print("compile seconds:", seconds)
 
 
 if __name__ == "__main__" and sys.argv[1:2] == ["compile-one"]:

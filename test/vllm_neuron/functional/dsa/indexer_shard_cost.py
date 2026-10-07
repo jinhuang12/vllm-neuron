@@ -46,15 +46,33 @@ import math
 import os
 import sys
 
+#: Host-local inputs of this campaign, read only. This module and its test are report
+#: scaffolding, not part of the plugin: the test skips where these paths are absent, and
+#: both files go when the device test (report section 8) replaces the DERIVED numbers.
 CALIB_DIR = "/home/ubuntu/glm53f-wt3/calib/prefill"
 PLANNER_DIR = "/home/ubuntu/glm53f-wt3/planner"
 CAL_CONSTANTS = os.path.join(PLANNER_DIR, "configs", "trn2_constants_glm_cal.json")
 
+#: The calibrated operating point (``rules.json`` reference point p1): TP = 64 ranks,
+#: 1024-row prefill chunks. Every as-built value below is read at this point.
 TP = 64
 CHUNK = 1024
-SELECT_K = 512
-INDEX_KPOOL = 4
-PARTITION = 128
+#: Bytes of one float32 value or id as it crosses a collective.
+FP32_BYTES = 4
+
+
+def _model_dials() -> tuple[int, int]:
+    """``(index_kpool, select_k)`` from the model's own config."""
+    from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
+
+    cfg = Glm5NextTextConfig()
+    return int(cfg.index_kpool), int(cfg.index_topk) // int(cfg.index_kpool)
+
+
+INDEX_KPOOL, SELECT_K = _model_dials()
+#: The two candidate widths the round-2 breakdown measured the indexer at: p1
+#: (max_model_len 4096) and p2 / p3 (8192). worker-3's fits and the top-k fit use both.
+FIT_CANDS = (1024, 2048)
 #: Score and causal-bound buckets carry a per-call intercept in worker-3's fit.
 FIT_BUCKETS = ("score_gemm", "causal_bound")
 #: The sentinel ordering's measured per-chunk ms (11 layers, T = 1024), from the round-2
@@ -62,7 +80,8 @@ FIT_BUCKETS = ("score_gemm", "causal_bound")
 #: p1 at C = 1024; p2 and p3 at C = 2048.
 SENTINEL_KEY = "dsa/sentinel_order.py"
 #: ASSUMED glue per DSA layer: 7 small ops (row index: arange, scale, add, clamp; three
-#: index_select; two casts) at about 3 us each. The device test (D3) must replace it.
+#: index_select; two casts) at about 3 us each. The device test D4 (report section 8)
+#: must replace it.
 GLUE_US_PER_LAYER = 20.0
 GLUE_BAND_US = (5.0, 100.0)
 #: Contexts the headline prices (max_model_len) and the TTFT prompts.
@@ -139,7 +158,17 @@ def topk_mcycles(rows: int, width: int, k: int = SELECT_K) -> float | None:
 
 
 def row_tiles(rows: int) -> int:
-    return -(-int(rows) // PARTITION)
+    """Query-row tiles the selection kernels walk for ``rows`` rows."""
+    from vllm_neuron.functional.dsa.indexer_shard import ROW_TILE
+
+    return -(-int(rows) // ROW_TILE)
+
+
+def cand_tiles(cands: int) -> int:
+    """Candidate tiles of the score GEMM's moving operand for ``cands`` candidates."""
+    from vllm_neuron.functional.dsa.score_gemm import CAND_TILE
+
+    return -(-int(cands) // CAND_TILE)
 
 
 class IndexerCost:
@@ -151,13 +180,14 @@ class IndexerCost:
         self.layers = int(self.m.r["architecture"]["dsa_layers"])
         self.glue_us = float(glue_us)
         # top-k: ms per call per layer = alpha + beta * Mcycles, on the two measured points.
-        y1 = self.m.idx_value("rotational_topk", 1024) / self.layers
-        y2 = self.m.idx_value("rotational_topk", 2048) / self.layers
-        m1, m2 = topk_mcycles(CHUNK, 1024), topk_mcycles(CHUNK, 2048)
+        lo, hi = FIT_CANDS
+        y1 = self.m.idx_value("rotational_topk", lo) / self.layers
+        y2 = self.m.idx_value("rotational_topk", hi) / self.layers
+        m1, m2 = topk_mcycles(CHUNK, lo), topk_mcycles(CHUNK, hi)
         self.beta = (y2 - y1) / (m2 - m1)
         self.alpha = y1 - self.beta * m1
         mt = {p: self.m.pts[p]["master_table_ms"][SENTINEL_KEY] for p in ("p1", "p2", "p3")}
-        self.sentinel_ms = {1024: mt["p1"], 2048: 0.5 * (mt["p2"] + mt["p3"])}
+        self.sentinel_ms = {lo: mt["p1"], hi: 0.5 * (mt["p2"] + mt["p3"])}
 
     # ------------------------------------------------------------------ as built
     def _scaled(self, raw: float) -> float:
@@ -165,7 +195,8 @@ class IndexerCost:
         return raw * self.m.tok_scale
 
     def sentinel_raw(self, cands: int) -> float:
-        return self.sentinel_ms[1024] if cands <= 1024 else self.sentinel_ms[2048]
+        lo, hi = FIT_CANDS
+        return self.sentinel_ms[lo] if cands <= lo else self.sentinel_ms[hi]
 
     def as_built(self, cands: int) -> dict:
         out = {bid: self._scaled(self.m.idx_value(bid, cands))
@@ -205,14 +236,14 @@ class IndexerCost:
                                   else self._topk_scaled(cands, rows, cands))
         compute_before = sum(base.values())
         compute_after = sum(out.values())
-        comm = self.layers * allgather_ms(degree, tokens * SELECT_K * 4, self.cc)
+        comm = self.layers * allgather_ms(degree, tokens * SELECT_K * FP32_BYTES, self.cc)
         glue = self.glue_ms() if degree > 1 else 0.0
         return {"design": "query", "degree": degree, "rows_per_rank": rows, "cands": cands,
                 "as_built_ms": base, "sharded_ms": out, "compute_before_ms": compute_before,
                 "compute_after_ms": compute_after,
                 "compute_saved_ms": compute_before - compute_after, "comm_added_ms": comm,
                 "glue_added_ms": glue, "net_saved_ms": compute_before - compute_after - comm - glue,
-                "gather_bytes_per_layer": tokens * SELECT_K * 4 if degree > 1 else 0}
+                "gather_bytes_per_layer": tokens * SELECT_K * FP32_BYTES if degree > 1 else 0}
 
     # ------------------------------------------------------------------ fallbacks
     def candidate_sharded(self, cands: int, degree: int, merge: str, tokens: int = CHUNK) -> dict:
@@ -221,7 +252,7 @@ class IndexerCost:
         base = self.as_built(cands)
         local = -(-cands // degree)
         kept = min(SELECT_K, local)
-        col_ratio = (-(-local // 512)) / (-(-cands // 512))
+        col_ratio = cand_tiles(local) / cand_tiles(cands)
         out = {}
         for bid in FIT_BUCKETS:
             fixed = self.intercept(bid)
@@ -236,12 +267,12 @@ class IndexerCost:
             local_topk + merge_topk)
         out["sentinel_order"] = base["sentinel_order"] * (
             1.0 if merge == "gather" else row_tiles(rows) / row_tiles(tokens))
-        pair = 8  # an fp32 value and its id travel together
+        pair = 2 * FP32_BYTES  # a value and its id travel together
         if merge == "gather":
             comm = self.layers * allgather_ms(degree, tokens * width * pair, self.cc)
         else:
             comm = self.layers * (all_to_all_ms(degree, tokens * kept * pair, self.cc)
-                                  + allgather_ms(degree, tokens * SELECT_K * 4, self.cc))
+                                  + allgather_ms(degree, tokens * SELECT_K * FP32_BYTES, self.cc))
         compute_before = sum(base.values())
         compute_after = None if out["rotational_topk"] is None else sum(out.values())
         saved = None if compute_after is None else compute_before - compute_after
@@ -292,8 +323,57 @@ class IndexerCost:
     def transient_bytes(rows: int, cands: int) -> dict:
         """Per-layer selection buffers one rank holds: the fp32 score and bounded score
         ``[rows, C]``, and the selector's fp32 values and int32 ids ``[rows, select_k]``."""
-        return {"scores": rows * cands * 4, "bounded": rows * cands * 4,
-                "topk_out": rows * SELECT_K * 8}
+        return {"scores": rows * cands * FP32_BYTES, "bounded": rows * cands * FP32_BYTES,
+                "topk_out": rows * SELECT_K * 2 * FP32_BYTES}
+
+
+#: The kind and source of every field of the report JSON, by field name. A value's label
+#: is that of the deepest field on its path that is listed here (so ``as_built_ms`` labels
+#: every bucket under it). INPUT marks an operating point or shape, not a measurement.
+_BUCKETS = f"worker-3 calibrated buckets ({CALIB_DIR}), per chunk for the 11 DSA layers"
+LABELS = {
+    "dsa_layers": f"INPUT: the calibrated model's DSA layer count ({CALIB_DIR})",
+    "context": "INPUT: max_model_len priced",
+    "cands": "INPUT: candidate pools, context // index_kpool",
+    "prompt": "INPUT: prompt tokens",
+    "column": "INPUT: worker-3 TTFT column (asbuilt, withbranches)",
+    "degree": "INPUT: ranks sharing the selection",
+    "design": "INPUT: design name",
+    "n_chunks": "DERIVED: ceil(prompt / 1024)",
+    "chunks": "DERIVED: ceil(prompt / 1024)",
+    "rows_per_rank": "DERIVED: ceil(1024 / degree)",
+    "cands_per_rank": "DERIVED: cands / degree",
+    "kept_per_rank": "DERIVED: min(select_k, cands_per_rank)",
+    "merge_rows": "DERIVED: merge top-k rows: 1024 (gather) or ceil(1024 / degree)",
+    "merge_width": "DERIVED: merge top-k width, degree x kept_per_rank",
+    "gather_bytes_per_layer": "DERIVED: 1024 x select_k x 4 bytes",
+    "as_built_ms": f"DERIVED: {_BUCKETS}; MEASURED at cands 1024 and 2048, linear above",
+    "compute_before_ms": "DERIVED: the sum of as_built_ms",
+    "sharded_ms": "DERIVED: as_built_ms scaled by the rules of the module docstring",
+    "compute_after_ms": "DERIVED: the sum of sharded_ms",
+    "compute_saved_ms": "DERIVED: compute_before_ms - compute_after_ms",
+    "comm_added_ms": f"DERIVED: allgather_ms / all_to_all_ms on {CAL_CONSTANTS}, 11 layers",
+    "glue_added_ms": "ASSUMED: glue_us_per_layer_assumed x 11 layers",
+    "net_saved_ms": "DERIVED: compute_saved_ms - comm_added_ms - glue_added_ms",
+    "query_d64_net_saved_band_ms": "DERIVED: net_saved_ms at the two ends of glue_band_us",
+    "memory_per_rank_per_layer_bytes": "DERIVED: buffer shapes x 4 bytes",
+    "before_ms": f"DERIVED: worker-3 prefill_model.py ({CALIB_DIR}); equal to "
+                 "prefill_calibrated.json where that file has the row",
+    "saved_per_chunk_ms": "DERIVED: net_saved_ms of query_d64 at the prompt's cands",
+    "after_ms": "DERIVED: before_ms - n_chunks x saved_per_chunk_ms",
+    "servable_as_built": f"DERIVED: worker-3 prefill_model.py admission ({CALIB_DIR})",
+    "fixed_c_ms": "DERIVED: compute_after_ms summed over the chunks at the full cands",
+    "prefix_sized_ms": "DERIVED: compute_after_ms summed over the chunks at prefix cands",
+    "saved_ms": "DERIVED: fixed_c_ms - prefix_sized_ms",
+    "alpha_ms_per_call_layer": "DERIVED: top-k fit to the two MEASURED as-built points",
+    "beta_ms_per_mcycle": "DERIVED: top-k fit to the two MEASURED as-built points",
+    "tok_scale": f"DERIVED: worker-3 calibration token scale ({CALIB_DIR})",
+    "collective": f"DERIVED: calibrated collective constants ({CAL_CONSTANTS})",
+    "fit_intercepts_ms": f"DERIVED: per-call intercepts of worker-3's fits ({CALIB_DIR})",
+    "glue_us_per_layer_assumed": "ASSUMED: 7 small ops x about 3 us (GLUE_US_PER_LAYER)",
+    "glue_band_us": "ASSUMED: the glue band (GLUE_BAND_US)",
+    "sentinel_order_measured_ms": "MEASURED: round-2 breakdown master table, by cands",
+}
 
 
 def report(cost: IndexerCost | None = None) -> dict:
@@ -301,7 +381,10 @@ def report(cost: IndexerCost | None = None) -> dict:
     out = {
         "what": "DERIVED cost of the query-sharded DSA prefill selection, per 1024-row chunk, "
                 "TP=64, all 11 DSA layers (per_layer = /11). Source of every as-built value: "
-                f"{CALIB_DIR} (worker-3 calibrated buckets).",
+                f"{CALIB_DIR} (worker-3 calibrated buckets). This is the evidence file of "
+                "/home/ubuntu/glm53f-wt5/reports/indexer_shard.md, not an integrator row "
+                "file: 'labels' gives the kind and source of every field, by field name.",
+        "labels": LABELS,
         "dsa_layers": cost.layers,
         "constants": {"alpha_ms_per_call_layer": cost.alpha,
                       "beta_ms_per_mcycle": cost.beta, "tok_scale": cost.m.tok_scale,
