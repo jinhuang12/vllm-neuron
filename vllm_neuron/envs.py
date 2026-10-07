@@ -76,6 +76,9 @@ if TYPE_CHECKING:
     # Build the GLM-5.3-Flash step's attention metadata on the host only: no per-step
     # block-table / slot-mapping uploads that its graph never reads.
     VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA: bool = False
+    # Worker GC policy after warmup (vllm_neuron/vllm/worker/gc_policy.py):
+    # "freeze_rare_gen2" (freeze + gen-2 threshold 100000), "freeze", or "off".
+    VLLM_NEURON_GC_POLICY: str = "freeze_rare_gen2"
 
 
 def maybe_convert_bool(value: str | None) -> bool | None:
@@ -344,6 +347,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA"))
         or False
+    ),
+    # GC policy each worker applies once after warmup. "freeze_rare_gen2" freezes
+    # the heap and raises only the gen-2 threshold, so full passes stop running every
+    # ~11 bs=64 steps; "freeze" is the freeze alone; "off" keeps CPython's default GC.
+    "VLLM_NEURON_GC_POLICY": lambda: os.getenv(
+        "VLLM_NEURON_GC_POLICY", "freeze_rare_gen2"
     ),
 }
 
