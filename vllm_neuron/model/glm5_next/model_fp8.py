@@ -245,24 +245,6 @@ def _per_rank(count: int, world_size: int) -> int:
     return max(1, count // max(world_size, 1))
 
 
-def _shadow_draft_k() -> int:
-    """The shadow-draft knob ``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT`` (MTP stage A, 0 = off).
-
-    Read through the head module's own reader, ``mtp.shadow_draft_k`` (stage A contract
-    C1), so the knob has one owner; until that reader lands the environment is read here
-    directly, which is the stub the integration replaces.
-    """
-    from vllm_neuron.model.glm5_next import mtp as mtp_module
-
-    reader = getattr(mtp_module, "shadow_draft_k", None)
-    if reader is not None:
-        return int(reader())
-    import os
-
-    raw = os.environ.get("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT", "")
-    return int(raw) if raw.strip() else 0
-
-
 def _resolve_tp_group() -> GroupCoordinator | None:
     """The tensor-parallel group to reduce a row-parallel partial across.
 
@@ -9607,8 +9589,15 @@ class Glm5NextForConditionalGeneration(nn.Module):
         collecting = {"collect_layer_streams": True} if collect_layer_streams else {}
         # Shadow draft: the draft layer's carrier rides at the end of the list and the
         # stack must not see it (it refuses a count that disagrees with its layers).
-        draft_head = getattr(self, "mtp", None)
-        shadow_k = _shadow_draft_k() if draft_head is not None else 0
+        draft_head = self.mtp
+        shadow_k = 0
+        if draft_head is not None:
+            # The knob's one reader (contract C1); lazily, as the head is imported
+            # everywhere in this module, so the two modules never import each other
+            # at load time.
+            from . import mtp as mtp_module
+
+            shadow_k = int(mtp_module.shadow_draft_k())
         draft_carrier: dict | None = None
         if shadow_k > 0:
             stack_depth = len(self.model.layers)
@@ -9660,6 +9649,15 @@ class Glm5NextForConditionalGeneration(nn.Module):
         # Alignment: the draft at position t consumes the trunk's post-final-norm row
         # h_t and the embedding of x_{t+1}. The sampled ids are read, never written.
         assert draft_carrier is not None
+        # The draft layer's MoE half runs the trunk's own feed-forward, under the same
+        # five keywords this forward handed the stack (one call shape on both legs).
+        ffn_keywords = {
+            "quant_config": quant_config,
+            "block_size": block_size,
+            "moe_group": moe_group,
+            "tp_degree": tp_degree,
+            "expert_parallel_rank": expert_parallel_rank,
+        }
         sampled_ids = (
             logits if device_sampling_params is not None else torch.argmax(logits, dim=-1)
         ).to(torch.int32)
@@ -9698,7 +9696,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     )
             fill = torch.where(boundary < 0, sampled_ids, boundary)
             next_ids = next_ids.index_copy(0, sampling_positions, fill)
-            draft_head.populate(hidden_states, next_ids, positions, **draft_carrier)
+            draft_head.populate(
+                hidden_states, next_ids, positions, **ffn_keywords, **draft_carrier
+            )
             draft_ids = torch.full(
                 (rows_out, shadow_k), -1, dtype=torch.int32, device=input_ids.device
             )
@@ -9711,7 +9711,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             if positions.numel() == 1 and rows_out > 1:
                 positions = positions.expand(rows_out)
             draft_ids = draft_head.draft_tokens(
-                rows, sampled_ids, positions, shadow_k, **draft_carrier
+                rows, sampled_ids, positions, shadow_k, **ffn_keywords, **draft_carrier
             )
         if collect_layer_streams:
             return (logits, draft_ids, *layer_streams)

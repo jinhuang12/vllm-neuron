@@ -312,6 +312,32 @@ def test_intermediate_prefill_chunks_and_sentinel_drafts_leave_no_trace(monkeypa
     assert (written[0]["scored"], written[0]["accepted_prefix_len"]) == (2, 2)
 
 
+def test_shutdown_resolves_the_in_flight_step_scores_the_rest_and_closes_the_log(monkeypatch, tmp_path):
+    """The worker's shutdown reaches the runner through ``ensure_kv_transfer_shutdown``: the
+    step still queued (one step late) is resolved, every tracked request is retired with its
+    pending drafts scored over what arrived, and the log handle is closed."""
+    log = tmp_path / "shadow.jsonl"
+    monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT", "2")
+    monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG", str(log))
+    runner = _runner_shell(k=2, req_ids=["r"])
+    # Three decode steps. One step late, the scorer has seen steps 0 and 1; step 0's two
+    # drafts need step 2's token, which is still queued, so nothing is complete yet.
+    _observe_step(runner, ["r"], sampled=[10], drafts=[[11, 12]], starts=[8], counts=[1])
+    _observe_step(runner, ["r"], sampled=[11], drafts=[[12, 13]], starts=[9], counts=[1])
+    _observe_step(runner, ["r"], sampled=[12], drafts=[[13, 0]], starts=[10], counts=[1])
+    assert _read_log(log) == [], "the newest step is still queued; no record is complete"
+    runner.ensure_kv_transfer_shutdown()
+    records = _read_log(log)
+    assert [r["step"] for r in records] == [0, 1, 2]
+    assert [r["scored"] for r in records] == [2, 1, 0]
+    assert [r["accepted_prefix_len"] for r in records] == [2, 1, 0]
+    assert runner._glm5next_shadow_log_handle.closed
+    assert runner._glm5next_shadow_scorer_instance is None
+    # Idempotent: a second shutdown neither writes nor fails.
+    runner.ensure_kv_transfer_shutdown()
+    assert len(_read_log(log)) == 3
+
+
 def test_the_log_is_written_by_rank_zero_only(monkeypatch, tmp_path):
     log = tmp_path / "shadow.jsonl"
     monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT", "2")

@@ -11500,7 +11500,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         return ("generate",)
 
     def ensure_kv_transfer_shutdown(self) -> None:
-        pass
+        # The worker's ``shutdown`` reaches the runner through this call; the
+        # shadow-draft log (MTP stage A) closes with it.
+        self._glm5next_shadow_shutdown()
 
     # ------------------------------------------------------------------------
     # GLM-5.3-Flash shadow draft (MTP stage A): bookkeeping, scoring, log.
@@ -11521,17 +11523,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         ``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT`` is above 0). The knob is GLM-specific and
         this runner is not, so the hooks key on the head, never on the environment
         alone: another model's tuple output is left untouched whatever the knob says.
+        The value comes from the knob's one reader, ``mtp.shadow_draft_k`` (contract
+        C1), which reads ``envs`` and bounds it.
         """
         if getattr(getattr(self, "model", None), "mtp", None) is None:
             return 0
         from vllm_neuron.model.glm5_next import mtp as mtp_module
 
-        reader = getattr(mtp_module, "shadow_draft_k", None)
-        if reader is not None:
-            return int(reader())
-        # Stub until the head's reader lands (stage A contract C1); same knob.
-        raw = os.environ.get("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT", "")
-        return int(raw) if raw.strip() else 0
+        return int(mtp_module.shadow_draft_k())
 
     def _glm5next_shadow_log_path(self) -> str:
         """``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG``: the JSONL path, "" = no log."""
@@ -11668,6 +11667,27 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             self._glm5next_shadow_scorer_instance = scorer
             self._glm5next_shadow_step_no = 0
         return scorer
+
+    def _glm5next_shadow_shutdown(self) -> None:
+        """Resolve the step still queued, retire every request, close the log.
+
+        Reached from the runner's shutdown. The queued step's tensors are the last
+        device futures; by shutdown the device has finished them, so reading them back
+        blocks nothing. Every tracked request retires with its pending drafts scored
+        over the tokens that arrived (``scored`` < k for the tail), so no record is
+        lost. Idempotent: a second call finds no scorer and returns.
+        """
+        scorer = getattr(self, "_glm5next_shadow_scorer_instance", None)
+        if scorer is None:
+            return
+        pending = self.__dict__.setdefault("_glm5next_shadow_pending", [])
+        while pending:
+            self._glm5next_shadow_resolve(pending.pop(0), scorer)
+        scorer.close()
+        self._glm5next_shadow_scorer_instance = None
+        handle = getattr(self, "_glm5next_shadow_log_handle", None)
+        if handle is not None:
+            handle.close()
 
     def _glm5next_shadow_observe(self, sampled, drafts, *, is_prefill: bool) -> None:
         """Queue this step's sampled ids and drafts; resolve the previous step's.
