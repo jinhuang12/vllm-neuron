@@ -533,17 +533,17 @@ def test_every_transpose_lands_in_the_source_dtype_sixteen_rows_per_dma():
 
 
 def test_indirect_gather_transposes_start_on_a_line():
-    """The low-precision body's two gather-transposes are the module's only indirect sites, and
-    each destination starts on a 32-byte line at every selected-row count the body serves.
+    """The low-precision body's gather-transpose is the module's only indirect site, and its
+    destination starts on a 32-byte line at every selected-row count the body serves.
 
-    The destination is the 2-byte ``[128, 1, n_latent, K]`` tile at its base (one DMA) or at
-    the score tile's first column (one DMA per tile); the body's gate hands it only the
-    cache's own 2-byte dtype, so the element width is 2 at every site.
+    The destination is the 2-byte ``[128, 1, n_latent, K]`` tile at its base, one DMA per
+    query; the body's gate hands it only the cache's own 2-byte dtype, so the element width
+    is 2. (The score-tile starts are read too, for a split of that DMA, should one return.)
     """
     source = _module_source()
     indirect = _indirect_lines(source)
     lowp = _body_lines(source, _LOWP_BODY)
-    assert len(indirect) == 2, f"indirect gather-transpose sites: {sorted(indirect)}"
+    assert len(indirect) == 1, f"indirect gather-transpose sites: {sorted(indirect)}"
     assert all(line in lowp for line in indirect), \
         f"an indirect site outside {_LOWP_BODY}: {sorted(indirect)}"
     for topk in (2048, 2176):

@@ -1518,9 +1518,9 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
 # * The softmax runs once over the whole row: the score tiles are evacuated from PSUM
 #   into one ``[1, K]`` tile (the sentinel bias added on the way), then one max, one
 #   exp with its sum, one mask multiply and one normalisation. No per-tile merge.
-# * The probabilities reach the key partitions by one SBUF-to-SBUF DMA that re-rows
-#   the ``[1, K]`` tile as ``[n_chunks, 128]`` and one PE transpose, instead of one PE
-#   transpose per chunk. They are then split into bf16 hi/lo halves for MM2.
+# * The probabilities reach the key partitions by one one-row PE transpose per chunk,
+#   all landing in one PSUM tile that is evacuated once (a one-row transpose is a
+#   one-column matmul). They are then split into bf16 hi/lo halves for MM2.
 # * The normalisation is applied to p before MM2 rather than to the output after
 #   it: at one head both are one instruction, and MM2's PSUM tile is then stored as is.
 #
@@ -1529,11 +1529,6 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
 # p, about 16 significand bits), in the softmax being taken against the global row
 # maximum rather than merged tile by tile, and in where the normalisation lands.
 # --------------------------------------------------------------------------- #
-
-#: Whether the low-precision body issues the gather-transpose per 512-wide score tile
-#: (True: n_tiles DMAs, so MM1 on tile 0 can start before tile 3 has landed) or once
-#: per query (False: one DMA of all selected rows).
-GATHER_TRANSPOSE_PER_TILE = False
 
 
 def _lowp_serves(q_lift_hbm, c_kv_hbm, heads: int, rope: int, STREAM_KV: bool) -> bool:
@@ -1548,12 +1543,11 @@ _LP_C_ROWS = 1     # the selected rows as gathered, keys on partitions: [128, n_
 _LP_RAW = 2        # the chunk-major indices, signed
 _LP_SAFE = 3       # the same with the sentinel clamped to row 0 (the gathers' offsets)
 _LP_U32 = 4        # the clamp as uint32 (the gather-transpose's offsets)
-_LP_P_ROWS = 5     # p re-rowed as [n_chunks, 128]
-_LP_P_T = 6        # p transposed, keys on partitions, fp32
-_LP_P_HI = 7       # bf16(p_t)
-_LP_P_HI_F = 8     # the hi half widened
-_LP_P_LO = 9       # bf16(p_t - hi)
-_LP_COUNT = 10
+_LP_P_T = 5        # p transposed, keys on partitions, fp32
+_LP_P_HI = 6       # bf16(p_t)
+_LP_P_HI_F = 7     # the hi half widened
+_LP_P_LO = 8       # bf16(p_t - hi)
+_LP_COUNT = 9
 
 
 def _lowp_scratch(latent, topk, n_latent, n_chunks, dtype):
@@ -1566,7 +1560,6 @@ def _lowp_scratch(latent, topk, n_latent, n_chunks, dtype):
     ws[_LP_RAW] = _sbuf_i32(KEY_CHUNK, _aligned(n_chunks))
     ws[_LP_SAFE] = _sbuf_i32(KEY_CHUNK, _aligned(n_chunks))
     ws[_LP_U32] = _sbuf_u32(KEY_CHUNK, _aligned(n_chunks))
-    ws[_LP_P_ROWS] = _sbuf(n_chunks, KEY_CHUNK)
     ws[_LP_P_T] = _sbuf(KEY_CHUNK, _aligned(n_chunks))
     ws[_LP_P_HI] = nl.ndarray((KEY_CHUNK, _aligned(n_chunks, STAGE_ALIGN)), dtype=dtype, buffer=nl.sbuf)
     ws[_LP_P_HI_F] = _sbuf(KEY_CHUNK, _aligned(n_chunks))
@@ -1635,7 +1628,6 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
             raw = ws[_LP_RAW]
             safe = ws[_LP_SAFE]
             idx_u32 = ws[_LP_U32]
-            p_rows = ws[_LP_P_ROWS]
             p_t = ws[_LP_P_T]
             p_hi = ws[_LP_P_HI]
             p_hi_f = ws[_LP_P_HI_F]
@@ -1668,26 +1660,15 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
             # ``dst[l, 0, li, k] = cache[idx[k], li * 128 + l]`` for every selected
             # column k, read column-major from the chunk-major index tile, which is
             # exactly the column order of the query's row. The source is viewed as
-            # ``[rows, 1, n_latent, 128]`` so one DMA lands every latent tile.
-            if GATHER_TRANSPOSE_PER_TILE:
-                for ti in range(len(tiles)):
-                    ks = tiles[ti][0]
-                    extent = tiles[ti][1]
-                    c0 = ks // KEY_CHUNK
-                    cn = extent // KEY_CHUNK
-                    nisa.dma_transpose(
-                        dst=c_t[:, :, :, ks:ks + extent],
-                        src=c_kv_hbm.ap(pattern=[[latent, extent], [0, 1],
-                                                 [LATENT_TILE, n_latent], [1, LATENT_TILE]],
-                                        vector_offset=idx_u32[:, c0:c0 + cn], indirect_dim=0),
-                        dge_mode=nisa.dge_mode.swdge)
-            else:
-                nisa.dma_transpose(
-                    dst=c_t,
-                    src=c_kv_hbm.ap(pattern=[[latent, topk], [0, 1],
-                                             [LATENT_TILE, n_latent], [1, LATENT_TILE]],
-                                    vector_offset=idx_u32[:, 0:n_chunks], indirect_dim=0),
-                    dge_mode=nisa.dge_mode.swdge)
+            # ``[rows, 1, n_latent, 128]`` so one DMA lands every latent tile. (A DMA
+            # per score tile would need a destination slice whose free dimensions are
+            # not contiguous, which the DGE refuses.)
+            nisa.dma_transpose(
+                dst=c_t,
+                src=c_kv_hbm.ap(pattern=[[latent, topk], [0, 1],
+                                         [LATENT_TILE, n_latent], [1, LATENT_TILE]],
+                                vector_offset=idx_u32[:, 0:n_chunks], indirect_dim=0),
+                dge_mode=nisa.dge_mode.swdge)
 
             # ---- the plain gathers: the selected rows as stored, keys on partitions -----
             for ck in range(n_chunks):
@@ -1721,10 +1702,14 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
             nisa.tensor_scalar(dst=p, data=scores_m, op0=nl.multiply, operand0=recip,
                                engine=nisa.engine.vector)
 
-            # ---- p onto the key partitions: re-row by DMA, one transpose, hi/lo split ----
-            nisa.dma_copy(dst=p_rows, src=p)
+            # ---- p onto the key partitions: one one-row transpose per chunk into one ----
+            # PSUM tile, evacuated once, then the hi/lo split. (A DMA that re-rows the
+            # ``[1, K]`` tile as ``[n_chunks, 128]`` is refused on device: a DMA copy
+            # keeps the per-partition element count.)
             p_t_ps = _psum(KEY_CHUNK, n_chunks)
-            nisa.nc_transpose(dst=p_t_ps, data=p_rows)
+            for ck in range(n_chunks):
+                nisa.nc_transpose(dst=p_t_ps[:, ck:ck + 1],
+                                  data=p[:, ck * KEY_CHUNK:(ck + 1) * KEY_CHUNK])
             nisa.tensor_copy(dst=p_t[:, 0:n_chunks], src=p_t_ps)
             nisa.tensor_copy(dst=p_hi[:, 0:n_chunks], src=p_t[:, 0:n_chunks])
             nisa.tensor_copy(dst=p_hi_f[:, 0:n_chunks], src=p_hi[:, 0:n_chunks])
