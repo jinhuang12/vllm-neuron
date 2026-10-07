@@ -14,10 +14,23 @@ from vllm_neuron import envs
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
-#: SBUF bytes one partition offers an NKI kernel on trn2, as the vendor kernel library
-#: states them (its ``MAX_AVAILABLE_SBUF_SIZE``): 224 KiB less the reserved head and tail.
-#: Host-side tile-size rules use it; inside a kernel ``nl.tile_size`` is authoritative.
-SBUF_BYTES_PER_PARTITION = 224 * 1024 - 16384 - 8 - 520
+#: SBUF bytes per partition on trn2, before the runtime's reservations.
+SBUF_TOTAL_BYTES_PER_PARTITION = 224 * 1024
+#: The dynamic-DMA scratch region nkilib names ``DynamicDMAScratchLoc``.
+SBUF_DYNAMIC_DMA_SCRATCH_BYTES = 16384
+#: The reserved region nkilib names ``EvalAccelReservedLoc``.
+SBUF_EVAL_ACCEL_RESERVED_BYTES = 8
+#: The last reservation. nkilib gives it as 256 B, the transpose's identity tensor, in
+#: ``core/mlp/mlp_cte/mlp_cte_constants.py:62-63`` and as 520 B in
+#: ``experimental/moe/bwd/bwmm_bwd_dropless.py:36-37`` (which describes its reservations as
+#: DMA header, metadata and alignment overhead). This takes 520, the larger, so a tile sized
+#: here fits under either.
+SBUF_TAIL_RESERVED_BYTES = 520
+#: SBUF bytes one partition offers an NKI kernel on trn2: nkilib's ``MAX_AVAILABLE_SBUF_SIZE``
+#: (``bwmm_bwd_dropless.py:37``). Host-side tile-size rules use it, because they run before a
+#: kernel is traced; inside a kernel ``nl.tile_size`` is authoritative.
+SBUF_BYTES_PER_PARTITION = (SBUF_TOTAL_BYTES_PER_PARTITION - SBUF_DYNAMIC_DMA_SCRATCH_BYTES
+                            - SBUF_EVAL_ACCEL_RESERVED_BYTES - SBUF_TAIL_RESERVED_BYTES)
 
 
 def can_run_kernel(device: torch.Tensor | str = "") -> bool:
