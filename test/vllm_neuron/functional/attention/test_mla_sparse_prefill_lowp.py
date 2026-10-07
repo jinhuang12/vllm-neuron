@@ -52,8 +52,9 @@ SCALE = BENCH.SCALE
 PAGE = BENCH.PAGE
 
 #: Low-precision path against 8aa22fa (fp32 outputs, relative L2 over the whole output).
-#: Measured in the simulator at every case below: at most 6.2e-6 (bf16 hi/lo split of p,
-#: 16 significand bits); the bound leaves 3x room.
+#: Measured in the simulator at every case below: 1.65e-6 .. 2.39e-6 (the largest at
+#: 1024 x 1024, where most columns are the sentinel); 3.0e-6 on device at 64 x 8192. The
+#: bound leaves 8x room. Element-wise the largest |after - before| seen is 1.35e-5.
 LOWP_REL_L2 = 2e-5
 #: The same, element-wise: |after - before| <= LOWP_ATOL + LOWP_RTOL * |before|.
 LOWP_RTOL = 2e-4
