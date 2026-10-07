@@ -6,9 +6,10 @@ context at pool 4) because the output transpose put every candidate tile on the
 partitions at once and every key of a request sat in SBUF at once. The kernel now walks
 the candidate axis in chunks of at most 128 tiles. Two claims are checked here:
 
-* Up to 16,384 candidates the kernel is the b17526a kernel: one chunk, the same
-  instructions, so the scores are equal bit for bit. The reference is b17526a's own
-  file, loaded from git into a module of its own (never by editing the tree).
+* Up to 16,384 candidates the kernel is the unchunked kernel: one chunk, the same
+  instructions, so the scores are equal bit for bit. The reference is the last unchunked
+  commit's own file, loaded from git into a module of its own (never by editing the
+  tree).
 * Past 16,384 candidates the scores match the torch oracle (the bf16 products summed in
   fp32 in another order: ``SCORE_RTOL``), every bounded column holds ``BOUND_FILL``
   exactly, and this step's pool stands in at its own column in any chunk.
@@ -19,6 +20,7 @@ from __future__ import annotations
 import importlib.util
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -26,32 +28,36 @@ import torch
 
 from vllm_neuron.functional.dsa import decode_batch as DB
 from vllm_neuron.functional.dsa.causal_bound import BOUND_FILL
+from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
-POOL = 4
-HEAD_DIM = 128
-HEADS = 32
-#: The commit whose kernel the chunked one must reproduce bit for bit.
-BASE_COMMIT = "b17526a"
-#: See test_decode_batch.py: fp32 rounding of a 128-term bf16 dot product and a 32-term
-#: head sum, in two orders.
-SCORE_RTOL = 1e-5
-SCORE_ATOL = 1e-5
-#: The old kernel's widest candidate axis.
-OLD_MAX = 128 * 128
+from test.vllm_neuron.functional.dsa.test_decode_batch import SCORE_ATOL, SCORE_RTOL
+
+_CONFIG = Glm5NextTextConfig()
+#: GLM-5.3-Flash's indexer: tokens per candidate pool, key width and query heads.
+POOL = _CONFIG.index_kpool
+HEAD_DIM = _CONFIG.index_head_dim
+HEADS = _CONFIG.index_n_heads
+#: The last commit whose kernel has no chunks: the chunked one must reproduce it bit for
+#: bit.
+UNCHUNKED_COMMIT = "b17526a"
+#: The unchunked kernel's widest candidate axis, which is one chunk now
+#: (``test_one_chunk_is_the_old_widest_axis`` checks it against that kernel).
+OLD_MAX = DB.CHUNK_CANDIDATES
 
 
 def _load_base_module():
-    """b17526a's decode_batch.py as a module of its own, from ``git show``."""
+    """The unchunked decode_batch.py as a module of its own, from ``git show``."""
     root = Path(DB.__file__).resolve().parents[3]
-    source = subprocess.run(
+    shown = subprocess.run(
         ["git", "-C", str(root), "show",
-         f"{BASE_COMMIT}:vllm_neuron/functional/dsa/decode_batch.py"],
-        check=True, capture_output=True).stdout
-    tmp = Path(__import__("tempfile").mkdtemp(prefix="decode_batch_base_"))
-    path = tmp / "decode_batch_b17526a.py"
-    path.write_bytes(source)
-    spec = importlib.util.spec_from_file_location("decode_batch_b17526a", path)
+         f"{UNCHUNKED_COMMIT}:vllm_neuron/functional/dsa/decode_batch.py"],
+        capture_output=True)
+    if shown.returncode != 0:
+        pytest.skip(f"commit {UNCHUNKED_COMMIT} is not in this checkout")
+    path = Path(tempfile.mkdtemp(prefix="decode_batch_unchunked_")) / "decode_batch_unchunked.py"
+    path.write_bytes(shown.stdout)
+    spec = importlib.util.spec_from_file_location("decode_batch_unchunked", path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -104,10 +110,14 @@ def _served_programs(monkeypatch, lnc):
         monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", lnc)
 
 
+def test_one_chunk_is_the_old_widest_axis(base):
+    assert OLD_MAX == base.MAX_CANDIDATES == DB.CHUNK_TILES * DB.PARTITIONS
+
+
 @pytest.mark.parametrize("lnc", [None, "2"])
 @pytest.mark.parametrize("batch", [1, 4])
 @pytest.mark.parametrize("candidates", [512, 2048, OLD_MAX])
-def test_chunked_kernel_equals_b17526a_bit_for_bit(base, monkeypatch, batch, candidates,
+def test_chunked_kernel_equals_the_unchunked_kernel_bit_for_bit(base, monkeypatch, batch, candidates,
                                                     lnc):
     _served_programs(monkeypatch, lnc)
     case = _case(batch, seed=candidates + batch, candidates=candidates,

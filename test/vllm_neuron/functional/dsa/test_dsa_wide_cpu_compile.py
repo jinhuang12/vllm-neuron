@@ -8,11 +8,15 @@ runs the whole compile (Dynamo -> HLO -> neuronx-cc -> NEFF) on the CPU
 the candidate count C = max_model_len / 4, at the widths a 64k, 256k and 1M context
 gives them, and for the MoE router, whose SBUF tile scales with the prefill chunk:
 
-* ``_causal_bound_nki`` at ``[8192, C]`` (one 8192-token prefill chunk), C in
-  {16384, 32768, 65536};
-* ``dsa_decode_scores_kernel`` at C in {65536 (B=4, two programs), 262144 (B=1)};
-* ``noaux_tc_rmsnorm_router_topk`` at an 8192-token chunk, H 4096, E 288 (b17526a's
-  single launch needs 524,288 B per partition there and neuronx-cc refuses it).
+* ``_causal_bound_nki`` at ``[8192, C]`` (one 8192-token prefill chunk), at the 64k,
+  128k and 256k contexts;
+* ``dsa_decode_scores_kernel`` at the 256k context (B=4, two programs) and the 1M
+  context (B=1);
+* ``noaux_tc_rmsnorm_router_topk`` at an 8192-token chunk, GLM-5.3-Flash's H and E (one
+  launch of the whole chunk needs 524,288 B per partition there and neuronx-cc refuses
+  it).
+
+The model dimensions come from ``Glm5NextTextConfig``.
 
 The child stops before the executor is built (``build_executable`` is replaced), so it
 never opens the Neuron runtime or a device node. A NEFF on disk is the pass.
@@ -29,18 +33,30 @@ import tempfile
 
 import pytest
 
+from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
+
+_CONFIG = Glm5NextTextConfig()
+POOL = _CONFIG.index_kpool
+HIDDEN = _CONFIG.hidden_size
+EXPERTS = _CONFIG.n_routed_experts
+TOP_K = _CONFIG.num_experts_per_tok
+INDEX_HEADS = _CONFIG.index_n_heads
+INDEX_HEAD_DIM = _CONFIG.index_head_dim
+#: The old largest prefill chunk, the one the chunk-8192 serve line failed to build.
+CHUNK = 8192
+
 ROW = "dsa_wide_cpu_compile"
 _ROOT = pathlib.Path(__file__).resolve().parents[4]
 _DROP = ("NKI_SIMULATOR", "NKI_PRECISE_FP", "VLLM_NEURON_CPU_MODE",
          "NEURON_LIBTORCH_CPU_MODE", "NEURON_RT_VISIBLE_CORES")
 
 CASES = (
-    ("causal_bound", 8192, 16384, 1),
-    ("causal_bound", 8192, 32768, 1),
-    ("causal_bound", 8192, 65536, 1),
-    ("decode_scores", 4, 65536, 2),
-    ("decode_scores", 1, 262144, 1),
-    ("router", 8192, 4096, 2),
+    ("causal_bound", CHUNK, 65536 // POOL, 1),
+    ("causal_bound", CHUNK, 131072 // POOL, 1),
+    ("causal_bound", CHUNK, 262144 // POOL, 1),
+    ("decode_scores", 4, 262144 // POOL, 2),
+    ("decode_scores", 1, 1048576 // POOL, 1),
+    ("router", CHUNK, HIDDEN, 2),
 )
 
 
@@ -64,7 +80,7 @@ def _child(kind: str, rows: int, width: int, grid: int) -> None:
         from vllm_neuron.functional.dsa import causal_bound as CB
 
         def fn(scores, lens):
-            return wrap_nki(CB._causal_bound_nki)(scores, lens, 4)
+            return wrap_nki(CB._causal_bound_nki)(scores, lens, POOL)
 
         args = (torch.empty((rows, width), dtype=f32, device=meta),
                 torch.empty((rows, 1), dtype=i32, device=meta))
@@ -73,12 +89,12 @@ def _child(kind: str, rows: int, width: int, grid: int) -> None:
         from vllm_neuron.functional.moe import router as R
 
         def fn(hidden, gamma, weights, bias):
-            return R.noaux_tc_rmsnorm_router_topk(hidden, gamma, weights, bias, top_k=8)
+            return R.noaux_tc_rmsnorm_router_topk(hidden, gamma, weights, bias, top_k=TOP_K)
 
         args = (torch.empty((1, rows, width), dtype=bf, device=meta),
                 torch.empty((width,), dtype=bf, device=meta),
-                torch.empty((width, 288), dtype=bf, device=meta),
-                torch.empty((288,), dtype=f32, device=meta))
+                torch.empty((width, EXPERTS), dtype=bf, device=meta),
+                torch.empty((EXPERTS,), dtype=f32, device=meta))
         module = R.__file__
     else:
         from vllm_neuron.functional.dsa import decode_batch as DB
@@ -87,16 +103,16 @@ def _child(kind: str, rows: int, width: int, grid: int) -> None:
             call = wrap_nki(DB.dsa_decode_scores_kernel)
             if grid == 2:
                 call = call[2]
-            return call(q, w, bank, slots, lens, pos, pooled, width, 4, DB.SOURCE_DIGEST)
+            return call(q, w, bank, slots, lens, pos, pooled, width, POOL, DB.SOURCE_DIGEST)
 
         batch = rows
-        args = (torch.empty((batch, 32, 128), dtype=bf, device=meta),
-                torch.empty((batch, 32), dtype=f32, device=meta),
-                torch.empty((2, width + 1, 128), dtype=bf, device=meta),
+        args = (torch.empty((batch, INDEX_HEADS, INDEX_HEAD_DIM), dtype=bf, device=meta),
+                torch.empty((batch, INDEX_HEADS), dtype=f32, device=meta),
+                torch.empty((2, width + 1, INDEX_HEAD_DIM), dtype=bf, device=meta),
                 torch.empty((batch, 1), dtype=i32, device=meta),
                 torch.empty((batch, 1), dtype=i32, device=meta),
                 torch.empty((batch, 1), dtype=i32, device=meta),
-                torch.empty((batch, 128), dtype=bf, device=meta))
+                torch.empty((batch, INDEX_HEAD_DIM), dtype=bf, device=meta))
         module = DB.__file__
     neff, message = "", ""
     try:

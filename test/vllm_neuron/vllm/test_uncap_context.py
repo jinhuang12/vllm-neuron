@@ -41,12 +41,16 @@ pytestmark = [pytest.mark.fast]
 
 KNOB = "VLLM_NEURON_GLM5NEXT_ON_DEVICE_SAMPLING"
 SERVED_BLOCK = 128
-CHUNK = 8192
+#: The largest segment the segmented attention kernel takes, the old cap.
+OLD_SEGMENT_MAX = max(BU.SUPPORTED_KV_SEGMENT_SIZES)
+#: A chunk as wide as the old cap, so ``2 * CHUNK + 1`` tokens is past the old window.
+CHUNK = OLD_SEGMENT_MAX
 LONG_LINES = (65536, 262144)
 
 
 def _long_line(max_model_len: int) -> dict:
-    """The serve line of reports/uncap.md: bs=1, chunk 8192, one segment of max_model_len."""
+    """A long line: bs=1, chunk ``CHUNK``, one segment of ``max_model_len``. The served
+    lines of reports/uncap.md have the same form, at chunk 2048 and 512."""
     return dict(
         max_model_len=max_model_len,
         max_num_seqs=1,
@@ -165,10 +169,12 @@ def test_the_runner_builds_a_long_line_with_the_buckets_admission_resolves(
 
 
 def test_the_old_cap_line_still_has_its_window(served_model_dir, monkeypatch):
-    """Segment 8192 + chunk 8192 at max_model_len 65536: the window is 16,384 tokens, as
-    before. The cap is now the operator's segment choice, not a whitelist."""
+    """The old largest segment + one chunk at max_model_len 65536: the window is segment +
+    chunk tokens, as before. The cap is now the operator's segment choice, not a
+    whitelist."""
     monkeypatch.setenv(KNOB, "1")
     line = _long_line(65536)
-    line["neuron_config"] = dict(line["neuron_config"], kv_segment_size_buckets=[8192])
+    line["neuron_config"] = dict(line["neuron_config"],
+                                 kv_segment_size_buckets=[OLD_SEGMENT_MAX])
     _serve(served_model_dir, line)
-    assert NeuronPlatform._admission.window.tokens == 16384
+    assert NeuronPlatform._admission.window.tokens == OLD_SEGMENT_MAX + CHUNK
