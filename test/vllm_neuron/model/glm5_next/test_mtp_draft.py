@@ -84,9 +84,13 @@ MAX_SEQ_LEN = 48
 INDEX_HEAD_DIM = 128
 TINY_VOCAB = 64
 
-#: The bypass-regime fixture: a context the selection keeps whole.
+#: The bypass-regime fixture: a context the selection keeps whole (``max_seq_len`` at
+#: the bypass bound, 11 at ``index_topk`` 8 / ``index_kpool`` 4). The dense decode
+#: kernel that regime attends with takes whole 128-row windows, so its latent bank is
+#: one such window (32 pages of 4) however short the model length.
 SHORT_PREFILL_TOKENS = 5
 SHORT_MAX_SEQ_LEN = 11
+DENSE_WINDOW_ROWS = 128
 
 TINY_GEOMETRY: dict[str, int] = {
     "hidden_size": ROUTED_HIDDEN_SIZE,
@@ -334,11 +338,16 @@ def _build_head(cfg, weights: dict, seed: int):
     return head
 
 
-def _caches(cfg, rows: int):
-    """One cache set for ``rows`` positions. Each side gets its own; all three are written in place."""
+def _caches(cfg, rows: int, *, window_rows: int | None = None):
+    """One cache set for ``rows`` positions. Each side gets its own; all three are written in place.
+
+    The latent bank is paged, so its rows round up to whole pages (and to ``window_rows``
+    when given: the bypass regime's dense kernel wants a 128-row window); the pooled
+    store keeps its trash row past ``rows // POOL_SIZE``."""
+    slots = max(-(-rows // PAGE_SIZE) * PAGE_SIZE, int(window_rows or 0))
     return {
-        "pool_cache": torch.zeros(rows // POOL_SIZE + 4, int(cfg.index_head_dim), dtype=torch.bfloat16),
-        "latent_cache": torch.zeros(rows, 1, TINY_HEAD_SIZE, dtype=torch.bfloat16),
+        "pool_cache": torch.zeros(slots // POOL_SIZE + 4, int(cfg.index_head_dim), dtype=torch.bfloat16),
+        "latent_cache": torch.zeros(slots, 1, TINY_HEAD_SIZE, dtype=torch.bfloat16),
         "tail": torch.zeros(2, int(cfg.index_kpool), int(cfg.index_head_dim), dtype=torch.bfloat16),
     }
 
@@ -454,8 +463,18 @@ class _Reference:
         self.twin.forward(x, **block_kwargs)
 
     def chain(self, caches: dict, hidden_row, sampled_id, position: int, k: int, *,
+              follow: tuple[torch.Tensor, list] | None = None,
               wrong_token_at: int | None = None, feed_prenorm: bool = False) -> list[dict]:
-        """``k`` reference iterations from ``position``, each on the twin's own state."""
+        """``k`` reference iterations from ``position``, each on the twin's own state.
+
+        ``follow=(tokens [1, k], hiddens)`` teacher-forces the chain on the head's own
+        outputs: iteration ``i + 1`` consumes the head's iteration-``i`` token and normed
+        hidden rather than this reference's. The indexer's top-k is discrete, and the
+        kernel MoE half and the torch oracle differ by bf16 ulps, so a free-running
+        reference and the head part ways the first time a near-tied pool flips (seed
+        63423, iteration 1: pools {1, 2} against {1, 5}); fed the same inputs the two
+        attention halves are bit-equal and the comparison reads the arithmetic.
+        """
         previous, token = hidden_row, sampled_id.reshape(1)
         out = []
         for i in range(k):
@@ -465,17 +484,24 @@ class _Reference:
                 self.embed(token), previous, torch.tensor([position + i], dtype=torch.int32),
                 _decode_kwargs(caches, position + i),
             )
-            token = logits.argmax(dim=-1).to(torch.int32)
+            own = logits.argmax(dim=-1).to(torch.int32)
             sorted_logits = logits.sort(dim=-1, descending=True).values
             margin = float(sorted_logits[0, 0] - sorted_logits[0, 1])
             span = float(logits.max() - logits.min())
-            out.append({"token": token, "hidden": hidden, "logits": logits,
+            out.append({"token": own, "hidden": hidden, "logits": logits,
                         "margin_share": margin / span if span else 0.0})
-            previous = prenorm if feed_prenorm else hidden
+            if follow is None:
+                token, previous = own, hidden
+            else:
+                token = follow[0][:, i].reshape(1).to(torch.int32)
+                previous = follow[1][i]
+            if feed_prenorm:
+                previous = prenorm
         return out
 
 
-def _fixture(seed: int, *, prefill: int = PREFILL_TOKENS, max_seq_len: int = MAX_SEQ_LEN, **overrides):
+def _fixture(seed: int, *, prefill: int = PREFILL_TOKENS, max_seq_len: int = MAX_SEQ_LEN,
+             window_rows: int | None = None, **overrides):
     """Head and reference from one seed, both sides prefilled over ``prefill`` positions
     through their own ``populate``: positions ``t`` consume ``h_t`` and ``x_{t+1}``."""
     cfg = _tiny_text_config(**overrides)
@@ -486,7 +512,8 @@ def _fixture(seed: int, *, prefill: int = PREFILL_TOKENS, max_seq_len: int = MAX
     gen = torch.Generator().manual_seed(seed + 17)
     hidden = torch.randn(prefill + DRAFT_K + 2, int(cfg.hidden_size), generator=gen).to(torch.bfloat16)
     ids = torch.randint(0, int(cfg.vocab_size), (prefill + DRAFT_K + 3,), generator=gen, dtype=torch.int32)
-    caches = {"impl": _caches(cfg, max_seq_len), "ref": _caches(cfg, max_seq_len)}
+    caches = {"impl": _caches(cfg, max_seq_len, window_rows=window_rows),
+              "ref": _caches(cfg, max_seq_len, window_rows=window_rows)}
     positions = torch.arange(prefill, dtype=torch.int32)
     head.populate(hidden[:prefill], ids[1:prefill + 1], positions, quant_config=_quant_config(),
                   **_prefill_kwargs(caches["impl"], prefill))
@@ -639,13 +666,15 @@ def test_mtp_parameter_names_are_the_trees_declared_leaves_without_mhc() -> None
 
 
 # --------------------------------------------------------------------------- #
-# populate: the pinned shift and the position-zero mask, over three rows.
+# populate: the pinned shift and the position-zero mask, over one pool of rows.
 
 
 def test_populate_consumes_h_t_with_embed_x_t_plus_1_and_masks_position_zero() -> None:
-    """Three rows: ``populate(h[0:3], x[1:4], [0, 1, 2])`` leaves the state the
+    """One pool of rows: ``populate(h[0:4], x[1:5], [0, 1, 2, 3])`` leaves the state the
     reference leaves for ``(h_t, embed(x_{t+1}))`` with position 0's embedding zeroed.
-    Two mutant references -- unshifted ids, and no mask -- both leave a different state."""
+    Two mutant references -- unshifted ids, and no mask -- both leave a different state.
+    Four rows and not three because the production indexer refuses a prefill chunk
+    shorter than a pool (``index_kpool`` 4): "no pool can complete in 3 token(s)"."""
     _skip_unless_live()
     cfg = _tiny_text_config()
     weights = _head_weights(cfg)
@@ -653,7 +682,7 @@ def test_populate_consumes_h_t_with_embed_x_t_plus_1_and_masks_position_zero() -
     twin, routed, shared = _build_twin_block(cfg, 63_301)
     ref = _Reference(cfg, weights, twin, routed, shared)
     gen = torch.Generator().manual_seed(63_311)
-    tokens = 3
+    tokens = POOL_SIZE
     hidden = torch.randn(tokens, int(cfg.hidden_size), generator=gen).to(torch.bfloat16)
     ids = torch.randint(0, int(cfg.vocab_size), (tokens + 1,), generator=gen, dtype=torch.int32)
     assert not torch.equal(ids[:tokens], ids[1:tokens + 1]), "the shift must move the ids"
@@ -697,21 +726,25 @@ def test_populate_consumes_h_t_with_embed_x_t_plus_1_and_masks_position_zero() -
 def test_a_k5_draft_matches_the_full_layer_reference_at_every_iteration() -> None:
     """Iteration ``i + 1`` consumes iteration ``i``'s token and its shared-head-normed
     hidden state at position ``p + i + 1``; attention and MoE halves on every iteration.
-    The flag is off so the reference's per-iteration indexer is the exact draft."""
+    The flag is off so the reference's per-iteration indexer is the exact draft. The
+    reference is teacher-forced on the head's own outputs (``_Reference.chain``), and
+    the two mutants below show the comparison moves when the wrong token or the
+    pre-norm hidden is fed, so the chain is pinned by what the head hands itself."""
     _skip_unless_live()
-    fx = _fixture(63_401, index_share_for_mtp_iteration=False)
+    fx = _fixture(63_430, index_share_for_mtp_iteration=False)
     p = fx["prefill"]
-    expected = _reference_chain(fx, p, DRAFT_K)
+    collected: list = []
+    got = _draft(fx, p, DRAFT_K, collector=collected)
+    _k_tokens_per_request(got, 1, DRAFT_K, "k=5")
+    assert len(collected) == DRAFT_K, f"one normed hidden per iteration, got {len(collected)}"
+    follow = (got, collected)
+    expected = _reference_chain(fx, p, DRAFT_K, follow=follow)
     margins = [e["margin_share"] for e in expected]
     assert min(margins) >= MIN_MARGIN_SHARE, (
         f"the reference's top-1/top-2 margins {margins} are too thin for a token "
         f"comparison to read anything; pick another seed"
     )
-    collected: list = []
-    got = _draft(fx, p, DRAFT_K, collector=collected)
-    _k_tokens_per_request(got, 1, DRAFT_K, "k=5")
     want = torch.cat([e["token"] for e in expected]).reshape(1, DRAFT_K)
-    assert len(collected) == DRAFT_K, f"one normed hidden per iteration, got {len(collected)}"
     for i, e in enumerate(expected):
         torch.testing.assert_close(collected[i].to(torch.float32), e["hidden"].to(torch.float32),
                                    rtol=HIDDEN_RTOL, atol=HIDDEN_ATOL,
@@ -721,8 +754,8 @@ def test_a_k5_draft_matches_the_full_layer_reference_at_every_iteration() -> Non
     # Controls: a reference that re-feeds the sampled token at iteration 1, and one that
     # feeds the pre-norm hidden, both leave the comparison.
     for label, kw in (("wrong token", {"wrong_token_at": 1}), ("pre-norm hidden", {"feed_prenorm": True})):
-        fx_m = _fixture(63_401, index_share_for_mtp_iteration=False)
-        mutant = _reference_chain(fx_m, p, DRAFT_K, **kw)
+        fx_m = _fixture(63_430, index_share_for_mtp_iteration=False)
+        mutant = _reference_chain(fx_m, p, DRAFT_K, follow=follow, **kw)
         moved = any(
             not torch.allclose(m["hidden"].float(), e["hidden"].float(), rtol=HIDDEN_RTOL, atol=HIDDEN_ATOL)
             for m, e in zip(mutant[1:], expected[1:])
@@ -735,7 +768,7 @@ def test_a_k5_draft_matches_the_full_layer_reference_at_every_iteration() -> Non
     torch.testing.assert_close(impl["latent_cache"][:p + 1].float(), ref["latent_cache"][:p + 1].float(),
                                rtol=HIDDEN_RTOL, atol=HIDDEN_ATOL)
     assert bool(impl["latent_cache"][p + 1:p + DRAFT_K].abs().sum() > 0), "draft rows were written"
-    one = _fixture(63_401, index_share_for_mtp_iteration=False)
+    one = _fixture(63_430, index_share_for_mtp_iteration=False)
     one_step = _draft(one, p, 1)
     assert torch.equal(one_step[0, 0], got[0, 0])
     assert torch.equal(impl["tail"], one["caches"]["impl"]["tail"]), (
@@ -785,7 +818,9 @@ def test_two_requests_draft_as_two_independent_one_request_drafts() -> None:
     cfg = _tiny_text_config(index_share_for_mtp_iteration=False)
     weights = _head_weights(cfg)
     head = _build_head(cfg, weights, 63_601)
-    lengths = (PREFILL_TOKENS, PREFILL_TOKENS - 6)
+    # Both at least 8 complete pools (the top-k select kernel's ``max8`` floor), in
+    # different pool phases (35 % 4 == 3, 33 % 4 == 1).
+    lengths = (PREFILL_TOKENS, PREFILL_TOKENS - 2)
     pages = MAX_SEQ_LEN // PAGE_SIZE
     bank = torch.zeros(2 * MAX_SEQ_LEN, 1, TINY_HEAD_SIZE, dtype=torch.bfloat16)
     pools = [torch.zeros(MAX_SEQ_LEN // POOL_SIZE + 4, INDEX_HEAD_DIM, dtype=torch.bfloat16) for _ in range(2)]
@@ -914,7 +949,7 @@ def test_index_share_skips_the_indexer_only_when_set_and_selecting(regime, flag,
         fx = _fixture(64_001, index_share_for_mtp_iteration=flag)
     else:
         fx = _fixture(64_002, prefill=SHORT_PREFILL_TOKENS, max_seq_len=SHORT_MAX_SEQ_LEN,
-                      index_share_for_mtp_iteration=flag)
+                      window_rows=DENSE_WINDOW_ROWS, index_share_for_mtp_iteration=flag)
     cfg = fx["cfg"]
     window = int(fx["caches"]["impl"]["latent_cache"].shape[0])
     bound = selection_bound(fx["max_seq_len"], window)

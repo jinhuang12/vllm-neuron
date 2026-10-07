@@ -110,7 +110,7 @@ def _reference(rows: torch.Tensor, head: torch.Tensor) -> torch.Tensor:
 def test_every_rank_recovers_the_global_greedy_token(batch: int) -> None:
     rows, head = _rows(7_101 + batch, batch), _head(7_002)
     want = _reference(rows, head)
-    assert int(want.min()) >= SHARD_ROWS, (
+    assert bool((want >= SHARD_ROWS).any()), (
         "the reference's tokens all sit in shard 0, where a local argmax is already "
         "global; this seed cannot tell the two apart"
     )
