@@ -101,11 +101,13 @@ def _count_operand_inputs(kwargs: dict) -> dict:
     """Distinct tensor leaves of the translated kwargs, the backend's dedup key."""
     seen = set()
     total = 0
+    strided = 0  # leaves the Neuron executor would refuse (non-contiguous inputs)
     per_key: dict[str, int] = {}
     for key, value in kwargs.items():
         before = len(seen)
         for leaf in _tensor_leaves(value):
             total += 1
+            strided += 0 if leaf.is_contiguous() else 1
             seen.add(
                 (
                     id(leaf.untyped_storage()),
@@ -123,6 +125,7 @@ def _count_operand_inputs(kwargs: dict) -> dict:
         families[family] = families.get(family, 0) + sum(1 for _ in _tensor_leaves(carrier))
     return {
         "operand_inputs": len(seen),
+        "operand_inputs_noncontiguous": strided,
         "tensor_leaves": total,
         "distinct_by_key": per_key,
         "carrier_leaves_by_family": families,

@@ -5637,6 +5637,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             scratch_slot,
             slot_tensor,
             sparse_bank_slots,
+            strided_bank_problem,
         )
 
         name = bank["name"]
@@ -5772,7 +5773,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             if slots_key not in operands:
                 operands[slots_key] = slot_tensor(slots, device)
             # The whole banks: the layer gathers its rows by slot and writes them back
-            # onto the bank itself, which the backend keeps as an aliased output.
+            # onto the bank itself, which the backend keeps as an aliased output. A
+            # whole bank must be a contiguous slice of its storage (the executor
+            # refuses a strided one after the compile); refused here by name.
+            for key in ("pool_cache", "tail"):
+                problem = strided_bank_problem(
+                    side[key], name=f"KV layer '{name}'s indexer {key}"
+                )
+                if problem is not None:
+                    raise ValueError(problem)
             carrier["pool_cache"] = side["pool_cache"]
             carrier["tail"] = side["tail"]
             carrier["state_slots"] = operands[slots_key]
@@ -5861,7 +5870,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 layers' row masks: an unmasked padding row would decay and update the
                 state with a row that carries no token.
         """
-        from vllm_neuron.vllm.worker.glm5next_state_banks import bank_form, slot_tensor
+        from vllm_neuron.vllm.worker.glm5next_state_banks import (
+            bank_form,
+            slot_tensor,
+            strided_bank_problem,
+        )
 
         if len(banks) != len(side_caches) or len(banks) != len(geometries):
             raise ValueError(
@@ -6012,6 +6025,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     # back onto the bank itself (``functional.state_banks``), which the
                     # backend keeps as a whole-bank aliased output. A padding row names
                     # the idle slot the runner chose and is handed back unchanged.
+                    # A whole bank must be a contiguous slice of its storage, or the
+                    # executor refuses it after the compile; refused here by name.
+                    for key in ("conv_state", "recurrent_state"):
+                        problem = strided_bank_problem(
+                            bank[key], name=f"KV layer '{bank['name']}'s {key}"
+                        )
+                        if problem is not None:
+                            raise ValueError(problem)
                     slots_key = ("slots", device, tuple(int(one) for one in state_slots))
                     if slots_key not in linear_step_operands:
                         linear_step_operands[slots_key] = slot_tensor(state_slots, device)
@@ -10501,6 +10522,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 _dtype_views[key] = view
             return view
 
+        from vllm_neuron.vllm.worker.glm5next_state_banks import state_bank_regions
+
         # Build KV caches per group
         kv_caches = {}
         for group in kv_cache_config.kv_cache_groups:
@@ -10626,44 +10649,30 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
                     num_slots = raw_tensor.numel() // slot_bytes
 
-                    # Both states live side by side inside each slot, so each
-                    # state is a slot-strided view of the same raw buffer: the
-                    # slot stride is the whole slot and the within-slot
-                    # strides are contiguous for that state's own shape.
-                    # ``strict=True`` because upstream pairs the two carriers
-                    # with a non-strict zip, so a short ``dtypes`` tuple would
-                    # silently under-allocate the slot.
-                    state_tensors = []
-                    state_offset_bytes = 0
-                    for shape, dtype in zip(
-                        kv_cache_spec.shapes, kv_cache_spec.dtypes, strict=True
-                    ):
-                        dtype_size = dtype.itemsize
-                        # The slot must be a whole number of this state's
-                        # elements, or the slot stride below would truncate.
-                        assert slot_bytes % dtype_size == 0
-                        target_shape = (num_slots, *shape)
-                        # Contiguous strides for the target shape, read off a
-                        # meta tensor: correct by construction and allocating
-                        # no storage for a reading used only as arithmetic.
-                        contiguous = torch.empty(target_shape, device="meta").stride()
-                        assert state_offset_bytes % dtype_size == 0
-                        state_tensors.append(
-                            torch.as_strided(
-                                _shared_dtype_view(raw_tensor, dtype),
-                                size=target_shape,
-                                stride=(
-                                    slot_bytes // dtype_size,
-                                    *contiguous[1:],
-                                ),
-                                storage_offset=state_offset_bytes // dtype_size,
-                            )
-                        )
-                        # Advance by this state's own per-slot footprint, so the
-                        # next carrier starts where this one ends inside a slot.
-                        state_offset_bytes += contiguous[0] * dtype_size
-
-                    kv_caches[layer_name] = state_tensors
+                    # Each state is one contiguous ``[num_slots, *shape]`` bank
+                    # over the same raw buffer, the banks one after another
+                    # (``glm5next_state_banks.state_bank_regions``). Not a
+                    # slot-strided view with both states side by side in every
+                    # slot: the bank form hands a whole bank to the decode graph
+                    # and the Neuron executor refuses a non-contiguous input
+                    # ("Detected non-contiguous slicing for requested Device
+                    # Tensor"); one row ``bank[slot]`` is contiguous in both
+                    # layouts, so the view form is unchanged. The buffer is the
+                    # same ``num_slots * slot_bytes``, so the footprint the worker
+                    # budgets is unchanged. ``strict=True`` inside, because
+                    # upstream pairs the two carriers with a non-strict zip, so a
+                    # short ``dtypes`` tuple would silently under-allocate the slot.
+                    kv_caches[layer_name] = state_bank_regions(
+                        raw_tensor,
+                        kv_cache_spec.shapes,
+                        kv_cache_spec.dtypes,
+                        slot_bytes=slot_bytes,
+                        dtype_view=_shared_dtype_view,
+                    )
+                    assert len(kv_caches[layer_name]) == len(kv_cache_spec.shapes)
+                    assert all(
+                        int(bank.shape[0]) == num_slots for bank in kv_caches[layer_name]
+                    )
                     # Not registered in ``_kv_cache_full_tensors``: that dict
                     # feeds the KV-transfer connector's (2, num_blocks, ...) K/V
                     # view, and a recurrent state has no K/V pair.
