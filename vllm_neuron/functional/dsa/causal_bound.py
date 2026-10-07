@@ -32,7 +32,7 @@ import nki.language as nl
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
-from vllm_neuron.utils.neuron_utils import can_run_kernel
+from vllm_neuron.utils.neuron_utils import SBUF_BYTES_PER_PARTITION, can_run_kernel
 
 logger = logging.getLogger(__name__)
 
@@ -85,13 +85,30 @@ arithmetic read one number.
 """
 
 
-COLUMN_TILE = 4096
-"""Candidate columns one bound tile holds: 16 KiB of fp32 scores per partition.
+_BOUND_BYTES_PER_COLUMN = 5 * 4 + 1
+"""SBUF bytes per partition that one candidate column of a bound column tile takes: the score
+tile and the ``ramp``, ``end``, ``room`` and ``fill`` helpers in fp32, and the ``bounded``
+predicate in uint8."""
 
-The bound keeps a score tile and five helper tiles of the same width live per row tile, so
-a whole candidate row in SBUF stops neuronx-cc from width 32,768 on (a 131,072-token
-context at pool 4). A width up to this one is one column tile: the instructions the kernel
-ran before the column axis was tiled, with the per-row length loaded first.
+_BOUND_TILES_IN_FLIGHT = 2
+"""Column tiles whose SBUF tiles fit at once. Two, so the unrolled column loop can load one tile
+while it bounds the one before it."""
+
+
+def _largest_power_of_two_at_most(n: int) -> int:
+    return 1 << (int(n).bit_length() - 1)
+
+
+COLUMN_TILE = _largest_power_of_two_at_most(
+    SBUF_BYTES_PER_PARTITION // (_BOUND_TILES_IN_FLIGHT * _BOUND_BYTES_PER_COLUMN))
+"""Candidate columns one bound tile holds: the largest power of two whose
+:data:`_BOUND_TILES_IN_FLIGHT` column tiles of :data:`_BOUND_BYTES_PER_COLUMN` bytes per column
+fit ``SBUF_BYTES_PER_PARTITION`` (4,096 on trn2). A power of two, so a power-of-two candidate
+width splits into whole tiles.
+
+A whole candidate row in SBUF stops neuronx-cc from width 32,768 on (a 131,072-token context at
+pool 4). A width up to this one is one column tile: the instructions the kernel ran before the
+column axis was tiled, with the per-row length loaded first.
 """
 
 

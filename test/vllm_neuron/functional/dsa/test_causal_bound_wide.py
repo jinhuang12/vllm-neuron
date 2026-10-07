@@ -7,8 +7,8 @@ helper tiles in SBUF per row tile, so neuronx-cc refused it from width 32,768 (c
 column tiles of :data:`causal_bound.COLUMN_TILE`. Two claims are checked here, on the
 simulator:
 
-* the result equals b17526a's kernel bit for bit at the widths it served (512 to
-  16,384), the reference being b17526a's own file loaded from git;
+* the result equals the untiled kernel bit for bit at the widths it served (512 to
+  16,384), the reference being the last untiled commit's own file loaded from git;
 * past them it equals the torch oracle exactly (a kept column carries the loaded bits,
   a bounded one holds ``BOUND_FILL``), with lengths that end inside every column tile.
 """
@@ -16,6 +16,8 @@ simulator:
 from __future__ import annotations
 
 import importlib.util
+import inspect
+import re
 import subprocess
 import sys
 import tempfile
@@ -25,21 +27,29 @@ import pytest
 import torch
 
 from vllm_neuron.functional.dsa import causal_bound as CB
-from vllm_neuron.utils.neuron_utils import can_run_kernel
+from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
+from vllm_neuron.utils.neuron_utils import SBUF_BYTES_PER_PARTITION, can_run_kernel
 
-BASE_COMMIT = "b17526a"
-POOL = 4
+#: The last commit whose bound holds a whole candidate row: the bit-equality reference.
+UNTILED_COMMIT = "b17526a"
+#: Tokens per candidate pool, GLM-5.3-Flash's.
+POOL = Glm5NextTextConfig().index_kpool
+#: The widest candidate row the untiled kernel built (context 65,536 at pool 4,
+#: ``test_dsa_wide_cpu_compile.py``).
+UNTILED_WIDTH_MAX = 16384
 
 
 def _load_base_module():
     root = Path(CB.__file__).resolve().parents[3]
-    source = subprocess.run(
+    shown = subprocess.run(
         ["git", "-C", str(root), "show",
-         f"{BASE_COMMIT}:vllm_neuron/functional/dsa/causal_bound.py"],
-        check=True, capture_output=True).stdout
-    path = Path(tempfile.mkdtemp(prefix="causal_bound_base_")) / "causal_bound_b17526a.py"
-    path.write_bytes(source)
-    spec = importlib.util.spec_from_file_location("causal_bound_b17526a", path)
+         f"{UNTILED_COMMIT}:vllm_neuron/functional/dsa/causal_bound.py"],
+        capture_output=True)
+    if shown.returncode != 0:
+        pytest.skip(f"commit {UNTILED_COMMIT} is not in this checkout")
+    path = Path(tempfile.mkdtemp(prefix="causal_bound_untiled_")) / "causal_bound_untiled.py"
+    path.write_bytes(shown.stdout)
+    spec = importlib.util.spec_from_file_location("causal_bound_untiled", path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -72,9 +82,24 @@ def _case(rows: int, width: int, seed: int):
     return scores, lengths.to(torch.int32).reshape(rows, 1)
 
 
+def test_the_column_tile_is_the_largest_power_of_two_that_fits_twice():
+    tile = CB.COLUMN_TILE
+    assert tile & (tile - 1) == 0
+    per_tile = CB._BOUND_BYTES_PER_COLUMN * CB._BOUND_TILES_IN_FLIGHT
+    assert tile * per_tile <= SBUF_BYTES_PER_PARTITION < 2 * tile * per_tile
+
+
+def test_the_bytes_per_column_are_the_kernels_column_tiles():
+    """The kernel source allocates the tiles `_BOUND_BYTES_PER_COLUMN` counts."""
+    source = inspect.getsource(CB._causal_bound_nki.func)   # the traced Python function
+    itemsize = {"float32": 4, "uint8": 1}
+    tiles = re.findall(r"nl\.ndarray\(\(height, cw\), dtype=nl\.(\w+), buffer=nl\.sbuf\)", source)
+    assert sum(itemsize[t] for t in tiles) == CB._BOUND_BYTES_PER_COLUMN
+
+
 @pytest.mark.parametrize("rows", [1, 130])
-@pytest.mark.parametrize("width", [512, 2048, 8192, 16384])
-def test_column_tiles_equal_b17526a_bit_for_bit(base, rows, width):
+@pytest.mark.parametrize("width", [512, 2048, 8192, UNTILED_WIDTH_MAX])
+def test_column_tiles_equal_the_untiled_kernel_bit_for_bit(base, rows, width):
     scores, lengths = _case(rows, width, seed=width + rows)
     want = base.dsa_causal_bound(scores, lengths, POOL)
     got = CB.dsa_causal_bound(scores, lengths, POOL)
@@ -83,7 +108,7 @@ def test_column_tiles_equal_b17526a_bit_for_bit(base, rows, width):
 
 
 @pytest.mark.parametrize("rows", [1, 130])
-@pytest.mark.parametrize("width", [16385, 32768, 65536])
+@pytest.mark.parametrize("width", [UNTILED_WIDTH_MAX + 1, 2 * UNTILED_WIDTH_MAX, 4 * UNTILED_WIDTH_MAX])
 def test_column_tiles_match_the_oracle_past_the_old_width(rows, width):
     scores, lengths = _case(rows, width, seed=3 * width + rows)
     got = CB.dsa_causal_bound(scores, lengths, POOL)
