@@ -25,6 +25,10 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
+from vllm_neuron.model.glm5_next.collective_policy import (
+    RowParallelSite,
+    reduce_row_parallel,
+)
 from vllm_neuron.model.glm5_next.config import (
     DSA_LAYER_TYPE,
     KDA_LAYER_TYPE,
@@ -3826,14 +3830,14 @@ class Glm5NextKDAAttention(nn.Module):
             self.o_proj_weight.to(torch.float32).t()
         )
         # ``o_proj_weight`` is row-parallel, so this is one rank's partial sum.
-        # Reduce it in fp32, before the cast below: partials add at the width they
-        # were computed in, and reducing after the cast would round each rank's
-        # fraction to the caller's dtype and add the rounded parts instead of
-        # rounding the whole. In place is safe -- ``attn_out`` is a fresh matmul
-        # result, not a view of a cached weight or of the caller's residual.
-        group = _resolve_tp_group()
-        if group is not None:
-            group.all_reduce(attn_out)
+        # Reduce it before the cast below, in the wire dtype ``collective_policy``
+        # names: fp32 as built, where partials add at the width they were computed
+        # in; ``VLLM_NEURON_TP_ALLREDUCE_DTYPE=bf16`` rounds each rank's partial to
+        # bfloat16 first, to halve the bytes. In place is safe -- ``attn_out`` is a
+        # fresh matmul result, not a view of a cached weight or of the residual.
+        attn_out = reduce_row_parallel(
+            attn_out, site=RowParallelSite.KDA_O_PROJ, group=_resolve_tp_group()
+        )
         return attn_out.to(hidden_states.dtype)
 
 
@@ -6279,7 +6283,9 @@ class Glm5NextMLAAttention(nn.Module):
         aliasing here because ``mla_projection`` returns a fresh tensor rather than a
         view of a cached weight. And the sum happens before the cast back to the
         input dtype, because rounding each rank's fraction to bfloat16 first and
-        adding after would round the parts instead of the whole.
+        adding after would round the parts instead of the whole. That holds at the
+        default fp32 wire; ``VLLM_NEURON_TP_ALLREDUCE_DTYPE=bf16`` makes the trade on
+        purpose, for half the bytes (``collective_policy``).
         """
         from vllm_neuron.functional.attention.mla_projections import (
             mla_projection_prepared,
@@ -6305,11 +6311,12 @@ class Glm5NextMLAAttention(nn.Module):
             # through its argument, so a tap holding ``projected`` would come back
             # holding the sum instead of this rank's share.
             collector += [x.to(torch.float32), projected.clone()]
-        # Sum this rank's partial with every other rank's. ``None`` means one
-        # rank, where the partial already is the whole sum.
-        group = _resolve_tp_group()
-        if group is not None:
-            group.all_reduce(projected)
+        # Sum this rank's partial with every other rank's, in the wire dtype
+        # ``collective_policy`` names (fp32 as built). ``None`` means one rank, where
+        # the partial already is the whole sum.
+        projected = reduce_row_parallel(
+            projected, site=RowParallelSite.MLA_O_PROJ, group=_resolve_tp_group()
+        )
         whole = projected.to(attn_out.dtype)
         if collector is not None:
             collector.append(whole)
@@ -7473,9 +7480,13 @@ class Glm5NextModel(nn.Module):
         # In place is safe against aliasing for the same reason it is at
         # ``project_output``: both branches return a freshly allocated tensor, so
         # neither is a view of a cached weight or of the residual the caller holds.
-        group = _resolve_tp_group()
-        if group is not None:
-            group.all_reduce(out)
+        #
+        # The wire dtype is ``collective_policy``'s: fp32 as built (the ordering
+        # above holds), or bfloat16 under ``VLLM_NEURON_TP_ALLREDUCE_DTYPE=bf16``,
+        # which rounds each rank's partial before the sum to halve the bytes.
+        out = reduce_row_parallel(
+            out, site=RowParallelSite.FFN, group=_resolve_tp_group()
+        )
         mixed = out.to(hidden_states.dtype)
         if collector is not None:
             collector.append(mixed)

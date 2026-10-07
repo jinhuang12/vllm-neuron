@@ -76,6 +76,11 @@ if TYPE_CHECKING:
     # Build the GLM-5.3-Flash step's attention metadata on the host only: no per-step
     # block-table / slot-mapping uploads that its graph never reads.
     VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA: bool = False
+    # GLM-5.3-Flash row-parallel all-reduce. Both defaults are the as-built path.
+    # The dtype a row-parallel partial crosses the wire in: "fp32" or "bf16".
+    VLLM_NEURON_TP_ALLREDUCE_DTYPE: str = "fp32"
+    # Keep every all-reduce one collective instead of the compiler's 8 MiB tiles.
+    VLLM_NEURON_TP_ALLREDUCE_FUSE: bool = False
 
 
 def maybe_convert_bool(value: str | None) -> bool | None:
@@ -344,6 +349,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA"))
         or False
+    ),
+    # ================== GLM-5.3-Flash Row-Parallel All-Reduce ==================
+    # The wire dtype of the tensor-parallel all-reduce at GLM-5.3-Flash's
+    # row-parallel sites (``model/glm5_next/collective_policy.py``). "fp32" (the
+    # default) reduces each rank's fp32 partial as computed; "bf16" rounds it to
+    # bfloat16 first, which halves the bytes every rank moves. Case and spaces are
+    # ignored; any other value is refused where it is read.
+    "VLLM_NEURON_TP_ALLREDUCE_DTYPE": lambda: (
+        os.getenv("VLLM_NEURON_TP_ALLREDUCE_DTYPE", "fp32").strip().lower()
+    ),
+    # "1" asks neuronx-cc to keep each all-reduce one collective. By default its
+    # SimpleAllReduceTiling pass splits an all-reduce larger than 8 MiB into up to
+    # four. Read by ``collective_policy.fuse_compiler_args``. Off by default.
+    "VLLM_NEURON_TP_ALLREDUCE_FUSE": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_TP_ALLREDUCE_FUSE")) or False
     ),
 }
 

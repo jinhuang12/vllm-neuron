@@ -1550,6 +1550,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # resulting multiple back-edges without this flag.
             "--internal-backend-options=--enable-verifier=false --enable-nested-dynamic-loop",
         ]
+        # The row-parallel all-reduce policy's compiler flag: with
+        # VLLM_NEURON_TP_ALLREDUCE_FUSE=1, neuronx-cc keeps each all-reduce one
+        # collective instead of splitting it into 8 MiB tiles. Unset, nothing is added.
+        from vllm_neuron.model.glm5_next.collective_policy import fuse_compiler_args
+
+        self.compile_options["compiler_args"] += fuse_compiler_args()
         logger.info(
             "neuronx-cc optlevel -O%s (from vLLM optimization_level)",
             self.vllm_config.optimization_level.value,
