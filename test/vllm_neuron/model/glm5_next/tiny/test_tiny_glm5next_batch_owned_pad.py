@@ -62,6 +62,7 @@ def test_a_padding_row_on_an_owned_unscheduled_slot_leaves_that_slots_kda_state_
     monkeypatch,
 ):
     monkeypatch.setattr(kda, "MAX_NUM_SEQS", BUCKET)
+    monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_STATE_BANKS", "0")  # this test pins the per-request VIEW form
     world = kda._world(BUCKET)
     table = world.runner._glm5next_request_slot_table
     assert sorted(table.values()) == list(range(BUCKET)), table
@@ -126,7 +127,8 @@ def test_a_padding_row_on_an_owned_unscheduled_slot_leaves_that_slots_kda_state_
                                rtol=kda.OUT_RTOL, atol=kda.OUT_ATOL)
 
 
-def test_a_padding_row_on_an_owned_unscheduled_slot_leaves_that_requests_dsa_state_unchanged():
+def test_a_padding_row_on_an_owned_unscheduled_slot_leaves_that_requests_dsa_state_unchanged(monkeypatch):
+    monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_STATE_BANKS", "0")  # this test pins the per-request VIEW form
     max_model_len = tiny.STACK_TOKENS + 8
     world = batch._world(BUCKET, max_model_len=max_model_len, prompts=[6, 9, 11, 7],
                          window_blocks=-(-max_model_len // batch.PAGE), slots=BUCKET)
