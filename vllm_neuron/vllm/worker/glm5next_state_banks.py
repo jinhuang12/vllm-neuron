@@ -32,6 +32,22 @@ write lands where no request reads, so a request that holds a slot but is not sc
 this step keeps its ring. The two families therefore get two slot tensors, built as two
 uploads even when equal, so the graph's signature does not depend on whether the step
 is padded.
+
+Emptying a slot (:func:`empty_slot`). A side-cache slot outlives its owner, so the
+runner empties it when it hands the slot to a new request and when a request opens at
+position 0. The write is one slot, in place, as a ``copy_`` from a host tensor of zeros:
+on the Neuron device ``copy_`` is the backend's native ``_copy_from`` (an NRT write into
+the slot's contiguous slice of the bank), while ``zero_``, ``fill_``, ``index_fill_`` and
+``index_put_`` take the backend's CPU fallback, whose write-back refuses a tensor with
+shared storage ("Can't call ReserveSpace on shared storage"). It runs on the host
+before the step's carriers are built, outside any captured graph, on the same tensor the
+carriers hand the layers (a view of it or, in the bank form, the bank itself).
+
+The backend's host-to-device ``_copy_from`` does not wait for an execution still writing
+the bank; its device-to-host copy does (``NeuronTensorImpl::Await`` on the storage's
+pending execution). A slot freed by a request whose last, asynchronously scheduled step
+is still running is written by that step, so the write is preceded by a one-element read
+of the slot, which orders it after that step as the whole-bank read of a rebuild did.
 """
 
 from __future__ import annotations
@@ -45,6 +61,7 @@ __all__ = [
     "SCRATCH_SLOTS",
     "STATE_BANKS_ENV",
     "bank_form",
+    "empty_slot",
     "scratch_slot",
     "slot_tensor",
     "sparse_bank_slots",
@@ -174,3 +191,26 @@ def sparse_bank_slots(state_slots, *, real_requests: int, scratch: int) -> list[
     """The sparse family's slots for a step: the real requests' own, then the scratch slot."""
     slots = [int(slot) for slot in state_slots]
     return slots[: int(real_requests)] + [int(scratch)] * (len(slots) - int(real_requests))
+
+
+#: One host tensor of zeros per (slot shape, dtype), read by every :func:`empty_slot`.
+_HOST_ZEROS: dict[tuple, torch.Tensor] = {}
+
+
+def empty_slot(bank: torch.Tensor, slot: int) -> None:
+    """Zero ``bank[slot]`` in place; every other slot of ``bank`` is left as it is.
+
+    The fresh-slot contract is ``torch.zeros``' bytes (``+0.0``) in every element of the
+    slot. Only that slot's bytes move (``bank[0].nbytes``), where a rebuild of the bank
+    would read and write all of it.
+    """
+    row = bank[int(slot)]
+    if not row.is_meta:
+        # The ordering read (module docstring): 2 bytes, after any step writing this
+        # bank. A capture on ``meta`` has no values and no step to wait for.
+        row.reshape(-1)[:1].to("cpu", copy=True)
+    key = (tuple(row.shape), row.dtype)
+    zeros = _HOST_ZEROS.get(key)
+    if zeros is None:
+        zeros = _HOST_ZEROS[key] = torch.zeros(key[0], dtype=row.dtype)
+    row.copy_(zeros)

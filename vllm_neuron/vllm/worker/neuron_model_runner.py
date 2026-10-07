@@ -5463,29 +5463,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             self._glm5next_finished_request_ids = noted
         noted.update(finished_req_ids or ())
 
-    @staticmethod
-    def _glm5next_emptied_at_slot(held: torch.Tensor, slot: int) -> torch.Tensor:
-        """Return a copy of ``held`` with row ``slot`` zeroed and every other row unchanged.
-
-        A copy rather than an in-place zero: every cache tensor here is a view of one
-        allocation, and the eager Neuron backend refuses an in-place write on shared
-        storage ("Can't call ReserveSpace on shared storage"). The mask is built on
-        the host and moved once, and the caller replaces its entry with the result
-        before the carriers are built. Only one row is emptied so a concurrent
-        request's row is untouched; a select (not a product) keeps a stale non-finite
-        value from surviving.
-
-        The recurrent and convolution states are instead zeroed where they are read,
-        since their reader is handed the position. The indexer's ring is consumed
-        inside kernels that get neither the position nor a per-request predicate, so
-        its freshness has to be a rebuilt input.
-        """
-        keep = torch.ones(
-            (int(held.shape[0]),) + (1,) * (held.dim() - 1), dtype=torch.bool
-        )
-        keep[int(slot)] = False
-        return torch.where(keep.to(held.device), held, torch.zeros_like(held))
-
     def _glm5next_request_slots(
         self, banks, request_ids, *, synthetic: bool, side_caches=None
     ):
@@ -5506,6 +5483,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         bucket) takes that many distinct slots, slots no request owns first, so the
         captured graph sees the disjoint per-request views a served batch hands it.
         """
+        from vllm_neuron.vllm.worker.glm5next_state_banks import empty_slot
+
         # A synthetic step takes slot 0 and no claim; the capacity bound is read
         # only where a claim is about to be taken.
         if synthetic:
@@ -5550,13 +5529,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # convolution history and the recurrent state.
             # The indexer's two caches are runner-allocated and their readers take
             # no position, so they are emptied here, together (a half-fresh slot
-            # would pool the previous owner's ring members) and by rebuild rather
-            # than in place, for the reason ``_glm5next_emptied_at_slot`` gives.
+            # would pool the previous owner's ring members): this slot only, in
+            # place, by a host copy (``glm5next_state_banks.empty_slot``).
             for side in side_caches or ():
                 if not side:
                     continue
                 for key in ("pool_cache", "tail"):
-                    side[key] = self._glm5next_emptied_at_slot(side[key], free)
+                    empty_slot(side[key], free)
             positions.pop(free, None)
             table[request_id] = free
         return [table[request_id] for request_id in request_ids]
@@ -6675,8 +6654,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # A fresh sequence must not inherit the previous owner's partial pool:
             # the side caches live for the process and every real token stashes
             # into the ring, so its next completion would pool stale members. Only
-            # this request's row is emptied, by rebuild rather than in place (see
-            # ``_glm5next_emptied_at_slot``).
+            # this request's row is emptied, in place (``empty_slot``).
             # The pooled store is left alone: the candidate gather is bounded by
             # ``max_seq_len`` and every complete pool below that bound is written by
             # this prefill, so a stale row above it is unreachable.
@@ -6691,9 +6669,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # The sparse family's single cursor is cleared with them, for the same
             # reason.
             self._glm5next_side_cache_cursor = None
+            from vllm_neuron.vllm.worker.glm5next_state_banks import empty_slot
+
             for side in side_caches:
                 if "tail" in side:
-                    side["tail"] = self._glm5next_emptied_at_slot(side["tail"], slot)
+                    empty_slot(side["tail"], slot)
         else:
             # Every other step must continue the sequence the ring already holds.
             # The ring is keyed by absolute position and carries no sequence
