@@ -1,16 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""neuronx-cc builds the DSA indexer kernels whose width grows with the context.
+"""neuronx-cc builds the kernels whose SBUF tiles grow with the context or the chunk.
 
 The simulator runs a kernel body as numpy and never checks SBUF capacity or the
 backend verifier, and the front-end compile stops before the allocator. This test
 runs the whole compile (Dynamo -> HLO -> neuronx-cc -> NEFF) on the CPU
 (``NEURON_LIBTORCH_CPU_COMPILE=1``) for the two kernels whose SBUF tiles scale with
 the candidate count C = max_model_len / 4, at the widths a 64k, 256k and 1M context
-gives them:
+gives them, and for the MoE router, whose SBUF tile scales with the prefill chunk:
 
 * ``_causal_bound_nki`` at ``[8192, C]`` (one 8192-token prefill chunk), C in
   {16384, 32768, 65536};
-* ``dsa_decode_scores_kernel`` at C in {65536 (B=4, two programs), 262144 (B=1)}.
+* ``dsa_decode_scores_kernel`` at C in {65536 (B=4, two programs), 262144 (B=1)};
+* ``noaux_tc_rmsnorm_router_topk`` at an 8192-token chunk, H 4096, E 288 (b17526a's
+  single launch needs 524,288 B per partition there and neuronx-cc refuses it).
 
 The child stops before the executor is built (``build_executable`` is replaced), so it
 never opens the Neuron runtime or a device node. A NEFF on disk is the pass.
@@ -38,6 +40,7 @@ CASES = (
     ("causal_bound", 8192, 65536, 1),
     ("decode_scores", 4, 65536, 2),
     ("decode_scores", 1, 262144, 1),
+    ("router", 8192, 4096, 2),
 )
 
 
@@ -66,6 +69,17 @@ def _child(kind: str, rows: int, width: int, grid: int) -> None:
         args = (torch.empty((rows, width), dtype=f32, device=meta),
                 torch.empty((rows, 1), dtype=i32, device=meta))
         module = CB.__file__
+    elif kind == "router":
+        from vllm_neuron.functional.moe import router as R
+
+        def fn(hidden, gamma, weights, bias):
+            return R.noaux_tc_rmsnorm_router_topk(hidden, gamma, weights, bias, top_k=8)
+
+        args = (torch.empty((1, rows, width), dtype=bf, device=meta),
+                torch.empty((width,), dtype=bf, device=meta),
+                torch.empty((width, 288), dtype=bf, device=meta),
+                torch.empty((288,), dtype=f32, device=meta))
+        module = R.__file__
     else:
         from vllm_neuron.functional.dsa import decode_batch as DB
 

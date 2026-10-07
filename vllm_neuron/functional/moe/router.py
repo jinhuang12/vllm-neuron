@@ -901,6 +901,15 @@ _NOAUX_TC_F_MAX = 512
 #: Token multiple for the fused two-core launch: a whole 128-row tile per core.
 _NOAUX_TC_T_MULTIPLE = 256
 
+#: Most tokens one fused-router launch takes; a longer prefill chunk runs as several
+#: launches. The kernel holds the RMSNorm output of every token of a launch in SBUF
+#: (`norm_sb`, `[128, T, H / 128]` bf16, `T * H / 64` B per partition): at H 4096 a
+#: launch of 8192 tokens needs 524,288 B of the 229,376 B a partition has, and
+#: neuronx-cc refuses it (NCC_IGCA037). 2048 tokens need 131,072 B. 2048 is also the
+#: bound nkilib's own router gate keeps (`_can_use_kernel`, NKILIB-618). A whole
+#: multiple of `_NOAUX_TC_T_MULTIPLE`, so every launch splits into two 128-row cores.
+NOAUX_TC_TOKEN_TILE = 2048
+
 _NOAUX_TC_TORCH_TO_NKI_DTYPE = {
     torch.bfloat16: nl.bfloat16,
     torch.float16: nl.float16,
@@ -1428,16 +1437,33 @@ def noaux_tc_rmsnorm_router_topk(
     # `[2]` is the SPMD launch grid: the nkilib subkernels shard over two logical
     # cores (LNC=2).
     wrapped = wrap_nki(_noaux_tc_rmsnorm_router_topk_nki)
-    logits, index, affinities, substrate_index = wrapped[2](
-        hidden_states=hidden_padded,
-        gamma=gamma,
-        router_weights=router_weights,
-        correction_bias=bias,
-        eps=eps,
-        norm_topk_prob=norm_topk_prob,
-        routed_scaling_factor=float(routed_scaling_factor),
-        router_mm_dtype=_NOAUX_TC_TORCH_TO_NKI_DTYPE[router_mm_dtype],
-    )
+
+    def launch(rows: Tensor):
+        return wrapped[2](
+            hidden_states=rows,
+            gamma=gamma,
+            router_weights=router_weights,
+            correction_bias=bias,
+            eps=eps,
+            norm_topk_prob=norm_topk_prob,
+            routed_scaling_factor=float(routed_scaling_factor),
+            router_mm_dtype=_NOAUX_TC_TORCH_TO_NKI_DTYPE[router_mm_dtype],
+        )
+
+    # A chunk above NOAUX_TC_TOKEN_TILE runs as one launch per tile (the RMSNorm
+    # output of a launch must fit SBUF). No stage reduces across tokens, so the
+    # tiles' rows are the rows one launch would give. Every tile is a whole
+    # multiple of 256, as `t_pad` and the tile are.
+    if t_pad <= NOAUX_TC_TOKEN_TILE:
+        logits, index, affinities, substrate_index = launch(hidden_padded)
+    else:
+        tiles = [
+            launch(hidden_padded[:, start:start + NOAUX_TC_TOKEN_TILE].contiguous())
+            for start in range(0, t_pad, NOAUX_TC_TOKEN_TILE)
+        ]
+        logits, index, affinities, substrate_index = (
+            torch.cat(parts, dim=0) for parts in zip(*tiles)
+        )
     # All four outputs are `[t_pad, ...]`; slice every one back to the caller's
     # extent.
     return (
