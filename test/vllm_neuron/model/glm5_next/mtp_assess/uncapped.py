@@ -171,11 +171,40 @@ def mla_us(C: int, T: int, variant: str) -> float:
     return v["fixed_us"] + T * v["per_row_per_1k_us"] * rows_read / 1024.0
 
 
-def delta_verify_ms(C: int, T: int, variant: str, **kw) -> dict:
+# Whole-layer cross-check (reports/indexer_micro.json, round 1, indexer tree = the tip's DSA layer code; the
+# same "one layer's decode step" unit as dsa_micro.json): one DSA layer in the SELECTED regime at B=1 takes
+# 671.4 us at 4k and 711.2 us at 8k (B=4 939.8, B=16 2141.2 at 8k); the BYPASS layer at 1k B=1 takes 286.64 us
+# (dsa_micro.json, the number projection.py's attention half rests on). Composing the tip chain and MLA above
+# gives 615 us at 8k B=1, so the selected regime carries a residual neither kernel benchmark accounts for
+# (selected-row gather set-up, index glue between the chain and the MLA). It is applied per DSA layer call at
+# C > 2051, for both variants (dsa8k and mla replaced the chain and the MLA kernel, not this glue).
+LAYER_SELECTED_8K_B1_TIP_US = 711.2
+LAYER_BYPASS_1K_B1_TIP_US = 286.64
+LAYER_SELECTED_8K_B4_TIP_US = 939.8
+
+
+def selected_residual_us() -> float:
+    composed = (LAYER_BYPASS_1K_B1_TIP_US - indexer_us(1024, 1, "tip") - mla_us(1024, 1, "tip")
+                + indexer_us(8192, 1, "tip") + mla_us(8192, 1, "tip"))
+    return LAYER_SELECTED_8K_B1_TIP_US - composed
+
+
+def residual_us(C: int, T: int, mode: str) -> float:
+    """``none`` | ``flat`` (one residual per layer call, the default) | ``per_row`` (one per query row: the
+    sensitivity case; indexer_micro's selected layer grows 76 us per extra row at 8k against the 41 us the
+    chain slope + MLA rows compose, so part of the residual may be per row)."""
+    if C <= INDEXER_BYPASS_MAX_CTX or mode == "none":
+        return 0.0
+    return selected_residual_us() * (T if mode == "per_row" else 1)
+
+
+def delta_verify_ms(C: int, T: int, variant: str, residual: str = "flat", **kw) -> dict:
     """Extra device time of the T-row attention half at context C over the same T rows at 1k."""
     di = indexer_us(C, T, variant, **kw) - indexer_us(1024, T, variant, **kw)
     dm = mla_us(C, T, variant) - mla_us(1024, T, variant)
-    return {"indexer_ms": 11 * di / 1000.0, "mla_ms": 11 * dm / 1000.0, "total_ms": 11 * (di + dm) / 1000.0}
+    dr = residual_us(C, T, residual)
+    return {"indexer_ms": 11 * di / 1000.0, "mla_ms": 11 * dm / 1000.0, "residual_ms": 11 * dr / 1000.0,
+            "total_ms": 11 * (di + dm + dr) / 1000.0}
 
 
 def main() -> None:
@@ -189,11 +218,17 @@ def main() -> None:
     ap.add_argument("--no-index-share", action="store_true",
                     help="draft iterations 1..k-1 re-run the indexer (upstream shares iteration 0's top-k)")
     ap.add_argument("--select-flat-in-ctx", action="store_true", help="32k lower bound: top-k select held flat in C")
+    ap.add_argument("--residual", choices=("none", "flat", "per_row"), default="flat",
+                    help="selected-regime residual (indexer_micro whole-layer minus composed kernels, %.1f us/layer)" % 0
+                    if False else "selected-regime residual per DSA layer call at C > 2051: none | flat (default) | per_row (sensitivity)")
     ap.add_argument("--output", type=Path, required=True)
     args = ap.parse_args()
     sel_kw = {"select_scales_with_ctx": not args.select_flat_in_ctx}
 
-    out: dict = {"inputs": vars(args) | {"output": str(args.output)}, "kvseg_check": check_against_kvseg_points()}
+    out: dict = {"inputs": vars(args) | {"output": str(args.output), "selected_residual_us_per_layer": round(selected_residual_us(), 1),
+                                         "indexer_micro_anchors_us": {"selected_8k_b1": LAYER_SELECTED_8K_B1_TIP_US, "selected_8k_b4": LAYER_SELECTED_8K_B4_TIP_US,
+                                                                      "bypass_1k_b1": LAYER_BYPASS_1K_B1_TIP_US}},
+                 "kvseg_check": check_against_kvseg_points()}
     assert all(p["pool_match"] and p["total_match"] for p in out["kvseg_check"]), out["kvseg_check"]
 
     # ---- (a) feasibility ------------------------------------------------------------------
@@ -240,7 +275,8 @@ def main() -> None:
                 anchors.append({"variant": variant, "ctx": C, "T": T,
                                 "indexer_us_per_layer": round(indexer_us(C, T, variant, **sel_kw), 1),
                                 "mla_us_per_layer": round(mla_us(C, T, variant), 1),
-                                "delta_vs_1k_ms_per_step": round(delta_verify_ms(C, T, variant, **sel_kw)["total_ms"], 3)})
+                                "residual_us_per_layer": round(residual_us(C, T, args.residual), 1),
+                                "delta_vs_1k_ms_per_step": round(delta_verify_ms(C, T, variant, args.residual, **sel_kw)["total_ms"], 3)})
     out["context_anchors"] = anchors
 
     ii_1 = P.verify_bound_ii(1)["step_ms"]
@@ -249,16 +285,17 @@ def main() -> None:
     break_even = {}
     for variant in ("after", "tip"):
         for C in args.ctxs:
-            base_itl = P.ITL_TODAY_MS + delta_verify_ms(C, 1, variant, **sel_kw)["total_ms"]
+            base_itl = P.ITL_TODAY_MS + delta_verify_ms(C, 1, variant, args.residual, **sel_kw)["total_ms"]
             for k in args.ks:
                 T = k + 1
                 bii = P.verify_bound_ii(T)
                 verify_1k = P.ITL_TODAY_MS * (bii["step_ms"] + kda_count * kda_b1 * k / 1000.0) / ii_1
-                dv = delta_verify_ms(C, T, variant, **sel_kw)
+                dv = delta_verify_ms(C, T, variant, args.residual, **sel_kw)
                 verify = verify_1k + dv["total_ms"]
                 d_mla = (mla_us(C, 1, variant) - mla_us(1024, 1, variant)) * k
                 d_idx = (indexer_us(C, 1, variant, **sel_kw) - indexer_us(1024, 1, variant, **sel_kw)) * (k if args.no_index_share else 1)
-                draft = (k * args.draft_us + args.draft_fixed_us + d_mla + d_idx) / 1000.0
+                d_res = residual_us(C, 1, args.residual) * k          # the MTP layer is a DSA layer: one residual per iteration
+                draft = (k * args.draft_us + args.draft_fixed_us + d_mla + d_idx + d_res) / 1000.0
                 num = draft + verify + args.verify_overhead_us / 1000.0
                 for alpha in args.alphas:
                     n = P.expected_accepted(k, alpha)
@@ -286,6 +323,7 @@ def main() -> None:
 
     # ---- print ------------------------------------------------------------------------------
     print("kvseg points reproduced:", all(p["pool_match"] and p["total_match"] for p in out["kvseg_check"]))
+    print(f"selected-regime residual: {selected_residual_us():.1f} us per DSA layer call at C > 2051 (mode {args.residual})")
     print("\n(a) KV need per rank, TP=64, incl. k=5 slots + KDA rollback snapshot")
     for r in feas:
         if r.get("largest_bs"):
@@ -297,7 +335,7 @@ def main() -> None:
     print(f"  absent --max-num-seqs -> {d['max_num_seqs']} slots at 1M: side caches {d['side_cache_gib']} GiB, pool {d['pool_gib']} GiB")
     print("\n(b) attention half per DSA layer, us (indexer / sparse MLA) and the per-step extra over 1k, ms")
     for a in anchors:
-        print(f"  {a['variant']:5s} ctx {a['ctx']:>6d} T={a['T']}  idx {a['indexer_us_per_layer']:>7.1f}  mla {a['mla_us_per_layer']:>6.1f}  +{a['delta_vs_1k_ms_per_step']:>6.3f} ms/step")
+        print(f"  {a['variant']:5s} ctx {a['ctx']:>6d} T={a['T']}  idx {a['indexer_us_per_layer']:>7.1f}  mla {a['mla_us_per_layer']:>6.1f}  res {a['residual_us_per_layer']:>6.1f}  +{a['delta_vs_1k_ms_per_step']:>6.3f} ms/step")
     print("\n(b) ITL projection, pessimistic bound, vs the baseline ITL at the same context")
     print("variant ctx     k  alpha  N      base   draft  verify  ITL_eff  x")
     for r in rows:
