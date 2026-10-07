@@ -1,4 +1,5 @@
 {
+ "about": "GLM-5.3-Flash KV state lists with the shadow-draft knob off, recorded on the tree named by base_commit, before the MTP draft layer's state existed: per serve line (bs1: 4k, one sequence; bs64: 64 x 8k) the get_kv_spec list, the runner's KV specs, vLLM's KV config, the banks, the side-cache shapes and, per warmup leg, every leaf the runner hands the root forward (path, kind, shape, dtype, stride, offset, contiguity, sha256 of operands up to 1 MiB) and each layer's carrier structure; plus the worker's KV need and footprint at TP=64. test_mtp_state_runner.py checks the knob-off tree against it. Regenerate from a checkout of base_commit: NKI_SIMULATOR=1 VLLM_NEURON_CPU_MODE=1 PYTHONPATH=$PWD python test/vllm_neuron/worker/test_mtp_state_runner.py --record <this file> --commit <sha>.",
  "base_commit": "82bee3b",
  "footprint": {
   "bs1": {
@@ -88458,6 +88459,5 @@
    ]
   }
  },
- "tree": "/home/ubuntu/glm53f-wt2/mtp-state",
  "tree_head": "82bee3b0dab9100fd4464e1413d3e62817886a1d"
 }

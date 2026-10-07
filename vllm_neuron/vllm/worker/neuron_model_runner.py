@@ -5389,7 +5389,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         besides its latent cache. ``get_kv_spec`` reports neither, because a
         ``LayerSpec`` carries one ``num_kv_heads``/``head_size``/``dtype`` triple and
         both of these have the indexer's width, ``index_head_dim``, so the cache
-        manager never sees them and the runner allocates them here.
+        manager never sees them and the runner allocates them here. One set per
+        sparse bank ``bind_kv_cache`` kept, the draft head's layer included when the
+        root built the head; every other bank gets an empty mapping, so the list
+        pairs with the banks positionally.
 
         Both carry a leading request-slot axis because each holds one sequence's
         indexer state; sharing them across requests lets a second request read the
@@ -5918,11 +5921,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         active_mla_query_rows: int | None = None,
         padded_requests: int = 0,
     ) -> list[dict]:
-        """Build one kwargs mapping per layer, in stack order, holding that layer's own state.
+        """Build one kwargs mapping per layer, in spec order, holding that layer's own state.
 
         ``Glm5NextModel.forward`` splats these and refuses a count that disagrees with
         the stack, so this walks the banks ``bind_kv_cache`` kept (the spec's layer
-        order) and never names a layer.
+        order) and never names a layer. When the root built the draft head, its one
+        decoder layer's bank follows the stack's, so its mapping is the last one, built
+        by the same family branch as a trunk layer's; the root hands the stack the
+        others and the head that one.
 
         A sparse-attention (DSA) layer takes ``latent_cache``, ``pool_cache``,
         ``seq_lens``, ``start_position``, ``softmax_scale``, ``max_seq_len``,

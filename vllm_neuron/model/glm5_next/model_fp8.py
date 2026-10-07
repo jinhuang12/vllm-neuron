@@ -9170,7 +9170,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
     # ── KV cache management ──────────────────────────────────────────────
 
     def get_kv_spec(self) -> KVSpec:
-        """One ``LayerSpec`` per layer of the hybrid stack, in layer order.
+        """One ``LayerSpec`` per cache-holding layer: the stack's, then the draft head's.
 
         Field mapping and naming follow the other model families; the construction
         path does not, because that precedent reads instantiated submodules and this
@@ -9199,33 +9199,42 @@ class Glm5NextForConditionalGeneration(nn.Module):
         positionally, so a partial set would shorten the reported page. One ``getattr``
         per field against one attribute-carrying class satisfies that by construction.
 
-        The MTP draft layer. When the shadow draft is on (``mtp.shadow_draft_k() > 0``,
-        contract C1) one more entry follows the stack: ``layers.45.self_attn``, the
-        checkpoint's layer 45 (``num_hidden_layers``, one past the stack), which is a
-        sparse-attention layer and keeps a trunk DSA layer's state. Its geometry is the
-        stack's last DSA layer's (43), because it is the same layer class built from
-        the same config, so the entry is that layer's with the name changed. Being an
-        identical ``MLAAttentionSpec``, vLLM puts it in the trunk's latent group, so it
-        pages through the trunk's block table; the runner walks the bank list, so its
-        side caches and its carrier (list index 45) follow from ``bind_kv_cache``. Off
-        (the default) the list is the stack's alone, exactly as before.
+        The draft layer. When the root built the multi-token-prediction head
+        (``self.mtp``, built when the shadow-draft knob is above 0), the head's decoder
+        block holds state exactly as a stack layer does, so the same loop reads its
+        attention and its entry follows the stack, named for the index the checkpoint
+        gives it, ``num_hidden_layers + num_nextn_predict_layers - 1``
+        (``layers.45.self_attn`` on GLM-5.3-Flash). That block is a sparse-attention
+        layer built from the same config as the stack's, so its page is the trunk DSA
+        page -- ``[blocks, num_kv_heads_per_rank, block_size, head_size]`` in
+        ``cache_dtype``, one latent buffer -- and vLLM groups it with the trunk's DSA
+        layers, so it pages through their block table. The head holds one decoder
+        layer: a config that places its last draft layer anywhere else is refused by
+        name. Without the head the list is the stack's alone.
+
+        Raises:
+            ValueError: the draft head's decoder layer does not sit at the index the
+                config gives the last draft layer.
         """
-        from dataclasses import replace
+        from .mtp import BLOCK_ATTR
 
-        from vllm_neuron.model.glm5_next import mtp
-
-        # Contract C1: ``mtp.shadow_draft_k()``. Until it lands the knob's variable is
-        # read here directly, as the root construction and forward stubs read it.
-        shadow_draft_k = getattr(mtp, "shadow_draft_k", None)
-        if shadow_draft_k is not None:
-            draft_on = int(shadow_draft_k()) > 0
-        else:
-            import os
-
-            raw = os.environ.get("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT", "").strip()
-            draft_on = bool(raw) and int(raw) > 0
+        blocks = list(enumerate(self.model.layers))
+        if self.mtp is not None:
+            first = int(self.text_config.num_hidden_layers)
+            count = int(self.text_config.num_nextn_predict_layers)
+            draft_index = first + count - 1
+            block = getattr(self.mtp, BLOCK_ATTR)
+            if block.layer_idx != draft_index:
+                raise ValueError(
+                    f"the draft head holds one decoder layer, at index "
+                    f"{block.layer_idx}, and the config places the last of its "
+                    f"{count} draft layer(s) at {draft_index} (num_hidden_layers "
+                    f"{first} + num_nextn_predict_layers {count} - 1); only one draft "
+                    f"layer, at num_hidden_layers, has KV state here"
+                )
+            blocks.append((draft_index, block))
         layers: list[LayerSpec] = []
-        for layer_idx, layer in enumerate(self.model.layers):
+        for layer_idx, layer in blocks:
             attention = layer.attention
             layers.append(
                 LayerSpec(
@@ -9249,19 +9258,6 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     ),
                     latent_kv=getattr(attention, "LATENT_KV_CACHE", False),
                 )
-            )
-        if draft_on:
-            trunk = [index for index, spec in enumerate(layers) if spec.latent_kv]
-            if not trunk:
-                raise ValueError(
-                    "the MTP draft layer is a sparse-attention layer and takes the "
-                    "stack's DSA geometry, and this stack holds no sparse-attention "
-                    "layer to take it from"
-                )
-            suffix = self.model.layers[trunk[-1]].attention.CACHE_NAME_SUFFIX
-            draft_index = int(self.text_config.num_hidden_layers)
-            layers.append(
-                replace(layers[trunk[-1]], name=f"layers.{draft_index}.{suffix}")
             )
         return KVSpec(layers=layers)
 
@@ -9307,14 +9303,15 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
         The layer modules are not read, only counted. Every geometry this method needs
         is already on the spec the model itself produced, so the loop walks the spec and
-        the stack length is checked against it.
+        the stack length, plus the draft head's one layer when the root built the head,
+        is checked against it.
 
-        The records land on ``glm5next_layer_banks``, in stack order, one mapping per
-        layer, then -- when the shadow draft is on -- the MTP draft layer's sparse
-        record at index 45, which the runner gives side caches and a carrier at list
-        index 45 exactly as it does layer 43 at index 43. The runner reads that
-        attribute and builds each layer's carrier from it;
-        nothing else in this tree reads it. A plain tuple of plain dicts is deliberate:
+        The records land on ``glm5next_layer_banks``, in spec order, one mapping per
+        layer: the stack's, then the draft head's (at position ``len(self.model.layers)``,
+        a sparse-family record like a trunk DSA layer's). The runner reads that
+        attribute and builds each layer's side caches and carrier from it, so the
+        draft layer's carrier is the last entry of ``layer_carriers``; nothing else in
+        this tree reads it. A plain tuple of plain dicts is deliberate:
         ``nn.Module.__setattr__`` leaves it alone, so ``_apply`` never walks these
         tensors and the runner stays their only owner.
 
@@ -9323,33 +9320,21 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 what ``initialize_kv_cache`` returns.
 
         Raises:
-            ValueError: the spec and the stack disagree on how many layers there are, a
-                layer's spec name is absent from ``kv_caches``, a bank's shape
-                disagrees with the spec that asked for it, a layer reports part of its
-                recurrent geometry, or a latent bank declares more than one KV head.
+            ValueError: the spec and the stack plus the draft head's layer disagree on
+                how many layers there are, a layer's spec name is absent from
+                ``kv_caches``, a bank's shape disagrees with the spec that asked for
+                it, a layer reports part of its recurrent geometry, or a latent bank
+                declares more than one KV head.
         """
-        from vllm_neuron.model.glm5_next import mtp
-
         spec_layers = self.get_kv_spec().layers
         stack = len(self.model.layers)
-        # The MTP draft layer's entry follows the stack when the shadow draft is on
-        # (``get_kv_spec``); its record lands at index ``stack`` (45), after the stack's.
-        # The knob is read as ``get_kv_spec`` reads it (C1, or its variable until then).
-        shadow_draft_k = getattr(mtp, "shadow_draft_k", None)
-        if shadow_draft_k is not None:
-            draft = 1 if int(shadow_draft_k()) > 0 else 0
-        else:
-            import os
-
-            raw = os.environ.get("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT", "").strip()
-            draft = 1 if raw and int(raw) > 0 else 0
+        draft = 0 if self.mtp is None else 1
         if len(spec_layers) != stack + draft:
             raise ValueError(
                 f"get_kv_spec reports {len(spec_layers)} layer(s) and the stack "
-                f"holds {stack}"
-                + (" plus the MTP draft layer" if draft else "")
-                + "; the carriers are paired positionally, so a "
-                f"disagreement here would hand a layer another layer's cache"
+                f"holds {stack} plus {draft} draft layer(s); the carriers are paired "
+                f"positionally, so a disagreement here would hand a layer another "
+                f"layer's cache"
             )
         banks: list[dict[str, object]] = []
         for layer_idx, layer_spec in enumerate(spec_layers):
