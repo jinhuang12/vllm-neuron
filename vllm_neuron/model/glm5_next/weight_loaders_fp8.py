@@ -334,12 +334,6 @@ MTP_LEAVES: tuple[tuple[str, str], ...] = (
     ("shared_head_norm_weight", "shared_head.norm.weight"),
 )
 
-#: How many draft layers the checkpoint ships (``num_nextn_predict_layers``).
-#: The text config drops that field, so the count is pinned here against the
-#: index: exactly one layer past the stack carries keys.
-NUM_MTP_LAYERS = 1
-
-
 def mtp_layer_indices_for(
     text_config: Glm5NextTextConfig, *, draft_k: int | None = None
 ) -> tuple[int, ...]:
@@ -348,13 +342,14 @@ def mtp_layer_indices_for(
     ``draft_k`` is the knob's value, read through the head's own
     :func:`~vllm_neuron.model.glm5_next.mtp.shadow_draft_k` -- the knob's one
     reader, contract C1 -- when not given. The indices start at ``len(layer_types)``,
-    the first index the stack does not use, and run for the draft-layer count.
+    the first index the stack does not use, and run for the checkpoint's own
+    ``num_nextn_predict_layers``.
     """
     k = shadow_draft_k() if draft_k is None else int(draft_k)
     if k <= 0:
         return ()
     start = len(list(text_config.layer_types or ()))
-    return tuple(range(start, start + NUM_MTP_LAYERS))
+    return tuple(range(start, start + int(text_config.num_nextn_predict_layers)))
 
 
 def build_weight_mappings(
