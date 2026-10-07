@@ -156,6 +156,11 @@ class NeuronPlatform(Platform):
     # server-level compile choice. Validate requests before they reach the
     # engine so a bad request returns a normal request error.
     _enable_structured_outputs: bool = False
+    # What this server refuses before a request reaches the engine: prompts past the
+    # prefill window, sampling knobs the on-device sampler cannot apply, logprobs it
+    # cannot return (vllm_neuron/vllm/admission.py). Set in check_and_update_config;
+    # None admits everything.
+    _admission = None
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
@@ -610,6 +615,15 @@ class NeuronPlatform(Platform):
 
         cls._resolve_sampling_from_the_model_class(vllm_config)
 
+        # After the sampling resolution above settles on_device_sampling_config and the
+        # hybrid block-size resolution publishes the KV page: both are policy inputs.
+        from vllm_neuron.vllm import admission
+
+        cls._admission = admission.policy_from_config(
+            vllm_config, block_size=cls.resolved_uniform_page(vllm_config)
+        )
+        admission.install_eager_validation()
+
         if envs.VLLM_NEURON_RUNTIME_INPUT_SNAPSHOT_ENABLE:
             # Capture copies a forward's inputs to host via a standalone op run
             # just before a plain execute. Under async scheduling the input
@@ -759,13 +773,18 @@ class NeuronPlatform(Platform):
         """Reject requests unsupported by the current Neuron server config.
 
         Called per-request before scheduling. Raises ValueError before model
-        execution so SO-off servers do not enter the SO mask path.
+        execution so SO-off servers do not enter the SO mask path, and so a prompt
+        past the prefill window or a sampling request the on-device sampler cannot
+        serve never reaches the engine (see ``vllm_neuron/vllm/admission.py``).
         """
         if (
             not cls._enable_structured_outputs
             and getattr(params, "structured_outputs", None) is not None
         ):
             raise ValueError(SO_DISABLED_MESSAGE)
+
+        if cls._admission is not None:
+            cls._admission.check(processed_inputs, params)
 
         if cls._max_embeds_per_image is None:
             return
