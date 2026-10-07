@@ -44,11 +44,6 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-#: Architectures whose runner reads a prefill chunk's KV through a block table of fixed
-#: width (``NeuronModelRunner._glm5next_model_kwargs``). Segmented prefill for the other
-#: families walks the prior KV one segment at a time and has no such window.
-WINDOWED_PREFILL_ARCHS = ("Glm5NextForConditionalGeneration",)
-
 #: Architectures whose on-device sampler returns token ids and no logits, under
 #: synchronous scheduling too (the GLM root hands its logits to ``sample_full_vocab``
 #: and returns only its int32 tokens).
@@ -155,7 +150,6 @@ def resolve_prefill_buckets(
 def prefill_window(
     neuron_config: Mapping[str, Any],
     *,
-    architectures,
     max_model_len: int,
     max_num_batched_tokens: int,
     block_size: int,
@@ -168,7 +162,12 @@ def prefill_window(
     ``max_model_len``, so only a window shorter than ``max_model_len`` is returned. With
     segmented prefill off the window is that whole table.
     """
-    if not any(arch in WINDOWED_PREFILL_ARCHS for arch in architectures or ()):
+    # Only a windowed-prefill model's runner reads a prefill chunk's KV through a block
+    # table of fixed width (``NeuronModelRunner._glm5next_model_kwargs``). Segmented
+    # prefill for the other families walks the prior KV one segment at a time and has no
+    # such window. The platform sets the flag from the model class's
+    # ``supports_windowed_prefill`` hook before it builds this policy.
+    if not neuron_config.get("_model_supports_windowed_prefill", False):
         return None
     try:
         segments, queries = resolve_prefill_buckets(
@@ -338,7 +337,6 @@ def policy_from_config(vllm_config, *, block_size: int) -> AdmissionPolicy:
 
     window = prefill_window(
         neuron_config,
-        architectures=architectures,
         max_model_len=model_config.max_model_len,
         max_num_batched_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
         block_size=block_size,

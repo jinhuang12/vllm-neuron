@@ -263,8 +263,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
     #: field is passed as ``windowed_prefill=`` to
     #: ``bucket_utils.resolve_segmented_prefill_config`` and
     #: ``bucket_utils.validate_kv_segment_size_buckets`` by the model runner and by
-    #: ``admission.resolve_prefill_buckets``. glm sets it: its prefill attention
-    #: gathers the window.
+    #: ``admission.resolve_prefill_buckets``, and ``admission.prefill_window`` refuses
+    #: prompts past the window only for such a model. glm sets it: its prefill
+    #: attention gathers the window.
     supports_windowed_prefill = True
 
     def __init__(

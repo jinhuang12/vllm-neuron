@@ -240,16 +240,23 @@ def test_single_shot_prefill_has_no_window(served_model_dir, monkeypatch):
     assert NeuronPlatform._admission.window is None
 
 
-def test_other_architectures_have_no_window():
-    """Only the GLM-5.3-Flash runner path reads a fixed window; segmented prefill for the
-    other families walks prior KV segment by segment."""
-    assert admission.prefill_window(
-        {"kv_segment_size_buckets": [1024], "num_batched_tokens_buckets": [1024]},
-        architectures=("LlamaForCausalLM",),
-        max_model_len=4096,
-        max_num_batched_tokens=1024,
+@pytest.mark.parametrize("windowed", [False, True])
+def test_only_a_windowed_prefill_model_has_a_window(windowed):
+    """Only a model whose runner reads a fixed window (``supports_windowed_prefill``,
+    GLM-5.3-Flash) has one; segmented prefill for the other families walks prior KV
+    segment by segment."""
+    segment = chunk = 1024
+    window = admission.prefill_window(
+        {"kv_segment_size_buckets": [segment], "num_batched_tokens_buckets": [chunk],
+         "_model_supports_windowed_prefill": windowed},
+        max_model_len=4 * (segment + chunk),
+        max_num_batched_tokens=chunk,
         block_size=SERVED_BLOCK,
-    ) is None
+    )
+    if windowed:
+        assert window.tokens == segment + chunk
+    else:
+        assert window is None
 
 
 @pytest.mark.parametrize(

@@ -208,7 +208,8 @@ class NeuronConfig:
     # Resolved by the platform from the model class's ``supports_windowed_prefill``
     # hook, as the flag above, and overwriting any caller value. Read by the model
     # runner and by ``admission.resolve_prefill_buckets``, which pass it as
-    # ``windowed_prefill=`` to the segment and chunk checks in ``bucket_utils``.
+    # ``windowed_prefill=`` to the segment and chunk checks in ``bucket_utils``, and by
+    # ``admission.prefill_window``, which gives only such a model a prompt window.
     _model_supports_windowed_prefill: bool = False
 
     @classmethod
