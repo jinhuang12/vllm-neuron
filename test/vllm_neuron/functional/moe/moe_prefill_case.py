@@ -225,3 +225,43 @@ def block_step(model, case, attn_out, streams, post_mix, comb_mix, expert_rank, 
             tp_degree=TP_PER_EP, expert_parallel_rank=expert_rank, **extra,
         ),
     )
+
+
+def block_step_tapped(model, case, attn_out, streams, post_mix, comb_mix, expert_rank,
+                      quant):
+    """:func:`block_step`, also returning what the router read and what it chose.
+
+    ``(streams_out, layer_input [T, H] bf16, router_logits [T, E] fp32,
+    expert_index [T, K])``: ``layer_input`` is the feed-forward site's collapse, the
+    rows ``route_tokens`` is handed. For accuracy checks only: the extra graph outputs
+    change what the compiler must materialise, so time :func:`block_step` instead.
+    """
+    layer, owner = case.layer, case.ffn_owner
+    streams = model._mhc_attention_site(layer, streams).mhc_post(
+        attn_out, streams, post_mix, comb_mix)
+    site = model._mhc_ffn_site(layer, streams)
+    collector: list = []
+    held: list = []
+
+    def sublayer(single):
+        held.append(single)
+        return model.Glm5NextModel._ffn_half(
+            owner, layer, single, quant_config=quant, block_size=None, moe_group=None,
+            tp_degree=TP_PER_EP, expert_parallel_rank=expert_rank, collector=collector,
+        )
+
+    out = site.forward(streams, sublayer)
+    return out, held[0], collector[1], collector[2]
+
+
+def exact_router(layer_input, gamma, router_weight, eps):
+    """fp64 router logits on ``layer_input`` with the fused kernel's two bf16 roundings.
+
+    ``bf16(bf16(x * rstd) * gamma) @ W`` with ``rstd`` and the GEMM in fp64: the router
+    8aa22fa's fused kernel defines, with no rounding of its own beyond those two.
+    """
+    x = layer_input.double()
+    rstd = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+    scaled = (x * rstd).to(torch.bfloat16).double()
+    normed = (scaled * gamma.double().reshape(1, -1)).to(torch.bfloat16).double()
+    return normed @ router_weight.double()

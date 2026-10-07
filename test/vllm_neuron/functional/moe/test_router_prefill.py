@@ -3,9 +3,10 @@
 
 Old side: 8aa22fa's prefill route, ``router.noaux_tc_rmsnorm_router_topk`` on the
 pre-norm activations (nkilib RMSNorm, nkilib router, noaux_tc stage, one kernel).
-New side: ``router_prefill.noaux_tc_router_prefill``: the same RMSNorm with the same
-two bf16 roundings, written in torch so it traces into XLA, then a kernel that runs
-the same nkilib router call and the same noaux_tc stage on the normalised rows.
+New side: ``router_prefill.noaux_tc_router_prefill``: the RMSNorm's scale and its first
+bf16 rounding, ``bf16(x * rstd)``, written in torch so it traces into XLA, then a kernel
+that applies the gain the way the fused kernel's norm stage does (its second rounding)
+and runs the same nkilib router call and the same noaux_tc stage.
 
 Declared tolerance. The only arithmetic that moved is the RMSNorm's fp32 sum of
 ``x**2`` (torch's order instead of the kernel's ``activation_reduce``) and its
@@ -148,21 +149,39 @@ def test_prefill_router_rows_are_independent():
     assert torch.equal(whole[0][:128], part[0])
 
 
-def test_router_norm_keeps_the_fused_kernels_two_roundings():
-    """``bf16(bf16(x * rstd) * gamma)``, the nkilib RMSNorm's order, not one rounding.
+def test_router_rms_scale_is_the_first_rounding_only():
+    """The XLA side stops at ``bf16(x * rstd)``; the gamma multiply is the kernel's.
 
-    The control is the fork's experts' norm (``Glm5NextModel._rms_norm``: one rounding).
-    It must differ on some elements here, or this test could not tell the two apart.
+    On the device neuronx-cc folds a ``bf16 -> fp32`` convert that follows an
+    ``fp32 -> bf16`` one, so a torch ``bf16(bf16(x * rstd) * gamma)`` runs there as one
+    rounding (``/tmp/w28/exp/exp9.py``: 99.99% of elements equal ``bf16(x * rstd *
+    gamma)``, 78% equal the two-rounding value). With nothing after the first rounding in
+    XLA there is no pair to fold, and the kernel's gamma multiply rounds the way the
+    fused kernel's norm stage does (same ``tensor_tensor`` on the same SBUF tile).
     """
-    x, gamma, _weights, _bias = realistic_router_inputs(256, layer=3, seed=5)
-    got = router_prefill.router_norm(x, gamma, EPS)
+    x, _gamma, _weights, _bias = realistic_router_inputs(256, layer=3, seed=5)
+    got = router_prefill.router_rms_scale(x, EPS)
     xf = x.float()
     rstd = torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + EPS)
-    want = ((xf * rstd).to(torch.bfloat16).float() * gamma.float()).to(torch.bfloat16)
-    one_rounding = (xf * rstd * gamma.float()).to(torch.bfloat16)
     assert got.dtype == torch.bfloat16 and got.shape == x.shape
-    assert torch.equal(got, want)
-    assert not torch.equal(want, one_rounding), "the control cannot fail"
+    assert torch.equal(got, (xf * rstd).to(torch.bfloat16))
+
+
+def test_round_to_bf16_grid_is_round_to_nearest_even():
+    """Veltkamp's split equals ``fp32 -> bf16 -> fp32`` on random values and exact ties.
+
+    The device folds that convert pair; the arithmetic form is what the router's scale
+    reads its rows through, so it must be the same rounding everywhere it is honoured.
+    """
+    gen = torch.Generator().manual_seed(3)
+    x = torch.randn(1 << 20, generator=gen) * torch.exp(3 * torch.randn(1 << 20, generator=gen))
+    ties = (torch.randn(1 << 18, generator=gen).to(torch.bfloat16).float()
+            .view(torch.int32) + 0x8000).view(torch.float32)
+    for values in (x, ties):
+        assert torch.equal(router_prefill.round_to_bf16_grid(values),
+                           values.to(torch.bfloat16).float())
+    on_grid = x.to(torch.bfloat16).float()
+    assert torch.equal(router_prefill.round_to_bf16_grid(on_grid), on_grid)
 
 
 @pytest.mark.parametrize("tokens", [1, DECODE_ROUTE_MAX_TOKENS])

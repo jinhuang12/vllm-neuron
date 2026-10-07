@@ -47,6 +47,12 @@ What is measured, per (T, variant):
    goal bounds; the block's total compiler-op ms and the window's instruction counts by
    opcode are reported too (the loop is ~4,000 fp32 ``MATMUL`` + ``LDWEIGHTS`` per pcore).
 
+3. Router accuracy (``--accuracy``, default on): a second graph per (T, collectives,
+   variant), ``moe_prefill_case.block_step_tapped``, returns the collapsed rows the
+   router read and its logits and index; on the host, both are compared with
+   ``moe_prefill_case.exact_router`` on those same rows (fp64, the fused kernel's two
+   bf16 roundings) and its noaux_tc selection. This graph is not timed.
+
 The compile cache is used (``NEURON_LIBTORCH_CACHE_ROOT``): its key ignores kernel
 bodies, so give it a fresh root after a kernel edit. Profiles are analysed by a second
 invocation (``--analyze-only``), off the device lease.
@@ -319,6 +325,60 @@ def build_variant(model, tokens: int, collectives: str, args):
     return graph, inputs, case
 
 
+def router_accuracy(model, tokens: int, collectives: str, args) -> dict:
+    """Device router logits and selection against the exact router on the same rows."""
+    import torch
+
+    from test.vllm_neuron.functional.moe import moe_prefill_case as case_lib
+    from test.vllm_neuron.functional.moe.decode_fixtures import index_sets_equal, tie_rows
+    from vllm_neuron.functional.moe.router import noaux_tc_correct_torch_oracle
+
+    torch.manual_seed(0)
+    case = case_lib.moe_layer(model, device=DEVICE)
+    ins = case_lib.block_inputs(case.cfg, tokens, device=DEVICE)
+    quant = case_lib.quant_config(model)
+    rank = torch.tensor(0, dtype=torch.int64, device=DEVICE)
+    resolve = model._resolve_tp_group
+
+    def step(attn_out, streams, post_mix, comb_mix, rank):
+        if collectives == "one-rank":
+            import torch.distributed as dist
+            from torch.distributed._functional_collectives import all_reduce
+
+            attn_out = all_reduce(attn_out.float(), "sum",
+                                  dist.group.WORLD).to(attn_out.dtype)
+            model._resolve_tp_group = _OneRankGroup
+        try:
+            return case_lib.block_step_tapped(model, case, attn_out, streams, post_mix,
+                                              comb_mix, rank, quant)
+        finally:
+            model._resolve_tp_group = resolve
+
+    graph = torch.compile(step, backend="neuron_libtorch", fullgraph=True, dynamic=False,
+                          options={"compiler_args": args.compiler_args})
+    _out, rows, logits, index = (t.cpu() for t in graph(
+        ins["attn_out"], ins["streams"], ins["post_mix"], ins["comb_mix"], rank))
+    bank = case.layer.mlp.experts
+    bias = bank.router_bias.detach().cpu().float()
+    exact = case_lib.exact_router(rows, case.layer.post_attention_layernorm_weight.detach().cpu(),
+                                  bank.router_weight.detach().cpu(), float(case.cfg.rms_norm_eps))
+    exact_index, _ = noaux_tc_correct_torch_oracle(
+        exact.float(), bias.unsqueeze(0), bool(case.cfg.norm_topk_prob),
+        float(case.cfg.routed_scaling_factor))
+    ties = tie_rows(exact.float(), bias, 1e-4)
+    other = ~index_sets_equal(index.long(), exact_index.long())
+    err = (logits.double() - exact).abs()
+    return {
+        "logits_rel_l2_vs_exact": float((logits.double() - exact).norm() / exact.norm()),
+        "logits_max_abs_err": float(err.max()),
+        "logits_mean_abs_err": float(err.mean()),
+        "rows_index_set_differs_from_exact": int(other.sum()),
+        "of_which_not_tie_rows": int((other & ~ties).sum()),
+        "exact_tie_rows_1e-4": int(ties.sum()),
+        "rows": int(tokens),
+    }
+
+
 def time_graphs(graphs: dict, inputs: dict, args) -> dict:
     from nrtpy._nrtpy import SystemTraceSession
 
@@ -444,6 +504,11 @@ def run_tokens(tokens: int, collectives: str, baseline, live, args) -> dict:
         "agreement": agreement(outputs["after"], outputs["before"]),
     }
     result["timing"] = time_graphs(graphs, inputs, args)
+    if args.accuracy:
+        result["router_accuracy"] = {}
+        for variant, model in variants.items():
+            torch._dynamo.reset()
+            result["router_accuracy"][variant] = router_accuracy(model, tokens, collectives, args)
     if args.profile_dir is not None and collectives in args.profile_collectives:
         result["profiles"] = {}
         for variant, graph in graphs.items():
@@ -464,6 +529,10 @@ def summarise(cases: list[dict]) -> dict:
             "block_p90_after_ms": t["after"]["device"]["p90_ms"],
             "block_iterations": t["after"]["device"]["iterations"],
         }
+        for variant, acc in case.get("router_accuracy", {}).items():
+            row[f"router_logits_rel_l2_vs_exact_{variant}"] = acc["logits_rel_l2_vs_exact"]
+            row[f"router_rows_other_set_vs_exact_{variant}"] = (
+                acc["rows_index_set_differs_from_exact"])
         profiles = case.get("profiles", {})
         if all("window_compiler_ops_ms" in profiles.get(v, {}) for v in ("before", "after")):
             b = profiles["before"]["window_compiler_ops_ms"]
@@ -512,6 +581,8 @@ def main() -> None:
     parser.add_argument("--no-profile", action="store_true")
     parser.add_argument("--explorer-data", type=Path,
                         default=Path("/home/ubuntu/glm53f-wt2/moe-prefill-profiles/explorer-data"))
+    parser.add_argument("--no-accuracy", dest="accuracy", action="store_false",
+                        help="skip the router-accuracy graphs")
     parser.add_argument("--analyze-only", action="store_true",
                         help="ingest and bucket the profiles --output names (no device)")
     parser.add_argument("--merge", action="store_true",
@@ -577,6 +648,7 @@ def main() -> None:
             args.output.write_text(json.dumps(report, indent=1) + "\n")
             print(json.dumps({"T": tokens, "collectives": collectives,
                               "agreement": case["agreement"],
+                              "router_accuracy": case.get("router_accuracy"),
                               "compile_s": case["compile_and_first_call_s"],
                               "median_ms": {v: case["timing"][v]["device"]["median_ms"]
                                             for v in ("before", "after")}}), flush=True)
