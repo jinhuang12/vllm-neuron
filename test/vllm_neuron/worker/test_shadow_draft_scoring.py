@@ -338,6 +338,41 @@ def test_shutdown_resolves_the_in_flight_step_scores_the_rest_and_closes_the_log
     assert len(_read_log(log)) == 3
 
 
+class _TornDownTensor(torch.Tensor):
+    """A device future whose runtime is gone: reading it back raises."""
+
+    def cpu(self):
+        raise RuntimeError("runtime closed")
+
+
+def test_shutdown_closes_the_log_even_when_the_queued_step_cannot_be_read_back(
+    monkeypatch, tmp_path, caplog
+):
+    """An abort mid-step reaches shutdown with a queued step whose device buffers are gone.
+    Reading them back raises; shutdown still retires every request over what did arrive,
+    closes the handle and drops the scorer, and says which step it lost."""
+    log = tmp_path / "shadow.jsonl"
+    monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT", "2")
+    monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG", str(log))
+    runner = _runner_shell(k=2, req_ids=["r"])
+    _observe_step(runner, ["r"], sampled=[10], drafts=[[11, 12]], starts=[8], counts=[1])
+    _observe_step(runner, ["r"], sampled=[11], drafts=[[12, 13]], starts=[9], counts=[1])
+    _observe_step(runner, ["r"], sampled=[12], drafts=[[13, 0]], starts=[10], counts=[1])
+    step_no, step, sampled, drafts = runner._glm5next_shadow_pending[-1]
+    torn = sampled.as_subclass(_TornDownTensor)
+    runner._glm5next_shadow_pending[-1] = (step_no, step, torn, drafts)
+    with caplog.at_level("WARNING"):
+        runner.ensure_kv_transfer_shutdown()
+    records = _read_log(log)
+    # Step 2's token never arrived: step 0 is scored over step 1's token only, step 1 over none.
+    assert [r["step"] for r in records] == [0, 1]
+    assert [r["scored"] for r in records] == [1, 0]
+    assert [r["accepted_prefix_len"] for r in records] == [1, 0]
+    assert runner._glm5next_shadow_log_handle.closed
+    assert runner._glm5next_shadow_scorer_instance is None
+    assert any("shadow draft" in rec.message and "step 2" in rec.message for rec in caplog.records)
+
+
 def test_the_log_is_written_by_rank_zero_only(monkeypatch, tmp_path):
     log = tmp_path / "shadow.jsonl"
     monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT", "2")

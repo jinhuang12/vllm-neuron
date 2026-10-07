@@ -11672,17 +11672,29 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         """Resolve the step still queued, retire every request, close the log.
 
         Reached from the runner's shutdown. The queued step's tensors are the last
-        device futures; by shutdown the device has finished them, so reading them back
-        blocks nothing. Every tracked request retires with its pending drafts scored
-        over the tokens that arrived (``scored`` < k for the tail), so no record is
-        lost. Idempotent: a second call finds no scorer and returns.
+        device futures; on an orderly shutdown the device has finished them, so reading
+        them back blocks nothing. After an abort mid-step the runtime may already be
+        gone and the read-back raises: that step is dropped with a warning naming it,
+        and the shutdown goes on, because a shutdown that raises leaves the log open
+        and every record still buffered unwritten. Every tracked request retires with
+        its pending drafts scored over the tokens that arrived (``scored`` < k for the
+        tail), so no record is lost. Idempotent: a second call finds no scorer and
+        returns.
         """
         scorer = getattr(self, "_glm5next_shadow_scorer_instance", None)
         if scorer is None:
             return
         pending = self.__dict__.setdefault("_glm5next_shadow_pending", [])
         while pending:
-            self._glm5next_shadow_resolve(pending.pop(0), scorer)
+            entry = pending.pop(0)
+            try:
+                self._glm5next_shadow_resolve(entry, scorer)
+            except Exception as exc:  # the device is gone; keep closing
+                logger.warning(
+                    "shadow draft: step %d could not be read back at shutdown (%s); "
+                    "its sampled ids and drafts are dropped",
+                    entry[0], exc,
+                )
         scorer.close()
         self._glm5next_shadow_scorer_instance = None
         handle = getattr(self, "_glm5next_shadow_log_handle", None)

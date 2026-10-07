@@ -64,10 +64,6 @@ KNOB = "VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT"
 #: The stack's five feed-forward keywords the decode leg must thread to the head (contract
 #: C3: the MoE half of the draft layer runs through the trunk's own ``_ffn_half``).
 FFN_KEYWORDS = ("quant_config", "block_size", "moe_group", "tp_degree", "expert_parallel_rank")
-#: Index sharing across draft iterations (``index_share_for_mtp_iteration``) needs the
-#: ``index_share`` keyword on the DSA layer's forward, which is worker-50's pending hunk;
-#: until it lands the tiny config runs the head with the flag off.
-NO_INDEX_SHARE = {"index_share_for_mtp_iteration": False}
 
 
 # ── the world: tiny root with the real head, its caches, a runner shell ──────
@@ -258,8 +254,11 @@ def _draft_layer_latent_rows(world, positions: list[int]) -> torch.Tensor:
 
 def test_the_knob_builds_the_real_head_and_the_runner_hands_it_its_own_carrier(monkeypatch):
     monkeypatch.setenv(KNOB, str(K))
-    world = _world(**NO_INDEX_SHARE)
+    world = _world()
     assert isinstance(world.root.mtp, mtp.Glm5NextMultiTokenPredictor)
+    # The checkpoint's default: the k iterations share the first one's index selection
+    # (``index_share_for_mtp_iteration``); every drafting test in this file runs that path.
+    assert world.root.text_config.index_share_for_mtp_iteration is True
     depth = len(world.root.model.layers)
     assert len(world.root.get_kv_spec().layers) == depth + 1
     recorder = _record(monkeypatch, world)
@@ -299,7 +298,7 @@ def test_k_is_read_through_the_heads_reader_only(monkeypatch):
 
 def test_four_tokens_pin_which_row_and_which_id_reach_the_draft(monkeypatch, logits_seen):
     monkeypatch.setenv(KNOB, str(K))
-    world = _world(**NO_INDEX_SHARE)
+    world = _world()
     recorder = _record(monkeypatch, world)
     vocab = tiny.STACK_VOCAB_SIZE
 
@@ -320,6 +319,7 @@ def test_four_tokens_pin_which_row_and_which_id_reach_the_draft(monkeypatch, log
     assert tuple(populate["hidden_rows"].shape) == (4, int(world.root.text_config.hidden_size))
     _assert_row_is_what_the_head_projected(populate["hidden_rows"][3], world.head, logits_seen[-1][0])
     assert "prefill_tail" in populate["kwargs"] and "tail" not in populate["kwargs"]
+    assert all(name in populate["kwargs"] for name in FFN_KEYWORDS), sorted(populate["kwargs"])
 
     # Decode s4 at position 4: the graph samples s5 and drafts from (h_4, s5).
     out = _step(world, [s4], cached=4, sampling=[0])
@@ -355,7 +355,7 @@ def test_four_tokens_pin_which_row_and_which_id_reach_the_draft(monkeypatch, log
 
 def test_chunked_prefill_pairs_the_chunk_boundary_row_with_the_next_prompt_token(monkeypatch):
     monkeypatch.setenv(KNOB, str(K))
-    world = _world(prompt=LONG_PROMPT, **NO_INDEX_SHARE)
+    world = _world(prompt=LONG_PROMPT)
     recorder = _record(monkeypatch, world)
     # Chunk 1: x0..x3, not the prompt's end. Its sample is meaningless and must not reach the
     # draft: row 3 pairs with x4, the first token of the next chunk, handed in by the runner.
@@ -394,7 +394,7 @@ def _run(monkeypatch, knob: int, *, head_seed: int = SEED_HEAD, steps: int = 3):
         monkeypatch.setenv(KNOB, str(knob))
     else:
         monkeypatch.delenv(KNOB, raising=False)
-    world = _world(prompt=LONG_PROMPT, head_seed=head_seed, **NO_INDEX_SHARE)
+    world = _world(prompt=LONG_PROMPT, head_seed=head_seed)
     assert (world.root.mtp is not None) == bool(knob)
     _step(world, LONG_PROMPT[:4], cached=0, sampling=[3])
     out = _step(world, LONG_PROMPT[4:], cached=4, sampling=[3])
@@ -459,7 +459,7 @@ def test_the_root_refuses_a_draft_carrier_that_names_no_leg(monkeypatch):
     decode); a carrier with neither is a protocol disagreement with the runner's carrier walk
     and is refused by name, not by a KeyError."""
     monkeypatch.setenv(KNOB, str(K))
-    world = _world(**NO_INDEX_SHARE)
+    world = _world()
 
     def strip_leg(converted):
         carrier = converted["layer_carriers"][-1]
@@ -474,7 +474,7 @@ def test_the_root_refuses_a_boundary_tensor_that_does_not_match_the_sampling_row
     """One boundary id per sampling row: a count mismatch would make ``index_copy`` fail
     deep inside the trace, or silently pair rows with the wrong id."""
     monkeypatch.setenv(KNOB, str(K))
-    world = _world(**NO_INDEX_SHARE)
+    world = _world()
 
     def two_boundaries(converted):
         converted["shadow_boundary_ids"] = torch.tensor([-1, -1], dtype=torch.int32)
