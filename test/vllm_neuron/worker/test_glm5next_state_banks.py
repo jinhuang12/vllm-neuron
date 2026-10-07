@@ -36,7 +36,7 @@ import torch
 from vllm_neuron.functional import state_banks as model_side
 from vllm_neuron.functional.kda.fused_decode import FUSED_DECODE_ENV
 from vllm_neuron.vllm.worker import glm5next_state_banks as runner_side
-from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
+from vllm_neuron.vllm.worker.neuron_model_runner import NULL_BLOCK_ID, NeuronModelRunner
 
 pytestmark = [pytest.mark.fast, pytest.mark.forked]
 
@@ -188,6 +188,17 @@ def test_a_decode_of_several_requests_hands_every_layer_its_whole_banks(monkeypa
     # The two families' slot tensors are distinct uploads even when equal, so the
     # graph signature does not depend on whether a step is padded.
     assert carriers[0]["state_slots"] is not carriers[LINEAR]["state_slots"]
+    # The carrier contracts: the layers take these as keywords, so an extra key raises
+    # and a missing one is served as a default.
+    assert set(carriers[0]) == {
+        "conv_state", "recurrent_state", "state_slots", "is_prefill",
+        "start_position", "real_tokens", "row_mask",
+    }
+    assert set(carriers[LINEAR]) == {
+        "latent_cache", "block_table_row", "latent_slots", "seq_lens", "start_position",
+        "position", "softmax_scale", "max_seq_len", "page_size",
+        "pool_cache", "tail", "state_slots",
+    }
 
 
 def test_padding_rows_name_the_scratch_slot_on_the_sparse_family_and_idle_slots_on_the_recurrent(monkeypatch):
@@ -204,6 +215,11 @@ def test_padding_rows_name_the_scratch_slot_on_the_sparse_family_and_idle_slots_
     assert int(side[2]["pool_cache"].shape[0]) == scratch + 1
     assert carriers[2]["state_slots"].tolist() == [3, 0, 5, scratch]
     assert carriers[2]["position"].tolist()[-1] == 0 and carriers[2]["seq_lens"].tolist()[-1] == 1
+    # The padding row is a one-token sequence in the null block: its table column names
+    # that block and nothing else, and its latent write lands in it.
+    assert carriers[2]["block_table_row"][:, -1].tolist() == [NULL_BLOCK_ID] + [-1] * (WINDOW - 1)
+    assert int(carriers[2]["latent_slots"][-1]) == NULL_BLOCK_ID * PAGE
+    assert carriers[0]["row_mask"].reshape(-1).tolist() == [1.0, 1.0, 1.0, 0.0]
 
 
 def test_a_sparse_bank_without_a_scratch_slot_is_refused_by_name(monkeypatch):

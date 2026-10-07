@@ -474,6 +474,33 @@ def test_the_dsa_bank_write_back_is_a_whole_bank_aliased_output():
         )
 
 
+# ── the warmup's synthetic step in the bank form ─────────────────────────────
+
+
+def test_a_synthetic_bank_form_decode_names_slots_zero_to_b_and_takes_no_claim():
+    """The warmup's B rows are served from slots 0..B-1 on every bank, none claimed."""
+    from test.vllm_neuron.model.glm5_next.tiny import test_tiny_glm5next_batch_capture as capture
+
+    _, runner, _ = capture._capture_runner()
+    kwargs = runner._build_decode_synthetic_inputs(4, compiled_graph_input=True)
+    converted = runner._glm5next_model_kwargs(kwargs)
+    banks = runner.model.glm5next_layer_banks
+    sides = runner._glm5next_side_cache_set
+    read = 0
+    for index, carrier in enumerate(converted["layer_carriers"]):
+        assert carrier["state_slots"].tolist() == [0, 1, 2, 3], (index, carrier["state_slots"])
+        if "tail" in carrier:
+            assert carrier["tail"] is sides[index]["tail"]
+            assert carrier["pool_cache"] is sides[index]["pool_cache"]
+            read += 1
+        else:
+            assert carrier["conv_state"] is banks[index]["conv_state"]
+            assert carrier["recurrent_state"] is banks[index]["recurrent_state"]
+    assert read == tiny.STACK_LAYERS
+    assert runner._glm5next_request_slot_table == {}
+    assert runner._glm5next_side_cache_positions == {}
+
+
 # ── removal, re-admission and preemption keep every slot consistent ──────────
 
 

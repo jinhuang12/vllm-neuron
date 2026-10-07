@@ -222,7 +222,8 @@ def _assert_banks_equal(left, right, label):
 
 
 @pytest.mark.parametrize("batch", [2, 4])
-def test_a_batched_kda_decode_advances_every_bank_row_as_one_request_steps_do(batch):
+def test_a_batched_kda_decode_advances_every_bank_row_as_one_request_steps_do(batch, monkeypatch):
+    monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_STATE_BANKS", "0")  # this test pins the per-request VIEW form
     world = _world(batch)
     slots = [world.runner._glm5next_request_slot_table[r] for r in world.req_ids]
     assert sorted(slots) == list(range(batch)), slots
@@ -277,8 +278,9 @@ def test_a_batched_kda_decode_advances_every_bank_row_as_one_request_steps_do(ba
                 )
 
 
-def test_a_padded_kda_decode_serves_the_padding_row_from_an_idle_slot_and_leaves_it():
+def test_a_padded_kda_decode_serves_the_padding_row_from_an_idle_slot_and_leaves_it(monkeypatch):
     """Three requests in the bucket of four: one padding row, whose slot is returned unchanged."""
+    monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_STATE_BANKS", "0")  # this test pins the per-request VIEW form
     batch, bucket = 3, 4
     world = _world(batch)
     snapshot = _snapshot(world)

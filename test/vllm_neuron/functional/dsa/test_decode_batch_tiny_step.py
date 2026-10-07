@@ -137,6 +137,7 @@ def _assert_state_identical(got, want):
 
 def _both_arms(monkeypatch, world):
     """The batched indexer and the per-request loop from one snapshot; what each did."""
+    monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_STATE_BANKS", "0")  # this test pins the per-request VIEW form
     slots = [world.runner._glm5next_request_slot_table[r] for r in world.req_ids]
     snapshot = BD._snapshot(world)
     seen: list = []
