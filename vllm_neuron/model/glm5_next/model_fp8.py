@@ -3206,6 +3206,7 @@ class Glm5NextKDAAttention(nn.Module):
         chunk_size: int | None = None,
         real_tokens: torch.Tensor | int | None = None,
         row_mask: torch.Tensor | None = None,
+        state_slots: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """One KDA layer's gated-delta linear attention over ``[T, hidden]``.
 
@@ -3240,6 +3241,12 @@ class Glm5NextKDAAttention(nn.Module):
                 zero for a padding row -- or ``[requests, T, 1]``, one mask per
                 request. Passed together with ``real_tokens``, or neither is
                 passed.
+            state_slots: ``[B]`` int slots, the bank form of a concurrent decode:
+                ``conv_state`` and ``recurrent_state`` are then the layer's whole
+                banks (``[slots, ...]``) and row ``b`` of the step is the request
+                at ``state_slots[b]``. Served by the fused decode launch alone,
+                which gathers the rows and writes them back onto the banks
+                (:mod:`vllm_neuron.functional.state_banks`).
 
         Returns:
             ``[T, hidden]`` at the input dtype.
@@ -3301,6 +3308,32 @@ class Glm5NextKDAAttention(nn.Module):
             raise ValueError(
                 f"hidden_states must be [tokens, hidden]; got shape "
                 f"{tuple(hidden_states.shape)}"
+            )
+        if state_slots is not None:
+            # The bank form: whole banks beside one slot per request, a decode only,
+            # and only on the fused launch, which is the one route that steps every
+            # request's rows together and can write them back by slot.
+            if is_prefill:
+                raise ValueError(
+                    "the bank form (state_slots beside whole state banks) is a "
+                    "concurrent decode's; a prefill serves one sequence on its own "
+                    "carrier"
+                )
+            if not fused_decode_enabled():
+                raise ValueError(
+                    "the bank form (state_slots beside whole state banks) is served "
+                    "by the fused KDA decode launch, which VLLM_NEURON_KDA_FUSED_DECODE=0 "
+                    "switched off; the per-request fallback writes each request's state "
+                    "through its own view and cannot take a bank"
+                )
+            return self._fused_decode_requests(
+                hidden_states,
+                convs=conv_state,
+                recurrents=recurrent_state,
+                start_position=start_position,
+                real_tokens=real_tokens,
+                row_mask=row_mask,
+                state_slots=state_slots,
             )
         # One carrier per request. Concurrent requests hold their states at
         # different slots of one bank, so what arrives here is a tuple of views --
@@ -3650,6 +3683,7 @@ class Glm5NextKDAAttention(nn.Module):
         start_position: torch.Tensor,
         real_tokens: torch.Tensor | None,
         row_mask: torch.Tensor | None,
+        state_slots: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """A concurrent decode, one token per request, in one ``kda_fused_decode`` launch.
 
@@ -3659,23 +3693,49 @@ class Glm5NextKDAAttention(nn.Module):
         ``real_tokens`` ``[B, 1]`` and ``row_mask`` ``[B, 1, 1]``, as the runner builds
         them; a padding row (``real_tokens`` 0, mask 0, a non-zero start) gets its
         carriers back unchanged.
+
+        With ``state_slots`` (``[B]`` int) ``convs`` and ``recurrents`` are the whole
+        banks: the rows are gathered by slot into the same ``[B, ...]`` carriers and
+        written back onto the banks themselves, in place, which is the write the
+        backend keeps as a whole-bank aliased output.
         """
         from vllm_neuron.functional.kda.fused_decode import kda_fused_decode
+        from vllm_neuron.functional.state_banks import (
+            bank_rows_problem,
+            gather_bank_rows,
+            scatter_bank_rows,
+        )
 
-        requests = len(convs)
         heads = int(self.num_kv_heads_per_rank)
         kdim = int(self.head_dim)
-        for conv, recurrent in zip(convs, recurrents):
-            if tuple(recurrent.shape) != (heads, kdim, kdim):
-                raise ValueError(
-                    f"recurrent_state {tuple(recurrent.shape)} must be "
-                    f"{(heads, kdim, kdim)} for this rank's geometry"
-                )
-            if tuple(conv.shape) != tuple(self.kda_conv_state_shape):
-                raise ValueError(
-                    f"conv_state {tuple(conv.shape)} must be the shape get_kv_spec "
-                    f"reports, {tuple(self.kda_conv_state_shape)}"
-                )
+        if state_slots is None:
+            requests = len(convs)
+            for conv, recurrent in zip(convs, recurrents):
+                if tuple(recurrent.shape) != (heads, kdim, kdim):
+                    raise ValueError(
+                        f"recurrent_state {tuple(recurrent.shape)} must be "
+                        f"{(heads, kdim, kdim)} for this rank's geometry"
+                    )
+                if tuple(conv.shape) != tuple(self.kda_conv_state_shape):
+                    raise ValueError(
+                        f"conv_state {tuple(conv.shape)} must be the shape get_kv_spec "
+                        f"reports, {tuple(self.kda_conv_state_shape)}"
+                    )
+        else:
+            for name, bank, row_shape in (
+                ("conv_state", convs, tuple(self.kda_conv_state_shape)),
+                ("recurrent_state", recurrents, (heads, kdim, kdim)),
+            ):
+                problem = bank_rows_problem(bank, state_slots, row_shape, name=name)
+                if problem is not None:
+                    raise ValueError(problem)
+            requests = int(state_slots.shape[0])
+        if int(hidden_states.shape[0]) != requests:
+            raise ValueError(
+                f"a decode step advances each sequence by one token, so this call "
+                f"carries one token per request; it holds "
+                f"{int(hidden_states.shape[0])} token(s) for {requests} request(s)"
+            )
         if (row_mask is None) != (real_tokens is None):
             raise ValueError(
                 "real_tokens and row_mask are one fact in two operands -- which rows "
@@ -3713,8 +3773,14 @@ class Glm5NextKDAAttention(nn.Module):
             project(self.v_proj_weight),
             raw_gate,
             project(self.b_proj_weight),
-            conv_state=torch.stack(convs),
-            recurrent_state=torch.stack(recurrents),
+            conv_state=(
+                torch.stack(convs) if state_slots is None
+                else gather_bank_rows(convs, state_slots)
+            ),
+            recurrent_state=(
+                torch.stack(recurrents) if state_slots is None
+                else gather_bank_rows(recurrents, state_slots)
+            ),
             q_conv1d_weight=self.q_conv1d_weight,
             k_conv1d_weight=self.k_conv1d_weight,
             v_conv1d_weight=self.v_conv1d_weight,
@@ -3726,9 +3792,13 @@ class Glm5NextKDAAttention(nn.Module):
             real_tokens=real_tokens,
             row_mask=row_mask,
         )
-        for index in range(requests):
-            convs[index].copy_(fused.conv_state[index])
-            recurrents[index].copy_(fused.recurrent_state[index])
+        if state_slots is None:
+            for index in range(requests):
+                convs[index].copy_(fused.conv_state[index])
+                recurrents[index].copy_(fused.recurrent_state[index])
+        else:
+            scatter_bank_rows(convs, state_slots, fused.conv_state)
+            scatter_bank_rows(recurrents, state_slots, fused.recurrent_state)
         return self._gated_output(fused.core, out_gate, hidden_states)
 
     def _gated_output(
@@ -3849,6 +3919,7 @@ class Glm5NextKDALayer(nn.Module):
         row_mask: torch.Tensor | None = None,
         streams: torch.Tensor | None = None,
         collector: list[torch.Tensor] | None = None,
+        state_slots: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The linear-attention half, mixed either by mHC or by a plain add.
 
@@ -3903,6 +3974,7 @@ class Glm5NextKDALayer(nn.Module):
                 chunk_size=chunk_size,
                 real_tokens=real_tokens,
                 row_mask=row_mask,
+                **({"state_slots": state_slots} if state_slots is not None else {}),
             )
             if collector is not None:
                 collector.append(attended)
@@ -5291,6 +5363,7 @@ class Glm5NextDSAIndexer(nn.Module):
             dsa_decode_ring_step,
             dsa_decode_scores,
         )
+        from vllm_neuron.functional.state_banks import shared_store_problem
         from vllm_neuron.utils.neuron_utils import values_are_readable
 
         self.require_dials()
@@ -5339,10 +5412,13 @@ class Glm5NextDSAIndexer(nn.Module):
                     f"{seq_lens.tolist()}"
                 )
         if not views and values_are_readable(slots):
-            if int(torch.unique(slots).numel()) != batch:
-                raise Glm5NextDSAIndexerError(
-                    f"slots must be distinct, one store per request; got {slots.tolist()}"
-                )
+            # Distinct stores, except the scratch store (the last slot, which no
+            # request owns) that every padding row of a bank-form step names.
+            problem = shared_store_problem(
+                slots, batch, scratch=int(pool_bank.shape[0]) - 1
+            )
+            if problem is not None:
+                raise Glm5NextDSAIndexerError(problem)
         ape = self.index_kpool_compress_ape
         if ape is None or tuple(ape.shape) != (pool, dim):
             raise Glm5NextDSAIndexerError(
@@ -6683,11 +6759,15 @@ class Glm5NextMLAAttention(nn.Module):
         tail,
         position: torch.Tensor,
         collector: list[torch.Tensor] | None,
+        state_slots: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """:meth:`forward` for a decode step of ``len(tail)`` requests, one row each.
 
         ``tail`` and ``pool_cache`` are one bank view per request and ``seq_lens``,
-        ``start_position`` and ``position`` are ``[batch]``. The query latent and the
+        ``start_position`` and ``position`` are ``[batch]``. With ``state_slots``
+        (``[B]`` int) they are instead the layer's whole ring and pooled-store banks,
+        row ``b`` of the step being the request at ``state_slots[b]``, and the indexer
+        writes them back in place on the banks. The query latent and the
         indexer's four projections run once on all rows. The indexer's write stage
         and selection run in one :meth:`Glm5NextDSAIndexer.forward_requests` pass,
         each request on its own ring and pooled store. :meth:`attend` then serves
@@ -6700,14 +6780,30 @@ class Glm5NextMLAAttention(nn.Module):
             selection_is_a_no_op,
         )
 
-        batch = len(tail)
-        pools = tuple(pool_cache) if isinstance(pool_cache, (tuple, list)) else ()
-        if len(pools) != batch or int(normed_hidden_states.shape[0]) != batch:
-            raise Glm5NextMLADecodeError(
-                f"a decode step of {batch} request ring(s) needs one pooled store per "
-                f"request and one row per request; got {len(pools)} store(s) and "
-                f"{int(normed_hidden_states.shape[0])} row(s)"
-            )
+        if state_slots is None:
+            batch = len(tail)
+            pools = tuple(pool_cache) if isinstance(pool_cache, (tuple, list)) else ()
+            if len(pools) != batch or int(normed_hidden_states.shape[0]) != batch:
+                raise Glm5NextMLADecodeError(
+                    f"a decode step of {batch} request ring(s) needs one pooled store "
+                    f"per request and one row per request; got {len(pools)} store(s) "
+                    f"and {int(normed_hidden_states.shape[0])} row(s)"
+                )
+            stores, rings = pools, tuple(tail)
+        else:
+            batch = int(state_slots.shape[0])
+            if (
+                isinstance(pool_cache, (tuple, list))
+                or isinstance(tail, (tuple, list))
+                or int(normed_hidden_states.shape[0]) != batch
+            ):
+                raise Glm5NextMLADecodeError(
+                    f"the bank form takes the whole pooled-store and ring banks beside "
+                    f"{batch} slot(s) and one row per slot; got pool_cache "
+                    f"{type(pool_cache).__name__}, tail {type(tail).__name__} and "
+                    f"{int(normed_hidden_states.shape[0])} row(s)"
+                )
+            stores, rings = pool_cache, tail
         for name, value in (("seq_lens", seq_lens), ("position", position)):
             if not torch.is_tensor(value) or tuple(value.shape) != (batch,):
                 raise Glm5NextMLADecodeError(
@@ -6729,9 +6825,9 @@ class Glm5NextMLAAttention(nn.Module):
         topk_indices = self.indexer.forward_requests(
             normed_hidden_states,
             q_latent,
-            pools,
-            tuple(tail),
-            None,
+            stores,
+            rings,
+            state_slots,
             seq_lens,
             position,
             max_seq_len=bound if dense else int(max_seq_len),
@@ -6776,6 +6872,7 @@ class Glm5NextMLAAttention(nn.Module):
         prefill_end_position: torch.Tensor | int | None = None,
         collector: list[torch.Tensor] | None = None,
         active_mla_query_rows: int | None = None,
+        state_slots: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """This module's whole contribution to one layer: select, then attend.
 
@@ -6825,8 +6922,9 @@ class Glm5NextMLAAttention(nn.Module):
             selection_is_a_no_op,
         )
 
-        if isinstance(tail, (tuple, list)):
-            # A decode step of several requests: one ring per request.
+        if isinstance(tail, (tuple, list)) or state_slots is not None:
+            # A decode step of several requests: one ring per request, or the whole
+            # ring and pooled-store banks beside one slot per request.
             if (
                 slot_mapping is not None
                 or prefill_tail is not None
@@ -6834,10 +6932,10 @@ class Glm5NextMLAAttention(nn.Module):
                 or active_mla_query_rows is not None
             ):
                 raise Glm5NextMLADecodeError(
-                    "a tuple of rings is a decode step of several requests; the "
-                    "prefill operands (slot_mapping, prefill_tail, "
-                    "prefill_end_position, active_mla_query_rows) belong to one "
-                    "request's prefill"
+                    "a tuple of rings, or state_slots beside the banks, is a decode "
+                    "step of several requests; the prefill operands (slot_mapping, "
+                    "prefill_tail, prefill_end_position, active_mla_query_rows) belong "
+                    "to one request's prefill"
                 )
             return self._forward_requests(
                 normed_hidden_states,
@@ -6853,6 +6951,7 @@ class Glm5NextMLAAttention(nn.Module):
                 tail=tail,
                 position=position,
                 collector=collector,
+                state_slots=state_slots,
             )
 
         if (
@@ -7030,6 +7129,7 @@ class Glm5NextDSALayer(nn.Module):
         streams: torch.Tensor | None = None,
         collector: list[torch.Tensor] | None = None,
         active_mla_query_rows: int | None = None,
+        state_slots: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The sparse-attention half, mixed either by mHC or by a plain add.
 
@@ -7100,6 +7200,7 @@ class Glm5NextDSALayer(nn.Module):
                     {"active_mla_query_rows": active_mla_query_rows}
                     if active_mla_query_rows is not None else {}
                 ),
+                **({"state_slots": state_slots} if state_slots is not None else {}),
             )
             if collector is not None:
                 collector.append(attended)
