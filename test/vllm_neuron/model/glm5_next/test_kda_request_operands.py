@@ -318,8 +318,9 @@ def test_an_operand_set_naming_another_request_count_is_refused(one_layer):
     assert str(DECLARED_REQUESTS) in said
 
 
-def test_the_runner_builds_one_operand_pair_per_request_for_the_layer(one_layer):
+def test_the_runner_builds_one_operand_pair_per_request_for_the_layer(one_layer, monkeypatch):
     """The carrier the runner builds at two requests carries a stacked pair per request."""
+    monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_STATE_BANKS", "0")  # this test pins the per-request VIEW form
     layer = one_layer.layer
     runner = layer_half._runner_module().NeuronModelRunner
     bank = _linear_bank(layer)

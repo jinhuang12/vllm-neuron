@@ -298,8 +298,9 @@ def test_a_batched_dense_decode_gives_the_one_request_tokens():
     _batched_against_single(world, dense=True)
 
 
-def test_a_padded_decode_serves_the_padding_row_from_the_null_block_and_an_idle_slot():
+def test_a_padded_decode_serves_the_padding_row_from_the_null_block_and_an_idle_slot(monkeypatch):
     """Three requests in the bucket of four: the requests' answers and state are unchanged."""
+    monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_STATE_BANKS", "0")  # this test pins the per-request VIEW form
     batch, bucket = 3, 4
     max_model_len = tiny.STACK_TOKENS + 8
     world = _world(batch, max_model_len=max_model_len, prompts=[6, 9, 11],

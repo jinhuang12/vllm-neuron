@@ -5339,7 +5339,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         address. Because the set lives for the process, a new sequence would otherwise
         start on the previous sequence's partial pool; ``_glm5next_position_arm``
         empties a request's ring when its prefill starts at position 0.
+
+        The slot axis is the engine's concurrency bound plus ``SCRATCH_SLOTS``: the last
+        slot is the scratch store every padding row of a bank-form decode step names
+        (``glm5next_state_banks``), so a padding row's ring write never lands in a slot
+        a request holds. No request is ever handed that slot.
         """
+        from vllm_neuron.vllm.worker.glm5next_state_banks import SCRATCH_SLOTS
+
         live = getattr(self, "_glm5next_side_cache_set", None)
         if live is not None and len(live) == len(banks):
             return live
@@ -5349,7 +5356,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             index_kpool=int(text_config.index_kpool),
             index_head_dim=int(text_config.index_head_dim),
             max_seq_len=int(self.max_model_len),
-            request_slots=self._glm5next_request_slot_capacity(banks),
+            request_slots=self._glm5next_request_slot_capacity(banks) + SCRATCH_SLOTS,
         )
         self._glm5next_side_cache_set = live
         # A fresh set is owned by nobody: the slot table and position record refer
@@ -5597,20 +5604,42 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         max_seq_len: int,
         index_kpool: int,
         operands: dict,
+        banked: bool = False,
     ) -> dict:
         """One sparse (DSA) layer's carrier for a decode step of ``B > 1`` requests.
 
         Request ``b`` is column ``b`` of every operand: its block-table column, its
-        latent slot, its position and seq len, and its own views of the indexer's
-        pooled store and ring. The checks are the one-request carrier's, per request.
+        latent slot, its position and seq len, and its own store of the indexer's
+        pooled keys and ring. The checks are the one-request carrier's, per request.
+
+        Two forms of the two side caches. ``banked`` hands the whole ``pool_cache`` and
+        ``tail`` banks beside a ``[B]`` int64 ``state_slots`` tensor (two graph inputs
+        per layer whatever ``B`` is; the layer gathers and writes back by slot, in place
+        on the bank). Otherwise each is a tuple of one disjoint bank view per request,
+        the per-request form, which the layer stacks and writes back view by view.
 
         A padding request (the last ``padding``) is a sequence of one token in the
         null block: position 0, a table column naming block ``NULL_BLOCK_ID`` and
         nothing else, its latent written to that block (the runner's own write-side
-        padding convention), and its ring the scratch ``pad_tail``. At position 0 no
-        pool completes, so its pooled write lands on its view's trash row, which no
-        candidate gather reads.
+        padding convention). At position 0 no pool completes, so its pooled write lands
+        on its store's trash row, which no candidate gather reads. Its ring is the
+        scratch ``pad_tail`` row in the view form and the scratch slot (the last store,
+        past the engine's concurrency bound, which no request owns) in the bank form,
+        so the ring write lands where no request reads.
+
+        The page-dependent operands (``block_table_row``, ``latent_slots``) and their
+        checks are done once per block-table object and kept in ``operands``: the
+        layers of one KV-cache group share one table, so they share one upload, while a
+        layer over other pages gets its own. The step operands (positions, seq lens,
+        slot tensor) are built once per device.
         """
+        from vllm_neuron.vllm.worker.glm5next_state_banks import (
+            scratch_slot,
+            slot_tensor,
+            sparse_bank_slots,
+            strided_bank_problem,
+        )
+
         name = bank["name"]
         if is_prefill:
             raise ValueError(
@@ -5652,38 +5681,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             )
         window_blocks = int(geometry["window_blocks"])
         real_requests = len(state_slots) - int(padding)
-        tables = [
-            [int(value) for value in row]
-            for row in geometry.get("request_block_ids", ())
-        ]
-        if len(tables) != real_requests:
-            raise ValueError(
-                f"KV layer '{name}' serves {real_requests} request(s) in this step and "
-                f"its geometry names {len(tables)} block-table row(s) "
-                f"('request_block_ids'); each request reads its own window"
-            )
-        for index, ids in enumerate(tables):
-            if not ids:
-                raise ValueError(
-                    f"KV layer '{name}' was handed an empty block-table row for request "
-                    f"{index}; a GLM-5.3-Flash request needs at least one KV block"
-                )
-            own_slots = len(ids) * block_size
-            if int(starts[index]) < 0 or int(starts[index]) + 1 > own_slots:
-                raise ValueError(
-                    f"KV layer '{name}' was handed request {index}'s token at position "
-                    f"{int(starts[index])} against {len(ids)} block(s) of {block_size} "
-                    f"slot(s); a write outside the request's own pages would land on "
-                    f"another sequence's rows"
-                )
-            if len(ids) > window_blocks:
-                raise ValueError(
-                    f"KV layer '{name}' was handed {len(ids)} block(s) for request "
-                    f"{index} and the bucket's block table holds {window_blocks} per "
-                    f"sequence; a request longer than its bucket cannot be served by "
-                    f"this window"
-                )
-        tables += [[NULL_BLOCK_ID]] * int(padding)
         latent = bank["latent_cache"]
         device = latent.device
         if device not in operands:
@@ -5695,37 +5692,107 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 "start_position": positions,
                 "position": positions,
             }
+        rows = geometry.get("request_block_ids", ())
+        pages_key = ("pages", device, id(rows), window_blocks, block_size)
+        paged = operands.get(pages_key)
+        if paged is None:
+            tables = [[int(value) for value in row] for row in rows]
+            if len(tables) != real_requests:
+                raise ValueError(
+                    f"KV layer '{name}' serves {real_requests} request(s) in this step and "
+                    f"its geometry names {len(tables)} block-table row(s) "
+                    f"('request_block_ids'); each request reads its own window"
+                )
+            for index, ids in enumerate(tables):
+                if not ids:
+                    raise ValueError(
+                        f"KV layer '{name}' was handed an empty block-table row for request "
+                        f"{index}; a GLM-5.3-Flash request needs at least one KV block"
+                    )
+                own_slots = len(ids) * block_size
+                if int(starts[index]) < 0 or int(starts[index]) + 1 > own_slots:
+                    raise ValueError(
+                        f"KV layer '{name}' was handed request {index}'s token at position "
+                        f"{int(starts[index])} against {len(ids)} block(s) of {block_size} "
+                        f"slot(s); a write outside the request's own pages would land on "
+                        f"another sequence's rows"
+                    )
+                if len(ids) > window_blocks:
+                    raise ValueError(
+                        f"KV layer '{name}' was handed {len(ids)} block(s) for request "
+                        f"{index} and the bucket's block table holds {window_blocks} per "
+                        f"sequence; a request longer than its bucket cannot be served by "
+                        f"this window"
+                    )
+            tables += [[NULL_BLOCK_ID]] * int(padding)
+            paged = {
+                # One column per request, ``-1`` past its pages, built on the host and
+                # moved once.
+                "block_table_row": torch.tensor(
+                    [
+                        [ids[page] if page < len(ids) else -1 for ids in tables]
+                        for page in range(window_blocks)
+                    ],
+                    dtype=torch.int32,
+                ).to(device),
+                # One physical bank row per request: its own token's slot.
+                "latent_slots": cls._glm5next_latent_slot_mapping(
+                    rows=tables,
+                    starts=starts,
+                    tokens=1,
+                    block_size=block_size,
+                    reals=[max(1, int(one)) for one in reals],
+                    device=device,
+                ),
+            }
+            operands[pages_key] = paged
         carrier = {
             "latent_cache": latent,
-            # One column per request, ``-1`` past its pages, built on the host and
-            # moved once.
-            "block_table_row": torch.tensor(
-                [
-                    [ids[page] if page < len(ids) else -1 for ids in tables]
-                    for page in range(window_blocks)
-                ],
-                dtype=torch.int32,
-            ).to(device),
-            # One physical bank row per request: its own token's slot.
-            "latent_slots": cls._glm5next_latent_slot_mapping(
-                rows=tables,
-                starts=starts,
-                tokens=1,
-                block_size=block_size,
-                reals=[max(1, int(one)) for one in reals],
-                device=device,
-            ),
-            # Disjoint views, one per request, so each advances in place.
-            "pool_cache": tuple(side["pool_cache"][int(slot)] for slot in state_slots),
-            "tail": tuple(
-                side["tail"][int(slot)] for slot in state_slots[:real_requests]
-            )
-            + tuple(side["pad_tail"][index] for index in range(int(padding))),
+            **paged,
             **operands[device],
             "softmax_scale": float(softmax_scale),
             "max_seq_len": int(max_seq_len),
             "page_size": int(geometry["page_size"]),
         }
+        if banked:
+            scratch = scratch_slot(side)
+            real_slots = [int(one_slot) for one_slot in state_slots[:real_requests]]
+            if scratch in real_slots:
+                raise ValueError(
+                    f"KV layer '{name}' holds {side_slots} indexer side-cache slot(s) and "
+                    f"a request of this step owns the last one, slot {scratch}, which the "
+                    f"bank form keeps as the scratch store every padding row writes; the "
+                    f"live side caches are allocated one slot past the engine's "
+                    f"concurrency bound for it, so a store without a scratch slot cannot "
+                    f"serve a banked step"
+                )
+            slots = sparse_bank_slots(
+                state_slots, real_requests=real_requests, scratch=scratch
+            )
+            slots_key = ("slots", device, tuple(slots))
+            if slots_key not in operands:
+                operands[slots_key] = slot_tensor(slots, device)
+            # The whole banks: the layer gathers its rows by slot and writes them back
+            # onto the bank itself, which the backend keeps as an aliased output. A
+            # whole bank must be a contiguous slice of its storage (the executor
+            # refuses a strided one after the compile); refused here by name.
+            for key in ("pool_cache", "tail"):
+                problem = strided_bank_problem(
+                    side[key], name=f"KV layer '{name}'s indexer {key}"
+                )
+                if problem is not None:
+                    raise ValueError(problem)
+            carrier["pool_cache"] = side["pool_cache"]
+            carrier["tail"] = side["tail"]
+            carrier["state_slots"] = operands[slots_key]
+        else:
+            # Disjoint views, one per request, so each advances in place.
+            carrier["pool_cache"] = tuple(
+                side["pool_cache"][int(slot)] for slot in state_slots
+            )
+            carrier["tail"] = tuple(
+                side["tail"][int(slot)] for slot in state_slots[:real_requests]
+            ) + tuple(side["pad_tail"][index] for index in range(int(padding)))
         return carrier
 
     @classmethod
@@ -5803,6 +5870,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 layers' row masks: an unmasked padding row would decay and update the
                 state with a row that carries no token.
         """
+        from vllm_neuron.vllm.worker.glm5next_state_banks import (
+            bank_form,
+            slot_tensor,
+            strided_bank_problem,
+        )
+
         if len(banks) != len(side_caches) or len(banks) != len(geometries):
             raise ValueError(
                 f"{len(banks)} bank(s) against {len(side_caches)} side-cache "
@@ -5903,6 +5976,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         linear_step_operands: dict = {}
         sparse_step_operands: dict = {}
         carriers: list[dict] = []
+        # Whether this step hands the layers whole banks and slot tensors (a decode of
+        # several requests) or one bank view per request (see ``glm5next_state_banks``).
+        banked = bank_form(len(starts), is_prefill=bool(is_prefill))
         for bank, side, geometry in zip(banks, side_caches, geometries):
             state_slots = [
                 int(value)
@@ -5943,6 +6019,33 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                             dtype=torch.float32,
                         ).to(device),
                     }
+                if banked:
+                    # The whole banks and one int64 slot per request, one upload for
+                    # the family: the layer gathers the rows it steps and writes them
+                    # back onto the bank itself (``functional.state_banks``), which the
+                    # backend keeps as a whole-bank aliased output. A padding row names
+                    # the idle slot the runner chose and is handed back unchanged.
+                    # A whole bank must be a contiguous slice of its storage, or the
+                    # executor refuses it after the compile; refused here by name.
+                    for key in ("conv_state", "recurrent_state"):
+                        problem = strided_bank_problem(
+                            bank[key], name=f"KV layer '{bank['name']}'s {key}"
+                        )
+                        if problem is not None:
+                            raise ValueError(problem)
+                    slots_key = ("slots", device, tuple(int(one) for one in state_slots))
+                    if slots_key not in linear_step_operands:
+                        linear_step_operands[slots_key] = slot_tensor(state_slots, device)
+                    carriers.append(
+                        {
+                            "conv_state": bank["conv_state"],
+                            "recurrent_state": bank["recurrent_state"],
+                            "state_slots": linear_step_operands[slots_key],
+                            "is_prefill": bool(is_prefill),
+                            **linear_step_operands[device],
+                        }
+                    )
+                    continue
                 # One entry per request. Two requests' states are two rows of one
                 # bank, so they travel as a tuple of views, never a copy: the
                 # recurrence advances in place. The positions are one tensor so no
@@ -5976,6 +6079,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         max_seq_len=max_seq_len,
                         index_kpool=index_kpool,
                         operands=sparse_step_operands,
+                        banked=banked,
                     )
                 )
                 continue
@@ -6208,6 +6312,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # points of their sequences is the ordinary concurrent case, but the layers
         # of one forward are stepped together.
         starts: set[tuple] = set()
+        # The layers of one KV-cache group share one metadata dict (the runner writes
+        # the group's entry under every layer name), so the walk below is done once
+        # per (metadata object, family) and its result reused: the geometry a group's
+        # layers get is one dict per layer over one set of row lists, so a later
+        # per-object memo (``_glm5next_sparse_batch_carrier``) sees one table for the
+        # group. The checks that name a layer fire on the group's first layer.
+        walked: dict[tuple, tuple] = {}
         for bank in banks:
             name = bank["name"]
             if name not in metadata_map:
@@ -6217,6 +6328,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     f"(:4256-4257) and this call site handed {sorted(metadata_map)}"
                 )
             metadata = metadata_map[name]
+            walk_key = (id(metadata), bank["family"])
+            seen = walked.get(walk_key)
+            if seen is not None:
+                geometry, leg_is_prefill, request_starts = seen
+                geometries.append(dict(geometry))
+                legs.add(leg_is_prefill)
+                starts.add(tuple(request_starts))
+                continue
             block_size = int(metadata["block_size"])
             rows = self._glm5next_host_geometry(metadata, "host_block_table", name)
             positions = self._glm5next_host_geometry(
@@ -6320,19 +6439,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 # the ``max_model_len`` fallback and the expensive case.
                 span_blocks = table_width
             window_blocks = min(table_width, max(1, span_blocks))
-            geometries.append(
-                {
-                    # The first request's pages, which a one-request step reads, and
-                    # every request's own, which a decode step of several reads.
-                    "block_ids": request_rows[0][: blocks_used[0]],
-                    "request_block_ids": [
-                        row[:used] for row, used in zip(request_rows, blocks_used)
-                    ],
-                    "state_slot": request_rows[0][0],
-                    "page_size": block_size,
-                    "window_blocks": window_blocks,
-                }
-            )
+            geometry = {
+                # The first request's pages, which a one-request step reads, and
+                # every request's own, which a decode step of several reads.
+                "block_ids": request_rows[0][: blocks_used[0]],
+                "request_block_ids": [
+                    row[:used] for row, used in zip(request_rows, blocks_used)
+                ],
+                "state_slot": request_rows[0][0],
+                "page_size": block_size,
+                "window_blocks": window_blocks,
+            }
+            walked[walk_key] = (geometry, leg_is_prefill, request_starts)
+            geometries.append(dict(geometry))
             # One reading of the leg per group, the one the window was sized from.
             legs.add(leg_is_prefill)
             # One tuple per group; the groups must agree about the same requests.
@@ -10403,6 +10522,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 _dtype_views[key] = view
             return view
 
+        from vllm_neuron.vllm.worker.glm5next_state_banks import state_bank_regions
+
         # Build KV caches per group
         kv_caches = {}
         for group in kv_cache_config.kv_cache_groups:
@@ -10528,44 +10649,30 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
                     num_slots = raw_tensor.numel() // slot_bytes
 
-                    # Both states live side by side inside each slot, so each
-                    # state is a slot-strided view of the same raw buffer: the
-                    # slot stride is the whole slot and the within-slot
-                    # strides are contiguous for that state's own shape.
-                    # ``strict=True`` because upstream pairs the two carriers
-                    # with a non-strict zip, so a short ``dtypes`` tuple would
-                    # silently under-allocate the slot.
-                    state_tensors = []
-                    state_offset_bytes = 0
-                    for shape, dtype in zip(
-                        kv_cache_spec.shapes, kv_cache_spec.dtypes, strict=True
-                    ):
-                        dtype_size = dtype.itemsize
-                        # The slot must be a whole number of this state's
-                        # elements, or the slot stride below would truncate.
-                        assert slot_bytes % dtype_size == 0
-                        target_shape = (num_slots, *shape)
-                        # Contiguous strides for the target shape, read off a
-                        # meta tensor: correct by construction and allocating
-                        # no storage for a reading used only as arithmetic.
-                        contiguous = torch.empty(target_shape, device="meta").stride()
-                        assert state_offset_bytes % dtype_size == 0
-                        state_tensors.append(
-                            torch.as_strided(
-                                _shared_dtype_view(raw_tensor, dtype),
-                                size=target_shape,
-                                stride=(
-                                    slot_bytes // dtype_size,
-                                    *contiguous[1:],
-                                ),
-                                storage_offset=state_offset_bytes // dtype_size,
-                            )
-                        )
-                        # Advance by this state's own per-slot footprint, so the
-                        # next carrier starts where this one ends inside a slot.
-                        state_offset_bytes += contiguous[0] * dtype_size
-
-                    kv_caches[layer_name] = state_tensors
+                    # Each state is one contiguous ``[num_slots, *shape]`` bank
+                    # over the same raw buffer, the banks one after another
+                    # (``glm5next_state_banks.state_bank_regions``). Not a
+                    # slot-strided view with both states side by side in every
+                    # slot: the bank form hands a whole bank to the decode graph
+                    # and the Neuron executor refuses a non-contiguous input
+                    # ("Detected non-contiguous slicing for requested Device
+                    # Tensor"); one row ``bank[slot]`` is contiguous in both
+                    # layouts, so the view form is unchanged. The buffer is the
+                    # same ``num_slots * slot_bytes``, so the footprint the worker
+                    # budgets is unchanged. ``strict=True`` inside, because
+                    # upstream pairs the two carriers with a non-strict zip, so a
+                    # short ``dtypes`` tuple would silently under-allocate the slot.
+                    kv_caches[layer_name] = state_bank_regions(
+                        raw_tensor,
+                        kv_cache_spec.shapes,
+                        kv_cache_spec.dtypes,
+                        slot_bytes=slot_bytes,
+                        dtype_view=_shared_dtype_view,
+                    )
+                    assert len(kv_caches[layer_name]) == len(kv_cache_spec.shapes)
+                    assert all(
+                        int(bank.shape[0]) == num_slots for bank in kv_caches[layer_name]
+                    )
                     # Not registered in ``_kv_cache_full_tensors``: that dict
                     # feeds the KV-transfer connector's (2, num_blocks, ...) K/V
                     # view, and a recurrent state has no K/V pair.
