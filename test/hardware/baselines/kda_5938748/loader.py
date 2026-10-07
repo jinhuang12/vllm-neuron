@@ -8,8 +8,9 @@ baseline.
 
 ``decode_state.py`` and ``gate_clamp.py`` import their emit helpers from the live
 ``vllm_neuron.functional.kda.chunked_recurrence``. The load checks that the live
-file is byte-identical to the snapshot of it, so those helpers are the 5938748
-helpers.
+file defines each name they import (:data:`IMPORTED_HELPERS`) with the source
+text of the snapshot of it, so those helpers are the 5938748 helpers; the rest of
+the live file (the prefill entry points and kernels) is free to change.
 
 :func:`old_decode_core` is the 5938748 decode region of
 ``Glm5NextKDAAttention.forward`` (``model_fp8.py`` lines 3406-3559 at that
@@ -20,6 +21,7 @@ file, so it is copied here line for line instead of loading that file.
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.util
 import sys
@@ -37,9 +39,43 @@ SNAPSHOT_SHA256 = {
 
 HERE = Path(__file__).resolve().parent
 
+#: Every name ``decode_state.py`` and ``gate_clamp.py`` import from the live
+#: ``chunked_recurrence``. Each is defined from these names and the module's ``nki``
+#: imports alone, so these six definitions are what the snapshots run from it.
+IMPORTED_HELPERS = (
+    "L2_NORM_EPS", "MAX_TILE", "_emit_l2_normalise", "_emit_transpose", "_psum", "_sbuf",
+)
+
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _definitions(path: Path, names) -> dict[str, str]:
+    """The source text of the last top-level binding of each of ``names`` in ``path``.
+
+    ``inspect.getsource`` returns this text for a function, and cannot for a
+    constant; the same AST segment serves both, read the same way on both sides.
+    """
+    text = path.read_text()
+    found = {}
+    for node in ast.parse(text).body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound = [node.name]
+        elif isinstance(node, ast.Assign):
+            bound = [t.id for t in node.targets if isinstance(t, ast.Name)]
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            bound = [node.target.id]
+        else:
+            continue
+        segment = "\n".join(
+            [f"@{ast.get_source_segment(text, d)}" for d in getattr(node, "decorator_list", [])]
+            + [ast.get_source_segment(text, node)]
+        )
+        for name in bound:
+            if name in names:
+                found[name] = segment
+    return found
 
 
 def _load(path: Path, name: str) -> ModuleType:
@@ -64,11 +100,14 @@ def load_baseline(directory: Path | str = HERE) -> SimpleNamespace:
             )
     import vllm_neuron.functional.kda.chunked_recurrence as live_chunked
 
-    live = _sha256(Path(live_chunked.__file__))
-    if live != SNAPSHOT_SHA256["chunked_recurrence.py"]:
+    want = _definitions(directory / "chunked_recurrence.py", IMPORTED_HELPERS)
+    live = _definitions(Path(live_chunked.__file__), IMPORTED_HELPERS)
+    changed = [name for name in IMPORTED_HELPERS if live.get(name) != want[name]]
+    if changed:
         raise ValueError(
-            "the live chunked_recurrence.py differs from 5938748, so the snapshot "
-            "decode_state/gate_clamp would import changed helpers"
+            f"the live chunked_recurrence.py defines {changed} differently from "
+            f"5938748, so the snapshot decode_state/gate_clamp would import changed "
+            f"helpers"
         )
     tag = f"_kda_5938748_{abs(hash(str(directory)))}"
     return SimpleNamespace(

@@ -669,8 +669,13 @@ def kda_intra_chunk(
         )
         return kda_intra_chunk_torch_oracle(q, k, v, beta, gk)
 
-    consts = chunk_constants(chunk, device=q.device, dtype=q.dtype)
     _count_nki_dispatch()
+    # On an LNC2 runtime: the same values from both cores, 128 // C chunks a tile.
+    from vllm_neuron.functional.kda import chunked_lnc2
+
+    if chunked_lnc2.chunked_lnc2_enabled():
+        return chunked_lnc2.intra_chunk_lnc2(q, k, v, beta, gk)
+    consts = chunk_constants(chunk, device=q.device, dtype=q.dtype)
     w, u, kg, a_inv, aqk = wrap_nki(kda_intra_chunk_kernel)(
         q_hbm=q,
         k_hbm=k,
@@ -1200,8 +1205,13 @@ def kda_inter_chunk(
         )
         return kda_inter_chunk_torch_oracle(kg, w, u, gk, q, aqk, state=state)
 
-    consts = inter_chunk_constants(chunk, kdim, vdim, device=kg.device, dtype=kg.dtype)
     _count_inter_nki_dispatch()
+    # On an LNC2 runtime: the same values from both cores, value columns split.
+    from vllm_neuron.functional.kda import chunked_lnc2
+
+    if chunked_lnc2.chunked_lnc2_enabled():
+        return chunked_lnc2.inter_chunk_lnc2(kg, w, u, gk, q, aqk, state)
+    consts = inter_chunk_constants(chunk, kdim, vdim, device=kg.device, dtype=kg.dtype)
     o, final_state, v_new = wrap_nki(kda_inter_chunk_kernel)(
         kg_hbm=kg,
         w_hbm=w,
