@@ -76,6 +76,10 @@ if TYPE_CHECKING:
     # Build the GLM-5.3-Flash step's attention metadata on the host only: no per-step
     # block-table / slot-mapping uploads that its graph never reads.
     VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA: bool = False
+    # GLM-5.3-Flash DSA prefill: a chunk whose top-k selection provably keeps every
+    # token attends its latent window densely (mla_dense_window.py) instead of
+    # selecting and gathering. On by default; 0 restores the sparse path.
+    VLLM_NEURON_MLA_DENSE_WINDOW: bool = True
 
 
 def maybe_convert_bool(value: str | None) -> bool | None:
@@ -344,6 +348,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA"))
         or False
+    ),
+    # ================== GLM-5.3-Flash DSA Prefill ==================
+    # Attend a prefill chunk densely over its latent window when the bound its graph
+    # can prove, min(max_model_len, window rows), is within the DSA identity bound
+    # (index_topk + index_kpool - 1 tokens): the top-k then keeps every token, so the
+    # indexer's query side, scoring, top-k and the sparse gathers are skipped. Read at
+    # trace time by ``model/glm5_next/dsa_dense_window.py``; a change needs a new
+    # compile. On by default; set 0 to restore the sparse path.
+    "VLLM_NEURON_MLA_DENSE_WINDOW": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_MLA_DENSE_WINDOW")) is not False
     ),
 }
 

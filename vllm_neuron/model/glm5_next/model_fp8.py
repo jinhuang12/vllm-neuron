@@ -6351,12 +6351,18 @@ class Glm5NextMLAAttention(nn.Module):
         latent_slots: torch.Tensor,
         page_size: int,
         dense: bool = False,
+        dense_window_seq_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """One layer's MLA attention. Returns ``[tokens, hidden_size]``.
 
         ``dense=True`` is a decode step whose selection keeps every token: the
         causal prefix ``0 .. start_position`` is attended directly by
         ``mla_decode_attention`` and ``topk_indices`` is not read (pass None).
+
+        ``dense_window_seq_lens`` is the prefill chunk's form of the same regime
+        (``dsa_dense_window.py``): each query row ``i`` attends window rows
+        ``0 .. seq_lens[i] - 1`` through ``mla_dense_window_attention`` and
+        ``topk_indices`` is not read (pass None).
 
         ``hidden_states`` is ``[tokens, hidden_size]``: a prefill passes all its
         tokens at once and a decode step passes one. ``latent_cache`` is the whole
@@ -6436,7 +6442,9 @@ class Glm5NextMLAAttention(nn.Module):
                     f"active_mla_query_rows must be a static integer in [1, {tokens}]; "
                     f"got {active_mla_query_rows!r}"
                 )
-            if topk_indices.ndim != 2 or topk_indices.shape[0] != tokens:
+            if dense_window_seq_lens is None and (
+                topk_indices.ndim != 2 or topk_indices.shape[0] != tokens
+            ):
                 raise Glm5NextMLADecodeError(
                     f"topk_indices must have {tokens} query rows before the active "
                     f"prefix is selected; got {tuple(topk_indices.shape)}"
@@ -6576,6 +6584,16 @@ class Glm5NextMLAAttention(nn.Module):
             attended = mla_decode_attention(
                 q_lift, c_kv, block_table_row.reshape(1, -1), start.reshape(1),
                 written, softmax_scale, page,
+            )
+        elif dense_window_seq_lens is not None:
+            # The prefill chunk whose selection keeps every token: the window's causal
+            # prefix, densely. Same operands and output layout as the sparse call.
+            from vllm_neuron.model.glm5_next.dsa_dense_window import attend_dense_window
+
+            attended = attend_dense_window(
+                q_lift, c_kv, dense_window_seq_lens, softmax_scale,
+                block_table_row=block_table_row, written=written, write_offset=at,
+                page_size=page, active_rows=active_mla_query_rows,
             )
         elif active_mla_query_rows is None or active_mla_query_rows == tokens:
             attended = mla_sparse_attention(
@@ -7003,15 +7021,33 @@ class Glm5NextMLAAttention(nn.Module):
                 bound, self.indexer.index_topk, self.indexer.index_kpool
             )
         )
+        # The prefill chunk whose selection is a no-op attends its window densely, on
+        # the same bound (dsa_dense_window.py). The indexer still writes its stores.
+        from vllm_neuron.model.glm5_next.dsa_dense_window import (
+            prefill_takes_dense_window,
+        )
+
+        dense_window = not dense and prefill_takes_dense_window(
+            is_decode=tail is not None,
+            max_seq_len=int(max_seq_len),
+            window_rows=int(block_table_row.shape[0]) * int(page_size),
+            index_topk=self.indexer.index_topk,
+            index_kpool=self.indexer.index_kpool,
+            hidden_dtype=normed_hidden_states.dtype,
+            cache_dtype=latent_cache.dtype,
+            heads=self.num_attention_heads,
+            latent=self.kv_lora_rank,
+        )
+        no_select = dense or dense_window
         q_latent = self.project_query_latent(normed_hidden_states)
         topk_indices = self.indexer(
             normed_hidden_states,
             q_latent,
             pool_cache,
             seq_lens,
-            max_seq_len=bound if dense else int(max_seq_len),
+            max_seq_len=bound if no_select else int(max_seq_len),
             page_size=int(page_size),
-            indices_wanted=not dense,
+            indices_wanted=not no_select,
             slot_mapping=slot_mapping,
             tail=tail,
             position=position,
@@ -7026,7 +7062,7 @@ class Glm5NextMLAAttention(nn.Module):
                 # slice inside the trace, no cast, so a -1 stays the sentinel it is
                 # rather than becoming a float. A shorter batch yields the rows it has.
             collector.append(
-                (self.indexer._bypass_indices(seq_lens) if dense else topk_indices)[:5]
+                (self.indexer._bypass_indices(seq_lens) if no_select else topk_indices)[:5]
             )
         return self.attend(
             normed_hidden_states,
@@ -7040,6 +7076,7 @@ class Glm5NextMLAAttention(nn.Module):
             latent_slots=latent_slots,
             page_size=int(page_size),
             dense=dense,
+            dense_window_seq_lens=seq_lens if dense_window else None,
             **(
                 {"active_mla_query_rows": active_mla_query_rows}
                 if active_mla_query_rows is not None else {}
