@@ -615,13 +615,11 @@ class NeuronPlatform(Platform):
 
         cls._resolve_sampling_from_the_model_class(vllm_config)
 
-        # After the sampling resolution above settles on_device_sampling_config and the
-        # hybrid block-size resolution publishes the KV page: both are policy inputs.
+        # After the sampling resolution above settles on_device_sampling_config, a
+        # policy input.
         from vllm_neuron.vllm import admission
 
-        cls._admission = admission.policy_from_config(
-            vllm_config, block_size=cls.resolved_uniform_page(vllm_config)
-        )
+        cls._admission = admission.policy_from_config(vllm_config)
         admission.install_eager_validation()
 
         if envs.VLLM_NEURON_RUNTIME_INPUT_SNAPSHOT_ENABLE:
@@ -774,8 +772,9 @@ class NeuronPlatform(Platform):
 
         Called per-request before scheduling. Raises ValueError before model
         execution so SO-off servers do not enter the SO mask path, and so a prompt
-        past the prefill window or a sampling request the on-device sampler cannot
-        serve never reaches the engine (see ``vllm_neuron/vllm/admission.py``).
+        that leaves no room for a generated token (``prompt + 1 > max_model_len``) or
+        a sampling request the on-device sampler cannot serve never reaches the
+        engine (see ``vllm_neuron/vllm/admission.py``).
         """
         if (
             not cls._enable_structured_outputs
