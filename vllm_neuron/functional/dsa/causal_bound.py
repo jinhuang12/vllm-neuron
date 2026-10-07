@@ -92,10 +92,12 @@ predicate in uint8."""
 
 _BOUND_TILES_IN_FLIGHT = 2
 """Column tiles whose SBUF tiles fit at once. Two, so the unrolled column loop can load one tile
-while it bounds the one before it."""
+while it bounds the one before it. This is a conservative sizing rule: the compiler can reuse the
+SBUF of a tile that is no longer live, so the real footprint is at most this."""
 
 
 def _largest_power_of_two_at_most(n: int) -> int:
+    """The largest power of two that is not above ``n``, for a positive ``n``."""
     return 1 << (int(n).bit_length() - 1)
 
 
@@ -104,7 +106,8 @@ COLUMN_TILE = _largest_power_of_two_at_most(
 """Candidate columns one bound tile holds: the largest power of two whose
 :data:`_BOUND_TILES_IN_FLIGHT` column tiles of :data:`_BOUND_BYTES_PER_COLUMN` bytes per column
 fit ``SBUF_BYTES_PER_PARTITION`` (4,096 on trn2). A power of two, so a power-of-two candidate
-width splits into whole tiles.
+width splits into whole tiles. The rule is conservative (see :data:`_BOUND_TILES_IN_FLIGHT`): a
+wider tile can also fit, but this one always does.
 
 A whole candidate row in SBUF stops neuronx-cc from width 32,768 on (a 131,072-token context at
 pool 4). A width up to this one is one column tile: the instructions the kernel ran before the
