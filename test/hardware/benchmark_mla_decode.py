@@ -17,7 +17,8 @@ written, ...)`` then ``.to(bfloat16)``, each layer with its own query and own ro
 table passed transposed as the model passes it. So a sample is one decode step's MLA
 decode attention plus the glue right around it, and one dispatch (the output is copied to
 CPU on every timed call); per-layer figures are the sample over ``--layers``. Before is
-the 0a08ff4 module loaded from ``--baseline-module``; after is this tree's.
+the 0a08ff4 module loaded from ``--baseline-module``; after is this tree's. Before and
+after samples interleave, so a change in host load reaches both alike.
 
 ``--profile-dir`` captures a device profile of ``--profile-iterations`` warmed iterations
 per variant after timing. ``cores`` (a separate CPU-only run, after ``neuron-explorer view
@@ -121,16 +122,28 @@ def rel_l2(got, want) -> float:
     return float((got - want).norm() / want.norm().clamp_min(1e-30))
 
 
-def measure(fn, inputs, layers: int, warmup: int, iterations: int) -> dict:
-    """Median and p90 of one sample (one step, ``layers`` calls), in microseconds."""
-    for _ in range(warmup):
-        fn(*inputs).to("cpu")
-    samples = []
-    for _ in range(iterations):
-        started = time.perf_counter_ns()
-        fn(*inputs).to("cpu")
-        samples.append((time.perf_counter_ns() - started) / 1000.0)
-    samples.sort()
+def measure(fns, inputs, layers: int, warmup: int, iterations: int) -> list[dict]:
+    """Median and p90 of one sample (one step, ``layers`` calls) per function, in us.
+
+    The functions' samples interleave (ABAB..., the order swapped every iteration), so a
+    change in host load during the run reaches every function alike.
+    """
+    for fn in fns:
+        for _ in range(warmup):
+            fn(*inputs).to("cpu")
+    samples = [[] for _ in fns]
+    for i in range(iterations):
+        order = range(len(fns)) if i % 2 == 0 else reversed(range(len(fns)))
+        for k in order:
+            started = time.perf_counter_ns()
+            fns[k](*inputs).to("cpu")
+            samples[k].append((time.perf_counter_ns() - started) / 1000.0)
+    return [_stats(one, layers, warmup) for one in samples]
+
+
+def _stats(samples: list, layers: int, warmup: int) -> dict:
+    samples = sorted(samples)
+    iterations = len(samples)
     median = statistics.median(samples)
     return {
         "iterations": iterations,
@@ -193,8 +206,8 @@ def run_case(batch: int, ctx: int, base, live, args) -> dict:
     if agreement > AGREE_REL_L2 or any(v["after"] > AGREE_REL_L2 for v in oracle.values()):
         raise AssertionError(f"B={batch} ctx={ctx}: after vs before {agreement:.3e}, "
                              f"vs oracle {oracle}")
-    before = measure(before_fn, inputs, args.layers, args.warmup, args.iterations)
-    after = measure(after_fn, inputs, args.layers, args.warmup, args.iterations)
+    before, after = measure((before_fn, after_fn), inputs, args.layers, args.warmup,
+                            args.iterations)
     profile_dir = None
     if args.profile_dir is not None:
         profile_dir = args.profile_dir.resolve() / f"b{batch}_ctx{ctx}"
@@ -337,6 +350,7 @@ def main() -> None:
         "shape": {"heads": HEADS, "latent": LATENT, "page": PAGE, "softmax_scale": SCALE,
                   "bank_rows": BANK_ROWS},
         "synchronization": "graph output copied to CPU on every timed call",
+        "sampling": "before and after samples interleaved, order swapped every iteration",
         "cases": [],
     }
     output.parent.mkdir(parents=True, exist_ok=True)
