@@ -67,10 +67,6 @@ from .config import Glm5NextTextConfig
 #: name error messages and tests spell.
 SHADOW_DRAFT_ENV = "VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT"
 
-#: The widest draft one step proposes. The recipe's ``num_speculative_tokens`` is 5
-#: and the shadow draft scores five positions; a wider knob is refused by name.
-MAX_DRAFT_K = 5
-
 #: The attribute the decoder block hangs on. The weight map spells the block's
 #: parameters ``mtp.block.<...>``; the head's own four hang flat on ``mtp``.
 BLOCK_ATTR = "block"
@@ -133,18 +129,19 @@ def shadow_draft_k() -> int:
     """The shadow draft's iteration count ``k``; 0 means off.
 
     The one reader of :data:`SHADOW_DRAFT_ENV` (contract C1): it goes through
-    ``envs``, which holds the knob's one definition, and bounds the value. Unset is
-    0. A value outside ``0 .. MAX_DRAFT_K`` is refused by name rather than clamped,
-    because a clamped knob would run a different draft than the one asked for and
-    the alpha it measures would be labelled with the wrong k.
+    ``envs``, which holds the knob's one definition. Unset is 0. A negative value is
+    refused by name rather than clamped, because a clamped knob would run a
+    different draft than the one asked for and the alpha it measures would be
+    labelled with the wrong k. Any positive k runs that many iterations; what bounds
+    it is the state the draft advances through, at run time, not a constant here.
     """
     from vllm_neuron import envs
 
     value = int(envs.VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT)
-    if not 0 <= value <= MAX_DRAFT_K:
+    if value < 0:
         raise ValueError(
-            f"{SHADOW_DRAFT_ENV}={value} is out of range; 0 turns the shadow draft "
-            f"off and 1..{MAX_DRAFT_K} runs that many draft iterations per step"
+            f"{SHADOW_DRAFT_ENV}={value} is negative; 0 turns the shadow draft off "
+            f"and k >= 1 runs that many draft iterations per step"
         )
     return value
 
@@ -176,9 +173,10 @@ class Glm5NextMultiTokenPredictor(nn.Module):
     """The draft head: layer 45 and the four tensors around it (see the module doc).
 
     Args:
-        text_config: the decoder config. The layer index is
-            ``num_hidden_layers`` (45), one past the stack; the norm epsilon, the
-            vocabulary and ``index_share_for_mtp_iteration`` are read off it.
+        text_config: the decoder config. The one draft layer's index is
+            ``num_hidden_layers + num_nextn_predict_layers - 1`` (one past the
+            stack); the norm epsilon, the vocabulary and
+            ``index_share_for_mtp_iteration`` are read off it.
         embed_tokens: a callable returning the embedding table, ``[vocab, H]``,
             replicated on every rank (the trunk indexes it directly). A callable
             because the table is materialised by the weight load, after this
@@ -206,9 +204,20 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         self.text_config = text_config
         self.hidden_size = int(text_config.hidden_size)
         self.vocab_size = int(text_config.vocab_size)
-        # One past the main stack, where the checkpoint puts the MTP layer. Read
-        # from the config rather than typed.
-        self.mtp_layer_idx = int(text_config.num_hidden_layers)
+        # The draft layers sit past the main stack, at indices ``num_hidden_layers ..
+        # num_hidden_layers + num_nextn_predict_layers - 1``. This head runs one, so
+        # any other count is refused. The count reads off the config when it carries
+        # the field (``Glm5NextTextConfig.num_nextn_predict_layers``, lifted from the
+        # checkpoint on the loader's branch) and is the checkpoint's one layer until
+        # the branches merge.
+        draft_layers = int(getattr(text_config, "num_nextn_predict_layers", 1))
+        if draft_layers != 1:
+            raise ValueError(
+                f"this head runs one draft layer and the config declares "
+                f"num_nextn_predict_layers={draft_layers}; a deeper MTP stack is not "
+                f"modelled"
+            )
+        self.mtp_layer_idx = int(text_config.num_hidden_layers) + draft_layers - 1
         self.world_size = int(world_size)
         self._embed_tokens = embed_tokens
         self._lm_head = lm_head
@@ -498,7 +507,8 @@ class Glm5NextMultiTokenPredictor(nn.Module):
             sampled_ids: ``[B]`` int32, the tokens the trunk sampled at ``positions``.
             positions: ``[B]`` int32, each request's position (the one the trunk
                 just consumed).
-            k: iterations, ``1 .. MAX_DRAFT_K``.
+            k: iterations, at least 1. The state the draft advances through (the
+                request's window, the pooled store) bounds it at run time.
             quant_config: the resolved quantisation policy the MoE half runs under
                 (the root resolves it once per forward and threads it to the stack;
                 the same object belongs here).
@@ -510,15 +520,12 @@ class Glm5NextMultiTokenPredictor(nn.Module):
                 present; no prefill keyword).
 
         Raises:
-            ValueError: for ``k`` out of range, a prefill-leg carrier, a decode
+            ValueError: for ``k < 1``, a prefill-leg carrier, a decode
                 carrier without ``tail``/``position``, or a missing ``quant_config``.
         """
         k = int(k)
-        if not 1 <= k <= MAX_DRAFT_K:
-            raise ValueError(
-                f"draft_tokens runs k draft iterations with 1 <= k <= {MAX_DRAFT_K}; "
-                f"got k={k}"
-            )
+        if k < 1:
+            raise ValueError(f"draft_tokens runs k >= 1 draft iterations; got k={k}")
         present = [name for name in _PREFILL_LEG_KEYWORDS if block_kwargs.get(name) is not None]
         if present:
             raise ValueError(

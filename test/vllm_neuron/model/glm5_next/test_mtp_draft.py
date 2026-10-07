@@ -599,15 +599,14 @@ def test_shadow_draft_k_reads_the_knob_through_envs(monkeypatch) -> None:
     monkeypatch.delenv(KNOB, raising=False)
     assert mtp.shadow_draft_k() == 0, "unset means no shadow draft"
     assert envs.VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT == 0
-    for value in ("1", "3", "5"):
+    for value in ("1", "3", "5", "8"):
         monkeypatch.setenv(KNOB, value)
         assert mtp.shadow_draft_k() == int(value)
         assert isinstance(mtp.shadow_draft_k(), int)
         assert envs.VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT == int(value)
-    for value in ("6", "-1"):
-        monkeypatch.setenv(KNOB, value)
-        with pytest.raises(ValueError, match=KNOB):
-            mtp.shadow_draft_k()
+    monkeypatch.setenv(KNOB, "-1")
+    with pytest.raises(ValueError, match=KNOB):
+        mtp.shadow_draft_k()
     assert KNOB in envs.environment_variables
     source = Path(envs.__file__).read_text()
     assert source.count(f'"{KNOB}": lambda') == 1, "exactly one definition of the knob in envs.py"
@@ -892,8 +891,9 @@ def test_a_proposal_of_the_wrong_width_is_rejected() -> None:
         _k_tokens_per_request(torch.zeros(1, 5, dtype=torch.int64), 1, 5, "dtype mutant")
 
 
-def test_every_draft_iteration_runs_the_single_layer_45_and_k_is_bounded() -> None:
-    """No layer index wraps: there is one draft layer and it runs ``k`` times."""
+def test_every_draft_iteration_runs_the_single_layer_45_and_k_is_positive() -> None:
+    """No layer index wraps: there is one draft layer and it runs ``k`` times; a
+    ``k`` below 1 is refused by name."""
     _skip_unless_live()
     fx = _fixture(63_801, index_share_for_mtp_iteration=False)
     head = fx["head"]
@@ -908,7 +908,7 @@ def test_every_draft_iteration_runs_the_single_layer_45_and_k_is_bounded() -> No
     head.block.forward = counting_forward
     _draft(fx, fx["prefill"], DRAFT_K)
     assert calls == [1] * DRAFT_K, f"layer 45 must run once per iteration on one row: {calls}"
-    for bad in (0, 6):
+    for bad in (0, -1):
         with pytest.raises(ValueError, match="k"):
             _draft(fx, fx["prefill"], bad)
 
