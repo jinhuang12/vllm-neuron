@@ -3,8 +3,9 @@
 
 The simulator runs a kernel body as plain Python, so it cannot see a call form the
 compiler's front end refuses. This file compiles every new entry at the served shapes --
-decode attention dense and selected at B in {1, 4} on one and two programs, and the
-low-precision projection at each DSA site's TP=64 width at M in {1, 4} on one and two
+decode attention dense and selected at B in {1, 4} on one and two programs, the
+key-split decode attention dense (ctx 1024) and selected (ctx 8192) at B in {1, 4, 64} on
+one and two programs, and the low-precision projection at each DSA site's TP=64 width at M in {1, 4} on one and two
 programs -- inside a child process that pins the platform target, opens no device node,
 and proves it parsed bodies by refusing one that reads an undefined name. The pattern is
 ``test_mla_sparse_frontend_compile.py``'s.
@@ -29,6 +30,9 @@ _PIN = {"VLLM_NEURON_CPU_COMPILE": "1", "NEURON_PLATFORM_TARGET_OVERRIDE": "trn2
 
 LATENT, PAGE, BANK_PAGES = 512, 128, 64
 DENSE_PAGES, SELECTED_PAGES, TOPK_ROWS = 16, 32, 2048
+#: The key-split kernel's served windows: ctx 1024 dense, ctx 8192 selected.
+SPLIT_DENSE_PAGES, SPLIT_SELECTED_PAGES = 16, 64
+SPLIT_BATCHES = (1, 4, 64)
 SITES = ((4096, 1536, True), (1536, 256, True), (4096, 512, True), (256, 4096, True),
          (1536, 4096, False), (4096, 128, False), (4096, 32, False))
 
@@ -78,6 +82,20 @@ def _compile_each_entry() -> None:
                 fake((b, 1, LATENT), bf), fake((BANK_PAGES * PAGE, LATENT), bf),
                 fake((b, SELECTED_PAGES), i32), fake((b,), i32), fake((b, LATENT), bf),
                 fake((b, TOPK_ROWS), i32), 0.0625, PAGE, MD.SOURCE_DIGEST)))
+    for batch in SPLIT_BATCHES:
+        for programs in (1, 2):
+            built.append((f"dense_split_b{batch}_g{programs}", lambda b=batch, g=programs: grid(
+                MD.mla_decode_dense_split_kernel, g)(
+                fake((b, 1, LATENT), bf), fake((BANK_PAGES * PAGE, LATENT), bf),
+                fake((b, SPLIT_DENSE_PAGES), i32), fake((b,), i32), fake((b, LATENT), bf),
+                0.0625, PAGE, MD.SOURCE_DIGEST)))
+            built.append((f"selected_split_b{batch}_g{programs}",
+                          lambda b=batch, g=programs: grid(
+                              MD.mla_decode_selected_split_kernel, g)(
+                              fake((b, 1, LATENT), bf), fake((BANK_PAGES * PAGE, LATENT), bf),
+                              fake((b, SPLIT_SELECTED_PAGES), i32), fake((b,), i32),
+                              fake((b, LATENT), bf), fake((b, TOPK_ROWS), i32), 0.0625, PAGE,
+                              MD.SOURCE_DIGEST)))
     for rows in (1, 4):
         for idim, odim, fp8 in SITES:
             for programs in (1, 2):
@@ -137,7 +155,7 @@ def test_the_front_end_accepts_every_new_entry_at_the_served_shapes() -> None:
     assert control and control[0]["refused"] == "True", (
         f"the child accepted a body that reads an undefined name, so it parsed none: {control}")
     entries = [row for row in rows if row["entry"] != "undefined_name_body"]
-    assert len(entries) == 8 + 2 * len(SITES) * 2, len(entries)
+    assert len(entries) == 8 + 2 * len(SPLIT_BATCHES) * 2 + 2 * len(SITES) * 2, len(entries)
     refused = [f"{row['entry']}: {row['diagnostic']}" for row in entries
                if row["refused"] != "False"]
     assert not refused, refused
