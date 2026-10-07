@@ -5382,7 +5382,12 @@ class Glm5NextDSAIndexer(nn.Module):
             if not indices_wanted:
                 return None
             return self._bypass_indices(seq_lens)
-        return self.expand_indices(self._select_bounded(bounded), seq_lens)
+        # One kernel for top-k, sentinel, order and expand: the same token set, real
+        # pools in ascending order (functional/dsa/decode_select.py).
+        from vllm_neuron.functional.dsa.decode_select import dsa_decode_select
+
+        return dsa_decode_select(bounded, seq_lens, select_k=self.select_k(),
+                                 pool_size=pool)
 
     def forward_ragged(
         self,

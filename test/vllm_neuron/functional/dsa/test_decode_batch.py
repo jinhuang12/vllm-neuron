@@ -98,6 +98,29 @@ def test_ring_step_reads_only_the_named_slots():
     assert torch.equal(clean[0], dirty[0]) and torch.equal(clean[1], dirty[1])
 
 
+@pytest.mark.parametrize("batch", [2, 5, 8])
+def test_ring_step_two_programs_split_the_requests_and_equal_one(monkeypatch, batch):
+    """Both cores of an LNC2 core advance half the rings each, bit for bit as one."""
+    bank, slots, key, score, ape, position = _ring_case(batch, seed=500 + batch)
+    one = DB.dsa_decode_ring_step(bank, slots, key, score, ape, position)
+    DB.reset_decode_batch_dispatch_counters()
+    monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", "2")
+    two = DB.dsa_decode_ring_step(bank, slots, key, score, ape, position)
+    assert DB.decode_batch_route_counts() == (1, 0, 1, 0)
+    assert torch.equal(one[0], two[0]) and torch.equal(one[1], two[1])
+
+
+def test_the_kernel_key_covers_the_butterfly_the_kernels_call():
+    """Both kernels' cache key is a digest over this module and ``kpool_hadamard.py``,
+    whose butterfly the ring step calls: an edit to either re-keys the kernels."""
+    import hashlib
+    from pathlib import Path
+
+    from vllm_neuron.functional.dsa import kpool_hadamard as KH
+    data = Path(DB.__file__).read_bytes() + Path(KH.__file__).read_bytes()
+    assert DB.SOURCE_DIGEST == int(hashlib.sha256(data).hexdigest()[:7], 16)
+
+
 def test_ring_step_torch_oracle_agrees():
     bank, slots, key, score, ape, position = _ring_case(4, seed=23)
     pooled, rings = DB.dsa_decode_ring_step(bank, slots, key, score, ape, position)

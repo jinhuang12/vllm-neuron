@@ -181,9 +181,10 @@ def test_a_selecting_step_scores_all_requests_in_one_launch_per_layer(monkeypatc
     # B > 1 attends through the batched decode kernel; one request keeps its own
     # one-request attention (``attend`` at batch_size 1), only its indexer moved.
     attention = _attention("selected" if batch > 1 else "sparse", launches)
-    # One ring step and one score launch per layer and step, each on every row.
+    # One ring step, one score launch and one selection per layer and step, each on every
+    # row (the selection counts in the batched decode family).
     assert seen == [("dsa_decode_ring_step", batch), ("dsa_decode_scores", batch)] * launches
-    assert batched_ran == {"batch": (2 * launches, 0), "routes": (launches, launches),
+    assert batched_ran == {"batch": (3 * launches, 0), "routes": (launches, launches),
                            "score_gemm": (0, 0), "tail": (0, 0),
                            "attention": attention}, batched_ran
     # The loop it replaced: the one-request kernels, once per request, layer and step.

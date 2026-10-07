@@ -27,9 +27,8 @@ and the head sum is one free-axis reduce. The one-request kernel puts the single
 on the partitions instead and pays a matmul, a rectify, a scale and an add per head per
 512 candidates, which is what made it slow at one token.
 
-Both physical cores of an LNC2 core split the requests of the score stage (``[2]``
-grid at ``B >= 2``). The ring step is a few vector ops on ``B`` partitions and runs on
-one program.
+Both physical cores of an LNC2 core split the requests of both stages (``[2]`` grid at
+``B >= 2``).
 """
 
 from __future__ import annotations
@@ -51,10 +50,11 @@ from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
 from vllm_neuron.functional.dsa.causal_bound import BOUND_FILL
 from vllm_neuron.functional.dsa.decode_tail_update import TAIL_HALVES, _compress_pool_torch
+from vllm_neuron.functional.dsa import kpool_hadamard as _kpool_hadamard
 from vllm_neuron.functional.dsa.kpool_hadamard import (
     HADAMARD_SCALE,
     INDEX_HEAD_DIM,
-    _fwht128_inplace,
+    _fwht128_blocks,
 )
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
@@ -74,10 +74,13 @@ MAX_CANDIDATES = PARTITIONS * PARTITIONS
 #: declares its scalars.
 _LINE = 8
 
-#: This file's content digest, handed to both kernels as a trace-time int: the compiled
-#: kernel cache keys on a kernel's own source and its arguments, and both kernels call
-#: helpers whose edits it would otherwise not see.
-SOURCE_DIGEST = int(hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:7], 16)
+#: The content digest of this file and of ``kpool_hadamard.py`` (whose butterfly the ring
+#: step calls), handed to both kernels as a trace-time int: the compiled kernel cache keys
+#: on a kernel's own source and its arguments, and both kernels call helpers whose edits it
+#: would otherwise not see.
+SOURCE_DIGEST = int(hashlib.sha256(
+    Path(__file__).read_bytes() + Path(_kpool_hadamard.__file__).read_bytes()
+).hexdigest()[:7], 16)
 
 
 class DecodeBatchError(ValueError):
@@ -91,6 +94,7 @@ class _DecodeBatchCounters:
     ring_dispatch: int = 0
     scores_dispatch: int = 0
     two_program_dispatch: int = 0
+    select_dispatch: int = 0
 
 
 _COUNTERS = _DecodeBatchCounters()
@@ -103,17 +107,22 @@ def reset_decode_batch_dispatch_counters() -> None:
     _COUNTERS.ring_dispatch = 0
     _COUNTERS.scores_dispatch = 0
     _COUNTERS.two_program_dispatch = 0
+    _COUNTERS.select_dispatch = 0
 
 
 def decode_batch_dispatch_counters() -> tuple[int, int]:
-    """``(nki_dispatch, torch_fallback)`` over both entry points, the family form."""
+    """``(nki_dispatch, torch_fallback)`` over the batched decode stages, the family form:
+    the ring step and the scores here, and the selection
+    (:func:`vllm_neuron.functional.dsa.decode_select.dsa_decode_select`), which counts in
+    this family."""
     return (_COUNTERS.nki_dispatch, _COUNTERS.torch_fallback)
 
 
-def decode_batch_route_counts() -> tuple[int, int, int]:
-    """``(ring_dispatch, scores_dispatch, two_program_dispatch)`` since the last reset."""
+def decode_batch_route_counts() -> tuple[int, int, int, int]:
+    """``(ring_dispatch, scores_dispatch, two_program_dispatch, select_dispatch)`` since
+    the last reset."""
     return (_COUNTERS.ring_dispatch, _COUNTERS.scores_dispatch,
-            _COUNTERS.two_program_dispatch)
+            _COUNTERS.two_program_dispatch, _COUNTERS.select_dispatch)
 
 
 @torch._dynamo.assume_constant_result
@@ -122,6 +131,8 @@ def _count_dispatch(entry: str, programs: int, batch: int) -> None:
     _COUNTERS.nki_dispatch += 1
     if entry == "ring":
         _COUNTERS.ring_dispatch += 1
+    elif entry == "select":
+        _COUNTERS.select_dispatch += 1
     else:
         _COUNTERS.scores_dispatch += 1
     if programs == 2:
@@ -187,7 +198,9 @@ def dsa_decode_ring_step_kernel(tail_hbm, slots_hbm, key_hbm, score_hbm, ape_hbm
 
     The compression is the one-request kernel's instruction sequence at its last slot,
     one request per partition: the same loads, the same order of adds, the same two
-    bf16 round trips and the same butterfly, so the two agree bit for bit.
+    bf16 round trips and the same butterfly arithmetic (each stage as two instructions
+    over every block, :func:`kpool_hadamard._fwht128_blocks`), so the two agree bit for
+    bit. The requests split evenly over the programs of the launch grid.
     """
     batch = key_hbm.shape[0]
     head_dim = key_hbm.shape[1]
@@ -195,8 +208,13 @@ def dsa_decode_ring_step_kernel(tail_hbm, slots_hbm, key_hbm, score_hbm, ape_hbm
     last = pool_size - 1
     pooled_hbm = nl.ndarray((batch, head_dim), dtype=tail_hbm.dtype, buffer=nl.shared_hbm)
     rings_hbm = nl.ndarray((batch, width), dtype=tail_hbm.dtype, buffer=nl.shared_hbm)
-    for r0 in range(0, batch, PARTITIONS):
-        h = min(PARTITIONS, batch - r0)
+    n_prgs = nl.num_programs(axes=0)
+    prg = nl.program_id(0)
+    share = (batch + n_prgs - 1) // n_prgs
+    lo = prg * share
+    hi = min(batch, lo + share)
+    for r0 in range(lo, hi, PARTITIONS):
+        h = min(PARTITIONS, hi - r0)
         ring = _sb((h, width), tail_hbm.dtype)
         if tail_hbm.shape[0] == 1:
             # One slot: the only valid slot is 0, so the read is static. (Tracing in CPU
@@ -274,7 +292,7 @@ def dsa_decode_ring_step_kernel(tail_hbm, slots_hbm, key_hbm, score_hbm, ape_hbm
         pooled_rt = _sb((h, head_dim), nl.float32)
         nisa.tensor_copy(dst=pooled_rt, src=pooled_bf)
         scratch = _sb((h, head_dim), nl.float32)
-        rotated = _fwht128_inplace(pooled_rt, scratch, head_dim)
+        rotated = _fwht128_blocks(pooled_rt, scratch, h, 1)
         scaled = _sb((h, head_dim), nl.float32)
         nisa.tensor_scalar(dst=scaled, data=rotated, op0=nl.multiply, operand0=HADAMARD_SCALE)
         result = _sb((h, head_dim), tail_hbm.dtype)
@@ -572,9 +590,13 @@ def dsa_decode_ring_step(tail_bank: Tensor, slots: Tensor, key: Tensor, score: T
     if not usable:
         _count_torch_fallback()
         return dsa_decode_ring_step_torch_oracle(tail_bank, slots, key, score, ape, position)
-    _count_dispatch("ring", 1, batch)
+    programs = _programs(batch)
+    _count_dispatch("ring", programs, batch)
     width = TAIL_HALVES * pool * head_dim
-    pooled, rings = wrap_nki(dsa_decode_ring_step_kernel)(
+    call = wrap_nki(dsa_decode_ring_step_kernel)
+    if programs == 2:
+        call = call[2]
+    pooled, rings = call(
         tail_bank.reshape(int(tail_bank.shape[0]), width).contiguous(),
         slots.reshape(batch, 1).to(torch.int32).contiguous(),
         key.contiguous(), score.contiguous(), ape.to(torch.float32).contiguous(),
