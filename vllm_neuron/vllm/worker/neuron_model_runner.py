@@ -402,6 +402,50 @@ def kv_cache_allocations(
     return allocations
 
 
+def indexer_side_cache_bytes(
+    kv_cache_spec: dict[str, KVCacheSpec],
+    text_config: Any,
+    *,
+    max_seq_len: int,
+    request_slots: int,
+) -> int:
+    """Return the bytes of the DSA indexer side caches the runner allocates beside the KV cache.
+
+    Every sparse-attention layer keeps a pooled-key store, a decode ring and a padding
+    ring (``pool_cache``, ``tail`` and ``pad_tail``) that no ``KVCacheSpec`` declares,
+    so neither vLLM's KV cache config nor :func:`kv_cache_allocations` holds them. The
+    bytes are read off the builder that allocates them,
+    ``NeuronModelRunner._glm5next_side_caches``, run on the meta device: the price is
+    the allocation by construction. A layer gets them when its spec is not a
+    ``MambaSpec``, the test ``bind_kv_cache`` makes, and in the latent bank's dtype.
+
+    ``max_seq_len`` and ``request_slots`` are the values the runner allocates with,
+    ``max_model_len`` and ``max_num_seqs``. A model whose text config declares no
+    indexer (``index_kpool`` and ``index_head_dim``) has no side caches: 0.
+    """
+    index_kpool = getattr(text_config, "index_kpool", None)
+    index_head_dim = getattr(text_config, "index_head_dim", None)
+    if index_kpool is None or index_head_dim is None:
+        return 0
+    banks = [
+        {"family": "linear_attn"}
+        if isinstance(spec, MambaSpec)
+        else {
+            "family": "self_attn",
+            "latent_cache": torch.empty((0,), dtype=spec.dtype, device="meta"),
+        }
+        for spec in kv_cache_spec.values()
+    ]
+    side = NeuronModelRunner._glm5next_side_caches(
+        banks,
+        index_kpool=int(index_kpool),
+        index_head_dim=int(index_head_dim),
+        max_seq_len=int(max_seq_len),
+        request_slots=int(request_slots),
+    )
+    return sum(tensor.nbytes for entry in side for tensor in entry.values())
+
+
 def build_sampling_params_tensor(
     sampling_metadata, num_reqs: int, device: torch.device
 ) -> torch.Tensor:
