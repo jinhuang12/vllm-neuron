@@ -335,10 +335,10 @@ def _grouped_experts(hidden, affinity, rank_reg, local, weights, scales, clamp, 
                             index_offset=0, padding_val=0)
     count = nisa.register_alloc()
     nisa.register_load(dst=count, src=work[:, items:items + 1])
-    item_expert = nl.ndarray((1, max(items, 8)), dtype=nl.uint32, buffer=nl.sbuf)
+    item_expert = nl.ndarray((1, max(items, 8)), dtype=nl.int32, buffer=nl.sbuf)
     nisa.tensor_scalar(dst=item_expert[:, 0:items], data=work[:, 0:items],
                        op0=nl.right_shift, operand0=shift)
-    item_group = nl.ndarray((1, max(items, 8)), dtype=nl.uint32, buffer=nl.sbuf)
+    item_group = nl.ndarray((1, max(items, 8)), dtype=nl.int32, buffer=nl.sbuf)
     nisa.tensor_scalar(dst=item_group[:, 0:items], data=work[:, 0:items],
                        op0=nl.bitwise_and, operand0=slots - 1)
 
