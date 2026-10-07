@@ -119,13 +119,14 @@ def test_the_old_standard_line_is_refused_naming_the_window_and_the_segment_to_a
 @pytest.mark.parametrize(
     "segments, queries, max_model_len, needed",
     [
-        ([1024, 2048], [1024], 4096, 3072),  # 3072 < 4096
-        ([1024], None, 4096, 2048),  # copied queries: 2048 < 4096, needs >= 2048 + ... 
+        ([1024, 2048], [1024], 4096, 3072),  # window 3072 < 4096; 4096 - 1024 needed
+        ([1024], None, 4096, 3072),  # queries copied from the segments: window 2048
         ([1024, 2048], [1024], 8192, 7168),
         ([4096], [1024], 8192, 7168),
     ],
 )
 def test_a_list_whose_window_falls_short_is_refused(segments, queries, max_model_len, needed):
+    """`needed` = max_model_len - the largest query bucket: the segment the message asks for."""
     with pytest.raises(ValueError, match="prefill window") as refused:
         validate_kv_segment_size_buckets(
             segments,
@@ -134,7 +135,9 @@ def test_a_list_whose_window_falls_short_is_refused(segments, queries, max_model
             block_size=PAGE,
             max_model_len=max_model_len,
         )
-    assert str(max_model_len) in str(refused.value)
+    message = str(refused.value)
+    assert str(max_model_len) in message, message
+    assert f"at least {needed} tokens" in message, message
 
 
 def test_a_window_no_supported_segment_covers_is_refused_naming_the_longest_window():
