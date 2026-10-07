@@ -25,10 +25,10 @@ Stages 4 and 5 (:func:`inter_chunk_lnc2`)
     read the state: the chunk-local cumulative gate, the normalised and gated query, the
     transposes of ``w``, ``qg`` and ``Aqk``, and the per-chunk decay column. Those run once
     per 128-token tile. The chunk loop keeps only what reads the state: ``v_new = u - w @ h``,
-    ``h' = h * decay + kg^T @ v_new``, and the output ``o = qg @ h + Aqk @ v_new``, which
-    accumulates both products in one PSUM tile. The two programs split the value columns:
-    the decay is per key channel, so the state's value columns never mix, and each program
-    carries ``[K, V / 2]`` of the state with no exchange between the cores.
+    ``h' = h * decay + kg^T @ v_new``, and the output ``o = qg @ h + Aqk @ v_new``, its two
+    products formed apart and added once, as 342e93e adds them. The two programs split the
+    value columns: the decay is per key channel, so the state's value columns never mix, and
+    each program carries ``[K, V / 2]`` of the state with no exchange between the cores.
 
 Both kernels take :data:`SOURCE_DIGEST` as their last argument, so an edit to this file or to
 the ``chunked_recurrence`` helpers they emit through changes the compiled-kernel cache key.
@@ -382,6 +382,7 @@ def _kda_inter_lnc2_nki(kg_hbm, w_hbm, u_hbm, gk_hbm, q_hbm, aqk_hbm, triu_hbm, 
     ps_v = [_psum(chunk, width), _psum(chunk, width)]
     ps_h = [_psum(kdim, width), _psum(kdim, width)]
     ps_o = [_psum(chunk, width), _psum(chunk, width)]
+    ps_a = [_psum(chunk, width), _psum(chunk, width)]
     cur = 0
 
     for c0 in range(0, n_chunks, group):
@@ -454,11 +455,16 @@ def _kda_inter_lnc2_nki(kg_hbm, w_hbm, u_hbm, gk_hbm, q_hbm, aqk_hbm, triu_hbm, 
                            accumulate=False)
             nisa.scalar_tensor_tensor(dst=h_next, data=h_now, op0=nl.multiply,
                                       operand0=decay[:, b:b + 1], op1=nl.add, operand1=ph)
+            # o = qg @ h + Aqk @ v_new: each product rounded on its own, then one fp32 add,
+            # as 342e93e forms it. Accumulating the second product into the first's PSUM
+            # tile rounds differently on the device (about 1 ulp of o).
             po = ps_o[b % 2]
+            pa = ps_a[b % 2]
             nisa.nc_matmul(dst=po, stationary=qg_t[:, cols], moving=h_now, accumulate=False)
-            nisa.nc_matmul(dst=po, stationary=aqk_t[:, cols], moving=vn3[:, b, :],
-                           accumulate=True)
+            nisa.nc_matmul(dst=pa, stationary=aqk_t[:, cols], moving=vn3[:, b, :],
+                           accumulate=False)
             nisa.tensor_copy(dst=o3[:, b, :], src=po)
+            nisa.tensor_tensor(dst=o3[:, b, :], data1=o3[:, b, :], data2=pa, op=nl.add)
             cur = 1 - cur
 
         out_pattern = [[vdim, chunk], [chunk * vdim, nc], [1, width]]
