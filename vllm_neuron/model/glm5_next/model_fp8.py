@@ -8444,6 +8444,27 @@ class Glm5NextForConditionalGeneration(nn.Module):
         # checkpoint key and therefore no separate parameter.
         if not self.text_config.tie_word_embeddings:
             _declare_parameters(self, "lm_head_weight")
+        # The multi-token-prediction draft head, the checkpoint's layer past the
+        # stack, built on the same knob the weight map follows (the head's own
+        # ``shadow_draft_k``, contract C1), so the map claims that layer's keys
+        # exactly when there is a module to hold them. ``None`` with the knob off:
+        # nothing else in this tree changes. The two weights the head reads are
+        # declared above and materialised only in ``load_weights``, so they are
+        # handed over as callables, and the group is resolved the way every
+        # row-parallel reduction in this file resolves it. Imported here, not at
+        # module level: the head imports this module lazily, so a top-level import
+        # either way would be a cycle.
+        from .mtp import Glm5NextMultiTokenPredictor, shadow_draft_k
+
+        self.mtp = None
+        if shadow_draft_k() > 0:
+            self.mtp = Glm5NextMultiTokenPredictor(
+                self.text_config,
+                embed_tokens=lambda: self.model.embed_tokens_weight,
+                lm_head=lambda: self.lm_head_weight,
+                world_size=self.world_size,
+                tp_group=_resolve_tp_group,
+            )
 
     # ── construction ─────────────────────────────────────────────────────
 
