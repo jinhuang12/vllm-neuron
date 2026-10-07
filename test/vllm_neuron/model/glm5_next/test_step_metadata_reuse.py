@@ -120,7 +120,8 @@ def test_next_step_builds_fresh_values_and_keeps_the_previous_step_intact():
         assert first[0][key] is not second[0][key]
 
 
-def test_multiple_request_axis_preserves_positions_and_state_slots():
+def test_multiple_request_axis_preserves_positions_and_state_slots(monkeypatch):
+    monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_STATE_BANKS", "0")  # this test pins the per-request VIEW form
     banks, side, geometries = _stack(linear=3, sparse=0)
     for geometry in geometries:
         geometry["state_slots"] = [1, 0]

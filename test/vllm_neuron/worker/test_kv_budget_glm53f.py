@@ -606,12 +606,15 @@ def test_the_recurrent_banks_follow_max_num_seqs_and_the_pool_follows_max_model_
         if isinstance(spec, MambaSpec):
             conv_bytes, recurrent_bytes = _kda_state_bytes(spec)
             conv, recurrent = caches[name]
-            slot_stride = conv.stride(0) * conv.element_size()
             assert conv.shape[0] == recurrent.shape[0] == max_num_seqs
             assert tuple(conv.shape[1:]) == spec.shapes[0]
             assert tuple(recurrent.shape[1:]) == spec.shapes[1]
-            assert recurrent.stride(0) * recurrent.element_size() == slot_stride
-            assert slot_stride <= 1.5 * (conv_bytes + recurrent_bytes)
+            # Both banks are contiguous regions of the layer's one buffer (the bank form
+            # hands them whole to the graph), and the buffer prices one slot per sequence.
+            assert conv.is_contiguous() and recurrent.is_contiguous()
+            assert conv.untyped_storage().data_ptr() == recurrent.untyped_storage().data_ptr()
+            slot_bytes = conv.untyped_storage().nbytes() // max_num_seqs
+            assert conv_bytes + recurrent_bytes <= slot_bytes <= 1.5 * (conv_bytes + recurrent_bytes)
         else:
             assert isinstance(spec, MLAAttentionSpec)
             (latent,) = caches[name]
