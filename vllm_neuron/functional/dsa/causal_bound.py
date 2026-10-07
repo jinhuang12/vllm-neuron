@@ -15,7 +15,9 @@ between partitions with a 0/1 permutation matmul, where ``0 * -inf`` is NaN. A
 row shorter than one pool completes nothing, so all of its columns are filled;
 what such a row means is the attention consumer's contract, not this module's.
 Both kernels walk the query-token axis in tiles of at most
-:data:`PARTITION_MAX` rows, the most one SBUF tile's partition axis holds.
+:data:`PARTITION_MAX` rows, the most one SBUF tile's partition axis holds. The bound
+also walks the candidate (column) axis in tiles of at most :data:`COLUMN_TILE`, so its
+SBUF use does not grow with the context.
 """
 
 import logging
@@ -80,6 +82,16 @@ This bounds one row tile, not the call. The kernel walks the query-token axis in
 most this height, so a prefill with more tokens than this is served rather than trapped in the
 assert the module docstring quotes. It is a module constant so both kernels and the tile
 arithmetic read one number.
+"""
+
+
+COLUMN_TILE = 4096
+"""Candidate columns one bound tile holds: 16 KiB of fp32 scores per partition.
+
+The bound keeps a score tile and five helper tiles of the same width live per row tile, so
+a whole candidate row in SBUF stops neuronx-cc from width 32,768 on (a 131,072-token
+context at pool 4). A width up to this one is one column tile: the instructions the kernel
+ran before the column axis was tiled, with the per-row length loaded first.
 """
 
 
@@ -204,6 +216,27 @@ def _row_tile_count_unchecked(rows: int) -> int:
     return (rows + PARTITION_MAX - 1) // PARTITION_MAX
 
 
+def _column_tiles_unchecked(width: int) -> list[tuple[int, int]]:
+    """The ``(start, width)`` candidate-column tiles of the bound, in order.
+
+    Written as :func:`_row_tiles_unchecked` is, for the same tracer. Every tile but the
+    last is :data:`COLUMN_TILE` wide.
+    """
+    tiles = []
+    for start in range(0, width, COLUMN_TILE):
+        remaining = width - start
+        if remaining < COLUMN_TILE:
+            tiles.append((start, remaining))
+        else:
+            tiles.append((start, COLUMN_TILE))
+    return tiles
+
+
+def _column_tile_count_unchecked(width: int) -> int:
+    """How many tiles :func:`_column_tiles_unchecked` returns. Ceiling division."""
+    return (width + COLUMN_TILE - 1) // COLUMN_TILE
+
+
 def row_tiles(rows: int) -> list[tuple[int, int]]:
     """The ``(start, height)`` query-token tiles both kernels walk, in order. The checked path.
 
@@ -255,7 +288,7 @@ def _causal_bound_nki(scores_hbm, causal_len_hbm, pool_size):
     one predicated copy, so a kept column carries the loaded bits unchanged: no add of ``0.0``
     to turn ``-0.0`` into ``+0.0``, and no ``0 * -inf`` to produce NaN. The query-token axis is
     walked in tiles of at most :data:`PARTITION_MAX` rows, each tile reading only its own rows
-    of both inputs.
+    of both inputs, and the candidate axis in tiles of at most :data:`COLUMN_TILE` columns.
     """
     rows = scores_hbm.shape[0]
     width = scores_hbm.shape[1]
@@ -266,18 +299,13 @@ def _causal_bound_nki(scores_hbm, causal_len_hbm, pool_size):
     # `row_tiles` raises, and NKI refuses a traced `raise`.
     tiles = _row_tiles_unchecked(int(rows))
     tile_count = _row_tile_count_unchecked(int(rows))
+    columns = _column_tiles_unchecked(int(width))
+    column_count = _column_tile_count_unchecked(int(width))
 
     for idx in range(tile_count):
         tile_geom = tiles[idx]
         start = tile_geom[0]
         height = tile_geom[1]
-
-        # This tile's scores, loaded once. The mask writes into this tile, so it is also this
-        # tile's slice of the result.
-        scores_sb = nl.ndarray((height, width), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(
-            dst=scores_sb, src=nl.load(scores_hbm[start:start + height, 0:width])
-        )
 
         # This tile's per-row lengths as a float32 column operand, re-loaded per tile because
         # `causal_len` is per row: a hoisted column would bound every tile by the first tile's
@@ -294,38 +322,53 @@ def _causal_bound_nki(scores_hbm, causal_len_hbm, pool_size):
         nclen = nl.ndarray((height, 1), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(dst=nclen, data=clen, op0=nl.multiply, operand0=-1.0)
 
-        # The column ramp `p`, the same 0..width-1 on every partition of this tile.
-        # `nisa.iota` with `channel_multiplier=0`, because this NKI image has no `nl.arange`,
-        # `mgrid`, `nl.iota` or `nl.affine_select` to synthesise it.
-        ramp = nl.ndarray((height, width), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.iota(dst=ramp, pattern=[[1, width]], offset=0, channel_multiplier=0)
+        for cidx in range(column_count):
+            column_geom = columns[cidx]
+            c0 = column_geom[0]
+            cw = column_geom[1]
 
-        # `(p + 1) * pool_size`, the first token index past pool `p`, as one two-scalar chain.
-        # The bound is written as this multiply-and-compare rather than
-        # `p >= causal_len // pool_size` because `nl.divide` is silently wrong on int32 and
-        # `nl.right_shift` refuses as the second op of a chain. Over integers the two agree.
-        end = nl.ndarray((height, width), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_scalar(dst=end, data=ramp,
-                           op0=nl.multiply, operand0=float(pool_size),
-                           op1=nl.add, operand1=float(pool_size))
+            # This tile's scores, loaded once. The mask writes into this tile, so it is also
+            # this tile's slice of the result.
+            scores_sb = nl.ndarray((height, cw), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(
+                dst=scores_sb, src=nl.load(scores_hbm[start:start + height, c0:c0 + cw])
+            )
 
-        # `(p + 1) * pool_size - causal_len[i]`, one tile operand broadcast along the free axis.
-        room = nl.ndarray((height, width), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_scalar(dst=room, data=end, op0=nl.add, operand0=nclen)
+            # The column ramp `p`, the same c0..c0+cw-1 on every partition of this tile.
+            # `nisa.iota` with `channel_multiplier=0`, because this NKI image has no
+            # `nl.arange`, `mgrid`, `nl.iota` or `nl.affine_select` to synthesise it.
+            ramp = nl.ndarray((height, cw), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.iota(dst=ramp, pattern=[[1, cw]], offset=c0, channel_multiplier=0)
 
-        # 1 exactly where the pool is incomplete for this row, which is where the bound applies.
-        # `greater` into an integer destination is the compare form this tree already uses.
-        bounded = nl.ndarray((height, width), dtype=nl.uint8, buffer=nl.sbuf)
-        nisa.tensor_scalar(dst=bounded, data=room, op0=nl.greater, operand0=0.0)
+            # `(p + 1) * pool_size`, the first token index past pool `p`, as one two-scalar
+            # chain. The bound is written as this multiply-and-compare rather than
+            # `p >= causal_len // pool_size` because `nl.divide` is silently wrong on int32
+            # and `nl.right_shift` refuses as the second op of a chain. Over integers the two
+            # agree.
+            end = nl.ndarray((height, cw), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=end, data=ramp,
+                               op0=nl.multiply, operand0=float(pool_size),
+                               op1=nl.add, operand1=float(pool_size))
 
-        fill = nl.ndarray((height, width), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.memset(dst=fill, value=BOUND_FILL)
+            # `(p + 1) * pool_size - causal_len[i]`, one tile operand broadcast along the
+            # free axis.
+            room = nl.ndarray((height, cw), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=room, data=end, op0=nl.add, operand0=nclen)
 
-        # `scores_sb` is left alone wherever `bounded` is 0, which is what keeps the untouched
-        # columns bit-identical rather than merely arithmetically unchanged.
-        nisa.tensor_copy_predicated(src=fill, predicate=bounded, dst=scores_sb)
+            # 1 exactly where the pool is incomplete for this row, which is where the bound
+            # applies. `greater` into an integer destination is the compare form this tree
+            # already uses.
+            bounded = nl.ndarray((height, cw), dtype=nl.uint8, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=bounded, data=room, op0=nl.greater, operand0=0.0)
 
-        nl.store(out[start:start + height, 0:width], value=scores_sb)
+            fill = nl.ndarray((height, cw), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.memset(dst=fill, value=BOUND_FILL)
+
+            # `scores_sb` is left alone wherever `bounded` is 0, which is what keeps the
+            # untouched columns bit-identical rather than merely arithmetically unchanged.
+            nisa.tensor_copy_predicated(src=fill, predicate=bounded, dst=scores_sb)
+
+            nl.store(out[start:start + height, c0:c0 + cw], value=scores_sb)
     return out
 
 
