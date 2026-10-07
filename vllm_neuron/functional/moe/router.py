@@ -828,12 +828,15 @@ def _can_use_kernel(
     router_computation_order: RouterComputationOrder = RouterComputationOrder.PRENORM_LINEAR_TOPK_ACT_SCATTER,
     transposed_hidden_states: bool = False,
 ) -> bool:
-    """
-    Check if the NKI kernel can be used for router computation.
+    """Whether :func:`router` takes nkilib's ``router_topk`` kernel: never, in this release.
 
-    Kernel constraints from router_topk_kernel_nki:
+    The vendor release 0.24.0.1.1.0 (``ed3580d``) turns the kernel off on this path because
+    of a compilation issue on TRN3, so every call takes ``_torch_router_impl``. The
+    arguments stay so the call site does not change when the kernel comes back. Then
+    these kernel constraints from ``router_topk_kernel_nki`` become checks here again:
+
     - K <= 8
-    - T <= 128 or (T <= 2048 and T % 128 == 0)
+    - T <= 128 or (T <= 2048 and T % 128 == 0); the T <= 2048 bound waits on NKILIB-618
     - E <= 512
     - (H % 128) == 0
     - Activation must be "softmax" or "sigmoid" (string only)
@@ -843,47 +846,9 @@ def _can_use_kernel(
     - Only PRENORM_LINEAR_TOPK_ACT_SCATTER and PRENORM_LINEAR_ACT_TOPK_RENORM_SCATTER computation orders supported
 
     Returns:
-        bool: True if kernel can be used, False otherwise
+        bool: False.
     """
-
-    # TODO: Remove this after debugging compilation issue on TRN3
     return False
-
-    if not can_run_kernel(hidden_states):
-        return False
-
-    if transposed_hidden_states:
-        H, T = hidden_states.shape
-    else:
-        T, H = hidden_states.shape
-    E = router_weights.shape[1]
-
-    if top_k > 8 or E > 512 or H % 128 != 0:
-        return False
-
-    # TODO: Remove T <= 2048 requirements when NKILIB-618 is resolved
-    if T > 128 and (T > 2048 or T % 128 != 0):
-        return False
-
-    if not isinstance(activation, str) or activation not in ["softmax", "sigmoid"]:
-        return False
-
-    if gamma is not None:
-        return False
-
-    # Bias shape validation
-    if router_bias is not None and router_bias.shape != (E,):
-        return False
-
-    # Only PRENORM_LINEAR_TOPK_ACT_SCATTER and PRENORM_LINEAR_ACT_TOPK_RENORM_SCATTER are supported by kernel
-    # PRENORM_LINEAR_TOPK_SCATTER_ACT requires PyTorch fallback
-    if (
-        router_computation_order
-        == RouterComputationOrder.PRENORM_LINEAR_TOPK_SCATTER_ACT
-    ):
-        return False
-
-    return True
 
 
 #: Tokens per tile: `nisa.max8`/`nisa.nc_find_index8` work one token per partition.
