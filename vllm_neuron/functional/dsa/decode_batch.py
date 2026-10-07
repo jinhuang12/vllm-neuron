@@ -27,9 +27,17 @@ and the head sum is one free-axis reduce. The one-request kernel puts the single
 on the partitions instead and pays a matmul, a rectify, a scale and an add per head per
 512 candidates, which is what made it slow at one token.
 
+The candidate axis is walked in chunks of at most ``CHUNK_TILES`` tiles (16,384
+candidates, 65,536 tokens of context at pool 4): a chunk's tile count rides the
+partitions of the output transpose, and a chunk's keys sit in SBUF twice (as read and
+turned). Each chunk carries this step's pool as one more tile, so a chunk is the
+whole-axis kernel on a column range, and an axis of one chunk runs exactly the
+instructions it ran before chunking.
+
 Both physical cores of an LNC2 core split the requests of the score stage (``[2]``
-grid at ``B >= 2``). The ring step is a few vector ops on ``B`` partitions and runs on
-one program.
+grid at ``B >= 2``). The chunks of one request run on its program, one after another,
+so ``B = 1`` runs on one core. The ring step is a few vector ops on ``B`` partitions and
+runs on one program.
 """
 
 from __future__ import annotations
@@ -67,9 +75,11 @@ TRANSPOSE_GROUP = 4
 #: fp32 columns of one PSUM bank; the head scores of ``PSUM_FP32 // heads`` candidate
 #: tiles share one bank, so the rectify, the weight and the head sum run once per bank.
 PSUM_FP32 = 512
-#: The widest candidate axis served: the output transpose puts the tile count on the
-#: partitions.
-MAX_CANDIDATES = PARTITIONS * PARTITIONS
+#: Candidate tiles per chunk of the score stage: the output transpose puts a chunk's
+#: tile count on the partitions. Wider candidate axes are walked chunk by chunk.
+CHUNK_TILES = PARTITIONS
+#: Candidates per chunk (16,384): the whole axis the kernel served before chunking.
+CHUNK_CANDIDATES = CHUNK_TILES * PARTITIONS
 #: fp32 columns of a [P, 1] scratch tile: one whole 32-byte line, as ``mla_decode``
 #: declares its scalars.
 _LINE = 8
@@ -328,9 +338,10 @@ def dsa_decode_scores_kernel(q_hbm, w_hbm, bank_hbm, slots_hbm, lens_hbm, pos_hb
         where it is not.
 
     Request ``b`` reads rows ``slot[b] * rows + [0, candidates)`` of the bank and nothing
-    else. Candidate ``c`` sits on partition ``c % 128`` of tile ``c // 128``. One extra
-    tile carries ``pooled[b]`` on every partition, so its score is computed by the very
-    instructions that score a bank row, and it is copied into the column it stands for.
+    else. Candidate ``c`` sits on partition ``c % 128`` of tile ``c // 128``. The tiles
+    are walked in chunks of ``CHUNK_TILES``; one extra tile per chunk carries
+    ``pooled[b]`` on every partition, so its score is computed by the very instructions
+    that score a bank row, and it is copied into the column it stands for.
     """
     batch = q_hbm.shape[0]
     heads = q_hbm.shape[1]
@@ -341,11 +352,7 @@ def dsa_decode_scores_kernel(q_hbm, w_hbm, bank_hbm, slots_hbm, lens_hbm, pos_hb
     n_tiles = full
     if rem > 0:
         n_tiles = full + 1
-    virt = n_tiles
-    n_all = n_tiles + 1
-    per_bank = PSUM_FP32 // heads
-    if per_bank > n_all:
-        per_bank = n_all
+    chunk_max = min(CHUNK_TILES, n_tiles)
     shift = _log2(pool_size)
     kv_dtype = bank_hbm.dtype
     one_slot = bank_hbm.shape[0] == 1
@@ -356,7 +363,7 @@ def dsa_decode_scores_kernel(q_hbm, w_hbm, bank_hbm, slots_hbm, lens_hbm, pos_hb
     end_f = _sb((PARTITIONS, n_tiles), nl.float32)
     nisa.tensor_scalar(dst=end_f, data=cand_f, op0=nl.multiply, operand0=float(pool_size),
                        op1=nl.add, operand1=float(pool_size))
-    fill = _sb((PARTITIONS, n_tiles), nl.float32)
+    fill = _sb((PARTITIONS, chunk_max), nl.float32)
     nisa.memset(dst=fill, value=BOUND_FILL)
 
     n_prgs = nl.num_programs(axes=0)
@@ -392,40 +399,6 @@ def dsa_decode_scores_kernel(q_hbm, w_hbm, bank_hbm, slots_hbm, lens_hbm, pos_hb
         nisa.tensor_tensor(dst=at_f, data1=at_f, data2=closes, op=nl.multiply)
         nisa.tensor_scalar(dst=at_f, data=at_f, op0=nl.add, operand0=-1.0)
 
-        # ---- the keys of this request's slot, and this step's pool as one more tile ---
-        # One slot: the only valid slot is 0, so the reads are static. (Tracing in CPU
-        # simulation fills int operands with ones, and slot 1 is past this bank.)
-        k_rows = _sb((PARTITIONS, n_all, head_dim), kv_dtype)
-        if full > 0:
-            if one_slot:
-                nisa.dma_copy(
-                    dst=k_rows[:, 0:full, :],
-                    src=bank_hbm.ap(pattern=[[head_dim, PARTITIONS],
-                                             [PARTITIONS * head_dim, full], [1, head_dim]],
-                                    offset=0))
-            else:
-                nisa.dma_copy(
-                    dst=k_rows[:, 0:full, :],
-                    src=bank_hbm.ap(pattern=[[head_dim, PARTITIONS],
-                                             [PARTITIONS * head_dim, full], [1, head_dim]],
-                                    offset=0, scalar_offset=slot_t[0:1, 0:1], indirect_dim=0))
-        if rem > 0:
-            nisa.memset(dst=k_rows[:, full, :], value=0.0)
-            if one_slot:
-                nisa.dma_copy(
-                    dst=k_rows[0:rem, full, :],
-                    src=bank_hbm.ap(pattern=[[head_dim, rem], [1, head_dim]],
-                                    offset=full * PARTITIONS * head_dim))
-            else:
-                nisa.dma_copy(
-                    dst=k_rows[0:rem, full, :],
-                    src=bank_hbm.ap(pattern=[[head_dim, rem], [1, head_dim]],
-                                    offset=full * PARTITIONS * head_dim,
-                                    scalar_offset=slot_t[0:1, 0:1], indirect_dim=0))
-        nisa.dma_copy(dst=k_rows[:, virt, :],
-                      src=pooled_hbm.ap(pattern=[[0, PARTITIONS], [1, head_dim]],
-                                        offset=b * head_dim))
-
         # ---- the query onto the head dimension, the weights onto every partition ------
         # A PE transpose writes PSUM in its input's dtype and PSUM writes are whole
         # 4-byte words, so the query is transposed in fp32 (exact) and rounded back,
@@ -443,62 +416,118 @@ def dsa_decode_scores_kernel(q_hbm, w_hbm, bank_hbm, slots_hbm, lens_hbm, pos_hb
         nisa.dma_copy(dst=w_rep, src=w_hbm.ap(pattern=[[0, PARTITIONS], [1, heads]],
                                               offset=b * heads))
 
-        # ---- keys onto the head dimension ---------------------------------------------
-        k_t = _sb((head_dim, n_all * PARTITIONS), kv_dtype)
-        for g0 in range(0, n_all, TRANSPOSE_GROUP):
-            gn = min(TRANSPOSE_GROUP, n_all - g0)
-            t_ps = nl.ndarray((head_dim, TRANSPOSE_GROUP * PARTITIONS), dtype=kv_dtype,
-                              buffer=nl.psum)
-            for i in range(gn):
-                nisa.nc_transpose(dst=t_ps[:, i * PARTITIONS:(i + 1) * PARTITIONS],
-                                  data=k_rows[:, g0 + i, :])
-            nisa.tensor_copy(dst=k_t[:, g0 * PARTITIONS:(g0 + gn) * PARTITIONS],
-                             src=t_ps[:, 0:gn * PARTITIONS])
+        for t0 in range(0, n_tiles, CHUNK_TILES):
+            # ---- one chunk: tiles t0 .. t0 + ct - 1, the last one ragged at the end ---
+            ct = min(CHUNK_TILES, n_tiles - t0)
+            c_rem = 0
+            if t0 + ct == n_tiles:
+                c_rem = rem
+            c_full = ct
+            if c_rem > 0:
+                c_full = ct - 1
+            virt = ct
+            n_all = ct + 1
+            per_bank = PSUM_FP32 // heads
+            if per_bank > n_all:
+                per_bank = n_all
 
-        # ---- per-head scores, rectified, weighted, summed over heads -------------------
-        scores = _sb((PARTITIONS, n_all), nl.float32)
-        for s0 in range(0, n_all, per_bank):
-            sn = min(per_bank, n_all - s0)
-            s_ps = nl.ndarray((PARTITIONS, per_bank, heads), dtype=nl.float32, buffer=nl.psum)
-            for i in range(sn):
-                t = s0 + i
-                nisa.nc_matmul(dst=s_ps[:, i, :],
-                               stationary=k_t[:, t * PARTITIONS:(t + 1) * PARTITIONS],
-                               moving=q_t, accumulate=False)
-            prod = _sb((PARTITIONS, per_bank, heads), nl.float32)
-            nisa.scalar_tensor_tensor(
-                dst=prod[:, 0:sn, :], data=s_ps[:, 0:sn, :], op0=nl.maximum, operand0=0.0,
-                op1=nl.multiply,
-                operand1=w_rep.ap(pattern=[[heads, PARTITIONS], [0, sn], [1, heads]]))
-            nisa.tensor_reduce(dst=scores[:, s0:s0 + sn], op=nl.add, data=prod[:, 0:sn, :],
-                               axis=2)
+            # ---- this chunk's keys of the request's slot, and this step's pool -------
+            # One slot: the only valid slot is 0, so the reads are static. (Tracing in
+            # CPU simulation fills int operands with ones, and slot 1 is past this bank.)
+            k_rows = _sb((PARTITIONS, n_all, head_dim), kv_dtype)
+            if c_full > 0:
+                if one_slot:
+                    nisa.dma_copy(
+                        dst=k_rows[:, 0:c_full, :],
+                        src=bank_hbm.ap(pattern=[[head_dim, PARTITIONS],
+                                                 [PARTITIONS * head_dim, c_full],
+                                                 [1, head_dim]],
+                                        offset=t0 * PARTITIONS * head_dim))
+                else:
+                    nisa.dma_copy(
+                        dst=k_rows[:, 0:c_full, :],
+                        src=bank_hbm.ap(pattern=[[head_dim, PARTITIONS],
+                                                 [PARTITIONS * head_dim, c_full],
+                                                 [1, head_dim]],
+                                        offset=t0 * PARTITIONS * head_dim,
+                                        scalar_offset=slot_t[0:1, 0:1], indirect_dim=0))
+            if c_rem > 0:
+                nisa.memset(dst=k_rows[:, c_full, :], value=0.0)
+                if one_slot:
+                    nisa.dma_copy(
+                        dst=k_rows[0:c_rem, c_full, :],
+                        src=bank_hbm.ap(pattern=[[head_dim, c_rem], [1, head_dim]],
+                                        offset=full * PARTITIONS * head_dim))
+                else:
+                    nisa.dma_copy(
+                        dst=k_rows[0:c_rem, c_full, :],
+                        src=bank_hbm.ap(pattern=[[head_dim, c_rem], [1, head_dim]],
+                                        offset=full * PARTITIONS * head_dim,
+                                        scalar_offset=slot_t[0:1, 0:1], indirect_dim=0))
+            nisa.dma_copy(dst=k_rows[:, virt, :],
+                          src=pooled_hbm.ap(pattern=[[0, PARTITIONS], [1, head_dim]],
+                                            offset=b * head_dim))
 
-        # ---- this step's pool at its own column, then the causal bound ----------------
-        stand_in = _sb((PARTITIONS, n_tiles), nl.float32)
-        nisa.tensor_scalar(dst=stand_in, data=cand_f, op0=nl.multiply, operand0=0.0,
-                           op1=nl.add, operand1=scores[:, virt:virt + 1])
-        hit = _sb((PARTITIONS, n_tiles), nl.uint8)
-        nisa.tensor_scalar(dst=hit, data=cand_f, op0=nl.equal, operand0=at_f)
-        nisa.tensor_copy_predicated(dst=scores[:, 0:n_tiles], src=stand_in, predicate=hit)
-        room = _sb((PARTITIONS, n_tiles), nl.float32)
-        nisa.tensor_scalar(dst=room, data=end_f, op0=nl.add, operand0=neg_len)
-        bounded = _sb((PARTITIONS, n_tiles), nl.uint8)
-        nisa.tensor_scalar(dst=bounded, data=room, op0=nl.greater, operand0=0.0)
-        nisa.tensor_copy_predicated(dst=scores[:, 0:n_tiles], src=fill, predicate=bounded)
+            # ---- keys onto the head dimension -----------------------------------------
+            k_t = _sb((head_dim, n_all * PARTITIONS), kv_dtype)
+            for g0 in range(0, n_all, TRANSPOSE_GROUP):
+                gn = min(TRANSPOSE_GROUP, n_all - g0)
+                t_ps = nl.ndarray((head_dim, TRANSPOSE_GROUP * PARTITIONS), dtype=kv_dtype,
+                                  buffer=nl.psum)
+                for i in range(gn):
+                    nisa.nc_transpose(dst=t_ps[:, i * PARTITIONS:(i + 1) * PARTITIONS],
+                                      data=k_rows[:, g0 + i, :])
+                nisa.tensor_copy(dst=k_t[:, g0 * PARTITIONS:(g0 + gn) * PARTITIONS],
+                                 src=t_ps[:, 0:gn * PARTITIONS])
 
-        # ---- candidate-major out: tiles onto the partitions, rows stored whole ---------
-        o_ps = nl.ndarray((n_tiles, PARTITIONS), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_transpose(dst=o_ps, data=scores[:, 0:n_tiles])
-        o_sb = _sb((n_tiles, PARTITIONS), nl.float32)
-        nisa.tensor_copy(dst=o_sb, src=o_ps)
-        if full > 0:
-            nisa.dma_copy(dst=out.ap(pattern=[[PARTITIONS, full], [1, PARTITIONS]],
-                                     offset=b * candidates),
-                          src=o_sb[0:full, :])
-        if rem > 0:
-            nisa.dma_copy(dst=out.ap(pattern=[[rem, 1], [1, rem]],
-                                     offset=b * candidates + full * PARTITIONS),
-                          src=o_sb[full:full + 1, 0:rem])
+            # ---- per-head scores, rectified, weighted, summed over heads ---------------
+            scores = _sb((PARTITIONS, n_all), nl.float32)
+            for s0 in range(0, n_all, per_bank):
+                sn = min(per_bank, n_all - s0)
+                s_ps = nl.ndarray((PARTITIONS, per_bank, heads), dtype=nl.float32,
+                                  buffer=nl.psum)
+                for i in range(sn):
+                    t = s0 + i
+                    nisa.nc_matmul(dst=s_ps[:, i, :],
+                                   stationary=k_t[:, t * PARTITIONS:(t + 1) * PARTITIONS],
+                                   moving=q_t, accumulate=False)
+                prod = _sb((PARTITIONS, per_bank, heads), nl.float32)
+                nisa.scalar_tensor_tensor(
+                    dst=prod[:, 0:sn, :], data=s_ps[:, 0:sn, :], op0=nl.maximum,
+                    operand0=0.0, op1=nl.multiply,
+                    operand1=w_rep.ap(pattern=[[heads, PARTITIONS], [0, sn], [1, heads]]))
+                nisa.tensor_reduce(dst=scores[:, s0:s0 + sn], op=nl.add,
+                                   data=prod[:, 0:sn, :], axis=2)
+
+            # ---- this step's pool at its own column, then the causal bound ------------
+            cand_c = cand_f[:, t0:t0 + ct]
+            stand_in = _sb((PARTITIONS, ct), nl.float32)
+            nisa.tensor_scalar(dst=stand_in, data=cand_c, op0=nl.multiply, operand0=0.0,
+                               op1=nl.add, operand1=scores[:, virt:virt + 1])
+            hit = _sb((PARTITIONS, ct), nl.uint8)
+            nisa.tensor_scalar(dst=hit, data=cand_c, op0=nl.equal, operand0=at_f)
+            nisa.tensor_copy_predicated(dst=scores[:, 0:ct], src=stand_in, predicate=hit)
+            room = _sb((PARTITIONS, ct), nl.float32)
+            nisa.tensor_scalar(dst=room, data=end_f[:, t0:t0 + ct], op0=nl.add,
+                               operand0=neg_len)
+            bounded = _sb((PARTITIONS, ct), nl.uint8)
+            nisa.tensor_scalar(dst=bounded, data=room, op0=nl.greater, operand0=0.0)
+            nisa.tensor_copy_predicated(dst=scores[:, 0:ct], src=fill[:, 0:ct],
+                                        predicate=bounded)
+
+            # ---- candidate-major out: tiles onto the partitions, rows stored whole -----
+            o_ps = nl.ndarray((ct, PARTITIONS), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_transpose(dst=o_ps, data=scores[:, 0:ct])
+            o_sb = _sb((ct, PARTITIONS), nl.float32)
+            nisa.tensor_copy(dst=o_sb, src=o_ps)
+            if c_full > 0:
+                nisa.dma_copy(dst=out.ap(pattern=[[PARTITIONS, c_full], [1, PARTITIONS]],
+                                         offset=b * candidates + t0 * PARTITIONS),
+                              src=o_sb[0:c_full, :])
+            if c_rem > 0:
+                nisa.dma_copy(dst=out.ap(pattern=[[c_rem, 1], [1, c_rem]],
+                                         offset=b * candidates + full * PARTITIONS),
+                              src=o_sb[c_full:c_full + 1, 0:c_rem])
     return out
 
 
@@ -603,9 +632,6 @@ def _require_scores(query, weights, pool_bank, slots, seq_lens, position, pooled
         raise DecodeBatchError(
             f"candidates must be a python int below the bank's {int(pool_bank.shape[1])} "
             f"rows per slot (the last row is the write trash); got {candidates!r}")
-    if candidates > MAX_CANDIDATES:
-        raise DecodeBatchError(f"candidates above {MAX_CANDIDATES} are not served; got "
-                               f"{candidates}")
     for name, value in (("slots", slots), ("seq_lens", seq_lens), ("position", position)):
         _require_vector(name, value, batch)
     if tuple(pooled.shape) != (batch, INDEX_HEAD_DIM):

@@ -4,7 +4,8 @@
 The simulator runs a kernel body as plain Python, so it cannot see a call form the
 compiler's front end refuses. This compiles ``dsa_decode_ring_step_kernel`` at B in
 {1, 16, 64, 130} (130 spans two partition tiles) and ``dsa_decode_scores_kernel`` at
-ctx 4096 and 8192 (1024 and 2048 candidates) and a ragged 300, at B in {1, 16}, on one
+ctx 4096 and 8192 (1024 and 2048 candidates), a ragged 300, and the chunked 16385 and
+65536 (ctx 65540 and 262144), at B in {1, 16}, on one
 and two programs, and both at B=1 on a one-slot bank (the one-request carrier's view,
 read statically), inside a child process that pins the platform target, opens no device
 node, and proves it parsed bodies by refusing one that reads an undefined name. The
@@ -30,7 +31,9 @@ _PIN = {"VLLM_NEURON_CPU_COMPILE": "1", "NEURON_PLATFORM_TARGET_OVERRIDE": "trn2
 
 HEADS, DIM, POOL, SLOTS = 32, 128, 4, 140
 RING_BATCHES = (1, 16, 64, 130)
-SCORE_CANDIDATES = (1024, 2048, 300)
+#: Past 16,384 the candidate axis is walked in chunks: 16385 (a one-row last chunk) and
+#: 65536 (four whole chunks, a 262,144-token context).
+SCORE_CANDIDATES = (1024, 2048, 300, 16385, 65536)
 SCORE_BATCHES = (1, 16)
 #: Candidate counts read from a one-slot bank: whole tiles, and a ragged last tile.
 ONE_SLOT_CANDIDATES = (1024, 300)
