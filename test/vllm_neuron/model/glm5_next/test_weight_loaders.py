@@ -27,6 +27,7 @@ import torch
 
 from test.vllm_neuron.model.glm5_next.fixtures import weight_index
 from test.vllm_neuron.model.utils import FakeSafeSlice, hf_state_to_fake_slices
+from vllm_neuron.model.glm5_next import mtp
 from vllm_neuron.model.glm5_next import weight_loaders_fp8 as _fp8_module
 from vllm_neuron.model.glm5_next.config import (
     DSA_LAYER_TYPE,
@@ -48,6 +49,7 @@ from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
     PROVISIONAL,
     DuplicateShardKeyError,
     Glm5NextShardIndex,
+    Glm5NextWeightMapError,
     block_agreement,
     block_grid_shape,
     blockwise_scale_loader,
@@ -288,7 +290,7 @@ def shard_index(slice_map: dict[str, FakeSafeSlice]) -> Glm5NextShardIndex:
 
 @pytest.fixture
 def coverage(shard_index, mini_config):
-    return check_key_coverage(shard_index, build_weight_mappings(mini_config))
+    return check_key_coverage(shard_index, build_weight_mappings(mini_config, mtp_layer_indices=()))
 
 
 # --------------------------------------------------------------------------- #
@@ -344,7 +346,7 @@ def test_unmatched_counters_report_a_missing_and_an_extra_key(
     coverage fraction stays 1.0, because a key that is absent cannot be unmapped.
     Adding a key no parameter asks for moves both readings.
     """
-    mappings = build_weight_mappings(mini_config)
+    mappings = build_weight_mappings(mini_config, mtp_layer_indices=())
     all_keys = list(slice_map)
 
     # Drop one checkpoint key the mapping asks for: an unmatched parameter. The
@@ -431,14 +433,14 @@ def test_a_cross_shard_duplicate_is_reported_by_the_shard_index(
     assert set(reported) == {duplicated}
     assert set(reported[duplicated]) == {home, other}
 
-    dirty = check_key_coverage(index, build_weight_mappings(mini_config))
+    dirty = check_key_coverage(index, build_weight_mappings(mini_config, mtp_layer_indices=()))
     assert dirty.duplicated_count == 1
     assert not dirty.is_complete
 
     with pytest.raises(DuplicateShardKeyError, match=duplicated):
         index.require_no_duplicates()
     with pytest.raises(DuplicateShardKeyError):
-        check_key_coverage(index, build_weight_mappings(mini_config), strict=True)
+        check_key_coverage(index, build_weight_mappings(mini_config, mtp_layer_indices=()), strict=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -497,7 +499,7 @@ def test_a_moe_expert_parameter_maps_to_a_list_of_keys(mini_config) -> None:
     This checkpoint stores one tensor per expert, so the fused parameter cannot map
     to a single key.
     """
-    mappings = build_weight_mappings(mini_config)
+    mappings = build_weight_mappings(mini_config, mtp_layer_indices=())
     param = "model.layers.3.mlp.experts.gate_proj_weight"
     keys = mappings[param]
     assert isinstance(keys, list)
@@ -510,7 +512,7 @@ def test_a_moe_expert_parameter_maps_to_a_list_of_keys(mini_config) -> None:
 
 def test_no_rope_projection_is_mapped(mini_config) -> None:
     """``mla_use_nope`` with ``qk_rope_head_dim == 0``: no rotary head slice."""
-    mappings = build_weight_mappings(mini_config)
+    mappings = build_weight_mappings(mini_config, mtp_layer_indices=())
     every_key = [
         key
         for value in mappings.values()
@@ -597,8 +599,12 @@ def real_index(real_in_scope) -> Glm5NextShardIndex:
 
 @pytest.fixture(scope="module")
 def real_mappings(real_text_config) -> dict[str, str | list[str]]:
-    """The mapping under test, over the published 45-layer schedule."""
-    return build_weight_mappings(real_text_config)
+    """The mapping under test, over the published 45-layer schedule.
+
+    The in-scope population only: the draft layer is asked for explicitly, by the
+    tests below that cover it, rather than following the shadow-draft knob here.
+    """
+    return build_weight_mappings(real_text_config, mtp_layer_indices=())
 
 
 @pytest.fixture(scope="module")
@@ -1847,7 +1853,9 @@ def test_no_scale_companion_is_requested_for_a_bf16_tensor(
     no request, because the builder already maps no scale for those families.
     """
     skip = tuple(real_quant_config["modules_to_not_convert"])
-    honoured = build_weight_mappings(real_text_config, modules_to_not_convert=skip)
+    honoured = build_weight_mappings(
+        real_text_config, modules_to_not_convert=skip, mtp_layer_indices=()
+    )
     requested = _requested_scale_keys(honoured)
 
     kept_bf16 = [key for key in requested if keeps_bf16(_base_tensor_of(key), skip)]
@@ -1874,14 +1882,18 @@ def test_no_scale_companion_is_requested_for_a_bf16_tensor(
     )
     shared_leaves = 3
     unsuppressed = _requested_scale_keys(
-        build_weight_mappings(real_text_config, modules_to_not_convert=())
+        build_weight_mappings(
+            real_text_config, modules_to_not_convert=(), mtp_layer_indices=()
+        )
     )
     fires = [key for key in unsuppressed if keeps_bf16(_base_tensor_of(key), probe)]
     assert len(fires) == moe_layers * shared_leaves
     assert len(fires) == SYNTHETIC_SKIP_DROP > 0
 
     suppressed = _requested_scale_keys(
-        build_weight_mappings(real_text_config, modules_to_not_convert=probe)
+        build_weight_mappings(
+            real_text_config, modules_to_not_convert=probe, mtp_layer_indices=()
+        )
     )
     assert [key for key in suppressed if keeps_bf16(_base_tensor_of(key), probe)] == []
     assert len(suppressed) == len(requested) - len(fires)
@@ -1986,3 +1998,161 @@ def test_the_squeeze_factor_is_an_exact_power_of_two() -> None:
     assert float(stored.to(torch.float32).max().item()) == FP8_OCP_MAX * down
     assert FP8_OCP_MAX * down < FP8_PLATFORM_CLAMP
 
+
+
+# --------------------------------------------------------------------------- #
+# The multi-token-prediction (MTP) draft layer, one past the stack.
+#
+# Mapped only when asked: ``mtp_layer_indices`` names the draft layers, and its
+# default follows the shadow-draft knob through ``resolve_shadow_draft_k``. With the
+# knob off the map is byte-for-byte the map it always was. Every expectation below
+# is derived from the published config and index: the draft layer's index is the
+# stack's length, its sibling is the last sparse-attention stack layer, and its key
+# count is the sibling's less the six mHC leaves plus the four draft leaves.
+# --------------------------------------------------------------------------- #
+
+MTP_KNOB = "VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT"
+
+
+def _draft_layer(text_config: Glm5NextTextConfig) -> int:
+    """The draft layer's index: the first one the stack does not use."""
+    return len(text_config.layer_types)
+
+
+def _last_dsa_layer(text_config: Glm5NextTextConfig) -> int:
+    """The stack's last sparse-attention layer, the draft layer's closest sibling."""
+    return max(
+        index
+        for index, kind in enumerate(text_config.layer_types)
+        if kind == _fp8_module.DSA_LAYER_TYPE
+    )
+
+
+def _layer_refs(mappings: dict[str, str | list[str]], layer: int) -> dict[str, int]:
+    """Reference count per checkpoint leaf on one layer, leaf = key less the layer prefix."""
+    prefix = f"model.language_model.layers.{layer}."
+    counts: dict[str, int] = {}
+    for value in mappings.values():
+        for key in value if isinstance(value, list) else [value]:
+            if key.startswith(prefix):
+                leaf = key[len(prefix):]
+                counts[leaf] = counts.get(leaf, 0) + 1
+    return counts
+
+
+def _index_leaves(weight_map: dict[str, str], layer: int) -> set[str]:
+    """The published index's leaves on one layer."""
+    prefix = f"model.language_model.layers.{layer}."
+    return {key[len(prefix):] for key in weight_map if key.startswith(prefix)}
+
+
+def test_mtp_layer_mapping_claims_every_draft_layer_key_with_the_sibling_reference_counts(
+    real_text_config, real_weight_map
+) -> None:
+    """Every draft-layer key of the published index is referenced, each as often as the sibling references its own leaf.
+
+    "As often as the sibling" rather than "once": the four scaled MLA projections
+    map their scale key twice by design (inside the weight's entry and as the grid's
+    own entry), on every sparse-attention layer, and the draft layer is one of them.
+    """
+    draft, sibling = _draft_layer(real_text_config), _last_dsa_layer(real_text_config)
+    with_mtp = build_weight_mappings(real_text_config, mtp_layer_indices=(draft,))
+    refs_draft = _layer_refs(with_mtp, draft)
+    refs_sibling = _layer_refs(with_mtp, sibling)
+
+    index_draft = _index_leaves(real_weight_map, draft)
+    index_sibling = _index_leaves(real_weight_map, sibling)
+    mhc = set(_fp8_module.MHC_LEAVES)
+    draft_leaves = {ckpt for _, ckpt in _fp8_module.MTP_LEAVES}
+    # The index agrees with the derivation: the sibling's leaves, less the six mHC
+    # tensors, plus the four draft leaves (1,762 - 6 + 4 = 1,760 on this checkpoint).
+    assert index_draft == (index_sibling - mhc) | draft_leaves
+    assert set(refs_draft) == index_draft, (
+        f"missing {sorted(index_draft - set(refs_draft))[:5]}, "
+        f"extra {sorted(set(refs_draft) - index_draft)[:5]}"
+    )
+
+    shared = set(refs_draft) & set(refs_sibling)
+    assert {leaf: refs_draft[leaf] for leaf in shared} == {
+        leaf: refs_sibling[leaf] for leaf in shared
+    }
+    assert set(refs_sibling) - set(refs_draft) == mhc
+    assert set(refs_draft) - set(refs_sibling) == draft_leaves
+    assert all(refs_draft[leaf] == 1 for leaf in draft_leaves)
+
+
+def test_mtp_layer_mapping_adds_only_mtp_entries_and_changes_no_other_entry(
+    real_text_config,
+) -> None:
+    """The map with the draft layer is the map without it plus ``mtp.*`` entries, and nothing else moves."""
+    draft, sibling = _draft_layer(real_text_config), _last_dsa_layer(real_text_config)
+    baseline = build_weight_mappings(real_text_config, mtp_layer_indices=())
+    with_mtp = build_weight_mappings(real_text_config, mtp_layer_indices=(draft,))
+
+    added = {name: keys for name, keys in with_mtp.items() if name not in baseline}
+    kept = {name: keys for name, keys in with_mtp.items() if name in baseline}
+    assert kept == baseline
+    assert added, "the draft layer added no entry"
+    prefix = _fp8_module.MTP_ROOT_ATTR + "."
+    assert all(name.startswith(prefix) for name in added), sorted(added)[:5]
+    # The sibling's entry set, less its six mHC leaves, plus the four draft leaves.
+    sibling_prefix = f"model.layers.{sibling}."
+    sibling_leaves = {
+        name[len(sibling_prefix):] for name in baseline if name.startswith(sibling_prefix)
+    }
+    expected = {
+        f"{mtp.BLOCK_ATTR}.{leaf}"
+        for leaf in sibling_leaves - set(_fp8_module.MHC_LEAVES)
+    } | {param for param, _ in _fp8_module.MTP_LEAVES}
+    assert {name[len(prefix):] for name in added} == expected
+
+
+def test_mtp_layer_indices_default_follows_the_shadow_draft_knob(
+    monkeypatch, real_text_config, real_weight_map
+) -> None:
+    """Knob unset or 0: no draft layer; knob k in 1..5: the one layer past the stack."""
+    draft = _draft_layer(real_text_config)
+    monkeypatch.delenv(MTP_KNOB, raising=False)
+    assert mtp.shadow_draft_k() == 0
+    assert _fp8_module.mtp_layer_indices_for(real_text_config) == ()
+    assert not any(
+        name.startswith(_fp8_module.MTP_ROOT_ATTR + ".")
+        for name in build_weight_mappings(real_text_config)
+    )
+
+    monkeypatch.setenv(MTP_KNOB, "0")
+    assert mtp.shadow_draft_k() == 0
+    assert _fp8_module.mtp_layer_indices_for(real_text_config) == ()
+
+    monkeypatch.setenv(MTP_KNOB, "5")
+    assert mtp.shadow_draft_k() == 5
+    assert _fp8_module.mtp_layer_indices_for(real_text_config) == (draft,)
+    followed = build_weight_mappings(real_text_config)
+    assert followed == build_weight_mappings(real_text_config, mtp_layer_indices=(draft,))
+    # Every index key once, plus the twice-referenced grid of each scaled projection.
+    assert sum(_layer_refs(followed, draft).values()) == len(
+        _index_leaves(real_weight_map, draft)
+    ) + len(_fp8_module.DSA_SCALED_PROJECTIONS)
+
+
+def test_an_unsupported_draft_layout_is_refused_by_name(real_text_config) -> None:
+    """A draft index inside the stack, or more than one draft layer, raises rather than maps."""
+    draft = _draft_layer(real_text_config)
+    with pytest.raises(Glm5NextWeightMapError, match="inside the"):
+        build_weight_mappings(real_text_config, mtp_layer_indices=(draft - 1,))
+    with pytest.raises(Glm5NextWeightMapError, match="single-layer head"):
+        build_weight_mappings(real_text_config, mtp_layer_indices=(draft, draft + 1))
+
+
+def test_the_draft_leaves_are_the_heads_own_parameter_names_in_order() -> None:
+    """Contract C2 for the four head-only leaves: the map's spelling is the head's."""
+    assert tuple(leaf for leaf, _ in _fp8_module.MTP_LEAVES) == mtp.HEAD_PARAMETER_NAMES
+    assert all(
+        param == ckpt.replace(".", "_") for param, ckpt in _fp8_module.MTP_LEAVES
+    ), "a draft leaf does not flatten its checkpoint key the way the tree flattens"
+
+
+def test_mtp_family_is_tagged_grounded() -> None:
+    """The draft-layer family is read off the real headers, so it is tagged GROUNDED."""
+    assert KEY_FAMILY_PROVENANCE["mtp_head"] == GROUNDED
+    assert "mtp_head" not in ABSENT_KEY_FAMILIES

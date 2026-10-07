@@ -25,6 +25,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 
 import vllm_neuron
+from vllm_neuron.model.glm5_next.mtp import BLOCK_ATTR, shadow_draft_k
 from vllm_neuron.model.glm5_next.config import (
     DSA_LAYER_TYPE,
     Glm5NextConfig,
@@ -47,10 +48,12 @@ from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
     MAPPED_KEY_QUANTISED_WEIGHT,
     MAPPED_KEY_SCALE_GRID,
     MAPPED_KEY_STACKED_BANK,
+    MTP_ROOT_ATTR,
     block_grid_shape,
     blockwise_scale_loader,
     build_weight_mappings,
     classify_mapped_keys,
+    mtp_layer_indices_for,
     scale_keys,
 )
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
@@ -77,8 +80,14 @@ MINI_ROUTED_EXPERTS = 4
 MINI_SHARED_EXPERTS = 1
 MINI_FIRST_K_DENSE = 1
 
-#: With every layer dense no routed bank is built, so the load completes.
+#: With every stack layer dense no routed bank is built in the stack, so the load
+#: completes. The draft layer, when the shadow-draft knob maps it, carries the MoE
+#: half the checkpoint gives it (the head refuses a dense one), so under the knob
+#: the "dense" tree holds exactly one routed bank: the draft layer's.
 MINI_ALL_DENSE_FIRST_K = MINI_LAYERS
+
+#: The shadow-draft knob; the draft layer exists in the tree exactly when it is on.
+MTP_KNOB = "VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT"
 
 #: One whole 128x128 quantisation block, so its scale grid is a single value.
 MINI_WEIGHT_SHAPE = (128, 128)
@@ -536,7 +545,15 @@ def test_the_map_load_weights_hands_over_covers_the_in_scope_index(
         f"{len(absent_from_index)} mapped keys are absent from the index, e.g. "
         f"{sorted(absent_from_index)[:5]}"
     )
-    assert not (claimed & mtp), "the map claims a multi-token-prediction key"
+    if shadow_draft_k() > 0:
+        # Shadow draft on: the root built ``self.mtp`` and the map claims the whole
+        # draft layer, every one of its 1,760 keys.
+        assert mtp <= claimed, (
+            f"the knob is on but {len(mtp - claimed)} multi-token-prediction keys "
+            f"are claimed by no mapping, e.g. {sorted(mtp - claimed)[:5]}"
+        )
+    else:
+        assert not (claimed & mtp), "the map claims a multi-token-prediction key"
 
 
 def test_the_reader_iterates_no_parameter_until_they_are_materialised() -> None:
@@ -592,7 +609,12 @@ def test_an_absent_checkpoint_refuses_by_name_and_leaves_the_tree_alone(
 
 
 def _out_of_band_entries(mappings: dict[str, str | list[str]]) -> dict[str, str]:
-    """Map entries whose scale the weight loader drops, as ``{param: scale key}``."""
+    """Map entries whose scales the weight loader drops, as ``{param: first scale key}``.
+
+    Two shapes, the two ``_load_out_of_band_scales`` reads: a weight with its one
+    companion scale whose grid has no entry of its own, and a stacked expert bank,
+    whose per-expert grids are interleaved with its weights.
+    """
     declared = {
         _keys_of(mappings, name)[0]
         for name in mappings
@@ -603,6 +625,8 @@ def _out_of_band_entries(mappings: dict[str, str | list[str]]) -> dict[str, str]
         keys = _keys_of(mappings, name)
         scales = [k for k in keys if _is_scale_key(k)]
         if len(keys) >= 2 and len(scales) == 1 and scales[0] not in declared:
+            found[name] = scales[0]
+        elif classify_mapped_keys(keys) == MAPPED_KEY_STACKED_BANK:
             found[name] = scales[0]
     return found
 
@@ -615,15 +639,24 @@ def _scale_attribute_of(param_name: str) -> tuple[str, str]:
 
 
 def _derived_dsa_scale_names(config: Glm5NextConfig) -> set[str]:
-    """The scale-grid parameter names the sparse-attention layers add, derived from the config."""
+    """The scale-grid parameter names the sparse-attention layers add, derived from the config.
+
+    The draft layer is one of them whenever the shadow-draft knob maps it: its block
+    is sparse-attention typed too, so it adds the same four grids under its own prefix.
+    """
     indices = [
         index
         for index, kind in enumerate(config.text_config.layer_types)
         if kind == DSA_LAYER_TYPE
     ]
+    prefixes = [f"model.layers.{index}.self_attn" for index in indices]
+    prefixes += [
+        f"{MTP_ROOT_ATTR}.{BLOCK_ATTR}.self_attn"
+        for _ in mtp_layer_indices_for(config.text_config)
+    ]
     return {
-        f"model.layers.{index}.self_attn.{leaf}_{FP8_SCALE_SUFFIX}"
-        for index in indices
+        f"{prefix}.{leaf}_{FP8_SCALE_SUFFIX}"
+        for prefix in prefixes
         for leaf in DSA_SCALED_PROJECTIONS
     }
 
@@ -739,7 +772,7 @@ def _every_prep_call_lives_in_the_caller(source: str) -> tuple[bool, dict]:
 
 
 def test_the_scale_grids_stay_fp32(
-    keep_the_loaded_tensors, tmp_path, single_rank_process_group
+    keep_the_loaded_tensors, tmp_path, single_rank_process_group, monkeypatch
 ) -> None:
     """Every scale grid, dropped or mapped, arrives fp32 with no cast; an absent scale key refuses by name."""
     model = _dense_model()
@@ -780,12 +813,17 @@ def test_the_scale_grids_stay_fp32(
         f"the load cast {len(cast_lines)} tensors to a placeholder dtype, e.g. "
         f"{cast_lines[0] if cast_lines else ''}"
     )
-    control = _dense_model()
-    control._placeholder_dtype = (
-        lambda keys, *, param_name, mappings: control.text_config.torch_dtype
-    )
-    with _captured_cast_lines() as control_lines:
-        control.load_weights(str(directory), torch.device("cpu"), None)
+    # The control's placeholders are mis-typed on purpose, so it is built with the
+    # shadow draft off: the draft layer's bank would otherwise reach its fp8 pack
+    # prep as bf16 and refuse by name before the casts this control exists to show.
+    with monkeypatch.context() as knob_off:
+        knob_off.delenv(MTP_KNOB, raising=False)
+        control = _dense_model()
+        control._placeholder_dtype = (
+            lambda keys, *, param_name, mappings: control.text_config.torch_dtype
+        )
+        with _captured_cast_lines() as control_lines:
+            control.load_weights(str(directory), torch.device("cpu"), None)
     assert len(control_lines) > 0, (
         "a load whose every placeholder took the config dtype cast nothing, so "
         "the zero above shows nothing"
