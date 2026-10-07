@@ -341,14 +341,15 @@ def mtp_layer_indices_for(
 
     ``draft_k`` is the knob's value, read through the head's own
     :func:`~vllm_neuron.model.glm5_next.mtp.shadow_draft_k` -- the knob's one
-    reader, contract C1 -- when not given. The indices start at ``len(layer_types)``,
-    the first index the stack does not use, and run for the checkpoint's own
+    reader, contract C1 -- when not given. The indices start at
+    ``num_hidden_layers``, the first index the stack does not use (the config pins
+    ``len(layer_types)`` to it), and run for the checkpoint's own
     ``num_nextn_predict_layers``.
     """
     k = shadow_draft_k() if draft_k is None else int(draft_k)
     if k <= 0:
         return ()
-    start = len(list(text_config.layer_types or ()))
+    start = int(text_config.num_hidden_layers)
     return tuple(range(start, start + int(text_config.num_nextn_predict_layers)))
 
 
@@ -477,10 +478,11 @@ def build_weight_mappings(
             f"map spells the single-layer head at {MTP_ROOT_ATTR!r} only"
         )
     for layer_id in draft_layers:
-        if layer_id < len(layer_types):
+        if layer_id < text_config.num_hidden_layers:
             raise Glm5NextWeightMapError(
-                f"draft layer {layer_id} is inside the {len(layer_types)}-layer "
-                f"stack; the multi-token-prediction layer is one past it"
+                f"draft layer {layer_id} is inside the "
+                f"{text_config.num_hidden_layers}-layer stack; the "
+                f"multi-token-prediction layer is one past it"
             )
         _add_mtp_layer(
             mappings,
@@ -511,8 +513,8 @@ def _add_mtp_layer(
     flat on the head (``mtp.enorm_weight``); everything the layer shares with a
     stack layer hangs on its block (``mtp.block.self_attn...``), because the head's
     module tree puts the decoder block one attribute down. The block's families
-    are added by the same four adders the stack uses, with the same leaf names and
-    the same key lists, so the loader chooser and the shard table see a layer-43
+    are added by the same adders the stack uses, with the same leaf names and the
+    same key lists, so the loader chooser and the shard table see a layer-43
     parameter and a layer-45 parameter as the same thing.
 
     Sparse attention, not linear: ``layer_types`` stops at the stack, so the
@@ -546,21 +548,25 @@ def _add_mtp_layer(
         mappings, ckpt_prefix, block_prefix, quantised=quantised, skip=skip
     )
 
-    # The same predicate ``_build_mlp`` applies to a stack layer; one past the
-    # stack is never below ``first_k_dense_replace`` on this checkpoint.
+    # The draft layer carries the MoE half: the router, the routed bank and the
+    # shared expert. ``_build_mlp`` would build a dense MLP below
+    # ``first_k_dense_replace``, and the head refuses such a block by name; so does
+    # the map, rather than spelling a dense draft layer no checkpoint ships.
     if layer_id < text_config.first_k_dense_replace:
-        _add_dense_mlp(
-            mappings, ckpt_prefix, block_prefix, quantised=quantised, skip=skip
+        raise Glm5NextWeightMapError(
+            f"draft layer {layer_id} is below first_k_dense_replace="
+            f"{text_config.first_k_dense_replace} and would be built dense; the "
+            f"multi-token-prediction layer carries the routed expert bank and the "
+            f"shared expert"
         )
-    else:
-        _add_moe_mlp(
-            mappings,
-            ckpt_prefix,
-            block_prefix,
-            text_config,
-            quantised=quantised,
-            skip=skip,
-        )
+    _add_moe_mlp(
+        mappings,
+        ckpt_prefix,
+        block_prefix,
+        text_config,
+        quantised=quantised,
+        skip=skip,
+    )
 
 
 #: The six multi-hyper-connection leaves each layer carries, in index order.

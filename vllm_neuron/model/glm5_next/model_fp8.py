@@ -8449,11 +8449,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
         # ``shadow_draft_k``, contract C1), so the map claims that layer's keys
         # exactly when there is a module to hold them. ``None`` with the knob off:
         # nothing else in this tree changes. The two weights the head reads are
-        # declared above and materialised only in ``load_weights``, so they are
-        # handed over as callables, and the group is resolved the way every
-        # row-parallel reduction in this file resolves it. Imported here, not at
-        # module level: the head imports this module lazily, so a top-level import
-        # either way would be a cycle.
+        # materialised only in ``load_weights``, so they are handed over as
+        # callables: the embedding table, and ``_head_weight``, the root's own
+        # tied-or-untied resolution of the logits weight; the group is resolved the
+        # way every row-parallel reduction in this file resolves it. Imported here,
+        # not at module level: the head imports this module lazily, so a top-level
+        # import either way would be a cycle.
         from .mtp import Glm5NextMultiTokenPredictor, shadow_draft_k
 
         self.mtp = None
@@ -8461,7 +8462,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             self.mtp = Glm5NextMultiTokenPredictor(
                 self.text_config,
                 embed_tokens=lambda: self.model.embed_tokens_weight,
-                lm_head=lambda: self.lm_head_weight,
+                lm_head=self._head_weight,
                 world_size=self.world_size,
                 tp_group=_resolve_tp_group,
             )

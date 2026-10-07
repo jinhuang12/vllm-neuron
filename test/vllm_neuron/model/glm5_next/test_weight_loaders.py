@@ -16,6 +16,7 @@ the duplicate tests run on the cross-shard path the helper cannot see.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import hashlib
 import json
 import logging
@@ -2016,7 +2017,7 @@ MTP_KNOB = "VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT"
 
 def _draft_layer(text_config: Glm5NextTextConfig) -> int:
     """The draft layer's index: the first one the stack does not use."""
-    return len(text_config.layer_types)
+    return int(text_config.num_hidden_layers)
 
 
 def _last_dsa_layer(text_config: Glm5NextTextConfig) -> int:
@@ -2136,12 +2137,17 @@ def test_mtp_layer_indices_default_follows_the_shadow_draft_knob(
 
 
 def test_an_unsupported_draft_layout_is_refused_by_name(real_text_config) -> None:
-    """A draft index inside the stack, or more than one draft layer, raises rather than maps."""
+    """A draft index inside the stack, more than one draft layer, or a dense draft layer raises rather than maps."""
     draft = _draft_layer(real_text_config)
     with pytest.raises(Glm5NextWeightMapError, match="inside the"):
         build_weight_mappings(real_text_config, mtp_layer_indices=(draft - 1,))
     with pytest.raises(Glm5NextWeightMapError, match="single-layer head"):
         build_weight_mappings(real_text_config, mtp_layer_indices=(draft, draft + 1))
+    # ``first_k_dense_replace`` past the draft layer would build it dense; the head
+    # refuses that block, and so does the map.
+    dense_draft = dataclasses.replace(real_text_config, first_k_dense_replace=draft + 1)
+    with pytest.raises(Glm5NextWeightMapError, match="would be built dense"):
+        build_weight_mappings(dense_draft, mtp_layer_indices=(draft,))
 
 
 def test_the_draft_leaves_are_the_heads_own_parameter_names_in_order() -> None:

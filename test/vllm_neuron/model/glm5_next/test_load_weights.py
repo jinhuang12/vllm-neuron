@@ -82,8 +82,8 @@ MINI_FIRST_K_DENSE = 1
 
 #: With every stack layer dense no routed bank is built in the stack, so the load
 #: completes. The draft layer, when the shadow-draft knob maps it, carries the MoE
-#: half the checkpoint gives it (the head refuses a dense one), so under the knob
-#: the "dense" tree holds exactly one routed bank: the draft layer's.
+#: half the checkpoint gives it (the head and the map refuse a dense one), so under
+#: the knob the "dense" tree holds exactly one routed bank: the draft layer's.
 MINI_ALL_DENSE_FIRST_K = MINI_LAYERS
 
 #: The shadow-draft knob; the draft layer exists in the tree exactly when it is on.

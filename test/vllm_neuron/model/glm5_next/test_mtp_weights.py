@@ -97,7 +97,7 @@ def real_config() -> Glm5NextConfig:
 @pytest.fixture(scope="module")
 def draft_layer(real_config) -> int:
     """The draft layer's index: the first one the stack does not use."""
-    return len(real_config.text_config.layer_types)
+    return int(real_config.text_config.num_hidden_layers)
 
 
 @pytest.fixture(scope="module")
