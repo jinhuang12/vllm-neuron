@@ -46,7 +46,13 @@ SIDE_ELEM_BYTES = 2          # latent bank dtype (bf16)
 HBM_PER_RANK_GIB = 24.00     # neuron_worker log: total_hbm=24.00 GiB (gate runs)
 FREE_AT_BUDGET_GIB = 16.94   # tip-b64-C (team-lead ruling 2): 24.00 total, 7.06 used at budget time
 CAP_TODAY_GIB = 6.62         # min(user, 0.30 x 22.08, 12 - 5 reserve) today
-ASSUMED_UNCAPPED_GIB = (12.0, 15.0)   # worker-37 wt2/kvbudget: free - graphs' real need - margin
+ASSUMED_UNCAPPED_GIB = (12.0, 15.0)   # worker-37 wt2/kvbudget: free - graphs' real need - margin (16.94 - 5 / - 2, rounded)
+# Today's per-physical-core staging bound (neuron_worker.py:1116-1135 `_physical_core_kv_bound`):
+# min(HBM/2 - reserve, 2 x (HBM/2 - reserve) - used) = min(12 - 5, 14 - 1.63) = 7.00 GiB (tip-b64-C server.log:6032).
+# A1 assumes wave 4 drops that term too; the alternative keeps it with the measured prefill graph need
+# (4.567 GiB on one physical core, kv.md) in place of the 5 GiB placeholder: 12 - 4.567 = 7.43 GiB.
+GRAPH_NEED_MEASURED_GIB = 4.567
+PER_CORE_TERM_KEPT_GIB = HBM_PER_RANK_GIB / 2 - GRAPH_NEED_MEASURED_GIB
 MTP_LAYER_PER_RANK_GIB = 6.979 / 64   # the draft layer's weights, sharded (tp_choice.py)
 
 
@@ -119,6 +125,8 @@ INDEXER = {
               "select_8k": {1: 108.1, 4: 112.4, 64: 168.4}},
 }
 INDEXER_BYPASS_MAX_CTX = 2051   # selection is the identity at or below this (dsa8k.md:127)
+EMPTY_PER_LAYER_US = 13.0       # fixed per-call cost each separately timed sub-graph carries (dsa8k.md:82: 134-189 us per
+                                # call / 11 layers); subtracted from scores and select before they are scaled with C
 INDEX_TOPK = 2048               # rows the sparse MLA reads per query row above the bypass
 
 # mla_micro.json / mla.md section 5: profiled device time per 11-layer step.
@@ -158,9 +166,9 @@ def indexer_us(C: int, T: int, variant: str, select_scales_with_ctx: bool = True
     if C <= 8192:
         return base
     f = C / 8192 - 1.0
-    extra = f * interp_rows(v["scores_8k"], T)
+    extra = f * max(interp_rows(v["scores_8k"], T) - EMPTY_PER_LAYER_US, 0.0)
     if select_scales_with_ctx:
-        extra += f * interp_rows(v["select_8k"], T)
+        extra += f * max(interp_rows(v["select_8k"], T) - EMPTY_PER_LAYER_US, 0.0)
     return base + extra
 
 
@@ -219,8 +227,8 @@ def main() -> None:
                     help="draft iterations 1..k-1 re-run the indexer (upstream shares iteration 0's top-k)")
     ap.add_argument("--select-flat-in-ctx", action="store_true", help="32k lower bound: top-k select held flat in C")
     ap.add_argument("--residual", choices=("none", "flat", "per_row"), default="flat",
-                    help="selected-regime residual (indexer_micro whole-layer minus composed kernels, %.1f us/layer)" % 0
-                    if False else "selected-regime residual per DSA layer call at C > 2051: none | flat (default) | per_row (sensitivity)")
+                    help="selected-regime residual per DSA layer call at C > 2051 (indexer_micro whole layer minus the composed "
+                         "kernels): none | flat (default) | per_row (sensitivity)")
     ap.add_argument("--output", type=Path, required=True)
     args = ap.parse_args()
     sel_kw = {"select_scales_with_ctx": not args.select_flat_in_ctx}
@@ -232,8 +240,8 @@ def main() -> None:
     assert all(p["pool_match"] and p["total_match"] for p in out["kvseg_check"]), out["kvseg_check"]
 
     # ---- (a) feasibility ------------------------------------------------------------------
-    budgets = {"today 6.62 (cap)": CAP_TODAY_GIB, "assumed 12 (low)": ASSUMED_UNCAPPED_GIB[0],
-               "assumed 15 (high)": ASSUMED_UNCAPPED_GIB[1]}
+    budgets = {"today 6.62 (cap)": CAP_TODAY_GIB, "A1-alt 7.43 (per-core term kept)": round(PER_CORE_TERM_KEPT_GIB, 2),
+               "assumed 12 (A1 low)": ASSUMED_UNCAPPED_GIB[0], "assumed 15 (A1 high)": ASSUMED_UNCAPPED_GIB[1]}
     variants = {"recipe line as written (prefix caching on, no --mamba-block-size)": False,
                 "+ --no-enable-prefix-caching --mamba-block-size <max_model_len>": True}
     feas = []
@@ -250,8 +258,10 @@ def main() -> None:
                 for bname, b in budgets.items():
                     S = largest_bs(L, int(b * GIB), mamba_block_is_L=flag, spec_tokens=5, kda_snapshot=True)
                     need = kv_need_bytes(L, max(S, 1), mamba_block_is_L=flag, spec_tokens=5, kda_snapshot=True)
+                    one = kv_need_bytes(L, 1, mamba_block_is_L=flag, spec_tokens=5, kda_snapshot=True)["total_bytes"]
                     feas.append({"variant": vname, "max_model_len": L, "bs": S, "budget": bname,
-                                 "largest_bs": True, "need_gib": round(need["total_bytes"] / GIB, 3)})
+                                 "largest_bs": True, "need_gib": round(need["total_bytes"] / GIB, 3),
+                                 "per_seq_gib_incl_k5": round(one / GIB, 3)})
     # the recipe's absent --max-num-seqs: the side caches and banks are allocated at max_num_seqs
     # slots (runner:5254 _glm5next_side_caches), not at the live batch.
     default_s = 256
@@ -324,7 +334,7 @@ def main() -> None:
     # ---- print ------------------------------------------------------------------------------
     print("kvseg points reproduced:", all(p["pool_match"] and p["total_match"] for p in out["kvseg_check"]))
     print(f"selected-regime residual: {selected_residual_us():.1f} us per DSA layer call at C > 2051 (mode {args.residual})")
-    print("\n(a) KV need per rank, TP=64, incl. k=5 slots + KDA rollback snapshot")
+    print(f"\n(a) KV need per rank, TP=64, incl. k=5 slots + KDA rollback snapshot; budgets GiB: {budgets}")
     for r in feas:
         if r.get("largest_bs"):
             print(f"  {r['variant'][:60]:60s} L={r['max_model_len']:>8d} budget {r['budget']:18s} largest bs {r['bs']:>4d} ({r['need_gib']} GiB)")
