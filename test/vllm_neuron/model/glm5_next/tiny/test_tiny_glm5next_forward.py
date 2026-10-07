@@ -192,6 +192,12 @@ _SEAM_REGISTRY = {
         "vllm_neuron.functional.dsa.decode_batch",
         "decode_batch_dispatch_counters",
         "reset_decode_batch_dispatch_counters"),
+    "glue_mhc_pre": (
+        "vllm_neuron.functional.glue.mhc_pre", "dispatch_counters", "reset_dispatch_counters"),
+    "glue_kda_projections": (
+        "vllm_neuron.functional.glue.kda_projections", "dispatch_counters", "reset_dispatch_counters"),
+    "glue_kda_output": (
+        "vllm_neuron.functional.glue.kda_output", "dispatch_counters", "reset_dispatch_counters"),
 }
 _SEAMS = tuple(_SEAM_REGISTRY)
 

@@ -180,6 +180,7 @@ def test_tiny_model_forward_matches_the_reference() -> None:
         "moe_fused": 1 * STACK_MOE_LAYERS,
         "noaux_tc_router": 1 * STACK_MOE_LAYERS,
         "mhc_sinkhorn": MHC_SITES_PER_LAYER * STACK_LAYERS,
+        "glue_mhc_pre": MHC_SITES_PER_LAYER * STACK_LAYERS,
         "mhc_hyper_connection": MHC_SITES_PER_LAYER * STACK_LAYERS,
     }
     _declare_bound_and_sentinel(route_expected)
@@ -528,6 +529,7 @@ def test_tiny_root_forward_matches_the_reference() -> None:
         "moe_fused": 1 * STACK_MOE_LAYERS,
         "noaux_tc_router": 1 * STACK_MOE_LAYERS,
         "mhc_sinkhorn": MHC_SITES_PER_LAYER * STACK_LAYERS,
+        "glue_mhc_pre": MHC_SITES_PER_LAYER * STACK_LAYERS,
         "mhc_hyper_connection": MHC_SITES_PER_LAYER * STACK_LAYERS,
     }
     _declare_bound_and_sentinel(route_expected)
