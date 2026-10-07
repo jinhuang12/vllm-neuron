@@ -1017,6 +1017,35 @@ def test_index_share_carrier_publishes_the_chain_s_selection_and_reuses_it() -> 
 
 
 # --------------------------------------------------------------------------- #
+# the window's edge: iterations past max_seq_len clamp to the last position.
+
+
+def test_draft_iterations_past_the_window_clamp_to_the_last_position() -> None:
+    """A draft that runs past ``max_seq_len`` clamps every later iteration to the last
+    position (upstream ``spec_decode/utils.py`` does the same), so no iteration indexes
+    the pooled store or the latent bank past the window; it still returns k ids. Without
+    the clamp an iteration past the window completes a pool the window does not have and
+    writes a store row the serve line does not allocate (the fixture keeps spare rows
+    between the window's pools and the store's trash row to watch)."""
+    _skip_unless_live()
+    fx = _fixture(64_301, prefill=MAX_SEQ_LEN - 2, index_share_for_mtp_iteration=False)
+    p = fx["prefill"]
+    pool = fx["caches"]["impl"]["pool_cache"]
+    trash = int(pool.shape[0]) - 1  # the store's last row (model_fp8 ``_require_serviceable``)
+    beyond = MAX_SEQ_LEN // POOL_SIZE  # the first pool index past the window
+    assert trash > beyond, "the fixture keeps rows between the window's pools and the trash row"
+    # Enough iterations for an unclamped draft to complete pool ``beyond``.
+    k = (beyond + 1) * POOL_SIZE - p
+    assert k > 2, k
+    got = _draft(fx, p, k)
+    _k_tokens_per_request(got, 1, k, "clamped")
+    assert bool(pool[beyond:trash].abs().sum() == 0), "no draft iteration wrote a pool past the window"
+    assert bool(fx["caches"]["impl"]["latent_cache"][MAX_SEQ_LEN - 1].abs().sum() > 0), (
+        "the clamped iterations wrote the window's last row"
+    )
+
+
+# --------------------------------------------------------------------------- #
 # the route predicate over a draft, and the control that moves the fallback counter.
 
 

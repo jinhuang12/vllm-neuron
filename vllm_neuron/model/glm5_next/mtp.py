@@ -132,8 +132,10 @@ def shadow_draft_k() -> int:
     ``envs``, which holds the knob's one definition. Unset is 0. A negative value is
     refused by name rather than clamped, because a clamped knob would run a
     different draft than the one asked for and the alpha it measures would be
-    labelled with the wrong k. Any positive k runs that many iterations; what bounds
-    it is the state the draft advances through, at run time, not a constant here.
+    labelled with the wrong k. Any positive k runs that many iterations; the
+    iterations past the request's window clamp to its last position
+    (``Glm5NextMultiTokenPredictor._iteration_carrier``), so no k indexes state
+    out of bounds.
     """
     from vllm_neuron import envs
 
@@ -162,11 +164,11 @@ def _declare_parameters(module: nn.Module, *names: str) -> None:
     )
 
 
-def _shifted(value: torch.Tensor | int, by: int) -> torch.Tensor | int:
-    """``value + by`` for a position that is a tensor on the traced path or an int."""
+def _advanced(value: torch.Tensor | int, by: int, limit: int) -> torch.Tensor | int:
+    """``min(value + by, limit)`` for a position that is a tensor on the traced path or an int."""
     if torch.is_tensor(value):
-        return value + int(by)
-    return int(value) + int(by)
+        return torch.clamp(value + int(by), max=int(limit))
+    return min(int(value) + int(by), int(limit))
 
 
 class Glm5NextMultiTokenPredictor(nn.Module):
@@ -408,13 +410,21 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         count, recomputes the latent slot for the advanced position and swaps the
         real ring for the scratch copy. Everything else -- the latent bank, the
         pooled store, the block table, the window -- is the same object.
+
+        The advance is clamped to the window's last position, ``max_seq_len - 1``
+        (upstream clamps draft positions to ``max_model_len - 1`` the same way,
+        ``spec_decode/utils.py``): a draft that runs past the window keeps writing
+        the last position -- the scratch ring, the last latent slot -- and never
+        indexes the pooled store past its trash row. The ids it drafts there are
+        what the trunk never uses, since a request at its last position ends.
         """
         if iteration == 0:
             return block_kwargs
+        last = int(block_kwargs["max_seq_len"]) - 1
         carrier = dict(block_kwargs)
-        carrier["position"] = _shifted(block_kwargs["position"], iteration)
-        carrier["seq_lens"] = block_kwargs["seq_lens"] + iteration
-        carrier["start_position"] = _shifted(block_kwargs["start_position"], iteration)
+        carrier["position"] = _advanced(block_kwargs["position"], iteration, last)
+        carrier["seq_lens"] = _advanced(block_kwargs["seq_lens"], iteration, last + 1)
+        carrier["start_position"] = _advanced(block_kwargs["start_position"], iteration, last)
         carrier["latent_slots"] = self._latent_slots_at(
             block_kwargs["block_table_row"],
             carrier["position"],
@@ -507,8 +517,9 @@ class Glm5NextMultiTokenPredictor(nn.Module):
             sampled_ids: ``[B]`` int32, the tokens the trunk sampled at ``positions``.
             positions: ``[B]`` int32, each request's position (the one the trunk
                 just consumed).
-            k: iterations, at least 1. The state the draft advances through (the
-                request's window, the pooled store) bounds it at run time.
+            k: iterations, at least 1. Iterations past the request's window
+                (``position >= max_seq_len``) clamp to its last position and draft
+                ids the caller never uses.
             quant_config: the resolved quantisation policy the MoE half runs under
                 (the root resolves it once per forward and threads it to the stack;
                 the same object belongs here).
