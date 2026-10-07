@@ -42,6 +42,7 @@ GIB = 1024**3
 # per-rank device residency measured before any graph staged.
 TOTAL_HBM_BYTES = 24 * GIB
 MEASURED_BYTES_USED = 13_733_871_288  # 12.79 GiB of weights and operands
+# The graph need assumed on a cold compile cache (the fake worker reads none).
 DEFAULT_RESERVE_GIB = 5.0
 
 # The page one block of the latent cache occupies: one buffer, not a key/value
@@ -88,10 +89,16 @@ CAP_FRACTION_BUDGET_BYTES = int(
 
 _WORKER_METHODS = (
     "determine_available_memory",
+    "_kv_budget",
     "_compute_kv_budget",
     "_kv_cache_need_bytes",
+    "_kv_cache_allocation_sizes",
     "_kv_cache_footprint_bytes",
-    "_physical_core_kv_bound",
+    "_max_num_seqs_that_fit",
+    "_kv_cache_footprint_at",
+    "_log_recurrent_blocks",
+    "_kv_cache_largest_tensor_bytes",
+    "_graph_need",
     "_prepared_operand_bytes",
     "_get_graph_reserve_bytes",
     "_get_kv_cap_fraction",
@@ -99,6 +106,12 @@ _WORKER_METHODS = (
     "_determine_available_memory_neuron",
     "_estimate_available_memory_neuron",
 )
+
+
+def _margin() -> int:
+    from vllm_neuron.vllm.worker.neuron_worker import KV_BUDGET_MARGIN_BYTES
+
+    return KV_BUDGET_MARGIN_BYTES
 
 
 class _FakeModel(torch.nn.Module):
@@ -173,6 +186,7 @@ def _worker(
         cache_dtype="auto",
         gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
         mamba_cache_mode="none",
+        mamba_block_size=None,
         num_gpu_blocks_override=None,
         # Prefix caching is on in the served configuration, so the allocator this
         # fixture drives hashes blocks exactly as the served run does.
@@ -220,6 +234,9 @@ def _worker(
         total_hbm - bytes_used,
     )
     worker._get_byte_used_from_model = lambda: bytes_used
+    # No compile cache: the graph need is the cold-cache reserve on every host.
+    worker._neff_cache_dir = lambda: None
+    worker._graphs_to_load = lambda: (3, None)
     return worker
 
 
@@ -232,39 +249,64 @@ def test_available_memory_is_the_block_rounded_served_need(monkeypatch) -> None:
     assert worker.determine_available_memory() == EXPECTED_NEED_BYTES
 
 
-def test_the_heuristic_is_bounded_by_one_physical_core(monkeypatch) -> None:
-    """A logical core reporting 24 GiB budgets against 12 GiB, less reserve."""
+def test_the_physical_core_bound_is_retired_for_the_logical_core(monkeypatch) -> None:
+    """Retired premise: a rank's KV cache must fit one physical core (24 / 2 - 5 GiB).
+
+    The bound assumed the runtime splits a rank's tensors over the two physical
+    cores and stages a graph on one of them, so the cache had to leave a 5 GiB
+    reserve inside 12 GiB. The runtime's own accounting says otherwise. At
+    tip-b64-C (``/home/ubuntu/glm53f-wt2/gate/runs/tip-b64-C/server.log``,
+    ``TDRV:dml_log_dev_neff_mem``, after each rank's 15 NEFF loads; the runtime
+    prints binary units as GB): ``:529036`` ND 0 NC 0 holds 14.457 GiB = 13.378
+    GiB of tensors + 0.75 GiB of shared scratchpad + the graphs' code, constants
+    and rings, while ``:528992`` ND 0 NC 1 holds 0.196 GiB; ``:532035`` ND 13 NC 6
+    holds 14.474 GiB, 13.378 GiB of it tensors. One physical core holds more than
+    12 GiB and serves; the only limit is the logical core's 24 GiB. So the budget
+    is that core's free memory (24 - 12.79 GiB resident here) less the graph
+    need (the 5 GiB reserve: this fake reads no compile cache) less the margin:
+    5.96 GiB, where the bound gave min(12 - 5, 2 x 7 - 12.79) = 1.21 GiB. The
+    September serve that ran out of device memory at this residency held 12.79
+    GiB of weights, 6.48 GiB of KV cache and 4.57 GiB of graph, about the
+    logical core's 24 GiB; this budget refuses that 6.48 GiB cache.
+    """
     monkeypatch.delenv("VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB", raising=False)
+    monkeypatch.delenv("VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION", raising=False)
     monkeypatch.delenv("VLLM_NEURON_CPU_MODE", raising=False)
     monkeypatch.delenv("VLLM_NEURON_CPU_COMPILE", raising=False)
     worker = _worker()
     reserve_bytes = int(DEFAULT_RESERVE_GIB * GIB)
-    room_on_one_core = TOTAL_HBM_BYTES // 2 - reserve_bytes
 
-    bound = worker._physical_core_kv_bound(TOTAL_HBM_BYTES, MEASURED_BYTES_USED)
     heuristic = worker._compute_kv_budget(
         TOTAL_HBM_BYTES, MEASURED_BYTES_USED, GPU_MEMORY_UTILIZATION
     )
     available = worker.determine_available_memory()
 
-    assert bound <= room_on_one_core
-    assert heuristic == bound
+    room_per_core = TOTAL_HBM_BYTES // 2 - reserve_bytes
+    retired_bound = min(room_per_core, 2 * room_per_core - MEASURED_BYTES_USED)
+
+    assert heuristic == TOTAL_HBM_BYTES - MEASURED_BYTES_USED - reserve_bytes - _margin()
+    assert round(heuristic / GIB, 2) == 5.96
+    assert round(retired_bound / GIB, 2) == 1.21
+    assert heuristic < int(6.48 * GIB)
     assert available == EXPECTED_NEED_BYTES
 
 
 def test_the_graph_reserve_is_overridable_and_validated(monkeypatch) -> None:
-    """The override moves the bound; an unusable value is refused by name."""
+    """The override moves the budget; an unusable value is refused by name."""
     worker = _worker()
 
+    def budget() -> int:
+        return worker._compute_kv_budget(
+            TOTAL_HBM_BYTES, MEASURED_BYTES_USED, GPU_MEMORY_UTILIZATION
+        )
+
     monkeypatch.delenv("VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB", raising=False)
-    default_bound = worker._physical_core_kv_bound(
-        TOTAL_HBM_BYTES, MEASURED_BYTES_USED
-    )
-    monkeypatch.setenv("VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB", "1.0")
-    overridden_bound = worker._physical_core_kv_bound(
-        TOTAL_HBM_BYTES, MEASURED_BYTES_USED
-    )
-    assert overridden_bound > default_bound
+    default_budget = budget()
+    monkeypatch.setenv("VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB", "measured")
+    assert budget() == default_budget
+    # 3 GiB keeps the measured term under the GMU limit (0.9 x 24 - 12.79 GiB).
+    monkeypatch.setenv("VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB", "3.0")
+    assert budget() == default_budget + int(DEFAULT_RESERVE_GIB * GIB) - 3 * GIB
 
     for offending in ("0", "-1", "not-a-number"):
         monkeypatch.setenv("VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB", offending)
@@ -424,15 +466,16 @@ def test_prepared_operands_count_once_towards_residency(monkeypatch) -> None:
     worker = _worker(model=model)
 
     prepared_bytes = worker._prepared_operand_bytes()
-    bound_with = worker._physical_core_kv_bound(
-        TOTAL_HBM_BYTES, MEASURED_BYTES_USED + prepared_bytes
+    # The estimate taken without a device charges them against the free memory.
+    estimate_with = worker._compute_kv_budget(
+        TOTAL_HBM_BYTES, MEASURED_BYTES_USED, GPU_MEMORY_UTILIZATION
     )
-    bound_without = worker._physical_core_kv_bound(
-        TOTAL_HBM_BYTES, MEASURED_BYTES_USED
+    estimate_without = _worker()._compute_kv_budget(
+        TOTAL_HBM_BYTES, MEASURED_BYTES_USED, GPU_MEMORY_UTILIZATION
     )
 
     assert prepared_bytes == operand_a.nbytes + operand_b.nbytes
-    assert bound_with < bound_without
+    assert estimate_without - estimate_with == prepared_bytes
 
 
 def test_prepared_operands_on_the_meta_device_are_counted(monkeypatch) -> None:
@@ -475,33 +518,32 @@ def test_a_need_over_the_budget_is_refused_by_name(monkeypatch) -> None:
     assert "VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB" in message
 
 
-def test_the_allocation_adds_a_bank_per_recurrent_layer_and_fits_the_bound(
+def test_the_allocation_adds_a_bank_per_recurrent_layer_and_fits_the_budget(
     monkeypatch,
 ) -> None:
-    """The allocation is the need plus one bank per recurrent layer, inside the bound."""
+    """The allocation is the need plus one bank per recurrent layer, inside the budget."""
     monkeypatch.setenv("VLLM_NEURON_CPU_MODE", "1")
     monkeypatch.delenv("VLLM_NEURON_CPU_COMPILE", raising=False)
     monkeypatch.delenv("VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB", raising=False)
+    monkeypatch.delenv("VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION", raising=False)
     worker = _worker()
 
     need = worker._kv_cache_need_bytes()
     allocated = worker._kv_cache_footprint_bytes(need)
-    bound = worker._physical_core_kv_bound(
-        TOTAL_HBM_BYTES, MEASURED_BYTES_USED + worker._prepared_operand_bytes()
+    budget = worker._compute_kv_budget(
+        TOTAL_HBM_BYTES, MEASURED_BYTES_USED, GPU_MEMORY_UTILIZATION
     )
     available = worker.determine_available_memory()
 
     assert need == EXPECTED_NEED_BYTES
     assert allocated == EXPECTED_FOOTPRINT_BYTES
     assert available == need
-    assert allocated <= bound
+    assert allocated <= budget
 
     # A budget the need fits and the allocation does not refuses, naming the
-    # allocation as well as the need.
+    # allocation as well as the need. CPU mode: the host share x GMU, uncapped.
     share = (need + allocated) // 2
-    between = _worker(
-        host_bytes=int(share / (GPU_MEMORY_UTILIZATION * worker._get_kv_cap_fraction()))
-    )
+    between = _worker(host_bytes=int(share / GPU_MEMORY_UTILIZATION))
     with pytest.raises(RuntimeError) as refusal:
         between.determine_available_memory()
     message = str(refusal.value)
@@ -509,20 +551,64 @@ def test_the_allocation_adds_a_bank_per_recurrent_layer_and_fits_the_bound(
     assert f"{need / GIB:.3f} GiB" in message
 
 
-def test_the_unbounded_logical_core_budget_over_allocates(monkeypatch) -> None:
-    """Without the core bound and the need cap, the cap fraction over-allocates."""
+def test_the_cap_fraction_is_retired_as_a_default(monkeypatch) -> None:
+    """Retired premise: a fixed 0.30 of GMU x HBM is a safe KV budget by default.
+
+    The cap stood in for the graphs' device memory, which nothing measured. The
+    graph need is now read from the compiled NEFFs (or the reserve stands in on a
+    cold cache), so the cap applies only when
+    ``VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION`` is set. Set to 0.30 it still gives
+    30x the served need at bs=1 x 4k, and the measured budget gives more; either
+    way the returned bytes are the need, so the block count is the compiled
+    graph's.
+    """
     monkeypatch.delenv("VLLM_NEURON_CPU_MODE", raising=False)
     monkeypatch.delenv("VLLM_NEURON_CPU_COMPILE", raising=False)
-    monkeypatch.delenv("VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB", raising=False)
-    worker = _worker()
-    bounded = worker.determine_available_memory()
+    # A 3 GiB graph need keeps the measured term under the GMU limit (21.6 - 1 GiB).
+    monkeypatch.setenv("VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB", "3.0")
+    monkeypatch.setenv("VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION", "0.30")
+    worker = _worker(bytes_used=GIB)
 
-    worker._physical_core_kv_bound = lambda *_: TOTAL_HBM_BYTES
-    unbounded = worker._compute_kv_budget(
+    capped = worker._compute_kv_budget(TOTAL_HBM_BYTES, GIB, GPU_MEMORY_UTILIZATION)
+    returned = worker.determine_available_memory()
+    monkeypatch.delenv("VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION")
+    measured = worker._compute_kv_budget(TOTAL_HBM_BYTES, GIB, GPU_MEMORY_UTILIZATION)
+
+    assert capped == CAP_FRACTION_BUDGET_BYTES
+    assert measured == TOTAL_HBM_BYTES - GIB - 3 * GIB - _margin()
+    assert returned == EXPECTED_NEED_BYTES
+    # About 30x on these figures: an order of magnitude over the served need.
+    assert capped >= 25 * returned
+    assert measured > capped
+
+
+def test_an_over_allocation_is_refused_with_the_shortfall_named(monkeypatch) -> None:
+    """A footprint above free - graph need - margin is refused, naming the shortfall.
+
+    On the device path, with the graph need set so the budget is half the footprint.
+    The 1 GiB minimum-budget floor is off so the footprint check is the one that
+    refuses.
+    """
+    monkeypatch.delenv("VLLM_NEURON_CPU_MODE", raising=False)
+    monkeypatch.delenv("VLLM_NEURON_CPU_COMPILE", raising=False)
+    monkeypatch.delenv("VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION", raising=False)
+    monkeypatch.setenv("VLLM_NEURON_MIN_KV_BUDGET_GIB", "0")
+    free = TOTAL_HBM_BYTES - MEASURED_BYTES_USED
+    graph_bytes = free - _margin() - EXPECTED_FOOTPRINT_BYTES // 2
+    monkeypatch.setenv("VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB", repr(graph_bytes / GIB))
+    worker = _worker()
+    budget = worker._compute_kv_budget(
         TOTAL_HBM_BYTES, MEASURED_BYTES_USED, GPU_MEMORY_UTILIZATION
     )
+    assert budget < EXPECTED_FOOTPRINT_BYTES
 
-    assert unbounded == CAP_FRACTION_BUDGET_BYTES
-    assert bounded == EXPECTED_NEED_BYTES
-    # About 30x on these figures: an order of magnitude over the served need.
-    assert unbounded >= 25 * bounded
+    with pytest.raises(RuntimeError) as refusal:
+        worker.determine_available_memory()
+
+    message = str(refusal.value)
+    assert "neuron mode" in message
+    assert f"free {free / GIB:.2f} GiB (runtime)" in message
+    assert f"graph need {graph_bytes / GIB:.2f} GiB" in message
+    assert f"budget {budget / GIB:.3f} GiB" in message
+    assert f"{EXPECTED_FOOTPRINT_BYTES / GIB:.3f} GiB" in message
+    assert f"short by {(EXPECTED_FOOTPRINT_BYTES - budget) / GIB:.3f} GiB" in message

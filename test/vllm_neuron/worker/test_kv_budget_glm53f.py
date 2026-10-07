@@ -89,16 +89,25 @@ FIXTURE_PATH = (
 
 _WORKER_METHODS = (
     "determine_available_memory",
+    "_kv_budget",
     "_compute_kv_budget",
     "_kv_cache_need_bytes",
+    "_kv_cache_allocation_sizes",
     "_kv_cache_footprint_bytes",
-    "_physical_core_kv_bound",
+    "_max_num_seqs_that_fit",
+    "_kv_cache_footprint_at",
+    "_log_recurrent_blocks",
+    "_kv_cache_largest_tensor_bytes",
+    "_graph_need",
     "_get_graph_reserve_bytes",
     "_get_kv_cap_fraction",
     "_determine_available_memory_cpu",
     "_determine_available_memory_neuron",
     "_estimate_available_memory_neuron",
 )
+
+#: Graphs the bs=64 @ 8k line warms: 1 prefill target, 7 batch x 2 ctx decode.
+SERVED_GRAPHS = 15
 
 
 # ---------------------------------------------------------------------------
@@ -272,8 +281,18 @@ def fake_worker(
     param_bytes: int = MEASURED_PARAM_BYTES,
     resident_bytes: int = MEASURED_RESIDENT_BYTES,
     total_hbm: int = TOTAL_HBM_BYTES,
+    runtime_used_bytes: int | None = None,
+    graph_cache_dir: Path | None = None,
+    expected_graphs: int = SERVED_GRAPHS,
 ):
-    """A worker-shaped object carrying the real budget methods of ``NeuronWorker``."""
+    """A worker-shaped object carrying the real budget methods of ``NeuronWorker``.
+
+    The runtime reports ``runtime_used_bytes`` used (``resident_bytes`` unless
+    given) out of ``total_hbm``. The graph need is read from ``graph_cache_dir``,
+    which warmup is taken to fill with ``expected_graphs`` graphs; without one the
+    worker reads a cache that does not exist, so the need is the cold-cache
+    reserve and no test depends on the compile caches of the host it runs on.
+    """
     from vllm_neuron.vllm.worker.neuron_worker import NeuronWorker
 
     worker = SimpleNamespace(
@@ -283,12 +302,13 @@ def fake_worker(
     )
     for name in _WORKER_METHODS:
         setattr(worker, name, types.MethodType(getattr(NeuronWorker, name), worker))
-    worker._query_runtime_memory_stats = lambda: (
-        resident_bytes,
-        total_hbm - resident_bytes,
-    )
+    used = resident_bytes if runtime_used_bytes is None else runtime_used_bytes
+    worker._query_runtime_memory_stats = lambda: (used, total_hbm - used)
     worker._get_byte_used_from_model = lambda: param_bytes
     worker._prepared_operand_bytes = lambda: resident_bytes - param_bytes
+    cache_dir = graph_cache_dir if graph_cache_dir is not None else Path("/nonexistent/compile_cache")
+    worker._neff_cache_dir = lambda: cache_dir
+    worker._graphs_to_load = lambda: (expected_graphs, None)
     return worker
 
 
@@ -412,23 +432,38 @@ def test_the_reference_reproduces_the_as_built_serve_log() -> None:
 
 
 def test_the_budget_reproduces_the_as_built_serve_log(monkeypatch) -> None:
-    """The worker's budget on the measured residency is the serve log's cap and bound.
+    """The serve log's cap still binds where its knob is set; by default it is gone.
 
-    ``server_decode.log``: "cap=6.62 GiB, physical_core_bound=6.04 GiB ...
-    effective=6.04 GiB" with the default knobs.
+    ``server_decode.log`` (5938748): "cap=6.62 GiB, physical_core_bound=6.04 GiB ...
+    effective=6.04 GiB" with the default knobs of the time. Since wt2/kvbudget the
+    0.30 cap applies only when ``VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION`` is set and
+    the per-physical-core bound not at all (``test_kv_budget_measured.py``). The
+    default budget is the free memory (24 - 7.96 resident) less the graph need (the
+    5 GiB reserve: the fake worker reads no compile cache) less the margin.
     """
+    from vllm_neuron.vllm.worker.neuron_worker import KV_BUDGET_MARGIN_BYTES
+
     monkeypatch.delenv("VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB", raising=False)
     monkeypatch.delenv("VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION", raising=False)
     layers, _ = glm53f_layer_specs()
     worker = fake_worker(fake_runner(layers, max_num_seqs=1, max_model_len=4096))
 
-    budget = worker._compute_kv_budget(
-        TOTAL_HBM_BYTES, MEASURED_PARAM_BYTES, GPU_MEMORY_UTILIZATION
-    )
+    def budget() -> int:
+        return worker._compute_kv_budget(
+            TOTAL_HBM_BYTES, MEASURED_PARAM_BYTES, GPU_MEMORY_UTILIZATION
+        )
+
+    measured = budget()
+    monkeypatch.setenv("VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION", "0.30")
+    capped = budget()
 
     cap = int(int(TOTAL_HBM_BYTES * GPU_MEMORY_UTILIZATION) * 0.30)
     assert round(cap / GIB, 2) == 6.62
-    assert round(budget / GIB, 2) == 6.04
+    assert capped == cap
+    assert measured == (
+        TOTAL_HBM_BYTES - MEASURED_RESIDENT_BYTES - 5 * GIB - KV_BUDGET_MARGIN_BYTES
+    )
+    assert round(measured / GIB, 2) == 10.79
 
 
 def test_the_default_line_prices_bs1_at_4k_exactly_as_5938748() -> None:
@@ -722,8 +757,8 @@ def test_the_worker_does_not_refuse_64_sequences_at_8k_with_the_default_knobs(
 ) -> None:
     """On the measured 0a08ff4 residency the default knobs admit the served point.
 
-    The side caches count since wt2/kvseg, so the 5938748 residency (7.96 GiB, budget
-    6.04 GiB) no longer admits it:
+    Even on a cold cache, where the 5 GiB reserve stands in for the graph need. A
+    budget between the KV tensors and the footprint is refused since wt2/kvseg:
     ``test_kv_budget_side_caches.py::test_a_point_that_fits_only_without_side_caches_is_refused_naming_the_shortfall``.
     """
     monkeypatch.delenv("VLLM_NEURON_CPU_MODE", raising=False)
