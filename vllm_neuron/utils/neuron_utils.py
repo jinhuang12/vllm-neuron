@@ -14,6 +14,11 @@ from vllm_neuron import envs
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
+#: SBUF bytes one partition offers an NKI kernel on trn2, as the vendor kernel library
+#: states them (its ``MAX_AVAILABLE_SBUF_SIZE``): 224 KiB less the reserved head and tail.
+#: Host-side tile-size rules use it; inside a kernel ``nl.tile_size`` is authoritative.
+SBUF_BYTES_PER_PARTITION = 224 * 1024 - 16384 - 8 - 520
+
 
 def can_run_kernel(device: torch.Tensor | str = "") -> bool:
     """Check if NKI kernels can run on the given device."""

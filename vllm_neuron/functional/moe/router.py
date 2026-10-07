@@ -11,7 +11,7 @@ from nkilib.core.router_topk.router_topk import router_topk
 from nkilib.core.utils.common_types import RouterActFnType
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
-from vllm_neuron.utils.neuron_utils import can_run_kernel
+from vllm_neuron.utils.neuron_utils import SBUF_BYTES_PER_PARTITION, can_run_kernel
 
 from dataclasses import dataclass
 
@@ -901,14 +901,9 @@ _NOAUX_TC_F_MAX = 512
 #: Token multiple for the fused two-core launch: a whole 128-row tile per core.
 _NOAUX_TC_T_MULTIPLE = 256
 
-#: Most tokens one fused-router launch takes; a longer prefill chunk runs as several
-#: launches. The kernel holds the RMSNorm output of every token of a launch in SBUF
-#: (`norm_sb`, `[128, T, H / 128]` bf16, `T * H / 64` B per partition): at H 4096 a
-#: launch of 8192 tokens needs 524,288 B of the 229,376 B a partition has, and
-#: neuronx-cc refuses it (NCC_IGCA037). 2048 tokens need 131,072 B. 2048 is also the
-#: bound nkilib's own router gate keeps (`_can_use_kernel`, NKILIB-618). A whole
-#: multiple of `_NOAUX_TC_T_MULTIPLE`, so every launch splits into two 128-row cores.
-NOAUX_TC_TOKEN_TILE = 2048
+#: Most tokens the nkilib router subkernels are built for in one launch ("Intended for
+#: token counts T <= 2048", nkilib/core/router_topk/router_topk.py:84).
+_NKILIB_ROUTER_MAX_TOKENS = 2048
 
 _NOAUX_TC_TORCH_TO_NKI_DTYPE = {
     torch.bfloat16: nl.bfloat16,
@@ -996,6 +991,34 @@ def can_run_noaux_tc_router(
     """
     _require_noaux_tc_extents(num_experts, top_k)
     return can_run_kernel(reference)
+
+
+def noaux_tc_token_tile(hidden: int, mm_dtype: torch.dtype) -> int:
+    """Most tokens one launch of the fused router takes at hidden size `hidden`.
+
+    The kernel keeps the RMSNorm output of every token of a launch in SBUF (`norm_sb`,
+    `[128, T, hidden / 128]` in `mm_dtype`, so `T * hidden / 128 * itemsize` bytes per
+    partition). The tile is the most tokens whose `norm_sb` fits
+    `SBUF_BYTES_PER_PARTITION`, rounded down to a whole `_NOAUX_TC_T_MULTIPLE` (each of
+    the two cores needs whole 128-row tiles) and capped at `_NKILIB_ROUTER_MAX_TOKENS`.
+    A longer prefill chunk runs as one launch per tile. For example, a bf16 router at
+    hidden 4096 needs 64 B per token: one launch of 8192 tokens needs 524,288 B and
+    neuronx-cc refuses it (NCC_IGCA037), and the tile is 2048.
+
+    Raises:
+        NoauxTcRouterError: if not even `_NOAUX_TC_T_MULTIPLE` tokens fit.
+    """
+    per_token = (int(hidden) // _pmax) * mm_dtype.itemsize
+    fitting = SBUF_BYTES_PER_PARTITION // per_token
+    tile = min(_NKILIB_ROUTER_MAX_TOKENS,
+               fitting // _NOAUX_TC_T_MULTIPLE * _NOAUX_TC_T_MULTIPLE)
+    if tile < _NOAUX_TC_T_MULTIPLE:
+        raise NoauxTcRouterError(
+            f"hidden={hidden} in {mm_dtype}: the RMSNorm output of "
+            f"{_NOAUX_TC_T_MULTIPLE} tokens needs {_NOAUX_TC_T_MULTIPLE * per_token} B of "
+            f"SBUF per partition, above the {SBUF_BYTES_PER_PARTITION} B there are"
+        )
+    return tile
 
 
 def _noaux_tc_pad_target(num_tokens: int, multiple: int) -> int:
@@ -1373,6 +1396,11 @@ def noaux_tc_rmsnorm_router_topk(
     logits, while `e_score_correction_bias` is added to the sigmoid scores for
     selection only.
 
+    `T` tokens are padded to a whole `_NOAUX_TC_T_MULTIPLE`. Up to
+    `noaux_tc_token_tile(H, router_mm_dtype)` padded tokens run as one kernel launch;
+    more run as one launch per tile, and the rows are concatenated in token order.
+    The two forms give the same rows, as no stage reduces across tokens.
+
     Returns:
         `(router_logits [T, E], expert_index [T, K] int32,
           expert_affinities [T, E] float32, substrate_index [T, K] int32)`.
@@ -1450,16 +1478,17 @@ def noaux_tc_rmsnorm_router_topk(
             router_mm_dtype=_NOAUX_TC_TORCH_TO_NKI_DTYPE[router_mm_dtype],
         )
 
-    # A chunk above NOAUX_TC_TOKEN_TILE runs as one launch per tile (the RMSNorm
-    # output of a launch must fit SBUF). No stage reduces across tokens, so the
-    # tiles' rows are the rows one launch would give. Every tile is a whole
-    # multiple of 256, as `t_pad` and the tile are.
-    if t_pad <= NOAUX_TC_TOKEN_TILE:
+    # A chunk above the token tile runs as one launch per tile (the RMSNorm output
+    # of a launch must fit SBUF, `noaux_tc_token_tile`). No stage reduces across
+    # tokens, so the tiles' rows are the rows one launch would give. Every launch
+    # is a whole multiple of 256 rows, as `t_pad` and the tile are.
+    tile = noaux_tc_token_tile(h_extent, router_mm_dtype)
+    if t_pad <= tile:
         logits, index, affinities, substrate_index = launch(hidden_padded)
     else:
         tiles = [
-            launch(hidden_padded[:, start:start + NOAUX_TC_TOKEN_TILE].contiguous())
-            for start in range(0, t_pad, NOAUX_TC_TOKEN_TILE)
+            launch(hidden_padded[:, start:start + tile].contiguous())
+            for start in range(0, t_pad, tile)
         ]
         logits, index, affinities, substrate_index = (
             torch.cat(parts, dim=0) for parts in zip(*tiles)

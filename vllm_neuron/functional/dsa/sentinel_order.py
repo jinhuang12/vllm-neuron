@@ -31,15 +31,12 @@ import nki.isa as nisa
 import nki.language as nl
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
-from vllm_neuron.utils.neuron_utils import can_run_kernel
+from vllm_neuron.utils.neuron_utils import SBUF_BYTES_PER_PARTITION, can_run_kernel
 
 logger = logging.getLogger(__name__)
 
 PARTITION_MAX = 128
 SEARCH_WIDTH = 8
-# The SBUF bytes one partition offers a kernel on trn2, as the vendor kernel library states them
-# (its ``MAX_AVAILABLE_SBUF_SIZE``): 224 KiB less the reserved head and tail.
-SBUF_BYTES_PER_PARTITION = 224 * 1024 - 16384 - 8 - 520
 _SUPPORTED_DTYPES = (torch.int32,)
 
 

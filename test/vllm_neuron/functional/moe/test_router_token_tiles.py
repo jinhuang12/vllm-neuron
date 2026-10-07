@@ -1,18 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The fused ``noaux_tc`` router at prefill chunks above 2048 tokens.
+"""The fused ``noaux_tc`` router at prefill chunks above one launch.
 
 The kernel holds the RMSNorm output of every token of a launch in SBUF
-(``[128, T, H / 128]`` bf16). At H 4096 a launch of 8192 tokens needs 524,288 B per
-partition of the 229,376 B there are, and neuronx-cc refused the chunk-8192 prefill
-graph with ``NCC_IGCA037`` in this kernel (runs/chunk8k, b17526a). The entry now runs
-a long chunk as launches of at most :data:`router.NOAUX_TC_TOKEN_TILE` tokens. No stage
-reduces across tokens, so on the simulator:
+(``[128, T, H / 128]`` in the router matmul dtype). At GLM-5.3-Flash's H 4096 in bf16 a
+launch of 8192 tokens needs 524,288 B per partition, more than SBUF has, and
+neuronx-cc refused the chunk-8192 prefill graph with ``NCC_IGCA037`` in this kernel.
+The entry now runs a long chunk as launches of at most
+:func:`router.noaux_tc_token_tile` tokens. No stage reduces across tokens, so on the
+simulator:
 
-* the result equals b17526a's single launch bit for bit (b17526a's own file, loaded
-  from git, is the reference), at chunks that need two and three launches;
+* the result equals the one-launch router bit for bit (the last commit before the
+  token tiles, loaded from git, is the reference), at chunks that need two and three
+  launches;
 * the launch count is the tile count, and a chunk that fits takes one launch.
 
-``test_dsa_wide_cpu_compile.py`` holds the compile at H 4096, E 288 and 8192 tokens.
+``test_dsa_wide_cpu_compile.py`` holds the compile at the served H, E and 8192 tokens.
 """
 
 from __future__ import annotations
@@ -29,27 +31,37 @@ import torch
 
 from vllm_neuron.functional.moe import router as seam
 
+from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
+from vllm_neuron.utils.neuron_utils import SBUF_BYTES_PER_PARTITION
+
 from test.vllm_neuron.functional.moe.test_router_token_axis import (
     NORM_TOPK_PROB,
     ROUTED_SCALING_FACTOR,
+    TINY_H,
     TOP_K,
     _SimulatorCounter,
     build_hidden,
     set_equal_rows,
 )
 
-BASE_COMMIT = "b17526a"
+#: The last commit whose router runs every chunk as one launch: the bit-equality reference.
+ONE_LAUNCH_COMMIT = "b17526a"
+
+#: The fixture's tile: `build_hidden` makes bf16 hidden states of width `TINY_H`.
+TILE = seam.noaux_tc_token_tile(TINY_H, torch.bfloat16)
 
 
-def _load_base_module():
+def _load_one_launch_module():
     root = Path(seam.__file__).resolve().parents[3]
-    source = subprocess.run(
+    shown = subprocess.run(
         ["git", "-C", str(root), "show",
-         f"{BASE_COMMIT}:vllm_neuron/functional/moe/router.py"],
-        check=True, capture_output=True).stdout
-    path = Path(tempfile.mkdtemp(prefix="router_base_")) / "router_b17526a.py"
-    path.write_bytes(source)
-    spec = importlib.util.spec_from_file_location("router_b17526a", path)
+         f"{ONE_LAUNCH_COMMIT}:vllm_neuron/functional/moe/router.py"],
+        capture_output=True)
+    if shown.returncode != 0:
+        pytest.skip(f"commit {ONE_LAUNCH_COMMIT} is not in this checkout")
+    path = Path(tempfile.mkdtemp(prefix="router_one_launch_")) / "router_one_launch.py"
+    path.write_bytes(shown.stdout)
+    spec = importlib.util.spec_from_file_location("router_one_launch", path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
@@ -58,7 +70,7 @@ def _load_base_module():
 
 @pytest.fixture(scope="module")
 def base():
-    return _load_base_module()
+    return _load_one_launch_module()
 
 
 def _route(entry, tokens: int):
@@ -72,19 +84,46 @@ def _route(entry, tokens: int):
     return out, sim.calls
 
 
-def test_the_token_tile_fits_the_partition_and_the_two_core_split():
-    tile = seam.NOAUX_TC_TOKEN_TILE
-    assert tile % seam._NOAUX_TC_T_MULTIPLE == 0
-    # RMSNorm output of one launch at the served H 4096, bf16, per partition.
-    assert tile * (4096 // 128) * 2 <= 229_376
+def _norm_bytes(tokens: int, hidden: int, dtype: torch.dtype) -> int:
+    """SBUF bytes per partition of one launch's RMSNorm output, `[128, T, H / 128]`."""
+    return tokens * (hidden // 128) * dtype.itemsize
+
+
+# 7168 in bf16 is a width where SBUF, not the nkilib bound, sets the tile.
+@pytest.mark.parametrize("hidden", [TINY_H, Glm5NextTextConfig().hidden_size, 7168])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_the_token_tile_is_the_most_tokens_that_fit_one_launch(hidden, dtype):
+    tile = seam.noaux_tc_token_tile(hidden, dtype)
+    multiple = seam._NOAUX_TC_T_MULTIPLE
+    assert tile % multiple == 0
+    assert tile <= seam._NKILIB_ROUTER_MAX_TOKENS
+    assert _norm_bytes(tile, hidden, dtype) <= SBUF_BYTES_PER_PARTITION
+    # Most: one more multiple is past the nkilib bound or past SBUF.
+    more = tile + multiple
+    assert (more > seam._NKILIB_ROUTER_MAX_TOKENS
+            or _norm_bytes(more, hidden, dtype) > SBUF_BYTES_PER_PARTITION)
+
+
+def test_the_served_chunk_8192_does_not_fit_one_launch():
+    hidden = Glm5NextTextConfig().hidden_size
+    assert _norm_bytes(8192, hidden, torch.bfloat16) > SBUF_BYTES_PER_PARTITION
+    assert seam.noaux_tc_token_tile(hidden, torch.bfloat16) < 8192
+
+
+def test_a_hidden_size_too_wide_for_one_multiple_raises():
+    multiple = seam._NOAUX_TC_T_MULTIPLE
+    hidden = 128 * (SBUF_BYTES_PER_PARTITION // (multiple * 2) + 1)
+    assert _norm_bytes(multiple, hidden, torch.bfloat16) > SBUF_BYTES_PER_PARTITION
+    with pytest.raises(seam.NoauxTcRouterError, match="SBUF"):
+        seam.noaux_tc_token_tile(hidden, torch.bfloat16)
 
 
 @pytest.mark.parametrize("tokens", [
-    seam.NOAUX_TC_TOKEN_TILE + 300,        # two launches, the second partial
-    2 * seam.NOAUX_TC_TOKEN_TILE + 1,      # three launches, the last one 256 rows
+    TILE + 300,        # two launches, the second partial
+    2 * TILE + 1,      # three launches, the last one 256 rows
 ])
-def test_a_long_chunk_equals_b17526a_one_launch_bit_for_bit(base, tokens):
-    tile = seam.NOAUX_TC_TOKEN_TILE
+def test_a_long_chunk_equals_the_one_launch_router_bit_for_bit(base, tokens):
+    tile = TILE
     padded = -(-tokens // seam._NOAUX_TC_T_MULTIPLE) * seam._NOAUX_TC_T_MULTIPLE
     seam.reset_noaux_tc_counters()
     got, launches = _route(seam.noaux_tc_rmsnorm_router_topk, tokens)
@@ -106,5 +145,5 @@ def test_a_long_chunk_equals_b17526a_one_launch_bit_for_bit(base, tokens):
 
 def test_a_chunk_that_fits_takes_one_launch():
     seam.reset_noaux_tc_counters()
-    _, launches = _route(seam.noaux_tc_rmsnorm_router_topk, seam.NOAUX_TC_TOKEN_TILE)
+    _, launches = _route(seam.noaux_tc_rmsnorm_router_topk, TILE)
     assert launches == 1
