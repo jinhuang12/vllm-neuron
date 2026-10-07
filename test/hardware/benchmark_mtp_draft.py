@@ -2,50 +2,49 @@
 """Time the GLM-5.3-Flash MTP draft head (``mtp.py``) at the per-rank TP=64 decode shape.
 
 Run it through the device lease (``devlease.py slice dense -- ...``); this script does
-not select cores. Three graphs are built, each at B in ``--batches`` requests:
+not select cores. One graph per ``k`` in ``--ks``:
+``Glm5NextMultiTokenPredictor.draft_tokens`` for one request, the ``k`` iterations
+unrolled in that one graph (the fused form of mtp.md 8.5), each iteration the whole of
+layer 45 at this rank's share:
 
-* ``null``        -- one bf16 add on a [B, H] row: the graph-launch floor of this harness.
-* ``head_only``   -- the head's own arithmetic as ``Glm5NextMTPLayer.forward`` and
-  ``propose_draft_tokens`` write it, with the block replaced by the identity: mask at
-  position 0, enorm, hnorm, concat, ``eh_proj`` ([H, 2H] bf16, replicated), shared-head
-  norm, ``compute_draft_logits`` against this rank's vocab shard ([2420, H] bf16) and the
-  ``argmax`` of that shard.
-* ``head_block``  -- the same with the real block: ``Glm5NextDSALayer`` (one MLA head,
-  latent 512, the indexer at 32 heads, fp8 projections with a 128x128 scale grid) built by
-  ``dsa_decode_case.build_attention``, at ctx 1024 in the 2048-row window the serving
-  line decodes in (the indexer bypass regime). One forward per request, as the layer takes
-  one request; the B forwards sit in one graph.
+* the head's own arithmetic -- position-0 mask, ``enorm``, ``hnorm``, concat, ``eh_proj``
+  ([H, 2H] bf16, replicated), the shared-head norm, this rank's head rows ([2420, H] bf16)
+  and the greedy token;
+* the attention half -- ``Glm5NextDSALayer`` (one MLA head, latent 512, the indexer at 32
+  heads, fp8 projections on a 128x128 scale grid) from ``dsa_decode_case.build_attention``,
+  at ctx 1024 in the 2048-row window the serving line decodes in (the indexer bypass);
+* the MoE half -- the fused router over 288 experts, the 18 local experts (EP 16) at
+  I=512 (2048 over the group's TP 4) through the packed fp8 decode kernel, the shared
+  expert at I=128 (2048 / 64 = 32, padded to one 128 block), the post-attention norm and
+  the residual add.
 
-Each graph is compiled once with one copy of the head and once with ``--chain`` copies
-(distinct weights and caches, copy ``i`` feeding its draft hidden state to copy ``i+1``
-as ``previous_hidden_states``), and both are timed; the per-step cost is reported two
-ways: ``single_launch_us`` (the one-copy graph, what a separate draft NEFF would cost per
-step) and ``marginal_us`` (the slope ``(t_chain - t_1) / (chain - 1)``, what the head
-costs once inside a graph that already launched).
+Geometry notes. ``vocab_size`` is set to the shard's 2420 rows, so the head is "whole" at
+one rank and the token is the plain ``argmax``: the same GEMV as the sharded route without
+the 2 x 64-value all-gather, which one rank cannot run. The request's next page is
+allocated in the block table (what Stage B's lookahead allocation does): iterations
+``1 .. k-1`` write rows 1024..1027, and without that page they would land on the null
+block. ``index_share_for_mtp_iteration`` stays the checkpoint's ``True``; in the bypass
+regime the carrier stays empty, so every iteration runs the indexer's write stage.
 
-Correctness: every graph's draft hidden state and shard logits are compared with an
-independently written fp32 torch head over the same block run eagerly on CPU
-(``rel_l2``), before any timing. With ``--mode sim`` (``NKI_SIMULATOR=1
-VLLM_NEURON_CPU_MODE=1``) the graphs run eagerly through the NKI simulator and only the
-comparison is reported; narrow ``--hidden``/``--q-lora`` there, as the DSA tests do,
-because the simulator's projection cost scales with both and neither changes the head's
-arithmetic.
+A ``null`` graph (one bf16 add on a [1, H] row) gives the launch floor. The per-iteration
+cost is the difference between consecutive ``k`` graphs, reported as ``marginal_us``.
 
-The MoE half of layer 45 (288 routed experts, the shared expert, the post-attention
-norm) is NOT part of either graph because ``Glm5NextMTPLayer`` never calls it: the block
-it is handed is ``Glm5NextDSALayer``, whose forward is the attention half only. The
-report adds that half from the MoE and dense microbenchmarks and says so.
+Correctness. ``--mode sim`` (``NKI_SIMULATOR=1 VLLM_NEURON_CPU_MODE=1``) runs the same
+graph eagerly through the NKI simulator and writes the ``[1, k]`` ids and the ``k`` normed
+hidden rows; ``--mode device`` writes the compiled graph's. ``--compare device.json
+sim.json`` reads two outputs and reports, per ``k``, whether the ids are bit-equal, the
+hidden rows' relative L2, and the top-1/top-2 logit margin the ids rest on.
 """
 
 from __future__ import annotations
 
 import argparse
-import contextlib
 import json
 import os
 import statistics
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -56,7 +55,8 @@ import torch  # noqa: E402
 
 import vllm_neuron  # noqa: E402,F401 -- registers the Neuron compilation backend
 from vllm_neuron.model.glm5_next import model_fp8, mtp  # noqa: E402
-from vllm_neuron.model.glm5_next.config import DSA_LAYER_TYPE  # noqa: E402
+from vllm_neuron.model.glm5_next.config import Glm5NextConfig  # noqa: E402
+from vllm_neuron.model.glm5_next.weight_loaders_fp8 import FP8_SCALE_SUFFIX  # noqa: E402
 from test.vllm_neuron.functional.dsa import dsa_decode_case as case  # noqa: E402
 
 MAX_SEQ_LEN = 4096
@@ -64,12 +64,28 @@ WINDOW_PAGES = 16  # 2048 rows: the serving line's decode context bucket (bypass
 CONTEXT = 1024
 TP_WORLD = 64
 VOCAB = 154880
+SHARD_ROWS = VOCAB // TP_WORLD  # 2420
 MTP_LAYER_IDX = 45
-#: The fp32 reference against a bf16 graph: the head is three norms, one 8192-wide bf16
-#: GEMV and a vocab GEMV; the block adds the DSA layer's own fp8-vs-fp32 gap
-#: (``benchmark_dsa_decode.LAYER_REL_L2``).
-HEAD_ONLY_REL_L2 = 2e-2
-HEAD_BLOCK_REL_L2 = 5e-2
+#: The MoE half's per-rank share on the TP=64 serve line: EP 16 x TP 4 within a group.
+EXPERTS = 288
+EP_DEGREE = 16
+LOCAL_EXPERTS = EXPERTS // EP_DEGREE  # 18
+LOCAL_INTERMEDIATE = 2048 // 4  # 512
+SHARED_INTERMEDIATE = 128  # 2048 / 64 = 32 rows, padded to one 128-wide scale block
+EXPERT_RANK = 5
+#: The pinned checkpoint config the quantisation policy (fp8, 128x128 blocks) is read from.
+FIXTURE_CONFIG = ROOT / "test" / "vllm_neuron" / "model" / "glm5_next" / "fixtures" / "config.json"
+#: The served model's neuronx-cc arguments (``benchmark_moe_decode.MODEL_COMPILER_ARGS``);
+#: ``NEURON_CC_FLAGS`` overrides.
+MODEL_COMPILER_ARGS = [
+    "--auto-cast=none",
+    "-O1",
+    "--internal-hlo2tensorizer-options=--modular-flow-mac-threshold=10 "
+    "--experimental-unsafe-fp8e4m3fn-as-fp8e4m3",
+    "--internal-backend-options=--enable-verifier=false --enable-nested-dynamic-loop",
+]
+BLOCK_NAMES = ("latent_cache", "pool_cache", "seq_lens", "start_position", "block_table_row",
+               "latent_slots", "tail", "position")
 
 
 def rel_l2(got: torch.Tensor, want: torch.Tensor) -> float:
@@ -77,9 +93,18 @@ def rel_l2(got: torch.Tensor, want: torch.Tensor) -> float:
     return float((got - want).norm() / want.norm().clamp_min(1e-30))
 
 
+def compiler_args():
+    return os.environ.get("NEURON_CC_FLAGS") or MODEL_COMPILER_ARGS
+
+
 def compiled(fn):
     return torch.compile(fn, backend="neuron_libtorch", fullgraph=True, dynamic=False,
-                         options={"compiler_args": os.environ.get("NEURON_CC_FLAGS", "")})
+                         options={"compiler_args": compiler_args()})
+
+
+def _sync(out):
+    outs = out if isinstance(out, (tuple, list)) else (out,)
+    return [o.to("cpu") for o in outs if torch.is_tensor(o)]
 
 
 def measure(fn, inputs, warmup: int, iterations: int) -> dict:
@@ -96,266 +121,284 @@ def measure(fn, inputs, warmup: int, iterations: int) -> dict:
             "min_us": samples[0], "max_us": samples[-1]}
 
 
-def _sync(out):
-    outs = out if isinstance(out, (tuple, list)) else (out,)
-    return [o.to("cpu") for o in outs if torch.is_tensor(o)]
-
-
 # --- building ------------------------------------------------------------------------
 
-def head_weights(cfg, seed: int, device) -> dict:
-    """The four MTP tensors at the checkpoint's shapes and dtypes, plus this rank's head shard."""
+def build_config(hidden: int, q_lora: int):
+    """The checkpoint config at one MLA head, the head 'whole' at this rank's 2420 rows."""
+    return replace(case.decode_config(hidden_size=hidden, q_lora_rank=q_lora), vocab_size=SHARD_ROWS)
+
+
+def quant_config():
+    """The resolved policy the MoE half runs under, from the pinned checkpoint config."""
+    raw = json.loads(FIXTURE_CONFIG.read_text())
+    return model_fp8.Glm5NextQuantConfig.from_model_config(Glm5NextConfig.from_configs(raw))
+
+
+def head_tables(cfg, seed: int, device) -> dict:
+    """The four MTP tensors, the embedding rows and the head rows, bf16 like the checkpoint."""
     gen = torch.Generator().manual_seed(seed)
-    hidden = int(cfg.hidden_size)
-    shard = int(cfg.vocab_size) // TP_WORLD
+    hidden, vocab = int(cfg.hidden_size), int(cfg.vocab_size)
     w = {
-        "enorm_weight": (1.0 + torch.randn(hidden, generator=gen) * 0.05).to(torch.bfloat16),
-        "hnorm_weight": (1.0 + torch.randn(hidden, generator=gen) * 0.05).to(torch.bfloat16),
-        "eh_proj_weight": (torch.randn(hidden, 2 * hidden, generator=gen)
-                           * (2 * hidden) ** -0.5).to(torch.bfloat16),
-        "shared_head_norm_weight": (1.0 + torch.randn(hidden, generator=gen) * 0.05).to(torch.bfloat16),
-        "lm_head_shard": (torch.randn(shard, hidden, generator=gen) * hidden ** -0.5).to(torch.bfloat16),
+        "enorm_weight": 1.0 + torch.randn(hidden, generator=gen) * 0.05,
+        "hnorm_weight": 1.0 + torch.randn(hidden, generator=gen) * 0.05,
+        "eh_proj_weight": torch.randn(hidden, 2 * hidden, generator=gen) * (2 * hidden) ** -0.5,
+        "shared_head_norm_weight": 1.0 + torch.randn(hidden, generator=gen) * 0.05,
+        "embed_tokens_weight": torch.randn(vocab, hidden, generator=gen),
+        "lm_head_weight": torch.randn(vocab, hidden, generator=gen) * hidden ** -0.5,
     }
-    return {k: v.to(device) for k, v in w.items()}
+    return {k: v.to(torch.bfloat16).to(device) for k, v in w.items()}
 
 
-class IdentityBlock(torch.nn.Module):
-    """Stands in for the block in ``head_only``: the head's own cost, nothing else."""
-
-    def forward(self, hidden_states, **_):
-        return hidden_states
-
-
-def build_block(cfg, seed: int, device):
-    """``Glm5NextDSALayer`` 45 with a prepared real-shape attention and its input norm."""
-    layer = model_fp8._build_layer(cfg, MTP_LAYER_IDX, DSA_LAYER_TYPE, 1)
-    gen = torch.Generator().manual_seed(seed)
-    layer.input_layernorm_weight = torch.nn.Parameter(
-        (1.0 + torch.randn(int(cfg.hidden_size), generator=gen) * 0.05), requires_grad=False)
-    layer.self_attn = case.build_attention(model_fp8, cfg, seed=seed + 1, device=device)
-    layer.to(device)
-    return layer
+def _fp8_bank(experts: int, out_features: int, in_features: int, gen) -> tuple[torch.Tensor, torch.Tensor]:
+    """``[E, out, in]`` fp8 bytes inside the trn2 range and an ``[E, out/128, in/128]`` grid."""
+    raw = (torch.randn(experts, out_features, in_features, generator=gen) * 48.0).clamp(
+        -case.FP8_LIMIT, case.FP8_LIMIT)
+    grid = (torch.rand(experts, out_features // case.BLOCK, in_features // case.BLOCK, generator=gen)
+            * 0.5 + 0.75) * (in_features ** -0.5) / 48.0
+    return raw.to(torch.float8_e4m3fn), grid.to(torch.float32)
 
 
-def build_head(cfg, block, weights: dict, device):
-    head = mtp.Glm5NextMultiTokenPredictor(cfg, 1, [block])
-    layer = head.layers[str(MTP_LAYER_IDX)]
-    for name in ("enorm_weight", "hnorm_weight", "eh_proj_weight", "shared_head_norm_weight"):
-        setattr(layer, name, torch.nn.Parameter(weights[name].clone().to(device), requires_grad=False))
-    return head.to(device)
+def _grid_name(leaf: str) -> str:
+    return model_fp8.Glm5NextForConditionalGeneration._sibling_scale_grid_name(leaf)
 
 
-def step_inputs(cfg, seed: int, batch: int, device) -> dict:
+def _attach(module, leaf: str, weight: torch.Tensor, grid: torch.Tensor, device) -> None:
+    setattr(module, leaf, torch.nn.Parameter(weight.to(device), requires_grad=False))
+    setattr(module, _grid_name(leaf), torch.nn.Parameter(grid.to(device), requires_grad=False))
+
+
+def materialise_moe(mlp, cfg, seed: int, device) -> None:
+    """This rank's 18-expert bank at I=512, the shared expert at I=128, the router; prepared."""
     gen = torch.Generator().manual_seed(seed)
     hidden = int(cfg.hidden_size)
-    return {
-        "inputs_embeds": (torch.randn(batch, hidden, generator=gen) * 0.5).to(torch.bfloat16).to(device),
-        "previous_hidden_states": (torch.randn(batch, hidden, generator=gen)).to(torch.bfloat16).to(device),
-        "positions": torch.full((batch,), CONTEXT - 1, dtype=torch.int64).to(device),
-    }
+    experts, shared = mlp.experts, mlp.shared_experts
+    assert int(experts.num_local_experts) == LOCAL_EXPERTS, experts.num_local_experts
+    gate_w, gate_s = _fp8_bank(LOCAL_EXPERTS, LOCAL_INTERMEDIATE, hidden, gen)
+    up_w, up_s = _fp8_bank(LOCAL_EXPERTS, LOCAL_INTERMEDIATE, hidden, gen)
+    down_w, down_s = _fp8_bank(LOCAL_EXPERTS, hidden, LOCAL_INTERMEDIATE, gen)
+    for leaf, weight, grid in (("gate_proj_weight", gate_w, gate_s), ("up_proj_weight", up_w, up_s),
+                               ("down_proj_weight", down_w, down_s)):
+        _attach(experts, leaf, weight, grid, device)
+    assert experts.prepare_scale_operands(
+        experts.gate_proj_weight, experts.up_proj_weight, experts.down_proj_weight,
+        getattr(experts, _grid_name("gate_proj_weight")), getattr(experts, _grid_name("up_proj_weight")),
+        getattr(experts, _grid_name("down_proj_weight")),
+    ) == 2
+    # The shared expert's weights are stored ``[H, I]`` (gate, up) and ``[I, H]`` (down).
+    s_gate, s_gate_s = case._fp8_weight(hidden, SHARED_INTERMEDIATE, gen)
+    s_up, s_up_s = case._fp8_weight(hidden, SHARED_INTERMEDIATE, gen)
+    s_down, s_down_s = case._fp8_weight(SHARED_INTERMEDIATE, hidden, gen)
+    for leaf, weight, grid in (("gate_proj_weight", s_gate, s_gate_s), ("up_proj_weight", s_up, s_up_s),
+                               ("down_proj_weight", s_down, s_down_s)):
+        _attach(shared, leaf, weight, grid, device)
+    assert shared.prepare_scale_operands(*shared.scale_route_operands()) == 3
+    experts.router_weight = torch.nn.Parameter(
+        (torch.randn(hidden, EXPERTS, generator=gen) * hidden ** -0.5).to(torch.bfloat16).to(device),
+        requires_grad=False)
+    experts.router_bias = torch.nn.Parameter(
+        ((torch.rand(EXPERTS, generator=gen) - 0.5) * 0.1).to(device), requires_grad=False)
 
 
-BLOCK_NAMES = ("latent_cache", "pool_cache", "seq_lens", "start_position", "block_table_row",
-               "latent_slots", "tail", "position")
+def build_head(cfg, seed: int, device):
+    """The head under test: layer 45 with a real-shape attention half and this rank's MoE share."""
+    tables = head_tables(cfg, seed, device)
+    head = mtp.Glm5NextMultiTokenPredictor(
+        cfg,
+        embed_tokens=lambda: tables["embed_tokens_weight"],
+        lm_head=lambda: tables["lm_head_weight"],
+        world_size=1,
+        tp_group=lambda: None,
+    )
+    for name in mtp.HEAD_PARAMETER_NAMES:
+        setattr(head, name, torch.nn.Parameter(tables[name].clone(), requires_grad=False))
+    block = head.block
+    gen = torch.Generator().manual_seed(seed + 1)
+    hidden = int(cfg.hidden_size)
+    for name in ("input_layernorm_weight", "post_attention_layernorm_weight"):
+        setattr(block, name, torch.nn.Parameter(
+            (1.0 + torch.randn(hidden, generator=gen) * 0.05).to(device), requires_grad=False))
+    block.self_attn = case.build_attention(model_fp8, cfg, seed=seed + 2, device=device)
+    # ``_build_layer`` gives the block the undistributed 288-expert bank; the serve line's
+    # rank holds 18 of them. The block's forward and the head's are unchanged by the swap.
+    block.mlp = model_fp8.Glm5NextMoEBlock(cfg, world_size=1, ep_degree=EP_DEGREE)
+    materialise_moe(block.mlp, cfg, seed + 3, device)
+    return head
 
 
-def block_operands(cfg, seed: int, device) -> tuple[dict, dict]:
-    ops = case.decode_operands(cfg, CONTEXT, window_pages=WINDOW_PAGES, max_seq_len=MAX_SEQ_LEN,
-                               seed=seed)
+def step_inputs(cfg, seed: int, device) -> tuple:
+    gen = torch.Generator().manual_seed(seed)
+    hidden = int(cfg.hidden_size)
+    return (
+        torch.randn(1, hidden, generator=gen).to(torch.bfloat16).to(device),
+        torch.randint(0, int(cfg.vocab_size), (1,), generator=gen, dtype=torch.int32).to(device),
+        torch.full((1,), CONTEXT - 1, dtype=torch.int32).to(device),
+    )
+
+
+def block_operands(cfg, seed: int, device) -> tuple[tuple, dict]:
+    """Layer 45's decode carrier at ctx 1024, with the request's next page allocated."""
+    ops = case.decode_operands(cfg, CONTEXT, window_pages=WINDOW_PAGES, max_seq_len=MAX_SEQ_LEN, seed=seed)
+    table = ops["block_table_row"]
+    used = -(-CONTEXT // case.PAGE)
+    if used < int(table.shape[0]):
+        bank_pages = int(ops["latent_cache"].shape[0]) // case.PAGE
+        free = sorted(set(range(bank_pages)) - set(table[table >= 0].tolist()))
+        table[used, 0] = free[0]
     statics = {"softmax_scale": ops["softmax_scale"], "max_seq_len": ops["max_seq_len"],
                "page_size": ops["page_size"]}
-    tensors = {name: ops[name].to(device) for name in BLOCK_NAMES}
-    return tensors, statics
+    return tuple(ops[name].to(device) for name in BLOCK_NAMES), statics
 
 
 # --- the graphs ----------------------------------------------------------------------
 
-def head_graph(heads, shards, statics, batch: int, with_block: bool):
-    """``step(embeds, previous, positions, per-copy-per-request block operands...)``.
+def make_step(head, qc, k: int, statics: dict):
+    """``step(hidden [1,H], sampled [1], positions [1], *carrier) -> (ids [1,k], hiddens [k,1,H])``."""
 
-    Returns ``(draft_hidden_last_copy [B, H], shard_logits_last_copy [B, shard],
-    local_argmax [B])``.
-    """
-    n = len(BLOCK_NAMES)
-
-    def step(embeds, previous, positions, *flat):
-        hidden = previous
-        at = 0
-        logits = None
-        for head, shard in zip(heads, shards):
-            rows = []
-            for b in range(batch):
-                kwargs = {}
-                if with_block:
-                    kwargs = dict(zip(BLOCK_NAMES, flat[at:at + n]))
-                    kwargs.update(statics)
-                    at += n
-                rows.append(head(
-                    inputs_embeds=embeds[b:b + 1],
-                    previous_hidden_states=hidden[b:b + 1],
-                    positions=positions[b:b + 1],
-                    **kwargs,
-                ))
-            hidden = torch.cat(rows, 0)
-            logits = head.compute_draft_logits(hidden, shard)
-        return hidden, logits, logits.argmax(dim=-1).to(torch.int32)
+    def step(hidden, sampled, positions, *flat):
+        kwargs = dict(zip(BLOCK_NAMES, flat))
+        kwargs.update(statics)
+        collected: list = []
+        ids = head.draft_tokens(
+            hidden, sampled, positions, k,
+            quant_config=qc, tp_degree=1, expert_parallel_rank=EXPERT_RANK,
+            draft_collector=collected, **kwargs,
+        )
+        return ids, torch.stack(collected, 0)
 
     return step
 
 
-@contextlib.contextmanager
-def cpu_simulator():
-    """Run the CPU reference's NKI kernels through the simulator, also in ``--mode device``.
-
-    ``libtorch_neuronx_lite.nki.nki_hop._cpu_impl`` reads ``NKI_SIMULATOR`` at call time and
-    refuses a CPU dispatch without it; the compiled device graph is built and executed outside
-    this block, so the flag does not reach it.
-    """
-    before = os.environ.get("NKI_SIMULATOR")
-    os.environ["NKI_SIMULATOR"] = "1"
-    try:
-        yield
-    finally:
-        if before is None:
-            del os.environ["NKI_SIMULATOR"]
-        else:
-            os.environ["NKI_SIMULATOR"] = before
-
-
-def reference(weights_per_copy: list[dict], blocks_cpu: list, inputs: dict, block_ops: list[list[dict]],
-              statics: dict, eps: float, with_block: bool):
-    """fp32 torch head, independently written, over the same block run eagerly on CPU."""
-
-    def rms(x, gain):
-        x = x.to(torch.float32)
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * gain.to(torch.float32)
-
-    embeds = inputs["inputs_embeds"].cpu()
-    hidden = inputs["previous_hidden_states"].cpu()
-    positions = inputs["positions"].cpu()
-    logits = None
-    for copy, (w, block) in enumerate(zip(weights_per_copy, blocks_cpu)):
-        e = torch.where((positions.unsqueeze(-1) == 0), torch.zeros_like(embeds), embeds)
-        e = rms(e, w["enorm_weight"].cpu()).to(torch.bfloat16)
-        h = rms(hidden, w["hnorm_weight"].cpu()).to(torch.bfloat16)
-        joined = torch.cat([e, h], -1).to(torch.float32)
-        proj = (joined @ w["eh_proj_weight"].cpu().to(torch.float32).t()).to(torch.bfloat16)
-        rows = []
-        for b in range(proj.shape[0]):
-            if with_block:
-                ops = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in block_ops[copy][b].items()}
-                out = block.forward(proj[b:b + 1], **ops, **statics)
-            else:
-                out = proj[b:b + 1]
-            rows.append(out)
-        block_out = torch.cat(rows, 0)
-        hidden = rms(block_out, w["shared_head_norm_weight"].cpu()).to(torch.bfloat16)
-        logits = (hidden.to(torch.float32) @ w["lm_head_shard"].cpu().to(torch.float32).t())
-    return hidden, logits
-
-
-def run_case(label: str, batch: int, chain: int, args, cfg, device) -> dict:
-    with_block = label == "head_block"
+def run_null(args, cfg, device) -> dict:
     torch._dynamo.reset()
-    result = {"graph": label, "batch": batch, "ctx": CONTEXT, "window_rows": WINDOW_PAGES * case.PAGE,
-              "max_seq_len": MAX_SEQ_LEN, "hidden": int(cfg.hidden_size), "q_lora_rank": int(cfg.q_lora_rank),
-              "vocab_shard_rows": int(cfg.vocab_size) // TP_WORLD, "tp_world": TP_WORLD,
-              "unit": "one draft step (one MTP layer + shard logits + local argmax) for all `batch` requests"}
-    if label == "null":
-        x = (torch.randn(batch, int(cfg.hidden_size))).to(torch.bfloat16).to(device)
-        fn = (lambda t: t + t) if args.mode == "sim" else compiled(lambda t: t + t)
-        started = time.perf_counter(); _sync(fn(x)); result["first_call_s"] = time.perf_counter() - started
-        if args.mode == "device":
-            result["timing"] = measure(fn, (x,), args.warmup, args.iterations)
-        return result
-
-    timings = {}
-    for copies in sorted({1, chain}):
-        weights = [head_weights(cfg, 7_000 + 13 * i, device) for i in range(copies)]
-        blocks_dev = [build_block(cfg, 9_000 + 31 * i, device) if with_block else IdentityBlock()
-                      for i in range(copies)]
-        blocks_cpu = [build_block(cfg, 9_000 + 31 * i, "cpu") if with_block else IdentityBlock()
-                      for i in range(copies)]
-        heads = [build_head(cfg, blocks_dev[i], weights[i], device) for i in range(copies)]
-        shards = [w["lm_head_shard"] for w in weights]
-        inputs = step_inputs(cfg, 11_000, batch, device)
-        flat, block_ops, statics = [], [], {}
-        for i in range(copies):
-            per_req = []
-            for b in range(batch):
-                tensors, statics = block_operands(cfg, 99 + 7 * i + 1009 * b, device)
-                per_req.append({k: v.cpu() for k, v in tensors.items()})
-                if with_block:
-                    flat.extend(tensors[name] for name in BLOCK_NAMES)
-            block_ops.append(per_req)
-        step = head_graph(heads, shards, statics, batch, with_block)
-        fn = step if args.mode == "sim" else compiled(step)
-        operands = (inputs["inputs_embeds"], inputs["previous_hidden_states"], inputs["positions"], *flat)
-        started = time.perf_counter()
-        hidden, logits, tokens = fn(*operands)
-        hidden, logits, tokens = hidden.cpu(), logits.cpu(), tokens.cpu()
-        first_call_s = time.perf_counter() - started
-        eps = float(cfg.rms_norm_eps)
-        with cpu_simulator():
-            ref_hidden, ref_logits = reference(weights, blocks_cpu, inputs, block_ops, statics, eps, with_block)
-        check = {"hidden_rel_l2": rel_l2(hidden, ref_hidden), "shard_logits_rel_l2": rel_l2(logits, ref_logits),
-                 "argmax_agrees": int((tokens.to(torch.int64) == ref_logits.argmax(-1)).sum()), "rows": batch}
-        bound = HEAD_BLOCK_REL_L2 if with_block else HEAD_ONLY_REL_L2
-        if not torch.isfinite(hidden.float()).all() or check["hidden_rel_l2"] > bound:
-            raise AssertionError(f"{label} B={batch} copies={copies}: vs CPU reference {check} > {bound}")
-        entry = {"first_call_s": first_call_s, "check": check}
-        if args.mode == "device":
-            entry["timing"] = measure(fn, operands, args.warmup, args.iterations)
-        timings[copies] = entry
-        del fn, step, heads, blocks_dev, blocks_cpu
-    result["copies"] = {str(k): v for k, v in timings.items()}
-    if args.mode == "device" and chain > 1:
-        t1 = timings[1]["timing"]["median_us"]
-        tn = timings[chain]["timing"]["median_us"]
-        result["single_launch_us"] = t1
-        result["marginal_us"] = (tn - t1) / (chain - 1)
-        result["chain"] = chain
+    x = torch.randn(1, int(cfg.hidden_size)).to(torch.bfloat16).to(device)
+    fn = (lambda t: t + t) if args.mode == "sim" else compiled(lambda t: t + t)
+    started = time.perf_counter()
+    _sync(fn(x))
+    result = {"graph": "null", "first_call_s": time.perf_counter() - started}
+    if args.mode == "device":
+        result["timing"] = measure(fn, (x,), args.warmup, args.iterations)
     return result
+
+
+def run_k(k: int, args, cfg, qc, device) -> dict:
+    torch._dynamo.reset()
+    head = build_head(cfg, args.seed, device)
+    inputs = step_inputs(cfg, args.seed + 11, device)
+    carrier, statics = block_operands(cfg, args.seed + 99, device)
+    step = make_step(head, qc, k, statics)
+    fn = step if args.mode == "sim" else compiled(step)
+    operands = (*inputs, *carrier)
+    started = time.perf_counter()
+    ids, hiddens = fn(*operands)
+    ids, hiddens = ids.cpu(), hiddens.cpu()
+    first_call_s = time.perf_counter() - started
+    if not torch.isfinite(hiddens.float()).all():
+        raise AssertionError(f"k={k}: the draft's hidden rows are not finite")
+    if tuple(ids.shape) != (1, k) or ids.dtype != torch.int32:
+        raise AssertionError(f"k={k}: ids {tuple(ids.shape)} {ids.dtype}, expected (1, {k}) int32")
+    # The margin the ids rest on, from the same bf16 head rows the route takes.
+    head_rows = head._lm_head().cpu()
+    logits = torch.nn.functional.linear(hiddens.reshape(k, -1), head_rows).float()
+    top2 = logits.topk(2, dim=-1).values
+    margins = ((top2[:, 0] - top2[:, 1]) / (logits.max(-1).values - logits.min(-1).values)).tolist()
+    result = {
+        "graph": "draft_tokens", "k": k, "batch": 1, "ctx": CONTEXT, "window_rows": WINDOW_PAGES * case.PAGE,
+        "max_seq_len": MAX_SEQ_LEN, "first_call_s": first_call_s,
+        "ids": ids.tolist(), "margin_share": margins,
+        "hidden_rows": hiddens.reshape(k, -1).float().tolist(),
+        "unit": f"one fused draft of k={k} iterations (layer 45 attention + MoE halves, head, token) for 1 request",
+    }
+    if args.mode == "device":
+        result["timing"] = measure(fn, operands, args.warmup, args.iterations)
+    del fn, step, head
+    return result
+
+
+def compare(device_path: Path, sim_path: Path) -> dict:
+    """Per ``k``: ids bit-equal?, hidden rows' relative L2, the margins both sides saw."""
+    dev, sim = json.loads(device_path.read_text()), json.loads(sim_path.read_text())
+    by_k = lambda report: {c["k"]: c for c in report["cases"] if c.get("graph") == "draft_tokens"}
+    d, s = by_k(dev), by_k(sim)
+    out = {}
+    for k in sorted(set(d) & set(s)):
+        hd, hs = torch.tensor(d[k]["hidden_rows"]), torch.tensor(s[k]["hidden_rows"])
+        out[str(k)] = {
+            "ids_device": d[k]["ids"], "ids_sim": s[k]["ids"],
+            "ids_bit_equal": d[k]["ids"] == s[k]["ids"],
+            "hidden_rel_l2_per_iteration": [rel_l2(hd[i], hs[i]) for i in range(hd.shape[0])],
+            "margin_share_device": d[k]["margin_share"], "margin_share_sim": s[k]["margin_share"],
+        }
+    return out
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--mode", choices=("sim", "device"), default="device")
-    parser.add_argument("--batches", type=int, nargs="+", default=[1, 4])
-    parser.add_argument("--graphs", nargs="+", default=["null", "head_only", "head_block"])
-    parser.add_argument("--chain", type=int, default=4)
+    parser.add_argument("--ks", type=int, nargs="+", default=[1, 5])
+    parser.add_argument("--null", action="store_true", help="also time the launch-floor graph")
     parser.add_argument("--hidden", type=int, default=4096)
     parser.add_argument("--q-lora", type=int, default=1536)
+    parser.add_argument("--seed", type=int, default=7_000)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=50)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--compare", type=Path, nargs=2, metavar=("DEVICE_JSON", "SIM_JSON"))
     args = parser.parse_args()
+    if args.compare:
+        print(json.dumps(compare(*args.compare), indent=1))
+        return
+    if args.output is None:
+        sys.exit("--output is required unless --compare is given")
     if args.mode == "sim" and os.environ.get("NKI_SIMULATOR") != "1":
         sys.exit("--mode sim needs NKI_SIMULATOR=1 VLLM_NEURON_CPU_MODE=1")
     device = "cpu" if args.mode == "sim" else "neuron:0"
-    cfg = case.decode_config(hidden_size=args.hidden, q_lora_rank=args.q_lora)
+    cfg = build_config(args.hidden, args.q_lora)
+    qc = quant_config()
     report = {
         "what": __doc__.split("\n\n")[0],
         "mode": args.mode, "device": device, "tree": str(ROOT),
         "environment": {k: os.environ.get(k) for k in (
             "NEURON_RT_VISIBLE_CORES", "NEURON_LOGICAL_NC_CONFIG", "NEURON_LIBTORCH_CACHE_ROOT",
             "NKI_SIMULATOR", "VLLM_NEURON_CPU_MODE", "NEURON_CC_FLAGS")},
-        "cores": "neuron:0 = 1 logical core (LNC2: 2 physical cores) of the leased slice" if args.mode == "device" else "cpu",
-        "args": vars(args) | {"output": str(args.output)},
+        "compiler_args": compiler_args() if args.mode == "device" else None,
+        "cores": "neuron:0 = 1 logical core (LNC2) of the leased slice" if args.mode == "device" else "cpu",
+        "args": vars(args) | {"output": str(args.output), "compare": None},
         "config": {"hidden_size": int(cfg.hidden_size), "q_lora_rank": int(cfg.q_lora_rank),
                    "kv_lora_rank": int(cfg.kv_lora_rank), "num_attention_heads": int(cfg.num_attention_heads),
                    "index_n_heads": int(cfg.index_n_heads), "index_head_dim": int(cfg.index_head_dim),
                    "index_kpool": int(cfg.index_kpool), "index_topk": int(cfg.index_topk),
-                   "vocab_size": int(cfg.vocab_size), "rms_norm_eps": float(cfg.rms_norm_eps)},
+                   "vocab_size_as_built": int(cfg.vocab_size), "vocab_size_model": VOCAB,
+                   "rms_norm_eps": float(cfg.rms_norm_eps),
+                   "index_share_for_mtp_iteration": bool(cfg.index_share_for_mtp_iteration),
+                   "quant_method": str(getattr(qc, "method", None))},
+        "moe_geometry": {"experts": EXPERTS, "ep_degree": EP_DEGREE, "local_experts": LOCAL_EXPERTS,
+                         "local_intermediate": LOCAL_INTERMEDIATE, "shared_intermediate": SHARED_INTERMEDIATE,
+                         "expert_rank": EXPERT_RANK, "top_k": int(cfg.num_experts_per_tok)},
         "cases": [],
     }
-    for label in args.graphs:
-        for batch in args.batches:
-            print(f"[mtp-bench] {label} B={batch}", file=sys.stderr, flush=True)
-            report["cases"].append(run_case(label, batch, args.chain, args, cfg, device))
-            args.output.parent.mkdir(parents=True, exist_ok=True)
-            args.output.write_text(json.dumps(report, indent=1, default=str))
-    print(json.dumps(report["cases"], indent=1, default=str))
+
+    def flush():
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(json.dumps(report, indent=1, default=str))
+
+    if args.null:
+        print("[mtp-bench] null", file=sys.stderr, flush=True)
+        report["cases"].append(run_null(args, cfg, device))
+        flush()
+    for k in args.ks:
+        print(f"[mtp-bench] draft_tokens k={k}", file=sys.stderr, flush=True)
+        report["cases"].append(run_k(k, args, cfg, qc, device))
+        flush()
+    if args.mode == "device":
+        timed = {c["k"]: c["timing"]["median_us"] for c in report["cases"] if c.get("graph") == "draft_tokens"}
+        ks = sorted(timed)
+        report["derived"] = {
+            "median_us_by_k": {str(k): timed[k] for k in ks},
+            "marginal_us": {f"{a}->{b}": (timed[b] - timed[a]) / (b - a) for a, b in zip(ks, ks[1:])},
+        }
+        flush()
+    summary = [{k: v for k, v in c.items() if k != "hidden_rows"} for c in report["cases"]]
+    print(json.dumps({"cases": summary, "derived": report.get("derived")}, indent=1, default=str))
 
 
 if __name__ == "__main__":
