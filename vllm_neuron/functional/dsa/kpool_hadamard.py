@@ -108,6 +108,20 @@ two instructions over every block of every row of a tile, so a tile of ``128 * 8
 at B=64 (``64 * 32`` rows) one tile per core.
 """
 
+POOLING_ELEMENTS_PER_PARTITION = 2048
+"""fp32 elements one partition carries per operand in a pooling tile: ``rows * pool_size * 128``.
+
+At ``index_kpool`` 4 that is 4 pools a partition, so a 1024-token prefill (1024 pools) is one
+``[128, 4 * 4 * 128]`` tile per core of an LNC2 launch; the softmax then costs one instruction
+per step (or per slot) for all 512 pools of a core where 342e93e issued them per 128-pool tile.
+"""
+
+
+def pooling_rows_per_partition(pool_size: int) -> int:
+    """Pools one partition carries in a pooling tile (at least one)."""
+    return max(1, POOLING_ELEMENTS_PER_PARTITION // (int(pool_size) * INDEX_HEAD_DIM))
+
+
 SOURCE_DIGEST = int(hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:7], 16)
 """This file's content digest, handed to every kernel here as a trace-time int.
 
@@ -263,45 +277,94 @@ def _rotate_rows(x_hbm, out_hbm, row0: int, parts: int, rows: int):
     nisa.dma_copy(dst=out_hbm.ap(pattern=pattern, offset=row0 * INDEX_HEAD_DIM), src=result)
 
 
-def _load_fp32(hbm, rows: int, head_dim: int, row_stride: int, offset: int):
-    """A ``(rows, head_dim)`` fp32 tile from a 2-D HBM buffer, widened on the way in.
+def _pool_rows(slot_k_hbm, slot_score_hbm, ape_full, out_hbm, row0: int, parts: int, rows: int,
+               pool_size: int):
+    """Pool and rotate pools ``row0 .. row0 + parts * rows - 1``: partition ``p`` holds pools
+    ``row0 + p * rows .. row0 + p * rows + rows - 1``, one contiguous read of each operand and
+    one contiguous write.
 
-    ``row_stride`` is in elements, so a caller reading slot ``s`` of a flattened
-    ``[n_pools * pool_size, head_dim]`` buffer passes ``pool_size * head_dim``.
-
-    The DMA lands in a tile of the source dtype and a separate ``tensor_copy`` does
-    the widening. The staging is unconditional rather than guarded by a
-    ``hbm.dtype == nl.float32`` test, because comparing a NKI tensor's dtype against
-    a ``nki.language`` dtype object is a trace-time equality; always staging is
-    correct for every input dtype at the cost of one extra copy when the source is
-    already fp32.
+    A partition's free axis is ``(row, slot, channel)``, so a pool's ``pool_size`` slots and a
+    partition's ``rows`` pools are all in one tile and each softmax step is one instruction over
+    every pool of the tile (one per slot where the step reads one slot). The per-element sequence
+    is 342e93e's, in its order: the operands staged in their own dtype and widened to fp32,
+    ``total = score + ape``, the running maximum from slot 0, ``exp(total - max)``, the
+    denominator and the weighted sum accumulated from zero in slot order, ``reciprocal`` then
+    multiply, the butterfly, one multiply by ``HADAMARD_SCALE``, the cast. The denominator skips
+    the zero start: ``0 + w == w`` exactly for every ``w >= +0``, and ``exp`` returns no ``-0``.
+    The weighted sum keeps it, because a ``-0`` product would otherwise survive.
     """
-    out = nl.ndarray((rows, head_dim), dtype=nl.float32, buffer=nl.sbuf)
-    staged = nl.ndarray((rows, head_dim), dtype=hbm.dtype, buffer=nl.sbuf)
-    nisa.dma_copy(dst=staged, src=hbm.ap(pattern=[[row_stride, rows], [1, head_dim]], offset=offset))
-    nisa.tensor_copy(dst=out, src=staged)
-    return out
+    head_dim = INDEX_HEAD_DIM
+    width = rows * pool_size * head_dim
+    pattern = [[width, parts], [1, width]]
+    offset = row0 * pool_size * head_dim
 
+    score_in = nl.ndarray((parts, width), dtype=slot_score_hbm.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=score_in, src=slot_score_hbm.ap(pattern=pattern, offset=offset))
+    key_in = nl.ndarray((parts, width), dtype=slot_k_hbm.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=key_in, src=slot_k_hbm.ap(pattern=pattern, offset=offset))
+    score = nl.ndarray((parts, width), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=score, src=score_in)
+    key = nl.ndarray((parts, width), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=key, src=key_in)
 
-def _broadcast_row(hbm, rows: int, head_dim: int, row: int):
-    """One row of a 2-D HBM buffer replicated across ``rows`` partitions, as an fp32 tile.
+    total = nl.ndarray((parts, width), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=total, data1=score, data2=ape_full[0:parts, 0:width], op=nl.add)
+    total4 = total.reshape((parts, rows, pool_size, head_dim))
 
-    A zero partition stride is what replicates: ``pattern=[[0, rows], ...]`` reads
-    the same source row for every partition. ``nisa.tensor_scalar`` cannot serve
-    this instead -- when its ``operand0`` is a tile it is a per-partition scalar and
-    must carry one entry per partition of ``dst``, so a ``(1, head_dim)`` row is
-    refused by the MLIR verifier.
+    running_max = nl.ndarray((parts, rows * head_dim), dtype=nl.float32, buffer=nl.sbuf)
+    rmax = running_max.reshape((parts, rows, head_dim))
+    if pool_size == 1:
+        nisa.tensor_copy(dst=rmax, src=total4[:, :, 0, :])
+    else:
+        nisa.tensor_tensor(dst=rmax, data1=total4[:, :, 0, :], data2=total4[:, :, 1, :],
+                           op=nl.maximum)
+        for slot in range(2, pool_size):
+            nisa.tensor_tensor(dst=rmax, data1=rmax, data2=total4[:, :, slot, :], op=nl.maximum)
 
-    Stages through the source dtype unconditionally, for the reason ``_load_fp32``
-    gives.
-    """
-    out = nl.ndarray((rows, head_dim), dtype=nl.float32, buffer=nl.sbuf)
-    staged = nl.ndarray((rows, head_dim), dtype=hbm.dtype, buffer=nl.sbuf)
+    shifted = nl.ndarray((parts, width), dtype=nl.float32, buffer=nl.sbuf)
+    shifted4 = shifted.reshape((parts, rows, pool_size, head_dim))
+    for slot in range(pool_size):
+        nisa.tensor_tensor(dst=shifted4[:, :, slot, :], data1=total4[:, :, slot, :], data2=rmax,
+                           op=nl.subtract)
+    weight = nl.ndarray((parts, width), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(dst=weight, op=nl.exp, data=shifted)
+    weight4 = weight.reshape((parts, rows, pool_size, head_dim))
+
+    denom = nl.ndarray((parts, rows * head_dim), dtype=nl.float32, buffer=nl.sbuf)
+    denom3 = denom.reshape((parts, rows, head_dim))
+    if pool_size == 1:
+        nisa.tensor_copy(dst=denom3, src=weight4[:, :, 0, :])
+    else:
+        nisa.tensor_tensor(dst=denom3, data1=weight4[:, :, 0, :], data2=weight4[:, :, 1, :],
+                           op=nl.add)
+        for slot in range(2, pool_size):
+            nisa.tensor_tensor(dst=denom3, data1=denom3, data2=weight4[:, :, slot, :], op=nl.add)
+
+    weighted = nl.ndarray((parts, width), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=weighted, data1=weight, data2=key, op=nl.multiply)
+    weighted4 = weighted.reshape((parts, rows, pool_size, head_dim))
+    acc = nl.ndarray((parts, rows * head_dim), dtype=nl.float32, buffer=nl.sbuf)
+    acc3 = acc.reshape((parts, rows, head_dim))
+    nisa.memset(dst=acc, value=0.0)
+    for slot in range(pool_size):
+        nisa.tensor_tensor(dst=acc3, data1=acc3, data2=weighted4[:, :, slot, :], op=nl.add)
+
+    inv = nl.ndarray((parts, rows * head_dim), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.reciprocal(dst=inv, data=denom)
+    pooled = nl.ndarray((parts, rows * head_dim), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=pooled, data1=acc, data2=inv, op=nl.multiply)
+
+    scratch = nl.ndarray((parts, rows * head_dim), dtype=nl.float32, buffer=nl.sbuf)
+    rotated = _fwht128_blocks(pooled, scratch, parts, rows)
+    scaled = nl.ndarray((parts, rows * head_dim), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=scaled, data=rotated, op0=nl.multiply, operand0=HADAMARD_SCALE)
+    result = nl.ndarray((parts, rows * head_dim), dtype=out_hbm.dtype, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=result, src=scaled)
     nisa.dma_copy(
-        dst=staged, src=hbm.ap(pattern=[[0, rows], [1, head_dim]], offset=row * head_dim)
+        dst=out_hbm.ap(pattern=[[rows * head_dim, parts], [1, rows * head_dim]],
+                       offset=row0 * head_dim),
+        src=result,
     )
-    nisa.tensor_copy(dst=out, src=staged)
-    return out
 
 
 # ---------------------------------------------------------------------------------------------
@@ -327,74 +390,49 @@ def _kpool_hadamard_nki(slot_k_hbm, slot_score_hbm, ape_hbm, n_pools, pool_size,
     Returns:
         ``[n_pools, head_dim]`` in ``slot_k_hbm``'s dtype.
 
-    The pool axis is the partition axis and the head dimension is the free axis,
-    which is what keeps the whole reduction elementwise: the softmax runs over the
-    slot tiles, so each of its steps is a ``tensor_tensor`` between two
-    ``(rows, head_dim)`` tiles and nothing reduces across partitions or along the
-    free axis. A short final tile is narrowed rather than masked, so no padded row
-    can reach the output.
+    The pools split evenly over the programs of the launch grid (both cores of an LNC2 core
+    with a ``[2]`` grid, :func:`kpool_hadamard_programs`). Each program's share goes in tiles of
+    ``128 * POOLING_ROWS_PER_PARTITION(pool_size)`` pools (:func:`_pool_rows`), then one tile of
+    whole 128-pool groups, then one short tile of the last ``< 128`` pools, one a partition --
+    the layout of :func:`_hadamard128_nki`. The pool axis is the partition axis and the head
+    dimension the free axis, so the whole reduction is elementwise: nothing reduces across
+    partitions or along the free axis. Pools are independent, so the split changes no value.
     """
     head_dim = slot_k_hbm.shape[1]
     out_hbm = nl.ndarray((n_pools, head_dim), dtype=slot_k_hbm.dtype, buffer=nl.shared_hbm)
     pmax = nl.tile_size.pmax
-    row_stride = pool_size * head_dim
+    n_prgs = nl.num_programs(axes=0)
+    prg = nl.program_id(0)
+    share = (n_pools + n_prgs - 1) // n_prgs
+    lo = prg * share
+    hi = min(n_pools, lo + share)
+    per_partition = pooling_rows_per_partition(pool_size)
 
-    for t in range((n_pools + pmax - 1) // pmax):
-        rows = min(pmax, n_pools - t * pmax)
-        base = t * pmax * row_stride
+    # The per-slot bias, replicated over every partition and every pool of a partition once
+    # per launch: a zero partition stride and a zero row stride on the read. Staged through
+    # its own dtype and widened, as 342e93e's per-slot broadcast was.
+    full = per_partition * pool_size * head_dim
+    ape_in = nl.ndarray((pmax, full), dtype=ape_hbm.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(
+        dst=ape_in,
+        src=ape_hbm.ap(pattern=[[0, pmax], [0, per_partition], [1, pool_size * head_dim]],
+                       offset=0),
+    )
+    ape_full = nl.ndarray((pmax, full), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=ape_full, src=ape_in)
 
-        # Pass 1: per-(pool, channel) max of slot_score + ape, for softmax stability.
-        # The sums are kept rather than recomputed in pass 2: a tile holds up to 128 pools, so
-        # holding pool_size fp32 tiles costs less than that many more strided DMA reads.
-        totals = []
-        running_max = nl.ndarray((rows, head_dim), dtype=nl.float32, buffer=nl.sbuf)
-        for slot in range(pool_size):
-            score = _load_fp32(slot_score_hbm, rows, head_dim, row_stride, base + slot * head_dim)
-            bias = _broadcast_row(ape_hbm, rows, head_dim, slot)
-            total = nl.ndarray((rows, head_dim), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_tensor(dst=total, data1=score, data2=bias, op=nl.add)
-            totals.append(total)
-            if slot == 0:
-                nisa.tensor_copy(dst=running_max, src=total)
-            else:
-                nisa.tensor_tensor(
-                    dst=running_max, data1=running_max, data2=total, op=nl.maximum
-                )
-
-        # Pass 2: softmax-weighted sum of slot_k.
-        acc = nl.ndarray((rows, head_dim), dtype=nl.float32, buffer=nl.sbuf)
-        denom = nl.ndarray((rows, head_dim), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.memset(dst=acc, value=0.0)
-        nisa.memset(dst=denom, value=0.0)
-        for slot in range(pool_size):
-            shifted = nl.ndarray((rows, head_dim), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_tensor(dst=shifted, data1=totals[slot], data2=running_max, op=nl.subtract)
-            weight = nl.ndarray((rows, head_dim), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.activation(dst=weight, op=nl.exp, data=shifted)
-            nisa.tensor_tensor(dst=denom, data1=denom, data2=weight, op=nl.add)
-            key = _load_fp32(slot_k_hbm, rows, head_dim, row_stride, base + slot * head_dim)
-            weighted = nl.ndarray((rows, head_dim), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_tensor(dst=weighted, data1=weight, data2=key, op=nl.multiply)
-            nisa.tensor_tensor(dst=acc, data1=acc, data2=weighted, op=nl.add)
-
-        # Reciprocal then multiply, not a divide: one op per tile either way, and the reciprocal
-        # is the form the ISA exposes directly.
-        inv = nl.ndarray((rows, head_dim), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.reciprocal(dst=inv, data=denom)
-        pooled = nl.ndarray((rows, head_dim), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(dst=pooled, data1=acc, data2=inv, op=nl.multiply)
-
-        # Rotate, scale once, cast, store.
-        scratch = nl.ndarray((rows, head_dim), dtype=nl.float32, buffer=nl.sbuf)
-        rotated = _fwht128_inplace(pooled, scratch, head_dim)
-        scaled = nl.ndarray((rows, head_dim), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_scalar(dst=scaled, data=rotated, op0=nl.multiply, operand0=HADAMARD_SCALE)
-        result = nl.ndarray((rows, head_dim), dtype=slot_k_hbm.dtype, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=result, src=scaled)
-        nl.store(
-            out_hbm.ap(pattern=[[head_dim, rows], [1, head_dim]], offset=t * pmax * head_dim),
-            value=result,
-        )
+    big = pmax * per_partition
+    n_big = (hi - lo) // big
+    for t in range(n_big):
+        _pool_rows(slot_k_hbm, slot_score_hbm, ape_full, out_hbm, lo + t * big, pmax,
+                   per_partition, pool_size)
+    row = lo + n_big * big
+    if hi - row >= pmax:
+        rows = (hi - row) // pmax
+        _pool_rows(slot_k_hbm, slot_score_hbm, ape_full, out_hbm, row, pmax, rows, pool_size)
+        row = row + pmax * rows
+    if hi - row > 0:
+        _pool_rows(slot_k_hbm, slot_score_hbm, ape_full, out_hbm, row, hi - row, 1, pool_size)
     return out_hbm
 
 
@@ -517,6 +555,13 @@ def hadamard128_programs(n_rows: int) -> int:
     return 1
 
 
+def kpool_hadamard_programs(n_pools: int) -> int:
+    """Programs the prefill pooling launches: both cores of an LNC2 core from two pools on."""
+    if os.environ.get("NEURON_LOGICAL_NC_CONFIG") == "2" and int(n_pools) >= 2:
+        return 2
+    return 1
+
+
 def can_run_dsa_hadamard128(x: Tensor) -> bool:
     """Whether the stage-alone NKI kernel serves this call."""
     if not can_run_kernel():
@@ -554,9 +599,10 @@ def dsa_kpool_hadamard(slot_k: Tensor, slot_score: Tensor, ape: Tensor) -> Tenso
     # The counter, the log and the identity read are folded off the traced graph: a counter store
     # inside the trace becomes a value guard that fails on the first call after warmup.
     _record_nki_dispatch("fused", n_pools, pool_size, head_dim)
-    return wrap_nki(_kpool_hadamard_nki)(
-        flat_k, flat_score, ape.contiguous(), n_pools, pool_size, SOURCE_DIGEST
-    )
+    call = wrap_nki(_kpool_hadamard_nki)
+    if kpool_hadamard_programs(n_pools) == 2:
+        call = call[2]
+    return call(flat_k, flat_score, ape.contiguous(), n_pools, pool_size, SOURCE_DIGEST)
 
 
 def dsa_hadamard128(x: Tensor) -> Tensor:
