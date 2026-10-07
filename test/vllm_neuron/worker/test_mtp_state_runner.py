@@ -97,7 +97,7 @@ LINES = {
 def set_draft_k(monkeypatch, value: int) -> None:
     """Point contract C1's ``mtp.shadow_draft_k()`` at ``value`` for this test.
 
-    The function is worker-38's (``envs.VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT``); on a tree
+    The function is worker-50's (``envs.VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT``); on a tree
     that does not define it yet the attribute is added, so the model's call reads it.
     """
     from vllm_neuron.model.glm5_next import mtp

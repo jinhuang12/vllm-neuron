@@ -7,14 +7,16 @@ above 0 the draft runs, so it needs the state a trunk DSA layer keeps: a latent 
 and the indexer side caches and a carrier on the runner's side
 (``test/vllm_neuron/worker/test_mtp_state_runner.py``). Read here:
 
-1. knob 0 (and a tree whose ``mtp`` defines no ``shadow_draft_k`` yet): the ``LayerSpec``
-   list is the one 82bee3b produces (the record ``mtp_state_base_82bee3b.json`` beside the
-   runner test, taken from 82bee3b by that file's ``main``);
+1. knob 0 (and a tree whose ``mtp`` defines no ``shadow_draft_k`` yet, with the knob's
+   variable unset, empty or 0): the ``LayerSpec`` list is the one 82bee3b produces (the
+   record ``mtp_state_base_82bee3b.json`` beside the runner test, taken from 82bee3b by
+   that file's ``main``);
 2. knob 1..5: exactly one more ``LayerSpec``, ``layers.45.self_attn``, last, with layer
    43's geometry (layer 45 is built by the same DSA class from the same config);
 3. ``bind_kv_cache`` keeps layer 45's bank at index 45 of ``glm5next_layer_banks``, as a
    sparse-family record over the runner's own tensor, and refuses a dict without it;
-4. the knob is read through ``shadow_draft_k()`` and nothing else.
+4. the knob is read through ``shadow_draft_k()``; on a tree without it, from the knob's
+   variable, the fallback the sibling stubs (root construction, root forward) use.
 
     NKI_SIMULATOR=1 VLLM_NEURON_CPU_MODE=1 python -m pytest \\
         test/vllm_neuron/model/glm5_next/test_mtp_state.py
@@ -32,6 +34,8 @@ FIXTURE_PATH = Path(__file__).resolve().parent / "fixtures" / "config.json"
 BASE_RECORD = (
     Path(__file__).resolve().parents[2] / "worker" / "mtp_state_base_82bee3b.json"
 )
+#: Contract C1's variable, read directly only while ``mtp.shadow_draft_k`` is absent.
+KNOB_ENV = "VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT"
 STACK = 45
 DRAFT_LAYER = 45
 LAST_TRUNK_DSA = 43
@@ -89,15 +93,51 @@ def test_knob_off_the_spec_list_is_the_82bee3b_record(monkeypatch) -> None:
     assert [_record(layer) for layer in _model().get_kv_spec().layers] == want
 
 
-def test_a_tree_without_the_knob_function_reads_knob_0(monkeypatch) -> None:
-    """Until worker-38's ``shadow_draft_k`` lands, the call defaults to off."""
+@pytest.mark.parametrize("raw", [None, "", "0"])
+def test_a_tree_without_the_knob_function_and_the_knob_unset_or_0_is_82bee3b(
+    raw, monkeypatch
+) -> None:
+    """Until worker-50's ``shadow_draft_k`` lands, unset, empty or 0 is off."""
     from vllm_neuron.model.glm5_next import mtp
 
     monkeypatch.delattr(mtp, "shadow_draft_k", raising=False)
+    if raw is None:
+        monkeypatch.delenv(KNOB_ENV, raising=False)
+    else:
+        monkeypatch.setenv(KNOB_ENV, raw)
     base = json.loads(BASE_RECORD.read_text())
-    assert [_record(layer) for layer in _model().get_kv_spec().layers] == (
-        base["lines"]["bs1"]["kv_spec"]
-    )
+    model = _model()
+    layers = model.get_kv_spec().layers
+    assert [_record(layer) for layer in layers] == base["lines"]["bs1"]["kv_spec"]
+    model.bind_kv_cache(_kv_caches(layers))
+    assert len(model.glm5next_layer_banks) == STACK
+
+
+def test_a_tree_without_the_knob_function_reads_the_knob_variable(monkeypatch) -> None:
+    """Without ``mtp.shadow_draft_k`` the knob's variable is read directly, as the root
+    construction (worker-51, ``resolve_shadow_draft_k``) and forward (worker-53,
+    ``_shadow_draft_k``) stubs read it, so a branch without worker-50's reader still
+    builds the head, the 12th spec and the 46th carrier together."""
+    from vllm_neuron.model.glm5_next import mtp
+
+    monkeypatch.delattr(mtp, "shadow_draft_k", raising=False)
+    monkeypatch.setenv(KNOB_ENV, "5")
+    model = _model()
+    layers = model.get_kv_spec().layers
+    assert len(layers) == STACK + 1
+    assert layers[DRAFT_LAYER].name == "layers.45.self_attn"
+    model.bind_kv_cache(_kv_caches(layers))
+    assert len(model.glm5next_layer_banks) == STACK + 1
+
+
+def test_the_knob_function_wins_over_the_knob_variable(monkeypatch) -> None:
+    monkeypatch.setenv(KNOB_ENV, "5")
+    _set_k(monkeypatch, 0)
+    model = _model()
+    layers = model.get_kv_spec().layers
+    assert len(layers) == STACK
+    model.bind_kv_cache(_kv_caches(layers))
+    assert len(model.glm5next_layer_banks) == STACK
 
 
 def test_knob_off_bind_keeps_the_stack_and_nothing_else(monkeypatch) -> None:

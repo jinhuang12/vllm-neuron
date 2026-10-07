@@ -9214,9 +9214,16 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
         from vllm_neuron.model.glm5_next import mtp
 
-        # Contract C1 (worker-38): until ``shadow_draft_k`` exists the draft is off.
+        # Contract C1: ``mtp.shadow_draft_k()``. Until it lands the knob's variable is
+        # read here directly, as the root construction and forward stubs read it.
         shadow_draft_k = getattr(mtp, "shadow_draft_k", None)
-        draft_on = shadow_draft_k is not None and int(shadow_draft_k()) > 0
+        if shadow_draft_k is not None:
+            draft_on = int(shadow_draft_k()) > 0
+        else:
+            import os
+
+            raw = os.environ.get("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT", "").strip()
+            draft_on = bool(raw) and int(raw) > 0
         layers: list[LayerSpec] = []
         for layer_idx, layer in enumerate(self.model.layers):
             attention = layer.attention
@@ -9327,8 +9334,15 @@ class Glm5NextForConditionalGeneration(nn.Module):
         stack = len(self.model.layers)
         # The MTP draft layer's entry follows the stack when the shadow draft is on
         # (``get_kv_spec``); its record lands at index ``stack`` (45), after the stack's.
+        # The knob is read as ``get_kv_spec`` reads it (C1, or its variable until then).
         shadow_draft_k = getattr(mtp, "shadow_draft_k", None)
-        draft = 1 if shadow_draft_k is not None and int(shadow_draft_k()) > 0 else 0
+        if shadow_draft_k is not None:
+            draft = 1 if int(shadow_draft_k()) > 0 else 0
+        else:
+            import os
+
+            raw = os.environ.get("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT", "").strip()
+            draft = 1 if raw and int(raw) > 0 else 0
         if len(spec_layers) != stack + draft:
             raise ValueError(
                 f"get_kv_spec reports {len(spec_layers)} layer(s) and the stack "
