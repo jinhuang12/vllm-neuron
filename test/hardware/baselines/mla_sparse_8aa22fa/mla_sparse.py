@@ -10,11 +10,7 @@ Per query, over the selected cache rows::
 
 This is the absorbed-latent path: attention runs in the latent rank L and the V-up
 projection belongs to the caller. The output is natural row-major ``[S, H, L]``
-float32. The untiled and latent-tiled bodies compute in fp32 throughout. The row-tiled
-body (the served geometry: K = 2176 selected columns) feeds the PE the stored 2-byte
-query and cache rows with fp32 accumulation and contracts a bf16 hi/lo split of the fp32
-probabilities (about 16 significand bits); ``VLLM_NEURON_MLA_SPARSE_FP32=1`` restores
-the fp32 arithmetic of commit 8aa22fa bit for bit.
+float32, and arithmetic is fp32 throughout.
 
 The latent rides the partition axis because ``nc_matmul`` contracts that axis and
 ``nc_n_gather`` gathers within a partition, so one gather per latent tile selects K
@@ -32,11 +28,9 @@ options. There is no torch attention fallback; an inadmissible geometry raises.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 from dataclasses import dataclass
-from pathlib import Path
 
 import torch
 from torch import Tensor
@@ -106,40 +100,6 @@ SENTINEL_INDEX = -1
 #: the scale and a small scale would give a masked column real weight. 200 is well past
 #: fp32's exp underflow point -- ``exp(-104)`` is already 0.0 there.
 _SENTINEL_EXP_FLOOR = 200.0
-
-#: This file's content digest, handed to every entry point as a trace-time int. The
-#: compiled-kernel cache keys on an entry point's own source and its arguments, and the
-#: entry points are thin wrappers over the bodies: without this, an edit to a body or a
-#: helper would be served the previous build (``mla_decode.py`` keys itself the same way).
-SOURCE_DIGEST = int(hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:7], 16)
-
-#: Kill switch for the low-precision PE path of the row-tiled body: ``1`` restores the
-#: fp32 arithmetic of commit 8aa22fa bit for bit. Read at trace time, like the LNC flag.
-FP32_ENV = "VLLM_NEURON_MLA_SPARSE_FP32"
-#: Per-query SBUF working sets the row-tiled body rotates through, so one query's
-#: gathers and transposes can run while the previous query's softmax and MM2 finish.
-#: Scheduling only: the arithmetic is the same at any count. ``1`` disables the rotation.
-QUERY_BUFFERS_ENV = "VLLM_NEURON_MLA_SPARSE_QUERY_BUFFERS"
-QUERY_BUFFERS_DEFAULT = 2
-#: ``1`` keeps the row-tiled body on one program (one physical core) where the seam would
-#: otherwise split the query blocks over the two cores of an LNC2 pair. For measurement.
-PROGRAMS_ENV = "VLLM_NEURON_MLA_SPARSE_PROGRAMS"
-
-
-def _pe_lowp_enabled() -> bool:
-    """True unless :data:`FP32_ENV` is ``1``."""
-    return os.environ.get(FP32_ENV, "0") != "1"
-
-
-def _query_buffers() -> int:
-    """:data:`QUERY_BUFFERS_ENV`, at least 1; the default when unset or malformed."""
-    raw = os.environ.get(QUERY_BUFFERS_ENV)
-    if raw is None:
-        return QUERY_BUFFERS_DEFAULT
-    try:
-        return max(1, int(raw))
-    except ValueError:
-        return QUERY_BUFFERS_DEFAULT
 
 
 class MlaSparseAttentionError(ValueError):
@@ -582,12 +542,11 @@ def _attention_body(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
 @nki.jit
 def mla_sparse_attention_nope_kernel(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale,
                                      block_table_hbm=None, written_hbm=None,
-                                     write_offset_hbm=None, page_size=0, source_digest=0):
+                                     write_offset_hbm=None, page_size=0):
     """The R == 0 entry point: sparse latent attention with no RoPE limb.
 
     A separate entry point rather than a flag because the limb is elided at trace
-    time; see :func:`_attention_body`. ``source_digest`` is :data:`SOURCE_DIGEST` and
-    only keys the kernel cache (so on every entry point below).
+    time; see :func:`_attention_body`.
     """
     seq, heads, latent = q_lift_hbm.shape
     out_hbm = nl.ndarray((seq, heads, latent), dtype=nl.float32, buffer=nl.shared_hbm)
@@ -599,7 +558,7 @@ def mla_sparse_attention_nope_kernel(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_sca
 
 @nki.jit
 def mla_sparse_attention_rope_kernel(q_lift_hbm, q_pe_hbm, c_kv_hbm, k_pe_hbm,
-                                     topk_hbm, softmax_scale, source_digest=0):
+                                     topk_hbm, softmax_scale):
     """The R > 0 entry point, for a checkpoint that carries an MLA RoPE half.
 
     Shares every line of arithmetic with the NoPE entry point above.
@@ -887,7 +846,7 @@ def _attention_body_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm
 def mla_sparse_attention_nope_tiled_kernel(q_lift_hbm, c_kv_hbm, topk_hbm,
                                            softmax_scale, block_table_hbm=None,
                                            written_hbm=None, write_offset_hbm=None,
-                                           page_size=0, source_digest=0):
+                                           page_size=0):
     """The latent-tiled R == 0 entry point."""
     seq, heads, latent = q_lift_hbm.shape
     out_hbm = nl.ndarray((seq, heads, latent), dtype=nl.float32, buffer=nl.shared_hbm)
@@ -899,7 +858,7 @@ def mla_sparse_attention_nope_tiled_kernel(q_lift_hbm, c_kv_hbm, topk_hbm,
 
 @nki.jit
 def mla_sparse_attention_rope_tiled_kernel(q_lift_hbm, q_pe_hbm, c_kv_hbm, k_pe_hbm,
-                                           topk_hbm, softmax_scale, source_digest=0):
+                                           topk_hbm, softmax_scale):
     """The latent-tiled R > 0 entry point.
 
     The RoPE limb contracts its own axis into the same score tile, so it is
@@ -1001,126 +960,9 @@ def _load_selected_rows(dst, cache_hbm, indices_hbm, offset, width):
         pattern=[[width, rows], [1, width]], vector_offset=safe, indirect_dim=0))
 
 
-def _mask_sentinel_rows(topk_hbm, offset, width, heads, sentinel_bias, comparand, idx_i32,
-                        valid_i32, valid_f, mask_bias):
-    """The streaming body's sentinel mask, built on the ``heads`` partitions that read it.
-
-    The streaming gather takes its row offsets from :func:`_load_selected_rows`, so the
-    only consumers of the index tile here are the per-column mask and bias of the
-    ``[heads, width]`` score tile. Building them on ``heads`` partitions rather than on
-    all 128 (``_mask_sentinel``, which also feeds ``nc_n_gather``) costs 128 / heads
-    fewer vector elements per tile and yields the same values: ``-1 < index`` is 1 for a
-    real row and 0 for the sentinel, cast to float, and the bias is
-    ``(valid - 1) * sentinel_bias``.
-    """
-    nisa.tensor_copy(
-        dst=idx_i32[:, 0:width],
-        src=nl.load(
-            topk_hbm.ap(pattern=[[0, heads], [1, width]], offset=offset),
-            dtype=nl.int32,
-        ),
-    )
-    nisa.tensor_tensor(dst=valid_i32[:, 0:width], data1=comparand[:, 0:width],
-                       data2=idx_i32[:, 0:width], op=nl.less)
-    nisa.tensor_copy(dst=valid_f[:, 0:width], src=valid_i32[:, 0:width])
-    nisa.tensor_scalar(dst=mask_bias[:, 0:width], data=valid_f[:, 0:width],
-                       op0=nl.add, operand0=-1.0)
-    nisa.tensor_scalar(dst=mask_bias[:, 0:width], data=mask_bias[:, 0:width],
-                       op0=nl.multiply, operand0=sentinel_bias)
-
-
-# Positions in the per-query working set :func:`_row_tiled_scratch` returns. A list
-# indexed by module constants rather than a class or a dict, because the kernel front
-# end resolves plain names and integer subscripts and little else.
-_WS_C_G = 0          # MM1 moving operand: the gathered rows transposed, latent on partitions
-_WS_C_G_T = 1        # the gathered rows as gathered, keys on partitions (MM2 moving operand)
-_WS_P_T = 2          # the probabilities transposed, keys on partitions (fp32)
-_WS_P = 3            # exp of the masked, rebased scores
-_WS_SCORES_M = 4     # scores plus the sentinel bias
-_WS_P_M = 5          # p with the sentinel columns zeroed
-_WS_VALID_F = 6      # 1.0 where a column carries a token
-_WS_MASK_BIAS = 7    # 0.0 there, -sentinel_bias elsewhere
-_WS_NEG_ROW_MAX = 8
-_WS_EXP_BIAS = 9
-_WS_TILE_SUM = 10
-_WS_IDX_SB = 11      # the clamped uint32 indices every partition gathers by (staged path)
-_WS_SEN = 12         # the 128-partition sentinel scratch (staged path)
-_WS_IDX_I32 = 13     # the signed indices on the head partitions (streaming path)
-_WS_VALID_I32 = 14   # 0/1 there
-_WS_K_PE_G = 15      # the gathered RoPE keys
-_WS_K_PE_ROWS = 16   # one chunk of RoPE rows as gathered (streaming path)
-_WS_P_HI = 17        # bf16 hi half of p_t (low-precision MM2)
-_WS_P_LO = 18        # bf16 lo half: p_t - hi
-_WS_P_HI_F = 19      # hi widened back, to form lo
-_WS_COUNT = 20
-
-
-def _row_tiled_scratch(heads, latent, tile_max, chunk_max, n_latent, rope, c_kv_hbm,
-                       k_pe_hbm, STREAM_KV, native_kv, lowp):
-    """One per-query working set of the row-tiled body.
-
-    Every buffer below is the size the untiled body uses at ``topk == MOVING_MAX``,
-    whatever K the caller passes. The body rotates through several of these so one
-    query's gathers and transposes need not wait for the previous query's MM2 to release
-    the gathered rows; the arithmetic does not depend on which set a query uses.
-    """
-    ws = []
-    for _ in range(_WS_COUNT):
-        ws.append(None)
-    if lowp:
-        ws[_WS_C_G] = nl.ndarray((LATENT_TILE, n_latent, tile_max), dtype=c_kv_hbm.dtype,
-                                 buffer=nl.sbuf)
-    else:
-        ws[_WS_C_G] = _sbuf(LATENT_TILE, n_latent, tile_max)
-    if native_kv:
-        ws[_WS_C_G_T] = nl.ndarray((KEY_CHUNK, chunk_max, latent), dtype=c_kv_hbm.dtype,
-                                   buffer=nl.sbuf)
-    else:
-        ws[_WS_C_G_T] = _sbuf(KEY_CHUNK, chunk_max, latent)
-    ws[_WS_P_T] = _sbuf(KEY_CHUNK, chunk_max, _aligned(heads))
-    ws[_WS_P] = _sbuf(heads, tile_max)
-    ws[_WS_SCORES_M] = _sbuf(heads, tile_max)
-    ws[_WS_P_M] = _sbuf(heads, tile_max)
-    ws[_WS_VALID_F] = _sbuf(heads, tile_max)
-    ws[_WS_MASK_BIAS] = _sbuf(heads, tile_max)
-    ws[_WS_NEG_ROW_MAX] = _scalar(heads)
-    ws[_WS_EXP_BIAS] = _scalar(heads)
-    ws[_WS_TILE_SUM] = _scalar(heads)
-    if STREAM_KV:
-        ws[_WS_IDX_I32] = _sbuf_i32(heads, tile_max)
-        ws[_WS_VALID_I32] = _sbuf_i32(heads, tile_max)
-    else:
-        ws[_WS_IDX_SB] = _sbuf_u32(LATENT_TILE, tile_max)
-        # The staged path keeps the 128-partition mask builder, which also clamps the
-        # indices every partition gathers by; its float outputs are aliased into this
-        # working set so the softmax reads one name in both paths.
-        sen = _sentinel_scratch(LATENT_TILE, tile_max, heads)
-        ws[_WS_SEN] = sen
-        ws[_WS_VALID_F] = sen[4]
-        ws[_WS_MASK_BIAS] = sen[5]
-        ws[_WS_SCORES_M] = sen[6]
-        ws[_WS_P_M] = sen[7]
-    if rope > 0:
-        ws[_WS_K_PE_G] = _sbuf(rope, tile_max)
-        if STREAM_KV:
-            if native_kv:
-                ws[_WS_K_PE_ROWS] = nl.ndarray((KEY_CHUNK, _aligned(rope, STAGE_ALIGN)),
-                                               dtype=k_pe_hbm.dtype, buffer=nl.sbuf)[:, 0:rope]
-            else:
-                ws[_WS_K_PE_ROWS] = _sbuf(KEY_CHUNK, _aligned(rope))[:, 0:rope]
-    if lowp:
-        ws[_WS_P_HI] = nl.ndarray((KEY_CHUNK, chunk_max, _aligned(heads, STAGE_ALIGN)),
-                                  dtype=c_kv_hbm.dtype, buffer=nl.sbuf)
-        ws[_WS_P_LO] = nl.ndarray((KEY_CHUNK, chunk_max, _aligned(heads, STAGE_ALIGN)),
-                                  dtype=c_kv_hbm.dtype, buffer=nl.sbuf)
-        ws[_WS_P_HI_F] = _sbuf(KEY_CHUNK, chunk_max, _aligned(heads))
-    return ws
-
-
 def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
                               q_pe_hbm=None, k_pe_hbm=None,
-                              BLOCK_N=MOVING_MAX, STREAM_KV=True, PE_LOWP=False,
-                              QUERY_BUFFERS=QUERY_BUFFERS_DEFAULT):
+                              BLOCK_N=MOVING_MAX, STREAM_KV=True):
     """Online sparse attention over score tiles, with input-derived dimensions.
 
     ``BLOCK_N`` is the selected-key tile width. It must be a multiple of
@@ -1128,30 +970,10 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
     merge grouping; the default keeps the untiled body's arithmetic order.
 
     Streaming prefill gathers ``[KEY_CHUNK, latent]`` rows in the cache's stored
-    dtype. One native-dtype transpose supplies MM1's operand, and MM2 reads each
-    gathered chunk as gathered. A single-query call keeps DMA widening, avoiding
-    MM2's extra copy on decode. Staging instead loads the full cache once and
-    gathers from SBUF. Both preserve duplicates and mask -1.
-
-    ``PE_LOWP`` selects the PE operand precision of the streaming multi-query path
-    when the query and the cache are stored in the same 2-byte float and there is no
-    RoPE limb (the served geometry); every other geometry runs the fp32 arithmetic
-    whatever the flag:
-
-    * fp32 (``False``, and the kill switch :data:`FP32_ENV`): the gathered rows and the
-      query are widened to fp32 before the PE, as commit 8aa22fa did. Bitwise that
-      commit's output.
-    * low precision (``True``): MM1 contracts the stored bf16/fp16 query against the
-      stored bf16/fp16 cache rows -- every product is exact, the PSUM accumulation is
-      fp32, and the widening copies disappear. MM2 contracts a hi/lo split of the fp32
-      probabilities (``hi = bf16(p)``, ``lo = bf16(p - hi)``, about 16 significand
-      bits) against the rows as gathered, as two accumulating single-pass matmuls.
-      The output differs from the fp32 path by about 1e-5 relative L2.
-
-    ``QUERY_BUFFERS`` per-query working sets rotate across consecutive queries so the
-    gathers and transposes of one query can proceed while the previous query's softmax
-    and MM2 complete. The sentinel mask of the streaming path is built on the ``heads``
-    partitions that read it. Neither changes the arithmetic.
+    dtype. One native-dtype transpose supplies MM1's FP32 operands, and MM2
+    widens each gathered chunk after MM1 has finished. A single-query call keeps
+    DMA widening, avoiding MM2's extra copy on decode. Staging instead loads the
+    full cache once and gathers from SBUF. Both preserve duplicates and mask -1.
 
     The geometry gate restricts this body to exact latent tiles that fit one MM2
     moving tile; other latent shapes take the other bodies.
@@ -1163,7 +985,6 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
     rope = 0 if q_pe_hbm is None else q_pe_hbm.shape[2]
     assert KEY_CHUNK <= BLOCK_N <= MOVING_MAX and BLOCK_N % KEY_CHUNK == 0, (
         "BLOCK_N must be a multiple of KEY_CHUNK in [KEY_CHUNK, MOVING_MAX]")
-    assert QUERY_BUFFERS >= 1, "QUERY_BUFFERS must be at least 1"
     tiles = _score_tiles(topk, BLOCK_N)
     single = len(tiles) == 1
     # Not ``max(extent for _, extent in tiles)``: the NKI compiler refuses a generator
@@ -1193,47 +1014,49 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
         _transpose_rows(k_pe_stage, k_pe_hbm, rope, s_kv, rope, 0)
         nisa.tensor_copy(dst=k_pe_sb, src=k_pe_stage)
 
-    # ---- the per-block query tiles ---------------------------------------------------
+    # ---- the working set, sized to one score tile and reused by every tile -------
+    # Every buffer below is the size the untiled body uses at `topk == MOVING_MAX`,
+    # whatever K the caller passes.
     qpb = _queries_per_block(seq, heads)
     block = qpb * heads
-    native_kv = STREAM_KV and seq > 1 and c_kv_hbm.dtype != nl.float32
-    lowp = (PE_LOWP and native_kv and rope == 0
-            and q_lift_hbm.dtype == c_kv_hbm.dtype)
+    idx_sb = _sbuf_u32(LATENT_TILE, tile_max)
     q_stage = []
     for _ in range(n_latent):
         q_stage.append(_stage(q_lift_hbm, LATENT_TILE, block))
-    # The low-precision path reads the staged 2-byte query tiles as MM1's stationary
-    # operand; the fp32 path widens them first, as before.
-    q_lift_t = None if lowp else _sbuf(LATENT_TILE, n_latent, _aligned(block))
+    q_lift_t = _sbuf(LATENT_TILE, n_latent, _aligned(block))
+    c_g = _sbuf(LATENT_TILE, n_latent, tile_max)
+    native_kv = STREAM_KV and seq > 1 and c_kv_hbm.dtype != nl.float32
+    if native_kv:
+        c_g_t = nl.ndarray((KEY_CHUNK, chunk_max, latent),
+                          dtype=c_kv_hbm.dtype, buffer=nl.sbuf)
+    else:
+        c_g_t = _sbuf(KEY_CHUNK, chunk_max, latent)
+    # MM1 no longer reads c_g once scores_ps is complete. Its first latent-wide
+    # slice can then hold MM2's FP32 moving chunk, so native KV storage does not
+    # need a second FP32 cache-shaped allocation. Matmul operands remain FP32.
+    c_mm2 = c_g.reshape((LATENT_TILE, n_latent * tile_max))[:, 0:latent]
+    p_t = _sbuf(KEY_CHUNK, chunk_max, _aligned(heads))
+    p = _sbuf(heads, tile_max)
+    neg_row_max = _scalar(heads)
+    exp_bias = _scalar(heads)
+    tile_sum = _scalar(heads)
+    recip = _scalar(heads)
+    out_sb = _sbuf(heads, latent)
     q_pe_t = _sbuf(rope, _aligned(block)) if rope > 0 else None
     q_pe_stage = _stage(q_pe_hbm, rope, block) if rope > 0 else None
-
-    # ---- the per-query working sets, rotated across consecutive queries -------------
-    scratch = []
-    for _ in range(QUERY_BUFFERS):
-        scratch.append(_row_tiled_scratch(heads, latent, tile_max, chunk_max, n_latent, rope,
-                                          c_kv_hbm, k_pe_hbm, STREAM_KV, native_kv, lowp))
-    # The sentinel comparand is read-only, so one serves every set.
-    comparand = None
-    if STREAM_KV:
-        comparand = _sbuf_i32(heads, tile_max)
-        nisa.memset(dst=comparand, value=SENTINEL_INDEX)
-    # MM1 no longer reads c_g once scores_ps is complete. In the fp32 path with a
-    # 2-byte cache its first latent-wide slice then holds MM2's widened moving chunk,
-    # so native KV storage does not need a second fp32 cache-shaped allocation.
-    c_mm2 = []
-    for bi in range(QUERY_BUFFERS):
-        if native_kv and not lowp:
-            c_mm2.append(scratch[bi][_WS_C_G].reshape((LATENT_TILE, n_latent * tile_max))[:, 0:latent])
+    k_pe_g = _sbuf(rope, tile_max) if rope > 0 else None
+    k_pe_rows = None
+    if rope > 0 and STREAM_KV:
+        if native_kv:
+            k_pe_rows = nl.ndarray((KEY_CHUNK, _aligned(rope, STAGE_ALIGN)),
+                                   dtype=k_pe_hbm.dtype, buffer=nl.sbuf)[:, 0:rope]
         else:
-            c_mm2.append(None)
+            k_pe_rows = _sbuf(KEY_CHUNK, _aligned(rope))[:, 0:rope]
 
-    # ---- the running state carried across score tiles, serial per query --------------
+    # ---- the running state carried across score tiles ----------------------------
     # `run_pos` holds `softmax_scale * (running row max)` in positive form, because
     # merging two maxima uses `tensor_tensor(op=nl.maximum)`. The softmax chain
     # produces the negated, scaled max, so it is negated once per tile.
-    recip = _scalar(heads)
-    out_sb = _sbuf(heads, latent)
     run_pos = _scalar(heads)
     run_sum = _scalar(heads)
     acc = _sbuf(heads, latent)
@@ -1251,9 +1074,9 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
     pv_added = _sbuf(heads, latent)
     acc_new = _sbuf(heads, latent)
 
-    # The sentinel bias is in exponent units divided by the scale, because `activation`
-    # below computes ``exp(scale * data + bias)``. `softmax_scale` is a Python float
-    # inside the traced body, so this division happens at trace time and emits nothing.
+    # The sentinel working set, sized to one score tile like every other buffer here
+    # and sliced per tile the same way, because the mask is a fact about the axis this
+    # body tiles.
     #
     # The merge needs no special case for sentinels because the bias is large in
     # exponent units. A wholly-sentinel tile's `tile_pos` lands `_SENTINEL_EXP_FLOOR`
@@ -1262,14 +1085,19 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
     # its already-zero numerator whichever order the tiles arrive in. A wholly-sentinel
     # first tile initialises the running state, and the next real tile's rescale wipes
     # what it left.
+    sen = _sentinel_scratch(LATENT_TILE, tile_max, heads)
+    valid_f = sen[4]
+    mask_bias = sen[5]
+    scores_m = sen[6]
+    p_m = sen[7]
     sentinel_bias = _SENTINEL_EXP_FLOOR / softmax_scale
 
     # ---- the queries, in blocks whose Q rows fill one 16-row transpose ----------
-    # One transpose per latent tile lands the block's Q rows in the source dtype and,
-    # in the fp32 path, one copy widens them; each query then reads its own columns of
-    # the block tile. A two-program grid partitions independent query blocks across the
-    # two PNCs of one LNC2 core. Each program owns its SBUF and optional private-HBM
-    # window, and writes disjoint query rows into the entry's shared-HBM output.
+    # One transpose per latent tile lands the block's Q rows in the source dtype and
+    # one copy widens them; each query then reads its own columns of the block tile.
+    # A two-program grid partitions independent query blocks across the two PNCs
+    # of one LNC2 core. Each program owns its SBUF and optional private-HBM window,
+    # and writes disjoint query rows into the entry's shared-HBM output.
     n_prgs = nl.num_programs(axes=0)
     prg_id = nl.program_id(0)
     for qb in nl.affine_range(prg_id, seq // qpb, n_prgs):
@@ -1277,27 +1105,13 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
         for li in range(n_latent):
             _transpose_rows(q_stage[li], q_lift_hbm, latent, block, LATENT_TILE,
                             q0 * heads * latent + li * LATENT_TILE)
-            if not lowp:
-                nisa.tensor_copy(dst=q_lift_t[:, li, 0:block], src=q_stage[li])
+            nisa.tensor_copy(dst=q_lift_t[:, li, 0:block], src=q_stage[li])
         if rope > 0:
             _transpose_rows(q_pe_stage, q_pe_hbm, rope, block, rope, q0 * heads * rope)
             nisa.tensor_copy(dst=q_pe_t[:, 0:block], src=q_pe_stage)
         for qi in range(qpb):
             q_idx = q0 + qi
             h0 = qi * heads
-            ws = scratch[qi % QUERY_BUFFERS]
-            c_g = ws[_WS_C_G]
-            c_g_t = ws[_WS_C_G_T]
-            p_t = ws[_WS_P_T]
-            p = ws[_WS_P]
-            scores_m = ws[_WS_SCORES_M]
-            p_m = ws[_WS_P_M]
-            valid_f = ws[_WS_VALID_F]
-            mask_bias = ws[_WS_MASK_BIAS]
-            neg_row_max = ws[_WS_NEG_ROW_MAX]
-            exp_bias = ws[_WS_EXP_BIAS]
-            tile_sum = ws[_WS_TILE_SUM]
-            k_pe_g = ws[_WS_K_PE_G]
             # Not ``for ti, (ks, extent) in enumerate(tiles)``: the NKI compiler refuses
             # a tuple target ("expecting simple variable") and `enumerate` ("failed to
             # resolve name 'builtins.enumerate'"), so the tiles are indexed by range.
@@ -1306,16 +1120,11 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
                 extent = tiles[ti][1]
                 n_chunks = extent // KEY_CHUNK
 
-                # ---- this tile's selected rows: the mask, and the gather's offsets ----
+                # ---- this tile's selected rows, replicated to every partition --------
                 # The untiled body loads all K rows of the query; this loads the tile's
-                # slice of them, signed and clamped before anything reads it.
-                if STREAM_KV:
-                    _mask_sentinel_rows(topk_hbm, q_idx * topk + ks, extent, heads,
-                                        sentinel_bias, comparand, ws[_WS_IDX_I32],
-                                        ws[_WS_VALID_I32], valid_f, mask_bias)
-                else:
-                    _mask_sentinel(topk_hbm, q_idx * topk + ks, extent, heads, sentinel_bias,
-                                   ws[_WS_SEN], ws[_WS_IDX_SB])
+                # slice of them, signed and clamped before the gather reads it.
+                _mask_sentinel(topk_hbm, q_idx * topk + ks, extent, heads, sentinel_bias,
+                               sen, idx_sb)
 
                 # ---- gather this tile's cache rows: one instruction per latent tile ---
                 if STREAM_KV:
@@ -1336,7 +1145,6 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
                             nisa.tensor_copy(dst=c_g[:, li, cs:cs + KEY_CHUNK],
                                              src=gathered_ps)
                         if rope > 0:
-                            k_pe_rows = ws[_WS_K_PE_ROWS]
                             _load_selected_rows(k_pe_rows, k_pe_hbm, topk_hbm,
                                                 q_idx * topk + ks + cs, rope)
                             rope_ps = nl.ndarray((rope, KEY_CHUNK),
@@ -1346,25 +1154,21 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
                 else:
                     for li in range(n_latent):
                         nisa.nc_n_gather(dst=c_g[:, li, 0:extent], data=c_sb[li],
-                                         indices=ws[_WS_IDX_SB][:, 0:extent])
+                                         indices=idx_sb[:, 0:extent])
 
                 # ---- MM1 over this tile: scores[H, extent] ---------------------------
                 scores_ps = _psum(heads, extent)
                 for li in range(n_latent):
-                    if lowp:
-                        q_col = q_stage[li][:, h0:h0 + heads]
-                    else:
-                        q_col = q_lift_t[:, li, h0:h0 + heads]
                     nisa.nc_matmul(
                         dst=scores_ps,
-                        stationary=q_col,
+                        stationary=q_lift_t[:, li, h0:h0 + heads],
                         moving=c_g[:, li, 0:extent],
                         accumulate=(li > 0),
                     )
                 if rope > 0:
                     if not STREAM_KV:
                         nisa.nc_n_gather(dst=k_pe_g[:, 0:extent], data=k_pe_sb,
-                                         indices=ws[_WS_IDX_SB][0:rope, 0:extent])
+                                         indices=idx_sb[0:rope, 0:extent])
                     nisa.nc_matmul(dst=scores_ps, stationary=q_pe_t[:, h0:h0 + heads],
                                    moving=k_pe_g[:, 0:extent], accumulate=True)
 
@@ -1400,43 +1204,20 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
                                    data2=valid_f[:, 0:extent], op=nl.multiply)
 
                 # ---- MM2 over this tile: pv[H, L] = p[H, extent] @ c_g[extent, L] ----
-                # p is transposed in fp32 (exact on the PE) onto the key partitions.
                 for ck in range(n_chunks):
                     cs = ck * KEY_CHUNK
                     p_t_ps = _psum(KEY_CHUNK, heads)
                     nisa.nc_transpose(dst=p_t_ps, data=p_m[:, cs:cs + KEY_CHUNK])
                     nisa.tensor_copy(dst=p_t[:, ck, 0:heads], src=p_t_ps)
                 pv_ps = _psum(heads, latent)
-                if lowp:
-                    # hi = bf16(p), lo = bf16(p - hi), split in the transposed layout;
-                    # both halves accumulate into one fp32 PSUM tile against the rows as
-                    # gathered, so no widening copy of the cache rows is made.
-                    p_hi = ws[_WS_P_HI]
-                    p_lo = ws[_WS_P_LO]
-                    p_hi_f = ws[_WS_P_HI_F]
-                    nisa.tensor_copy(dst=p_hi[:, 0:n_chunks, 0:heads],
-                                     src=p_t[:, 0:n_chunks, 0:heads])
-                    nisa.tensor_copy(dst=p_hi_f[:, 0:n_chunks, 0:heads],
-                                     src=p_hi[:, 0:n_chunks, 0:heads])
-                    nisa.tensor_tensor(dst=p_lo[:, 0:n_chunks, 0:heads],
-                                       data1=p_t[:, 0:n_chunks, 0:heads],
-                                       data2=p_hi_f[:, 0:n_chunks, 0:heads],
-                                       op=nl.subtract)
-                    for ck in range(n_chunks):
-                        nisa.nc_matmul(dst=pv_ps, stationary=p_hi[:, ck, 0:heads],
+                for ck in range(n_chunks):
+                    if native_kv:
+                        nisa.tensor_copy(dst=c_mm2, src=c_g_t[:, ck, :])
+                        nisa.nc_matmul(dst=pv_ps, stationary=p_t[:, ck, 0:heads],
+                                       moving=c_mm2, accumulate=(ck > 0))
+                    else:
+                        nisa.nc_matmul(dst=pv_ps, stationary=p_t[:, ck, 0:heads],
                                        moving=c_g_t[:, ck, :], accumulate=(ck > 0))
-                        nisa.nc_matmul(dst=pv_ps, stationary=p_lo[:, ck, 0:heads],
-                                       moving=c_g_t[:, ck, :], accumulate=True)
-                else:
-                    for ck in range(n_chunks):
-                        if native_kv:
-                            c_wide = c_mm2[qi % QUERY_BUFFERS]
-                            nisa.tensor_copy(dst=c_wide, src=c_g_t[:, ck, :])
-                            nisa.nc_matmul(dst=pv_ps, stationary=p_t[:, ck, 0:heads],
-                                           moving=c_wide, accumulate=(ck > 0))
-                        else:
-                            nisa.nc_matmul(dst=pv_ps, stationary=p_t[:, ck, 0:heads],
-                                           moving=c_g_t[:, ck, :], accumulate=(ck > 0))
 
                 # ---- the merge ------------------------------------------------------
                 if single:
@@ -1502,295 +1283,36 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
             )
 
 
-# --------------------------------------------------------------------------- #
-# The low-precision streaming body, for the served one-head geometry.
-#
-# Same tiles of K and the same gather as the body above, but the per-query work is
-# cut to about a hundred instructions where the fp32 body issues several hundred:
-#
-# * One gather-transpose DMA (``nisa.dma_transpose`` over an indirect source, TRN2+)
-#   lands the query's selected rows with the latent on partitions -- MM1's moving
-#   operand -- so no PE transposes and no PSUM evacuations of the gathered cache are
-#   issued. The plain gathers for MM2 stay, one per 128-row chunk.
-# * The selected-row indices are loaded twice per query: once chunk-major, as the
-#   ``[128, n_chunks]`` offset tile both gathers read, and once as the row the mask is
-#   built from, on the one head partition, in fp32 (``index >= 0``).
-# * The softmax runs once over the whole row: the score tiles are evacuated from PSUM
-#   into one ``[1, K]`` tile (the sentinel bias added on the way), then one max, one
-#   exp with its sum, one mask multiply and one normalisation. No per-tile merge.
-# * The probabilities reach the key partitions by one SBUF-to-SBUF DMA that re-rows
-#   the ``[1, K]`` tile as ``[n_chunks, 128]`` and one PE transpose, instead of one PE
-#   transpose per chunk. They are then split into bf16 hi/lo halves for MM2.
-# * The normalisation is applied to p before MM2 rather than to the output after
-#   it: at one head both are one instruction, and MM2's PSUM tile is then stored as is.
-#
-# The arithmetic differs from the fp32 body in the operand precision of MM1 (exact
-# products of the stored 2-byte values, fp32 accumulation) and MM2 (hi/lo split of
-# p, about 16 significand bits), in the softmax being taken against the global row
-# maximum rather than merged tile by tile, and in where the normalisation lands.
-# --------------------------------------------------------------------------- #
-
-#: Whether the low-precision body issues the gather-transpose per 512-wide score tile
-#: (True: n_tiles DMAs, so MM1 on tile 0 can start before tile 3 has landed) or once
-#: per query (False: one DMA of all selected rows).
-GATHER_TRANSPOSE_PER_TILE = False
-
-
-def _lowp_serves(q_lift_hbm, c_kv_hbm, heads: int, rope: int, STREAM_KV: bool) -> bool:
-    """True when the low-precision body serves this call: the one-head streaming geometry
-    with the query and cache stored in the same 2-byte float and more than one query."""
-    return (bool(STREAM_KV) and q_lift_hbm.shape[0] > 1 and heads == 1 and rope == 0
-            and c_kv_hbm.dtype != nl.float32 and q_lift_hbm.dtype == c_kv_hbm.dtype)
-
-
-_LP_C_T = 0        # the selected rows transposed, latent on partitions: [128, 1, n_latent, K]
-_LP_C_ROWS = 1     # the selected rows as gathered, keys on partitions: [128, n_chunks, latent]
-_LP_RAW = 2        # the chunk-major indices, signed
-_LP_SAFE = 3       # the same with the sentinel clamped to row 0 (the gathers' offsets)
-_LP_U32 = 4        # the clamp as uint32 (the gather-transpose's offsets)
-_LP_P_ROWS = 5     # p re-rowed as [n_chunks, 128]
-_LP_P_T = 6        # p transposed, keys on partitions, fp32
-_LP_P_HI = 7       # bf16(p_t)
-_LP_P_HI_F = 8     # the hi half widened
-_LP_P_LO = 9       # bf16(p_t - hi)
-_LP_COUNT = 10
-
-
-def _lowp_scratch(latent, topk, n_latent, n_chunks, dtype):
-    """One per-query working set of the low-precision body (see :func:`_row_tiled_scratch`)."""
-    ws = []
-    for _ in range(_LP_COUNT):
-        ws.append(None)
-    ws[_LP_C_T] = nl.ndarray((LATENT_TILE, 1, n_latent, topk), dtype=dtype, buffer=nl.sbuf)
-    ws[_LP_C_ROWS] = nl.ndarray((KEY_CHUNK, n_chunks, latent), dtype=dtype, buffer=nl.sbuf)
-    ws[_LP_RAW] = _sbuf_i32(KEY_CHUNK, _aligned(n_chunks))
-    ws[_LP_SAFE] = _sbuf_i32(KEY_CHUNK, _aligned(n_chunks))
-    ws[_LP_U32] = _sbuf_u32(KEY_CHUNK, _aligned(n_chunks))
-    ws[_LP_P_ROWS] = _sbuf(n_chunks, KEY_CHUNK)
-    ws[_LP_P_T] = _sbuf(KEY_CHUNK, _aligned(n_chunks))
-    ws[_LP_P_HI] = nl.ndarray((KEY_CHUNK, _aligned(n_chunks, STAGE_ALIGN)), dtype=dtype, buffer=nl.sbuf)
-    ws[_LP_P_HI_F] = _sbuf(KEY_CHUNK, _aligned(n_chunks))
-    ws[_LP_P_LO] = nl.ndarray((KEY_CHUNK, _aligned(n_chunks, STAGE_ALIGN)), dtype=dtype, buffer=nl.sbuf)
-    return ws
-
-
-def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
-                                   QUERY_BUFFERS=QUERY_BUFFERS_DEFAULT):
-    """The low-precision streaming body; see the section comment above.
-
-    Preconditions (:func:`_lowp_serves`): one head, no RoPE limb, more than one query,
-    the query and the cache in the same 2-byte float, and the row-tiled gate's own: the
-    latent an exact multiple of 128 within one MM2 moving tile, K a multiple of 128.
-    """
-    seq, heads, latent = q_lift_hbm.shape
-    topk = topk_hbm.shape[1]
-    n_latent = latent // LATENT_TILE
-    n_chunks = topk // KEY_CHUNK
-    tiles = _score_tiles(topk, MOVING_MAX)
-    dtype = c_kv_hbm.dtype
-    assert QUERY_BUFFERS >= 1, "QUERY_BUFFERS must be at least 1"
-
-    # ---- the per-block query tiles: the staged 2-byte rows are MM1's stationary --------
-    qpb = _queries_per_block(seq, heads)
-    block = qpb * heads
-    q_stage = []
-    for _ in range(n_latent):
-        q_stage.append(_stage(q_lift_hbm, LATENT_TILE, block))
-
-    # ---- the per-query working sets, rotated across consecutive queries -------------
-    scratch = []
-    for _ in range(QUERY_BUFFERS):
-        scratch.append(_lowp_scratch(latent, topk, n_latent, n_chunks, dtype))
-
-    # ---- the one-partition row tiles of the softmax chain, shared by every query -----
-    # Each [1, K] fp32 tile costs its full row of every partition's address space, so
-    # these are not rotated and two of them are reused along the chain: `scores_m`
-    # receives the masked probabilities once the exp has read it, and `p` the
-    # normalised ones once the mask multiply has read it.
-    idx_row = _sbuf_i32(heads, topk)
-    valid_f = _sbuf(heads, topk)
-    mask_bias = _sbuf(heads, topk)
-    scores_m = _sbuf(heads, topk)
-    p = _sbuf(heads, topk)
-    neg_row_max = _scalar(heads)
-    exp_bias = _scalar(heads)
-    row_sum = _scalar(heads)
-    recip = _scalar(heads)
-    out_sb = _sbuf(heads, latent)
-    sentinel_bias = _SENTINEL_EXP_FLOOR / softmax_scale
-
-    n_prgs = nl.num_programs(axes=0)
-    prg_id = nl.program_id(0)
-    for qb in nl.affine_range(prg_id, seq // qpb, n_prgs):
-        q0 = qb * qpb
-        for li in range(n_latent):
-            _transpose_rows(q_stage[li], q_lift_hbm, latent, block, LATENT_TILE,
-                            q0 * heads * latent + li * LATENT_TILE)
-        for qi in range(qpb):
-            q_idx = q0 + qi
-            base = q_idx * topk
-            ws = scratch[qi % QUERY_BUFFERS]
-            c_t = ws[_LP_C_T]
-            c_rows = ws[_LP_C_ROWS]
-            raw = ws[_LP_RAW]
-            safe = ws[_LP_SAFE]
-            idx_u32 = ws[_LP_U32]
-            p_rows = ws[_LP_P_ROWS]
-            p_t = ws[_LP_P_T]
-            p_hi = ws[_LP_P_HI]
-            p_hi_f = ws[_LP_P_HI_F]
-            p_lo = ws[_LP_P_LO]
-
-            # ---- the selected rows, chunk-major on partitions: column c holds chunk c ----
-            # Element (p, c) is column c * 128 + p of the query's row. The sentinel is
-            # clamped onto row 0 so every gathered address is legal; its column is masked
-            # below. The gather-transpose reads the clamp as uint32.
-            nisa.dma_copy(dst=raw[:, 0:n_chunks],
-                          src=topk_hbm.ap(pattern=[[1, KEY_CHUNK], [KEY_CHUNK, n_chunks]],
-                                          offset=base))
-            nisa.tensor_scalar(dst=safe[:, 0:n_chunks], data=raw[:, 0:n_chunks],
-                               op0=nl.maximum, operand0=0)
-            nisa.tensor_copy(dst=idx_u32[:, 0:n_chunks], src=safe[:, 0:n_chunks])
-
-            # ---- the same row on the head partition, as the mask ----------------------
-            # ``index >= 0`` in fp32 (every index is far below 2**24, so the cast is
-            # exact): 1.0 where a token lives, 0.0 at the sentinel; the bias is
-            # ``(valid - 1) * sentinel_bias``, exactly 0.0 or -sentinel_bias.
-            nisa.dma_copy(dst=idx_row, src=topk_hbm.ap(pattern=[[0, heads], [1, topk]],
-                                                       offset=base))
-            nisa.tensor_copy(dst=valid_f, src=idx_row)
-            nisa.tensor_scalar(dst=valid_f, data=valid_f, op0=nl.greater_equal, operand0=0.0)
-            nisa.tensor_scalar(dst=mask_bias, data=valid_f, op0=nl.add, operand0=-1.0)
-            nisa.tensor_scalar(dst=mask_bias, data=mask_bias, op0=nl.multiply,
-                               operand0=sentinel_bias)
-
-            # ---- gather-transpose: the selected rows with the latent on partitions ------
-            # ``dst[l, 0, li, k] = cache[idx[k], li * 128 + l]`` for every selected
-            # column k, read column-major from the chunk-major index tile, which is
-            # exactly the column order of the query's row. The source is viewed as
-            # ``[rows, 1, n_latent, 128]`` so one DMA lands every latent tile.
-            if GATHER_TRANSPOSE_PER_TILE:
-                for ti in range(len(tiles)):
-                    ks = tiles[ti][0]
-                    extent = tiles[ti][1]
-                    c0 = ks // KEY_CHUNK
-                    cn = extent // KEY_CHUNK
-                    nisa.dma_transpose(
-                        dst=c_t[:, :, :, ks:ks + extent],
-                        src=c_kv_hbm.ap(pattern=[[latent, extent], [0, 1],
-                                                 [LATENT_TILE, n_latent], [1, LATENT_TILE]],
-                                        vector_offset=idx_u32[:, c0:c0 + cn], indirect_dim=0),
-                        dge_mode=nisa.dge_mode.swdge)
-            else:
-                nisa.dma_transpose(
-                    dst=c_t,
-                    src=c_kv_hbm.ap(pattern=[[latent, topk], [0, 1],
-                                             [LATENT_TILE, n_latent], [1, LATENT_TILE]],
-                                    vector_offset=idx_u32[:, 0:n_chunks], indirect_dim=0),
-                    dge_mode=nisa.dge_mode.swdge)
-
-            # ---- the plain gathers: the selected rows as stored, keys on partitions -----
-            for ck in range(n_chunks):
-                nisa.dma_copy(dst=c_rows[:, ck, :],
-                              src=c_kv_hbm.ap(pattern=[[latent, KEY_CHUNK], [1, latent]],
-                                              vector_offset=safe[:, ck:ck + 1], indirect_dim=0))
-
-            # ---- MM1 per score tile, evacuated into one masked row ----------------------
-            for ti in range(len(tiles)):
-                ks = tiles[ti][0]
-                extent = tiles[ti][1]
-                scores_ps = _psum(heads, extent)
-                for li in range(n_latent):
-                    nisa.nc_matmul(dst=scores_ps, stationary=q_stage[li][:, qi:qi + 1],
-                                   moving=c_t[:, 0, li, ks:ks + extent], accumulate=(li > 0))
-                nisa.tensor_tensor(dst=scores_m[:, ks:ks + extent], data1=scores_ps,
-                                   data2=mask_bias[:, ks:ks + extent], op=nl.add)
-
-            # ---- softmax over the whole row, normalised before MM2 ----------------------
-            # A wholly-sentinel row exponentiates against its own maximum, so `row_sum` is
-            # at least 1 and the mask multiply makes every probability exactly 0.
-            nisa.tensor_reduce(dst=neg_row_max, op=nl.maximum, data=scores_m, axis=1,
-                               negate=True)
-            nisa.tensor_scalar(dst=exp_bias, data=neg_row_max, op0=nl.multiply,
-                               operand0=softmax_scale, engine=nisa.engine.vector)
-            nisa.activation(dst=p, op=nl.exp, data=scores_m, bias=exp_bias,
-                            scale=softmax_scale, reduce_op=nl.add, reduce_res=row_sum,
-                            reduce_cmd=nisa.reduce_cmd.reset_reduce)
-            nisa.tensor_tensor(dst=scores_m, data1=p, data2=valid_f, op=nl.multiply)
-            nisa.reciprocal(dst=recip, data=row_sum)
-            nisa.tensor_scalar(dst=p, data=scores_m, op0=nl.multiply, operand0=recip,
-                               engine=nisa.engine.vector)
-
-            # ---- p onto the key partitions: re-row by DMA, one transpose, hi/lo split ----
-            nisa.dma_copy(dst=p_rows, src=p)
-            p_t_ps = _psum(KEY_CHUNK, n_chunks)
-            nisa.nc_transpose(dst=p_t_ps, data=p_rows)
-            nisa.tensor_copy(dst=p_t[:, 0:n_chunks], src=p_t_ps)
-            nisa.tensor_copy(dst=p_hi[:, 0:n_chunks], src=p_t[:, 0:n_chunks])
-            nisa.tensor_copy(dst=p_hi_f[:, 0:n_chunks], src=p_hi[:, 0:n_chunks])
-            nisa.tensor_tensor(dst=p_lo[:, 0:n_chunks], data1=p_t[:, 0:n_chunks],
-                               data2=p_hi_f[:, 0:n_chunks], op=nl.subtract)
-
-            # ---- MM2: out[1, L] = p[1, K] @ c[K, L], both halves into one fp32 PSUM -----
-            pv_ps = _psum(heads, latent)
-            for ck in range(n_chunks):
-                nisa.nc_matmul(dst=pv_ps, stationary=p_hi[:, ck:ck + 1],
-                               moving=c_rows[:, ck, :], accumulate=(ck > 0))
-                nisa.nc_matmul(dst=pv_ps, stationary=p_lo[:, ck:ck + 1],
-                               moving=c_rows[:, ck, :], accumulate=True)
-            nisa.tensor_copy(dst=out_sb, src=pv_ps)
-            nl.store(out_hbm.ap(pattern=[[latent, heads], [1, latent]],
-                                offset=q_idx * heads * latent),
-                     value=out_sb)
-
-
 @nki.jit
 def mla_sparse_attention_nope_row_tiled_kernel(q_lift_hbm, c_kv_hbm, topk_hbm,
                                                softmax_scale, block_table_hbm=None,
                                                written_hbm=None, write_offset_hbm=None,
                                                page_size=0, BLOCK_N=MOVING_MAX,
-                                               STREAM_KV=True, PE_LOWP=False,
-                                               QUERY_BUFFERS=QUERY_BUFFERS_DEFAULT,
-                                               source_digest=0):
+                                               STREAM_KV=True):
     """Row-tiled NoPE sparse attention; the paged operands and tile parameters are optional.
 
     The paged operands are declared before the tile parameters so a paged call reaches
-    ``page_size`` positionally without passing a tile parameter. ``PE_LOWP`` and
-    ``QUERY_BUFFERS`` are :func:`_attention_body_row_tiled`'s; ``source_digest`` is
-    :data:`SOURCE_DIGEST` and only keys the kernel cache.
+    ``page_size`` positionally without passing a tile parameter.
     """
     seq, heads, latent = q_lift_hbm.shape
     out_hbm = nl.ndarray((seq, heads, latent), dtype=nl.float32, buffer=nl.shared_hbm)
     window_hbm = _window_of(c_kv_hbm, block_table_hbm, written_hbm, write_offset_hbm,
                             page_size)
-    if PE_LOWP and _lowp_serves(q_lift_hbm, window_hbm, heads, 0, STREAM_KV):
-        _attention_body_row_tiled_lowp(q_lift_hbm, window_hbm, topk_hbm, softmax_scale,
-                                       out_hbm, QUERY_BUFFERS=QUERY_BUFFERS)
-    else:
-        _attention_body_row_tiled(q_lift_hbm, window_hbm, topk_hbm, softmax_scale, out_hbm,
-                                  BLOCK_N=BLOCK_N, STREAM_KV=STREAM_KV, PE_LOWP=False,
-                                  QUERY_BUFFERS=QUERY_BUFFERS)
+    _attention_body_row_tiled(q_lift_hbm, window_hbm, topk_hbm, softmax_scale, out_hbm,
+                              BLOCK_N=BLOCK_N, STREAM_KV=STREAM_KV)
     return out_hbm
 
 
 @nki.jit
 def mla_sparse_attention_rope_row_tiled_kernel(q_lift_hbm, q_pe_hbm, c_kv_hbm, k_pe_hbm,
                                                topk_hbm, softmax_scale,
-                                               BLOCK_N=MOVING_MAX, STREAM_KV=True,
-                                               PE_LOWP=False,
-                                               QUERY_BUFFERS=QUERY_BUFFERS_DEFAULT,
-                                               source_digest=0):
-    """Row-tiled sparse attention with paired RoPE operands and compile-time tile options.
-
-    ``PE_LOWP`` is accepted for a uniform signature; with a RoPE limb the body runs the
-    fp32 arithmetic whatever its value.
-    """
+                                               BLOCK_N=MOVING_MAX, STREAM_KV=True):
+    """Row-tiled sparse attention with paired RoPE operands and compile-time tile options."""
     seq, heads, latent = q_lift_hbm.shape
     out_hbm = nl.ndarray((seq, heads, latent), dtype=nl.float32, buffer=nl.shared_hbm)
     _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
                               q_pe_hbm=q_pe_hbm, k_pe_hbm=k_pe_hbm,
-                              BLOCK_N=BLOCK_N, STREAM_KV=STREAM_KV, PE_LOWP=False,
-                              QUERY_BUFFERS=QUERY_BUFFERS)
+                              BLOCK_N=BLOCK_N, STREAM_KV=STREAM_KV)
     return out_hbm
 
 
@@ -2098,20 +1620,11 @@ def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
     c_kv_in = _kernel_operand(c_kv)
     topk_i32 = topk_indices.contiguous().to(torch.int32)
     nope_call = wrap_nki(nope_entry)
-    # The row-tiled entries take their tile options, the PE precision (the kill switch
-    # :data:`FP32_ENV` restores fp32) and the per-query buffer count before the digest;
-    # the other entries take the digest alone. Spelled out per call rather than expanded
-    # from a sequence: the kernel front end refuses ``*sequence`` in a call it parses, and
-    # a module-wide test keeps every call site to that rule.
-    lowp = _pe_lowp_enabled()
-    buffers = _query_buffers()
     # Only the measured production geometry uses both physical halves. Requiring
     # explicit LNC2 preserves single-PNC launches in LNC1 or unspecified sessions;
     # a single query block keeps its original launch and arithmetic order.
-    # :data:`PROGRAMS_ENV` ``1`` keeps one program, for measurement.
     if (
         os.environ.get("NEURON_LOGICAL_NC_CONFIG") == "2"
-        and os.environ.get(PROGRAMS_ENV) != "1"
         and rows_tiled
         and rope == 0
         and heads == 1
@@ -2125,35 +1638,21 @@ def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
         overlaid = written is not None and int(written.shape[0]) > 0
         rows = _kernel_operand(written) if overlaid else None
         at = write_offset.contiguous().to(torch.int32) if overlaid else None
-        table = block_table_row.contiguous().to(torch.int32)
-        if rows_tiled:
-            return nope_call(
-                q_lift_in, c_kv_in, topk_i32, float(softmax_scale), table, rows, at,
-                int(page_size), MOVING_MAX, True, lowp, buffers, SOURCE_DIGEST
-            )
         return nope_call(
-            q_lift_in, c_kv_in, topk_i32, float(softmax_scale), table, rows, at,
-            int(page_size), SOURCE_DIGEST
+            q_lift_in, c_kv_in, topk_i32, float(softmax_scale),
+            block_table_row.contiguous().to(torch.int32), rows, at, int(page_size)
         )
     if rope == 0:
-        if rows_tiled:
-            return nope_call(
-                q_lift_in, c_kv_in, topk_i32, float(softmax_scale), None, None, None, 0,
-                MOVING_MAX, True, lowp, buffers, SOURCE_DIGEST
-            )
         return nope_call(
-            q_lift_in, c_kv_in, topk_i32, float(softmax_scale), None, None, None, 0,
-            SOURCE_DIGEST
+            q_lift_in, c_kv_in, topk_i32, float(softmax_scale)
         )
-    rope_call = wrap_nki(rope_entry)
-    if rows_tiled:
-        return rope_call(
-            q_lift_in, _kernel_operand(q_pe), c_kv_in, _kernel_operand(k_pe), topk_i32,
-            float(softmax_scale), MOVING_MAX, True, lowp, buffers, SOURCE_DIGEST
-        )
-    return rope_call(
-        q_lift_in, _kernel_operand(q_pe), c_kv_in, _kernel_operand(k_pe), topk_i32,
-        float(softmax_scale), SOURCE_DIGEST
+    return wrap_nki(rope_entry)(
+        q_lift_in,
+        _kernel_operand(q_pe),
+        c_kv_in,
+        _kernel_operand(k_pe),
+        topk_i32,
+        float(softmax_scale),
     )
 
 
