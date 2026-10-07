@@ -971,6 +971,15 @@ class Glm5NextHyperConnection(nn.Module):
 
         tokens, streams, hidden = self._require_streams(residual)
 
+        from vllm_neuron.functional.glue import mhc_pre as glue_mhc_pre
+
+        if glue_mhc_pre.mhc_pre_admits(residual, self.fn, self.hc_scale, self.hc_base):
+            post_mix, comb_start, layer_input = glue_mhc_pre.mhc_pre_fused(
+                residual, self.fn, self.hc_scale, self.hc_base, rms_eps=self.rms_eps,
+                hc_eps=self.hc_eps, post_mult=self.post_mult_value)
+            comb_mix = sinkhorn_normalise_blocks(comb_start, iters=self.sinkhorn_iters)
+            return post_mix, comb_mix, layer_input
+
         flat = residual.reshape(tokens, streams * hidden).to(torch.float32)
         mixes = flat @ self.fn.to(torch.float32).t()
         # The RMS scale. Both upstream spellings divide the squared sum by the
@@ -1068,12 +1077,16 @@ class Glm5NextHyperConnection(nn.Module):
             hyper_connection_combine,
         )
 
+        from vllm_neuron.functional.glue import glue_fused_enabled
+
         # Argument names and order are the kernel's, which are the base's, so this
-        # is a call rather than a translation. The kernel takes fp32 and computes
-        # in fp32; only the return is cast back to the carrier's dtype.
+        # is a call rather than a translation. The kernel computes in fp32 and takes
+        # bf16 ``x`` and streams as they are (functional/glue); with the glue switch
+        # off they are widened first, as at 0a08ff4. Same values either way.
+        wide = not glue_fused_enabled()
         mixed = hyper_connection_combine(
-            x=x.to(torch.float32),
-            residual=residual.to(torch.float32),
+            x=x.to(torch.float32) if wide else x,
+            residual=residual.to(torch.float32) if wide else residual,
             post_layer_mix=post_layer_mix.to(torch.float32),
             comb_res_mix=comb_res_mix.to(torch.float32),
         )
@@ -3419,24 +3432,12 @@ class Glm5NextKDAAttention(nn.Module):
                 f"for each row of hidden_states"
             )
 
-        x = hidden_states.to(torch.float32)
+        from vllm_neuron.functional.glue.kda_projections import kda_projections
 
-        def project(weight: torch.Tensor) -> torch.Tensor:
-            return x @ weight.to(torch.float32).t()
-
-        q_in = project(self.q_proj_weight)
-        k_in = project(self.k_proj_weight)
-        v_in = project(self.v_proj_weight)
-        raw_beta = project(self.b_proj_weight)
-        # Both gates are low-rank: a bottleneck projection, then an expansion
-        # back to the head width. The bottleneck width is read from the weights
-        # rather than from the config, because the config declares no such field.
-        raw_gate = (x @ self.f_a_proj_weight.to(torch.float32).t()) @ (
-            self.f_b_proj_weight.to(torch.float32).t()
-        )
-        out_gate = (x @ self.g_a_proj_weight.to(torch.float32).t()) @ (
-            self.g_b_proj_weight.to(torch.float32).t()
-        )
+        # The six input projections (both gates low-rank: a bottleneck, then an
+        # expansion), on the fused kernel or 0a08ff4's torch expressions.
+        q_in, k_in, v_in, raw_gate, raw_beta, out_gate = kda_projections(
+            hidden_states, self)
 
         # A sequence that has computed nothing enters with a zero state, and this is
         # the one predicate that says so. A sequence at position 0 carries no
@@ -3696,23 +3697,16 @@ class Glm5NextKDAAttention(nn.Module):
                     for one in start_position
                 ]
             )
-        x = hidden_states.to(torch.float32)
+        from vllm_neuron.functional.glue.kda_projections import kda_projections
 
-        def project(weight: torch.Tensor) -> torch.Tensor:
-            return x @ weight.to(torch.float32).t()
-
-        raw_gate = (x @ self.f_a_proj_weight.to(torch.float32).t()) @ (
-            self.f_b_proj_weight.to(torch.float32).t()
-        )
-        out_gate = (x @ self.g_a_proj_weight.to(torch.float32).t()) @ (
-            self.g_b_proj_weight.to(torch.float32).t()
-        )
+        q_in, k_in, v_in, raw_gate, raw_beta, out_gate = kda_projections(
+            hidden_states, self)
         fused = kda_fused_decode(
-            project(self.q_proj_weight),
-            project(self.k_proj_weight),
-            project(self.v_proj_weight),
+            q_in,
+            k_in,
+            v_in,
             raw_gate,
-            project(self.b_proj_weight),
+            raw_beta,
             conv_state=torch.stack(convs),
             recurrent_state=torch.stack(recurrents),
             q_conv1d_weight=self.q_conv1d_weight,
@@ -3735,26 +3729,16 @@ class Glm5NextKDAAttention(nn.Module):
         self, core: torch.Tensor, out_gate: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
         """The attention output from ``core`` (``[tokens, H*K]`` float32)."""
-        tokens = int(core.shape[0])
-        heads = int(self.num_kv_heads_per_rank)
-        kdim = int(self.head_dim)
-        width = heads * kdim
+        from vllm_neuron.functional.glue.kda_output import kda_gated_projection
+
         # --- gated output norm, then the output projection -------------------
         # ``rmsnorm(core) * sigmoid(out_gate)``, normalised over the head extent
         # because the norm gain is one value per key channel. The reference
         # builds this half as a gated RMSNorm whose activation is sigmoid
         # (``kimi_gdn_linear_attn.py``), which is why the raw gate is passed
-        # through a sigmoid here and not through a silu.
-        shaped = core.reshape(tokens, heads, kdim)
-        variance = shaped.pow(2).mean(dim=-1, keepdim=True)
-        shaped = shaped * torch.rsqrt(variance + self.rms_norm_eps)
-        shaped = shaped * self.o_norm_weight.to(torch.float32).reshape(1, 1, kdim)
-        shaped = shaped * torch.sigmoid(
-            out_gate.reshape(tokens, heads, kdim)
-        )
-        attn_out = shaped.reshape(tokens, width) @ (
-            self.o_proj_weight.to(torch.float32).t()
-        )
+        # through a sigmoid here and not through a silu. On the fused kernel or
+        # 0a08ff4's torch expressions (functional/glue/kda_output.py).
+        attn_out = kda_gated_projection(core, out_gate, self)
         # ``o_proj_weight`` is row-parallel, so this is one rank's partial sum.
         # Reduce it in fp32, before the cast below: partials add at the width they
         # were computed in, and reducing after the cast would round each rank's
