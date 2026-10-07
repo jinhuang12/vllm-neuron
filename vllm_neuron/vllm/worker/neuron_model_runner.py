@@ -9,6 +9,7 @@ state management.
 
 import logging
 import math
+import json
 import os
 import threading
 import time
@@ -492,6 +493,129 @@ def build_sampling_params_tensor(
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug("On-device sampling params (top_k, top_p, temp): %s", result.tolist())
     return result
+
+
+class Glm5NextShadowDraftScorer:
+    """Score shadow drafts against the tokens the trunk samples at the following steps.
+
+    MTP stage A for GLM-5.3-Flash runs the layer-45 draft beside the decode graph and
+    never uses its output. This class keeps, per request, the sampled tokens in step
+    order and the draft records still waiting for ground truth, and hands each record
+    to ``sink`` once it is scored.
+
+    Alignment: a decode step at position ``s`` consumed ``x_s`` and sampled ``x_{s+1}``;
+    the ``k`` drafts it emits predict ``x_{s+2} .. x_{s+k+1}``, the tokens sampled at
+    the next ``k`` steps. Draft ``d_j`` is accepted iff ``d_1 .. d_{j-1}`` were accepted
+    and ``d_j`` equals the token sampled ``j`` steps later. A record emitted at the
+    prefill step (``sampled`` = ``x_T``) is scored the same way against ``x_{T+1} ..``.
+
+    A record is complete when ``k`` later tokens arrived. A request that retires
+    earlier (finished, preempted, its batch row handed to another request) has its
+    pending records scored over the tokens that did arrive: ``scored`` is that count and
+    ``accepted_prefix_len`` never exceeds it, so a reader can separate "rejected" from
+    "unscored". The record is a plain dict::
+
+        {"req_id", "step", "position", "row", "drafts", "actual", "scored",
+         "accepted_prefix_len"}
+
+    Requests are keyed by the engine's request id, not by batch row, so a row reused by a
+    new request never scores the old request's drafts against the new one's tokens.
+    """
+
+    def __init__(self, k: int, sink) -> None:
+        self.k = int(k)
+        if self.k < 1:
+            raise ValueError(f"a shadow-draft scorer needs k >= 1 drafts per step, got {k!r}")
+        self._sink = sink
+        self._history: dict[str, list[int]] = {}
+        self._pending: dict[str, list[dict]] = {}
+
+    @property
+    def tracked(self) -> set[str]:
+        """The request ids with a history (every observed, not yet retired request)."""
+        return set(self._history)
+
+    def observe(
+        self,
+        req_id: str,
+        *,
+        step: int,
+        position: int,
+        sampled: int,
+        drafts=None,
+        row: int | None = None,
+    ) -> None:
+        """Record one step of ``req_id``: the token it sampled and the drafts it emitted.
+
+        ``drafts`` is ``None`` for a step that drafted nothing (a prefill chunk).
+        """
+        history = self._history.setdefault(req_id, [])
+        pending = self._pending.setdefault(req_id, [])
+        history.append(int(sampled))
+        if drafts is not None:
+            pending.append(
+                {
+                    "req_id": req_id,
+                    "step": int(step),
+                    "position": int(position),
+                    "row": row,
+                    "drafts": [int(value) for value in drafts],
+                    # The first token this record is scored against is the one sampled
+                    # at the next step, which lands at this index of the history.
+                    "start": len(history),
+                }
+            )
+        self._flush(req_id, final=False)
+
+    def retire(self, req_id: str) -> None:
+        """The request is gone: score what arrived, mark the rest unscored, forget it."""
+        if req_id not in self._history:
+            return
+        self._flush(req_id, final=True)
+        del self._history[req_id]
+        del self._pending[req_id]
+
+    def retire_absent(self, present) -> None:
+        """Retire every tracked request that is not in ``present`` (this step's batch)."""
+        keep = set(present)
+        for req_id in list(self._history):
+            if req_id not in keep:
+                self.retire(req_id)
+
+    def close(self) -> None:
+        """Retire every request (shutdown)."""
+        for req_id in list(self._history):
+            self.retire(req_id)
+
+    def _flush(self, req_id: str, *, final: bool) -> None:
+        history = self._history[req_id]
+        pending = self._pending[req_id]
+        keep: list[dict] = []
+        for record in pending:
+            available = len(history) - record["start"]
+            if available < self.k and not final:
+                keep.append(record)
+                continue
+            scored = min(self.k, max(available, 0))
+            actual = history[record["start"] : record["start"] + scored]
+            accepted = 0
+            for draft, truth in zip(record["drafts"], actual):
+                if draft != truth:
+                    break
+                accepted += 1
+            out = {key: value for key, value in record.items() if key != "start"}
+            out["actual"] = list(actual)
+            out["scored"] = scored
+            out["accepted_prefix_len"] = accepted
+            self._sink(out)
+        # Keep the history bounded: tokens older than every pending record's start are
+        # never read again.
+        cut = min((record["start"] for record in keep), default=len(history))
+        if cut > 0:
+            del history[:cut]
+            for record in keep:
+                record["start"] -= cut
+        self._pending[req_id] = keep
 
 
 # TODO: Inherit from LoRAModelRunnerMixin to support LoRA
@@ -11350,3 +11474,207 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
     def ensure_kv_transfer_shutdown(self) -> None:
         pass
+
+    # ------------------------------------------------------------------------
+    # GLM-5.3-Flash shadow draft (MTP stage A): bookkeeping, scoring, log.
+    #
+    # With ``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT=k`` the root returns ``k`` draft ids per
+    # request beside the sampled ids and never uses them. This block hands the prefill
+    # leg the id its last row pairs with (``shadow_boundary_ids``), peels the draft ids
+    # off the graph output, and scores them one step late against the tokens the trunk
+    # samples next (``Glm5NextShadowDraftScorer``), writing one JSONL record per draft
+    # step to ``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG`` on rank 0.
+    # ------------------------------------------------------------------------
+
+    def _glm5next_shadow_k(self) -> int:
+        """The shadow-draft knob ``k`` (0 = off), read through the head's own reader."""
+        from vllm_neuron.model.glm5_next import mtp as mtp_module
+
+        reader = getattr(mtp_module, "shadow_draft_k", None)
+        if reader is not None:
+            return int(reader())
+        # Stub until the head's reader lands (stage A contract C1); same knob.
+        raw = os.environ.get("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT", "")
+        return int(raw) if raw.strip() else 0
+
+    def _glm5next_shadow_log_path(self) -> str:
+        return str(getattr(envs, "VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG", "") or "")
+
+    def _glm5next_shadow_rank(self) -> int:
+        cached = getattr(self, "_glm5next_shadow_rank_cache", None)
+        if cached is None:
+            tensor = getattr(self, "rank_tensor", None)
+            cached = 0 if tensor is None else int(tensor.item())
+            self._glm5next_shadow_rank_cache = cached
+        return cached
+
+    def _glm5next_shadow_active(self) -> bool:
+        """Scoring runs on rank 0 only, when the knob is on and a log path is set.
+
+        Every rank samples the same ids and drafts (the draft ids are global, gathered
+        on device), so one log is the whole measurement; no log path means nothing to
+        measure and the per-step host work is skipped.
+        """
+        return (
+            self._glm5next_shadow_k() > 0
+            and bool(self._glm5next_shadow_log_path())
+            and self._glm5next_shadow_rank() == 0
+        )
+
+    def _glm5next_shadow_kwargs(
+        self,
+        *,
+        is_prefill: bool,
+        request_ids,
+        request_starts,
+        request_tokens,
+        synthetic: bool,
+        device,
+    ) -> dict:
+        """The root keyword the shadow draft needs this step, and the step's bookkeeping.
+
+        The prefill leg populates layer 45 at every row of the chunk with the id that
+        row's draft consumes: the next prompt token, which the graph has for every row
+        but the last. The last row's id is handed in as ``shadow_boundary_ids``, one per
+        request: the first token of the next chunk when more of the prompt follows, or
+        ``-1`` when this chunk is the prompt's last, in which case the graph substitutes
+        the token it samples. The decode leg needs nothing: the sampled token is in the
+        graph. The step's request ids, leg and positions are stashed for the output
+        side (``_glm5next_shadow_observe``); a synthetic step (warmup, capture, the idle
+        dummy step) stashes nothing. Returns ``{}`` with the knob off, so the traced
+        signature is unchanged.
+        """
+        self._glm5next_shadow_step = None
+        if self._glm5next_shadow_k() <= 0:
+            return {}
+        starts = [int(value) for value in request_starts]
+        counts = [int(value) for value in request_tokens]
+        requests = getattr(self, "requests", None) or {}
+        finals: list[bool] = []
+        boundaries: list[int] = []
+        for req_id, start, count in zip(request_ids, starts, counts):
+            end = start + count
+            state = None if synthetic or req_id is None else requests.get(req_id)
+            prompt_len = (
+                int(getattr(state, "num_prompt_tokens", 0)) if state is not None else 0
+            )
+            if state is not None and end < prompt_len:
+                finals.append(False)
+                boundaries.append(int(state.prompt_token_ids[end]))
+            else:
+                finals.append(True)
+                boundaries.append(-1)
+        if not synthetic:
+            self._glm5next_shadow_step = {
+                "request_ids": list(request_ids),
+                "is_prefill": bool(is_prefill),
+                "finals": finals,
+                # The trunk's last consumed position this step: the row the drafts
+                # (decode) or the final populate (prefill) stand on.
+                "positions": [start + count - 1 for start, count in zip(starts, counts)],
+            }
+        if not is_prefill:
+            return {}
+        return {
+            "shadow_boundary_ids": torch.tensor(boundaries, dtype=torch.int32).to(device)
+        }
+
+    def _glm5next_shadow_take_output(self, model_output):
+        """Peel the draft ids off a shadow-drafting root's output and hold them.
+
+        With the knob on the root returns ``(sampled_or_logits, draft_ids, *streams)``;
+        every consumer downstream expects the shape it returned before, so the drafts
+        come off here, before the layer-stream dump and the sampling unpack.
+        """
+        self._glm5next_shadow_last_drafts = None
+        if (
+            self._glm5next_shadow_k() <= 0
+            or not isinstance(model_output, tuple)
+            or len(model_output) < 2
+        ):
+            return model_output
+        primary, drafts, *rest = model_output
+        self._glm5next_shadow_last_drafts = drafts
+        return primary if not rest else (primary, *rest)
+
+    def _glm5next_shadow_scorer(self) -> Glm5NextShadowDraftScorer:
+        scorer = getattr(self, "_glm5next_shadow_scorer_instance", None)
+        if scorer is None:
+            path = self._glm5next_shadow_log_path()
+            handle = open(path, "a", encoding="utf-8")  # noqa: SIM115 (lives with the runner)
+            self._glm5next_shadow_log_handle = handle
+
+            def sink(record: dict) -> None:
+                handle.write(json.dumps(record) + "\n")
+                handle.flush()
+
+            scorer = Glm5NextShadowDraftScorer(self._glm5next_shadow_k(), sink)
+            self._glm5next_shadow_scorer_instance = scorer
+            self._glm5next_shadow_step_no = 0
+        return scorer
+
+    def _glm5next_shadow_observe(self, sampled, drafts, *, is_prefill: bool) -> None:
+        """Queue this step's sampled ids and drafts; resolve the previous step's.
+
+        Under async scheduling the sampled ids are still a device future when the step
+        returns, and reading them back here would block the host on the step it just
+        dispatched. So each step's tensors are queued and resolved when the NEXT step is
+        observed, by which time the device has finished them; the scorer itself only
+        sees ordered observations. Request completion is read from the batch: a
+        tracked request absent from this step's batch has left (finished or
+        preempted), and its pending drafts are scored over the tokens that arrived.
+        """
+        step = getattr(self, "_glm5next_shadow_step", None)
+        self._glm5next_shadow_step = None
+        pending = self.__dict__.setdefault("_glm5next_shadow_pending", [])
+        if not self._glm5next_shadow_active():
+            return
+        scorer = self._glm5next_shadow_scorer()
+        real_step = step is not None and len(step["request_ids"]) > 0 and sampled is not None
+        if real_step:
+            step_no = self._glm5next_shadow_step_no
+            self._glm5next_shadow_step_no = step_no + 1
+            pending.append((step_no, step, sampled, drafts))
+            present = set(req_id for req_id in step["request_ids"] if req_id is not None)
+        else:
+            present = set()
+        # Resolve every queued step but the newest, which may still be in flight.
+        while len(pending) > (1 if real_step else 0):
+            self._glm5next_shadow_resolve(pending.pop(0), scorer)
+        scorer.retire_absent(present)
+
+    def _glm5next_shadow_resolve(self, entry, scorer: Glm5NextShadowDraftScorer) -> None:
+        step_no, step, sampled, drafts = entry
+        if torch.is_tensor(sampled) and sampled.is_floating_point():
+            if not getattr(self, "_glm5next_shadow_warned_logits", False):
+                self._glm5next_shadow_warned_logits = True
+                logger.warning(
+                    "shadow draft: the graph returned logits, not sampled ids; scoring "
+                    "needs on-device sampling (VLLM_NEURON_GLM5NEXT_ON_DEVICE_SAMPLING=1) "
+                    "and is skipped"
+                )
+            return
+        ids = sampled.cpu().reshape(-1).tolist() if torch.is_tensor(sampled) else list(sampled)
+        rows = None
+        if drafts is not None:
+            draft_tensor = drafts.cpu() if torch.is_tensor(drafts) else torch.as_tensor(drafts)
+            rows = draft_tensor.reshape(draft_tensor.shape[0], -1).tolist()
+        for row, (req_id, final, position) in enumerate(
+            zip(step["request_ids"], step["finals"], step["positions"])
+        ):
+            if req_id is None or row >= len(ids):
+                continue
+            if step["is_prefill"] and not final:
+                # An intermediate chunk's sampled id is not a token of the sequence.
+                continue
+            candidate = None
+            if rows is not None and row < len(rows) and any(value >= 0 for value in rows[row]):
+                candidate = rows[row]
+            scorer.observe(
+                req_id,
+                step=step_no,
+                position=position,
+                sampled=ids[row],
+                drafts=candidate,
+                row=row,
+            )

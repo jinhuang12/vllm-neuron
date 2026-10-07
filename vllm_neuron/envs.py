@@ -76,6 +76,9 @@ if TYPE_CHECKING:
     # Build the GLM-5.3-Flash step's attention metadata on the host only: no per-step
     # block-table / slot-mapping uploads that its graph never reads.
     VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA: bool = False
+    # Where the GLM-5.3-Flash shadow draft (MTP stage A) writes its per-step scoring
+    # records (JSONL, rank 0). Empty = no log, no scoring.
+    VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG: str = ""
 
 
 def maybe_convert_bool(value: str | None) -> bool | None:
@@ -344,6 +347,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA"))
         or False
+    ),
+    # JSONL path for the GLM-5.3-Flash shadow-draft scoring records (MTP stage A);
+    # empty = no log. Read with VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT (the draft count).
+    "VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG": lambda: (
+        os.getenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG", "") or ""
     ),
 }
 
