@@ -128,11 +128,6 @@ MTP_PARAMETER_NAMES: tuple[str, ...] = (
 #: no meaning for a position the draft advances one at a time.
 _PREFILL_LEG_KEYWORDS = ("slot_mapping", "prefill_tail", "prefill_end_position")
 
-#: The key the attention half fills on the first iteration and reads on the later
-#: ones when ``index_share_for_mtp_iteration`` applies (``Glm5NextMLAAttention``'s
-#: ``index_share`` carrier).
-_SHARED_INDICES_KEY = "topk_indices"
-
 
 def shadow_draft_k() -> int:
     """The shadow draft's iteration count ``k``; 0 means off.
@@ -420,19 +415,22 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         carrier["tail"] = scratch_ring
         return carrier
 
-    def _index_share(self, k: int) -> dict | None:
+    def _index_share(self, k: int):
         """The ``index_share`` carrier for a ``k``-iteration draft, or ``None``.
 
         ``index_share_for_mtp_iteration`` (config.py) is upstream's ``skip_topk``:
         iteration 0 computes the indexer's selection and iterations ``1 .. k - 1``
-        reuse it. The carrier is an empty mapping the attention half fills on the
-        first selecting iteration and reads on the later ones; in the bypass regime
-        (selection is a no-op) nothing is ever stored, so every iteration runs the
-        indexer's write stage as it must, and the flag changes nothing there. At
-        ``k == 1`` there is nothing to share.
+        reuse it. The carrier is a fresh ``model_fp8.IndexShare`` the attention half
+        fills on the first selecting iteration and reads on the later ones; in the
+        bypass regime (selection is a no-op) nothing is ever stored, so every
+        iteration runs the indexer's write stage as it must, and the flag changes
+        nothing there. At ``k == 1`` there is nothing to share. Imported here, not
+        at module level, to keep the head importable without the model tree.
         """
         if int(k) > 1 and bool(self.text_config.index_share_for_mtp_iteration):
-            return {}
+            from .model_fp8 import IndexShare
+
+            return IndexShare()
         return None
 
     # ── the two entry points (contract C3) ───────────────────────────────

@@ -974,6 +974,48 @@ def test_index_share_skips_the_indexer_only_when_set_and_selecting(regime, flag,
         )
 
 
+def test_index_share_carrier_publishes_the_chain_s_selection_and_reuses_it() -> None:
+    """No carrier and an empty carrier run the same chain and attend byte-identically;
+    the carrier then holds the indices the chain produced; a carrier handed those
+    indices skips the chain and attends the same way, and a different selection does
+    not (the reuse path consumes the carrier)."""
+    _skip_unless_live()
+    from vllm_neuron.model.glm5_next.model_fp8 import IndexShare
+
+    def one_step(fx, **extra):
+        p = fx["prefill"]
+        head = fx["head"]
+        x = head._layer_input(fx["ids"][p + 1:p + 2], fx["hidden"][p:p + 1],
+                              torch.tensor([p], dtype=torch.int32))
+        return head.block(x, **_decode_kwargs(fx["caches"]["impl"], p), **extra)
+
+    # Four identical fixtures, built before any counter is read: populating one
+    # dispatches the prefill leg's own kernels.
+    fixtures = [_fixture(64_201) for _ in range(4)]
+    collected: list = []
+    plain = one_step(fixtures[0], collector=collected)
+    carrier = IndexShare()
+    reset_all_counters()
+    shared = one_step(fixtures[1], index_share=carrier)
+    assert read_all_counters()["topk_select"][0] == 1, "an empty carrier runs the chain"
+    assert torch.equal(plain, shared), "no carrier and an empty carrier are byte-identical"
+    indices = carrier.topk_indices
+    assert indices is not None and indices.dtype == torch.int32 and indices.ndim == 2
+    assert int(indices.shape[0]) == 1, "one row per request"
+    assert any(
+        torch.is_tensor(c) and c.dtype == indices.dtype and c.shape == indices.shape and torch.equal(c, indices)
+        for c in collected
+    ), "the stored indices are the ones the chain produced (the block's collector saw them)"
+    reset_all_counters()
+    reused = one_step(fixtures[2], index_share=IndexShare(topk_indices=indices.clone()))
+    assert read_all_counters()["topk_select"][0] == 0, "a filled carrier skips the chain"
+    assert torch.equal(reused, plain), "and attends the first iteration's selection"
+    wrong = indices.clone()
+    wrong[0, 0] = -1
+    moved = one_step(fixtures[3], index_share=IndexShare(topk_indices=wrong))
+    assert not torch.equal(moved, plain), "a different selection moves the attention"
+
+
 # --------------------------------------------------------------------------- #
 # the route predicate over a draft, and the control that moves the fallback counter.
 

@@ -5646,6 +5646,31 @@ class Glm5NextMLADecodeError(ValueError):
     """
 
 
+@dataclass
+class IndexShare:
+    """One speculative step's indexer selection, shared across its draft iterations.
+
+    The carrier for ``index_share_for_mtp_iteration`` (config.py; upstream's
+    ``skip_topk``). The draft head (``mtp.py``) hands one instance to every
+    iteration of one ``draft_tokens`` call; the trunk's own decode step passes none.
+
+    * ``topk_indices is None`` -- run the indexer chain (ring step, pooled-store
+      write, scores, selection) and, when the step selects, publish the result here;
+    * ``topk_indices`` set -- reuse it and skip the chain whole: no ring step, no
+      pooled-store write, no scores.
+
+    ``topk_indices`` is what :meth:`Glm5NextDSAIndexer.forward_requests` returns for
+    a selecting step: ``[B, width]`` int32 row indices into the request's latent
+    window (``-1`` = masked), one row per request, on the step's device. A step
+    whose selection is a no-op (the bypass regime,
+    ``decode_bypass.selection_is_a_no_op``) returns ``None`` and stores nothing, so
+    every iteration of such a step runs the write stage and the carrier changes
+    nothing there.
+    """
+
+    topk_indices: torch.Tensor | None = None
+
+
 class Glm5NextMLAAttention(nn.Module):
     """Multi-head latent attention at ``self_attn``, NoPE on this checkpoint.
 
@@ -6778,6 +6803,7 @@ class Glm5NextMLAAttention(nn.Module):
         position: torch.Tensor,
         collector: list[torch.Tensor] | None,
         state_slots: torch.Tensor | None = None,
+        index_share: IndexShare | None = None,
     ) -> torch.Tensor:
         """:meth:`forward` for a decode step of ``len(tail)`` requests, one row each.
 
@@ -6792,6 +6818,23 @@ class Glm5NextMLAAttention(nn.Module):
         every request in one batched call. A one-request decode step is the
         ``batch = 1`` case of this method (see :meth:`forward`); there :meth:`attend`
         serves ``batch_size`` 1 with its one-request attention.
+
+        ``index_share`` is the draft head's :class:`IndexShare` carrier for
+        ``index_share_for_mtp_iteration`` (config.py; upstream's ``skip_topk``).
+        Two regimes:
+
+        * selecting (the window is wider than the candidate axis): the first
+          iteration of one speculative step runs the chain and stores its
+          ``topk_indices`` on the carrier; every later iteration of that step reads
+          them and skips the whole chain -- no ring step, no pooled-store write, no
+          scores -- attending the first iteration's selection plus its own row,
+          which :meth:`attend` stands in at the position;
+        * bypass (the selection is a no-op): the chain returns ``None``, nothing is
+          stored, and every iteration runs the write stage; the carrier changes
+          nothing.
+
+        ``None`` is the trunk's own decode step; it is byte-identical to a carrier
+        with nothing stored, as both run the chain.
         """
         from vllm_neuron.functional.dsa.decode_bypass import (
             selection_bound,
@@ -6834,24 +6877,34 @@ class Glm5NextMLAAttention(nn.Module):
         dense = selection_is_a_no_op(
             bound, self.indexer.index_topk, self.indexer.index_kpool
         )
-        q_latent = self.project_query_latent(normed_hidden_states)
-        projected = self.indexer.project_stage(
-            normed_hidden_states, q_latent, query_side=not dense
-        )
-        # Every request's ring step, write and selection in one indexer pass: one
-        # launch per stage for the whole batch, each request on its own views.
-        topk_indices = self.indexer.forward_requests(
-            normed_hidden_states,
-            q_latent,
-            stores,
-            rings,
-            state_slots,
-            seq_lens,
-            position,
-            max_seq_len=bound if dense else int(max_seq_len),
-            indices_wanted=not dense,
-            projected=projected,
-        )
+        shared = None if index_share is None else index_share.topk_indices
+        if shared is not None:
+            # A later draft iteration of the same speculative step: the selection is
+            # the first iteration's, and the indexer chain is skipped whole.
+            topk_indices = shared
+        else:
+            q_latent = self.project_query_latent(normed_hidden_states)
+            projected = self.indexer.project_stage(
+                normed_hidden_states, q_latent, query_side=not dense
+            )
+            # Every request's ring step, write and selection in one indexer pass: one
+            # launch per stage for the whole batch, each request on its own views.
+            topk_indices = self.indexer.forward_requests(
+                normed_hidden_states,
+                q_latent,
+                stores,
+                rings,
+                state_slots,
+                seq_lens,
+                position,
+                max_seq_len=bound if dense else int(max_seq_len),
+                indices_wanted=not dense,
+                projected=projected,
+            )
+            if index_share is not None and topk_indices is not None:
+                # Only a selecting step has indices to share; the bypass regime's
+                # None is never stored, so its later iterations keep writing.
+                index_share.topk_indices = topk_indices
         if collector is not None:
             collector.append(
                 (self.indexer._bypass_indices(seq_lens) if dense else topk_indices)[:5]
@@ -6891,6 +6944,7 @@ class Glm5NextMLAAttention(nn.Module):
         collector: list[torch.Tensor] | None = None,
         active_mla_query_rows: int | None = None,
         state_slots: torch.Tensor | None = None,
+        index_share: IndexShare | None = None,
     ) -> torch.Tensor:
         """This module's whole contribution to one layer: select, then attend.
 
@@ -6970,6 +7024,7 @@ class Glm5NextMLAAttention(nn.Module):
                 position=position,
                 collector=collector,
                 state_slots=state_slots,
+                index_share=index_share,
             )
 
         if (
@@ -7003,6 +7058,13 @@ class Glm5NextMLAAttention(nn.Module):
                 tail=(tail,),
                 position=_int64_scalar(position, device).reshape(1),
                 collector=collector,
+                index_share=index_share,
+            )
+        if index_share is not None:
+            raise Glm5NextMLADecodeError(
+                "index_share carries one speculative step's selection across its draft "
+                "iterations, which is a decode step of 2-byte rows; this call is a "
+                "prefill chunk or a float32 step and has no selection to share"
             )
 
         # The decode step whose selection is a no-op attends the causal prefix
@@ -7148,6 +7210,7 @@ class Glm5NextDSALayer(nn.Module):
         collector: list[torch.Tensor] | None = None,
         active_mla_query_rows: int | None = None,
         state_slots: torch.Tensor | None = None,
+        index_share: IndexShare | None = None,
     ) -> torch.Tensor:
         """The sparse-attention half, mixed either by mHC or by a plain add.
 
@@ -7219,6 +7282,7 @@ class Glm5NextDSALayer(nn.Module):
                     if active_mla_query_rows is not None else {}
                 ),
                 **({"state_slots": state_slots} if state_slots is not None else {}),
+                **({"index_share": index_share} if index_share is not None else {}),
             )
             if collector is not None:
                 collector.append(attended)
