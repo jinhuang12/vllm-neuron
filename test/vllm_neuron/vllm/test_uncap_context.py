@@ -49,8 +49,11 @@ LONG_LINES = (65536, 262144)
 
 
 def _long_line(max_model_len: int) -> dict:
-    """A long line: bs=1, chunk ``CHUNK``, one segment of ``max_model_len``. The served
-    lines of reports/uncap.md have the same form, at chunk 2048 and 512."""
+    """A long line: bs=1, chunk ``CHUNK``, one segment of ``max_model_len``.
+
+    The GLM-5.3-Flash long-context lines were served at TP 64 in this form: max_model_len
+    65,536 at chunk 2048, and max_model_len 262,144 at chunk 512. Each had one KV segment
+    and a mamba block size of max_model_len."""
     return dict(
         max_model_len=max_model_len,
         max_num_seqs=1,
