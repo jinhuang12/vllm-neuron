@@ -93,6 +93,10 @@ if TYPE_CHECKING:
     VLLM_NEURON_TP_ALLREDUCE_DTYPE: str = "fp32"
     # Keep every all-reduce one collective instead of the compiler's 8 MiB tiles.
     VLLM_NEURON_TP_ALLREDUCE_FUSE: bool = False
+    # GLM-5.3-Flash DSA prefill: a chunk whose top-k selection provably keeps every
+    # token attends its latent window densely (mla_dense_window.py) instead of
+    # selecting and gathering. On by default; 0 restores the sparse path.
+    VLLM_NEURON_MLA_DENSE_WINDOW: bool = True
 
 
 def maybe_convert_bool(value: str | None) -> bool | None:
@@ -409,6 +413,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # four. Read by ``collective_policy.fuse_compiler_args``. Off by default.
     "VLLM_NEURON_TP_ALLREDUCE_FUSE": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_TP_ALLREDUCE_FUSE")) or False
+    ),
+    # ================== GLM-5.3-Flash DSA Prefill ==================
+    # Attend a prefill chunk densely over its latent window when the bound its graph
+    # can prove, min(max_model_len, window rows), is within the DSA identity bound
+    # (index_topk + index_kpool - 1 tokens): the top-k then keeps every token, so the
+    # indexer's query side, scoring, top-k and the sparse gathers are skipped. Read at
+    # trace time by ``model/glm5_next/dsa_dense_window.py``; a change needs a new
+    # compile. On by default; set 0 to restore the sparse path.
+    "VLLM_NEURON_MLA_DENSE_WINDOW": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_MLA_DENSE_WINDOW")) is not False
     ),
 }
 

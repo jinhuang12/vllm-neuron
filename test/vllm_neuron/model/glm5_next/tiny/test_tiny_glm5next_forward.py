@@ -111,6 +111,10 @@ _SEAM_REGISTRY = {
     "mla_sparse": (
         "vllm_neuron.functional.attention.mla_sparse",
         "mla_sparse_dispatch_counters", "reset_mla_sparse_dispatch_counters"),
+    "mla_dense_window": (
+        "vllm_neuron.functional.attention.mla_dense_window",
+        "mla_dense_window_dispatch_counters",
+        "reset_mla_dense_window_dispatch_counters"),
     "mla_sparse_tiled": (
         "vllm_neuron.functional.attention.mla_sparse",
         "mla_sparse_tiled_dispatch_counters",
