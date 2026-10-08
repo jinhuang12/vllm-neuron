@@ -138,6 +138,10 @@ class Glm5NextTextConfig:
     tie_word_embeddings: bool = False
     torch_dtype: torch.dtype = torch.bfloat16
     first_k_dense_replace: int = 3
+    # Number of multi-token-prediction (next-n prediction) draft layers the
+    # checkpoint ships past the main stack, at indices ``num_hidden_layers ..``;
+    # GLM-5.3-Flash ships 1. The weight map and the draft head read it here.
+    num_nextn_predict_layers: int = 1
 
     # -- Hybrid attention schedule (MODEL-SPECIFIC) -------------------------
     # 45 entries, one per layer, each KDA_LAYER_TYPE or DSA_LAYER_TYPE.

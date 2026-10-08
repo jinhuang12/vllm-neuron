@@ -5628,6 +5628,31 @@ class Glm5NextMLADecodeError(ValueError):
     """
 
 
+@dataclass
+class IndexShare:
+    """One speculative step's indexer selection, shared across its draft iterations.
+
+    The carrier for ``index_share_for_mtp_iteration`` (config.py; upstream's
+    ``skip_topk``). The draft head (``mtp.py``) hands one instance to every
+    iteration of one ``draft_tokens`` call; the trunk's own decode step passes none.
+
+    * ``topk_indices is None`` -- run the indexer chain (ring step, pooled-store
+      write, scores, selection) and, when the step selects, publish the result here;
+    * ``topk_indices`` set -- reuse it and skip the chain whole: no ring step, no
+      pooled-store write, no scores.
+
+    ``topk_indices`` is what :meth:`Glm5NextDSAIndexer.forward_requests` returns for
+    a selecting step: ``[B, width]`` int32 row indices into the request's latent
+    window (``-1`` = masked), one row per request, on the step's device. A step
+    whose selection is a no-op (the bypass regime,
+    ``decode_bypass.selection_is_a_no_op``) returns ``None`` and stores nothing, so
+    every iteration of such a step runs the write stage and the carrier changes
+    nothing there.
+    """
+
+    topk_indices: torch.Tensor | None = None
+
+
 class Glm5NextMLAAttention(nn.Module):
     """Multi-head latent attention at ``self_attn``, NoPE on this checkpoint.
 
@@ -6760,6 +6785,7 @@ class Glm5NextMLAAttention(nn.Module):
         position: torch.Tensor,
         collector: list[torch.Tensor] | None,
         state_slots: torch.Tensor | None = None,
+        index_share: IndexShare | None = None,
     ) -> torch.Tensor:
         """:meth:`forward` for a decode step of ``len(tail)`` requests, one row each.
 
@@ -6774,6 +6800,23 @@ class Glm5NextMLAAttention(nn.Module):
         every request in one batched call. A one-request decode step is the
         ``batch = 1`` case of this method (see :meth:`forward`); there :meth:`attend`
         serves ``batch_size`` 1 with its one-request attention.
+
+        ``index_share`` is the draft head's :class:`IndexShare` carrier for
+        ``index_share_for_mtp_iteration`` (config.py; upstream's ``skip_topk``).
+        Two regimes:
+
+        * selecting (the window is wider than the candidate axis): the first
+          iteration of one speculative step runs the chain and stores its
+          ``topk_indices`` on the carrier; every later iteration of that step reads
+          them and skips the whole chain -- no ring step, no pooled-store write, no
+          scores -- attending the first iteration's selection plus its own row,
+          which :meth:`attend` stands in at the position;
+        * bypass (the selection is a no-op): the chain returns ``None``, nothing is
+          stored, and every iteration runs the write stage; the carrier changes
+          nothing.
+
+        ``None`` is the trunk's own decode step; it is byte-identical to a carrier
+        with nothing stored, as both run the chain.
         """
         from vllm_neuron.functional.dsa.decode_bypass import (
             selection_bound,
@@ -6816,24 +6859,34 @@ class Glm5NextMLAAttention(nn.Module):
         dense = selection_is_a_no_op(
             bound, self.indexer.index_topk, self.indexer.index_kpool
         )
-        q_latent = self.project_query_latent(normed_hidden_states)
-        projected = self.indexer.project_stage(
-            normed_hidden_states, q_latent, query_side=not dense
-        )
-        # Every request's ring step, write and selection in one indexer pass: one
-        # launch per stage for the whole batch, each request on its own views.
-        topk_indices = self.indexer.forward_requests(
-            normed_hidden_states,
-            q_latent,
-            stores,
-            rings,
-            state_slots,
-            seq_lens,
-            position,
-            max_seq_len=bound if dense else int(max_seq_len),
-            indices_wanted=not dense,
-            projected=projected,
-        )
+        shared = None if index_share is None else index_share.topk_indices
+        if shared is not None:
+            # A later draft iteration of the same speculative step: the selection is
+            # the first iteration's, and the indexer chain is skipped whole.
+            topk_indices = shared
+        else:
+            q_latent = self.project_query_latent(normed_hidden_states)
+            projected = self.indexer.project_stage(
+                normed_hidden_states, q_latent, query_side=not dense
+            )
+            # Every request's ring step, write and selection in one indexer pass: one
+            # launch per stage for the whole batch, each request on its own views.
+            topk_indices = self.indexer.forward_requests(
+                normed_hidden_states,
+                q_latent,
+                stores,
+                rings,
+                state_slots,
+                seq_lens,
+                position,
+                max_seq_len=bound if dense else int(max_seq_len),
+                indices_wanted=not dense,
+                projected=projected,
+            )
+            if index_share is not None and topk_indices is not None:
+                # Only a selecting step has indices to share; the bypass regime's
+                # None is never stored, so its later iterations keep writing.
+                index_share.topk_indices = topk_indices
         if collector is not None:
             collector.append(
                 (self.indexer._bypass_indices(seq_lens) if dense else topk_indices)[:5]
@@ -6873,6 +6926,7 @@ class Glm5NextMLAAttention(nn.Module):
         collector: list[torch.Tensor] | None = None,
         active_mla_query_rows: int | None = None,
         state_slots: torch.Tensor | None = None,
+        index_share: IndexShare | None = None,
     ) -> torch.Tensor:
         """This module's whole contribution to one layer: select, then attend.
 
@@ -6952,6 +7006,7 @@ class Glm5NextMLAAttention(nn.Module):
                 position=position,
                 collector=collector,
                 state_slots=state_slots,
+                index_share=index_share,
             )
 
         if (
@@ -6985,6 +7040,13 @@ class Glm5NextMLAAttention(nn.Module):
                 tail=(tail,),
                 position=_int64_scalar(position, device).reshape(1),
                 collector=collector,
+                index_share=index_share,
+            )
+        if index_share is not None:
+            raise Glm5NextMLADecodeError(
+                "index_share carries one speculative step's selection across its draft "
+                "iterations, which is a decode step of 2-byte rows; this call is a "
+                "prefill chunk or a float32 step and has no selection to share"
             )
 
         # The decode step whose selection is a no-op attends the causal prefix
@@ -7130,6 +7192,7 @@ class Glm5NextDSALayer(nn.Module):
         collector: list[torch.Tensor] | None = None,
         active_mla_query_rows: int | None = None,
         state_slots: torch.Tensor | None = None,
+        index_share: IndexShare | None = None,
     ) -> torch.Tensor:
         """The sparse-attention half, mixed either by mHC or by a plain add.
 
@@ -7201,6 +7264,7 @@ class Glm5NextDSALayer(nn.Module):
                     if active_mla_query_rows is not None else {}
                 ),
                 **({"state_slots": state_slots} if state_slots is not None else {}),
+                **({"index_share": index_share} if index_share is not None else {}),
             )
             if collector is not None:
                 collector.append(attended)
@@ -7363,11 +7427,13 @@ class Glm5NextModel(nn.Module):
         normed = normed * gain.to(torch.float32)
         return normed.to(hidden_states.dtype)
 
+    @staticmethod
     def _ffn_half(
-        self,
         layer: nn.Module,
         hidden_states: torch.Tensor,
         *,
+        text_config: Glm5NextTextConfig,
+        rms_norm: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
         quant_config: Glm5NextQuantConfig,
         block_size: int | None,
         moe_group: object | None,
@@ -7380,6 +7446,22 @@ class Glm5NextModel(nn.Module):
         The residual add is the caller's, so this method is only the sublayer:
         normalise with that layer's own post-attention gain, then run whichever MLP
         ``_build_mlp`` gave the layer.
+
+        A static method: it reads nothing off a model instance, so the stack and the
+        MTP draft head (``mtp.py``) share one body. What it needs it takes by name:
+
+        * ``layer``: the module holding ``post_attention_layernorm_weight`` (``[H]``,
+          the FFN norm's gain) and ``mlp`` (a ``Glm5NextMoEBlock`` or a
+          ``Glm5NextDenseMLP``);
+        * ``hidden_states``: ``[T, H]`` in the stack's activation dtype, the
+          attention half's output after its residual add -- the FFN norm's input and
+          the fused router's pre-norm input;
+        * ``text_config``: the decoder config the MoE branch's routing hyperparameters
+          live on;
+        * ``rms_norm``: the caller's ``(hidden_states, gain) -> normed`` RMSNorm, the
+          one body the stack applies everywhere (``_rms_norm``), so the head's norms
+          are whatever the stack's are;
+        * the remaining keywords are the MoE branch's and are passed through.
 
         It lives here rather than in the layer forwards because both layer forwards
         end at the attention half, and joining the halves here leaves both of their
@@ -7412,7 +7494,7 @@ class Glm5NextModel(nn.Module):
                 f"post_attention_layernorm_weight; the FFN norm's gain is a "
                 f"mapped checkpoint tensor and nothing was loaded onto it"
             )
-        normed = self._rms_norm(hidden_states, gain)
+        normed = rms_norm(hidden_states, gain)
         if collector is not None:
             collector.append(normed)
         mlp = layer.mlp
@@ -7422,7 +7504,7 @@ class Glm5NextModel(nn.Module):
                 normed,
                 **({"collector": collector} if collector is not None else {}),
                 router_gamma=gain,
-                text_config=self.text_config,
+                text_config=text_config,
                 quant_config=quant_config,
                 block_size=block_size,
                 moe_group=moe_group,
@@ -7630,6 +7712,8 @@ class Glm5NextModel(nn.Module):
                 ): self._ffn_half(
                     layer,
                     single_stream,
+                    text_config=self.text_config,
+                    rms_norm=self._rms_norm,
                     quant_config=quant_config,
                     block_size=block_size,
                     moe_group=moe_group,
@@ -8362,6 +8446,28 @@ class Glm5NextForConditionalGeneration(nn.Module):
         # checkpoint key and therefore no separate parameter.
         if not self.text_config.tie_word_embeddings:
             _declare_parameters(self, "lm_head_weight")
+        # The multi-token-prediction draft head, the checkpoint's layer past the
+        # stack, built on the same knob the weight map follows (the head's own
+        # ``shadow_draft_k``, contract C1), so the map claims that layer's keys
+        # exactly when there is a module to hold them. ``None`` with the knob off:
+        # nothing else in this tree changes. The two weights the head reads are
+        # materialised only in ``load_weights``, so they are handed over as
+        # callables: the embedding table, and ``_head_weight``, the root's own
+        # tied-or-untied resolution of the logits weight; the group is resolved the
+        # way every row-parallel reduction in this file resolves it. Imported here,
+        # not at module level: the head imports this module lazily, so a top-level
+        # import either way would be a cycle.
+        from .mtp import Glm5NextMultiTokenPredictor, shadow_draft_k
+
+        self.mtp = None
+        if shadow_draft_k() > 0:
+            self.mtp = Glm5NextMultiTokenPredictor(
+                self.text_config,
+                embed_tokens=lambda: self.model.embed_tokens_weight,
+                lm_head=self._head_weight,
+                world_size=self.world_size,
+                tp_group=_resolve_tp_group,
+            )
 
     # ── construction ─────────────────────────────────────────────────────
 
@@ -9066,7 +9172,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
     # ── KV cache management ──────────────────────────────────────────────
 
     def get_kv_spec(self) -> KVSpec:
-        """One ``LayerSpec`` per layer of the hybrid stack, in layer order.
+        """One ``LayerSpec`` per cache-holding layer: the stack's, then the draft head's.
 
         Field mapping and naming follow the other model families; the construction
         path does not, because that precedent reads instantiated submodules and this
@@ -9094,9 +9200,43 @@ class Glm5NextForConditionalGeneration(nn.Module):
         part of the geometry, because the conv and recurrent carriers are paired
         positionally, so a partial set would shorten the reported page. One ``getattr``
         per field against one attribute-carrying class satisfies that by construction.
+
+        The draft layer. When the root built the multi-token-prediction head
+        (``self.mtp``, built when the shadow-draft knob is above 0), the head's decoder
+        block holds state exactly as a stack layer does, so the same loop reads its
+        attention and its entry follows the stack, named for the index the checkpoint
+        gives it, ``num_hidden_layers + num_nextn_predict_layers - 1``
+        (``layers.45.self_attn`` on GLM-5.3-Flash). That block is a sparse-attention
+        layer built from the same config as the stack's, so its page is the trunk DSA
+        page -- ``[blocks, num_kv_heads_per_rank, block_size, head_size]`` in
+        ``cache_dtype``, one latent buffer -- and vLLM groups it with the trunk's DSA
+        layers, so it pages through their block table. The head holds one decoder
+        layer: a config that places its last draft layer anywhere else is refused by
+        name. Without the head the list is the stack's alone.
+
+        Raises:
+            ValueError: the draft head's decoder layer does not sit at the index the
+                config gives the last draft layer.
         """
+        from .mtp import BLOCK_ATTR
+
+        blocks = list(enumerate(self.model.layers))
+        if self.mtp is not None:
+            first = int(self.text_config.num_hidden_layers)
+            count = int(self.text_config.num_nextn_predict_layers)
+            draft_index = first + count - 1
+            block = getattr(self.mtp, BLOCK_ATTR)
+            if block.layer_idx != draft_index:
+                raise ValueError(
+                    f"the draft head holds one decoder layer, at index "
+                    f"{block.layer_idx}, and the config places the last of its "
+                    f"{count} draft layer(s) at {draft_index} (num_hidden_layers "
+                    f"{first} + num_nextn_predict_layers {count} - 1); only one draft "
+                    f"layer, at num_hidden_layers, has KV state here"
+                )
+            blocks.append((draft_index, block))
         layers: list[LayerSpec] = []
-        for layer_idx, layer in enumerate(self.model.layers):
+        for layer_idx, layer in blocks:
             attention = layer.attention
             layers.append(
                 LayerSpec(
@@ -9165,11 +9305,15 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
         The layer modules are not read, only counted. Every geometry this method needs
         is already on the spec the model itself produced, so the loop walks the spec and
-        the stack length is checked against it.
+        the stack length, plus the draft head's one layer when the root built the head,
+        is checked against it.
 
-        The records land on ``glm5next_layer_banks``, in stack order, one mapping per
-        layer. The runner reads that attribute and builds each layer's carrier from it;
-        nothing else in this tree reads it. A plain tuple of plain dicts is deliberate:
+        The records land on ``glm5next_layer_banks``, in spec order, one mapping per
+        layer: the stack's, then the draft head's (at position ``len(self.model.layers)``,
+        a sparse-family record like a trunk DSA layer's). The runner reads that
+        attribute and builds each layer's side caches and carrier from it, so the
+        draft layer's carrier is the last entry of ``layer_carriers``; nothing else in
+        this tree reads it. A plain tuple of plain dicts is deliberate:
         ``nn.Module.__setattr__`` leaves it alone, so ``_apply`` never walks these
         tensors and the runner stays their only owner.
 
@@ -9178,18 +9322,21 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 what ``initialize_kv_cache`` returns.
 
         Raises:
-            ValueError: the spec and the stack disagree on how many layers there are, a
-                layer's spec name is absent from ``kv_caches``, a bank's shape
-                disagrees with the spec that asked for it, a layer reports part of its
-                recurrent geometry, or a latent bank declares more than one KV head.
+            ValueError: the spec and the stack plus the draft head's layer disagree on
+                how many layers there are, a layer's spec name is absent from
+                ``kv_caches``, a bank's shape disagrees with the spec that asked for
+                it, a layer reports part of its recurrent geometry, or a latent bank
+                declares more than one KV head.
         """
         spec_layers = self.get_kv_spec().layers
         stack = len(self.model.layers)
-        if len(spec_layers) != stack:
+        draft = 0 if self.mtp is None else 1
+        if len(spec_layers) != stack + draft:
             raise ValueError(
                 f"get_kv_spec reports {len(spec_layers)} layer(s) and the stack "
-                f"holds {stack}; the carriers are paired positionally, so a "
-                f"disagreement here would hand a layer another layer's cache"
+                f"holds {stack} plus {draft} draft layer(s); the carriers are paired "
+                f"positionally, so a disagreement here would hand a layer another "
+                f"layer's cache"
             )
         banks: list[dict[str, object]] = []
         for layer_idx, layer_spec in enumerate(spec_layers):
@@ -9342,6 +9489,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         collect_layer_streams: bool = False,
         device_sampling_params: torch.Tensor | None = None,
         device_logit_mask: torch.Tensor | None = None,
+        shadow_boundary_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Logits for the rows the caller wants sampled: stack, select, project.
 
@@ -9422,11 +9570,28 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 is flat because these are graph outputs: a nested tuple is one output
                 to a caller and a structure the capture has to flatten.
 
+            shadow_boundary_ids: shadow draft (MTP stage A), prefill leg only: one
+                int32 per sampled row, the id the chunk's last row pairs with when the
+                draft layer is populated -- the next prompt token when more of the
+                prompt follows, ``-1`` when this chunk ends the prompt, in which case
+                the token sampled in this graph is taken. ``None`` means ``-1``.
+
+        Shadow draft (``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT=k``, ``self.mtp`` built):
+        ``layer_carriers`` then holds one more mapping than the stack has layers, the
+        draft layer's (index ``num_hidden_layers``, built by the runner's carrier walk
+        like a sparse layer's); it is taken off before the stack runs. On the prefill
+        leg the draft is populated at every row of the chunk from the post-final-norm
+        hidden rows and the shifted ids (row ``t`` pairs with ``x_{t+1}``), and the
+        draft output is a ``[rows, k]`` row of ``-1``. On the decode leg the draft runs
+        ``k`` unrolled iterations from the selected rows and the sampled ids and the
+        output is ``[rows, k]`` global token ids. The sampled ids never read the draft.
+
         Returns:
             ``[len(sampling_positions), vocab_size]`` logits, in the dtype the head
             weight and the stack output share -- or, under ``collect_layer_streams``,
             that tensor first and then one ``[T, hc_mult, H]`` carrier per layer of the
-            stack.
+            stack. With the shadow draft on, the ``[rows, k]`` int32 draft ids follow
+            the logits (or sampled ids) and precede the layer streams.
 
         Raises:
             ValueError: when the head tensor this call needs was never loaded, or when
@@ -9442,6 +9607,31 @@ class Glm5NextForConditionalGeneration(nn.Module):
         # The keyword is added, not passed as False, so an ordinary forward hands its
         # stack the six keywords it always handed over and no seventh.
         collecting = {"collect_layer_streams": True} if collect_layer_streams else {}
+        # Shadow draft: the draft layer's carrier rides at the end of the list and the
+        # stack must not see it (it refuses a count that disagrees with its layers).
+        draft_head = self.mtp
+        shadow_k = 0
+        if draft_head is not None:
+            # The knob's one reader (contract C1); lazily, as the head is imported
+            # everywhere in this module, so the two modules never import each other
+            # at load time.
+            from . import mtp as mtp_module
+
+            shadow_k = int(mtp_module.shadow_draft_k())
+        draft_carrier: dict | None = None
+        if shadow_k > 0:
+            stack_depth = len(self.model.layers)
+            carriers = list(layer_carriers)
+            if len(carriers) != stack_depth + 1:
+                raise ValueError(
+                    f"the shadow draft is on (k={shadow_k}) and this forward received "
+                    f"{len(carriers)} per-layer carrier mapping(s) for a stack of "
+                    f"{stack_depth} layers plus the draft layer; the runner's carrier walk "
+                    f"adds the draft layer's mapping (index {stack_depth}) when the knob "
+                    f"is on, and without it the draft would run on a trunk layer's state"
+                )
+            draft_carrier = carriers[stack_depth]
+            layer_carriers = carriers[:stack_depth]
         stack_output = self.model(
             input_ids,
             layer_carriers=layer_carriers,
@@ -9471,6 +9661,83 @@ class Glm5NextForConditionalGeneration(nn.Module):
             logits = sample_full_vocab(
                 logits, device_sampling_params, sampling_config, device_logit_mask
             )
+        if shadow_k <= 0:
+            if collect_layer_streams:
+                return (logits, *layer_streams)
+            return logits
+        # ── shadow draft ─────────────────────────────────────────────────────
+        # Alignment: the draft at position t consumes the trunk's post-final-norm row
+        # h_t and the embedding of x_{t+1}. The sampled ids are read, never written.
+        assert draft_carrier is not None
+        # The draft layer's MoE half runs the trunk's own feed-forward, under the same
+        # five keywords this forward handed the stack (one call shape on both legs).
+        ffn_keywords = {
+            "quant_config": quant_config,
+            "block_size": block_size,
+            "moe_group": moe_group,
+            "tp_degree": tp_degree,
+            "expert_parallel_rank": expert_parallel_rank,
+        }
+        sampled_ids = (
+            logits if device_sampling_params is not None else torch.argmax(logits, dim=-1)
+        ).to(torch.int32)
+        rows_out = int(sampled_ids.shape[0])
+        if "prefill_tail" not in draft_carrier and "position" not in draft_carrier:
+            raise ValueError(
+                "the shadow draft reads its leg off the draft layer's carrier: "
+                "'prefill_tail' on the prefill leg, 'position' on the decode leg; this "
+                f"carrier has neither (keys {sorted(draft_carrier)}), so the runner's "
+                "carrier walk and this forward disagree about the sparse layer's "
+                "operands"
+            )
+        if "prefill_tail" in draft_carrier:
+            # Prefill leg: populate every row of the chunk. Row t pairs with the next
+            # row's id; the sampled rows (the chunk's last real row) pair with the
+            # boundary id, or with the id sampled here when the boundary is -1.
+            tokens = int(input_ids.shape[0])
+            start_position = draft_carrier["start_position"]
+            if not torch.is_tensor(start_position):
+                # A number is factory-built so a trace keeps it fake (``_int64_scalar``).
+                start_position = _int64_scalar(start_position, input_ids.device)
+            start = start_position.reshape(-1)[0].to(
+                device=input_ids.device, dtype=torch.int32
+            )
+            positions = start + torch.arange(
+                tokens, dtype=torch.int32, device=input_ids.device
+            )
+            next_ids = torch.cat([input_ids[1:], input_ids[:1] * 0]).to(torch.int32)
+            if shadow_boundary_ids is None:
+                boundary = torch.full_like(sampled_ids, -1)
+            else:
+                boundary = shadow_boundary_ids.to(
+                    device=sampled_ids.device, dtype=torch.int32
+                ).reshape(-1)
+                if int(boundary.shape[0]) != rows_out:
+                    raise ValueError(
+                        f"shadow_boundary_ids holds {int(boundary.shape[0])} id(s) and "
+                        f"this forward samples {rows_out} row(s); the prefill leg pairs "
+                        f"each sampling row with one boundary id"
+                    )
+            fill = torch.where(boundary < 0, sampled_ids, boundary)
+            next_ids = next_ids.index_copy(0, sampling_positions, fill)
+            draft_head.populate(
+                hidden_states, next_ids, positions, **ffn_keywords, **draft_carrier
+            )
+            draft_ids = torch.full(
+                (rows_out, shadow_k), -1, dtype=torch.int32, device=input_ids.device
+            )
+        else:
+            # Decode leg: the selected rows are one per request, at the request's
+            # position; iteration 0 of the draft populates the draft layer there.
+            position = draft_carrier["position"]
+            if not torch.is_tensor(position):
+                position = _int64_scalar(position, input_ids.device)
+            positions = position.reshape(-1).to(device=input_ids.device, dtype=torch.int32)
+            if positions.numel() == 1 and rows_out > 1:
+                positions = positions.expand(rows_out)
+            draft_ids = draft_head.draft_tokens(
+                rows, sampled_ids, positions, shadow_k, **ffn_keywords, **draft_carrier
+            )
         if collect_layer_streams:
-            return (logits, *layer_streams)
-        return logits
+            return (logits, draft_ids, *layer_streams)
+        return logits, draft_ids
