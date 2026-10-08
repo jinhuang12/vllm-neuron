@@ -39,10 +39,13 @@ Numerics run first, on the one-call graphs at ``--seeds``: ``after`` against ``b
 (``torch.equal``, the mismatch count and the largest distance in ulps) and both against
 the CPU torch reference and an fp64 evaluation of the same function (the largest error,
 in absolute terms and in ulps of the output dtype, and the count of elements more than
-half an ulp off). The rotation's fp32 route (``--fp32-rows``) is read the same way, plus
-its involution. The tensors are saved under ``--pt-dir``. Before all of it, two engine
-facts the kernels rely on are read on the device: Tensor Engine transposes return their
-input bit for bit, and the Scalar Engine's reciprocal at every fp32 a softmax sum can take.
+half an ulp off), and both against the error bound derived in
+``test/vllm_neuron/functional/dsa/test_kpool_hadamard_error_bound.py``, the pooling's with
+the Scalar Engine errors this run measures. The rotation's fp32 route (``--fp32-rows``) is
+read the same way, plus its involution. The tensors are saved under ``--pt-dir``. Before
+all of it, the engine facts the kernels rely on are read on the device: Tensor Engine
+transposes return their input bit for bit, and the Scalar Engine's reciprocal and ``exp``
+are read at every fp32 of the ranges the error bound takes them over.
 
 Every run compiles from scratch: ``--cache-root`` must name a new or empty directory,
 which becomes ``NEURON_LIBTORCH_CACHE_ROOT``, and the compile cache is disabled on top.
@@ -83,10 +86,14 @@ from libtorch_neuronx_lite.nki.nki_hop import wrap_nki  # noqa: E402
 from vllm_neuron.functional.dsa import decode_batch as decode_batch_after  # noqa: E402
 from vllm_neuron.functional.dsa import decode_tail_update as decode_tail_after  # noqa: E402
 from vllm_neuron.functional.dsa import kpool_hadamard as kh  # noqa: E402
+from test.vllm_neuron.functional.dsa import test_kpool_hadamard_error_bound as bound  # noqa: E402
 
 DEVICE = "neuron:0"
 HEAD_DIM = kh.INDEX_HEAD_DIM
 POOL_SIZE = kh.DEFAULT_POOL_SIZE
+#: One device chunk of a Scalar Engine sweep: ``SWEEP_ROWS`` partitions' worth of rows,
+#: ``SWEEP_WIDTH`` fp32 each.
+SWEEP_ROWS, SWEEP_WIDTH = 2048, 8192
 
 BASELINE_COMMIT = "f3a833f"
 #: module name -> (repository path, git blob id at :data:`BASELINE_COMMIT`).
@@ -218,15 +225,19 @@ def transpose_check(x_hbm, scalar_copy):
 
 
 @nki.jit
-def reciprocal_check(x_hbm):
-    """``1 / x`` for every element of ``x_hbm[rows, width]`` fp32, as the pooling computes it."""
+def scalar_engine_check(x_hbm, use_exp):
+    """``exp(x)`` when ``use_exp`` is set, else ``1 / x``, for every element of
+    ``x_hbm[rows, width]`` fp32, on the Scalar Engine as the pooling computes them."""
     pmax = nl.tile_size.pmax
     out = nl.ndarray(x_hbm.shape, dtype=nl.float32, buffer=nl.shared_hbm)
     for tile in range(x_hbm.shape[0] // pmax):
         x = nl.ndarray((pmax, x_hbm.shape[1]), dtype=nl.float32, buffer=nl.sbuf)
         nisa.dma_copy(dst=x, src=x_hbm[tile * pmax:(tile + 1) * pmax, :])
         y = nl.ndarray((pmax, x_hbm.shape[1]), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.activation(dst=y, op=nl.reciprocal, data=x)
+        if use_exp:
+            nisa.activation(dst=y, op=nl.exp, data=x)
+        else:
+            nisa.activation(dst=y, op=nl.reciprocal, data=x)
         nisa.dma_copy(dst=out[tile * pmax:(tile + 1) * pmax, :], src=y)
     return out
 
@@ -390,18 +401,6 @@ def slopes(device: dict, variants, links: int) -> tuple[dict, dict]:
 # ---------------------------------------------------------------------------------------------
 
 
-def exact_rotation(x: torch.Tensor) -> torch.Tensor:
-    """The rotation in fp64, unrounded: the value both kernels round."""
-    hadamard = kh.hadamard_matrix(int(x.shape[1]), dtype=torch.float64)
-    return (x.double() @ hadamard.t()) * kh.HADAMARD_SCALE
-
-
-def exact_pooling(slot_k: torch.Tensor, slot_score: torch.Tensor, ape: torch.Tensor) -> torch.Tensor:
-    """The fused pooling in fp64, unrounded."""
-    weights = torch.softmax(slot_score.double() + ape.double().unsqueeze(0), dim=1)
-    return exact_rotation((weights * slot_k.double()).sum(dim=1))
-
-
 def ulps(out: torch.Tensor, exact: torch.Tensor) -> torch.Tensor:
     """``|out - exact|`` in units in the last place of ``out``'s dtype at ``exact``.
 
@@ -409,16 +408,16 @@ def ulps(out: torch.Tensor, exact: torch.Tensor) -> torch.Tensor:
     value, wherever that value falls between two representable numbers, so ``< 1`` is the
     bound every faithful kernel meets.
     """
-    info = torch.finfo(out.dtype)
-    # |exact| = m * 2**e with m in [0.5, 1): the binade [2**(e-1), 2**e), whose ulp is eps * 2**(e-1).
-    _, exponent = torch.frexp(exact.abs().clamp(min=info.tiny))
-    unit = torch.ldexp(torch.full_like(exact, info.eps), exponent - 1)
-    return (out.double() - exact).abs() / unit
+    return (out.double() - exact).abs() / bound.ulp(exact, out.dtype)
 
 
 def compare(after: torch.Tensor, before: torch.Tensor, reference: torch.Tensor,
-            exact: torch.Tensor) -> dict:
+            exact: torch.Tensor, error_bound: torch.Tensor) -> dict:
+    """``after`` against ``before``, and both against the CPU ``reference``, the fp64 ``exact``
+    value and the derived ``error_bound`` of ``test_kpool_hadamard_error_bound``."""
     after_ulps, before_ulps = ulps(after, exact), ulps(before, exact)
+    after_ratio = bound.error_over_bound(after, exact, error_bound)
+    before_ratio = bound.error_over_bound(before, exact, error_bound)
     return {
         "after_equals_before": bool(torch.equal(after, before)),
         "after_before_mismatches": int((after != before).sum()),
@@ -432,6 +431,10 @@ def compare(after: torch.Tensor, before: torch.Tensor, reference: torch.Tensor,
         "before_vs_exact_max_ulps": float(before_ulps.max()),
         "after_elements_over_half_ulp": int((after_ulps > 0.5).sum()),
         "before_elements_over_half_ulp": int((before_ulps > 0.5).sum()),
+        "after_max_error_over_bound": float(after_ratio.max()),
+        "before_max_error_over_bound": float(before_ratio.max()),
+        "after_within_bound": bool(after_ratio.max() <= 1.0),
+        "before_within_bound": bool(before_ratio.max() <= 1.0),
     }
 
 
@@ -475,7 +478,8 @@ def rotation_case(n_rows: int, args, base, timed_variants) -> dict:
         path = args.pt_dir / f"rotation_rows{n_rows}_seed{seed}.pt"
         torch.save({"seed": seed, "x": x_cpu, "after": after, "before": before}, path)
         numerics.append({"seed": seed, "pt": str(path),
-                         **compare(after, before, reference, exact_rotation(x_cpu))})
+                         **compare(after, before, reference, bound.exact_rotation(x_cpu),
+                                   bound.rotation_error_bound(x_cpu))})
         print(json.dumps({"rotation_rows": n_rows, **numerics[-1]}), flush=True)
     device = time_graphs(graphs, inputs, args.warmup, args.iterations)
     timing, noise = slopes(device, timed_variants, args.links)
@@ -484,7 +488,11 @@ def rotation_case(n_rows: int, args, base, timed_variants) -> dict:
             "noise_floor_aa_abs_diff": noise, "numerics": numerics}
 
 
-def pool_case(n_pools: int, args, base) -> dict:
+def pool_case(n_pools: int, args, base, engine: dict) -> dict:
+    """The pooling at ``n_pools``: numerics against the derived bound, with the engine errors
+    ``engine_checks`` measured in this run, then the timings."""
+    errors = {"exp_error": engine["scalar_engine_exp"]["max_relative"],
+              "reciprocal_error": engine["scalar_engine_reciprocal"]["max_relative"]}
     variants = pool_variants(base)
     operands = [pool_input(n_pools, seed=n_pools + link) for link in range(args.links)]
     ape = operands[0][2].to(DEVICE)
@@ -509,15 +517,17 @@ def pool_case(n_pools: int, args, base) -> dict:
         path = args.pt_dir / f"pooling_pools{n_pools}_seed{seed}.pt"
         torch.save({"seed": seed, "slot_k": slot_k, "slot_score": slot_score, "ape": ape_cpu,
                     "after": after, "before": before}, path)
-        exact = exact_pooling(slot_k, slot_score, ape_cpu)
-        numerics.append({"seed": seed, "pt": str(path), **compare(after, before, reference, exact)})
+        exact = bound.exact_pooling(slot_k, slot_score, ape_cpu)
+        error_bound = bound.pooling_error_bound(slot_k, slot_score, ape_cpu, **errors)
+        numerics.append({"seed": seed, "pt": str(path),
+                         **compare(after, before, reference, exact, error_bound)})
         print(json.dumps({"pooling_pools": n_pools, **numerics[-1]}), flush=True)
     device = time_graphs(graphs, inputs, args.warmup, args.iterations)
     timing, noise = slopes(device, variants, args.links)
     return {"kernel": "_kpool_hadamard_nki", "pools": n_pools,
             "shape": [n_pools, POOL_SIZE, HEAD_DIM], "dtype": "bfloat16 slot_k and slot_score",
             "links": args.links, "graph": "chain through ape", "variants": timing,
-            "noise_floor_aa_abs_diff": noise, "numerics": numerics}
+            "noise_floor_aa_abs_diff": noise, "bound_engine_errors": errors, "numerics": numerics}
 
 
 def fp32_rotation_case(n_rows: int, args, base) -> dict:
@@ -538,7 +548,8 @@ def fp32_rotation_case(n_rows: int, args, base) -> dict:
         torch.save({"seed": seed, "x": x_cpu, "after": after, "before": before,
                     "involution": involution}, path)
         numerics.append({"seed": seed, "pt": str(path),
-                         **compare(after, before, reference, exact_rotation(x_cpu)),
+                         **compare(after, before, reference, bound.exact_rotation(x_cpu),
+                                   bound.rotation_error_bound(x_cpu)),
                          "after_before_max_abs": float((after - before).abs().max()),
                          "involution_max_abs": float((involution - x_cpu).abs().max())})
         print(json.dumps({"rotation_fp32_rows": n_rows, **numerics[-1]}), flush=True)
@@ -547,13 +558,14 @@ def fp32_rotation_case(n_rows: int, args, base) -> dict:
 
 
 def engine_checks(args) -> dict:
-    """The two engine facts the kernels' numerics rest on, read on the device.
+    """The engine facts the kernels' numerics rest on, read on the device.
 
     Tensor Engine transposes, as ``_transpose_group`` runs them with either copy engine, must
     return their input bit for bit, in bf16 and fp32, over a wide exponent range. The Scalar
-    Engine's reciprocal, which the pooling applies to its softmax sums, is read at every fp32
-    from 1 to ``POOL_SIZE``, the whole range of such a sum, against the correctly rounded
-    ``1 / x``.
+    Engine's two functions in the pooling are read at every fp32 they can meet there, against
+    the exact value: the reciprocal from 1 to ``POOL_SIZE``, the whole range of a softmax sum,
+    and ``exp`` from the error bound's ``EXP_LOW`` to 0, where the max-shifted scores of every
+    input the bound admits lie.
     """
     tiles = 4
     gen = torch.Generator().manual_seed(args.seeds[0])
@@ -571,21 +583,54 @@ def engine_checks(args) -> dict:
             transposes.append({"dtype": str(dtype), "copy_engine": "scalar" if scalar_copy else "vector",
                                "elements": got.numel(), "equal": bool(torch.equal(got, expected))})
             print(json.dumps({"transpose_check": transposes[-1]}), flush=True)
-    low = int(torch.tensor(1.0).view(torch.int32))
-    high = int(torch.tensor(float(POOL_SIZE)).view(torch.int32))
-    width = 8192
-    rows = -(-(high - low + 1) // (width * 128)) * 128
-    bits = torch.arange(low, low + rows * width, dtype=torch.int64).clamp(max=high)
-    x_cpu = bits.to(torch.int32).view(torch.float32).reshape(rows, width)
-    got = _first(compile_fn(lambda x: wrap_nki(reciprocal_check)(x))(x_cpu.to(DEVICE))).to("cpu")
-    exact = 1.0 / x_cpu.double()
-    distance = ulps(got, exact)
-    reciprocal = {"values": high - low + 1, "range": [1.0, float(POOL_SIZE)],
-                  "max_ulps": float(distance.max()),
-                  "max_relative": float(((got.double() - exact) / exact).abs().max()),
-                  "elements_over_half_ulp": int((distance > 0.5).sum())}
+    reciprocal_graph = compile_fn(lambda x: wrap_nki(scalar_engine_check)(x, 0))
+    reciprocal = scalar_engine_sweep(reciprocal_graph, 1.0, float(POOL_SIZE), lambda x: 1.0 / x)
     print(json.dumps({"reciprocal_check": reciprocal}), flush=True)
-    return {"transposes": transposes, "scalar_engine_reciprocal": reciprocal}
+    exp_graph = compile_fn(lambda x: wrap_nki(scalar_engine_check)(x, 1))
+    exp = scalar_engine_sweep(exp_graph, -0.0, bound.EXP_LOW, torch.exp)
+    # The max slot's shift is +0.0, which the sweep's -0.0 does not stand for.
+    at_zero = _first(exp_graph(torch.zeros(SWEEP_ROWS, SWEEP_WIDTH).to(DEVICE))).to("cpu")
+    exp["results_at_positive_zero"] = [float(v) for v in at_zero.unique()]
+    print(json.dumps({"exp_check": exp}), flush=True)
+    # The CPU tests take these errors as constants; a device that exceeds them needs new ones.
+    reciprocal["within_test_constant"] = (
+        reciprocal["max_relative"] <= bound.SCALAR_ENGINE_RECIPROCAL_ERROR)
+    exp["within_test_constant"] = exp["max_relative"] <= bound.SCALAR_ENGINE_EXP_ERROR
+    return {"transposes": transposes, "scalar_engine_reciprocal": reciprocal,
+            "scalar_engine_exp": exp}
+
+
+def scalar_engine_sweep(graph, first: float, last: float, exact) -> dict:
+    """``graph``, a compiled ``scalar_engine_check``, at every fp32 from ``first`` to ``last``.
+
+    ``first`` and ``last`` share a sign. The values go through the device
+    ``SWEEP_ROWS * SWEEP_WIDTH`` at a time, in bit-pattern order; the last chunk is padded
+    with ``last``, and the padding is not counted. ``exact`` maps the fp64 inputs to the exact
+    results.
+    """
+    low = int(torch.tensor(first).view(torch.int32))
+    high = int(torch.tensor(last).view(torch.int32))
+    chunk = SWEEP_ROWS * SWEEP_WIDTH
+    worst_relative, worst_ulps, over_half, largest = 0.0, 0.0, 0, -float("inf")
+    worst_input = None
+    for start in range(low, high + 1, chunk):
+        raw = torch.arange(start, start + chunk, dtype=torch.int64)
+        counted = (raw <= high).reshape(SWEEP_ROWS, SWEEP_WIDTH)
+        bits = raw.clamp(max=high)
+        x_cpu = bits.to(torch.int32).view(torch.float32).reshape(SWEEP_ROWS, SWEEP_WIDTH)
+        got = _first(graph(x_cpu.to(DEVICE))).to("cpu")
+        want = exact(x_cpu.double())
+        relative = ((got.double() - want) / want).abs()
+        distance = ulps(got, want)
+        if float(relative.max()) > worst_relative:
+            worst_relative = float(relative.max())
+            worst_input = float(x_cpu.flatten()[int(relative.argmax())])
+        worst_ulps = max(worst_ulps, float(distance.max()))
+        over_half += int((distance[counted] > 0.5).sum())
+        largest = max(largest, float(got.max()))
+    return {"values": high - low + 1, "range": [first, last], "max_relative": worst_relative,
+            "max_relative_at": worst_input, "max_ulps": worst_ulps,
+            "elements_over_half_ulp": over_half, "largest_result": largest}
 
 
 def tail_input(seed: int):
@@ -728,7 +773,7 @@ def main() -> None:
         report["rotation"].append(rotation_case(n_rows, args, base, ("before", "after", "after_aa")))
         write()
     for n_pools in args.pools:
-        report["pooling"].append(pool_case(n_pools, args, base))
+        report["pooling"].append(pool_case(n_pools, args, base, report["engine_checks"]))
         write()
     for n_rows in args.fp32_rows:
         report["rotation_fp32"].append(fp32_rotation_case(n_rows, args, base))
