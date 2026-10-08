@@ -9490,6 +9490,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         device_sampling_params: torch.Tensor | None = None,
         device_logit_mask: torch.Tensor | None = None,
         shadow_boundary_ids: torch.Tensor | None = None,
+        draft_k: int | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Logits for the rows the caller wants sampled: stack, select, project.
 
@@ -9575,6 +9576,14 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 draft layer is populated -- the next prompt token when more of the
                 prompt follows, ``-1`` when this chunk ends the prompt, in which case
                 the token sampled in this graph is taken. ``None`` means ``-1``.
+            draft_k: the draft's iteration count for this forward, a Python int the
+                runner names explicitly (the proposer's ``num_speculative_tokens``
+                under speculative method "mtp", the knob's value under the shadow
+                draft). ``None`` reads the knob's one reader, ``mtp.shadow_draft_k``,
+                which is what the shadow draft's direct callers rely on. A count
+                without a head, or a count below 1, is refused by name: a forward
+                that silently drafted nothing would return the bare ids and the
+                caller would read a missing draft as a shape change.
 
         Shadow draft (``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT=k``, ``self.mtp`` built):
         ``layer_carriers`` then holds one more mapping than the stack has layers, the
@@ -9611,7 +9620,20 @@ class Glm5NextForConditionalGeneration(nn.Module):
         # stack must not see it (it refuses a count that disagrees with its layers).
         draft_head = self.mtp
         shadow_k = 0
-        if draft_head is not None:
+        if draft_k is not None:
+            if draft_head is None:
+                raise ValueError(
+                    f"this forward was handed draft_k={int(draft_k)} and the root built "
+                    f"no draft head (its 'mtp' attribute is None); the head is built at "
+                    f"construction when the head's reader of k is above 0"
+                )
+            shadow_k = int(draft_k)
+            if shadow_k < 1:
+                raise ValueError(
+                    f"draft_k={shadow_k} names no draft; leave the keyword out to draft "
+                    f"nothing, or hand the head's k >= 1"
+                )
+        elif draft_head is not None:
             # The knob's one reader (contract C1); lazily, as the head is imported
             # everywhere in this module, so the two modules never import each other
             # at load time.
