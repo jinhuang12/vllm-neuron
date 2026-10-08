@@ -314,6 +314,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NEURON_DISABLE_NKI_KERNELS": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_DISABLE_NKI_KERNELS")) or False
     ),
+    # Keep libtorch_neuronx_lite's own compile cache keys: do not fold the NKI
+    # kernel-source digest (vllm_neuron/compile_cache_key.py) into the graph and
+    # kernel cache keys. A warm cache may then serve a stale kernel.
+    "VLLM_NEURON_DISABLE_KERNEL_DIGEST_KEY": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_DISABLE_KERNEL_DIGEST_KEY")) or False
+    ),
     # Skip prefill warmup/compilation without requiring kv-transfer-config.
     # Useful for decode-only profiling workflows.
     "VLLM_NEURON_SKIP_PREFILL_WARMUP": lambda: (
