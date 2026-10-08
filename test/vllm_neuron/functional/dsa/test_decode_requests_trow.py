@@ -16,11 +16,23 @@ bypass regime (a 2048-token window attends densely) and the selecting one (8192)
 served ring depth for ``T <= 2`` and at the deeper ring a speculative config allocates.
 The rollback test proposes ``T`` rows, keeps ``a`` of them, steps on, and matches the
 path that never saw the rejected tokens -- output and every bank.
+
+Two one-row attention kernels exist (``mla_decode._route``): at the served per-rank shape
+(one head, latent 512, 128-row pages) a one-row call runs the key-split kernel, every
+request on both programs; a ``T``-row call always runs the general kernel. The bit-for-bit
+reference therefore takes its one-token steps through the general kernel
+(:func:`_general_kernel_only`); the same sequence as dispatched -- the key-split kernel at
+every attention launch -- is matched to the two kernels' rounding through the bf16 cast
+before ``W_UV`` (the bound ``test_mla_decode_split.py`` holds the kernels to is 2e-5
+relative; the cast turns that into single bf16 ulps), and its banks bit for bit (no bank
+row depends on the attention output within a step).
 """
 
 from __future__ import annotations
 
+import contextlib
 import functools
+from unittest import mock
 
 import pytest
 import torch
@@ -155,22 +167,56 @@ def _one_token_step_batched_attention(ops, hidden, start, latent_slots):
         page_size=PAGE, dense=dense)
 
 
-def _sequential(ops, hidden, start, latent_slots, rows, *, production=False):
+@contextlib.contextmanager
+def _general_kernel_only():
+    """Route every one-row attention call through the general kernel.
+
+    As dispatched (``mla_decode._route``), a one-row call at the served per-rank shape runs
+    the key-split kernel, whose rounding is not the general kernel's; the ``T``-row step
+    runs the general kernel, so the bit-for-bit reference is the general kernel's sequence.
+    """
+    with mock.patch.object(MD, "_split_serves", lambda *_: False):
+        yield
+
+
+def _sequential(ops, hidden, start, latent_slots, rows, *, production=False, general=True):
     """``rows`` one-token steps per request on the same banks, in position order.
 
     The production leg at ``B > 1``; at ``B = 1`` the same chain with the batched
     attention (see :func:`_one_token_step_batched_attention`) unless ``production``.
+    ``general`` takes every attention launch through the general kernel (the bit-for-bit
+    reference); ``general=False`` dispatches as served (the key-split kernel at this shape).
     """
     batch = int(start.shape[0])
     out = torch.empty(batch * rows, int(hidden.shape[1]), dtype=hidden.dtype)
-    for t in range(rows):
-        picked = torch.arange(batch) * rows + t
-        if batch > 1 or production:
-            out[picked] = _step(ops, hidden[picked], start + t, latent_slots[picked], 1)
-        else:
-            out[picked] = _one_token_step_batched_attention(
-                ops, hidden[picked], start + t, latent_slots[picked])
+    with _general_kernel_only() if general else contextlib.nullcontext():
+        for t in range(rows):
+            picked = torch.arange(batch) * rows + t
+            if batch > 1 or production:
+                out[picked] = _step(ops, hidden[picked], start + t, latent_slots[picked], 1)
+            else:
+                out[picked] = _one_token_step_batched_attention(
+                    ops, hidden[picked], start + t, latent_slots[picked])
     return out
+
+
+def _assert_served_sequence_agrees(out, mine, ops, rows, *, hidden=None, start=None,
+                                   latent_slots=None, before=None):
+    """The same sequence as dispatched: every attention launch the key-split kernel;
+    output within the two kernels' rounding, banks bit for bit. ``before`` replays earlier
+    steps on the clone first (the rollback's accepted rows)."""
+    served = _cloned(ops)
+    if before is not None:
+        before(served)
+    _reset_counters()
+    want = _sequential(served, ops["hidden"] if hidden is None else hidden,
+                       ops["start"] if start is None else start,
+                       ops["latent_slots"] if latent_slots is None else latent_slots, rows,
+                       general=False)
+    launches = MD.mla_decode_dispatch_counters()[0]
+    assert MD.mla_decode_split_counts()[0] == launches, (MD.mla_decode_split_counts(), launches)
+    torch.testing.assert_close(out.float(), want.float(), rtol=2e-2, atol=2e-3)
+    _assert_banks_equal(mine, served)
 
 
 def _assert_banks_equal(got, want):
@@ -206,7 +252,11 @@ def test_the_rows_step_equals_sequential_one_token_steps_bit_for_bit(rows, batch
     else:
         assert MD.mla_decode_dispatch_counters() == (1, 0)
         assert MD.mla_decode_route_counts()[:2] == ((1, 0) if regime == "bypass" else (0, 1))
-    want = _sequential(ref, ops["hidden"], ops["start"], ops["latent_slots"], rows)
+    # A T-row step runs the general kernel, so its bit-for-bit reference is the general
+    # kernel's sequence; a one-row step dispatches as served (the key-split kernel here),
+    # and so does its reference.
+    want = _sequential(ref, ops["hidden"], ops["start"], ops["latent_slots"], rows,
+                       general=rows > 1)
     assert out.shape == (batch * rows, int(_module().hidden_size))
     if batch == 1 and regime == "selecting":
         # Kernel for kernel the rows step equals the sequence; the production
@@ -226,6 +276,7 @@ def test_the_rows_step_equals_sequential_one_token_steps_bit_for_bit(rows, batch
         assert torch.equal(out, want)
     _assert_banks_equal(mine, ref)
     assert not torch.equal(mine["tail_bank"], ops["tail_bank"])
+    _assert_served_sequence_agrees(out, mine, ops, rows)
 
 
 @pytest.mark.parametrize("regime", sorted(REGIMES))
@@ -247,9 +298,11 @@ def test_the_served_ring_depth_takes_one_and_two_rows(rows, regime):
     else:
         assert TU.decode_tail_dispatch_counters() == (1, 0)
         assert DB.decode_batch_dispatch_counters() == (0, 0)
-    want = _sequential(ref, ops["hidden"], ops["start"], ops["latent_slots"], rows)
+    want = _sequential(ref, ops["hidden"], ops["start"], ops["latent_slots"], rows,
+                       general=rows > 1)
     assert torch.equal(out, want)
     _assert_banks_equal(mine, ref)
+    _assert_served_sequence_agrees(out, mine, ops, rows)
 
 
 @pytest.mark.parametrize("accepted", (1, 2, 3))
@@ -280,6 +333,10 @@ def test_rollback_leaves_no_rejected_state_the_next_step_reads(accepted):
     want2 = _sequential(honest, hidden2, start2, slots2, rows)
     assert torch.equal(out2, want2)
     _assert_banks_equal(spec, honest)
+    _assert_served_sequence_agrees(
+        out2, spec, ops, rows, hidden=hidden2, start=start2, latent_slots=slots2,
+        before=lambda clone: _sequential(clone, ops["hidden"][picked], ops["start"],
+                                         ops["latent_slots"][picked], accepted, general=False))
 
 
 def test_a_shared_selection_must_match_the_rows():

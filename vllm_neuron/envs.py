@@ -36,8 +36,10 @@ if TYPE_CHECKING:
     # TODO: Remove VLLM_NEURON_SWITCH_CC and derive topology from instance type.
     VLLM_NEURON_SWITCH_CC: bool = False
     VLLM_NEURON_MIN_KV_BUDGET_GIB: float = 1.0
-    VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION: float = 0.30
-    VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB: float = 5.0
+    # Both KV budget knobs default to None, spelled "measured": the budget is the
+    # measured free device memory less the compiled graphs' need.
+    VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION: Optional[float] = None
+    VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB: Optional[float] = None
     VLLM_NEURON_WORKER_TERMINATION_TIMEOUT: int = 5
     VLLM_NEURON_MLP_FORCE_TKG: bool = False
     VLLM_NEURON_DISABLE_NKI_KERNELS: bool = False
@@ -83,6 +85,25 @@ if TYPE_CHECKING:
     # Where the GLM-5.3-Flash shadow draft (MTP stage A) writes its per-step scoring
     # records (JSONL, rank 0). Empty = no log, no scoring.
     VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG: str = ""
+    # Worker GC policy after warmup (vllm_neuron/vllm/worker/gc_policy.py):
+    # "freeze_rare_gen2" (freeze + gen-2 threshold 100000), "freeze", or "off".
+    VLLM_NEURON_GC_POLICY: str = "freeze_rare_gen2"
+    # GLM-5.3-Flash row-parallel all-reduce. Both defaults are the as-built path.
+    # The dtype a row-parallel partial crosses the wire in: "fp32" or "bf16".
+    VLLM_NEURON_TP_ALLREDUCE_DTYPE: str = "fp32"
+    # Keep every all-reduce one collective instead of the compiler's 8 MiB tiles.
+    VLLM_NEURON_TP_ALLREDUCE_FUSE: bool = False
+    # GLM-5.3-Flash DSA prefill: a chunk whose top-k selection provably keeps every
+    # token attends its latent window densely (mla_dense_window.py) instead of
+    # selecting and gathering. On by default; 0 restores the sparse path.
+    VLLM_NEURON_MLA_DENSE_WINDOW: bool = True
+    # Divide the GLM-5.3-Flash DSA prefill selection's query rows over the
+    # tensor-parallel ranks. On by default; 0 restores the replicated selection.
+    VLLM_NEURON_DSA_INDEXER_SHARD: bool = True
+    # GLM-5.3-Flash fused glue kernels (``vllm_neuron/functional/glue``): which
+    # kernel serves which call, and how the KDA kernels load their weights.
+    VLLM_NEURON_GLUE_FUSED: str = "1"
+    VLLM_NEURON_GLUE_KDA_DMA_TRANSPOSE: bool = True
 
 
 def maybe_convert_bool(value: str | None) -> bool | None:
@@ -146,20 +167,73 @@ def maybe_convert_float(value: str | None) -> float | None:
     return float(value)
 
 
-#: Device memory a compiled graph keeps on one physical NeuronCore, in GiB.
+#: The value that leaves a KV budget knob at its default: the measured budget.
+MEASURED = "measured"
+
+
+def maybe_measured_float(value: str | None) -> float | None:
+    """Return None for an unset, empty or ``"measured"`` value, else the float.
+
+    Raises:
+        ValueError: the value is neither ``"measured"`` nor a number.
+
+    Examples:
+        >>> maybe_measured_float(None), maybe_measured_float("Measured")
+        (None, None)
+        >>> maybe_measured_float("2.5")
+        2.5
+    """
+    if value is None or value.strip().lower() in ("", MEASURED):
+        return None
+    return float(value)
+
+
+#: Device memory assumed for the compiled graphs, in GiB per logical NeuronCore,
+#: when it cannot be read from the compile cache.
 #:
-#: A logical NeuronCore is two physical cores, and the Neuron runtime allocates
-#: and accounts memory on each physical core separately. A staged graph puts its
-#: shared scratchpad and most of its code on one of the pair, so the KV cache
-#: budget has to leave that much room on a single physical core rather than on
-#: the logical pair.
-#:
-#: The default is a measured figure rounded up for margin: on trn2, a
-#: GLM-5.3-Flash prefill graph at bucket 1024 held 4.567 GiB on the even
-#: physical core of every rank (3.875 GiB of shared scratchpad plus 705 MiB of
-#: graph) against 159.9 MiB on the odd one. Another model, another bucket or
-#: another compiler release moves it, which is what the override is for.
+#: The KV cache budget takes the graphs' need from the NEFFs the compile cache
+#: holds for the served configuration
+#: (:mod:`vllm_neuron.vllm.worker.neff_memory`). On a cold cache, where warmup
+#: has yet to compile some of those graphs, and for graphs the cache cannot tie
+#: to the configuration (a drafter's, a vision encoder's), this figure stands in.
+#: It is the September measurement rounded up: a GLM-5.3-Flash prefill graph at
+#: bucket 1024 held 4.567 GiB per rank (3.875 GiB of shared scratchpad plus 705
+#: MiB of graph). ``VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB`` overrides both the
+#: measured need and this figure.
 DEFAULT_DEVICE_GRAPH_RESERVE_GIB = 5.0
+
+#: What ``VLLM_NEURON_GLUE_FUSED=1``, and an unset switch, selects: each fused glue
+#: kernel at the prefill row buckets where it beat its torch route, and nothing else.
+#:
+#: The buckets are the ones where the in-graph device A/B
+#: (``test/hardware/benchmark_glue_block.py``) measured a win. It runs one
+#: GLM-5.3-Flash KDA + MoE layer per graph at one TP=64 rank's shapes on trn2, and
+#: compares each value with ``0``; ``reports/glue.md`` (round 2, the in-graph A/B
+#: section) and ``reports/glue-c.md`` have the tables. Per layer:
+#:
+#: * ``mhc_pre:prefill@128`` and ``mhc_pre:prefill@1024``: the fused mHC pre-mix and
+#:   collapse at both mHC sites, with the feed-forward RMSNorm at the feed-forward
+#:   site, 274.9 us faster on a 2.54 ms 128-row layer and 6.92 ms faster on a 16.0 ms
+#:   1024-row layer. At 1024 rows the torch route's collapse at the feed-forward site,
+#:   whose rows the MoE router reads, compiles to a per-token loop.
+#: * ``mhc_post:prefill@128`` and ``mhc_post:prefill@1024``: the bf16 mHC combine,
+#:   45.2 us faster at 128 rows and 275.0 us faster on a 16.0 ms 1024-row layer, but
+#:   197.1 us slower on a 9.07 ms 512-row layer. So the default names the measured
+#:   buckets, not a range, and a row count that was not measured keeps the torch route.
+#:
+#: Two loads of one graph have measured up to 11 us apart, so a gain of 11 us or less
+#: is not a win. kda_projections was 7.1 us faster at 128 rows, and 0.3 us slower when
+#: the layer's two reductions were chains of 4 and 8 all-reduces: inside that bound, so
+#: it is not in the default. kda_output was 24.1 us slower at 128 rows. No kernel is
+#: selected at decode: on the served TP=64 line, ``all`` made the bs=1 decode step
+#: 1.75 ms longer, while the single-rank benchmark (no tensor-parallel collectives)
+#: measured it shorter. So every decode graph under ``1`` is the graph ``0`` traces.
+#:
+#: Measure a bucket before adding it, on a device lease, with
+#: ``python test/hardware/benchmark_glue_block.py --output <json> --cases
+#: kda:prefill:<rows> --variants off aa=0 <kernel> default``.
+DEFAULT_GLUE_FUSED_SPEC = (
+    "mhc_pre:prefill@128,mhc_pre:prefill@1024,mhc_post:prefill@128,mhc_post:prefill@1024")
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
@@ -197,21 +271,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if os.getenv("VLLM_NEURON_MIN_KV_BUDGET_GIB") is not None
         else 1.0
     ),
-    # KV cap fraction applied to GMU-scaled total HBM budget.
-    # TODO: Interim global safety cap. Replace with a better compile-safe
-    # estimator that adapts across model families and hardware generations.
-    "VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION": lambda: (
-        maybe_convert_float(os.getenv("VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION"))
-        if os.getenv("VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION") is not None
-        else 0.30
+    # Optional cap on the KV cache budget, as a fraction in (0, 1] of the
+    # GMU-scaled total HBM. Unset or "measured" (the default): no cap, the budget
+    # is the measured free HBM less the compiled graphs' need.
+    "VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION": lambda: maybe_measured_float(
+        os.getenv("VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION")
     ),
-    # Graph reserve (GiB) held back on each physical NeuronCore when the KV
-    # cache budget is computed. See DEFAULT_DEVICE_GRAPH_RESERVE_GIB above for
-    # where the default comes from.
-    "VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB": lambda: (
-        maybe_convert_float(os.getenv("VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB"))
-        if os.getenv("VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB") is not None
-        else DEFAULT_DEVICE_GRAPH_RESERVE_GIB
+    # Optional override, in GiB per logical NeuronCore, of the device memory the
+    # compiled graphs need. Unset or "measured" (the default): read from the
+    # compile cache's NEFFs, or DEFAULT_DEVICE_GRAPH_RESERVE_GIB on a cold cache.
+    "VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB": lambda: maybe_measured_float(
+        os.getenv("VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB")
     ),
     # Local cache directory for model checkpoints
     "VLLM_NEURON_CHECKPOINT_CACHE": lambda: os.getenv(
@@ -243,6 +313,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Disable NKI kernels — forces can_run_kernel() to return False
     "VLLM_NEURON_DISABLE_NKI_KERNELS": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_DISABLE_NKI_KERNELS")) or False
+    ),
+    # Keep libtorch_neuronx_lite's own compile cache keys: do not fold the NKI
+    # kernel-source digest (vllm_neuron/compile_cache_key.py) into the graph and
+    # kernel cache keys. A warm cache may then serve a stale kernel.
+    "VLLM_NEURON_DISABLE_KERNEL_DIGEST_KEY": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_DISABLE_KERNEL_DIGEST_KEY")) or False
     ),
     # Skip prefill warmup/compilation without requiring kv-transfer-config.
     # Useful for decode-only profiling workflows.
@@ -362,6 +438,62 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # empty = no log. Read with VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT (the draft count).
     "VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG": lambda: (
         os.getenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG", "") or ""
+    ),
+    # GC policy each worker applies once after warmup. "freeze_rare_gen2" freezes
+    # the heap and raises only the gen-2 threshold, so full passes stop running every
+    # ~11 bs=64 steps; "freeze" is the freeze alone; "off" keeps CPython's default GC.
+    "VLLM_NEURON_GC_POLICY": lambda: os.getenv(
+        "VLLM_NEURON_GC_POLICY", "freeze_rare_gen2"
+    ),
+    # ================== GLM-5.3-Flash Row-Parallel All-Reduce ==================
+    # The wire dtype of the tensor-parallel all-reduce at GLM-5.3-Flash's
+    # row-parallel sites (``model/glm5_next/collective_policy.py``). "fp32" (the
+    # default) reduces each rank's fp32 partial as computed; "bf16" rounds it to
+    # bfloat16 first, which halves the bytes every rank moves. Case and spaces are
+    # ignored; any other value is refused where it is read.
+    "VLLM_NEURON_TP_ALLREDUCE_DTYPE": lambda: (
+        os.getenv("VLLM_NEURON_TP_ALLREDUCE_DTYPE", "fp32").strip().lower()
+    ),
+    # "1" asks neuronx-cc to keep each all-reduce one collective. By default its
+    # SimpleAllReduceTiling pass splits an all-reduce larger than 8 MiB into up to
+    # four. Read by ``collective_policy.fuse_compiler_args``. Off by default.
+    "VLLM_NEURON_TP_ALLREDUCE_FUSE": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_TP_ALLREDUCE_FUSE")) or False
+    ),
+    # ================== GLM-5.3-Flash DSA Prefill ==================
+    # Attend a prefill chunk densely over its latent window when the bound its graph
+    # can prove, min(max_model_len, window rows), is within the DSA identity bound
+    # (index_topk + index_kpool - 1 tokens): the top-k then keeps every token, so the
+    # indexer's query side, scoring, top-k and the sparse gathers are skipped. Read at
+    # trace time by ``model/glm5_next/dsa_dense_window.py``; a change needs a new
+    # compile. On by default; set 0 to restore the sparse path.
+    "VLLM_NEURON_MLA_DENSE_WINDOW": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_MLA_DENSE_WINDOW")) is not False
+    ),
+    # ================== GLM-5.3-Flash DSA Indexer ==================
+    # Shard the DSA prefill selection (score GEMM, causal bound, top-k, sentinel
+    # order) by query rows over the TP ranks, with one all-gather of the pool ids
+    # per DSA layer (``functional/dsa/indexer_shard.py``). Read at trace time, so
+    # a compiled graph keeps the value it was traced with. On by default; 0 runs
+    # the replicated selection on every rank.
+    "VLLM_NEURON_DSA_INDEXER_SHARD": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_DSA_INDEXER_SHARD", "1"))
+    ),
+    # ================== GLM-5.3-Flash Fused Glue Kernels ==================
+    # Which fused glue kernel (``vllm_neuron/functional/glue``) serves which call.
+    # ``0``: none, every site takes its torch route. ``1`` (the default):
+    # DEFAULT_GLUE_FUSED_SPEC. ``all``: every kernel at every phase and row count.
+    # Otherwise a comma list of rules ``kernel[:phase][@rows]``: ``kernel`` is one
+    # of mhc_pre, kda_projections, kda_output, mhc_post; ``phase`` is prefill,
+    # decode or all (the default); ``rows`` is N, N-M, N- or -M (inclusive, N >= 1).
+    # A call is fused when any rule selects it, and when the kernel's own shape
+    # rules admit it. Read when a graph is traced; a malformed value raises
+    # ValueError there. Example: ``mhc_post:prefill,mhc_pre:decode@2-64``.
+    "VLLM_NEURON_GLUE_FUSED": lambda: os.getenv("VLLM_NEURON_GLUE_FUSED", "1").strip(),
+    # How the KDA glue kernels load their weights' transposes: ``1`` (the default)
+    # by DMA transpose, ``0`` by a plain DMA and tensor-engine transposes.
+    "VLLM_NEURON_GLUE_KDA_DMA_TRANSPOSE": lambda: bool(
+        maybe_convert_bool(os.getenv("VLLM_NEURON_GLUE_KDA_DMA_TRANSPOSE", "1"))
     ),
 }
 

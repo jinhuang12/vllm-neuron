@@ -38,6 +38,7 @@ Each bucket (sequence length × batch size combination) produces a separate NEFF
 | Topic | Description |
 | --- | --- |
 | [Compilation cache](compilation_cache.md) | Compilation cache (hit/miss, remote store) |
+| [Kernel source digest](kernel_source_digest.md) | Kernel-source digest folded into the cache keys |
 | [CPU compilation](cpu_compilation.md) | Ahead-of-time CPU compilation (NEFF extraction) |
 | [FX passes architecture](fx_passes_design.md) | FX passes architecture |
 | [Aliasing output rewrite pass](aliasing_output_rewrite_pass.md) | Aliasing output rewrite pass |
@@ -49,6 +50,7 @@ Each bucket (sequence length × batch size combination) produces a separate NEFF
 :hidden:
 
 compilation_cache
+kernel_source_digest
 cpu_compilation
 fx_passes_design
 aliasing_output_rewrite_pass

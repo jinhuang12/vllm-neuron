@@ -111,10 +111,14 @@ def test_selected_at_the_served_shape_matches_the_oracle_and_5938748(batch, monk
 
 @pytest.mark.parametrize("selected", [False, True])
 def test_two_programs_split_the_requests_and_agree_with_one(selected, monkeypatch):
-    args = _case(4, 1, 512, 8, 128, 12, seed=31, selected=selected, width=512)
+    # Two heads: the general kernel, which gives each request whole to one program, so
+    # one and two programs agree bit for bit. (One head is the key-split kernel's; its
+    # one- and two-program results agree to a tolerance, test_mla_decode_split.py.)
+    args = _case(4, 2, 512, 8, 128, 12, seed=31, selected=selected, width=512)
     one, counts_one = _run(args, monkeypatch)
     two, counts_two = _run(args, monkeypatch, lnc="2")
     assert counts_one[2] == 0 and counts_two[2] == 1
+    assert MD.mla_decode_split_counts() == (0, 0)
     assert torch.equal(one, two)
     _check(two, MD.mla_decode_attention_torch_oracle(*args), "grid [2] vs oracle")
 

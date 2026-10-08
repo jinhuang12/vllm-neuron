@@ -623,9 +623,14 @@ def test_the_index_rows_tap_holds_the_rows_the_indexer_emitted(tmp_path, monkeyp
         )
 
 
-def test_the_output_projection_taps_are_the_input_the_partial_and_the_whole(tmp_path, monkeypatch):
+@pytest.mark.parametrize("wire", ["fp32", "bf16"])
+def test_the_output_projection_taps_are_the_input_the_partial_and_the_whole(
+    tmp_path, monkeypatch, wire
+):
     """The partial is this rank's own share, so a reduce that adds shows in one file only."""
     _require_cpu_mode()
+    # ``collective_policy``'s wire dtype, pinned so an exported switch does not decide.
+    monkeypatch.setenv("VLLM_NEURON_TP_ALLREDUCE_DTYPE", wire)
     save_dir = tmp_path / "layer-streams"
     layers, tap, runner, root = _run_a_dumping_prefill(save_dir, monkeypatch)
     added = 7.0
@@ -665,7 +670,9 @@ def test_the_output_projection_taps_are_the_input_the_partial_and_the_whole(tmp_
     # The cast is part of the claim, so the reference carries it rather than a tolerance
     # absorbing it: the method adds in float32 and hands the whole back in the input's
     # dtype, so the partial plus the added amount, under that same cast, is the file.
-    expected = (partial + added).to(handed.dtype).float()
+    # On the bf16 wire the partial is rounded to bfloat16 before the add.
+    sent = partial if wire == "fp32" else partial.to(torch.bfloat16)
+    expected = (sent + added).to(handed.dtype).float()
     assert torch.equal(whole, expected), (
         f"the reduce added {added} to every element, so the reduced file must be the partial "
         f"plus that under the output cast; they differ by "

@@ -12,6 +12,7 @@ import inspect
 import math
 import os
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -682,6 +683,7 @@ def _assert_route_predicate_r3(label: str, before: dict, after: dict) -> None:
     )
 
 
+@mock.patch.dict("os.environ", {"VLLM_NEURON_GLUE_FUSED": "all"})  # every glue kernel on its route, whatever the served default selects
 def test_the_generation_is_eight_tokens_and_every_step_matches_the_reference():
     """Eight tokens through the runner's converter, each step matching the torch reference."""
     _require_cpu_mode()

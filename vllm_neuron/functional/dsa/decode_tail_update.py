@@ -975,6 +975,21 @@ def _require_rows(tail_bank, slots, key, score, ape, position) -> tuple[int, int
     return batch, rows, pool, depth
 
 
+@torch._dynamo.assume_constant_result
+def _record_rows_dispatch(batch: int, rows: int, pool_size: int, depth: int) -> None:
+    """Count the T-row ring kernel's dispatch and record it, off the compiled graph.
+
+    One folded helper for the count and the kernel identity: a store to module state from
+    the traced seam itself would recompile the graph (``test_dispatch_counters_off_the_trace``).
+    """
+    _COUNTERS.nki_dispatch += 1
+    _COUNTERS.last_kernel = _kernel_identity_of(dsa_decode_ring_rows_kernel)
+    logger.info(
+        "[dsa-decode-tail-update] kernel=nki entry=ring_rows batch=%d rows=%d pool_size=%d depth=%d",
+        batch, rows, pool_size, depth,
+    )
+
+
 def dsa_decode_ring_rows(tail_bank: Tensor, slots: Tensor, key: Tensor, score: Tensor,
                          ape: Tensor, position: Tensor) -> tuple[Tensor, Tensor]:
     """Advance each request's ring by its ``rows`` tokens in one step. Nothing is written
@@ -1005,8 +1020,7 @@ def dsa_decode_ring_rows(tail_bank: Tensor, slots: Tensor, key: Tensor, score: T
     if not usable:
         _count_torch_fallback()
         return dsa_decode_ring_rows_torch_oracle(tail_bank, slots, key, score, ape, position)
-    _count_nki_dispatch()
-    _COUNTERS.last_kernel = _kernel_identity_of(dsa_decode_ring_rows_kernel)
+    _record_rows_dispatch(batch, rows, pool, depth)
     width = TAIL_HALVES * depth * int(tail_bank.shape[3])
     pooled, rings = wrap_nki(dsa_decode_ring_rows_kernel)(
         tail_bank.reshape(int(tail_bank.shape[0]), width).contiguous(),

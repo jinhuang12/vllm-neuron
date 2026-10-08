@@ -24,7 +24,7 @@ from vllm_neuron.vllm.worker.neuron_worker import NeuronWorker
 CAPABILITY_FIELD = "_model_supports_independent_prefill_buckets"
 
 
-def _config(monkeypatch, model_cls, neuron_config):
+def _config(monkeypatch, model_cls, neuron_config, *, max_model_len: int = 4096):
     """Keep model resolution real at the class boundary, without loading weights."""
     monkeypatch.setattr(
         ModelRegistry,
@@ -38,7 +38,7 @@ def _config(monkeypatch, model_cls, neuron_config):
             uses_mrope=False,
             uses_xdrope_dim=0,
             hf_config=SimpleNamespace(vocab_size=256),
-            max_model_len=4096,
+            max_model_len=max_model_len,
             enable_prompt_embeds=False,
             get_inputs_embeds_size=lambda: 0,
         ),
@@ -74,6 +74,13 @@ def test_generic_segmented_kernel_still_requires_equal_query_buckets():
     assert validate_kv_segment_size_buckets([1024], [1024]) == [1024]
 
 
+def test_generic_segmented_kernel_still_takes_one_segment():
+    """Its kernel needs seqlen_q == kv_segment_size; several segments are for a model
+    whose kernel takes the query length independently."""
+    with pytest.raises(ValueError, match="Only one segment size"):
+        validate_kv_segment_size_buckets([512, 1024], [512, 1024])
+
+
 @pytest.mark.parametrize(
     "segments,match",
     [
@@ -83,7 +90,6 @@ def test_generic_segmented_kernel_still_requires_equal_query_buckets():
         (["1024"], "must be an integer"),
         ([128], "not a supported segment size"),
         ([1024, 512], "strictly ascending"),
-        ([512, 1024], "Only one segment size"),
     ],
 )
 def test_independent_queries_keep_all_segment_guards(segments, match):
@@ -123,14 +129,18 @@ def test_glm_resolves_independent_queries_and_warms_each_pair(
     knobs = {"num_batched_tokens_buckets": [128, 1024]}
     if explicit_segments:
         knobs["kv_segment_size_buckets"] = [1024]
-    config = _config(monkeypatch, Glm5NextForConditionalGeneration, knobs)
+    # One 1024 segment plus the 1024 query bucket is a 2048-token prefill window, so the
+    # model length here is 2048; the 4096-token lines are read in test_prompt_window.py.
+    config = _config(
+        monkeypatch, Glm5NextForConditionalGeneration, knobs, max_model_len=2048
+    )
     runner = _runner(monkeypatch, config)
     assert runner.neuron_config._model_supports_independent_prefill_buckets is True
     assert runner.neuron_config.num_batched_tokens_buckets == [128, 1024]
     assert runner.neuron_config.kv_segment_size_buckets == [1024]
     assert runner.max_num_batched_tokens == 1024
     assert config.scheduler_config.max_num_batched_tokens == 1024
-    assert runner.max_model_len == 4096
+    assert runner.max_model_len == 2048
 
     worker = NeuronWorker.__new__(NeuronWorker)
     worker.model_runner = runner
@@ -154,7 +164,9 @@ def test_glm_resolves_independent_queries_and_warms_each_pair(
 @pytest.mark.parametrize("explicit_segments", [False, True])
 def test_glm_automatic_query_buckets_are_unchanged(monkeypatch, explicit_segments):
     knobs = {"kv_segment_size_buckets": [1024]} if explicit_segments else {}
-    config = _config(monkeypatch, Glm5NextForConditionalGeneration, knobs)
+    config = _config(
+        monkeypatch, Glm5NextForConditionalGeneration, knobs, max_model_len=2048
+    )
     runner = _runner(monkeypatch, config)
     assert runner.neuron_config.num_batched_tokens_buckets == [1024]
     assert runner.neuron_config.kv_segment_size_buckets == [1024]
@@ -176,6 +188,7 @@ def test_independent_queries_do_not_allow_an_unmaterialized_cached_prefix(monkey
         monkeypatch,
         Glm5NextForConditionalGeneration,
         {"num_batched_tokens_buckets": [128, 1024], "kv_segment_size_buckets": [1024]},
+        max_model_len=2048,
     )
     runner = _runner(monkeypatch, config)
     runner._glm5next_side_cache_positions = {}

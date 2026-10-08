@@ -8,6 +8,7 @@ segment has to enter the recurrence with the state the first left.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -420,6 +421,7 @@ def test_the_runner_hands_the_position_to_the_layer(
     assert "not_a_layer_keyword" in str(raised.value)
 
 
+@mock.patch.dict("os.environ", {"VLLM_NEURON_GLUE_FUSED": "all"})  # every glue kernel on its route, whatever the served default selects
 def test_the_segmented_drive_took_the_kernel_route(
     stack: SimpleNamespace,
 ) -> None:

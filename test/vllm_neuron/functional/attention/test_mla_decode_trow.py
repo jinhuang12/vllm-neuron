@@ -8,7 +8,14 @@ before the next one attends. The T-row call sees none of those writes -- it read
 step's own rows off ``written`` -- so the comparison is bit for bit, and it proves the
 per-row causal limit, the overlay of earlier rows of the same step, and the own-row
 stand-in at once. Every case reads the dispatch counters, so a torch answer cannot
-pass for the kernel; ``T = 1`` is pinned to commit ea04c81's kernel bit for bit.
+pass for the kernel.
+
+Two one-row kernels serve ``T = 1``: at the served per-rank shape (one head, latent 512,
+128-row pages) the key-split kernel of ``test_mla_decode_split.py``, elsewhere the general
+kernel, which is commit ea04c81's bit for bit. A T-row step always runs the general
+kernel, so it equals ``T`` sequential general-kernel steps bit for bit and ``T``
+sequential key-split steps within that kernel's own bound (:data:`REL`, the bound
+``test_mla_decode_split.py`` holds it to against the general kernel).
 """
 
 from __future__ import annotations
@@ -22,6 +29,8 @@ from vllm_neuron.functional.attention import mla_decode as MD
 LATENT, PAGE = 512, 128
 ROWS = (2, 4, 6)
 BATCHES = (1, 4)
+#: The key-split kernel's relative bound against the general kernel (test_mla_decode_split.py).
+REL = 2e-5
 
 
 def _case(batch, rows, heads, latent, pages, page, *, seed, selected, width=None,
@@ -83,6 +92,20 @@ def _sequential(module, q, bank, table, start, written, scale, page, topk):
     return out
 
 
+def _sequential_general(monkeypatch, *args):
+    """The sequential reference through the general kernel only, however the shape serves."""
+    with monkeypatch.context() as m:
+        m.setattr(MD, "_split_serves", lambda *_: False)
+        MD.reset_mla_decode_dispatch_counters()
+        out = _sequential(MD, *args)
+    assert MD.mla_decode_split_counts() == (0, 0)
+    return out
+
+
+def _within_split_bound(got, want):
+    torch.testing.assert_close(got, want, rtol=10 * REL, atol=REL * float(want.abs().max()))
+
+
 def _run(args, monkeypatch, lnc=None):
     if lnc is None:
         monkeypatch.delenv("NEURON_LOGICAL_NC_CONFIG", raising=False)
@@ -104,9 +127,15 @@ def test_dense_rows_equal_sequential_single_row_steps_bit_for_bit(rows, batch, m
                  selected=False, starts=starts)
     out = _run(args, monkeypatch)
     assert MD.mla_decode_route_counts() == (1, 0, 0)
+    assert MD.mla_decode_split_counts() == (0, 0)
     assert out.shape == (batch * rows, 1, LATENT)
-    want = _sequential(MD, *args)
+    want = _sequential_general(monkeypatch, *args)
     assert torch.equal(out, want)
+    # As dispatched, the one-row steps at this served shape are the key-split kernel's.
+    MD.reset_mla_decode_dispatch_counters()
+    served = _sequential(MD, *args)
+    assert MD.mla_decode_split_counts() == (batch * rows, 0)
+    _within_split_bound(out, served)
     torch.testing.assert_close(out, MD.mla_decode_attention_torch_oracle(*args), rtol=2e-4,
                                atol=2e-5 * float(want.abs().max()))
 
@@ -122,8 +151,13 @@ def test_selected_rows_equal_sequential_single_row_steps_bit_for_bit(rows, batch
                  selected=True, width=2048, starts=starts)
     out = _run(args, monkeypatch)
     assert MD.mla_decode_route_counts() == (0, 1, 0)
-    want = _sequential(MD, *args)
+    assert MD.mla_decode_split_counts() == (0, 0)
+    want = _sequential_general(monkeypatch, *args)
     assert torch.equal(out, want)
+    MD.reset_mla_decode_dispatch_counters()
+    served = _sequential(MD, *args)
+    assert MD.mla_decode_split_counts() == (batch * rows, 0)
+    _within_split_bound(out, served)
     torch.testing.assert_close(out, MD.mla_decode_attention_torch_oracle(*args), rtol=2e-4,
                                atol=2e-5 * float(want.abs().max()))
 
@@ -133,7 +167,10 @@ def test_heads_and_small_pages_with_rows(selected, monkeypatch):
     # Four heads, latent 256, 16-row pages: several pieces per 128-row chunk, T = 3.
     args = _case(3, 3, 4, 256, 16, 16, seed=41, selected=selected, width=256)
     out = _run(args, monkeypatch)
-    assert torch.equal(out, _sequential(MD, *args))
+    MD.reset_mla_decode_dispatch_counters()
+    want = _sequential(MD, *args)
+    assert MD.mla_decode_split_counts() == (0, 0)
+    assert torch.equal(out, want)
 
 
 @pytest.mark.parametrize("selected", [False, True])
@@ -161,14 +198,52 @@ def test_the_steps_own_rows_are_read_from_written_not_the_bank(selected, monkeyp
 @pytest.mark.parametrize("selected", [False, True])
 @pytest.mark.parametrize("batch", BATCHES)
 def test_one_row_is_commit_ea04c81s_kernel_bit_for_bit(batch, selected, monkeypatch):
+    # Two heads: a shape the key-split kernel does not serve, so the one-row call is the
+    # general kernel -- ea04c81's, bit for bit.
     before = load_ea04c81().mla_decode
     pages, width = (32, 2048) if selected else (16, None)
     starts = ([4095, 3000, 2052, 4000] if selected else [2047, 1000, 2000, 517])[:batch]
+    args = _case(batch, 1, 2, LATENT, pages, PAGE, seed=61 + batch,
+                 selected=selected, width=width, starts=starts)
+    monkeypatch.delenv("NEURON_LOGICAL_NC_CONFIG", raising=False)
+    want = before.mla_decode_attention(*args[:5], args[5], args[6], args[7])
+    out = _run(args, monkeypatch)
+    assert MD.mla_decode_split_counts() == (0, 0)
+    assert torch.equal(out, want)
+
+
+@pytest.mark.parametrize("selected", [False, True])
+@pytest.mark.parametrize("batch", BATCHES)
+def test_one_row_at_the_served_shape_is_the_key_split_kernel_within_its_bound(
+        batch, selected, monkeypatch):
+    # One head at the served shape: the one-row call is the key-split kernel
+    # (test_mla_decode_split.py pins it), within REL of ea04c81's general kernel.
+    before = load_ea04c81().mla_decode
+    pages, width = (64, 2048) if selected else (16, None)
+    starts = ([8191, 3000, 2052, 4000] if selected else [2047, 1000, 2000, 517])[:batch]
     args = _case(batch, 1, 1, LATENT, pages, PAGE, seed=61 + batch,
                  selected=selected, width=width, starts=starts)
     monkeypatch.delenv("NEURON_LOGICAL_NC_CONFIG", raising=False)
     want = before.mla_decode_attention(*args[:5], args[5], args[6], args[7])
-    assert torch.equal(_run(args, monkeypatch), want)
+    out = _run(args, monkeypatch)
+    assert MD.mla_decode_split_counts() == (1, 0)
+    _within_split_bound(out, want)
+
+
+@pytest.mark.parametrize("selected", [False, True])
+def test_rows_keep_the_general_kernel_where_the_split_kernel_serves_one_row(
+        selected, monkeypatch):
+    # The served shape on two programs: one row per request is the key-split kernel on
+    # both programs; T rows per request is the general kernel, the requests split.
+    pages, width = (64, 2048) if selected else (16, None)
+    one_row = _case(4, 1, 1, LATENT, pages, PAGE, seed=71, selected=selected, width=width)
+    _run(one_row, monkeypatch, lnc="2")
+    assert MD.mla_decode_split_counts() == (1, 1)
+    args = _case(4, 4, 1, LATENT, pages, PAGE, seed=71, selected=selected, width=width)
+    out = _run(args, monkeypatch, lnc="2")
+    assert MD.mla_decode_split_counts() == (0, 0)
+    assert MD.mla_decode_route_counts()[2] == 1
+    assert torch.equal(out, _sequential_general(monkeypatch, *args))
 
 
 def test_refusals_name_the_rows():

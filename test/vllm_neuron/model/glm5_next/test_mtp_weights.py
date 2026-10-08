@@ -359,7 +359,14 @@ def test_every_mtp_parameter_matches_the_header_dtype_and_its_sibling_shard_geom
         else:
             assert name.startswith(layer_prefix), name
             assert leaf in mtp_only_shapes, name
-            assert geometry is None, (name, geometry)
+            if leaf == "eh_proj_weight":
+                # Row-parallel (functional/mtp/tail_in.py): each rank holds H / world
+                # rows and the layer_input slices are all-gathered in rank order.
+                assert (geometry.shard_dim, geometry.shard_size, geometry.num_shards) == (
+                    0, hidden // WORLD, WORLD,
+                ), (name, geometry)
+            else:
+                assert geometry is None, (name, geometry)
             assert len(key_list) == 1, name
             assert real_headers[key_list[0]][1] == mtp_only_shapes[leaf], (
                 name,
