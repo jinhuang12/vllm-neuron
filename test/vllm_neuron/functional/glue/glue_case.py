@@ -22,6 +22,7 @@ checkpoint load squeezes them into) with random block grids; the DSA attention i
 
 from __future__ import annotations
 
+import inspect
 import json
 from pathlib import Path
 from types import MethodType, SimpleNamespace
@@ -342,9 +343,16 @@ def dsa_carriers(case, batch: int, *, context: int = 1024, seed: int = 31,
 
 
 def _ffn_owner(model, cfg):
-    """The stack's ``_ffn_half`` and ``_rms_norm`` bound to a stand-in holding the config."""
+    """The stack's ``_ffn_half`` and ``_rms_norm`` bound to a stand-in holding the config.
+
+    ``ffn_static``: whether this tree's ``_ffn_half`` is a static method that takes the
+    config and the norm by name (the 0a08ff4 snapshot's is a method of the model).
+    Read here, outside any trace.
+    """
     owner = SimpleNamespace(text_config=cfg)
     owner._rms_norm = MethodType(model.Glm5NextModel._rms_norm, owner)
+    owner.ffn_static = isinstance(
+        inspect.getattr_static(model.Glm5NextModel, "_ffn_half"), staticmethod)
     return owner
 
 
@@ -356,10 +364,10 @@ def layer_step(model, case, streams: torch.Tensor, carriers: dict,
     streams = layer(streams, **keywords, streams=streams)
     owner = case.ffn_owner  # built with the case: a graph cannot construct it
     site = model._mhc_ffn_site(layer, streams)
+    ffn = dict(quant_config=quant, block_size=None, moe_group=None, tp_degree=TP_PER_EP,
+               expert_parallel_rank=expert_rank)
+    if owner.ffn_static:  # as ``Glm5NextModel.forward`` calls it
+        ffn.update(text_config=owner.text_config, rms_norm=owner._rms_norm)
+    head = () if owner.ffn_static else (owner,)
     return site.forward(
-        streams,
-        lambda single: model.Glm5NextModel._ffn_half(
-            owner, layer, single, quant_config=quant, block_size=None, moe_group=None,
-            tp_degree=TP_PER_EP, expert_parallel_rank=expert_rank,
-        ),
-    )
+        streams, lambda single: model.Glm5NextModel._ffn_half(*head, layer, single, **ffn))
