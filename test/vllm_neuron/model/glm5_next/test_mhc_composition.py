@@ -785,12 +785,18 @@ class _StubSite:
         self.given: list[torch.Tensor] = []
         self.returned: list[torch.Tensor] = []
         self.results: list[torch.Tensor] = []
+        self.norms: list[object] = []
 
-    def forward(self, residual: torch.Tensor, sublayer: object) -> torch.Tensor:
+    def forward(
+        self, residual: torch.Tensor, sublayer: object, norm: object = None
+    ) -> torch.Tensor:
         self.residuals.append(tuple(residual.shape))
+        self.norms.append(norm)
         collapsed = residual.mean(dim=1)
         self.given.append(collapsed)
-        produced = sublayer(collapsed)
+        # With a norm, the torch route's call: no normed tensor, the sub-block
+        # normalises.
+        produced = sublayer(collapsed) if norm is None else sublayer(collapsed, None)
         self.returned.append(produced)
         # FP32 out, as the combine seam does on purpose
         # -- the carrier decides what to cast back to, and an
@@ -842,6 +848,9 @@ def _stub_stack(text_config, *, tokens: int = TOKENS, dtype=torch.float32):
     hidden = int(text_config.hidden_size)
     stubs = [_StubLayer("kda"), _StubLayer("dsa")]
     for stub in stubs:
+        stub.post_attention_layernorm_weight = nn.Parameter(
+            torch.ones(hidden, dtype=dtype), requires_grad=False
+        )
         stub.ffn_site = _StubSite()
         setattr(
             stub,
@@ -1036,9 +1045,17 @@ def test_the_ffn_site_runs_over_ffn_halfs_unchanged_return() -> None:
             "collector",
             "expert_parallel_rank",
             "moe_group",
+            "normed",
             "quant_config",
             "tp_degree",
         ]
+        # The stub site takes its torch route, so no normed tensor is handed over.
+        assert call["kwargs"]["normed"] is None
+        # The site is handed the layer's own feed-forward gain and the config's eps.
+        assert len(site.norms) == 1 and site.norms[0] is not None
+        gain, eps = site.norms[0]
+        assert gain is call["layer"].post_attention_layernorm_weight
+        assert eps == float(text_config.rms_norm_eps)
         assert call["kwargs"]["quant_config"] is QUANT
         assert call["kwargs"]["block_size"] is BLOCKS
         assert call["kwargs"]["moe_group"] is MOE_GROUP

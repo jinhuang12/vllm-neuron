@@ -16,7 +16,9 @@ that opens no device node:
 * LNC2: compile only (BIRSim runs one core).
 
 Served dtypes and geometry: one rank's shapes at B in {1, 4, 64}, both transpose modes
-of the two KDA kernels.
+of the two KDA kernels. The two mhc_pre kernels (with and without the feed-forward norm)
+also run at the prefill row counts their token tiles walk: one tile, 200 rows (a whole
+tile, then a partial one) and the served 1024-row chunk.
 """
 
 from __future__ import annotations
@@ -34,8 +36,11 @@ _DROP = ("NKI_SIMULATOR", "NKI_PRECISE_FP", "VLLM_NEURON_CPU_MODE", "VLLM_NEURON
 _PIN = {"NEURON_PLATFORM_TARGET_OVERRIDE": "trn2", "PYTHONDONTWRITEBYTECODE": "1"}
 BATCHES = (1, 4, 64)
 #: (kernel, DMA transpose) cases; ``None`` where the kernel has no transpose switch.
-CASES = (("mhc_pre", None), ("kda_projections", True), ("kda_projections", False),
-         ("kda_output", True), ("kda_output", False), ("combine_bf16", None))
+CASES = (("mhc_pre", None), ("mhc_pre_norm", None), ("kda_projections", True),
+         ("kda_projections", False), ("kda_output", True), ("kda_output", False),
+         ("combine_bf16", None))
+#: Prefill row counts, for the two mhc_pre kernels only.
+TILED_ROWS = (128, 200, 1024)
 #: Tolerances, as the simulator tests state them (see each test module's docstring).
 POST_ATOL = COMB_ATOL = 2e-5
 PROJ_RTOL = 2e-6
@@ -82,12 +87,16 @@ def _child() -> None:
         return k(**args)
 
     def build(name, batch, dma):
-        if name == "mhc_pre":
+        if name in ("mhc_pre", "mhc_pre_norm"):
             args = dict(residual=rnd((batch, streams, hidden), scale=0.5),
                         fn=rnd((mix, streams * hidden), scale=(streams * hidden) ** -0.5, seed=1),
                         hc_scale=np.array([0.1, 0.2, 0.3], np.float32),
                         hc_base=rnd((mix,), np.float32, 0.5, 2))
-            return mhc_pre.mhc_pre_kernel, args
+            if name == "mhc_pre":
+                return mhc_pre.mhc_pre_kernel, args
+            args.update(norm_gain=(1.0 + rnd((hidden,), np.float32, 0.05, 5)).astype(bf),
+                        RMS_EPS=1e-6, HC_EPS=1e-6, POST_MULT=2.0, NORM_EPS=1e-5)
+            return mhc_pre.mhc_pre_norm_kernel, args
         if name == "kda_projections":
             shapes = dict(q_w=(width, hidden), k_w=(width, hidden), v_w=(width, hidden),
                           b_w=(1, hidden), f_a_w=(rank, hidden), f_b_w=(width, rank),
@@ -111,7 +120,7 @@ def _child() -> None:
     def check(name, args, out):
         """``(ok, reading)`` of the BIRSim outputs against the torch expressions."""
         outs = [t(o) for o in (out if isinstance(out, tuple) else (out,))]
-        if name == "mhc_pre":
+        if name in ("mhc_pre", "mhc_pre_norm"):
             r, fn = t(args["residual"]).double(), t(args["fn"]).double()
             sc, base = t(args["hc_scale"]).double(), t(args["hc_base"]).double()
             batch = r.shape[0]
@@ -128,8 +137,17 @@ def _child() -> None:
             d_comb = float((outs[1].double() - comb).abs().max())
             bound = step(x, outs[2]) + CANCEL_RTOL * float(x.abs().max())
             x_ok = bool(((outs[2] - x).abs() <= bound).all())
-            return (d_post <= POST_ATOL and d_comb <= COMB_ATOL and x_ok,
-                    f"post={d_post:.1e} comb={d_comb:.1e} x_within_step={x_ok}")
+            reading = f"post={d_post:.1e} comb={d_comb:.1e} x_within_step={x_ok}"
+            if name == "mhc_pre_norm":
+                # ``_rms_norm`` of the kernel's own (rounded) layer_input: one step
+                # (test_mhc_pre.py's bound; the square sum's order and the rsqrt).
+                li = outs[2]
+                own = (li * torch.rsqrt(li.square().mean(-1, keepdim=True) + 1e-5)
+                       * t(args["norm_gain"])).to(torch.bfloat16).float()
+                n_ok = bool(((outs[3] - own).abs() <= step(own, outs[3])).all())
+                return (d_post <= POST_ATOL and d_comb <= COMB_ATOL and x_ok and n_ok,
+                        reading + f" normed_within_step={n_ok}")
+            return d_post <= POST_ATOL and d_comb <= COMB_ATOL and x_ok, reading
         if name == "kda_projections":
             attn = SimpleNamespace(**{f"{key[:-2]}_proj_weight": t(v).to(torch.bfloat16)
                                       for key, v in args.items() if key.endswith("_w")})
@@ -152,20 +170,21 @@ def _child() -> None:
         ok = bool((d <= bound).all())
         return ok, f"within_bound={ok} max|d|/max|ref|={float(d.max() / want.abs().max()):.1e}"
 
-    for name, dma in CASES:
-        for batch in BATCHES:
-            for lnc in (1, 2):
-                kernel, args = build(name, batch, dma)
-                row = dict(kernel=name, dma=dma, B=batch, lnc=lnc)
-                try:
-                    out = launch(kernel, lnc, args)
-                    row["compiled"] = True
-                    if lnc == 1:
-                        row["agrees"], row["reading"] = check(name, args, out)
-                except Exception as refusal:  # the backend's refusal is the row's reading
-                    row["compiled"] = False
-                    row["reading"] = " ".join(str(refusal).split())[:1500]
-                print(ROW + "|" + json.dumps(row), flush=True)
+    grid = [(name, dma, batch) for name, dma in CASES for batch in BATCHES] + [
+        (name, None, rows) for name in ("mhc_pre", "mhc_pre_norm") for rows in TILED_ROWS]
+    for name, dma, batch in grid:
+        for lnc in (1, 2):
+            kernel, args = build(name, batch, dma)
+            row = dict(kernel=name, dma=dma, B=batch, lnc=lnc)
+            try:
+                out = launch(kernel, lnc, args)
+                row["compiled"] = True
+                if lnc == 1:
+                    row["agrees"], row["reading"] = check(name, args, out)
+            except Exception as refusal:  # the backend's refusal is the row's reading
+                row["compiled"] = False
+                row["reading"] = " ".join(str(refusal).split())[:1500]
+            print(ROW + "|" + json.dumps(row), flush=True)
     fds = 0
     for handle in os.listdir("/proc/self/fd"):
         try:
@@ -192,7 +211,7 @@ def test_every_glue_kernel_passes_the_backend_and_birsim(tmp_path):
     assert done.returncode == 0, done.stderr[-3000:]
     assert rows and rows[-1] == {"neuron_fds": 0}, rows[-1:]
     cases = rows[:-1]
-    assert len(cases) == len(CASES) * len(BATCHES) * 2
+    assert len(cases) == (len(CASES) * len(BATCHES) + 2 * len(TILED_ROWS)) * 2
     refused = [row for row in cases if not row["compiled"]]
     assert refused == [], refused
     disagree = [row for row in cases if row["lnc"] == 1 and not row["agrees"]]

@@ -18,9 +18,9 @@ not reach the graph.)
   nor ``all``'s.
 
 The 1024-row prefill is not traced here: one trace at 1024 rows takes about 300 s on the
-CPU. At 1024 rows only mhc_post can serve (the other kernels' row bounds), so ``1`` and
-``all`` select the same kernels there. ``test_layer_prefill.py`` shows both outputs
-bit-identical to ``0``'s, and ``test/hardware/benchmark_glue_block.py`` records the
+CPU. At 1024 rows the two KDA kernels decline (their row bounds), so ``all`` fuses
+mhc_pre and mhc_post there. ``test_layer_prefill.py`` checks each value's output and
+the kernels that served it, and ``test/hardware/benchmark_glue_block.py`` records the
 device compile keys (``same_graph_as``).
 """
 

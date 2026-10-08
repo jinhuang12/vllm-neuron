@@ -32,7 +32,11 @@ What runs. One graph per (case, variant), all from this tree:
   or ``name=spec``; ``aa=0`` is a second copy of ``off`` (the A/A control). Each
   variant's graph is traced from its own code object with the switch set, so no graph
   traced under one value serves another; the trace-time dispatch counts of the three
-  counted kernels are recorded per variant.
+  counted kernels are recorded per variant, and how many mhc_pre launches also returned
+  the feed-forward norm (``mhc_pre_normed``). ``glue_case.layer_step`` hands the
+  feed-forward site its norm as the model does, so where mhc_pre serves a prefill case
+  (``mhc_pre:prefill@1024`` at ``kda:prefill:1024``) the feed-forward site's kernel
+  returns the norm and no torch op is left between that site and the router.
 
 What is measured, per case:
 
@@ -338,8 +342,11 @@ def build_variant(case: dict, layers: list, spec: str, tag: str, args):
     dispatch = {name: list(module.dispatch_counters()) for name, module in COUNTED.items()}
     dispatch["graphs"] = [{"key": key, "cached_before": hit}
                           for key, hit in _GRAPH_KEYS[keys_from:]]
-    dispatch["mhc_post_bf16"] = glue.glue_selection(switch).selects("mhc_post",
-                                                                    case["rows"])
+    dispatch["mhc_post_bf16"] = glue.glue_selection(switch).selects(
+        "mhc_post", case["rows"], case["phase"])
+    # The mhc_pre launches that also returned the feed-forward norm: one per layer where
+    # the feed-forward site's kernel serves.
+    dispatch["mhc_pre_normed"] = mhc_pre.normed_dispatches()
     return call, inputs, first, dispatch, compile_s, pristine
 
 
