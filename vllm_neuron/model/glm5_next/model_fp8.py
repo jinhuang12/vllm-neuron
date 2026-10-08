@@ -3033,10 +3033,15 @@ def _checkpoint_row_tensor(checkpoint_rows, requests: int, device: torch.device)
 
     The checkpoint row each request starts from. A tensor is reshaped and cast and
     never read on the host, so the device tensor the previous step's commit
-    returned serves; a number or numbers are factory-built so a trace keeps them fake.
+    returned serves; one int for every request is factory-built (``torch.full``) so a
+    trace keeps it fake. Per-request host numbers are refused: a tensor built from
+    python data on the traced path is real under graph extraction, so the caller
+    builds that tensor (the runner hands a ``[B]`` int32 tensor on every step).
     """
     if checkpoint_rows is None:
         return torch.zeros((requests,), dtype=torch.int64, device=device)
+    if isinstance(checkpoint_rows, int):
+        return torch.full((requests,), int(checkpoint_rows), dtype=torch.int64, device=device)
     if torch.is_tensor(checkpoint_rows):
         if int(checkpoint_rows.numel()) != requests:
             raise ValueError(
@@ -3044,15 +3049,11 @@ def _checkpoint_row_tensor(checkpoint_rows, requests: int, device: torch.device)
                 f"{requests} request(s); one per request"
             )
         return checkpoint_rows.reshape(requests).to(device=device, dtype=torch.int64)
-    counts = [int(checkpoint_rows)] * requests if isinstance(checkpoint_rows, int) else [
-        int(one) for one in checkpoint_rows
-    ]
-    if len(counts) != requests:
-        raise ValueError(
-            f"checkpoint_rows carries {len(counts)} value(s) for {requests} request(s); "
-            f"one per request"
-        )
-    return torch.tensor(counts, dtype=torch.int64, device=device)
+    raise ValueError(
+        f"checkpoint_rows is None, one int for every request, or a [B] int tensor (the "
+        f"previous step's commit); got {type(checkpoint_rows).__name__}: per-request host "
+        f"numbers are handed as a tensor the caller builds, not built here on the traced path"
+    )
 
 
 def _pad_token_rows(rows: torch.Tensor, requests: int, tokens: int, total: int) -> torch.Tensor:
@@ -3067,17 +3068,16 @@ def _pad_token_rows(rows: torch.Tensor, requests: int, tokens: int, total: int) 
 def _checkpoint_rows_of_views(views, checkpoint_rows) -> torch.Tensor:
     """Row ``checkpoint_rows[b]`` of each request's ``[T, ...]`` checkpoint view, as ``[B, ...]``.
 
-    Host numbers slice (a free view; one request returns the view itself, so the
-    bs=1 line adds no device work); a tensor gathers by ``index_select``, never read.
+    ``None`` or one host int slices (a free view; one request returns the view itself,
+    so the bs=1 line adds no device work and nothing is read); a tensor gathers by
+    ``index_select``, never read; anything else is refused by ``_checkpoint_row_tensor``.
     """
     requests = len(views)
-    if checkpoint_rows is None or isinstance(checkpoint_rows, int) or not torch.is_tensor(
-        checkpoint_rows
-    ):
-        counts = _checkpoint_row_tensor(checkpoint_rows, requests, torch.device("cpu")).tolist()
+    if checkpoint_rows is None or isinstance(checkpoint_rows, int):
+        row = 0 if checkpoint_rows is None else int(checkpoint_rows)
         if requests == 1:
-            return views[0][counts[0] : counts[0] + 1]
-        return torch.stack([view[count] for view, count in zip(views, counts)])
+            return views[0][row : row + 1]
+        return torch.stack([view[row] for view in views])
     rows = _checkpoint_row_tensor(checkpoint_rows, requests, views[0].device)
     if requests == 1:
         return views[0].index_select(0, rows)
@@ -3325,8 +3325,11 @@ class Glm5NextKDAAttention(nn.Module):
                 request starts from -- what the previous verify step's
                 :func:`~vllm_neuron.functional.kda.fused_decode.commit_kda_checkpoints`
                 returned (its accepted tokens minus one), ``0`` after a prefill -- as a
-                ``[B]`` int tensor (a device tensor is never read on the host), an
-                int, or ints; ``None`` means ``0`` for every request.
+                ``[B]`` int tensor (a device tensor is never read on the host) or one
+                int for every request; ``None`` means ``0`` for every request. Per-request
+                host numbers are refused: the caller hands them as a tensor, because a
+                tensor built from python data on the traced path is real under graph
+                extraction.
 
         Returns:
             ``[T, hidden]`` at the input dtype.

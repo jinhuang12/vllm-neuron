@@ -270,9 +270,11 @@ def test_verify_step_takes_host_checkpoint_rows_on_one_request(monkeypatch):
     out, conv, rec, counts = _step(module, case, 1, bank_form=False, accepted=2)
     assert counts["fused"] == (1, 0)
     _assert_matches_chain(out, conv, rec, reference, case, 1, "host int")
-    out_list, conv_list, rec_list, _ = _step(module, case, 1, bank_form=False, accepted=[2])
-    assert torch.equal(out_list, out) and torch.equal(rec_list, rec)
-    assert torch.equal(conv_list, conv)
+    # Per-request host numbers are python data: a tensor built from them on the traced
+    # path would be real under graph extraction, so the layer refuses the list and the
+    # caller hands a tensor (the runner always does).
+    with pytest.raises(ValueError, match="checkpoint_rows"):
+        _step(module, case, 1, bank_form=False, accepted=[2])
 
 
 def test_verify_step_on_whole_banks_is_bit_equal_to_the_view_form(monkeypatch):
