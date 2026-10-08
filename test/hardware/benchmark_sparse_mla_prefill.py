@@ -33,7 +33,8 @@ position ``start + t`` and sees rows ``0 .. start + t``. The served cases (:data
   step of 64 requests runs ``mla_decode_attention``); it covers the multi-query path at a
   decode-sized row count.
 
-Per case: both graphs are compiled and checked against a float64 oracle, then timed in
+Per case: both graphs are compiled and checked against a float64 oracle, within the
+low-precision body's derived error budget (:func:`error_budget`), then timed in
 ``--reps`` repeats of ``--iterations`` calls each, the two graphs interleaved (the order
 flips every call). A sample is one dispatch with the output copied to CPU; its device time
 is the runtime system trace's ``nc_exec_running`` interval with the two physical cores
@@ -77,8 +78,10 @@ HBM_BYTES_PER_S = 716e9
 #: The MEASURED bf16 matmul peak of one logical core (two physical cores at LNC2), the
 #: campaign's ship-bar rate; a FLOP-bound case is shown against both peaks.
 LNC2_MEASURED_PEAK_FLOPS = 153.0e12
-#: Every device output against the float64 oracle, relative L2 over the whole output.
-ORACLE_REL_L2 = 3e-5
+#: The fp32 unit roundoff.
+FP32_UNIT = 2.0 ** -24
+#: The bf16 unit roundoff: 8 significand bits, round to nearest.
+BF16_UNIT = 2.0 ** -8
 LEASE_MARKER = "NEURON_RT_VISIBLE_CORES"
 
 
@@ -189,6 +192,58 @@ def oracle(q, window, indices):
     return out
 
 
+def error_budget(selected: int, latent: int, max_abs_logit: float) -> float:
+    """The low-precision body's error against float64 attention: relative L2 over the output.
+
+    One term per step that rounds, each the size of that step's error as a fraction of
+    the output. ``n`` roundings of relative size ``u`` in one sum move it by about
+    ``sqrt(n) * u`` (random-walk rounding), and a relative error of every probability is
+    the same relative error of the output, which is their weighted mean. The sum terms
+    are that root-mean-square model, which a relative L2 over the whole output measures;
+    the split term is a worst-case bound on every element. ``selected`` is
+    the most rows a query selects, ``max_abs_logit`` the largest scaled score a selected
+    row gets, ``|softmax_scale * q . c|``. The products of MM1 and MM2 are exact: both
+    take 2-byte operands and accumulate in fp32.
+
+    * MM2's moving operand, p split into two bf16 halves: hi + lo is p to within
+      ``BF16_UNIT ** 2`` relative (hi rounds p, lo rounds p - hi, which is exact in fp32);
+    * MM2's fp32 sums over the ``selected`` rows, and the add of the hi and lo sums;
+    * the softmax's fp32 sum over the same rows, which scales the whole output row;
+    * MM1's fp32 sum over the latent: an absolute error of ``sqrt(latent) * u`` times the
+      score in each scaled score, which the exp turns into that relative error of p;
+    * the exp's argument ``scale * x - scale * max``: three roundings of values at most
+      ``max_abs_logit``, absolute;
+    * the exp, the reciprocal of the sum and the normalising multiply: one ``u`` each.
+
+    A change of summation order inside any of these sums stays inside the budget. The
+    fp32 body, which serves one-row calls, is held to the same bar.
+    """
+    split = BF16_UNIT ** 2
+    mm2 = selected ** 0.5 * FP32_UNIT + FP32_UNIT
+    row_sum = selected ** 0.5 * FP32_UNIT
+    mm1 = latent ** 0.5 * FP32_UNIT * max_abs_logit
+    exp_argument = 3 * FP32_UNIT * max_abs_logit
+    pointwise = 3 * FP32_UNIT
+    return split + mm2 + row_sum + mm1 + exp_argument + pointwise
+
+
+def operand_budget(q, window, indices) -> dict:
+    """:func:`error_budget` of these operands, with its two data terms."""
+    import torch
+
+    qd, cd = q.double(), window.double()
+    rows = indices.to(torch.int64)
+    keep = rows >= 0
+    largest = 0.0
+    for s in range(q.shape[0]):
+        if bool(keep[s].any()):
+            scores = torch.einsum("hl,kl->hk", qd[s], cd[rows[s][keep[s]]]) * SCALE
+            largest = max(largest, float(scores.abs().max()))
+    selected = int(keep.sum(dim=1).max())
+    return {"selected": selected, "max_abs_logit": largest,
+            "rel_l2": error_budget(selected, LATENT, largest)}
+
+
 def rel_l2(got, want) -> float:
     got, want = got.double(), want.double()
     return float((got - want).norm() / want.norm().clamp_min(1e-30))
@@ -278,13 +333,14 @@ def run_case(case: Case, modules: dict, args) -> dict:
             outputs[name] = graph(*inputs).to("cpu")
             first_call_s.setdefault(name, time.perf_counter() - started)
         want = oracle(q, window, indices)
-        row = {"seed": seed,
+        bar = operand_budget(q, window, indices)
+        row = {"seed": seed, "error_budget": bar,
                "bit_equal": bool(torch.equal(outputs["base"], outputs["after"])),
                "max_abs_after_vs_base": float((outputs["after"] - outputs["base"]).abs().max()),
                "rel_l2_after_vs_base": rel_l2(outputs["after"], outputs["base"])}
         for name, got in outputs.items():
             row[f"rel_l2_{name}_vs_float64"] = rel_l2(got, want)
-            if not torch.isfinite(got).all() or row[f"rel_l2_{name}_vs_float64"] > ORACLE_REL_L2:
+            if not torch.isfinite(got).all() or row[f"rel_l2_{name}_vs_float64"] > bar["rel_l2"]:
                 raise AssertionError(f"{case.name} seed {seed}: {name} {row}")
         if args.save_dir is not None:
             args.save_dir.mkdir(parents=True, exist_ok=True)
