@@ -1094,3 +1094,55 @@ def test_the_scaled_mla_weights_reach_the_dequant_as_fp8(
     mlp_path = attn_path.rsplit(".", 1)[0] + ".mlp"
     mlp_weight = getattr(model.get_submodule(mlp_path), "gate_proj_weight")
     assert _is_fp8_dtype(mlp_weight.dtype)
+
+
+# --------------------------------------------------------------------------- #
+# The draft head's eh_proj row shard (functional/mtp/tail_in.py).
+
+#: The served tensor-parallel degree the draft head's shard row is read at.
+MTP_TP = 64
+
+
+def test_the_draft_heads_eh_proj_is_row_sharded_and_its_other_leaves_replicated(monkeypatch) -> None:
+    """The loader shards ``eh_proj_weight`` on dim 0, ``H / world`` rows per rank at TP=64,
+    and slices rank ``r``'s rows ``[r * H / 64, (r + 1) * H / 64)`` -- the order the input
+    tail's all-gather concatenates in -- while ``enorm``, ``hnorm`` and
+    ``shared_head_norm`` stay replicated and one rank shards nothing. The row is
+    registered when the head is built (``mtp._declare_shard_geometry``), so it is read
+    off a root built with the shadow draft on."""
+    from vllm_neuron.model.glm5_next import model_fp8
+    from vllm_neuron.utils.weight_loader import sharding_weight_loader
+
+    monkeypatch.setenv(MTP_KNOB, "1")
+    root = _routed_model()
+    head = getattr(root, MTP_ROOT_ATTR)
+    assert head is not None, "the knob is on, so the root builds the draft head"
+    hidden = int(root.text_config.hidden_size)
+    assert hidden % MTP_TP == 0, hidden
+    geometry = model_fp8._shard_geometry_for(head, "eh_proj_weight", MTP_TP)
+    assert (geometry.shard_dim, geometry.shard_size, geometry.num_shards) == (
+        0, hidden // MTP_TP, MTP_TP,
+    ), geometry
+    for leaf in ("enorm_weight", "hnorm_weight", "shared_head_norm_weight"):
+        assert model_fp8._shard_geometry_for(head, leaf, MTP_TP) is None, leaf
+    assert model_fp8._shard_geometry_for(head, "eh_proj_weight", 1) is None
+    assert "eh_proj_weight" in head.declared_param_names, "the shard row names a declared leaf"
+
+    full = torch.arange(hidden * 2 * hidden, dtype=torch.float32).reshape(hidden, 2 * hidden)
+    loader = sharding_weight_loader(
+        shard_dim=geometry.shard_dim,
+        shard_size=geometry.shard_size,
+        num_shards=geometry.num_shards,
+    )
+
+    class _CheckpointSlice:  # the safetensors slice interface the loader reads
+        def get_shape(self):
+            return list(full.shape)
+
+        def __getitem__(self, index):
+            return full[index]
+
+    rows = hidden // MTP_TP
+    for rank in (0, 5, MTP_TP - 1):
+        got = loader.transform([_CheckpointSlice()], rank)
+        assert torch.equal(got, full[rank * rows:(rank + 1) * rows]), rank

@@ -3,10 +3,12 @@
 
 At TP=64 each rank holds ``154880 / 64 = 2420`` rows of the head. A rank's local
 ``argmax`` is an index into its own shard, so handing it on as a token id is wrong on
-63 of 64 ranks (mtp.md H2). The route under test projects the shard, takes the shard's
-``(max, argmax)``, all-gathers that ``[B, 2]`` pair once over the group and resolves the
-global id as ``rank * shard_rows + local_index`` of the rank holding the largest max
-(H5: the gather moves ``2 x 64`` values per row, not ``154880``).
+63 of 64 ranks (mtp.md H2). The route under test takes the shard's ``(max, argmax)``
+pair -- the output tail kernel's second result (``functional/mtp/tail_out.py``), here
+built by its torch route ``shard_pair`` from the shard logits -- all-gathers that
+``[B, 2]`` pair once over the group and resolves the global id as
+``rank * shard_rows + local_index`` of the rank holding the largest max (H5: the gather
+moves ``2 x 64`` values per row, not ``154880``).
 
 The reference is the replicated head's ``argmax`` over the full vocabulary, which is
 what every rank must return. Ties resolve to the lowest id, the same convention as
@@ -27,6 +29,7 @@ import pytest
 import torch
 
 from vllm_neuron.functional.draft_token import DraftTokenError, draft_token_ids
+from vllm_neuron.functional.mtp.tail_out import shard_pair
 
 VOCAB = 154880
 TP = 64
@@ -72,17 +75,21 @@ def _rows(seed: int, batch: int) -> torch.Tensor:
     return torch.randn(batch, HIDDEN, generator=gen).to(torch.bfloat16)
 
 
+def _pair(rows: torch.Tensor, shard: torch.Tensor) -> torch.Tensor:
+    """The shard's ``[B, 2]`` fp32 ``(max, argmax)``: what the output tail kernel hands over."""
+    return shard_pair(torch.nn.functional.linear(rows, shard).to(torch.float32))
+
+
 def _every_rank(rows: torch.Tensor, head: torch.Tensor) -> tuple[list[torch.Tensor], _SimulatedTensorParallelGroup]:
-    """``draft_token_ids`` on all ``TP`` ranks, each on its own shard, in two rounds."""
+    """``draft_token_ids`` on all ``TP`` ranks, each on its own shard's pair, in two rounds."""
     shards = head.reshape(TP, SHARD_ROWS, HIDDEN)
     group = _SimulatedTensorParallelGroup(TP)
     for group.gathering in (False, True):
         results = []
         for rank in range(TP):
             group.rank = rank
-            results.append(
-                draft_token_ids(rows, shards[rank], vocab_size=VOCAB, group=group)
-            )
+            results.append(draft_token_ids(_pair(rows, shards[rank]), shard_rows=SHARD_ROWS,
+                                           vocab_size=VOCAB, group=group))
     return results, group
 
 
@@ -163,11 +170,11 @@ def test_a_whole_head_is_served_without_a_gather() -> None:
     rows, head = _rows(7_031, 3), _head(7_032)
     group = _SimulatedTensorParallelGroup(TP)
     group.rank = 0
-    got = draft_token_ids(rows, head, vocab_size=VOCAB, group=group)
+    got = draft_token_ids(_pair(rows, head), shard_rows=VOCAB, vocab_size=VOCAB, group=group)
     assert torch.equal(got.to(torch.int64), _reference(rows, head))
     assert got.dtype == torch.int32
     assert group.gathers == [], "a whole head needs no collective"
-    alone = draft_token_ids(rows, head, vocab_size=VOCAB, group=None)
+    alone = draft_token_ids(_pair(rows, head), shard_rows=VOCAB, vocab_size=VOCAB, group=None)
     assert torch.equal(alone, got)
 
 
@@ -175,11 +182,24 @@ def test_a_head_that_is_neither_whole_nor_one_shard_is_refused() -> None:
     rows, head = _rows(7_041, 2), _head(7_042)
     group = _SimulatedTensorParallelGroup(TP)
     group.rank = 0
+    pair = _pair(rows, head[:SHARD_ROWS])
     with pytest.raises(DraftTokenError, match="shard"):
-        draft_token_ids(rows, head[: SHARD_ROWS + 1], vocab_size=VOCAB, group=group)
+        draft_token_ids(pair, shard_rows=SHARD_ROWS + 1, vocab_size=VOCAB, group=group)
     with pytest.raises(DraftTokenError, match="shard"):
-        draft_token_ids(rows, head[:SHARD_ROWS], vocab_size=VOCAB, group=None)
+        draft_token_ids(pair, shard_rows=SHARD_ROWS, vocab_size=VOCAB, group=None)
     assert issubclass(DraftTokenError, ValueError)
+
+
+def test_an_operand_that_is_not_a_pair_is_refused_by_name() -> None:
+    rows, head = _rows(7_045, 2), _head(7_046)
+    group = _SimulatedTensorParallelGroup(TP)
+    group.rank = 0
+    logits = torch.nn.functional.linear(rows, head[:SHARD_ROWS]).to(torch.float32)
+    with pytest.raises(DraftTokenError, match=r"\[B, 2\]"):
+        draft_token_ids(logits, shard_rows=SHARD_ROWS, vocab_size=VOCAB, group=group)
+    with pytest.raises(DraftTokenError, match="float32"):
+        draft_token_ids(_pair(rows, head[:SHARD_ROWS]).to(torch.bfloat16), shard_rows=SHARD_ROWS,
+                        vocab_size=VOCAB, group=group)
 
 
 def test_the_gathered_operand_is_two_values_per_row_not_the_vocabulary() -> None:
