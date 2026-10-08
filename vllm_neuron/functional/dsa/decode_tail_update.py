@@ -29,8 +29,10 @@ entry points agree bit for bit wherever the pooled value means anything.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 from torch import Tensor
@@ -656,3 +658,364 @@ def decode_tail_recompute(
         tail_k[1, pos % pool_size] = scores[step].to(dtype)
     _ = head_dim  # read for the shape contract above; not needed again
     return pooled_list, tail_k
+
+
+# ---------------------------------------------------------------------------------------
+# T tokens per request in one step: the verify step's ring advance
+# ---------------------------------------------------------------------------------------
+
+_PARTITIONS = 128
+
+
+def _sb(shape, dtype):
+    return nl.ndarray(shape, dtype=dtype, buffer=nl.sbuf)
+
+
+def _col(parts, dtype):
+    return nl.ndarray((parts, 1), dtype=dtype, buffer=nl.sbuf)
+
+
+def _log2(value):
+    shift = 0
+    while (1 << shift) < value:
+        shift += 1
+    return shift
+
+
+def ring_depth_for(pool_size: int, max_rows: int) -> int:
+    """Ring rows a config needs: a power of two, at least ``pool_size``, holding one step's
+    ``max_rows`` tokens and the ``pool_size - 2`` more a rollback can still need
+    (:func:`dsa_decode_ring_rows`). ``max_rows = 1`` gives ``pool_size``."""
+    depth = int(pool_size)
+    while depth < max_rows + pool_size - 2:
+        depth *= 2
+    return depth
+
+
+def max_rows_for(depth: int, pool_size: int) -> int:
+    """The most tokens one step may hand a ring of ``depth`` rows: the inverse of
+    :func:`ring_depth_for`."""
+    return int(depth) - int(pool_size) + 2
+
+
+@nki.jit
+def dsa_decode_ring_rows_kernel(tail_hbm, slots_hbm, key_hbm, score_hbm, ape_hbm, pos_hbm,
+                                pool_size, rows, source_digest):
+    """Advance ``B`` rings by ``rows`` tokens each; compress the pool each row would close.
+
+    Args:
+        tail_hbm: ``[slots, 2 * depth * head_dim]`` the ring bank, one flattened ring per
+            slot: keys in rows ``0 .. depth - 1``, gate scores after them. ``depth`` is a
+            power-of-two multiple of ``pool_size``; a token at absolute position ``p``
+            lives at ring row ``p % depth``.
+        slots_hbm: ``[B, 1]`` int32, each request's slot.
+        key_hbm / score_hbm: ``[B * rows, head_dim]`` this step's indexer keys and gate
+            scores, request-major: request ``b``'s row ``t`` is row ``b * rows + t``.
+        ape_hbm: ``[pool_size, head_dim]`` fp32, the per-slot additive bias.
+        pos_hbm: ``[B, 1]`` int32, each request's position of row 0.
+        pool_size: tokens per pool, a power of two.
+        rows: tokens per request this step, a trace-time int, at most
+            ``depth - pool_size + 2``.
+        source_digest: :data:`ROWS_SOURCE_DIGEST`; it only keys the kernel cache.
+
+    Returns:
+        ``(pooled, rings)``: ``[B * rows, head_dim]``, row ``b * rows + t`` the compressed
+        pool that ends at position ``pos[b] + t`` -- meaningful exactly when that position
+        is ``pool_size - 1`` mod ``pool_size`` (the caller writes the rest to the slot's
+        trash row) -- and ``[B, 2 * depth * head_dim]`` the advanced rings, token ``t``
+        stashed at row ``(pos[b] + t) % depth`` of each half.
+
+    Row ``t``'s pool members at positions ``pos + t - pool_size + 1 .. pos + t`` are this
+    step's own rows where they fall at or after ``pos`` (read off the operands, never off
+    the ring) and ring rows otherwise; where the position closes a pool those ring rows are
+    ``m + pool_size * g`` with ``g`` the pool's index within the ring, picked by predicated
+    copies so no address depends on data. Every read of the ring precedes every stash, so a
+    stash may land on a row a later pool of the same step no longer needs. The compression
+    is :func:`decode_batch.dsa_decode_ring_step_kernel`'s instruction sequence per row, so
+    at ``depth == pool_size`` the two agree bit for bit, row by row.
+    """
+    batch = slots_hbm.shape[0]
+    head_dim = key_hbm.shape[1]
+    width = tail_hbm.shape[1]
+    depth = width // (TAIL_HALVES * head_dim)
+    groups = depth // pool_size
+    shift = _log2(pool_size)
+    last = pool_size - 1
+    pooled_hbm = nl.ndarray((batch * rows, head_dim), dtype=tail_hbm.dtype,
+                            buffer=nl.shared_hbm)
+    rings_hbm = nl.ndarray((batch, width), dtype=tail_hbm.dtype, buffer=nl.shared_hbm)
+    for r0 in range(0, batch, _PARTITIONS):
+        h = min(_PARTITIONS, batch - r0)
+        ring = _sb((h, width), tail_hbm.dtype)
+        if tail_hbm.shape[0] == 1:
+            # One slot: the only valid slot is 0, so the read is static. (Tracing in CPU
+            # simulation fills int operands with ones, and slot 1 is past this bank.)
+            nisa.dma_copy(dst=ring, src=tail_hbm.ap(pattern=[[0, h], [1, width]], offset=0))
+        else:
+            slot_t = _col(h, nl.int32)
+            nisa.dma_copy(dst=slot_t, src=slots_hbm.ap(pattern=[[1, h], [1, 1]], offset=r0))
+            nisa.dma_copy(dst=ring, src=tail_hbm.ap(pattern=[[width, h], [1, width]],
+                                                    vector_offset=slot_t, indirect_dim=0))
+        keys_bf, scores_bf, keys_f, scores_f = [], [], [], []
+        for t in range(rows):
+            key_bf = _sb((h, head_dim), key_hbm.dtype)
+            nisa.dma_copy(dst=key_bf,
+                          src=key_hbm.ap(pattern=[[rows * head_dim, h], [1, head_dim]],
+                                         offset=(r0 * rows + t) * head_dim))
+            score_bf = _sb((h, head_dim), score_hbm.dtype)
+            nisa.dma_copy(dst=score_bf,
+                          src=score_hbm.ap(pattern=[[rows * head_dim, h], [1, head_dim]],
+                                           offset=(r0 * rows + t) * head_dim))
+            key_f = _sb((h, head_dim), nl.float32)
+            nisa.tensor_copy(dst=key_f, src=key_bf)
+            score_f = _sb((h, head_dim), nl.float32)
+            nisa.tensor_copy(dst=score_f, src=score_bf)
+            keys_bf.append(key_bf)
+            scores_bf.append(score_bf)
+            keys_f.append(key_f)
+            scores_f.append(score_f)
+        pos_i = _col(h, nl.int32)
+        nisa.dma_copy(dst=pos_i, src=pos_hbm.ap(pattern=[[1, h], [1, 1]], offset=r0))
+        ones = _sb((h, head_dim), nl.float32)
+        nisa.memset(dst=ones, value=1.0)
+
+        for t in range(rows):
+            # ---- which of the ring's pools this row's position falls in -----------------
+            at_i = _col(h, nl.int32)
+            nisa.tensor_scalar(dst=at_i, data=pos_i, op0=nl.add, operand0=t)
+            group_masks = []
+            if groups > 1:
+                pool_i = _col(h, nl.int32)
+                nisa.tensor_scalar(dst=pool_i, data=at_i, op0=nl.right_shift, operand0=shift)
+                grp_i = _col(h, nl.int32)
+                nisa.tensor_scalar(dst=grp_i, data=pool_i, op0=nl.bitwise_and,
+                                   operand0=groups - 1)
+                grp_f = _col(h, nl.float32)
+                nisa.tensor_copy(dst=grp_f, src=grp_i)
+                for g in range(groups):
+                    hit = _col(h, nl.float32)
+                    nisa.tensor_scalar(dst=hit, data=grp_f, op0=nl.equal, operand0=float(g))
+                    mask = _sb((h, head_dim), nl.uint8)
+                    nisa.tensor_scalar(dst=mask, data=ones, op0=nl.multiply, operand0=hit)
+                    group_masks.append(mask)
+
+            def member_source(member, half):
+                """Member ``member``'s fp32 key (half 0) or score (half 1) for row ``t``."""
+                own = t - last + member
+                if own >= 0:
+                    return (keys_f if half == 0 else scores_f)[own]
+                src = _sb((h, head_dim), nl.float32)
+                base = half * depth + member
+                if groups == 1:
+                    row0 = base * head_dim
+                    nisa.tensor_copy(dst=src, src=ring[:, row0:row0 + head_dim])
+                    return src
+                picked = _sb((h, head_dim), tail_hbm.dtype)
+                for g in range(groups):
+                    row0 = (base + g * pool_size) * head_dim
+                    nisa.tensor_copy_predicated(dst=picked, src=ring[:, row0:row0 + head_dim],
+                                                predicate=group_masks[g])
+                nisa.tensor_copy(dst=src, src=picked)
+                return src
+
+            # ---- the pool this row would close: members 0 .. last-1 from the ring ------
+            totals = []
+            running_max = _sb((h, head_dim), nl.float32)
+            for member in range(pool_size):
+                if member == last:
+                    score_src = scores_f[t]
+                else:
+                    score_src = member_source(member, 1)
+                bias = _sb((h, head_dim), nl.float32)
+                nisa.dma_copy(dst=bias, src=ape_hbm.ap(pattern=[[0, h], [1, head_dim]],
+                                                       offset=member * head_dim))
+                total = _sb((h, head_dim), nl.float32)
+                nisa.tensor_tensor(dst=total, data1=score_src, data2=bias, op=nl.add)
+                totals.append(total)
+                if member == 0:
+                    nisa.tensor_copy(dst=running_max, src=total)
+                else:
+                    nisa.tensor_tensor(dst=running_max, data1=running_max, data2=total,
+                                       op=nl.maximum)
+            acc = _sb((h, head_dim), nl.float32)
+            denom = _sb((h, head_dim), nl.float32)
+            nisa.memset(dst=acc, value=0.0)
+            nisa.memset(dst=denom, value=0.0)
+            for member in range(pool_size):
+                shifted = _sb((h, head_dim), nl.float32)
+                nisa.tensor_tensor(dst=shifted, data1=totals[member], data2=running_max,
+                                   op=nl.subtract)
+                weight = _sb((h, head_dim), nl.float32)
+                nisa.activation(dst=weight, op=nl.exp, data=shifted)
+                nisa.tensor_tensor(dst=denom, data1=denom, data2=weight, op=nl.add)
+                if member == last:
+                    key_src = keys_f[t]
+                else:
+                    key_src = member_source(member, 0)
+                weighted = _sb((h, head_dim), nl.float32)
+                nisa.tensor_tensor(dst=weighted, data1=weight, data2=key_src, op=nl.multiply)
+                nisa.tensor_tensor(dst=acc, data1=acc, data2=weighted, op=nl.add)
+            inv = _sb((h, head_dim), nl.float32)
+            nisa.reciprocal(dst=inv, data=denom)
+            pooled = _sb((h, head_dim), nl.float32)
+            nisa.tensor_tensor(dst=pooled, data1=acc, data2=inv, op=nl.multiply)
+            pooled_bf = _sb((h, head_dim), tail_hbm.dtype)
+            nisa.tensor_copy(dst=pooled_bf, src=pooled)
+            pooled_rt = _sb((h, head_dim), nl.float32)
+            nisa.tensor_copy(dst=pooled_rt, src=pooled_bf)
+            scratch = _sb((h, head_dim), nl.float32)
+            rotated = _fwht128_inplace(pooled_rt, scratch, head_dim)
+            scaled = _sb((h, head_dim), nl.float32)
+            nisa.tensor_scalar(dst=scaled, data=rotated, op0=nl.multiply,
+                               operand0=HADAMARD_SCALE)
+            result = _sb((h, head_dim), tail_hbm.dtype)
+            nisa.tensor_copy(dst=result, src=scaled)
+            nisa.dma_copy(dst=pooled_hbm.ap(pattern=[[rows * head_dim, h], [1, head_dim]],
+                                            offset=(r0 * rows + t) * head_dim),
+                          src=result)
+
+        # ---- the stashes: token t at row (pos + t) % depth of each half ---------------
+        # Every ring read above is done, so a stash may take a row an earlier pool of this
+        # step read: the next step's pools no longer need it (depth >= rows + pool - 2).
+        for t in range(rows):
+            pos_t = _col(h, nl.int32)
+            nisa.tensor_scalar(dst=pos_t, data=pos_i, op0=nl.add, operand0=t)
+            at_i = _col(h, nl.int32)
+            nisa.tensor_scalar(dst=at_i, data=pos_t, op0=nl.bitwise_and, operand0=depth - 1)
+            at_f = _col(h, nl.float32)
+            nisa.tensor_copy(dst=at_f, src=at_i)
+            for row in range(depth):
+                hit = _col(h, nl.float32)
+                nisa.tensor_scalar(dst=hit, data=at_f, op0=nl.equal, operand0=float(row))
+                mask = _sb((h, head_dim), nl.uint8)
+                nisa.tensor_scalar(dst=mask, data=ones, op0=nl.multiply, operand0=hit)
+                for half in range(TAIL_HALVES):
+                    row0 = (half * depth + row) * head_dim
+                    nisa.tensor_copy_predicated(dst=ring[:, row0:row0 + head_dim],
+                                                src=keys_bf[t] if half == 0 else scores_bf[t],
+                                                predicate=mask)
+        nisa.dma_copy(dst=rings_hbm.ap(pattern=[[width, h], [1, width]], offset=r0 * width),
+                      src=ring)
+    return pooled_hbm, rings_hbm
+
+
+ROWS_SOURCE_DIGEST = int(hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:7], 16)
+"""A digest of this file, passed to the rows kernel so the kernel cache keys on its source."""
+
+
+def _require_rows(tail_bank, slots, key, score, ape, position) -> tuple[int, int, int, int]:
+    """Check a :func:`dsa_decode_ring_rows` call; return ``(batch, rows, pool, depth)``."""
+    if tail_bank.ndim != 4 or int(tail_bank.shape[1]) != TAIL_HALVES:
+        raise DecodeTailUpdateError(
+            f"tail must be the ring bank [slots, {TAIL_HALVES}, depth, head_dim]; got "
+            f"{tuple(tail_bank.shape)}")
+    depth, head_dim = int(tail_bank.shape[2]), int(tail_bank.shape[3])
+    if head_dim != INDEX_HEAD_DIM:
+        raise DecodeTailUpdateError(f"the rotation is a {INDEX_HEAD_DIM}-point transform; got "
+                                    f"head_dim {head_dim}")
+    if ape.ndim != 2 or int(ape.shape[1]) != head_dim:
+        raise DecodeTailUpdateError(f"ape must be [pool_size, {head_dim}]; got {tuple(ape.shape)}")
+    pool = int(ape.shape[0])
+    if pool < 2 or pool & (pool - 1):
+        raise DecodeTailUpdateError(f"ape's pool_size must be a power of two >= 2; got {pool}")
+    if depth < pool or depth & (depth - 1):
+        raise DecodeTailUpdateError(
+            f"the ring depth must be a power-of-two multiple of pool_size {pool}; got "
+            f"{depth} rows")
+    if not torch.is_tensor(slots) or slots.ndim != 1 or int(slots.shape[0]) < 1:
+        raise DecodeTailUpdateError(f"slots must be a [B] tensor; got {slots!r}")
+    batch = int(slots.shape[0])
+    if tuple(position.shape) != (batch,):
+        raise DecodeTailUpdateError(f"position must be [{batch}], one entry per request; got "
+                                    f"{tuple(position.shape)}")
+    for name, value in (("slots", slots), ("position", position)):
+        if value.dtype not in (torch.int32, torch.int64):
+            raise DecodeTailUpdateError(f"{name} must be int32 or int64; got {value.dtype}")
+    if key.ndim != 2 or int(key.shape[1]) != head_dim or tuple(score.shape) != tuple(key.shape):
+        raise DecodeTailUpdateError(f"key and score must both be [B * rows, {head_dim}]; got "
+                                    f"{tuple(key.shape)} and {tuple(score.shape)}")
+    total = int(key.shape[0])
+    if total < batch or total % batch:
+        raise DecodeTailUpdateError(
+            f"key must hold a whole number of rows per request: {total} rows do not split "
+            f"over {batch} requests")
+    rows = total // batch
+    if rows > max_rows_for(depth, pool):
+        raise DecodeTailUpdateError(
+            f"{rows} rows per request exceed what a ring of depth {depth} can take back on "
+            f"rollback: at most {max_rows_for(depth, pool)} (depth - pool_size + 2), or a "
+            f"rejected row would overwrite a token the next step's pools still need")
+    return batch, rows, pool, depth
+
+
+def dsa_decode_ring_rows(tail_bank: Tensor, slots: Tensor, key: Tensor, score: Tensor,
+                         ape: Tensor, position: Tensor) -> tuple[Tensor, Tensor]:
+    """Advance each request's ring by its ``rows`` tokens in one step. Nothing is written
+    in place.
+
+    Args:
+        tail_bank: ``[slots, 2, depth, head_dim]`` bf16, the ring bank (keys in half 0,
+            gate scores in half 1), read at ``slots`` only. ``depth`` is a power-of-two
+            multiple of the pool size (:func:`ring_depth_for`).
+        slots: ``[B]`` int, each request's slot; distinct.
+        key / score: ``[B * rows, head_dim]`` bf16, request-major: request ``b``'s token
+            ``t`` is row ``b * rows + t``. ``rows`` is read off the shapes.
+        ape: ``[pool_size, head_dim]`` fp32.
+        position: ``[B]`` int, each request's position of token 0.
+
+    Returns:
+        ``(pooled, rings)``: ``[B * rows, head_dim]``, row ``b * rows + t`` the pool that
+        closes at ``position[b] + t`` where that position is ``pool_size - 1`` mod
+        ``pool_size`` (meaningless otherwise), and ``[B, 2, depth, head_dim]`` the advanced
+        rings, for the caller to write back at ``slots``.
+
+    Refuses ``rows > depth - pool_size + 2``: a rejected row's stash would then alias a
+    ring row the next step's pools still need.
+    """
+    batch, rows, pool, depth = _require_rows(tail_bank, slots, key, score, ape, position)
+    usable = (can_run_kernel(key) and tail_bank.dtype == torch.bfloat16
+              and key.dtype == torch.bfloat16 and score.dtype == torch.bfloat16)
+    if not usable:
+        _count_torch_fallback()
+        return dsa_decode_ring_rows_torch_oracle(tail_bank, slots, key, score, ape, position)
+    _count_nki_dispatch()
+    _COUNTERS.last_kernel = _kernel_identity_of(dsa_decode_ring_rows_kernel)
+    width = TAIL_HALVES * depth * int(tail_bank.shape[3])
+    pooled, rings = wrap_nki(dsa_decode_ring_rows_kernel)(
+        tail_bank.reshape(int(tail_bank.shape[0]), width).contiguous(),
+        slots.reshape(batch, 1).to(torch.int32).contiguous(),
+        key.contiguous(), score.contiguous(), ape.to(torch.float32).contiguous(),
+        position.reshape(batch, 1).to(torch.int32).contiguous(), pool, rows,
+        ROWS_SOURCE_DIGEST)
+    return pooled, rings.reshape(batch, TAIL_HALVES, depth, int(tail_bank.shape[3]))
+
+
+def dsa_decode_ring_rows_torch_oracle(tail_bank, slots, key, score, ape, position):
+    """The rows step in torch, from the token stream: pool members come from this step's
+    tokens where they fall at or after ``position`` and from the ring (row ``p % depth``)
+    before it; no stepped ring is consulted. Rows that close no pool hold the compression
+    of the same members anyway, so every row is defined."""
+    batch, rows, pool, depth = _require_rows(tail_bank, slots, key, score, ape, position)
+    rings = tail_bank[slots.to(torch.int64)].clone()
+    dtype = rings.dtype
+    pooled = torch.empty(batch * rows, int(rings.shape[3]), dtype=dtype)
+    for b in range(batch):
+        start = int(position[b])
+
+        def member(pos, half):
+            if pos >= start:
+                src = key if half == 0 else score
+                return src[b * rows + pos - start].to(dtype)
+            return rings[b, half, pos % depth]
+
+        for t in range(rows):
+            pos = start + t
+            members = range(pos - pool + 1, pos + 1)
+            pool_key = torch.stack([member(p, 0) for p in members])
+            pool_score = torch.stack([member(p, 1) for p in members])
+            pooled[b * rows + t] = _compress_pool_torch(pool_key, pool_score, ape.float())[0]
+        for t in range(rows):
+            at = (start + t) % depth
+            rings[b, 0, at] = key[b * rows + t].to(dtype)
+            rings[b, 1, at] = score[b * rows + t].to(dtype)
+    return pooled, rings
