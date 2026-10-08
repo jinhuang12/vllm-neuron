@@ -421,9 +421,17 @@ def run_ops(args, cfg, qc, device) -> dict:
                 result["ratio_to_entitlement"] = result["timing"]["median_us"] / result["entitlement_us"]
         results.append(result)
     token = int(out.cpu().reshape(-1)[0])
+    # The tail pair (K1' at the served shard + K2) against its summed entitlement: the bar
+    # mtp-head.md 9.2 states for the two kernels together (x1.5 of the sum).
+    pair = [r for r in results if r["op"].startswith(("3s", "4 "))]
+    tail_pair = {"ops": [r["op"] for r in pair],
+                 "entitlement_us": sum(r["entitlement_us"] for r in pair)}
+    if args.mode == "device":
+        tail_pair["median_us"] = sum(r["timing"]["median_us"] for r in pair)
+        tail_pair["ratio_to_entitlement"] = tail_pair["median_us"] / tail_pair["entitlement_us"]
     del fns, head
     return {"graph": "ops", "batch": 1, "ctx": CONTEXT, "window_rows": WINDOW_PAGES * case.PAGE,
-            "pieces": results, "token": token,
+            "pieces": results, "tail_pair": tail_pair, "token": token,
             "hbm_bytes_per_us_per_core": HBM_BYTES_PER_US_PER_CORE,
             "unit": "one draft iteration at B=1 as separately compiled graphs on the same inputs"}
 
