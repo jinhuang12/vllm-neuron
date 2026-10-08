@@ -3015,11 +3015,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # are built, so they're sized 1-token-per-req when we fall back to
             # the non-spec NEFF. See _get_dp_padding /
             # _maybe_strip_spec_for_nonspec_step for the deadlock rationale.
-            local_force_nonspec = (
-                self.vllm_config.kv_transfer_config is not None
-                and self.vllm_config.kv_transfer_config.is_kv_consumer
-                and self._local_step_forces_nonspec(scheduler_output)
-            )
+            local_force_nonspec = self._local_force_nonspec(scheduler_output)
             local_max_decode_ctx_len = (
                 int(self.input_batch.num_computed_tokens_cpu[:padded_num_reqs].max())
                 if padded_num_reqs > 0
@@ -9495,6 +9491,46 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         num_reqs = self.input_batch.num_reqs
         req_ids = self.input_batch.req_ids[:num_reqs]
         return any(not spec_tokens.get(req_id) for req_id in req_ids)
+
+    def _local_force_nonspec(self, scheduler_output: "SchedulerOutput") -> bool:
+        """This rank's vote to run the one-row (non-spec) decode graph this step.
+
+        Two voters. A disaggregated-inference consumer whose step has no drafts or
+        is a mixed batch (``_local_step_forces_nonspec``, unchanged). And a
+        GLM-5.3-Flash server under speculative method "mtp" whose step is mixed
+        (``_glm5next_step_is_mixed``): the translator serves one row width per step,
+        so a step whose requests carry different draft counts -- a request's first
+        decode beside drafted ones, or one whose drafts the scheduler truncated near
+        ``max_model_len`` -- is stripped to one token per request by
+        ``_maybe_strip_spec_for_nonspec_step`` and speculation resumes on the next
+        step. A uniform step, with or without drafts, keeps its shape. O(B) host
+        ints.
+        """
+        kv_transfer = self.vllm_config.kv_transfer_config
+        if (
+            kv_transfer is not None
+            and kv_transfer.is_kv_consumer
+            and self._local_step_forces_nonspec(scheduler_output)
+        ):
+            return True
+        return bool(getattr(self, "is_mtp_spec", False)) and self._glm5next_step_is_mixed(
+            scheduler_output
+        )
+
+    def _glm5next_step_is_mixed(self, scheduler_output: "SchedulerOutput") -> bool:
+        """True when this step's scheduled requests carry different draft counts.
+
+        Read off ``scheduled_spec_decode_tokens`` for the batch's requests (a request
+        absent from it carries none). A step with no drafts at all is uniform.
+        """
+        spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        if not spec_tokens:
+            return False
+        num_reqs = self.input_batch.num_reqs
+        counts = {
+            len(spec_tokens.get(req_id, ())) for req_id in self.input_batch.req_ids[:num_reqs]
+        }
+        return len(counts) > 1
 
     def _maybe_strip_spec_for_nonspec_step(
         self,
