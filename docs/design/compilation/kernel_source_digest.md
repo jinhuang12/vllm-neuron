@@ -82,7 +82,7 @@ on the graph is in the FX text, which the library already keys on.
 | `from vllm_neuron.a import f`, `f` defined in `a/__init__.py` | all of `a/__init__.py` |
 | `from vllm_neuron.a import *` | all of `a/__init__.py` |
 | relative imports | the same, from the file's own package |
-| `import importlib` or `__import__` in a reached file | nothing: the key folds the package digest |
+| `import importlib` or `__import__` in any snapshot file | nothing: every key folds the package digest |
 | an import under `if TYPE_CHECKING:` | nothing: it never runs |
 | an import of another package | not that package's source (it is versioned with its package), but every snapshot file that patches that package |
 | an import of `vllm_neuron.envs` or `vllm_neuron.accuracy.tensor_capture` | nothing: these files hold no kernel code (a kernel's trace-time branch on a knob is in the FX graph text; tensor capture is host-side debug code), so the snapshot excludes them |
@@ -113,10 +113,37 @@ Every kernel file imports `nkilib` (for example `kernel_assert`), so
 graph. `parallel/neuron_parallel_state.py` patches `vllm.distributed` and joins
 the closures that import `vllm` at run time.
 `test/vllm_neuron/test_compile_cache_key_pergraph.py` pins this list, so a new
-patch fails a test until it is reviewed here. Not detected: a mutation inside
-a function the file calls (`mod.set_mode(1)`), a mutating-method name called
+patch fails a test until it is reviewed here.
+
+Some patches have a target the scan cannot name. A snapshot file with one of
+them makes **every** key that folds files fall back, even when no kernel
+imports the file:
+
+| Form in any snapshot file | INFO reason names |
+| --- | --- |
+| `import importlib`, `importlib.reload(m)`, `__import__(...)` | `imports modules dynamically` |
+| `vars(mod)[k] = v`, `globals()[k] = v`, `globals().update(...)` | `stores through vars()` / `globals()` |
+| `sys.modules[k] = m`, `sys.modules.setdefault(...)` | `mutates sys.modules` |
+| a decorator rooted in another package, outside the allowlist | `decorates with <name> of another package` |
+
+The decorator allowlist (`NON_REGISTERING_DECORATOR_ROOTS`) holds `nki`,
+`torch`, `functools`, `dataclasses`, `typing`, `abc`, `contextlib` and `enum`:
+their decorators wrap or describe the function and register it nowhere another
+file reads. The package uses `@nki.jit`, `@torch._dynamo.assume_constant_result`
+and `@dataclass` today. A test pins the allowlist, and another test pins that no
+snapshot file has such a form today.
+
+Not detected: a mutation inside a function the file calls
+(`mod.set_mode(1)`), a store through a function parameter
+(`def f(m): m.X = v`), `unittest.mock` patching, a mutating-method name called
 directly on a module bound by `import` (`nl.add` is a kernel op), and `exec` /
-`eval`.
+`eval`. A kernel of another package that a snapshot file imports only under an
+alias another module re-exports (for example `SbufManager` for
+`allocator.BufferManager`) is not seen as imported there. If no other file
+imports the kernel, its key falls back. If another file imports it by its own
+name, the key folds that file's closure only, and an edit to the aliasing file
+does not move the key. No served kernel is imported this way today: every
+served nkilib kernel's importers include the file that wraps it.
 
 ### Kernels of other packages
 
@@ -146,7 +173,8 @@ never serves a stale kernel. These references fall back:
 - a kernel module of the package that is outside the snapshot (for example a
   kernel under `vllm_neuron/model/`) or that has no source file,
 - a kernel of another package that no snapshot file imports,
-- a dynamic import in the closure,
+- a dynamic import or a patch of unknown target in any snapshot file (see
+  [Patches](#patches)),
 - an NKI node whose `kernel_idx` is not in the process's kernel registry,
 - an error during the reference scan (logged at WARNING).
 

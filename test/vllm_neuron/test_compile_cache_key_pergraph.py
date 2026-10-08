@@ -373,10 +373,6 @@ RULES_TREE = {
         "def kernel(x):\n    from vllm_neuron.functional.leaf_b import f\n    return f(x)\n"
     ),
     "functional/plain_import.py": "import vllm_neuron.functional.leaf_b as lb\n",
-    "functional/dynamic.py": (
-        "import importlib\n\nmod = importlib.import_module('vllm_neuron.functional.leaf_b')\n"
-    ),
-    "functional/uses_dynamic.py": "from vllm_neuron.functional import dynamic\n",
     "functional/uses_envs.py": "from vllm_neuron import envs\n",
     "functional/typed.py": (
         "from typing import TYPE_CHECKING\n\nif TYPE_CHECKING:\n"
@@ -426,14 +422,81 @@ def test_the_closure_follows_static_imports(rules, module, expected):
     assert files == expected_rel
 
 
-def test_a_dynamic_import_in_the_closure_falls_back(rules):
-    resolution = rules.resolve(
-        [ck.Reference(ck.RefKind.MODULE, "vllm_neuron.functional.uses_dynamic")]
+#: A kernel, a file it imports, and a kernel of another package it wraps.
+UNKNOWN_PATCH_BASE = {
+    "functional/__init__.py": "",
+    "functional/leaf.py": "def f(x):\n    return x\n",
+    "functional/kernel.py": (
+        "from extpkg.k import ext_kernel\n"
+        "from vllm_neuron.functional.leaf import f\n\n"
+        "def kernel(x):\n    return f(x)\n"
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "source, fragment",
+    [
+        ("import importlib\n\nm = importlib.import_module('vllm_neuron.functional.leaf')\n",
+         "dynamically"),
+        ("import importlib\nimport extpkg.cfg as cfg\n\nimportlib.reload(cfg)\n", "dynamically"),
+        ("m = __import__('extpkg')\n", "dynamically"),
+        ("import extpkg.cfg as cfg\n\nvars(cfg)['MODE'] = 1\n", "stores through vars()"),
+        ("globals()['TILE'] = 1\n", "stores through globals()"),
+        ("globals().update(TILE=1)\n", "mutates globals()"),
+        ("import sys\n\nsys.modules['extpkg.cfg'] = object()\n", "mutates sys.modules"),
+        ("from sys import modules\n\nmodules.setdefault('extpkg.cfg', None)\n",
+         "mutates sys.modules"),
+        ("import extpkg.registry as reg\n\n@reg.register('k')\ndef k(x):\n    return x\n",
+         "decorates with extpkg.registry of another package"),
+        ("from extpkg.registry import register\n\n@register\nclass K:\n    pass\n",
+         "decorates with extpkg.registry.register of another package"),
+    ],
+)
+def test_a_file_that_may_patch_an_unnamed_module_falls_back_every_key(
+    tmp_path, source, fragment
+):
+    """The scan cannot name what such a file patches, so it may patch what any
+    kernel uses: every key that folds files falls back, though no kernel
+    imports the file."""
+    resolver = ck.KernelDigestResolver(
+        _write_tree(tmp_path, {**UNKNOWN_PATCH_BASE, "functional/odd.py": source})
     )
 
-    assert not resolution.per_graph
-    assert any("functional/dynamic.py" in r for r in resolution.reasons)
-    assert rules.digest(resolution) == rules.package_digest
+    for ref in (
+        ck.Reference(ck.RefKind.MODULE, "vllm_neuron.functional.kernel"),
+        ck.Reference(ck.RefKind.QUALIFIED_NAME, "extpkg.k.ext_kernel"),
+    ):
+        resolution = resolver.resolve([ref])
+        assert not resolution.per_graph, ref
+        assert any("functional/odd.py" in r and fragment in r for r in resolution.reasons)
+        assert resolver.digest(resolution) == resolver.package_digest
+
+
+def test_decorators_of_the_allowlisted_packages_and_of_this_package_keep_the_key(tmp_path):
+    source = (
+        "import dataclasses\nimport functools\nimport nki\nimport torch\n"
+        "from typing import final\n"
+        "from vllm_neuron.functional.leaf import f\n\n"
+        "@functools.lru_cache\n@nki.jit\n@torch.no_grad()\ndef k(x):\n    return x\n\n"
+        "@dataclasses.dataclass\n@final\nclass C:\n    pass\n\n"
+        "@f\n@staticmethod\ndef g():\n    pass\n"
+    )
+    resolver = ck.KernelDigestResolver(
+        _write_tree(tmp_path, {**UNKNOWN_PATCH_BASE, "functional/odd.py": source})
+    )
+
+    assert _module_files(resolver, "vllm_neuron.functional.kernel") == {
+        F + "kernel.py", F + "leaf.py",
+    }
+
+
+def test_the_decorator_allowlist_is_the_one_the_doc_names():
+    """A package added here is trusted to register nothing: review it, then update
+    this list, the module docstring and docs/design/compilation/kernel_source_digest.md."""
+    assert ck.NON_REGISTERING_DECORATOR_ROOTS == frozenset(
+        {"nki", "torch", "functools", "dataclasses", "typing", "abc", "contextlib", "enum"}
+    )
 
 
 @pytest.mark.parametrize(
@@ -617,6 +680,7 @@ def test_the_package_patches_only_the_modules_the_doc_names():
     then update this list and docs/design/compilation/kernel_source_digest.md."""
     patchers = ck.default_resolver()._patch_index()
 
+    assert patchers.unknown == {}
     assert patchers.by_file == {}
     assert patchers.by_package == {
         "nkilib": frozenset({"functional/mlp.py"}),
@@ -1441,3 +1505,29 @@ def test_the_library_key_signatures_match_what_the_wrappers_read():
 
     assert list(inspect.signature(graph_fn).parameters)[:2] == ["gm", "example_inputs"]
     assert list(inspect.signature(nki_fn).parameters) == ["func", "args", "grid"]
+
+
+def test_a_code_line_outside_the_kernel_function_moves_only_the_digests_that_reach_it(
+    tmp_path,
+):
+    """Proof (c), host side: the library's NKI key hashes the kernel function's
+    own source; a module-level code line beside it moves only the per-graph
+    digest of the kernels whose closure holds the file."""
+    copy = _copy_tree(tmp_path)
+    decode = "vllm_neuron.functional.kda.fused_decode"
+    prefill = "vllm_neuron.functional.moe.router_prefill"
+
+    def digests():
+        resolver = ck.KernelDigestResolver(copy)
+        return {
+            m: resolver.digest(resolver.resolve([ck.Reference(ck.RefKind.MODULE, m)]))
+            for m in (decode, prefill)
+        }
+
+    before = digests()
+    target = copy / "functional/kda/fused_decode.py"
+    target.write_bytes(target.read_bytes() + b"_CACHEKEY_PROOF_C = 1\n")
+    after = digests()
+
+    assert after[decode] != before[decode]
+    assert after[prefill] == before[prefill]

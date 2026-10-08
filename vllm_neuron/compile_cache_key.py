@@ -44,11 +44,19 @@ deleting an attribute or item (``mod.X = v``, ``mod.TABLE[k] = v``,
 ``discard``, ``add``, ``update``, ``setdefault``, ``sort``, ``reverse`` and the
 ``__setitem__`` family) on an imported object or a module attribute
 (``mod.TABLE.update(...)``). Imports and patches under ``if TYPE_CHECKING:`` do
-not count. Not detected: a mutation inside a function the file calls
-(``mod.set_mode(1)``), a mutating-method name called directly on a module bound
-by ``import`` (``nl.add`` is a kernel op, not a mutation), and ``exec`` /
-``eval``. ``test_compile_cache_key_pergraph.py`` pins the patches the package
-makes today, so a new one fails a test until it is reviewed.
+not count. A snapshot file that may patch a module the scan cannot name makes
+every key that folds files fall back, wherever the file sits: a dynamic import
+(``importlib``, ``importlib.reload``, ``__import__``), a store through
+``vars(mod)`` or ``globals()``, a store into ``sys.modules``, or a decorator
+rooted in another package outside :data:`NON_REGISTERING_DECORATOR_ROOTS`
+(``nki``, ``torch``, ``functools``, ``dataclasses``, ``typing``, ``abc``,
+``contextlib``, ``enum``), which may register into that package. Not detected:
+a mutation inside a function the file calls (``mod.set_mode(1)``), a store
+through a function parameter (``def f(m): m.X = v``), ``unittest.mock``
+patching, a mutating-method name called directly on a module bound by
+``import`` (``nl.add`` is a kernel op, not a mutation), and ``exec`` / ``eval``.
+``test_compile_cache_key_pergraph.py`` pins the patches the package makes today
+and the decorator allowlist, so a new one fails a test until it is reviewed.
 
 The library looks both key functions up through their module at every call
 (``cache.create_cache_hash(...)``; ``from .nki_cache import create_nki_cache_key``
@@ -543,6 +551,10 @@ class _ModuleImports:
     #: rebinds or deletes (``mod.ATTR = v``, ``mod.TABLE[k] = v``,
     #: ``setattr(mod, ...)``), at any depth.
     patched: tuple[str, ...]
+    #: The first mutation whose target the scan cannot name (``vars(mod)[k] = v``,
+    #: ``globals()[k] = v``, ``sys.modules[k] = m``, a decorator of another
+    #: package outside :data:`NON_REGISTERING_DECORATOR_ROOTS`), if any.
+    unknown_patch: Optional[str]
 
 
 class _Patchers(NamedTuple):
@@ -552,6 +564,10 @@ class _Patchers(NamedTuple):
     by_file: Mapping[str, frozenset[str]]
     #: Top-level name of another package -> the snapshot files that patch it.
     by_package: Mapping[str, frozenset[str]]
+    #: Snapshot file -> why it may patch any module (a dynamic import or a
+    #: mutation of unknown target). Every key that folds files falls back
+    #: while such a file is in the snapshot.
+    unknown: Mapping[str, str]
 
 
 def _package_of(rel: str) -> str:
@@ -612,6 +628,42 @@ _MUTATING_METHODS = frozenset(
 )
 
 
+#: Builtins whose result is a module's namespace: a store through it can
+#: rebind any name of any module.
+_NAMESPACE_BUILTINS = frozenset({"vars", "globals"})
+
+#: The namespace of every loaded module (``sys.modules[name] = shim``).
+_MODULE_TABLE = "sys.modules"
+
+#: Top-level packages whose decorators wrap or describe the function they
+#: decorate and register it nowhere another file reads. A decorator from any
+#: other package may register into that package's state, a mutation of
+#: unknown target.
+NON_REGISTERING_DECORATOR_ROOTS = frozenset(
+    {"nki", "torch", "functools", "dataclasses", "typing", "abc", "contextlib", "enum"}
+)
+
+
+def _namespace_store(expr: ast.expr) -> Optional[str]:
+    """The builtin (``vars`` / ``globals``) whose result ``expr`` goes through."""
+    while isinstance(expr, (ast.Attribute, ast.Subscript)):
+        expr = expr.value
+    if (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Name)
+        and expr.func.id in _NAMESPACE_BUILTINS
+    ):
+        return expr.func.id
+    return None
+
+
+def _decorator_root(expr: ast.expr) -> Optional[str]:
+    """The name a decorator expression starts from (``@a.b(c)`` -> ``a``)."""
+    while isinstance(expr, (ast.Call, ast.Attribute, ast.Subscript)):
+        expr = expr.func if isinstance(expr, ast.Call) else expr.value
+    return expr.id if isinstance(expr, ast.Name) else None
+
+
 def _mutated_object(expr: ast.expr) -> Optional[tuple[str, tuple[str, ...]]]:
     """``(base name, attribute path)`` of the object ``expr`` evaluates to.
 
@@ -658,10 +710,14 @@ def _parse_imports(rel: str, source: bytes) -> _ModuleImports:
     aliases: list[tuple[str, ast.expr]] = []  # ``name = <attribute chain>``
     mutated: list[ast.expr] = []
     method_receivers: list[ast.expr] = []  # ``<receiver>.append(...)`` and the like
+    decorators: list[ast.expr] = []
+    unknown: list[str] = []  # mutations whose target the scan cannot name
     type_only = _type_checking_only(tree)
     for node in ast.walk(tree):
         if id(node) in type_only:
             continue
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            decorators.extend(node.decorator_list)
         if isinstance(node, ast.Import):
             entries_by_node[id(node)] = [
                 (alias.asname or alias.name.partition(".")[0], _ImportEntry(alias.name, None))
@@ -700,6 +756,8 @@ def _parse_imports(rel: str, source: bytes) -> _ModuleImports:
                 node.ctx, (ast.Store, ast.Del)
             ):
                 mutated.append(node.value)
+                if (builtin := _namespace_store(node.value)) is not None:
+                    unknown.append(f"line {node.lineno} stores through {builtin}()")
             elif (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Name)
@@ -713,6 +771,8 @@ def _parse_imports(rel: str, source: bytes) -> _ModuleImports:
                 and node.func.attr in _MUTATING_METHODS
             ):
                 method_receivers.append(node.func.value)
+                if (builtin := _namespace_store(node.func.value)) is not None:
+                    unknown.append(f"line {node.lineno} mutates {builtin}()")
             continue
         if used and dynamic is None:
             dynamic = f"line {node.lineno} uses {used[0]}"
@@ -742,6 +802,20 @@ def _parse_imports(rel: str, source: bytes) -> _ModuleImports:
         # call (``nl.add``), not a mutation; ``mod.TABLE.update(...)`` is one.
         if found is not None and not (found[0] in module_names and not found[1]):
             patched.extend(objects(expr))
+    # ``sys.modules[name] = shim`` replaces a whole module: its target is a
+    # run-time string, so the scan cannot name the module it patches.
+    if any(t == _MODULE_TABLE or t.startswith(_MODULE_TABLE + ".") for t in patched):
+        unknown.append(f"mutates {_MODULE_TABLE}")
+        patched = [
+            t for t in patched if not (t == _MODULE_TABLE or t.startswith(_MODULE_TABLE + "."))
+        ]
+    for expr in decorators:
+        root = _decorator_root(expr)
+        for dotted in bound_to.get(root, ()) if root is not None else ():
+            if not _in_package(dotted) and (
+                dotted.partition(".")[0] not in NON_REGISTERING_DECORATOR_ROOTS
+            ):
+                unknown.append(f"line {expr.lineno} decorates with {dotted} of another package")
     module_imports, defined = _module_level_bindings(tree)
     imported: dict[str, list[_ImportEntry]] = {}
     for node in module_imports:
@@ -754,6 +828,7 @@ def _parse_imports(rel: str, source: bytes) -> _ModuleImports:
         defined_names=frozenset(defined),
         dynamic=dynamic,
         patched=tuple(dict.fromkeys(patched)),
+        unknown_patch=unknown[0] if unknown else None,
     )
 
 
@@ -949,8 +1024,14 @@ class KernelDigestResolver:
         if self._patchers is None:
             by_file: dict[str, set[str]] = {}
             by_package: dict[str, set[str]] = {}
+            unknown: dict[str, str] = {}
             for rel in self.files:
-                for target in self._parsed(rel).patched:
+                info = self._parsed(rel)
+                if info.dynamic is not None:
+                    unknown[rel] = f"imports modules dynamically ({info.dynamic})"
+                elif info.unknown_patch is not None:
+                    unknown[rel] = f"patches an object the scan cannot name ({info.unknown_patch})"
+                for target in info.patched:
                     if not _in_package(target):
                         by_package.setdefault(target.partition(".")[0], set()).add(rel)
                         continue
@@ -963,13 +1044,16 @@ class KernelDigestResolver:
             self._patchers = _Patchers(
                 {k: frozenset(v) for k, v in by_file.items()},
                 {k: frozenset(v) for k, v in by_package.items()},
+                unknown,
             )
         return self._patchers
 
     def _closure(self, start: str) -> tuple[frozenset[str], tuple[str, ...]]:
         if start not in self._closures:
             patchers = self._patch_index()
-            files, reasons, seen, work = set(), [], set(), [(start, None)]
+            # A file that may patch any module reaches every closure.
+            reasons = [f"{rel} {why}" for rel, why in sorted(patchers.unknown.items())]
+            files, seen, work = set(), set(), [(start, None)]
             while work:
                 node = work.pop()
                 if node in seen:
@@ -979,8 +1063,6 @@ class KernelDigestResolver:
                 files.add(rel)
                 work.extend((p, None) for p in patchers.by_file.get(rel, ()))
                 info = self._parsed(rel)
-                if info.dynamic is not None:
-                    reasons.append(f"{rel} imports modules dynamically ({info.dynamic})")
                 if name is None or name in info.defined_names or name not in info.imported_names:
                     entries = info.entries
                 else:
