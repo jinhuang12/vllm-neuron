@@ -429,6 +429,7 @@ def indexer_side_cache_bytes(
     *,
     max_seq_len: int,
     request_slots: int,
+    speculative_tokens: int = 0,
 ) -> int:
     """Return the bytes of the DSA indexer side caches the runner allocates beside the KV cache.
 
@@ -441,8 +442,10 @@ def indexer_side_cache_bytes(
     ``MambaSpec``, the test ``bind_kv_cache`` makes, and in the latent bank's dtype.
 
     ``max_seq_len`` and ``request_slots`` are the values the runner allocates with,
-    ``max_model_len`` and ``max_num_seqs``. A model whose text config declares no
-    indexer (``index_kpool`` and ``index_head_dim``) has no side caches: 0.
+    ``max_model_len`` and ``max_num_seqs``; ``speculative_tokens`` is the mtp
+    server's ``k`` (0 otherwise), which deepens the two rings
+    (``NeuronModelRunner._glm5next_indexer_ring_rows``). A model whose text config
+    declares no indexer (``index_kpool`` and ``index_head_dim``) has no side caches: 0.
     """
     index_kpool = getattr(text_config, "index_kpool", None)
     index_head_dim = getattr(text_config, "index_head_dim", None)
@@ -463,6 +466,9 @@ def indexer_side_cache_bytes(
         index_head_dim=int(index_head_dim),
         max_seq_len=int(max_seq_len),
         request_slots=int(request_slots),
+        ring_rows=NeuronModelRunner._glm5next_indexer_ring_rows(
+            int(index_kpool), int(speculative_tokens)
+        ),
     )
     return sum(tensor.nbytes for entry in side for tensor in entry.values())
 
@@ -5424,6 +5430,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         index_head_dim: int,
         max_seq_len: int,
         request_slots: int,
+        ring_rows: int | None = None,
     ) -> list[dict]:
         """Allocate the two indexer caches no ``LayerSpec`` declares, one set per sparse layer.
 
@@ -5448,10 +5455,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         the indexer needs one spare row above every addressable candidate pool, and
         ``max_seq_len`` is the engine's bound so the count is one constant per process
         rather than a per-step int that would need its own captured graph. ``tail`` is
-        ``[slots, 2, index_kpool, index_head_dim]``, half 0 keys and half 1 gate
-        scores. Both live across steps (the decode leg advances the ring in place and
-        the pooled store accumulates), so the caller allocates once and keeps them.
-        The dtype is the latent bank's; the layer casts on write.
+        ``[slots, 2, ring_rows, index_head_dim]``, half 0 keys and half 1 gate
+        scores; ``ring_rows`` is ``index_kpool`` when not given (the plain server's
+        ring) and at least that (``_glm5next_indexer_ring_rows``: a speculative
+        server's deeper ring; the kernels read the depth off the shape). Both live
+        across steps (the decode leg advances the ring in place and the pooled store
+        accumulates), so the caller allocates once and keeps them. The dtype is the
+        latent bank's; the layer casts on write.
 
         ``pad_tail`` is a scratch ring of the same shape. A decode step padded to its
         batch bucket serves each padding row from it, so a padding row's ring write
@@ -5472,6 +5482,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 f"the side caches are allocated one set per request slot, so the "
                 f"slot count must be positive; got {request_slots!r}"
             )
+        ring = pool if ring_rows is None else int(ring_rows)
+        if ring < pool:
+            raise ValueError(
+                f"the indexer ring holds at least one candidate pool of {pool} key(s); "
+                f"a ring of {ring} row(s) cannot close a pool"
+            )
         rows = int(max_seq_len) // pool + 1
         side: list[dict] = []
         for bank in banks:
@@ -5487,18 +5503,41 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         device=reference.device,
                     ),
                     "tail": torch.zeros(
-                        (slots, 2, pool, width),
+                        (slots, 2, ring, width),
                         dtype=reference.dtype,
                         device=reference.device,
                     ),
                     "pad_tail": torch.zeros(
-                        (slots, 2, pool, width),
+                        (slots, 2, ring, width),
                         dtype=reference.dtype,
                         device=reference.device,
                     ),
                 }
             )
         return side
+
+    @staticmethod
+    def _glm5next_indexer_ring_rows(index_kpool: int, speculative_tokens: int) -> int:
+        """The indexer ring's row count: ``index_kpool`` when nothing drafts, else the drafting depth.
+
+        A verify step writes ``1 + k`` ring rows ahead of a request's position, and a
+        pool-deep ring (``index_kpool`` rows) overwrites an accepted position's key
+        once ``1 + k >= 3``; the depth that keeps every accepted row is
+        :func:`vllm_neuron.functional.dsa.decode_trow.indexer_ring_depth` (one
+        function, the kernels read the depth off the bank's shape). A server that
+        drafts nothing keeps today's shape, bit-identical, and never imports it.
+        """
+        if int(speculative_tokens) <= 0:
+            return int(index_kpool)
+        from vllm_neuron.functional.dsa.decode_trow import indexer_ring_depth
+
+        return int(indexer_ring_depth(int(index_kpool), int(speculative_tokens)))
+
+    def _glm5next_speculative_tokens(self) -> int:
+        """``num_speculative_tokens`` under speculative method "mtp", else 0 (the shadow draft is not speculation)."""
+        if not getattr(self, "is_mtp_spec", False):
+            return 0
+        return int(self.drafter.num_speculative_tokens)
 
     def _glm5next_live_side_caches(self, banks) -> list[dict]:
         """Return this process's one live set of side caches, allocated on first use.
@@ -5526,6 +5565,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             index_head_dim=int(text_config.index_head_dim),
             max_seq_len=int(self.max_model_len),
             request_slots=self._glm5next_request_slot_capacity(banks) + SCRATCH_SLOTS,
+            ring_rows=self._glm5next_indexer_ring_rows(
+                int(text_config.index_kpool), self._glm5next_speculative_tokens()
+            ),
         )
         self._glm5next_side_cache_set = live
         # A fresh set is owned by nobody: the slot table and position record refer
