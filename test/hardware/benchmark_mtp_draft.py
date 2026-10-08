@@ -57,6 +57,7 @@ import torch  # noqa: E402
 
 import vllm_neuron  # noqa: E402,F401 -- registers the Neuron compilation backend
 from vllm_neuron.model.glm5_next import model_fp8, mtp  # noqa: E402
+from vllm_neuron.functional.mtp.common import launch_programs  # noqa: E402
 from vllm_neuron.model.glm5_next.config import Glm5NextConfig  # noqa: E402
 from vllm_neuron.model.glm5_next.weight_loaders_fp8 import FP8_SCALE_SUFFIX  # noqa: E402
 from test.vllm_neuron.functional.dsa import dsa_decode_case as case  # noqa: E402
@@ -484,6 +485,9 @@ def main() -> None:
         "environment": {k: os.environ.get(k) for k in (
             "NEURON_RT_VISIBLE_CORES", "NEURON_LOGICAL_NC_CONFIG", "NEURON_LIBTORCH_CACHE_ROOT",
             "NKI_SIMULATOR", "VLLM_NEURON_CPU_MODE", "NEURON_CC_FLAGS")},
+        # The program count the two tail kernels dispatch at (2 = the LNC2 split with the sendrecv
+        # combine), so a run's JSON says which kernel variant it timed.
+        "launch_programs": launch_programs(),
         "compiler_args": compiler_args() if args.mode == "device" else None,
         "cores": "neuron:0 = 1 logical core (LNC2) of the leased slice" if args.mode == "device" else "cpu",
         "args": vars(args) | {"output": str(args.output), "compare": None},
