@@ -1336,14 +1336,13 @@ class NeuronWorker(WorkerBase):
         """
         bytes_used_params = sum(p.nbytes for p in self.model_runner.model.parameters())
         bytes_used_buffers = sum(b.nbytes for b in self.model_runner.model.buffers())
-        # Add spec decode model weights.
-        if self.model_runner.drafter is not None:
-            bytes_used_params += sum(
-                p.nbytes for p in self.model_runner.drafter.model.parameters()
-            )
-            bytes_used_buffers += sum(
-                b.nbytes for b in self.model_runner.drafter.model.buffers()
-            )
+        # Add spec decode model weights -- unless the drafter is a head of the
+        # target (speculative method "mtp": ``MtpProposer.shares_target_parameters``),
+        # whose bytes the target's sums already hold.
+        drafter = self.model_runner.drafter
+        if drafter is not None and not getattr(drafter, "shares_target_parameters", False):
+            bytes_used_params += sum(p.nbytes for p in drafter.model.parameters())
+            bytes_used_buffers += sum(b.nbytes for b in drafter.model.buffers())
         return bytes_used_params + bytes_used_buffers
 
     def _estimate_available_memory_neuron(self, gpu_mem_util: float) -> int:
