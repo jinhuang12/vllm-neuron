@@ -7,10 +7,12 @@ near-ties flip; (H2) a draft write reaches trunk state (a KV or KDA row, the poo
 null block, the ring) and changes later trunk tokens. H1 cannot show on the simulator (no
 compiler, eager arithmetic, one rounding), H2 can; so this file runs the knob-5 and the knob-0
 arm through the same steps and compares, after EVERY step, every logit and every trunk tensor
-a step may write -- the stack layers' banks (latent, convolution, recurrent) and their side
-caches (pooled store, tail ring, scratch ring) -- bit for bit. The draft layer's own bank and
-side caches (index ``depth``, the last entry of the carrier walk) are the one place the draft
-is allowed to write and are not compared.
+a step may write -- the stack layers' banks and their side caches -- bit for bit. The trunk is
+the hybrid tiny stack (``test_independent_prefill_state._hybrid_root``: a real KDA layer between
+two DSA layers), so both state families are in the compared set: the DSA layers' latent banks
+with their pooled store, tail ring and scratch ring, and the KDA layer's convolution and
+recurrent banks. The draft layer's own bank and side caches (index ``depth``, the last entry of
+the carrier walk) are the one place the draft is allowed to write and are not compared.
 
 What the knob-5 arm does, so the writes the shadow legs can make are all made: three requests
 of different lengths, one prefilled in two chunks (the boundary id of the prefill leg); 64
@@ -43,6 +45,7 @@ from test.vllm_neuron.model.glm5_next import test_shadow_draft_e2e as shadow
 from test.vllm_neuron.model.glm5_next.tiny import test_tiny_glm5next_batch_decode as batch
 from test.vllm_neuron.model.glm5_next.tiny import test_tiny_glm5next_e2e as e2e
 from test.vllm_neuron.model.glm5_next.tiny import test_tiny_glm5next_forward as tiny
+from test.vllm_neuron.model.glm5_next.tiny import test_independent_prefill_state as hybrid
 
 pytestmark = [pytest.mark.forked]
 
@@ -68,9 +71,12 @@ MAX_MODEL_LEN = max(PROMPTS) + DECODE_STEPS + K + PAGE
 
 
 def _world(monkeypatch, knob: int):
-    """The tiny root at ``knob`` (read at construction), its caches, a runner shell.
+    """The hybrid tiny root at ``knob`` (read at construction), its caches, a runner shell.
 
-    Three requests own disjoint page runs after the null block; the block table the
+    The root is ``_hybrid_root``'s: the tiny DSA stack with a real KDA layer in the middle,
+    so the trunk holds both state families. The caches are the runner's own shapes
+    (``_runner_shaped_caches``: ``[slots, *state]`` banks for the KDA layer), with the paged
+    banks widened to three requests' pages after the null block. The block table the
     translator hands a layer names only the pages a request has used, so a draft position
     past the current page resolves to slot 0. The same seeds build the same head, prompts
     and teacher tokens on both arms.
@@ -80,7 +86,7 @@ def _world(monkeypatch, knob: int):
     else:
         monkeypatch.delenv(KNOB, raising=False)
     e2e._require_cpu_mode()
-    root = e2e._fixture()["root"]
+    root = hybrid._hybrid_root()
     assert (root.mtp is not None) == bool(knob)
     head = torch.randn(
         tiny.STACK_VOCAB_SIZE, int(root.text_config.hidden_size),
@@ -92,12 +98,13 @@ def _world(monkeypatch, knob: int):
         shadow._materialise_head(root, shadow.SEED_HEAD)
     per_request = -(-MAX_MODEL_LEN // PAGE)
     blocks = 1 + len(PROMPTS) * per_request
-    caches = {}
+    caches = e2e._runner_shaped_caches(root)
     for spec in root.get_kv_spec().layers:
-        shape = (blocks, int(spec.num_kv_heads), PAGE, int(spec.head_size))
-        caches[spec.name] = [
-            torch.zeros(shape, dtype=spec.dtype) for _ in range(1 if spec.latent_kv else 2)
-        ]
+        if spec.kda_recurrent_state_shape is None:
+            caches[spec.name] = [
+                torch.zeros((blocks, *bank.shape[1:]), dtype=bank.dtype)
+                for bank in caches[spec.name]
+            ]
     root.bind_kv_cache(caches)
     generator = torch.Generator().manual_seed(SEED)
     prompts = [
@@ -173,10 +180,10 @@ def _observe(world, logits, drafts, *, is_prefill: bool, read_back: bool = True)
 def _trunk_state(world) -> dict[str, torch.Tensor]:
     """Every trunk tensor a step may write, cloned, by name.
 
-    The stack layers' banks (``bind_kv_cache``'s views: the latent bank of a sparse layer,
-    the convolution and recurrent banks of a linear layer) and their side caches (the
-    indexer's pooled store, tail ring and scratch ring). The draft layer's entries, at index
-    ``depth``, are its own and are left out.
+    The stack layers' banks (the tensors ``bind_kv_cache`` was handed: the latent bank of a
+    sparse layer, the convolution and recurrent banks of the linear layer) and their side
+    caches (the indexer's pooled store, tail ring and scratch ring). The draft layer's
+    entries, at index ``depth``, are its own and are left out.
     """
     state = {}
     banks = world.root.glm5next_layer_banks
@@ -281,6 +288,20 @@ def test_the_shadow_draft_leaves_every_trunk_tensor_and_every_logit_bit_equal(
     with caplog.at_level(logging.WARNING):
         on = _run(monkeypatch, K, tmp_path)
     _assert_traces_agree(off, on)
+
+    # Both state families were compared, and both moved: the KDA layer's two banks and the
+    # DSA layers' latent banks are in the set and non-zero at the end.
+    final = on.trace[-1][3]
+    recurrent = [
+        spec.name for spec in on.world.root.get_kv_spec().layers[: on.world.depth]
+        if spec.kda_recurrent_state_shape is not None
+    ]
+    assert recurrent, "the hybrid trunk holds a KDA layer"
+    for name in recurrent:
+        for position in (0, 1):
+            key = next(k for k in final if k.endswith(f"{name}[{position}]"))
+            assert float(final[key].detach().float().abs().sum()) > 0.0, key
+    assert sum("side pool_cache" in k for k in final) == on.world.depth - len(recurrent)
 
     # The knob-5 arm did what the server does: a [B, K] draft every decode step, written to
     # the draft layer's own bank, crossing into an unnamed page (slot 0) on every step.
