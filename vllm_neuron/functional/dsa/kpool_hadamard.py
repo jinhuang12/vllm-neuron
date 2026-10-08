@@ -230,6 +230,23 @@ def _fwht128_inplace(buf_a, buf_b, head_dim: int):
     return src
 
 
+def _fwht128_blocks(buf_a, buf_b, parts: int, rows: int):
+    """The butterfly over ``rows`` 128-channel rows on each of ``parts`` partitions.
+
+    ``buf_a`` and ``buf_b`` are ``(parts, rows * INDEX_HEAD_DIM)`` fp32 tiles, row ``j`` of a
+    partition in columns ``128 j .. 128 j + 127``; ``buf_a`` holds the input, ``buf_b`` is
+    scratch, and the result is in the returned tile. This is the name and signature the
+    batched decode ring step calls (``_fwht128_blocks(pooled, scratch, h, 1)``, one row on
+    each of ``h`` partitions). :func:`_fwht128_inplace` already transforms every
+    ``INDEX_HEAD_DIM``-wide vector of its free axis on its own, two instructions a stage, so
+    this is that call on the two tiles viewed at the stated shape: the same instructions on
+    the same operands.
+    """
+    width = rows * INDEX_HEAD_DIM
+    return _fwht128_inplace(buf_a.reshape((parts, width)), buf_b.reshape((parts, width)),
+                            INDEX_HEAD_DIM)
+
+
 def _broadcast_row(hbm, rows: int, head_dim: int, row: int):
     """One row of a 2-D HBM buffer replicated across ``rows`` partitions, as an fp32 tile.
 
