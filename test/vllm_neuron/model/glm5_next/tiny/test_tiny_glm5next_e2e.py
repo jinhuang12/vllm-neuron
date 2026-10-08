@@ -1193,7 +1193,9 @@ def test_the_decode_leg_serves_uniform_multi_row_steps_and_refuses_ragged_ones()
     )
 
     def build(tokens: int, requests: int = 1):
-        geometries = _geometries(banks, block_ids=range(PROMPT_BLOCKS), state_slot=0)
+        # The step's rows sit past the prompt, so the row names the pages they land on.
+        blocks = _blocks_for(item.STACK_TOKENS + tokens)
+        geometries = _geometries(banks, block_ids=range(blocks), state_slot=0)
         for geometry in geometries:
             geometry["request_block_ids"] = [list(geometry["block_ids"])] * requests
             geometry["state_slots"] = list(range(requests))

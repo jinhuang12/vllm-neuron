@@ -6133,9 +6133,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # on the plain leg, ``1 + k`` on speculative decoding's verify step. Rows
             # that do not divide into whole requests name no request.
             raise ValueError(
-                f"a decode step carries one row set per request, the same width for "
-                f"every request (one token, or 1 + k on a verify step); this step "
-                f"carries {int(tokens)} token(s) for {int(requests)} request(s), which "
+                f"a decode step carries one token per request, or 1 + k on a verify "
+                f"step, the same width for every request; this step carries "
+                f"{int(tokens)} token(s) for {int(requests)} request(s), which "
                 f"do not divide into whole requests"
             )
         real = int(tokens) if real_tokens is None else int(real_tokens)
@@ -6302,13 +6302,23 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 # bank, so they travel as a tuple of views, never a copy: the
                 # recurrence advances in place. The positions are one tensor so no
                 # host number reaches the graph (see ``_glm5next_start_positions``).
+                # A bank holding ``1 + k`` state rows per slot (``[slots, 1 + k, ...]``,
+                # speculative method "mtp"; the bind records ``state_checkpoints`` on
+                # the bank) hands a prefill the one-row carrier ``bank[slot, 0]`` -- a
+                # prefill writes row 0 -- and a decode the slot's rows whole; a plain
+                # bank hands ``bank[slot]`` on both legs.
+                prefill_row = bool(is_prefill) and int(bank.get("state_checkpoints", 1)) > 1
+
+                def state_view(key, one_slot):
+                    return bank[key][one_slot, 0] if prefill_row else bank[key][one_slot]
+
                 carriers.append(
                     {
                         "conv_state": tuple(
-                            bank["conv_state"][one_slot] for one_slot in state_slots
+                            state_view("conv_state", one_slot) for one_slot in state_slots
                         ),
                         "recurrent_state": tuple(
-                            bank["recurrent_state"][one_slot]
+                            state_view("recurrent_state", one_slot)
                             for one_slot in state_slots
                         ),
                         "is_prefill": bool(is_prefill),

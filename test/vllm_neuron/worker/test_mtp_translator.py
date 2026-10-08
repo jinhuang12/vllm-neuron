@@ -319,6 +319,67 @@ def test_a_padding_row_resumes_from_its_slots_own_row():
     assert NeuronModelRunner._glm5next_recurrent_checkpoints(runner, [1], is_prefill=False) is None
 
 
+def _kda_prefill_convert(world, req_id: str, tokens: int) -> list[dict]:
+    """A fresh request's opening prefill of ``tokens`` rows on the KDA world, converted (not
+    run); returns the carriers."""
+    runner = world.runner
+    runner.input_batch.req_ids = [req_id]
+    runner._glm5next_request_tokens = None
+    metadata = kda._metadata(world.banks, rows=tokens, max_query_len=tokens, cached=[0])
+    converted = runner._glm5next_model_kwargs({
+        "input_ids": torch.zeros(tokens, dtype=torch.long),
+        "attn_metadata": metadata,
+        "sampling_positions": torch.tensor([tokens - 1], dtype=torch.long),
+    })
+    return converted["layer_carriers"]
+
+
+def test_a_prefill_on_a_checkpoint_bank_hands_the_one_row_carrier_and_a_decode_the_slots_rows():
+    """worker-57's banks hold ``1 + k`` state rows per slot (``[slots, 1 + k, ...]``) and the
+    bank record names it (``state_checkpoints``): a prefill writes row 0, so its view is the
+    plain per-slot state at row 0 of the request's slot and no checkpoint keyword rides
+    along; a one-request decode's view is the slot's rows whole (the eager-view form) with
+    the checkpoint keywords. A plain bank (no record) keeps ``bank[slot]`` on both legs."""
+    world = kda._world(1)
+    _mtp_server(world.runner)
+    plain_shapes = {}
+    for bank in world.banks:
+        for key in ("conv_state", "recurrent_state"):
+            plain_shapes[key] = tuple(bank[key].shape[1:])
+            bank[key] = bank[key].unsqueeze(1).repeat(1, T, *([1] * (bank[key].dim() - 1)))
+        bank["state_checkpoints"] = T
+    prefill = _kda_prefill_convert(world, "req-fresh", tokens=5)
+    slot = world.runner._glm5next_request_slot_table["req-fresh"]
+    assert len(prefill) == len(world.banks)
+    for bank, carrier in zip(world.banks, prefill):
+        assert carrier["is_prefill"] is True
+        assert "state_checkpoints" not in carrier and "checkpoint_rows" not in carrier
+        for key in ("conv_state", "recurrent_state"):
+            views = carrier[key]
+            assert isinstance(views, tuple) and len(views) == 1
+            assert tuple(views[0].shape) == plain_shapes[key]
+            assert views[0].data_ptr() == bank[key][slot, 0].data_ptr(), "row 0 of the slot"
+    # The same server's one-request decode: the slot's ``T`` rows, whole.
+    start = kda.PROMPTS[0]
+    decode = _kda_convert(world, [0], cached=[start], tokens=T, real=[T])
+    slot0 = world.runner._glm5next_request_slot_table[world.req_ids[0]]
+    for bank, carrier in zip(world.banks, decode):
+        assert carrier["state_checkpoints"] == T
+        for key in ("conv_state", "recurrent_state"):
+            views = carrier[key]
+            assert isinstance(views, tuple) and len(views) == 1
+            assert tuple(views[0].shape) == (T, *plain_shapes[key])
+            assert views[0].data_ptr() == bank[key][slot0].data_ptr()
+    # A plain bank: ``bank[slot]`` on the prefill leg too.
+    plain = kda._world(1)
+    _mtp_server(plain.runner)
+    for bank, carrier in zip(plain.banks, _kda_prefill_convert(plain, "req-fresh", tokens=5)):
+        slot = plain.runner._glm5next_request_slot_table["req-fresh"]
+        for key in ("conv_state", "recurrent_state"):
+            assert carrier[key][0].data_ptr() == bank[key][slot].data_ptr()
+            assert tuple(carrier[key][0].shape) == tuple(bank[key].shape[1:])
+
+
 def test_a_mixed_batch_is_refused_by_name():
     """One request with k drafts beside one with none has no one width; refused rather
     than laid out until the prefill leg drafts too."""
