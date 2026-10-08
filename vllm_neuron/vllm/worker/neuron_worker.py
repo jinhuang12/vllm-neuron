@@ -172,7 +172,9 @@ def _indexer_side_cache_bytes(vllm_config, model_runner, kv_cache_spec=None) -> 
     """Return the bytes of the DSA indexer side caches the runner allocates.
 
     ``pool_cache``, ``tail`` and ``pad_tail`` of every sparse-attention layer, one
-    set per request slot (``max_num_seqs``), sized by ``max_model_len``:
+    set per request slot (``max_num_seqs``), sized by ``max_model_len``; on a server
+    drafting ``k`` mtp tokens (``model_runner.speculative_config``) the two rings are
+    ``indexer_ring_depth(index_kpool, k)`` rows deep, ``index_kpool`` otherwise:
     :func:`~vllm_neuron.vllm.worker.neuron_model_runner.indexer_side_cache_bytes`.
     0 for a model with no indexer.
     """
@@ -180,11 +182,17 @@ def _indexer_side_cache_bytes(vllm_config, model_runner, kv_cache_spec=None) -> 
 
     if kv_cache_spec is None:
         kv_cache_spec = model_runner.get_kv_cache_spec()
+    speculative_config = model_runner.speculative_config
     return indexer_side_cache_bytes(
         kv_cache_spec,
         getattr(model_runner.model, "text_config", None),
         max_seq_len=vllm_config.model_config.max_model_len,
         request_slots=vllm_config.scheduler_config.max_num_seqs,
+        speculative_tokens=(
+            int(speculative_config.num_speculative_tokens)
+            if speculative_config is not None and speculative_config.method == "mtp"
+            else 0
+        ),
     )
 
 
@@ -1660,14 +1668,13 @@ class NeuronWorker(WorkerBase):
         """
         bytes_used_params = sum(p.nbytes for p in self.model_runner.model.parameters())
         bytes_used_buffers = sum(b.nbytes for b in self.model_runner.model.buffers())
-        # Add spec decode model weights.
-        if self.model_runner.drafter is not None:
-            bytes_used_params += sum(
-                p.nbytes for p in self.model_runner.drafter.model.parameters()
-            )
-            bytes_used_buffers += sum(
-                b.nbytes for b in self.model_runner.drafter.model.buffers()
-            )
+        # Add spec decode model weights -- unless the drafter is a head of the
+        # target (speculative method "mtp": ``MtpProposer.shares_target_parameters``),
+        # whose bytes the target's sums already hold.
+        drafter = self.model_runner.drafter
+        if drafter is not None and not getattr(drafter, "shares_target_parameters", False):
+            bytes_used_params += sum(p.nbytes for p in drafter.model.parameters())
+            bytes_used_buffers += sum(b.nbytes for b in drafter.model.buffers())
         return bytes_used_params + bytes_used_buffers
 
     def _estimate_available_memory_neuron(
