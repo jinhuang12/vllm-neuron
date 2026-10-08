@@ -267,21 +267,23 @@ def _resolve_tp_group() -> GroupCoordinator | None:
 
 
 def _tp_group_if_initialized() -> GroupCoordinator | None:
-    """:func:`_resolve_tp_group`, or None when vllm's tensor-parallel group does not exist.
+    """:func:`_resolve_tp_group`, or None when the world is distributed but vllm's
+    tensor-parallel group has not been initialized.
 
     Load time may run without one: a checkpoint loaded out of process for one rank of
-    a larger world (``test_tensor_parallel_shards.py``) has a world size and a rank but
-    no group. vllm signals the missing group with ``get_tp_group``'s assertion
-    ("tensor model parallel group is not initialized", ``distributed/parallel_state.py``);
-    only that refusal becomes None, so the forward's row-parallel sites, which call
-    :func:`_resolve_tp_group` directly, still refuse to reduce without a group.
+    a larger world (the shard tests) has a world size and a rank but no group. The
+    probe is vllm's own ``model_parallel_is_initialized``, consulted only at a world
+    size above one, so a single-rank process never imports vllm here and a test that
+    substitutes :func:`_resolve_tp_group` reaches its substitute. The forward's
+    row-parallel sites call :func:`_resolve_tp_group` directly and still refuse to
+    reduce without a group.
     """
-    try:
-        return _resolve_tp_group()
-    except AssertionError as refusal:
-        if "tensor model parallel group is not initialized" not in str(refusal):
-            raise
-        return None
+    if _resolve_world_size() > 1:
+        from vllm.distributed.parallel_state import model_parallel_is_initialized
+
+        if not model_parallel_is_initialized():
+            return None
+    return _resolve_tp_group()
 
 
 # --------------------------------------------------------------------------- #

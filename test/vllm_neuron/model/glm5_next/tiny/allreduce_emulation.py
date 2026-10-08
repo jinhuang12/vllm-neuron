@@ -156,6 +156,9 @@ class EmulatedTPGroup:
             after, while the CPU MoE route returns its sum already rounded to bfloat16,
             which is that same result.
         ranks: the emulated tensor-parallel degree.
+        rank: this process's emulated index in the group, exposed as ``rank_in_group``
+            as ``GroupCoordinator`` exposes it (the indexer's load-time shard binding
+            reads it); the partials' arithmetic does not depend on it.
         kappa: spread of each partial, in units of its row's RMS.
         order: ``rdh`` or ``ring``.
         seed: seeds the partials and the dither.
@@ -177,13 +180,17 @@ class EmulatedTPGroup:
         order: str = "rdh",
         seed: int = 0,
         active_sites=None,
+        rank: int = 0,
     ) -> None:
         """Seed the partials and start the per-call records; arguments as above."""
         if wire not in ("fp32", "bf16"):
             raise ValueError(f"wire must be fp32 or bf16, got {wire!r}")
+        if not 0 <= rank < ranks:
+            raise ValueError(f"rank must lie in [0, {ranks}), got {rank}")
         self.wire = wire
         self.world_size = ranks
         self.ranks = ranks
+        self.rank_in_group = rank
         self.kappa = kappa
         self.order = order
         self.active_sites = None if active_sites is None else set(active_sites)
