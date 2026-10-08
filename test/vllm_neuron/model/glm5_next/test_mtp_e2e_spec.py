@@ -241,8 +241,8 @@ def _assert_draft_from_rows(
 ):
     """The one draft call starts request ``b`` from verify row ``rows[b]`` (request-major
     index into the populate rows) with the id kept there and that row's position; its
-    one-row carrier moves the three per-request position operands (a scalar for one
-    request, ``[B]`` for more) and gathers the kept rows' slots, on the step's own state
+    one-row carrier moves the three per-request position operands (``[B]`` tensors at one
+    request as at more) and gathers the kept rows' slots, on the step's own state
     objects."""
     draft = recorder.of("draft")
     assert len(draft) == 1
@@ -257,8 +257,10 @@ def _assert_draft_from_rows(
     kwargs = call["kwargs"]
     assert "tail" in kwargs and "position" in kwargs and "prefill_tail" not in kwargs
     for key in ("position", "start_position"):
-        assert tuple(kwargs[key].shape) == (() if len(rows) == 1 else (len(rows),)), key
-        assert kwargs[key].reshape(-1).tolist() == positions, key
+        # The request form, one request included: the sparse layer's T-row leg reads a
+        # [B] position (a scalar beside a tuple of rings is refused by name).
+        assert tuple(kwargs[key].shape) == (len(rows),), key
+        assert kwargs[key].tolist() == positions, key
     assert kwargs["seq_lens"].tolist() == [position + 1 for position in positions]
     assert kwargs["latent_slots"].tolist() == [int(carriers[-1]["latent_slots"][row]) for row in rows]
     for key in ("tail", "pool_cache", "latent_cache", "block_table_row"):

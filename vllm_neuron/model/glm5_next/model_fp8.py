@@ -10139,12 +10139,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
         ids_last = torch.gather(accepted, 1, last.reshape(-1, 1)).reshape(-1).to(torch.int32)
         positions_last = positions + last.to(torch.int32)
         # A one-row carrier at the kept row: the same state objects, with the three
-        # per-request position operands moved and the per-row slot gathered. One
-        # request keeps the scalar form the one-request decode carrier uses.
-        scalar = positions_last if requests > 1 else positions_last.reshape(())
+        # per-request position operands moved and the per-row slot gathered. The
+        # positions stay ``[B]`` at one request too: the carrier is the request form
+        # (a tuple of ring views), whose sparse leg reads a ``[B]`` position.
         one_row = dict(draft_carrier)
-        one_row["position"] = scalar
-        one_row["start_position"] = scalar
+        one_row["position"] = positions_last
+        one_row["start_position"] = positions_last
         one_row["seq_lens"] = (positions_last + 1).to(torch.int32)
         one_row["latent_slots"] = torch.index_select(draft_carrier["latent_slots"], 0, row_index)
         draft_ids = draft_head.draft_tokens(
