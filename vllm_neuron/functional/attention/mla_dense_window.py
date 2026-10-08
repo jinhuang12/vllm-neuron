@@ -230,12 +230,15 @@ def _row_tile(q_hbm, limits_hbm, out_hbm, c_t, c_rows, cols_f, softmax_scale,
                   src=out_sb[0:rt, :])
 
 
-def _dense_body(q_hbm, window_hbm, limits_hbm, softmax_scale, key_rows, out_hbm):
-    """Attend ``window_hbm`` rows ``0 .. min(limit, key_rows) - 1`` for every query row.
+def _dense_body(q_hbm, window_hbm, limits_hbm, softmax_scale, key_rows, active_rows,
+                out_hbm):
+    """Attend ``window_hbm`` rows ``0 .. min(limit, key_rows) - 1`` for query rows
+    ``0 .. active_rows - 1``, and write zero rows from ``active_rows`` on.
 
     ``q_hbm`` is ``[rows, L]`` (queries x heads, row-major), ``limits_hbm`` ``[rows]``
     int32, ``out_hbm`` ``[rows, L]`` fp32. ``key_rows`` is a trace-time int no larger
-    than the staged window.
+    than the staged window; ``active_rows`` a trace-time int in ``1 .. rows``. The limits
+    of the rows past ``active_rows`` are not read.
     """
     rows, latent = q_hbm.shape
     n_lat = latent // LATENT_TILE
@@ -268,23 +271,38 @@ def _dense_body(q_hbm, window_hbm, limits_hbm, softmax_scale, key_rows, out_hbm)
     cols_f = _sb((ROW_TILE, width), nl.float32)
     nisa.iota(dst=cols_f, pattern=[[1, width]], offset=0)
 
-    n_full = rows // ROW_TILE
-    tail = rows - n_full * ROW_TILE
+    # Work is dealt round-robin over the programs: the whole tiles of active rows, then
+    # the partial tile, then the zero-row chunks. ``program_id`` is a trace-time int (the
+    # kernel is traced once per program), so each program keeps only its own jobs.
+    n_full = active_rows // ROW_TILE
+    tail = active_rows - n_full * ROW_TILE
     n_prgs = nl.num_programs(axes=0)
     prg = nl.program_id(0)
     for qt in nl.affine_range(prg, n_full, n_prgs):
         _row_tile(q_hbm, limits_hbm, out_hbm, c_t, c_rows, cols_f, softmax_scale,
                   key_rows, qt * ROW_TILE, ROW_TILE)
+    job = n_full
     if tail > 0:
-        # The seam launches one program whenever a partial tile exists.
-        _row_tile(q_hbm, limits_hbm, out_hbm, c_t, c_rows, cols_f, softmax_scale,
-                  key_rows, n_full * ROW_TILE, tail)
+        if job % n_prgs == prg:
+            _row_tile(q_hbm, limits_hbm, out_hbm, c_t, c_rows, cols_f, softmax_scale,
+                      key_rows, n_full * ROW_TILE, tail)
+        job += 1
+    if active_rows < rows:
+        zero = _sb((ROW_TILE, latent), nl.float32)
+        nisa.memset(dst=zero, value=0.0)
+        for z0 in range(active_rows, rows, ROW_TILE):
+            if job % n_prgs == prg:
+                zn = min(ROW_TILE, rows - z0)
+                nisa.dma_copy(dst=out_hbm.ap(pattern=[[latent, zn], [1, latent]],
+                                             offset=z0 * latent),
+                              src=zero[0:zn, :])
+            job += 1
 
 
 @nki.jit
 def mla_dense_window_kernel(q_hbm, bank_hbm, table_hbm, limits_hbm, written_hbm,
                             write_offset_hbm, softmax_scale, page_size, key_rows,
-                            source_digest=0, staging_digest=0):
+                            active_rows, source_digest=0, staging_digest=0):
     """Dense causal attention of query rows over the window a block table names.
 
     Args:
@@ -299,20 +317,24 @@ def mla_dense_window_kernel(q_hbm, bank_hbm, table_hbm, limits_hbm, written_hbm,
         page_size: python int, rows per page.
         key_rows: python int, the staged window rows (``pages * page_size``), at most
             :data:`MAX_KEY_ROWS`.
+        active_rows: python int in ``1 .. rows``: rows from it on are written as zeros,
+            with no compute, and their limits are not read (a padded chunk's rows).
         source_digest, staging_digest: python ints that only key the compiled-kernel cache
             on this file and on ``mla_sparse.py`` (the staging helper).
 
     Returns:
-        ``[rows, L]`` fp32 in shared HBM. A row whose limit is 0 is zero.
+        ``[rows, L]`` fp32 in shared HBM. A row whose limit is 0 is zero, and so is every
+        row from ``active_rows`` on.
 
-    Under a two-program launch the query tiles are split between the programs; the seam
-    launches two only when ``rows`` is a whole number of 128-row tiles.
+    Under a two-program launch the work is dealt round-robin between the programs: the
+    whole 128-row tiles of active rows, the partial tile, then the zero-row chunks.
     """
     rows, latent = q_hbm.shape
     out_hbm = nl.ndarray((rows, latent), dtype=nl.float32, buffer=nl.shared_hbm)
     window_hbm = _ms._staged_window(bank_hbm, table_hbm, written_hbm, write_offset_hbm,
                                     page_size)
-    _dense_body(q_hbm, window_hbm, limits_hbm, softmax_scale, key_rows, out_hbm)
+    _dense_body(q_hbm, window_hbm, limits_hbm, softmax_scale, key_rows, active_rows,
+                out_hbm)
     return out_hbm
 
 
@@ -375,14 +397,10 @@ def _require_values(seq: int, heads: int, latent: int, cache_latent: int,
 
 
 def _programs(rows: int) -> int:
-    """Two programs on an LNC2 core when every tile is whole and there are two or more."""
+    """Two programs on an LNC2 core when the rows span two or more 128-row tiles."""
     # NEURON_LOGICAL_NC_CONFIG is the Neuron runtime's core setting, read here the way
     # every LNC2 kernel in functional/ reads it; it is not a vllm-neuron knob.
-    if (
-        os.environ.get("NEURON_LOGICAL_NC_CONFIG") == "2"
-        and rows % ROW_TILE == 0
-        and rows // ROW_TILE >= 2
-    ):
+    if os.environ.get("NEURON_LOGICAL_NC_CONFIG") == "2" and rows > ROW_TILE:
         return 2
     return 1
 
@@ -391,7 +409,8 @@ def mla_dense_window_attention(q_lift: Tensor, c_kv: Tensor, seq_lens: Tensor,
                                softmax_scale: float, block_table_row: Tensor,
                                written: Tensor | None = None,
                                write_offset: Tensor | None = None,
-                               page_size: int = 0) -> Tensor:
+                               page_size: int = 0,
+                               active_rows: int | None = None) -> Tensor:
     """Dense causal MLA attention over the window a block table names. ``[S, H, L]`` fp32.
 
     Args:
@@ -404,6 +423,9 @@ def mla_dense_window_attention(q_lift: Tensor, c_kv: Tensor, seq_lens: Tensor,
         written: ``[tokens, L]`` this step's own rows, overlaid at ``write_offset``.
         write_offset: ``[1, 1]`` int32, read on device.
         page_size: rows per page, a trace-time int.
+        active_rows: a trace-time int in ``1 .. S``, or None for ``S``: queries from it
+            on (a padded chunk's rows) come back as zero rows, written by the kernel, and
+            their ``seq_lens`` entries are not read.
 
     The whole window is staged, as the sparse seam stages it: this step's rows are
     overlaid at a runtime offset, and only the window's own extent is a trace-time
@@ -432,10 +454,15 @@ def mla_dense_window_attention(q_lift: Tensor, c_kv: Tensor, seq_lens: Tensor,
             f"seq_lens must be [seq] = [{seq}], one causal length per query; got "
             f"{tuple(seq_lens.shape)}"
         )
+    active = seq if active_rows is None else int(active_rows)
+    if not 1 <= active <= seq:
+        raise MlaDenseWindowError(
+            f"active_rows must be in [1, {seq}], a prefix of the queries; got {active_rows!r}"
+        )
     # Checked eagerly only, as the sparse seam checks its indices: a traced call has no
     # values to read, and the kernel clamps each row's length at the staged rows.
     if values_are_readable(seq_lens):
-        lo, hi = int(seq_lens.min()), int(seq_lens.max())
+        lo, hi = int(seq_lens[:active].min()), int(seq_lens[:active].max())
         if lo < 1 or hi > staged:
             raise MlaDenseWindowError(
                 f"every seq_lens entry must be in [1, {staged}], the window rows this call "
@@ -461,6 +488,7 @@ def mla_dense_window_attention(q_lift: Tensor, c_kv: Tensor, seq_lens: Tensor,
         float(softmax_scale),
         page,
         int(staged),
+        active * heads,
         SOURCE_DIGEST,
         STAGING_DIGEST,
     )

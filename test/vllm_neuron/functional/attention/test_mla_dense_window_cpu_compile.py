@@ -9,7 +9,9 @@ at 1 head (TP=64) and latent 512:
 * 1024 query rows over a 2048-row window (the p1 chunk: segment 1024 + chunk 1024);
 * 2048 query rows over a 2048-row window (one 2048-token chunk);
 * 1024 query rows over a 2176-row window (17 pages: the widest window the identity
-  bound of 2051 rows needs at page 128).
+  bound of 2051 rows needs at page 128);
+* the p1 chunk padded: 1000 active of 1024 query rows (a 1000-token prompt in the
+  1024-row bucket), whose zero rows the kernel writes on both programs.
 
 The child stops before the executor is built (``build_executable`` is replaced), so it
 never opens the Neuron runtime, and its platform target is set, so nothing asks the
@@ -35,12 +37,12 @@ ROW = "mla_dense_window_cpu_compile"
 _ROOT = pathlib.Path(__file__).resolve().parents[4]
 _DROP = ("NKI_SIMULATOR", "NKI_PRECISE_FP", "VLLM_NEURON_CPU_MODE",
          "NEURON_LIBTORCH_CPU_MODE", "NEURON_RT_VISIBLE_CORES")
-#: ``(query rows, window pages)`` at page 128, latent 512, one head.
-CASES = ((1024, 16), (2048, 16), (1024, 17))
+#: ``(query rows, window pages, active rows)`` at page 128, latent 512, one head.
+CASES = ((1024, 16, 1024), (2048, 16, 2048), (1024, 17, 1024), (1024, 16, 1000))
 LATENT, PAGE, SCALE = 512, 128, 0.0625
 
 
-def _child(rows: int, pages: int) -> None:
+def _child(rows: int, pages: int, active: int) -> None:
     import torch
 
     import libtorch_neuronx_lite  # noqa: F401  (registers the backends)
@@ -64,7 +66,7 @@ def _child(rows: int, pages: int) -> None:
     def fn(q, bank, table, seq_lens, written, offset):
         return DW.mla_dense_window_attention(q, bank, seq_lens, SCALE, block_table_row=table,
                                              written=written, write_offset=offset,
-                                             page_size=PAGE)
+                                             page_size=PAGE, active_rows=active)
 
     args = (torch.empty((rows, 1, LATENT), dtype=bf, device=meta),
             torch.empty((2 * pages * PAGE, LATENT), dtype=bf, device=meta),
@@ -113,8 +115,9 @@ def _allocator_lines(scratch: str) -> list[str]:
 @pytest.mark.skipif(shutil.which("neuronx-cc") is None
                     and not pathlib.Path(sys.executable).with_name("neuronx-cc").exists(),
                     reason="neuronx-cc is not installed")
-@pytest.mark.parametrize("rows,pages", CASES, ids=[f"q{r}-w{p * PAGE}" for r, p in CASES])
-def test_neuronx_cc_builds_the_dense_window_kernel(rows, pages):
+@pytest.mark.parametrize("rows,pages,active", CASES,
+                         ids=[f"q{r}-w{p * PAGE}-a{a}" for r, p, a in CASES])
+def test_neuronx_cc_builds_the_dense_window_kernel(rows, pages, active):
     environment = {k: v for k, v in os.environ.items() if k not in _DROP}
     scratch = tempfile.mkdtemp(prefix="mla_dense_window_compile_")
     try:
@@ -126,7 +129,7 @@ def test_neuronx_cc_builds_the_dense_window_kernel(rows, pages):
             PATH=f"{pathlib.Path(sys.executable).parent}:{environment.get('PATH', '')}")
         done = subprocess.run(
             [sys.executable, str(pathlib.Path(__file__).resolve()), "child", str(rows),
-             str(pages)],
+             str(pages), str(active)],
             cwd=scratch, env=environment, capture_output=True, text=True, timeout=1500,
             check=False)
         printed = [line for line in done.stdout.splitlines() if line.startswith(ROW + "|")]
@@ -144,4 +147,4 @@ def test_neuronx_cc_builds_the_dense_window_kernel(rows, pages):
 
 
 if __name__ == "__main__" and sys.argv[1:2] == ["child"]:
-    _child(int(sys.argv[2]), int(sys.argv[3]))
+    _child(int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]))

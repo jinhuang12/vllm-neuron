@@ -74,17 +74,11 @@ def attend_dense_window(q_lift: Tensor, c_kv: Tensor, seq_lens: Tensor,
     """The short regime's attention: ``[tokens, H, L]`` float32, as the sparse call returns.
 
     ``active_rows`` is the sparse branch's own contract: only that prefix of query rows is
-    attended and the rest are zero rows, restored in float32 before the caller's cast.
+    attended and the rest are zero rows. The kernel writes those rows itself, so a padded
+    chunk adds no op here and keeps the kernel's two-program launch.
     """
-    tokens = int(q_lift.shape[0])
-    rows = tokens if active_rows is None else int(active_rows)
-    attended = mla_dense_window_attention(
-        q_lift[:rows], c_kv, seq_lens[:rows].to(torch.int32), float(softmax_scale),
+    return mla_dense_window_attention(
+        q_lift, c_kv, seq_lens, float(softmax_scale),
         block_table_row=block_table_row, written=written, write_offset=write_offset,
-        page_size=int(page_size),
-    )
-    if rows == tokens:
-        return attended
-    return torch.cat(
-        (attended, attended.new_zeros((tokens - rows, *attended.shape[1:]))), dim=0
+        page_size=int(page_size), active_rows=active_rows,
     )

@@ -337,6 +337,41 @@ def test_one_program_equals_two(monkeypatch):
     torch.testing.assert_close(one, two, rtol=0.0, atol=0.0)
 
 
+#: ``(tokens, active, pages, heads)``: a padded chunk whose active rows end inside a tile,
+#: one whose active rows are whole tiles, and two heads per rank with a partial last tile.
+PADDED = [
+    pytest.param(256, 200, 2, 1, id="t256-a200-h1"),
+    pytest.param(256, 128, 2, 1, id="t256-a128-h1"),
+    pytest.param(130, 100, 3, 2, id="t130-a100-h2"),
+]
+
+
+@pytest.mark.parametrize("tokens,active,pages,heads", PADDED)
+def test_padding_rows_are_zero_and_active_rows_are_the_prefix_call(
+        monkeypatch, tokens, active, pages, heads):
+    """``active_rows`` attends the query prefix and the kernel itself writes zero rows after
+    it. Rows are independent, so the active rows equal the prefix-only call bitwise; the
+    padding rows' lengths are not read as lengths (0 here, which a live row refuses); a
+    padded chunk keeps the two-program launch of its full row count; and one program
+    gives the same rows. The one-program run is the one that sees a missing zero row: the
+    simulator fills a one-program output with NaN and a two-program output with zeros."""
+    _set_lnc2(monkeypatch)
+    q, bank, table, written, offset, seq_lens, _ = _case(tokens, 0, pages, heads,
+                                                         seed=tokens + active)
+    padded_lens = seq_lens.clone()
+    padded_lens[active:] = 0
+    DW.reset_mla_dense_window_dispatch_counters()
+    two = _dense(q, bank, padded_lens, table, written, offset, active_rows=active)
+    assert DW.mla_dense_window_route_counts() == (1, 1)
+    prefix = _dense(q[:active], bank, seq_lens[:active], table, written, offset)
+    monkeypatch.delenv("NEURON_LOGICAL_NC_CONFIG")
+    one = _dense(q, bank, padded_lens, table, written, offset, active_rows=active)
+    assert two.dtype == torch.float32 and tuple(two.shape) == tuple(q.shape)
+    torch.testing.assert_close(two[:active], prefix, rtol=0.0, atol=0.0)
+    assert torch.equal(one[active:], torch.zeros_like(one[active:]))
+    torch.testing.assert_close(one, two, rtol=0.0, atol=0.0)
+
+
 def test_stale_window_rows_do_not_reach_the_softmax(monkeypatch):
     """Rows past a query's context are other pages or stale slots; huge values there must
     change nothing, because masked scores are written by predicate, not by a bias."""
@@ -359,6 +394,13 @@ def test_refuses_a_row_past_its_staged_rows():
     q, bank, table, written, offset, seq_lens, _ = _case(128, 0, 1, 1, seed=3)
     with pytest.raises(DW.MlaDenseWindowError, match="seq_lens"):
         _dense(q, bank, seq_lens + 1, table, written, offset)
+
+
+@pytest.mark.parametrize("active", [0, 129])
+def test_refuses_active_rows_outside_the_queries(active):
+    q, bank, table, written, offset, seq_lens, _ = _case(128, 0, 1, 1, seed=3)
+    with pytest.raises(DW.MlaDenseWindowError, match="active_rows"):
+        _dense(q, bank, seq_lens, table, written, offset, active_rows=active)
 
 
 def test_refuses_fp32_operands():
