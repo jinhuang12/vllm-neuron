@@ -1594,6 +1594,8 @@ def _lowp_offsets(ws, topk_hbm, row):
     Element (p, c) is column c * 128 + p of the row. A sentinel's offset is `fill`,
     partition p's index in chunk 0 clamped to row 0: max(index, (index < 0) * fill).
     Every index is far below 2**24, so the fp32 arithmetic of these instructions is exact.
+    The load runs on the Sync engine's hardware DGE, which leaves the software DGE, the
+    body's busiest engine, to the gathers.
     """
     topk = topk_hbm.shape[1]
     n_chunks = topk // KEY_CHUNK
@@ -1603,7 +1605,8 @@ def _lowp_offsets(ws, topk_hbm, row):
     offsets = ws[_LP_OFFSET]
     nisa.dma_copy(dst=raw[:, 0:n_chunks],
                   src=topk_hbm.ap(pattern=[[1, KEY_CHUNK], [KEY_CHUNK, n_chunks]],
-                                  offset=row * topk))
+                                  offset=row * topk),
+                  dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync)
     nisa.tensor_scalar(dst=fill, data=raw[:, 0:1], op0=nl.maximum, operand0=0.0,
                        engine=nisa.engine.vector)
     nisa.tensor_scalar(dst=shift[:, 0:n_chunks], data=raw[:, 0:n_chunks],
