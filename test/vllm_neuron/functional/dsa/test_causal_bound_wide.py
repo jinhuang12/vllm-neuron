@@ -22,6 +22,7 @@ import pytest
 import torch
 
 from vllm_neuron.functional.dsa import causal_bound as CB
+from vllm_neuron.functional.dsa import decode_batch as DB
 from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
 from vllm_neuron.utils.neuron_utils import SBUF_BYTES_PER_PARTITION, can_run_kernel
 
@@ -31,9 +32,13 @@ from test.vllm_neuron.functional.reference_at_commit import load_reference, need
 UNTILED_COMMIT = "b17526a"
 #: Tokens per candidate pool, GLM-5.3-Flash's.
 POOL = Glm5NextTextConfig().index_kpool
-#: The widest candidate row the untiled kernel built (context 65,536 at pool 4,
-#: ``test_dsa_wide_cpu_compile.py``).
-UNTILED_WIDTH_MAX = 16384
+#: The widest candidate row of the indexer chain at :data:`UNTILED_COMMIT`: the old decode
+#: kernel's ``MAX_CANDIDATES`` (65,536 tokens at pool 4), which is one decode chunk now, as
+#: ``test_decode_batch_tiled.py`` defines its ``OLD_MAX`` (and checks it against that kernel).
+#: The untiled bound held a whole row in SBUF, which neuronx-cc refuses from twice this
+#: width on (``causal_bound.COLUMN_TILE``); ``test_dsa_wide_cpu_compile.py`` builds the tiled
+#: bound at those widths.
+UNTILED_WIDTH_MAX = DB.CHUNK_CANDIDATES
 
 
 #: The reference file at :data:`UNTILED_COMMIT`.
