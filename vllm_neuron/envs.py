@@ -74,11 +74,18 @@ if TYPE_CHECKING:
     # Let GLM-5.3-Flash sample its full-vocabulary logits on device, which also lets
     # async scheduling stay on.
     VLLM_NEURON_GLM5NEXT_ON_DEVICE_SAMPLING: bool = False
+    # GLM-5.3-Flash shadow draft (MTP stage A): run the layer-45 draft head k times
+    # per decode step beside the trunk and return the k draft ids; 0 = off. The
+    # sampled tokens never read the draft. Read through ``mtp.shadow_draft_k()``.
+    VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT: int = 0
     # Build the GLM-5.3-Flash step's attention metadata on the host only: no per-step
     # block-table / slot-mapping uploads that its graph never reads.
     VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA: bool = False
     # Neuron SDK settings read here (the runtime and the compiler own them).
     NEURON_LOGICAL_NC_CONFIG: Optional[int] = None
+    # Where the GLM-5.3-Flash shadow draft (MTP stage A) writes its per-step scoring
+    # records (JSONL, rank 0). Empty = no log, no scoring.
+    VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG: str = ""
 
 
 def maybe_convert_bool(value: str | None) -> bool | None:
@@ -342,6 +349,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         maybe_convert_bool(os.getenv("VLLM_NEURON_GLM5NEXT_ON_DEVICE_SAMPLING"))
         or False
     ),
+    # The GLM-5.3-Flash shadow draft's iteration count k (MTP stage A); 0 = off.
+    # The one definition of the knob: everything else calls ``mtp.shadow_draft_k()``,
+    # which bounds the value, rather than reading the environment itself.
+    "VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT": lambda: (
+        maybe_convert_int(os.getenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT")) or 0
+    ),
     # Skip the per-step device copies of block tables, slot mappings and cached
     # lengths for GLM-5.3-Flash, whose graph reads only host geometry. Off by default.
     "VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA": lambda: (
@@ -355,6 +368,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kernels launch one program.
     "NEURON_LOGICAL_NC_CONFIG": lambda: maybe_convert_int(
         os.getenv("NEURON_LOGICAL_NC_CONFIG")
+    ),
+    # JSONL path for the GLM-5.3-Flash shadow-draft scoring records (MTP stage A);
+    # empty = no log. Read with VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT (the draft count).
+    "VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG": lambda: (
+        os.getenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG", "") or ""
     ),
 }
 

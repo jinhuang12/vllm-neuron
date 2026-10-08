@@ -42,6 +42,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
 from .config import DSA_LAYER_TYPE, Glm5NextTextConfig
+from .mtp import BLOCK_ATTR, shadow_draft_k
 from .quantization import keeps_bf16
 
 #: The HF shard-index filename. Read for its ``weight_map`` object; see
@@ -83,6 +84,7 @@ KEY_FAMILY_PROVENANCE: dict[str, str] = {
     "moe_router": GROUNDED,
     "moe_routed_experts": GROUNDED,
     "moe_shared_experts": GROUNDED,
+    "mtp_head": GROUNDED,
 }
 
 #: Families ``config.json`` requires that this module deliberately does not map,
@@ -296,11 +298,67 @@ def _add(
     mappings[param] = list(keys) if len(keys) > 1 else keys[0]
 
 
+# --------------------------------------------------------------------------- #
+# The multi-token-prediction (MTP) draft layer.
+#
+# The checkpoint ships ``num_nextn_predict_layers`` draft layers past the main
+# stack, at indices ``len(layer_types) ..``; GLM-5.3-Flash ships one, ``layers.45``.
+# It is a full decoder layer (GROUNDED against the published shard headers): the
+# sparse-attention family with its indexer, the router, the routed expert bank,
+# the shared expert and both norms, exactly as the last sparse-attention stack
+# layer ships them, plus four leaves of its own (:data:`MTP_LEAVES`) and no
+# multi-hyper-connection tensor -- the draft layer mixes no residual streams.
+#
+# Mapped only when asked. ``build_weight_mappings`` takes the draft layers as
+# ``mtp_layer_indices``; the default follows the shadow-draft knob, so the one
+# production caller (``load_weights``) and the root model's ``__init__``, which
+# builds ``self.mtp`` on the same knob, cannot disagree about whether the layer
+# exists. With the knob off the map is the map it always was.
+# --------------------------------------------------------------------------- #
+
+#: The root attribute the draft head hangs on. The head holds exactly one draft
+#: layer, so its four own leaves hang flat on ``mtp`` and the decoder block one
+#: attribute down, at the head's own ``BLOCK_ATTR`` (``mtp.block``); the parameter
+#: paths are the module tree's, as everywhere else in this map. Contract C2 with
+#: ``mtp.py``, which publishes the same paths as ``MTP_PARAMETER_NAMES``.
+MTP_ROOT_ATTR = "mtp"
+
+#: The draft layer's own four leaves, ``(parameter leaf, checkpoint leaf)``. Flat
+#: on the draft layer, beside the block; none is quantised and none has a
+#: companion. The parameter leaves are the head's ``HEAD_PARAMETER_NAMES``, in its
+#: order, paired here with the checkpoint spelling each one flattens.
+MTP_LEAVES: tuple[tuple[str, str], ...] = (
+    ("enorm_weight", "enorm.weight"),
+    ("hnorm_weight", "hnorm.weight"),
+    ("eh_proj_weight", "eh_proj.weight"),
+    ("shared_head_norm_weight", "shared_head.norm.weight"),
+)
+
+def mtp_layer_indices_for(
+    text_config: Glm5NextTextConfig, *, draft_k: int | None = None
+) -> tuple[int, ...]:
+    """The draft layers to map: ``()`` with the knob off, else those past the stack.
+
+    ``draft_k`` is the knob's value, read through the head's own
+    :func:`~vllm_neuron.model.glm5_next.mtp.shadow_draft_k` -- the knob's one
+    reader, contract C1 -- when not given. The indices start at
+    ``num_hidden_layers``, the first index the stack does not use (the config pins
+    ``len(layer_types)`` to it), and run for the checkpoint's own
+    ``num_nextn_predict_layers``.
+    """
+    k = shadow_draft_k() if draft_k is None else int(draft_k)
+    if k <= 0:
+        return ()
+    start = int(text_config.num_hidden_layers)
+    return tuple(range(start, start + int(text_config.num_nextn_predict_layers)))
+
+
 def build_weight_mappings(
     text_config: Glm5NextTextConfig,
     *,
     quantised: bool = True,
     modules_to_not_convert: Sequence[str] = (),
+    mtp_layer_indices: Sequence[int] | None = None,
 ) -> dict[str, str | list[str]]:
     """Build ``{param_name: checkpoint_key | [checkpoint_key, ...]}``.
 
@@ -324,6 +382,14 @@ def build_weight_mappings(
     all are also structural in their own adders, so the two agree and each checks
     the other.
 
+    The multi-token-prediction draft layer, one past the stack, is mapped by
+    :func:`_add_mtp_layer` only when ``mtp_layer_indices`` names it: its block's
+    families take the stack's own adders and therefore the stack's shard rules
+    (column-parallel ``q_b_proj``/``kv_b_proj``, row-parallel ``o_proj``, the
+    expert bank inside its expert-parallel group, the shared expert over the
+    world, everything else replicated), its four own leaves are replicated, and
+    it has no ``hc_*`` entry because the checkpoint ships none for it.
+
     Args:
         text_config: drives every count -- layer schedule, ``first_k_dense_replace``,
             ``n_routed_experts``, ``n_shared_experts``, ``tie_word_embeddings``.
@@ -332,6 +398,10 @@ def build_weight_mappings(
             keeps it in BF16.
         modules_to_not_convert: the checkpoint's own BF16 skip list, as
             ``Glm5NextConfig`` lifts it. Empty suppresses nothing.
+        mtp_layer_indices: the multi-token-prediction draft layers to map, by
+            absolute layer index (``(45,)`` on this checkpoint). ``()`` maps none.
+            ``None``, the default and what ``load_weights`` passes, follows the
+            shadow-draft knob through :func:`mtp_layer_indices_for`.
 
     Returns:
         The mapping, parameter name to checkpoint key or list of keys.
@@ -339,6 +409,11 @@ def build_weight_mappings(
     mappings: dict[str, str | list[str]] = {}
     layer_types = list(text_config.layer_types or ())
     skip = tuple(modules_to_not_convert or ())
+    draft_layers = (
+        mtp_layer_indices_for(text_config)
+        if mtp_layer_indices is None
+        else tuple(int(i) for i in mtp_layer_indices)
+    )
 
     # -- outside the layer stack (GROUNDED) --------------------------------- #
     # The two namespaces part company here: parameter names are the module tree's,
@@ -394,7 +469,104 @@ def build_weight_mappings(
                 skip=skip,
             )
 
+    if len(draft_layers) > 1:
+        # The head is the layer: its leaves hang on ``MTP_ROOT_ATTR`` with no index
+        # in the path. More than one draft layer needs a container keyed by index,
+        # which neither the head nor this map spells.
+        raise Glm5NextWeightMapError(
+            f"{len(draft_layers)} draft layers {draft_layers} were asked for; this "
+            f"map spells the single-layer head at {MTP_ROOT_ATTR!r} only"
+        )
+    for layer_id in draft_layers:
+        if layer_id < text_config.num_hidden_layers:
+            raise Glm5NextWeightMapError(
+                f"draft layer {layer_id} is inside the "
+                f"{text_config.num_hidden_layers}-layer stack; the "
+                f"multi-token-prediction layer is one past it"
+            )
+        _add_mtp_layer(
+            mappings,
+            f"{CKPT_TEXT_PREFIX}.layers.{layer_id}",
+            MTP_ROOT_ATTR,
+            text_config,
+            layer_id=layer_id,
+            quantised=quantised,
+            skip=skip,
+        )
+
     return mappings
+
+
+def _add_mtp_layer(
+    mappings: dict[str, str | list[str]],
+    ckpt_prefix: str,
+    param_prefix: str,
+    text_config: Glm5NextTextConfig,
+    *,
+    layer_id: int,
+    quantised: bool,
+    skip: Sequence[str] = (),
+) -> None:
+    """One multi-token-prediction draft layer (GROUNDED against the shard headers).
+
+    Two parameter prefixes under one checkpoint prefix. The four draft leaves hang
+    flat on the head (``mtp.enorm_weight``); everything the layer shares with a
+    stack layer hangs on its block (``mtp.block.self_attn...``), because the head's
+    module tree puts the decoder block one attribute down. The block's families
+    are added by the same adders the stack uses, with the same leaf names and the
+    same key lists, so the loader chooser and the shard table see a layer-43
+    parameter and a layer-45 parameter as the same thing.
+
+    Sparse attention, not linear: ``layer_types`` stops at the stack, so the
+    family is read off the shard headers, which give the draft layer the
+    sparse-attention tensors (``self_attn.indexer.*``, ``kv_a_proj_with_mqa``,
+    ``q_a_proj``) and no linear-attention tensor. The header test pins it.
+
+    No ``_add_mhc``: the checkpoint ships no hyper-connection tensor on this layer.
+    A block that declared one would be materialised as a placeholder no key fills,
+    because an unmapped declared leaf is looked up under its own name.
+    """
+    block_prefix = f"{param_prefix}.{BLOCK_ATTR}"
+
+    for param_leaf, ckpt_leaf in MTP_LEAVES:
+        _add(mappings, f"{param_prefix}.{param_leaf}", [f"{ckpt_prefix}.{ckpt_leaf}"])
+
+    _add(
+        mappings,
+        f"{block_prefix}.input_layernorm_weight",
+        [f"{ckpt_prefix}.input_layernorm.weight"],
+    )
+    _add(
+        mappings,
+        f"{block_prefix}.post_attention_layernorm_weight",
+        [f"{ckpt_prefix}.post_attention_layernorm.weight"],
+    )
+
+    # The stack's own adder, so the four scaled projections and the indexer map
+    # exactly as on a sparse-attention stack layer.
+    _add_dsa_attention(
+        mappings, ckpt_prefix, block_prefix, quantised=quantised, skip=skip
+    )
+
+    # The draft layer carries the MoE half: the router, the routed bank and the
+    # shared expert. ``_build_mlp`` would build a dense MLP below
+    # ``first_k_dense_replace``, and the head refuses such a block by name; so does
+    # the map, rather than spelling a dense draft layer no checkpoint ships.
+    if layer_id < text_config.first_k_dense_replace:
+        raise Glm5NextWeightMapError(
+            f"draft layer {layer_id} is below first_k_dense_replace="
+            f"{text_config.first_k_dense_replace} and would be built dense; the "
+            f"multi-token-prediction layer carries the routed expert bank and the "
+            f"shared expert"
+        )
+    _add_moe_mlp(
+        mappings,
+        ckpt_prefix,
+        block_prefix,
+        text_config,
+        quantised=quantised,
+        skip=skip,
+    )
 
 
 #: The six multi-hyper-connection leaves each layer carries, in index order.
@@ -467,8 +639,8 @@ def _add_mhc(
 
     Six bare tensors per layer, hanging off the layer rather than off the
     attention or the MLP -- they are the layer's own residual-mixing state. Every
-    decoder layer carries all six; the MTP layer carries none, which this function
-    never has to know because that layer is not in ``layer_types``.
+    decoder layer carries all six; the MTP layer carries none, and
+    :func:`_add_mtp_layer` does not call this function.
     """
     for leaf in MHC_LEAVES:
         _add(mappings, f"{param_prefix}.{leaf}", [f"{ckpt_prefix}.{leaf}"])

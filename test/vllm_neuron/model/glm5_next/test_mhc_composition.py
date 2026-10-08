@@ -1037,8 +1037,12 @@ def test_the_ffn_site_runs_over_ffn_halfs_unchanged_return() -> None:
             "expert_parallel_rank",
             "moe_group",
             "quant_config",
+            "rms_norm",
+            "text_config",
             "tp_degree",
         ]
+        assert call["kwargs"]["text_config"] is model.text_config
+        assert call["kwargs"]["rms_norm"].__func__ is type(model)._rms_norm
         assert call["kwargs"]["quant_config"] is QUANT
         assert call["kwargs"]["block_size"] is BLOCKS
         assert call["kwargs"]["moe_group"] is MOE_GROUP
