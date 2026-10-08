@@ -6303,10 +6303,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 # recurrence advances in place. The positions are one tensor so no
                 # host number reaches the graph (see ``_glm5next_start_positions``).
                 # A bank holding ``1 + k`` state rows per slot (``[slots, 1 + k, ...]``,
-                # speculative method "mtp"; the bind records ``state_checkpoints`` on
-                # the bank) hands a prefill the one-row carrier ``bank[slot, 0]`` -- a
-                # prefill writes row 0 -- and a decode the slot's rows whole; a plain
-                # bank hands ``bank[slot]`` on both legs.
+                # speculative method "mtp"; the bind records ``state_checkpoints = 1 + k``
+                # on the bank) hands a prefill the one-row carrier ``bank[slot, 0]`` -- a
+                # prefill writes row 0 -- and a decode the slot's rows whole. A plain
+                # bank's record carries no ``state_checkpoints`` key (absent = 1, the
+                # Stage-A record, team-lead ruling) and hands ``bank[slot]`` on both legs.
                 prefill_row = bool(is_prefill) and int(bank.get("state_checkpoints", 1)) > 1
 
                 def state_view(key, one_slot):

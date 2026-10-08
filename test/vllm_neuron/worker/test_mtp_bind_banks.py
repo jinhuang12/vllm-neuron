@@ -7,7 +7,8 @@ every ``linear_attn`` bank is ``[slots, 1 + k, *state]`` (the per-slot state the
 spec declares, one row per verify-step token) and the bank record names the axis
 (``state_checkpoints == 1 + k``), which the translator reads for the prefill leg's
 one-row carrier ``bank[slot, 0]``; with speculation off the banks are ``[slots, *state]``
-and the record carries no axis (``state_checkpoints`` absent or 1). Expectations come
+and the record carries no ``state_checkpoints`` key (absent = 1, the Stage-A record; team-lead
+ruling (a)). Expectations come
 from the layer spec the runner reports and from ``k``; no shape is pinned here.
 
 The model is a double whose ``bind_kv_cache`` IS ``Glm5NextForConditionalGeneration``'s
