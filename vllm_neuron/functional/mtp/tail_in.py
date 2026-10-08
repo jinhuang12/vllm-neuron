@@ -43,16 +43,14 @@ from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 from nkilib.core.utils.kernel_assert import kernel_assert
 
 from vllm_neuron.functional.mtp.common import (
-    MATMUL_COLS,
     PARTITIONS,
-    TRANSPOSE_STRIDE,
     DispatchCounters,
     MtpTailError,
     count_kernel,
     count_torch_route,
+    even,
     launch_programs,
-    load_transposed,
-    padded,
+    load_rows_transposed,
     rms_rows,
     tile,
     transpose_rows,
@@ -149,15 +147,16 @@ def mtp_tail_in_kernel(token_ids, table, positions, previous, enorm, hnorm, eh_p
         transpose_rows(xt[:, :, b0:b0 + n], e_normed, n, half, 0)
         transpose_rows(xt[:, :, b0:b0 + n], h_normed, n, half, half)
 
-    # ---- 2. This program's rows of eh_proj, streamed transposed, one GEMV each. --- #
+    # ---- 2. This program's rows of eh_proj, 128 at a time as contiguous row tiles -- #
+    #         turned on the PE; one GEMV per (row tile, batch tile).
     share = -(-rows // programs)
     c_lo = program * share
     c_hi = min(rows, c_lo + share)
-    for c0 in range(c_lo, c_hi, MATMUL_COLS):
-        cn = min(MATMUL_COLS, c_hi - c0)
-        wt = nl.ndarray((PARTITIONS, blocks, padded(cn, TRANSPOSE_STRIDE)),
-                        dtype=eh_proj_rows.dtype, buffer=nl.sbuf)
-        load_transposed(wt, eh_proj_rows, c0, cn, blocks)
+    for c0 in range(c_lo, c_hi, PARTITIONS):
+        cn = min(PARTITIONS, c_hi - c0)
+        wt = nl.ndarray((PARTITIONS, blocks, even(cn)), dtype=eh_proj_rows.dtype,
+                        buffer=nl.sbuf)
+        load_rows_transposed(wt, eh_proj_rows, c0, cn, blocks)
         for b0 in range(0, batch, PARTITIONS):
             n = min(PARTITIONS, batch - b0)
             acc = nl.ndarray((n, cn), dtype=nl.float32, buffer=nl.psum)

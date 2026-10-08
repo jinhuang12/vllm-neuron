@@ -43,16 +43,14 @@ from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 from nkilib.core.utils.kernel_assert import kernel_assert
 
 from vllm_neuron.functional.mtp.common import (
-    MATMUL_COLS,
     PARTITIONS,
-    TRANSPOSE_STRIDE,
     DispatchCounters,
     MtpTailError,
     count_kernel,
     count_torch_route,
+    even,
     launch_programs,
-    load_transposed,
-    padded,
+    load_rows_transposed,
     rms_rows,
     tile,
     transpose_rows,
@@ -137,16 +135,17 @@ def mtp_tail_out_kernel(attended, ffn, gain, head_rows, EPS: float):
             nisa.dma_copy(dst=hidden_out[b0:b0 + n, :], src=normed)
         transpose_rows(xt[:, :, b0:b0 + n], normed, n, blocks, 0)
 
-    # ---- 2. The shard rows this program takes, streamed transposed; bf16 logits. -- #
+    # ---- 2. The shard rows this program takes, 128 at a time as contiguous row ---- #
+    #         tiles turned on the PE; one GEMV per (row tile, batch tile); bf16 logits.
     logits = []
     for i in range(ntiles):
         n = min(PARTITIONS, batch - i * PARTITIONS)
         logits.append(nl.ndarray((n, span), dtype=work, buffer=nl.sbuf))
-    for c0 in range(0, span, MATMUL_COLS):
-        cn = min(MATMUL_COLS, span - c0)
-        wt = nl.ndarray((PARTITIONS, blocks, padded(cn, TRANSPOSE_STRIDE)),
-                        dtype=head_rows.dtype, buffer=nl.sbuf)
-        load_transposed(wt, head_rows, v_lo + c0, cn, blocks)
+    for c0 in range(0, span, PARTITIONS):
+        cn = min(PARTITIONS, span - c0)
+        wt = nl.ndarray((PARTITIONS, blocks, even(cn)), dtype=head_rows.dtype,
+                        buffer=nl.sbuf)
+        load_rows_transposed(wt, head_rows, v_lo + c0, cn, blocks)
         for i in range(ntiles):
             b0 = i * PARTITIONS
             n = min(PARTITIONS, batch - b0)

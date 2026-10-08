@@ -11,10 +11,11 @@ those rows against a row-major bf16 weight whose rows are the OUTPUT features
 * ``transpose_rows``: the normed rows moved onto the contraction axis,
   ``xt[c, kb, r] = x[r, kb * 128 + c]`` (tensor engine transposes, one PSUM bank at
   a time);
-* ``load_transposed``: a weight slab ``[cols, K]`` brought in as
-  ``wt[c, kb, col] = w[col, kb * 128 + c]`` by the DMA engines' transpose, so the
-  GEMV is ``nc_matmul(stationary=xt[:, kb, :], moving=wt[:, kb, :])`` accumulated
-  over ``kb`` -- one pass over the weight, which is the bytes the kernel's time is;
+* ``load_rows_transposed``: a weight slab ``[cols, K]`` brought in as
+  ``wt[c, kb, col] = w[col, kb * 128 + c]`` -- contiguous row tiles of at most 128
+  rows by DMA, turned on the tensor engine by ``transpose_rows`` -- so the GEMV is
+  ``nc_matmul(stationary=xt[:, kb, :], moving=wt[:, kb, :])`` accumulated over
+  ``kb``: one pass over the weight, which is the bytes the kernel's time is;
 * the launch-side helpers: the program count under LNC2, the dispatch counters the
   tests read, and :class:`MtpTailError`.
 """
@@ -33,19 +34,10 @@ PARTITIONS = nl.tile_size.pmax
 #: One PSUM bank: 2 KiB, the widest fp32 ``nc_matmul`` result (512 columns).
 BANK_BYTES = 2048
 MATMUL_COLS = BANK_BYTES // 4
-#: Rows per DMA transpose (the engine transposes 16-row groups of a 2-byte dtype) and
-#: the alignment of the transpose's output row stride (32 bytes = 16 bf16).
-TRANSPOSE_ROWS = 16
-TRANSPOSE_STRIDE = 16
 
 
 class MtpTailError(ValueError):
     """An operand geometry or dtype the MTP tail kernels do not take."""
-
-
-def padded(count: int, step: int) -> int:
-    """``count`` rounded up to a multiple of ``step``."""
-    return -(-count // step) * step
 
 
 def even(count: int) -> int:
@@ -107,21 +99,23 @@ def transpose_rows(dst, x, rows: int, blocks: int, block0: int = 0) -> None:
                          src=flipped[:, :, 0:rows])
 
 
-def load_transposed(dst, weight, row0: int, rows: int, blocks: int) -> None:
+def load_rows_transposed(dst, weight, row0: int, rows: int, blocks: int) -> None:
     """``dst[c, kb, i] = weight[row0 + i, kb * 128 + c]`` for ``i < rows``, ``kb < blocks``.
 
-    ``weight`` is a row-major 2-byte ``[*, blocks * 128]`` HBM tensor; ``dst`` an SBUF
-    tile ``[128, blocks, >= rows]`` whose last stride is a multiple of
-    :data:`TRANSPOSE_STRIDE` elements (the caller pads it). The DMA engines
-    transpose 16 rows at a time.
+    ``weight`` is a row-major ``[*, blocks * 128]`` HBM tensor; ``dst`` an SBUF tile
+    ``[128, blocks, >= rows]``. The rows come in as contiguous row tiles of at most 128
+    (one whole row per partition: ``blocks * 128`` elements, >= 2 KiB, the DMA's
+    efficient shape) and are turned on the PE by :func:`transpose_rows`. This replaced
+    the DMA-transpose stream (16-row ``dma_transpose`` groups), which on device ran the
+    same bytes 4x slower at the head shard's shape (reports/mtp-kernels.md 4.5); the PE
+    transposes hide under the DMA.
     """
-    width = weight.shape[1]
-    for r0 in range(0, rows, TRANSPOSE_ROWS):
-        n = min(TRANSPOSE_ROWS, rows - r0)
-        nisa.dma_transpose(
-            dst=dst[:, :, r0:r0 + n],
-            src=weight.ap(pattern=[[width, n], [PARTITIONS, blocks], [1, PARTITIONS]],
-                          offset=(row0 + r0) * width))
+    width = blocks * PARTITIONS
+    for t0 in range(0, rows, PARTITIONS):
+        tn = min(PARTITIONS, rows - t0)
+        row_tile = nl.ndarray((tn, width), dtype=weight.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=row_tile, src=weight[row0 + t0:row0 + t0 + tn, :])
+        transpose_rows(dst[:, :, t0:t0 + tn], row_tile, tn, blocks, 0)
 
 
 def launch_programs() -> int:
