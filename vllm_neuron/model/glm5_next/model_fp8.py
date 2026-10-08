@@ -3317,8 +3317,8 @@ class Glm5NextKDAAttention(nn.Module):
                 (:func:`~vllm_neuron.functional.kda.fused_decode.kda_fused_decode_tstep`).
                 A step carries ``1 .. 1 + k`` tokens per request (a short one is padded
                 inside; the slot is always written whole, a bucket padding row's slot
-                included -- so a padding row names an unowned slot, or an unscheduled
-                owner's slot with that owner's live row in ``checkpoint_rows``; see
+                included -- so a padding row's ``checkpoint_rows`` entry is its slot's
+                recorded live row, ``0`` when the slot has none; see
                 ``_fused_decode_requests``). ``None`` is the plain server: one row per
                 slot, one token per request.
             checkpoint_rows: with ``state_checkpoints``, the checkpoint row each
@@ -3832,12 +3832,10 @@ class Glm5NextKDAAttention(nn.Module):
         masked padding rows, so the slot is still written whole and the rows past the
         last token repeat its checkpoint (the runner records row ``tokens - 1``). The
         whole-slot write means a bucket padding row's slot is rewritten too, with the
-        state of the row it read, so the runner's rule for a padding row is: an
-        UNOWNED slot first (a slot no live request holds); only when the bucket needs
-        more rows than there are unowned slots, a slot owned by a request this step
-        does not schedule, and then its ``checkpoint_rows`` entry carries that owner's
-        current live row (its stored accepted count), so the slot is rewritten with its
-        own bytes. Never a live request's slot with a different row.
+        state of the row it read, so the runner's rule for a padding row is: its
+        ``checkpoint_rows`` entry is the slot's recorded live row (the stored kept
+        count minus one; ``0`` when the slot has none), so the slot is rewritten with
+        its own bytes. Never a slot with a different row than its live one.
         """
         from vllm_neuron.functional.kda.fused_decode import (
             kda_checkpoint_rows,
