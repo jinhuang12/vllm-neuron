@@ -12,14 +12,23 @@ it. The consistency rules stay: ascending, positive, whole 128-row tiles, nothin
 The runner half reads ``NeuronModelRunner._decode_ctx_bucket_from_max_decode_ctx_len`` on a
 runner shell (no model, no device): a decode step goes to the smallest bucket that holds
 its context plus this step's token, and the window it gets is that bucket's pages.
+
+One ceiling stays, on the DSA decode indexer only: its selection serves the candidate axis
+up to :data:`~vllm_neuron.functional.dsa.decode_select.MAX_DECODE_INDEX_CANDIDATES`, the
+widest row it compacts whole. Past it the selection merges row segments, which returned
+wrong rows on trn2 in ways the compiled-program ordering check does not see, so a
+``max_model_len`` that needs a wider axis is refused when the runner starts.
 """
 
 from __future__ import annotations
 
+import inspect
 from types import SimpleNamespace
 
 import pytest
 
+from test.vllm_neuron.functional.dsa.dsa_decode_case import decode_config
+from vllm_neuron.functional.dsa import decode_select as DS
 from vllm_neuron.utils.bucket_utils import validate_decode_context_length_buckets
 from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
 
@@ -85,3 +94,71 @@ def test_a_list_of_max_model_len_alone_is_the_fallback_alone():
     runner = _runner([MAX_MODEL_LEN])
     for computed in (0, 2047, 32767):
         assert runner._decode_ctx_bucket_from_max_decode_ctx_len(computed, 0) == MAX_MODEL_LEN
+
+
+#: The model's tokens per pool: one decode index candidate per pool.
+POOL = int(decode_config().index_kpool)
+#: The longest ``max_model_len`` the indexer serves: the whole-row width in pools.
+SERVED_LEN = DS.WHOLE_ROW_COLUMNS * POOL
+
+
+def test_the_decode_index_ceiling_is_the_whole_row():
+    assert DS.MAX_DECODE_INDEX_CANDIDATES == DS.WHOLE_ROW_COLUMNS
+
+
+@pytest.mark.parametrize("max_model_len", [MAX_MODEL_LEN, SERVED_LEN, SERVED_LEN + POOL - 1])
+def test_a_context_the_whole_row_holds_starts(max_model_len):
+    DS.check_decode_index_context(max_model_len, POOL)
+
+
+@pytest.mark.parametrize("max_model_len", [SERVED_LEN + POOL, 2 * SERVED_LEN])
+def test_a_longer_context_is_refused_with_its_reason(max_model_len):
+    with pytest.raises(DS.DecodeSelectError, match="merges row segments") as refused:
+        DS.check_decode_index_context(max_model_len, POOL)
+    message = str(refused.value)
+    assert f"max_model_len={max_model_len}" in message
+    assert f"{max_model_len // POOL} decode index candidates" in message
+    assert f"max_model_len <= {SERVED_LEN + POOL - 1}" in message
+
+
+def test_a_model_without_an_indexer_is_not_checked():
+    DS.check_decode_index_context(64 * SERVED_LEN, None)
+
+
+def test_the_runner_checks_the_context_before_anything_compiles():
+    source = inspect.getsource(NeuronModelRunner.__init__)
+    length = source.index("self.max_model_len = vllm_config.model_config.max_model_len")
+    check = source.index("check_decode_index_context(")
+    # Before the decode buckets are parsed and before the device is chosen.
+    assert length < check < source.index("self.device =")
+    assert check < source.index("validate_decode_context_length_buckets(")
+    assert '"index_kpool"' in source[check:check + 300]
+
+
+def _decode_contexts(max_model_len, buckets):
+    """The contexts the runner compiles decode graphs at: the validated buckets and the
+    ``max_model_len`` fallback (``neuron_worker._decode_compile_targets``)."""
+    listed = [] if buckets is None else validate_decode_context_length_buckets(
+        buckets, max_model_len)
+    return listed + [max_model_len]
+
+
+@pytest.mark.parametrize("buckets", [
+    None,                              # max_model_len alone
+    [2048, 8192],                      # buckets below the ceiling, the fallback past it
+    [2048, 8192, 2 * SERVED_LEN],      # a bucket past it, folded into the fallback
+])
+def test_every_configuration_with_a_graph_past_the_ceiling_is_refused(buckets):
+    max_model_len = 2 * SERVED_LEN
+    # Every decode graph's context is at most max_model_len (the bucket rule), and the
+    # fallback is max_model_len itself, so the check on max_model_len bounds them all.
+    assert max(_decode_contexts(max_model_len, buckets)) == max_model_len
+    with pytest.raises(DS.DecodeSelectError, match="MAX_DECODE_INDEX_CANDIDATES"):
+        DS.check_decode_index_context(max_model_len, POOL)
+
+
+@pytest.mark.parametrize("buckets", [None, [2048, 8192], [2048, 8192, SERVED_LEN]])
+def test_every_graph_of_a_served_configuration_is_inside_the_ceiling(buckets):
+    DS.check_decode_index_context(SERVED_LEN, POOL)
+    assert all(context // POOL <= DS.MAX_DECODE_INDEX_CANDIDATES
+               for context in _decode_contexts(SERVED_LEN, buckets))

@@ -62,6 +62,12 @@ gives the positions of the ids in order, ``nc_n_gather`` reads them, and the res
 again one list of at most ``k`` ids in ascending order, the first list of the next merge.
 Every shape is static; no step depends on how many pools a segment selected.
 
+The decode indexer serves the whole-row path only (:data:`MAX_DECODE_INDEX_CANDIDATES`):
+the segment merge returned wrong rows on trn2 in ways that depended on the graph around
+the kernel and that the compiled-program ordering check does not see, so a model whose
+``max_model_len`` needs a wider candidate axis is refused when the runner starts
+(:func:`check_decode_index_context`). The merge stays for the work that lifts the ceiling.
+
 Both physical cores of an LNC2 core split the requests (``[2]`` grid at ``B >= 2``).
 
 Dispatches count in ``decode_batch``'s family (``decode_batch_dispatch_counters`` and the
@@ -133,6 +139,11 @@ MERGE_LISTS = 8
 #: The widest candidate axis served: a lone request folds over 128 partitions of
 #: :data:`FOLD_COLUMNS_LIMIT` columns. A physical (SBUF) bound, not a policy.
 MAX_SELECT_CANDIDATES = PARTITIONS * FOLD_COLUMNS_LIMIT
+#: The widest candidate axis the decode indexer serves: the whole-row path, 16384 pools
+#: (a 64k context at four tokens a pool). Wider rows go through the segment merge, whose
+#: device results are not yet trusted (module docstring); the runner refuses a
+#: ``max_model_len`` past it (:func:`check_decode_index_context`).
+MAX_DECODE_INDEX_CANDIDATES = WHOLE_ROW_COLUMNS
 #: fp32 columns of a ``[P, 1]`` scratch tile: one whole 32-byte line.
 _LINE = 8
 #: The sign bit as an int32. Every immediate here is a power of two or ``-1``, so it is
@@ -634,6 +645,32 @@ def decode_select_programs(batch: int) -> int:
     if envs.NEURON_LOGICAL_NC_CONFIG == 2 and int(batch) >= 2:
         return 2
     return 1
+
+
+def check_decode_index_context(max_model_len: int, pool_size: int | None) -> None:
+    """Refuse a ``max_model_len`` whose decode candidate axis is past the served width.
+
+    Args:
+        max_model_len: the longest context the runner serves.
+        pool_size: the model's tokens per pool (``index_kpool``); ``None`` for a model
+            with no DSA indexer, which is not checked.
+
+    Raises:
+        DecodeSelectError: ``max_model_len // pool_size`` (the candidate axis of the
+            ``max_model_len`` decode graph) is above :data:`MAX_DECODE_INDEX_CANDIDATES`.
+    """
+    if pool_size is None:
+        return
+    candidates = int(max_model_len) // int(pool_size)
+    if candidates > MAX_DECODE_INDEX_CANDIDATES:
+        longest = (MAX_DECODE_INDEX_CANDIDATES + 1) * int(pool_size) - 1
+        raise DecodeSelectError(
+            f"max_model_len={max_model_len} needs {candidates} decode index candidates "
+            f"(index_kpool={pool_size}); the DSA decode indexer serves up to "
+            f"MAX_DECODE_INDEX_CANDIDATES={MAX_DECODE_INDEX_CANDIDATES} (max_model_len <= "
+            f"{longest}). Past that width the selection merges row segments, which returned "
+            f"wrong rows on trn2 in ways that depend on the surrounding graph (an open "
+            f"defect, indexer report section 4.3). Lower max_model_len.")
 
 
 def _validate(bounded: Tensor, seq_lens: Tensor, select_k, pool_size) -> tuple[int, int]:
