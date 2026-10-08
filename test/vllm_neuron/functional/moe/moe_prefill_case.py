@@ -28,6 +28,7 @@ built: the block starts at the attention output.
 
 from __future__ import annotations
 
+import inspect
 import json
 from pathlib import Path
 from types import MethodType, SimpleNamespace
@@ -176,7 +177,24 @@ def moe_layer(model, *, seed: int = 3, device="cpu", use_checkpoint: bool = True
     _stand_in_root(model, layer, cfg)._run_load_time_preps(torch.device(device))
     owner = SimpleNamespace(text_config=cfg)
     owner._rms_norm = MethodType(model.Glm5NextModel._rms_norm, owner)
+    # Read here, outside any trace: which ``_ffn_half`` form this tree has.
+    owner.ffn_static = isinstance(
+        inspect.getattr_static(model.Glm5NextModel, "_ffn_half"), staticmethod)
     return SimpleNamespace(layer=layer, cfg=cfg, checkpoint=src.real, ffn_owner=owner)
+
+
+def _ffn_half(model, owner, layer, single, **keywords) -> torch.Tensor:
+    """``Glm5NextModel._ffn_half`` on ``single``, called as ``model``'s own stack calls it.
+
+    This tree's is a static method that takes the decoder config and the RMSNorm by
+    name, both from ``owner``; the 8aa22fa snapshot's is a method of the model, called
+    on ``owner``.
+    """
+    if owner.ffn_static:
+        return model.Glm5NextModel._ffn_half(
+            layer, single, text_config=owner.text_config, rms_norm=owner._rms_norm,
+            **keywords)
+    return model.Glm5NextModel._ffn_half(owner, layer, single, **keywords)
 
 
 def block_inputs(cfg, tokens: int, *, seed: int = 11, device="cpu") -> dict:
@@ -220,8 +238,8 @@ def block_step(model, case, attn_out, streams, post_mix, comb_mix, expert_rank, 
     extra = {"collector": collector} if collector is not None else {}
     return site.forward(
         streams,
-        lambda single: model.Glm5NextModel._ffn_half(
-            owner, layer, single, quant_config=quant, block_size=None, moe_group=None,
+        lambda single: _ffn_half(
+            model, owner, layer, single, quant_config=quant, block_size=None, moe_group=None,
             tp_degree=TP_PER_EP, expert_parallel_rank=expert_rank, **extra,
         ),
     )
@@ -245,8 +263,8 @@ def block_step_tapped(model, case, attn_out, streams, post_mix, comb_mix, expert
 
     def sublayer(single):
         held.append(single)
-        return model.Glm5NextModel._ffn_half(
-            owner, layer, single, quant_config=quant, block_size=None, moe_group=None,
+        return _ffn_half(
+            model, owner, layer, single, quant_config=quant, block_size=None, moe_group=None,
             tp_degree=TP_PER_EP, expert_parallel_rank=expert_rank, collector=collector,
         )
 
