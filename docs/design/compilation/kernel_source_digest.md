@@ -219,7 +219,7 @@ earlier whole-package scheme). Startup uses `install_per_graph_digest_key`.
 ## What it costs
 
 - One recompile of each graph that reaches an edited file, including
-  comment-only edits. On the stack-1b served set (20 graphs), 65 of the 104
+  comment-only edits. On the stack-1b served set (20 graphs), 64 of the 104
   files reach no graph, and a decode-only kernel edit recompiles the decode
   graphs only. `functional/mlp.py` (an nkilib patch) reaches every graph.
 - No change to a cache root that was filled with the same tree: the digests
