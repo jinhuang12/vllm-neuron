@@ -1520,7 +1520,8 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
 #   PE transposes, which are bit-exact from NeuronCore-v3 on, rather than gathered a
 #   second time: the second gather is one indirect DMA per 128-row chunk, and the
 #   software descriptor generator that issues every indirect DMA is the body's busiest
-#   engine.
+#   engine. A gather waits on its offsets, so each group's offsets are computed while
+#   the group before it is in flight.
 # * The softmax runs for a group of :data:`SOFTMAX_ROWS` queries at once, one query
 #   per partition. A query's MM1 stationary is a ``[128, rows]`` tile whose only
 #   non-zero column is the query's own, so its scores accumulate into its own PSUM row
@@ -1585,6 +1586,32 @@ def _lowp_scratch(topk, n_latent, n_chunks, dtype):
     ws[_LP_SHIFT] = _sbuf_i32(KEY_CHUNK, _aligned(n_chunks))
     ws[_LP_OFFSET] = _sbuf_u32(KEY_CHUNK, _aligned(n_chunks))
     return ws
+
+
+def _lowp_offsets(ws, topk_hbm, row):
+    """Load index row ``row`` into ``ws`` chunk-major and compute its gather offsets there.
+
+    Element (p, c) is column c * 128 + p of the row. A sentinel's offset is `fill`,
+    partition p's index in chunk 0 clamped to row 0: max(index, (index < 0) * fill).
+    Every index is far below 2**24, so the fp32 arithmetic of these instructions is exact.
+    """
+    topk = topk_hbm.shape[1]
+    n_chunks = topk // KEY_CHUNK
+    raw = ws[_LP_RAW]
+    fill = ws[_LP_FILL]
+    shift = ws[_LP_SHIFT]
+    offsets = ws[_LP_OFFSET]
+    nisa.dma_copy(dst=raw[:, 0:n_chunks],
+                  src=topk_hbm.ap(pattern=[[1, KEY_CHUNK], [KEY_CHUNK, n_chunks]],
+                                  offset=row * topk))
+    nisa.tensor_scalar(dst=fill, data=raw[:, 0:1], op0=nl.maximum, operand0=0.0,
+                       engine=nisa.engine.vector)
+    nisa.tensor_scalar(dst=shift[:, 0:n_chunks], data=raw[:, 0:n_chunks],
+                       op0=nl.less, operand0=0.0, op1=nl.multiply,
+                       operand1=fill, engine=nisa.engine.vector)
+    nisa.tensor_tensor(dst=offsets[:, 0:n_chunks], data1=raw[:, 0:n_chunks],
+                       data2=shift[:, 0:n_chunks], op=nl.maximum,
+                       engine=nisa.engine.vector)
 
 
 def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
@@ -1670,6 +1697,11 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
         for li in range(n_latent):
             _transpose_rows(q_stage[li], q_lift_hbm, latent, block, LATENT_TILE,
                             q0 * heads * latent + li * LATENT_TILE)
+        # Each group's gather offsets are computed while the group before it is still in
+        # flight, ahead of that group's softmax in the Vector engine's program order: the
+        # engine runs its instructions in that order, and a gather waits on its offsets.
+        for r in range(group):
+            _lowp_offsets(scratch[r % ring], topk_hbm, q0 + r)
         for g0 in range(0, qpb, group):
             scores_ps = []
             for ti in range(len(tiles)):
@@ -1678,27 +1710,7 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
                 qi = g0 + r
                 ws = scratch[qi % ring]
                 c_t = ws[_LP_C_T]
-                raw = ws[_LP_RAW]
-                fill = ws[_LP_FILL]
-                shift = ws[_LP_SHIFT]
                 offsets = ws[_LP_OFFSET]
-
-                # ---- the selected rows, chunk-major on partitions ---------------------
-                # Element (p, c) is column c * 128 + p of the query's row. A sentinel's
-                # offset is `fill`, partition p's index in chunk 0 clamped to row 0:
-                # max(index, (index < 0) * fill). Every index is far below 2**24, so the
-                # fp32 arithmetic of these instructions is exact.
-                nisa.dma_copy(dst=raw[:, 0:n_chunks],
-                              src=topk_hbm.ap(pattern=[[1, KEY_CHUNK], [KEY_CHUNK, n_chunks]],
-                                              offset=(q0 + qi) * topk))
-                nisa.tensor_scalar(dst=fill, data=raw[:, 0:1], op0=nl.maximum, operand0=0.0,
-                                   engine=nisa.engine.vector)
-                nisa.tensor_scalar(dst=shift[:, 0:n_chunks], data=raw[:, 0:n_chunks],
-                                   op0=nl.less, operand0=0.0, op1=nl.multiply,
-                                   operand1=fill, engine=nisa.engine.vector)
-                nisa.tensor_tensor(dst=offsets[:, 0:n_chunks], data1=raw[:, 0:n_chunks],
-                                   data2=shift[:, 0:n_chunks], op=nl.maximum,
-                                   engine=nisa.engine.vector)
 
                 # ---- gather-transpose: the selected rows with the latent on partitions --
                 # ``dst[l, 0, li, k] = cache[idx[k], li * 128 + l]`` for every selected
@@ -1724,15 +1736,18 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
                                        stationary=q_masked[r][:, li, 0:group],
                                        moving=c_t[:, 0, li, ks:ks + extent],
                                        accumulate=(r > 0 or li > 0))
+            if g0 + group < qpb:
+                for r in range(group):
+                    qi = g0 + group + r
+                    _lowp_offsets(scratch[qi % ring], topk_hbm, q0 + qi)
 
             # ---- the group's mask, from its index rows ---------------------------------
-            # ``index >= 0`` in fp32 (every index is far below 2**24, so the cast is
-            # exact): 1.0 where a token lives, 0.0 at the sentinel; the bias is
+            # ``index >= 0`` in fp32 (every index is far below 2**24, so the conversion
+            # is exact): 1.0 where a token lives, 0.0 at the sentinel; the bias is
             # ``(valid - 1) * sentinel_bias``, exactly 0.0 or -sentinel_bias.
             nisa.dma_copy(dst=idx_rows, src=topk_hbm.ap(pattern=[[topk, group], [1, topk]],
                                                         offset=(q0 + g0) * topk))
-            nisa.tensor_copy(dst=valid_f, src=idx_rows, engine=nisa.engine.vector)
-            nisa.tensor_scalar(dst=valid_f, data=valid_f, op0=nl.greater_equal, operand0=0.0,
+            nisa.tensor_scalar(dst=valid_f, data=idx_rows, op0=nl.greater_equal, operand0=0.0,
                                engine=nisa.engine.vector)
             nisa.tensor_scalar(dst=mask_bias, data=valid_f, op0=nl.add, operand0=-1.0,
                                engine=nisa.engine.scalar)
