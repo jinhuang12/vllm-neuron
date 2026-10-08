@@ -71,8 +71,8 @@ DEFAULT_GRID = (1, 2, 8, 16, 32, 63, 64, 65, 127, 128, 129, 512, 1023, 1024, 102
 
 
 def test_default_is_the_measured_prefill_subset():
-    """``1`` is mhc_pre at a 128-row prefill and mhc_post at 128- and 1024-row
-    prefills, and nothing else: the buckets where the device A/B measured a win
+    """``1`` is mhc_pre and mhc_post at 128- and 1024-row prefills, and nothing
+    else: the buckets where the device A/B measured a win
     (``envs.DEFAULT_GLUE_FUSED_SPEC``'s docstring). A row count between or beyond them,
     such as the 512 rows where mhc_post lost, keeps the torch route. The table is
     written out, not derived, so a rule added to or removed from the default without
@@ -80,8 +80,8 @@ def test_default_is_the_measured_prefill_subset():
     sel = glue.glue_selection("1")
     got = {(k, p, t) for k in KERNELS for p in glue.PHASES for t in DEFAULT_GRID
            if sel.selects(k, t, p)}
-    assert got == {("mhc_pre", "prefill", 128), ("mhc_post", "prefill", 128),
-                   ("mhc_post", "prefill", 1024)}
+    assert got == {("mhc_pre", "prefill", 128), ("mhc_pre", "prefill", 1024),
+                   ("mhc_post", "prefill", 128), ("mhc_post", "prefill", 1024)}
 
 
 def test_default_decode_takes_the_zero_route_at_every_row_count():

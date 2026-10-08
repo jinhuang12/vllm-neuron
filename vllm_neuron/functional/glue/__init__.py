@@ -47,8 +47,10 @@ construction a value that the row count cannot follow (:func:`require_rows_tell_
 A call whose phase is not known (``phase=None``) is selected only by rules without a
 phase.
 
-Every kernel is also bounded by its own shape rules in its ``*_admits`` predicate
-(for example ``mhc_pre.MHC_PRE_MAX_TOKENS``), whatever the switch selects.
+Every kernel is also bounded by its own shape rules in its ``*_admits`` predicate,
+whatever the switch selects. A kernel may declare its own row bound (for example
+``kda_projections.KDA_PROJECTIONS_MAX_TOKENS``); mhc_pre has none, it walks the rows
+in token tiles.
 """
 
 from __future__ import annotations

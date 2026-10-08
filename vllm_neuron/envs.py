@@ -209,10 +209,13 @@ DEFAULT_DEVICE_GRAPH_RESERVE_GIB = 5.0
 #: (``test/hardware/benchmark_glue_block.py``) measured a win. It runs one
 #: GLM-5.3-Flash KDA + MoE layer per graph at one TP=64 rank's shapes on trn2, and
 #: compares each value with ``0``; ``reports/glue.md`` (round 2, the in-graph A/B
-#: section) has the tables. Per layer:
+#: section) and ``reports/glue-c.md`` have the tables. Per layer:
 #:
-#: * ``mhc_pre:prefill@128``: the fused mHC pre-mix, 254.0 us faster on a 2.54 ms
-#:   128-row layer. It serves at most 128 rows (``mhc_pre.MHC_PRE_MAX_TOKENS``).
+#: * ``mhc_pre:prefill@128`` and ``mhc_pre:prefill@1024``: the fused mHC pre-mix and
+#:   collapse at both mHC sites, with the feed-forward RMSNorm at the feed-forward
+#:   site, 274.9 us faster on a 2.54 ms 128-row layer and 6.92 ms faster on a 16.0 ms
+#:   1024-row layer. At 1024 rows the torch route's collapse at the feed-forward site,
+#:   whose rows the MoE router reads, compiles to a per-token loop.
 #: * ``mhc_post:prefill@128`` and ``mhc_post:prefill@1024``: the bf16 mHC combine,
 #:   45.2 us faster at 128 rows and 275.0 us faster on a 16.0 ms 1024-row layer, but
 #:   197.1 us slower on a 9.07 ms 512-row layer. So the default names the measured
@@ -229,7 +232,8 @@ DEFAULT_DEVICE_GRAPH_RESERVE_GIB = 5.0
 #: Measure a bucket before adding it, on a device lease, with
 #: ``python test/hardware/benchmark_glue_block.py --output <json> --cases
 #: kda:prefill:<rows> --variants off aa=0 <kernel> default``.
-DEFAULT_GLUE_FUSED_SPEC = "mhc_pre:prefill@128,mhc_post:prefill@128,mhc_post:prefill@1024"
+DEFAULT_GLUE_FUSED_SPEC = (
+    "mhc_pre:prefill@128,mhc_pre:prefill@1024,mhc_post:prefill@128,mhc_post:prefill@1024")
 
 
 environment_variables: dict[str, Callable[[], Any]] = {

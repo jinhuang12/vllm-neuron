@@ -23,11 +23,11 @@ from vllm_neuron.model.glm5_next import model_fp8
 from vllm_neuron.model.neuron_config import NeuronConfig
 from vllm_neuron.utils.bucket_utils import get_default_num_seqs_buckets
 
-#: A server whose decode batches outgrow mhc_pre's row bound: more concurrent requests
-#: than ``MHC_PRE_MAX_TOKENS`` rows.
-MANY_SEQS = 2 * mhc_pre.MHC_PRE_MAX_TOKENS
-#: A decode batch of exactly the row count a 128-row prefill rule names.
-ROWS = mhc_pre.MHC_PRE_MAX_TOKENS
+#: A decode batch of exactly the row count a 128-row prefill rule names: one token tile.
+ROWS = mhc_pre.MHC_PRE_TOKEN_TILE
+#: A server whose decode batches outgrow that row count: more concurrent requests than
+#: ``ROWS``.
+MANY_SEQS = 2 * ROWS
 #: The phase-split value these tests route by: mhc_pre and mhc_post at prefill only.
 PREFILL_ONLY = "mhc_pre:prefill,mhc_post:prefill"
 

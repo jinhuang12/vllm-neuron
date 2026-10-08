@@ -1022,6 +1022,33 @@ class Glm5NextHyperConnection(nn.Module):
                 torch path, so an absent route raises rather than falling back.
                 Propagated, never caught.
         """
+        post_mix, comb_mix, layer_input, _ = self.mhc_pre_normed(residual)
+        return post_mix, comb_mix, layer_input
+
+    def mhc_pre_normed(
+        self,
+        residual: torch.Tensor,
+        norm_gain: torch.Tensor | None = None,
+        norm_eps: float | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """:meth:`mhc_pre`, and the sub-block's input RMSNorm where the kernel has it.
+
+        Args:
+            residual: as :meth:`mhc_pre`.
+            norm_gain: ``[H]`` gain of the RMSNorm the sub-block applies to
+                ``layer_input`` first, or None.
+            norm_eps: that norm's epsilon, with ``norm_gain``.
+
+        Returns:
+            ``(post_mix, comb_mix, layer_input, normed)``: :meth:`mhc_pre`'s three,
+            and ``layer_input * rsqrt(mean(layer_input**2) + norm_eps) * norm_gain``
+            in ``layer_input``'s dtype when the fused kernel serves this call
+            (``functional/glue/mhc_pre.py``). Otherwise ``normed`` is None, and the
+            sub-block normalises ``layer_input`` itself.
+
+        Raises:
+            As :meth:`mhc_pre`.
+        """
         from vllm_neuron.functional.mhc.sinkhorn import sinkhorn_normalise_blocks
 
         tokens, streams, hidden = self._require_streams(residual)
@@ -1029,12 +1056,14 @@ class Glm5NextHyperConnection(nn.Module):
         from vllm_neuron.functional.glue import mhc_pre as glue_mhc_pre
 
         if glue_mhc_pre.mhc_pre_admits(residual, self.fn, self.hc_scale, self.hc_base,
-                                       phase=self._glue_phase(tokens)):
-            post_mix, comb_start, layer_input = glue_mhc_pre.mhc_pre_fused(
+                                       phase=self._glue_phase(tokens),
+                                       norm_gain=norm_gain):
+            post_mix, comb_start, layer_input, normed = glue_mhc_pre.mhc_pre_fused(
                 residual, self.fn, self.hc_scale, self.hc_base, rms_eps=self.rms_eps,
-                hc_eps=self.hc_eps, post_mult=self.post_mult_value)
+                hc_eps=self.hc_eps, post_mult=self.post_mult_value,
+                norm_gain=norm_gain, norm_eps=norm_eps)
             comb_mix = sinkhorn_normalise_blocks(comb_start, iters=self.sinkhorn_iters)
-            return post_mix, comb_mix, layer_input
+            return post_mix, comb_mix, layer_input, normed
 
         flat = residual.reshape(tokens, streams * hidden).to(torch.float32)
         mixes = flat @ self.fn.to(torch.float32).t()
@@ -1099,6 +1128,7 @@ class Glm5NextHyperConnection(nn.Module):
             post_mix.reshape(tokens, streams, 1),
             comb_mix,
             layer_input.to(residual.dtype),
+            None,
         )
 
     # ── mHC post: one combine call ────────────────────────────────────────
@@ -1151,7 +1181,12 @@ class Glm5NextHyperConnection(nn.Module):
         return mixed.to(residual.dtype)
 
     # ── one layer call ────────────────────────────────────────────────────
-    def forward(self, residual: torch.Tensor, sublayer: object) -> torch.Tensor:
+    def forward(
+        self,
+        residual: torch.Tensor,
+        sublayer: object,
+        norm: tuple[torch.Tensor | None, float] | None = None,
+    ) -> torch.Tensor:
         """One mHC layer call: pre, then the sub-block, then post.
 
         Args:
@@ -1159,6 +1194,10 @@ class Glm5NextHyperConnection(nn.Module):
             sublayer: the wrapped sub-block, a callable ``[T, H] -> [T, H]``.
                 Annotated ``object`` rather than ``Callable`` because every
                 import in this section is function-local.
+            norm: ``(gain, eps)`` of the RMSNorm the sub-block applies to its input
+                first, or None. With it, ``sublayer`` is called as
+                ``sublayer(layer_input, normed)``, ``normed`` from
+                :meth:`mhc_pre_normed` (None when the sub-block must normalise).
 
         Returns:
             ``[T, S, H]`` in the streams' own dtype -- the re-mixed streams,
@@ -1173,8 +1212,9 @@ class Glm5NextHyperConnection(nn.Module):
                 f"sublayer must be a callable [T, H] -> [T, H], got "
                 f"{type(sublayer).__name__}"
             )
-        post_mix, comb_mix, layer_input = self.mhc_pre(residual)
-        x = sublayer(layer_input)
+        gain, eps = (None, None) if norm is None else norm
+        post_mix, comb_mix, layer_input, normed = self.mhc_pre_normed(residual, gain, eps)
+        x = sublayer(layer_input) if norm is None else sublayer(layer_input, normed)
         if not isinstance(x, torch.Tensor) or tuple(x.shape) != tuple(
             layer_input.shape
         ):
@@ -7640,6 +7680,7 @@ class Glm5NextModel(nn.Module):
         tp_degree: int,
         expert_parallel_rank: int | torch.Tensor,
         collector: list[torch.Tensor] | None = None,
+        normed: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """One layer's feed-forward contribution, without its residual add.
 
@@ -7682,6 +7723,11 @@ class Glm5NextModel(nn.Module):
         unrecognised third type refuses by name rather than falling through to one
         of the two.
 
+        ``normed`` is the feed-forward RMSNorm of ``hidden_states`` (this layer's
+        gain, the config's ``rms_norm_eps``) when the feed-forward mHC site fused it
+        into its mhc_pre kernel, and None when this method must normalise, with
+        :meth:`_rms_norm`. The site never hands a normed tensor on its torch route.
+
         Returns:
             ``[T, H]`` in ``hidden_states``' dtype. Both routes return their own
             kernels' dtype and this method casts, because both callees put that
@@ -7694,7 +7740,8 @@ class Glm5NextModel(nn.Module):
                 f"post_attention_layernorm_weight; the FFN norm's gain is a "
                 f"mapped checkpoint tensor and nothing was loaded onto it"
             )
-        normed = rms_norm(hidden_states, gain)
+        if normed is None:
+            normed = rms_norm(hidden_states, gain)
         if collector is not None:
             collector.append(normed)
         mlp = layer.mlp
@@ -7904,14 +7951,16 @@ class Glm5NextModel(nn.Module):
                 streams=streams,
                 **({"collector": taps} if index in tap_layers else {}),
             )
-            # The feed-forward site. ``_ffn_half`` is called, never edited: the site
-            # collapses the streams, hands it the single ``[T, H]`` stream it has
-            # always taken, and mixes its unchanged return back. ``streams`` is never
-            # ``None`` here, so this is a site or a refusal, never the plain add.
+            # The feed-forward site. The site collapses the streams, hands
+            # ``_ffn_half`` the single ``[T, H]`` stream it has always taken, with that
+            # stream's feed-forward RMSNorm when the fused mhc_pre kernel computed it
+            # (else ``_ffn_half`` normalises it), and mixes its return back.
+            # ``streams`` is never ``None`` here, so this is a site or a refusal,
+            # never the plain add.
             site = _mhc_ffn_site(layer, streams)
             streams = site.forward(
                 streams,
-                lambda single_stream, layer=layer, collector=(
+                lambda single_stream, normed, layer=layer, collector=(
                     taps if index in tap_layers else None
                 ): self._ffn_half(
                     layer,
@@ -7924,6 +7973,11 @@ class Glm5NextModel(nn.Module):
                     tp_degree=tp_degree,
                     expert_parallel_rank=expert_parallel_rank,
                     collector=collector,
+                    normed=normed,
+                ),
+                norm=(
+                    layer.post_attention_layernorm_weight,
+                    float(self.text_config.rms_norm_eps),
                 ),
             )
             if collect_layer_streams and index < DUMP_STREAM_LAYERS:

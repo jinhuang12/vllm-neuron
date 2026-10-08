@@ -3,11 +3,11 @@
 
 ``all`` is 821274e's selection, where each site asked one on/off switch and then its
 own shape rules. So under ``all`` each site's predicate is its shape rules alone.
-Checked on a grid of row counts on both sides of each kernel's row bound, in both
-operand dtypes, with the phase known or not: each
-predicate admits a call exactly when it has at most the kernel's ``*_MAX_TOKENS`` rows
-and operands of a dtype the kernel takes, whatever phase the caller passes. Under ``0``
-no predicate admits any call.
+Checked on a grid of row counts on both sides of each bounded kernel's row bound, in
+both operand dtypes, with the phase known or not: each predicate admits a call exactly
+when it has at most the kernel's ``*_MAX_TOKENS`` rows (mhc_pre has no bound) and
+operands of a dtype the kernel takes, whatever phase the caller passes. Under ``0`` no
+predicate admits any call.
 """
 
 from __future__ import annotations
@@ -24,8 +24,8 @@ from vllm_neuron.functional.glue import kda_output, kda_projections, mhc_pre
 
 ROWS = (1, 2, 4, 63, 64, 65, 127, 128, 129, 256, 1024)
 PHASES = (None, "prefill", "decode")
-MAX_ROWS = {"mhc_pre": mhc_pre.MHC_PRE_MAX_TOKENS,
-            "kda_projections": kda_projections.KDA_PROJECTIONS_MAX_TOKENS,
+#: The bounded kernels' largest row count; mhc_pre serves any row count.
+MAX_ROWS = {"kda_projections": kda_projections.KDA_PROJECTIONS_MAX_TOKENS,
             "kda_output": kda_output.KDA_OUTPUT_MAX_TOKENS}
 PREDICATES = {"mhc_pre": mhc_pre.mhc_pre_admits,
               "kda_projections": kda_projections.kda_projections_admits,
@@ -38,17 +38,19 @@ pair = projection_case.pair
 def _questions(sites, pair):
     """``(kernel, args, rows, dtypes the kernel takes)`` for every predicate and row count.
 
-    mhc_pre and kda_projections take bf16 (served) and fp32 activations; kda_output
-    takes fp32 rows only, so its bf16 ``core`` must be refused at every row count.
+    mhc_pre and kda_projections take bf16 (served) and fp32 activations, so mhc_pre's
+    fp16 streams must be refused at every row count; kda_output takes fp32 rows only, so
+    its bf16 ``core`` must be refused at every row count.
     """
     live_site, _, cfg = sites
     attn, _, attn_cfg = pair
     out = []
     for rows in ROWS:
         streams = glue_case.streams_input(cfg, rows)
-        for residual in (streams, streams.float()):
+        for residual, taken in ((streams, True), (streams.float(), True),
+                                (streams.to(torch.float16), False)):
             out.append(("mhc_pre", (residual, live_site.fn, live_site.hc_scale,
-                                    live_site.hc_base), rows, True))
+                                    live_site.hc_base), rows, taken))
         hidden = projection_case._hidden(attn_cfg, rows)
         for h in (hidden, hidden.float()):
             out.append(("kda_projections", (h, attn), rows, True))
@@ -76,7 +78,7 @@ def test_each_site_admits_by_its_shape_rules_alone(sites, pair, value, monkeypat
     monkeypatch.setenv(glue.GLUE_FUSED_ENV, value)
     admitted = set()
     for kernel, args, rows, dtype_taken in _questions(sites, pair):
-        want = value == "all" and dtype_taken and rows <= MAX_ROWS[kernel]
+        want = value == "all" and dtype_taken and rows <= MAX_ROWS.get(kernel, rows)
         for phase in PHASES:
             got = PREDICATES[kernel](*args, phase=phase)
             assert got == want, (

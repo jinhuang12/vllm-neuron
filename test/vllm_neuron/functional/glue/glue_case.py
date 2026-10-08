@@ -8,9 +8,10 @@ trees the same weights and the same operands.
 
 * :func:`kda_layer` is checkpoint layer 4 (linear attention + MoE), :func:`dsa_layer`
   checkpoint layer 3 (sparse attention + MoE), each with its two mHC sites bound.
-* :func:`layer_step` is what ``Glm5NextModel.forward`` does with one layer at decode: the
-  layer forward (attention site) and the feed-forward site around ``_ffn_half``, with the
-  model's own methods. Collectives are the identity: no process group is initialised, so
+* :func:`layer_step` is what ``Glm5NextModel.forward`` does with one layer: the layer
+  forward (attention site) and the feed-forward site around ``_ffn_half`` (with the
+  feed-forward norm handed to the site, as the model does), with the model's own
+  methods. Collectives are the identity: no process group is initialised, so
   ``_resolve_tp_group`` answers ``None`` at both reductions.
 
 Weights. The mHC leaves, norms, KDA projections and the router are read from the served
@@ -345,12 +346,16 @@ def dsa_carriers(case, batch: int, *, context: int = 1024, seed: int = 31,
 def _ffn_owner(model, cfg):
     """The stack's ``_ffn_half`` and ``_rms_norm`` bound to a stand-in holding the config.
 
+    ``site_takes_norm``: whether this tree's FFN site hands ``_ffn_half`` the norm
+    (``Glm5NextHyperConnection.forward``'s ``norm``; the 0a08ff4 snapshot has none).
     ``ffn_static``: whether this tree's ``_ffn_half`` is a static method that takes the
     config and the norm by name (the 0a08ff4 snapshot's is a method of the model).
     Read here, outside any trace.
     """
     owner = SimpleNamespace(text_config=cfg)
     owner._rms_norm = MethodType(model.Glm5NextModel._rms_norm, owner)
+    owner.site_takes_norm = "norm" in inspect.signature(
+        model.Glm5NextHyperConnection.forward).parameters
     owner.ffn_static = isinstance(
         inspect.getattr_static(model.Glm5NextModel, "_ffn_half"), staticmethod)
     return owner
@@ -369,5 +374,13 @@ def layer_step(model, case, streams: torch.Tensor, carriers: dict,
     if owner.ffn_static:  # as ``Glm5NextModel.forward`` calls it
         ffn.update(text_config=owner.text_config, rms_norm=owner._rms_norm)
     head = () if owner.ffn_static else (owner,)
+    if not owner.site_takes_norm:
+        return site.forward(
+            streams, lambda single: model.Glm5NextModel._ffn_half(*head, layer, single, **ffn))
+    # As ``Glm5NextModel.forward``'s feed-forward site: the norm's gain and epsilon.
     return site.forward(
-        streams, lambda single: model.Glm5NextModel._ffn_half(*head, layer, single, **ffn))
+        streams,
+        lambda single, normed: model.Glm5NextModel._ffn_half(
+            *head, layer, single, normed=normed, **ffn),
+        norm=(layer.post_attention_layernorm_weight, float(owner.text_config.rms_norm_eps)),
+    )

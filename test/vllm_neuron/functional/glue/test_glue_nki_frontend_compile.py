@@ -5,7 +5,10 @@ The simulator runs a kernel body as plain Python, so it cannot see a call form t
 front end refuses. This test compiles the kernels instead (the pattern of
 ``test/vllm_neuron/functional/moe/test_moe_nki_frontend_compile.py``): fake operands of
 one rank's served shapes at B = 1 and B = 64, two programs, in a child process whose
-environment pins the platform target, so the compile opens no device node.
+environment pins the platform target, so the compile opens no device node. The two
+mhc_pre kernels (with and without the feed-forward norm) also compile at the prefill
+row counts their token tiles walk: one tile, the served 1024-row chunk, and 200 rows
+(a whole tile, then a partial one).
 """
 
 from __future__ import annotations
@@ -20,8 +23,11 @@ _ROOT = pathlib.Path(__file__).resolve().parents[4]
 _DROP = ("NKI_SIMULATOR", "NKI_PRECISE_FP", "VLLM_NEURON_CPU_MODE", "NEURON_RT_VISIBLE_CORES")
 _PIN = {"VLLM_NEURON_CPU_COMPILE": "1", "NEURON_PLATFORM_TARGET_OVERRIDE": "trn2",
         "PYTHONDONTWRITEBYTECODE": "1", "NEURON_LOGICAL_NC_CONFIG": "2"}
-KERNELS = ("mhc_pre", "kda_projections", "kda_output", "combine_bf16")
+KERNELS = ("mhc_pre", "mhc_pre_norm", "kda_projections", "kda_output", "combine_bf16")
 BATCHES = (1, 64)
+#: Prefill row counts, for the two mhc_pre kernels only.
+TILED_KERNELS = ("mhc_pre", "mhc_pre_norm")
+TILED_ROWS = (128, 1024, 200)
 
 
 def _emit(*fields: object) -> None:
@@ -67,12 +73,17 @@ def _compile_each_kernel() -> None:
         o_norm_weight=fake((width,), bf16), o_proj_weight=fake((hidden, width), bf16),
         num_kv_heads_per_rank=1, head_dim=width, rms_norm_eps=1e-6)
 
+    def pre(batch, norm):
+        gain = dict(norm_gain=fake((hidden,), bf16), norm_eps=1e-5) if norm else {}
+        return lambda: mhc_pre.mhc_pre_fused(
+            fake((batch, streams, hidden), bf16), fake((mix, streams * hidden), bf16),
+            fake((3,), fp32), fake((mix,), fp32), rms_eps=1e-6, hc_eps=1e-6,
+            post_mult=2.0, **gain)
+
     def cases(batch):
         return (
-            ("mhc_pre", lambda: mhc_pre.mhc_pre_fused(
-                fake((batch, streams, hidden), bf16), fake((mix, streams * hidden), bf16),
-                fake((3,), fp32), fake((mix,), fp32), rms_eps=1e-6, hc_eps=1e-6,
-                post_mult=2.0)),
+            ("mhc_pre", pre(batch, False)),
+            ("mhc_pre_norm", pre(batch, True)),
             ("kda_projections", lambda: kda_projections._KERNELS[2](
                 x=fake((batch, hidden), bf16), q_w=attn.q_proj_weight, k_w=attn.k_proj_weight,
                 v_w=attn.v_proj_weight, b_w=attn.b_proj_weight, f_a_w=attn.f_a_proj_weight,
@@ -91,18 +102,20 @@ def _compile_each_kernel() -> None:
           "cpu_compile=" + os.environ.get("VLLM_NEURON_CPU_COMPILE", "unset"),
           "target=" + os.environ.get("NEURON_PLATFORM_TARGET_OVERRIDE", "unset"),
           "lnc=" + os.environ.get("NEURON_LOGICAL_NC_CONFIG", "unset"))
-    for batch in BATCHES:
-        for name, call in cases(batch):
-            started = time.time()
-            message = ""
-            try:
-                with FakeTensorMode():
-                    call()
-            except Exception as refusal:  # the front end's refusal is the row's reading
-                message = _flat(refusal, 4000)
-            _emit(f"kernel={name}", f"B={batch}", f"refused={bool(message)}",
-                  f"seconds={time.time() - started:.1f}", f"neuron_fds={_open_device_nodes()}",
-                  f"diagnostic={message or 'none'}")
+    tiled = [(name, rows, pre(rows, name == "mhc_pre_norm"))
+             for name in TILED_KERNELS for rows in TILED_ROWS]
+    for batch, name, call in ([(b, n, c) for b in BATCHES for n, c in cases(b)]
+                              + [(rows, name, call) for name, rows, call in tiled]):
+        started = time.time()
+        message = ""
+        try:
+            with FakeTensorMode():
+                call()
+        except Exception as refusal:  # the front end's refusal is the row's reading
+            message = _flat(refusal, 4000)
+        _emit(f"kernel={name}", f"B={batch}", f"refused={bool(message)}",
+              f"seconds={time.time() - started:.1f}", f"neuron_fds={_open_device_nodes()}",
+              f"diagnostic={message or 'none'}")
 
 
 def _rows_from_a_child() -> list[str]:
@@ -140,7 +153,8 @@ def test_the_front_end_accepts_every_glue_kernel():
     venue = [line for line in printed if line.startswith(ROW + "|venue|")]
     assert venue and f"|module={_ROOT}/" in venue[0], f"compiled another tree: {venue}"
     assert [(row["kernel"], int(row["B"])) for row in rows] == [
-        (name, batch) for batch in BATCHES for name in KERNELS], rows
+        (name, batch) for batch in BATCHES for name in KERNELS] + [
+        (name, batch) for name in TILED_KERNELS for batch in TILED_ROWS], rows
     assert {row["neuron_fds"] for row in rows} == {"0"}, rows
     refused = [f"{row['kernel']} B={row['B']}: {row['diagnostic']}"
                for row in rows if row["refused"] == "True"]
