@@ -1107,9 +1107,9 @@ def test_the_draft_heads_eh_proj_is_row_sharded_and_its_other_leaves_replicated(
     """The loader shards ``eh_proj_weight`` on dim 0, ``H / world`` rows per rank at TP=64,
     and slices rank ``r``'s rows ``[r * H / 64, (r + 1) * H / 64)`` -- the order the input
     tail's all-gather concatenates in -- while ``enorm``, ``hnorm`` and
-    ``shared_head_norm`` stay replicated and one rank shards nothing. The row is
-    registered when the head is built (``mtp._declare_shard_geometry``), so it is read
-    off a root built with the shadow draft on."""
+    ``shared_head_norm`` stay replicated and one rank shards nothing. The row is the
+    loader's table entry for the head's class (``model_fp8._SHARD_GEOMETRY``), read off a
+    root built with the shadow draft on."""
     from vllm_neuron.model.glm5_next import model_fp8
     from vllm_neuron.utils.weight_loader import sharding_weight_loader
 

@@ -174,38 +174,6 @@ def _advanced(value: torch.Tensor | int, by: int, limit: int) -> torch.Tensor | 
     return min(int(value) + int(by), int(limit))
 
 
-def _eh_proj_shard_width(module: nn.Module, world_size: int) -> int:
-    """The shard-table width function for ``eh_proj_weight``: rows per rank, ``H / world``."""
-    from vllm_neuron.functional.mtp.tail_in import eh_proj_shard_rows
-
-    return eh_proj_shard_rows(int(module.hidden_size), world_size)
-
-
-def _declare_shard_geometry(model_fp8) -> None:
-    """This class's row of the loader's shard table, ``model_fp8._SHARD_GEOMETRY``.
-
-    ``eh_proj_weight`` is row-parallel: rank ``r`` holds rows
-    ``[r * H / world, (r + 1) * H / world)`` of the checkpoint's ``[H, 2H]`` tensor and
-    computes that slice of ``layer_input``, which :meth:`_layer_input` all-gathers
-    (rank order is row order). The other three head tensors stay replicated. The row
-    is registered beside the class that owns the leaf, as the root registers
-    ``lm_head_weight`` beside its own -- lazily, from the one place the head imports
-    the model tree, because the table lives there and the head must stay importable
-    without it. Idempotent.
-    """
-    model_fp8._SHARD_GEOMETRY.setdefault(
-        Glm5NextMultiTokenPredictor.__name__,
-        {
-            "eh_proj_weight": model_fp8._DeclaredShard(
-                0,
-                _eh_proj_shard_width,
-                "row-parallel -- each rank's rows of layer_input are all-gathered "
-                "(functional/mtp/tail_in.py)",
-            ),
-        },
-    )
-
-
 class Glm5NextMultiTokenPredictor(nn.Module):
     """The draft head: layer 45 and the four tensors around it (see the module doc).
 
@@ -289,7 +257,6 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         from . import model_fp8
         from .config import DSA_LAYER_TYPE
 
-        _declare_shard_geometry(model_fp8)
         block = model_fp8._build_layer(text_config, layer_idx, DSA_LAYER_TYPE, world_size)
         if not isinstance(block.mlp, model_fp8.Glm5NextMoEBlock):
             raise ValueError(
@@ -348,8 +315,8 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         token to draft from -- as upstream does.
 
         Raises:
-            ValueError: when ``eh_proj_weight`` is not this rank's row shard
-                (:func:`_declare_shard_geometry`).
+            ValueError: when ``eh_proj_weight`` is not this rank's row shard (the
+                loader's ``model_fp8._SHARD_GEOMETRY`` entry for this class).
         """
         from vllm_neuron.functional.mtp.tail_in import eh_proj_shard_rows, mtp_tail_in
 
