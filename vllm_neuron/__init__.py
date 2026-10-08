@@ -261,3 +261,12 @@ apply_pin_memory_patch()
 from vllm_neuron.vllm.patches.kv_spec_patch import apply_kv_spec_patch
 
 apply_kv_spec_patch()
+
+# GLM-5.3-Flash carries its own multi-token-prediction draft layer, but vLLM's
+# SpeculativeConfig knows no MTP family for its architecture and refuses
+# --speculative-config method "mtp". The retyping must be live before the engine
+# config is built, earlier than any platform hook, so it is applied here at import
+# time. See the patch module docstring.
+from vllm_neuron.vllm.patches.spec_config_patch import apply_spec_config_patch
+
+apply_spec_config_patch()
