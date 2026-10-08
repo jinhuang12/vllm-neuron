@@ -129,7 +129,8 @@ def _runner_shell(*, k: int = K, req_ids=None, rank: int | None = 0, head: bool 
     )
     if rank is not None:
         runner._glm5next_shadow_rank_cache = rank
-    runner.model = SimpleNamespace(mtp=object() if head else None)
+    # The root records the k it built the head for; the runner reads it there.
+    runner.model = SimpleNamespace(mtp=object() if head else None, draft_k=k if head else 0)
     runner.use_async_scheduling = async_scheduling
     # get_output() writes the ids back into the batch; the batch is not under test here.
     runner._update_batch_state_with_samples = lambda *args, **kwargs: None

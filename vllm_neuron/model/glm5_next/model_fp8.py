@@ -8459,8 +8459,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
         # import either way would be a cycle.
         from .mtp import Glm5NextMultiTokenPredictor, shadow_draft_k
 
+        # Read once, here, inside the worker's config context: the forward runs
+        # outside it, where the reader would fall back to the knob and a served
+        # speculative root would silently draft nothing.
+        self.draft_k = int(shadow_draft_k())
         self.mtp = None
-        if shadow_draft_k() > 0:
+        if self.draft_k > 0:
             self.mtp = Glm5NextMultiTokenPredictor(
                 self.text_config,
                 embed_tokens=lambda: self.model.embed_tokens_weight,
@@ -9634,12 +9638,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     f"nothing, or hand the head's k >= 1"
                 )
         elif draft_head is not None:
-            # The knob's one reader (contract C1); lazily, as the head is imported
-            # everywhere in this module, so the two modules never import each other
-            # at load time.
-            from . import mtp as mtp_module
-
-            shadow_k = int(mtp_module.shadow_draft_k())
+            # The k the head was built for, recorded at construction (``draft_k``).
+            shadow_k = int(self.draft_k)
         draft_carrier: dict | None = None
         if shadow_k > 0:
             stack_depth = len(self.model.layers)

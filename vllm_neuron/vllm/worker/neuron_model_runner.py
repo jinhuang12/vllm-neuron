@@ -11621,18 +11621,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         runner is not, so the hooks key on the head, never on the environment alone:
         another model's tuple output is left untouched whatever the knob says. Under
         speculative method "mtp" the count is the proposer's
-        (``num_speculative_tokens``); otherwise it comes from the knob's one reader,
-        ``mtp.shadow_draft_k`` (contract C1), which reads ``envs`` and bounds it.
+        (``num_speculative_tokens``), which the proposer checked against the head's at
+        load; otherwise it is the ``draft_k`` the root read once at construction from
+        the knob's one reader (``mtp.shadow_draft_k``, contract C1) -- never re-read
+        here, where the worker's config context is gone and the reader would fall
+        back to the knob.
         """
         if getattr(getattr(self, "model", None), "mtp", None) is None:
             return 0
         if getattr(self, "is_mtp_spec", False):
-            # Speculative method "mtp": the engine's own count, which the proposer
-            # checked against the head's at load.
             return int(self.drafter.num_speculative_tokens)
-        from vllm_neuron.model.glm5_next import mtp as mtp_module
-
-        return int(mtp_module.shadow_draft_k())
+        return int(self.model.draft_k)
 
     def _glm5next_draft_kwargs(self) -> dict:
         """The root's ``draft_k`` keyword for this step: ``{}`` when nothing drafts.
