@@ -7,23 +7,35 @@ cores::
     python3 devlease.py slice dsa -- python test/vllm_neuron/functional/dsa/indexer_shard_device.py \\
         --cands 16384 --label dsa-r1 --output /tmp/indexer_shard_device/c16384_r1.json
 
-For one candidate width ``C`` it compiles and times three graphs on one logical core:
+For one candidate width ``C`` it compiles and times five graphs on one logical core:
 
 * ``replicated`` -- the as-built chain on all ``T`` rows of a chunk:
   ``Glm5NextDSAIndexer.score_pools`` then ``select_bounded_pools`` (score GEMM, causal
   bound, top-k, sentinel, order) -> ``[T, k]`` int32 pool ids.
 * ``sharded`` -- one rank's share at degree ``d``: ``indexer_shard.select_local_rows`` on
-  the same ``T``-row operands (row index, three ``index_select``, the same two stages on
-  ``R = ceil(T / d)`` rows) and the float32 cast the all-gather sends. The rank is a device
-  operand, as in the model. The all-gather is not timed: one chip has no TP group.
+  the same ``T``-row operands (one NKI launch cuts the three operands, then the same two
+  stages run on ``R = ceil(T / d)`` rows) -> ``[R, k]`` int32, what the all-gather sends.
+  The rank is a device operand, as in the model. The all-gather is not timed: one chip has
+  no TP group.
+* ``precut`` -- the same two stages on the rank's ``R`` rows cut on the CPU beforehand:
+  the sharded chain without the row cut. ``sharded - precut`` is what the cut adds to the
+  chain on the device.
+* ``cut`` -- the row cut alone: ``select_local_rows`` with a selection that returns its
+  three operands. After timing it runs for the first, a middle and the last rank, and each
+  output must equal ``index_select`` on the CPU reference index, bit for bit.
 * ``launch`` -- a graph that only scales a one-element input: the launch and the
-  synchronising copy every timed call pays, subtracted from the two graphs above.
+  synchronising copy every timed call pays, subtracted from the graphs above.
 
-Each graph returns its ids and a float32 sum of them; a timed call copies only the sum to
-the CPU, which waits for the whole graph. The chunk sits at the end of a
+Each graph returns its outputs and a float32 sum of one of them; a timed call copies only
+the sum to the CPU, which waits for the whole graph. Each graph is timed in its own block
+of calls: a call that switches to another compiled graph pays a few hundred microseconds
+more (MEASURED on this lease), so the blocks are not interleaved. The launch graph is timed
+again after the others (``after_us``), which shows how far the subtracted baseline drifts. The chunk sits at the end of a
 ``index_kpool * C``-token context, so every row sees all ``C`` pools. After timing, the
 sharded ids must equal the replicated ids on the rank's rows as per-row sets, and every
-stage must have taken the NKI route. One JSON object is written per run.
+stage must have taken the NKI route. The run also records every node of each traced graph
+(``graph_ops``): the op inventory of the selection path. One JSON object is written per
+run.
 
 ``--skip-bound`` times the chain without the causal bound: ``_select_bounded`` (the tail
 ``select_bounded_pools`` shares with ``forward_requests``) on the raw scores. At
@@ -51,6 +63,7 @@ sys.dont_write_bytecode = True
 import torch  # noqa: E402
 
 import vllm_neuron  # noqa: E402,F401 -- registers the Neuron compilation backend
+from vllm_neuron.functional.dsa import shard_rows  # noqa: E402
 from vllm_neuron.functional.dsa.indexer_shard import row_shard, select_local_rows  # noqa: E402
 from test.vllm_neuron.functional.dsa import indexer_shard_case as case  # noqa: E402
 
@@ -59,9 +72,23 @@ DEVICE = "neuron:0"
 CHUNK = 1024
 
 
-def compiled(fn):
-    return torch.compile(fn, backend="neuron_libtorch", fullgraph=True, dynamic=False,
-                         options={"compiler_args": os.environ.get("NEURON_CC_FLAGS", "")})
+def compiled(fn, ops: list):
+    """``fn`` compiled for the device, recording each traced node into ``ops``."""
+    device_backend = torch._dynamo.lookup_backend("neuron_libtorch")
+
+    def recording(gm, example_inputs):
+        for node in gm.graph.nodes:
+            if node.op not in ("call_function", "call_method", "call_module"):
+                continue
+            value = node.meta.get("example_value")
+            values = value if isinstance(value, (tuple, list)) else [value]
+            ops.append({"op": node.op, "target": str(node.target),
+                        "out": [[list(v.shape), str(v.dtype).replace("torch.", "")]
+                                for v in values if isinstance(v, torch.Tensor)]})
+        return device_backend(gm, example_inputs,
+                              options={"compiler_args": os.environ.get("NEURON_CC_FLAGS", "")})
+
+    return torch.compile(fn, backend=recording, fullgraph=True, dynamic=False)
 
 
 def operands(tokens: int, cands: int, seed: int):
@@ -90,17 +117,22 @@ def measure(fn, inputs, warmup: int, iterations: int) -> dict:
             "min_us": samples[0], "max_us": samples[-1]}
 
 
-def timed(name, graph, inputs, args, out) -> torch.Tensor:
-    """Compile ``graph``, time it into ``out[name]``, and return its ids on the CPU."""
+def first_call(name, graph, inputs, out):
+    """Compile ``graph`` and run it once, recording into ``out[name]``; return the compiled
+    graph and its first output on the CPU."""
     torch._dynamo.reset()
     case.reset_stage_counters()
-    fn = compiled(graph)
+    shard_rows.reset_shard_rows_dispatch_counters()
+    ops = []
+    fn = compiled(graph, ops)
     started = time.perf_counter()
-    ids = fn(*inputs)[0].to("cpu")
-    first = time.perf_counter() - started
-    out[name] = {"first_call_s": first, "routes": case.stage_counters(),
-                 **measure(fn, inputs, args.warmup, args.iterations)}
-    return ids
+    first_out = fn(*inputs)[0]
+    first_out = tuple(t.to("cpu") for t in first_out) if isinstance(first_out, tuple) else (
+        first_out.to("cpu"))
+    out[name] = {"first_call_s": time.perf_counter() - started,
+                 "routes": case.stage_counters(),
+                 "cut_routes": shard_rows.shard_rows_dispatch_counters(), "graph_ops": ops}
+    return fn, first_out
 
 
 def main() -> None:
@@ -110,7 +142,7 @@ def main() -> None:
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--iterations", type=int, default=30)
+    parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--skip-bound", action="store_true",
                         help="time the chain without the causal bound (see the docstring)")
     parser.add_argument("--label", required=True, help="lease name and repeat, for the record")
@@ -128,10 +160,12 @@ def main() -> None:
 
     indexer = case.make_indexer(args.cands)
     shard = row_shard(CHUNK, args.degree)
-    query, keys, weights, seq_lens = (t.to(DEVICE) for t in operands(CHUNK, args.cands,
-                                                                       args.seed))
+    host = operands(CHUNK, args.cands, args.seed)
+    query, keys, weights, seq_lens = (t.to(DEVICE) for t in host)
     rank = torch.full((1,), args.rank, dtype=torch.int32, device=DEVICE)
     probe = torch.ones(1, dtype=torch.float32, device=DEVICE)
+    mine = shard_rows.rank_row_index(CHUNK, shard.rows, args.rank, "cpu")
+    rank_rows = tuple(host[j].index_select(0, mine).to(DEVICE) for j in (0, 2, 3))
 
     def select(rows_query, rows_weights, rows_seq_lens):
         scores = indexer.score_pools(rows_query, keys, rows_weights)
@@ -144,8 +178,16 @@ def main() -> None:
         return ids, ids.to(torch.float32).sum()
 
     def sharded(q, w, s, r):
-        ids = select_local_rows(select, q, w, s, shard, r).to(torch.float32)
-        return ids, ids.sum()
+        ids = select_local_rows(select, q, w, s, shard, r)
+        return ids, ids.to(torch.float32).sum()
+
+    def precut(q, w, s):
+        ids = select(q, w, s)
+        return ids, ids.to(torch.float32).sum()
+
+    def cut(q, w, s, r):
+        taken = select_local_rows(lambda *rows: rows, q, w, s, shard, r)
+        return taken, taken[2].to(torch.float32).sum()
 
     def launch(x):
         y = x * 2.0
@@ -160,22 +202,43 @@ def main() -> None:
               "lnc": os.environ.get("NEURON_LOGICAL_NC_CONFIG"),
               "neuron_cc_flags": os.environ.get("NEURON_CC_FLAGS", ""), "graphs": {}}
     graphs = record["graphs"]
-    timed("launch", launch, (probe,), args, graphs)
-    whole = timed("replicated", replicated, (query, weights, seq_lens), args, graphs)
-    local = timed("sharded", sharded, (query, weights, seq_lens, rank), args, graphs)
+    chunk = (query, weights, seq_lens)
+    plan = {"launch": (launch, (probe,)), "replicated": (replicated, chunk),
+            "sharded": (sharded, (*chunk, rank)), "precut": (precut, rank_rows),
+            "cut": (cut, (*chunk, rank))}
+    calls, first = {}, {}
+    for name, (graph, inputs) in plan.items():
+        fn, first[name] = first_call(name, graph, inputs, graphs)
+        calls[name] = (fn, inputs)
+        graphs[name].update(measure(fn, inputs, args.warmup, args.iterations))
+    graphs["launch"]["after_us"] = measure(*calls["launch"], args.warmup,
+                                           args.iterations)["median_us"]
+    whole, local, cut_fn = first["replicated"], first["sharded"], calls["cut"][0]
+    cut_exact = {}
+    for other in sorted({0, args.degree // 2, args.degree - 1}):
+        taken = cut_fn(query, weights, seq_lens,
+                       torch.full((1,), other, dtype=torch.int32, device=DEVICE))[0]
+        index = shard_rows.rank_row_index(CHUNK, shard.rows, other, "cpu")
+        cut_exact[str(other)] = all(
+            torch.equal(t.to("cpu"), h.index_select(0, index))
+            for t, h in zip(taken, (host[0], host[2], host[3])))
 
     rows = range(args.rank * shard.rows, min((args.rank + 1) * shard.rows, CHUNK))
-    mine = local.to(torch.int64)
-    same = sum(int(set(mine[i].tolist()) == set(whole[row].to(torch.int64).tolist()))
+    same = sum(int(set(local[i].tolist()) == set(whole[row].tolist()))
                for i, row in enumerate(rows))
+    same_precut = torch.equal(local, first["precut"])
     launch_us = graphs["launch"]["median_us"]
-    record["check"] = {"rows": len(rows), "same_set_rows": same,
+    record["check"] = {"rows": len(rows), "same_set_rows": same, "cut_exact_by_rank": cut_exact,
+                       "sharded_equals_precut": same_precut,
                        "routes_off_nki": {g: {k: v for k, v in body["routes"].items()
                                               if v[1] != 0}
-                                          for g, body in graphs.items()}}
+                                          for g, body in graphs.items()},
+                       "cut_routes": {g: body["cut_routes"] for g, body in graphs.items()}}
     record["net_ms"] = {g: (graphs[g]["median_us"] - launch_us) / 1000.0
-                        for g in ("replicated", "sharded")}
-    record["net_ms"]["saved"] = record["net_ms"]["replicated"] - record["net_ms"]["sharded"]
+                        for g in ("replicated", "sharded", "precut", "cut")}
+    net = record["net_ms"]
+    net["saved"] = net["replicated"] - net["sharded"]
+    net["cut_in_chain"] = net["sharded"] - net["precut"]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(record, indent=1, sort_keys=True) + "\n")
     print(json.dumps({"label": args.label, "cands": args.cands, "net_ms": record["net_ms"],
@@ -187,6 +250,14 @@ def main() -> None:
     off_nki = {g: v for g, v in record["check"]["routes_off_nki"].items() if v}
     if off_nki:
         raise SystemExit(f"a stage left the NKI route: {off_nki}")
+    for g in ("sharded", "cut"):
+        if graphs[g]["cut_routes"] != (1, 0):
+            raise SystemExit(f"the {g} graph's row cut left the NKI route: "
+                             f"{graphs[g]['cut_routes']}")
+    if not all(cut_exact.values()):
+        raise SystemExit(f"the row cut differs from the reference: {cut_exact}")
+    if not same_precut:
+        raise SystemExit("the sharded ids differ from the chain on the CPU-cut rows")
 
 
 if __name__ == "__main__":
