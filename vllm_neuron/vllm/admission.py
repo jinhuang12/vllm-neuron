@@ -10,13 +10,18 @@ never sees the request.
 
 Three request classes are refused:
 
-* **A prompt longer than the prefill window.** The GLM-5.3-Flash runner reads each
-  prefill chunk's KV through a block table of fixed width (``_glm5next_model_kwargs``):
-  ``window_blocks = min(table_width, ceil((kv_segment_size + max_query_len) / page))``,
-  where ``max_query_len`` is the largest ``num_batched_tokens_buckets`` entry (the runner
-  widens a one-request prefill to it). The last chunk of a prompt of P tokens holds
-  ``ceil(P / page)`` pages, so P past ``page * window_blocks`` stops the engine with "a
-  request longer than its bucket cannot be served by this window".
+* **A prompt that leaves no room for a generated token** (``prompt + 1 > max_model_len``).
+  Every sampling request generates at least one token (``max_tokens >= 1``), and the KV
+  block table, the DSA side caches and the decode graphs are sized for ``max_model_len``
+  positions, so the longest prompt is ``max_model_len - 1`` tokens. vLLM's own check
+  (``prompt > max_model_len``) admits a prompt of exactly ``max_model_len``, whose first
+  decode step would write past the request's pages. Nothing shorter is enforced: the
+  GLM-5.3-Flash runner reads a prefill chunk's KV through a window of
+  ``kv_segment_size + query bucket`` tokens, picks the KV segment per request from
+  ``kv_segment_size_buckets`` and refuses at startup a list whose largest segment does
+  not cover ``max_model_len`` (``bucket_utils.validate_kv_segment_size_buckets``), so
+  every server that starts prefills every prompt vLLM admits. A pooling request
+  generates nothing and may fill ``max_model_len``.
 * **A sampling knob the ``all_greedy`` on-device sampler cannot apply.** That sampler is
   ``torch.argmax`` for every row (``functional/full_vocab_sampling.py``), so
   ``temperature > 0``, ``top_k``, ``top_p``, ``min_p``, ``seed`` and ``n > 1`` would be
@@ -44,11 +49,6 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-#: Architectures whose runner reads a prefill chunk's KV through a block table of fixed
-#: width (``NeuronModelRunner._glm5next_model_kwargs``). Segmented prefill for the other
-#: families walks the prior KV one segment at a time and has no such window.
-WINDOWED_PREFILL_ARCHS = ("Glm5NextForConditionalGeneration",)
-
 #: Architectures whose on-device sampler returns token ids and no logits, under
 #: synchronous scheduling too (the GLM root hands its logits to ``sample_full_vocab``
 #: and returns only its int32 tokens).
@@ -74,119 +74,26 @@ _WARNED: set[str] = set()
 _EAGER_MARK = "_vllm_neuron_eager_validation"
 
 
-# ── prefill window ───────────────────────────────────────────────────────────────
+# ── prompt length ────────────────────────────────────────────────────────────────
 
 
 @dataclass(frozen=True)
-class PrefillWindow:
-    """The longest prompt this server can prefill, and the numbers it comes from."""
+class PromptLength:
+    """The longest prompt this server generates from: ``max_model_len - 1`` tokens."""
 
-    tokens: int
-    kv_segment: int
-    query_bucket: int
-    block_size: int
+    max_model_len: int
+
+    @property
+    def tokens(self) -> int:
+        return int(self.max_model_len) - 1
 
     def refusal(self, prompt_len: int) -> str:
         return (
-            f"The prompt has {prompt_len} tokens, and this server can prefill at most "
-            f"{self.tokens} tokens per prompt: one KV segment of {self.kv_segment} "
-            f"tokens (kv_segment_size_buckets) plus one query bucket of "
-            f"{self.query_bucket} tokens (num_batched_tokens_buckets), in pages of "
-            f"{self.block_size}. Shorten the prompt to {self.tokens} tokens or fewer, or "
-            f"restart the server with a larger kv_segment_size_buckets."
+            f"The prompt has {prompt_len} tokens and this server's max_model_len is "
+            f"{self.max_model_len}: the prompt and at least one generated token must fit "
+            f"in max_model_len, so a prompt can have at most {self.tokens} tokens. "
+            f"Shorten the prompt, or restart the server with a larger --max-model-len."
         )
-
-
-def resolve_prefill_buckets(
-    neuron_config: Mapping[str, Any],
-    *,
-    max_num_batched_tokens: int,
-    max_model_len: int,
-    block_size: int,
-    dcp_size: int = 1,
-) -> tuple[list[int] | None, list[int]]:
-    """The ``(kv_segment_size_buckets, num_batched_tokens_buckets)`` the runner resolves.
-
-    The same steps, in the same order, with the same ``bucket_utils`` functions as
-    ``NeuronModelRunner.__init__`` (the block under "Parse num_batched_tokens_buckets"):
-    an explicit segment list wins and, when the query buckets were not set, becomes them
-    too; otherwise ``resolve_segmented_prefill_config`` auto-enables one segment equal to
-    the token budget when that budget is below ``max_model_len``. The runner's validation
-    of the segment list is not repeated: it returns the list unchanged or stops the
-    server at startup.
-
-    Raises:
-        ValueError: the runner would refuse this config at startup.
-    """
-    from vllm_neuron.utils.bucket_utils import (
-        get_max_num_batched_tokens,
-        resolve_num_batched_tokens_buckets,
-        resolve_segmented_prefill_config,
-    )
-
-    budget = get_max_num_batched_tokens(max_num_batched_tokens, max_model_len)
-    user_segments = "kv_segment_size_buckets" in neuron_config
-    user_queries = "num_batched_tokens_buckets" in neuron_config
-    auto_segments = auto_queries = None
-    if not user_segments:
-        auto_segments, auto_queries = resolve_segmented_prefill_config(
-            budget, max_model_len
-        )
-    queries = resolve_num_batched_tokens_buckets(
-        budget,
-        configured_buckets=neuron_config.get("num_batched_tokens_buckets"),
-        use_configured_buckets=user_queries,
-        auto_buckets=auto_queries,
-        dcp_stride=dcp_size * block_size if dcp_size > 1 else 1,
-    )
-    if user_segments:
-        segments = neuron_config.get("kv_segment_size_buckets")
-        if not user_queries:
-            queries = segments
-    else:
-        segments = auto_segments
-    return segments, queries
-
-
-def prefill_window(
-    neuron_config: Mapping[str, Any],
-    *,
-    architectures,
-    max_model_len: int,
-    max_num_batched_tokens: int,
-    block_size: int,
-    dcp_size: int = 1,
-) -> PrefillWindow | None:
-    """The prefill window, or None when it adds nothing to vLLM's ``max_model_len`` check.
-
-    ``tokens = page * ceil((largest segment + largest query bucket) / page)``. The table
-    width caps the window at ``ceil(max_model_len / page)`` pages, which is never below
-    ``max_model_len``, so only a window shorter than ``max_model_len`` is returned. With
-    segmented prefill off the window is that whole table.
-    """
-    if not any(arch in WINDOWED_PREFILL_ARCHS for arch in architectures or ()):
-        return None
-    try:
-        segments, queries = resolve_prefill_buckets(
-            neuron_config,
-            max_num_batched_tokens=max_num_batched_tokens,
-            max_model_len=max_model_len,
-            block_size=block_size,
-            dcp_size=dcp_size,
-        )
-    except ValueError:
-        # The runner refuses this config at startup, so no request is ever served.
-        return None
-    if not segments or not queries:
-        return None
-    # One segment size is all the validator accepts today, so the largest is the one the
-    # runner reads; a runner that pairs each chunk with a fitting segment of several
-    # serves up to the largest.
-    segment, query = max(segments), max(queries)
-    tokens = -(-(segment + query) // block_size) * block_size
-    if tokens >= max_model_len:
-        return None
-    return PrefillWindow(tokens, segment, query, block_size)
 
 
 def prompt_length(processed_inputs: Any) -> int | None:
@@ -291,18 +198,19 @@ class SamplingAdmission:
 
 @dataclass(frozen=True)
 class AdmissionPolicy:
-    window: PrefillWindow | None = None
+    prompt: PromptLength | None = None
     sampling: SamplingAdmission = field(default_factory=SamplingAdmission)
 
     def check(self, processed_inputs: Any, params: Any) -> None:
         """Raise ``ValueError`` naming every reason this request cannot be served."""
         refusals = []
-        if self.window is not None:
-            tokens = prompt_length(processed_inputs)
-            if tokens is not None and tokens > self.window.tokens:
-                refusals.append(self.window.refusal(tokens))
-        # PoolingParams carry no sampling knobs.
+        # PoolingParams carry no sampling knobs and generate no token, so neither the
+        # length rule nor the sampling rules apply to them.
         if hasattr(params, "temperature"):
+            if self.prompt is not None:
+                tokens = prompt_length(processed_inputs)
+                if tokens is not None and tokens > self.prompt.tokens:
+                    refusals.append(self.prompt.refusal(tokens))
             refusals.extend(self.sampling.refusals(params))
         if refusals:
             raise ValueError(" ".join(refusals))
@@ -323,23 +231,16 @@ def _server_defaults(model_config) -> dict[str, float]:
     return {name: diff.get(name, value) for name, value in _PROTOCOL_DEFAULTS.items()}
 
 
-def policy_from_config(vllm_config, *, block_size: int) -> AdmissionPolicy:
+def policy_from_config(vllm_config) -> AdmissionPolicy:
     """The policy for this served config. Called after the platform has settled
-    ``on_device_sampling_config`` and the KV page size."""
+    ``on_device_sampling_config``."""
     from vllm_neuron.model.neuron_config import OnDeviceSamplingConfig
 
     model_config = vllm_config.model_config
     architectures = tuple(getattr(model_config.hf_config, "architectures", None) or ())
     neuron_config = vllm_config.additional_config.get("neuron_config", {})
 
-    window = prefill_window(
-        neuron_config,
-        architectures=architectures,
-        max_model_len=model_config.max_model_len,
-        max_num_batched_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
-        block_size=block_size,
-        dcp_size=vllm_config.parallel_config.decode_context_parallel_size,
-    )
+    prompt = PromptLength(int(model_config.max_model_len))
 
     # The runner samples on device exactly when NeuronConfig.from_dict yields a sampler
     # config: absent means the default config, an explicit null means none.
@@ -365,10 +266,12 @@ def policy_from_config(vllm_config, *, block_size: int) -> AdmissionPolicy:
             prompt_logprobs=False,
             defaults=_server_defaults(model_config),
         )
-    policy = AdmissionPolicy(window=window, sampling=sampling)
+    policy = AdmissionPolicy(prompt=prompt, sampling=sampling)
     logger.info(
-        "Request admission: prefill window %s; on-device sampling %s",
-        f"{window.tokens} tokens" if window else "none (max_model_len applies)",
+        "Request admission: prompts up to %d tokens (max_model_len %d less one generated "
+        "token); on-device sampling %s",
+        prompt.tokens,
+        prompt.max_model_len,
         "off" if sampler is None
         else f"on (all_greedy={sampler.all_greedy}, logprobs={sampling.logprobs})",
     )

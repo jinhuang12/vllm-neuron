@@ -201,3 +201,73 @@ def routed_affinities(local_hits, *, experts: int = EXPERTS,
         row[torch.tensor(picks)] = weight / weight.sum() * SCALING
         rows.append(row)
     return torch.stack(rows).to(torch.float32)
+
+
+# ---- Batched decode routing tables ------------------------------------------ #
+
+#: Where the 0a08ff4 snapshot of the decode expert kernel lives.
+BASELINE_0A08FF4 = REPO / "test" / "hardware" / "baselines" / "moe_0a08ff4"
+
+
+def baseline_0a08ff4():
+    """The 0a08ff4 decode-expert entry point (``pipeline.decode_experts``)."""
+    import importlib.util
+    import sys
+
+    name = "moe_0a08ff4"
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(
+            name, BASELINE_0A08FF4 / "__init__.py",
+            submodule_search_locations=[str(BASELINE_0A08FF4)],
+        )
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    import importlib
+
+    return importlib.import_module(f"{name}.pipeline")
+
+
+def batch_routing_table(tokens: int, seed: int = 0, *,
+                        local_experts: int = LOCAL_EXPERTS,
+                        top_k: int = TOP_K, groups: int = EP_GROUPS,
+                        skew: float = 1.2):
+    """Seeded local hits ``[T][k]`` for one rank, shaped like served decode routing.
+
+    Token ``t`` keeps ``k_t ~ Binomial(top_k, 1 / groups)`` of its ``top_k`` picks
+    on this rank, drawn without replacement from a Zipf popularity
+    ``p_e ~ 1 / (r_e + 1) ** skew`` over a seeded ranking ``r`` of the experts.
+    The skew is what served routing shows: rank 0 of the bs=64 profile
+    (``profile/out/b64c1k_dev_r00``) visits 6 to 17 of its 18 experts per layer,
+    mean 10.8, where uniform routing would visit 15. So some experts get no
+    token, a few get many, and tokens carry 0..k picks.
+    """
+    gen = torch.Generator().manual_seed(seed)
+    order = torch.randperm(local_experts, generator=gen)
+    popularity = torch.empty(local_experts)
+    popularity[order] = 1.0 / torch.arange(1, local_experts + 1, dtype=torch.float32) ** skew
+    popularity /= popularity.sum()
+    hits = []
+    for _ in range(tokens):
+        k = int((torch.rand(top_k, generator=gen) < 1.0 / groups).sum())
+        if k == 0:
+            hits.append([])
+            continue
+        picks = torch.multinomial(popularity, k, replacement=False, generator=gen)
+        hits.append(sorted(int(e) for e in picks))
+    return hits
+
+
+def hit_histogram(hits, local_experts: int = LOCAL_EXPERTS):
+    """Tokens per local expert, distinct experts, pairs: the table's summary."""
+    per_expert = [0] * local_experts
+    for row in hits:
+        for e in row:
+            per_expert[e] += 1
+    return {
+        "tokens_per_local_expert": per_expert,
+        "distinct_local_experts": sum(1 for n in per_expert if n),
+        "token_expert_pairs": sum(per_expert),
+        "tokens_with_no_local_expert": sum(1 for row in hits if not row),
+        "max_tokens_on_one_expert": max(per_expert),
+    }

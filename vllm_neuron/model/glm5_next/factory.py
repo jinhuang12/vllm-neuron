@@ -254,6 +254,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
     supports_on_device_sampling = False
     #: glm builds query and cached-KV carriers with independent lengths.
     supports_independent_prefill_buckets = True
+    #: glm reads a prefill chunk's prior KV through a gathered block-table window,
+    #: not the segmented attention kernel, so any KV segment size is served.
+    supports_windowed_prefill = True
 
     def __init__(
         self,

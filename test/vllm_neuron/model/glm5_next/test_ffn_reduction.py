@@ -245,6 +245,8 @@ def test_the_reduced_sharded_ffn_half_equals_the_unsharded_output(
     monkeypatch,
 ) -> None:
     """Two ranks' reduced FFN half equals the unsharded one, and reduces once per rank."""
+    # Pin the as-built fp32 wire, so an exported policy switch does not decide.
+    monkeypatch.setenv("VLLM_NEURON_TP_ALLREDUCE_DTYPE", "fp32")
     model_fp8 = _impl()
     text_config = _text_config()
     operands = _whole_operands()

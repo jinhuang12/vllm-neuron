@@ -75,13 +75,16 @@ DRAFT_K = 5
 
 #: The two serve lines (``/home/ubuntu/glm53f-wt2/00_brief.md``, "Serving facts").
 LINES = {
-    # Fast bs=1 recipe: max_model_len 4096, one sequence, segment 1024, batched 1024,
-    # decode context bucket 2048, hybrid block 128, prefix caching left at vLLM's default
-    # (on) and no --mamba-block-size.
+    # Fast bs=1 recipe: max_model_len 4096, one sequence, segments 1024 / 2048 / 4096
+    # (the largest segment plus the 1024-row query must cover max_model_len, the bucket
+    # rule for a windowed prefill), batched 1024, decode context bucket 2048, hybrid
+    # block 128, prefix caching left at vLLM's default (on) and no --mamba-block-size.
+    # The prefill leg warms the smallest segment, 1024, as before.
     "bs1": {
         "max_model_len": 4096,
         "max_num_seqs": 1,
         "prefill_bucket": 1024,
+        "kv_segment_buckets": (1024, 2048, 4096),
         "kv_segment": 1024,
         "decode_ctx": 2048,
         "batch_buckets": (1,),
@@ -94,6 +97,7 @@ LINES = {
         "max_model_len": 8192,
         "max_num_seqs": 64,
         "prefill_bucket": 1024,
+        "kv_segment_buckets": (8192,),
         "kv_segment": 8192,
         "decode_ctx": 2048,
         "batch_buckets": (1, 2, 4, 8, 16, 32, 64),
@@ -242,7 +246,7 @@ def line_runner(line: str, tmp_path, record: dict):
     spec = LINES[line]
     neuron_config = {
         "num_batched_tokens_buckets": [spec["prefill_bucket"]],
-        "kv_segment_size_buckets": [spec["kv_segment"]],
+        "kv_segment_size_buckets": list(spec["kv_segment_buckets"]),
         "decode_context_length_buckets": [spec["decode_ctx"]],
         "num_seqs_buckets": list(spec["batch_buckets"]),
         "hybrid_kv_block_size": BLOCK,

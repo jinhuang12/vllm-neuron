@@ -111,6 +111,10 @@ _SEAM_REGISTRY = {
     "mla_sparse": (
         "vllm_neuron.functional.attention.mla_sparse",
         "mla_sparse_dispatch_counters", "reset_mla_sparse_dispatch_counters"),
+    "mla_dense_window": (
+        "vllm_neuron.functional.attention.mla_dense_window",
+        "mla_dense_window_dispatch_counters",
+        "reset_mla_dense_window_dispatch_counters"),
     "mla_sparse_tiled": (
         "vllm_neuron.functional.attention.mla_sparse",
         "mla_sparse_tiled_dispatch_counters",
@@ -155,6 +159,9 @@ _SEAM_REGISTRY = {
         "vllm_neuron.functional.dsa.sentinel_order",
         "sentinel_order_dispatch_counters",
         "reset_sentinel_order_dispatch_counters"),
+    "dsa_shard_rows": (
+        "vllm_neuron.functional.dsa.shard_rows",
+        "shard_rows_dispatch_counters", "reset_shard_rows_dispatch_counters"),
     "kda_chunked_recurrence": (
         "vllm_neuron.functional.kda.chunked_recurrence",
         "dispatch_counters", "reset_dispatch_counters"),
@@ -192,6 +199,12 @@ _SEAM_REGISTRY = {
         "vllm_neuron.functional.dsa.decode_batch",
         "decode_batch_dispatch_counters",
         "reset_decode_batch_dispatch_counters"),
+    "glue_mhc_pre": (
+        "vllm_neuron.functional.glue.mhc_pre", "dispatch_counters", "reset_dispatch_counters"),
+    "glue_kda_projections": (
+        "vllm_neuron.functional.glue.kda_projections", "dispatch_counters", "reset_dispatch_counters"),
+    "glue_kda_output": (
+        "vllm_neuron.functional.glue.kda_output", "dispatch_counters", "reset_dispatch_counters"),
 }
 _SEAMS = tuple(_SEAM_REGISTRY)
 

@@ -13,6 +13,7 @@ the model must see the translated mapping and nothing else.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -168,6 +169,7 @@ def _assert_finite_logits(label: str, logits, rows: int) -> None:
     assert torch.isfinite(logits.to(torch.float32)).all()
 
 
+@mock.patch.dict("os.environ", {"VLLM_NEURON_GLUE_FUSED": "all"})  # every glue kernel on its route, whatever the served default selects
 def test_prefill_graph_capture_hands_the_root_its_carriers():
     """One prefill capture, translated, through to the root and into the caller's banks."""
     root, caches = _bound_root()
@@ -242,6 +244,7 @@ def test_prefill_capture_with_independent_query_and_kv_lengths():
             assert carrier["row_mask"].shape == (1, 1024, 1)
 
 
+@mock.patch.dict("os.environ", {"VLLM_NEURON_GLUE_FUSED": "all"})  # every glue kernel on its route, whatever the served default selects
 def test_decode_graph_capture_hands_the_root_its_carriers():
     """One decode capture, translated, and classified as the decode leg it is."""
     root, caches = _bound_root()
