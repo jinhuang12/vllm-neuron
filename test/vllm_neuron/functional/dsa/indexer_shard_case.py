@@ -126,8 +126,10 @@ def replicated_task(tokens: int, cands: int, seed: int):
 
 
 def rank_task(tokens: int, cands: int, degree: int, rank: int, seed: int):
-    """Rank ``rank`` of ``degree``: its ``[R, k]`` pool ids through the production row cut
-    (``select_local_rows``) and the indexer's own two selection stages."""
+    """Rank ``rank`` of ``degree``: ``(pool_ids [R, k], stage counters, row-cut counters)``
+    through the production row cut (``select_local_rows``, with the rank as the model's
+    ``[1]`` int32 operand) and the indexer's own two selection stages."""
+    from vllm_neuron.functional.dsa import shard_rows
     from vllm_neuron.functional.dsa.indexer_shard import row_shard, select_local_rows
 
     torch.set_num_threads(1)
@@ -139,8 +141,10 @@ def rank_task(tokens: int, cands: int, degree: int, rank: int, seed: int):
         return indexer.select_bounded_pools(scores, rows_seq_lens)
 
     reset_stage_counters()
-    local = select_local_rows(select, query, weights, seq_lens, row_shard(tokens, degree), rank)
-    return local, stage_counters()
+    shard_rows.reset_shard_rows_dispatch_counters()
+    local = select_local_rows(select, query, weights, seq_lens, row_shard(tokens, degree),
+                              torch.tensor([rank], dtype=torch.int32))
+    return local, stage_counters(), shard_rows.shard_rows_dispatch_counters()
 
 
 def worker_environment() -> dict[str, str]:

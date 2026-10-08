@@ -18,8 +18,6 @@ The kernel-level equality over the production shapes is
 
 from __future__ import annotations
 
-import copy
-
 import pytest
 import torch
 
@@ -180,10 +178,10 @@ def test_every_rank_returns_the_replicated_selection(world, monkeypatch):
             # The write stage is not sharded: every rank stores the same pools and ring.
             for mine, theirs in zip(state, want_state):
                 assert torch.equal(mine, theirs)
-    # One gather per forward, on the query rows, in float32, of this rank's R rows.
+    # One gather per forward, on the query rows, of this rank's R rows as the selector's int32.
     k = indexer.select_k()
     assert [c[0] for c in group.calls] == list(range(world)) * 2
-    assert all(c[1:] == (torch.float32, 0, (rows, k)) for c in group.calls), group.calls[:2]
+    assert all(c[1:] == (torch.int32, 0, (rows, k)) for c in group.calls), group.calls[:2]
 
 
 def test_a_rank_hands_the_gather_exactly_its_own_rows(monkeypatch):
@@ -275,8 +273,10 @@ def test_an_unbound_rank_operand_stays_replicated(monkeypatch):
 
 
 def test_the_rank_operand_is_a_graph_input(monkeypatch):
-    """A compile reads the bound operand at run time: one graph, each rank's own rows."""
-    from vllm_neuron.functional.dsa.indexer_shard import local_row_index, row_shard
+    """A compile reads the bound operand at run time: one graph, each rank's own rows,
+    through the production row cut."""
+    from vllm_neuron.functional.dsa.indexer_shard import row_shard
+    from vllm_neuron.functional.dsa.shard_rows import dsa_take_rank_rows
 
     model_fp8 = _impl()
     indexer, _cfg = _indexer()
@@ -291,7 +291,7 @@ def test_the_rank_operand_is_a_graph_input(monkeypatch):
 
         def forward(self, x):
             rank = getattr(self.inner, self.inner.SHARD_RANK_ATTR)
-            return x.index_select(0, local_row_index(shard, rank, x.device))
+            return dsa_take_rank_rows((x,), rank, shard.rows)[0]
 
     graphs = []
 

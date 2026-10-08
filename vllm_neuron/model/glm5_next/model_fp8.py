@@ -4950,7 +4950,7 @@ class Glm5NextDSAIndexer(nn.Module):
             return select(query, weights, seq_lens)
         shard = row_shard(tokens, degree)
         local = select_local_rows(select, query, weights, seq_lens, shard, rank)
-        return gather_rows(local, group, shard, id_bound=int(candidate_keys.shape[0]))
+        return gather_rows(local, group, shard)
 
     @staticmethod
     def _canonical_sentinel_order(pool_ids: torch.Tensor) -> torch.Tensor:
@@ -5274,9 +5274,10 @@ class Glm5NextDSAIndexer(nn.Module):
         it: shape validation, index arithmetic for the gather and for the two write
         addresses, one ``index_copy_`` per leg, one ring copy on the decode leg, and
         one ring copy on the prefill leg -- masked over the whole ring when the
-        chunk's end arrives as a tensor. When the prefill selection shards, three row
-        ``index_select`` calls cut this rank's rows and one all-gather returns the pool
-        ids (:meth:`_select_pool_ids`). No torch path computes an indexer value.
+        chunk's end arrives as a tensor. When the prefill selection shards, an NKI row
+        cut (``shard_rows``) takes this rank's rows of each operand and one int32
+        all-gather returns the pool ids (:meth:`_select_pool_ids`). No torch path
+        computes an indexer value.
         """
         from vllm_neuron.functional.dsa.decode_tail_update import decode_pool_address
 

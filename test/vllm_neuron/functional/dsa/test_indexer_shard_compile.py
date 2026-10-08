@@ -11,7 +11,10 @@ the trn2 target and opens no device node:
   262,144-token context (``max_model_len // 4``);
 * ``rotational_topk`` at ``[R, 65536]``, ``k = 512``, with the config the seam builds for
   that row count. At 16 rows that config differs from every config the replicated path
-  builds (tile 8, 16 stages against tile 16, 8 stages at 128 or 1024 rows).
+  builds (tile 8, 16 stages against tile 16, 8 stages at 128 or 1024 rows);
+* ``_take_rank_rows_nki``, the row cut, taking ``R`` rows of the chunk's three selection
+  operands in one launch: query ``[1024, 32 * 128]`` bf16, gate ``[1024, 32]`` fp32 and
+  lengths ``[1024, 1]`` int32.
 
 A control entry, a body that reads an undefined name, must be refused, which proves the
 children really trace and compile what they are given. Each entry prints its trace and
@@ -41,7 +44,8 @@ CHUNK = 1024
 #: The two designs the report compares: every TP rank, and groups of 8.
 DEGREES = (64, 8)
 ROWS = tuple(-(-CHUNK // d) for d in DEGREES)
-ENTRIES = [("score", r) for r in ROWS] + [("topk", r) for r in ROWS] + [("control", 1)]
+ENTRIES = ([("score", r) for r in ROWS] + [("topk", r) for r in ROWS]
+           + [("rows", r) for r in ROWS] + [("control", 1)])
 
 
 def _dials() -> tuple[int, int, int, int]:
@@ -85,6 +89,16 @@ def _compile_one(kind: str, rows: int, work: str) -> None:
         config = module._nki_config(rows, cands, select_k, nl.float32)
         kernel = module.rotational_topk[config.n_prgs]
         inputs = {"inp": np.zeros((rows, cands), dtype=np.float32), "config": config}
+    elif kind == "rows":
+        from vllm_neuron.functional.dsa import shard_rows as module
+
+        kernel = module._take_rank_rows_nki
+        sources = (np.zeros((CHUNK, heads * dim), dtype=ml_dtypes.bfloat16),
+                   np.zeros((CHUNK, heads), dtype=np.float32),
+                   np.zeros((CHUNK, 1), dtype=np.int32))
+        inputs = {"rank_hbm": np.zeros((1, 1), dtype=np.int32), "rows": rows,
+                  "free_tile": module.FREE_TILE_BYTES // max(s.dtype.itemsize for s in sources),
+                  "first_hbm": sources[0], "second_hbm": sources[1], "third_hbm": sources[2]}
     else:
         @nki.jit
         def body_that_reads_an_undefined_name(x_hbm):

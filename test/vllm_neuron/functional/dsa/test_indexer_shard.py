@@ -80,13 +80,10 @@ def test_a_rank_takes_its_own_rows_and_padding_repeats_the_last_real_row():
 @pytest.mark.parametrize("rank", [torch.tensor([1, 2], dtype=torch.int32),
                                   torch.tensor([1.0])])
 def test_a_rank_operand_that_is_not_one_integer_is_refused(rank):
-    from vllm_neuron.functional.dsa.indexer_shard import (
-        IndexerShardError,
-        local_row_index,
-        row_shard,
-    )
+    from vllm_neuron.functional.dsa.indexer_shard import local_row_index, row_shard
+    from vllm_neuron.functional.dsa.shard_rows import ShardRowsError
 
-    with pytest.raises(IndexerShardError):
+    with pytest.raises(ShardRowsError):
         local_row_index(row_shard(10, 4), rank, torch.device("cpu"))
 
 
@@ -145,29 +142,32 @@ def test_the_gather_restores_row_order_trims_padding_and_keeps_int32():
     per_rank = list(padded.split(shard.rows))
     for rank in range(4):
         group = _ConcatGroup(per_rank, rank)
-        out = gather_rows(per_rank[rank], group, shard, id_bound=1000)
+        out = gather_rows(per_rank[rank], group, shard)
         assert out.dtype == torch.int32 and torch.equal(out, full)
-        # One collective per call, in float32: the dtype the model's collectives already
-        # move, and exact for every id below 2 ** 24.
-        assert group.calls == [(torch.float32, 0)]
+        # One collective per call, of the selector's own int32 ids: no cast on either side.
+        assert group.calls == [(torch.int32, 0)]
 
 
-def test_the_gather_refuses_ids_float32_cannot_carry_exactly():
-    from vllm_neuron.functional.dsa.indexer_shard import (
-        FP32_EXACT_INT,
-        IndexerShardError,
-        gather_rows,
-        row_shard,
-    )
+def test_an_exact_plan_returns_the_gathered_block_itself():
+    from vllm_neuron.functional.dsa.indexer_shard import gather_rows, row_shard
+
+    shard = row_shard(8, 4)
+    per_rank = list((torch.arange(8 * 3, dtype=torch.int32).reshape(8, 3) - 1).split(shard.rows))
+    group = _ConcatGroup(per_rank, 1)
+    gathered = torch.cat(per_rank)
+    group.all_gather = lambda local, dim=-1: gathered
+    # ``d * R == T``: no slice, no copy -- the collective's output is the chunk's ids.
+    assert gather_rows(per_rank[1], group, shard) is gathered
+
+
+def test_the_gather_refuses_ids_of_another_dtype():
+    from vllm_neuron.functional.dsa.indexer_shard import IndexerShardError, gather_rows, row_shard
 
     shard = row_shard(4, 2)
-    local = torch.zeros(2, 3, dtype=torch.int32)
-    # The largest id float32 still carries exactly crosses; one past it is refused.
-    edge = torch.full((2, 3), FP32_EXACT_INT - 1, dtype=torch.int32)
-    out = gather_rows(edge, _ConcatGroup([edge, edge], 0), shard, id_bound=FP32_EXACT_INT)
-    assert torch.equal(out, torch.cat([edge, edge]))
-    with pytest.raises(IndexerShardError):
-        gather_rows(local, _ConcatGroup([local, local], 0), shard, id_bound=FP32_EXACT_INT + 1)
+    for dtype in (torch.float32, torch.int64):
+        local = torch.zeros(2, 3, dtype=dtype)
+        with pytest.raises(IndexerShardError):
+            gather_rows(local, _ConcatGroup([local, local], 0), shard)
 
 
 def test_the_gather_refuses_a_block_of_the_wrong_height():
@@ -176,7 +176,7 @@ def test_the_gather_refuses_a_block_of_the_wrong_height():
     shard = row_shard(4, 2)
     wrong = torch.zeros(3, 3, dtype=torch.int32)
     with pytest.raises(IndexerShardError):
-        gather_rows(wrong, _ConcatGroup([wrong, wrong], 0), shard, id_bound=8)
+        gather_rows(wrong, _ConcatGroup([wrong, wrong], 0), shard)
 
 
 @pytest.mark.parametrize("value,enabled", [(None, True), ("1", True), ("0", False)])
@@ -282,8 +282,7 @@ def _gathered(matrix, tokens, cands, degree):
     per_rank = [matrix["ranks"][(tokens, cands, degree, r)][0] for r in range(degree)]
     for local in per_rank:
         assert local.dtype == torch.int32 and tuple(local.shape) == (shard.rows, local.shape[1])
-    outs = [gather_rows(per_rank[r], _ConcatGroup(per_rank, r), shard, id_bound=cands)
-            for r in range(degree)]
+    outs = [gather_rows(per_rank[r], _ConcatGroup(per_rank, r), shard) for r in range(degree)]
     for other in outs[1:]:
         assert torch.equal(other, outs[0]), "every rank must see the same gathered selection"
     return outs[0]
@@ -315,6 +314,8 @@ def test_the_sharded_rows_select_the_same_pool_sets(matrix, tokens, cands, degre
         rank_counters = matrix["ranks"][(tokens, cands, degree, r)][1]
         for family, value in rank_counters.items():
             assert value == (1, 0), (f"rank {r}", family, value)
+        # The row cut: one NKI launch takes the three operands (query, weights, seq_lens).
+        assert matrix["ranks"][(tokens, cands, degree, r)][2] == (1, 0), f"rank {r}"
 
     bad = [i for i, (a, b) in enumerate(zip(_row_sets(want), _row_sets(got))) if a != b]
     assert not bad, f"{len(bad)} row(s) select a different pool set, first {bad[:5]}"

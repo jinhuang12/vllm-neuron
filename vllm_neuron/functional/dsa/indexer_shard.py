@@ -19,14 +19,14 @@ as before, with each row's own length.
 
 The rank is a device operand, not a python int: one prefill graph serves every rank (the
 runner passes its own rank to the model as a tensor for the same reason), so a rank read
-at trace time would compile rank 0's rows into every rank's graph.
+at trace time would compile rank 0's rows into every rank's graph. A slice cannot take a
+device start row, so the cut is an NKI kernel (``shard_rows.dsa_take_rank_rows``) that
+builds the row index on device and gathers the rows by indirect DMA.
 
-The all-gather contract: the ids cross the collective as float32, by value, in the
-group's ``rank_in_group`` order. Float32 is the dtype the model's other collectives move,
-and every id here (``-1`` and the pool ids ``< C``) is an integer of magnitude at most
-``2 ** 24``, which float32 carries exactly; :func:`gather_rows` refuses a wider id range. A
-bit-cast would also be exact in the bytes, but it would turn ``-1`` into a NaN pattern,
-and nothing promises that a NaN crosses a collective unchanged.
+The all-gather contract: the ids cross the collective as the selector's own int32, in the
+group's ``rank_in_group`` order. An all-gather only moves bytes, so no cast is needed on
+either side; when ``d * R == T`` the gathered block is the chunk as it stands, and only a
+padded plan takes the leading ``T`` rows, a view.
 
 ``VLLM_NEURON_DSA_INDEXER_SHARD=0`` (``vllm_neuron/envs.py``) restores the replicated path.
 """
@@ -41,6 +41,7 @@ from torch import Tensor
 
 from vllm_neuron import envs
 from vllm_neuron.functional.dsa.score_gemm import TOKEN_TILE
+from vllm_neuron.functional.dsa.shard_rows import dsa_take_rank_rows, rank_row_index
 
 #: Query rows one row tile of the selection kernels holds: the score GEMM's stationary
 #: free size (``score_gemm.TOKEN_TILE``, ``nl.tile_size.pmax`` = 128 on trn2), which is
@@ -49,13 +50,13 @@ from vllm_neuron.functional.dsa.score_gemm import TOKEN_TILE
 #: nothing.
 ROW_TILE = TOKEN_TILE
 
-#: Every integer of magnitude at most ``2 ** 24`` is exact in float32 (24-bit significand).
-FP32_EXACT_INT = 2**24
+#: The dtype of the selector's pool ids, which the all-gather moves unchanged.
+POOL_ID_DTYPE = torch.int32
 
 
 class IndexerShardError(ValueError):
     """A shard plan or a gather this module refuses: an empty chunk, a non-positive degree,
-    a rank operand or local block of the wrong shape, or ids float32 cannot carry exactly."""
+    an operand or local block of the wrong shape, or ids of another dtype."""
 
 
 def indexer_shard_enabled() -> bool:
@@ -106,21 +107,12 @@ def shard_degree(tokens: int, world_size: int) -> int:
 def local_row_index(shard: RowShard, rank: Tensor | int, device: torch.device) -> Tensor:
     """``[R]`` int64: the chunk rows rank ``rank`` selects, padding clamped to row ``T - 1``.
 
-    ``rank`` is a one-element integer tensor on the traced path (one graph for every rank)
-    or a python int in an eager caller. The clamp keeps every pad row a legal row of the
-    chunk, so its chain computes ordinary values that the gather then drops.
+    The reference for the row cut :func:`select_local_rows` makes on device
+    (``shard_rows.rank_row_index``). ``rank`` is a one-element integer tensor or a python
+    int. The clamp keeps every pad row a legal row of the chunk, so its chain computes
+    ordinary values that the gather then drops.
     """
-    offsets = torch.arange(shard.rows, device=device, dtype=torch.int64)
-    if torch.is_tensor(rank):
-        if rank.numel() != 1 or rank.is_floating_point():
-            raise IndexerShardError(
-                f"the rank operand must be one integer element; got shape "
-                f"{tuple(rank.shape)} dtype {rank.dtype}"
-            )
-        start = rank.to(device=device, dtype=torch.int64).reshape(()) * shard.rows
-    else:
-        start = int(rank) * shard.rows
-    return (offsets + start).clamp_max(shard.tokens - 1)
+    return rank_row_index(shard.tokens, shard.rows, rank, device)
 
 
 def select_local_rows(
@@ -145,33 +137,35 @@ def select_local_rows(
 
     Returns:
         ``[R, k]``: ``select`` on rows ``rank * R .. rank * R + R - 1`` (pad rows clamped).
+
+    The three operands' rows are cut on device by ``shard_rows.dsa_take_rank_rows``, in
+    one NKI launch.
     """
     for name, operand in (("query", query), ("weights", weights), ("seq_lens", seq_lens)):
         if int(operand.shape[0]) != shard.tokens:
             raise IndexerShardError(
                 f"{name} has {int(operand.shape[0])} rows; the plan is for {shard.tokens}"
             )
-    rows = local_row_index(shard, rank, query.device)
-    return select(query.index_select(0, rows), weights.index_select(0, rows),
-                  seq_lens.index_select(0, rows))
+    return select(*dsa_take_rank_rows((query, weights, seq_lens), rank, shard.rows))
 
 
-def gather_rows(local: Tensor, group, shard: RowShard, *, id_bound: int) -> Tensor:
+def gather_rows(local: Tensor, group, shard: RowShard) -> Tensor:
     """Every rank's ``[R, k]`` int32 pool ids, gathered into the chunk's ``[T, k]`` int32.
 
     ``group`` is the tensor-parallel ``GroupCoordinator`` whose ``rank_in_group`` order the
     rows were cut in; its ``all_gather`` concatenates on ``dim=0`` in that order, which is
-    the order :func:`local_row_index` assigned. ``id_bound`` is the candidate count, the
-    exclusive upper bound of every id, and must leave float32 exact.
+    the order :func:`local_row_index` assigned. The ids cross as they are; a padded plan
+    keeps the leading ``T`` rows (a view of the gathered block).
     """
     if int(local.shape[0]) != shard.rows or local.dim() != 2:
         raise IndexerShardError(
             f"a rank gathers [{shard.rows}, k] ids; got shape {tuple(local.shape)}"
         )
-    if int(id_bound) > FP32_EXACT_INT:
+    if local.dtype != POOL_ID_DTYPE:
         raise IndexerShardError(
-            f"ids up to {int(id_bound) - 1} cross the gather as float32, which is exact only "
-            f"up to {FP32_EXACT_INT}"
+            f"the gather moves the selector's {POOL_ID_DTYPE} ids; got {local.dtype}"
         )
-    whole = group.all_gather(local.to(torch.float32), dim=0)
-    return whole[: shard.tokens].to(torch.int32)
+    whole = group.all_gather(local, dim=0)
+    if shard.degree * shard.rows == shard.tokens:
+        return whole
+    return whole[: shard.tokens]
