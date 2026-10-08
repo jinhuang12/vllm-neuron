@@ -1000,10 +1000,11 @@ def test_index_share_skips_the_indexer_only_when_set_and_selecting(regime, flag,
 
 
 def test_index_share_carrier_publishes_the_chain_s_selection_and_reuses_it() -> None:
-    """No carrier and an empty carrier run the same chain and attend byte-identically;
-    the carrier then holds the indices the chain produced; a carrier handed those
-    indices skips the chain and attends the same way, and a different selection does
-    not (the reuse path consumes the carrier)."""
+    """No carrier and an empty carrier run the same selection and attend byte-identically;
+    the carrier then holds the indices the selection produced; a carrier handed those
+    indices skips the selection and attends the same way, and a different selection does
+    not (the reuse path consumes the carrier). The selection is the tip's kernel chain or
+    the fused decode kernel, whichever the tree has (``selection_is_fused``)."""
     _skip_unless_live()
     from vllm_neuron.model.glm5_next.model_fp8 import IndexShare
 
@@ -1030,7 +1031,7 @@ def test_index_share_carrier_publishes_the_chain_s_selection_and_reuses_it() -> 
     assert any(
         torch.is_tensor(c) and c.dtype == indices.dtype and c.shape == indices.shape and torch.equal(c, indices)
         for c in collected
-    ), "the stored indices are the ones the chain produced (the block's collector saw them)"
+    ), "the stored indices are the ones the selection produced (the block's collector saw them)"
     reset_all_counters()
     reused = one_step(fixtures[2], index_share=IndexShare(topk_indices=indices.clone()))
     assert read_selection_count() == 0, "a filled carrier skips the selection"
