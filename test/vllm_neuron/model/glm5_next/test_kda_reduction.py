@@ -143,6 +143,15 @@ def _zero_state(module: nn.Module) -> dict:
     }
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _as_built_wire():
+    """These checks hold the as-built fp32 reduction, so an exported
+    ``VLLM_NEURON_TP_ALLREDUCE_DTYPE`` (``collective_policy``) does not decide."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("VLLM_NEURON_TP_ALLREDUCE_DTYPE", "fp32")
+        yield
+
+
 @pytest.fixture(scope="module")
 def case() -> SimpleNamespace:
     """Drive the unsharded reference once, then each of the two ranks once."""

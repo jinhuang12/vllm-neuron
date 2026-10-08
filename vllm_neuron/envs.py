@@ -88,6 +88,11 @@ if TYPE_CHECKING:
     # Worker GC policy after warmup (vllm_neuron/vllm/worker/gc_policy.py):
     # "freeze_rare_gen2" (freeze + gen-2 threshold 100000), "freeze", or "off".
     VLLM_NEURON_GC_POLICY: str = "freeze_rare_gen2"
+    # GLM-5.3-Flash row-parallel all-reduce. Both defaults are the as-built path.
+    # The dtype a row-parallel partial crosses the wire in: "fp32" or "bf16".
+    VLLM_NEURON_TP_ALLREDUCE_DTYPE: str = "fp32"
+    # Keep every all-reduce one collective instead of the compiler's 8 MiB tiles.
+    VLLM_NEURON_TP_ALLREDUCE_FUSE: bool = False
 
 
 def maybe_convert_bool(value: str | None) -> bool | None:
@@ -389,6 +394,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ~11 bs=64 steps; "freeze" is the freeze alone; "off" keeps CPython's default GC.
     "VLLM_NEURON_GC_POLICY": lambda: os.getenv(
         "VLLM_NEURON_GC_POLICY", "freeze_rare_gen2"
+    ),
+    # ================== GLM-5.3-Flash Row-Parallel All-Reduce ==================
+    # The wire dtype of the tensor-parallel all-reduce at GLM-5.3-Flash's
+    # row-parallel sites (``model/glm5_next/collective_policy.py``). "fp32" (the
+    # default) reduces each rank's fp32 partial as computed; "bf16" rounds it to
+    # bfloat16 first, which halves the bytes every rank moves. Case and spaces are
+    # ignored; any other value is refused where it is read.
+    "VLLM_NEURON_TP_ALLREDUCE_DTYPE": lambda: (
+        os.getenv("VLLM_NEURON_TP_ALLREDUCE_DTYPE", "fp32").strip().lower()
+    ),
+    # "1" asks neuronx-cc to keep each all-reduce one collective. By default its
+    # SimpleAllReduceTiling pass splits an all-reduce larger than 8 MiB into up to
+    # four. Read by ``collective_policy.fuse_compiler_args``. Off by default.
+    "VLLM_NEURON_TP_ALLREDUCE_FUSE": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_TP_ALLREDUCE_FUSE")) or False
     ),
 }
 
