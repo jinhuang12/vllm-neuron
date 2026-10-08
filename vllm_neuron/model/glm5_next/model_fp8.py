@@ -266,6 +266,24 @@ def _resolve_tp_group() -> GroupCoordinator | None:
     return group if group.world_size > 1 else None
 
 
+def _tp_group_if_initialized() -> GroupCoordinator | None:
+    """:func:`_resolve_tp_group`, or None when vllm's tensor-parallel group does not exist.
+
+    Load time may run without one: a checkpoint loaded out of process for one rank of
+    a larger world (``test_tensor_parallel_shards.py``) has a world size and a rank but
+    no group. vllm signals the missing group with ``get_tp_group``'s assertion
+    ("tensor model parallel group is not initialized", ``distributed/parallel_state.py``);
+    only that refusal becomes None, so the forward's row-parallel sites, which call
+    :func:`_resolve_tp_group` directly, still refuse to reduce without a group.
+    """
+    try:
+        return _resolve_tp_group()
+    except AssertionError as refusal:
+        if "tensor model parallel group is not initialized" not in str(refusal):
+            raise
+        return None
+
+
 # --------------------------------------------------------------------------- #
 # which parameter families are sharded, and on which dim.
 #
@@ -4207,15 +4225,32 @@ class Glm5NextDSAIndexer(nn.Module):
         Bound here because preparation runs once per rank at load, outside any trace, on
         the device the forward reads its weights from. The index is ``rank_in_group`` of
         the same group the selection gathers over, so the rows a rank takes are the rows
-        the gather's group order puts back in place.
+        the gather's group order puts back in place. A load without a tensor-parallel
+        group (one rank of a larger world, loaded out of process) binds the rank the
+        loader sliced this rank's weights with, :func:`_resolve_rank`, so the indexer's
+        row shard stays aligned with the weight shards; an index outside the world is
+        refused by name.
         """
-        group = _resolve_tp_group()
-        rank = None
+        group = _tp_group_if_initialized()
+        world = _resolve_world_size()
         if group is not None:
-            rank = torch.full(
-                (1,), int(group.rank_in_group), dtype=torch.int32, device=device
-            )
-        setattr(self, self.SHARD_RANK_ATTR, rank)
+            index = int(group.rank_in_group)
+        elif world > 1:
+            index = int(_resolve_rank())
+            if not 0 <= index < world:
+                raise Glm5NextDSAIndexerError(
+                    f"no tensor-parallel group is initialized and the loader's rank "
+                    f"{index} lies outside its world of {world}, so the indexer's row "
+                    f"shard cannot be aligned with the weight shards"
+                )
+        else:
+            setattr(self, self.SHARD_RANK_ATTR, None)
+            return
+        setattr(
+            self,
+            self.SHARD_RANK_ATTR,
+            torch.full((1,), index, dtype=torch.int32, device=device),
+        )
 
     def _lowp_operand(self, name: str):
         """``(weight, scale)`` for the low-precision route, or None for the fp32 one."""
