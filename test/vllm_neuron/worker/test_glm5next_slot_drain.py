@@ -25,7 +25,11 @@ thread's wait has returned, that is when the execution is complete):
 3. without a pending step (synchronous scheduling, or the first step) nothing is drained
    and the slot is emptied exactly as before;
 4. a pending step the output thread has already read back costs the hand-out one idempotent
-   call and registers no waiter.
+   call and registers no waiter;
+5. against the real ``AsyncNeuronModelRunnerOutput`` holding an all-partial step whose future
+   is a tensor that counts its read-backs: two hand-outs in one step and the output thread's
+   own call read the future back once, and leave the step's sampled ids as the empty lists
+   the all-partial drain writes.
 
     NKI_SIMULATOR=1 VLLM_NEURON_CPU_MODE=1 python -m pytest \\
         test/vllm_neuron/worker/test_glm5next_slot_drain.py
@@ -36,14 +40,22 @@ from __future__ import annotations
 import pytest
 import torch
 
+from vllm.v1.outputs import ModelRunnerOutput
+
 from vllm_neuron.vllm.worker import glm5next_state_banks
-from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
+from vllm_neuron.vllm.worker.neuron_model_runner import (
+    AsyncNeuronModelRunnerOutput,
+    NeuronModelRunner,
+)
 
 pytestmark = [pytest.mark.fast, pytest.mark.forked]
 
 #: The runtime registers one completion handle per in-flight execution; a second waiter
 #: overwrites the first ("Completion handle already set for sequence ..., overwriting").
 HANDLES_PER_SEQUENCE = 1
+#: A step's future is read back from the device once; every later ``get_output`` sees the
+#: materialized lists and returns them.
+READBACKS_PER_STEP = 1
 SLOTS = 4
 LINEAR, SPARSE = 1, 2
 POOL = 4
@@ -93,6 +105,20 @@ class _PendingStep:
         self.calls += 1
         self.runtime.finish(self.sequence)
         return None
+
+
+class _Future(torch.Tensor):
+    """A sampled-token future that counts its device-to-host read-backs (``.cpu()``)."""
+
+    @staticmethod
+    def __new__(cls, data: torch.Tensor, log: list):
+        future = torch.Tensor._make_subclass(cls, data)
+        future.log = log
+        return future
+
+    def cpu(self, *args, **kwargs):
+        self.log.append("cpu")
+        return torch.Tensor.cpu(self, *args, **kwargs)
 
 
 def _banks() -> list[dict]:
@@ -218,3 +244,43 @@ def test_a_pending_step_already_read_back_costs_one_idempotent_call(monkeypatch)
     assert pending.calls == 1
     assert runtime.waiters == {}, "a completed execution takes no waiter"
     assert events == [("empty_slot", 0)] * (2 * SPARSE)
+
+
+def test_the_drain_through_the_real_async_output_reads_the_future_back_once(monkeypatch):
+    runtime = _Runtime()
+    events: list = []
+    readbacks: list = []
+    runner, banks, side = _runner(None)
+    _side_cache_reads(monkeypatch, runtime, None, events)
+    # The aborted request's intermediate chunk: every request of the step is partial, so
+    # ``get_output`` drains the future and writes empty lists (the all-partial branch).
+    pending = AsyncNeuronModelRunnerOutput(
+        model_runner_output=ModelRunnerOutput(
+            req_ids=["aborted"], req_id_to_index={"aborted": 0},
+            sampled_token_ids=_Future(torch.zeros(1, dtype=torch.int64), readbacks),
+        ),
+        model_runner=runner,
+        partial_prefill_req_ids={"aborted"},
+    )
+    assert pending.is_all_partial_prefill()
+    runner.use_async_scheduling = True
+    runner.async_execution_buffer = {"async_output": pending}
+    runner._glm5next_request_slot_table["aborted"] = 0
+    runner._glm5next_note_finished_requests(["aborted"])
+
+    slots = runner._glm5next_request_slots(
+        banks, ["new-a", "new-b"], synthetic=False, side_caches=side
+    )
+    assert not torch.is_tensor(pending.model_runner_output.sampled_token_ids), (
+        "the hand-out did not drain the pending step through get_output"
+    )
+    output_thread_view = pending.get_output()   # the output thread's own call, later
+
+    assert slots == [0, 1], "two hand-outs in one step, the aborted request's slot first"
+    assert readbacks == ["cpu"] * READBACKS_PER_STEP, (
+        f"the future was read back {len(readbacks)} times over two hand-outs and the output "
+        f"thread's call; every call after the first must find the materialized lists"
+    )
+    assert output_thread_view is pending.model_runner_output
+    assert output_thread_view.sampled_token_ids == [[] for _ in output_thread_view.req_ids]
+    assert events == [("empty_slot", 0)] * (2 * SPARSE) + [("empty_slot", 1)] * (2 * SPARSE)
