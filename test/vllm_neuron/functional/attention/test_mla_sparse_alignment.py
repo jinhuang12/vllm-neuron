@@ -431,7 +431,8 @@ _EXPECTED_HOST_SHAPED = {
 #: the module rather than copied, so an expression is evaluated with the arithmetic the
 #: kernel will trace. Absent names are left out.
 _MODULE_ARITHMETIC = ("_aligned", "DMA_TRANSPOSE_ALIGN", "STAGE_ALIGN", "DGE_TRANSPOSE_ROWS",
-                      "_queries_per_block", "_score_tiles", "_latent_tiles", "_output_tiles")
+                      "_queries_per_block", "_score_tiles", "_latent_tiles", "_output_tiles",
+                      "_softmax_rows", "SOFTMAX_ROWS")
 
 #: The element widths a staged destination can have: the seam hands 2-byte floats through
 #: and widens anything else to float32.
