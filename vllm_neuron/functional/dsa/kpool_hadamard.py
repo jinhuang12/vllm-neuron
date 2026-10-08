@@ -370,7 +370,7 @@ def _pool_block(slot_k_hbm, slot_score_hbm, out_hbm, biases, transform, block, p
 
     # Reciprocal then multiply: no engine divides one tile by another. Measured on trn2 at
     # every fp32 from 1 to 4, a 4-slot sum's whole range, the Scalar Engine's reciprocal is
-    # within 2.4e-5 relative of the exact one; the Vector Engine's is correctly rounded but
+    # within 1.2e-5 relative of the exact one; the Vector Engine's is correctly rounded but
     # takes about 6 cycles an element, and this kernel is bound by the Vector Engine.
     inv = nl.ndarray((rows, columns, head_dim), dtype=nl.float32, buffer=nl.sbuf)
     nisa.activation(dst=inv, op=nl.reciprocal, data=denom)
