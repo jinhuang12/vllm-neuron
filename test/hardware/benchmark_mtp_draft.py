@@ -7,9 +7,11 @@ not select cores. One graph per ``k`` in ``--ks``:
 unrolled in that one graph (the fused form of mtp.md 8.5), each iteration the whole of
 layer 45 at this rank's share:
 
-* the head's own arithmetic -- position-0 mask, ``enorm``, ``hnorm``, concat, ``eh_proj``
-  ([H, 2H] bf16, replicated), the shared-head norm, this rank's head rows ([2420, H] bf16)
-  and the greedy token;
+* the head's own arithmetic as its two kernels (``functional/mtp/``): K1' ``mtp_tail_in``
+  -- position-0 mask, ``enorm``, ``hnorm``, concat, ``eh_proj`` ([H, 2H] bf16, whole at this
+  one rank; the served line row-shards it) -- and K2 ``mtp_tail_out`` -- the shared-head
+  norm, this rank's head rows ([2420, H] bf16) and the ``(max, argmax)`` the greedy token
+  is read from;
 * the attention half -- ``Glm5NextDSALayer`` (one MLA head, latent 512, the indexer at 32
   heads, fp8 projections on a 128x128 scale grid) from ``dsa_decode_case.build_attention``,
   at ctx 1024 in the 2048-row window the serving line decodes in (the indexer bypass);
@@ -55,6 +57,7 @@ import torch  # noqa: E402
 
 import vllm_neuron  # noqa: E402,F401 -- registers the Neuron compilation backend
 from vllm_neuron.model.glm5_next import model_fp8, mtp  # noqa: E402
+from vllm_neuron.functional.mtp.common import launch_programs  # noqa: E402
 from vllm_neuron.model.glm5_next.config import Glm5NextConfig  # noqa: E402
 from vllm_neuron.model.glm5_next.weight_loaders_fp8 import FP8_SCALE_SUFFIX  # noqa: E402
 from test.vllm_neuron.functional.dsa import dsa_decode_case as case  # noqa: E402
@@ -73,6 +76,9 @@ LOCAL_EXPERTS = EXPERTS // EP_DEGREE  # 18
 LOCAL_INTERMEDIATE = 2048 // 4  # 512
 SHARED_INTERMEDIATE = 128  # 2048 / 64 = 32 rows, padded to one 128-wide scale block
 EXPERT_RANK = 5
+#: HBM bandwidth one LNC2 core draws, 716 GB/s: the basis of every entitlement in
+#: ``reports/mtp-head.md`` 9.2 (a weight-streaming kernel's entitlement is its bytes over it).
+HBM_BYTES_PER_US_PER_CORE = 716e9 / 1e6
 #: The pinned checkpoint config the quantisation policy (fp8, 128x128 blocks) is read from.
 FIXTURE_CONFIG = ROOT / "test" / "vllm_neuron" / "model" / "glm5_next" / "fixtures" / "config.json"
 #: The served model's neuronx-cc arguments (``benchmark_moe_decode.MODEL_COMPILER_ARGS``);
@@ -199,8 +205,35 @@ def materialise_moe(mlp, cfg, seed: int, device) -> None:
         ((torch.rand(EXPERTS, generator=gen) - 0.5) * 0.1).to(device), requires_grad=False)
 
 
-def build_head(cfg, seed: int, device):
-    """The head under test: layer 45 with a real-shape attention half and this rank's MoE share."""
+class _LayerInputGatherEmulation:
+    """Stands in for the tensor-parallel group at one rank when the head runs the served
+    rank's ``eh_proj`` row shard (``--eh-proj-world``).
+
+    ``all_gather`` of the layer-input slice ``[B, H / world]`` tiles it ``world`` times to
+    ``[B, H]`` -- the bytes and shapes of the served rank's work without the collective
+    (the real 8 KiB per-rank all-gather is the TP=64 gate's to measure); the drafted ids
+    are therefore a timing proxy, not the model's. Any other tensor (the draft token's
+    ``[B, 2]`` pair) passes through unchanged, and the object carries no ``world_size``,
+    so ``draft_token_ids`` keeps its one-rank form (the owner select over 64 pairs is O(B)
+    bookkeeping, exempt-but-listed in the report).
+    """
+
+    def __init__(self, world: int, hidden: int) -> None:
+        self.world, self.hidden = int(world), int(hidden)
+
+    def all_gather(self, x: torch.Tensor, dim: int) -> torch.Tensor:
+        if int(x.shape[dim]) * self.world == self.hidden:
+            return torch.cat([x] * self.world, dim=dim)
+        return x
+
+
+def build_head(cfg, seed: int, device, eh_proj_world: int = 1, eh_proj_rank: int = 0):
+    """The head under test: layer 45 with a real-shape attention half and this rank's MoE share.
+
+    ``eh_proj_world`` > 1 gives the head the served rank's ``[H / world, 2H]`` row shard of
+    ``eh_proj`` (rank ``eh_proj_rank``'s rows) and the gather emulation above; the block
+    itself stays the one-rank build (its own collectives are not the question here).
+    """
     tables = head_tables(cfg, seed, device)
     head = mtp.Glm5NextMultiTokenPredictor(
         cfg,
@@ -211,6 +244,18 @@ def build_head(cfg, seed: int, device):
     )
     for name in mtp.HEAD_PARAMETER_NAMES:
         setattr(head, name, torch.nn.Parameter(tables[name].clone(), requires_grad=False))
+    if eh_proj_world > 1:
+        from vllm_neuron.functional.mtp.tail_in import eh_proj_shard_rows
+        hidden = int(cfg.hidden_size)
+        rows = eh_proj_shard_rows(hidden, eh_proj_world)  # refuses a world that does not divide H
+        if not 0 <= eh_proj_rank < eh_proj_world:
+            raise ValueError(f"eh_proj_rank {eh_proj_rank} outside world {eh_proj_world}")
+        # Sliced on the host: an eager slice + clone of a device-resident tensor failed in the
+        # runtime's tensor copy (nrt_tensor_copy status=2) on the first device run.
+        shard = tables["eh_proj_weight"].to("cpu")[eh_proj_rank * rows:(eh_proj_rank + 1) * rows].contiguous()
+        head.eh_proj_weight = torch.nn.Parameter(shard.to(device), requires_grad=False)
+        head.world_size = int(eh_proj_world)
+        head._tp_group = lambda: _LayerInputGatherEmulation(eh_proj_world, hidden)
     block = head.block
     gen = torch.Generator().manual_seed(seed + 1)
     hidden = int(cfg.hidden_size)
@@ -282,7 +327,7 @@ def run_null(args, cfg, device) -> dict:
 
 def run_k(k: int, args, cfg, qc, device) -> dict:
     torch._dynamo.reset()
-    head = build_head(cfg, args.seed, device)
+    head = build_head(cfg, args.seed, device, args.eh_proj_world, args.eh_proj_rank)
     inputs = step_inputs(cfg, args.seed + 11, device)
     carrier, statics = block_operands(cfg, args.seed + 99, device)
     step = make_step(head, qc, k, statics)
@@ -306,7 +351,11 @@ def run_k(k: int, args, cfg, qc, device) -> dict:
         "max_seq_len": MAX_SEQ_LEN, "first_call_s": first_call_s,
         "ids": ids.tolist(), "margin_share": margins,
         "hidden_rows": hiddens.reshape(k, -1).float().tolist(),
-        "unit": f"one fused draft of k={k} iterations (layer 45 attention + MoE halves, head, token) for 1 request",
+        "eh_proj_rows": int(head.eh_proj_weight.shape[0]),
+        "eh_proj_world": args.eh_proj_world,
+        "unit": f"one fused draft of k={k} iterations (layer 45 attention + MoE halves, head, token) for 1 request"
+                + (f"; eh_proj as the served rank's {int(head.eh_proj_weight.shape[0])}-row shard with the layer-input "
+                   f"gather emulated by tiling (timing proxy: ids are not the model's)" if args.eh_proj_world > 1 else ""),
     }
     if args.mode == "device":
         result["timing"] = measure(fn, operands, args.warmup, args.iterations)
@@ -315,16 +364,26 @@ def run_k(k: int, args, cfg, qc, device) -> dict:
 
 
 def run_ops(args, cfg, qc, device) -> dict:
-    """One draft iteration at B=1 as six separately compiled pieces, each fed the tensors
-    the previous piece produced (so the MoE routes real activations), timed one by one.
+    """One draft iteration at B=1 as separately compiled pieces, each fed the tensors the
+    previous piece produced (so the MoE routes real activations), timed one by one.
 
-    Each piece carries its own launch floor (the ``null`` graph), so the floor is
-    reported beside the raw medians; the fused k=1 graph timed on the same inputs is
-    the whole the pieces are compared with. At one rank the token route is the plain
-    argmax (``draft_token_ids``' whole-head branch): piece 6 times the sharded route's
-    arithmetic with the gather elided (``world`` 1), so it is the select without the
-    TP collective.
+    The tail pieces are the two authored kernels (``functional/mtp/``): K1'
+    ``mtp_tail_in`` (embedding gather, mask, ``enorm``/``hnorm``, concat, ``eh_proj``) and
+    K2 ``mtp_tail_out`` (residual add, shared-head norm, this rank's 2420 head rows,
+    ``(max, argmax)``). K1' is timed twice: as the chain runs it at one rank (the whole
+    ``[H, 2H]`` ``eh_proj``, the same bytes Stage A's replicated tail streamed, so the
+    chain compares like for like) and standalone at the served per-rank shape (the
+    64-row shard, the kernel's own entitlement; its all-gather needs the 64-rank group
+    and is the gate trace's). Each weight-streaming piece carries its bytes and its
+    entitlement, ``bytes / HBM_BYTES_PER_US_PER_CORE``; the device run adds the measured
+    median and the ratio. Each piece also carries its own launch floor (the ``null``
+    graph), so the floor is reported beside the raw medians; the fused k=1 graph timed
+    on the same inputs is the whole the pieces are compared with. At one rank the token
+    route is the whole-head branch of ``draft_token_ids`` (the gather elided).
     """
+    from vllm_neuron.functional.draft_token import draft_token_ids
+    from vllm_neuron.functional.mtp import tail_in, tail_out
+
     torch._dynamo.reset()
     head = build_head(cfg, args.seed, device)
     hidden, sampled, positions = step_inputs(cfg, args.seed + 11, device)
@@ -333,9 +392,17 @@ def run_ops(args, cfg, qc, device) -> dict:
                         expert_parallel_rank=EXPERT_RANK)
     gain = head.shared_head_norm_weight
     lm_head = head._lm_head()
+    table = head._embed_tokens()
+    eps = float(cfg.rms_norm_eps)
+    shard_rows = tail_in.eh_proj_shard_rows(int(cfg.hidden_size), TP_WORLD)
+    eh_proj_shard = head.eh_proj_weight[:shard_rows].contiguous()
 
-    def layer_input(token, previous, pos):  # enorm/hnorm + cat + eh_proj (embedding gather included)
+    def layer_input(token, previous, pos):  # K1' as the chain runs it at one rank: whole eh_proj
         return head._layer_input(token, previous, pos)
+
+    def layer_input_shard(token, previous, pos):  # K1' at the served per-rank shape: 64 rows
+        return tail_in.mtp_tail_in(token, table, pos, previous, head.enorm_weight,
+                                   head.hnorm_weight, eh_proj_shard, eps=eps)
 
     def attention(x, *flat):  # layer 45's attention half, the trunk's DSA kernels
         kwargs = dict(zip(BLOCK_NAMES, flat))
@@ -345,28 +412,30 @@ def run_ops(args, cfg, qc, device) -> dict:
     def ffn(attended):  # post-attention norm + MoE (router, routed bank, shared expert) + reduce
         return head._ffn_half(attended, **ffn_keywords)
 
-    def shared_head_norm(attended, ffn_out):  # residual add + shared-head norm
-        return head._rms_norm(attended + ffn_out, gain)
+    def tail(attended, ffn_out):  # K2: residual add + shared-head norm + 2420-row logits + (max, argmax)
+        return tail_out.mtp_tail_out(attended, ffn_out, gain, lm_head, eps=eps)
 
-    def logits(rows):  # the vocab-shard head linear, 2420 rows at one rank
-        return torch.nn.functional.linear(rows.to(lm_head.dtype), lm_head).to(torch.float32)
+    def select(pair):  # the owner select; the TP gather elided at one rank (whole-head branch)
+        return draft_token_ids(pair, shard_rows=int(lm_head.shape[0]), vocab_size=int(cfg.vocab_size),
+                               group=None)
 
-    def select(shard_logits):  # (max, argmax) pair -> owner -> global id, the TP gather elided
-        local_max, local_arg = shard_logits.max(dim=-1)
-        pair = torch.stack([local_max, local_arg.to(torch.float32)], dim=-1)
-        owner = pair[:, 0::2].argmax(dim=-1)
-        local = torch.gather(pair[:, 1::2], 1, owner.reshape(-1, 1)).reshape(-1).to(torch.int64)
-        return (owner * int(lm_head.shape[0]) + local).to(torch.int32)
-
-    pieces = [("3 enorm/hnorm+cat+eh_proj", layer_input), ("1 attention half", attention),
-              ("2 _ffn_half (norm+MoE+reduce)", ffn), ("6 residual+shared_head.norm", shared_head_norm),
-              ("4 vocab-shard logits linear", logits), ("5 (max,argmax)+select", select)]
+    weight_bytes = {
+        "3 K1' mtp_tail_in (whole eh_proj, as the one-rank chain runs it)": head.eh_proj_weight.numel() * 2,
+        "3s K1' mtp_tail_in (64-row eh_proj shard, served per-rank)": eh_proj_shard.numel() * 2,
+        "4 K2 mtp_tail_out (residual+norm+2420-row logits+(max,argmax))": lm_head.numel() * 2,
+    }
+    pieces = [("3 K1' mtp_tail_in (whole eh_proj, as the one-rank chain runs it)", layer_input),
+              ("3s K1' mtp_tail_in (64-row eh_proj shard, served per-rank)", layer_input_shard),
+              ("1 attention half", attention),
+              ("2 _ffn_half (norm+MoE+reduce)", ffn),
+              ("4 K2 mtp_tail_out (residual+norm+2420-row logits+(max,argmax))", tail),
+              ("5 draft_token_ids (owner select, gather elided at one rank)", select)]
     wrap = (lambda f: f) if args.mode == "sim" else compiled
     fns = {name: wrap(fn) for name, fn in pieces}
     chain = {}
-    chain["3 enorm/hnorm+cat+eh_proj"] = (sampled, hidden, positions)
+    chain[pieces[0][0]] = (sampled, hidden, positions)
+    chain[pieces[1][0]] = (sampled, hidden, positions)
     results = []
-    x = None
     for name, _ in pieces:
         fn = fns[name]
         inputs = chain[name]
@@ -374,27 +443,41 @@ def run_ops(args, cfg, qc, device) -> dict:
         out = fn(*inputs)
         _sync(out)
         first_call_s = time.perf_counter() - started
-        if name.startswith("3"):
-            x = out
-            chain["1 attention half"] = (x, *carrier)
+        if name.startswith("3 "):
+            chain["1 attention half"] = (out, *carrier)
+        elif name.startswith("3s"):
+            if tuple(out.shape) != (1, shard_rows):
+                raise AssertionError(f"the shard piece returned {tuple(out.shape)}, expected (1, {shard_rows})")
         elif name.startswith("1"):
             attended = out
             chain["2 _ffn_half (norm+MoE+reduce)"] = (attended,)
         elif name.startswith("2"):
-            chain["6 residual+shared_head.norm"] = (attended, out)
-        elif name.startswith("6"):
-            chain["4 vocab-shard logits linear"] = (out,)
+            chain[pieces[4][0]] = (attended, out)
         elif name.startswith("4"):
-            chain["5 (max,argmax)+select"] = (out,)
+            chain[pieces[5][0]] = (out[1],)
         result = {"op": name, "first_call_s": first_call_s}
+        if name in weight_bytes:
+            result["weight_bytes"] = weight_bytes[name]
+            result["entitlement_us"] = weight_bytes[name] / HBM_BYTES_PER_US_PER_CORE
         if args.mode == "device":
             result["timing"] = measure(fn, inputs, args.warmup, args.iterations)
+            if name in weight_bytes:
+                result["ratio_to_entitlement"] = result["timing"]["median_us"] / result["entitlement_us"]
         results.append(result)
     token = int(out.cpu().reshape(-1)[0])
+    # The tail pair (K1' at the served shard + K2) against its summed entitlement: the bar
+    # mtp-head.md 9.2 states for the two kernels together (x1.5 of the sum).
+    pair = [r for r in results if r["op"].startswith(("3s", "4 "))]
+    tail_pair = {"ops": [r["op"] for r in pair],
+                 "entitlement_us": sum(r["entitlement_us"] for r in pair)}
+    if args.mode == "device":
+        tail_pair["median_us"] = sum(r["timing"]["median_us"] for r in pair)
+        tail_pair["ratio_to_entitlement"] = tail_pair["median_us"] / tail_pair["entitlement_us"]
     del fns, head
     return {"graph": "ops", "batch": 1, "ctx": CONTEXT, "window_rows": WINDOW_PAGES * case.PAGE,
-            "pieces": results, "token": token,
-            "unit": "one draft iteration at B=1 as six separately compiled graphs on the same inputs"}
+            "pieces": results, "tail_pair": tail_pair, "token": token,
+            "hbm_bytes_per_us_per_core": HBM_BYTES_PER_US_PER_CORE,
+            "unit": "one draft iteration at B=1 as separately compiled graphs on the same inputs"}
 
 
 def compare(device_path: Path, sim_path: Path) -> dict:
@@ -420,10 +503,14 @@ def main() -> None:
     parser.add_argument("--ks", type=int, nargs="+", default=[1, 5])
     parser.add_argument("--null", action="store_true", help="also time the launch-floor graph")
     parser.add_argument("--ops", action="store_true",
-                        help="also time one draft iteration as six separately compiled pieces")
+                        help="also time one draft iteration as separately compiled pieces (the two tail kernels among them)")
     parser.add_argument("--hidden", type=int, default=4096)
     parser.add_argument("--q-lora", type=int, default=1536)
     parser.add_argument("--seed", type=int, default=7_000)
+    parser.add_argument("--eh-proj-world", type=int, default=1,
+                        help="run the fused chain with the served rank's eh_proj row shard [H/world, 2H] and a tiled "
+                             "stand-in for the layer-input all-gather (timing proxy, see _LayerInputGatherEmulation)")
+    parser.add_argument("--eh-proj-rank", type=int, default=0, help="which rank's eh_proj rows the shard holds")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--output", type=Path)
@@ -445,6 +532,9 @@ def main() -> None:
         "environment": {k: os.environ.get(k) for k in (
             "NEURON_RT_VISIBLE_CORES", "NEURON_LOGICAL_NC_CONFIG", "NEURON_LIBTORCH_CACHE_ROOT",
             "NKI_SIMULATOR", "VLLM_NEURON_CPU_MODE", "NEURON_CC_FLAGS")},
+        # The program count the two tail kernels dispatch at (2 = the LNC2 split with the sendrecv
+        # combine), so a run's JSON says which kernel variant it timed.
+        "launch_programs": launch_programs(),
         "compiler_args": compiler_args() if args.mode == "device" else None,
         "cores": "neuron:0 = 1 logical core (LNC2) of the leased slice" if args.mode == "device" else "cpu",
         "args": vars(args) | {"output": str(args.output), "compare": None},
@@ -479,7 +569,7 @@ def main() -> None:
         ops = run_ops(args, cfg, qc, device)
         k1 = next((c for c in report["cases"] if c.get("graph") == "draft_tokens" and c["k"] == 1), None)
         if k1 is not None and ops["token"] != int(k1["ids"][0][0]):
-            raise AssertionError(f"the six pieces drafted {ops['token']}; the fused k=1 graph {k1['ids'][0][0]}")
+            raise AssertionError(f"the pieces drafted {ops['token']}; the fused k=1 graph {k1['ids'][0][0]}")
         report["cases"].append(ops)
         flush()
     if args.mode == "device":

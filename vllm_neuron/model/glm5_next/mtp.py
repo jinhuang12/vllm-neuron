@@ -11,7 +11,9 @@ the four and the arithmetic around the layer:
 * the embedding of the next token, masked at absolute position 0 (no previous
   token to draft from), normalised by ``enorm``; the trunk's post-final-norm hidden
   row normalised by ``hnorm``; the two concatenated (embedding first) and projected
-  from ``2H`` to ``H`` by ``eh_proj``;
+  from ``2H`` to ``H`` by ``eh_proj`` -- one authored kernel per rank over this
+  rank's ``H / world`` rows of ``eh_proj`` (``functional/mtp/tail_in.py``), then one
+  all-gather of the ``[B, H / world]`` slices;
 * the decoder block: the attention half through ``Glm5NextDSALayer.forward`` (which
   writes layer 45's latent row, pooled store and tail ring) and the feed-forward
   half through the trunk's own ``Glm5NextModel._ffn_half`` (post-attention norm,
@@ -20,10 +22,11 @@ the four and the arithmetic around the layer:
   the right one and ``_mhc_site`` agrees;
 * the shared-head norm, whose output is both the hidden state the next draft
   iteration feeds to ``hnorm`` (upstream GLM5 returns the normed vector as both of
-  its outputs) and the row the head projects;
-* the greedy token, TP-correct: this rank's vocab-shard logits, its ``(max, argmax)``
-  pair, one all-gather over the group, and the global id of the winning rank
-  (``functional/draft_token.py``).
+  its outputs) and the row the head projects, and this rank's vocab-shard logits
+  with their ``(max, argmax)`` pair -- the residual add, the norm, the logits GEMV
+  and the pair are one authored kernel (``functional/mtp/tail_out.py``);
+* the greedy token, TP-correct: one all-gather of the pair over the group and the
+  global id of the winning rank (``functional/draft_token.py``).
 
 Two entry points, the Stage A contract (C3):
 
@@ -301,26 +304,43 @@ class Glm5NextMultiTokenPredictor(nn.Module):
     ) -> torch.Tensor:
         """``eh_proj(cat(enorm(mask(embed(token))), hnorm(previous)))``: ``[B, H]``.
 
-        The concatenation order is load-bearing: the embedding half first, the
-        previous hidden state second, because ``eh_proj_weight``'s columns are the
-        checkpoint's in that order. The embedding is zeroed wherever the absolute
-        position is 0 -- there is no previous token to draft from -- as upstream does.
+        One kernel launch per rank (``functional/mtp/tail_in.py``: the embedding
+        gather, the position-0 mask, both norms, the concatenation and this rank's
+        ``H / world`` rows of ``eh_proj``), then one all-gather of the ``[B, H / world]``
+        slices along the last dimension -- rank order is row order -- or no collective
+        at one rank, where the rows are the whole ``eh_proj``. The concatenation order
+        is load-bearing: the embedding half first, the previous hidden state second,
+        because ``eh_proj_weight``'s columns are the checkpoint's in that order. The
+        embedding is zeroed wherever the absolute position is 0 -- there is no previous
+        token to draft from -- as upstream does.
+
+        Raises:
+            ValueError: when ``eh_proj_weight`` is not this rank's row shard (the
+                loader's ``model_fp8._SHARD_GEOMETRY`` entry for this class).
         """
+        from vllm_neuron.functional.mtp.tail_in import eh_proj_shard_rows, mtp_tail_in
+
         table = self._require("embedding table", self._embed_tokens())
-        embeds = table[token_ids.to(torch.int64)]
-        embeds = torch.where(
-            positions.reshape(-1, 1) == 0,
-            torch.zeros((), dtype=embeds.dtype, device=embeds.device),
-            embeds,
+        eh_proj_rows = self._require("eh_proj_weight", self.eh_proj_weight)
+        shard = eh_proj_shard_rows(self.hidden_size, self.world_size)
+        if int(eh_proj_rows.shape[0]) != shard:
+            raise ValueError(
+                f"eh_proj_weight holds {int(eh_proj_rows.shape[0])} rows; this rank's row "
+                f"shard at world size {self.world_size} is {shard} of {self.hidden_size}"
+            )
+        slice_ = mtp_tail_in(
+            token_ids.to(torch.int32),
+            table,
+            positions.to(torch.int32),
+            previous_hidden.to(table.dtype),
+            self._require("enorm_weight", self.enorm_weight),
+            self._require("hnorm_weight", self.hnorm_weight),
+            eh_proj_rows,
+            eps=float(self.text_config.rms_norm_eps),
         )
-        embeds = self._rms_norm(embeds, self._require("enorm_weight", self.enorm_weight))
-        previous = self._rms_norm(
-            previous_hidden.to(embeds.dtype), self._require("hnorm_weight", self.hnorm_weight)
-        )
-        joined = torch.cat([embeds, previous], dim=-1)
-        return torch.nn.functional.linear(
-            joined, self._require("eh_proj_weight", self.eh_proj_weight)
-        )
+        if self.world_size == 1:
+            return slice_
+        return self._tp_group().all_gather(slice_, dim=-1)
 
     def _ffn_half(
         self,
@@ -561,9 +581,12 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         group = self._tp_group()
         share = self._index_share(k)
         from vllm_neuron.functional.draft_token import draft_token_ids
+        from vllm_neuron.functional.mtp.tail_out import mtp_tail_out
 
         block = getattr(self, BLOCK_ATTR)
         gain = self._require("shared_head_norm_weight", self.shared_head_norm_weight)
+        eps = float(self.text_config.rms_norm_eps)
+        shard_rows = int(head.shape[0])
         ffn_keywords = {
             "quant_config": quant_config,
             "block_size": block_size,
@@ -587,11 +610,16 @@ class Glm5NextMultiTokenPredictor(nn.Module):
             )
             # The residual add is the caller's at the feed-forward site, as it is in
             # the stack; here it is the plain add, because layer 45 has no mHC site.
-            mixed = attended + self._ffn_half(attended, **ffn_keywords)
-            hidden = self._rms_norm(mixed, gain)
+            # The add, the shared-head norm, this rank's shard logits and their
+            # (max, argmax) pair are one kernel (functional/mtp/tail_out.py).
+            hidden, pair = mtp_tail_out(
+                attended, self._ffn_half(attended, **ffn_keywords), gain, head, eps=eps
+            )
             if draft_collector is not None:
                 draft_collector.append(hidden)
-            token = draft_token_ids(hidden, head, vocab_size=self.vocab_size, group=group)
+            token = draft_token_ids(
+                pair, shard_rows=shard_rows, vocab_size=self.vocab_size, group=group
+            )
             drafts.append(token)
             previous = hidden
         return torch.stack(drafts, dim=1)
