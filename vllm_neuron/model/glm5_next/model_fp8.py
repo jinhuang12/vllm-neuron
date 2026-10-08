@@ -9695,9 +9695,13 @@ class Glm5NextForConditionalGeneration(nn.Module):
             # row's id; the sampled rows (the chunk's last real row) pair with the
             # boundary id, or with the id sampled here when the boundary is -1.
             tokens = int(input_ids.shape[0])
-            start = torch.as_tensor(
-                draft_carrier["start_position"], device=input_ids.device
-            ).reshape(-1)[0].to(torch.int32)
+            start_position = draft_carrier["start_position"]
+            if not torch.is_tensor(start_position):
+                # A number is factory-built so a trace keeps it fake (``_int64_scalar``).
+                start_position = _int64_scalar(start_position, input_ids.device)
+            start = start_position.reshape(-1)[0].to(
+                device=input_ids.device, dtype=torch.int32
+            )
             positions = start + torch.arange(
                 tokens, dtype=torch.int32, device=input_ids.device
             )
@@ -9725,9 +9729,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
         else:
             # Decode leg: the selected rows are one per request, at the request's
             # position; iteration 0 of the draft populates the draft layer there.
-            positions = torch.as_tensor(
-                draft_carrier["position"], device=input_ids.device
-            ).reshape(-1).to(torch.int32)
+            position = draft_carrier["position"]
+            if not torch.is_tensor(position):
+                position = _int64_scalar(position, input_ids.device)
+            positions = position.reshape(-1).to(device=input_ids.device, dtype=torch.int32)
             if positions.numel() == 1 and rows_out > 1:
                 positions = positions.expand(rows_out)
             draft_ids = draft_head.draft_tokens(
