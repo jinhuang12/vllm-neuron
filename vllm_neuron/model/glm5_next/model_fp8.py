@@ -3055,6 +3055,15 @@ def _checkpoint_row_tensor(checkpoint_rows, requests: int, device: torch.device)
     return torch.tensor(counts, dtype=torch.int64, device=device)
 
 
+def _pad_token_rows(rows: torch.Tensor, requests: int, tokens: int, total: int) -> torch.Tensor:
+    """``[B*tokens, W]`` request-major rows padded to ``[B*total, W]`` with zero rows after each
+    request's real ones (the kernel's masked padding rows)."""
+    width = int(rows.shape[1])
+    kept = rows.reshape(requests, tokens, width)
+    pad = rows.new_zeros((requests, total - tokens, width))
+    return torch.cat([kept, pad], dim=1).reshape(requests * total, width)
+
+
 def _checkpoint_rows_of_views(views, checkpoint_rows) -> torch.Tensor:
     """Row ``checkpoint_rows[b]`` of each request's ``[T, ...]`` checkpoint view, as ``[B, ...]``.
 
@@ -3303,10 +3312,12 @@ class Glm5NextKDAAttention(nn.Module):
                 with ``checkpoints``): a view carrier is then ``[1 + k, ...]`` and a
                 bank ``[slots, 1 + k, ...]``, and a decode step carries exactly
                 ``1 + k`` tokens per request (the last sampled token and the ``k``
-                drafts, request-major rows). The step reads the row of
+                drafts, request-major rows), or fewer. The step reads the row of
                 ``checkpoint_rows`` and writes every row as that token's checkpoint
                 (:func:`~vllm_neuron.functional.kda.fused_decode.kda_fused_decode_tstep`).
-                ``None`` is the plain server: one row per slot, one token per request.
+                A step carries ``1 .. 1 + k`` tokens per request (a short one is padded
+                inside; the slot is always written whole). ``None`` is the plain server:
+                one row per slot, one token per request.
             checkpoint_rows: with ``state_checkpoints``, the checkpoint row each
                 request starts from -- what the previous verify step's
                 :func:`~vllm_neuron.functional.kda.fused_decode.commit_kda_checkpoints`
@@ -3812,9 +3823,14 @@ class Glm5NextKDAAttention(nn.Module):
         ``[slots, 1 + k, ...]``. The step gathers row ``checkpoint_rows[b]`` of each
         request (``fused_decode.kda_checkpoint_rows``; a read through a flat view) and
         writes all ``1 + k`` rows of the slot -- a whole-view ``copy_`` or a whole-slot
-        ``index_copy_`` on the bank, the two writes the backend keeps -- so the step
-        carries exactly ``state_checkpoints`` tokens per request and is refused
-        otherwise.
+        ``index_copy_`` on the bank, the two writes the backend keeps. A step carries
+        ``1 .. 1 + k`` tokens per request; a short step (no drafts after a prefill, or
+        the drafts trimmed at ``max_model_len``) runs the kernel at ``1 + k`` rows with
+        masked padding rows, so the slot is still written whole and the rows past the
+        last token repeat its checkpoint (the runner records row ``tokens - 1``). The
+        whole-slot write means a bucket padding row's slot is rewritten too, with the
+        state of the row it read: such a row names a slot no live request owns, or
+        carries that owner's live row.
         """
         from vllm_neuron.functional.kda.fused_decode import (
             kda_checkpoint_rows,
@@ -3847,11 +3863,11 @@ class Glm5NextKDAAttention(nn.Module):
             lead: tuple[int, ...] = ()
         else:
             checkpoints = int(state_checkpoints)
-            if tokens != checkpoints:
+            if not 1 <= tokens <= checkpoints:
                 raise ValueError(
-                    f"a speculative step writes every checkpoint row of its slot, so it "
-                    f"carries exactly state_checkpoints = {checkpoints} token(s) per "
-                    f"request; this call holds {tokens}"
+                    f"a slot holds state_checkpoints = {checkpoints} checkpoint row(s), one "
+                    f"per token of a verify step, so a step on checkpoint carriers carries "
+                    f"1 .. {checkpoints} token(s) per request; this call holds {tokens}"
                 )
             lead = (checkpoints,)
         conv_row = (*lead, *self.kda_conv_state_shape)
@@ -3948,9 +3964,37 @@ class Glm5NextKDAAttention(nn.Module):
         )
         if state_checkpoints is None:
             fused = kda_fused_decode(*projections, **operands)
+            core = fused.core
             advanced = (fused.conv_state, fused.recurrent_state)
         else:
+            if tokens < checkpoints:
+                # A short step (fewer tokens than the slot holds rows): the kernel is
+                # run at the slot's row count with masked padding rows after the real
+                # ones, so the slot is still written whole and the rows past the last
+                # token repeat its checkpoint. The padding rows' operands are zeros;
+                # masked, they leave the state and the conv history where they stand.
+                projections = tuple(
+                    _pad_token_rows(one, requests, tokens, checkpoints) for one in projections
+                )
+                real = operands["real_tokens"]
+                operands["real_tokens"] = (
+                    hidden_states.new_full((requests, 1), tokens, dtype=torch.int32)
+                    if real is None else real
+                )
+                mask = operands["row_mask"]
+                mask = (
+                    hidden_states.new_ones((requests, tokens), dtype=torch.float32)
+                    if mask is None else mask.reshape(requests, tokens).to(torch.float32)
+                )
+                operands["row_mask"] = torch.cat(
+                    [mask, mask.new_zeros((requests, checkpoints - tokens))], dim=1
+                )
             fused = kda_fused_decode_tstep(*projections, **operands)
+            core = fused.core
+            if tokens < checkpoints:
+                core = core.reshape(requests, checkpoints, -1)[:, :tokens].reshape(
+                    requests * tokens, -1
+                )
             advanced = (fused.conv_checkpoints, fused.recurrent_checkpoints)
         for bank, new_rows in zip((convs, recurrents), advanced):
             if state_slots is None:
@@ -3958,7 +4002,7 @@ class Glm5NextKDAAttention(nn.Module):
                     bank[index].copy_(new_rows[index])
             else:
                 scatter_bank_rows(bank, state_slots, new_rows)
-        return self._gated_output(fused.core, out_gate, hidden_states)
+        return self._gated_output(core, out_gate, hidden_states)
 
     def _gated_output(
         self, core: torch.Tensor, out_gate: torch.Tensor, hidden_states: torch.Tensor

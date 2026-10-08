@@ -110,7 +110,7 @@ def _case(module, hidden, batch, tokens=TOKENS):
         (BANK_SLOTS, *module.kda_recurrent_state_shape), generator=gen
     ).to(module.kda_recurrent_state_dtype) * 0.1
     hidden_states = torch.randn(batch * tokens, hidden, generator=gen)
-    accepted = torch.tensor([0, tokens - 1, 1, 2][:batch], dtype=torch.int32)
+    accepted = torch.tensor([0, TOKENS - 1, 1, 2][:batch], dtype=torch.int32)
     if batch == 1:
         return dict(
             hidden_states=hidden_states, conv_bank=conv_bank, rec_bank=rec_bank,
@@ -122,7 +122,8 @@ def _case(module, hidden, batch, tokens=TOKENS):
     return dict(
         hidden_states=hidden_states, conv_bank=conv_bank, rec_bank=rec_bank,
         start_position=torch.tensor([0, 9, 3, 12], dtype=torch.int32),
-        real=torch.tensor([tokens, 2, 0, 1], dtype=torch.int32), accepted=accepted,
+        real=torch.tensor([tokens, 2, 0, 1], dtype=torch.int32).clamp(max=tokens),
+        accepted=accepted,
     )
 
 
@@ -158,7 +159,7 @@ def _chained_reference(module, case, batch, tokens=TOKENS):
     return outputs, conv_ckpts, rec_ckpts
 
 
-def _checkpoint_banks(case, batch, tokens=TOKENS):
+def _checkpoint_banks(case, batch, checkpoints=TOKENS):
     """``[slots, T, ...]`` banks: the entering state at row ``accepted``, NaN elsewhere.
 
     The step reads only the accepted row and overwrites every row of the slot, so
@@ -166,8 +167,8 @@ def _checkpoint_banks(case, batch, tokens=TOKENS):
     write; the slots no request holds keep their bytes.
     """
     gen = torch.Generator().manual_seed(8400 + batch)
-    conv = torch.randn((BANK_SLOTS, tokens, *case["conv_bank"].shape[1:]), generator=gen)
-    rec = torch.randn((BANK_SLOTS, tokens, *case["rec_bank"].shape[1:]), generator=gen)
+    conv = torch.randn((BANK_SLOTS, checkpoints, *case["conv_bank"].shape[1:]), generator=gen)
+    rec = torch.randn((BANK_SLOTS, checkpoints, *case["rec_bank"].shape[1:]), generator=gen)
     conv = conv.to(case["conv_bank"].dtype)
     rec = rec.to(case["rec_bank"].dtype)
     for b, slot in enumerate(SLOTS[:batch]):
@@ -187,8 +188,8 @@ def _padding(case, batch, tokens=TOKENS):
     return {"real_tokens": real.reshape(batch, 1), "row_mask": mask.reshape(batch, tokens, 1)}
 
 
-def _step(module, case, batch, *, bank_form, accepted, tokens=TOKENS):
-    conv, rec = _checkpoint_banks(case, batch, tokens)
+def _step(module, case, batch, *, bank_form, accepted, tokens=TOKENS, checkpoints=TOKENS):
+    conv, rec = _checkpoint_banks(case, batch, checkpoints)
     slots = torch.tensor(SLOTS[:batch], dtype=torch.int64)
     if bank_form:
         carriers = dict(conv_state=conv, recurrent_state=rec, state_slots=slots)
@@ -203,7 +204,7 @@ def _step(module, case, batch, *, bank_form, accepted, tokens=TOKENS):
         is_prefill=False,
         start_position=case["start_position"],
         checkpoint_rows=accepted,
-        state_checkpoints=tokens,
+        state_checkpoints=checkpoints,
         **carriers,
         **_padding(case, batch, tokens),
     )
@@ -293,6 +294,37 @@ def test_verify_step_on_whole_banks_is_bit_equal_to_the_view_form(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("batch,tokens", [(1, 1), (4, 1), (4, 2)])
+def test_a_short_step_on_checkpoint_carriers_writes_the_whole_slot(batch, tokens, monkeypatch):
+    """A decode step of fewer than ``1 + k`` tokens on checkpoint carriers (the first
+    step after a prefill without drafts, or the last steps before ``max_model_len``):
+    the layer reads the request's row, and the slot is written whole -- rows
+    ``0 .. tokens-1`` the token checkpoints, the rows after them repeating the last
+    -- so the runner records row ``tokens - 1`` (``0`` for a one-row step)."""
+    monkeypatch.setenv(fused.FUSED_DECODE_ENV, "1")
+    module, hidden = _attention()
+    case = _case(module, hidden, batch, tokens)
+    ref_out, conv_ckpts, rec_ckpts = _chained_reference(module, case, batch, tokens)
+    out, conv, rec, counts = _step(module, case, batch, bank_form=False,
+                                   accepted=case["accepted"], tokens=tokens)
+    assert counts == {"fused": (1, 0), "conv": (0, 0), "gate": (0, 0), "decode": (0, 0)}
+    slots = list(SLOTS[:batch])
+    torch.testing.assert_close(out, ref_out, rtol=OUT_RTOL, atol=OUT_ATOL)
+    assert torch.isfinite(rec[slots]).all() and torch.isfinite(conv[slots].float()).all()
+    torch.testing.assert_close(conv[slots][:, :tokens].float(), conv_ckpts.float(),
+                               rtol=CONV_TOL, atol=CONV_TOL)
+    torch.testing.assert_close(rec[slots][:, :tokens], rec_ckpts, rtol=STATE_RTOL, atol=STATE_ATOL)
+    for row in range(tokens, TOKENS):
+        assert torch.equal(conv[slots][:, row], conv[slots][:, tokens - 1]), row
+        assert torch.equal(rec[slots][:, row], rec[slots][:, tokens - 1]), row
+    if batch > 1:
+        bank_out, bank_conv, bank_rec, _ = _step(module, case, batch, bank_form=True,
+                                                 accepted=case["accepted"], tokens=tokens)
+        assert torch.equal(bank_out, out)
+        assert torch.equal(bank_conv.view(torch.uint8), conv.view(torch.uint8))
+        assert torch.equal(bank_rec.nan_to_num(7.0), rec.nan_to_num(7.0))
+
+
 def test_verify_step_refusals(monkeypatch):
     monkeypatch.setenv(fused.FUSED_DECODE_ENV, "1")
     module, hidden = _attention()
@@ -312,10 +344,11 @@ def test_verify_step_refusals(monkeypatch):
     # T rows per request without checkpoint carriers.
     with pytest.raises(ValueError, match="state_checkpoints"):
         module(case["hidden_states"], **one_row, **common)
-    # Fewer tokens than checkpoint rows.
-    short = case["hidden_states"].reshape(batch, TOKENS, hidden)[:, : TOKENS - 1].reshape(-1, hidden)
-    with pytest.raises(ValueError, match="exactly"):
-        module(short, **views, is_prefill=False, start_position=case["start_position"],
+    # More tokens than the slot holds rows.
+    long = torch.cat([case["hidden_states"], case["hidden_states"]]).reshape(
+        2, batch, TOKENS, hidden).permute(1, 0, 2, 3).reshape(-1, hidden)
+    with pytest.raises(ValueError, match="state_checkpoints"):
+        module(long, **views, is_prefill=False, start_position=case["start_position"],
                checkpoint_rows=case["accepted"], state_checkpoints=TOKENS)
     # One row per request.
     with pytest.raises(ValueError, match="checkpoint_rows"):
