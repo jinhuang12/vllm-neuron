@@ -23,10 +23,11 @@ hands the root, the root's rejection sampler and its one-row draft carrier, the
 sampler's parse, the per-step state hook (the ring cursor pulled back to the kept
 rows), the proposal (placeholders after a prefill, the root's drafts after a decode,
 nothing near ``max_model_len``) -- while the trunk's decode rows and the head's drafts
-are oracles read off the plain run: the kernels that consume ``T`` rows per request
-(DSA indexer ring, MLA decode, KDA checkpoints) are other workers' and this tree has
-no ``T``-row path for them yet, so the identity here is of the bookkeeping, and is
-restated on the real kernels once they land. The prefill runs the real stack. Each
+are oracles read off the plain run and the head's ``populate`` (its own attention
+layer at ``T`` rows) is a counted no-op: the kernels that consume ``T`` rows per
+request (DSA indexer ring, MLA decode, KDA checkpoints) are other workers' and this
+tree has no ``T``-row path for them yet, so the identity here is of the bookkeeping,
+and is restated on the real kernels once they land. The prefill runs the real stack. Each
 prompt's drafts follow a policy (every draft accepted, every draft rejected, a fixed
 or cycling prefix accepted), so the all-accepted and all-rejected cases are covered by
 construction; the plain run's greedy ties do not matter here, the oracle emits its
@@ -56,6 +57,16 @@ from test.vllm_neuron.model.glm5_next.tiny import test_tiny_glm5next_batch_decod
 from test.vllm_neuron.model.glm5_next.tiny import test_tiny_glm5next_e2e as e2e
 from test.vllm_neuron.model.glm5_next.tiny import test_tiny_glm5next_first_request as fr
 from test.vllm_neuron.model.glm5_next.tiny import test_tiny_glm5next_forward as tiny
+
+
+@pytest.fixture(autouse=True)
+def _plain_ring_depth(monkeypatch):
+    """worker-58's ``indexer_ring_depth`` is not in this tree; the oracle never reads the
+    ring, so an mtp server is allocated the plain depth (what the helper returns for
+    k = 0). Dropped once the trees merge."""
+    monkeypatch.setattr(
+        NeuronModelRunner, "_glm5next_indexer_ring_rows", staticmethod(lambda pool, k: int(pool))
+    )
 
 pytestmark = [pytest.mark.forked]
 
@@ -414,6 +425,13 @@ class _Oracle:
         self.position: int | None = None
         self.active = False
         self.calls = 0
+        self.populated = 0
+
+    def populate(self, hidden_rows, next_ids, positions, **kwargs):
+        """The head's state write at ``T`` rows (its attention layer's ``T``-row leg is
+        worker-58's); the drafts come from this oracle, so the state is never read."""
+        assert hidden_rows.shape[0] == next_ids.numel() == positions.numel()
+        self.populated += 1
 
     def stack(self, real):
         def forward(input_ids, **kwargs):
@@ -489,6 +507,7 @@ def test_greedy_speculative_output_is_token_identical_to_the_plain_run(tmp_path,
     monkeypatch.delenv(KNOB, raising=False)
     plain_config = _config(None)
     references: list[list[int]] = []
+    (tmp_path / "plain").mkdir()
     with fr._parallel_state(tmp_path / "plain", plain_config):
         runner = _runner(plain_config, _root()[0])
         assert runner.drafter is None
@@ -498,15 +517,11 @@ def test_greedy_speculative_output_is_token_identical_to_the_plain_run(tmp_path,
             assert steps == GENERATED + 2 * T - 1
             references.append(ids)
             finished = {f"plain-{i}"}
-    # The deeper ring of a speculative server comes from worker-58's helper, which this
-    # tree does not carry; the oracle never reads the ring, so the plain depth serves.
-    monkeypatch.setattr(
-        NeuronModelRunner, "_glm5next_indexer_ring_rows", staticmethod(lambda pool, k: int(pool))
-    )
     report = []
     for k in (1, 3):
         monkeypatch.setenv(KNOB, str(k))
         config = _config(k)
+        (tmp_path / f"mtp-{k}").mkdir()
         with fr._parallel_state(tmp_path / f"mtp-{k}", config):
             root, head = _root()
             runner = _runner(config, root)
@@ -516,11 +531,15 @@ def test_greedy_speculative_output_is_token_identical_to_the_plain_run(tmp_path,
                 oracle = _Oracle(head, prompt + references[i], policy)
                 with pytest.MonkeyPatch.context() as patch:
                     patch.setattr(root.model, "forward", oracle.stack(root.model.forward))
+                    patch.setattr(root.mtp, "populate", oracle.populate)
                     patch.setattr(root.mtp, "draft_tokens", oracle.draft_tokens)
                     ids, steps = _generate(runner, f"mtp-{k}-{i}", prompt, tokens=GENERATED,
                                            finished=finished, oracle=oracle)
                 finished = {f"mtp-{k}-{i}"}
                 assert ids == references[i][:GENERATED], (k, name, i)
+                # The prefill leg populates the head once (Stage A); every verify step
+                # populates once and drafts once.
+                assert (oracle.populated, oracle.calls) == (steps + 1, steps), (k, name, steps)
                 report.append((k, name, steps))
                 if name.startswith("accept-all"):
                     # The first verify step carries a prefill's placeholders; every one after

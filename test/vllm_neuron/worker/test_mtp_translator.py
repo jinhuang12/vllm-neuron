@@ -31,6 +31,7 @@ import pytest
 import torch
 
 from vllm_neuron import envs
+from vllm_neuron.functional.kda import fused_decode
 from vllm_neuron.model.glm5_next import mtp as head_module
 from vllm_neuron.vllm.worker.glm5next_state_banks import bank_form
 from vllm_neuron.vllm.worker.neuron_model_runner import NULL_BLOCK_ID, NeuronModelRunner
@@ -52,6 +53,16 @@ PROMPTS = [PAGE + 3, 2 * PAGE + 2]
 #: The batch-decode file's selecting regime: the indexer's top-k wants this much room.
 MAX_MODEL_LEN = tiny.STACK_TOKENS + 8
 WINDOW_BLOCKS = -(-MAX_MODEL_LEN // PAGE)
+
+
+@pytest.fixture(autouse=True)
+def _plain_ring_depth(monkeypatch):
+    """worker-58's ``indexer_ring_depth`` is not in this tree; nothing here reads the
+    ring, so an mtp server is allocated the plain depth (what the helper returns for
+    k = 0). Dropped once the trees merge."""
+    monkeypatch.setattr(
+        NeuronModelRunner, "_glm5next_indexer_ring_rows", staticmethod(lambda pool, k: int(pool))
+    )
 
 
 def _world(batch_size: int, *, slots: int | None = None):
@@ -235,11 +246,20 @@ def _mtp_server(runner) -> None:
     runner.drafter = SimpleNamespace(num_speculative_tokens=K)
 
 
-def test_the_recurrent_carriers_start_the_next_step_from_the_accepted_row():
+def test_the_recurrent_carriers_start_the_next_step_from_the_accepted_row(monkeypatch):
     """Under method "mtp" every decode step's recurrent carrier names the checkpoint
     geometry (``state_checkpoints = T``) and each request's accepted draft count from
     the verify step before it (0 after a prefill), which the per-step state hook
     learned from the sampled ids; a bucket padding row starts from row 0."""
+    # worker-57's commit is not in this tree; the hook's call is recorded, its return
+    # (the row each request resumes from) shaped as the contract says.
+    commits = []
+
+    def commit(banks, slot_ids, kept_counts, *, state_checkpoints):
+        commits.append((list(slot_ids), list(kept_counts), int(state_checkpoints)))
+        return torch.tensor([int(count) - 1 for count in kept_counts], dtype=torch.int32)
+
+    monkeypatch.setattr(fused_decode, "commit_kda_checkpoints", commit, raising=False)
     world = kda._world(2)
     runner = world.runner
     _mtp_server(runner)
@@ -250,6 +270,7 @@ def test_the_recurrent_carriers_start_the_next_step_from_the_accepted_row():
     # The host learns the kept ids: request 0 keeps three rows, request 1 one.
     runner._update_states_after_model_execute([[5, 6, 7], [9]], None)
     kept = [3, 1]
+    assert commits[-1][1:] == (kept, T), "the verify step commits the kept rows"
     nexts = [s + n for s, n in zip(starts, kept)]
     for carrier in _kda_convert(world, [0, 1], cached=nexts, tokens=2 * T, real=[T, T]):
         assert carrier["start_position"].tolist() == nexts
@@ -269,7 +290,9 @@ def test_the_recurrent_carriers_start_the_next_step_from_the_accepted_row():
     for carrier in _kda_convert(world, [0, 1], cached=nexts, tokens=2, real=[1, 1], width=1):
         assert carrier["state_checkpoints"] == T
         assert carrier["checkpoint_rows"].tolist() == [n - 1 for n in kept]
+    committed = len(commits)
     runner._update_states_after_model_execute([[4], [5]], None)
+    assert len(commits) == committed, "a one-row step commits nothing"
     nexts = [s + 1 for s in nexts]
     for carrier in _kda_convert(world, [0, 1], cached=nexts, tokens=2, real=[1, 1], width=1):
         assert carrier["checkpoint_rows"].tolist() == [0, 0], "a one-row step keeps its row 0"

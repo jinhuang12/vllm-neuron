@@ -5738,7 +5738,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if noted:
             for finished in [key for key in table if key in noted]:
                 positions.pop(table[finished], None)
-                self._glm5next_checkpoint_rows.pop(table[finished], None)
+                # The checkpoint record is created with the live side-cache set; a
+                # slot table set up without one has no record to clear.
+                recorded = getattr(self, "_glm5next_checkpoint_rows", None)
+                if recorded is not None:
+                    recorded.pop(table[finished], None)
                 del table[finished]
             # A finished id that never held a slot has nothing to release; the
             # record is emptied whole so it cannot grow for the process's life.
