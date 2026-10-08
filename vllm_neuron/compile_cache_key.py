@@ -36,6 +36,20 @@ dynamic import, another package's kernel no snapshot file imports -- folds the
 whole-package digest instead and is logged once at INFO, so a fallback costs a
 recompile and never serves a stale kernel.
 
+A *patch* is what a snapshot file does to an object it imported: rebinding or
+deleting an attribute or item (``mod.X = v``, ``mod.TABLE[k] = v``,
+``del mod.X``, ``setattr(mod, ...)``, ``delattr``), also through an alias
+(``cfg = mod.cfg; cfg.X = v``), or calling a mutating method (``append``,
+``extend``, ``insert``, ``pop``, ``popitem``, ``clear``, ``remove``,
+``discard``, ``add``, ``update``, ``setdefault``, ``sort``, ``reverse`` and the
+``__setitem__`` family) on an imported object or a module attribute
+(``mod.TABLE.update(...)``). Imports and patches under ``if TYPE_CHECKING:`` do
+not count. Not detected: a mutation inside a function the file calls
+(``mod.set_mode(1)``), a mutating-method name called directly on a module bound
+by ``import`` (``nl.add`` is a kernel op, not a mutation), and ``exec`` /
+``eval``. ``test_compile_cache_key_pergraph.py`` pins the patches the package
+makes today, so a new one fails a test until it is reviewed.
+
 The library looks both key functions up through their module at every call
 (``cache.create_cache_hash(...)``; ``from .nki_cache import create_nki_cache_key``
 inside ``compile_nki``), so replacing the module attribute is the whole hook. The
@@ -588,6 +602,15 @@ def _module_level_bindings(tree: ast.Module) -> tuple[list[ast.stmt], set[str]]:
 #: Builtins that rebind or delete an attribute of their first argument.
 _ATTRIBUTE_SETTERS = frozenset({"setattr", "delattr"})
 
+#: Methods that mutate their receiver in place (list, dict, set, attribute hooks).
+_MUTATING_METHODS = frozenset(
+    {
+        "append", "extend", "insert", "pop", "popitem", "clear", "remove", "discard",
+        "add", "update", "setdefault", "sort", "reverse",
+        "__setitem__", "__delitem__", "__setattr__", "__delattr__",
+    }
+)
+
 
 def _mutated_object(expr: ast.expr) -> Optional[tuple[str, tuple[str, ...]]]:
     """``(base name, attribute path)`` of the object ``expr`` evaluates to.
@@ -631,8 +654,10 @@ def _parse_imports(rel: str, source: bytes) -> _ModuleImports:
     package = _package_of(rel)
     entries_by_node, dynamic = {}, None
     bound_to: dict[str, list[str]] = {}  # name an import binds -> dotted object names
+    module_names: set[str] = set()  # names bound by ``import`` (always modules)
     aliases: list[tuple[str, ast.expr]] = []  # ``name = <attribute chain>``
     mutated: list[ast.expr] = []
+    method_receivers: list[ast.expr] = []  # ``<receiver>.append(...)`` and the like
     type_only = _type_checking_only(tree)
     for node in ast.walk(tree):
         if id(node) in type_only:
@@ -644,6 +669,7 @@ def _parse_imports(rel: str, source: bytes) -> _ModuleImports:
             ]
             for alias in node.names:
                 name = alias.asname or alias.name.partition(".")[0]
+                module_names.add(name)
                 bound_to.setdefault(name, []).append(
                     alias.name if alias.asname else alias.name.partition(".")[0]
                 )
@@ -681,6 +707,12 @@ def _parse_imports(rel: str, source: bytes) -> _ModuleImports:
                 and node.args
             ):
                 mutated.append(node.args[0])
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in _MUTATING_METHODS
+            ):
+                method_receivers.append(node.func.value)
             continue
         if used and dynamic is None:
             dynamic = f"line {node.lineno} uses {used[0]}"
@@ -704,6 +736,12 @@ def _parse_imports(rel: str, source: bytes) -> _ModuleImports:
         if not grew:
             break
     patched = [dotted for expr in mutated for dotted in objects(expr)]
+    for expr in method_receivers:
+        found = _mutated_object(expr)
+        # ``mod.add(...)`` on a module bound by ``import`` is a module function
+        # call (``nl.add``), not a mutation; ``mod.TABLE.update(...)`` is one.
+        if found is not None and not (found[0] in module_names and not found[1]):
+            patched.extend(objects(expr))
     module_imports, defined = _module_level_bindings(tree)
     imported: dict[str, list[_ImportEntry]] = {}
     for node in module_imports:

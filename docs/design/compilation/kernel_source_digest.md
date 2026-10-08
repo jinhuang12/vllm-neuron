@@ -93,11 +93,14 @@ module; those runs are not followed.
 
 ### Patches
 
-A snapshot file *patches* a module when it rebinds or deletes an attribute or
-an item of an object it imported from that module (`mod.ATTR = v`,
-`mod.TABLE[k] = v`, `del mod.ATTR`, `setattr(mod, ...)`, also through an alias
-`cfg = mod.cfg; cfg.X = v`), at any depth. The patch changes what the patched
-module's code does wherever it runs, so:
+A snapshot file *patches* a module when, at any depth, it rebinds or deletes
+an attribute or an item of an object it imported from that module
+(`mod.ATTR = v`, `mod.TABLE[k] = v`, `del mod.ATTR`, `setattr(mod, ...)`, also
+through an alias `cfg = mod.cfg; cfg.X = v`), or calls a mutating method
+(`append`, `extend`, `insert`, `pop`, `popitem`, `clear`, `remove`, `discard`,
+`add`, `update`, `setdefault`, `sort`, `reverse`, `__setitem__` and its family)
+on an imported object or a module attribute (`mod.TABLE.update(...)`). The
+patch changes what the patched module's code does wherever it runs, so:
 
 | Patched module | The patcher's closure joins |
 | --- | --- |
@@ -110,8 +113,10 @@ Every kernel file imports `nkilib` (for example `kernel_assert`), so
 graph. `parallel/neuron_parallel_state.py` patches `vllm.distributed` and joins
 the closures that import `vllm` at run time.
 `test/vllm_neuron/test_compile_cache_key_pergraph.py` pins this list, so a new
-patch fails a test until it is reviewed here. A mutation through a method call
-(`mod.TABLE.update(...)`) is not detected.
+patch fails a test until it is reviewed here. Not detected: a mutation inside
+a function the file calls (`mod.set_mode(1)`), a mutating-method name called
+directly on a module bound by `import` (`nl.add` is a kernel op), and `exec` /
+`eval`.
 
 ### Kernels of other packages
 

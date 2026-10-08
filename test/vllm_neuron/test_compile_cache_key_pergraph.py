@@ -592,11 +592,24 @@ def test_the_patch_scan_sees_each_mutation_form_and_nothing_else():
         "if typing.TYPE_CHECKING:\n"
         "    from n import o\n"
         "    o.T = 1\n"  # never runs
+        "import p.q as pq\n"
+        "from r import TABLE\n"
+        "from s import t\n"
+        "import u\n"
+        "pq.REGISTRY.update({})\n"  # a mutating method on a module attribute
+        "TABLE.append(1)\n"  # a mutating method on an imported object
+        "t.u.v.setdefault('k', 1)\n"
+        "pq.add(1, 2)\n"  # a module function named like a mutator: a call, not a patch
+        "u.pop()\n"
+        "TABLE.copy()\n"  # not a mutating method
     )
 
     patched = ck._parse_imports("functional/x.py", source.encode()).patched
 
-    assert set(patched) == {"a.b", "c.d", "e.f", "g.h.tbl", "i.j.cfg", "k.m"}
+    assert set(patched) == {
+        "a.b", "c.d", "e.f", "g.h.tbl", "i.j.cfg", "k.m",
+        "p.q.REGISTRY", "r.TABLE", "s.t.u.v",
+    }
 
 
 def test_the_package_patches_only_the_modules_the_doc_names():
@@ -652,6 +665,33 @@ def test_editing_the_wrapper_of_an_nkilib_kernel_changes_only_its_graph_key(
 
     assert after_mlp[0] != before[0] and after_mlp[1] == before[1]
     assert after_sinkhorn[0] == after_mlp[0] and after_sinkhorn[1] != after_mlp[1]
+
+
+def test_editing_the_nkilib_predicate_patch_moves_the_nkilib_mlp_digest(tmp_path):
+    """da-14's round-1 probe: flip the forced-TKG predicate inside mlp.py:18-35.
+
+    At 5f90590 the nkilib kernel folded the empty file set and kept its digest.
+    """
+    copy = _copy_tree(tmp_path)
+    refs = (
+        ck.Reference(ck.RefKind.MODULE, "nkilib.core.mlp.mlp"),
+        ck.Reference(ck.RefKind.QUALIFIED_NAME, "nkilib.core.mlp.mlp.mlp"),
+    )
+
+    def digests():
+        resolver = ck.KernelDigestResolver(copy)
+        resolutions = [resolver.resolve([ref]) for ref in refs]
+        assert all(r.per_graph and r.files for r in resolutions)
+        return [resolver.digest(r) for r in resolutions]
+
+    before = digests()
+    path = copy / "functional/mlp.py"
+    source = path.read_text()
+    assert source.count("            return True\n") == 1
+    path.write_text(source.replace("            return True\n", "            return False\n"))
+    after = digests()
+
+    assert after[0] != before[0] and after[1] != before[1]
 
 
 @pytest.mark.parametrize(
