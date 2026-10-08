@@ -26,8 +26,9 @@ BATCHES = (1, 4, 33, 64)
 @pytest.fixture(scope="module")
 def sites():
     cfg = glue_case.text_config()
-    return (model_fp8.Glm5NextHyperConnection(cfg),
-            load_0a08ff4().model_fp8.Glm5NextHyperConnection(cfg), cfg)
+    return (model_fp8.Glm5NextHyperConnection(cfg, neuron_config=cfg.neuron_config),
+            load_0a08ff4().model_fp8.Glm5NextHyperConnection(
+                cfg, neuron_config=cfg.neuron_config), cfg)
 
 
 def _operands(cfg, batch):

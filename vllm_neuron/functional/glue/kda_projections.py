@@ -45,13 +45,15 @@ from nkilib.core.utils.kernel_assert import kernel_assert
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
-from vllm_neuron.functional.glue import glue_fused_enabled
+from vllm_neuron import envs
+from vllm_neuron.functional.glue import glue_selected
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 #: Largest token count served (the activations' transpose is the matmul stationary).
 KDA_PROJECTIONS_MAX_TOKENS = 128
 
-#: ``1`` loads the weights' transposes by DMA, ``0`` by tensor-engine transposes.
+#: The switch (registered in :mod:`vllm_neuron.envs`): ``1`` loads the weights'
+#: transposes by DMA transpose, ``0`` by a plain DMA and tensor-engine transposes.
 DMA_TRANSPOSE_ENV = "VLLM_NEURON_GLUE_KDA_DMA_TRANSPOSE"
 
 _P = 128
@@ -279,8 +281,22 @@ def _weights(attn) -> tuple[Tensor, ...]:
             attn.g_a_proj_weight, attn.g_b_proj_weight)
 
 
-def kda_projections_admits(hidden_states: Tensor, attn) -> bool:
-    """True when :func:`kda_projections` serves this call: bf16 or fp32 operands."""
+def kda_projections_admits(hidden_states: Tensor, attn, phase: str | None = None) -> bool:
+    """True when :func:`kda_projections` serves this call.
+
+    Args:
+        hidden_states: ``[T, H]`` activations, bf16 (served) or fp32.
+        attn: the KDA attention module; its eight projection weights are read.
+        phase: the step's ``"prefill"`` or ``"decode"``; None when it is not known,
+            and then only a rule without a phase selects the kernel.
+
+    The kernel serves ``1 <= T <= KDA_PROJECTIONS_MAX_TOKENS``, bf16 or fp32 weights of
+    the shapes ``kda_projections_torch`` multiplies (``q/k/v [W, H]``, ``b [Bw, H]``,
+    the gates' ``[R, H]`` then ``[W, R]``, with ``W``, ``Bw`` and ``R`` at most 128),
+    ``H`` in 128-blocks per program, on an NKI device or the simulator, when
+    ``VLLM_NEURON_GLUE_FUSED`` selects ``kda_projections`` for this row count and phase.
+    Anything else is counted as declined.
+    """
     ok = False
     weights = _weights(attn)
     if hidden_states.dim() == 2 and all(w.dim() == 2 for w in weights):
@@ -288,7 +304,7 @@ def kda_projections_admits(hidden_states: Tensor, attn) -> bool:
         q_w, k_w, v_w, b_w, f_a, f_b, g_a, g_b = weights
         width, rank = int(q_w.shape[0]), int(f_a.shape[0])
         ok = (
-            glue_fused_enabled()
+            glue_selected("kda_projections", tokens, phase)
             and hidden_states.dtype in (torch.bfloat16, torch.float32)
             and all(w.dtype in (torch.bfloat16, torch.float32) for w in weights)
             and 1 <= tokens <= KDA_PROJECTIONS_MAX_TOKENS
@@ -325,15 +341,27 @@ def kda_projections_torch(hidden_states: Tensor, attn) -> tuple[Tensor, ...]:
     return q_in, k_in, v_in, raw_gate, raw_beta, out_gate
 
 
-def kda_projections(hidden_states: Tensor, attn) -> tuple[Tensor, ...]:
-    """``(q_in, k_in, v_in, raw_gate, raw_beta, out_gate)`` fp32, kernel or 0a08ff4 torch."""
-    if not kda_projections_admits(hidden_states, attn):
+def kda_projections(hidden_states: Tensor, attn,
+                    phase: str | None = None) -> tuple[Tensor, ...]:
+    """The six KDA input projections of ``hidden_states``, on the kernel or in torch.
+
+    Args:
+        hidden_states: ``[T, H]`` activations, bf16 or fp32.
+        attn: the KDA attention module (its projection weights).
+        phase: the step's ``"prefill"`` or ``"decode"``, for ``VLLM_NEURON_GLUE_FUSED``.
+
+    Returns:
+        ``(q_in, k_in, v_in, raw_gate, raw_beta, out_gate)``, each ``[T, rows]`` fp32,
+        ``rows`` the weight's output rows. When :func:`kda_projections_admits` says no,
+        these are the torch expressions (:func:`kda_projections_torch`).
+    """
+    if not kda_projections_admits(hidden_states, attn, phase):
         return kda_projections_torch(hidden_states, attn)
     _count_nki_dispatch()
     q_w, k_w, v_w, b_w, f_a, f_b, g_a, g_b = (w.contiguous() for w in _weights(attn))
     q_in, k_in, v_in, raw_gate, raw_beta, out_gate = _KERNELS[launch_programs()](
         x=hidden_states.contiguous(), q_w=q_w, k_w=k_w, v_w=v_w, b_w=b_w,
         f_a_w=f_a, f_b_w=f_b, g_a_w=g_a, g_b_w=g_b,
-        DMA_TRANSPOSE=os.environ.get(DMA_TRANSPOSE_ENV, "1") != "0",
+        DMA_TRANSPOSE=envs.VLLM_NEURON_GLUE_KDA_DMA_TRANSPOSE,
     )
     return q_in, k_in, v_in, raw_gate, raw_beta, out_gate

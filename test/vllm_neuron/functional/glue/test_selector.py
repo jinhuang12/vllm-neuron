@@ -1,0 +1,168 @@
+# SPDX-License-Identifier: Apache-2.0
+"""``VLLM_NEURON_GLUE_FUSED``: which fused glue kernel serves which (phase, row count).
+
+The contract (``vllm_neuron/functional/glue/__init__.py``):
+
+* ``0``: nothing fused, every site keeps 0a08ff4's torch route (the kill switch).
+* ``1`` or unset: ``envs.DEFAULT_GLUE_FUSED_SPEC``.
+* ``all``: every kernel at every phase and row count (821274e's behaviour).
+* otherwise a comma list of ``kernel[:phase][@rows]`` rules.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from vllm_neuron import envs
+from vllm_neuron.functional import glue
+
+KERNELS = ("mhc_pre", "kda_projections", "kda_output", "mhc_post")
+TOKENS = (1, 2, 8, 64, 65, 128, 1024)
+
+
+def _table(spec: str) -> set:
+    """``{(kernel, phase, tokens)}`` the spec selects over a grid of calls."""
+    sel = glue.glue_selection(spec)
+    return {(k, p, t) for k in KERNELS for p in glue.PHASES for t in TOKENS
+            if sel.selects(k, t, p)}
+
+
+def test_kernel_names_are_the_four_sites():
+    assert glue.KERNELS == KERNELS
+    assert glue.PHASES == ("prefill", "decode")
+
+
+def test_zero_selects_nothing():
+    assert _table("0") == set()
+
+
+def test_all_selects_every_kernel_everywhere():
+    assert _table("all") == {(k, p, t) for k in KERNELS for p in glue.PHASES
+                             for t in TOKENS}
+
+
+def test_the_switch_is_registered_in_envs(monkeypatch):
+    assert glue.GLUE_FUSED_ENV in dir(envs)
+    monkeypatch.delenv(glue.GLUE_FUSED_ENV, raising=False)
+    assert envs.VLLM_NEURON_GLUE_FUSED == "1"
+    assert not envs.is_set(glue.GLUE_FUSED_ENV)
+    monkeypatch.setenv(glue.GLUE_FUSED_ENV, " mhc_pre:decode ")
+    assert envs.VLLM_NEURON_GLUE_FUSED == "mhc_pre:decode"
+
+
+def test_one_and_unset_are_the_default_spec(monkeypatch):
+    default = envs.DEFAULT_GLUE_FUSED_SPEC
+    assert _table("1") == _table(default)
+    monkeypatch.delenv(glue.GLUE_FUSED_ENV, raising=False)
+    assert glue.glue_selection() == glue.glue_selection(default)
+    monkeypatch.setenv(glue.GLUE_FUSED_ENV, "1")
+    assert glue.glue_selection() == glue.glue_selection(default)
+
+
+def test_the_environment_is_read_at_each_call(monkeypatch):
+    monkeypatch.setenv(glue.GLUE_FUSED_ENV, "0")
+    assert not glue.glue_selected("mhc_post", 1024, "prefill")
+    monkeypatch.setenv(glue.GLUE_FUSED_ENV, "all")
+    assert glue.glue_selected("mhc_post", 1024, "prefill")
+    monkeypatch.setenv(glue.GLUE_FUSED_ENV, "mhc_pre:decode")
+    assert glue.glue_selected("mhc_pre", 1, "decode")
+    assert not glue.glue_selected("mhc_post", 1, "decode")
+
+
+def test_a_bare_kernel_name_selects_both_phases():
+    assert _table("kda_output") == {("kda_output", p, t) for p in glue.PHASES
+                                    for t in TOKENS}
+
+
+def test_a_phase_restricts_the_rule():
+    assert _table("mhc_pre:prefill,kda_projections:all") == (
+        {("mhc_pre", "prefill", t) for t in TOKENS}
+        | {("kda_projections", p, t) for p in glue.PHASES for t in TOKENS})
+
+
+def test_token_ranges_restrict_the_rule():
+    got = _table("mhc_post:decode@64,mhc_pre:decode@2-64,kda_output@65-,"
+                 "kda_projections:prefill@-8")
+    assert got == (
+        {("mhc_post", "decode", 64)}
+        | {("mhc_pre", "decode", t) for t in (2, 8, 64)}
+        | {("kda_output", p, t) for p in glue.PHASES for t in (65, 128, 1024)}
+        | {("kda_projections", "prefill", t) for t in (1, 2, 8)})
+
+
+def test_rules_for_one_kernel_add_up_and_whitespace_is_ignored():
+    assert _table(" mhc_post:decode@1 , mhc_post:prefill ") == (
+        {("mhc_post", "decode", 1)} | {("mhc_post", "prefill", t) for t in TOKENS})
+
+
+@pytest.mark.parametrize("spec", (
+    "mhc_pree", "mhc_pre:prefil", "mhc_pre@x", "mhc_pre@5-2", "mhc_pre@0",
+    "mhc_pre:decode:1", "kda_output,,mhc_post", "", "2", "ALL", "hyper_connection",
+    "mhc_pre@1-2-3", "mhc_pre@-",
+))
+def test_malformed_or_unknown_rules_are_refused_by_name(spec):
+    with pytest.raises(ValueError, match=glue.GLUE_FUSED_ENV):
+        glue.glue_selection(spec)
+
+
+def test_a_bad_environment_value_is_refused_at_the_call_site(monkeypatch):
+    monkeypatch.setenv(glue.GLUE_FUSED_ENV, "mhc_pre:prefil")
+    with pytest.raises(ValueError, match="prefil"):
+        glue.glue_selected("mhc_pre", 1, "decode")
+
+
+def test_an_unknown_kernel_or_phase_at_the_call_site_is_refused():
+    with pytest.raises(ValueError, match="mhc_pree"):
+        glue.glue_selected("mhc_pree", 1, "decode")
+    with pytest.raises(ValueError, match="verify"):
+        glue.glue_selected("mhc_pre", 1, "verify")
+
+
+@pytest.mark.parametrize("tokens", TOKENS)
+def test_a_call_of_unknown_phase_is_selected_only_by_a_rule_without_one(tokens):
+    sel = glue.glue_selection("mhc_pre:prefill,mhc_pre:decode,kda_output")
+    assert not sel.selects("mhc_pre", tokens)
+    assert sel.selects("mhc_pre", tokens, "prefill") and sel.selects("mhc_pre", tokens,
+                                                                      "decode")
+    assert sel.selects("kda_output", tokens)
+    assert glue.glue_selection("all").selects("mhc_post", tokens)
+
+
+#: A site that tells the phase by row count: decode batches of up to this many rows, and
+#: a prefill bucket of fewer rows (so the two look alike there) next to a larger one.
+DECODE_ROWS = 155
+PREFILL_ROWS = (128, 1024)
+
+
+def test_a_value_the_row_count_cannot_follow_is_refused_by_name():
+    with pytest.raises(ValueError, match=rf"{glue.GLUE_FUSED_ENV}=.*mhc_pre at 128 rows"):
+        glue.require_rows_tell_phase(("mhc_pre", "mhc_post"), DECODE_ROWS, PREFILL_ROWS,
+                                     spec="mhc_pre:prefill@128")
+    with pytest.raises(ValueError, match="mhc_post at 128 rows"):
+        glue.require_rows_tell_phase(("mhc_pre", "mhc_post"), DECODE_ROWS, PREFILL_ROWS,
+                                     spec="mhc_post:decode")
+
+
+@pytest.mark.parametrize("spec", ("0", "all", "mhc_pre", "mhc_post:decode@129-",
+                                  "mhc_post:prefill@1024", "kda_output:prefill"))
+def test_a_value_the_row_count_can_follow_is_kept(spec):
+    glue.require_rows_tell_phase(("mhc_pre", "mhc_post"), DECODE_ROWS, PREFILL_ROWS,
+                                 spec=spec)
+
+
+def test_a_prefill_bucket_above_every_decode_batch_is_told_apart_by_its_rows():
+    glue.require_rows_tell_phase(("mhc_pre", "mhc_post"), PREFILL_ROWS[0] - 1,
+                                 PREFILL_ROWS, spec="mhc_pre:prefill@128")
+
+
+def test_the_refusal_reads_the_switch_when_no_value_is_given(monkeypatch):
+    monkeypatch.setenv(glue.GLUE_FUSED_ENV, "mhc_pre:decode")
+    with pytest.raises(ValueError, match="'mhc_pre:decode'"):
+        glue.require_rows_tell_phase(("mhc_pre",), DECODE_ROWS, PREFILL_ROWS)
+
+
+def test_the_dma_transpose_switch_is_registered_in_envs(monkeypatch):
+    monkeypatch.delenv("VLLM_NEURON_GLUE_KDA_DMA_TRANSPOSE", raising=False)
+    assert envs.VLLM_NEURON_GLUE_KDA_DMA_TRANSPOSE is True
+    monkeypatch.setenv("VLLM_NEURON_GLUE_KDA_DMA_TRANSPOSE", "0")
+    assert envs.VLLM_NEURON_GLUE_KDA_DMA_TRANSPOSE is False

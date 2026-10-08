@@ -45,8 +45,9 @@ Both LNC2 cores: yes. Each program does half the contraction (step 2), half the
 transposes and half the collapse; steps 3-4 are ``T x (M + T)`` values, done on both.
 
 ``T`` is bounded by :data:`MHC_PRE_MAX_TOKENS` (the stationary ``residual^T`` block of
-step 2 is at most 128 columns): decode and batched decode. Prefill keeps 0a08ff4's
-torch route through :func:`mhc_pre_admits`.
+step 2 is at most 128 columns): a decode batch or a prefill chunk of at most 128 rows.
+A larger call (the served 1024-row prefill chunk) keeps the torch route through
+:func:`mhc_pre_admits`.
 """
 
 from __future__ import annotations
@@ -64,7 +65,7 @@ from nkilib.core.utils.kernel_assert import kernel_assert
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
-from vllm_neuron.functional.glue import GLUE_FUSED_ENV, glue_fused_enabled
+from vllm_neuron.functional.glue import glue_selected
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 #: Largest token count served: ``residual^T`` blocks are the matmul's stationary.
@@ -84,10 +85,8 @@ def _group(dtype):
 _P = 128
 
 __all__ = [
-    "GLUE_FUSED_ENV",
     "MHC_PRE_MAX_TOKENS",
     "dispatch_counters",
-    "glue_fused_enabled",
     "launch_programs",
     "mhc_pre_admits",
     "mhc_pre_fused",
@@ -346,14 +345,24 @@ def launch_programs() -> int:
     return 2 if os.environ.get("NEURON_LOGICAL_NC_CONFIG") == "2" else 1
 
 
-def mhc_pre_admits(residual: Tensor, fn: Tensor, hc_scale: Tensor, hc_base: Tensor) -> bool:
+def mhc_pre_admits(residual: Tensor, fn: Tensor, hc_scale: Tensor, hc_base: Tensor,
+                   phase: str | None = None) -> bool:
     """True when :func:`mhc_pre_fused` serves this site call.
 
-    bf16 streams and bf16 ``fn`` (the checkpoint's dtype, served) or fp32 ones (the
-    CPU fixtures'), fp32 scale and base, ``1 <= T <= 128``, ``S <= 4``, ``H`` in 128-blocks per
-    program, ``S * H`` a power of two (so the kernel's ``* (1/K)`` is the reference's
-    ``/ K``), on an NKI device or the simulator, with the glue switch on. Anything
-    else keeps the 0a08ff4 torch route, and is counted as declined.
+    Args:
+        residual: ``[T, S, H]`` streams, bf16 (served) or fp32 (the CPU fixtures').
+        fn: ``[M, S*H]`` projection, ``M = 2S + S*S``, bf16 or fp32.
+        hc_scale: ``[3]`` fp32 head scales.
+        hc_base: ``[M]`` fp32 head biases.
+        phase: the step's ``"prefill"`` or ``"decode"``; None when it is not known,
+            and then only a rule without a phase selects the kernel.
+
+    The kernel serves ``1 <= T <= MHC_PRE_MAX_TOKENS``, streams that fit its partition
+    layout (``S * 32 <= 128`` and ``M * S <= 128``, so ``S <= 4``), ``H`` in 128-blocks
+    per program and ``S * H`` a power of two (so the kernel's ``* (1/K)`` is the
+    reference's ``/ K``), on an NKI device or the simulator, when
+    ``VLLM_NEURON_GLUE_FUSED`` selects ``mhc_pre`` for this row count and phase.
+    Anything else keeps the torch route and is counted as declined.
     """
     ok = False
     if residual.dim() == 3 and fn.dim() == 2:
@@ -361,13 +370,13 @@ def mhc_pre_admits(residual: Tensor, fn: Tensor, hc_scale: Tensor, hc_base: Tens
         mix = 2 * streams + streams * streams
         programs = launch_programs()
         ok = (
-            glue_fused_enabled()
+            glue_selected("mhc_pre", tokens, phase)
             and residual.dtype in (torch.bfloat16, torch.float32)
             and fn.dtype in (torch.bfloat16, torch.float32)
             and hc_scale.dtype == torch.float32
             and hc_base.dtype == torch.float32
             and 1 <= tokens <= MHC_PRE_MAX_TOKENS
-            and 1 <= streams <= 4
+            and streams >= 1 and streams * _CHUNK <= _P and mix * streams <= _P
             and hidden % (_P * programs) == 0
             and (streams * hidden) & (streams * hidden - 1) == 0
             and tuple(fn.shape) == (mix, streams * hidden)

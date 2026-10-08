@@ -35,6 +35,7 @@ import torch
 
 from test.hardware.baselines.glue_0a08ff4 import load as load_0a08ff4
 from test.vllm_neuron.functional.glue import glue_case
+from vllm_neuron.functional import glue
 from vllm_neuron.functional.glue import mhc_pre as fused
 from vllm_neuron.model.glm5_next import model_fp8
 
@@ -47,9 +48,14 @@ LAYER_INPUT_MAX_FLIPS = 0.01
 FP32_INPUT_RTOL = 1e-5
 
 
-def _site(model, src, fn_dtype=torch.bfloat16):
+def _site(model, src, fn_dtype=torch.bfloat16, neuron_config=None):
+    """An mHC site with checkpoint layer 4's attention-site weights.
+
+    ``neuron_config`` defaults to the config's own (the serving line's buckets).
+    """
     cfg = glue_case.text_config()
-    site = model.Glm5NextHyperConnection(cfg)
+    site = model.Glm5NextHyperConnection(
+        cfg, neuron_config=cfg.neuron_config if neuron_config is None else neuron_config)
     prefix = f"model.language_model.layers.{glue_case.KDA_LAYER}."
     streams, hidden = int(cfg.hc_mult), int(cfg.hidden_size)
     mix = (2 + streams) * streams
@@ -129,7 +135,7 @@ def test_two_programs_agree_with_one(sites, batch, monkeypatch):
 def test_the_kill_switch_restores_0a08ff4_bit_for_bit(sites, monkeypatch):
     live, old, cfg = sites
     streams = glue_case.streams_input(cfg, 4)
-    monkeypatch.setenv(fused.GLUE_FUSED_ENV, "0")
+    monkeypatch.setenv(glue.GLUE_FUSED_ENV, "0")
     fused.reset_dispatch_counters()
     got = live.mhc_pre(streams)
     assert fused.dispatch_counters() == (0, 1)

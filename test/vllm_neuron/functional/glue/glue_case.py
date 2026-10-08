@@ -40,12 +40,28 @@ DSA_LAYER = 3
 FP8_LIMIT = 224.0
 BLOCK = 128
 PAGE = 128
+#: The TP=64 serving line's bucket config: ``max_num_seqs = 64`` (so the runner's default
+#: decode buckets 1, 2, 4, ..., 64) and one 1024-row prefill chunk. The mHC layers read
+#: the step's phase off the row count against them.
+SERVED_MAX_NUM_SEQS = 64
+SERVED_PREFILL_BUCKETS = (1024,)
+
+
+def served_decode_buckets() -> list[int]:
+    """The decode batch buckets the runner builds for :data:`SERVED_MAX_NUM_SEQS`."""
+    from vllm_neuron.utils.bucket_utils import get_default_num_seqs_buckets
+
+    return get_default_num_seqs_buckets(SERVED_MAX_NUM_SEQS)
 
 
 def text_config():
+    """The checkpoint's text config, carrying the serving line's buckets."""
     from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
+    from vllm_neuron.model.neuron_config import NeuronConfig
 
-    return Glm5NextTextConfig()
+    return Glm5NextTextConfig(neuron_config=NeuronConfig(
+        num_seqs_buckets=served_decode_buckets(),
+        num_batched_tokens_buckets=list(SERVED_PREFILL_BUCKETS)))
 
 
 def quant_config(model):

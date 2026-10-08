@@ -76,6 +76,10 @@ if TYPE_CHECKING:
     # Build the GLM-5.3-Flash step's attention metadata on the host only: no per-step
     # block-table / slot-mapping uploads that its graph never reads.
     VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA: bool = False
+    # GLM-5.3-Flash fused glue kernels (``vllm_neuron/functional/glue``): which
+    # kernel serves which call, and how the KDA kernels load their weights.
+    VLLM_NEURON_GLUE_FUSED: str = "1"
+    VLLM_NEURON_GLUE_KDA_DMA_TRANSPOSE: bool = True
 
 
 def maybe_convert_bool(value: str | None) -> bool | None:
@@ -153,6 +157,10 @@ def maybe_convert_float(value: str | None) -> float | None:
 #: graph) against 159.9 MiB on the odd one. Another model, another bucket or
 #: another compiler release moves it, which is what the override is for.
 DEFAULT_DEVICE_GRAPH_RESERVE_GIB = 5.0
+
+#: What ``VLLM_NEURON_GLUE_FUSED=1``, and an unset switch, selects: every fused glue
+#: kernel at every phase and row count, as before the switch took per-kernel rules.
+DEFAULT_GLUE_FUSED_SPEC = "all"
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
@@ -344,6 +352,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA"))
         or False
+    ),
+    # ================== GLM-5.3-Flash Fused Glue Kernels ==================
+    # Which fused glue kernel (``vllm_neuron/functional/glue``) serves which call.
+    # ``0``: none, every site takes its torch route. ``1`` (the default):
+    # DEFAULT_GLUE_FUSED_SPEC. ``all``: every kernel at every phase and row count.
+    # Otherwise a comma list of rules ``kernel[:phase][@rows]``: ``kernel`` is one
+    # of mhc_pre, kda_projections, kda_output, mhc_post; ``phase`` is prefill,
+    # decode or all (the default); ``rows`` is N, N-M, N- or -M (inclusive, N >= 1).
+    # A call is fused when any rule selects it, and when the kernel's own shape
+    # rules admit it. Read when a graph is traced; a malformed value raises
+    # ValueError there. Example: ``mhc_post:prefill,mhc_pre:decode@2-64``.
+    "VLLM_NEURON_GLUE_FUSED": lambda: os.getenv("VLLM_NEURON_GLUE_FUSED", "1").strip(),
+    # How the KDA glue kernels load their weights' transposes: ``1`` (the default)
+    # by DMA transpose, ``0`` by a plain DMA and tensor-engine transposes.
+    "VLLM_NEURON_GLUE_KDA_DMA_TRANSPOSE": lambda: bool(
+        maybe_convert_bool(os.getenv("VLLM_NEURON_GLUE_KDA_DMA_TRANSPOSE", "1"))
     ),
 }
 

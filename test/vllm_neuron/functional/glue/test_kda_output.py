@@ -116,7 +116,7 @@ def test_gated_output_matches_0a08ff4(pair, batch):
     live, old, _ = pair
     core, gate, hidden = _operands(batch)
     fused.reset_dispatch_counters()
-    got = live._gated_output(core, gate, hidden)
+    got = live._gated_output(core, gate, hidden, phase="decode")
     assert fused.dispatch_counters() == (1, 0)
     want = old._gated_output(core, gate, hidden)
     assert got.dtype == want.dtype == torch.bfloat16
@@ -131,6 +131,17 @@ def test_the_kill_switch_restores_0a08ff4_bit_for_bit(pair, monkeypatch):
     monkeypatch.setenv("VLLM_NEURON_GLUE_FUSED", "0")
     core, gate, hidden = _operands(4)
     fused.reset_dispatch_counters()
-    got = live._gated_output(core, gate, hidden)
+    got = live._gated_output(core, gate, hidden, phase="decode")
     assert fused.dispatch_counters() == (0, 1)
     assert torch.equal(got, old._gated_output(core, gate, hidden))
+
+
+def test_the_layer_hands_its_phase_to_the_output_kernel(pair, monkeypatch):
+    """The phase the layer passes decides the route, whatever the row count."""
+    live, _, _ = pair
+    core, gate, hidden = _operands(4)
+    monkeypatch.setenv("VLLM_NEURON_GLUE_FUSED", "kda_output:prefill")
+    for phase, counters in (("prefill", (1, 0)), ("decode", (0, 1))):
+        fused.reset_dispatch_counters()
+        live._gated_output(core, gate, hidden, phase=phase)
+        assert fused.dispatch_counters() == counters, phase

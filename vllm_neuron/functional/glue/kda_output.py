@@ -38,13 +38,15 @@ from nkilib.core.utils.kernel_assert import kernel_assert
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
-from vllm_neuron.functional.glue import glue_fused_enabled
+from vllm_neuron import envs
+from vllm_neuron.functional.glue import glue_selected
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 #: Largest token count served.
 KDA_OUTPUT_MAX_TOKENS = 128
 
-#: ``1`` loads ``o_proj^T`` by DMA transpose, ``0`` by tensor-engine transposes.
+#: The switch (registered in :mod:`vllm_neuron.envs`): ``1`` loads ``o_proj^T`` by DMA
+#: transpose, ``0`` by a plain DMA and tensor-engine transposes.
 DMA_TRANSPOSE_ENV = "VLLM_NEURON_GLUE_KDA_DMA_TRANSPOSE"
 
 _P = 128
@@ -213,14 +215,28 @@ def launch_programs() -> int:
     return 2 if os.environ.get("NEURON_LOGICAL_NC_CONFIG") == "2" else 1
 
 
-def kda_gated_projection_admits(core: Tensor, out_gate: Tensor, attn) -> bool:
-    """True when the kernel serves this call: fp32 rows, bf16/fp32 ``o_proj``, ``T <= 128``."""
+def kda_gated_projection_admits(core: Tensor, out_gate: Tensor, attn,
+                                phase: str | None = None) -> bool:
+    """True when :func:`kda_gated_projection` serves this call on the kernel.
+
+    Args:
+        core: ``[T, W]`` fp32 attention core, ``W = heads * K``.
+        out_gate: ``[T, W]`` fp32 output gate (before its sigmoid).
+        attn: the KDA attention module (``o_norm_weight [K]``, ``o_proj_weight [H, W]``).
+        phase: the step's ``"prefill"`` or ``"decode"``; None when it is not known,
+            and then only a rule without a phase selects the kernel.
+
+    The kernel serves ``1 <= T <= KDA_OUTPUT_MAX_TOKENS``, ``W <= 128``, ``K`` a power of
+    two, bf16 or fp32 ``o_proj`` and gain, ``H`` in 128-blocks per program, on an NKI
+    device or the simulator, when ``VLLM_NEURON_GLUE_FUSED`` selects ``kda_output`` for
+    this row count and phase. Anything else is counted as declined.
+    """
     o_proj, gain = attn.o_proj_weight, attn.o_norm_weight
     heads, kdim = int(attn.num_kv_heads_per_rank), int(attn.head_dim)
     width = heads * kdim
     ok = (
-        glue_fused_enabled()
-        and core.dim() == 2 and out_gate.dim() == 2 and o_proj.dim() == 2
+        core.dim() == 2 and out_gate.dim() == 2 and o_proj.dim() == 2
+        and glue_selected("kda_output", int(core.shape[0]), phase)
         and core.dtype == torch.float32 and out_gate.dtype == torch.float32
         and o_proj.dtype in (torch.bfloat16, torch.float32)
         and gain.dtype in (torch.bfloat16, torch.float32)
@@ -250,14 +266,27 @@ def kda_gated_projection_torch(core: Tensor, out_gate: Tensor, attn) -> Tensor:
     return shaped.reshape(tokens, width) @ (attn.o_proj_weight.to(torch.float32).t())
 
 
-def kda_gated_projection(core: Tensor, out_gate: Tensor, attn) -> Tensor:
-    """``attn_out [T, H]`` fp32 before the TP reduction: the kernel or 0a08ff4 torch."""
-    if not kda_gated_projection_admits(core, out_gate, attn):
+def kda_gated_projection(core: Tensor, out_gate: Tensor, attn,
+                         phase: str | None = None) -> Tensor:
+    """The gated RMSNorm of ``core`` and its output projection, on the kernel or in torch.
+
+    Args:
+        core: ``[T, W]`` fp32 attention core.
+        out_gate: ``[T, W]`` fp32 output gate.
+        attn: the KDA attention module.
+        phase: the step's ``"prefill"`` or ``"decode"``, for ``VLLM_NEURON_GLUE_FUSED``.
+
+    Returns:
+        ``attn_out [T, H]`` fp32, this rank's partial sum before the TP reduction. When
+        :func:`kda_gated_projection_admits` says no, it is the torch expression
+        (:func:`kda_gated_projection_torch`).
+    """
+    if not kda_gated_projection_admits(core, out_gate, attn, phase):
         return kda_gated_projection_torch(core, out_gate, attn)
     _count_nki_dispatch()
     return _KERNELS[launch_programs()](
         core=core.contiguous(), out_gate=out_gate.contiguous(),
         o_norm=attn.o_norm_weight.contiguous(), o_proj=attn.o_proj_weight.contiguous(),
         HEADS=int(attn.num_kv_heads_per_rank), EPS=float(attn.rms_norm_eps),
-        DMA_TRANSPOSE=os.environ.get(DMA_TRANSPOSE_ENV, "1") != "0",
+        DMA_TRANSPOSE=envs.VLLM_NEURON_GLUE_KDA_DMA_TRANSPOSE,
     )
