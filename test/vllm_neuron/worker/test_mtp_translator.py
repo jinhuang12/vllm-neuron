@@ -10,8 +10,11 @@ kernels that consume ``T`` rows are another worker's): the one-request and the
 request-major two-request layouts of every per-row and per-request operand, the
 padding request's masks and null-block slots, the refusals (a mixed batch, a width
 that does not divide into whole requests), the step record the per-step state hook
-reads (``_glm5next_verify_step``), the ``draft_k`` keyword handed to the root, and
-``_glm5next_host_only_metadata`` staying on under the mtp spec config.
+reads (``_glm5next_step_record``), the ``spec_decode_metadata`` and ``draft_k``
+keywords handed to the root, the recurrent layers' checkpoint operands under method
+"mtp" (``state_checkpoints``, ``checkpoint_rows``: the next step starts from the row
+the host learned was accepted), and ``_glm5next_host_only_metadata`` staying on under
+the mtp spec config.
 
 Every expectation is derived from the world's own tables and positions.
 
@@ -66,7 +69,10 @@ def _verify_metadata(world, rows: list[int], *, cached: list[int], tokens: int, 
     return {bank["name"]: entry for bank in world.root.glm5next_layer_banks}
 
 
-def _convert(world, rows: list[int], *, cached: list[int], tokens: int, real: list[int], width: int = T):
+def _convert(
+    world, rows: list[int], *, cached: list[int], tokens: int, real: list[int], width: int = T,
+    spec_decode_metadata=None,
+):
     runner = world.runner
     runner.input_batch.req_ids = [world.req_ids[r] for r in rows]
     runner._glm5next_request_tokens = np.array(real, np.int32)
@@ -76,7 +82,7 @@ def _convert(world, rows: list[int], *, cached: list[int], tokens: int, real: li
         "attn_metadata": _verify_metadata(world, rows, cached=cached, tokens=tokens, width=width),
         "sampling_positions": torch.arange(tokens, dtype=torch.long),
         "sampling_params": None,
-        "spec_decode_metadata": None,
+        "spec_decode_metadata": spec_decode_metadata,
         "rank": None,
         "logit_mask": None,
     })
@@ -89,12 +95,15 @@ def _sparse(world, carriers) -> list[dict]:
     return sparse
 
 
-def _kda_convert(world, rows: list[int], *, cached: list[int], tokens: int, real: list[int]) -> list[dict]:
-    """The KDA batch file's recurrent-only world, read as a verify step; returns the carriers."""
+def _kda_convert(
+    world, rows: list[int], *, cached: list[int], tokens: int, real: list[int], width: int = T,
+) -> list[dict]:
+    """The KDA batch file's recurrent-only world, read as a decode step of ``width`` rows per
+    request (a verify step by default); returns the carriers."""
     runner = world.runner
     runner.input_batch.req_ids = [world.req_ids[r] for r in rows]
     runner._glm5next_request_tokens = np.array(real, np.int32)
-    metadata = kda._metadata(world.banks, rows=tokens, max_query_len=T, cached=cached)
+    metadata = kda._metadata(world.banks, rows=tokens, max_query_len=width, cached=cached)
     for entry in metadata.values():
         entry["decode_token_threshold"] = T
     converted = runner._glm5next_model_kwargs({
@@ -128,8 +137,10 @@ def test_a_one_request_verify_step_carries_t_rows_of_one_sequence():
         assert int(carrier["position"]) == start and int(carrier["start_position"]) == start
         assert torch.is_tensor(carrier["tail"]), "one request: its own ring view"
         assert tuple(carrier["block_table_row"].shape) == (WINDOW_BLOCKS, 1)
-    slot = world.runner._glm5next_verify_step["slots"][0]
-    assert world.runner._glm5next_verify_step == {"slots": [slot], "starts": [start], "counts": [T]}
+    slot = world.runner._glm5next_step_record["slots"][0]
+    assert world.runner._glm5next_step_record == {
+        "slots": [slot], "starts": [start], "counts": [T], "is_prefill": False, "width": T,
+    }
     # The cursor stands past every verify row; the per-step hook pulls it back to the
     # accepted count once the host knows it.
     assert world.runner._glm5next_side_cache_positions[slot] == start + T
@@ -148,8 +159,8 @@ def test_a_two_request_verify_step_is_request_major():
         assert carrier["start_position"].tolist() == starts
         assert tuple(carrier["block_table_row"].shape) == (WINDOW_BLOCKS, 2)
         _per_request(carrier, "pool_cache", 2)
-    assert world.runner._glm5next_verify_step["starts"] == starts
-    assert world.runner._glm5next_verify_step["counts"] == [T, T]
+    assert world.runner._glm5next_step_record["starts"] == starts
+    assert world.runner._glm5next_step_record["counts"] == [T, T]
 
 
 def test_a_bucket_padded_verify_step_masks_the_padding_request():
@@ -164,7 +175,7 @@ def test_a_bucket_padded_verify_step_masks_the_padding_request():
         assert carrier["position"].tolist() == starts + [0]
         _per_request(carrier, "tail", bucket)
     # Only the real requests are recorded for the hook.
-    assert world.runner._glm5next_verify_step["counts"] == [T, T]
+    assert world.runner._glm5next_step_record["counts"] == [T, T]
 
 
 def test_a_verify_step_hands_the_recurrent_layers_each_requests_rows():
@@ -176,7 +187,7 @@ def test_a_verify_step_hands_the_recurrent_layers_each_requests_rows():
         assert tuple(carrier["row_mask"].shape) == (2, T, 1)
         assert carrier["row_mask"].reshape(-1).tolist() == [1.0] * (2 * T)
         _per_request(carrier, "conv_state", 2)
-    assert world.runner._glm5next_verify_step["starts"] == starts
+    assert world.runner._glm5next_step_record["starts"] == starts
 
 
 def test_a_bucket_padded_verify_step_masks_the_recurrent_padding_rows():
@@ -190,6 +201,99 @@ def test_a_bucket_padded_verify_step_masks_the_recurrent_padding_rows():
         assert carrier["row_mask"][:2].reshape(-1).tolist() == [1.0] * (2 * T)
         # The padding request keeps its idle slot's state at position 1, as before.
         assert carrier["start_position"].tolist() == starts + [1]
+
+
+def test_a_verify_step_hands_the_root_its_spec_decode_metadata():
+    """The root runs the rejection sampler, so the step's metadata crosses under its own
+    name; a one-row decode (no drafts scheduled) carries none and the key stays absent."""
+    world = _world(1)
+    start = world.lengths[0]
+    metadata = object()
+    converted = _convert(world, [0], cached=[start], tokens=T, real=[T], spec_decode_metadata=metadata)
+    assert converted["spec_decode_metadata"] is metadata
+    # A fresh world: the verify step above advanced slot 0's ring past ``start``.
+    world = _world(1)
+    plain = _convert(world, [0], cached=[start], tokens=1, real=[1], width=1)
+    assert "spec_decode_metadata" not in plain
+
+
+def test_a_one_row_decode_and_a_prefill_are_recorded_for_the_hook_too():
+    """The hook zeroes the accepted count on these steps, so they are recorded as well."""
+    world = _world(1)
+    start = world.lengths[0]
+    _convert(world, [0], cached=[start], tokens=1, real=[1], width=1)
+    record = world.runner._glm5next_step_record
+    assert (record["is_prefill"], record["width"], record["counts"]) == (False, 1, [1])
+    plain = shadow._world()
+    _prefill_conversion(plain)
+    record = plain.runner._glm5next_step_record
+    assert (record["is_prefill"], record["counts"]) == (True, [len(shadow.PROMPT)])
+
+
+def _mtp_server(runner) -> None:
+    runner.is_mtp_spec = True
+    runner.drafter = SimpleNamespace(num_speculative_tokens=K)
+
+
+def test_the_recurrent_carriers_start_the_next_step_from_the_accepted_row():
+    """Under method "mtp" every decode step's recurrent carrier names the checkpoint
+    geometry (``state_checkpoints = T``) and each request's accepted draft count from
+    the verify step before it (0 after a prefill), which the per-step state hook
+    learned from the sampled ids; a bucket padding row starts from row 0."""
+    world = kda._world(2)
+    runner = world.runner
+    _mtp_server(runner)
+    starts = list(kda.PROMPTS[:2])
+    for carrier in _kda_convert(world, [0, 1], cached=starts, tokens=2 * T, real=[T, T]):
+        assert carrier["state_checkpoints"] == T
+        assert carrier["checkpoint_rows"].tolist() == [0, 0], "after a prefill"
+    # The host learns the kept ids: request 0 keeps three rows, request 1 one.
+    runner._update_states_after_model_execute([[5, 6, 7], [9]], None)
+    kept = [3, 1]
+    nexts = [s + n for s, n in zip(starts, kept)]
+    for carrier in _kda_convert(world, [0, 1], cached=nexts, tokens=2 * T, real=[T, T]):
+        assert carrier["start_position"].tolist() == nexts
+        assert carrier["checkpoint_rows"].tolist() == [n - 1 for n in kept]
+        assert carrier["checkpoint_rows"].dtype == torch.int32
+    runner._update_states_after_model_execute([[1, 2], [3, 4, 5, 6]], None)
+    kept = [2, T]
+    nexts = [s + n for s, n in zip(nexts, kept)]
+    bucket = 3
+    for carrier in _kda_convert(world, [0, 1], cached=nexts, tokens=bucket * T, real=[T, T]):
+        assert carrier["checkpoint_rows"].tolist() == [n - 1 for n in kept] + [0]
+    # A one-row decode on the same server (no drafts scheduled near max_model_len) keeps
+    # the checkpoint geometry: the banks have not changed shape.
+    runner._update_states_after_model_execute([[1], [2, 3]], None)
+    kept = [1, 2]
+    nexts = [s + n for s, n in zip(nexts, kept)]
+    for carrier in _kda_convert(world, [0, 1], cached=nexts, tokens=2, real=[1, 1], width=1):
+        assert carrier["state_checkpoints"] == T
+        assert carrier["checkpoint_rows"].tolist() == [n - 1 for n in kept]
+    runner._update_states_after_model_execute([[4], [5]], None)
+    nexts = [s + 1 for s in nexts]
+    for carrier in _kda_convert(world, [0, 1], cached=nexts, tokens=2, real=[1, 1], width=1):
+        assert carrier["checkpoint_rows"].tolist() == [0, 0], "a one-row step keeps its row 0"
+
+
+def test_without_the_mtp_spec_the_recurrent_carriers_carry_no_checkpoint_operands():
+    world = kda._world(1)
+    for carrier in _kda_convert(world, [0], cached=[kda.PROMPTS[0]], tokens=1, real=[1], width=1):
+        assert "state_checkpoints" not in carrier and "checkpoint_rows" not in carrier
+
+
+def test_a_padding_row_resumes_from_its_slots_own_row():
+    """A padding row names a slot no scheduled request holds; when that slot is owned by a
+    request this step does not schedule, its row is the owner's live one, so the layer
+    rewrites the slot with its own bytes (worker-57's checkpoint hazard)."""
+    runner = SimpleNamespace(
+        is_mtp_spec=True, drafter=SimpleNamespace(num_speculative_tokens=K),
+        _glm5next_checkpoint_rows={1: 2, 5: 3},
+    )
+    checkpoints = NeuronModelRunner._glm5next_recurrent_checkpoints(runner, [1, 7, 5], is_prefill=False)
+    assert checkpoints == (T, [2, 0, 3])
+    assert NeuronModelRunner._glm5next_recurrent_checkpoints(runner, [1], is_prefill=True) is None
+    runner.is_mtp_spec = False
+    assert NeuronModelRunner._glm5next_recurrent_checkpoints(runner, [1], is_prefill=False) is None
 
 
 def test_a_mixed_batch_is_refused_by_name():

@@ -24,6 +24,7 @@ import pathlib
 
 import pytest
 import torch
+from vllm.config import set_current_vllm_config
 from vllm.engine.arg_utils import EngineArgs
 
 from vllm_neuron.model.glm5_next import mtp as head_module
@@ -124,6 +125,7 @@ def test_load_model_binds_the_roots_own_head(monkeypatch):
     monkeypatch.setenv(KNOB, str(DRAFT_K))
     root = e2e._fixture()["root"]
     assert root.mtp is not None
+    assert root.draft_k == DRAFT_K, "the root records the k it built the head for"
     proposer = MtpProposer(_engine_config(_mtp()), torch.device("cpu"), True)
     proposer.load_model(root)
     assert proposer.model is root.mtp
@@ -133,6 +135,7 @@ def test_load_model_refuses_a_root_without_a_head_by_name(monkeypatch):
     e2e._require_cpu_mode()
     monkeypatch.delenv(KNOB, raising=False)
     root = e2e._fixture()["root"]
+    assert root.draft_k == 0
     assert root.mtp is None
     proposer = MtpProposer(_engine_config(_mtp()), torch.device("cpu"), True)
     with pytest.raises(ValueError, match="draft head"):
@@ -157,3 +160,36 @@ def test_the_eagle_only_hooks_are_no_ops():
     proposer = MtpProposer(_engine_config(_mtp()), torch.device("cpu"), True)
     assert proposer.warmup(num_tokens=4, num_reqs=1, attn_metadata={}) is None
     assert proposer.graph_extract(num_tokens=4, num_reqs=1, attn_metadata={}, device=None) is None
+
+
+# ── the head's reader of k honours the speculative config (team-lead ruling 10:10Z, hunk 1) ──
+
+
+def test_the_reader_takes_k_from_the_current_speculative_config(monkeypatch):
+    """Inside the worker's config context (``load_model``) the production reader is the
+    spec config; outside it, and without the knob, nothing drafts."""
+    monkeypatch.delenv(KNOB, raising=False)
+    config = _engine_config(_mtp(DRAFT_K))
+    with set_current_vllm_config(config, check_compile=False):
+        assert head_module.shadow_draft_k() == DRAFT_K
+    assert head_module.shadow_draft_k() == 0
+
+
+def test_the_knob_and_the_config_must_agree(monkeypatch):
+    config = _engine_config(_mtp(DRAFT_K))
+    monkeypatch.setenv(KNOB, str(DRAFT_K + 2))
+    with set_current_vllm_config(config, check_compile=False), pytest.raises(ValueError) as raised:
+        head_module.shadow_draft_k()
+    assert KNOB in str(raised.value) and "num_speculative_tokens" in str(raised.value)
+    monkeypatch.setenv(KNOB, str(DRAFT_K))
+    with set_current_vllm_config(config, check_compile=False):
+        assert head_module.shadow_draft_k() == DRAFT_K
+
+
+def test_a_config_without_speculation_leaves_the_knob_to_the_shadow_path(monkeypatch):
+    monkeypatch.setenv(KNOB, "5")
+    with set_current_vllm_config(_engine_config(None), check_compile=False):
+        assert head_module.shadow_draft_k() == 5
+    monkeypatch.delenv(KNOB, raising=False)
+    with set_current_vllm_config(_engine_config(None), check_compile=False):
+        assert head_module.shadow_draft_k() == 0
