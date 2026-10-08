@@ -29,10 +29,10 @@ def _worklist_probe(row_ids, expert_ids):
     manager = create_auto_alloc_manager()
     manager.open_scope("worklist_probe")
     step = _module._row_step(q, q)
-    tile_counts = _module._routing_counts(row_ids, step, manager)
+    span = _module._routing_spans(row_ids, step, manager)
     paired, classes, empty = _module._routing_worklists(
-        tile_counts, expert_ids, _module._row_classes(q, step), manager,
-        merge_pairs=(q == 256), extra=1)
+        span, _module._experts_row(expert_ids), _module._row_classes(q, step),
+        manager, merge_pairs=(q == 256), extra=1)
     result = []
     for worklist in ([paired] if paired else []) + classes + [empty]:
         listed = _module._list_entries(worklist, blocks)

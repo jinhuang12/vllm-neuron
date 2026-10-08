@@ -191,9 +191,9 @@ def _ownership_probe(row_ids, expert_ids):
     manager.open_scope("ownership_probe")
     q = row_ids.shape[1]
     step = _module._row_step(q, q)
-    tile_counts = _module._routing_counts(row_ids, step, manager)
+    span = _module._routing_spans(row_ids, step, manager)
     paired, classes, empty = _module._routing_worklists(
-        tile_counts, expert_ids, _module._row_classes(q, step), manager,
+        span, _module._experts_row(expert_ids), _module._row_classes(q, step), manager,
         merge_pairs=(q == 256),
     )
     result = []
@@ -260,11 +260,10 @@ def _small_pair_body_probe(hidden, weights, scales, row_ids, expert_ids,
     clamp = nl.ndarray((128, 3), dtype=nl.float32, buffer=nl.sbuf)
     nisa.dma_copy(dst=clamp, src=bounds)
     block = nisa.register_alloc(FIRST)
-    expert, scale = _module._expert_operands(expert_ids, scales, block,
-                                            weights.shape[1], nh)
-    _module._compute_rows(hidden, weights, affinity, row_ids, expert_ids,
-                          output, clamp, scale, expert, block, 0, 2 * q,
-                          2, 2)
+    loaded = _module._expert_operands(weights, scales, _module._experts_row(expert_ids),
+                                      block, 2, 2)
+    compute = (hidden, weights, row_ids, expert_ids, affinity, clamp, output)
+    _module._compute_rows(compute, loaded, block, 0, 2 * q)
     return output
 
 
