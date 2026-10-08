@@ -47,21 +47,26 @@ RTOL = 1e-2
 ATOL = 1e-5
 
 
-def _inputs(n_pools: int, seed: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+def _inputs(
+    n_pools: int,
+    seed: int,
+    score_dtype: torch.dtype = torch.float32,
+    pool_size: int = POOL_SIZE,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """One case's three input tensors.
 
     ``slot_k`` is bf16 because that is the only dtype the fused gate admits; ``ape`` is
-    fp32. ``slot_score`` is fp32 here and the kernel casts it, so the bf16-score route
-    is not what these cases read.
+    fp32. ``slot_score`` is fp32 unless a case asks for the bf16 score the indexer
+    serves; the kernel reads either.
     """
     gen = torch.Generator().manual_seed(seed)
     slot_k = torch.randn(
-        (n_pools, POOL_SIZE, INDEX_HEAD_DIM), generator=gen, dtype=torch.float32
+        (n_pools, pool_size, INDEX_HEAD_DIM), generator=gen, dtype=torch.float32
     ).to(torch.bfloat16)
     slot_score = torch.randn(
-        (n_pools, POOL_SIZE, INDEX_HEAD_DIM), generator=gen, dtype=torch.float32
-    )
-    ape = torch.randn((POOL_SIZE, INDEX_HEAD_DIM), generator=gen, dtype=torch.float32)
+        (n_pools, pool_size, INDEX_HEAD_DIM), generator=gen, dtype=torch.float32
+    ).to(score_dtype)
+    ape = torch.randn((pool_size, INDEX_HEAD_DIM), generator=gen, dtype=torch.float32)
     return slot_k, slot_score, ape
 
 
@@ -95,9 +100,14 @@ def _unfused_reference(
     return _reference_rotation(pooled, slot_k.dtype)
 
 
-def _assert_fused_matches_unfused(n_pools: int, seed: int) -> None:
+def _assert_fused_matches_unfused(
+    n_pools: int,
+    seed: int,
+    score_dtype: torch.dtype = torch.float32,
+    pool_size: int = POOL_SIZE,
+) -> None:
     """Run the fused kernel for one pool count and compare it with the unfused form."""
-    slot_k, slot_score, ape = _inputs(n_pools, seed)
+    slot_k, slot_score, ape = _inputs(n_pools, seed, score_dtype, pool_size)
     # The reference is built before the reset, so the counters read below cover the
     # kernel call alone.
     expected = _unfused_reference(slot_k, slot_score, ape)
@@ -325,10 +335,10 @@ def test_wrong_head_dim_is_refused() -> None:
 # ---------------------------------------------------------------------------------------------
 # Tiling branches
 #
-# The rotation splits its rows over the programs of the launch and tiles each program's share in
-# pieces whose sizes come from the module's tiling constants. The cases below derive their row
-# counts from those constants, so every branch of the tiling is reached at grid 1 and under LNC2
-# (``NEURON_LOGICAL_NC_CONFIG=2``, two programs) whatever the constants are.
+# Both kernels split their rows (pools) over the programs of the launch and tile each program's
+# share in pieces whose sizes come from the module's tiling constants. The cases below derive
+# their row and pool counts from those constants, so every branch of the tiling is reached at
+# grid 1 and under LNC2 (``NEURON_LOGICAL_NC_CONFIG=2``, two programs) whatever the constants are.
 # ---------------------------------------------------------------------------------------------
 
 PARTITIONS = 128
@@ -344,6 +354,13 @@ def _rows_reaching_every_rotation_branch(programs: int) -> int:
     ``_GROUP_TILES`` whenever that constant is above three.
     """
     per_program = PARTITIONS * kpool_hadamard._CHUNK_TILES + PARTITIONS * 3 + 5
+    return programs * per_program
+
+
+def _pools_reaching_every_pool_branch(programs: int) -> int:
+    """Per program: one whole tile of ``_POOL_TILE_COLUMNS`` pools per partition, a narrower
+    tile of one pool per partition, and a 3-partition tail."""
+    per_program = PARTITIONS * (kpool_hadamard._POOL_TILE_COLUMNS + 1) + 3
     return programs * per_program
 
 
@@ -383,3 +400,28 @@ def test_rotation_of_fp32_rows_under_lnc2_is_an_involution(monkeypatch: pytest.M
     monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", LNC2)
     x = _rows(_rows_reaching_every_rotation_branch(2), torch.float32, seed=302)
     torch.testing.assert_close(dsa_hadamard128(dsa_hadamard128(x)), x, rtol=0.0, atol=ATOL)
+
+
+@pytest.mark.parametrize("lnc", [None, LNC2], ids=["grid1", "lnc2"])
+@pytest.mark.parametrize("score_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+def test_pooling_reaches_every_tiling_branch(
+    monkeypatch: pytest.MonkeyPatch, lnc, score_dtype: torch.dtype
+) -> None:
+    """Whole pool tile, narrow tile and partition tail, with the served bf16 score and fp32."""
+    if lnc is None:
+        monkeypatch.delenv("NEURON_LOGICAL_NC_CONFIG", raising=False)
+    else:
+        monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", lnc)
+    programs = kpool_hadamard._programs(2)
+    _assert_fused_matches_unfused(
+        _pools_reaching_every_pool_branch(programs), seed=303, score_dtype=score_dtype
+    )
+
+
+@pytest.mark.parametrize("pool_size", [1, 3])
+def test_pooling_with_other_pool_sizes_under_lnc2(
+    monkeypatch: pytest.MonkeyPatch, pool_size: int
+) -> None:
+    """One slot (no max or sum chain at all) and an odd slot count."""
+    monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", LNC2)
+    _assert_fused_matches_unfused(260, seed=304 + pool_size, pool_size=pool_size)
