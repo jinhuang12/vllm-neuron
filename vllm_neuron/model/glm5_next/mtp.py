@@ -275,8 +275,8 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         """``x / sqrt(mean(x**2) + eps) * gain`` in fp32, cast back to the input dtype.
 
         The same body as ``Glm5NextModel._rms_norm`` -- which is load-bearing: the
-        trunk's ``_ffn_half`` is called with this head as its ``self`` (see
-        :meth:`_ffn_half`) and reads this method and ``text_config`` off it.
+        trunk's ``_ffn_half`` is handed this method as its ``rms_norm`` (see
+        :meth:`_ffn_half`), so the head's norms are the stack's.
         """
         eps = float(self.text_config.rms_norm_eps)
         x = hidden_states.to(torch.float32)
@@ -338,17 +338,17 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         authority on the feed-forward half (post-attention norm, the fused router's
         pre-norm input, routed bank, shared expert, and the one all-reduce at the
         feed-forward site), and layer 45 inherits whatever it does -- including any
-        later change to how that all-reduce is issued. It is a method of a class this
-        module does not instantiate, so it is called unbound with this head as its
-        ``self``; of ``self`` it reads ``text_config`` and ``_rms_norm`` only, both
-        of which this class provides with the stack's own meaning.
+        later change to how that all-reduce is issued. It is a static method that
+        takes what it reads by name: this head's ``text_config`` and its
+        :meth:`_rms_norm`, both with the stack's own meaning.
         """
         from .model_fp8 import Glm5NextModel
 
         return Glm5NextModel._ffn_half(
-            self,
             getattr(self, BLOCK_ATTR),
             attended,
+            text_config=self.text_config,
+            rms_norm=self._rms_norm,
             quant_config=quant_config,
             block_size=block_size,
             moe_group=moe_group,

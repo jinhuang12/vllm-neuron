@@ -7427,11 +7427,13 @@ class Glm5NextModel(nn.Module):
         normed = normed * gain.to(torch.float32)
         return normed.to(hidden_states.dtype)
 
+    @staticmethod
     def _ffn_half(
-        self,
         layer: nn.Module,
         hidden_states: torch.Tensor,
         *,
+        text_config: Glm5NextTextConfig,
+        rms_norm: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
         quant_config: Glm5NextQuantConfig,
         block_size: int | None,
         moe_group: object | None,
@@ -7444,6 +7446,22 @@ class Glm5NextModel(nn.Module):
         The residual add is the caller's, so this method is only the sublayer:
         normalise with that layer's own post-attention gain, then run whichever MLP
         ``_build_mlp`` gave the layer.
+
+        A static method: it reads nothing off a model instance, so the stack and the
+        MTP draft head (``mtp.py``) share one body. What it needs it takes by name:
+
+        * ``layer``: the module holding ``post_attention_layernorm_weight`` (``[H]``,
+          the FFN norm's gain) and ``mlp`` (a ``Glm5NextMoEBlock`` or a
+          ``Glm5NextDenseMLP``);
+        * ``hidden_states``: ``[T, H]`` in the stack's activation dtype, the
+          attention half's output after its residual add -- the FFN norm's input and
+          the fused router's pre-norm input;
+        * ``text_config``: the decoder config the MoE branch's routing hyperparameters
+          live on;
+        * ``rms_norm``: the caller's ``(hidden_states, gain) -> normed`` RMSNorm, the
+          one body the stack applies everywhere (``_rms_norm``), so the head's norms
+          are whatever the stack's are;
+        * the remaining keywords are the MoE branch's and are passed through.
 
         It lives here rather than in the layer forwards because both layer forwards
         end at the attention half, and joining the halves here leaves both of their
@@ -7476,7 +7494,7 @@ class Glm5NextModel(nn.Module):
                 f"post_attention_layernorm_weight; the FFN norm's gain is a "
                 f"mapped checkpoint tensor and nothing was loaded onto it"
             )
-        normed = self._rms_norm(hidden_states, gain)
+        normed = rms_norm(hidden_states, gain)
         if collector is not None:
             collector.append(normed)
         mlp = layer.mlp
@@ -7486,7 +7504,7 @@ class Glm5NextModel(nn.Module):
                 normed,
                 **({"collector": collector} if collector is not None else {}),
                 router_gamma=gain,
-                text_config=self.text_config,
+                text_config=text_config,
                 quant_config=quant_config,
                 block_size=block_size,
                 moe_group=moe_group,
@@ -7694,6 +7712,8 @@ class Glm5NextModel(nn.Module):
                 ): self._ffn_half(
                     layer,
                     single_stream,
+                    text_config=self.text_config,
+                    rms_norm=self._rms_norm,
                     quant_config=quant_config,
                     block_size=block_size,
                     moe_group=moe_group,

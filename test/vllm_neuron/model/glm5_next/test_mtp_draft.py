@@ -1123,3 +1123,28 @@ def test_softmax_scale_is_the_reference_derivation_not_the_latent_rank() -> None
     width = TINY_GEOMETRY["qk_nope_head_dim"] + TINY_GEOMETRY["qk_rope_head_dim"]
     assert SOFTMAX_SCALE == float(width**-0.5)
     assert SOFTMAX_SCALE != float(TINY_GEOMETRY["kv_lora_rank"] ** -0.5)
+
+
+def test_the_stacks_ffn_half_runs_on_the_heads_block_with_explicit_dependencies() -> None:
+    """``Glm5NextModel._ffn_half`` takes what it reads -- the config and the norm -- as
+    keywords, so the head runs it on its block without posing as a model instance, and
+    the result is the reference's MoE half; the injected norm is the one it applies."""
+    fx = _fixture(64_401)
+    head = fx["head"]
+    gen = torch.Generator().manual_seed(64_401)
+    attended = torch.randn(2, int(fx["cfg"].hidden_size), generator=gen).to(torch.bfloat16)
+    keywords = dict(quant_config=_quant_config(), block_size=None, moe_group=None,
+                    tp_degree=1, expert_parallel_rank=0)
+    got = _impl().Glm5NextModel._ffn_half(
+        head.block, attended, text_config=fx["cfg"], rms_norm=head._rms_norm, **keywords,
+    )
+    want = fx["ref"].ffn(attended) - attended
+    torch.testing.assert_close(got.float(), want.float(), rtol=HIDDEN_RTOL, atol=HIDDEN_ATOL)
+    doubled = _impl().Glm5NextModel._ffn_half(
+        head.block, attended, text_config=fx["cfg"],
+        rms_norm=lambda x, gain: head._rms_norm(x, gain) * 2, **keywords,
+    )
+    assert not torch.allclose(doubled.float(), got.float(), rtol=HIDDEN_RTOL, atol=HIDDEN_ATOL), (
+        "a different norm left the FFN half unchanged; the norm is read from somewhere "
+        "other than the keyword"
+    )
