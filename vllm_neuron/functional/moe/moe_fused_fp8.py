@@ -378,21 +378,24 @@ def _select(worklist, blocks, index, width=1):
                    scalar_offset=index, indirect_dim=1)
 
 
-def _routing_worklists(span, experts_row, bounds, sbm, merge_pairs=False, extra=0):
+def _routing_worklists(span, experts_row, bounds, sbm, merge_pairs=False, extra=0,
+                       empty_extra=0):
     """Compact routed blocks by row class, adjacent dense pairs, and empty blocks.
 
     ``span`` is ``_routing_spans``'s [1, blocks] row. Class ``c`` holds the
     blocks with ``bounds[c-1] < span <= bounds[c]``; the last class is the
     whole block. With ``merge_pairs``, consecutive whole-block entries of one
-    expert are paired greedily and leave that class. Returns
-    ``(paired or None, classes, empty)``; every PNC builds the same lists.
+    expert are paired greedily and leave that class. Every list holds ``extra``
+    padding entries past its ``blocks + 1``, the empty list
+    ``max(extra, empty_extra)``. Returns ``(paired or None, classes, empty)``;
+    every PNC builds the same lists.
     """
     blocks = span.shape[1]
 
     classes = []
     for _ in range(len(bounds)):
         classes.append(_worklist(blocks, extra, sbm))
-    empty = _worklist(blocks, extra, sbm)
+    empty = _worklist(blocks, max(extra, empty_extra), sbm)
     paired = None
     if merge_pairs:
         paired = _worklist(blocks, extra, sbm)
@@ -471,22 +474,69 @@ def _phase_bounds(total, program, nprograms, sbm):
     return boundary_reg
 
 
-def _work_item(worklist, blocks, at_index, sbm):
-    """Select one compacted item; duplicate the last item for an odd pair."""
-    sbm.open_scope(name="routing_work_item")
-    index = sbm.alloc((1, 8), nl.int32)[:, :1]
-    last = sbm.alloc((1, 8), nl.float32)[:, :1]
-    item = sbm.alloc((1, 8), nl.int32)[:, :1]
-    nisa.register_store(dst=index, src=at_index)
-    nisa.tensor_scalar(dst=last, data=worklist[1], op0=nl.add, operand0=-1)
-    nisa.tensor_scalar(dst=index, data=index, op0=nl.minimum, operand0=last)
-    position = nisa.register_alloc()
-    nisa.register_load(dst=position, src=index)
-    nisa.tensor_copy(dst=item, src=_select(worklist, blocks, position))
-    item_reg = nisa.register_alloc()
-    nisa.register_load(dst=item_reg, src=item)
+def _table_rows(blocks, nprograms):
+    """Rows of an item table: the item indices a loop over up to ``blocks`` items reaches."""
+    return -(-blocks // nprograms) * nprograms
+
+
+def _table_reach(blocks, nprograms, loops, slots):
+    """Empty-list entries that ``loops`` item tables can read, from entry 0.
+
+    A table reads entries up to first_slot + rows * slots. A loop over c items
+    advances first_slot by ceil(c / programs) * programs * slots, and the loops
+    share at most ``blocks`` items, so first_slot stays at or below
+    (blocks + loops * (programs - 1)) * slots.
+    """
+    return (blocks + loops * (nprograms - 1) + _table_rows(blocks, nprograms)) * slots
+
+
+def _item_table(worklist, empty, first_slot, slots, blocks, rows, sbm):
+    """Tabulate a loop's items and zero fills, int32 [1, rows, 1 + slots].
+
+    Row ``at`` serves iteration ``at``: column 0 is list entry ``at``, or past
+    the list its last entry (an odd list's second program repeats the last
+    item; later rows never run). Columns 1.. are empty-list entries
+    [first + at * slots, +slots), first = ``first_slot``; past that list they
+    hold the out-of-range id ``blocks``, whose DMAs the engine skips. One copy
+    then gives an iteration its block and its zero-fill targets, so the fills
+    issue beside the weights instead of behind engine work queued for the
+    products. ``first_slot`` then advances past every row the loop runs.
+    """
+    tile, count = worklist
+    empty_tile = empty[0]
+    nprograms = nl.num_programs(0)
+    table = sbm.alloc((1, rows, 1 + slots), nl.int32)
+    sbm.open_scope(name="item_table")
+    items = table[:, :, 0]
+    nisa.tensor_copy(dst=items, src=tile[:, blocks:blocks + rows])
+    # Entries past the list read ``blocks``; they become the last entry.
+    last = _tile(1, 1)
+    nisa.tensor_scalar(dst=last, data=count, op0=nl.add, operand0=-1)
+    last_index = _tile(1, 1, nl.int32)
+    nisa.tensor_copy(dst=last_index, src=last)
+    last_reg = nisa.register_alloc()
+    nisa.register_load(dst=last_reg, src=last_index)
+    shift = _tile(1, 1)
+    nisa.tensor_copy(dst=shift, src=_select(worklist, blocks, last_reg))
+    nisa.tensor_scalar(dst=shift, data=shift, op0=nl.add, operand0=-blocks)
+    padding = sbm.alloc((1, max(rows, 8)), nl.float32)[:, :rows]
+    nisa.tensor_scalar(dst=padding, data=items, op0=nl.equal, operand0=blocks,
+                       op1=nl.multiply, operand1=shift)
+    nisa.tensor_tensor(dst=items, data1=items, data2=padding, op=nl.add)
+    # Zero-fill targets: one strided read of the empty list from ``first_slot``.
+    first = _tile(1, 1, nl.int32)
+    nisa.tensor_copy(dst=first, src=first_slot)
+    first_reg = nisa.register_alloc()
+    nisa.register_load(dst=first_reg, src=first)
+    nisa.tensor_copy(dst=table[:, :, 1:1 + slots], src=empty_tile.ap(
+        pattern=[[empty_tile.shape[1], 1], [slots, rows], [1, slots]], offset=blocks,
+        scalar_offset=first_reg, indirect_dim=1))
+    iterations = _ceil_div(count, nprograms, sbm)
+    nisa.tensor_scalar(dst=iterations, data=iterations, op0=nl.multiply,
+                       operand0=nprograms * slots)
+    nisa.tensor_tensor(dst=first_slot, data1=first_slot, data2=iterations, op=nl.add)
     sbm.close_scope()
-    return item_reg
+    return table
 
 
 def _zero_rows(out, zeros, block, start, count):
@@ -540,30 +590,38 @@ def _block_rows(compute, loaded, zeros, block, width, block_m):
 def _item_loop(compute, loads, worklist, zero_fill, width, block_m, sbm):
     """One dynamic loop over a worklist, computing rows [0, width) of each block.
 
-    An iteration loads its block's weights, queues its zero fills behind them,
-    then computes. It zeroes ``slots`` entries of the empty list from
-    ``first_slot`` on; ``first_slot`` then advances past every slot the loop
-    owned, on both programs.
+    An iteration reads its block and its ``slots`` zero-fill targets from the
+    loop's item table (``_item_table``), loads the block's weights, queues the
+    zero fills behind them, then computes.
     """
     weights, scales, experts_row, kstep, nstep = loads
     zeros, empty, first_slot, slots = zero_fill
     out = compute[6]
-    blocks = out.shape[0]
+    blocks, q = out.shape[0], out.shape[1]
     nprograms, program = nl.num_programs(0), nl.program_id(0)
+    rows = _table_rows(blocks, nprograms)
+    table = _item_table(worklist, empty, first_slot, slots, blocks, rows, sbm)
     boundary = _phase_bounds(worklist[1], program, nprograms, sbm)
 
     def iteration(at_index):
-        block = _work_item(worklist, blocks, at_index, sbm)
+        sbm.open_scope(name="routing_item")
+        entry = sbm.alloc((1, max(1 + slots, 8)), nl.int32)[:, :1 + slots]
+        nisa.tensor_copy(dst=entry, src=table.ap(
+            pattern=[[rows * (1 + slots), 1], [1, 1 + slots]], scalar_offset=at_index,
+            indirect_dim=1))
+        block = nisa.register_alloc()
+        nisa.register_load(dst=block, src=entry[:, 0:1])
+        targets = []
+        for slot in range(slots):
+            target = nisa.register_alloc()
+            nisa.register_load(dst=target, src=entry[:, 1 + slot:2 + slot])
+            targets.append(target)
+        sbm.close_scope()
         loaded = _expert_operands(weights, scales, experts_row, block, kstep, nstep)
-        _zero_blocks(out, zeros, empty, first_slot, at_index, slots, sbm)
+        for target in targets:
+            _zero_rows(out, zeros, target, 0, q)
         _block_rows(compute, loaded, zeros, block, width, block_m)
     nl.fori_loop(program, boundary, iteration, step=nprograms)
-    sbm.open_scope(name="zero_slot_advance")
-    iterations = _ceil_div(worklist[1], nprograms, sbm)
-    nisa.tensor_scalar(dst=iterations, data=iterations, op0=nl.multiply,
-                       operand0=nprograms * slots)
-    nisa.tensor_tensor(dst=first_slot, data1=first_slot, data2=iterations, op=nl.add)
-    sbm.close_scope()
 
 
 @nki.jit
@@ -645,8 +703,10 @@ def moe_fused_fp8_kernel(hidden, weights, scales, row_ids, expert_ids, affinity,
     sbm = create_auto_alloc_manager()
     sbm.open_scope(name="routing")
     span = _routing_spans(row_ids, row_step, sbm)
+    loops = len(class_bounds) + (1 if merge_pairs else 0)
     paired, classes, empty = _routing_worklists(
-        span, experts_row, class_bounds, sbm, merge_pairs=merge_pairs, extra=trailing)
+        span, experts_row, class_bounds, sbm, merge_pairs=merge_pairs, extra=trailing,
+        empty_extra=_table_reach(blocks, nprograms, loops, slots) - blocks - 1)
     first_slot = sbm.alloc((1, 8), nl.float32)[:, :1]
     nisa.memset(dst=first_slot, value=0.0)
 

@@ -90,19 +90,24 @@ def _expected_lists(ids, experts, merge):
     return ([pairs] if merge else []) + classes + [empty]
 
 
-@pytest.mark.parametrize("programs", [1, 2])
-@pytest.mark.parametrize("blocks,q", [(1, 256), (3, 256), (9, 256), (49, 256), (5, 33), (4, 64)])
-def test_worklists_split_blocks_by_last_routed_row_tile(blocks, q, programs):
+def _spread_ids(blocks, q):
+    """Routing ids whose last routed row runs from empty through every class edge to a full block."""
     generator = torch.Generator().manual_seed(20261008 + blocks + q)
     ids = torch.full((blocks, q), -1, dtype=torch.int32)
     for block in range(blocks):
-        # Last routed row from empty through every class boundary to a full block.
         last = (block * 37) % (q + 1) - 1
         if last >= 0:
             ids[block, last] = block
             fill = torch.randperm(last + 1, generator=generator)[: (last + 1) // 2]
             ids[block, fill] = block
     experts = torch.tensor([b // 2 for b in range(blocks)], dtype=torch.int32).reshape(-1, 1)
+    return ids, experts
+
+
+@pytest.mark.parametrize("programs", [1, 2])
+@pytest.mark.parametrize("blocks,q", [(1, 256), (3, 256), (9, 256), (49, 256), (5, 33), (4, 64)])
+def test_worklists_split_blocks_by_last_routed_row_tile(blocks, q, programs):
+    ids, experts = _spread_ids(blocks, q)
     outputs = wrap_nki(_worklist_probe)[programs](ids, experts)
     expected = _expected_lists(ids, experts.flatten().tolist(), merge=(q == 256))
     assert len(outputs) == 2 * len(expected)
@@ -193,3 +198,60 @@ def test_every_block_routed_writes_no_zero_block(programs):
     torch.testing.assert_close(output, dense, rtol=1e-5, atol=1e-7)
     assert torch.count_nonzero(output[row_ids < 0]) == 0
 
+
+@nki.jit
+def _item_table_probe(row_ids, expert_ids, SLOTS=1):
+    """Copy every item table of a prefill, in loop order, and the empty list, to HBM."""
+    program, programs = nl.program_id(0), nl.num_programs(0)
+    blocks, q = row_ids.shape
+    manager = create_auto_alloc_manager()
+    manager.open_scope("item_table_probe")
+    step = _module._row_step(q, q)
+    bounds = _module._row_classes(q, step)
+    merge = q == 256
+    span = _module._routing_spans(row_ids, step, manager)
+    reach = _module._table_reach(blocks, programs, len(bounds) + merge, SLOTS)
+    paired, classes, empty = _module._routing_worklists(
+        span, _module._experts_row(expert_ids), bounds, manager, merge_pairs=merge,
+        extra=1, empty_extra=reach - blocks - 1)
+    first_slot = manager.alloc((1, 8), nl.float32)[:, :1]
+    nisa.memset(dst=first_slot, value=0.0)
+    rows = _module._table_rows(blocks, programs)
+    result = []
+    for worklist in ([paired] if paired else []) + classes:
+        table = _module._item_table(worklist, empty, first_slot, SLOTS, blocks, rows, manager)
+        copied = nl.ndarray((programs, rows, 1 + SLOTS), dtype=nl.int32, buffer=nl.shared_hbm)
+        nisa.dma_copy(dst=copied[program:program + 1], src=table)
+        result.append(copied)
+    listed = _module._list_entries(empty, blocks)
+    entries = nl.ndarray((programs, listed.shape[1]), dtype=nl.int32, buffer=nl.shared_hbm)
+    nisa.dma_copy(dst=entries[program:program + 1, :], src=listed)
+    manager.close_scope()
+    return tuple(result) + (entries,)
+
+
+@pytest.mark.parametrize("programs", [1, 2])
+@pytest.mark.parametrize("blocks,q,slots",
+                         [(1, 256, 1), (3, 256, 2), (9, 256, 3), (49, 256, 2), (5, 33, 1),
+                          (4, 64, 2)])
+def test_item_tables_give_each_iteration_its_block_and_zero_targets(blocks, q, slots, programs):
+    # Row ``at`` of a loop's table is iteration ``at``: its list entry (the last
+    # one again where a program runs past an odd list) and ``slots`` empty-list
+    # entries, which continue where the previous loop's run rows stopped.
+    ids, experts = _spread_ids(blocks, q)
+    *tables, entries = wrap_nki(_item_table_probe)[programs](ids, experts, SLOTS=slots)
+    *loops, empty = _expected_lists(ids, experts.flatten().tolist(), merge=(q == 256))
+    assert len(tables) == len(loops)
+    rows = -(-blocks // programs) * programs
+    width = entries.shape[1]
+    padded = empty + [blocks] * (width - len(empty))
+    first = 0
+    for table, wanted in zip(tables, loops):
+        run = -(-len(wanted) // programs) * programs
+        assert first + rows * slots <= width  # every read stays inside the empty list
+        targets = [[padded[first + at * slots + slot] for slot in range(slots)]
+                   for at in range(rows)]
+        for program in range(programs):
+            assert table[program, :run, 0].tolist() == wanted + wanted[-1:] * (run - len(wanted))
+            assert table[program, :, 1:].tolist() == targets
+        first += run * slots
