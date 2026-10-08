@@ -15,10 +15,13 @@ trees the same weights and the same operands.
   ``_resolve_tp_group`` answers ``None`` at both reductions.
 
 Weights. The mHC leaves, norms, KDA projections and the router are read from the served
-checkpoint when it is present (rank 0's rows; bf16 and fp32 as stored) and drawn at the
-same scale otherwise. The expert banks are random fp8 inside +-224 (the trn2 range the
-checkpoint load squeezes them into) with random block grids; the DSA attention is
-``dsa_decode_case.build_attention`` (random, one head per rank).
+checkpoint (rank 0's rows; bf16 and fp32 as stored), the directory
+``VLLM_NEURON_GLM5NEXT_CHECKPOINT_DIR`` names (``test/vllm_neuron/artifacts.py``). Where
+that checkpoint is absent the calling test skips, naming the path; ``_Source`` draws
+these leaves at random only when asked to (``use_checkpoint=False``). The expert banks
+are random fp8 inside +-224 (the trn2 range the checkpoint load squeezes them into) with
+random block grids; the DSA attention is ``dsa_decode_case.build_attention`` (random, one
+head per rank).
 """
 
 from __future__ import annotations
@@ -30,7 +33,8 @@ from types import MethodType, SimpleNamespace
 
 import torch
 
-CHECKPOINT = Path("/home/ubuntu/glm53f-campaign/lane-serve/models/GLM-5.3-Flash-04c4e9e9")
+from test.vllm_neuron import artifacts
+
 CONFIG_FIXTURE = (
     Path(__file__).resolve().parents[3] / "vllm_neuron/model/glm5_next/fixtures/config.json"
 )
@@ -74,23 +78,32 @@ def quant_config(model):
 
 
 class _Source:
-    """Rank 0's slice of a checkpoint tensor, or a random tensor of that shape."""
+    """Rank 0's slice of a served-checkpoint tensor, or a random tensor when asked for.
+
+    ``use_checkpoint=True`` (the default) reads the checkpoint
+    ``artifacts.require_checkpoint`` resolves, which skips the calling test, naming the
+    path, when it is absent; a leaf the checkpoint does not hold is a ``KeyError``.
+    ``use_checkpoint=False`` draws every leaf from ``seed`` at ``get``'s ``scale`` and
+    ``offset`` and reads no checkpoint.
+    """
 
     def __init__(self, seed: int, use_checkpoint: bool = True):
         self.gen = torch.Generator().manual_seed(int(seed))
-        index = CHECKPOINT / "model.safetensors.index.json"
-        self.map = (json.loads(index.read_text())["weight_map"]
-                    if use_checkpoint and index.exists() else None)
+        self.root = artifacts.require_checkpoint() if use_checkpoint else None
+        self.map = (None if self.root is None else json.loads(
+            (self.root / artifacts.CHECKPOINT_INDEX).read_text())["weight_map"])
 
     @property
     def real(self) -> bool:
         return self.map is not None
 
     def get(self, key: str, shape, dtype, rows=None, cols=None, scale=1.0, offset=0.0):
-        if self.map is not None and key in self.map:
+        if self.map is not None:
+            if key not in self.map:
+                raise KeyError(f"{key} is not in the checkpoint at {self.root}")
             from safetensors import safe_open
 
-            with safe_open(str(CHECKPOINT / self.map[key]), framework="pt") as f:
+            with safe_open(str(self.root / self.map[key]), framework="pt") as f:
                 part = f.get_slice(key)
                 if rows is not None and cols is not None:
                     tensor = part[rows[0]:rows[1], cols[0]:cols[1]]

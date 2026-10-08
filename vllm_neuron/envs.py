@@ -287,6 +287,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NEURON_CHECKPOINT_CACHE": lambda: os.getenv(
         "NXDI_CHECKPOINT_CACHE", "/tmp/vllm_neuron-checkpoints"
     ),
+    # The served GLM-5.3-Flash checkpoint directory (the one that holds
+    # model.safetensors.index.json) that tests and benchmarks under test/ read
+    # real weights from, through test/vllm_neuron/artifacts.py only. Unset or
+    # empty: the serving host's campaign checkpoint below. A test that needs the
+    # checkpoint skips, naming the resolved path, when the index is absent; it
+    # never substitutes random weights. The server does not read this knob.
+    "VLLM_NEURON_GLM5NEXT_CHECKPOINT_DIR": lambda: (
+        os.getenv("VLLM_NEURON_GLM5NEXT_CHECKPOINT_DIR")
+        or "/home/ubuntu/glm53f-campaign/lane-serve/models/GLM-5.3-Flash-04c4e9e9"
+    ),
     # Golden cache directory (disk tier)
     "VLLM_NEURON_GOLDEN_CACHE_DIR": lambda: os.path.expandvars(
         os.getenv("VLLM_NEURON_GOLDEN_CACHE_DIR", "/tmp/vllm_neuron-goldens-$USER")
