@@ -868,7 +868,9 @@ class Glm5NextHyperConnection(nn.Module):
             text_config: carries ``hc_mult``, ``hc_sinkhorn_iters``, ``hc_eps``
                 and ``rms_norm_eps``.
             neuron_config: framework overrides. ``mhc_sinkhorn_iters`` and
-                ``mhc_eps`` win when not ``None``.
+                ``mhc_eps`` win when not ``None``. The runner's
+                ``num_seqs_buckets`` and ``num_batched_tokens_buckets`` tell this
+                layer's two glue sites the step's phase (``max_decode_rows``).
             post_mult_value: the multiplier on the post gate. ``2.0`` is the
                 target model's own number -- it computes
                 ``post = 2 * sigmoid(post_w * post_scale + post_b)``, with the
@@ -891,6 +893,9 @@ class Glm5NextHyperConnection(nn.Module):
         Raises:
             Glm5NextHyperConnectionError: on a non-positive ``hc_mult``,
                 ``hidden_size`` or iteration count.
+            ValueError: when ``VLLM_NEURON_GLUE_FUSED`` routes an mHC kernel by
+                phase at the row count of a prefill bucket that a decode batch can
+                also have (``functional.glue.require_rows_tell_phase``).
         """
         super().__init__()
         hc_mult = int(text_config.hc_mult)
@@ -929,6 +934,26 @@ class Glm5NextHyperConnection(nn.Module):
         self.rms_eps = float(text_config.rms_norm_eps)
         self.post_mult_value = float(post_mult_value)
 
+        # The step's phase for the glue switch (``VLLM_NEURON_GLUE_FUSED``,
+        # functional/glue). This layer sees only ``[T, S, H]`` streams, so it tells
+        # the phases apart by row count. The runner pads a decode batch to one of
+        # ``num_seqs_buckets``, one row per request (its layer carriers refuse a
+        # decode step of more tokens than requests), so a call of more rows than the
+        # largest bucket is a prefill chunk. A prefill bucket that a decode batch can also
+        # have is refused here when the switch routes it by phase. None when the
+        # layer is built without the runner's buckets; then only a rule without a
+        # phase selects a kernel here.
+        decode_buckets = getattr(neuron_config, "num_seqs_buckets", None)
+        self.max_decode_rows = max(decode_buckets) if decode_buckets else None
+        if self.max_decode_rows is not None:
+            from vllm_neuron.functional.glue import require_rows_tell_phase
+
+            require_rows_tell_phase(
+                ("mhc_pre", "mhc_post"),
+                self.max_decode_rows,
+                getattr(neuron_config, "num_batched_tokens_buckets", None) or (),
+            )
+
         # ``hc_mult3`` is the base's own name for the projection's output width:
         # ``hc_mult`` pre weights + ``hc_mult`` post weights + ``hc_mult ** 2``
         # mixing weights, in that order, which is the order the three heads are
@@ -958,6 +983,12 @@ class Glm5NextHyperConnection(nn.Module):
         self.hc_base = nn.Parameter(
             torch.zeros(self.hc_mult3, dtype=torch.float32), requires_grad=False
         )
+
+    def _glue_phase(self, tokens: int) -> str | None:
+        """The glue switch's phase for a call of ``tokens`` rows (``max_decode_rows``)."""
+        if self.max_decode_rows is None:
+            return None
+        return "decode" if tokens <= self.max_decode_rows else "prefill"
 
     # ── mHC pre: the folded input, and one Sinkhorn call ──────────────────
     def mhc_pre(
@@ -994,6 +1025,16 @@ class Glm5NextHyperConnection(nn.Module):
         from vllm_neuron.functional.mhc.sinkhorn import sinkhorn_normalise_blocks
 
         tokens, streams, hidden = self._require_streams(residual)
+
+        from vllm_neuron.functional.glue import mhc_pre as glue_mhc_pre
+
+        if glue_mhc_pre.mhc_pre_admits(residual, self.fn, self.hc_scale, self.hc_base,
+                                       phase=self._glue_phase(tokens)):
+            post_mix, comb_start, layer_input = glue_mhc_pre.mhc_pre_fused(
+                residual, self.fn, self.hc_scale, self.hc_base, rms_eps=self.rms_eps,
+                hc_eps=self.hc_eps, post_mult=self.post_mult_value)
+            comb_mix = sinkhorn_normalise_blocks(comb_start, iters=self.sinkhorn_iters)
+            return post_mix, comb_mix, layer_input
 
         flat = residual.reshape(tokens, streams * hidden).to(torch.float32)
         mixes = flat @ self.fn.to(torch.float32).t()
@@ -1092,12 +1133,18 @@ class Glm5NextHyperConnection(nn.Module):
             hyper_connection_combine,
         )
 
+        from vllm_neuron.functional.glue import glue_selected
+
         # Argument names and order are the kernel's, which are the base's, so this
-        # is a call rather than a translation. The kernel takes fp32 and computes
-        # in fp32; only the return is cast back to the carrier's dtype.
+        # is a call rather than a translation. The kernel computes in fp32 and takes
+        # bf16 ``x`` and streams as they are (functional/glue); where the glue switch
+        # does not select ``mhc_post`` for this call they are widened first, as on the
+        # torch route. Same values either way.
+        rows = int(residual.shape[0])
+        wide = not glue_selected("mhc_post", rows, self._glue_phase(rows))
         mixed = hyper_connection_combine(
-            x=x.to(torch.float32),
-            residual=residual.to(torch.float32),
+            x=x.to(torch.float32) if wide else x,
+            residual=residual.to(torch.float32) if wide else residual,
             post_layer_mix=post_layer_mix.to(torch.float32),
             comb_res_mix=comb_res_mix.to(torch.float32),
         )
@@ -3497,24 +3544,15 @@ class Glm5NextKDAAttention(nn.Module):
                 f"for each row of hidden_states"
             )
 
-        x = hidden_states.to(torch.float32)
+        from vllm_neuron.functional.glue.kda_projections import kda_projections
 
-        def project(weight: torch.Tensor) -> torch.Tensor:
-            return x @ weight.to(torch.float32).t()
-
-        q_in = project(self.q_proj_weight)
-        k_in = project(self.k_proj_weight)
-        v_in = project(self.v_proj_weight)
-        raw_beta = project(self.b_proj_weight)
-        # Both gates are low-rank: a bottleneck projection, then an expansion
-        # back to the head width. The bottleneck width is read from the weights
-        # rather than from the config, because the config declares no such field.
-        raw_gate = (x @ self.f_a_proj_weight.to(torch.float32).t()) @ (
-            self.f_b_proj_weight.to(torch.float32).t()
-        )
-        out_gate = (x @ self.g_a_proj_weight.to(torch.float32).t()) @ (
-            self.g_b_proj_weight.to(torch.float32).t()
-        )
+        # The six input projections (both gates low-rank: a bottleneck, then an
+        # expansion), on the fused kernel or the torch expressions. ``phase``
+        # selects the glue kernels here and at the output projection
+        # (``VLLM_NEURON_GLUE_FUSED``, functional/glue).
+        phase = "prefill" if is_prefill else "decode"
+        q_in, k_in, v_in, raw_gate, raw_beta, out_gate = kda_projections(
+            hidden_states, self, phase=phase)
 
         # A sequence that has computed nothing enters with a zero state, and this is
         # the one predicate that says so. A sequence at position 0 carries no
@@ -3562,7 +3600,7 @@ class Glm5NextKDAAttention(nn.Module):
             )
             conv_state.copy_(fused.conv_state[0])
             recurrent_state.copy_(fused.recurrent_state[0])
-            return self._gated_output(fused.core, out_gate, hidden_states)
+            return self._gated_output(fused.core, out_gate, hidden_states, phase=phase)
 
         # --- 1: the short convolution, one call for q, k and v ---------------
         # The three streams are convolved together as one channel block, which is
@@ -3717,7 +3755,7 @@ class Glm5NextKDAAttention(nn.Module):
 
             recurrent_state[h] = state.to(recurrent_state.dtype)
 
-        return self._gated_output(core, out_gate, hidden_states)
+        return self._gated_output(core, out_gate, hidden_states, phase=phase)
 
     def _fused_decode_requests(
         self,
@@ -3801,23 +3839,16 @@ class Glm5NextKDAAttention(nn.Module):
                     for one in start_position
                 ]
             )
-        x = hidden_states.to(torch.float32)
+        from vllm_neuron.functional.glue.kda_projections import kda_projections
 
-        def project(weight: torch.Tensor) -> torch.Tensor:
-            return x @ weight.to(torch.float32).t()
-
-        raw_gate = (x @ self.f_a_proj_weight.to(torch.float32).t()) @ (
-            self.f_b_proj_weight.to(torch.float32).t()
-        )
-        out_gate = (x @ self.g_a_proj_weight.to(torch.float32).t()) @ (
-            self.g_b_proj_weight.to(torch.float32).t()
-        )
+        q_in, k_in, v_in, raw_gate, raw_beta, out_gate = kda_projections(
+            hidden_states, self, phase="decode")
         fused = kda_fused_decode(
-            project(self.q_proj_weight),
-            project(self.k_proj_weight),
-            project(self.v_proj_weight),
+            q_in,
+            k_in,
+            v_in,
             raw_gate,
-            project(self.b_proj_weight),
+            raw_beta,
             conv_state=(
                 torch.stack(convs) if state_slots is None
                 else gather_bank_rows(convs, state_slots)
@@ -3844,32 +3875,26 @@ class Glm5NextKDAAttention(nn.Module):
         else:
             scatter_bank_rows(convs, state_slots, fused.conv_state)
             scatter_bank_rows(recurrents, state_slots, fused.recurrent_state)
-        return self._gated_output(fused.core, out_gate, hidden_states)
+        return self._gated_output(fused.core, out_gate, hidden_states, phase="decode")
 
     def _gated_output(
-        self, core: torch.Tensor, out_gate: torch.Tensor, hidden_states: torch.Tensor
+        self, core: torch.Tensor, out_gate: torch.Tensor, hidden_states: torch.Tensor,
+        *, phase: str,
     ) -> torch.Tensor:
-        """The attention output from ``core`` (``[tokens, H*K]`` float32)."""
-        tokens = int(core.shape[0])
-        heads = int(self.num_kv_heads_per_rank)
-        kdim = int(self.head_dim)
-        width = heads * kdim
+        """The attention output from ``core`` (``[tokens, H*K]`` float32).
+
+        ``phase`` (``"prefill"`` or ``"decode"``) is the step's, for the glue switch.
+        """
+        from vllm_neuron.functional.glue.kda_output import kda_gated_projection
+
         # --- gated output norm, then the output projection -------------------
         # ``rmsnorm(core) * sigmoid(out_gate)``, normalised over the head extent
         # because the norm gain is one value per key channel. The reference
         # builds this half as a gated RMSNorm whose activation is sigmoid
         # (``kimi_gdn_linear_attn.py``), which is why the raw gate is passed
-        # through a sigmoid here and not through a silu.
-        shaped = core.reshape(tokens, heads, kdim)
-        variance = shaped.pow(2).mean(dim=-1, keepdim=True)
-        shaped = shaped * torch.rsqrt(variance + self.rms_norm_eps)
-        shaped = shaped * self.o_norm_weight.to(torch.float32).reshape(1, 1, kdim)
-        shaped = shaped * torch.sigmoid(
-            out_gate.reshape(tokens, heads, kdim)
-        )
-        attn_out = shaped.reshape(tokens, width) @ (
-            self.o_proj_weight.to(torch.float32).t()
-        )
+        # through a sigmoid here and not through a silu. On the fused kernel or
+        # the torch expressions (functional/glue/kda_output.py).
+        attn_out = kda_gated_projection(core, out_gate, self, phase=phase)
         # ``o_proj_weight`` is row-parallel, so this is one rank's partial sum.
         # Reduce it before the cast below, in the wire dtype ``collective_policy``
         # names: fp32 as built, where partials add at the width they were computed

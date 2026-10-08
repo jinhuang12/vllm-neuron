@@ -100,6 +100,10 @@ if TYPE_CHECKING:
     # Divide the GLM-5.3-Flash DSA prefill selection's query rows over the
     # tensor-parallel ranks. On by default; 0 restores the replicated selection.
     VLLM_NEURON_DSA_INDEXER_SHARD: bool = True
+    # GLM-5.3-Flash fused glue kernels (``vllm_neuron/functional/glue``): which
+    # kernel serves which call, and how the KDA kernels load their weights.
+    VLLM_NEURON_GLUE_FUSED: str = "1"
+    VLLM_NEURON_GLUE_KDA_DMA_TRANSPOSE: bool = True
 
 
 def maybe_convert_bool(value: str | None) -> bool | None:
@@ -197,6 +201,35 @@ def maybe_measured_float(value: str | None) -> float | None:
 #: MiB of graph). ``VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB`` overrides both the
 #: measured need and this figure.
 DEFAULT_DEVICE_GRAPH_RESERVE_GIB = 5.0
+
+#: What ``VLLM_NEURON_GLUE_FUSED=1``, and an unset switch, selects: each fused glue
+#: kernel at the prefill row buckets where it beat its torch route, and nothing else.
+#:
+#: The buckets are the ones where the in-graph device A/B
+#: (``test/hardware/benchmark_glue_block.py``) measured a win. It runs one
+#: GLM-5.3-Flash KDA + MoE layer per graph at one TP=64 rank's shapes on trn2, and
+#: compares each value with ``0``; ``reports/glue.md`` (round 2, the in-graph A/B
+#: section) has the tables. Per layer:
+#:
+#: * ``mhc_pre:prefill@128``: the fused mHC pre-mix, 254.0 us faster on a 2.54 ms
+#:   128-row layer. It serves at most 128 rows (``mhc_pre.MHC_PRE_MAX_TOKENS``).
+#: * ``mhc_post:prefill@128`` and ``mhc_post:prefill@1024``: the bf16 mHC combine,
+#:   45.2 us faster at 128 rows and 275.0 us faster on a 16.0 ms 1024-row layer, but
+#:   197.1 us slower on a 9.07 ms 512-row layer. So the default names the measured
+#:   buckets, not a range, and a row count that was not measured keeps the torch route.
+#:
+#: Two loads of one graph have measured up to 11 us apart, so a gain of 11 us or less
+#: is not a win. kda_projections was 7.1 us faster at 128 rows, and 0.3 us slower when
+#: the layer's two reductions were chains of 4 and 8 all-reduces: inside that bound, so
+#: it is not in the default. kda_output was 24.1 us slower at 128 rows. No kernel is
+#: selected at decode: on the served TP=64 line, ``all`` made the bs=1 decode step
+#: 1.75 ms longer, while the single-rank benchmark (no tensor-parallel collectives)
+#: measured it shorter. So every decode graph under ``1`` is the graph ``0`` traces.
+#:
+#: Measure a bucket before adding it, on a device lease, with
+#: ``python test/hardware/benchmark_glue_block.py --output <json> --cases
+#: kda:prefill:<rows> --variants off aa=0 <kernel> default``.
+DEFAULT_GLUE_FUSED_SPEC = "mhc_pre:prefill@128,mhc_post:prefill@128,mhc_post:prefill@1024"
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
@@ -435,6 +468,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the replicated selection on every rank.
     "VLLM_NEURON_DSA_INDEXER_SHARD": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_DSA_INDEXER_SHARD", "1"))
+    ),
+    # ================== GLM-5.3-Flash Fused Glue Kernels ==================
+    # Which fused glue kernel (``vllm_neuron/functional/glue``) serves which call.
+    # ``0``: none, every site takes its torch route. ``1`` (the default):
+    # DEFAULT_GLUE_FUSED_SPEC. ``all``: every kernel at every phase and row count.
+    # Otherwise a comma list of rules ``kernel[:phase][@rows]``: ``kernel`` is one
+    # of mhc_pre, kda_projections, kda_output, mhc_post; ``phase`` is prefill,
+    # decode or all (the default); ``rows`` is N, N-M, N- or -M (inclusive, N >= 1).
+    # A call is fused when any rule selects it, and when the kernel's own shape
+    # rules admit it. Read when a graph is traced; a malformed value raises
+    # ValueError there. Example: ``mhc_post:prefill,mhc_pre:decode@2-64``.
+    "VLLM_NEURON_GLUE_FUSED": lambda: os.getenv("VLLM_NEURON_GLUE_FUSED", "1").strip(),
+    # How the KDA glue kernels load their weights' transposes: ``1`` (the default)
+    # by DMA transpose, ``0`` by a plain DMA and tensor-engine transposes.
+    "VLLM_NEURON_GLUE_KDA_DMA_TRANSPOSE": lambda: bool(
+        maybe_convert_bool(os.getenv("VLLM_NEURON_GLUE_KDA_DMA_TRANSPOSE", "1"))
     ),
 }
 
