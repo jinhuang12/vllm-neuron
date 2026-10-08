@@ -20,6 +20,7 @@ import math
 import pytest
 import torch
 
+from vllm_neuron.functional.dsa import kpool_hadamard
 from vllm_neuron.functional.dsa.kpool_hadamard import (
     HADAMARD_SCALE,
     HADAMARD_STAGES,
@@ -319,3 +320,66 @@ def test_wrong_head_dim_is_refused() -> None:
     """A head dimension other than 128 raises: the Hadamard path is a 128-point transform."""
     with pytest.raises(KpoolHadamardError):
         dsa_hadamard128(torch.zeros((4, 64), dtype=torch.bfloat16))
+
+
+# ---------------------------------------------------------------------------------------------
+# Tiling branches
+#
+# The rotation splits its rows over the programs of the launch and tiles each program's share in
+# pieces whose sizes come from the module's tiling constants. The cases below derive their row
+# counts from those constants, so every branch of the tiling is reached at grid 1 and under LNC2
+# (``NEURON_LOGICAL_NC_CONFIG=2``, two programs) whatever the constants are.
+# ---------------------------------------------------------------------------------------------
+
+PARTITIONS = 128
+"""SBUF partitions, the row count of one tile on every NeuronCore generation."""
+
+LNC2 = "2"
+
+
+def _rows_reaching_every_rotation_branch(programs: int) -> int:
+    """Per program: one whole chunk, a short chunk of three tiles, and a 5-row partial tile.
+
+    The short chunk has an odd tile count, so its last PSUM group is narrower than
+    ``_GROUP_TILES`` whenever that constant is above three.
+    """
+    per_program = PARTITIONS * kpool_hadamard._CHUNK_TILES + PARTITIONS * 3 + 5
+    return programs * per_program
+
+
+def test_launch_uses_both_cores_under_lnc2(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Two programs under LNC2 once there are two rows to split, one otherwise."""
+    monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", LNC2)
+    assert kpool_hadamard._programs(2) == 2
+    assert kpool_hadamard._programs(1) == 1
+    monkeypatch.delenv("NEURON_LOGICAL_NC_CONFIG")
+    assert kpool_hadamard._programs(2) == 1
+
+
+@pytest.mark.parametrize("lnc", [None, LNC2], ids=["grid1", "lnc2"])
+def test_rotation_reaches_every_tiling_branch(monkeypatch: pytest.MonkeyPatch, lnc) -> None:
+    """Whole chunk, short chunk, short PSUM group and partial tile, on one core and on two."""
+    if lnc is None:
+        monkeypatch.delenv("NEURON_LOGICAL_NC_CONFIG", raising=False)
+    else:
+        monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", lnc)
+    programs = kpool_hadamard._programs(2)
+    _assert_rotation_matches_reference(
+        _rows_reaching_every_rotation_branch(programs), torch.bfloat16, seed=301
+    )
+
+
+@pytest.mark.parametrize("n_rows", [1, 3, 32, 128, 512, 2048])
+def test_rotation_at_decode_row_counts_under_lnc2(
+    monkeypatch: pytest.MonkeyPatch, n_rows: int
+) -> None:
+    """The served decode calls rotate ``batch * index_n_heads`` rows; 1 and 3 split unevenly."""
+    monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", LNC2)
+    _assert_rotation_matches_reference(n_rows, torch.bfloat16, seed=400 + n_rows)
+
+
+def test_rotation_of_fp32_rows_under_lnc2_is_an_involution(monkeypatch: pytest.MonkeyPatch) -> None:
+    """fp32 rows take the same path under LNC2 and still satisfy ``h(h(x)) == x`` to 1e-5."""
+    monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", LNC2)
+    x = _rows(_rows_reaching_every_rotation_branch(2), torch.float32, seed=302)
+    torch.testing.assert_close(dsa_hadamard128(dsa_hadamard128(x)), x, rtol=0.0, atol=ATOL)
