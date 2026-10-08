@@ -8,7 +8,7 @@ partition, and splits the rows over both cores. The arithmetic is the same fp32 
 subtract on the same operands in the same order, so the contract is equality, not a
 tolerance: any differing bit is a defect.
 
-The reference is the 0a08ff4 snapshot (``test/hardware/baselines/dsa_0a08ff4``), run in
+The reference is the 0a08ff4 snapshot (``test/hardware/baselines/dsa_four_kernel_select``), run in
 the same simulator.
 """
 
@@ -20,7 +20,7 @@ import torch
 from vllm_neuron.functional.dsa import kpool_hadamard as KH
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
-from test.hardware.baselines.dsa_0a08ff4 import load as load_0a08ff4
+from test.hardware.baselines.dsa_four_kernel_select import load as load_0a08ff4
 
 #: Row counts: one row, a ragged tile, one whole tile, more than one tile, the decode
 #: query at B=4 and B=64 (32 heads per request), and a count that leaves a short final

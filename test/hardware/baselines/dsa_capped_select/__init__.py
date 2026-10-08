@@ -5,7 +5,7 @@
 pinned blob id, rewrites the imports between these files to point at the snapshot's own
 copies, and imports the result from a temporary directory outside the worktree. Every
 other import (configs, loaders, attention kernels, the DSA kernels this change does not
-edit) resolves to the live tree. The layout is ``dsa_0a08ff4``'s.
+edit) resolves to the live tree. The layout is ``dsa_four_kernel_select``'s.
 
 What it serves: :func:`chain` is e3f38f8's decode indexer chain for ``B`` requests from
 the indexer's projections on -- the query rotation (``dsa_hadamard128``) and then
@@ -42,7 +42,7 @@ SOURCES: dict[str, tuple[str, str]] = {
                      "8a7d01c0cce30e92bd3bfac03599523d76ee2413"),
 }
 
-PACKAGE = "dsa_e3f38f8_snapshot"
+PACKAGE = "dsa_capped_select_snapshot"
 
 #: Live module paths the snapshot's own copies replace inside every snapshot file. Each
 #: is a full dotted module path, so no rewrite is a prefix of a module kept live.
@@ -71,7 +71,7 @@ def load() -> types.SimpleNamespace:
     global _LOADED
     if _LOADED is not None:
         return _LOADED
-    where = pathlib.Path(tempfile.mkdtemp(prefix="dsa_e3f38f8_"))
+    where = pathlib.Path(tempfile.mkdtemp(prefix="dsa_capped_select_"))
     package = where / PACKAGE
     package.mkdir(parents=True)
     (package / "__init__.py").write_text('"""Commit e3f38f8, read by git show."""\n')

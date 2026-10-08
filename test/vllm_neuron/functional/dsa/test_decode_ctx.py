@@ -36,8 +36,8 @@ import functools
 import pytest
 import torch
 
-from test.hardware.baselines.dsa_e3f38f8 import chain as chain_base
-from test.hardware.baselines.dsa_e3f38f8 import load_or_skip as load_base
+from test.hardware.baselines.dsa_capped_select import chain as chain_base
+from test.hardware.baselines.dsa_capped_select import load_or_skip as load_base
 from test.vllm_neuron.functional.dsa.dsa_decode_case import decode_config
 from vllm_neuron import envs
 from vllm_neuron.functional.dsa import decode_batch as DB

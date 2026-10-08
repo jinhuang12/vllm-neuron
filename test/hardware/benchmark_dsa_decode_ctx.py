@@ -10,7 +10,7 @@ layers of operands at the call site's real shapes -- the per-rank TP=64 indexer 
 of 128, ``index_topk`` 2048, ``index_kpool`` 4), a pooled-key bank of ``ctx // 4 + 1``
 rows per slot (``_glm5next_side_caches`` at ``max_model_len = ctx``) and
 ``max_seq_len = ctx`` -- and times, for ``before`` (e3f38f8,
-``test/hardware/baselines/dsa_e3f38f8``) and ``after`` (this tree):
+``test/hardware/baselines/dsa_capped_select``) and ``after`` (this tree):
 
 * ``chain`` -- the decode indexer chain as ``Glm5NextMLAAttention._forward_requests``
   runs it from the projections on: the query rotation and
@@ -647,7 +647,7 @@ def _kernel_call(tree: str, kernel: str, batch: int, cands: int, programs: int,
     if tree == "after":
         from vllm_neuron.functional.dsa import decode_batch as db, decode_select as ds
     else:
-        base = _bench().load_baseline(ROOT / "test/hardware/baselines/dsa_e3f38f8")[1]
+        base = _bench().load_baseline(ROOT / "test/hardware/baselines/dsa_capped_select")[1]
         db, ds = base.decode_batch, base.decode_select
     from vllm_neuron.functional.dsa.index_expand import index_expand_width
     bf, f32, i32 = torch.bfloat16, torch.float32, torch.int32
@@ -693,7 +693,7 @@ def _chain_call(tree: str, batch: int, cands: int):
     and ``max_seq_len = ctx`` (``Tree.chain``), operands on the meta device."""
     torch = _torch()
     from test.vllm_neuron.functional.dsa import dsa_decode_case as case
-    base = _bench().load_baseline(ROOT / "test/hardware/baselines/dsa_e3f38f8")[1]
+    base = _bench().load_baseline(ROOT / "test/hardware/baselines/dsa_capped_select")[1]
     cfg = case.decode_config()
     pool = int(cfg.index_kpool)
     ctx = int(cands) * pool
@@ -870,7 +870,7 @@ def main() -> None:
     sub = parser.add_subparsers(dest="cmd", required=True)
     run = sub.add_parser("run")
     run.add_argument("--baseline-module", type=Path,
-                     default=ROOT / "test/hardware/baselines/dsa_e3f38f8")
+                     default=ROOT / "test/hardware/baselines/dsa_capped_select")
     run.add_argument("--output", type=Path, required=True)
     run.add_argument("--profile-dir", type=Path)
     run.add_argument("--profile-iterations", type=int, default=3)
