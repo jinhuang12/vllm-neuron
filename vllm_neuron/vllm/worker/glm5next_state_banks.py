@@ -94,7 +94,9 @@ def bank_form(requests: int, *, is_prefill: bool) -> bool:
     return fused_decode_enabled()
 
 
-def state_bank_regions(raw, shapes, dtypes, *, slot_bytes: int, dtype_view=None) -> list[torch.Tensor]:
+def state_bank_regions(
+    raw, shapes, dtypes, *, slot_bytes: int, dtype_view=None, checkpoints: int = 1
+) -> list[torch.Tensor]:
     """One contiguous ``[slots, *shape]`` bank per state over ``raw``, a recurrent layer's buffer.
 
     ``raw`` is the layer's one raw byte buffer: ``slots`` request slots of ``slot_bytes``
@@ -115,7 +117,21 @@ def state_bank_regions(raw, shapes, dtypes, *, slot_bytes: int, dtype_view=None)
     name otherwise. ``dtype_view(raw, dtype)`` reinterprets ``raw`` as ``dtype`` (the runner
     caches one per buffer and dtype, so the banks share one ``._base``); by default
     ``raw.view(dtype)``.
+
+    ``checkpoints`` is the state rows one slot holds, ``1 + num_speculative_blocks`` of
+    the layer's ``MambaSpec`` (one, the plain decode's, by default). Above one every bank
+    is ``[slots, checkpoints, *shape]``: row ``j`` of a slot is the state after ``j + 1``
+    tokens of the request's last speculative step, and row 0 also where a prefill or a
+    one-token step writes (``functional.kda.fused_decode``, "Checkpoint banks"). A slot
+    stays one contiguous ``bank[slot]`` view, so both carrier forms keep their shape of
+    access; ``slot_bytes`` is the whole slot, every checkpoint included
+    (``recurrent_state_slot_bytes``).
     """
+    checkpoints = int(checkpoints)
+    if checkpoints < 1:
+        raise ValueError(
+            f"a slot holds at least one state row; got checkpoints={checkpoints!r}"
+        )
     if raw.dim() != 1 or raw.element_size() != 1:
         raise ValueError(
             f"a recurrent layer's raw buffer is a flat byte tensor; got shape "
@@ -134,7 +150,7 @@ def state_bank_regions(raw, shapes, dtypes, *, slot_bytes: int, dtype_view=None)
     for index, (shape, dtype) in enumerate(zip(shapes, dtypes, strict=True)):
         shape = tuple(int(extent) for extent in shape)
         itemsize = int(dtype.itemsize)
-        bank_bytes = slots * math.prod(shape) * itemsize
+        bank_bytes = slots * checkpoints * math.prod(shape) * itemsize
         if offset_bytes % itemsize:
             raise ValueError(
                 f"state bank {index} ({shape}, {dtype}) would start at byte "
@@ -149,7 +165,8 @@ def state_bank_regions(raw, shapes, dtypes, *, slot_bytes: int, dtype_view=None)
             )
         view = dtype_view(raw, dtype) if dtype_view is not None else raw.view(dtype)
         start = offset_bytes // itemsize
-        banks.append(view[start : start + bank_bytes // itemsize].view(slots, *shape))
+        rows = (slots, checkpoints) if checkpoints > 1 else (slots,)
+        banks.append(view[start : start + bank_bytes // itemsize].view(*rows, *shape))
         offset_bytes += bank_bytes
     return banks
 
