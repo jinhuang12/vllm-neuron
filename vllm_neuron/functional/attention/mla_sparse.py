@@ -1505,30 +1505,49 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
 # --------------------------------------------------------------------------- #
 # The low-precision streaming body, for the served one-head geometry.
 #
-# Same tiles of K and the same gather as the body above, but the per-query work is
-# cut to about a hundred instructions where the fp32 body issues several hundred:
+# The fp32 body's tiles of K and its mask, in far fewer instructions per query:
 #
-# * One gather-transpose DMA (``nisa.dma_transpose`` over an indirect source, TRN2+)
-#   lands the query's selected rows with the latent on partitions -- MM1's moving
-#   operand -- so no PE transposes and no PSUM evacuations of the gathered cache are
-#   issued. The plain gathers for MM2 stay, one per 128-row chunk.
-# * The selected-row indices are loaded twice per query: once chunk-major, as the
-#   ``[128, n_chunks]`` offset tile both gathers read, and once as the row the mask is
-#   built from, on the one head partition, in fp32 (``index >= 0``).
-# * The softmax runs once over the whole row: the score tiles are evacuated from PSUM
-#   into one ``[1, K]`` tile (the sentinel bias added on the way), then one max, one
-#   exp with its sum, one mask multiply and one normalisation. No per-tile merge.
-# * The probabilities reach the key partitions by one one-row PE transpose per chunk,
-#   all landing in one PSUM tile that is evacuated once (a one-row transpose is a
-#   one-column matmul). They are then split into bf16 hi/lo halves for MM2.
-# * The normalisation is applied to p before MM2 rather than to the output after
-#   it: at one head both are one instruction, and MM2's PSUM tile is then stored as is.
+# * One gather-transpose DMA per query (``nisa.dma_transpose`` over an indirect
+#   source, TRN2+) lands the query's selected rows with the latent on partitions,
+#   MM1's moving operand. Every offset it reads is a cache row the call may read: a
+#   sentinel column reads the row named in the same partition of the query's first
+#   128-column chunk, or row 0 where that is a sentinel too, and the mask removes it.
+#   (Clamped onto row 0 alone, every sentinel column of a mostly-empty index row --
+#   the start of a prompt -- reads that one row, and the gather is slower.) The
+#   gather never skips an offset: a gather-transpose with ``oob_mode.skip`` over an
+#   out-of-bounds offset aborted the DMA queues on device (``reports/mla_sparse.md``).
+# * MM2's moving operand, the same rows with the keys on partitions, is made from that
+#   tile by PE transposes, which are bit-exact from NeuronCore-v3 on, rather than
+#   gathered a second time: the second gather is one indirect DMA per 128-row chunk,
+#   and the software descriptor generator that issues every indirect DMA is the
+#   body's busiest engine.
+# * The softmax runs for a group of :data:`SOFTMAX_ROWS` queries at once, one query
+#   per partition. A query's MM1 stationary is a ``[128, rows]`` tile whose only
+#   non-zero column is the query's own, so its scores accumulate into its own PSUM row
+#   and the other rows gain exact zeros (for finite rows: a non-finite value in a row
+#   the group gathers reaches every query of the group, as ``0 * nan``). Every
+#   gathered row is a row a query of the group selects, or row 0. The group's mask,
+#   maximum, exp with its sum, mask multiply and normalisation are then one
+#   instruction each, and one PE transpose per chunk puts the group's probabilities on
+#   the key partitions, where they are split into bf16 hi/lo halves for MM2.
+# * MM2 runs per query, hi then lo per chunk into one fp32 PSUM tile that is stored as
+#   is: p is normalised before it.
 #
-# The arithmetic differs from the fp32 body in the operand precision of MM1 (exact
-# products of the stored 2-byte values, fp32 accumulation) and MM2 (hi/lo split of
-# p, about 16 significand bits), in the softmax being taken against the global row
-# maximum rather than merged tile by tile, and in where the normalisation lands.
+# A query's values pass the same instructions in the same order whatever its group,
+# so the grouping changes no bit. The arithmetic differs from the fp32 body in the
+# operand precision of MM1 (exact products of the stored 2-byte values, fp32
+# accumulation) and MM2 (hi/lo split of p, about 16 significand bits), in the softmax
+# being taken against the global row maximum rather than merged tile by tile, and in
+# where the normalisation lands.
 # --------------------------------------------------------------------------- #
+
+
+#: Queries whose softmax shares one set of row instructions, one query per partition.
+#: Used when it divides the query block (:func:`_queries_per_block`), else a group is
+#: one query. A group's queries keep their gathered rows until the group's softmax is
+#: done, so the body holds ``SOFTMAX_ROWS + QUERY_BUFFERS`` gathered-row buffers of
+#: ``n_latent * K`` 2-byte elements per partition.
+SOFTMAX_ROWS = 4
 
 
 def _lowp_serves(q_lift_hbm, c_kv_hbm, heads: int, rope: int, STREAM_KV: bool) -> bool:
@@ -1538,32 +1557,29 @@ def _lowp_serves(q_lift_hbm, c_kv_hbm, heads: int, rope: int, STREAM_KV: bool) -
             and c_kv_hbm.dtype != nl.float32 and q_lift_hbm.dtype == c_kv_hbm.dtype)
 
 
+def _softmax_rows(queries_per_block: int) -> int:
+    """Queries per softmax group: :data:`SOFTMAX_ROWS` when it divides the query block, else 1."""
+    return SOFTMAX_ROWS if queries_per_block % SOFTMAX_ROWS == 0 else 1
+
+
 _LP_C_T = 0        # the selected rows transposed, latent on partitions: [128, 1, n_latent, K]
-_LP_C_ROWS = 1     # the selected rows as gathered, keys on partitions: [128, n_chunks, latent]
-_LP_RAW = 2        # the chunk-major indices, signed
-_LP_SAFE = 3       # the same with the sentinel clamped to row 0 (the gathers' offsets)
-_LP_U32 = 4        # the clamp as uint32 (the gather-transpose's offsets)
-_LP_P_T = 5        # p transposed, keys on partitions, fp32
-_LP_P_HI = 6       # bf16(p_t)
-_LP_P_HI_F = 7     # the hi half widened
-_LP_P_LO = 8       # bf16(p_t - hi)
-_LP_COUNT = 9
+_LP_RAW = 1        # the chunk-major indices, signed
+_LP_FILL = 2       # max(first chunk's index, 0) per partition, fp32: a sentinel's row
+_LP_SHIFT = 3      # (index < 0) * fill
+_LP_OFFSET = 4     # the gather's offsets, uint32: max(index, shift)
+_LP_COUNT = 5
 
 
-def _lowp_scratch(latent, topk, n_latent, n_chunks, dtype):
-    """One per-query working set of the low-precision body (see :func:`_row_tiled_scratch`)."""
+def _lowp_scratch(topk, n_latent, n_chunks, dtype):
+    """One per-query working set of the low-precision body: its gathered rows and their offsets."""
     ws = []
     for _ in range(_LP_COUNT):
         ws.append(None)
     ws[_LP_C_T] = nl.ndarray((LATENT_TILE, 1, n_latent, topk), dtype=dtype, buffer=nl.sbuf)
-    ws[_LP_C_ROWS] = nl.ndarray((KEY_CHUNK, n_chunks, latent), dtype=dtype, buffer=nl.sbuf)
     ws[_LP_RAW] = _sbuf_i32(KEY_CHUNK, _aligned(n_chunks))
-    ws[_LP_SAFE] = _sbuf_i32(KEY_CHUNK, _aligned(n_chunks))
-    ws[_LP_U32] = _sbuf_u32(KEY_CHUNK, _aligned(n_chunks))
-    ws[_LP_P_T] = _sbuf(KEY_CHUNK, _aligned(n_chunks))
-    ws[_LP_P_HI] = nl.ndarray((KEY_CHUNK, _aligned(n_chunks, STAGE_ALIGN)), dtype=dtype, buffer=nl.sbuf)
-    ws[_LP_P_HI_F] = _sbuf(KEY_CHUNK, _aligned(n_chunks))
-    ws[_LP_P_LO] = nl.ndarray((KEY_CHUNK, _aligned(n_chunks, STAGE_ALIGN)), dtype=dtype, buffer=nl.sbuf)
+    ws[_LP_FILL] = _scalar(KEY_CHUNK)
+    ws[_LP_SHIFT] = _sbuf_i32(KEY_CHUNK, _aligned(n_chunks))
+    ws[_LP_OFFSET] = _sbuf_u32(KEY_CHUNK, _aligned(n_chunks))
     return ws
 
 
@@ -1574,41 +1590,69 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
     Preconditions (:func:`_lowp_serves`): one head, no RoPE limb, more than one query,
     the query and the cache in the same 2-byte float, and the row-tiled gate's own: the
     latent an exact multiple of 128 within one MM2 moving tile, K a multiple of 128.
+    ``QUERY_BUFFERS`` gathered-row buffers beyond one group's let the next group's
+    gathers start while a group finishes; scheduling only.
     """
     seq, heads, latent = q_lift_hbm.shape
     topk = topk_hbm.shape[1]
     n_latent = latent // LATENT_TILE
     n_chunks = topk // KEY_CHUNK
     tiles = _score_tiles(topk, MOVING_MAX)
-    dtype = c_kv_hbm.dtype
     assert QUERY_BUFFERS >= 1, "QUERY_BUFFERS must be at least 1"
 
-    # ---- the per-block query tiles: the staged 2-byte rows are MM1's stationary --------
+    # ---- the per-block query tiles: the staged 2-byte rows -------------------------
     qpb = _queries_per_block(seq, heads)
     block = qpb * heads
     q_stage = []
     for _ in range(n_latent):
         q_stage.append(_stage(q_lift_hbm, LATENT_TILE, block))
 
-    # ---- the per-query working sets, rotated across consecutive queries -------------
-    scratch = []
-    for _ in range(QUERY_BUFFERS):
-        scratch.append(_lowp_scratch(latent, topk, n_latent, n_chunks, dtype))
+    # ---- MM1's stationaries: slot r carries query r of a group in column r ----------
+    # Every other column is zero for the whole call: only column r of slot r is ever
+    # written, so query r's scores land on PSUM row r and the other rows gain zeros.
+    # The group axis is padded to whole 32-byte lines; the stationary reads its first
+    # `group` columns.
+    group = _softmax_rows(qpb)
+    q_masked = []
+    for _ in range(group):
+        slot = nl.ndarray((LATENT_TILE, n_latent, _aligned(group, STAGE_ALIGN)),
+                          dtype=c_kv_hbm.dtype, buffer=nl.sbuf)
+        nisa.memset(dst=slot, value=0.0, engine=nisa.engine.vector)
+        q_masked.append(slot)
 
-    # ---- the one-partition row tiles of the softmax chain, shared by every query -----
-    # Each [1, K] fp32 tile costs its full row of every partition's address space, so
-    # these are not rotated and two of them are reused along the chain: `scores_m`
+    # ---- the per-query gathered rows, rotated across consecutive queries ------------
+    ring = group + QUERY_BUFFERS
+    scratch = []
+    for _ in range(ring):
+        scratch.append(_lowp_scratch(topk, n_latent, n_chunks, c_kv_hbm.dtype))
+    # MM2's moving operand, one chunk of keys on partitions at a time.
+    c_rows = []
+    for _ in range(2):
+        c_rows.append(nl.ndarray((KEY_CHUNK, latent), dtype=c_kv_hbm.dtype, buffer=nl.sbuf))
+
+    # ---- the group's softmax rows, one query per partition ------------------------
+    # Each [group, K] fp32 tile costs its full row of every partition's address space,
+    # so two are reused along the chain as the one-query body reused them: `scores_m`
     # receives the masked probabilities once the exp has read it, and `p` the
     # normalised ones once the mask multiply has read it.
-    idx_row = _sbuf_i32(heads, topk)
-    valid_f = _sbuf(heads, topk)
-    mask_bias = _sbuf(heads, topk)
-    scores_m = _sbuf(heads, topk)
-    p = _sbuf(heads, topk)
-    neg_row_max = _scalar(heads)
-    exp_bias = _scalar(heads)
-    row_sum = _scalar(heads)
-    recip = _scalar(heads)
+    idx_rows = _sbuf_i32(group, topk)
+    valid_f = _sbuf(group, topk)
+    mask_bias = _sbuf(group, topk)
+    scores_m = _sbuf(group, topk)
+    p = _sbuf(group, topk)
+    neg_row_max = _scalar(group)
+    exp_bias = _scalar(group)
+    row_sum = _scalar(group)
+    recip = _scalar(group)
+    # The group's probabilities on the key partitions: column ck * group + r holds
+    # chunk ck of query r.
+    p_cols = n_chunks * group
+    p_t = _sbuf(KEY_CHUNK, _aligned(p_cols))
+    p_hi = nl.ndarray((KEY_CHUNK, _aligned(p_cols, STAGE_ALIGN)), dtype=c_kv_hbm.dtype,
+                      buffer=nl.sbuf)
+    p_hi_f = _sbuf(KEY_CHUNK, _aligned(p_cols))
+    p_lo = nl.ndarray((KEY_CHUNK, _aligned(p_cols, STAGE_ALIGN)), dtype=c_kv_hbm.dtype,
+                      buffer=nl.sbuf)
     out_sb = _sbuf(heads, latent)
     sentinel_bias = _SENTINEL_EXP_FLOOR / softmax_scale
 
@@ -1619,77 +1663,83 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
         for li in range(n_latent):
             _transpose_rows(q_stage[li], q_lift_hbm, latent, block, LATENT_TILE,
                             q0 * heads * latent + li * LATENT_TILE)
-        for qi in range(qpb):
-            q_idx = q0 + qi
-            base = q_idx * topk
-            ws = scratch[qi % QUERY_BUFFERS]
-            c_t = ws[_LP_C_T]
-            c_rows = ws[_LP_C_ROWS]
-            raw = ws[_LP_RAW]
-            safe = ws[_LP_SAFE]
-            idx_u32 = ws[_LP_U32]
-            p_t = ws[_LP_P_T]
-            p_hi = ws[_LP_P_HI]
-            p_hi_f = ws[_LP_P_HI_F]
-            p_lo = ws[_LP_P_LO]
+        for g0 in range(0, qpb, group):
+            scores_ps = []
+            for ti in range(len(tiles)):
+                scores_ps.append(_psum(group, tiles[ti][1]))
+            for r in range(group):
+                qi = g0 + r
+                ws = scratch[qi % ring]
+                c_t = ws[_LP_C_T]
+                raw = ws[_LP_RAW]
+                fill = ws[_LP_FILL]
+                shift = ws[_LP_SHIFT]
+                offsets = ws[_LP_OFFSET]
 
-            # ---- the selected rows, chunk-major on partitions: column c holds chunk c ----
-            # Element (p, c) is column c * 128 + p of the query's row. The sentinel is
-            # clamped onto row 0 so every gathered address is legal; its column is masked
-            # below. The gather-transpose reads the clamp as uint32.
-            nisa.dma_copy(dst=raw[:, 0:n_chunks],
-                          src=topk_hbm.ap(pattern=[[1, KEY_CHUNK], [KEY_CHUNK, n_chunks]],
-                                          offset=base))
-            nisa.tensor_scalar(dst=safe[:, 0:n_chunks], data=raw[:, 0:n_chunks],
-                               op0=nl.maximum, operand0=0)
-            nisa.tensor_copy(dst=idx_u32[:, 0:n_chunks], src=safe[:, 0:n_chunks])
+                # ---- the selected rows, chunk-major on partitions ---------------------
+                # Element (p, c) is column c * 128 + p of the query's row. A sentinel's
+                # offset is `fill`, partition p's index in chunk 0 clamped to row 0:
+                # max(index, (index < 0) * fill). Every index is far below 2**24, so the
+                # fp32 arithmetic of these instructions is exact.
+                nisa.dma_copy(dst=raw[:, 0:n_chunks],
+                              src=topk_hbm.ap(pattern=[[1, KEY_CHUNK], [KEY_CHUNK, n_chunks]],
+                                              offset=(q0 + qi) * topk))
+                nisa.tensor_scalar(dst=fill, data=raw[:, 0:1], op0=nl.maximum, operand0=0.0,
+                                   engine=nisa.engine.vector)
+                nisa.tensor_scalar(dst=shift[:, 0:n_chunks], data=raw[:, 0:n_chunks],
+                                   op0=nl.less, operand0=0.0, op1=nl.multiply,
+                                   operand1=fill, engine=nisa.engine.vector)
+                nisa.tensor_tensor(dst=offsets[:, 0:n_chunks], data1=raw[:, 0:n_chunks],
+                                   data2=shift[:, 0:n_chunks], op=nl.maximum,
+                                   engine=nisa.engine.vector)
 
-            # ---- the same row on the head partition, as the mask ----------------------
+                # ---- gather-transpose: the selected rows with the latent on partitions --
+                # ``dst[l, 0, li, k] = cache[idx[k], li * 128 + l]`` for every selected
+                # column k, read column-major from the chunk-major offset tile, which is
+                # the column order of the query's row. The source is viewed as
+                # ``[rows, 1, n_latent, 128]`` so one DMA lands every latent tile.
+                nisa.dma_transpose(
+                    dst=c_t,
+                    src=c_kv_hbm.ap(pattern=[[latent, topk], [0, 1],
+                                             [LATENT_TILE, n_latent], [1, LATENT_TILE]],
+                                    vector_offset=offsets[:, 0:n_chunks], indirect_dim=0),
+                    dge_mode=nisa.dge_mode.swdge)
+
+                # ---- MM1 per score tile into the group's PSUM rows ---------------------
+                for li in range(n_latent):
+                    nisa.tensor_copy(dst=q_masked[r][:, li, r:r + 1],
+                                     src=q_stage[li][:, qi:qi + 1], engine=nisa.engine.vector)
+                for ti in range(len(tiles)):
+                    ks = tiles[ti][0]
+                    extent = tiles[ti][1]
+                    for li in range(n_latent):
+                        nisa.nc_matmul(dst=scores_ps[ti],
+                                       stationary=q_masked[r][:, li, 0:group],
+                                       moving=c_t[:, 0, li, ks:ks + extent],
+                                       accumulate=(r > 0 or li > 0))
+
+            # ---- the group's mask, from its index rows ---------------------------------
             # ``index >= 0`` in fp32 (every index is far below 2**24, so the cast is
             # exact): 1.0 where a token lives, 0.0 at the sentinel; the bias is
             # ``(valid - 1) * sentinel_bias``, exactly 0.0 or -sentinel_bias.
-            nisa.dma_copy(dst=idx_row, src=topk_hbm.ap(pattern=[[0, heads], [1, topk]],
-                                                       offset=base))
-            nisa.tensor_copy(dst=valid_f, src=idx_row)
-            nisa.tensor_scalar(dst=valid_f, data=valid_f, op0=nl.greater_equal, operand0=0.0)
-            nisa.tensor_scalar(dst=mask_bias, data=valid_f, op0=nl.add, operand0=-1.0)
+            nisa.dma_copy(dst=idx_rows, src=topk_hbm.ap(pattern=[[topk, group], [1, topk]],
+                                                        offset=(q0 + g0) * topk))
+            nisa.tensor_copy(dst=valid_f, src=idx_rows, engine=nisa.engine.vector)
+            nisa.tensor_scalar(dst=valid_f, data=valid_f, op0=nl.greater_equal, operand0=0.0,
+                               engine=nisa.engine.vector)
+            nisa.tensor_scalar(dst=mask_bias, data=valid_f, op0=nl.add, operand0=-1.0,
+                               engine=nisa.engine.scalar)
             nisa.tensor_scalar(dst=mask_bias, data=mask_bias, op0=nl.multiply,
-                               operand0=sentinel_bias)
-
-            # ---- gather-transpose: the selected rows with the latent on partitions ------
-            # ``dst[l, 0, li, k] = cache[idx[k], li * 128 + l]`` for every selected
-            # column k, read column-major from the chunk-major index tile, which is
-            # exactly the column order of the query's row. The source is viewed as
-            # ``[rows, 1, n_latent, 128]`` so one DMA lands every latent tile. (A DMA
-            # per score tile would need a destination slice whose free dimensions are
-            # not contiguous, which the DGE refuses.)
-            nisa.dma_transpose(
-                dst=c_t,
-                src=c_kv_hbm.ap(pattern=[[latent, topk], [0, 1],
-                                         [LATENT_TILE, n_latent], [1, LATENT_TILE]],
-                                vector_offset=idx_u32[:, 0:n_chunks], indirect_dim=0),
-                dge_mode=nisa.dge_mode.swdge)
-
-            # ---- the plain gathers: the selected rows as stored, keys on partitions -----
-            for ck in range(n_chunks):
-                nisa.dma_copy(dst=c_rows[:, ck, :],
-                              src=c_kv_hbm.ap(pattern=[[latent, KEY_CHUNK], [1, latent]],
-                                              vector_offset=safe[:, ck:ck + 1], indirect_dim=0))
-
-            # ---- MM1 per score tile, evacuated into one masked row ----------------------
+                               operand0=sentinel_bias, engine=nisa.engine.scalar)
             for ti in range(len(tiles)):
                 ks = tiles[ti][0]
                 extent = tiles[ti][1]
-                scores_ps = _psum(heads, extent)
-                for li in range(n_latent):
-                    nisa.nc_matmul(dst=scores_ps, stationary=q_stage[li][:, qi:qi + 1],
-                                   moving=c_t[:, 0, li, ks:ks + extent], accumulate=(li > 0))
-                nisa.tensor_tensor(dst=scores_m[:, ks:ks + extent], data1=scores_ps,
+                nisa.tensor_tensor(dst=scores_m[:, ks:ks + extent], data1=scores_ps[ti],
                                    data2=mask_bias[:, ks:ks + extent], op=nl.add)
 
-            # ---- softmax over the whole row, normalised before MM2 ----------------------
-            # A wholly-sentinel row exponentiates against its own maximum, so `row_sum` is
-            # at least 1 and the mask multiply makes every probability exactly 0.
+            # ---- softmax over each whole row, normalised before MM2 --------------------
+            # A wholly-sentinel row exponentiates against its own maximum, so its
+            # `row_sum` is at least 1 and the mask multiply makes every probability 0.
             nisa.tensor_reduce(dst=neg_row_max, op=nl.maximum, data=scores_m, axis=1,
                                negate=True)
             nisa.tensor_scalar(dst=exp_bias, data=neg_row_max, op0=nl.multiply,
@@ -1697,37 +1747,56 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
             nisa.activation(dst=p, op=nl.exp, data=scores_m, bias=exp_bias,
                             scale=softmax_scale, reduce_op=nl.add, reduce_res=row_sum,
                             reduce_cmd=nisa.reduce_cmd.reset_reduce)
-            nisa.tensor_tensor(dst=scores_m, data1=p, data2=valid_f, op=nl.multiply)
+            nisa.tensor_tensor(dst=scores_m, data1=p, data2=valid_f, op=nl.multiply,
+                               engine=nisa.engine.vector)
             nisa.reciprocal(dst=recip, data=row_sum)
             nisa.tensor_scalar(dst=p, data=scores_m, op0=nl.multiply, operand0=recip,
                                engine=nisa.engine.vector)
 
-            # ---- p onto the key partitions: one one-row transpose per chunk into one ----
-            # PSUM tile, evacuated once, then the hi/lo split. (A DMA that re-rows the
-            # ``[1, K]`` tile as ``[n_chunks, 128]`` is refused on device: a DMA copy
-            # keeps the per-partition element count.)
-            p_t_ps = _psum(KEY_CHUNK, n_chunks)
+            # ---- p onto the key partitions: one PE transpose per chunk, then hi/lo -----
+            p_t_ps = _psum(KEY_CHUNK, p_cols)
             for ck in range(n_chunks):
-                nisa.nc_transpose(dst=p_t_ps[:, ck:ck + 1],
-                                  data=p[:, ck * KEY_CHUNK:(ck + 1) * KEY_CHUNK])
-            nisa.tensor_copy(dst=p_t[:, 0:n_chunks], src=p_t_ps)
-            nisa.tensor_copy(dst=p_hi[:, 0:n_chunks], src=p_t[:, 0:n_chunks])
-            nisa.tensor_copy(dst=p_hi_f[:, 0:n_chunks], src=p_hi[:, 0:n_chunks])
-            nisa.tensor_tensor(dst=p_lo[:, 0:n_chunks], data1=p_t[:, 0:n_chunks],
-                               data2=p_hi_f[:, 0:n_chunks], op=nl.subtract)
+                nisa.nc_transpose(dst=p_t_ps[:, ck * group:(ck + 1) * group],
+                                  data=p[:, ck * KEY_CHUNK:(ck + 1) * KEY_CHUNK],
+                                  engine=nisa.engine.tensor)
+            nisa.tensor_copy(dst=p_t[:, 0:p_cols], src=p_t_ps, engine=nisa.engine.vector)
+            nisa.tensor_copy(dst=p_hi[:, 0:p_cols], src=p_t[:, 0:p_cols],
+                             engine=nisa.engine.vector)
+            nisa.tensor_copy(dst=p_hi_f[:, 0:p_cols], src=p_hi[:, 0:p_cols],
+                             engine=nisa.engine.vector)
+            nisa.tensor_tensor(dst=p_lo[:, 0:p_cols], data1=p_t[:, 0:p_cols],
+                               data2=p_hi_f[:, 0:p_cols], op=nl.subtract,
+                               engine=nisa.engine.vector)
 
-            # ---- MM2: out[1, L] = p[1, K] @ c[K, L], both halves into one fp32 PSUM -----
-            pv_ps = _psum(heads, latent)
-            for ck in range(n_chunks):
-                nisa.nc_matmul(dst=pv_ps, stationary=p_hi[:, ck:ck + 1],
-                               moving=c_rows[:, ck, :], accumulate=(ck > 0))
-                nisa.nc_matmul(dst=pv_ps, stationary=p_lo[:, ck:ck + 1],
-                               moving=c_rows[:, ck, :], accumulate=True)
-            nisa.tensor_copy(dst=out_sb, src=pv_ps)
-            nl.store(out_hbm.ap(pattern=[[latent, heads], [1, latent]],
-                                offset=q_idx * heads * latent),
-                     value=out_sb)
-
+            # ---- MM2 per query: out[1, L] = p[1, K] @ c[K, L], hi and lo per chunk ------
+            # Each chunk of the gathered rows is put back on the key partitions by one
+            # PE transpose per latent tile, evacuated alternately by the Vector and the
+            # Scalar engine.
+            for r in range(group):
+                qi = g0 + r
+                c_t = scratch[qi % ring][_LP_C_T]
+                pv_ps = _psum(heads, latent)
+                for ck in range(n_chunks):
+                    rows_ps = nl.ndarray((KEY_CHUNK, latent), dtype=c_kv_hbm.dtype,
+                                         buffer=nl.psum)
+                    for li in range(n_latent):
+                        nisa.nc_transpose(
+                            dst=rows_ps[:, li * LATENT_TILE:(li + 1) * LATENT_TILE],
+                            data=c_t[:, 0, li, ck * KEY_CHUNK:(ck + 1) * KEY_CHUNK],
+                            engine=nisa.engine.tensor)
+                    chunk = c_rows[ck % 2]
+                    nisa.tensor_copy(dst=chunk, src=rows_ps,
+                                     engine=nisa.engine.vector if ck % 2 == 0
+                                     else nisa.engine.scalar)
+                    col = ck * group + r
+                    nisa.nc_matmul(dst=pv_ps, stationary=p_hi[:, col:col + 1], moving=chunk,
+                                   accumulate=(ck > 0))
+                    nisa.nc_matmul(dst=pv_ps, stationary=p_lo[:, col:col + 1], moving=chunk,
+                                   accumulate=True)
+                nisa.tensor_copy(dst=out_sb, src=pv_ps)
+                nl.store(out_hbm.ap(pattern=[[latent, heads], [1, latent]],
+                                    offset=(q0 + qi) * heads * latent),
+                         value=out_sb)
 
 @nki.jit
 def mla_sparse_attention_nope_row_tiled_kernel(q_lift_hbm, c_kv_hbm, topk_hbm,
