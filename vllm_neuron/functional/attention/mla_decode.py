@@ -272,19 +272,27 @@ def _overlay_own_rows(c_rows, written_hbm, rel_f, own_rows, first_row):
         nisa.tensor_copy_predicated(dst=c_rows[:, j, :], src=gathered, predicate=mask)
 
 
-def _transpose_keys(c_t, c_rows, width, n_lat):
-    """``c_t[:, li, c] = c_rows[c, :, li-th latent tile]``: keys onto the latent axis."""
+def _transpose_block(c_t, c_rows, t0, tw, n_lat, at):
+    """``c_t[:, li, at:at + tw] = c_rows[t0 .. t0 + tw, :, li-th latent tile]`` transposed:
+    one ``MOVING_MAX`` block of keys onto the latent axis (one PE transpose per key chunk
+    and latent tile, one PSUM copy out per latent tile)."""
     kv_dtype = c_rows.dtype
+    for li in range(n_lat):
+        t_ps = nl.ndarray((LATENT_TILE, MOVING_MAX), dtype=kv_dtype, buffer=nl.psum)
+        for ck in range(tw // KEY_CHUNK):
+            nisa.nc_transpose(
+                dst=t_ps[:, ck * KEY_CHUNK:(ck + 1) * KEY_CHUNK],
+                data=c_rows[:, t0 // KEY_CHUNK + ck,
+                            li * LATENT_TILE:(li + 1) * LATENT_TILE])
+        nisa.tensor_copy(dst=c_t[:, li, at:at + tw], src=t_ps[:, 0:tw])
+
+
+def _transpose_keys(c_t, c_rows, width, n_lat):
+    """``c_t[:, li, c] = c_rows[c, :, li-th latent tile]``: the whole window onto the latent
+    axis, once, for the rows that share it (``rows > 1``)."""
     for t0 in range(0, width, MOVING_MAX):
         tw = min(MOVING_MAX, width - t0)
-        for li in range(n_lat):
-            t_ps = nl.ndarray((LATENT_TILE, MOVING_MAX), dtype=kv_dtype, buffer=nl.psum)
-            for ck in range(tw // KEY_CHUNK):
-                nisa.nc_transpose(
-                    dst=t_ps[:, ck * KEY_CHUNK:(ck + 1) * KEY_CHUNK],
-                    data=c_rows[:, t0 // KEY_CHUNK + ck,
-                                li * LATENT_TILE:(li + 1) * LATENT_TILE])
-            nisa.tensor_copy(dst=c_t[:, li, t0:t0 + tw], src=t_ps[:, 0:tw])
+        _transpose_block(c_t, c_rows, t0, tw, n_lat, t0)
 
 
 def _decode_body(q_hbm, bank_hbm, table_hbm, pos_hbm, written_hbm, topk_hbm,
@@ -325,22 +333,28 @@ def _decode_body(q_hbm, bank_hbm, table_hbm, pos_hbm, written_hbm, topk_hbm,
             start_key_f = _col(KEY_CHUNK, nl.float32)
             nisa.tensor_copy(dst=start_key_f, src=start_key_i)
 
-        if dense:
+        if dense and rows > 1:
             # ---- the window once, shared by the request's rows -----------------------
             c_rows = _sb((KEY_CHUNK, n_chunks, latent), kv_dtype)
             _load_dense_rows(c_rows, bank_hbm, table_hbm, b, page_size)
-            if rows > 1:
-                rel_f = _sb((KEY_CHUNK, n_chunks), nl.float32)
-                nisa.tensor_scalar(dst=rel_f, data=key_row_f, op0=nl.subtract,
-                                   operand0=start_key_f)
-                _overlay_own_rows(c_rows, written_hbm, rel_f, rows, b * rows)
+            rel_f = _sb((KEY_CHUNK, n_chunks), nl.float32)
+            nisa.tensor_scalar(dst=rel_f, data=key_row_f, op0=nl.subtract,
+                               operand0=start_key_f)
+            _overlay_own_rows(c_rows, written_hbm, rel_f, rows, b * rows)
             c_t = _sb((LATENT_TILE, n_lat, width), kv_dtype)
             _transpose_keys(c_t, c_rows, width, n_lat)
 
+        # One row per request (today's served line) keeps the one-row kernel's instruction
+        # stream: the row's position is the start itself, the window is loaded after the
+        # query and transposed block by block inside the score loop. Every T-row addition
+        # below is under ``rows > 1`` / ``t > 0``.
         for t in range(rows):
             row = b * rows + t
-            pos_f = _col(heads, nl.float32)
-            nisa.tensor_scalar(dst=pos_f, data=start_f, op0=nl.add, operand0=float(t))
+            if t == 0:
+                pos_f = start_f
+            else:
+                pos_f = _col(heads, nl.float32)
+                nisa.tensor_scalar(dst=pos_f, data=start_f, op0=nl.add, operand0=float(t))
 
             # ---- this row's query and own latent row ----------------------------------
             q_nat = _sb((heads, latent), q_hbm.dtype)
@@ -370,7 +384,12 @@ def _decode_body(q_hbm, bank_hbm, table_hbm, pos_hbm, written_hbm, topk_hbm,
             s_self = _col(heads, nl.float32)
             nisa.tensor_reduce(dst=s_self, op=nl.add, data=prod, axis=1)
 
-            if not dense:
+            if dense:
+                if rows == 1:
+                    # ---- the one row's window, rows on partitions --------------------
+                    c_rows = _sb((KEY_CHUNK, n_chunks, latent), kv_dtype)
+                    _load_dense_rows(c_rows, bank_hbm, table_hbm, b, page_size)
+            else:
                 # ---- this row's selected rows, rows on partitions ----------------------
                 c_rows = _sb((KEY_CHUNK, n_chunks, latent), kv_dtype)
                 idx = _load_selected_rows(c_rows, bank_hbm, table_hbm, topk_hbm, b, row,
@@ -382,8 +401,9 @@ def _decode_body(q_hbm, bank_hbm, table_hbm, pos_hbm, written_hbm, topk_hbm,
                     nisa.tensor_scalar(dst=rel_f, data=idx_key_f, op0=nl.subtract,
                                        operand0=start_key_f)
                     _overlay_own_rows(c_rows, written_hbm, rel_f, t, b * rows)
-                c_t = _sb((LATENT_TILE, n_lat, width), kv_dtype)
-                _transpose_keys(c_t, c_rows, width, n_lat)
+                if rows > 1:
+                    c_t = _sb((LATENT_TILE, n_lat, width), kv_dtype)
+                    _transpose_keys(c_t, c_rows, width, n_lat)
 
             # ---- which columns carry a token, and how often the own row counts ----------
             valid = _sb((heads, width), nl.float32)
@@ -416,11 +436,18 @@ def _decode_body(q_hbm, bank_hbm, table_hbm, pos_hbm, written_hbm, topk_hbm,
             nisa.memset(dst=scores, value=MASKED_SCORE)
             for t0 in range(0, width, MOVING_MAX):
                 tw = min(MOVING_MAX, width - t0)
+                if rows == 1:
+                    # One row: transpose this block here, as the one-row kernel does.
+                    c_t = _sb((LATENT_TILE, n_lat, MOVING_MAX), kv_dtype)
+                    _transpose_block(c_t, c_rows, t0, tw, n_lat, 0)
+                    at = 0
+                else:
+                    at = t0
                 s_ps = nl.ndarray((heads, MOVING_MAX), dtype=nl.float32, buffer=nl.psum)
                 for li in range(n_lat):
                     nisa.nc_matmul(dst=s_ps[:, 0:tw],
                                    stationary=q_t[:, li * heads:(li + 1) * heads],
-                                   moving=c_t[:, li, t0:t0 + tw], accumulate=(li > 0))
+                                   moving=c_t[:, li, at:at + tw], accumulate=(li > 0))
                 nisa.tensor_copy_predicated(dst=scores[:, t0:t0 + tw], src=s_ps[:, 0:tw],
                                             predicate=pred[:, t0:t0 + tw])
 
