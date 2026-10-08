@@ -1321,28 +1321,6 @@ def inter_chunk_constants(
     )
 
 
-#: The partition granule of an engine access. A compute instruction over at most
-#: 32 partitions starts at a multiple of 32, over at most 64 at a multiple of 64,
-#: and over more at partition 0 (the Trainium ``start_partition`` rule).
-PARTITION_QUADRANT = 32
-
-
-def _output_row(chunk: int) -> int:
-    """The partition at which ``qg @ ht`` lands in the merged state product.
-
-    The inter-chunk step multiplies the state by ``[w^T | qg^T]`` in one matmul, so
-    ``w @ ht`` lands on partitions ``[0, chunk)`` and ``qg @ ht`` on
-    ``[row, row + chunk)``, ``row`` the first start the ``start_partition`` rule
-    allows past ``chunk``. Returns ``0`` when that does not fit one partition
-    tile, and the step then issues the two products separately.
-    """
-    align = PARTITION_QUADRANT
-    while align < chunk:
-        align *= 2
-    row = -(-chunk // align) * align
-    return row if row + chunk <= MAX_TILE else 0
-
-
 @dataclass(frozen=True)
 class _InterLayout(nl.NKIObject):
     """The packed-tile constants of the inter-chunk kernel, built once per launch.
@@ -1390,17 +1368,13 @@ def _emit_inter_operands(sources, layout, g0, groups, chunk, kdim, v0, vpart, sc
     chunk-local, ``[C, groups, *]``, because they enter the chain as the
     partition-axis operands of chunk-sized matmuls.
 
-    Returns ``(wq_t, za_t, decay, kg_c, u_c, row)``: per chunk ``g``,
-    ``wq_t[:, g]`` is the stationary ``[w^T | qg^T]`` (``qg`` from column ``row``,
-    or from column ``chunk`` when ``row`` is 0 and the products are separate),
-    ``za_t[:, g]`` the stationary ``aqk^T`` padded so ``aqk @ v_new`` lands on the
-    same partitions as ``qg @ ht``, and ``decay[:, g]`` the state decay column.
+    Returns ``(w_t, qg_t, aqk_t, decay, kg_c, u_c)``: per chunk ``g``, the
+    stationary ``w^T``, ``qg^T`` and ``aqk^T`` at ``[:, g]``, and ``decay[:, g]``
+    the state decay column.
     """
     kg_hbm, w_rows, u_hbm, gk_rows, q_rows, aqk_rows = sources
     r0 = g0 * chunk
     count = groups * chunk
-    row = _output_row(chunk)
-    qg_col = row if row else chunk
 
     gk_sb = _load_tiles(gk_rows, r0, 1, count, kdim, nisa.engine.sync)
     gc_sb = _sbuf(count, kdim)
@@ -1418,33 +1392,20 @@ def _emit_inter_operands(sources, layout, g0, groups, chunk, kdim, v0, vpart, sc
     nisa.tensor_tensor(dst=qg_sb, data1=q_sb, data2=egc_sb, op=nl.multiply)
 
     w_sb = _load_tiles(w_rows, r0, 1, count, kdim, nisa.engine.sync)
-    wq_t = nl.ndarray((kdim, groups, qg_col + chunk), dtype=nl.float32, buffer=nl.sbuf)
-    if row:
-        # The columns between the two factors give output rows nothing reads;
-        # zeroed so no product reads unwritten memory.
-        nisa.memset(dst=wq_t[0:kdim, 0:groups, chunk:row], value=0.0)
+    w_t = nl.ndarray((kdim, groups, chunk), dtype=nl.float32, buffer=nl.sbuf)
     ps_w = _psum(kdim, count)
     nisa.nc_transpose(dst=ps_w, data=w_sb)
-    nisa.tensor_copy(
-        dst=wq_t[0:kdim, 0:groups, 0:chunk], src=ps_w.reshape((kdim, groups, chunk))
-    )
+    nisa.tensor_copy(dst=w_t, src=ps_w.reshape((kdim, groups, chunk)))
+    qg_t = nl.ndarray((kdim, groups, chunk), dtype=nl.float32, buffer=nl.sbuf)
     ps_q = _psum(kdim, count)
     nisa.nc_transpose(dst=ps_q, data=qg_sb)
-    nisa.tensor_copy(
-        dst=wq_t[0:kdim, 0:groups, qg_col : qg_col + chunk],
-        src=ps_q.reshape((kdim, groups, chunk)),
-    )
+    nisa.tensor_copy(dst=qg_t, src=ps_q.reshape((kdim, groups, chunk)))
 
     aqk_sb = _load_tiles(aqk_rows, r0, 1, count, chunk, nisa.engine.scalar)
-    za_t = nl.ndarray((chunk, groups, row + chunk), dtype=nl.float32, buffer=nl.sbuf)
-    if row:
-        nisa.memset(dst=za_t[0:chunk, 0:groups, 0:row], value=0.0)
+    aqk_t = nl.ndarray((chunk, groups, chunk), dtype=nl.float32, buffer=nl.sbuf)
     ps_a = _psum(chunk, count)
     nisa.nc_transpose(dst=ps_a, data=aqk_sb)
-    nisa.tensor_copy(
-        dst=za_t[0:chunk, 0:groups, row : row + chunk],
-        src=ps_a.reshape((chunk, groups, chunk)),
-    )
+    nisa.tensor_copy(dst=aqk_t, src=ps_a.reshape((chunk, groups, chunk)))
 
     ps_d = _psum(kdim, groups)
     nisa.nc_matmul(
@@ -1460,68 +1421,55 @@ def _emit_inter_operands(sources, layout, g0, groups, chunk, kdim, v0, vpart, sc
     u_c = nl.ndarray((chunk, groups, vpart), dtype=nl.float32, buffer=nl.sbuf)
     _dma(u_c, u_hbm[g0 : g0 + groups, 0:chunk, nl.ds(v0, vpart)].permute((1, 0, 2)),
          nisa.engine.scalar)
-    return wq_t, za_t, decay, kg_c, u_c, row
+    return w_t, qg_t, aqk_t, decay, kg_c, u_c
 
 
 def _emit_inter_step(ht, operands, g, vnew_c, o_c, chunk, kdim, vpart):
     """One chunk of stages 4 and 5 on this program's ``vpart`` state columns.
 
     ``ht`` is the entering state ``[K, vpart]``; returns the leaving one. The
-    carried chain is the merged product, ``v_new``, the update product and the
-    decayed sum; ``o`` hangs off it.
+    carried chain is ``w @ ht``, ``v_new``, ``kg^T @ v_new`` and the decayed sum.
+    ``o``'s two products read the same entering state and ``v_new`` but feed
+    nothing the chain reads, so they are separate matmuls issued after it: a
+    product merged into the chain's matmul would put its stationary columns on
+    every step's weight load.
     """
-    wq_t, za_t, decay, kg_c, u_c, row = operands
-    qg_col = row if row else chunk
-    ps_x = _psum(qg_col + chunk, vpart)
-    if row:
-        nisa.nc_matmul(
-            dst=ps_x, stationary=wq_t[0:kdim, g, 0 : row + chunk], moving=ht,
-            accumulate=False,
-        )
-        qh = ps_x[row : row + chunk, 0:vpart]
-    else:
-        nisa.nc_matmul(
-            dst=ps_x[0:chunk, 0:vpart], stationary=wq_t[0:kdim, g, 0:chunk],
-            moving=ht, accumulate=False,
-        )
-        ps_y = _psum(chunk, vpart)
-        nisa.nc_matmul(
-            dst=ps_y, stationary=wq_t[0:kdim, g, chunk : 2 * chunk], moving=ht,
-            accumulate=False,
-        )
-        qh = ps_y
+    w_t, qg_t, aqk_t, decay, kg_c, u_c = operands
 
     # Stage 4: v_new = u - w @ ht, on the entering state.
+    ps_x = _psum(chunk, vpart)
+    nisa.nc_matmul(dst=ps_x, stationary=w_t[0:kdim, g, 0:chunk], moving=ht,
+                   accumulate=False)
     vnew = vnew_c[0:chunk, g, 0:vpart]
     nisa.tensor_tensor(
-        dst=vnew, data1=u_c[0:chunk, g, 0:vpart], data2=ps_x[0:chunk, 0:vpart],
-        op=nl.subtract,
+        dst=vnew, data1=u_c[0:chunk, g, 0:vpart], data2=ps_x, op=nl.subtract
     )
 
-    # Stage 5: o = qg @ ht + aqk @ v_new, also on the entering state. One
-    # addend leaves PSUM first: an elementwise instruction reads one PSUM operand.
-    o_rows = o_c[row : row + chunk, g, 0:vpart]
-    nisa.tensor_copy(dst=o_rows, src=qh)
-    ps_a = _psum(row + chunk, vpart)
-    nisa.nc_matmul(
-        dst=ps_a, stationary=za_t[0:chunk, g, 0 : row + chunk], moving=vnew,
-        accumulate=False,
-    )
-    nisa.tensor_tensor(
-        dst=o_rows, data1=o_rows, data2=ps_a[row : row + chunk, 0:vpart], op=nl.add
-    )
-
-    # The carry: ht <- ht * exp(gc[C - 1]) + kg^T @ v_new.
-    decayed = _sbuf(kdim, vpart)
-    nisa.tensor_scalar(
-        dst=decayed, data=ht, op0=nl.multiply, operand0=decay[0:kdim, g : g + 1]
-    )
+    # The carry: ht <- ht * exp(gc[C - 1]) + kg^T @ v_new, the product and the
+    # sum in one vector instruction, so the step's last instruction waits on the
+    # tensor engine alone.
     ps_h = _psum(kdim, vpart)
     nisa.nc_matmul(
         dst=ps_h, stationary=kg_c[0:chunk, g, 0:kdim], moving=vnew, accumulate=False
     )
     ht_next = _sbuf(kdim, vpart)
-    nisa.tensor_tensor(dst=ht_next, data1=decayed, data2=ps_h, op=nl.add)
+    nisa.scalar_tensor_tensor(
+        dst=ht_next, data=ht, op0=nl.multiply, operand0=decay[0:kdim, g : g + 1],
+        op1=nl.add, operand1=ps_h,
+    )
+
+    # Stage 5, off the chain: o = qg @ ht + aqk @ v_new, also on the entering
+    # state, each product rounded on its own and then added. One addend leaves
+    # PSUM first: an elementwise instruction reads one PSUM operand.
+    ps_q = _psum(chunk, vpart)
+    nisa.nc_matmul(dst=ps_q, stationary=qg_t[0:kdim, g, 0:chunk], moving=ht,
+                   accumulate=False)
+    o_rows = o_c[0:chunk, g, 0:vpart]
+    nisa.tensor_copy(dst=o_rows, src=ps_q)
+    ps_a = _psum(chunk, vpart)
+    nisa.nc_matmul(dst=ps_a, stationary=aqk_t[0:chunk, g, 0:chunk], moving=vnew,
+                   accumulate=False)
+    nisa.tensor_tensor(dst=o_rows, data1=o_rows, data2=ps_a, op=nl.add)
     return ht_next
 
 
@@ -1550,10 +1498,10 @@ def kda_inter_chunk_kernel(
     Each chunk depends on the state the previous one leaves, so the chunk loop is
     a chain. Everything the chain reads but does not carry is formed per packed
     tile of ``MAX_TILE // C`` chunks (:func:`_emit_inter_operands`), so a chain
-    step is four instructions on the state: the merged product
-    ``[w^T | qg^T]^T @ ht``, ``v_new``, ``kg^T @ v_new`` and the decayed sum. Value
-    columns are independent, so a two-program launch gives each program
-    ``V / 2`` of them and the same chain.
+    step is four instructions on the state: ``w @ ht``, ``v_new``,
+    ``kg^T @ v_new`` and the decayed sum; ``o``'s two products hang off it
+    (:func:`_emit_inter_step`). Value columns are independent, so a two-program
+    launch gives each program ``V / 2`` of them and the same chain.
     """
     n_chunks, chunk, kdim = kg_hbm.shape
     vdim = u_hbm.shape[2]
@@ -1566,7 +1514,6 @@ def kda_inter_chunk_kernel(
     assert vdim % n_prog == 0, "the value width does not split over the programs"
     vpart = vdim // n_prog
     v0 = nl.program_id(0) * vpart
-    row = _output_row(chunk)
 
     o_hbm = nl.ndarray((n_chunks, chunk, vdim), dtype=nl.float32, buffer=nl.shared_hbm)
     vnew_hbm = nl.ndarray(
@@ -1593,13 +1540,13 @@ def kda_inter_chunk_kernel(
             sources, layout, g0, groups, chunk, kdim, v0, vpart, scale
         )
         vnew_c = nl.ndarray((chunk, groups, vpart), dtype=nl.float32, buffer=nl.sbuf)
-        o_c = nl.ndarray((row + chunk, groups, vpart), dtype=nl.float32, buffer=nl.sbuf)
+        o_c = nl.ndarray((chunk, groups, vpart), dtype=nl.float32, buffer=nl.sbuf)
         for g in range(groups):
             ht = _emit_inter_step(ht, operands, g, vnew_c, o_c, chunk, kdim, vpart)
         _dma(vnew_hbm[g0 : g0 + groups, 0:chunk, nl.ds(v0, vpart)].permute((1, 0, 2)),
              vnew_c, nisa.engine.sync)
         _dma(o_hbm[g0 : g0 + groups, 0:chunk, nl.ds(v0, vpart)].permute((1, 0, 2)),
-             o_c[row : row + chunk, 0:groups, 0:vpart], nisa.engine.scalar)
+             o_c, nisa.engine.scalar)
 
     leaving = _sbuf(vpart, kdim)
     _emit_transpose(leaving, ht, kdim, vpart)
