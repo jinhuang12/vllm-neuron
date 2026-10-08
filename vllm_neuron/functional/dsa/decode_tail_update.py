@@ -711,10 +711,12 @@ def _ring_member(ring, half, member, pool_size, depth, group_masks):
         nisa.tensor_copy(dst=src, src=ring[:, row0:row0 + head_dim])
         return src
     picked = _sb((h, head_dim), ring.dtype)
-    for g, mask in enumerate(group_masks):
+    # An index loop, not ``enumerate``: the NKI front end takes one simple variable as
+    # a loop target.
+    for g in range(len(group_masks)):
         row0 = (base + g * pool_size) * head_dim
         nisa.tensor_copy_predicated(dst=picked, src=ring[:, row0:row0 + head_dim],
-                                    predicate=mask)
+                                    predicate=group_masks[g])
     nisa.tensor_copy(dst=src, src=picked)
     return src
 
