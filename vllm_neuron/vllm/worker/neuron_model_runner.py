@@ -157,6 +157,11 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
         # the bonus token will be re-emitted by the transition step itself,
         # to avoid duplicate emission to the client.
         self._skip_emit: bool = False
+        # Shadow draft (MTP stage A): the step whose ids this output carries, with
+        # its unread draft tensor, scored in get_output() from the ids read back
+        # there. None with the knob off (every other model), so nothing else moves.
+        claim = getattr(model_runner, "_glm5next_shadow_claim", None)
+        self._glm5next_shadow = claim() if claim is not None else None
 
     def _discard_partial_prefill_samples(
         self, sampled_token_ids: list[list[int]]
@@ -169,6 +174,18 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
                 continue
             if req_idx < len(sampled_token_ids):
                 sampled_token_ids[req_idx] = []
+
+    def _glm5next_shadow_score(self, sampled_token_ids) -> None:
+        """Hand the step's ids, read back on this thread, to the shadow-draft scorer, once.
+
+        ``sampled_token_ids`` is the materialized ``list[list[int]]``, or ``None`` for an
+        intermediate prefill chunk drained without ids. The draft tensor of the same
+        execution is read by the scorer here, after the sampled ids, on this thread; no
+        other thread reads this step's futures (see ``_glm5next_shadow_observe``).
+        """
+        record, self._glm5next_shadow = self._glm5next_shadow, None
+        if record is not None:
+            self._model_runner._glm5next_shadow_commit(record, sampled_token_ids)
 
     def is_all_partial_prefill(self) -> bool:
         """True when every request in this output is an intermediate
@@ -205,6 +222,7 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
                     # longer than kv_segment_size * NRT_queue_cap overflows it
                     # ("Execution queue full").
                     sampled_token_ids.cpu()
+                    self._glm5next_shadow_score(None)
                     sampled_token_ids = [
                         [] for _ in range(len(self.model_runner_output.req_ids))
                     ]
@@ -241,6 +259,7 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
                 else:
                     # Non-spec: [bs] of sampled tokens.
                     sampled_token_ids = [[x] for x in sampled_token_ids.cpu().tolist()]
+                self._glm5next_shadow_score(sampled_token_ids)
                 self._discard_partial_prefill_samples(sampled_token_ids)
                 # If this output was marked for skip-emit (e.g. the last
                 # spec step's bonus will be re-emitted by the following
@@ -493,6 +512,14 @@ def build_sampling_params_tensor(
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug("On-device sampling params (top_k, top_p, temp): %s", result.tolist())
     return result
+
+
+class Glm5NextShadowStep(NamedTuple):
+    """One dispatched step waiting for its ids: dispatch index, bookkeeping, unread drafts."""
+
+    step_no: int
+    step: dict
+    drafts: Any
 
 
 class Glm5NextShadowDraftScorer:
@@ -9329,17 +9356,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             if self._debug_logits_dir:
                 self._on_device_logits = model_output_tensor
 
-        # Shadow draft: queue this step's sampled ids and drafts for scoring (no-op
-        # with the knob off; resolved one step later, so no readback here).
+        # Move model_output_tensor (logits or sampled token ids) back to CPU
+        if not self.use_async_scheduling:
+            model_output_tensor = model_output_tensor.to("cpu")
+
+        # Shadow draft: hand this step to the scorer (no-op with the knob off). Under
+        # async scheduling the tensor is still a device future and is not read here;
+        # the step's output object scores it when it reads the ids back.
         self._glm5next_shadow_observe(
             model_output_tensor,
             getattr(self, "_glm5next_shadow_last_drafts", None),
             is_prefill=is_prefill,
         )
-
-        # Move model_output_tensor (logits or sampled token ids) back to CPU
-        if not self.use_async_scheduling:
-            model_output_tensor = model_output_tensor.to("cpu")
 
         return model_output_tensor, aux_hidden_states, last_accepted_token
 
@@ -11537,10 +11565,20 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         return str(envs.VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG or "")
 
     def _glm5next_shadow_rank(self) -> int:
+        """This worker's tensor-parallel rank, read on the host once.
+
+        Never from ``rank_tensor``: that is a device tensor, and reading it is a
+        device-to-host copy on the worker's main thread. A process with no
+        model-parallel group is rank 0.
+        """
         cached = getattr(self, "_glm5next_shadow_rank_cache", None)
         if cached is None:
-            tensor = getattr(self, "rank_tensor", None)
-            cached = 0 if tensor is None else int(tensor.item())
+            from vllm.distributed.parallel_state import (
+                get_tp_group,
+                model_parallel_is_initialized,
+            )
+
+            cached = int(get_tp_group().rank_in_group) if model_parallel_is_initialized() else 0
             self._glm5next_shadow_rank_cache = cached
         return cached
 
@@ -11665,104 +11703,165 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
             scorer = Glm5NextShadowDraftScorer(self._glm5next_shadow_k(), sink)
             self._glm5next_shadow_scorer_instance = scorer
+            # Dispatch order (main thread) and scoring order (whichever thread reads a
+            # step's ids back); the lock covers the scorer and the ready steps.
             self._glm5next_shadow_step_no = 0
+            self._glm5next_shadow_next_step = 0
+            self._glm5next_shadow_ready = {}
+            self._glm5next_shadow_lock = threading.Lock()
         return scorer
 
     def _glm5next_shadow_shutdown(self) -> None:
-        """Resolve the step still queued, retire every request, close the log.
+        """Score what was read back, name what was not, retire every request, close the log.
 
-        Reached from the runner's shutdown. The queued step's tensors are the last
-        device futures; on an orderly shutdown the device has finished them, so reading
-        them back blocks nothing. After an abort mid-step the runtime may already be
-        gone and the read-back raises: that step is dropped with a warning naming it,
-        and the shutdown goes on, because a shutdown that raises leaves the log open
-        and every record still buffered unwritten. Every tracked request retires with
-        its pending drafts scored over the tokens that arrived (``scored`` < k for the
-        tail), so no record is lost. Idempotent: a second call finds no scorer and
-        returns.
+        Reached from the runner's shutdown, on the main thread. Nothing is read from the
+        device here: a step whose output no thread materialized (an abort mid-step; the
+        runtime may already be gone, and a read here would be the hang
+        ``_glm5next_shadow_observe`` describes) is dropped with a warning naming it, and
+        the steps behind it are scored in order, so no record that has its data is lost.
+        Every tracked request retires with its pending drafts scored over the tokens that
+        arrived (``scored`` < k for the tail). Idempotent: a second call finds no scorer
+        and returns.
         """
         scorer = getattr(self, "_glm5next_shadow_scorer_instance", None)
         if scorer is None:
             return
-        pending = self.__dict__.setdefault("_glm5next_shadow_pending", [])
-        while pending:
-            entry = pending.pop(0)
-            try:
-                self._glm5next_shadow_resolve(entry, scorer)
-            except Exception as exc:  # the device is gone; keep closing
-                logger.warning(
-                    "shadow draft: step %d could not be read back at shutdown (%s); "
-                    "its sampled ids and drafts are dropped",
-                    entry[0], exc,
-                )
-        scorer.close()
-        self._glm5next_shadow_scorer_instance = None
+        with self._glm5next_shadow_lock:
+            self._glm5next_shadow_drain(scorer)
+            ready = self._glm5next_shadow_ready
+            dispatched = self._glm5next_shadow_step_no
+            for step_no in sorted(ready) + [dispatched]:
+                if step_no < self._glm5next_shadow_next_step:
+                    continue  # scored by the drain of an earlier held step
+                lost = list(range(self._glm5next_shadow_next_step, step_no))
+                if lost:
+                    logger.warning(
+                        "shadow draft: %s never read back before shutdown; the sampled ids "
+                        "and drafts of %s are dropped",
+                        ", ".join(f"step {number}" for number in lost),
+                        "that step" if len(lost) == 1 else "those steps",
+                    )
+                self._glm5next_shadow_next_step = step_no
+                if step_no in ready:
+                    self._glm5next_shadow_drain(scorer)
+            self._glm5next_shadow_inflight = None
+            scorer.close()
+            self._glm5next_shadow_scorer_instance = None
         handle = getattr(self, "_glm5next_shadow_log_handle", None)
         if handle is not None:
             handle.close()
 
     def _glm5next_shadow_observe(self, sampled, drafts, *, is_prefill: bool) -> None:
-        """Queue this step's sampled ids and drafts; resolve the previous step's.
+        """Hand this step to the scorer without reading the device on the worker's main thread.
 
-        Under async scheduling the sampled ids are still a device future when the step
-        returns, and reading them back here would block the host on the step it just
-        dispatched. So each step's tensors are queued and resolved when the NEXT step is
-        observed, by which time the device has finished them; the scorer itself only
-        sees ordered observations. Request completion is read from the batch: a
-        tracked request absent from this step's batch has left (finished or
-        preempted), and its pending drafts are scored over the tokens that arrived.
+        Under async scheduling ``sampled`` is a device future that the output thread reads
+        back inside ``AsyncNeuronModelRunnerOutput.get_output()``, and ``drafts`` is a
+        second output of the same execution. A read here would make this thread a second
+        reader of that future, and the runtime delivers a future's completion once: the
+        gate's knob-5 server hung at its first decode step exactly there (rank 0's main
+        thread in ``sample_tokens``; the engine core timed out behind it). So the step is
+        stashed -- its bookkeeping and its unread draft tensor -- for the output object
+        ``sample_tokens`` builds next to claim (``_glm5next_shadow_claim``); ``get_output``
+        scores it from the ids it read back and reads the drafts there, after the sampled
+        ids, on the thread that materialized them. A synchronous runner moved ``sampled``
+        to the host already, and the step is scored at once. A step the kwargs hook did not
+        stash (a synthetic forward) observes nothing.
         """
         step = getattr(self, "_glm5next_shadow_step", None)
         self._glm5next_shadow_step = None
-        pending = self.__dict__.setdefault("_glm5next_shadow_pending", [])
-        if not self._glm5next_shadow_active():
+        self._glm5next_shadow_inflight = None
+        if step is None or sampled is None or not self._glm5next_shadow_active():
             return
-        scorer = self._glm5next_shadow_scorer()
-        real_step = step is not None and len(step["request_ids"]) > 0 and sampled is not None
-        if real_step:
-            step_no = self._glm5next_shadow_step_no
-            self._glm5next_shadow_step_no = step_no + 1
-            pending.append((step_no, step, sampled, drafts))
-            present = set(req_id for req_id in step["request_ids"] if req_id is not None)
+        self._glm5next_shadow_scorer()
+        step_no = self._glm5next_shadow_step_no
+        self._glm5next_shadow_step_no = step_no + 1
+        record = Glm5NextShadowStep(step_no, step, drafts)
+        if getattr(self, "use_async_scheduling", False):
+            self._glm5next_shadow_inflight = record
         else:
-            present = set()
-        # Resolve every queued step but the newest, which may still be in flight.
-        while len(pending) > (1 if real_step else 0):
-            self._glm5next_shadow_resolve(pending.pop(0), scorer)
-        scorer.retire_absent(present)
+            self._glm5next_shadow_commit(record, sampled)
 
-    def _glm5next_shadow_resolve(self, entry, scorer: Glm5NextShadowDraftScorer) -> None:
-        step_no, step, sampled, drafts = entry
-        if torch.is_tensor(sampled) and sampled.is_floating_point():
-            if not getattr(self, "_glm5next_shadow_warned_logits", False):
-                self._glm5next_shadow_warned_logits = True
-                logger.warning(
-                    "shadow draft: the graph returned logits, not sampled ids; scoring "
-                    "needs on-device sampling (VLLM_NEURON_GLM5NEXT_ON_DEVICE_SAMPLING=1) "
-                    "and is skipped"
-                )
-            return
-        ids = sampled.cpu().reshape(-1).tolist() if torch.is_tensor(sampled) else list(sampled)
+    def _glm5next_shadow_claim(self):
+        """The step just observed, for the async output ``sample_tokens`` is building.
+
+        Called once per output object, from its constructor, so a step rides with exactly
+        the output whose ids it is scored from. ``None`` with the knob off, for a synthetic
+        step, or on a synchronous runner (which scored the step already).
+        """
+        record = getattr(self, "_glm5next_shadow_inflight", None)
+        self._glm5next_shadow_inflight = None
+        return record
+
+    def _glm5next_shadow_commit(self, record: Glm5NextShadowStep, sampled) -> None:
+        """Score one step from its ids on the host, in dispatch order.
+
+        ``sampled`` is a host tensor (a synchronous runner), ``get_output``'s
+        ``list[list[int]]`` rows (one id per row: the shadow runs without speculative
+        decoding), or ``None`` for an intermediate prefill chunk drained without ids. The
+        draft tensor is read here, after the sampled ids of the same execution, on the
+        same thread. Outputs may be materialized out of dispatch order (the worker's
+        fallback path takes the newest first); a step whose predecessors are still in
+        flight waits in ``_glm5next_shadow_ready`` until they are scored.
+        """
+        ids = self._glm5next_shadow_ids(sampled)
         rows = None
-        if drafts is not None:
+        if ids is not None and record.drafts is not None:
+            drafts = record.drafts
             draft_tensor = drafts.cpu() if torch.is_tensor(drafts) else torch.as_tensor(drafts)
             rows = draft_tensor.reshape(draft_tensor.shape[0], -1).tolist()
-        for row, (req_id, final, position) in enumerate(
-            zip(step["request_ids"], step["finals"], step["positions"])
-        ):
-            if req_id is None or row >= len(ids):
-                continue
-            if step["is_prefill"] and not final:
-                # An intermediate chunk's sampled id is not a token of the sequence.
-                continue
-            candidate = None
-            if rows is not None and row < len(rows) and any(value >= 0 for value in rows[row]):
-                candidate = rows[row]
-            scorer.observe(
-                req_id,
-                step=step_no,
-                position=position,
-                sampled=ids[row],
-                drafts=candidate,
-                row=row,
-            )
+        lock = getattr(self, "_glm5next_shadow_lock", None)
+        if lock is None:
+            return
+        with lock:
+            scorer = getattr(self, "_glm5next_shadow_scorer_instance", None)
+            if scorer is None:
+                return  # shut down already: the log is closed
+            self._glm5next_shadow_ready[record.step_no] = (record.step, ids, rows)
+            self._glm5next_shadow_drain(scorer)
+
+    def _glm5next_shadow_ids(self, sampled):
+        """The sampled id per batch row from what was read back, or ``None`` to score nothing."""
+        if sampled is None:
+            return None
+        if torch.is_tensor(sampled):
+            if sampled.is_floating_point():
+                if not getattr(self, "_glm5next_shadow_warned_logits", False):
+                    self._glm5next_shadow_warned_logits = True
+                    logger.warning(
+                        "shadow draft: the graph returned logits, not sampled ids; scoring "
+                        "needs on-device sampling (VLLM_NEURON_GLM5NEXT_ON_DEVICE_SAMPLING=1) "
+                        "and is skipped"
+                    )
+                return None
+            return sampled.reshape(-1).tolist()
+        return [row[0] if row else None for row in sampled]
+
+    def _glm5next_shadow_drain(self, scorer: Glm5NextShadowDraftScorer) -> None:
+        """Score every ready step from the next expected one on; caller holds the lock."""
+        ready = self._glm5next_shadow_ready
+        while self._glm5next_shadow_next_step in ready:
+            step_no = self._glm5next_shadow_next_step
+            step, ids, rows = ready.pop(step_no)
+            self._glm5next_shadow_next_step = step_no + 1
+            present = {req_id for req_id in step["request_ids"] if req_id is not None}
+            if ids is not None:
+                for row, (req_id, final, position) in enumerate(
+                    zip(step["request_ids"], step["finals"], step["positions"])
+                ):
+                    if req_id is None or row >= len(ids) or ids[row] is None:
+                        continue
+                    if step["is_prefill"] and not final:
+                        # An intermediate chunk's sampled id is not a token of the sequence.
+                        continue
+                    candidate = None
+                    if rows is not None and row < len(rows) and any(value >= 0 for value in rows[row]):
+                        candidate = rows[row]
+                    scorer.observe(
+                        req_id,
+                        step=step_no,
+                        position=position,
+                        sampled=ids[row],
+                        drafts=candidate,
+                        row=row,
+                    )
+            scorer.retire_absent(present)

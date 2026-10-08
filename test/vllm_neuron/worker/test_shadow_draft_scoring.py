@@ -25,7 +25,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.distributed import parallel_state as dist_state
+
 from vllm_neuron.vllm.worker.neuron_model_runner import (
+    AsyncNeuronModelRunnerOutput,
     Glm5NextShadowDraftScorer,
     NeuronModelRunner,
 )
@@ -67,13 +70,59 @@ def _alphas(records: list[dict], k: int) -> tuple[list[float], list[float]]:
     return conditional, cumulative
 
 
-def _runner_shell(*, k: int = K, req_ids=None, rank: int = 0, head: bool = True):
-    """A runner with the state the shadow hooks read; ``head`` = the served root built ``mtp``."""
+class _DeviceTensor(torch.Tensor):
+    """A tensor on the device: a host read (``.cpu()``, ``.tolist()``, ``.item()``, ``.to("cpu")``)
+    raises while ``armed``. The glue must never read one on the worker's main thread; the
+    test disarms a future once "the output thread" is the one reading it back.
+
+    Tensor operations on it return plain tensors (the next step consumes the sampled ids as
+    its device input), so only the host reads are watched.
+    """
+
+    __torch_function__ = torch._C._disabled_torch_function_impl
+
+    @staticmethod
+    def of(tensor: torch.Tensor) -> "_DeviceTensor":
+        device = tensor.as_subclass(_DeviceTensor)
+        device.armed = True
+        return device
+
+    def _read(self) -> torch.Tensor:
+        if self.armed:
+            raise RuntimeError("device read on the host")
+        return self.as_subclass(torch.Tensor)
+
+    def cpu(self):
+        return self._read()
+
+    def tolist(self):
+        return self._read().tolist()
+
+    def item(self):
+        return self._read().item()
+
+    def to(self, *args, **kwargs):
+        return self._read().to(*args, **kwargs)
+
+
+def _runner_shell(*, k: int = K, req_ids=None, rank: int | None = 0, head: bool = True,
+                  async_scheduling: bool = False):
+    """A runner with the state the shadow hooks read.
+
+    ``head`` = the served root built ``mtp``. ``rank`` is the host-side tensor-parallel rank a
+    built runner reads once from its group; ``None`` leaves it to be read. ``rank_tensor`` is
+    a device tensor that raises on any host read, as the production one is a device tensor.
+    """
     runner = NeuronModelRunner.__new__(NeuronModelRunner)
     runner.input_batch = SimpleNamespace(req_ids=list(req_ids or []))
     runner.requests = {}
-    runner.rank_tensor = torch.tensor(rank, dtype=torch.int32)
+    runner.rank_tensor = _DeviceTensor.of(torch.tensor(0 if rank is None else rank, dtype=torch.int32))
+    if rank is not None:
+        runner._glm5next_shadow_rank_cache = rank
     runner.model = SimpleNamespace(mtp=object() if head else None)
+    runner.use_async_scheduling = async_scheduling
+    # get_output() writes the ids back into the batch; the batch is not under test here.
+    runner._update_batch_state_with_samples = lambda *args, **kwargs: None
     return runner
 
 
@@ -208,7 +257,11 @@ def test_retire_absent_flushes_only_the_requests_that_left():
 
 def _observe_step(runner, req_ids, *, sampled, drafts, is_prefill=False, final=None,
                   starts=None, counts=None):
-    """One step as the runner sees it: kwargs hook (stashes the step), then the unpack."""
+    """One step as the runner sees it: kwargs hook (stashes the step), then the unpack.
+
+    ``sampled`` and ``drafts`` are lists (the host copy a synchronous runner made) or tensors
+    handed through as they are (a device future under async scheduling).
+    """
     runner.input_batch.req_ids = list(req_ids)
     n = len(req_ids)
     starts = list(starts) if starts is not None else [0] * n
@@ -217,39 +270,192 @@ def _observe_step(runner, req_ids, *, sampled, drafts, is_prefill=False, final=N
         is_prefill=is_prefill, request_ids=list(req_ids), request_starts=starts,
         request_tokens=counts, synthetic=False, device=torch.device("cpu"), sampling_rows=n,
     )
-    sampled_t = torch.tensor(sampled, dtype=torch.int32)
-    drafts_t = None if drafts is None else torch.tensor(drafts, dtype=torch.int32)
+    sampled_t = sampled if torch.is_tensor(sampled) else torch.tensor(sampled, dtype=torch.int32)
+    if drafts is None or torch.is_tensor(drafts):
+        drafts_t = drafts
+    else:
+        drafts_t = torch.tensor(drafts, dtype=torch.int32)
     runner._glm5next_shadow_observe(sampled_t, drafts_t, is_prefill=is_prefill)
+
+
+def _async_output(runner, req_ids, sampled) -> AsyncNeuronModelRunnerOutput:
+    """The step's async output the way ``sample_tokens`` builds it: one per step, right after
+    the unpack, so it claims the step the glue just stashed."""
+    return AsyncNeuronModelRunnerOutput(
+        model_runner_output=SimpleNamespace(req_ids=list(req_ids), sampled_token_ids=sampled),
+        model_runner=runner,
+    )
+
+
+def _device_step(runner, req_ids, *, sampled, drafts, **kwargs):
+    """One async step: futures the main thread must not read, observed, then its output."""
+    sampled_t = _DeviceTensor.of(torch.tensor(sampled, dtype=torch.int32))
+    drafts_t = None if drafts is None else _DeviceTensor.of(torch.tensor(drafts, dtype=torch.int32))
+    _observe_step(runner, req_ids, sampled=sampled_t, drafts=drafts_t, **kwargs)
+    return _async_output(runner, req_ids, sampled_t), sampled_t, drafts_t
+
+
+def _materialize(output, sampled_t, drafts_t):
+    """The output thread's turn: the device has finished, the ids are read back."""
+    sampled_t.armed = False
+    if drafts_t is not None:
+        drafts_t.armed = False
+    return output.get_output().sampled_token_ids
 
 
 def _read_log(path) -> list[dict]:
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
-def test_async_one_step_late_ids_are_resolved_at_the_next_step(monkeypatch, tmp_path):
-    """The glue resolves a step's device outputs when the next step is observed, so the
-    host never blocks on the step it just dispatched; the log is complete at retirement."""
+def _records(path) -> list[dict]:
+    """The records written so far; the scorer opens the file before its first record."""
+    return _read_log(path) if path.exists() else []
+
+
+def test_the_rank_is_read_on_the_host_from_the_tensor_parallel_group(monkeypatch):
+    """``rank_tensor`` lives on the device; reading it is a device-to-host copy on the worker's
+    main thread, so the rank comes from the tensor-parallel group instead, once. A process
+    with no model-parallel group is rank 0."""
+    runner = _runner_shell(k=2, rank=None)
+    monkeypatch.setattr(dist_state, "model_parallel_is_initialized", lambda: True)
+    monkeypatch.setattr(dist_state, "get_tp_group", lambda: SimpleNamespace(rank_in_group=3))
+    assert runner._glm5next_shadow_rank() == 3
+    monkeypatch.setattr(dist_state, "get_tp_group", lambda: SimpleNamespace(rank_in_group=0))
+    assert runner._glm5next_shadow_rank() == 3, "read once, then held"
+    alone = _runner_shell(k=2, rank=None)
+    monkeypatch.setattr(dist_state, "model_parallel_is_initialized", lambda: False)
+    assert alone._glm5next_shadow_rank() == 0
+
+
+def test_under_async_scheduling_the_main_thread_reads_no_future_and_the_output_scores_the_step(
+    monkeypatch, tmp_path
+):
+    """The gate's knob-5 server hung at the first decode: the glue read the previous step's
+    sampled ids back from the device on the worker's main thread while the output thread was
+    reading the same future inside ``get_output()``. Now the main thread stashes the step
+    (its bookkeeping and its draft future, unread); the step's ``AsyncNeuronModelRunnerOutput``
+    claims it; ``get_output()`` scores it from the ids it read back, on whichever thread
+    materializes, and reads the draft future there, once, after the sampled ids of the same
+    execution. The log fills as outputs are materialized, not as steps are dispatched."""
+    log = tmp_path / "shadow.jsonl"
+    monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT", "2")
+    monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG", str(log))
+    runner = _runner_shell(k=2, req_ids=["r"], async_scheduling=True)
+    toks = _tokens(3, 8)
+    # Prefill (final chunk of a 5-token prompt), then three decodes at positions 5, 6, 7.
+    plan = [
+        dict(sampled=[toks[0]], drafts=[[-1, -1]], is_prefill=True, starts=[0], counts=[5]),
+        dict(sampled=[toks[1]], drafts=[[toks[2], toks[3]]], starts=[5]),
+        dict(sampled=[toks[2]], drafts=[[toks[3], 0]], starts=[6]),
+        dict(sampled=[toks[3]], drafts=[[0, 0]], starts=[7]),
+    ]
+    steps = [_device_step(runner, ["r"], **spec) for spec in plan]
+    # Every step was dispatched; no future was read; each step's record left with its output.
+    assert _records(log) == []
+    assert runner._glm5next_shadow_inflight is None
+    assert all(sampled.armed and drafts.armed for _out, sampled, drafts in steps)
+    # The output thread materializes the steps in order.
+    ids = [_materialize(*step) for step in steps]
+    assert ids == [[[toks[0]]], [[toks[1]]], [[toks[2]]], [[toks[3]]]]
+    written = _read_log(log)
+    # Step 1's two drafts were scored against steps 2 and 3; steps 2 and 3 still wait.
+    assert [(r["step"], r["position"], r["scored"], r["accepted_prefix_len"]) for r in written] == [
+        (1, 5, 2, 2)
+    ]
+    runner.ensure_kv_transfer_shutdown()
+    written = _read_log(log)
+    assert [(r["step"], r["scored"], r["accepted_prefix_len"]) for r in written] == [
+        (1, 2, 2), (2, 1, 1), (3, 0, 0)
+    ]
+    assert runner._glm5next_shadow_log_handle.closed
+
+
+def test_a_second_get_output_on_the_same_step_scores_nothing_twice(monkeypatch, tmp_path):
+    """Both the output thread and the worker's fallback path may call ``get_output()`` on one
+    step; the step is scored once."""
+    log = tmp_path / "shadow.jsonl"
+    monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT", "1")
+    monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG", str(log))
+    runner = _runner_shell(k=1, req_ids=["r"], async_scheduling=True)
+    first = _device_step(runner, ["r"], sampled=[10], drafts=[[11]], starts=[4])
+    second = _device_step(runner, ["r"], sampled=[11], drafts=[[12]], starts=[5])
+    _materialize(*first)
+    assert first[0].get_output().sampled_token_ids == [[10]], "the list, read back once"
+    _materialize(*second)
+    _materialize(*second)
+    assert [(r["step"], r["actual"]) for r in _read_log(log)] == [(0, [11])]
+    assert runner._glm5next_shadow_scorer_instance.tracked == {"r"}
+
+
+def test_outputs_materialized_out_of_dispatch_order_are_scored_in_dispatch_order(monkeypatch, tmp_path):
+    """The output thread works through the steps in order, but the worker's fallback path may
+    materialize the newest step first; the scorer sees steps in dispatch order regardless."""
+    log = tmp_path / "shadow.jsonl"
+    monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT", "1")
+    monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG", str(log))
+    runner = _runner_shell(k=1, req_ids=["r"], async_scheduling=True)
+    steps = [
+        _device_step(runner, ["r"], sampled=[20], drafts=[[21]], starts=[4]),
+        _device_step(runner, ["r"], sampled=[21], drafts=[[22]], starts=[5]),
+        _device_step(runner, ["r"], sampled=[22], drafts=[[0]], starts=[6]),
+    ]
+    _materialize(*steps[1])
+    assert _records(log) == [], "step 1 waits for step 0"
+    _materialize(*steps[2])
+    assert _records(log) == []
+    _materialize(*steps[0])
+    written = _read_log(log)
+    assert [(r["step"], r["position"], r["actual"], r["accepted_prefix_len"]) for r in written] == [
+        (0, 4, [21], 1), (1, 5, [22], 1)
+    ]
+
+
+def test_an_intermediate_prefill_chunk_output_advances_the_order_and_scores_nothing(monkeypatch, tmp_path):
+    """An all-partial prefill output is drained in ``get_output()`` without ids; the step takes
+    its turn in the order and leaves no record, so the steps behind it are not held."""
+    log = tmp_path / "shadow.jsonl"
+    monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT", "1")
+    monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG", str(log))
+    runner = _runner_shell(k=1, req_ids=["c"], async_scheduling=True)
+    runner.requests = {"c": SimpleNamespace(prompt_token_ids=list(range(100, 108)), num_prompt_tokens=8)}
+    # Chunk 1 of 2: rows 0..3 of an 8-token prompt. Its output is all-partial.
+    chunk_sampled = _DeviceTensor.of(torch.tensor([5], dtype=torch.int32))
+    chunk_drafts = _DeviceTensor.of(torch.tensor([[-1]], dtype=torch.int32))
+    _observe_step(runner, ["c"], sampled=chunk_sampled, drafts=chunk_drafts, is_prefill=True,
+                  starts=[0], counts=[4])
+    chunk_out = AsyncNeuronModelRunnerOutput(
+        model_runner_output=SimpleNamespace(req_ids=["c"], sampled_token_ids=chunk_sampled),
+        model_runner=runner, partial_prefill_req_ids={"c"},
+    )
+    final = _device_step(runner, ["c"], sampled=[107], drafts=[[-1]], is_prefill=True, starts=[4], counts=[4])
+    decode = _device_step(runner, ["c"], sampled=[30], drafts=[[31]], starts=[8])
+    _materialize(*final)
+    _materialize(*decode)
+    assert _records(log) == [], "the chunk's turn has not come"
+    chunk_sampled.armed = False
+    assert chunk_out.get_output().sampled_token_ids == [[]]
+    runner.ensure_kv_transfer_shutdown()
+    assert [(r["step"], r["position"], r["actual"]) for r in _read_log(log)] == [(2, 8, [])]
+
+
+def test_without_async_scheduling_each_step_is_scored_as_it_is_observed(monkeypatch, tmp_path):
+    """A synchronous runner moved the sampled ids to the host before the glue runs; the step is
+    scored at once, the drafts read back once, and a request that leaves is retired."""
     log = tmp_path / "shadow.jsonl"
     monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT", "3")
     monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG", str(log))
     runner = _runner_shell(k=3)
     tokens = _tokens(6, 10)
-    # Prefill: one request, final chunk, position 4 (prompt of 5 tokens).
     _observe_step(runner, ["q"], sampled=[tokens[0]], drafts=[[-1, -1, -1]], is_prefill=True,
                   starts=[0], counts=[5])
-    # Decode steps 1..4 at positions 5..8.
     for t in range(1, 5):
         future = tokens[t + 1 : t + 4]
         _observe_step(runner, ["q"], sampled=[tokens[t]],
                       drafts=[_planted_drafts(future, 2)[:3]], starts=[4 + t], counts=[1])
-    # The newest step is still pending (its tensors are futures on device); every older
-    # step has been resolved. Step 1's record needs steps 2..4: it is complete now.
-    pending = runner._glm5next_shadow_pending
-    assert len(pending) == 1
-    # Step 1's record needs the tokens of steps 2, 3 and 4; step 4 is the one still in
-    # flight, so nothing is written yet: the lag is exactly one step.
-    assert not log.exists() or _read_log(log) == []
-    # The request leaves the batch: the pending step is resolved and the rest flushed.
+        if t == 4:
+            # Step 1's record needs the tokens of steps 2, 3 and 4: complete as step 4 is observed.
+            assert [r["step"] for r in _read_log(log)] == [1]
+    assert runner._glm5next_shadow_inflight is None
     _observe_step(runner, [], sampled=[], drafts=None)
     written = _read_log(log)
     assert [r["step"] for r in written] == [1, 2, 3, 4]
@@ -265,67 +471,57 @@ def test_slot_reuse_by_a_new_request_starts_a_fresh_history(monkeypatch, tmp_pat
     monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT", "2")
     monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG", str(log))
     runner = _runner_shell(k=2)
-    a, b = _tokens(7, 6), _tokens(8, 6)
-    _observe_step(runner, ["A"], sampled=[a[0]], drafts=[[-1, -1]], is_prefill=True, counts=[3])
-    _observe_step(runner, ["A"], sampled=[a[1]], drafts=[[a[2], b[1]]], starts=[2])
-    _observe_step(runner, ["A"], sampled=[a[2]], drafts=[[b[0], b[1]]], starts=[3])
-    # A finishes; B takes row 0 in the very next step (its prefill).
-    _observe_step(runner, ["B"], sampled=[b[0]], drafts=[[-1, -1]], is_prefill=True, counts=[3])
-    _observe_step(runner, ["B"], sampled=[b[1]], drafts=[[b[2], b[3]]], starts=[2])
-    _observe_step(runner, ["B"], sampled=[b[2]], drafts=[[0, 0]], starts=[3])
-    _observe_step(runner, ["B"], sampled=[b[3]], drafts=[[0, 0]], starts=[4])
+    a, b = _tokens(1, 6), _tokens(2, 6)
+    _observe_step(runner, ["a"], sampled=[a[0]], drafts=[[-1, -1]], is_prefill=True, counts=[3])
+    _observe_step(runner, ["a"], sampled=[a[1]], drafts=[[a[2], a[3]]], starts=[3])
+    # 'a' finishes; 'b' takes row 0. b's prefill id must not score a's drafts.
+    _observe_step(runner, ["b"], sampled=[b[0]], drafts=[[-1, -1]], is_prefill=True, counts=[3])
+    _observe_step(runner, ["b"], sampled=[b[1]], drafts=[[b[2], b[3]]], starts=[3])
+    _observe_step(runner, ["b"], sampled=[b[2]], drafts=[[0, 0]], starts=[4])
     _observe_step(runner, [], sampled=[], drafts=None)
     written = _read_log(log)
-    by_req = {}
-    for r in written:
-        by_req.setdefault(r["req_id"], []).append(r)
-    # A's second record predicted b[0], b[1]: B's tokens must not have scored it.
-    assert [(r["scored"], r["accepted_prefix_len"]) for r in by_req["A"]] == [(1, 1), (0, 0)]
-    assert by_req["A"][1]["actual"] == []
-    # B's history starts at its own prefill token.
-    assert [(r["scored"], r["accepted_prefix_len"]) for r in by_req["B"]] == [(2, 2), (1, 0), (0, 0)]
-    assert by_req["B"][0]["actual"] == [b[2], b[3]]
-    assert all(r["row"] == 0 for r in written)
+    by_req = {r["req_id"]: r for r in written if r["drafts"] != [0, 0]}
+    assert by_req["a"]["scored"] == 0 and by_req["a"]["actual"] == []
+    assert by_req["b"]["scored"] == 1 and by_req["b"]["actual"] == [b[2]]
+    assert by_req["b"]["accepted_prefix_len"] == 1
 
 
 def test_intermediate_prefill_chunks_and_sentinel_drafts_leave_no_trace(monkeypatch, tmp_path):
+    """A chunk that is not the prompt's last samples an id that is not a token of the sequence;
+    the prefill leg's -1 drafts are not drafts. Neither reaches the scorer."""
     log = tmp_path / "shadow.jsonl"
     monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT", "2")
     monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG", str(log))
     runner = _runner_shell(k=2)
-    runner.requests = {"c": SimpleNamespace(prompt_token_ids=list(range(10)), num_prompt_tokens=10)}
-    toks = _tokens(9, 6)
-    # Chunk 1 of 2: positions 0..5, not final. Its sampled id is garbage and is not a token.
-    _observe_step(runner, ["c"], sampled=[999], drafts=[[-1, -1]], is_prefill=True,
-                  starts=[0], counts=[6])
-    # Chunk 2: positions 6..9, final: samples x_T.
-    _observe_step(runner, ["c"], sampled=[toks[0]], drafts=[[-1, -1]], is_prefill=True,
-                  starts=[6], counts=[4])
-    _observe_step(runner, ["c"], sampled=[toks[1]], drafts=[[toks[2], toks[3]]], starts=[10])
-    _observe_step(runner, ["c"], sampled=[toks[2]], drafts=[[0, 0]], starts=[11])
-    _observe_step(runner, ["c"], sampled=[toks[3]], drafts=[[0, 0]], starts=[12])
+    runner.requests = {"c": SimpleNamespace(prompt_token_ids=list(range(100, 108)), num_prompt_tokens=8)}
+    # Chunk 1 of 2: rows 0..3 of an 8-token prompt; its sampled id is noise.
+    _observe_step(runner, ["c"], sampled=[5], drafts=[[-1, -1]], is_prefill=True, starts=[0], counts=[4])
+    # Chunk 2: rows 4..7, the last; its sampled id is x_8.
+    _observe_step(runner, ["c"], sampled=[107], drafts=[[-1, -1]], is_prefill=True, starts=[4], counts=[4])
+    _observe_step(runner, ["c"], sampled=[30], drafts=[[31, 32]], starts=[8])
+    _observe_step(runner, ["c"], sampled=[31], drafts=[[0, 0]], starts=[9])
     _observe_step(runner, [], sampled=[], drafts=None)
     written = _read_log(log)
-    # The record at step 3 (first decode) is scored 2/2: the history is [x_T, x_T+1, ...]
-    # with no garbage token from chunk 1 in it.
-    assert written[0]["step"] == 2 and written[0]["position"] == 10
-    assert (written[0]["scored"], written[0]["accepted_prefix_len"]) == (2, 2)
+    history = [31]  # what step 2's drafts were scored against
+    assert [r["step"] for r in written] == [2, 3]
+    assert written[0]["actual"] == history and written[0]["accepted_prefix_len"] == 1
+    assert written[0]["position"] == 8
 
 
-def test_shutdown_resolves_the_in_flight_step_scores_the_rest_and_closes_the_log(monkeypatch, tmp_path):
-    """The worker's shutdown reaches the runner through ``ensure_kv_transfer_shutdown``: the
-    step still queued (one step late) is resolved, every tracked request is retired with its
-    pending drafts scored over what arrived, and the log handle is closed."""
+def test_shutdown_scores_the_rest_and_closes_the_log(monkeypatch, tmp_path):
+    """The worker's shutdown reaches the runner through ``ensure_kv_transfer_shutdown``: every
+    tracked request is retired with its pending drafts scored over what arrived, and the log
+    handle is closed."""
     log = tmp_path / "shadow.jsonl"
     monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT", "2")
     monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG", str(log))
     runner = _runner_shell(k=2, req_ids=["r"])
-    # Three decode steps. One step late, the scorer has seen steps 0 and 1; step 0's two
-    # drafts need step 2's token, which is still queued, so nothing is complete yet.
+    # Three decode steps. Step 0's two drafts need step 2's token: complete as step 2 is
+    # observed; steps 1 and 2 wait for tokens that never come.
     _observe_step(runner, ["r"], sampled=[10], drafts=[[11, 12]], starts=[8], counts=[1])
     _observe_step(runner, ["r"], sampled=[11], drafts=[[12, 13]], starts=[9], counts=[1])
     _observe_step(runner, ["r"], sampled=[12], drafts=[[13, 0]], starts=[10], counts=[1])
-    assert _read_log(log) == [], "the newest step is still queued; no record is complete"
+    assert [r["step"] for r in _read_log(log)] == [0]
     runner.ensure_kv_transfer_shutdown()
     records = _read_log(log)
     assert [r["step"] for r in records] == [0, 1, 2]
@@ -338,31 +534,27 @@ def test_shutdown_resolves_the_in_flight_step_scores_the_rest_and_closes_the_log
     assert len(_read_log(log)) == 3
 
 
-class _TornDownTensor(torch.Tensor):
-    """A device future whose runtime is gone: reading it back raises."""
-
-    def cpu(self):
-        raise RuntimeError("runtime closed")
-
-
-def test_shutdown_closes_the_log_even_when_the_queued_step_cannot_be_read_back(
+def test_shutdown_drops_a_step_whose_output_was_never_read_back_and_closes_the_log(
     monkeypatch, tmp_path, caplog
 ):
-    """An abort mid-step reaches shutdown with a queued step whose device buffers are gone.
-    Reading them back raises; shutdown still retires every request over what did arrive,
-    closes the handle and drops the scorer, and says which step it lost."""
+    """An abort mid-step reaches shutdown with a dispatched step whose output no thread
+    materialized. Shutdown does not read the device (the runtime may be gone, and a read
+    here is the hang this file pins): the step is dropped with a warning naming it, every
+    request retires over what did arrive, the handle closes and the scorer is dropped."""
     log = tmp_path / "shadow.jsonl"
     monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT", "2")
     monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG", str(log))
-    runner = _runner_shell(k=2, req_ids=["r"])
-    _observe_step(runner, ["r"], sampled=[10], drafts=[[11, 12]], starts=[8], counts=[1])
-    _observe_step(runner, ["r"], sampled=[11], drafts=[[12, 13]], starts=[9], counts=[1])
-    _observe_step(runner, ["r"], sampled=[12], drafts=[[13, 0]], starts=[10], counts=[1])
-    step_no, step, sampled, drafts = runner._glm5next_shadow_pending[-1]
-    torn = sampled.as_subclass(_TornDownTensor)
-    runner._glm5next_shadow_pending[-1] = (step_no, step, torn, drafts)
+    runner = _runner_shell(k=2, req_ids=["r"], async_scheduling=True)
+    steps = [
+        _device_step(runner, ["r"], sampled=[10], drafts=[[11, 12]], starts=[8]),
+        _device_step(runner, ["r"], sampled=[11], drafts=[[12, 13]], starts=[9]),
+        _device_step(runner, ["r"], sampled=[12], drafts=[[13, 0]], starts=[10]),
+    ]
+    _materialize(*steps[0])
+    _materialize(*steps[1])
     with caplog.at_level("WARNING"):
         runner.ensure_kv_transfer_shutdown()
+    assert steps[2][1].armed and steps[2][2].armed, "shutdown read nothing from the device"
     records = _read_log(log)
     # Step 2's token never arrived: step 0 is scored over step 1's token only, step 1 over none.
     assert [r["step"] for r in records] == [0, 1]
@@ -389,10 +581,10 @@ def test_the_log_is_written_by_rank_zero_only(monkeypatch, tmp_path):
 def test_without_a_log_path_nothing_is_scored(monkeypatch, tmp_path):
     monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT", "2")
     monkeypatch.delenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG", raising=False)
-    runner = _runner_shell(k=2)
+    runner = _runner_shell(k=2, async_scheduling=True)
     _observe_step(runner, ["n"], sampled=[1], drafts=[[-1, -1]], is_prefill=True, counts=[2])
     _observe_step(runner, ["n"], sampled=[2], drafts=[[3, 4]], starts=[2])
-    assert runner._glm5next_shadow_pending == []
+    assert runner._glm5next_shadow_inflight is None
     assert getattr(runner, "_glm5next_shadow_scorer_instance", None) is None
 
 
@@ -506,8 +698,8 @@ def test_take_output_peels_the_draft_ids_off_the_graph_output(monkeypatch):
 
 def test_execute_model_forward_peels_the_drafts_and_observes_the_step(monkeypatch, tmp_path):
     """With the knob on the GLM root returns ``(sampled_ids, draft_ids)``; the unpack hands the
-    sampled ids on unchanged and queues the step for scoring, so the next step's observe can
-    resolve it. Everything around the model call is a shell: this reads the two hunks only."""
+    sampled ids on unchanged and observes the step for scoring. Everything around the model
+    call is a shell: this reads the two hunks only."""
     import contextlib
 
     from vllm_neuron.vllm.worker import neuron_model_runner as module
@@ -561,12 +753,11 @@ def test_execute_model_forward_peels_the_drafts_and_observes_the_step(monkeypatc
     )
     assert aux is None and last is None
     assert torch.equal(out, sampled), "the sampled ids pass through unchanged"
-    assert len(runner._glm5next_shadow_pending) == 1
-    step_no, step, queued_sampled, queued_drafts = runner._glm5next_shadow_pending[0]
-    assert step["request_ids"] == ["u"] and step["positions"] == [7]
-    assert torch.equal(queued_sampled, sampled) and torch.equal(queued_drafts, drafts)
-    # The next step resolves it; with 'u' gone, the record is flushed with nothing scored.
-    runner.input_batch.req_ids = []
-    runner._glm5next_shadow_observe(torch.tensor([], dtype=torch.int32), None, is_prefill=False)
+    # A synchronous runner: the step was scored as it was observed and its drafts wait.
+    scorer = runner._glm5next_shadow_scorer_instance
+    assert scorer.tracked == {"u"} and runner._glm5next_shadow_inflight is None
+    assert _records(log) == []
+    # The next step has 'u' gone: the record is flushed with nothing scored.
+    _observe_step(runner, [], sampled=[], drafts=None)
     written = _read_log(log)
     assert [(r["req_id"], r["step"], r["position"], r["drafts"]) for r in written] == [("u", 0, 7, [43, 44])]
