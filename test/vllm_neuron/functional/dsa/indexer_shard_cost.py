@@ -6,8 +6,8 @@ What it prices, per 1024-row prefill chunk on TP = 64 (every chunk runs 1024 ope
 
 * **as built** -- every rank runs the score GEMM, the causal bound, the top-k and the
   sentinel ordering on all ``T`` rows over ``C = max_model_len // 4`` candidates. The
-  values are worker-3's calibrated buckets (``/home/ubuntu/glm53f-wt3/calib/prefill``,
-  read only): MEASURED at ``C`` 1024 and 2048, a stated linear extrapolation above.
+  values are worker-3's calibrated buckets (:data:`CALIB_DIR`, read only): MEASURED at
+  ``C`` 1024 and 2048, a stated linear extrapolation above.
 * **query-sharded at degree d** -- each rank runs the same chain on ``R = ceil(T / d)``
   rows, then one all-gather of the ``[R, select_k]`` ids per layer.
 * **two candidate-sharded fallbacks** -- each rank scores ``C / d`` candidates, takes a
@@ -73,18 +73,24 @@ import re
 import statistics
 import sys
 
-#: Host-local inputs of this campaign, read only. This module, its test and the device and
-#: profile scripts are report scaffolding, not part of the plugin: the test skips where
-#: these paths are absent.
-CALIB_DIR = "/home/ubuntu/glm53f-wt3/calib/prefill"
-PLANNER_DIR = "/home/ubuntu/glm53f-wt3/planner"
+from test.vllm_neuron import artifacts
+
+#: Host-local inputs of this campaign, read only, below the campaign directory
+#: (``artifacts.campaign_path``). This module, its test and the device and profile scripts
+#: are report scaffolding, not part of the plugin: the test skips where these paths are
+#: absent.
+CALIB_DIR = str(artifacts.campaign_path("glm53f-wt3", "calib", "prefill"))
+PLANNER_DIR = str(artifacts.campaign_path("glm53f-wt3", "planner"))
 CAL_CONSTANTS = os.path.join(PLANNER_DIR, "configs", "trn2_constants_glm_cal.json")
 #: The hardware rates every entitlement uses (``meta.hardware``: te_peak_flops,
 #: hbm_bw_bytes_per_s, per logical core).
-ENTITLEMENT_JSON = "/home/ubuntu/glm53f-wt3/reports/entitlement.json"
+ENTITLEMENT_JSON = str(artifacts.campaign_path("glm53f-wt3", "reports", "entitlement.json"))
 #: The device A/B records (``indexer_shard_device.py``), their logs and per-op profiles
 #: (``<name>.ops.json``, ``indexer_shard_profile.py``), kept beside the report.
-DEVICE_RECORDS_DIR = "/home/ubuntu/glm53f-wt5/reports/indexer_shard_device"
+DEVICE_RECORDS_DIR = str(artifacts.campaign_path("glm53f-wt5", "reports",
+                                                  "indexer_shard_device"))
+#: The report this module's JSON is the evidence file of.
+REPORT_MD = str(artifacts.campaign_path("glm53f-wt5", "reports", "indexer_shard.md"))
 
 #: The calibrated operating point (``rules.json`` reference point p1): TP = 64 ranks,
 #: 1024-row prefill chunks. Every as-built value below is read at this point.
@@ -1015,7 +1021,7 @@ def report(cost: IndexerCost | None = None) -> dict:
                 f"on one chip (device_ab), its per-op device time against entitlement "
                 f"(perf) and a two-rank all-gather check (allgather_two_ranks), all from "
                 f"{DEVICE_RECORDS_DIR}. This is the evidence file of "
-                "/home/ubuntu/glm53f-wt5/reports/indexer_shard.md, not an integrator row "
+                f"{REPORT_MD}, not an integrator row "
                 "file: 'labels' gives the kind and source of every field, by field name.",
         "labels": LABELS,
         "dsa_layers": cost.layers,

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The reports the tests read: a frozen copy, never the live ``/home/ubuntu/glm53f-wt/reports``.
+"""The reports the tests read: a frozen copy, never the live ``readers.micro.REPORTS_DIR``.
 
 ``fixtures/reports/`` holds byte copies (taken 2026-10-06) of the team's records that the
 tests pin: the microbenchmark files, ``dsa_kernels.json``, ``moe-t.md`` (a cited source)

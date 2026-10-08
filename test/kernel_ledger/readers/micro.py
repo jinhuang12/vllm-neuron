@@ -29,10 +29,12 @@ from pathlib import Path
 from statistics import mean
 from typing import Dict, List, Optional, Tuple
 
+from test.vllm_neuron import artifacts
+
 from .emf import KernelResult
 
-#: The team's reports directory (read-only input).
-REPORTS_DIR = Path("/home/ubuntu/glm53f-wt/reports")
+#: The team's reports directory (read-only input), below the campaign directory.
+REPORTS_DIR = artifacts.campaign_path("glm53f-wt", "reports")
 
 MICRO_FILES = {
     "mhc": "mhc_micro.json",

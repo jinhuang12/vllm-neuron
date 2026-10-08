@@ -15,14 +15,19 @@ import os
 
 import pytest
 
+from test.vllm_neuron import artifacts
 from test.vllm_neuron.functional.dsa import indexer_shard_cost as cost_model
 
-REPORT_JSON = "/home/ubuntu/glm53f-wt5/reports/indexer_shard.json"
-PUBLISHED_JSON = "/home/ubuntu/glm53f-wt3/reports/prefill_calibrated.json"
+REPORT_JSON = str(artifacts.campaign_path("glm53f-wt5", "reports", "indexer_shard.json"))
+PUBLISHED_JSON = str(artifacts.campaign_path("glm53f-wt3", "reports",
+                                             "prefill_calibrated.json"))
 
-pytestmark = pytest.mark.skipif(not (cost_model.calibration_available()
-                                     and os.path.exists(PUBLISHED_JSON)),
-                                reason="worker-3's calibrated prefill model is not on this host")
+pytestmark = pytest.mark.skipif(
+    not (cost_model.calibration_available() and os.path.exists(PUBLISHED_JSON)),
+    reason=(f"worker-3's calibrated prefill model is not on this host: needs "
+            f"{cost_model.CALIB_DIR}, {cost_model.CAL_CONSTANTS}, "
+            f"{cost_model.ENTITLEMENT_JSON}, {cost_model.DEVICE_RECORDS_DIR} and "
+            f"{PUBLISHED_JSON} ({artifacts.CAMPAIGN_KNOB})"))
 
 
 @pytest.fixture(scope="module")
