@@ -126,26 +126,44 @@ _PREFILL_LEG_KEYWORDS = ("slot_mapping", "prefill_tail", "prefill_end_position")
 
 
 def shadow_draft_k() -> int:
-    """The shadow draft's iteration count ``k``; 0 means off.
+    """The draft's iteration count ``k``; 0 means no draft.
 
-    The one reader of :data:`SHADOW_DRAFT_ENV` (contract C1): it goes through
-    ``envs``, which holds the knob's one definition. Unset is 0. A negative value is
-    refused by name rather than clamped, because a clamped knob would run a
-    different draft than the one asked for and the alpha it measures would be
-    labelled with the wrong k. Any positive k runs that many iterations; the
+    The one reader of ``k`` (contract C1), with two sources. The production one is
+    the current vLLM config's speculative config, method "mtp":
+    ``num_speculative_tokens``; the worker sets that config around ``load_model``
+    (``set_current_vllm_config``), where the root reads this once at construction.
+    The diagnostic one is :data:`SHADOW_DRAFT_ENV` through ``envs``, which holds the
+    knob's one definition: the shadow draft (stage A) with no speculative config.
+    Both set and disagreeing is refused by name: the root builds one head for one
+    k, and the alpha the shadow log measures would otherwise be labelled with the
+    wrong k. Unset, with no config, is 0. A negative knob is refused rather than
+    clamped, for the same reason. Any positive k runs that many iterations; the
     iterations past the request's window clamp to its last position
     (``Glm5NextMultiTokenPredictor._iteration_carrier``), so no k indexes state
     out of bounds.
     """
+    from vllm.config import get_current_vllm_config_or_none
+
     from vllm_neuron import envs
 
-    value = int(envs.VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT)
-    if value < 0:
+    knob = int(envs.VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT)
+    if knob < 0:
         raise ValueError(
-            f"{SHADOW_DRAFT_ENV}={value} is negative; 0 turns the shadow draft off "
+            f"{SHADOW_DRAFT_ENV}={knob} is negative; 0 turns the shadow draft off "
             f"and k >= 1 runs that many draft iterations per step"
         )
-    return value
+    config = get_current_vllm_config_or_none()
+    speculative = None if config is None else config.speculative_config
+    if speculative is None or speculative.method != "mtp":
+        return knob
+    configured = int(speculative.num_speculative_tokens)
+    if knob and knob != configured:
+        raise ValueError(
+            f"{SHADOW_DRAFT_ENV}={knob} and the speculative config's "
+            f"num_speculative_tokens={configured} disagree; the root builds one head "
+            f"for one k, so set the knob to {configured} or leave it unset"
+        )
+    return configured
 
 
 def _declare_parameters(module: nn.Module, *names: str) -> None:
