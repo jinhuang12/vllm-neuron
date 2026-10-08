@@ -77,7 +77,8 @@ def case_operands(tokens: int, cands: int, seed: int):
     return query, keys, weights, seq_lens
 
 
-def _counters() -> dict[str, tuple[int, int]]:
+def stage_counters() -> dict[str, tuple[int, int]]:
+    """``(nki, fallback)`` dispatch counts of each selection stage since the last reset."""
     from vllm_neuron.functional.dsa import causal_bound, score_gemm, sentinel_order, topk_select
 
     return {
@@ -89,7 +90,8 @@ def _counters() -> dict[str, tuple[int, int]]:
     }
 
 
-def _reset_counters() -> None:
+def reset_stage_counters() -> None:
+    """Zero every selection stage's dispatch counters."""
     from vllm_neuron.functional.dsa import causal_bound, score_gemm, sentinel_order, topk_select
 
     score_gemm.reset_score_gemm_dispatch_counters()
@@ -110,11 +112,11 @@ def replicated_task(tokens: int, cands: int, seed: int):
     torch.set_num_threads(1)
     query, keys, weights, seq_lens = case_operands(tokens, cands, seed)
     indexer = make_indexer(cands)
-    _reset_counters()
+    reset_stage_counters()
     pool_ids = indexer.select_bounded_pools(
         indexer.score_pools(query, keys, weights), seq_lens
     )
-    counters = _counters()
+    counters = stage_counters()
     bounded = dsa_causal_bound(
         indexer.score_pools(query, keys, weights),
         seq_lens.reshape(-1, 1),
@@ -136,9 +138,9 @@ def rank_task(tokens: int, cands: int, degree: int, rank: int, seed: int):
         scores = indexer.score_pools(rows_query, keys, rows_weights)
         return indexer.select_bounded_pools(scores, rows_seq_lens)
 
-    _reset_counters()
+    reset_stage_counters()
     local = select_local_rows(select, query, weights, seq_lens, row_shard(tokens, degree), rank)
-    return local, _counters()
+    return local, stage_counters()
 
 
 def worker_environment() -> dict[str, str]:
