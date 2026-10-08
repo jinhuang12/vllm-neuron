@@ -175,13 +175,15 @@ def _child() -> None:
     print(ROW + "|" + json.dumps(dict(neuron_fds=fds)), flush=True)
 
 
-def test_every_glue_kernel_passes_the_backend_and_birsim():
+def test_every_glue_kernel_passes_the_backend_and_birsim(tmp_path):
+    # neuronx-cc writes its intermediates (``<hash>/*.colz``, ``global_metric_store.json``)
+    # into the working directory, so the child runs in a scratch one, not the tree.
     environment = {k: v for k, v in os.environ.items() if k not in _DROP}
     venv_bin = str(pathlib.Path(sys.executable).parent)
     environment.update(_PIN, PYTHONPATH=str(_ROOT),
                        PATH=venv_bin + os.pathsep + environment.get("PATH", ""))
     done = subprocess.run([sys.executable, str(pathlib.Path(__file__).resolve()), "child"],
-                          cwd=_ROOT, env=environment, capture_output=True, text=True,
+                          cwd=tmp_path, env=environment, capture_output=True, text=True,
                           timeout=1500, check=False)
     rows = [json.loads(line.split("|", 1)[1]) for line in done.stdout.splitlines()
             if line.startswith(ROW + "|")]
