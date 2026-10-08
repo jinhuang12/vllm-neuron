@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 import torch
 
+from vllm_neuron.vllm.worker.glm5next_state_banks import SCRATCH_SLOTS
 from vllm_neuron.vllm.worker.neuron_model_runner import (
     NULL_BLOCK_ID,
     PAD_SLOT_ID,
@@ -422,9 +423,10 @@ def test_a1_two_requests_are_assigned_distinct_state_slots() -> None:
     assert again == slots, f"the slots moved from {slots} to {again} within one life"
 
 
-def test_a1_each_requests_carrier_is_a_view_of_its_own_bank_row() -> None:
+def test_a1_each_requests_carrier_is_a_view_of_its_own_bank_row(monkeypatch) -> None:
     """The carrier half: two requests, two views, and the writes land in the bank.
     """
+    monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_STATE_BANKS", "0")  # this test pins the per-request VIEW form
     _require_cpu_mode()
     banks = _linear_banks(_banks())
     bank = banks[0]
@@ -775,11 +777,11 @@ def test_a2_the_side_cache_slot_axis_is_the_engines_concurrency_bound() -> None:
         for entry in rings
     ]
     for pool_axis, tail_axis in axes:
-        assert pool_axis == DECLARED_MAX_NUM_SEQS, (
+        assert pool_axis == DECLARED_MAX_NUM_SEQS + SCRATCH_SLOTS, (
             f"the pooled store carries {pool_axis} slot(s) while the engine admits "
             f"{DECLARED_MAX_NUM_SEQS} concurrent sequence(s)"
         )
-        assert tail_axis == DECLARED_MAX_NUM_SEQS, (
+        assert tail_axis == DECLARED_MAX_NUM_SEQS + SCRATCH_SLOTS, (
             f"the tail ring carries {tail_axis} slot(s) while the engine admits "
             f"{DECLARED_MAX_NUM_SEQS} concurrent sequence(s)"
         )
