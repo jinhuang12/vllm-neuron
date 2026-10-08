@@ -5685,6 +5685,23 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # no position, so they are emptied here, together (a half-fresh slot
             # would pool the previous owner's ring members): this slot only, in
             # place, by a host copy (``glm5next_state_banks.empty_slot``).
+            # The slot's last owner can have left its last step in flight (a request
+            # the engine finished by an abort while its prefill chunk still runs), and
+            # the async-output thread is then draining that step with a device wait
+            # (``AsyncNeuronModelRunnerOutput.get_output``; the composition-change
+            # materialize skips an all-partial step on purpose). ``empty_slot``'s
+            # ordering read would be a second device wait on the same execution, and
+            # the runtime keeps one completion handle per execution ("Completion handle
+            # already set for sequence ..., overwriting previous FD"), which orphans
+            # the first waiter: the dsa8k-pc hang of 2026-10-08. Drain the pending
+            # step first, through ``get_output``'s lock, so this thread waits on the
+            # lock (or is the single device waiter) and the read below finds the step
+            # complete. One dict lookup when nothing is pending; a no-op once drained.
+            if side_caches:
+                pending = getattr(self, "async_execution_buffer", None)
+                pending = pending.get("async_output") if pending else None
+                if pending is not None:
+                    pending.get_output()
             for side in side_caches or ():
                 if not side:
                     continue
