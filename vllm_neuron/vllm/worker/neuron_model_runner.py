@@ -11719,9 +11719,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         runtime may already be gone, and a read here would be the hang
         ``_glm5next_shadow_observe`` describes) is dropped with a warning naming it, and
         the steps behind it are scored in order, so no record that has its data is lost.
-        Every tracked request retires with its pending drafts scored over the tokens that
-        arrived (``scored`` < k for the tail). Idempotent: a second call finds no scorer
-        and returns.
+        Every request alive across the gap retires at the gap with its pending drafts
+        scored over the tokens that arrived before it (its history lacks the lost tokens,
+        so nothing behind the gap is scored against them) and is tracked afresh behind it.
+        Every tracked request retires at the end with its pending drafts scored over the
+        tokens that arrived (``scored`` < k for the tail). Idempotent: a second call finds
+        no scorer and returns.
         """
         scorer = getattr(self, "_glm5next_shadow_scorer_instance", None)
         if scorer is None:
@@ -11741,6 +11744,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         ", ".join(f"step {number}" for number in lost),
                         "that step" if len(lost) == 1 else "those steps",
                     )
+                    # The histories lack the lost steps' tokens: what is pending is
+                    # scored over the tokens that arrived before the gap, and every
+                    # request starts afresh behind it, so no draft is scored against
+                    # a token that was not the one that followed it.
+                    scorer.retire_absent(set())
                 self._glm5next_shadow_next_step = step_no
                 if step_no in ready:
                     self._glm5next_shadow_drain(scorer)
@@ -11759,9 +11767,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         second output of the same execution. A read here would make this thread a second
         reader of that future, and the runtime delivers a future's completion once: the
         gate's knob-5 server hung at its first decode step exactly there (rank 0's main
-        thread in ``sample_tokens``; the engine core timed out behind it). So the step is
-        stashed -- its bookkeeping and its unread draft tensor -- for the output object
-        ``sample_tokens`` builds next to claim (``_glm5next_shadow_claim``); ``get_output``
+        thread, in ``execute_model``'s forward epilogue ``_execute_model_forward``; the
+        engine core timed out behind it). So the step is stashed -- its bookkeeping and
+        its unread draft tensor -- for the output object ``sample_tokens`` builds next to
+        claim (``_glm5next_shadow_claim``); ``get_output``
         scores it from the ids it read back and reads the drafts there, after the sampled
         ids, on the thread that materialized them. A synchronous runner moved ``sampled``
         to the host already, and the step is scored at once. A step the kwargs hook did not

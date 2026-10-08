@@ -624,6 +624,33 @@ def test_shutdown_drops_a_step_whose_output_was_never_read_back_and_closes_the_l
     assert any("shadow draft" in rec.message and "step 2" in rec.message for rec in caplog.records)
 
 
+def test_shutdown_scores_nothing_across_a_lost_step(monkeypatch, tmp_path, caplog):
+    """A step lost in the middle (its output never materialized) leaves the histories without
+    its token; a record that waited for it must not be scored against the token of the step
+    after the gap as if it were the next one. Shutdown scores what arrived before the gap,
+    starts every request afresh behind it, and names the lost step."""
+    log = tmp_path / "shadow.jsonl"
+    monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT", "1")
+    monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG", str(log))
+    runner = _runner_shell(k=1, req_ids=["r"], async_scheduling=True)
+    # Step 0 drafts step 2's token: right only if step 1's token were skipped, which is the
+    # mis-scoring a lost step 1 must not produce.
+    steps = [
+        _device_step(runner, ["r"], sampled=[10], drafts=[[12]], starts=[4]),
+        _device_step(runner, ["r"], sampled=[11], drafts=[[12]], starts=[5]),
+        _device_step(runner, ["r"], sampled=[12], drafts=[[13]], starts=[6]),
+    ]
+    _materialize(*steps[0])
+    _materialize(*steps[2])
+    with caplog.at_level("WARNING"):
+        runner.ensure_kv_transfer_shutdown()
+    records = _read_log(log)
+    assert [(r["step"], r["scored"], r["actual"], r["accepted_prefix_len"]) for r in records] == [
+        (0, 0, [], 0), (2, 0, [], 0)
+    ]
+    assert any("step 1" in rec.message for rec in caplog.records)
+
+
 def test_the_log_is_written_by_rank_zero_only(monkeypatch, tmp_path):
     log = tmp_path / "shadow.jsonl"
     monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT", "2")
