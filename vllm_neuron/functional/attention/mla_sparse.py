@@ -1516,11 +1516,11 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
 #   the start of a prompt -- reads that one row, and the gather is slower.) The
 #   gather never skips an offset: a gather-transpose with ``oob_mode.skip`` over an
 #   out-of-bounds offset aborted the DMA queues on device (``reports/mla_sparse.md``).
-# * MM2's moving operand, the same rows with the keys on partitions, is made from that
-#   tile by PE transposes, which are bit-exact from NeuronCore-v3 on, rather than
-#   gathered a second time: the second gather is one indirect DMA per 128-row chunk,
-#   and the software descriptor generator that issues every indirect DMA is the
-#   body's busiest engine.
+# * MM2's operand, the same rows with the keys on partitions, is made from that tile by
+#   PE transposes, which are bit-exact from NeuronCore-v3 on, rather than gathered a
+#   second time: the second gather is one indirect DMA per 128-row chunk, and the
+#   software descriptor generator that issues every indirect DMA is the body's busiest
+#   engine.
 # * The softmax runs for a group of :data:`SOFTMAX_ROWS` queries at once, one query
 #   per partition. A query's MM1 stationary is a ``[128, rows]`` tile whose only
 #   non-zero column is the query's own, so its scores accumulate into its own PSUM row
@@ -1530,8 +1530,12 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
 #   maximum, exp with its sum, mask multiply and normalisation are then one
 #   instruction each, and one PE transpose per chunk puts the group's probabilities on
 #   the key partitions, where they are split into bf16 hi/lo halves for MM2.
-# * MM2 runs per query, hi then lo per chunk into one fp32 PSUM tile that is stored as
-#   is: p is normalised before it.
+# * MM2 runs per query with the latent on partitions: each latent tile of a chunk of
+#   rows is a stationary, and the query's hi and lo halves of p are two moving
+#   columns, so MM2 streams 2 columns per stationary rather than 512 per chunk. The
+#   halves accumulate over the chunks in their own fp32 PSUM columns, and one fp32 add
+#   sums them; p is normalised before MM2. One PE transpose per latent tile puts a
+#   block's output rows back.
 #
 # A query's values pass the same instructions in the same order whatever its group,
 # so the grouping changes no bit. The arithmetic differs from the fp32 body in the
@@ -1625,7 +1629,7 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
     scratch = []
     for _ in range(ring):
         scratch.append(_lowp_scratch(topk, n_latent, n_chunks, c_kv_hbm.dtype))
-    # MM2's moving operand, one chunk of keys on partitions at a time.
+    # MM2's stationaries, one chunk of keys on partitions at a time.
     c_rows = []
     for _ in range(2):
         c_rows.append(nl.ndarray((KEY_CHUNK, latent), dtype=c_kv_hbm.dtype, buffer=nl.sbuf))
@@ -1648,12 +1652,15 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
     # chunk ck of query r.
     p_cols = n_chunks * group
     p_t = _sbuf(KEY_CHUNK, _aligned(p_cols))
-    p_hi = nl.ndarray((KEY_CHUNK, _aligned(p_cols, STAGE_ALIGN)), dtype=c_kv_hbm.dtype,
-                      buffer=nl.sbuf)
     p_hi_f = _sbuf(KEY_CHUNK, _aligned(p_cols))
-    p_lo = nl.ndarray((KEY_CHUNK, _aligned(p_cols, STAGE_ALIGN)), dtype=c_kv_hbm.dtype,
-                      buffer=nl.sbuf)
-    out_sb = _sbuf(heads, latent)
+    # MM2's moving operands: column c of p_t split into its bf16 halves, side by side,
+    # so one ``[128, 2]`` moving tile carries both: ``p_hl[:, c, 0]`` = bf16(p_t[:, c])
+    # and ``p_hl[:, c, 1]`` = bf16(p_t[:, c] - hi).
+    p_hl = nl.ndarray((KEY_CHUNK, _aligned(p_cols), 2), dtype=c_kv_hbm.dtype, buffer=nl.sbuf)
+    # MM2's output, latent on partitions: column (li, qi) holds latent tile li of query
+    # qi of the block. One PE transpose per latent tile puts the block's rows back.
+    out_t = _sbuf(LATENT_TILE, n_latent, _aligned(qpb))
+    out_rows = _sbuf(qpb, latent)
     sentinel_bias = _SENTINEL_EXP_FLOOR / softmax_scale
 
     n_prgs = nl.num_programs(axes=0)
@@ -1760,22 +1767,30 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
                                   data=p[:, ck * KEY_CHUNK:(ck + 1) * KEY_CHUNK],
                                   engine=nisa.engine.tensor)
             nisa.tensor_copy(dst=p_t[:, 0:p_cols], src=p_t_ps, engine=nisa.engine.vector)
-            nisa.tensor_copy(dst=p_hi[:, 0:p_cols], src=p_t[:, 0:p_cols],
+            nisa.tensor_copy(dst=p_hl[:, 0:p_cols, 0], src=p_t[:, 0:p_cols],
                              engine=nisa.engine.vector)
-            nisa.tensor_copy(dst=p_hi_f[:, 0:p_cols], src=p_hi[:, 0:p_cols],
+            nisa.tensor_copy(dst=p_hi_f[:, 0:p_cols], src=p_hl[:, 0:p_cols, 0],
                              engine=nisa.engine.vector)
-            nisa.tensor_tensor(dst=p_lo[:, 0:p_cols], data1=p_t[:, 0:p_cols],
+            nisa.tensor_tensor(dst=p_hl[:, 0:p_cols, 1], data1=p_t[:, 0:p_cols],
                                data2=p_hi_f[:, 0:p_cols], op=nl.subtract,
                                engine=nisa.engine.vector)
 
-            # ---- MM2 per query: out[1, L] = p[1, K] @ c[K, L], hi and lo per chunk ------
+            # ---- MM2 per query, latent on partitions: out[L] = sum_k c[k, L] * p[k] -----
             # Each chunk of the gathered rows is put back on the key partitions by one
             # PE transpose per latent tile, evacuated alternately by the Vector and the
-            # Scalar engine.
+            # Scalar engine. Each latent tile of the chunk is then one matmul's
+            # stationary, and the query's two p halves are its moving columns, so a chunk
+            # costs four stationary loads and eight moving columns. The halves
+            # accumulate in two PSUM columns over the chunks; one fp32 add sums them.
+            # Each latent tile accumulates in a PSUM tile of its own: on device, matmuls
+            # accumulating into different column ranges of one 3D PSUM tile give wrong
+            # sums, which the simulator does not show (``reports/mla_sparse.md``).
             for r in range(group):
                 qi = g0 + r
                 c_t = scratch[qi % ring][_LP_C_T]
-                pv_ps = _psum(heads, latent)
+                pv_ps = []
+                for _ in range(n_latent):
+                    pv_ps.append(_psum(LATENT_TILE, 2))
                 for ck in range(n_chunks):
                     rows_ps = nl.ndarray((KEY_CHUNK, latent), dtype=c_kv_hbm.dtype,
                                          buffer=nl.psum)
@@ -1789,14 +1804,24 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
                                      engine=nisa.engine.vector if ck % 2 == 0
                                      else nisa.engine.scalar)
                     col = ck * group + r
-                    nisa.nc_matmul(dst=pv_ps, stationary=p_hi[:, col:col + 1], moving=chunk,
-                                   accumulate=(ck > 0))
-                    nisa.nc_matmul(dst=pv_ps, stationary=p_lo[:, col:col + 1], moving=chunk,
-                                   accumulate=True)
-                nisa.tensor_copy(dst=out_sb, src=pv_ps)
-                nl.store(out_hbm.ap(pattern=[[latent, heads], [1, latent]],
-                                    offset=(q0 + qi) * heads * latent),
-                         value=out_sb)
+                    for li in range(n_latent):
+                        nisa.nc_matmul(dst=pv_ps[li],
+                                       stationary=chunk[:, li * LATENT_TILE:(li + 1) * LATENT_TILE],
+                                       moving=p_hl[:, col, 0:2], accumulate=(ck > 0))
+                for li in range(n_latent):
+                    nisa.tensor_reduce(dst=out_t[:, li, qi:qi + 1], op=nl.add, data=pv_ps[li],
+                                       axis=1)
+
+        # ---- the block's rows: one PE transpose per latent tile, one store -------------
+        rows_out_ps = _psum(qpb, latent)
+        for li in range(n_latent):
+            nisa.nc_transpose(dst=rows_out_ps[:, li * LATENT_TILE:(li + 1) * LATENT_TILE],
+                              data=out_t[:, li, 0:qpb], engine=nisa.engine.tensor)
+        nisa.tensor_copy(dst=out_rows, src=rows_out_ps, engine=nisa.engine.vector)
+        nl.store(out_hbm.ap(pattern=[[heads * latent, qpb], [1, latent]],
+                            offset=q0 * heads * latent),
+                 value=out_rows)
+
 
 @nki.jit
 def mla_sparse_attention_nope_row_tiled_kernel(q_lift_hbm, c_kv_hbm, topk_hbm,
