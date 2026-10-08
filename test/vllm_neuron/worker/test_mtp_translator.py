@@ -55,16 +55,6 @@ MAX_MODEL_LEN = tiny.STACK_TOKENS + 8
 WINDOW_BLOCKS = -(-MAX_MODEL_LEN // PAGE)
 
 
-@pytest.fixture(autouse=True)
-def _plain_ring_depth(monkeypatch):
-    """worker-58's ``indexer_ring_depth`` is not in this tree; nothing here reads the
-    ring, so an mtp server is allocated the plain depth (what the helper returns for
-    k = 0). Dropped once the trees merge."""
-    monkeypatch.setattr(
-        NeuronModelRunner, "_glm5next_indexer_ring_rows", staticmethod(lambda pool, k: int(pool))
-    )
-
-
 def _world(batch_size: int, *, slots: int | None = None):
     """The batch-decode file's sparse (DSA) world: ``batch_size`` prefilled requests."""
     return batch._world(

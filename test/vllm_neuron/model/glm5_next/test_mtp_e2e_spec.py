@@ -60,15 +60,6 @@ from test.vllm_neuron.model.glm5_next.tiny import test_tiny_glm5next_first_reque
 from test.vllm_neuron.model.glm5_next.tiny import test_tiny_glm5next_forward as tiny
 
 
-@pytest.fixture(autouse=True)
-def _plain_ring_depth(monkeypatch):
-    """worker-58's ``indexer_ring_depth`` is not in this tree; the oracle never reads the
-    ring, so an mtp server is allocated the plain depth (what the helper returns for
-    k = 0). Dropped once the trees merge."""
-    monkeypatch.setattr(
-        NeuronModelRunner, "_glm5next_indexer_ring_rows", staticmethod(lambda pool, k: int(pool))
-    )
-
 pytestmark = [pytest.mark.forked]
 
 K = 3
@@ -599,17 +590,14 @@ def _generate(runner, req: str, prompt: list[int], *, tokens: int, finished: set
         slot = runner._glm5next_request_slot_table[req]
         assert runner._glm5next_side_cache_positions[slot] == position
         drafts = _proposal(runner)
-        if oracle is None:
+        if runner.drafter is None:
             assert drafts == [], "the plain run proposes nothing"
     return generated[:tokens], steps
 
 
-def test_greedy_speculative_output_is_token_identical_to_the_plain_run(tmp_path, monkeypatch):
-    e2e._require_cpu_mode()
-    fr._declaring_a_sampler(monkeypatch)
-    prompts = _prompts()
-    # The plain run, far enough past ``GENERATED`` for every oracle row the verify steps read.
-    monkeypatch.delenv(KNOB, raising=False)
+def _plain_references(tmp_path, prompts: list[list[int]]) -> list[list[int]]:
+    """The plain run's ids per prompt, far enough past ``GENERATED`` for every oracle row
+    the verify steps read."""
     plain_config = _config(None)
     references: list[list[int]] = []
     (tmp_path / "plain").mkdir()
@@ -622,6 +610,15 @@ def test_greedy_speculative_output_is_token_identical_to_the_plain_run(tmp_path,
             assert steps == GENERATED + 2 * T - 1
             references.append(ids)
             finished = {f"plain-{i}"}
+    return references
+
+
+def test_greedy_speculative_output_is_token_identical_to_the_plain_run(tmp_path, monkeypatch):
+    e2e._require_cpu_mode()
+    fr._declaring_a_sampler(monkeypatch)
+    prompts = _prompts()
+    monkeypatch.delenv(KNOB, raising=False)
+    references = _plain_references(tmp_path, prompts)
     report = []
     for k in (1, 3):
         monkeypatch.setenv(KNOB, str(k))
@@ -653,3 +650,35 @@ def test_greedy_speculative_output_is_token_identical_to_the_plain_run(tmp_path,
                 if name.startswith("reject-all"):
                     assert steps == GENERATED - 1, (k, name, steps)
     assert len(report) == 2 * len(POLICIES)
+
+
+def test_greedy_speculative_output_from_the_heads_own_drafts_is_token_identical_to_the_plain_run(
+    tmp_path, monkeypatch
+):
+    """Part 2 without the oracle: the real root forward on the verify step's ``T`` rows,
+    the head's own ``populate`` on its ``T``-row indexer leg and its own drafts. Greedy
+    rejection sampling returns the plain run's ids whatever the head drafts; the drafts
+    only set how many rows a step keeps, so the step count is bounded by the all-rejected
+    run above and the all-accepted run below."""
+    e2e._require_cpu_mode()
+    fr._declaring_a_sampler(monkeypatch)
+    prompts = _prompts()
+    monkeypatch.delenv(KNOB, raising=False)
+    references = _plain_references(tmp_path, prompts)
+    report = []
+    for k in (1, 3):
+        monkeypatch.setenv(KNOB, str(k))
+        config = _config(k)
+        (tmp_path / f"head-{k}").mkdir()
+        with fr._parallel_state(tmp_path / f"head-{k}", config):
+            root, _head = _root()
+            runner = _runner(config, root)
+            assert runner.is_mtp_spec and runner.drafter.num_speculative_tokens == k
+            finished: set = set()
+            for i, prompt in enumerate(prompts):
+                ids, steps = _generate(runner, f"head-{k}-{i}", prompt, tokens=GENERATED, finished=finished)
+                finished = {f"head-{k}-{i}"}
+                assert ids == references[i][:GENERATED], (k, i, steps)
+                assert 1 + -(-(GENERATED - 2) // (k + 1)) <= steps <= GENERATED - 1, (k, i, steps)
+                report.append((k, i, steps))
+    assert len(report) == 2 * len(prompts)
