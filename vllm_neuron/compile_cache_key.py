@@ -18,6 +18,11 @@ of only the files that key's kernels can reach:
   custom op it calls (through :data:`CUSTOM_OP_KERNEL_MODULES`);
 * an NKI kernel key folds the files reached from that kernel.
 
+A graph with no kernel node, package callable or custom op folds the empty file
+set: the key is the graph's dependency set, and such a graph compiles from its
+FX text alone, which the library key already holds. No kernel edit can change
+what it compiles to, so none recompiles it.
+
 "Reached" is static: the kernel's defining module, then the transitive closure
 of its ``import`` / ``from ... import`` statements (read with :mod:`ast`, never
 by importing) that stay inside the snapshot, plus every snapshot file that

@@ -332,6 +332,22 @@ def test_a_graph_without_kernels_folds_the_empty_file_set(
     assert key == ck.fold_key(_library_graph_key(lib, gm), resolver.digest_of(()))
 
 
+def test_a_kernel_edit_does_not_change_a_kernel_free_graph_key(
+    tmp_path, lib, restore_keys, no_kernel_compile
+):
+    """The key is the graph's dependency set: no kernel node, no kernel file."""
+    copy = _copy_tree(tmp_path)
+    kernel_free = _call_graph(torch.relu)
+    kernel = _kernel_graph(_kernel_entry(DECODE_BATCH, "dsa_decode_scores_kernel"))
+
+    before = _graph_keys(lib, copy, kernel_free, kernel)
+    _append_byte(copy / _rel(DECODE_BATCH))
+    after = _graph_keys(lib, copy, kernel_free, kernel)
+
+    assert after[0] == before[0]
+    assert after[1] != before[1]
+
+
 # ------------------------------------------------- import-closure rules
 
 
