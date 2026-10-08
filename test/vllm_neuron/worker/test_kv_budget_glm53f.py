@@ -27,6 +27,7 @@ Run with ``VLLM_NEURON_CPU_MODE=1`` (``test/conftest.py`` pins it).
 from __future__ import annotations
 
 import copy
+import functools
 import json
 import math
 import types
@@ -71,6 +72,12 @@ BEFORE_FLOOR_BYTES = 50 * GIB
 TOTAL_HBM_BYTES = 24 * GIB
 MEASURED_PARAM_BYTES = int(2.79 * GIB)
 MEASURED_RESIDENT_BYTES = int(7.96 * GIB)
+
+#: The measured device at 0a08ff4 on the bs=64 @ 8k serve line, every rank
+#: (``gate/runs/indexer-A/server.log``): "bytes_used=1.63 GiB, resident=6.79 GiB ...
+#: effective=6.62 GiB".
+TIP_PARAM_BYTES = int(1.63 * GIB)
+TIP_RESIDENT_BYTES = int(6.79 * GIB)
 
 FIXTURE_PATH = (
     Path(__file__).resolve().parents[1]
@@ -148,10 +155,15 @@ def glm53f_layer_specs():
 
 
 class _SpecOnlyModel:
-    """A model exposing ``get_kv_spec`` and a ``bind_kv_cache`` that records."""
+    """A model exposing ``get_kv_spec``, a recording ``bind_kv_cache`` and its text config.
 
-    def __init__(self, layers) -> None:
+    ``text_config`` carries the two indexer dials (``index_kpool``,
+    ``index_head_dim``) the worker prices the DSA side caches from.
+    """
+
+    def __init__(self, layers, text_config=None) -> None:
         self._spec = SimpleNamespace(layers=list(layers))
+        self.text_config = text_config
         self.bound: list[dict] = []
 
     def get_kv_spec(self):
@@ -204,10 +216,25 @@ def served_vllm_config(
     )
 
 
+@functools.lru_cache(maxsize=1)
+def _real_text_config():
+    """The real model's text config (indexer dials included), built once."""
+    return glm53f_layer_specs()[1]
+
+
 def fake_runner(
-    layers, *, max_num_seqs: int, max_model_len: int, gate_knobs: bool = True
+    layers,
+    *,
+    max_num_seqs: int,
+    max_model_len: int,
+    gate_knobs: bool = True,
+    text_config=None,
 ):
-    """A runner-shaped object carrying the real KV-cache methods of ``NeuronModelRunner``."""
+    """A runner-shaped object carrying the real KV-cache methods of ``NeuronModelRunner``.
+
+    The model carries the real text config unless ``text_config`` is given, so the
+    worker prices the DSA indexer side caches as it does for the served model.
+    """
     from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
 
     fake = SimpleNamespace(
@@ -225,7 +252,10 @@ def fake_runner(
         max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
         vocab_size=128,
         is_pooling_model=False,
-        model=_SpecOnlyModel(layers),
+        model=_SpecOnlyModel(
+            layers,
+            text_config if text_config is not None else _real_text_config(),
+        ),
         _kv_cache_full_tensors={},
     )
     fake.get_kv_cache_spec = types.MethodType(NeuronModelRunner.get_kv_cache_spec, fake)
@@ -304,6 +334,8 @@ def after_fix_bytes(
     """What the worker prices and the runner allocates at one served point, by part.
 
     ``model_specs`` is a ``glm53f_layer_specs()`` result to reuse; built when None.
+    ``footprint_bytes`` is the worker's check, which counts the indexer side caches,
+    so it equals ``total_bytes``.
     """
     from vllm.v1.kv_cache_interface import MambaSpec
 
@@ -315,6 +347,7 @@ def after_fix_bytes(
         max_num_seqs=max_num_seqs,
         max_model_len=max_model_len,
         gate_knobs=gate_knobs,
+        text_config=text_config,
     )
     worker = fake_worker(runner)
     need = worker._kv_cache_need_bytes()
@@ -331,10 +364,10 @@ def after_fix_bytes(
     return {
         "need_bytes": need,
         "footprint_bytes": footprint,
-        "pool_bytes": footprint - recurrent,
+        "pool_bytes": footprint - recurrent - side,
         "recurrent_state_bytes": recurrent,
         "indexer_side_cache_bytes": side,
-        "total_bytes": footprint + side,
+        "total_bytes": footprint,
         "num_blocks": config.num_blocks,
     }
 
@@ -430,8 +463,11 @@ def test_the_default_line_prices_bs1_at_4k_exactly_as_5938748() -> None:
     slot = RECURRENT_STATE_BYTES + 3 * 384 * 2
     footprint = worker._kv_cache_footprint_bytes(need)
     before = before_fix_footprint_bytes(max_num_seqs=1, max_model_len=4096)
-    assert footprint == need + KDA_LAYERS * 1 * slot
-    assert before - footprint == KDA_LAYERS * (161 * page - slot)
+    # Since wt2/kvseg the footprint also counts the DSA indexer side caches, which
+    # 5938748 did not price.
+    side = side_cache_bytes(_real_text_config(), max_num_seqs=1, max_model_len=4096)
+    assert footprint == need + KDA_LAYERS * 1 * slot + side
+    assert before - (footprint - side) == KDA_LAYERS * (161 * page - slot)
 
 
 def test_the_opt_in_line_prices_one_block_per_kda_group_per_request() -> None:
@@ -570,12 +606,15 @@ def test_the_recurrent_banks_follow_max_num_seqs_and_the_pool_follows_max_model_
         if isinstance(spec, MambaSpec):
             conv_bytes, recurrent_bytes = _kda_state_bytes(spec)
             conv, recurrent = caches[name]
-            slot_stride = conv.stride(0) * conv.element_size()
             assert conv.shape[0] == recurrent.shape[0] == max_num_seqs
             assert tuple(conv.shape[1:]) == spec.shapes[0]
             assert tuple(recurrent.shape[1:]) == spec.shapes[1]
-            assert recurrent.stride(0) * recurrent.element_size() == slot_stride
-            assert slot_stride <= 1.5 * (conv_bytes + recurrent_bytes)
+            # Both banks are contiguous regions of the layer's one buffer (the bank form
+            # hands them whole to the graph), and the buffer prices one slot per sequence.
+            assert conv.is_contiguous() and recurrent.is_contiguous()
+            assert conv.untyped_storage().data_ptr() == recurrent.untyped_storage().data_ptr()
+            slot_bytes = conv.untyped_storage().nbytes() // max_num_seqs
+            assert conv_bytes + recurrent_bytes <= slot_bytes <= 1.5 * (conv_bytes + recurrent_bytes)
         else:
             assert isinstance(spec, MLAAttentionSpec)
             (latent,) = caches[name]
@@ -681,20 +720,30 @@ def test_a_mamba_block_size_with_prefix_caching_on_is_refused_by_name() -> None:
 def test_the_worker_does_not_refuse_64_sequences_at_8k_with_the_default_knobs(
     served, monkeypatch
 ) -> None:
-    """On the measured 5938748 residency the default knobs admit the served point."""
+    """On the measured 0a08ff4 residency the default knobs admit the served point.
+
+    The side caches count since wt2/kvseg, so the 5938748 residency (7.96 GiB, budget
+    6.04 GiB) no longer admits it:
+    ``test_kv_budget_side_caches.py::test_a_point_that_fits_only_without_side_caches_is_refused_naming_the_shortfall``.
+    """
     monkeypatch.delenv("VLLM_NEURON_CPU_MODE", raising=False)
     monkeypatch.delenv("VLLM_NEURON_CPU_COMPILE", raising=False)
     monkeypatch.delenv("VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB", raising=False)
     monkeypatch.delenv("VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION", raising=False)
+    worker = fake_worker(
+        served.runner,
+        param_bytes=TIP_PARAM_BYTES,
+        resident_bytes=TIP_RESIDENT_BYTES,
+    )
 
-    available = served.worker.determine_available_memory()
+    available = worker.determine_available_memory()
 
-    assert available == served.worker._kv_cache_need_bytes()
+    assert available == worker._kv_cache_need_bytes()
     assert (
         before_fix_footprint_bytes(
             max_num_seqs=SERVED_MAX_NUM_SEQS, max_model_len=SERVED_MAX_MODEL_LEN
         )
-        > served.worker._compute_kv_budget(
-            TOTAL_HBM_BYTES, MEASURED_PARAM_BYTES, GPU_MEMORY_UTILIZATION
+        > worker._compute_kv_budget(
+            TOTAL_HBM_BYTES, TIP_PARAM_BYTES, GPU_MEMORY_UTILIZATION
         )
     )
