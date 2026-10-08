@@ -56,7 +56,8 @@ def test_the_bucket_list_is_the_one_the_validator_admits_for_sixty_four():
     assert validate_num_seqs_buckets(list(BUCKETS), MAX_NUM_SEQS) == BUCKETS
 
 
-def test_decode_graphs_extract_for_every_batch_bucket_up_to_sixty_four():
+def test_decode_graphs_extract_for_every_batch_bucket_up_to_sixty_four(monkeypatch):
+    monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_STATE_BANKS", "0")  # this test pins the per-request VIEW form
     root, runner, backend = _capture_runner()
     sparse_layers = [
         index
@@ -109,8 +110,9 @@ def test_decode_graphs_extract_for_every_batch_bucket_up_to_sixty_four():
         assert not getattr(runner, "_glm5next_side_cache_positions", {})
 
 
-def test_a_synthetic_decode_takes_distinct_slots_and_no_claim():
+def test_a_synthetic_decode_takes_distinct_slots_and_no_claim(monkeypatch):
     """The warmup's B rows are served from B distinct slots, none claimed."""
+    monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_STATE_BANKS", "0")  # this test pins the per-request VIEW form
     _, runner, _ = _capture_runner()
     kwargs = runner._build_decode_synthetic_inputs(4, compiled_graph_input=True)
     converted = runner._glm5next_model_kwargs(kwargs)

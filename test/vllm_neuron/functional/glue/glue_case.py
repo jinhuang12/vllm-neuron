@@ -348,12 +348,16 @@ def _ffn_owner(model, cfg):
 
     ``site_takes_norm``: whether this tree's FFN site hands ``_ffn_half`` the norm
     (``Glm5NextHyperConnection.forward``'s ``norm``; the 0a08ff4 snapshot has none).
+    ``ffn_static``: whether this tree's ``_ffn_half`` is a static method that takes the
+    config and the norm by name (the 0a08ff4 snapshot's is a method of the model).
     Read here, outside any trace.
     """
     owner = SimpleNamespace(text_config=cfg)
     owner._rms_norm = MethodType(model.Glm5NextModel._rms_norm, owner)
     owner.site_takes_norm = "norm" in inspect.signature(
         model.Glm5NextHyperConnection.forward).parameters
+    owner.ffn_static = isinstance(
+        inspect.getattr_static(model.Glm5NextModel, "_ffn_half"), staticmethod)
     return owner
 
 
@@ -367,14 +371,16 @@ def layer_step(model, case, streams: torch.Tensor, carriers: dict,
     site = model._mhc_ffn_site(layer, streams)
     ffn = dict(quant_config=quant, block_size=None, moe_group=None, tp_degree=TP_PER_EP,
                expert_parallel_rank=expert_rank)
+    if owner.ffn_static:  # as ``Glm5NextModel.forward`` calls it
+        ffn.update(text_config=owner.text_config, rms_norm=owner._rms_norm)
+    head = () if owner.ffn_static else (owner,)
     if not owner.site_takes_norm:
         return site.forward(
-            streams,
-            lambda single: model.Glm5NextModel._ffn_half(owner, layer, single, **ffn))
+            streams, lambda single: model.Glm5NextModel._ffn_half(*head, layer, single, **ffn))
     # As ``Glm5NextModel.forward``'s feed-forward site: the norm's gain and epsilon.
     return site.forward(
         streams,
         lambda single, normed: model.Glm5NextModel._ffn_half(
-            owner, layer, single, normed=normed, **ffn),
+            *head, layer, single, normed=normed, **ffn),
         norm=(layer.post_attention_layernorm_weight, float(owner.text_config.rms_norm_eps)),
     )

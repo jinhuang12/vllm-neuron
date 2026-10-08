@@ -100,6 +100,26 @@ def _tensors_in(value: Any) -> list[torch.Tensor]:
     return [item for item in candidates if isinstance(item, torch.Tensor)]
 
 
+def _indexer_side_cache_bytes(vllm_config, model_runner, kv_cache_spec=None) -> int:
+    """Return the bytes of the DSA indexer side caches the runner allocates.
+
+    ``pool_cache``, ``tail`` and ``pad_tail`` of every sparse-attention layer, one
+    set per request slot (``max_num_seqs``), sized by ``max_model_len``:
+    :func:`~vllm_neuron.vllm.worker.neuron_model_runner.indexer_side_cache_bytes`.
+    0 for a model with no indexer.
+    """
+    from .neuron_model_runner import indexer_side_cache_bytes
+
+    if kv_cache_spec is None:
+        kv_cache_spec = model_runner.get_kv_cache_spec()
+    return indexer_side_cache_bytes(
+        kv_cache_spec,
+        getattr(model_runner.model, "text_config", None),
+        max_seq_len=vllm_config.model_config.max_model_len,
+        request_slots=vllm_config.scheduler_config.max_num_seqs,
+    )
+
+
 def validate_cross_node_master_addr(
     nnodes: int,
     master_addr: str | None,
@@ -1187,7 +1207,9 @@ class NeuronWorker(WorkerBase):
         sizes its blocks from ``need_bytes``; the runner then gives each recurrent
         layer its own bank of one request slot per concurrent sequence
         (``max_num_seqs``), because a recurrent bank is addressed by request slot
-        rather than by block. This total, not
+        rather than by block. Every sparse-attention layer also holds the DSA
+        indexer side caches, which no KV cache spec declares
+        (:func:`_indexer_side_cache_bytes`). This total, not
         ``need_bytes``, is what has to fit the device. No bank is grown beyond it:
         a latent layer reads only the pages its block table names, so nothing
         reads past the blocks the scheduler handed out.
@@ -1199,18 +1221,20 @@ class NeuronWorker(WorkerBase):
 
         from .neuron_model_runner import kv_cache_allocations
 
-        groups = get_kv_cache_groups(
-            self.vllm_config, self.model_runner.get_kv_cache_spec()
-        )
+        kv_cache_spec = self.model_runner.get_kv_cache_spec()
+        groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
         kv_cache_config = get_kv_cache_config_from_groups(
             self.vllm_config, groups, need_bytes
         )
-        return sum(
+        kv_tensor_bytes = sum(
             size
             for size, _owners in kv_cache_allocations(
                 kv_cache_config,
                 state_slots=self.vllm_config.scheduler_config.max_num_seqs,
             )
+        )
+        return kv_tensor_bytes + _indexer_side_cache_bytes(
+            self.vllm_config, self.model_runner, kv_cache_spec
         )
 
     def _determine_available_memory_cpu(self, gpu_mem_util: float) -> int:
@@ -1402,6 +1426,9 @@ class NeuronWorker(WorkerBase):
             return heuristic_bytes
 
         footprint_bytes = self._kv_cache_footprint_bytes(need_bytes)
+        side_cache_bytes = _indexer_side_cache_bytes(
+            self.vllm_config, self.model_runner
+        )
         if footprint_bytes > heuristic_bytes:
             raise RuntimeError(
                 f"The KV cache the served configuration needs does not fit the "
@@ -1410,9 +1437,11 @@ class NeuronWorker(WorkerBase):
                 f"{self.vllm_config.scheduler_config.max_num_seqs} sequence(s) of "
                 f"{self.vllm_config.model_config.max_model_len} tokens, allocated "
                 f"as {footprint_bytes / (1024**3):.3f} GiB once every recurrent "
-                f"layer holds its own state bank; budget "
-                f"{heuristic_bytes / (1024**3):.3f} GiB, of which the graph "
-                f"reserve holds back "
+                f"layer holds its own state bank and the DSA indexer side caches "
+                f"{side_cache_bytes / (1024**3):.3f} GiB are counted; budget "
+                f"{heuristic_bytes / (1024**3):.3f} GiB, short by "
+                f"{(footprint_bytes - heuristic_bytes) / (1024**3):.3f} GiB. "
+                f"The graph reserve holds back "
                 f"{self._get_graph_reserve_bytes() / (1024**3):.2f} GiB on each "
                 f"physical NeuronCore. Serving the smaller figure is refused "
                 f"because the KV cache tensors would take a shape the compiled "
@@ -1424,11 +1453,13 @@ class NeuronWorker(WorkerBase):
             )
 
         logger.info(
-            "KV cache budget in %s mode: need=%.3f GiB, allocated=%.3f GiB, "
-            "heuristic=%.2f GiB, available=%.3f GiB",
+            "KV cache budget in %s mode: need=%.3f GiB, allocated=%.3f GiB "
+            "(DSA indexer side caches %.3f GiB), heuristic=%.2f GiB, "
+            "available=%.3f GiB",
             mode,
             need_bytes / (1024**3),
             footprint_bytes / (1024**3),
+            side_cache_bytes / (1024**3),
             heuristic_bytes / (1024**3),
             need_bytes / (1024**3),
         )

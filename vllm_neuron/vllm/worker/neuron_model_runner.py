@@ -9,6 +9,7 @@ state management.
 
 import logging
 import math
+import json
 import os
 import threading
 import time
@@ -156,6 +157,11 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
         # the bonus token will be re-emitted by the transition step itself,
         # to avoid duplicate emission to the client.
         self._skip_emit: bool = False
+        # Shadow draft (MTP stage A): the step whose ids this output carries, with
+        # its unread draft tensor, scored in get_output() from the ids read back
+        # there. None with the knob off (every other model), so nothing else moves.
+        claim = getattr(model_runner, "_glm5next_shadow_claim", None)
+        self._glm5next_shadow = claim() if claim is not None else None
 
     def _discard_partial_prefill_samples(
         self, sampled_token_ids: list[list[int]]
@@ -168,6 +174,18 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
                 continue
             if req_idx < len(sampled_token_ids):
                 sampled_token_ids[req_idx] = []
+
+    def _glm5next_shadow_score(self, sampled_token_ids) -> None:
+        """Hand the step's ids, read back on this thread, to the shadow-draft scorer, once.
+
+        ``sampled_token_ids`` is the materialized ``list[list[int]]``, or ``None`` for an
+        intermediate prefill chunk drained without ids. The draft tensor of the same
+        execution is read by the scorer here, after the sampled ids, on this thread; no
+        other thread reads this step's futures (see ``_glm5next_shadow_observe``).
+        """
+        record, self._glm5next_shadow = self._glm5next_shadow, None
+        if record is not None:
+            self._model_runner._glm5next_shadow_commit(record, sampled_token_ids)
 
     def is_all_partial_prefill(self) -> bool:
         """True when every request in this output is an intermediate
@@ -204,6 +222,7 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
                     # longer than kv_segment_size * NRT_queue_cap overflows it
                     # ("Execution queue full").
                     sampled_token_ids.cpu()
+                    self._glm5next_shadow_score(None)
                     sampled_token_ids = [
                         [] for _ in range(len(self.model_runner_output.req_ids))
                     ]
@@ -240,6 +259,7 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
                 else:
                     # Non-spec: [bs] of sampled tokens.
                     sampled_token_ids = [[x] for x in sampled_token_ids.cpu().tolist()]
+                self._glm5next_shadow_score(sampled_token_ids)
                 self._discard_partial_prefill_samples(sampled_token_ids)
                 # If this output was marked for skip-emit (e.g. the last
                 # spec step's bonus will be re-emitted by the following
@@ -402,6 +422,50 @@ def kv_cache_allocations(
     return allocations
 
 
+def indexer_side_cache_bytes(
+    kv_cache_spec: dict[str, KVCacheSpec],
+    text_config: Any,
+    *,
+    max_seq_len: int,
+    request_slots: int,
+) -> int:
+    """Return the bytes of the DSA indexer side caches the runner allocates beside the KV cache.
+
+    Every sparse-attention layer keeps a pooled-key store, a decode ring and a padding
+    ring (``pool_cache``, ``tail`` and ``pad_tail``) that no ``KVCacheSpec`` declares,
+    so neither vLLM's KV cache config nor :func:`kv_cache_allocations` holds them. The
+    bytes are read off the builder that allocates them,
+    ``NeuronModelRunner._glm5next_side_caches``, run on the meta device: the price is
+    the allocation by construction. A layer gets them when its spec is not a
+    ``MambaSpec``, the test ``bind_kv_cache`` makes, and in the latent bank's dtype.
+
+    ``max_seq_len`` and ``request_slots`` are the values the runner allocates with,
+    ``max_model_len`` and ``max_num_seqs``. A model whose text config declares no
+    indexer (``index_kpool`` and ``index_head_dim``) has no side caches: 0.
+    """
+    index_kpool = getattr(text_config, "index_kpool", None)
+    index_head_dim = getattr(text_config, "index_head_dim", None)
+    if index_kpool is None or index_head_dim is None:
+        return 0
+    banks = [
+        {"family": "linear_attn"}
+        if isinstance(spec, MambaSpec)
+        else {
+            "family": "self_attn",
+            "latent_cache": torch.empty((0,), dtype=spec.dtype, device="meta"),
+        }
+        for spec in kv_cache_spec.values()
+    ]
+    side = NeuronModelRunner._glm5next_side_caches(
+        banks,
+        index_kpool=int(index_kpool),
+        index_head_dim=int(index_head_dim),
+        max_seq_len=int(max_seq_len),
+        request_slots=int(request_slots),
+    )
+    return sum(tensor.nbytes for entry in side for tensor in entry.values())
+
+
 def build_sampling_params_tensor(
     sampling_metadata, num_reqs: int, device: torch.device
 ) -> torch.Tensor:
@@ -448,6 +512,137 @@ def build_sampling_params_tensor(
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug("On-device sampling params (top_k, top_p, temp): %s", result.tolist())
     return result
+
+
+class Glm5NextShadowStep(NamedTuple):
+    """One dispatched step waiting for its ids: dispatch index, bookkeeping, unread drafts."""
+
+    step_no: int
+    step: dict
+    drafts: Any
+
+
+class Glm5NextShadowDraftScorer:
+    """Score shadow drafts against the tokens the trunk samples at the following steps.
+
+    MTP stage A for GLM-5.3-Flash runs the layer-45 draft beside the decode graph and
+    never uses its output. This class keeps, per request, the sampled tokens in step
+    order and the draft records still waiting for ground truth, and hands each record
+    to ``sink`` once it is scored.
+
+    Alignment: a decode step at position ``s`` consumed ``x_s`` and sampled ``x_{s+1}``;
+    the ``k`` drafts it emits predict ``x_{s+2} .. x_{s+k+1}``, the tokens sampled at
+    the next ``k`` steps. Draft ``d_j`` is accepted iff ``d_1 .. d_{j-1}`` were accepted
+    and ``d_j`` equals the token sampled ``j`` steps later. A record emitted at the
+    prefill step (``sampled`` = ``x_T``) is scored the same way against ``x_{T+1} ..``.
+
+    A record is complete when ``k`` later tokens arrived. A request that retires
+    earlier (finished, preempted, its batch row handed to another request) has its
+    pending records scored over the tokens that did arrive: ``scored`` is that count and
+    ``accepted_prefix_len`` never exceeds it, so a reader can separate "rejected" from
+    "unscored". The record is a plain dict::
+
+        {"req_id", "step", "position", "row", "drafts", "actual", "scored",
+         "accepted_prefix_len"}
+
+    Requests are keyed by the engine's request id, not by batch row, so a row reused by a
+    new request never scores the old request's drafts against the new one's tokens.
+    """
+
+    def __init__(self, k: int, sink) -> None:
+        self.k = int(k)
+        if self.k < 1:
+            raise ValueError(f"a shadow-draft scorer needs k >= 1 drafts per step, got {k!r}")
+        self._sink = sink
+        self._history: dict[str, list[int]] = {}
+        self._pending: dict[str, list[dict]] = {}
+
+    @property
+    def tracked(self) -> set[str]:
+        """The request ids with a history (every observed, not yet retired request)."""
+        return set(self._history)
+
+    def observe(
+        self,
+        req_id: str,
+        *,
+        step: int,
+        position: int,
+        sampled: int,
+        drafts=None,
+        row: int | None = None,
+    ) -> None:
+        """Record one step of ``req_id``: the token it sampled and the drafts it emitted.
+
+        ``drafts`` is ``None`` for a step that drafted nothing (a prefill chunk).
+        """
+        history = self._history.setdefault(req_id, [])
+        pending = self._pending.setdefault(req_id, [])
+        history.append(int(sampled))
+        if drafts is not None:
+            pending.append(
+                {
+                    "req_id": req_id,
+                    "step": int(step),
+                    "position": int(position),
+                    "row": row,
+                    "drafts": [int(value) for value in drafts],
+                    # The first token this record is scored against is the one sampled
+                    # at the next step, which lands at this index of the history.
+                    "start": len(history),
+                }
+            )
+        self._flush(req_id, final=False)
+
+    def retire(self, req_id: str) -> None:
+        """The request is gone: score what arrived, mark the rest unscored, forget it."""
+        if req_id not in self._history:
+            return
+        self._flush(req_id, final=True)
+        del self._history[req_id]
+        del self._pending[req_id]
+
+    def retire_absent(self, present) -> None:
+        """Retire every tracked request that is not in ``present`` (this step's batch)."""
+        keep = set(present)
+        for req_id in list(self._history):
+            if req_id not in keep:
+                self.retire(req_id)
+
+    def close(self) -> None:
+        """Retire every request (shutdown)."""
+        for req_id in list(self._history):
+            self.retire(req_id)
+
+    def _flush(self, req_id: str, *, final: bool) -> None:
+        history = self._history[req_id]
+        pending = self._pending[req_id]
+        keep: list[dict] = []
+        for record in pending:
+            available = len(history) - record["start"]
+            if available < self.k and not final:
+                keep.append(record)
+                continue
+            scored = min(self.k, max(available, 0))
+            actual = history[record["start"] : record["start"] + scored]
+            accepted = 0
+            for draft, truth in zip(record["drafts"], actual):
+                if draft != truth:
+                    break
+                accepted += 1
+            out = {key: value for key, value in record.items() if key != "start"}
+            out["actual"] = list(actual)
+            out["scored"] = scored
+            out["accepted_prefix_len"] = accepted
+            self._sink(out)
+        # Keep the history bounded: tokens older than every pending record's start are
+        # never read again.
+        cut = min((record["start"] for record in keep), default=len(history))
+        if cut > 0:
+            del history[:cut]
+            for record in keep:
+                record["start"] -= cut
+        self._pending[req_id] = keep
 
 
 # TODO: Inherit from LoRAModelRunnerMixin to support LoRA
@@ -5019,10 +5214,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         masking them: the layer already repeats the last real latent into those rows,
         so writing the same value to the same slot again changes nothing, while a
         sentinel would need a masked write an indexed copy cannot express.
-        ``padded_rows`` are whole rows past the batch's requests; they get
-        ``PAD_SLOT_ID`` rather than ``NULL_BLOCK_ID``, because the latter is zero,
-        which is a real slot (block 0, offset 0), and a padded decode row's latent
-        would land in a slot a live request can own.
+        ``padded_rows`` appends that many ``PAD_SLOT_ID`` (-1) entries, a value no bank
+        row has. No carrier builder passes it. The batch carrier
+        (``_glm5next_sparse_batch_carrier``) hands each padding request a ``rows``
+        entry of ``[NULL_BLOCK_ID]`` and start 0 instead, so a padding row's latent
+        lands in slot 0 (block 0, offset 0). Block 0 is vLLM's reserved null block
+        (``BlockPool.null_block``), which the allocator never gives to a request, and
+        it is the runner's own target for padding writes (padded ``slot_mapping``
+        entries are ``NULL_BLOCK_ID``). So that write reaches no live request's latent.
         """
         slots: list[int] = []
         table = [list(row) for row in rows]
@@ -5217,7 +5416,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         besides its latent cache. ``get_kv_spec`` reports neither, because a
         ``LayerSpec`` carries one ``num_kv_heads``/``head_size``/``dtype`` triple and
         both of these have the indexer's width, ``index_head_dim``, so the cache
-        manager never sees them and the runner allocates them here.
+        manager never sees them and the runner allocates them here. One set per
+        sparse bank ``bind_kv_cache`` kept, the draft head's layer included when the
+        root built the head; every other bank gets an empty mapping, so the list
+        pairs with the banks positionally.
 
         Both carry a leading request-slot axis because each holds one sequence's
         indexer state; sharing them across requests lets a second request read the
@@ -5291,7 +5493,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         address. Because the set lives for the process, a new sequence would otherwise
         start on the previous sequence's partial pool; ``_glm5next_position_arm``
         empties a request's ring when its prefill starts at position 0.
+
+        The slot axis is the engine's concurrency bound plus ``SCRATCH_SLOTS``: the last
+        slot is the scratch store every padding row of a bank-form decode step names
+        (``glm5next_state_banks``), so a padding row's ring write never lands in a slot
+        a request holds. No request is ever handed that slot.
         """
+        from vllm_neuron.vllm.worker.glm5next_state_banks import SCRATCH_SLOTS
+
         live = getattr(self, "_glm5next_side_cache_set", None)
         if live is not None and len(live) == len(banks):
             return live
@@ -5301,7 +5510,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             index_kpool=int(text_config.index_kpool),
             index_head_dim=int(text_config.index_head_dim),
             max_seq_len=int(self.max_model_len),
-            request_slots=self._glm5next_request_slot_capacity(banks),
+            request_slots=self._glm5next_request_slot_capacity(banks) + SCRATCH_SLOTS,
         )
         self._glm5next_side_cache_set = live
         # A fresh set is owned by nobody: the slot table and position record refer
@@ -5408,29 +5617,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             self._glm5next_finished_request_ids = noted
         noted.update(finished_req_ids or ())
 
-    @staticmethod
-    def _glm5next_emptied_at_slot(held: torch.Tensor, slot: int) -> torch.Tensor:
-        """Return a copy of ``held`` with row ``slot`` zeroed and every other row unchanged.
-
-        A copy rather than an in-place zero: every cache tensor here is a view of one
-        allocation, and the eager Neuron backend refuses an in-place write on shared
-        storage ("Can't call ReserveSpace on shared storage"). The mask is built on
-        the host and moved once, and the caller replaces its entry with the result
-        before the carriers are built. Only one row is emptied so a concurrent
-        request's row is untouched; a select (not a product) keeps a stale non-finite
-        value from surviving.
-
-        The recurrent and convolution states are instead zeroed where they are read,
-        since their reader is handed the position. The indexer's ring is consumed
-        inside kernels that get neither the position nor a per-request predicate, so
-        its freshness has to be a rebuilt input.
-        """
-        keep = torch.ones(
-            (int(held.shape[0]),) + (1,) * (held.dim() - 1), dtype=torch.bool
-        )
-        keep[int(slot)] = False
-        return torch.where(keep.to(held.device), held, torch.zeros_like(held))
-
     def _glm5next_request_slots(
         self, banks, request_ids, *, synthetic: bool, side_caches=None
     ):
@@ -5451,6 +5637,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         bucket) takes that many distinct slots, slots no request owns first, so the
         captured graph sees the disjoint per-request views a served batch hands it.
         """
+        from vllm_neuron.vllm.worker.glm5next_state_banks import empty_slot
+
         # A synthetic step takes slot 0 and no claim; the capacity bound is read
         # only where a claim is about to be taken.
         if synthetic:
@@ -5495,13 +5683,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # convolution history and the recurrent state.
             # The indexer's two caches are runner-allocated and their readers take
             # no position, so they are emptied here, together (a half-fresh slot
-            # would pool the previous owner's ring members) and by rebuild rather
-            # than in place, for the reason ``_glm5next_emptied_at_slot`` gives.
+            # would pool the previous owner's ring members): this slot only, in
+            # place, by a host copy (``glm5next_state_banks.empty_slot``).
             for side in side_caches or ():
                 if not side:
                     continue
                 for key in ("pool_cache", "tail"):
-                    side[key] = self._glm5next_emptied_at_slot(side[key], free)
+                    empty_slot(side[key], free)
             positions.pop(free, None)
             table[request_id] = free
         return [table[request_id] for request_id in request_ids]
@@ -5549,20 +5737,42 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         max_seq_len: int,
         index_kpool: int,
         operands: dict,
+        banked: bool = False,
     ) -> dict:
         """One sparse (DSA) layer's carrier for a decode step of ``B > 1`` requests.
 
         Request ``b`` is column ``b`` of every operand: its block-table column, its
-        latent slot, its position and seq len, and its own views of the indexer's
-        pooled store and ring. The checks are the one-request carrier's, per request.
+        latent slot, its position and seq len, and its own store of the indexer's
+        pooled keys and ring. The checks are the one-request carrier's, per request.
+
+        Two forms of the two side caches. ``banked`` hands the whole ``pool_cache`` and
+        ``tail`` banks beside a ``[B]`` int64 ``state_slots`` tensor (two graph inputs
+        per layer whatever ``B`` is; the layer gathers and writes back by slot, in place
+        on the bank). Otherwise each is a tuple of one disjoint bank view per request,
+        the per-request form, which the layer stacks and writes back view by view.
 
         A padding request (the last ``padding``) is a sequence of one token in the
         null block: position 0, a table column naming block ``NULL_BLOCK_ID`` and
         nothing else, its latent written to that block (the runner's own write-side
-        padding convention), and its ring the scratch ``pad_tail``. At position 0 no
-        pool completes, so its pooled write lands on its view's trash row, which no
-        candidate gather reads.
+        padding convention). At position 0 no pool completes, so its pooled write lands
+        on its store's trash row, which no candidate gather reads. Its ring is the
+        scratch ``pad_tail`` row in the view form and the scratch slot (the last store,
+        past the engine's concurrency bound, which no request owns) in the bank form,
+        so the ring write lands where no request reads.
+
+        The page-dependent operands (``block_table_row``, ``latent_slots``) and their
+        checks are done once per block-table object and kept in ``operands``: the
+        layers of one KV-cache group share one table, so they share one upload, while a
+        layer over other pages gets its own. The step operands (positions, seq lens,
+        slot tensor) are built once per device.
         """
+        from vllm_neuron.vllm.worker.glm5next_state_banks import (
+            scratch_slot,
+            slot_tensor,
+            sparse_bank_slots,
+            strided_bank_problem,
+        )
+
         name = bank["name"]
         if is_prefill:
             raise ValueError(
@@ -5604,38 +5814,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             )
         window_blocks = int(geometry["window_blocks"])
         real_requests = len(state_slots) - int(padding)
-        tables = [
-            [int(value) for value in row]
-            for row in geometry.get("request_block_ids", ())
-        ]
-        if len(tables) != real_requests:
-            raise ValueError(
-                f"KV layer '{name}' serves {real_requests} request(s) in this step and "
-                f"its geometry names {len(tables)} block-table row(s) "
-                f"('request_block_ids'); each request reads its own window"
-            )
-        for index, ids in enumerate(tables):
-            if not ids:
-                raise ValueError(
-                    f"KV layer '{name}' was handed an empty block-table row for request "
-                    f"{index}; a GLM-5.3-Flash request needs at least one KV block"
-                )
-            own_slots = len(ids) * block_size
-            if int(starts[index]) < 0 or int(starts[index]) + 1 > own_slots:
-                raise ValueError(
-                    f"KV layer '{name}' was handed request {index}'s token at position "
-                    f"{int(starts[index])} against {len(ids)} block(s) of {block_size} "
-                    f"slot(s); a write outside the request's own pages would land on "
-                    f"another sequence's rows"
-                )
-            if len(ids) > window_blocks:
-                raise ValueError(
-                    f"KV layer '{name}' was handed {len(ids)} block(s) for request "
-                    f"{index} and the bucket's block table holds {window_blocks} per "
-                    f"sequence; a request longer than its bucket cannot be served by "
-                    f"this window"
-                )
-        tables += [[NULL_BLOCK_ID]] * int(padding)
         latent = bank["latent_cache"]
         device = latent.device
         if device not in operands:
@@ -5647,37 +5825,107 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 "start_position": positions,
                 "position": positions,
             }
+        rows = geometry.get("request_block_ids", ())
+        pages_key = ("pages", device, id(rows), window_blocks, block_size)
+        paged = operands.get(pages_key)
+        if paged is None:
+            tables = [[int(value) for value in row] for row in rows]
+            if len(tables) != real_requests:
+                raise ValueError(
+                    f"KV layer '{name}' serves {real_requests} request(s) in this step and "
+                    f"its geometry names {len(tables)} block-table row(s) "
+                    f"('request_block_ids'); each request reads its own window"
+                )
+            for index, ids in enumerate(tables):
+                if not ids:
+                    raise ValueError(
+                        f"KV layer '{name}' was handed an empty block-table row for request "
+                        f"{index}; a GLM-5.3-Flash request needs at least one KV block"
+                    )
+                own_slots = len(ids) * block_size
+                if int(starts[index]) < 0 or int(starts[index]) + 1 > own_slots:
+                    raise ValueError(
+                        f"KV layer '{name}' was handed request {index}'s token at position "
+                        f"{int(starts[index])} against {len(ids)} block(s) of {block_size} "
+                        f"slot(s); a write outside the request's own pages would land on "
+                        f"another sequence's rows"
+                    )
+                if len(ids) > window_blocks:
+                    raise ValueError(
+                        f"KV layer '{name}' was handed {len(ids)} block(s) for request "
+                        f"{index} and the bucket's block table holds {window_blocks} per "
+                        f"sequence; a request longer than its bucket cannot be served by "
+                        f"this window"
+                    )
+            tables += [[NULL_BLOCK_ID]] * int(padding)
+            paged = {
+                # One column per request, ``-1`` past its pages, built on the host and
+                # moved once.
+                "block_table_row": torch.tensor(
+                    [
+                        [ids[page] if page < len(ids) else -1 for ids in tables]
+                        for page in range(window_blocks)
+                    ],
+                    dtype=torch.int32,
+                ).to(device),
+                # One physical bank row per request: its own token's slot.
+                "latent_slots": cls._glm5next_latent_slot_mapping(
+                    rows=tables,
+                    starts=starts,
+                    tokens=1,
+                    block_size=block_size,
+                    reals=[max(1, int(one)) for one in reals],
+                    device=device,
+                ),
+            }
+            operands[pages_key] = paged
         carrier = {
             "latent_cache": latent,
-            # One column per request, ``-1`` past its pages, built on the host and
-            # moved once.
-            "block_table_row": torch.tensor(
-                [
-                    [ids[page] if page < len(ids) else -1 for ids in tables]
-                    for page in range(window_blocks)
-                ],
-                dtype=torch.int32,
-            ).to(device),
-            # One physical bank row per request: its own token's slot.
-            "latent_slots": cls._glm5next_latent_slot_mapping(
-                rows=tables,
-                starts=starts,
-                tokens=1,
-                block_size=block_size,
-                reals=[max(1, int(one)) for one in reals],
-                device=device,
-            ),
-            # Disjoint views, one per request, so each advances in place.
-            "pool_cache": tuple(side["pool_cache"][int(slot)] for slot in state_slots),
-            "tail": tuple(
-                side["tail"][int(slot)] for slot in state_slots[:real_requests]
-            )
-            + tuple(side["pad_tail"][index] for index in range(int(padding))),
+            **paged,
             **operands[device],
             "softmax_scale": float(softmax_scale),
             "max_seq_len": int(max_seq_len),
             "page_size": int(geometry["page_size"]),
         }
+        if banked:
+            scratch = scratch_slot(side)
+            real_slots = [int(one_slot) for one_slot in state_slots[:real_requests]]
+            if scratch in real_slots:
+                raise ValueError(
+                    f"KV layer '{name}' holds {side_slots} indexer side-cache slot(s) and "
+                    f"a request of this step owns the last one, slot {scratch}, which the "
+                    f"bank form keeps as the scratch store every padding row writes; the "
+                    f"live side caches are allocated one slot past the engine's "
+                    f"concurrency bound for it, so a store without a scratch slot cannot "
+                    f"serve a banked step"
+                )
+            slots = sparse_bank_slots(
+                state_slots, real_requests=real_requests, scratch=scratch
+            )
+            slots_key = ("slots", device, tuple(slots))
+            if slots_key not in operands:
+                operands[slots_key] = slot_tensor(slots, device)
+            # The whole banks: the layer gathers its rows by slot and writes them back
+            # onto the bank itself, which the backend keeps as an aliased output. A
+            # whole bank must be a contiguous slice of its storage (the executor
+            # refuses a strided one after the compile); refused here by name.
+            for key in ("pool_cache", "tail"):
+                problem = strided_bank_problem(
+                    side[key], name=f"KV layer '{name}'s indexer {key}"
+                )
+                if problem is not None:
+                    raise ValueError(problem)
+            carrier["pool_cache"] = side["pool_cache"]
+            carrier["tail"] = side["tail"]
+            carrier["state_slots"] = operands[slots_key]
+        else:
+            # Disjoint views, one per request, so each advances in place.
+            carrier["pool_cache"] = tuple(
+                side["pool_cache"][int(slot)] for slot in state_slots
+            )
+            carrier["tail"] = tuple(
+                side["tail"][int(slot)] for slot in state_slots[:real_requests]
+            ) + tuple(side["pad_tail"][index] for index in range(int(padding)))
         return carrier
 
     @classmethod
@@ -5700,11 +5948,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         active_mla_query_rows: int | None = None,
         padded_requests: int = 0,
     ) -> list[dict]:
-        """Build one kwargs mapping per layer, in stack order, holding that layer's own state.
+        """Build one kwargs mapping per layer, in spec order, holding that layer's own state.
 
         ``Glm5NextModel.forward`` splats these and refuses a count that disagrees with
         the stack, so this walks the banks ``bind_kv_cache`` kept (the spec's layer
-        order) and never names a layer.
+        order) and never names a layer. When the root built the draft head, its one
+        decoder layer's bank follows the stack's, so its mapping is the last one, built
+        by the same family branch as a trunk layer's; the root hands the stack the
+        others and the head that one.
 
         A sparse-attention (DSA) layer takes ``latent_cache``, ``pool_cache``,
         ``seq_lens``, ``start_position``, ``softmax_scale``, ``max_seq_len``,
@@ -5755,6 +6006,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 layers' row masks: an unmasked padding row would decay and update the
                 state with a row that carries no token.
         """
+        from vllm_neuron.vllm.worker.glm5next_state_banks import (
+            bank_form,
+            slot_tensor,
+            strided_bank_problem,
+        )
+
         if len(banks) != len(side_caches) or len(banks) != len(geometries):
             raise ValueError(
                 f"{len(banks)} bank(s) against {len(side_caches)} side-cache "
@@ -5855,6 +6112,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         linear_step_operands: dict = {}
         sparse_step_operands: dict = {}
         carriers: list[dict] = []
+        # Whether this step hands the layers whole banks and slot tensors (a decode of
+        # several requests) or one bank view per request (see ``glm5next_state_banks``).
+        banked = bank_form(len(starts), is_prefill=bool(is_prefill))
         for bank, side, geometry in zip(banks, side_caches, geometries):
             state_slots = [
                 int(value)
@@ -5895,6 +6155,33 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                             dtype=torch.float32,
                         ).to(device),
                     }
+                if banked:
+                    # The whole banks and one int64 slot per request, one upload for
+                    # the family: the layer gathers the rows it steps and writes them
+                    # back onto the bank itself (``functional.state_banks``), which the
+                    # backend keeps as a whole-bank aliased output. A padding row names
+                    # the idle slot the runner chose and is handed back unchanged.
+                    # A whole bank must be a contiguous slice of its storage, or the
+                    # executor refuses it after the compile; refused here by name.
+                    for key in ("conv_state", "recurrent_state"):
+                        problem = strided_bank_problem(
+                            bank[key], name=f"KV layer '{bank['name']}'s {key}"
+                        )
+                        if problem is not None:
+                            raise ValueError(problem)
+                    slots_key = ("slots", device, tuple(int(one) for one in state_slots))
+                    if slots_key not in linear_step_operands:
+                        linear_step_operands[slots_key] = slot_tensor(state_slots, device)
+                    carriers.append(
+                        {
+                            "conv_state": bank["conv_state"],
+                            "recurrent_state": bank["recurrent_state"],
+                            "state_slots": linear_step_operands[slots_key],
+                            "is_prefill": bool(is_prefill),
+                            **linear_step_operands[device],
+                        }
+                    )
+                    continue
                 # One entry per request. Two requests' states are two rows of one
                 # bank, so they travel as a tuple of views, never a copy: the
                 # recurrence advances in place. The positions are one tensor so no
@@ -5928,6 +6215,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         max_seq_len=max_seq_len,
                         index_kpool=index_kpool,
                         operands=sparse_step_operands,
+                        banked=banked,
                     )
                 )
                 continue
@@ -6160,6 +6448,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # points of their sequences is the ordinary concurrent case, but the layers
         # of one forward are stepped together.
         starts: set[tuple] = set()
+        # The layers of one KV-cache group share one metadata dict (the runner writes
+        # the group's entry under every layer name), so the walk below is done once
+        # per (metadata object, family) and its result reused: the geometry a group's
+        # layers get is one dict per layer over one set of row lists, so a later
+        # per-object memo (``_glm5next_sparse_batch_carrier``) sees one table for the
+        # group. The checks that name a layer fire on the group's first layer.
+        walked: dict[tuple, tuple] = {}
         for bank in banks:
             name = bank["name"]
             if name not in metadata_map:
@@ -6169,6 +6464,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     f"(:4256-4257) and this call site handed {sorted(metadata_map)}"
                 )
             metadata = metadata_map[name]
+            walk_key = (id(metadata), bank["family"])
+            seen = walked.get(walk_key)
+            if seen is not None:
+                geometry, leg_is_prefill, request_starts = seen
+                geometries.append(dict(geometry))
+                legs.add(leg_is_prefill)
+                starts.add(tuple(request_starts))
+                continue
             block_size = int(metadata["block_size"])
             rows = self._glm5next_host_geometry(metadata, "host_block_table", name)
             positions = self._glm5next_host_geometry(
@@ -6272,19 +6575,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 # the ``max_model_len`` fallback and the expensive case.
                 span_blocks = table_width
             window_blocks = min(table_width, max(1, span_blocks))
-            geometries.append(
-                {
-                    # The first request's pages, which a one-request step reads, and
-                    # every request's own, which a decode step of several reads.
-                    "block_ids": request_rows[0][: blocks_used[0]],
-                    "request_block_ids": [
-                        row[:used] for row, used in zip(request_rows, blocks_used)
-                    ],
-                    "state_slot": request_rows[0][0],
-                    "page_size": block_size,
-                    "window_blocks": window_blocks,
-                }
-            )
+            geometry = {
+                # The first request's pages, which a one-request step reads, and
+                # every request's own, which a decode step of several reads.
+                "block_ids": request_rows[0][: blocks_used[0]],
+                "request_block_ids": [
+                    row[:used] for row, used in zip(request_rows, blocks_used)
+                ],
+                "state_slot": request_rows[0][0],
+                "page_size": block_size,
+                "window_blocks": window_blocks,
+            }
+            walked[walk_key] = (geometry, leg_is_prefill, request_starts)
+            geometries.append(dict(geometry))
             # One reading of the leg per group, the one the window was sized from.
             legs.add(leg_is_prefill)
             # One tuple per group; the groups must agree about the same requests.
@@ -6447,6 +6750,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # so captured and served graphs share a signature. Absent unless a dump
             # directory is configured.
             **self._layer_stream_kwargs(),
+            # Shadow draft (MTP stage A): the prefill leg's boundary id; {} with the knob off.
+            **self._glm5next_shadow_kwargs(
+                is_prefill=is_prefill,
+                request_ids=request_ids,
+                request_starts=request_starts,
+                request_tokens=request_tokens,
+                synthetic=synthetic_step,
+                device=input_ids.device,
+                sampling_rows=int(kwargs["sampling_positions"].shape[0]),
+            ),
         }
 
     def _glm5next_parallel_kwargs(self, device: torch.device | None = None) -> dict:
@@ -6508,8 +6821,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # A fresh sequence must not inherit the previous owner's partial pool:
             # the side caches live for the process and every real token stashes
             # into the ring, so its next completion would pool stale members. Only
-            # this request's row is emptied, by rebuild rather than in place (see
-            # ``_glm5next_emptied_at_slot``).
+            # this request's row is emptied, in place (``empty_slot``).
             # The pooled store is left alone: the candidate gather is bounded by
             # ``max_seq_len`` and every complete pool below that bound is written by
             # this prefill, so a stale row above it is unreachable.
@@ -6524,9 +6836,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # The sparse family's single cursor is cleared with them, for the same
             # reason.
             self._glm5next_side_cache_cursor = None
+            from vllm_neuron.vllm.worker.glm5next_state_banks import empty_slot
+
             for side in side_caches:
                 if "tail" in side:
-                    side["tail"] = self._glm5next_emptied_at_slot(side["tail"], slot)
+                    empty_slot(side["tail"], slot)
         else:
             # Every other step must continue the sequence the ring already holds.
             # The ring is keyed by absolute position and carries no sequence
@@ -8987,6 +9301,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             bucket_name=neff_bucket_name,
         ).inc()
 
+        # Shadow draft (MTP stage A): the GLM root's draft ids ride second in its
+        # output; take them off before anything reads the output's shape.
+        model_output = self._glm5next_shadow_take_output(model_output)
         # Strip the per-layer stream dump from the output first: every branch below
         # expects the shape the model returns with no dump configured.
         model_output = self._take_layer_stream_dump(
@@ -9042,6 +9359,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # Move model_output_tensor (logits or sampled token ids) back to CPU
         if not self.use_async_scheduling:
             model_output_tensor = model_output_tensor.to("cpu")
+
+        # Shadow draft: hand this step to the scorer (no-op with the knob off). Under
+        # async scheduling the tensor is still a device future and is not read here;
+        # the step's output object scores it when it reads the ids back.
+        self._glm5next_shadow_observe(
+            model_output_tensor,
+            getattr(self, "_glm5next_shadow_last_drafts", None),
+            is_prefill=is_prefill,
+        )
 
         return model_output_tensor, aux_hidden_states, last_accepted_token
 
@@ -10355,6 +10681,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 _dtype_views[key] = view
             return view
 
+        from vllm_neuron.vllm.worker.glm5next_state_banks import state_bank_regions
+
         # Build KV caches per group
         kv_caches = {}
         for group in kv_cache_config.kv_cache_groups:
@@ -10480,44 +10808,30 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
                     num_slots = raw_tensor.numel() // slot_bytes
 
-                    # Both states live side by side inside each slot, so each
-                    # state is a slot-strided view of the same raw buffer: the
-                    # slot stride is the whole slot and the within-slot
-                    # strides are contiguous for that state's own shape.
-                    # ``strict=True`` because upstream pairs the two carriers
-                    # with a non-strict zip, so a short ``dtypes`` tuple would
-                    # silently under-allocate the slot.
-                    state_tensors = []
-                    state_offset_bytes = 0
-                    for shape, dtype in zip(
-                        kv_cache_spec.shapes, kv_cache_spec.dtypes, strict=True
-                    ):
-                        dtype_size = dtype.itemsize
-                        # The slot must be a whole number of this state's
-                        # elements, or the slot stride below would truncate.
-                        assert slot_bytes % dtype_size == 0
-                        target_shape = (num_slots, *shape)
-                        # Contiguous strides for the target shape, read off a
-                        # meta tensor: correct by construction and allocating
-                        # no storage for a reading used only as arithmetic.
-                        contiguous = torch.empty(target_shape, device="meta").stride()
-                        assert state_offset_bytes % dtype_size == 0
-                        state_tensors.append(
-                            torch.as_strided(
-                                _shared_dtype_view(raw_tensor, dtype),
-                                size=target_shape,
-                                stride=(
-                                    slot_bytes // dtype_size,
-                                    *contiguous[1:],
-                                ),
-                                storage_offset=state_offset_bytes // dtype_size,
-                            )
-                        )
-                        # Advance by this state's own per-slot footprint, so the
-                        # next carrier starts where this one ends inside a slot.
-                        state_offset_bytes += contiguous[0] * dtype_size
-
-                    kv_caches[layer_name] = state_tensors
+                    # Each state is one contiguous ``[num_slots, *shape]`` bank
+                    # over the same raw buffer, the banks one after another
+                    # (``glm5next_state_banks.state_bank_regions``). Not a
+                    # slot-strided view with both states side by side in every
+                    # slot: the bank form hands a whole bank to the decode graph
+                    # and the Neuron executor refuses a non-contiguous input
+                    # ("Detected non-contiguous slicing for requested Device
+                    # Tensor"); one row ``bank[slot]`` is contiguous in both
+                    # layouts, so the view form is unchanged. The buffer is the
+                    # same ``num_slots * slot_bytes``, so the footprint the worker
+                    # budgets is unchanged. ``strict=True`` inside, because
+                    # upstream pairs the two carriers with a non-strict zip, so a
+                    # short ``dtypes`` tuple would silently under-allocate the slot.
+                    kv_caches[layer_name] = state_bank_regions(
+                        raw_tensor,
+                        kv_cache_spec.shapes,
+                        kv_cache_spec.dtypes,
+                        slot_bytes=slot_bytes,
+                        dtype_view=_shared_dtype_view,
+                    )
+                    assert len(kv_caches[layer_name]) == len(kv_cache_spec.shapes)
+                    assert all(
+                        int(bank.shape[0]) == num_slots for bank in kv_caches[layer_name]
+                    )
                     # Not registered in ``_kv_cache_full_tensors``: that dict
                     # feeds the KV-transfer connector's (2, num_blocks, ...) K/V
                     # view, and a recurrent state has no K/V pair.
@@ -11214,4 +11528,349 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         return ("generate",)
 
     def ensure_kv_transfer_shutdown(self) -> None:
-        pass
+        # The worker's ``shutdown`` reaches the runner through this call; the
+        # shadow-draft log (MTP stage A) closes with it.
+        self._glm5next_shadow_shutdown()
+
+    # ------------------------------------------------------------------------
+    # GLM-5.3-Flash shadow draft (MTP stage A): bookkeeping, scoring, log.
+    #
+    # With ``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT=k`` the root returns ``k`` draft ids per
+    # request beside the sampled ids and never uses them. This block hands the prefill
+    # leg the id its last row pairs with (``shadow_boundary_ids``), peels the draft ids
+    # off the graph output, and scores them one step late against the tokens the trunk
+    # samples next (``Glm5NextShadowDraftScorer``), writing one JSONL record per draft
+    # step to ``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG`` on rank 0.
+    # ------------------------------------------------------------------------
+
+    def _glm5next_shadow_k(self) -> int:
+        """The number of shadow drafts per step for the model this runner serves.
+
+        ``0`` unless the served root built its draft head (``model.mtp``, stage A
+        contract C2: the GLM-5.3-Flash root builds it at construction exactly when
+        ``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT`` is above 0). The knob is GLM-specific and
+        this runner is not, so the hooks key on the head, never on the environment
+        alone: another model's tuple output is left untouched whatever the knob says.
+        The value comes from the knob's one reader, ``mtp.shadow_draft_k`` (contract
+        C1), which reads ``envs`` and bounds it.
+        """
+        if getattr(getattr(self, "model", None), "mtp", None) is None:
+            return 0
+        from vllm_neuron.model.glm5_next import mtp as mtp_module
+
+        return int(mtp_module.shadow_draft_k())
+
+    def _glm5next_shadow_log_path(self) -> str:
+        """``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG``: the JSONL path, "" = no log."""
+        return str(envs.VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG or "")
+
+    def _glm5next_shadow_rank(self) -> int:
+        """This worker's tensor-parallel rank, read on the host once.
+
+        Never from ``rank_tensor``: that is a device tensor, and reading it is a
+        device-to-host copy on the worker's main thread. A process with no
+        model-parallel group is rank 0.
+        """
+        cached = getattr(self, "_glm5next_shadow_rank_cache", None)
+        if cached is None:
+            from vllm.distributed.parallel_state import (
+                get_tp_group,
+                model_parallel_is_initialized,
+            )
+
+            cached = int(get_tp_group().rank_in_group) if model_parallel_is_initialized() else 0
+            self._glm5next_shadow_rank_cache = cached
+        return cached
+
+    def _glm5next_shadow_active(self) -> bool:
+        """Scoring runs on rank 0 only, when the knob is on and a log path is set.
+
+        Every rank samples the same ids and drafts (the draft ids are global, gathered
+        on device), so one log is the whole measurement; no log path means nothing to
+        measure and the per-step host work is skipped.
+        """
+        return (
+            self._glm5next_shadow_k() > 0
+            and bool(self._glm5next_shadow_log_path())
+            and self._glm5next_shadow_rank() == 0
+        )
+
+    def _glm5next_shadow_kwargs(
+        self,
+        *,
+        is_prefill: bool,
+        request_ids,
+        request_starts,
+        request_tokens,
+        synthetic: bool,
+        device,
+        sampling_rows: int,
+    ) -> dict:
+        """The root keyword the shadow draft needs this step, and the step's bookkeeping.
+
+        The prefill leg populates the draft layer at every row of the chunk with the id
+        that row's draft consumes: the next prompt token, which the graph has for every
+        row but the last. The last row's id is handed in as ``shadow_boundary_ids``, an
+        int32 tensor with one entry per SAMPLING ROW (``sampling_rows`` = the length of
+        ``sampling_positions``): the first token of the next chunk when more of the
+        prompt follows, or ``-1`` when this chunk is the prompt's last, in which case the
+        graph substitutes the token it samples. The input builder pads the sampling rows
+        to the request bucket by repeating the last real row's index, so the padding
+        entries repeat the last real request's id: duplicate indices then write one
+        value. The decode leg needs nothing: the sampled token is in the graph. The
+        step's request ids, leg and positions are stashed for the output side
+        (``_glm5next_shadow_observe``); a synthetic step (warmup, capture, the idle dummy
+        step) stashes nothing. Returns ``{}`` with the draft off, so the traced
+        signature is unchanged.
+
+        Raises:
+            ValueError: fewer sampling rows than requests (a geometry the translator
+                never produces; a boundary tensor could not cover every request).
+        """
+        self._glm5next_shadow_step = None
+        if self._glm5next_shadow_k() <= 0:
+            return {}
+        starts = [int(value) for value in request_starts]
+        counts = [int(value) for value in request_tokens]
+        rows = int(sampling_rows)
+        if rows < len(starts):
+            raise ValueError(
+                f"the shadow draft needs one boundary id per sampling row and this "
+                f"step has {rows} sampling row(s) for {len(starts)} request(s); a "
+                f"prefill samples at least one row per request"
+            )
+        requests = getattr(self, "requests", None) or {}
+        finals: list[bool] = []
+        boundaries: list[int] = []
+        for req_id, start, count in zip(request_ids, starts, counts):
+            end = start + count
+            state = None if synthetic or req_id is None else requests.get(req_id)
+            prompt_len = (
+                int(getattr(state, "num_prompt_tokens", 0)) if state is not None else 0
+            )
+            if state is not None and end < prompt_len:
+                finals.append(False)
+                boundaries.append(int(state.prompt_token_ids[end]))
+            else:
+                finals.append(True)
+                boundaries.append(-1)
+        if not synthetic:
+            self._glm5next_shadow_step = {
+                "request_ids": list(request_ids),
+                "is_prefill": bool(is_prefill),
+                "finals": finals,
+                # The trunk's last consumed position this step: the row the drafts
+                # (decode) or the final populate (prefill) stand on.
+                "positions": [start + count - 1 for start, count in zip(starts, counts)],
+            }
+        if not is_prefill:
+            return {}
+        # Padding rows repeat the last real row's index (``_pad_to_compiled_shapes``),
+        # so they repeat its id.
+        boundaries += [boundaries[-1]] * (rows - len(boundaries))
+        return {
+            "shadow_boundary_ids": torch.tensor(boundaries, dtype=torch.int32).to(device)
+        }
+
+    def _glm5next_shadow_take_output(self, model_output):
+        """Peel the draft ids off a shadow-drafting root's output and hold them.
+
+        With the knob on the root returns ``(sampled_or_logits, draft_ids, *streams)``;
+        every consumer downstream expects the shape it returned before, so the drafts
+        come off here, before the layer-stream dump and the sampling unpack.
+        """
+        self._glm5next_shadow_last_drafts = None
+        if (
+            self._glm5next_shadow_k() <= 0
+            or not isinstance(model_output, tuple)
+            or len(model_output) < 2
+        ):
+            return model_output
+        primary, drafts, *rest = model_output
+        self._glm5next_shadow_last_drafts = drafts
+        return primary if not rest else (primary, *rest)
+
+    def _glm5next_shadow_scorer(self) -> Glm5NextShadowDraftScorer:
+        scorer = getattr(self, "_glm5next_shadow_scorer_instance", None)
+        if scorer is None:
+            path = self._glm5next_shadow_log_path()
+            handle = open(path, "a", encoding="utf-8")  # noqa: SIM115 (lives with the runner)
+            self._glm5next_shadow_log_handle = handle
+
+            def sink(record: dict) -> None:
+                handle.write(json.dumps(record) + "\n")
+                handle.flush()
+
+            scorer = Glm5NextShadowDraftScorer(self._glm5next_shadow_k(), sink)
+            self._glm5next_shadow_scorer_instance = scorer
+            # Dispatch order (main thread) and scoring order (whichever thread reads a
+            # step's ids back); the lock covers the scorer and the ready steps.
+            self._glm5next_shadow_step_no = 0
+            self._glm5next_shadow_next_step = 0
+            self._glm5next_shadow_ready = {}
+            self._glm5next_shadow_lock = threading.Lock()
+        return scorer
+
+    def _glm5next_shadow_shutdown(self) -> None:
+        """Score what was read back, name what was not, retire every request, close the log.
+
+        Reached from the runner's shutdown, on the main thread. Nothing is read from the
+        device here: a step whose output no thread materialized (an abort mid-step; the
+        runtime may already be gone, and a read here would be the hang
+        ``_glm5next_shadow_observe`` describes) is dropped with a warning naming it, and
+        the steps behind it are scored in order, so no record that has its data is lost.
+        Every request alive across the gap retires at the gap with its pending drafts
+        scored over the tokens that arrived before it (its history lacks the lost tokens,
+        so nothing behind the gap is scored against them) and is tracked afresh behind it.
+        Every tracked request retires at the end with its pending drafts scored over the
+        tokens that arrived (``scored`` < k for the tail). Idempotent: a second call finds
+        no scorer and returns.
+        """
+        scorer = getattr(self, "_glm5next_shadow_scorer_instance", None)
+        if scorer is None:
+            return
+        with self._glm5next_shadow_lock:
+            self._glm5next_shadow_drain(scorer)
+            ready = self._glm5next_shadow_ready
+            dispatched = self._glm5next_shadow_step_no
+            for step_no in sorted(ready) + [dispatched]:
+                if step_no < self._glm5next_shadow_next_step:
+                    continue  # scored by the drain of an earlier held step
+                lost = list(range(self._glm5next_shadow_next_step, step_no))
+                if lost:
+                    logger.warning(
+                        "shadow draft: %s never read back before shutdown; the sampled ids "
+                        "and drafts of %s are dropped",
+                        ", ".join(f"step {number}" for number in lost),
+                        "that step" if len(lost) == 1 else "those steps",
+                    )
+                    # The histories lack the lost steps' tokens: what is pending is
+                    # scored over the tokens that arrived before the gap, and every
+                    # request starts afresh behind it, so no draft is scored against
+                    # a token that was not the one that followed it.
+                    scorer.retire_absent(set())
+                self._glm5next_shadow_next_step = step_no
+                if step_no in ready:
+                    self._glm5next_shadow_drain(scorer)
+            self._glm5next_shadow_inflight = None
+            scorer.close()
+            self._glm5next_shadow_scorer_instance = None
+        handle = getattr(self, "_glm5next_shadow_log_handle", None)
+        if handle is not None:
+            handle.close()
+
+    def _glm5next_shadow_observe(self, sampled, drafts, *, is_prefill: bool) -> None:
+        """Hand this step to the scorer without reading the device on the worker's main thread.
+
+        Under async scheduling ``sampled`` is a device future that the output thread reads
+        back inside ``AsyncNeuronModelRunnerOutput.get_output()``, and ``drafts`` is a
+        second output of the same execution. A read here would make this thread a second
+        reader of that future, and the runtime delivers a future's completion once: the
+        gate's knob-5 server hung at its first decode step exactly there (rank 0's main
+        thread, in ``execute_model``'s forward epilogue ``_execute_model_forward``; the
+        engine core timed out behind it). So the step is stashed -- its bookkeeping and
+        its unread draft tensor -- for the output object ``sample_tokens`` builds next to
+        claim (``_glm5next_shadow_claim``); ``get_output``
+        scores it from the ids it read back and reads the drafts there, after the sampled
+        ids, on the thread that materialized them. A synchronous runner moved ``sampled``
+        to the host already, and the step is scored at once. A step the kwargs hook did not
+        stash (a synthetic forward) observes nothing.
+        """
+        step = getattr(self, "_glm5next_shadow_step", None)
+        self._glm5next_shadow_step = None
+        self._glm5next_shadow_inflight = None
+        if step is None or sampled is None or not self._glm5next_shadow_active():
+            return
+        self._glm5next_shadow_scorer()
+        step_no = self._glm5next_shadow_step_no
+        self._glm5next_shadow_step_no = step_no + 1
+        record = Glm5NextShadowStep(step_no, step, drafts)
+        if getattr(self, "use_async_scheduling", False):
+            self._glm5next_shadow_inflight = record
+        else:
+            self._glm5next_shadow_commit(record, sampled)
+
+    def _glm5next_shadow_claim(self):
+        """The step just observed, for the async output ``sample_tokens`` is building.
+
+        Called once per output object, from its constructor, so a step rides with exactly
+        the output whose ids it is scored from. ``None`` with the knob off, for a synthetic
+        step, or on a synchronous runner (which scored the step already).
+        """
+        record = getattr(self, "_glm5next_shadow_inflight", None)
+        self._glm5next_shadow_inflight = None
+        return record
+
+    def _glm5next_shadow_commit(self, record: Glm5NextShadowStep, sampled) -> None:
+        """Score one step from its ids on the host, in dispatch order.
+
+        ``sampled`` is a host tensor (a synchronous runner), ``get_output``'s
+        ``list[list[int]]`` rows (one id per row: the shadow runs without speculative
+        decoding), or ``None`` for an intermediate prefill chunk drained without ids. The
+        draft tensor is read here, after the sampled ids of the same execution, on the
+        same thread. Outputs may be materialized out of dispatch order (the worker's
+        fallback path takes the newest first); a step whose predecessors are still in
+        flight waits in ``_glm5next_shadow_ready`` until they are scored.
+        """
+        ids = self._glm5next_shadow_ids(sampled)
+        rows = None
+        if ids is not None and record.drafts is not None:
+            drafts = record.drafts
+            draft_tensor = drafts.cpu() if torch.is_tensor(drafts) else torch.as_tensor(drafts)
+            rows = draft_tensor.reshape(draft_tensor.shape[0], -1).tolist()
+        lock = getattr(self, "_glm5next_shadow_lock", None)
+        if lock is None:
+            return
+        with lock:
+            scorer = getattr(self, "_glm5next_shadow_scorer_instance", None)
+            if scorer is None:
+                return  # shut down already: the log is closed
+            self._glm5next_shadow_ready[record.step_no] = (record.step, ids, rows)
+            self._glm5next_shadow_drain(scorer)
+
+    def _glm5next_shadow_ids(self, sampled):
+        """The sampled id per batch row from what was read back, or ``None`` to score nothing."""
+        if sampled is None:
+            return None
+        if torch.is_tensor(sampled):
+            if sampled.is_floating_point():
+                if not getattr(self, "_glm5next_shadow_warned_logits", False):
+                    self._glm5next_shadow_warned_logits = True
+                    logger.warning(
+                        "shadow draft: the graph returned logits, not sampled ids; scoring "
+                        "needs on-device sampling (VLLM_NEURON_GLM5NEXT_ON_DEVICE_SAMPLING=1) "
+                        "and is skipped"
+                    )
+                return None
+            return sampled.reshape(-1).tolist()
+        return [row[0] if row else None for row in sampled]
+
+    def _glm5next_shadow_drain(self, scorer: Glm5NextShadowDraftScorer) -> None:
+        """Score every ready step from the next expected one on; caller holds the lock."""
+        ready = self._glm5next_shadow_ready
+        while self._glm5next_shadow_next_step in ready:
+            step_no = self._glm5next_shadow_next_step
+            step, ids, rows = ready.pop(step_no)
+            self._glm5next_shadow_next_step = step_no + 1
+            present = {req_id for req_id in step["request_ids"] if req_id is not None}
+            if ids is not None:
+                for row, (req_id, final, position) in enumerate(
+                    zip(step["request_ids"], step["finals"], step["positions"])
+                ):
+                    if req_id is None or row >= len(ids) or ids[row] is None:
+                        continue
+                    if step["is_prefill"] and not final:
+                        # An intermediate chunk's sampled id is not a token of the sequence.
+                        continue
+                    candidate = None
+                    if rows is not None and row < len(rows) and any(value >= 0 for value in rows[row]):
+                        candidate = rows[row]
+                    scorer.observe(
+                        req_id,
+                        step=step_no,
+                        position=position,
+                        sampled=ids[row],
+                        drafts=candidate,
+                        row=row,
+                    )
+            scorer.retire_absent(present)
