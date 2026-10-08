@@ -251,15 +251,16 @@ def test_the_recurrent_carriers_start_the_next_step_from_the_accepted_row(monkey
     geometry (``state_checkpoints = T``) and each request's accepted draft count from
     the verify step before it (0 after a prefill), which the per-step state hook
     learned from the sampled ids; a bucket padding row starts from row 0."""
-    # worker-57's commit is not in this tree; the hook's call is recorded, its return
-    # (the row each request resumes from) shaped as the contract says.
+    # The hook's commit is recorded, not run: this world's recurrent banks are the plain
+    # ``[slots, ...]`` ones (no checkpoint axis), which the real ``commit_kda_checkpoints``
+    # refuses by shape; the hook test commits through the real function on ``T``-row banks.
     commits = []
 
     def commit(banks, slot_ids, kept_counts, *, state_checkpoints):
         commits.append((list(slot_ids), list(kept_counts), int(state_checkpoints)))
         return torch.tensor([int(count) - 1 for count in kept_counts], dtype=torch.int32)
 
-    monkeypatch.setattr(fused_decode, "commit_kda_checkpoints", commit, raising=False)
+    monkeypatch.setattr(fused_decode, "commit_kda_checkpoints", commit)
     world = kda._world(2)
     runner = world.runner
     _mtp_server(runner)

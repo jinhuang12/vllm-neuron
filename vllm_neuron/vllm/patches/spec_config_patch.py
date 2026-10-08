@@ -9,7 +9,7 @@ resolves that method in ``__post_init__``: the draft model is the target
 checkpoint, loaded a second time as a ``ModelConfig`` with
 ``hf_overrides=SpeculativeConfig.hf_config_override``, and the method is then
 confirmed only if the draft's ``hf_config.model_type`` is in the module-global
-``MTPModelTypes`` list; anything else raises ``NotImplementedError("Unsupported
+``MTPModelTypes`` ``Literal``; anything else raises ``NotImplementedError("Unsupported
 speculative method: 'mtp'")``. Upstream's override has a branch per known MTP
 family (``Glm4MoeForCausalLM`` -> ``glm4_moe_mtp`` and so on) and none for
 ``Glm5NextForConditionalGeneration``, so the GLM-5.3-Flash draft keeps
@@ -18,8 +18,9 @@ family (``Glm4MoeForCausalLM`` -> ``glm4_moe_mtp`` and so on) and none for
 This patch adds that one family the way upstream adds its own:
 
 * ``MTPModelTypes`` gains :data:`GLM5_NEXT_MTP_MODEL_TYPE`. Rebinding the module
-  attribute suffices: the one call site is ``get_args(MTPModelTypes)`` inside the
-  target module itself, a module-global lookup at call time. The derived
+  attribute suffices: both readers, ``get_args(MTPModelTypes)`` in ``__post_init__``
+  and the one in the method check, are inside the target module and look the
+  global up at call time. The derived
   ``Literal`` aliases upstream builds at import (``EagleModelTypes``,
   ``SpeculativeMethod``) are typing annotations only and are left as they are.
 * ``SpeculativeConfig.hf_config_override`` is wrapped: upstream's override runs

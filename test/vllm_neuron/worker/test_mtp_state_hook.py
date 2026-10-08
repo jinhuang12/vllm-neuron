@@ -72,14 +72,16 @@ def _hook(runner, rows):
 
 @pytest.fixture
 def commit(monkeypatch):
-    """worker-57's commit, recorded: returns the row each request resumes from."""
+    """The KDA commit, called through and recorded (the hook imports it by name at call
+    time, so the recording wrapper is what it reaches)."""
     calls = []
+    real = fused_decode.commit_kda_checkpoints
 
-    def fake(banks, slot_ids, accepted_counts, *, state_checkpoints):
+    def recording(banks, slot_ids, accepted_counts, *, state_checkpoints):
         calls.append((list(banks), list(slot_ids), list(accepted_counts), int(state_checkpoints)))
-        return torch.tensor([int(count) - 1 for count in accepted_counts], dtype=torch.int32)
+        return real(banks, slot_ids, accepted_counts, state_checkpoints=state_checkpoints)
 
-    monkeypatch.setattr(fused_decode, "commit_kda_checkpoints", fake, raising=False)
+    monkeypatch.setattr(fused_decode, "commit_kda_checkpoints", recording)
     return calls
 
 

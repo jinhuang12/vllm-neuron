@@ -61,6 +61,19 @@ class MtpProposer:
         device: torch.device,
         on_device_sampling: bool = True,
     ):
+        """Fix ``k`` from the speculative config; refuse by name what this proposer cannot serve.
+
+        Args:
+            vllm_config: the engine config; ``speculative_config.method`` must be "mtp".
+            device: where the drafts the root returns live.
+            on_device_sampling: the runner's sampling mode; the verify step samples and
+                drafts inside the target graph, so a host sampler is refused.
+
+        Raises:
+            ValueError: method other than "mtp", host sampling, or async scheduling
+                (the accepted count would reach the host one step late; the async
+                series lifts this).
+        """
         self.vllm_config = vllm_config
         self.speculative_config = vllm_config.speculative_config
         if self.speculative_config is None or self.speculative_config.method != "mtp":

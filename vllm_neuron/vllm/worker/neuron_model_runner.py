@@ -652,7 +652,6 @@ class Glm5NextShadowDraftScorer:
         self._pending[req_id] = keep
 
 
-# TODO: Inherit from LoRAModelRunnerMixin to support LoRA
 def _eagle_drafter_has_its_own_model(speculative_config) -> bool:
     """True when the configured drafter is an eagle model of its own, with KV layers to bind.
 
@@ -668,6 +667,7 @@ def _eagle_drafter_has_its_own_model(speculative_config) -> bool:
     )
 
 
+# TODO: Inherit from LoRAModelRunnerMixin to support LoRA
 class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunnerMixin):
     """
     Model runner that executes the NeuronModel with proper state management.
@@ -6307,7 +6307,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 # on the bank) hands a prefill the one-row carrier ``bank[slot, 0]`` -- a
                 # prefill writes row 0 -- and a decode the slot's rows whole. A plain
                 # bank's record carries no ``state_checkpoints`` key (absent = 1, the
-                # Stage-A record, team-lead ruling) and hands ``bank[slot]`` on both legs.
+                # Stage-A record) and hands ``bank[slot]`` on both legs.
                 prefill_row = bool(is_prefill) and int(bank.get("state_checkpoints", 1)) > 1
 
                 def state_view(key, one_slot):
