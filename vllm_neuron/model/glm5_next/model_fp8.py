@@ -9552,8 +9552,14 @@ class Glm5NextForConditionalGeneration(nn.Module):
             ValueError: the spec and the stack plus the draft head's layer disagree on
                 how many layers there are, a layer's spec name is absent from
                 ``kv_caches``, a bank's shape disagrees with the spec that asked for
-                it, a layer reports part of its recurrent geometry, or a latent bank
+                it, a layer reports part of its recurrent geometry, a layer's two
+                state banks disagree on their checkpoint rows, or a latent bank
                 declares more than one KV head.
+
+        A linear-attention record carries ``state_checkpoints``: the state rows one
+        slot holds, ``1 + k`` when the runner carved ``[slots, 1 + k, ...]`` banks for
+        a speculative server and ``1`` on a plain bank -- bind is the one place that
+        reads the axis, so the carrier translator asks the record, not the config.
         """
         spec_layers = self.get_kv_spec().layers
         stack = len(self.model.layers)
@@ -9592,18 +9598,34 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     "layer_index": layer_idx,
                     "family": "linear_attn",
                 }
+                checkpoint_rows: dict[str, int] = {}
                 for key, tensor, want in (
                     ("conv_state", tensors[0], recurrent[0]),
                     ("recurrent_state", tensors[1], recurrent[1]),
                 ):
-                    if tuple(tensor.shape[1:]) != tuple(want):
+                    shape, want = tuple(tensor.shape[1:]), tuple(want)
+                    if shape == want:
+                        checkpoint_rows[key] = 1
+                    elif shape[1:] == want:
+                        checkpoint_rows[key] = int(shape[0])
+                    else:
+                        per_slot = ", ".join(str(v) for v in want)
                         raise ValueError(
                             f"KV layer '{name}' has a {key} bank of "
                             f"{tuple(tensor.shape)}; the spec asked for one "
-                            f"{tuple(want)} state per slot, so the bank must be "
-                            f"[slots, {', '.join(str(v) for v in want)}]"
+                            f"{want} state per slot, so the bank must be "
+                            f"[slots, {per_slot}] or, with 1 + k checkpoint rows per "
+                            f"slot, [slots, 1 + k, {per_slot}]"
                         )
                     record[key] = tensor
+                if checkpoint_rows["conv_state"] != checkpoint_rows["recurrent_state"]:
+                    raise ValueError(
+                        f"KV layer '{name}' has {checkpoint_rows['conv_state']} checkpoint "
+                        f"row(s) per conv_state slot against "
+                        f"{checkpoint_rows['recurrent_state']} per recurrent_state slot; the "
+                        f"two states of one request hold the same 1 + k rows"
+                    )
+                record["state_checkpoints"] = checkpoint_rows["conv_state"]
                 if int(tensors[0].shape[0]) != int(tensors[1].shape[0]):
                     raise ValueError(
                         f"KV layer '{name}' has {int(tensors[0].shape[0])} "

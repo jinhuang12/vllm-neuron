@@ -118,3 +118,59 @@ def test_the_slot_bytes_hold_every_checkpoint_row(drafts):
                                checkpoints=1 + drafts)
     for bank, shape in zip(banks, SHAPES, strict=True):
         assert tuple(bank.shape) == ((SLOTS, 1 + drafts, *shape) if drafts else (SLOTS, *shape))
+
+
+def _bind(conv_bank: torch.Tensor, rec_bank: torch.Tensor) -> dict:
+    """Run the real ``bind_kv_cache`` on one linear-attention layer's two banks.
+
+    The model object is a bare instance: ``bind_kv_cache`` reads only the spec's
+    layer list, the stack length and the draft head, and leaves the bank records on
+    ``glm5next_layer_banks``.
+    """
+    from types import SimpleNamespace
+
+    from vllm_neuron.model.glm5_next.model_fp8 import Glm5NextForConditionalGeneration
+
+    model = Glm5NextForConditionalGeneration.__new__(Glm5NextForConditionalGeneration)
+    layer = SimpleNamespace(
+        name="layers.0", kda_conv_state_shape=SHAPES[0], kda_recurrent_state_shape=SHAPES[1]
+    )
+    model.get_kv_spec = lambda: SimpleNamespace(layers=[layer])
+    model.model = SimpleNamespace(layers=[object()])
+    model.mtp = None
+    model.bind_kv_cache({"layers.0": [conv_bank, rec_bank]})
+    (record,) = model.glm5next_layer_banks
+    return record
+
+
+@pytest.mark.parametrize("checkpoints", (1, 2, 4))  # plain, k = 1, k = 3
+def test_bind_kv_cache_records_the_checkpoint_rows_of_a_slot(checkpoints):
+    """The runner carves ``[slots, 1 + k, ...]`` banks on a speculative server and
+    hands them to ``bind_kv_cache``; bind must keep them and record ``1 + k`` as
+    ``state_checkpoints`` (``1`` on a plain ``[slots, ...]`` bank), the field the
+    runner's carrier translator reads to hand a prefill the one-row ``bank[slot, 0]``."""
+    raw = torch.zeros(_slot_bytes(checkpoints) * SLOTS, dtype=torch.uint8)
+    conv_bank, rec_bank = state_bank_regions(
+        raw, SHAPES, DTYPES, slot_bytes=_slot_bytes(checkpoints), checkpoints=checkpoints
+    )
+    record = _bind(conv_bank, rec_bank)
+    assert record["family"] == "linear_attn"
+    assert record["conv_state"] is conv_bank and record["recurrent_state"] is rec_bank
+    assert record["state_slots"] == SLOTS
+    assert int(record["state_checkpoints"]) == checkpoints
+    if checkpoints > 1:
+        assert tuple(record["conv_state"].shape) == (SLOTS, checkpoints, *SHAPES[0])
+
+
+def test_bind_kv_cache_refuses_banks_whose_checkpoint_rows_disagree():
+    """Conv and recurrent banks of one layer carry the same ``1 + k``; a pair that
+    disagrees is refused by name, not bound."""
+    raw_two = torch.zeros(_slot_bytes(2) * SLOTS, dtype=torch.uint8)
+    raw_four = torch.zeros(_slot_bytes(4) * SLOTS, dtype=torch.uint8)
+    conv_two, _ = state_bank_regions(raw_two, SHAPES, DTYPES, slot_bytes=_slot_bytes(2), checkpoints=2)
+    _, rec_four = state_bank_regions(raw_four, SHAPES, DTYPES, slot_bytes=_slot_bytes(4), checkpoints=4)
+    with pytest.raises(
+        ValueError,
+        match=r"2 checkpoint row\(s\) per conv_state slot against 4 per recurrent_state slot",
+    ):
+        _bind(conv_two, rec_four)
