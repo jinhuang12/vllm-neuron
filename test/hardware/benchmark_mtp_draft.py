@@ -205,8 +205,35 @@ def materialise_moe(mlp, cfg, seed: int, device) -> None:
         ((torch.rand(EXPERTS, generator=gen) - 0.5) * 0.1).to(device), requires_grad=False)
 
 
-def build_head(cfg, seed: int, device):
-    """The head under test: layer 45 with a real-shape attention half and this rank's MoE share."""
+class _LayerInputGatherEmulation:
+    """Stands in for the tensor-parallel group at one rank when the head runs the served
+    rank's ``eh_proj`` row shard (``--eh-proj-world``).
+
+    ``all_gather`` of the layer-input slice ``[B, H / world]`` tiles it ``world`` times to
+    ``[B, H]`` -- the bytes and shapes of the served rank's work without the collective
+    (the real 8 KiB per-rank all-gather is the TP=64 gate's to measure); the drafted ids
+    are therefore a timing proxy, not the model's. Any other tensor (the draft token's
+    ``[B, 2]`` pair) passes through unchanged, and the object carries no ``world_size``,
+    so ``draft_token_ids`` keeps its one-rank form (the owner select over 64 pairs is O(B)
+    bookkeeping, exempt-but-listed in the report).
+    """
+
+    def __init__(self, world: int, hidden: int) -> None:
+        self.world, self.hidden = int(world), int(hidden)
+
+    def all_gather(self, x: torch.Tensor, dim: int) -> torch.Tensor:
+        if int(x.shape[dim]) * self.world == self.hidden:
+            return torch.cat([x] * self.world, dim=dim)
+        return x
+
+
+def build_head(cfg, seed: int, device, eh_proj_world: int = 1, eh_proj_rank: int = 0):
+    """The head under test: layer 45 with a real-shape attention half and this rank's MoE share.
+
+    ``eh_proj_world`` > 1 gives the head the served rank's ``[H / world, 2H]`` row shard of
+    ``eh_proj`` (rank ``eh_proj_rank``'s rows) and the gather emulation above; the block
+    itself stays the one-rank build (its own collectives are not the question here).
+    """
     tables = head_tables(cfg, seed, device)
     head = mtp.Glm5NextMultiTokenPredictor(
         cfg,
@@ -217,6 +244,16 @@ def build_head(cfg, seed: int, device):
     )
     for name in mtp.HEAD_PARAMETER_NAMES:
         setattr(head, name, torch.nn.Parameter(tables[name].clone(), requires_grad=False))
+    if eh_proj_world > 1:
+        from vllm_neuron.functional.mtp.tail_in import eh_proj_shard_rows
+        hidden = int(cfg.hidden_size)
+        rows = eh_proj_shard_rows(hidden, eh_proj_world)  # refuses a world that does not divide H
+        if not 0 <= eh_proj_rank < eh_proj_world:
+            raise ValueError(f"eh_proj_rank {eh_proj_rank} outside world {eh_proj_world}")
+        shard = tables["eh_proj_weight"][eh_proj_rank * rows:(eh_proj_rank + 1) * rows].contiguous()
+        head.eh_proj_weight = torch.nn.Parameter(shard.clone(), requires_grad=False)
+        head.world_size = int(eh_proj_world)
+        head._tp_group = lambda: _LayerInputGatherEmulation(eh_proj_world, hidden)
     block = head.block
     gen = torch.Generator().manual_seed(seed + 1)
     hidden = int(cfg.hidden_size)
@@ -288,7 +325,7 @@ def run_null(args, cfg, device) -> dict:
 
 def run_k(k: int, args, cfg, qc, device) -> dict:
     torch._dynamo.reset()
-    head = build_head(cfg, args.seed, device)
+    head = build_head(cfg, args.seed, device, args.eh_proj_world, args.eh_proj_rank)
     inputs = step_inputs(cfg, args.seed + 11, device)
     carrier, statics = block_operands(cfg, args.seed + 99, device)
     step = make_step(head, qc, k, statics)
@@ -312,7 +349,11 @@ def run_k(k: int, args, cfg, qc, device) -> dict:
         "max_seq_len": MAX_SEQ_LEN, "first_call_s": first_call_s,
         "ids": ids.tolist(), "margin_share": margins,
         "hidden_rows": hiddens.reshape(k, -1).float().tolist(),
-        "unit": f"one fused draft of k={k} iterations (layer 45 attention + MoE halves, head, token) for 1 request",
+        "eh_proj_rows": int(head.eh_proj_weight.shape[0]),
+        "eh_proj_world": args.eh_proj_world,
+        "unit": f"one fused draft of k={k} iterations (layer 45 attention + MoE halves, head, token) for 1 request"
+                + (f"; eh_proj as the served rank's {int(head.eh_proj_weight.shape[0])}-row shard with the layer-input "
+                   f"gather emulated by tiling (timing proxy: ids are not the model's)" if args.eh_proj_world > 1 else ""),
     }
     if args.mode == "device":
         result["timing"] = measure(fn, operands, args.warmup, args.iterations)
@@ -464,6 +505,10 @@ def main() -> None:
     parser.add_argument("--hidden", type=int, default=4096)
     parser.add_argument("--q-lora", type=int, default=1536)
     parser.add_argument("--seed", type=int, default=7_000)
+    parser.add_argument("--eh-proj-world", type=int, default=1,
+                        help="run the fused chain with the served rank's eh_proj row shard [H/world, 2H] and a tiled "
+                             "stand-in for the layer-input all-gather (timing proxy, see _LayerInputGatherEmulation)")
+    parser.add_argument("--eh-proj-rank", type=int, default=0, help="which rank's eh_proj rows the shard holds")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=50)
     parser.add_argument("--output", type=Path)
