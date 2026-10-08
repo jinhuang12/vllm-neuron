@@ -17,12 +17,6 @@ the candidate axis in chunks of at most 128 tiles. Two claims are checked here:
 
 from __future__ import annotations
 
-import importlib.util
-import subprocess
-import sys
-import tempfile
-from pathlib import Path
-
 import pytest
 import torch
 
@@ -32,6 +26,7 @@ from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 from test.vllm_neuron.functional.dsa.test_decode_batch import SCORE_ATOL, SCORE_RTOL
+from test.vllm_neuron.functional.reference_at_commit import load_reference, needs_reference
 
 _CONFIG = Glm5NextTextConfig()
 #: GLM-5.3-Flash's indexer: tokens per candidate pool, key width and query heads.
@@ -46,27 +41,15 @@ UNCHUNKED_COMMIT = "b17526a"
 OLD_MAX = DB.CHUNK_CANDIDATES
 
 
-def _load_base_module():
-    """The unchunked decode_batch.py as a module of its own, from ``git show``."""
-    root = Path(DB.__file__).resolve().parents[3]
-    shown = subprocess.run(
-        ["git", "-C", str(root), "show",
-         f"{UNCHUNKED_COMMIT}:vllm_neuron/functional/dsa/decode_batch.py"],
-        capture_output=True)
-    if shown.returncode != 0:
-        pytest.skip(f"commit {UNCHUNKED_COMMIT} is not in this checkout")
-    path = Path(tempfile.mkdtemp(prefix="decode_batch_unchunked_")) / "decode_batch_unchunked.py"
-    path.write_bytes(shown.stdout)
-    spec = importlib.util.spec_from_file_location("decode_batch_unchunked", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+#: The reference file at :data:`UNCHUNKED_COMMIT`.
+UNCHUNKED_PATH = "vllm_neuron/functional/dsa/decode_batch.py"
+#: The bit-equality tests need the unchunked kernel from git; without it they skip, and say why.
+needs_unchunked = needs_reference(UNCHUNKED_COMMIT, UNCHUNKED_PATH)
 
 
 @pytest.fixture(scope="module")
 def base():
-    return _load_base_module()
+    return load_reference(UNCHUNKED_COMMIT, UNCHUNKED_PATH, "decode_batch_unchunked")
 
 
 @pytest.fixture(autouse=True)
@@ -110,10 +93,12 @@ def _served_programs(monkeypatch, lnc):
         monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", lnc)
 
 
+@needs_unchunked
 def test_one_chunk_is_the_old_widest_axis(base):
     assert OLD_MAX == base.MAX_CANDIDATES == DB.CHUNK_TILES * DB.PARTITIONS
 
 
+@needs_unchunked
 @pytest.mark.parametrize("lnc", [None, "2"])
 @pytest.mark.parametrize("batch", [1, 4])
 @pytest.mark.parametrize("candidates", [512, 2048, OLD_MAX])
@@ -163,6 +148,7 @@ def test_chunked_kernel_matches_the_oracle_past_the_old_cap(monkeypatch, batch,
                                    atol=SCORE_ATOL)
 
 
+@needs_unchunked
 def test_the_old_kernel_refused_what_the_chunked_one_serves(base):
     candidates = OLD_MAX + 1
     case = _case(1, seed=2, candidates=candidates, lengths=[candidates * POOL])

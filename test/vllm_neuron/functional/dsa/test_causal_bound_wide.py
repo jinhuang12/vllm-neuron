@@ -15,13 +15,8 @@ simulator:
 
 from __future__ import annotations
 
-import importlib.util
 import inspect
 import re
-import subprocess
-import sys
-import tempfile
-from pathlib import Path
 
 import pytest
 import torch
@@ -29,6 +24,8 @@ import torch
 from vllm_neuron.functional.dsa import causal_bound as CB
 from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
 from vllm_neuron.utils.neuron_utils import SBUF_BYTES_PER_PARTITION, can_run_kernel
+
+from test.vllm_neuron.functional.reference_at_commit import load_reference, needs_reference
 
 #: The last commit whose bound holds a whole candidate row: the bit-equality reference.
 UNTILED_COMMIT = "b17526a"
@@ -39,26 +36,15 @@ POOL = Glm5NextTextConfig().index_kpool
 UNTILED_WIDTH_MAX = 16384
 
 
-def _load_base_module():
-    root = Path(CB.__file__).resolve().parents[3]
-    shown = subprocess.run(
-        ["git", "-C", str(root), "show",
-         f"{UNTILED_COMMIT}:vllm_neuron/functional/dsa/causal_bound.py"],
-        capture_output=True)
-    if shown.returncode != 0:
-        pytest.skip(f"commit {UNTILED_COMMIT} is not in this checkout")
-    path = Path(tempfile.mkdtemp(prefix="causal_bound_untiled_")) / "causal_bound_untiled.py"
-    path.write_bytes(shown.stdout)
-    spec = importlib.util.spec_from_file_location("causal_bound_untiled", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+#: The reference file at :data:`UNTILED_COMMIT`.
+UNTILED_PATH = "vllm_neuron/functional/dsa/causal_bound.py"
+#: The bit-equality tests need the untiled bound from git; without it they skip, and say why.
+needs_untiled = needs_reference(UNTILED_COMMIT, UNTILED_PATH)
 
 
 @pytest.fixture(scope="module")
 def base():
-    return _load_base_module()
+    return load_reference(UNTILED_COMMIT, UNTILED_PATH, "causal_bound_untiled")
 
 
 @pytest.fixture(autouse=True)
@@ -97,6 +83,7 @@ def test_the_bytes_per_column_are_the_kernels_column_tiles():
     assert sum(itemsize[t] for t in tiles) == CB._BOUND_BYTES_PER_COLUMN
 
 
+@needs_untiled
 @pytest.mark.parametrize("rows", [1, 130])
 @pytest.mark.parametrize("width", [512, 2048, 8192, UNTILED_WIDTH_MAX])
 def test_column_tiles_equal_the_untiled_kernel_bit_for_bit(base, rows, width):

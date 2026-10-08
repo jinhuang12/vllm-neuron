@@ -19,12 +19,7 @@ simulator:
 
 from __future__ import annotations
 
-import importlib.util
 import inspect
-import subprocess
-import sys
-import tempfile
-from pathlib import Path
 
 import pytest
 import torch
@@ -43,6 +38,7 @@ from test.vllm_neuron.functional.moe.test_router_token_axis import (
     build_hidden,
     set_equal_rows,
 )
+from test.vllm_neuron.functional.reference_at_commit import load_reference, needs_reference
 
 #: The last commit whose router runs every chunk as one launch: the bit-equality reference.
 ONE_LAUNCH_COMMIT = "b17526a"
@@ -51,26 +47,15 @@ ONE_LAUNCH_COMMIT = "b17526a"
 TILE = seam.noaux_tc_token_tile(TINY_H, torch.bfloat16)
 
 
-def _load_one_launch_module():
-    root = Path(seam.__file__).resolve().parents[3]
-    shown = subprocess.run(
-        ["git", "-C", str(root), "show",
-         f"{ONE_LAUNCH_COMMIT}:vllm_neuron/functional/moe/router.py"],
-        capture_output=True)
-    if shown.returncode != 0:
-        pytest.skip(f"commit {ONE_LAUNCH_COMMIT} is not in this checkout")
-    path = Path(tempfile.mkdtemp(prefix="router_one_launch_")) / "router_one_launch.py"
-    path.write_bytes(shown.stdout)
-    spec = importlib.util.spec_from_file_location("router_one_launch", path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+#: The reference file at :data:`ONE_LAUNCH_COMMIT`.
+ONE_LAUNCH_PATH = "vllm_neuron/functional/moe/router.py"
+#: The bit-equality tests need the one-launch router from git; without it they skip, and say why.
+needs_one_launch = needs_reference(ONE_LAUNCH_COMMIT, ONE_LAUNCH_PATH)
 
 
 @pytest.fixture(scope="module")
 def base():
-    return _load_one_launch_module()
+    return load_reference(ONE_LAUNCH_COMMIT, ONE_LAUNCH_PATH, "router_one_launch")
 
 
 def _route(entry, tokens: int):
@@ -118,6 +103,7 @@ def test_a_hidden_size_too_wide_for_one_multiple_raises():
         seam.noaux_tc_token_tile(hidden, torch.bfloat16)
 
 
+@needs_one_launch
 @pytest.mark.parametrize("tokens", [
     TILE + 300,        # two launches, the second partial
     2 * TILE + 1,      # three launches, the last one 256 rows
