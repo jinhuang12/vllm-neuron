@@ -3,9 +3,12 @@
 
 Times :func:`kda_intra_chunk` (stages 1 to 3), :func:`kda_inter_chunk` (stages 4
 and 5) and the two chained, intra-chunk outputs into the inter-chunk call as a
-prefill layer runs them, at the served prefill shapes ``[NC, C, K] = [128, 8, 128]``
-(a 1024-token chunk) and ``[256, 8, 128]`` (a 2048-token chunk). The variants are
-the baseline revision, this checkout and any ``--variant NAME=REV``.
+prefill layer runs them, at the served prefill sizes, 512, 1024 and 2048 tokens per
+call. The variants are the baseline revision, this checkout and any
+``--variant NAME=REV``. Each variant runs at the chunk width ``C`` the KDA layer
+resolves when it runs that variant's kernels, so its call shape is
+``[NC, C, K] = [tokens / C, C, 128]``: ``[128, 8, 128]`` for a 1024-token call at
+``C = 8`` and ``[64, 16, 128]`` at ``C = 16``.
 
 A revision's variant is its ``chunked_recurrence.py`` plus every module of the
 KDA package it imports, at any depth, read with ``git show``. Those modules
@@ -32,14 +35,17 @@ floor is the largest per-call spread over every kernel and variant, i.e. how far
 one variant's own per-call figure moves between repetitions in this run; the
 graphs' own spreads, the floor graph's included, are reported beside it.
 
-Numerics. For each ``--seeds`` entry and each shape, one-call graphs of every
-variant run on the same operands; the outputs are saved as ``.pt`` files under
-``--numerics-dir`` and compared with ``torch.equal`` against the baseline and
-against the CPU references (:func:`kda_intra_chunk_torch_oracle`,
+Numerics. For each ``--seeds`` entry, each ``--gates`` draw and each size,
+one-call graphs of every variant run on operands drawn per token, so every chunk
+width sees the same flat sequence. The outputs are saved as ``.pt`` files under
+``--numerics-dir`` and compared with ``torch.equal`` against the baseline where
+the two run at the same chunk width, and against the CPU references at the
+variant's own width (:func:`kda_intra_chunk_torch_oracle`,
 :func:`rebuild_i_plus_a`, :func:`kda_inter_chunk_torch_oracle`). The inter-chunk
 operands are the CPU reference's intra-chunk outputs, so every variant's
-inter-chunk kernel reads identical bits; the chained graph reads each variant's
-own intra-chunk outputs.
+inter-chunk kernel reads identical bits at one width; the chained graph reads each
+variant's own intra-chunk outputs. The inter-chunk and chained outputs are also
+compared, across widths, with a float64 sequential scan of the flat sequence.
 
 The compiled-kernel cache keys a kernel on its own source text, not on the
 helpers or constants it emits through, so a warm cache can serve a kernel built
@@ -96,13 +102,13 @@ BASELINE_REV = "f3a833f"
 BASELINE = "baseline"
 CHECKOUT = "checkout"
 
-#: Chunks per call at the two served prefill chunk sizes, 1024 and 2048 tokens.
-SERVED_N_CHUNKS = (128, 256)
+#: Tokens per call at the served prefill chunk sizes: 512 (the 256k-context line),
+#: 1024 (the short-context line) and 2048 (the 64k-context line).
+SERVED_PREFILL_TOKENS = (512, 1024, 2048)
 
-#: The chunk width the KDA layer resolves, and the per-rank key and value widths
-#: at TP=64 (one head per rank). ``test_chunked_recurrence`` reads the same three
-#: values off the layer.
-SERVED_CHUNK = 8
+#: The per-rank key and value widths at TP=64 (one head per rank), which
+#: ``test_chunked_recurrence`` reads off the layer too. The chunk width is not a
+#: constant here: :func:`layer_chunk` asks the layer, per variant.
 SERVED_KDIM = 128
 SERVED_VDIM = 128
 
@@ -112,6 +118,12 @@ KDA_LAYERS = 34
 #: The checkpoint's gate lower bound: each per-token log gate lies in
 #: ``(GATE_LOWER_BOUND, 0)``, as the gate clamp produces it.
 GATE_LOWER_BOUND = -5.0
+
+#: The gate draws the numerics run: ``served`` spreads each log gate over
+#: ``(GATE_LOWER_BOUND, 0)`` as the timing operands do; ``bound`` puts every entry
+#: at ``GATE_LOWER_BOUND``, the largest chunk-local cumulative gate the layer can
+#: send at its chunk width.
+GATES = ("served", "bound")
 
 #: The timed and checked graphs: the two entry points and the two chained.
 KERNELS = ("intra", "inter", "chain")
@@ -206,6 +218,7 @@ class Variant:
     rev: str
     module: ModuleType
     sha256: dict[str, str]
+    chunk: int
 
 
 def load_revision(name: str, rev: str, workdir: Path) -> Variant:
@@ -255,29 +268,64 @@ def load_revision(name: str, rev: str, workdir: Path) -> Variant:
     return Variant(
         name=name, rev=rev, module=modules[KERNEL_LEAF],
         sha256={leaf: hashlib.sha256(s.encode()).hexdigest() for leaf, s in sources.items()},
+        chunk=layer_chunk(modules[KERNEL_LEAF]),
     )
 
 
 def checkout_variant() -> Variant:
     path = Path(live.__file__)
     return Variant(name=CHECKOUT, rev="checkout", module=live,
-                   sha256={KERNEL_LEAF: hashlib.sha256(path.read_bytes()).hexdigest()})
+                   sha256={KERNEL_LEAF: hashlib.sha256(path.read_bytes()).hexdigest()},
+                   chunk=layer_chunk(live))
 
 
-def make_inputs(n_chunks: int, seed: int) -> dict:
-    """One call's operands for every graph, as CPU float32 tensors.
+def layer_chunk(module: ModuleType) -> int:
+    """The chunk width the KDA layer resolves when ``module`` is its kernel module.
 
-    The intra-chunk operands are drawn; the inter-chunk operands are the CPU
-    reference's intra-chunk outputs on them, plus an entering state.
+    The layer derives the width (``_resolve_chunk_size``) from the kernel module's
+    gate limit, which it imports by package name when it resolves, so it is asked
+    with ``module`` bound to that name. Its gate lower bound must be the one this
+    benchmark draws gates from, or the width would be for other inputs.
+    """
+    from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
+    from vllm_neuron.model.glm5_next.model_fp8 import Glm5NextKDAAttention
+
+    layer = Glm5NextKDAAttention(Glm5NextTextConfig(), world_size=1)
+    if layer.gate_lower_bound != GATE_LOWER_BOUND:
+        raise ValueError(f"the layer's gate lower bound is {layer.gate_lower_bound}, "
+                         f"not the {GATE_LOWER_BOUND} the operands are drawn from")
+    with bound({KERNEL_LEAF: module}):
+        return int(layer._resolve_chunk_size(None))
+
+
+def flat_inputs(tokens: int, seed: int, gate: str = "served") -> tuple:
+    """One call's flat operands, ``[T, *]``, and an entering state ``[V, K]``.
+
+    Drawn per token, so every chunk width regroups the same sequence. ``gate`` is
+    one of :data:`GATES`; the ``bound`` draw replaces the gate after drawing it, so
+    the other operands are the same for both draws.
     """
     gen = torch.Generator().manual_seed(seed)
-    shape_k = (n_chunks, SERVED_CHUNK, SERVED_KDIM)
-    q = torch.randn(shape_k, generator=gen)
-    k = torch.randn(shape_k, generator=gen)
-    v = torch.randn((n_chunks, SERVED_CHUNK, SERVED_VDIM), generator=gen)
-    beta = torch.sigmoid(torch.randn((n_chunks, SERVED_CHUNK), generator=gen))
-    gk = GATE_LOWER_BOUND * torch.sigmoid(torch.randn(shape_k, generator=gen) * 2)
+    q = torch.randn((tokens, SERVED_KDIM), generator=gen)
+    k = torch.randn((tokens, SERVED_KDIM), generator=gen)
+    v = torch.randn((tokens, SERVED_VDIM), generator=gen)
+    beta = torch.sigmoid(torch.randn(tokens, generator=gen))
+    gk = GATE_LOWER_BOUND * torch.sigmoid(torch.randn((tokens, SERVED_KDIM), generator=gen) * 2)
+    if gate == "bound":
+        gk = torch.full_like(gk, GATE_LOWER_BOUND)
     state = torch.randn((SERVED_VDIM, SERVED_KDIM), generator=gen) * 0.5
+    return q, k, v, beta, gk, state
+
+
+def make_inputs(flat: tuple, chunk: int) -> dict:
+    """One call's operands for every graph at ``chunk``, as CPU float32 tensors.
+
+    The intra-chunk operands are the flat ones regrouped into chunks; the
+    inter-chunk operands are the CPU reference's intra-chunk outputs on them, plus
+    the entering state.
+    """
+    *per_token, state = flat
+    q, k, v, beta, gk = (x.reshape(-1, chunk, *x.shape[1:]).contiguous() for x in per_token)
     ref = live.kda_intra_chunk_torch_oracle(q, k, v, beta, gk)
     return {
         "intra": (q, k, v, beta, gk),
@@ -285,6 +333,26 @@ def make_inputs(n_chunks: int, seed: int) -> dict:
         "chain": (q, k, v, beta, gk, state),
         "intra_reference": ref,
     }
+
+
+def sequential_float64(flat: tuple) -> tuple[torch.Tensor, torch.Tensor]:
+    """The delta rule one token at a time in float64 from the entering state.
+
+    :func:`kda_sequential_torch_oracle`'s steps at float64 and from ``state``
+    rather than zero: no cumulative gate is ever exponentiated, so it is a
+    reference for every chunk width alike. Returns ``(o [T, V], final_state [V, K])``.
+    """
+    q, k, v, beta, gk, state = (x.double() for x in flat)
+    kdim = q.shape[1]
+    qn = q / torch.sqrt((q * q).sum(-1, keepdim=True) + live.L2_NORM_EPS) * kdim**-0.5
+    kn = k / torch.sqrt((k * k).sum(-1, keepdim=True) + live.L2_NORM_EPS)
+    o = torch.empty(q.shape[0], v.shape[1], dtype=torch.float64)
+    for t in range(q.shape[0]):
+        state = state * torch.exp(gk[t]).unsqueeze(0)
+        delta = (v[t] - state @ kn[t]) * beta[t]
+        state = state + torch.outer(delta, kn[t])
+        o[t] = state @ qn[t]
+    return o, state
 
 
 def graph_fn(kernel: str, module, layers: int):
@@ -348,26 +416,36 @@ def summarize_reps(per_rep: list[float]) -> dict:
     }
 
 
-def bench_shape(n_chunks: int, variants: list[Variant], args) -> dict:
-    """Timed graphs for one shape: every kernel of every variant, and the floor."""
+def bench_shape(tokens: int, variants: list[Variant], args) -> dict:
+    """Timed graphs for one call size: every kernel of every variant, and the floor.
+
+    Each variant's graphs take operands at its own chunk width; every width
+    regroups the same flat draws.
+    """
     torch._dynamo.reset()
     layers = args.layers
-    cases = [make_inputs(n_chunks, args.timing_seed + layer) for layer in range(layers)]
-    inputs = {kernel: to_device([t for c in cases for t in c[kernel]]) for kernel in KERNELS}
+    flats = [flat_inputs(tokens, args.timing_seed + layer) for layer in range(layers)]
+    inputs = {}
+    for chunk in sorted({variant.chunk for variant in variants}):
+        cases = [make_inputs(flat, chunk) for flat in flats]
+        for kernel in KERNELS:
+            inputs[(kernel, chunk)] = to_device([t for c in cases for t in c[kernel]])
     graphs = {
         (kernel, variant.name): (compiled(graph_fn(kernel, variant.module, layers)),
-                                 inputs[kernel])
+                                 inputs[(kernel, variant.chunk)])
         for kernel in KERNELS for variant in variants
     }
-    graphs[("floor", "")] = (compiled(floor_graph), inputs["intra"])
+    graphs[("floor", "")] = (compiled(floor_graph), inputs[("intra", variants[0].chunk)])
     label = {key: "floor" if key[0] == "floor" else f"{key[0]}_{key[1]}" for key in graphs}
-    result = {"n_chunks": n_chunks, "layers": layers, "first_call_s": {}}
+    result = {"tokens": tokens, "layers": layers,
+              "chunk": {variant.name: variant.chunk for variant in variants},
+              "first_call_s": {}}
     for key, (model, operands) in graphs.items():
         started = time.perf_counter()
         first = model(*operands)[0].to("cpu")
         result["first_call_s"][label[key]] = time.perf_counter() - started
         if not torch.isfinite(first).all():
-            raise AssertionError(f"{label[key]} at n_chunks={n_chunks} returned non-finite values")
+            raise AssertionError(f"{label[key]} at tokens={tokens} returned non-finite values")
 
     per_rep = {key: [] for key in graphs}
     raw = {label[key]: [] for key in graphs}
@@ -406,61 +484,93 @@ def bench_shape(n_chunks: int, variants: list[Variant], args) -> dict:
     return result
 
 
+def bit_equal_summary(by_field: dict) -> bool | None:
+    """Whether every field of one output compared bit-equal to the baseline's.
+
+    ``None`` when the variant runs at another chunk width than the baseline, so no
+    field was compared bit for bit.
+    """
+    flags = [f["bit_equal_to_baseline"] for f in by_field.values() if "bit_equal_to_baseline" in f]
+    return None if None in flags else all(flags)
+
+
 def tensor_diff(got: torch.Tensor, want: torch.Tensor) -> dict:
     got, want = got.double(), want.double()
     residual = got - want
+    scale = want.abs().max()
     return {
         "max_abs": float(residual.abs().max()),
-        "rel_l2": float(residual.norm() / want.norm().clamp_min(1e-300)),
+        "max_abs_over_scale": float(residual.abs().max() / scale) if scale > 0 else None,
+        "rel_l2": float(residual.norm() / want.norm()) if want.norm() > 0 else None,
         "mismatched_elements": int((got != want).sum()),
     }
 
 
-def numerics_shape(n_chunks: int, variants: list[Variant], args) -> list[dict]:
-    """One-call graphs of every variant on ``--seeds`` operands; outputs saved."""
+def numerics_shape(tokens: int, variants: list[Variant], args) -> list[dict]:
+    """One-call graphs of every variant on ``--seeds`` x ``--gates`` operands; outputs saved."""
     torch._dynamo.reset()
     models = {
         (kernel, variant.name): compiled(graph_fn(kernel, variant.module, 1))
         for kernel in KERNELS for variant in variants
     }
+    baseline = next(variant for variant in variants if variant.name == BASELINE)
     rows = []
-    for seed in args.seeds:
-        case = make_inputs(n_chunks, seed)
-        directory = args.numerics_dir / f"n{n_chunks}" / f"seed{seed}"
-        directory.mkdir(parents=True, exist_ok=True)
-        torch.save({kernel: case[kernel] for kernel in KERNELS}, directory / "inputs.pt")
-        outputs = {}
-        for (kernel, name), model in models.items():
-            got = model(*to_device(case[kernel]))
-            outputs[(kernel, name)] = {f: t.to("cpu") for f, t in zip(FIELDS[kernel], got)}
-            torch.save(outputs[(kernel, name)], directory / f"{kernel}_{name}.pt")
+    for gate in args.gates:
+        for seed in args.seeds:
+            flat = flat_inputs(tokens, seed, gate)
+            cases = {chunk: make_inputs(flat, chunk)
+                     for chunk in sorted({variant.chunk for variant in variants})}
+            directory = args.numerics_dir / f"t{tokens}" / gate / f"seed{seed}"
+            directory.mkdir(parents=True, exist_ok=True)
+            torch.save({"flat": flat, "chunks": {c: {kernel: case[kernel] for kernel in KERNELS}
+                                                 for c, case in cases.items()}},
+                       directory / "inputs.pt")
+            outputs = {}
+            for (kernel, name), model in models.items():
+                chunk = next(v.chunk for v in variants if v.name == name)
+                got = model(*to_device(cases[chunk][kernel]))
+                outputs[(kernel, name)] = {f: t.to("cpu") for f, t in zip(FIELDS[kernel], got)}
+                torch.save(outputs[(kernel, name)], directory / f"{kernel}_{name}.pt")
 
-        _, k, _, beta, gk = case["intra"]
-        inter_ref = live.kda_inter_chunk_torch_oracle(*case["inter"][:6],
-                                                      state=case["inter"][6])
-        reference = {"intra": case["intra_reference"], "inter": inter_ref, "chain": inter_ref}
-        row = {"n_chunks": n_chunks, "seed": seed, "dir": str(directory)}
-        for kernel in KERNELS:
-            baseline = outputs[(kernel, BASELINE)]
-            row[kernel] = {}
-            for variant in variants:
-                got = outputs[(kernel, variant.name)]
-                row[kernel][variant.name] = {
-                    f: {
-                        "bit_equal_to_baseline": bool(torch.equal(got[f], baseline[f])),
-                        "vs_baseline": tensor_diff(got[f], baseline[f]),
-                        "vs_reference": tensor_diff(got[f], getattr(reference[kernel], f)),
+            scan_o, scan_state = sequential_float64(flat)
+            reference = {}
+            for chunk, case in cases.items():
+                inter_ref = live.kda_inter_chunk_torch_oracle(*case["inter"][:6],
+                                                              state=case["inter"][6])
+                reference[chunk] = {"intra": case["intra_reference"], "inter": inter_ref,
+                                    "chain": inter_ref}
+            row = {"tokens": tokens, "gate": gate, "seed": seed, "dir": str(directory)}
+            for kernel in KERNELS:
+                row[kernel] = {}
+                for variant in variants:
+                    got = outputs[(kernel, variant.name)]
+                    same_width = variant.chunk == baseline.chunk
+                    row[kernel][variant.name] = {
+                        f: {
+                            "bit_equal_to_baseline": (
+                                bool(torch.equal(got[f], outputs[(kernel, BASELINE)][f]))
+                                if same_width else None),
+                            "vs_baseline": (tensor_diff(got[f], outputs[(kernel, BASELINE)][f])
+                                            if same_width else None),
+                            "vs_reference": tensor_diff(
+                                got[f], getattr(reference[variant.chunk][kernel], f)),
+                        }
+                        for f in FIELDS[kernel]
                     }
-                    for f in FIELDS[kernel]
-                }
-        i_plus_a = live.rebuild_i_plus_a(k, beta, gk)
-        identity = torch.eye(SERVED_CHUNK).expand_as(i_plus_a)
-        row["intra_inverse_residual_max_abs"] = {
-            variant.name: float(
-                (i_plus_a @ outputs[("intra", variant.name)]["a_inv"] - identity).abs().max())
-            for variant in variants
-        }
-        rows.append(row)
+                    if kernel != "intra":
+                        row[kernel][variant.name]["vs_float64_scan"] = {
+                            "o": tensor_diff(got["o"].reshape(scan_o.shape), scan_o),
+                            "final_state": tensor_diff(got["final_state"], scan_state),
+                        }
+            row["intra_inverse_residual_max_abs"] = {}
+            for variant in variants:
+                _, k, _, beta, gk = cases[variant.chunk]["intra"]
+                i_plus_a = live.rebuild_i_plus_a(k, beta, gk)
+                identity = torch.eye(variant.chunk).expand_as(i_plus_a)
+                a_inv = outputs[("intra", variant.name)]["a_inv"]
+                row["intra_inverse_residual_max_abs"][variant.name] = float(
+                    (i_plus_a @ a_inv - identity).abs().max())
+            rows.append(row)
     return rows
 
 
@@ -484,13 +594,14 @@ def main() -> None:
     parser.add_argument("--baseline-rev", default=BASELINE_REV)
     parser.add_argument("--variant", type=_named_rev, action="append", default=[],
                         metavar="NAME=REV", help="another revision to time and check")
-    parser.add_argument("--n-chunks", type=int, nargs="+", default=list(SERVED_N_CHUNKS))
+    parser.add_argument("--tokens", type=int, nargs="+", default=list(SERVED_PREFILL_TOKENS))
     parser.add_argument("--layers", type=int, default=KDA_LAYERS)
     parser.add_argument("--reps", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iterations", type=int, default=30)
     parser.add_argument("--timing-seed", type=int, default=20261008)
     parser.add_argument("--seeds", type=int, nargs="+", default=[1, 2, 3])
+    parser.add_argument("--gates", nargs="+", choices=GATES, default=list(GATES))
     parser.add_argument("--numerics-dir", type=Path)
     parser.add_argument("--workdir", type=Path)
     args = parser.parse_args()
@@ -537,8 +648,9 @@ def main() -> None:
                         "NEURON_LIBTORCH_CACHE_ROOT")
         },
         "tree": {"head": head, "kernel_file_dirty": bool(dirty)},
-        "variants": {v.name: {"rev": v.rev, "sha256": v.sha256} for v in variants},
-        "shape": {"chunk": SERVED_CHUNK, "kdim": SERVED_KDIM, "vdim": SERVED_VDIM},
+        "variants": {v.name: {"rev": v.rev, "sha256": v.sha256, "chunk": v.chunk}
+                     for v in variants},
+        "shape": {"kdim": SERVED_KDIM, "vdim": SERVED_VDIM},
         "timing_unit": (
             "microseconds per kernel call = (graph median - floor median) / layers; "
             "graph time is host wall time of one launch plus its first-output copy"
@@ -553,25 +665,27 @@ def main() -> None:
         report["compiled_kernels"] = sorted(p.name for p in args.workdir.rglob("*.colz"))
         args.out.write_text(json.dumps(report, indent=2) + "\n")
 
-    for n_chunks in args.n_chunks:
-        result = bench_shape(n_chunks, variants, args)
+    for tokens in args.tokens:
+        result = bench_shape(tokens, variants, args)
         report["timing"].append(result)
         write()
-        print(json.dumps({"n_chunks": n_chunks, "per_call_us": {
+        print(json.dumps({"tokens": tokens, "chunk": result["chunk"], "per_call_us": {
             kernel: {name: figure["median_us"] for name, figure in by_name.items()}
             for kernel, by_name in result["per_call_us"].items()},
             "noise_floor_spread": result["noise_floor_spread"]}), flush=True)
-    for n_chunks in args.n_chunks:
-        rows = numerics_shape(n_chunks, variants, args)
+    for tokens in args.tokens:
+        rows = numerics_shape(tokens, variants, args)
         report["numerics"].extend(rows)
         write()
         for row in rows:
             print(json.dumps({
-                "n_chunks": n_chunks, "seed": row["seed"],
+                "tokens": tokens, "gate": row["gate"], "seed": row["seed"],
                 "bit_equal_to_baseline": {
-                    kernel: {name: all(f["bit_equal_to_baseline"] for f in by_field.values())
-                             for name, by_field in row[kernel].items()}
+                    kernel: {name: bit_equal_summary(by_field) for name, by_field in row[kernel].items()}
                     for kernel in KERNELS},
+                "chain_o_vs_float64_scan": {
+                    name: by_field["vs_float64_scan"]["o"]["max_abs_over_scale"]
+                    for name, by_field in row["chain"].items()},
             }), flush=True)
 
 
