@@ -21,12 +21,14 @@ import re
 import pytest
 import torch
 
+from test.vllm_neuron.functional.reference_at_commit import (
+    load_reference,
+    needs_reference,
+)
 from vllm_neuron.functional.dsa import causal_bound as CB
 from vllm_neuron.functional.dsa import decode_batch as DB
 from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
 from vllm_neuron.utils.neuron_utils import SBUF_BYTES_PER_PARTITION, can_run_kernel
-
-from test.vllm_neuron.functional.reference_at_commit import load_reference, needs_reference
 
 #: The last commit whose bound holds a whole candidate row: the bit-equality reference.
 UNTILED_COMMIT = "b17526a"

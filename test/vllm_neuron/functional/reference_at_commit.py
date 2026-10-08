@@ -28,7 +28,7 @@ REPO_ROOT = Path(vllm_neuron.__file__).resolve().parents[1]
 def has_reference(commit: str, path: str) -> bool:
     """True when ``path`` at ``commit`` is in this checkout."""
     probe = subprocess.run(["git", "-C", str(REPO_ROOT), "cat-file", "-e", f"{commit}:{path}"],
-                           capture_output=True)
+                           capture_output=True, check=False)
     return probe.returncode == 0
 
 
@@ -46,7 +46,7 @@ def load_reference(commit: str, path: str, name: str) -> ModuleType:
     :func:`needs_reference` is skipped before it gets here.
     """
     shown = subprocess.run(["git", "-C", str(REPO_ROOT), "show", f"{commit}:{path}"],
-                           capture_output=True)
+                           capture_output=True, check=False)
     if shown.returncode != 0:
         raise FileNotFoundError(f"{commit}:{path}: {shown.stderr.decode().strip()}")
     file = Path(tempfile.mkdtemp(prefix=f"{name}_")) / f"{name}.py"
