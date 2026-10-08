@@ -97,6 +97,9 @@ if TYPE_CHECKING:
     # token attends its latent window densely (mla_dense_window.py) instead of
     # selecting and gathering. On by default; 0 restores the sparse path.
     VLLM_NEURON_MLA_DENSE_WINDOW: bool = True
+    # Divide the GLM-5.3-Flash DSA prefill selection's query rows over the
+    # tensor-parallel ranks. On by default; 0 restores the replicated selection.
+    VLLM_NEURON_DSA_INDEXER_SHARD: bool = True
 
 
 def maybe_convert_bool(value: str | None) -> bool | None:
@@ -423,6 +426,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # compile. On by default; set 0 to restore the sparse path.
     "VLLM_NEURON_MLA_DENSE_WINDOW": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_MLA_DENSE_WINDOW")) is not False
+    ),
+    # ================== GLM-5.3-Flash DSA Indexer ==================
+    # Shard the DSA prefill selection (score GEMM, causal bound, top-k, sentinel
+    # order) by query rows over the TP ranks, with one all-gather of the pool ids
+    # per DSA layer (``functional/dsa/indexer_shard.py``). Read at trace time, so
+    # a compiled graph keeps the value it was traced with. On by default; 0 runs
+    # the replicated selection on every rank.
+    "VLLM_NEURON_DSA_INDEXER_SHARD": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_DSA_INDEXER_SHARD", "1"))
     ),
 }
 

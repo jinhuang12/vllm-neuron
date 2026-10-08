@@ -159,6 +159,9 @@ _SEAM_REGISTRY = {
         "vllm_neuron.functional.dsa.sentinel_order",
         "sentinel_order_dispatch_counters",
         "reset_sentinel_order_dispatch_counters"),
+    "dsa_shard_rows": (
+        "vllm_neuron.functional.dsa.shard_rows",
+        "shard_rows_dispatch_counters", "reset_shard_rows_dispatch_counters"),
     "kda_chunked_recurrence": (
         "vllm_neuron.functional.kda.chunked_recurrence",
         "dispatch_counters", "reset_dispatch_counters"),

@@ -4075,6 +4075,15 @@ class Glm5NextDSAIndexer(nn.Module):
     #: projection weights, which carry no scale grid. The load releases these.
     RELEASED_AFTER_PREP: tuple[str, ...] = tuple(PROJECTION_PARAMETERS.values())
 
+    #: Attribute this rank's index in the tensor-parallel group is bound on, as a ``[1]``
+    #: int32 tensor beside the prepared weights, or None at one rank. The query-sharded
+    #: prefill selection (``functional/dsa/indexer_shard.py``) reads it. A tensor and not a
+    #: python int because one prefill graph serves every rank: a compile lifts a module's
+    #: tensor attribute as a graph input, as it does the prepared weights, so each rank
+    #: runs its own rows; an int would be folded into the graph as rank 0's. A plain
+    #: attribute and not a buffer, for the reason :data:`PREPARED_WEIGHTS_ATTR` gives.
+    SHARD_RANK_ATTR = "_indexer_shard_rank"
+
     def __init__(self, text_config: Glm5NextTextConfig) -> None:
         super().__init__()
         # The dials this class computes with, each read from the config rather than
@@ -4189,7 +4198,24 @@ class Glm5NextDSAIndexer(nn.Module):
         setattr(self, self.LOWP_WEIGHTS_ATTR, _lowp_projection_operands(
             {name: getattr(self, self.PROJECTION_PARAMETERS[name])
              for name, _, _ in self.projection_widths()}, {}))
+        self._bind_shard_rank(prepared["wq_b"].device)
         return len(prepared)
+
+    def _bind_shard_rank(self, device: torch.device) -> None:
+        """Bind this rank's index in the tensor-parallel group, or None at one rank.
+
+        Bound here because preparation runs once per rank at load, outside any trace, on
+        the device the forward reads its weights from. The index is ``rank_in_group`` of
+        the same group the selection gathers over, so the rows a rank takes are the rows
+        the gather's group order puts back in place.
+        """
+        group = _resolve_tp_group()
+        rank = None
+        if group is not None:
+            rank = torch.full(
+                (1,), int(group.rank_in_group), dtype=torch.int32, device=device
+            )
+        setattr(self, self.SHARD_RANK_ATTR, rank)
 
     def _lowp_operand(self, name: str):
         """``(weight, scale)`` for the low-precision route, or None for the fp32 one."""
@@ -4910,6 +4936,47 @@ class Glm5NextDSAIndexer(nn.Module):
         sentinelised = dsa_causal_sentinel(values, pool_ids, int(bounded.shape[1]))
         return self._canonical_sentinel_order(sentinelised)
 
+    def _select_pool_ids(
+        self,
+        query: torch.Tensor,
+        candidate_keys: torch.Tensor,
+        weights: torch.Tensor,
+        seq_lens: torch.Tensor,
+        *,
+        shardable: bool,
+    ) -> torch.Tensor:
+        """``[T, select_k]`` int32 pool ids for a selecting call: replicated or row-sharded.
+
+        Every row runs :meth:`score_pools` then :meth:`select_bounded_pools` against the
+        whole candidate axis. Sharded when the call may shard (the prefill leg of
+        :meth:`forward`), a rank operand is bound, a tensor-parallel group exists and
+        :func:`~vllm_neuron.functional.dsa.indexer_shard.shard_degree` says the chunk
+        spans more than one row tile with the switch on: each rank then runs that chain on
+        its own rows (:func:`~vllm_neuron.functional.dsa.indexer_shard.select_local_rows`)
+        and one all-gather returns every row to every rank. Otherwise every rank selects
+        every row, as built.
+        """
+        from vllm_neuron.functional.dsa.indexer_shard import (
+            gather_rows,
+            row_shard,
+            select_local_rows,
+            shard_degree,
+        )
+
+        def select(rows_query, rows_weights, rows_seq_lens):
+            scores = self.score_pools(rows_query, candidate_keys, rows_weights)
+            return self.select_bounded_pools(scores, rows_seq_lens)
+
+        tokens = int(query.shape[0])
+        rank = getattr(self, self.SHARD_RANK_ATTR, None)
+        group = _resolve_tp_group() if shardable and rank is not None else None
+        degree = 1 if group is None else shard_degree(tokens, int(group.world_size))
+        if degree <= 1:
+            return select(query, weights, seq_lens)
+        shard = row_shard(tokens, degree)
+        local = select_local_rows(select, query, weights, seq_lens, shard, rank)
+        return gather_rows(local, group, shard)
+
     @staticmethod
     def _canonical_sentinel_order(pool_ids: torch.Tensor) -> torch.Tensor:
         """Sentinels to the trailing columns; real ids keep their relative order.
@@ -5232,7 +5299,10 @@ class Glm5NextDSAIndexer(nn.Module):
         it: shape validation, index arithmetic for the gather and for the two write
         addresses, one ``index_copy_`` per leg, one ring copy on the decode leg, and
         one ring copy on the prefill leg -- masked over the whole ring when the
-        chunk's end arrives as a tensor. No torch path computes an indexer value.
+        chunk's end arrives as a tensor. When the prefill selection shards, an NKI row
+        cut (``shard_rows``) takes this rank's rows of each operand and one int32
+        all-gather returns the pool ids (:meth:`_select_pool_ids`). No torch path
+        computes an indexer value.
         """
         from vllm_neuron.functional.dsa.decode_tail_update import decode_pool_address
 
@@ -5331,9 +5401,12 @@ class Glm5NextDSAIndexer(nn.Module):
             return self._bypass_indices(seq_lens)
 
         candidate_keys = self._gather_candidates(pool_cache, candidates, int(page_size))
-        scores = self.score_pools(query, candidate_keys, weights)
-        # The causal bound and the sentinel, at one site.
-        pool_ids = self.select_bounded_pools(scores, seq_lens)
+        # The score, the causal bound and the sentinel, at one site. The prefill leg's
+        # rows may divide over the ranks (``_select_pool_ids``); the expansion below runs
+        # on every row either way, with each row's own length.
+        pool_ids = self._select_pool_ids(
+            query, candidate_keys, weights, seq_lens, shardable=not is_decode
+        )
         return self.expand_indices(pool_ids, seq_lens)
 
     def forward_requests(
