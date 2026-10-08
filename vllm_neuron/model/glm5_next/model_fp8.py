@@ -1355,6 +1355,27 @@ class Glm5NextRoutedExperts(nn.Module):
                 routed_scaling_factor=float(text_config.routed_scaling_factor),
             )
 
+        # Prefill (T > 64): the router's RMSNorm in XLA, beside the experts' norm on
+        # the same pre-norm rows, so the mHC collapse feeding both fuses instead of
+        # running as a per-token matmul loop; then the router GEMM and noaux_tc top-8
+        # in one launch (router_prefill.py). Same three outputs, same seam counters;
+        # any call it declines keeps the fused router below.
+        from vllm_neuron.functional.moe import router_prefill
+
+        if router_prefill.prefill_route_admits(
+            hidden_states, self.router_weight, int(text_config.num_experts_per_tok)
+        ):
+            return router_prefill.noaux_tc_router_prefill(
+                hidden_states,
+                gamma,
+                self.router_weight,
+                self.router_bias,
+                top_k=int(text_config.num_experts_per_tok),
+                eps=eps,
+                norm_topk_prob=bool(text_config.norm_topk_prob),
+                routed_scaling_factor=float(text_config.routed_scaling_factor),
+            )
+
         from vllm_neuron.functional.moe.router import (
             noaux_tc_rmsnorm_router_topk,
         )
