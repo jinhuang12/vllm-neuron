@@ -31,10 +31,11 @@ silent: the server starts fast and runs stale code.
 [1. import vllm_neuron] --> [2. snapshot kernel sources] --> [3. wrap both key fns]
 
  graph key:  create_cache_hash(gm, ...)
-   [kernels gm calls] --> [their modules] --> [import closure] --> [file set] --> sha256 --> fold
+   [kernels gm calls] --> [module.qualname] --> [import + patch closure] --> [file set] --> sha256 --> fold
  kernel key: create_nki_cache_key(func, ...)
-   [func's module]  -----------------------> [import closure] --> [file set] --> sha256 --> fold
- unmapped reference --------------------------------------------> package digest -----> fold
+   [func] ----------------> [module.qualname] --> [import + patch closure] --> [file set] --> sha256 --> fold
+ nkilib kernel: [module.qualname] --> [package files importing it] --> [their closures]
+ unmapped reference --------------------------------------------------> package digest -----> fold
 ```
 
 1. Step 2 reads every `*.py` under `vllm_neuron/functional/` and the modules
@@ -46,7 +47,10 @@ silent: the server starts fast and runs stale code.
 2. A graph's kernels come from its FX nodes:
    - each NKI kernel node (`torch.ops.higher_order.nki_kernel_wrapper`) gives
      its kernel function through the library's kernel registry
-     (`kernel_idx`), and the function gives its defining module;
+     (`kernel_idx`); the function gives `<module>.<qualname>`, the spelling of
+     the HLO `func_name`. A package kernel maps to its defining module. A kernel
+     of another package (`nkilib`) maps to the package files that import it
+     (see [Kernels of other packages](#kernels-of-other-packages));
    - each call target, called submodule class, fetched attribute or argument
      constant that a `vllm_neuron` module defines gives that module (the
      served graphs build rotational top-k configs in the graph);
@@ -55,8 +59,9 @@ silent: the server starts fast and runs stale code.
      `CUSTOM_OP_KERNEL_MODULES`.
 3. The import closure starts at each module file and follows its `import` and
    `from ... import` statements, read with `ast` (no import runs). It follows
-   statements at any depth (also inside functions) and stops at files outside
-   the snapshot.
+   statements at any depth (also inside functions), except under
+   `if TYPE_CHECKING:`, and stops at files outside the snapshot. Files that
+   patch a reached module join the closure (see [Patches](#patches)).
 4. The digest is sha256 over the sorted file set: path, length, then bytes,
    the same stream as the whole-package digest. The key is
    `sha256(library_key + "|kernel_digest:" + digest)[:32]`, so the cache
@@ -78,13 +83,53 @@ on the graph is in the FX text, which the library already keys on.
 | `from vllm_neuron.a import *` | all of `a/__init__.py` |
 | relative imports | the same, from the file's own package |
 | `import importlib` or `__import__` in a reached file | nothing: the key folds the package digest |
-| an import of another package | nothing: that source is versioned with its package |
+| an import under `if TYPE_CHECKING:` | nothing: it never runs |
+| an import of another package | not that package's source (it is versioned with its package), but every snapshot file that patches that package |
 | an import of `vllm_neuron.envs` or `vllm_neuron.accuracy.tensor_capture` | nothing: these files hold no kernel code (a kernel's trace-time branch on a knob is in the FX graph text; tensor capture is host-side debug code), so the snapshot excludes them |
 
 A package `__init__.py` is reached only when a reached file imports from it.
 Python also runs every parent package `__init__.py` when it imports a
-module; those runs are not followed. The rules assume that no module rebinds
-an attribute of another module at import time.
+module; those runs are not followed.
+
+### Patches
+
+A snapshot file *patches* a module when it rebinds or deletes an attribute or
+an item of an object it imported from that module (`mod.ATTR = v`,
+`mod.TABLE[k] = v`, `del mod.ATTR`, `setattr(mod, ...)`, also through an alias
+`cfg = mod.cfg; cfg.X = v`), at any depth. The patch changes what the patched
+module's code does wherever it runs, so:
+
+| Patched module | The patcher's closure joins |
+| --- | --- |
+| a snapshot module M | every closure that reaches M's file |
+| a module of another package P | every closure with a run-time import from P, and so every key of a P kernel |
+
+`functional/mlp.py:18-35` patches `nkilib.core.mlp`'s `is_mlp_tkg` at import.
+Every kernel file imports `nkilib` (for example `kernel_assert`), so
+`functional/mlp.py` joins every kernel key: an edit there recompiles every
+graph. `parallel/neuron_parallel_state.py` patches `vllm.distributed` and joins
+the closures that import `vllm` at run time.
+`test/vllm_neuron/test_compile_cache_key_pergraph.py` pins this list, so a new
+patch fails a test until it is reviewed here. A mutation through a method call
+(`mod.TABLE.update(...)`) is not detected.
+
+### Kernels of other packages
+
+A kernel of another package, for example nkilib's `find_nonzero_indices`, is
+named `nkilib.core.subkernels.find_nonzero_indices.find_nonzero_indices`. Its
+source is versioned with nkilib, but package files decide what it compiles to:
+they wrap it, choose its arguments and may patch nkilib. Its key folds the
+closures of the snapshot files with a run-time import of:
+
+- the kernel itself (`from nkilib.core.mlp.mlp import mlp`),
+- a module or package that holds it (`from nkilib.core.mlp import mlp`,
+  `import nkilib`),
+- something from inside it, or a parent package's re-export of it
+  (`from nkilib import attention_cte`).
+
+The dotted name tells a kernel from a namesake: `cumsum`, `mlp`, `moe_tkg` and
+`rotational_topk` exist in both trees. A kernel of another package that no
+snapshot file imports (for example a test stand-in kernel) falls back.
 
 ### Fallback
 
@@ -95,6 +140,7 @@ never serves a stale kernel. These references fall back:
 - a custom op that is not in `CUSTOM_OP_KERNEL_MODULES`,
 - a kernel module of the package that is outside the snapshot (for example a
   kernel under `vllm_neuron/model/`) or that has no source file,
+- a kernel of another package that no snapshot file imports,
 - a dynamic import in the closure,
 - an NKI node whose `kernel_idx` is not in the process's kernel registry,
 - an error during the reference scan (logged at WARNING).
@@ -104,9 +150,6 @@ Each reason is logged once per process at INFO:
 ``` text
 INFO - compile_cache_key.py - kernel digest fallback: custom op ns::op has no entry in CUSTOM_OP_KERNEL_MODULES (vllm_neuron.compile_cache_key); keys that reach it fold the whole-package digest
 ```
-
-A kernel from another package (for example `nkilib`) reaches no package file.
-Its source is versioned with that package, as before.
 
 ### The custom op table
 
@@ -171,9 +214,9 @@ earlier whole-package scheme). Startup uses `install_per_graph_digest_key`.
 ## What it costs
 
 - One recompile of each graph that reaches an edited file, including
-  comment-only edits. On the stack-1b served set (20 graphs), 68 of the 104
+  comment-only edits. On the stack-1b served set (20 graphs), 65 of the 104
   files reach no graph, and a decode-only kernel edit recompiles the decode
-  graphs only.
+  graphs only. `functional/mlp.py` (an nkilib patch) reaches every graph.
 - No change to a cache root that was filled with the same tree: the digests
   are deterministic across processes and hosts.
 - Cache roots filled **before** this change miss once (the key changed); the

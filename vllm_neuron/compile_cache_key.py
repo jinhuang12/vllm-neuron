@@ -20,13 +20,16 @@ of only the files that key's kernels can reach:
 
 "Reached" is static: the kernel's defining module, then the transitive closure
 of its ``import`` / ``from ... import`` statements (read with :mod:`ast`, never
-by importing) that stay inside the snapshot. An edit to kernel X therefore
-recompiles only the graphs that call X, and an edit to a file no kernel reaches
-(torch code around the kernels, whose effect is in the FX text) recompiles no
-graph for kernel reasons. A reference the resolver cannot map -- a custom op
-missing from the table, a package module outside the snapshot, a dynamic import
--- folds the whole-package digest instead and is logged once at INFO, so a
-fallback costs a recompile and never serves a stale kernel.
+by importing) that stay inside the snapshot, plus every snapshot file that
+patches a module the closure uses. A kernel of another package (``nkilib``)
+reaches the closures of the snapshot files that import it. An edit to kernel X
+therefore recompiles only the graphs that call X, and an edit to a file no
+kernel reaches (torch code around the kernels, whose effect is in the FX text)
+recompiles no graph for kernel reasons. A reference the resolver cannot map --
+a custom op missing from the table, a package module outside the snapshot, a
+dynamic import, another package's kernel no snapshot file imports -- folds the
+whole-package digest instead and is logged once at INFO, so a fallback costs a
+recompile and never serves a stale kernel.
 
 The library looks both key functions up through their module at every call
 (``cache.create_cache_hash(...)``; ``from .nki_cache import create_nki_cache_key``
@@ -206,6 +209,7 @@ class KernelResolution:
     """
 
     files: Optional[frozenset[str]]
+    #: Package kernel modules, and the dotted names of other packages' kernels.
     modules: frozenset[str]
     reasons: tuple[str, ...]
 
@@ -229,33 +233,54 @@ def _op_references(qualified: str) -> list[Reference]:
     return [Reference(RefKind.CUSTOM_OP, qualified)]
 
 
-def _defining_modules(obj: Any) -> list[str]:
-    """The modules of ``obj`` and of every function it wraps (``.func``, ``__wrapped__``).
-
-    A wrapper's own module counts too: a package decorator around a torch
-    function runs package code.
-    """
-    modules, seen = [], set()
+def _unwrapped(obj: Any) -> list[Any]:
+    """``obj`` and every callable it wraps (``.func``, ``__wrapped__``)."""
+    chain, seen = [], set()
     while obj is not None and id(obj) not in seen:
         seen.add(id(obj))
-        if callable(obj):
-            module = getattr(obj, "__module__", None)
-        else:
-            module = type(obj).__module__
-        if isinstance(module, str) and module not in modules:
-            modules.append(module)
+        chain.append(obj)
         if not callable(obj):
             break
         inner = getattr(obj, "func", None)  # nki.jit kernels, functools.partial
         obj = inner if callable(inner) else getattr(obj, "__wrapped__", None)
+    return chain
+
+
+def _defining_modules(obj: Any) -> list[str]:
+    """The modules of ``obj`` and of every function it wraps.
+
+    A wrapper's own module counts too: a package decorator around a torch
+    function runs package code. A non-callable gives its type's module.
+    """
+    modules = []
+    for item in _unwrapped(obj):
+        module = getattr(item, "__module__", None) if callable(item) else type(item).__module__
+        if isinstance(module, str) and module not in modules:
+            modules.append(module)
     return modules
 
 
-def _object_references(obj: Any, kernel: bool = False) -> list[Reference]:
-    """References for a callable or object a graph node or kernel call holds.
+def _kernel_references(func: Any) -> list[Reference]:
+    """``<module>.<qualname>`` of an NKI kernel and of every function it wraps.
 
-    For a kernel every defining module is returned (another package's module
-    resolves to no file); otherwise only package modules are.
+    The dotted name is the HLO ``func_name`` spelling. It tells a package kernel
+    from a namesake in another package (``cumsum``, ``rotational_topk``), and it
+    lets another package's kernel be matched to the package files importing it.
+    """
+    refs = []
+    for item in _unwrapped(func):
+        module = getattr(item, "__module__", None)
+        qualname = getattr(item, "__qualname__", None)
+        if isinstance(module, str) and isinstance(qualname, str):
+            refs.append(Reference(RefKind.QUALIFIED_NAME, f"{module}.{qualname}"))
+    return refs or [_unresolved(f"cannot tell which module defines NKI kernel {func!r}")]
+
+
+def _object_references(obj: Any) -> list[Reference]:
+    """References for a callable or object a graph node or kernel argument holds.
+
+    Only package modules count: another package's callable in the graph is torch
+    code, whose effect is in the FX text.
     """
     from torch._ops import HigherOrderOperator, OpOverload, OpOverloadPacket
 
@@ -265,12 +290,7 @@ def _object_references(obj: Any, kernel: bool = False) -> list[Reference]:
         return _op_references(obj._qualified_op_name)
     if isinstance(obj, HigherOrderOperator):
         return []
-    modules = _defining_modules(obj)
-    if kernel and not modules:
-        return [_unresolved(f"cannot tell which module defines NKI kernel {obj!r}")]
-    return [
-        Reference(RefKind.MODULE, m) for m in modules if kernel or _in_package(m)
-    ]
+    return [Reference(RefKind.MODULE, m) for m in _defining_modules(obj) if _in_package(m)]
 
 
 def _value_references(value: Any) -> list[Reference]:
@@ -306,7 +326,7 @@ def _kernel_node_references(node, registry) -> list[Reference]:
         func = registry.get_func(idx)
     except KeyError:
         return [_unresolved(f"NKI kernel_idx {idx} is not in this process's kernel registry")]
-    refs = _object_references(func, kernel=True)
+    refs = _kernel_references(func)
     constant_args_key = node.kwargs.get("constant_args_key", -1)
     if constant_args_key != -1:
         try:
@@ -353,8 +373,8 @@ def graph_module_references(gm) -> list[Reference]:
 
 
 def kernel_call_references(func: Callable, args: Mapping[str, Any]) -> list[Reference]:
-    """References for one NKI kernel compile: its module and its argument objects."""
-    refs = _object_references(func, kernel=True)
+    """References for one NKI kernel compile: the kernel and its argument objects."""
+    refs = _kernel_references(func)
     refs.extend(_value_references(list(args.values())))
     return refs
 
@@ -500,6 +520,19 @@ class _ModuleImports:
     #: Module-level names bound any other way (def, class, assignment, global).
     defined_names: frozenset[str]
     dynamic: Optional[str]
+    #: Dotted names of imported objects whose attributes or items the file
+    #: rebinds or deletes (``mod.ATTR = v``, ``mod.TABLE[k] = v``,
+    #: ``setattr(mod, ...)``), at any depth.
+    patched: tuple[str, ...]
+
+
+class _Patchers(NamedTuple):
+    """Snapshot files that patch modules, by what they patch."""
+
+    #: Patched snapshot file -> the other snapshot files that patch its module.
+    by_file: Mapping[str, frozenset[str]]
+    #: Top-level name of another package -> the snapshot files that patch it.
+    by_package: Mapping[str, frozenset[str]]
 
 
 def _package_of(rel: str) -> str:
@@ -547,16 +580,68 @@ def _module_level_bindings(tree: ast.Module) -> tuple[list[ast.stmt], set[str]]:
     return imports, defined
 
 
+#: Builtins that rebind or delete an attribute of their first argument.
+_ATTRIBUTE_SETTERS = frozenset({"setattr", "delattr"})
+
+
+def _mutated_object(expr: ast.expr) -> Optional[tuple[str, tuple[str, ...]]]:
+    """``(base name, attribute path)`` of the object ``expr`` evaluates to.
+
+    The path stops at the first item or call (``a.b[0].c`` -> ``("a", ("b",))``),
+    so it names the module-level object the mutation goes through.
+    """
+    attrs: list[str] = []
+    while not isinstance(expr, ast.Name):
+        if isinstance(expr, ast.Attribute):
+            attrs.append(expr.attr)
+            expr = expr.value
+        elif isinstance(expr, (ast.Subscript, ast.Call)):
+            attrs.clear()
+            expr = expr.value if isinstance(expr, ast.Subscript) else expr.func
+        else:
+            return None
+    return expr.id, tuple(reversed(attrs))
+
+
+#: The ``typing`` flag whose ``if`` body never runs.
+_TYPE_CHECKING = "TYPE_CHECKING"
+
+
+def _type_checking_only(tree: ast.Module) -> set[int]:
+    """Ids of the nodes inside ``if TYPE_CHECKING:`` bodies (they never run)."""
+    skipped = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        name = test.id if isinstance(test, ast.Name) else getattr(test, "attr", None)
+        if name == _TYPE_CHECKING:
+            for stmt in node.body:
+                skipped.update(id(n) for n in ast.walk(stmt))
+    return skipped
+
+
 def _parse_imports(rel: str, source: bytes) -> _ModuleImports:
     tree = ast.parse(source, filename=rel)
     package = _package_of(rel)
     entries_by_node, dynamic = {}, None
+    bound_to: dict[str, list[str]] = {}  # name an import binds -> dotted object names
+    aliases: list[tuple[str, ast.expr]] = []  # ``name = <attribute chain>``
+    mutated: list[ast.expr] = []
+    type_only = _type_checking_only(tree)
     for node in ast.walk(tree):
+        if id(node) in type_only:
+            continue
         if isinstance(node, ast.Import):
             entries_by_node[id(node)] = [
                 (alias.asname or alias.name.partition(".")[0], _ImportEntry(alias.name, None))
                 for alias in node.names
             ]
+            for alias in node.names:
+                name = alias.asname or alias.name.partition(".")[0]
+                bound_to.setdefault(name, []).append(
+                    alias.name if alias.asname else alias.name.partition(".")[0]
+                )
             used = [a.name for a in node.names if a.name.partition(".")[0] in DYNAMIC_IMPORT_MODULES]
         elif isinstance(node, ast.ImportFrom):
             module = _absolute_module(node, package)
@@ -566,13 +651,54 @@ def _parse_imports(rel: str, source: bytes) -> _ModuleImports:
                 (None if a.name == "*" else (a.asname or a.name), _ImportEntry(module, a.name))
                 for a in node.names
             ]
+            for alias in node.names:
+                if alias.name != "*":
+                    bound_to.setdefault(alias.asname or alias.name, []).append(
+                        f"{module}.{alias.name}"
+                    )
             used = [module] if module.partition(".")[0] in DYNAMIC_IMPORT_MODULES else []
         elif isinstance(node, ast.Name) and node.id == "__import__":
             used = ["__import__"]
         else:
+            if isinstance(node, (ast.Assign, ast.AnnAssign)) and isinstance(
+                node.value, (ast.Name, ast.Attribute)
+            ):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                aliases.extend((t.id, node.value) for t in targets if isinstance(t, ast.Name))
+            elif isinstance(node, (ast.Attribute, ast.Subscript)) and isinstance(
+                node.ctx, (ast.Store, ast.Del)
+            ):
+                mutated.append(node.value)
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in _ATTRIBUTE_SETTERS
+                and node.args
+            ):
+                mutated.append(node.args[0])
             continue
         if used and dynamic is None:
             dynamic = f"line {node.lineno} uses {used[0]}"
+    def objects(expr: ast.expr) -> list[str]:
+        """Dotted names of the imported objects ``expr`` can evaluate to."""
+        found = _mutated_object(expr)
+        if found is None:
+            return []
+        base, attrs = found
+        return [".".join((dotted, *attrs)) for dotted in bound_to.get(base, ())]
+
+    # An alias of an imported object (``cfg = pkg.mod.cfg``) patches it too;
+    # each pass resolves one more link of an alias chain.
+    for _ in aliases:
+        grew = False
+        for name, expr in aliases:
+            for dotted in objects(expr):
+                if dotted not in bound_to.setdefault(name, []):
+                    bound_to[name].append(dotted)
+                    grew = True
+        if not grew:
+            break
+    patched = [dotted for expr in mutated for dotted in objects(expr)]
     module_imports, defined = _module_level_bindings(tree)
     imported: dict[str, list[_ImportEntry]] = {}
     for node in module_imports:
@@ -584,7 +710,20 @@ def _parse_imports(rel: str, source: bytes) -> _ModuleImports:
         imported_names={k: tuple(v) for k, v in imported.items()},
         defined_names=frozenset(defined),
         dynamic=dynamic,
+        patched=tuple(dict.fromkeys(patched)),
     )
+
+
+def _imports_name(entry: _ImportEntry, name: str) -> bool:
+    """Whether ``entry`` imports ``name`` (a dotted module or kernel name of
+    another package), a module or package that holds it, something from inside
+    it, or a parent package's re-export of it."""
+    target = entry.module if entry.name in (None, "*") else f"{entry.module}.{entry.name}"
+    if name == target or name.startswith(target + ".") or target.startswith(name + "."):
+        return True
+    if entry.name in (None, "*") or not name.startswith(entry.module + "."):
+        return False
+    return entry.name in name[len(entry.module) + 1 :].split(".")
 
 
 class KernelDigestResolver:
@@ -600,6 +739,13 @@ class KernelDigestResolver:
     reached only when imported from, and imports leaving the snapshot (another
     package, ``vllm_neuron.envs``) are not followed, as the whole-package digest
     never covered them.
+
+    A snapshot file that patches a module (rebinds or deletes one of its
+    attributes or items) changes what that module's code does wherever it runs,
+    so the patcher joins every closure that reaches the patched package module,
+    and every closure that imports from the patched other package. A kernel of
+    another package (``nkilib``) reaches the closures of the snapshot files that
+    import it: they wrap it, choose its arguments and may patch its package.
     """
 
     def __init__(self, root: Path | str = PACKAGE_ROOT):
@@ -612,6 +758,8 @@ class KernelDigestResolver:
         self._imports: dict[str, _ModuleImports] = {}
         self._closures: dict[str, tuple[frozenset[str], tuple[str, ...]]] = {}
         self._digests: dict[frozenset[str], str] = {}
+        self._importers: dict[str, tuple[str, ...]] = {}
+        self._patchers: Optional[_Patchers] = None
 
     def digest_of(self, rels: Iterable[str]) -> str:
         """The digest of a set of snapshot files, in the package digest's format."""
@@ -641,7 +789,9 @@ class KernelDigestResolver:
         """Map references to files; any unmappable reference makes it a fallback."""
         files, modules, reasons = set(), set(), []
         for ref in refs:
-            if ref.kind is RefKind.MODULE:
+            if ref.kind in (RefKind.MODULE, RefKind.QUALIFIED_NAME) and not _in_package(ref.name):
+                self._add_external(ref.name, files, modules, reasons)
+            elif ref.kind is RefKind.MODULE:
                 self._add_module(ref.name, files, modules, reasons)
             elif ref.kind is RefKind.QUALIFIED_NAME:
                 module = self._defining_module(ref.name)
@@ -678,9 +828,7 @@ class KernelDigestResolver:
         return None
 
     def _defining_module(self, qualified: str) -> Optional[str]:
-        """The longest package-module prefix of ``<module>.<qualname>``."""
-        if not _in_package(qualified):
-            return qualified.rpartition(".")[0] or qualified
+        """The longest package-module prefix of a package ``<module>.<qualname>``."""
         parts = qualified.split(".")
         for end in range(len(parts), 1, -1):
             module = ".".join(parts[:end])
@@ -688,10 +836,22 @@ class KernelDigestResolver:
                 return module
         return None
 
+    def _add_external(self, name, files, modules, reasons) -> None:
+        """Another package's kernel (or kernel module): the files importing it."""
+        modules.add(name)
+        importers = self._importers_of(name)
+        if not importers:
+            reasons.append(
+                f"kernel {name} of package {name.partition('.')[0]} is imported by no "
+                f"digested file under {self.root}"
+            )
+        for rel in importers:
+            closure, why = self._closure(rel)
+            files.update(closure)
+            reasons.extend(why)
+
     def _add_module(self, module, files, modules, reasons) -> None:
         modules.add(module)
-        if not _in_package(module):
-            return  # another package's source: versioned with that package
         rel = self._module_file(module)
         if rel is None:
             reasons.append(f"module {module} has no source file under {self.root}")
@@ -731,8 +891,41 @@ class KernelDigestResolver:
             targets.append((package, entry.name))
         return targets
 
+    def _importers_of(self, name: str) -> tuple[str, ...]:
+        """Snapshot files with an import of another package's ``name`` (any depth)."""
+        if name not in self._importers:
+            self._importers[name] = tuple(
+                rel
+                for rel in self.files
+                if any(_imports_name(e, name) for e in self._parsed(rel).entries)
+            )
+        return self._importers[name]
+
+    def _patch_index(self) -> _Patchers:
+        """Which snapshot files patch which modules, over every snapshot file."""
+        if self._patchers is None:
+            by_file: dict[str, set[str]] = {}
+            by_package: dict[str, set[str]] = {}
+            for rel in self.files:
+                for target in self._parsed(rel).patched:
+                    if not _in_package(target):
+                        by_package.setdefault(target.partition(".")[0], set()).add(rel)
+                        continue
+                    module = self._defining_module(target)
+                    patched = self._module_file(module) if module else None
+                    # A patch of a module outside the snapshot (envs) is not
+                    # kernel source, as the module itself is not.
+                    if patched in self._sources and patched != rel:
+                        by_file.setdefault(patched, set()).add(rel)
+            self._patchers = _Patchers(
+                {k: frozenset(v) for k, v in by_file.items()},
+                {k: frozenset(v) for k, v in by_package.items()},
+            )
+        return self._patchers
+
     def _closure(self, start: str) -> tuple[frozenset[str], tuple[str, ...]]:
         if start not in self._closures:
+            patchers = self._patch_index()
             files, reasons, seen, work = set(), [], set(), [(start, None)]
             while work:
                 node = work.pop()
@@ -741,6 +934,7 @@ class KernelDigestResolver:
                 seen.add(node)
                 rel, name = node
                 files.add(rel)
+                work.extend((p, None) for p in patchers.by_file.get(rel, ()))
                 info = self._parsed(rel)
                 if info.dynamic is not None:
                     reasons.append(f"{rel} imports modules dynamically ({info.dynamic})")
@@ -749,7 +943,11 @@ class KernelDigestResolver:
                 else:
                     entries = info.imported_names[name]
                 for entry in entries:
-                    work.extend(self._targets(entry))
+                    if _in_package(entry.module):
+                        work.extend(self._targets(entry))
+                    else:
+                        package = entry.module.partition(".")[0]
+                        work.extend((p, None) for p in patchers.by_package.get(package, ()))
             self._closures[start] = (frozenset(files), tuple(dict.fromkeys(reasons)))
         return self._closures[start]
 

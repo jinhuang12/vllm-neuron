@@ -362,6 +362,10 @@ RULES_TREE = {
     ),
     "functional/uses_dynamic.py": "from vllm_neuron.functional import dynamic\n",
     "functional/uses_envs.py": "from vllm_neuron import envs\n",
+    "functional/typed.py": (
+        "from typing import TYPE_CHECKING\n\nif TYPE_CHECKING:\n"
+        "    from vllm_neuron.functional.leaf_b import f\n"
+    ),
     "utils/neuron_utils.py": "TILE = 128\n",
     "envs.py": "FLAG = 1\n",
     "model/kernel_outside.py": "def k(x):\n    return x\n",
@@ -393,6 +397,8 @@ def rules(tmp_path):
         # envs.py is outside the digested sources: not followed (as before).
         ("functional.uses_envs", {"uses_envs.py"}),
         ("functional.torch_only", {"torch_only.py"}),
+        # An import under ``if TYPE_CHECKING:`` never runs.
+        ("functional.typed", {"typed.py"}),
     ],
 )
 def test_the_closure_follows_static_imports(rules, module, expected):
@@ -431,16 +437,6 @@ def test_a_package_kernel_module_the_digest_cannot_cover_falls_back(
     assert rules.digest(resolution) == rules.package_digest
 
 
-def test_a_kernel_from_another_package_reaches_no_package_file(rules):
-    """nkilib kernels: their source is outside vllm_neuron (library-versioned)."""
-    resolution = rules.resolve(
-        [ck.Reference(ck.RefKind.MODULE, "nkilib.core.attention.attention_cte")]
-    )
-
-    assert resolution.per_graph
-    assert resolution.files == frozenset()
-
-
 def test_a_qualified_kernel_name_resolves_to_its_defining_module(rules):
     """HLO backend configs carry ``<module>.<qualname>``; nested names too."""
     for name in (
@@ -455,6 +451,291 @@ def test_the_file_set_digest_matches_the_package_digest_format(rules):
     """Digest of every file == the whole-package digest (same byte stream)."""
     assert rules.digest_of(rules.files) == rules.package_digest
     assert rules.package_digest == ck.kernel_digest(rules.root)
+
+
+# ------------------------------- kernels of other packages, and patched modules
+
+
+EXTERNAL_TREE = {
+    "functional/__init__.py": "",
+    "functional/leaf.py": "def f(x):\n    return x\n",
+    # Wraps a kernel of another package and holds constants its callers use.
+    "functional/wraps_ext.py": (
+        "from extpkg.kern import ext_kernel\n"
+        "from vllm_neuron.functional.leaf import f\n\n"
+        "TILE = 128\n"
+    ),
+    # A kernel a parent package re-exports.
+    "functional/reexport_user.py": "from extpkg import other_kernel\n",
+    # The module that holds the kernel, imported inside a function.
+    "functional/module_user.py": (
+        "def run():\n    from extpkg import mod\n    return mod.mod_kernel\n"
+    ),
+    # Same names, other targets: neither imports extpkg.kern.ext_kernel.
+    "functional/near_miss.py": (
+        "from extpkg.kern import helper\nfrom otherpkg.kern import ext_kernel\n"
+    ),
+    # Patches extpkg state at import without importing any extpkg kernel.
+    "functional/patch_ext.py": "import extpkg.config as cfg\n\ncfg.MODE = 1\n",
+    "functional/wraps_ext2.py": "from extpkg2.x import k2\n",
+    "functional/item_patch.py": "from extpkg2 import TABLE\n\nTABLE['k'] = 1\n",
+    "functional/wraps_ext3.py": "from extpkg3.mod import k3\n",
+    "functional/setattr_patch.py": (
+        "from extpkg3 import cfg3\n\ndef apply():\n    setattr(cfg3, 'FLAG', 1)\n"
+    ),
+    # An in-package module another digested file patches.
+    "functional/kernel_p.py": "TILE = 64\n\ndef kernel_p(x):\n    return x * TILE\n",
+    "functional/patch_in_package.py": (
+        "from vllm_neuron.functional import kernel_p\n\nkernel_p.TILE = 32\n"
+    ),
+    "functional/other_user.py": "from otherpkg.kern import other\n",
+    # A patch through a module-level alias of an imported object.
+    "functional/wraps_ext4.py": "from extpkg4.k import k4\n",
+    "functional/alias_patch.py": (
+        "import extpkg4.inner\n\n_cfg = extpkg4.inner.cfg\n_cfg.MODE = 2\n"
+    ),
+    # Imports under ``if TYPE_CHECKING:`` never run: no importer, no patch reach.
+    "functional/typed_user.py": (
+        "import typing\n\nif typing.TYPE_CHECKING:\n"
+        "    from extpkg.kern import ext_kernel\n"
+        "from otherpkg.kern import other\n"
+    ),
+}
+
+
+@pytest.fixture
+def external(tmp_path):
+    return ck.KernelDigestResolver(_write_tree(tmp_path, EXTERNAL_TREE))
+
+
+def _kernel_files(resolver, qualified: str) -> frozenset[str]:
+    resolution = resolver.resolve([ck.Reference(ck.RefKind.QUALIFIED_NAME, qualified)])
+    assert resolution.per_graph, resolution.reasons
+    return resolution.files
+
+
+@pytest.mark.parametrize(
+    "kernel, expected",
+    [
+        # The importer, its closure, and the file that patches extpkg.
+        ("extpkg.kern.ext_kernel", {"wraps_ext.py", "leaf.py", "patch_ext.py"}),
+        ("extpkg.sub.impl.other_kernel", {"reexport_user.py", "patch_ext.py"}),
+        ("extpkg.mod.mod_kernel", {"module_user.py", "patch_ext.py"}),
+        # A patch of extpkg reaches only closures that import extpkg at run time.
+        ("otherpkg.kern.other", {"other_user.py", "typed_user.py"}),
+        ("extpkg2.x.k2", {"wraps_ext2.py", "item_patch.py"}),
+        ("extpkg3.mod.k3", {"wraps_ext3.py", "setattr_patch.py"}),
+        ("extpkg4.k.k4", {"wraps_ext4.py", "alias_patch.py"}),
+    ],
+)
+def test_a_kernel_of_another_package_folds_its_importers_and_patchers(
+    external, kernel, expected
+):
+    """nkilib kernels: the package files that import (and wrap) them, and every
+    file that patches the kernel's package, decide what the kernel compiles to."""
+    assert _kernel_files(external, kernel) == {F + rel for rel in expected}
+
+
+def test_a_kernel_of_another_package_no_digested_file_imports_falls_back(external):
+    """A kernel the digested sources never import (for example a test stand-in)."""
+    resolution = external.resolve(
+        [ck.Reference(ck.RefKind.QUALIFIED_NAME, "extpkg.nobody.lonely_kernel")]
+    )
+
+    assert not resolution.per_graph
+    assert any("extpkg.nobody.lonely_kernel" in r for r in resolution.reasons)
+    assert external.digest(resolution) == external.package_digest
+
+
+def test_a_file_that_patches_a_package_module_joins_its_closure(external):
+    assert _module_files(external, "vllm_neuron.functional.kernel_p") == {
+        F + "kernel_p.py",
+        F + "patch_in_package.py",
+    }
+
+
+def test_the_patch_scan_sees_each_mutation_form_and_nothing_else():
+    source = (
+        "import typing\n"
+        "import a.b\n"
+        "import c.d as cd\n"
+        "from e import f\n"
+        "from g.h import tbl\n"
+        "from i import j\n"
+        "from k import m\n"
+        "a.b.X = 1\n"  # attribute of a module reached through its package
+        "cd.Y += 1\n"  # augmented assignment
+        "del f.Z\n"  # deletion
+        "tbl['k'] = 1\n"  # item
+        "alias = j.cfg\n"
+        "alias.W = 1\n"  # through an alias
+        "def later():\n"
+        "    setattr(m, 'V', 1)\n"  # inside a function, via setattr
+        "    local = object()\n"
+        "    local.U = 1\n"  # not an imported object
+        "if typing.TYPE_CHECKING:\n"
+        "    from n import o\n"
+        "    o.T = 1\n"  # never runs
+    )
+
+    patched = ck._parse_imports("functional/x.py", source.encode()).patched
+
+    assert set(patched) == {"a.b", "c.d", "e.f", "g.h.tbl", "i.j.cfg", "k.m"}
+
+
+def test_the_package_patches_only_the_modules_the_doc_names():
+    """A new patch widens every key that reaches the patched package: review it,
+    then update this list and docs/design/compilation/kernel_source_digest.md."""
+    patchers = ck.default_resolver()._patch_index()
+
+    assert patchers.by_file == {}
+    assert patchers.by_package == {
+        "nkilib": frozenset({"functional/mlp.py"}),
+        "vllm": frozenset({"parallel/neuron_parallel_state.py"}),
+    }
+
+
+def test_a_live_kernel_of_another_package_resolves_by_its_qualified_name(external):
+    resolution = external.graph_resolution(
+        _kernel_graph(_stand_in_kernel("extpkg.kern", "ext_kernel"))
+    )
+
+    assert resolution.files == {F + "wraps_ext.py", F + "leaf.py", F + "patch_ext.py"}
+    assert resolution.modules == {"extpkg.kern.ext_kernel"}
+
+
+def test_a_kernel_defined_outside_every_package_tree_falls_back(external):
+    """A kernel a test module defines: no digested file imports it."""
+
+    def stand_in(x_hbm):
+        return x_hbm
+
+    resolution = external.graph_resolution(_kernel_graph(stand_in))
+
+    assert not resolution.per_graph
+    assert any(__name__ in r for r in resolution.reasons)
+
+
+MLP = "vllm_neuron.functional.mlp"
+
+
+def test_editing_the_wrapper_of_an_nkilib_kernel_changes_only_its_graph_key(
+    tmp_path, lib, restore_keys, no_kernel_compile
+):
+    """functional/mlp.py wraps nkilib's mlp kernel and patches nkilib's
+    ``is_mlp_tkg`` at import (mlp.py:18-35); an edit there must miss."""
+    copy = _copy_tree(tmp_path)
+    graph_mlp = _kernel_graph(_kernel_entry(MLP, "nkilib_mlp"))
+    graph_sinkhorn = _kernel_graph(_kernel_entry(SINKHORN, "sinkhorn_blocks_kernel"))
+
+    before = _graph_keys(lib, copy, graph_mlp, graph_sinkhorn)
+    _append_byte(copy / _rel(MLP))
+    after_mlp = _graph_keys(lib, copy, graph_mlp, graph_sinkhorn)
+    _append_byte(copy / _rel(SINKHORN))
+    after_sinkhorn = _graph_keys(lib, copy, graph_mlp, graph_sinkhorn)
+
+    assert after_mlp[0] != before[0] and after_mlp[1] == before[1]
+    assert after_sinkhorn[0] == after_mlp[0] and after_sinkhorn[1] != after_mlp[1]
+
+
+@pytest.mark.parametrize(
+    "func_name, wrapper",
+    [
+        (
+            "nkilib.core.subkernels.find_nonzero_indices.find_nonzero_indices",
+            "functional/moe/moe_blockwise.py",
+        ),
+        ("nkilib.core.subkernels.indexed_flatten.indexed_flatten", "functional/moe/moe_blockwise.py"),
+        (
+            "nkilib.experimental.conv.depthwise_conv1d.depthwise_conv1d_implicit_gemm",
+            "functional/kda/depthwise_conv1d.py",
+        ),
+        ("nkilib.core.mlp.mlp.mlp", "functional/mlp.py"),
+        ("nkilib.core.cumsum.cumsum.cumsum", "functional/cumsum.py"),
+    ],
+)
+def test_a_served_nkilib_kernel_folds_its_wrapper_and_the_nkilib_patcher(func_name, wrapper):
+    """The first three are the nkilib func_names in the served prefill graph.hlo."""
+    files = _kernel_files(ck.default_resolver(), func_name)
+
+    assert wrapper in files
+    assert "functional/mlp.py" in files  # patches nkilib.core.mlp at import
+
+
+def test_the_dotted_path_separates_a_package_kernel_from_its_nkilib_namesake():
+    """``cumsum`` and ``rotational_topk`` exist in both trees."""
+    resolver = ck.default_resolver()
+
+    def resolve(name):
+        return resolver.resolve([ck.Reference(ck.RefKind.QUALIFIED_NAME, name)])
+
+    package = resolve("vllm_neuron.functional.cumsum.cumsum")
+    nkilib = resolve("nkilib.core.cumsum.cumsum.cumsum")
+    vendored = resolve(
+        "vllm_neuron.functional.vendored_kernels.rotational_topk.rotational_topk.rotational_topk"
+    )
+    unimported = resolve("nkilib.core.topk.rotational_topk.rotational_topk")
+
+    assert package.modules == {"vllm_neuron.functional.cumsum"}
+    assert nkilib.modules == {"nkilib.core.cumsum.cumsum.cumsum"}
+    assert "functional/cumsum.py" in nkilib.files  # the file wrapping nkilib's cumsum
+    assert "functional/vendored_kernels/rotational_topk/rotational_topk.py" in vendored.files
+    assert not unimported.per_graph
+
+
+# Each row: a kernel module, a file an edit of which must move that kernel's
+# digest, and the reason the closure reaches it (file:line at 866f8c4).
+TRAP_ROWS = [
+    # A kernel called inside another traced kernel.
+    ("moe.hierarchical_all2all_combine_reduce", "functional/moe/topk_reduce.py"),  # :18/:139
+    ("moe.permute_routed_tokens", "functional/argsort_unstable.py"),  # :23/:654
+    # Imports inside a function body.
+    ("moe.moe_tkg", "functional/moe/moe_tkg_wrapper.py"),  # :158
+    ("attention.attention_decode", "utils/dtype_utils.py"),  # :967 FP8_CLAMP_MAX
+    ("attention.attention_decode", "functional/collectives/all_to_all.py"),  # :842 via __init__
+    ("topk", "functional/collectives/all_to_all.py"),  # :263 via functional/__init__.py:22
+    # A vendored package init that re-exports a name shadowing its submodule.
+    ("topk", "functional/vendored_kernels/rotational_topk/rotational_topk.py"),
+    ("topk", "functional/vendored_kernels/rotational_topk/__init__.py"),  # :30
+    ("dsa.topk_select", "functional/vendored_kernels/rotational_topk/rotational_topk_utils.py"),
+    # A submodule imported by name.
+    ("attention.mla_dense_window", "functional/attention/mla_sparse.py"),  # :50 as _ms
+    ("moe.router_decode", "functional/moe/router.py"),  # :46 from . import router
+    ("glue.kda_output", "functional/glue/__init__.py"),  # :42 glue_selected
+    # Helpers and constants in other modules.
+    ("blockwise_fp8_mm", "functional/moe/blockwise_fp8_retile.py"),  # TILE_SIZE
+    ("dsa.index_expand", "functional/attention/mla_sparse.py"),  # KEY_CHUNK
+    ("attention.attention_segmented_cte", "utils/bucket_utils.py"),  # SUPPORTED_KV_SEGMENT_SIZES
+    ("kda.fused_decode", "functional/kda/chunked_recurrence.py"),  # MAX_TILE
+    ("dsa.decode_batch", "functional/dsa/causal_bound.py"),
+    ("moe.fused_fp8", "functional/moe/fused_fp8_config.py"),
+    ("moe.expert_decode", "functional/moe/fused_fp8_pack.py"),
+    ("mhc.sinkhorn", "utils/neuron_utils.py"),  # can_run_kernel
+]
+
+
+@pytest.fixture(scope="module")
+def trap_tree(tmp_path_factory):
+    return _copy_tree(tmp_path_factory.mktemp("traps"))
+
+
+@pytest.mark.parametrize("kernel_module, reached", TRAP_ROWS)
+def test_an_edit_to_a_file_a_kernel_reaches_indirectly_moves_its_digest(
+    trap_tree, kernel_module, reached
+):
+    module = f"vllm_neuron.functional.{kernel_module}"
+    before = ck.KernelDigestResolver(trap_tree)
+    files = _module_files(before, module)
+    assert reached in files
+
+    path = trap_tree / reached
+    original = path.read_bytes()
+    path.write_bytes(original + b"\n")
+    try:
+        after = ck.KernelDigestResolver(trap_tree)
+        assert after.digest_of(_module_files(after, module)) != before.digest_of(files)
+    finally:
+        path.write_bytes(original)
 
 
 # --------------------------------------------- references a graph carries
@@ -618,6 +899,28 @@ def test_the_nki_key_folds_only_its_kernels_closure(tmp_path, lib, restore_keys)
     assert after[0] == ck.fold_key(
         library(sinkhorn, args, (1,)), resolver.digest_of(_module_files(resolver, SINKHORN))
     )
+
+
+def test_the_nki_key_of_an_nkilib_kernel_moves_with_its_wrapper_module(
+    tmp_path, lib, restore_keys
+):
+    _, nki_cache = lib
+    copy = _copy_tree(tmp_path)
+    nkilib_mlp = _raw_kernel("vllm_neuron.functional.mlp", "nkilib_mlp")
+    args = {"x_hbm": torch.empty(4, 8, device="meta")}
+
+    def key():
+        ck.install_per_graph_digest_key(ck.KernelDigestResolver(copy))
+        return nki_cache.create_nki_cache_key(nkilib_mlp, args, (1,))
+
+    before = key()
+    _append_byte(copy / _rel(SINKHORN))
+    unrelated = key()
+    _append_byte(copy / "functional/mlp.py")
+    after = key()
+
+    assert before is not None
+    assert unrelated == before and after != before
 
 
 def test_a_package_object_argument_joins_the_kernel_closure(tmp_path, monkeypatch):
@@ -961,25 +1264,28 @@ def test_every_nki_entry_point_under_functional_resolves_to_a_file_set():
             obj = getattr(module, name)
             func = getattr(obj, "func", obj)
             defining = func.__module__
-            for ref in (
-                ck.Reference(ck.RefKind.MODULE, defining),
-                ck.Reference(ck.RefKind.QUALIFIED_NAME, f"{defining}.{func.__qualname__}"),
-            ):
+            # A package kernel must reach its own file; another package's
+            # kernel must reach the package file that wraps it.
+            if defining.startswith("vllm_neuron."):
+                owner = _rel(defining)
+                owners = {owner, owner.replace(".py", "/__init__.py")}
+            else:
+                external.add(defining.split(".")[0])
+                owners = {path.relative_to(PACKAGE_ROOT).as_posix()}
+            refs = [ck.Reference(ck.RefKind.QUALIFIED_NAME, f"{defining}.{func.__qualname__}")]
+            if defining.startswith("vllm_neuron."):
+                refs.append(ck.Reference(ck.RefKind.MODULE, defining))
+            for ref in refs:
                 resolution = resolver.resolve([ref])
                 if not resolution.per_graph:
                     failures.append((path.name, name, ref, resolution.reasons))
-                elif defining.startswith("vllm_neuron."):
-                    if _rel(defining) not in resolution.files and (
-                        _rel(defining).replace(".py", "/__init__.py") not in resolution.files
-                    ):
-                        failures.append((path.name, name, ref, "defining file missing"))
-                else:
-                    external.add(defining.split(".")[0])
+                elif not owners & resolution.files:
+                    failures.append((path.name, name, ref, f"none of {sorted(owners)} reached"))
             checked += 1
 
     assert failures == []
     assert checked >= 60  # the scan sees the package's kernels, not nothing
-    assert external <= {"nkilib"}
+    assert external == {"nkilib"}
 
 
 def test_no_nki_entry_point_lives_outside_the_digested_sources():
