@@ -190,8 +190,10 @@ INFO - compile_cache_key.py - kernel digest: graph key <32-hex key> folds files=
 
 The first line comes once per process. The second line comes once for each
 new graph, at the rate of the library's own `Compilation cache key:` line. The
-first graph of a process also parses the files it reaches (about 215 ms for a
-served decode graph); later graphs take about 50 ms.
+first graph of a process also parses every snapshot file once to find the
+patches (about 1.7 s on a host at load average 217, at nice 10). A served-size
+graph (13 436 nodes, 552 kernel calls) then takes about 160 ms on the same
+host; the library's own `deepcopy` of that graph takes about 580 ms.
 
 Print the digests without starting a server:
 
