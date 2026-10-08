@@ -210,6 +210,7 @@ def _worker(
             get_kv_cache_spec=_kv_cache_specs,
             model=model if model is not None else _FakeModel(),
             drafter=None,
+            speculative_config=None,
         ),
     )
     for name in _WORKER_METHODS:
