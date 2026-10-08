@@ -315,10 +315,14 @@ class _Graph:
         """``{(node, semaphore): count}``: each semaphore's cumulative update right after
         each node's own update. Each semaphore belongs to one engine or queue, whose
         updates land in program order; a ``GroupResetSemaphores`` (between the blocks of a
-        device loop) zeroes its group."""
+        device loop) zeroes its group. A reset that names no group leaves every count after
+        it unknown, so it makes the dump undecided."""
         total, after = collections.Counter(), {}
         for name, inst in self.updates:
             if inst["opcode"] == "GroupResetSemaphores":
+                if "sema_group" not in inst:
+                    self.undecided.append(f"{name} GroupResetSemaphores@{inst['engine']}: "
+                                          f"no sema_group, so the counts after it are unknown")
                 for sem in inst.get("sema_group", []):
                     total[sem] = 0
             for update in (inst.get("sync_info") or {}).get("on_update", []):

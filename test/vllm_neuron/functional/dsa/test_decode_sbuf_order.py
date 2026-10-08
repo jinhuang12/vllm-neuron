@@ -152,6 +152,16 @@ def test_a_semaphore_reset_restarts_the_count(tmp_path):
     assert found.clean
 
 
+def test_a_reset_that_names_no_group_leaves_the_dump_undecided(tmp_path):
+    # Without a group the reset's semaphores are unknown, so no count after it is known.
+    found = _found(tmp_path, [_inst("a", "DVE", updates=[(7, 1)]),
+                              _inst("reset", "ALL", opcode="GroupResetSemaphores"),
+                              _inst("c", "DVE", outs=[_tile("x")], updates=[(7, 1)]),
+                              _inst("b", "Pool", ins=[_tile("x")], waits=[("c", 7, 1)])],
+                   [_loc("x")])
+    assert found.undecided and "sema_group" in found.undecided[0] and not found.clean
+
+
 def test_one_engine_and_a_barrier_order_their_accesses(tmp_path):
     found = _found(tmp_path, [_inst("a", "DVE", outs=[_tile("x")]),
                               _inst("b", "DVE", ins=[_tile("x")]),
