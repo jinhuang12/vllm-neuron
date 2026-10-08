@@ -16,6 +16,14 @@
 """Rotational top-k kernel finding the k largest elements along a dimension.
 
 Uses multi-stage rotation and reduction optimized for NeuronCore architecture.
+
+Vendored from nkilib ``core/topk`` (KaenaNeuronKernelLibrary 88ffd98c, see this package's
+``__init__``) and patched here: ``_topk_rotated_core`` gathers each stage's global indices into
+its own columns of the ``indices`` tile it reads rather than a fresh tile, and ``rotational_topk``
+builds ``indices`` per row tile so that each of its columns is written once. The gather then
+never writes SBUF its sources occupy (a gather dst/src alias, which the device's pieced gather
+turns into wrong indices). Carry the patch upstream, or apply it again, before nkilib's copy
+replaces this one.
 """
 
 from typing import Tuple
@@ -194,18 +202,18 @@ def rotational_topk(
     n_stages = config.n_stages
     stage_free_size = config.stage_free_size
     total_partition_dim = n_stages * tile_size
-    concatenated_stage_free_dim = stage_free_size + (
-        n_stages * config.local_top_k_per_stage
+    local_top_k_per_stage = config.local_top_k_per_stage
+    # The columns of one row tile's `indices` (laid out in `_topk_rotated_core`): the widest
+    # `data` a stage gathers from (the chunk's global indices and the rotated indices every stage
+    # but the last inserts), then one block of gathered global indices per stage.
+    index_free_dim = (
+        stage_free_size
+        + (n_stages - 1) * local_top_k_per_stage
+        + n_stages * local_top_k_per_stage
     )
 
-    indices = nl.ndarray(
-        (total_partition_dim, concatenated_stage_free_dim), dtype=nl.float32
-    )
-    nisa.iota(
-        dst=indices[:, nl.ds(0, stage_free_size)],
-        pattern=[[1, stage_free_size]],
-        offset=0,
-    )
+    chunk_index = nl.ndarray((total_partition_dim, stage_free_size), dtype=nl.float32)
+    nisa.iota(dst=chunk_index, pattern=[[1, stage_free_size]], offset=0)
 
     stage_offsets = build_stage_offsets(n_stages, tile_size, stage_free_size)
 
@@ -215,18 +223,22 @@ def rotational_topk(
     )
     nisa.tensor_copy(dst=rotation_f32, src=rotation, engine=nisa.vector_engine)
 
-    nisa.tensor_scalar(
-        dst=indices[:, nl.ds(0, stage_free_size)],
-        data=indices[:, nl.ds(0, stage_free_size)],
-        op0=nl.add,
-        operand0=stage_offsets,
-        engine=nisa.vector_engine,
-    )
-
     for tile_idx in nl.sequential_range(n_bxs_tiles):
         tile_batch_start = lnc_batch_start + tile_idx * tile_size
         tile_batch_end = min(
             tile_batch_start + tile_size, min(lnc_batch_start + config.per_lnc_BxS, BxS)
+        )
+
+        # One `indices` per row tile, so that each of its columns is written once (see
+        # `_topk_rotated_core`). The scalar engine fills it: the top-k keeps the vector engine
+        # busy, so the fill of one tile can run under the top-k of the tile before.
+        indices = nl.ndarray((total_partition_dim, index_free_dim), dtype=nl.float32)
+        nisa.tensor_scalar(
+            dst=indices[:, nl.ds(0, stage_free_size)],
+            data=chunk_index,
+            op0=nl.add,
+            operand0=stage_offsets,
+            engine=nisa.scalar_engine,
         )
 
         value, global_index = _topk_rotated_core(
@@ -304,23 +316,31 @@ def _topk_rotated_core(
         config (RotationalTopkConfig): Configuration with algorithm parameters
         batch_start (int): Start index for batch tile
         batch_end (int): End index for batch tile
+        rotation (nl.NkiTensor): [total_partition_dim, total_partition_dim], Rotation matrix
+        rotation_f32 (nl.NkiTensor): The rotation matrix in float32, for the indices
+        indices (nl.NkiTensor): [total_partition_dim, stage_free_size + (2 * n_stages - 1) *
+            local_top_k_per_stage], This tile's global indices, written by the caller in the
+            first stage_free_size columns and in the rest only here
 
     Returns:
         Tuple[nl.NkiTensor, nl.NkiTensor]: A tuple containing:
             - value: [total_partition_dim, local_top_k_per_stage], Top-k values
-            - global_index: [total_partition_dim, local_top_k_per_stage], Global indices
+            - global_index: [total_partition_dim, local_top_k_per_stage], Global indices,
+              a column slice of indices
 
     Pseudocode:
         # Initialize buffers with on-chip index generation
         values = folded_load(inp, n_stages)
-        indices = iota(0..stage_free_size) + stage_offsets
+        indices[:, :stage_free_size] = iota(0..stage_free_size) + stage_offsets  # by the caller
         rotation_matrix = load_circulant_permutation(n_stages, BxS)
+        gathered_start = stage_free_size + (local_top_k * (n_stages - 1))
 
         # Iterative rotation and top-k
         for stage_idx in range(n_stages):
             offset = stage_free_size + (local_top_k * stage_idx)
             local_vals, local_idx = topk_core(values[:, :offset], k=local_top_k)
-            global_idx = gather(indices, local_idx)
+            global_idx = indices[:, gathered_start + (local_top_k * stage_idx):][:, :local_top_k]
+            global_idx[...] = gather(indices[:, :offset], local_idx)
             if stage_idx < n_stages - 1:
                 rotated_vals = matmul(rotation_matrix, local_vals)
                 rotated_idx = matmul(rotation_matrix, global_idx)
@@ -336,6 +356,9 @@ def _topk_rotated_core(
 
     total_partition_dim = n_stages * BxS_size
     concatenated_stage_free_dim = stage_free_size + (n_stages * local_top_k_per_stage)
+    # The last stage reads the widest `data`, `indices[:, :offset]` at its `offset`; each
+    # stage's gathered global indices go to its own block of columns past it.
+    gathered_start = stage_free_size + (local_top_k_per_stage * (n_stages - 1))
 
     values = nl.ndarray(
         (total_partition_dim, concatenated_stage_free_dim), dtype=inp.dtype
@@ -362,9 +385,25 @@ def _topk_rotated_core(
 
         value, local_index = topk_core(data=values[:, :offset], k=local_top_k_per_stage)
 
-        global_index = nl.ndarray(
-            local_index.shape, dtype=indices.dtype, buffer=nl.sbuf
-        )
+        # Gather into this stage's own block of `indices`, which is disjoint by its columns from
+        # `data` and is not `local_index`. The device runs `nc_n_gather` in pieces that each read
+        # their part of `data` and of the indices from SBUF, so a destination over a source lets
+        # a piece read what an earlier piece wrote (the gather dst/src alias); the simulator
+        # gathers in one step and never shows it. A fresh destination tile is born at the
+        # gather, where on the last stage both sources die, and the backend's SBUF placement
+        # (`address_rotation_sb`) put it on the first bytes of `indices`. A column slice keeps
+        # the destination in the memory location of `data` only while each column of `indices`
+        # is written once: the backend may give a tile whose columns are written again a new
+        # memory location there (an SSA clone), which it places like a fresh tile. So the
+        # caller allocates `indices` per row tile, and every insert and gather here writes
+        # columns nothing else writes.
+        global_index = indices[
+            :,
+            nl.ds(
+                gathered_start + (local_top_k_per_stage * stage_idx),
+                local_index.shape[1],
+            ),
+        ]
         # Tile the gather into chunks no wider than the nc_n_gather ISA group size. A
         # single gather wider than this splits into multiple internal ISA groups, and
         # that multi-group form corrupts the tail elements of the last BxS tile on
