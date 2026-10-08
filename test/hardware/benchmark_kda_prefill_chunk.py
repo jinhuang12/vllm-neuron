@@ -1,35 +1,51 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The KDA prefill chunk kernels on Neuron: a baseline revision against this tree.
+"""The KDA prefill chunk kernels on Neuron: revisions of them against each other.
 
-Times :func:`kda_intra_chunk` (stages 1 to 3) and :func:`kda_inter_chunk` (stages 4
-and 5) at the served prefill shapes, ``[NC, C, K] = [128, 8, 128]`` (a 1024-token
-chunk) and ``[256, 8, 128]`` (a 2048-token chunk), for the baseline revision's
-``chunked_recurrence.py`` (read with ``git show``) and for this checkout's.
+Times :func:`kda_intra_chunk` (stages 1 to 3), :func:`kda_inter_chunk` (stages 4
+and 5) and the two chained, intra-chunk outputs into the inter-chunk call as a
+prefill layer runs them, at the served prefill shapes ``[NC, C, K] = [128, 8, 128]``
+(a 1024-token chunk) and ``[256, 8, 128]`` (a 2048-token chunk). The variants are
+the baseline revision, this checkout and any ``--variant NAME=REV``.
 
-One compiled graph holds ``--layers`` independent calls of one entry point, each on
-its own operands, because a prefill chunk calls each kernel once per KDA layer. A
-graph's time is the host wall time of one launch plus the copy of its first output
-to CPU; an empty graph over the same operands that returns a tensor of the same
-shape (``floor``) is timed alongside, and the per-call figure is
-``(graph - floor) / layers``.
+A revision's variant is its ``chunked_recurrence.py`` plus every module of the
+KDA package it imports, at any depth, read with ``git show``. Those modules
+import one another by their package names. While they load, those names are
+bound to the variant's copies, and then the live modules are restored. A module
+this checkout does not have stays bound to the variant's copy for the whole run,
+because a compiled graph that imported it re-checks that binding at every call.
+A revision that imports, inside a function, a module this checkout also has is
+refused, because its graphs would resolve this checkout's module.
 
-The variants are timed interleaved: every repetition times every variant once, in
-the same order, ``--iterations`` launches each after ``--warmup``. A graph's figure
-is the median over repetitions of the per-repetition medians. A kernel's
-per-call figure in one repetition is that repetition's ``(graph - floor) /
-layers``, and its spread is ``(max - min) / median`` of those over the
-repetitions. The noise floor is the largest per-call spread over the four kernel
-variants, i.e. how far one tree's own per-call figure moves between repetitions
-in this run; the graphs' own spreads, the floor graph's included, are reported
-beside it.
+One compiled graph holds ``--layers`` independent calls of one entry point (or
+one chained pair), each on its own operands, because a prefill chunk calls each
+kernel once per KDA layer. A graph's time is the host wall time of one launch
+plus the copy of its first output to CPU; an empty graph over the same operands
+that returns a tensor of the same shape (``floor``) is timed alongside, and the
+per-call figure is ``(graph - floor) / layers``.
 
-Numerics. For each ``--seeds`` entry and each shape, one-call graphs of both
-revisions run on the same operands; the outputs are saved as ``.pt`` files under
-``--numerics-dir`` and compared with ``torch.equal`` (baseline against this tree)
-and against the CPU references (:func:`kda_intra_chunk_torch_oracle`,
+The graphs are timed interleaved: every repetition times every graph once, in the
+same order, ``--iterations`` launches each after ``--warmup``. A graph's figure is
+the median over repetitions of the per-repetition medians. A kernel's per-call
+figure in one repetition is that repetition's ``(graph - floor) / layers``, and
+its spread is ``(max - min) / median`` of those over the repetitions. The noise
+floor is the largest per-call spread over every kernel and variant, i.e. how far
+one variant's own per-call figure moves between repetitions in this run; the
+graphs' own spreads, the floor graph's included, are reported beside it.
+
+Numerics. For each ``--seeds`` entry and each shape, one-call graphs of every
+variant run on the same operands; the outputs are saved as ``.pt`` files under
+``--numerics-dir`` and compared with ``torch.equal`` against the baseline and
+against the CPU references (:func:`kda_intra_chunk_torch_oracle`,
 :func:`rebuild_i_plus_a`, :func:`kda_inter_chunk_torch_oracle`). The inter-chunk
-operands are the CPU reference's intra-chunk outputs, so both revisions' inter-chunk
-kernels read identical bits.
+operands are the CPU reference's intra-chunk outputs, so every variant's
+inter-chunk kernel reads identical bits; the chained graph reads each variant's
+own intra-chunk outputs.
+
+The compiled-kernel cache keys a kernel on its own source text, not on the
+helpers or constants it emits through, so a warm cache can serve a kernel built
+from older helpers. ``NEURON_LIBTORCH_CACHE_ROOT`` must therefore name an empty
+or absent directory, and ``--workdir`` must be empty or absent too; the report
+records both, and the kernel artifacts the run compiled.
 
 Run it through the device lease, which pins the cores and the LNC; this script
 refuses to run without ``NEURON_RT_VISIBLE_CORES``.
@@ -38,7 +54,10 @@ refuses to run without ``NEURON_RT_VISIBLE_CORES``.
 from __future__ import annotations
 
 import argparse
+import ast
+import contextlib
 import hashlib
+import importlib.machinery
 import importlib.util
 import json
 import os
@@ -46,7 +65,9 @@ import statistics
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from types import ModuleType
 
 #: The worktree root, ahead of any installed copy: the lease command sets no
 #: PYTHONPATH, and the venv's own ``vllm_neuron`` is another tree.
@@ -61,11 +82,19 @@ from vllm_neuron.functional.kda import chunked_recurrence as live
 
 DEVICE = "neuron:0"
 
-#: The file both revisions are read from.
-KERNEL_PATH = "vllm_neuron/functional/kda/chunked_recurrence.py"
+#: The package the kernel module lives in, and the kernel module's leaf name in it.
+KDA_PACKAGE = "vllm_neuron.functional.kda"
+KERNEL_LEAF = "chunked_recurrence"
+
+#: Where a leaf of :data:`KDA_PACKAGE` lives in a revision.
+PACKAGE_DIR = "vllm_neuron/functional/kda"
 
 #: The revision this series starts from; ``--baseline-rev`` names another.
 BASELINE_REV = "f3a833f"
+
+#: The variant names of the baseline revision and of this checkout.
+BASELINE = "baseline"
+CHECKOUT = "checkout"
 
 #: Chunks per call at the two served prefill chunk sizes, 1024 and 2048 tokens.
 SERVED_N_CHUNKS = (128, 256)
@@ -84,35 +113,159 @@ KDA_LAYERS = 34
 #: ``(GATE_LOWER_BOUND, 0)``, as the gate clamp produces it.
 GATE_LOWER_BOUND = -5.0
 
+#: The timed and checked graphs: the two entry points and the two chained.
+KERNELS = ("intra", "inter", "chain")
+
 INTRA_FIELDS = ("w", "u", "kg", "a_inv", "aqk")
 INTER_FIELDS = ("o", "final_state", "v_new")
+FIELDS = {"intra": INTRA_FIELDS, "inter": INTER_FIELDS, "chain": INTER_FIELDS}
+
+#: Operands per call of each graph: the entry point's, or for the chain the
+#: intra-chunk operands and the entering state.
+OPERANDS = {"intra": 5, "inter": 7, "chain": 6}
 
 
-def load_baseline(rev: str, workdir: Path):
-    """The baseline revision's ``chunked_recurrence`` as a fresh module.
-
-    The source is written into ``workdir`` because the NKI front end reads a
-    kernel's source from its file. The module is registered under its own name,
-    because a compiled graph resolves the kernel's globals by module name.
-    """
-    source = subprocess.run(
-        ["git", "-C", str(REPO), "show", f"{rev}:{KERNEL_PATH}"],
+def _git_show(rev: str, path: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(REPO), "show", f"{rev}:{path}"],
         check=True, capture_output=True, text=True,
     ).stdout
-    path = workdir / "baseline_chunked_recurrence.py"
-    path.write_text(source)
-    name = "_kda_prefill_baseline_chunked_recurrence"
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise ValueError(f"cannot load the baseline source {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module, hashlib.sha256(source.encode()).hexdigest()
+
+
+def _imported_leaves(nodes) -> set[str]:
+    """The leaves of :data:`KDA_PACKAGE` that the import statements in ``nodes`` name."""
+    prefix = KDA_PACKAGE + "."
+    leaves = set()
+    for node in nodes:
+        if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            if node.module == KDA_PACKAGE:
+                leaves.update(alias.name for alias in node.names)
+            elif node.module.startswith(prefix):
+                leaves.add(node.module[len(prefix):].split(".")[0])
+        elif isinstance(node, ast.Import):
+            leaves.update(alias.name[len(prefix):].split(".")[0]
+                          for alias in node.names if alias.name.startswith(prefix))
+    return leaves
+
+
+def package_imports(source: str) -> tuple[set[str], set[str]]:
+    """The leaves of :data:`KDA_PACKAGE` that ``source`` imports at any scope, and
+    those it imports inside a function, i.e. when that function runs."""
+    tree = ast.parse(source)
+    functions = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+    in_functions = _imported_leaves(
+        node for scope in ast.walk(tree) if isinstance(scope, functions)
+        for node in ast.walk(scope))
+    return _imported_leaves(ast.walk(tree)), in_functions
+
+
+@contextlib.contextmanager
+def bound(modules: dict[str, ModuleType]):
+    """Bind each leaf of :data:`KDA_PACKAGE` to ``modules[leaf]``, then restore.
+
+    A leaf is bound both in ``sys.modules`` and as the package's attribute, the
+    two places ``from package import leaf`` reads.
+    """
+    package = sys.modules[KDA_PACKAGE]
+    absent = object()
+    saved = {
+        leaf: (sys.modules.get(f"{KDA_PACKAGE}.{leaf}", absent),
+               getattr(package, leaf, absent))
+        for leaf in modules
+    }
+    for leaf, module in modules.items():
+        sys.modules[f"{KDA_PACKAGE}.{leaf}"] = module
+        setattr(package, leaf, module)
+    try:
+        yield
+    finally:
+        for leaf, (entry, attribute) in saved.items():
+            name = f"{KDA_PACKAGE}.{leaf}"
+            if entry is absent:
+                del sys.modules[name]
+            else:
+                sys.modules[name] = entry
+            if attribute is absent:
+                delattr(package, leaf)
+            else:
+                setattr(package, leaf, attribute)
+
+
+def _checkout_has(leaf: str) -> bool:
+    """Whether this checkout's package has ``leaf``, on disk, whatever is bound."""
+    package = sys.modules[KDA_PACKAGE]
+    return importlib.machinery.PathFinder.find_spec(
+        f"{KDA_PACKAGE}.{leaf}", package.__path__) is not None
+
+
+@dataclass
+class Variant:
+    """One revision of the kernel module: its entry points and the sources loaded."""
+
+    name: str
+    rev: str
+    module: ModuleType
+    sha256: dict[str, str]
+
+
+def load_revision(name: str, rev: str, workdir: Path) -> Variant:
+    """``rev``'s kernel module and the package modules it imports, as fresh modules.
+
+    Each source is written into ``workdir`` under a name of its own, because the
+    NKI front end reads a kernel's source from its file and the compiled-kernel
+    cache keys on that file's base name. Each module is registered under its own
+    name, because a compiled graph resolves the kernel's globals by module name.
+    The package names are bound as the module docstring states.
+    """
+    sources, in_functions = {}, {}
+    pending = [KERNEL_LEAF]
+    while pending:
+        leaf = pending.pop(0)
+        sources[leaf] = _git_show(rev, f"{PACKAGE_DIR}/{leaf}.py")
+        every, in_functions[leaf] = package_imports(sources[leaf])
+        pending.extend(sorted(every - sources.keys() - set(pending)))
+    kept = {leaf for leaf in sources if not _checkout_has(leaf)}
+    unbindable = sorted(set().union(*in_functions.values()) - kept)
+    if unbindable:
+        raise ValueError(
+            f"{rev} imports {unbindable} inside a function, and this checkout has "
+            f"them too: its graphs would trace this checkout's modules")
+    taken = sorted(leaf for leaf in kept if f"{KDA_PACKAGE}.{leaf}" in sys.modules)
+    if taken:
+        raise ValueError(f"{rev} needs {taken} bound for the run, and another variant holds them")
+    modules = {}
+    for leaf, source in sources.items():
+        path = workdir / f"{name}_{leaf}.py"
+        path.write_text(source)
+        module_name = f"_kda_prefill_{name}_{leaf}"
+        spec = importlib.util.spec_from_file_location(module_name, path)
+        if spec is None or spec.loader is None:
+            raise ValueError(f"cannot load {rev}:{PACKAGE_DIR}/{leaf}.py from {path}")
+        modules[leaf] = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = modules[leaf]
+    # In discovery order, so the kernel module runs before the modules that
+    # import it at their top level.
+    with bound(modules):
+        for module in modules.values():
+            module.__spec__.loader.exec_module(module)
+    package = sys.modules[KDA_PACKAGE]
+    for leaf in sorted(kept):
+        sys.modules[f"{KDA_PACKAGE}.{leaf}"] = modules[leaf]
+        setattr(package, leaf, modules[leaf])
+    return Variant(
+        name=name, rev=rev, module=modules[KERNEL_LEAF],
+        sha256={leaf: hashlib.sha256(s.encode()).hexdigest() for leaf, s in sources.items()},
+    )
+
+
+def checkout_variant() -> Variant:
+    path = Path(live.__file__)
+    return Variant(name=CHECKOUT, rev="checkout", module=live,
+                   sha256={KERNEL_LEAF: hashlib.sha256(path.read_bytes()).hexdigest()})
 
 
 def make_inputs(n_chunks: int, seed: int) -> dict:
-    """One call's operands for both kernels, as CPU float32 tensors.
+    """One call's operands for every graph, as CPU float32 tensors.
 
     The intra-chunk operands are drawn; the inter-chunk operands are the CPU
     reference's intra-chunk outputs on them, plus an entering state.
@@ -129,27 +282,28 @@ def make_inputs(n_chunks: int, seed: int) -> dict:
     return {
         "intra": (q, k, v, beta, gk),
         "inter": (ref.kg, ref.w, ref.u, gk, q, ref.aqk, state),
+        "chain": (q, k, v, beta, gk, state),
         "intra_reference": ref,
     }
 
 
-def intra_graph(module, layers: int):
+def graph_fn(kernel: str, module, layers: int):
+    """``layers`` independent calls of ``kernel`` from ``module``, one graph."""
+    width = OPERANDS[kernel]
+
     def run(*args):
         outs = []
         for layer in range(layers):
-            got = module.kda_intra_chunk(*args[5 * layer : 5 * (layer + 1)])
-            outs.extend(got)
-        return tuple(outs)
-
-    return run
-
-
-def inter_graph(module, layers: int):
-    def run(*args):
-        outs = []
-        for layer in range(layers):
-            kg, w, u, gk, q, aqk, state = args[7 * layer : 7 * (layer + 1)]
-            outs.extend(module.kda_inter_chunk(kg, w, u, gk, q, aqk, state=state))
+            call = args[width * layer: width * (layer + 1)]
+            if kernel == "intra":
+                outs.extend(module.kda_intra_chunk(*call))
+            elif kernel == "inter":
+                outs.extend(module.kda_inter_chunk(*call[:6], state=call[6]))
+            else:
+                q, k, v, beta, gk, state = call
+                intra = module.kda_intra_chunk(q, k, v, beta, gk)
+                outs.extend(module.kda_inter_chunk(
+                    intra.kg, intra.w, intra.u, gk, q, intra.aqk, state=state))
         return tuple(outs)
 
     return run
@@ -194,61 +348,59 @@ def summarize_reps(per_rep: list[float]) -> dict:
     }
 
 
-def bench_shape(n_chunks: int, baseline, args) -> dict:
-    """Timed graphs for one shape: both kernels, both revisions, and the floor."""
+def bench_shape(n_chunks: int, variants: list[Variant], args) -> dict:
+    """Timed graphs for one shape: every kernel of every variant, and the floor."""
     torch._dynamo.reset()
     layers = args.layers
     cases = [make_inputs(n_chunks, args.timing_seed + layer) for layer in range(layers)]
-    intra_in = to_device([t for c in cases for t in c["intra"]])
-    inter_in = to_device([t for c in cases for t in c["inter"]])
-    variants = {
-        "intra_before": (compiled(intra_graph(baseline, layers)), intra_in),
-        "intra_after": (compiled(intra_graph(live, layers)), intra_in),
-        "inter_before": (compiled(inter_graph(baseline, layers)), inter_in),
-        "inter_after": (compiled(inter_graph(live, layers)), inter_in),
-        "floor": (compiled(floor_graph), intra_in),
+    inputs = {kernel: to_device([t for c in cases for t in c[kernel]]) for kernel in KERNELS}
+    graphs = {
+        (kernel, variant.name): (compiled(graph_fn(kernel, variant.module, layers)),
+                                 inputs[kernel])
+        for kernel in KERNELS for variant in variants
     }
+    graphs[("floor", "")] = (compiled(floor_graph), inputs["intra"])
+    label = {key: "floor" if key[0] == "floor" else f"{key[0]}_{key[1]}" for key in graphs}
     result = {"n_chunks": n_chunks, "layers": layers, "first_call_s": {}}
-    for name, (model, inputs) in variants.items():
+    for key, (model, operands) in graphs.items():
         started = time.perf_counter()
-        first = model(*inputs)[0].to("cpu")
-        result["first_call_s"][name] = time.perf_counter() - started
+        first = model(*operands)[0].to("cpu")
+        result["first_call_s"][label[key]] = time.perf_counter() - started
         if not torch.isfinite(first).all():
-            raise AssertionError(f"{name} at n_chunks={n_chunks} returned non-finite values")
+            raise AssertionError(f"{label[key]} at n_chunks={n_chunks} returned non-finite values")
 
-    per_rep = {name: [] for name in variants}
-    raw = {name: [] for name in variants}
+    per_rep = {key: [] for key in graphs}
+    raw = {label[key]: [] for key in graphs}
     for _ in range(args.reps):
-        for name, (model, inputs) in variants.items():
-            got = time_once(model, inputs, args.warmup, args.iterations)
-            per_rep[name].append(got["median_us"])
-            raw[name].append(got["samples_us"])
-    graphs = {name: summarize_reps(values) for name, values in per_rep.items()}
-    floor_us = graphs["floor"]["median_us"]
-    per_call = {}
-    for name, summary in graphs.items():
-        if name == "floor":
+        for key, (model, operands) in graphs.items():
+            got = time_once(model, operands, args.warmup, args.iterations)
+            per_rep[key].append(got["median_us"])
+            raw[label[key]].append(got["samples_us"])
+    summaries = {key: summarize_reps(values) for key, values in per_rep.items()}
+    floor = summaries[("floor", "")]
+    per_call = {kernel: {} for kernel in KERNELS}
+    for (kernel, name), summary in summaries.items():
+        if kernel == "floor":
             continue
-        per_rep_us = [
-            (value - floor_rep) / layers
-            for value, floor_rep in zip(summary["per_rep_median_us"],
-                                        graphs["floor"]["per_rep_median_us"])
-        ]
-        per_call[name] = {
-            "median_us": (summary["median_us"] - floor_us) / layers,
+        per_rep_us = [(value - floor_rep) / layers for value, floor_rep in
+                      zip(summary["per_rep_median_us"], floor["per_rep_median_us"])]
+        per_call[kernel][name] = {
+            "median_us": (summary["median_us"] - floor["median_us"]) / layers,
             "per_rep_us": per_rep_us,
             "spread": (max(per_rep_us) - min(per_rep_us)) / statistics.median(per_rep_us),
         }
-    kernel_variants = tuple(per_call)
-    for kernel in ("intra", "inter"):
-        before = per_call[f"{kernel}_before"]["median_us"]
-        after = per_call[f"{kernel}_after"]["median_us"]
-        per_call[f"{kernel}_speedup"] = before / after
+    speedup = {
+        kernel: {name: per_call[kernel][BASELINE]["median_us"] / figure["median_us"]
+                 for name, figure in per_call[kernel].items() if name != BASELINE}
+        for kernel in KERNELS
+    }
     result.update({
-        "graphs_us": graphs,
+        "graphs_us": {label[key]: summary for key, summary in summaries.items()},
         "per_call_us": per_call,
-        "noise_floor_spread": max(per_call[name]["spread"] for name in kernel_variants),
-        "graph_spread": {name: summary["spread"] for name, summary in graphs.items()},
+        "speedup_vs_baseline": speedup,
+        "noise_floor_spread": max(figure["spread"] for kernel in KERNELS
+                                  for figure in per_call[kernel].values()),
+        "graph_spread": {label[key]: summary["spread"] for key, summary in summaries.items()},
         "samples_us": raw,
     })
     return result
@@ -264,62 +416,74 @@ def tensor_diff(got: torch.Tensor, want: torch.Tensor) -> dict:
     }
 
 
-def numerics_shape(n_chunks: int, baseline, args) -> list[dict]:
-    """One-call graphs of both revisions on ``--seeds`` operands; outputs saved."""
+def numerics_shape(n_chunks: int, variants: list[Variant], args) -> list[dict]:
+    """One-call graphs of every variant on ``--seeds`` operands; outputs saved."""
     torch._dynamo.reset()
     models = {
-        "intra_before": compiled(intra_graph(baseline, 1)),
-        "intra_after": compiled(intra_graph(live, 1)),
-        "inter_before": compiled(inter_graph(baseline, 1)),
-        "inter_after": compiled(inter_graph(live, 1)),
+        (kernel, variant.name): compiled(graph_fn(kernel, variant.module, 1))
+        for kernel in KERNELS for variant in variants
     }
     rows = []
     for seed in args.seeds:
         case = make_inputs(n_chunks, seed)
         directory = args.numerics_dir / f"n{n_chunks}" / f"seed{seed}"
         directory.mkdir(parents=True, exist_ok=True)
-        torch.save({"intra": case["intra"], "inter": case["inter"]},
-                   directory / "inputs.pt")
+        torch.save({kernel: case[kernel] for kernel in KERNELS}, directory / "inputs.pt")
         outputs = {}
-        for name, model in models.items():
-            kernel = name.split("_")[0]
-            fields = INTRA_FIELDS if kernel == "intra" else INTER_FIELDS
+        for (kernel, name), model in models.items():
             got = model(*to_device(case[kernel]))
-            outputs[name] = {f: t.to("cpu") for f, t in zip(fields, got)}
-            torch.save(outputs[name], directory / f"{name}.pt")
+            outputs[(kernel, name)] = {f: t.to("cpu") for f, t in zip(FIELDS[kernel], got)}
+            torch.save(outputs[(kernel, name)], directory / f"{kernel}_{name}.pt")
 
         _, k, _, beta, gk = case["intra"]
-        intra_ref = case["intra_reference"]
-        inter_ref = live.kda_inter_chunk_torch_oracle(
-            *case["inter"][:6], state=case["inter"][6]
-        )
+        inter_ref = live.kda_inter_chunk_torch_oracle(*case["inter"][:6],
+                                                      state=case["inter"][6])
+        reference = {"intra": case["intra_reference"], "inter": inter_ref, "chain": inter_ref}
         row = {"n_chunks": n_chunks, "seed": seed, "dir": str(directory)}
-        for kernel, fields, ref in (("intra", INTRA_FIELDS, intra_ref),
-                                    ("inter", INTER_FIELDS, inter_ref)):
-            before, after = outputs[f"{kernel}_before"], outputs[f"{kernel}_after"]
-            row[kernel] = {
-                f: {
-                    "bit_equal": bool(torch.equal(before[f], after[f])),
-                    "after_vs_before": tensor_diff(after[f], before[f]),
-                    "before_vs_reference": tensor_diff(before[f], getattr(ref, f)),
-                    "after_vs_reference": tensor_diff(after[f], getattr(ref, f)),
+        for kernel in KERNELS:
+            baseline = outputs[(kernel, BASELINE)]
+            row[kernel] = {}
+            for variant in variants:
+                got = outputs[(kernel, variant.name)]
+                row[kernel][variant.name] = {
+                    f: {
+                        "bit_equal_to_baseline": bool(torch.equal(got[f], baseline[f])),
+                        "vs_baseline": tensor_diff(got[f], baseline[f]),
+                        "vs_reference": tensor_diff(got[f], getattr(reference[kernel], f)),
+                    }
+                    for f in FIELDS[kernel]
                 }
-                for f in fields
-            }
         i_plus_a = live.rebuild_i_plus_a(k, beta, gk)
         identity = torch.eye(SERVED_CHUNK).expand_as(i_plus_a)
         row["intra_inverse_residual_max_abs"] = {
-            rev: float((i_plus_a @ outputs[f"intra_{rev}"]["a_inv"] - identity).abs().max())
-            for rev in ("before", "after")
+            variant.name: float(
+                (i_plus_a @ outputs[("intra", variant.name)]["a_inv"] - identity).abs().max())
+            for variant in variants
         }
         rows.append(row)
     return rows
+
+
+def _named_rev(text: str) -> tuple[str, str]:
+    name, sep, rev = text.partition("=")
+    if not sep or not name.isidentifier() or not rev or name in (BASELINE, CHECKOUT):
+        raise argparse.ArgumentTypeError(
+            f"expected NAME=REV with NAME an identifier other than {BASELINE!r} and "
+            f"{CHECKOUT!r}, got {text!r}")
+    return name, rev
+
+
+def _require_fresh(path: Path, what: str) -> None:
+    if path.exists() and any(path.iterdir()):
+        raise ValueError(f"{what} {path} is not empty; name a fresh directory")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--baseline-rev", default=BASELINE_REV)
+    parser.add_argument("--variant", type=_named_rev, action="append", default=[],
+                        metavar="NAME=REV", help="another revision to time and check")
     parser.add_argument("--n-chunks", type=int, nargs="+", default=list(SERVED_N_CHUNKS))
     parser.add_argument("--layers", type=int, default=KDA_LAYERS)
     parser.add_argument("--reps", type=int, default=5)
@@ -336,30 +500,44 @@ def main() -> None:
         raise ValueError("Run through the device lease, which pins NEURON_RT_VISIBLE_CORES")
     if args.reps < 1 or args.iterations < 1 or args.warmup < 0 or args.layers < 1:
         raise ValueError("Use positive reps, iterations and layers, nonnegative warmup")
+    names = [name for name, _ in args.variant]
+    if len(set(names)) != len(names):
+        raise ValueError(f"variant names repeat: {names}")
+    cache_root = os.environ.get("NEURON_LIBTORCH_CACHE_ROOT")
+    if not cache_root:
+        raise ValueError("Set NEURON_LIBTORCH_CACHE_ROOT to an empty or absent directory")
+    _require_fresh(Path(cache_root), "NEURON_LIBTORCH_CACHE_ROOT")
     args.out = args.out.resolve()
     args.workdir = (args.workdir or args.out.parent / f"{args.out.stem}_workdir").resolve()
     args.numerics_dir = (
         args.numerics_dir or args.out.parent / f"{args.out.stem}_numerics"
     ).resolve()
+    _require_fresh(args.workdir, "--workdir")
     args.workdir.mkdir(parents=True, exist_ok=True)
-    baseline, baseline_sha256 = load_baseline(args.baseline_rev, args.workdir)
+    variants = [load_revision(BASELINE, args.baseline_rev, args.workdir), checkout_variant()]
+    variants += [load_revision(name, rev, args.workdir) for name, rev in args.variant]
+    # Every kernel's graph of every variant is one more compile of the same code
+    # object (``graph_fn``'s ``run``); past the recompile limit dynamo would run
+    # that frame eagerly, untimed as a graph, so raise the limit and fail past it.
+    torch._dynamo.config.recompile_limit = len(KERNELS) * len(variants)
+    torch._dynamo.config.fail_on_recompile_limit_hit = True
     # The kernel compiler writes its artifacts into the working directory; keep
     # them out of the checkout.
     os.chdir(args.workdir)
     head = subprocess.run(["git", "-C", str(REPO), "rev-parse", "HEAD"],
                           check=True, capture_output=True, text=True).stdout.strip()
-    dirty = subprocess.run(["git", "-C", str(REPO), "status", "--porcelain", KERNEL_PATH],
-                           check=True, capture_output=True, text=True).stdout.strip()
+    dirty = subprocess.run(
+        ["git", "-C", str(REPO), "status", "--porcelain", f"{PACKAGE_DIR}/{KERNEL_LEAF}.py"],
+        check=True, capture_output=True, text=True).stdout.strip()
     report = {
         "environment": {
             key: os.environ.get(key)
             for key in ("NEURON_RT_VISIBLE_CORES", "NEURON_LOGICAL_NC_CONFIG",
-                        "NEURON_CC_FLAGS", "NEURON_PLATFORM_TARGET_OVERRIDE")
+                        "NEURON_CC_FLAGS", "NEURON_PLATFORM_TARGET_OVERRIDE",
+                        "NEURON_LIBTORCH_CACHE_ROOT")
         },
-        "tree": {"head": head, "kernel_file_dirty": bool(dirty),
-                 "kernel_sha256": hashlib.sha256(
-                     (REPO / KERNEL_PATH).read_bytes()).hexdigest()},
-        "baseline": {"rev": args.baseline_rev, "kernel_sha256": baseline_sha256},
+        "tree": {"head": head, "kernel_file_dirty": bool(dirty)},
+        "variants": {v.name: {"rev": v.rev, "sha256": v.sha256} for v in variants},
         "shape": {"chunk": SERVED_CHUNK, "kdim": SERVED_KDIM, "vdim": SERVED_VDIM},
         "timing_unit": (
             "microseconds per kernel call = (graph median - floor median) / layers; "
@@ -370,21 +548,30 @@ def main() -> None:
         "numerics": [],
     }
     args.out.parent.mkdir(parents=True, exist_ok=True)
+
+    def write() -> None:
+        report["compiled_kernels"] = sorted(p.name for p in args.workdir.rglob("*.colz"))
+        args.out.write_text(json.dumps(report, indent=2) + "\n")
+
     for n_chunks in args.n_chunks:
-        result = bench_shape(n_chunks, baseline, args)
+        result = bench_shape(n_chunks, variants, args)
         report["timing"].append(result)
-        args.out.write_text(json.dumps(report, indent=2) + "\n")
-        print(json.dumps({"n_chunks": n_chunks, "per_call_us": result["per_call_us"],
-                          "noise_floor_spread": result["noise_floor_spread"]}), flush=True)
+        write()
+        print(json.dumps({"n_chunks": n_chunks, "per_call_us": {
+            kernel: {name: figure["median_us"] for name, figure in by_name.items()}
+            for kernel, by_name in result["per_call_us"].items()},
+            "noise_floor_spread": result["noise_floor_spread"]}), flush=True)
     for n_chunks in args.n_chunks:
-        rows = numerics_shape(n_chunks, baseline, args)
+        rows = numerics_shape(n_chunks, variants, args)
         report["numerics"].extend(rows)
-        args.out.write_text(json.dumps(report, indent=2) + "\n")
+        write()
         for row in rows:
             print(json.dumps({
                 "n_chunks": n_chunks, "seed": row["seed"],
-                "intra_bit_equal": {f: row["intra"][f]["bit_equal"] for f in INTRA_FIELDS},
-                "inter_bit_equal": {f: row["inter"][f]["bit_equal"] for f in INTER_FIELDS},
+                "bit_equal_to_baseline": {
+                    kernel: {name: all(f["bit_equal_to_baseline"] for f in by_field.values())
+                             for name, by_field in row[kernel].items()}
+                    for kernel in KERNELS},
             }), flush=True)
 
 
