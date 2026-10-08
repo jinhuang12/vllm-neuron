@@ -5,7 +5,7 @@ The simulator runs a kernel body as plain Python, so it never meets the NKI fron
 end, which refuses call forms the simulator accepts, nor the backend compiler.
 These cases build each kernel as ``compile_nki`` does for the served graph --
 ``CompileKernel`` for the platform target, at the launch's LNC -- through the
-front end to BIR, then through ``neuronx-cc`` to a NEFF, at the two served
+front end to BIR, then through ``neuronx-cc`` to a NEFF, at the served
 prefill shapes. Nothing here opens a device: the target comes from
 ``NEURON_PLATFORM_TARGET_OVERRIDE``, which ``test/conftest.py`` pins.
 
@@ -33,9 +33,11 @@ CHUNK = 8
 KDIM = 128
 VDIM = 128
 
-#: The served prefill chunk sizes, in tokens; a call takes ``tokens // CHUNK``
-#: chunks.
-SERVED_PREFILL_TOKENS = (1024, 2048)
+#: The served prefill chunk sizes, in tokens, one per served line: 1024 (the
+#: short-context line), 2048 (the 64k-context line) and 512 (the 256k-context
+#: line, whose indexer chain stops a larger chunk from compiling). A call takes
+#: ``tokens // CHUNK`` chunks.
+SERVED_PREFILL_TOKENS = (1024, 2048, 512)
 
 #: The served runtime's LNC, and the one-program launch every other runtime takes.
 SERVED_LNC = cr.LNC2_PROGRAMS
