@@ -56,7 +56,8 @@ KNOB_NAMES = [name for name, _, _ in GLM5NEXT_KNOBS]
 
 #: Capabilities the model code sets for itself. They are fields of the same
 #: dataclass but are not user-settable knobs, so the table below excludes them.
-INTERNAL_FIELDS = ("_model_supports_independent_prefill_buckets",)
+INTERNAL_FIELDS = ("_model_supports_independent_prefill_buckets",
+                   "_model_supports_windowed_prefill")
 
 
 def _field_names(cls):

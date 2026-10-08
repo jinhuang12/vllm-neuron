@@ -203,6 +203,10 @@ class NeuronConfig:
     # taken from the caller, who must not be able to claim a bucketing mode the
     # kernels do not support.
     _model_supports_independent_prefill_buckets: bool = False
+    # Whether the model reads a prefill chunk's prior KV through a gathered window
+    # rather than the segmented attention kernel, so any segment size is served.
+    # Resolved by the platform from the model class, as the flag above.
+    _model_supports_windowed_prefill: bool = False
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> "NeuronConfig":
@@ -290,6 +294,9 @@ class NeuronConfig:
             block_quant_scale_min=config_dict.get("block_quant_scale_min"),
             _model_supports_independent_prefill_buckets=config_dict.get(
                 "_model_supports_independent_prefill_buckets", False
+            ),
+            _model_supports_windowed_prefill=config_dict.get(
+                "_model_supports_windowed_prefill", False
             ),
         )
 

@@ -43,8 +43,9 @@ from test.vllm_neuron.vllm.test_admission import (
     KNOB,
     SERVED_BLOCK,
     SERVED_GENERATION_CONFIG,
+    OLD_WINDOW,
     STANDARD_LINE,
-    STANDARD_WINDOW,
+    STANDARD_MAX,
 )
 
 pytestmark = [pytest.mark.fast]
@@ -171,12 +172,23 @@ def _error(response) -> str:
 
 
 @pytest.mark.parametrize("stream", [False, True], ids=["plain", "streamed"])
-def test_a_prompt_past_the_window_is_a_400_the_engine_never_sees(greedy_server, stream):
-    response = _complete(greedy_server, STANDARD_WINDOW + 1, temperature=0.0, stream=stream)
+def test_a_prompt_past_max_model_len_is_a_400_the_engine_never_sees(greedy_server, stream):
+    """A 4096-token prompt plus the requested tokens exceeds max_model_len 4096."""
+    response = _complete(greedy_server, STANDARD_MAX, temperature=0.0, stream=stream)
     assert response.status_code == 400, response.text
     message = _error(response)
-    assert str(STANDARD_WINDOW + 1) in message and str(STANDARD_WINDOW) in message, message
+    assert str(STANDARD_MAX) in message, message
     assert greedy_server[1].requests == []
+
+
+@pytest.mark.parametrize("tokens", [OLD_WINDOW + 1, 3000, STANDARD_MAX - 3])
+def test_a_prompt_past_the_old_2048_token_window_reaches_the_engine(greedy_server, tokens):
+    """Before this change the standard line answered 400 here (window 2048 < 4096)."""
+    response = _complete(greedy_server, tokens, temperature=0.0, return_token_ids=True)
+    assert response.status_code == 200, response.text
+    assert response.json()["choices"][0]["token_ids"] == ENGINE_TOKENS
+    assert len(greedy_server[1].requests) == 1
+    assert len(greedy_server[1].requests[0].prompt_token_ids) == tokens
 
 
 @pytest.mark.parametrize("stream", [False, True], ids=["plain", "streamed"])
@@ -197,21 +209,20 @@ def test_top_k_under_all_greedy_is_a_400_the_engine_never_sees(greedy_server):
 def test_a_valid_greedy_request_after_each_refusal_is_served(greedy_server):
     """Refused, refused, refused, then served: the engine sees exactly the one request it
     can serve, and returns its tokens."""
-    for body in ({"prompt_tokens": STANDARD_WINDOW + 1, "temperature": 0.0},
+    for body in ({"prompt_tokens": STANDARD_MAX, "temperature": 0.0},
                  {"prompt_tokens": 10, "top_k": 50},
                  {"prompt_tokens": 10, "temperature": 0.0, "logprobs": 5}):
         tokens = body.pop("prompt_tokens")
         assert _complete(greedy_server, tokens, **body).status_code == 400
-    response = _complete(greedy_server, STANDARD_WINDOW, temperature=0.0,
-                         return_token_ids=True)
+    response = _complete(greedy_server, 3000, temperature=0.0, return_token_ids=True)
     assert response.status_code == 200, response.text
     assert response.json()["choices"][0]["token_ids"] == ENGINE_TOKENS
     assert len(greedy_server[1].requests) == 1
-    assert len(greedy_server[1].requests[0].prompt_token_ids) == STANDARD_WINDOW
+    assert len(greedy_server[1].requests[0].prompt_token_ids) == 3000
 
 
 def test_a_streamed_valid_request_after_a_refusal_streams_its_tokens(greedy_server):
-    assert _complete(greedy_server, STANDARD_WINDOW + 1, temperature=0.0,
+    assert _complete(greedy_server, STANDARD_MAX, temperature=0.0,
                      stream=True).status_code == 400
     response = _complete(greedy_server, 10, temperature=0.0, stream=True,
                          return_token_ids=True)

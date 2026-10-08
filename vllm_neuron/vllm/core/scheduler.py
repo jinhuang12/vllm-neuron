@@ -525,7 +525,12 @@ class NeuronScheduler(Scheduler):
 
         Note: We don't check bucket fit here because chunked prefill allows
         long prompts to be processed in multiple iterations. Each chunk will
-        fit in a bucket. The max_model_len limit is enforced by vLLM.
+        fit in a bucket (``num_batched_tokens_buckets``), and the runner picks
+        the KV segment each request's chunks read through from
+        ``kv_segment_size_buckets`` so the window covers the whole request; a
+        segment list whose window falls short of ``max_model_len`` is refused at
+        startup (``validate_kv_segment_size_buckets``). The max_model_len limit is
+        enforced by vLLM, plus one generated token's room by ``platform.validate_request``.
 
         Args:
             request: The request to check.

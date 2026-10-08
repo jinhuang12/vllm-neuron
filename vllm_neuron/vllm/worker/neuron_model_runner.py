@@ -784,6 +784,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # This must happen before InputBatch creation to ensure buffers are sized correctly
         from vllm_neuron.utils.bucket_utils import (
             SUPPORTED_KV_SEGMENT_SIZES,
+            complete_kv_segment_cover,
             get_default_num_seqs_buckets,
             resolve_num_batched_tokens_buckets,
             resolve_segmented_prefill_config,
@@ -806,7 +807,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 auto_kv_segment_size_buckets,
                 auto_num_batched_tokens_buckets,
             ) = resolve_segmented_prefill_config(
-                self.max_num_batched_tokens, self.max_model_len
+                self.max_num_batched_tokens,
+                self.max_model_len,
+                windowed_prefill=self.neuron_config._model_supports_windowed_prefill,
             )
 
         dcp_stride = (
@@ -884,6 +887,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 if user_set_num_batched_tokens_buckets
                 else None
             )
+            # A windowed-prefill model reads a prefill chunk's KV through a window of
+            # segment + query bucket tokens, so the list's largest segment must cover
+            # max_model_len; the validator refuses one that does not.
             self.neuron_config.kv_segment_size_buckets = (
                 validate_kv_segment_size_buckets(
                     buckets,
@@ -891,6 +897,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     allow_independent_query_buckets=(
                         self.neuron_config._model_supports_independent_prefill_buckets
                     ),
+                    windowed_prefill=self.neuron_config._model_supports_windowed_prefill,
+                    block_size=getattr(vllm_config.cache_config, "block_size", None),
+                    max_model_len=self.max_model_len,
                 )
             )
             kv_segment_size = self.neuron_config.kv_segment_size_buckets[0]
@@ -920,14 +929,45 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 self.neuron_config.kv_segment_size_buckets,
             )
         elif auto_kv_segment_size_buckets is not None:
-            # Cross-check the resolver's segment size against the user's
-            # explicit num_batched_tokens_buckets (if any), using the same
-            # validation rule as the explicit opt-in path.
-            explicit_num_batched_tokens_buckets = (
-                self.neuron_config.num_batched_tokens_buckets
-                if user_set_num_batched_tokens_buckets
-                else None
+            # A windowed-prefill model whose kernel takes the query length
+            # independently of the cached length can hold several segments.
+            windowed = (
+                self.neuron_config._model_supports_windowed_prefill
+                and self.neuron_config._model_supports_independent_prefill_buckets
             )
+            block_size = getattr(vllm_config.cache_config, "block_size", None)
+            if windowed:
+                # The resolver picks one segment equal to the token budget, a window
+                # of twice the budget; a windowed model with a longer max_model_len
+                # gets the smallest supported segment that covers it appended (or one
+                # of max_model_len), so a user who set no list is not capped below
+                # max_model_len.
+                completed = complete_kv_segment_cover(
+                    auto_kv_segment_size_buckets,
+                    self.neuron_config.num_batched_tokens_buckets,
+                    self.max_model_len,
+                    block_size,
+                    windowed_prefill=True,
+                )
+                if completed != auto_kv_segment_size_buckets:
+                    logger.info(
+                        "Segmented prefill: kv_segment_size_buckets %s completed to %s "
+                        "so the prefill window covers max_model_len %s",
+                        auto_kv_segment_size_buckets,
+                        completed,
+                        self.max_model_len,
+                    )
+                auto_kv_segment_size_buckets = completed
+            # Cross-check the resolver's segment list against the query buckets
+            # (the user's explicit ones, or the resolved ones for a windowed model
+            # whose list may now hold several segments), with the same rules as the
+            # explicit opt-in path.
+            if user_set_num_batched_tokens_buckets or windowed:
+                explicit_num_batched_tokens_buckets = (
+                    self.neuron_config.num_batched_tokens_buckets
+                )
+            else:
+                explicit_num_batched_tokens_buckets = None
             self.neuron_config.kv_segment_size_buckets = (
                 validate_kv_segment_size_buckets(
                     auto_kv_segment_size_buckets,
@@ -935,6 +975,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     allow_independent_query_buckets=(
                         self.neuron_config._model_supports_independent_prefill_buckets
                     ),
+                    windowed_prefill=self.neuron_config._model_supports_windowed_prefill,
+                    block_size=block_size,
+                    max_model_len=self.max_model_len,
                 )
             )
             logger.info(
@@ -4406,6 +4449,35 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         ctx_for_blocks = ctx_bucket if ctx_bucket is not None else self.max_model_len
         return (ctx_for_blocks + dcp_block_size - 1) // dcp_block_size
 
+    def _prefill_kv_segment_size(self, request_tokens: int) -> int:
+        """Return the KV segment a request of ``request_tokens`` tokens is prefilled with.
+
+        The smallest of ``neuron_config.kv_segment_size_buckets`` at least as long as
+        the request (:func:`vllm_neuron.utils.bucket_utils.select_kv_segment_size`), or
+        the largest, whose window the validator proved covers ``max_model_len``; 0 when
+        segmented prefill is off. Warmup compiles one prefill graph per configured
+        segment, so every value returned here has its graph.
+        """
+        from vllm_neuron.utils.bucket_utils import select_kv_segment_size
+
+        buckets = self.neuron_config.kv_segment_size_buckets
+        if not buckets:
+            return 0
+        return select_kv_segment_size(buckets, int(request_tokens))
+
+    def _prefill_request_tokens(self, cached_seq_len: int, scheduled_rows: int) -> int:
+        """Return the length the prefilling request reaches, prompt and recomputed tokens.
+
+        Read off the input batch (``num_tokens_no_spec``: the request's prompt plus any
+        output tokens it recomputes after a preemption). A batch that carries no such
+        array (a synthetic step built without one) is given the chunk's padded end,
+        ``cached_seq_len + scheduled_rows``, which the chunk's window also holds.
+        """
+        lengths = getattr(self.input_batch, "num_tokens_no_spec", None)
+        if lengths is not None and len(lengths) > 0:
+            return int(lengths[0])
+        return int(cached_seq_len) + int(scheduled_rows)
+
     def _build_attention_metadata(
         self,
         padded_num_reqs: int,
@@ -4442,6 +4514,29 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         step_device = torch.device("cpu") if host_only else self.device
         decode_token_threshold = 1 + max_num_draft_tokens
         is_decode = max_query_len <= decode_token_threshold
+        # The KV segment this step's graph is compiled for. A prefill chunk (one
+        # request per step) takes the smallest segment at least as long as its
+        # request, so every chunk of the request reads a window that holds its whole
+        # sequence; a decode step keeps the first segment, the one its warmup graph
+        # was built with (the decode converter does not read it). 0 when segmented
+        # prefill is off.
+        segments = self.neuron_config.kv_segment_size_buckets
+        if is_decode or not segments:
+            kv_segment_size = segments[0] if segments else 0
+        else:
+            request_tokens = self._prefill_request_tokens(
+                cached_seq_len, total_num_scheduled_tokens
+            )
+            kv_segment_size = self._prefill_kv_segment_size(request_tokens)
+            req_ids = list(getattr(self.input_batch, "req_ids", None) or ())
+            logger.info(
+                "Prefill chunk of request %s: %s of %s tokens cached, KV segment %s of %s",
+                req_ids[0] if req_ids else "?",
+                int(cached_seq_len),
+                request_tokens,
+                kv_segment_size,
+                segments,
+            )
 
         for kv_cache_group_id, kv_cache_group_spec in enumerate(
             self.kv_cache_config.kv_cache_groups
@@ -4499,10 +4594,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
             # Note there are more data available in self.input_batch you can
             # use in attention_metadata. Now we only use the ones below.
-            kv_segment_size = 0
-            if self.neuron_config.kv_segment_size_buckets is not None:
-                kv_segment_size = self.neuron_config.kv_segment_size_buckets[0]
-
             swa_kv_pos_offset = None
 
             # Only include the raw (pre-transform) block table when running
@@ -4633,6 +4724,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         decode_token_threshold: int | None = None,
         ctx_bucket: int | None = None,
         device: torch.device | None = None,
+        kv_segment_size: int = 0,
     ) -> dict:
         """
         Build attention metadata for warmup without using InputBatch.
@@ -4653,6 +4745,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 for non-SWA groups; SWA groups always trim to the window.
             device: Device to allocate synthetic tensors on. Defaults to
                 ``self.device``.
+            kv_segment_size: The KV segment a prefill warmup is built for, one of
+                ``kv_segment_size_buckets``; the converter sizes the window the
+                captured graph reads from it. 0 takes the first bucket, which is
+                what a decode step carries.
 
         Returns:
             dict mapping layer names to attention metadata dicts
@@ -4773,9 +4869,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # max_query_len: for prefill = bucket_size, for decode = 1
             max_query_len = num_tokens // num_reqs
 
-            kv_segment_size = 0
-            if self.neuron_config.kv_segment_size_buckets is not None:
-                kv_segment_size = self.neuron_config.kv_segment_size_buckets[0]
+            segment = int(kv_segment_size)
+            if not segment and self.neuron_config.kv_segment_size_buckets is not None:
+                segment = self.neuron_config.kv_segment_size_buckets[0]
 
             # Host-side geometry in the same form the serving builder produces, so
             # capture needs no special case: this bucket's blocks and the declared
@@ -4802,7 +4898,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 ),
                 "host_block_table": host_block_table,
                 "host_num_computed_tokens": host_num_computed_tokens,
-                "kv_segment_size": kv_segment_size,
+                "kv_segment_size": segment,
                 "full_block_table_tensor": full_block_table_tensor,
             }
             if swa_kv_pos_offset is not None:
@@ -4860,6 +4956,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # (matches _build_attention_metadata where max_num_draft_tokens=0).
             decode_token_threshold=1,
             device=device,
+            # One prefill graph per segment: the window is built from this value.
+            kv_segment_size=kv_segment_size,
         )
 
         # Create dummy sampling params for warmup
