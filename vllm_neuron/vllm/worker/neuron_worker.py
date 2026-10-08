@@ -104,7 +104,9 @@ def _indexer_side_cache_bytes(vllm_config, model_runner, kv_cache_spec=None) -> 
     """Return the bytes of the DSA indexer side caches the runner allocates.
 
     ``pool_cache``, ``tail`` and ``pad_tail`` of every sparse-attention layer, one
-    set per request slot (``max_num_seqs``), sized by ``max_model_len``:
+    set per request slot (``max_num_seqs``), sized by ``max_model_len``; on a server
+    drafting ``k`` mtp tokens (``model_runner.speculative_config``) the two rings are
+    ``indexer_ring_depth(index_kpool, k)`` rows deep, ``index_kpool`` otherwise:
     :func:`~vllm_neuron.vllm.worker.neuron_model_runner.indexer_side_cache_bytes`.
     0 for a model with no indexer.
     """
@@ -112,11 +114,17 @@ def _indexer_side_cache_bytes(vllm_config, model_runner, kv_cache_spec=None) -> 
 
     if kv_cache_spec is None:
         kv_cache_spec = model_runner.get_kv_cache_spec()
+    speculative_config = model_runner.speculative_config
     return indexer_side_cache_bytes(
         kv_cache_spec,
         getattr(model_runner.model, "text_config", None),
         max_seq_len=vllm_config.model_config.max_model_len,
         request_slots=vllm_config.scheduler_config.max_num_seqs,
+        speculative_tokens=(
+            int(speculative_config.num_speculative_tokens)
+            if speculative_config is not None and speculative_config.method == "mtp"
+            else 0
+        ),
     )
 
 
