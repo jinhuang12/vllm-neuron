@@ -14,8 +14,10 @@ runs ``NeuronPlatform.check_and_update_config``) and the real runner constructor
 * the bucket rules accept a 65,536 and a 262,144 segment for a windowed-prefill model
   and still refuse them for the other families;
 * a server with ``max_model_len`` 65,536 or 262,144, chunk 8192 and one segment of
-  ``max_model_len`` has no admission window, so no prompt below ``max_model_len`` is
-  refused, and the runner resolves the same buckets admission does.
+  ``max_model_len`` refuses no prompt below ``max_model_len`` (admission's only length
+  rule is prompt + 1 <= max_model_len), and the runner serves that one segment;
+* the old cap line (segment 8192 + chunk 8192 at ``max_model_len`` 65,536, a 16,384-token
+  window) does not start: the runner names the window and the segment to add.
 """
 
 from __future__ import annotations
@@ -31,7 +33,6 @@ from vllm.engine.arg_utils import EngineArgs
 from vllm.sampling_params import SamplingParams
 
 from vllm_neuron.utils import bucket_utils as BU
-from vllm_neuron.vllm import admission
 from vllm_neuron.vllm.platform import NeuronPlatform
 from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
 
@@ -146,38 +147,46 @@ def test_a_long_line_refuses_no_prompt_below_max_model_len(served_model_dir, mon
     config = _serve(served_model_dir, _long_line(max_model_len))
     assert config.additional_config["neuron_config"][
         "_model_supports_windowed_prefill"] is True
-    assert NeuronPlatform._admission.window is None
+    assert NeuronPlatform._admission.prompt.tokens == max_model_len - 1
     greedy = SamplingParams(temperature=0.0, max_tokens=1)
     for tokens in (2 * CHUNK + 1, max_model_len // 2, max_model_len - 1):
         NeuronPlatform.validate_request(
             {"type": "token", "prompt_token_ids": [11] * tokens}, greedy)
+    with pytest.raises(ValueError, match=f"max_model_len is {max_model_len}"):
+        NeuronPlatform.validate_request(
+            {"type": "token", "prompt_token_ids": [11] * max_model_len}, greedy)
 
 
 @pytest.mark.parametrize("max_model_len", LONG_LINES)
-def test_the_runner_builds_a_long_line_with_the_buckets_admission_resolves(
+def test_the_runner_builds_a_long_line_with_one_segment_of_max_model_len(
         served_model_dir, monkeypatch, tmp_path, max_model_len):
     monkeypatch.setenv(KNOB, "1")
     config = _serve(served_model_dir, _long_line(max_model_len))
     with fr._parallel_state(tmp_path, config):
         runner = NeuronModelRunner(config, device=torch.device("cpu"))
+    assert runner.neuron_config._model_supports_windowed_prefill is True
     assert runner.neuron_config.kv_segment_size_buckets == [max_model_len]
     assert runner.neuron_config.num_batched_tokens_buckets == [CHUNK]
-    resolved = admission.resolve_prefill_buckets(
-        config.additional_config["neuron_config"],
-        max_num_batched_tokens=config.scheduler_config.max_num_batched_tokens,
-        max_model_len=config.model_config.max_model_len,
-        block_size=SERVED_BLOCK,
-    )
-    assert resolved == ([max_model_len], [CHUNK])
+    assert BU.prefill_window_tokens(
+        [max_model_len], [CHUNK], SERVED_BLOCK) >= max_model_len
 
 
-def test_the_old_cap_line_still_has_its_window(served_model_dir, monkeypatch):
-    """The old largest segment + one chunk at max_model_len 65536: the window is segment +
-    chunk tokens, as before. The cap is now the operator's segment choice, not a
-    whitelist."""
+def test_the_old_cap_line_does_not_start(served_model_dir, monkeypatch, tmp_path):
+    """The old largest segment + one chunk at max_model_len 65,536: its window of
+    segment + chunk tokens is below max_model_len, so the runner refuses the line at
+    startup and names the segment to add. No server serves a window below max_model_len."""
     monkeypatch.setenv(KNOB, "1")
-    line = _long_line(65536)
+    max_model_len = LONG_LINES[0]
+    line = _long_line(max_model_len)
     line["neuron_config"] = dict(line["neuron_config"],
                                  kv_segment_size_buckets=[OLD_SEGMENT_MAX])
-    _serve(served_model_dir, line)
-    assert NeuronPlatform._admission.window.tokens == OLD_SEGMENT_MAX + CHUNK
+    config = _serve(served_model_dir, line)
+    with fr._parallel_state(tmp_path, config), pytest.raises(ValueError) as refused:
+        NeuronModelRunner(config, device=torch.device("cpu"))
+    message = str(refused.value)
+    # The window rule: largest segment + largest query bucket, rounded up to whole pages.
+    window = SERVED_BLOCK * -(-(OLD_SEGMENT_MAX + CHUNK) // SERVED_BLOCK)
+    assert window < max_model_len
+    assert f"prefill window of {window} tokens" in message, message
+    assert f"max_model_len={max_model_len}" in message, message
+    assert f"at least {max_model_len - CHUNK} tokens" in message, message

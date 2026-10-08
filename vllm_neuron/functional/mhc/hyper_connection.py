@@ -56,10 +56,12 @@ Under an LNC2 launch (``NEURON_LOGICAL_NC_CONFIG=2``, the serving setting) the
 kernel runs as two SPMD programs, each on one contiguous half of the hidden axis,
 so both physical cores of the logical core work, in either layout.
 
-This module is fp32 in and fp32 out where upstream's ``mhc_post`` takes bf16 and
-returns ``residual.dtype``, which is why upstream's own test compares at
-``atol=5e-2``. bf16's roughly three decimal digits cannot express a tighter
-agreement than that. Casting the result is the caller's business.
+The kernel computes in fp32 and returns ``residual``'s dtype. ``x`` and the
+streams may be fp32 or bf16: bf16 tiles are upcast on chip (exact), so a bf16
+call does the fp32 products and adds of an fp32 call on the same values and rounds
+only the last add to bf16 -- bit for bit the fp32 call followed by ``.to(bf16)``,
+without the fp32 copies of the operands and the result in HBM. Upstream's
+``mhc_post`` also takes bf16 and returns ``residual.dtype``.
 
 ``T`` is unbounded: the hidden layout walks it in chunks sized to a fixed SBUF
 budget (:data:`SBUF_CHUNK_ELEMS`), the token layout in tiles of 128 tokens.
@@ -155,7 +157,9 @@ def hyper_connection_kernel(x, residual, post_layer_mix, comb_res_mix):
             stream ``i`` into output stream ``j``.
 
     Returns:
-        ``[T, S, H]`` fp32, ``out_j = post_layer_mix_j * x + sum_i comb_ij * res_i``.
+        ``[T, S, H]`` in ``residual``'s dtype,
+        ``out_j = post_layer_mix_j * x + sum_i comb_ij * res_i``, computed in fp32
+        and rounded once. ``x`` and ``residual`` may be fp32 or bf16.
 
     The arithmetic is the 5938748 kernel's, in its order and rounding:
     ``acc = post_j * x`` and then ``acc = acc + comb_ij * res_i`` for
@@ -183,7 +187,7 @@ def hyper_connection_kernel(x, residual, post_layer_mix, comb_res_mix):
     prog = nl.program_id(0)
 
     out = nl.ndarray(
-        (t_extent, s_extent, h_extent), dtype=nl.float32, buffer=nl.shared_hbm
+        (t_extent, s_extent, h_extent), dtype=residual.dtype, buffer=nl.shared_hbm
     )
 
     # This program's contiguous hidden range [h_lo, h_lo + width).
@@ -242,10 +246,14 @@ def _combine_hidden_on_partitions(
     n_chunks = (t_extent + chunk - 1) // chunk
     mix = s_extent * s_extent
 
-    x_t = nl.ndarray((parts, chunk, hf), dtype=nl.float32, buffer=nl.sbuf)
-    res_t = nl.ndarray((parts, chunk, s_extent, hf), dtype=nl.float32, buffer=nl.sbuf)
+    x_t = nl.ndarray((parts, chunk, hf), dtype=x.dtype, buffer=nl.sbuf)
+    res_t = nl.ndarray((parts, chunk, s_extent, hf), dtype=residual.dtype, buffer=nl.sbuf)
     acc = nl.ndarray((parts, chunk, s_extent, hf), dtype=nl.float32, buffer=nl.sbuf)
     term = nl.ndarray((parts, chunk, s_extent, hf), dtype=nl.float32, buffer=nl.sbuf)
+    # The last add rounds into the output dtype; an fp32 output is the accumulator.
+    fin = acc
+    if out.dtype != nl.float32:
+        fin = nl.ndarray((parts, chunk, s_extent, hf), dtype=out.dtype, buffer=nl.sbuf)
     post_b = nl.ndarray((parts, chunk, s_extent), dtype=nl.float32, buffer=nl.sbuf)
     comb_b = nl.ndarray(
         (parts, chunk, s_extent, s_extent), dtype=nl.float32, buffer=nl.sbuf
@@ -320,6 +328,7 @@ def _combine_hidden_on_partitions(
 
         acc_c = acc[0:parts, 0:tc, 0:s_extent, 0:hf]
         term_c = term[0:parts, 0:tc, 0:s_extent, 0:hf]
+        fin_c = fin[0:parts, 0:tc, 0:s_extent, 0:hf]
         # acc[.., j, :] = post_j * x: x broadcast over j, post_j over hidden.
         nisa.tensor_tensor(
             dst=acc_c,
@@ -335,7 +344,8 @@ def _combine_hidden_on_partitions(
                 data2=comb_b[0:parts, 0:tc, i, 0:s_extent].expand_dim(3).broadcast(3, hf),
                 op=nl.multiply,
             )
-            nisa.tensor_tensor(dst=acc_c, data1=acc_c, data2=term_c, op=nl.add)
+            nisa.tensor_tensor(dst=fin_c if i == s_extent - 1 else acc_c, data1=acc_c,
+                               data2=term_c, op=nl.add)
 
         nisa.dma_copy(
             dst=out.ap(
@@ -347,7 +357,7 @@ def _combine_hidden_on_partitions(
                 ],
                 offset=t0 * s_extent * h_extent + h_lo,
             ),
-            src=acc[0:full_parts, 0:tc, 0:s_extent, 0:hf],
+            src=fin[0:full_parts, 0:tc, 0:s_extent, 0:hf],
         )
         if tail > 0:
             nisa.dma_copy(
@@ -360,7 +370,7 @@ def _combine_hidden_on_partitions(
                     ],
                     offset=t0 * s_extent * h_extent + h_lo + full_parts * hf,
                 ),
-                src=acc[full_parts:parts, 0:tc, 0:s_extent, 0:tail],
+                src=fin[full_parts:parts, 0:tc, 0:s_extent, 0:tail],
             )
 
 
@@ -414,9 +424,12 @@ def _combine_tokens_on_partitions(
             w = width - h0
             if w > TOKEN_LAYOUT_HIDDEN_SLICE:
                 w = TOKEN_LAYOUT_HIDDEN_SLICE
-            x_t = nl.ndarray((rows, w), dtype=nl.float32, buffer=nl.sbuf)
-            res_t = nl.ndarray((rows, s_extent, w), dtype=nl.float32, buffer=nl.sbuf)
+            x_t = nl.ndarray((rows, w), dtype=x.dtype, buffer=nl.sbuf)
+            res_t = nl.ndarray((rows, s_extent, w), dtype=residual.dtype, buffer=nl.sbuf)
             acc = nl.ndarray((rows, s_extent, w), dtype=nl.float32, buffer=nl.sbuf)
+            fin = acc
+            if out.dtype != nl.float32:
+                fin = nl.ndarray((rows, s_extent, w), dtype=out.dtype, buffer=nl.sbuf)
             nisa.dma_copy(
                 dst=x_t,
                 src=x.ap(
@@ -440,7 +453,7 @@ def _combine_tokens_on_partitions(
                 )
                 for i in range(s_extent):
                     nisa.scalar_tensor_tensor(
-                        dst=acc[0:rows, j, 0:w],
+                        dst=(fin if i == s_extent - 1 else acc)[0:rows, j, 0:w],
                         data=res_t[0:rows, i, 0:w],
                         op0=nl.multiply,
                         operand0=comb_t[0:rows, i, j:j + 1],
@@ -452,7 +465,7 @@ def _combine_tokens_on_partitions(
                     pattern=[[s_extent * h_extent, rows], [h_extent, s_extent], [1, w]],
                     offset=off * s_extent * h_extent + h_lo + h0,
                 ),
-                src=acc,
+                src=fin,
             )
 
 
@@ -598,7 +611,8 @@ def hyper_connection_combine(
             stream ``j``.
 
     Returns:
-        ``[T, S, H]`` fp32.
+        ``[T, S, H]`` in ``residual``'s dtype, computed in fp32 (fp32 or bf16
+        ``x`` and ``residual``; see :func:`hyper_connection_kernel`).
 
     Raises:
         HyperConnectionError: on an inadmissible rank or extent.
@@ -611,7 +625,7 @@ def hyper_connection_combine(
         )
         return hyper_connection_torch_oracle(
             x, residual, post_layer_mix, comb_res_mix
-        )
+        ).to(residual.dtype)
 
     _count_nki_dispatch()
     call = wrap_nki(hyper_connection_kernel)

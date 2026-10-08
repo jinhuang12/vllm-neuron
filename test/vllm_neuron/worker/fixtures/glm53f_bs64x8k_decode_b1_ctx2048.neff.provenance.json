@@ -1,0 +1,40 @@
+{
+  "fixture": "glm53f_bs64x8k_decode_b1_ctx2048.neff",
+  "fixture_form": "reduced NEFF; see record_neff_fixture.py for what is kept",
+  "graph": "GLM-5.3-Flash TP=64 decode graph, 1 sequence, context bucket 2048, bs=64 @ 8k serve line (KV pool 4353 blocks)",
+  "source_compile_cache_key": "3dfb0cc291c58e6de085e667ea2eb1b4",
+  "source_bytes": 1790844,
+  "serve_run": "tip-b64-C",
+  "sha256": "7be50418798e6c25f4c633dfc3424b5851274bb10f3d04d6164f1ec4c3dd0b6c",
+  "bytes": 33410,
+  "runtime_breakdown": {
+    "source": "tip-b64-C server log, TDRV:dml_log_dev_neff_mem, ND 0, first load of the graph; units as printed (binary, MB = MiB)",
+    "per_core": {
+      "0": {
+        "Total": "5.191MB",
+        "model code": "2.781MB",
+        "model constants": "451.008KB",
+        "scratchpad": "0.000B",
+        "runtime": "436.109KB",
+        "dma rings io": "778.250KB",
+        "dma rings spill": "727.500KB",
+        "dma rings collectives": "0.000B",
+        "dma rings runtime": "4.000KB",
+        "collectives": "71.188KB"
+      },
+      "1": {
+        "Total": "4.266MB",
+        "model code": "2.218MB",
+        "model constants": "451.008KB",
+        "scratchpad": "0.000B",
+        "runtime": "436.109KB",
+        "dma rings io": "716.500KB",
+        "dma rings spill": "490.000KB",
+        "dma rings collectives": "0.000B",
+        "dma rings runtime": "4.000KB",
+        "collectives": "0.000B"
+      }
+    }
+  },
+  "produced_by": "python test/vllm_neuron/worker/fixtures/record_neff_fixture.py --neff <compile cache>/3dfb0cc291c58e6de085e667ea2eb1b4/graph_3dfb0cc291c58e6de085e667ea2eb1b4.neff --server-log <tip-b64-C>/server.log --nd 0 --graph \"GLM-5.3-Flash TP=64 decode graph, 1 sequence, context bucket 2048, bs=64 @ 8k serve line (KV pool 4353 blocks)\" --serve-run tip-b64-C --out test/vllm_neuron/worker/fixtures/glm53f_bs64x8k_decode_b1_ctx2048.neff"
+}

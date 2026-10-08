@@ -817,3 +817,36 @@ def _deferred_leaves(
             if cls == family and leaf in declared:
                 found.append((path, module, leaf, shard_dim, full))
     return found
+
+
+def test_shard_a_load_without_a_tensor_parallel_group_binds_the_loaders_rank(
+    tmp_path, monkeypatch, single_rank_process_group
+) -> None:
+    """One rank of a larger world loaded out of process has no tensor-parallel group.
+
+    The indexer's rank operand (``Glm5NextDSAIndexer.SHARD_RANK_ATTR``) is then the rank
+    the loader sliced this rank's weights with -- the patched ``_resolve_rank`` -- as a
+    ``[1]`` int32 tensor on the prepared weights' device, so the query-row shard stays
+    aligned with the weight shards; at one rank it is None. Regression: bbf0f6d refused
+    the whole load with vllm's "tensor model parallel group is not initialized".
+    """
+    directory, _, _ = _shard_checkpoint(tmp_path, MINI_ALL_DENSE_FIRST_K)
+    for rank in range(SHARD_WORLD):
+        model = _load_at_world(
+            directory, SHARD_WORLD, rank, monkeypatch, MINI_ALL_DENSE_FIRST_K
+        )
+        indexers = [
+            m for m in model.modules() if isinstance(m, _MODEL_FP8.Glm5NextDSAIndexer)
+        ]
+        assert indexers, "the miniature tree has no DSA indexer to bind a rank on"
+        for indexer in indexers:
+            bound = getattr(indexer, indexer.SHARD_RANK_ATTR)
+            weight = indexer._prepared_weight("wq_b")
+            assert bound.dtype == torch.int32 and tuple(bound.shape) == (1,), bound
+            assert bound.device == weight.device
+            assert bound.tolist() == [_MODEL_FP8._resolve_rank()], (rank, bound)
+    whole = _load_at_world(directory, 1, 0, monkeypatch, MINI_ALL_DENSE_FIRST_K)
+    for indexer in (
+        m for m in whole.modules() if isinstance(m, _MODEL_FP8.Glm5NextDSAIndexer)
+    ):
+        assert getattr(indexer, indexer.SHARD_RANK_ATTR) is None

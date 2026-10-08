@@ -8,17 +8,20 @@ hands a request to ``NeuronPlatform.validate_request``, the hook vLLM's
 
 Three request classes are refused, each with a message that names the problem:
 
-* a prompt longer than the prefill window (the runner raises at
-  ``neuron_model_runner.py`` "a request longer than its bucket cannot be served" and the
-  engine dies);
+* a prompt that leaves no room for a generated token (``prompt + 1 > max_model_len``);
+  the prefill window itself is ``max_model_len`` since the runner picks a KV segment per
+  request from ``kv_segment_size_buckets`` and refuses at startup a list whose largest
+  segment does not cover ``max_model_len``, so admission has nothing shorter to enforce;
 * a sampling knob the ``all_greedy`` on-device sampler cannot apply (today it returns
   greedy tokens in silence);
 * logprobs / prompt_logprobs under on-device sampling (today HTTP 500, IndexError in
   ``_create_completion_logprobs``).
 
 Everything else is accepted: greedy requests, the gate's requests, an OpenAI request that
-leaves every sampling knob at the server default, an 8000-token prompt on the bs=64 line,
-and every one of the refused requests on a server that samples on the host.
+leaves every sampling knob at the server default, a 3000-token prompt on the standard line
+(refused with HTTP 400 before this change, when the window was 2048), an 8000-token
+prompt on the bs=64 line, and every one of the refused requests on a server that samples
+on the host.
 
     NKI_SIMULATOR=1 VLLM_NEURON_CPU_MODE=1 PYTHONPATH=$PWD python -m pytest \\
         test/vllm_neuron/vllm/test_admission.py
@@ -38,6 +41,9 @@ from vllm.engine.arg_utils import EngineArgs
 from vllm.entrypoints.openai.completion.protocol import CompletionRequest
 from vllm.sampling_params import SamplingParams
 
+from vllm.pooling_params import PoolingParams
+
+from vllm_neuron.utils.bucket_utils import prefill_window_tokens
 from vllm_neuron.vllm import admission
 from vllm_neuron.vllm.platform import NeuronPlatform
 from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
@@ -56,14 +62,16 @@ SERVED_GENERATION_CONFIG = {
     "top_p": 0.95,
 }
 SERVED_BLOCK = 128
-# The gate's standard line (gate/serve.sh, GATE_RECIPE=host) and its bs=64 @ 8k line.
+# The gate's standard line (gate/serve.sh, GATE_RECIPE=host, with the three segments that
+# cover max_model_len 4096: one 1024 segment alone served a 2048-token window) and its
+# bs=64 @ 8k line.
 STANDARD_LINE = dict(
     max_model_len=4096,
     max_num_seqs=1,
     max_num_batched_tokens=1024,
     neuron_config={
         "ep_degree": 16,
-        "kv_segment_size_buckets": [1024],
+        "kv_segment_size_buckets": [1024, 2048, 4096],
         "num_batched_tokens_buckets": [1024],
         "decode_context_length_buckets": [2048],
         "hybrid_kv_block_size": SERVED_BLOCK,
@@ -83,8 +91,10 @@ BS64_LINE = dict(
     },
 )
 ALL_GREEDY = {"all_greedy": True}
-# The standard line's window: one 1024-token KV segment plus one 1024-token query bucket.
-STANDARD_WINDOW = 2048
+# The standard line's longest prompt: max_model_len less one generated token.
+STANDARD_MAX = STANDARD_LINE["max_model_len"]
+# The window the old standard line ([1024] alone) served; prompts past it are admitted now.
+OLD_WINDOW = 2048
 
 
 @pytest.fixture(scope="module")
@@ -160,103 +170,66 @@ def _validate(prompt_tokens: int, params) -> None:
     NeuronPlatform.validate_request(_prompt(prompt_tokens), params)
 
 
-# ── prompt length: the prefill window ───────────────────────────────────────────────
+# ── prompt length: max_model_len ────────────────────────────────────────────────────
 
 
-def test_standard_line_window_is_one_segment_plus_one_query_bucket(greedy_server):
-    window = NeuronPlatform._admission.window
-    assert (window.tokens, window.kv_segment, window.query_bucket, window.block_size) == (
-        STANDARD_WINDOW, 1024, 1024, SERVED_BLOCK
-    ), window
-
-
-def test_prompt_one_token_past_the_window_is_refused_naming_both_lengths(greedy_server):
+def test_a_prompt_of_max_model_len_tokens_is_refused_naming_max_model_len(greedy_server):
+    """4096 prompt tokens leave no room for the one token every request generates."""
     with pytest.raises(ValueError) as refused:
-        _validate(STANDARD_WINDOW + 1, SamplingParams(temperature=0.0, max_tokens=8))
+        _validate(STANDARD_MAX, SamplingParams(temperature=0.0, max_tokens=1))
     message = str(refused.value)
-    assert str(STANDARD_WINDOW + 1) in message and str(STANDARD_WINDOW) in message, message
-    assert "kv_segment_size_buckets" in message, message
+    assert "max_model_len" in message and str(STANDARD_MAX) in message, message
+    assert str(STANDARD_MAX - 1) in message, message
 
 
-def test_prompt_of_exactly_the_window_is_accepted(greedy_server):
-    _validate(STANDARD_WINDOW, SamplingParams(temperature=0.0, max_tokens=8))
+def test_a_prompt_of_max_model_len_minus_one_is_accepted(greedy_server):
+    _validate(STANDARD_MAX - 1, SamplingParams(temperature=0.0, max_tokens=1))
 
 
-def test_the_window_holds_with_host_sampling_too(host_server):
-    """The window is the runner's, not the sampler's: a host-sampling serve has it too."""
-    with pytest.raises(ValueError, match=str(STANDARD_WINDOW)):
-        _validate(STANDARD_WINDOW + 1, SamplingParams(temperature=0.0, max_tokens=8))
-    _validate(STANDARD_WINDOW, SamplingParams(temperature=0.0, max_tokens=8))
+@pytest.mark.parametrize("tokens", [OLD_WINDOW, OLD_WINDOW + 1, 3000, 3500, STANDARD_MAX - 1])
+def test_prompts_past_the_old_window_are_admitted(greedy_server, tokens):
+    """The 2048-token cap is gone: the runner serves every prompt vLLM admits."""
+    _validate(tokens, SamplingParams(temperature=0.0, max_tokens=8))
 
 
-def test_bs64_line_accepts_an_8000_token_prompt(served_model_dir, monkeypatch):
-    """kv_segment 8192 + query 1024 covers max_model_len 8192: nothing to add to vLLM's
-    own max_model_len check, so no window is enforced."""
+def test_the_length_rule_holds_with_host_sampling_too(host_server):
+    """The rule is the model length's, not the sampler's: a host-sampling serve has it too."""
+    with pytest.raises(ValueError, match="max_model_len"):
+        _validate(STANDARD_MAX, SamplingParams(temperature=0.0, max_tokens=8))
+    _validate(STANDARD_MAX - 1, SamplingParams(temperature=0.0, max_tokens=8))
+
+
+def test_bs64_line_accepts_an_8000_token_prompt_and_refuses_8192(served_model_dir,
+                                                                monkeypatch):
     monkeypatch.setenv(KNOB, "1")
     _serve(served_model_dir, BS64_LINE, sampler=ALL_GREEDY, async_scheduling=True)
-    assert NeuronPlatform._admission.window is None
     _validate(8000, SamplingParams(temperature=0.0, max_tokens=64))
     _validate(8191, SamplingParams(temperature=0.0, max_tokens=1))
+    with pytest.raises(ValueError, match="8192"):
+        _validate(8192, SamplingParams(temperature=0.0, max_tokens=1))
+
+
+def test_a_pooling_request_generates_nothing_so_it_may_fill_max_model_len(greedy_server):
+    NeuronPlatform.validate_request(_prompt(STANDARD_MAX), PoolingParams())
 
 
 def test_a_refused_prompt_leaves_the_next_request_admitted(greedy_server):
     """Admission keeps no state: a valid request right after a refused one is admitted."""
     greedy = SamplingParams(temperature=0.0, max_tokens=8)
     with pytest.raises(ValueError):
-        _validate(STANDARD_WINDOW + 1, greedy)
-    _validate(1000, greedy)
+        _validate(STANDARD_MAX, greedy)
+    _validate(3000, greedy)
 
 
-@pytest.mark.parametrize(
-    "line, expected",
-    [
-        # Explicit buckets, the runner's [0] segment and largest query bucket.
-        ({"kv_segment_size_buckets": [2048], "num_batched_tokens_buckets": [1024]}, 3072),
-        # Segment only: the runner sets the query buckets to the segment buckets.
-        ({"kv_segment_size_buckets": [1024]}, 2048),
-        # Neither: max_num_batched_tokens 1024 < max_model_len auto-enables [1024], [1024].
-        ({}, 2048),
-    ],
-)
-def test_window_follows_the_resolved_buckets(served_model_dir, monkeypatch, line, expected):
+def test_the_policy_names_max_model_len_in_its_startup_line(served_model_dir, monkeypatch,
+                                                           caplog):
     monkeypatch.setenv(KNOB, "1")
-    _serve(
-        served_model_dir,
-        dict(STANDARD_LINE, max_model_len=8192, neuron_config=dict(line, ep_degree=16)),
-        sampler=ALL_GREEDY,
-    )
-    assert NeuronPlatform._admission.window.tokens == expected
-
-
-def test_single_shot_prefill_has_no_window(served_model_dir, monkeypatch):
-    """max_num_batched_tokens == max_model_len: segmented prefill is off, the block table
-    spans max_model_len, and only vLLM's own length check applies."""
-    monkeypatch.setenv(KNOB, "1")
-    _serve(
-        served_model_dir,
-        dict(STANDARD_LINE, max_num_batched_tokens=4096, neuron_config={"ep_degree": 16}),
-        sampler=ALL_GREEDY,
-    )
-    assert NeuronPlatform._admission.window is None
-
-
-@pytest.mark.parametrize("windowed", [False, True])
-def test_only_a_windowed_prefill_model_has_a_window(windowed):
-    """Only a model whose runner reads a fixed window (``supports_windowed_prefill``,
-    GLM-5.3-Flash) has one; segmented prefill for the other families walks prior KV
-    segment by segment."""
-    segment = chunk = 1024
-    window = admission.prefill_window(
-        {"kv_segment_size_buckets": [segment], "num_batched_tokens_buckets": [chunk],
-         "_model_supports_windowed_prefill": windowed},
-        max_model_len=4 * (segment + chunk),
-        max_num_batched_tokens=chunk,
-        block_size=SERVED_BLOCK,
-    )
-    if windowed:
-        assert window.tokens == segment + chunk
-    else:
-        assert window is None
+    with caplog.at_level(logging.INFO, logger=admission.__name__):
+        _serve(served_model_dir, STANDARD_LINE, sampler=ALL_GREEDY, async_scheduling=True)
+    assert any(
+        "max_model_len" in record.getMessage() and str(STANDARD_MAX) in record.getMessage()
+        for record in caplog.records
+    ), caplog.text
 
 
 @pytest.mark.parametrize(
@@ -267,25 +240,39 @@ def test_only_a_windowed_prefill_model_has_a_window(windowed):
      dict(STANDARD_LINE, max_num_batched_tokens=4096, neuron_config={})],
     ids=["standard", "bs64", "segment-only", "auto", "single-shot"],
 )
-def test_admission_resolves_the_buckets_the_runner_resolves(served_model_dir, monkeypatch,
-                                                             tmp_path, line):
-    """Drift guard: the window is computed in the API server from the same config the
-    worker's runner resolves its buckets from. A runner change to that resolution must
-    show up here, not as a refused-but-valid or admitted-but-fatal prompt."""
+def test_every_line_that_starts_serves_a_prefill_window_of_max_model_len(
+    served_model_dir, monkeypatch, tmp_path, line
+):
+    """Drift guard: admission refuses only prompts past max_model_len, which holds because
+    the worker's runner refuses at startup any segment list whose window is shorter. A
+    runner change to that rule must show up here, not as an admitted-but-fatal prompt."""
     monkeypatch.setenv(KNOB, "1")
     config = _serve(served_model_dir, line, sampler=ALL_GREEDY)
     with fr._parallel_state(tmp_path, config):
         runner = NeuronModelRunner(config, device=torch.device("cpu"))
-    resolved = admission.resolve_prefill_buckets(
-        config.additional_config["neuron_config"],
-        max_num_batched_tokens=config.scheduler_config.max_num_batched_tokens,
-        max_model_len=config.model_config.max_model_len,
-        block_size=SERVED_BLOCK,
+    segments = runner.neuron_config.kv_segment_size_buckets
+    if segments is None:
+        # Single-shot prefill: the block table spans max_model_len.
+        assert config.scheduler_config.max_num_batched_tokens >= config.model_config.max_model_len
+        return
+    window = prefill_window_tokens(
+        segments, runner.neuron_config.num_batched_tokens_buckets, SERVED_BLOCK
     )
-    assert resolved == (
-        runner.neuron_config.kv_segment_size_buckets,
-        runner.neuron_config.num_batched_tokens_buckets,
-    )
+    assert window >= config.model_config.max_model_len, (segments, window)
+
+
+def test_the_old_standard_line_does_not_start(served_model_dir, monkeypatch, tmp_path):
+    """[1024] alone at max_model_len 4096 is refused by the runner, naming the 2048-token
+    window it would serve: the HTTP 400 guard for prompts past it has no config to guard."""
+    monkeypatch.setenv(KNOB, "1")
+    old = dict(STANDARD_LINE, neuron_config=dict(STANDARD_LINE["neuron_config"],
+                                                 kv_segment_size_buckets=[1024]))
+    config = _serve(served_model_dir, old, sampler=ALL_GREEDY)
+    with fr._parallel_state(tmp_path, config), pytest.raises(ValueError) as refused:
+        NeuronModelRunner(config, device=torch.device("cpu"))
+    message = str(refused.value)
+    assert "prefill window" in message and str(OLD_WINDOW) in message, message
+    assert str(STANDARD_MAX) in message, message
 
 
 # ── sampling under the all_greedy on-device sampler ─────────────────────────────────

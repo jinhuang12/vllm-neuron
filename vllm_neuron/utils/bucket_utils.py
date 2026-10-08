@@ -396,41 +396,176 @@ def resolve_segmented_prefill_config(
     return ([max_num_batched_tokens], [max_num_batched_tokens])
 
 
+def _cdiv(value: int, divisor: int) -> int:
+    return -(-int(value) // int(divisor))
+
+
+def prefill_window_tokens(
+    kv_segment_size_buckets: list[int],
+    num_batched_tokens_buckets: list[int],
+    block_size: int | None = None,
+) -> int:
+    """Return the longest prompt a windowed prefill serves with these buckets.
+
+    The GLM-5.3-Flash runner reads a prefill chunk's KV through a block table of
+    ``ceil((segment + query_bucket) / page)`` pages (``_glm5next_model_kwargs``), the
+    query bucket being the largest configured one since a one-request prefill is widened
+    to it. The last chunk of a prompt of P tokens holds ``ceil(P / page)`` pages, so the
+    window is ``page * ceil((largest segment + largest query bucket) / page)`` tokens.
+    Without ``block_size`` the exact sum is returned, a lower bound on the paged window.
+    """
+    segment = max(int(value) for value in kv_segment_size_buckets)
+    query = max(int(value) for value in num_batched_tokens_buckets)
+    if block_size is None:
+        return segment + query
+    return int(block_size) * _cdiv(segment + query, block_size)
+
+
+def select_kv_segment_size(buckets: list[int], tokens: int) -> int:
+    """Return the KV segment a request of ``tokens`` tokens is prefilled with.
+
+    The smallest of ``buckets`` (the validated ``kv_segment_size_buckets``, strictly
+    ascending) at least as long as the request, so every chunk of the request reads a
+    window of ``segment + query_bucket`` tokens that holds its whole sequence, through the
+    graph compiled for that segment. A request longer than every segment takes the largest:
+    the validator (:func:`validate_kv_segment_size_buckets`) has proved that segment's
+    window covers ``max_model_len``, which bounds every request.
+    """
+    for segment in buckets:
+        if int(tokens) <= int(segment):
+            return int(segment)
+    return int(buckets[-1])
+
+
+def covering_kv_segment_size(
+    max_model_len: int,
+    max_query_tokens: int,
+    block_size: int | None = None,
+    *,
+    windowed_prefill: bool = False,
+) -> int | None:
+    """Return the smallest supported segment whose window covers ``max_model_len``.
+
+    A windowed-prefill model takes any positive segment (its segment only sizes the
+    gathered window), so when no size of ``SUPPORTED_KV_SEGMENT_SIZES`` covers, a
+    segment of ``max_model_len`` is returned for it: its window is the whole table.
+    ``None`` otherwise: the longest window is then
+    ``prefill_window_tokens([max(SUPPORTED_KV_SEGMENT_SIZES)], [max_query_tokens])``.
+    """
+    for segment in sorted(SUPPORTED_KV_SEGMENT_SIZES):
+        if prefill_window_tokens([segment], [max_query_tokens], block_size) >= int(
+            max_model_len
+        ):
+            return int(segment)
+    if windowed_prefill:
+        return int(max_model_len)
+    return None
+
+
+def complete_kv_segment_cover(
+    kv_segment_size_buckets: list[int],
+    num_batched_tokens_buckets: list[int],
+    max_model_len: int,
+    block_size: int | None = None,
+    *,
+    windowed_prefill: bool = False,
+) -> list[int]:
+    """Return the segment list with the covering segment appended when it falls short.
+
+    For the auto-enabled list (the user set no ``kv_segment_size_buckets``): the list
+    the resolver picks is one segment equal to the token budget, whose window is twice
+    the budget. A windowed model with ``max_model_len`` above that would refuse every
+    longer prompt, so the smallest supported segment whose window covers
+    ``max_model_len`` is appended (a segment of ``max_model_len`` itself for a
+    windowed-prefill model when no supported size covers). A list that covers already
+    is returned unchanged.
+
+    Raises:
+        ValueError: no supported segment covers ``max_model_len`` (not windowed).
+    """
+    segments = [int(value) for value in kv_segment_size_buckets]
+    if prefill_window_tokens(segments, num_batched_tokens_buckets, block_size) >= int(
+        max_model_len
+    ):
+        return segments
+    query = max(int(value) for value in num_batched_tokens_buckets)
+    cover = covering_kv_segment_size(
+        max_model_len, query, block_size, windowed_prefill=windowed_prefill
+    )
+    if cover is None:
+        longest = prefill_window_tokens(
+            [max(SUPPORTED_KV_SEGMENT_SIZES)], [query], block_size
+        )
+        raise ValueError(
+            f"No supported KV segment size {sorted(SUPPORTED_KV_SEGMENT_SIZES)} gives "
+            f"a prefill window that covers max_model_len={max_model_len} with a query "
+            f"bucket of {query} tokens: the longest window is {longest} tokens "
+            f"(segment {max(SUPPORTED_KV_SEGMENT_SIZES)} + query bucket {query}). "
+            f"Lower max_model_len to {longest} or raise max_num_batched_tokens."
+        )
+    return segments + [cover] if cover > segments[-1] else sorted(set(segments) | {cover})
+
+
 def validate_kv_segment_size_buckets(
     buckets: Any,
     num_batched_tokens_buckets: list[int] | None,
     *,
     allow_independent_query_buckets: bool = False,
     windowed_prefill: bool = False,
+    block_size: int | None = None,
+    max_model_len: int | None = None,
 ) -> list[int]:
     """Validate kv_segment_size_buckets configuration for segmented prefill.
 
+    A segment is how much of a request's sequence one prefill chunk's compiled graph
+    may address: a request is prefilled on the smallest segment at least as long as it
+    (:func:`select_kv_segment_size`), and its chunks read a window of
+    ``segment + query bucket`` tokens.
+
     Validates the following interface constraints (always enforced):
         1. Bucket list is a non-empty list of integers.
-        2. Buckets must be in strictly ascending order.
+        2. Buckets must be in strictly ascending order, so the first segment that
+           holds a request is the smallest.
         3. Each value must be one of the sizes supported by the segmented
            attention NKI kernel (see ``SUPPORTED_KV_SEGMENT_SIZES``). A
            windowed-prefill model takes any positive size instead: its segment
            only sizes the gathered KV window a prefill chunk reads.
 
-    Current kernel limitations (will be relaxed in the future):
-        4. Only one segment size is supported (len == 1).
+    Current kernel limitations:
+        4. Several segment sizes need a model whose kernel takes the prefill bucket
+           length independently of the cached-KV length
+           (``allow_independent_query_buckets``); the generic segmented kernel requires
+           ``seqlen_q == kv_segment_size``, so it takes one segment. Several segments
+           also need ``num_batched_tokens_buckets`` set explicitly: left unset it copies
+           the segment list, and the runner would compile every (query, segment) pair
+           and run every chunk at the largest segment's width.
         5. When num_batched_tokens_buckets is explicitly set by the user, it
            must equal kv_segment_size_buckets because the segmented kernel
            currently requires the prefill bucket length to be exactly the
            segment size. Models whose kernel accepts a query length independent
            of the cached-KV length are exempt.
 
+    The prefill window (windowed models only, when ``max_model_len`` is given):
+        6. The largest segment plus the largest query bucket, in whole KV pages, must
+           reach ``max_model_len`` (:func:`prefill_window_tokens`). The runner reads a
+           chunk's KV through a block table of that many pages, so a shorter window
+           would refuse every prompt past it although ``max_model_len`` admits it. The
+           refusal names the segment to add.
+
     Args:
         buckets: List of segment size buckets to validate.
         num_batched_tokens_buckets: Explicitly configured batched tokens buckets,
-            or None if not set by user.
+            or None if not set by user (they then copy the segment list).
         allow_independent_query_buckets: True when the model's segmented kernel
             takes a prefill bucket length that differs from the segment size.
-            Relaxes constraint 5 only; constraints 1-4 still apply.
+            Allows several segments (constraint 4) and relaxes constraint 5.
         windowed_prefill: True when the model reads a chunk's prior KV through a
             gathered block-table window rather than the segmented attention
-            kernel. Relaxes constraint 3 to "positive"; 1, 2, 4 and 5 still apply.
+            kernel. Relaxes constraint 3 to "positive" and enables the window
+            rule (constraint 6); 1, 2, 4 and 5 still apply.
+        block_size: The KV cache block size in tokens, for the window rule's page
+            rounding; None for the exact sum.
+        max_model_len: The model length the window must cover; None skips rule 6.
 
     Returns:
         The validated bucket list.
@@ -443,6 +578,10 @@ def validate_kv_segment_size_buckets(
         [2048]
         >>> validate_kv_segment_size_buckets([2048], [2048])
         [2048]
+        >>> validate_kv_segment_size_buckets(
+        ...     [1024, 2048, 4096], [1024], allow_independent_query_buckets=True,
+        ...     block_size=128, max_model_len=4096)
+        [1024, 2048, 4096]
     """
     param_name = "kv_segment_size_buckets"
 
@@ -451,12 +590,11 @@ def validate_kv_segment_size_buckets(
         raise ValueError(f"{param_name} must be a non-empty list")
 
     for i, s in enumerate(buckets):
-        if not isinstance(s, int):
+        if not isinstance(s, int) or isinstance(s, bool):
             raise ValueError(f"{param_name}[{i}] must be an integer, got {s}")
 
-    # 2. Strictly ascending order
-    # TODO: Ordering matters once multiple segment sizes are supported,
-    # so that bucket selection can pick the smallest fitting segment.
+    # 2. Strictly ascending order, which select_kv_segment_size relies on to
+    # pick the smallest segment that holds a request.
     for i in range(1, len(buckets)):
         if buckets[i] <= buckets[i - 1]:
             raise ValueError(
@@ -480,14 +618,23 @@ def validate_kv_segment_size_buckets(
 
     # --- Current kernel limitations ---
 
-    # 4. Only one segment size for now
-    if len(buckets) != 1:
-        # TODO: Add support for multiple segment sizes and implement
-        # bucket selection logic.
-        raise ValueError(
-            f"Only one segment size is currently supported, got "
-            f"{len(buckets)}: {buckets}."
-        )
+    # 4. Several segment sizes: only for a model whose kernel takes the query
+    # length independently, and only with explicit query buckets
+    if len(buckets) > 1:
+        if not allow_independent_query_buckets:
+            raise ValueError(
+                f"Only one segment size is supported for a model whose segmented "
+                f"kernel requires the prefill bucket length to equal the segment "
+                f"size, got {len(buckets)}: {buckets}."
+            )
+        if num_batched_tokens_buckets is None:
+            raise ValueError(
+                f"{param_name}={buckets} names several segment sizes, so "
+                f"num_batched_tokens_buckets must be set explicitly (for example "
+                f"[{buckets[0]}]): left unset it copies the segment list, and the "
+                f"runner would compile every (query, segment) pair and run every "
+                f"prefill chunk at the width of the largest segment, {buckets[-1]} rows."
+            )
 
     # 5. If user explicitly set num_batched_tokens_buckets, it must match unless
     # the model's kernel takes the two lengths independently
@@ -504,6 +651,36 @@ def validate_kv_segment_size_buckets(
                 f"prefill bucket length to equal the segment size. "
                 f"Got num_batched_tokens_buckets={num_batched_tokens_buckets}, "
                 f"{param_name}={buckets}"
+            )
+
+    # --- The prefill window of a windowed model ---
+
+    # 6. The largest segment plus the largest query bucket must cover max_model_len
+    # (a windowed-prefill model: its prefill chunk reads that window and no more)
+    if windowed_prefill and max_model_len is not None:
+        queries = (
+            num_batched_tokens_buckets
+            if num_batched_tokens_buckets is not None
+            else buckets
+        )
+        window = prefill_window_tokens(buckets, queries, block_size)
+        if window < int(max_model_len):
+            query = max(int(value) for value in queries)
+            needed = int(max_model_len) - query
+            cover = covering_kv_segment_size(
+                max_model_len, query, block_size, windowed_prefill=True
+            )
+            remedy = (
+                f"Add a segment of at least {needed} tokens, for example "
+                f"{param_name}={sorted(set(buckets) | {cover})}, or lower "
+                f"max_model_len to {window}"
+            )
+            raise ValueError(
+                f"{param_name}={buckets} with num_batched_tokens_buckets={list(queries)} "
+                f"serve a prefill window of {window} tokens (largest segment "
+                f"{buckets[-1]} + largest query bucket {query}, in KV pages of "
+                f"{block_size}), below max_model_len={max_model_len}: a prompt longer "
+                f"than {window} tokens could not be prefilled. {remedy}."
             )
 
     return buckets

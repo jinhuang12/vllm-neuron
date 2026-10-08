@@ -259,13 +259,14 @@ class Glm5NextForConditionalGeneration(nn.Module):
     #: the kernel's segment set {512..8192}, its chunk set and its single-shot bound
     #: on max_model_len do not apply: any positive KV segment and chunk are served.
     #: The platform copies it into ``neuron_config._model_supports_windowed_prefill``
-    #: (``NeuronPlatform``, next to ``supports_independent_prefill_buckets``). That
-    #: field is passed as ``windowed_prefill=`` to
+    #: (``NeuronPlatform``, next to ``supports_independent_prefill_buckets``). The
+    #: model runner passes that field as ``windowed_prefill=`` to
     #: ``bucket_utils.resolve_segmented_prefill_config`` and
-    #: ``bucket_utils.validate_kv_segment_size_buckets`` by the model runner and by
-    #: ``admission.resolve_prefill_buckets``, and ``admission.prefill_window`` refuses
-    #: prompts past the window only for such a model. glm sets it: its prefill
-    #: attention gathers the window.
+    #: ``bucket_utils.validate_kv_segment_size_buckets``; the validator then also
+    #: requires the largest segment + largest query bucket to cover max_model_len, and,
+    #: with independent prefill buckets, an auto-resolved list is completed with a
+    #: covering segment (``bucket_utils.complete_kv_segment_cover``). glm sets it: its
+    #: prefill attention gathers the window.
     supports_windowed_prefill = True
 
     def __init__(

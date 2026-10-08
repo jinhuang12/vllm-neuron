@@ -129,9 +129,6 @@ def _child(kind: str, rows: int, width: int, grid: int) -> None:
           flush=True)
 
 
-@pytest.mark.skipif(shutil.which("neuronx-cc") is None
-                    and not pathlib.Path(sys.executable).with_name("neuronx-cc").exists(),
-                    reason="neuronx-cc is not installed")
 @pytest.mark.parametrize("kind,rows,width,grid", CASES,
                          ids=[f"{k}-{r}x{w}-g{g}" for k, r, w, g in CASES])
 def test_neuronx_cc_builds_the_wide_kernel(kind, rows, width, grid):
@@ -143,6 +140,7 @@ def test_neuronx_cc_builds_the_wide_kernel(kind, rows, width, grid):
             NEURON_LIBTORCH_CACHE_ROOT=scratch, PYTHONDONTWRITEBYTECODE="1",
             PYTHONPATH=str(_ROOT),
             PATH=f"{pathlib.Path(sys.executable).parent}:{environment.get('PATH', '')}")
+        assert shutil.which("neuronx-cc", path=environment["PATH"]), "neuronx-cc is not installed"
         done = subprocess.run(
             [sys.executable, str(pathlib.Path(__file__).resolve()), "child", kind, str(rows),
              str(width), str(grid)],

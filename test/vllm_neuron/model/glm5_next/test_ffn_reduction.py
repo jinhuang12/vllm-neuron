@@ -151,17 +151,16 @@ def _dense_module(text_config, operands: dict):
     return module
 
 
-def _carrier(text_config):
-    """A ``Glm5NextModel`` stand-in that carries only what ``_ffn_half`` reads. """
+def _dependencies(text_config) -> dict:
+    """The two keywords ``_ffn_half`` takes by name: the config, and the stack's own
+    RMSNorm body bound to a holder of that config (it reads ``rms_norm_eps`` off it)."""
     import types
 
-    model_fp8 = _impl()
-    carrier = object.__new__(model_fp8.Glm5NextModel)
-    object.__setattr__(carrier, "text_config", text_config)
-    object.__setattr__(
-        carrier, "_rms_norm", types.MethodType(model_fp8.Glm5NextModel._rms_norm, carrier)
-    )
-    return carrier
+    holder = types.SimpleNamespace(text_config=text_config)
+    return {
+        "text_config": text_config,
+        "rms_norm": types.MethodType(_impl().Glm5NextModel._rms_norm, holder),
+    }
 
 
 def _layer(mlp, gain: torch.Tensor):
@@ -175,12 +174,12 @@ def _layer(mlp, gain: torch.Tensor):
     return layer
 
 
-def _run_half(carrier, layer, hidden: torch.Tensor) -> torch.Tensor:
-    """The production ``_ffn_half``, unbound, on the stand-in carrier."""
+def _run_half(dependencies: dict, layer, hidden: torch.Tensor) -> torch.Tensor:
+    """The production ``_ffn_half`` with its dependencies passed by name."""
     return _impl().Glm5NextModel._ffn_half(
-        carrier,
         layer,
         hidden,
+        **dependencies,
         quant_config=_quant_config(),
         block_size=None,
         moe_group=None,
@@ -229,13 +228,13 @@ def _run_two_ranks(monkeypatch, text_config, operands, group, *, reduce: bool = 
     monkeypatch.setattr(
         model_fp8, "_resolve_tp_group", (lambda: group) if reduce else (lambda: None)
     )
-    carrier = _carrier(text_config)
+    dependencies = _dependencies(text_config)
     last = None
     for rank in range(WORLD):
         group.recording = rank == 0
         module = _dense_module(text_config, _shard(operands, rank))
         layer = _layer(module, operands["gain"])
-        last = _run_half(carrier, layer, operands["hidden"])
+        last = _run_half(dependencies, layer, operands["hidden"])
     return last
 
 
@@ -246,6 +245,8 @@ def test_the_reduced_sharded_ffn_half_equals_the_unsharded_output(
     monkeypatch,
 ) -> None:
     """Two ranks' reduced FFN half equals the unsharded one, and reduces once per rank."""
+    # Pin the as-built fp32 wire, so an exported policy switch does not decide.
+    monkeypatch.setenv("VLLM_NEURON_TP_ALLREDUCE_DTYPE", "fp32")
     model_fp8 = _impl()
     text_config = _text_config()
     operands = _whole_operands()
@@ -255,7 +256,7 @@ def test_the_reduced_sharded_ffn_half_equals_the_unsharded_output(
     #    symbol, which is what makes check-2 below a control rather than a hope.
     assert model_fp8._resolve_tp_group() is None
     whole = _dense_module(text_config, operands)
-    reference = _run_half(_carrier(text_config), _layer(whole, operands["gain"]), operands["hidden"])
+    reference = _run_half(_dependencies(text_config), _layer(whole, operands["gain"]), operands["hidden"])
     if float(reference.abs().max()) == 0.0:
         raise VacuousControlError(
             "the unsharded reference is all zeros; every arm below would agree with "

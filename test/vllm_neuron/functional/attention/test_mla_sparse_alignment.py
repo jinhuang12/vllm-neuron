@@ -17,6 +17,7 @@ operands through the entry point and with bfloat16 operands through the seam.
 
 from __future__ import annotations
 
+import ast
 import pathlib
 from collections import Counter
 
@@ -336,7 +337,13 @@ def _assert_bit_identical(seq: int, latent: int, topk: int, s_kv: int,
 
 def _assert_bit_identical_two_byte(seq: int, latent: int, topk: int, s_kv: int,
                                    heads: int) -> None:
-    """With bfloat16 operands the seam hands them through unwidened and the values still match."""
+    """With bfloat16 operands the seam hands them through unwidened and the values still match.
+
+    Read on the fp32 kill-switch path (``VLLM_NEURON_MLA_SPARSE_FP32=1``): the served
+    default feeds the PE the 2-byte operands and a hi/lo split of the probabilities, which
+    is read against the fp32 path within a tolerance in ``test_mla_sparse_prefill_lowp.py``.
+    The claim here is about the operand staging, which both paths share.
+    """
     q_lift, c_kv, topk_idx = _inputs(seq, heads, latent, topk, s_kv)
     q_2b, c_2b = q_lift.to(torch.bfloat16), c_kv.to(torch.bfloat16)
     # Before this change the seam widened its operands to float32; a module without the
@@ -376,20 +383,23 @@ def test_bit_identical_at_1152_rows_with_a_narrower_last_tile():
         _assert_bit_identical(*_GEOMETRIES[2], heads)
 
 
-def test_two_byte_operands_bit_identical_at_the_prefill_geometry():
+def test_two_byte_operands_bit_identical_at_the_prefill_geometry(monkeypatch):
     """The seam hands bfloat16 through; latent 512 and 2,048 rows, at each head count."""
+    monkeypatch.setenv("VLLM_NEURON_MLA_SPARSE_FP32", "1")
     for heads in _HEADS:
         _assert_bit_identical_two_byte(*_GEOMETRIES[0], heads)
 
 
-def test_two_byte_operands_bit_identical_at_640_rows_with_a_narrower_last_tile():
+def test_two_byte_operands_bit_identical_at_640_rows_with_a_narrower_last_tile(monkeypatch):
     """The seam hands bfloat16 through; two score tiles, at each head count."""
+    monkeypatch.setenv("VLLM_NEURON_MLA_SPARSE_FP32", "1")
     for heads in _HEADS:
         _assert_bit_identical_two_byte(*_GEOMETRIES[1], heads)
 
 
-def test_two_byte_operands_bit_identical_at_1152_rows_with_a_narrower_last_tile():
+def test_two_byte_operands_bit_identical_at_1152_rows_with_a_narrower_last_tile(monkeypatch):
     """The seam hands bfloat16 through; three score tiles, at each head count."""
+    monkeypatch.setenv("VLLM_NEURON_MLA_SPARSE_FP32", "1")
     for heads in _HEADS:
         _assert_bit_identical_two_byte(*_GEOMETRIES[2], heads)
 
@@ -447,6 +457,47 @@ def _sites(source: str, at: dict) -> list:
     return census(source, at, _arithmetic(), _WIDTHS)
 
 
+#: The low-precision body. ``_lowp_serves`` traces it only for more than one query, one
+#: head and no rotary limb, so its sites are read at the prefill geometry alone.
+_LOWP_BODY = "_attention_body_row_tiled_lowp"
+
+
+def _indirect_lines(source: str) -> set[int]:
+    """The lines of every ``dma_transpose`` whose source is an indirect (``vector_offset``) gather.
+
+    Such a site is a row gather, one descriptor per selected row, not a direct 2D transpose:
+    the 16-rows-per-DMA shape the census grades does not describe it. Its destination
+    alignment is read by :func:`test_indirect_gather_transposes_start_on_a_line` instead.
+    """
+    found = set()
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call) or getattr(node.func, "attr", "") != "dma_transpose":
+            continue
+        src = next((kw.value for kw in node.keywords if kw.arg == "src"), None)
+        if isinstance(src, ast.Call) and any(kw.arg == "vector_offset" for kw in src.keywords):
+            found.add(node.lineno)
+    return found
+
+
+def _body_lines(source: str, name: str) -> range:
+    """The source lines the function ``name`` spans."""
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return range(node.lineno, node.end_lineno + 1)
+    return range(0)
+
+
+def _direct_sites(source: str, at: dict, geometry: str) -> list:
+    """The direct transpose sites the trace visits at ``geometry``: indirect gathers set aside,
+    and the low-precision body's sites read at prefill only."""
+    indirect = _indirect_lines(source)
+    lowp = _body_lines(source, _LOWP_BODY)
+    sites = [s for s in _sites(source, at) if s.line not in indirect]
+    if geometry != "prefill":
+        sites = [s for s in sites if s.line not in lowp]
+    return sites
+
+
 def _tile_rows(source: str, at: dict) -> list:
     """Every SBUF tile ``source`` declares at ``at``, as ``(line, name, bytes per partition)``."""
     return tile_rows(source, at, _arithmetic(), _WIDTHS)
@@ -456,7 +507,7 @@ def test_no_transpose_destination_starts_off_a_32_byte_boundary():
     """At each geometry and either operand width, no transpose destination starts off 32 bytes."""
     source = _module_source()
     for name, at in _GEOMETRIES_READ:
-        sites = _sites(source, at)
+        sites = _direct_sites(source, at, name)
         unreadable = tuple(s.line for s in sites if s.misaligned is None)
         misaligned = tuple(s.line for s in sites if s.misaligned)
         assert sites, f"the census read no transpose site at {name}"
@@ -470,7 +521,7 @@ def test_every_transpose_lands_in_the_source_dtype_sixteen_rows_per_dma():
     found = {}
     float32_only: tuple[int, ...] = ()
     for name, at in _GEOMETRIES_READ:
-        sites = _sites(source, at)
+        sites = _direct_sites(source, at, name)
         shaped = [s for s in sites if s.host_shaped(_DGE_ROWS)]
         found[name] = dict(sorted(Counter(s.source for s in shaped).items()))
         if name == "prefill":
@@ -479,6 +530,48 @@ def test_every_transpose_lands_in_the_source_dtype_sixteen_rows_per_dma():
     assert float32_only == (), f"destinations only float32 can land in: {float32_only}"
     assert found == _EXPECTED_HOST_SHAPED, \
         f"host-shaped sites by source {found} are not the expected {_EXPECTED_HOST_SHAPED}"
+
+
+def test_indirect_gather_transposes_start_on_a_line():
+    """The low-precision body's gather-transpose is the module's only indirect site, and its
+    destination starts on a 32-byte line at every selected-row count the body serves.
+
+    The destination is the 2-byte ``[128, 1, n_latent, K]`` tile at its base, one DMA per
+    query; the body's gate hands it only the cache's own 2-byte dtype, so the element width
+    is 2. (The score-tile starts are read too, for a split of that DMA, should one return.)
+    """
+    source = _module_source()
+    indirect = _indirect_lines(source)
+    lowp = _body_lines(source, _LOWP_BODY)
+    assert len(indirect) == 1, f"indirect gather-transpose sites: {sorted(indirect)}"
+    assert all(line in lowp for line in indirect), \
+        f"an indirect site outside {_LOWP_BODY}: {sorted(indirect)}"
+    for topk in (2048, 2176):
+        starts = {0} | {ks for ks, _ in mod._score_tiles(topk, mod.MOVING_MAX)}
+        off_line = sorted(ks for ks in starts if (ks * 2) % LINE)
+        assert off_line == [], f"gather-transpose destinations off a line at K={topk}: {off_line}"
+        assert (topk // mod.LATENT_TILE * topk * 2) % LINE == 0  # the tile's whole row
+
+
+def test_the_low_precision_body_serves_only_two_byte_one_head_multi_query_calls():
+    """``_lowp_serves`` admits the geometry the gather-transposes are written for and nothing else."""
+    q = torch.zeros(2, 1, 512, dtype=torch.bfloat16)
+    c = torch.zeros(1024, 512, dtype=torch.bfloat16)
+    nk = [nl.bfloat16, nl.float16, nl.float32]
+
+    class _T:
+        def __init__(self, shape, dtype):
+            self.shape, self.dtype = shape, dtype
+
+    assert mod._lowp_serves(_T((2, 1, 512), nk[0]), _T((1024, 512), nk[0]), 1, 0, True)
+    assert mod._lowp_serves(_T((2, 1, 512), nk[1]), _T((1024, 512), nk[1]), 1, 0, True)
+    assert not mod._lowp_serves(_T((1, 1, 512), nk[0]), _T((1024, 512), nk[0]), 1, 0, True)
+    assert not mod._lowp_serves(_T((2, 1, 512), nk[0]), _T((1024, 512), nk[0]), 2, 0, True)
+    assert not mod._lowp_serves(_T((2, 1, 512), nk[0]), _T((1024, 512), nk[0]), 1, 64, True)
+    assert not mod._lowp_serves(_T((2, 1, 512), nk[0]), _T((1024, 512), nk[0]), 1, 0, False)
+    assert not mod._lowp_serves(_T((2, 1, 512), nk[2]), _T((1024, 512), nk[2]), 1, 0, True)
+    assert not mod._lowp_serves(_T((2, 1, 512), nk[0]), _T((1024, 512), nk[1]), 1, 0, True)
+    del q, c
 
 
 def test_every_sbuf_tile_row_is_a_whole_number_of_32_byte_lines():
