@@ -411,12 +411,13 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         real ring for the scratch copy. Everything else -- the latent bank, the
         pooled store, the block table, the window -- is the same object.
 
-        The advance is clamped to the window's last position, ``max_seq_len - 1``
-        (upstream clamps draft positions to ``max_model_len - 1`` the same way,
-        ``spec_decode/utils.py``): a draft that runs past the window keeps writing
-        the last position -- the scratch ring, the last latent slot -- and never
-        indexes the pooled store past its trash row. The ids it drafts there are
-        what the trunk never uses, since a request at its last position ends.
+        The advance is clamped to the window's last position, ``max_seq_len - 1``.
+        Upstream clamps an out-of-window draft position to 0 and pads its slot
+        (``vllm/v1/spec_decode/utils.py:65-66``); here it is the last position, so
+        the scratch ring and the latent slot stay in-window and the pooled store is
+        never indexed past its trash row. The effect is the same: a draft that runs
+        past the window writes nothing the trunk reads, and the ids it drafts there
+        are what the trunk never uses, since a request at its last position ends.
         """
         if iteration == 0:
             return block_kwargs
