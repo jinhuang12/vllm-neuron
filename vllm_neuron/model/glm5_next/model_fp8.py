@@ -5544,8 +5544,15 @@ class Glm5NextDSAIndexer(nn.Module):
                     pooled[b * rows:(b + 1) * rows].to(pool_views[b].dtype),
                 )
         else:
-            tail_bank.index_copy_(0, slot_index[::rows], rings.to(tail_bank.dtype))
-            pool_bank.index_put_((slot_index, row), pooled.to(pool_bank.dtype))
+            # One ring per request at its slot; one pooled row per step row at its
+            # flat store address. Both are 1-D ``index_copy_`` scatters (the latent
+            # write's form): no strided index slice and no multi-index put, which the
+            # device compiler's access-conflict pass did not take at B = 4.
+            tail_bank.index_copy_(0, slots.to(torch.int64), rings.to(tail_bank.dtype))
+            store_rows = int(pool_bank.shape[1])
+            pool_bank.view(-1, dim).index_copy_(
+                0, slot_index * store_rows + row, pooled.to(pool_bank.dtype)
+            )
         if bounded is None:
             if not indices_wanted:
                 return None
