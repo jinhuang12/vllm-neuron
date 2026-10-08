@@ -6,10 +6,11 @@ The four kernel files next to this one are byte copies taken with
 pins them, so an edit to a snapshot fails the load instead of moving the
 baseline.
 
-``decode_state.py`` and ``gate_clamp.py`` import their emit helpers from the live
-``vllm_neuron.functional.kda.chunked_recurrence``. The load checks that the live
-file is byte-identical to the snapshot of it, so those helpers are the 5938748
-helpers.
+``decode_state.py`` and ``gate_clamp.py`` import their emit helpers by name from
+``vllm_neuron.functional.kda.chunked_recurrence``. The load binds that name to the
+``chunked_recurrence.py`` snapshot next to them while the two files execute, and
+then restores the live module. So they import the 5938748 helpers, whatever the
+live file holds.
 
 :func:`old_decode_core` is the 5938748 decode region of
 ``Glm5NextKDAAttention.forward`` (``model_fp8.py`` lines 3406-3559 at that
@@ -21,6 +22,7 @@ file, so it is copied here line for line instead of loading that file.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import importlib.util
 import sys
 from pathlib import Path
@@ -37,6 +39,9 @@ SNAPSHOT_SHA256 = {
 
 HERE = Path(__file__).resolve().parent
 
+#: The module name the decode snapshots import their emit helpers from.
+CHUNKED_MODULE = "vllm_neuron.functional.kda.chunked_recurrence"
+
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -52,8 +57,31 @@ def _load(path: Path, name: str) -> ModuleType:
     return module
 
 
+def _load_with_helpers(path: Path, name: str, helpers: ModuleType) -> ModuleType:
+    """Load ``path`` with :data:`CHUNKED_MODULE` bound to ``helpers``, then restore it.
+
+    The live module is imported first. So the restore puts back the object that
+    every other importer holds, and everything the live module imports is loaded
+    before the swap.
+    """
+    live = importlib.import_module(CHUNKED_MODULE)
+    package, _, leaf = CHUNKED_MODULE.rpartition(".")
+    sys.modules[CHUNKED_MODULE] = helpers
+    try:
+        module = _load(path, name)
+    finally:
+        sys.modules[CHUNKED_MODULE] = live
+    assert sys.modules[CHUNKED_MODULE] is live, "the live module was not restored"
+    assert getattr(sys.modules[package], leaf) is live, "the package lost the live module"
+    return module
+
+
 def load_baseline(directory: Path | str = HERE) -> SimpleNamespace:
-    """The three 5938748 decode kernels as fresh modules, plus the composition."""
+    """The three 5938748 decode kernels as fresh modules, plus the composition.
+
+    ``chunked_recurrence`` is the 5938748 snapshot that ``gate_clamp`` and
+    ``decode_state`` take their helpers from.
+    """
     directory = Path(directory).resolve()
     for name, digest in SNAPSHOT_SHA256.items():
         got = _sha256(directory / name)
@@ -62,20 +90,16 @@ def load_baseline(directory: Path | str = HERE) -> SimpleNamespace:
                 f"baseline snapshot {directory / name} hashes to {got}, not the "
                 f"5938748 copy {digest}"
             )
-    import vllm_neuron.functional.kda.chunked_recurrence as live_chunked
-
-    live = _sha256(Path(live_chunked.__file__))
-    if live != SNAPSHOT_SHA256["chunked_recurrence.py"]:
-        raise ValueError(
-            "the live chunked_recurrence.py differs from 5938748, so the snapshot "
-            "decode_state/gate_clamp would import changed helpers"
-        )
     tag = f"_kda_5938748_{abs(hash(str(directory)))}"
+    chunked = _load(directory / "chunked_recurrence.py", f"{tag}_chunked")
     return SimpleNamespace(
         directory=directory,
+        chunked_recurrence=chunked,
         depthwise_conv1d=_load(directory / "depthwise_conv1d.py", f"{tag}_conv"),
-        gate_clamp=_load(directory / "gate_clamp.py", f"{tag}_gate"),
-        decode_state=_load(directory / "decode_state.py", f"{tag}_decode"),
+        gate_clamp=_load_with_helpers(directory / "gate_clamp.py", f"{tag}_gate", chunked),
+        decode_state=_load_with_helpers(
+            directory / "decode_state.py", f"{tag}_decode", chunked
+        ),
     )
 
 
