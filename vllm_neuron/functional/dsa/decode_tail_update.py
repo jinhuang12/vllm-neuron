@@ -685,8 +685,23 @@ def _log2(value):
 def ring_depth_for(pool_size: int, max_rows: int) -> int:
     """Ring rows a config needs: a power of two, at least ``pool_size``, holding one step's
     ``max_rows`` tokens and the ``pool_size - 2`` more a rollback can still need
-    (:func:`dsa_decode_ring_rows`). ``max_rows = 1`` gives ``pool_size``."""
-    depth = int(pool_size)
+    (:func:`dsa_decode_ring_rows`). ``max_rows = 1`` gives ``pool_size``.
+
+    ``pool_size`` must itself be a power of two of at least 2 (the ring row of a position
+    is ``position % depth`` and a pool must not wrap mid-way), and ``max_rows`` at least
+    1; anything else is refused by name rather than looped on or answered with a depth
+    the kernels would refuse at the first step.
+    """
+    pool_size, max_rows = int(pool_size), int(max_rows)
+    if pool_size < 2 or pool_size & (pool_size - 1):
+        raise DecodeTailUpdateError(
+            f"pool_size must be a power of two of at least 2 (index_kpool); got {pool_size}"
+        )
+    if max_rows < 1:
+        raise DecodeTailUpdateError(
+            f"max_rows is the most tokens one step hands the ring, at least 1; got {max_rows}"
+        )
+    depth = pool_size
     while depth < max_rows + pool_size - 2:
         depth *= 2
     return depth
@@ -738,7 +753,11 @@ def dsa_decode_ring_rows_kernel(tail_hbm, slots_hbm, key_hbm, score_hbm, ape_hbm
         pos_hbm: ``[B, 1]`` int32, each request's position of row 0.
         pool_size: tokens per pool, a power of two.
         rows: tokens per request this step, a trace-time int, at most
-            ``depth - pool_size + 2``.
+            ``depth - pool_size + 2``. The bound takes a verify step's row 0 as accepted
+            (the step's first token is the previously sampled one, so ``a >= 1``): with
+            ``a = 0`` a rejected row ``pos + rows - 1`` could alias the oldest member the
+            next step re-reads once ``rows > depth - pool_size + 1`` (``rows = 6`` at
+            depth 8); ``rows <= 4`` at depth 8 is safe at any ``a``.
         source_digest: :data:`ROWS_SOURCE_DIGEST`; it only keys the kernel cache.
 
     Returns:

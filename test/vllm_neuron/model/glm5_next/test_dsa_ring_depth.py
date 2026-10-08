@@ -196,3 +196,35 @@ def test_a_deep_seeded_ring_pools_the_same_rows_as_todays_ring(end: int) -> None
     for t in range(rows):
         position = end + t
         assert torch.equal(new_deep[:, position % deep], today[:, position % POOL])
+
+
+# --------------------------------------------------------------------------- #
+# the helper refuses malformed inputs by name instead of looping or answering
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("pool", [0, 1, 3, 6, -4])
+def test_ring_depth_for_refuses_a_pool_size_that_is_not_a_power_of_two_of_at_least_two(pool: int) -> None:
+    from vllm_neuron.functional.dsa.decode_tail_update import (
+        DecodeTailUpdateError,
+        ring_depth_for,
+    )
+
+    with pytest.raises(DecodeTailUpdateError, match="pool_size"):
+        ring_depth_for(pool, 3)
+
+
+@pytest.mark.parametrize("max_rows", [0, -1])
+def test_ring_depth_for_refuses_a_step_of_no_rows(max_rows: int) -> None:
+    from vllm_neuron.functional.dsa.decode_tail_update import (
+        DecodeTailUpdateError,
+        ring_depth_for,
+    )
+
+    with pytest.raises(DecodeTailUpdateError, match="max_rows"):
+        ring_depth_for(POOL, max_rows)
+
+
+def test_indexer_ring_depth_refuses_a_malformed_pool_by_name() -> None:
+    from vllm_neuron.functional.dsa.decode_tail_update import DecodeTailUpdateError
+
+    with pytest.raises(DecodeTailUpdateError, match="pool_size"):
+        indexer_ring_depth(0, GATE_DRAFTS)

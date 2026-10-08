@@ -110,7 +110,8 @@ def indexer_ring_depth(index_kpool: int, num_speculative_tokens: int | None) -> 
     back off that shape. A verify step hands the ring ``1 + num_speculative_tokens``
     rows, and a ring of depth ``R`` takes ``R - index_kpool + 2`` rows back on rollback
     (:func:`decode_tail_update.max_rows_for`), so the depth is the smallest power of two
-    at or above ``max(index_kpool, num_speculative_tokens + 3)``. A server that drafts
+    at or above ``max(index_kpool, (1 + num_speculative_tokens) + index_kpool - 2)`` --
+    ``max(4, num_speculative_tokens + 3)`` at this checkpoint's pool of 4. A server that drafts
     nothing (``0`` or ``None``) gets ``index_kpool``: today's ring, shape and kernels
     untouched.
     """
