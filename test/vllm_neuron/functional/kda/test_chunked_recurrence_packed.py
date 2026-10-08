@@ -2,7 +2,7 @@
 """The packed-tile layout of the KDA chunked recurrence kernels.
 
 Both kernels place ``MAX_TILE // C`` chunks of ``C`` tokens on the partitions of one
-tile, so the production chunk width 8 fills a tile with 16 chunks. These cases
+tile, so the production chunk width 16 fills a tile with 8 chunks. These cases
 cover what the layout adds over the single-chunk cases in
 ``test_chunked_recurrence``: several full tiles, a partial tail tile, a chunk
 width that does not divide the tile, and the two-program launch an LNC2 runtime
@@ -23,7 +23,7 @@ from vllm_neuron.functional.kda import chunked_recurrence as cr
 
 #: The production chunk width, the key/value width a TP=64 rank sees, and the
 #: tolerances ``test_chunked_recurrence`` uses against the same references.
-CHUNK = 8
+CHUNK = 16
 KDIM = 128
 VDIM = 128
 RTOL = 1e-2
@@ -94,7 +94,7 @@ def test_intra_chunk_packed_tiles_match_the_reference(n_chunks):
     assert_close(product, identity, rtol=0.0, atol=ATOL, name="packed_intra.(I+A)@inv")
 
 
-@pytest.mark.parametrize("chunk,n_chunks", [(8, 40), (24, 11)])
+@pytest.mark.parametrize("chunk,n_chunks", [(CHUNK, 20), (24, 11)])
 def test_inter_chunk_packed_tiles_match_the_sequential_scan(chunk, n_chunks):
     """The carry crosses tile boundaries, including a chunk width that leaves
     unused partitions at the bottom of every tile (24 does not divide 128)."""

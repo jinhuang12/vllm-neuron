@@ -29,7 +29,7 @@ from vllm_neuron.functional.kda import chunked_recurrence as cr
 
 #: The chunk width the KDA layer resolves and the key/value widths one TP=64 rank
 #: sees, as in ``test_chunked_recurrence_packed``.
-CHUNK = 8
+CHUNK = 16
 KDIM = 128
 VDIM = 128
 

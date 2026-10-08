@@ -16,11 +16,14 @@ mismatch.
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 
 from vllm_neuron.accuracy.testing import assert_close
 from vllm_neuron.functional.kda.chunked_recurrence import (
+    L2_NORM_EPS,
     ChunkConstants,
     ChunkedRecurrenceError,
     chunk_constants,
@@ -426,10 +429,10 @@ def test_inter_chunk_refuses_an_entering_state_it_cannot_serve():
 
 
 #: The geometry the KDA layer actually enters these kernels at, which is not one of
-#: :data:`CHUNK_SIZES`: the layer binds width 128 and resolves chunk width 8.
+#: :data:`CHUNK_SIZES`: the layer binds width 128 and resolves chunk width 16.
 EXPECTED_PRODUCTION_KDIM = 128
 EXPECTED_PRODUCTION_VDIM = 128
-EXPECTED_PRODUCTION_CHUNK = 8
+EXPECTED_PRODUCTION_CHUNK = 16
 
 #: The checkpoint's gate lower bound, which is what the chunk derivation reads.
 EXPECTED_GATE_LOWER_BOUND = -5.0
@@ -480,7 +483,7 @@ def _production_inputs(seed: int = 20260904):
 def test_intra_chunk_matches_the_reference_at_the_production_geometry():
     """The kernel agrees with the reference at the geometry the KDA layer resolves.
 
-    The chunk width the layer picks, 8, is narrower than any in
+    The chunk width the layer picks, 16, is narrower than any in
     :data:`CHUNK_SIZES`, and the head width is wider, so this covers a shape the
     cases above do not.
     """
@@ -518,13 +521,13 @@ def test_intra_chunk_matches_the_reference_at_the_production_geometry():
 
 
 def test_production_geometry_gate_bound_stays_inside_the_declared_limit():
-    """The worst cumulative gate at chunk 8 is admissible, and chunk 16 would not be.
+    """The worst cumulative gate is admissible at the layer's chunk, not at twice it.
 
     The worst case the checkpoint can produce is every gate entry at
     ``gate_lower_bound``, so the chunk-local cumulative gate reaches
-    ``|gate_lower_bound| * chunk``. That is what makes 8 the widest admissible
-    chunk rather than an arbitrary choice, and the kernel's own admissibility check
-    is asked rather than the arithmetic restated.
+    ``|gate_lower_bound| * chunk``. That is what makes the layer's chunk the widest
+    admissible one rather than an arbitrary choice, and the kernel's own
+    admissibility check is asked rather than the arithmetic restated.
     """
     from vllm_neuron.functional.kda.chunked_recurrence import (
         GATE_CUMSUM_ABS_LIMIT,
@@ -541,8 +544,8 @@ def test_production_geometry_gate_bound_stays_inside_the_declared_limit():
     )
     worst_case = float(worst_gk.cumsum(dim=1).abs().max().item())
 
-    # Eight additions of -5.0 are exact in fp32, both being a power of two times a
-    # small integer, so the measured worst case is the derivation's number exactly.
+    # Every partial sum of -5.0 is a small integer, exact in fp32, so the measured
+    # worst case is the derivation's number exactly.
     assert worst_case == bound * chunk
     assert bound * chunk <= GATE_CUMSUM_ABS_LIMIT
     assert bound * (chunk * 2) > GATE_CUMSUM_ABS_LIMIT
@@ -556,7 +559,148 @@ def test_production_geometry_gate_bound_stays_inside_the_declared_limit():
     ) is True
 
 
+def test_the_gate_limit_is_the_fp32_exponent_range_less_the_named_margin():
+    """``GATE_CUMSUM_ABS_LIMIT`` is fp32's range in nats less ``GATE_EXPONENT_MARGIN``.
+
+    The chunk-local products scale each channel component by ``exp(gc)`` and by
+    ``exp(-gc)``, so the limit is the narrower side of fp32's range, ``-log(tiny)``
+    (the smaller factor stays normal) against ``log(max)`` (the larger stays
+    finite), less a margin of ``log(MAX_TILE)``. What the margin buys is checked
+    in exact arithmetic: at the limit, the smaller factor times a component of
+    ``1 / MAX_TILE`` is still fp32's smallest normal, and ``MAX_TILE`` terms of the
+    larger factor are still finite.
+    """
+    from vllm_neuron.functional.kda.chunked_recurrence import (
+        GATE_CUMSUM_ABS_LIMIT,
+        GATE_EXPONENT_MARGIN,
+        MAX_TILE,
+    )
+
+    fp32 = torch.finfo(torch.float32)
+    narrower_side = min(-math.log(fp32.tiny), math.log(fp32.max))
+    assert GATE_EXPONENT_MARGIN == math.log(MAX_TILE)
+    assert GATE_CUMSUM_ABS_LIMIT == narrower_side - GATE_EXPONENT_MARGIN
+
+    assert math.exp(-GATE_CUMSUM_ABS_LIMIT) / MAX_TILE == pytest.approx(fp32.tiny)
+    assert math.exp(GATE_CUMSUM_ABS_LIMIT) * MAX_TILE < fp32.max
+
+
+#: Chunks in the gate-edge cases: two, so the second chunk enters a state the first
+#: decayed through its whole chunk-local cumulative gate.
+EDGE_CHUNKS = 2
+
+#: fp32's unit roundoff, half the gap between 1 and the next float.
+FP32_UNIT_ROUNDOFF = torch.finfo(torch.float32).eps / 2
+
+
+def _sequential_float64(q, k, v, beta, gk):
+    """The sequential delta rule in float64, over flat ``[T, *]`` inputs.
+
+    :func:`kda_sequential_torch_oracle` step for step, at float64: it evaluates
+    each token's own ``exp(gk[t])`` and never a cumulative gate, so nothing in it
+    approaches fp32's range at any gate. Returns ``(o, final_state)``, ``o``
+    ``[T, V]`` and the state ``[V, K]``.
+    """
+    q, k, v, beta, gk = (x.double() for x in (q, k, v, beta, gk))
+    tokens, kdim = q.shape
+    qn = q / torch.sqrt((q * q).sum(-1, keepdim=True) + L2_NORM_EPS) * kdim**-0.5
+    kn = k / torch.sqrt((k * k).sum(-1, keepdim=True) + L2_NORM_EPS)
+    state = torch.zeros(v.shape[1], kdim, dtype=torch.float64)
+    o = torch.empty(tokens, v.shape[1], dtype=torch.float64)
+    for t in range(tokens):
+        state = state * torch.exp(gk[t]).unsqueeze(0)
+        delta = (v[t] - state @ kn[t]) * beta[t]
+        state = state + torch.outer(delta, kn[t])
+        o[t] = state @ qn[t]
+    return o, state
+
+
+#: Single roundings on one chunk's path that do not depend on its width: the root,
+#: divide and scale of the L2 norm (3), the exponential and operand product of
+#: both gate factors (4), the difference, exponential and product of ``kg``'s
+#: decay (3), ``beta`` and the mask on ``A`` (2), ``beta`` on ``u`` / ``w`` (1),
+#: the subtraction to ``v_new`` (1), the decay and sum of the carry (2) and the
+#: sum of ``o``'s two parts (1).
+FIXED_ROUNDINGS = 17
+
+
+def _rounding_path(n_chunks: int, chunk: int, kdim: int) -> int:
+    """An upper bound on the fp32 roundings along any path to ``o`` or the state.
+
+    Every contraction and single rounding one chunk performs is counted once,
+    whether or not one path passes through all of them: four contractions over
+    the key axis (the L2 norm, ``A`` / ``Aqk``, ``w @ h`` and ``qg @ h``) and,
+    over the chunk axis, the cumulative gate, two per doubling stage of the
+    inverse (the power and the partial sum), the inverse's application to ``u`` /
+    ``w``, ``kg^T @ v_new`` and ``aqk @ v_new``. A length-``n`` contraction rounds
+    ``n`` times. Each stage adds one more rounding, its partial sum, to
+    :data:`FIXED_ROUNDINGS`. The state carries every earlier chunk's path into
+    the next, so the count is per chunk times the chunk count.
+    """
+    stages = doubling_stages(chunk)
+    per_chunk = 4 * kdim + (2 * stages + 4) * chunk + stages + FIXED_ROUNDINGS
+    return n_chunks * per_chunk
+
+
+@pytest.mark.parametrize("edge", ["checkpoint_bound", "kernel_limit"])
+def test_the_chunk_pair_stays_accurate_at_the_gate_edge(edge):
+    """At the largest chunk-local gate, the two kernels agree with a float64 scan.
+
+    Two edges, every gate entry equal so the cumulative gate is as far from zero
+    as it can get: the checkpoint's ``gate_lower_bound`` at the layer's chunk,
+    which is the worst input the layer can send, and ``GATE_CUMSUM_ABS_LIMIT``
+    spread over the chunk, which is the worst the kernels accept. The tolerance
+    is derived, not chosen: every element of ``o`` and of the leaving state is
+    within :func:`_rounding_path` units of fp32's roundoff of that output's
+    largest magnitude.
+    """
+    from vllm_neuron.functional.kda.chunked_recurrence import GATE_CUMSUM_ABS_LIMIT
+
+    geo = _production_geometry()
+    chunk, kdim, vdim = geo["chunk"], geo["kdim"], geo["vdim"]
+    per_token = {
+        "checkpoint_bound": geo["gate_lower_bound"],
+        "kernel_limit": -GATE_CUMSUM_ABS_LIMIT / chunk,
+    }[edge]
+    tokens = EDGE_CHUNKS * chunk
+    gen = torch.Generator().manual_seed(20261008)
+    q = torch.randn((tokens, kdim), generator=gen, dtype=torch.float32)
+    k = torch.randn((tokens, kdim), generator=gen, dtype=torch.float32)
+    v = torch.randn((tokens, vdim), generator=gen, dtype=torch.float32)
+    beta = torch.rand(tokens, generator=gen, dtype=torch.float32) * 0.9 + 0.05
+    gk = torch.full((tokens, kdim), per_token, dtype=torch.float32)
+    worst = float(gk.reshape(EDGE_CHUNKS, chunk, kdim).cumsum(dim=1).abs().max())
+    assert worst <= GATE_CUMSUM_ABS_LIMIT
+
+    def chunked(x):
+        return x.reshape(EDGE_CHUNKS, chunk, *x.shape[1:]).contiguous()
+
+    q_c, k_c, v_c, beta_c, gk_c = (chunked(x) for x in (q, k, v, beta, gk))
+    reset_dispatch_counters()
+    intra = kda_intra_chunk(q_c, k_c, v_c, beta_c, gk_c)
+    assert dispatch_counters() == (1, 0), "the intra-chunk kernel did not serve the edge"
+    reset_inter_dispatch_counters()
+    out = kda_inter_chunk(intra.kg, intra.w, intra.u, gk_c, q_c, intra.aqk)
+    assert inter_dispatch_counters() == (1, 0), (
+        "the inter-chunk kernel did not serve the edge"
+    )
+
+    ref_o, ref_state = _sequential_float64(q, k, v, beta, gk)
+    tolerance = _rounding_path(EDGE_CHUNKS, chunk, kdim) * FP32_UNIT_ROUNDOFF
+    for name, got, want in (
+        ("o", _t(out.o).reshape(tokens, vdim), ref_o),
+        ("final_state", _t(out.final_state), ref_state),
+    ):
+        assert torch.isfinite(got).all(), f"{edge}: {name} is not finite"
+        error = (got.double() - want).abs().max().item()
+        scale = want.abs().max().item()
+        assert error <= tolerance * scale, (
+            f"{edge}: {name} max error {error:.3e} exceeds {tolerance:.3e} of its "
+            f"scale {scale:.3e}"
+        )
+
+
 def test_doubling_stages_is_ceil_log2_of_the_chunk_width():
     """``doubling_stages`` is the Neumann series' stage count, ``ceil(log2(chunk))``."""
-    assert doubling_stages(EXPECTED_PRODUCTION_CHUNK) == 3
+    assert doubling_stages(EXPECTED_PRODUCTION_CHUNK) == 4
     assert {c: doubling_stages(c) for c in CHUNK_SIZES} == {32: 5, 64: 6, 128: 7}

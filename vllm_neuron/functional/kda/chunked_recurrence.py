@@ -128,21 +128,34 @@ logger = logging.getLogger(__name__)
 #: docstring for why this is a declared value and not an inherited default.
 L2_NORM_EPS = 1e-6
 
-#: Largest ``|gc|`` this kernel accepts, where ``gc`` is the inclusive cumulative
-#: gate. The two chunk-local products are formed as ``exp(gc[t]) * exp(-gc[j])``
-#: so that one matmul contracts the channel axis. That factorisation is exact, but
-#: it evaluates both signs of the exponent, so a cumulative gate far from zero
-#: overflows fp32 even where the product itself is tiny. At ``60`` the larger
-#: factor is about ``1.1e26``, which leaves the channel sum room inside fp32's
-#: ``3.4e38``. Upstream keeps the same quantity small differently, by blocking to
-#: 16 or 64 and re-referencing the gate per block; this kernel does not tile, so
-#: the limit is checked instead.
-GATE_CUMSUM_ABS_LIMIT = 60.0
-
 #: Widest chunk, key and value extent, one partition tile each. A literal rather
 #: than ``nl.tile_size.pmax`` read at import time, because this module must import
 #: on a host with no NKI device.
 MAX_TILE = 128
+
+#: fp32's range in nats: ``exp(x)`` is a normal fp32 number for ``x`` from
+#: ``FP32_LOG_TINY`` (about -87.34) to ``FP32_LOG_MAX`` (about 88.72).
+FP32_LOG_TINY = math.log(torch.finfo(torch.float32).tiny)
+FP32_LOG_MAX = math.log(torch.finfo(torch.float32).max)
+
+#: Headroom, in nats, between the largest admissible ``|gc|`` and fp32's range.
+#: The chunk-local products scale each of up to ``MAX_TILE`` channel components by
+#: ``exp(gc)`` and ``exp(-gc)``. A component of a unit vector is typically
+#: ``K ** -0.5`` and the query carries ``K ** -0.5`` more, so ``log(MAX_TILE)``
+#: keeps a ``1 / MAX_TILE`` component times the smaller factor a normal number, and
+#: a sum of ``MAX_TILE`` terms of the larger factor finite.
+GATE_EXPONENT_MARGIN = math.log(MAX_TILE)
+
+#: Largest ``|gc|`` this kernel accepts, where ``gc`` is the inclusive cumulative
+#: gate. The two chunk-local products are formed as ``exp(gc[t]) * exp(-gc[j])``
+#: so that one matmul contracts the channel axis. That factorisation is exact, but
+#: it evaluates both signs of the exponent, so a cumulative gate far from zero
+#: takes one factor out of fp32's range even where the product itself is moderate.
+#: The limit is the narrower side of that range less ``GATE_EXPONENT_MARGIN``,
+#: about 82.48. Upstream keeps the same quantity small differently, by blocking to
+#: 16 or 64 and re-referencing the gate per block; this kernel does not tile, so
+#: the limit is checked instead.
+GATE_CUMSUM_ABS_LIMIT = min(-FP32_LOG_TINY, FP32_LOG_MAX) - GATE_EXPONENT_MARGIN
 
 #: Physical cores behind one logical core on an LNC2 runtime, and so the programs
 #: of a two-program launch.
