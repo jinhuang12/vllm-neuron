@@ -5467,7 +5467,8 @@ class Glm5NextDSAIndexer(nn.Module):
             )
         if not torch.is_tensor(position) or tuple(position.shape) != (batch,):
             raise Glm5NextDSAIndexerError(
-                f"position must be a [{batch}] tensor, row 0's position per request; "
+                f"position must be a [{batch}] tensor, row 0's position per request "
+                f"(one entry per slot in slots); "
                 f"got {position!r}"
             )
         if not torch.is_tensor(seq_lens) or tuple(seq_lens.shape) != (total,):

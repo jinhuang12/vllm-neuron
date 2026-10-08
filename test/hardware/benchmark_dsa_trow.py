@@ -397,7 +397,8 @@ def layer_operands(cfg, batch, rows, pages, context, max_seq_len, depth, seed):
         "tail": (torch.randn(slots_total, 2, depth, head_dim, generator=gen) * 0.5
                  ).to(torch.bfloat16),
         "state_slots": torch.randperm(slots_total, generator=gen)[:batch].to(torch.int32),
-        "seq_lens": torch.full((batch,), context, dtype=torch.int32),
+        # One length per row of the step: ``position[b] + t + 1`` (the translator's layout).
+        "seq_lens": (positions + 1).to(torch.int32),
         "start_position": torch.full((batch,), start, dtype=torch.int64),
         "position": torch.full((batch,), start, dtype=torch.int64),
         "block_table_row": table.t().contiguous(),
