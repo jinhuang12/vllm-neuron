@@ -5825,7 +5825,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         banked: bool = False,
         width: int = 1,
     ) -> dict:
-        """One sparse (DSA) layer's carrier for a decode step of ``B > 1`` requests.
+        """One sparse (DSA) layer's carrier for a request-major decode step: ``B > 1``
+        requests, or one request's verify step of ``width > 1`` rows (the layer's
+        ``T``-row leg takes this form; its one-ring form serves one token).
 
         Request ``b`` is column ``b`` of every per-request operand: its block-table
         column, its position, and its own store of the indexer's pooled keys and
@@ -6327,7 +6329,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     }
                 )
                 continue
-            if len(state_slots) > 1:
+            # The request form (a tuple of ring views, ``[B]`` positions, request-major
+            # rows) is the sparse layer's ``T``-row leg: a step of several requests, or
+            # one request's verify step of ``1 + k`` rows. The one-ring form below
+            # serves exactly one token (the layer's ``tail_step``), so a one-request
+            # step keeps it only on the plain decode leg -- the Stage-A carrier, bit
+            # for bit -- and on the prefill leg.
+            if len(state_slots) > 1 or (not is_prefill and request_width > 1):
                 carriers.append(
                     cls._glm5next_sparse_batch_carrier(
                         bank,

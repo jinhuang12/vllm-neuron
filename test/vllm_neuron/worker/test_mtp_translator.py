@@ -139,14 +139,21 @@ def _per_request(carrier: dict, key: str, requests: int) -> None:
 
 
 def test_a_one_request_verify_step_carries_t_rows_of_one_sequence():
+    """A verify step of one request is the batch-of-one case of the request-major step:
+    the sparse layer routes a step to its ``T``-row leg by the request form (a tuple of
+    ring views, ``[B]`` positions), and its one-ring form serves exactly one token per
+    step -- a bare ring beside ``T`` rows is refused by shape (``tail_step``)."""
     world = _world(1)
     start = world.lengths[0]
     converted = _convert(world, [0], cached=[start], tokens=T, real=[T])
-    for carrier in _sparse(world, converted["layer_carriers"]):
+    slot = world.runner._glm5next_step_record["slots"][0]
+    sides = world.runner._glm5next_live_side_caches(world.root.glm5next_layer_banks)
+    for side, carrier in zip(sides, _sparse(world, converted["layer_carriers"])):
         assert carrier["seq_lens"].tolist() == [start + 1 + t for t in range(T)]
         assert carrier["latent_slots"].tolist() == [_slot(world, 0, start + t) for t in range(T)]
-        assert int(carrier["position"]) == start and int(carrier["start_position"]) == start
-        assert torch.is_tensor(carrier["tail"]), "one request: its own ring view"
+        assert carrier["position"].tolist() == [start] and int(carrier["start_position"]) == start
+        assert isinstance(carrier["tail"], tuple) and len(carrier["tail"]) == 1
+        assert carrier["tail"][0].data_ptr() == side["tail"][slot].data_ptr(), "the slot's own ring view"
         assert tuple(carrier["block_table_row"].shape) == (WINDOW_BLOCKS, 1)
     slot = world.runner._glm5next_step_record["slots"][0]
     assert world.runner._glm5next_step_record == {
@@ -232,9 +239,12 @@ def test_a_one_row_decode_and_a_prefill_are_recorded_for_the_hook_too():
     """The hook zeroes the accepted count on these steps, so they are recorded as well."""
     world = _world(1)
     start = world.lengths[0]
-    _convert(world, [0], cached=[start], tokens=1, real=[1], width=1)
+    converted = _convert(world, [0], cached=[start], tokens=1, real=[1], width=1)
     record = world.runner._glm5next_step_record
     assert (record["is_prefill"], record["width"], record["counts"]) == (False, 1, [1])
+    # The plain one-row step of one request keeps the one-ring form (the Stage-A carrier).
+    for carrier in _sparse(world, converted["layer_carriers"]):
+        assert torch.is_tensor(carrier["tail"]) and int(carrier["position"]) == start
     plain = shadow._world()
     _prefill_conversion(plain)
     record = plain.runner._glm5next_step_record
