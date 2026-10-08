@@ -3344,6 +3344,16 @@ class Glm5NextKDAAttention(nn.Module):
         its own entry of all five, and a concurrent prefill is refused, because
         the carrier says nothing about where one request's tokens end.
 
+        Device contract for the carriers: they are inputs of the compiled step --
+        the whole banks with ``state_slots``, or ``bank[slot]`` views sliced eagerly
+        OUTSIDE the compiled region and passed in. The backend keeps a write-back
+        only as a mutation of one of its inputs (``aliasing_output_rewrite``'s
+        ``io_map``); a view sliced inside the traced region is an intermediate, its
+        ``copy_`` reaches no device memory, and the output is still right, so the
+        stale state is silent. Eager CPU and the simulator cannot show the
+        difference; ``test_kda_carrier_write_back_contract.py`` pins the backend
+        property on the three forms.
+
         A prefill enters with a zero state only when it opens the sequence. A
         prompt longer than one batch of tokens is prefilled in segments, and the
         second segment continues the recurrence the first left, so the entering
@@ -3826,7 +3836,9 @@ class Glm5NextKDAAttention(nn.Module):
         ``[slots, 1 + k, ...]``. The step gathers row ``checkpoint_rows[b]`` of each
         request (``fused_decode.kda_checkpoint_rows``; a read through a flat view) and
         writes all ``1 + k`` rows of the slot -- a whole-view ``copy_`` or a whole-slot
-        ``index_copy_`` on the bank, the two writes the backend keeps. A step carries
+        ``index_copy_`` on the bank, the two writes the backend keeps -- when the view or
+        the bank is an input of the compiled step; a view sliced inside the traced region
+        is not written back on device (the forward's device contract). A step carries
         ``1 .. 1 + k`` tokens per request; a short step (no drafts after a prefill, or
         the drafts trimmed at ``max_model_len``) runs the kernel at ``1 + k`` rows with
         masked padding rows, so the slot is still written whole and the rows past the

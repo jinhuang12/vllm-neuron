@@ -1149,8 +1149,9 @@ def commit_kda_checkpoints(
     tokens kept (the always-real first row plus the accepted drafts, ``1 .. T``)
     means row ``accepted_counts[b] - 1`` is the live state, and that row is what
     this returns: the ``checkpoint_rows`` the next step's forward reads from, each
-    request's slot overwritten whole by that step. Nothing is copied into a live
-    row, and the rejected rows are never read again.
+    request's slot overwritten whole by that step, through carriers that are inputs
+    of that step's compiled graph (the forward's device contract). Nothing is copied
+    into a live row, and the rejected rows are never read again.
 
     Args:
         state_banks: the layer banks to commit on, each ``[slots, T, ...]`` (any
