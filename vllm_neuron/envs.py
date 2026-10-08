@@ -85,6 +85,9 @@ if TYPE_CHECKING:
     # Where the GLM-5.3-Flash shadow draft (MTP stage A) writes its per-step scoring
     # records (JSONL, rank 0). Empty = no log, no scoring.
     VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG: str = ""
+    # Worker GC policy after warmup (vllm_neuron/vllm/worker/gc_policy.py):
+    # "freeze_rare_gen2" (freeze + gen-2 threshold 100000), "freeze", or "off".
+    VLLM_NEURON_GC_POLICY: str = "freeze_rare_gen2"
 
 
 def maybe_convert_bool(value: str | None) -> bool | None:
@@ -380,6 +383,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # empty = no log. Read with VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT (the draft count).
     "VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG": lambda: (
         os.getenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG", "") or ""
+    ),
+    # GC policy each worker applies once after warmup. "freeze_rare_gen2" freezes
+    # the heap and raises only the gen-2 threshold, so full passes stop running every
+    # ~11 bs=64 steps; "freeze" is the freeze alone; "off" keeps CPython's default GC.
+    "VLLM_NEURON_GC_POLICY": lambda: os.getenv(
+        "VLLM_NEURON_GC_POLICY", "freeze_rare_gen2"
     ),
 }
 
