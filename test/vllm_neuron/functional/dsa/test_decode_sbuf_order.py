@@ -199,6 +199,62 @@ def test_a_dma_over_stepped_partitions_is_reported(tmp_path):
     assert found.stepped_dma and not found.clean
 
 
+def _dram(name, nbytes=256):
+    return {"name": name, "type": "DRAM", "addr": 0, "dims": [1, nbytes]}
+
+
+def _at_runtime_address(memloc):
+    """An operand whose address is a register the program sets (a dynamic offset)."""
+    return {"kind": "register_ap", "memsetref": f"{memloc}_set", "dtype": "float32",
+            "ap": [[1, 1], [1, 4]], "regref": "r", "reg_ap_offset": "o"}
+
+
+def test_a_dram_read_at_a_runtime_address_covers_its_whole_tensor(tmp_path):
+    flat = {"kind": "physical_ap", "memref": "t", "dtype": "float32",
+            "ap": [[64, 1], [1, 64]], "offset": 0}
+    found = _found(tmp_path, [_inst("w", "DVE", outs=[flat]),
+                              _inst("d", "SP", opcode="DMACopy",
+                                    ins=[_at_runtime_address("t")], queue="q")],
+                   [_dram("t")])
+    assert len(found.unsync) == 1 and found.unsync[0].startswith("RAW w ")
+
+
+def test_an_sbuf_operand_at_a_runtime_address_leaves_the_dump_undecided(tmp_path):
+    found = _found(tmp_path, [_inst("c", "DVE", opcode="TensorCopy",
+                                    ins=[_at_runtime_address("x")], outs=[_tile("y")])],
+                   [_loc("x"), _loc("y", addr=_COLS * 4)])
+    assert len(found.undecided) == 1 and not found.clean
+    assert "UNDECIDED" in found.summary()
+
+
+def test_two_instructions_of_one_name_stay_two_nodes(tmp_path):
+    # "l" on DVE after the write and "l" on Pool before the read: one node for both would
+    # order the write before the read through it.
+    found = _found(tmp_path, [_inst("w", "DVE", outs=[_tile("x")]), _inst("l", "DVE"),
+                              _inst("l", "Pool"), _inst("r", "Pool", ins=[_tile("x")])],
+                   [_loc("x")])
+    assert len(found.unsync) == 1 and found.unsync[0].startswith("RAW w ")
+
+
+def test_a_cycle_leaves_the_dump_undecided(tmp_path):
+    found = _found(tmp_path, [_inst("a", "DVE", outs=[_tile("x")], waits=[("b", 1, 1)],
+                                    updates=[(2, 1)]),
+                              _inst("b", "Pool", outs=[_tile("x")], waits=[("a", 2, 1)],
+                                    updates=[(1, 1)])], [_loc("x")])
+    assert found.undecided and "cycle" in found.undecided[0] and not found.clean
+
+
+def test_a_wait_on_a_repeated_name_waits_for_the_update_that_reaches_it(tmp_path):
+    # Two "u" on DVE, one semaphore update each; the read waits for the count 2, which only
+    # the second "u", after the write, reaches.
+    found = _found(tmp_path, [_inst("u", "DVE", updates=[(5, 1)]),
+                              _inst("w", "DVE", outs=[_tile("x")]),
+                              _inst("u", "DVE", updates=[(5, 1)]),
+                              _inst("r", "Pool", ins=[_tile("x")], waits=[("u", 5, 2)])],
+                   [_loc("x")])
+    assert found.clean and found.ordered == 1
+
+
 # ---------------------------------------------------------------------------------------
 # The compiled kernels
 # ---------------------------------------------------------------------------------------

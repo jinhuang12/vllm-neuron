@@ -30,6 +30,14 @@ and reports:
   the check even where every pair it takes part in is ordered.
 * ``early_waits``: a semaphore wait whose value the producer's update has not yet
   reached (or that no update reaches), so the edge the wait stands for is not real.
+* ``undecided``: what the check cannot model, so a dump that has any is not clean: an
+  SBUF or PSUM operand at a runtime address (``register_ap``, a register the program sets),
+  an operand of a kind the check does not know, or a cycle in the happens-before graph.
+
+A DRAM operand at a runtime address covers its whole tensor (the offset is not known on
+the CPU), so every pair it can take part in is checked. Instructions are nodes by their
+position, not their name: two instructions of one name stay two nodes, and a wait on a
+repeated name waits for the first of them whose update reaches its value.
 
 Pairs ordered only because two DMAs of one queue complete in issue order are counted
 apart (``queue_order``): the compiler relies on that order everywhere.
@@ -54,6 +62,8 @@ LIBRARY_OPCODES = frozenset({"Gather", "NonzeroWithCount", "Nonzero", "LocalGath
                              "Max8", "TopK", "MatchReplace8", "RangeSelect", "MaxIndex8"})
 #: Fields of the dump the check reads.
 DUMP_SCHEMA_KEYS = ("functions", "queues")
+#: Operand kinds that name no memory (an immediate, a register read).
+_NO_MEMORY_KINDS = frozenset({"imm_value", "register_access"})
 #: Largest interval list an access pattern expands to before the bounding box stands in.
 _EXPAND_CAP = 100000
 _ENGINE_SUFFIX = re.compile(r"-(Activation|PE|DVE|SP|Pool)\d+$")
@@ -69,17 +79,21 @@ class Findings:
     library_alias: list = field(default_factory=list)
     stepped_dma: list = field(default_factory=list)
     early_waits: list = field(default_factory=list)
+    undecided: list = field(default_factory=list)
 
     @property
     def clean(self) -> bool:
-        return not (self.unsync or self.library_alias or self.stepped_dma or self.early_waits)
+        return not (self.unsync or self.library_alias or self.stepped_dma or self.early_waits
+                    or self.undecided)
 
     def summary(self) -> str:
         return (f"{self.instructions} instructions: {len(self.unsync)} unsynchronized pairs, "
                 f"{len(self.library_alias)} library dst/src overlaps, "
                 f"{len(self.stepped_dma)} stepped-partition DMAs, {len(self.early_waits)} "
                 f"early waits ({self.ordered} pairs ordered, {self.queue_order} by same-queue "
-                f"DMA order)")
+                f"DMA order)"
+                + (f"; UNDECIDED: {len(self.undecided)} accesses or edges the check cannot "
+                   f"model" if self.undecided else ""))
 
 
 def _intervals(pattern, start):
@@ -112,10 +126,45 @@ def _intervals_overlap(a, b):
     return False
 
 
+class _Undecided(Exception):
+    """An operand the check cannot place in memory."""
+
+
+class _Cycle(ValueError):
+    """The happens-before graph is not a partial order."""
+
+
+def _runtime_footprint(operand, memlocs):
+    """A ``register_ap`` operand: its address is a register the program sets, so on the
+    CPU it may touch any byte of its tensor. DRAM: the whole tensor. SBUF/PSUM: a runtime
+    partition and column the check cannot model."""
+    ref = operand.get("memref") or operand.get("memsetref") or ""
+    if ref not in memlocs and ref.endswith("_set"):
+        ref = ref[:-len("_set")]
+    if ref not in memlocs:
+        raise _Undecided(f"a runtime-address operand on {ref!r}, which no memory location "
+                         f"names")
+    loc = memlocs[ref]
+    if loc["type"] != "DRAM":
+        raise _Undecided(f"a runtime-address {loc['type']} operand on {ref}")
+    size = 1
+    for n in loc["dims"]:
+        size *= n
+    space = "DRAM:" + ("internal" if loc["kind"] == "Internal" else ref)
+    return dict(space=space, parts=None, lo=loc["addr"], hi=loc["addr"] + size, ivs=None,
+                memref=ref)
+
+
 def _footprint(operand, memlocs):
-    """The bytes one operand touches: its space, partitions (SBUF/PSUM) and intervals."""
-    if operand.get("kind") != "physical_ap":
+    """The bytes one operand touches: its space, partitions (SBUF/PSUM) and intervals;
+    ``None`` for an operand that names no memory. Raises :class:`_Undecided`."""
+    kind = operand.get("kind")
+    if kind in _NO_MEMORY_KINDS:
         return None
+    if kind == "register_ap":
+        return _runtime_footprint(operand, memlocs)
+    if kind != "physical_ap":
+        raise _Undecided(f"an operand of kind {kind!r}")
     loc = memlocs[operand["memref"]]
     size = _DTYPE_BYTES[operand["dtype"]]
     pattern, offset = operand["ap"], operand["offset"]
@@ -202,10 +251,27 @@ class _Graph:
         self.queue_edges = collections.defaultdict(set)
         self.access = []
         self.updates = []
+        self.undecided = []
+        # Nodes are positions: two instructions (or DMA blocks) of one name stay two nodes.
+        inst_count = collections.Counter(i["name"] for i in self.instructions)
+        block_count = collections.Counter(b for i in self.instructions
+                                          for b in i.get("dma_blocks", []))
+        seen = collections.Counter()
+        self.ids_of = collections.defaultdict(list)
+
+        def node_of(name, count):
+            node = name if count[name] == 1 else f"{name}@{seen[name]}"
+            seen[name] += 1
+            self.ids_of[name].append(node)
+            return node
+
+        self.node = []
         last_on_engine, last_on_queue, done_of = {}, {}, {}
         barrier = None
         for inst in self.instructions:
-            name, engine, opcode = inst["name"], inst["engine"], inst["opcode"]
+            engine, opcode = inst["engine"], inst["opcode"]
+            name = node_of(inst["name"], inst_count)
+            self.node.append(name)
             self.updates.append((name, inst))
             if engine == "ALL":
                 for e, prev in list(last_on_engine.items()):
@@ -226,25 +292,65 @@ class _Graph:
                 self._add(name, name, done, inst, inst.get("ins", []), inst.get("outs", []))
                 self._queue(last_on_queue, inst.get("queue"), done)
             elif opcode == "DMATrigger":
-                for block in inst.get("dma_blocks", []):
+                for block_name in inst.get("dma_blocks", []):
+                    block = node_of(block_name, block_count)
                     self.edges[name].add(block)
-                    if block in block_info:
-                        self.updates.append((block, block_info[block]))
-                    descs = blocks.get(block, [])
+                    if block_name in block_info:
+                        self.updates.append((block, block_info[block_name]))
+                    descs = blocks.get(block_name, [])
                     self._add(block, block, block, inst,
                               [x for d in descs for x in d.get("ins", [])],
                               [x for d in descs for x in d.get("outs", [])])
                     self._queue(last_on_queue, inst.get("queue"), block)
             else:
                 self._add(name, name, name, inst, inst.get("ins", []), inst.get("outs", []))
-        for inst in self.instructions:
+        self.reached = self._cumulative_updates()
+        for name, inst in zip(self.node, self.instructions):
             for wait in (inst.get("sync_info") or {}).get("on_wait", []):
-                self.edges[done_of.get(wait["from"], wait["from"])].add(inst["name"])
+                producer = self.producer(wait)
+                self.edges[done_of.get(producer, producer)].add(name)
         self._reach = {}
 
+    def _cumulative_updates(self):
+        """``{(node, semaphore): count}``: each semaphore's cumulative update right after
+        each node's own update. Each semaphore belongs to one engine or queue, whose
+        updates land in program order; a ``GroupResetSemaphores`` (between the blocks of a
+        device loop) zeroes its group."""
+        total, after = collections.Counter(), {}
+        for name, inst in self.updates:
+            if inst["opcode"] == "GroupResetSemaphores":
+                for sem in inst.get("sema_group", []):
+                    total[sem] = 0
+            for update in (inst.get("sync_info") or {}).get("on_update", []):
+                total[update["id"]] += update["update_value"]
+                after[(name, update["id"])] = total[update["id"]]
+        return after
+
+    def producer(self, wait):
+        """The node a wait waits for: its ``from`` instruction, or, for a name several
+        instructions share, the first of them whose update reaches the wait's value."""
+        nodes = self.ids_of.get(wait["from"]) or [wait["from"]]
+        for node in nodes:
+            if self.reached.get((node, wait["id"]), -1) >= wait["wait_value"]:
+                return node
+        return nodes[-1]
+
     def _add(self, name, issue, done, inst, ins, outs):
-        reads = [f for f in (_footprint(x, self.memlocs) for x in ins) if f]
-        writes = [f for f in (_footprint(x, self.memlocs) for x in outs) if f]
+        sides = []
+        for operands in (ins, outs):
+            side = []
+            for operand in operands:
+                try:
+                    footprint = _footprint(operand, self.memlocs)
+                except _Undecided as why:
+                    debug = inst.get("debug") or {}
+                    self.undecided.append(f"{name} {inst['opcode']}@{inst['engine']} line "
+                                          f"{debug.get('lineno')}: {why}")
+                    continue
+                if footprint:
+                    side.append(footprint)
+            sides.append(side)
+        reads, writes = sides
         if reads or writes:
             self.access.append(dict(name=name, issue=issue, done=done, inst=inst,
                                     dma="DMA" in inst["opcode"], reads=reads, writes=writes))
@@ -256,8 +362,9 @@ class _Graph:
 
     def _closure(self, with_queue):
         """Every node's successors in the happens-before order, as a bit set over a node
-        index: one pass in reverse topological order (the order is acyclic, or the program
-        would deadlock)."""
+        index: one pass in reverse topological order. A real program's order is acyclic (it
+        would deadlock otherwise); a cycle raises :class:`_Cycle` and leaves the dump
+        undecided."""
         succ = collections.defaultdict(set)
         for edges in (self.edges, self.queue_edges) if with_queue else (self.edges,):
             for node, after in edges.items():
@@ -275,7 +382,8 @@ class _Graph:
                 if not incoming[later]:
                     order.append(later)
         if len(order) != len(nodes):
-            raise ValueError("the happens-before graph has a cycle")
+            raise _Cycle(f"the happens-before graph has a cycle through "
+                         f"{len(nodes) - len(order)} nodes")
         reach = {}
         for node in reversed(order):
             bits = 0
@@ -292,21 +400,12 @@ class _Graph:
         return b["issue"] in index and bool(reach.get(a["done"], 0) >> index[b["issue"]] & 1)
 
     def early_waits(self):
-        """Waits below the producer's cumulative update of that semaphore. Each semaphore
-        belongs to one engine or queue, whose updates land in program order; a
-        ``GroupResetSemaphores`` (between the blocks of a device loop) zeroes its group."""
-        total, after = collections.Counter(), {}
-        for name, inst in self.updates:
-            if inst["opcode"] == "GroupResetSemaphores":
-                for sem in inst.get("sema_group", []):
-                    total[sem] = 0
-            for update in (inst.get("sync_info") or {}).get("on_update", []):
-                total[update["id"]] += update["update_value"]
-                after[(name, update["id"])] = total[update["id"]]
+        """Waits below the producer's cumulative update of that semaphore (or that no
+        update reaches)."""
         out = []
         for inst in self.instructions:
             for wait in (inst.get("sync_info") or {}).get("on_wait", []):
-                reached = after.get((wait["from"], wait["id"]))
+                reached = self.reached.get((self.producer(wait), wait["id"]))
                 if reached is None or wait["wait_value"] < reached:
                     out.append(f"{inst['name']} waits for {wait['from']} semaphore "
                                f"{wait['id']} >= {wait['wait_value']}; the update reaches "
@@ -328,22 +427,29 @@ def check_dump(path: str) -> Findings:
     if missing:
         raise ValueError(f"{path}: not a lower_sync instruction dump (no {missing})")
     graph = _Graph(dump)
-    found = Findings(instructions=len(graph.instructions))
+    found = Findings(instructions=len(graph.instructions), undecided=list(graph.undecided))
     nodes = graph.access
     pairs = _overlapping_pairs(nodes)
-    for x, y, kind in sorted(pairs):
-        first, second = nodes[x], nodes[y]
-        if graph.before(first, second) or graph.before(second, first):
-            found.ordered += 1
-        elif graph.before(first, second, True) or graph.before(second, first, True):
-            found.queue_order += 1
-        elif (first["inst"]["opcode"] == second["inst"]["opcode"] == "TensorSave"
-              and any(fa["memref"] == fb["memref"] for fa, fb in pairs[(x, y, kind)])
-              and _ENGINE_SUFFIX.sub("", first["name"]) == _ENGINE_SUFFIX.sub("", second["name"])):
-            # One loop register saved by each engine: the same value, one slot.
-            found.ordered += 1
-        else:
-            found.unsync.append(f"{kind} {_label(first)} <-> {_label(second)}")
+    try:
+        for x, y, kind in sorted(pairs):
+            first, second = nodes[x], nodes[y]
+            if graph.before(first, second) or graph.before(second, first):
+                found.ordered += 1
+            elif graph.before(first, second, True) or graph.before(second, first, True):
+                found.queue_order += 1
+            elif (first["inst"]["opcode"] == second["inst"]["opcode"] == "TensorSave"
+                  and any(fa["memref"] == fb["memref"] for fa, fb in pairs[(x, y, kind)])
+                  and _ENGINE_SUFFIX.sub("", first["inst"]["name"])
+                  == _ENGINE_SUFFIX.sub("", second["inst"]["name"])):
+                # One loop register saved by each engine: the same value, one slot.
+                found.ordered += 1
+            else:
+                found.unsync.append(f"{kind} {_label(first)} <-> {_label(second)}")
+    except _Cycle as cycle:
+        # No pair's order can be read off a graph with a cycle.
+        found.undecided.append(f"{cycle}: {len(pairs)} overlapping pairs not decided")
+        found.ordered = found.queue_order = 0
+        found.unsync = []
     for node in nodes:
         if node["inst"]["opcode"] in LIBRARY_OPCODES:
             for r in node["reads"]:
