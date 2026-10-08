@@ -503,18 +503,20 @@ def validate_decode_context_length_buckets(
     Validates that:
         1. Bucket list is a non-empty list of positive ints in strictly
            ascending order.
-        2. Every value is strictly less than ``max_model_len``. Equality
-           is redundant — the ``max_model_len`` fallback NEFF is always
-           compiled separately.
-        3. Every value is divisible by ``P_MAX = 128`` (the NKI attention
-           kernel tile constraint).
+        2. No value exceeds ``max_model_len``. A last value equal to it is
+           the ``max_model_len`` fallback itself, which is always compiled
+           separately, so it is folded into the fallback: the returned list
+           leaves it out and that graph compiles once.
+        3. Every other value is divisible by ``P_MAX = 128`` (the NKI
+           attention kernel tile constraint).
 
     Args:
         buckets: List of decode context length bucket sizes to validate.
         max_model_len: Model's maximum sequence length.
 
     Returns:
-        The validated bucket list.
+        The validated bucket list, without a last value equal to
+        ``max_model_len``.
 
     Raises:
         ValueError: If validation fails.
@@ -522,6 +524,8 @@ def validate_decode_context_length_buckets(
     Example:
         >>> validate_decode_context_length_buckets([2048, 4096], max_model_len=16384)
         [2048, 4096]
+        >>> validate_decode_context_length_buckets([2048, 16384], max_model_len=16384)
+        [2048]
     """
     param_name = "decode_context_length_buckets"
 
@@ -543,12 +547,14 @@ def validate_decode_context_length_buckets(
             )
 
     for i, bucket in enumerate(buckets):
-        if bucket >= max_model_len:
+        if bucket > max_model_len:
             raise ValueError(
-                f"{param_name}[{i}]={bucket} must be strictly less than "
-                f"max_model_len={max_model_len}; max_model_len is the "
-                f"implicit fallback bucket."
+                f"{param_name}[{i}]={bucket} must not exceed max_model_len="
+                f"{max_model_len}; max_model_len is the implicit fallback bucket."
             )
+        if bucket == max_model_len:
+            # The fallback itself (the last value): folded below, not tile-checked.
+            continue
         if bucket % _DECODE_CONTEXT_LENGTH_PMAX != 0:
             raise ValueError(
                 f"{param_name}[{i}]={bucket} must be divisible by "
@@ -556,6 +562,12 @@ def validate_decode_context_length_buckets(
                 f"kernel tile constraint."
             )
 
+    # max_model_len is the implicit fallback: listed, it would compile twice.
+    if buckets[-1] == max_model_len:
+        logger.info(
+            "%s: the last value %d equals max_model_len; it is the fallback graph, "
+            "which compiles once", param_name, max_model_len)
+        return buckets[:-1]
     return buckets
 
 
