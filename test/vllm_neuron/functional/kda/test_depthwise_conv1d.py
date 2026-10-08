@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the KDA prefill depthwise conv1d wrapper.
+"""Tests for the KDA prefill depthwise conv1d wrap and its in-tree kernel.
 
-Two numeric cases and a set of refusals.
+Two numeric cases and a set of refusals. The kernel's numerics across geometries
+are tested against the definition in ``test_depthwise_conv1d_kernel.py``; this
+file covers the wrap's contract.
 
-The first case compares the simulated kernel against ``nkilib``'s own torch
-reference for it, so neither side of the comparison is numerics authored here.
+The first case compares the simulated kernel against the module's torch
+reference, which ``test_depthwise_conv1d_kernel.py`` checks against a direct sum.
 That comparison alone could pass while measuring nothing about a kernel: if the
 module took its torch path, both sides would be torch. So each numeric case also
 reads the module's dispatch counters and counts real
@@ -23,16 +25,16 @@ distinct so that "reversed" is falsifiable rather than a symmetric coincidence.
 from __future__ import annotations
 
 import os
+import pathlib
 
 import pytest
 import torch
 
 import nki.simulator
 
+from vllm_neuron.functional.kda import depthwise_conv1d_kernel as kernel_module
 from vllm_neuron.functional.kda.depthwise_conv1d import (
-    LNC_SHARDS,
     NO_PADDING,
-    UNIT_STRIDE,
     KdaDepthwiseConv1dError,
     can_run_depthwise_conv1d,
     depthwise_conv1d,
@@ -44,10 +46,9 @@ from vllm_neuron.functional.kda.depthwise_conv1d import (
 )
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
-#: The tiny case's geometry. ``C`` is read off ``LNC_SHARDS`` so the fixture and
-#: the module's divisibility refusal cannot drift apart.
+#: The tiny case's geometry: fewer channels than one partition tile.
 BATCH = 1
-CHANNELS = 4 * LNC_SHARDS  # 8
+CHANNELS = 8
 WIDTH = 16
 TAPS = 4
 Q = output_width(WIDTH, TAPS)  # 13
@@ -64,9 +65,10 @@ IMPULSE_ATOL = 1e-5
 #: inside the input and the closed form below is exact rather than truncated.
 IMPULSE_AT = TAPS - 1
 
-#: The ``nkilib`` member this module wraps.
-SUBSTRATE_MODULE = "nkilib.experimental.conv.depthwise_conv1d"
-SUBSTRATE_QUALNAME = "depthwise_conv1d_implicit_gemm"
+#: The production package, which must not import the substrate's depthwise conv1d
+#: (the module this package's kernel replaced, and its torch reference beside it).
+PACKAGE_ROOT = pathlib.Path(kernel_module.__file__).resolve().parents[2]
+SUBSTRATE_DEPTHWISE_MODULE = "nkilib.experimental.conv.depthwise_conv1d"
 
 
 class _SimulatorCounter:
@@ -168,8 +170,8 @@ def _impulse_closed_form(filt: torch.Tensor) -> torch.Tensor:
     return expected
 
 
-def test_the_kernel_matches_the_nkilib_torch_reference() -> None:
-    """The tiny case agrees with ``nkilib``'s reference, in shape, dtype and value."""
+def test_the_kernel_matches_the_torch_reference() -> None:
+    """The tiny case agrees with the module's reference, in shape, dtype and value."""
     img, filt = _image(), _filter()
     expected = depthwise_conv1d_torch_reference(img, filt)
 
@@ -191,7 +193,7 @@ def test_the_kernel_matches_the_nkilib_torch_reference() -> None:
 def test_a_unit_impulse_recovers_the_taps_reversed() -> None:
     """A unit impulse returns the tap vector reversed, which pins argument order.
 
-    The closed form is also checked against ``nkilib``'s reference, so the two
+    The closed form is also checked against the module's reference, so the two
     independent sides agree on it as well.
     """
     filt = _distinct_taps()
@@ -235,30 +237,16 @@ def test_the_torch_fallback_is_taken_and_counted_without_a_simulator(
     assert tuple(out.shape) == (BATCH, CHANNELS, 1, Q)
 
 
-def test_kernel_identity_names_the_nkilib_kernel() -> None:
-    """``kernel_identity`` names ``nkilib``'s kernel, not anything authored here."""
-    assert kernel_identity() == (SUBSTRATE_MODULE, SUBSTRATE_QUALNAME)
+def test_kernel_identity_names_the_in_tree_kernel() -> None:
+    """``kernel_identity`` names the kernel authored in this package, not a substrate's."""
+    assert kernel_identity() == (kernel_module.__name__, "depthwise_conv1d_kernel")
 
 
-def test_the_torch_reference_delegates_to_the_nkilib_reference() -> None:
-    """The module's reference is bit-identical to the ``nkilib`` one it wraps.
-
-    Measured by driving the vendor function directly with the same inputs: a torch
-    convolution authored here would differ in the last bits at best.
-    """
-    from nkilib.experimental.conv.depthwise_conv1d_torch import (
-        depthwise_conv1d_implicit_gemm_torch_ref,
-    )
-
-    img, filt = _image(), _filter()
-    direct = depthwise_conv1d_implicit_gemm_torch_ref(
-        img, filt, padding=NO_PADDING, stride=UNIT_STRIDE, feature_group_count=CHANNELS
-    )["output"]
-    through_module = depthwise_conv1d_torch_reference(img, filt)
-    assert torch.equal(through_module, direct), (
-        "the module's reference is not bit-identical to the vendor's own, so it is "
-        "not a pure delegation"
-    )
+def test_the_production_package_imports_no_substrate_depthwise_conv() -> None:
+    """No module under ``vllm_neuron/`` names ``nkilib``'s depthwise conv1d."""
+    hits = [str(path.relative_to(PACKAGE_ROOT)) for path in PACKAGE_ROOT.rglob("*.py")
+            if SUBSTRATE_DEPTHWISE_MODULE in path.read_text()]
+    assert not hits, hits
 
 
 def test_dispatch_counters_accumulate_across_calls() -> None:
@@ -280,13 +268,8 @@ def test_dispatch_counters_accumulate_across_calls() -> None:
     assert dispatch_counters() == (0, 0)
 
 
-def test_a_channel_count_the_shards_do_not_divide_is_refused() -> None:
-    """An odd ``C`` raises, and the refusal neither dispatches nor falls back.
-
-    The refusal is this module's, on the ``nkilib`` kernel's documented device
-    requirement that ``C`` divide by the shard count: the NKI simulator does not
-    enforce it, so nothing below this module would refuse.
-    """
+def test_an_odd_channel_count_is_served_by_the_kernel() -> None:
+    """An odd ``C`` runs on the kernel: the programs split columns, not channels."""
     odd_channels = CHANNELS + 1
     generator = torch.Generator().manual_seed(55)
     img = torch.rand(
@@ -297,12 +280,11 @@ def test_a_channel_count_the_shards_do_not_divide_is_refused() -> None:
     )
 
     reset_dispatch_counters()
-    with pytest.raises(KdaDepthwiseConv1dError) as excinfo:
-        depthwise_conv1d(img, filt)
-    assert "LNC_SHARDS" in str(excinfo.value), str(excinfo.value)
-    assert dispatch_counters() == (0, 0), (
-        "a refused geometry incremented a counter; a refusal must not dispatch "
-        "and must not fall back"
+    with _SimulatorCounter() as sim:
+        actual = depthwise_conv1d(img, filt)
+    _assert_nki_ran(sim, 1, "odd-channel-case")
+    torch.testing.assert_close(
+        actual, depthwise_conv1d_torch_reference(img, filt), rtol=RTOL, atol=ATOL
     )
 
 
@@ -319,7 +301,7 @@ def test_a_channel_count_the_shards_do_not_divide_is_refused() -> None:
 def test_unsupported_options_are_refused(
     label: str, kwargs: dict, needle: str
 ) -> None:
-    """Every option the ``nkilib`` kernel asserts on is refused before dispatch.
+    """Every option outside the kernel's contract is refused before dispatch.
 
     Refused rather than coerced or routed to torch, and each message names the
     option so a caller can act on it.
@@ -342,7 +324,7 @@ def test_shape_refusals_name_the_offending_extent() -> None:
         depthwise_conv1d(img.reshape(BATCH, CHANNELS, WIDTH), filt)
     assert "4-D" in str(rank_exc.value), str(rank_exc.value)
 
-    mismatched = _filter()[: CHANNELS - LNC_SHARDS]
+    mismatched = _filter()[: CHANNELS - 1]
     with pytest.raises(KdaDepthwiseConv1dError) as channel_exc:
         depthwise_conv1d(img, mismatched)
     assert "channel extent" in str(channel_exc.value), str(channel_exc.value)
@@ -353,11 +335,37 @@ def test_shape_refusals_name_the_offending_extent() -> None:
 
 
 def test_dtype_mismatch_is_refused() -> None:
-    """Mixed dtypes are refused, because the kernel contracts the two together."""
+    """Mixed dtypes are refused: a call carries one precision."""
     img, filt = _image(), _filter()
     with pytest.raises(KdaDepthwiseConv1dError) as excinfo:
         depthwise_conv1d(img, filt.to(torch.bfloat16))
     assert "dtype" in str(excinfo.value), str(excinfo.value)
+
+
+def test_a_non_float_dtype_is_refused() -> None:
+    """An integer call is refused by name, before dispatch."""
+    img, filt = _image(), _filter()
+    reset_dispatch_counters()
+    with pytest.raises(KdaDepthwiseConv1dError) as excinfo:
+        depthwise_conv1d(img.to(torch.int32), filt.to(torch.int32))
+    assert "dtype" in str(excinfo.value), str(excinfo.value)
+    assert dispatch_counters() == (0, 0)
+
+
+def test_taps_past_the_sbuf_budget_are_refused() -> None:
+    """More tap slots than the kernel's weight tile holds raise, before dispatch.
+
+    The kernel keeps every channel tile's taps in one SBUF tile of
+    ``TAP_SLOTS_MAX`` float32 slots per partition; one slot more is refused.
+    """
+    taps = kernel_module.TAP_SLOTS_MAX + 1
+    img = torch.zeros((BATCH, CHANNELS, 1, taps), dtype=torch.float32)
+    filt = torch.zeros((CHANNELS, 1, 1, taps), dtype=torch.float32)
+    reset_dispatch_counters()
+    with pytest.raises(KdaDepthwiseConv1dError) as excinfo:
+        depthwise_conv1d(img, filt)
+    assert "TAP_SLOTS_MAX" in str(excinfo.value), str(excinfo.value)
+    assert dispatch_counters() == (0, 0)
 
 
 def test_gate_reports_availability_separately_from_admissibility() -> None:

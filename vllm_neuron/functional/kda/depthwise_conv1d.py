@@ -1,27 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""KDA prefill depthwise conv1d: a thin wrap of ``nkilib``'s NKI kernel.
+"""KDA prefill depthwise conv1d: the wrap around this package's NKI kernel.
 
 The KDA prefill path applies a per-channel convolution along the sequence axis
-before the delta rule runs. ``nkilib`` already ships that kernel, so no numerics
-are authored here::
+before the delta rule runs. The kernel is authored here, in
+:mod:`vllm_neuron.functional.kda.depthwise_conv1d_kernel`; this module checks
+every geometry and option condition in one place, picks the launch grid, counts
+which path ran, and carries the torch reference the kernel is tested against.
 
-    nkilib.experimental.conv.depthwise_conv1d.depthwise_conv1d_implicit_gemm
-
-The torch reference this module exposes likewise delegates to the substrate's own
-``depthwise_conv1d_implicit_gemm_torch_ref``, which ships beside the kernel.
-
-What the wrap adds is argument handling the kernel makes easy to get wrong:
-it derives ``feature_group_count`` from the input channel extent (the kernel
-asserts ``feature_group_count == C`` but defaults it to ``1``), it checks every
-geometry and option condition in one place, and it unwraps the reference's
-``{"output": tensor}`` return so both paths hand back a plain tensor.
-
-The channel count must divide :data:`LNC_SHARDS`. The substrate kernel divides
-the channel extent by ``nl.num_programs()`` and indexes each shard from
-``shard_id * C_per_shard``, so an odd ``C`` on a two-shard device drops channels
-rather than failing. The NKI simulator does not enforce this and computes an odd
-``C`` correctly, so the refusal here is conservatism about the documented device
-requirement, not a reproduction of a simulator failure.
+Under ``NEURON_LOGICAL_NC_CONFIG=2`` the kernel launches on :data:`LNC_SHARDS`
+programs that split the output columns, at every admissible geometry; otherwise
+it launches on one.
 
 A refused geometry raises; it never routes to the torch reference.
 """
@@ -32,40 +20,42 @@ import logging
 import os
 
 import torch
+import torch.nn.functional as F
+from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 from torch import Tensor
 
-from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
-from nkilib.experimental.conv.depthwise_conv1d import (
-    depthwise_conv1d_implicit_gemm,
+from vllm_neuron.functional.kda.depthwise_conv1d_kernel import (
+    TAP_SLOTS_MAX,
+    depthwise_conv1d_kernel,
+    tap_slots,
 )
-from nkilib.experimental.conv.depthwise_conv1d_torch import (
-    depthwise_conv1d_implicit_gemm_torch_ref,
-)
-
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 logger = logging.getLogger(__name__)
 
-#: Logical Neuron Core shard count the substrate kernel shards its channel extent
-#: over, from its own Notes ("Requires C to be divisible by NUM_SHARDS (2)") and
-#: its ``C_per_shard = C // nl.num_programs()``.
+#: Programs the kernel launches on under ``NEURON_LOGICAL_NC_CONFIG=2``, one per
+#: physical core of the logical core; each takes a contiguous share of the output
+#: columns.
 LNC_SHARDS = 2
 
-#: The one spatial extent the kernel's layout fixes: both the image and the
-#: filter carry a singleton height axis, because this is a 1-D convolution
-#: expressed in the substrate's 2-D ``[N, C, H, W]`` argument layout.
+#: The one spatial extent the layout fixes: both the image and the filter carry a
+#: singleton height axis, because this is a 1-D convolution expressed in a 2-D
+#: ``[N, C, H, W]`` argument layout.
 SINGLETON_H = 1
 
-#: Zero padding on both sides of both axes, the only padding the substrate kernel
-#: supports ("Only supports zero padding").
+#: No padding on either axis, the default. Width padding may be any non-negative
+#: pair, left and right independently; height padding must stay zero.
 NO_PADDING = ((0, 0), (0, 0))
 
-#: Unit stride on both axes. ``stride_h`` must be 1 -- the kernel asserts it --
-#: while ``stride_w`` may be any positive integer.
+#: Unit stride on both axes. ``stride_h`` must be 1, while ``stride_w`` may be any
+#: positive integer.
 UNIT_STRIDE = (1, 1)
 
-#: The only dilation the kernel supports, on both axes, asserted in its body.
+#: The only dilation the kernel computes, on both axes.
 UNIT_DILATION = (1, 1)
+
+#: Dtypes the kernel loads and stores; it accumulates in float32 whichever it is.
+_KERNEL_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
 
 __all__ = [
     "LNC_SHARDS",
@@ -98,7 +88,7 @@ def output_width(
     padding: tuple[tuple[int, int], tuple[int, int]] = NO_PADDING,
     stride: tuple[int, int] = UNIT_STRIDE,
 ) -> int:
-    """The output extent ``Q``, from the substrate's own formula.
+    """The output extent ``Q`` of a padded, strided convolution.
 
     ``Q = (W + W_pad_l + W_pad_r - S) // stride_w + 1``, stated once here so
     callers do not restate the arithmetic.
@@ -130,10 +120,10 @@ def _require_admissible(
     lhs_dilation: tuple[int, int],
     batch_group_count: int,
 ) -> None:
-    """Every condition the substrate kernel imposes, checked in one place.
+    """Every condition of the convolution's contract, checked in one place.
 
-    Each message names what in the kernel needs the condition, so a refusal can
-    be checked against the substrate.
+    The contract is what the kernel and the torch reference both compute; the
+    kernel's SBUF capacity is checked separately, by :func:`_require_capacity`.
     """
     problems: list[str] = []
 
@@ -158,7 +148,7 @@ def _require_admissible(
     if int(img.shape[2]) != SINGLETON_H:
         problems.append(
             f"img height extent is {int(img.shape[2])}, must be {SINGLETON_H}: "
-            f"this is a 1-D convolution in the substrate's 2-D argument layout"
+            f"this is a 1-D convolution in a 2-D argument layout"
         )
     if int(filt.shape[0]) != channels:
         problems.append(
@@ -170,50 +160,37 @@ def _require_admissible(
         problems.append(
             f"filter must be [C, 1, 1, S], got {tuple(filt.shape)}"
         )
-    if channels % LNC_SHARDS != 0:
-        problems.append(
-            f"C={channels} is not divisible by LNC_SHARDS={LNC_SHARDS}; the "
-            f"substrate kernel shards its channel extent over the logical "
-            f"cores and its own Notes require the division to be exact, so an "
-            f"odd channel count would drop channels on a two-shard device "
-            f"rather than fail. Refused here rather than routed to the torch "
-            f"reference."
-        )
     if img.dtype != filt.dtype:
         problems.append(
-            f"img dtype {img.dtype} and filter dtype {filt.dtype} differ; the "
-            f"kernel allocates its output at the img dtype and contracts the "
-            f"two tensors against each other in one matmul"
+            f"img dtype {img.dtype} and filter dtype {filt.dtype} differ; a call "
+            f"carries one precision, the output's"
         )
-    if padding[0] != (0, 0):
+    if img.dtype not in _KERNEL_DTYPES:
         problems.append(
-            f"height padding {padding[0]} must be (0, 0): the kernel reads "
-            f"padding[1] only, so height padding would be silently dropped "
-            f"rather than applied"
+            f"dtype {img.dtype} is not one of {_KERNEL_DTYPES}, the dtypes the "
+            f"kernel loads and stores"
+        )
+    if tuple(padding[0]) != (0, 0):
+        problems.append(
+            f"height padding {padding[0]} must be (0, 0): the height axis is a "
+            f"singleton, so height padding has no column to pad"
         )
     if min(padding[1]) < 0:
         problems.append(f"width padding {padding[1]} must be non-negative")
     if stride[0] != 1:
-        problems.append(
-            f"stride_h={stride[0]} must be 1; the kernel asserts it"
-        )
+        problems.append(f"stride_h={stride[0]} must be 1")
     if stride[1] <= 0:
         problems.append(f"stride_w={stride[1]} must be positive")
     if tuple(rhs_dilation) != UNIT_DILATION:
         problems.append(
-            f"rhs_dilation={tuple(rhs_dilation)} must be {UNIT_DILATION}; the "
-            f"kernel asserts it"
+            f"rhs_dilation={tuple(rhs_dilation)} must be {UNIT_DILATION}"
         )
     if tuple(lhs_dilation) != UNIT_DILATION:
         problems.append(
-            f"lhs_dilation={tuple(lhs_dilation)} must be {UNIT_DILATION}; the "
-            f"kernel asserts it"
+            f"lhs_dilation={tuple(lhs_dilation)} must be {UNIT_DILATION}"
         )
     if batch_group_count != 1:
-        problems.append(
-            f"batch_group_count={batch_group_count} must be 1; the kernel "
-            f"asserts it"
-        )
+        problems.append(f"batch_group_count={batch_group_count} must be 1")
 
     if problems:
         raise KdaDepthwiseConv1dError(
@@ -224,10 +201,22 @@ def _require_admissible(
     output_width(int(img.shape[3]), int(filt.shape[3]), padding, stride)
 
 
+def _require_capacity(img: Tensor, filt: Tensor) -> None:
+    """The kernel holds every channel tile's taps in one SBUF tile; refuse more."""
+    slots = tap_slots(int(img.shape[1]), int(filt.shape[3]))
+    if slots > TAP_SLOTS_MAX:
+        raise KdaDepthwiseConv1dError(
+            f"kda depthwise conv1d refuses this call: C={int(img.shape[1])} channels "
+            f"of S={int(filt.shape[3])} taps need {slots} float32 tap slots per "
+            f"partition, more than the kernel's weight tile holds "
+            f"(TAP_SLOTS_MAX={TAP_SLOTS_MAX})"
+        )
+
+
 class _DispatchCounters:
     """Which path actually ran, counted rather than inferred.
 
-    ``nki_dispatch`` counts entries into the ``wrap_nki`` call, ``torch_fallback``
+    ``nki_dispatch`` counts entries into the kernel launch, ``torch_fallback``
     entries into the reference path. Two counters rather than one flag, so "the
     kernel ran" and "the fallback did not" are independent readings.
     """
@@ -277,8 +266,9 @@ def can_run_depthwise_conv1d(
 
     Two independent conditions:
     :func:`~vllm_neuron.utils.neuron_utils.can_run_kernel` answers whether a
-    device or simulator exists, :func:`_require_admissible` whether the substrate
-    kernel accepts these extents and options.
+    device or simulator exists; :func:`_require_admissible` and
+    :func:`_require_capacity` whether the kernel accepts these extents and
+    options.
 
     Raises:
         KdaDepthwiseConv1dError: if the call is inadmissible. Inadmissible is not
@@ -287,6 +277,7 @@ def can_run_depthwise_conv1d(
     _require_admissible(
         img, filt, padding, stride, rhs_dilation, lhs_dilation, batch_group_count
     )
+    _require_capacity(img, filt)
     return can_run_kernel(img)
 
 
@@ -305,7 +296,7 @@ def depthwise_conv1d(
         img: ``[N, C, 1, W]`` input.
         filt: ``[C, 1, 1, S]`` depthwise taps, one filter per channel.
         padding: ``((0, 0), (W_pad_l, W_pad_r))``. Height padding must be zero;
-            width padding must be zero or positive. Defaults to
+            width padding must be zero or positive on each side. Defaults to
             :data:`NO_PADDING`.
         stride: ``(1, stride_w)``. Defaults to :data:`UNIT_STRIDE`.
         rhs_dilation: must be :data:`UNIT_DILATION`.
@@ -319,18 +310,16 @@ def depthwise_conv1d(
     Raises:
         KdaDepthwiseConv1dError: on an inadmissible geometry, dtype or option.
 
-    ``feature_group_count`` is deliberately not a parameter here. The substrate
-    kernel asserts ``feature_group_count == C`` yet defaults it to ``1``, so every
-    caller would otherwise have to restate the channel extent correctly or hit a
-    trace-time failure. It is derived from ``img`` instead.
+    There is no ``feature_group_count`` parameter: a depthwise convolution has one
+    group per channel, read off ``img``.
     """
     if not can_run_depthwise_conv1d(
         img, filt, padding, stride, rhs_dilation, lhs_dilation, batch_group_count
     ):
         _count_torch_fallback()
         logger.debug(
-            "depthwise_conv1d: NKI route unavailable, using the substrate's "
-            "torch reference (reference only, not the shipped path)"
+            "depthwise_conv1d: NKI route unavailable, using the torch reference "
+            "(reference only, not the shipped path)"
         )
         return depthwise_conv1d_torch_reference(
             img,
@@ -343,25 +332,11 @@ def depthwise_conv1d(
         )
 
     _count_nki_dispatch()
-    call = wrap_nki(depthwise_conv1d_implicit_gemm)
-    if (
-        os.environ.get("NEURON_LOGICAL_NC_CONFIG") == "2"
-        and tuple(img.shape[:3]) == (1, 384, 1)
-        and tuple(filt.shape) == (384, 1, 1, 4)
-        and img.dtype == torch.float32
-        and stride == UNIT_STRIDE
-    ):
-        call = call[2]
-    return call(
-        img_ref=img,
-        filter_ref=filt,
-        padding=padding,
-        stride=stride,
-        rhs_dilation=rhs_dilation,
-        lhs_dilation=lhs_dilation,
-        feature_group_count=int(img.shape[1]),
-        batch_group_count=batch_group_count,
-    )
+    call = wrap_nki(depthwise_conv1d_kernel)
+    if os.environ.get("NEURON_LOGICAL_NC_CONFIG") == "2":
+        call = call[LNC_SHARDS]
+    pad_left, pad_right = padding[1]
+    return call(img, filt, int(pad_left), int(pad_right), int(stride[1]))
 
 
 def depthwise_conv1d_torch_reference(
@@ -373,42 +348,34 @@ def depthwise_conv1d_torch_reference(
     lhs_dilation: tuple[int, int] = UNIT_DILATION,
     batch_group_count: int = 1,
 ) -> Tensor:
-    """``nkilib``'s own torch reference for this kernel. Never the shipped path.
+    """The convolution in torch, the comparator for the kernel. Never the shipped path.
 
-    Delegates to ``depthwise_conv1d_implicit_gemm_torch_ref``, deriving
-    ``feature_group_count`` as :func:`depthwise_conv1d` does and unwrapping the
-    reference's ``{"output": tensor}`` return so both paths hand back a plain
-    tensor.
+    Pads the width left and right independently, then convolves with one group per
+    channel at ``stride``. It computes in float32, as the kernel accumulates, and
+    rounds once to the input dtype.
 
-    One asymmetry this wrap does not hide: the reference applies width padding
-    through ``F.conv2d``, which pads both sides by the same amount, while the
-    kernel pads left and right independently. The two therefore agree only for
-    symmetric width padding, :data:`NO_PADDING` included; at an asymmetric pad a
-    comparison measures the reference's limitation, not the kernel.
+    Raises:
+        KdaDepthwiseConv1dError: on a call outside the contract
+            :func:`depthwise_conv1d` serves.
 
     Returns:
         ``[N, C, 1, Q]``.
     """
-    result = depthwise_conv1d_implicit_gemm_torch_ref(
-        img,
-        filt,
-        padding=padding,
-        stride=stride,
-        rhs_dilation=rhs_dilation,
-        lhs_dilation=lhs_dilation,
-        feature_group_count=int(img.shape[1]),
-        batch_group_count=batch_group_count,
+    _require_admissible(
+        img, filt, padding, stride, rhs_dilation, lhs_dilation, batch_group_count
     )
-    return result["output"]
+    padded = F.pad(img.to(torch.float32), tuple(padding[1]))
+    out = F.conv2d(
+        padded, filt.to(torch.float32), stride=tuple(stride), groups=int(img.shape[1])
+    )
+    return out.to(img.dtype)
 
 
 def kernel_identity() -> tuple[str, str]:
-    """``(module, qualname)`` of the wrapped kernel, read off the object.
+    """``(module, qualname)`` of the kernel :func:`depthwise_conv1d` launches.
 
-    Lets a caller check that this module dispatches to ``nkilib``'s member rather
-    than to anything authored here, so a substitution shows up as a changed
-    reading.
+    Read off the object, so a substitution shows up as a changed reading.
     """
-    func = getattr(depthwise_conv1d_implicit_gemm, "func", None)
-    target = func if func is not None else depthwise_conv1d_implicit_gemm
+    func = getattr(depthwise_conv1d_kernel, "func", None)
+    target = func if func is not None else depthwise_conv1d_kernel
     return target.__module__, target.__qualname__

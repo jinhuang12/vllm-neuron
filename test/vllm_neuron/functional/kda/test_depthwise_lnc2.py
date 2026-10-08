@@ -1,5 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""KDA channel sharding preserves the convolution and its carried state."""
+"""The LNC2 column split preserves the KDA convolution and its carried state.
+
+Under ``NEURON_LOGICAL_NC_CONFIG=2`` the wrap launches the kernel on
+``LNC_SHARDS`` programs, each computing a contiguous share of the output columns.
+Every output element is formed by the same instructions whichever program owns
+it, so the split must not change a bit: each case compares the two-program launch
+against the kernel launched on one program.
+"""
 
 import os
 from unittest.mock import patch
@@ -9,6 +16,7 @@ import torch
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 from vllm_neuron.functional.kda import depthwise_conv1d as conv
+from vllm_neuron.functional.kda.depthwise_conv1d_kernel import depthwise_conv1d_kernel
 from test.vllm_neuron.model.glm5_next import test_kda_padded_prefill as state_fixture
 
 pytestmark = [pytest.mark.fast, pytest.mark.forked]
@@ -39,12 +47,9 @@ def _operands(tokens, channels=384, taps=4, dtype=torch.float32, batches=1):
 
 
 def _grid_one(img, filt, stride=conv.UNIT_STRIDE):
-    """The unchanged substrate launch, independent of the wrapper's new gate."""
-    return wrap_nki(conv.depthwise_conv1d_implicit_gemm)(
-        img_ref=img, filter_ref=filt, feature_group_count=int(img.shape[1]),
-        padding=conv.NO_PADDING, stride=stride, rhs_dilation=conv.UNIT_DILATION,
-        lhs_dilation=conv.UNIT_DILATION, batch_group_count=1,
-    )
+    """The kernel on one program, launched directly rather than through the wrap's gate."""
+    pad_left, pad_right = conv.NO_PADDING[1]
+    return wrap_nki(depthwise_conv1d_kernel)(img, filt, pad_left, pad_right, stride[1])
 
 
 @pytest.mark.parametrize("tokens", [1, 2, 3, 7, 8, 9, 127, 128, 129, 511, 512, 513, 1024])
@@ -56,7 +61,7 @@ def test_channel_and_sequence_tile_boundaries(tokens, monkeypatch):
     _assert_bits(new, old)
     reference = conv.depthwise_conv1d_torch_reference(img, filt)
     torch.testing.assert_close(new, reference, rtol=1e-2, atol=1e-5)
-    # Distinct channel data makes shifted, omitted, or duplicated shards visible.
+    # Distinct channel data makes shifted, omitted, or duplicated channel tiles visible.
     for channel in (0, 127, 128, 191, 192, 255, 256, 383):
         _assert_bits(new[:, channel], old[:, channel])
 
@@ -73,9 +78,10 @@ def test_channel_and_sequence_tile_boundaries(tokens, monkeypatch):
         (384, 4, torch.float32, 1, (1, 2)),
     ],
 )
-def test_other_runtime_and_public_geometries_retain_grid_one(
+def test_only_lnc2_launches_two_programs_at_every_geometry(
     lnc, channels, taps, dtype, batches, stride, monkeypatch,
 ):
+    """The program count follows the runtime setting alone, not the geometry."""
     if lnc is None:
         monkeypatch.delenv("NEURON_LOGICAL_NC_CONFIG", raising=False)
     else:
@@ -90,20 +96,16 @@ def test_other_runtime_and_public_geometries_retain_grid_one(
         def __getitem__(self, grid):
             return RecordCall(self.call[grid])
 
-        def __call__(self, **kwargs):
+        def __call__(self, *args):
             selected.append(tuple(self.call.grid))
-            return self.call(**kwargs)
+            return self.call(*args)
 
     monkeypatch.setattr(conv, "wrap_nki", lambda kernel: RecordCall(real_wrap(kernel)))
     img, filt = _operands(1, channels, taps, dtype, batches)
     expected = _grid_one(img, filt, stride=stride)
     actual = conv.depthwise_conv1d(img, filt, stride=stride)
     _assert_bits(actual, expected)
-    eligible = (
-        lnc == "2" and channels == 384 and taps == 4
-        and dtype == torch.float32 and batches == 1 and stride == (1, 1)
-    )
-    assert selected == [(2,) if eligible else ()]
+    assert selected == [(conv.LNC_SHARDS,) if lnc == "2" else ()]
 
 
 def test_padded_prefill_continuation_decode_and_state_aliases(monkeypatch):
