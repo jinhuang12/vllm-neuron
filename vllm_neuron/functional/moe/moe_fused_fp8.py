@@ -22,13 +22,16 @@ _TRAILING_ZERO_BLOCKS = 4
 # 64 rows) exceeds its issue interval (about 200 ns), so a single chain stalls.
 _FOLD_CHAINS = 4
 # Of every _OFFLOAD_PERIOD accumulators, _OFFLOAD_FOLDS fold as a Scalar
-# Engine scale plus a GpSimd add instead of one Vector Engine instruction. At
-# 64 rows each engine issues a fold step in about 200 ns (Vector, Scalar) or
-# 300 ns (GpSimd), so 3 of 8 balances the Vector Engine against GpSimd.
-_OFFLOAD_FOLDS = 3
+# Engine scale plus a GpSimd add instead of one Vector Engine instruction. A
+# 64-row fold step takes about 280 ns there and 300-410 ns on the others; of
+# 3/8, 7/16 and 1/2, half measured fastest at 1k tokens, within 0.4 % at 2k.
+_OFFLOAD_FOLDS = 4
 _OFFLOAD_PERIOD = 8
+# Hidden tiles per gate/up weight DMA. The first products wait for one such
+# load, not for the whole BLOCK_K tile; 16 tiles keep 2 KB contiguous runs.
+_WEIGHT_DMA_TILES = 16
 # DMA descriptors come from the hardware generator on the Sync engine's queue,
-# which issues nothing else, in program order: an item's weights and scales,
+# which issues nothing else, in program order: an item's scales and weights,
 # its zero fills, its row ids, then its stores. Only the per-row gathers, which
 # need a vector of row offsets, keep software descriptors.
 _HWDGE = nisa.dge_mode.hwdge
@@ -59,11 +62,12 @@ def _expert_operands(weights, scales, experts_row, block, kstep, nstep):
 
     The expert id comes from ``experts_row`` (SBUF [1, >=blocks] int32), at
     register ``block``. Returns ``(gate_up, down, scale)``: FP8 gate/up tiles
-    ``[128, 2I/128, nk, 128]`` for each BLOCK_K hidden chunk and down tiles
-    ``[128, I/128, nn, 128]`` for each BLOCK_N hidden chunk, one DMA each, so
-    every 128x128 stationary is one contiguous row of 128 columns; and every
-    scale of the expert on every partition, ``[128, 3I/128, H/128]``, from one
-    broadcast DMA.
+    ``[128, 2I/128, nk, 128]`` of at most min(BLOCK_K/128, _WEIGHT_DMA_TILES)
+    hidden tiles and down tiles ``[128, I/128, nn, 128]`` for each BLOCK_N
+    hidden chunk, one DMA each, so every 128x128 stationary is one contiguous
+    row of 128 columns; and every scale of the expert on every partition,
+    ``[128, 3I/128, H/128]``, from one broadcast DMA, queued first because the
+    first fold needs it.
     """
     experts, panels, contraction, nh, channels = weights.shape
     h, ni = nh * 128, panels // 3
@@ -73,18 +77,19 @@ def _expert_operands(weights, scales, experts_row, block, kstep, nstep):
     expert_reg = nisa.register_alloc()
     nisa.register_load(dst=expert_reg, src=expert)
 
+    scale = nl.ndarray((128, panels, nh), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=scale.reshape((128, panels * nh)), src=scales.ap(
+        pattern=[[0, 128], [1, panels * nh]], scalar_offset=expert_reg, indirect_dim=0),
+        dge_mode=_HWDGE, engine=_DMA_QUEUE)
     gate_up = []
-    for k0 in range(0, nh, kstep):
-        nk = min(kstep, nh - k0)
+    chunk = min(kstep, _WEIGHT_DMA_TILES)
+    for k0 in range(0, nh, chunk):
+        nk = min(chunk, nh - k0)
         tile = nl.ndarray((128, 2 * ni, nk, 128), dtype=weights.dtype, buffer=nl.sbuf)
         nisa.dma_copy(dst=tile.reshape((128, 2 * ni * nk * 128)), src=weights.ap(
             pattern=[[h, 128], [128 * h, 2 * ni], [1, nk * 128]], offset=k0 * 128,
             scalar_offset=expert_reg, indirect_dim=0), dge_mode=_HWDGE, engine=_DMA_QUEUE)
         gate_up.append(tile)
-    scale = nl.ndarray((128, panels, nh), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.dma_copy(dst=scale.reshape((128, panels * nh)), src=scales.ap(
-        pattern=[[0, 128], [1, panels * nh]], scalar_offset=expert_reg, indirect_dim=0),
-        dge_mode=_HWDGE, engine=_DMA_QUEUE)
     down = []
     for n0 in range(0, nh, nstep):
         nn = min(nstep, nh - n0)
