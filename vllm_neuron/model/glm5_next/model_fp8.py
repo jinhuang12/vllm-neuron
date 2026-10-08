@@ -64,6 +64,7 @@ from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 from vllm_neuron.utils.weight_loader import set_weight_loader
 
 if TYPE_CHECKING:
+    from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
     # Annotation only: this module imports no vllm symbol at runtime, so the
     # guard keeps the return type of ``_resolve_tp_group`` a real class name.
     from vllm.distributed.parallel_state import GroupCoordinator
@@ -9495,6 +9496,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         device_logit_mask: torch.Tensor | None = None,
         shadow_boundary_ids: torch.Tensor | None = None,
         draft_k: int | None = None,
+        spec_decode_metadata: "SpecDecodeMetadata | None" = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Logits for the rows the caller wants sampled: stack, select, project.
 
@@ -9525,18 +9527,21 @@ class Glm5NextForConditionalGeneration(nn.Module):
         projection the selection exists to prevent.
 
         There is no ``**kwargs`` sink, deliberately, and this is where the family
-        precedent is not followed. The runner passes eight keys today plus up to four
-        conditional ones, and three of them -- ``sampling_params``, ``logit_mask`` and
-        ``spec_decode_metadata`` -- carry on-device sampling, which this tree
-        implements nowhere: there is no sampler on this class and no
-        ``on_device_sampling_config``. A sink would accept those three silently and
-        return unsampled logits while reporting success. Naming the parameters instead
-        makes an unconsumed key a ``TypeError`` at the call. On-device sampling arrives
-        under this root's own names, ``device_sampling_params`` and
-        ``device_logit_mask``, which the runner sets only for a root built with an
-        ``on_device_sampling_config``; the logits then go to
+        precedent is not followed. The runner's generic keys (``sampling_params``,
+        ``logit_mask``, ``positions``, ``rank``, ...) are translated or dropped by
+        ``NeuronModelRunner._glm5next_model_kwargs``; a sink would accept an
+        untranslated one silently and return unsampled logits while reporting
+        success. Naming the parameters instead makes an unconsumed key a
+        ``TypeError`` at the call. On-device sampling arrives under this root's own
+        names, ``device_sampling_params`` and ``device_logit_mask``, which the runner
+        sets only for a root built with an ``on_device_sampling_config``; the logits
+        then go to
         :func:`~vllm_neuron.functional.full_vocab_sampling.sample_full_vocab` and the
-        root returns ``[len(sampling_positions)]`` int32 token ids instead.
+        root returns ``[len(sampling_positions)]`` int32 token ids instead. The
+        speculative verify step's ``spec_decode_metadata`` is the one generic key
+        handed over under its own name, because this root consumes it: the rejection
+        sampler runs here, on the sampled ids, so that the draft can start from the
+        accepted row inside the same graph.
 
         The quantisation policy is resolved here, once per call, and threaded down as
         an argument -- the convention every compute method in this file follows. It is
@@ -9580,6 +9585,14 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 draft layer is populated -- the next prompt token when more of the
                 prompt follows, ``-1`` when this chunk ends the prompt, in which case
                 the token sampled in this graph is taken. ``None`` means ``-1``.
+            spec_decode_metadata: speculative decoding's verify step (method "mtp"):
+                the runner's ``SpecDecodeMetadata`` for this batch, with
+                ``draft_token_ids`` (flat, int32), ``cu_num_draft_tokens`` (``[B]``)
+                and ``max_spec_len`` (``k``) read on device. Decode leg only, with the
+                head built: the forward then carries ``T = 1 + k`` rows per request,
+                row ``b * T + t`` being request ``b``'s token ``t`` at position
+                ``start_b + t``, and ``sampling_positions`` selects all of them.
+                ``None`` is the plain decode leg (one row per request) or a prefill.
             draft_k: the draft's iteration count for this forward, a Python int the
                 runner names explicitly (the proposer's ``num_speculative_tokens``
                 under speculative method "mtp", the knob's value under the shadow
@@ -9599,16 +9612,38 @@ class Glm5NextForConditionalGeneration(nn.Module):
         ``k`` unrolled iterations from the selected rows and the sampled ids and the
         output is ``[rows, k]`` global token ids. The sampled ids never read the draft.
 
+        Verify leg (``spec_decode_metadata`` given, head built, decode carrier): every
+        row is sampled on device and
+        :func:`~vllm_neuron.nn.rejection_sampler.rejection_sampler` keeps, per
+        request, the drafts that match the trunk's ids up to the first mismatch, that
+        mismatch's corrected id, and the bonus id when every draft matched
+        (``[B, k + 1]`` int32, ``-1`` past the kept ids). The draft layer is populated
+        at every verify row with the id the trunk sampled there (the draft itself on an
+        accepted row, the correction on the mismatch row, an id never read on the rows
+        past it, which the next step's real tokens rewrite before anything reads
+        them), and ``k`` tokens are drafted from the last kept row -- row
+        ``kept_b - 1`` of request ``b``, with the id kept there, at position
+        ``start_b + kept_b - 1`` -- through a one-row carrier derived from the step's
+        own: the same banks, rings, pooled stores and block table, with ``position``,
+        ``start_position`` and ``seq_lens`` moved to that row and ``latent_slots``
+        gathered from the step's. The bookkeeping is O(B * T) index operations on
+        device; no value is read back to the host.
+
         Returns:
             ``[len(sampling_positions), vocab_size]`` logits, in the dtype the head
             weight and the stack output share -- or, under ``collect_layer_streams``,
             that tensor first and then one ``[T, hc_mult, H]`` carrier per layer of the
             stack. With the shadow draft on, the ``[rows, k]`` int32 draft ids follow
-            the logits (or sampled ids) and precede the layer streams.
+            the logits (or sampled ids) and precede the layer streams. On the verify
+            leg the first output is the rejection sampler's ``[B, k + 1]`` accepted
+            ids instead of the sampled ids, and the draft ids are ``[B, k]``.
 
         Raises:
-            ValueError: when the head tensor this call needs was never loaded, or when
-                the stack refuses its own inputs.
+            ValueError: when the head tensor this call needs was never loaded, when the
+                stack refuses its own inputs, when a decode step carries more rows than
+                requests without ``spec_decode_metadata`` (a verify step that would be
+                drafted from as if each row were a request), or when the metadata's
+                width disagrees with the rows.
         """
         head = self._head_weight()
         sampling_config = (
@@ -9749,17 +9784,112 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 (rows_out, shadow_k), -1, dtype=torch.int32, device=input_ids.device
             )
         else:
-            # Decode leg: the selected rows are one per request, at the request's
-            # position; iteration 0 of the draft populates the draft layer there.
             position = draft_carrier["position"]
             if not torch.is_tensor(position):
                 position = _int64_scalar(position, input_ids.device)
             positions = position.reshape(-1).to(device=input_ids.device, dtype=torch.int32)
-            if positions.numel() == 1 and rows_out > 1:
-                positions = positions.expand(rows_out)
-            draft_ids = draft_head.draft_tokens(
-                rows, sampled_ids, positions, shadow_k, **ffn_keywords, **draft_carrier
-            )
+            requests = int(positions.shape[0])
+            if spec_decode_metadata is None:
+                # Decode leg: the selected rows are one per request, at the request's
+                # position; iteration 0 of the draft populates the draft layer there.
+                if rows_out != requests:
+                    raise ValueError(
+                        f"this decode step samples {rows_out} row(s) for {requests} "
+                        f"request(s) and carries no spec_decode_metadata; a decode step "
+                        f"with more rows than requests is speculative decoding's verify "
+                        f"step, and drafting from its rows as if each were a request "
+                        f"would advance every ring from a token the trunk did not accept"
+                    )
+                draft_ids = draft_head.draft_tokens(
+                    rows, sampled_ids, positions, shadow_k, **ffn_keywords, **draft_carrier
+                )
+            else:
+                logits, draft_ids = self._verify_and_draft(
+                    draft_head,
+                    spec_decode_metadata,
+                    rows=rows,
+                    sampled_ids=sampled_ids,
+                    positions=positions,
+                    k=shadow_k,
+                    ffn_keywords=ffn_keywords,
+                    draft_carrier=draft_carrier,
+                )
         if collect_layer_streams:
             return (logits, draft_ids, *layer_streams)
         return logits, draft_ids
+
+    @staticmethod
+    def _verify_and_draft(
+        draft_head,
+        spec_decode_metadata,
+        *,
+        rows: torch.Tensor,
+        sampled_ids: torch.Tensor,
+        positions: torch.Tensor,
+        k: int,
+        ffn_keywords: dict,
+        draft_carrier: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The verify leg of :meth:`forward`: accept, populate every row, draft from the last kept row.
+
+        Args:
+            draft_head: the root's ``mtp`` head.
+            spec_decode_metadata: the step's ``SpecDecodeMetadata`` (see :meth:`forward`).
+            rows: ``[B * T, H]`` the sampled rows of the stack output, request-major.
+            sampled_ids: ``[B * T]`` int32, the id the trunk sampled at each row.
+            positions: ``[B]`` int32, each request's position of row 0 (its cached length).
+            k: the draft's iteration count; ``T = 1 + k``.
+            ffn_keywords: the stack's five feed-forward keywords.
+            draft_carrier: the draft layer's decode carrier for the ``T``-row step.
+
+        Returns:
+            ``(accepted [B, k + 1] int32, draft_ids [B, k] int32)``.
+        """
+        from vllm_neuron.nn.rejection_sampler import PLACEHOLDER_TOKEN_ID, rejection_sampler
+
+        device = sampled_ids.device
+        requests = int(positions.shape[0])
+        rows_out = int(sampled_ids.shape[0])
+        width = 1 + int(spec_decode_metadata.max_spec_len)
+        if rows_out != requests * width or width != 1 + int(k):
+            raise ValueError(
+                f"a verify step carries 1 + k rows per request and this one samples "
+                f"{rows_out} row(s) for {requests} request(s) with max_spec_len="
+                f"{int(spec_decode_metadata.max_spec_len)} and a head drafting k={int(k)}; "
+                f"the runner pads every request to the full draft, so the three agree or "
+                f"the rows pair with the wrong requests"
+            )
+        accepted = rejection_sampler(spec_decode_metadata, sampled_ids)
+        if tuple(accepted.shape) != (requests, width):
+            raise ValueError(
+                f"the rejection sampler returned {tuple(accepted.shape)} for {requests} "
+                f"request(s) of width {width}; its batch is cu_num_draft_tokens' length, "
+                f"which must be this step's request count"
+            )
+        # Every verify row populates the draft layer with the id the trunk sampled
+        # there (see ``forward``); row t of request b sits at start_b + t.
+        row_offsets = torch.arange(width, dtype=torch.int32, device=device)
+        row_positions = positions.repeat_interleave(width) + row_offsets.repeat(requests)
+        draft_head.populate(rows, sampled_ids, row_positions, **ffn_keywords, **draft_carrier)
+        # The last kept row of each request: kept ids are the non-placeholders, at
+        # least one (the correction or the first draft) and at most T (all drafts and
+        # the bonus); the draft starts from that row, with the id kept there.
+        kept = (accepted != PLACEHOLDER_TOKEN_ID).to(torch.int64).sum(dim=1)
+        last = kept - 1
+        row_index = torch.arange(requests, dtype=torch.int64, device=device) * width + last
+        rows_last = torch.index_select(rows, 0, row_index)
+        ids_last = torch.gather(accepted, 1, last.reshape(-1, 1)).reshape(-1).to(torch.int32)
+        positions_last = positions + last.to(torch.int32)
+        # A one-row carrier at the kept row: the same state objects, with the three
+        # per-request position operands moved and the per-row slot gathered. One
+        # request keeps the scalar form the one-request decode carrier uses.
+        scalar = positions_last if requests > 1 else positions_last.reshape(())
+        one_row = dict(draft_carrier)
+        one_row["position"] = scalar
+        one_row["start_position"] = scalar
+        one_row["seq_lens"] = (positions_last + 1).to(torch.int32)
+        one_row["latent_slots"] = torch.index_select(draft_carrier["latent_slots"], 0, row_index)
+        draft_ids = draft_head.draft_tokens(
+            rows_last, ids_last, positions_last, k, **ffn_keywords, **one_row
+        )
+        return accepted, draft_ids
