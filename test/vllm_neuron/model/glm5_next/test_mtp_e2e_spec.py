@@ -11,7 +11,7 @@ replaced by a fake that returns hidden rows the head maps to chosen tokens, and 
 head by a recorder, so these tests pin WHICH rows, ids, positions and carrier
 operands reach the two head entry points and WHAT the root returns, for the three
 acceptance patterns (all drafts rejected, a partial accept, all accepted) and for a
-two-request batch of different lengths and accept counts. The kernels that consume ``T`` rows are other workers' and are not
+two-request batch of different lengths and accept counts at ``k`` = 1 and 3. The kernels that consume ``T`` rows are other workers' and are not
 run here.
 
 Part 2, the greedy identity through the real runner: ``NeuronModelRunner`` built from a
@@ -132,7 +132,7 @@ def _fake_stack(head: torch.Tensor, targets: list[int]):
     return forward
 
 
-def _verify_world(monkeypatch, lengths: list[int] | None = None):
+def _verify_world(monkeypatch, lengths: list[int] | None = None, *, k: int = K):
     """An mtp server's world with its opening prefills run (they set the ring cursors the
     verify step continues): ``shadow``'s one request, or the batch-decode file's
     ``len(lengths)`` requests of those prompt lengths, given ``shadow``'s head (the fake
@@ -140,8 +140,8 @@ def _verify_world(monkeypatch, lengths: list[int] | None = None):
     read back) before the head's weights are materialised, so for those prefills the
     head's ``populate`` is kept out and the root hands back its logits alone, not the
     ``(logits, drafts)`` pair a head-bearing root returns; part 1 never runs the head (the
-    recorder replaces both entry points)."""
-    monkeypatch.setenv(KNOB, str(K))
+    recorder replaces both entry points). ``k`` is the server's draft count."""
+    monkeypatch.setenv(KNOB, str(k))
     if lengths is None:
         world = shadow._world()
     else:
@@ -174,7 +174,7 @@ def _verify_world(monkeypatch, lengths: list[int] | None = None):
         world.head = head.to(torch.bfloat16)
         world.runner.on_device_sampling = True
     world.runner.is_mtp_spec = True
-    world.runner.drafter = SimpleNamespace(num_speculative_tokens=K)
+    world.runner.drafter = SimpleNamespace(num_speculative_tokens=k)
     if lengths is None:
         shadow._step(world, shadow.PROMPT, cached=0, sampling=[len(shadow.PROMPT) - 1])
     return world
@@ -182,19 +182,20 @@ def _verify_world(monkeypatch, lengths: list[int] | None = None):
 
 def _verify_step(
     world, *, inputs: list[int], drafts: list[list[int]], targets: list[int], recorder,
-    starts: list[int] | None = None,
+    starts: list[int] | None = None, k: int = K,
 ):
-    """Convert a verify step of ``inputs`` (request-major, ``T`` per request, request ``b``
-    at row 0 position ``starts[b]``, its cached length) and run the root."""
+    """Convert a verify step of ``inputs`` (request-major, ``1 + k`` per request, request
+    ``b`` at row 0 position ``starts[b]``, its cached length) and run the root."""
     runner = world.runner
     requests = len(drafts)
+    width = 1 + k
     starts = [len(shadow.PROMPT)] * requests if starts is None else list(starts)
     runner.input_batch.req_ids = list(world.req_ids)
-    runner._glm5next_request_tokens = np.array([T] * requests, np.int32)
+    runner._glm5next_request_tokens = np.array([width] * requests, np.int32)
     metadata = batch._metadata(world, list(range(requests)), cached=starts, tokens=len(inputs))
     for entry in metadata.values():
-        entry["max_query_len"] = T
-        entry["decode_token_threshold"] = T
+        entry["max_query_len"] = width
+        entry["decode_token_threshold"] = width
     converted = runner._glm5next_model_kwargs({
         "input_ids": torch.tensor(inputs, dtype=torch.int32),
         "positions": None,
@@ -205,7 +206,7 @@ def _verify_step(
         "rank": None,
         "logit_mask": None,
     })
-    assert converted["draft_k"] == K
+    assert converted["draft_k"] == k
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(world.root.model, "forward", _fake_stack(world.head, targets))
         patch.setattr(world.root.mtp, "populate", recorder.populate)
@@ -214,19 +215,21 @@ def _verify_step(
     return out, converted
 
 
-def _assert_populate_covers_every_row(recorder, *, carriers, targets, starts: list[int]):
+def _assert_populate_covers_every_row(
+    recorder, *, carriers, targets, starts: list[int], width: int = T,
+):
     populate = recorder.of("populate")
     assert len(populate) == 1, [name for name, _ in recorder.calls]
     call = populate[0]
     rows = len(targets)
-    assert rows == len(starts) * T
+    assert rows == len(starts) * width
     assert tuple(call["hidden_rows"].shape) == (rows, call["hidden_rows"].shape[1])
     # Row t pairs with the token the trunk sampled there: the draft (== target) on an
     # accepted row, the corrected token on the mismatch row, garbage past it (rewritten
     # before it is read). Row t of request b sits at starts[b] + t, request-major.
     assert call["next_ids"].tolist() == targets
     assert call["next_ids"].dtype == torch.int32
-    assert call["positions"].tolist() == [start + t for start in starts for t in range(T)]
+    assert call["positions"].tolist() == [start + t for start in starts for t in range(width)]
     assert call["positions"].dtype == torch.int32
     # The step's own T-row carrier, object for object.
     for key in ("tail", "pool_cache", "latent_cache", "block_table_row", "seq_lens", "latent_slots"):
@@ -234,7 +237,7 @@ def _assert_populate_covers_every_row(recorder, *, carriers, targets, starts: li
 
 
 def _assert_draft_from_rows(
-    recorder, *, carriers, rows: list[int], tokens: list[int], positions: list[int],
+    recorder, *, carriers, rows: list[int], tokens: list[int], positions: list[int], k: int = K,
 ):
     """The one draft call starts request ``b`` from verify row ``rows[b]`` (request-major
     index into the populate rows) with the id kept there and that row's position; its
@@ -244,7 +247,7 @@ def _assert_draft_from_rows(
     draft = recorder.of("draft")
     assert len(draft) == 1
     call = draft[0]
-    assert call["k"] == K
+    assert call["k"] == k
     assert call["sampled_ids"].tolist() == tokens and call["sampled_ids"].dtype == torch.int32
     assert call["positions"].tolist() == positions and call["positions"].dtype == torch.int32
     populated = recorder.of("populate")[0]["hidden_rows"]
@@ -294,41 +297,48 @@ def test_the_verify_leg_accepts_then_drafts_from_the_last_accepted_row(monkeypat
 
 
 @pytest.mark.parametrize(
-    "accepts",
-    [(0, K), (2, 1)],
-    ids=["rejected-and-all-accepted", "two-and-one"],
+    "k, accepts",
+    [(1, (0, 1)), (3, (0, 3)), (3, (2, 1))],
+    ids=["k1-rejected-and-accepted", "k3-rejected-and-all-accepted", "k3-two-and-one"],
 )
 def test_a_two_request_verify_step_keeps_each_requests_rows_and_drafts_per_request(
-    monkeypatch, accepts,
+    monkeypatch, k, accepts,
 ):
-    """Two requests of different lengths in one verify step: rows request-major, each
-    request's accepted ids on its own row, every populate position ``starts[b] + t``, and
-    the draft from each request's own last kept row with ``[B]`` position operands."""
+    """Two requests of different lengths in one verify step, at k = 1 and k = 3: rows
+    request-major, each request's accepted ids on its own row, every populate position
+    ``starts[b] + t``, and the draft from each request's own last kept row with ``[B]``
+    position operands."""
+    width = 1 + k
     lengths = [5, 9]
-    world = _verify_world(monkeypatch, lengths)
+    world = _verify_world(monkeypatch, lengths, k=k)
     vocab = tiny.STACK_VOCAB_SIZE
-    drafts = [[11, 23, 37], [41, 53, 67]]
+    drafts = [[11, 23, 37][:k], [41, 53, 67][:k]]
+    next_drafts = [[5, 6, 7][:k], [8, 9, 10][:k]]
     targets, inputs, expected = [], [], []
     for b, accept in enumerate(accepts):
-        row_targets = [drafts[b][j] if j < accept else (drafts[b][j] + 1) % vocab for j in range(K)]
+        row_targets = [drafts[b][j] if j < accept else (drafts[b][j] + 1) % vocab for j in range(k)]
         row_targets.append(90 + b)
         targets += row_targets
         inputs += [3 + b] + drafts[b]
-        expected.append(row_targets[: accept + 1] + [PLACEHOLDER_TOKEN_ID] * (K - accept))
-    recorder = _HeadRecorder([[5, 6, 7], [8, 9, 10]])
+        expected.append(row_targets[: accept + 1] + [PLACEHOLDER_TOKEN_ID] * (k - accept))
+    recorder = _HeadRecorder(next_drafts)
     out, converted = _verify_step(
-        world, inputs=inputs, drafts=drafts, targets=targets, recorder=recorder, starts=lengths,
+        world, inputs=inputs, drafts=drafts, targets=targets, recorder=recorder,
+        starts=lengths, k=k,
     )
     accepted, draft_ids = out
     assert accepted.dtype == torch.int32 and accepted.tolist() == expected
-    assert draft_ids.tolist() == [[5, 6, 7], [8, 9, 10]]
+    assert draft_ids.tolist() == next_drafts
     carriers = converted["layer_carriers"]
-    _assert_populate_covers_every_row(recorder, carriers=carriers, targets=targets, starts=lengths)
+    _assert_populate_covers_every_row(
+        recorder, carriers=carriers, targets=targets, starts=lengths, width=width,
+    )
     _assert_draft_from_rows(
         recorder, carriers=carriers,
-        rows=[b * T + accept for b, accept in enumerate(accepts)],
-        tokens=[targets[b * T + accept] for b, accept in enumerate(accepts)],
+        rows=[b * width + accept for b, accept in enumerate(accepts)],
+        tokens=[targets[b * width + accept] for b, accept in enumerate(accepts)],
         positions=[lengths[b] + accept for b, accept in enumerate(accepts)],
+        k=k,
     )
 
 
