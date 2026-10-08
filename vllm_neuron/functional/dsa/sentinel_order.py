@@ -42,14 +42,14 @@ _SUPPORTED_DTYPES = (torch.int32,)
 
 
 def sentinel_order_sbuf_bytes(k: int) -> int:
-    """SBUF bytes one partition needs for a ``k``-wide row: 12 padded tiles, 3 int32, 2 scalars."""
+    """SBUF bytes one partition needs for a ``k``-wide row: 12 padded tiles, 2k int32, 2 scalars."""
     k_pad = -(-k // SEARCH_WIDTH) * SEARCH_WIDTH
-    return 48 * k_pad + 12 * k + 8
+    return 48 * k_pad + 8 * k + 8
 
 
 def _widest_row_that_fits() -> int:
     """The largest ``k`` whose tiles fit one partition; the footprint only grows with ``k``."""
-    k = SBUF_BYTES_PER_PARTITION // 60  # every row needs at least 60 bytes per column
+    k = SBUF_BYTES_PER_PARTITION // 56  # every row needs at least 56 bytes per column
     while sentinel_order_sbuf_bytes(k) > SBUF_BYTES_PER_PARTITION:
         k -= 1
     return k
@@ -114,6 +114,17 @@ def _sentinel_order_nki(pool_ids_hbm):
     """``[rows, k]`` int32 as stored -> the same ids, the negatives moved to the trailing columns.
 
     Serves any width up to ``SEARCH_MAX_FREE``.
+
+    The gather must not write SBUF its sources occupy (the gather dst/src alias, hazard class (c)
+    of trn2-1's 2026-10-08 pipeline notice): the device runs ``nc_n_gather`` in pieces that each
+    read their part of ``data`` and the indices from SBUF, so a piece would read what an earlier
+    piece wrote. The backend's ``address_rotation_sb`` pass may place a tile that is born at the
+    gather on a source that dies there, and its ``tensor_copy_elim`` pass removes a plain copy,
+    so a fresh destination tile, or a fresh copy of ``ids``, is no guarantee. Here the ids and
+    their order are the two halves of one tile, loaded by DMA straight into the first half: the
+    gather reads one half of a memory location and writes the other, which no placement of that
+    location can overlap, and the tile is live from the load to the store, so it is never placed
+    on the indices, which are born and die inside that span.
     """
     rows = pool_ids_hbm.shape[0]
     k = pool_ids_hbm.shape[1]
@@ -124,8 +135,11 @@ def _sentinel_order_nki(pool_ids_hbm):
     out = nl.ndarray((rows, k), dtype=nl.int32, buffer=nl.shared_hbm)
     for r0 in range(0, rows, PARTITION_MAX):
         h = min(PARTITION_MAX, rows - r0)
-        ids = nl.ndarray((h, k), dtype=nl.int32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=ids, src=nl.load(pool_ids_hbm[r0:r0 + h, 0:k]))
+        # The ids in the first k columns, their order in the last k (see the docstring).
+        staged = nl.ndarray((h, 2 * k), dtype=nl.int32, buffer=nl.sbuf)
+        ids = staged[:, 0:k]
+        ordered = staged[:, k:2 * k]
+        nisa.dma_copy(dst=ids, src=pool_ids_hbm[r0:r0 + h, 0:k])
         ones = nl.ndarray((h, k_pad), dtype=nl.float32, buffer=nl.sbuf)
         nisa.memset(dst=ones, value=1.0)
         zero = nl.ndarray((h, 1), dtype=nl.float32, buffer=nl.sbuf)
@@ -165,7 +179,6 @@ def _sentinel_order_nki(pool_ids_hbm):
         for c0 in range(0, k_pad, SEARCH_WIDTH):
             nisa.nc_find_index8(dst=source[:, c0:c0 + SEARCH_WIDTH], data=key,
                                 vals=vals[:, c0:c0 + SEARCH_WIDTH])
-        ordered = nl.ndarray((h, k), dtype=nl.int32, buffer=nl.sbuf)
         nisa.nc_n_gather(dst=ordered, data=ids, indices=source[:, 0:k])
         nl.store(out[r0:r0 + h, 0:k], value=ordered)
     return out
