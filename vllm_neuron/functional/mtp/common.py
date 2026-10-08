@@ -31,9 +31,8 @@ import nki.isa as nisa
 import nki.language as nl
 
 PARTITIONS = nl.tile_size.pmax
-#: One PSUM bank: 2 KiB, the widest fp32 ``nc_matmul`` result (512 columns).
+#: One PSUM bank: 2 KiB (the transposes go through PSUM one bank at a time).
 BANK_BYTES = 2048
-MATMUL_COLS = BANK_BYTES // 4
 
 
 class MtpTailError(ValueError):
@@ -106,9 +105,9 @@ def load_rows_transposed(dst, weight, row0: int, rows: int, blocks: int) -> None
     ``[128, blocks, >= rows]``. The rows come in as contiguous row tiles of at most 128
     (one whole row per partition: ``blocks * 128`` elements, >= 2 KiB, the DMA's
     efficient shape) and are turned on the PE by :func:`transpose_rows`. This replaced
-    the DMA-transpose stream (16-row ``dma_transpose`` groups), which on device ran the
-    same bytes 4x slower at the head shard's shape (reports/mtp-kernels.md 4.5); the PE
-    transposes hide under the DMA.
+    a DMA-transpose stream (16-row ``dma_transpose`` groups), which on device moved the
+    same bytes about four times slower at the head shard's shape; the PE transposes hide
+    under the DMA.
     """
     width = blocks * PARTITIONS
     for t0 in range(0, rows, PARTITIONS):
