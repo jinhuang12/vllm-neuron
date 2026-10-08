@@ -714,8 +714,10 @@ def test_the_prefill_boundary_id_is_the_next_prompt_token_or_the_sampled_sentine
 
 
 def test_with_the_knob_off_the_hook_adds_nothing_and_the_output_passes_through(monkeypatch):
+    """The knob off at construction is a root with no head and ``draft_k = 0``; the runner
+    reads that record (never the environment at step time), so nothing is added."""
     monkeypatch.delenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT", raising=False)
-    runner = _runner_shell()
+    runner = _runner_shell(head=False)
     out = runner._glm5next_shadow_kwargs(
         is_prefill=True, request_ids=["p"], request_starts=[0], request_tokens=[4],
         synthetic=False, device=torch.device("cpu"), sampling_rows=1,
@@ -832,6 +834,7 @@ def test_execute_model_forward_peels_the_drafts_and_observes_the_step(monkeypatc
     drafts = torch.tensor([[43, 44]], dtype=torch.int32)
     runner.model = lambda **kwargs: (sampled, drafts)
     runner.model.mtp = object()          # the served root built its draft head
+    runner.model.draft_k = 2             # ... for the knob's k, recorded at construction
     metadata = {"layer": {"max_query_len": 1, "decode_token_threshold": 1,
                           "block_table_tensor": torch.zeros(1, 4, dtype=torch.int32)}}
 
