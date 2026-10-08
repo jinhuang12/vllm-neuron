@@ -5,7 +5,7 @@ Run it ONLY through the device lease, which pins the cores and sets LNC2; the sc
 to run without them and selects no cores itself::
 
     export NEURON_LIBTORCH_CACHE_ROOT=<an empty directory>
-    python3 /home/ubuntu/glm53f-wt/devlease.py slice dsa -- python3 \\
+    python3 /home/ubuntu/glm53f-wt/devlease.py slice <slice> -- python3 \\
         test/hardware/benchmark_sparse_mla_prefill.py --base-module <base>/mla_sparse.py \\
         --out bench.json
 
@@ -50,15 +50,15 @@ non-cache operands and the fp32 output plus the unique cache rows the call can t
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass
 import hashlib
 import importlib.util
 import json
 import os
-from pathlib import Path
 import statistics
 import sys
 import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
 
 #: The worktree root, ahead of any installed copy (the lease sets no PYTHONPATH).
 ROOT = Path(__file__).resolve().parents[2]
@@ -75,7 +75,7 @@ WIDTH = ((SELECT_K * KPOOL + KPOOL - 1 + 127) // 128) * 128
 TE_PEAK_FLOPS = 79e12
 HBM_BYTES_PER_S = 716e9
 #: The MEASURED bf16 matmul peak of one logical core (two physical cores at LNC2), the
-#: campaign's provisional ship-bar rate; a FLOP-bound case is shown against both peaks.
+#: campaign's ship-bar rate; a FLOP-bound case is shown against both peaks.
 LNC2_MEASURED_PEAK_FLOPS = 153.0e12
 #: Every device output against the float64 oracle, relative L2 over the whole output.
 ORACLE_REL_L2 = 3e-5
@@ -340,7 +340,7 @@ def main() -> int:
         raise SystemExit("set NEURON_LIBTORCH_CACHE_ROOT to a compile cache directory")
     os.environ.setdefault("NEURON_PLATFORM_TARGET_OVERRIDE", "trn2")
 
-    import vllm_neuron  # noqa: F401 -- registers the Neuron compilation backend
+    import vllm_neuron  # registers the Neuron compilation backend
     from vllm_neuron.functional.attention import mla_sparse as live
 
     if not vllm_neuron.__file__.startswith(str(ROOT) + "/"):
@@ -369,7 +369,7 @@ def main() -> int:
         "rates": {"te_peak_flops": TE_PEAK_FLOPS, "hbm_bytes_per_s": HBM_BYTES_PER_S,
                   "lnc2_measured_peak_flops": LNC2_MEASURED_PEAK_FLOPS,
                   "source": "glm53f-wt3/planner/configs/trn2_constants.json; LNC2 peak MEASURED"
-                            " (team-lead ruling, provisional)"},
+                            " (team-lead ruling, final)"},
         "timing_method": {"reps": args.reps, "iterations": args.iterations,
                           "warmup": args.warmup, "order": "base/after flipped every call",
                           "device": "system trace nc_exec_running, physical cores merged",
