@@ -42,8 +42,8 @@ its evidence:
   leaves one of them waiting forever, which is what the server did.
 
 On the glue that read the previous step back on the main thread (``b654dc1``) this test
-fails by timeout with rank 0's progress stopping at ``dispatched 1`` (its main thread) or
-its output thread never reporting step 0; on the fix every step is materialized, the
+fails by the 60 s step bound with rank 0's progress stopping at ``dispatched 1`` (its main
+thread) or its output thread never reporting step 0; on the fix every step is materialized, the
 sampled ids agree across the two ranks, rank 0's log holds the two draft records (the
 first scored against the token that followed, the second retired unscored at shutdown)
 and rank 1 wrote no log.
@@ -85,11 +85,15 @@ DEVICE_STEP_SECONDS = 10.0
 # A prefill and two decodes: the first decode's drafts are scored against the second decode's
 # token, the second decode's drafts retire unscored at shutdown (the server's one record).
 STEPS = 3
-# Both ranks build the tiny root and warm the runner (about 25 s on this machine); a rank
-# that has not reported by then is hung, and its progress file says where.
-JOIN_TIMEOUT_SECONDS = 180.0
+# Both ranks build the tiny root and warm the runner (about 30 s on this machine) within the
+# setup bound; from the moment both are warm, the three steps, their outputs and the shutdown
+# must finish within the step bound (team-lead's 60 s). A rank that has not reported by then
+# is hung: its progress file says where, its stack file (dumped shortly before the bound) says
+# on which line.
+SETUP_TIMEOUT_SECONDS = 240.0
+STEP_TIMEOUT_SECONDS = 60.0
 OUTPUT_THREAD_TIMEOUT_SECONDS = 30.0
-STACK_DUMP_MARGIN_SECONDS = 20.0
+STACK_DUMP_MARGIN_SECONDS = 10.0
 
 
 # ── the simulated device ────────────────────────────────────────────────────
@@ -230,7 +234,7 @@ def _rank_main(rank: int, world: int, run_dir: str) -> None:
 
     # A rank that hangs reports every thread's stack shortly before the parent gives up.
     stacks = (run / f"stacks_rank{rank}.txt").open("w", encoding="utf-8")
-    faulthandler.dump_traceback_later(JOIN_TIMEOUT_SECONDS - STACK_DUMP_MARGIN_SECONDS, file=stacks)
+    faulthandler.dump_traceback_later(SETUP_TIMEOUT_SECONDS - STACK_DUMP_MARGIN_SECONDS, file=stacks)
     log = run / f"shadow_rank{rank}.jsonl"
     os.environ[KNOB] = str(K)
     os.environ[LOG_KNOB] = str(log)
@@ -270,6 +274,9 @@ def _rank_main(rank: int, world: int, run_dir: str) -> None:
             device = _Device(device_group)
             device.attach(root)
             mark("warm")
+            faulthandler.dump_traceback_later(
+                STEP_TIMEOUT_SECONDS - STACK_DUMP_MARGIN_SECONDS, file=stacks
+            )
             groups = first._groups(runner)
             steps = [first._prefill_step(prompt, groups)] + [
                 first._decode_step(position=len(prompt) + n, generated=n + 1, groups=groups)
@@ -327,13 +334,14 @@ def test_two_ranks_finish_a_prefill_and_two_decodes_and_only_rank_zero_scores(tm
     context = mp.start_processes(
         _rank_main, args=(WORLD, str(tmp_path)), nprocs=WORLD, join=False, start_method="spawn"
     )
-    deadline = time.monotonic() + JOIN_TIMEOUT_SECONDS
+    deadline = time.monotonic() + SETUP_TIMEOUT_SECONDS
+    bound = "setup"
     finished = False
-    while not finished:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        finished = context.join(timeout=remaining)
+    while not finished and time.monotonic() < deadline:
+        finished = context.join(timeout=1.0)
+        if bound == "setup" and all("warm" in stages for stages in _progress(tmp_path).values()):
+            bound = "step"
+            deadline = time.monotonic() + STEP_TIMEOUT_SECONDS
     if not finished:
         progress = _progress(tmp_path)
         for process in context.processes:
@@ -343,9 +351,10 @@ def test_two_ranks_finish_a_prefill_and_two_decodes_and_only_rank_zero_scores(tm
             rank: (tmp_path / f"stacks_rank{rank}.txt").read_text()
             for rank in range(WORLD) if (tmp_path / f"stacks_rank{rank}.txt").exists()
         }
+        limit = STEP_TIMEOUT_SECONDS if bound == "step" else SETUP_TIMEOUT_SECONDS
         pytest.fail(
-            f"the ranks did not finish within {JOIN_TIMEOUT_SECONDS:.0f} s; progress per rank: "
-            f"{progress}; thread stacks per rank: {stacks}"
+            f"the ranks did not finish within the {bound} bound of {limit:.0f} s; progress per "
+            f"rank: {progress}; thread stacks per rank: {stacks}"
         )
     results = [json.loads((tmp_path / f"result_rank{rank}.json").read_text()) for rank in range(WORLD)]
     assert [result["tp_rank"] for result in results] == list(range(WORLD))

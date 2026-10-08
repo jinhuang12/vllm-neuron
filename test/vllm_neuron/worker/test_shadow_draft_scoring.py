@@ -19,7 +19,10 @@ d_1..d_{j-1} were accepted and d_j equals the token sampled j steps later.
 
 from __future__ import annotations
 
+import inspect
 import json
+import re
+import traceback
 from types import SimpleNamespace
 
 import pytest
@@ -72,7 +75,8 @@ def _alphas(records: list[dict], k: int) -> tuple[list[float], list[float]]:
 
 class _DeviceTensor(torch.Tensor):
     """A tensor on the device: a host read (``.cpu()``, ``.tolist()``, ``.item()``, ``.to("cpu")``)
-    raises while ``armed``. The glue must never read one on the worker's main thread; the
+    raises while ``armed``, and every read is recorded with the function names on its stack
+    (``_DeviceTensor.reads``). The glue must never read one on the worker's main thread; a
     test disarms a future once "the output thread" is the one reading it back.
 
     Tensor operations on it return plain tensors (the next step consumes the sampled ids as
@@ -80,14 +84,18 @@ class _DeviceTensor(torch.Tensor):
     """
 
     __torch_function__ = torch._C._disabled_torch_function_impl
+    reads: list[tuple[str, list[str]]] = []
 
     @staticmethod
-    def of(tensor: torch.Tensor) -> "_DeviceTensor":
+    def of(tensor: torch.Tensor, *, armed: bool = True, label: str = "") -> "_DeviceTensor":
         device = tensor.as_subclass(_DeviceTensor)
-        device.armed = True
+        device.armed = armed
+        device.label = label
         return device
 
     def _read(self) -> torch.Tensor:
+        frames = [frame.name for frame in traceback.extract_stack()]
+        _DeviceTensor.reads.append((getattr(self, "label", ""), frames))
         if self.armed:
             raise RuntimeError("device read on the host")
         return self.as_subclass(torch.Tensor)
@@ -116,7 +124,9 @@ def _runner_shell(*, k: int = K, req_ids=None, rank: int | None = 0, head: bool 
     runner = NeuronModelRunner.__new__(NeuronModelRunner)
     runner.input_batch = SimpleNamespace(req_ids=list(req_ids or []))
     runner.requests = {}
-    runner.rank_tensor = _DeviceTensor.of(torch.tensor(0 if rank is None else rank, dtype=torch.int32))
+    runner.rank_tensor = _DeviceTensor.of(
+        torch.tensor(0 if rank is None else rank, dtype=torch.int32), label="rank_tensor"
+    )
     if rank is not None:
         runner._glm5next_shadow_rank_cache = rank
     runner.model = SimpleNamespace(mtp=object() if head else None)
@@ -368,6 +378,55 @@ def test_under_async_scheduling_the_main_thread_reads_no_future_and_the_output_s
         (1, 2, 2), (2, 1, 1), (3, 0, 0)
     ]
     assert runner._glm5next_shadow_log_handle.closed
+
+
+def test_every_device_read_of_the_glue_happens_inside_get_output(monkeypatch, tmp_path):
+    """The regression guard for the hang's class: with every tensor readable (nothing armed),
+    three async steps are driven and every host read of a device tensor is traced. Each one
+    sits under ``get_output()`` (the runner's own read of the sampled ids, and the glue's read
+    of the drafts through ``_glm5next_shadow_commit``), and ``rank_tensor`` is never read."""
+    log = tmp_path / "shadow.jsonl"
+    monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT", "2")
+    monkeypatch.setenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG", str(log))
+    runner = _runner_shell(k=2, req_ids=["r"], rank=None, async_scheduling=True)
+    monkeypatch.setattr(dist_state, "model_parallel_is_initialized", lambda: False)
+    _DeviceTensor.reads.clear()
+    outputs = []
+    for n, (sampled, drafts) in enumerate([([10], [[11, 12]]), ([11], [[12, 13]]), ([12], [[13, 0]])]):
+        sampled_t = _DeviceTensor.of(torch.tensor(sampled, dtype=torch.int32), armed=False, label="sampled")
+        drafts_t = _DeviceTensor.of(torch.tensor(drafts, dtype=torch.int32), armed=False, label="drafts")
+        _observe_step(runner, ["r"], sampled=sampled_t, drafts=drafts_t, starts=[4 + n])
+        outputs.append(_async_output(runner, ["r"], sampled_t))
+    assert _DeviceTensor.reads == [], "the main thread read nothing while dispatching"
+    for output in outputs:
+        output.get_output()
+    runner.ensure_kv_transfer_shutdown()
+    labels = sorted({label for label, _frames in _DeviceTensor.reads})
+    assert labels == ["drafts", "sampled"], labels
+    for label, frames in _DeviceTensor.reads:
+        assert "get_output" in frames, (label, frames)
+        if label == "drafts":
+            assert "_glm5next_shadow_commit" in frames, frames
+    assert [r["step"] for r in _read_log(log)] == [0, 1, 2]
+
+
+def test_the_shadow_glue_reads_the_device_only_in_its_commit_path():
+    """Grep-level guard: of every ``_glm5next_shadow_*`` method, only the commit path that
+    ``get_output()`` calls (or a synchronous runner calls on its host copy) contains a host read
+    (``.cpu()``, ``.item()``, ``.tolist()``, ``.numpy()``)."""
+    allowed = {"_glm5next_shadow_commit", "_glm5next_shadow_ids"}
+    pattern = re.compile(r"\.(cpu|item|tolist|numpy)\(")
+    offenders = {}
+    for name in dir(NeuronModelRunner):
+        if not name.startswith("_glm5next_shadow_"):
+            continue
+        source = inspect.getsource(getattr(NeuronModelRunner, name))
+        body = source.split('"""', 2)[-1] if source.count('"""') >= 2 else source
+        hits = pattern.findall(body)
+        if hits and name not in allowed:
+            offenders[name] = hits
+    assert offenders == {}, offenders
+    assert pattern.findall(inspect.getsource(NeuronModelRunner._glm5next_shadow_commit)), "the drafts are read in the commit"
 
 
 def test_a_second_get_output_on_the_same_step_scores_nothing_twice(monkeypatch, tmp_path):
