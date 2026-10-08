@@ -81,6 +81,7 @@ from vllm_neuron.model.neuron_config import (
 from libtorch_neuronx_lite.compile.capture_backend import CaptureComplete
 from vllm_neuron.vllm.sample.rejection_sampler import RejectionSampler
 from vllm_neuron.vllm.spec_decode.eagle import EagleProposer
+from vllm_neuron.vllm.spec_decode.mtp import MtpProposer
 from vllm_neuron.vllm.platform import SO_DISABLED_MESSAGE
 from vllm_neuron.utils.bucket_utils import (
     get_max_num_batched_tokens,
@@ -1014,6 +1015,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # Set up speculative decoding.
         self.drafter = None
         self.is_eagle3_spec = False
+        # Speculative method "mtp": the GLM-5.3-Flash root drafts from its own head
+        # inside the target graph (``vllm_neuron/vllm/spec_decode/mtp.py``).
+        self.is_mtp_spec = False
         self._draft_token_ids = None
         # Async EAGLE3 draft rows by req_id. Only used at batch-composition
         # changes (e.g. several prefills merging into the first bs-wide decode).
@@ -1029,6 +1033,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     self.vllm_config, self.device, self.on_device_sampling
                 )
                 self.rejection_sampler = RejectionSampler()
+            elif self.speculative_config.method == "mtp":
+                # Rejection sampling runs on device inside the root's verify leg
+                # (``vllm_neuron/nn/rejection_sampler.py``); no host sampler is kept.
+                self.is_mtp_spec = True
+                self.drafter = MtpProposer(
+                    self.vllm_config, self.device, self.on_device_sampling
+                )
             else:
                 raise ValueError(
                     f"Unsupported speculative decoding method: {self.speculative_config.method}"
@@ -1768,7 +1779,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         logger.info("NeuronModel loading complete (moved to device and compiled)")
 
-        if self.drafter is not None:
+        if self.is_mtp_spec:
+            # The draft is the root's own head; nothing is loaded or compiled here.
+            self.drafter.load_model(self.model)
+        elif self.drafter is not None:
             logger.info("Spec decode enabled. Loading draft model ...")
             # TODO: model loading logic could be extracted
             # Pass target model's padded hidden_size to draft model
@@ -4959,8 +4973,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 kv_segment_size,
             )
 
-        # === Draft model graph capture ===
-        if self.drafter is not None:
+        # === Draft model graph capture (eagle only: the mtp draft is in the target) ===
+        if self.is_eagle3_spec:
             logger.info(
                 "Capturing EAGLE3 prefill graphs for bucket size: %d", bucket_size
             )
@@ -5042,8 +5056,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             kv_segment_size,
         )
 
-        # === Draft model warmup ===
-        if self.drafter is not None:
+        # === Draft model warmup (eagle only: the mtp draft is in the target) ===
+        if self.is_eagle3_spec:
             logger.info("Warming up EAGLE3 for bucket size: %d", bucket_size)
             self.drafter.warmup(
                 num_tokens=bucket_size,
@@ -7084,7 +7098,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 batch_size,
             )
 
-            # === Draft model decode graph capture ===
+        # === Draft model decode graph capture (eagle only: the mtp draft is in the target) ===
+        if self.is_eagle3_spec:
             logger.info("Capturing EAGLE3 decode graphs for batch size: %d", batch_size)
             num_spec_tokens = self.speculative_config.num_speculative_tokens
             draft_num_tokens = batch_size * (1 + num_spec_tokens)
@@ -7209,7 +7224,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 kwargs["input_ids"].shape[0],
             )
 
-            # === Draft model warmup ===
+        # === Draft model warmup (eagle only: the mtp draft is in the target) ===
+        if self.is_eagle3_spec:
             logger.info("Warming up EAGLE3 for batch size: %d", batch_size)
             num_spec_tokens = self.speculative_config.num_speculative_tokens
             draft_num_tokens = batch_size * (1 + num_spec_tokens)
@@ -10844,7 +10860,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # This binds the cache tensors to the model
         self.model.bind_kv_cache(kv_caches)
 
-        if self.speculative_config and self.speculative_config.use_eagle():
+        # The mtp head's KV layer is in the root's own spec and banks; only an eagle
+        # drafter binds a model of its own.
+        if self.is_eagle3_spec:
             assert isinstance(self.drafter, EagleProposer)
             # This binds the cache tensors to the draft model
             self.drafter.model.bind_kv_cache(kv_caches)
@@ -11027,7 +11045,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         spec, page_size_padded=attention_page
                     )
 
-        if self.speculative_config and self.speculative_config.use_eagle():
+        # The mtp head's layer is already in the root's ``get_kv_spec`` (it holds the
+        # head); only an eagle drafter brings layers of its own.
+        if self.is_eagle3_spec:
             assert isinstance(self.drafter, EagleProposer)
 
             drafter_kv_spec = self.drafter.model.get_kv_spec()
