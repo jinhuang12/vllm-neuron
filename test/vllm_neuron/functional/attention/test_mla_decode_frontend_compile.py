@@ -3,9 +3,10 @@
 
 The simulator runs a kernel body as plain Python, so it cannot see a call form the
 compiler's front end refuses. This file compiles every new entry at the served shapes --
-decode attention dense and selected at B in {1, 4} on one and two programs, the
-key-split decode attention dense (ctx 1024) and selected (ctx 8192) at B in {1, 4, 64} on
-one and two programs, and the low-precision projection at each DSA site's TP=64 width at M in {1, 4} on one and two
+decode attention dense and selected at B in {1, 4} x T in {1, 2, 4, 6} query rows per
+request on one and two programs, the key-split decode attention dense (ctx 1024) and
+selected (ctx 8192) at B in {1, 4, 64} on one and two programs, and the low-precision
+projection at each DSA site's TP=64 width at M in {1, 4} on one and two
 programs -- inside a child process that pins the platform target, opens no device node,
 and proves it parsed bodies by refusing one that reads an undefined name. The pattern is
 ``test_mla_sparse_frontend_compile.py``'s.
@@ -21,6 +22,7 @@ import tempfile
 
 import nki
 import nki.language as nl
+import pytest
 
 ROW = "decode_frontend"
 _ROOT = pathlib.Path(__file__).resolve().parents[4]
@@ -30,6 +32,8 @@ _PIN = {"VLLM_NEURON_CPU_COMPILE": "1", "NEURON_PLATFORM_TARGET_OVERRIDE": "trn2
 
 LATENT, PAGE, BANK_PAGES = 512, 128, 64
 DENSE_PAGES, SELECTED_PAGES, TOPK_ROWS = 16, 32, 2048
+# Query rows per request: the one-token step and the verify step's 1 + k at k in {1, 3, 5}.
+QUERY_ROWS = (1, 2, 4, 6)
 #: The key-split kernel's served windows: ctx 1024 dense, ctx 8192 selected.
 SPLIT_DENSE_PAGES, SPLIT_SELECTED_PAGES = 16, 64
 SPLIT_BATCHES = (1, 4, 64)
@@ -71,17 +75,19 @@ def _compile_each_entry() -> None:
 
     built = []
     for batch in (1, 4):
-        for programs in (1, 2):
-            built.append((f"dense_b{batch}_g{programs}", lambda b=batch, g=programs: grid(
-                MD.mla_decode_dense_kernel, g)(
-                fake((b, 1, LATENT), bf), fake((BANK_PAGES * PAGE, LATENT), bf),
-                fake((b, DENSE_PAGES), i32), fake((b,), i32), fake((b, LATENT), bf),
-                0.0625, PAGE, MD.SOURCE_DIGEST)))
-            built.append((f"selected_b{batch}_g{programs}", lambda b=batch, g=programs: grid(
-                MD.mla_decode_selected_kernel, g)(
-                fake((b, 1, LATENT), bf), fake((BANK_PAGES * PAGE, LATENT), bf),
-                fake((b, SELECTED_PAGES), i32), fake((b,), i32), fake((b, LATENT), bf),
-                fake((b, TOPK_ROWS), i32), 0.0625, PAGE, MD.SOURCE_DIGEST)))
+        for rows in QUERY_ROWS:
+            for programs in (1, 2):
+                name = f"b{batch}_t{rows}_g{programs}"
+                built.append((f"dense_{name}", lambda b=batch, t=rows, g=programs: grid(
+                    MD.mla_decode_dense_kernel, g)(
+                    fake((b * t, 1, LATENT), bf), fake((BANK_PAGES * PAGE, LATENT), bf),
+                    fake((b, DENSE_PAGES), i32), fake((b,), i32), fake((b * t, LATENT), bf),
+                    0.0625, PAGE, MD.SOURCE_DIGEST)))
+                built.append((f"selected_{name}", lambda b=batch, t=rows, g=programs: grid(
+                    MD.mla_decode_selected_kernel, g)(
+                    fake((b * t, 1, LATENT), bf), fake((BANK_PAGES * PAGE, LATENT), bf),
+                    fake((b, SELECTED_PAGES), i32), fake((b,), i32), fake((b * t, LATENT), bf),
+                    fake((b * t, TOPK_ROWS), i32), 0.0625, PAGE, MD.SOURCE_DIGEST)))
     for batch in SPLIT_BATCHES:
         for programs in (1, 2):
             built.append((f"dense_split_b{batch}_g{programs}", lambda b=batch, g=programs: grid(
@@ -148,6 +154,30 @@ def _rows() -> list[dict[str, str]]:
     return rows
 
 
+@pytest.mark.parametrize("dense", [True, False])
+@pytest.mark.parametrize("lnc", [None, "2"])
+def test_the_served_shard_shape_routes_one_row_to_the_key_split_kernel_and_rows_to_the_general(
+        dense, lnc, monkeypatch) -> None:
+    """The dispatch at TP=64's per-rank shape (one head, latent 512, 128-row pages; ctx 1024
+    dense / ctx 8192 selected): one query row per request is the key-split kernel on every
+    program of the core; ``1 + k`` rows per request is the general kernel. Pinned here, beside
+    the compiled entries, so a kernel change cannot flip either route unnoticed."""
+    from vllm_neuron.functional.attention import mla_decode as MD
+    if lnc is None:
+        monkeypatch.delenv("NEURON_LOGICAL_NC_CONFIG", raising=False)
+    else:
+        monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", lnc)
+    width = SPLIT_DENSE_PAGES * PAGE if dense else TOPK_ROWS
+    split_entry = MD.mla_decode_dense_split_kernel if dense else MD.mla_decode_selected_split_kernel
+    general = MD.mla_decode_dense_kernel if dense else MD.mla_decode_selected_kernel
+    for batch in SPLIT_BATCHES:
+        assert MD._route(batch, 1, 1, LATENT, PAGE, width, dense) == (
+            split_entry, 2 if lnc == "2" else 1, True), (batch, dense, lnc)
+        for rows in QUERY_ROWS[1:]:
+            assert MD._route(batch, rows, 1, LATENT, PAGE, width, dense) == (
+                general, 2 if lnc == "2" and batch >= 2 else 1, False), (batch, rows, dense, lnc)
+
+
 def test_the_front_end_accepts_every_new_entry_at_the_served_shapes() -> None:
     rows = _rows()
     assert {row["neuron_fds"] for row in rows} == {"0"}, rows
@@ -155,7 +185,8 @@ def test_the_front_end_accepts_every_new_entry_at_the_served_shapes() -> None:
     assert control and control[0]["refused"] == "True", (
         f"the child accepted a body that reads an undefined name, so it parsed none: {control}")
     entries = [row for row in rows if row["entry"] != "undefined_name_body"]
-    assert len(entries) == 8 + 2 * len(SPLIT_BATCHES) * 2 + 2 * len(SITES) * 2, len(entries)
+    assert len(entries) == (2 * 2 * len(QUERY_ROWS) * 2 + 2 * len(SPLIT_BATCHES) * 2
+                            + 2 * len(SITES) * 2), len(entries)
     refused = [f"{row['entry']}: {row['diagnostic']}" for row in entries
                if row["refused"] != "False"]
     assert not refused, refused
