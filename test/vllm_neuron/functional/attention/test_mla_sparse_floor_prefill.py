@@ -19,7 +19,16 @@ that must not change:
 * the grouped softmax computes the one-query path's values: a call whose query count
   is not a whole query block runs one query per group, and its rows match the grouped
   call's to within one re-association of MM1's fp32 sums (see
-  :data:`REASSOCIATION_REL_L2`). On the device the two are equal bit for bit.
+  :data:`REASSOCIATION_REL_L2`). On the device the two are equal bit for bit;
+* the body's output stays within its derived error budget of the float64 attention
+  (``error_budget`` of ``test/hardware/benchmark_sparse_mla_prefill.py``, which holds the
+  device outputs to the same bar): the precision it gives up is accounted for step by
+  step, so a change that loses precision (MM2 on the bf16 hi half of p alone, say) fails.
+
+Decode (one query row) is not served by this body (``_lowp_serves``), so its output is
+the fp32 body's, bit for bit, whatever this body does. Prefill outputs are not bit-equal
+to the kernel before MM2 ran per query: the hi and lo halves of p now accumulate in
+separate PSUM columns, a different fp32 summation order, which the budget covers.
 
 The index rows follow the selector's layout at the start of a prompt (the chunk-1
 case): query ``t`` names ``t + 1`` distinct rows in a random order, then -1 to the end
@@ -29,14 +38,35 @@ wholly sentinel, which the body must zero.
 
 from __future__ import annotations
 
+import importlib.util
+import pathlib
+import sys
+
 import torch
 
 from vllm_neuron.functional.attention import mla_sparse as MS
 
+
+def _benchmark_module():
+    """The device benchmark, for its error budget: one bar for the simulator and the device."""
+    name = "benchmark_sparse_mla_prefill"
+    cached = sys.modules.get(name)
+    if cached is not None:
+        return cached
+    path = pathlib.Path(__file__).resolve().parents[4] / "test" / "hardware" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module        # its dataclass looks its module up while it loads
+    spec.loader.exec_module(module)
+    return module
+
+
+BENCH = _benchmark_module()
+
 LATENT = MS.TARGET_LATENT_RANK
 #: The selector's index row: 512 pools of 4 rows, the 3-row tail, -1 to whole chunks.
 WIDTH = 17 * MS.KEY_CHUNK
-SCALE = 0.0625
+SCALE = BENCH.SCALE
 #: Query rows of one query block (``_queries_per_block`` at one head).
 BLOCK = MS.DGE_TRANSPOSE_ROWS
 #: The simulator computes a matmul with numpy's sgemm, whose summation order depends on
@@ -46,7 +76,7 @@ BLOCK = MS.DGE_TRANSPOSE_ROWS
 #: and the softmax and MM2 carry that relative change into the output. The device's PE
 #: sums every column in one fixed order, so there the grouping changes no bit
 #: (``reports/mla_sparse.md``).
-REASSOCIATION_REL_L2 = LATENT ** 0.5 * 2.0 ** -24
+REASSOCIATION_REL_L2 = LATENT ** 0.5 * BENCH.FP32_UNIT
 
 
 def _empty_row(seq: int) -> int:
@@ -117,3 +147,41 @@ def test_the_grouped_softmax_computes_the_one_query_values(monkeypatch):
     assert rel <= REASSOCIATION_REL_L2, rel
     empty = _empty_row(2 * BLOCK + 1)
     assert torch.count_nonzero(grouped[empty]) == 0 and torch.count_nonzero(single[empty]) == 0
+
+
+def _float64_attention(q, cache, indices):
+    """Softmax attention over each query's selected rows in float64; -1 is masked, repeats kept."""
+    rows = indices.to(torch.int64)
+    keep = rows >= 0
+    gathered = cache.double()[rows.clamp(min=0)]                  # [seq, width, latent]
+    scores = torch.einsum("sl,skl->sk", q[:, 0].double(), gathered) * SCALE
+    weights = torch.nan_to_num(torch.softmax(scores.masked_fill(~keep, float("-inf")), dim=-1))
+    out = torch.einsum("sk,skl->sl", weights, gathered).unsqueeze(1)
+    return out, scores.masked_fill(~keep, 0.0), weights
+
+
+def _rel_l2(got, want) -> float:
+    return float((got.double() - want).norm() / want.norm())
+
+
+def test_the_output_is_within_its_error_budget_of_float64(monkeypatch):
+    monkeypatch.delenv("VLLM_NEURON_MLA_SPARSE_FP32", raising=False)
+    monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", "2")
+    seq, rows = 2 * BLOCK, 2600
+    gen = torch.Generator().manual_seed(13)
+    q = (torch.randn(seq, 1, LATENT, generator=gen) * 0.5).to(torch.bfloat16)
+    cache = torch.randn(rows, LATENT, generator=gen).to(torch.bfloat16)
+    # The last chunk of a long prompt: every column of every row selects a distinct row,
+    # so each sum runs over the whole width.
+    indices = torch.stack([torch.randperm(rows, generator=gen)[:WIDTH] for _ in range(seq)])
+    indices = indices.to(torch.int32)
+    want, scores, weights = _float64_attention(q, cache, indices)
+    budget = BENCH.error_budget(WIDTH, LATENT, float(scores.abs().max()))
+    got = _attend(q, cache, indices)
+    error = _rel_l2(got, want)
+    assert error <= budget, (error, budget)
+    # The budget tells precision lost from precision kept: MM2 on the bf16 hi half of p
+    # alone is a regression it must refuse.
+    hi_only = torch.einsum("sk,skl->sl", weights.float().to(torch.bfloat16).double(),
+                           cache.double()[indices.to(torch.int64)]).unsqueeze(1)
+    assert _rel_l2(hi_only, want) > budget
