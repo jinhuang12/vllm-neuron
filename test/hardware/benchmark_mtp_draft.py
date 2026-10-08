@@ -314,6 +314,89 @@ def run_k(k: int, args, cfg, qc, device) -> dict:
     return result
 
 
+def run_ops(args, cfg, qc, device) -> dict:
+    """One draft iteration at B=1 as six separately compiled pieces, each fed the tensors
+    the previous piece produced (so the MoE routes real activations), timed one by one.
+
+    Each piece carries its own launch floor (the ``null`` graph), so the floor is
+    reported beside the raw medians; the fused k=1 graph timed on the same inputs is
+    the whole the pieces are compared with. At one rank the token route is the plain
+    argmax (``draft_token_ids``' whole-head branch): piece 6 times the sharded route's
+    arithmetic with the gather elided (``world`` 1), so it is the select without the
+    TP collective.
+    """
+    torch._dynamo.reset()
+    head = build_head(cfg, args.seed, device)
+    hidden, sampled, positions = step_inputs(cfg, args.seed + 11, device)
+    carrier, statics = block_operands(cfg, args.seed + 99, device)
+    ffn_keywords = dict(quant_config=qc, block_size=None, moe_group=None, tp_degree=1,
+                        expert_parallel_rank=EXPERT_RANK)
+    gain = head.shared_head_norm_weight
+    lm_head = head._lm_head()
+
+    def layer_input(token, previous, pos):  # enorm/hnorm + cat + eh_proj (embedding gather included)
+        return head._layer_input(token, previous, pos)
+
+    def attention(x, *flat):  # layer 45's attention half, the trunk's DSA kernels
+        kwargs = dict(zip(BLOCK_NAMES, flat))
+        kwargs.update(statics)
+        return head.block(x, **kwargs)
+
+    def ffn(attended):  # post-attention norm + MoE (router, routed bank, shared expert) + reduce
+        return head._ffn_half(attended, **ffn_keywords)
+
+    def shared_head_norm(attended, ffn_out):  # residual add + shared-head norm
+        return head._rms_norm(attended + ffn_out, gain)
+
+    def logits(rows):  # the vocab-shard head linear, 2420 rows at one rank
+        return torch.nn.functional.linear(rows.to(lm_head.dtype), lm_head).to(torch.float32)
+
+    def select(shard_logits):  # (max, argmax) pair -> owner -> global id, the TP gather elided
+        local_max, local_arg = shard_logits.max(dim=-1)
+        pair = torch.stack([local_max, local_arg.to(torch.float32)], dim=-1)
+        owner = pair[:, 0::2].argmax(dim=-1)
+        local = torch.gather(pair[:, 1::2], 1, owner.reshape(-1, 1)).reshape(-1).to(torch.int64)
+        return (owner * int(lm_head.shape[0]) + local).to(torch.int32)
+
+    pieces = [("3 enorm/hnorm+cat+eh_proj", layer_input), ("1 attention half", attention),
+              ("2 _ffn_half (norm+MoE+reduce)", ffn), ("6 residual+shared_head.norm", shared_head_norm),
+              ("4 vocab-shard logits linear", logits), ("5 (max,argmax)+select", select)]
+    wrap = (lambda f: f) if args.mode == "sim" else compiled
+    fns = {name: wrap(fn) for name, fn in pieces}
+    chain = {}
+    chain["3 enorm/hnorm+cat+eh_proj"] = (sampled, hidden, positions)
+    results = []
+    x = None
+    for name, _ in pieces:
+        fn = fns[name]
+        inputs = chain[name]
+        started = time.perf_counter()
+        out = fn(*inputs)
+        _sync(out)
+        first_call_s = time.perf_counter() - started
+        if name.startswith("3"):
+            x = out
+            chain["1 attention half"] = (x, *carrier)
+        elif name.startswith("1"):
+            attended = out
+            chain["2 _ffn_half (norm+MoE+reduce)"] = (attended,)
+        elif name.startswith("2"):
+            chain["6 residual+shared_head.norm"] = (attended, out)
+        elif name.startswith("6"):
+            chain["4 vocab-shard logits linear"] = (out,)
+        elif name.startswith("4"):
+            chain["5 (max,argmax)+select"] = (out,)
+        result = {"op": name, "first_call_s": first_call_s}
+        if args.mode == "device":
+            result["timing"] = measure(fn, inputs, args.warmup, args.iterations)
+        results.append(result)
+    token = int(out.cpu().reshape(-1)[0])
+    del fns, head
+    return {"graph": "ops", "batch": 1, "ctx": CONTEXT, "window_rows": WINDOW_PAGES * case.PAGE,
+            "pieces": results, "token": token,
+            "unit": "one draft iteration at B=1 as six separately compiled graphs on the same inputs"}
+
+
 def compare(device_path: Path, sim_path: Path) -> dict:
     """Per ``k``: ids bit-equal?, hidden rows' relative L2, the margins both sides saw."""
     dev, sim = json.loads(device_path.read_text()), json.loads(sim_path.read_text())
@@ -336,6 +419,8 @@ def main() -> None:
     parser.add_argument("--mode", choices=("sim", "device"), default="device")
     parser.add_argument("--ks", type=int, nargs="+", default=[1, 5])
     parser.add_argument("--null", action="store_true", help="also time the launch-floor graph")
+    parser.add_argument("--ops", action="store_true",
+                        help="also time one draft iteration as six separately compiled pieces")
     parser.add_argument("--hidden", type=int, default=4096)
     parser.add_argument("--q-lora", type=int, default=1536)
     parser.add_argument("--seed", type=int, default=7_000)
@@ -388,6 +473,14 @@ def main() -> None:
     for k in args.ks:
         print(f"[mtp-bench] draft_tokens k={k}", file=sys.stderr, flush=True)
         report["cases"].append(run_k(k, args, cfg, qc, device))
+        flush()
+    if args.ops:
+        print("[mtp-bench] ops", file=sys.stderr, flush=True)
+        ops = run_ops(args, cfg, qc, device)
+        k1 = next((c for c in report["cases"] if c.get("graph") == "draft_tokens" and c["k"] == 1), None)
+        if k1 is not None and ops["token"] != int(k1["ids"][0][0]):
+            raise AssertionError(f"the six pieces drafted {ops['token']}; the fused k=1 graph {k1['ids'][0][0]}")
+        report["cases"].append(ops)
         flush()
     if args.mode == "device":
         timed = {c["k"]: c["timing"]["median_us"] for c in report["cases"] if c.get("graph") == "draft_tokens"}
