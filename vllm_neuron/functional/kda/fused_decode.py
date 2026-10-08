@@ -1197,6 +1197,7 @@ def commit_kda_checkpoints(
         )
     return accepted - 1
 
+
 def kda_fused_decode_torch_reference(
     q_in: Tensor,
     k_in: Tensor,
