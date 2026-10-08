@@ -102,6 +102,28 @@ def _count_torch_fallback() -> None:
     _COUNTERS.torch_fallback += 1
 
 
+def indexer_ring_depth(index_kpool: int, num_speculative_tokens: int | None) -> int:
+    """The indexer ring's depth for a server that drafts ``num_speculative_tokens``.
+
+    The one site this number is derived at: the runner sizes ``tail`` and ``pad_tail``
+    as ``[slots, 2, depth, index_head_dim]`` with it, and the decode legs read the depth
+    back off that shape. A verify step hands the ring ``1 + num_speculative_tokens``
+    rows, and a ring of depth ``R`` takes ``R - index_kpool + 2`` rows back on rollback
+    (:func:`decode_tail_update.max_rows_for`), so the depth is the smallest power of two
+    at or above ``max(index_kpool, num_speculative_tokens + 3)``. A server that drafts
+    nothing (``0`` or ``None``) gets ``index_kpool``: today's ring, shape and kernels
+    untouched.
+    """
+    from vllm_neuron.functional.dsa.decode_tail_update import ring_depth_for
+
+    drafts = 0 if num_speculative_tokens is None else int(num_speculative_tokens)
+    if drafts < 0:
+        raise DecodeTrowError(
+            f"num_speculative_tokens is a count of drafted tokens; got {drafts}"
+        )
+    return ring_depth_for(int(index_kpool), 1 + drafts)
+
+
 def _sb(shape, dtype):
     return nl.ndarray(shape, dtype=dtype, buffer=nl.sbuf)
 

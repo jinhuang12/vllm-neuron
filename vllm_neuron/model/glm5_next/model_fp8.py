@@ -4547,11 +4547,15 @@ class Glm5NextDSAIndexer(nn.Module):
         before the first decode step -- otherwise the next completion pools zeros in
         their place and no check notices.
 
-        The ring slot of an absolute position is ``position % index_kpool``. With
+        The ring row of an absolute position is ``position % depth``, with ``depth``
+        the ring's own row count: ``index_kpool`` on a server that drafts nothing,
+        a power-of-two multiple of it on one that does
+        (``decode_trow.indexer_ring_depth``), so a pool never wraps mid-way. With
         ``end_position`` the sequence length after this chunk, the open pool holds
         positions ``end_position - r`` through ``end_position - 1`` for
-        ``r = end_position % index_kpool``, and those are slots ``0`` through
-        ``r - 1``. Half 0 is keys and half 1 is gate scores, the halves
+        ``r = end_position % index_kpool``, and those are rows ``e - r`` through
+        ``e - 1`` for ``e = end_position % depth`` (``0 .. r - 1`` at today's
+        depth). Half 0 is keys and half 1 is gate scores, the halves
         :meth:`tail_step` declares and refuses on.
 
         A chunked prefill writes only its own share: when the open pool started in
@@ -4577,12 +4581,18 @@ class Glm5NextDSAIndexer(nn.Module):
         anyway.
         """
         pool = self.index_kpool
-        want_tail = (2, pool, self.index_head_dim)
-        if tail.ndim != 3 or tuple(tail.shape) != want_tail:
+        # The ring's depth is read off its shape: ``index_kpool`` on a server that
+        # drafts nothing, a power-of-two multiple of it on one that does
+        # (``decode_trow.indexer_ring_depth``). The ring row of a position is
+        # ``position % depth`` either way.
+        depth = int(tail.shape[1]) if tail.ndim == 3 else 0
+        deep_enough = depth >= pool and depth % pool == 0 and depth & (depth - 1) == 0
+        if not deep_enough or tuple(tail.shape) != (2, depth, self.index_head_dim):
             raise Glm5NextDSAIndexerError(
-                f"prefill_tail must be [2, index_kpool, index_head_dim] = "
-                f"{want_tail} -- half 0 keys, half 1 gate scores; got "
-                f"{tuple(tail.shape)}"
+                f"prefill_tail must be [2, depth, index_head_dim] with depth a "
+                f"power-of-two multiple of index_kpool {pool} (today's ring is "
+                f"{(2, pool, self.index_head_dim)}) -- half 0 keys, half 1 gate scores; "
+                f"got {tuple(tail.shape)}"
             )
         if key.ndim != 2 or int(key.shape[1]) != self.index_head_dim:
             raise Glm5NextDSAIndexerError(
@@ -4613,8 +4623,11 @@ class Glm5NextDSAIndexer(nn.Module):
                 f"{int(end_position)} is shorter than the chunk's own {real} "
                 f"token(s)"
             )
-        rows = int(end_position) % pool
-        take = min(rows, real)
+        # The open pool's ``r = end % pool`` positions sit at ring rows ``end % depth
+        # - r .. end % depth - 1``: ``depth`` is a multiple of ``pool``, so the pool's
+        # first position is at a multiple-of-``pool`` row and never wraps mid-pool.
+        rows = int(end_position) % depth
+        take = min(int(end_position) % pool, real)
         if take <= 0:
             return 0
         # ``take`` and ``rows`` are python ints, so these are trace-time addresses --
@@ -4642,12 +4655,12 @@ class Glm5NextDSAIndexer(nn.Module):
     ) -> torch.Tensor:
         """:meth:`seed_tail`'s write with the chunk's end as a tensor. The same slots.
 
-        The same three numbers, none of them read: ``r = end_position %
-        index_kpool`` is the open pool's row count, the written slots are
-        ``r - take`` through ``r - 1`` for ``take = min(r, real)``, and slot ``s``
-        takes the key at row ``real - r + s``. All three are arithmetic on a 0-d
-        tensor here, so the write's addresses are values rather than trace-time
-        constants.
+        The same numbers, none of them read: ``r = end_position % index_kpool`` is
+        the open pool's row count, ``e = end_position % depth`` the ring row after
+        its last one, the written rows are ``e - take`` through ``e - 1`` for
+        ``take = min(r, real)``, and row ``s`` takes the key at ``real - e + s``.
+        All of them are arithmetic on a 0-d tensor here, so the write's addresses
+        are values rather than trace-time constants.
 
         ``real`` is the chunk's own length, ``end_position - start_position``, and
         it is the operand's width only when nothing was padded. The remainder
@@ -4657,8 +4670,8 @@ class Glm5NextDSAIndexer(nn.Module):
 
         The whole ring is copied to write part of it, because a slice needs its
         bounds as host ints and a boolean index produces a data-dependent shape --
-        the graph break in another costume. ``torch.where`` over all
-        ``index_kpool`` rows has one shape at every position, and the rows outside
+        the graph break in another costume. ``torch.where`` over all ``depth``
+        rows has one shape at every position, and the rows outside
         the window take their own old value, which is what "an earlier chunk's rows
         stay" means as an op. Nothing is written when the sequence divides evenly,
         because the mask is then empty everywhere.
@@ -4668,14 +4681,17 @@ class Glm5NextDSAIndexer(nn.Module):
         would read out of bounds to produce values nothing uses.
         """
         pool = self.index_kpool
+        depth = int(tail.shape[1])
         device = tail.device
-        rows = torch.remainder(_int64_scalar(end_position, device), pool)
-        slots = torch.arange(pool, device=device)
+        end = _int64_scalar(end_position, device)
+        rows = torch.remainder(end, depth)
+        slots = torch.arange(depth, device=device)
         real = _int64_scalar(tokens, device)
         if start_position is not None:
             began = _int64_scalar(start_position, device)
-            real = _int64_scalar(end_position, device) - began
-        write = ((slots >= (rows - real).clamp_min(0)) & (slots < rows))[:, None]
+            real = end - began
+        take = torch.minimum(torch.remainder(end, pool), real)
+        write = ((slots >= rows - take) & (slots < rows))[:, None]
         source = (slots - rows + real).clamp_min(0).minimum(real - 1)
         tail[0].copy_(
             torch.where(write, key.index_select(0, source).to(tail.dtype), tail[0])
@@ -5446,7 +5462,8 @@ class Glm5NextDSAIndexer(nn.Module):
                 f"{rows} rows per request exceed the {max_rows_for(depth, pool)} a ring "
                 f"of depth {depth} takes back on rollback (depth - index_kpool + 2): a "
                 f"rejected row's stash would overwrite a token the next step's pools "
-                f"still need; allocate the ring at ring_depth_for(index_kpool, rows)"
+                f"still need; allocate the ring at decode_trow.indexer_ring_depth("
+                f"index_kpool, rows - 1)"
             )
         if not torch.is_tensor(position) or tuple(position.shape) != (batch,):
             raise Glm5NextDSAIndexerError(
