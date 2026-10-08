@@ -183,6 +183,12 @@ _SEAM_REGISTRY = {
     "mhc_sinkhorn": (
         "vllm_neuron.functional.mhc.sinkhorn",
         "dispatch_counters", "reset_dispatch_counters"),
+    "mtp_tail_in": (
+        "vllm_neuron.functional.mtp.tail_in",
+        "dispatch_counters", "reset_dispatch_counters"),
+    "mtp_tail_out": (
+        "vllm_neuron.functional.mtp.tail_out",
+        "dispatch_counters", "reset_dispatch_counters"),
     "vision_patch_embed": (
         "vllm_neuron.functional.vision.patch_embed",
         "dispatch_counters", "reset_dispatch_counters"),
