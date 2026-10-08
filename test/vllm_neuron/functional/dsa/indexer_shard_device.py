@@ -42,8 +42,12 @@ baseline drifts.
 The chunk sits at the end of a ``index_kpool * C``-token context, so every row sees all
 ``C`` pools. After timing, the sharded ids must equal the replicated ids on the rank's rows
 as per-row sets, and every stage must have taken the NKI route. The run also records every
-node of each traced graph (``graph_ops``): the op inventory of the selection path. One JSON
-object is written per run.
+node of each traced graph (``graph_ops``): the op inventory of the selection path. Each
+graph compiles after a ``torch._dynamo.reset()`` (so the stage counters see its own trace),
+so a graph called again after a later graph's compile (the launch graph's second timing,
+the profiles) is traced again (``traces`` > 1); that trace must give the same nodes
+(``traces_identical``), and it finds the same compile-cache entry. One JSON object is
+written per run.
 
 ``--compile-only GRAPH`` compiles that one graph, runs it once and writes only its record:
 for a width where a graph does not compile, so each path's compiler error is in its own log
@@ -93,11 +97,12 @@ CHUNK = 1024
 GRAPHS = ("launch", "replicated", "sharded", "precut", "cut")
 
 
-def compiled(fn, ops: list):
-    """``fn`` compiled for the device, recording each traced node into ``ops``."""
+def compiled(fn, traces: list):
+    """``fn`` compiled for the device, appending the nodes of each trace to ``traces``."""
     device_backend = torch._dynamo.lookup_backend("neuron_libtorch")
 
     def recording(gm, example_inputs):
+        ops = []
         for node in gm.graph.nodes:
             if node.op not in ("call_function", "call_method", "call_module"):
                 continue
@@ -106,6 +111,7 @@ def compiled(fn, ops: list):
             ops.append({"op": node.op, "target": str(node.target),
                         "out": [[list(v.shape), str(v.dtype).replace("torch.", "")]
                                 for v in values if isinstance(v, torch.Tensor)]})
+        traces.append(ops)
         return device_backend(gm, example_inputs,
                               options={"compiler_args": os.environ.get("NEURON_CC_FLAGS", "")})
 
@@ -175,16 +181,26 @@ def first_call(name, graph, inputs, out):
     torch._dynamo.reset()
     case.reset_stage_counters()
     shard_rows.reset_shard_rows_dispatch_counters()
-    ops = []
-    fn = compiled(graph, ops)
+    traces = []
+    fn = compiled(graph, traces)
     started = time.perf_counter()
     first_out = fn(*inputs)[0]
     first_out = tuple(t.to("cpu") for t in first_out) if isinstance(first_out, tuple) else (
         first_out.to("cpu"))
     out[name] = {"first_call_s": time.perf_counter() - started,
                  "routes": case.stage_counters(),
-                 "cut_routes": shard_rows.shard_rows_dispatch_counters(), "graph_ops": ops}
+                 "cut_routes": shard_rows.shard_rows_dispatch_counters(), "graph_traces": traces}
     return fn, first_out
+
+
+def write_record(record: dict, path: Path) -> None:
+    """Write ``record``, each graph's traces as its nodes (``graph_ops``), its trace count
+    and whether every trace gave those nodes."""
+    for body in record["graphs"].values():
+        traces = body.pop("graph_traces")
+        body.update({"graph_ops": traces[0], "traces": len(traces),
+                     "traces_identical": all(t == traces[0] for t in traces)})
+    path.write_text(json.dumps(record, indent=1, sort_keys=True) + "\n")
 
 
 def profile(name: str, fn, inputs, args) -> dict:
@@ -296,7 +312,7 @@ def main() -> None:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     if args.compile_only is not None:
         first_call(args.compile_only, *plan[args.compile_only], graphs)
-        args.output.write_text(json.dumps(record, indent=1, sort_keys=True) + "\n")
+        write_record(record, args.output)
         return
     calls, first = {}, {}
     for name, (graph, inputs) in plan.items():
@@ -334,7 +350,7 @@ def main() -> None:
     if args.profile_dir is not None:
         record["profiles"] = {name: profile(name, fn, inputs, args)
                               for name, (fn, inputs) in calls.items()}
-    args.output.write_text(json.dumps(record, indent=1, sort_keys=True) + "\n")
+    write_record(record, args.output)
     print(json.dumps({"label": args.label, "cands": args.cands, "net_ms": record["net_ms"],
                       "wall_net_ms": record["wall_net_ms"], "check": record["check"],
                       "first_call_s": {g: round(b["first_call_s"], 1)
@@ -352,6 +368,9 @@ def main() -> None:
         raise SystemExit(f"the row cut differs from the reference: {cut_exact}")
     if not same_precut:
         raise SystemExit("the sharded ids differ from the chain on the CPU-cut rows")
+    retraced = [g for g, body in graphs.items() if not body["traces_identical"]]
+    if retraced:
+        raise SystemExit(f"a second trace gave other nodes: {retraced}")
 
 
 if __name__ == "__main__":

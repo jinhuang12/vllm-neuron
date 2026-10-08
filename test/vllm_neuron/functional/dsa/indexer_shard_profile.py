@@ -31,8 +31,16 @@ and the output copies), so the segment times of one execution add up to the exec
 op's time is exclusive. An op whose instructions all overlap a longer op's segment (a
 kernel the compiler runs beside the next one) gets no time of its own: the segment table
 keeps every op found in each segment with its instruction time, so it stays visible there,
-and its cost in the chain is the difference of two graphs (``sharded - precut`` for the
-row cut).
+and its own time comes from a graph that runs it alone (the ``cut`` graph for the row cut).
+
+A compiler copy (a ``DMA*`` instruction with HBM reads) only queues its transfer: the
+instruction ends before its data moves, and the packets often run under the next segment.
+Each copy instruction's ``transfer_us`` therefore runs from its issue to the last packet of
+its transfer: the first burst, on the copy's physical core, that starts after the issue and
+moves the copy's HBM read bytes (to within :data:`QUEUE_EXTRA_BYTES` per DMA queue, the
+completion write each queue adds). A burst is the packets of one queue family (a queue name
+less its ``-E<engine>`` suffix) with gaps of at most :data:`BURST_GAP_NS`. ``matches``
+counts the bursts that fit, so an ambiguous match is visible.
 """
 
 from __future__ import annotations
@@ -51,14 +59,22 @@ CORE_BARRIER = "PSEUDO_CORE_BARRIER"
 VENDORED = "/vendored_kernels/"
 #: Names of the segments before the first and after the last barrier.
 PREAMBLE, EPILOGUE = "preamble", "epilogue"
+#: Packets of one queue family at most this far apart (ns) belong to one DMA burst. In the
+#: C = 2048 profiles the packets of one copy are at most 0.15 us apart, and the next
+#: transfer on the same family starts at least 2.4 us after the copy's last packet.
+BURST_GAP_NS = 1000
+#: Bytes a DMA queue may add to a copy's payload: its completion write (4 bytes a queue in
+#: the C = 2048 profiles: a 2 MiB copy over 16 queues moved 131076 bytes a queue).
+QUEUE_EXTRA_BYTES = 16
 
 
 def session_dir(explorer_data: str, display_name: str) -> str:
-    """The ingested session of ``display_name`` that holds executions (logical core 0)."""
+    """The one ingested session of ``display_name`` that holds executions (logical core
+    0); a second one is a stale ingest of the same name, refused."""
     pattern = f"{explorer_data}/profiles/global/{display_name}_*_session_*@latest"
     found = sorted(glob.glob(pattern))
-    if not found:
-        raise FileNotFoundError(f"no ingested session matches {pattern}")
+    if len(found) != 1:
+        raise FileNotFoundError(f"{len(found)} ingested sessions match {pattern}, not 1")
     return found[0]
 
 
@@ -104,6 +120,33 @@ def _group(bir_name: str) -> str:
     return "-".join(parts[:2]) if len(parts) >= 2 and parts[0] == "I" else bir_name
 
 
+def _bursts(packets: list[tuple[int, str, int, int, int]]) -> list[dict]:
+    """``(start, queue, end, bytes, _)`` packets in start order -> bursts (module docstring)."""
+    bursts, open_burst = [], {}
+    for start, queue, end, size, _core in packets:
+        family = queue.rsplit("-E", 1)[0]
+        burst = open_burst.get(family)
+        if burst is None or start - burst["end"] > BURST_GAP_NS:
+            burst = open_burst[family] = {"start": start, "end": end, "bytes": 0,
+                                          "queues": set()}
+            bursts.append(burst)
+        burst["end"] = max(burst["end"], end)
+        burst["bytes"] += size
+        burst["queues"].add(queue)
+    return bursts
+
+
+def copy_transfer(packets: list[tuple[int, str, int, int, int]], issued: int,
+                  size: int) -> tuple[int | None, int]:
+    """``(ns from the issue to the transfer's last packet, bursts that fit)`` of a copy
+    issued at ``issued`` that reads ``size`` HBM bytes; ``packets`` are its core's, in start
+    order (module docstring)."""
+    after = packets[bisect.bisect_left(packets, (issued,)):]
+    fits = [b for b in _bursts(after)
+            if size <= b["bytes"] <= size + QUEUE_EXTRA_BYTES * len(b["queues"])]
+    return (fits[0]["end"] - issued if fits else None), len(fits)
+
+
 def analyse_session(path: str) -> dict:
     """Segments, op times and compiler-op instructions of every execution in ``path``."""
     import duckdb
@@ -121,6 +164,12 @@ def analyse_session(path: str) -> dict:
             f"bir_instruction_name, nki_source_location, hbm_read_bytes, hbm_write_bytes "
             f"FROM {table} WHERE start_ts >= {begin} AND end_ts <= {end} "
             f"ORDER BY start_ts").fetchall()
+        packets: dict[int, list] = {}
+        for packet in con.sql(
+                f"SELECT start_ts, queue_name, end_ts, transfer_bytes, pcore_idx "
+                f"FROM '{path}/DmaPacket.parquet' WHERE start_ts >= {begin} AND "
+                f"start_ts <= {end} ORDER BY start_ts").fetchall():
+            packets.setdefault(packet[4], []).append(packet)
         barriers: dict[str, int] = {}
         for r in mine:
             if r[6] == CORE_BARRIER:
@@ -134,7 +183,7 @@ def analyse_session(path: str) -> dict:
                      "length_us": (cuts[i + 1] - cuts[i]) / 1000.0, "ops": {}}
                     for i in range(len(cuts) - 1)]
         compiler: dict[str, dict] = {}
-        for start, _end, duration, _core, engine, opcode, cop, bir, nki, hbm_in, hbm_out in mine:
+        for start, _end, duration, core, engine, opcode, cop, bir, nki, hbm_in, hbm_out in mine:
             if cop == CORE_BARRIER:
                 continue
             if nki:
@@ -143,7 +192,8 @@ def analyse_session(path: str) -> dict:
                 op = f"compiler {_group(bir)}"
                 entry = compiler.setdefault(op, {"opcodes": {}, "instructions": 0,
                                                  "instruction_us": 0.0, "hbm_read_bytes": 0,
-                                                 "hbm_write_bytes": 0, "first_us": None})
+                                                 "hbm_write_bytes": 0, "first_us": None,
+                                                 "copies": []})
                 entry["opcodes"][f"{engine}:{opcode}"] = entry["opcodes"].get(
                     f"{engine}:{opcode}", 0) + 1
                 entry["instructions"] += 1
@@ -152,6 +202,12 @@ def analyse_session(path: str) -> dict:
                 entry["hbm_write_bytes"] += hbm_out or 0
                 if entry["first_us"] is None:
                     entry["first_us"] = (start - begin) / 1000.0
+                if opcode and opcode.startswith("DMA") and hbm_in:
+                    took, matches = copy_transfer(packets.get(core, []), start, hbm_in)
+                    entry["copies"].append({
+                        "instruction": bir, "core": core, "issued_us": (start - begin) / 1000.0,
+                        "hbm_read_bytes": hbm_in, "matches": matches,
+                        "transfer_us": None if took is None else took / 1000.0})
             else:
                 continue
             at = bisect.bisect_right(cuts, start) - 1
