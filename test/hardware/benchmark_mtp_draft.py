@@ -250,8 +250,10 @@ def build_head(cfg, seed: int, device, eh_proj_world: int = 1, eh_proj_rank: int
         rows = eh_proj_shard_rows(hidden, eh_proj_world)  # refuses a world that does not divide H
         if not 0 <= eh_proj_rank < eh_proj_world:
             raise ValueError(f"eh_proj_rank {eh_proj_rank} outside world {eh_proj_world}")
-        shard = tables["eh_proj_weight"][eh_proj_rank * rows:(eh_proj_rank + 1) * rows].contiguous()
-        head.eh_proj_weight = torch.nn.Parameter(shard.clone(), requires_grad=False)
+        # Sliced on the host: an eager slice + clone of a device-resident tensor failed in the
+        # runtime's tensor copy (nrt_tensor_copy status=2) on the first device run.
+        shard = tables["eh_proj_weight"].to("cpu")[eh_proj_rank * rows:(eh_proj_rank + 1) * rows].contiguous()
+        head.eh_proj_weight = torch.nn.Parameter(shard.to(device), requires_grad=False)
         head.world_size = int(eh_proj_world)
         head._tp_group = lambda: _LayerInputGatherEmulation(eh_proj_world, hidden)
     block = head.block
