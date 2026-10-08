@@ -5325,64 +5325,98 @@ class Glm5NextDSAIndexer(nn.Module):
         indices_wanted: bool = True,
         projected: tuple | None = None,
     ) -> torch.Tensor | None:
-        """:meth:`forward`'s decode leg for ``B`` requests, one token each, in one pass.
+        """:meth:`forward`'s decode leg for ``B`` requests, ``T`` tokens each, in one pass.
 
-        Request ``b`` is row ``b`` of ``hidden_states`` and ``q_latent`` and entry
-        ``b`` of ``seq_lens`` and ``position``. Returns ``[B, width]`` token indices,
-        the same rows :meth:`forward` returns one request at a time, or None (or the
-        causal fill) when ``max_seq_len`` does not select. The kernels serve every
-        request in one launch per stage, each on its own ring and pooled store, so no
-        request can read another's rows.
+        Request ``b``'s token ``t`` is row ``b * T + t`` of ``hidden_states``,
+        ``q_latent`` and ``seq_lens`` (request-major) and sits at position
+        ``position[b] + t`` with causal length ``seq_lens[b * T + t] = position[b] + t
+        + 1``; ``position`` is ``[B]``, row 0's position per request. ``T`` is read
+        off the shapes: the rows over the requests (the bank form's ``slots``, or the
+        carrier's views). ``T = 1`` is the one-token decode step; ``T = 1 + k`` is a
+        speculative verify step. Returns
+        ``[B * T, width]`` token indices, row ``b * T + t`` what :meth:`forward` returns
+        for request ``b`` at position ``position[b] + t``, or None (or the causal fill)
+        when ``max_seq_len`` does not select. The kernels serve every request in one
+        launch per stage, each on its own ring and pooled store, so no request can read
+        another's rows.
 
         The stores arrive in one of two forms:
 
         * whole banks and a slot per request: ``pool_bank`` ``[slots, rows,
-          index_head_dim]``, ``tail_bank`` ``[slots, 2, index_kpool,
-          index_head_dim]``, ``slots`` ``[B]`` int, distinct. Written in place on the
-          banks.
+          index_head_dim]``, ``tail_bank`` ``[slots, 2, depth, index_head_dim]``,
+          ``slots`` ``[B]`` int, distinct. Written in place on the banks.
         * the runner's carrier: ``pool_bank`` and ``tail_bank`` are tuples of one view
-          per request (``[rows, index_head_dim]`` and ``[2, index_kpool,
-          index_head_dim]``, disjoint, which the runner guarantees, padding rows
-          included) and ``slots`` is None. The kernels read a bank, so ``B > 1`` views
-          are stacked (one read of each store) and ``B = 1`` is its view with a leading
-          axis (no copy); the writes land in each view, the forms the one-request leg
-          writes with.
+          per request (``[rows, index_head_dim]`` and ``[2, depth, index_head_dim]``,
+          disjoint, which the runner guarantees, padding rows included) and ``slots``
+          is None. The kernels read a bank, so ``B > 1`` views are stacked (one read of
+          each store) and ``B = 1`` is its view with a leading axis (no copy); the
+          writes land in each view, the forms the one-request leg writes with.
+
+        ``depth`` is the ring's rows: ``index_kpool`` for a config that decodes one
+        token per step, and ``decode_tail_update.ring_depth_for(index_kpool, 1 + k)``
+        for one that verifies ``1 + k``. A step may hand a ring at most
+        ``max_rows_for(depth, index_kpool)`` tokens: with more, a rejected token's stash
+        would overwrite a ring row the next step's pools still need, so the step is
+        refused by name. The deeper ring changes nothing else: ring row ``p % depth``
+        holds position ``p`` and a pool's members are the ``index_kpool`` positions
+        before and including the one that closes it.
 
         ``rows > max_seq_len // index_kpool`` either way: the last row of a store is
-        its write trash. ``position`` must be ``seq_lens - 1``: the bound reads the
-        length and this step's stand-in pool reads the position. Both rules, and
-        distinct bank slots, are checked where the values are readable (eager); in a
-        traced step they are the runner's, which builds both from one start.
+        its write trash, where every row that closes no pool writes. ``seq_lens[b * T
+        + t]`` must be ``position[b] + t + 1``: the bound reads each row's length and
+        the stand-in pools read the positions. Both rules, and distinct bank slots, are
+        checked where the values are readable (eager); in a traced step they are the
+        runner's, which builds both from one start.
 
-        The score kernel takes this step's completed pool from the ring step's output
-        rather than from the store, so the selection does not depend on when the
-        store write lands.
+        Every row's completed pool comes to the score kernel from the ring step's output
+        rather than from the store -- including the pools this step's earlier rows
+        close, which no write has landed for -- so the selection does not depend on
+        when the store write lands. The one-token step at the served depth keeps
+        :mod:`decode_batch`'s kernels; every other form runs the ``T``-row kernels.
         """
         from vllm_neuron.functional.dsa.decode_batch import (
             decode_pool_destinations,
             dsa_decode_ring_step,
             dsa_decode_scores,
         )
+        from vllm_neuron.functional.dsa.decode_tail_update import (
+            dsa_decode_ring_rows,
+            max_rows_for,
+        )
+        from vllm_neuron.functional.dsa.decode_trow import dsa_decode_scores_rows
         from vllm_neuron.functional.state_banks import shared_store_problem
         from vllm_neuron.utils.neuron_utils import values_are_readable
 
         self.require_dials()
         pool, dim = self.index_kpool, self.index_head_dim
-        batch = int(hidden_states.shape[0])
+        total = int(hidden_states.shape[0])
         views = isinstance(pool_bank, (tuple, list))
         if views:
             pool_views, tail_views = tuple(pool_bank), tuple(tail_bank)
-            if slots is not None or len(pool_views) != batch or len(tail_views) != batch:
+            batch = len(pool_views)
+            if slots is not None or batch < 1 or len(tail_views) != batch:
                 raise Glm5NextDSAIndexerError(
                     f"the carrier form takes one pooled store and one ring per request "
                     f"and no slots; got {len(pool_views)} store(s), {len(tail_views)} "
-                    f"ring(s) and slots={slots!r} for {batch} row(s)"
+                    f"ring(s) and slots={slots!r} for {total} row(s)"
                 )
             pool_bank = (pool_views[0].unsqueeze(0) if batch == 1
                          else torch.stack(pool_views))
             tail_bank = (tail_views[0].unsqueeze(0) if batch == 1
                          else torch.stack(tail_views))
             slots = torch.arange(batch, dtype=torch.int32, device=pool_bank.device)
+        else:
+            if not torch.is_tensor(slots) or slots.ndim != 1 or int(slots.shape[0]) < 1:
+                raise Glm5NextDSAIndexerError(
+                    f"slots must be a [B] tensor, one slot per request; got {slots!r}"
+                )
+            batch = int(slots.shape[0])
+        if total < batch or total % batch:
+            raise Glm5NextDSAIndexerError(
+                f"hidden_states must hold a whole number of rows per request: {total} "
+                f"row(s) do not split over {batch} request(s)"
+            )
+        rows = total // batch
         if pool_bank.ndim != 3 or int(pool_bank.shape[2]) != dim:
             raise Glm5NextDSAIndexerError(
                 f"pool_bank must be [slots, rows, {dim}]; got {tuple(pool_bank.shape)}"
@@ -5392,24 +5426,49 @@ class Glm5NextDSAIndexer(nn.Module):
         candidates, _trash, selects = self._require_serviceable(
             int(max_seq_len), 1, pool_bank[0]
         )
-        want_tail = (int(pool_bank.shape[0]), 2, pool, dim)
-        if tuple(tail_bank.shape) != want_tail:
+        if (
+            tail_bank.ndim != 4
+            or tuple(tail_bank.shape[:2]) != (int(pool_bank.shape[0]), 2)
+            or int(tail_bank.shape[3]) != dim
+            or int(tail_bank.shape[2]) < pool
+            or int(tail_bank.shape[2]) % pool
+            or int(tail_bank.shape[2]) & (int(tail_bank.shape[2]) - 1)
+        ):
             raise Glm5NextDSAIndexerError(
-                f"tail_bank must be [slots, 2, index_kpool, index_head_dim] = "
-                f"{want_tail}, one ring per pool_bank slot; got {tuple(tail_bank.shape)}"
+                f"tail_bank must be [slots, 2, depth, index_head_dim] = "
+                f"[{int(pool_bank.shape[0])}, 2, depth, {dim}], one ring per pool_bank "
+                f"slot with depth a power-of-two multiple of index_kpool {pool}; got "
+                f"{tuple(tail_bank.shape)}"
             )
-        for name, value in (("slots", slots), ("seq_lens", seq_lens), ("position", position)):
-            if not torch.is_tensor(value) or tuple(value.shape) != (batch,):
-                raise Glm5NextDSAIndexerError(
-                    f"{name} must be a [{batch}] tensor, one entry per request; got "
-                    f"{value!r}"
-                )
+        depth = int(tail_bank.shape[2])
+        if rows > max_rows_for(depth, pool):
+            raise Glm5NextDSAIndexerError(
+                f"{rows} rows per request exceed the {max_rows_for(depth, pool)} a ring "
+                f"of depth {depth} takes back on rollback (depth - index_kpool + 2): a "
+                f"rejected row's stash would overwrite a token the next step's pools "
+                f"still need; allocate the ring at ring_depth_for(index_kpool, rows)"
+            )
+        if not torch.is_tensor(position) or tuple(position.shape) != (batch,):
+            raise Glm5NextDSAIndexerError(
+                f"position must be a [{batch}] tensor, row 0's position per request; "
+                f"got {position!r}"
+            )
+        if not torch.is_tensor(seq_lens) or tuple(seq_lens.shape) != (total,):
+            raise Glm5NextDSAIndexerError(
+                f"seq_lens must be a [{total}] tensor, one causal length per row "
+                f"({batch} request(s) x {rows} row(s), request-major); got {seq_lens!r}"
+            )
+        # Row b * rows + t sits at position[b] + t. O(B * T) index bookkeeping, no
+        # kernel.
+        offsets = torch.arange(rows, device=position.device, dtype=torch.int64)
+        row_positions = (position.to(torch.int64)[:, None] + offsets[None, :]).reshape(-1)
         if values_are_readable(position) and values_are_readable(seq_lens):
-            if not torch.equal(position.to(torch.int64), seq_lens.to(torch.int64) - 1):
+            if not torch.equal(row_positions + 1, seq_lens.to(torch.int64)):
                 raise Glm5NextDSAIndexerError(
-                    f"position must be seq_lens - 1 for a decode step of one token per "
-                    f"request; got position {position.tolist()} and seq_lens "
-                    f"{seq_lens.tolist()}"
+                    f"seq_lens[b * rows + t] must be position[b] + t + 1 (position must "
+                    f"be seq_lens - 1 at one token per request); got position "
+                    f"{position.tolist()} and seq_lens {seq_lens.tolist()} at {rows} "
+                    f"row(s) per request"
                 )
         if not views and values_are_readable(slots):
             # Distinct stores, except the scratch store (the last slot, which no
@@ -5431,28 +5490,43 @@ class Glm5NextDSAIndexer(nn.Module):
             )
         query, key, weights, gate_score = projected
 
-        pooled, rings = dsa_decode_ring_step(
-            tail_bank, slots, key, gate_score, ape.to(torch.float32), position
-        )
+        one_token = rows == 1 and depth == pool
+        if one_token:
+            pooled, rings = dsa_decode_ring_step(
+                tail_bank, slots, key, gate_score, ape.to(torch.float32), position
+            )
+        else:
+            pooled, rings = dsa_decode_ring_rows(
+                tail_bank, slots, key, gate_score, ape.to(torch.float32), position
+            )
         slot_index, row = decode_pool_destinations(
-            slots, position, rows=int(pool_bank.shape[1]), pool_size=pool
+            slots.repeat_interleave(rows), row_positions, rows=int(pool_bank.shape[1]),
+            pool_size=pool,
         )
         bounded = None
         if selects:
-            bounded = dsa_decode_scores(
-                query, weights, pool_bank, slots, seq_lens, position, pooled,
-                candidates=candidates, pool_size=pool,
-            )
-        # The writes after the read: the kernel stands this step's pool in itself,
-        # and the store rows it reads are the pools before this step.
+            if one_token:
+                bounded = dsa_decode_scores(
+                    query, weights, pool_bank, slots, seq_lens, position, pooled,
+                    candidates=candidates, pool_size=pool,
+                )
+            else:
+                bounded = dsa_decode_scores_rows(
+                    query, weights, pool_bank, slots, position, pooled,
+                    candidates=candidates, pool_size=pool,
+                )
+        # The writes after the read: the kernel stands every pool this step closes in
+        # itself, and the store rows it reads are the pools before this step. A row
+        # that closes no pool writes the slot's trash row (several rows may).
         if views:
             for b in range(batch):
                 tail_views[b].copy_(rings[b].to(tail_views[b].dtype))
                 pool_views[b].index_copy_(
-                    0, row[b:b + 1], pooled[b:b + 1].to(pool_views[b].dtype)
+                    0, row[b * rows:(b + 1) * rows],
+                    pooled[b * rows:(b + 1) * rows].to(pool_views[b].dtype),
                 )
         else:
-            tail_bank.index_copy_(0, slot_index, rings.to(tail_bank.dtype))
+            tail_bank.index_copy_(0, slot_index[::rows], rings.to(tail_bank.dtype))
             pool_bank.index_put_((slot_index, row), pooled.to(pool_bank.dtype))
         if bounded is None:
             if not indices_wanted:
@@ -5642,12 +5716,14 @@ class IndexShare:
       pooled-store write, no scores.
 
     ``topk_indices`` is what :meth:`Glm5NextDSAIndexer.forward_requests` returns for
-    a selecting step: ``[B, width]`` int32 row indices into the request's latent
-    window (``-1`` = masked), one row per request, on the step's device. A step
-    whose selection is a no-op (the bypass regime,
-    ``decode_bypass.selection_is_a_no_op``) returns ``None`` and stores nothing, so
-    every iteration of such a step runs the write stage and the carrier changes
-    nothing there.
+    a selecting step: ``[B * T, width]`` int32 row indices into the request's latent
+    window (``-1`` = masked), one row per query row (``T`` per request,
+    request-major), on the step's device. An iteration that reuses it must present
+    the same ``B * T`` rows; one with another row count is refused by name, because
+    row ``b * T + t`` is one position's selection. A step whose selection is a no-op
+    (the bypass regime, ``decode_bypass.selection_is_a_no_op``) returns ``None`` and
+    stores nothing, so every iteration of such a step runs the write stage and the
+    carrier changes nothing there.
     """
 
     topk_indices: torch.Tensor | None = None
@@ -6666,17 +6742,20 @@ class Glm5NextMLAAttention(nn.Module):
         page_size: int,
         dense: bool,
     ) -> torch.Tensor:
-        """:meth:`attend` for a decode step of ``batch`` requests, one token each.
+        """:meth:`attend` for a decode step of ``batch`` requests, ``T`` tokens each.
 
-        Request ``b`` is row ``b`` of ``hidden_states``, column ``b`` of
-        ``block_table_row`` (``[pages, batch]``, ``-1`` past its pages), entry ``b``
-        of ``latent_slots`` and of ``start_position`` (``[batch]``), and row ``b``
-        of ``topk_indices`` -- window rows of its own window -- unless ``dense``.
-        The projections, the cache write, both absorbs and the output projection are
-        the one-request chain on ``batch`` rows. The attention is
+        Request ``b``'s token ``t`` is row ``b * T + t`` of ``hidden_states``,
+        ``latent_slots`` (``[batch * T]``) and ``topk_indices`` -- window rows of its
+        own window -- unless ``dense``; the request is column ``b`` of
+        ``block_table_row`` (``[pages, batch]``, ``-1`` past its pages) and entry
+        ``b`` of ``start_position`` (``[batch]``, row 0's position), so its row ``t``
+        sits at window row ``start_position[b] + t``. ``T`` is the rows over
+        ``batch``. The projections, the cache write, both absorbs and the output
+        projection are the one-request chain on ``batch * T`` rows. The attention is
         ``mla_decode_attention``, which reads each request's window through its own
-        table column and stands each request's ``written`` row in at its position,
-        so the result does not depend on when the cache write lands.
+        table column and stands this step's ``written`` rows in at their positions
+        (row ``t`` sees rows ``0 .. t`` of its request), so the result does not
+        depend on when the cache write lands.
         """
         from vllm_neuron.functional.attention.mla_absorb import mla_absorb
         from vllm_neuron.functional.attention.mla_decode import mla_decode_attention
@@ -6687,12 +6766,18 @@ class Glm5NextMLAAttention(nn.Module):
                 f"each; a prefill chunk (prefill_end_position) and an active query "
                 f"prefix (active_mla_query_rows) belong to one request's prefill"
             )
-        if tuple(hidden_states.shape) != (batch, self.hidden_size):
+        if (
+            hidden_states.ndim != 2
+            or int(hidden_states.shape[1]) != self.hidden_size
+            or int(hidden_states.shape[0]) < batch
+            or int(hidden_states.shape[0]) % batch
+        ):
             raise Glm5NextMLADecodeError(
-                f"hidden_states must be [batch_size, {self.hidden_size}] = "
-                f"[{batch}, {self.hidden_size}], one decode row per request; got "
+                f"hidden_states must be [batch_size * rows, {self.hidden_size}], a whole "
+                f"number of rows per request over batch_size={batch}; got "
                 f"{tuple(hidden_states.shape)}"
             )
+        total = int(hidden_states.shape[0])
         want_cache = (self.NUM_LATENT_KV_HEADS, self.head_size)
         if latent_cache.ndim != 3 or tuple(latent_cache.shape[1:]) != want_cache:
             raise Glm5NextMLADecodeError(
@@ -6714,10 +6799,10 @@ class Glm5NextMLAAttention(nn.Module):
                 f"block_table_row must be [pages, batch_size={batch}], one column per "
                 f"request; got {tuple(block_table_row.shape)}"
             )
-        if tuple(latent_slots.shape) != (batch,):
+        if tuple(latent_slots.shape) != (total,):
             raise Glm5NextMLADecodeError(
-                f"latent_slots must carry one physical bank row per request, "
-                f"[{batch}]; got {tuple(latent_slots.shape)}"
+                f"latent_slots must carry one physical bank row per row of the step, "
+                f"[{total}]; got {tuple(latent_slots.shape)}"
             )
         if not torch.is_tensor(start_position) or tuple(start_position.shape) != (batch,):
             raise Glm5NextMLADecodeError(
@@ -6727,11 +6812,11 @@ class Glm5NextMLAAttention(nn.Module):
         if not dense and (
             topk_indices is None
             or topk_indices.ndim != 2
-            or int(topk_indices.shape[0]) != batch
+            or int(topk_indices.shape[0]) != total
         ):
             raise Glm5NextMLADecodeError(
-                f"a selecting decode step of batch_size={batch} needs "
-                f"[{batch}, width] topk_indices; got "
+                f"a selecting decode step of batch_size={batch} x {total // batch} "
+                f"row(s) needs [{total}, width] topk_indices, one row per query row; got "
                 f"{None if topk_indices is None else tuple(topk_indices.shape)}"
             )
 
@@ -6787,19 +6872,27 @@ class Glm5NextMLAAttention(nn.Module):
         state_slots: torch.Tensor | None = None,
         index_share: IndexShare | None = None,
     ) -> torch.Tensor:
-        """:meth:`forward` for a decode step of ``len(tail)`` requests, one row each.
+        """:meth:`forward` for a decode step of ``B`` requests, ``T`` rows each.
 
-        ``tail`` and ``pool_cache`` are one bank view per request and ``seq_lens``,
-        ``start_position`` and ``position`` are ``[batch]``. With ``state_slots``
-        (``[B]`` int) they are instead the layer's whole ring and pooled-store banks,
-        row ``b`` of the step being the request at ``state_slots[b]``, and the indexer
-        writes them back in place on the banks. The query latent and the
-        indexer's four projections run once on all rows. The indexer's write stage
-        and selection run in one :meth:`Glm5NextDSAIndexer.forward_requests` pass,
-        each request on its own ring and pooled store. :meth:`attend` then serves
-        every request in one batched call. A one-request decode step is the
-        ``batch = 1`` case of this method (see :meth:`forward`); there :meth:`attend`
-        serves ``batch_size`` 1 with its one-request attention.
+        ``normed_hidden_states`` is ``[B * T, hidden]``, request-major: request ``b``'s
+        row ``t`` is row ``b * T + t`` and sits at position ``position[b] + t``.
+        ``T = 1`` is the one-token decode step and ``T = 1 + k`` a speculative verify
+        step; ``T`` is the rows over the requests. ``tail`` and ``pool_cache`` are
+        one bank view per request, ``start_position`` and ``position`` are ``[B]``
+        (row 0's position per request, the same tensor) and ``seq_lens`` is ``[B *
+        T]``, row ``b * T + t`` the causal length ``position[b] + t + 1``. With
+        ``state_slots`` (``[B]`` int) they are
+        instead the layer's whole ring and pooled-store banks, request ``b`` of the
+        step being the one at ``state_slots[b]``, and the indexer writes them back in
+        place on the banks. ``latent_slots`` is ``[B * T]``, one bank row per row of
+        the step. The query latent and the indexer's four projections run once on
+        all rows. The indexer's write stage and selection run in one
+        :meth:`Glm5NextDSAIndexer.forward_requests` pass, each request on its own
+        ring and pooled store, each row at its own causal length. :meth:`attend` then
+        serves every row in one batched call (rows ``> 1`` go to
+        :meth:`_attend_requests` directly, whatever ``B``). A one-request decode step
+        is the ``B = 1, T = 1`` case of this method (see :meth:`forward`); there
+        :meth:`attend` serves ``batch_size`` 1 with its one-request attention.
 
         ``index_share`` is the draft head's :class:`IndexShare` carrier for
         ``index_share_for_mtp_iteration`` (config.py; upstream's ``skip_topk``).
@@ -6823,14 +6916,14 @@ class Glm5NextMLAAttention(nn.Module):
             selection_is_a_no_op,
         )
 
+        total = int(normed_hidden_states.shape[0])
         if state_slots is None:
             batch = len(tail)
             pools = tuple(pool_cache) if isinstance(pool_cache, (tuple, list)) else ()
-            if len(pools) != batch or int(normed_hidden_states.shape[0]) != batch:
+            if len(pools) != batch or batch < 1:
                 raise Glm5NextMLADecodeError(
                     f"a decode step of {batch} request ring(s) needs one pooled store "
-                    f"per request and one row per request; got {len(pools)} store(s) "
-                    f"and {int(normed_hidden_states.shape[0])} row(s)"
+                    f"per request; got {len(pools)} store(s)"
                 )
             stores, rings = pools, tuple(tail)
         else:
@@ -6838,21 +6931,31 @@ class Glm5NextMLAAttention(nn.Module):
             if (
                 isinstance(pool_cache, (tuple, list))
                 or isinstance(tail, (tuple, list))
-                or int(normed_hidden_states.shape[0]) != batch
+                or batch < 1
             ):
                 raise Glm5NextMLADecodeError(
                     f"the bank form takes the whole pooled-store and ring banks beside "
-                    f"{batch} slot(s) and one row per slot; got pool_cache "
-                    f"{type(pool_cache).__name__}, tail {type(tail).__name__} and "
-                    f"{int(normed_hidden_states.shape[0])} row(s)"
+                    f"{batch} slot(s); got pool_cache {type(pool_cache).__name__} and "
+                    f"tail {type(tail).__name__}"
                 )
             stores, rings = pool_cache, tail
-        for name, value in (("seq_lens", seq_lens), ("position", position)):
-            if not torch.is_tensor(value) or tuple(value.shape) != (batch,):
+        if total < batch or total % batch:
+            raise Glm5NextMLADecodeError(
+                f"a decode step of {batch} request(s) takes a whole number of rows per "
+                f"request; got {total} row(s)"
+            )
+        rows = total // batch
+        for name, value in (("latent_slots", latent_slots), ("seq_lens", seq_lens)):
+            if not torch.is_tensor(value) or tuple(value.shape) != (total,):
                 raise Glm5NextMLADecodeError(
-                    f"{name} must be a [{batch}] tensor, one entry per request; got "
-                    f"{value!r}"
+                    f"{name} must be a [{total}] tensor, one entry per row of the step "
+                    f"({batch} request(s) x {rows} row(s)); got {value!r}"
                 )
+        if not torch.is_tensor(position) or tuple(position.shape) != (batch,):
+            raise Glm5NextMLADecodeError(
+                f"position must be a [{batch}] tensor, row 0's position per request; "
+                f"got {position!r}"
+            )
         bound = selection_bound(
             int(max_seq_len), int(block_table_row.shape[0]) * int(page_size)
         )
@@ -6862,7 +6965,16 @@ class Glm5NextMLAAttention(nn.Module):
         shared = None if index_share is None else index_share.topk_indices
         if shared is not None:
             # A later draft iteration of the same speculative step: the selection is
-            # the first iteration's, and the indexer chain is skipped whole.
+            # the first iteration's, and the indexer chain is skipped whole. It is one
+            # row per query row, so the iteration must present the rows it was made
+            # for.
+            if shared.ndim != 2 or int(shared.shape[0]) != total:
+                raise Glm5NextMLADecodeError(
+                    f"index_share holds a [{None if shared.ndim != 2 else int(shared.shape[0])}"
+                    f", width] selection, one row per query row of the step that "
+                    f"published it; this step has {total} row(s) ({batch} request(s) x "
+                    f"{rows}), so it cannot reuse that selection"
+                )
             topk_indices = shared
         else:
             q_latent = self.project_query_latent(normed_hidden_states)
@@ -6890,6 +7002,24 @@ class Glm5NextMLAAttention(nn.Module):
         if collector is not None:
             collector.append(
                 (self.indexer._bypass_indices(seq_lens) if dense else topk_indices)[:5]
+            )
+        if rows > 1:
+            # Several rows per request: the batched attention whatever the batch (at
+            # batch_size 1 :meth:`attend` would read the rows as a prefill chunk).
+            return self._attend_requests(
+                normed_hidden_states,
+                latent_cache,
+                start_position,
+                topk_indices,
+                float(softmax_scale),
+                batch,
+                prefill_end_position=None,
+                collector=collector,
+                active_mla_query_rows=None,
+                block_table_row=block_table_row,
+                latent_slots=latent_slots,
+                page_size=int(page_size),
+                dense=dense,
             )
         return self.attend(
             normed_hidden_states,

@@ -698,6 +698,27 @@ def max_rows_for(depth: int, pool_size: int) -> int:
     return int(depth) - int(pool_size) + 2
 
 
+def _ring_member(ring, half, member, pool_size, depth, group_masks):
+    """Pool member ``member``'s key (``half`` 0) or gate score (``half`` 1) off the ring,
+    in fp32: ring row ``member + pool_size * g`` with ``g`` the pool's index within the
+    ring, which ``group_masks[g]`` marks per partition (one group: a plain copy)."""
+    h, width = ring.shape
+    head_dim = width // (TAIL_HALVES * depth)
+    src = _sb((h, head_dim), nl.float32)
+    base = half * depth + member
+    if len(group_masks) == 0:
+        row0 = base * head_dim
+        nisa.tensor_copy(dst=src, src=ring[:, row0:row0 + head_dim])
+        return src
+    picked = _sb((h, head_dim), ring.dtype)
+    for g, mask in enumerate(group_masks):
+        row0 = (base + g * pool_size) * head_dim
+        nisa.tensor_copy_predicated(dst=picked, src=ring[:, row0:row0 + head_dim],
+                                    predicate=mask)
+    nisa.tensor_copy(dst=src, src=picked)
+    return src
+
+
 @nki.jit
 def dsa_decode_ring_rows_kernel(tail_hbm, slots_hbm, key_hbm, score_hbm, ape_hbm, pos_hbm,
                                 pool_size, rows, source_digest):
@@ -799,33 +820,16 @@ def dsa_decode_ring_rows_kernel(tail_hbm, slots_hbm, key_hbm, score_hbm, ape_hbm
                     nisa.tensor_scalar(dst=mask, data=ones, op0=nl.multiply, operand0=hit)
                     group_masks.append(mask)
 
-            def member_source(member, half):
-                """Member ``member``'s fp32 key (half 0) or score (half 1) for row ``t``."""
-                own = t - last + member
-                if own >= 0:
-                    return (keys_f if half == 0 else scores_f)[own]
-                src = _sb((h, head_dim), nl.float32)
-                base = half * depth + member
-                if groups == 1:
-                    row0 = base * head_dim
-                    nisa.tensor_copy(dst=src, src=ring[:, row0:row0 + head_dim])
-                    return src
-                picked = _sb((h, head_dim), tail_hbm.dtype)
-                for g in range(groups):
-                    row0 = (base + g * pool_size) * head_dim
-                    nisa.tensor_copy_predicated(dst=picked, src=ring[:, row0:row0 + head_dim],
-                                                predicate=group_masks[g])
-                nisa.tensor_copy(dst=src, src=picked)
-                return src
-
             # ---- the pool this row would close: members 0 .. last-1 from the ring ------
             totals = []
             running_max = _sb((h, head_dim), nl.float32)
             for member in range(pool_size):
                 if member == last:
                     score_src = scores_f[t]
+                elif t - last + member >= 0:
+                    score_src = scores_f[t - last + member]
                 else:
-                    score_src = member_source(member, 1)
+                    score_src = _ring_member(ring, 1, member, pool_size, depth, group_masks)
                 bias = _sb((h, head_dim), nl.float32)
                 nisa.dma_copy(dst=bias, src=ape_hbm.ap(pattern=[[0, h], [1, head_dim]],
                                                        offset=member * head_dim))
@@ -850,8 +854,10 @@ def dsa_decode_ring_rows_kernel(tail_hbm, slots_hbm, key_hbm, score_hbm, ape_hbm
                 nisa.tensor_tensor(dst=denom, data1=denom, data2=weight, op=nl.add)
                 if member == last:
                     key_src = keys_f[t]
+                elif t - last + member >= 0:
+                    key_src = keys_f[t - last + member]
                 else:
-                    key_src = member_source(member, 0)
+                    key_src = _ring_member(ring, 0, member, pool_size, depth, group_masks)
                 weighted = _sb((h, head_dim), nl.float32)
                 nisa.tensor_tensor(dst=weighted, data1=weight, data2=key_src, op=nl.multiply)
                 nisa.tensor_tensor(dst=acc, data1=acc, data2=weighted, op=nl.add)
