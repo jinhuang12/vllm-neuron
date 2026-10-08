@@ -142,6 +142,9 @@ _SEAM_REGISTRY = {
     "dsa_decode_tail_update": (
         "vllm_neuron.functional.dsa.decode_tail_update",
         "decode_tail_dispatch_counters", "reset_decode_tail_dispatch_counters"),
+    "dsa_decode_trow": (
+        "vllm_neuron.functional.dsa.decode_trow",
+        "decode_trow_dispatch_counters", "reset_decode_trow_dispatch_counters"),
     "dsa_ragged_pack": (
         "vllm_neuron.functional.dsa.ragged_pack",
         "ragged_pack_dispatch_counters", "reset_ragged_pack_dispatch_counters"),
