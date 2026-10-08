@@ -36,8 +36,10 @@ if TYPE_CHECKING:
     # TODO: Remove VLLM_NEURON_SWITCH_CC and derive topology from instance type.
     VLLM_NEURON_SWITCH_CC: bool = False
     VLLM_NEURON_MIN_KV_BUDGET_GIB: float = 1.0
-    VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION: float = 0.30
-    VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB: float = 5.0
+    # Both KV budget knobs default to None, spelled "measured": the budget is the
+    # measured free device memory less the compiled graphs' need.
+    VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION: Optional[float] = None
+    VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB: Optional[float] = None
     VLLM_NEURON_WORKER_TERMINATION_TIMEOUT: int = 5
     VLLM_NEURON_MLP_FORCE_TKG: bool = False
     VLLM_NEURON_DISABLE_NKI_KERNELS: bool = False
@@ -146,19 +148,39 @@ def maybe_convert_float(value: str | None) -> float | None:
     return float(value)
 
 
-#: Device memory a compiled graph keeps on one physical NeuronCore, in GiB.
+#: The value that leaves a KV budget knob at its default: the measured budget.
+MEASURED = "measured"
+
+
+def maybe_measured_float(value: str | None) -> float | None:
+    """Return None for an unset, empty or ``"measured"`` value, else the float.
+
+    Raises:
+        ValueError: the value is neither ``"measured"`` nor a number.
+
+    Examples:
+        >>> maybe_measured_float(None), maybe_measured_float("Measured")
+        (None, None)
+        >>> maybe_measured_float("2.5")
+        2.5
+    """
+    if value is None or value.strip().lower() in ("", MEASURED):
+        return None
+    return float(value)
+
+
+#: Device memory assumed for the compiled graphs, in GiB per logical NeuronCore,
+#: when it cannot be read from the compile cache.
 #:
-#: A logical NeuronCore is two physical cores, and the Neuron runtime allocates
-#: and accounts memory on each physical core separately. A staged graph puts its
-#: shared scratchpad and most of its code on one of the pair, so the KV cache
-#: budget has to leave that much room on a single physical core rather than on
-#: the logical pair.
-#:
-#: The default is a measured figure rounded up for margin: on trn2, a
-#: GLM-5.3-Flash prefill graph at bucket 1024 held 4.567 GiB on the even
-#: physical core of every rank (3.875 GiB of shared scratchpad plus 705 MiB of
-#: graph) against 159.9 MiB on the odd one. Another model, another bucket or
-#: another compiler release moves it, which is what the override is for.
+#: The KV cache budget takes the graphs' need from the NEFFs the compile cache
+#: holds for the served configuration
+#: (:mod:`vllm_neuron.vllm.worker.neff_memory`). On a cold cache, where warmup
+#: has yet to compile some of those graphs, and for graphs the cache cannot tie
+#: to the configuration (a drafter's, a vision encoder's), this figure stands in.
+#: It is the September measurement rounded up: a GLM-5.3-Flash prefill graph at
+#: bucket 1024 held 4.567 GiB per rank (3.875 GiB of shared scratchpad plus 705
+#: MiB of graph). ``VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB`` overrides both the
+#: measured need and this figure.
 DEFAULT_DEVICE_GRAPH_RESERVE_GIB = 5.0
 
 
@@ -197,21 +219,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if os.getenv("VLLM_NEURON_MIN_KV_BUDGET_GIB") is not None
         else 1.0
     ),
-    # KV cap fraction applied to GMU-scaled total HBM budget.
-    # TODO: Interim global safety cap. Replace with a better compile-safe
-    # estimator that adapts across model families and hardware generations.
-    "VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION": lambda: (
-        maybe_convert_float(os.getenv("VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION"))
-        if os.getenv("VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION") is not None
-        else 0.30
+    # Optional cap on the KV cache budget, as a fraction in (0, 1] of the
+    # GMU-scaled total HBM. Unset or "measured" (the default): no cap, the budget
+    # is the measured free HBM less the compiled graphs' need.
+    "VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION": lambda: maybe_measured_float(
+        os.getenv("VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION")
     ),
-    # Graph reserve (GiB) held back on each physical NeuronCore when the KV
-    # cache budget is computed. See DEFAULT_DEVICE_GRAPH_RESERVE_GIB above for
-    # where the default comes from.
-    "VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB": lambda: (
-        maybe_convert_float(os.getenv("VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB"))
-        if os.getenv("VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB") is not None
-        else DEFAULT_DEVICE_GRAPH_RESERVE_GIB
+    # Optional override, in GiB per logical NeuronCore, of the device memory the
+    # compiled graphs need. Unset or "measured" (the default): read from the
+    # compile cache's NEFFs, or DEFAULT_DEVICE_GRAPH_RESERVE_GIB on a cold cache.
+    "VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB": lambda: maybe_measured_float(
+        os.getenv("VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB")
     ),
     # Local cache directory for model checkpoints
     "VLLM_NEURON_CHECKPOINT_CACHE": lambda: os.getenv(
