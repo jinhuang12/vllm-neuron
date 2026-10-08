@@ -14,8 +14,6 @@ receives three ints and not a tensor, and the parent and every worker see the sa
 
 from __future__ import annotations
 
-import os
-
 import torch
 
 #: At a candidate count at or below the production ``select_k`` the call is the bypass

@@ -33,7 +33,8 @@ def cost():
 def _published_rows() -> dict:
     """worker-3's published rows, TP = 64 colocated, bs = 1, chunk 1024, keyed by
     ``(context, prompt)``."""
-    rows = json.load(open(PUBLISHED_JSON))["rows"]
+    with open(PUBLISHED_JSON) as handle:
+        rows = json.load(handle)["rows"]
     return {(r["context"], r["prompt_tokens"]): r["ttft_ms"] for r in rows
             if r["config_id"] == "colocated-c16-tp64-cp1" and r["line"] == "bs1"
             and r["chunk"] == cost_model.CHUNK}
@@ -85,7 +86,8 @@ def test_the_all_gather_is_half_the_calibrated_all_reduce():
         import entitlement_formulas as ef
     finally:
         sys.path.remove(cost_model.PLANNER_DIR)
-    cal = json.load(open(cost_model.CAL_CONSTANTS))
+    with open(cost_model.CAL_CONSTANTS) as handle:
+        cal = json.load(handle)
     hw = ef.HW(**{k: v for k, v in cal.items() if not k.startswith("_")})
     for tp in (8, 16, 64):
         for nbytes in (1 << 21, 1 << 23):
@@ -150,6 +152,45 @@ def test_every_profiled_execution_divides_into_named_ops():
                 assert "compiler op (other)" not in times, (run, graph, times)
 
 
+def test_every_compiled_selection_graph_orders_every_overlapping_pair():
+    """trn2-1's pipeline-hazard check (report section 17). In every compiled graph, on both
+    cores: no unordered pair, no stepped DMA, every wait holds, and no device opened. Each
+    recompiled device graph is the NEFF that ran. The only instructions that write over
+    their own input, other than exact in-place ops, are the gathers of
+    ``OWN_DATA_GATHERS``; each writes at most one piece from the first byte of its data, and
+    only the as-built chain has the partial one. On the device no piece of those gathers
+    reads what another wrote, and none writes over its indices."""
+    data = cost_model.depcheck()
+    assert set(data["cpu_graphs"]) == set(cost_model.DEPCHECK_CPU_GRAPHS)
+    assert set(data["device_graphs"]) == set(cost_model.DEPCHECK_DEVICE_GRAPHS)
+    kernels = {(kernel, int(line.rsplit(":", 1)[1]))
+               for line, names in cost_model.OWN_DATA_GATHERS.items() for kernel in names}
+    for name, graph in {**data["cpu_graphs"], **data["device_graphs"]}.items():
+        assert graph["device_opens"] == 0, name
+        assert set(graph["cores"]) == set(cost_model.DEPCHECK_CORES), name
+        as_built = graph.get("mode", graph.get("graph")) == "replicated"
+        for core, row in graph["cores"].items():
+            found = (row["overlapping_pairs"] - row["ordered"], row["unsync"],
+                     row["queue_order_only"], row["stepped_partition_dmas"],
+                     row["waits_not_ok"])
+            assert found == (0, 0, 0, 0, 0), (name, core, row)
+            partial = [a for a in row["gather_aliases"] if not a["identical"]]
+            assert row["alias_partial"] == len(partial), (name, core, row)
+            assert as_built or not partial, (name, core, partial)
+            for alias in row["gather_aliases"]:
+                assert (alias["kernel"], alias["source_line"]) in kernels, (name, core, alias)
+                assert alias["dst_at_data_base"], (name, core, alias)
+                assert alias["write_bytes"] <= cost_model.GATHER_PIECE_BYTES, (name, core, alias)
+    for name, graph in data["device_graphs"].items():
+        assert graph["neff_bin_same"] > 0 and graph["neff_bin_diff"] == 0, name
+        assert graph["kernel_hashes_same"], name
+    assert set(data["gather_pieces_on_device"]) == set(cost_model.OWN_DATA_GATHERS)
+    for line, graphs in data["gather_pieces_on_device"].items():
+        assert graphs, line
+        for name, entry in graphs.items():
+            assert all(entry[key] == 0 for key in cost_model.GATHER_HAZARDS), (line, name, entry)
+
+
 def _leaf_paths(node, path=()):
     if isinstance(node, dict):
         for key, value in node.items():
@@ -171,4 +212,5 @@ def test_the_committed_report_json_is_what_the_model_computes():
     if not os.path.exists(REPORT_JSON):
         pytest.skip(f"{REPORT_JSON} is not written yet")
     fresh = json.loads(json.dumps(cost_model.report(), sort_keys=True, default=float))
-    assert json.load(open(REPORT_JSON)) == fresh
+    with open(REPORT_JSON) as handle:
+        assert json.load(handle) == fresh

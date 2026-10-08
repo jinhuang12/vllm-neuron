@@ -51,6 +51,13 @@ Three MEASURED sections come from the durable device records (``DEVICE_RECORDS_D
   two ranks of one chip (``nccom-test``, output verified), at the sizes up to the one the
   sharded selection gathers.
 
+``depcheck`` (MEASURED on the CPU, the device profile for the gathers) is trn2-1's
+pipeline-hazard check of every compiled selection graph: per core, the pairs of accesses
+with no order between them, the instructions that write their own input, and the stepped
+DMAs, from the compiler's ``lower_sync`` dump (``DEPCHECK_DIR``, its ``README.md``). For
+each gather that writes over its own data (``OWN_DATA_GATHERS``), the device profiles show
+how its pieces ran on each physical core.
+
 ``python -m test.vllm_neuron.functional.dsa.indexer_shard_cost --write PATH`` writes the
 report JSON; ``test_indexer_shard_cost.py`` pins the arithmetic.
 """
@@ -58,7 +65,6 @@ report JSON; ``test_indexer_shard_cost.py`` pins the arithmetic.
 from __future__ import annotations
 
 import argparse
-import glob
 import importlib.util
 import json
 import math
@@ -128,6 +134,51 @@ COMPILE_FAILURE_LOGS = {path: f"c65536_{path}_compile.log" for path in ("sharded
 #: The dtypes of the two-rank all-gather check, each in ``allgather_<dtype>.json`` (the
 #: command is in ``allgather_command.txt``).
 ALLGATHER_DTYPES = ("int32", "fp32")
+#: The pipeline-hazard check (``FROM_TRN2_1/2026-10-08T0550Z_nki_pipeline_hazard.md``,
+#: corrected at 0710Z): tools, outputs and ``README.md`` beside the device records.
+DEPCHECK_DIR = os.path.join(DEVICE_RECORDS_DIR, "depcheck")
+#: The hazard counts of ``depcheck/gather_pieces.py`` (its docstring): each must be 0.
+GATHER_HAZARDS = ("loads_reading_an_earlier_write", "dst_over_indices",
+                  "loads_in_flight_at_a_write")
+#: The served graphs compiled on the CPU (``depcheck/compile_graph.py``), by run name:
+#: ``(tokens, cands, causal bound, mode)``. ``replicated`` is the as-built chain, for
+#: what the tip has already.
+DEPCHECK_CPU_GRAPHS = {
+    **{f"g{t}_c{c}": (t, c, True, "sharded") for t in (1024, 2048) for c in (2048, 8192, 16384)},
+    **{f"g{t}_c65536nb": (t, 65536, False, "sharded") for t in (1024, 2048)},
+    "r1024_c2048": (1024, 2048, True, "replicated"),
+    "r1024_c16384": (1024, 16384, True, "replicated")}
+#: The device runs' graphs recompiled from their own ``graph.hlo`` with the dump flags
+#: (``depcheck/run_devgraph.sh``), by name: ``(device run, graph)``. The ``cut`` graph is
+#: one compile for every width. Of the as-built graphs only C = 2048 is here: the debug
+#: recompile of C = 16384 was stopped half way (``depcheck/README.md``).
+DEPCHECK_DEVICE_GRAPHS = {
+    **{f"{run}_sharded": (run, "sharded") for run in DEVICE_RUNS},
+    "cut": ("c2048", "cut"),
+    "c2048_replicated": ("c2048", "replicated")}
+#: The two physical cores of LNC 2, as the dumps name them.
+DEPCHECK_CORES = ("nc00", "nc01")
+#: The checker's pair line and wait line (``runs/<graph>.<core>.depcheck.txt``).
+DEPCHECK_PAIRS = re.compile(r"(\d+) overlapping pairs: (\d+) ordered by engine order \+ "
+                            r"semaphores, (\d+) ordered only if same-queue DMAs complete in "
+                            r"order, (\d+) UNSYNCHRONIZED")
+DEPCHECK_WAITS = re.compile(r"(\d+) waits checked, (\d+) not OK")
+#: The opcodes of check (c) the notice names: an instruction that gathers by index, whose
+#: destination over its own data or indices is a race when it runs in pieces.
+GATHER_OPCODES = ("Gather", "NonZero")
+#: The ``nc_n_gather`` calls whose destination the allocator placed over their own data in
+#: these graphs, by the source line the device profile names, with the kernel names the
+#: dumps give them: the sentinel order's (every graph) and the vendored top-k's last stage
+#: (the as-built chain at C = 16384, one copy per physical core).
+OWN_DATA_GATHERS = {
+    "sentinel_order.py:171": ("_sentinel_order_nki",),
+    "rotational_topk.py:381": ("rotational_topk_lnc0", "rotational_topk_lnc1")}
+#: Bytes of one POOL_BUFFER_LOAD piece of these gathers on the device: 512 elements of 4
+#: bytes (int32 ids, float32 indices; ``mask=0x1ff`` in the profiles). A destination over
+#: its data is read before it is written only if it lies in the first piece.
+GATHER_PIECE_BYTES = 512 * 4
+#: A dump footprint ``SB[p<first>..<last>][<start>:<end>)``: partitions and bytes.
+FOOTPRINT = re.compile(r"\[p(\d+)\.\.(\d+)\]\[(\d+):(\d+)\)")
 #: Contexts the headline prices (max_model_len) and the TTFT prompts.
 CONTEXTS = {"8k": 8192, "64k": 65536, "256k": 262144}
 TTFT_PROMPTS = {"1k": 1024, "8k": 8192, "64k": 65536, "256k": 262144}
@@ -158,7 +209,8 @@ def load_model():
 
 
 def collective_constants() -> dict:
-    cal = json.load(open(CAL_CONSTANTS))
+    with open(CAL_CONSTANTS) as handle:
+        cal = json.load(handle)
     assert cal["collective_hops_model"] == "log2", cal["collective_hops_model"]
     return {"per_hop_s": float(cal["collective_per_hop_latency_s"]),
             "bus_bytes_per_s": float(cal["collective_bw_bytes_per_s"]),
@@ -288,7 +340,110 @@ def allgather_check() -> dict:
                                 for size, us in p50["int32"].items()},
             "chunk_ids_bytes": CHUNK * SELECT_K * ID_BYTES,
             "check_files": [f"allgather_{dtype}.{ext}" for dtype in ALLGATHER_DTYPES
-                      for ext in ("json", "log")]}
+                            for ext in ("json", "log")]}
+
+
+def _summary_lines(name: str) -> dict[str, dict[str, str]]:
+    """The ``key=value`` fields of each line of a depcheck summary file, by its first word."""
+    out = {}
+    with open(os.path.join(DEPCHECK_DIR, "runs", name)) as handle:
+        for line in handle:
+            words = line.split()
+            if words and all("=" in w for w in words[1:]):
+                out[words[0]] = dict(w.split("=", 1) for w in words[1:])
+    return out
+
+
+def _depcheck_core(stem: str) -> dict:
+    """One core's dump: the checker's pair and wait counts (``depcheck_w21_quadrant.py``,
+    its full output), the summary's alias and stepped-DMA checks (``depcheck/summarize.py``)
+    and the gathers that write their own input (``depcheck/gather_alias.py``)."""
+    with open(f"{stem}.depcheck.txt") as handle:
+        text = handle.read()
+    (pairs, ordered, queue_only, unsync), = DEPCHECK_PAIRS.findall(text)
+    (waits, waits_not_ok), = DEPCHECK_WAITS.findall(text)
+    with open(f"{stem}.summary.json") as handle:
+        summary = json.load(handle)
+    with open(f"{stem}.gather_alias.json") as handle:
+        aliases = json.load(handle)["pool_aliases"]
+    return {"instructions": summary["instructions"],
+            "overlapping_pairs": int(pairs), "ordered": int(ordered),
+            "unsync": int(unsync), "queue_order_only": int(queue_only),
+            "alias_partial": summary["c_alias_partial"],
+            "alias_in_place": summary["c_alias_exact_in_place_by_opcode"],
+            "stepped_partition_dmas": summary["d_stepped_partition_dmas"],
+            "waits": int(waits), "waits_not_ok": int(waits_not_ok),
+            "register_ap_operands": sum(summary["register_ap_operands"].values()),
+            "gather_aliases": [_gather_alias(a) for a in aliases
+                               if a["opcode"] in GATHER_OPCODES]}
+
+
+def _gather_alias(alias: dict) -> dict:
+    """One gather whose write overlaps its own read (``gather_alias.py``): where, and the
+    write's and read's bytes per partition."""
+    (w_first, w_last, w_start, w_end), = FOOTPRINT.findall(alias["write"])
+    (_, _, r_start, r_end), = FOOTPRINT.findall(alias["read"])
+    return {"kernel": alias["kernel"], "source_line": alias["line"], "opcode": alias["opcode"],
+            "identical": alias["identical"], "partitions": int(w_last) - int(w_first) + 1,
+            "write_bytes": int(w_end) - int(w_start), "read_bytes": int(r_end) - int(r_start),
+            "dst_at_data_base": w_start == r_start}
+
+
+def _gather_pieces(source_line: str) -> dict:
+    """``depcheck/gather_pieces.py``'s per-core check of one gather line, by profiled graph:
+    the sets of counts over its executions, and the three hazard counts summed."""
+    stem = source_line.split(".py:", 1)[0]
+    counted = ("gather_instructions", "gathers", "max_pieces", "gathers_writing_their_own_data")
+    graphs = {}
+    with open(os.path.join(DEPCHECK_DIR, "runs", f"{stem}_gather_pieces.jsonl")) as handle:
+        for line in handle:
+            row = json.loads(line)
+            session = row["session"].split("_i-", 1)[0].removeprefix("dsa-")
+            entry = graphs.setdefault(session, {
+                "executions": 0, "physical_cores": row["physical_cores"],
+                **{key: set() for key in counted},
+                **{key: 0 for key in GATHER_HAZARDS}})
+            entry["executions"] += 1
+            for key in counted:
+                entry[key].add(row[key])
+            for key in GATHER_HAZARDS:
+                entry[key] += row[key]
+    for entry in graphs.values():
+        for key in counted:
+            entry[key] = sorted(entry[key])
+    return dict(sorted(graphs.items()))
+
+
+def depcheck() -> dict:
+    """The pipeline-hazard check of every compiled selection graph, per core; and, from the
+    device profiles, how the device ran each gather that writes over its own data."""
+    from vllm_neuron.functional.dsa.indexer_shard import row_shard
+
+    runs = os.path.join(DEPCHECK_DIR, "runs")
+    compiles = _summary_lines("compile.summary")
+    cpu = {}
+    for name, (tokens, cands, bound, mode) in DEPCHECK_CPU_GRAPHS.items():
+        cpu[name] = {"mode": mode, "tokens": tokens,
+                     "rows": row_shard(tokens, TP).rows if mode == "sharded" else tokens,
+                     "cands": cands, "with_causal_bound": bound,
+                     "device_opens": int(compiles[name]["device_opens"]),
+                     "cores": {core: _depcheck_core(os.path.join(runs, f"{name}.{core}"))
+                               for core in DEPCHECK_CORES}}
+    recompiled = _summary_lines("devgraph.summary")
+    device = {}
+    for name, (run, graph) in DEPCHECK_DEVICE_GRAPHS.items():
+        compiled_line, record = recompiled[name], device_record(f"{run}_r1")
+        device[name] = {"device_run": run, "graph": graph, "tokens": record["tokens"],
+                        "rows": record["tokens"] if graph == "replicated" else record["rows"],
+                        "cands": record["cands"], "with_causal_bound": record["causal_bound"],
+                        "device_opens": int(compiled_line["device_opens"]),
+                        "neff_bin_same": int(compiled_line["neff_bin_same"]),
+                        "neff_bin_diff": int(compiled_line["neff_bin_diff"]),
+                        "kernel_hashes_same": compiled_line["colz"] == "SAME",
+                        "cores": {core: _depcheck_core(os.path.join(runs, f"dev_{name}", core))
+                                  for core in DEPCHECK_CORES}}
+    return {"cpu_graphs": cpu, "device_graphs": device,
+            "gather_pieces_on_device": {line: _gather_pieces(line) for line in OWN_DATA_GATHERS}}
 
 
 class IndexerCost:
@@ -785,6 +940,67 @@ LABELS = {
     "chunk_ids_bytes": "DERIVED: the bytes one layer's all-gather returns, tokens x select_k "
                        "x 4 (int32)",
     "check_files": f"INPUT: the check's outputs in {DEVICE_RECORDS_DIR}",
+    # depcheck: DEPCHECK_DIR (README.md there); every compile on the CPU, no device; the
+    # gather pieces from the device profiles
+    "depcheck": "MEASURED: trn2-1's pipeline-hazard check over the lower_sync dump of each "
+                "core (depcheck_w21_quadrant.py: quadrant-aware footprints, runtime-address "
+                "DMA operands over-approximated by their whole DRAM tensor)",
+    "cpu_graphs": "MEASURED: the served graph compiled on the CPU (depcheck/compile_graph.py, "
+                  "production compile mode, meta inputs)",
+    "device_graphs": "MEASURED: a device run's own graph.hlo recompiled with the dump flags "
+                     "(depcheck/run_devgraph.sh)",
+    "mode": "INPUT: sharded (one rank of 64) or replicated (the as-built chain on all rows)",
+    "tokens": "INPUT: chunk rows T",
+    "device_opens": "MEASURED: /dev/neuron opens of the compile (strace)",
+    "device_run": "INPUT: the device run whose graph this is",
+    "graph": "INPUT: the device run's graph",
+    "neff_bin_same": "MEASURED: *.bin files of the recompiled NEFF byte-equal to the device "
+                     "run's NEFF (engine streams and tables)",
+    "neff_bin_diff": "MEASURED: *.bin files that differ (0 = the dump is the schedule that ran)",
+    "kernel_hashes_same": "MEASURED: both compile logs name the same kernel .colz hashes",
+    "cores": "MEASURED: per physical core (nc00, nc01)",
+    "instructions": "MEASURED: instructions in the core's dump",
+    "overlapping_pairs": "MEASURED: producer -> consumer access pairs with overlapping "
+                         "footprints, as the checker counts them (depcheck.txt)",
+    "ordered": "MEASURED: of those, the pairs ordered by engine order and semaphores",
+    "unsync": "MEASURED: check (a), pairs ordered neither by engine order nor by semaphores",
+    "queue_order_only": "MEASURED: check (b), pairs ordered only if same-queue DMAs complete "
+                        "in order",
+    "alias_partial": "MEASURED: check (c), instructions whose write partly overlaps one of "
+                     "their own reads",
+    "alias_in_place": "MEASURED: check (c), instructions whose write is exactly one of their "
+                      "own reads, by opcode",
+    "stepped_partition_dmas": "MEASURED: check (d), DMAs whose SBUF partitions are not "
+                              "contiguous",
+    "waits": "MEASURED: semaphore waits whose value was checked",
+    "waits_not_ok": "MEASURED: waits whose value is below the producer's count",
+    "register_ap_operands": "MEASURED: runtime-address DMA operands (whole-tensor footprints)",
+    "gather_aliases": "MEASURED: the gathers (GATHER_OPCODES) among the in-place and partial "
+                      "aliases, with kernel and line (depcheck/gather_alias.py)",
+    "kernel": "MEASURED: the NKI kernel of the instruction (dump debug info)",
+    "source_line": "MEASURED: its kernel source line (dump debug info)",
+    "opcode": "MEASURED: its opcode",
+    "identical": "MEASURED: whether the write covers exactly the read",
+    "partitions": "MEASURED: SBUF partitions of the write",
+    "write_bytes": "MEASURED: bytes per partition the gather writes",
+    "read_bytes": "MEASURED: bytes per partition of the data it reads",
+    "dst_at_data_base": "MEASURED: the write starts at the first byte of the data",
+    "gather_pieces_on_device": "MEASURED: the device profile of every profiled graph "
+                               "(depcheck/gather_pieces.py), per gather line in "
+                               "OWN_DATA_GATHERS: how the device ran it, per physical core",
+    "physical_cores": "MEASURED: the physical cores that ran the line's pieces",
+    "gather_instructions": "MEASURED: (physical core, BIR instruction) groups of the line, "
+                           "per execution",
+    "gathers": "MEASURED: GATHER pieces per execution",
+    "max_pieces": "MEASURED: the most GATHER pieces of one group",
+    "gathers_writing_their_own_data": "MEASURED: groups whose destination overlaps one of "
+                                      "their own loads, per execution",
+    "loads_reading_an_earlier_write": "MEASURED: loads issued after a GATHER of their group "
+                                      "that wrote over them, summed over the executions",
+    "dst_over_indices": "MEASURED: GATHER pieces whose destination overlaps their group's "
+                        "indices, summed over the executions",
+    "loads_in_flight_at_a_write": "MEASURED: loads still running when a GATHER of their "
+                                  "group starts writing over them, summed over the executions",
 }
 
 
@@ -806,6 +1022,7 @@ def report(cost: IndexerCost | None = None) -> dict:
         "device_ab": ab,
         "perf": perf(ab, cost),
         "allgather_two_ranks": allgather_check(),
+        "depcheck": depcheck(),
         "constants": {"alpha_ms_per_call_layer": cost.alpha,
                       "beta_ms_per_mcycle": cost.beta, "tok_scale": cost.m.tok_scale,
                       "glue_us_per_layer": cost.glue_us,
