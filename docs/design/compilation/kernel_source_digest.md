@@ -1,8 +1,8 @@
 # Kernel Source Digest in the Compile Cache Key
 
-<!-- meta: description: Why and how a digest of the NKI kernel sources is folded into the compile cache keys -->
+<!-- meta: description: How a per-graph digest of the NKI kernel sources is folded into the compile cache keys -->
 <!-- meta: content_type: conceptual-deep-dive -->
-<!-- meta: date_updated: 2026-10-06 -->
+<!-- meta: date_updated: 2026-10-08 -->
 
 ## Problem
 
@@ -24,37 +24,98 @@ silent: the server starts fast and runs stale code.
 
 ## Fix
 
-`vllm_neuron/compile_cache_key.py` computes one digest of the kernel sources
-and folds it into both library keys.
+`vllm_neuron/compile_cache_key.py` folds into each library key the digest of
+**only the kernel source files that key's kernels can reach**.
 
 ``` text
-[1. import vllm_neuron] --> [2. sha256 over kernel sources] --> [3. wrap both key fns]
-                                                                      |
-   compile / capture --> cache.create_cache_hash(gm, inputs) ---------+--> fold --> 32-hex key
-   compile_nki       --> nki_cache.create_nki_cache_key(fn, args) ----+--> fold --> 32-hex key
+[1. import vllm_neuron] --> [2. snapshot kernel sources] --> [3. wrap both key fns]
+
+ graph key:  create_cache_hash(gm, ...)
+   [kernels gm calls] --> [their modules] --> [import closure] --> [file set] --> sha256 --> fold
+ kernel key: create_nki_cache_key(func, ...)
+   [func's module]  -----------------------> [import closure] --> [file set] --> sha256 --> fold
+ unmapped reference --------------------------------------------> package digest -----> fold
 ```
 
-Step 2 reads, in sorted order, every `*.py` under `vllm_neuron/functional/`
-plus the modules kernel files import from elsewhere in the package
-(`KERNEL_SOURCE_FILES`: `parallel/neuron_parallel_state.py`,
-`utils/bucket_utils.py`, `utils/dtype_utils.py`, `utils/neuron_utils.py`).
-The relative path and the content of each file feed the hash, so a rename or
-a one-byte edit changes the digest, and two checkouts of one commit at
-different paths share it. 94 files, about 7 ms, once per process.
+1. Step 2 reads every `*.py` under `vllm_neuron/functional/` and the modules
+   kernel files import from elsewhere in the package (`KERNEL_SOURCE_FILES`:
+   `parallel/neuron_parallel_state.py`, `utils/bucket_utils.py`,
+   `utils/dtype_utils.py`, `utils/neuron_utils.py`). The process keeps these
+   bytes, so every key it computes reads the same snapshot. 104 files, about
+   7 ms, once per process.
+2. A graph's kernels come from its FX nodes:
+   - each NKI kernel node (`torch.ops.higher_order.nki_kernel_wrapper`) gives
+     its kernel function through the library's kernel registry
+     (`kernel_idx`), and the function gives its defining module;
+   - each call target, called submodule class, fetched attribute or argument
+     constant that a `vllm_neuron` module defines gives that module (the
+     served graphs build rotational top-k configs in the graph);
+   - each custom op outside the ATen, prims, higher-order and functional
+     collective namespaces gives its kernel modules through
+     `CUSTOM_OP_KERNEL_MODULES`.
+3. The import closure starts at each module file and follows its `import` and
+   `from ... import` statements, read with `ast` (no import runs). It follows
+   statements at any depth (also inside functions) and stops at files outside
+   the snapshot.
+4. The digest is sha256 over the sorted file set: path, length, then bytes,
+   the same stream as the whole-package digest. The key is
+   `sha256(library_key + "|kernel_digest:" + digest)[:32]`, so the cache
+   directory layout (`<root>/neuron/compile_cache/<key>/`) does not change.
 
-Step 3 replaces the two module attributes with wrappers that return
-`sha256(library_key + "|kernel_digest:" + digest)[:32]`. The key stays 32 hex
-characters, so the cache directory layout
-(`<root>/neuron/compile_cache/<key>/`) is unchanged; a kernel edit lands in a
-**new** directory. The wrappers return `None` where the library returns `None`
-(an NKI call with an unhashable argument stays uncacheable).
+The result: an edit to kernel X recompiles only the graphs that call X (or a
+kernel that imports X). An edit to a file no kernel reaches, for example torch
+code around a kernel call, recompiles no graph for kernel reasons; its effect
+on the graph is in the FX text, which the library already keys on.
 
-The library looks both functions up through their module at every call
-(`cache.create_cache_hash(...)` in `compile` and `setup_workdir_common`;
-`from .nki_cache import create_nki_cache_key` inside `compile_nki`), so the
-attribute replacement is the whole hook.
-`test/vllm_neuron/test_compile_cache_key.py` checks that this stays true for
-the installed library version.
+### Closure rules
+
+| Statement in a reached file | The closure follows |
+| --- | --- |
+| `import vllm_neuron.a.b` | all of `a/b.py` |
+| `from vllm_neuron.a import b`, `b` a submodule | all of `a/b.py` (and the statement in `a/__init__.py` that binds `b`, if any) |
+| `from vllm_neuron.a import f`, `f` only re-exported by `a/__init__.py` | `a/__init__.py` and the statement that binds `f` (not the other re-exports) |
+| `from vllm_neuron.a import f`, `f` defined in `a/__init__.py` | all of `a/__init__.py` |
+| `from vllm_neuron.a import *` | all of `a/__init__.py` |
+| relative imports | the same, from the file's own package |
+| `import importlib` or `__import__` in a reached file | nothing: the key folds the package digest |
+| an import of another package | nothing: that source is versioned with its package |
+| an import of `vllm_neuron.envs` or `vllm_neuron.accuracy.tensor_capture` | nothing: these files hold no kernel code (a kernel's trace-time branch on a knob is in the FX graph text; tensor capture is host-side debug code), so the snapshot excludes them |
+
+A package `__init__.py` is reached only when a reached file imports from it.
+Python also runs every parent package `__init__.py` when it imports a
+module; those runs are not followed. The rules assume that no module rebinds
+an attribute of another module at import time.
+
+### Fallback
+
+A reference that does not map to files makes the key fold the whole-package
+digest (the digest of every snapshot file). A fallback costs a recompile. It
+never serves a stale kernel. These references fall back:
+
+- a custom op that is not in `CUSTOM_OP_KERNEL_MODULES`,
+- a kernel module of the package that is outside the snapshot (for example a
+  kernel under `vllm_neuron/model/`) or that has no source file,
+- a dynamic import in the closure,
+- an NKI node whose `kernel_idx` is not in the process's kernel registry,
+- an error during the reference scan (logged at WARNING).
+
+Each reason is logged once per process at INFO:
+
+``` text
+INFO - compile_cache_key.py - kernel digest fallback: custom op ns::op has no entry in CUSTOM_OP_KERNEL_MODULES (vllm_neuron.compile_cache_key); keys that reach it fold the whole-package digest
+```
+
+A kernel from another package (for example `nkilib`) reaches no package file.
+Its source is versioned with that package, as before.
+
+### The custom op table
+
+`CUSTOM_OP_KERNEL_MODULES` maps `"namespace::op"` to the modules that define
+the op's kernels. A `torch.library` op is opaque in the FX graph, so the table
+names its kernels. The package registers no custom op today, so the table is
+empty. `test/vllm_neuron/test_compile_cache_key_pergraph.py` scans the package
+(including `model/glm5_next/model_fp8.py`) for op registrations and fails when
+a registered op has no entry.
 
 ### Why the key, not a sub-directory of the cache root
 
@@ -65,52 +126,75 @@ The library offers no key-component hook. The two mechanisms it does offer:
 | Digest-named sub-root (`NEURON_LIBTORCH_CACHE_ROOT/<digest>`) | yes | no | no | no |
 | Digest folded into the key (chosen) | yes | yes | yes | yes |
 
-A remote cache shared across nodes is exactly where a stale kernel does the
-most damage, so the key fold was chosen.
+The library looks both functions up through their module at every call
+(`cache.create_cache_hash(...)` in `compile` and `setup_workdir_common`;
+`from .nki_cache import create_nki_cache_key` inside `compile_nki`), so the
+attribute replacement is the whole hook.
+`test/vllm_neuron/test_compile_cache_key.py` checks that this stays true for
+the installed library version.
 
 ## Startup log
 
 ``` text
-INFO - compile_cache_key.py - VLLM_NEURON_KERNEL_DIGEST=2df626e3...a3b718a files=94 digest_ms=6.6
+INFO - compile_cache_key.py - VLLM_NEURON_KERNEL_DIGEST=f3e81b81...94ee29 files=104 digest_ms=7.1 keys=per-graph
+INFO - compile_cache_key.py - kernel digest: graph key <32-hex key> folds files=25 modules=vllm_neuron.functional.attention.mla_absorb,... resolve_ms=<ms> (graphs per-graph=1 fallback=0)
 ```
 
-Print the digest without starting a server:
+The first line comes once per process. The second line comes once for each
+new graph, at the rate of the library's own `Compilation cache key:` line. The
+first graph of a process also parses the files it reaches (about 215 ms for a
+served decode graph); later graphs take about 50 ms.
+
+Print the digests without starting a server:
 
 ``` bash
-python -m vllm_neuron.compile_cache_key          # digest, file count, time
-python -m vllm_neuron.compile_cache_key --files  # also the file list
+python -m vllm_neuron.compile_cache_key                  # package digest, file count, time
+python -m vllm_neuron.compile_cache_key --files          # also the file list
+python -m vllm_neuron.compile_cache_key --graph <entry>  # the files one cached graph folds
 ```
+
+`--graph` takes a cache entry directory (`<root>/neuron/compile_cache/<key>`),
+its `fxgraph.txt` or its `graph.hlo`. The persisted FX text holds only the
+process-local `kernel_idx` of each kernel, so the kernel names come from the
+`func_name` of each NKI custom call in `graph.hlo`. FX text without a
+`graph.hlo` beside it falls back.
 
 ## Knob
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `VLLM_NEURON_DISABLE_KERNEL_DIGEST_KEY` | `0` | `1` keeps the library's own keys. A warm cache may then serve a stale kernel. The log line still prints the digest. |
+| `VLLM_NEURON_DISABLE_KERNEL_DIGEST_KEY` | `0` | `1` keeps the library's own keys. A warm cache may then serve a stale kernel. The log line still prints the package digest. |
+
+`install_kernel_digest_key(digest)` still folds one digest into every key (the
+earlier whole-package scheme). Startup uses `install_per_graph_digest_key`.
 
 ## What it costs
 
-- One recompile after any edit under `functional/` or to one of the four
-  allowlisted modules, including comment-only edits and edits to a kernel
-  the current model never traces. Over-inclusion costs one recompile;
-  omission serves a stale kernel, so the allowlist errs toward inclusion.
-- No change to a cache root that was filled with the same tree: the digest is
-  deterministic across processes and hosts.
-- Cache roots filled **before** this change miss once (the key format
-  changed); the old directories are not deleted.
+- One recompile of each graph that reaches an edited file, including
+  comment-only edits. On the stack-1b served set (20 graphs), 68 of the 104
+  files reach no graph, and a decode-only kernel edit recompiles the decode
+  graphs only.
+- No change to a cache root that was filled with the same tree: the digests
+  are deterministic across processes and hosts.
+- Cache roots filled **before** this change miss once (the key changed); the
+  old directories are not deleted.
 
 ## Relation to `SOURCE_DIGEST` in kernel files
 
 Four kernels (`functional/dsa/decode_batch.py`, `functional/attention/mla_decode.py`)
 already pass a digest of their own file into the kernel as a trace-time
-integer. That still works and is now redundant; the package digest covers
+integer. That still works and is now redundant; the per-graph digest covers
 those files too.
 
 ## Manual device check
 
-1. Start the server with an empty `NEURON_LIBTORCH_CACHE_ROOT=/tmp/root-A`;
-   note `VLLM_NEURON_KERNEL_DIGEST=` in the log and
+1. Start the server with an empty `NEURON_LIBTORCH_CACHE_ROOT=/tmp/root-A`.
+   Record each `kernel digest: graph key` line and
    `ls /tmp/root-A/neuron/compile_cache/`.
-2. Edit one comment line in any file under `vllm_neuron/functional/`.
-3. Restart with the same root: the digest line differs, every graph reports
-   a cache miss, and new directory names appear next to the old ones.
-4. Restart once more without an edit: every graph is a local cache hit.
+2. Edit one comment line in a decode-only kernel file, for example
+   `vllm_neuron/functional/dsa/decode_batch.py`.
+3. Run `python -m vllm_neuron.compile_cache_key --graph <entry>` for each
+   entry. Write down the entries whose file list holds the edited file.
+4. Restart with the same root. Only those entries report a cache miss; every
+   other graph is a local cache hit.
+5. Restart once more without an edit: every graph is a local cache hit.
