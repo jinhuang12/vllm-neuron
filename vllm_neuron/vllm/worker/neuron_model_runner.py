@@ -10925,12 +10925,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     # budgets is unchanged. ``strict=True`` inside, because
                     # upstream pairs the two carriers with a non-strict zip, so a
                     # short ``dtypes`` tuple would silently under-allocate the slot.
+                    # ``checkpoints``: the state rows a slot holds, ``1 + k`` on a
+                    # speculative server (``num_speculative_blocks`` of the spec, the
+                    # rows ``slot_bytes`` was priced for), one otherwise.
                     kv_caches[layer_name] = state_bank_regions(
                         raw_tensor,
                         kv_cache_spec.shapes,
                         kv_cache_spec.dtypes,
                         slot_bytes=slot_bytes,
                         dtype_view=_shared_dtype_view,
+                        checkpoints=1 + int(kv_cache_spec.num_speculative_blocks),
                     )
                     assert len(kv_caches[layer_name]) == len(kv_cache_spec.shapes)
                     assert all(
@@ -11017,6 +11021,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 # the global KV cache dtype describes a key/value cache and would
                 # mistype an fp32 recurrent state. ``page_size_padded`` is set
                 # after the loop, once the attention page is known.
+                # ``num_speculative_blocks``: one extra state row per draft token, so
+                # a verify step of ``1 + k`` tokens can keep every token's carriers
+                # and the next step start from the accepted one
+                # (``functional.kda.fused_decode``, "Checkpoint banks"). Upstream's
+                # field, read from the speculative config, never a literal.
                 spec = MambaSpec(
                     block_size=recurrent_block_size,
                     shapes=(
@@ -11026,6 +11035,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     dtypes=(
                         layer.kda_conv_state_dtype,
                         layer.kda_recurrent_state_dtype,
+                    ),
+                    num_speculative_blocks=(
+                        int(self.speculative_config.num_speculative_tokens)
+                        if self.speculative_config is not None
+                        else 0
                     ),
                 )
             # A latent-attention layer caches one compressed vector per token and
