@@ -315,15 +315,19 @@ RECURRENT_SLOT_ALIGN_BYTES = 256
 def recurrent_state_slot_bytes(spec) -> int:
     """Return the bytes one request slot of a recurrent-state bank occupies.
 
-    This is the state's own geometry (every carrier's shape times its dtype size),
-    rounded up to :data:`RECURRENT_SLOT_ALIGN_BYTES`. It is not
-    ``spec.page_size_bytes``: this patch pads that page up to the attention page so
-    that vLLM's single block pool sees one page size, and the pad holds nothing.
+    This is the state's own geometry (every carrier's shape times its dtype size)
+    times the ``1 + spec.num_speculative_blocks`` state rows a slot holds -- one on a
+    plain server; one per token of a speculative verify step, so the step can keep
+    every token's carriers as a checkpoint
+    (``glm5next_state_banks.state_bank_regions``, ``checkpoints``) -- rounded up to
+    :data:`RECURRENT_SLOT_ALIGN_BYTES`. It is not ``spec.page_size_bytes``: this patch
+    pads that page up to the attention page so that vLLM's single block pool sees
+    one page size, and the pad holds nothing.
     """
     state_bytes = sum(
         math.prod(shape) * dtype.itemsize
         for shape, dtype in zip(spec.shapes, spec.dtypes, strict=True)
-    )
+    ) * (1 + int(spec.num_speculative_blocks))
     align = RECURRENT_SLOT_ALIGN_BYTES
     return -(-state_bytes // align) * align
 

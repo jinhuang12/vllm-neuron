@@ -10821,12 +10821,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     # budgets is unchanged. ``strict=True`` inside, because
                     # upstream pairs the two carriers with a non-strict zip, so a
                     # short ``dtypes`` tuple would silently under-allocate the slot.
+                    # ``checkpoints``: the state rows a slot holds, ``1 + k`` on a
+                    # speculative server (``num_speculative_blocks`` of the spec, the
+                    # rows ``slot_bytes`` was priced for), one otherwise.
                     kv_caches[layer_name] = state_bank_regions(
                         raw_tensor,
                         kv_cache_spec.shapes,
                         kv_cache_spec.dtypes,
                         slot_bytes=slot_bytes,
                         dtype_view=_shared_dtype_view,
+                        checkpoints=1 + int(kv_cache_spec.num_speculative_blocks),
                     )
                     assert len(kv_caches[layer_name]) == len(kv_cache_spec.shapes)
                     assert all(

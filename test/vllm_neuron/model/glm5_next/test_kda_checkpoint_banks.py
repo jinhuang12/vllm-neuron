@@ -18,6 +18,7 @@ import pytest
 import torch
 
 from vllm_neuron.functional.kda import fused_decode as fused
+from vllm_neuron.vllm.patches.kv_spec_patch import recurrent_state_slot_bytes
 from vllm_neuron.vllm.worker.glm5next_state_banks import state_bank_regions
 
 #: The TP=64 KDA slot: a bf16 ``[3, 384]`` conv row and a fp32 ``[1, 128, 128]`` recurrent row.
@@ -96,3 +97,24 @@ def test_flat_checkpoint_rows_address_the_carved_banks():
     untouched = [s for s in range(SLOTS) if s not in slots.tolist()]
     assert torch.equal(rec_bank[untouched], before[untouched])
 
+
+@pytest.mark.parametrize("drafts", [0, 1, 3, 5])
+def test_the_slot_bytes_hold_every_checkpoint_row(drafts):
+    """``recurrent_state_slot_bytes`` prices ``1 + num_speculative_blocks`` rows, so the
+    runner's ``slots x slot_bytes`` buffer carves exactly ``1 + k`` rows per slot; at
+    ``k = 0`` (no speculative config) it is the plain server's slot."""
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    def spec(k):
+        return MambaSpec(block_size=128, shapes=SHAPES, dtypes=DTYPES, num_speculative_blocks=k)
+
+    plain = recurrent_state_slot_bytes(spec(0))
+    assert plain == _slot_bytes(1)
+    slot_bytes = recurrent_state_slot_bytes(spec(drafts))
+    assert slot_bytes == _slot_bytes(1 + drafts)
+    assert slot_bytes == (1 + drafts) * plain
+    raw = torch.zeros(SLOTS * slot_bytes, dtype=torch.uint8)
+    banks = state_bank_regions(raw, SHAPES, DTYPES, slot_bytes=slot_bytes,
+                               checkpoints=1 + drafts)
+    for bank, shape in zip(banks, SHAPES, strict=True):
+        assert tuple(bank.shape) == ((SLOTS, 1 + drafts, *shape) if drafts else (SLOTS, *shape))
