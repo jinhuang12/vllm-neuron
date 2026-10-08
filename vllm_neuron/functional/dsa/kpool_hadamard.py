@@ -39,7 +39,7 @@ import nki.language as nl
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
-from vllm_neuron import envs
+from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 logger = logging.getLogger(__name__)
@@ -512,7 +512,7 @@ def can_run_dsa_kpool_hadamard(slot_k: Tensor, slot_score: Tensor, ape: Tensor) 
 
 def hadamard128_programs(n_rows: int) -> int:
     """Programs the rotation launches: both cores of an LNC2 core from two rows on."""
-    if envs.NEURON_LOGICAL_NC_CONFIG == 2 and int(n_rows) >= 2:
+    if lnc_pair() and int(n_rows) >= 2:
         return 2
     return 1
 

@@ -52,7 +52,6 @@ import nki.language as nl
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
-from vllm_neuron import envs
 from vllm_neuron.functional.dsa.causal_bound import BOUND_FILL
 from vllm_neuron.functional.dsa.decode_tail_update import TAIL_HALVES, _compress_pool_torch
 from vllm_neuron.functional.dsa import kpool_hadamard as _kpool_hadamard
@@ -61,6 +60,7 @@ from vllm_neuron.functional.dsa.kpool_hadamard import (
     INDEX_HEAD_DIM,
     _fwht128_blocks,
 )
+from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 logger = logging.getLogger(__name__)
@@ -810,7 +810,7 @@ def _programs(batch: int, units: int) -> int:
     """Both cores of an LNC2 core when there are two units of work to split: two
     requests, or one request with two (ring step: the pool and the stash; scores: two
     candidate tiles)."""
-    if envs.NEURON_LOGICAL_NC_CONFIG == 2 and (batch >= 2 or units >= 2):
+    if lnc_pair() and (batch >= 2 or units >= 2):
         return 2
     return 1
 

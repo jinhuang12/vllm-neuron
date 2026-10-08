@@ -89,7 +89,6 @@ import nki.language as nl
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
-from vllm_neuron import envs
 from vllm_neuron.functional.dsa.causal_bound import BOUND_FILL, BOUND_FILL_MARK, SENTINEL
 from vllm_neuron.functional.dsa.decode_batch import (
     PARTITIONS,
@@ -101,6 +100,7 @@ from vllm_neuron.functional.dsa.index_expand import (
     index_expand_width,
     is_power_of_two,
 )
+from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 #: ``nonzero_with_count`` reads and writes partition ``16 i`` of each 16-partition group.
@@ -642,7 +642,7 @@ def dsa_decode_select_kernel(bounded_hbm, lens_hbm, select_k, pool_size, out_col
 
 def decode_select_programs(batch: int) -> int:
     """Programs the selection launches: both cores of an LNC2 core from two requests on."""
-    if envs.NEURON_LOGICAL_NC_CONFIG == 2 and int(batch) >= 2:
+    if lnc_pair() and int(batch) >= 2:
         return 2
     return 1
 
