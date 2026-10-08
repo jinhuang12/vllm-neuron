@@ -3941,10 +3941,13 @@ class Glm5NextKDAAttention(nn.Module):
             self.g_b_proj_weight.to(torch.float32).t()
         )
         if state_checkpoints is None:
-            entering = tuple(
-                torch.stack(bank) if state_slots is None else gather_bank_rows(bank, state_slots)
-                for bank in (convs, recurrents)
-            )
+            if state_slots is None:
+                entering = (torch.stack(convs), torch.stack(recurrents))
+            else:
+                entering = (
+                    gather_bank_rows(convs, state_slots),
+                    gather_bank_rows(recurrents, state_slots),
+                )
         elif state_slots is None:
             entering = tuple(
                 _checkpoint_rows_of_views(bank, checkpoint_rows) for bank in (convs, recurrents)
@@ -9556,10 +9559,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 state banks disagree on their checkpoint rows, or a latent bank
                 declares more than one KV head.
 
-        A linear-attention record carries ``state_checkpoints``: the state rows one
-        slot holds, ``1 + k`` when the runner carved ``[slots, 1 + k, ...]`` banks for
-        a speculative server and ``1`` on a plain bank -- bind is the one place that
-        reads the axis, so the carrier translator asks the record, not the config.
+        A speculative server's linear-attention record carries ``state_checkpoints``:
+        the ``1 + k`` state rows one slot holds, read off the ``[slots, 1 + k, ...]``
+        banks the runner carved. A plain bank's record has no such key (the record a
+        plain server built before speculation existed is unchanged; readers take an
+        absent key as one row) -- bind is the one place that reads the axis, so the
+        carrier translator asks the record, not the config.
         """
         spec_layers = self.get_kv_spec().layers
         stack = len(self.model.layers)
@@ -9625,7 +9630,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
                         f"{checkpoint_rows['recurrent_state']} per recurrent_state slot; the "
                         f"two states of one request hold the same 1 + k rows"
                     )
-                record["state_checkpoints"] = checkpoint_rows["conv_state"]
+                if checkpoint_rows["conv_state"] > 1:
+                    record["state_checkpoints"] = checkpoint_rows["conv_state"]
                 if int(tensors[0].shape[0]) != int(tensors[1].shape[0]):
                     raise ValueError(
                         f"KV layer '{name}' has {int(tensors[0].shape[0])} "

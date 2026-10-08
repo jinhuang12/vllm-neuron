@@ -147,8 +147,9 @@ def _bind(conv_bank: torch.Tensor, rec_bank: torch.Tensor) -> dict:
 def test_bind_kv_cache_records_the_checkpoint_rows_of_a_slot(checkpoints):
     """The runner carves ``[slots, 1 + k, ...]`` banks on a speculative server and
     hands them to ``bind_kv_cache``; bind must keep them and record ``1 + k`` as
-    ``state_checkpoints`` (``1`` on a plain ``[slots, ...]`` bank), the field the
-    runner's carrier translator reads to hand a prefill the one-row ``bank[slot, 0]``."""
+    ``state_checkpoints`` -- the field the runner's carrier translator reads to hand
+    a prefill the one-row ``bank[slot, 0]`` -- and leave a plain ``[slots, ...]``
+    bank's record as it always was, without the key."""
     raw = torch.zeros(_slot_bytes(checkpoints) * SLOTS, dtype=torch.uint8)
     conv_bank, rec_bank = state_bank_regions(
         raw, SHAPES, DTYPES, slot_bytes=_slot_bytes(checkpoints), checkpoints=checkpoints
@@ -157,9 +158,12 @@ def test_bind_kv_cache_records_the_checkpoint_rows_of_a_slot(checkpoints):
     assert record["family"] == "linear_attn"
     assert record["conv_state"] is conv_bank and record["recurrent_state"] is rec_bank
     assert record["state_slots"] == SLOTS
-    assert int(record["state_checkpoints"]) == checkpoints
+    assert int(record.get("state_checkpoints", 1)) == checkpoints
     if checkpoints > 1:
         assert tuple(record["conv_state"].shape) == (SLOTS, checkpoints, *SHAPES[0])
+    else:
+        # A plain server's record is the one it built before speculation existed.
+        assert "state_checkpoints" not in record
 
 
 def test_bind_kv_cache_refuses_banks_whose_checkpoint_rows_disagree():
