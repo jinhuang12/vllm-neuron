@@ -8419,6 +8419,24 @@ _SHARD_GEOMETRY["Glm5NextForConditionalGeneration"] = {
 }
 
 
+def _eh_proj_row_shard_width(module: nn.Module, world_size: int) -> int:
+    from vllm_neuron.functional.mtp.tail_in import eh_proj_shard_rows
+
+    return eh_proj_shard_rows(int(module.hidden_size), world_size)
+
+
+# The draft head's eh_proj: each rank loads its H / world rows of the checkpoint's
+# [H, 2H] tensor, computes that slice of layer_input and the slices are all-gathered
+# in rank order (``functional/mtp/tail_in.py``). The head's other three leaves stay
+# replicated. Registered here, in the one table the loader reads; the class lives in
+# ``mtp.py``, which the root imports lazily.
+_SHARD_GEOMETRY["Glm5NextMultiTokenPredictor"] = {
+    "eh_proj_weight": _DeclaredShard(
+        0, _eh_proj_row_shard_width, "row-parallel -- the layer_input slices are all-gathered"
+    ),
+}
+
+
 class Glm5NextForConditionalGeneration(nn.Module):
     """The blockwise-FP8 glm-5.3-Flash implementation.
 
