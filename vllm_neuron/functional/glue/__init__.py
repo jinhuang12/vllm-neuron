@@ -23,7 +23,8 @@ The switch is registered in :mod:`vllm_neuron.envs`. It names four sites
 Values:
 
 * ``0``: nothing is fused. Every site takes its torch route.
-* ``1`` or unset: :data:`vllm_neuron.envs.DEFAULT_GLUE_FUSED_SPEC`.
+* ``1`` or unset: :data:`vllm_neuron.envs.DEFAULT_GLUE_FUSED_SPEC`, which is prefill
+  only. Its docstring gives the measurement it rests on.
 * ``all``: every kernel at every phase and row count.
 * otherwise a comma list of rules ``kernel[:phase][@rows]``:
 

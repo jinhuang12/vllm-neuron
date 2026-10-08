@@ -8,6 +8,8 @@ projection of the rows it was asked to sample. Fixtures come from
 
 from __future__ import annotations
 
+from unittest import mock
+
 import pytest
 import torch
 
@@ -109,6 +111,7 @@ def _max_row_spread(rows: torch.Tensor) -> float:
     return float(vals.max())
 
 
+@mock.patch.dict("os.environ", {"VLLM_NEURON_GLUE_FUSED": "all"})  # every glue kernel on its route, whatever the served default selects
 def test_tiny_model_forward_matches_the_reference() -> None:
     """The decoder stack equals its torch composition, layer boundary by boundary."""
     fixture = _stack_fixture()
@@ -483,6 +486,7 @@ def test_tiny_model_forward_matches_the_reference() -> None:
         )
 
 
+@mock.patch.dict("os.environ", {"VLLM_NEURON_GLUE_FUSED": "all"})  # every glue kernel on its route, whatever the served default selects
 def test_tiny_root_forward_matches_the_reference() -> None:
     """The root equals the head projection of the rows it was asked to sample."""
     fixture = _root_fixture()

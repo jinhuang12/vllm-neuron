@@ -41,7 +41,7 @@ ROWS = {"prefill": capture.PREFILL_BUCKET, "decode": capture.DECODE_BATCH}
 #: ``{value: {phase: (mhc_pre counters, combine dtype)}}``, written out.
 RECORDED = {
     "0": {"prefill": ((0, SITES), torch.float32), "decode": ((0, SITES), torch.float32)},
-    "1": {"prefill": ((SITES, 0), torch.bfloat16), "decode": ((SITES, 0), torch.bfloat16)},
+    "1": {"prefill": ((SITES, 0), torch.bfloat16), "decode": ((0, SITES), torch.float32)},
     "all": {"prefill": ((SITES, 0), torch.bfloat16),
             "decode": ((SITES, 0), torch.bfloat16)},
 }

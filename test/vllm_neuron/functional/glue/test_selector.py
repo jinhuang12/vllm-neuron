@@ -4,7 +4,8 @@
 The contract (``vllm_neuron/functional/glue/__init__.py``):
 
 * ``0``: nothing fused, every site keeps 0a08ff4's torch route (the kill switch).
-* ``1`` or unset: ``envs.DEFAULT_GLUE_FUSED_SPEC``.
+* ``1`` or unset: ``envs.DEFAULT_GLUE_FUSED_SPEC``, the subset that won in-graph on the
+  device, at prefill only.
 * ``all``: every kernel at every phase and row count (821274e's behaviour).
 * otherwise a comma list of ``kernel[:phase][@rows]`` rules.
 """
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import pytest
 
+from test.vllm_neuron.functional.glue import glue_case
 from vllm_neuron import envs
 from vllm_neuron.functional import glue
 
@@ -57,6 +59,60 @@ def test_one_and_unset_are_the_default_spec(monkeypatch):
     assert glue.glue_selection() == glue.glue_selection(default)
     monkeypatch.setenv(glue.GLUE_FUSED_ENV, "1")
     assert glue.glue_selection() == glue.glue_selection(default)
+
+
+def test_default_is_neither_nothing_nor_everything():
+    default = _table(envs.DEFAULT_GLUE_FUSED_SPEC)
+    assert default and default != _table("all")
+
+
+#: Row counts either side of every bound the default holds.
+DEFAULT_GRID = (1, 2, 8, 16, 32, 63, 64, 65, 127, 128, 129, 512, 1023, 1024, 1025, 2048)
+
+
+def test_default_is_the_measured_prefill_subset():
+    """``1`` is mhc_pre at a 128-row prefill and mhc_post at 128- and 1024-row
+    prefills, and nothing else: the buckets where the device A/B measured a win
+    (``envs.DEFAULT_GLUE_FUSED_SPEC``'s docstring). A row count between or beyond them,
+    such as the 512 rows where mhc_post lost, keeps the torch route. The table is
+    written out, not derived, so a rule added to or removed from the default without
+    changing this table fails here."""
+    sel = glue.glue_selection("1")
+    got = {(k, p, t) for k in KERNELS for p in glue.PHASES for t in DEFAULT_GRID
+           if sel.selects(k, t, p)}
+    assert got == {("mhc_pre", "prefill", 128), ("mhc_post", "prefill", 128),
+                   ("mhc_post", "prefill", 1024)}
+
+
+def test_default_decode_takes_the_zero_route_at_every_row_count():
+    """Under ``1`` no kernel is selected at decode, at any row count, so every decode
+    graph is the graph ``0`` traces."""
+    one, zero = glue.glue_selection("1"), glue.glue_selection("0")
+    for rows in DEFAULT_GRID:
+        for kernel in KERNELS:
+            assert not one.selects(kernel, rows, "decode"), (kernel, rows)
+            assert one.selects(kernel, rows, "decode") == zero.selects(kernel, rows,
+                                                                       "decode")
+
+
+def test_default_selects_nothing_where_the_phase_is_not_known():
+    """Every rule of ``1`` names a phase, so a call of unknown phase (an mHC layer built
+    without the runner's buckets) keeps the torch route."""
+    sel = glue.glue_selection("1")
+    assert not any(sel.selects(k, t) for k in KERNELS for t in DEFAULT_GRID)
+
+
+def test_an_mhc_layer_follows_the_default_on_the_serving_buckets_only():
+    """``1`` routes the mHC kernels by phase at 128 rows. A server whose decode batches
+    reach 128 rows and that has a 128-row prefill bucket cannot tell the two apart at the
+    mHC sites, so the layer refuses ``1`` there; on the serving lines' buckets (decode
+    batches of 1 or up to ``SERVED_MAX_NUM_SEQS``, one 1024-row prefill bucket) it holds."""
+    with pytest.raises(ValueError, match="'1'"):
+        glue.require_rows_tell_phase(("mhc_pre", "mhc_post"), DECODE_ROWS, PREFILL_ROWS,
+                                     spec="1")
+    for max_decode_rows in (1, glue_case.SERVED_MAX_NUM_SEQS):
+        glue.require_rows_tell_phase(("mhc_pre", "mhc_post"), max_decode_rows,
+                                     glue_case.SERVED_PREFILL_BUCKETS, spec="1")
 
 
 def test_the_environment_is_read_at_each_call(monkeypatch):

@@ -287,6 +287,23 @@ def kda_carriers(case, batch: int, *, seed: int = 21, device="cpu") -> dict:
     return out
 
 
+def kda_prefill_carriers(case, tokens: int, *, seed: int = 23, device="cpu") -> dict:
+    """The runner's prefill carriers for one opening request of ``tokens`` rows.
+
+    One request at position 0 (its first chunk), slot 1 of a 4-slot bank, every row a
+    real token: the served p1 prefill (a 1024-token prompt in the 1024-row chunk).
+    """
+    attn = case.layer.self_attn
+    gen = torch.Generator().manual_seed(int(seed) + int(tokens))
+    conv_bank = (torch.randn(4, *attn.kda_conv_state_shape, generator=gen) * 0.5
+                 ).to(attn.kda_conv_state_dtype).to(device)
+    rec_bank = (torch.randn(4, *attn.kda_recurrent_state_shape, generator=gen) * 0.05
+                ).to(attn.kda_recurrent_state_dtype).to(device)
+    return {"banks": (conv_bank, rec_bank), "is_prefill": True,
+            "conv_state": conv_bank[1], "recurrent_state": rec_bank[1],
+            "start_position": torch.tensor(0, dtype=torch.int32).to(device)}
+
+
 def dsa_carriers(case, batch: int, *, context: int = 1024, seed: int = 31,
                  device="cpu") -> dict:
     """The runner's decode carriers for ``B`` requests at ``context`` tokens each.
