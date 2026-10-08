@@ -25,7 +25,6 @@ import torch
 NARROW_BUDGET_DIVISOR = 4
 
 
-
 def production_config():
     """``Glm5NextTextConfig()``: the production indexer dials (heads, head width, pool
     size, token budget)."""

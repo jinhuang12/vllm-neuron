@@ -126,6 +126,30 @@ def test_the_ttft_after_is_before_less_the_per_chunk_saving(cost):
             row["before_ms"] - row["n_chunks"] * row["saved_per_chunk_ms"], rel=1e-12)
 
 
+def test_every_device_run_passed_its_checks(cost):
+    """Every repeat of every run: the rank's rows select the replicated sets, the cut is
+    bit-exact, every stage took NKI; and each C = 65536 path's compile log names its error."""
+    ab = cost_model.device_ab(cost)
+    assert set(ab) == {*cost_model.DEVICE_RUNS, "compile_failures"}
+    for run in cost_model.DEVICE_RUNS:
+        assert ab[run]["repeats"] == cost_model.DEVICE_REPEATS, run
+        assert ab[run]["checks_pass"], run
+    assert set(ab["compile_failures"]) == set(cost_model.COMPILE_FAILURE_LOGS)
+
+
+def test_every_profiled_execution_divides_into_named_ops():
+    """The segments of each profiled execution add up to it, and in the selection graphs
+    each one is an op the report names (no unattributed compiler segment)."""
+    for run in cost_model.DEVICE_RUNS:
+        with open(os.path.join(cost_model.DEVICE_RECORDS_DIR, f"{run}_r1.ops.json")) as handle:
+            profiled = json.load(handle)
+        for graph in ("replicated", "sharded", "precut"):
+            for execution in profiled["graphs"][graph]["executions"]:
+                times, _ = cost_model._segment_ops(execution)
+                assert sum(times.values()) == pytest.approx(execution["execution_us"], abs=1e-6)
+                assert "compiler op (other)" not in times, (run, graph, times)
+
+
 def _leaf_paths(node, path=()):
     if isinstance(node, dict):
         for key, value in node.items():
