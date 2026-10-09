@@ -29,7 +29,9 @@ from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.sampling_params import SamplingType
 from vllm.tasks import SupportedTask
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm_neuron.vllm.worker.kv_group_blocks import draft_blocks_per_request
 from vllm_neuron.utils.dtype_utils import kv_cache_dtype_str_to_dtype
+from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -81,6 +83,7 @@ from vllm_neuron.model.neuron_config import (
 from libtorch_neuronx_lite.compile.capture_backend import CaptureComplete
 from vllm_neuron.vllm.sample.rejection_sampler import RejectionSampler
 from vllm_neuron.vllm.spec_decode.eagle import EagleProposer
+from vllm_neuron.vllm.spec_decode.mtp import MtpProposer
 from vllm_neuron.vllm.platform import SO_DISABLED_MESSAGE
 from vllm_neuron.utils.bucket_utils import (
     get_max_num_batched_tokens,
@@ -428,6 +431,7 @@ def indexer_side_cache_bytes(
     *,
     max_seq_len: int,
     request_slots: int,
+    speculative_tokens: int = 0,
 ) -> int:
     """Return the bytes of the DSA indexer side caches the runner allocates beside the KV cache.
 
@@ -440,8 +444,10 @@ def indexer_side_cache_bytes(
     ``MambaSpec``, the test ``bind_kv_cache`` makes, and in the latent bank's dtype.
 
     ``max_seq_len`` and ``request_slots`` are the values the runner allocates with,
-    ``max_model_len`` and ``max_num_seqs``. A model whose text config declares no
-    indexer (``index_kpool`` and ``index_head_dim``) has no side caches: 0.
+    ``max_model_len`` and ``max_num_seqs``; ``speculative_tokens`` is the mtp
+    server's ``k`` (0 otherwise), which deepens the two rings
+    (``NeuronModelRunner._glm5next_indexer_ring_rows``). A model whose text config
+    declares no indexer (``index_kpool`` and ``index_head_dim``) has no side caches: 0.
     """
     index_kpool = getattr(text_config, "index_kpool", None)
     index_head_dim = getattr(text_config, "index_head_dim", None)
@@ -462,6 +468,9 @@ def indexer_side_cache_bytes(
         index_head_dim=int(index_head_dim),
         max_seq_len=int(max_seq_len),
         request_slots=int(request_slots),
+        ring_rows=NeuronModelRunner._glm5next_indexer_ring_rows(
+            int(index_kpool), int(speculative_tokens)
+        ),
     )
     return sum(tensor.nbytes for entry in side for tensor in entry.values())
 
@@ -643,6 +652,21 @@ class Glm5NextShadowDraftScorer:
             for record in keep:
                 record["start"] -= cut
         self._pending[req_id] = keep
+
+
+def _eagle_drafter_has_its_own_model(speculative_config) -> bool:
+    """True when the configured drafter is an eagle model of its own, with KV layers to bind.
+
+    ``SpeculativeConfig.use_eagle()`` is true for method "mtp" too, but the mtp
+    draft is a layer of the target (``Glm5NextForConditionalGeneration.mtp``),
+    already in the root's KV spec and banks; only the eagle family brings a second
+    model. ``None`` (no speculation) is ``False``.
+    """
+    return (
+        speculative_config is not None
+        and speculative_config.use_eagle()
+        and speculative_config.method != "mtp"
+    )
 
 
 # TODO: Inherit from LoRAModelRunnerMixin to support LoRA
@@ -1064,6 +1088,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # Set up speculative decoding.
         self.drafter = None
         self.is_eagle3_spec = False
+        # Speculative method "mtp": the GLM-5.3-Flash root drafts from its own head
+        # inside the target graph (``vllm_neuron/vllm/spec_decode/mtp.py``).
+        self.is_mtp_spec = False
+        # The GLM-5.3-Flash translator's record of the step it last converted (the
+        # requests' slots, cached lengths and widths), read by the per-step state
+        # hook and the mtp draft proposal; None until a step is converted and after
+        # a synthetic one.
+        self._glm5next_step_record = None
         self._draft_token_ids = None
         # Async EAGLE3 draft rows by req_id. Only used at batch-composition
         # changes (e.g. several prefills merging into the first bs-wide decode).
@@ -1079,6 +1111,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     self.vllm_config, self.device, self.on_device_sampling
                 )
                 self.rejection_sampler = RejectionSampler()
+            elif self.speculative_config.method == "mtp":
+                # Rejection sampling runs on device inside the root's verify leg
+                # (``vllm_neuron/nn/rejection_sampler.py``); no host sampler is kept.
+                self.is_mtp_spec = True
+                self.drafter = MtpProposer(
+                    self.vllm_config, self.device, self.on_device_sampling
+                )
             else:
                 raise ValueError(
                     f"Unsupported speculative decoding method: {self.speculative_config.method}"
@@ -1824,7 +1863,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         logger.info("NeuronModel loading complete (moved to device and compiled)")
 
-        if self.drafter is not None:
+        if self.is_mtp_spec:
+            # The draft is the root's own head; nothing is loaded or compiled here.
+            self.drafter.load_model(self.model)
+        elif self.drafter is not None:
             logger.info("Spec decode enabled. Loading draft model ...")
             # TODO: model loading logic could be extracted
             # Pass target model's padded hidden_size to draft model
@@ -2610,15 +2652,20 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         no attention metadata, so the per-step device block tables, slot mappings and
         cached lengths reach no graph. Opt-in through
         ``VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA``, and only where nothing else reads
-        those device tensors: speculative decoding, KV transfer, KV / runtime-input
-        snapshots, tensor replacement or capture, and context parallelism all do.
+        those device tensors: speculative decoding other than the GLM root's own
+        ``mtp`` method (whose verify step the translator builds from the same host
+        arrays), KV transfer, KV / runtime-input snapshots, tensor replacement or
+        capture, and context parallelism all do.
         """
         if not envs.VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA:
             return False
         if not getattr(getattr(self, "model", None), "glm5next_layer_banks", None):
             return False
         return (
-            getattr(self, "speculative_config", None) is None
+            (
+                getattr(self, "speculative_config", None) is None
+                or getattr(self, "is_mtp_spec", False)
+            )
             and self.vllm_config.kv_transfer_config is None
             and not getattr(self, "_kv_snapshot_enabled", False)
             and getattr(self, "_tensor_replacer", None) is None
@@ -3052,11 +3099,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # are built, so they're sized 1-token-per-req when we fall back to
             # the non-spec NEFF. See _get_dp_padding /
             # _maybe_strip_spec_for_nonspec_step for the deadlock rationale.
-            local_force_nonspec = (
-                self.vllm_config.kv_transfer_config is not None
-                and self.vllm_config.kv_transfer_config.is_kv_consumer
-                and self._local_step_forces_nonspec(scheduler_output)
-            )
+            local_force_nonspec = self._local_force_nonspec(scheduler_output)
             local_max_decode_ctx_len = (
                 int(self.input_batch.num_computed_tokens_cpu[:padded_num_reqs].max())
                 if padded_num_reqs > 0
@@ -5070,8 +5113,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 kv_segment_size,
             )
 
-        # === Draft model graph capture ===
-        if self.drafter is not None:
+        # === Draft model graph capture (eagle only: the mtp draft is in the target) ===
+        if isinstance(self.drafter, EagleProposer):
             logger.info(
                 "Capturing EAGLE3 prefill graphs for bucket size: %d", bucket_size
             )
@@ -5153,8 +5196,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             kv_segment_size,
         )
 
-        # === Draft model warmup ===
-        if self.drafter is not None:
+        # === Draft model warmup (eagle only: the mtp draft is in the target) ===
+        if isinstance(self.drafter, EagleProposer):
             logger.info("Warming up EAGLE3 for bucket size: %d", bucket_size)
             self.drafter.warmup(
                 num_tokens=bucket_size,
@@ -5520,6 +5563,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         index_head_dim: int,
         max_seq_len: int,
         request_slots: int,
+        ring_rows: int | None = None,
     ) -> list[dict]:
         """Allocate the two indexer caches no ``LayerSpec`` declares, one set per sparse layer.
 
@@ -5544,10 +5588,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         the indexer needs one spare row above every addressable candidate pool, and
         ``max_seq_len`` is the engine's bound so the count is one constant per process
         rather than a per-step int that would need its own captured graph. ``tail`` is
-        ``[slots, 2, index_kpool, index_head_dim]``, half 0 keys and half 1 gate
-        scores. Both live across steps (the decode leg advances the ring in place and
-        the pooled store accumulates), so the caller allocates once and keeps them.
-        The dtype is the latent bank's; the layer casts on write.
+        ``[slots, 2, ring_rows, index_head_dim]``, half 0 keys and half 1 gate
+        scores; ``ring_rows`` is ``index_kpool`` when not given (the plain server's
+        ring) and at least that (``_glm5next_indexer_ring_rows``: a speculative
+        server's deeper ring; the kernels read the depth off the shape). Both live
+        across steps (the decode leg advances the ring in place and the pooled store
+        accumulates), so the caller allocates once and keeps them. The dtype is the
+        latent bank's; the layer casts on write.
 
         ``pad_tail`` is a scratch ring of the same shape. A decode step padded to its
         batch bucket serves each padding row from it, so a padding row's ring write
@@ -5568,6 +5615,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 f"the side caches are allocated one set per request slot, so the "
                 f"slot count must be positive; got {request_slots!r}"
             )
+        ring = pool if ring_rows is None else int(ring_rows)
+        if ring < pool:
+            raise ValueError(
+                f"the indexer ring holds at least one candidate pool of {pool} key(s); "
+                f"a ring of {ring} row(s) cannot close a pool"
+            )
         rows = int(max_seq_len) // pool + 1
         side: list[dict] = []
         for bank in banks:
@@ -5583,18 +5636,41 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         device=reference.device,
                     ),
                     "tail": torch.zeros(
-                        (slots, 2, pool, width),
+                        (slots, 2, ring, width),
                         dtype=reference.dtype,
                         device=reference.device,
                     ),
                     "pad_tail": torch.zeros(
-                        (slots, 2, pool, width),
+                        (slots, 2, ring, width),
                         dtype=reference.dtype,
                         device=reference.device,
                     ),
                 }
             )
         return side
+
+    @staticmethod
+    def _glm5next_indexer_ring_rows(index_kpool: int, speculative_tokens: int) -> int:
+        """The indexer ring's row count: ``index_kpool`` when nothing drafts, else the drafting depth.
+
+        A verify step writes ``1 + k`` ring rows ahead of a request's position, and a
+        pool-deep ring (``index_kpool`` rows) overwrites an accepted position's key
+        once ``1 + k >= 3``; the depth that keeps every accepted row is
+        :func:`vllm_neuron.functional.dsa.decode_trow.indexer_ring_depth` (one
+        function, the kernels read the depth off the bank's shape). A server that
+        drafts nothing keeps today's shape, bit-identical, and never imports it.
+        """
+        if int(speculative_tokens) <= 0:
+            return int(index_kpool)
+        from vllm_neuron.functional.dsa.decode_trow import indexer_ring_depth
+
+        return int(indexer_ring_depth(int(index_kpool), int(speculative_tokens)))
+
+    def _glm5next_speculative_tokens(self) -> int:
+        """``num_speculative_tokens`` under speculative method "mtp", else 0 (the shadow draft is not speculation)."""
+        if not getattr(self, "is_mtp_spec", False):
+            return 0
+        return int(self.drafter.num_speculative_tokens)
 
     def _glm5next_live_side_caches(self, banks) -> list[dict]:
         """Return this process's one live set of side caches, allocated on first use.
@@ -5622,12 +5698,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             index_head_dim=int(text_config.index_head_dim),
             max_seq_len=int(self.max_model_len),
             request_slots=self._glm5next_request_slot_capacity(banks) + SCRATCH_SLOTS,
+            ring_rows=self._glm5next_indexer_ring_rows(
+                int(text_config.index_kpool), self._glm5next_speculative_tokens()
+            ),
         )
         self._glm5next_side_cache_set = live
         # A fresh set is owned by nobody: the slot table and position record refer
         # to rows that no longer exist, so both are cleared with it.
         self._glm5next_request_slot_table = {}
         self._glm5next_side_cache_positions = {}
+        # Per slot, the KDA checkpoint row the next step resumes from: the accepted
+        # draft count of the last verify step served from the slot; absent is 0.
+        self._glm5next_checkpoint_rows = {}
         return live
 
     def _glm5next_batch_request_ids(self) -> list:
@@ -5769,6 +5851,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if noted:
             for finished in [key for key in table if key in noted]:
                 positions.pop(table[finished], None)
+                # The checkpoint record is created with the live side-cache set; a
+                # slot table set up without one has no record to clear.
+                recorded = getattr(self, "_glm5next_checkpoint_rows", None)
+                if recorded is not None:
+                    recorded.pop(table[finished], None)
                 del table[finished]
             # A finished id that never held a slot has nothing to release; the
             # record is emptied whole so it cannot grow for the process's life.
@@ -5860,12 +5947,20 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         index_kpool: int,
         operands: dict,
         banked: bool = False,
+        width: int = 1,
     ) -> dict:
-        """One sparse (DSA) layer's carrier for a decode step of ``B > 1`` requests.
+        """One sparse (DSA) layer's carrier for a request-major decode step: ``B > 1``
+        requests, or one request's verify step of ``width > 1`` rows (the layer's
+        ``T``-row leg takes this form; its one-ring form serves one token).
 
-        Request ``b`` is column ``b`` of every operand: its block-table column, its
-        latent slot, its position and seq len, and its own store of the indexer's
-        pooled keys and ring. The checks are the one-request carrier's, per request.
+        Request ``b`` is column ``b`` of every per-request operand: its block-table
+        column, its position, and its own store of the indexer's pooled keys and
+        ring. The per-row operands, ``seq_lens`` and ``latent_slots``, carry
+        ``width`` entries per request in request-major order (row ``b * width + t``
+        is request ``b``'s token ``t``, at position ``start_b + t``): one on the
+        plain decode leg, ``1 + k`` on speculative decoding's verify step. A padding
+        request's rows all name the null block. The checks are the one-request
+        carrier's, per request.
 
         Two forms of the two side caches. ``banked`` hands the whole ``pool_cache`` and
         ``tail`` banks beside a ``[B]`` int64 ``state_slots`` tensor (two graph inputs
@@ -5942,7 +6037,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             positions = cls._glm5next_start_positions(starts, device)
             operands[device] = {
                 "seq_lens": cls._glm5next_batch_row_seq_lens(
-                    [(1, start) for start in starts], device=device
+                    [(int(width), start) for start in starts], device=device
                 ),
                 "start_position": positions,
                 "position": positions,
@@ -5965,12 +6060,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         f"{index}; a GLM-5.3-Flash request needs at least one KV block"
                     )
                 own_slots = len(ids) * block_size
-                if int(starts[index]) < 0 or int(starts[index]) + 1 > own_slots:
+                own_rows = max(1, int(reals[index]))
+                if int(starts[index]) < 0 or int(starts[index]) + own_rows > own_slots:
                     raise ValueError(
-                        f"KV layer '{name}' was handed request {index}'s token at position "
-                        f"{int(starts[index])} against {len(ids)} block(s) of {block_size} "
-                        f"slot(s); a write outside the request's own pages would land on "
-                        f"another sequence's rows"
+                        f"KV layer '{name}' was handed request {index}'s {own_rows} "
+                        f"token(s) at position {int(starts[index])} against {len(ids)} "
+                        f"block(s) of {block_size} slot(s); a write outside the request's "
+                        f"own pages would land on another sequence's rows"
                     )
                 if len(ids) > window_blocks:
                     raise ValueError(
@@ -5990,11 +6086,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     ],
                     dtype=torch.int32,
                 ).to(device),
-                # One physical bank row per request: its own token's slot.
+                # ``width`` physical bank rows per request: its own tokens' slots, a
+                # padding request's (no real token) all clamped to the null block.
                 "latent_slots": cls._glm5next_latent_slot_mapping(
                     rows=tables,
                     starts=starts,
-                    tokens=1,
+                    tokens=int(width),
                     block_size=block_size,
                     reals=[max(1, int(one)) for one in reals],
                     device=device,
@@ -6069,8 +6166,21 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         request_real_tokens=None,
         active_mla_query_rows: int | None = None,
         padded_requests: int = 0,
+        state_checkpoints: int | None = None,
+        checkpoint_rows=None,
     ) -> list[dict]:
         """Build one kwargs mapping per layer, in spec order, holding that layer's own state.
+
+        ``state_checkpoints`` / ``checkpoint_rows`` (speculative method "mtp", decode
+        leg): the recurrent layers' banks hold ``1 + k`` state rows per slot, one
+        checkpoint per token of a verify step, and the step resumes each row's slot
+        from row ``checkpoint_rows[b]`` -- the previous verify step's accepted draft
+        count, 0 after a prefill -- so the two ride on every recurrent carrier as
+        ``state_checkpoints`` (the Python int ``1 + k``) and ``checkpoint_rows`` (a
+        ``[requests]`` int32 tensor, one per row in batch order, padding rows
+        included: a padding row names a slot no scheduled request holds and resumes
+        from that slot's own live row, so the layer rewrites the slot with its own
+        bytes). Both absent on a plain server and on the prefill leg.
 
         ``Glm5NextModel.forward`` splats these and refuses a count that disagrees with
         the stack, so this walks the banks ``bind_kv_cache`` kept (the spec's layer
@@ -6089,7 +6199,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         pages it names, so the allocator may place them anywhere. A decode step of
         ``B > 1`` requests hands one column per request (``[pages, B]``), one bank
         view per request for ``pool_cache`` and ``tail`` (tuples, so each ring
-        advances in place), and ``[B]`` int32 positions, seq lens and latent slots;
+        advances in place), ``[B]`` int32 positions and, per row, ``[B * width]``
+        int32 seq lens and int64 latent slots, where ``width`` is the rows each
+        request carries: one on the plain decode leg, ``1 + k`` on speculative
+        decoding's verify step (row ``b * width + t`` is request ``b``'s token
+        ``t``, at position ``start_b + t``, with causal length ``start_b + t + 1``);
         a prefill serves one request per forward (the scheduler schedules one).
 
         ``padded_requests`` counts the trailing requests that are a batch bucket's
@@ -6140,17 +6254,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 f"entry(ies) and {len(geometries)} geometry(ies); the three come "
                 f"from one walk and must pair"
             )
-        if not is_prefill and int(tokens) != int(requests):
-            # A decode step carries one token per request: the ring advances one
-            # position per sequence, its kernel taking a single key row and a single
-            # position. A step with more tokens than requests is speculative
-            # decoding's verify step, which this path does not implement.
+        if not is_prefill and int(tokens) % int(requests) != 0:
+            # A decode step carries the same number of rows for every request: one
+            # on the plain leg, ``1 + k`` on speculative decoding's verify step. Rows
+            # that do not divide into whole requests name no request.
             raise ValueError(
-                f"the decode leg advances each sequence's tail ring one position at a "
-                f"time, so a decode step carries exactly one token per request; this "
-                f"step carries {int(tokens)} token(s) for {int(requests)} request(s), "
-                f"and threading a multi-token decode, which is speculative decoding's "
-                f"verify step, is not this path's work"
+                f"a decode step carries one token per request, or 1 + k on a verify "
+                f"step, the same width for every request; this step carries "
+                f"{int(tokens)} token(s) for {int(requests)} request(s), which "
+                f"do not divide into whole requests"
             )
         real = int(tokens) if real_tokens is None else int(real_tokens)
         if real <= 0 or real > int(tokens):
@@ -6176,17 +6288,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 f"positions come from one batch and must agree"
             )
         # Each request's own real length and operand width. One request brings the
-        # whole padded step; several bring one row each, since a decode step carries
-        # one token per request. A prefill of several requests packs their tokens
-        # into one row set with no per-request width, and the sparse layer refuses
-        # such a call by name below, so the operands stay the batch's there.
+        # whole padded step; several bring the same width each (``tokens`` divides
+        # into whole requests above): one row on the plain decode leg, ``1 + k`` on
+        # a verify step, where row ``b * width + t`` is request ``b``'s token ``t``.
+        # A prefill of several requests packs their tokens into one row set with no
+        # per-request width, and the sparse layer refuses such a call by name
+        # below, so the operands stay the batch's there.
         # ``request_real_tokens`` comes from the block tables rather than from this
         # derivation, so the two are sourced independently and checked below.
         if bool(is_prefill) and len(starts) > 1:
             reals = [real]
             request_width = int(tokens)
         else:
-            request_width = int(tokens) if len(starts) == 1 else 1
+            request_width = int(tokens) // len(starts)
             if request_real_tokens is not None:
                 reals = [int(value) for value in request_real_tokens]
             elif len(starts) == 1:
@@ -6265,6 +6379,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         "start_position": cls._glm5next_start_positions(
                             linear_starts, device
                         ),
+                        **cls._glm5next_checkpoint_operands(
+                            state_checkpoints,
+                            checkpoint_rows,
+                            rows=len(linear_starts),
+                            device=device,
+                        ),
                         "real_tokens": torch.tensor(
                             [[one_real] for one_real in reals], dtype=torch.int32
                         ).to(device),
@@ -6308,13 +6428,24 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 # bank, so they travel as a tuple of views, never a copy: the
                 # recurrence advances in place. The positions are one tensor so no
                 # host number reaches the graph (see ``_glm5next_start_positions``).
+                # A bank holding ``1 + k`` state rows per slot (``[slots, 1 + k, ...]``,
+                # speculative method "mtp"; the bind records ``state_checkpoints = 1 + k``
+                # on the bank) hands a prefill the one-row carrier ``bank[slot, 0]`` -- a
+                # prefill writes row 0 -- and a decode the slot's rows whole. A plain
+                # bank's record carries no ``state_checkpoints`` key (absent = 1, the
+                # Stage-A record) and hands ``bank[slot]`` on both legs.
+                prefill_row = bool(is_prefill) and int(bank.get("state_checkpoints", 1)) > 1
+
+                def state_view(key, one_slot):
+                    return bank[key][one_slot, 0] if prefill_row else bank[key][one_slot]
+
                 carriers.append(
                     {
                         "conv_state": tuple(
-                            bank["conv_state"][one_slot] for one_slot in state_slots
+                            state_view("conv_state", one_slot) for one_slot in state_slots
                         ),
                         "recurrent_state": tuple(
-                            bank["recurrent_state"][one_slot]
+                            state_view("recurrent_state", one_slot)
                             for one_slot in state_slots
                         ),
                         "is_prefill": bool(is_prefill),
@@ -6322,7 +6453,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     }
                 )
                 continue
-            if len(state_slots) > 1:
+            # The request form (a tuple of ring views, ``[B]`` positions, request-major
+            # rows) is the sparse layer's ``T``-row leg: a step of several requests, or
+            # one request's verify step of ``1 + k`` rows. The one-ring form below
+            # serves exactly one token (the layer's ``tail_step``), so a one-request
+            # step keeps it only on the plain decode leg -- the Stage-A carrier, bit
+            # for bit -- and on the prefill leg.
+            if len(state_slots) > 1 or (not is_prefill and request_width > 1):
                 carriers.append(
                     cls._glm5next_sparse_batch_carrier(
                         bank,
@@ -6338,6 +6475,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         index_kpool=index_kpool,
                         operands=sparse_step_operands,
                         banked=banked,
+                        width=request_width,
                     )
                 )
                 continue
@@ -6474,6 +6612,64 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             carriers.append(carrier)
         return carriers
 
+    @staticmethod
+    def _glm5next_checkpoint_operands(
+        state_checkpoints, checkpoint_rows, *, rows: int, device
+    ) -> dict:
+        """The recurrent layers' ``state_checkpoints`` and ``checkpoint_rows`` operands; ``{}`` without.
+
+        ``checkpoint_rows`` is one int per row of the step (real requests first, then
+        the padding rows), each in ``0 .. state_checkpoints - 1``. The row axis is
+        assembled on the host and uploaded once per device, like the positions
+        beside it.
+        """
+        if state_checkpoints is None:
+            if checkpoint_rows is not None:
+                raise ValueError(
+                    "checkpoint_rows were handed without state_checkpoints; a checkpoint "
+                    "row to resume from means nothing on a bank with one row per slot"
+                )
+            return {}
+        checkpoints = int(state_checkpoints)
+        resume = [int(one) for one in (checkpoint_rows if checkpoint_rows is not None else [])]
+        if len(resume) != int(rows):
+            raise ValueError(
+                f"this step carries {int(rows)} row(s) and {len(resume)} checkpoint "
+                f"row(s); each row's slot resumes from its own row"
+            )
+        for index, one in enumerate(resume):
+            if not 0 <= one < checkpoints:
+                raise ValueError(
+                    f"row {index} resumes from checkpoint row {one} of a bank holding "
+                    f"{checkpoints} per slot; a verify step keeps at most "
+                    f"{checkpoints - 1} draft(s)"
+                )
+        return {
+            "state_checkpoints": checkpoints,
+            "checkpoint_rows": torch.tensor(resume, dtype=torch.int32).to(device),
+        }
+
+    def _glm5next_recurrent_checkpoints(
+        self, slots, *, is_prefill: bool
+    ) -> tuple[int, list[int]] | None:
+        """``(1 + k, the checkpoint row per slot)`` for a decode step under method "mtp", else None.
+
+        ``slots`` are the step's rows' slots, real requests first and the padding
+        rows' after. Each row resumes from its slot's recorded row
+        (``_glm5next_checkpoint_rows``, written by the per-step state hook; a slot
+        never verified from, just prefilled, or owned by nobody resumes from 0), so a
+        padding row that had to take a slot owned by a request this step does not
+        schedule rewrites that slot with its own bytes. A synthetic step resumes
+        every slot from 0.
+        """
+        if is_prefill or not getattr(self, "is_mtp_spec", False):
+            return None
+        recorded = self._glm5next_checkpoint_rows
+        return (
+            1 + int(self.drafter.num_speculative_tokens),
+            [int(recorded.get(int(one_slot), 0)) for one_slot in slots],
+        )
+
     def _glm5next_model_kwargs(self, kwargs: dict) -> dict:
         """Translate the generic model kwargs for the carrier-passing GLM-5.3-Flash family.
 
@@ -6483,9 +6679,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         The root forward declares ``input_ids``, ``layer_carriers``,
         ``sampling_positions`` and three parallelism arguments, so the generic
-        ``positions``, ``sampling_params``, ``spec_decode_metadata``, ``rank``,
-        ``logit_mask`` and ``rotary_position_ids`` are dropped once the batch
-        geometry has been read out of ``attn_metadata``. ``block_size`` is not passed
+        ``positions``, ``sampling_params``, ``rank``, ``logit_mask`` and
+        ``rotary_position_ids`` are dropped once the batch geometry has been read
+        out of ``attn_metadata``. ``spec_decode_metadata`` alone crosses under its
+        own name, and only on a verify step (a decode carrying ``1 + k`` rows per
+        request): the root runs the rejection sampler itself so the draft can start
+        from the accepted row in the same graph. ``block_size`` is not passed
         either: the root's parameter of that name is the FP8 weight-quant block, not
         the KV page, which reaches the layers on each carrier's ``page_size``.
         ``moe_group``, ``tp_degree`` and ``expert_parallel_rank`` are supplied on
@@ -6759,17 +6958,34 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         )
         # A decode step padded to its batch bucket: the input builder pads the token
         # rows to the bucket while the block tables keep one row per request, so the
-        # rows past the requests are padding, one token each and no request's. Each
-        # gets a slot no request in this step holds, so every view stays disjoint.
-        # A decode with more than one token per request is not padding; it reaches
-        # the carrier builder's multi-token refusal unchanged.
+        # rows past the requests are padding, ``width`` rows each and no request's.
+        # Each gets a slot no request in this step holds, so every view stays
+        # disjoint. The width is the rows every request carries: one on the plain
+        # decode leg, ``1 + k`` on speculative decoding's verify step. The requests
+        # of one step must agree on it (the kernels take one row set per request):
+        # a batch where one request carries drafts and another none is refused by
+        # name rather than laid out.
         padding = 0
-        if (
-            not is_prefill
-            and tokens > len(request_starts)
-            and all(int(count) == 1 for count in request_tokens)
-        ):
-            padding = tokens - len(request_starts)
+        width = 1
+        if not is_prefill:
+            widths = sorted({int(count) for count in request_tokens})
+            if len(widths) != 1:
+                raise ValueError(
+                    f"the requests of one decode step must carry the same number of "
+                    f"tokens each (one, or 1 + k on a speculative verify step) and this "
+                    f"step's carry {[int(count) for count in request_tokens]}; a mixed "
+                    f"batch has no one row width, so it is refused rather than padded "
+                    f"request by request"
+                )
+            width = widths[0]
+            if tokens % width != 0 or tokens // width < len(request_starts):
+                raise ValueError(
+                    f"this decode step carries {tokens} token row(s) for "
+                    f"{len(request_starts)} request(s) of {width} token(s) each; the "
+                    f"rows are padded to the batch bucket by whole requests, so they "
+                    f"divide into at least that many requests of that width"
+                )
+            padding = tokens // width - len(request_starts)
         padding_slots = (
             self._glm5next_idle_slots(banks, state_slots, padding) if padding else []
         )
@@ -6807,6 +7023,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     side_caches=side_caches,
                     is_prefill=is_prefill,
                 )
+        checkpoints = self._glm5next_recurrent_checkpoints(
+            list(state_slots) + padding_slots, is_prefill=is_prefill
+        )
         carriers = self._glm5next_layer_carriers(
             banks,
             side_caches,
@@ -6839,12 +7058,30 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             request_real_tokens=list(request_tokens) + [0] * padding,
             active_mla_query_rows=active_mla_query_rows,
             padded_requests=padding,
+            # Speculative method "mtp": the recurrent layers' checkpoint geometry and
+            # each row's checkpoint row to resume from, padding rows included; None
+            # on a prefill or a plain server.
+            state_checkpoints=None if checkpoints is None else checkpoints[0],
+            checkpoint_rows=None if checkpoints is None else checkpoints[1],
         )
         # The cursor advances only once the carriers exist: the call above can still
-        # refuse (multi-token decode, paging disagreement, slot out of range), and a
-        # refused step must leave no trace. A synthetic step takes no claim. Each
-        # request advances by its own real tokens, not the batch's total or the
-        # bucket's width.
+        # refuse (paging disagreement, slot out of range), and a refused step must
+        # leave no trace. A synthetic step takes no claim. Each request advances by
+        # its own real tokens, not the batch's total or the bucket's width. On a
+        # verify step that is every row it carries; the per-step state hook
+        # (``_update_states_after_model_execute``) pulls the cursor back to the
+        # accepted count once the host knows it, from the record kept here, which
+        # the mtp draft proposal reads too (``_glm5next_propose_drafts``). A
+        # prefill has no per-request row width.
+        self._glm5next_step_record = None
+        if not synthetic_step:
+            self._glm5next_step_record = {
+                "slots": [int(one_slot) for one_slot in state_slots],
+                "starts": [int(one_start) for one_start in request_starts],
+                "counts": [int(one_count) for one_count in request_tokens],
+                "is_prefill": bool(is_prefill),
+                "width": None if is_prefill else int(width),
+            }
         if not synthetic_step:
             for one_slot, one_start, one_count in zip(
                 state_slots, request_starts, request_tokens
@@ -6872,6 +7109,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # so captured and served graphs share a signature. Absent unless a dump
             # directory is configured.
             **self._layer_stream_kwargs(),
+            # The draft's iteration count, from the one place the runner reads it
+            # (the proposer under speculative method "mtp", the knob's reader under
+            # the shadow draft); absent with no head, so the signature every
+            # non-drafting serve traced is unchanged.
+            **self._glm5next_draft_kwargs(),
+            # The verify step's metadata, for the root's rejection sampler; {} on
+            # every other step, so the one-row decode and prefill signatures are
+            # the ones every non-speculative serve traced.
+            **self._glm5next_verify_kwargs(kwargs, is_prefill=is_prefill),
             # Shadow draft (MTP stage A): the prefill leg's boundary id; {} with the knob off.
             **self._glm5next_shadow_kwargs(
                 is_prefill=is_prefill,
@@ -7206,7 +7452,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 batch_size,
             )
 
-            # === Draft model decode graph capture ===
+        # === Draft model decode graph capture (eagle only: the mtp draft is in the target) ===
+        if isinstance(self.drafter, EagleProposer):
             logger.info("Capturing EAGLE3 decode graphs for batch size: %d", batch_size)
             num_spec_tokens = self.speculative_config.num_speculative_tokens
             draft_num_tokens = batch_size * (1 + num_spec_tokens)
@@ -7331,7 +7578,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 kwargs["input_ids"].shape[0],
             )
 
-            # === Draft model warmup ===
+        # === Draft model warmup (eagle only: the mtp draft is in the target) ===
+        if isinstance(self.drafter, EagleProposer):
             logger.info("Warming up EAGLE3 for batch size: %d", batch_size)
             num_spec_tokens = self.speculative_config.num_speculative_tokens
             draft_num_tokens = batch_size * (1 + num_spec_tokens)
@@ -8155,23 +8403,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # aux_hidden_states is None when eagle3 is not active.
         if self.is_eagle3_spec and aux_hidden_states is not None:
             max_position = positions.max().item() if positions.numel() > 0 else 0
-            num_spec_tokens = self.drafter.num_speculative_tokens
-            # Stop proposing early enough that the scheduler never trims
-            # draft tokens. After this step's verification with full acceptance,
-            # num_computed_tokens becomes max_position + 1. The scheduler trims
-            # when num_computed_tokens >= max_model_len - 1 - num_spec_tokens.
-            # So we skip when max_position + 1 >= max_model_len - 1 - num_spec_tokens,
-            # i.e., max_position >= max_model_len - num_spec_tokens - 2.
-            #
-            # Async scheduling adds one step of pipelining (batch_queue=2), so
-            # by the time we decide to skip_propose at step K, step K+1 has
-            # already been scheduled by the engine. To ensure K+1 doesn't
-            # schedule drafts that the scheduler would then trim, we need to
-            # skip one step earlier: subtract one full spec-decode step
-            # (1 + num_spec_tokens) from the limit.
-            spec_decode_limit = self.max_model_len - num_spec_tokens - 2
-            if self.use_async_scheduling:
-                spec_decode_limit -= 1 + num_spec_tokens
+            # Stop proposing early enough that the scheduler never trims draft
+            # tokens (the derivation is ``_spec_decode_limit``'s).
+            spec_decode_limit = self._spec_decode_limit()
 
             # Skip draft proposal in two cases to avoid recompilation:
             # 1. Near max_model_len: proposed tokens would exceed the
@@ -8223,21 +8457,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     # On the next step the target model verifies with
                     # spec decode NEFFs, after which the real EAGLE3
                     # proposer takes over.
-                    num_spec_tokens = self.drafter.num_speculative_tokens
-                    pad_token_id = getattr(
-                        self.vllm_config.model_config.hf_config,
-                        "pad_token_id",
-                        None,
-                    )
-                    if pad_token_id is None:
-                        logger.warning(
-                            "Model does not define pad_token_id, falling "
-                            "back to token 0 for DI spec decode placeholder "
-                            "drafts."
-                        )
-                        pad_token_id = 0
                     self._draft_token_ids = [
-                        [pad_token_id] * num_spec_tokens for _ in range(num_reqs)
+                        self._placeholder_drafts() for _ in range(num_reqs)
                     ]
                 else:
                     self._draft_token_ids = None
@@ -8261,6 +8482,21 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     logits_indices=logits_indices,
                     raw_sampled_token_ids=raw_sampled_token_ids,
                 )
+        elif self.is_mtp_spec:
+            # Speculative method "mtp": the root drafted inside the target graph;
+            # proposing is host bookkeeping on this step's record
+            # (``_glm5next_propose_drafts``), so no operand is read back here.
+            self._draft_token_ids = self._propose_draft_token_ids(
+                scheduler_output=scheduler_output,
+                sampled_token_ids=sampler_output.sampled_token_ids,
+                aux_hidden_states=None,
+                spec_decode_metadata=spec_decode_metadata,
+                input_ids=input_ids,
+                positions=positions,
+                attn_metadata=attn_metadata,
+                logits_indices=logits_indices,
+                raw_sampled_token_ids=raw_sampled_token_ids,
+            )
 
         # Trim sampler output back to real num_reqs before output generation.
         # With spec decode batch padding, the sampler runs at padded_num_reqs;
@@ -9553,6 +9789,46 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         req_ids = self.input_batch.req_ids[:num_reqs]
         return any(not spec_tokens.get(req_id) for req_id in req_ids)
 
+    def _local_force_nonspec(self, scheduler_output: "SchedulerOutput") -> bool:
+        """This rank's vote to run the one-row (non-spec) decode graph this step.
+
+        Two voters. A disaggregated-inference consumer whose step has no drafts or
+        is a mixed batch (``_local_step_forces_nonspec``, unchanged). And a
+        GLM-5.3-Flash server under speculative method "mtp" whose step is mixed
+        (``_glm5next_step_is_mixed``): the translator serves one row width per step,
+        so a step whose requests carry different draft counts -- a request's first
+        decode beside drafted ones, or one whose drafts the scheduler truncated near
+        ``max_model_len`` -- is stripped to one token per request by
+        ``_maybe_strip_spec_for_nonspec_step`` and speculation resumes on the next
+        step. A uniform step, with or without drafts, keeps its shape. O(B) host
+        ints.
+        """
+        kv_transfer = self.vllm_config.kv_transfer_config
+        if (
+            kv_transfer is not None
+            and kv_transfer.is_kv_consumer
+            and self._local_step_forces_nonspec(scheduler_output)
+        ):
+            return True
+        return bool(getattr(self, "is_mtp_spec", False)) and self._glm5next_step_is_mixed(
+            scheduler_output
+        )
+
+    def _glm5next_step_is_mixed(self, scheduler_output: "SchedulerOutput") -> bool:
+        """True when this step's scheduled requests carry different draft counts.
+
+        Read off ``scheduled_spec_decode_tokens`` for the batch's requests (a request
+        absent from it carries none). A step with no drafts at all is uniform.
+        """
+        spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        if not spec_tokens:
+            return False
+        num_reqs = self.input_batch.num_reqs
+        counts = {
+            len(spec_tokens.get(req_id, ())) for req_id in self.input_batch.req_ids[:num_reqs]
+        }
+        return len(counts) > 1
+
     def _maybe_strip_spec_for_nonspec_step(
         self,
         scheduler_output: "SchedulerOutput",
@@ -10463,14 +10739,80 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
     ) -> None:
         """Update the cached states after model execution.
 
-        On GPU this handles MTP/EAGLE for hybrid models (linear attention
-        state shifting). Neuron does not support hybrid models yet, so this
-        is a no-op.
+        Upstream's hook for a hybrid model's linear-attention state under
+        speculative decoding. The GLM-5.3-Flash translator
+        (``_glm5next_model_kwargs``) runs before the step knows how many drafts the
+        trunk accepts, so a verify step advances every request's indexer-ring cursor
+        past all ``1 + k`` of its rows. Here, with the rejection sampler's rows on
+        the host (``kept`` ids per request, ``1 .. 1 + k``), the cursor is pulled
+        back to ``start + kept``; the kept counts are committed to the recurrent
+        layers' checkpoint banks
+        (:func:`~vllm_neuron.functional.kda.fused_decode.commit_kda_checkpoints`, a
+        pointer commit: it validates the banks' ``1 + k`` rows and the counts, no
+        bytes move) when the stack has recurrent layers; and ``kept - 1`` -- the
+        accepted draft count -- is recorded for the request's slot, which the next
+        step's recurrent carriers hand the KDA layers as ``checkpoint_rows``, the
+        row to resume from. A one-row decode or a prefill records 0 for its slots and
+        commits nothing (a prefill writes row 0; a one-row step's layer writes the
+        whole slot from its one token); its cursor already stands where the
+        translator put it. A synthetic step (warmup, the idle dummy step) recorded
+        nothing and nothing happens, as for every model outside this family. O(B)
+        host ints; no device value is read; the commit's returned tensor (the same
+        counts, for the asynchronous series' device-side carry) is not read here.
 
-        The parameter order matches the caller, which passes
+        ``sampled_token_ids`` is the sampler's list, one row per request in batch
+        order, possibly padded to the batch bucket past the real requests. The
+        parameter order matches the caller, which passes
         ``(sampled_token_ids, scheduler_output)`` positionally, as upstream does.
+
+        Raises:
+            ValueError: fewer sampler rows than the step's requests, or a verify
+                row kept outside ``1 .. 1 + k``.
         """
-        pass
+        record = self._glm5next_step_record
+        if record is None:
+            return
+        slots, starts, width = record["slots"], record["starts"], record["width"]
+        rows = list(sampled_token_ids)
+        if len(rows) < len(slots):
+            raise ValueError(
+                f"this step named {len(slots)} request(s) and the sampler returned "
+                f"{len(rows)} row(s); the state hook reads one row per request, in "
+                f"batch order"
+            )
+        verify = not record["is_prefill"] and int(width) > 1
+        kept_counts: list[int] = []
+        for slot, start, row in zip(slots, starts, rows):
+            resume_row = 0
+            if verify:
+                kept = len(row)
+                if not 1 <= kept <= int(width):
+                    raise ValueError(
+                        f"the request at slot {slot} kept {kept} id(s) of a verify step "
+                        f"{width} row(s) wide; the rejection sampler keeps at least the "
+                        f"first mismatch's correction and at most every row, so a count "
+                        f"outside 1 .. {width} is not this step's"
+                    )
+                self._glm5next_side_cache_positions[int(slot)] = int(start) + kept
+                kept_counts.append(kept)
+                resume_row = kept - 1
+            self._glm5next_checkpoint_rows[int(slot)] = resume_row
+        if verify:
+            recurrent = [
+                bank[key]
+                for bank in self.model.glm5next_layer_banks
+                if bank["family"] != "self_attn"
+                for key in ("conv_state", "recurrent_state")
+            ]
+            if recurrent:
+                from vllm_neuron.functional.kda.fused_decode import commit_kda_checkpoints
+
+                commit_kda_checkpoints(
+                    recurrent,
+                    [int(slot) for slot in slots],
+                    kept_counts,
+                    state_checkpoints=1 + int(self.drafter.num_speculative_tokens),
+                )
 
     def _update_batch_state_with_samples(
         self,
@@ -10574,6 +10916,93 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self._draft_token_ids = None
         return DraftTokenIds(req_ids, draft_token_ids)
 
+    def _spec_decode_limit(self) -> int:
+        """The row position from which no drafts are proposed, so the scheduler never trims one.
+
+        After a step's verification with full acceptance ``num_computed_tokens``
+        becomes ``max_position + 1``, and the scheduler trims drafts once
+        ``num_computed_tokens >= max_model_len - 1 - num_spec_tokens``; proposing
+        stops when ``max_position + 1`` would reach that, i.e. at
+        ``max_position >= max_model_len - num_spec_tokens - 2``. Async scheduling
+        adds one step of pipelining (``batch_queue=2``): when step K decides to stop,
+        step K+1 is already scheduled, so the limit moves one full speculative step
+        (``1 + num_spec_tokens``) earlier.
+        """
+        num_spec_tokens = int(self.drafter.num_speculative_tokens)
+        limit = int(self.max_model_len) - num_spec_tokens - 2
+        if self.use_async_scheduling:
+            limit -= 1 + num_spec_tokens
+        return limit
+
+    def _placeholder_drafts(self) -> list[int]:
+        """``num_speculative_tokens`` copies of the model's pad id: a draft row that bootstraps speculation.
+
+        The rejection sampler rejects them (or accepts one that happens to equal the
+        trunk's own argmax, which changes no output), and the step after runs with
+        real drafts. Token 0 stands in, with a warning, for a model whose config
+        names no ``pad_token_id``.
+        """
+        pad_token_id = getattr(self.vllm_config.model_config.hf_config, "pad_token_id", None)
+        if pad_token_id is None:
+            logger.warning(
+                "Model does not define pad_token_id, falling back to token 0 for "
+                "spec decode placeholder drafts."
+            )
+            pad_token_id = 0
+        return [int(pad_token_id)] * int(self.drafter.num_speculative_tokens)
+
+    def _glm5next_propose_drafts(self, sampled_token_ids) -> list[list[int]]:
+        """Speculative method "mtp": this step's drafts for the scheduler, one list per request.
+
+        The root drafted inside the target graph, so nothing runs here; the host
+        decides what the scheduler sees, from the translator's record of the step
+        (``_glm5next_step_record``):
+
+        * a decode step: the ``[B, k]`` draft ids the root returned
+          (``_glm5next_shadow_take_output`` holds them), the first ``num_reqs`` rows
+          read back to the host -- one more read of this step's output beside the
+          sampled ids the synchronous runner already read back; a ``-1`` ends a row
+          (``MtpProposer.take_drafts``);
+        * a prefill: ``k`` placeholder drafts (``_placeholder_drafts``) for every
+          request that sampled a token, so its first decode is a verify step as wide
+          as every other request's -- the translator serves one row width per
+          batch -- and the trunk rejects them; a chunk that sampled nothing gets
+          none;
+        * near ``max_model_len`` (``_spec_decode_limit``) or after a synthetic step:
+          none, so the scheduler never trims a draft and the next step runs the
+          one-row graph for the whole batch.
+
+        Returns:
+            ``num_reqs`` lists of ``k`` or 0 ints.
+
+        Raises:
+            ValueError: a decode step whose root output carried no draft ids.
+        """
+        num_reqs = int(self.input_batch.num_reqs)
+        record = self._glm5next_step_record
+        if record is None:
+            return [[] for _ in range(num_reqs)]
+        if record["is_prefill"]:
+            rows = list(sampled_token_ids)[:num_reqs]
+            rows += [[] for _ in range(num_reqs - len(rows))]
+            placeholder = self._placeholder_drafts()
+            return [list(placeholder) if len(row) else [] for row in rows]
+        last_row = max(
+            int(start) + int(count) - 1
+            for start, count in zip(record["starts"], record["counts"])
+        )
+        if last_row >= self._spec_decode_limit():
+            return [[] for _ in range(num_reqs)]
+        drafts = self._glm5next_shadow_last_drafts
+        if drafts is None:
+            raise ValueError(
+                "this decode step's root output carried no draft ids under speculative "
+                "method \"mtp\"; the GLM-5.3-Flash root drafts k tokens on every decode "
+                "step and the runner takes them off its output "
+                "(``_glm5next_shadow_take_output``)"
+            )
+        return MtpProposer.take_drafts(drafts[:num_reqs].cpu())
+
     def _propose_draft_token_ids(
         self,
         scheduler_output: Any,
@@ -10586,8 +11015,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         logits_indices: torch.Tensor | None = None,
         raw_sampled_token_ids: torch.Tensor | None = None,
     ) -> list[list[int]] | torch.Tensor:
-        # TODO: now only supports EAGLE speculative decoding
-        # Add more when needed
+        if getattr(self, "is_mtp_spec", False):
+            # Speculative method "mtp": the drafts are the root's own output; none
+            # of the eagle operands are read.
+            return self._glm5next_propose_drafts(sampled_token_ids)
         assert isinstance(self.drafter, EagleProposer)
 
         num_reqs = self.input_batch.num_reqs
@@ -10759,6 +11190,20 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         block_sizes = [
             group.kv_cache_spec.block_size for group in kv_cache_config.kv_cache_groups
         ]
+        # Each group's block-table row must hold every block the scheduler hands a
+        # request there: the sequence's pages, plus a recurrent group's draft blocks
+        # on a speculative server (``draft_blocks_per_request``, the figure the KV
+        # need is priced with; the GPU runner sizes its rows the same way). vLLM's
+        # default row, ``cdiv(max_model_len, block_size)``, overflows on the first
+        # drafting request otherwise ("could not broadcast input array").
+        max_num_blocks_per_req = [
+            cdiv(self.max_model_len, group.kv_cache_spec.block_size)
+            + draft_blocks_per_request(
+                group.kv_cache_spec,
+                f"KV cache group {index} ({', '.join(group.layer_names)})",
+            )
+            for index, group in enumerate(kv_cache_config.kv_cache_groups)
+        ]
         logger.info(
             "KV cache block_size resolved: cache_config=%s, per_group=%s",
             self.vllm_config.cache_config.block_size,
@@ -10774,6 +11219,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             vocab_size=self.vocab_size,
             block_sizes=block_sizes,
             kernel_block_sizes=block_sizes,
+            max_num_blocks_per_req=max_num_blocks_per_req,
             logitsprocs=None,
             logitsprocs_need_output_token_ids=False,
             is_pooling_model=self.is_pooling_model,
@@ -10943,12 +11389,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     # budgets is unchanged. ``strict=True`` inside, because
                     # upstream pairs the two carriers with a non-strict zip, so a
                     # short ``dtypes`` tuple would silently under-allocate the slot.
+                    # ``checkpoints``: the state rows a slot holds, ``1 + k`` on a
+                    # speculative server (``num_speculative_blocks`` of the spec, the
+                    # rows ``slot_bytes`` was priced for), one otherwise.
                     kv_caches[layer_name] = state_bank_regions(
                         raw_tensor,
                         kv_cache_spec.shapes,
                         kv_cache_spec.dtypes,
                         slot_bytes=slot_bytes,
                         dtype_view=_shared_dtype_view,
+                        checkpoints=1 + int(kv_cache_spec.num_speculative_blocks),
                     )
                     assert len(kv_caches[layer_name]) == len(kv_cache_spec.shapes)
                     assert all(
@@ -10966,7 +11416,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # This binds the cache tensors to the model
         self.model.bind_kv_cache(kv_caches)
 
-        if self.speculative_config and self.speculative_config.use_eagle():
+        # The mtp head's KV layer is in the root's own spec and banks; only an eagle
+        # drafter binds a model of its own.
+        if _eagle_drafter_has_its_own_model(self.speculative_config):
             assert isinstance(self.drafter, EagleProposer)
             # This binds the cache tensors to the draft model
             self.drafter.model.bind_kv_cache(kv_caches)
@@ -11035,6 +11487,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 # the global KV cache dtype describes a key/value cache and would
                 # mistype an fp32 recurrent state. ``page_size_padded`` is set
                 # after the loop, once the attention page is known.
+                # ``num_speculative_blocks``: one extra state row per draft token, so
+                # a verify step of ``1 + k`` tokens can keep every token's carriers
+                # and the next step start from the accepted one
+                # (``functional.kda.fused_decode``, "Checkpoint banks"). Upstream's
+                # field, read from the speculative config, never a literal.
                 spec = MambaSpec(
                     block_size=recurrent_block_size,
                     shapes=(
@@ -11044,6 +11501,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     dtypes=(
                         layer.kda_conv_state_dtype,
                         layer.kda_recurrent_state_dtype,
+                    ),
+                    num_speculative_blocks=(
+                        int(self.speculative_config.num_speculative_tokens)
+                        if self.speculative_config is not None
+                        else 0
                     ),
                 )
             # A latent-attention layer caches one compressed vector per token and
@@ -11149,7 +11611,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         spec, page_size_padded=attention_page
                     )
 
-        if self.speculative_config and self.speculative_config.use_eagle():
+        # The mtp head's layer is already in the root's ``get_kv_spec`` (it holds the
+        # head); only an eagle drafter brings layers of its own.
+        if _eagle_drafter_has_its_own_model(self.speculative_config):
             assert isinstance(self.drafter, EagleProposer)
 
             drafter_kv_spec = self.drafter.model.get_kv_spec()
@@ -11666,21 +12130,49 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
     # ------------------------------------------------------------------------
 
     def _glm5next_shadow_k(self) -> int:
-        """The number of shadow drafts per step for the model this runner serves.
+        """The number of tokens the served root drafts per step; ``0`` with no head.
 
         ``0`` unless the served root built its draft head (``model.mtp``, stage A
         contract C2: the GLM-5.3-Flash root builds it at construction exactly when
-        ``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT`` is above 0). The knob is GLM-specific and
-        this runner is not, so the hooks key on the head, never on the environment
-        alone: another model's tuple output is left untouched whatever the knob says.
-        The value comes from the knob's one reader, ``mtp.shadow_draft_k`` (contract
-        C1), which reads ``envs`` and bounds it.
+        the head's reader of ``k`` is above 0). The knob is GLM-specific and this
+        runner is not, so the hooks key on the head, never on the environment alone:
+        another model's tuple output is left untouched whatever the knob says. Under
+        speculative method "mtp" the count is the proposer's
+        (``num_speculative_tokens``), which the proposer checked against the head's at
+        load; otherwise it is the ``draft_k`` the root read once at construction from
+        the knob's one reader (``mtp.shadow_draft_k``, contract C1) -- never re-read
+        here, where the worker's config context is gone and the reader would fall
+        back to the knob.
         """
         if getattr(getattr(self, "model", None), "mtp", None) is None:
             return 0
-        from vllm_neuron.model.glm5_next import mtp as mtp_module
+        if getattr(self, "is_mtp_spec", False):
+            return int(self.drafter.num_speculative_tokens)
+        return int(self.model.draft_k)
 
-        return int(mtp_module.shadow_draft_k())
+    @staticmethod
+    def _glm5next_verify_kwargs(kwargs: dict, *, is_prefill: bool) -> dict:
+        """The root's ``spec_decode_metadata`` keyword: the step's own on a verify step, else ``{}``.
+
+        The runner builds the metadata only for a decode step on which some request
+        carries drafts (``scheduled_spec_decode_tokens`` non-empty), so its presence
+        is the step's classification; it is never built on the prefill leg, and a
+        prefill is not handed one even if a caller passes it.
+        """
+        metadata = kwargs.get("spec_decode_metadata")
+        if is_prefill or metadata is None:
+            return {}
+        return {"spec_decode_metadata": metadata}
+
+    def _glm5next_draft_kwargs(self) -> dict:
+        """The root's ``draft_k`` keyword for this step: ``{}`` when nothing drafts.
+
+        The root reads the knob's reader itself when the keyword is absent (the
+        shadow draft's direct callers); the runner names the count explicitly so the
+        forward never re-reads a knob at step time.
+        """
+        k = self._glm5next_shadow_k()
+        return {"draft_k": k} if k > 0 else {}
 
     def _glm5next_shadow_log_path(self) -> str:
         """``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG``: the JSONL path, "" = no log."""

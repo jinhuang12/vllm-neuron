@@ -81,6 +81,9 @@ if TYPE_CHECKING:
     # GLM-5.3-Flash shadow draft (MTP stage A): run the layer-45 draft head k times
     # per decode step beside the trunk and return the k draft ids; 0 = off. The
     # sampled tokens never read the draft. Read through ``mtp.shadow_draft_k()``.
+    # Diagnostic (shadow) path: with ``--speculative-config '{"method": "mtp", ...}'``
+    # the speculative config is the production reader of k, and a set knob must
+    # agree with it.
     VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT: int = 0
     # Build the GLM-5.3-Flash step's attention metadata on the host only: no per-step
     # block-table / slot-mapping uploads that its graph never reads.

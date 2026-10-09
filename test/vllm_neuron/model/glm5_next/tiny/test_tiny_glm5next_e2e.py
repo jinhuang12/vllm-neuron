@@ -1171,8 +1171,10 @@ def _live_rings(runner, banks):
     return [side for side in runner._glm5next_live_side_caches(banks) if "tail" in side]
 
 
-def test_the_decode_leg_refuses_a_step_carrying_more_than_one_token():
-    """A decode step with more than one token is refused by name."""
+def test_the_decode_leg_serves_uniform_multi_row_steps_and_refuses_ragged_ones():
+    """A decode step of several rows per request (speculative decoding's verify step,
+    ``T = 1 + k`` rows each) is served; rows that do not divide into whole requests are
+    refused by name."""
     _require_cpu_mode()
     fixture = _fixture()
     root = fixture["root"]
@@ -1182,50 +1184,69 @@ def test_the_decode_leg_refuses_a_step_carrying_more_than_one_token():
     if MULTI_TOKEN_DECODE <= 1:
         raise item.VacuousControlError(
             f"this check needs a decode carrying more than one token; it carries "
-            f"{MULTI_TOKEN_DECODE}, which is what the refusal allows"
+            f"{MULTI_TOKEN_DECODE}, which is what a one-row step carries"
         )
     side = NeuronModelRunner._glm5next_side_caches(
         banks,
         index_kpool=int(text_config.index_kpool),
         index_head_dim=int(text_config.index_head_dim),
-        max_seq_len=item.STACK_TOKENS,
+        max_seq_len=item.STACK_TOKENS + MULTI_TOKEN_DECODE,
         request_slots=E2E_STATE_SLOTS,
     )
 
-    def build(tokens: int):
+    def build(tokens: int, requests: int = 1):
+        # The step's rows sit past the prompt, so the row names the pages they land on.
+        blocks = _blocks_for(item.STACK_TOKENS + tokens)
+        geometries = _geometries(banks, block_ids=range(blocks), state_slot=0)
+        for geometry in geometries:
+            geometry["request_block_ids"] = [list(geometry["block_ids"])] * requests
+            geometry["state_slots"] = list(range(requests))
         return NeuronModelRunner._glm5next_layer_carriers(
             banks,
             side,
-            geometries=_geometries(banks, block_ids=range(PROMPT_BLOCKS), state_slot=0),
+            geometries=geometries,
             is_prefill=False,
             tokens=tokens,
             start_position=item.STACK_TOKENS,
             softmax_scale=item.MLA_SOFTMAX_SCALE,
-            max_seq_len=item.STACK_TOKENS + tokens,
+            max_seq_len=item.STACK_TOKENS + MULTI_TOKEN_DECODE,
             index_kpool=int(text_config.index_kpool),
+            requests=requests,
+            request_starts=[item.STACK_TOKENS] * requests,
+            real_tokens=tokens // requests,
+            request_real_tokens=[tokens // requests] * requests,
         )
 
+    # One request, every row its own: the verify step's layout.
+    carriers = build(MULTI_TOKEN_DECODE)
+    sparse = [carrier for carrier in carriers if "seq_lens" in carrier]
+    assert sparse, "the fixture exposes no sparse layer, so the multi-row step was not laid out"
+    for carrier in sparse:
+        assert carrier["seq_lens"].tolist() == [
+            item.STACK_TOKENS + 1 + t for t in range(MULTI_TOKEN_DECODE)
+        ]
+    # The same rows over two requests do not divide: refused, naming the count.
     with pytest.raises(ValueError) as caught:
-        build(MULTI_TOKEN_DECODE)
+        build(MULTI_TOKEN_DECODE, requests=2)
     message = str(caught.value)
-    assert "threading a multi-token decode" in message, (
-        f"a {MULTI_TOKEN_DECODE}-token decode raised, but not the refusal this check names: "
-        f"{message}"
+    assert "do not divide into whole requests" in message, (
+        f"a {MULTI_TOKEN_DECODE}-row step over two requests raised, but not the refusal this "
+        f"check names: {message}"
     )
     assert f"{MULTI_TOKEN_DECODE} token(s)" in message, (
         "the refusal does not report the count it actually saw, so a reader cannot tell "
         "which step was refused"
     )
-
+    # Control: two requests at one row each are served, so the refusal measures the division.
     control = None
     try:
-        build(1)
+        build(2, requests=2)
     except Exception as exc:
         control = f"{type(exc).__name__}: {exc}"
-    if control is not None and "threading a multi-token decode" in control:
+    if control is not None and "do not divide into whole requests" in control:
         raise item.VacuousControlError(
-            "a single-token decode raised the multi-token refusal too, so this check is not "
-            "measuring the token count and would pass with the guard removed"
+            "a one-row-per-request step raised the division refusal too, so this check is not "
+            "measuring the division and would pass with the guard removed"
         )
 
 

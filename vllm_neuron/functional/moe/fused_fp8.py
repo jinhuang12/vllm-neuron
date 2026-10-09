@@ -6,10 +6,10 @@ device routing for one compiled row bucket and performs the usual FP32 combine
 of the returned expert contributions.
 """
 
-import os
-
 import torch
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+
+from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 
 from .moe_fused_fp8 import moe_fused_fp8_kernel
 from .moe_fused_fp8_decode import compact_decode_kernel
@@ -99,7 +99,7 @@ def fused_fp8_experts(hidden, packed, row_ids, expert_ids, affinity, bounds,
             raise ValueError("All operands must be contiguous and on the same device")
     _count_nki_dispatch()
     if (
-        os.environ.get("NEURON_LOGICAL_NC_CONFIG") == "2"
+        lnc_pair()
         and tuple(hidden.shape) == (2, 4096)
         and tuple(row_ids.shape) == (8, 1)
         and experts == 18
