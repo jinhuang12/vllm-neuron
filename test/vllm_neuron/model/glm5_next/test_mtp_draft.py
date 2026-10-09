@@ -184,10 +184,34 @@ def read_all_counters() -> dict[str, tuple[int, int]]:
     return out
 
 
-def read_route_counts() -> tuple[int, int, int, int]:
-    """``(ring_dispatch, scores_dispatch, two_program_dispatch, select_dispatch)`` since the
-    last reset. The decode selection is one kernel (``decode_select``), counted here."""
-    return tuple(int(v) for v in _decode_batch().decode_batch_route_counts())
+def read_route_counts() -> tuple[int, int, int]:
+    """``(ring_dispatch, scores_dispatch, two_program_dispatch)`` since the last reset.
+
+    The decode-batch family's route counts begin with these three on every tree; a tree
+    whose selection is one fused kernel appends a fourth (:func:`read_selection_count`).
+    """
+    return tuple(int(v) for v in _decode_batch().decode_batch_route_counts()[:3])
+
+
+def selection_is_fused() -> bool:
+    """Whether this tree selects with one fused decode kernel.
+
+    ``functional/dsa/decode_select.py`` (top-k, sentinel, order and expand in one kernel)
+    counts its dispatches as the decode-batch family's fourth route entry,
+    ``select_dispatch``; a tree without it selects with the ``topk_select`` family and
+    expands with ``index_expand``, one dispatch each per selection. Read off the route
+    tuple's width, the one API both forms share, so these tests pin what the indexer does
+    (select once per draft when sharing, once per iteration otherwise) and not which
+    kernel the tree does it with.
+    """
+    return len(_decode_batch().decode_batch_route_counts()) >= 4
+
+
+def read_selection_count() -> int:
+    """Selection dispatches since the last reset, whichever kernel the tree selects with."""
+    if selection_is_fused():
+        return int(_decode_batch().decode_batch_route_counts()[3])
+    return read_all_counters()["topk_select"][0]
 
 
 # --------------------------------------------------------------------------- #
@@ -961,10 +985,11 @@ def test_index_share_skips_the_indexer_only_when_set_and_selecting(regime, flag,
     assert fx["prefill"] + DRAFT_K <= bound
     reset_all_counters()
     got = _draft(fx, fx["prefill"], DRAFT_K)
-    ring, scores, _two, select = read_route_counts()
-    assert (ring, scores, select) == want, (
-        f"{regime} flag={flag}: (ring, scores, select) dispatches over a k={DRAFT_K} draft "
-        f"were {(ring, scores, select)}, expected {want}"
+    ring, scores, _two = read_route_counts()
+    selections = read_selection_count()
+    assert (ring, scores, selections) == want, (
+        f"{regime} flag={flag}: (ring, scores, selection) dispatches over a k={DRAFT_K} draft "
+        f"were {(ring, scores, selections)}, expected {want}"
     )
     _k_tokens_per_request(got, 1, DRAFT_K, f"{regime}/{flag}")
     if regime == "selected":
@@ -975,10 +1000,11 @@ def test_index_share_skips_the_indexer_only_when_set_and_selecting(regime, flag,
 
 
 def test_index_share_carrier_publishes_the_chain_s_selection_and_reuses_it() -> None:
-    """No carrier and an empty carrier run the same chain and attend byte-identically;
-    the carrier then holds the indices the chain produced; a carrier handed those
-    indices skips the chain and attends the same way, and a different selection does
-    not (the reuse path consumes the carrier)."""
+    """No carrier and an empty carrier run the same selection and attend byte-identically;
+    the carrier then holds the indices the selection produced; a carrier handed those
+    indices skips the selection and attends the same way, and a different selection does
+    not (the reuse path consumes the carrier). The selection is the tip's kernel chain or
+    the fused decode kernel, whichever the tree has (``selection_is_fused``)."""
     _skip_unless_live()
     from vllm_neuron.model.glm5_next.model_fp8 import IndexShare
 
@@ -997,7 +1023,7 @@ def test_index_share_carrier_publishes_the_chain_s_selection_and_reuses_it() -> 
     carrier = IndexShare()
     reset_all_counters()
     shared = one_step(fixtures[1], index_share=carrier)
-    assert read_route_counts()[3] == 1, "an empty carrier runs the chain"
+    assert read_selection_count() == 1, "an empty carrier runs the selection"
     assert torch.equal(plain, shared), "no carrier and an empty carrier are byte-identical"
     indices = carrier.topk_indices
     assert indices is not None and indices.dtype == torch.int32 and indices.ndim == 2
@@ -1005,10 +1031,10 @@ def test_index_share_carrier_publishes_the_chain_s_selection_and_reuses_it() -> 
     assert any(
         torch.is_tensor(c) and c.dtype == indices.dtype and c.shape == indices.shape and torch.equal(c, indices)
         for c in collected
-    ), "the stored indices are the ones the chain produced (the block's collector saw them)"
+    ), "the stored indices are the ones the selection produced (the block's collector saw them)"
     reset_all_counters()
     reused = one_step(fixtures[2], index_share=IndexShare(topk_indices=indices.clone()))
-    assert read_route_counts()[3] == 0, "a filled carrier skips the chain"
+    assert read_selection_count() == 0, "a filled carrier skips the selection"
     assert torch.equal(reused, plain), "and attends the first iteration's selection"
     wrong = indices.clone()
     wrong[0, 0] = -1
@@ -1066,10 +1092,11 @@ def test_the_route_predicate_holds_over_populate_and_a_k5_draft() -> None:
         fallbacks = {f: v[1] for f, v in readings.items() if v[1] > 0}
         assert not fallbacks, f"[{phase}] a torch fallback ran: {readings}"
     assert draft_readings["decode_batch"][0] >= 2 * DRAFT_K, draft_readings
-    # One selection kernel per draft iteration does the top-k, the sentinel, the order and
-    # the expand; the four-kernel route's top-k and expand no longer run on the decode leg.
-    assert read_route_counts()[3] == DRAFT_K
-    assert draft_readings["topk_select"][0] == 0 and draft_readings["index_expand"][0] == 0
+    assert read_selection_count() == DRAFT_K, draft_readings
+    # The chain form expands the selection in its own kernel once per iteration; the fused
+    # form expands inside the selection kernel and dispatches ``index_expand`` not at all.
+    expands = DRAFT_K if not selection_is_fused() else 0
+    assert draft_readings["index_expand"][0] == expands, draft_readings
 
 
 def test_the_fallback_counter_reads_non_zero_when_a_fallback_is_provoked() -> None:
