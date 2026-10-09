@@ -83,7 +83,7 @@ Feature support is at the framework level. See the model cards in [`docs/model-r
 | | Compile cache (local/remote) | ✅ |
 | | CPU compilation | ✅ |
 | **Speculative Decoding** | EAGLE3 | ✅ |
-| | MTP | ❌ |
+| | MTP | ✅ GLM-5.3-Flash, opt-in ([usage](#mtp-speculative-decoding-glm-53-flash)) |
 | **Quantization** | BF16 | ✅ |
 | | FP8 | ✅ |
 | | Quantized KV cache (FP8) | ✅ |
@@ -99,6 +99,26 @@ Feature support is at the framework level. See the model cards in [`docs/model-r
 
 - ✅ Supported — integrated and tested for at least one model
 - ❌ Not supported — may be considered for future releases
+
+### MTP speculative decoding (GLM-5.3-Flash)
+
+GLM-5.3-Flash drafts from its own multi-token-prediction layer, so no draft model is loaded. The drafter is opt-in: a server started without `--speculative-config` decodes one token per step. It needs the on-device sampler, which GLM-5.3-Flash turns on only with `VLLM_NEURON_GLM5NEXT_ON_DEVICE_SAMPLING=1`, and synchronous scheduling:
+
+```bash
+VLLM_NEURON_GLM5NEXT_ON_DEVICE_SAMPLING=1 \
+vllm serve <GLM-5.3-Flash checkpoint> \
+    --tensor-parallel-size 64 \
+    --enable-expert-parallel \
+    --no-async-scheduling \
+    --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}' \
+    --additional-config '{"neuron_config": {"ep_degree": 16, "on_device_sampling_config": {"all_greedy": true}}}'
+```
+
+- Without `VLLM_NEURON_GLM5NEXT_ON_DEVICE_SAMPLING=1`, the server refuses this configuration: `Glm5NextForConditionalGeneration has no on-device sampler: additional_config.neuron_config.on_device_sampling_config must be null or absent, got {'all_greedy': True}`. With `on_device_sampling_config` removed instead, the drafter refuses: `speculative method 'mtp' on GLM-5.3-Flash needs on-device sampling`. With async scheduling, the drafter refuses and names `--no-async-scheduling`.
+- The drafter is served greedy only (`all_greedy: true`). Requests with sampling parameters that the greedy sampler cannot apply are refused at admission. A draft token is accepted only when it is the same token that the target model's own greedy choice gives for that position. Thus each verify step emits the target model's greedy tokens.
+- `num_speculative_tokens: 3` is the measured choice for this model (trn2, tensor parallel 64, expert parallel 16).
+
+For the contract and the measurements, see the [speculative decoding design doc](docs/design/speculation/speculative_decoding_design.md#glm-53-flash-mtp-drafter-method-mtp).
 
 ## Documentation
 

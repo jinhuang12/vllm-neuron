@@ -599,7 +599,10 @@ outputs = llm.generate(["Explain quantum computing"], sampling_params)
 
 GLM-5.3-Flash drafts from its own multi-token-prediction head (no draft model):
 `--speculative-config '{"method": "mtp", "num_speculative_tokens": 3}'` with
-`--no-async-scheduling` and `on_device_sampling_config: {"all_greedy": true}`. It is
+`--no-async-scheduling`, `on_device_sampling_config: {"all_greedy": true}` and the
+environment variable `VLLM_NEURON_GLM5NEXT_ON_DEVICE_SAMPLING=1`, which turns on
+GLM-5.3-Flash's on-device sampler (without it the server refuses the
+`on_device_sampling_config`). It is
 served greedy only (sampling knobs are refused at admission) and its greedy output
 can differ from non-speculative greedy decoding at near-ties, because the
 `1 + k`-row verify graph and the one-token decode graph accumulate in different
