@@ -8383,7 +8383,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # aux_hidden_states is None when eagle3 is not active.
         if self.is_eagle3_spec and aux_hidden_states is not None:
             max_position = positions.max().item() if positions.numel() > 0 else 0
-            num_spec_tokens = self.drafter.num_speculative_tokens
             # Stop proposing early enough that the scheduler never trims draft
             # tokens (the derivation is ``_spec_decode_limit``'s).
             spec_decode_limit = self._spec_decode_limit()
