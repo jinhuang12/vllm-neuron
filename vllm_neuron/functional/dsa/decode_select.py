@@ -512,17 +512,30 @@ def _compact_segments(mask_hbm, ids_hbm, zeros_hbm, r0, n, width, select_k):
                      0, False)
 
 
+def _rows_past_pad(tile, hbm, row0, m, cols):
+    """:func:`_gpsimd_copy` of the first ``cols`` columns of rows ``row0 .. row0 + m - 1``
+    of ``hbm`` into columns ``[1, cols + 1)`` of partitions ``0, 16, .., 16 (m - 1)`` of
+    ``tile``, past its column 0."""
+    row_cols = hbm.shape[1]
+    for i in range(m):
+        part = GPSIMD_STRIDE * i
+        _dma(tile[part:part + 1, 1:cols + 1],
+             hbm.ap(pattern=[[row_cols, 1], [1, cols]], offset=(row0 + i) * row_cols), True)
+
+
 def _compact_pool_rows(mask_hbm, bounded_hbm, ids_hbm, values_hbm, r0, n, span, select_k):
     """:func:`_compact_whole_rows` with each id's score read beside it: requests ``r0 .. r0 +
     n - 1``' ids to ``ids_hbm`` (ascending, :data:`POOL_PAD_ID` after them) and their scores
     to ``values_hbm`` (:data:`POOL_PAD_VALUE` after them).
 
-    After the compaction the score rows come into the mask rows' tile, on the same GpSimd
-    partitions; its column ``span``, past the mask, holds :data:`POOL_PAD_VALUE`. One
-    ``nc_n_gather`` per eight requests reads the scores at the ids, a pad id (``-1``,
-    ``2**32 - 1`` as an unsigned index) clamped to column ``span``; the partitions between
-    the rows gather column ``span`` too. Every value is a copy of a score, so the list holds
-    the scores bit for bit.
+    The mask rows come into columns ``1 .. span`` of a tile whose column 0 holds
+    :data:`POOL_PAD_VALUE`, and the compaction writes the ids out as it finds them, a pad
+    as :data:`POOL_PAD_ID` (``-1``). After it the score rows come into the same columns, on
+    the same GpSimd partitions, and one ``nc_n_gather`` per eight requests reads column
+    ``id + 1`` for every id: the score at a real id, column 0 at a pad. The partitions
+    between the rows gather column 0 too. Every value is a copy of a score, so the list
+    holds the scores bit for bit. The one immediate, ``1``, is exact in any width, and every
+    gather index is at least 0, so the unsigned view reads it as it is.
 
     One tile for both rows, at 16384 candidates the only room there is beside the
     compaction's (a third row-wide tile does not fit a partition). The pad column is written
@@ -539,22 +552,21 @@ def _compact_pool_rows(mask_hbm, bounded_hbm, ids_hbm, values_hbm, r0, n, span, 
         # Partitions 0 .. 16 (m - 1): every compute instruction here starts on partition 0.
         parts = GPSIMD_STRIDE * (m - 1) + 1
         rows = _sb((PARTITIONS, span + 1), nl.float32)
-        nisa.memset(dst=rows[:, span:span + 1], value=POOL_PAD_VALUE)
+        nisa.memset(dst=rows[:, 0:1], value=POOL_PAD_VALUE)
         found = _gpsimd_dst((PARTITIONS, span + 1), nl.int32)
         nisa.memset(dst=found[0:parts, 0:select_k], value=POOL_PAD_ID)
-        _gpsimd_copy(rows, mask_hbm, row0, m, span, span, 0, True)
-        nisa.nonzero_with_count(dst=found, src=rows[:, 0:span], index_offset=0,
+        _rows_past_pad(rows, mask_hbm, row0, m, span)
+        nisa.nonzero_with_count(dst=found, src=rows[:, 1:span + 1], index_offset=0,
                                 padding_val=POOL_PAD_ID)
         _gpsimd_copy(found, ids_hbm, row0, m, select_k, select_k, 0, False)
-        at = _sb((PARTITIONS, select_k), nl.uint32)
-        nisa.tensor_scalar(dst=at[0:parts, 0:select_k],
-                           data=found[0:parts, 0:select_k].view(nl.uint32),
-                           op0=nl.minimum, operand0=span)
+        at = _sb((PARTITIONS, select_k), nl.int32)  # id + 1: the column of its score
+        nisa.tensor_scalar(dst=at[0:parts, 0:select_k], data=found[0:parts, 0:select_k],
+                           op0=nl.add, operand0=1)
         # ---- the score rows over the mask rows: every id is below the width -------------
-        _gpsimd_copy(rows, bounded_hbm, row0, m, width, width, 0, True)
+        _rows_past_pad(rows, bounded_hbm, row0, m, width)
         values = _gpsimd_dst((PARTITIONS, select_k), nl.float32)
         nisa.nc_n_gather(dst=values[0:parts, 0:select_k], data=rows[0:parts, 0:span + 1],
-                         indices=at[0:parts, 0:select_k])
+                         indices=at[0:parts, 0:select_k].view(nl.uint32))
         _gpsimd_copy(values, values_hbm, row0, m, select_k, select_k, 0, False)
 
 
