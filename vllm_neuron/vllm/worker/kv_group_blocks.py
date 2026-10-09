@@ -75,20 +75,23 @@ def group_blocks_per_request(spec: KVCacheSpec, max_model_len: int, where: str, 
     ``dcp`` is the decode context parallel size (vLLM's
     ``decode_context_parallel_size``). Each rank of a decode context parallel group
     keeps ``1 / dcp`` of an attention group's tokens, so an ``AttentionSpec`` group
-    holds ``cdiv(max_model_len, block_size * dcp)`` pages per rank, vLLM's own per-rank
-    figure (``FullAttentionSpec.max_memory_usage_bytes``, ``MultiGroupBlockTable``). A
+    holds ``cdiv(max_model_len, block_size * dcp)`` pages per rank. For full and MLA
+    attention that is vLLM's own per-rank figure
+    (``FullAttentionSpec.max_memory_usage_bytes``, ``MultiGroupBlockTable``); vLLM
+    does not serve sliding-window attention under decode context parallelism
+    (``SlidingWindowSpec.max_memory_usage_bytes`` asserts ``dcp == 1``). A
     ``MambaSpec`` group is not divided: the runner keeps each recurrent layer's state
     in a bank of one slot per request on every rank, so the group holds
     ``cdiv(max_model_len, block_size)`` pages plus its draft blocks at every ``dcp``.
     This models the served line, where ``--mamba-block-size`` is ``max_model_len``: a
     recurrent group then holds one block (plus its draft blocks) per request at any
-    ``dcp``, as the hybrid DCP block-size patch resolves it
-    (``vllm_neuron/vllm/patches/dcp_hybrid_patch.py``, a23eeb2). Off that line, with a
-    shorter recurrent block, vLLM's managers and block table divide a recurrent group
-    by ``dcp`` as well (the same patch's caveat); this figure is then larger than the
-    blocks vLLM hands out, never smaller, so a pool or a block-table row sized on it
-    still holds every request. A ``UniformTypeKVCacheSpecs`` group is divided as its
-    layers are; at ``dcp > 1`` its layers must agree on whether they are divided.
+    ``dcp``, as the hybrid DCP block-size patch of commit a23eeb2 resolves it. Off
+    that line, with a shorter recurrent block, vLLM's managers and block table divide
+    a recurrent group by ``dcp`` as well (the same patch's caveat); this figure is
+    then larger than the blocks vLLM hands out, never smaller, so a pool or a
+    block-table row sized on it still holds every request. A
+    ``UniformTypeKVCacheSpecs`` group is divided as its layers are; at ``dcp > 1`` its
+    layers must agree on whether they are divided.
 
     At ``dcp = 1`` the figure is ``cdiv(max_model_len, spec.block_size) +
     draft_blocks_per_request(spec, where)`` for every spec class priced here.

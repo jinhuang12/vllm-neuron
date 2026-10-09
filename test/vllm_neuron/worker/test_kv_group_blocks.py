@@ -38,8 +38,10 @@ from test.vllm_neuron.worker.test_mtp_kv_budget import _mtp
 from vllm_neuron.vllm.worker import kv_group_blocks as KB
 
 #: Every sequence length the KV pool and block-table tests serve (512, 4096, 8192), the
-#: block-boundary neighbours of the 128-token block, and the long-context lines.
-CONTEXTS = (1, 127, 128, 129, 255, 256, 512, 1000, 4096, 4097, 8192, 65536, 131072, 1048576)
+#: block-boundary neighbours of the 128-token block, 384 (whole blocks per rank at
+#: ``dcp = 3``), and the long-context lines.
+CONTEXTS = (1, 127, 128, 129, 255, 256, 384, 512, 1000, 4096, 4097, 8192, 65536, 131072,
+            1048576)
 #: The decode context parallel sizes the hybrid KV cache is resolved at, and a non-power.
 DCPS = (2, 3, 4, 8)
 
