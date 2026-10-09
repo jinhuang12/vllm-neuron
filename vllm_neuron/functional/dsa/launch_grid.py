@@ -32,18 +32,18 @@ import torch
 
 from vllm_neuron import envs
 
-#: The settings the DSA decode kernels serve: one physical core per logical core (unset,
+#: The settings the LNC-aware kernels serve: one physical core per logical core (unset,
 #: or 1) or the LNC2 pair (2), the two trn2 configurations.
 SERVED_SETTINGS = (None, 1, 2)
 
 
 class LaunchGridError(ValueError):
-    """``NEURON_LOGICAL_NC_CONFIG`` holds a setting the DSA decode kernels do not serve."""
+    """``NEURON_LOGICAL_NC_CONFIG`` holds a setting the LNC-aware kernels do not serve."""
 
 
 @torch._dynamo.assume_constant_result
 def lnc_pair() -> bool:
-    """Whether the decode kernels may split their work over an LNC2 pair (setting 2).
+    """Whether the LNC-aware kernels may split their work over an LNC2 pair (setting 2).
 
     Raises:
         LaunchGridError: ``NEURON_LOGICAL_NC_CONFIG`` is not an integer, or is not one of
@@ -56,6 +56,6 @@ def lnc_pair() -> bool:
             f"NEURON_LOGICAL_NC_CONFIG must be an integer; {error}") from error
     if setting not in SERVED_SETTINGS:
         raise LaunchGridError(
-            f"NEURON_LOGICAL_NC_CONFIG={setting}: the DSA decode kernels launch one "
+            f"NEURON_LOGICAL_NC_CONFIG={setting}: the LNC-aware kernels launch one "
             f"program (unset or 1) or two, one per core of an LNC2 pair (2)")
     return setting == 2
