@@ -102,9 +102,12 @@ def dynamic_ragged_paged_attention_nki(
         page_count_f = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.sbuf)
         page_count = nl.ndarray((1, 1), dtype=nl.int32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=q_limit_f, src=q_limit)
+        # Use separate operations: Trainium2 ScalarE does not support an
+        # add-then-multiply tensor_scalar instruction as one operation.
         nisa.tensor_scalar(dst=page_count_f, data=q_limit_f,
-                           op0=nl.add, operand0=127.0,
-                           op1=nl.multiply, operand1=1.0 / 128.0)
+                           op0=nl.add, operand0=127.0)
+        nisa.tensor_scalar(dst=page_count_f, data=page_count_f,
+                           op0=nl.multiply, operand0=1.0 / 128.0)
         # Do not rely on the FP32 -> int32 cast's rounding mode.
         # floor((q_limit + PAGE - 1) / PAGE) is exact for this range.
         pages_floor = nl.floor(page_count_f)
