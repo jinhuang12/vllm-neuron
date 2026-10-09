@@ -631,12 +631,13 @@ def test_the_decode_call_site_hands_the_indexer_its_window_bound(monkeypatch, wi
 # ---------------------------------------------------------------------------------------
 
 
+# The query rotation's grid belongs to kpool_hadamard.py and is pinned by that module's own
+# tests, so this file does not depend on how a kpool_hadamard.py names its grid.
 @pytest.mark.parametrize("programs_of", [
     lambda work: DB._programs(work, 1),
     lambda work: DB._programs(1, work),
     DS.decode_select_programs,
-    KH.hadamard128_programs,
-], ids=["ring-and-scores-by-requests", "ring-and-scores-by-units", "selection", "rotation"])
+], ids=["ring-and-scores-by-requests", "ring-and-scores-by-units", "selection"])
 @pytest.mark.parametrize("lnc", [None, 1, 2])
 def test_the_launch_grid_follows_the_logical_core_config(monkeypatch, programs_of, lnc):
     # The entry, not a module attribute: ``envs`` resolves names lazily, so an attribute
