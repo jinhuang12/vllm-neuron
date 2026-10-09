@@ -1,38 +1,46 @@
 # SPDX-License-Identifier: Apache-2.0
 """The garbage-collector policy a serving worker applies once, after warmup.
 
-Why a policy and not only the freeze
-------------------------------------
-After warmup a TP=64 GLM-5.3-Flash worker tracks ~5 M objects. Without a freeze,
-each gen-2 (full) pass scans all of them: 3.5-6 s, and every one is a decode stall,
-because the other 63 ranks wait for the rank in GC. ``freeze_gc_heap()`` (vLLM's
-``gc.collect(0/1/2)`` then ``gc.freeze()``) takes that heap out of the scans.
+Why a policy
+------------
+After warmup a TP=64 GLM-5.3-Flash worker tracks 1.6-5.4 M objects. CPython 3.12 runs
+a full (gen-2) pass when more than ``threshold2`` gen-1 passes ran since the last one
+AND ``long_lived_pending >= long_lived_total / 4``. With CPython's ``threshold2`` = 10,
+bs=64 decode (about one gen-1 pass per step on each rank) keeps reaching full passes:
+2-6 stalls of 3.8-6 s per 119 steps on the TP=64 bs=64 line. Each pass scans the whole
+heap, and each one is a decode stall, because the other 63 ranks wait for the rank in GC.
 
-CPython 3.12 runs a full pass when more than ``threshold2`` gen-1 passes ran since
-the last full one AND ``long_lived_pending >= long_lived_total / 4``. Each full pass
-sets ``long_lived_total`` to the objects it kept, and frozen objects are not in it.
-So after the freeze, the first full pass leaves a small total, the 25 % rule stops
-holding gen-2 back, and every 11th gen-1 trigger (``threshold2`` = 10) becomes a full
-pass: ~11 per rank per 120 bs=64 steps, 3-12 ms each, on a different rank each step.
-On 64 lock-stepped ranks that is a late rank on most steps. In the TP=64 A/B the
-5,248 worker full passes after the freeze collected 0 objects in total.
+Why the default raises one threshold and freezes nothing
+--------------------------------------------------------
+The default, ``rare_gen2``, sets only ``threshold2`` to :data:`GEN2_THRESHOLD`. A full
+pass then needs that many gen-1 passes: about one per 100 k bs=64 steps (4-6 h of
+continuous bs=64 decode), none in practice at bs=1. Gen-0/1 thresholds do not change,
+so those passes still collect the per-step cyclic garbage.
+
+The default does not call vLLM's ``freeze_gc_heap()`` (``gc.collect(0/1/2)``, then
+``gc.freeze()``), which vLLM's GPU worker runs at this point. On the TP=64 server that
+one call at the end of warmup made every later bs=1 decode step slower: the same tree
+with and without it served bs=1 at 22.4-24.2 ms against 19.6 ms ITL, with device compute
+16.6 ms in both; the time is host-side lateness of single ranks at the all-rank start
+barrier. It is not a collection: at bs=1 a worker ran ~20 gen-0 passes and one gen-1
+pass in a whole launch (``VLLM_GC_DEBUG``), and on CPU (``test/perf/gc_step_cost.py``)
+a decode step makes the same collections, callbacks and host calls with and without the
+call. A freeze only shortens full passes, and with ``threshold2`` raised there are none
+to shorten. The trade: the first full pass, after :data:`GEN2_THRESHOLD` gen-1 passes,
+scans the whole heap (seconds), where a frozen heap leaves it the unfrozen objects only.
 
 Policies (``VLLM_NEURON_GC_POLICY``)
 ------------------------------------
-* ``freeze_rare_gen2`` (default): freeze, then raise only ``threshold2`` to
-  :data:`GEN2_THRESHOLD`. Gen-0/1 passes keep their thresholds and still collect
-  the per-step cyclic garbage; a full pass needs :data:`GEN2_THRESHOLD` gen-1 passes.
-* ``freeze``: the freeze alone (CPython thresholds kept), for A/B runs.
-* ``off``: no freeze and no threshold change: CPython's default GC.
+* ``rare_gen2`` (default): ``threshold2`` = :data:`GEN2_THRESHOLD`, no collection, no
+  freeze.
+* ``freeze_rare_gen2``: ``freeze_gc_heap()``, then ``threshold2`` raised (the default
+  before ``rare_gen2``), for A/B runs.
+* ``freeze``: ``freeze_gc_heap()`` alone (CPython thresholds kept), for A/B runs.
+* ``off``: CPython's default GC, nothing changed.
 
-All three then call vLLM's ``maybe_attach_gc_debug_callback()`` (as vLLM's GPU
-worker does after its freeze), so ``VLLM_GC_DEBUG=1`` logs every collection with its
-time on each worker. Without ``VLLM_GC_DEBUG`` it does nothing.
-
-On CPU (``test/perf/gc_decode_pattern.py``: 5 M frozen objects, 5000 bs=64-like
-steps), the freeze alone ran 61.8 full passes per 1000 steps and this policy 0, with
-the same gen-0/1 rates (~8.2 k / 0.75 k per 1000 steps) and RSS growth within 1 MB
-of the run without a freeze (+7.4-7.5 MB against +6.8-6.9 MB, two runs).
+Every policy then calls vLLM's ``maybe_attach_gc_debug_callback()`` (as vLLM's GPU
+worker does), so ``VLLM_GC_DEBUG=1`` logs every collection with its time on each worker;
+without ``VLLM_GC_DEBUG`` it attaches nothing (``gc_step_cost.py`` counts the callbacks).
 """
 
 from __future__ import annotations
@@ -47,17 +55,22 @@ from vllm_neuron import envs
 
 logger = logging.getLogger(__name__)
 
+RARE_GEN2 = "rare_gen2"
 FREEZE_RARE_GEN2 = "freeze_rare_gen2"
 FREEZE_ONLY = "freeze"
 OFF = "off"
-POLICIES = (FREEZE_RARE_GEN2, FREEZE_ONLY, OFF)
-DEFAULT_POLICY = FREEZE_RARE_GEN2
+POLICIES = (RARE_GEN2, FREEZE_RARE_GEN2, FREEZE_ONLY, OFF)
+DEFAULT_POLICY = RARE_GEN2
+#: Policies that run ``freeze_gc_heap()`` (a full collection and a freeze).
+FREEZING_POLICIES = (FREEZE_RARE_GEN2, FREEZE_ONLY)
+#: Policies that raise ``threshold2`` to :data:`GEN2_THRESHOLD`.
+RAISING_POLICIES = (RARE_GEN2, FREEZE_RARE_GEN2)
 
-#: ``threshold2`` after the freeze: gen-1 passes between two full passes. A bs=64
-#: decode step runs ~1 gen-1 pass per rank (gen-2 every ~11 steps with
-#: ``threshold2`` = 10), so this is about one full pass per 100k steps (~4 h at
-#: 160 ms per step), and none in practice at bs=1. Cyclic garbage that reaches
-#: gen-2 waits that long to be freed; the A/B above saw none.
+#: ``threshold2`` after warmup: gen-1 passes between two full passes. A bs=64 decode
+#: step runs ~1 gen-1 pass per rank, so this is about one full pass per 100 k steps
+#: (~4-6 h at 160 ms per step), and none in practice at bs=1. Cyclic garbage that
+#: reaches gen 2 waits that long to be freed; on the TP=64 server the full passes of a
+#: bs=64 run freed 0 objects in total.
 GEN2_THRESHOLD = 100_000
 
 
@@ -84,10 +97,10 @@ def apply_post_warmup_gc_policy(policy: str | None = None) -> AppliedGCPolicy:
             f"VLLM_NEURON_GC_POLICY={policy!r} is not one of {', '.join(POLICIES)}"
         )
 
-    frozen = policy != OFF
+    frozen = policy in FREEZING_POLICIES
     if frozen:
         gc_utils.freeze_gc_heap()
-    if policy == FREEZE_RARE_GEN2:
+    if policy in RAISING_POLICIES:
         t0, t1, _ = gc.get_threshold()
         gc.set_threshold(t0, t1, GEN2_THRESHOLD)
     gc_utils.maybe_attach_gc_debug_callback()

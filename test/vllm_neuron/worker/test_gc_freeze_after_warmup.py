@@ -1,19 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""A worker that will serve freezes its GC heap once, after warmup.
+"""A worker that will serve applies its GC policy once, after warmup.
 
 Each TP=64 worker of the bs=64 GLM-5.3-Flash line tracks 5.2-5.4 M objects in
 generation 2 after warmup, so one gen-2 pass takes 3.5-6.0 s. The rank in GC does
 not submit its step and the other 63 ranks wait for it: that is the 3.8-6 s decode
-stall (DECODE_BREAKDOWN_v2.md 5.2). ``vllm.utils.gc_utils.freeze_gc_heap``
-(``gc.collect(0/1/2)`` then ``gc.freeze()``) moves that static heap out of the
-collector's reach; vLLM's GPU worker calls it at the end of its own
-``compile_or_warm_up_model``.
-
-After the freeze, the worker also raises the gen-2 threshold (``gc_policy.py``):
-with the static heap frozen, CPython's 25 % rule no longer holds full passes back,
-so they ran every ~11 bs=64 decode steps per rank (3-12 ms each, a different rank
-on each step). ``VLLM_NEURON_GC_POLICY`` selects ``freeze_rare_gen2`` (default),
-``freeze`` (freeze alone) or ``off`` (CPython default GC).
+stall. The default policy (``gc_policy.py``, ``rare_gen2``) raises the gen-2
+threshold so those passes stop, and runs no collection and no freeze: vLLM's
+``freeze_gc_heap()`` (``gc.collect(0/1/2)`` then ``gc.freeze()``), which vLLM's GPU
+worker calls at the end of its own ``compile_or_warm_up_model``, slowed every later
+bs=1 decode step on TP=64. ``VLLM_NEURON_GC_POLICY`` selects ``rare_gen2`` (default),
+``freeze_rare_gen2`` (freeze, then raise), ``freeze`` (freeze alone) or ``off``
+(CPython default GC).
 
 The tests drive the real ``NeuronWorker.compile_or_warm_up_model`` with the
 extraction, compile and warmup steps replaced by recorders, and replace the freeze,
@@ -37,10 +34,14 @@ FREEZE = "freeze_gc_heap"
 #: The gen-2 threshold change of the default policy (gen-0/1 thresholds kept).
 RAISE_GEN2 = "set_threshold_gen2"
 GC_DEBUG = "gc_debug"
-#: The default policy's GC calls, in order.
-DEFAULT_GC = [FREEZE, RAISE_GEN2, GC_DEBUG]
+#: The default policy's GC calls, in order: no freeze.
+DEFAULT_GC = [RAISE_GEN2, GC_DEBUG]
+#: ``freeze_rare_gen2``'s GC calls, in order.
+FREEZE_RARE_GEN2_GC = [FREEZE, RAISE_GEN2, GC_DEBUG]
+#: Every recorded GC call.
+GC_CALLS = (FREEZE, RAISE_GEN2, GC_DEBUG)
 POLICY_ENV = "VLLM_NEURON_GC_POLICY"
-#: The steps of the main path that create the post-warmup heap. The freeze must
+#: The steps of the main path that create the post-warmup heap. The policy must
 #: come after every one of them that runs.
 WARMUP_WORK = (
     "extract_graphs",
@@ -138,27 +139,27 @@ def _worker(record: list[str], *, model=None, enforce_eager: bool = False):
 def test_main_path_applies_the_gc_policy_once_after_the_warmup_work(
     events, monkeypatch, skip_env, warmup_ran
 ):
-    """Freeze, then raise gen-2, exactly once, after every warmup step that ran."""
+    """Raise gen-2 (no freeze), exactly once, after every warmup step that ran."""
     if skip_env is not None:
         monkeypatch.setenv(skip_env, "1")
 
     result = NeuronWorker.compile_or_warm_up_model(_worker(events))
 
     assert isinstance(result, CompilationTimes)
-    assert [e for e in events if e in DEFAULT_GC or e.startswith(("set_", "gc_"))] == (
+    assert [e for e in events if e in GC_CALLS or e.startswith(("set_", "gc_"))] == (
         DEFAULT_GC
     )
     assert [e for e in events if e.startswith("warmup_")] == warmup_ran
-    freeze_at = events.index(FREEZE)
+    policy_at = events.index(DEFAULT_GC[0])
     for step in WARMUP_WORK:
         if step in events:
-            assert events.index(step) < freeze_at, (step, events)
-    assert events[freeze_at:] == DEFAULT_GC, events
+            assert events.index(step) < policy_at, (step, events)
+    assert events[policy_at:] == DEFAULT_GC, events
 
 
 @pytest.mark.parametrize("missing", ["model_runner", "model"])
-def test_no_freeze_when_no_model_is_loaded(events, missing):
-    """No model, nothing to serve: the early return leaves the heap alone."""
+def test_no_gc_change_when_no_model_is_loaded(events, missing):
+    """No model, nothing to serve: the early return leaves the GC alone."""
     worker = _worker(events)
     if missing == "model_runner":
         worker.model_runner = None
@@ -207,6 +208,17 @@ def test_kill_switch_keeps_cpython_default_gc_on_every_serving_path(
 
     assert FREEZE not in events
     assert [e for e in events if e.startswith(("set_", "gc_"))] == [GC_DEBUG]
+
+
+def test_freeze_rare_gen2_policy_freezes_then_raises_once(events, monkeypatch):
+    """``VLLM_NEURON_GC_POLICY=freeze_rare_gen2``: the earlier default, for A/B runs."""
+    monkeypatch.setenv(POLICY_ENV, "freeze_rare_gen2")
+
+    NeuronWorker.compile_or_warm_up_model(_worker(events))
+
+    assert [e for e in events if e in GC_CALLS or e.startswith(("set_", "gc_"))] == (
+        FREEZE_RARE_GEN2_GC
+    )
 
 
 def test_freeze_policy_freezes_once_and_keeps_the_thresholds(events, monkeypatch):

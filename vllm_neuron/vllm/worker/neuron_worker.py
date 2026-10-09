@@ -1912,11 +1912,11 @@ class NeuronWorker(WorkerBase):
             )
             return CompilationTimes(language_model=0.0, encoder=0.0)
 
-        # Every return below serves: apply the post-warmup GC policy there. The
-        # freeze (as vLLM's GPU worker does) keeps gen-2 passes off the static heap
-        # (3.5-6 s per pass at bs=64 on TP=64 otherwise, each one a decode stall);
-        # the raised gen-2 threshold stops the frequent short full passes that
-        # follow a freeze (gc_policy.py).
+        # Every return below serves: apply the post-warmup GC policy there. By
+        # default it raises the gen-2 threshold, so full passes (3.5-6 s per pass at
+        # bs=64 on TP=64, each one a decode stall) stop; it does not freeze the heap
+        # as vLLM's GPU worker does, because that freeze slowed every bs=1 step on
+        # TP=64 (gc_policy.py).
         from vllm_neuron.vllm.worker.gc_policy import apply_post_warmup_gc_policy
 
         # SyntheticNeuronModel: skip warmup (no compiled graphs needed)
