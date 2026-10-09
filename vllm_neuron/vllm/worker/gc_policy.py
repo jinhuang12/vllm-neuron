@@ -45,13 +45,15 @@ bs=1 a worker ran ~20 gen-0 passes and one gen-1 pass in a whole launch
 the same collections, callbacks and host calls with and without the call. A freeze
 only shortens full passes, and with ``threshold2`` raised there are none to shorten.
 
-The cost of the freeze depends on the host: on a second server of the same type,
-the tree with ``freeze_rare_gen2`` on served bs=1 at 19.3 ms (18.9 ms later). The
-spread between launches without the freeze (barrier 1.3-5.0 ms) comes from the
-launch or the host, not from this code: ``off`` imports this module, reads the knob
-and logs one line, and changes no GC state. The freeze alone (``freeze``) was
-rejected earlier for a bs=1 cost of the same kind (+1.4 ms per step, barrier
-0.04 -> 3.05 ms).
+The cost of the freeze also depends on the host. On a second server of the same
+type, the tree with ``freeze_rare_gen2`` on served bs=1 at 19.3 ms 10 min after
+startup (18.9 ms warm). Between ~2.5 and ~17 min after startup this server served
+20.3-21.9 ms with the policy on (above), 1-2.6 ms slower at comparable times. The
+first point after startup was not measured there. The spread between launches
+without the freeze (barrier 1.3-5.0 ms) comes from the launch or the host, not from
+this code: ``off`` imports this module, reads the knob and logs one line, and
+changes no GC state. The freeze alone (``freeze``) was rejected earlier for a bs=1
+cost of the same kind (+1.4 ms per step, barrier 0.04 -> 3.05 ms).
 
 The trade: the first full pass, after :data:`GEN2_THRESHOLD` gen-1 passes, scans the
 whole heap (seconds), where a frozen heap leaves it the unfrozen objects only. With
