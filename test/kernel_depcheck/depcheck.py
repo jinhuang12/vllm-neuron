@@ -21,7 +21,22 @@ the pairs it takes part in and adds or removes no edge, so a pair the graph leav
 stays unordered in a dump that has one. A cycle or a reset that names no group leaves edges
 unknown, and then no pair is confirmed. `VERDICT` is FINDINGS when a pair is confirmed or a
 wait's arithmetic is not OK (with the edges known); else UNDECIDED when an operand or edge is
-undecided or a pair goes through a runtime address; else CLEAN. The counts follow the word.
+undecided or a pair goes through a runtime address; else CLEAN. The counts follow the word,
+always all of them and in this order, so `VERDICT_LINE` parses the line:
+
+  VERDICT: <word> (confirmed <n>: SB-RAW <n> SB-WAW <n> SB-WAR <n> PSUM <n> DRAM <n>;
+    not confirmed: same-value-TensorSave <n> runtime-address <n> edges-unknown <n>;
+    undecided <n>: runtime-SB-PSUM-operand <n> other-operand <n> cycle <n> ungrouped-reset <n>;
+    waits-not-OK <n>)
+
+on one line. The pair counts are UNSYNC footprint pairs (the unit of the `UNSYNCHRONIZED`
+count above it). `confirmed` splits by space (SB by kind; PSUM and DRAM all kinds);
+`edges-unknown` counts the pairs that would be confirmed if the edges were known.
+`undecided` is the number of entries under `## UNDECIDED`, split by cause: an SBUF/PSUM
+operand at a runtime address, another operand the check cannot place, a cycle, a
+GroupResetSemaphores that names no group. trn2-2's verdicts.json columns read: sbuf_raw_unsync
+= SB-RAW, tensorsave_waw_unsync = same-value-TensorSave, other_unsync_classes = the other
+pair counts, undecided_class = the four undecided counts.
 
 That graph is one pass over the program: a dynamic loop's body is checked as one
 iteration. Blocks are taken in the dump's order, which is program order apart from the
@@ -189,6 +204,31 @@ def ivs_overlap(a, b):
 
 NO_MEMORY_KINDS = {"imm_value", "register_access"}   # an immediate, a register read
 ENGINE_SUFFIX = re.compile(r"-(Activation|PE|DVE|SP|Pool)\d+$")   # an engine's copy of a name
+#: The confirmed UNSYNC pairs of the one-pass VERDICT line, by space (module docstring).
+CONFIRMED_BY_SPACE = ("SB-RAW", "SB-WAW", "SB-WAR", "PSUM", "DRAM")
+#: Parses a one-pass VERDICT line (module docstring): `word` and one group per count.
+VERDICT_LINE = re.compile(
+    r"^VERDICT: (?P<word>FINDINGS|UNDECIDED|CLEAN) "
+    r"\(confirmed (?P<confirmed>\d+): SB-RAW (?P<sb_raw>\d+) SB-WAW (?P<sb_waw>\d+) "
+    r"SB-WAR (?P<sb_war>\d+) PSUM (?P<psum>\d+) DRAM (?P<dram>\d+); "
+    r"not confirmed: same-value-TensorSave (?P<same_value_tensorsave>\d+) "
+    r"runtime-address (?P<runtime_address>\d+) edges-unknown (?P<edges_unknown>\d+); "
+    r"undecided (?P<undecided>\d+): runtime-SB-PSUM-operand (?P<runtime_sb_psum_operand>\d+) "
+    r"other-operand (?P<other_operand>\d+) cycle (?P<cycle>\d+) "
+    r"ungrouped-reset (?P<ungrouped_reset>\d+); waits-not-OK (?P<waits_not_ok>\d+)\)$")
+
+
+def verdict_line(word, n):
+    """The one-pass VERDICT line (module docstring) for `word` and the counts `n`
+    (`Model.one_pass_verdict`); `VERDICT_LINE` parses it."""
+    return (f"VERDICT: {word} (confirmed {n['confirmed']}: SB-RAW {n['SB-RAW']} "
+            f"SB-WAW {n['SB-WAW']} SB-WAR {n['SB-WAR']} PSUM {n['PSUM']} DRAM {n['DRAM']}; "
+            f"not confirmed: same-value-TensorSave {n['same-value-TensorSave']} "
+            f"runtime-address {n['runtime-address']} edges-unknown {n['edges-unknown']}; "
+            f"undecided {n['undecided']}: runtime-SB-PSUM-operand "
+            f"{n['runtime-SB-PSUM-operand']} other-operand {n['other-operand']} "
+            f"cycle {n['cycle']} ungrouped-reset {n['ungrouped-reset']}; "
+            f"waits-not-OK {n['waits-not-OK']})")
 
 
 class Undecided(Exception):
@@ -327,6 +367,7 @@ class Model:
         self.pos = {}
         self.info = {}
         self.undecided = []    # operands / edges the check cannot model: the dump is UNDECIDED
+        self.undecided_class = collections.Counter()   # their causes (module docstring)
         self.loop_undecided = []   # (block or None for the dump, why): the loop-carried class's
         # Nodes are positions: an instruction (or DMA block) name that repeats gets `name@k`.
         icount = collections.Counter(i["name"] for i in ins)
@@ -354,6 +395,8 @@ class Model:
                     text = f"{node} {i['opcode']}@{i['engine']} L{dbg.get('lineno')}: {why}"
                     self.undecided.append(text)
                     w = whole_location(x, memlocs)
+                    self.undecided_class["other-operand" if w is None
+                                         else "runtime-SB-PSUM-operand"] += 1
                     if w is None:
                         self.loop_undecided.append((block, text))
                     else:
@@ -455,6 +498,7 @@ class Model:
         cyc = self.cycle_nodes()
         if cyc:
             self.undecided.append(f"happens-before graph has a cycle through {cyc} nodes: no pair's order can be read off it")
+            self.undecided_class["cycle"] += 1
         # reachability (DFS memo)
         self._reach = {}
         self._loop_pairs = None
@@ -497,6 +541,7 @@ class Model:
                 if group is None:
                     self.undecided.append(f"{node} GroupResetSemaphores@{i.get('engine')}: "
                                           f"no sema_group, so the counts after it are unknown")
+                    self.undecided_class["ungrouped-reset"] += 1
                 for sem in group or []:
                     cum[sem] = 0
             for u in (i.get("sync_info") or {}).get("on_update", []):
@@ -597,38 +642,42 @@ class Model:
 
     def unconfirmed_because(self, P, C, fp, fc):
         """Why the UNSYNC footprint pair (P's `fp`, C's `fc`) is not confirmed: "runtime-address"
-        or "same-value TensorSave"; None when it is confirmed (module docstring, "The one-pass
+        or "same-value-TensorSave"; None when it is confirmed (module docstring, "The one-pass
         verdict")."""
         if fp.get("runtime") or fc.get("runtime"):
             return "runtime-address"
         if (P["i"]["opcode"] == C["i"]["opcode"] == "TensorSave" and fp["memref"] == fc["memref"]
                 and ENGINE_SUFFIX.sub("", P["i"]["name"]) == ENGINE_SUFFIX.sub("", C["i"]["name"])):
-            return "same-value TensorSave"
+            return "same-value-TensorSave"
         return None
 
     def one_pass_verdict(self, unsync, waits_not_ok):
-        """(word, counts) of the one-pass VERDICT line (module docstring): `unsync` the UNSYNC
-        footprint pairs (kind, P, C, fp, fc), `waits_not_ok` the number of waits whose
-        arithmetic is not OK."""
-        why = collections.Counter(self.unconfirmed_because(P, C, fp, fc)
-                                  for _, P, C, fp, fc in unsync)
-        edges_unknown = self.cycle_nodes() > 0 or any(
-            i.get("opcode") == "GroupResetSemaphores" and i.get("sema_group") is None
-            for i in self.ins)
-        confirmed = 0 if edges_unknown else why[None]
-        if confirmed or (waits_not_ok and not edges_unknown):
+        """(word, counts) of the one-pass VERDICT line (module docstring; `verdict_line` prints
+        it): `unsync` the UNSYNC footprint pairs (kind, P, C, fp, fc), `waits_not_ok` the
+        number of waits whose arithmetic is not OK."""
+        edges_unknown = bool(self.undecided_class["cycle"]
+                             or self.undecided_class["ungrouped-reset"])
+        counts = collections.Counter()
+        for kind, P, C, fp, fc in unsync:
+            because = self.unconfirmed_because(P, C, fp, fc)
+            if because is None and edges_unknown:
+                because = "edges-unknown"
+            if because is not None:
+                counts[because] += 1
+            elif fp["space"] == "SB":
+                counts[f"SB-{kind}"] += 1
+            else:
+                counts["PSUM" if fp["space"].startswith("PSUM") else "DRAM"] += 1
+        counts["confirmed"] = sum(counts[part] for part in CONFIRMED_BY_SPACE)
+        counts.update(self.undecided_class)
+        counts["undecided"] = len(self.undecided)
+        counts["waits-not-OK"] = waits_not_ok
+        if counts["confirmed"] or (waits_not_ok and not edges_unknown):
             word = "FINDINGS"
-        elif self.undecided or why["runtime-address"]:
+        elif self.undecided or counts["runtime-address"]:
             word = "UNDECIDED"
         else:
             word = "CLEAN"
-        counts = (f"{confirmed} confirmed unsynchronized pair{'' if confirmed == 1 else 's'}; "
-                  f"not confirmed: {why['same-value TensorSave']} same-value TensorSave, "
-                  f"{why['runtime-address']} through a runtime-address operand"
-                  + (f", {why[None]} with the edges unknown" if edges_unknown else "")
-                  + f"; {len(self.undecided)} "
-                  f"{'operand or edge' if len(self.undecided) == 1 else 'operands or edges'} "
-                  f"undecided; {waits_not_ok} wait{'' if waits_not_ok == 1 else 's'} not OK")
         return word, counts
 
     def label(self, a):
@@ -1010,8 +1059,7 @@ def main():
         print(f"\n## UNDECIDED: {len(M.undecided)} operands or edges the check cannot model")
         for u in M.undecided[:20]:
             print(f"  {u}")
-    word, counts = M.one_pass_verdict(unsync, bad)
-    print(f"VERDICT: {word} ({counts})")
+    print(verdict_line(*M.one_pass_verdict(unsync, bad)))
     print_loop_carried(M, show_all)
 
 

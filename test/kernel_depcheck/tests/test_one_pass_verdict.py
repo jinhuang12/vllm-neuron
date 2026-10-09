@@ -6,10 +6,14 @@ trn2-2's re-run of the v8d dumps (2026-10-09) printed ``VERDICT: UNDECIDED`` abo
 six SBUF RAW pairs that nothing orders, because runtime-address operands elsewhere in the
 dump were undecided. An undecided operand only hides the pairs it takes part in; it adds or
 removes no edge, so a pair the graph leaves unordered stays unordered.
+
+The line's counts come in fixed fields, so trn2-2's verdicts.json columns are filled by
+``depcheck.VERDICT_LINE``; every test here reads the line through it.
 """
 
 from __future__ import annotations
 
+import collections
 import sys
 
 from test.kernel_depcheck import depcheck
@@ -17,7 +21,8 @@ from test.kernel_depcheck.tests.synthetic import Dump
 
 
 def _verdict(tmp_path, monkeypatch, capsys, build):
-    """The ``VERDICT:`` line ``depcheck.main()`` prints for the dump ``build(d, block)`` makes."""
+    """The fields of the ``VERDICT:`` line ``depcheck.main()`` prints for the dump
+    ``build(d, block)`` makes: the word, and every count as an int."""
     d = Dump()
     build(d, d.block("Block1"))
     path = d.write(tmp_path / "dump.json")
@@ -26,7 +31,12 @@ def _verdict(tmp_path, monkeypatch, capsys, build):
     lines = [line for line in capsys.readouterr().out.splitlines()
              if line.startswith("VERDICT:")]
     assert len(lines) == 1, lines
-    return lines[0]
+    match = depcheck.VERDICT_LINE.match(lines[0])
+    assert match, lines[0]
+    fields = {k: v if k == "word" else int(v) for k, v in match.groupdict().items()}
+    assert fields["undecided"] == sum(fields[k] for k in (
+        "runtime_sb_psum_operand", "other_operand", "cycle", "ungrouped_reset"))
+    return fields
 
 
 def _runtime_dram(name):
@@ -43,9 +53,9 @@ def test_a_confirmed_pair_is_a_finding_beside_an_undecided_operand(tmp_path, mon
         d.ins(b, "read", "Pool", "TensorCopy", reads=[d.whole(t)])
         d.ins(b, "at_runtime", "DVE", "TensorCopy", reads=[d.runtime(other)])
 
-    line = _verdict(tmp_path, monkeypatch, capsys, build)
-    assert line.startswith("VERDICT: FINDINGS (1 confirmed unsynchronized pair")
-    assert "1 operand or edge undecided" in line
+    v = _verdict(tmp_path, monkeypatch, capsys, build)
+    assert (v["word"], v["confirmed"], v["sb_raw"]) == ("FINDINGS", 1, 1)
+    assert (v["undecided"], v["runtime_sb_psum_operand"]) == (1, 1)
 
 
 def test_pairs_only_through_a_runtime_address_leave_the_dump_undecided(tmp_path, monkeypatch,
@@ -56,9 +66,8 @@ def test_pairs_only_through_a_runtime_address_leave_the_dump_undecided(tmp_path,
         d.ins(b, "store", "SP", "DMACopy", writes=[d.whole(out)], queue="q")
         d.ins(b, "gather", "Pool", "DMACopy", reads=[_runtime_dram(out)], queue="q2")
 
-    line = _verdict(tmp_path, monkeypatch, capsys, build)
-    assert line.startswith("VERDICT: UNDECIDED (0 confirmed unsynchronized pairs")
-    assert "1 through a runtime-address operand" in line
+    v = _verdict(tmp_path, monkeypatch, capsys, build)
+    assert (v["word"], v["confirmed"], v["runtime_address"]) == ("UNDECIDED", 0, 1)
 
 
 def test_each_engine_saving_one_register_to_one_slot_is_not_a_finding(tmp_path, monkeypatch,
@@ -70,9 +79,8 @@ def test_each_engine_saving_one_register_to_one_slot_is_not_a_finding(tmp_path, 
             d.ins(b, f"I-7_inst__I-10-0-{engine}0", engine, "TensorSave",
                   writes=[d.whole(slot)])
 
-    line = _verdict(tmp_path, monkeypatch, capsys, build)
-    assert line.startswith("VERDICT: CLEAN (0 confirmed unsynchronized pairs")
-    assert "1 same-value TensorSave" in line
+    v = _verdict(tmp_path, monkeypatch, capsys, build)
+    assert (v["word"], v["confirmed"], v["same_value_tensorsave"]) == ("CLEAN", 0, 1)
 
 
 def test_an_unordered_pair_is_not_confirmed_when_the_edges_are_unknown(tmp_path, monkeypatch,
@@ -85,6 +93,17 @@ def test_an_unordered_pair_is_not_confirmed_when_the_edges_are_unknown(tmp_path,
         d.ins(b, "write", "DVE", "Memset", writes=[d.whole(t)])
         d.ins(b, "read", "Pool", "TensorCopy", reads=[d.whole(t)])
 
-    line = _verdict(tmp_path, monkeypatch, capsys, build)
-    assert line.startswith("VERDICT: UNDECIDED (0 confirmed unsynchronized pairs")
-    assert "edges unknown" in line
+    v = _verdict(tmp_path, monkeypatch, capsys, build)
+    assert (v["word"], v["confirmed"], v["edges_unknown"]) == ("UNDECIDED", 0, 1)
+    assert v["ungrouped_reset"] == 1
+
+
+def test_the_verdict_line_parses_back_into_every_count():
+    labels = ("confirmed", *depcheck.CONFIRMED_BY_SPACE, "same-value-TensorSave",
+              "runtime-address", "edges-unknown", "undecided", "runtime-SB-PSUM-operand",
+              "other-operand", "cycle", "ungrouped-reset", "waits-not-OK")
+    counts = collections.Counter({label: k for k, label in enumerate(labels, 1)})
+    match = depcheck.VERDICT_LINE.match(depcheck.verdict_line("FINDINGS", counts))
+    assert match["word"] == "FINDINGS"
+    assert [int(match[label.lower().replace("-", "_")]) for label in labels] == list(
+        range(1, len(labels) + 1))
