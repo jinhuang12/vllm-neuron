@@ -609,13 +609,15 @@ greedy output is not guaranteed identical to non-speculative greedy decoding: wi
 the draft layer's earlier view-form latent write, consecutive identical requests
 drafted differently on device (one six-run series gave two alternating outputs; fixed
 by writing into the bank itself: 12 of 12 repeated generations and 8 of 8 prompts
-identical across runs). Output can still differ from non-speculative greedy decoding:
-the fused `1 + k`-row verify-step kernels and the one-row decode graph round
-differently (deterministic within a configuration; each step is lossless by id
-equality, and an on-device-sampling server returns no logprobs with which to read the
-margins). GSM8K@200 exact-match is 0.985 on this configuration (0.99 on the earlier
-one; one question flipped, cause under investigation). Leave it off where token
-identity with non-speculative decoding is required. Details:
+identical across two passes against the same server). Output still differs from
+non-speculative greedy decoding, deterministically within a configuration (3 of 8
+identity prompts on the bank-write configuration, 4 of 8 on the earlier one): the
+likeliest carrier is the `1 + k`-row verify graph and the one-row decode graph
+accumulating in different orders (each step is lossless by id equality, and an
+on-device-sampling server returns no logprobs with which to read the margins).
+GSM8K@200 exact-match is 0.985 on this configuration (0.99 on the earlier one; one
+question flipped, cause under investigation). Leave it off where token identity with
+non-speculative decoding is required. Details:
 [`docs/design/speculation/speculative_decoding_design.md`](../design/speculation/speculative_decoding_design.md#glm-53-flash-mtp-drafter-method-mtp).
 
 ### On-device vs CPU sampling

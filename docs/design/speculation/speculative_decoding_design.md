@@ -628,19 +628,21 @@ Contract of the opt-in (measured on trn2 at TP64/EP16, `k = 3`, `max_num_seqs 1`
   `_attend_requests`; pinned by `test/vllm_neuron/worker/test_glm5next_slot_residue.py`).
   With the bank write, 12 of 12 repeated greedy generations of the same prompt were
   identical across two passes, and 8 of 8 identity prompts were identical across two
-  independent server-side runs; per-position draft acceptance rose to 0.919 / 0.881 /
-  0.813 (conditional; 3.39 of 3 drafts accepted per step on average) from 0.899 / 0.840 /
-  0.710 with the view-form write. Speculative output can still differ from
-  non-speculative greedy decoding, deterministically within a configuration. GSM8K@200
-  exact-match on this configuration is 0.985 (197 of 200) against 0.99 for the earlier
-  one -- one question flipped; the cause is under investigation (the numerics of the
-  fused verify-step glue, unconfirmed).
+  passes against the same server. On the bank-write configuration 3 of 8 identity
+  prompts differ from the non-speculative run (first differing token at 12-36; a
+  different set of prompts from the earlier configuration's 4), 57 of 200 GSM8K response
+  texts are identical to it, and GSM8K@200 exact-match is 0.985 (197 of 200) against
+  0.99 for the earlier configuration -- one question flipped; the cause is under
+  investigation. Per-position draft acceptance on GSM8K@200 is 0.933 / 0.887 / 0.814
+  (conditional), mean acceptance length 3.43 (2.43 of 3 drafts accepted per step); the
+  earlier configuration's is in the next bullet. Output differs from non-speculative
+  greedy decoding deterministically within a configuration.
   Each verify step is lossless by construction -- an accepted draft is the id
   the target's own argmax returned for that row -- so a divergence from the
   non-speculative run is the target's argmax picking differently where its top two
-  logits are within rounding of each other; the carrier is the fused
-  `1 + k`-row verify-step kernels and the one-row decode graph rounding differently --
-  accumulating in different orders, deterministically within a configuration
+  logits are within rounding of each other; the likeliest carrier, deterministic within a
+  configuration, is the `1 + k`-row verify graph and the one-row decode graph
+  accumulating in different orders
   (in the dense regime the MLA decode kernel routes one query row per request to its
   key-split kernel and `T` rows per request to the general kernel,
   `vllm_neuron/functional/attention/mla_decode.py::_route`; past the selector bound the
@@ -648,8 +650,9 @@ Contract of the opt-in (measured on trn2 at TP64/EP16, `k = 3`, `max_num_seqs 1`
   be read from a server that samples on device (its sampler returns ids only and refuses
   `logprobs`), so the margins are not measured. A server whose consumers need token
   identity with non-speculative greedy decoding should leave the drafter off.
-* **What does not move.** Acceptance on GSM8K@200: conditional per-position rates
-  0.932 / 0.853 / 0.716, mean acceptance length 3.29 tokens per step; the drafter adds
+* **What does not move.** Acceptance on GSM8K@200 (earlier configuration): conditional
+  per-position rates 0.932 / 0.853 / 0.716, mean acceptance length 3.29 tokens per step
+  (bank-write configuration: 0.933 / 0.887 / 0.814, 3.43); the drafter adds
   about one layer's work to a prefill (measured within the run-to-run spread of TTFT at
   1k tokens); the KV pool and block table are sized for the `1 + k` recurrent blocks a
   drafting request holds (`kv_group_blocks.draft_blocks_per_request`).
