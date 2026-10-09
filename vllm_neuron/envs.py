@@ -253,8 +253,11 @@ DEFAULT_DEVICE_GRAPH_RESERVE_GIB = 5.0
 #: it is not in the default. kda_output was 24.1 us slower at 128 rows. No kernel is
 #: selected at decode (one row per request): on the served TP=64 line, ``all`` made
 #: the bs=1 decode step 1.75 ms longer, while the single-rank benchmark (no
-#: tensor-parallel collectives) measured it shorter. So every decode graph under ``1``
-#: is the graph ``0`` traces; only a speculative server's verify graph differs.
+#: tensor-parallel collectives) measured it shorter. So without speculation every
+#: decode graph under ``1`` is the graph ``0`` traces. A speculative server's verify
+#: graphs differ, and so does its one-row-per-request decode graph (the first decode
+#: step, a mixed step) of ``B * (1 + k)`` requests, whose row count is a verify step's:
+#: an mHC site cannot tell the two apart, so that graph takes the verify route too.
 #:
 #: Measure a bucket before adding it, on a device lease, with
 #: ``python test/hardware/benchmark_glue_block.py --output <json> --cases
