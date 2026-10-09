@@ -19,14 +19,12 @@ stand between each head's matmul and the sum, so every head pays its own matmul,
 rectify, scale and one add into an SBUF accumulator.
 
 ``nisa.nc_matmul`` contracts the partition axis of both operands, so the head
-dimension has to arrive there. The kernel makes that turn itself, transposing each
-slab on the PE through a PSUM tile of its own dtype. The turn is exact for finite
-values, because the destination dtype matches the input and a bf16 value written to a
-bf16 tile cannot round. It is not bit-accurate for NaN or Inf, where one bad element
-can reach every output of its partition column inside that tile. Nothing scans for
-finiteness here: neither the rotation nor the normalisation the callers apply removes
-a non-finite value, and a per-call scan would cost more than the transport it
-replaces.
+dimension has to arrive there. The kernel makes that turn itself, with DMA transposes
+from HBM straight into SBUF. A DMA moves each 2-byte element as a bit pattern, so the
+turn is exact for every value, NaN and Inf included: a non-finite element reaches only
+the scores its own query row or key column takes part in, as in the reference. Nothing
+scans for finiteness here: neither the rotation nor the normalisation the callers apply
+removes a non-finite value, and a per-call scan would cost more than the transport.
 
 Quantisation, masking, top-k and head padding all belong to neighbouring stages. In
 particular there is no MX path: ``nc_matmul_mx`` needs NeuronCore-v4 and this target
@@ -35,6 +33,7 @@ rather than merely cheaper, since ``q @ H @ H.T @ k.T == q @ k.T``.
 """
 
 import logging
+import os
 
 import torch
 from dataclasses import dataclass
@@ -81,6 +80,26 @@ CAND_TILE = 512
 
 CONTRACTION_TILE = 128
 """The contraction extent, bounded by the partition maximum. Equal to ``INDEX_HEAD_DIM`` by design."""
+
+_GROUP_TILES = 4
+"""Candidate tiles in one score group: the columns one head's matmuls fill before one rectify.
+
+A candidate tile of fp32 scores is one PSUM bank, so a group of four takes half of the eight banks
+of NeuronCore-v2 and v3 and the PE fills the next head's group in the other half while this one
+drains. The scalar engine's rectify and the vector engine's weighted add each run once per group,
+over ``_GROUP_TILES * CAND_TILE`` columns, which spreads their fixed per-instruction cost four
+times wider than one instruction per matmul would.
+"""
+
+_BUFFERS = 2
+"""Copies kept of each streamed SBUF tile: a token tile's query and weights, and a group's sum.
+
+With two, the next token tile's query and weights land while the current tile computes, and a
+finished group's sum drains to HBM while the next group accumulates into the other copy.
+"""
+
+_LNC2_PROGRAMS = 2
+"""Programs on an LNC2 launch: one per physical core of the logical core."""
 
 _SUPPORTED_Q_DTYPES = (torch.bfloat16,)
 """Query and key dtypes that take the NKI route.
@@ -160,24 +179,42 @@ def _kernel_identity_of(kernel) -> tuple[str, str]:
 # ---------------------------------------------------------------------------------------------
 
 
-def _transpose_tile(src_sb, rows, cols):
-    """``[rows, cols]`` SBUF -> ``[cols, rows]`` SBUF, turned on the PE through same-dtype PSUM."""
-    ps = nl.ndarray((cols, rows), dtype=src_sb.dtype, buffer=nl.psum)
-    nisa.nc_transpose(dst=ps, data=src_sb)
-    tile = nl.ndarray((cols, rows), dtype=src_sb.dtype, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=tile, src=ps)
-    return tile
+def _transpose_tile(dst_sb, src_hbm):
+    """Write ``src_hbm``, a ``[rows, cols]`` HBM slab, into ``dst_sb`` as ``[cols, rows]``.
+
+    The turn is a DMA transpose, HBM to SBUF, which takes ``cols <= 128`` and a 2-byte dtype. No
+    compute engine spends cycles on it, and the source and destination are in different
+    memories, so they cannot alias.
+    """
+    nisa.dma_transpose(dst=dst_sb, src=src_hbm)
 
 
 def _keys_transposed(k_hbm, head_dim, cands):
-    """``k`` as stored, ``[cands, head_dim]`` -> ``[head_dim, cands]`` SBUF, one PE turn per 128 rows."""
+    """``k`` as stored, ``[cands, head_dim]`` -> ``[head_dim, cands]`` SBUF.
+
+    One transpose per ``CAND_TILE`` candidates, so the first matmuls wait only for their own
+    columns rather than for all of ``k``.
+    """
     kt = nl.ndarray((head_dim, cands), dtype=k_hbm.dtype, buffer=nl.sbuf)
-    for c0 in range(0, cands, CONTRACTION_TILE):
-        cw = min(CONTRACTION_TILE, cands - c0)
-        k_sb = nl.ndarray((cw, head_dim), dtype=k_hbm.dtype, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=k_sb, src=nl.load(k_hbm[c0:c0 + cw, :]))
-        nisa.tensor_copy(dst=kt[:, c0:c0 + cw], src=_transpose_tile(k_sb, cw, head_dim))
+    for n0 in range(0, cands, CAND_TILE):
+        nw = min(CAND_TILE, cands - n0)
+        _transpose_tile(kt[0:head_dim, n0:n0 + nw], k_hbm[n0:n0 + nw, 0:head_dim])
     return kt
+
+
+def _load_token_tile(q_hbm, w_hbm, qt, w_sb, m0, mw, slot):
+    """Token rows ``m0 .. m0 + mw`` into copy ``slot`` of the streamed query and weight tiles.
+
+    ``qt`` is ``[head_dim, _BUFFERS, heads, TOKEN_TILE]``: each head's ``[mw, head_dim]`` rows are
+    turned to ``[head_dim, mw]``, the stationary layout. ``w_sb`` is
+    ``[TOKEN_TILE, _BUFFERS, heads]``, read as stored: column ``h`` of a copy is head ``h``'s
+    per-token scale, the per-partition operand the vector engine's scale takes.
+    """
+    heads = q_hbm.shape[1]
+    head_dim = q_hbm.shape[2]
+    for h in range(heads):
+        _transpose_tile(qt[0:head_dim, slot, h, 0:mw], q_hbm[m0:m0 + mw, h, 0:head_dim])
+    nisa.dma_copy(dst=w_sb[0:mw, slot, 0:heads], src=w_hbm[m0:m0 + mw, 0:heads])
 
 
 @nki.jit
@@ -193,19 +230,25 @@ def _score_gemm_nki(q_hbm, k_hbm, w_hbm):
     Returns:
         ``[tokens, cands]`` fp32.
 
-    All transport is on chip. Every operand slab is a ``[rows, head_dim]`` tile with
-    ``rows <= 128``, loaded as stored and turned by one PE ``nc_transpose`` into a
-    same-dtype PSUM tile, then copied to SBUF; a ragged ``rows`` needs no padding
-    because the PE takes any tile up to (128, 128). ``k`` is turned once per call into
-    ``[head_dim, cands]`` and each (token tile, candidate tile, head) reads a column
-    range of it -- at ``cands`` 1024 that tile is 2,048 bytes per partition, 262,144
-    bytes of SBUF in all.
+    Launch: plain, or on an SPMD grid of two (LNC2, one program per physical core). The
+    programs take the ``TOKEN_TILE`` row tiles in turn, program ``p`` the tiles ``p, p + 2, ...``;
+    each turns all of ``k`` for itself, and each writes only its own output rows.
 
-    Each loop level answers to one bound: ``tokens`` walks in ``TOKEN_TILE`` steps
-    because it becomes the stationary free size (max 128), ``cands`` walks in
-    ``CAND_TILE`` steps because it becomes the moving free size (max 512), and
-    ``head_dim`` does not walk at all because it is the contraction axis and equals
-    the partition maximum exactly.
+    ``k`` is turned once per program into ``[head_dim, cands]`` (at ``cands`` 16384, 32 KiB of
+    each SBUF partition). Each token tile's query rows are turned once and serve every candidate;
+    the next tile's rows are loaded into the other of ``_BUFFERS`` copies while this one computes.
+    A ragged tile needs no padding: every operation takes any extent up to its tile bound.
+
+    Per (token tile, group of ``_GROUP_TILES`` candidate tiles, head) the engines split the work
+    three ways, which is what lets them overlap across heads: the PE writes this head's raw
+    scores to PSUM, one matmul per candidate tile, the scalar engine rectifies the whole group on
+    the way out of PSUM, and the vector engine folds the weight and the add into the group's SBUF
+    sum in one instruction, ``acc = rect * w[:, h] + acc``. The first head initialises ``acc``
+    with ``rect * w[:, 0] + 0.0``; the ``+ 0.0`` is the ``0 + x`` of a zeroed sum, which turns a
+    ``-0.0`` product into ``+0.0`` exactly as the add would. Each step rounds once in fp32, in the
+    reference order (dot, rectify, weight, then the head sum in head order), so the bits are those
+    of the four-instruction form. A finished sum leaves on the Sync engine's DMA queue, which no
+    compute stage waits behind.
 
     The matmul tiles are loaded without a widening cast: ``nc_matmul`` admits bf16
     operands and accumulates in fp32 regardless, so casting up first would buy no
@@ -215,53 +258,58 @@ def _score_gemm_nki(q_hbm, k_hbm, w_hbm):
     heads = q_hbm.shape[1]
     head_dim = q_hbm.shape[2]
     cands = k_hbm.shape[0]
+    programs = nl.num_programs(axes=0)
+    program = nl.program_id(0)
+    group = _GROUP_TILES * CAND_TILE
+    groups = (cands + group - 1) // group
+    # This program's token tiles start at ``first`` and step by ``stride``.
+    first = program * TOKEN_TILE
+    stride = programs * TOKEN_TILE
+    tiles = (tokens - first + stride - 1) // stride
 
     out = nl.ndarray((tokens, cands), dtype=nl.float32, buffer=nl.shared_hbm)
     kt = _keys_transposed(k_hbm, head_dim, cands)
+    qt = nl.ndarray((head_dim, _BUFFERS, heads, TOKEN_TILE), dtype=q_hbm.dtype, buffer=nl.sbuf)
+    w_sb = nl.ndarray((TOKEN_TILE, _BUFFERS, heads), dtype=nl.float32, buffer=nl.sbuf)
+    acc = nl.ndarray((TOKEN_TILE, _BUFFERS, group), dtype=nl.float32, buffer=nl.sbuf)
+    if tiles > 0:
+        _load_token_tile(q_hbm, w_hbm, qt, w_sb, first, min(TOKEN_TILE, tokens - first), 0)
 
-    for m0 in range(0, tokens, TOKEN_TILE):
+    for i in range(tiles):
+        m0 = first + i * stride
         mw = min(TOKEN_TILE, tokens - m0)
-        for n0 in range(0, cands, CAND_TILE):
-            nw = min(CAND_TILE, cands - n0)
+        if i + 1 < tiles:
+            _load_token_tile(q_hbm, w_hbm, qt, w_sb, m0 + stride,
+                             min(TOKEN_TILE, tokens - m0 - stride), (i + 1) % _BUFFERS)
+        q_tile = qt[0:head_dim, i % _BUFFERS, 0:heads, 0:mw]
+        w_tile = w_sb[0:mw, i % _BUFFERS, 0:heads]
 
-            # The head sum lives in SBUF, not PSUM, because a rectify and a scale stand between each
-            # head's matmul and this add. One memset per output tile reads more easily than
-            # special-casing the first head inside the loop.
-            acc = nl.ndarray((mw, nw), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.memset(dst=acc, value=0.0)
-
+        for g in range(groups):
+            n0 = g * group
+            gw = min(group, cands - n0)
+            # The copies alternate over every group of the program, across token tiles too.
+            total = acc[0:mw, (i * groups + g) % _BUFFERS, 0:gw]
             for h in range(heads):
-                # Stationary: this head's [mw, head_dim] rows as stored, turned to [head_dim, mw] so
-                # head_dim is the partition axis that contracts and mw becomes PSUM's partition.
-                q_sb = nl.ndarray((mw, head_dim), dtype=q_hbm.dtype, buffer=nl.sbuf)
-                nisa.tensor_copy(dst=q_sb, src=nl.load(q_hbm[m0:m0 + mw, h, :]))
-                q_tile = _transpose_tile(q_sb, mw, head_dim)
-
-                # Moving: [head_dim, nw], a column range of the keys turned once above.
-                k_tile = kt[:, n0:n0 + nw]
-
-                # dst = stationary.T @ moving = [mw, nw]. PSUM and fp32 are both forced here.
-                ps = nl.ndarray((mw, nw), dtype=nl.float32, buffer=nl.psum)
-                nisa.nc_matmul(dst=ps, stationary=q_tile, moving=k_tile, accumulate=False)
-
-                raw = nl.ndarray((mw, nw), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_copy(dst=raw, src=ps)
-
+                # dst = stationary.T @ moving = [mw, jw] per candidate tile: head_dim contracts
+                # on the partitions, and each tile lands in its own PSUM bank of the group.
+                ps = nl.ndarray((mw, gw), dtype=nl.float32, buffer=nl.psum)
+                for j0 in range(0, gw, CAND_TILE):
+                    jw = min(CAND_TILE, gw - j0)
+                    nisa.nc_matmul(dst=ps[0:mw, j0:j0 + jw], stationary=q_tile[0:head_dim, h, 0:mw],
+                                   moving=kt[0:head_dim, n0 + j0:n0 + j0 + jw], accumulate=False)
                 # Rectify per head, before the weight and before the sum.
-                rect = nl.ndarray((mw, nw), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.activation(dst=rect, op=nl.relu, data=raw)
-
-                # The per-token weight has to be a (mw, 1) column: tensor_scalar's operand0 is a
-                # per-partition scalar, and a (1, nw) row is refused by the MLIR verifier.
-                wcol = nl.ndarray((mw, 1), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_copy(dst=wcol, src=nl.load(w_hbm[m0:m0 + mw, h:h + 1], dtype=nl.float32))
-
-                scaled = nl.ndarray((mw, nw), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_scalar(dst=scaled, data=rect, op0=nl.multiply, operand0=wcol)
-
-                nisa.tensor_tensor(dst=acc, data1=acc, data2=scaled, op=nl.add)
-
-            nl.store(out[m0:m0 + mw, n0:n0 + nw], value=acc)
+                rect = nl.ndarray((mw, gw), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.activation(dst=rect, op=nl.relu, data=ps)
+                if h == 0:
+                    nisa.tensor_scalar(dst=total, data=rect, op0=nl.multiply,
+                                       operand0=w_tile[0:mw, 0:1], op1=nl.add, operand1=0.0,
+                                       engine=nisa.vector_engine)
+                else:
+                    nisa.scalar_tensor_tensor(dst=total, data=rect, op0=nl.multiply,
+                                              operand0=w_tile[0:mw, h:h + 1], op1=nl.add,
+                                              operand1=total)
+            nisa.dma_copy(dst=out[m0:m0 + mw, n0:n0 + gw], src=total,
+                          dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync)
 
     return out
 
@@ -272,7 +320,8 @@ def _score_gemm_nki(q_hbm, k_hbm, w_hbm):
 
 
 @torch._dynamo.assume_constant_result
-def _record_nki_dispatch(tokens: int, cands: int, heads: int, head_dim: int) -> None:
+def _record_nki_dispatch(tokens: int, cands: int, heads: int, head_dim: int,
+                         programs: int) -> None:
     """Record which kernel the seam dispatched, and log it, off the compiled graph.
 
     The dispatch branch is traced under ``fullgraph=True``, so a host call Dynamo
@@ -283,12 +332,23 @@ def _record_nki_dispatch(tokens: int, cands: int, heads: int, head_dim: int) -> 
     """
     _COUNTERS.last_kernel = _kernel_identity_of(_score_gemm_nki)
     logger.info(
-        "[dsa-score-gemm] kernel=nki tokens=%d cands=%d heads=%d head_dim=%d",
+        "[dsa-score-gemm] kernel=nki tokens=%d cands=%d heads=%d head_dim=%d programs=%d",
         tokens,
         cands,
         heads,
         head_dim,
+        programs,
     )
+
+
+def _programs(tokens: int) -> int:
+    """SPMD programs for a launch: two on an LNC2 runtime once there is a token tile for each.
+
+    The programs split the token tiles, so a call with one token tile runs as one program.
+    """
+    if os.environ.get("NEURON_LOGICAL_NC_CONFIG") == str(_LNC2_PROGRAMS) and tokens > TOKEN_TILE:
+        return _LNC2_PROGRAMS
+    return 1
 
 
 def _validate(q: Tensor, k: Tensor, weights: Tensor) -> tuple[int, int, int, int]:
@@ -372,10 +432,14 @@ def dsa_score_gemm(q: Tensor, k: Tensor, weights: Tensor) -> Tensor:
     _count_nki_dispatch()
     # The counter, the log and the identity read are folded off the traced graph: a counter store
     # inside the trace becomes a value guard that fails on the first call after warmup.
-    _record_nki_dispatch(tokens, cands, heads, head_dim)
+    programs = _programs(tokens)
+    _record_nki_dispatch(tokens, cands, heads, head_dim, programs)
+    launch = wrap_nki(_score_gemm_nki)
+    if programs > 1:
+        launch = launch[programs]
     # Same layout in, same layout out: a contiguous caller gets its own storage back, a strided
     # one gets a plain copy. Neither is a transposing relayout; the kernel turns the operands.
-    return wrap_nki(_score_gemm_nki)(q.contiguous(), k.contiguous(), weights.contiguous())
+    return launch(q.contiguous(), k.contiguous(), weights.contiguous())
 
 
 # ---------------------------------------------------------------------------------------------
