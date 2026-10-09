@@ -88,8 +88,9 @@ if TYPE_CHECKING:
     # records (JSONL, rank 0). Empty = no log, no scoring.
     VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG: str = ""
     # Worker GC policy after warmup (vllm_neuron/vllm/worker/gc_policy.py):
-    # "freeze_rare_gen2" (freeze + gen-2 threshold 100000), "freeze", or "off".
-    VLLM_NEURON_GC_POLICY: str = "freeze_rare_gen2"
+    # "off" (CPython's GC), "freeze_rare_gen2" (freeze + gen-2 threshold 100000), or
+    # "freeze".
+    VLLM_NEURON_GC_POLICY: str = "off"
     # GLM-5.3-Flash row-parallel all-reduce. Both defaults are the as-built path.
     # The dtype a row-parallel partial crosses the wire in: "fp32" or "bf16".
     VLLM_NEURON_TP_ALLREDUCE_DTYPE: str = "fp32"
@@ -459,12 +460,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG": lambda: (
         os.getenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG", "") or ""
     ),
-    # GC policy each worker applies once after warmup. "freeze_rare_gen2" freezes
-    # the heap and raises only the gen-2 threshold, so full passes stop running every
-    # ~11 bs=64 steps; "freeze" is the freeze alone; "off" keeps CPython's default GC.
-    "VLLM_NEURON_GC_POLICY": lambda: os.getenv(
-        "VLLM_NEURON_GC_POLICY", "freeze_rare_gen2"
-    ),
+    # GC policy each worker applies once after warmup. "off" (the default) keeps
+    # CPython's default GC: the freezing policies made every bs=1 decode step slower
+    # on TP=64 (gc_policy.py). "freeze_rare_gen2" freezes the heap and raises only
+    # the gen-2 threshold, so bs=64 decode has no full-pass stalls, at that bs=1
+    # cost; "freeze" is the freeze alone. Any other value is refused when the policy
+    # is applied.
+    "VLLM_NEURON_GC_POLICY": lambda: os.getenv("VLLM_NEURON_GC_POLICY", "off"),
     # ================== GLM-5.3-Flash Row-Parallel All-Reduce ==================
     # The wire dtype of the tensor-parallel all-reduce at GLM-5.3-Flash's
     # row-parallel sites (``model/glm5_next/collective_policy.py``). "fp32" (the
