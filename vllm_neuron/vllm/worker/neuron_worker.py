@@ -28,13 +28,7 @@ from vllm.distributed.kv_transfer import (
 from vllm.profiler.wrapper import TorchProfilerWrapper, WorkerProfiler
 from vllm.utils.torch_utils import set_random_seed
 from vllm.tasks import SupportedTask
-from vllm.v1.kv_cache_interface import (
-    AttentionSpec,
-    KVCacheConfig,
-    KVCacheSpec,
-    MambaSpec,
-    UniformTypeKVCacheSpecs,
-)
+from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 from vllm.v1.outputs import (
     DraftTokenIds,
@@ -172,52 +166,6 @@ def _tensors_in(value: Any) -> list[torch.Tensor]:
     else:
         return []
     return [item for item in candidates if isinstance(item, torch.Tensor)]
-
-
-def _draft_blocks_per_request(spec: KVCacheSpec, where: str) -> int:
-    """Return the blocks a request holds in a KV cache group beyond its sequence's pages.
-
-    A ``MambaSpec`` group holds ``num_speculative_blocks`` draft blocks: one state row
-    per draft token, which vLLM's ``MambaSpec.max_memory_usage_bytes`` prices (as
-    ``1 + num_speculative_blocks`` blocks in the ``none`` cache mode the plugin
-    serves) and the scheduler hands out. An ``AttentionSpec`` group holds none. A
-    ``UniformTypeKVCacheSpecs`` group -- one group of layers of one type at differing
-    geometries, the layout vLLM builds for a drafter whose KV geometry differs from
-    the target's (vLLM PR 25101; the runner allocates it) -- holds what its member
-    specs hold, which vLLM's grouping keeps uniform. A spec of any other class has no
-    pricing here and is refused by name: priced as attention it could hand vLLM a
-    pool it does not fit.
-
-    Args:
-        spec: The group's KV cache spec.
-        where: The group, named for the refusal.
-
-    Raises:
-        ValueError: ``spec`` is of a class the pool cannot price, or a uniform-type
-            group's members do not agree on their draft blocks.
-    """
-    if isinstance(spec, MambaSpec):
-        return int(spec.num_speculative_blocks)
-    if isinstance(spec, AttentionSpec):
-        return 0
-    if isinstance(spec, UniformTypeKVCacheSpecs):
-        per_member = {
-            _draft_blocks_per_request(member, f"{where}, layer {name!r}")
-            for name, member in spec.kv_cache_specs.items()
-        }
-        if len(per_member) != 1:
-            raise ValueError(
-                f"{where} is a UniformTypeKVCacheSpecs group whose layers hold "
-                f"differing draft blocks per request ({sorted(per_member)}); the "
-                "need-sized KV pool prices one figure per group"
-            )
-        return per_member.pop()
-    raise ValueError(
-        f"{where} is a {type(spec).__name__}: the need-sized KV pool prices "
-        "attention groups (the sequence's pages), MambaSpec groups (the sequence's "
-        "pages plus one block per draft token) and uniform-type groups of those "
-        "only, so this spec class needs its own pricing before it is served"
-    )
 
 
 def _indexer_side_cache_bytes(vllm_config, model_runner, kv_cache_spec=None) -> int:
@@ -1406,7 +1354,7 @@ class NeuronWorker(WorkerBase):
         ``num_speculative_blocks`` draft blocks per request, the blocks vLLM's own
         group-based admission check (``_check_enough_kv_cache_memory``) counts; an
         attention group has none; a uniform-type group holds what its members hold
-        (:func:`_draft_blocks_per_request`). In the recurrent cache modes the
+        (:func:`~vllm_neuron.vllm.worker.kv_group_blocks.draft_blocks_per_request`). In the recurrent cache modes the
         plugin serves (``mamba_cache_mode`` ``none``, the default, or ``all``) the
         need is not below that check's figure for the real layers.
 
@@ -1429,6 +1377,8 @@ class NeuronWorker(WorkerBase):
             get_kv_cache_groups,
             get_uniform_page_size,
         )
+
+        from .kv_group_blocks import draft_blocks_per_request
 
         kv_cache_spec = self.model_runner.get_kv_cache_spec()
         if not kv_cache_spec:
@@ -1457,11 +1407,11 @@ class NeuronWorker(WorkerBase):
         # taken for it here. A recurrent group of a speculative server also holds
         # its draft blocks per request (one state row per draft token; the
         # scheduler hands them out), counted as vLLM's admission check counts
-        # them; :func:`_draft_blocks_per_request` prices them per spec class and
+        # them; :func:`~vllm_neuron.vllm.worker.kv_group_blocks.draft_blocks_per_request` prices them per spec class and
         # refuses a class it cannot price.
         blocks_per_request = sum(
             cdiv(max_model_len, group.kv_cache_spec.block_size)
-            + _draft_blocks_per_request(
+            + draft_blocks_per_request(
                 group.kv_cache_spec,
                 f"KV cache group {index} ({', '.join(group.layer_names)})",
             )

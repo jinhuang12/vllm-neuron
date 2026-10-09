@@ -29,7 +29,9 @@ from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.sampling_params import SamplingType
 from vllm.tasks import SupportedTask
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm_neuron.vllm.worker.kv_group_blocks import draft_blocks_per_request
 from vllm_neuron.utils.dtype_utils import kv_cache_dtype_str_to_dtype
+from vllm.utils.math_utils import cdiv
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -11170,6 +11172,20 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         block_sizes = [
             group.kv_cache_spec.block_size for group in kv_cache_config.kv_cache_groups
         ]
+        # Each group's block-table row must hold every block the scheduler hands a
+        # request there: the sequence's pages, plus a recurrent group's draft blocks
+        # on a speculative server (``draft_blocks_per_request``, the figure the KV
+        # need is priced with; the GPU runner sizes its rows the same way). vLLM's
+        # default row, ``cdiv(max_model_len, block_size)``, overflows on the first
+        # drafting request otherwise ("could not broadcast input array").
+        max_num_blocks_per_req = [
+            cdiv(self.max_model_len, group.kv_cache_spec.block_size)
+            + draft_blocks_per_request(
+                group.kv_cache_spec,
+                f"KV cache group {index} ({', '.join(group.layer_names)})",
+            )
+            for index, group in enumerate(kv_cache_config.kv_cache_groups)
+        ]
         logger.info(
             "KV cache block_size resolved: cache_config=%s, per_group=%s",
             self.vllm_config.cache_config.block_size,
@@ -11185,6 +11201,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             vocab_size=self.vocab_size,
             block_sizes=block_sizes,
             kernel_block_sizes=block_sizes,
+            max_num_blocks_per_req=max_num_blocks_per_req,
             logitsprocs=None,
             logitsprocs_need_output_token_ids=False,
             is_pooling_model=self.is_pooling_model,
