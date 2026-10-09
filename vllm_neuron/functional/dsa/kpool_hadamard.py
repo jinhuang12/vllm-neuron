@@ -557,7 +557,7 @@ def hadamard128_programs(n_rows: int) -> int:
 
 def kpool_hadamard_programs(n_pools: int) -> int:
     """Programs the prefill pooling launches: both cores of an LNC2 core from two pools on."""
-    if os.environ.get("NEURON_LOGICAL_NC_CONFIG") == "2" and int(n_pools) >= 2:
+    if lnc_pair() and int(n_pools) >= 2:
         return 2
     return 1
 

@@ -19,6 +19,9 @@ and ragged counts that leave a short tile on one or both programs.
 
 from __future__ import annotations
 
+import ast
+import pathlib
+
 import pytest
 import torch
 
@@ -90,6 +93,24 @@ def test_pooling_runs_on_both_programs_from_two_pools_on(monkeypatch):
     assert KH.kpool_hadamard_programs(1) == 1
     assert KH.kpool_hadamard_programs(2) == 2
     assert KH.kpool_hadamard_programs(1024) == 2
+
+
+def test_the_pooling_grid_reads_the_setting_through_lnc_pair_and_refuses_an_unserved_one(
+        monkeypatch):
+    """The grid comes from ``launch_grid.lnc_pair``, which a trace folds to a constant, as
+    the decode grids do. A raw environment read in this module would become a guard that
+    reads the environment again before every step of the prefill graph. A setting the
+    kernels do not serve (4) is refused by name."""
+    from vllm_neuron.functional.dsa.launch_grid import LaunchGridError
+
+    tree = ast.parse(pathlib.Path(KH.__file__).read_text())
+    raw = [node.lineno for node in ast.walk(tree)
+           if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+           and node.value.id in ("os", "envs")]
+    assert not raw, f"kpool_hadamard.py reads the environment itself at lines {raw}"
+    monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", "4")
+    with pytest.raises(LaunchGridError, match="NEURON_LOGICAL_NC_CONFIG=4"):
+        KH.kpool_hadamard_programs(2)
 
 
 def _launches(monkeypatch, n_pools: int) -> list:
