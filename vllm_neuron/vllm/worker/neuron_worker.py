@@ -172,7 +172,10 @@ def _indexer_side_cache_bytes(vllm_config, model_runner, kv_cache_spec=None) -> 
     """Return the bytes of the DSA indexer side caches the runner allocates.
 
     ``pool_cache``, ``tail`` and ``pad_tail`` of every sparse-attention layer, one
-    set per request slot (``max_num_seqs``), sized by ``max_model_len``:
+    set per request slot (``max_num_seqs``), sized by ``max_model_len``, or under
+    decode context parallelism by this rank's share of it
+    (:func:`~vllm_neuron.vllm.worker.neuron_model_runner.indexer_context_per_rank`),
+    the context the runner allocates with:
     :func:`~vllm_neuron.vllm.worker.neuron_model_runner.indexer_side_cache_bytes`.
     0 for a model with no indexer.
     """
@@ -180,10 +183,15 @@ def _indexer_side_cache_bytes(vllm_config, model_runner, kv_cache_spec=None) -> 
 
     if kv_cache_spec is None:
         kv_cache_spec = model_runner.get_kv_cache_spec()
+    max_seq_len = vllm_config.model_config.max_model_len
+    if vllm_config.parallel_config.decode_context_parallel_size > 1:
+        from .neuron_model_runner import indexer_context_per_rank
+
+        max_seq_len = indexer_context_per_rank(vllm_config)
     return indexer_side_cache_bytes(
         kv_cache_spec,
         getattr(model_runner.model, "text_config", None),
-        max_seq_len=vllm_config.model_config.max_model_len,
+        max_seq_len=max_seq_len,
         request_slots=vllm_config.scheduler_config.max_num_seqs,
     )
 
@@ -1380,11 +1388,28 @@ class NeuronWorker(WorkerBase):
         # single-block premise would then be too small for a request vLLM's
         # admission arithmetic said would fit. Where a recurrent block does span
         # the sequence this expression reads one block, so it is right either way.
-        # Context parallelism would let a rank keep fewer tokens; no discount is
-        # taken for it here.
-        blocks_per_request = sum(
-            cdiv(max_model_len, group.kv_cache_spec.block_size) for group in groups
-        )
+        dcp_size = self.vllm_config.parallel_config.decode_context_parallel_size
+        if dcp_size > 1:
+            # Under decode context parallelism the allocator gives a rank one block
+            # per ``block_size * dcp_size`` tokens of a sequence: vLLM's KV cache
+            # manager scales each group's block size by the DCP size
+            # (``SingleTypeKVCacheManager.__init__``), so a rank keeps only its own
+            # blocks. The need is priced the same way, per rank.
+            from vllm_neuron.utils.dcp_ownership import ownership_stride
+
+            blocks_per_request = sum(
+                cdiv(
+                    max_model_len,
+                    ownership_stride(
+                        block_size=group.kv_cache_spec.block_size, dcp_size=dcp_size
+                    ),
+                )
+                for group in groups
+            )
+        else:
+            blocks_per_request = sum(
+                cdiv(max_model_len, group.kv_cache_spec.block_size) for group in groups
+            )
         # Plus the pool's null block, which no request can be given.
         num_blocks = blocks_per_request * max_num_seqs + 1
         need_bytes = num_blocks * page_size * layers_per_pool
