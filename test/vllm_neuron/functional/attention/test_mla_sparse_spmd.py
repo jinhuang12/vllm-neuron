@@ -87,7 +87,6 @@ def test_dual_pnc_paged_programs_keep_private_overlay_windows(seq, dtype):
     [
         (None, 32, 1, 512, 0, 2176, False, 1),
         ("1", 32, 1, 512, 0, 2176, False, 1),
-        ("invalid", 32, 1, 512, 0, 2176, False, 1),
         ("2", 1, 1, 512, 0, 2176, False, 1),
         ("2", 16, 1, 512, 0, 2176, False, 1),
         ("2", 32, 1, 512, 0, 2176, False, 2),

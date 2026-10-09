@@ -47,6 +47,7 @@ import nki.language as nl
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
+from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 from vllm_neuron.utils.neuron_utils import can_run_kernel, values_are_readable
 
 logger = logging.getLogger(__name__)
@@ -2095,7 +2096,7 @@ def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
     # a single query block keeps its original launch and arithmetic order.
     # :data:`PROGRAMS_ENV` ``1`` keeps one program, for measurement.
     if (
-        os.environ.get("NEURON_LOGICAL_NC_CONFIG") == "2"
+        lnc_pair()
         and os.environ.get(PROGRAMS_ENV) != "1"
         and rows_tiled
         and rope == 0

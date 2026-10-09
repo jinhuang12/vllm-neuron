@@ -25,7 +25,6 @@ Both LNC2 cores: yes. Each program forms the (tiny) gated rows and its half of t
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 
 import torch
@@ -39,6 +38,7 @@ from nkilib.core.utils.kernel_assert import kernel_assert
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
 from vllm_neuron import envs
+from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 from vllm_neuron.functional.glue import glue_selected
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
@@ -211,8 +211,12 @@ def _count_declined() -> None:
 
 
 def launch_programs() -> int:
-    """2 programs (both LNC2 cores) under ``NEURON_LOGICAL_NC_CONFIG=2``, else 1."""
-    return 2 if os.environ.get("NEURON_LOGICAL_NC_CONFIG") == "2" else 1
+    """2 programs (both LNC2 cores) under ``NEURON_LOGICAL_NC_CONFIG=2``, 1 when unset or 1.
+
+    :func:`~vllm_neuron.functional.dsa.launch_grid.lnc_pair` refuses a setting other
+    than unset, 1 or 2 (``LaunchGridError``).
+    """
+    return 2 if lnc_pair() else 1
 
 
 def kda_gated_projection_admits(core: Tensor, out_gate: Tensor, attn,
