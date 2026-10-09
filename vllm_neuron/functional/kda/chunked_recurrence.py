@@ -106,7 +106,6 @@ from __future__ import annotations
 
 import logging
 import math
-import os
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -119,6 +118,7 @@ import nki.language as nl
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
+from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 from vllm_neuron.utils.neuron_utils import can_run_kernel, values_are_readable
 
 logger = logging.getLogger(__name__)
@@ -709,6 +709,11 @@ def _tile_rows(tensor_rows, r0, n_tiles, rows, width):
 
 
 def _load_tiles(tensor_rows, r0, n_tiles, rows, width, engine):
+    """Load the rows :func:`_tile_rows` names into a new ``[rows, n_tiles * width]`` tile.
+
+    One DMA, its descriptors from ``engine`` (see :func:`_dma`); the inverse of
+    :func:`_store_tiles`.
+    """
     tile = _sbuf(rows, n_tiles * width)
     _dma(_blocks(tile, rows, n_tiles, width),
          _tile_rows(tensor_rows, r0, n_tiles, rows, width), engine)
@@ -1017,7 +1022,7 @@ def intra_chunk_grid(n_chunks: int, chunk: int) -> tuple[int, ...]:
     evenly over the programs, else ``()`` (one program). Each program then owns a
     contiguous run of whole tiles.
     """
-    if os.environ.get("NEURON_LOGICAL_NC_CONFIG") != "2":
+    if not lnc_pair():
         return ()
     rows = n_chunks * chunk
     full, tail = divmod(rows, tile_rows(chunk))
@@ -1619,7 +1624,7 @@ def inter_chunk_grid(vdim: int) -> tuple[int, ...]:
     the value columns split evenly over the programs, else ``()``. Each program
     carries its own value columns of the state through the same chain.
     """
-    if os.environ.get("NEURON_LOGICAL_NC_CONFIG") != "2" or vdim % LNC2_PROGRAMS:
+    if not lnc_pair() or vdim % LNC2_PROGRAMS:
         return ()
     return (LNC2_PROGRAMS,)
 
