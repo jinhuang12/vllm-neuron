@@ -250,8 +250,13 @@ def mla_projection_kernel_identity() -> tuple[str, str]:
 # accumulates across every contraction block and no per-block vector op touches
 # the output. The fold rounds ``x_k * s[k, n]`` to bf16, the stationary dtype.
 #
-# Both physical cores of an LNC2 core split the output columns (``[2]`` grid);
-# each program loads only its half of the weight.
+# Both physical cores of an LNC2 core split the work (``[2]`` grid). A decode batch
+# (one sequence tile) splits the output columns: each program loads only its half of
+# the weight. A prefill chunk splits its rows instead (:func:`lowp_splits_rows`):
+# each program transposes only its own rows of ``x`` once, holds every weight column,
+# and picks per weight chunk which operand is stationary
+# (:func:`lowp_weight_stationary`). Both splits compute every output element with the
+# same products in the same order, so they return the same bits.
 # ---------------------------------------------------------------------------
 
 #: Weight rows per scale block, the checkpoint's ``weight_block_size``.
@@ -308,10 +313,14 @@ def mla_projection_lowp_kernel(x_hbm, w_hbm, scale_hbm=None, col_chunk=0):
         scale_hbm: ``[programs, K // 128, N // (128 * programs)]`` fp32 dequant
             multipliers, program-major (see :func:`lowp_scale_layout`), or None.
         col_chunk: weight columns held in SBUF at once, a trace-time int; 0 holds
-            the program's whole share. The seam sizes it to the SBUF budget.
+            the program's whole share (every column when the rows split). The seam
+            sizes it to the SBUF budget.
 
     Returns:
         ``[M, N]`` fp32.
+
+    Rows split over the programs when :func:`lowp_splits_rows` says so
+    (:func:`_lowp_project_rows`); else the output columns do, as below.
     """
     m_ext, k_ext = x_hbm.shape
     n_ext = w_hbm.shape[1]
@@ -332,6 +341,9 @@ def mla_projection_lowp_kernel(x_hbm, w_hbm, scale_hbm=None, col_chunk=0):
                       and scale_hbm.shape[2] * LOWP_SCALE_BLOCK == width,
                       "the scale grid must be program-major for this launch grid")
     out = nl.ndarray((m_ext, n_ext), dtype=nl.float32, buffer=nl.shared_hbm)
+    if lowp_splits_rows(m_ext, programs, _lowp_x_row_bytes(x_hbm)):
+        _lowp_project_rows(x_hbm, w_hbm, scale_hbm, col_chunk, out)
+        return out
     rows_per_transpose = CONTRACTION_TILE // n_kb
     if rows_per_transpose < 1:
         rows_per_transpose = 1
@@ -456,6 +468,321 @@ def mla_projection_lowp_kernel(x_hbm, w_hbm, scale_hbm=None, col_chunk=0):
                 src=res,
             )
     return out
+
+
+#: Rows of x^T one matmul streams in the row-split path when the weight block is the
+#: stationary operand and x^T the moving one: the moving free extent,
+#: ``nl.tile_size.gemm_moving_fmax``. Also the rows one output DMA carries.
+LOWP_ROW_BLOCK = OUTPUT_TILE
+
+#: Bytes per partition of one PSUM bank (``nl.tile_size.psum_bank_fmax`` fp32 words).
+#: A transposed 128-wide block is 128 elements per partition, so a bank holds eight
+#: bf16 blocks or four fp32 ones.
+_PSUM_BANK_BYTES = 2048
+
+#: Every this-many-th scale fold runs on the Scalar engine, the rest on Vector. A
+#: ``[128, 512]`` bf16 fold MEASURED 347 ns on Vector and 711 ns on Scalar in the
+#: kernel, so Vector takes two of three. GpSimd is not used: its fold MEASURED 4.1 us,
+#: and a Vector fold running beside it 2.0-4.1 us (``reports/mla_projection.md``,
+#: engine costs).
+LOWP_SCALAR_FOLD_PERIOD = 3
+
+#: Contraction blocks from which the row-split path may make the weight block the
+#: stationary operand (see :func:`lowp_weight_stationary`). Swapping adds one fp32 PE
+#: transpose per output block and saves PE time on every contraction block. MEASURED
+#: per call: x^T stationary is faster at 2 blocks (o_proj) and ties at 12 (q_b), so the
+#: bound lies in between (``reports/mla_projection.md``, design measurements).
+LOWP_WEIGHT_STATIONARY_MIN_BLOCKS = 8
+
+#: SBUF bytes per partition of fp32 results one output DMA carries in the row-split
+#: path: 2 MiB a DMA. MEASURED per call against one DMA per PSUM bank (256 KiB to
+#: 1 MiB): wq_b 106 -> 92 us; against one DMA per row block (8 MiB for o_proj),
+#: o_proj 61 -> 38 us, its stores overlapping the matmuls (``reports/mla_projection.md``,
+#: design measurements).
+LOWP_RESULT_SBUF_BYTES = 16 * 1024
+
+#: Every this-many-th PSUM evacuation runs on the Scalar engine. In the kernel a
+#: ``[128, 512]`` fp32 PSUM read MEASURED 692 ns on Vector and 587 ns on Scalar, and a
+#: bf16 bank of x^T blocks 692 ns and 1012 ns: an even split (``reports/mla_projection.md``,
+#: engine costs).
+LOWP_SCALAR_EVAC_PERIOD = 2
+
+#: Largest row of ``x``, in bytes, the row-split path reads whole: one row on each
+#: partition, so this is the SBUF its row buffer takes. A wider ``x`` keeps the column
+#: split (see :func:`lowp_splits_rows`).
+LOWP_X_ROW_BYTES = 16 * 1024
+
+#: SBUF bytes per partition of x^T the row-split path holds at once; a program's rows
+#: past it are transposed and projected a batch at a time. A third of trn2's 192 KiB
+#: partition, beside the weight chunk (:data:`LOWP_WEIGHT_SBUF_BYTES`) and the row
+#: buffers: a 2048-row chunk of a 4096-wide ``x`` on an LNC2 pair is one batch.
+LOWP_XT_SBUF_BYTES = 64 * 1024
+
+
+def lowp_splits_rows(rows: int, programs: int, row_bytes: int) -> bool:
+    """Whether the low-precision kernel splits ``rows`` rather than the output columns.
+
+    A prefill chunk -- more than one sequence tile, in whole tiles per program --
+    splits its rows: each core transposes only its own rows of ``x``, and x^T, the
+    larger operand there, is built once rather than once per program. A decode batch
+    (one sequence tile) splits the output columns, so each core reads half the
+    weight, the larger operand there. ``row_bytes`` is one row of ``x`` in bytes; a
+    row wider than :data:`LOWP_X_ROW_BYTES` keeps the column split. Shape arithmetic
+    only, so the seam and the kernel decide alike.
+    """
+    return (rows > SEQUENCE_TILE and rows % (SEQUENCE_TILE * programs) == 0
+            and row_bytes <= LOWP_X_ROW_BYTES)
+
+
+def _lowp_x_row_bytes(x_hbm) -> int:
+    """Bytes of one row of ``x_hbm``, which is bf16 or fp32 (the seam admits no other)."""
+    return x_hbm.shape[1] * (2 if x_hbm.dtype == nl.bfloat16 else 4)
+
+
+def _lowp_rows_held(n_kb: int) -> int:
+    """Rows of x^T, whole sequence tiles, that :data:`LOWP_XT_SBUF_BYTES` holds."""
+    held = LOWP_XT_SBUF_BYTES // (n_kb * 2) // SEQUENCE_TILE * SEQUENCE_TILE
+    return max(held, SEQUENCE_TILE)
+
+
+def _alternate(index: int, period: int):
+    """The Scalar engine for every ``period``-th instruction, Vector for the rest."""
+    return nisa.scalar_engine if index % period == period - 1 else nisa.vector_engine
+
+
+def _row_dma(dst, src) -> None:
+    """A row-split-path DMA, its descriptors from the Sync engine's hardware DGE ring.
+
+    The default, GpSimd's software DGE, MEASURED 0.65-1.1 us of GpSimd per DMA, and
+    GpSimd slows Vector beside it. Per call against it the Sync ring MEASURED 2-12 %
+    faster on q_a, kv_a and q_b and 2 % slower on o_proj, and static descriptors 1-18 %
+    slower (``reports/mla_projection.md``, design measurements).
+    """
+    nisa.dma_copy(dst=dst, src=src, dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync)
+
+
+def _lowp_transpose_rows(x_hbm, row0, rows: int):
+    """``xt[p, kb, m] = bf16(x[row0 + m, kb * 128 + p])`` for ``rows`` rows of ``x``.
+
+    Whole rows are read (one contiguous run per partition), rounded to bf16 when
+    ``x`` is fp32 -- the transpose is bit-accurate (MEASURED on trn2), so rounding
+    first gives the same bf16 as rounding after -- and transposed on the PE, a bank
+    of blocks at a time.
+    """
+    k_ext = x_hbm.shape[1]
+    n_kb = k_ext // CONTRACTION_TILE
+    per_bank = _PSUM_BANK_BYTES // (SEQUENCE_TILE * 2)
+    xt = nl.ndarray((CONTRACTION_TILE, n_kb, rows), dtype=nl.bfloat16, buffer=nl.sbuf)
+    evac = 0
+    for m0 in range(0, rows, SEQUENCE_TILE):
+        x_rows = nl.ndarray((SEQUENCE_TILE, k_ext), dtype=x_hbm.dtype, buffer=nl.sbuf)
+        _row_dma(
+            dst=x_rows,
+            src=x_hbm.ap(pattern=[[k_ext, SEQUENCE_TILE], [1, k_ext]],
+                         offset=(row0 + m0) * k_ext),
+        )
+        if x_hbm.dtype != nl.bfloat16:
+            x_bf = nl.ndarray((SEQUENCE_TILE, k_ext), dtype=nl.bfloat16, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=x_bf, src=x_rows, engine=_alternate(m0 // SEQUENCE_TILE, 2))
+            x_rows = x_bf
+        for g0 in range(0, n_kb, per_bank):
+            group = min(per_bank, n_kb - g0)
+            t_ps = nl.ndarray((CONTRACTION_TILE, group, SEQUENCE_TILE), dtype=nl.bfloat16,
+                              buffer=nl.psum)
+            for j in range(group):
+                k0 = (g0 + j) * CONTRACTION_TILE
+                nisa.nc_transpose(dst=t_ps[:, j, :], data=x_rows[:, k0:k0 + CONTRACTION_TILE])
+            nisa.tensor_copy(dst=xt[:, g0:g0 + group, m0:m0 + SEQUENCE_TILE], src=t_ps,
+                             engine=_alternate(evac, LOWP_SCALAR_EVAC_PERIOD))
+            evac += 1
+    return xt
+
+
+def _lowp_grid_index(n_kb: int, prog_nb: int, kb: int, nb: int) -> int:
+    """Offset of block ``(kb, nb)`` in the flat program-major grid (:func:`lowp_scale_layout`)."""
+    return (nb // prog_nb) * n_kb * prog_nb + kb * prog_nb + nb % prog_nb
+
+
+def lowp_weight_stationary(n_kb: int, cols: int, scaled: bool) -> bool:
+    """Whether the row-split path makes the weight block the stationary operand.
+
+    x^T stationary (the column-split path's orientation) moves at most a PSUM bank of
+    output columns per matmul -- one 128-wide scale block when a block's multiplier is
+    folded into x, else ``min(cols, 512)``. The weight stationary moves up to
+    :data:`LOWP_ROW_BLOCK` rows per matmul instead, at the price of one PE transpose of
+    each ``[128, 128]`` output block, which :data:`LOWP_WEIGHT_STATIONARY_MIN_BLOCKS`
+    contraction blocks amortise. So the weight is stationary when x^T-stationary
+    matmuls would be narrow -- scaled, or fewer than 512 columns -- and the
+    contraction is deep enough.
+    """
+    narrow = scaled or cols < OUTPUT_TILE
+    return narrow and n_kb >= LOWP_WEIGHT_STATIONARY_MIN_BLOCKS
+
+
+def _lowp_rows_matmuls(xt, w_sb, s_sb, prog_nb: int, out, row0, col0: int):
+    """``out[row0 + m, col0 + c] = x @ dequant(w)`` for one resident weight chunk.
+
+    ``s_sb`` is the broadcast scale grid of an fp8 weight, or None for bf16. A scaled
+    block's multiplier is folded into x^T as in the column-split path,
+    ``bf16(bf16(x) * s[kb, nb])``, once per block pair over up to
+    :data:`LOWP_ROW_BLOCK` rows. The orientation is :func:`lowp_weight_stationary`'s;
+    with the weight stationary the ``[n, m]`` result is transposed back on the PE,
+    which is bit-accurate. The products and their order are the same in either
+    orientation, so the sums are the same bits (MEASURED bit-identical on trn2).
+
+    Every accumulation group has a PSUM bank of its own: two groups in one bank, even
+    one after the other, MEASURED wrong sums on trn2; single-matmul writes such as the
+    transposes may share one (``reports/mla_projection.md``, engine probes).
+    """
+    n_kb, rows = xt.shape[1], xt.shape[2]
+    cw = w_sb.shape[2]
+    scaled = s_sb is not None
+    weight_stationary = lowp_weight_stationary(n_kb, cw, scaled)
+    # Output columns per accumulation group: the stationary width when the weight is
+    # stationary, one scale block when it is folded into x, else a PSUM bank. Rows per
+    # pass: what one moving operand or one fold covers; a bf16 weight's x^T-stationary
+    # matmuls need neither, so they take a row tile at a time, one bank per group.
+    block = OUTPUT_TILE
+    row_block = SEQUENCE_TILE
+    if weight_stationary or scaled:
+        block = LOWP_SCALE_BLOCK
+        row_block = LOWP_ROW_BLOCK
+    count = [0, 0]  # folds, PSUM evacuations: each alternates its engines
+    for r0 in range(0, rows, row_block):
+        rw = min(row_block, rows - r0)
+        n_mt = rw // SEQUENCE_TILE
+        # One output DMA per span of whole banks, LOWP_RESULT_SBUF_BYTES a partition.
+        span = max(OUTPUT_TILE, LOWP_RESULT_SBUF_BYTES // (n_mt * 4) // OUTPUT_TILE
+                   * OUTPUT_TILE)
+        for s0 in range(0, cw, span):
+            sw = min(span, cw - s0)
+            # res[m, mt, c]: row tile mt of the row block, the span's columns.
+            res = nl.ndarray((SEQUENCE_TILE, n_mt, sw), dtype=nl.float32, buffer=nl.sbuf)
+            for g0 in range(0, sw, OUTPUT_TILE):
+                _lowp_rows_bank(xt, w_sb, s_sb, prog_nb, res, r0, rw, s0, g0, col0, block,
+                                weight_stationary, count)
+            _row_dma(
+                dst=out.ap(pattern=[[out.shape[1], SEQUENCE_TILE],
+                                    [SEQUENCE_TILE * out.shape[1], n_mt], [1, sw]],
+                           offset=(row0 + r0) * out.shape[1] + col0 + s0),
+                src=res,
+            )
+
+
+def _lowp_rows_bank(xt, w_sb, s_sb, prog_nb: int, res, r0: int, rw: int, s0: int, g0: int,
+                    col0: int, block: int, weight_stationary: bool, count) -> None:
+    """One PSUM bank's worth of output columns, ``res[:, :, g0 : g0 + 512]``, of the
+    span at chunk column ``s0`` for the ``rw`` rows at ``r0`` (see
+    :func:`_lowp_rows_matmuls`).
+    """
+    n_kb = xt.shape[1]
+    n_mt = rw // SEQUENCE_TILE
+    gw = min(OUTPUT_TILE, res.shape[2] - g0)
+    # With the weight stationary the blocks' transposes fill one tile; else one x^T-
+    # stationary block covering the bank leaves it whole in its accumulation tile.
+    whole = weight_stationary or gw <= block
+    held = None
+    if whole:
+        held = nl.ndarray((SEQUENCE_TILE, n_mt, OUTPUT_TILE), dtype=nl.float32,
+                          buffer=nl.psum)
+    for b0 in range(0, gw, block):
+        bw = min(block, gw - b0)
+        c0 = s0 + g0 + b0
+        if weight_stationary:
+            acc_ps = _psum(bw, rw)
+        elif whole:
+            acc_ps = held
+        else:
+            # One bank per row tile, each group in its first ``bw`` words.
+            acc_ps = nl.ndarray((SEQUENCE_TILE, n_mt, OUTPUT_TILE), dtype=nl.float32,
+                                buffer=nl.psum)
+        for kb in range(n_kb):
+            x_op = xt[:, kb, r0:r0 + rw]
+            if s_sb is not None:
+                at = _lowp_grid_index(n_kb, prog_nb, kb, (col0 + c0) // LOWP_SCALE_BLOCK)
+                x_op = nl.ndarray((CONTRACTION_TILE, rw), dtype=nl.bfloat16, buffer=nl.sbuf)
+                nisa.tensor_scalar(dst=x_op, data=xt[:, kb, r0:r0 + rw], op0=nl.multiply,
+                                   operand0=s_sb[:, at:at + 1],
+                                   engine=_alternate(count[0], LOWP_SCALAR_FOLD_PERIOD))
+                count[0] += 1
+            w_block = w_sb[:, kb, c0:c0 + bw]
+            if weight_stationary:
+                nisa.nc_matmul(dst=acc_ps, stationary=w_block, moving=x_op,
+                               accumulate=(kb > 0))
+            else:
+                for mt in range(n_mt):
+                    m0 = mt * SEQUENCE_TILE
+                    nisa.nc_matmul(dst=acc_ps[:, mt, 0:bw],
+                                   stationary=x_op[:, m0:m0 + SEQUENCE_TILE],
+                                   moving=w_block, accumulate=(kb > 0))
+        if weight_stationary:
+            y_t = _sbuf(bw, rw)
+            nisa.tensor_copy(dst=y_t, src=acc_ps,
+                             engine=_alternate(count[1], LOWP_SCALAR_EVAC_PERIOD))
+            count[1] += 1
+            for mt in range(n_mt):
+                m0 = mt * SEQUENCE_TILE
+                nisa.nc_transpose(dst=held[:, mt, b0:b0 + bw],
+                                  data=y_t[:, m0:m0 + SEQUENCE_TILE])
+        elif not whole:
+            nisa.tensor_copy(dst=res[:, :, g0 + b0:g0 + b0 + bw], src=acc_ps[:, :, 0:bw],
+                             engine=_alternate(count[1], LOWP_SCALAR_EVAC_PERIOD))
+            count[1] += 1
+    if whole:
+        nisa.tensor_copy(dst=res[:, :, g0:g0 + gw], src=held[:, :, 0:gw],
+                         engine=_alternate(count[1], LOWP_SCALAR_EVAC_PERIOD))
+        count[1] += 1
+
+
+def _lowp_project_rows(x_hbm, w_hbm, scale_hbm, col_chunk: int, out) -> None:
+    """The row-split body (see :func:`lowp_splits_rows`): this program's rows against
+    every output column, :func:`_lowp_rows_held` rows of x^T at a time.
+
+    ``col_chunk`` counts columns of the whole weight here, not of a program's share.
+    """
+    m_ext, k_ext = x_hbm.shape
+    n_ext = w_hbm.shape[1]
+    n_kb = k_ext // CONTRACTION_TILE
+    programs = nl.num_programs(axes=0)
+    rows = m_ext // programs
+    row0 = nl.program_id(0) * rows
+    chunk = n_ext if col_chunk == 0 or col_chunk > n_ext else col_chunk
+    s_sb = None
+    if scale_hbm is not None:
+        # The whole program-major grid on every partition: one contiguous run each.
+        grid = scale_hbm.shape[0] * scale_hbm.shape[1] * scale_hbm.shape[2]
+        s_sb = nl.ndarray((CONTRACTION_TILE, grid), dtype=nl.float32, buffer=nl.sbuf)
+        _row_dma(dst=s_sb, src=scale_hbm.ap(pattern=[[0, CONTRACTION_TILE], [1, grid]],
+                                                 offset=0))
+    prog_nb = 0 if scale_hbm is None else scale_hbm.shape[2]
+    # One resident chunk is loaded once; several are reloaded per batch of x^T.
+    resident = chunk == n_ext
+    w_sb = None
+    if resident:
+        w_sb = _lowp_load_weight(w_hbm, 0, n_ext)
+    held = _lowp_rows_held(n_kb)
+    for t0 in range(0, rows, held):
+        xt = _lowp_transpose_rows(x_hbm, row0 + t0, min(held, rows - t0))
+        for col0 in range(0, n_ext, chunk):
+            if not resident:
+                w_sb = _lowp_load_weight(w_hbm, col0, min(chunk, n_ext - col0))
+            _lowp_rows_matmuls(xt, w_sb, s_sb, prog_nb, out, row0 + t0, col0)
+
+
+def _lowp_load_weight(w_hbm, col0: int, cols: int):
+    """``w_sb[p, kb, c] = w[kb * 128 + p, col0 + c]``, :data:`LOWP_KB_PER_DMA` blocks a DMA."""
+    n_kb = w_hbm.shape[0] // CONTRACTION_TILE
+    n_ext = w_hbm.shape[1]
+    w_sb = nl.ndarray((CONTRACTION_TILE, n_kb, cols), dtype=w_hbm.dtype, buffer=nl.sbuf)
+    for kb0 in range(0, n_kb, LOWP_KB_PER_DMA):
+        group = min(LOWP_KB_PER_DMA, n_kb - kb0)
+        _row_dma(
+            dst=w_sb[:, kb0:kb0 + group, :],
+            src=w_hbm.ap(pattern=[[n_ext, CONTRACTION_TILE],
+                                  [CONTRACTION_TILE * n_ext, group], [1, cols]],
+                         offset=kb0 * CONTRACTION_TILE * n_ext + col0),
+        )
+    return w_sb
 
 
 #: SBUF bytes per partition one weight chunk may hold. A quarter of trn2's 192 KiB
@@ -584,8 +911,11 @@ def mla_projection_lowp(x: Tensor, weight: Tensor, scale: Tensor | None = None) 
     _require_lowp_admissible(x, weight, scale, programs)
     if scaled and scale.ndim == 2:
         scale = lowp_scale_layout(scale, programs)
-    chunk = _lowp_col_chunk(int(weight.shape[0]), int(weight.shape[1]) // programs,
-                            weight.element_size(), scaled)
+    # A program holds every weight column when the kernel splits rows, its share else.
+    held = int(weight.shape[1])
+    if not lowp_splits_rows(int(x.shape[0]), programs, int(x.shape[1]) * x.element_size()):
+        held //= programs
+    chunk = _lowp_col_chunk(int(weight.shape[0]), held, weight.element_size(), scaled)
     # Both counters move: this is a dispatch of the projection family as much as the
     # fp32 kernel's is, so the family reading stays one count per projection site.
     _count_nki_dispatch()
