@@ -17,6 +17,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from vllm_neuron import envs
 from vllm_neuron.functional.dsa import kpool_hadamard as KH
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
@@ -66,6 +67,17 @@ def test_one_row_runs_on_one_program(monkeypatch):
     monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", "2")
     assert KH.hadamard128_programs(1) == 1
     assert KH.hadamard128_programs(2) == 2
+
+
+@pytest.mark.parametrize("lnc", [None, 1, 2])
+def test_the_rotation_grid_follows_the_logical_core_config(monkeypatch, lnc):
+    """Both cores only under an LNC2 launch. Moved from test_decode_ctx.py, whose launch-grid
+    test now pins the decode_batch and decode_select grids only."""
+    # The entry, not a module attribute: ``envs`` resolves names lazily, so an attribute
+    # set here would outlive the test and shadow the variable for every later test.
+    monkeypatch.setitem(envs.environment_variables, "NEURON_LOGICAL_NC_CONFIG", lambda: lnc)
+    assert KH.hadamard128_programs(1) == 1
+    assert KH.hadamard128_programs(2) == (2 if lnc == 2 else 1)
 
 
 def test_the_kernel_is_keyed_by_this_files_digest():
