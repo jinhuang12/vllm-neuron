@@ -474,6 +474,60 @@ def check_dcp_decode_index_context(vllm_config: Any, index_kpool: int | None) ->
         ) from exc
 
 
+def _dcp_owned_latent_slots(
+    row: list[int],
+    positions: torch.Tensor,
+    *,
+    block_size: int,
+    dcp_size: int,
+    cp_rank: int,
+) -> list[int]:
+    """Return the latent slot rank ``cp_rank`` of a DCP group writes each position to.
+
+    Under decode context parallelism an entry of a request's block-table row names
+    one block of this rank's, and that block holds the rank's share of a
+    ``block_size * dcp_size`` stretch of the sequence
+    (:mod:`vllm_neuron.utils.dcp_ownership`). A position this rank owns lands at
+    ``row[local // block_size] * block_size + local % block_size``, with ``local`` its
+    local row: the slot ``_compute_slot_mapping_cpu`` gives it. A position another
+    rank owns lands at offset 0 of vLLM's null block (``NULL_BLOCK_ID``), the target
+    of the runner's padding writes, which no request's latent occupies. So a rank
+    writes no latent row it does not own, and the write keeps the step's shape.
+
+    Args:
+        row: the request's block-table entries, as ints.
+        positions: ``[tokens]`` int64, the absolute position each row writes.
+        block_size: tokens per KV block, the DCP interleave.
+        dcp_size: ranks in the DCP group.
+        cp_rank: this rank's index in the group.
+
+    Raises:
+        ValueError: a position past the stretch the row covers, which has no slot on
+            any rank.
+    """
+    from vllm_neuron.utils.dcp_ownership import (
+        ownership_stride,
+        token_local_row,
+        token_owner,
+    )
+
+    local = token_local_row(positions, block_size=block_size, dcp_size=dcp_size)
+    pages = local // block_size
+    if positions.numel() and (int(positions.min()) < 0 or int(pages.max()) >= len(row)):
+        stride = ownership_stride(block_size=block_size, dcp_size=dcp_size)
+        raise ValueError(
+            f"positions {int(positions.min())}..{int(positions.max())} reach table entry "
+            f"{int(pages.max())} of a row that names {len(row)} entry(ies); under "
+            f"decode_context_parallel_size={dcp_size} one entry covers {stride} "
+            f"positions, and a position outside the row has no slot"
+        )
+    owned = token_owner(positions, block_size=block_size, dcp_size=dcp_size) == cp_rank
+    slots = torch.tensor(row, dtype=torch.int64)[pages] * block_size + local % block_size
+    return torch.where(
+        owned, slots, torch.full_like(slots, NULL_BLOCK_ID * block_size)
+    ).tolist()
+
+
 def indexer_side_cache_bytes(
     kv_cache_spec: dict[str, KVCacheSpec],
     text_config: Any,
@@ -5329,11 +5383,20 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         start_position: int,
         index_kpool: int,
         real_tokens: int | None = None,
+        block_size: int | None = None,
+        dcp_size: int = 1,
+        cp_rank: int = 0,
     ) -> torch.Tensor:
         """Host-side form of ``_glm5next_pool_slot_mapping``.
 
         Same rule and arithmetic without the device move, so a batch can concatenate
         several of these and move once.
+
+        Under decode context parallelism (``dcp_size > 1``) a completed pool is this
+        rank's to write only when its block is (:mod:`vllm_neuron.utils.dcp_ownership`):
+        the id is then the pool's local id on this rank (``cp_rank``) and ``-1`` on
+        every other rank, which the indexer sends to its trash row. ``block_size``, the
+        KV block size and DCP interleave, is required there and read nowhere else.
         """
         pool = int(index_kpool)
         if pool <= 0:
@@ -5342,6 +5405,26 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         rows = torch.arange(int(tokens), dtype=torch.int32)
         positions = rows + int(start_position)
         completes = (((positions + 1) % pool) == 0) & (rows < real)
+        if dcp_size > 1:
+            from vllm_neuron.utils.dcp_ownership import pool_local_index, pool_owner
+
+            if block_size is None:
+                raise ValueError(
+                    f"decode_context_parallel_size={dcp_size} assigns pools to ranks by "
+                    f"KV block, so the pool mapping needs the block size; got none"
+                )
+            pools = positions // pool
+            geometry = {
+                "block_size": int(block_size),
+                "dcp_size": int(dcp_size),
+                "index_kpool": pool,
+            }
+            owned = pool_owner(pools, **geometry) == int(cp_rank)
+            return torch.where(
+                completes & owned,
+                pool_local_index(pools, **geometry),
+                torch.full_like(positions, -1),
+            )
         return torch.where(
             completes, positions // pool, torch.full_like(positions, -1)
         )
@@ -5372,7 +5455,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
     @staticmethod
     def _glm5next_latent_slot_mapping(
         *, rows, starts, tokens: int, block_size: int, padded_rows: int = 0,
-        reals=None, device
+        reals=None, device, dcp_size: int = 1, cp_rank: int = 0
     ) -> torch.Tensor:
         """Return ``[sum(tokens) + padded_rows]`` int64: each token's physical latent slot.
 
@@ -5393,6 +5476,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         (``BlockPool.null_block``), which the allocator never gives to a request, and
         it is the runner's own target for padding writes (padded ``slot_mapping``
         entries are ``NULL_BLOCK_ID``). So that write reaches no live request's latent.
+
+        Under decode context parallelism (``dcp_size > 1``) a row's entries are this
+        rank's blocks, and a token another rank owns writes to that same null-block
+        slot (:func:`_dcp_owned_latent_slots`), so the rank ``cp_rank`` persists only
+        the latent rows it owns.
         """
         slots: list[int] = []
         table = [list(row) for row in rows]
@@ -5400,6 +5488,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             [int(tokens)] * len(table) if reals is None else [int(one) for one in reals]
         )
         for row, start, real in zip(table, starts, limits):
+            if dcp_size > 1:
+                offsets = torch.arange(int(tokens), dtype=torch.int64)
+                slots.extend(
+                    _dcp_owned_latent_slots(
+                        row,
+                        offsets.clamp(max=max(real - 1, 0)) + int(start),
+                        block_size=int(block_size),
+                        dcp_size=int(dcp_size),
+                        cp_rank=int(cp_rank),
+                    )
+                )
+                continue
             for offset in range(int(tokens)):
                 position = int(start) + min(offset, max(real - 1, 0))
                 page = position // int(block_size)
@@ -5436,14 +5536,23 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
     @classmethod
     def _glm5next_batch_pool_slot_mapping(
-        cls, requests, *, index_kpool: int, device, real_tokens=None
+        cls,
+        requests,
+        *,
+        index_kpool: int,
+        device,
+        real_tokens=None,
+        block_size: int | None = None,
+        dcp_size: int = 1,
+        cp_rank: int = 0,
     ) -> torch.Tensor:
         """Return ``[sum(tokens)]`` int32: the pool id where a pool completes, in batch order.
 
         Derived per request because a pool completes on the sequence's own boundaries,
         not the batch's. ``real_tokens`` is per request (one entry per row of
         ``requests``) or ``None`` when every row carries a token. Concatenated on the
-        host and moved once.
+        host and moved once. ``block_size``, ``dcp_size`` and ``cp_rank`` are the DCP
+        geometry :meth:`_glm5next_pool_slot_mapping_host` owner-gates the ids with.
         """
         rows = list(requests)
         lengths = [None] * len(rows) if real_tokens is None else list(real_tokens)
@@ -5460,6 +5569,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     start_position=int(start),
                     index_kpool=int(index_kpool),
                     real_tokens=real,
+                    block_size=block_size,
+                    dcp_size=dcp_size,
+                    cp_rank=cp_rank,
                 )
                 for (tokens, start), real in zip(rows, lengths)
             ]
@@ -5924,6 +6036,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         index_kpool: int,
         operands: dict,
         banked: bool = False,
+        dcp_size: int = 1,
+        cp_rank: int = 0,
     ) -> dict:
         """One sparse (DSA) layer's carrier for a decode step of ``B > 1`` requests.
 
@@ -5951,6 +6065,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         layers of one KV-cache group share one table, so they share one upload, while a
         layer over other pages gets its own. The step operands (positions, seq lens,
         slot tensor) are built once per device.
+
+        Under decode context parallelism (``dcp_size > 1``) a table entry is one block
+        of this rank's, which holds the rank's share of ``block_size * dcp_size``
+        positions, and each request's latent slot is owner-gated for rank ``cp_rank``
+        (:meth:`_glm5next_latent_slot_mapping`).
         """
         from vllm_neuron.vllm.worker.glm5next_state_banks import (
             scratch_slot,
@@ -6029,7 +6148,23 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         f"{index}; a GLM-5.3-Flash request needs at least one KV block"
                     )
                 own_slots = len(ids) * block_size
-                if int(starts[index]) < 0 or int(starts[index]) + 1 > own_slots:
+                if dcp_size > 1:
+                    from vllm_neuron.utils.dcp_ownership import ownership_stride
+
+                    stride = ownership_stride(
+                        block_size=int(block_size), dcp_size=int(dcp_size)
+                    )
+                    reach = len(ids) * stride
+                    if int(starts[index]) < 0 or int(starts[index]) + 1 > reach:
+                        raise ValueError(
+                            f"KV layer '{name}' was handed request {index}'s token at "
+                            f"position {int(starts[index])} against {len(ids)} block(s), "
+                            f"each this rank's share of {stride} "
+                            f"positions at decode_context_parallel_size={int(dcp_size)}, "
+                            f"which reach {reach} positions; a write outside the "
+                            f"request's own pages would land on another sequence's rows"
+                        )
+                elif int(starts[index]) < 0 or int(starts[index]) + 1 > own_slots:
                     raise ValueError(
                         f"KV layer '{name}' was handed request {index}'s token at position "
                         f"{int(starts[index])} against {len(ids)} block(s) of {block_size} "
@@ -6062,6 +6197,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     block_size=block_size,
                     reals=[max(1, int(one)) for one in reals],
                     device=device,
+                    dcp_size=dcp_size,
+                    cp_rank=cp_rank,
                 ),
             }
             operands[pages_key] = paged
@@ -6133,6 +6270,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         request_real_tokens=None,
         active_mla_query_rows: int | None = None,
         padded_requests: int = 0,
+        dcp_size: int = 1,
+        cp_rank: int = 0,
     ) -> list[dict]:
         """Build one kwargs mapping per layer, in spec order, holding that layer's own state.
 
@@ -6191,6 +6330,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             request_real_tokens: Each request's real length, for the recurrent
                 layers' row masks: an unmasked padding row would decay and update the
                 state with a row that carries no token.
+            dcp_size: Ranks in this rank's decode-context-parallel group, 1 without
+                DCP. Above 1 a block-table entry is one block of this rank's, which
+                holds the rank's share of ``block_size * dcp_size`` positions, and
+                the sparse layers' write addresses (``latent_slots`` and the prefill
+                ``slot_mapping``) are owner-gated: a row this rank does not own is
+                written to the null block or the indexer's trash row.
+            cp_rank: This rank's index in that group (the runner's ``cp_rank``).
         """
         from vllm_neuron.vllm.worker.glm5next_state_banks import (
             bank_form,
@@ -6402,6 +6548,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         index_kpool=index_kpool,
                         operands=sparse_step_operands,
                         banked=banked,
+                        dcp_size=dcp_size,
+                        cp_rank=cp_rank,
                     )
                 )
                 continue
@@ -6436,7 +6584,26 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # a write past the request's last page would land on another sequence's
             # rows in silence.
             own_slots = len(ids) * block_size
-            if int(start_position) < 0 or int(start_position) + real > own_slots:
+            if dcp_size > 1:
+                # Under DCP an entry is one block of this rank's, which holds the
+                # rank's share of ``block_size * dcp_size`` positions of the sequence.
+                from vllm_neuron.utils.dcp_ownership import ownership_stride
+
+                stride = ownership_stride(
+                    block_size=int(block_size), dcp_size=int(dcp_size)
+                )
+                reach = len(ids) * stride
+                if int(start_position) < 0 or int(start_position) + real > reach:
+                    raise ValueError(
+                        f"KV layer '{bank['name']}' was handed {real} real token(s) at "
+                        f"position {int(start_position)} against {len(ids)} block(s), "
+                        f"each this rank's share of {stride} "
+                        f"positions at decode_context_parallel_size={int(dcp_size)}, "
+                        f"which reach {reach} positions of this request; a write "
+                        f"outside them would land on the rows a padded table entry "
+                        f"resolves to, which are another sequence's"
+                    )
+            elif int(start_position) < 0 or int(start_position) + real > own_slots:
                 raise ValueError(
                     f"KV layer '{bank['name']}' was handed {real} real token(s) at "
                     f"position {int(start_position)} against {len(ids)} block(s) of "
@@ -6482,6 +6649,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         index_kpool=index_kpool,
                         device=device,
                         real_tokens=[real],
+                        block_size=block_size,
+                        dcp_size=dcp_size,
+                        cp_rank=cp_rank,
                     )
                     shared["prefill_end_position"] = cls._glm5next_start_position(
                         int(start_position) + real, device
@@ -6510,6 +6680,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     block_size=block_size,
                     reals=[real],
                     device=device,
+                    dcp_size=dcp_size,
+                    cp_rank=cp_rank,
                 ),
                 # This request's own row of each side cache, so two requests in one
                 # batch reach disjoint views.
@@ -6627,6 +6799,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # padded to, while the pages each request holds and the position it reaches
         # are its real length, one per request in batch order.
         real_counts = self._glm5next_take_request_tokens()
+        # Decode context parallelism: this rank's group size and its index in it. A
+        # table entry then covers ``block_size * dcp_size`` positions of a sequence and
+        # the sparse layers write only the rows this rank owns.
+        dcp_size = int(getattr(self, "_dcp_size", 1))
+        cp_rank = int(self.cp_rank) if dcp_size > 1 else 0
         geometries: list[dict] = []
         legs: set[bool] = set()
         # Cached lengths travel as one tuple per group, one entry per request in row
@@ -6700,10 +6877,21 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         f"steps through or the one slot a recurrent bank keeps its "
                         f"state in, and an empty row names neither"
                     )
-            blocks_used = [
-                -(-(start + count) // block_size)
-                for start, count in zip(request_starts, request_tokens)
-            ]
+            if dcp_size > 1:
+                # Under DCP an entry is one block of this rank's, which holds the
+                # rank's share of ``block_size * dcp_size`` positions.
+                from vllm_neuron.utils.dcp_ownership import ownership_stride
+
+                stride = ownership_stride(block_size=block_size, dcp_size=dcp_size)
+                blocks_used = [
+                    -(-(start + count) // stride)
+                    for start, count in zip(request_starts, request_tokens)
+                ]
+            else:
+                blocks_used = [
+                    -(-(start + count) // block_size)
+                    for start, count in zip(request_starts, request_tokens)
+                ]
             # A paged row addresses pages; a recurrent row names one slot. Both
             # tables are as wide (a recurrent group's spec carries the attention
             # block size), but only a paged layer walks the pages its step covers,
@@ -6903,6 +7091,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             request_real_tokens=list(request_tokens) + [0] * padding,
             active_mla_query_rows=active_mla_query_rows,
             padded_requests=padding,
+            dcp_size=dcp_size,
+            cp_rank=cp_rank,
         )
         # The cursor advances only once the carriers exist: the call above can still
         # refuse (multi-token decode, paging disagreement, slot out of range), and a

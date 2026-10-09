@@ -4319,6 +4319,61 @@ class Glm5NextDSAIndexer(nn.Module):
             torch.full((1,), index, dtype=torch.int32, device=device),
         )
 
+    @property
+    def dcp_size(self) -> int:
+        """Ranks in this rank's decode-context-parallel (DCP) group; 1 without DCP.
+
+        Read per call and not bound in the constructor, on the ground
+        :func:`_resolve_tp_group` states: the classes are built before the parallel
+        state exists. vllm's DCP group is consulted only at a world size above one, so
+        a single-rank process never imports vllm here, and a process with no DCP group
+        reads 1. The value is the same on every rank, so a trace may fold it.
+        """
+        if _resolve_world_size() <= 1:
+            return 1
+        from vllm.distributed.parallel_state import get_dcp_group
+
+        try:
+            return int(get_dcp_group().world_size)
+        except AssertionError:
+            return 1
+
+    def _dcp_owned_position(
+        self, position: torch.Tensor, block_size: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Under DCP: each decode position's row on its owner, and whether this rank owns it.
+
+        Returns ``(local, owned)`` in ``position``'s shape: ``local`` is int64, the
+        position's row in its owner's local store
+        (:func:`~vllm_neuron.utils.dcp_ownership.token_local_row`), and ``owned`` is
+        bool, true where this rank is the owner. ``index_kpool`` divides
+        ``block_size`` (refused otherwise), so ``local`` closes a pool exactly where
+        ``position`` does, and that pool's id on its owner is ``local // index_kpool``.
+
+        This rank is ``tp_rank % dcp_size``, the runner's ``cp_rank``, computed on
+        device from the tensor-parallel index :meth:`_bind_shard_rank` binds at load:
+        a tensor, so one graph serves every rank of the group.
+        """
+        from vllm_neuron.utils.dcp_ownership import (
+            pools_per_block,
+            token_local_row,
+            token_owner,
+        )
+
+        pools_per_block(block_size=int(block_size), index_kpool=self.index_kpool)
+        rank = getattr(self, self.SHARD_RANK_ATTR, None)
+        if rank is None:
+            raise Glm5NextDSAIndexerError(
+                f"decode_context_parallel_size={self.dcp_size} gates the pooled-key "
+                f"write by owner, which needs this rank's tensor-parallel index; it is "
+                f"bound at load by prepare_projection_weights, which has not run"
+            )
+        dcp_size = self.dcp_size
+        at = position.to(torch.int64)
+        local = token_local_row(at, block_size=int(block_size), dcp_size=dcp_size)
+        owner = token_owner(at, block_size=int(block_size), dcp_size=dcp_size)
+        return local, owner == torch.remainder(rank.to(torch.int64), dcp_size)
+
     def _lowp_operand(self, name: str):
         """``(weight, scale)`` for the low-precision route, or None for the fp32 one."""
         return getattr(self, self.LOWP_WEIGHTS_ATTR, {}).get(name)
@@ -5420,6 +5475,13 @@ class Glm5NextDSAIndexer(nn.Module):
                 "the decode leg needs both tail and position; got a tail with "
                 "no position"
             )
+        if is_decode and self.dcp_size > 1 and not torch.is_tensor(position):
+            raise Glm5NextDSAIndexerError(
+                f"decode_context_parallel_size={self.dcp_size} gates the pooled-key "
+                f"write by owner on device, so the decode position must be a tensor, "
+                f"as the runner hands it; a python int position is the eager "
+                f"single-rank route"
+            )
         if not is_decode and slot_mapping is None:
             raise Glm5NextDSAIndexerError(
                 "the prefill leg needs slot_mapping, the pool-granular slot per "
@@ -5455,9 +5517,20 @@ class Glm5NextDSAIndexer(nn.Module):
                 # branches below, for the same reason: a write the graph performs at
                 # every position beats a write whose existence was decided when the
                 # graph was captured.
-                pool_index, completes = decode_pool_address(
-                    position, pool, pool_cache.device
-                )
+                if self.dcp_size > 1:
+                    # Under DCP the pool is its block owner's to store, at its local
+                    # id; on every other rank the write lands on the trash row. The
+                    # ring above stays replicated. ``page_size`` is the latent bank's
+                    # block, the DCP interleave (Glm5NextMLAAttention.forward).
+                    local, owned = self._dcp_owned_position(position, int(page_size))
+                    pool_index, completes = decode_pool_address(
+                        local, pool, pool_cache.device
+                    )
+                    completes = completes & owned
+                else:
+                    pool_index, completes = decode_pool_address(
+                        position, pool, pool_cache.device
+                    )
                 # ``new_full`` and not ``torch.tensor``: a tensor built from python data
                 # stays real while the rest of the trace is fake, and graph extraction
                 # refuses that mix. Both pool writes below take the same form.
@@ -5524,6 +5597,7 @@ class Glm5NextDSAIndexer(nn.Module):
         max_seq_len: int,
         indices_wanted: bool = True,
         projected: tuple | None = None,
+        page_size: int | None = None,
     ) -> torch.Tensor | None:
         """:meth:`forward`'s decode leg for ``B`` requests, one token each, in one pass.
 
@@ -5557,6 +5631,11 @@ class Glm5NextDSAIndexer(nn.Module):
         The score kernel takes this step's completed pool from the ring step's output
         rather than from the store, so the selection does not depend on when the
         store write lands.
+
+        ``page_size`` is the latent bank's block, the decode-context-parallel (DCP)
+        interleave, and is read only at ``dcp_size > 1``: there a closed pool is stored
+        by its block's owner at its local id, and every other rank writes the trash row
+        (:meth:`_dcp_owned_position`). The ring step stays replicated.
         """
         from vllm_neuron.functional.dsa.decode_batch import (
             decode_pool_destinations,
@@ -5604,6 +5683,12 @@ class Glm5NextDSAIndexer(nn.Module):
                     f"{name} must be a [{batch}] tensor, one entry per request; got "
                     f"{value!r}"
                 )
+        if self.dcp_size > 1 and page_size is None:
+            raise Glm5NextDSAIndexerError(
+                f"decode_context_parallel_size={self.dcp_size} assigns pools to ranks "
+                f"by KV block, so the decode step needs page_size, the latent bank's "
+                f"block; got none"
+            )
         if values_are_readable(position) and values_are_readable(seq_lens):
             if not torch.equal(position.to(torch.int64), seq_lens.to(torch.int64) - 1):
                 raise Glm5NextDSAIndexerError(
@@ -5634,9 +5719,19 @@ class Glm5NextDSAIndexer(nn.Module):
         pooled, rings = dsa_decode_ring_step(
             tail_bank, slots, key, gate_score, ape.to(torch.float32), position
         )
-        slot_index, row = decode_pool_destinations(
-            slots, position, rows=int(pool_bank.shape[1]), pool_size=pool
-        )
+        if self.dcp_size > 1:
+            # Under DCP each closed pool is its block owner's to store, at its local
+            # id; every other rank writes its trash row.
+            local, owned = self._dcp_owned_position(position, int(page_size))
+            slot_index, row = decode_pool_destinations(
+                slots, local, rows=int(pool_bank.shape[1]), pool_size=pool
+            )
+            trash = torch.full_like(row, int(pool_bank.shape[1]) - 1)
+            row = torch.where(owned, row, trash)
+        else:
+            slot_index, row = decode_pool_destinations(
+                slots, position, rows=int(pool_bank.shape[1]), pool_size=pool
+            )
         bounded = None
         if selects:
             bounded = dsa_decode_scores(
@@ -5961,6 +6056,57 @@ class Glm5NextMLAAttention(nn.Module):
         needs the division here because its attribute is not.
         """
         return _per_rank(self.num_attention_heads, _resolve_world_size())
+
+    @property
+    def dcp_size(self) -> int:
+        """Ranks in this rank's decode-context-parallel group, read where the indexer reads it."""
+        return self.indexer.dcp_size
+
+    def _dcp_write_latent_then_refuse(
+        self,
+        hidden_states: torch.Tensor,
+        latent_cache: torch.Tensor,
+        latent_slots: torch.Tensor,
+        *,
+        start_position: torch.Tensor | int,
+        prefill_end_position: torch.Tensor | int | None = None,
+    ) -> None:
+        """Write this step's latent rows, then refuse the attention by name.
+
+        Called in place of :meth:`attend` at ``dcp_size > 1`` only, after the indexer
+        has stored its pooled keys. The write is :meth:`attend`'s own: one latent per
+        token at the physical bank row the runner computed, which under decode context
+        parallelism is owner-gated (a row this rank does not own goes to the null
+        block), with a padded prefill chunk's trailing rows clamped onto its last real
+        row. So every DCP write has landed on its owner and no attention kernel has
+        run.
+
+        Raises:
+            Glm5NextMLADecodeError: always, naming "DCP attention (item 2b)". A rank
+                holds only its own blocks of the latent window, so its attention is a
+                partial that needs the softmax merge across the DCP group; item 2b
+                replaces this call with that path.
+        """
+        _query, kv_latent = self.project_query_and_latent(hidden_states)
+        if prefill_end_position is not None:
+            start = _int64_scalar(start_position, latent_cache.device)
+            end = _int64_scalar(prefill_end_position, latent_cache.device)
+            offsets = torch.arange(
+                int(hidden_states.shape[0]), device=latent_cache.device
+            )
+            kv_latent = kv_latent.index_select(
+                0, torch.minimum(offsets, end - start - 1)
+            )
+        latent_cache[:, 0, :].index_copy_(
+            0, latent_slots, kv_latent.to(latent_cache.dtype)
+        )
+        raise Glm5NextMLADecodeError(
+            f"DCP attention (item 2b) is not implemented: at "
+            f"decode_context_parallel_size={self.dcp_size} this rank holds only its own "
+            f"blocks of the latent window, and attending them needs the partial-attention "
+            f"merge across the DCP group. The latent and pooled-key writes have run; use "
+            f"decode_context_parallel_size=1 until item 2b lands"
+        )
 
     # The five low-rank projections run on the ``mla_projection`` NKI kernel,
     # because both substrate candidates refuse this checkpoint's widths. Every
@@ -7120,6 +7266,7 @@ class Glm5NextMLAAttention(nn.Module):
                 max_seq_len=bound,
                 indices_wanted=not dense,
                 projected=projected,
+                **({"page_size": int(page_size)} if self.dcp_size > 1 else {}),
             )
             if index_share is not None and topk_indices is not None:
                 # Only a selecting step has indices to share; the bypass regime's
@@ -7128,6 +7275,13 @@ class Glm5NextMLAAttention(nn.Module):
         if collector is not None:
             collector.append(
                 (self.indexer._bypass_indices(seq_lens) if dense else topk_indices)[:5]
+            )
+        if self.dcp_size > 1:
+            self._dcp_write_latent_then_refuse(
+                normed_hidden_states,
+                latent_cache,
+                latent_slots,
+                start_position=start_position,
             )
         return self.attend(
             normed_hidden_states,
@@ -7345,6 +7499,14 @@ class Glm5NextMLAAttention(nn.Module):
                 # rather than becoming a float. A shorter batch yields the rows it has.
             collector.append(
                 (self.indexer._bypass_indices(seq_lens) if no_select else topk_indices)[:5]
+            )
+        if self.dcp_size > 1:
+            self._dcp_write_latent_then_refuse(
+                normed_hidden_states,
+                latent_cache,
+                latent_slots,
+                start_position=start_position,
+                prefill_end_position=prefill_end_position,
             )
         return self.attend(
             normed_hidden_states,
