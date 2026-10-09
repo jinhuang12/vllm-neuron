@@ -257,6 +257,9 @@ def mla_projection_kernel_identity() -> tuple[str, str]:
 # and picks per weight chunk which operand is stationary
 # (:func:`lowp_weight_stationary`). Both splits compute every output element with the
 # same products in the same order, so they return the same bits.
+#
+# The latent kernel (:func:`mla_latent_projection_kernel`) is the row-split body
+# with the latent's RMSNorm folded into each row's store.
 # ---------------------------------------------------------------------------
 
 #: Weight rows per scale block, the checkpoint's ``weight_block_size``.
@@ -619,8 +622,12 @@ def lowp_weight_stationary(n_kb: int, cols: int, scaled: bool) -> bool:
     return narrow and n_kb >= LOWP_WEIGHT_STATIONARY_MIN_BLOCKS
 
 
-def _lowp_rows_matmuls(xt, w_sb, s_sb, prog_nb: int, out, row0, col0: int):
+def _lowp_rows_matmuls(xt, w_sb, s_sb, prog_nb: int, out, row0, col0: int, norm=None):
     """``out[row0 + m, col0 + c] = x @ dequant(w)`` for one resident weight chunk.
+
+    ``norm`` is None, or ``(gain_sb, eps)``: then each output row is normalised
+    (:func:`_lowp_rms_norm`) before its store, which needs the chunk to be every
+    output column and one span (the callers' ``n_ext <= 512``).
 
     ``s_sb`` is the broadcast scale grid of an fp8 weight, or None for bf16. A scaled
     block's multiplier is folded into x^T as in the column-split path,
@@ -658,9 +665,16 @@ def _lowp_rows_matmuls(xt, w_sb, s_sb, prog_nb: int, out, row0, col0: int):
             sw = min(span, cw - s0)
             # res[m, mt, c]: row tile mt of the row block, the span's columns.
             res = nl.ndarray((SEQUENCE_TILE, n_mt, sw), dtype=nl.float32, buffer=nl.sbuf)
-            for g0 in range(0, sw, OUTPUT_TILE):
-                _lowp_rows_bank(xt, w_sb, s_sb, prog_nb, res, r0, rw, s0, g0, col0, block,
-                                weight_stationary, count)
+            if norm is None:
+                for g0 in range(0, sw, OUTPUT_TILE):
+                    _lowp_rows_bank(xt, w_sb, s_sb, prog_nb, res, r0, rw, s0, g0, col0,
+                                    block, weight_stationary, count)
+            else:
+                # One bank: the norm reads it from PSUM where one tile holds it all.
+                held = _lowp_rows_bank(xt, w_sb, s_sb, prog_nb, res, r0, rw, s0, 0, col0,
+                                       block, weight_stationary, count, keep=True)
+                res = _lowp_rms_norm(res if held is None else held, sw, norm[0], norm[1],
+                                     out.dtype)
             _row_dma(
                 dst=out.ap(pattern=[[out.shape[1], SEQUENCE_TILE],
                                     [SEQUENCE_TILE * out.shape[1], n_mt], [1, sw]],
@@ -669,11 +683,46 @@ def _lowp_rows_matmuls(xt, w_sb, s_sb, prog_nb: int, out, row0, col0: int):
             )
 
 
+def _lowp_rms_norm(src, width: int, gain_sb, eps: float, dtype):
+    """``y * rsqrt(mean(y ** 2) + eps) * gain`` for each row ``y = src[m, t, 0 : width]``,
+    in ``dtype``; ``src`` is the PSUM tile of the results or their SBUF copy.
+
+    The reference's fp32 steps (``Glm5NextMLAAttention._latent_norm``) in order: the
+    square sum on the Scalar engine, ``* (1 / width)`` for the mean (the quotient
+    itself for a power-of-two width), ``rsqrt`` on GpSimd, the higher-precision engine
+    for it (``functional/norm.py``), then ``(y * rstd) * gain`` in fp32 on Vector,
+    rounded to ``dtype`` once. Only the square sum's order is the engine's own. One row
+    tile at a time, so Vector scales tile ``t`` while Scalar sums tile ``t + 1``.
+    """
+    n_mt = src.shape[1]
+    sqsum = nl.ndarray((SEQUENCE_TILE, n_mt), dtype=nl.float32, buffer=nl.sbuf)
+    rstd = nl.ndarray((SEQUENCE_TILE, n_mt), dtype=nl.float32, buffer=nl.sbuf)
+    normed = nl.ndarray((SEQUENCE_TILE, n_mt, width), dtype=dtype, buffer=nl.sbuf)
+    for mt in range(n_mt):
+        row = src[:, mt, 0:width]
+        squares = _sbuf(SEQUENCE_TILE, width)
+        nisa.activation_reduce(dst=squares, op=nl.square, data=row, reduce_op=nl.add,
+                               reduce_res=sqsum[:, mt:mt + 1])
+        nisa.tensor_scalar(dst=rstd[:, mt:mt + 1], data=sqsum[:, mt:mt + 1],
+                           op0=nl.multiply, operand0=1.0 / width, op1=nl.add,
+                           operand1=float(eps))
+        nisa.tensor_scalar(dst=rstd[:, mt:mt + 1], data=rstd[:, mt:mt + 1], op0=nl.rsqrt,
+                           operand0=0.0, engine=nisa.engine.gpsimd)
+        nisa.scalar_tensor_tensor(dst=normed[:, mt, :], data=row, op0=nl.multiply,
+                                  operand0=rstd[:, mt:mt + 1], op1=nl.multiply,
+                                  operand1=gain_sb[:, 0:width])
+    return normed
+
+
 def _lowp_rows_bank(xt, w_sb, s_sb, prog_nb: int, res, r0: int, rw: int, s0: int, g0: int,
-                    col0: int, block: int, weight_stationary: bool, count) -> None:
+                    col0: int, block: int, weight_stationary: bool, count, keep: bool = False):
     """One PSUM bank's worth of output columns, ``res[:, :, g0 : g0 + 512]``, of the
     span at chunk column ``s0`` for the ``rw`` rows at ``r0`` (see
     :func:`_lowp_rows_matmuls`).
+
+    With ``keep``, when one PSUM tile holds the whole bank (``[128, rw // 128, 512]``,
+    the bank's columns first), that tile is returned and ``res`` is not written;
+    otherwise ``res`` is written and None returned.
     """
     n_kb = xt.shape[1]
     n_mt = rw // SEQUENCE_TILE
@@ -728,17 +777,23 @@ def _lowp_rows_bank(xt, w_sb, s_sb, prog_nb: int, res, r0: int, rw: int, s0: int
             nisa.tensor_copy(dst=res[:, :, g0 + b0:g0 + b0 + bw], src=acc_ps[:, :, 0:bw],
                              engine=_alternate(count[1], LOWP_SCALAR_EVAC_PERIOD))
             count[1] += 1
+    if whole and keep:
+        return held
     if whole:
         nisa.tensor_copy(dst=res[:, :, g0:g0 + gw], src=held[:, :, 0:gw],
                          engine=_alternate(count[1], LOWP_SCALAR_EVAC_PERIOD))
         count[1] += 1
+    return None
 
 
-def _lowp_project_rows(x_hbm, w_hbm, scale_hbm, col_chunk: int, out) -> None:
+def _lowp_project_rows(x_hbm, w_hbm, scale_hbm, col_chunk: int, out, gain_hbm=None,
+                       eps: float = 0.0) -> None:
     """The row-split body (see :func:`lowp_splits_rows`): this program's rows against
     every output column, :func:`_lowp_rows_held` rows of x^T at a time.
 
     ``col_chunk`` counts columns of the whole weight here, not of a program's share.
+    ``gain_hbm`` (``[N]`` or None) normalises each output row with ``eps``
+    (:func:`_lowp_rms_norm`).
     """
     m_ext, k_ext = x_hbm.shape
     n_ext = w_hbm.shape[1]
@@ -755,6 +810,13 @@ def _lowp_project_rows(x_hbm, w_hbm, scale_hbm, col_chunk: int, out) -> None:
         _row_dma(dst=s_sb, src=scale_hbm.ap(pattern=[[0, CONTRACTION_TILE], [1, grid]],
                                                  offset=0))
     prog_nb = 0 if scale_hbm is None else scale_hbm.shape[2]
+    norm = None
+    if gain_hbm is not None:
+        # Read as stored: Vector widens it to fp32 exactly in the norm's multiply.
+        gain_sb = nl.ndarray((SEQUENCE_TILE, n_ext), dtype=gain_hbm.dtype, buffer=nl.sbuf)
+        _row_dma(dst=gain_sb, src=gain_hbm.ap(pattern=[[0, SEQUENCE_TILE], [1, n_ext]],
+                                              offset=0))
+        norm = (gain_sb, eps)
     # One resident chunk is loaded once; several are reloaded per batch of x^T.
     resident = chunk == n_ext
     w_sb = None
@@ -766,7 +828,7 @@ def _lowp_project_rows(x_hbm, w_hbm, scale_hbm, col_chunk: int, out) -> None:
         for col0 in range(0, n_ext, chunk):
             if not resident:
                 w_sb = _lowp_load_weight(w_hbm, col0, min(chunk, n_ext - col0))
-            _lowp_rows_matmuls(xt, w_sb, s_sb, prog_nb, out, row0 + t0, col0)
+            _lowp_rows_matmuls(xt, w_sb, s_sb, prog_nb, out, row0 + t0, col0, norm)
 
 
 def _lowp_load_weight(w_hbm, col0: int, cols: int):
@@ -783,6 +845,41 @@ def _lowp_load_weight(w_hbm, col0: int, cols: int):
                          offset=kb0 * CONTRACTION_TILE * n_ext + col0),
         )
     return w_sb
+
+
+@nki.jit
+def mla_latent_projection_kernel(x_hbm, w_hbm, scale_hbm, gain_hbm, eps):
+    """``rms_norm(x @ dequant(w)) * gain`` per row, in ``x``'s dtype.
+
+    The low-precision projection's row-split body (:func:`_lowp_project_rows`) with
+    each output row normalised before its store (:func:`_lowp_rms_norm`), so the fp32
+    projection never leaves the core.
+
+    Args:
+        x_hbm: ``[M, K]`` bf16 or fp32, a shape :func:`lowp_splits_rows` splits.
+        w_hbm: ``[K, N]`` fp8-e4m3 (with ``scale_hbm``) or bf16, ``N <= 512``.
+        scale_hbm: the program-major grid (:func:`lowp_scale_layout`), or None.
+        gain_hbm: ``[N]`` norm gain.
+        eps: the epsilon added to the mean square, a trace-time float.
+
+    Returns:
+        ``[M, N]`` in ``x_hbm``'s dtype.
+    """
+    m_ext, k_ext = x_hbm.shape
+    n_ext = w_hbm.shape[1]
+    programs = nl.num_programs(axes=0)
+    kernel_assert(k_ext % CONTRACTION_TILE == 0, "in_features must be whole 128-row blocks")
+    kernel_assert(lowp_splits_rows(m_ext, programs, _lowp_x_row_bytes(x_hbm)),
+                  "the rows must split over the programs in whole sequence tiles")
+    kernel_assert(n_ext <= OUTPUT_TILE, "the norm needs every output column in one bank")
+    if scale_hbm is not None:
+        kernel_assert(scale_hbm.shape[0] == programs
+                      and scale_hbm.shape[1] == k_ext // CONTRACTION_TILE
+                      and scale_hbm.shape[2] * LOWP_SCALE_BLOCK * programs == n_ext,
+                      "the scale grid must be program-major for this launch grid")
+    out = nl.ndarray((m_ext, n_ext), dtype=x_hbm.dtype, buffer=nl.shared_hbm)
+    _lowp_project_rows(x_hbm, w_hbm, scale_hbm, 0, out, gain_hbm, eps)
+    return out
 
 
 #: SBUF bytes per partition one weight chunk may hold. A quarter of trn2's 192 KiB
@@ -927,6 +1024,68 @@ def mla_projection_lowp(x: Tensor, weight: Tensor, scale: Tensor | None = None) 
         return call(x.contiguous(), weight.contiguous(),
                     scale.contiguous().to(torch.float32), chunk)
     return call(x.contiguous(), weight.contiguous(), None, chunk)
+
+
+def mla_latent_projection_admits(x: Tensor, weight: Tensor, scale: Tensor | None) -> bool:
+    """Whether :func:`mla_latent_projection` serves ``x`` against this prepared weight.
+
+    Shape and dtype only: a shape the low-precision seam admits, that its kernel splits
+    by rows (:func:`lowp_splits_rows`), with every output column in one PSUM bank and
+    the whole weight resident at once, which the folded norm needs.
+    """
+    if x.ndim != 2 or weight.ndim != 2:
+        return False
+    rows, idim = (int(d) for d in x.shape)
+    odim = int(weight.shape[1])
+    scaled = scale is not None
+    programs = _lowp_programs(odim, scaled)
+    try:
+        _require_lowp_admissible(x, weight, scale, programs)
+    except MlaProjectionError:
+        return False
+    return (odim <= OUTPUT_TILE
+            and lowp_splits_rows(rows, programs, idim * x.element_size())
+            and _lowp_col_chunk(idim, odim, weight.element_size(), scaled) == 0)
+
+
+def mla_latent_projection(x: Tensor, weight: Tensor, scale: Tensor | None, gain: Tensor,
+                          eps: float) -> Tensor:
+    """``rms_norm(x @ dequant(weight)) * gain`` in ``x.dtype``: a projection to a latent
+    and the latent's RMSNorm in one launch.
+
+    The operands are :func:`mla_projection_lowp`'s; ``gain`` is the norm's ``[N]`` gain
+    and ``eps`` its epsilon. Only for shapes :func:`mla_latent_projection_admits`; its
+    rows split over an LNC2 pair.
+
+    Numerics: the projection's fp32 rows are :func:`mla_projection_lowp`'s bits; the
+    norm runs the reference's fp32 steps in order (:func:`_lowp_rms_norm`), so it
+    differs from another fp32 evaluation only by the square sum's summation order,
+    before the one rounding to ``x.dtype``.
+
+    Raises:
+        MlaProjectionError: for a shape it does not admit, or a gain that is not ``[N]``.
+    """
+    if not mla_latent_projection_admits(x, weight, scale):
+        raise MlaProjectionError(
+            f"the folded latent norm serves a row-split projection of at most "
+            f"{OUTPUT_TILE} columns; got x {tuple(x.shape)} {x.dtype} against weight "
+            f"{tuple(weight.shape)} {weight.dtype}"
+        )
+    odim = int(weight.shape[1])
+    if tuple(gain.shape) != (odim,):
+        raise MlaProjectionError(f"gain must be [{odim}]; got {tuple(gain.shape)}")
+    scaled = scale is not None
+    programs = _lowp_programs(odim, scaled)
+    if scaled and scale.ndim == 2:
+        scale = lowp_scale_layout(scale, programs)
+    _count_nki_dispatch()
+    _count_lowp_dispatch(scaled, programs)
+    call = wrap_nki(mla_latent_projection_kernel)
+    if programs == 2:
+        call = call[2]
+    return call(x.contiguous(), weight.contiguous(),
+                None if scale is None else scale.contiguous().to(torch.float32),
+                gain.contiguous(), float(eps))
 
 
 def mla_projection_prepared(
