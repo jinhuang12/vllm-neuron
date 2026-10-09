@@ -8,8 +8,9 @@ the objects it kept, and the frozen heap is not in that count. So once the heap 
 frozen, the first full pass leaves a small total, the 25 % rule no longer holds
 gen-2 back, and every 11th gen-1 trigger becomes a full pass: ~11 per rank per 120
 bs=64 decode steps on the TP=64 server, each 3-12 ms, a different rank on every
-step (DECODE_BREAKDOWN_v2.md 5.4; reports/gate_gcfreeze.md). The default policy
-keeps the freeze and raises only ``threshold2``.
+step (DECODE_BREAKDOWN_v2.md 5.4; reports/gate_gcfreeze.md). ``freeze_rare_gen2``
+keeps the freeze and raises only ``threshold2``. It is not the default (``off``):
+on TP=64 it made every bs=1 decode step slower (``test_gc_policy_default.py``).
 
 Unit cases replace the freeze, ``gc.set_threshold``, ``gc.disable`` and the vLLM
 GC-debug hook with recorders: the real calls would change the pytest process.
@@ -55,13 +56,15 @@ def _young_thresholds() -> tuple[int, int]:
     return t0, t1
 
 
-def test_default_policy_freezes_then_raises_only_the_gen2_threshold(calls):
+def test_freeze_rare_gen2_policy_freezes_then_raises_only_the_gen2_threshold(
+    calls, monkeypatch
+):
     """Freeze first, then only threshold2 changes; gen-0/1 keep their thresholds."""
+    monkeypatch.setenv(ENV, "freeze_rare_gen2")
     t0, t1 = _young_thresholds()
 
     applied = gc_policy.apply_post_warmup_gc_policy()
 
-    assert gc_policy.DEFAULT_POLICY == gc_policy.FREEZE_RARE_GEN2
     assert calls == [
         ("freeze_gc_heap",),
         ("set_threshold", t0, t1, gc_policy.GEN2_THRESHOLD),
@@ -120,7 +123,7 @@ def _load_harness():
 
 
 def test_harness_measures_the_policy_the_worker_applies(monkeypatch):
-    """The harness's chosen policy is the worker default, run through the worker's code."""
+    """The harness's chosen policy, ``freeze_rare_gen2``, runs through the worker's code."""
     harness = _load_harness()
     seen: list[str] = []
     monkeypatch.setattr(
@@ -131,8 +134,8 @@ def test_harness_measures_the_policy_the_worker_applies(monkeypatch):
 
     harness.apply_policy(harness.CHOSEN_POLICY)
 
-    assert harness.CHOSEN_POLICY == gc_policy.DEFAULT_POLICY
-    assert seen == [gc_policy.DEFAULT_POLICY]
+    assert harness.CHOSEN_POLICY == gc_policy.FREEZE_RARE_GEN2
+    assert seen == [gc_policy.FREEZE_RARE_GEN2]
 
 
 def _run_child(policy: str) -> dict:
@@ -150,14 +153,14 @@ def _run_child(policy: str) -> dict:
     return _load_harness().parse_child_output(out.stdout)
 
 
-def test_real_freeze_alone_runs_frequent_full_passes_and_default_does_not():
-    """Real CPython: freeze alone -> a full pass every few steps; default -> none."""
+def test_real_freeze_alone_runs_frequent_full_passes_and_freeze_rare_gen2_does_not():
+    """Real CPython: freeze alone -> a full pass every few steps; rare gen-2 -> none."""
     freeze_only = _run_child(gc_policy.FREEZE_ONLY)
-    default = _run_child(gc_policy.DEFAULT_POLICY)
+    rare = _run_child(gc_policy.FREEZE_RARE_GEN2)
 
     assert freeze_only["per_1000_steps"]["gen2"] >= 20, freeze_only["per_1000_steps"]
-    assert default["per_1000_steps"]["gen2"] <= 1, default["per_1000_steps"]
-    assert default["per_1000_steps"]["gen0"] > 0
-    assert default["per_1000_steps"]["gen1"] > 0
-    assert default["frozen_objects"] >= 300000
-    assert default["threshold_after"][2] == gc_policy.GEN2_THRESHOLD
+    assert rare["per_1000_steps"]["gen2"] <= 1, rare["per_1000_steps"]
+    assert rare["per_1000_steps"]["gen0"] > 0
+    assert rare["per_1000_steps"]["gen1"] > 0
+    assert rare["frozen_objects"] >= 300000
+    assert rare["threshold_after"][2] == gc_policy.GEN2_THRESHOLD
