@@ -2301,7 +2301,9 @@ class Glm5NextSharedExperts(nn.Module):
         operand inside the per-forward path costs 128 device writes per
         projection at this dense geometry. A block scale is a weight-loader
         product that never changes after a load, so the operand it implies is
-        built here, once, and held on this module.
+        built here, once, and held on this module. Only the three-call fallback
+        of :func:`~vllm_neuron.functional.blockwise_fp8_mm.blockwise_fp8_mlp`
+        reads them; the served shapes run its fused kernels on the public grids.
 
         The argument list mirrors :meth:`shared_expert_mm`'s own -- same operands,
         same order -- because the two methods consume the same things and a
@@ -2375,9 +2377,11 @@ class Glm5NextSharedExperts(nn.Module):
         The SwiGLU the checkpoint stores, which clamps both projections before the
         product: ``down(silu(min(gate(x), L)) * clip(up(x), -L, L))``, where ``L``
         is ``self.swiglu_limit``, the checkpoint's own bound resolved from the
-        config when this object was built. Each of the three projections is a
-        separate entry into
-        :func:`~vllm_neuron.functional.blockwise_fp8_mm.blockwise_fp8_mm`.
+        config when this object was built. The whole MLP is one call of
+        :func:`~vllm_neuron.functional.blockwise_fp8_mm.blockwise_fp8_mlp`: one
+        NKI kernel for a short step and one for whole-tile prefill, or its three
+        :func:`~vllm_neuron.functional.blockwise_fp8_mm.blockwise_fp8_mm` calls
+        where neither kernel applies.
 
         Args:
             hidden_states: ``[T, H]`` activations, ``bfloat16``. ``T`` may be any
@@ -2480,8 +2484,9 @@ class Glm5NextSharedExperts(nn.Module):
         # down. The clamp bound is ``self.swiglu_limit`` (``text_config``), the
         # gate clamped above only and up on both sides, as the reference does; the
         # SwiGLU product is cast to the activation dtype before down, as before.
-        # ``1 <= T < 128`` runs one small-M NKI kernel; whole-tile prefill keeps
-        # the three ``blockwise_fp8_mm`` calls, which take the prebuilt operands.
+        # ``1 <= T < 128`` runs one small-M NKI kernel and whole-tile prefill one
+        # prefill NKI kernel, both on the public grids; the prebuilt operands
+        # serve the three ``blockwise_fp8_mm`` calls of the fallback alone.
         return _unpad_rows(
             blockwise_fp8_mlp(
                 hidden_states,
@@ -2934,16 +2939,18 @@ class Glm5NextDenseMLP(nn.Module):
     ) -> int:
         """Build the three kernel scale operands once. Returns how many.
 
-        Without them each whole-tile prefill :meth:`forward` would build every
-        operand from its grid inside the traced graph, one scalar write per
-        ``128`` block: 192 writes per call at the served geometry. The grids
+        Without them each three-call :meth:`forward` would build every operand
+        from its grid inside the traced graph, one scalar write per ``128``
+        block: 192 writes per call at the served geometry. The grids
         never change after a load, so the operands are built here, once, by the
         shared expert's own builder, :func:`_build_scale_operands`; their bytes
         are those of the per-call build. ``_run_load_time_preps`` enrols this
         method by ``hasattr`` and passes the operands by keyword, after
         :meth:`retile_checkpoint_scale_grids` has put them in the frame
-        :meth:`forward` consumes. Only the whole-tile route reads them: a short
-        step's small-M kernel reads the public grids.
+        :meth:`forward` consumes. Only the three-call fallback of
+        :func:`~vllm_neuron.functional.blockwise_fp8_mm.blockwise_fp8_mlp` reads
+        them: at the served shapes a short step runs its small-M kernel and a
+        whole-tile prefill its prefill kernel, both on the public grids.
 
         Args:
             gate_proj_weight: ``[H, I]`` fp8-e4m3. Read for its extents only.
@@ -3014,11 +3021,13 @@ class Glm5NextDenseMLP(nn.Module):
 
         ``down(silu(min(gate(x), L)) * clip(up(x), -L, L))``, where ``L`` is
         ``self.swiglu_limit``, the checkpoint's own bound resolved from the config
-        when this object was built. Each of the three projections is a separate
-        entry into
-        :func:`~vllm_neuron.functional.blockwise_fp8_mm.blockwise_fp8_mm`, the
+        when this object was built. The whole MLP is one call of
+        :func:`~vllm_neuron.functional.blockwise_fp8_mm.blockwise_fp8_mlp`, the
         dense blockwise route this fork uses for the dense MLP and the shared
-        expert alike.
+        expert alike: one NKI kernel for a short step and one for whole-tile
+        prefill, or its three
+        :func:`~vllm_neuron.functional.blockwise_fp8_mm.blockwise_fp8_mm` calls
+        where neither kernel applies.
 
         The weights must arrive in the frame the kernel multiplies in -- gate and
         up ``[H, I]``, down ``[I, H]``, each with its ``128`` grid beside it --
@@ -3130,9 +3139,10 @@ class Glm5NextDenseMLP(nn.Module):
         # ---- One fused call: gate, up, the checkpoint's clamps (gate above only,
         # up on both sides), SwiGLU, the bf16 cast and down. ``1 <= T < 128`` runs
         # one small-M NKI kernel on the public grids, and passes nothing else, as
-        # it did before the load-time prep existed; whole-tile prefill keeps the
-        # three ``blockwise_fp8_mm`` calls, which take the prebuilt operands. The
-        # slice back is the last thing that happens.
+        # it did before the load-time prep existed; whole-tile prefill runs one
+        # prefill NKI kernel on the public grids, and the prebuilt operands it is
+        # passed serve the three ``blockwise_fp8_mm`` calls of the fallback alone.
+        # The slice back is the last thing that happens.
         prebuilt_scale_t = None
         if int(hidden_states.shape[0]) >= TILE_SIZE:
             prebuilt_scale_t = self._prebuilt_scale_operands()
