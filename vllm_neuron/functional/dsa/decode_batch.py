@@ -1076,7 +1076,7 @@ def dcp_decode_operands(position: Tensor, *, cp_rank: int, cp_size: int,
     Returns:
         :class:`DcpDecodeOperands`. At ``cp_size = 1`` they are ``(position + 1,
         position, 1)``. About twelve elementwise ops on ``[B]`` int64 tensors (``B * 8``
-        bytes each), once per step for every DSA layer.
+        bytes each), once per step; every DSA layer of the step reads the same operands.
     """
     _require_dcp(cp_rank, cp_size, block_size)
     if not torch.is_tensor(position) or position.ndim != 1:

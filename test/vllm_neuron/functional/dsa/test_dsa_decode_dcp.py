@@ -16,8 +16,9 @@ lists into the global one. What this file pins, against the CP = 1 answer:
   step's own pool stands in on its owner only.
 * **The owner gate** (``decode_pool_destinations(..., owner=)``): a step that closes a pool
   writes it on the owner, at its local row; every other rank writes its trash row.
-* **The local top-k** (``decode_select.dsa_decode_select_pools``): values descending, local
-  pool ids, ties to the lowest local id, rows short of ``k`` pools padded with ``-1`` and
+* **The local top-k** (``decode_select.dsa_decode_select_pools``): the selected local pool
+  ids in ascending order (ties at the ``k``-th value to the lowest local id) and their
+  scores beside them, rows short of ``k`` pools padded with ``-1`` and
   :data:`decode_select.POOL_PAD_VALUE`; bit for bit against the torch oracle, and the
   expanded tokens equal to ``dsa_decode_select``'s.
 * **The merge**: a reference merge of the ``CP`` local lists under the global tie rule
@@ -93,7 +94,8 @@ def _global_token(local: int, rank: int, cp: int) -> int:
 
 def _global_pool(local_pool: int, rank: int, cp: int) -> int:
     """The interface's global pool id of local pool ``p`` on ``rank``."""
-    return (local_pool // BLOCK_POOLS) * BLOCK_POOLS * cp + rank * BLOCK_POOLS + local_pool % BLOCK_POOLS
+    block, within = divmod(local_pool, BLOCK_POOLS)
+    return block * BLOCK_POOLS * cp + rank * BLOCK_POOLS + within
 
 
 def _reference_operands(position: int, rank: int, cp: int) -> tuple[int, int, int]:
@@ -378,10 +380,19 @@ def _check_layout(values, ids, bounded):
         assert torch.all(ids[b, :real] < width)
         assert torch.equal(values[b, :real], bounded[b, ids[b, :real].long()])
         assert real == min(k, int((bounded[b] > DS.BOUND_FILL_MARK).sum()))
-        v = values[b, :real]
-        assert torch.all(v[:-1] >= v[1:])                        # descending
-        tie = v[:-1] == v[1:]
-        assert torch.all(ids[b, :real][:-1][tie] < ids[b, :real][1:][tie])   # lowest id first
+        assert torch.all(ids[b, :real][:-1] < ids[b, :real][1:])   # ascending local ids
+        if real < int((bounded[b] > DS.BOUND_FILL_MARK).sum()):
+            # The k largest, ties at the k-th value to the lowest ids: every pool left out
+            # is below the k-th value, or equal to it at a higher id than every pool kept
+            # at that value.
+            kth = values[b, :real].min()
+            out = torch.ones(width, dtype=torch.bool)
+            out[ids[b, :real].long()] = False
+            left = bounded[b][out]
+            assert torch.all(left <= kth)
+            tied_in = ids[b, :real][values[b, :real] == kth]
+            tied_out = torch.nonzero(out & (bounded[b] == kth)).flatten()
+            assert tied_out.numel() == 0 or int(tied_out.min()) > int(tied_in.max())
 
 
 @pytest.mark.parametrize("lengths, candidates", [
@@ -462,7 +473,7 @@ def test_two_programs_equal_one(monkeypatch, batch):
         assert torch.equal(a, b)
 
 
-@pytest.mark.parametrize("k", [8, 128, 256])
+@pytest.mark.parametrize("k", [8, 128, 200, 256])
 def test_other_k(k):
     lengths = [900, 3000, 40]
     bounded = _bounded(lengths, 700, seed=k)
@@ -475,8 +486,9 @@ def test_other_k(k):
 def test_local_topk_refusals():
     lengths = [8000]
     bounded = _bounded(lengths, 2048, seed=1)
-    with pytest.raises(DS.DecodeSelectError):      # k neither <= 128 nor a multiple of 128
-        DS.dsa_decode_select_pools(bounded, _lens(lengths), select_k=200, pool_size=POOL)
+    for k in (0, -1, 2.0, True):
+        with pytest.raises(DS.DecodeSelectError):
+            DS.dsa_decode_select_pools(bounded, _lens(lengths), select_k=k, pool_size=POOL)
     with pytest.raises(DS.DecodeSelectError):
         DS.dsa_decode_select_pools(bounded, _lens([1, 2]), select_k=K, pool_size=POOL)
     with pytest.raises(DS.DecodeSelectError):
@@ -516,17 +528,30 @@ def test_the_pools_kernel_is_keyed_by_this_files_digest():
 # ---------------------------------------------------------------------------------------
 
 
-def _reference_merge(lists, cp):
+def _reference_merge(lists, cp, *, seed=0):
     """trn2-2's item-3 rule on the ``CP`` local lists: higher value first, equal values to
-    the lower global pool id; the first ``K``. Pads (``-1``) carry the lowest value."""
-    values = torch.cat([v for v, _ in lists], dim=1)
+    the lower global pool id; the first ``K``. Pads (``-1``) carry the lowest value.
+
+    Each local list is shuffled first: the rule reads values and global ids only, never the
+    order a list comes in. The result is returned in the CP = 1 list's order (ascending
+    global id, pads last) so that it compares bit for bit."""
+    gen = torch.Generator().manual_seed(seed)
+    shuffled = []
+    for values, ids in lists:
+        order = torch.stack([torch.randperm(int(ids.shape[1]), generator=gen)
+                             for _ in range(int(ids.shape[0]))])
+        shuffled.append((torch.gather(values, 1, order), torch.gather(ids, 1, order)))
+    values = torch.cat([v for v, _ in shuffled], dim=1)
     gids = torch.cat([DS.dcp_global_pool_ids(i, cp_rank=r, cp_size=cp, block_pools=BLOCK_POOLS)
-                      for r, (_, i) in enumerate(lists)], dim=1)
+                      for r, (_, i) in enumerate(shuffled)], dim=1)
     by_id = torch.sort(gids.to(torch.int64), dim=1, stable=True)
     values = torch.gather(values, 1, by_id.indices)
     by_value = torch.sort(values, dim=1, descending=True, stable=True)
-    gids = torch.gather(by_id.values, 1, by_value.indices)
-    return by_value.values[:, :K], gids[:, :K].to(torch.int32)
+    gids = torch.gather(by_id.values, 1, by_value.indices)[:, :K]
+    values = by_value.values[:, :K]
+    last = torch.where(gids >= 0, gids, torch.full_like(gids, torch.iinfo(torch.int64).max))
+    order = torch.sort(last, dim=1, stable=True).indices
+    return torch.gather(values, 1, order), torch.gather(gids, 1, order).to(torch.int32)
 
 
 def _rank_lists(bounded, lengths, cp, *, local_bounded=None):
@@ -650,10 +675,10 @@ _needs_compiler = pytest.mark.skipif(
         and not pathlib.Path(sys.executable).with_name("neuronx-cc").exists()),
     reason="neuronx-cc is not installed, or this host has /dev/neuron* and no bwrap to hide "
            "them from the compile")
-#: ``(B, candidates)``: one request at the local axes of a 64k context at CP = 2 (the
-#: widest served axis) and of an 8k context at CP = 8 (shorter than ``k``), and the
-#: two-program batches.
-COMPILE_SHAPES = ((1, 16384), (1, 256), (4, 4096), (64, 1024))
+#: ``(B, candidates)``: one request at the local axes of a 128k context at CP = 2 (the
+#: widest served axis) and of an 8k context at CP = 8 (shorter than ``k``); a full tile
+#: (two compaction groups) at the widest axis; the two-program batches.
+COMPILE_SHAPES = ((1, 16384), (1, 256), (16, 16384), (4, 4096), (64, 1024), (64, 2048))
 
 
 def _depcheck(dump: str) -> tuple[str, str]:

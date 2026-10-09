@@ -70,6 +70,14 @@ the kernel and that the compiled-program ordering check does not see, so a model
 
 Both physical cores of an LNC2 core split the requests (``[2]`` grid at ``B >= 2``).
 
+Decode context parallelism (DCP): each rank of a group selects over its own pools, and the
+group merges the ranks' lists (trn2-2's item 3). :func:`dsa_decode_select_pools` is this
+selection with, beside the tokens, the local top-``k`` before the expansion: the selected
+pool ids in ascending order and their scores, the pads (:data:`POOL_PAD_ID`,
+:data:`POOL_PAD_VALUE`) after them. :func:`dcp_global_pool_ids` and
+:func:`dcp_owned_pool_rows` map a rank's ids to the global pool axis and the merged ids
+back to the rank's own bank rows.
+
 Dispatches count in ``decode_batch``'s family (``decode_batch_dispatch_counters`` and the
 fourth entry of ``decode_batch_route_counts``): this is the batched decode indexer's third
 stage, after that module's ring step and scores.
@@ -147,7 +155,7 @@ MAX_DECODE_INDEX_CANDIDATES = WHOLE_ROW_COLUMNS
 #: What a row of :func:`dsa_decode_select_pools`' local top-``k`` holds past its real
 #: entries, beside the id :data:`POOL_PAD_ID`: the causal sentinel value, ``BOUND_FILL``
 #: (-1.0e30), which the score kernel writes at every pool that is not complete. Every real
-#: entry is above :data:`BOUND_FILL_MARK`, so a pad sorts after every real entry in the
+#: entry is above :data:`BOUND_FILL_MARK`, so a pad ranks after every real entry in the
 #: merge whatever its tie rule.
 POOL_PAD_VALUE = BOUND_FILL
 #: The pool id of a pad entry: the selection's ``SENTINEL`` (-1).
@@ -504,98 +512,60 @@ def _compact_segments(mask_hbm, ids_hbm, zeros_hbm, r0, n, width, select_k):
                      0, False)
 
 
-def _rank_pools(bounded_hbm, ids_hbm, asc_hbm, values_hbm, pool_ids_hbm, r0, n, select_k):
-    """Requests ``r0 .. r0 + n - 1``: their compacted pool ids (ascending, ``-1`` after) to
-    the local top-``k`` list, values descending, equal values in ascending id order, the
-    pads (:data:`POOL_PAD_ID`, :data:`POOL_PAD_VALUE`) last.
+def _compact_pool_rows(mask_hbm, bounded_hbm, ids_hbm, values_hbm, r0, n, span, select_k):
+    """:func:`_compact_whole_rows` with each id's score read beside it: requests ``r0 .. r0 +
+    n - 1``' ids to ``ids_hbm`` (ascending, :data:`POOL_PAD_ID` after them) and their scores
+    to ``values_hbm`` (:data:`POOL_PAD_VALUE` after them).
 
-    Entry ``i`` of a request's ascending list sits on partition ``i // cols``, column
-    ``i % cols`` (``lanes * cols = k`` entries, ``lanes = min(k, 128)``). Its value is
-    gathered from the request's scores (one indirect DMA per column), the row goes through
-    the ``asc_hbm`` scratch and comes back on every lane, and the entry's place in the
-    list is the number of entries ahead of it: those with a larger value, and those with
-    the same value and a lower index (the list is in ascending id order, so a lower index
-    is a lower id). The places are a permutation of ``0 .. k - 1``; one indirect DMA per
-    column scatters the values and the ids to them. Every value moves by DMA, so the list
-    holds the scores bit for bit.
+    After the compaction the score rows come into the mask rows' tile, on the same GpSimd
+    partitions; its column ``span``, past the mask, holds :data:`POOL_PAD_VALUE`. One
+    ``nc_n_gather`` per eight requests reads the scores at the ids, a pad id (``-1``,
+    ``2**32 - 1`` as an unsigned index) clamped to column ``span``; the partitions between
+    the rows gather column ``span`` too. Every value is a copy of a score, so the list holds
+    the scores bit for bit.
+
+    One tile for both rows, at 16384 candidates the only room there is beside the
+    compaction's (a third row-wide tile does not fit a partition). The pad column is written
+    before the mask rows and read by the gather after the score rows, so the score rows are
+    a later write to the same tile, ordered after the compaction's read of the mask rows; a
+    tile whose every read follows the new write is given a second address by the device
+    compiler, which put it over the mask rows without that order (the ordering check, one
+    request at 16384 candidates).
     """
     width = bounded_hbm.shape[1]
-    lanes = min(select_k, PARTITIONS)
-    cols = select_k // lanes
-    flat_scores = bounded_hbm.reshape((bounded_hbm.shape[0] * width, 1))
-    flat_values = values_hbm.reshape((values_hbm.shape[0] * select_k, 1))
-    flat_ids = pool_ids_hbm.reshape((pool_ids_hbm.shape[0] * select_k, 1))
-    # below[t][p, j] = 1 where entry j is ahead of entry p * cols + t in index order.
-    below = []
-    for t in range(cols):
-        rel = _sb((lanes, select_k), nl.float32)
-        nisa.iota(dst=rel, pattern=[[1, select_k]], offset=-t, channel_multiplier=-cols)
-        ahead = _sb((lanes, select_k), nl.float32)
-        nisa.tensor_scalar(dst=ahead, data=rel, op0=nl.less, operand0=0.0)
-        below.append(ahead)
-    pad = _sb((lanes, cols), nl.float32)
-    nisa.memset(dst=pad, value=POOL_PAD_VALUE)
-    for i in range(n):
-        r = r0 + i
-        ids = _sb((lanes, cols), nl.int32)
-        nisa.dma_copy(dst=ids, src=ids_hbm.ap(pattern=[[cols, lanes], [1, cols]],
-                                              offset=r * select_k))
-        # A pad's -1 reads column 0 (a valid address); its value is replaced below.
-        at = _sb((lanes, cols), nl.int32)
-        nisa.tensor_scalar(dst=at, data=ids, op0=nl.maximum, operand0=0, op1=nl.add,
-                           operand1=r * width)
-        vals = _sb((lanes, cols), nl.float32)
-        for t in range(cols):
-            nisa.dma_copy(dst=vals[:, t:t + 1],
-                          src=flat_scores.ap(pattern=[[1, lanes], [1, 1]], offset=0,
-                                             vector_offset=at[:, t:t + 1], indirect_dim=0))
-        is_pad = _sb((lanes, cols), nl.uint8)
-        nisa.tensor_scalar(dst=is_pad, data=ids, op0=nl.less, operand0=0)
-        nisa.tensor_copy_predicated(dst=vals, src=pad, predicate=is_pad)
-        # ---- the row on every lane, then each entry's place in the list -----------------
-        nisa.dma_copy(dst=asc_hbm.ap(pattern=[[cols, lanes], [1, cols]], offset=r * select_k),
-                      src=vals)
-        row = _sb((lanes, select_k), nl.float32)
-        nisa.dma_copy(dst=row, src=asc_hbm.ap(pattern=[[0, lanes], [1, select_k]],
-                                              offset=r * select_k))
-        place = _sb((lanes, cols), nl.float32)
-        for t in range(cols):
-            larger = _col(lanes, nl.float32)
-            junk = _sb((lanes, select_k), nl.float32)
-            nisa.tensor_scalar_reduce(dst=junk, data=row, op0=nl.greater,
-                                      operand0=vals[:, t:t + 1], reduce_op=nl.add,
-                                      reduce_res=larger)
-            ties = _sb((lanes, select_k), nl.float32)
-            nisa.scalar_tensor_tensor(dst=ties, data=row, op0=nl.equal,
-                                      operand0=vals[:, t:t + 1], op1=nl.multiply,
-                                      operand1=below[t])
-            ties_ahead = _col(lanes, nl.float32)
-            nisa.tensor_reduce(dst=ties_ahead, op=nl.add, data=ties, axis=1)
-            nisa.tensor_tensor(dst=place[:, t:t + 1], data1=larger, data2=ties_ahead,
-                               op=nl.add)
-        # ---- the scatter: element r * k + place ------------------------------------------
-        # A place is below k and r * k + place below 2**24, so the fp32 sum is exact.
-        dest_f = _sb((lanes, cols), nl.float32)
-        nisa.tensor_scalar(dst=dest_f, data=place, op0=nl.add, operand0=float(r * select_k))
-        dest = _sb((lanes, cols), nl.int32)
-        nisa.tensor_copy(dst=dest, src=dest_f)
-        for t in range(cols):
-            nisa.dma_copy(dst=flat_values.ap(pattern=[[1, lanes], [1, 1]], offset=0,
-                                             vector_offset=dest[:, t:t + 1], indirect_dim=0),
-                          src=vals[:, t:t + 1])
-            nisa.dma_copy(dst=flat_ids.ap(pattern=[[1, lanes], [1, 1]], offset=0,
-                                          vector_offset=dest[:, t:t + 1], indirect_dim=0),
-                          src=ids[:, t:t + 1])
+    for g in range(_ceil_div(n, COMPACT_ROWS)):
+        m = min(COMPACT_ROWS, n - g * COMPACT_ROWS)
+        row0 = r0 + g * COMPACT_ROWS
+        # Partitions 0 .. 16 (m - 1): every compute instruction here starts on partition 0.
+        parts = GPSIMD_STRIDE * (m - 1) + 1
+        rows = _sb((PARTITIONS, span + 1), nl.float32)
+        nisa.memset(dst=rows[:, span:span + 1], value=POOL_PAD_VALUE)
+        found = _gpsimd_dst((PARTITIONS, span + 1), nl.int32)
+        nisa.memset(dst=found[0:parts, 0:select_k], value=POOL_PAD_ID)
+        _gpsimd_copy(rows, mask_hbm, row0, m, span, span, 0, True)
+        nisa.nonzero_with_count(dst=found, src=rows[:, 0:span], index_offset=0,
+                                padding_val=POOL_PAD_ID)
+        _gpsimd_copy(found, ids_hbm, row0, m, select_k, select_k, 0, False)
+        at = _sb((PARTITIONS, select_k), nl.uint32)
+        nisa.tensor_scalar(dst=at[0:parts, 0:select_k],
+                           data=found[0:parts, 0:select_k].view(nl.uint32),
+                           op0=nl.minimum, operand0=span)
+        # ---- the score rows over the mask rows: every id is below the width -------------
+        _gpsimd_copy(rows, bounded_hbm, row0, m, width, width, 0, True)
+        values = _gpsimd_dst((PARTITIONS, select_k), nl.float32)
+        nisa.nc_n_gather(dst=values[0:parts, 0:select_k], data=rows[0:parts, 0:span + 1],
+                         indices=at[0:parts, 0:select_k])
+        _gpsimd_copy(values, values_hbm, row0, m, select_k, select_k, 0, False)
 
 
 def _select_tile(bounded_hbm, lens_hbm, out_hbm, mask_hbm, ids_hbm, zeros_hbm, tok_hbm,
-                 r0, n, select_k, pool_size, out_cols, fold_cap, span, pools):
+                 r0, n, select_k, pool_size, out_cols, fold_cap, span, values_hbm):
     """Requests ``r0 .. r0 + n - 1``: select, compact, expand.
 
     ``span``: the mask width, the candidate axis or (:func:`dsa_decode_select_pools` on an
     axis of at most ``k`` pools) wider, the columns past the axis at ``BOUND_FILL``.
-    ``pools``: ``None``, or ``(asc_hbm, values_hbm, pool_ids_hbm)`` for the local top-``k``
-    list (:func:`_rank_pools`) after the compaction.
+    ``values_hbm``: ``None``, or where the selected scores go beside the ids
+    (:func:`_compact_pool_rows`, the whole-row path only).
     """
     width = bounded_hbm.shape[1]
     fold, chunk, request_major = fold_layout(n, span, fold_cap)
@@ -614,12 +584,12 @@ def _select_tile(bounded_hbm, lens_hbm, out_hbm, mask_hbm, ids_hbm, zeros_hbm, t
 
     # ---- compaction: rows on the GpSimd cores' first partitions -------------------------
     count, _seg = segments(span)
-    if count == 1:
+    if values_hbm is not None:
+        _compact_pool_rows(mask_hbm, bounded_hbm, ids_hbm, values_hbm, r0, n, span, select_k)
+    elif count == 1:
         _compact_whole_rows(mask_hbm, ids_hbm, r0, n, span, select_k)
     else:
         _compact_segments(mask_hbm, ids_hbm, zeros_hbm, r0, n, span, select_k)
-    if pools is not None:
-        _rank_pools(bounded_hbm, ids_hbm, pools[0], pools[1], pools[2], r0, n, select_k)
 
     # ---- expansion: pool p -> tokens p * pool + t; -1 stays -1 --------------------------
     spread = 1
@@ -743,30 +713,27 @@ def dsa_decode_select_pools_kernel(bounded_hbm, lens_hbm, select_k, pool_size, o
 
     Args:
         bounded_hbm / lens_hbm / select_k / pool_size / out_cols / source_digest: as
-            :func:`dsa_decode_select_kernel`; ``select_k`` at most 128 or a multiple of it.
+            :func:`dsa_decode_select_kernel`.
         fold_cap: python int, :func:`select_fold_cap` of ``span``.
         span: python int, :func:`select_span`: the candidate axis, or ``select_k + 1`` on
-            an axis of at most ``select_k`` pools (every pool there is selected).
+            an axis of at most ``select_k`` pools (every pool there is selected); at most
+            :data:`WHOLE_ROW_COLUMNS`.
 
     Returns:
         ``(tokens, values, pool_ids)``: ``[B, out_cols]`` int32, the selection kernel's
-        layout; ``[B, select_k]`` fp32, the selected scores in descending order, equal
-        scores in ascending id order, then :data:`POOL_PAD_VALUE`; ``[B, select_k]``
-        int32, their pool ids (candidate-axis indices), then :data:`POOL_PAD_ID`.
+        layout; ``[B, select_k]`` fp32, the selected scores, then :data:`POOL_PAD_VALUE`;
+        ``[B, select_k]`` int32, their pool ids (candidate-axis indices) in ascending
+        order, then :data:`POOL_PAD_ID`. Entry ``j`` of ``values`` is the score of entry
+        ``j`` of ``pool_ids``.
     """
     batch = bounded_hbm.shape[0]
-    width = bounded_hbm.shape[1]
     out_hbm = nl.ndarray((batch, out_cols), dtype=nl.int32, buffer=nl.shared_hbm)
     values_hbm = nl.ndarray((batch, select_k), dtype=nl.float32, buffer=nl.shared_hbm)
+    # The compacted ids: an output, and the expansion's input.
     pool_ids_hbm = nl.ndarray((batch, select_k), dtype=nl.int32, buffer=nl.shared_hbm)
     mask_hbm = nl.ndarray((batch, span), dtype=nl.float32, buffer=nl.private_hbm)
-    ids_hbm = nl.ndarray((batch, select_k), dtype=nl.int32, buffer=nl.private_hbm)
-    asc_hbm = nl.ndarray((batch, select_k), dtype=nl.float32, buffer=nl.private_hbm)
     tok_hbm = nl.ndarray((batch, select_k * pool_size), dtype=nl.int32,
                          buffer=nl.private_hbm)
-    # The whole-row path only (dsa_decode_select_pools refuses a wider span), so no
-    # segment pads are zeroed; the scratch is the segment path's argument.
-    zeros_hbm = nl.ndarray((1, SEGMENT_COLUMNS), dtype=nl.float32, buffer=nl.private_hbm)
     n_prgs = nl.num_programs(axes=0)
     prg = nl.program_id(0)
     share = (batch + n_prgs - 1) // n_prgs
@@ -777,9 +744,9 @@ def dsa_decode_select_pools_kernel(bounded_hbm, lens_hbm, select_k, pool_size, o
     for t in range(n_tiles):
         r0 = lo + t * per_tile
         n = min(per_tile, hi - r0)
-        _select_tile(bounded_hbm, lens_hbm, out_hbm, mask_hbm, ids_hbm, zeros_hbm, tok_hbm,
-                     r0, n, select_k, pool_size, out_cols, fold_cap, span,
-                     (asc_hbm, values_hbm, pool_ids_hbm))
+        # No segment scratch: the whole-row path only.
+        _select_tile(bounded_hbm, lens_hbm, out_hbm, mask_hbm, pool_ids_hbm, None, tok_hbm,
+                     r0, n, select_k, pool_size, out_cols, fold_cap, span, values_hbm)
     return out_hbm, values_hbm, pool_ids_hbm
 
 
@@ -906,11 +873,8 @@ def _validate_pools(bounded: Tensor, seq_lens: Tensor, select_k, pool_size) -> t
     if batch < 1 or width < 1:
         raise DecodeSelectError(f"bounded must carry at least one request and one pool; got "
                                 f"{tuple(bounded.shape)}")
-    if (not isinstance(select_k, int) or isinstance(select_k, bool) or select_k < 1
-            or (select_k > PARTITIONS and select_k % PARTITIONS != 0)):
-        raise DecodeSelectError(
-            f"select_k must be a positive python int, at most {PARTITIONS} or a multiple of "
-            f"it (the list's entries ride {PARTITIONS} partitions); got {select_k!r}")
+    if not isinstance(select_k, int) or isinstance(select_k, bool) or select_k < 1:
+        raise DecodeSelectError(f"select_k must be a positive python int; got {select_k!r}")
     if not isinstance(pool_size, int) or not is_power_of_two(pool_size):
         raise DecodeSelectError(f"pool_size must be a power-of-two python int; got "
                                 f"{pool_size!r}")
@@ -932,14 +896,16 @@ def dsa_decode_select_pools(bounded: Tensor, seq_lens: Tensor, *, select_k: int,
 
     The input of trn2-2's decode context parallel merge (item 3): each rank selects over
     its own pools and the ``CP`` lists merge into the global one. Rows are requests
-    (``R = B`` at one decode token each).
+    (``R = B`` at one decode token each). The list is in pool order, not score order: the
+    merge ranks the ``CP * k`` entries by score and global pool id, which does not depend on
+    the order they come in, and this selection never sorts.
 
     Args:
         bounded: ``[B, C]`` fp32, a rank's bounded candidate scores over its local pool
             axis (``dsa_decode_scores`` with the rank's operands).
         seq_lens: ``[B]`` int, each request's length on this rank (its owned length).
-        select_k: pools selected per request: at most 128 or a multiple of 128. ``C <=
-            select_k`` is served: every complete pool is selected.
+        select_k: pools selected per request, a positive python int. ``C <= select_k`` is
+            served: every complete pool is selected.
         pool_size: tokens per pool, a power of two.
 
     Returns:
@@ -948,12 +914,12 @@ def dsa_decode_select_pools(bounded: Tensor, seq_lens: Tensor, *, select_k: int,
         * ``tokens``: ``[B, index_expand_width(select_k, pool_size)]`` int32, the
           selection's expanded token indices, :func:`dsa_decode_select`'s where ``C >
           select_k``;
-        * ``values``: ``[B, select_k]`` fp32, the selected scores, descending; equal
-          scores in ascending pool id order (the selection's tie rule, lowest index
-          first); a row with fewer than ``select_k`` complete pools has its real entries
-          first and :data:`POOL_PAD_VALUE` after them;
-        * ``pool_ids``: ``[B, select_k]`` int32, the entries' local candidate-axis indices,
-          :data:`POOL_PAD_ID` after the real ones.
+        * ``values``: ``[B, select_k]`` fp32, the score of each entry of ``pool_ids``
+          (bit for bit ``bounded[b, pool_ids[b, j]]``), :data:`POOL_PAD_VALUE` at a pad;
+        * ``pool_ids``: ``[B, select_k]`` int32, the selected local candidate-axis indices
+          in ascending order (the ``k`` largest scores, ties at the ``k``-th value to the
+          lowest index), :data:`POOL_PAD_ID` after them in a row with fewer than
+          ``select_k`` complete pools.
     """
     batch, width = _validate_pools(bounded, seq_lens, select_k, pool_size)
     span = select_span(width, select_k)
@@ -1049,17 +1015,21 @@ def dsa_decode_select_pools_torch_oracle(bounded: Tensor, seq_lens: Tensor, *,
                                          ) -> tuple[Tensor, Tensor, Tensor]:
     """CPU reference and fallback of :func:`dsa_decode_select_pools`: the scores padded with
     ``BOUND_FILL`` to :func:`select_span`, a stable descending sort (equal values in index
-    order), its first ``select_k``; the masked ones become the pads."""
+    order), its first ``select_k`` that are complete pools, back in ascending index order,
+    the pads after them."""
     batch, width = int(bounded.shape[0]), int(bounded.shape[1])
     scores = bounded.to(torch.float32)
     span = select_span(width, select_k)
     if span > width:
         scores = torch.cat([scores, scores.new_full((batch, span - width), BOUND_FILL)], dim=1)
     top = torch.sort(scores, dim=1, descending=True, stable=True)
-    values, ids = top.values[:, :select_k], top.indices[:, :select_k]
-    keep = values > BOUND_FILL_MARK
-    values = torch.where(keep, values, torch.full_like(values, POOL_PAD_VALUE))
-    pool_ids = torch.where(keep, ids, torch.full_like(ids, POOL_PAD_ID)).to(torch.int32)
+    first = top.indices[:, :select_k]
+    keep = top.values[:, :select_k] > BOUND_FILL_MARK
+    ids = torch.where(keep, first, torch.full_like(first, span)).sort(dim=1).values
+    real = ids < span
+    values = torch.gather(scores, 1, torch.where(real, ids, torch.zeros_like(ids)))
+    values = torch.where(real, values, torch.full_like(values, POOL_PAD_VALUE))
+    pool_ids = torch.where(real, ids, torch.full_like(ids, POOL_PAD_ID)).to(torch.int32)
     tokens = dsa_decode_select_torch_oracle(scores, seq_lens, select_k=select_k,
                                             pool_size=pool_size)
     return tokens, values, pool_ids
