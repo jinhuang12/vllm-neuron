@@ -9,6 +9,7 @@ state management.
 
 import logging
 import math
+import json
 import os
 import threading
 import time
@@ -156,6 +157,11 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
         # the bonus token will be re-emitted by the transition step itself,
         # to avoid duplicate emission to the client.
         self._skip_emit: bool = False
+        # Shadow draft (MTP stage A): the step whose ids this output carries, with
+        # its unread draft tensor, scored in get_output() from the ids read back
+        # there. None with the knob off (every other model), so nothing else moves.
+        claim = getattr(model_runner, "_glm5next_shadow_claim", None)
+        self._glm5next_shadow = claim() if claim is not None else None
 
     def _discard_partial_prefill_samples(
         self, sampled_token_ids: list[list[int]]
@@ -168,6 +174,18 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
                 continue
             if req_idx < len(sampled_token_ids):
                 sampled_token_ids[req_idx] = []
+
+    def _glm5next_shadow_score(self, sampled_token_ids) -> None:
+        """Hand the step's ids, read back on this thread, to the shadow-draft scorer, once.
+
+        ``sampled_token_ids`` is the materialized ``list[list[int]]``, or ``None`` for an
+        intermediate prefill chunk drained without ids. The draft tensor of the same
+        execution is read by the scorer here, after the sampled ids, on this thread; no
+        other thread reads this step's futures (see ``_glm5next_shadow_observe``).
+        """
+        record, self._glm5next_shadow = self._glm5next_shadow, None
+        if record is not None:
+            self._model_runner._glm5next_shadow_commit(record, sampled_token_ids)
 
     def is_all_partial_prefill(self) -> bool:
         """True when every request in this output is an intermediate
@@ -204,6 +222,7 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
                     # longer than kv_segment_size * NRT_queue_cap overflows it
                     # ("Execution queue full").
                     sampled_token_ids.cpu()
+                    self._glm5next_shadow_score(None)
                     sampled_token_ids = [
                         [] for _ in range(len(self.model_runner_output.req_ids))
                     ]
@@ -240,6 +259,7 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
                 else:
                     # Non-spec: [bs] of sampled tokens.
                     sampled_token_ids = [[x] for x in sampled_token_ids.cpu().tolist()]
+                self._glm5next_shadow_score(sampled_token_ids)
                 self._discard_partial_prefill_samples(sampled_token_ids)
                 # If this output was marked for skip-emit (e.g. the last
                 # spec step's bonus will be re-emitted by the following
@@ -494,6 +514,137 @@ def build_sampling_params_tensor(
     return result
 
 
+class Glm5NextShadowStep(NamedTuple):
+    """One dispatched step waiting for its ids: dispatch index, bookkeeping, unread drafts."""
+
+    step_no: int
+    step: dict
+    drafts: Any
+
+
+class Glm5NextShadowDraftScorer:
+    """Score shadow drafts against the tokens the trunk samples at the following steps.
+
+    MTP stage A for GLM-5.3-Flash runs the layer-45 draft beside the decode graph and
+    never uses its output. This class keeps, per request, the sampled tokens in step
+    order and the draft records still waiting for ground truth, and hands each record
+    to ``sink`` once it is scored.
+
+    Alignment: a decode step at position ``s`` consumed ``x_s`` and sampled ``x_{s+1}``;
+    the ``k`` drafts it emits predict ``x_{s+2} .. x_{s+k+1}``, the tokens sampled at
+    the next ``k`` steps. Draft ``d_j`` is accepted iff ``d_1 .. d_{j-1}`` were accepted
+    and ``d_j`` equals the token sampled ``j`` steps later. A record emitted at the
+    prefill step (``sampled`` = ``x_T``) is scored the same way against ``x_{T+1} ..``.
+
+    A record is complete when ``k`` later tokens arrived. A request that retires
+    earlier (finished, preempted, its batch row handed to another request) has its
+    pending records scored over the tokens that did arrive: ``scored`` is that count and
+    ``accepted_prefix_len`` never exceeds it, so a reader can separate "rejected" from
+    "unscored". The record is a plain dict::
+
+        {"req_id", "step", "position", "row", "drafts", "actual", "scored",
+         "accepted_prefix_len"}
+
+    Requests are keyed by the engine's request id, not by batch row, so a row reused by a
+    new request never scores the old request's drafts against the new one's tokens.
+    """
+
+    def __init__(self, k: int, sink) -> None:
+        self.k = int(k)
+        if self.k < 1:
+            raise ValueError(f"a shadow-draft scorer needs k >= 1 drafts per step, got {k!r}")
+        self._sink = sink
+        self._history: dict[str, list[int]] = {}
+        self._pending: dict[str, list[dict]] = {}
+
+    @property
+    def tracked(self) -> set[str]:
+        """The request ids with a history (every observed, not yet retired request)."""
+        return set(self._history)
+
+    def observe(
+        self,
+        req_id: str,
+        *,
+        step: int,
+        position: int,
+        sampled: int,
+        drafts=None,
+        row: int | None = None,
+    ) -> None:
+        """Record one step of ``req_id``: the token it sampled and the drafts it emitted.
+
+        ``drafts`` is ``None`` for a step that drafted nothing (a prefill chunk).
+        """
+        history = self._history.setdefault(req_id, [])
+        pending = self._pending.setdefault(req_id, [])
+        history.append(int(sampled))
+        if drafts is not None:
+            pending.append(
+                {
+                    "req_id": req_id,
+                    "step": int(step),
+                    "position": int(position),
+                    "row": row,
+                    "drafts": [int(value) for value in drafts],
+                    # The first token this record is scored against is the one sampled
+                    # at the next step, which lands at this index of the history.
+                    "start": len(history),
+                }
+            )
+        self._flush(req_id, final=False)
+
+    def retire(self, req_id: str) -> None:
+        """The request is gone: score what arrived, mark the rest unscored, forget it."""
+        if req_id not in self._history:
+            return
+        self._flush(req_id, final=True)
+        del self._history[req_id]
+        del self._pending[req_id]
+
+    def retire_absent(self, present) -> None:
+        """Retire every tracked request that is not in ``present`` (this step's batch)."""
+        keep = set(present)
+        for req_id in list(self._history):
+            if req_id not in keep:
+                self.retire(req_id)
+
+    def close(self) -> None:
+        """Retire every request (shutdown)."""
+        for req_id in list(self._history):
+            self.retire(req_id)
+
+    def _flush(self, req_id: str, *, final: bool) -> None:
+        history = self._history[req_id]
+        pending = self._pending[req_id]
+        keep: list[dict] = []
+        for record in pending:
+            available = len(history) - record["start"]
+            if available < self.k and not final:
+                keep.append(record)
+                continue
+            scored = min(self.k, max(available, 0))
+            actual = history[record["start"] : record["start"] + scored]
+            accepted = 0
+            for draft, truth in zip(record["drafts"], actual):
+                if draft != truth:
+                    break
+                accepted += 1
+            out = {key: value for key, value in record.items() if key != "start"}
+            out["actual"] = list(actual)
+            out["scored"] = scored
+            out["accepted_prefix_len"] = accepted
+            self._sink(out)
+        # Keep the history bounded: tokens older than every pending record's start are
+        # never read again.
+        cut = min((record["start"] for record in keep), default=len(history))
+        if cut > 0:
+            del history[:cut]
+            for record in keep:
+                record["start"] -= cut
+        self._pending[req_id] = keep
+
+
 # TODO: Inherit from LoRAModelRunnerMixin to support LoRA
 class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunnerMixin):
     """
@@ -633,6 +784,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # This must happen before InputBatch creation to ensure buffers are sized correctly
         from vllm_neuron.utils.bucket_utils import (
             SUPPORTED_KV_SEGMENT_SIZES,
+            complete_kv_segment_cover,
             get_default_num_seqs_buckets,
             resolve_num_batched_tokens_buckets,
             resolve_segmented_prefill_config,
@@ -655,7 +807,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 auto_kv_segment_size_buckets,
                 auto_num_batched_tokens_buckets,
             ) = resolve_segmented_prefill_config(
-                self.max_num_batched_tokens, self.max_model_len
+                self.max_num_batched_tokens,
+                self.max_model_len,
+                windowed_prefill=self.neuron_config._model_supports_windowed_prefill,
             )
 
         dcp_stride = (
@@ -733,6 +887,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 if user_set_num_batched_tokens_buckets
                 else None
             )
+            # A windowed-prefill model reads a prefill chunk's KV through a window of
+            # segment + query bucket tokens, so the list's largest segment must cover
+            # max_model_len; the validator refuses one that does not.
             self.neuron_config.kv_segment_size_buckets = (
                 validate_kv_segment_size_buckets(
                     buckets,
@@ -740,6 +897,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     allow_independent_query_buckets=(
                         self.neuron_config._model_supports_independent_prefill_buckets
                     ),
+                    windowed_prefill=self.neuron_config._model_supports_windowed_prefill,
+                    block_size=getattr(vllm_config.cache_config, "block_size", None),
+                    max_model_len=self.max_model_len,
                 )
             )
             kv_segment_size = self.neuron_config.kv_segment_size_buckets[0]
@@ -769,14 +929,45 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 self.neuron_config.kv_segment_size_buckets,
             )
         elif auto_kv_segment_size_buckets is not None:
-            # Cross-check the resolver's segment size against the user's
-            # explicit num_batched_tokens_buckets (if any), using the same
-            # validation rule as the explicit opt-in path.
-            explicit_num_batched_tokens_buckets = (
-                self.neuron_config.num_batched_tokens_buckets
-                if user_set_num_batched_tokens_buckets
-                else None
+            # A windowed-prefill model whose kernel takes the query length
+            # independently of the cached length can hold several segments.
+            windowed = (
+                self.neuron_config._model_supports_windowed_prefill
+                and self.neuron_config._model_supports_independent_prefill_buckets
             )
+            block_size = getattr(vllm_config.cache_config, "block_size", None)
+            if windowed:
+                # The resolver picks one segment equal to the token budget, a window
+                # of twice the budget; a windowed model with a longer max_model_len
+                # gets the smallest supported segment that covers it appended (or one
+                # of max_model_len), so a user who set no list is not capped below
+                # max_model_len.
+                completed = complete_kv_segment_cover(
+                    auto_kv_segment_size_buckets,
+                    self.neuron_config.num_batched_tokens_buckets,
+                    self.max_model_len,
+                    block_size,
+                    windowed_prefill=True,
+                )
+                if completed != auto_kv_segment_size_buckets:
+                    logger.info(
+                        "Segmented prefill: kv_segment_size_buckets %s completed to %s "
+                        "so the prefill window covers max_model_len %s",
+                        auto_kv_segment_size_buckets,
+                        completed,
+                        self.max_model_len,
+                    )
+                auto_kv_segment_size_buckets = completed
+            # Cross-check the resolver's segment list against the query buckets
+            # (the user's explicit ones, or the resolved ones for a windowed model
+            # whose list may now hold several segments), with the same rules as the
+            # explicit opt-in path.
+            if user_set_num_batched_tokens_buckets or windowed:
+                explicit_num_batched_tokens_buckets = (
+                    self.neuron_config.num_batched_tokens_buckets
+                )
+            else:
+                explicit_num_batched_tokens_buckets = None
             self.neuron_config.kv_segment_size_buckets = (
                 validate_kv_segment_size_buckets(
                     auto_kv_segment_size_buckets,
@@ -784,6 +975,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     allow_independent_query_buckets=(
                         self.neuron_config._model_supports_independent_prefill_buckets
                     ),
+                    windowed_prefill=self.neuron_config._model_supports_windowed_prefill,
+                    block_size=block_size,
+                    max_model_len=self.max_model_len,
                 )
             )
             logger.info(
@@ -1550,6 +1744,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # resulting multiple back-edges without this flag.
             "--internal-backend-options=--enable-verifier=false --enable-nested-dynamic-loop",
         ]
+        # The row-parallel all-reduce policy's compiler flag: with
+        # VLLM_NEURON_TP_ALLREDUCE_FUSE=1, neuronx-cc keeps each all-reduce one
+        # collective instead of splitting it into 8 MiB tiles. Unset, nothing is added.
+        from vllm_neuron.model.glm5_next.collective_policy import fuse_compiler_args
+
+        self.compile_options["compiler_args"] += fuse_compiler_args()
         logger.info(
             "neuronx-cc optlevel -O%s (from vLLM optimization_level)",
             self.vllm_config.optimization_level.value,
@@ -4255,6 +4455,35 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         ctx_for_blocks = ctx_bucket if ctx_bucket is not None else self.max_model_len
         return (ctx_for_blocks + dcp_block_size - 1) // dcp_block_size
 
+    def _prefill_kv_segment_size(self, request_tokens: int) -> int:
+        """Return the KV segment a request of ``request_tokens`` tokens is prefilled with.
+
+        The smallest of ``neuron_config.kv_segment_size_buckets`` at least as long as
+        the request (:func:`vllm_neuron.utils.bucket_utils.select_kv_segment_size`), or
+        the largest, whose window the validator proved covers ``max_model_len``; 0 when
+        segmented prefill is off. Warmup compiles one prefill graph per configured
+        segment, so every value returned here has its graph.
+        """
+        from vllm_neuron.utils.bucket_utils import select_kv_segment_size
+
+        buckets = self.neuron_config.kv_segment_size_buckets
+        if not buckets:
+            return 0
+        return select_kv_segment_size(buckets, int(request_tokens))
+
+    def _prefill_request_tokens(self, cached_seq_len: int, scheduled_rows: int) -> int:
+        """Return the length the prefilling request reaches, prompt and recomputed tokens.
+
+        Read off the input batch (``num_tokens_no_spec``: the request's prompt plus any
+        output tokens it recomputes after a preemption). A batch that carries no such
+        array (a synthetic step built without one) is given the chunk's padded end,
+        ``cached_seq_len + scheduled_rows``, which the chunk's window also holds.
+        """
+        lengths = getattr(self.input_batch, "num_tokens_no_spec", None)
+        if lengths is not None and len(lengths) > 0:
+            return int(lengths[0])
+        return int(cached_seq_len) + int(scheduled_rows)
+
     def _build_attention_metadata(
         self,
         padded_num_reqs: int,
@@ -4291,6 +4520,29 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         step_device = torch.device("cpu") if host_only else self.device
         decode_token_threshold = 1 + max_num_draft_tokens
         is_decode = max_query_len <= decode_token_threshold
+        # The KV segment this step's graph is compiled for. A prefill chunk (one
+        # request per step) takes the smallest segment at least as long as its
+        # request, so every chunk of the request reads a window that holds its whole
+        # sequence; a decode step keeps the first segment, the one its warmup graph
+        # was built with (the decode converter does not read it). 0 when segmented
+        # prefill is off.
+        segments = self.neuron_config.kv_segment_size_buckets
+        if is_decode or not segments:
+            kv_segment_size = segments[0] if segments else 0
+        else:
+            request_tokens = self._prefill_request_tokens(
+                cached_seq_len, total_num_scheduled_tokens
+            )
+            kv_segment_size = self._prefill_kv_segment_size(request_tokens)
+            req_ids = list(getattr(self.input_batch, "req_ids", None) or ())
+            logger.info(
+                "Prefill chunk of request %s: %s of %s tokens cached, KV segment %s of %s",
+                req_ids[0] if req_ids else "?",
+                int(cached_seq_len),
+                request_tokens,
+                kv_segment_size,
+                segments,
+            )
 
         for kv_cache_group_id, kv_cache_group_spec in enumerate(
             self.kv_cache_config.kv_cache_groups
@@ -4348,10 +4600,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
             # Note there are more data available in self.input_batch you can
             # use in attention_metadata. Now we only use the ones below.
-            kv_segment_size = 0
-            if self.neuron_config.kv_segment_size_buckets is not None:
-                kv_segment_size = self.neuron_config.kv_segment_size_buckets[0]
-
             swa_kv_pos_offset = None
 
             # Only include the raw (pre-transform) block table when running
@@ -4482,6 +4730,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         decode_token_threshold: int | None = None,
         ctx_bucket: int | None = None,
         device: torch.device | None = None,
+        kv_segment_size: int = 0,
     ) -> dict:
         """
         Build attention metadata for warmup without using InputBatch.
@@ -4502,6 +4751,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 for non-SWA groups; SWA groups always trim to the window.
             device: Device to allocate synthetic tensors on. Defaults to
                 ``self.device``.
+            kv_segment_size: The KV segment a prefill warmup is built for, one of
+                ``kv_segment_size_buckets``; the converter sizes the window the
+                captured graph reads from it. 0 takes the first bucket, which is
+                what a decode step carries.
 
         Returns:
             dict mapping layer names to attention metadata dicts
@@ -4622,9 +4875,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # max_query_len: for prefill = bucket_size, for decode = 1
             max_query_len = num_tokens // num_reqs
 
-            kv_segment_size = 0
-            if self.neuron_config.kv_segment_size_buckets is not None:
-                kv_segment_size = self.neuron_config.kv_segment_size_buckets[0]
+            segment = int(kv_segment_size)
+            if not segment and self.neuron_config.kv_segment_size_buckets is not None:
+                segment = self.neuron_config.kv_segment_size_buckets[0]
 
             # Host-side geometry in the same form the serving builder produces, so
             # capture needs no special case: this bucket's blocks and the declared
@@ -4651,7 +4904,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 ),
                 "host_block_table": host_block_table,
                 "host_num_computed_tokens": host_num_computed_tokens,
-                "kv_segment_size": kv_segment_size,
+                "kv_segment_size": segment,
                 "full_block_table_tensor": full_block_table_tensor,
             }
             if swa_kv_pos_offset is not None:
@@ -4709,6 +4962,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # (matches _build_attention_metadata where max_num_draft_tokens=0).
             decode_token_threshold=1,
             device=device,
+            # One prefill graph per segment: the window is built from this value.
+            kv_segment_size=kv_segment_size,
         )
 
         # Create dummy sampling params for warmup
@@ -5265,7 +5520,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         besides its latent cache. ``get_kv_spec`` reports neither, because a
         ``LayerSpec`` carries one ``num_kv_heads``/``head_size``/``dtype`` triple and
         both of these have the indexer's width, ``index_head_dim``, so the cache
-        manager never sees them and the runner allocates them here.
+        manager never sees them and the runner allocates them here. One set per
+        sparse bank ``bind_kv_cache`` kept, the draft head's layer included when the
+        root built the head; every other bank gets an empty mapping, so the list
+        pairs with the banks positionally.
 
         Both carry a leading request-slot axis because each holds one sequence's
         indexer state; sharing them across requests lets a second request read the
@@ -5794,11 +6052,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         active_mla_query_rows: int | None = None,
         padded_requests: int = 0,
     ) -> list[dict]:
-        """Build one kwargs mapping per layer, in stack order, holding that layer's own state.
+        """Build one kwargs mapping per layer, in spec order, holding that layer's own state.
 
         ``Glm5NextModel.forward`` splats these and refuses a count that disagrees with
         the stack, so this walks the banks ``bind_kv_cache`` kept (the spec's layer
-        order) and never names a layer.
+        order) and never names a layer. When the root built the draft head, its one
+        decoder layer's bank follows the stack's, so its mapping is the last one, built
+        by the same family branch as a trunk layer's; the root hands the stack the
+        others and the head that one.
 
         A sparse-attention (DSA) layer takes ``latent_cache``, ``pool_cache``,
         ``seq_lens``, ``start_position``, ``softmax_scale``, ``max_seq_len``,
@@ -6593,6 +6854,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # so captured and served graphs share a signature. Absent unless a dump
             # directory is configured.
             **self._layer_stream_kwargs(),
+            # Shadow draft (MTP stage A): the prefill leg's boundary id; {} with the knob off.
+            **self._glm5next_shadow_kwargs(
+                is_prefill=is_prefill,
+                request_ids=request_ids,
+                request_starts=request_starts,
+                request_tokens=request_tokens,
+                synthetic=synthetic_step,
+                device=input_ids.device,
+                sampling_rows=int(kwargs["sampling_positions"].shape[0]),
+            ),
         }
 
     def _glm5next_parallel_kwargs(self, device: torch.device | None = None) -> dict:
@@ -9134,6 +9405,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             bucket_name=neff_bucket_name,
         ).inc()
 
+        # Shadow draft (MTP stage A): the GLM root's draft ids ride second in its
+        # output; take them off before anything reads the output's shape.
+        model_output = self._glm5next_shadow_take_output(model_output)
         # Strip the per-layer stream dump from the output first: every branch below
         # expects the shape the model returns with no dump configured.
         model_output = self._take_layer_stream_dump(
@@ -9189,6 +9463,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # Move model_output_tensor (logits or sampled token ids) back to CPU
         if not self.use_async_scheduling:
             model_output_tensor = model_output_tensor.to("cpu")
+
+        # Shadow draft: hand this step to the scorer (no-op with the knob off). Under
+        # async scheduling the tensor is still a device future and is not read here;
+        # the step's output object scores it when it reads the ids back.
+        self._glm5next_shadow_observe(
+            model_output_tensor,
+            getattr(self, "_glm5next_shadow_last_drafts", None),
+            is_prefill=is_prefill,
+        )
 
         return model_output_tensor, aux_hidden_states, last_accepted_token
 
@@ -11349,4 +11632,349 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         return ("generate",)
 
     def ensure_kv_transfer_shutdown(self) -> None:
-        pass
+        # The worker's ``shutdown`` reaches the runner through this call; the
+        # shadow-draft log (MTP stage A) closes with it.
+        self._glm5next_shadow_shutdown()
+
+    # ------------------------------------------------------------------------
+    # GLM-5.3-Flash shadow draft (MTP stage A): bookkeeping, scoring, log.
+    #
+    # With ``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT=k`` the root returns ``k`` draft ids per
+    # request beside the sampled ids and never uses them. This block hands the prefill
+    # leg the id its last row pairs with (``shadow_boundary_ids``), peels the draft ids
+    # off the graph output, and scores them one step late against the tokens the trunk
+    # samples next (``Glm5NextShadowDraftScorer``), writing one JSONL record per draft
+    # step to ``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG`` on rank 0.
+    # ------------------------------------------------------------------------
+
+    def _glm5next_shadow_k(self) -> int:
+        """The number of shadow drafts per step for the model this runner serves.
+
+        ``0`` unless the served root built its draft head (``model.mtp``, stage A
+        contract C2: the GLM-5.3-Flash root builds it at construction exactly when
+        ``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT`` is above 0). The knob is GLM-specific and
+        this runner is not, so the hooks key on the head, never on the environment
+        alone: another model's tuple output is left untouched whatever the knob says.
+        The value comes from the knob's one reader, ``mtp.shadow_draft_k`` (contract
+        C1), which reads ``envs`` and bounds it.
+        """
+        if getattr(getattr(self, "model", None), "mtp", None) is None:
+            return 0
+        from vllm_neuron.model.glm5_next import mtp as mtp_module
+
+        return int(mtp_module.shadow_draft_k())
+
+    def _glm5next_shadow_log_path(self) -> str:
+        """``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG``: the JSONL path, "" = no log."""
+        return str(envs.VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG or "")
+
+    def _glm5next_shadow_rank(self) -> int:
+        """This worker's tensor-parallel rank, read on the host once.
+
+        Never from ``rank_tensor``: that is a device tensor, and reading it is a
+        device-to-host copy on the worker's main thread. A process with no
+        model-parallel group is rank 0.
+        """
+        cached = getattr(self, "_glm5next_shadow_rank_cache", None)
+        if cached is None:
+            from vllm.distributed.parallel_state import (
+                get_tp_group,
+                model_parallel_is_initialized,
+            )
+
+            cached = int(get_tp_group().rank_in_group) if model_parallel_is_initialized() else 0
+            self._glm5next_shadow_rank_cache = cached
+        return cached
+
+    def _glm5next_shadow_active(self) -> bool:
+        """Scoring runs on rank 0 only, when the knob is on and a log path is set.
+
+        Every rank samples the same ids and drafts (the draft ids are global, gathered
+        on device), so one log is the whole measurement; no log path means nothing to
+        measure and the per-step host work is skipped.
+        """
+        return (
+            self._glm5next_shadow_k() > 0
+            and bool(self._glm5next_shadow_log_path())
+            and self._glm5next_shadow_rank() == 0
+        )
+
+    def _glm5next_shadow_kwargs(
+        self,
+        *,
+        is_prefill: bool,
+        request_ids,
+        request_starts,
+        request_tokens,
+        synthetic: bool,
+        device,
+        sampling_rows: int,
+    ) -> dict:
+        """The root keyword the shadow draft needs this step, and the step's bookkeeping.
+
+        The prefill leg populates the draft layer at every row of the chunk with the id
+        that row's draft consumes: the next prompt token, which the graph has for every
+        row but the last. The last row's id is handed in as ``shadow_boundary_ids``, an
+        int32 tensor with one entry per SAMPLING ROW (``sampling_rows`` = the length of
+        ``sampling_positions``): the first token of the next chunk when more of the
+        prompt follows, or ``-1`` when this chunk is the prompt's last, in which case the
+        graph substitutes the token it samples. The input builder pads the sampling rows
+        to the request bucket by repeating the last real row's index, so the padding
+        entries repeat the last real request's id: duplicate indices then write one
+        value. The decode leg needs nothing: the sampled token is in the graph. The
+        step's request ids, leg and positions are stashed for the output side
+        (``_glm5next_shadow_observe``); a synthetic step (warmup, capture, the idle dummy
+        step) stashes nothing. Returns ``{}`` with the draft off, so the traced
+        signature is unchanged.
+
+        Raises:
+            ValueError: fewer sampling rows than requests (a geometry the translator
+                never produces; a boundary tensor could not cover every request).
+        """
+        self._glm5next_shadow_step = None
+        if self._glm5next_shadow_k() <= 0:
+            return {}
+        starts = [int(value) for value in request_starts]
+        counts = [int(value) for value in request_tokens]
+        rows = int(sampling_rows)
+        if rows < len(starts):
+            raise ValueError(
+                f"the shadow draft needs one boundary id per sampling row and this "
+                f"step has {rows} sampling row(s) for {len(starts)} request(s); a "
+                f"prefill samples at least one row per request"
+            )
+        requests = getattr(self, "requests", None) or {}
+        finals: list[bool] = []
+        boundaries: list[int] = []
+        for req_id, start, count in zip(request_ids, starts, counts):
+            end = start + count
+            state = None if synthetic or req_id is None else requests.get(req_id)
+            prompt_len = (
+                int(getattr(state, "num_prompt_tokens", 0)) if state is not None else 0
+            )
+            if state is not None and end < prompt_len:
+                finals.append(False)
+                boundaries.append(int(state.prompt_token_ids[end]))
+            else:
+                finals.append(True)
+                boundaries.append(-1)
+        if not synthetic:
+            self._glm5next_shadow_step = {
+                "request_ids": list(request_ids),
+                "is_prefill": bool(is_prefill),
+                "finals": finals,
+                # The trunk's last consumed position this step: the row the drafts
+                # (decode) or the final populate (prefill) stand on.
+                "positions": [start + count - 1 for start, count in zip(starts, counts)],
+            }
+        if not is_prefill:
+            return {}
+        # Padding rows repeat the last real row's index (``_pad_to_compiled_shapes``),
+        # so they repeat its id.
+        boundaries += [boundaries[-1]] * (rows - len(boundaries))
+        return {
+            "shadow_boundary_ids": torch.tensor(boundaries, dtype=torch.int32).to(device)
+        }
+
+    def _glm5next_shadow_take_output(self, model_output):
+        """Peel the draft ids off a shadow-drafting root's output and hold them.
+
+        With the knob on the root returns ``(sampled_or_logits, draft_ids, *streams)``;
+        every consumer downstream expects the shape it returned before, so the drafts
+        come off here, before the layer-stream dump and the sampling unpack.
+        """
+        self._glm5next_shadow_last_drafts = None
+        if (
+            self._glm5next_shadow_k() <= 0
+            or not isinstance(model_output, tuple)
+            or len(model_output) < 2
+        ):
+            return model_output
+        primary, drafts, *rest = model_output
+        self._glm5next_shadow_last_drafts = drafts
+        return primary if not rest else (primary, *rest)
+
+    def _glm5next_shadow_scorer(self) -> Glm5NextShadowDraftScorer:
+        scorer = getattr(self, "_glm5next_shadow_scorer_instance", None)
+        if scorer is None:
+            path = self._glm5next_shadow_log_path()
+            handle = open(path, "a", encoding="utf-8")  # noqa: SIM115 (lives with the runner)
+            self._glm5next_shadow_log_handle = handle
+
+            def sink(record: dict) -> None:
+                handle.write(json.dumps(record) + "\n")
+                handle.flush()
+
+            scorer = Glm5NextShadowDraftScorer(self._glm5next_shadow_k(), sink)
+            self._glm5next_shadow_scorer_instance = scorer
+            # Dispatch order (main thread) and scoring order (whichever thread reads a
+            # step's ids back); the lock covers the scorer and the ready steps.
+            self._glm5next_shadow_step_no = 0
+            self._glm5next_shadow_next_step = 0
+            self._glm5next_shadow_ready = {}
+            self._glm5next_shadow_lock = threading.Lock()
+        return scorer
+
+    def _glm5next_shadow_shutdown(self) -> None:
+        """Score what was read back, name what was not, retire every request, close the log.
+
+        Reached from the runner's shutdown, on the main thread. Nothing is read from the
+        device here: a step whose output no thread materialized (an abort mid-step; the
+        runtime may already be gone, and a read here would be the hang
+        ``_glm5next_shadow_observe`` describes) is dropped with a warning naming it, and
+        the steps behind it are scored in order, so no record that has its data is lost.
+        Every request alive across the gap retires at the gap with its pending drafts
+        scored over the tokens that arrived before it (its history lacks the lost tokens,
+        so nothing behind the gap is scored against them) and is tracked afresh behind it.
+        Every tracked request retires at the end with its pending drafts scored over the
+        tokens that arrived (``scored`` < k for the tail). Idempotent: a second call finds
+        no scorer and returns.
+        """
+        scorer = getattr(self, "_glm5next_shadow_scorer_instance", None)
+        if scorer is None:
+            return
+        with self._glm5next_shadow_lock:
+            self._glm5next_shadow_drain(scorer)
+            ready = self._glm5next_shadow_ready
+            dispatched = self._glm5next_shadow_step_no
+            for step_no in sorted(ready) + [dispatched]:
+                if step_no < self._glm5next_shadow_next_step:
+                    continue  # scored by the drain of an earlier held step
+                lost = list(range(self._glm5next_shadow_next_step, step_no))
+                if lost:
+                    logger.warning(
+                        "shadow draft: %s never read back before shutdown; the sampled ids "
+                        "and drafts of %s are dropped",
+                        ", ".join(f"step {number}" for number in lost),
+                        "that step" if len(lost) == 1 else "those steps",
+                    )
+                    # The histories lack the lost steps' tokens: what is pending is
+                    # scored over the tokens that arrived before the gap, and every
+                    # request starts afresh behind it, so no draft is scored against
+                    # a token that was not the one that followed it.
+                    scorer.retire_absent(set())
+                self._glm5next_shadow_next_step = step_no
+                if step_no in ready:
+                    self._glm5next_shadow_drain(scorer)
+            self._glm5next_shadow_inflight = None
+            scorer.close()
+            self._glm5next_shadow_scorer_instance = None
+        handle = getattr(self, "_glm5next_shadow_log_handle", None)
+        if handle is not None:
+            handle.close()
+
+    def _glm5next_shadow_observe(self, sampled, drafts, *, is_prefill: bool) -> None:
+        """Hand this step to the scorer without reading the device on the worker's main thread.
+
+        Under async scheduling ``sampled`` is a device future that the output thread reads
+        back inside ``AsyncNeuronModelRunnerOutput.get_output()``, and ``drafts`` is a
+        second output of the same execution. A read here would make this thread a second
+        reader of that future, and the runtime delivers a future's completion once: the
+        gate's knob-5 server hung at its first decode step exactly there (rank 0's main
+        thread, in ``execute_model``'s forward epilogue ``_execute_model_forward``; the
+        engine core timed out behind it). So the step is stashed -- its bookkeeping and
+        its unread draft tensor -- for the output object ``sample_tokens`` builds next to
+        claim (``_glm5next_shadow_claim``); ``get_output``
+        scores it from the ids it read back and reads the drafts there, after the sampled
+        ids, on the thread that materialized them. A synchronous runner moved ``sampled``
+        to the host already, and the step is scored at once. A step the kwargs hook did not
+        stash (a synthetic forward) observes nothing.
+        """
+        step = getattr(self, "_glm5next_shadow_step", None)
+        self._glm5next_shadow_step = None
+        self._glm5next_shadow_inflight = None
+        if step is None or sampled is None or not self._glm5next_shadow_active():
+            return
+        self._glm5next_shadow_scorer()
+        step_no = self._glm5next_shadow_step_no
+        self._glm5next_shadow_step_no = step_no + 1
+        record = Glm5NextShadowStep(step_no, step, drafts)
+        if getattr(self, "use_async_scheduling", False):
+            self._glm5next_shadow_inflight = record
+        else:
+            self._glm5next_shadow_commit(record, sampled)
+
+    def _glm5next_shadow_claim(self):
+        """The step just observed, for the async output ``sample_tokens`` is building.
+
+        Called once per output object, from its constructor, so a step rides with exactly
+        the output whose ids it is scored from. ``None`` with the knob off, for a synthetic
+        step, or on a synchronous runner (which scored the step already).
+        """
+        record = getattr(self, "_glm5next_shadow_inflight", None)
+        self._glm5next_shadow_inflight = None
+        return record
+
+    def _glm5next_shadow_commit(self, record: Glm5NextShadowStep, sampled) -> None:
+        """Score one step from its ids on the host, in dispatch order.
+
+        ``sampled`` is a host tensor (a synchronous runner), ``get_output``'s
+        ``list[list[int]]`` rows (one id per row: the shadow runs without speculative
+        decoding), or ``None`` for an intermediate prefill chunk drained without ids. The
+        draft tensor is read here, after the sampled ids of the same execution, on the
+        same thread. Outputs may be materialized out of dispatch order (the worker's
+        fallback path takes the newest first); a step whose predecessors are still in
+        flight waits in ``_glm5next_shadow_ready`` until they are scored.
+        """
+        ids = self._glm5next_shadow_ids(sampled)
+        rows = None
+        if ids is not None and record.drafts is not None:
+            drafts = record.drafts
+            draft_tensor = drafts.cpu() if torch.is_tensor(drafts) else torch.as_tensor(drafts)
+            rows = draft_tensor.reshape(draft_tensor.shape[0], -1).tolist()
+        lock = getattr(self, "_glm5next_shadow_lock", None)
+        if lock is None:
+            return
+        with lock:
+            scorer = getattr(self, "_glm5next_shadow_scorer_instance", None)
+            if scorer is None:
+                return  # shut down already: the log is closed
+            self._glm5next_shadow_ready[record.step_no] = (record.step, ids, rows)
+            self._glm5next_shadow_drain(scorer)
+
+    def _glm5next_shadow_ids(self, sampled):
+        """The sampled id per batch row from what was read back, or ``None`` to score nothing."""
+        if sampled is None:
+            return None
+        if torch.is_tensor(sampled):
+            if sampled.is_floating_point():
+                if not getattr(self, "_glm5next_shadow_warned_logits", False):
+                    self._glm5next_shadow_warned_logits = True
+                    logger.warning(
+                        "shadow draft: the graph returned logits, not sampled ids; scoring "
+                        "needs on-device sampling (VLLM_NEURON_GLM5NEXT_ON_DEVICE_SAMPLING=1) "
+                        "and is skipped"
+                    )
+                return None
+            return sampled.reshape(-1).tolist()
+        return [row[0] if row else None for row in sampled]
+
+    def _glm5next_shadow_drain(self, scorer: Glm5NextShadowDraftScorer) -> None:
+        """Score every ready step from the next expected one on; caller holds the lock."""
+        ready = self._glm5next_shadow_ready
+        while self._glm5next_shadow_next_step in ready:
+            step_no = self._glm5next_shadow_next_step
+            step, ids, rows = ready.pop(step_no)
+            self._glm5next_shadow_next_step = step_no + 1
+            present = {req_id for req_id in step["request_ids"] if req_id is not None}
+            if ids is not None:
+                for row, (req_id, final, position) in enumerate(
+                    zip(step["request_ids"], step["finals"], step["positions"])
+                ):
+                    if req_id is None or row >= len(ids) or ids[row] is None:
+                        continue
+                    if step["is_prefill"] and not final:
+                        # An intermediate chunk's sampled id is not a token of the sequence.
+                        continue
+                    candidate = None
+                    if rows is not None and row < len(rows) and any(value >= 0 for value in rows[row]):
+                        candidate = rows[row]
+                    scorer.observe(
+                        req_id,
+                        step=step_no,
+                        position=position,
+                        sampled=ids[row],
+                        drafts=candidate,
+                        row=row,
+                    )
+            scorer.retire_absent(present)

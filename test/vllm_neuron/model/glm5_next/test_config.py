@@ -289,7 +289,7 @@ QUANT_CONFIG_KEYS = 4
 # How many of the published text_config keys ``Glm5NextTextConfig`` does not declare. The
 # derivation below computes the set; this pins its size beside it, so a population that moves
 # for an undeclared reason fails even though the derivation would follow it.
-UNMODELLED_TEXT_CONFIG_KEYS = 18
+UNMODELLED_TEXT_CONFIG_KEYS = 17
 
 # The indexer's dials. They are declared in the published text_config and modelled as dataclass
 # fields, so none of them may appear in the drop log. Asserted by name because a count cannot

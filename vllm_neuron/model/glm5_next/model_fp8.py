@@ -25,6 +25,10 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
+from vllm_neuron.model.glm5_next.collective_policy import (
+    RowParallelSite,
+    reduce_row_parallel,
+)
 from vllm_neuron.model.glm5_next.config import (
     DSA_LAYER_TYPE,
     KDA_LAYER_TYPE,
@@ -260,6 +264,26 @@ def _resolve_tp_group() -> GroupCoordinator | None:
 
     group = get_tp_group()
     return group if group.world_size > 1 else None
+
+
+def _tp_group_if_initialized() -> GroupCoordinator | None:
+    """:func:`_resolve_tp_group`, or None when the world is distributed but vllm's
+    tensor-parallel group has not been initialized.
+
+    Load time may run without one: a checkpoint loaded out of process for one rank of
+    a larger world (the shard tests) has a world size and a rank but no group. The
+    probe is vllm's own ``model_parallel_is_initialized``, consulted only at a world
+    size above one, so a single-rank process never imports vllm here and a test that
+    substitutes :func:`_resolve_tp_group` reaches its substitute. The forward's
+    row-parallel sites call :func:`_resolve_tp_group` directly and still refuse to
+    reduce without a group.
+    """
+    if _resolve_world_size() > 1:
+        from vllm.distributed.parallel_state import model_parallel_is_initialized
+
+        if not model_parallel_is_initialized():
+            return None
+    return _resolve_tp_group()
 
 
 # --------------------------------------------------------------------------- #
@@ -844,7 +868,9 @@ class Glm5NextHyperConnection(nn.Module):
             text_config: carries ``hc_mult``, ``hc_sinkhorn_iters``, ``hc_eps``
                 and ``rms_norm_eps``.
             neuron_config: framework overrides. ``mhc_sinkhorn_iters`` and
-                ``mhc_eps`` win when not ``None``.
+                ``mhc_eps`` win when not ``None``. The runner's
+                ``num_seqs_buckets`` and ``num_batched_tokens_buckets`` tell this
+                layer's two glue sites the step's phase (``max_decode_rows``).
             post_mult_value: the multiplier on the post gate. ``2.0`` is the
                 target model's own number -- it computes
                 ``post = 2 * sigmoid(post_w * post_scale + post_b)``, with the
@@ -867,6 +893,9 @@ class Glm5NextHyperConnection(nn.Module):
         Raises:
             Glm5NextHyperConnectionError: on a non-positive ``hc_mult``,
                 ``hidden_size`` or iteration count.
+            ValueError: when ``VLLM_NEURON_GLUE_FUSED`` routes an mHC kernel by
+                phase at the row count of a prefill bucket that a decode batch can
+                also have (``functional.glue.require_rows_tell_phase``).
         """
         super().__init__()
         hc_mult = int(text_config.hc_mult)
@@ -905,6 +934,26 @@ class Glm5NextHyperConnection(nn.Module):
         self.rms_eps = float(text_config.rms_norm_eps)
         self.post_mult_value = float(post_mult_value)
 
+        # The step's phase for the glue switch (``VLLM_NEURON_GLUE_FUSED``,
+        # functional/glue). This layer sees only ``[T, S, H]`` streams, so it tells
+        # the phases apart by row count. The runner pads a decode batch to one of
+        # ``num_seqs_buckets``, one row per request (its layer carriers refuse a
+        # decode step of more tokens than requests), so a call of more rows than the
+        # largest bucket is a prefill chunk. A prefill bucket that a decode batch can also
+        # have is refused here when the switch routes it by phase. None when the
+        # layer is built without the runner's buckets; then only a rule without a
+        # phase selects a kernel here.
+        decode_buckets = getattr(neuron_config, "num_seqs_buckets", None)
+        self.max_decode_rows = max(decode_buckets) if decode_buckets else None
+        if self.max_decode_rows is not None:
+            from vllm_neuron.functional.glue import require_rows_tell_phase
+
+            require_rows_tell_phase(
+                ("mhc_pre", "mhc_post"),
+                self.max_decode_rows,
+                getattr(neuron_config, "num_batched_tokens_buckets", None) or (),
+            )
+
         # ``hc_mult3`` is the base's own name for the projection's output width:
         # ``hc_mult`` pre weights + ``hc_mult`` post weights + ``hc_mult ** 2``
         # mixing weights, in that order, which is the order the three heads are
@@ -934,6 +983,12 @@ class Glm5NextHyperConnection(nn.Module):
         self.hc_base = nn.Parameter(
             torch.zeros(self.hc_mult3, dtype=torch.float32), requires_grad=False
         )
+
+    def _glue_phase(self, tokens: int) -> str | None:
+        """The glue switch's phase for a call of ``tokens`` rows (``max_decode_rows``)."""
+        if self.max_decode_rows is None:
+            return None
+        return "decode" if tokens <= self.max_decode_rows else "prefill"
 
     # ── mHC pre: the folded input, and one Sinkhorn call ──────────────────
     def mhc_pre(
@@ -967,9 +1022,48 @@ class Glm5NextHyperConnection(nn.Module):
                 torch path, so an absent route raises rather than falling back.
                 Propagated, never caught.
         """
+        post_mix, comb_mix, layer_input, _ = self.mhc_pre_normed(residual)
+        return post_mix, comb_mix, layer_input
+
+    def mhc_pre_normed(
+        self,
+        residual: torch.Tensor,
+        norm_gain: torch.Tensor | None = None,
+        norm_eps: float | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """:meth:`mhc_pre`, and the sub-block's input RMSNorm where the kernel has it.
+
+        Args:
+            residual: as :meth:`mhc_pre`.
+            norm_gain: ``[H]`` gain of the RMSNorm the sub-block applies to
+                ``layer_input`` first, or None.
+            norm_eps: that norm's epsilon, with ``norm_gain``.
+
+        Returns:
+            ``(post_mix, comb_mix, layer_input, normed)``: :meth:`mhc_pre`'s three,
+            and ``layer_input * rsqrt(mean(layer_input**2) + norm_eps) * norm_gain``
+            in ``layer_input``'s dtype when the fused kernel serves this call
+            (``functional/glue/mhc_pre.py``). Otherwise ``normed`` is None, and the
+            sub-block normalises ``layer_input`` itself.
+
+        Raises:
+            As :meth:`mhc_pre`.
+        """
         from vllm_neuron.functional.mhc.sinkhorn import sinkhorn_normalise_blocks
 
         tokens, streams, hidden = self._require_streams(residual)
+
+        from vllm_neuron.functional.glue import mhc_pre as glue_mhc_pre
+
+        if glue_mhc_pre.mhc_pre_admits(residual, self.fn, self.hc_scale, self.hc_base,
+                                       phase=self._glue_phase(tokens),
+                                       norm_gain=norm_gain):
+            post_mix, comb_start, layer_input, normed = glue_mhc_pre.mhc_pre_fused(
+                residual, self.fn, self.hc_scale, self.hc_base, rms_eps=self.rms_eps,
+                hc_eps=self.hc_eps, post_mult=self.post_mult_value,
+                norm_gain=norm_gain, norm_eps=norm_eps)
+            comb_mix = sinkhorn_normalise_blocks(comb_start, iters=self.sinkhorn_iters)
+            return post_mix, comb_mix, layer_input, normed
 
         flat = residual.reshape(tokens, streams * hidden).to(torch.float32)
         mixes = flat @ self.fn.to(torch.float32).t()
@@ -1034,6 +1128,7 @@ class Glm5NextHyperConnection(nn.Module):
             post_mix.reshape(tokens, streams, 1),
             comb_mix,
             layer_input.to(residual.dtype),
+            None,
         )
 
     # ── mHC post: one combine call ────────────────────────────────────────
@@ -1068,19 +1163,30 @@ class Glm5NextHyperConnection(nn.Module):
             hyper_connection_combine,
         )
 
+        from vllm_neuron.functional.glue import glue_selected
+
         # Argument names and order are the kernel's, which are the base's, so this
-        # is a call rather than a translation. The kernel takes fp32 and computes
-        # in fp32; only the return is cast back to the carrier's dtype.
+        # is a call rather than a translation. The kernel computes in fp32 and takes
+        # bf16 ``x`` and streams as they are (functional/glue); where the glue switch
+        # does not select ``mhc_post`` for this call they are widened first, as on the
+        # torch route. Same values either way.
+        rows = int(residual.shape[0])
+        wide = not glue_selected("mhc_post", rows, self._glue_phase(rows))
         mixed = hyper_connection_combine(
-            x=x.to(torch.float32),
-            residual=residual.to(torch.float32),
+            x=x.to(torch.float32) if wide else x,
+            residual=residual.to(torch.float32) if wide else residual,
             post_layer_mix=post_layer_mix.to(torch.float32),
             comb_res_mix=comb_res_mix.to(torch.float32),
         )
         return mixed.to(residual.dtype)
 
     # ── one layer call ────────────────────────────────────────────────────
-    def forward(self, residual: torch.Tensor, sublayer: object) -> torch.Tensor:
+    def forward(
+        self,
+        residual: torch.Tensor,
+        sublayer: object,
+        norm: tuple[torch.Tensor | None, float] | None = None,
+    ) -> torch.Tensor:
         """One mHC layer call: pre, then the sub-block, then post.
 
         Args:
@@ -1088,6 +1194,10 @@ class Glm5NextHyperConnection(nn.Module):
             sublayer: the wrapped sub-block, a callable ``[T, H] -> [T, H]``.
                 Annotated ``object`` rather than ``Callable`` because every
                 import in this section is function-local.
+            norm: ``(gain, eps)`` of the RMSNorm the sub-block applies to its input
+                first, or None. With it, ``sublayer`` is called as
+                ``sublayer(layer_input, normed)``, ``normed`` from
+                :meth:`mhc_pre_normed` (None when the sub-block must normalise).
 
         Returns:
             ``[T, S, H]`` in the streams' own dtype -- the re-mixed streams,
@@ -1102,8 +1212,9 @@ class Glm5NextHyperConnection(nn.Module):
                 f"sublayer must be a callable [T, H] -> [T, H], got "
                 f"{type(sublayer).__name__}"
             )
-        post_mix, comb_mix, layer_input = self.mhc_pre(residual)
-        x = sublayer(layer_input)
+        gain, eps = (None, None) if norm is None else norm
+        post_mix, comb_mix, layer_input, normed = self.mhc_pre_normed(residual, gain, eps)
+        x = sublayer(layer_input) if norm is None else sublayer(layer_input, normed)
         if not isinstance(x, torch.Tensor) or tuple(x.shape) != tuple(
             layer_input.shape
         ):
@@ -1341,6 +1452,27 @@ class Glm5NextRoutedExperts(nn.Module):
             hidden_states, self.router_weight, int(text_config.num_experts_per_tok)
         ):
             return router_decode.noaux_tc_router_decode(
+                hidden_states,
+                gamma,
+                self.router_weight,
+                self.router_bias,
+                top_k=int(text_config.num_experts_per_tok),
+                eps=eps,
+                norm_topk_prob=bool(text_config.norm_topk_prob),
+                routed_scaling_factor=float(text_config.routed_scaling_factor),
+            )
+
+        # Prefill (T > 64): the router's RMSNorm in XLA, beside the experts' norm on
+        # the same pre-norm rows, so the mHC collapse feeding both fuses instead of
+        # running as a per-token matmul loop; then the router GEMM and noaux_tc top-8
+        # in one launch (router_prefill.py). Same three outputs, same seam counters;
+        # any call it declines keeps the fused router below.
+        from vllm_neuron.functional.moe import router_prefill
+
+        if router_prefill.prefill_route_admits(
+            hidden_states, self.router_weight, int(text_config.num_experts_per_tok)
+        ):
+            return router_prefill.noaux_tc_router_prefill(
                 hidden_states,
                 gamma,
                 self.router_weight,
@@ -3452,24 +3584,15 @@ class Glm5NextKDAAttention(nn.Module):
                 f"for each row of hidden_states"
             )
 
-        x = hidden_states.to(torch.float32)
+        from vllm_neuron.functional.glue.kda_projections import kda_projections
 
-        def project(weight: torch.Tensor) -> torch.Tensor:
-            return x @ weight.to(torch.float32).t()
-
-        q_in = project(self.q_proj_weight)
-        k_in = project(self.k_proj_weight)
-        v_in = project(self.v_proj_weight)
-        raw_beta = project(self.b_proj_weight)
-        # Both gates are low-rank: a bottleneck projection, then an expansion
-        # back to the head width. The bottleneck width is read from the weights
-        # rather than from the config, because the config declares no such field.
-        raw_gate = (x @ self.f_a_proj_weight.to(torch.float32).t()) @ (
-            self.f_b_proj_weight.to(torch.float32).t()
-        )
-        out_gate = (x @ self.g_a_proj_weight.to(torch.float32).t()) @ (
-            self.g_b_proj_weight.to(torch.float32).t()
-        )
+        # The six input projections (both gates low-rank: a bottleneck, then an
+        # expansion), on the fused kernel or the torch expressions. ``phase``
+        # selects the glue kernels here and at the output projection
+        # (``VLLM_NEURON_GLUE_FUSED``, functional/glue).
+        phase = "prefill" if is_prefill else "decode"
+        q_in, k_in, v_in, raw_gate, raw_beta, out_gate = kda_projections(
+            hidden_states, self, phase=phase)
 
         # A sequence that has computed nothing enters with a zero state, and this is
         # the one predicate that says so. A sequence at position 0 carries no
@@ -3517,7 +3640,7 @@ class Glm5NextKDAAttention(nn.Module):
             )
             conv_state.copy_(fused.conv_state[0])
             recurrent_state.copy_(fused.recurrent_state[0])
-            return self._gated_output(fused.core, out_gate, hidden_states)
+            return self._gated_output(fused.core, out_gate, hidden_states, phase=phase)
 
         # --- 1: the short convolution, one call for q, k and v ---------------
         # The three streams are convolved together as one channel block, which is
@@ -3672,7 +3795,7 @@ class Glm5NextKDAAttention(nn.Module):
 
             recurrent_state[h] = state.to(recurrent_state.dtype)
 
-        return self._gated_output(core, out_gate, hidden_states)
+        return self._gated_output(core, out_gate, hidden_states, phase=phase)
 
     def _fused_decode_requests(
         self,
@@ -3756,23 +3879,16 @@ class Glm5NextKDAAttention(nn.Module):
                     for one in start_position
                 ]
             )
-        x = hidden_states.to(torch.float32)
+        from vllm_neuron.functional.glue.kda_projections import kda_projections
 
-        def project(weight: torch.Tensor) -> torch.Tensor:
-            return x @ weight.to(torch.float32).t()
-
-        raw_gate = (x @ self.f_a_proj_weight.to(torch.float32).t()) @ (
-            self.f_b_proj_weight.to(torch.float32).t()
-        )
-        out_gate = (x @ self.g_a_proj_weight.to(torch.float32).t()) @ (
-            self.g_b_proj_weight.to(torch.float32).t()
-        )
+        q_in, k_in, v_in, raw_gate, raw_beta, out_gate = kda_projections(
+            hidden_states, self, phase="decode")
         fused = kda_fused_decode(
-            project(self.q_proj_weight),
-            project(self.k_proj_weight),
-            project(self.v_proj_weight),
+            q_in,
+            k_in,
+            v_in,
             raw_gate,
-            project(self.b_proj_weight),
+            raw_beta,
             conv_state=(
                 torch.stack(convs) if state_slots is None
                 else gather_bank_rows(convs, state_slots)
@@ -3799,41 +3915,35 @@ class Glm5NextKDAAttention(nn.Module):
         else:
             scatter_bank_rows(convs, state_slots, fused.conv_state)
             scatter_bank_rows(recurrents, state_slots, fused.recurrent_state)
-        return self._gated_output(fused.core, out_gate, hidden_states)
+        return self._gated_output(fused.core, out_gate, hidden_states, phase="decode")
 
     def _gated_output(
-        self, core: torch.Tensor, out_gate: torch.Tensor, hidden_states: torch.Tensor
+        self, core: torch.Tensor, out_gate: torch.Tensor, hidden_states: torch.Tensor,
+        *, phase: str,
     ) -> torch.Tensor:
-        """The attention output from ``core`` (``[tokens, H*K]`` float32)."""
-        tokens = int(core.shape[0])
-        heads = int(self.num_kv_heads_per_rank)
-        kdim = int(self.head_dim)
-        width = heads * kdim
+        """The attention output from ``core`` (``[tokens, H*K]`` float32).
+
+        ``phase`` (``"prefill"`` or ``"decode"``) is the step's, for the glue switch.
+        """
+        from vllm_neuron.functional.glue.kda_output import kda_gated_projection
+
         # --- gated output norm, then the output projection -------------------
         # ``rmsnorm(core) * sigmoid(out_gate)``, normalised over the head extent
         # because the norm gain is one value per key channel. The reference
         # builds this half as a gated RMSNorm whose activation is sigmoid
         # (``kimi_gdn_linear_attn.py``), which is why the raw gate is passed
-        # through a sigmoid here and not through a silu.
-        shaped = core.reshape(tokens, heads, kdim)
-        variance = shaped.pow(2).mean(dim=-1, keepdim=True)
-        shaped = shaped * torch.rsqrt(variance + self.rms_norm_eps)
-        shaped = shaped * self.o_norm_weight.to(torch.float32).reshape(1, 1, kdim)
-        shaped = shaped * torch.sigmoid(
-            out_gate.reshape(tokens, heads, kdim)
-        )
-        attn_out = shaped.reshape(tokens, width) @ (
-            self.o_proj_weight.to(torch.float32).t()
-        )
+        # through a sigmoid here and not through a silu. On the fused kernel or
+        # the torch expressions (functional/glue/kda_output.py).
+        attn_out = kda_gated_projection(core, out_gate, self, phase=phase)
         # ``o_proj_weight`` is row-parallel, so this is one rank's partial sum.
-        # Reduce it in fp32, before the cast below: partials add at the width they
-        # were computed in, and reducing after the cast would round each rank's
-        # fraction to the caller's dtype and add the rounded parts instead of
-        # rounding the whole. In place is safe -- ``attn_out`` is a fresh matmul
-        # result, not a view of a cached weight or of the caller's residual.
-        group = _resolve_tp_group()
-        if group is not None:
-            group.all_reduce(attn_out)
+        # Reduce it before the cast below, in the wire dtype ``collective_policy``
+        # names: fp32 as built, where partials add at the width they were computed
+        # in; ``VLLM_NEURON_TP_ALLREDUCE_DTYPE=bf16`` rounds each rank's partial to
+        # bfloat16 first, to halve the bytes. In place is safe -- ``attn_out`` is a
+        # fresh matmul result, not a view of a cached weight or of the residual.
+        attn_out = reduce_row_parallel(
+            attn_out, site=RowParallelSite.KDA_O_PROJ, group=_resolve_tp_group()
+        )
         return attn_out.to(hidden_states.dtype)
 
 
@@ -4050,6 +4160,15 @@ class Glm5NextDSAIndexer(nn.Module):
     #: projection weights, which carry no scale grid. The load releases these.
     RELEASED_AFTER_PREP: tuple[str, ...] = tuple(PROJECTION_PARAMETERS.values())
 
+    #: Attribute this rank's index in the tensor-parallel group is bound on, as a ``[1]``
+    #: int32 tensor beside the prepared weights, or None at one rank. The query-sharded
+    #: prefill selection (``functional/dsa/indexer_shard.py``) reads it. A tensor and not a
+    #: python int because one prefill graph serves every rank: a compile lifts a module's
+    #: tensor attribute as a graph input, as it does the prepared weights, so each rank
+    #: runs its own rows; an int would be folded into the graph as rank 0's. A plain
+    #: attribute and not a buffer, for the reason :data:`PREPARED_WEIGHTS_ATTR` gives.
+    SHARD_RANK_ATTR = "_indexer_shard_rank"
+
     def __init__(self, text_config: Glm5NextTextConfig) -> None:
         super().__init__()
         # The dials this class computes with, each read from the config rather than
@@ -4164,7 +4283,41 @@ class Glm5NextDSAIndexer(nn.Module):
         setattr(self, self.LOWP_WEIGHTS_ATTR, _lowp_projection_operands(
             {name: getattr(self, self.PROJECTION_PARAMETERS[name])
              for name, _, _ in self.projection_widths()}, {}))
+        self._bind_shard_rank(prepared["wq_b"].device)
         return len(prepared)
+
+    def _bind_shard_rank(self, device: torch.device) -> None:
+        """Bind this rank's index in the tensor-parallel group, or None at one rank.
+
+        Bound here because preparation runs once per rank at load, outside any trace, on
+        the device the forward reads its weights from. The index is ``rank_in_group`` of
+        the same group the selection gathers over, so the rows a rank takes are the rows
+        the gather's group order puts back in place. A load without a tensor-parallel
+        group (one rank of a larger world, loaded out of process) binds the rank the
+        loader sliced this rank's weights with, :func:`_resolve_rank`, so the indexer's
+        row shard stays aligned with the weight shards; an index outside the world is
+        refused by name.
+        """
+        group = _tp_group_if_initialized()
+        world = _resolve_world_size()
+        if group is not None:
+            index = int(group.rank_in_group)
+        elif world > 1:
+            index = int(_resolve_rank())
+            if not 0 <= index < world:
+                raise Glm5NextDSAIndexerError(
+                    f"no tensor-parallel group is initialized and the loader's rank "
+                    f"{index} lies outside its world of {world}, so the indexer's row "
+                    f"shard cannot be aligned with the weight shards"
+                )
+        else:
+            setattr(self, self.SHARD_RANK_ATTR, None)
+            return
+        setattr(
+            self,
+            self.SHARD_RANK_ATTR,
+            torch.full((1,), index, dtype=torch.int32, device=device),
+        )
 
     def _lowp_operand(self, name: str):
         """``(weight, scale)`` for the low-precision route, or None for the fp32 one."""
@@ -4885,6 +5038,47 @@ class Glm5NextDSAIndexer(nn.Module):
         sentinelised = dsa_causal_sentinel(values, pool_ids, int(bounded.shape[1]))
         return self._canonical_sentinel_order(sentinelised)
 
+    def _select_pool_ids(
+        self,
+        query: torch.Tensor,
+        candidate_keys: torch.Tensor,
+        weights: torch.Tensor,
+        seq_lens: torch.Tensor,
+        *,
+        shardable: bool,
+    ) -> torch.Tensor:
+        """``[T, select_k]`` int32 pool ids for a selecting call: replicated or row-sharded.
+
+        Every row runs :meth:`score_pools` then :meth:`select_bounded_pools` against the
+        whole candidate axis. Sharded when the call may shard (the prefill leg of
+        :meth:`forward`), a rank operand is bound, a tensor-parallel group exists and
+        :func:`~vllm_neuron.functional.dsa.indexer_shard.shard_degree` says the chunk
+        spans more than one row tile with the switch on: each rank then runs that chain on
+        its own rows (:func:`~vllm_neuron.functional.dsa.indexer_shard.select_local_rows`)
+        and one all-gather returns every row to every rank. Otherwise every rank selects
+        every row, as built.
+        """
+        from vllm_neuron.functional.dsa.indexer_shard import (
+            gather_rows,
+            row_shard,
+            select_local_rows,
+            shard_degree,
+        )
+
+        def select(rows_query, rows_weights, rows_seq_lens):
+            scores = self.score_pools(rows_query, candidate_keys, rows_weights)
+            return self.select_bounded_pools(scores, rows_seq_lens)
+
+        tokens = int(query.shape[0])
+        rank = getattr(self, self.SHARD_RANK_ATTR, None)
+        group = _resolve_tp_group() if shardable and rank is not None else None
+        degree = 1 if group is None else shard_degree(tokens, int(group.world_size))
+        if degree <= 1:
+            return select(query, weights, seq_lens)
+        shard = row_shard(tokens, degree)
+        local = select_local_rows(select, query, weights, seq_lens, shard, rank)
+        return gather_rows(local, group, shard)
+
     @staticmethod
     def _canonical_sentinel_order(pool_ids: torch.Tensor) -> torch.Tensor:
         """Sentinels to the trailing columns; real ids keep their relative order.
@@ -5207,7 +5401,10 @@ class Glm5NextDSAIndexer(nn.Module):
         it: shape validation, index arithmetic for the gather and for the two write
         addresses, one ``index_copy_`` per leg, one ring copy on the decode leg, and
         one ring copy on the prefill leg -- masked over the whole ring when the
-        chunk's end arrives as a tensor. No torch path computes an indexer value.
+        chunk's end arrives as a tensor. When the prefill selection shards, an NKI row
+        cut (``shard_rows``) takes this rank's rows of each operand and one int32
+        all-gather returns the pool ids (:meth:`_select_pool_ids`). No torch path
+        computes an indexer value.
         """
         from vllm_neuron.functional.dsa.decode_tail_update import decode_pool_address
 
@@ -5306,9 +5503,12 @@ class Glm5NextDSAIndexer(nn.Module):
             return self._bypass_indices(seq_lens)
 
         candidate_keys = self._gather_candidates(pool_cache, candidates, int(page_size))
-        scores = self.score_pools(query, candidate_keys, weights)
-        # The causal bound and the sentinel, at one site.
-        pool_ids = self.select_bounded_pools(scores, seq_lens)
+        # The score, the causal bound and the sentinel, at one site. The prefill leg's
+        # rows may divide over the ranks (``_select_pool_ids``); the expansion below runs
+        # on every row either way, with each row's own length.
+        pool_ids = self._select_pool_ids(
+            query, candidate_keys, weights, seq_lens, shardable=not is_decode
+        )
         return self.expand_indices(pool_ids, seq_lens)
 
     def forward_requests(
@@ -5631,6 +5831,31 @@ class Glm5NextMLADecodeError(ValueError):
     be asserted without being measured. The kernels this path calls raise their own
     named errors for the same reason.
     """
+
+
+@dataclass
+class IndexShare:
+    """One speculative step's indexer selection, shared across its draft iterations.
+
+    The carrier for ``index_share_for_mtp_iteration`` (config.py; upstream's
+    ``skip_topk``). The draft head (``mtp.py``) hands one instance to every
+    iteration of one ``draft_tokens`` call; the trunk's own decode step passes none.
+
+    * ``topk_indices is None`` -- run the indexer chain (ring step, pooled-store
+      write, scores, selection) and, when the step selects, publish the result here;
+    * ``topk_indices`` set -- reuse it and skip the chain whole: no ring step, no
+      pooled-store write, no scores.
+
+    ``topk_indices`` is what :meth:`Glm5NextDSAIndexer.forward_requests` returns for
+    a selecting step: ``[B, width]`` int32 row indices into the request's latent
+    window (``-1`` = masked), one row per request, on the step's device. A step
+    whose selection is a no-op (the bypass regime,
+    ``decode_bypass.selection_is_a_no_op``) returns ``None`` and stores nothing, so
+    every iteration of such a step runs the write stage and the carrier changes
+    nothing there.
+    """
+
+    topk_indices: torch.Tensor | None = None
 
 
 class Glm5NextMLAAttention(nn.Module):
@@ -6284,7 +6509,9 @@ class Glm5NextMLAAttention(nn.Module):
         aliasing here because ``mla_projection`` returns a fresh tensor rather than a
         view of a cached weight. And the sum happens before the cast back to the
         input dtype, because rounding each rank's fraction to bfloat16 first and
-        adding after would round the parts instead of the whole.
+        adding after would round the parts instead of the whole. That holds at the
+        default fp32 wire; ``VLLM_NEURON_TP_ALLREDUCE_DTYPE=bf16`` makes the trade on
+        purpose, for half the bytes (``collective_policy``).
         """
         from vllm_neuron.functional.attention.mla_projections import (
             mla_projection_prepared,
@@ -6310,11 +6537,12 @@ class Glm5NextMLAAttention(nn.Module):
             # through its argument, so a tap holding ``projected`` would come back
             # holding the sum instead of this rank's share.
             collector += [x.to(torch.float32), projected.clone()]
-        # Sum this rank's partial with every other rank's. ``None`` means one
-        # rank, where the partial already is the whole sum.
-        group = _resolve_tp_group()
-        if group is not None:
-            group.all_reduce(projected)
+        # Sum this rank's partial with every other rank's, in the wire dtype
+        # ``collective_policy`` names (fp32 as built). ``None`` means one rank, where
+        # the partial already is the whole sum.
+        projected = reduce_row_parallel(
+            projected, site=RowParallelSite.MLA_O_PROJ, group=_resolve_tp_group()
+        )
         whole = projected.to(attn_out.dtype)
         if collector is not None:
             collector.append(whole)
@@ -6356,12 +6584,18 @@ class Glm5NextMLAAttention(nn.Module):
         latent_slots: torch.Tensor,
         page_size: int,
         dense: bool = False,
+        dense_window_seq_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """One layer's MLA attention. Returns ``[tokens, hidden_size]``.
 
         ``dense=True`` is a decode step whose selection keeps every token: the
         causal prefix ``0 .. start_position`` is attended directly by
         ``mla_decode_attention`` and ``topk_indices`` is not read (pass None).
+
+        ``dense_window_seq_lens`` is the prefill chunk's form of the same regime
+        (``dsa_dense_window.py``): each query row ``i`` attends window rows
+        ``0 .. seq_lens[i] - 1`` through ``mla_dense_window_attention`` and
+        ``topk_indices`` is not read (pass None).
 
         ``hidden_states`` is ``[tokens, hidden_size]``: a prefill passes all its
         tokens at once and a decode step passes one. ``latent_cache`` is the whole
@@ -6441,7 +6675,9 @@ class Glm5NextMLAAttention(nn.Module):
                     f"active_mla_query_rows must be a static integer in [1, {tokens}]; "
                     f"got {active_mla_query_rows!r}"
                 )
-            if topk_indices.ndim != 2 or topk_indices.shape[0] != tokens:
+            if dense_window_seq_lens is None and (
+                topk_indices.ndim != 2 or topk_indices.shape[0] != tokens
+            ):
                 raise Glm5NextMLADecodeError(
                     f"topk_indices must have {tokens} query rows before the active "
                     f"prefix is selected; got {tuple(topk_indices.shape)}"
@@ -6581,6 +6817,16 @@ class Glm5NextMLAAttention(nn.Module):
             attended = mla_decode_attention(
                 q_lift, c_kv, block_table_row.reshape(1, -1), start.reshape(1),
                 written, softmax_scale, page,
+            )
+        elif dense_window_seq_lens is not None:
+            # The prefill chunk whose selection keeps every token: the window's causal
+            # prefix, densely. Same operands and output layout as the sparse call.
+            from vllm_neuron.model.glm5_next.dsa_dense_window import attend_dense_window
+
+            attended = attend_dense_window(
+                q_lift, c_kv, dense_window_seq_lens, softmax_scale,
+                block_table_row=block_table_row, written=written, write_offset=at,
+                page_size=page, active_rows=active_mla_query_rows,
             )
         elif active_mla_query_rows is None or active_mla_query_rows == tokens:
             attended = mla_sparse_attention(
@@ -6765,6 +7011,7 @@ class Glm5NextMLAAttention(nn.Module):
         position: torch.Tensor,
         collector: list[torch.Tensor] | None,
         state_slots: torch.Tensor | None = None,
+        index_share: IndexShare | None = None,
     ) -> torch.Tensor:
         """:meth:`forward` for a decode step of ``len(tail)`` requests, one row each.
 
@@ -6779,6 +7026,23 @@ class Glm5NextMLAAttention(nn.Module):
         every request in one batched call. A one-request decode step is the
         ``batch = 1`` case of this method (see :meth:`forward`); there :meth:`attend`
         serves ``batch_size`` 1 with its one-request attention.
+
+        ``index_share`` is the draft head's :class:`IndexShare` carrier for
+        ``index_share_for_mtp_iteration`` (config.py; upstream's ``skip_topk``).
+        Two regimes:
+
+        * selecting (the window is wider than the candidate axis): the first
+          iteration of one speculative step runs the chain and stores its
+          ``topk_indices`` on the carrier; every later iteration of that step reads
+          them and skips the whole chain -- no ring step, no pooled-store write, no
+          scores -- attending the first iteration's selection plus its own row,
+          which :meth:`attend` stands in at the position;
+        * bypass (the selection is a no-op): the chain returns ``None``, nothing is
+          stored, and every iteration runs the write stage; the carrier changes
+          nothing.
+
+        ``None`` is the trunk's own decode step; it is byte-identical to a carrier
+        with nothing stored, as both run the chain.
         """
         from vllm_neuron.functional.dsa.decode_bypass import (
             selection_bound,
@@ -6821,24 +7085,34 @@ class Glm5NextMLAAttention(nn.Module):
         dense = selection_is_a_no_op(
             bound, self.indexer.index_topk, self.indexer.index_kpool
         )
-        q_latent = self.project_query_latent(normed_hidden_states)
-        projected = self.indexer.project_stage(
-            normed_hidden_states, q_latent, query_side=not dense
-        )
-        # Every request's ring step, write and selection in one indexer pass: one
-        # launch per stage for the whole batch, each request on its own views.
-        topk_indices = self.indexer.forward_requests(
-            normed_hidden_states,
-            q_latent,
-            stores,
-            rings,
-            state_slots,
-            seq_lens,
-            position,
-            max_seq_len=bound if dense else int(max_seq_len),
-            indices_wanted=not dense,
-            projected=projected,
-        )
+        shared = None if index_share is None else index_share.topk_indices
+        if shared is not None:
+            # A later draft iteration of the same speculative step: the selection is
+            # the first iteration's, and the indexer chain is skipped whole.
+            topk_indices = shared
+        else:
+            q_latent = self.project_query_latent(normed_hidden_states)
+            projected = self.indexer.project_stage(
+                normed_hidden_states, q_latent, query_side=not dense
+            )
+            # Every request's ring step, write and selection in one indexer pass: one
+            # launch per stage for the whole batch, each request on its own views.
+            topk_indices = self.indexer.forward_requests(
+                normed_hidden_states,
+                q_latent,
+                stores,
+                rings,
+                state_slots,
+                seq_lens,
+                position,
+                max_seq_len=bound if dense else int(max_seq_len),
+                indices_wanted=not dense,
+                projected=projected,
+            )
+            if index_share is not None and topk_indices is not None:
+                # Only a selecting step has indices to share; the bypass regime's
+                # None is never stored, so its later iterations keep writing.
+                index_share.topk_indices = topk_indices
         if collector is not None:
             collector.append(
                 (self.indexer._bypass_indices(seq_lens) if dense else topk_indices)[:5]
@@ -6878,6 +7152,7 @@ class Glm5NextMLAAttention(nn.Module):
         collector: list[torch.Tensor] | None = None,
         active_mla_query_rows: int | None = None,
         state_slots: torch.Tensor | None = None,
+        index_share: IndexShare | None = None,
     ) -> torch.Tensor:
         """This module's whole contribution to one layer: select, then attend.
 
@@ -6957,6 +7232,7 @@ class Glm5NextMLAAttention(nn.Module):
                 position=position,
                 collector=collector,
                 state_slots=state_slots,
+                index_share=index_share,
             )
 
         if (
@@ -6990,6 +7266,13 @@ class Glm5NextMLAAttention(nn.Module):
                 tail=(tail,),
                 position=_int64_scalar(position, device).reshape(1),
                 collector=collector,
+                index_share=index_share,
+            )
+        if index_share is not None:
+            raise Glm5NextMLADecodeError(
+                "index_share carries one speculative step's selection across its draft "
+                "iterations, which is a decode step of 2-byte rows; this call is a "
+                "prefill chunk or a float32 step and has no selection to share"
             )
 
         # The decode step whose selection is a no-op attends the causal prefix
@@ -7008,15 +7291,33 @@ class Glm5NextMLAAttention(nn.Module):
                 bound, self.indexer.index_topk, self.indexer.index_kpool
             )
         )
+        # The prefill chunk whose selection is a no-op attends its window densely, on
+        # the same bound (dsa_dense_window.py). The indexer still writes its stores.
+        from vllm_neuron.model.glm5_next.dsa_dense_window import (
+            prefill_takes_dense_window,
+        )
+
+        dense_window = not dense and prefill_takes_dense_window(
+            is_decode=tail is not None,
+            max_seq_len=int(max_seq_len),
+            window_rows=int(block_table_row.shape[0]) * int(page_size),
+            index_topk=self.indexer.index_topk,
+            index_kpool=self.indexer.index_kpool,
+            hidden_dtype=normed_hidden_states.dtype,
+            cache_dtype=latent_cache.dtype,
+            heads=self.num_attention_heads,
+            latent=self.kv_lora_rank,
+        )
+        no_select = dense or dense_window
         q_latent = self.project_query_latent(normed_hidden_states)
         topk_indices = self.indexer(
             normed_hidden_states,
             q_latent,
             pool_cache,
             seq_lens,
-            max_seq_len=bound if dense else int(max_seq_len),
+            max_seq_len=bound if no_select else int(max_seq_len),
             page_size=int(page_size),
-            indices_wanted=not dense,
+            indices_wanted=not no_select,
             slot_mapping=slot_mapping,
             tail=tail,
             position=position,
@@ -7031,7 +7332,7 @@ class Glm5NextMLAAttention(nn.Module):
                 # slice inside the trace, no cast, so a -1 stays the sentinel it is
                 # rather than becoming a float. A shorter batch yields the rows it has.
             collector.append(
-                (self.indexer._bypass_indices(seq_lens) if dense else topk_indices)[:5]
+                (self.indexer._bypass_indices(seq_lens) if no_select else topk_indices)[:5]
             )
         return self.attend(
             normed_hidden_states,
@@ -7045,6 +7346,7 @@ class Glm5NextMLAAttention(nn.Module):
             latent_slots=latent_slots,
             page_size=int(page_size),
             dense=dense,
+            dense_window_seq_lens=seq_lens if dense_window else None,
             **(
                 {"active_mla_query_rows": active_mla_query_rows}
                 if active_mla_query_rows is not None else {}
@@ -7135,6 +7437,7 @@ class Glm5NextDSALayer(nn.Module):
         collector: list[torch.Tensor] | None = None,
         active_mla_query_rows: int | None = None,
         state_slots: torch.Tensor | None = None,
+        index_share: IndexShare | None = None,
     ) -> torch.Tensor:
         """The sparse-attention half, mixed either by mHC or by a plain add.
 
@@ -7206,6 +7509,7 @@ class Glm5NextDSALayer(nn.Module):
                     if active_mla_query_rows is not None else {}
                 ),
                 **({"state_slots": state_slots} if state_slots is not None else {}),
+                **({"index_share": index_share} if index_share is not None else {}),
             )
             if collector is not None:
                 collector.append(attended)
@@ -7368,23 +7672,42 @@ class Glm5NextModel(nn.Module):
         normed = normed * gain.to(torch.float32)
         return normed.to(hidden_states.dtype)
 
+    @staticmethod
     def _ffn_half(
-        self,
         layer: nn.Module,
         hidden_states: torch.Tensor,
         *,
+        text_config: Glm5NextTextConfig,
+        rms_norm: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
         quant_config: Glm5NextQuantConfig,
         block_size: int | None,
         moe_group: object | None,
         tp_degree: int,
         expert_parallel_rank: int | torch.Tensor,
         collector: list[torch.Tensor] | None = None,
+        normed: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """One layer's feed-forward contribution, without its residual add.
 
         The residual add is the caller's, so this method is only the sublayer:
         normalise with that layer's own post-attention gain, then run whichever MLP
         ``_build_mlp`` gave the layer.
+
+        A static method: it reads nothing off a model instance, so the stack and the
+        MTP draft head (``mtp.py``) share one body. What it needs it takes by name:
+
+        * ``layer``: the module holding ``post_attention_layernorm_weight`` (``[H]``,
+          the FFN norm's gain) and ``mlp`` (a ``Glm5NextMoEBlock`` or a
+          ``Glm5NextDenseMLP``);
+        * ``hidden_states``: ``[T, H]`` in the stack's activation dtype, the
+          attention half's output after its residual add -- the FFN norm's input and
+          the fused router's pre-norm input;
+        * ``text_config``: the decoder config the MoE branch's routing hyperparameters
+          live on;
+        * ``rms_norm``: the caller's ``(hidden_states, gain) -> normed`` RMSNorm, the
+          one body the stack applies everywhere (``_rms_norm``), so the head's norms
+          are whatever the stack's are;
+        * the remaining keywords are the MoE branch's and are passed through.
 
         It lives here rather than in the layer forwards because both layer forwards
         end at the attention half, and joining the halves here leaves both of their
@@ -7405,6 +7728,11 @@ class Glm5NextModel(nn.Module):
         unrecognised third type refuses by name rather than falling through to one
         of the two.
 
+        ``normed`` is the feed-forward RMSNorm of ``hidden_states`` (this layer's
+        gain, the config's ``rms_norm_eps``) when the feed-forward mHC site fused it
+        into its mhc_pre kernel, and None when this method must normalise, with
+        :meth:`_rms_norm`. The site never hands a normed tensor on its torch route.
+
         Returns:
             ``[T, H]`` in ``hidden_states``' dtype. Both routes return their own
             kernels' dtype and this method casts, because both callees put that
@@ -7417,7 +7745,8 @@ class Glm5NextModel(nn.Module):
                 f"post_attention_layernorm_weight; the FFN norm's gain is a "
                 f"mapped checkpoint tensor and nothing was loaded onto it"
             )
-        normed = self._rms_norm(hidden_states, gain)
+        if normed is None:
+            normed = rms_norm(hidden_states, gain)
         if collector is not None:
             collector.append(normed)
         mlp = layer.mlp
@@ -7427,7 +7756,7 @@ class Glm5NextModel(nn.Module):
                 normed,
                 **({"collector": collector} if collector is not None else {}),
                 router_gamma=gain,
-                text_config=self.text_config,
+                text_config=text_config,
                 quant_config=quant_config,
                 block_size=block_size,
                 moe_group=moe_group,
@@ -7478,9 +7807,13 @@ class Glm5NextModel(nn.Module):
         # In place is safe against aliasing for the same reason it is at
         # ``project_output``: both branches return a freshly allocated tensor, so
         # neither is a view of a cached weight or of the residual the caller holds.
-        group = _resolve_tp_group()
-        if group is not None:
-            group.all_reduce(out)
+        #
+        # The wire dtype is ``collective_policy``'s: fp32 as built (the ordering
+        # above holds), or bfloat16 under ``VLLM_NEURON_TP_ALLREDUCE_DTYPE=bf16``,
+        # which rounds each rank's partial before the sum to halve the bytes.
+        out = reduce_row_parallel(
+            out, site=RowParallelSite.FFN, group=_resolve_tp_group()
+        )
         mixed = out.to(hidden_states.dtype)
         if collector is not None:
             collector.append(mixed)
@@ -7623,24 +7956,33 @@ class Glm5NextModel(nn.Module):
                 streams=streams,
                 **({"collector": taps} if index in tap_layers else {}),
             )
-            # The feed-forward site. ``_ffn_half`` is called, never edited: the site
-            # collapses the streams, hands it the single ``[T, H]`` stream it has
-            # always taken, and mixes its unchanged return back. ``streams`` is never
-            # ``None`` here, so this is a site or a refusal, never the plain add.
+            # The feed-forward site. The site collapses the streams, hands
+            # ``_ffn_half`` the single ``[T, H]`` stream it has always taken, with that
+            # stream's feed-forward RMSNorm when the fused mhc_pre kernel computed it
+            # (else ``_ffn_half`` normalises it), and mixes its return back.
+            # ``streams`` is never ``None`` here, so this is a site or a refusal,
+            # never the plain add.
             site = _mhc_ffn_site(layer, streams)
             streams = site.forward(
                 streams,
-                lambda single_stream, layer=layer, collector=(
+                lambda single_stream, normed, layer=layer, collector=(
                     taps if index in tap_layers else None
                 ): self._ffn_half(
                     layer,
                     single_stream,
+                    text_config=self.text_config,
+                    rms_norm=self._rms_norm,
                     quant_config=quant_config,
                     block_size=block_size,
                     moe_group=moe_group,
                     tp_degree=tp_degree,
                     expert_parallel_rank=expert_parallel_rank,
                     collector=collector,
+                    normed=normed,
+                ),
+                norm=(
+                    layer.post_attention_layernorm_weight,
+                    float(self.text_config.rms_norm_eps),
                 ),
             )
             if collect_layer_streams and index < DUMP_STREAM_LAYERS:
@@ -8367,6 +8709,28 @@ class Glm5NextForConditionalGeneration(nn.Module):
         # checkpoint key and therefore no separate parameter.
         if not self.text_config.tie_word_embeddings:
             _declare_parameters(self, "lm_head_weight")
+        # The multi-token-prediction draft head, the checkpoint's layer past the
+        # stack, built on the same knob the weight map follows (the head's own
+        # ``shadow_draft_k``, contract C1), so the map claims that layer's keys
+        # exactly when there is a module to hold them. ``None`` with the knob off:
+        # nothing else in this tree changes. The two weights the head reads are
+        # materialised only in ``load_weights``, so they are handed over as
+        # callables: the embedding table, and ``_head_weight``, the root's own
+        # tied-or-untied resolution of the logits weight; the group is resolved the
+        # way every row-parallel reduction in this file resolves it. Imported here,
+        # not at module level: the head imports this module lazily, so a top-level
+        # import either way would be a cycle.
+        from .mtp import Glm5NextMultiTokenPredictor, shadow_draft_k
+
+        self.mtp = None
+        if shadow_draft_k() > 0:
+            self.mtp = Glm5NextMultiTokenPredictor(
+                self.text_config,
+                embed_tokens=lambda: self.model.embed_tokens_weight,
+                lm_head=self._head_weight,
+                world_size=self.world_size,
+                tp_group=_resolve_tp_group,
+            )
 
     # ── construction ─────────────────────────────────────────────────────
 
@@ -9071,7 +9435,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
     # ── KV cache management ──────────────────────────────────────────────
 
     def get_kv_spec(self) -> KVSpec:
-        """One ``LayerSpec`` per layer of the hybrid stack, in layer order.
+        """One ``LayerSpec`` per cache-holding layer: the stack's, then the draft head's.
 
         Field mapping and naming follow the other model families; the construction
         path does not, because that precedent reads instantiated submodules and this
@@ -9099,9 +9463,43 @@ class Glm5NextForConditionalGeneration(nn.Module):
         part of the geometry, because the conv and recurrent carriers are paired
         positionally, so a partial set would shorten the reported page. One ``getattr``
         per field against one attribute-carrying class satisfies that by construction.
+
+        The draft layer. When the root built the multi-token-prediction head
+        (``self.mtp``, built when the shadow-draft knob is above 0), the head's decoder
+        block holds state exactly as a stack layer does, so the same loop reads its
+        attention and its entry follows the stack, named for the index the checkpoint
+        gives it, ``num_hidden_layers + num_nextn_predict_layers - 1``
+        (``layers.45.self_attn`` on GLM-5.3-Flash). That block is a sparse-attention
+        layer built from the same config as the stack's, so its page is the trunk DSA
+        page -- ``[blocks, num_kv_heads_per_rank, block_size, head_size]`` in
+        ``cache_dtype``, one latent buffer -- and vLLM groups it with the trunk's DSA
+        layers, so it pages through their block table. The head holds one decoder
+        layer: a config that places its last draft layer anywhere else is refused by
+        name. Without the head the list is the stack's alone.
+
+        Raises:
+            ValueError: the draft head's decoder layer does not sit at the index the
+                config gives the last draft layer.
         """
+        from .mtp import BLOCK_ATTR
+
+        blocks = list(enumerate(self.model.layers))
+        if self.mtp is not None:
+            first = int(self.text_config.num_hidden_layers)
+            count = int(self.text_config.num_nextn_predict_layers)
+            draft_index = first + count - 1
+            block = getattr(self.mtp, BLOCK_ATTR)
+            if block.layer_idx != draft_index:
+                raise ValueError(
+                    f"the draft head holds one decoder layer, at index "
+                    f"{block.layer_idx}, and the config places the last of its "
+                    f"{count} draft layer(s) at {draft_index} (num_hidden_layers "
+                    f"{first} + num_nextn_predict_layers {count} - 1); only one draft "
+                    f"layer, at num_hidden_layers, has KV state here"
+                )
+            blocks.append((draft_index, block))
         layers: list[LayerSpec] = []
-        for layer_idx, layer in enumerate(self.model.layers):
+        for layer_idx, layer in blocks:
             attention = layer.attention
             layers.append(
                 LayerSpec(
@@ -9170,11 +9568,15 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
         The layer modules are not read, only counted. Every geometry this method needs
         is already on the spec the model itself produced, so the loop walks the spec and
-        the stack length is checked against it.
+        the stack length, plus the draft head's one layer when the root built the head,
+        is checked against it.
 
-        The records land on ``glm5next_layer_banks``, in stack order, one mapping per
-        layer. The runner reads that attribute and builds each layer's carrier from it;
-        nothing else in this tree reads it. A plain tuple of plain dicts is deliberate:
+        The records land on ``glm5next_layer_banks``, in spec order, one mapping per
+        layer: the stack's, then the draft head's (at position ``len(self.model.layers)``,
+        a sparse-family record like a trunk DSA layer's). The runner reads that
+        attribute and builds each layer's side caches and carrier from it, so the
+        draft layer's carrier is the last entry of ``layer_carriers``; nothing else in
+        this tree reads it. A plain tuple of plain dicts is deliberate:
         ``nn.Module.__setattr__`` leaves it alone, so ``_apply`` never walks these
         tensors and the runner stays their only owner.
 
@@ -9183,18 +9585,21 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 what ``initialize_kv_cache`` returns.
 
         Raises:
-            ValueError: the spec and the stack disagree on how many layers there are, a
-                layer's spec name is absent from ``kv_caches``, a bank's shape
-                disagrees with the spec that asked for it, a layer reports part of its
-                recurrent geometry, or a latent bank declares more than one KV head.
+            ValueError: the spec and the stack plus the draft head's layer disagree on
+                how many layers there are, a layer's spec name is absent from
+                ``kv_caches``, a bank's shape disagrees with the spec that asked for
+                it, a layer reports part of its recurrent geometry, or a latent bank
+                declares more than one KV head.
         """
         spec_layers = self.get_kv_spec().layers
         stack = len(self.model.layers)
-        if len(spec_layers) != stack:
+        draft = 0 if self.mtp is None else 1
+        if len(spec_layers) != stack + draft:
             raise ValueError(
                 f"get_kv_spec reports {len(spec_layers)} layer(s) and the stack "
-                f"holds {stack}; the carriers are paired positionally, so a "
-                f"disagreement here would hand a layer another layer's cache"
+                f"holds {stack} plus {draft} draft layer(s); the carriers are paired "
+                f"positionally, so a disagreement here would hand a layer another "
+                f"layer's cache"
             )
         banks: list[dict[str, object]] = []
         for layer_idx, layer_spec in enumerate(spec_layers):
@@ -9347,6 +9752,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         collect_layer_streams: bool = False,
         device_sampling_params: torch.Tensor | None = None,
         device_logit_mask: torch.Tensor | None = None,
+        shadow_boundary_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Logits for the rows the caller wants sampled: stack, select, project.
 
@@ -9427,11 +9833,28 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 is flat because these are graph outputs: a nested tuple is one output
                 to a caller and a structure the capture has to flatten.
 
+            shadow_boundary_ids: shadow draft (MTP stage A), prefill leg only: one
+                int32 per sampled row, the id the chunk's last row pairs with when the
+                draft layer is populated -- the next prompt token when more of the
+                prompt follows, ``-1`` when this chunk ends the prompt, in which case
+                the token sampled in this graph is taken. ``None`` means ``-1``.
+
+        Shadow draft (``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT=k``, ``self.mtp`` built):
+        ``layer_carriers`` then holds one more mapping than the stack has layers, the
+        draft layer's (index ``num_hidden_layers``, built by the runner's carrier walk
+        like a sparse layer's); it is taken off before the stack runs. On the prefill
+        leg the draft is populated at every row of the chunk from the post-final-norm
+        hidden rows and the shifted ids (row ``t`` pairs with ``x_{t+1}``), and the
+        draft output is a ``[rows, k]`` row of ``-1``. On the decode leg the draft runs
+        ``k`` unrolled iterations from the selected rows and the sampled ids and the
+        output is ``[rows, k]`` global token ids. The sampled ids never read the draft.
+
         Returns:
             ``[len(sampling_positions), vocab_size]`` logits, in the dtype the head
             weight and the stack output share -- or, under ``collect_layer_streams``,
             that tensor first and then one ``[T, hc_mult, H]`` carrier per layer of the
-            stack.
+            stack. With the shadow draft on, the ``[rows, k]`` int32 draft ids follow
+            the logits (or sampled ids) and precede the layer streams.
 
         Raises:
             ValueError: when the head tensor this call needs was never loaded, or when
@@ -9447,6 +9870,31 @@ class Glm5NextForConditionalGeneration(nn.Module):
         # The keyword is added, not passed as False, so an ordinary forward hands its
         # stack the six keywords it always handed over and no seventh.
         collecting = {"collect_layer_streams": True} if collect_layer_streams else {}
+        # Shadow draft: the draft layer's carrier rides at the end of the list and the
+        # stack must not see it (it refuses a count that disagrees with its layers).
+        draft_head = self.mtp
+        shadow_k = 0
+        if draft_head is not None:
+            # The knob's one reader (contract C1); lazily, as the head is imported
+            # everywhere in this module, so the two modules never import each other
+            # at load time.
+            from . import mtp as mtp_module
+
+            shadow_k = int(mtp_module.shadow_draft_k())
+        draft_carrier: dict | None = None
+        if shadow_k > 0:
+            stack_depth = len(self.model.layers)
+            carriers = list(layer_carriers)
+            if len(carriers) != stack_depth + 1:
+                raise ValueError(
+                    f"the shadow draft is on (k={shadow_k}) and this forward received "
+                    f"{len(carriers)} per-layer carrier mapping(s) for a stack of "
+                    f"{stack_depth} layers plus the draft layer; the runner's carrier walk "
+                    f"adds the draft layer's mapping (index {stack_depth}) when the knob "
+                    f"is on, and without it the draft would run on a trunk layer's state"
+                )
+            draft_carrier = carriers[stack_depth]
+            layer_carriers = carriers[:stack_depth]
         stack_output = self.model(
             input_ids,
             layer_carriers=layer_carriers,
@@ -9476,6 +9924,83 @@ class Glm5NextForConditionalGeneration(nn.Module):
             logits = sample_full_vocab(
                 logits, device_sampling_params, sampling_config, device_logit_mask
             )
+        if shadow_k <= 0:
+            if collect_layer_streams:
+                return (logits, *layer_streams)
+            return logits
+        # ── shadow draft ─────────────────────────────────────────────────────
+        # Alignment: the draft at position t consumes the trunk's post-final-norm row
+        # h_t and the embedding of x_{t+1}. The sampled ids are read, never written.
+        assert draft_carrier is not None
+        # The draft layer's MoE half runs the trunk's own feed-forward, under the same
+        # five keywords this forward handed the stack (one call shape on both legs).
+        ffn_keywords = {
+            "quant_config": quant_config,
+            "block_size": block_size,
+            "moe_group": moe_group,
+            "tp_degree": tp_degree,
+            "expert_parallel_rank": expert_parallel_rank,
+        }
+        sampled_ids = (
+            logits if device_sampling_params is not None else torch.argmax(logits, dim=-1)
+        ).to(torch.int32)
+        rows_out = int(sampled_ids.shape[0])
+        if "prefill_tail" not in draft_carrier and "position" not in draft_carrier:
+            raise ValueError(
+                "the shadow draft reads its leg off the draft layer's carrier: "
+                "'prefill_tail' on the prefill leg, 'position' on the decode leg; this "
+                f"carrier has neither (keys {sorted(draft_carrier)}), so the runner's "
+                "carrier walk and this forward disagree about the sparse layer's "
+                "operands"
+            )
+        if "prefill_tail" in draft_carrier:
+            # Prefill leg: populate every row of the chunk. Row t pairs with the next
+            # row's id; the sampled rows (the chunk's last real row) pair with the
+            # boundary id, or with the id sampled here when the boundary is -1.
+            tokens = int(input_ids.shape[0])
+            start_position = draft_carrier["start_position"]
+            if not torch.is_tensor(start_position):
+                # A number is factory-built so a trace keeps it fake (``_int64_scalar``).
+                start_position = _int64_scalar(start_position, input_ids.device)
+            start = start_position.reshape(-1)[0].to(
+                device=input_ids.device, dtype=torch.int32
+            )
+            positions = start + torch.arange(
+                tokens, dtype=torch.int32, device=input_ids.device
+            )
+            next_ids = torch.cat([input_ids[1:], input_ids[:1] * 0]).to(torch.int32)
+            if shadow_boundary_ids is None:
+                boundary = torch.full_like(sampled_ids, -1)
+            else:
+                boundary = shadow_boundary_ids.to(
+                    device=sampled_ids.device, dtype=torch.int32
+                ).reshape(-1)
+                if int(boundary.shape[0]) != rows_out:
+                    raise ValueError(
+                        f"shadow_boundary_ids holds {int(boundary.shape[0])} id(s) and "
+                        f"this forward samples {rows_out} row(s); the prefill leg pairs "
+                        f"each sampling row with one boundary id"
+                    )
+            fill = torch.where(boundary < 0, sampled_ids, boundary)
+            next_ids = next_ids.index_copy(0, sampling_positions, fill)
+            draft_head.populate(
+                hidden_states, next_ids, positions, **ffn_keywords, **draft_carrier
+            )
+            draft_ids = torch.full(
+                (rows_out, shadow_k), -1, dtype=torch.int32, device=input_ids.device
+            )
+        else:
+            # Decode leg: the selected rows are one per request, at the request's
+            # position; iteration 0 of the draft populates the draft layer there.
+            position = draft_carrier["position"]
+            if not torch.is_tensor(position):
+                position = _int64_scalar(position, input_ids.device)
+            positions = position.reshape(-1).to(device=input_ids.device, dtype=torch.int32)
+            if positions.numel() == 1 and rows_out > 1:
+                positions = positions.expand(rows_out)
+            draft_ids = draft_head.draft_tokens(
+                rows, sampled_ids, positions, shadow_k, **ffn_keywords, **draft_carrier
+            )
         if collect_layer_streams:
-            return (logits, *layer_streams)
-        return logits
+            return (logits, draft_ids, *layer_streams)
+        return logits, draft_ids

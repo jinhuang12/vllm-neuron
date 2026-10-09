@@ -169,6 +169,116 @@ class NeuronPlatform(Platform):
         return f"neuron:{device_id}"
 
     @classmethod
+    def get_device_total_memory(cls, device_id: int = 0) -> int:
+        """Return the HBM of one logical NeuronCore, the device one rank owns, in bytes.
+
+        vLLM reads this to pick its batch defaults
+        (``EngineArgs.get_batch_defaults``). The figure is the static table the CPU
+        compilation flow sizes the KV cache with
+        (``libtorch_neuronx_lite.compile.platform.HBM_MEMORY_GB``: 24 GiB per
+        logical core on trn2), for the target ``NEURON_PLATFORM_TARGET_OVERRIDE``
+        names, or else the instance family the host reports
+        (:func:`~vllm_neuron.utils.hardware_config.get_instance_family`). Neither
+        opens the Neuron runtime, so the API server can answer without a device.
+
+        Raises:
+            RuntimeError: Neither names a target the table holds.
+        """
+        from libtorch_neuronx_lite.compile.platform import (
+            HBM_MEMORY_GB,
+            normalize_target_family,
+        )
+
+        from vllm_neuron.utils import hardware_config
+
+        target = os.environ.get("NEURON_PLATFORM_TARGET_OVERRIDE")
+        if not target:
+            target = hardware_config.get_instance_family()
+        try:
+            return HBM_MEMORY_GB[normalize_target_family(target)] * 1024**3
+        except (KeyError, ValueError, RuntimeError) as exc:
+            raise RuntimeError(
+                f"No HBM size is known for Neuron target {target!r} "
+                f"(known families: {sorted(HBM_MEMORY_GB)})."
+            ) from exc
+
+    @classmethod
+    def _default_glm5next_recurrent_blocks(cls, vllm_config: "VllmConfig") -> None:
+        """Default GLM-5.3-Flash to prefix caching off and one KDA block per request.
+
+        vLLM turns prefix caching on for this model (upstream does not flag it
+        hybrid, so ``HybridAttentionMambaModelConfig`` never runs). Each recurrent
+        (KDA) group then keeps the attention block, and vLLM's mamba "none" mode
+        reserves ``cdiv(max_model_len, block_size)`` blocks per request in each
+        group. Those blocks hold no data: the runner keeps the state in a bank
+        addressed by request slot, and refuses a prefix-cache hit on a recurrent
+        stack (``kv_spec_patch.recurrent_spec_block_size``). At 1 x 1M tokens they
+        are 55.69 GiB of a rank's KV cache against 11.70 GiB with one block.
+
+        So, as upstream does for a hybrid model with prefix caching off:
+
+        * ``enable_prefix_caching=False`` unless the command line gives
+          ``--enable-prefix-caching`` or ``--no-enable-prefix-caching``;
+        * ``mamba_block_size=max_model_len`` unless a mamba block size is set,
+          or prefix caching is on (vLLM's hybrid coordinator then needs the
+          attention block).
+
+        Each default yields to its own flag. vLLM keeps no record of a given
+        prefix-caching flag, so it is read from ``sys.argv`` as
+        :meth:`apply_config_platform_defaults` reads ``--optimization-level``;
+        an offline ``LLM(enable_prefix_caching=True)`` is not seen and is
+        defaulted off, which the log line says. Only this architecture on the
+        hybrid KV cache is changed. One log line always states the outcome.
+        """
+        architectures = getattr(vllm_config.model_config.hf_config, "architectures", None) or ()
+        neuron_config = vllm_config.additional_config.get("neuron_config", {})
+        if "Glm5NextForConditionalGeneration" not in architectures or not neuron_config.get(
+            "enable_hybrid_kv_cache", False
+        ):
+            return
+
+        def given(flag: str) -> bool:
+            spellings = {flag, flag.replace("-", "_").replace("__", "--", 1)}
+            return any(arg.split("=", 1)[0] in spellings for arg in sys.argv)
+
+        cache_config = vllm_config.cache_config
+        max_model_len = vllm_config.model_config.max_model_len
+        block_size = cache_config.block_size
+        if given("--enable-prefix-caching") or given("--no-enable-prefix-caching"):
+            prefix = (
+                f"prefix caching {'on' if cache_config.enable_prefix_caching else 'off'}"
+                f" as given"
+            )
+        else:
+            cache_config.enable_prefix_caching = False
+            prefix = (
+                "prefix caching defaulted off (no --enable-prefix-caching given; "
+                "the runner refuses a prefix-cache hit on the recurrent layers)"
+            )
+        if cache_config.mamba_block_size is not None:
+            recurrent = f"mamba_block_size={cache_config.mamba_block_size} as given"
+        elif cache_config.enable_prefix_caching:
+            recurrent = (
+                f"mamba_block_size left unset, so each KDA group keeps the "
+                f"{block_size}-token block: cdiv({max_model_len}, {block_size}) = "
+                f"{-(-max_model_len // block_size)} blocks per request per group, "
+                f"priced in the KV cache budget"
+            )
+        else:
+            cache_config.mamba_block_size = max_model_len
+            recurrent = (
+                f"mamba_block_size defaulted to max_model_len={max_model_len} (no "
+                f"--mamba-block-size given), so each KDA group holds one block per "
+                f"request, not cdiv({max_model_len}, {block_size}) = "
+                f"{-(-max_model_len // block_size)}"
+            )
+        logger.info(
+            "Glm5NextForConditionalGeneration KV cache defaults: %s; %s.",
+            prefix,
+            recurrent,
+        )
+
+    @classmethod
     def pre_register_and_update(cls, parser=None) -> None:
         """Register Neuron model architectures before ModelConfig validation."""
         import os
@@ -547,6 +657,7 @@ class NeuronPlatform(Platform):
                 tp_size,
                 kv_cache_dtype,
             )
+            cls._default_glm5next_recurrent_blocks(vllm_config)
 
         # Component DP on dense models needs the MoE/DP engine path to
         # preserve data_parallel_size across engine core subprocesses.
@@ -615,13 +726,11 @@ class NeuronPlatform(Platform):
 
         cls._resolve_sampling_from_the_model_class(vllm_config)
 
-        # After the sampling resolution above settles on_device_sampling_config and the
-        # hybrid block-size resolution publishes the KV page: both are policy inputs.
+        # After the sampling resolution above settles on_device_sampling_config, a
+        # policy input.
         from vllm_neuron.vllm import admission
 
-        cls._admission = admission.policy_from_config(
-            vllm_config, block_size=cls.resolved_uniform_page(vllm_config)
-        )
+        cls._admission = admission.policy_from_config(vllm_config)
         admission.install_eager_validation()
 
         if envs.VLLM_NEURON_RUNTIME_INPUT_SNAPSHOT_ENABLE:
@@ -688,6 +797,9 @@ class NeuronPlatform(Platform):
         neuron_config = vllm_config.additional_config.setdefault("neuron_config", {})
         neuron_config["_model_supports_independent_prefill_buckets"] = bool(
             getattr(model_cls, "supports_independent_prefill_buckets", False)
+        )
+        neuron_config["_model_supports_windowed_prefill"] = bool(
+            getattr(model_cls, "supports_windowed_prefill", False)
         )
         if getattr(model_cls, "supports_on_device_sampling", True):
             return
@@ -774,8 +886,9 @@ class NeuronPlatform(Platform):
 
         Called per-request before scheduling. Raises ValueError before model
         execution so SO-off servers do not enter the SO mask path, and so a prompt
-        past the prefill window or a sampling request the on-device sampler cannot
-        serve never reaches the engine (see ``vllm_neuron/vllm/admission.py``).
+        that leaves no room for a generated token (``prompt + 1 > max_model_len``) or
+        a sampling request the on-device sampler cannot serve never reaches the
+        engine (see ``vllm_neuron/vllm/admission.py``).
         """
         if (
             not cls._enable_structured_outputs

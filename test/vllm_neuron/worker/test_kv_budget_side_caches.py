@@ -16,7 +16,7 @@ the gate's serve line (``--no-enable-prefix-caching --mamba-block-size 8192``):
 * side caches: 11 x 64 x (2049 x 128 + 2 x (2 x 4 x 128)) x 2 B = 372162560 B
 * footprint: 6795902976 B = 6.3292 GiB (6.0 GiB = 6423740416 B without the side caches)
 
-The same numbers are in ``/home/ubuntu/glm53f-wt2/reports/kvseg_budget.json``.
+The same numbers are in the kvseg-footprint gate report's budget table (``kvseg_budget.json``).
 
 Run with ``VLLM_NEURON_CPU_MODE=1`` (``test/conftest.py`` pins it).
 """
@@ -174,17 +174,27 @@ def test_a_model_with_no_indexer_prices_no_side_caches() -> None:
 def test_a_point_that_fits_only_without_side_caches_is_refused_naming_the_shortfall(
     monkeypatch,
 ) -> None:
-    """64 x 8k on the 5938748 residency: the KV tensors fit 6.04 GiB, the side caches do not."""
+    """64 x 8k against a budget between the KV tensors and the footprint: refused.
+
+    The graph-need override puts the budget midway between the KV tensors
+    (5.983 GiB) and the footprint with the side caches (6.329 GiB). Until
+    wt2/kvbudget the 5938748 residency put it there by itself (6.04 GiB, the
+    per-physical-core bound, short by 0.289 GiB); that bound is gone.
+    """
     from vllm_neuron.vllm.worker.neuron_model_runner import kv_cache_allocations
+    from vllm_neuron.vllm.worker.neuron_worker import KV_BUDGET_MARGIN_BYTES
 
     _clear_knobs(monkeypatch)
     worker = _worker(seqs=64, length=8192)
-    budget = worker._compute_kv_budget(
-        kv.TOTAL_HBM_BYTES, kv.MEASURED_PARAM_BYTES, kv.GPU_MEMORY_UTILIZATION
-    )
     config = kv.served_kv_cache_config(worker.model_runner, worker)
     kv_tensors = sum(size for size, _ in kv_cache_allocations(config, state_slots=64))
     footprint = hand_footprint_bytes(seqs=64, length=8192, gate_line=True)
+    free = kv.TOTAL_HBM_BYTES - kv.MEASURED_RESIDENT_BYTES
+    graph_bytes = free - KV_BUDGET_MARGIN_BYTES - (kv_tensors + footprint) // 2
+    monkeypatch.setenv("VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB", repr(graph_bytes / GIB))
+    budget = worker._compute_kv_budget(
+        kv.TOTAL_HBM_BYTES, kv.MEASURED_PARAM_BYTES, kv.GPU_MEMORY_UTILIZATION
+    )
     # The premise: this point fits only while the side caches are left out.
     assert kv_tensors <= budget < footprint
 
@@ -195,11 +205,18 @@ def test_a_point_that_fits_only_without_side_caches_is_refused_naming_the_shortf
     assert f"{footprint / GIB:.3f} GiB" in message
     assert f"side caches {372162560 / GIB:.3f} GiB" in message
     assert f"short by {(footprint - budget) / GIB:.3f} GiB" in message
-    assert round((footprint - budget) / GIB, 3) == 0.289
+    assert "VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB override" in message
 
 
 def test_the_0a08ff4_residency_admits_64_by_8k_with_the_side_caches(monkeypatch) -> None:
-    """On the measured tip the cap binds at 6.62 GiB and the 6.33 GiB footprint fits."""
+    """On the measured tip the 6.33 GiB footprint fits with 5.6 GiB to spare.
+
+    A cold cache (the fake worker reads none) assumes the 5 GiB default reserve:
+    24 - 6.79 resident - 5 - 0.25 margin = 11.96 GiB. Until wt2/kvbudget the 0.30
+    cap bound by default at 6.62 GiB, 0.295 GiB above the footprint.
+    """
+    from vllm_neuron.vllm.worker.neuron_worker import KV_BUDGET_MARGIN_BYTES
+
     _clear_knobs(monkeypatch)
     worker = _worker(
         seqs=64,
@@ -214,9 +231,12 @@ def test_the_0a08ff4_residency_admits_64_by_8k_with_the_side_caches(monkeypatch)
     available = worker.determine_available_memory()
 
     footprint = hand_footprint_bytes(seqs=64, length=8192, gate_line=True)
-    assert round(budget / GIB, 2) == 6.62
+    assert budget == (
+        kv.TOTAL_HBM_BYTES - TIP_RESIDENT_BYTES - 5 * GIB - KV_BUDGET_MARGIN_BYTES
+    )
+    assert round(budget / GIB, 2) == 11.96
     assert available == hand_need_bytes(seqs=64, length=8192, gate_line=True)
-    assert round((budget - footprint) / GIB, 3) == 0.295
+    assert round((budget - footprint) / GIB, 2) == 5.63
 
 
 @pytest.mark.parametrize(
