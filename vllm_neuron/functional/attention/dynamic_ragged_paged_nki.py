@@ -105,7 +105,10 @@ def dynamic_ragged_paged_attention_nki(
         nisa.tensor_scalar(dst=page_count_f, data=q_limit_f,
                            op0=nl.add, operand0=127.0,
                            op1=nl.multiply, operand1=1.0 / 128.0)
-        nisa.tensor_copy(dst=page_count, src=page_count_f)
+        # Do not rely on the FP32 -> int32 cast's rounding mode.
+        # floor((q_limit + PAGE - 1) / PAGE) is exact for this range.
+        pages_floor = nl.floor(page_count_f)
+        nisa.tensor_copy(dst=page_count, src=pages_floor)
         pages_reg = nisa.register_alloc()
         nisa.register_load(dst=pages_reg, src=page_count)
 
