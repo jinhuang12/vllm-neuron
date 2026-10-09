@@ -68,9 +68,13 @@ Limits of the class:
     location, which assumes the address stays inside it (the pair is marked `runtime`); such
     an operand never counts as a covering write. The one-pass check still calls the dump
     UNDECIDED for it;
+  - a covering write is one write that holds every byte of C's footprint; writes that cover
+    it only together are not combined, so such a RAW pair is still reported;
   - covering is decided in program order (a write's issue position), not by completion;
-  - no pair has C after P in the body: iteration i+1 runs P again before such a C, and P is
-    taken to write the same bytes in every iteration, which a runtime-address P need not do;
+  - no pair has C after P in the body. RAW: iteration i+1 runs P again before such a C, and
+    P is taken to write the same bytes in every iteration, which a runtime-address P need
+    not do. WAR/WAW: the one-pass check orders P before C in iteration i, and C's engine
+    issues C of iteration i before C of iteration i+1;
   - a trailing memory-free instruction of the kernel's own (an engine's wait at the end of
     the body) is part of the back-edge sequence by the definition above;
   - `Drain` (`is_reset_sema`) is a plain instruction: its effect on semaphores is not
