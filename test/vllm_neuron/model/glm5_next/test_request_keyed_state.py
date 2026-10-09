@@ -1143,7 +1143,16 @@ def test_a5_the_runners_slot_mapping_addresses_the_banks_own_view() -> None:
 
 
 def test_a6_a_decode_carrying_more_tokens_than_requests_refuses_by_name() -> None:
-    """Speculative decoding's verify step is still out of scope, now stated exactly. """
+    """A decode step whose rows do not divide into whole requests is refused by name.
+
+    The refused half hands three tokens for two requests. The admitted half is a real
+    two-request step: one token each, ``request_starts`` and two ``request_block_ids``
+    rows (the file's own two-request pattern). Its earlier form declared two requests
+    but handed one cached length, which the translator reads as ONE request of width
+    2 -- a mis-declared step the one-ring form tolerated until 5534f59 routed every
+    one-request decode step of width > 1 to the request form (the verify step of
+    ``1 + k`` rows), which refuses it for want of per-request block tables.
+    """
     _require_cpu_mode()
     from vllm_neuron.functional.attention.mla_sparse import (
         mla_sparse_dispatch_counters,
@@ -1170,7 +1179,7 @@ def test_a6_a_decode_carrying_more_tokens_than_requests_refuses_by_name() -> Non
         raise VacuousControlError(
             "this test needs more tokens than requests to have anything to refuse"
         )
-    with pytest.raises(ValueError, match="one token per request"):
+    with pytest.raises(ValueError, match="do not divide into whole requests"):
         _carriers_for_requests(
             banks, side, tokens=over_by_one, requests=DECLARED_REQUESTS,
             is_prefill=False,
@@ -1188,10 +1197,40 @@ def test_a6_a_decode_carrying_more_tokens_than_requests_refuses_by_name() -> Non
             "the refused step wrote into a pooled store"
         )
 
-    # ---- the admitted case, so the refusal is not simply refusing everything.
-    admitted = _carriers_for_requests(
-        banks, side, tokens=DECLARED_REQUESTS, requests=DECLARED_REQUESTS,
+    # ---- the admitted case, so the refusal is not simply refusing everything: a
+    # real two-request step, one token each, with its own cached length and block
+    # row per request (the sparse layer's request form reads ``request_block_ids``).
+    rows = [[int(value) for value in row] for row in DECLARED_SPARSE_ROWS]
+    slots = [0, 2]
+    if len(rows) != DECLARED_REQUESTS or len(set(slots)) != DECLARED_REQUESTS:
+        raise VacuousControlError(
+            f"this test needs one block row and one distinct slot per request; it "
+            f"declares {len(rows)} row(s) and slots {slots} for {DECLARED_REQUESTS} "
+            f"request(s)"
+        )
+    geometries = [
+        {
+            "block_ids": rows[0],
+            "request_block_ids": rows,
+            "state_slot": slots[0],
+            "state_slots": slots,
+            "page_size": DECLARED_PAGE_SIZE,
+            "window_blocks": max(len(row) for row in rows),
+        }
+        for _ in banks
+    ]
+    admitted = NeuronModelRunner._glm5next_layer_carriers(
+        banks,
+        side,
+        geometries=geometries,
         is_prefill=False,
+        tokens=DECLARED_REQUESTS,
+        start_position=DECLARED_CACHED_LENGTHS[0],
+        softmax_scale=float(DECLARED_HEAD_SIZE) ** -0.5,
+        max_seq_len=max(DECLARED_CACHED_LENGTHS) + 1,
+        index_kpool=DECLARED_INDEX_KPOOL,
+        requests=DECLARED_REQUESTS,
+        request_starts=list(DECLARED_CACHED_LENGTHS),
     )
     assert len(admitted) == len(banks)
 
