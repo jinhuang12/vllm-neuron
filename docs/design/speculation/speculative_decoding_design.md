@@ -589,6 +589,7 @@ whose on-device greedy rejection sampler (`vllm_neuron/nn/rejection_sampler.py`)
 accepts drafts by id equality until the first mismatch.
 
 ```bash
+VLLM_NEURON_GLM5NEXT_ON_DEVICE_SAMPLING=1 \
 python3 -m vllm.entrypoints.openai.api_server \
     --model <GLM-5.3-Flash checkpoint> \
     --tensor-parallel-size 64 --enable-expert-parallel \

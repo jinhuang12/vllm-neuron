@@ -76,6 +76,9 @@ def _counts():
         # A one-request decode step scores through the batched kernel, as a batch of one.
         "batch_scores": decode_batch.decode_batch_route_counts()[1],
         "topk": topk[0] + topk[1],
+        # The decode step selects in one kernel (top-k, sentinel, order and expand),
+        # counted in the batched decode family.
+        "select": decode_batch.decode_batch_route_counts()[3],
         "hadamard": kpool_hadamard.kpool_hadamard_dispatch_counters()[0],
         "lowp": mla_projections.mla_projection_lowp_counts()[0],
     }
@@ -139,7 +142,7 @@ def test_the_bypass_is_exact_and_skips_selection(layers, context):
     assert dense_counts["dense"] == 1, dense_counts
     assert dense_counts["sparse"] == 0, dense_counts
     assert dense_counts["score_gemm"] == 0 and dense_counts["batch_scores"] == 0, dense_counts
-    assert dense_counts["topk"] == 0, dense_counts
+    assert dense_counts["topk"] == 0 and dense_counts["select"] == 0, dense_counts
     # The query rotation is skipped with the query; the four sites the step still reads
     # (q_a twice, q_b, kv_a, o_proj, wk, gate) all took the fp8/bf16 route.
     assert dense_counts["hadamard"] == 0, dense_counts
@@ -148,7 +151,7 @@ def test_the_bypass_is_exact_and_skips_selection(layers, context):
     chosen, chosen_col, chosen_counts, chosen_ops = _run(live, operands)
     assert chosen_counts["dense"] == 0 and chosen_counts["sparse"] == 1, chosen_counts
     assert chosen_counts["batch_scores"] == 1 and chosen_counts["score_gemm"] == 0, chosen_counts
-    assert chosen_counts["topk"] == 1, chosen_counts
+    assert chosen_counts["select"] == 1 and chosen_counts["topk"] == 0, chosen_counts
     # Selection is a no-op here: the set it picks is the whole causal prefix.
     assert _selected_set(chosen_col[0][0]) == set(range(context))
     # The dump's index entry is the same tensor either way.
@@ -173,7 +176,7 @@ def test_2052_tokens_still_select_and_drop_one_pool(layers):
     out, col, counts, _ = _run(live, operands)
     assert counts["dense"] == 0 and counts["sparse"] == 1, counts
     assert counts["batch_scores"] == 1 and counts["score_gemm"] == 0, counts
-    assert counts["topk"] == 1, counts
+    assert counts["select"] == 1 and counts["topk"] == 0, counts
     assert counts["hadamard"] == 1, counts
     picked = _selected_set(col[0][0])
     # 513 complete pools, 512 kept, no open tail at 2052 = 513 * 4: four tokens dropped.
@@ -197,7 +200,7 @@ def test_selected_decode_keeps_5938748s_selection(layers):
     operands = case.decode_operands(cfg, context, window_pages=FULL_WINDOW_PAGES,
                                     max_seq_len=FULL_MAX_SEQ_LEN)
     out, col, counts, _ = _run(live, operands)
-    assert counts["dense"] == 0 and counts["sparse"] == 1 and counts["topk"] == 1, counts
+    assert counts["dense"] == 0 and counts["sparse"] == 1 and counts["select"] == 1, counts
     baseline, base_col, _, _ = _run(base, operands)
     picked, base_picked = _selected_set(col[0][0]), _selected_set(base_col[0][0])
     assert len(picked) == len(base_picked) == int(cfg.index_topk)

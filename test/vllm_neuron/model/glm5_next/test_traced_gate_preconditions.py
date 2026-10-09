@@ -11,6 +11,7 @@ import pytest
 import torch
 
 from vllm_neuron.functional.kda.chunked_recurrence import (
+    GATE_CUMSUM_ABS_LIMIT,
     ChunkedRecurrenceError,
     kda_intra_chunk,
 )
@@ -40,8 +41,10 @@ REFUSAL = "Could not guard on data-dependent expression"
 
 #: Chunks, chunk length, key width, value width. One tile each, chunk a power of two.
 NC, CHUNK, KDIM, VDIM = 2, 64, 64, 64
-#: Inside the cumulative limit, and past it.
-GATE_OK, GATE_OVER = -0.01, -1.0
+#: Far inside the cumulative limit.
+GATE_OK = -0.01
+#: Past it: a chunk sum twice the limit.
+GATE_OVER = -2.0 * GATE_CUMSUM_ABS_LIMIT / CHUNK
 #: One token's gate, past the decode limit.
 DECODE_GATE_OVER = -61.0
 

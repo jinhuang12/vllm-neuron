@@ -24,6 +24,11 @@ from nkilib.core.topk.rotational_topk import SupportedTopkMethods
 # from nkilib (byte-identical to upstream; the canonical enum). When the
 # on-device kernel lands in-image, drop the vendored package and import
 # rotational_topk + create_*_config from nkilib.core.topk.rotational_topk again.
+# The vendored copy carries a local patch (its gathers never write over their own
+# sources: the rotational core gathers into per-tile `indices` columns; see
+# test/vllm_neuron/functional/dsa/test_rotational_topk_gather_alias.py), so
+# dropping it requires nkilib's kernel to give the same guarantee, or that test
+# to be pointed at nkilib's kernel.
 from vllm_neuron.functional.vendored_kernels.rotational_topk import (
     create_rotational_topk_config,
     create_topk_config,

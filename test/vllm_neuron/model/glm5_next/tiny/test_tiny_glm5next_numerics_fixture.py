@@ -11,9 +11,17 @@ sha256 digests, per batch size, of:
   output and both state banks of every layer after the last step.
 
 This tree runs the identical scenarios -- the bank-form carriers at ``B > 1`` and the
-untouched one-request path at ``B = 1`` -- and every digest must be equal. Two negative
-controls show the digests have power: a broken bank gather and a broken ring write each
-change them.
+untouched one-request path at ``B = 1`` -- and every digest must be equal, but for the four
+values :data:`SELECTION_ORDER_DIGESTS` pins instead (in the DSA world at ``B = 64``, which
+the decode selection's pool order moves). Two negative controls show the
+digests have power: a broken bank gather and a broken ring write each change them.
+
+The fixture was produced at ``OMP_NUM_THREADS=4`` (the producing command in
+``gen_numerics_fixture.py``). Torch splits a CPU op's work by the intra-op thread count,
+and some of the worlds' sums round apart at another count: an unchanged tree moves the
+DSA ``B = 64`` digests at 1 thread, and the DSA ``B = 64`` and KDA ``B = 1`` digests at
+96. So every test here runs at :data:`FIXTURE_THREADS`, whatever count the process
+started with.
 
     NKI_SIMULATOR=1 VLLM_NEURON_CPU_MODE=1 python -m pytest \\
         test/vllm_neuron/model/glm5_next/tiny/test_tiny_glm5next_numerics_fixture.py
@@ -32,6 +40,41 @@ from test.vllm_neuron.model.glm5_next.tiny import test_tiny_glm5next_e2e as e2e
 pytestmark = [pytest.mark.fast, pytest.mark.forked]
 
 BASE_REV = "0a08ff4"
+
+#: The digests this tree's decode selection moves from the base, by batch size: in the DSA
+#: world at B = 64, the final logits and the last DSA layer's pooled store, ring and KV
+#: cache. The one-kernel selection (``decode_select.py``) lists a request's selected pools
+#: in ascending pool order, where the base's four-kernel route listed them by descending
+#: score. The selected sets are the same (``test_decode_select.py`` pins them against the
+#: base's chain); the sparse attention sums the selected rows in column order, so its bf16
+#: output rounds apart in the last bits from the second layer on. The first two layers'
+#: state keeps the base's digests; the third layer's input is the second layer's output,
+#: so what it writes moves, and the logits after it. The greedy ids stay the base's. Each
+#: value is this tree's own, bitwise, so any further move fails. B = 1 and B = 4 move
+#: nothing.
+SELECTION_ORDER_DIGESTS = {
+    64: {
+        "final_logits": "c9c5a400f85df1c43c1c35aad8cf24b47e77923260111cb873f538b35f90aa21",
+        "side.2.pool_cache[:B]":
+            "f2270e6ad69a9c5e19e8e57f73e23dd0496387bb6f128d585dd8616e56a2d42a",
+        "side.2.tail[:B]": "955d01bff2d68a2a96624205827f0264b83f16bb82eff2797d239c795c74cbf6",
+        "kv.layers.2.self_attn.0":
+            "8a3f808a04c7cc026db25badd23b8abf56070d39ca247cd7e914e01950d0a0a1",
+    },
+}
+
+#: The intra-op thread count the fixture was produced at; every test runs at it.
+FIXTURE_THREADS = 4
+
+
+@pytest.fixture(autouse=True)
+def _at_the_fixture_thread_count():
+    before = torch.get_num_threads()
+    torch.set_num_threads(FIXTURE_THREADS)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(before)
 
 
 def _fixture() -> dict:
@@ -55,7 +98,9 @@ def test_the_dsa_world_is_bitwise_the_base_revision(batch):
     assert want["steps"] >= 8
     got = gen.dsa_numerics(batch, want["steps"])
     assert got["prompts"] == want["prompts"]
-    _assert_same_digests(got["digests"], want["digests"], f"DSA B={batch}")
+    moved = SELECTION_ORDER_DIGESTS.get(batch, {})
+    assert set(moved) <= set(want["digests"]), sorted(set(moved) - set(want["digests"]))
+    _assert_same_digests(got["digests"], {**want["digests"], **moved}, f"DSA B={batch}")
     # Information, not evidence (the seeded head pins the argmax): still equal.
     assert got["ids"] == want["ids"]
 

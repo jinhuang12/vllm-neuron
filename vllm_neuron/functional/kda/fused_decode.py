@@ -80,6 +80,7 @@ import nki.language as nl
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
+from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 from vllm_neuron.functional.kda.chunked_recurrence import L2_NORM_EPS, MAX_TILE
 from vllm_neuron.utils.neuron_utils import can_run_kernel, values_are_readable
 
@@ -722,8 +723,12 @@ def fused_decode_enabled() -> bool:
 
 
 def fused_decode_grid(vdim: int) -> tuple[int, ...]:
-    """``(2,)`` on an LNC2 runtime when the value rows split evenly, else ``()``."""
-    if os.environ.get("NEURON_LOGICAL_NC_CONFIG") == "2" and vdim % 2 == 0:
+    """``(2,)`` on an LNC2 runtime when the value rows split evenly, else ``()``.
+
+    :func:`~vllm_neuron.functional.dsa.launch_grid.lnc_pair` refuses a setting other
+    than unset, 1 or 2 (``LaunchGridError``).
+    """
+    if lnc_pair() and vdim % 2 == 0:
         return (2,)
     return ()
 

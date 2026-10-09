@@ -190,24 +190,22 @@ def _ownership_probe(row_ids, expert_ids):
     manager = create_auto_alloc_manager()
     manager.open_scope("ownership_probe")
     q = row_ids.shape[1]
-    step = min(q, 32)
-    while q % step:
-        step -= 1
-    tile_counts, block_counts = _module._routing_counts(row_ids, step, manager)
-    paired, paired_count, dense, sparse, tiles, dense_count, sparse_count, tile_count = _module._routing_worklists(
-        tile_counts, block_counts, expert_ids, q, manager,
+    step = _module._row_step(q, q)
+    span = _module._routing_spans(row_ids, step, manager)
+    paired, classes, empty = _module._routing_worklists(
+        span, _module._experts_row(expert_ids), _module._row_classes(q, step), manager,
         merge_pairs=(q == 256),
     )
-    if paired is None:
-        paired = manager.alloc((1, row_ids.shape[0] + 1), nl.int32)
-        nisa.memset(dst=paired, value=-1)
-        nisa.memset(dst=paired[:, row_ids.shape[0]:row_ids.shape[0] + 1], value=0)
     result = []
-    for source in (paired, dense, sparse, tiles):
-        destination = nl.ndarray((programs, source.shape[1]), dtype=nl.int32,
+    blocks = row_ids.shape[0]
+    for source in ([paired] if paired else []) + classes + [empty]:
+        listed = _module._list_entries(source, blocks)
+        destination = nl.ndarray((programs, listed.shape[1]), dtype=nl.int32,
                                   buffer=nl.shared_hbm)
-        nisa.dma_copy(dst=destination[program:program + 1, :], src=source)
-        result.append(destination)
+        count = nl.ndarray((programs, 1), dtype=nl.float32, buffer=nl.shared_hbm)
+        nisa.dma_copy(dst=destination[program:program + 1, :], src=listed)
+        nisa.dma_copy(dst=count[program:program + 1, :], src=source[1])
+        result += [destination, count]
     manager.close_scope()
     return tuple(result)
 
@@ -225,35 +223,23 @@ def test_worklists_cover_original_slots_once(blocks, q, programs, monkeypatch):
         ids[block, torch.randperm(q, generator=generator)[:count]] = block
     experts = torch.tensor([i // 3 for i in range(blocks)], dtype=torch.int32).reshape(-1, 1)
     actual = wrap_nki(_ownership_probe)[programs](ids, experts)
-    dense = [i for i, count in enumerate(counts) if count > q // 2]
-    sparse = [i for i, count in enumerate(counts) if count <= q // 2]
-    pairs, covered = [], set()
-    index = 0
-    while index < blocks - 1:
-        if q == 256 and index in dense and index + 1 in dense and experts[index] == experts[index + 1]:
-            pairs.append(index)
-            covered.update((index, index + 1))
-            index += 2
-        else:
-            index += 1
-    singles = [i for i in dense if i not in covered]
-    step = min(q, 32)
-    while q % step:
-        step -= 1
-    tiles = [block * (q // step) + tile for block in sparse
-             for tile in range(q // step)
-             if (ids[block, tile * step:(tile + 1) * step] >= 0).any()]
-    expected_lists = (pairs, singles, sparse, tiles)
-    for observed, expected in zip(actual, expected_lists):
-        for program in range(programs):
-            assert int(observed[program, -1]) == len(expected)
-            assert observed[program, :len(expected)].tolist() == expected
-            assert torch.equal(observed[program, len(expected):-1],
-                               torch.full_like(observed[program, len(expected):-1], -1))
-        assert torch.equal(observed, observed[:1].expand_as(observed))
-    owners = [slot for first in pairs for slot in (first, first + 1)] + singles
-    assert sorted(owners) == dense and len(owners) == len(set(owners))
-    assert set(owners).isdisjoint(sparse)
+    lists = []
+    for entries, count in zip(actual[0::2], actual[1::2]):
+        assert torch.equal(entries, entries[:1].expand_as(entries))
+        assert torch.equal(count, count[:1].expand_as(count))
+        length = int(count[0, 0])
+        assert torch.all(entries[0, length:] == blocks)
+        lists.append(entries[0, :length].tolist())
+    pairs = lists[0] if q == 256 else []
+    owners = [slot for first in pairs for slot in (first, first + 1)]
+    owners += [block for owned in lists[1 if q == 256 else 0:] for block in owned]
+    # Every original block has exactly one owner: a pair, a row class, or the
+    # zero list, which holds exactly the blocks without a routed row.
+    assert sorted(owners) == list(range(blocks))
+    assert lists[-1] == [block for block, count in enumerate(counts) if count == 0]
+    for first in pairs:
+        assert experts[first] == experts[first + 1]
+        assert counts[first] > 0 and counts[first + 1] > 0
 
 
 @nki.jit
@@ -274,11 +260,10 @@ def _small_pair_body_probe(hidden, weights, scales, row_ids, expert_ids,
     clamp = nl.ndarray((128, 3), dtype=nl.float32, buffer=nl.sbuf)
     nisa.dma_copy(dst=clamp, src=bounds)
     block = nisa.register_alloc(FIRST)
-    expert, scale = _module._expert_operands(expert_ids, scales, block,
-                                            weights.shape[1], nh)
-    _module._compute_rows(hidden, weights, affinity, row_ids, expert_ids,
-                          output, clamp, scale, expert, block, 0, 2 * q,
-                          2, 2)
+    loaded = _module._expert_operands(weights, scales, _module._experts_row(expert_ids),
+                                      block, 2, 2)
+    compute = (hidden, weights, row_ids, expert_ids, affinity, clamp, output)
+    _module._compute_rows(compute, loaded, block, 0, 2 * q)
     return output
 
 

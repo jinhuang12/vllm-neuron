@@ -22,13 +22,14 @@ those rows against a row-major bf16 weight whose rows are the OUTPUT features
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 
 import torch
 
 import nki.isa as nisa
 import nki.language as nl
+
+from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 
 PARTITIONS = nl.tile_size.pmax
 #: One PSUM bank: 2 KiB (the transposes go through PSUM one bank at a time).
@@ -118,8 +119,12 @@ def load_rows_transposed(dst, weight, row0: int, rows: int, blocks: int) -> None
 
 
 def launch_programs() -> int:
-    """2 programs (both LNC2 cores) under ``NEURON_LOGICAL_NC_CONFIG=2``, else 1."""
-    return 2 if os.environ.get("NEURON_LOGICAL_NC_CONFIG") == "2" else 1
+    """2 programs (both cores of an LNC2 pair) under the LNC setting 2, 1 when unset or 1.
+
+    :func:`~vllm_neuron.functional.dsa.launch_grid.lnc_pair` reads the setting and
+    refuses one other than unset, 1 or 2 (``LaunchGridError``).
+    """
+    return 2 if lnc_pair() else 1
 
 
 @dataclass
