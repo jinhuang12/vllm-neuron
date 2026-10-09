@@ -22,7 +22,7 @@ import torch
 from vllm_neuron.functional.moe import router as seam
 from vllm_neuron.functional.moe.router import (
     NOAUX_TC_DENOM_EPS,
-    NOAUX_TC_K,
+    NOAUX_TC_MAX8_WIDTH,
     NOAUX_TC_TILE,
     NoauxTcRouterError,
     noaux_tc_correct,
@@ -74,15 +74,15 @@ def build_logits(tokens: int, seed: int = FIXTURE_SEED):
     every ``tokens``.
     """
     gen = torch.Generator().manual_seed(seed)
-    w_top = (WINNER_HI - WINNER_LO) / (NOAUX_TC_K - 1)
-    w_lo = (LOSER_HI - LOSER_LO) / (NUM_EXPERTS - NOAUX_TC_K - 1)
+    w_top = (WINNER_HI - WINNER_LO) / (NOAUX_TC_MAX8_WIDTH - 1)
+    w_lo = (LOSER_HI - LOSER_LO) / (NUM_EXPERTS - NOAUX_TC_MAX8_WIDTH - 1)
 
     ladder = torch.empty(NUM_EXPERTS, dtype=torch.float32)
     for rank in range(NUM_EXPERTS):
-        if rank < NOAUX_TC_K:
+        if rank < NOAUX_TC_MAX8_WIDTH:
             ladder[rank] = WINNER_HI - rank * w_top
         else:
-            ladder[rank] = LOSER_HI - (rank - NOAUX_TC_K) * w_lo
+            ladder[rank] = LOSER_HI - (rank - NOAUX_TC_MAX8_WIDTH) * w_lo
 
     choice = torch.empty(tokens, NUM_EXPERTS, dtype=torch.float32)
     for token in range(tokens):
@@ -215,7 +215,7 @@ def _check_correct_entry(tokens: int, label: str) -> None:
 
     got = got_affinities.to(torch.float32)
     expected = expected_affinities.to(torch.float32)
-    assert tuple(got_index.shape) == (tokens, NOAUX_TC_K)
+    assert tuple(got_index.shape) == (tokens, NOAUX_TC_MAX8_WIDTH)
     assert got.shape == expected.shape == (tokens, NUM_EXPERTS)
     assert set_equal_rows(got_index, expected_index) == tokens
     torch.testing.assert_close(got, expected, rtol=RTOL, atol=ATOL)
@@ -257,9 +257,9 @@ def _check_fused_entry(tokens: int, label: str) -> None:
     # extent -- `substrate_index` included, which would otherwise stay at the
     # padded length and be compared row-for-row against a shorter selection.
     assert tuple(logits.shape) == (tokens, NUM_EXPERTS)
-    assert tuple(got_index.shape) == (tokens, NOAUX_TC_K)
+    assert tuple(got_index.shape) == (tokens, NOAUX_TC_MAX8_WIDTH)
     assert tuple(got_affinities.shape) == (tokens, NUM_EXPERTS)
-    assert tuple(substrate_index.shape) == (tokens, NOAUX_TC_K)
+    assert tuple(substrate_index.shape) == (tokens, NOAUX_TC_MAX8_WIDTH)
     assert bool(torch.isfinite(logits).all())
 
     expected_logits, expected_index, expected_affinities, _ = (

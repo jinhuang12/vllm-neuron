@@ -566,6 +566,9 @@ def analyse_only(args) -> None:
 
 
 def main() -> None:
+    from test.vllm_neuron import artifacts
+
+    profiles = artifacts.campaign_path("glm53f-wt2", "moe-prefill-profiles")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--tokens", type=int, nargs="+", default=list(TOKENS))
@@ -576,11 +579,9 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=30)
     parser.add_argument("--profile-iterations", type=int, default=3)
-    parser.add_argument("--profile-dir", type=Path,
-                        default=Path("/home/ubuntu/glm53f-wt2/moe-prefill-profiles"))
+    parser.add_argument("--profile-dir", type=Path, default=profiles)
     parser.add_argument("--no-profile", action="store_true")
-    parser.add_argument("--explorer-data", type=Path,
-                        default=Path("/home/ubuntu/glm53f-wt2/moe-prefill-profiles/explorer-data"))
+    parser.add_argument("--explorer-data", type=Path, default=profiles / "explorer-data")
     parser.add_argument("--no-accuracy", dest="accuracy", action="store_false",
                         help="skip the router-accuracy graphs")
     parser.add_argument("--analyze-only", action="store_true",

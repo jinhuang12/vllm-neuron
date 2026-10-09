@@ -12,8 +12,14 @@ matching ``slot_score`` and a per-slot additive bias ``ape[pool_size, 128]``::
 The softmax is per (pool, channel), not per pool: one independent ``pool_size``-way
 softmax for every ``(p, d)`` pair. A whole-vector softmax over the 128 channels is a
 plausible-looking different function. ``ape`` is applied inside the softmax, and the
-gate arrives already evaluated as ``slot_score``. The rotation is an in-register
-butterfly, so no 128x128 transform matrix is built or multiplied here.
+gate arrives already evaluated as ``slot_score``. Both kernels rotate by multiplying
+with ``H_128`` on the Tensor Engine, and both build that matrix on chip by running the
+butterfly (``_fwht128_inplace``) over ``I_128``; the decode kernels run the same
+butterfly on their pooled vectors directly, so every path applies one transform.
+
+Under LNC2 (``NEURON_LOGICAL_NC_CONFIG=2``, the serving setting) both kernels launch
+two programs, one per physical core, and each program serves a contiguous half of the
+rows or pools.
 
 The kernel only ever sees complete pools; pool formation, the sliding window, slot
 mapping and the trailing partial pool belong to the indexer, and the fp8
@@ -25,10 +31,8 @@ graph specialises on the exact ``(n_pools, pool_size, head_dim, dtype)`` tuple.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 from dataclasses import dataclass
-from pathlib import Path
 
 import torch
 from torch import Tensor
@@ -98,22 +102,30 @@ spelling would fail a correct kernel.
 _SUPPORTED_DTYPES = (torch.bfloat16,)
 """``slot_k`` dtypes that take the NKI route. bf16 is the indexer path's dtype."""
 
-ROTATION_ROWS_PER_PARTITION = 8
-"""Rows one partition carries in a rotation tile: ``[128, 8 * 128]`` fp32, 4 KiB a partition.
+_CHUNK_TILES = 16
+"""128-row tiles the rotation moves per DMA: 4 KiB per partition at bf16.
 
-The butterfly's cost is the instruction count, not the element count: 0a08ff4 issued 254
-vector instructions per 128-row tile, each on a ``[rows, stride]`` slice. Every stage is now
-two instructions over every block of every row of a tile, so a tile of ``128 * 8`` rows costs
-14 butterfly instructions instead of ``8 * 254``. Eight rows a partition make the decode query
-at B=64 (``64 * 32`` rows) one tile per core.
+Measured on trn2 at the served prefill row counts: 8 and 32 tiles are slower, and
+chunks that ramp up and down in size to shorten the pipeline's fill and drain are
+slower still, because each extra DMA costs more than the fill it saves.
 """
 
-SOURCE_DIGEST = int(hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:7], 16)
-"""This file's content digest, handed to every kernel here as a trace-time int.
+_GROUP_TILES = 8
+"""128-row tiles per PSUM round trip of the rotation.
 
-The compiled kernel cache keys on a kernel's own source and its arguments, and the kernels call
-helpers whose edits it would otherwise not see (``decode_batch.SOURCE_DIGEST`` is the same
-mechanism).
+A group's bf16 transposes fill one 2 KiB PSUM bank and its fp32 products two, so the
+next group's transposes and this group's products fit in PSUM's eight banks side by
+side. 4 and 16 were slower on trn2.
+"""
+
+_POOL_TILE_COLUMNS = 3
+"""Pools each partition carries per tile of the fused kernel.
+
+A tile holds 128 partitions of this many consecutive pools, so one DMA moves this many
+whole pools per partition and every Vector Engine instruction covers them all. Wider
+tiles cost fewer instructions, narrower ones let the next tile's load overlap this one's
+compute. Measured on trn2 at the served 1024 and 2048 pools, 3 is within 0.5 us of the
+fastest width at both; 1 is slower at both, 2 at 2048 pools and 4 at 1024.
 """
 
 
@@ -187,100 +199,52 @@ def _kernel_identity_of(kernel) -> tuple[str, str]:
 def _fwht128_inplace(buf_a, buf_b, head_dim: int):
     """The 7-stage FWHT butterfly along the free axis. Returns the tile holding the result.
 
-    Ping-pongs between two ``(rows, head_dim)`` tiles because a stage reads two
-    slices and writes both of them: writing into the tile being read would let a
-    later group in the same stage consume an already-rotated value. Seven stages is
-    an odd number, so the result is in whichever buffer this returns -- the caller
-    must use the return value. Each stage, for every block of ``2 * stride``
-    channels::
+    ``buf_a`` holds the input and ``buf_b`` is scratch of the same shape. The free axis may
+    carry several ``head_dim``-wide vectors side by side (``(rows, k * head_dim)``); each is
+    transformed on its own, because no butterfly block of ``2 * stride <= head_dim`` channels
+    crosses a ``head_dim`` boundary.
+
+    Ping-pongs between the two tiles because a stage reads two slices and writes both of
+    them: writing into the tile being read would let a later block of the same stage consume
+    an already-rotated value. Seven stages is an odd number, so the result is in whichever
+    tile this returns, and the caller must use the return value. Each stage is two
+    instructions over every block at once, for every block of ``2 * stride`` channels::
 
         out[lo] = in[lo] + in[hi]
         out[hi] = in[lo] - in[hi]
 
-    The ``1/sqrt(128)`` scale is not applied here; the caller applies it once, after
-    all seven stages.
+    The ``1/sqrt(128)`` scale is not applied here; the caller applies it once, after all
+    seven stages.
     """
+    vectors = buf_a.shape[1] // head_dim
     src, dst = buf_a, buf_b
     for stride in HADAMARD_STRIDES:
-        block = 2 * stride
-        for start in range(0, head_dim, block):
-            lo_in = src[:, start:start + stride]
-            hi_in = src[:, start + stride:start + block]
-            nisa.tensor_tensor(
-                dst=dst[:, start:start + stride], data1=lo_in, data2=hi_in, op=nl.add
-            )
-            nisa.tensor_tensor(
-                dst=dst[:, start + stride:start + block], data1=lo_in, data2=hi_in, op=nl.subtract
-            )
+        blocks = vectors * (head_dim // (2 * stride))
+        src_pairs = src.reshape_dim(1, (blocks, 2, stride))
+        dst_pairs = dst.reshape_dim(1, (blocks, 2, stride))
+        lo_in = src_pairs.select(2, 0)
+        hi_in = src_pairs.select(2, 1)
+        nisa.tensor_tensor(dst=dst_pairs.select(2, 0), data1=lo_in, data2=hi_in, op=nl.add)
+        nisa.tensor_tensor(dst=dst_pairs.select(2, 1), data1=lo_in, data2=hi_in, op=nl.subtract)
         src, dst = dst, src
     return src
 
 
 def _fwht128_blocks(buf_a, buf_b, parts: int, rows: int):
-    """The 7-stage FWHT butterfly over ``rows`` 128-channel rows per partition at once.
+    """The butterfly over ``rows`` 128-channel rows on each of ``parts`` partitions.
 
-    ``buf_a`` and ``buf_b`` are ``(parts, rows * 128)`` fp32 tiles, row ``j`` of a partition in
-    columns ``128 j .. 128 j + 127``. A stage of stride ``s`` sees every partition's free axis
-    as ``rows * 128 / (2 s)`` blocks of ``2 s`` channels, and one instruction writes the low
-    half of every block (``in[lo] + in[hi]``), one the high half (``in[lo] - in[hi]``): the same
-    fp32 add and subtract on the same operands as :func:`_fwht128_inplace`, which issues them
-    one block at a time, so the two agree bit for bit. Ping-pongs and returns the result tile
-    for the reason :func:`_fwht128_inplace` gives.
-    """
-    src, dst = buf_a, buf_b
-    for stride in HADAMARD_STRIDES:
-        blocks = rows * (INDEX_HEAD_DIM // (2 * stride))
-        src3 = src.reshape((parts, blocks, 2 * stride))
-        dst3 = dst.reshape((parts, blocks, 2 * stride))
-        lo_in = src3[:, :, 0:stride]
-        hi_in = src3[:, :, stride:2 * stride]
-        nisa.tensor_tensor(dst=dst3[:, :, 0:stride], data1=lo_in, data2=hi_in, op=nl.add)
-        nisa.tensor_tensor(dst=dst3[:, :, stride:2 * stride], data1=lo_in, data2=hi_in,
-                           op=nl.subtract)
-        src, dst = dst, src
-    return src
-
-
-def _rotate_rows(x_hbm, out_hbm, row0: int, parts: int, rows: int):
-    """Rotate rows ``row0 .. row0 + parts * rows - 1``: partition ``p`` holds rows
-    ``row0 + p * rows .. row0 + p * rows + rows - 1``, one contiguous read and write each.
-
-    The per-element sequence is 0a08ff4's: the source dtype staged and widened to fp32, the
-    butterfly, one multiply by ``HADAMARD_SCALE`` in fp32, the cast back.
+    ``buf_a`` and ``buf_b`` are ``(parts, rows * INDEX_HEAD_DIM)`` fp32 tiles, row ``j`` of a
+    partition in columns ``128 j .. 128 j + 127``; ``buf_a`` holds the input, ``buf_b`` is
+    scratch, and the result is in the returned tile. This is the name and signature the
+    batched decode ring step calls (``_fwht128_blocks(pooled, scratch, h, 1)``, one row on
+    each of ``h`` partitions). :func:`_fwht128_inplace` already transforms every
+    ``INDEX_HEAD_DIM``-wide vector of its free axis on its own, two instructions a stage, so
+    this is that call on the two tiles viewed at the stated shape: the same instructions on
+    the same operands.
     """
     width = rows * INDEX_HEAD_DIM
-    pattern = [[width, parts], [1, width]]
-    staged = nl.ndarray((parts, width), dtype=x_hbm.dtype, buffer=nl.sbuf)
-    nisa.dma_copy(dst=staged, src=x_hbm.ap(pattern=pattern, offset=row0 * INDEX_HEAD_DIM))
-    buf_a = nl.ndarray((parts, width), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=buf_a, src=staged)
-    buf_b = nl.ndarray((parts, width), dtype=nl.float32, buffer=nl.sbuf)
-    rotated = _fwht128_blocks(buf_a, buf_b, parts, rows)
-    scaled = nl.ndarray((parts, width), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_scalar(dst=scaled, data=rotated, op0=nl.multiply, operand0=HADAMARD_SCALE)
-    result = nl.ndarray((parts, width), dtype=x_hbm.dtype, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=result, src=scaled)
-    nisa.dma_copy(dst=out_hbm.ap(pattern=pattern, offset=row0 * INDEX_HEAD_DIM), src=result)
-
-
-def _load_fp32(hbm, rows: int, head_dim: int, row_stride: int, offset: int):
-    """A ``(rows, head_dim)`` fp32 tile from a 2-D HBM buffer, widened on the way in.
-
-    ``row_stride`` is in elements, so a caller reading slot ``s`` of a flattened
-    ``[n_pools * pool_size, head_dim]`` buffer passes ``pool_size * head_dim``.
-
-    The DMA lands in a tile of the source dtype and a separate ``tensor_copy`` does
-    the widening. The staging is unconditional rather than guarded by a
-    ``hbm.dtype == nl.float32`` test, because comparing a NKI tensor's dtype against
-    a ``nki.language`` dtype object is a trace-time equality; always staging is
-    correct for every input dtype at the cost of one extra copy when the source is
-    already fp32.
-    """
-    out = nl.ndarray((rows, head_dim), dtype=nl.float32, buffer=nl.sbuf)
-    staged = nl.ndarray((rows, head_dim), dtype=hbm.dtype, buffer=nl.sbuf)
-    nisa.dma_copy(dst=staged, src=hbm.ap(pattern=[[row_stride, rows], [1, head_dim]], offset=offset))
-    nisa.tensor_copy(dst=out, src=staged)
-    return out
+    return _fwht128_inplace(buf_a.reshape((parts, width)), buf_b.reshape((parts, width)),
+                            INDEX_HEAD_DIM)
 
 
 def _broadcast_row(hbm, rows: int, head_dim: int, row: int):
@@ -292,8 +256,11 @@ def _broadcast_row(hbm, rows: int, head_dim: int, row: int):
     must carry one entry per partition of ``dst``, so a ``(1, head_dim)`` row is
     refused by the MLIR verifier.
 
-    Stages through the source dtype unconditionally, for the reason ``_load_fp32``
-    gives.
+    The DMA lands in a tile of the source dtype and a separate ``tensor_copy`` does the
+    widening. The staging is unconditional rather than guarded by a dtype test, because
+    comparing a NKI tensor's dtype against a ``nki.language`` dtype object is a
+    trace-time equality; always staging is correct for every input dtype at the cost of
+    one extra copy of one row per slot, once per kernel.
     """
     out = nl.ndarray((rows, head_dim), dtype=nl.float32, buffer=nl.sbuf)
     staged = nl.ndarray((rows, head_dim), dtype=hbm.dtype, buffer=nl.sbuf)
@@ -304,138 +271,329 @@ def _broadcast_row(hbm, rows: int, head_dim: int, row: int):
     return out
 
 
+def _program_share(n_items: int):
+    """``(first, owned)``: the contiguous run of ``n_items`` rows (pools) this program serves.
+
+    The launch's programs split the rows into ``ceil(n_items / programs)``-long runs in
+    program order, the last one shorter; every program reaches here with ``owned >= 1``
+    because the host launches more than one program only for ``n_items >= 2``.
+    """
+    programs = nl.num_programs(axes=0)
+    share = (n_items + programs - 1) // programs
+    first = nl.program_id(axis=0) * share
+    return first, min(share, n_items - first)
+
+
+def _row_blocks(first: int, owned: int, pmax: int, columns_cap: int):
+    """The ``owned`` rows from ``first`` as blocks: a list of ``(row0, partitions, columns)``.
+
+    Partition ``p`` of a block holds the ``columns`` consecutive rows from
+    ``row0 + p * columns``, so the block is ``partitions * columns`` consecutive rows and its
+    DMA reads ``columns`` whole rows per partition in one contiguous run. Whole 128-row
+    tiles are grouped ``columns_cap`` at a time, the last group shorter; the
+    ``owned % pmax`` rows left over form one block of that many partitions and one column.
+    """
+    blocks = []
+    row = first
+    whole_tiles = owned // pmax
+    for start in range(0, whole_tiles, columns_cap):
+        columns = min(columns_cap, whole_tiles - start)
+        blocks.append((row, pmax, columns))
+        row = row + pmax * columns
+    if owned % pmax > 0:
+        blocks.append((row, owned % pmax, 1))
+    return blocks
+
+
+def _block_rows(hbm, block, unit):
+    """``hbm`` viewed as one block of ``_row_blocks``: ``[partitions, columns, *unit]``.
+
+    ``unit`` is the shape of one of the block's rows in ``hbm``'s elements: ``(head_dim,)`` for
+    a rotated row, ``(pool_size, head_dim)`` for a pool of a flattened
+    ``[n_pools * pool_size, head_dim]`` buffer.
+    """
+    unit_elements = 1
+    for extent in unit:
+        unit_elements = unit_elements * extent
+    pattern = [[block[2] * unit_elements, block[1]], [unit_elements, block[2]]]
+    stride = unit_elements
+    for extent in unit:
+        stride = stride // extent
+        pattern.append([stride, extent])
+    return hbm.ap(pattern=pattern, offset=block[0] * unit_elements)
+
+
+def _slot_fold(values, op, pool_size: int):
+    """``op`` folded over the slot axis of ``values[rows, columns, pool_size, head_dim]``.
+
+    In slot order, ``op(...op(op(v[0], v[1]), v[2])..., v[pool_size - 1])``: the order the
+    reference sums in, so an ``add`` fold rounds the same way. Each step writes its own slot of
+    one fresh tile, so no step's destination is one of its sources. Returns a
+    ``[rows, columns, head_dim]`` view of the last step, or of slot 0 when there is one slot.
+    """
+    if pool_size == 1:
+        return values[:, :, 0, :]
+    rows, columns, _, head_dim = values.shape
+    steps = nl.ndarray((rows, pool_size - 1, columns, head_dim), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=steps[:, 0, :, :], data1=values[:, :, 0, :], data2=values[:, :, 1, :], op=op)
+    for slot in range(2, pool_size):
+        nisa.tensor_tensor(
+            dst=steps[:, slot - 1, :, :], data1=steps[:, slot - 2, :, :], data2=values[:, :, slot, :],
+            op=op,
+        )
+    return steps[:, pool_size - 2, :, :]
+
+
+def _pool_block(slot_k_hbm, slot_score_hbm, out_hbm, biases, transform, block, pool_size: int):
+    """Pool, rotate, scale and store one block of ``_row_blocks`` over the pools.
+
+    ``biases`` holds one ``(pmax, head_dim)`` fp32 tile of ``ape`` per slot and ``transform`` is
+    the fp32 ``H_128`` of ``_transform_matrix``. Every Vector Engine step is one instruction
+    over the whole block, so a block of ``columns`` pools per partition costs the instructions
+    of one pool. The softmax is the reference's, step for step: the max, the shift, ``exp`` on
+    the Scalar Engine, the slot sums in slot order. Two steps move off the Vector Engine, which
+    bounds this kernel: the reciprocal of the sum runs on the Scalar Engine, and the rotation
+    is the rotation kernel's, a multiply by ``H`` on the Tensor Engine with the scale applied
+    once on the way out of PSUM.
+    """
+    rows = block[1]
+    columns = block[2]
+    head_dim = slot_k_hbm.shape[1]
+    shape = (rows, columns, pool_size, head_dim)
+    unit = (pool_size, head_dim)
+    score = nl.ndarray(shape, dtype=slot_score_hbm.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=score, src=_block_rows(slot_score_hbm, block, unit))
+    key = nl.ndarray(shape, dtype=slot_k_hbm.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=key, src=_block_rows(slot_k_hbm, block, unit))
+
+    # Softmax over the slots, per (pool, channel), shifted by the max for stability.
+    total = nl.ndarray(shape, dtype=nl.float32, buffer=nl.sbuf)
+    for slot in range(pool_size):
+        nisa.tensor_tensor(
+            dst=total[:, :, slot, :], data1=score[:, :, slot, :],
+            data2=biases[slot][0:rows, :].expand_dim(1).broadcast(1, columns), op=nl.add,
+        )
+    peak = _slot_fold(total, nl.maximum, pool_size)
+    shifted = nl.ndarray(shape, dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(
+        dst=shifted, data1=total, data2=peak.expand_dim(2).broadcast(2, pool_size), op=nl.subtract
+    )
+    weight = nl.ndarray(shape, dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(dst=weight, op=nl.exp, data=shifted)
+    denom = _slot_fold(weight, nl.add, pool_size)
+    weighted = nl.ndarray(shape, dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=weighted, data1=weight, data2=key, op=nl.multiply)
+    acc = _slot_fold(weighted, nl.add, pool_size)
+
+    # Reciprocal then multiply: no engine divides one tile by another. Measured on trn2 at
+    # every fp32 from 1 to 4, a 4-slot sum's whole range, the Scalar Engine's reciprocal is
+    # within 1.2e-5 relative of the exact one; the Vector Engine's is correctly rounded but
+    # takes about 6 cycles an element, and this kernel is bound by the Vector Engine.
+    inv = nl.ndarray((rows, columns, head_dim), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(dst=inv, op=nl.reciprocal, data=denom)
+    pooled = nl.ndarray((rows, columns, head_dim), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=pooled, data1=acc, data2=inv, op=nl.multiply)
+
+    # One PSUM group for the whole block; the Scalar Engine moves the transposes out of PSUM,
+    # because the Vector Engine is this kernel's busy one.
+    group = _tile_groups([block], columns)[0]
+    transposed = _transpose_group(pooled, block, group, nisa.scalar_engine)
+    result = nl.ndarray((rows, columns, head_dim), dtype=slot_k_hbm.dtype, buffer=nl.sbuf)
+    _rotate_group(transposed, result, block, group, transform)
+    nisa.dma_copy(dst=_block_rows(out_hbm, block, (head_dim,)), src=result)
+
+
+def _transform_matrix(head_dim: int, dtype):
+    """``H_128`` in ``dtype``, built on chip as the butterfly applied to ``I_128``.
+
+    Row ``r`` of the butterfly's output on ``I`` is the transform of the unit vector ``e_r``,
+    which is row ``r`` of ``H``; ``H`` is symmetric, so ``x @ H`` is the butterfly applied to
+    every row of ``x``. Every entry is ``+-1``, exact in any float dtype.
+    """
+    identity = nl.shared_identity_matrix(n=head_dim, dtype=nl.float32)
+    halves = nl.ndarray((head_dim, 2 * head_dim), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=halves[:, 0:head_dim], src=identity)
+    rows = _fwht128_inplace(halves[:, 0:head_dim], halves[:, head_dim:2 * head_dim], head_dim)
+    transform = nl.ndarray((head_dim, head_dim), dtype=dtype, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=transform, src=rows)
+    return transform
+
+
+def _tile_groups(blocks, group_cap: int):
+    """The 128-row tiles of every block, ``group_cap`` at a time.
+
+    A list of ``(block_index, first_tile, tiles, opens_block, closes_block)`` in block order:
+    ``block_index`` indexes ``blocks``, ``first_tile`` is the group's first tile within that
+    block, and the two flags mark a block's first and last group.
+    """
+    groups = []
+    for index in range(len(blocks)):
+        columns = blocks[index][2]
+        for start in range(0, columns, group_cap):
+            tiles = min(group_cap, columns - start)
+            groups.append((index, start, tiles, start == 0, start + tiles == columns))
+    return groups
+
+
+def _load_block(x_hbm, block):
+    """Allocate one block's input and output tiles and start the input's DMA."""
+    shape = (block[1], block[2], x_hbm.shape[1])
+    rows_in = nl.ndarray(shape, dtype=x_hbm.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=rows_in, src=_block_rows(x_hbm, block, (x_hbm.shape[1],)))
+    rows_out = nl.ndarray(shape, dtype=x_hbm.dtype, buffer=nl.sbuf)
+    return rows_in, rows_out
+
+
+def _transpose_group(rows_in, block, group, engine):
+    """One group's tiles transposed on the Tensor Engine: ``[head_dim, tiles, pmax]`` in SBUF.
+
+    Tensor Engine transposes are bit-exact on trn2. A partial block's tiles fill the first
+    ``partitions`` columns only, and only those are copied out of PSUM, by ``engine``: the
+    Vector or the Scalar Engine, whichever the caller's other work leaves idle. Both copy a
+    same-dtype tile exactly.
+    """
+    partitions = block[1]
+    first_tile = group[1]
+    tiles = group[2]
+    head_dim = rows_in.shape[2]
+    pmax = nl.tile_size.pmax
+    staged = nl.ndarray((head_dim, tiles, pmax), dtype=rows_in.dtype, buffer=nl.psum)
+    for k in range(tiles):
+        nisa.nc_transpose(
+            dst=staged[:, k, 0:partitions], data=rows_in[:, first_tile + k, :],
+            engine=nisa.tensor_engine,
+        )
+    transposed = nl.ndarray((head_dim, tiles, pmax), dtype=rows_in.dtype, buffer=nl.sbuf)
+    nisa.tensor_copy(
+        dst=transposed[:, :, 0:partitions], src=staged[:, :, 0:partitions], engine=engine
+    )
+    return transposed
+
+
+def _rotate_group(transposed, rows_out, block, group, transform):
+    """``tile @ H * (1 / sqrt(128))`` for one group's tiles, into the block's output tile.
+
+    The products accumulate in fp32 PSUM; the Scalar Engine applies the scale while it moves
+    them to SBUF in the output dtype, so the scale is applied once and rounded once.
+    """
+    partitions = block[1]
+    first_tile = group[1]
+    tiles = group[2]
+    head_dim = rows_out.shape[2]
+    product = nl.ndarray((nl.tile_size.pmax, tiles, head_dim), dtype=nl.float32, buffer=nl.psum)
+    for k in range(tiles):
+        nisa.nc_matmul(
+            dst=product[0:partitions, k, :], stationary=transposed[:, k, 0:partitions],
+            moving=transform,
+        )
+    nisa.activation(
+        dst=rows_out[:, first_tile:first_tile + tiles, :], op=nl.copy,
+        data=product[0:partitions, :, :], scale=HADAMARD_SCALE,
+    )
+
+
 # ---------------------------------------------------------------------------------------------
 # Kernels
 # ---------------------------------------------------------------------------------------------
 
 
 @nki.jit
-def _kpool_hadamard_nki(slot_k_hbm, slot_score_hbm, ape_hbm, n_pools, pool_size,
-                        source_digest):
+def _kpool_hadamard_nki(slot_k_hbm, slot_score_hbm, ape_hbm, n_pools, pool_size):
     """Fused per-(pool, channel) softmax-weighted pooling and Hadamard-128 rotation.
 
     Args:
         slot_k_hbm: ``[n_pools * pool_size, head_dim]`` -- ``slot_k`` flattened so that a pool and
             a slot together address one row. bf16 on the shipped path.
         slot_score_hbm: ``[n_pools * pool_size, head_dim]`` -- the gate's per-token score,
-            flattened the same way.
+            flattened the same way. bf16 as served; any float dtype is read as is.
         ape_hbm: ``[pool_size, head_dim]`` fp32 -- the per-slot additive bias.
         n_pools: pools in the batch. A compile-time constant.
         pool_size: tokens per pool. A compile-time constant.
-        source_digest: :data:`SOURCE_DIGEST`; it only keys the kernel cache.
 
     Returns:
         ``[n_pools, head_dim]`` in ``slot_k_hbm``'s dtype.
 
-    The pool axis is the partition axis and the head dimension is the free axis,
-    which is what keeps the whole reduction elementwise: the softmax runs over the
-    slot tiles, so each of its steps is a ``tensor_tensor`` between two
-    ``(rows, head_dim)`` tiles and nothing reduces across partitions or along the
-    free axis. A short final tile is narrowed rather than masked, so no padded row
-    can reach the output.
+    The pool axis is the partition axis and the head dimension is the free axis, which is
+    what keeps the whole reduction elementwise: the softmax runs over the slot axis of one
+    tile, so each step is one ``tensor_tensor`` and nothing reduces across partitions. Each
+    program takes its run of pools (``_program_share``) as blocks of up to
+    ``_POOL_TILE_COLUMNS`` consecutive pools per partition (``_row_blocks``); a block of fewer
+    than 128 partitions is narrowed rather than masked, so no padded row can reach the
+    output. The softmax is Vector Engine element passes, which bound the kernel, so a wider
+    block divides the per-instruction cost and not the element count; the rotation runs on
+    the Tensor Engine with the rotation kernel's ``H`` in fp32, so the two kernels apply one
+    transform.
     """
     head_dim = slot_k_hbm.shape[1]
     out_hbm = nl.ndarray((n_pools, head_dim), dtype=slot_k_hbm.dtype, buffer=nl.shared_hbm)
     pmax = nl.tile_size.pmax
-    row_stride = pool_size * head_dim
-
-    for t in range((n_pools + pmax - 1) // pmax):
-        rows = min(pmax, n_pools - t * pmax)
-        base = t * pmax * row_stride
-
-        # Pass 1: per-(pool, channel) max of slot_score + ape, for softmax stability.
-        # The sums are kept rather than recomputed in pass 2: a tile holds up to 128 pools, so
-        # holding pool_size fp32 tiles costs less than that many more strided DMA reads.
-        totals = []
-        running_max = nl.ndarray((rows, head_dim), dtype=nl.float32, buffer=nl.sbuf)
-        for slot in range(pool_size):
-            score = _load_fp32(slot_score_hbm, rows, head_dim, row_stride, base + slot * head_dim)
-            bias = _broadcast_row(ape_hbm, rows, head_dim, slot)
-            total = nl.ndarray((rows, head_dim), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_tensor(dst=total, data1=score, data2=bias, op=nl.add)
-            totals.append(total)
-            if slot == 0:
-                nisa.tensor_copy(dst=running_max, src=total)
-            else:
-                nisa.tensor_tensor(
-                    dst=running_max, data1=running_max, data2=total, op=nl.maximum
-                )
-
-        # Pass 2: softmax-weighted sum of slot_k.
-        acc = nl.ndarray((rows, head_dim), dtype=nl.float32, buffer=nl.sbuf)
-        denom = nl.ndarray((rows, head_dim), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.memset(dst=acc, value=0.0)
-        nisa.memset(dst=denom, value=0.0)
-        for slot in range(pool_size):
-            shifted = nl.ndarray((rows, head_dim), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_tensor(dst=shifted, data1=totals[slot], data2=running_max, op=nl.subtract)
-            weight = nl.ndarray((rows, head_dim), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.activation(dst=weight, op=nl.exp, data=shifted)
-            nisa.tensor_tensor(dst=denom, data1=denom, data2=weight, op=nl.add)
-            key = _load_fp32(slot_k_hbm, rows, head_dim, row_stride, base + slot * head_dim)
-            weighted = nl.ndarray((rows, head_dim), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_tensor(dst=weighted, data1=weight, data2=key, op=nl.multiply)
-            nisa.tensor_tensor(dst=acc, data1=acc, data2=weighted, op=nl.add)
-
-        # Reciprocal then multiply, not a divide: one op per tile either way, and the reciprocal
-        # is the form the ISA exposes directly.
-        inv = nl.ndarray((rows, head_dim), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.reciprocal(dst=inv, data=denom)
-        pooled = nl.ndarray((rows, head_dim), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(dst=pooled, data1=acc, data2=inv, op=nl.multiply)
-
-        # Rotate, scale once, cast, store.
-        scratch = nl.ndarray((rows, head_dim), dtype=nl.float32, buffer=nl.sbuf)
-        rotated = _fwht128_inplace(pooled, scratch, head_dim)
-        scaled = nl.ndarray((rows, head_dim), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_scalar(dst=scaled, data=rotated, op0=nl.multiply, operand0=HADAMARD_SCALE)
-        result = nl.ndarray((rows, head_dim), dtype=slot_k_hbm.dtype, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=result, src=scaled)
-        nl.store(
-            out_hbm.ap(pattern=[[head_dim, rows], [1, head_dim]], offset=t * pmax * head_dim),
-            value=result,
-        )
+    first, owned = _program_share(n_pools)
+    biases = []
+    for slot in range(pool_size):
+        biases.append(_broadcast_row(ape_hbm, pmax, head_dim, slot))
+    transform = _transform_matrix(head_dim, nl.float32)
+    for block in _row_blocks(first, owned, pmax, _POOL_TILE_COLUMNS):
+        _pool_block(slot_k_hbm, slot_score_hbm, out_hbm, biases, transform, block, pool_size)
     return out_hbm
 
 
 @nki.jit
-def _hadamard128_nki(x_hbm, n_rows, source_digest):
+def _hadamard128_nki(x_hbm, n_rows):
     """The rotation stage alone: ``FWHT_128(row) * (1 / sqrt(128))`` for every row.
 
     Args:
         x_hbm: ``[n_rows, head_dim]`` -- the rows to rotate.
         n_rows: rows in the batch. A compile-time constant.
-        source_digest: :data:`SOURCE_DIGEST`; it only keys the kernel cache.
 
     Returns:
         ``[n_rows, head_dim]`` in ``x_hbm``'s dtype.
 
-    The rows split evenly over the programs of the launch grid (both cores of an LNC2 core
-    with a ``[2]`` grid), each program's share in tiles of up to ``128 *
-    ROTATION_ROWS_PER_PARTITION`` rows (:func:`_rotate_rows`), then one tile of whole
-    128-row groups, then one short tile of the last ``< 128`` rows, one row a partition. Rows
-    are independent, so the split changes no value. On ``I_128`` the output is ``H_128 /
-    sqrt(128)``, which reads all seven stages and the final scale at once.
+    A multiply by ``H_128`` on the Tensor Engine, with ``H`` built on chip from the butterfly
+    the fused kernel uses (``_transform_matrix``), so the two kernels apply one transform. The
+    products are exact and accumulate in fp32, and the result is scaled and rounded once, as
+    the butterfly's is; the two differ only in the order of the fp32 additions.
+
+    Rows sit on partitions as they arrive and the transform contracts over the head
+    dimension, so each 128-row tile is transposed on the Tensor Engine first and then
+    multiplied: two passes of the array per tile, which is what bounds this kernel. Each
+    program takes its run of rows (``_program_share``) in blocks of up to ``_CHUNK_TILES``
+    tiles (``_row_blocks``), one DMA each way per block, and works through them in groups of
+    ``_GROUP_TILES`` tiles per PSUM round trip. The program order is software-pipelined: the
+    next group's transposes are issued before this group's multiplies, so the array does not
+    wait while the Vector Engine moves a group out of PSUM, and the next block's load is
+    issued when the previous block's first group starts.
     """
     head_dim = x_hbm.shape[1]
     out_hbm = nl.ndarray((n_rows, head_dim), dtype=x_hbm.dtype, buffer=nl.shared_hbm)
-    pmax = nl.tile_size.pmax
-    n_prgs = nl.num_programs(axes=0)
-    prg = nl.program_id(0)
-    share = (n_rows + n_prgs - 1) // n_prgs
-    lo = prg * share
-    hi = min(n_rows, lo + share)
-    big = pmax * ROTATION_ROWS_PER_PARTITION
-    n_big = (hi - lo) // big
-    for t in range(n_big):
-        _rotate_rows(x_hbm, out_hbm, lo + t * big, pmax, ROTATION_ROWS_PER_PARTITION)
-    row = lo + n_big * big
-    if hi - row >= pmax:
-        rows = (hi - row) // pmax
-        _rotate_rows(x_hbm, out_hbm, row, pmax, rows)
-        row = row + pmax * rows
-    if hi - row > 0:
-        _rotate_rows(x_hbm, out_hbm, row, hi - row, 1)
+    first, owned = _program_share(n_rows)
+    blocks = _row_blocks(first, owned, nl.tile_size.pmax, _CHUNK_TILES)
+    groups = _tile_groups(blocks, _GROUP_TILES)
+    transform = _transform_matrix(head_dim, x_hbm.dtype)
+
+    rows_in = []
+    rows_out = []
+    for index in range(min(2, len(blocks))):
+        tiles = _load_block(x_hbm, blocks[index])
+        rows_in.append(tiles[0])
+        rows_out.append(tiles[1])
+    pending = _transpose_group(rows_in[0], blocks[0], groups[0], nisa.vector_engine)
+    for index in range(len(groups)):
+        group = groups[index]
+        ready = pending
+        if index + 1 < len(groups):
+            following = groups[index + 1]
+            if following[3] and following[0] + 1 < len(blocks):
+                tiles = _load_block(x_hbm, blocks[following[0] + 1])
+                rows_in.append(tiles[0])
+                rows_out.append(tiles[1])
+            pending = _transpose_group(
+                rows_in[following[0]], blocks[following[0]], following, nisa.vector_engine
+            )
+        _rotate_group(ready, rows_out[group[0]], blocks[group[0]], group, transform)
+        if group[4]:
+            nisa.dma_copy(
+                dst=_block_rows(out_hbm, blocks[group[0]], (head_dim,)), src=rows_out[group[0]]
+            )
     return out_hbm
 
 
@@ -463,6 +621,18 @@ def _record_nki_dispatch(entry: str, n_pools: int, pool_size: int, head_dim: int
         pool_size,
         head_dim,
     )
+
+
+def _programs(n_items: int) -> int:
+    """Programs to launch over ``n_items`` rows or pools: one per physical core under LNC2.
+
+    ``NEURON_LOGICAL_NC_CONFIG=2`` is the serving setting, one logical core made of two
+    physical cores, and the variable other DSA kernels read for the same choice
+    (``decode_batch._programs``). A single row cannot be split, so it takes one program.
+    """
+    if lnc_pair() and n_items >= 2:
+        return 2
+    return 1
 
 
 def _validate(slot_k: Tensor, slot_score: Tensor, ape: Tensor) -> tuple[int, int, int]:
@@ -510,13 +680,6 @@ def can_run_dsa_kpool_hadamard(slot_k: Tensor, slot_score: Tensor, ape: Tensor) 
     return ape.ndim == 2 and tuple(ape.shape) == tuple(slot_k.shape[1:])
 
 
-def hadamard128_programs(n_rows: int) -> int:
-    """Programs the rotation launches: both cores of an LNC2 core from two rows on."""
-    if lnc_pair() and int(n_rows) >= 2:
-        return 2
-    return 1
-
-
 def can_run_dsa_hadamard128(x: Tensor) -> bool:
     """Whether the stage-alone NKI kernel serves this call."""
     if not can_run_kernel():
@@ -554,8 +717,8 @@ def dsa_kpool_hadamard(slot_k: Tensor, slot_score: Tensor, ape: Tensor) -> Tenso
     # The counter, the log and the identity read are folded off the traced graph: a counter store
     # inside the trace becomes a value guard that fails on the first call after warmup.
     _record_nki_dispatch("fused", n_pools, pool_size, head_dim)
-    return wrap_nki(_kpool_hadamard_nki)(
-        flat_k, flat_score, ape.contiguous(), n_pools, pool_size, SOURCE_DIGEST
+    return wrap_nki(_kpool_hadamard_nki)[_programs(n_pools)](
+        flat_k, flat_score, ape.contiguous(), n_pools, pool_size
     )
 
 
@@ -586,10 +749,7 @@ def dsa_hadamard128(x: Tensor) -> Tensor:
 
     _count_nki_dispatch()
     _record_nki_dispatch("stage", n_rows, 1, head_dim)
-    call = wrap_nki(_hadamard128_nki)
-    if hadamard128_programs(n_rows) == 2:
-        call = call[2]
-    return call(x.contiguous(), n_rows, SOURCE_DIGEST)
+    return wrap_nki(_hadamard128_nki)[_programs(n_rows)](x.contiguous(), n_rows)
 
 
 # ---------------------------------------------------------------------------------------------

@@ -24,14 +24,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Tuple
 
-BREAKDOWN_DIR = Path("/home/ubuntu/glm53f-decode-breakdown-20261005")
+from test.vllm_neuron import artifacts
+
+from ...readers.micro import REPORTS_DIR
+
+#: The round-1 decode breakdown, below the campaign directory.
+BREAKDOWN_DIR = artifacts.campaign_path("glm53f-decode-breakdown-20261005")
 DECODE_BREAKDOWN = BREAKDOWN_DIR / "DECODE_BREAKDOWN.md"
 ATTENTION = BREAKDOWN_DIR / "attention.md"
 DENSE_BD = BREAKDOWN_DIR / "dense.md"
 MOE_HOST = BREAKDOWN_DIR / "moe_host.md"
 WAITS = BREAKDOWN_DIR / "waits.md"
-MOE_T = Path("/home/ubuntu/glm53f-wt/reports/moe-t.md")
-DENSE_MICRO = Path("/home/ubuntu/glm53f-wt/reports/dense_micro.json")
+MOE_T = REPORTS_DIR / "moe-t.md"
+DENSE_MICRO = REPORTS_DIR / "dense_micro.json"
 
 
 @dataclass(frozen=True)

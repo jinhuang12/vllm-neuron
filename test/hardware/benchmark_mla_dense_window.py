@@ -6,7 +6,7 @@ and sets LNC2; this script refuses to run without the pinned cores and does not 
 cores itself::
 
     export NEURON_LIBTORCH_CACHE_ROOT=$(mktemp -d)   # a new, empty compile cache
-    python3 /home/ubuntu/glm53f-wt/devlease.py slice spare1 -- timeout 570 \\
+    python3 <devlease.py> slice spare1 -- timeout 570 \\
         python test/hardware/benchmark_mla_dense_window.py --output dense_window.json
 
 The script sets ``NEURON_PLATFORM_TARGET_OVERRIDE=trn2`` itself when it is unset.

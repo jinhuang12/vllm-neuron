@@ -55,6 +55,8 @@ import torch
 import vllm_neuron  # noqa: F401 -- registers the Neuron compilation backend
 import libtorch_neuronx_lite.envs as libtorch_envs
 
+from test.vllm_neuron import artifacts
+
 from vllm_neuron.functional.moe.expert_decode import expert_decode_torch_oracle
 from vllm_neuron.functional.moe.fused_fp8 import fused_fp8_decode_experts
 from vllm_neuron.functional.moe.fused_fp8_pack import PackedExperts, pack_experts
@@ -66,7 +68,9 @@ from vllm_neuron.functional.moe.router_decode import (
 
 HIDDEN, EXPERTS, TOP_K, SCALING, EPS = 4096, 288, 8, 2.5, 1e-5
 LOCAL_EXPERTS, LOCAL_INTERMEDIATE, SWIGLU_LIMIT, RANK = 18, 512, 10.0, 5
-CHECKPOINT = Path("/home/ubuntu/glm53f-campaign/lane-serve/models/GLM-5.3-Flash-04c4e9e9")
+#: The served checkpoint (``VLLM_NEURON_GLM5NEXT_CHECKPOINT_DIR``); absent, the router
+#: inputs are random and the report says so (``router_weights``).
+CHECKPOINT = artifacts.checkpoint_dir()
 DEVICE = "neuron:0"
 
 #: Distinct local experts per layer (token -> local expert ids) per scenario.

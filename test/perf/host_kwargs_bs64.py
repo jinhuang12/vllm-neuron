@@ -35,7 +35,7 @@ multiproc executor runs each worker.
 
     NKI_SIMULATOR=1 VLLM_NEURON_CPU_MODE=1 OMP_NUM_THREADS=4 PYTHONPATH=$PWD \\
         python test/perf/host_kwargs_bs64.py --json reports/hostpath_kwargs.json \\
-        --base-tree /home/ubuntu/glm53f-wt2/hostpath-base
+        --base-tree <0a08ff4 worktree>
 
 ``--profile`` additionally prints the top cumulative frames of the timed converter calls
 (cProfile) for each case, to stderr.
@@ -333,7 +333,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--json", type=pathlib.Path, required=False)
     parser.add_argument("--base-tree", type=pathlib.Path,
-                        default=pathlib.Path("/home/ubuntu/glm53f-wt2/hostpath-base"))
+                        help="read-only worktree of the base revision; needed for --trees base")
     parser.add_argument("--steps", type=int, default=60)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--batches", type=int, nargs="+", default=list(BATCHES))
@@ -346,9 +346,13 @@ def main() -> int:
         print("RESULT " + json.dumps(_child(json.loads(args.child))), flush=True)
         return 0
 
+    if "base" in args.trees and args.base_tree is None:
+        parser.error("--trees base needs --base-tree")
     script = pathlib.Path(__file__).resolve()
     head = script.parents[2]
-    trees = {"base": args.base_tree.resolve(), "head": head}
+    trees = {"head": head}
+    if args.base_tree is not None:
+        trees["base"] = args.base_tree.resolve()
     revs = {
         name: subprocess.run(["git", "-C", str(path), "rev-parse", "--short", "HEAD"],
                              check=True, capture_output=True, text=True).stdout.strip()

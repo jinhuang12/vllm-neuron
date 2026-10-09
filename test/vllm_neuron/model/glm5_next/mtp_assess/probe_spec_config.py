@@ -27,7 +27,7 @@ the innermost traceback frame inside ``vllm_neuron`` or ``vllm`` as ``file:line`
 
     NKI_SIMULATOR=1 VLLM_NEURON_CPU_MODE=1 PYTHONPATH=<worktree> \\
         <venv>/bin/python -m test.vllm_neuron.model.glm5_next.mtp_assess.probe_spec_config \\
-        --output /home/ubuntu/glm53f-wt2/reports/mtp-logs/probe_spec_config.json
+        --output <reports>/mtp-logs/probe_spec_config.json
 """
 
 from __future__ import annotations

@@ -11,7 +11,7 @@ from nkilib.core.router_topk.router_topk import router_topk
 from nkilib.core.utils.common_types import RouterActFnType
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
-from vllm_neuron.utils.neuron_utils import can_run_kernel
+from vllm_neuron.utils.neuron_utils import SBUF_BYTES_PER_PARTITION, can_run_kernel
 
 from dataclasses import dataclass
 
@@ -828,12 +828,15 @@ def _can_use_kernel(
     router_computation_order: RouterComputationOrder = RouterComputationOrder.PRENORM_LINEAR_TOPK_ACT_SCATTER,
     transposed_hidden_states: bool = False,
 ) -> bool:
-    """
-    Check if the NKI kernel can be used for router computation.
+    """Whether :func:`router` takes nkilib's ``router_topk`` kernel: never, in this release.
 
-    Kernel constraints from router_topk_kernel_nki:
+    The vendor release 0.24.0.1.1.0 (``ed3580d``) turns the kernel off on this path because
+    of a compilation issue on TRN3, so every call takes ``_torch_router_impl``. The
+    arguments stay so the call site does not change when the kernel comes back. Then
+    these kernel constraints from ``router_topk_kernel_nki`` become checks here again:
+
     - K <= 8
-    - T <= 128 or (T <= 2048 and T % 128 == 0)
+    - T <= 128 or (T <= 2048 and T % 128 == 0); the T <= 2048 bound waits on NKILIB-618
     - E <= 512
     - (H % 128) == 0
     - Activation must be "softmax" or "sigmoid" (string only)
@@ -843,54 +846,18 @@ def _can_use_kernel(
     - Only PRENORM_LINEAR_TOPK_ACT_SCATTER and PRENORM_LINEAR_ACT_TOPK_RENORM_SCATTER computation orders supported
 
     Returns:
-        bool: True if kernel can be used, False otherwise
+        bool: False.
     """
-
-    # TODO: Remove this after debugging compilation issue on TRN3
     return False
-
-    if not can_run_kernel(hidden_states):
-        return False
-
-    if transposed_hidden_states:
-        H, T = hidden_states.shape
-    else:
-        T, H = hidden_states.shape
-    E = router_weights.shape[1]
-
-    if top_k > 8 or E > 512 or H % 128 != 0:
-        return False
-
-    # TODO: Remove T <= 2048 requirements when NKILIB-618 is resolved
-    if T > 128 and (T > 2048 or T % 128 != 0):
-        return False
-
-    if not isinstance(activation, str) or activation not in ["softmax", "sigmoid"]:
-        return False
-
-    if gamma is not None:
-        return False
-
-    # Bias shape validation
-    if router_bias is not None and router_bias.shape != (E,):
-        return False
-
-    # Only PRENORM_LINEAR_TOPK_ACT_SCATTER and PRENORM_LINEAR_ACT_TOPK_RENORM_SCATTER are supported by kernel
-    # PRENORM_LINEAR_TOPK_SCATTER_ACT requires PyTorch fallback
-    if (
-        router_computation_order
-        == RouterComputationOrder.PRENORM_LINEAR_TOPK_SCATTER_ACT
-    ):
-        return False
-
-    return True
 
 
 #: Tokens per tile: `nisa.max8`/`nisa.nc_find_index8` work one token per partition.
 NOAUX_TC_TILE = 128
 
-#: `nisa.max8` emits, and `nisa.nc_find_index8` consumes, exactly 8 values per token.
-NOAUX_TC_K = 8
+#: The max8 width, a hardware fact: `nisa.max8` emits, and `nisa.nc_find_index8` consumes,
+#: exactly 8 values per token (per partition). The kernel's top-k outputs are this wide,
+#: so it serves exactly this `top_k` (see `_require_noaux_tc_extents`).
+NOAUX_TC_MAX8_WIDTH = 8
 
 #: Guard term in the L1 denominator, verbatim from the reference implementation.
 NOAUX_TC_DENOM_EPS = 1e-20
@@ -900,6 +867,10 @@ _NOAUX_TC_F_MAX = 512
 
 #: Token multiple for the fused two-core launch: a whole 128-row tile per core.
 _NOAUX_TC_T_MULTIPLE = 256
+
+#: Most tokens the nkilib router subkernels are built for in one launch ("Intended for
+#: token counts T <= 2048", nkilib/core/router_topk/router_topk.py:84).
+_NKILIB_ROUTER_MAX_TOKENS = 2048
 
 _NOAUX_TC_TORCH_TO_NKI_DTYPE = {
     torch.bfloat16: nl.bfloat16,
@@ -957,15 +928,21 @@ def _require_noaux_tc_extents(num_experts: int, top_k: int) -> None:
 
     The token extent is not checked here: both entry points pad it to a whole tile.
     """
-    if top_k != NOAUX_TC_K:
+    if top_k > NOAUX_TC_MAX8_WIDTH:
         raise NoauxTcRouterError(
-            f"top_k must be exactly {NOAUX_TC_K}: `nisa.max8` emits 8 values "
-            f"per partition and `nisa.nc_find_index8` consumes exactly 8, and "
-            f"nkilib refuses k > 8 (router_topk.py:582-583). got top_k={top_k}"
+            f"top_k={top_k} is above the max8 width {NOAUX_TC_MAX8_WIDTH}: `nisa.max8` "
+            f"emits {NOAUX_TC_MAX8_WIDTH} values per partition, so no ISA top-k is wider, "
+            f"and nkilib refuses k > {NOAUX_TC_MAX8_WIDTH} (router_topk.py:582-583)"
         )
-    if num_experts < NOAUX_TC_K:
+    if top_k != NOAUX_TC_MAX8_WIDTH:
         raise NoauxTcRouterError(
-            f"E must be >= {NOAUX_TC_K} for the ISA top-K members "
+            f"top_k must be exactly {NOAUX_TC_MAX8_WIDTH}: `nisa.nc_find_index8` "
+            f"consumes exactly {NOAUX_TC_MAX8_WIDTH} values per partition, so the "
+            f"kernel's outputs are {NOAUX_TC_MAX8_WIDTH} wide. got top_k={top_k}"
+        )
+    if num_experts < NOAUX_TC_MAX8_WIDTH:
+        raise NoauxTcRouterError(
+            f"E must be >= {NOAUX_TC_MAX8_WIDTH} for the ISA top-K members "
             f"(router_topk.py:312 pads E to at least 8). got E={num_experts}"
         )
     if num_experts > _NOAUX_TC_F_MAX:
@@ -987,6 +964,34 @@ def can_run_noaux_tc_router(
     """
     _require_noaux_tc_extents(num_experts, top_k)
     return can_run_kernel(reference)
+
+
+def noaux_tc_token_tile(hidden: int, mm_dtype: torch.dtype) -> int:
+    """Most tokens one launch of the fused router takes at hidden size `hidden`.
+
+    The kernel keeps the RMSNorm output of every token of a launch in SBUF (`norm_sb`,
+    `[128, T, hidden / 128]` in `mm_dtype`, so `T * hidden / 128 * itemsize` bytes per
+    partition). The tile is the most tokens whose `norm_sb` fits
+    `SBUF_BYTES_PER_PARTITION`, rounded down to a whole `_NOAUX_TC_T_MULTIPLE` (each of
+    the two cores needs whole 128-row tiles) and capped at `_NKILIB_ROUTER_MAX_TOKENS`.
+    A longer prefill chunk runs as one launch per tile. For example, a bf16 router at
+    hidden 4096 needs 64 B per token: one launch of 8192 tokens needs 524,288 B and
+    neuronx-cc refuses it (NCC_IGCA037), and the tile is 2048.
+
+    Raises:
+        NoauxTcRouterError: if not even `_NOAUX_TC_T_MULTIPLE` tokens fit.
+    """
+    per_token = (int(hidden) // _pmax) * mm_dtype.itemsize
+    fitting = SBUF_BYTES_PER_PARTITION // per_token
+    tile = min(_NKILIB_ROUTER_MAX_TOKENS,
+               fitting // _NOAUX_TC_T_MULTIPLE * _NOAUX_TC_T_MULTIPLE)
+    if tile < _NOAUX_TC_T_MULTIPLE:
+        raise NoauxTcRouterError(
+            f"hidden={hidden} in {mm_dtype}: the RMSNorm output of "
+            f"{_NOAUX_TC_T_MULTIPLE} tokens needs {_NOAUX_TC_T_MULTIPLE * per_token} B of "
+            f"SBUF per partition, above the {SBUF_BYTES_PER_PARTITION} B there are"
+        )
+    return tile
 
 
 def _noaux_tc_pad_target(num_tokens: int, multiple: int) -> int:
@@ -1103,14 +1108,14 @@ def _noaux_tc_stage(
 
         # Top-k on the corrected score, with the same two ISA instructions nkilib's
         # router uses.
-        top8 = nl.ndarray((rows, NOAUX_TC_K), dtype=nl.float32, buffer=nl.sbuf)
+        top8 = nl.ndarray((rows, NOAUX_TC_MAX8_WIDTH), dtype=nl.float32, buffer=nl.sbuf)
         nisa.max8(dst=top8, src=choice)
-        idx8 = nl.ndarray((rows, NOAUX_TC_K), dtype=nl.uint32, buffer=nl.sbuf)
+        idx8 = nl.ndarray((rows, NOAUX_TC_MAX8_WIDTH), dtype=nl.uint32, buffer=nl.sbuf)
         nisa.nc_find_index8(dst=idx8, data=choice, vals=top8)
 
         # One-hot over the selected indices; the indices are cast to fp32 to compare
         # against the fp32 iota.
-        idx_f32 = nl.ndarray((rows, NOAUX_TC_K), dtype=nl.float32, buffer=nl.sbuf)
+        idx_f32 = nl.ndarray((rows, NOAUX_TC_MAX8_WIDTH), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=idx_f32, src=idx8)
         col = nl.ndarray((rows, num_experts), dtype=nl.float32, buffer=nl.sbuf)
         nisa.iota(dst=col, pattern=[[1, num_experts]], offset=0, channel_multiplier=0)
@@ -1118,7 +1123,7 @@ def _noaux_tc_stage(
         mask = nl.ndarray((rows, num_experts), dtype=nl.float32, buffer=nl.sbuf)
         nisa.memset(dst=mask, value=0.0)
         hit = nl.ndarray((rows, num_experts), dtype=nl.float32, buffer=nl.sbuf)
-        for k in range(NOAUX_TC_K):
+        for k in range(NOAUX_TC_MAX8_WIDTH):
             # `tensor_scalar` broadcasts a [par, 1] operand along the free dim.
             nisa.tensor_scalar(
                 dst=hit, data=col, op0=nl.equal, operand0=idx_f32[:, k : k + 1]
@@ -1170,7 +1175,7 @@ def _noaux_tc_correct_nki(
     """Run the `noaux_tc` stage alone: `[T, E]` logits in, indices and weights out."""
     t_extent, e_extent = router_logits.shape
     expert_index = nl.ndarray(
-        (t_extent, NOAUX_TC_K), dtype=nl.uint32, buffer=nl.shared_hbm
+        (t_extent, NOAUX_TC_MAX8_WIDTH), dtype=nl.uint32, buffer=nl.shared_hbm
     )
     expert_affinities = nl.ndarray(
         (t_extent, e_extent), dtype=nl.float32, buffer=nl.shared_hbm
@@ -1227,12 +1232,12 @@ def _noaux_tc_rmsnorm_router_topk_nki(
     norm_output = nl.ndarray((t_extent, h_extent), dtype=router_mm_dtype,
                              buffer=nl.shared_hbm)
     # The nkilib router's own uncorrected outputs.
-    substrate_index = nl.ndarray((t_extent, NOAUX_TC_K), dtype=nl.int32,
+    substrate_index = nl.ndarray((t_extent, NOAUX_TC_MAX8_WIDTH), dtype=nl.int32,
                                  buffer=nl.shared_hbm)
     substrate_affinities = nl.ndarray((t_extent, e_extent), dtype=nl.bfloat16,
                                       buffer=nl.shared_hbm)
     # The corrected outputs.
-    expert_index = nl.ndarray((t_extent, NOAUX_TC_K), dtype=nl.uint32,
+    expert_index = nl.ndarray((t_extent, NOAUX_TC_MAX8_WIDTH), dtype=nl.uint32,
                               buffer=nl.shared_hbm)
     expert_affinities = nl.ndarray((t_extent, e_extent), dtype=nl.float32,
                                    buffer=nl.shared_hbm)
@@ -1262,7 +1267,7 @@ def _noaux_tc_rmsnorm_router_topk_nki(
         expert_affinities=substrate_affinities,
         expert_index=substrate_index,
         act_fn=RouterActFnType.SIGMOID,
-        k=NOAUX_TC_K,
+        k=NOAUX_TC_MAX8_WIDTH,
         x_hbm_layout=0,
         x_sb_layout=XSBLayout_tp102__0,
         router_pre_norm=False,
@@ -1295,7 +1300,7 @@ def _noaux_tc_rmsnorm_router_topk_nki(
 def noaux_tc_correct(
     router_logits: Tensor,
     correction_bias: Tensor,
-    top_k: int = NOAUX_TC_K,
+    top_k: int = NOAUX_TC_MAX8_WIDTH,
     norm_topk_prob: bool = True,
     routed_scaling_factor: float = 1.0,
 ) -> Tuple[Tensor, Tensor]:
@@ -1305,7 +1310,7 @@ def noaux_tc_correct(
         router_logits: `[T, E]` raw router logits, any `T >= 1`; the token axis is
             padded to a whole tile before the launch and the outputs sliced back.
         correction_bias: `[E]` or `[1, E]` `e_score_correction_bias`.
-        top_k: must equal `NOAUX_TC_K`; a mismatch raises rather than reshapes.
+        top_k: must equal `NOAUX_TC_MAX8_WIDTH`; a mismatch raises rather than reshapes.
         norm_topk_prob: L1-normalise the selected weights.
         routed_scaling_factor: final multiplier on the weights.
 
@@ -1350,7 +1355,7 @@ def noaux_tc_rmsnorm_router_topk(
     gamma: Tensor,
     router_weights: Tensor,
     correction_bias: Tensor,
-    top_k: int = NOAUX_TC_K,
+    top_k: int = NOAUX_TC_MAX8_WIDTH,
     eps: float = 1e-6,
     norm_topk_prob: bool = True,
     routed_scaling_factor: float = 1.0,
@@ -1363,6 +1368,11 @@ def noaux_tc_rmsnorm_router_topk(
     `correction_bias` in place of `router_bias`: a projection bias is added to the
     logits, while `e_score_correction_bias` is added to the sigmoid scores for
     selection only.
+
+    `T` tokens are padded to a whole `_NOAUX_TC_T_MULTIPLE`. Up to
+    `noaux_tc_token_tile(H, router_mm_dtype)` padded tokens run as one kernel launch;
+    more run as one launch per tile, and the rows are concatenated in token order.
+    The two forms give the same rows, as no stage reduces across tokens.
 
     Returns:
         `(router_logits [T, E], expert_index [T, K] int32,
@@ -1428,16 +1438,34 @@ def noaux_tc_rmsnorm_router_topk(
     # `[2]` is the SPMD launch grid: the nkilib subkernels shard over two logical
     # cores (LNC=2).
     wrapped = wrap_nki(_noaux_tc_rmsnorm_router_topk_nki)
-    logits, index, affinities, substrate_index = wrapped[2](
-        hidden_states=hidden_padded,
-        gamma=gamma,
-        router_weights=router_weights,
-        correction_bias=bias,
-        eps=eps,
-        norm_topk_prob=norm_topk_prob,
-        routed_scaling_factor=float(routed_scaling_factor),
-        router_mm_dtype=_NOAUX_TC_TORCH_TO_NKI_DTYPE[router_mm_dtype],
-    )
+
+    def launch(rows: Tensor):
+        return wrapped[2](
+            hidden_states=rows,
+            gamma=gamma,
+            router_weights=router_weights,
+            correction_bias=bias,
+            eps=eps,
+            norm_topk_prob=norm_topk_prob,
+            routed_scaling_factor=float(routed_scaling_factor),
+            router_mm_dtype=_NOAUX_TC_TORCH_TO_NKI_DTYPE[router_mm_dtype],
+        )
+
+    # A chunk above the token tile runs as one launch per tile (the RMSNorm output
+    # of a launch must fit SBUF, `noaux_tc_token_tile`). No stage reduces across
+    # tokens, so the tiles' rows are the rows one launch would give. Every launch
+    # is a whole multiple of 256 rows, as `t_pad` and the tile are.
+    tile = noaux_tc_token_tile(h_extent, router_mm_dtype)
+    if t_pad <= tile:
+        logits, index, affinities, substrate_index = launch(hidden_padded)
+    else:
+        tiles = [
+            launch(hidden_padded[:, start:start + tile].contiguous())
+            for start in range(0, t_pad, tile)
+        ]
+        logits, index, affinities, substrate_index = (
+            torch.cat(parts, dim=0) for parts in zip(*tiles)
+        )
     # All four outputs are `[t_pad, ...]`; slice every one back to the caller's
     # extent.
     return (
@@ -1482,7 +1510,7 @@ def noaux_tc_correct_torch_oracle(
     scores = logits.sigmoid()
     scores_for_choice = scores + bias
     topk_indices = torch.topk(
-        scores_for_choice, k=NOAUX_TC_K, dim=-1, sorted=False
+        scores_for_choice, k=NOAUX_TC_MAX8_WIDTH, dim=-1, sorted=False
     )[1]
     topk_weights = scores.gather(1, topk_indices)
     if norm_topk_prob:
@@ -1529,5 +1557,5 @@ def noaux_tc_rmsnorm_router_topk_torch_oracle(
         logits, correction_bias, norm_topk_prob, routed_scaling_factor
     )
     # The nkilib router's uncorrected selection: top-k on the raw logits.
-    substrate_index = torch.topk(logits, k=NOAUX_TC_K, dim=-1)[1].to(torch.int32)
+    substrate_index = torch.topk(logits, k=NOAUX_TC_MAX8_WIDTH, dim=-1)[1].to(torch.int32)
     return logits, index, affinities, substrate_index

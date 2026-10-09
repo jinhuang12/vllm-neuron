@@ -27,7 +27,7 @@ from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
 
 from vllm_neuron.functional.moe.router import (
     NOAUX_TC_DENOM_EPS,
-    NOAUX_TC_K,
+    NOAUX_TC_MAX8_WIDTH,
     NOAUX_TC_TILE,
     NoauxTcRouterError,
     _noaux_tc_correct_nki,
@@ -89,15 +89,15 @@ MOVED_ROWS_FLOOR = 64
 def build_designed_logits(seed: int = FIXTURE_SEED):
     """Build the corrected ladder first, then derive the raw logits from it. """
     gen = torch.Generator().manual_seed(seed)
-    w_top = (WINNER_HI - WINNER_LO) / (NOAUX_TC_K - 1)
-    w_lo = (LOSER_HI - LOSER_LO) / (DECLARED_E - NOAUX_TC_K - 1)
+    w_top = (WINNER_HI - WINNER_LO) / (NOAUX_TC_MAX8_WIDTH - 1)
+    w_lo = (LOSER_HI - LOSER_LO) / (DECLARED_E - NOAUX_TC_MAX8_WIDTH - 1)
 
     ladder = torch.empty(DECLARED_E, dtype=torch.float32)
     for rank in range(DECLARED_E):
-        if rank < NOAUX_TC_K:
+        if rank < NOAUX_TC_MAX8_WIDTH:
             ladder[rank] = WINNER_HI - rank * w_top
         else:
-            ladder[rank] = LOSER_HI - (rank - NOAUX_TC_K) * w_lo
+            ladder[rank] = LOSER_HI - (rank - NOAUX_TC_MAX8_WIDTH) * w_lo
 
     choice = torch.empty(DECLARED_T, DECLARED_E, dtype=torch.float32)
     for token in range(DECLARED_T):
@@ -233,7 +233,7 @@ def verbatim_upstream_stage(logits: torch.Tensor, bias: torch.Tensor):
         ~score_mask.bool(), float("-inf")
     )
     topk_indices = torch.topk(
-        scores_for_choice, k=NOAUX_TC_K, dim=-1, sorted=False
+        scores_for_choice, k=NOAUX_TC_MAX8_WIDTH, dim=-1, sorted=False
     )[1]
     topk_weights = scores.gather(1, topk_indices)
     denominator = topk_weights.sum(dim=-1, keepdim=True) + NOAUX_TC_DENOM_EPS
@@ -251,7 +251,7 @@ def set_equal_rows(got_index: torch.Tensor, expected_index: torch.Tensor) -> int
 def rows_with_k_distinct(index: torch.Tensor) -> int:
     """Rows selecting ``K`` distinct experts. """
     return sum(
-        1 for row in index.to(torch.int64) if len(set(row.tolist())) == NOAUX_TC_K
+        1 for row in index.to(torch.int64) if len(set(row.tolist())) == NOAUX_TC_MAX8_WIDTH
     )
 
 
@@ -288,7 +288,7 @@ def test_fixture_conditioning_is_measured_not_assumed() -> None:
     choice = logits.sigmoid() + bias.reshape(-1)
     descending, _ = torch.sort(choice, dim=-1, descending=True)
     boundary = float(
-        (descending[:, NOAUX_TC_K - 1] - descending[:, NOAUX_TC_K]).min()
+        (descending[:, NOAUX_TC_MAX8_WIDTH - 1] - descending[:, NOAUX_TC_MAX8_WIDTH]).min()
     )
     ascending, _ = torch.sort(choice, dim=-1)
     pairwise = float((ascending[:, 1:] - ascending[:, :-1]).min())
@@ -301,7 +301,7 @@ def test_fixture_conditioning_is_measured_not_assumed() -> None:
 
     # The weight arm's own conditioning: no cancellation anywhere.
     scores = logits.sigmoid()
-    index = torch.topk(choice, k=NOAUX_TC_K, dim=-1, sorted=False)[1]
+    index = torch.topk(choice, k=NOAUX_TC_MAX8_WIDTH, dim=-1, sorted=False)[1]
     gathered = scores.gather(1, index)
     denominator = gathered.sum(dim=-1, keepdim=True)
     assert bool((gathered > 0).all()), "a gathered weight is non-positive"
@@ -316,9 +316,9 @@ def test_correction_moves_the_selection() -> None:
     """the control: the conditioned fixture must not condition the correction away."""
     logits, bias = build_designed_logits()
     scores = logits.sigmoid()
-    uncorrected = torch.topk(scores, k=NOAUX_TC_K, dim=-1, sorted=False)[1]
+    uncorrected = torch.topk(scores, k=NOAUX_TC_MAX8_WIDTH, dim=-1, sorted=False)[1]
     corrected = torch.topk(
-        scores + bias.reshape(-1), k=NOAUX_TC_K, dim=-1, sorted=False
+        scores + bias.reshape(-1), k=NOAUX_TC_MAX8_WIDTH, dim=-1, sorted=False
     )[1]
     moved = DECLARED_T - set_equal_rows(uncorrected, corrected)
     assert moved >= MOVED_ROWS_FLOOR, (
@@ -388,19 +388,19 @@ def test_declared_index_sets_match_the_noaux_tc_reference_exactly() -> None:
         )
     _assert_route(sim, 1, "declared-index-arm")
 
-    assert tuple(got_index.shape) == (DECLARED_T, NOAUX_TC_K)
+    assert tuple(got_index.shape) == (DECLARED_T, NOAUX_TC_MAX8_WIDTH)
     assert tuple(got_affinities.shape) == (DECLARED_T, DECLARED_E)
 
     distinct = rows_with_k_distinct(got_index)
     equal_rows = set_equal_rows(got_index, expected_index)
     nonzero = (got_affinities != 0).sum(dim=1)
     assert distinct == DECLARED_ROWS, (
-        f"{DECLARED_T - distinct} rows select fewer than {NOAUX_TC_K} distinct "
+        f"{DECLARED_T - distinct} rows select fewer than {NOAUX_TC_MAX8_WIDTH} distinct "
         f"experts; the selection collapsed"
     )
     assert equal_rows == DECLARED_ROWS
-    assert int(nonzero.min()) == NOAUX_TC_K
-    assert int(nonzero.max()) == NOAUX_TC_K
+    assert int(nonzero.min()) == NOAUX_TC_MAX8_WIDTH
+    assert int(nonzero.max()) == NOAUX_TC_MAX8_WIDTH
 
 
 def test_kernel_affinity_columns_are_its_own_emitted_indices() -> None:
@@ -513,7 +513,7 @@ def test_dispatch_counters_are_module_level_state_reachable_from_elsewhere() -> 
         (DECLARED_T, 513, DECLARED_TOP_K, "E must be <= 512"),
         (DECLARED_T, 4, DECLARED_TOP_K, "E must be >= 8"),
         (DECLARED_T, DECLARED_E, 4, "top_k must be exactly 8"),
-        (DECLARED_T, DECLARED_E, 9, "top_k must be exactly 8"),
+        (DECLARED_T, DECLARED_E, NOAUX_TC_MAX8_WIDTH + 1, "is above the max8 width"),
     ],
 )
 def test_refused_extents_raise_by_name(tokens, experts, top_k, needle) -> None:
@@ -555,7 +555,7 @@ def _assert_admitted_token_extent(tokens: int) -> None:
 
     got = got_affinities.to(torch.float32)
     want = expected_affinities.to(torch.float32)
-    assert tuple(got_index.shape) == (tokens, NOAUX_TC_K)
+    assert tuple(got_index.shape) == (tokens, NOAUX_TC_MAX8_WIDTH)
     assert got.shape == want.shape == (tokens, DECLARED_E)
 
     equal_rows = set_equal_rows(got_index, expected_index)
@@ -634,9 +634,9 @@ def test_fused_seam_matches_the_reference_on_its_own_logits() -> None:
     _assert_route(sim, 1, "fused-seam")
 
     assert tuple(logits.shape) == (DECLARED_T, DECLARED_E)
-    assert tuple(expert_index.shape) == (DECLARED_T, NOAUX_TC_K)
+    assert tuple(expert_index.shape) == (DECLARED_T, NOAUX_TC_MAX8_WIDTH)
     assert tuple(expert_affinities.shape) == (DECLARED_T, DECLARED_E)
-    assert tuple(substrate_index.shape) == (DECLARED_T, NOAUX_TC_K)
+    assert tuple(substrate_index.shape) == (DECLARED_T, NOAUX_TC_MAX8_WIDTH)
     assert bool(torch.isfinite(logits).all())
 
     expected_index, expected_affinities = noaux_tc_correct_torch_oracle(
@@ -704,7 +704,7 @@ def test_model_call_site_routes_through_the_seam() -> None:
     _assert_route(sim, 1, "model-call-site")
 
     assert tuple(logits.shape) == (DECLARED_T, DECLARED_E)
-    assert tuple(expert_index.shape) == (DECLARED_T, NOAUX_TC_K)
+    assert tuple(expert_index.shape) == (DECLARED_T, NOAUX_TC_MAX8_WIDTH)
     assert tuple(expert_affinities.shape) == (DECLARED_T, DECLARED_E)
 
     expected_index, expected_affinities = noaux_tc_correct_torch_oracle(
@@ -862,14 +862,14 @@ def test_fused_seam_stage_takes_a_distinct_token_range_per_core(monkeypatch) -> 
     )
 
     # The union of the two cores' writes is still the complete output.
-    assert tuple(expert_index.shape) == (DECLARED_T, NOAUX_TC_K)
+    assert tuple(expert_index.shape) == (DECLARED_T, NOAUX_TC_MAX8_WIDTH)
     assert tuple(expert_affinities.shape) == (DECLARED_T, DECLARED_E)
     nonzero_per_row = (expert_affinities != 0).sum(dim=-1)
-    assert int(nonzero_per_row.min()) == NOAUX_TC_K, (
+    assert int(nonzero_per_row.min()) == NOAUX_TC_MAX8_WIDTH, (
         "some token row carries fewer than K gate weights, so no core wrote it "
         "-- the shard leaves a gap"
     )
-    assert int(nonzero_per_row.max()) == NOAUX_TC_K
+    assert int(nonzero_per_row.max()) == NOAUX_TC_MAX8_WIDTH
 
 
 @nki.jit
@@ -1101,9 +1101,9 @@ def test_fused_torch_fallback_executes_and_is_the_cpu_oracle(monkeypatch) -> Non
     )
     assert sim_off.calls == 0
     assert tuple(fb_logits.shape) == (DECLARED_T, DECLARED_E)
-    assert tuple(fb_index.shape) == (DECLARED_T, NOAUX_TC_K)
+    assert tuple(fb_index.shape) == (DECLARED_T, NOAUX_TC_MAX8_WIDTH)
     assert tuple(fb_affinities.shape) == (DECLARED_T, DECLARED_E)
-    assert tuple(fb_sub.shape) == (DECLARED_T, NOAUX_TC_K)
+    assert tuple(fb_sub.shape) == (DECLARED_T, NOAUX_TC_MAX8_WIDTH)
     # The fallback is the CPU oracle, so it must agree with the kernel.
     assert set_equal_rows(fb_index, kernel_index) == DECLARED_ROWS
     torch.testing.assert_close(
