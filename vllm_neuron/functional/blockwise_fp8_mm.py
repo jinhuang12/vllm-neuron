@@ -38,7 +38,9 @@ import nki.language as nl
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 from nkilib.core.utils.allocator import SbufManager
 from nkilib.core.utils.kernel_assert import kernel_assert
+from nkilib.core.utils.kernel_helpers import div_ceil
 
+from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 from vllm_neuron.functional.moe.blockwise_fp8_retile import TILE_SIZE
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
@@ -268,6 +270,23 @@ _PSUM_BANK_BF16 = 1024
 
 #: fp32 elements per partition one ``nisa.sendrecv`` moves (1 KiB).
 _SENDRECV_FP32 = 256
+
+#: Token rows per pass of :func:`blockwise_fp8_mlp_prefill_kernel`: the moving
+#: extent of every gate/up matmul, one fp32 PSUM bank per projection block.
+MLP_PREFILL_CHUNK = _PSUM_BANK_FP32
+
+#: Widest ``H // 128`` and ``I`` the prefill kernel is built and measured for
+#: (TP=64: H = 4096, I = 128 shared and 256 dense). Per partition it holds the
+#: three weights, ``3 * (H // 128) * I`` fp8 bytes, and one chunk of ``x``
+#: transposed, ``(H // 128) * MLP_PREFILL_CHUNK`` bf16; wider geometries keep
+#: the three calls.
+MLP_PREFILL_MAX_KB = 32
+MLP_PREFILL_MAX_INTERMEDIATE = 256
+
+#: The weight dtype the prefill kernel takes: it multiplies the weights as
+#: stored, against bf16 ``x``. The three-call route casts any weight to bf16
+#: on the DMA, so weights of another dtype keep that route.
+MLP_PREFILL_WEIGHT_DTYPE = torch.float8_e4m3fn
 
 # DMA modes, from the slice profiles. The default (software DGE) generates
 # descriptors on GpSimd at ~0.65 us per DMA and starts packets 2-3 us after
@@ -1011,6 +1030,275 @@ def blockwise_fp8_mm_kernel(x, weight, weight_scale_t):
     return out
 
 
+def _load_x_chunk(x, c0, m_rows):
+    """``x_t[p, kb, m] = x[c0 + m, kb * 128 + p]``: ``m_rows`` tokens of ``x``,
+    transposed by the DMA, contraction on partitions."""
+    kb_count = x.shape[1] // TILE_SIZE
+    x_t = nl.ndarray((TILE_SIZE, kb_count, m_rows), dtype=nl.bfloat16, buffer=nl.sbuf)
+    for kb in range(kb_count):
+        nisa.dma_transpose(
+            dst=x_t[:, kb, :],
+            src=x[c0:c0 + m_rows, kb * TILE_SIZE:(kb + 1) * TILE_SIZE],
+        )
+    return x_t
+
+
+#: Of every ``den`` gate/up multiply-adds of the prefill kernel, ``num`` run as
+#: a Scalar multiply and a GpSimd add, the rest as one Vector instruction.
+#: 3 / 8 balances the two routes at the slice profiles' fp32 ``[128, 512]``
+#: rates: Vector multiply-add 0.75 us, Scalar multiply 0.68 us, GpSimd add
+#: 1.27 us.
+_PREFILL_GPSIMD_SHARE = (3, 8)
+
+
+def _prefill_add_engine(step):
+    """The engine of the add of gate/up multiply-add number ``step``: GpSimd
+    for ``num`` of every ``den`` steps (:data:`_PREFILL_GPSIMD_SHARE`), spread
+    evenly, else ``None`` (one Vector multiply-add)."""
+    num, den = _PREFILL_GPSIMD_SHARE
+    return nisa.engine.gpsimd if (step * num) % den < num else None
+
+
+def _load_blocked_rows(dst, weight):
+    """``dst[p, kb, n] = weight[kb * 128 + p, n]``: a ``[K, N]`` weight as stored
+    (fp8), contraction row ``k = kb * 128 + p`` on partition ``p``; one DMA of
+    static descriptors, so the load starts with the kernel instead of behind
+    the descriptor generation on GpSimd."""
+    rows, cols = weight.shape
+    _static_dma(
+        dst=dst,
+        src=weight.ap(
+            pattern=[[cols, TILE_SIZE], [TILE_SIZE * cols, rows // TILE_SIZE], [1, cols]]
+        ),
+    )
+
+
+def _prefill_projection_block(acc, weights_sb, grid, x_t, kb, ib, col, add_engine):
+    """One contraction block of one gate or up block, transposed and scaled.
+
+    ``acc[i, m] (+)= grid[col] * sum_p W[kb * 128 + p, ib * 128 + i] x_t[p, kb, m]``
+    in fp32: the matmul of :func:`blockwise_fp8_mm_kernel`'s block ``(kb, ib)``
+    with the weight stationary, then its scale step -- a multiply on the first
+    block, a multiply-add onto ``acc`` after it. ``add_engine`` ``None`` runs
+    the multiply-add as one Vector ``scalar_tensor_tensor``; an engine runs it
+    as its two fp32 steps, the multiply on the Scalar engine and the add on
+    that engine. Both compute ``fl(fl(part * s) + acc)``: the Vector
+    instruction rounds the product to fp32 before the add.
+    """
+    part = nl.ndarray((TILE_SIZE, acc.shape[1]), dtype=nl.float32, buffer=nl.psum)
+    nisa.nc_matmul(
+        dst=part,
+        stationary=weights_sb[:, kb, ib * TILE_SIZE:(ib + 1) * TILE_SIZE],
+        moving=x_t[:, kb, :],
+        accumulate=False,
+    )
+    if kb == 0:
+        nisa.tensor_scalar(
+            dst=acc, data=part, op0=nl.multiply, operand0=grid[:, col:col + 1]
+        )
+    elif add_engine is not None:
+        scaled = nl.ndarray(acc.shape, dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(
+            dst=scaled,
+            data=part,
+            op0=nl.multiply,
+            operand0=grid[:, col:col + 1],
+            engine=nisa.engine.scalar,
+        )
+        nisa.tensor_tensor(
+            dst=acc, data1=scaled, data2=acc, op=nl.add, engine=add_engine
+        )
+    else:
+        nisa.scalar_tensor_tensor(
+            dst=acc,
+            data=part,
+            op0=nl.multiply,
+            operand0=grid[:, col:col + 1],
+            op1=nl.add,
+            operand1=acc,
+        )
+
+
+@nki.jit
+def blockwise_fp8_mlp_prefill_kernel(
+    x,
+    gate_weight,
+    up_weight,
+    down_weight,
+    gate_scale,
+    up_scale,
+    down_scale,
+    swiglu_limit,
+):
+    """One fused blockwise-fp8 SwiGLU MLP for whole-tile prefill.
+
+    ``down(silu(min(gate(x), L)) * clip(up(x), -L, L))`` with the bf16 cast of
+    the SwiGLU product between projections: the three-call route's function,
+    computed with the same arithmetic, so the output is that route's to the bit.
+
+    Args:
+        x: ``[M, H]`` bf16, ``M`` a positive multiple of 128.
+        gate_weight, up_weight: ``[H, I]`` fp8-e4m3, compute frame.
+        down_weight: ``[I, H]`` fp8-e4m3, compute frame.
+        gate_scale, up_scale: ``[H // 128, I // 128]`` fp32 public grids.
+        down_scale: ``[I // 128, H // 128]`` fp32 public grid.
+        swiglu_limit: the checkpoint's clamp bound ``L``.
+
+    Returns:
+        ``[M, H]`` fp32.
+
+    Launch: one program, or a ``[2]`` grid (:func:`mlp_prefill_launch_grid`)
+    that gives each physical core of an LNC2 core one contiguous half of the
+    token tiles. Each program loads all three weights; no value crosses the
+    cores, and the engine of every step depends on its block alone, so every
+    output element is computed by the same instructions on either launch.
+
+    The arithmetic is :func:`blockwise_fp8_mm_kernel`'s, element for element.
+    Each ``128``-deep contraction block is one ``nc_matmul`` into PSUM, multiplied
+    by that block's scale into an fp32 SBUF accumulator (first block) or
+    multiplied and added to it (later blocks, in block order). Gate and up run
+    transposed, ``acc[i, m] = sum_k W[k, i] x[m, k]``, the weight stationary and
+    ``MLP_PREFILL_CHUNK`` tokens of ``x`` moving: the products and the order of
+    their sums are those of the token-major call, each scale is one value over
+    the whole ``[128, chunk]`` tile, and the activated product comes out with
+    the intermediate on partitions, the stationary layout the down projection
+    contracts over. The down projection runs token-major, 512 hidden columns
+    per matmul, each ``128``-column block scaled by its own grid entry.
+
+    Engines: the fp32 scale steps, not the matmuls, bound the kernel, so they
+    are spread over three engines (:data:`_PREFILL_GPSIMD_SHARE`; the down
+    multiplies alternate Scalar and Vector when ``I = 128``). The next chunk
+    of ``x`` is loaded before the current chunk's down projection, so its
+    transposing DMA runs under that work.
+    """
+    m_total, hidden = x.shape
+    _, inter = gate_weight.shape
+    kernel_assert(
+        m_total > 0 and m_total % TILE_SIZE == 0, "prefill MLP needs whole 128-token tiles"
+    )
+    kernel_assert(hidden % TILE_SIZE == 0, "H must be blocked by 128")
+    kernel_assert(inter % TILE_SIZE == 0, "I must be blocked by 128")
+    kb_count = hidden // TILE_SIZE
+    kernel_assert(kb_count <= MLP_PREFILL_MAX_KB, "H too wide for the resident x chunk")
+    kernel_assert(inter <= MLP_PREFILL_MAX_INTERMEDIATE, "I too wide for resident weights")
+    kernel_assert(up_weight.shape[1] == inter, "gate and up must agree")
+    kernel_assert(down_weight.shape[0] == inter, "down must be [I, H]")
+    kernel_assert(down_weight.shape[1] == hidden, "down must be [I, H]")
+    programs = nl.num_programs(axes=0)
+    program = nl.program_id(0)
+    kernel_assert(programs in (1, MLP_PROGRAMS), "launch on one program or a [2] grid")
+    n_inter_blocks = inter // TILE_SIZE
+    n_grid = kb_count * n_inter_blocks
+    limit = float(swiglu_limit)
+    # This program's token rows: a contiguous share of whole tiles.
+    n_tiles = m_total // TILE_SIZE
+    share = div_ceil(n_tiles, programs)
+    row_lo = min(program * share, n_tiles) * TILE_SIZE
+    row_hi = min(program * share + share, n_tiles) * TILE_SIZE
+    kernel_assert(row_hi > row_lo, "every program owns at least one token tile")
+
+    out = nl.ndarray((m_total, hidden), dtype=nl.float32, buffer=nl.shared_hbm)
+
+    gate_sb = nl.ndarray((TILE_SIZE, kb_count, inter), dtype=gate_weight.dtype, buffer=nl.sbuf)
+    _load_blocked_rows(gate_sb, gate_weight)
+    up_sb = nl.ndarray((TILE_SIZE, kb_count, inter), dtype=up_weight.dtype, buffer=nl.sbuf)
+    _load_blocked_rows(up_sb, up_weight)
+    down_sb = nl.ndarray(
+        (TILE_SIZE, n_inter_blocks, hidden), dtype=down_weight.dtype, buffer=nl.sbuf
+    )
+    _load_blocked_rows(down_sb, down_weight)
+    # Each grid replicated on every partition: (kb, ib) of gate/up at
+    # kb * nI + ib, (ib, hb) of down at ib * KB + hb.
+    gate_grid = _load_grid(gate_scale, n_grid)
+    up_grid = _load_grid(up_scale, n_grid)
+    down_grid = _load_grid(down_scale, n_grid)
+
+    n_chunks = div_ceil(row_hi - row_lo, MLP_PREFILL_CHUNK)
+    x_next = _load_x_chunk(x, row_lo, min(MLP_PREFILL_CHUNK, row_hi - row_lo))
+    for ci in range(n_chunks):
+        c0 = row_lo + ci * MLP_PREFILL_CHUNK
+        m_rows = min(MLP_PREFILL_CHUNK, row_hi - c0)
+        x_t = x_next
+
+        # ---- gate / up, intermediate on partitions: acc[i, ib, m]. -------- #
+        gate = nl.ndarray((TILE_SIZE, n_inter_blocks, m_rows), dtype=nl.float32, buffer=nl.sbuf)
+        up = nl.ndarray((TILE_SIZE, n_inter_blocks, m_rows), dtype=nl.float32, buffer=nl.sbuf)
+        for kb in range(kb_count):
+            for ib in range(n_inter_blocks):
+                col = kb * n_inter_blocks + ib
+                _prefill_projection_block(
+                    gate[:, ib, :], gate_sb, gate_grid, x_t, kb, ib, col,
+                    _prefill_add_engine(2 * col),
+                )
+                _prefill_projection_block(
+                    up[:, ib, :], up_sb, up_grid, x_t, kb, ib, col,
+                    _prefill_add_engine(2 * col + 1),
+                )
+
+        if ci + 1 < n_chunks:
+            c1 = c0 + MLP_PREFILL_CHUNK
+            x_next = _load_x_chunk(x, c1, min(MLP_PREFILL_CHUNK, row_hi - c1))
+
+        # ---- silu(min(gate, L)) * clip(up, -L, L), cast to bf16. ---------- #
+        nisa.tensor_scalar(dst=gate, data=gate, op0=nl.minimum, operand0=limit)
+        gated = nl.ndarray((TILE_SIZE, n_inter_blocks, m_rows), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.activation(dst=gated, op=nl.silu, data=gate)
+        nisa.tensor_scalar(
+            dst=up, data=up, op0=nl.maximum, operand0=-limit, op1=nl.minimum, operand1=limit
+        )
+        activated = nl.ndarray(
+            (TILE_SIZE, n_inter_blocks, m_rows), dtype=nl.bfloat16, buffer=nl.sbuf
+        )
+        nisa.tensor_tensor(dst=activated, data1=gated, data2=up, op=nl.multiply)
+
+        # ---- down, tokens on partitions: out[m, h]. ----------------------- #
+        for mt in range(m_rows // TILE_SIZE):
+            res = nl.ndarray((TILE_SIZE, hidden), dtype=nl.float32, buffer=nl.sbuf)
+            for h0 in range(0, hidden, _PSUM_BANK_FP32):
+                n_cols = min(_PSUM_BANK_FP32, hidden - h0)
+                for ib in range(n_inter_blocks):
+                    part = nl.ndarray((TILE_SIZE, n_cols), dtype=nl.float32, buffer=nl.psum)
+                    nisa.nc_matmul(
+                        dst=part,
+                        stationary=activated[:, ib, mt * TILE_SIZE:(mt + 1) * TILE_SIZE],
+                        moving=down_sb[:, ib, h0:h0 + n_cols],
+                        accumulate=False,
+                    )
+                    for q in range(n_cols // TILE_SIZE):
+                        col = ib * kb_count + h0 // TILE_SIZE + q
+                        dst = res[:, h0 + q * TILE_SIZE:h0 + (q + 1) * TILE_SIZE]
+                        block = part[:, q * TILE_SIZE:(q + 1) * TILE_SIZE]
+                        if ib == 0:
+                            # With one intermediate block every step is a
+                            # multiply; Scalar and Vector take turns. With
+                            # more, Vector runs the later blocks' adds.
+                            on_vector = n_inter_blocks == 1 and q % 2 == 1
+                            nisa.tensor_scalar(
+                                dst=dst,
+                                data=block,
+                                op0=nl.multiply,
+                                operand0=down_grid[:, col:col + 1],
+                                engine=nisa.engine.vector if on_vector else nisa.engine.scalar,
+                            )
+                        else:
+                            nisa.scalar_tensor_tensor(
+                                dst=dst,
+                                data=block,
+                                op0=nl.multiply,
+                                operand0=down_grid[:, col:col + 1],
+                                op1=nl.add,
+                                operand1=dst,
+                            )
+            _static_dma(
+                dst=out.ap(
+                    pattern=[[hidden, TILE_SIZE], [1, hidden]],
+                    offset=(c0 + mt * TILE_SIZE) * hidden,
+                ),
+                src=res,
+            )
+    return out
+
+
 def _require_blocked(rows: int, cols: int, tokens: int) -> None:
     """Check every extent condition the kernel above imposes.
 
@@ -1355,11 +1643,14 @@ def mlp_launch_grid(hidden: int) -> tuple[int, ...]:
 
     ``(2,)`` on an LNC2 runtime (``NEURON_LOGICAL_NC_CONFIG=2``: two physical
     cores per logical core) when the ``H // 128`` hidden blocks split into two
-    halves, else ``()`` (one program).
-    """
-    import os
+    halves, else ``()`` (one program). The setting is read through
+    :func:`~vllm_neuron.functional.dsa.launch_grid.lnc_pair`.
 
-    if os.environ.get("NEURON_LOGICAL_NC_CONFIG") != "2":
+    Raises:
+        LaunchGridError: ``NEURON_LOGICAL_NC_CONFIG`` is set to anything but
+            ``1`` or ``2``.
+    """
+    if not lnc_pair():
         return ()
     if hidden <= 0 or hidden % TILE_SIZE or (hidden // TILE_SIZE) % MLP_PROGRAMS:
         return ()
@@ -1377,6 +1668,33 @@ def fused_mlp_admissible(tokens: int, hidden: int, intermediate: int) -> bool:
     return intermediate <= MLP_MAX_INTERMEDIATE
 
 
+def prefill_mlp_admissible(tokens: int, hidden: int, intermediate: int) -> bool:
+    """Does :func:`blockwise_fp8_mlp_prefill_kernel` accept this geometry?"""
+    if tokens < TILE_SIZE or tokens % TILE_SIZE:
+        return False
+    if hidden <= 0 or hidden % TILE_SIZE or hidden // TILE_SIZE > MLP_PREFILL_MAX_KB:
+        return False
+    if intermediate <= 0 or intermediate % TILE_SIZE:
+        return False
+    return intermediate <= MLP_PREFILL_MAX_INTERMEDIATE
+
+
+def mlp_prefill_launch_grid(tokens: int) -> tuple[int, ...]:
+    """The launch grid of :func:`blockwise_fp8_mlp_prefill_kernel`.
+
+    ``(2,)`` on an LNC2 runtime when there are at least two token tiles to
+    share, else ``()`` (one program). The setting is read through
+    :func:`~vllm_neuron.functional.dsa.launch_grid.lnc_pair`.
+
+    Raises:
+        LaunchGridError: ``NEURON_LOGICAL_NC_CONFIG`` is set to anything but
+            ``1`` or ``2``.
+    """
+    if not lnc_pair() or tokens < MLP_PROGRAMS * TILE_SIZE:
+        return ()
+    return (MLP_PROGRAMS,)
+
+
 def blockwise_fp8_mlp(
     x: Tensor,
     gate_weight: Tensor,
@@ -1389,7 +1707,7 @@ def blockwise_fp8_mlp(
     swiglu_limit: float,
     prebuilt_scale_t: tuple[Tensor, Tensor, Tensor] | None = None,
 ) -> Tensor:
-    """The clamped SwiGLU MLP on blockwise fp8 weights, fused when small.
+    """The clamped SwiGLU MLP on blockwise fp8 weights, one fused kernel.
 
     ``down(silu(min(gate(x), L)) * clip(up(x), -L, L))`` with the SwiGLU product
     cast to ``x.dtype`` before the down projection, exactly as the three-call
@@ -1406,11 +1724,15 @@ def blockwise_fp8_mlp(
     Returns:
         ``[M, H]`` fp32.
 
-    Route: ``1 <= M < 128`` with the NKI route available runs one
+    Route, with the NKI route available: ``1 <= M < 128`` runs one
     :func:`blockwise_fp8_mlp_small_m_kernel` call and never pads tokens, on the
-    launch grid :func:`mlp_launch_grid` picks (both cores of an LNC2 core). Any
-    other geometry (whole-tile prefill, or ``I > MLP_MAX_INTERMEDIATE``) runs
-    the three :func:`blockwise_fp8_mm` calls.
+    launch grid :func:`mlp_launch_grid` picks (both cores of an LNC2 core).
+    Whole-tile prefill on :data:`MLP_PREFILL_WEIGHT_DTYPE` weights runs one
+    :func:`blockwise_fp8_mlp_prefill_kernel` call on the grid
+    :func:`mlp_prefill_launch_grid` picks. Any other geometry (``I`` above the
+    kernels' limits, ``H // 128 > MLP_PREFILL_MAX_KB``), whole-tile weights of
+    another dtype, or no NKI route, runs the three :func:`blockwise_fp8_mm`
+    calls, the only consumer of ``prebuilt_scale_t``.
     """
     from torch.nn.functional import silu
 
@@ -1422,6 +1744,28 @@ def blockwise_fp8_mlp(
         grid = mlp_launch_grid(hidden)
         _count_mlp_launch(grid[0] if grid else 1)
         call = wrap_nki(blockwise_fp8_mlp_small_m_kernel)
+        if grid:
+            call = call[grid]
+        return call(
+            x=x,
+            gate_weight=gate_weight,
+            up_weight=up_weight,
+            down_weight=down_weight,
+            gate_scale=gate_scale,
+            up_scale=up_scale,
+            down_scale=down_scale,
+            swiglu_limit=float(swiglu_limit),
+        )
+    weights = (gate_weight, up_weight, down_weight)
+    if (
+        nki
+        and prefill_mlp_admissible(tokens, hidden, intermediate)
+        and all(w.dtype == MLP_PREFILL_WEIGHT_DTYPE for w in weights)
+    ):
+        _count_mlp_fused()
+        grid = mlp_prefill_launch_grid(tokens)
+        _count_mlp_launch(grid[0] if grid else 1)
+        call = wrap_nki(blockwise_fp8_mlp_prefill_kernel)
         if grid:
             call = call[grid]
         return call(

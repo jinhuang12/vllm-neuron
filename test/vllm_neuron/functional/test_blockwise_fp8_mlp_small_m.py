@@ -148,20 +148,6 @@ def test_fused_mlp_rows_are_independent():
         _assert_agrees(batch[row:row + 1], one)
 
 
-def test_full_tiles_take_the_three_call_path():
-    # M >= 128 is prefill; the fused small-M kernel refuses it and the
-    # dispatcher keeps the 5938748 three-call arithmetic.
-    ops = _operands(128, 128, seed=3)
-    bw.reset_mlp_dispatch_counters()
-    bw.reset_dispatch_counters()
-    got = bw.blockwise_fp8_mlp(*ops, swiglu_limit=SWIGLU_LIMIT)
-    # Three blockwise_fp8_mm kernel dispatches; not a torch fallback of the MLP.
-    assert bw.mlp_dispatch_counters() == (0, 0)
-    assert bw.dispatch_counters() == (3, 0)
-    ref = path_5938748(*ops, SWIGLU_LIMIT)
-    torch.testing.assert_close(got, ref, rtol=0, atol=0)
-
-
 def test_intermediates_that_overflow_sbuf_take_the_three_call_path():
     # The fused kernel keeps all three weights in SBUF (96 B per partition per
     # intermediate column at H=4096); a wide per-rank intermediate (low TP) does
