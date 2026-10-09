@@ -979,137 +979,18 @@ def dsa_decode_scores(query: Tensor, weights: Tensor, pool_bank: Tensor, slots: 
 
 
 def decode_pool_destinations(slots: Tensor, position: Tensor, *, rows: int,
-                             pool_size: int, owner: Tensor | None = None
-                             ) -> tuple[Tensor, Tensor]:
+                             pool_size: int) -> tuple[Tensor, Tensor]:
     """Where each request's ``pooled`` row is written: ``(slot, row)`` int64, ``[B]`` each.
 
     ``row`` is ``position // pool_size`` where this step closes that pool and the slot's
     trash row ``rows - 1`` otherwise, so every request writes once and a step that closes
     nothing lands where no candidate read looks.
-
-    Under decode context parallelism ``position`` is the rank's local position
-    (:func:`dcp_decode_operands`) and ``owner`` its ``[B]`` owner flag (any integer or
-    bool dtype, nonzero = this rank holds the step's token): a closed pool is written on
-    its owner only, at its local row, and every other rank writes its trash row, whatever
-    the position it was given. Without ``owner`` the destinations are the CP = 1 ones.
     """
     at = position.to(torch.int64)
     closes = torch.remainder(at, pool_size) == pool_size - 1
-    if owner is not None:
-        _require_owner(owner, int(at.shape[0]))
-        closes = closes & (owner != 0)
     row = torch.where(closes, torch.div(at, pool_size, rounding_mode="floor"),
                       torch.full_like(at, int(rows) - 1))
     return slots.to(torch.int64), row
-
-
-def _require_owner(owner, batch: int) -> None:
-    if not torch.is_tensor(owner) or tuple(owner.shape) != (batch,):
-        raise DecodeBatchError(f"owner must be a [{batch}] tensor, one flag per request; got "
-                               f"{owner!r}")
-    if owner.dtype not in (torch.int32, torch.int64, torch.bool):
-        raise DecodeBatchError(f"owner must be int32, int64 or bool; got {owner.dtype}")
-
-
-# ---------------------------------------------------------------------------------------
-# Decode context parallelism: a rank's operands over its own pool shard
-# ---------------------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class DcpDecodeOperands:
-    """One rank's decode-step operands under decode context parallelism, ``[B]`` each.
-
-    Attributes:
-        seq_lens: int64, the tokens of each request this rank holds, this step's token
-            included where the rank owns it (the score stage's ``seq_lens`` and the
-            selection's).
-        position: int64, the token's local index on its owner; the owned length (a whole
-            number of blocks) on every other rank (the score stage's ``position`` and
-            :func:`decode_pool_destinations`').
-        owner: int32, 1 where this rank holds the step's token, else 0
-            (:func:`decode_pool_destinations`' ``owner``; ``mla_decode``'s owner input).
-    """
-
-    seq_lens: Tensor
-    position: Tensor
-    owner: Tensor
-
-
-def _require_dcp(cp_rank, cp_size, block_size) -> None:
-    for name, value in (("cp_rank", cp_rank), ("cp_size", cp_size),
-                        ("block_size", block_size)):
-        if not isinstance(value, int) or isinstance(value, bool):
-            raise DecodeBatchError(f"{name} must be a python int; got {value!r}")
-    if cp_size < 1 or not 0 <= cp_rank < cp_size:
-        raise DecodeBatchError(f"cp_rank must lie in [0, cp_size) with cp_size >= 1; got "
-                               f"cp_rank={cp_rank}, cp_size={cp_size}")
-    if block_size < 1:
-        raise DecodeBatchError(f"block_size must be positive; got {block_size}")
-
-
-def dcp_decode_operands(position: Tensor, *, cp_rank: int, cp_size: int,
-                        block_size: int) -> DcpDecodeOperands:
-    """This rank's score-stage and pool-write operands for one decode token per request.
-
-    The ``cp_size`` ranks of a decode context parallel group hold a sequence interleaved by
-    ``block_size``-token block: block ``P // block_size`` on rank ``(P // block_size) %
-    cp_size`` at local block ``(P // block_size) // cp_size`` (the runner's slot split and
-    ``cp_rank = tp_rank % cp_size``). On that layout the causal bound, the stand-in of this
-    step's pool and the pool write read local coordinates:
-
-    * the owner: ``position`` = the token's local index, ``seq_lens`` = ``position + 1``;
-    * any other rank: ``position`` = ``seq_lens`` = the tokens it holds, a whole number of
-      blocks (every block it holds lies before the current one, so all are complete): no
-      pool there closes on this step, and the score kernel's stand-in
-      (``position % pool == pool - 1``) does not fire as long as the pool divides the block.
-
-    The ring step is not addressed here: every rank advances the sequence's ring with the
-    GLOBAL position (the ring row is ``position % pool``, and a non-owner's local position
-    is not the token's).
-
-    Args:
-        position: ``[B]`` int, each request's global position (``seq_lens - 1``).
-        cp_rank / cp_size: python ints, this rank's place in its group and the group size.
-        block_size: python int, the interleave unit (``hybrid_kv_block_size``).
-
-    Returns:
-        :class:`DcpDecodeOperands`. At ``cp_size = 1`` they are ``(position + 1,
-        position, 1)``. About twelve elementwise ops on ``[B]`` int64 tensors (``B * 8``
-        bytes each), once per step; every DSA layer of the step reads the same operands.
-    """
-    _require_dcp(cp_rank, cp_size, block_size)
-    if not torch.is_tensor(position) or position.ndim != 1:
-        raise DecodeBatchError(f"position must be a [B] tensor; got {position!r}")
-    _require_vector("position", position, int(position.shape[0]))
-    at = position.to(torch.int64)
-    block = torch.div(at, block_size, rounding_mode="floor")
-    offset = at - block * block_size
-    owns = torch.remainder(block, cp_size) == cp_rank
-    # Blocks this rank holds below the current one: those b < block with b % cp == rank.
-    before = torch.div(block + (cp_size - 1 - cp_rank), cp_size, rounding_mode="floor")
-    held = owns.to(torch.int64)
-    local = before * block_size + held * offset
-    return DcpDecodeOperands(seq_lens=local + held, position=local,
-                             owner=owns.to(torch.int32))
-
-
-def dcp_local_candidates(max_seq_len: int, *, cp_size: int, block_size: int,
-                         pool_size: int) -> int:
-    """The local candidate axis of a ``max_seq_len`` decode graph under decode context
-    parallelism: the complete pools of the rank holding the most of a ``max_seq_len``
-    sequence (``max_seq_len // pool_size`` at ``cp_size = 1``). A python int."""
-    _require_dcp(0, cp_size, block_size)
-    if not isinstance(pool_size, int) or not _is_power_of_two(pool_size):
-        raise DecodeBatchError(f"pool_size must be a power-of-two python int; got "
-                               f"{pool_size!r}")
-    if block_size % pool_size != 0:
-        raise DecodeBatchError(f"block_size {block_size} must be a whole number of pools "
-                               f"(pool_size {pool_size}): a pool must not straddle owners")
-    whole, partial = divmod(int(max_seq_len), block_size)
-    held = [block_size * ((whole + cp_size - 1 - rank) // cp_size)
-            + (partial if rank == whole % cp_size else 0) for rank in range(cp_size)]
-    return max(held) // pool_size
 
 
 # ---------------------------------------------------------------------------------------

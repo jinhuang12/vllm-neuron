@@ -3,31 +3,39 @@
 
 Under DCP a group of ``CP`` ranks holds one sequence's pooled-key bank interleaved by
 128-token block: block ``P // 128`` lives on rank ``(P // 128) % CP`` at local block
-``(P // 128) // CP`` (the runner's prefill slot split, ``neuron_model_runner.py``
-``slot_mapping.view(S // (W * I), W, I)[:, R, :]``; ``cp_rank = tp_rank % CP``). Each rank
-scores and selects over its own pools; trn2-2's item 3 merges the ``CP`` local top-``k``
-lists into the global one. What this file pins, against the CP = 1 answer:
+``(P // 128) // CP`` (the runner's prefill slot split; ``cp_rank = tp_rank % CP``). The
+ownership map ``vllm_neuron.utils.dcp_ownership`` spells that layout; the decode kernels
+take its results as plain tensors. Each rank scores and selects over its own pools, and
+trn2-2's item 3 merges the ``CP`` local top-``k`` lists into the global one. What this
+file pins, against the CP = 1 answer:
 
-* **Operands** (``decode_batch.dcp_decode_operands``): the owned length, the position (the
-  token's local index on its owner, the owned length elsewhere) and the owner flag, against
-  a token-by-token count of the interleave.
+* **Operands** from the ownership map: ``seq_lens = owned_length(seq_lens, rank)``,
+  ``position = owned_length(position, rank)`` (the token's local row on its owner, a whole
+  number of blocks elsewhere), the owner flag ``token_owner(position) == rank`` and the
+  candidate axis ``local_context_capacity(max_seq_len) // index_kpool``, against a
+  token-by-token count of the interleave.
 * **Scores over the local shard**: ``dsa_decode_scores`` on a rank's bank with those
   operands gives the CP = 1 scores of the pools the rank owns, at their local columns; the
   step's own pool stands in on its owner only.
-* **The owner gate** (``decode_pool_destinations(..., owner=)``): a step that closes a pool
-  writes it on the owner, at its local row; every other rank writes its trash row.
+* **The owner gate** as the model applies it (``decode_pool_destinations`` at the token's
+  local row, then the trash row wherever this rank is not the owner): a step that closes a
+  pool writes it on the owner, at its local row; every other rank writes its trash row.
 * **The local top-k** (``decode_select.dsa_decode_select_pools``): the selected local pool
   ids in ascending order (ties at the ``k``-th value to the lowest local id) and their
   scores beside them, rows short of ``k`` pools padded with ``-1`` and
   :data:`decode_select.POOL_PAD_VALUE`; bit for bit against the torch oracle, and the
   expanded tokens equal to ``dsa_decode_select``'s.
 * **The merge**: a reference merge of the ``CP`` local lists under the global tie rule
-  ``g = (p // 32) * 32 * CP + cp_rank * 32 + (p % 32)`` gives the CP = 1 list exactly, values
-  and ids, at CP in {2, 4, 8}.
-* **The ownership remap** (``dcp_global_pool_ids`` / ``dcp_owned_pool_rows``): a round trip,
-  and the union of the ranks' expanded rows equal to the CP = 1 token set.
+  ``g = (p // 32) * 32 * CP + cp_rank * 32 + (p % 32)`` (``pool_global_index``) gives the
+  CP = 1 list exactly, values and ids, at CP in {2, 4, 8}.
+* **The ownership remap** (``pool_global_index``, ``pool_owner``, ``pool_local_index``): a
+  round trip, and the union of the ranks' expanded rows equal to the CP = 1 token set.
 * **The device compile** of the new kernel at served shapes: every access ordered
   (``sbuf_order``) and the dependency checker's one-pass and loop-carried verdicts CLEAN.
+
+On a tree without ``vllm_neuron.utils.dcp_ownership`` (the d92592e base) the tests read
+:class:`_OwnershipFormulas`, the same functions with the same signatures; with the module
+present they read the module.
 """
 
 from __future__ import annotations
@@ -63,6 +71,52 @@ DIM = int(_CFG.index_head_dim)
 CPS = (2, 4, 8)
 
 
+class _OwnershipFormulas:
+    """The functions of ``vllm_neuron.utils.dcp_ownership`` these tests call, with its
+    signatures and formulas (trn2-2's ownership map), for a tree that does not carry it."""
+
+    @staticmethod
+    def token_owner(positions, *, block_size, dcp_size):
+        return (positions // block_size) % dcp_size
+
+    @staticmethod
+    def token_local_row(positions, *, block_size, dcp_size):
+        return (positions // block_size // dcp_size) * block_size + positions % block_size
+
+    @staticmethod
+    def owned_length(context_lens, rank, *, block_size, dcp_size):
+        whole = context_lens // block_size
+        partial = context_lens % block_size
+        blocks = (whole + (dcp_size - 1) - rank) // dcp_size
+        own_partial = torch.where(whole % dcp_size == rank, partial, torch.zeros_like(partial))
+        return blocks * block_size + own_partial
+
+    @staticmethod
+    def pool_owner(pools, *, block_size, dcp_size, index_kpool):
+        return (pools // (block_size // index_kpool)) % dcp_size
+
+    @staticmethod
+    def pool_local_index(pools, *, block_size, dcp_size, index_kpool):
+        per_block = block_size // index_kpool
+        return (pools // per_block // dcp_size) * per_block + pools % per_block
+
+    @staticmethod
+    def pool_global_index(local_pools, owner, *, block_size, dcp_size, index_kpool):
+        per_block = block_size // index_kpool
+        return ((local_pools // per_block) * dcp_size + owner) * per_block + (
+            local_pools % per_block)
+
+    @staticmethod
+    def local_context_capacity(context, *, block_size, dcp_size):
+        return -(-context // (block_size * dcp_size)) * block_size
+
+
+try:
+    from vllm_neuron.utils import dcp_ownership as OWN
+except ImportError:
+    OWN = _OwnershipFormulas
+
+
 @pytest.fixture(autouse=True)
 def _kernels_on():
     assert can_run_kernel(), "run with VLLM_NEURON_CPU_MODE=1 and NKI_SIMULATOR=1"
@@ -75,7 +129,7 @@ def _select_launches():
 
 
 # ---------------------------------------------------------------------------------------
-# The interleave, spelled token by token (the reference every DCP helper is checked against)
+# The interleave, spelled token by token (the reference the operands are checked against)
 # ---------------------------------------------------------------------------------------
 
 
@@ -106,11 +160,18 @@ def _reference_operands(position: int, rank: int, cp: int) -> tuple[int, int, in
     return owned, owned, 0
 
 
+def _operands(position, rank, cp):
+    """The DCP operands of the score stage from the ownership map, for ``[B]`` int64 global
+    positions: ``(seq_lens, position, owner)``, int64 / int64 / bool."""
+    seq_lens = OWN.owned_length(position + 1, rank, block_size=BLOCK, dcp_size=cp)
+    local = OWN.owned_length(position, rank, block_size=BLOCK, dcp_size=cp)
+    owner = OWN.token_owner(position, block_size=BLOCK, dcp_size=cp) == rank
+    return seq_lens, local, owner
+
+
 def _local_candidates(ctx: int, cp: int) -> int:
-    """The complete pools of the rank holding the most of a ``ctx``-token sequence."""
-    if ctx % (BLOCK * cp) == 0:
-        return ctx // (cp * POOL)
-    return max(sum(1 for t in range(ctx) if _owner_of(t, cp) == r) for r in range(cp)) // POOL
+    """The per-rank candidate axis: the runner's per-rank pool store for a ``ctx`` context."""
+    return OWN.local_context_capacity(ctx, block_size=BLOCK, dcp_size=cp) // POOL
 
 
 # ---------------------------------------------------------------------------------------
@@ -125,62 +186,54 @@ _POSITIONS = [0, 1, 3, 4, 126, 127, 128, 129, 255, 256, 383, 511, 512, 1023, 102
 def test_operands_count_the_interleave(cp):
     position = torch.tensor(_POSITIONS, dtype=torch.int64)
     for rank in range(cp):
-        ops = DB.dcp_decode_operands(position, cp_rank=rank, cp_size=cp, block_size=BLOCK)
+        seq_lens, local, owner = _operands(position, rank, cp)
         want = [_reference_operands(p, rank, cp) for p in _POSITIONS]
-        assert ops.seq_lens.tolist() == [w[0] for w in want], (cp, rank)
-        assert ops.position.tolist() == [w[1] for w in want], (cp, rank)
-        assert ops.owner.tolist() == [w[2] for w in want], (cp, rank)
-        assert ops.owner.dtype == torch.int32
-        assert tuple(ops.seq_lens.shape) == tuple(ops.position.shape) == (len(_POSITIONS),)
+        assert seq_lens.tolist() == [w[0] for w in want], (cp, rank)
+        assert local.tolist() == [w[1] for w in want], (cp, rank)
+        assert owner.tolist() == [bool(w[2]) for w in want], (cp, rank)
+        # On the owner the local position is the token's local row (the row the model's
+        # pool write uses).
+        rows = OWN.token_local_row(position, block_size=BLOCK, dcp_size=cp)
+        assert torch.equal(local[owner], rows[owner])
 
 
 @pytest.mark.parametrize("cp", CPS)
 def test_exactly_one_rank_owns_the_token_and_non_owners_never_stand_in(cp):
     position = torch.tensor(_POSITIONS, dtype=torch.int64)
-    ranks = [DB.dcp_decode_operands(position, cp_rank=r, cp_size=cp, block_size=BLOCK)
-             for r in range(cp)]
-    assert torch.equal(sum(o.owner for o in ranks), torch.ones(len(_POSITIONS), dtype=torch.int32))
+    ranks = [_operands(position, r, cp) for r in range(cp)]
+    assert torch.equal(sum(o.to(torch.int64) for _s, _p, o in ranks),
+                       torch.ones(len(_POSITIONS), dtype=torch.int64))
     # The owned lengths add up to the global length.
-    assert torch.equal(sum(o.seq_lens for o in ranks), position + 1)
-    for ops in ranks:
-        other = ops.owner == 0
+    assert torch.equal(sum(s for s, _p, _o in ranks), position + 1)
+    for seq_lens, local, owner in ranks:
+        other = ~owner
         # A non-owner's position is its owned length, a whole number of blocks: it never
         # closes a pool, so the score kernel's stand-in (position % pool == pool - 1) never
         # fires there.
-        assert torch.all(ops.position[other] % BLOCK == 0)
-        assert torch.all(ops.position[other] == ops.seq_lens[other])
-        assert torch.all(ops.position[~other] == ops.seq_lens[~other] - 1)
+        assert torch.all(local[other] % BLOCK == 0)
+        assert torch.all(local[other] == seq_lens[other])
+        assert torch.all(local[owner] == seq_lens[owner] - 1)
 
 
 def test_cp_one_is_the_identity():
     position = torch.tensor(_POSITIONS, dtype=torch.int64)
-    ops = DB.dcp_decode_operands(position, cp_rank=0, cp_size=1, block_size=BLOCK)
-    assert torch.equal(ops.position, position)
-    assert torch.equal(ops.seq_lens, position + 1)
-    assert torch.equal(ops.owner, torch.ones(len(_POSITIONS), dtype=torch.int32))
+    seq_lens, local, owner = _operands(position, 0, 1)
+    assert torch.equal(local, position)
+    assert torch.equal(seq_lens, position + 1)
+    assert torch.all(owner)
 
 
 @pytest.mark.parametrize("ctx", [2048, 2051, 4100, 8192, 8319, 65536, 131072, 1048576])
 @pytest.mark.parametrize("cp", (1,) + CPS)
-def test_local_candidates_hold_every_owned_pool(ctx, cp):
-    got = DB.dcp_local_candidates(ctx, cp_size=cp, block_size=BLOCK, pool_size=POOL)
-    assert got == _local_candidates(ctx, cp)
-    if cp == 1:
-        assert got == ctx // POOL            # the CP = 1 candidate axis
-
-
-def test_operand_refusals():
-    position = torch.tensor([5], dtype=torch.int64)
-    for kwargs in ({"cp_rank": 2, "cp_size": 2, "block_size": BLOCK},
-                   {"cp_rank": -1, "cp_size": 2, "block_size": BLOCK},
-                   {"cp_rank": 0, "cp_size": 0, "block_size": BLOCK},
-                   {"cp_rank": 0, "cp_size": 2, "block_size": 0}):
-        with pytest.raises(DB.DecodeBatchError):
-            DB.dcp_decode_operands(position, **kwargs)
-    with pytest.raises(DB.DecodeBatchError):
-        DB.dcp_decode_operands(position.reshape(1, 1), cp_rank=0, cp_size=2, block_size=BLOCK)
-    with pytest.raises(DB.DecodeBatchError):
-        DB.dcp_local_candidates(4096, cp_size=2, block_size=126, pool_size=POOL)
+def test_the_local_axis_holds_every_owned_pool(ctx, cp):
+    got = _local_candidates(ctx, cp)
+    # The complete pools each rank owns, pool by pool.
+    pools = torch.arange(ctx // POOL)
+    held = int(torch.bincount((pools // BLOCK_POOLS) % cp, minlength=cp).max())
+    assert got >= held
+    assert got % BLOCK_POOLS == 0           # whole blocks, as the block table addresses them
+    if ctx % (BLOCK * cp) == 0:
+        assert got == ctx // (cp * POOL)     # an even split: every rank holds the same
 
 
 # ---------------------------------------------------------------------------------------
@@ -242,11 +295,11 @@ def test_local_scores_are_the_cp1_scores_of_the_owned_pools(cp):
     case = _global_case(lengths, ctx, seed=cp)
     position = case["position"]
     want = _scores(case, case["bank"], position + 1, position, case["candidates"])
-    local_c = DB.dcp_local_candidates(ctx, cp_size=cp, block_size=BLOCK, pool_size=POOL)
+    local_c = _local_candidates(ctx, cp)
     for rank in range(cp):
-        ops = DB.dcp_decode_operands(position, cp_rank=rank, cp_size=cp, block_size=BLOCK)
+        seq_lens, local, _owner = _operands(position, rank, cp)
         bank = _local_bank(case["bank"], rank, cp, local_c)
-        got = _scores(case, bank, ops.seq_lens, ops.position, local_c)
+        got = _scores(case, bank, seq_lens, local, local_c)
         assert torch.equal(got, _to_local_columns(want, rank, cp, local_c)), (cp, rank)
     assert DB.decode_batch_dispatch_counters()[1] == 0
 
@@ -258,28 +311,30 @@ def test_the_stand_in_lands_on_the_owner_only():
     lengths = [516]                       # position 515: closes pool 128, block 4 -> rank 0
     case = _global_case(lengths, ctx, seed=7)
     position = case["position"]
-    local_c = DB.dcp_local_candidates(ctx, cp_size=cp, block_size=BLOCK, pool_size=POOL)
+    local_c = _local_candidates(ctx, cp)
     stale = case["bank"].clone()
     stale[:, 128] = 0                    # the store row the step has not written yet
     want = _scores({**case, "bank": stale}, stale, position + 1, position, case["candidates"])
     for rank in range(cp):
-        ops = DB.dcp_decode_operands(position, cp_rank=rank, cp_size=cp, block_size=BLOCK)
-        got = _scores(case, _local_bank(stale, rank, cp, local_c), ops.seq_lens, ops.position,
-                      local_c)
+        seq_lens, local, _owner = _operands(position, rank, cp)
+        got = _scores(case, _local_bank(stale, rank, cp, local_c), seq_lens, local, local_c)
         assert torch.equal(got, _to_local_columns(want, rank, cp, local_c))
     owner_col = 128 // (BLOCK_POOLS * cp) * BLOCK_POOLS + 128 % BLOCK_POOLS
     assert want[0, 128] > BOUND_FILL and owner_col == 64
 
 
 # ---------------------------------------------------------------------------------------
-# The owner gate on the pool write
+# The owner gate on the pool write, as the model applies it
 # ---------------------------------------------------------------------------------------
 
 
-def _destinations(slots, position, rows, owner=None):
-    if owner is None:
-        return DB.decode_pool_destinations(slots, position, rows=rows, pool_size=POOL)
-    return DB.decode_pool_destinations(slots, position, rows=rows, pool_size=POOL, owner=owner)
+def _gated_destinations(slots, position, rows, rank, cp):
+    """The model's DCP pool write: ``decode_pool_destinations`` at the token's local row,
+    then the trash row wherever this rank is not the token's owner."""
+    local = OWN.token_local_row(position, block_size=BLOCK, dcp_size=cp)
+    owned = OWN.token_owner(position, block_size=BLOCK, dcp_size=cp) == rank
+    slot, row = DB.decode_pool_destinations(slots, local, rows=rows, pool_size=POOL)
+    return slot, torch.where(owned, row, torch.full_like(row, rows - 1))
 
 
 @pytest.mark.parametrize("cp", CPS)
@@ -289,8 +344,7 @@ def test_only_the_owner_writes_the_closed_pool(cp):
     rows = _local_candidates(16384, cp) + 1
     trash = rows - 1
     for rank in range(cp):
-        ops = DB.dcp_decode_operands(position, cp_rank=rank, cp_size=cp, block_size=BLOCK)
-        slot, row = _destinations(slots, ops.position, rows, owner=ops.owner)
+        slot, row = _gated_destinations(slots, position, rows, rank, cp)
         assert torch.equal(slot, slots.to(torch.int64))
         for b, p in enumerate(position.tolist()):
             closes = p % POOL == POOL - 1
@@ -298,41 +352,11 @@ def test_only_the_owner_writes_the_closed_pool(cp):
                 assert int(row[b]) == _local_of(p, cp) // POOL, (cp, rank, p)
             else:
                 assert int(row[b]) == trash, (cp, rank, p)
-
-
-def test_the_gate_holds_for_a_global_position_too():
-    """RED without the gate: today's call with the global position sends a non-owner's
-    closing step to a real row of its bank (``position // pool``); with ``owner`` it lands
-    on the trash row whatever the position."""
-    cp, rows = 2, 1025
-    position = torch.tensor([131], dtype=torch.int64)     # block 1 -> rank 1; closes pool 32
-    slots = torch.zeros(1, dtype=torch.int32)
-    rank0 = DB.dcp_decode_operands(position, cp_rank=0, cp_size=cp, block_size=BLOCK)
-    assert int(rank0.owner[0]) == 0
-    _, ungated = _destinations(slots, position, rows)
-    assert int(ungated[0]) == 32                           # a real row on the non-owner
-    _, gated = _destinations(slots, position, rows, owner=rank0.owner)
-    assert int(gated[0]) == rows - 1
-
-
-def test_without_owner_the_destinations_are_todays():
-    position = torch.tensor(_POSITIONS, dtype=torch.int64)
-    slots = torch.arange(len(_POSITIONS), dtype=torch.int32)
-    slot, row = _destinations(slots, position, 4097)
-    at = position % POOL == POOL - 1
-    assert torch.equal(row, torch.where(at, position // POOL, torch.full_like(position, 4096)))
-    assert slot.dtype == row.dtype == torch.int64
-    everyone = torch.ones(len(_POSITIONS), dtype=torch.int32)
-    assert torch.equal(_destinations(slots, position, 4097, owner=everyone)[1], row)
-
-
-def test_owner_refusals():
-    position = torch.tensor([3, 7], dtype=torch.int64)
-    slots = torch.zeros(2, dtype=torch.int32)
-    with pytest.raises(DB.DecodeBatchError):
-        _destinations(slots, position, 9, owner=torch.ones(3, dtype=torch.int32))
-    with pytest.raises(DB.DecodeBatchError):
-        _destinations(slots, position, 9, owner=torch.ones(2, dtype=torch.float32))
+        # The score stage's local position gives the same rows with no gate: on a non-owner
+        # it is a whole number of blocks, which closes no pool.
+        _seq, local, _own = _operands(position, rank, cp)
+        assert torch.equal(DB.decode_pool_destinations(slots, local, rows=rows,
+                                                       pool_size=POOL)[1], row)
 
 
 # ---------------------------------------------------------------------------------------
@@ -528,6 +552,24 @@ def test_the_pools_kernel_is_keyed_by_this_files_digest():
 # ---------------------------------------------------------------------------------------
 
 
+def _global_ids(ids, rank, cp):
+    """A rank's local pool ids as global pool ids (``pool_global_index``); a pad (``-1``)
+    stays ``-1``: the map itself sends ``-1`` to another negative id."""
+    gids = OWN.pool_global_index(ids.to(torch.int64), rank, block_size=BLOCK, dcp_size=cp,
+                                 index_kpool=POOL)
+    return torch.where(ids >= 0, gids, torch.full_like(gids, SENTINEL))
+
+
+def _owned_rows(gids, rank, cp):
+    """The merged global pool ids ``rank`` owns, as its local bank rows (``pool_owner``,
+    ``pool_local_index``); every other id, and ``-1``, as ``-1``. int32."""
+    g = gids.to(torch.int64)
+    mine = (g >= 0) & (OWN.pool_owner(g, block_size=BLOCK, dcp_size=cp,
+                                      index_kpool=POOL) == rank)
+    rows = OWN.pool_local_index(g, block_size=BLOCK, dcp_size=cp, index_kpool=POOL)
+    return torch.where(mine, rows, torch.full_like(g, SENTINEL)).to(torch.int32)
+
+
 def _reference_merge(lists, cp, *, seed=0):
     """trn2-2's item-3 rule on the ``CP`` local lists: higher value first, equal values to
     the lower global pool id; the first ``K``. Pads (``-1``) carry the lowest value.
@@ -542,8 +584,7 @@ def _reference_merge(lists, cp, *, seed=0):
                              for _ in range(int(ids.shape[0]))])
         shuffled.append((torch.gather(values, 1, order), torch.gather(ids, 1, order)))
     values = torch.cat([v for v, _ in shuffled], dim=1)
-    gids = torch.cat([DS.dcp_global_pool_ids(i, cp_rank=r, cp_size=cp, block_pools=BLOCK_POOLS)
-                      for r, (_, i) in enumerate(shuffled)], dim=1)
+    gids = torch.cat([_global_ids(i, r, cp) for r, (_, i) in enumerate(shuffled)], dim=1)
     by_id = torch.sort(gids.to(torch.int64), dim=1, stable=True)
     values = torch.gather(values, 1, by_id.indices)
     by_value = torch.sort(values, dim=1, descending=True, stable=True)
@@ -557,13 +598,13 @@ def _reference_merge(lists, cp, *, seed=0):
 def _rank_lists(bounded, lengths, cp, *, local_bounded=None):
     position = torch.tensor([n - 1 for n in lengths], dtype=torch.int64)
     ctx = int(bounded.shape[1]) * POOL
-    local_c = DB.dcp_local_candidates(ctx, cp_size=cp, block_size=BLOCK, pool_size=POOL)
+    local_c = _local_candidates(ctx, cp)
     lists = []
     for rank in range(cp):
-        ops = DB.dcp_decode_operands(position, cp_rank=rank, cp_size=cp, block_size=BLOCK)
+        seq_lens, _local, _owner = _operands(position, rank, cp)
         mine = (_to_local_columns(bounded, rank, cp, local_c) if local_bounded is None
                 else local_bounded[rank])
-        _tokens, values, ids = _pools(mine, ops.seq_lens.tolist())
+        _tokens, values, ids = _pools(mine, seq_lens.tolist())
         lists.append((values, ids))
     return lists
 
@@ -590,12 +631,12 @@ def test_the_chain_merges_to_the_cp1_list(cp):
     position = case["position"]
     bounded = _scores(case, case["bank"], position + 1, position, case["candidates"])
     _t, want_values, want_ids = _pools(bounded, lengths)
-    local_c = DB.dcp_local_candidates(ctx, cp_size=cp, block_size=BLOCK, pool_size=POOL)
+    local_c = _local_candidates(ctx, cp)
     local = []
     for rank in range(cp):
-        ops = DB.dcp_decode_operands(position, cp_rank=rank, cp_size=cp, block_size=BLOCK)
-        local.append(_scores(case, _local_bank(case["bank"], rank, cp, local_c), ops.seq_lens,
-                             ops.position, local_c))
+        seq_lens, local_pos, _owner = _operands(position, rank, cp)
+        local.append(_scores(case, _local_bank(case["bank"], rank, cp, local_c), seq_lens,
+                             local_pos, local_c))
     got_values, got_ids = _reference_merge(_rank_lists(bounded, lengths, cp,
                                                        local_bounded=local), cp)
     assert torch.equal(got_ids, want_ids)
@@ -613,15 +654,12 @@ def test_the_remap_round_trips(cp):
     local = torch.randint(0, 4096, (3, K), generator=gen).to(torch.int32)
     local[:, -7:] = SENTINEL
     for rank in range(cp):
-        gids = DS.dcp_global_pool_ids(local, cp_rank=rank, cp_size=cp, block_pools=BLOCK_POOLS)
-        assert gids.dtype == torch.int32
+        gids = _global_ids(local, rank, cp)
         want = torch.tensor([[_global_pool(p, rank, cp) if p >= 0 else SENTINEL for p in row]
-                             for row in local.tolist()], dtype=torch.int32)
+                             for row in local.tolist()], dtype=torch.int64)
         assert torch.equal(gids, want)
         for other in range(cp):
-            rows = DS.dcp_owned_pool_rows(gids, cp_rank=other, cp_size=cp,
-                                          block_pools=BLOCK_POOLS)
-            assert rows.dtype == torch.int32
+            rows = _owned_rows(gids, other, cp)
             if other == rank:
                 assert torch.equal(rows, local)
             else:
@@ -639,22 +677,12 @@ def test_the_ranks_rows_expand_to_the_cp1_tokens(cp):
     position = torch.tensor([n - 1 for n in lengths], dtype=torch.int64)
     union = [set() for _ in lengths]
     for rank in range(cp):
-        ops = DB.dcp_decode_operands(position, cp_rank=rank, cp_size=cp, block_size=BLOCK)
-        rows = DS.dcp_owned_pool_rows(ids_cp1, cp_rank=rank, cp_size=cp, block_pools=BLOCK_POOLS)
-        local_tokens = _dsa_index_expand_torch(rows, ops.seq_lens.to(torch.int32), POOL)
+        seq_lens, _local, _owner = _operands(position, rank, cp)
+        rows = _owned_rows(ids_cp1, rank, cp)
+        local_tokens = _dsa_index_expand_torch(rows, seq_lens.to(torch.int32), POOL)
         for b, row in enumerate(local_tokens.tolist()):
             union[b] |= {_global_token(t, rank, cp) for t in row if t >= 0}
     assert union == [set(t for t in row if t >= 0) for row in tokens_cp1.tolist()]
-
-
-def test_remap_refusals():
-    ids = torch.zeros(1, K, dtype=torch.int32)
-    with pytest.raises(DS.DecodeSelectError):
-        DS.dcp_owned_pool_rows(ids, cp_rank=2, cp_size=2, block_pools=BLOCK_POOLS)
-    with pytest.raises(DS.DecodeSelectError):
-        DS.dcp_global_pool_ids(ids, cp_rank=0, cp_size=0, block_pools=BLOCK_POOLS)
-    with pytest.raises(DS.DecodeSelectError):
-        DS.dcp_global_pool_ids(ids.float(), cp_rank=0, cp_size=2, block_pools=BLOCK_POOLS)
 
 
 # ---------------------------------------------------------------------------------------

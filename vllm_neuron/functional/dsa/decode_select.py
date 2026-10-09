@@ -74,8 +74,8 @@ Decode context parallelism (DCP): each rank of a group selects over its own pool
 group merges the ranks' lists (trn2-2's item 3). :func:`dsa_decode_select_pools` is this
 selection with, beside the tokens, the local top-``k`` before the expansion: the selected
 pool ids in ascending order and their scores, the pads (:data:`POOL_PAD_ID`,
-:data:`POOL_PAD_VALUE`) after them. :func:`dcp_global_pool_ids` and
-:func:`dcp_owned_pool_rows` map a rank's ids to the global pool axis and the merged ids
+:data:`POOL_PAD_VALUE`) after them. The ids are local; the DCP ownership map
+(``vllm_neuron.utils.dcp_ownership``) maps them to the global pool axis and the merged ids
 back to the rank's own bank rows.
 
 Dispatches count in ``decode_batch``'s family (``decode_batch_dispatch_counters`` and the
@@ -948,55 +948,6 @@ def dsa_decode_select_pools(bounded: Tensor, seq_lens: Tensor, *, select_k: int,
     return call(bounded.contiguous(), seq_lens.reshape(batch, 1).to(torch.int32).contiguous(),
                 int(select_k), int(pool_size), out_cols, int(select_fold_cap(span)), int(span),
                 SOURCE_DIGEST)
-
-
-def _require_group(ids: Tensor, cp_rank, cp_size, block_pools) -> None:
-    for name, value in (("cp_rank", cp_rank), ("cp_size", cp_size),
-                        ("block_pools", block_pools)):
-        if not isinstance(value, int) or isinstance(value, bool):
-            raise DecodeSelectError(f"{name} must be a python int; got {value!r}")
-    if cp_size < 1 or not 0 <= cp_rank < cp_size or block_pools < 1:
-        raise DecodeSelectError(f"need 0 <= cp_rank < cp_size and block_pools >= 1; got "
-                                f"cp_rank={cp_rank}, cp_size={cp_size}, "
-                                f"block_pools={block_pools}")
-    if not torch.is_tensor(ids) or ids.dtype not in (torch.int32, torch.int64):
-        raise DecodeSelectError(f"pool ids must be an int32 or int64 tensor; got {ids!r}")
-
-
-def dcp_global_pool_ids(local_ids: Tensor, *, cp_rank: int, cp_size: int,
-                        block_pools: int) -> Tensor:
-    """A rank's local pool ids as global pool ids; ``-1`` stays ``-1``. int32.
-
-    Local pool ``p`` of rank ``cp_rank`` is global pool ``(p // block_pools) * block_pools *
-    cp_size + cp_rank * block_pools + p % block_pools`` (``block_pools`` = pools per
-    interleaved block, ``hybrid_kv_block_size // index_kpool``): the id on which the merge's
-    global tie rule (lower global id first) gives the CP = 1 order.
-    """
-    _require_group(local_ids, cp_rank, cp_size, block_pools)
-    ids = local_ids.to(torch.int32)
-    block = torch.div(ids, block_pools, rounding_mode="floor")
-    gids = (block * cp_size + cp_rank) * block_pools + (ids - block * block_pools)
-    return torch.where(ids >= 0, gids, torch.full_like(ids, POOL_PAD_ID))
-
-
-def dcp_owned_pool_rows(global_ids: Tensor, *, cp_rank: int, cp_size: int,
-                        block_pools: int) -> Tensor:
-    """The merged global pool ids this rank owns as its local bank rows; every other id, and
-    ``-1``, as ``-1``. int32, ``global_ids``' shape.
-
-    Global pool ``g`` sits in interleaved block ``g // block_pools``, owned by rank ``(g //
-    block_pools) % cp_size`` at local row ``((g // block_pools) // cp_size) * block_pools +
-    g % block_pools`` (the inverse of :func:`dcp_global_pool_ids`). Expanded with the rank's
-    own length (``dsa_index_expand``), the rows give the local token rows the rank attends.
-    About eight elementwise int32 ops over ``[R, k]`` (``4 R k`` bytes each) per DSA layer.
-    """
-    _require_group(global_ids, cp_rank, cp_size, block_pools)
-    gids = global_ids.to(torch.int32)
-    block = torch.div(gids, block_pools, rounding_mode="floor")
-    mine = (gids >= 0) & (torch.remainder(block, cp_size) == cp_rank)
-    rows = torch.div(block, cp_size, rounding_mode="floor") * block_pools + (
-        gids - block * block_pools)
-    return torch.where(mine, rows, torch.full_like(gids, POOL_PAD_ID))
 
 
 # ---------------------------------------------------------------------------------------
