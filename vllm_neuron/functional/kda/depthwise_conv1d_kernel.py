@@ -69,6 +69,7 @@ SLOTS_PER_CHAIN = 2
 
 
 def _div_ceil(numerator: int, denominator: int) -> int:
+    """``ceil(numerator / denominator)`` in integers, for ``numerator >= 0 < denominator``."""
     return (numerator + denominator - 1) // denominator
 
 

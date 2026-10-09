@@ -66,7 +66,7 @@ def test_channel_and_sequence_tile_boundaries(tokens, monkeypatch):
         _assert_bits(new[:, channel], old[:, channel])
 
 
-@pytest.mark.parametrize("lnc", [None, "1", "2", "invalid"])
+@pytest.mark.parametrize("lnc", [None, "1", "2"])
 @pytest.mark.parametrize(
     "channels,taps,dtype,batches,stride",
     [

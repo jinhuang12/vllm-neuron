@@ -17,13 +17,13 @@ A refused geometry raises; it never routes to the torch reference.
 from __future__ import annotations
 
 import logging
-import os
 
 import torch
 import torch.nn.functional as F
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 from torch import Tensor
 
+from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 from vllm_neuron.functional.kda.depthwise_conv1d_kernel import (
     TAP_SLOTS_MAX,
     depthwise_conv1d_kernel,
@@ -333,7 +333,7 @@ def depthwise_conv1d(
 
     _count_nki_dispatch()
     call = wrap_nki(depthwise_conv1d_kernel)
-    if os.environ.get("NEURON_LOGICAL_NC_CONFIG") == "2":
+    if lnc_pair():
         call = call[LNC_SHARDS]
     pad_left, pad_right = padding[1]
     return call(img, filt, int(pad_left), int(pad_right), int(stride[1]))
