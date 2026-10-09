@@ -27,11 +27,13 @@ owns nothing the worker has to load, warm, capture or bind:
   ``-1``; those become "no drafts", and the first decode after a prefill runs as a
   one-token step whose in-graph draft opens the verify loop.
 
-Served with synchronous scheduling only. Under async scheduling the accepted count
-reaches the host one step late, and the indexer-ring cursor and the recurrent-state
-commit (``NeuronModelRunner._update_states_after_model_execute``) are corrected on
-the host from that count, so that path is a second series and is refused here by
-name rather than served with stale state.
+Scheduling: the synchronous drafter is the shipped opt-in. Under async scheduling the
+accepted count reaches the host one step late, so the host corrections of
+``NeuronModelRunner._update_states_after_model_execute`` (indexer-ring cursor, recurrent
+checkpoint commit, resume rows) cannot run on the step's own output; that path is served
+only by the async drafter (``VLLM_NEURON_GLM5NEXT_MTP_ASYNC=1``, one sequence), which takes
+the step's output and corrects the next step's positions on device
+(``functional/mtp/async_step``), and is refused here by name otherwise.
 """
 
 from __future__ import annotations

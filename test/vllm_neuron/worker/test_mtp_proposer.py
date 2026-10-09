@@ -105,12 +105,14 @@ def test_mtp_without_on_device_sampling_is_refused_by_name(tmp_path):
 
 
 def test_mtp_with_async_scheduling_is_refused_by_name(tmp_path, monkeypatch):
-    """Async scheduling is the second series (the accepted count arrives one step late)."""
+    """With the knob off, async scheduling is refused and the refusal names the knob that
+    selects the async drafter (the accepted count arrives one step late otherwise)."""
     e2e._require_cpu_mode()
     fr._declaring_a_sampler(monkeypatch)
+    monkeypatch.delenv(ASYNC_KNOB, raising=False)
     config = _engine_config(_mtp(), async_scheduling=True, on_device_sampling=True)
     assert config.scheduler_config.async_scheduling is True
-    with fr._parallel_state(tmp_path, config), pytest.raises(ValueError, match="async scheduling"):
+    with fr._parallel_state(tmp_path, config), pytest.raises(ValueError, match=ASYNC_KNOB):
         NeuronModelRunner(config, device=torch.device("cpu"))
 
 

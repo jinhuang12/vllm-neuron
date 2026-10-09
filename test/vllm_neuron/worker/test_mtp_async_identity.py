@@ -154,6 +154,7 @@ def test_the_async_drafters_greedy_output_is_the_synchronous_drafters(tmp_path, 
         runner = spec._runner(async_config, root)
         assert runner.use_async_scheduling and runner.drafter.async_steps is True
         finished = set()
+        counts: list[tuple[int, int, int]] = []
         for i, prompt in enumerate(prompts):
             ids, steps, async_steps, fallbacks = _generate_async(
                 runner, f"async-{i}", prompt, tokens=spec.GENERATED, finished=finished
@@ -164,8 +165,113 @@ def test_the_async_drafters_greedy_output_is_the_synchronous_drafters(tmp_path, 
             # synchronous drafter's step; the async scheduler has one more step in
             # flight when that step's output is applied (``_generate_async``).
             assert steps == control[i][1] + 1, (i, steps, control[i][1])
+            counts.append((i, control[i][1], steps))
             # Every decode step after the first consumed the previous step's device
             # future as its input ids; the first decode after a prefill too (the
             # prefill's take carries the placeholders).
             assert fallbacks == 0, (i, async_steps, fallbacks)
             assert async_steps == steps, (i, async_steps, steps)
+    # Per prompt: (prompt, the synchronous drafter's decode steps, the async drafter's);
+    # ``GENERATED - 1`` synchronous steps means no draft was accepted on that prompt.
+    print("identity steps (prompt, sync, async):", counts)
+
+
+# ── the context limit: the served scheduler ends a request in one-row steps ─────
+
+
+LIMIT_PROMPT = 5  # the longest prompt (44 tokens): the limit comes soonest
+
+
+def _generate_async_to_the_limit(runner, req: str, prompt: list[int], *, finished: set):
+    """Prefill, then decode as the served async scheduler drives it until ``max_model_len``.
+
+    ``NeuronAsyncScheduler._update_after_schedule`` (``vllm/core/scheduler.py``) re-arms ``k``
+    placeholder drafts after every step whatever the runner proposed, until the request's
+    (optimistic) count passes ``max_model_len - 3 - 2 k``; from then on, stickily, it
+    schedules one-row steps, so vLLM's own trim (``num_new = min(1 + k, max_model_len - 1 -
+    num_computed)``) never shortens a step. The request is held while no row fits until its
+    output lands (``scheduler.py:504``); the handed count is pulled back one step late as in
+    ``_generate_async``. Returns ``(ids, steps, widths, async steps, sync fallbacks)``.
+    """
+    groups = fr._groups(runner)
+    blocks = list(range(spec.FIRST_BLOCK, spec.FIRST_BLOCK + -(-len(prompt) // spec.PAGE)))
+    _, pending = fr._step(runner, spec._prefill(req, prompt, groups, blocks, finished))
+    pending_rows = 1
+    handed = len(prompt)
+    safe = spec.MAX_MODEL_LEN - 3 - 2 * K
+    disabled = handed > safe
+    generated: list[int] = []
+    widths: list[int] = []
+    steps = 0
+    async_before, sync_before = runner._async_steps, runner._sync_fallback_steps
+    while True:
+        drafts = [] if disabled else [-1] * K
+        rows = min(1 + len(drafts), spec.MAX_MODEL_LEN - handed - 1)
+        if rows <= 0:
+            assert pending is not None, "the request stands at the limit with nothing in flight"
+            kept = _materialize(pending)
+            assert 1 <= len(kept) <= pending_rows, (kept, pending_rows)
+            generated += kept
+            handed -= pending_rows - len(kept)
+            pending = None
+            if handed >= spec.MAX_MODEL_LEN - 1:
+                break
+            continue
+        assert rows == 1 + len(drafts), "the served scheduler never trims a step"
+        needed = -(-(handed + rows) // spec.PAGE)
+        new = list(range(spec.FIRST_BLOCK + len(blocks), spec.FIRST_BLOCK + needed))
+        blocks += new
+        _, output = fr._step(runner, spec._decode(req, handed, len(generated), groups, drafts, new))
+        steps += 1
+        widths.append(rows)
+        handed += rows
+        # ``_update_after_schedule``: the sticky check on the count after this step.
+        disabled = disabled or handed > safe
+        if pending is not None:
+            kept = _materialize(pending)
+            assert 1 <= len(kept) <= pending_rows, (kept, pending_rows)
+            generated += kept
+            handed -= pending_rows - len(kept)
+        pending, pending_rows = output, rows
+    return (
+        generated, steps, widths,
+        runner._async_steps - async_before, runner._sync_fallback_steps - sync_before,
+    )
+
+
+def test_the_async_drafter_reaches_the_context_limit_with_the_synchronous_drafters_ids(tmp_path, monkeypatch):
+    """The last steps of a request are the scheduler's, not the drafter's: under async
+    scheduling the proposal is never consulted, the served scheduler switches the request to
+    one-row steps near ``max_model_len`` on its own, and that transition step must take its
+    input id from the carried future (its prefix, ``_glm5next_async_prefix``) -- not the
+    generic fallback, which reads the future back and reconciles the handed start the
+    correction then pulls back a second time. The ids to the last position are the
+    synchronous drafter's, which stops proposing early (``_spec_decode_limit``) and ends in
+    one-row steps too."""
+    e2e._require_cpu_mode()
+    fr._declaring_a_sampler(monkeypatch)
+    prompt = spec._prompts()[LIMIT_PROMPT]
+    tokens = spec.MAX_MODEL_LEN - len(prompt)  # every position to the last one
+    monkeypatch.delenv(proposer_tests.ASYNC_KNOB, raising=False)
+    monkeypatch.setenv(spec.KNOB, str(K))
+    (tmp_path / "sync").mkdir()
+    with fr._parallel_state(tmp_path / "sync", spec._config(K)):
+        root, _ = spec._root()
+        runner = spec._runner(spec._config(K), root)
+        control, control_steps = spec._generate(runner, "sync-limit", prompt, tokens=tokens, finished=set())
+    assert len(control) == tokens
+
+    monkeypatch.setenv(proposer_tests.ASYNC_KNOB, "1")
+    (tmp_path / "async").mkdir()
+    with fr._parallel_state(tmp_path / "async", _async_config(K)):
+        root, _ = spec._root()
+        runner = spec._runner(_async_config(K), root)
+        ids, steps, widths, async_steps, fallbacks = _generate_async_to_the_limit(
+            runner, "async-limit", prompt, finished=set()
+        )
+    assert ids == control, (ids, control)
+    # Verify steps, then the sticky transition to one-row steps, nothing in between.
+    assert widths[0] == T and widths[-1] == 1 and set(widths) == {1, T}, widths
+    assert widths == sorted(widths, reverse=True), widths
+    assert fallbacks == 0 and async_steps == steps, (async_steps, fallbacks, steps)
+    print("limit steps (sync, async, widths):", control_steps, steps, widths)

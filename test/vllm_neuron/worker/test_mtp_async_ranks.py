@@ -20,11 +20,19 @@ simulator reads a kernel's inputs on the host to run it, which on the real devic
 launch does not do, and the reads this test watches are the runner's own. The kernels are
 held to the torch route bit for bit in ``functional/test_mtp_async_step.py``.
 
-On a runner that read a future back on the main thread this test fails by the step bound
-with the rank's progress stopping at ``dispatched 1`` or ``dispatched 2`` and its stacks
-naming the read; on the async drafter every step is materialised once (``waiters`` one
-per step), both ranks return the same ids, each decode keeps ``1 .. 1 + k`` of them and
-no step fell back to the synchronous input path.
+What fails on a runner that reads a future back on the main thread: a reader that never
+returns trips the step bound (the rank's progress stops at ``dispatched 1`` or
+``dispatched 2``, its stacks name the read); a reader that returns once the simulated
+device completes the step shows as a second waiter on that future (``waiters``) -- the
+serialisation the async drafter removes. The recorded RED arm on 22d8be7 (the synchronous
+drafter forced under async scheduling, its refusal bypassed; log
+``reports/mtp-runner-logs/asm/red-mtp-async-ranks-22d8be7.log``) fails earlier still: the
+synchronous proposal reads the sampler's output as host lists and the device future is a
+tensor (``len() of a 0-d tensor`` at the prefill's proposal), the first of the host reads
+(``_glm5next_propose_drafts``, then the hook's ``list(sampled_token_ids)``) that path makes.
+On the async drafter every step is materialised once (``waiters`` one per step), both
+ranks return the same ids, each decode keeps ``1 .. 1 + k`` of them and no step fell back
+to the synchronous input path.
 
     NKI_SIMULATOR=1 VLLM_NEURON_CPU_MODE=1 python -m pytest \\
         test/vllm_neuron/worker/test_mtp_async_ranks.py

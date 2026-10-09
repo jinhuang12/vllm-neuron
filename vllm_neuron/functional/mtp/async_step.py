@@ -36,6 +36,8 @@ from __future__ import annotations
 from typing import NamedTuple
 
 import torch
+
+from vllm_neuron.nn.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from torch import Tensor
 
 import nki
@@ -67,10 +69,8 @@ __all__ = [
     "reset_dispatch_counters",
 ]
 
-#: The rejection sampler's marker for a rejected row (``nn/rejection_sampler.py``).
-PLACEHOLDER_TOKEN_ID = -1
-#: The largest value any operand or result may hold: fp32 is exact below it.
-EXACT_BOUND = 1 << 24
+#: Two int32 words make the int64 the latent slots are consumed as (NKI has no int64).
+INT64_WORDS = 2
 
 
 def _on_the_host(tensor: Tensor) -> bool:
@@ -442,7 +442,7 @@ def mtp_async_correct_kernel(prev_rows, starts, table, PREV_WIDTH: int, WIDTH: i
     start_out = nl.ndarray((rows, 1), dtype=nl.int32, buffer=nl.shared_hbm)
     linear_out = nl.ndarray((rows, 1), dtype=nl.int32, buffer=nl.shared_hbm)
     seq_out = nl.ndarray((rows, WIDTH), dtype=nl.int32, buffer=nl.shared_hbm)
-    slots_out = nl.ndarray((rows, 2 * WIDTH), dtype=nl.int32, buffer=nl.shared_hbm)
+    slots_out = nl.ndarray((rows, INT64_WORDS * WIDTH), dtype=nl.int32, buffer=nl.shared_hbm)
     rows_out = nl.ndarray((rows, 1), dtype=nl.int32, buffer=nl.shared_hbm)
 
     # ---- the real requests: partitions 0 .. B - 1 ---------------------------------- #
@@ -480,7 +480,7 @@ def mtp_async_correct_kernel(prev_rows, starts, table, PREV_WIDTH: int, WIDTH: i
     within_i = nl.ndarray((batch, WIDTH), dtype=nl.int32, buffer=nl.sbuf)
     nisa.tensor_scalar(dst=within_i, data=pos_i, op0=nl.bitwise_and, operand0=page - 1)
     if not WITH_SLOTS:
-        zero_slots = nl.ndarray((rows, 2 * WIDTH), dtype=nl.int32, buffer=nl.sbuf)
+        zero_slots = nl.ndarray((rows, INT64_WORDS * WIDTH), dtype=nl.int32, buffer=nl.sbuf)
         nisa.memset(dst=zero_slots, value=0)
         nisa.dma_copy(dst=slots_out, src=zero_slots)
     # Each request's block-table column as a row: column_t[r, page] = table[page, r], one
@@ -503,22 +503,22 @@ def mtp_async_correct_kernel(prev_rows, starts, table, PREV_WIDTH: int, WIDTH: i
         picked = nl.ndarray((batch, pages), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_tensor(dst=picked, data1=column_f[0:batch, :], data2=hit, op=nl.multiply)
         nisa.tensor_reduce(dst=block_f[:, t:t + 1], op=nl.add, data=picked, axis=(1,))
-    scaled_f = nl.ndarray((batch, WIDTH), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_scalar(dst=scaled_f, data=block_f, op0=nl.multiply, operand0=float(page))
-    within_f = nl.ndarray((batch, WIDTH), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=within_f, src=within_i)
-    slot_f = nl.ndarray((batch, WIDTH), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_tensor(dst=slot_f, data1=scaled_f, data2=within_f, op=nl.add)
-    slot_i = nl.ndarray((batch, WIDTH), dtype=nl.int32, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=slot_i, src=slot_f)
-    zero_i = nl.ndarray((batch, WIDTH), dtype=nl.int32, buffer=nl.sbuf)
-    nisa.memset(dst=zero_i, value=0)
-    # Low words at even columns, zero high words at odd ones: an int64 bit for bit.
     if WITH_SLOTS:
-        nisa.dma_copy(dst=slots_out.ap(pattern=[[2 * WIDTH, batch], [2, WIDTH]], offset=0),
-                      src=slot_i)
-        nisa.dma_copy(dst=slots_out.ap(pattern=[[2 * WIDTH, batch], [2, WIDTH]], offset=1),
-                      src=zero_i)
+        scaled_f = nl.ndarray((batch, WIDTH), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=scaled_f, data=block_f, op0=nl.multiply, operand0=float(page))
+        within_f = nl.ndarray((batch, WIDTH), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=within_f, src=within_i)
+        slot_f = nl.ndarray((batch, WIDTH), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_tensor(dst=slot_f, data1=scaled_f, data2=within_f, op=nl.add)
+        slot_i = nl.ndarray((batch, WIDTH), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=slot_i, src=slot_f)
+        zero_i = nl.ndarray((batch, WIDTH), dtype=nl.int32, buffer=nl.sbuf)
+        nisa.memset(dst=zero_i, value=0)
+        # Low words at even columns, zero high words at odd ones: an int64 bit for bit.
+        nisa.dma_copy(dst=slots_out.ap(pattern=[[INT64_WORDS * WIDTH, batch], [INT64_WORDS, WIDTH]],
+                                       offset=0), src=slot_i)
+        nisa.dma_copy(dst=slots_out.ap(pattern=[[INT64_WORDS * WIDTH, batch], [INT64_WORDS, WIDTH]],
+                                       offset=1), src=zero_i)
 
     # ---- the padding rows: partitions B .. R - 1 ------------------------------------ #
     if PADDING > 0:
@@ -546,10 +546,10 @@ def mtp_async_correct_kernel(prev_rows, starts, table, PREV_WIDTH: int, WIDTH: i
             nisa.tensor_scalar(dst=pad_slot_i, data=pad_ones_f, op0=nl.multiply,
                                operand0=pad_scaled_f)
         if WITH_SLOTS:
-            nisa.dma_copy(dst=slots_out.ap(pattern=[[2 * WIDTH, PADDING], [2, WIDTH]],
-                                           offset=batch * 2 * WIDTH), src=pad_slot_i)
-            nisa.dma_copy(dst=slots_out.ap(pattern=[[2 * WIDTH, PADDING], [2, WIDTH]],
-                                           offset=batch * 2 * WIDTH + 1), src=pad_zero_w)
+            nisa.dma_copy(dst=slots_out.ap(pattern=[[INT64_WORDS * WIDTH, PADDING], [INT64_WORDS, WIDTH]],
+                                           offset=batch * INT64_WORDS * WIDTH), src=pad_slot_i)
+            nisa.dma_copy(dst=slots_out.ap(pattern=[[INT64_WORDS * WIDTH, PADDING], [INT64_WORDS, WIDTH]],
+                                           offset=batch * INT64_WORDS * WIDTH + 1), src=pad_zero_w)
     return start_out, linear_out, seq_out, slots_out, rows_out
 
 
@@ -572,7 +572,11 @@ def mtp_async_correct(
         prev_width: rows per request of the previous step (``1 + k`` after a verify step).
         width: rows per request of this step (``1 + k`` on a verify step, 1 on a one-row decode).
         page_size: the latent bank's page, a power of two.
-        padding: the bucket's padding rows past the ``B`` requests.
+        padding: the bucket's padding rows past the ``B`` requests. A padding row starts at
+            position 0 of the null block with checkpoint row 0; the synchronous builder
+            records an idle slot's last row there instead -- unserved either way: the async
+            drafter serves one request (``MtpProposer`` refuses ``max_num_seqs > 1``), so a
+            bucket with padding is laid out but never run.
 
     Raises:
         MtpAsyncStepError: another geometry or dtype, a page size that is not a power of

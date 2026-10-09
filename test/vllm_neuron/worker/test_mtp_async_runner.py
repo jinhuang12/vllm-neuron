@@ -72,7 +72,10 @@ def proposer():
 
 class _Unreadable(torch.Tensor):
     """A device future as the hook sees it: a host read is the hang the async drafter exists
-    to avoid, so every read raises; tensor operations return plain tensors, as on device."""
+    to avoid, so every read of THIS tensor raises. Tensor operations return plain tensors
+    (``__torch_function__`` is disabled), as a NEFF output fed to the next launch does, so
+    the watch is on the hook's and the take's direct reads of the sampler's output -- a read
+    of a derived tensor is not caught here; the two-rank test's ``waiters`` count is."""
 
     __torch_function__ = torch._C._disabled_torch_function_impl
 
@@ -83,7 +86,13 @@ class _Unreadable(torch.Tensor):
     def _refuse(self, *args, **kwargs):
         raise AssertionError("the async drafter read a device future back on the host")
 
-    cpu = tolist = item = numpy = __bool__ = __iter__ = __int__ = __float__ = _refuse
+    cpu = tolist = item = numpy = __bool__ = __iter__ = __int__ = __float__ = __index__ = _refuse
+
+    def to(self, *args, **kwargs):
+        target = args[0] if args else kwargs.get("device")
+        if target is not None and str(target).startswith("cpu"):
+            self._refuse()
+        return torch.Tensor.to(self.as_subclass(torch.Tensor), *args, **kwargs)
 
 
 def _bind(runner, *names) -> None:
@@ -91,8 +100,18 @@ def _bind(runner, *names) -> None:
         setattr(runner, name, functools.partial(getattr(NeuronModelRunner, name), runner))
 
 
+#: A recurrent bank record as the hook's synchronous branch reads it: with one present that
+#: branch commits checkpoints (``commit_kda_checkpoints``), which ``no_commit`` refuses, so
+#: the async branch is proven to return before it.
+_RECURRENT_BANK = {
+    "family": "recurrent", "conv_state": torch.zeros((1, 1, 1, 1)), "recurrent_state": torch.zeros((1, 1, 1, 1)),
+}
+
+
 def _async_runner(proposer, *, record, drafts, req_ids=(REQ,), banks=None):
     """A runner holding what the async hook and proposal read and write."""
+    if banks is None:
+        banks = [_RECURRENT_BANK]
     runner = SimpleNamespace(
         is_mtp_spec=True,
         drafter=proposer,
@@ -103,7 +122,7 @@ def _async_runner(proposer, *, record, drafts, req_ids=(REQ,), banks=None):
         vllm_config=SimpleNamespace(
             model_config=SimpleNamespace(hf_config=SimpleNamespace(pad_token_id=PAD))
         ),
-        model=SimpleNamespace(glm5next_layer_banks=[] if banks is None else banks),
+        model=SimpleNamespace(glm5next_layer_banks=banks),
         _glm5next_step_record=record,
         _glm5next_side_cache_positions={SLOT: START + T},
         _glm5next_checkpoint_rows={SLOT: 2},
@@ -236,13 +255,67 @@ def test_a_partial_prefill_chunk_proposes_nothing(no_commit, proposer):
     assert runner._futures_drafts_only is None
 
 
-def test_near_max_model_len_nothing_is_proposed(no_commit, proposer):
-    limit = NeuronModelRunner._spec_decode_limit(_async_runner(proposer, record=None, drafts=None))
+def test_near_max_model_len_the_proposal_is_still_the_carrys_tensor(no_commit, proposer):
+    """vLLM's async scheduler never consults the proposal (``async_scheduler.py:23-25,44``
+    re-arms ``k`` placeholders every step) and clips the last steps of a request itself
+    (``scheduler.py:474-479``), so proposing nothing near ``max_model_len`` would only lose
+    the device future the clipped step takes its input ids from: the proposal is the
+    carry's tensor on every decode step, however close to the limit."""
     drafts = torch.ones((1, K), dtype=torch.int32)
-    runner = _settled(proposer, _record(width=T, start=limit - T + 1), drafts, torch.tensor([[5, -1, -1, -1]], dtype=torch.int32))
-    assert runner._glm5next_propose_drafts(None, None) == [[]]
-    runner = _settled(proposer, _record(width=T, start=limit - T), drafts, torch.tensor([[5, -1, -1, -1]], dtype=torch.int32))
-    assert torch.is_tensor(runner._glm5next_propose_drafts(None, None))
+    for start in (MAX_MODEL_LEN - 2 * T, MAX_MODEL_LEN - T, MAX_MODEL_LEN - 2):
+        runner = _settled(proposer, _record(width=T, start=start), drafts, torch.tensor([[5, -1, -1, -1]], dtype=torch.int32))
+        assert runner._glm5next_propose_drafts(None, None) is runner._glm5next_async_carry.next_input_ids, start
+        assert runner._futures_drafts_only is drafts, start
+
+
+def _swapping_runner(proposer, *, next_ids, drafts_only, sampled):
+    """A runner at the generic input-id swap with the previous step's futures buffered."""
+    runner = _async_runner(proposer, record=_record(width=T), drafts=drafts_only)
+    runner.async_execution_buffer = {
+        "futures_sampled_token_ids": sampled, "futures_draft_token_ids": next_ids,
+        "futures_drafts_only": drafts_only, "prev_req_ids_ordered": [REQ],
+    }
+    runner._batch_composition_changed = False
+    runner._transition_bonus_tensor = None
+    runner._is_decode = lambda: True
+    runner._async_steps = runner._sync_fallback_steps = 0
+    _bind(runner, "_maybe_swap_async_input_ids", "_try_assemble_spec_input_ids",
+          "_try_reuse_nonspec_future", "_glm5next_async_prefix")
+    return runner
+
+
+def test_a_step_narrower_than_the_carry_takes_the_futures_first_ids(no_commit, proposer):
+    """At the context limit the async scheduler clips a step to ``w < 1 + k`` rows
+    (``scheduler.py:474-479``; no proposal can stop it, the placeholders are re-armed every
+    step). The swap takes the first ``w`` ids of the carried ``[rows, 1 + k]`` future -- the
+    contiguous prefix of one request's row: no copy, no launch -- and counts an async step,
+    never the host-built fallback that would read the future back; a full step takes it whole."""
+    next_ids = torch.tensor([[5, 7, 8, 9]], dtype=torch.int32)
+    runner = _swapping_runner(proposer, next_ids=next_ids, drafts_only=next_ids[:, 1:].clone(),
+                              sampled=torch.tensor([[5, -1, -1, -1]], dtype=torch.int32))
+    for width in (T, 3, 2, 1):
+        runner._async_steps = runner._sync_fallback_steps = 0
+        swapped = runner._maybe_swap_async_input_ids(torch.full((width,), -1, dtype=torch.int32))
+        assert swapped.tolist() == [5, 7, 8, 9][:width], width
+        assert swapped.data_ptr() == next_ids.data_ptr(), "a view of the future, not a copy"
+        assert (runner._async_steps, runner._sync_fallback_steps) == (1, 0), width
+
+
+def test_the_carried_futures_prefix_is_one_requests_contiguous_row(no_commit, proposer):
+    """``_glm5next_async_prefix`` hands a future through whole at its own width, the prefix
+    view when the step is narrower, and refuses by name a step wider than the carry or a
+    prefix that is not contiguous (more than one request: the async drafter serves one)."""
+    runner = _async_runner(proposer, record=_record(width=T), drafts=None)
+    _bind(runner, "_glm5next_async_prefix")
+    drafts = torch.tensor([[7, 8, 9]], dtype=torch.int32)
+    assert runner._glm5next_async_prefix(drafts, K, name="drafts") is drafts
+    narrowed = runner._glm5next_async_prefix(drafts, 1, name="drafts")
+    assert narrowed.tolist() == [[7]] and narrowed.is_contiguous()
+    assert narrowed.data_ptr() == drafts.data_ptr()
+    with pytest.raises(ValueError, match="wider"):
+        runner._glm5next_async_prefix(drafts, K + 1, name="drafts")
+    with pytest.raises(ValueError, match="one request"):
+        runner._glm5next_async_prefix(torch.zeros((2, K), dtype=torch.int32), 1, name="drafts")
 
 
 def test_a_synthetic_step_proposes_nothing(no_commit, proposer):
@@ -336,6 +409,21 @@ def test_a_one_row_decode_is_laid_out_at_the_true_position(proposer):
     converted = translator._convert(world, [0], cached=[start + T + 1], tokens=1, real=[1], width=1)
     for carrier in translator._sparse(world, converted["layer_carriers"]):
         assert int(carrier["position"]) == start + T + 1
+
+
+def test_the_handed_width_is_the_steps_own_and_only_one_or_the_full_width(proposer):
+    """The correction pulls back from the previous step's own width, 1 or ``1 + k``: the two
+    widths the served scheduler produces (``NeuronAsyncScheduler`` clears the placeholders,
+    stickily, before vLLM's trim could shorten a step). Another width never reaches the
+    carry (the translator refuses the ragged step first) and is refused here by name, with
+    the derivation of what the generic bookkeeping would have done to it in the docstring."""
+    runner = _async_runner(proposer, record=None, drafts=None)
+    _bind(runner, "_glm5next_async_handed_width")
+    assert runner._glm5next_async_handed_width(1) == 1
+    assert runner._glm5next_async_handed_width(T) == T
+    for width in (0, 2, K, T + 1):
+        with pytest.raises(ValueError, match="1 or 4"):
+            runner._glm5next_async_handed_width(width)
 
 
 def test_the_recurrent_carriers_resume_from_the_carried_row_at_the_true_position(proposer):
