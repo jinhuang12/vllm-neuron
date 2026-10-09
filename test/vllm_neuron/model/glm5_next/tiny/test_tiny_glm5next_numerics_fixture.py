@@ -16,6 +16,13 @@ values :data:`SELECTION_ORDER_DIGESTS` pins instead (in the DSA world at ``B = 6
 the decode selection's pool order moves). Two negative controls show the
 digests have power: a broken bank gather and a broken ring write each change them.
 
+The fixture was produced at ``OMP_NUM_THREADS=4`` (the producing command in
+``gen_numerics_fixture.py``). Torch splits a CPU op's work by the intra-op thread count,
+and some of the worlds' sums round apart at another count: an unchanged tree moves the
+DSA ``B = 64`` digests at 1 thread, and the DSA ``B = 64`` and KDA ``B = 1`` digests at
+96. So every test here runs at :data:`FIXTURE_THREADS`, whatever count the process
+started with.
+
     NKI_SIMULATOR=1 VLLM_NEURON_CPU_MODE=1 python -m pytest \\
         test/vllm_neuron/model/glm5_next/tiny/test_tiny_glm5next_numerics_fixture.py
 """
@@ -55,6 +62,19 @@ SELECTION_ORDER_DIGESTS = {
             "8a3f808a04c7cc026db25badd23b8abf56070d39ca247cd7e914e01950d0a0a1",
     },
 }
+
+#: The intra-op thread count the fixture was produced at; every test runs at it.
+FIXTURE_THREADS = 4
+
+
+@pytest.fixture(autouse=True)
+def _at_the_fixture_thread_count():
+    before = torch.get_num_threads()
+    torch.set_num_threads(FIXTURE_THREADS)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(before)
 
 
 def _fixture() -> dict:

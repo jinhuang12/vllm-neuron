@@ -772,20 +772,40 @@ def test_editing_the_nkilib_predicate_patch_moves_the_nkilib_mlp_digest(tmp_path
             "functional/moe/moe_blockwise.py",
         ),
         ("nkilib.core.subkernels.indexed_flatten.indexed_flatten", "functional/moe/moe_blockwise.py"),
-        (
-            "nkilib.experimental.conv.depthwise_conv1d.depthwise_conv1d_implicit_gemm",
-            "functional/kda/depthwise_conv1d.py",
-        ),
         ("nkilib.core.mlp.mlp.mlp", "functional/mlp.py"),
         ("nkilib.core.cumsum.cumsum.cumsum", "functional/cumsum.py"),
     ],
 )
 def test_a_served_nkilib_kernel_folds_its_wrapper_and_the_nkilib_patcher(func_name, wrapper):
-    """The first three are the nkilib func_names in the served prefill graph.hlo."""
+    """The first two are the nkilib func_names in the served prefill graph.hlo."""
     files = _kernel_files(ck.default_resolver(), func_name)
 
     assert wrapper in files
     assert "functional/mlp.py" in files  # patches nkilib.core.mlp at import
+
+
+def test_the_served_kda_conv1d_is_the_package_kernel_and_folds_its_own_module():
+    """The KDA prefill conv1d was nkilib's ``depthwise_conv1d_implicit_gemm``, which
+    ``functional/kda/depthwise_conv1d.py`` imported and wrapped. It is now the package
+    kernel ``depthwise_conv1d_kernel``: the key folds that kernel's module, which
+    imports only ``nki``. No digested file imports the nkilib kernel any more, so a
+    graph that still names it folds the whole-package digest (never a stale hit)."""
+    resolver = ck.default_resolver()
+
+    files = _kernel_files(
+        resolver, "vllm_neuron.functional.kda.depthwise_conv1d_kernel.depthwise_conv1d_kernel"
+    )
+    assert files == {"functional/kda/depthwise_conv1d_kernel.py"}
+
+    retired = resolver.resolve([
+        ck.Reference(
+            ck.RefKind.QUALIFIED_NAME,
+            "nkilib.experimental.conv.depthwise_conv1d.depthwise_conv1d_implicit_gemm",
+        )
+    ])
+    assert not retired.per_graph
+    assert any("depthwise_conv1d_implicit_gemm" in r for r in retired.reasons)
+    assert resolver.digest(retired) == resolver.package_digest
 
 
 def test_the_dotted_path_separates_a_package_kernel_from_its_nkilib_namesake():

@@ -5,10 +5,11 @@ The simulator runs a kernel body as plain Python, so it cannot see a call form t
 front end refuses. This test compiles the kernels instead (the pattern of
 ``test/vllm_neuron/functional/moe/test_moe_nki_frontend_compile.py``): fake operands of
 one rank's served shapes at B = 1 and B = 64, two programs, in a child process whose
-environment pins the platform target, so the compile opens no device node. The two
-mhc_pre kernels (with and without the feed-forward norm) also compile at the prefill
-row counts their token tiles walk: one tile, the served 1024-row chunk, and 200 rows
-(a whole tile, then a partial one).
+environment pins the platform target, so the compile opens no device node. The
+kernels the default value serves at prefill (the two mhc_pre kernels, with and without
+the feed-forward norm, and the bf16 combine) also compile at the prefill row counts
+their token tiles walk: one tile, the served 1024-row chunk, the uncapped line's
+2048-row chunk, and 200 rows (a whole tile, then a partial one).
 """
 
 from __future__ import annotations
@@ -25,9 +26,9 @@ _PIN = {"VLLM_NEURON_CPU_COMPILE": "1", "NEURON_PLATFORM_TARGET_OVERRIDE": "trn2
         "PYTHONDONTWRITEBYTECODE": "1", "NEURON_LOGICAL_NC_CONFIG": "2"}
 KERNELS = ("mhc_pre", "mhc_pre_norm", "kda_projections", "kda_output", "combine_bf16")
 BATCHES = (1, 64)
-#: Prefill row counts, for the two mhc_pre kernels only.
-TILED_KERNELS = ("mhc_pre", "mhc_pre_norm")
-TILED_ROWS = (128, 1024, 200)
+#: Prefill row counts, for the kernels the default serves at prefill only.
+TILED_KERNELS = ("mhc_pre", "mhc_pre_norm", "combine_bf16")
+TILED_ROWS = (128, 1024, 2048, 200)
 
 
 def _emit(*fields: object) -> None:
@@ -102,7 +103,7 @@ def _compile_each_kernel() -> None:
           "cpu_compile=" + os.environ.get("VLLM_NEURON_CPU_COMPILE", "unset"),
           "target=" + os.environ.get("NEURON_PLATFORM_TARGET_OVERRIDE", "unset"),
           "lnc=" + os.environ.get("NEURON_LOGICAL_NC_CONFIG", "unset"))
-    tiled = [(name, rows, pre(rows, name == "mhc_pre_norm"))
+    tiled = [(name, rows, dict(cases(rows))[name])
              for name in TILED_KERNELS for rows in TILED_ROWS]
     for batch, name, call in ([(b, n, c) for b in BATCHES for n, c in cases(b)]
                               + [(rows, name, call) for name, rows, call in tiled]):
