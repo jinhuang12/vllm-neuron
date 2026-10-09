@@ -175,7 +175,11 @@ def test_a_decode_of_several_requests_hands_every_layer_its_whole_banks(monkeypa
             assert carrier[key] is carriers[0][key]
     for index in range(LINEAR, LINEAR + SPARSE):
         carrier = carriers[index]
-        assert carrier["pool_cache"] is side[index]["pool_cache"]
+        # The pooled store goes flat: the bank's own storage, [slots * rows, dim].
+        pool, flat = side[index]["pool_cache"], carrier["pool_cache"]
+        assert flat.untyped_storage().data_ptr() == pool.untyped_storage().data_ptr()
+        assert flat.storage_offset() == 0
+        assert tuple(flat.shape) == (pool.shape[0] * pool.shape[1], pool.shape[2])
         assert carrier["tail"] is side[index]["tail"]
         assert carrier["state_slots"].dtype == torch.int64
         assert carrier["state_slots"].tolist() == slots

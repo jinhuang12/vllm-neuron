@@ -564,7 +564,11 @@ def test_knob_on_adds_one_dsa_layer_carried_like_the_trunks_last(
         assert not strided, (leg, strided[:2])
         if leg.startswith("decode_b") and int(leg[len("decode_b"):]) >= 2:
             # The bank form: the draft layer's whole banks and its slot tensor.
-            assert mine["pool_cache"] is live[stack]["pool_cache"], leg
+            # The pooled store goes flat: the bank's own storage, [slots * rows, dim].
+            pool, flat = live[stack]["pool_cache"], mine["pool_cache"]
+            assert flat.untyped_storage().data_ptr() == pool.untyped_storage().data_ptr(), leg
+            assert flat.storage_offset() == 0, leg
+            assert tuple(flat.shape) == (pool.shape[0] * pool.shape[1], pool.shape[2]), leg
             assert mine["tail"] is live[stack]["tail"], leg
             assert mine["state_slots"].dtype == theirs["state_slots"].dtype, leg
 
