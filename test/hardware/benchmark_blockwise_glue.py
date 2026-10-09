@@ -22,12 +22,13 @@ Variants, on the same operands in one process:
 * ``tree``: this tree's call site itself, the model class's method on a module built
   from the checkpoint's text config, its weights and grids bound in the compute frame
   and its ``prepare_scale_operands`` run as the load path runs it (by keyword).
-* ``base`` (with ``--baseline-module``): the call site as it is at ab4f37fc
-  (``model_fp8.py``: ``shared_expert_mm`` passes the load-time kernel scale operands,
-  ``Glm5NextDenseMLP.forward`` passes the public grids alone), reproduced as the
-  ``blockwise_fp8_mlp`` call it makes, through the module file given there loaded
-  beside this tree's. At these row counts neither call site pads or slices, so the call
-  is the whole site.
+* ``base`` (with ``--baseline-module``): the call site of an earlier tree, reproduced
+  as the ``blockwise_fp8_mlp`` call it makes, through the module file given there
+  loaded beside this tree's. ``--base-prebuilt`` names the sites whose call passes the
+  load-time kernel scale operands: ``shared`` alone is ab4f37fc
+  (``Glm5NextDenseMLP.forward`` passed the public grids alone); ``shared dense`` is a
+  tree whose dense MLP has the load-time prep too. At these row counts neither call
+  site pads or slices, so the call is the whole site.
 
 What is measured:
 
@@ -78,8 +79,6 @@ DEVICE = "neuron:0"
 HIDDEN = 4096
 #: One TP=64 rank's intermediate width per site, each padded to whole 128 blocks.
 SITE_INTERMEDIATE = {"shared": 128, "dense": 256}
-#: Sites whose call passes the load-time kernel scale operands at ab4f37fc.
-BASE_SITE_PREBUILT = {"shared": True, "dense": False}
 #: The model's names of the three projections, in the order the call sites take them.
 PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 #: fp8-e4m3's largest finite magnitude on trn2 (the checkpoint load squeezes into it).
@@ -135,7 +134,7 @@ def build_base(case: dict, module, ops: dict, text_config, args):
     names = ("gate", "up", "down")
     tensors = [ops["x"], *(ops[f"{n}_weight"] for n in names),
                *(ops[f"{n}_scale"] for n in names)]
-    if BASE_SITE_PREBUILT[case["site"]]:
+    if case["site"] in args.base_prebuilt:
         # Built once on the CPU, as the shared expert's load-time prep does.
         tensors += [module.to_kernel_scale_layout(ops[f"{n}_scale"],
                                                   *ops[f"{n}_weight"].shape) for n in names]
@@ -197,7 +196,7 @@ def run_case(case: dict, base_module, args) -> dict:
     text_config = glue_case.text_config()
     quant_config = glue_case.quant_config(model_fp8)
     result = {"case": case["tag"], **case, "intermediate": SITE_INTERMEDIATE[case["site"]],
-              "base_prebuilt_scale_operands": BASE_SITE_PREBUILT[case["site"]],
+              "base_prebuilt_scale_operands": case["site"] in args.base_prebuilt,
               "numerics": []}
     timed = {}
     for seed in args.seeds:
@@ -256,6 +255,10 @@ def main() -> None:
                         default=["shared:1024", "shared:2048", "dense:1024", "dense:2048"])
     parser.add_argument("--baseline-module", type=Path, default=None,
                         help="a blockwise_fp8_mm.py to run as variant 'base'")
+    parser.add_argument("--base-prebuilt", nargs="*", choices=sorted(SITE_INTERMEDIATE),
+                        default=["shared"],
+                        help="sites whose base call passes the load-time kernel scale "
+                             "operands (default: the ab4f37fc call sites)")
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=5)
