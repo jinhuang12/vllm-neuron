@@ -37,6 +37,26 @@ with interleaved calls. The noise floor is the spread of the per-repetition
 medians of one variant. Numerics: the 1-call graphs' full emissions are saved
 per seed and compared bitwise (``torch.equal``).
 
+More variants. ``--variant-module LABEL=DIR`` adds a variant ``LABEL`` from
+another snapshot package (loaded as ``bench_LABEL``), compared with "before"
+like "after" is.
+
+Routed-rows contract. A kernel may leave padding rows undefined if it writes
+every routed row (``row_ids >= 0``) and row 0. ``--chain-row0`` makes the
+chain read row 0 only (``bounds + 2^-8 * y_{l-1}[0, :3]`` on every bounds
+row), and ``--defined-rows-only`` limits the finiteness check and every
+comparison to the routed rows and row 0. ``--sentinel V`` fills a device
+buffer of the emission's size with ``V`` and frees it before each emission,
+then counts the rows outside the defined set that still hold ``V``, zero, or
+other values. ``--combine`` also runs the model's token combine
+(``_token_gather_combine``) on each emission and compares the ``[T, H]``
+layer outputs. ``--reference`` adds a float64 torch reference over the same
+FP8 weights, scales and BF16 inputs: per variant, the max absolute error over
+routed rows, that error over the reference's max magnitude, and the relative
+Frobenius error. ``--emissions N`` emits each variant N times per seed, each
+after its own sentinel fill, and records whether the defined rows of all N are
+bit-identical (device identity); the first emission is the one compared.
+
 The compile cache is off unless ``--use-compile-cache``: the graph cache key
 ignores kernel bodies, so an edited kernel could otherwise be timed from a
 stale NEFF.
@@ -68,7 +88,11 @@ import vllm_neuron  # noqa: E402,F401 -- registers the Neuron compilation backen
 import libtorch_neuronx_lite.envs as libtorch_envs  # noqa: E402
 
 from vllm_neuron.functional.moe.blockwise_fp8_retile import BLOCK_QUANT_SIZE  # noqa: E402
-from vllm_neuron.functional.moe.fused_fp8_pack import PackedExperts, pack_experts  # noqa: E402
+from vllm_neuron.functional.moe.fused_fp8_pack import (  # noqa: E402
+    PackedExperts,
+    pack_experts,
+    unpack_experts,
+)
 from vllm_neuron.functional.moe.moe_blockwise import (  # noqa: E402
     _build_blockwise_mapping_torch,
 )
@@ -94,9 +118,8 @@ MODEL_COMPILER_ARGS = [
 ]
 
 
-def load_baseline(path: Path):
-    """Import the snapshot directory as package ``moe_5938748``; return its wrapper."""
-    name = "moe_5938748"
+def load_baseline(path: Path, name: str = "moe_5938748"):
+    """Import the snapshot directory as package ``name``; return its wrapper."""
     if name not in sys.modules:
         spec = importlib.util.spec_from_file_location(
             name, path / "__init__.py", submodule_search_locations=[str(path)])
@@ -182,16 +205,67 @@ def compile_fn(fn):
                          options={"compiler_args": compiler_args()})
 
 
-def chain_graph(experts_fn, calls: int):
+def chain_graph(experts_fn, calls: int, row0: bool = False):
     def chained(x, row_ids, expert_ids, affinity, bounds, *bank):
         current = bounds
         for call in range(calls):
             packed = PackedExperts(bank[2 * call], bank[2 * call + 1])
             y = experts_fn(x, packed, row_ids, expert_ids, affinity, current)
-            current = bounds + CHAIN * y[:128, :3]
-        return y[:128, :3]
+            current = bounds + CHAIN * (y[:1, :3] if row0 else y[:128, :3])
+        return y[:1, :3] if row0 else y[:128, :3]
 
     return compile_fn(chained)
+
+
+def combine_graph(rows: int):
+    """The model's token combine of one emission, ``[T, H]`` fp32."""
+    from vllm_neuron.model.glm5_next.model_fp8 import _token_gather_combine
+
+    def combine(contribution, affinities):
+        return _token_gather_combine(contribution, affinities, BLOCK_QUANT_SIZE, rows, TOP_K)
+
+    return compile_fn(combine)
+
+
+# ---- Reference -------------------------------------------------------------- #
+
+
+def reference_emission(x, bank: PackedExperts, row_ids, expert_ids, affinity, limit):
+    """Float64 emission over the bank's FP8 weights and scales, ``[blocks * q, H]``.
+
+    Every 128x128 weight block times its scale, the clamps of
+    ``_swiglu_bound_operand(limit, limit)``, SwiGLU and the routing weight, with
+    no intermediate rounding. Padding rows are zero.
+    """
+    gate_up, down, gu_scales, d_scales = unpack_experts(bank)
+    experts, hidden, twice_i = gate_up.shape
+    out = torch.zeros(row_ids.numel(), hidden, dtype=torch.float64)
+    flat_ids = row_ids.reshape(-1)
+    block_expert = expert_ids.reshape(-1).repeat_interleave(row_ids.shape[1])
+    for expert in range(experts):
+        slots = ((flat_ids >= 0) & (block_expert == expert)).nonzero().reshape(-1)
+        if slots.numel() == 0:
+            continue
+        tokens = flat_ids[slots].long()
+        gu = gate_up[expert].double() * gu_scales[expert].double().reshape(
+            hidden // 128, twice_i // 128).repeat_interleave(128, 0).repeat_interleave(128, 1)
+        dn = down[expert].double() * d_scales[expert].double().repeat_interleave(
+            128, 0).repeat_interleave(128, 1)
+        gate, up = (x[tokens].double() @ gu).split(twice_i // 2, dim=1)
+        gate = gate.clamp(max=limit)
+        up = up.clamp(min=-limit, max=limit)
+        activated = torch.nn.functional.silu(gate) * up
+        out[slots] = (activated @ dn) * affinity[tokens, expert].double().unsqueeze(1)
+    return out
+
+
+def error_stats(actual, reference, mask):
+    """Max abs error, its share of the reference's max magnitude, relative Frobenius."""
+    diff = (actual.double() - reference)[mask]
+    ref = reference[mask]
+    return {"max_abs": float(diff.abs().max()),
+            "max_abs_over_ref_max": float(diff.abs().max() / ref.abs().max()),
+            "rel_fro": float(diff.norm() / ref.norm())}
 
 
 def emission_graph(experts_fn):
@@ -283,7 +357,9 @@ def bucket_case(tokens: int, entries: dict, args) -> dict:
     case = {"tokens": tokens, "layers": layers, "expected_pairs": expected_pairs,
             "seeds": [], "reps": []}
     emit = {variant: emission_graph(fn) for variant, fn in entries.items()}
-    graphs = {f"{v}_k{n}": chain_graph(fn, n) for v, fn in entries.items() for n in (1, layers)}
+    graphs = {f"{v}_k{n}": chain_graph(fn, n, args.chain_row0)
+              for v, fn in entries.items() for n in (1, layers)}
+    combine = combine_graph(min(tokens, BLOCK_QUANT_SIZE)) if args.combine else None
     timing_inputs = None
     for kind, seed in seeds:
         row_ids, expert_ids, affinity, blocks = routing(tokens, seed, kind == "skewed")
@@ -292,24 +368,83 @@ def bucket_case(tokens: int, entries: dict, args) -> dict:
                                  f"bucket has {SERVED_BLOCKS[tokens]}")
         x = hidden_states(tokens, 101 + seed)
         dev = [t.to(DEVICE) for t in (x, row_ids, expert_ids, affinity)]
-        outputs = {v: g(*dev, bounds, *bank_dev[:2]).to("cpu") for v, g in emit.items()}
         record = {"routing": kind, "seed": seed, "row_ids_shape": list(row_ids.shape),
                   "realised_pairs": int((row_ids >= 0).sum()),
                   "blocks_with_rows": int((row_ids >= 0).any(1).sum()),
                   "max_rows_per_block": int((row_ids >= 0).sum(1).max())}
+        defined = (row_ids >= 0).reshape(-1).clone()
+        defined[0] = True
+        if not args.defined_rows_only:
+            defined[:] = True
+        outputs, layer = {}, {}
+        for variant, graph in emit.items():
+            identical = True
+            for index in range(args.emissions):
+                if args.sentinel is not None:
+                    filler = torch.full((row_ids.numel(), HIDDEN), args.sentinel, device=DEVICE)
+                    filler[:1, :1].to("cpu")  # the fill has run before its memory is freed
+                    del filler
+                emission = graph(*dev, bounds, *bank_dev[:2])
+                if index == 0:
+                    outputs[variant] = emission.to("cpu")
+                    if combine is not None:
+                        layer[variant] = combine(emission, dev[3][:-1]).to("cpu")
+                else:
+                    identical &= torch.equal(emission.to("cpu")[defined].view(torch.int32),
+                                             outputs[variant][defined].view(torch.int32))
+            record[f"{variant}_emissions"] = {"count": args.emissions,
+                                              "defined_rows_bit_identical": identical}
         for variant, out in outputs.items():
-            if not torch.isfinite(out).all():
+            if not torch.isfinite(out[defined]).all():
                 raise AssertionError(f"T={tokens} seed {seed}: {variant} has nonfinite values")
-        if "before" in outputs and "after" in outputs:
-            before, after = outputs["before"], outputs["after"]
-            record["bit_equal"] = bool(torch.equal(before.view(torch.int32), after.view(torch.int32)))
-            record["max_abs_after_minus_before"] = float((after - before).abs().max())
-            record["max_abs_before"] = float(before.abs().max())
+            if args.sentinel is not None:
+                undefined = out[~defined] if args.defined_rows_only else out[(row_ids < 0).reshape(-1)]
+                record[f"{variant}_undefined_rows"] = {
+                    "rows": int(undefined.shape[0]),
+                    "sentinel": int((undefined == args.sentinel).all(1).sum()),
+                    "zero": int((undefined == 0).all(1).sum()),
+                    "nonfinite_rows": int((~torch.isfinite(undefined)).any(1).sum())}
+        if "before" in outputs:
+            before = outputs["before"]
+            for variant, out in outputs.items():
+                if variant == "before":
+                    continue
+                tag = "" if variant == "after" else f"_{variant}"
+                record[f"bit_equal{tag}"] = bool(torch.equal(
+                    before[defined].view(torch.int32), out[defined].view(torch.int32)))
+                record[f"max_abs_{variant}_minus_before"] = float(
+                    (out[defined] - before[defined]).abs().max())
+            record["max_abs_before"] = float(before[defined].abs().max())
+        if layer:
+            first = next(iter(layer))
+            for variant, out in layer.items():
+                record[f"layer_{variant}_finite"] = bool(torch.isfinite(out).all())
+                record[f"layer_bit_equal_{variant}_vs_{first}"] = bool(
+                    torch.equal(out.view(torch.int32), layer[first].view(torch.int32)))
+                record[f"layer_max_abs_{variant}_minus_{first}"] = float(
+                    (out - layer[first]).abs().max())
+        if args.reference:
+            reference = reference_emission(x, banks[0], row_ids, expert_ids, affinity,
+                                           SWIGLU_LIMIT)
+            routed = (row_ids >= 0).reshape(-1)
+            for variant, out in outputs.items():
+                record[f"fp64_{variant}"] = error_stats(out, reference, routed)
+            if args.save_dir is not None:
+                path = args.save_dir / f"reference_T{tokens}_{kind}{seed}.pt"
+                torch.save(reference.float(), path)
+                record["reference_pt"] = str(path)
         if args.save_dir is not None:
+            path = args.save_dir / f"row_ids_T{tokens}_{kind}{seed}.pt"
+            torch.save(row_ids, path)
+            record["row_ids_pt"] = str(path)
             for variant, out in outputs.items():
                 path = args.save_dir / f"emission_T{tokens}_{kind}{seed}_{variant}.pt"
                 torch.save(out, path)
                 record[f"{variant}_pt"] = str(path)
+            for variant, out in layer.items():
+                path = args.save_dir / f"layer_T{tokens}_{kind}{seed}_{variant}.pt"
+                torch.save(out, path)
+                record[f"layer_{variant}_pt"] = str(path)
         case["seeds"].append(record)
         print(json.dumps({"tokens": tokens, **record}), flush=True)
         if timing_inputs is None and kind == "uniform":
@@ -343,8 +478,11 @@ def bucket_case(tokens: int, entries: dict, args) -> dict:
         summary[variant] = {"per_rep_median_us": medians, "median_us": middle,
                             "min_us": min(medians), "max_us": max(medians),
                             "noise_floor_rel": (max(medians) - min(medians)) / middle}
-    if "before" in summary and "after" in summary:
-        summary["after_over_before"] = summary["after"]["median_us"] / summary["before"]["median_us"]
+    if "before" in summary:
+        for variant in entries:
+            if variant != "before":
+                summary[f"{variant}_over_before"] = (summary[variant]["median_us"]
+                                                     / summary["before"]["median_us"])
     case["summary"] = summary
     if args.profile_dir is not None:
         case["profile_dir"] = capture_profile(
@@ -360,8 +498,22 @@ def main() -> None:
     parser.add_argument("--baseline-module", type=Path,
                         default=REPO / "test/hardware/baselines/moe_5938748")
     parser.add_argument("--tokens", type=int, nargs="+", default=[1024, 2048])
+    parser.add_argument("--variant-module", action="append", default=[], metavar="LABEL=DIR",
+                        help="add variant LABEL from the snapshot package DIR")
     parser.add_argument("--variants", nargs="+", default=["before", "after"],
-                        choices=["before", "after"])
+                        help="before, after, or a --variant-module label")
+    parser.add_argument("--chain-row0", action="store_true",
+                        help="chain the calls through row 0 of the emission only")
+    parser.add_argument("--defined-rows-only", action="store_true",
+                        help="check and compare only routed rows and row 0")
+    parser.add_argument("--sentinel", type=float,
+                        help="fill and free an emission-sized device buffer with this value first")
+    parser.add_argument("--combine", action="store_true",
+                        help="also compare the model's token combine of each emission")
+    parser.add_argument("--reference", action="store_true",
+                        help="compare every emission with a float64 torch reference")
+    parser.add_argument("--emissions", type=int, default=1,
+                        help="emissions per variant and seed, checked for bit identity")
     parser.add_argument("--seeds", type=int, nargs="+", default=[1, 2, 3])
     parser.add_argument("--skewed-seeds", type=int, nargs="*", default=[4])
     parser.add_argument("--layers", type=int, default=8)
@@ -369,7 +521,7 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--save-dir", type=Path,
-                        help="save each seed's full 1-call emissions as .pt files here")
+                        help="save each seed's row ids and full 1-call emissions as .pt files here")
     parser.add_argument("--profile-dir", type=Path)
     parser.add_argument("--profile-iterations", type=int, default=2)
     parser.add_argument("--use-compile-cache", action="store_true",
@@ -384,14 +536,25 @@ def main() -> None:
         raise ValueError("Hardware benchmark cannot run in VLLM_NEURON_CPU_MODE=1")
     if not os.environ.get("NEURON_RT_VISIBLE_CORES"):
         raise ValueError("Run under devlease.py, which pins NEURON_RT_VISIBLE_CORES")
-    if args.layers < 2 or args.reps < 1 or args.iterations < 1:
-        raise ValueError("Use --layers >= 2, --reps >= 1 and --iterations >= 1")
+    if args.layers < 2 or args.reps < 1 or args.iterations < 1 or args.emissions < 1:
+        raise ValueError("Use --layers >= 2 and --reps, --iterations, --emissions >= 1")
     if not Path(vllm_neuron.__file__).resolve().is_relative_to(REPO):
         raise RuntimeError(f"imported {vllm_neuron.__file__}, not this tree ({REPO})")
     from vllm_neuron.functional.moe import fused_fp8 as current
 
     baseline = load_baseline(args.baseline_module.resolve())
     entries = {"before": baseline.fused_fp8_experts, "after": current.fused_fp8_experts}
+    sources = {"before": args.baseline_module / "moe_fused_fp8.py",
+               "after": Path(current.__file__).parent / "moe_fused_fp8.py"}
+    for spec in args.variant_module:
+        label, _, directory = spec.partition("=")
+        if not label.isidentifier() or label in entries or not directory:
+            raise ValueError(f"--variant-module needs a new LABEL=DIR, got {spec!r}")
+        entries[label] = load_baseline(Path(directory).resolve(), f"bench_{label}").fused_fp8_experts
+        sources[label] = Path(directory) / "moe_fused_fp8.py"
+    unknown = [v for v in args.variants if v not in entries]
+    if unknown:
+        raise ValueError(f"unknown variants {unknown}; known: {sorted(entries)}")
     entries = {v: entries[v] for v in args.variants}
     for path in ("out", "save_dir", "profile_dir"):
         if getattr(args, path) is not None:
@@ -402,19 +565,14 @@ def main() -> None:
     workdir = Path(os.environ.get("NEURON_LIBTORCH_CACHE_ROOT") or "/tmp") / "benchmark_workdir"
     workdir.mkdir(parents=True, exist_ok=True)
     os.chdir(workdir)
-    kernel_dir = Path(current.__file__).parent
     report = {
         "environment": {k: os.environ.get(k) for k in (
             "NEURON_RT_VISIBLE_CORES", "NEURON_LOGICAL_NC_CONFIG", "NEURON_CC_FLAGS",
             "NEURON_PLATFORM_TARGET_OVERRIDE", "NEURON_LIBTORCH_CACHE_ROOT",
             "NEURON_LIBTORCH_DISABLE_COMPILE_CACHE")},
         "compiler_args": compiler_args(),
-        "kernel_sources": {
-            "before": {"file": str(args.baseline_module / "moe_fused_fp8.py"),
-                       "md5": md5(args.baseline_module / "moe_fused_fp8.py")},
-            "after": {"file": str(kernel_dir / "moe_fused_fp8.py"),
-                      "md5": md5(kernel_dir / "moe_fused_fp8.py")},
-        },
+        "kernel_sources": {v: {"file": str(sources[v]), "md5": md5(sources[v])}
+                           for v in entries},
         "method": __doc__.split("Method.")[1].split("The compile cache")[0].strip(),
         "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
         "cases": [],
