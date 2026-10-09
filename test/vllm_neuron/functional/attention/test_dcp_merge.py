@@ -249,11 +249,13 @@ def test_a_ragged_latent_is_tiled_without_padding():
     assert_within_bound(got, partials, lse)
 
 
-@pytest.mark.parametrize("rows", (512, 200))
+@pytest.mark.parametrize("rows", (512, 200, 300))
 def test_two_programs_are_bitwise_one_program(monkeypatch, rows):
     """The LNC2 grid splits whole row tiles between the programs; no arithmetic moves.
 
     200 rows are two tiles, the second ragged (72 rows), so the second program takes it.
+    300 rows are three: the first program takes two and the second one, an uneven split
+    fixed at trace time (``reports/dcp_item4.md`` section 14).
     """
     partials, lse = make_partials(4, 1, rows, seed=51, empty_fraction=0.2)
     monkeypatch.delenv("NEURON_LOGICAL_NC_CONFIG", raising=False)

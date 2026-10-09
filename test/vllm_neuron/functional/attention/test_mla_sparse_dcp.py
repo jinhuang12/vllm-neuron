@@ -499,19 +499,21 @@ class RecordingCall:
         return self.inner(*args)
 
 
-@pytest.mark.parametrize("hq", (2, 8))
-def test_two_programs_are_bitwise_one_program_in_partial_mode(hq, monkeypatch):
+@pytest.mark.parametrize("hq,seq", ((2, 32), (8, 32), (2, 24)))
+def test_two_programs_are_bitwise_one_program_in_partial_mode(hq, seq, monkeypatch):
     """At LNC2 the partial's row-tiled launch splits the query blocks over both cores.
 
     The one-head rule of the DCP-off seam's grid does not apply here: Hq is CP * H >= 2, and
     the heads ride the partitions. (The DCP-off seam keeps it: ``test_mla_sparse_spmd.py``
-    pins a two-head call to one program.)
+    pins a two-head call to one program.) 24 queries at Hq 2 are three query blocks: the
+    first program takes two and the second one, an uneven split fixed at trace time
+    (``reports/dcp_item4.md`` section 14).
     """
-    q, c, idx = make_operands(32, hq, SERVED_TOPK, 4096, seed=80 + hq)
+    q, c, idx = make_operands(seq, hq, SERVED_TOPK, 4096, seed=48 + hq + seq)
     mine = owned(idx, 2, 0)
     scale = scale_of(LATENT)
     monkeypatch.delenv("NEURON_LOGICAL_NC_CONFIG", raising=False)
-    assert MS.partial_programs(32, hq, SERVED_TOPK) == 1
+    assert MS.partial_programs(seq, hq, SERVED_TOPK) == 1
     one = MS.mla_sparse_attention_partial(q, c, mine, scale)
     calls = []
 
@@ -521,7 +523,7 @@ def test_two_programs_are_bitwise_one_program_in_partial_mode(hq, monkeypatch):
 
     monkeypatch.setattr(MS, "wrap_nki", record)
     monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", "2")
-    assert MS.partial_programs(32, hq, SERVED_TOPK) == 2
+    assert MS.partial_programs(seq, hq, SERVED_TOPK) == 2
     two = MS.mla_sparse_attention_partial(q, c, mine, scale)
     assert [call.grid for call in calls] == [2]
     torch.testing.assert_close(two[0], one[0], rtol=0.0, atol=0.0)
@@ -756,10 +758,14 @@ def test_dense_window_dcp_through_the_merge_kernel_is_the_cp1_output_rounded_onc
             f"rank {rank}: max err/bound {float((err / bound.clamp_min(1e-300)).max()):.3g}"
 
 
-@pytest.mark.parametrize("hq", (2, 8))
+@pytest.mark.parametrize("hq", (1, 2, 8))
 def test_two_programs_are_bitwise_one_program_for_the_dense_window_partial(hq, monkeypatch):
     """At LNC2 the dense partial deals its jobs over both cores: each head's whole tiles, then
-    each head's partial tile, then each head's zero-row chunk (150 of 200 queries active)."""
+    each head's partial tile, then each head's zero-row chunk (150 of 200 queries active).
+
+    At Hq 1 those are three jobs: the first program takes two and the second one, an uneven
+    split fixed at trace time (``reports/dcp_item4.md`` section 14).
+    """
     q, bank, table, lens = dense_case(200, 100, 3, hq, seed=160 + hq)
     own = own_lens(lens, 2, 0, 3)
     mine = rank_table(table, 2, 0)
