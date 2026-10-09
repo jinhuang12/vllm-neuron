@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The worker's default GC policy is ``off``: CPython's own GC after warmup.
+"""The worker's default GC policy is ``rare_gen2``: raise ``threshold2``, freeze nothing.
 
 ``freeze_rare_gen2`` (freeze the heap after warmup, then raise ``threshold2``) stops
 the bs=64 full-pass stalls, but on the TP=64 server it made every bs=1 decode step
-slower (``gc_policy.py``). So the default changes nothing until a policy without
-that cost is measured. These cases pin the default, keep every policy selectable by
-its name, and refuse any other name before the GC changes.
+slower (``gc_policy.py``). ``rare_gen2`` stops the stalls with the threshold alone.
+These cases pin the default to that, keep every policy selectable by its name, and
+refuse any other name before the GC changes.
 
 The freeze, ``gc.set_threshold``, ``gc.disable``, ``gc.freeze`` and the vLLM
 GC-debug hook are replaced with recorders: the real calls would change the pytest
@@ -24,7 +24,7 @@ from vllm_neuron.vllm.worker import gc_policy
 
 ENV = "VLLM_NEURON_GC_POLICY"
 #: The knob's accepted values, spelled out: they are the operator interface.
-ACCEPTED = ("freeze_rare_gen2", "freeze", "off")
+ACCEPTED = ("rare_gen2", "freeze_rare_gen2", "freeze", "off")
 
 
 @pytest.fixture
@@ -42,33 +42,32 @@ def calls(monkeypatch):
     return record
 
 
-def test_unset_knob_applies_off_and_leaves_cpython_gc_unchanged(calls):
-    """No knob set: no freeze, no threshold change, automatic collection stays on."""
-    before = gc.get_threshold()
+def test_unset_knob_applies_rare_gen2_without_a_freeze(calls):
+    """No knob set: only threshold2 is raised; no freeze, automatic collection stays on."""
+    t0, t1, _ = gc.get_threshold()
 
     applied = gc_policy.apply_post_warmup_gc_policy()
 
-    assert envs.VLLM_NEURON_GC_POLICY == "off"
-    assert gc_policy.DEFAULT_POLICY == "off"
-    assert applied == gc_policy.AppliedGCPolicy(
-        policy="off", frozen=False, threshold=before
-    )
-    assert calls == [("gc_debug",)]
-    assert gc.get_threshold() == before
+    assert envs.VLLM_NEURON_GC_POLICY == "rare_gen2"
+    assert gc_policy.DEFAULT_POLICY == "rare_gen2"
+    assert applied.policy == "rare_gen2"
+    assert applied.frozen is False
+    assert calls == [("set_threshold", t0, t1, gc_policy.GEN2_THRESHOLD), ("gc_debug",)]
     assert gc.isenabled()
 
 
 @pytest.mark.parametrize("value", ACCEPTED)
 def test_every_policy_is_still_selectable_by_name(calls, monkeypatch, value):
-    """The opt-in policies stay available (``freeze_rare_gen2``: the bs=64 stall fix)."""
+    """Every policy stays selectable by its name (case and spaces ignored)."""
     monkeypatch.setenv(ENV, f" {value.upper()} ")
 
     applied = gc_policy.apply_post_warmup_gc_policy()
 
     assert gc_policy.POLICIES == ACCEPTED
     assert applied.policy == value
-    assert applied.frozen is (value != "off")
-    assert (("freeze_gc_heap",) in calls) is (value != "off")
+    freezes = value in ("freeze_rare_gen2", "freeze")
+    assert applied.frozen is freezes
+    assert (("freeze_gc_heap",) in calls) is freezes
 
 
 def test_unknown_policy_is_refused_by_name_before_any_gc_change(calls, monkeypatch):
@@ -78,7 +77,8 @@ def test_unknown_policy_is_refused_by_name_before_any_gc_change(calls, monkeypat
     with pytest.raises(
         ValueError,
         match=(
-            r"^VLLM_NEURON_GC_POLICY='freez' is not one of freeze_rare_gen2, freeze, off$"
+            r"^VLLM_NEURON_GC_POLICY='freez' is not one of "
+            r"rare_gen2, freeze_rare_gen2, freeze, off$"
         ),
     ):
         gc_policy.apply_post_warmup_gc_policy()
