@@ -1145,7 +1145,9 @@ def test_a5_the_runners_slot_mapping_addresses_the_banks_own_view() -> None:
 def test_a6_a_decode_carrying_more_tokens_than_requests_refuses_by_name() -> None:
     """A decode step whose rows do not divide into whole requests is refused by name.
 
-    The refused half hands three tokens for two requests. The admitted half is a real
+    The refused half hands three tokens for two requests and matches the counts the
+    refusal reports (the wording differs between the base and this series; the
+    counts do not). The admitted half is a real
     two-request step: one token each, ``request_starts`` and two ``request_block_ids``
     rows (the file's own two-request pattern). Its earlier form declared two requests
     but handed one cached length, which the translator reads as ONE request of width
@@ -1179,7 +1181,12 @@ def test_a6_a_decode_carrying_more_tokens_than_requests_refuses_by_name() -> Non
         raise VacuousControlError(
             "this test needs more tokens than requests to have anything to refuse"
         )
-    with pytest.raises(ValueError, match="do not divide into whole requests"):
+    # The match names the counts the refusal reports, which every wording of the
+    # ragged refusal carries; the stale phrase "one token per request" is not it.
+    with pytest.raises(
+        ValueError,
+        match=rf"carries {over_by_one} token\(s\) for {DECLARED_REQUESTS} request\(s\)",
+    ):
         _carriers_for_requests(
             banks, side, tokens=over_by_one, requests=DECLARED_REQUESTS,
             is_prefill=False,
