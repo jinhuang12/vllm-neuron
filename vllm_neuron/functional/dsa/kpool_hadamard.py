@@ -25,8 +25,10 @@ graph specialises on the exact ``(n_pools, pool_size, head_dim, dtype)`` tuple.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
 from torch import Tensor
@@ -37,6 +39,7 @@ import nki.language as nl
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
+from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 logger = logging.getLogger(__name__)
@@ -94,6 +97,24 @@ spelling would fail a correct kernel.
 
 _SUPPORTED_DTYPES = (torch.bfloat16,)
 """``slot_k`` dtypes that take the NKI route. bf16 is the indexer path's dtype."""
+
+ROTATION_ROWS_PER_PARTITION = 8
+"""Rows one partition carries in a rotation tile: ``[128, 8 * 128]`` fp32, 4 KiB a partition.
+
+The butterfly's cost is the instruction count, not the element count: 0a08ff4 issued 254
+vector instructions per 128-row tile, each on a ``[rows, stride]`` slice. Every stage is now
+two instructions over every block of every row of a tile, so a tile of ``128 * 8`` rows costs
+14 butterfly instructions instead of ``8 * 254``. Eight rows a partition make the decode query
+at B=64 (``64 * 32`` rows) one tile per core.
+"""
+
+SOURCE_DIGEST = int(hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:7], 16)
+"""This file's content digest, handed to every kernel here as a trace-time int.
+
+The compiled kernel cache keys on a kernel's own source and its arguments, and the kernels call
+helpers whose edits it would otherwise not see (``decode_batch.SOURCE_DIGEST`` is the same
+mechanism).
+"""
 
 
 class KpoolHadamardError(ValueError):
@@ -195,6 +216,53 @@ def _fwht128_inplace(buf_a, buf_b, head_dim: int):
     return src
 
 
+def _fwht128_blocks(buf_a, buf_b, parts: int, rows: int):
+    """The 7-stage FWHT butterfly over ``rows`` 128-channel rows per partition at once.
+
+    ``buf_a`` and ``buf_b`` are ``(parts, rows * 128)`` fp32 tiles, row ``j`` of a partition in
+    columns ``128 j .. 128 j + 127``. A stage of stride ``s`` sees every partition's free axis
+    as ``rows * 128 / (2 s)`` blocks of ``2 s`` channels, and one instruction writes the low
+    half of every block (``in[lo] + in[hi]``), one the high half (``in[lo] - in[hi]``): the same
+    fp32 add and subtract on the same operands as :func:`_fwht128_inplace`, which issues them
+    one block at a time, so the two agree bit for bit. Ping-pongs and returns the result tile
+    for the reason :func:`_fwht128_inplace` gives.
+    """
+    src, dst = buf_a, buf_b
+    for stride in HADAMARD_STRIDES:
+        blocks = rows * (INDEX_HEAD_DIM // (2 * stride))
+        src3 = src.reshape((parts, blocks, 2 * stride))
+        dst3 = dst.reshape((parts, blocks, 2 * stride))
+        lo_in = src3[:, :, 0:stride]
+        hi_in = src3[:, :, stride:2 * stride]
+        nisa.tensor_tensor(dst=dst3[:, :, 0:stride], data1=lo_in, data2=hi_in, op=nl.add)
+        nisa.tensor_tensor(dst=dst3[:, :, stride:2 * stride], data1=lo_in, data2=hi_in,
+                           op=nl.subtract)
+        src, dst = dst, src
+    return src
+
+
+def _rotate_rows(x_hbm, out_hbm, row0: int, parts: int, rows: int):
+    """Rotate rows ``row0 .. row0 + parts * rows - 1``: partition ``p`` holds rows
+    ``row0 + p * rows .. row0 + p * rows + rows - 1``, one contiguous read and write each.
+
+    The per-element sequence is 0a08ff4's: the source dtype staged and widened to fp32, the
+    butterfly, one multiply by ``HADAMARD_SCALE`` in fp32, the cast back.
+    """
+    width = rows * INDEX_HEAD_DIM
+    pattern = [[width, parts], [1, width]]
+    staged = nl.ndarray((parts, width), dtype=x_hbm.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=staged, src=x_hbm.ap(pattern=pattern, offset=row0 * INDEX_HEAD_DIM))
+    buf_a = nl.ndarray((parts, width), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=buf_a, src=staged)
+    buf_b = nl.ndarray((parts, width), dtype=nl.float32, buffer=nl.sbuf)
+    rotated = _fwht128_blocks(buf_a, buf_b, parts, rows)
+    scaled = nl.ndarray((parts, width), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=scaled, data=rotated, op0=nl.multiply, operand0=HADAMARD_SCALE)
+    result = nl.ndarray((parts, width), dtype=x_hbm.dtype, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=result, src=scaled)
+    nisa.dma_copy(dst=out_hbm.ap(pattern=pattern, offset=row0 * INDEX_HEAD_DIM), src=result)
+
+
 def _load_fp32(hbm, rows: int, head_dim: int, row_stride: int, offset: int):
     """A ``(rows, head_dim)`` fp32 tile from a 2-D HBM buffer, widened on the way in.
 
@@ -242,7 +310,8 @@ def _broadcast_row(hbm, rows: int, head_dim: int, row: int):
 
 
 @nki.jit
-def _kpool_hadamard_nki(slot_k_hbm, slot_score_hbm, ape_hbm, n_pools, pool_size):
+def _kpool_hadamard_nki(slot_k_hbm, slot_score_hbm, ape_hbm, n_pools, pool_size,
+                        source_digest):
     """Fused per-(pool, channel) softmax-weighted pooling and Hadamard-128 rotation.
 
     Args:
@@ -253,6 +322,7 @@ def _kpool_hadamard_nki(slot_k_hbm, slot_score_hbm, ape_hbm, n_pools, pool_size)
         ape_hbm: ``[pool_size, head_dim]`` fp32 -- the per-slot additive bias.
         n_pools: pools in the batch. A compile-time constant.
         pool_size: tokens per pool. A compile-time constant.
+        source_digest: :data:`SOURCE_DIGEST`; it only keys the kernel cache.
 
     Returns:
         ``[n_pools, head_dim]`` in ``slot_k_hbm``'s dtype.
@@ -329,37 +399,43 @@ def _kpool_hadamard_nki(slot_k_hbm, slot_score_hbm, ape_hbm, n_pools, pool_size)
 
 
 @nki.jit
-def _hadamard128_nki(x_hbm, n_rows):
+def _hadamard128_nki(x_hbm, n_rows, source_digest):
     """The rotation stage alone: ``FWHT_128(row) * (1 / sqrt(128))`` for every row.
 
     Args:
         x_hbm: ``[n_rows, head_dim]`` -- the rows to rotate.
         n_rows: rows in the batch. A compile-time constant.
+        source_digest: :data:`SOURCE_DIGEST`; it only keys the kernel cache.
 
     Returns:
         ``[n_rows, head_dim]`` in ``x_hbm``'s dtype.
 
-    Exists so the transform can be exercised on its own: on ``I_128`` the output is
-    ``H_128 / sqrt(128)``, which reads all seven stages and the final scale at once.
-    It shares ``_fwht128_inplace`` with the fused kernel, so the two butterflies
-    cannot drift apart.
+    The rows split evenly over the programs of the launch grid (both cores of an LNC2 core
+    with a ``[2]`` grid), each program's share in tiles of up to ``128 *
+    ROTATION_ROWS_PER_PARTITION`` rows (:func:`_rotate_rows`), then one tile of whole
+    128-row groups, then one short tile of the last ``< 128`` rows, one row a partition. Rows
+    are independent, so the split changes no value. On ``I_128`` the output is ``H_128 /
+    sqrt(128)``, which reads all seven stages and the final scale at once.
     """
     head_dim = x_hbm.shape[1]
     out_hbm = nl.ndarray((n_rows, head_dim), dtype=x_hbm.dtype, buffer=nl.shared_hbm)
     pmax = nl.tile_size.pmax
-    for t in range((n_rows + pmax - 1) // pmax):
-        rows = min(pmax, n_rows - t * pmax)
-        src = _load_fp32(x_hbm, rows, head_dim, head_dim, t * pmax * head_dim)
-        scratch = nl.ndarray((rows, head_dim), dtype=nl.float32, buffer=nl.sbuf)
-        rotated = _fwht128_inplace(src, scratch, head_dim)
-        scaled = nl.ndarray((rows, head_dim), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_scalar(dst=scaled, data=rotated, op0=nl.multiply, operand0=HADAMARD_SCALE)
-        result = nl.ndarray((rows, head_dim), dtype=x_hbm.dtype, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=result, src=scaled)
-        nl.store(
-            out_hbm.ap(pattern=[[head_dim, rows], [1, head_dim]], offset=t * pmax * head_dim),
-            value=result,
-        )
+    n_prgs = nl.num_programs(axes=0)
+    prg = nl.program_id(0)
+    share = (n_rows + n_prgs - 1) // n_prgs
+    lo = prg * share
+    hi = min(n_rows, lo + share)
+    big = pmax * ROTATION_ROWS_PER_PARTITION
+    n_big = (hi - lo) // big
+    for t in range(n_big):
+        _rotate_rows(x_hbm, out_hbm, lo + t * big, pmax, ROTATION_ROWS_PER_PARTITION)
+    row = lo + n_big * big
+    if hi - row >= pmax:
+        rows = (hi - row) // pmax
+        _rotate_rows(x_hbm, out_hbm, row, pmax, rows)
+        row = row + pmax * rows
+    if hi - row > 0:
+        _rotate_rows(x_hbm, out_hbm, row, hi - row, 1)
     return out_hbm
 
 
@@ -434,6 +510,13 @@ def can_run_dsa_kpool_hadamard(slot_k: Tensor, slot_score: Tensor, ape: Tensor) 
     return ape.ndim == 2 and tuple(ape.shape) == tuple(slot_k.shape[1:])
 
 
+def hadamard128_programs(n_rows: int) -> int:
+    """Programs the rotation launches: both cores of an LNC2 core from two rows on."""
+    if lnc_pair() and int(n_rows) >= 2:
+        return 2
+    return 1
+
+
 def can_run_dsa_hadamard128(x: Tensor) -> bool:
     """Whether the stage-alone NKI kernel serves this call."""
     if not can_run_kernel():
@@ -472,7 +555,7 @@ def dsa_kpool_hadamard(slot_k: Tensor, slot_score: Tensor, ape: Tensor) -> Tenso
     # inside the trace becomes a value guard that fails on the first call after warmup.
     _record_nki_dispatch("fused", n_pools, pool_size, head_dim)
     return wrap_nki(_kpool_hadamard_nki)(
-        flat_k, flat_score, ape.contiguous(), n_pools, pool_size
+        flat_k, flat_score, ape.contiguous(), n_pools, pool_size, SOURCE_DIGEST
     )
 
 
@@ -503,7 +586,10 @@ def dsa_hadamard128(x: Tensor) -> Tensor:
 
     _count_nki_dispatch()
     _record_nki_dispatch("stage", n_rows, 1, head_dim)
-    return wrap_nki(_hadamard128_nki)(x.contiguous(), n_rows)
+    call = wrap_nki(_hadamard128_nki)
+    if hadamard128_programs(n_rows) == 2:
+        call = call[2]
+    return call(x.contiguous(), n_rows, SOURCE_DIGEST)
 
 
 # ---------------------------------------------------------------------------------------------

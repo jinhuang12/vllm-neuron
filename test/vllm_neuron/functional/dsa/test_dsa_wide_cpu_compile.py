@@ -10,8 +10,8 @@ gives them, and for the MoE router, whose SBUF tile scales with the prefill chun
 
 * ``_causal_bound_nki`` at ``[8192, C]`` (one 8192-token prefill chunk), at the 64k,
   128k and 256k contexts;
-* ``dsa_decode_scores_kernel`` at the 256k context (B=4, two programs) and the 1M
-  context (B=1);
+* ``dsa_decode_scores_kernel`` at the 256k context (B=4) and the 1M context (B=1), each
+  as two programs (the LNC2 form; one program at 1M is a neuronx-cc refusal, exit 70);
 * ``noaux_tc_rmsnorm_router_topk`` at an 8192-token chunk, GLM-5.3-Flash's H and E (one
   launch of the whole chunk needs 524,288 B per partition there and neuronx-cc refuses
   it).
@@ -55,7 +55,7 @@ CASES = (
     ("causal_bound", CHUNK, 131072 // POOL, 1),
     ("causal_bound", CHUNK, 262144 // POOL, 1),
     ("decode_scores", 4, 262144 // POOL, 2),
-    ("decode_scores", 1, 1048576 // POOL, 1),
+    ("decode_scores", 1, 1048576 // POOL, 2),
     ("router", CHUNK, HIDDEN, 2),
 )
 
@@ -103,7 +103,9 @@ def _child(kind: str, rows: int, width: int, grid: int) -> None:
             call = wrap_nki(DB.dsa_decode_scores_kernel)
             if grid == 2:
                 call = call[2]
-            return call(q, w, bank, slots, lens, pos, pooled, width, POOL, DB.SOURCE_DIGEST)
+            # The block size and unroll the dispatcher passes (``dsa_decode_scores``).
+            return call(q, w, bank, slots, lens, pos, pooled, width, POOL,
+                        DB.score_blocks(rows, width, grid), DB.UNROLL_BLOCKS, DB.SOURCE_DIGEST)
 
         batch = rows
         args = (torch.empty((batch, INDEX_HEADS, INDEX_HEAD_DIM), dtype=bf, device=meta),

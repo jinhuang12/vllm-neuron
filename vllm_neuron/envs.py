@@ -7,7 +7,8 @@ This module provides centralized environment variable management for vLLM Neuron
 All environment variables are:
 - Lazily evaluated when accessed
 - Type-safe with proper validation
-- Prefixed with VLLM_NEURON_ for namespace isolation
+- Prefixed with VLLM_NEURON_ for namespace isolation, except the Neuron SDK
+  settings vLLM Neuron reads, which keep the SDK's own names
 """
 
 import functools
@@ -82,6 +83,8 @@ if TYPE_CHECKING:
     # Build the GLM-5.3-Flash step's attention metadata on the host only: no per-step
     # block-table / slot-mapping uploads that its graph never reads.
     VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA: bool = False
+    # Neuron SDK settings read here (the runtime and the compiler own them).
+    NEURON_LOGICAL_NC_CONFIG: Optional[int] = None
     # Where the GLM-5.3-Flash shadow draft (MTP stage A) writes its per-step scoring
     # records (JSONL, rank 0). Empty = no log, no scoring.
     VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG: str = ""
@@ -443,6 +446,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA"))
         or False
+    ),
+    # ================== Neuron SDK ==================
+    # Physical NeuronCores per logical core (trn2: 1 or 2), set by the launcher for
+    # the runtime and the compiler. A kernel that splits its work over an LNC2 pair
+    # launches a grid of two programs only when this is 2. Unset: None, and such
+    # kernels launch one program.
+    "NEURON_LOGICAL_NC_CONFIG": lambda: maybe_convert_int(
+        os.getenv("NEURON_LOGICAL_NC_CONFIG")
     ),
     # JSONL path for the GLM-5.3-Flash shadow-draft scoring records (MTP stage A);
     # empty = no log. Read with VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT (the draft count).

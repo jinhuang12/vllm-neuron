@@ -35,12 +35,11 @@ UNTILED_COMMIT = "b17526a"
 #: Tokens per candidate pool, GLM-5.3-Flash's.
 POOL = Glm5NextTextConfig().index_kpool
 #: The widest candidate row of the indexer chain at :data:`UNTILED_COMMIT`: the old decode
-#: kernel's ``MAX_CANDIDATES`` (65,536 tokens at pool 4), which is one decode chunk now, as
-#: ``test_decode_batch_tiled.py`` defines its ``OLD_MAX`` (and checks it against that kernel).
-#: The untiled bound held a whole row in SBUF, which neuronx-cc refuses from twice this
-#: width on (``causal_bound.COLUMN_TILE``); ``test_dsa_wide_cpu_compile.py`` builds the tiled
-#: bound at those widths.
-UNTILED_WIDTH_MAX = DB.CHUNK_CANDIDATES
+#: kernel's ``MAX_CANDIDATES``, one ``PARTITIONS x PARTITIONS`` block of candidates (65,536
+#: tokens at pool 4). The untiled bound held a whole row in SBUF, which neuronx-cc refuses
+#: from twice this width on (``causal_bound.COLUMN_TILE``); ``test_dsa_wide_cpu_compile.py``
+#: builds the tiled bound at those widths.
+UNTILED_WIDTH_MAX = DB.PARTITIONS**2
 
 
 #: The reference file at :data:`UNTILED_COMMIT`.
