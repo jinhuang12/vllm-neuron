@@ -112,8 +112,14 @@ def _inst(name, engine, opcode="TensorTensor", ins=(), outs=(), waits=(), update
 
 
 def _found(tmp_path, instructions, locs):
+    return _found_in_blocks(tmp_path, {"Block1": instructions}, locs)
+
+
+def _found_in_blocks(tmp_path, blocks, locs):
+    """``blocks``: ``{block name: its instructions}``, in program order."""
     dump = {"functions": [{"allocations": [{"kind": "Internal", "memorylocations": locs}],
-                           "blocks": [{"instructions": instructions}]}],
+                           "blocks": [{"name": name, "instructions": instructions}
+                                      for name, instructions in blocks.items()]}],
             "queues": []}
     path = tmp_path / "dump.json"
     path.write_text(json.dumps(dump))
@@ -247,10 +253,12 @@ def test_two_instructions_of_one_name_stay_two_nodes(tmp_path):
 
 
 def test_a_cycle_leaves_the_dump_undecided(tmp_path):
-    found = _found(tmp_path, [_inst("a", "DVE", outs=[_tile("x")], waits=[("b", 1, 1)],
-                                    updates=[(2, 1)]),
-                              _inst("b", "Pool", outs=[_tile("x")], waits=[("a", 2, 1)],
-                                    updates=[(1, 1)])], [_loc("x")])
+    # A wait binds to an instruction before it only, so every edge runs forward in program
+    # order. An instruction named as a DMA's completion node is that node: "d#done" runs
+    # before the DMA "d", which waits for it, and completes after it.
+    found = _found(tmp_path, [_inst("d#done", "DVE", outs=[_tile("x")], updates=[(2, 1)]),
+                              _inst("d", "SP", opcode="DMACopy", ins=[_tile("x")], queue="q",
+                                    waits=[("d#done", 2, 1)])], [_loc("x")])
     assert found.undecided and "cycle" in found.undecided[0] and not found.clean
 
 
@@ -263,6 +271,46 @@ def test_a_wait_on_a_repeated_name_waits_for_the_update_that_reaches_it(tmp_path
                               _inst("r", "Pool", ins=[_tile("x")], waits=[("u", 5, 2)])],
                    [_loc("x")])
     assert found.clean and found.ordered == 1
+
+
+#: walrus names each device loop's counter increment alike in every loop body.
+_INC = "scf.for-Inc_inst__I-10-0-DVE0"
+
+
+def _reset(sem):
+    return dict(_inst("reset", "ALL", opcode="GroupResetSemaphores"), sema_group=[sem])
+
+
+def test_a_wait_on_a_name_every_loop_body_repeats_binds_in_its_own_body(tmp_path):
+    # Body 2's read waits for body 2's increment, after the write. Body 1's increment is the
+    # first to reach the value, but the reset after it zeroed the count before body 2 ran.
+    found = _found_in_blocks(tmp_path, {
+        "Block1_LoopBody_1": [_inst(_INC, "DVE", updates=[(13, 1)]), _reset(13)],
+        "Block1_LoopBody_2": [_inst("w", "DVE", outs=[_tile("x")]),
+                              _inst(_INC, "DVE", updates=[(13, 1)]),
+                              _inst("r", "Pool", ins=[_tile("x")], waits=[(_INC, 13, 1)])]},
+        [_loc("x")])
+    assert found.clean and found.ordered == 1
+
+
+def test_a_wait_in_a_block_without_the_name_binds_in_the_nearest_earlier_block(tmp_path):
+    # The exit block holds no increment: its read waits for the one that ran last before it,
+    # body 2's, after the write.
+    found = _found_in_blocks(tmp_path, {
+        "Block1_LoopBody_1": [_inst(_INC, "DVE", updates=[(13, 1)]), _reset(13)],
+        "Block1_LoopBody_2": [_inst("w", "DVE", outs=[_tile("x")]),
+                              _inst(_INC, "DVE", updates=[(13, 1)])],
+        "Block1_LoopExit_2": [_inst("r", "Pool", ins=[_tile("x")], waits=[(_INC, 13, 1)])]},
+        [_loc("x")])
+    assert found.clean and found.ordered == 1
+
+
+def test_a_wait_on_a_name_that_runs_only_after_it_is_an_early_wait(tmp_path):
+    # Only "u", after "r" on r's own engine, updates the semaphore r waits on: no edge.
+    found = _found(tmp_path, [_inst("r", "DVE", waits=[("u", 5, 1)]),
+                              _inst("u", "DVE", updates=[(5, 1)])], [])
+    assert len(found.early_waits) == 1 and found.early_waits[0].startswith("r waits for u ")
+    assert not found.undecided and not found.clean
 
 
 # ---------------------------------------------------------------------------------------
