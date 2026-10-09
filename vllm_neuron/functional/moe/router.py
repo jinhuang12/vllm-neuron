@@ -22,10 +22,11 @@ from nkilib.core.moe_block.moe_block_tkg_utils import _pmax
 from nkilib.core.router_topk.router_topk import XSBLayout_tp102__0
 from nkilib.core.router_topk.router_topk import router_topk as _substrate_router_topk
 from nkilib.core.subkernels.rmsnorm_tkg import _rmsnorm_tkg_dloc
+from nkilib.core.utils.allocator import sizeinbytes
 from nkilib.core.utils.common_types import QuantizationType
 # The same sharding query nkilib's router uses to choose its token split, so the
 # `noaux_tc` stage and the router cannot disagree about which core owns which rows.
-from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
+from nkilib.core.utils.kernel_helpers import div_ceil, get_verified_program_sharding_info
 
 from vllm_neuron.functional.moe.rmsnorm_router_topk_tkg import (
     _can_use_kernel as _substrate_can_use_kernel,
@@ -862,6 +863,11 @@ NOAUX_TC_MAX8_WIDTH = 8
 #: Guard term in the L1 denominator, verbatim from the reference implementation.
 NOAUX_TC_DENOM_EPS = 1e-20
 
+#: Written by `nc_match_replace8` over the eight selected corrected scores, so the gate
+#: mask is one compare. A corrected score is `sigmoid(logit) + bias`, inside
+#: `[bias, bias + 1]`; it equals this value only for a correction bias near -3e38.
+_NOAUX_TC_SELECTED = -3.0e38
+
 #: nkilib's router caps E at its gemm moving free-dim maximum.
 _NOAUX_TC_F_MAX = 512
 
@@ -1038,6 +1044,175 @@ def _noaux_tc_shard_range(num_tokens: int, n_prgs: int, prg_id: int):
     if prg_id == 0:
         return 0, t_first
     return t_first, num_tokens - t_first
+
+
+def _noaux_tc_gain_rows(gamma_hbm, hidden: int):
+    """The `[1, H]` RMSNorm gain on every partition: `[NOAUX_TC_TILE, H]` in SBUF.
+
+    One DMA with a zero partition stride on the sync engine's hardware queue, made once
+    per launch; every tile's gain multiply (`_noaux_tc_gained_columns`) reads it.
+    """
+    gamma_rows = nl.ndarray((NOAUX_TC_TILE, hidden), dtype=gamma_hbm.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=gamma_rows,
+                  src=gamma_hbm.ap(pattern=[[0, NOAUX_TC_TILE], [1, hidden]]),
+                  dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync)
+    return gamma_rows
+
+
+def _noaux_tc_router_weights(router_weights_hbm):
+    """The router weights in the `tp102` layout: `w_sb` `[128, cols, E]` in SBUF.
+
+    `w_sb[p, j, :] = W[p * cols + j, :]` with `cols = H / 128`: each partition holds
+    `cols` consecutive weight rows, one contiguous run of HBM, so the whole matrix is
+    one DMA on the sync engine's hardware queue.
+    """
+    hidden, num_experts = router_weights_hbm.shape
+    cols = hidden // _pmax
+    w_sb = nl.ndarray((_pmax, cols, num_experts), dtype=router_weights_hbm.dtype,
+                      buffer=nl.sbuf)
+    nisa.dma_copy(dst=w_sb, src=router_weights_hbm.ap(
+        pattern=[[cols * num_experts, _pmax], [num_experts, cols], [1, num_experts]]),
+        dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync)
+    return w_sb
+
+
+def _noaux_tc_token_rows(rows_hbm, t0: int, rows: int):
+    """Token rows `t0 .. t0 + rows` of `rows_hbm` `[T, H]`, one token per partition.
+
+    One contiguous DMA on the sync engine's hardware queue, which carries all of the
+    launch's large loads in the order the kernel needs them.
+    """
+    _, hidden = rows_hbm.shape
+    x = nl.ndarray((rows, hidden), dtype=rows_hbm.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=x, src=rows_hbm[t0:t0 + rows, :],
+                  dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync)
+    return x
+
+
+def _noaux_tc_gained_columns(x, gamma_rows):
+    """Token rows `x` `[rows, H]`, gained, in the `tp102` columns `[128, cols, rows]`.
+
+    `out[p, j, t] = bf16(x[t, p * cols + j] * gain[p * cols + j])`: the vector engine
+    multiplies the rows by the gain in place (the tensor_tensor nkilib's RMSNorm runs on
+    the same bf16 tile), then PE transposes (exact) turn them into columns, as many per
+    PSUM bank as fit. The bank copies to SBUF alternate between the scalar and the
+    vector engine, so consecutive banks are copied on two engines at once.
+    """
+    rows, hidden = x.shape
+    cols = hidden // _pmax
+    nisa.tensor_tensor(dst=x, data1=x, data2=gamma_rows[0:rows, :], op=nl.multiply)
+
+    # x_cols[t, p, j] = x[t, p * cols + j]: column j of every partition block is one
+    # [rows, 128] transpose source.
+    x_cols = x.reshape((rows, _pmax, cols))
+    xt = nl.ndarray((_pmax, cols, rows), dtype=x.dtype, buffer=nl.sbuf)
+    per_bank = nl.tile_size.psum_bank_fmax_bytes // (rows * sizeinbytes(x.dtype))
+    for group in range(div_ceil(cols, per_bank)):
+        j0 = group * per_bank
+        width = min(per_bank, cols - j0)
+        bank = nl.ndarray((_pmax, width, rows), dtype=x.dtype, buffer=nl.psum)
+        for g in range(width):
+            nisa.nc_transpose(dst=bank[:, g, :], data=x_cols[:, :, j0 + g])
+        nisa.tensor_copy(dst=xt[:, j0:j0 + width, :], src=bank,
+                         engine=nisa.engine.scalar if group % 2 == 0 else nisa.engine.vector)
+    return xt
+
+
+def _noaux_tc_router_matmul(xt, w_sb):
+    """Router logits `[rows, E]` fp32 in PSUM from gained columns `xt` `[128, cols, rows]`.
+
+    The contraction follows nkilib `router_topk` on the `tp102` layout, so the logits are
+    bit-equal to it: for each column `j` in ascending order one matmul over the 128
+    partitions `p` (hidden index `p * cols + j`; stationary `xt[:, j, :]`, moving
+    `w_sb[:, j, :]`), accumulated in one PSUM tile.
+    """
+    _, cols, rows = xt.shape
+    _, _, num_experts = w_sb.shape
+    logits = nl.ndarray((rows, num_experts), dtype=nl.float32, buffer=nl.psum)
+    for j in range(cols):
+        nisa.nc_matmul(dst=logits, stationary=xt[:, j, :], moving=w_sb[:, j, :],
+                       accumulate=(j > 0))
+    return logits
+
+
+def _noaux_tc_bias_tile(correction_bias_hbm, num_experts: int):
+    """The `[1, E]` correction bias on every partition: `[NOAUX_TC_TILE, E]` fp32 in SBUF.
+
+    One DMA with a zero partition stride, made once per launch; every tile's selection
+    reads it.
+    """
+    bias_bc = nl.ndarray((NOAUX_TC_TILE, num_experts), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=bias_bc,
+                  src=correction_bias_hbm.ap(pattern=[[0, NOAUX_TC_TILE], [1, num_experts]]))
+    return bias_bc
+
+
+def _noaux_tc_select(logits, bias_bc, norm_topk_prob: bool, routed_scaling_factor: float):
+    """The `noaux_tc` numerics on one tile of router logits, one token per partition.
+
+    `logits` is `[rows, E]` fp32 in SBUF or PSUM, `bias_bc` the `[rows, E]` correction
+    bias (`_noaux_tc_bias_tile`). Returns SBUF tiles `(idx8 [rows, 8] uint32,
+    weights [rows, E] fp32)`. Per token, following `Glm5NextTextTopkRouter.forward`::
+
+        scores            = sigmoid(logits)
+        scores_for_choice = scores + correction_bias
+        topk_indices      = topk(scores_for_choice, k)   # nisa.max8 + nc_find_index8
+        topk_weights      = scores[topk_indices]         # nc_match_replace8 mask, below
+        if norm_topk_prob:
+            topk_weights /= topk_weights.sum() + 1e-20
+        topk_weights     *= routed_scaling_factor
+
+    The gather is a mask over the selected positions, not a DMA gather: the MoE block
+    consumes the scattered `[T, E]` form anyway. `nc_match_replace8` overwrites, for each
+    of the eight `max8` values, its first not yet replaced occurrence with
+    `_NOAUX_TC_SELECTED`; `nc_find_index8` reports the same positions (a value `max8`
+    returns twice is paired with its first two occurrences by both), so the mask selects
+    exactly the eight reported experts, also when experts tie on the corrected score.
+    The values are `_noaux_tc_stage`'s, whose one-hot index mask takes eight compare and
+    add pairs per tile where this mask takes two instructions; the prefill router kernel
+    runs this form.
+    """
+    rows, num_experts = logits.shape
+
+    # fp32 throughout: the selection is discrete, and a bf16 score would decide
+    # near-tie experts by round-off rather than by value.
+    scores = nl.ndarray((rows, num_experts), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(dst=scores, op=nl.sigmoid, data=logits)
+    # On the GpSimd engine: the vector engine runs every other step of the selection
+    # and the gain multiply, and fp32 addition rounds the same on both.
+    choice = nl.ndarray((rows, num_experts), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=choice, data1=scores, data2=bias_bc, op=nl.add,
+                       engine=nisa.engine.gpsimd)
+
+    # Top-k on the corrected score.
+    top8 = nl.ndarray((rows, NOAUX_TC_MAX8_WIDTH), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.max8(dst=top8, src=choice)
+    idx8 = nl.ndarray((rows, NOAUX_TC_MAX8_WIDTH), dtype=nl.uint32, buffer=nl.sbuf)
+    nisa.nc_find_index8(dst=idx8, data=choice, vals=top8)
+
+    # Gate weights from the unbiased scores at the selected positions, zero elsewhere.
+    marked = nl.ndarray((rows, num_experts), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.nc_match_replace8(dst=marked, data=choice, vals=top8, imm=_NOAUX_TC_SELECTED)
+    sel = nl.ndarray((rows, num_experts), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.scalar_tensor_tensor(dst=sel, data=marked, op0=nl.equal,
+                              operand0=_NOAUX_TC_SELECTED, op1=nl.multiply, operand1=scores)
+
+    out = nl.ndarray((rows, num_experts), dtype=nl.float32, buffer=nl.sbuf)
+    if norm_topk_prob:
+        # Normalise, then scale, in one pass.
+        row_sum = nl.ndarray((rows, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_reduce(dst=row_sum, op=nl.add, data=sel, axis=1, keepdims=True)
+        denom = nl.ndarray((rows, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=denom, data=row_sum, op0=nl.add, operand0=NOAUX_TC_DENOM_EPS)
+        recip = nl.ndarray((rows, 1), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.reciprocal(dst=recip, data=denom)
+        nisa.tensor_scalar(dst=out, data=sel, op0=nl.multiply, operand0=recip,
+                           op1=nl.multiply, operand1=float(routed_scaling_factor))
+    else:
+        # Scale only.
+        nisa.tensor_scalar(dst=out, data=sel, op0=nl.multiply,
+                           operand0=float(routed_scaling_factor))
+    return idx8, out
 
 
 def _noaux_tc_stage(
