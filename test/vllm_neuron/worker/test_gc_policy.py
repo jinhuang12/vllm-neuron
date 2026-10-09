@@ -5,16 +5,18 @@ CPython 3.12 runs a full (gen-2) collection when more than ``threshold2`` gen-1
 collections ran since the last one AND ``long_lived_pending`` is at least
 ``long_lived_total / 4``. With CPython's ``threshold2`` = 10, bs=64 decode on the
 TP=64 server reached a full pass over the whole heap every few hundred steps (3.5-6 s
-each, a decode stall). The default policy raises only ``threshold2``.
+each, a decode stall). ``rare_gen2`` raises only ``threshold2``.
 
-It no longer runs vLLM's ``freeze_gc_heap()`` (a full collection, then
-``gc.freeze()``) at the end of warmup: that one call slowed every later bs=1 decode
-step of the TP=64 server, although a bs=1 step runs almost no collection. The pin
-test below fails if the default runs a collection or freezes anything again.
+It does not run vLLM's ``freeze_gc_heap()`` (a full collection, then ``gc.freeze()``)
+at the end of warmup: that one call slowed every later bs=1 decode step of the TP=64
+server, although a bs=1 step runs almost no collection. The default is ``off``
+(``test_gc_policy_default.py``) until ``rare_gen2`` passes its bs=1 measurement. The
+pin test below fails if ``rare_gen2`` or the default runs a collection or freezes
+anything again.
 
 Unit cases replace the freeze, ``gc.set_threshold``, ``gc.disable`` and the vLLM
 GC-debug hook with recorders: the real calls would change the pytest process. The pin
-runs the real default policy with automatic GC disabled and restores the thresholds;
+runs the real policies with automatic GC disabled and restores the thresholds;
 one case runs real policies in child processes (``test/perf/gc_decode_pattern.py``).
 
 Run with ``VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1``.
@@ -59,13 +61,13 @@ def _young_thresholds() -> tuple[int, int]:
     return t0, t1
 
 
-def test_default_policy_raises_only_the_gen2_threshold(calls):
+def test_rare_gen2_policy_raises_only_the_gen2_threshold(calls, monkeypatch):
     """Only threshold2 changes; gen-0/1 keep their thresholds; no freeze."""
+    monkeypatch.setenv(ENV, "rare_gen2")
     t0, t1 = _young_thresholds()
 
     applied = gc_policy.apply_post_warmup_gc_policy()
 
-    assert gc_policy.DEFAULT_POLICY == gc_policy.RARE_GEN2
     assert calls == [
         ("set_threshold", t0, t1, gc_policy.GEN2_THRESHOLD),
         ("gc_debug",),
@@ -88,16 +90,21 @@ class _Cycle:
         self.me = self
 
 
-def test_default_policy_collects_nothing_and_freezes_nothing(monkeypatch):
-    """PIN: the end-of-warmup default runs no collection and freezes no object.
+@pytest.mark.parametrize("value", ["rare_gen2", None], ids=["rare_gen2", "unset-default"])
+def test_rare_gen2_and_the_default_collect_nothing_and_freeze_nothing(monkeypatch, value):
+    """PIN: neither ``rare_gen2`` nor the served default collects or freezes at warmup end.
 
     The full collection + freeze (``freeze_gc_heap()``) at the end of warmup is what
     slowed every bs=1 decode step of the TP=64 server. A cycle that sits in the oldest
     generation survives anything but a full collection, so it is the witness: it must
     still be alive after the policy, the freeze count and the collection counts must
-    not move, and only ``threshold2`` changes.
+    not move, and at most ``threshold2`` changes.
     """
-    monkeypatch.delenv(ENV, raising=False)  # the served default: knob unset
+    if value is None:
+        monkeypatch.delenv(ENV, raising=False)  # the served default: knob unset
+    else:
+        monkeypatch.setenv(ENV, value)
+    name = value or f"default ({gc_policy.DEFAULT_POLICY})"
     saved = gc.get_threshold()
     was_enabled = gc.isenabled()
     gc.disable()  # no automatic pass between the two snapshots
@@ -114,10 +121,13 @@ def test_default_policy_collects_nothing_and_freezes_nothing(monkeypatch):
 
         applied = gc_policy.apply_post_warmup_gc_policy()
 
-        assert handle() is not None, "the default policy ran a full collection"
-        assert gc.get_freeze_count() == frozen_before, "the default policy froze objects"
+        raised = applied.policy in gc_policy.RAISING_POLICIES
+        assert handle() is not None, f"{name} ran a full collection"
+        assert gc.get_freeze_count() == frozen_before, f"{name} froze objects"
         assert [g["collections"] for g in gc.get_stats()] == collections_before
-        assert gc.get_threshold() == (saved[0], saved[1], gc_policy.GEN2_THRESHOLD)
+        assert gc.get_threshold() == (
+            saved[0], saved[1], gc_policy.GEN2_THRESHOLD if raised else saved[2]
+        )
         assert applied.frozen is False
     finally:
         gc.unfreeze()
@@ -128,7 +138,7 @@ def test_default_policy_collects_nothing_and_freezes_nothing(monkeypatch):
 
 
 def test_freeze_rare_gen2_policy_freezes_then_raises_the_gen2_threshold(calls, monkeypatch):
-    """``freeze_rare_gen2`` (the default before ``rare_gen2``), for A/B runs."""
+    """``freeze_rare_gen2`` (the default before ``off``), for A/B runs."""
     monkeypatch.setenv(ENV, "freeze_rare_gen2")
     t0, t1 = _young_thresholds()
 
@@ -192,7 +202,7 @@ def _load_harness():
 
 
 def test_harness_measures_the_policy_the_worker_applies(monkeypatch):
-    """The harness's chosen policy is the worker default, run through the worker's code."""
+    """The harness's chosen policy, ``rare_gen2``, runs through the worker's code."""
     harness = _load_harness()
     seen: list[str] = []
     monkeypatch.setattr(
@@ -203,8 +213,8 @@ def test_harness_measures_the_policy_the_worker_applies(monkeypatch):
 
     harness.apply_policy(harness.CHOSEN_POLICY)
 
-    assert harness.CHOSEN_POLICY == gc_policy.DEFAULT_POLICY
-    assert seen == [gc_policy.DEFAULT_POLICY]
+    assert harness.CHOSEN_POLICY == gc_policy.RARE_GEN2
+    assert seen == [gc_policy.RARE_GEN2]
 
 
 def _run_child(policy: str) -> dict:
@@ -222,15 +232,15 @@ def _run_child(policy: str) -> dict:
     return _load_harness().parse_child_output(out.stdout)
 
 
-def test_real_freeze_alone_runs_frequent_full_passes_and_default_does_not():
-    """Real CPython: freeze alone -> a full pass every few steps; default -> none."""
+def test_real_freeze_alone_runs_frequent_full_passes_and_rare_gen2_does_not():
+    """Real CPython: freeze alone -> a full pass every few steps; rare_gen2 -> none."""
     freeze_only = _run_child(gc_policy.FREEZE_ONLY)
-    default = _run_child(gc_policy.DEFAULT_POLICY)
+    rare = _run_child(gc_policy.RARE_GEN2)
 
     assert freeze_only["per_1000_steps"]["gen2"] >= 20, freeze_only["per_1000_steps"]
-    assert default["per_1000_steps"]["gen2"] <= 1, default["per_1000_steps"]
-    assert default["per_1000_steps"]["gen0"] > 0
-    assert default["per_1000_steps"]["gen1"] > 0
+    assert rare["per_1000_steps"]["gen2"] <= 1, rare["per_1000_steps"]
+    assert rare["per_1000_steps"]["gen0"] > 0
+    assert rare["per_1000_steps"]["gen1"] > 0
     assert freeze_only["frozen_objects"] >= 300000
-    assert default["frozen_objects"] < 300000, "the default froze the heap"
-    assert default["threshold_after"][2] == gc_policy.GEN2_THRESHOLD
+    assert rare["frozen_objects"] < 300000, "rare_gen2 froze the heap"
+    assert rare["threshold_after"][2] == gc_policy.GEN2_THRESHOLD

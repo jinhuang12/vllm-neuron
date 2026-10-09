@@ -4,13 +4,14 @@
 Each TP=64 worker of the bs=64 GLM-5.3-Flash line tracks 5.2-5.4 M objects in
 generation 2 after warmup, so one gen-2 pass takes 3.5-6.0 s. The rank in GC does
 not submit its step and the other 63 ranks wait for it: that is the 3.8-6 s decode
-stall. The default policy (``gc_policy.py``, ``rare_gen2``) raises the gen-2
-threshold so those passes stop, and runs no collection and no freeze: vLLM's
+stall (DECODE_BREAKDOWN_v2.md 5.2). ``rare_gen2`` (``gc_policy.py``) raises the
+gen-2 threshold so those passes stop, and runs no collection and no freeze: vLLM's
 ``freeze_gc_heap()`` (``gc.collect(0/1/2)`` then ``gc.freeze()``), which vLLM's GPU
 worker calls at the end of its own ``compile_or_warm_up_model``, slowed every later
-bs=1 decode step on TP=64. ``VLLM_NEURON_GC_POLICY`` selects ``rare_gen2`` (default),
-``freeze_rare_gen2`` (freeze, then raise), ``freeze`` (freeze alone) or ``off``
-(CPython default GC).
+bs=1 decode step on TP=64. ``VLLM_NEURON_GC_POLICY`` selects ``off`` (default,
+CPython default GC), ``rare_gen2``, ``freeze_rare_gen2`` (freeze, then raise) or
+``freeze`` (freeze alone). The ordering cases run ``rare_gen2``; the default is
+pinned on every serving path below and in ``test_gc_policy_default.py``.
 
 The tests drive the real ``NeuronWorker.compile_or_warm_up_model`` with the
 extraction, compile and warmup steps replaced by recorders, and replace the freeze,
@@ -31,11 +32,11 @@ from vllm_neuron.vllm.worker import gc_policy, neuron_worker
 from vllm_neuron.vllm.worker.neuron_worker import NeuronWorker
 
 FREEZE = "freeze_gc_heap"
-#: The gen-2 threshold change of the default policy (gen-0/1 thresholds kept).
+#: The gen-2 threshold change of the raising policies (gen-0/1 thresholds kept).
 RAISE_GEN2 = "set_threshold_gen2"
 GC_DEBUG = "gc_debug"
-#: The default policy's GC calls, in order: no freeze.
-DEFAULT_GC = [RAISE_GEN2, GC_DEBUG]
+#: ``rare_gen2``'s GC calls, in order: no freeze.
+RARE_GEN2_GC = [RAISE_GEN2, GC_DEBUG]
 #: ``freeze_rare_gen2``'s GC calls, in order.
 FREEZE_RARE_GEN2_GC = [FREEZE, RAISE_GEN2, GC_DEBUG]
 #: Every recorded GC call.
@@ -63,10 +64,14 @@ WARMUP_ENV = (
 
 @pytest.fixture
 def events(monkeypatch):
-    """Ordered record of the steps the worker ran, freeze calls included."""
+    """Ordered record of the steps the worker ran, freeze calls included.
+
+    The policy is ``rare_gen2`` unless a case sets or clears it.
+    """
     record: list[str] = []
-    for name in WARMUP_ENV + (POLICY_ENV,):
+    for name in WARMUP_ENV:
         monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(POLICY_ENV, gc_policy.RARE_GEN2)
     monkeypatch.setattr(neuron_worker, "tp_barrier", lambda: record.append("tp_barrier"))
 
     def freeze_gc_heap() -> None:
@@ -147,14 +152,14 @@ def test_main_path_applies_the_gc_policy_once_after_the_warmup_work(
 
     assert isinstance(result, CompilationTimes)
     assert [e for e in events if e in GC_CALLS or e.startswith(("set_", "gc_"))] == (
-        DEFAULT_GC
+        RARE_GEN2_GC
     )
     assert [e for e in events if e.startswith("warmup_")] == warmup_ran
-    policy_at = events.index(DEFAULT_GC[0])
+    policy_at = events.index(RARE_GEN2_GC[0])
     for step in WARMUP_WORK:
         if step in events:
             assert events.index(step) < policy_at, (step, events)
-    assert events[policy_at:] == DEFAULT_GC, events
+    assert events[policy_at:] == RARE_GEN2_GC, events
 
 
 @pytest.mark.parametrize("missing", ["model_runner", "model"])
@@ -182,22 +187,26 @@ def test_synthetic_model_applies_the_gc_policy_once_and_skips_warmup(events):
     """The synthetic DI-test model serves without warmup, so it gets the policy too."""
     NeuronWorker.compile_or_warm_up_model(_worker(events, model=_synthetic_model()))
 
-    assert events == DEFAULT_GC
+    assert events == RARE_GEN2_GC
 
 
 def test_cpu_eager_mode_applies_the_gc_policy_once_and_skips_warmup(events):
     """CPU eager mode serves without warmup, so it gets the policy too."""
     NeuronWorker.compile_or_warm_up_model(_worker(events, enforce_eager=True))
 
-    assert events == DEFAULT_GC
+    assert events == RARE_GEN2_GC
 
 
+@pytest.mark.parametrize("value", ["off", None], ids=["off", "unset-default"])
 @pytest.mark.parametrize("path", ["main", "synthetic", "cpu-eager"])
-def test_kill_switch_keeps_cpython_default_gc_on_every_serving_path(
-    events, monkeypatch, path
+def test_off_and_the_default_keep_cpython_default_gc_on_every_serving_path(
+    events, monkeypatch, path, value
 ):
-    """``VLLM_NEURON_GC_POLICY=off``: no freeze, no threshold change, gc stays on."""
-    monkeypatch.setenv(POLICY_ENV, "off")
+    """``off``, also the default: no freeze, no threshold change, gc stays on."""
+    if value is None:
+        monkeypatch.delenv(POLICY_ENV)
+    else:
+        monkeypatch.setenv(POLICY_ENV, value)
     worker = _worker(
         events,
         model=_synthetic_model() if path == "synthetic" else None,
@@ -211,7 +220,7 @@ def test_kill_switch_keeps_cpython_default_gc_on_every_serving_path(
 
 
 def test_freeze_rare_gen2_policy_freezes_then_raises_once(events, monkeypatch):
-    """``VLLM_NEURON_GC_POLICY=freeze_rare_gen2``: the earlier default, for A/B runs."""
+    """``VLLM_NEURON_GC_POLICY=freeze_rare_gen2``: the default before ``off``, for A/B runs."""
     monkeypatch.setenv(POLICY_ENV, "freeze_rare_gen2")
 
     NeuronWorker.compile_or_warm_up_model(_worker(events))
