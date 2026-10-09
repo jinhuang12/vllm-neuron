@@ -13,7 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Utility functions and configuration classes for top-k operations including rotational algorithm support and scanning implementations."""
+"""Utility functions and configuration classes for top-k operations including rotational algorithm support and scanning implementations.
+
+Vendored from nkilib ``core/topk`` (KaenaNeuronKernelLibrary 88ffd98c, see this package's
+``__init__``) and patched here: ``sort`` keeps its pass indices and its gathered global indices
+in the two halves of one tile, so its gather never writes SBUF its sources occupy (a gather
+dst/src alias, which the device's pieced gather turns into wrong indices). Carry the patch
+upstream, or apply it again, before nkilib's copy replaces this one.
+"""
 
 import math
 from dataclasses import dataclass
@@ -1088,8 +1095,16 @@ def sort(data_sbuf, indices, true_k):
     padded_k = num_pass * HW_PARAMS.dve_max_alus
 
     topk_val_buf = nl.ndarray((m, padded_k), dtype=data_sbuf.dtype, buffer=nl.sbuf)
-    topk_idx_buf = nl.ndarray((m, padded_k), dtype=nl.uint32, buffer=nl.sbuf)
-    global_topk_idx_buf = nl.ndarray((m, padded_k), dtype=nl.uint32, buffer=nl.sbuf)
+    # The pass indices and the gathered global indices are the two halves of one tile, so the
+    # gather below never writes SBUF its sources occupy (a gather dst/src alias: the device
+    # gathers in pieces, so a piece can read what an earlier piece wrote). As separate tiles,
+    # with one pass, the destination is born at the gather where both sources die, which lets
+    # the backend place it on either.
+    # The halves are disjoint by their columns, and the pass writes the tile before the gather
+    # reads `indices`, so the tile and `indices` are live together and never share SBUF.
+    index_buf = nl.ndarray((m, 2 * padded_k), dtype=nl.uint32, buffer=nl.sbuf)
+    topk_idx_buf = index_buf[:, nl.ds(0, padded_k)]
+    global_topk_idx_buf = index_buf[:, nl.ds(padded_k, padded_k)]
 
     ix_data, iy_data = nl.ds(0, m), nl.ds(0, pk)
 
