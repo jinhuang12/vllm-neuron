@@ -598,7 +598,8 @@ python3 -m vllm.entrypoints.openai.api_server \
     --additional-config '{"neuron_config": {"on_device_sampling_config": {"all_greedy": true}, ...}}'
 ```
 
-Contract of the opt-in (measured on trn2 at TP64/EP16, `k = 3`, 2026-10-09):
+Contract of the opt-in (measured on trn2 at TP64/EP16, `k = 3`, `max_num_seqs 1`, `max_model_len 4096`,
+`VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA=1`, 2026-10-09):
 
 * **Served greedy, synchronously.** The proposer needs on-device sampling and refuses
   async scheduling by name (the accepted count would reach the host one step late and
@@ -609,22 +610,23 @@ Contract of the opt-in (measured on trn2 at TP64/EP16, `k = 3`, 2026-10-09):
   sampling under this drafter is not a served configuration: the on-device rejection
   sampler compares ids, not probabilities.
 * **Greedy output is not guaranteed identical to non-speculative greedy decoding, and
-  before acbc5b0a it was not identical run to run.** Measured on the gate's r3 server
-  (before that fix): 4 of 8 identity prompts (64 greedy tokens each) diverged from the
+  with the draft layer's earlier view-form latent write it was not identical run to
+  run.** Measured with that write form (trn2, TP64/EP16, bs = 1, `k = 3`): 4 of 8 identity prompts (64 greedy tokens each) diverged from the
   non-speculative run at tokens 15-41 -- the first differing token a wording or
   whitespace alternative, the continuations then differ (one prompt reaches different
   arithmetic) -- GSM8K@200 exact-match 0.99 on both, response text identical for 90 of
   the 200 documents (the two non-speculative arms: 200 of 200); and one six-run series of
-  the measure prompt produced two outputs, A/B/A/B/A/B, splitting at token 106
-  (`hostrec/measure_D.json`), while the non-speculative arms were 6/6 identical. The
-  run-to-run alternation's measured cause is a dropped write, not a tie: the draft layer
+  the measure prompt produced two outputs, A/B/A/B/A/B, splitting at token 106,
+  while the non-speculative arms were 6/6 identical. The
+  run-to-run alternation's cause is a dropped write (the drafts differed between runs; a
+  draft difference reaches the output only through the carrier below): the draft layer
   wrote its latent rows through a view (`latent_cache[:, 0, :].index_copy_`), which the
   backend's in-place-to-out-of-place pass does not chain, so on device the verify rows
   were never stored, the draft iterations attended what the request's pages held before
   the step, and vLLM's two alternating block sets made consecutive identical requests
-  draft differently. Fixed in acbc5b0a (`model_fp8.py` `attend` / `_attend_requests`
-  write into the bank; pinned by `test/vllm_neuron/worker/test_glm5next_slot_residue.py`).
-  Run-to-run identity and the eight identity prompts are re-measured on the fixed tree by the gate's SLOT 2 replay; `reports/gate_packet_mtpB.md` records the result. Each verify step is lossless by construction -- an accepted draft is the id
+  draft differently. Fixed by writing into the bank itself (`model_fp8.py` `attend` /
+  `_attend_requests`; pinned by `test/vllm_neuron/worker/test_glm5next_slot_residue.py`).
+  Each verify step is lossless by construction -- an accepted draft is the id
   the target's own argmax returned for that row -- so a divergence from the
   non-speculative run is the target's argmax picking differently where its top two
   logits are within rounding of each other; the likeliest carrier, under replay, is the
@@ -632,7 +634,7 @@ Contract of the opt-in (measured on trn2 at TP64/EP16, `k = 3`, 2026-10-09):
   (in the dense regime the MLA decode kernel routes one query row per request to its
   key-split kernel and `T` rows per request to the general kernel,
   `vllm_neuron/functional/attention/mla_decode.py::_route`; past the selector bound the
-  one-row path is `mla_sparse_attention`). The top-2 logit margin at a divergence cannot
+  one-row path is `mla_sparse_attention`, at batch size 1). The top-2 logit margin at a divergence cannot
   be read from a server that samples on device (its sampler returns ids only and refuses
   `logprobs`), so the margins are not measured. A server whose consumers need token
   identity with non-speculative greedy decoding should leave the drafter off.
