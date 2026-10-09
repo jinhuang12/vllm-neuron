@@ -7489,8 +7489,13 @@ class Glm5NextDSALayer(nn.Module):
         unchanged.
         """
 
-        def attention_half(single_stream: torch.Tensor) -> torch.Tensor:
-            normed = self._input_norm(single_stream)
+        def attention_half(
+            single_stream: torch.Tensor, normed: torch.Tensor | None = None
+        ) -> torch.Tensor:
+            # ``normed`` is the input norm the mHC site's fused kernel computed, or
+            # None: then the norm runs here.
+            if normed is None:
+                normed = self._input_norm(single_stream)
             if collector is not None:
                 # What the attention half was actually handed: the stream the
                 # hyper-connection site collapsed, and that stream normalised. The
@@ -7530,7 +7535,13 @@ class Glm5NextDSALayer(nn.Module):
         site = _mhc_attention_site(self, streams)
         if site is None:
             return hidden_states + attention_half(hidden_states)
-        return site.forward(streams, attention_half)
+        # The input norm's gain and epsilon go to the site, as the feed-forward site's
+        # do, so a fused mhc_pre computes the norm beside the collapse it reads.
+        return site.forward(
+            streams,
+            attention_half,
+            norm=(self.input_layernorm_weight, float(self.rms_norm_eps)),
+        )
 
 
 def _build_layer(
