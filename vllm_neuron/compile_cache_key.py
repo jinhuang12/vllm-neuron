@@ -51,10 +51,12 @@ every key that folds files fall back, wherever the file sits: a dynamic import
 rooted in another package outside :data:`NON_REGISTERING_DECORATOR_ROOTS`
 (``nki``, ``torch``, ``functools``, ``dataclasses``, ``typing``, ``abc``,
 ``contextlib``, ``enum``), which may register into that package. Not detected:
-a mutation inside a function the file calls (``mod.set_mode(1)``), a store
-through a function parameter (``def f(m): m.X = v``), ``unittest.mock``
-patching, a mutating-method name called directly on a module bound by
-``import`` (``nl.add`` is a kernel op, not a mutation), and ``exec`` / ``eval``.
+a mutation inside a function the file calls (``mod.set_mode(1)``) or of an
+object a call returns (``mod.get_table().append(x)``; ``torch.where(...).sort()``
+sorts a new tensor and patches nothing), a store through a function parameter
+(``def f(m): m.X = v``), ``unittest.mock`` patching, a mutating-method name
+called directly on a module bound by ``import`` (``nl.add`` is a kernel op, not
+a mutation), and ``exec`` / ``eval``.
 ``test_compile_cache_key_pergraph.py`` pins the patches the package makes today
 and the decorator allowlist, so a new one fails a test until it is reviewed.
 
@@ -667,17 +669,20 @@ def _decorator_root(expr: ast.expr) -> Optional[str]:
 def _mutated_object(expr: ast.expr) -> Optional[tuple[str, tuple[str, ...]]]:
     """``(base name, attribute path)`` of the object ``expr`` evaluates to.
 
-    The path stops at the first item or call (``a.b[0].c`` -> ``("a", ("b",))``),
-    so it names the module-level object the mutation goes through.
+    The path stops at the first item (``a.b[0].c`` -> ``("a", ("b",))``), so it
+    names the module-level object the mutation goes through. What a call returns
+    names nothing (``None``): ``torch.where(...).sort()`` sorts a new tensor, not
+    ``torch.where``; a call that hands out module state is the documented gap of
+    a mutation inside a called function.
     """
     attrs: list[str] = []
     while not isinstance(expr, ast.Name):
         if isinstance(expr, ast.Attribute):
             attrs.append(expr.attr)
             expr = expr.value
-        elif isinstance(expr, (ast.Subscript, ast.Call)):
+        elif isinstance(expr, ast.Subscript):
             attrs.clear()
-            expr = expr.value if isinstance(expr, ast.Subscript) else expr.func
+            expr = expr.value
         else:
             return None
     return expr.id, tuple(reversed(attrs))

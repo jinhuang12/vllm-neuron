@@ -665,13 +665,19 @@ def test_the_patch_scan_sees_each_mutation_form_and_nothing_else():
         "pq.add(1, 2)\n"  # a module function named like a mutator: a call, not a patch
         "u.pop()\n"
         "TABLE.copy()\n"  # not a mutating method
+        "pq.TABLES['k'].append(1)\n"  # a method on an item of a module attribute
+        "import w.x as wx\n"
+        "wx.where(1, 2, 3).sort(dim=1)\n"  # a method on what a call returns: a new value
+        "wx.make()[0] = 1\n"  # an item, an attribute of what a call returns
+        "wx.make().X = 1\n"
+        "setattr(wx.make(), 'Y', 1)\n"
     )
 
     patched = ck._parse_imports("functional/x.py", source.encode()).patched
 
     assert set(patched) == {
         "a.b", "c.d", "e.f", "g.h.tbl", "i.j.cfg", "k.m",
-        "p.q.REGISTRY", "r.TABLE", "s.t.u.v",
+        "p.q.REGISTRY", "r.TABLE", "s.t.u.v", "p.q.TABLES",
     }
 
 
