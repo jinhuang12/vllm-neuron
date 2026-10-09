@@ -2322,47 +2322,25 @@ class Glm5NextSharedExperts(nn.Module):
         Raises:
             Glm5NextSharedExpertRouteError: if an operand is missing or a weight
                 is not 2-D. The grid's own agreement with the weight extents is
-                checked by ``to_kernel_scale_layout`` below rather than here, so
-                there is one authority for it and not two that can drift.
+                checked by ``to_kernel_scale_layout`` rather than here, so there
+                is one authority for it and not two that can drift.
 
         The extents come from the weights and not from the grid's own shape:
         deriving them from the grid would make this method unable to detect a
         transposed grid, because the kernel's replacement check pins only the
         element count.
-        """
-        from vllm_neuron.functional.blockwise_fp8_mm import to_kernel_scale_layout
 
-        prepared: dict[str, torch.Tensor] = {}
-        for name, weight, scale in (
-            ("gate_proj", gate_proj_weight, gate_proj_scale),
-            ("up_proj", up_proj_weight, up_proj_scale),
-            ("down_proj", down_proj_weight, down_proj_scale),
-        ):
-            if weight is None or scale is None:
-                raise Glm5NextSharedExpertRouteError(
-                    f"prepare_scale_operands needs both {name}_weight and "
-                    f"{name}_scale; load the checkpoint before preparing the "
-                    f"scale operands"
-                )
-            if weight.dim() != 2:
-                raise Glm5NextSharedExpertRouteError(
-                    f"{name}_weight must be 2-D to give the scale operand its "
-                    f"extents, got shape {tuple(weight.shape)}"
-                )
-            rows, cols = int(weight.shape[0]), int(weight.shape[1])
-            # The producer runs on a host copy and its result moves back once, the
-            # same rule the routed bank's prep follows. ``to_kernel_scale_layout``
-            # broadcasts the flat grid across the partition axis with
-            # ``expand(...).contiguous()``, and the Neuron backend has no strided
-            # copy to make that dense, so on a device-resident grid it raises
-            # ``Expected self.is_contiguous() to be true, but got false``. Nothing
-            # about the operand changes: the grid check it performs is on shapes,
-            # which the copy preserves.
-            (host_scale,) = _on_the_host(scale)
-            (operand,) = _on_the_device(
-                scale.device, to_kernel_scale_layout(host_scale, rows, cols)
-            )
-            prepared[name] = operand
+        The body is :func:`_build_scale_operands`, which the dense MLP's prep
+        shares.
+        """
+        prepared = _build_scale_operands(
+            Glm5NextSharedExpertRouteError,
+            (
+                ("gate_proj", gate_proj_weight, gate_proj_scale),
+                ("up_proj", up_proj_weight, up_proj_scale),
+                ("down_proj", down_proj_weight, down_proj_scale),
+            ),
+        )
         setattr(self, self.PREPARED_SCALE_OPERANDS_ATTR, prepared)
         return len(prepared)
 
@@ -2902,6 +2880,19 @@ class Glm5NextDenseMLP(nn.Module):
     #: finds a record knows which module wrote it.
     DENSE_RETILE_HEALTH_ATTR = "_dense_mlp_retile_health"
 
+    #: Where :meth:`prepare_scale_operands` leaves its three operands, under the
+    #: name the shared expert uses for the same three.
+    PREPARED_SCALE_OPERANDS_ATTR = "_prepared_scale_operands"
+
+    #: The projections with a kernel scale operand, in the order
+    #: ``blockwise_fp8_mlp`` takes them.
+    SCALE_OPERAND_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
+
+    #: Nothing: :meth:`forward` still reads the weights and the public grids (the
+    #: small-M decode kernel takes the grids directly), so the load releases no
+    #: tensor of this class.
+    RELEASED_AFTER_PREP: tuple[str, ...] = ()
+
     def retile_checkpoint_scale_grids(self) -> int:
         """Publish this module's grids at the kernel's granularity and set the frame.
 
@@ -2932,17 +2923,87 @@ class Glm5NextDenseMLP(nn.Module):
             self, Glm5NextDenseMLPRouteError, self.DENSE_RETILE_HEALTH_ATTR
         )
 
+    def prepare_scale_operands(
+        self,
+        gate_proj_weight: torch.Tensor,
+        up_proj_weight: torch.Tensor,
+        down_proj_weight: torch.Tensor,
+        gate_proj_scale: torch.Tensor,
+        up_proj_scale: torch.Tensor,
+        down_proj_scale: torch.Tensor,
+    ) -> int:
+        """Build the three kernel scale operands once. Returns how many.
+
+        Without them each whole-tile prefill :meth:`forward` would build every
+        operand from its grid inside the traced graph, one scalar write per
+        ``128`` block: 192 writes per call at the served geometry. The grids
+        never change after a load, so the operands are built here, once, by the
+        shared expert's own builder, :func:`_build_scale_operands`; their bytes
+        are those of the per-call build. ``_run_load_time_preps`` enrols this
+        method by ``hasattr`` and passes the operands by keyword, after
+        :meth:`retile_checkpoint_scale_grids` has put them in the frame
+        :meth:`forward` consumes. Only the whole-tile route reads them: a short
+        step's small-M kernel reads the public grids.
+
+        Args:
+            gate_proj_weight: ``[H, I]`` fp8-e4m3. Read for its extents only.
+            up_proj_weight: ``[H, I]`` fp8-e4m3.
+            down_proj_weight: ``[I, H]`` fp8-e4m3.
+            gate_proj_scale: ``[H//128, I//128]`` fp32, the published grid.
+            up_proj_scale: the same, for ``up_proj_weight``.
+            down_proj_scale: ``[I//128, H//128]`` fp32, for ``down_proj_weight``.
+
+        Returns:
+            How many operands were built: ``3``, or ``0`` on a miniature whose
+            extents are not whole ``128`` blocks. Such a module has no kernel
+            operand to build -- :meth:`retile_checkpoint_scale_grids` leaves it as
+            loaded and ``blockwise_fp8_mm`` refuses its whole-tile geometry -- so
+            nothing is stored and only a short step can run it.
+
+        Raises:
+            Glm5NextDenseMLPRouteError: if an operand is missing or a weight is
+                not 2-D.
+        """
+        from vllm_neuron.functional.blockwise_fp8_mm import SCALE_BLOCK_SIZE
+
+        projections = tuple(
+            zip(
+                self.SCALE_OPERAND_PROJECTIONS,
+                (gate_proj_weight, up_proj_weight, down_proj_weight),
+                (gate_proj_scale, up_proj_scale, down_proj_scale),
+            )
+        )
+        if any(
+            weight is not None
+            and weight.dim() == 2
+            and any(int(extent) % SCALE_BLOCK_SIZE for extent in weight.shape)
+            for _, weight, _ in projections
+        ):
+            return 0
+        prepared = _build_scale_operands(Glm5NextDenseMLPRouteError, projections)
+        setattr(self, self.PREPARED_SCALE_OPERANDS_ATTR, prepared)
+        return len(prepared)
+
+    def _prebuilt_scale_operands(self) -> tuple[torch.Tensor, ...] | None:
+        """The operands :meth:`prepare_scale_operands` built, or ``None``.
+
+        ``None`` when it stored none: a module bound without the load path (a
+        fixture that sets the weights itself) or a miniature whose extents are
+        not whole ``128`` blocks. ``blockwise_fp8_mm`` then builds each operand
+        inside the call, as it did before this prep existed, and counts each
+        build it traces
+        (:func:`~vllm_neuron.functional.blockwise_fp8_mm.scale_layout_builds`),
+        so a load that skipped the prep reads non-zero there.
+        """
+        prepared = getattr(self, self.PREPARED_SCALE_OPERANDS_ATTR, None)
+        if not prepared:
+            return None
+        return tuple(prepared[name] for name in self.SCALE_OPERAND_PROJECTIONS)
+
     # The shared expert's ``shared_expert_mm`` is the same arithmetic on the same
     # kernel, and it is not called from here because it reads that class's prepared
-    # scale operands off ``self`` and this class has no prep. Reaching into it
-    # would either move that method or bind this forward to another module's
-    # instance state.
-    #
-    # ``blockwise_fp8_mm``'s ``prebuilt_scale_t`` is optional and keyword-only, so
-    # omitting it makes the call behave exactly as it did before the load-time prep
-    # existed. ``_run_load_time_preps`` reaches a prep through
-    # ``hasattr(type(module), "prepare_scale_operands")``, a per-class opt-in this
-    # class does not take: adding it would change what the load path does.
+    # scale operands off ``self``. Reaching into it would either move that method or
+    # bind this forward to another module's instance state.
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -3068,8 +3129,13 @@ class Glm5NextDenseMLP(nn.Module):
 
         # ---- One fused call: gate, up, the checkpoint's clamps (gate above only,
         # up on both sides), SwiGLU, the bf16 cast and down. ``1 <= T < 128`` runs
-        # one small-M NKI kernel; whole-tile prefill keeps the three
-        # ``blockwise_fp8_mm`` calls. The slice back is the last thing that happens.
+        # one small-M NKI kernel on the public grids, and passes nothing else, as
+        # it did before the load-time prep existed; whole-tile prefill keeps the
+        # three ``blockwise_fp8_mm`` calls, which take the prebuilt operands. The
+        # slice back is the last thing that happens.
+        prebuilt_scale_t = None
+        if int(hidden_states.shape[0]) >= TILE_SIZE:
+            prebuilt_scale_t = self._prebuilt_scale_operands()
         return _unpad_rows(
             blockwise_fp8_mlp(
                 hidden_states,
@@ -3080,6 +3146,7 @@ class Glm5NextDenseMLP(nn.Module):
                 scale_grid("up_proj_weight"),
                 scale_grid("down_proj_weight"),
                 swiglu_limit=self.swiglu_limit,
+                prebuilt_scale_t=prebuilt_scale_t,
             ),
             tokens,
         )
@@ -8256,6 +8323,59 @@ def _publish_compute_frame_operands(
     # whole 128-wide block but not a whole 256-wide one -- 384, for one -- now counts
     # instead of being skipped.
     return published
+
+
+def _build_scale_operands(
+    error_cls: type[ValueError],
+    projections: tuple[tuple[str, torch.Tensor | None, torch.Tensor | None], ...],
+) -> dict[str, torch.Tensor]:
+    """The kernel scale operand of each ``(name, weight, grid)``, keyed by name.
+
+    One definition for the dense MLP and the shared expert, whose
+    ``prepare_scale_operands`` build the operands of the same three projections
+    for the same kernel. Each operand is
+    :func:`~vllm_neuron.functional.blockwise_fp8_mm.to_kernel_scale_layout` of the
+    projection's public grid, the operand ``blockwise_fp8_mm`` builds on every call
+    when it is given none; built here, once, its bytes are the same.
+
+    Every operand is built before any is returned, so a refusal leaves the caller
+    nothing half-built to store.
+
+    Raises:
+        error_cls: if a weight or grid is missing, or a weight is not 2-D. The
+            grid's agreement with the weight extents is checked by
+            ``to_kernel_scale_layout``, which takes the extents from the weight.
+    """
+    from vllm_neuron.functional.blockwise_fp8_mm import to_kernel_scale_layout
+
+    prepared: dict[str, torch.Tensor] = {}
+    for name, weight, scale in projections:
+        if weight is None or scale is None:
+            raise error_cls(
+                f"prepare_scale_operands needs both {name}_weight and "
+                f"{name}_scale; load the checkpoint before preparing the "
+                f"scale operands"
+            )
+        if weight.dim() != 2:
+            raise error_cls(
+                f"{name}_weight must be 2-D to give the scale operand its "
+                f"extents, got shape {tuple(weight.shape)}"
+            )
+        rows, cols = int(weight.shape[0]), int(weight.shape[1])
+        # The producer runs on a host copy and its result moves back once, the
+        # same rule the routed bank's prep follows. ``to_kernel_scale_layout``
+        # broadcasts the flat grid across the partition axis with
+        # ``expand(...).contiguous()``, and the Neuron backend has no strided
+        # copy to make that dense, so on a device-resident grid it raises
+        # ``Expected self.is_contiguous() to be true, but got false``. Nothing
+        # about the operand changes: the grid check it performs is on shapes,
+        # which the copy preserves.
+        (host_scale,) = _on_the_host(scale)
+        (operand,) = _on_the_device(
+            scale.device, to_kernel_scale_layout(host_scale, rows, cols)
+        )
+        prepared[name] = operand
+    return prepared
 
 
 # ---------------------------------------------------------------------------
