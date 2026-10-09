@@ -88,9 +88,9 @@ if TYPE_CHECKING:
     # records (JSONL, rank 0). Empty = no log, no scoring.
     VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG: str = ""
     # Worker GC policy after warmup (vllm_neuron/vllm/worker/gc_policy.py):
-    # "off" (CPython's GC), "rare_gen2" (gen-2 threshold 100000, no freeze),
+    # "rare_gen2" (gen-2 threshold 100000, no freeze), "off" (CPython's GC),
     # "freeze_rare_gen2" (freeze + gen-2 threshold 100000), or "freeze".
-    VLLM_NEURON_GC_POLICY: str = "off"
+    VLLM_NEURON_GC_POLICY: str = "rare_gen2"
     # GLM-5.3-Flash row-parallel all-reduce. Both defaults are the as-built path.
     # The dtype a row-parallel partial crosses the wire in: "fp32" or "bf16".
     VLLM_NEURON_TP_ALLREDUCE_DTYPE: str = "fp32"
@@ -460,13 +460,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG": lambda: (
         os.getenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG", "") or ""
     ),
-    # GC policy each worker applies once after warmup. "off" (the default) keeps
-    # CPython's default GC: the freezing policies made every bs=1 decode step slower
-    # on TP=64 (gc_policy.py). "rare_gen2" raises only the gen-2 threshold, so bs=64
-    # decode has no full-pass stalls, and neither collects nor freezes;
+    # GC policy each worker applies once after warmup. "rare_gen2" (the default)
+    # raises only the gen-2 threshold, so bs=64 decode has no full-pass stalls, and
+    # neither collects nor freezes: the freezing policies made every bs=1 decode step
+    # slower on TP=64 (gc_policy.py). "off" keeps CPython's default GC;
     # "freeze_rare_gen2" freezes, then raises, at that bs=1 cost; "freeze" is the
     # freeze alone. Any other value is refused when the policy is applied.
-    "VLLM_NEURON_GC_POLICY": lambda: os.getenv("VLLM_NEURON_GC_POLICY", "off"),
+    "VLLM_NEURON_GC_POLICY": lambda: os.getenv("VLLM_NEURON_GC_POLICY", "rare_gen2"),
     # ================== GLM-5.3-Flash Row-Parallel All-Reduce ==================
     # The wire dtype of the tensor-parallel all-reduce at GLM-5.3-Flash's
     # row-parallel sites (``model/glm5_next/collective_policy.py``). "fp32" (the

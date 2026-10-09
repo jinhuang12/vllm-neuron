@@ -32,9 +32,9 @@ Policies:
 * ``off``: CPython default GC, no freeze (0a08ff4).
 * ``freeze``: ``freeze_gc_heap()`` alone (e9aa679).
 * ``freeze_rare_gen2`` (a): freeze, then ``threshold2`` = ``GEN2_THRESHOLD``
-  (the worker default before ``off``).
+  (an earlier worker default).
 * ``rare_gen2``: ``threshold2`` = ``GEN2_THRESHOLD``, no collection and no freeze
-  (:data:`CHOSEN_POLICY`; the worker default is ``off``, see ``gc_policy.py``).
+  (the worker default, :data:`CHOSEN_POLICY`).
 * ``b_disable_safe_point`` (b): freeze, ``gc.disable()``, then ``gc.collect(1)`` every
   16 steps and ``gc.collect(2)`` every 4096 steps, at the step boundary.
 * ``c_periodic_refreeze`` (c): freeze, then ``gc.collect(); gc.freeze()`` every 1000
@@ -67,8 +67,7 @@ from pathlib import Path
 
 #: The policy this harness recommends for bs=64 (no full-pass stalls, no freeze).
 #: ``test_gc_policy.py`` asserts that it is a worker policy run through the worker's
-#: code, so the two cannot drift apart. The worker default is ``off`` until this
-#: policy passes its bs=1 measurement on the TP=64 server (``gc_policy.py``).
+#: code, so the two cannot drift apart. It is the worker default (``gc_policy.py``).
 CHOSEN_POLICY = "rare_gen2"
 FREEZE_RARE_GEN2 = "freeze_rare_gen2"
 NO_FREEZE = "off"

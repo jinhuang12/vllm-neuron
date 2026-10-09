@@ -9,10 +9,9 @@ each, a decode stall). ``rare_gen2`` raises only ``threshold2``.
 
 It does not run vLLM's ``freeze_gc_heap()`` (a full collection, then ``gc.freeze()``)
 at the end of warmup: that one call slowed every later bs=1 decode step of the TP=64
-server, although a bs=1 step runs almost no collection. The default is ``off``
-(``test_gc_policy_default.py``) until ``rare_gen2`` passes its bs=1 measurement. The
-pin test below fails if ``rare_gen2`` or the default runs a collection or freezes
-anything again.
+server, although a bs=1 step runs almost no collection. ``rare_gen2`` is the default
+(``test_gc_policy_default.py``). The pin test below fails if ``rare_gen2`` or the
+default runs a collection or freezes anything again.
 
 Unit cases replace the freeze, ``gc.set_threshold``, ``gc.disable`` and the vLLM
 GC-debug hook with recorders: the real calls would change the pytest process. The pin
@@ -138,7 +137,7 @@ def test_rare_gen2_and_the_default_collect_nothing_and_freeze_nothing(monkeypatc
 
 
 def test_freeze_rare_gen2_policy_freezes_then_raises_the_gen2_threshold(calls, monkeypatch):
-    """``freeze_rare_gen2`` (the default before ``off``), for A/B runs."""
+    """``freeze_rare_gen2`` (an earlier default), for A/B runs."""
     monkeypatch.setenv(ENV, "freeze_rare_gen2")
     t0, t1 = _young_thresholds()
 

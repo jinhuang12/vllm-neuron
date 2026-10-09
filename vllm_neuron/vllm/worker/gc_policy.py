@@ -17,8 +17,8 @@ pass: ~11 per rank per 120 bs=64 steps, 3-12 ms each, on a different rank each s
 On 64 lock-stepped ranks that is a late rank on most steps. In the TP=64 A/B the
 5,248 worker full passes after the freeze collected 0 objects in total.
 
-Why the default is ``off``
---------------------------
+Why the default raises one threshold and freezes nothing
+--------------------------------------------------------
 On the TP=64 server, ``freeze_rare_gen2`` made every bs=1 decode step slower,
 although no collection ran during decode. bs=1 ITL in ms, at the first point after
 startup (then two quiet points ~2.5 and ~17 min later), and the all-rank start
@@ -29,43 +29,37 @@ barrier of a captured step, which is where the time went (device compute was
   20.3-21.5), barrier 5.6-10.3;
 * ``off`` on such a tree (1 launch): 20.1 (20.0 / 20.2), barrier 5.0;
 * that tree with the policy's code removed (1 launch): 19.6 (19.6 / 18.7), barrier
-  1.95.
+  1.95;
+* ``rare_gen2`` on such a tree (1 launch): 19.3 (18.5 / 18.7), barrier 1.3.
 
-With ``off`` the first two points came back; the late point and the barrier stayed
-at the level of the launches with the policy. At runtime ``off`` is the same as the
-code removed: the code that stays imports this module (about 90 GC-tracked objects,
-once), reads the knob and logs one line. It changes no threshold, freezes nothing,
-attaches no callback, and adds no barrier or warmup step. So what separates those two
-launches comes from the launch or the host, not from this code. The cost of the
-policy also depends on the host: on a second server of the same type, the tree with
-``freeze_rare_gen2`` on served bs=1 at 19.3 ms (18.9 ms later), the level of the run
-without the code.
-
-The freeze alone (``freeze``) was rejected earlier for a bs=1 cost of the same kind
-(+1.4 ms per step, barrier 0.04 -> 3.05 ms). So the default keeps CPython's GC until
-a policy that removes the bs=64 stalls passes its own bs=1 measurement. The trade:
-with ``off``, bs=64 decode has its full-pass stalls again (3.8-6 s each, several per
-120 steps); ``VLLM_NEURON_GC_POLICY=freeze_rare_gen2`` removes them and has the bs=1
-cost above; ``rare_gen2`` removes them without the freeze.
-
-``rare_gen2``: raise one threshold, freeze nothing
---------------------------------------------------
-``rare_gen2`` sets only ``threshold2`` to :data:`GEN2_THRESHOLD`. A full pass then
-needs that many gen-1 passes: about one per 100 k bs=64 steps (4-6 h of continuous
-bs=64 decode), none in practice at bs=1. Gen-0/1 thresholds do not change, so those
-passes still collect the per-step cyclic garbage. It does not call
+The default, ``rare_gen2``, sets only ``threshold2`` to :data:`GEN2_THRESHOLD`. A
+full pass then needs that many gen-1 passes: about one per 100 k bs=64 steps (4-6 h
+of continuous bs=64 decode), none in practice at bs=1. Gen-0/1 thresholds do not
+change, so those passes still collect the per-step cyclic garbage. It does not call
 ``freeze_gc_heap()``, the one call at the end of warmup that the bs=1 cost above
 follows: at bs=1 a worker ran ~20 gen-0 passes and one gen-1 pass in a whole launch
 (``VLLM_GC_DEBUG``), and on CPU (``test/perf/gc_step_cost.py``) a decode step makes
 the same collections, callbacks and host calls with and without the call. A freeze
 only shortens full passes, and with ``threshold2`` raised there are none to shorten.
+
+The cost of the freeze depends on the host: on a second server of the same type,
+the tree with ``freeze_rare_gen2`` on served bs=1 at 19.3 ms (18.9 ms later). The
+spread between launches without the freeze (barrier 1.3-5.0 ms) comes from the
+launch or the host, not from this code: ``off`` imports this module, reads the knob
+and logs one line, and changes no GC state. The freeze alone (``freeze``) was
+rejected earlier for a bs=1 cost of the same kind (+1.4 ms per step, barrier
+0.04 -> 3.05 ms).
+
 The trade: the first full pass, after :data:`GEN2_THRESHOLD` gen-1 passes, scans the
-whole heap (seconds), where a frozen heap leaves it the unfrozen objects only.
+whole heap (seconds), where a frozen heap leaves it the unfrozen objects only. With
+``off``, bs=64 decode has its full-pass stalls again (3.8-6 s each, several per 120
+steps).
 
 Policies (``VLLM_NEURON_GC_POLICY``)
 ------------------------------------
-* ``off`` (default): CPython's default GC, nothing changed.
-* ``rare_gen2``: ``threshold2`` = :data:`GEN2_THRESHOLD`, no collection, no freeze.
+* ``rare_gen2`` (default): ``threshold2`` = :data:`GEN2_THRESHOLD`, no collection,
+  no freeze.
+* ``off``: CPython's default GC, nothing changed.
 * ``freeze_rare_gen2``: ``freeze_gc_heap()``, then ``threshold2`` raised, for A/B
   runs.
 * ``freeze``: ``freeze_gc_heap()`` alone (CPython thresholds kept), for A/B runs.
@@ -98,7 +92,7 @@ FREEZE_RARE_GEN2 = "freeze_rare_gen2"
 FREEZE_ONLY = "freeze"
 OFF = "off"
 POLICIES = (RARE_GEN2, FREEZE_RARE_GEN2, FREEZE_ONLY, OFF)
-DEFAULT_POLICY = OFF
+DEFAULT_POLICY = RARE_GEN2
 #: Policies that run ``freeze_gc_heap()`` (a full collection and a freeze).
 FREEZING_POLICIES = (FREEZE_RARE_GEN2, FREEZE_ONLY)
 #: Policies that raise ``threshold2`` to :data:`GEN2_THRESHOLD`.

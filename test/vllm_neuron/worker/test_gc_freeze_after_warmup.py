@@ -8,8 +8,8 @@ stall (DECODE_BREAKDOWN_v2.md 5.2). ``rare_gen2`` (``gc_policy.py``) raises the
 gen-2 threshold so those passes stop, and runs no collection and no freeze: vLLM's
 ``freeze_gc_heap()`` (``gc.collect(0/1/2)`` then ``gc.freeze()``), which vLLM's GPU
 worker calls at the end of its own ``compile_or_warm_up_model``, slowed every later
-bs=1 decode step on TP=64. ``VLLM_NEURON_GC_POLICY`` selects ``off`` (default,
-CPython default GC), ``rare_gen2``, ``freeze_rare_gen2`` (freeze, then raise) or
+bs=1 decode step on TP=64. ``VLLM_NEURON_GC_POLICY`` selects ``rare_gen2``
+(default), ``off`` (CPython default GC), ``freeze_rare_gen2`` (freeze, then raise) or
 ``freeze`` (freeze alone). The ordering cases run ``rare_gen2``; the default is
 pinned on every serving path below and in ``test_gc_policy_default.py``.
 
@@ -197,16 +197,31 @@ def test_cpu_eager_mode_applies_the_gc_policy_once_and_skips_warmup(events):
     assert events == RARE_GEN2_GC
 
 
-@pytest.mark.parametrize("value", ["off", None], ids=["off", "unset-default"])
 @pytest.mark.parametrize("path", ["main", "synthetic", "cpu-eager"])
-def test_off_and_the_default_keep_cpython_default_gc_on_every_serving_path(
-    events, monkeypatch, path, value
+def test_the_default_raises_gen2_without_a_freeze_on_every_serving_path(
+    events, monkeypatch, path
 ):
-    """``off``, also the default: no freeze, no threshold change, gc stays on."""
-    if value is None:
-        monkeypatch.delenv(POLICY_ENV)
-    else:
-        monkeypatch.setenv(POLICY_ENV, value)
+    """Knob unset: ``rare_gen2`` on every serving path, no freeze."""
+    monkeypatch.delenv(POLICY_ENV)
+    worker = _worker(
+        events,
+        model=_synthetic_model() if path == "synthetic" else None,
+        enforce_eager=path == "cpu-eager",
+    )
+
+    NeuronWorker.compile_or_warm_up_model(worker)
+
+    assert [e for e in events if e in GC_CALLS or e.startswith(("set_", "gc_"))] == (
+        RARE_GEN2_GC
+    )
+
+
+@pytest.mark.parametrize("path", ["main", "synthetic", "cpu-eager"])
+def test_kill_switch_keeps_cpython_default_gc_on_every_serving_path(
+    events, monkeypatch, path
+):
+    """``VLLM_NEURON_GC_POLICY=off``: no freeze, no threshold change, gc stays on."""
+    monkeypatch.setenv(POLICY_ENV, "off")
     worker = _worker(
         events,
         model=_synthetic_model() if path == "synthetic" else None,
@@ -220,7 +235,7 @@ def test_off_and_the_default_keep_cpython_default_gc_on_every_serving_path(
 
 
 def test_freeze_rare_gen2_policy_freezes_then_raises_once(events, monkeypatch):
-    """``VLLM_NEURON_GC_POLICY=freeze_rare_gen2``: the default before ``off``, for A/B runs."""
+    """``VLLM_NEURON_GC_POLICY=freeze_rare_gen2``: an earlier default, for A/B runs."""
     monkeypatch.setenv(POLICY_ENV, "freeze_rare_gen2")
 
     NeuronWorker.compile_or_warm_up_model(_worker(events))
