@@ -31,6 +31,7 @@ import nki.language as nl
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 from nkilib.core.utils.kernel_assert import kernel_assert
 
+from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 logger = logging.getLogger(__name__)
@@ -479,9 +480,7 @@ _LOWP_WEIGHT_DTYPES = (torch.float8_e4m3fn, torch.bfloat16)
 
 def _lowp_programs(odim: int, scaled: bool) -> int:
     """2 on an LNC2 core when the output columns split into whole scale blocks."""
-    import os
-
-    if os.environ.get("NEURON_LOGICAL_NC_CONFIG") != "2":
+    if not lnc_pair():
         return 1
     unit = 2 * (LOWP_SCALE_BLOCK if scaled else 1)
     return 2 if odim % unit == 0 else 1
