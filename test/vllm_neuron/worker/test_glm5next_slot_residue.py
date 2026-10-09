@@ -1,29 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Stage B's cross-request residue: the draft layer's latent rows a verify step writes.
+"""The draft layer's latent rows a verify step writes persist across requests.
 
-On one Stage B server (MTP draft, ``k = 3``) the same greedy prompt alternated between
-two or three outputs over consecutive ``bs=1`` requests (gate run stage-b-replay-D);
-the standard arm of the same server did not. The state that survived a request was not
-a request slot's: it was the draft layer's (layer 45's) paged ``latent_cache``. A
-verify step writes that bank ``1 + k`` times in one graph (``populate`` at the
-``T = 1 + k`` verify rows, then one row per draft iteration). Written through a view
-(``latent_cache[:, 0, :].index_copy_``), the backend's ``InPlaceToOutOfPlacePass``
-moved only the later uses of that view onto each write's result, so no later view saw
-a write and only the last write reached the aliased output the runtime copies back:
-the ``T`` verify rows were lost, the draft iterations attended what the request's pages
-held before the step, and one draft row was stored. vLLM's need-sized pool hands
-consecutive ``bs=1`` requests alternating block sets, each holding its own leftovers,
-so each set settled on its own drafts. The trunk's layers write their banks once per
-graph, so the last write was the only one and they kept it.
+With MTP drafting (``k = 3``), the output for identical greedy prompts alternated
+between two classes over consecutive ``bs=1`` requests; without a draft head it did
+not. The state that survived a request was not a request slot's: it was the draft
+layer's (layer 45's) paged ``latent_cache``. A verify step writes that bank ``1 + k``
+times in one graph (``populate`` at the ``T = 1 + k`` verify rows, then one row per
+draft iteration). Written through a view (``latent_cache[:, 0, :].index_copy_``), the
+backend's in-place to out-of-place lowering (``InPlaceToOutOfPlacePass``) moved only
+the later uses of that view onto each write's result, so no later view saw a write
+and only the last write reached the aliased output the runtime copies back: the
+accepted rows' latents did not persist, the draft iterations attended what the
+request's pages held before the step, and one draft row was stored. vLLM's
+need-sized pool hands consecutive ``bs=1`` requests alternating block sets, each
+holding its own leftovers, so each set settled on its own drafts. The trunk's layers
+write their banks once per graph, so the last write was the only one and they kept it.
 
 Every test here runs the graph the way the device does: the step is traced with
 Dynamo as one graph, the backend's default pass list (``get_default_pass_manager``)
 rewrites it, the rewritten graph runs on CPU and each aliased output (``io_map``) is
 copied onto its input.
 
-1. One decode step keeps every bank the eager step writes: at ``k = 0`` (no draft head:
-   the standard arm), and at ``k = 1`` and ``k = 3`` the draft layer's ``latent_cache``
-   too.
+1. One decode step keeps every bank the eager step writes: at ``k = 0`` (no draft
+   head), and at ``k = 1`` and ``k = 3`` the draft layer's ``latent_cache`` too.
 2. Two identical drafted requests, one after another on the two block sets vLLM
    alternates between, the second set holding another request's leftovers: the same
    ids, the same drafts, the same draft-layer and trunk rows at the positions they
@@ -425,8 +424,8 @@ def _slot_lines(caplog) -> list[str]:
 
 @pytest.mark.fast
 def test_handing_out_and_releasing_a_slot_each_log_one_info_line(caplog):
-    """Which slot a request held is the first fact a residue investigation needs, and the
-    served tree logged none (stage-b-replay-D: 0 slot lines)."""
+    """Which slot a request held is the first fact a cross-request residue investigation
+    needs, and before this line the server logged no slot ids."""
     runner, banks = _runner(), _banks()
     with caplog.at_level(logging.INFO, logger=RUNNER_LOGGER):
         assert runner._glm5next_request_slots(banks, ["req-a"], synthetic=False) == [0]
