@@ -215,7 +215,8 @@ DEFAULT_DEVICE_GRAPH_RESERVE_GIB = 5.0
 #: (``test/hardware/benchmark_glue_block.py``) measured a win. It runs one
 #: GLM-5.3-Flash KDA + MoE layer per graph at one TP=64 rank's shapes on trn2, and
 #: compares each value with ``0``; ``reports/glue.md`` (round 2, the in-graph A/B
-#: section) and ``reports/glue-c.md`` have the tables. Per layer:
+#: section), ``reports/glue-c.md`` and ``reports/glue_spec_2048.md`` have the tables.
+#: Per layer:
 #:
 #: * ``mhc_pre:prefill@128`` and ``mhc_pre:prefill@1024``: the fused mHC pre-mix and
 #:   collapse at both mHC sites, with the feed-forward RMSNorm at the feed-forward
@@ -226,6 +227,10 @@ DEFAULT_DEVICE_GRAPH_RESERVE_GIB = 5.0
 #:   45.2 us faster at 128 rows and 275.0 us faster on a 16.0 ms 1024-row layer, but
 #:   197.1 us slower on a 9.07 ms 512-row layer. So the default names the measured
 #:   buckets, not a range, and a row count that was not measured keeps the torch route.
+#: * ``mhc_pre:prefill@2048`` and ``mhc_post:prefill@2048``: both kernels at the
+#:   2048-row chunk of the uncapped prefill line, measured together (at ab4f37f, not
+#:   each alone): 995.5 us faster on a 9.80 ms 2048-row layer, faster in each of 5
+#:   rounds by 989 to 1003 us.
 #:
 #: Two loads of one graph have measured up to 11 us apart, so a gain of 11 us or less
 #: is not a win. kda_projections was 7.1 us faster at 128 rows, and 0.3 us slower when
@@ -239,7 +244,8 @@ DEFAULT_DEVICE_GRAPH_RESERVE_GIB = 5.0
 #: ``python test/hardware/benchmark_glue_block.py --output <json> --cases
 #: kda:prefill:<rows> --variants off aa=0 <kernel> default``.
 DEFAULT_GLUE_FUSED_SPEC = (
-    "mhc_pre:prefill@128,mhc_pre:prefill@1024,mhc_post:prefill@128,mhc_post:prefill@1024")
+    "mhc_pre:prefill@128,mhc_pre:prefill@1024,mhc_pre:prefill@2048,"
+    "mhc_post:prefill@128,mhc_post:prefill@1024,mhc_post:prefill@2048")
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
