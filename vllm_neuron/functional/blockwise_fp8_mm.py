@@ -283,6 +283,11 @@ MLP_PREFILL_CHUNK = _PSUM_BANK_FP32
 MLP_PREFILL_MAX_KB = 32
 MLP_PREFILL_MAX_INTERMEDIATE = 256
 
+#: The weight dtype the prefill kernel takes: it multiplies the weights as
+#: stored, against bf16 ``x``. The three-call route casts any weight to bf16
+#: on the DMA, so weights of another dtype keep that route.
+MLP_PREFILL_WEIGHT_DTYPE = torch.float8_e4m3fn
+
 # DMA modes, from the slice profiles. The default (software DGE) generates
 # descriptors on GpSimd at ~0.65 us per DMA and starts packets 2-3 us after
 # issue. The weights go through the Sync engine's hardware DGE ring (narrow
@@ -1722,11 +1727,12 @@ def blockwise_fp8_mlp(
     Route, with the NKI route available: ``1 <= M < 128`` runs one
     :func:`blockwise_fp8_mlp_small_m_kernel` call and never pads tokens, on the
     launch grid :func:`mlp_launch_grid` picks (both cores of an LNC2 core).
-    Whole-tile prefill runs one :func:`blockwise_fp8_mlp_prefill_kernel` call
-    on the grid :func:`mlp_prefill_launch_grid` picks. Any other geometry
-    (``I`` above the kernels' limits, ``H // 128 > MLP_PREFILL_MAX_KB``), or no
-    NKI route, runs the three :func:`blockwise_fp8_mm` calls, the only
-    consumer of ``prebuilt_scale_t``.
+    Whole-tile prefill on :data:`MLP_PREFILL_WEIGHT_DTYPE` weights runs one
+    :func:`blockwise_fp8_mlp_prefill_kernel` call on the grid
+    :func:`mlp_prefill_launch_grid` picks. Any other geometry (``I`` above the
+    kernels' limits, ``H // 128 > MLP_PREFILL_MAX_KB``), whole-tile weights of
+    another dtype, or no NKI route, runs the three :func:`blockwise_fp8_mm`
+    calls, the only consumer of ``prebuilt_scale_t``.
     """
     from torch.nn.functional import silu
 
@@ -1750,7 +1756,12 @@ def blockwise_fp8_mlp(
             down_scale=down_scale,
             swiglu_limit=float(swiglu_limit),
         )
-    if nki and prefill_mlp_admissible(tokens, hidden, intermediate):
+    weights = (gate_weight, up_weight, down_weight)
+    if (
+        nki
+        and prefill_mlp_admissible(tokens, hidden, intermediate)
+        and all(w.dtype == MLP_PREFILL_WEIGHT_DTYPE for w in weights)
+    ):
         _count_mlp_fused()
         grid = mlp_prefill_launch_grid(tokens)
         _count_mlp_launch(grid[0] if grid else 1)
