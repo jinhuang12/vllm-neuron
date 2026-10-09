@@ -36,6 +36,16 @@ ROOFLINE (``docs/kernel_ledger.md`` section 3, ``reports/dcp_item4.md`` section 
 ``max(FLOPs / 79e12, bytes / 716e9, 2 us)``, FLOPs ``2 * CP * H * R * L`` (one multiply-add
 per partial element) and bytes the float32 partials and lses read once and the bf16 output
 written once. The bar is ``median <= 1.5 x roofline``; each case prints its ratio.
+
+LNC2 LOOP PARITY (``reports/dcp_item4.md`` section 14): no site of the merge kernel, or of
+the partial kernels that feed it, is exposed to the LNC2 hang class (the two cores of a pair
+running different run-time trip counts around a barrier). The merge has no run-time loop or
+branch: its loops are Python loops over trace-time ints (heads, the program's row tiles,
+latent chunks, ranks), and each program's contiguous share of the row tiles is fixed at
+trace time from ``program_id`` (at an odd tile count the first program takes one tile
+more). Its compiled programs hold no barrier and no branch instruction on either core at
+CP 2, 4 and 8, so neither core waits on the other. The script catches no exception: an
+execution error the runtime raises ends the run before the next case.
 """
 
 from __future__ import annotations
