@@ -4,8 +4,8 @@
 The contract (``vllm_neuron/functional/glue/__init__.py``):
 
 * ``0``: nothing fused, every site keeps 0a08ff4's torch route (the kill switch).
-* ``1`` or unset: ``envs.DEFAULT_GLUE_FUSED_SPEC``, the subset that won in-graph on the
-  device, at prefill only.
+* ``1`` or unset: ``envs.DEFAULT_GLUE_FUSED_SPEC``, the subset that won on the device: at
+  prefill, and mhc_pre at the speculative verify step.
 * ``all``: every kernel at every phase and row count (821274e's behaviour).
 * otherwise a comma list of ``kernel[:phase][@rows]`` rules.
 """
@@ -68,21 +68,23 @@ def test_default_is_neither_nothing_nor_everything():
 
 
 #: Row counts either side of every bound the default holds.
-DEFAULT_GRID = (1, 2, 8, 16, 32, 63, 64, 65, 127, 128, 129, 512, 1023, 1024, 1025, 2048)
+DEFAULT_GRID = (1, 2, 3, 4, 5, 8, 16, 32, 63, 64, 65, 127, 128, 129, 512, 1023, 1024, 1025,
+                2048)
 
 
-def test_default_is_the_measured_prefill_subset():
-    """``1`` is mhc_pre and mhc_post at 128- and 1024-row prefills, and nothing
-    else: the buckets where the device A/B measured a win
-    (``envs.DEFAULT_GLUE_FUSED_SPEC``'s docstring). A row count between or beyond them,
-    such as the 512 rows where mhc_post lost, keeps the torch route. The table is
-    written out, not derived, so a rule added to or removed from the default without
-    changing this table fails here."""
+def test_default_is_the_measured_prefill_subset_and_mhc_pre_at_verify():
+    """``1`` is mhc_pre and mhc_post at 128- and 1024-row prefills, and mhc_pre at every
+    verify step, and nothing else: where the device A/B measured a win
+    (``envs.DEFAULT_GLUE_FUSED_SPEC``'s docstring). A prefill row count between or
+    beyond them, such as the 512 rows where mhc_post lost, keeps the torch route. The
+    table is written out, not derived, so a rule added to or removed from the default
+    without changing this table fails here."""
     sel = glue.glue_selection("1")
     got = {(k, p, t) for k in KERNELS for p in glue.PHASES for t in DEFAULT_GRID
            if sel.selects(k, t, p)}
-    assert got == {("mhc_pre", "prefill", 128), ("mhc_pre", "prefill", 1024),
-                   ("mhc_post", "prefill", 128), ("mhc_post", "prefill", 1024)}
+    assert got == ({("mhc_pre", "prefill", 128), ("mhc_pre", "prefill", 1024),
+                    ("mhc_post", "prefill", 128), ("mhc_post", "prefill", 1024)}
+                   | {("mhc_pre", "verify", t) for t in DEFAULT_GRID})
 
 
 #: The measured prefill subset, written out: the route every prefill and decode call
@@ -91,6 +93,11 @@ PREFILL_DEFAULT = ("mhc_pre:prefill@128,mhc_pre:prefill@1024,mhc_post:prefill@12
                    "mhc_post:prefill@1024")
 #: The prefill subset and mhc_pre at every verify step.
 VERIFY_VALUE = PREFILL_DEFAULT + ",mhc_pre:verify"
+
+
+def test_one_is_the_prefill_subset_and_mhc_pre_at_verify():
+    """The default is the verify value: every test of that value holds for ``1``."""
+    assert glue.glue_selection("1") == glue.glue_selection(VERIFY_VALUE)
 
 
 def test_the_verify_rule_moves_no_prefill_or_decode_call():

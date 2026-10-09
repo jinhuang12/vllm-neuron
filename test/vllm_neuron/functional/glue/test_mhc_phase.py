@@ -173,6 +173,17 @@ def test_the_verify_step_takes_the_fused_mhc_pre(monkeypatch):
     assert _routes(site, cfg, 1, monkeypatch) == ((0, 1), torch.float32)
 
 
+def test_under_the_default_the_verify_step_takes_the_fused_mhc_pre(monkeypatch):
+    """The switch unset (``1``), bs=1 with 3 drafts: the 4-row verify call runs the fused
+    mhc_pre and the fp32 combine; the one-row draft call keeps the torch route."""
+    monkeypatch.delenv(glue.GLUE_FUSED_ENV, raising=False)
+    monkeypatch.delenv(mtp.SHADOW_DRAFT_ENV, raising=False)
+    with _speculative(3):
+        site, cfg = _site(_neuron_config(1))
+    assert _routes(site, cfg, 4, monkeypatch) == ((1, 0), torch.float32)
+    assert _routes(site, cfg, 1, monkeypatch) == ((0, 1), torch.float32)
+
+
 def test_a_draft_call_of_a_verify_row_count_takes_the_verify_route(monkeypatch):
     """k=1 at decode buckets [1, 2]: a 2-row call is one request's verify step or two
     requests' draft call; both take the fused mhc_pre."""

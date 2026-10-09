@@ -209,7 +209,8 @@ def maybe_measured_float(value: str | None) -> float | None:
 DEFAULT_DEVICE_GRAPH_RESERVE_GIB = 5.0
 
 #: What ``VLLM_NEURON_GLUE_FUSED=1``, and an unset switch, selects: each fused glue
-#: kernel at the prefill row buckets where it beat its torch route, and nothing else.
+#: kernel at the prefill row buckets where it beat its torch route, mhc_pre at the
+#: speculative verify step, and nothing else.
 #:
 #: The buckets are the ones where the in-graph device A/B
 #: (``test/hardware/benchmark_glue_block.py``) measured a win. It runs one
@@ -226,20 +227,33 @@ DEFAULT_DEVICE_GRAPH_RESERVE_GIB = 5.0
 #:   45.2 us faster at 128 rows and 275.0 us faster on a 16.0 ms 1024-row layer, but
 #:   197.1 us slower on a 9.07 ms 512-row layer. So the default names the measured
 #:   buckets, not a range, and a row count that was not measured keeps the torch route.
+#: * ``mhc_pre:verify``: the fused mHC pre-mix at the speculative verify step, whose
+#:   row counts the mHC sites derive from the speculative config: each decode bucket
+#:   times ``1 + k`` (``functional/glue``, ``verify_rows``). At 4 rows (bs=1, 3 drafts)
+#:   the torch route runs its dots as 2-row pieces, and at the MoE feed-forward site
+#:   the collapse that the router reads as a per-token loop: the feed-forward sites'
+#:   XLA before their consumer grows 2.54 ms over the one-token step
+#:   (``reports/mtpB_verify_cost.md``). On the served TP=64 line the kernel made the
+#:   bs=1, 3-draft verify step's device compute 24.24 ms, against 28.13 ms without it,
+#:   at the 2048-token context bucket (measured as ``mhc_pre:prefill@4`` on a tree that
+#:   called those 4 rows prefill; the 4096-token bucket's graph was not timed). A
+#:   server without speculation has no verify step, so its graphs are unchanged.
 #:
 #: Two loads of one graph have measured up to 11 us apart, so a gain of 11 us or less
 #: is not a win. kda_projections was 7.1 us faster at 128 rows, and 0.3 us slower when
 #: the layer's two reductions were chains of 4 and 8 all-reduces: inside that bound, so
 #: it is not in the default. kda_output was 24.1 us slower at 128 rows. No kernel is
-#: selected at decode: on the served TP=64 line, ``all`` made the bs=1 decode step
-#: 1.75 ms longer, while the single-rank benchmark (no tensor-parallel collectives)
-#: measured it shorter. So every decode graph under ``1`` is the graph ``0`` traces.
+#: selected at decode (one row per request): on the served TP=64 line, ``all`` made
+#: the bs=1 decode step 1.75 ms longer, while the single-rank benchmark (no
+#: tensor-parallel collectives) measured it shorter. So every decode graph under ``1``
+#: is the graph ``0`` traces; only a speculative server's verify graph differs.
 #:
 #: Measure a bucket before adding it, on a device lease, with
 #: ``python test/hardware/benchmark_glue_block.py --output <json> --cases
 #: kda:prefill:<rows> --variants off aa=0 <kernel> default``.
 DEFAULT_GLUE_FUSED_SPEC = (
-    "mhc_pre:prefill@128,mhc_pre:prefill@1024,mhc_post:prefill@128,mhc_post:prefill@1024")
+    "mhc_pre:prefill@128,mhc_pre:prefill@1024,mhc_post:prefill@128,mhc_post:prefill@1024,"
+    "mhc_pre:verify")
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
