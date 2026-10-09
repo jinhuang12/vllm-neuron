@@ -155,3 +155,34 @@ def test_the_need_grows_by_k_blocks_per_recurrent_group_per_request() -> None:
     assert worker._kv_cache_need_bytes() - plain == (
         K * _recurrent_groups(worker) * B64_SEQS * _page_size(worker) * layers_per_pool
     )
+
+
+def test_a_spec_class_the_need_cannot_price_is_refused_by_name(monkeypatch) -> None:
+    """The need prices an attention group at its pages and a recurrent group at
+    ``1 + num_speculative_blocks`` blocks per request. A KV spec of another class has no
+    place in that arithmetic; pricing it as attention would hand vLLM a pool it may not
+    fit, so the worker refuses it by the class's name instead of guessing."""
+    from vllm.v1 import kv_cache_interface as kvi
+    from vllm.v1.core import kv_cache_utils
+
+    class ForeignSpec(kvi.KVCacheSpec):
+        @property
+        def type_id(self) -> str:
+            return "foreign"
+
+        @property
+        def page_size_bytes(self) -> int:
+            return 131072
+
+        def max_memory_usage_bytes(self, vllm_config) -> int:
+            return self.page_size_bytes
+
+    worker = _worker(drafter=False, k=0, seqs=SEQS, length=LENGTH)
+    foreign = kvi.KVCacheGroupSpec(
+        layer_names=["layers.0.foreign"], kv_cache_spec=ForeignSpec(block_size=128)
+    )
+    monkeypatch.setattr(
+        kv_cache_utils, "get_kv_cache_groups", lambda *args, **kwargs: [foreign]
+    )
+    with pytest.raises(ValueError, match="ForeignSpec"):
+        worker._kv_cache_need_bytes()

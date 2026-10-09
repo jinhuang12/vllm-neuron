@@ -1349,7 +1349,11 @@ class NeuronWorker(WorkerBase):
         ``max_model_len`` tokens for each of ``max_num_seqs`` sequences, rounded
         up to whole blocks. Block size, page size and the group layout all come
         from the runner's own KV cache specs through vLLM's grouping, so a hybrid
-        recurrent/attention cache is measured the way it will be allocated.
+        recurrent/attention cache is measured the way it will be allocated. A
+        recurrent (``MambaSpec``) group of a speculative server is priced with its
+        ``num_speculative_blocks`` draft blocks per request, the blocks vLLM's own
+        admission check (``max_memory_usage_bytes``) counts; an attention group has
+        none. The need is never below that check's total over the real layers.
 
         Args:
             log: Log the need. Off where candidate points are priced
@@ -1358,13 +1362,18 @@ class NeuronWorker(WorkerBase):
         Returns:
             The bytes needed, or None when the model reports no cache to size,
             which leaves the memory heuristic to stand on its own.
+
+        Raises:
+            ValueError: A KV cache group's spec is neither an ``AttentionSpec``
+                nor a ``MambaSpec``; the pool has no pricing for it and refuses
+                it by class name rather than pricing it as attention.
         """
         from vllm.utils.math_utils import cdiv
         from vllm.v1.core.kv_cache_utils import (
             get_kv_cache_groups,
             get_uniform_page_size,
         )
-        from vllm.v1.kv_cache_interface import MambaSpec
+        from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
 
         kv_cache_spec = self.model_runner.get_kv_cache_spec()
         if not kv_cache_spec:
@@ -1392,17 +1401,27 @@ class NeuronWorker(WorkerBase):
         # Context parallelism would let a rank keep fewer tokens; no discount is
         # taken for it here. A recurrent group of a speculative server also holds
         # ``num_speculative_blocks`` extra blocks per request (one state row per
-        # draft token, ``MambaSpec.max_memory_usage_bytes``; the scheduler hands
-        # them out), so they are counted here as vLLM's admission check counts them.
-        blocks_per_request = sum(
-            cdiv(max_model_len, group.kv_cache_spec.block_size)
-            + (
-                int(group.kv_cache_spec.num_speculative_blocks)
-                if isinstance(group.kv_cache_spec, MambaSpec)
-                else 0
-            )
-            for group in groups
-        )
+        # draft token; ``MambaSpec.max_memory_usage_bytes`` prices ``1 +
+        # num_speculative_blocks`` blocks, and the scheduler hands them out), so
+        # they are counted here as vLLM's admission check counts them. An
+        # attention group carries no such row. A spec of any other class has no
+        # pricing here and is refused by name rather than priced as attention.
+        blocks_per_request = 0
+        for index, group in enumerate(groups):
+            spec = group.kv_cache_spec
+            if isinstance(spec, MambaSpec):
+                draft_blocks = int(spec.num_speculative_blocks)
+            elif isinstance(spec, AttentionSpec):
+                draft_blocks = 0
+            else:
+                raise ValueError(
+                    f"KV cache group {index} ({', '.join(group.layer_names) or 'padding'}) "
+                    f"is a {type(spec).__name__}: the need-sized KV pool prices "
+                    "attention groups (the sequence's pages) and MambaSpec groups "
+                    "(the sequence's pages plus one block per draft token) only, "
+                    "so this spec class needs its own pricing before it is served"
+                )
+            blocks_per_request += cdiv(max_model_len, spec.block_size) + draft_blocks
         # Plus the pool's null block, which no request can be given.
         num_blocks = blocks_per_request * max_num_seqs + 1
         need_bytes = num_blocks * page_size * layers_per_pool
