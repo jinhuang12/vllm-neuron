@@ -867,7 +867,7 @@ def dsa_decode_select(bounded: Tensor, seq_lens: Tensor, *, select_k: int,
 
 
 # ---------------------------------------------------------------------------------------
-# Decode context parallelism: the local top-k before the expansion, and the id maps
+# Decode context parallelism: the local top-k before the expansion
 # ---------------------------------------------------------------------------------------
 
 
