@@ -45,8 +45,12 @@ LATENT, PAGE, SCALE = 512, 128, 0.0625
 def _child(rows: int, pages: int, active: int) -> None:
     import torch
 
+    # The plugin first: its patches must be in place when the backends load.
+    # isort: off
+    import vllm_neuron  # noqa: F401
     import libtorch_neuronx_lite  # noqa: F401  (registers the backends)
     import libtorch_neuronx_lite.compile.backend as backend
+    # isort: on
 
     from test.vllm_neuron.functional.attention.neuron_device_nodes import (
         open_neuron_device_nodes,
@@ -112,9 +116,6 @@ def _allocator_lines(scratch: str) -> list[str]:
     return found
 
 
-@pytest.mark.skipif(shutil.which("neuronx-cc") is None
-                    and not pathlib.Path(sys.executable).with_name("neuronx-cc").exists(),
-                    reason="neuronx-cc is not installed")
 @pytest.mark.parametrize("rows,pages,active", CASES,
                          ids=[f"q{r}-w{p * PAGE}-a{a}" for r, p, a in CASES])
 def test_neuronx_cc_builds_the_dense_window_kernel(rows, pages, active):
@@ -127,6 +128,7 @@ def test_neuronx_cc_builds_the_dense_window_kernel(rows, pages, active):
             NEURON_LIBTORCH_CACHE_ROOT=scratch, PYTHONDONTWRITEBYTECODE="1",
             PYTHONPATH=str(_ROOT),
             PATH=f"{pathlib.Path(sys.executable).parent}:{environment.get('PATH', '')}")
+        assert shutil.which("neuronx-cc", path=environment["PATH"]), "neuronx-cc is not installed"
         done = subprocess.run(
             [sys.executable, str(pathlib.Path(__file__).resolve()), "child", str(rows),
              str(pages), str(active)],
