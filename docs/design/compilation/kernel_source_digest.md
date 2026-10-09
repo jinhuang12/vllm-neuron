@@ -134,7 +134,9 @@ and `@dataclass` today. A test pins the allowlist, and another test pins that no
 snapshot file has such a form today.
 
 Not detected: a mutation inside a function the file calls
-(`mod.set_mode(1)`), a store through a function parameter
+(`mod.set_mode(1)`) or of an object a call returns (`mod.get_table().append(x)`;
+`torch.where(...).sort()` sorts a new tensor and patches nothing), a store
+through a function parameter
 (`def f(m): m.X = v`), `unittest.mock` patching, a mutating-method name called
 directly on a module bound by `import` (`nl.add` is a kernel op), and `exec` /
 `eval`. A kernel of another package that a snapshot file imports only under an
