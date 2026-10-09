@@ -20,6 +20,9 @@ Run the device stage ONLY through the device lease, which pins the cores and set
 ``--stage run`` then times and profiles those NEFFs under the lease (``--stage all`` does
 both). ``--stage summarize`` re-derives ``summary.json`` from the records of an earlier run
 (``neuron-explorer view`` reads the kept profiles again; it needs no device).
+``--table``, ``--wire`` and ``--form`` select a part of the arms, for a shorter lease.
+``--stop-check <command>`` runs the command (a check of the kernel log for device faults,
+say) before every device case, and stops the run at the first non-zero exit.
 
 Geometry. One site's partial is ``[tokens, hidden]`` at the served prefill chunk; the
 producer is a matmul whose contraction is the KDA output projection's per-rank width at
@@ -88,6 +91,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import statistics
 import subprocess
@@ -867,6 +871,17 @@ def main() -> int:
         default="all",
         help="the arms of one wire only (a shorter lease)",
     )
+    parser.add_argument(
+        "--form",
+        choices=("all",) + FORMS,
+        default="all",
+        help="the arms of one form only (a shorter lease)",
+    )
+    parser.add_argument(
+        "--stop-check",
+        help="a command run before every device case; a non-zero exit stops the run "
+        "there, with the records made so far",
+    )
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeats", type=int, default=5)
@@ -897,7 +912,9 @@ def main() -> int:
     selected = [
         a
         for a in arms()
-        if args.table in ("all", a["table"]) and args.wire in ("all", a["wire"])
+        if args.table in ("all", a["table"])
+        and args.wire in ("all", a["wire"])
+        and args.form in ("all", a["form"])
     ]
     if args.stage == "run":
         manifest = json.loads(manifest_path.read_text())
@@ -926,10 +943,21 @@ def main() -> int:
         bench_start=_now(),
     )
     raw = out / "raw"
+
+    def check(case: str) -> None:
+        """Run ``--stop-check`` before ``case``; stop the run if it fails."""
+        if args.stop_check is None:
+            return
+        if subprocess.run(shlex.split(args.stop_check), check=False).returncode:
+            manifest["stopped_before"] = {"case": case, "time": _now()}
+            save()
+            raise SystemExit(f"stop check failed before {case}; records kept in {out}")
+
     for rep in range(args.repeats):
         # Interleaved: every arm once per repeat, the order rotated each repeat.
         shift = rep * len(timed) // args.repeats
         for a in timed[shift:] + timed[:shift]:
+            check(f"{a['name']} rep {rep}")
             record = bench(
                 Path(manifest["compiled"][a["name"]]["neff"]),
                 raw / a["name"] / f"rep{rep}",
@@ -942,6 +970,7 @@ def main() -> int:
             print(f"rep {rep} {a['name']}: rc {record['rc']}", flush=True)
     for a in timed:
         if a["cc"]:
+            check(f"{a['name']} profile")
             record = profile(
                 Path(manifest["compiled"][a["name"]]["neff"]),
                 raw / a["name"] / "profile",
