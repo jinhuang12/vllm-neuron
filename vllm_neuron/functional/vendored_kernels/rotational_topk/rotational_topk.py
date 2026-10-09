@@ -24,6 +24,11 @@ builds ``indices`` per row tile so that each of its columns is written once. The
 never writes SBUF its sources occupy (a gather dst/src alias, which the device's pieced gather
 turns into wrong indices). Carry the patch upstream, or apply it again, before nkilib's copy
 replaces this one.
+
+It also diverges from upstream in how the sorted output is built: consecutive row tiles share
+one ``sort``, so that its passes hold a row on every partition rather than on ``tile_size`` of
+them. Upstream sorts each row tile alone. The passes cost the same on any number of partitions
+and work on each partition alone, so the output is the same, bit for bit, in fewer passes.
 """
 
 from typing import Tuple
@@ -100,17 +105,21 @@ def rotational_topk(
         if n_stages == 1:
             return naive_scanning_topk(inp, config.topk_config)
 
-        # Multi-stage rotational algorithm per tile
-        value, global_index = _topk_rotated_core(inp, config, n_programs, program_id)
+        # Row tiles in groups of sort_group (pmax // tile_size when sorted, else 1)
+        for group in row_tile_groups:
+            for tile in group:
+                # Multi-stage rotational algorithm per tile
+                value, global_index = _topk_rotated_core(inp, config, tile)
+                if sorted:
+                    flat_value[tile rows] = reshape_with_dma(value, n_stages)
+                    flat_index[tile rows] = reshape_with_dma(global_index, n_stages)
+                else:
+                    unfolded_store(value, global_index to HBM)
 
-        # Optional sorting (per tile)
-        if sorted:
-            flat_value = reshape_with_dma(value, n_stages)
-            flat_index = reshape_with_dma(global_index, n_stages)
-            sorted_val, sorted_idx = sort(flat_value, flat_index)
-            dma_copy(sorted_val[:true_k], sorted_idx[:true_k] to HBM)
-        else:
-            unfolded_store(value, global_index to HBM)
+            # Optional sorting (per group: a row per partition)
+            if sorted:
+                sorted_val, sorted_idx = sort(flat_value, flat_index)
+                dma_copy(sorted_val[:true_k], sorted_idx[:true_k] to HBM)
 
         return topk_values, topk_indices
     """
@@ -197,6 +206,13 @@ def rotational_topk(
     tile_size = config.tile_size
     n_bxs_tiles = config.n_bxs_tiles
     lnc_batch_start = prg_id * config.per_lnc_BxS
+    lnc_batch_end = min(lnc_batch_start + config.per_lnc_BxS, BxS)
+    # Row tiles whose rows one `sort` takes together. `sort` holds a row per partition, so one
+    # row tile fills only `tile_size` of them, and its passes cost the same on any number of
+    # partitions; consecutive tiles therefore share one `sort`, as many as fill the
+    # partitions. Every instruction of `sort` reads and writes each partition alone, so a
+    # row's output does not depend on the rows beside it.
+    sort_group = min(n_bxs_tiles, nl.tile_size.pmax // tile_size) if sorted_flag else 1
 
     # Hoist tile-invariant constants out of the loop
     n_stages = config.n_stages
@@ -223,45 +239,76 @@ def rotational_topk(
     )
     nisa.tensor_copy(dst=rotation_f32, src=rotation, engine=nisa.vector_engine)
 
-    for tile_idx in nl.sequential_range(n_bxs_tiles):
-        tile_batch_start = lnc_batch_start + tile_idx * tile_size
-        tile_batch_end = min(
-            tile_batch_start + tile_size, min(lnc_batch_start + config.per_lnc_BxS, BxS)
-        )
-
-        # One `indices` per row tile, so that each of its columns is written once (see
-        # `_topk_rotated_core`). The scalar engine fills it: the top-k keeps the vector engine
-        # busy, so the fill of one tile can run under the top-k of the tile before.
-        indices = nl.ndarray((total_partition_dim, index_free_dim), dtype=nl.float32)
-        nisa.tensor_scalar(
-            dst=indices[:, nl.ds(0, stage_free_size)],
-            data=chunk_index,
-            op0=nl.add,
-            operand0=stage_offsets,
-            engine=nisa.scalar_engine,
-        )
-
-        value, global_index = _topk_rotated_core(
-            inp=inp,
-            config=config,
-            batch_start=tile_batch_start,
-            batch_end=tile_batch_end,
-            rotation=rotation,
-            rotation_f32=rotation_f32,
-            indices=indices,
-        )
-
-        tile_bxs = tile_batch_end - tile_batch_start
-        hbm_slice = nl.ds(tile_batch_start, tile_bxs)
-        sbuf_slice = nl.ds(0, tile_bxs)
+    for group_start in nl.sequential_range(0, n_bxs_tiles, sort_group):
+        group_tiles = min(sort_group, n_bxs_tiles - group_start)
+        group_batch_start = lnc_batch_start + group_start * tile_size
+        group_batch_end = min(group_batch_start + group_tiles * tile_size, lnc_batch_end)
 
         if sorted_flag:
-            flat_value = reshape_with_dma(value, config.n_stages, dtype=inp.dtype)
-            flat_index = reshape_with_dma(
-                global_index, config.n_stages, dtype=index_dtype
+            # The group's rows, a row per partition: each tile's rows reach their own
+            # partitions by the DMA that takes them out of the stages layout.
+            flat_shape = (group_tiles * tile_size, n_stages * local_top_k_per_stage)
+            flat_value = nl.ndarray(flat_shape, dtype=inp.dtype, buffer=nl.sbuf)
+            flat_index = nl.ndarray(flat_shape, dtype=index_dtype, buffer=nl.sbuf)
+
+        for member in nl.static_range(group_tiles):
+            tile_batch_start = group_batch_start + member * tile_size
+            tile_batch_end = min(tile_batch_start + tile_size, lnc_batch_end)
+
+            # One `indices` per row tile, so that each of its columns is written once (see
+            # `_topk_rotated_core`). The scalar engine fills it: the top-k keeps the vector
+            # engine busy, so the fill of one tile can run under the top-k of the tile before.
+            indices = nl.ndarray((total_partition_dim, index_free_dim), dtype=nl.float32)
+            nisa.tensor_scalar(
+                dst=indices[:, nl.ds(0, stage_free_size)],
+                data=chunk_index,
+                op0=nl.add,
+                operand0=stage_offsets,
+                engine=nisa.scalar_engine,
             )
 
+            value, global_index = _topk_rotated_core(
+                inp=inp,
+                config=config,
+                batch_start=tile_batch_start,
+                batch_end=tile_batch_end,
+                rotation=rotation,
+                rotation_f32=rotation_f32,
+                indices=indices,
+            )
+
+            if sorted_flag:
+                member_rows = nl.ds(member * tile_size, tile_size)
+                reshape_with_dma(value, n_stages, dst=flat_value[member_rows, :])
+                reshape_with_dma(global_index, n_stages, dst=flat_index[member_rows, :])
+            else:
+                global_index_int = nl.ndarray(
+                    global_index.shape, dtype=index_dtype, buffer=nl.sbuf
+                )
+                nisa.tensor_copy(dst=global_index_int, src=global_index)
+
+                unfolded_store(
+                    global_index_int[:, :],
+                    topk_indices,
+                    fold_factor=config.n_stages,
+                    batch_start=tile_batch_start,
+                    batch_end=tile_batch_end,
+                )
+                unfolded_store(
+                    value[:, :],
+                    topk_values,
+                    fold_factor=config.n_stages,
+                    batch_start=tile_batch_start,
+                    batch_end=tile_batch_end,
+                )
+
+        if sorted_flag:
             trimmed_val, trimmed_idx = sort(flat_value, flat_index, true_k)
+            # The group's rows are consecutive, in HBM as on the partitions: only its last
+            # tile can be short.
+            group_bxs = group_batch_end - group_batch_start
+            hbm_slice = nl.ds(group_batch_start, group_bxs)
+            sbuf_slice = nl.ds(0, group_bxs)
             nisa.dma_copy(
                 dst=topk_indices[hbm_slice, :true_k],
                 src=trimmed_idx[sbuf_slice, :true_k],
@@ -269,26 +316,6 @@ def rotational_topk(
             nisa.dma_copy(
                 dst=topk_values[hbm_slice, :true_k],
                 src=trimmed_val[sbuf_slice, :true_k],
-            )
-        else:
-            global_index_int = nl.ndarray(
-                global_index.shape, dtype=index_dtype, buffer=nl.sbuf
-            )
-            nisa.tensor_copy(dst=global_index_int, src=global_index)
-
-            unfolded_store(
-                global_index_int[:, :],
-                topk_indices,
-                fold_factor=config.n_stages,
-                batch_start=tile_batch_start,
-                batch_end=tile_batch_end,
-            )
-            unfolded_store(
-                value[:, :],
-                topk_values,
-                fold_factor=config.n_stages,
-                batch_start=tile_batch_start,
-                batch_end=tile_batch_end,
             )
 
     return topk_values, topk_indices
