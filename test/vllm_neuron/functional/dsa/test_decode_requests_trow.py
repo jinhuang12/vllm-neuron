@@ -48,6 +48,7 @@ from vllm_neuron.functional.attention import mla_decode as MD
 from vllm_neuron.functional.dsa import decode_batch as DB
 from vllm_neuron.functional.dsa import decode_tail_update as TU
 from vllm_neuron.functional.dsa import decode_trow as TR
+from vllm_neuron.functional.dsa.launch_grid import LaunchGridError
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 ROWS = (1, 2, 4, 6)
@@ -375,3 +376,25 @@ def test_refusals_name_the_rows_and_the_depth():
     ops = _operands(4, 2, max_seq_len, starts, depth=pool, seed=82)
     with pytest.raises(model_fp8.Glm5NextMLADecodeError, match="whole number of rows"):
         _step(_cloned(ops), ops["hidden"][:7], ops["start"], ops["latent_slots"][:7], 2)
+
+
+@pytest.mark.parametrize("setting, programs", [(None, 1), ("1", 1), ("2", 2)],
+                         ids=["unset", "lnc1", "lnc2"])
+def test_the_row_scores_split_over_an_lnc2_pair_from_two_requests(setting, programs,
+                                                                    monkeypatch):
+    """The ``T``-row score kernel takes both cores of an LNC2 pair (setting 2) from two
+    requests on, and one program otherwise."""
+    if setting is None:
+        monkeypatch.delenv("NEURON_LOGICAL_NC_CONFIG", raising=False)
+    else:
+        monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", setting)
+    assert TR._programs(2) == programs
+    assert TR._programs(1) == 1
+
+
+@pytest.mark.parametrize("setting", ["3", "abc"])
+def test_an_lnc_setting_the_row_scores_do_not_serve_is_refused_by_name(setting,
+                                                                       monkeypatch):
+    monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", setting)
+    with pytest.raises(LaunchGridError, match="NEURON_LOGICAL_NC_CONFIG"):
+        TR._programs(2)

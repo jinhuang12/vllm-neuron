@@ -6,13 +6,15 @@ worker starts, so the setting is a property of the process. These kernel seams i
 ``vllm_neuron/functional`` split their work over an LNC2 pair only when :func:`lnc_pair`
 says they may:
 
-- ``dsa``: the decode kernels (``decode_batch``, ``decode_select``), ``kpool_hadamard``
-  and ``score_gemm``;
+- ``dsa``: the decode kernels (``decode_batch``, ``decode_select``, ``decode_trow``),
+  ``kpool_hadamard`` and ``score_gemm``;
 - ``kda``: ``chunked_recurrence`` (the prefill chunk kernels), ``depthwise_conv1d`` and
   ``fused_decode``;
 - ``attention``: ``mla_decode``, ``mla_dense_window`` and ``mla_sparse``;
 - ``glue``: ``kda_output``, ``kda_projections`` and ``mhc_pre``;
-- ``moe``: ``expert_decode``, ``fused_fp8`` and ``token_gather_combine``.
+- ``moe``: ``expert_decode``, ``fused_fp8`` and ``token_gather_combine``;
+- ``mtp``: the tail kernels ``tail_in`` and ``tail_out``, through
+  ``common.launch_programs``.
 
 They read it once per trace and never per step. An ordinary read inside a
 traced function becomes a Dynamo guard, and that guard reads the environment again

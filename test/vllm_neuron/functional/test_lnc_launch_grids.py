@@ -23,6 +23,7 @@ from vllm_neuron.functional.moe import expert_decode as ED
 from vllm_neuron.functional.moe import fused_fp8 as FF
 from vllm_neuron.functional.moe import token_gather_combine as TGC
 from vllm_neuron.functional.moe.fused_fp8_pack import PackedExperts
+from vllm_neuron.functional.mtp import common as mtp_common
 
 NC_CONFIG = "NEURON_LOGICAL_NC_CONFIG"
 #: The two-core answer of a seam that launches a ``[2]`` grid on an LNC2 pair.
@@ -128,6 +129,7 @@ SEAMS = {
     "expert_decode": lambda mp: ED.default_programs(2, 2),
     "fused_fp8": _fused_fp8_route,
     "token_gather_combine": _token_gather_combine,
+    "mtp_tail": lambda mp: mtp_common.launch_programs(),
 }
 
 

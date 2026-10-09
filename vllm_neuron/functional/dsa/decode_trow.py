@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,6 +33,7 @@ import nki.language as nl
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
 from vllm_neuron.functional.dsa.causal_bound import BOUND_FILL
+from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 from vllm_neuron.utils.neuron_utils import can_run_kernel, values_are_readable
 
 logger = logging.getLogger(__name__)
@@ -363,7 +363,13 @@ def dsa_decode_scores_rows_kernel(q_hbm, w_hbm, bank_hbm, slots_hbm, pos_hbm, po
 
 
 def _programs(batch: int) -> int:
-    if os.environ.get("NEURON_LOGICAL_NC_CONFIG") == "2" and batch >= 2:
+    """Programs of the ``T``-row score kernel: 2 (an LNC2 pair) for two or more requests,
+    else 1.
+
+    :func:`~vllm_neuron.functional.dsa.launch_grid.lnc_pair` refuses a setting other
+    than unset, 1 or 2 (``LaunchGridError``).
+    """
+    if lnc_pair() and batch >= 2:
         return 2
     return 1
 
