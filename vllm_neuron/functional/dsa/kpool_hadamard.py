@@ -32,7 +32,6 @@ graph specialises on the exact ``(n_pools, pool_size, head_dim, dtype)`` tuple.
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass
 
 import torch
@@ -44,6 +43,7 @@ import nki.language as nl
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
+from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 logger = logging.getLogger(__name__)
@@ -630,7 +630,7 @@ def _programs(n_items: int) -> int:
     physical cores, and the variable other DSA kernels read for the same choice
     (``decode_batch._programs``). A single row cannot be split, so it takes one program.
     """
-    if os.environ.get("NEURON_LOGICAL_NC_CONFIG") == "2" and n_items >= 2:
+    if lnc_pair() and n_items >= 2:
         return 2
     return 1
 
