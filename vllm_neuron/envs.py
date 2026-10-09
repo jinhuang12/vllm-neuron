@@ -17,6 +17,8 @@ import subprocess
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Optional
 
+from vllm_neuron import _artifact_paths
+
 logger = logging.getLogger(__name__)
 
 
@@ -290,6 +292,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NEURON_CHECKPOINT_CACHE": lambda: os.getenv(
         "NXDI_CHECKPOINT_CACHE", "/tmp/vllm_neuron-checkpoints"
     ),
+    # The served GLM-5.3-Flash checkpoint directory (the one that holds
+    # model.safetensors.index.json) that tests and benchmarks under test/ read
+    # real weights from, through test/vllm_neuron/artifacts.py only. Unset or
+    # empty: _artifact_paths.CHECKPOINT_DEFAULT, the serving host's campaign
+    # checkpoint /home/ubuntu/glm53f-campaign/lane-serve/models/GLM-5.3-Flash-04c4e9e9.
+    # A test that needs the checkpoint skips, naming the resolved path, when the
+    # index is absent; it never substitutes random weights. The server does not
+    # read this knob.
+    "VLLM_NEURON_GLM5NEXT_CHECKPOINT_DIR": _artifact_paths.checkpoint_dir,
+    # The directory the GLM-5.3-Flash performance campaign keeps its worktrees and
+    # records under (glm53f-wt*/reports, glm53f-wt3/calib, the decode breakdown,
+    # device profiles). Report scaffolding, perf harnesses and hardware benchmarks
+    # under test/ resolve their default inputs and outputs below it, through
+    # test/vllm_neuron/artifacts.py only. Unset or empty:
+    # _artifact_paths.CAMPAIGN_DEFAULT, /home/ubuntu, the campaign hosts'
+    # directory. A test whose record is absent below it skips or fails naming the
+    # resolved path. The server does not read this knob.
+    "VLLM_NEURON_GLM5NEXT_CAMPAIGN_DIR": _artifact_paths.campaign_dir,
     # Golden cache directory (disk tier)
     "VLLM_NEURON_GOLDEN_CACHE_DIR": lambda: os.path.expandvars(
         os.getenv("VLLM_NEURON_GOLDEN_CACHE_DIR", "/tmp/vllm_neuron-goldens-$USER")

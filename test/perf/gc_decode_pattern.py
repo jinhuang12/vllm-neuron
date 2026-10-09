@@ -45,7 +45,7 @@ measurement.
 Usage (from the worktree root; one child at a time, ~1-3 min each):
 
     PYTHONPATH=$PWD python test/perf/gc_decode_pattern.py \\
-        --json /home/ubuntu/glm53f-wt2/reports/gcfreeze2_harness.json
+        --json <reports>/gcfreeze2_harness.json
 """
 
 from __future__ import annotations

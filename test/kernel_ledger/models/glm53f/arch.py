@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """GLM-5.3-Flash architecture constants (from the checkpoint config.json) and sharding.
 
-``load_arch()`` parses ``text_config`` of the served checkpoint's ``config.json``.
-``GLM53F`` is the parsed default; ``test_glm_graph.py`` re-parses the file and checks
-the two agree, so a checkpoint change shows up as a test failure, not a silent drift.
+``load_arch()`` parses ``text_config`` of the served checkpoint's ``config.json``, read
+from its byte copy in the repository (``DEFAULT_CONFIG``; the copy's sha256 is pinned by
+``test_weight_loaders.py``). ``GLM53F`` is the parsed default; ``test_glm_graph.py``
+re-parses the file and checks the two agree, so a config change shows up as a test
+failure, not a silent drift.
 
 Sharding as deployed (``PLANNER_REPORT.md`` section 1, ``dense.md`` E2): TP=64 over all
 64 logical cores; experts EP=16 groups of 4 ranks (each expert's intermediate split
@@ -19,8 +21,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Tuple
 
-#: The served checkpoint's config (read-only).
-DEFAULT_CONFIG = Path("/home/ubuntu/glm53f-campaign/lane-serve/models/GLM-5.3-Flash-04c4e9e9/config.json")
+#: The served checkpoint's ``config.json``, as the repository's byte copy of it
+#: (``hf-config.json.provenance.json`` beside it records the source and digest).
+DEFAULT_CONFIG = (Path(__file__).resolve().parents[4]
+                  / "test/vllm_neuron/model/glm5_next/fixtures/hf-config.json")
 
 
 @dataclass(frozen=True)
