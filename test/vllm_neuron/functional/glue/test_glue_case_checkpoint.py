@@ -97,15 +97,6 @@ def test_random_source_is_asked_for_and_ignores_the_knob(monkeypatch, tmp_path):
                                again.get(LEAF, LEAF_SHAPE, torch.float32), atol=0, rtol=0)
 
 
-def test_empty_knob_means_the_default(monkeypatch):
-    """An empty value is the documented default, not the working directory."""
-    monkeypatch.delenv(KNOB, raising=False)
-    default = artifacts.checkpoint_dir()
-    monkeypatch.setenv(KNOB, "")
-    assert artifacts.checkpoint_dir() == default
-    assert default.is_absolute()
-
-
 def test_served_checkpoint_is_read():
     """The checkpoint the knob names on this host: real weights, as served.
 

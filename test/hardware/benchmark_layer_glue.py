@@ -202,6 +202,7 @@ import torch  # noqa: E402
 
 import vllm_neuron  # noqa: E402,F401 -- registers the Neuron compilation backend
 from vllm_neuron.model.glm5_next import model_fp8 as live_model  # noqa: E402
+from test.vllm_neuron import artifacts  # noqa: E402
 from test.vllm_neuron.functional.glue import glue_case as case_lib  # noqa: E402
 
 DEVICE = "neuron:0"
@@ -543,11 +544,10 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=30)
     parser.add_argument("--profile-iterations", type=int, default=3)
-    parser.add_argument("--profile-dir", type=Path,
-                        default=Path("/home/ubuntu/glm53f-wt2/glue-profiles"))
+    profiles = artifacts.campaign_path("glm53f-wt2", "glue-profiles")
+    parser.add_argument("--profile-dir", type=Path, default=profiles)
     parser.add_argument("--no-profile", action="store_true")
-    parser.add_argument("--explorer-data", type=Path,
-                        default=Path("/home/ubuntu/glm53f-wt2/glue-profiles/explorer-data"))
+    parser.add_argument("--explorer-data", type=Path, default=profiles / "explorer-data")
     parser.add_argument("--no-analyze", dest="analyze", action="store_false")
     parser.add_argument("--merge", action="store_true",
                         help="keep the cases already in --output that this run does not redo")

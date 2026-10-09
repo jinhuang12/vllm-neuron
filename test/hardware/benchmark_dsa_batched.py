@@ -79,7 +79,7 @@ BEFORE_NAMES = ("latent_cache", "pool_cache", "seq_lens", "start_position",
 
 
 def load_baseline(directory: Path):
-    """The baseline package's ``load()``: 75090b9's modules, read by ``git show``."""
+    """The baseline package's ``load()``: 75090b9's modules, from its committed copies."""
     spec = importlib.util.spec_from_file_location(
         "dsa_batched_baseline_loader", directory / "__init__.py",
         submodule_search_locations=[str(directory)])

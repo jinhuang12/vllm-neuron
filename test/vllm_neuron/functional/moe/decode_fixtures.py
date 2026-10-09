@@ -16,11 +16,10 @@ import nki.simulator
 import pytest
 import torch
 
+from test.vllm_neuron import artifacts
+
 REPO = Path(__file__).resolve().parents[4]
 BASELINE = REPO / "test" / "hardware" / "baselines" / "moe_5938748"
-CHECKPOINT = Path(
-    "/home/ubuntu/glm53f-campaign/lane-serve/models/GLM-5.3-Flash-04c4e9e9"
-)
 
 #: GLM-5.3-Flash routing constants (``glm5_next/config.py``).
 HIDDEN = 4096
@@ -87,11 +86,11 @@ def random_router_inputs(tokens: int, seed: int = 7, hidden: int = HIDDEN):
     return x, gamma, weights, bias.to(torch.float32)
 
 
-def _checkpoint_tensor(name: str) -> torch.Tensor:
+def _checkpoint_tensor(root: Path, name: str) -> torch.Tensor:
     from safetensors import safe_open
 
-    index = json.loads((CHECKPOINT / "model.safetensors.index.json").read_text())
-    shard = CHECKPOINT / index["weight_map"][name]
+    index = json.loads((root / artifacts.CHECKPOINT_INDEX).read_text())
+    shard = root / index["weight_map"][name]
     with safe_open(str(shard), framework="pt") as handle:
         return handle.get_tensor(name)
 
@@ -100,14 +99,14 @@ def realistic_router_inputs(tokens: int, layer: int = 10, seed: int = 11):
     """The checkpoint's own router weight, correction bias and FFN-norm gain.
 
     Activations are synthetic but shaped like a decoder residual: Gaussian with a
-    few large outlier channels. Skips when the checkpoint is not on this host.
+    few large outlier channels. Skips, naming the path, when the checkpoint
+    (``artifacts.require_checkpoint``) is not on this host.
     """
-    if not (CHECKPOINT / "model.safetensors.index.json").exists():
-        pytest.skip("GLM-5.3-Flash checkpoint not on this host")
+    root = artifacts.require_checkpoint()
     prefix = f"model.language_model.layers.{layer}"
-    weight = _checkpoint_tensor(f"{prefix}.mlp.gate.weight")  # [E, H]
-    bias = _checkpoint_tensor(f"{prefix}.mlp.gate.e_score_correction_bias")
-    gamma = _checkpoint_tensor(f"{prefix}.post_attention_layernorm.weight")
+    weight = _checkpoint_tensor(root, f"{prefix}.mlp.gate.weight")  # [E, H]
+    bias = _checkpoint_tensor(root, f"{prefix}.mlp.gate.e_score_correction_bias")
+    gamma = _checkpoint_tensor(root, f"{prefix}.post_attention_layernorm.weight")
     gen = torch.Generator().manual_seed(seed)
     scale = torch.ones(HIDDEN)
     scale[torch.randperm(HIDDEN, generator=gen)[:24]] = 20.0
