@@ -17,6 +17,7 @@ import pytest
 from test.vllm_neuron.functional.glue import glue_case
 from vllm_neuron import envs
 from vllm_neuron.functional import glue
+from vllm_neuron.utils.bucket_utils import get_default_num_seqs_buckets
 
 KERNELS = ("mhc_pre", "kda_projections", "kda_output", "mhc_post")
 TOKENS = (1, 2, 8, 64, 65, 128, 1024)
@@ -31,7 +32,7 @@ def _table(spec: str) -> set:
 
 def test_kernel_names_are_the_four_sites():
     assert glue.KERNELS == KERNELS
-    assert glue.PHASES == ("prefill", "decode")
+    assert glue.PHASES == ("prefill", "decode", "verify")
 
 
 def test_zero_selects_nothing():
@@ -82,6 +83,133 @@ def test_default_is_the_measured_prefill_subset():
            if sel.selects(k, t, p)}
     assert got == {("mhc_pre", "prefill", 128), ("mhc_pre", "prefill", 1024),
                    ("mhc_post", "prefill", 128), ("mhc_post", "prefill", 1024)}
+
+
+#: The measured prefill subset, written out: the route every prefill and decode call
+#: takes with and without the verify rule.
+PREFILL_DEFAULT = ("mhc_pre:prefill@128,mhc_pre:prefill@1024,mhc_post:prefill@128,"
+                   "mhc_post:prefill@1024")
+#: The prefill subset and mhc_pre at every verify step.
+VERIFY_VALUE = PREFILL_DEFAULT + ",mhc_pre:verify"
+
+
+def test_the_verify_rule_moves_no_prefill_or_decode_call():
+    """The verify rule changes the route of verify-step calls only: at every row count a
+    prefill, decode or unknown-phase call takes the route it took before the rule."""
+    one, before = glue.glue_selection(VERIFY_VALUE), glue.glue_selection(PREFILL_DEFAULT)
+    for rows in range(1, 4097):
+        for kernel in KERNELS:
+            for phase in ("prefill", "decode", None):
+                assert one.selects(kernel, rows, phase) == before.selects(
+                    kernel, rows, phase), (kernel, rows, phase)
+            assert one.selects(kernel, rows, "verify") == (kernel == "mhc_pre"), (
+                kernel, rows)
+
+
+#: The draft counts and the largest decode buckets the verify derivation is tested at.
+DRAFT_KS = (1, 2, 3)
+MAX_SEQS = (1, 2)
+
+
+@pytest.mark.parametrize("k", DRAFT_KS)
+@pytest.mark.parametrize("max_seqs", MAX_SEQS)
+def test_the_verify_step_is_each_decode_bucket_times_one_plus_k(k, max_seqs):
+    buckets = get_default_num_seqs_buckets(max_seqs)
+    rows = glue.verify_rows(buckets, k)
+    assert rows == {b * (1 + k) for b in buckets}
+    for verify in rows:
+        assert glue.phase_of_rows(verify, max_seqs, rows) == "verify"
+    for bucket in set(buckets) - rows:
+        assert glue.phase_of_rows(bucket, max_seqs, rows) == "decode"
+    for bucket in glue_case.SERVED_PREFILL_BUCKETS:
+        assert glue.phase_of_rows(bucket, max_seqs, rows) == "prefill"
+    glue.require_rows_tell_phase(("mhc_pre", "mhc_post"), max_seqs,
+                                 glue_case.SERVED_PREFILL_BUCKETS, spec=VERIFY_VALUE,
+                                 verify=rows)
+
+
+def test_a_decode_batch_of_a_verify_row_count_is_the_verify_step():
+    """k=1 at decode buckets [1, 2]: one request's verify step and two requests' draft
+    call both have 2 rows. The stack runs no one-row-per-request decode step on a
+    speculative server, so the site calls 2 rows verify; the draft call takes that
+    route too."""
+    rows = glue.verify_rows([1, 2], 1)
+    assert rows == {2, 4}
+    assert glue.phase_of_rows(2, 2, rows) == "verify"
+    assert glue.phase_of_rows(1, 2, rows) == "decode"
+
+
+def test_without_speculation_there_is_no_verify_step():
+    """k=0 (no speculative config, or the shadow draft) has no verify rows, so every call
+    keeps the phase it had before the verify rule: a 4-row call at a bs=1 site is a
+    prefill call, which the verify value does not fuse at 4 rows."""
+    assert glue.verify_rows(get_default_num_seqs_buckets(64), 0) == frozenset()
+    assert glue.phase_of_rows(4, 1) == "prefill"
+    assert glue.phase_of_rows(1, 1) == "decode"
+    assert not glue.glue_selection(VERIFY_VALUE).selects("mhc_pre", 4, "prefill")
+
+
+@pytest.mark.parametrize("draft_k, buckets", ((-1, [1]), (1, [0, 1])))
+def test_a_negative_k_or_an_empty_bucket_is_refused_by_name(draft_k, buckets):
+    with pytest.raises(ValueError, match=glue.GLUE_FUSED_ENV):
+        glue.verify_rows(buckets, draft_k)
+
+
+def test_a_verify_rule_that_leaves_a_verify_row_count_out_is_refused_by_name():
+    """``mhc_pre:verify@4`` names the 4-row verify step of bs=1 with 3 drafts. With 2
+    drafts the step has 3 rows, and at decode buckets [1, 2] with 3 drafts it also has
+    8: a row count with no entry would keep the torch route without a word."""
+    sites, prefill = ("mhc_pre", "mhc_post"), glue_case.SERVED_PREFILL_BUCKETS
+    with pytest.raises(ValueError, match=r"'mhc_pre:verify@4'.*\[3\] rows"):
+        glue.require_rows_tell_phase(sites, 1, prefill, spec="mhc_pre:verify@4",
+                                     verify=glue.verify_rows([1], 2))
+    with pytest.raises(ValueError, match=r"\[8\] rows"):
+        glue.require_rows_tell_phase(sites, 2, prefill, spec="mhc_pre:verify@4",
+                                     verify=glue.verify_rows([1, 2], 3))
+    for spec, buckets, k in (("mhc_pre:verify@4", [1], 3),
+                             ("mhc_pre:verify@4,mhc_pre:verify@8", [1, 2], 3),
+                             ("mhc_pre:verify", [1, 2], 2),
+                             ("mhc_pre:prefill@4", [1], 2)):
+        glue.require_rows_tell_phase(sites, max(buckets), prefill, spec=spec,
+                                     verify=glue.verify_rows(buckets, k))
+
+
+def test_a_prefill_bucket_of_a_verify_row_count_refuses_a_phase_split():
+    """32 requests with 3 drafts verify 128 rows, the row count of a 128-row prefill
+    bucket: the verify value fuses mhc_post there at prefill and not at verify."""
+    rows = glue.verify_rows(get_default_num_seqs_buckets(32), 3)
+    assert 128 in rows
+    with pytest.raises(ValueError, match="mhc_post at 128 rows.*a verify step"):
+        glue.require_rows_tell_phase(("mhc_pre", "mhc_post"), 32, PREFILL_ROWS,
+                                     spec=VERIFY_VALUE, verify=rows)
+    glue.require_rows_tell_phase(("mhc_pre", "mhc_post"), 32, PREFILL_ROWS, spec="all",
+                                 verify=rows)
+
+
+#: The value of the device A/B of the verify step, on a tree that called the bs=1 verify
+#: step's 4 rows prefill (the phase rule without verify rows).
+AB_VALUE = PREFILL_DEFAULT + ",mhc_pre:prefill@4"
+
+
+def test_the_verify_value_routes_bs1_with_3_drafts_as_the_device_ab_did():
+    """At bs=1 with 3 drafts every call takes the route the device A/B measured, so the
+    A/B measures the verify value's graph."""
+    ab, one = glue.glue_selection(AB_VALUE), glue.glue_selection(VERIFY_VALUE)
+    verify = glue.verify_rows([1], 3)
+    for rows in range(1, 4097):
+        before, now = glue.phase_of_rows(rows, 1), glue.phase_of_rows(rows, 1, verify)
+        for kernel in KERNELS:
+            assert ab.selects(kernel, rows, before) == one.selects(kernel, rows, now), (
+                kernel, rows)
+
+
+def test_a_verify_rule_names_an_mhc_kernel_only():
+    """Only the mHC sites tell the verify step; the KDA layer calls it decode."""
+    assert glue.VERIFY_KERNELS == ("mhc_pre", "mhc_post")
+    for kernel in ("kda_projections", "kda_output"):
+        with pytest.raises(ValueError, match=rf"{kernel} has no verify phase"):
+            glue.glue_selection(f"{kernel}:verify")
+    assert glue.glue_selection("mhc_post:verify@8").selects("mhc_post", 8, "verify")
 
 
 def test_default_decode_takes_the_zero_route_at_every_row_count():
@@ -154,7 +282,7 @@ def test_rules_for_one_kernel_add_up_and_whitespace_is_ignored():
 @pytest.mark.parametrize("spec", (
     "mhc_pree", "mhc_pre:prefil", "mhc_pre@x", "mhc_pre@5-2", "mhc_pre@0",
     "mhc_pre:decode:1", "kda_output,,mhc_post", "", "2", "ALL", "hyper_connection",
-    "mhc_pre@1-2-3", "mhc_pre@-",
+    "mhc_pre@1-2-3", "mhc_pre@-", "kda_output:verify", "kda_projections:verify@4",
 ))
 def test_malformed_or_unknown_rules_are_refused_by_name(spec):
     with pytest.raises(ValueError, match=glue.GLUE_FUSED_ENV):
@@ -170,8 +298,8 @@ def test_a_bad_environment_value_is_refused_at_the_call_site(monkeypatch):
 def test_an_unknown_kernel_or_phase_at_the_call_site_is_refused():
     with pytest.raises(ValueError, match="mhc_pree"):
         glue.glue_selected("mhc_pree", 1, "decode")
-    with pytest.raises(ValueError, match="verify"):
-        glue.glue_selected("mhc_pre", 1, "verify")
+    with pytest.raises(ValueError, match="draft"):
+        glue.glue_selected("mhc_pre", 1, "draft")
 
 
 @pytest.mark.parametrize("tokens", TOKENS)

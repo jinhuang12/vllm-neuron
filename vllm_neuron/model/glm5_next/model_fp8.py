@@ -946,13 +946,16 @@ class Glm5NextHyperConnection(nn.Module):
         # phase selects a kernel here.
         decode_buckets = getattr(neuron_config, "num_seqs_buckets", None)
         self.max_decode_rows = max(decode_buckets) if decode_buckets else None
+        self.verify_rows = frozenset()  # the verify step's rows: glue.verify_rows
         if self.max_decode_rows is not None:
-            from vllm_neuron.functional.glue import require_rows_tell_phase
+            from vllm_neuron.functional.glue import require_rows_tell_phase, verify_rows
 
+            self.verify_rows = verify_rows(decode_buckets)
             require_rows_tell_phase(
                 ("mhc_pre", "mhc_post"),
                 self.max_decode_rows,
                 getattr(neuron_config, "num_batched_tokens_buckets", None) or (),
+                verify=self.verify_rows,
             )
 
         # ``hc_mult3`` is the base's own name for the projection's output width:
@@ -989,7 +992,9 @@ class Glm5NextHyperConnection(nn.Module):
         """The glue switch's phase for a call of ``tokens`` rows (``max_decode_rows``)."""
         if self.max_decode_rows is None:
             return None
-        return "decode" if tokens <= self.max_decode_rows else "prefill"
+        from vllm_neuron.functional.glue import phase_of_rows
+
+        return phase_of_rows(tokens, self.max_decode_rows, self.verify_rows)
 
     # ── mHC pre: the folded input, and one Sinkhorn call ──────────────────
     def mhc_pre(

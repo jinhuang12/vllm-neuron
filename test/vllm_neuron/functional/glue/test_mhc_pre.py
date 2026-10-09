@@ -62,6 +62,8 @@ BATCHES = (1, 4, 64)
 TILED_ROWS = (fused.MHC_PRE_TOKEN_TILE, glue_case.SERVED_PREFILL_BUCKETS[0], 200)
 POST_ATOL = 2e-5
 COMB_ATOL = 2e-5
+#: The speculative verify step's rows at bs 1 and 2 with 1 to 3 drafts: B * (1 + k).
+VERIFY_ROWS = (2, 3, 4, 6, 8)
 #: Share of ``layer_input`` elements allowed one bf16 step away from 0a08ff4.
 LAYER_INPUT_MAX_FLIPS = 0.01
 #: fp32 ``layer_input``: ``|d| <= FP32_INPUT_RTOL * max|ref|``.
@@ -163,7 +165,7 @@ def _bf16_step(*values: torch.Tensor) -> torch.Tensor:
     return torch.exp2(torch.floor(torch.log2(mag)) - 7.0)
 
 
-@pytest.mark.parametrize("batch", BATCHES + TILED_ROWS)
+@pytest.mark.parametrize("batch", sorted(set(BATCHES + VERIFY_ROWS)) + list(TILED_ROWS))
 def test_fused_mhc_pre_matches_0a08ff4(sites, batch):
     live, old, cfg = sites
     streams = glue_case.streams_input(cfg, batch)
@@ -174,7 +176,7 @@ def test_fused_mhc_pre_matches_0a08ff4(sites, batch):
     _assert_mixes_match(got, old.mhc_pre(streams))
 
 
-@pytest.mark.parametrize("rows", (1,) + TILED_ROWS)
+@pytest.mark.parametrize("rows", (1,) + VERIFY_ROWS + TILED_ROWS)
 def test_the_ffn_site_kernel_returns_the_ffn_norm(ffn_sites, rows):
     live, old, cfg, gain, eps, rms_norm = ffn_sites
     streams = glue_case.streams_input(cfg, rows)
