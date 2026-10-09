@@ -242,10 +242,17 @@ def test_the_rows_step_equals_sequential_one_token_steps_bit_for_bit(rows, batch
     mine, ref = _cloned(ops), _cloned(ops)
     _reset_counters()
     out = _rows_step(mine)
-    # One launch per stage, every one a kernel: ring, scores (selecting only), attention.
+    # One launch per stage, every one a kernel: the ring (decode_tail_update); selecting
+    # only, the scores (decode_trow) and the selection; then the attention (mla_decode).
+    # The selection is one kernel, decode_select.dsa_decode_select (top-k, causal
+    # sentinel, order and expansion together), and it counts in decode_batch's family,
+    # so that family reads one launch here, its select entry, and no ring or scores.
+    selecting = regime == "selecting"
     assert TU.decode_tail_dispatch_counters() == (1, 0)
-    assert TR.decode_trow_dispatch_counters() == ((1, 0) if regime == "selecting" else (0, 0))
-    assert DB.decode_batch_dispatch_counters() == (0, 0)
+    assert TR.decode_trow_dispatch_counters() == ((1, 0) if selecting else (0, 0))
+    assert DB.decode_batch_dispatch_counters() == ((1, 0) if selecting else (0, 0))
+    ring, scores, _, select = DB.decode_batch_route_counts()
+    assert (ring, scores, select) == (0, 0, int(selecting))
     if batch == 1 and rows == 1 and regime == "selecting":
         # The one-request one-token step keeps its one-request sparse attention.
         assert MD.mla_decode_dispatch_counters() == (0, 0)
@@ -290,14 +297,21 @@ def test_the_served_ring_depth_takes_one_and_two_rows(rows, regime):
     mine, ref = _cloned(ops), _cloned(ops)
     _reset_counters()
     out = _rows_step(mine)
+    # One launch per stage, every one a kernel. One row: decode_batch's ring step, and,
+    # selecting, its scores and the selection kernel (decode_select, same family). Two
+    # rows: the T-row ring and scores, and the same selection kernel.
+    selecting = regime == "selecting"
+    ring, scores, _, select = DB.decode_batch_route_counts()
     if rows == 1:
-        assert DB.decode_batch_dispatch_counters() == ((2, 0) if regime == "selecting"
-                                                       else (1, 0))
+        assert DB.decode_batch_dispatch_counters() == ((3, 0) if selecting else (1, 0))
+        assert (ring, scores, select) == (1, int(selecting), int(selecting))
         assert TU.decode_tail_dispatch_counters() == (0, 0)
         assert TR.decode_trow_dispatch_counters() == (0, 0)
     else:
         assert TU.decode_tail_dispatch_counters() == (1, 0)
-        assert DB.decode_batch_dispatch_counters() == (0, 0)
+        assert TR.decode_trow_dispatch_counters() == ((1, 0) if selecting else (0, 0))
+        assert DB.decode_batch_dispatch_counters() == ((1, 0) if selecting else (0, 0))
+        assert (ring, scores, select) == (0, 0, int(selecting))
     want = _sequential(ref, ops["hidden"], ops["start"], ops["latent_slots"], rows,
                        general=rows > 1)
     assert torch.equal(out, want)
