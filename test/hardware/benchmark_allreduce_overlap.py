@@ -56,9 +56,10 @@ twice, for one). ``single`` raises that threshold above every graph here
 (:data:`ONE_MODULE_ARG`), so the graph is one module and the all-reduce sits inside it, as
 most of the served prefill graph's collectives do (its compile log cuts at 14 of its 91
 collectives). ``_fuse`` adds the policy's ``FUSE_COMPILER_ARG``. Those four are the core
-table (``--table core``). The option sweep (``--table options``) adds the documented
-``neuronx-cc compile`` options that claim to tune whole-graph scheduling (:data:`OPTIONS`)
-to a base flag set (:data:`OPTION_SETS`), for the :data:`OPTION_FORMS` on the fp32 wire.
+table (``--table core``). The option sweep (``--table options``) adds the
+options that claim to tune whole-graph or collective scheduling (:data:`OPTIONS`) to a
+base flag set (:data:`OPTION_SETS`), for the :data:`OPTION_FORMS` on the fp32 wire, with
+the collective only.
 
 What is read (``summarize``):
 
@@ -138,6 +139,8 @@ SERVED_ARGS = (
 )
 #: The served option that cuts a graph into modules at its collectives.
 MODULAR_ARG = SERVED_ARGS[3]
+#: The served options of the backend (``walrus_driver``).
+BACKEND_ARG = SERVED_ARGS[4]
 #: A modular-flow MAC threshold above every graph here (the largest, ``indep_mm``, has
 #: about 5.1e10 MACs), so each compiles as one module; :func:`compile_graph` checks it.
 ONE_MODULE_MACS = 10**15
@@ -146,13 +149,17 @@ ONE_MODULE_ARG = (
 )
 #: The flag sets of the core table.
 CORE_FLAGSETS = ("served", "served_fuse", "single", "single_fuse")
-#: Documented ``neuronx-cc compile`` options that claim to tune scheduling of a whole
-#: graph, each as (name, arguments to drop, arguments to add).
+#: Options that claim to tune the scheduling of a whole graph or of its collectives, each
+#: as (name, arguments to drop, arguments to add). The first four are documented by
+#: ``neuronx-cc compile --help``. ``spmd`` is not: the backend's own help lists
+#: ``--enable-SPMD-opt``, "Enable reordering of collectives"; it is measured here and
+#: never shipped.
 OPTIONS = (
     ("O2", ("-O1",), ("-O2",)),
     ("O3", ("-O1",), ("-O3",)),
     ("transformer", (), ("--model-type=transformer",)),
     ("llmtraining", (), ("--distribution-strategy=llm-training",)),
+    ("spmd", (BACKEND_ARG,), (f"{BACKEND_ARG} --enable-SPMD-opt",)),
 )
 #: (base flag set, option) of the option sweep. ``-O2`` and ``-O3`` compile every graph
 #: here as one module from either base, so they run on ``served`` only.
@@ -163,6 +170,8 @@ OPTION_SETS = (
     ("single", "transformer"),
     ("served", "llmtraining"),
     ("single", "llmtraining"),
+    ("served", "spmd"),
+    ("single", "spmd"),
 )
 #: The forms of the option sweep: the base (the reference), one with independent work,
 #: and the token split.
@@ -384,15 +393,16 @@ def arm_name(form: str, dep: bool, wire: str, cc: bool, flagset: str) -> str:
 def arms() -> list[dict]:
     """Every timed arm, the core table and then the option sweep.
 
-    A form with independent work runs free and ``dep`` (``cc``), and free without the
-    collective (``nocc``: there the two variants are the same graph). A ``cc`` arm's
-    ``nocc`` partner is the free form at its flag set without ``_fuse`` (no collective,
-    nothing for the flag to change).
+    A form with independent work runs free and ``dep`` (``cc``). In the core table each
+    form also runs free without the collective (``nocc``: there the two variants are the
+    same graph), and a ``cc`` arm's ``nocc`` partner is that arm at its flag set without
+    ``_fuse`` (no collective, nothing for the flag to change). The option sweep has no
+    ``nocc`` arms: its verdict is the free/``dep`` pair alone.
     """
 
-    def arm(form, dep, wire, cc, flagset):
+    def arm(form, dep, wire, cc, flagset, partnered):
         partner = None
-        if cc:
+        if cc and partnered:
             partner = arm_name(form, False, wire, False, flagset.removesuffix("_fuse"))
         return {
             "name": arm_name(form, dep, wire, cc, flagset),
@@ -407,8 +417,13 @@ def arms() -> list[dict]:
 
     def form_arms(form, wire, cc_flagsets, nocc_flagsets):
         variants = (False,) if form == "base" else (False, True)
-        out = [arm(form, dep, wire, True, f) for dep in variants for f in cc_flagsets]
-        return out + [arm(form, False, wire, False, f) for f in nocc_flagsets]
+        partnered = bool(nocc_flagsets)
+        out = [
+            arm(form, dep, wire, True, f, partnered)
+            for dep in variants
+            for f in cc_flagsets
+        ]
+        return out + [arm(form, False, wire, False, f, False) for f in nocc_flagsets]
 
     out = []
     for wire in WIRES:
@@ -417,7 +432,7 @@ def arms() -> list[dict]:
     for base, option in OPTION_SETS:
         flagset = f"{base}_{option}"
         for form in OPTION_FORMS:
-            out += form_arms(form, "f32", (flagset,), (flagset,))
+            out += form_arms(form, "f32", (flagset,), ())
     return out
 
 
