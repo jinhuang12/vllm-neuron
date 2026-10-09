@@ -29,15 +29,23 @@ and reports:
   compiler once left such a DMA's reads unordered against a later write, so one fails
   the check even where every pair it takes part in is ordered.
 * ``early_waits``: a semaphore wait whose value the producer's update has not yet
-  reached (or that no update reaches), so the edge the wait stands for is not real.
+  reached (or that no update reaches, or whose producer runs only after it), so the edge
+  the wait stands for is not real.
 * ``undecided``: what the check cannot model, so a dump that has any is not clean: an
   SBUF or PSUM operand at a runtime address (``register_ap``, a register the program sets),
   an operand of a kind the check does not know, or a cycle in the happens-before graph.
 
 A DRAM operand at a runtime address covers its whole tensor (the offset is not known on
 the CPU), so every pair it can take part in is checked. Instructions are nodes by their
-position, not their name: two instructions of one name stay two nodes, and a wait on a
-repeated name waits for the first of them whose update reaches its value.
+position, not their name: two instructions of one name stay two nodes.
+
+A wait names its producer by name only, and the compiler repeats a name in every block
+that holds the instruction: each device loop's counter increment is
+``scf.for-Inc_inst__I-10-0[-<engine>0]`` in every loop body. A wait binds to the
+instructions of that name before it in its own block, else to those of the nearest earlier
+block that holds the name; of these, to the first whose update reaches the wait's value,
+else the last. A wait whose name runs only after it is no edge (an early wait). The graph
+is one pass over the program: a device loop's body is checked as one iteration.
 
 Pairs ordered only because two DMAs of one queue complete in issue order are counted
 apart (``queue_order``): the compiler relies on that order everywhere.
@@ -240,6 +248,8 @@ class _Graph:
                                                  dims=loc["dims"], kind=alloc["kind"],
                                                  bank=loc.get("bank"), base=loc.get("base"))
         self.instructions = [i for b in func["blocks"] for i in b["instructions"]]
+        # The block of each instruction, by its index in the function.
+        self.block_at = [k for k, b in enumerate(func["blocks"]) for _ in b["instructions"]]
         blocks, block_info = {}, {}
         for queue in dump["queues"]:
             for blk in queue["blocks"]:
@@ -258,19 +268,22 @@ class _Graph:
                                           for b in i.get("dma_blocks", []))
         seen = collections.Counter()
         self.ids_of = collections.defaultdict(list)
+        # The position of each instruction node (a DMA block's: its trigger's).
+        self.position = {}
 
-        def node_of(name, count):
+        def node_of(name, count, at):
             node = name if count[name] == 1 else f"{name}@{seen[name]}"
             seen[name] += 1
             self.ids_of[name].append(node)
+            self.position[node] = at
             return node
 
         self.node = []
         last_on_engine, last_on_queue, done_of = {}, {}, {}
         barrier = None
-        for inst in self.instructions:
+        for at, inst in enumerate(self.instructions):
             engine, opcode = inst["engine"], inst["opcode"]
-            name = node_of(inst["name"], inst_count)
+            name = node_of(inst["name"], inst_count, at)
             self.node.append(name)
             self.updates.append((name, inst))
             if engine == "ALL":
@@ -293,7 +306,7 @@ class _Graph:
                 self._queue(last_on_queue, inst.get("queue"), done)
             elif opcode == "DMATrigger":
                 for block_name in inst.get("dma_blocks", []):
-                    block = node_of(block_name, block_count)
+                    block = node_of(block_name, block_count, at)
                     self.edges[name].add(block)
                     if block_name in block_info:
                         self.updates.append((block, block_info[block_name]))
@@ -305,10 +318,13 @@ class _Graph:
             else:
                 self._add(name, name, name, inst, inst.get("ins", []), inst.get("outs", []))
         self.reached = self._cumulative_updates()
-        for name, inst in zip(self.node, self.instructions):
+        self.waits = []        # (instruction, one of its waits, the node it waits for)
+        for at, (name, inst) in enumerate(zip(self.node, self.instructions)):
             for wait in (inst.get("sync_info") or {}).get("on_wait", []):
-                producer = self.producer(wait)
-                self.edges[done_of.get(producer, producer)].add(name)
+                producer = self.producer(at, wait)
+                self.waits.append((inst, wait, producer))
+                if producer is not None:
+                    self.edges[done_of.get(producer, producer)].add(name)
         self._reach = {}
 
     def _cumulative_updates(self):
@@ -330,10 +346,21 @@ class _Graph:
                 after[(name, update["id"])] = total[update["id"]]
         return after
 
-    def producer(self, wait):
-        """The node a wait waits for: its ``from`` instruction, or, for a name several
-        instructions share, the first of them whose update reaches the wait's value."""
-        nodes = self.ids_of.get(wait["from"]) or [wait["from"]]
+    def producer(self, at, wait):
+        """The node ``wait``, of the instruction at position ``at``, waits for (module
+        docstring): of the instructions its ``from`` names, those before it in its own block,
+        else those of the nearest earlier block that holds the name; of these, the first
+        whose update reaches the wait's value, else the last. ``None`` when none runs before
+        it; the name itself when no instruction has it."""
+        named = self.ids_of.get(wait["from"])
+        if not named:
+            return wait["from"]
+        earlier = [node for node in named if self.position[node] < at]
+        if not earlier:
+            return None
+        block_of = {node: self.block_at[self.position[node]] for node in earlier}
+        own = [node for node in earlier if block_of[node] == self.block_at[at]]
+        nodes = own or [node for node in earlier if block_of[node] == block_of[earlier[-1]]]
         for node in nodes:
             if self.reached.get((node, wait["id"]), -1) >= wait["wait_value"]:
                 return node
@@ -405,15 +432,17 @@ class _Graph:
 
     def early_waits(self):
         """Waits below the producer's cumulative update of that semaphore (or that no
-        update reaches)."""
+        update reaches, or on a name that runs only after the wait)."""
         out = []
-        for inst in self.instructions:
-            for wait in (inst.get("sync_info") or {}).get("on_wait", []):
-                reached = self.reached.get((self.producer(wait), wait["id"]))
-                if reached is None or wait["wait_value"] < reached:
-                    out.append(f"{inst['name']} waits for {wait['from']} semaphore "
-                               f"{wait['id']} >= {wait['wait_value']}; the update reaches "
-                               f"{reached}")
+        for inst, wait, producer in self.waits:
+            text = (f"{inst['name']} waits for {wait['from']} semaphore {wait['id']} >= "
+                    f"{wait['wait_value']}")
+            if producer is None:
+                out.append(f"{text}; no instruction of that name runs before it")
+                continue
+            reached = self.reached.get((producer, wait["id"]))
+            if reached is None or wait["wait_value"] < reached:
+                out.append(f"{text}; the update reaches {reached}")
         return out
 
 
