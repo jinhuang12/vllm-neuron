@@ -5840,9 +5840,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if positions is None:
             positions = {}
             self._glm5next_side_cache_positions = positions
+        # One INFO line per hand-out and per release, on tensor-parallel rank 0 only
+        # (every rank keys the same table): which slot a request held is the first
+        # fact a cross-request state investigation needs, and it costs one line per
+        # request, not per step.
+        log_slots = self._glm5next_shadow_rank() == 0
         noted = getattr(self, "_glm5next_finished_request_ids", None)
         if noted:
             for finished in [key for key in table if key in noted]:
+                if log_slots:
+                    logger.info(
+                        "glm5next request %r released request slot %d",
+                        finished, table[finished],
+                    )
                 positions.pop(table[finished], None)
                 # The checkpoint record is created with the live side-cache set; a
                 # slot table set up without one has no record to clear.
@@ -5883,6 +5893,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     empty_slot(side[key], free)
             positions.pop(free, None)
             table[request_id] = free
+            if log_slots:
+                logger.info("glm5next request %r holds request slot %d", request_id, free)
         return [table[request_id] for request_id in request_ids]
 
     def _glm5next_idle_slots(self, banks, busy, count: int) -> list[int]:
