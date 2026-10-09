@@ -1093,10 +1093,12 @@ def test_the_route_predicate_holds_over_populate_and_a_k5_draft() -> None:
         assert not fallbacks, f"[{phase}] a torch fallback ran: {readings}"
     assert draft_readings["decode_batch"][0] >= 2 * DRAFT_K, draft_readings
     assert read_selection_count() == DRAFT_K, draft_readings
-    # The chain form expands the selection in its own kernel once per iteration; the fused
-    # form expands inside the selection kernel and dispatches ``index_expand`` not at all.
-    expands = DRAFT_K if not selection_is_fused() else 0
-    assert draft_readings["index_expand"][0] == expands, draft_readings
+    # The chain form selects and expands in its own two kernels once per iteration; the
+    # fused form does both inside the selection kernel and dispatches neither
+    # ``topk_select`` nor ``index_expand``, so no iteration selects twice.
+    chain = DRAFT_K if not selection_is_fused() else 0
+    assert draft_readings["topk_select"][0] == chain, draft_readings
+    assert draft_readings["index_expand"][0] == chain, draft_readings
 
 
 def test_the_fallback_counter_reads_non_zero_when_a_fallback_is_provoked() -> None:
