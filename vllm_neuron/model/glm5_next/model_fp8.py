@@ -6449,6 +6449,8 @@ class Glm5NextMLAAttention(nn.Module):
         never mentions.
         """
         from vllm_neuron.functional.attention.mla_projections import (
+            mla_latent_projection,
+            mla_latent_projection_admits,
             mla_projection_prepared,
         )
 
@@ -6468,14 +6470,24 @@ class Glm5NextMLAAttention(nn.Module):
         )
         query = query.reshape(tokens, heads, widths["q_b_proj"][1] // heads)
 
-        kv_latent = mla_projection_prepared(
-            x, self._prepared_weight("kv_a_proj_with_mqa"),
-            self._lowp_operand("kv_a_proj_with_mqa"),
-        )
-        kv_latent = self._latent_norm(kv_latent, self.kv_a_layernorm_weight)
-
         out_dtype = hidden_states.dtype
-        return query.to(out_dtype), kv_latent.to(out_dtype)
+        lowp = self._lowp_operand("kv_a_proj_with_mqa")
+        if lowp is not None and mla_latent_projection_admits(x, *lowp):
+            # A prefill chunk: the projection, :meth:`_latent_norm` and the cast in one
+            # launch. The projection is the same bits; the norm runs the same fp32 steps
+            # in order, so it differs only by its square sum's summation order before
+            # the one rounding (functional/attention/mla_projections.py
+            # ``_lowp_rms_norm``).
+            kv_latent = mla_latent_projection(
+                x, *lowp, self.kv_a_layernorm_weight, self.rms_norm_eps
+            )
+        else:
+            kv_latent = mla_projection_prepared(
+                x, self._prepared_weight("kv_a_proj_with_mqa"), lowp
+            )
+            kv_latent = self._latent_norm(kv_latent, self.kv_a_layernorm_weight)
+            kv_latent = kv_latent.to(out_dtype)
+        return query.to(out_dtype), kv_latent
 
     def project_output(
         self,
