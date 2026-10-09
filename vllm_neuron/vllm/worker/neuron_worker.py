@@ -1364,6 +1364,7 @@ class NeuronWorker(WorkerBase):
             get_kv_cache_groups,
             get_uniform_page_size,
         )
+        from vllm.v1.kv_cache_interface import MambaSpec
 
         kv_cache_spec = self.model_runner.get_kv_cache_spec()
         if not kv_cache_spec:
@@ -1389,9 +1390,18 @@ class NeuronWorker(WorkerBase):
         # admission arithmetic said would fit. Where a recurrent block does span
         # the sequence this expression reads one block, so it is right either way.
         # Context parallelism would let a rank keep fewer tokens; no discount is
-        # taken for it here.
+        # taken for it here. A recurrent group of a speculative server also holds
+        # ``num_speculative_blocks`` extra blocks per request (one state row per
+        # draft token, ``MambaSpec.max_memory_usage_bytes``; the scheduler hands
+        # them out), so they are counted here as vLLM's admission check counts them.
         blocks_per_request = sum(
-            cdiv(max_model_len, group.kv_cache_spec.block_size) for group in groups
+            cdiv(max_model_len, group.kv_cache_spec.block_size)
+            + (
+                int(group.kv_cache_spec.num_speculative_blocks)
+                if isinstance(group.kv_cache_spec, MambaSpec)
+                else 0
+            )
+            for group in groups
         )
         # Plus the pool's null block, which no request can be given.
         num_blocks = blocks_per_request * max_num_seqs + 1
