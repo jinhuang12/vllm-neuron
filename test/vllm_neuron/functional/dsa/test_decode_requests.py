@@ -111,9 +111,10 @@ def _counted_batched(ops):
 
 
 def _assert_batched_route(taps):
-    """The ring step and the scores ran as one NKI launch each, attention as one."""
-    assert taps["decode_batch"] == (2, 0)
-    assert taps["routes"][:2] == (1, 1)
+    """The ring step, the scores and the selection ran as one NKI launch each,
+    attention as one."""
+    assert taps["decode_batch"] == (3, 0)
+    assert taps["routes"][:2] == (1, 1) and taps["routes"][3] == 1
     assert taps["mla_decode"][:2] == (0, 1)
 
 
@@ -147,7 +148,8 @@ def _paired(batch: int):
 def test_batched_selection_equals_the_per_request_selection(batch):
     ops, mine, ref, _out, taps, _want, want_taps = _paired(batch)
     _assert_batched_route(taps)
-    assert taps["topk"] == (1, 0) and taps["expand"] == (1, 0)
+    # One selection kernel (``_assert_batched_route``) for top-k, sentinel, order, expand.
+    assert taps["topk"] == (0, 0) and taps["expand"] == (0, 0)
     got = taps["indices"]
     assert got.shape[0] == batch
     for b in range(batch):
@@ -333,7 +335,8 @@ def test_the_carrier_form_selects_and_writes_as_the_bank_form(batch):
     got = indexer.forward_requests(
         ops["hidden"], q_latent, pools, tails, None, ops["seq_lens"], ops["position"],
         max_seq_len=MAX_SEQ_LEN, projected=projected)
-    assert DB.decode_batch_dispatch_counters() == (4, 0)
+    # Two forward_requests calls: a ring step, scores and a selection each.
+    assert DB.decode_batch_dispatch_counters() == (6, 0)
     assert torch.equal(got, want)
     assert torch.equal(by_view["tail_bank"], by_bank["tail_bank"])
     assert torch.equal(by_view["pool_bank"], by_bank["pool_bank"])
