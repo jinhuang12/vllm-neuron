@@ -175,12 +175,6 @@ def _assert_matches_reference_kernel(tokens: int, heads: int, cands: int) -> Non
     assert torch.equal(got, expected)
 
 
-def _tile_rows(index: int) -> slice:
-    """The 128-element block that holds ``index``: the widest a non-finite element may spread."""
-    start = index - index % 128
-    return slice(start, start + 128)
-
-
 def test_matches_the_torch_reference_at_8_tokens_12_candidates():
     """Scores agree with the torch reference at rtol 1e-2, atol 1e-5."""
     q, k, weights = _random_inputs(tokens=8, cands=12)
@@ -248,8 +242,78 @@ def test_matches_the_reference_at_2048_tokens_32_heads_512_candidates():
     _assert_matches_reference_kernel(2048, 32, 512)
 
 
-def test_a_non_finite_element_stays_inside_its_tile():
-    """A NaN or Inf in ``q`` or ``k`` changes nothing outside its own 128-row tile."""
+def test_matches_the_reference_at_130_tokens_5_heads_600_candidates():
+    """Ragged on every axis: a partial token tile, a partial candidate tile, an odd head count."""
+    _assert_matches_reference_kernel(130, 5, 600)
+
+
+def test_matches_the_reference_past_one_score_group():
+    """Two score groups, the second ragged, over three token tiles on one program.
+
+    The second group holds one whole candidate tile and three columns of another, so the group's
+    PSUM tile is filled by a whole and a partial matmul. Three token tiles take the streamed
+    copies in the order 0, 1, 0, and the group sums alternate across the tile boundaries.
+    """
+    group = mod._GROUP_TILES * CAND_TILE
+    tokens = 2 * TOKEN_TILE + 5
+    cands = group + CAND_TILE + 3
+    assert -(-tokens // TOKEN_TILE) == mod._BUFFERS + 1
+    _assert_matches_reference_kernel(tokens, 2, cands)
+
+
+def _record_launch_grids(monkeypatch) -> list:
+    """Record the SPMD grid of every launch the seam makes: ``None`` for a plain call."""
+    grids = []
+    real_wrap = mod.wrap_nki
+
+    class Recorder:
+        def __init__(self, kernel):
+            self._launch = real_wrap(kernel)
+
+        def __getitem__(self, grid):
+            grids.append(grid)
+            return self._launch[grid]
+
+        def __call__(self, *operands):
+            grids.append(None)
+            return self._launch(*operands)
+
+    monkeypatch.setattr(mod, "wrap_nki", Recorder)
+    return grids
+
+
+def test_two_programs_split_the_token_tiles_and_agree_with_one(monkeypatch):
+    """Under LNC2 the seam launches two programs, which split the token tiles between them.
+
+    Four token tiles, the last one ragged, so each program serves two and one of them serves
+    the ragged one; the result is the one-program result, bit for bit.
+    """
+    tokens = 3 * TOKEN_TILE + 5
+    q, k, weights = _random_inputs(tokens=tokens, cands=CAND_TILE + 7, seed=53)
+    one = dsa_score_gemm(q, k, weights)
+    grids = _record_launch_grids(monkeypatch)
+    monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", "2")
+    two = dsa_score_gemm(q, k, weights)
+    assert grids == [2]
+    assert torch.equal(two, one)
+    assert torch.equal(two, _reference_kernel_scores(q, k, weights))
+
+
+def test_one_token_tile_launches_one_program_under_lnc2(monkeypatch):
+    """With a single token tile there is nothing for a second program to take."""
+    grids = _record_launch_grids(monkeypatch)
+    monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", "2")
+    q, k, weights = _random_inputs(tokens=TOKEN_TILE, cands=12)
+    dsa_score_gemm(q, k, weights)
+    assert grids == [None]
+
+
+def test_a_non_finite_element_reaches_only_its_own_row_or_column():
+    """A NaN or Inf in ``q`` changes only its token's row, one in ``k`` only its candidate's column.
+
+    The turns move each element unchanged, so a non-finite element meets only the dot products
+    it takes part in, as in the reference.
+    """
     tokens, heads, cands = 200, 2, 300
     q_at, k_at = (5, 1, 7), (130, 3)
     for operand, kind in (("q", "nan"), ("q", "inf"), ("k", "nan"), ("k", "inf")):
@@ -264,12 +328,12 @@ def test_a_non_finite_element_stays_inside_its_tile():
         same = torch.eq(got.view(torch.int32), expected.view(torch.int32))
         if operand == "q":
             inside = torch.zeros(tokens, dtype=torch.bool)
-            inside[_tile_rows(q_at[0])] = True
+            inside[q_at[0]] = True
             outside_differing = int((~same[~inside]).sum().item())
             planted_row, clean_row = got[q_at[0]], clean[q_at[0]]
         else:
             inside = torch.zeros(cands, dtype=torch.bool)
-            inside[_tile_rows(k_at[0])] = True
+            inside[k_at[0]] = True
             outside_differing = int((~same[:, ~inside]).sum().item())
             planted_row, clean_row = got[:, k_at[0]], clean[:, k_at[0]]
         assert outside_differing == 0, f"{operand} {kind} changed {outside_differing} elements"
@@ -404,6 +468,12 @@ def test_tile_constants_match_the_isa_tile_extents():
     assert TOKEN_TILE == int(nl.tile_size.gemm_stationary_fmax)
     assert CAND_TILE == int(nl.tile_size.gemm_moving_fmax)
     assert CONTRACTION_TILE == int(nl.tile_size.pmax)
+
+
+def test_a_candidate_tile_of_fp32_scores_is_one_psum_bank():
+    """Each matmul of a score group writes one whole PSUM bank, so a group spans whole banks."""
+    fp32_bytes = torch.finfo(torch.float32).bits // 8
+    assert CAND_TILE * fp32_bytes == int(nl.tile_size.psum_bank_fmax_bytes)
 
 
 def test_contraction_tile_equals_index_head_dim():

@@ -51,6 +51,10 @@ PAGE = 128
 #: the step's phase off the row count against them.
 SERVED_MAX_NUM_SEQS = 64
 SERVED_PREFILL_BUCKETS = (1024,)
+#: The prefill chunk of a line that serves 2048-token chunks
+#: (``num_batched_tokens_buckets [2048]``, the uncapped prefill line). The default glue
+#: value fuses mhc_pre and mhc_post there too (``envs.DEFAULT_GLUE_FUSED_SPEC``).
+UNCAPPED_PREFILL_CHUNK = 2048
 
 
 def served_decode_buckets() -> list[int]:

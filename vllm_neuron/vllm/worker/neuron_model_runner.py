@@ -725,6 +725,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             self.vocab_size = hf_config.vocab_size
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.max_model_len = vllm_config.model_config.max_model_len
+        # The DSA decode indexer serves up to its verified selection width; refuse a
+        # longer max_model_len here, before any graph compiles.
+        from vllm_neuron.functional.dsa.decode_select import check_decode_index_context
+        check_decode_index_context(
+            self.max_model_len,
+            getattr(getattr(hf_config, "text_config", hf_config), "index_kpool", None),
+        )
 
         # Initialize persistent batch and request tracking
         # Use provided device or default to neuron:0
@@ -5876,6 +5883,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # no position, so they are emptied here, together (a half-fresh slot
             # would pool the previous owner's ring members): this slot only, in
             # place, by a host copy (``glm5next_state_banks.empty_slot``).
+            # Drain the pending step first, through ``get_output``'s lock: the slot's
+            # last owner can have left a step in flight that the output thread is
+            # draining, and ``empty_slot``'s ordering read would be a second device
+            # wait on that execution, which the runtime's single completion handle
+            # per execution turns into a hang (reports/prefill-cores-hang.md
+            # §worker-59). O(1) when nothing is pending; a no-op once read back.
+            if side_caches:
+                pending = getattr(self, "async_execution_buffer", None)
+                pending = pending.get("async_output") if pending else None
+                if pending is not None:
+                    pending.get_output()
             for side in side_caches or ():
                 if not side:
                     continue

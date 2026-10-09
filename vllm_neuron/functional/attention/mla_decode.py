@@ -51,7 +51,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -64,6 +63,7 @@ import nki.language as nl
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
+from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 from vllm_neuron.utils.neuron_utils import values_are_readable
 
 logger = logging.getLogger(__name__)
@@ -978,12 +978,13 @@ def mla_decode_selected_split_kernel(q_hbm, bank_hbm, table_hbm, pos_hbm, writte
     return out
 
 
-def _lnc2() -> bool:
-    return os.environ.get("NEURON_LOGICAL_NC_CONFIG") == "2"
-
-
 def _programs(batch: int) -> int:
-    if _lnc2() and batch >= 2:
+    """Programs of the general kernel: 2 (an LNC2 pair) for two or more requests, else 1.
+
+    :func:`~vllm_neuron.functional.dsa.launch_grid.lnc_pair` refuses a setting other
+    than unset, 1 or 2 (``LaunchGridError``).
+    """
+    if lnc_pair() and batch >= 2:
         return 2
     return 1
 
@@ -1104,7 +1105,7 @@ def _route(batch: int, rows: int, heads: int, latent: int, page: int, width: int
     rows with per-row causal limits. Tests pin both routes at the served shard shape
     (``test_mla_decode_frontend_compile.py``, ``test_mla_decode_trow.py``).
     """
-    split_programs = 2 if _lnc2() else 1
+    split_programs = 2 if lnc_pair() else 1
     split = rows == 1 and _split_serves(heads, latent, page, width, split_programs)
     programs = split_programs if split else _programs(batch)
     if split:

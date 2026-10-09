@@ -67,7 +67,25 @@ one ``wrap_nki`` dispatch per call, because the chunk loop lives inside the
 kernel. :func:`kda_intra_chunk_kernel` computes stages 1 to 3 together;
 :func:`kda_stage3_kernel` computes stage 3 alone and takes the inverse as an
 argument, which is the boundary upstream's ``recompute_w_u_fwd`` also uses. Both
-emit from the shared :func:`_emit_stage3`, so stage 3 has one implementation.
+emit stage 3 from the shared :func:`_emit_uw` and :func:`_emit_kg`, so stage 3
+has one implementation.
+
+Packed tiles
+------------
+A chunk of ``C`` tokens fills ``C`` of a tile's ``MAX_TILE`` partitions, so the
+kernels place :func:`tile_rows` ``// C`` chunks on one tile. Every chunk-local
+``[C, C]`` product of the tile is then a diagonal block of one ``[rows, rows]``
+product, and the block-diagonal masks zero the cross-chunk blocks. The masks are
+the host constants laid on every diagonal block in-kernel (:func:`_emit_chunk_rows`,
+:func:`_emit_unpack`), so the inputs keep their ``[C, C]`` shapes. Each
+kept entry of a masked product contracts the same terms as the per-chunk product,
+and a product of two block-diagonal tiles adds only exact zeros from the other
+blocks.
+
+On an LNC2 runtime the entry points launch two programs, one per physical core:
+the intra-chunk kernel splits the whole tiles between them
+(:func:`intra_chunk_grid`), the inter-chunk kernel the value columns of the
+state (:func:`inter_chunk_grid`).
 
 Four ``[C, C]`` constants are built on the host by :func:`chunk_constants` and
 passed in as tensors: the upper-inclusive ones matrix that turns the cumulative
@@ -100,6 +118,7 @@ import nki.language as nl
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
+from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 from vllm_neuron.utils.neuron_utils import can_run_kernel, values_are_readable
 
 logger = logging.getLogger(__name__)
@@ -109,21 +128,38 @@ logger = logging.getLogger(__name__)
 #: docstring for why this is a declared value and not an inherited default.
 L2_NORM_EPS = 1e-6
 
-#: Largest ``|gc|`` this kernel accepts, where ``gc`` is the inclusive cumulative
-#: gate. The two chunk-local products are formed as ``exp(gc[t]) * exp(-gc[j])``
-#: so that one matmul contracts the channel axis. That factorisation is exact, but
-#: it evaluates both signs of the exponent, so a cumulative gate far from zero
-#: overflows fp32 even where the product itself is tiny. At ``60`` the larger
-#: factor is about ``1.1e26``, which leaves the channel sum room inside fp32's
-#: ``3.4e38``. Upstream keeps the same quantity small differently, by blocking to
-#: 16 or 64 and re-referencing the gate per block; this kernel does not tile, so
-#: the limit is checked instead.
-GATE_CUMSUM_ABS_LIMIT = 60.0
-
 #: Widest chunk, key and value extent, one partition tile each. A literal rather
 #: than ``nl.tile_size.pmax`` read at import time, because this module must import
 #: on a host with no NKI device.
 MAX_TILE = 128
+
+#: fp32's range in nats: ``exp(x)`` is a normal fp32 number for ``x`` from
+#: ``FP32_LOG_TINY`` (about -87.34) to ``FP32_LOG_MAX`` (about 88.72).
+FP32_LOG_TINY = math.log(torch.finfo(torch.float32).tiny)
+FP32_LOG_MAX = math.log(torch.finfo(torch.float32).max)
+
+#: Headroom, in nats, between the largest admissible ``|gc|`` and fp32's range.
+#: The chunk-local products scale each of up to ``MAX_TILE`` channel components by
+#: ``exp(gc)`` and ``exp(-gc)``. A component of a unit vector is typically
+#: ``K ** -0.5`` and the query carries ``K ** -0.5`` more, so ``log(MAX_TILE)``
+#: keeps a ``1 / MAX_TILE`` component times the smaller factor a normal number, and
+#: a sum of ``MAX_TILE`` terms of the larger factor finite.
+GATE_EXPONENT_MARGIN = math.log(MAX_TILE)
+
+#: Largest ``|gc|`` this kernel accepts, where ``gc`` is the inclusive cumulative
+#: gate. The two chunk-local products are formed as ``exp(gc[t]) * exp(-gc[j])``
+#: so that one matmul contracts the channel axis. That factorisation is exact, but
+#: it evaluates both signs of the exponent, so a cumulative gate far from zero
+#: takes one factor out of fp32's range even where the product itself is moderate.
+#: The limit is the narrower side of that range less ``GATE_EXPONENT_MARGIN``,
+#: about 82.48. Upstream keeps the same quantity small differently, by blocking to
+#: 16 or 64 and re-referencing the gate per block; this kernel does not tile, so
+#: the limit is checked instead.
+GATE_CUMSUM_ABS_LIMIT = min(-FP32_LOG_TINY, FP32_LOG_MAX) - GATE_EXPONENT_MARGIN
+
+#: Physical cores behind one logical core on an LNC2 runtime, and so the programs
+#: of a two-program launch.
+LNC2_PROGRAMS = 2
 
 
 class ChunkedRecurrenceError(ValueError):
@@ -255,6 +291,18 @@ def _psum(rows, cols):
     return nl.ndarray((rows, cols), dtype=nl.float32, buffer=nl.psum)
 
 
+def _dma(dst, src, engine):
+    """``dst = src`` by DMA, descriptors from ``engine``'s hardware DGE.
+
+    ``engine`` is ``nisa.engine.sync`` or ``nisa.engine.scalar``, the two that
+    drive a hardware descriptor ring. Each DMA instruction occupies its issuing
+    queue for about a microsecond, so the kernels alternate the two and a tile's
+    loads arrive in parallel; GpSimd, which software descriptors would occupy,
+    stays free for the layout constants.
+    """
+    nisa.dma_copy(dst=dst, src=src, dge_mode=nisa.dge_mode.hwdge, engine=engine)
+
+
 def _emit_transpose(dst, src, rows, cols):
     """``dst = src^T`` for a ``[rows, cols]`` source, through PSUM.
 
@@ -298,105 +346,383 @@ def _emit_gate_cumsum(dst, gk_sb, triu_sb, chunk, width):
     nisa.tensor_copy(dst=dst, src=ps)
 
 
-def _emit_row_products(dst, left_sb, right_t_sb, chunk, width):
-    """``dst = left @ right^T`` for ``[chunk, width]`` tiles.
+def tile_rows(chunk: int) -> int:
+    """Token rows of one packed tile: the most whole chunks one partition tile holds.
 
-    ``right_t_sb`` is already ``[width, chunk]``; ``left`` is transposed here so
-    that ``stationary^T @ moving`` lands the ``[chunk, chunk]`` product.
+    Both kernels place ``MAX_TILE // chunk`` chunks on the partitions of one tile, so
+    a ``chunk``-wide matrix of every chunk in the tile sits on the diagonal of one
+    ``[tile_rows, tile_rows]`` block-diagonal tile.
     """
-    left_t = _sbuf(width, chunk)
-    _emit_transpose(left_t, left_sb, chunk, width)
-    ps = _psum(chunk, chunk)
-    nisa.nc_matmul(dst=ps, stationary=left_t, moving=right_t_sb, accumulate=False)
-    nisa.tensor_copy(dst=dst, src=ps)
+    return (MAX_TILE // chunk) * chunk
 
 
-def _emit_unit_lower_inverse(dst, a_sb, eye_sb, chunk):
-    """``dst = (I + A)**-1`` for strictly lower triangular ``A``, by doubling.
+def _emit_same_chunk(rows, chunk):
+    """``[rows, rows]`` 0/1 tile: 1 where tokens ``p`` and ``f`` share a chunk.
 
-    ``s`` holds the partial sum and ``n`` holds ``N**(2**j)``; ``nt`` holds ``n``'s
-    transpose so that every product is a ``stationary^T @ moving`` without a
-    transpose inside the loop. The loop runs :func:`doubling_stages` ==
-    ``log2(chunk)`` times and does not walk tokens: each stage squares the current
-    power and doubles the number of series terms summed.
+    With the free axis viewed as ``(f // chunk, f % chunk)``, ``p // chunk ==
+    f // chunk`` is the pair of affine conditions ``p - chunk * (f // chunk) >= 0``
+    and ``chunk * (f // chunk) + chunk - 1 - p >= 0``, one ``affine_select`` each.
+    Returned as ``[rows, rows // chunk, chunk]``.
+    """
+    groups = rows // chunk
+    ones = nl.ndarray((rows, groups, chunk), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.memset(dst=ones, value=1.0)
+    not_before = nl.ndarray((rows, groups, chunk), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.affine_select(
+        dst=not_before, pattern=[[-chunk, groups], [0, chunk]], channel_multiplier=1,
+        on_true_tile=ones, on_false_value=0.0, cmp_op=nl.greater_equal,
+    )
+    same = nl.ndarray((rows, groups, chunk), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.affine_select(
+        dst=same, pattern=[[chunk, groups], [0, chunk]], channel_multiplier=-1,
+        on_true_tile=not_before, on_false_value=0.0, cmp_op=nl.greater_equal,
+        offset=chunk - 1,
+    )
+    return same
 
-    Every scratch tile is allocated before the loop. Allocating inside would ask
-    for one live PSUM tile per unrolled stage where two suffice.
+
+def _emit_replicator(rows, chunk):
+    """``[chunk, rows]`` 0/1 tile: 1 where ``f % chunk`` equals the partition.
+
+    As a stationary operand it copies row ``f % chunk`` of a ``[chunk, X]`` moving
+    operand onto output row ``f``: one nonzero term per output, so exact.
+    """
+    groups = rows // chunk
+    ones = nl.ndarray((chunk, groups, chunk), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.memset(dst=ones, value=1.0)
+    rep = nl.ndarray((chunk, groups, chunk), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.affine_select(
+        dst=rep, pattern=[[0, groups], [1, chunk]], channel_multiplier=-1,
+        on_true_tile=ones, on_false_value=0.0, cmp_op=nl.equal,
+    )
+    return rep
+
+
+def _emit_unpack(dst, packed, same, rows, chunk):
+    """``dst [rows, rows]`` block-diagonal from ``packed [rows, chunk]``.
+
+    Row ``p`` of a packed tile holds row ``p % chunk`` of its chunk's
+    ``[C, C]`` matrix, which is the ``[NC, C, C]`` HBM layout read as rows.
+    """
+    groups = rows // chunk
+    nisa.tensor_tensor(
+        dst=dst.reshape((rows, groups, chunk)),
+        data1=packed.reshape((rows, 1, chunk)).broadcast(1, groups),
+        data2=same[0:rows, 0:groups, 0:chunk], op=nl.multiply,
+    )
+
+
+def _emit_chunk_rows(consts_hbm, rep, rows, chunk, engine):
+    """Every ``[C, C]`` constant's row ``p % chunk`` on tile row ``p``.
+
+    Returns ``[rows, len(consts_hbm) * chunk]``, constant ``i`` in columns
+    ``i * chunk`` onward: that constant repeated in every chunk, in the packed
+    layout :func:`_emit_unpack` reads. One matmul against the replicator serves
+    all of them, and each output has one nonzero term, so it is exact. ``engine``
+    issues the constants' DMAs.
+    """
+    count = len(consts_hbm)
+    stacked = nl.ndarray((chunk, count, chunk), dtype=nl.float32, buffer=nl.sbuf)
+    for index in range(count):
+        _dma(stacked[0:chunk, index, 0:chunk], consts_hbm[index], engine)
+    ps = _psum(rows, count * chunk)
+    nisa.nc_matmul(
+        dst=ps, stationary=rep.reshape((chunk, rows)),
+        moving=stacked.reshape((chunk, count * chunk)), accumulate=False,
+    )
+    chunk_rows = _sbuf(rows, count * chunk)
+    nisa.tensor_copy(dst=chunk_rows, src=ps)
+    return chunk_rows
+
+
+def _emit_block_diagonal(chunk_rows, index, same, rows, chunk):
+    """``[rows, rows]``: constant ``index`` of :func:`_emit_chunk_rows` on every
+    diagonal block, zero elsewhere."""
+    dst = _sbuf(rows, rows)
+    _emit_unpack(dst, chunk_rows[0:rows, index * chunk : (index + 1) * chunk], same,
+                 rows, chunk)
+    return dst
+
+
+def _emit_pack(dst, full, rows, chunk):
+    """``dst [rows, chunk]`` = the diagonal blocks of a block-diagonal ``full``.
+
+    Every off-block entry of ``full`` is zero, so the sum over the column blocks
+    is the diagonal block itself, exactly.
+    """
+    groups = rows // chunk
+    nisa.tensor_reduce(
+        dst=dst, data=full.reshape((rows, groups, chunk)).permute((0, 2, 1)),
+        op=nl.add, axis=(2,),
+    )
+
+
+@dataclass(frozen=True)
+class _IntraLayout(nl.NKIObject):
+    """The block-diagonal constants of one packed tile, built once per launch.
+
+    An ``NKIObject``, because the NKI front end admits no other user class.
+    """
+
+    triu: object
+    neg_mask_lower: object
+    causal: object
+    last_row: object
+    same_chunk: object
+    eye_packed: object
+
+
+def _emit_intra_layout(triu_hbm, eye_hbm, mask_lower_hbm, last_row_hbm, rows, chunk):
+    """The four ``[C, C]`` constants, laid on the diagonal of a packed tile.
+
+    ``neg_mask_lower`` is ``-mask_lower``, so the inverse's ``N = -A`` is one
+    product; ``causal`` is ``mask_lower + eye``; ``eye_packed`` is the identity
+    in the packed ``[rows, C]`` layout, the doubling series' first term.
+    """
+    same = _emit_same_chunk(rows, chunk)
+    rep = _emit_replicator(rows, chunk)
+    chunk_rows = _emit_chunk_rows(
+        (triu_hbm, eye_hbm, mask_lower_hbm, last_row_hbm), rep, rows, chunk,
+        nisa.engine.scalar,
+    )
+    triu = _emit_block_diagonal(chunk_rows, 0, same, rows, chunk)
+    eye = _emit_block_diagonal(chunk_rows, 1, same, rows, chunk)
+    mask_lower = _emit_block_diagonal(chunk_rows, 2, same, rows, chunk)
+    last_row = _emit_block_diagonal(chunk_rows, 3, same, rows, chunk)
+    neg_mask_lower = _sbuf(rows, rows)
+    nisa.tensor_scalar(
+        dst=neg_mask_lower, data=mask_lower, op0=nl.multiply, operand0=-1.0
+    )
+    causal = _sbuf(rows, rows)
+    nisa.tensor_tensor(dst=causal, data1=mask_lower, data2=eye, op=nl.add)
+    eye_packed = chunk_rows[0:rows, chunk : 2 * chunk]
+    return _IntraLayout(triu, neg_mask_lower, causal, last_row, same, eye_packed)
+
+
+def _emit_unit_lower_inverse(dst, n_bd, eye_packed, rows, chunk):
+    """``dst = (I - N)**-1 = (I + A)**-1`` in the packed layout, by doubling.
+
+    ``n_bd`` is ``N = -A``, block-diagonal ``[rows, rows]`` and strictly lower in
+    every block. The partial sum ``s`` stays packed ``[rows, chunk]``: with the
+    block-diagonal ``N**m`` transposed as the stationary operand, ``N**m @ s``
+    contracts only within each chunk, so it streams ``chunk`` columns instead of
+    ``rows``. The powers themselves are squared block-diagonal. The loop runs
+    :func:`doubling_stages` == ``log2(chunk)`` stages and walks no tokens; the
+    last stage needs no further power and the one before it only the transposed
+    one.
+
+    ``dst`` receives the packed inverse, which is the ``[NC, C, C]`` HBM layout
+    as rows.
     """
     stages = doubling_stages(chunk)
-
-    n_sb = _sbuf(chunk, chunk)
-    nt_sb = _sbuf(chunk, chunk)
-    s_sb = _sbuf(chunk, chunk)
-    nisa.tensor_scalar(dst=n_sb, data=a_sb, op0=nl.multiply, operand0=-1.0)
-    _emit_transpose(nt_sb, n_sb, chunk, chunk)
-    nisa.tensor_copy(dst=s_sb, src=eye_sb)
-
-    ps_x = _psum(chunk, chunk)
-    ps_y = _psum(chunk, chunk)
-    tmp = _sbuf(chunk, chunk)
-
+    n_cur = n_bd
+    nt_cur = _sbuf(rows, rows)
+    _emit_transpose(nt_cur, n_bd, rows, rows)
+    s_cur = eye_packed[0:rows]
     for stage in range(stages):
         # s <- s + n @ s, which doubles the number of series terms summed.
-        nisa.nc_matmul(dst=ps_x, stationary=nt_sb, moving=s_sb, accumulate=False)
-        nisa.tensor_copy(dst=tmp, src=ps_x)
-        nisa.tensor_tensor(dst=s_sb, data1=s_sb, data2=tmp, op=nl.add)
+        ps_s = _psum(rows, chunk)
+        nisa.nc_matmul(dst=ps_s, stationary=nt_cur, moving=s_cur, accumulate=False)
+        s_next = dst if stage == stages - 1 else _sbuf(rows, chunk)
+        nisa.tensor_tensor(dst=s_next, data1=s_cur, data2=ps_s, op=nl.add)
+        s_cur = s_next
         if stage < stages - 1:
-            # n <- n @ n and nt <- nt @ nt, both read from the pre-update pair.
-            nisa.nc_matmul(dst=ps_x, stationary=nt_sb, moving=n_sb, accumulate=False)
-            nisa.nc_matmul(dst=ps_y, stationary=n_sb, moving=nt_sb, accumulate=False)
-            nisa.tensor_copy(dst=n_sb, src=ps_x)
-            nisa.tensor_copy(dst=nt_sb, src=ps_y)
+            # nt <- nt @ nt always; n <- n @ n only while a later stage needs it.
+            ps_t = _psum(rows, rows)
+            nisa.nc_matmul(dst=ps_t, stationary=n_cur, moving=nt_cur, accumulate=False)
+            if stage < stages - 2:
+                ps_n = _psum(rows, rows)
+                nisa.nc_matmul(
+                    dst=ps_n, stationary=nt_cur, moving=n_cur, accumulate=False
+                )
+                n_next = _sbuf(rows, rows)
+                nisa.tensor_copy(dst=n_next, src=ps_n)
+                n_cur = n_next
+            nt_next = _sbuf(rows, rows)
+            nisa.tensor_copy(dst=nt_next, src=ps_t)
+            nt_cur = nt_next
 
-    nisa.tensor_copy(dst=dst, src=s_sb)
+
+def _blocks(tile, rows, n_blocks, width):
+    """``tile [rows, n_blocks * width]`` viewed as ``[rows, n_blocks, width]``."""
+    return tile.reshape((rows, n_blocks, width))
 
 
-def _emit_stage3(
-    w_dst, u_dst, kg_dst, k_sb, v_sb, beta_sb, gc_sb, egc_sb, a_inv_sb,
-    last_row_sb, chunk, kdim, vdim,
-):
-    """Stage 3: ``w``, ``u`` and ``kg``. The one body both entry points emit.
+def _per_block(column, rows, n_blocks, width):
+    """``column [rows, n_blocks]`` repeated along each block's ``width`` columns."""
+    return column.reshape((rows, n_blocks, 1)).broadcast(2, width)
 
-    ``u = T @ (beta * v)`` and ``w = T @ (beta * k * exp(gc))``, each one matmul
-    against the inverse ``T`` passed in. ``kg[t] = k[t] * exp(gc[C - 1] - gc[t])``
-    takes the chunk's last gate row by a matmul against the row-selector constant,
-    so no partition-axis broadcast is needed.
+
+def _emit_l2_normalise_blocks(dst, src, rows, n_blocks, cols):
+    """:func:`_emit_l2_normalise` of every ``[rows, cols]`` block of ``src``.
+
+    ``src`` is ``n_blocks`` blocks side by side, ``[rows, n_blocks * cols]``, each
+    normalised along its own row. The per-element operations are those of
+    :func:`_emit_l2_normalise`; each runs once over every block instead of once
+    per block.
     """
-    a_inv_t = _sbuf(chunk, chunk)
-    _emit_transpose(a_inv_t, a_inv_sb, chunk, chunk)
+    sq = _sbuf(rows, n_blocks * cols)
+    nisa.tensor_tensor(dst=sq, data1=src, data2=src, op=nl.multiply)
+    total = _sbuf(rows, n_blocks)
+    nisa.tensor_reduce(
+        dst=total, op=nl.add, data=_blocks(sq, rows, n_blocks, cols), axis=(2,)
+    )
+    den = _sbuf(rows, n_blocks)
+    nisa.tensor_scalar(dst=den, data=total, op0=nl.add, operand0=L2_NORM_EPS)
+    inv_root = _sbuf(rows, n_blocks)
+    nisa.activation(dst=inv_root, data=den, op=nl.rsqrt)
+    nisa.tensor_tensor(
+        dst=_blocks(dst, rows, n_blocks, cols),
+        data1=_blocks(src, rows, n_blocks, cols),
+        data2=_per_block(inv_root, rows, n_blocks, cols), op=nl.multiply,
+    )
 
-    vb = _sbuf(chunk, vdim)
-    nisa.tensor_scalar(dst=vb, data=v_sb, op0=nl.multiply, operand0=beta_sb)
-    ps_u = _psum(chunk, vdim)
-    nisa.nc_matmul(dst=ps_u, stationary=a_inv_t, moving=vb, accumulate=False)
-    nisa.tensor_copy(dst=u_dst, src=ps_u)
 
-    kb = _sbuf(chunk, kdim)
-    nisa.tensor_scalar(dst=kb, data=k_sb, op0=nl.multiply, operand0=beta_sb)
-    nisa.tensor_tensor(dst=kb, data1=kb, data2=egc_sb, op=nl.multiply)
-    ps_w = _psum(chunk, kdim)
-    nisa.nc_matmul(dst=ps_w, stationary=a_inv_t, moving=kb, accumulate=False)
-    nisa.tensor_copy(dst=w_dst, src=ps_w)
+#: fp32 elements one PSUM bank holds per partition, so the widest matmul result.
+PSUM_BANK_FP32 = 512
 
-    ps_last = _psum(chunk, kdim)
-    nisa.nc_matmul(dst=ps_last, stationary=last_row_sb, moving=gc_sb, accumulate=False)
-    gl = _sbuf(chunk, kdim)
-    nisa.tensor_copy(dst=gl, src=ps_last)
-    nisa.tensor_tensor(dst=gl, data1=gl, data2=gc_sb, op=nl.subtract)
-    decay = _sbuf(chunk, kdim)
+
+def _emit_row_matmul(dst, stationary, moving, rows, width):
+    """``dst [rows, width] = stationary^T @ moving``, one PSUM bank at a time.
+
+    For a ``moving`` of several side-by-side blocks that share one stationary
+    operand: the gate cumulative sum and the last-row selection of every packed
+    tile in one pass per bank.
+    """
+    for c0 in range(0, width, PSUM_BANK_FP32):
+        cols = min(PSUM_BANK_FP32, width - c0)
+        ps = _psum(rows, cols)
+        nisa.nc_matmul(
+            dst=ps, stationary=stationary, moving=moving[0:rows, c0 : c0 + cols],
+            accumulate=False,
+        )
+        nisa.tensor_copy(dst=dst[0:rows, c0 : c0 + cols], src=ps)
+
+
+def _emit_gate_terms(gc_sb, exps, gk_sb, triu_bd, rows, width):
+    """The cumulative gate ``gc`` and its exponentials, one PSUM bank at a time.
+
+    ``gk_sb`` is side-by-side packed tiles ``[rows, width]``; ``triu_bd`` the
+    block-diagonal upper-inclusive ones, so the cumulative sum restarts at every
+    chunk. ``exps`` is a tuple of ``(dst, scale)``: each ``dst = exp(scale * gc)``.
+    The exponentials read the matmul's PSUM result while the Vector engine copies
+    it out, so neither waits on the other.
+    """
+    for c0 in range(0, width, PSUM_BANK_FP32):
+        cols = min(PSUM_BANK_FP32, width - c0)
+        ps = _psum(rows, cols)
+        nisa.nc_matmul(
+            dst=ps, stationary=triu_bd, moving=gk_sb[0:rows, c0 : c0 + cols],
+            accumulate=False,
+        )
+        nisa.tensor_copy(dst=gc_sb[0:rows, c0 : c0 + cols], src=ps,
+                         engine=nisa.engine.vector)
+        for index in range(len(exps)):
+            nisa.activation(dst=exps[index][0][0:rows, c0 : c0 + cols], data=ps,
+                            op=nl.exp, scale=exps[index][1])
+
+
+def _emit_prepare(k_sb, gc_sb, egc_sb, k_raw, gk_sb, triu_bd, rows, n_tiles, kdim):
+    """L2-normalise ``k`` into ``k_sb``, then form ``gc`` and ``exp(gc)``.
+
+    The stage-3 entry point's preparation, from the same helpers the combined
+    entry point uses, so it derives its normalised key and cumulative gate
+    exactly as that one does.
+    """
+    _emit_l2_normalise_blocks(k_sb, k_raw, rows, n_tiles, kdim)
+    _emit_gate_terms(gc_sb, ((egc_sb, 1.0),), gk_sb, triu_bd, rows, n_tiles * kdim)
+
+
+def _emit_uw(uw_dst, k_sb, v_sb, beta_col, egc_sb, a_inv_packed, same_chunk, rows,
+             chunk, kdim, vdim):
+    """Stage 3's ``u`` and ``w`` for one packed tile.
+
+    ``u = T @ (beta * v)`` and ``w = T @ (beta * k * exp(gc))`` are one matmul
+    against the block-diagonal inverse ``T``, unpacked from ``a_inv_packed`` and
+    transposed: the two moving operands are disjoint column ranges of one tile,
+    and ``uw_dst [rows, V + K]`` receives ``u`` then ``w``.
+    """
+    t_bd = _sbuf(rows, rows)
+    _emit_unpack(t_bd, a_inv_packed, same_chunk, rows, chunk)
+    t_t = _sbuf(rows, rows)
+    _emit_transpose(t_t, t_bd, rows, rows)
+    vk = _sbuf(rows, vdim + kdim)
+    nisa.tensor_scalar(
+        dst=vk[0:rows, 0:vdim], data=v_sb, op0=nl.multiply, operand0=beta_col
+    )
+    nisa.scalar_tensor_tensor(
+        dst=vk[0:rows, vdim : vdim + kdim], data=k_sb, op0=nl.multiply,
+        operand0=beta_col, op1=nl.multiply, operand1=egc_sb,
+    )
+    ps_uw = _psum(rows, vdim + kdim)
+    nisa.nc_matmul(dst=ps_uw, stationary=t_t, moving=vk, accumulate=False)
+    nisa.tensor_copy(dst=uw_dst, src=ps_uw)
+
+
+def _emit_kg(kg_dst, k_sb, gc_sb, last_row_bd, rows, width):
+    """Stage 3's ``kg[t] = k[t] * exp(gc[last of t's chunk] - gc[t])``.
+
+    Over side-by-side packed tiles ``[rows, width]``: the chunk's last gate row
+    comes from a matmul against the block-diagonal row selector.
+    """
+    last = _sbuf(rows, width)
+    _emit_row_matmul(last, last_row_bd[0:rows, 0:rows], gc_sb, rows, width)
+    gl = _sbuf(rows, width)
+    nisa.tensor_tensor(dst=gl, data1=last, data2=gc_sb, op=nl.subtract)
+    decay = _sbuf(rows, width)
     nisa.activation(dst=decay, data=gl, op=nl.exp)
     nisa.tensor_tensor(dst=kg_dst, data1=k_sb, data2=decay, op=nl.multiply)
 
 
-def _emit_prepare(k_sb, gc_sb, egc_sb, k_raw, gk_sb, triu_sb, chunk, kdim):
-    """L2-normalise ``k`` into ``k_sb``, then form ``gc`` and ``exp(gc)``.
+def _program_tiles(rows, layout_rows):
+    """``(full tiles per program, first full tile, tail rows)`` for this program.
 
-    Shared, so the stage-3 entry point derives its normalised key and cumulative
-    gate exactly as the combined entry point does.
+    A two-program launch splits whole tiles evenly; :func:`intra_chunk_grid`
+    only asks for one where that is possible, and anything else is refused here
+    rather than silently computed twice or skipped.
     """
-    _emit_l2_normalise(k_sb, k_raw, chunk, kdim)
-    _emit_gate_cumsum(gc_sb, gk_sb, triu_sb, chunk, kdim)
-    nisa.activation(dst=egc_sb, data=gc_sb, op=nl.exp)
+    n_prog = nl.num_programs(0)
+    full, tail = divmod(rows, layout_rows)
+    # The NKI front end admits ``assert`` and no ``raise``.
+    assert n_prog == 1 or (tail == 0 and full % n_prog == 0), (
+        "the packed tiles of this geometry do not split over the launch's programs"
+    )
+    per_prog = full // n_prog
+    return per_prog, nl.program_id(0) * per_prog, tail
+
+
+def _rows_view(tensor_hbm):
+    """``[NC, C, X]`` HBM as ``[NC * C, X]`` token rows."""
+    n_chunks, chunk, width = tensor_hbm.shape
+    return tensor_hbm.reshape((n_chunks * chunk, width))
+
+
+def _tile_rows(tensor_rows, r0, n_tiles, rows, width):
+    """``n_tiles`` packed tiles of ``tensor_rows`` from row ``r0``, as one DMA operand.
+
+    Token row ``r0 + i * rows + p`` maps to partition ``p``, block ``i``: the
+    ``[rows, n_tiles * width]`` SBUF layout every batched step reads.
+    """
+    return tensor_rows[nl.ds(r0, n_tiles * rows), 0:width].reshape(
+        (n_tiles, rows, width)
+    ).permute((1, 0, 2))
+
+
+def _load_tiles(tensor_rows, r0, n_tiles, rows, width, engine):
+    """Load the rows :func:`_tile_rows` names into a new ``[rows, n_tiles * width]`` tile.
+
+    One DMA, its descriptors from ``engine`` (see :func:`_dma`); the inverse of
+    :func:`_store_tiles`.
+    """
+    tile = _sbuf(rows, n_tiles * width)
+    _dma(_blocks(tile, rows, n_tiles, width),
+         _tile_rows(tensor_rows, r0, n_tiles, rows, width), engine)
+    return tile
+
+
+def _store_tiles(tensor_rows, src3, r0, n_tiles, rows, width, engine):
+    """Store ``src3 [rows, n_tiles, width]`` to the rows :func:`_tile_rows` names."""
+    _dma(_tile_rows(tensor_rows, r0, n_tiles, rows, width), src3, engine)
 
 
 @nki.jit
@@ -407,95 +733,195 @@ def kda_intra_chunk_kernel(
     """Stages 1 to 3 for every chunk, in one dispatch.
 
     ``q``, ``k`` and ``gk`` are ``[NC, C, K]``; ``v`` is ``[NC, C, V]``; ``beta``
-    is ``[NC, C, 1]``; the four constants are ``[C, C]``.
+    is ``[NC, C, 1]``; the four constants are ``[C, C]``; all float32. Returns
+    ``w [NC, C, K]``, ``u [NC, C, V]``, ``kg [NC, C, K]``, ``a_inv [NC, C, C]`` and
+    ``aqk [NC, C, C]``, float32.
 
-    The chunk loop is ``nl.affine_range`` because stages 1 to 3 are chunk-local
-    with no carry between chunks. The inter-chunk half does carry state, which is
-    why it needs a sequential range.
+    Tokens are packed ``MAX_TILE // C`` chunks to a tile (:func:`tile_rows`), and
+    every chunk-local ``[C, C]`` product of the tile is a diagonal block of one
+    ``[rows, rows]`` product, masked by the block-diagonal constants. Stages 1 to
+    3 are chunk-local with no carry, so the tiles are independent: a program
+    loads all of its tiles side by side, runs every row-wise step once over them
+    and the chunk-local products per tile, and a two-program launch gives each
+    program a contiguous half of the whole tiles.
     """
     n_chunks, chunk, kdim = q_hbm.shape
     vdim = v_hbm.shape[2]
     scale = float(kdim) ** -0.5
+    rows = n_chunks * chunk
+    layout_rows = min(tile_rows(chunk), rows)
 
     w_hbm = nl.ndarray((n_chunks, chunk, kdim), dtype=nl.float32, buffer=nl.shared_hbm)
     u_hbm = nl.ndarray((n_chunks, chunk, vdim), dtype=nl.float32, buffer=nl.shared_hbm)
     kg_hbm = nl.ndarray((n_chunks, chunk, kdim), dtype=nl.float32, buffer=nl.shared_hbm)
     ainv_hbm = nl.ndarray((n_chunks, chunk, chunk), dtype=nl.float32, buffer=nl.shared_hbm)
     aqk_hbm = nl.ndarray((n_chunks, chunk, chunk), dtype=nl.float32, buffer=nl.shared_hbm)
+    sources = (
+        _rows_view(q_hbm), _rows_view(k_hbm), _rows_view(v_hbm), _rows_view(beta_hbm),
+        _rows_view(gk_hbm),
+    )
+    sinks = (
+        _rows_view(w_hbm), _rows_view(u_hbm), _rows_view(kg_hbm), _rows_view(ainv_hbm),
+        _rows_view(aqk_hbm),
+    )
 
-    triu_sb = _sbuf(chunk, chunk)
-    eye_sb = _sbuf(chunk, chunk)
-    mask_lower_sb = _sbuf(chunk, chunk)
-    last_row_sb = _sbuf(chunk, chunk)
-    causal_sb = _sbuf(chunk, chunk)
-    nisa.tensor_copy(dst=triu_sb, src=nl.load(triu_hbm, dtype=nl.float32))
-    nisa.tensor_copy(dst=eye_sb, src=nl.load(eye_hbm, dtype=nl.float32))
-    nisa.tensor_copy(dst=mask_lower_sb, src=nl.load(mask_lower_hbm, dtype=nl.float32))
-    nisa.tensor_copy(dst=last_row_sb, src=nl.load(last_row_hbm, dtype=nl.float32))
-    nisa.tensor_tensor(dst=causal_sb, data1=mask_lower_sb, data2=eye_sb, op=nl.add)
-
-    for ic in nl.affine_range(n_chunks):
-        k_sb = _sbuf(chunk, kdim)
-        gc_sb = _sbuf(chunk, kdim)
-        egc_sb = _sbuf(chunk, kdim)
-        gk_sb = _sbuf(chunk, kdim)
-        nisa.tensor_copy(dst=gk_sb, src=nl.load(gk_hbm[ic], dtype=nl.float32))
-        _emit_prepare(k_sb, gc_sb, egc_sb, nl.load(k_hbm[ic], dtype=nl.float32),
-                      gk_sb, triu_sb, chunk, kdim)
-
-        q_sb = _sbuf(chunk, kdim)
-        _emit_l2_normalise(q_sb, nl.load(q_hbm[ic], dtype=nl.float32), chunk, kdim)
-        nisa.tensor_scalar(dst=q_sb, data=q_sb, op0=nl.multiply, operand0=scale)
-
-        beta_sb = _sbuf(chunk, 1)
-        nisa.tensor_copy(dst=beta_sb, src=nl.load(beta_hbm[ic], dtype=nl.float32))
-
-        # The gate difference exp(gc[t] - gc[j]) is factorised so that one matmul
-        # contracts the channel axis: exp(gc[t]) on the left rows, exp(-gc[j]) on
-        # the right rows. GATE_CUMSUM_ABS_LIMIT is what bounds both factors.
-        neg_gc = _sbuf(chunk, kdim)
-        emgc_sb = _sbuf(chunk, kdim)
-        nisa.tensor_scalar(dst=neg_gc, data=gc_sb, op0=nl.multiply, operand0=-1.0)
-        nisa.activation(dst=emgc_sb, data=neg_gc, op=nl.exp)
-
-        kp_sb = _sbuf(chunk, kdim)
-        km_sb = _sbuf(chunk, kdim)
-        nisa.tensor_tensor(dst=kp_sb, data1=k_sb, data2=egc_sb, op=nl.multiply)
-        nisa.tensor_tensor(dst=km_sb, data1=k_sb, data2=emgc_sb, op=nl.multiply)
-        km_t_sb = _sbuf(kdim, chunk)
-        _emit_transpose(km_t_sb, km_sb, chunk, kdim)
-
-        kk_sb = _sbuf(chunk, chunk)
-        a_sb = _sbuf(chunk, chunk)
-        _emit_row_products(kk_sb, kp_sb, km_t_sb, chunk, kdim)
-        nisa.tensor_scalar(dst=a_sb, data=kk_sb, op0=nl.multiply, operand0=beta_sb)
-        nisa.tensor_tensor(dst=a_sb, data1=a_sb, data2=mask_lower_sb, op=nl.multiply)
-
-        qp_sb = _sbuf(chunk, kdim)
-        qk_sb = _sbuf(chunk, chunk)
-        aqk_sb = _sbuf(chunk, chunk)
-        nisa.tensor_tensor(dst=qp_sb, data1=q_sb, data2=egc_sb, op=nl.multiply)
-        _emit_row_products(qk_sb, qp_sb, km_t_sb, chunk, kdim)
-        nisa.tensor_tensor(dst=aqk_sb, data1=qk_sb, data2=causal_sb, op=nl.multiply)
-
-        a_inv_sb = _sbuf(chunk, chunk)
-        _emit_unit_lower_inverse(a_inv_sb, a_sb, eye_sb, chunk)
-
-        v_sb = _sbuf(chunk, vdim)
-        nisa.tensor_copy(dst=v_sb, src=nl.load(v_hbm[ic], dtype=nl.float32))
-        w_sb = _sbuf(chunk, kdim)
-        u_sb = _sbuf(chunk, vdim)
-        kg_sb = _sbuf(chunk, kdim)
-        _emit_stage3(w_sb, u_sb, kg_sb, k_sb, v_sb, beta_sb, gc_sb, egc_sb,
-                     a_inv_sb, last_row_sb, chunk, kdim, vdim)
-
-        nl.store(w_hbm[ic], value=w_sb)
-        nl.store(u_hbm[ic], value=u_sb)
-        nl.store(kg_hbm[ic], value=kg_sb)
-        nl.store(ainv_hbm[ic], value=a_inv_sb)
-        nl.store(aqk_hbm[ic], value=aqk_sb)
-
+    layout = _emit_intra_layout(
+        triu_hbm, eye_hbm, mask_lower_hbm, last_row_hbm, layout_rows, chunk
+    )
+    per_prog, first, tail = _program_tiles(rows, layout_rows)
+    if per_prog:
+        _emit_intra_tiles(
+            sinks, sources, layout, first * layout_rows, per_prog, layout_rows,
+            chunk, kdim, vdim, scale,
+        )
+    if tail:
+        _emit_intra_tiles(
+            sinks, sources, layout, rows - tail, 1, tail, chunk, kdim, vdim, scale
+        )
     return w_hbm, u_hbm, kg_hbm, ainv_hbm, aqk_hbm
+
+
+def _emit_intra_tiles(
+    sinks, sources, layout, r0, n_tiles, rows, chunk, kdim, vdim, scale
+):
+    """Stages 1 to 3 for ``n_tiles`` packed tiles of ``rows`` rows from row ``r0``.
+
+    The loads, the stores, the normalisation, the cumulative gate and its
+    exponentials run once over all the tiles side by side; the chunk-local
+    products run per tile, so one tile's products overlap the next one's
+    elementwise steps. The normalisation's reciprocal root runs before every
+    exponential, so the Scalar engine switches activation tables once.
+    """
+    q_rows, k_rows, v_rows, beta_rows, gk_rows = sources
+    w_rows, u_rows, kg_rows, ainv_rows, aqk_rows = sinks
+    wk = n_tiles * kdim
+    width = vdim + kdim
+
+    gk_sb = _load_tiles(gk_rows, r0, n_tiles, rows, kdim, nisa.engine.sync)
+    # q and k side by side, so one pass of each normalisation step serves both.
+    qk_raw = _sbuf(rows, 2 * wk)
+    _dma(_blocks(qk_raw[0:rows, 0:wk], rows, n_tiles, kdim),
+         _tile_rows(q_rows, r0, n_tiles, rows, kdim), nisa.engine.scalar)
+    _dma(_blocks(qk_raw[0:rows, wk : 2 * wk], rows, n_tiles, kdim),
+         _tile_rows(k_rows, r0, n_tiles, rows, kdim), nisa.engine.sync)
+    v_sb = _load_tiles(v_rows, r0, n_tiles, rows, vdim, nisa.engine.scalar)
+    beta_sb = _load_tiles(beta_rows, r0, n_tiles, rows, 1, nisa.engine.sync)
+
+    qk_norm = _sbuf(rows, 2 * wk)
+    _emit_l2_normalise_blocks(qk_norm, qk_raw, rows, 2 * n_tiles, kdim)
+    k_sb = qk_norm[0:rows, wk : 2 * wk]
+    q_sb = _sbuf(rows, wk)
+    nisa.tensor_scalar(dst=q_sb, data=qk_norm[0:rows, 0:wk], op0=nl.multiply,
+                       operand0=scale)
+    # The gate difference exp(gc[t] - gc[j]) is factorised so that one matmul
+    # contracts the channel axis: exp(gc[t]) on the left rows, exp(-gc[j]) on
+    # the right rows. GATE_CUMSUM_ABS_LIMIT is what bounds both factors, and
+    # pairs from different chunks are bounded the same way before the mask
+    # zeroes them.
+    gc_sb = _sbuf(rows, wk)
+    egc_sb = _sbuf(rows, wk)
+    emgc_sb = _sbuf(rows, wk)
+    _emit_gate_terms(gc_sb, ((egc_sb, 1.0), (emgc_sb, -1.0)), gk_sb,
+                     layout.triu[0:rows, 0:rows], rows, wk)
+
+    ainv_sb = _sbuf(rows, n_tiles * chunk)
+    aqk_sb = _sbuf(rows, n_tiles * chunk)
+    uw_sb = _sbuf(rows, n_tiles * width)
+    for t in range(n_tiles):
+        k0 = t * kdim
+        c0 = t * chunk
+        k_t = k_sb[0:rows, k0 : k0 + kdim]
+        egc_t = egc_sb[0:rows, k0 : k0 + kdim]
+        beta_col = beta_sb[0:rows, t : t + 1]
+        kp_sb = _sbuf(rows, kdim)
+        km_sb = _sbuf(rows, kdim)
+        qp_sb = _sbuf(rows, kdim)
+        nisa.tensor_tensor(dst=kp_sb, data1=k_t, data2=egc_t, op=nl.multiply)
+        nisa.tensor_tensor(dst=km_sb, data1=k_t, data2=emgc_sb[0:rows, k0 : k0 + kdim],
+                           op=nl.multiply)
+        nisa.tensor_tensor(dst=qp_sb, data1=q_sb[0:rows, k0 : k0 + kdim], data2=egc_t,
+                           op=nl.multiply)
+        km_t = _sbuf(kdim, rows)
+        kp_t = _sbuf(kdim, rows)
+        qp_t = _sbuf(kdim, rows)
+        _emit_transpose(km_t, km_sb, rows, kdim)
+        _emit_transpose(kp_t, kp_sb, rows, kdim)
+        _emit_transpose(qp_t, qp_sb, rows, kdim)
+
+        # N = -A = -(beta * kk) * mask_lower, block-diagonal.
+        ps_kk = _psum(rows, rows)
+        nisa.nc_matmul(dst=ps_kk, stationary=kp_t, moving=km_t, accumulate=False)
+        n_bd = _sbuf(rows, rows)
+        nisa.scalar_tensor_tensor(
+            dst=n_bd, data=ps_kk, op0=nl.multiply, operand0=beta_col,
+            op1=nl.multiply, operand1=layout.neg_mask_lower[0:rows, 0:rows],
+        )
+
+        ps_qk = _psum(rows, rows)
+        nisa.nc_matmul(dst=ps_qk, stationary=qp_t, moving=km_t, accumulate=False)
+        aqk_bd = _sbuf(rows, rows)
+        nisa.tensor_tensor(
+            dst=aqk_bd, data1=ps_qk, data2=layout.causal[0:rows, 0:rows], op=nl.multiply
+        )
+        _emit_pack(aqk_sb[0:rows, c0 : c0 + chunk], aqk_bd, rows, chunk)
+        a_inv_t = ainv_sb[0:rows, c0 : c0 + chunk]
+        _emit_unit_lower_inverse(a_inv_t, n_bd, layout.eye_packed, rows, chunk)
+        _emit_uw(uw_sb[0:rows, t * width : (t + 1) * width], k_t,
+                 v_sb[0:rows, t * vdim : (t + 1) * vdim], beta_col, egc_t, a_inv_t,
+                 layout.same_chunk, rows, chunk, kdim, vdim)
+
+    kg_sb = _sbuf(rows, wk)
+    _emit_kg(kg_sb, k_sb, gc_sb, layout.last_row, rows, wk)
+
+    uw3 = _blocks(uw_sb, rows, n_tiles, width)
+    _store_tiles(u_rows, uw3[0:rows, 0:n_tiles, 0:vdim], r0, n_tiles, rows, vdim,
+                 nisa.engine.sync)
+    _store_tiles(w_rows, uw3[0:rows, 0:n_tiles, vdim:width], r0, n_tiles, rows, kdim,
+                 nisa.engine.scalar)
+    _store_tiles(kg_rows, _blocks(kg_sb, rows, n_tiles, kdim), r0, n_tiles, rows, kdim,
+                 nisa.engine.sync)
+    _store_tiles(ainv_rows, _blocks(ainv_sb, rows, n_tiles, chunk), r0, n_tiles, rows,
+                 chunk, nisa.engine.scalar)
+    _store_tiles(aqk_rows, _blocks(aqk_sb, rows, n_tiles, chunk), r0, n_tiles, rows,
+                 chunk, nisa.engine.sync)
+
+
+def _emit_stage3_tiles(
+    sinks, sources, same, triu, last_row, r0, n_tiles, rows, chunk, kdim, vdim
+):
+    """Stage 3 alone for ``n_tiles`` packed tiles of ``rows`` rows from row ``r0``."""
+    k_rows, v_rows, beta_rows, gk_rows, ainv_rows = sources
+    w_rows, u_rows, kg_rows = sinks
+    wk = n_tiles * kdim
+    gk_sb = _load_tiles(gk_rows, r0, n_tiles, rows, kdim, nisa.engine.sync)
+    k_raw = _load_tiles(k_rows, r0, n_tiles, rows, kdim, nisa.engine.scalar)
+    v_sb = _load_tiles(v_rows, r0, n_tiles, rows, vdim, nisa.engine.sync)
+    beta_sb = _load_tiles(beta_rows, r0, n_tiles, rows, 1, nisa.engine.scalar)
+    a_inv_packed = _load_tiles(ainv_rows, r0, n_tiles, rows, chunk, nisa.engine.sync)
+    k_sb = _sbuf(rows, wk)
+    gc_sb = _sbuf(rows, wk)
+    egc_sb = _sbuf(rows, wk)
+    _emit_prepare(k_sb, gc_sb, egc_sb, k_raw, gk_sb, triu[0:rows, 0:rows], rows,
+                  n_tiles, kdim)
+    width = vdim + kdim
+    uw_sb = _sbuf(rows, n_tiles * width)
+    for t in range(n_tiles):
+        k0 = t * kdim
+        _emit_uw(uw_sb[0:rows, t * width : (t + 1) * width],
+                 k_sb[0:rows, k0 : k0 + kdim],
+                 v_sb[0:rows, t * vdim : (t + 1) * vdim], beta_sb[0:rows, t : t + 1],
+                 egc_sb[0:rows, k0 : k0 + kdim],
+                 a_inv_packed[0:rows, t * chunk : (t + 1) * chunk], same, rows, chunk,
+                 kdim, vdim)
+    kg_sb = _sbuf(rows, wk)
+    _emit_kg(kg_sb, k_sb, gc_sb, last_row, rows, wk)
+    uw3 = _blocks(uw_sb, rows, n_tiles, width)
+    _store_tiles(u_rows, uw3[0:rows, 0:n_tiles, 0:vdim], r0, n_tiles, rows, vdim,
+                 nisa.engine.sync)
+    _store_tiles(w_rows, uw3[0:rows, 0:n_tiles, vdim:width], r0, n_tiles, rows, kdim,
+                 nisa.engine.scalar)
+    _store_tiles(kg_rows, _blocks(kg_sb, rows, n_tiles, kdim), r0, n_tiles, rows, kdim,
+                 nisa.engine.sync)
 
 
 @nki.jit
@@ -504,49 +930,47 @@ def kda_stage3_kernel(
 ):
     """Stage 3 alone, taking the inverse as an argument.
 
-    The boundary upstream's ``recompute_w_u_fwd`` also uses. The body is
-    :func:`_emit_stage3`, the same one the combined entry point emits.
+    ``k`` and ``gk`` are ``[NC, C, K]``, ``v`` is ``[NC, C, V]``, ``beta`` is
+    ``[NC, C, 1]``, ``a_inv`` is ``[NC, C, C]``, the two constants are ``[C, C]``;
+    returns ``w``, ``u``, ``kg`` as :func:`kda_intra_chunk_kernel` does. The
+    boundary upstream's ``recompute_w_u_fwd`` also uses; the body is
+    :func:`_emit_uw` and :func:`_emit_kg`, the ones the combined entry point emits.
 
     Because ``u = T @ (beta * v)`` is linear in ``T``, scaling a row of the
     supplied inverse scales the same row of ``u``.
     """
     n_chunks, chunk, kdim = k_hbm.shape
     vdim = v_hbm.shape[2]
+    rows = n_chunks * chunk
+    layout_rows = min(tile_rows(chunk), rows)
 
     w_hbm = nl.ndarray((n_chunks, chunk, kdim), dtype=nl.float32, buffer=nl.shared_hbm)
     u_hbm = nl.ndarray((n_chunks, chunk, vdim), dtype=nl.float32, buffer=nl.shared_hbm)
     kg_hbm = nl.ndarray((n_chunks, chunk, kdim), dtype=nl.float32, buffer=nl.shared_hbm)
+    sources = (
+        _rows_view(k_hbm), _rows_view(v_hbm), _rows_view(beta_hbm), _rows_view(gk_hbm),
+        _rows_view(a_inv_hbm),
+    )
+    sinks = (_rows_view(w_hbm), _rows_view(u_hbm), _rows_view(kg_hbm))
 
-    triu_sb = _sbuf(chunk, chunk)
-    last_row_sb = _sbuf(chunk, chunk)
-    nisa.tensor_copy(dst=triu_sb, src=nl.load(triu_hbm, dtype=nl.float32))
-    nisa.tensor_copy(dst=last_row_sb, src=nl.load(last_row_hbm, dtype=nl.float32))
+    same = _emit_same_chunk(layout_rows, chunk)
+    rep = _emit_replicator(layout_rows, chunk)
+    chunk_rows = _emit_chunk_rows((triu_hbm, last_row_hbm), rep, layout_rows, chunk,
+                                  nisa.engine.scalar)
+    triu = _emit_block_diagonal(chunk_rows, 0, same, layout_rows, chunk)
+    last_row = _emit_block_diagonal(chunk_rows, 1, same, layout_rows, chunk)
 
-    for ic in nl.affine_range(n_chunks):
-        k_sb = _sbuf(chunk, kdim)
-        gc_sb = _sbuf(chunk, kdim)
-        egc_sb = _sbuf(chunk, kdim)
-        gk_sb = _sbuf(chunk, kdim)
-        nisa.tensor_copy(dst=gk_sb, src=nl.load(gk_hbm[ic], dtype=nl.float32))
-        _emit_prepare(k_sb, gc_sb, egc_sb, nl.load(k_hbm[ic], dtype=nl.float32),
-                      gk_sb, triu_sb, chunk, kdim)
-
-        beta_sb = _sbuf(chunk, 1)
-        nisa.tensor_copy(dst=beta_sb, src=nl.load(beta_hbm[ic], dtype=nl.float32))
-        v_sb = _sbuf(chunk, vdim)
-        nisa.tensor_copy(dst=v_sb, src=nl.load(v_hbm[ic], dtype=nl.float32))
-        a_inv_sb = _sbuf(chunk, chunk)
-        nisa.tensor_copy(dst=a_inv_sb, src=nl.load(a_inv_hbm[ic], dtype=nl.float32))
-
-        w_sb = _sbuf(chunk, kdim)
-        u_sb = _sbuf(chunk, vdim)
-        kg_sb = _sbuf(chunk, kdim)
-        _emit_stage3(w_sb, u_sb, kg_sb, k_sb, v_sb, beta_sb, gc_sb, egc_sb,
-                     a_inv_sb, last_row_sb, chunk, kdim, vdim)
-
-        nl.store(w_hbm[ic], value=w_sb)
-        nl.store(u_hbm[ic], value=u_sb)
-        nl.store(kg_hbm[ic], value=kg_sb)
+    per_prog, first, tail = _program_tiles(rows, layout_rows)
+    if per_prog:
+        _emit_stage3_tiles(
+            sinks, sources, same, triu, last_row, first * layout_rows, per_prog,
+            layout_rows, chunk, kdim, vdim,
+        )
+    if tail:
+        _emit_stage3_tiles(
+            sinks, sources, same, triu, last_row, rows - tail, 1, tail, chunk, kdim,
+            vdim,
+        )
 
     return w_hbm, u_hbm, kg_hbm
 
@@ -588,6 +1012,23 @@ def _require_admissible(
         raise ChunkedRecurrenceError(
             "kda_intra_chunk cannot serve this input: " + "; ".join(problems)
         )
+
+
+def intra_chunk_grid(n_chunks: int, chunk: int) -> tuple[int, ...]:
+    """The launch grid of :func:`kda_intra_chunk_kernel` for this geometry.
+
+    ``(LNC2_PROGRAMS,)`` on an LNC2 runtime (``NEURON_LOGICAL_NC_CONFIG=2``: two
+    physical cores per logical core) when the packed tiles are all whole and split
+    evenly over the programs, else ``()`` (one program). Each program then owns a
+    contiguous run of whole tiles.
+    """
+    if not lnc_pair():
+        return ()
+    rows = n_chunks * chunk
+    full, tail = divmod(rows, tile_rows(chunk))
+    if tail or full % LNC2_PROGRAMS:
+        return ()
+    return (LNC2_PROGRAMS,)
 
 
 def can_run_intra_chunk(
@@ -671,7 +1112,11 @@ def kda_intra_chunk(
 
     consts = chunk_constants(chunk, device=q.device, dtype=q.dtype)
     _count_nki_dispatch()
-    w, u, kg, a_inv, aqk = wrap_nki(kda_intra_chunk_kernel)(
+    call = wrap_nki(kda_intra_chunk_kernel)
+    grid = intra_chunk_grid(n_chunks, chunk)
+    if grid:
+        call = call[grid]
+    w, u, kg, a_inv, aqk = call(
         q_hbm=q,
         k_hbm=k,
         v_hbm=v,
@@ -894,6 +1339,158 @@ def inter_chunk_constants(
     )
 
 
+@dataclass(frozen=True)
+class _InterLayout(nl.NKIObject):
+    """The packed-tile constants of the inter-chunk kernel, built once per launch.
+
+    ``triu`` is the block-diagonal upper-inclusive ones, so one matmul forms every
+    chunk's cumulative gate in the tile; ``last_sel[r, g]`` is 1 where ``r`` is
+    chunk ``g``'s last token, so one matmul against it lands every chunk's last
+    cumulative-gate row as a ``[K, 1]`` decay column.
+    """
+
+    triu: object
+    last_sel: object
+
+
+def _emit_inter_layout(triu_hbm, last_col_hbm, rows, chunk):
+    """:class:`_InterLayout` for a packed tile of ``rows`` rows."""
+    groups = rows // chunk
+    same = _emit_same_chunk(rows, chunk)
+    rep = _emit_replicator(rows, chunk)
+    chunk_rows = _emit_chunk_rows((triu_hbm,), rep, rows, chunk, nisa.engine.sync)
+    triu = _emit_block_diagonal(chunk_rows, 0, same, rows, chunk)
+    last_col = _sbuf(chunk, 1)
+    _dma(last_col, last_col_hbm, nisa.engine.scalar)
+    ps_last = _psum(rows, 1)
+    nisa.nc_matmul(
+        dst=ps_last, stationary=rep.reshape((chunk, rows)), moving=last_col,
+        accumulate=False,
+    )
+    last_rows = _sbuf(rows, 1)
+    nisa.tensor_copy(dst=last_rows, src=ps_last)
+    last_sel = _sbuf(rows, groups)
+    nisa.tensor_scalar(
+        dst=last_sel, data=same[0:rows, 0:groups, 0], op0=nl.multiply,
+        operand0=last_rows,
+    )
+    return _InterLayout(triu, last_sel)
+
+
+def _emit_inter_operands(sources, layout, g0, groups, chunk, kdim, v0, vpart, scale):
+    """The chain's per-chunk operands for the ``groups`` chunks starting at ``g0``.
+
+    Everything here is off the carried state's critical path; the chain only
+    reads it. The row-layout operands (``gk``, ``q``, ``w``, ``aqk``) are loaded
+    one packed tile at a time; ``kg`` and this program's ``u`` columns are loaded
+    chunk-local, ``[C, groups, *]``, because they enter the chain as the
+    partition-axis operands of chunk-sized matmuls.
+
+    Returns ``(w_t, qg_t, aqk_t, decay, kg_c, u_c)``: per chunk ``g``, the
+    stationary ``w^T``, ``qg^T`` and ``aqk^T`` at ``[:, g]``, and ``decay[:, g]``
+    the state decay column.
+    """
+    kg_hbm, w_rows, u_hbm, gk_rows, q_rows, aqk_rows = sources
+    r0 = g0 * chunk
+    count = groups * chunk
+
+    gk_sb = _load_tiles(gk_rows, r0, 1, count, kdim, nisa.engine.sync)
+    gc_sb = _sbuf(count, kdim)
+    _emit_gate_cumsum(gc_sb, gk_sb, layout.triu[0:count, 0:count], count, kdim)
+    egc_sb = _sbuf(count, kdim)
+    nisa.activation(dst=egc_sb, data=gc_sb, op=nl.exp)
+
+    # `q` arrives raw and is normalised and scaled here, as stage 2 does.
+    q_raw = _load_tiles(q_rows, r0, 1, count, kdim, nisa.engine.scalar)
+    q_norm = _sbuf(count, kdim)
+    _emit_l2_normalise(q_norm, q_raw, count, kdim)
+    q_sb = _sbuf(count, kdim)
+    nisa.tensor_scalar(dst=q_sb, data=q_norm, op0=nl.multiply, operand0=scale)
+    qg_sb = _sbuf(count, kdim)
+    nisa.tensor_tensor(dst=qg_sb, data1=q_sb, data2=egc_sb, op=nl.multiply)
+
+    w_sb = _load_tiles(w_rows, r0, 1, count, kdim, nisa.engine.sync)
+    w_t = nl.ndarray((kdim, groups, chunk), dtype=nl.float32, buffer=nl.sbuf)
+    ps_w = _psum(kdim, count)
+    nisa.nc_transpose(dst=ps_w, data=w_sb)
+    nisa.tensor_copy(dst=w_t, src=ps_w.reshape((kdim, groups, chunk)))
+    qg_t = nl.ndarray((kdim, groups, chunk), dtype=nl.float32, buffer=nl.sbuf)
+    ps_q = _psum(kdim, count)
+    nisa.nc_transpose(dst=ps_q, data=qg_sb)
+    nisa.tensor_copy(dst=qg_t, src=ps_q.reshape((kdim, groups, chunk)))
+
+    aqk_sb = _load_tiles(aqk_rows, r0, 1, count, chunk, nisa.engine.scalar)
+    aqk_t = nl.ndarray((chunk, groups, chunk), dtype=nl.float32, buffer=nl.sbuf)
+    ps_a = _psum(chunk, count)
+    nisa.nc_transpose(dst=ps_a, data=aqk_sb)
+    nisa.tensor_copy(dst=aqk_t, src=ps_a.reshape((chunk, groups, chunk)))
+
+    ps_d = _psum(kdim, groups)
+    nisa.nc_matmul(
+        dst=ps_d, stationary=gc_sb, moving=layout.last_sel[0:count, 0:groups],
+        accumulate=False,
+    )
+    decay = _sbuf(kdim, groups)
+    nisa.activation(dst=decay, data=ps_d, op=nl.exp)
+
+    kg_c = nl.ndarray((chunk, groups, kdim), dtype=nl.float32, buffer=nl.sbuf)
+    _dma(kg_c, kg_hbm[g0 : g0 + groups, 0:chunk, 0:kdim].permute((1, 0, 2)),
+         nisa.engine.sync)
+    u_c = nl.ndarray((chunk, groups, vpart), dtype=nl.float32, buffer=nl.sbuf)
+    _dma(u_c, u_hbm[g0 : g0 + groups, 0:chunk, nl.ds(v0, vpart)].permute((1, 0, 2)),
+         nisa.engine.scalar)
+    return w_t, qg_t, aqk_t, decay, kg_c, u_c
+
+
+def _emit_inter_step(ht, operands, g, vnew_c, o_c, chunk, kdim, vpart):
+    """One chunk of stages 4 and 5 on this program's ``vpart`` state columns.
+
+    ``ht`` is the entering state ``[K, vpart]``; returns the leaving one. The
+    carried chain is ``w @ ht``, ``v_new``, ``kg^T @ v_new`` and the decayed sum.
+    ``o``'s two products read the same entering state and ``v_new`` but feed
+    nothing the chain reads, so they are separate matmuls issued after it: a
+    product merged into the chain's matmul would put its stationary columns on
+    every step's weight load.
+    """
+    w_t, qg_t, aqk_t, decay, kg_c, u_c = operands
+
+    # Stage 4: v_new = u - w @ ht, on the entering state.
+    ps_x = _psum(chunk, vpart)
+    nisa.nc_matmul(dst=ps_x, stationary=w_t[0:kdim, g, 0:chunk], moving=ht,
+                   accumulate=False)
+    vnew = vnew_c[0:chunk, g, 0:vpart]
+    nisa.tensor_tensor(
+        dst=vnew, data1=u_c[0:chunk, g, 0:vpart], data2=ps_x, op=nl.subtract
+    )
+
+    # The carry: ht <- ht * exp(gc[C - 1]) + kg^T @ v_new, the product and the
+    # sum in one vector instruction, so the step's last instruction waits on the
+    # tensor engine alone.
+    ps_h = _psum(kdim, vpart)
+    nisa.nc_matmul(
+        dst=ps_h, stationary=kg_c[0:chunk, g, 0:kdim], moving=vnew, accumulate=False
+    )
+    ht_next = _sbuf(kdim, vpart)
+    nisa.scalar_tensor_tensor(
+        dst=ht_next, data=ht, op0=nl.multiply, operand0=decay[0:kdim, g : g + 1],
+        op1=nl.add, operand1=ps_h,
+    )
+
+    # Stage 5, off the chain: o = qg @ ht + aqk @ v_new, also on the entering
+    # state, each product rounded on its own and then added. One addend leaves
+    # PSUM first: an elementwise instruction reads one PSUM operand.
+    ps_q = _psum(chunk, vpart)
+    nisa.nc_matmul(dst=ps_q, stationary=qg_t[0:kdim, g, 0:chunk], moving=ht,
+                   accumulate=False)
+    o_rows = o_c[0:chunk, g, 0:vpart]
+    nisa.tensor_copy(dst=o_rows, src=ps_q)
+    ps_a = _psum(chunk, vpart)
+    nisa.nc_matmul(dst=ps_a, stationary=aqk_t[0:chunk, g, 0:chunk], moving=vnew,
+                   accumulate=False)
+    nisa.tensor_tensor(dst=o_rows, data1=o_rows, data2=ps_a, op=nl.add)
+    return ht_next
+
+
 @nki.jit
 def kda_inter_chunk_kernel(
     kg_hbm, w_hbm, u_hbm, gk_hbm, q_hbm, aqk_hbm, triu_hbm, last_col_hbm,
@@ -903,133 +1500,75 @@ def kda_inter_chunk_kernel(
 
     ``kg``, ``w``, ``gk`` and ``q`` are ``[NC, C, K]``; ``u`` is ``[NC, C, V]``;
     ``aqk`` is ``[NC, C, C]``; ``triu`` is ``[C, C]``; ``last_col`` is ``[C, 1]``;
-    ``state_init`` is ``[V, K]``.
+    ``state_init`` is ``[V, K]``; all float32. Returns ``o [NC, C, V]``,
+    ``final_state [V, K]`` and ``v_new [NC, C, V]``, float32.
 
     There is no raw ``v`` argument: ``v_new`` is derived from ``u`` inside stage 4.
-
-    The chunk loop is ``nl.sequential_range`` where the intra-chunk kernel's is
-    ``nl.affine_range``, because stage 4 carries a state from one chunk into the
-    next and stages 1 to 3 do not.
 
     The state is carried transposed, as ``ht`` shaped ``[K, V]``, where upstream
     carries ``[V, K]``. Two things follow: ``nc_matmul(stationary=kg,
     moving=v_new)`` computes ``kg^T @ v_new`` and lands ``[K, V]`` directly, so
     the update needs no transpose; and the per-key-channel decay becomes a
     ``[K, 1]`` operand broadcast along the free axis, which is what
-    ``nisa.tensor_scalar`` serves. Carried the other way round the decay would
-    need a partition-axis broadcast, which it does not do. The transpose back to
-    ``[V, K]`` is paid once after the loop, and the entering state is turned the
-    same way once before it.
+    ``nisa.tensor_scalar`` serves. The transpose back to ``[V, K]`` is paid once
+    after the loop, and the entering state is turned the same way once before it.
+
+    Each chunk depends on the state the previous one leaves, so the chunk loop is
+    a chain. Everything the chain reads but does not carry is formed per packed
+    tile of ``MAX_TILE // C`` chunks (:func:`_emit_inter_operands`), so a chain
+    step is four instructions on the state: ``w @ ht``, ``v_new``,
+    ``kg^T @ v_new`` and the decayed sum; ``o``'s two products hang off it
+    (:func:`_emit_inter_step`). Value columns are independent, so a two-program
+    launch gives each program ``V / 2`` of them and the same chain.
     """
     n_chunks, chunk, kdim = kg_hbm.shape
     vdim = u_hbm.shape[2]
     scale = float(kdim) ** -0.5
+    rows = n_chunks * chunk
+    layout_rows = min(tile_rows(chunk), rows)
+    tile_chunks = layout_rows // chunk
+    n_prog = nl.num_programs(0)
+    # The NKI front end admits ``assert`` and no ``raise``.
+    assert vdim % n_prog == 0, "the value width does not split over the programs"
+    vpart = vdim // n_prog
+    v0 = nl.program_id(0) * vpart
 
     o_hbm = nl.ndarray((n_chunks, chunk, vdim), dtype=nl.float32, buffer=nl.shared_hbm)
     vnew_hbm = nl.ndarray(
         (n_chunks, chunk, vdim), dtype=nl.float32, buffer=nl.shared_hbm
     )
     state_hbm = nl.ndarray((vdim, kdim), dtype=nl.float32, buffer=nl.shared_hbm)
+    sources = (
+        kg_hbm, _rows_view(w_hbm), u_hbm, _rows_view(gk_hbm), _rows_view(q_hbm),
+        _rows_view(aqk_hbm),
+    )
+    layout = _emit_inter_layout(triu_hbm, last_col_hbm, layout_rows, chunk)
 
-    triu_sb = _sbuf(chunk, chunk)
-    last_col_sb = _sbuf(chunk, 1)
-    nisa.tensor_copy(dst=triu_sb, src=nl.load(triu_hbm, dtype=nl.float32))
-    nisa.tensor_copy(dst=last_col_sb, src=nl.load(last_col_hbm, dtype=nl.float32))
+    # The entering state arrives in the orientation this kernel returns and is
+    # turned here, so the conversion is emitted on this engine rather than by
+    # torch on the host.
+    entering = _sbuf(vpart, kdim)
+    _dma(entering, state_init_hbm[nl.ds(v0, vpart), 0:kdim], nisa.engine.scalar)
+    ht = _sbuf(kdim, vpart)
+    _emit_transpose(ht, entering, vpart, kdim)
 
-    # The loop-carried value, allocated once before the loop because it is the
-    # one tile that must survive an iteration boundary. The entering state
-    # arrives in the orientation this kernel returns and is turned here, so the
-    # conversion is emitted on this engine rather than by torch on the host.
-    entering_sb = _sbuf(vdim, kdim)
-    nisa.tensor_copy(dst=entering_sb, src=nl.load(state_init_hbm, dtype=nl.float32))
-    ht_sb = _sbuf(kdim, vdim)
-    _emit_transpose(ht_sb, entering_sb, vdim, kdim)
-
-    for ic in nl.sequential_range(n_chunks):
-        kg_sb = _sbuf(chunk, kdim)
-        w_sb = _sbuf(chunk, kdim)
-        u_sb = _sbuf(chunk, vdim)
-        gk_sb = _sbuf(chunk, kdim)
-        aqk_sb = _sbuf(chunk, chunk)
-        nisa.tensor_copy(dst=kg_sb, src=nl.load(kg_hbm[ic], dtype=nl.float32))
-        nisa.tensor_copy(dst=w_sb, src=nl.load(w_hbm[ic], dtype=nl.float32))
-        nisa.tensor_copy(dst=u_sb, src=nl.load(u_hbm[ic], dtype=nl.float32))
-        nisa.tensor_copy(dst=gk_sb, src=nl.load(gk_hbm[ic], dtype=nl.float32))
-        nisa.tensor_copy(dst=aqk_sb, src=nl.load(aqk_hbm[ic], dtype=nl.float32))
-
-        # The cumulative gate is CHUNK-LOCAL, exactly as upstream re-references
-        # it per chunk. That is what bounds every exponent below by one chunk's
-        # gate sum instead of by the whole sequence's.
-        gc_sb = _sbuf(chunk, kdim)
-        _emit_gate_cumsum(gc_sb, gk_sb, triu_sb, chunk, kdim)
-        egc_sb = _sbuf(chunk, kdim)
-        nisa.activation(dst=egc_sb, data=gc_sb, op=nl.exp)
-
-        # ---- stage 4, first half: v_new = u - w @ ht, on the ENTERING state.
-        w_t_sb = _sbuf(kdim, chunk)
-        _emit_transpose(w_t_sb, w_sb, chunk, kdim)
-        ps_v = _psum(chunk, vdim)
-        nisa.nc_matmul(dst=ps_v, stationary=w_t_sb, moving=ht_sb, accumulate=False)
-        wh_sb = _sbuf(chunk, vdim)
-        nisa.tensor_copy(dst=wh_sb, src=ps_v)
-        vnew_sb = _sbuf(chunk, vdim)
-        nisa.tensor_tensor(dst=vnew_sb, data1=u_sb, data2=wh_sb, op=nl.subtract)
-
-        # ---- stage 5: o = qg @ ht + Aqk @ v_new, also on the ENTERING state.
-        # `q` arrives raw and is normalised and scaled here rather than imported
-        # already normalised, because this entry point takes `q` and not `qn`.
-        # `Aqk` already carries both the K**-0.5 scale and the causal mask from
-        # stage 2, so it is neither re-scaled nor re-masked.
-        q_sb = _sbuf(chunk, kdim)
-        _emit_l2_normalise(q_sb, nl.load(q_hbm[ic], dtype=nl.float32), chunk, kdim)
-        nisa.tensor_scalar(dst=q_sb, data=q_sb, op0=nl.multiply, operand0=scale)
-        qg_sb = _sbuf(chunk, kdim)
-        nisa.tensor_tensor(dst=qg_sb, data1=q_sb, data2=egc_sb, op=nl.multiply)
-        qg_t_sb = _sbuf(kdim, chunk)
-        _emit_transpose(qg_t_sb, qg_sb, chunk, kdim)
-        ps_o = _psum(chunk, vdim)
-        nisa.nc_matmul(dst=ps_o, stationary=qg_t_sb, moving=ht_sb, accumulate=False)
-        inter_sb = _sbuf(chunk, vdim)
-        nisa.tensor_copy(dst=inter_sb, src=ps_o)
-
-        aqk_t_sb = _sbuf(chunk, chunk)
-        _emit_transpose(aqk_t_sb, aqk_sb, chunk, chunk)
-        ps_a = _psum(chunk, vdim)
-        nisa.nc_matmul(dst=ps_a, stationary=aqk_t_sb, moving=vnew_sb, accumulate=False)
-        intra_sb = _sbuf(chunk, vdim)
-        nisa.tensor_copy(dst=intra_sb, src=ps_a)
-
-        o_sb = _sbuf(chunk, vdim)
-        nisa.tensor_tensor(dst=o_sb, data1=inter_sb, data2=intra_sb, op=nl.add)
-
-        nl.store(o_hbm[ic], value=o_sb)
-        nl.store(vnew_hbm[ic], value=vnew_sb)
-
-        # ---- stage 4, second half: the carry.
-        # ht <- ht * exp(gc[C - 1]) + kg^T @ v_new. The decay column is the
-        # chunk's last cumulative-gate row, landed as [K, 1] by one matmul
-        # against the column selector -- no transpose, no partition broadcast.
-        ps_d = _psum(kdim, 1)
-        nisa.nc_matmul(dst=ps_d, stationary=gc_sb, moving=last_col_sb, accumulate=False)
-        glast_sb = _sbuf(kdim, 1)
-        nisa.tensor_copy(dst=glast_sb, src=ps_d)
-        decay_sb = _sbuf(kdim, 1)
-        nisa.activation(dst=decay_sb, data=glast_sb, op=nl.exp)
-        decayed_sb = _sbuf(kdim, vdim)
-        nisa.tensor_scalar(
-            dst=decayed_sb, data=ht_sb, op0=nl.multiply, operand0=decay_sb
+    for g0 in range(0, n_chunks, tile_chunks):
+        groups = min(tile_chunks, n_chunks - g0)
+        operands = _emit_inter_operands(
+            sources, layout, g0, groups, chunk, kdim, v0, vpart, scale
         )
+        vnew_c = nl.ndarray((chunk, groups, vpart), dtype=nl.float32, buffer=nl.sbuf)
+        o_c = nl.ndarray((chunk, groups, vpart), dtype=nl.float32, buffer=nl.sbuf)
+        for g in range(groups):
+            ht = _emit_inter_step(ht, operands, g, vnew_c, o_c, chunk, kdim, vpart)
+        _dma(vnew_hbm[g0 : g0 + groups, 0:chunk, nl.ds(v0, vpart)].permute((1, 0, 2)),
+             vnew_c, nisa.engine.sync)
+        _dma(o_hbm[g0 : g0 + groups, 0:chunk, nl.ds(v0, vpart)].permute((1, 0, 2)),
+             o_c, nisa.engine.scalar)
 
-        ps_h = _psum(kdim, vdim)
-        nisa.nc_matmul(dst=ps_h, stationary=kg_sb, moving=vnew_sb, accumulate=False)
-        upd_sb = _sbuf(kdim, vdim)
-        nisa.tensor_copy(dst=upd_sb, src=ps_h)
-        nisa.tensor_tensor(dst=ht_sb, data1=decayed_sb, data2=upd_sb, op=nl.add)
-
-    state_sb = _sbuf(vdim, kdim)
-    _emit_transpose(state_sb, ht_sb, kdim, vdim)
-    nl.store(state_hbm, value=state_sb)
-
+    leaving = _sbuf(vpart, kdim)
+    _emit_transpose(leaving, ht, kdim, vpart)
+    _dma(state_hbm[nl.ds(v0, vpart), 0:kdim], leaving, nisa.engine.sync)
     return o_hbm, state_hbm, vnew_hbm
 
 
@@ -1076,6 +1615,18 @@ def _require_inter_admissible(
         raise ChunkedRecurrenceError(
             "kda_inter_chunk cannot serve this input: " + "; ".join(problems)
         )
+
+
+def inter_chunk_grid(vdim: int) -> tuple[int, ...]:
+    """The launch grid of :func:`kda_inter_chunk_kernel` for this value width.
+
+    ``(LNC2_PROGRAMS,)`` on an LNC2 runtime (``NEURON_LOGICAL_NC_CONFIG=2``) when
+    the value columns split evenly over the programs, else ``()``. Each program
+    carries its own value columns of the state through the same chain.
+    """
+    if not lnc_pair() or vdim % LNC2_PROGRAMS:
+        return ()
+    return (LNC2_PROGRAMS,)
 
 
 def can_run_inter_chunk(
@@ -1202,7 +1753,11 @@ def kda_inter_chunk(
 
     consts = inter_chunk_constants(chunk, kdim, vdim, device=kg.device, dtype=kg.dtype)
     _count_inter_nki_dispatch()
-    o, final_state, v_new = wrap_nki(kda_inter_chunk_kernel)(
+    call = wrap_nki(kda_inter_chunk_kernel)
+    grid = inter_chunk_grid(vdim)
+    if grid:
+        call = call[grid]
+    o, final_state, v_new = call(
         kg_hbm=kg,
         w_hbm=w,
         u_hbm=u,

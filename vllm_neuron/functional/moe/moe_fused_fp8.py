@@ -11,78 +11,142 @@ import nki.language as nl
 from nkilib.core.utils.kernel_assert import kernel_assert
 from nkilib.core.utils.allocator import create_auto_alloc_manager
 
+# Partitions of an SBUF or PSUM tile (nl.tile_size.pmax), and the edge of every
+# FP8 product: the checkpoint scales 128x128 blocks, and each block is one Tensor
+# Engine stationary whose contraction and output channels fill the partitions.
+_PMAX = 128
+# Moving free size of one Tensor Engine product (nl.tile_size.gemm_moving_fmax),
+# also the FP32 width of one PSUM bank (nl.tile_size.psum_fmax): the most rows
+# one product computes.
+_MOVING_FMAX = 512
+# Routing is counted, and row classes are sized, in row tiles of at most this
+# many rows (the largest divisor of the block width that does not exceed it).
+_ROW_TILE = 32
+# Zero-fill blocks per iteration of the trailing zero loop, which writes the
+# empty blocks that the item loops did not reach.
+_TRAILING_ZERO_BLOCKS = 4
+# Gate/up accumulators the Vector Engine folds in turn. A fold reads the
+# accumulator its predecessor wrote, and one fold's latency (about 280 ns at
+# 64 rows) exceeds its issue interval (about 200 ns), so a single chain stalls.
+_FOLD_CHAINS = 4
+# Of every _OFFLOAD_PERIOD accumulators, _OFFLOAD_FOLDS fold as a Scalar
+# Engine scale plus a GpSimd add instead of one Vector Engine instruction. A
+# 64-row fold step takes about 280 ns there and 300-410 ns on the others; of
+# 3/8, 7/16 and 1/2, half measured fastest at 1k tokens, within 0.4 % at 2k.
+_OFFLOAD_FOLDS = 4
+_OFFLOAD_PERIOD = 8
+# Hidden tiles per gate/up weight DMA. The first products wait for one such
+# load, not for the whole BLOCK_K tile; 16 tiles keep 2 KB contiguous runs.
+_WEIGHT_DMA_TILES = 16
+# DMA descriptors come from the hardware generator on the Sync engine's queue,
+# which issues nothing else, in program order: an item's scales and weights,
+# its zero fills, its row ids, then its stores. Only the per-row gathers, which
+# need a vector of row offsets, keep software descriptors.
+_HWDGE = nisa.dge_mode.hwdge
+_DMA_QUEUE = nisa.engine.sync
+
 
 def _tile(rows, cols, dtype=nl.float32):
     """Allocate an SBUF tile of shape (rows, cols), backed by at least 8 columns."""
     return nl.ndarray((rows, max(cols, 8)), dtype=dtype, buffer=nl.sbuf)[:, :cols]
 
 
-def _transpose(dst, src):
-    """Transpose src into dst through a PSUM round-trip."""
-    psum = nl.ndarray(dst.shape, dtype=dst.dtype, buffer=nl.psum)
-    nisa.nc_transpose(dst=psum, data=src)
-    nisa.tensor_copy(dst=dst, src=psum)
+def _block_ap(tensor, block, pattern, offset=0):
+    """Access ``pattern`` at element ``offset`` of routing block ``block`` (a register)."""
+    return tensor.ap(pattern=pattern, offset=offset, scalar_offset=block,
+                     indirect_dim=0)
 
 
-def _weight_panel(weights, expert, panel, first, count):
-    """Load contiguous hidden tiles from one packed gate/up or down panel."""
-    hidden = weights.shape[3] * 128
-    tile = nl.ndarray((128, count, 128), dtype=nl.bfloat16, buffer=nl.sbuf)
-    nisa.dma_copy(
-        dst=tile.reshape((128, count * 128)),
-        src=weights.ap(
-            pattern=[[hidden, 128], [1, count * 128]],
-            offset=panel * 128 * hidden + first * 128,
-            scalar_offset=expert, indirect_dim=0,
-        ),
-    )
-    return tile
+def _experts_row(expert_ids):
+    """Load the block experts [blocks, 1] into one SBUF row, [1, max(blocks, 8)] int32."""
+    blocks = expert_ids.shape[0]
+    row = nl.ndarray((1, max(blocks, 8)), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=row[:, :blocks], src=expert_ids.reshape((1, blocks)))
+    return row
 
 
-def _compute_rows(hidden, weights, affinity, row_ids, expert_ids, out,
-                  clamp, scale, expert_reg, block, m0, m, nstep, kstep,
-                  static_block=-1, expert_block=None):
-    """Preserve the original 128-product, scale, and contraction order.
+def _expert_operands(weights, scales, experts_row, block, kstep, nstep):
+    """Load a block's expert weights and block scales, once per block.
 
-    Arithmetic buffers retain their original compiler automatic allocation.
-    New routing buffers use managed scopes separately from this legacy body.
+    The expert id comes from ``experts_row`` (SBUF [1, >=blocks] int32), at
+    register ``block``. Returns ``(gate_up, down, scale)``: FP8 gate/up tiles
+    ``[128, 2I/128, nk, 128]`` of at most min(BLOCK_K/128, _WEIGHT_DMA_TILES)
+    hidden tiles and down tiles ``[128, I/128, nn, 128]`` for each BLOCK_N
+    hidden chunk, one DMA each, so every 128x128 stationary is one contiguous
+    row of 128 columns; and every scale of the expert on every partition,
+    ``[128, 3I/128, H/128]``, from one broadcast DMA, queued first because the
+    first fold needs it.
     """
-    blocks, q = row_ids.shape
     experts, panels, contraction, nh, channels = weights.shape
-    h = hidden.shape[1]
-    ni = panels // 3
-    x = nl.ndarray((128, nh, m), dtype=nl.bfloat16, buffer=nl.sbuf)
+    h, ni = nh * _PMAX, panels // 3
+    expert = _tile(1, 1, nl.int32)
+    nisa.tensor_copy(dst=expert, src=experts_row.ap(
+        pattern=[[experts_row.shape[1], 1], [1, 1]], scalar_offset=block, indirect_dim=1))
+    expert_reg = nisa.register_alloc()
+    nisa.register_load(dst=expert_reg, src=expert)
+
+    scale = nl.ndarray((_PMAX, panels, nh), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=scale.reshape((_PMAX, panels * nh)), src=scales.ap(
+        pattern=[[0, _PMAX], [1, panels * nh]], scalar_offset=expert_reg, indirect_dim=0),
+        dge_mode=_HWDGE, engine=_DMA_QUEUE)
+    gate_up = []
+    chunk = min(kstep, _WEIGHT_DMA_TILES)
+    for k0 in range(0, nh, chunk):
+        nk = min(chunk, nh - k0)
+        tile = nl.ndarray((_PMAX, 2 * ni, nk, _PMAX), dtype=weights.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=tile.reshape((_PMAX, 2 * ni * nk * _PMAX)), src=weights.ap(
+            pattern=[[h, _PMAX], [_PMAX * h, 2 * ni], [1, nk * _PMAX]], offset=k0 * _PMAX,
+            scalar_offset=expert_reg, indirect_dim=0), dge_mode=_HWDGE, engine=_DMA_QUEUE)
+        gate_up.append(tile)
+    down = []
+    for n0 in range(0, nh, nstep):
+        nn = min(nstep, nh - n0)
+        tile = nl.ndarray((_PMAX, ni, nn, _PMAX), dtype=weights.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=tile.reshape((_PMAX, ni * nn * _PMAX)), src=weights.ap(
+            pattern=[[h, _PMAX], [_PMAX * h, ni], [1, nn * _PMAX]],
+            offset=2 * ni * _PMAX * h + n0 * _PMAX,
+            scalar_offset=expert_reg, indirect_dim=0), dge_mode=_HWDGE, engine=_DMA_QUEUE)
+        down.append(tile)
+    return gate_up, down, scale
+
+
+def _gather_rows(hidden, affinity, row_ids, expert_ids, block, m0, m, x):
+    """Transpose the hidden rows [m0, m0+m) of a block into ``x`` [128, H/128, m].
+
+    Returns the routing weight of every row, one [rows, 1] tile per 128 rows.
+    An invalid id (-1) reads the zero hidden row and the zero affinity row.
+    """
+    tokens, h = hidden.shape
+    nh = h // _PMAX
+    experts = affinity.shape[0] // tokens
     routing = []
-    for t0 in range(0, m, 128):
-        rows = min(128, m - t0)
+    for t0 in range(0, m, _PMAX):
+        rows = min(_PMAX, m - t0)
         ids = _tile(rows, 1, nl.int32)
-        if static_block >= 0:
-            nisa.dma_copy(dst=ids, src=row_ids.ap(
-                pattern=[[1, rows], [1, 1]], offset=static_block * q + m0 + t0))
-        else:
-            nisa.dma_copy(dst=ids, src=row_ids.ap(
-                pattern=[[1, rows], [1, 1]], offset=m0 + t0,
-                scalar_offset=block, indirect_dim=0))
+        nisa.dma_copy(dst=ids, src=_block_ap(row_ids, block, [[1, rows], [1, 1]], m0 + t0),
+                      dge_mode=_HWDGE, engine=_DMA_QUEUE)
         invalid = _tile(rows, 1, nl.int32)
         nisa.tensor_scalar(dst=invalid, data=ids, op0=nl.less, operand0=0)
         bump = _tile(rows, 1, nl.int32)
-        nisa.tensor_scalar(dst=bump, data=invalid, op0=nl.multiply, operand0=hidden.shape[0])
+        nisa.tensor_scalar(dst=bump, data=invalid, op0=nl.multiply, operand0=tokens)
         resolved = _tile(rows, 1, nl.int32)
         nisa.tensor_tensor(dst=resolved, data1=ids, data2=bump, op=nl.add)
         gathered = nl.ndarray((rows, h), dtype=nl.bfloat16, buffer=nl.sbuf)
         nisa.dma_copy(dst=gathered, src=hidden.ap(
             pattern=[[h, rows], [1, h]], vector_offset=resolved, indirect_dim=0))
-        for hb in range(nh):
-            _transpose(x[:, hb, t0:t0 + rows], gathered[:, hb * 128:(hb + 1) * 128])
+        # Transposes share a PSUM bank; one copy evacuates the whole bank.
+        group = max(1, min(nh, nl.tile_size.psum_fmax // rows))
+        for hb0 in range(0, nh, group):
+            count = min(group, nh - hb0)
+            psum = nl.ndarray((_PMAX, count, rows), dtype=nl.bfloat16, buffer=nl.psum)
+            for j in range(count):
+                hb = hb0 + j
+                nisa.nc_transpose(dst=psum[:, j, :],
+                                  data=gathered[:, hb * _PMAX:(hb + 1) * _PMAX])
+            nisa.tensor_copy(dst=x[:, hb0:hb0 + count, t0:t0 + rows], src=psum)
         expert_rows = _tile(rows, 1, nl.int32)
-        if static_block >= 0:
-            nisa.dma_copy(dst=expert_rows, src=expert_ids.ap(
-                pattern=[[0, rows], [1, 1]], offset=static_block))
-        else:
-            nisa.dma_copy(dst=expert_rows, src=expert_ids.ap(
-                pattern=[[0, rows], [1, 1]], offset=0,
-                scalar_offset=block if expert_block is None else expert_block,
-                indirect_dim=0))
+        nisa.dma_copy(dst=expert_rows, src=_block_ap(expert_ids, block, [[0, rows], [1, 1]]),
+                      dge_mode=_HWDGE, engine=_DMA_QUEUE)
         affinity_rows = _tile(rows, 1, nl.int32)
         nisa.tensor_scalar(dst=affinity_rows, data=resolved, op0=nl.multiply, operand0=experts)
         nisa.tensor_tensor(dst=affinity_rows, data1=affinity_rows, data2=expert_rows, op=nl.add)
@@ -90,151 +154,331 @@ def _compute_rows(hidden, weights, affinity, row_ids, expert_ids, out,
         nisa.dma_copy(dst=route_rows, src=affinity.ap(
             pattern=[[1, rows], [1, 1]], vector_offset=affinity_rows, indirect_dim=0))
         routing.append(route_rows)
+    return routing
 
-    gate_up = nl.ndarray((128, 2 * ni, m), dtype=nl.float32, buffer=nl.sbuf)
-    for n0 in range(0, 2 * ni, nstep):
-        nn = min(nstep, 2 * ni - n0)
-        for k0 in range(0, nh, kstep):
-            nk = min(kstep, nh - k0)
-            gate_weights = []
-            for n in range(nn):
-                gate_weights.append(_weight_panel(weights, expert_reg, n0 + n, k0, nk))
-            for k in range(nk):
-                hb = k0 + k
-                for n in range(nn):
-                    panel = n0 + n
-                    partial = nl.ndarray((128, m), dtype=nl.float32, buffer=nl.psum)
-                    nisa.nc_matmul(dst=partial, stationary=gate_weights[n][:, k, :],
-                                   moving=x[:, hb, :], accumulate=False)
-                    if hb == 0:
-                        nisa.tensor_scalar(dst=gate_up[:, panel, :], data=partial,
-                                           op0=nl.multiply, operand0=scale[:, panel, hb:hb + 1])
-                    else:
-                        nisa.scalar_tensor_tensor(dst=gate_up[:, panel, :], data=partial,
-                            op0=nl.multiply, operand0=scale[:, panel, hb:hb + 1],
-                            op1=nl.add, operand1=gate_up[:, panel, :])
-    activation = nl.ndarray((128, ni, m), dtype=nl.bfloat16, buffer=nl.sbuf)
-    for ib in range(ni):
-        gate, up = _tile(128, m), _tile(128, m)
-        nisa.tensor_scalar(dst=gate, data=gate_up[:, ib, :], op0=nl.minimum, operand0=clamp[:, 0:1])
-        nisa.tensor_scalar(dst=up, data=gate_up[:, ni + ib, :], op0=nl.maximum, operand0=clamp[:, 1:2])
-        nisa.tensor_scalar(dst=up, data=up, op0=nl.minimum, operand0=clamp[:, 2:3])
-        sigmoid, silu, gated = _tile(128, m), _tile(128, m), _tile(128, m)
-        nisa.activation(dst=sigmoid, data=gate, op=nl.sigmoid)
-        nisa.scalar_tensor_tensor(dst=silu, data=gate, op0=nl.multiply, operand0=1.0,
-                                   op1=nl.multiply, operand1=sigmoid)
-        nisa.scalar_tensor_tensor(dst=gated, data=silu, op0=nl.multiply, operand0=1.0,
-                                   op1=nl.multiply, operand1=up)
-        nisa.tensor_copy(dst=activation[:, ib, :], src=gated)
 
-    result = nl.ndarray((128, nh, m), dtype=nl.float32, buffer=nl.sbuf)
-    for n0 in range(0, nh, nstep):
-        nn = min(nstep, nh - n0)
-        for k0 in range(0, ni, kstep):
-            nk = min(kstep, ni - k0)
-            for k in range(nk):
-                ib = k0 + k
-                w = _weight_panel(weights, expert_reg, 2 * ni + ib, n0, nn)
-                for n in range(nn):
-                    hb = n0 + n
-                    partial = nl.ndarray((128, m), dtype=nl.float32, buffer=nl.psum)
-                    nisa.nc_matmul(dst=partial, stationary=w[:, n, :],
-                                   moving=activation[:, ib, :], accumulate=False)
-                    if ib == 0:
-                        nisa.tensor_scalar(dst=result[:, hb, :], data=partial,
-                            op0=nl.multiply, operand0=scale[:, 2 * ni + ib, hb:hb + 1])
-                    else:
-                        nisa.scalar_tensor_tensor(dst=result[:, hb, :], data=partial,
-                            op0=nl.multiply, operand0=scale[:, 2 * ni + ib, hb:hb + 1],
-                            op1=nl.add, operand1=result[:, hb, :])
-    for t0 in range(0, m, 128):
-        rows = min(128, m - t0)
-        output_rows = nl.ndarray((rows, h), dtype=nl.float32, buffer=nl.sbuf)
-        for hb in range(nh):
-            _transpose(output_rows[:, hb * 128:(hb + 1) * 128], result[:, hb, t0:t0 + rows])
-        nisa.tensor_scalar(dst=output_rows, data=output_rows, op0=nl.multiply,
-                           operand0=routing[t0 // 128])
-        if static_block >= 0:
-            nisa.dma_copy(dst=out[static_block, m0 + t0:m0 + t0 + rows, :],
-                          src=output_rows)
+def _offloaded(index):
+    """Whether accumulator ``index`` folds on the Scalar and GpSimd engines.
+
+    Spreads ``_OFFLOAD_FOLDS`` of every ``_OFFLOAD_PERIOD`` accumulators evenly.
+    """
+    return ((index + 1) * _OFFLOAD_FOLDS // _OFFLOAD_PERIOD
+            > index * _OFFLOAD_FOLDS // _OFFLOAD_PERIOD)
+
+
+def _fold(dst, partial, scale, first, offload):
+    """Scale one 128x128 product and add it to ``dst`` in contraction order.
+
+    The Vector Engine fuses both steps. With ``offload`` the Scalar Engine
+    scales the product out of PSUM and GpSimd, which cannot read PSUM, adds
+    it; every engine rounds the FP32 product and then the FP32 sum, so the
+    bits match.
+    """
+    if offload:
+        if first:
+            nisa.tensor_scalar(dst=dst, data=partial, op0=nl.multiply, operand0=scale,
+                               engine=nisa.engine.scalar)
         else:
-            nisa.dma_copy(dst=out.ap(
-                pattern=[[h, rows], [1, h]], offset=(m0 + t0) * h,
-                scalar_offset=block, indirect_dim=0), src=output_rows)
+            scaled = nl.ndarray(partial.shape, dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=scaled, data=partial, op0=nl.multiply, operand0=scale,
+                               engine=nisa.engine.scalar)
+            nisa.tensor_tensor(dst=dst, data1=scaled, data2=dst, op=nl.add,
+                               engine=nisa.engine.gpsimd)
+    elif first:
+        nisa.tensor_scalar(dst=dst, data=partial, op0=nl.multiply, operand0=scale,
+                           engine=nisa.engine.vector)
+    else:
+        nisa.scalar_tensor_tensor(dst=dst, data=partial, op0=nl.multiply, operand0=scale,
+                                  op1=nl.add, operand1=dst)
 
 
-def _routing_counts(row_ids, row_step, sbm):
-    """Read routing once; retain small counts and release ID temporaries."""
+def _swiglu(activation, gate_up, clamp, ib, m):
+    """Clamp gate/up panel ``ib`` and store its SwiGLU in BF16."""
+    ni = activation.shape[1]
+    gate, up = _tile(_PMAX, m), _tile(_PMAX, m)
+    nisa.tensor_scalar(dst=gate, data=gate_up[:, ib, :], op0=nl.minimum, operand0=clamp[:, 0:1])
+    nisa.tensor_scalar(dst=up, data=gate_up[:, ni + ib, :], op0=nl.maximum, operand0=clamp[:, 1:2])
+    nisa.tensor_scalar(dst=up, data=up, op0=nl.minimum, operand0=clamp[:, 2:3])
+    sigmoid, silu, gated = _tile(_PMAX, m), _tile(_PMAX, m), _tile(_PMAX, m)
+    nisa.activation(dst=sigmoid, data=gate, op=nl.sigmoid)
+    nisa.scalar_tensor_tensor(dst=silu, data=gate, op0=nl.multiply, operand0=1.0,
+                              op1=nl.multiply, operand1=sigmoid)
+    nisa.scalar_tensor_tensor(dst=gated, data=silu, op0=nl.multiply, operand0=1.0,
+                              op1=nl.multiply, operand1=up)
+    nisa.tensor_copy(dst=activation[:, ib, :], src=gated)
+
+
+def _compute_rows(operands, loaded, block, m0, m):
+    """Compute and store rows [m0, m0+m) of one routing block for its expert.
+
+    Every output element keeps the original arithmetic: an FP32 128x128
+    product, its block scale, a left fold over the contraction tiles, the same
+    SwiGLU instruction sequence with a BF16 activation, and the routing weight.
+    Gate/up panels run in groups of (gate, up) pairs, the folds of a group
+    interleaved, so each group's SwiGLU overlaps the next group's products.
+    Every stationary is one contiguous 128-column row of a weight tile: the
+    Tensor Engine reads a stationary with one free dimension only.
+    """
+    hidden, weights, row_ids, expert_ids, affinity, clamp, out = operands
+    gate_up_tiles, down_tiles, scale = loaded
+    nh, h = weights.shape[3], hidden.shape[1]
+    ni = weights.shape[1] // 3
+    x = nl.ndarray((_PMAX, nh, m), dtype=nl.bfloat16, buffer=nl.sbuf)
+    routing = _gather_rows(hidden, affinity, row_ids, expert_ids, block, m0, m, x)
+
+    gate_up = nl.ndarray((_PMAX, 2 * ni, m), dtype=nl.float32, buffer=nl.sbuf)
+    activation = nl.ndarray((_PMAX, ni, m), dtype=nl.bfloat16, buffer=nl.sbuf)
+    pairs = max(1, _FOLD_CHAINS // 2)
+    for ib0 in range(0, ni, pairs):
+        group = []
+        for ib in range(ib0, min(ni, ib0 + pairs)):
+            group.append(ib)
+            group.append(ni + ib)
+        k0 = 0
+        for tile in gate_up_tiles:
+            for k in range(tile.shape[2]):
+                hb = k0 + k
+                for panel in group:
+                    partial = nl.ndarray((_PMAX, m), dtype=nl.float32, buffer=nl.psum)
+                    nisa.nc_matmul(dst=partial, stationary=tile[:, panel, k, :],
+                                   moving=x[:, hb, :], accumulate=False)
+                    _fold(gate_up[:, panel, :], partial, scale[:, panel, hb:hb + 1], hb == 0,
+                          _offloaded(panel))
+            k0 += tile.shape[2]
+        for ib in range(ib0, min(ni, ib0 + pairs)):
+            _swiglu(activation, gate_up, clamp, ib, m)
+
+    result = nl.ndarray((_PMAX, nh, m), dtype=nl.float32, buffer=nl.sbuf)
+    for ib in range(ni):
+        n0 = 0
+        for tile in down_tiles:
+            for n in range(tile.shape[2]):
+                hb = n0 + n
+                partial = nl.ndarray((_PMAX, m), dtype=nl.float32, buffer=nl.psum)
+                nisa.nc_matmul(dst=partial, stationary=tile[:, ib, n, :],
+                               moving=activation[:, ib, :], accumulate=False)
+                _fold(result[:, hb, :], partial, scale[:, 2 * ni + ib, hb:hb + 1], ib == 0,
+                      _offloaded(hb))
+            n0 += tile.shape[2]
+
+    group = max(1, nl.tile_size.psum_fmax // _PMAX)
+    for t0 in range(0, m, _PMAX):
+        rows = min(_PMAX, m - t0)
+        output_rows = nl.ndarray((rows, nh, _PMAX), dtype=nl.float32, buffer=nl.sbuf)
+        for hb0 in range(0, nh, group):
+            count = min(group, nh - hb0)
+            psum = nl.ndarray((rows, count, _PMAX), dtype=nl.float32, buffer=nl.psum)
+            for j in range(count):
+                nisa.nc_transpose(dst=psum[:, j, :], data=result[:, hb0 + j, t0:t0 + rows])
+            # The routing weight scales the transposed product straight out of PSUM.
+            nisa.tensor_scalar(dst=output_rows[:, hb0:hb0 + count, :], data=psum,
+                               op0=nl.multiply, operand0=routing[t0 // _PMAX])
+        nisa.dma_copy(dst=_block_ap(out, block, [[h, rows], [1, h]], (m0 + t0) * h),
+                      src=output_rows.reshape((rows, h)), dge_mode=_HWDGE, engine=_DMA_QUEUE)
+
+
+def _dense_schedule(compute, loads, block_m):
+    """Retain the original static block schedule and arithmetic."""
+    weights, scales, experts_row, kstep, nstep = loads
+    blocks, q = compute[2].shape
+    for static_block in range(nl.program_id(0), blocks, nl.num_programs(0)):
+        block = nisa.register_alloc(static_block)
+        loaded = _expert_operands(weights, scales, experts_row, block, kstep, nstep)
+        for m0 in range(0, q, block_m):
+            _compute_rows(compute, loaded, block, m0, min(block_m, q - m0))
+
+
+def _row_step(q, block_m):
+    """The largest divisor of the block width ``q`` within ``min(block_m, _ROW_TILE)``."""
+    step = min(block_m, _ROW_TILE)
+    while q % step:
+        step -= 1
+    return step
+
+
+def _row_classes(q, row_step):
+    """Row-tile bounds of the compute classes, widest (the whole block) last.
+
+    A routed block runs in the narrowest class that holds its last routed row
+    tile. Widths double from two row tiles; one row tile is not its own class,
+    since a 128x128 weight load costs the Tensor Engine about as long as the
+    product of two tiles' rows.
+    """
+    tiles = q // row_step
+    bounds, width = [], 2
+    while width < tiles:
+        bounds.append(width)
+        width *= 2
+    return tuple(bounds) + (tiles,)
+
+
+def _zero_slots(blocks, experts):
+    """Empty blocks to zero beside each compute item.
+
+    With every expert's rows in one block, ``blocks / experts - 1`` empty
+    blocks remain per item. Slots past the empty list are skipped; empty
+    blocks past the slots go to the trailing zero loop.
+    """
+    return max(1, -(-blocks // experts) - 1)
+
+
+def _routing_spans(row_ids, row_step, sbm):
+    """Read routing once and return each block's span, int32 [1, blocks].
+
+    A block's span is its last routed row tile plus one, 0 when it is empty.
+    Blocks sit on partitions, up to 128 at a time, so every step works on
+    whole rows of ids; one PE transpose per chunk moves the spans to partition 0.
+    """
     blocks, q = row_ids.shape
     ntiles = q // row_step
-    tile_counts = sbm.alloc((1, blocks, ntiles), nl.int32)
-    block_counts = sbm.alloc((1, max(blocks, 8)), nl.int32)[:, :blocks]
-    # At most two 64-KiB temporary tiles share partition 0. Both are released
-    # before the expert body, including for larger prefill buckets.
-    tiles_per_load = max(1, 16384 // row_step)
-    for first in range(0, blocks * ntiles, tiles_per_load):
-        count = min(tiles_per_load, blocks * ntiles - first)
-        sbm.open_scope(name="routing_count_input")
-        ids = sbm.alloc((1, max(count * row_step, 8)), nl.int32)[:, :count * row_step]
-        valid = sbm.alloc((1, max(count * row_step, 8)), nl.int32)[:, :count * row_step]
-        nisa.dma_copy(dst=ids, src=row_ids.ap(
-            pattern=[[0, 1], [1, count * row_step]], offset=first * row_step))
+    span = sbm.alloc((1, max(blocks, 8)), nl.int32)[:, :blocks]
+    for b0 in range(0, blocks, _PMAX):
+        count = min(_PMAX, blocks - b0)
+        sbm.open_scope(name="routing_spans")
+        ids = sbm.alloc((count, max(q, 8)), nl.int32)[:, :q]
+        nisa.dma_copy(dst=ids, src=row_ids[b0:b0 + count, :])
+        valid = sbm.alloc((count, max(q, 8)), nl.int32)[:, :q]
         nisa.tensor_scalar(dst=valid, data=ids, op0=nl.greater_equal, operand0=0)
-        nisa.tensor_reduce(
-            dst=tile_counts.reshape((1, blocks * ntiles))[:, first:first + count],
-            data=valid.reshape((1, count, row_step)), op=nl.add, axis=(2,),
-        )
+        counts = sbm.alloc((count, max(ntiles, 8)), nl.int32)[:, :ntiles]
+        nisa.tensor_reduce(dst=counts, data=valid.reshape((count, ntiles, row_step)),
+                           op=nl.add, axis=(2,))
+        position = sbm.alloc((count, max(ntiles, 8)), nl.int32)[:, :ntiles]
+        nisa.iota(dst=position, pattern=[[1, ntiles]], offset=1)
+        routed = sbm.alloc((count, max(ntiles, 8)), nl.int32)[:, :ntiles]
+        nisa.tensor_scalar(dst=routed, data=counts, op0=nl.greater, operand0=0)
+        nisa.tensor_tensor(dst=routed, data1=routed, data2=position, op=nl.multiply)
+        last = sbm.alloc((count, 8), nl.float32)[:, :1]
+        nisa.tensor_reduce(dst=last, data=routed, op=nl.maximum, axis=(1,))
+        row = nl.ndarray((1, count), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_transpose(dst=row, data=last)
+        nisa.tensor_copy(dst=span[:, b0:b0 + count], src=row)
         sbm.close_scope()
-    nisa.tensor_reduce(dst=block_counts, data=tile_counts, op=nl.add, axis=(2,))
-    return tile_counts, block_counts
+    return span
 
 
-def _expert_operands(expert_ids, scales, block, panels, nh, static_block=-1):
-    expert = _tile(1, 1, nl.int32)
-    if static_block >= 0:
-        nisa.dma_copy(dst=expert, src=expert_ids[static_block:static_block + 1, :])
-    else:
-        nisa.dma_copy(dst=expert, src=expert_ids.ap(
-            pattern=[[1, 1], [1, 1]], scalar_offset=block, indirect_dim=0))
-    expert_reg = nisa.register_alloc()
-    nisa.register_load(dst=expert_reg, src=expert)
-    scale = nl.ndarray((128, panels, nh), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.dma_copy(
-        dst=scale.reshape((128, panels * nh)),
-        src=scales.ap(pattern=[[0, 128], [1, panels * nh]],
-                      scalar_offset=expert_reg, indirect_dim=0),
-    )
-    return expert_reg, scale
+def _worklist(blocks, extra, sbm):
+    """Allocate a compacted block list as ``(tile, count)``.
+
+    The tile is int32 in partition 0: flags in columns [0, blocks), and the
+    list from column ``blocks`` on, which ``nonzero_with_count`` writes. Source
+    and destination are disjoint column ranges of one tile, so no placement can
+    alias them. ``count`` is the FP32 list length.
+    """
+    tile = sbm.alloc((1, max(2 * blocks + 1 + extra, 8)), nl.int32)
+    count = sbm.alloc((1, 8), nl.float32)[:, :1]
+    return tile, count
 
 
-def _dense_schedule(hidden, weights, scales, row_ids, expert_ids, affinity,
-                    out, clamp, block_m, nstep, kstep):
-    """Retain the original static block schedule and arithmetic."""
-    blocks, q = row_ids.shape
-    panels, nh = weights.shape[1], weights.shape[3]
-    for static_block in range(nl.program_id(0), blocks, nl.num_programs(0)):
-        expert_reg, scale = _expert_operands(
-            expert_ids, scales, None, panels, nh, static_block=static_block
-        )
-        for m0 in range(0, q, block_m):
-            m = min(block_m, q - m0)
-            _compute_rows(hidden, weights, affinity, row_ids, expert_ids,
-                          out, clamp, scale, expert_reg, None, m0, m,
-                          nstep, kstep, static_block=static_block)
+def _list_entries(worklist, blocks):
+    """The list columns of a worklist tile: the ids, then the out-of-range id ``blocks``."""
+    tile = worklist[0]
+    return tile[:, blocks:tile.shape[1]]
+
+
+def _compact(worklist, blocks):
+    """Compact the flags; every entry past the count, and its slot, reads ``blocks``."""
+    tile, count = worklist
+    nisa.nonzero_with_count(dst=tile[:, blocks:2 * blocks + 1], src=tile[:, :blocks],
+                            padding_val=blocks)
+    nisa.tensor_copy(dst=count, src=tile[:, 2 * blocks:2 * blocks + 1])
+    nisa.memset(dst=tile[:, 2 * blocks:tile.shape[1]], value=blocks)
+
+
+def _select(worklist, blocks, index, width=1):
+    """``width`` list entries from register ``index`` on, as an SBUF read."""
+    tile = worklist[0]
+    return tile.ap(pattern=[[tile.shape[1], 1], [1, width]], offset=blocks,
+                   scalar_offset=index, indirect_dim=1)
+
+
+def _routing_worklists(span, experts_row, bounds, sbm, merge_pairs=False, extra=0,
+                       empty_extra=0):
+    """Compact routed blocks by row class, adjacent dense pairs, and empty blocks.
+
+    ``span`` is ``_routing_spans``'s [1, blocks] row. Class ``c`` holds the
+    blocks with ``bounds[c-1] < span <= bounds[c]``; the last class is the
+    whole block. With ``merge_pairs``, consecutive whole-block entries of one
+    expert are paired greedily and leave that class. Every list holds ``extra``
+    padding entries past its ``blocks + 1``, the empty list
+    ``max(extra, empty_extra)``. Returns ``(paired or None, classes, empty)``;
+    every PNC builds the same lists.
+    """
+    blocks = span.shape[1]
+
+    classes = []
+    for _ in range(len(bounds)):
+        classes.append(_worklist(blocks, extra, sbm))
+    empty = _worklist(blocks, max(extra, empty_extra), sbm)
+    paired = None
+    if merge_pairs:
+        paired = _worklist(blocks, extra, sbm)
+    sbm.open_scope(name="routing_class_flags")
+    below = sbm.alloc((1, max(blocks, 8)), nl.int32)[:, :blocks]
+    low = 0
+    for c in range(len(bounds)):
+        flags = classes[c][0][:, :blocks]
+        nisa.tensor_scalar(dst=flags, data=span, op0=nl.greater, operand0=low)
+        nisa.tensor_scalar(dst=below, data=span, op0=nl.less_equal, operand0=bounds[c])
+        nisa.tensor_tensor(dst=flags, data1=flags, data2=below, op=nl.multiply)
+        low = bounds[c]
+    nisa.tensor_scalar(dst=empty[0][:, :blocks], data=span, op0=nl.equal, operand0=0)
+
+    if merge_pairs:
+        # Greedily pair consecutive whole-block entries for the same expert.
+        # All PNCs build the same non-overlapping list and keep output positions.
+        dense = classes[-1][0][:, :blocks]
+        pair_flags = paired[0][:, :blocks]
+        nisa.memset(dst=pair_flags, value=0)
+        if blocks > 1:
+            block_experts = experts_row[:, :blocks]
+            eligible = sbm.alloc((1, max(blocks - 1, 8)), nl.int32)[:, :blocks - 1]
+            negated = sbm.alloc((1, max(blocks - 1, 8)), nl.int32)[:, :blocks - 1]
+            members = sbm.alloc((1, max(blocks, 8)), nl.int32)[:, :blocks]
+            nisa.tensor_tensor(dst=eligible, data1=block_experts[:, :blocks - 1],
+                               data2=block_experts[:, 1:blocks], op=nl.equal)
+            nisa.tensor_tensor(dst=eligible, data1=eligible,
+                               data2=dense[:, :blocks - 1], op=nl.multiply)
+            nisa.tensor_tensor(dst=eligible, data1=eligible,
+                               data2=dense[:, 1:blocks], op=nl.multiply)
+            # pair[p] = eligible[p] * (1 - pair[p - 1]), as one scan:
+            # pair[p] = (-eligible[p]) * pair[p - 1] + eligible[p], pair[-1] = 0.
+            nisa.tensor_scalar(dst=negated, data=eligible, op0=nl.multiply, operand0=-1)
+            nisa.tensor_tensor_scan(dst=pair_flags[:, :blocks - 1], data0=negated,
+                                    data1=eligible, initial=0.0, op0=nl.multiply,
+                                    op1=nl.add)
+            nisa.tensor_copy(dst=members[:, :1], src=pair_flags[:, :1])
+            nisa.tensor_tensor(dst=members[:, 1:blocks],
+                               data1=pair_flags[:, 1:blocks],
+                               data2=pair_flags[:, :blocks - 1], op=nl.add)
+            nisa.tensor_tensor(dst=dense, data1=dense, data2=members, op=nl.subtract)
+    sbm.close_scope()
+    if merge_pairs:
+        _compact(paired, blocks)
+    for c in range(len(bounds)):
+        _compact(classes[c], blocks)
+    _compact(empty, blocks)
+    return paired, classes, empty
+
+
+def _ceil_div(count, divisor, sbm):
+    """ceil(count / divisor) of a small non-negative FP32 count, as int32 [1, 1].
+
+    Float-to-int tensor_copy rounds to nearest even. Adding
+    (divisor - 1) / (2 * divisor) moves an exact quotient k below k + 1/2 and
+    any remainder above it, so the rounding lands on the ceiling with no tie.
+    """
+    quotient = sbm.alloc((1, 8), nl.float32)[:, :1]
+    result = sbm.alloc((1, 8), nl.int32)[:, :1]
+    nisa.tensor_scalar(dst=quotient, data=count, op0=nl.multiply, operand0=1.0 / divisor,
+                       op1=nl.add, operand1=(divisor - 1) / (2 * divisor))
+    nisa.tensor_copy(dst=result, src=quotient)
+    return result
 
 
 def _phase_bounds(total, program, nprograms, sbm):
-    """Round the dense prefix to an equal number of iterations on both cores."""
+    """Round a phase to an equal number of iterations on both cores."""
     sbm.open_scope(name="routing_phase_bounds")
-    pairs = sbm.alloc((1, 8), nl.float32)[:, :1]
-    boundary = sbm.alloc((1, 8), nl.int32)[:, :1]
-    # Float-to-int tensor_copy uses round-to-nearest-even. For P=2, integral
-    # counts become k+.25 (even) or k+.75 (odd), yielding ceil(count/2)
-    # without a .5 tie. P=1 keeps the exact integral count.
-    nisa.tensor_scalar(dst=pairs, data=total, op0=nl.multiply,
-                       operand0=1.0 / nprograms, op1=nl.add,
-                       operand1=(nprograms - 1) * 0.25)
-    nisa.tensor_copy(dst=boundary, src=pairs)
+    boundary = _ceil_div(total, nprograms, sbm)
     nisa.tensor_scalar(dst=boundary, data=boundary, op0=nl.multiply,
                        operand0=nprograms, op1=nl.add, operand1=program)
     boundary_reg = nisa.register_alloc()
@@ -243,104 +487,159 @@ def _phase_bounds(total, program, nprograms, sbm):
     return boundary_reg
 
 
-def _routing_worklists(tile_counts, block_counts, expert_ids, q, sbm,
-                       merge_pairs=False):
-    """Compact dense blocks, sparse blocks, and active sparse row tiles."""
-    blocks, ntiles = tile_counts.shape[1], tile_counts.shape[2]
-    paired, paired_count = None, None
-    if merge_pairs:
-        paired = sbm.alloc((1, blocks + 1), nl.int32)
-        paired_count = sbm.alloc((1, 8), nl.float32)[:, :1]
-    dense = sbm.alloc((1, blocks + 1), nl.int32)
-    sparse = sbm.alloc((1, blocks + 1), nl.int32)
-    tiles = sbm.alloc((1, blocks * ntiles + 1), nl.int32)
-    dense_count = sbm.alloc((1, 8), nl.float32)[:, :1]
-    sparse_count = sbm.alloc((1, 8), nl.float32)[:, :1]
-    tile_count = sbm.alloc((1, 8), nl.float32)[:, :1]
-    sbm.open_scope(name="routing_worklist_flags")
-    dense_flags = sbm.alloc((1, max(blocks, 8)), nl.int32)[:, :blocks]
-    sparse_flags = sbm.alloc((1, max(blocks, 8)), nl.int32)[:, :blocks]
-    tile_flags = sbm.alloc((1, blocks, ntiles), nl.int32)
-    nisa.tensor_scalar(dst=dense_flags, data=block_counts,
-                       op0=nl.greater, operand0=q // 2)
-    nisa.tensor_scalar(dst=sparse_flags, data=block_counts,
-                       op0=nl.less_equal, operand0=q // 2)
-    nisa.tensor_scalar(dst=tile_flags, data=tile_counts,
-                       op0=nl.greater, operand0=0)
-    nisa.tensor_tensor(dst=tile_flags, data1=tile_flags,
-                       data2=sparse_flags.ap(
-                           pattern=[[max(blocks, 8), 1], [1, blocks],
-                                    [0, ntiles]]),
-                       op=nl.multiply)
-    if merge_pairs:
-        # Greedily pair consecutive dense blocks for the same expert. All PNCs
-        # build the same non-overlapping list and keep original output positions.
-        pair_flags = sbm.alloc((1, max(blocks, 8)), nl.int32)[:, :blocks]
-        nisa.memset(dst=pair_flags, value=0)
-        if blocks > 1:
-            block_experts = sbm.alloc((1, max(blocks, 8)), nl.int32)[:, :blocks]
-            eligible = sbm.alloc((1, max(blocks - 1, 8)), nl.int32)[:, :blocks - 1]
-            inverse = sbm.alloc((1, 8), nl.int32)[:, :1]
-            members = sbm.alloc((1, max(blocks, 8)), nl.int32)[:, :blocks]
-            nisa.dma_copy(dst=block_experts, src=expert_ids.reshape((1, blocks)))
-            nisa.tensor_tensor(dst=eligible, data1=block_experts[:, :blocks - 1],
-                               data2=block_experts[:, 1:blocks], op=nl.equal)
-            nisa.tensor_tensor(dst=eligible, data1=eligible,
-                               data2=dense_flags[:, :blocks - 1], op=nl.multiply)
-            nisa.tensor_tensor(dst=eligible, data1=eligible,
-                               data2=dense_flags[:, 1:blocks], op=nl.multiply)
-            nisa.tensor_copy(dst=pair_flags[:, :1], src=eligible[:, :1])
-            for position in range(1, blocks - 1):
-                nisa.tensor_scalar(dst=inverse,
-                                   data=pair_flags[:, position - 1:position],
-                                   op0=nl.multiply, operand0=-1,
-                                   op1=nl.add, operand1=1)
-                nisa.tensor_tensor(dst=pair_flags[:, position:position + 1],
-                                   data1=eligible[:, position:position + 1],
-                                   data2=inverse, op=nl.multiply)
-            nisa.tensor_copy(dst=members[:, :1], src=pair_flags[:, :1])
-            nisa.tensor_tensor(dst=members[:, 1:blocks],
-                               data1=pair_flags[:, 1:blocks],
-                               data2=pair_flags[:, :blocks - 1], op=nl.add)
-            nisa.tensor_tensor(dst=dense_flags, data1=dense_flags,
-                               data2=members, op=nl.subtract)
-        nisa.nonzero_with_count(dst=paired, src=pair_flags)
-        nisa.tensor_copy(dst=paired_count, src=paired[:, blocks:blocks + 1])
-    nisa.nonzero_with_count(dst=dense, src=dense_flags)
-    nisa.nonzero_with_count(dst=sparse, src=sparse_flags)
-    nisa.nonzero_with_count(dst=tiles,
-                           src=tile_flags.reshape((1, blocks * ntiles)))
-    nisa.tensor_copy(dst=dense_count, src=dense[:, blocks:blocks + 1])
-    nisa.tensor_copy(dst=sparse_count, src=sparse[:, blocks:blocks + 1])
-    nisa.tensor_copy(dst=tile_count,
-                     src=tiles[:, blocks * ntiles:blocks * ntiles + 1])
-    sbm.close_scope()
-    return paired, paired_count, dense, sparse, tiles, dense_count, sparse_count, tile_count
+def _table_rows(blocks, nprograms):
+    """Rows of an item table: the item indices a loop over up to ``blocks`` items reaches."""
+    return -(-blocks // nprograms) * nprograms
 
 
-def _work_item(worklist, count, at_index, sbm):
-    """Select one compacted item; duplicate the last item for an odd pair."""
-    sbm.open_scope(name="routing_work_item")
-    index = sbm.alloc((1, 8), nl.int32)[:, :1]
-    last = sbm.alloc((1, 8), nl.float32)[:, :1]
-    item = sbm.alloc((1, 8), nl.int32)[:, :1]
-    nisa.register_store(dst=index, src=at_index)
+def _table_reach(blocks, nprograms, loops, slots):
+    """Empty-list entries that ``loops`` item tables can read, from entry 0.
+
+    A table reads entries up to first_slot + rows * slots. A loop over c items
+    advances first_slot by ceil(c / programs) * programs * slots, and the loops
+    share at most ``blocks`` items, so first_slot stays at or below
+    (blocks + loops * (programs - 1)) * slots.
+    """
+    return (blocks + loops * (nprograms - 1) + _table_rows(blocks, nprograms)) * slots
+
+
+def _item_table(worklist, empty, first_slot, slots, blocks, rows, sbm):
+    """Tabulate a loop's items and zero fills, int32 [1, rows, 1 + slots].
+
+    Row ``at`` serves iteration ``at``: column 0 is list entry ``at``, or past
+    the list its last entry (an odd list's second program repeats the last
+    item; later rows never run). Columns 1.. are empty-list entries
+    [first + at * slots, +slots), first = ``first_slot``; past that list they
+    hold the out-of-range id ``blocks``, whose DMAs the engine skips. One copy
+    then gives an iteration its block and its zero-fill targets, so the fills
+    issue beside the weights instead of behind engine work queued for the
+    products. ``first_slot`` then advances past every row the loop runs.
+    """
+    tile, count = worklist
+    empty_tile = empty[0]
+    nprograms = nl.num_programs(0)
+    table = sbm.alloc((1, rows, 1 + slots), nl.int32)
+    sbm.open_scope(name="item_table")
+    items = table[:, :, 0]
+    nisa.tensor_copy(dst=items, src=tile[:, blocks:blocks + rows])
+    # Entries past the list read ``blocks``; they become the last entry.
+    last = _tile(1, 1)
     nisa.tensor_scalar(dst=last, data=count, op0=nl.add, operand0=-1)
-    nisa.tensor_scalar(dst=index, data=index, op0=nl.minimum, operand0=last)
+    last_index = _tile(1, 1, nl.int32)
+    nisa.tensor_copy(dst=last_index, src=last)
+    last_reg = nisa.register_alloc()
+    nisa.register_load(dst=last_reg, src=last_index)
+    shift = _tile(1, 1)
+    nisa.tensor_copy(dst=shift, src=_select(worklist, blocks, last_reg))
+    nisa.tensor_scalar(dst=shift, data=shift, op0=nl.add, operand0=-blocks)
+    padding = sbm.alloc((1, max(rows, 8)), nl.float32)[:, :rows]
+    nisa.tensor_scalar(dst=padding, data=items, op0=nl.equal, operand0=blocks,
+                       op1=nl.multiply, operand1=shift)
+    nisa.tensor_tensor(dst=items, data1=items, data2=padding, op=nl.add)
+    # Zero-fill targets: one strided read of the empty list from ``first_slot``.
+    first = _tile(1, 1, nl.int32)
+    nisa.tensor_copy(dst=first, src=first_slot)
+    first_reg = nisa.register_alloc()
+    nisa.register_load(dst=first_reg, src=first)
+    nisa.tensor_copy(dst=table[:, :, 1:1 + slots], src=empty_tile.ap(
+        pattern=[[empty_tile.shape[1], 1], [slots, rows], [1, slots]], offset=blocks,
+        scalar_offset=first_reg, indirect_dim=1))
+    iterations = _ceil_div(count, nprograms, sbm)
+    nisa.tensor_scalar(dst=iterations, data=iterations, op0=nl.multiply,
+                       operand0=nprograms * slots)
+    nisa.tensor_tensor(dst=first_slot, data1=first_slot, data2=iterations, op=nl.add)
+    sbm.close_scope()
+    return table
+
+
+def _zero_rows(out, zeros, block, start, count):
+    """Write zeros to rows [start, start+count) of block ``block`` (a register), in one DMA.
+
+    The source repeats the rows of ``zeros``; an out-of-range block is skipped.
+    """
+    h = out.shape[2]
+    rows = min(zeros.shape[0], count)
+    while count % rows:
+        rows -= 1
+    nisa.dma_copy(dst=_block_ap(out, block, [[h, count], [1, h]], start * h),
+                  src=zeros.ap(pattern=[[h, rows], [0, count // rows], [1, h]]),
+                  oob_mode=nisa.oob_mode.skip, dge_mode=_HWDGE, engine=_DMA_QUEUE)
+
+
+def _zero_blocks(out, zeros, empty, first_slot, at_index, slots, sbm):
+    """Zero empty-list entries [first + at*slots, +slots), first = ``first_slot``.
+
+    Positions past the list read the out-of-range id, whose DMAs the engine
+    skips, so a slot never writes a routed block.
+    """
+    blocks, q = out.shape[0], out.shape[1]
+    sbm.open_scope(name="zero_blocks")
+    index = sbm.alloc((1, 8), nl.int32)[:, :1]
+    nisa.register_store(dst=index, src=at_index)
+    nisa.tensor_scalar(dst=index, data=index, op0=nl.multiply, operand0=slots,
+                       op1=nl.add, operand1=first_slot)
+    nisa.tensor_scalar(dst=index, data=index, op0=nl.minimum, operand0=empty[1])
     position = nisa.register_alloc()
     nisa.register_load(dst=position, src=index)
-    nisa.tensor_copy(dst=item, src=worklist.ap(
-        pattern=[[worklist.shape[1], 1], [1, 1]],
-        scalar_offset=position, indirect_dim=1))
-    item_reg = nisa.register_alloc()
-    nisa.register_load(dst=item_reg, src=item)
+    targets = sbm.alloc((1, max(slots, 8)), nl.int32)[:, :slots]
+    nisa.tensor_copy(dst=targets, src=_select(empty, blocks, position, slots))
+    for slot in range(slots):
+        target = nisa.register_alloc()
+        nisa.register_load(dst=target, src=targets[:, slot:slot + 1])
+        _zero_rows(out, zeros, target, 0, q)
     sbm.close_scope()
-    return item_reg
+
+
+def _block_rows(compute, loaded, zeros, block, width, block_m):
+    """Zero rows [width, q) of a block, then compute rows [0, width) in ``block_m`` slices."""
+    out = compute[6]
+    q = out.shape[1]
+    if width < q:
+        _zero_rows(out, zeros, block, width, q - width)
+    for m0 in range(0, width, block_m):
+        _compute_rows(compute, loaded, block, m0, min(block_m, width - m0))
+
+
+def _item_loop(compute, loads, worklist, zero_fill, width, block_m, sbm):
+    """One dynamic loop over a worklist, computing rows [0, width) of each block.
+
+    An iteration reads its block and its ``slots`` zero-fill targets from the
+    loop's item table (``_item_table``), loads the block's weights, queues the
+    zero fills behind them, then computes.
+    """
+    weights, scales, experts_row, kstep, nstep = loads
+    zeros, empty, first_slot, slots = zero_fill
+    out = compute[6]
+    blocks, q = out.shape[0], out.shape[1]
+    nprograms, program = nl.num_programs(0), nl.program_id(0)
+    rows = _table_rows(blocks, nprograms)
+    table = _item_table(worklist, empty, first_slot, slots, blocks, rows, sbm)
+    boundary = _phase_bounds(worklist[1], program, nprograms, sbm)
+
+    def iteration(at_index):
+        sbm.open_scope(name="routing_item")
+        entry = sbm.alloc((1, max(1 + slots, 8)), nl.int32)[:, :1 + slots]
+        nisa.tensor_copy(dst=entry, src=table.ap(
+            pattern=[[rows * (1 + slots), 1], [1, 1 + slots]], scalar_offset=at_index,
+            indirect_dim=1))
+        block = nisa.register_alloc()
+        nisa.register_load(dst=block, src=entry[:, 0:1])
+        targets = []
+        for slot in range(slots):
+            target = nisa.register_alloc()
+            nisa.register_load(dst=target, src=entry[:, 1 + slot:2 + slot])
+            targets.append(target)
+        sbm.close_scope()
+        loaded = _expert_operands(weights, scales, experts_row, block, kstep, nstep)
+        for target in targets:
+            _zero_rows(out, zeros, target, 0, q)
+        _block_rows(compute, loaded, zeros, block, width, block_m)
+    nl.fori_loop(program, boundary, iteration, step=nprograms)
 
 
 @nki.jit
 def moe_fused_fp8_kernel(hidden, weights, scales, row_ids, expert_ids, affinity,
-                         bounds, BLOCK_M=128, BLOCK_N=1024, BLOCK_K=4096,
+                         bounds, BLOCK_M=_PMAX, BLOCK_N=1024, BLOCK_K=4096,
                          SKIP_PADDING=True):
     """Return FP32 [blocks,q,H] contributions from device routing.
 
@@ -351,26 +650,28 @@ def moe_fused_fp8_kernel(hidden, weights, scales, row_ids, expert_ids, affinity,
         row_ids: int32 [blocks,q], token IDs or -1 (holes are allowed).
         expert_ids: int32 [blocks,1], expert for each block.
         affinity: FP32 [(T+1)*E,1], final E entries zero.
-        bounds: FP32 [128,3], gate upper, up lower, up upper.
+        bounds: FP32 [128,3], gate upper, up lower, up upper, the same on
+            every row.
         BLOCK_M/N/K: Compile-time scheduling groups; scaled products stay
             128-granular and accumulate in their original contraction order.
-        SKIP_PADDING: Skip empty blocks and row tiles using device control flow.
+        SKIP_PADDING: Skip empty blocks and rows using device control flow.
             The false setting preserves dense execution for comparisons.
 
     Notes:
-        Padding rows are initialized to zero. Small tiles avoid calculating a
-        whole 256-row expert block for an expert that receives only a few tokens.
-        Blocks over half full retain wide tiles and their weight reuse. Routing
-        IDs are read once into tile counts. Device worklists retain original
-        output block positions. The verified production geometry merges adjacent
-        dense blocks only when their expert IDs match; its 512-row moving tile
-        reuses one set of weights. Remaining dense blocks use the original width,
-        and active sparse row tiles run in a separate compact loop. Both physical
+        Padding rows are zero. Routing IDs are read once into per-block spans;
+        each routed block runs once, for the row prefix that holds its last
+        routed row tile, in the narrowest of a few compile-time row classes, so
+        its expert weights load once, as FP8 PE stationaries. Rows past the
+        prefix and every empty block are written with zeros beside the
+        products, queued behind the block's weights; every output row has
+        exactly one writer, so no barrier orders them. When a whole block is
+        one product and two blocks fill its moving rows (BLOCK_M == q ==
+        _MOVING_FMAX / 2), adjacent whole blocks whose expert IDs match merge
+        into one product, which loads the expert's weights once. Both physical
         programs take equal iteration counts; an odd list duplicates its last
-        pure output write. Sparse blocks are zeroed before a shared-output barrier
-        and sparse tile computation, including holes inside a block.
-        Single-row decode retains its original dense expert schedule.
-        All routing decisions remain on device, including zero and skewed routing.
+        pure output write. Single-row decode retains its original dense expert
+        schedule. All routing decisions remain on device, including zero and
+        skewed routing.
     """
     blocks, q = row_ids.shape
     experts, panels, contraction, nh, channels = weights.shape
@@ -378,111 +679,73 @@ def moe_fused_fp8_kernel(hidden, weights, scales, row_ids, expert_ids, affinity,
     ni = panels // 3
     kernel_assert(blocks > 0 and q > 0 and experts > 0,
                   "Require positive blocks, row width, and expert count")
-    kernel_assert(panels % 3 == 0 and ni > 0 and h == nh * 128,
+    kernel_assert(panels % 3 == 0 and ni > 0 and h == nh * _PMAX,
                   "Packed panels and hidden width disagree")
-    kernel_assert(contraction == 128 and channels == 128,
+    kernel_assert(contraction == _PMAX and channels == _PMAX,
                   "FP8 products must retain the 128x128 checkpoint blocks")
     kernel_assert(scales.shape == (experts, panels, nh),
                   "Scale shape must match the packed weights")
-    kernel_assert(1 <= BLOCK_M <= 512, "BLOCK_M must be in [1,512]")
-    kernel_assert(BLOCK_N > 0 and BLOCK_N % 128 == 0,
+    kernel_assert(1 <= BLOCK_M <= _MOVING_FMAX, "BLOCK_M must be in [1,512]")
+    kernel_assert(BLOCK_N > 0 and BLOCK_N % _PMAX == 0,
                   "BLOCK_N must be a positive multiple of 128")
-    kernel_assert(BLOCK_K > 0 and BLOCK_K % 128 == 0,
+    kernel_assert(BLOCK_K > 0 and BLOCK_K % _PMAX == 0,
                   "BLOCK_K must be a positive multiple of 128")
-    nstep, kstep = BLOCK_N // 128, BLOCK_K // 128
+    nstep, kstep = BLOCK_N // _PMAX, BLOCK_K // _PMAX
     nprograms, program = nl.num_programs(0), nl.program_id(0)
     out = nl.ndarray((blocks, q, h), dtype=nl.float32, buffer=nl.shared_hbm)
-    clamp = nl.ndarray((128, 3), dtype=nl.float32, buffer=nl.sbuf)
+    clamp = nl.ndarray((_PMAX, 3), dtype=nl.float32, buffer=nl.sbuf)
     nisa.dma_copy(dst=clamp, src=bounds)
+    experts_row = _experts_row(expert_ids)
+    zeros = nl.ndarray((min(_PMAX, q), h), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.memset(dst=zeros, value=0.0)
+    compute = (hidden, weights, row_ids, expert_ids, affinity, clamp, out)
+    loads = (weights, scales, experts_row, kstep, nstep)
 
     if not SKIP_PADDING or q == 1:
-        _dense_schedule(hidden, weights, scales, row_ids, expert_ids, affinity,
-                        out, clamp, BLOCK_M, nstep, kstep)
+        _dense_schedule(compute, loads, BLOCK_M)
         return out
     kernel_assert(nprograms in (1, 2),
                   "Padding-aware prefill supports one or two core programs")
-    # The 512-row merge is enabled only for the geometry verified on Trn2.
-    # Other callers retain the same compact single-block and row-tile schedule.
-    merge_pairs = (h == 4096 and ni * 128 == 512 and q == 256
-                   and BLOCK_M == 256 and BLOCK_N == 4096 and BLOCK_K == 4096
-                   and nprograms == 2)
-    row_step = min(BLOCK_M, 32)
-    while q % row_step:
-        row_step -= 1
+    # Two adjacent whole blocks of one expert run as one product of 2 * q rows,
+    # so the expert's weights load once for both. That needs a whole block to be
+    # one product (BLOCK_M == q), so a pair is two of the products the caller
+    # sized side by side, and two blocks to fill the moving free size exactly
+    # (2 * q == _MOVING_FMAX): wider does not fit one product, and narrower
+    # blocks would want more than two to a product.
+    merge_pairs = BLOCK_M == q and 2 * q == _MOVING_FMAX
+    row_step = _row_step(q, BLOCK_M)
+    class_bounds = _row_classes(q, row_step)
+    slots = _zero_slots(blocks, experts)
+    trailing = max(slots, _TRAILING_ZERO_BLOCKS)
     sbm = create_auto_alloc_manager()
     sbm.open_scope(name="routing")
-    tile_counts, block_counts = _routing_counts(row_ids, row_step, sbm)
-    paired, paired_count, dense, sparse, tiles, dense_count, sparse_count, tile_count = _routing_worklists(
-        tile_counts, block_counts, expert_ids, q, sbm,
-        merge_pairs=merge_pairs,
-    )
-    boundary = _phase_bounds(dense_count, program, nprograms, sbm)
-    tiles_per_block = q // row_step
-    tile_rows = row_ids.reshape((blocks * tiles_per_block, row_step))
-    tile_out = out.reshape((blocks * tiles_per_block, row_step, h))
-    tile_blocks = sbm.alloc((1, max(blocks * tiles_per_block, 8)), nl.int32)
-    nisa.iota(dst=tile_blocks[:, :blocks * tiles_per_block].reshape(
-        (1, blocks, tiles_per_block)),
-        pattern=[[1, blocks], [0, tiles_per_block]])
+    span = _routing_spans(row_ids, row_step, sbm)
+    loops = len(class_bounds) + (1 if merge_pairs else 0)
+    paired, classes, empty = _routing_worklists(
+        span, experts_row, class_bounds, sbm, merge_pairs=merge_pairs, extra=trailing,
+        empty_extra=_table_reach(blocks, nprograms, loops, slots) - blocks - 1)
+    first_slot = sbm.alloc((1, 8), nl.float32)[:, :1]
+    nisa.memset(dst=first_slot, value=0.0)
 
-    if merge_pairs:
-        kernel_assert(2 * q <= 512, "Merged moving dimension exceeds 512")
+    zero_fill = (zeros, empty, first_slot, slots)
+    if paired is not None:
+        _item_loop(compute, loads, paired, zero_fill, 2 * q, 2 * q, sbm)
+    for c in range(len(class_bounds)):
+        _item_loop(compute, loads, classes[c], zero_fill, class_bounds[c] * row_step,
+                   BLOCK_M, sbm)
 
-        def process_paired(at_block):
-            block = _work_item(paired, paired_count, at_block, sbm)
-            expert_reg, scale = _expert_operands(
-                expert_ids, scales, block, panels, nh
-            )
-            _compute_rows(hidden, weights, affinity, row_ids, expert_ids,
-                          out, clamp, scale, expert_reg, block, 0, 2 * q,
-                          nstep, kstep)
-        pair_boundary = _phase_bounds(paired_count, program, nprograms, sbm)
-        nl.fori_loop(program, pair_boundary, process_paired, step=nprograms)
+    sbm.open_scope(name="trailing_zero_bounds")
+    remaining = sbm.alloc((1, 8), nl.float32)[:, :1]
+    nisa.tensor_tensor(dst=remaining, data1=empty[1], data2=first_slot, op=nl.subtract)
+    nisa.tensor_scalar(dst=remaining, data=remaining, op0=nl.maximum, operand0=0.0)
+    passes = _ceil_div(remaining, trailing, sbm)
+    passes_f32 = sbm.alloc((1, 8), nl.float32)[:, :1]
+    nisa.tensor_copy(dst=passes_f32, src=passes)
+    zero_boundary = _phase_bounds(passes_f32, program, nprograms, sbm)
+    sbm.close_scope()
 
-    def process_dense(at_block):
-        block = _work_item(dense, dense_count, at_block, sbm)
-        expert_reg, scale = _expert_operands(
-            expert_ids, scales, block, panels, nh
-        )
-        for m0 in range(0, q, BLOCK_M):
-            m = min(BLOCK_M, q - m0)
-            _compute_rows(hidden, weights, affinity, row_ids, expert_ids,
-                          out, clamp, scale, expert_reg, block, m0, m,
-                          nstep, kstep)
-    nl.fori_loop(program, boundary, process_dense, step=nprograms)
-
-    zeros = sbm.alloc((128, h), nl.float32)
-    nisa.memset(dst=zeros, value=0.0)
-
-    def zero_sparse(at_block):
-        block = _work_item(sparse, sparse_count, at_block, sbm)
-        for start in range(0, q, 128):
-            rows = min(128, q - start)
-            nisa.dma_copy(dst=out.ap(
-                pattern=[[h, rows], [1, h]], offset=start * h,
-                scalar_offset=block, indirect_dim=0), src=zeros[:rows, :])
-    zero_boundary = _phase_bounds(sparse_count, program, nprograms, sbm)
-    nl.fori_loop(program, zero_boundary, zero_sparse, step=nprograms)
-    if nprograms == 2:
-        nisa.core_barrier(data=out, cores=(0, 1))
-
-    def process_sparse(at_tile):
-        linear = _work_item(tiles, tile_count, at_tile, sbm)
-        sbm.open_scope(name="sparse_tile")
-        block_value = sbm.alloc((1, 8), nl.int32)[:, :1]
-        nisa.tensor_copy(dst=block_value, src=tile_blocks.ap(
-            pattern=[[max(blocks * tiles_per_block, 8), 1], [1, 1]],
-            scalar_offset=linear, indirect_dim=1))
-        block = nisa.register_alloc()
-        nisa.register_load(dst=block, src=block_value)
-        expert_reg, scale = _expert_operands(
-            expert_ids, scales, block, panels, nh
-        )
-        _compute_rows(hidden, weights, affinity, tile_rows, expert_ids,
-                      tile_out, clamp, scale, expert_reg, linear, 0,
-                      row_step, nstep, kstep, expert_block=block)
-        sbm.close_scope()
-    sparse_boundary = _phase_bounds(tile_count, program, nprograms, sbm)
-    nl.fori_loop(program, sparse_boundary, process_sparse, step=nprograms)
+    def zero_rest(at_index):
+        _zero_blocks(out, zeros, empty, first_slot, at_index, trailing, sbm)
+    nl.fori_loop(program, zero_boundary, zero_rest, step=nprograms)
     sbm.close_scope()
     return out

@@ -4,9 +4,10 @@
 The simulator runs a kernel body as plain Python, so it cannot see a call form the
 compiler's front end refuses. This compiles ``dsa_decode_ring_step_kernel`` at B in
 {1, 16, 64, 130} (130 spans two partition tiles) and ``dsa_decode_scores_kernel`` at
-ctx 4096 and 8192 (1024 and 2048 candidates) and a ragged 300, at B in {1, 16}, on one
-and two programs, and both at B=1 on a one-slot bank (the one-request carrier's view,
-read statically), inside a child process that pins the platform target, opens no device
+ctx 4096 and 8192 (1024 and 2048 candidates), a ragged 300, and the wide 16385 and 65536
+(ctx 65540 and 262144: the device loop over score blocks, with and without a tail block),
+at B in {1, 16}, on one and two programs, and both at B=1 on a one-slot bank (the
+one-request carrier's view, read statically; 16500 takes the loop there), inside a child process that pins the platform target, opens no device
 node, and proves it parsed bodies by refusing one that reads an undefined name. The
 pattern is ``test_mla_decode_frontend_compile.py``'s.
 """
@@ -30,10 +31,12 @@ _PIN = {"VLLM_NEURON_CPU_COMPILE": "1", "NEURON_PLATFORM_TARGET_OVERRIDE": "trn2
 
 HEADS, DIM, POOL, SLOTS = 32, 128, 4, 140
 RING_BATCHES = (1, 16, 64, 130)
-SCORE_CANDIDATES = (1024, 2048, 300)
+#: Past 4 uniform blocks of 32 tiles (16384 candidates) the score blocks run as a device
+#: loop: 16385 (the loop and a one-row tail block) and 65536 (the loop alone).
+SCORE_CANDIDATES = (1024, 2048, 300, 16385, 65536)
 SCORE_BATCHES = (1, 16)
-#: Candidate counts read from a one-slot bank: whole tiles, and a ragged last tile.
-ONE_SLOT_CANDIDATES = (1024, 300)
+#: Candidate counts read from a one-slot bank: whole tiles, a ragged last tile, the loop.
+ONE_SLOT_CANDIDATES = (1024, 300, 16500)
 
 
 @nki.jit
@@ -83,7 +86,8 @@ def _compile_each_entry() -> None:
                                   fake((b, HEADS, DIM), bf), fake((b, HEADS), f32),
                                   fake((SLOTS, c + 1, DIM), bf), fake((b, 1), i32),
                                   fake((b, 1), i32), fake((b, 1), i32), fake((b, DIM), bf),
-                                  c, POOL, DB.SOURCE_DIGEST)))
+                                  c, POOL, DB.score_blocks(b, c, g), DB.UNROLL_BLOCKS,
+                                  DB.SOURCE_DIGEST)))
     built.append(("ring_b1_one_slot", lambda: wrap_nki(DB.dsa_decode_ring_step_kernel)(
         fake((1, 2 * POOL * DIM), bf), fake((1, 1), i32), fake((1, DIM), bf),
         fake((1, DIM), bf), fake((POOL, DIM), f32), fake((1, 1), i32), POOL,
@@ -93,7 +97,7 @@ def _compile_each_entry() -> None:
             DB.dsa_decode_scores_kernel)(
             fake((1, HEADS, DIM), bf), fake((1, HEADS), f32), fake((1, c + 1, DIM), bf),
             fake((1, 1), i32), fake((1, 1), i32), fake((1, 1), i32), fake((1, DIM), bf),
-            c, POOL, DB.SOURCE_DIGEST)))
+            c, POOL, DB.score_blocks(1, c, 1), DB.UNROLL_BLOCKS, DB.SOURCE_DIGEST)))
     built.append(("undefined_name_body", lambda: wrap_nki(body_that_reads_an_undefined_name)(
         fake((1, 128), torch.float32))))
     print(ROW + "|tree|module=" + DB.__file__, flush=True)

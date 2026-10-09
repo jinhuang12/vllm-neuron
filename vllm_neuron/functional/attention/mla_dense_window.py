@@ -34,7 +34,6 @@ window and each row's causal length. The call site is
 from __future__ import annotations
 
 import hashlib
-import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -48,6 +47,7 @@ import nki.language as nl
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
 from vllm_neuron.functional.attention import mla_sparse as _ms
+from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 from vllm_neuron.utils.neuron_utils import values_are_readable
 
 #: Partition extent. Query rows (queries x heads) are tiled to it for MM1 and the
@@ -397,10 +397,12 @@ def _require_values(seq: int, heads: int, latent: int, cache_latent: int,
 
 
 def _programs(rows: int) -> int:
-    """Two programs on an LNC2 core when the rows span two or more 128-row tiles."""
-    # NEURON_LOGICAL_NC_CONFIG is the Neuron runtime's core setting, read here the way
-    # every LNC2 kernel in functional/ reads it; it is not a vllm-neuron knob.
-    if os.environ.get("NEURON_LOGICAL_NC_CONFIG") == "2" and rows > ROW_TILE:
+    """Two programs on an LNC2 core when the rows span two or more 128-row tiles.
+
+    :func:`~vllm_neuron.functional.dsa.launch_grid.lnc_pair` refuses a setting other
+    than unset, 1 or 2 (``LaunchGridError``).
+    """
+    if lnc_pair() and rows > ROW_TILE:
         return 2
     return 1
 

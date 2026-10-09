@@ -48,6 +48,7 @@ from vllm_neuron.functional.attention import mla_decode as MD
 from vllm_neuron.functional.dsa import decode_batch as DB
 from vllm_neuron.functional.dsa import decode_tail_update as TU
 from vllm_neuron.functional.dsa import decode_trow as TR
+from vllm_neuron.functional.dsa.launch_grid import LaunchGridError
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 ROWS = (1, 2, 4, 6)
@@ -242,10 +243,17 @@ def test_the_rows_step_equals_sequential_one_token_steps_bit_for_bit(rows, batch
     mine, ref = _cloned(ops), _cloned(ops)
     _reset_counters()
     out = _rows_step(mine)
-    # One launch per stage, every one a kernel: ring, scores (selecting only), attention.
+    # One launch per stage, every one a kernel: the ring (decode_tail_update); selecting
+    # only, the scores (decode_trow) and the selection; then the attention (mla_decode).
+    # The selection is one kernel, decode_select.dsa_decode_select (top-k, causal
+    # sentinel, order and expansion together), and it counts in decode_batch's family,
+    # so that family reads one launch here, its select entry, and no ring or scores.
+    selecting = regime == "selecting"
     assert TU.decode_tail_dispatch_counters() == (1, 0)
-    assert TR.decode_trow_dispatch_counters() == ((1, 0) if regime == "selecting" else (0, 0))
-    assert DB.decode_batch_dispatch_counters() == (0, 0)
+    assert TR.decode_trow_dispatch_counters() == ((1, 0) if selecting else (0, 0))
+    assert DB.decode_batch_dispatch_counters() == ((1, 0) if selecting else (0, 0))
+    ring, scores, _, select = DB.decode_batch_route_counts()
+    assert (ring, scores, select) == (0, 0, int(selecting))
     if batch == 1 and rows == 1 and regime == "selecting":
         # The one-request one-token step keeps its one-request sparse attention.
         assert MD.mla_decode_dispatch_counters() == (0, 0)
@@ -290,14 +298,21 @@ def test_the_served_ring_depth_takes_one_and_two_rows(rows, regime):
     mine, ref = _cloned(ops), _cloned(ops)
     _reset_counters()
     out = _rows_step(mine)
+    # One launch per stage, every one a kernel. One row: decode_batch's ring step, and,
+    # selecting, its scores and the selection kernel (decode_select, same family). Two
+    # rows: the T-row ring and scores, and the same selection kernel.
+    selecting = regime == "selecting"
+    ring, scores, _, select = DB.decode_batch_route_counts()
     if rows == 1:
-        assert DB.decode_batch_dispatch_counters() == ((2, 0) if regime == "selecting"
-                                                       else (1, 0))
+        assert DB.decode_batch_dispatch_counters() == ((3, 0) if selecting else (1, 0))
+        assert (ring, scores, select) == (1, int(selecting), int(selecting))
         assert TU.decode_tail_dispatch_counters() == (0, 0)
         assert TR.decode_trow_dispatch_counters() == (0, 0)
     else:
         assert TU.decode_tail_dispatch_counters() == (1, 0)
-        assert DB.decode_batch_dispatch_counters() == (0, 0)
+        assert TR.decode_trow_dispatch_counters() == ((1, 0) if selecting else (0, 0))
+        assert DB.decode_batch_dispatch_counters() == ((1, 0) if selecting else (0, 0))
+        assert (ring, scores, select) == (0, 0, int(selecting))
     want = _sequential(ref, ops["hidden"], ops["start"], ops["latent_slots"], rows,
                        general=rows > 1)
     assert torch.equal(out, want)
@@ -361,3 +376,25 @@ def test_refusals_name_the_rows_and_the_depth():
     ops = _operands(4, 2, max_seq_len, starts, depth=pool, seed=82)
     with pytest.raises(model_fp8.Glm5NextMLADecodeError, match="whole number of rows"):
         _step(_cloned(ops), ops["hidden"][:7], ops["start"], ops["latent_slots"][:7], 2)
+
+
+@pytest.mark.parametrize("setting, programs", [(None, 1), ("1", 1), ("2", 2)],
+                         ids=["unset", "lnc1", "lnc2"])
+def test_the_row_scores_split_over_an_lnc2_pair_from_two_requests(setting, programs,
+                                                                    monkeypatch):
+    """The ``T``-row score kernel takes both cores of an LNC2 pair (setting 2) from two
+    requests on, and one program otherwise."""
+    if setting is None:
+        monkeypatch.delenv("NEURON_LOGICAL_NC_CONFIG", raising=False)
+    else:
+        monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", setting)
+    assert TR._programs(2) == programs
+    assert TR._programs(1) == 1
+
+
+@pytest.mark.parametrize("setting", ["3", "abc"])
+def test_an_lnc_setting_the_row_scores_do_not_serve_is_refused_by_name(setting,
+                                                                       monkeypatch):
+    monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", setting)
+    with pytest.raises(LaunchGridError, match="NEURON_LOGICAL_NC_CONFIG"):
+        TR._programs(2)

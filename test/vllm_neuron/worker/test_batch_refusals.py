@@ -103,6 +103,10 @@ def test_the_gate_context_buckets_validate_and_max_model_len_is_the_fallback():
         validate_decode_context_length_buckets(list(DECODE_CONTEXT_BUCKETS), MAX_MODEL_LEN)
         == DECODE_CONTEXT_BUCKETS
     )
-    # Listing max_model_len itself is refused: it is the implicit last bucket.
-    with pytest.raises(ValueError, match="strictly less than"):
-        validate_decode_context_length_buckets([2048, MAX_MODEL_LEN], MAX_MODEL_LEN)
+    # Listing max_model_len itself is accepted and folded: it is the implicit last bucket,
+    # so the returned list leaves it out and that graph compiles once.
+    assert validate_decode_context_length_buckets(
+        [2048, MAX_MODEL_LEN], MAX_MODEL_LEN) == [2048]
+    # A bucket above max_model_len is still refused.
+    with pytest.raises(ValueError, match="must not exceed max_model_len"):
+        validate_decode_context_length_buckets([2048, 2 * MAX_MODEL_LEN], MAX_MODEL_LEN)

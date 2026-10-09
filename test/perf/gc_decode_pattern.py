@@ -8,11 +8,13 @@ interpreter, so the GC state of one policy never leaks into the next):
 2. Build a static heap of ``--heap`` objects (default 5 M, one tracked list each with
    a pointer to an earlier one), then ``gc.collect()``: the end-of-warmup state. The
    TP=64 worker tracked 5.39 M gen-2 objects at its first ``execute_model``.
-3. Apply the policy. The worker's policies (``off``, ``freeze``, ``freeze_rare_gen2``)
-   run through the worker's own ``gc_policy.apply_post_warmup_gc_policy``; the
-   other two need a per-step hook the worker does not have and are emulated here.
+3. Apply the policy. The worker's policies (``off``, ``freeze``, ``freeze_rare_gen2``,
+   ``rare_gen2``) run through the worker's own ``gc_policy.apply_post_warmup_gc_policy``;
+   the other two need a per-step hook the worker does not have and are emulated here.
 4. Run ``--steps`` decode-like steps and record every collection with
-   ``gc.callbacks`` (generation, pause, step), and RSS before and after.
+   ``gc.callbacks`` (generation, pause, step), and RSS before and after. The gen-1
+   pause of the first fifth of the steps against the last fifth shows whether gen-1
+   passes slow down as a run goes on.
 
 One step, calibrated to the bs=64 worker diag (``profile/runs/b64v2/diag``: after the
 freeze ~0.07 full passes per step = one per 11 gen-1 triggers, so ~1 gen-1 and ~9-11
@@ -30,7 +32,9 @@ Policies:
 * ``off``: CPython default GC, no freeze (0a08ff4).
 * ``freeze``: ``freeze_gc_heap()`` alone (e9aa679).
 * ``freeze_rare_gen2`` (a): freeze, then ``threshold2`` = ``GEN2_THRESHOLD``
-  (:data:`CHOSEN_POLICY`; the worker default is ``off``, see ``gc_policy.py``).
+  (an earlier worker default).
+* ``rare_gen2``: ``threshold2`` = ``GEN2_THRESHOLD``, no collection and no freeze
+  (the worker default, :data:`CHOSEN_POLICY`).
 * ``b_disable_safe_point`` (b): freeze, ``gc.disable()``, then ``gc.collect(1)`` every
   16 steps and ``gc.collect(2)`` every 4096 steps, at the step boundary.
 * ``c_periodic_refreeze`` (c): freeze, then ``gc.collect(); gc.freeze()`` every 1000
@@ -61,22 +65,23 @@ import sys
 import time
 from pathlib import Path
 
-#: The policy this harness recommends for bs=64 (no full-pass stalls).
+#: The policy this harness recommends for bs=64 (no full-pass stalls, no freeze).
 #: ``test_gc_policy.py`` asserts that it is a worker policy run through the worker's
-#: code, so the two cannot drift apart. It is not the worker default (``off``): on
-#: TP=64 it made every bs=1 decode step slower (``gc_policy.py``).
-CHOSEN_POLICY = "freeze_rare_gen2"
+#: code, so the two cannot drift apart. It is the worker default (``gc_policy.py``).
+CHOSEN_POLICY = "rare_gen2"
+FREEZE_RARE_GEN2 = "freeze_rare_gen2"
 NO_FREEZE = "off"
 FREEZE_ONLY = "freeze"
 SAFE_POINT = "b_disable_safe_point"
 REFREEZE = "c_periodic_refreeze"
 #: Policies the worker itself can apply (``gc_policy.POLICIES``).
-WORKER_POLICIES = (CHOSEN_POLICY, FREEZE_ONLY, NO_FREEZE)
-ORDER = (NO_FREEZE, FREEZE_ONLY, CHOSEN_POLICY, SAFE_POINT, REFREEZE)
+WORKER_POLICIES = (CHOSEN_POLICY, FREEZE_RARE_GEN2, FREEZE_ONLY, NO_FREEZE)
+ORDER = (NO_FREEZE, FREEZE_ONLY, FREEZE_RARE_GEN2, CHOSEN_POLICY, SAFE_POINT, REFREEZE)
 LABELS = {
     NO_FREEZE: "no freeze (CPython default)",
     FREEZE_ONLY: "freeze only (e9aa679)",
-    CHOSEN_POLICY: "(a) freeze + gen-2 threshold",
+    FREEZE_RARE_GEN2: "(a) freeze + gen-2 threshold",
+    CHOSEN_POLICY: "gen-2 threshold, no freeze (rare_gen2)",
     SAFE_POINT: "(b) freeze + gc.disable + safe-point collect",
     REFREEZE: "(c) freeze + re-freeze every 1000 steps",
 }
@@ -152,7 +157,9 @@ def _percentile(values: list[float], q: float) -> float:
 
 def run_child(policy: str, args) -> dict:
     """One policy, in this process. Returns the measurement as a dict."""
-    import vllm_neuron  # noqa: F401  (the worker's module heap: torch, vLLM, plugin)
+    import torch
+
+    import vllm_neuron  # the worker's module heap: torch, vLLM, plugin
 
     rng = random.Random(args.seed)
     t_build = time.perf_counter()
@@ -229,6 +236,11 @@ def run_child(policy: str, args) -> dict:
                 between.append(n1)
             n1 = 0
 
+    # Gen-1 pause against step index: does a raised threshold2 let gen-1 passes slow
+    # down as the run goes on? First fifth of the steps against the last fifth.
+    gen1_first = [e[1] for e in events if e[0] == 1 and 0 <= e[2] < steps // 5]
+    gen1_last = [e[1] for e in events if e[0] == 1 and e[2] >= steps - steps // 5]
+
     # 64-rank lock-step estimate (see module docstring).
     offsets = [0] * args.ranks if policy == SAFE_POINT else [
         rng.randrange(steps) for _ in range(args.ranks)
@@ -247,6 +259,8 @@ def run_child(policy: str, args) -> dict:
     return {
         "policy": policy,
         "label": LABELS.get(policy, policy),
+        "vllm_neuron": vllm_neuron.__file__,
+        "torch_threads": torch.get_num_threads(),
         "python": sys.version.split()[0],
         "steps": steps,
         "heap_objects": args.heap,
@@ -268,6 +282,12 @@ def run_child(policy: str, args) -> dict:
             "first_step": gen2[0][2] if gen2 else None,
             "collected_total": sum(e[3] for e in gen2),
             "gen1_between_median": statistics.median(between) if between else None,
+        },
+        "gen1_pause_ms_by_run_fifth": {
+            "first_median": round(_percentile(gen1_first, 0.5), 4),
+            "last_median": round(_percentile(gen1_last, 0.5), 4),
+            "first_max": round(max(gen1_first, default=0.0), 4),
+            "last_max": round(max(gen1_last, default=0.0), 4),
         },
         "gc_ms_per_step_mean": round(sum(total_ms) / steps, 4),
         "step_ms_mean": round(steps_s * 1e3 / steps, 3),
@@ -332,7 +352,8 @@ def _check(chosen: dict, baseline: dict) -> dict:
 def _table(results: dict) -> str:
     head = (
         f"{'policy':<46} {'gen0/1k':>8} {'gen1/1k':>8} {'gen2/1k':>8} {'max ms':>8} "
-        f"{'p99 ms':>7} {'gen2 med':>8} {'RSS dMB':>8} {'gc ms/st':>8} {'64-rank gen2':>12}"
+        f"{'p99 ms':>7} {'gen2 med':>8} {'RSS dMB':>8} {'gc ms/st':>8} {'64-rank gen2':>12} "
+        f"{'g1 ms 1st/last 5th':>18}"
     )
     rows = [head, "-" * len(head)]
     for name in ORDER:
@@ -345,7 +366,9 @@ def _table(results: dict) -> str:
             f"{r['pause_ms']['max']:>8.2f} {r['pause_ms']['p99']:>7.3f} "
             f"{r['gen2_pause_ms']['median']:>8.2f} {r['rss_mb']['delta']:>8.2f} "
             f"{r['gc_ms_per_step_mean']:>8.3f} "
-            f"{r['lockstep']['slowest_rank_gen2_ms_per_step_mean']:>12.3f}"
+            f"{r['lockstep']['slowest_rank_gen2_ms_per_step_mean']:>12.3f} "
+            f"{r['gen1_pause_ms_by_run_fifth']['first_median']:>8.3f}/"
+            f"{r['gen1_pause_ms_by_run_fifth']['last_median']:<8.3f}"
         )
     return "\n".join(rows)
 
@@ -378,6 +401,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     env.pop("VLLM_NEURON_GC_POLICY", None)
     env.pop("VLLM_GC_DEBUG", None)
+    print(f"[gc_decode_pattern] root {root} python {sys.version.split()[0]} "
+          f"OMP_NUM_THREADS={env.get('OMP_NUM_THREADS')}", flush=True)
     results: dict[str, dict] = {}
     for name in [p for p in args.policies.split(",") if p]:
         t = time.perf_counter()
@@ -389,7 +414,9 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write(out.stdout[-4000:] + out.stderr[-4000:])
             raise SystemExit(f"child {name} failed with rc={out.returncode}")
         results[name] = parse_child_output(out.stdout)
-        print(f"[{name}] done in {time.perf_counter() - t:.0f} s", flush=True)
+        print(f"[{name}] done in {time.perf_counter() - t:.0f} s (vllm_neuron.__file__ "
+              f"{results[name]['vllm_neuron']}, torch threads {results[name]['torch_threads']})",
+              flush=True)
 
     print(_table(results))
     verdict = None

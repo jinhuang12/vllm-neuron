@@ -8,7 +8,8 @@ the softmax and the pre-weighted collapse in one launch) before the unchanged Si
 and the 0a08ff4 snapshot's, which runs that region as torch ops. The Sinkhorn kernel is
 the same file on both sides. Row counts: the decode batches B in {1, 4, 64}, one token
 tile (:data:`~vllm_neuron.functional.glue.mhc_pre.MHC_PRE_TOKEN_TILE`), the served
-1024-row prefill chunk, and 200 rows (no bucket: a whole tile, then a partial one).
+1024-row prefill chunk, the 2048-row chunk of the uncapped prefill line, and 200 rows
+(no bucket: a whole tile, then a partial one).
 
 The feed-forward norm. At the feed-forward site the kernel also returns the sub-block's
 RMSNorm of ``layer_input`` (``mhc_pre_normed``). Against ``Glm5NextModel._rms_norm`` of
@@ -57,9 +58,10 @@ from vllm_neuron.functional.glue import mhc_pre as fused
 from vllm_neuron.model.glm5_next import model_fp8
 
 BATCHES = (1, 4, 64)
-#: One token tile, the served prefill chunk, and two tiles of which the second is
-#: partial (72 rows: also a partial 32-row transpose chunk).
-TILED_ROWS = (fused.MHC_PRE_TOKEN_TILE, glue_case.SERVED_PREFILL_BUCKETS[0], 200)
+#: One token tile, the served prefill chunk, the uncapped line's chunk, and two tiles of
+#: which the second is partial (72 rows: also a partial 32-row transpose chunk).
+TILED_ROWS = (fused.MHC_PRE_TOKEN_TILE, glue_case.SERVED_PREFILL_BUCKETS[0],
+              glue_case.UNCAPPED_PREFILL_CHUNK, 200)
 POST_ATOL = 2e-5
 COMB_ATOL = 2e-5
 #: The speculative verify step's rows at bs 1 and 2 with 1 to 3 drafts: B * (1 + k).

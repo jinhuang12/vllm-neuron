@@ -226,9 +226,14 @@ def get_efa_interface(local_rank: int, visible_devices: list[int]) -> str:
     except IndexError:
         lnc = local_rank
 
-    lnc_config = int(
-        os.environ.get("NEURON_LOGICAL_NC_CONFIG", str(_DEFAULT_LNC_CONFIG))
-    )
+    # The device index needs the grouping itself, with the runtime's default when the
+    # launcher leaves the setting unset, so this reads the registered setting rather than
+    # launch_grid.lnc_pair (a kernel's one-or-pair question, where unset means one).
+    # Imported lazily, as in get_instance_family.
+    from vllm_neuron import envs
+
+    setting = envs.NEURON_LOGICAL_NC_CONFIG
+    lnc_config = _DEFAULT_LNC_CONFIG if setting is None else setting
     nd = lnc * lnc_config // 8
 
     try:

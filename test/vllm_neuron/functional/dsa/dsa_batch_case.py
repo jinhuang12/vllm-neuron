@@ -120,7 +120,7 @@ def batched_layer(module, ops: dict, *, taps: dict | None = None) -> torch.Tenso
     indices = indexer.forward_requests(
         hidden, q_latent, ops["pool_bank"], ops["tail_bank"], ops["state_slots"],
         ops["seq_lens"], ops["position"],
-        max_seq_len=bound if dense else int(ops["max_seq_len"]),
+        max_seq_len=bound,
         indices_wanted=not dense, projected=projected)
     query, kv_latent = module.project_query_and_latent(hidden)
     cache = ops["latent_cache"]
