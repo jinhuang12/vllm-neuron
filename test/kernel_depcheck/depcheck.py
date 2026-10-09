@@ -13,6 +13,16 @@ completion node (the DMACopy name or the DMABlock name; only semaphore waits lea
 It also checks the arithmetic of every wait: the wait value must be >= the cumulative
 update count of the producer's semaphore at the producer's completion.
 
+The one-pass verdict (`Model.one_pass_verdict`). An UNSYNC pair is confirmed unless one of
+its footprints is a runtime-address DRAM operand taken as its whole tensor (its real range is
+not known), or it is two TensorSave of one register by two engines (names equal but for the
+engine suffix) into one memref: the same value into one slot. An undecided operand only hides
+the pairs it takes part in and adds or removes no edge, so a pair the graph leaves unordered
+stays unordered in a dump that has one. A cycle or a reset that names no group leaves edges
+unknown, and then no pair is confirmed. `VERDICT` is FINDINGS when a pair is confirmed or a
+wait's arithmetic is not OK (with the edges known); else UNDECIDED when an operand or edge is
+undecided or a pair goes through a runtime address; else CLEAN. The counts follow the word.
+
 That graph is one pass over the program: a dynamic loop's body is checked as one
 iteration. Blocks are taken in the dump's order, which is program order apart from the
 loop back-edges. A loop body is a block holding a branch that names the block itself; walrus
@@ -109,10 +119,16 @@ Limits of the class:
 #                     Waits in a loop body are checked for the later iterations too. New:
 #                     the loop-carried class and its verdict line. Tests:
 #                     test/kernel_depcheck/tests/.
+# 2026-10-09          (trn2-2's v8d re-run) the one-pass VERDICT was UNDECIDED whenever an
+#                     operand was undecided, above SBUF RAW pairs nothing orders. A confirmed
+#                     pair is now FINDINGS (Model.one_pass_verdict); pairs only through a
+#                     runtime address are UNDECIDED (were FINDINGS); one register saved by
+#                     each engine into one slot is not a finding (was FINDINGS).
 
 import bisect
 import collections
 import json
+import re
 import sys
 
 DSZ = {"float32": 4, "int32": 4, "uint32": 4, "bfloat16": 2, "float16": 2, "int16": 2,
@@ -172,6 +188,7 @@ def ivs_overlap(a, b):
 
 
 NO_MEMORY_KINDS = {"imm_value", "register_access"}   # an immediate, a register read
+ENGINE_SUFFIX = re.compile(r"-(Activation|PE|DVE|SP|Pool)\d+$")   # an engine's copy of a name
 
 
 class Undecided(Exception):
@@ -578,6 +595,42 @@ class Model:
             n = prev[n]
         return list(reversed(out))
 
+    def unconfirmed_because(self, P, C, fp, fc):
+        """Why the UNSYNC footprint pair (P's `fp`, C's `fc`) is not confirmed: "runtime-address"
+        or "same-value TensorSave"; None when it is confirmed (module docstring, "The one-pass
+        verdict")."""
+        if fp.get("runtime") or fc.get("runtime"):
+            return "runtime-address"
+        if (P["i"]["opcode"] == C["i"]["opcode"] == "TensorSave" and fp["memref"] == fc["memref"]
+                and ENGINE_SUFFIX.sub("", P["i"]["name"]) == ENGINE_SUFFIX.sub("", C["i"]["name"])):
+            return "same-value TensorSave"
+        return None
+
+    def one_pass_verdict(self, unsync, waits_not_ok):
+        """(word, counts) of the one-pass VERDICT line (module docstring): `unsync` the UNSYNC
+        footprint pairs (kind, P, C, fp, fc), `waits_not_ok` the number of waits whose
+        arithmetic is not OK."""
+        why = collections.Counter(self.unconfirmed_because(P, C, fp, fc)
+                                  for _, P, C, fp, fc in unsync)
+        edges_unknown = self.cycle_nodes() > 0 or any(
+            i.get("opcode") == "GroupResetSemaphores" and i.get("sema_group") is None
+            for i in self.ins)
+        confirmed = 0 if edges_unknown else why[None]
+        if confirmed or (waits_not_ok and not edges_unknown):
+            word = "FINDINGS"
+        elif self.undecided or why["runtime-address"]:
+            word = "UNDECIDED"
+        else:
+            word = "CLEAN"
+        counts = (f"{confirmed} confirmed unsynchronized pair{'' if confirmed == 1 else 's'}; "
+                  f"not confirmed: {why['same-value TensorSave']} same-value TensorSave, "
+                  f"{why['runtime-address']} through a runtime-address operand"
+                  + (f", {why[None]} with the edges unknown" if edges_unknown else "")
+                  + f"; {len(self.undecided)} "
+                  f"{'operand or edge' if len(self.undecided) == 1 else 'operands or edges'} "
+                  f"undecided; {waits_not_ok} wait{'' if waits_not_ok == 1 else 's'} not OK")
+        return word, counts
+
     def label(self, a):
         i = a["i"]
         dbg = i.get("debug") or {}
@@ -905,6 +958,7 @@ def main():
     n_ok = n_bad = 0
     seen = set()
     n_q = 0
+    unsync = []
     for kind, P, C, fa, fb in conf:
         ok = M.ordered(P, C)
         okq = ok or M.ordered(P, C, True)
@@ -915,6 +969,7 @@ def main():
             n_q += 1
         else:
             n_bad += 1
+            unsync.append((kind, P, C, fa, fb))
         if (not ok) or show_all:
             if key in seen and not verbose:
                 continue
@@ -922,9 +977,11 @@ def main():
             deps = [d[0] for d in (C["i"].get("dependencies") or [])]
             dep_flag = "dep-listed" if P["name"] in deps or P["name"].replace("#done", "") in deps else "NO-DEP"
             tag = "OK " if ok else ("QUEUE-ORDER-ONLY" if okq else "UNSYNC")
+            because = None if okq else M.unconfirmed_because(P, C, fa, fb)
             print(f"  [{tag}] {kind} {M.label(P)}  ->  {M.label(C)}")
             print(f"         prod {fp_str(fa)}")
-            print(f"         cons {fp_str(fb)}   ({dep_flag})")
+            print(f"         cons {fp_str(fb)}   ({dep_flag}"
+                  f"{f'; not confirmed: {because}' if because else ''})")
             if okq and (verbose or not ok):
                 print(f"         via {' -> '.join(M.path(P['done'], C['issue'], not ok) or [])}")
     if "--pairs" in sys.argv:
@@ -953,9 +1010,8 @@ def main():
         print(f"\n## UNDECIDED: {len(M.undecided)} operands or edges the check cannot model")
         for u in M.undecided[:20]:
             print(f"  {u}")
-        print("VERDICT: UNDECIDED (0 pairs above is not evidence)")
-    else:
-        print(f"VERDICT: {'CLEAN' if n_bad == 0 and bad == 0 else 'FINDINGS'}")
+    word, counts = M.one_pass_verdict(unsync, bad)
+    print(f"VERDICT: {word} ({counts})")
     print_loop_carried(M, show_all)
 
 
