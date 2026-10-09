@@ -626,11 +626,21 @@ Contract of the opt-in (measured on trn2 at TP64/EP16, `k = 3`, `max_num_seqs 1`
   the step, and vLLM's two alternating block sets made consecutive identical requests
   draft differently. Fixed by writing into the bank itself (`model_fp8.py` `attend` /
   `_attend_requests`; pinned by `test/vllm_neuron/worker/test_glm5next_slot_residue.py`).
+  With the bank write, 12 of 12 repeated greedy generations of the same prompt were
+  identical across two passes, and 8 of 8 identity prompts were identical across two
+  independent server-side runs; per-position draft acceptance rose to 0.919 / 0.881 /
+  0.813 (conditional; 3.39 of 3 drafts accepted per step on average) from 0.899 / 0.840 /
+  0.710 with the view-form write. Speculative output can still differ from
+  non-speculative greedy decoding, deterministically within a configuration. GSM8K@200
+  exact-match on this configuration is 0.985 (197 of 200) against 0.99 for the earlier
+  one -- one question flipped; the cause is under investigation (the numerics of the
+  fused verify-step glue, unconfirmed).
   Each verify step is lossless by construction -- an accepted draft is the id
   the target's own argmax returned for that row -- so a divergence from the
   non-speculative run is the target's argmax picking differently where its top two
-  logits are within rounding of each other; the likeliest carrier, under replay, is the
-  `1 + k`-row verify graph and the one-row decode graph accumulating in different orders
+  logits are within rounding of each other; the carrier is the fused
+  `1 + k`-row verify-step kernels and the one-row decode graph rounding differently --
+  accumulating in different orders, deterministically within a configuration
   (in the dense regime the MLA decode kernel routes one query row per request to its
   key-split kernel and `T` rows per request to the general kernel,
   `vllm_neuron/functional/attention/mla_decode.py::_route`; past the selector bound the
