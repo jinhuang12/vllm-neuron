@@ -57,6 +57,11 @@ Frobenius error. ``--emissions N`` emits each variant N times per seed, each
 after its own sentinel fill, and records whether the defined rows of all N are
 bit-identical (device identity); the first emission is the one compared.
 
+One case per process. ``--seeds`` and ``--skewed-seeds`` may each be empty
+and ``--variants`` may name one variant, so a process can run one variant
+on one routing; ``--reps 0`` skips the timing. Then a caller can check the
+host between cases, and interleave repetitions by alternating processes.
+
 The compile cache is off unless ``--use-compile-cache``: the graph cache key
 ignores kernel bodies, so an edited kernel could otherwise be timed from a
 stale NEFF.
@@ -449,7 +454,7 @@ def bucket_case(tokens: int, entries: dict, args) -> dict:
         print(json.dumps({"tokens": tokens, **record}), flush=True)
         if timing_inputs is None and kind == "uniform":
             timing_inputs = (dev, record["realised_pairs"])
-    if timing_inputs is None:
+    if timing_inputs is None or args.reps == 0:
         return case
     dev, pairs = timing_inputs
     case["timed_seed_realised_pairs"] = pairs
@@ -514,7 +519,7 @@ def main() -> None:
                         help="compare every emission with a float64 torch reference")
     parser.add_argument("--emissions", type=int, default=1,
                         help="emissions per variant and seed, checked for bit identity")
-    parser.add_argument("--seeds", type=int, nargs="+", default=[1, 2, 3])
+    parser.add_argument("--seeds", type=int, nargs="*", default=[1, 2, 3])
     parser.add_argument("--skewed-seeds", type=int, nargs="*", default=[4])
     parser.add_argument("--layers", type=int, default=8)
     parser.add_argument("--reps", type=int, default=5)
@@ -536,8 +541,12 @@ def main() -> None:
         raise ValueError("Hardware benchmark cannot run in VLLM_NEURON_CPU_MODE=1")
     if not os.environ.get("NEURON_RT_VISIBLE_CORES"):
         raise ValueError("Run under devlease.py, which pins NEURON_RT_VISIBLE_CORES")
-    if args.layers < 2 or args.reps < 1 or args.iterations < 1 or args.emissions < 1:
-        raise ValueError("Use --layers >= 2 and --reps, --iterations, --emissions >= 1")
+    if args.layers < 2 or args.reps < 0 or args.iterations < 1 or args.emissions < 1:
+        raise ValueError("Use --layers >= 2, --reps >= 0 and --iterations, --emissions >= 1")
+    if not args.seeds and not args.skewed_seeds:
+        raise ValueError("Give at least one routing: --seeds or --skewed-seeds")
+    if args.profile_dir is not None and args.reps == 0:
+        raise ValueError("--profile-dir profiles the timed graphs: use --reps >= 1")
     if not Path(vllm_neuron.__file__).resolve().is_relative_to(REPO):
         raise RuntimeError(f"imported {vllm_neuron.__file__}, not this tree ({REPO})")
     from vllm_neuron.functional.moe import fused_fp8 as current
