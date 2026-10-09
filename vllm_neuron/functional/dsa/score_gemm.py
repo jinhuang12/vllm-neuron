@@ -33,7 +33,6 @@ rather than merely cheaper, since ``q @ H @ H.T @ k.T == q @ k.T``.
 """
 
 import logging
-import os
 
 import torch
 from dataclasses import dataclass
@@ -45,6 +44,7 @@ import nki.language as nl
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
+from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 logger = logging.getLogger(__name__)
@@ -346,7 +346,7 @@ def _programs(tokens: int) -> int:
 
     The programs split the token tiles, so a call with one token tile runs as one program.
     """
-    if os.environ.get("NEURON_LOGICAL_NC_CONFIG") == str(_LNC2_PROGRAMS) and tokens > TOKEN_TILE:
+    if lnc_pair() and tokens > TOKEN_TILE:
         return _LNC2_PROGRAMS
     return 1
 
