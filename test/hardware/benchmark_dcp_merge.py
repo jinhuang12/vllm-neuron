@@ -1,8 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Time the DCP log-sum-exp merge kernel at its served shapes on Neuron, against its roofline.
 
-Run it ONLY through the device lease, which pins the cores and sets LNC2; the script refuses
-to run without them and selects no cores itself::
+It runs on a Neuron device at LNC2 and selects no cores itself. It refuses, by name, to run
+with no Neuron device visible, in the simulator or CPU mode, at another LNC, or with no
+compile cache root.
+
+Operator note: start it under your core-allocation mechanism, which gives the process its
+cores and sets ``NEURON_LOGICAL_NC_CONFIG=2``. On this campaign's hosts that is ``devlease.py
+slice <name>``::
 
     export NEURON_LIBTORCH_CACHE_ROOT=<an empty directory>
     python3 /home/ubuntu/glm53f-wt/devlease.py slice <name> -- python3 \\
@@ -37,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import asdict, dataclass
+import glob
 import hashlib
 import json
 import os
@@ -44,7 +50,7 @@ from pathlib import Path
 import statistics
 import sys
 
-#: The worktree root, ahead of any installed copy (the lease sets no PYTHONPATH).
+#: The worktree root, ahead of any installed copy (the launcher sets no PYTHONPATH).
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.dont_write_bytecode = True
@@ -59,7 +65,6 @@ FLOOR_US = 2.0
 BAR = 1.5
 #: The share of (rank, head, row) slots that are empty in the checked operands.
 EMPTY_FRACTION = 0.2
-LEASE_MARKER = "NEURON_RT_VISIBLE_CORES"
 
 
 @dataclass(frozen=True)
@@ -96,6 +101,12 @@ def roofline(case: Case) -> dict:
             "bar_us": BAR * bound, "binds": binds,
             "formula": "max(FLOPs / 79e12, bytes / 716e9, 2 us); FLOPs 2*CP*H*R*L; bytes "
                        "= f32 partials + f32 lses + bf16 output"}
+
+
+def neuron_devices() -> list[str]:
+    """The Neuron device nodes this process can see. None on a host without a device, or in
+    a namespace that hides them."""
+    return sorted(glob.glob("/dev/neuron[0-9]*"))
 
 
 def md5_of(path: str) -> str:
@@ -205,10 +216,11 @@ def main() -> int:
     args = parser.parse_args()
     if args.reps < 1 or args.iterations < 1 or args.warmup < 0 or args.seeds < 1:
         parser.error("use reps, iterations and seeds >= 1 and warmup >= 0")
+    if not neuron_devices():
+        raise SystemExit("hardware benchmark: no Neuron device is visible (no /dev/neuron* "
+                         "node); run it on a Neuron host, on the cores your allocation gives it")
     if os.environ.get("VLLM_NEURON_CPU_MODE") == "1" or os.environ.get("NKI_SIMULATOR"):
         raise SystemExit("hardware benchmark: unset VLLM_NEURON_CPU_MODE and NKI_SIMULATOR")
-    if not os.environ.get(LEASE_MARKER):
-        raise SystemExit(f"run under devlease.py slice <name>, which sets {LEASE_MARKER}")
     if os.environ.get("NEURON_LOGICAL_NC_CONFIG") != "2":
         raise SystemExit("the served geometry is LNC2: NEURON_LOGICAL_NC_CONFIG must be 2")
     cache_root = os.environ.get("NEURON_LIBTORCH_CACHE_ROOT")
@@ -236,8 +248,9 @@ def main() -> int:
     os.chdir(scratch)
     report = {
         "environment": {key: os.environ.get(key) for key in (
-            LEASE_MARKER, "NEURON_LOGICAL_NC_CONFIG", "NEURON_PLATFORM_TARGET_OVERRIDE",
+            "NEURON_LOGICAL_NC_CONFIG", "NEURON_PLATFORM_TARGET_OVERRIDE",
             "NEURON_LIBTORCH_CACHE_ROOT", "NEURON_CC_FLAGS")},
+        "neuron_devices": len(neuron_devices()),
         "tree": str(ROOT),
         "modules": modules,
         "shape": {"latent": LATENT, "partials": "float32", "lse": "float32",

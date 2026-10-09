@@ -402,5 +402,77 @@ def test_the_bound_is_tight_enough_to_see_a_dropped_correction():
         assert_rounds_to_nearest_away_from_ties(nudged, partials, lse)
 
 
+# --------------------------------------------------------------------------- #
+# The device benchmark (test/hardware/benchmark_dcp_merge.py), on the CPU
+# --------------------------------------------------------------------------- #
+_BENCHMARK = _ROOT / "test" / "hardware" / "benchmark_dcp_merge.py"
+
+
+def _load_benchmark():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("benchmark_dcp_merge", _BENCHMARK)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture
+def benchmark(monkeypatch, tmp_path):
+    """The benchmark module with an environment that passes every guard: a device is
+    reported present (no device is opened), LNC2, a cache root, no simulator."""
+    module = _load_benchmark()
+    monkeypatch.setattr(sys, "argv", ["benchmark_dcp_merge.py", "--out",
+                                      str(tmp_path / "bench.json")])
+    monkeypatch.setattr(module, "neuron_devices", lambda: ["/dev/neuron0"])
+    for key in ("VLLM_NEURON_CPU_MODE", "NKI_SIMULATOR"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", "2")
+    monkeypatch.setenv("NEURON_LIBTORCH_CACHE_ROOT", str(tmp_path / "cache"))
+    return module
+
+
+@pytest.mark.parametrize("guard,match", (
+    ("device", "no Neuron device is visible"),
+    ("simulator", "unset VLLM_NEURON_CPU_MODE and NKI_SIMULATOR"),
+    ("lnc", "NEURON_LOGICAL_NC_CONFIG must be 2"),
+    ("cache", "set NEURON_LIBTORCH_CACHE_ROOT"),
+))
+def test_the_device_benchmark_refuses_an_unfit_environment_by_name(benchmark, monkeypatch,
+                                                                    tmp_path, guard, match):
+    """Each guard alone stops the run before anything is compiled or written."""
+    if guard == "device":
+        monkeypatch.setattr(benchmark, "neuron_devices", lambda: [])
+    if guard == "simulator":
+        monkeypatch.setenv("NKI_SIMULATOR", "1")
+    if guard == "lnc":
+        monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", "1")
+    if guard == "cache":
+        monkeypatch.delenv("NEURON_LIBTORCH_CACHE_ROOT")
+    with pytest.raises(SystemExit, match=match):
+        benchmark.main()
+    assert not (tmp_path / "bench.json").exists()
+
+
+def test_the_device_benchmark_takes_no_core_selection_from_the_environment():
+    """Core selection is the launcher's: the benchmark neither reads nor sets it."""
+    assert "NEURON_RT_VISIBLE_CORES" not in _BENCHMARK.read_text()
+
+
+def test_the_device_benchmark_s_roofline_counts_each_operand_byte_once():
+    """Its bytes are the merge's operands as the seam takes them: the f32 partials and lses
+    read once, the bf16 output written once (``reports/dcp_item4.md`` section 9 matches them
+    to the compiled kernel's DMA bytes)."""
+    module = _load_benchmark()
+    for case in module.CASES:
+        partials, lse = make_partials(case.cp, case.heads, 2)
+        per_row = (partials[0, 0, 0].numel() * partials.element_size() * case.cp * case.heads
+                   + lse.element_size() * case.cp * case.heads
+                   + LATENT * case.heads * torch.tensor([], dtype=torch.bfloat16).element_size())
+        assert module.roofline(case)["bytes"] == per_row * case.rows
+        assert module.roofline(case)["binds"] == "bytes"
+
+
 if __name__ == "__main__" and sys.argv[1:2] == ["child"]:
     _child(int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]))
