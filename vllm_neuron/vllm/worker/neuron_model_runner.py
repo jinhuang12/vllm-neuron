@@ -422,6 +422,58 @@ def kv_cache_allocations(
     return allocations
 
 
+def indexer_context_per_rank(vllm_config: Any) -> int:
+    """Return the context one rank's DSA indexer covers: its pooled-key rows and decode candidates.
+
+    ``max_model_len``, except under decode context parallelism
+    (``decode_context_parallel_size > 1``). A rank then holds only the blocks it owns
+    of each sequence (:mod:`vllm_neuron.utils.dcp_ownership`). So its pooled-key
+    store and its decode candidate axis cover
+    ``ceil(max_model_len / (block_size * dcp_size)) * block_size`` tokens
+    (:func:`~vllm_neuron.utils.dcp_ownership.local_context_capacity`). The decode
+    ring holds one sequence's open pool, and the KDA state is per sequence, so
+    neither shrinks.
+    """
+    max_model_len = int(vllm_config.model_config.max_model_len)
+    dcp_size = int(vllm_config.parallel_config.decode_context_parallel_size)
+    if dcp_size > 1:
+        from vllm_neuron.utils.dcp_ownership import local_context_capacity
+
+        return local_context_capacity(
+            max_model_len,
+            block_size=int(vllm_config.cache_config.block_size),
+            dcp_size=dcp_size,
+        )
+    return max_model_len
+
+
+def check_dcp_decode_index_context(vllm_config: Any, index_kpool: int | None) -> None:
+    """Refuse a DCP run whose per-rank decode candidate axis is past the served width.
+
+    Under DCP each rank's decode indexer scores only its own pools. So
+    :func:`~vllm_neuron.functional.dsa.decode_select.check_decode_index_context`
+    reads the context that rank covers (:func:`indexer_context_per_rank`), not
+    ``max_model_len``. A refusal names both lengths, followed by the check's own
+    message.
+    """
+    from vllm_neuron.functional.dsa.decode_select import (
+        DecodeSelectError,
+        check_decode_index_context,
+    )
+
+    per_rank = indexer_context_per_rank(vllm_config)
+    try:
+        check_decode_index_context(per_rank, index_kpool)
+    except DecodeSelectError as exc:
+        raise DecodeSelectError(
+            f"decode_context_parallel_size="
+            f"{vllm_config.parallel_config.decode_context_parallel_size} leaves each "
+            f"rank {per_rank} of max_model_len={vllm_config.model_config.max_model_len} "
+            f"tokens (whole blocks of {vllm_config.cache_config.block_size}), and the "
+            f"rank's decode indexer covers those: {exc}"
+        ) from exc
+
+
 def indexer_side_cache_bytes(
     kv_cache_spec: dict[str, KVCacheSpec],
     text_config: Any,
@@ -440,7 +492,8 @@ def indexer_side_cache_bytes(
     ``MambaSpec``, the test ``bind_kv_cache`` makes, and in the latent bank's dtype.
 
     ``max_seq_len`` and ``request_slots`` are the values the runner allocates with,
-    ``max_model_len`` and ``max_num_seqs``. A model whose text config declares no
+    :func:`indexer_context_per_rank` (``max_model_len`` unless DCP splits the context)
+    and ``max_num_seqs``. A model whose text config declares no
     indexer (``index_kpool`` and ``index_head_dim``) has no side caches: 0.
     """
     index_kpool = getattr(text_config, "index_kpool", None)
@@ -704,10 +757,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # The DSA decode indexer serves up to its verified selection width; refuse a
         # longer max_model_len here, before any graph compiles.
         from vllm_neuron.functional.dsa.decode_select import check_decode_index_context
-        check_decode_index_context(
-            self.max_model_len,
-            getattr(getattr(hf_config, "text_config", hf_config), "index_kpool", None),
-        )
+        if vllm_config.parallel_config.decode_context_parallel_size > 1:
+            # Under DCP the width is one rank's share of the context.
+            check_dcp_decode_index_context(
+                vllm_config,
+                getattr(getattr(hf_config, "text_config", hf_config), "index_kpool", None),
+            )
+        else:
+            check_decode_index_context(
+                self.max_model_len,
+                getattr(getattr(hf_config, "text_config", hf_config), "index_kpool", None),
+            )
 
         # Initialize persistent batch and request tracking
         # Use provided device or default to neuron:0
@@ -5596,12 +5656,27 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             )
         return side
 
+    def _glm5next_indexer_context(self) -> int:
+        """Return the context this rank's DSA indexer covers, as a python int.
+
+        ``max_model_len``, or under DCP this rank's share of it
+        (:func:`indexer_context_per_rank`). The side caches are allocated from this
+        number and the carrier hands it to the layers as ``max_seq_len``, so the
+        pooled-key store and the indexer agree on how many candidate pools it may
+        address.
+        """
+        if getattr(self, "_dcp_size", 1) > 1:
+            return indexer_context_per_rank(self.vllm_config)
+        return int(self.max_model_len)
+
     def _glm5next_live_side_caches(self, banks) -> list[dict]:
         """Return this process's one live set of side caches, allocated on first use.
 
-        The allocation bound is ``max_model_len``, the same bound the carrier passes as
-        ``max_seq_len``, so the two agree on how many candidate pools the indexer may
-        address. Because the set lives for the process, a new sequence would otherwise
+        The allocation bound is :meth:`_glm5next_indexer_context`, the same bound the
+        carrier passes as ``max_seq_len``, so the two agree on how many candidate pools
+        the indexer may address: ``max_model_len``, or under DCP this rank's share of
+        it, since a rank stores only the pools of its own blocks.
+        Because the set lives for the process, a new sequence would otherwise
         start on the previous sequence's partial pool; ``_glm5next_position_arm``
         empties a request's ring when its prefill starts at position 0.
 
@@ -5620,7 +5695,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             banks,
             index_kpool=int(text_config.index_kpool),
             index_head_dim=int(text_config.index_head_dim),
-            max_seq_len=int(self.max_model_len),
+            max_seq_len=self._glm5next_indexer_context(),
             request_slots=self._glm5next_request_slot_capacity(banks) + SCRATCH_SLOTS,
         )
         self._glm5next_side_cache_set = live
@@ -6816,8 +6891,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # end would need a graph per step, while this value is constant. Nothing
             # beyond the sequence becomes visible: each row is bounded to its own
             # length by ``seq_lens`` before selection. The pooled store is allocated
-            # from this same number.
-            max_seq_len=int(self.max_model_len),
+            # from this same number, which under DCP is this rank's share of it.
+            max_seq_len=self._glm5next_indexer_context(),
             index_kpool=int(text_config.index_kpool),
             requests=len(state_slots) + padding,
             request_starts=list(request_starts) + [0] * padding,
