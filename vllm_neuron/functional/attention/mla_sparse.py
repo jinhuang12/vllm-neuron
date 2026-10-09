@@ -28,6 +28,12 @@ selected-row-tiled -- and the seam picks one from the shapes alone. The row-tile
 entries take compile-time ``BLOCK_N`` (a multiple of 128 up to 512) and ``STREAM_KV``
 options. There is no torch attention fallback; an inadmissible geometry raises.
 :func:`mla_sparse_attention_torch_oracle` is a CPU reference for tests only.
+
+Partial mode (:func:`mla_sparse_attention_partial`) serves decode context parallelism: the
+same bodies, with every head of the CP group (``Hq = CP * H``) and this rank's columns only
+(the others arrive as the sentinel), return the head-major ``[Hq, S, L]`` float32 output
+normalised over those columns and its log-sum-exp ``[Hq, S]``, which ``dcp_merge`` combines
+across the ranks. A row with no valid column returns 0 and ``dcp_merge.EMPTY_LSE``.
 """
 
 from __future__ import annotations
@@ -47,7 +53,10 @@ import nki.language as nl
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
+from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 from vllm_neuron.utils.neuron_utils import can_run_kernel, values_are_readable
+# The partial contract's empty lse lives with the merge that reads it.
+from vllm_neuron.functional.attention.dcp_merge import EMPTY_LSE
 
 logger = logging.getLogger(__name__)
 
@@ -355,7 +364,8 @@ def _sentinel_scratch(parts, width, heads):
             _sbuf(heads, width), _sbuf(heads, width))
 
 
-def _mask_sentinel(topk_hbm, offset, width, heads, sentinel_bias, sen, idx_sb):
+def _mask_sentinel(topk_hbm, offset, width, heads, sentinel_bias, sen, idx_sb,
+                   live_m1=None):
     """Read one query's selected rows, clamp the sentinel columns, build their mask.
 
     ``-1 < index`` is 1 for a real cache row and 0 for the sentinel, and the clamp is
@@ -366,6 +376,11 @@ def _mask_sentinel(topk_hbm, offset, width, heads, sentinel_bias, sen, idx_sb):
     The bias is ``(valid - 1) * sentinel_bias``: exactly 0.0 where a token lives and
     ``-sentinel_bias`` where none does, by two scalar ops against Python constants --
     ``tensor_scalar``'s ``operand0`` must be a Python scalar and never a tile.
+
+    ``live_m1`` (partial mode) is a ``[heads, 1]`` tile that receives the maximum of
+    ``valid - 1`` in the pass that computes it: 0.0 when the row has a valid column, -1.0
+    when it has none. The reduce rides the float32 step, not the int-to-float copy: the
+    device compiler refuses an int32 input to ``tensor_scalar_reduce`` (NCC_IBVF013).
     """
     nisa.tensor_copy(
         dst=sen[1][:, 0:width],
@@ -380,8 +395,13 @@ def _mask_sentinel(topk_hbm, offset, width, heads, sentinel_bias, sen, idx_sb):
                        data2=sen[2][:, 0:width], op=nl.multiply)
     nisa.tensor_copy(dst=idx_sb[:, 0:width], src=sen[3][:, 0:width])
     nisa.tensor_copy(dst=sen[4][:, 0:width], src=sen[2][0:heads, 0:width])
-    nisa.tensor_scalar(dst=sen[5][:, 0:width], data=sen[4][:, 0:width],
-                       op0=nl.add, operand0=-1.0)
+    if live_m1 is None:
+        nisa.tensor_scalar(dst=sen[5][:, 0:width], data=sen[4][:, 0:width],
+                           op0=nl.add, operand0=-1.0)
+    else:
+        nisa.tensor_scalar_reduce(dst=sen[5][:, 0:width], data=sen[4][:, 0:width],
+                                  op0=nl.add, operand0=-1.0, reduce_op=nl.maximum,
+                                  reduce_res=live_m1)
     nisa.tensor_scalar(dst=sen[5][:, 0:width], data=sen[5][:, 0:width],
                        op0=nl.multiply, operand0=sentinel_bias)
 
@@ -390,8 +410,78 @@ def _psum(*shape: int):
     return nl.ndarray(tuple(shape), dtype=nl.float32, buffer=nl.psum)
 
 
+# Positions in partial mode's working set (:func:`_lse_scratch`), indexed like the
+# row-tiled body's (see :data:`_WS_COUNT`).
+_LSE_LIVE_M1 = 0   # max(valid) - 1: 0.0 where the row has a valid column, else -1.0
+_LSE_LN = 1        # ln of the softmax denominator
+_LSE_RAW = 2       # the lse before the empty-row select
+_LSE_DEAD = 3      # live_m1 * 1e30: 0.0, or EMPTY_LSE
+_LSE_BLOCK = 4     # one query block's lses, a column per query
+_LSE_TILES = 5     # the row-tiled body's per-score-tile live_m1 flags, a column per tile
+_LSE_LIVE = 6      # live_m1 + 1: 1.0 or 0.0
+_LSE_COUNT = 7
+
+
+def _lse_scratch(heads, qpb, n_tiles):
+    """Partial mode's working set: the ``[heads, 1]`` lse chain and the per-block lse tile."""
+    ws = []
+    for _ in range(_LSE_COUNT):
+        ws.append(None)
+    ws[_LSE_LIVE_M1] = _scalar(heads)
+    ws[_LSE_LN] = _scalar(heads)
+    ws[_LSE_RAW] = _scalar(heads)
+    ws[_LSE_DEAD] = _scalar(heads)
+    ws[_LSE_LIVE] = _scalar(heads)
+    ws[_LSE_BLOCK] = _sbuf(heads, _aligned(qpb))
+    if n_tiles > 1:
+        ws[_LSE_TILES] = _sbuf(heads, _aligned(n_tiles))
+    return ws
+
+
+def _partial_lse(dst, total, shift, shift_op, ws):
+    """Write one query's lse into the ``[heads, 1]`` column ``dst``; EMPTY_LSE for an empty row.
+
+    ``lse = ln(total) shift_op shift``, with ``total`` the softmax denominator against the
+    row's scaled maximum and ``shift`` that maximum: as the activation's negated bias
+    (``nl.subtract``) or in positive form (``nl.add``). That is ``softmax_scale * m +
+    ln(l)``. A row with no valid column was exponentiated against its own (masked) maximum,
+    so its ``total`` is at least 1 and that lse is finite and meaningless; the select
+    ``lse * (live_m1 + 1) + live_m1 * 1e30`` returns exactly the lse where ``live_m1`` is
+    0.0 and exactly EMPTY_LSE where it is -1.0.
+    """
+    nisa.activation(dst=ws[_LSE_LN], op=nl.log, data=total)
+    nisa.tensor_tensor(dst=ws[_LSE_RAW], data1=ws[_LSE_LN], data2=shift, op=shift_op)
+    nisa.tensor_scalar(dst=ws[_LSE_DEAD], data=ws[_LSE_LIVE_M1], op0=nl.multiply,
+                       operand0=-EMPTY_LSE, engine=nisa.engine.vector)
+    nisa.tensor_scalar(dst=ws[_LSE_LIVE], data=ws[_LSE_LIVE_M1], op0=nl.add, operand0=1.0,
+                       engine=nisa.engine.vector)
+    nisa.scalar_tensor_tensor(dst=dst, data=ws[_LSE_RAW], op0=nl.multiply,
+                              operand0=ws[_LSE_LIVE], op1=nl.add, operand1=ws[_LSE_DEAD])
+
+
+def _store_query(out_hbm, out_sb, q_idx, seq, heads, latent, head_major):
+    """Store one query's ``[heads, latent]`` output into ``[S, H, L]``.
+
+    In partial mode (``head_major``) the output is ``[H, S, L]`` instead.
+    """
+    if head_major:
+        nl.store(out_hbm.ap(pattern=[[seq * latent, heads], [1, latent]],
+                            offset=q_idx * latent),
+                 value=out_sb)
+    else:
+        nl.store(out_hbm.ap(pattern=[[latent, heads], [1, latent]],
+                            offset=q_idx * heads * latent),
+                 value=out_sb)
+
+
+def _store_lse_block(lse_hbm, ws, q0, seq, heads, qpb):
+    """Store one query block's lses, columns ``q0 .. q0 + qpb - 1`` of ``[H, S]``."""
+    nisa.dma_copy(dst=lse_hbm.ap(pattern=[[seq, heads], [1, qpb]], offset=q0),
+                  src=ws[_LSE_BLOCK][:, 0:qpb])
+
+
 def _attention_body(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
-                    q_pe_hbm=None, k_pe_hbm=None):
+                    q_pe_hbm=None, k_pe_hbm=None, lse_hbm=None):
     """Trace the sparse latent attention. Shared by both jit entry points.
 
     The RoPE limb is elided at trace time, not masked at run time: with no RoPE half
@@ -409,7 +499,9 @@ def _attention_body(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
         topk_hbm    [S, K] int32   the selected cache rows, per query; -1 means none
         q_pe_hbm    [S, H, R]      present only when R > 0
         k_pe_hbm    [S_kv, R]      present only when R > 0
-        out_hbm     [S, H, L]      written once per query
+        out_hbm     [S, H, L]      written once per query; [H, S, L] in partial mode
+        lse_hbm     [H, S]         partial mode only: the lse of each row, written once
+                                   per query block (:func:`_partial_lse`)
     """
     seq, heads, latent = q_lift_hbm.shape
     s_kv = c_kv_hbm.shape[0]
@@ -470,6 +562,8 @@ def _attention_body(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
     scores_m = sen[6]
     p_m = sen[7]
     sentinel_bias = _SENTINEL_EXP_FLOOR / softmax_scale
+    lse_ws = _lse_scratch(heads, qpb, 1) if lse_hbm is not None else None
+    live_m1 = lse_ws[_LSE_LIVE_M1] if lse_hbm is not None else None
 
     # ---- the queries, in blocks whose Q rows fill one 16-row transpose ----------
     # One transpose per latent tile lands the block's Q rows in the source dtype and
@@ -491,7 +585,8 @@ def _attention_body(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
             # same partition, so all 128 latent partitions need the same K offsets. A
             # zero-stride partition read is one DMA and replicates them for free; the
             # alternative is a shuffle plus a fan-out copy.
-            _mask_sentinel(topk_hbm, q_idx * topk, topk, heads, sentinel_bias, sen, idx_sb)
+            _mask_sentinel(topk_hbm, q_idx * topk, topk, heads, sentinel_bias, sen, idx_sb,
+                           live_m1)
 
             # ---- gather the latent cache rows: one instruction per latent tile ------
             for li in range(n_latent):
@@ -572,11 +667,12 @@ def _attention_body(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
             # the accumulation.
             nisa.tensor_scalar(dst=out_sb, data=pv_ps, op0=nl.multiply, operand0=recip,
                                engine=nisa.engine.vector)
-            nl.store(
-                out_hbm.ap(pattern=[[latent, heads], [1, latent]],
-                           offset=q_idx * heads * latent),
-                value=out_sb,
-            )
+            if lse_ws is not None:
+                _partial_lse(lse_ws[_LSE_BLOCK][:, qi:qi + 1], row_sum, exp_bias, nl.subtract,
+                             lse_ws)
+            _store_query(out_hbm, out_sb, q_idx, seq, heads, latent, lse_ws is not None)
+        if lse_ws is not None:
+            _store_lse_block(lse_hbm, lse_ws, q0, seq, heads, qpb)
 
 
 @nki.jit
@@ -691,7 +787,7 @@ def _output_tiles(latent: int) -> tuple[tuple[int, int], ...]:
 
 
 def _attention_body_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
-                          q_pe_hbm=None, k_pe_hbm=None):
+                          q_pe_hbm=None, k_pe_hbm=None, lse_hbm=None):
     """Trace sparse latent attention with the latent rank tiled on both its axes.
 
     Same arithmetic as the untiled body and the same RoPE elision at trace time. Every
@@ -705,7 +801,8 @@ def _attention_body_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm
         topk_hbm    [S, K] int32   the selected cache rows, per query
         q_pe_hbm    [S, H, R]      present only when R > 0
         k_pe_hbm    [S_kv, R]      present only when R > 0
-        out_hbm     [S, H, L]      written once per query
+        out_hbm     [S, H, L]      written once per query; [H, S, L] in partial mode
+        lse_hbm     [H, S]         partial mode only, as in :func:`_attention_body`
     """
     seq, heads, latent = q_lift_hbm.shape
     s_kv = c_kv_hbm.shape[0]
@@ -778,6 +875,8 @@ def _attention_body_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm
     scores_m = sen[6]
     p_m = sen[7]
     sentinel_bias = _SENTINEL_EXP_FLOOR / softmax_scale
+    lse_ws = _lse_scratch(heads, qpb, 1) if lse_hbm is not None else None
+    live_m1 = lse_ws[_LSE_LIVE_M1] if lse_hbm is not None else None
 
     # ---- the queries, in blocks whose Q rows fill one 16-row transpose ----------
     # One transpose per latent tile lands the block's Q rows in the source dtype and
@@ -797,7 +896,8 @@ def _attention_body_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm
             q_idx = q0 + qi
             h0 = qi * heads
             # ---- this query's selected rows, replicated to every partition ----------
-            _mask_sentinel(topk_hbm, q_idx * topk, topk, heads, sentinel_bias, sen, idx_sb)
+            _mask_sentinel(topk_hbm, q_idx * topk, topk, heads, sentinel_bias, sen, idx_sb,
+                           live_m1)
 
             # ---- gather the latent cache rows: one instruction per latent tile ------
             # The index tile is sliced to the data tile's extent. `nc_n_gather` reads its
@@ -876,11 +976,12 @@ def _attention_body_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm
                 nisa.tensor_scalar(dst=out_sb[:, offset:offset + extent], data=pv_ps,
                                    op0=nl.multiply, operand0=recip,
                                    engine=nisa.engine.vector)
-            nl.store(
-                out_hbm.ap(pattern=[[latent, heads], [1, latent]],
-                           offset=q_idx * heads * latent),
-                value=out_sb,
-            )
+            if lse_ws is not None:
+                _partial_lse(lse_ws[_LSE_BLOCK][:, qi:qi + 1], row_sum, exp_bias, nl.subtract,
+                             lse_ws)
+            _store_query(out_hbm, out_sb, q_idx, seq, heads, latent, lse_ws is not None)
+        if lse_ws is not None:
+            _store_lse_block(lse_hbm, lse_ws, q0, seq, heads, qpb)
 
 
 @nki.jit
@@ -1002,7 +1103,7 @@ def _load_selected_rows(dst, cache_hbm, indices_hbm, offset, width):
 
 
 def _mask_sentinel_rows(topk_hbm, offset, width, heads, sentinel_bias, comparand, idx_i32,
-                        valid_i32, valid_f, mask_bias):
+                        valid_i32, valid_f, mask_bias, live_m1=None):
     """The streaming body's sentinel mask, built on the ``heads`` partitions that read it.
 
     The streaming gather takes its row offsets from :func:`_load_selected_rows`, so the
@@ -1011,7 +1112,7 @@ def _mask_sentinel_rows(topk_hbm, offset, width, heads, sentinel_bias, comparand
     all 128 (``_mask_sentinel``, which also feeds ``nc_n_gather``) costs 128 / heads
     fewer vector elements per tile and yields the same values: ``-1 < index`` is 1 for a
     real row and 0 for the sentinel, cast to float, and the bias is
-    ``(valid - 1) * sentinel_bias``.
+    ``(valid - 1) * sentinel_bias``. ``live_m1`` is :func:`_mask_sentinel`'s.
     """
     nisa.tensor_copy(
         dst=idx_i32[:, 0:width],
@@ -1023,8 +1124,13 @@ def _mask_sentinel_rows(topk_hbm, offset, width, heads, sentinel_bias, comparand
     nisa.tensor_tensor(dst=valid_i32[:, 0:width], data1=comparand[:, 0:width],
                        data2=idx_i32[:, 0:width], op=nl.less)
     nisa.tensor_copy(dst=valid_f[:, 0:width], src=valid_i32[:, 0:width])
-    nisa.tensor_scalar(dst=mask_bias[:, 0:width], data=valid_f[:, 0:width],
-                       op0=nl.add, operand0=-1.0)
+    if live_m1 is None:
+        nisa.tensor_scalar(dst=mask_bias[:, 0:width], data=valid_f[:, 0:width],
+                           op0=nl.add, operand0=-1.0)
+    else:
+        nisa.tensor_scalar_reduce(dst=mask_bias[:, 0:width], data=valid_f[:, 0:width],
+                                  op0=nl.add, operand0=-1.0, reduce_op=nl.maximum,
+                                  reduce_res=live_m1)
     nisa.tensor_scalar(dst=mask_bias[:, 0:width], data=mask_bias[:, 0:width],
                        op0=nl.multiply, operand0=sentinel_bias)
 
@@ -1120,7 +1226,7 @@ def _row_tiled_scratch(heads, latent, tile_max, chunk_max, n_latent, rope, c_kv_
 def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
                               q_pe_hbm=None, k_pe_hbm=None,
                               BLOCK_N=MOVING_MAX, STREAM_KV=True, PE_LOWP=False,
-                              QUERY_BUFFERS=QUERY_BUFFERS_DEFAULT):
+                              QUERY_BUFFERS=QUERY_BUFFERS_DEFAULT, lse_hbm=None):
     """Online sparse attention over score tiles, with input-derived dimensions.
 
     ``BLOCK_N`` is the selected-key tile width. It must be a multiple of
@@ -1155,6 +1261,10 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
 
     The geometry gate restricts this body to exact latent tiles that fit one MM2
     moving tile; other latent shapes take the other bodies.
+
+    ``lse_hbm`` ``[H, S]`` selects partial mode, as in :func:`_attention_body`: the output
+    is stored head-major and each row's lse is ``run_pos + ln(run_sum)`` after the last
+    tile (``ln(sum) - bias`` at one tile), EMPTY_LSE when no tile holds a valid column.
     """
     seq, heads, latent = q_lift_hbm.shape
     s_kv = c_kv_hbm.shape[0]
@@ -1263,6 +1373,9 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
     # first tile initialises the running state, and the next real tile's rescale wipes
     # what it left.
     sentinel_bias = _SENTINEL_EXP_FLOOR / softmax_scale
+    # Partial mode: each tile's mask records whether it holds a valid column, and one
+    # reduce over those flags per query says whether the row does.
+    lse_ws = _lse_scratch(heads, qpb, len(tiles)) if lse_hbm is not None else None
 
     # ---- the queries, in blocks whose Q rows fill one 16-row transpose ----------
     # One transpose per latent tile lands the block's Q rows in the source dtype and,
@@ -1309,13 +1422,17 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
                 # ---- this tile's selected rows: the mask, and the gather's offsets ----
                 # The untiled body loads all K rows of the query; this loads the tile's
                 # slice of them, signed and clamped before anything reads it.
+                tile_live_m1 = None
+                if lse_ws is not None:
+                    tile_live_m1 = (lse_ws[_LSE_LIVE_M1] if single
+                                 else lse_ws[_LSE_TILES][:, ti:ti + 1])
                 if STREAM_KV:
                     _mask_sentinel_rows(topk_hbm, q_idx * topk + ks, extent, heads,
                                         sentinel_bias, comparand, ws[_WS_IDX_I32],
-                                        ws[_WS_VALID_I32], valid_f, mask_bias)
+                                        ws[_WS_VALID_I32], valid_f, mask_bias, tile_live_m1)
                 else:
                     _mask_sentinel(topk_hbm, q_idx * topk + ks, extent, heads, sentinel_bias,
-                                   ws[_WS_SEN], ws[_WS_IDX_SB])
+                                   ws[_WS_SEN], ws[_WS_IDX_SB], tile_live_m1)
 
                 # ---- gather this tile's cache rows: one instruction per latent tile ---
                 if STREAM_KV:
@@ -1495,11 +1612,18 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
             nisa.reciprocal(dst=recip, data=run_sum)
             nisa.tensor_scalar(dst=out_sb, data=acc, op0=nl.multiply, operand0=recip,
                                engine=nisa.engine.vector)
-            nl.store(
-                out_hbm.ap(pattern=[[latent, heads], [1, latent]],
-                           offset=q_idx * heads * latent),
-                value=out_sb,
-            )
+            if lse_ws is not None:
+                if single:
+                    _partial_lse(lse_ws[_LSE_BLOCK][:, qi:qi + 1], run_sum, exp_bias,
+                                 nl.subtract, lse_ws)
+                else:
+                    nisa.tensor_reduce(dst=lse_ws[_LSE_LIVE_M1], op=nl.maximum,
+                                       data=lse_ws[_LSE_TILES][:, 0:len(tiles)], axis=1)
+                    _partial_lse(lse_ws[_LSE_BLOCK][:, qi:qi + 1], run_sum, run_pos, nl.add,
+                                 lse_ws)
+            _store_query(out_hbm, out_sb, q_idx, seq, heads, latent, lse_ws is not None)
+        if lse_ws is not None:
+            _store_lse_block(lse_hbm, lse_ws, q0, seq, heads, qpb)
 
 
 # --------------------------------------------------------------------------- #
@@ -1779,6 +1903,41 @@ def mla_sparse_attention_rope_row_tiled_kernel(q_lift_hbm, q_pe_hbm, c_kv_hbm, k
     return out_hbm
 
 
+@nki.jit
+def mla_sparse_attention_nope_partial_kernel(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale,
+                                             block_table_hbm=None, written_hbm=None,
+                                             write_offset_hbm=None, page_size=0,
+                                             BLOCK_N=MOVING_MAX, STREAM_KV=True,
+                                             QUERY_BUFFERS=QUERY_BUFFERS_DEFAULT,
+                                             source_digest=0):
+    """Partial mode, R == 0: ``(partial [Hq, S, L], lse [Hq, S])`` float32, this rank's columns.
+
+    The body is chosen from the shapes as the seam chooses it: row-tiled past one MM1
+    moving tile of selected rows, latent-tiled for a ragged or wide latent, else untiled.
+    Every body runs its fp32 arithmetic. The low-precision body
+    (:func:`_attention_body_row_tiled_lowp`) is not served here: it is written for one head
+    on one partition, and ``Hq = CP * H`` is at least 2 under DCP
+    (``reports/dcp_item4.md``). The other parameters are the row-tiled NoPE entry's.
+    """
+    seq, heads, latent = q_lift_hbm.shape
+    topk = topk_hbm.shape[1]
+    partial_hbm = nl.ndarray((heads, seq, latent), dtype=nl.float32, buffer=nl.shared_hbm)
+    lse_hbm = nl.ndarray((heads, seq), dtype=nl.float32, buffer=nl.shared_hbm)
+    window_hbm = _window_of(c_kv_hbm, block_table_hbm, written_hbm, write_offset_hbm,
+                            page_size)
+    if topk > MOVING_MAX:
+        _attention_body_row_tiled(q_lift_hbm, window_hbm, topk_hbm, softmax_scale, partial_hbm,
+                                  BLOCK_N=BLOCK_N, STREAM_KV=STREAM_KV, PE_LOWP=False,
+                                  QUERY_BUFFERS=QUERY_BUFFERS, lse_hbm=lse_hbm)
+    elif latent % LATENT_TILE != 0 or latent > MOVING_MAX:
+        _attention_body_tiled(q_lift_hbm, window_hbm, topk_hbm, softmax_scale, partial_hbm,
+                              lse_hbm=lse_hbm)
+    else:
+        _attention_body(q_lift_hbm, window_hbm, topk_hbm, softmax_scale, partial_hbm,
+                        lse_hbm=lse_hbm)
+    return partial_hbm, lse_hbm
+
+
 def _require_admissible(seq: int, heads: int, latent: int, rope: int, topk: int,
                         s_kv: int, softmax_scale: float) -> None:
     """Raise unless a kernel body serves this geometry; there is no fallback.
@@ -1947,42 +2106,14 @@ def _require_paged(c_kv: Tensor, block_table_row: Tensor, written: Tensor | None
     return window
 
 
-def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
-                         softmax_scale: float, q_pe: Tensor | None = None,
-                         k_pe: Tensor | None = None,
-                         block_table_row: Tensor | None = None,
-                         written: Tensor | None = None,
-                         write_offset: Tensor | None = None,
-                         page_size: int = 0) -> Tensor:
-    """Sparse MLA attention over each query's selected cache rows.
-
-    Args:
-        q_lift: ``[S, H, L]`` -- the absorbed Q latent, per head.
-        c_kv: ``[S_kv, L]`` -- the latent KV cache, or the whole latent bank when
-            ``block_table_row`` is given.
-        topk_indices: ``[S, K]`` integer -- selected cache rows per query. ``-1``
-            marks a column that carries no token; it is masked, not read.
-        softmax_scale: positive; multiplies the raw scores.
-        q_pe: ``[S, H, R]`` -- the RoPE half of Q. Present together with ``k_pe`` or
-            not at all.
-        k_pe: ``[S_kv, R]`` -- the RoPE half of the cache.
-        block_table_row: ``[pages, 1]`` int32 -- makes the call paged. The window is
-            the named ``page_size``-row blocks of the bank, in order, and a selected
-            row indexes that window (``pages * page_size`` rows) exactly as it would
-            index ``c_kv`` in an unpaged call.
-        written: ``[tokens, L]`` -- this step's own rows, overlaid onto the window at
-            row ``write_offset``.
-        write_offset: ``[1, 1]`` int32 -- read on device.
-        page_size: rows per page; a trace-time constant.
-
-    Returns:
-        ``[S, H, L]`` float32.
-
-    Raises:
-        MlaSparseAttentionError: for a malformed call or a geometry no kernel body
-            serves. The selected-row range is checked only when the values are
-            readable, so a traced call relies on the producer's contract instead.
-    """
+def _checked_geometry(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
+                      softmax_scale: float, q_pe: Tensor | None, k_pe: Tensor | None,
+                      block_table_row: Tensor | None, written: Tensor | None,
+                      write_offset: Tensor | None,
+                      page_size: int) -> tuple[int, int, int, int, int, int]:
+    """Refuse a malformed call or a geometry no body serves; return ``(seq, heads, latent,
+    s_kv, topk, rope)``. Shared by :func:`mla_sparse_attention` and
+    :func:`mla_sparse_attention_partial`; ``s_kv`` is the window length of a paged call."""
     if q_lift.ndim != 3:
         raise MlaSparseAttentionError(
             f"q_lift must be [seq, heads, latent]; got shape {tuple(q_lift.shape)}"
@@ -2052,6 +2183,48 @@ def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
                 f"every selected row must index the cache or be the {SENTINEL_INDEX} "
                 f"sentinel; got the range [{lo}, {hi}] against s_kv={s_kv}"
             )
+    return seq, heads, latent, s_kv, topk, rope
+
+
+def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
+                         softmax_scale: float, q_pe: Tensor | None = None,
+                         k_pe: Tensor | None = None,
+                         block_table_row: Tensor | None = None,
+                         written: Tensor | None = None,
+                         write_offset: Tensor | None = None,
+                         page_size: int = 0) -> Tensor:
+    """Sparse MLA attention over each query's selected cache rows.
+
+    Args:
+        q_lift: ``[S, H, L]`` -- the absorbed Q latent, per head.
+        c_kv: ``[S_kv, L]`` -- the latent KV cache, or the whole latent bank when
+            ``block_table_row`` is given.
+        topk_indices: ``[S, K]`` integer -- selected cache rows per query. ``-1``
+            marks a column that carries no token; it is masked, not read.
+        softmax_scale: positive; multiplies the raw scores.
+        q_pe: ``[S, H, R]`` -- the RoPE half of Q. Present together with ``k_pe`` or
+            not at all.
+        k_pe: ``[S_kv, R]`` -- the RoPE half of the cache.
+        block_table_row: ``[pages, 1]`` int32 -- makes the call paged. The window is
+            the named ``page_size``-row blocks of the bank, in order, and a selected
+            row indexes that window (``pages * page_size`` rows) exactly as it would
+            index ``c_kv`` in an unpaged call.
+        written: ``[tokens, L]`` -- this step's own rows, overlaid onto the window at
+            row ``write_offset``.
+        write_offset: ``[1, 1]`` int32 -- read on device.
+        page_size: rows per page; a trace-time constant.
+
+    Returns:
+        ``[S, H, L]`` float32.
+
+    Raises:
+        MlaSparseAttentionError: for a malformed call or a geometry no kernel body
+            serves. The selected-row range is checked only when the values are
+            readable, so a traced call relies on the producer's contract instead.
+    """
+    seq, heads, latent, s_kv, topk, rope = _checked_geometry(
+        q_lift, c_kv, topk_indices, softmax_scale, q_pe, k_pe, block_table_row, written,
+        write_offset, page_size)
 
     _count_nki_dispatch()
 
@@ -2142,6 +2315,84 @@ def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
     )
 
 
+def partial_programs(seq: int, heads: int, topk: int,
+                     latent: int = TARGET_LATENT_RANK) -> int:
+    """Programs the partial launch uses: 2 on an LNC2 pair, else 1.
+
+    The row-tiled body at this checkpoint's latent splits whole query blocks over the two
+    cores of an LNC2 pair from two blocks on, at any head count: the heads ride the
+    partitions, so a block's work per program does not grow with Hq = CP * H. (The
+    attention seam keeps its measured one-head rule for DCP off.) The other bodies, and a
+    single block, keep one program.
+    """
+    if (lnc_pair() and topk > MOVING_MAX and latent == TARGET_LATENT_RANK
+            and seq // _queries_per_block(seq, heads) >= 2):
+        return 2
+    return 1
+
+
+def mla_sparse_attention_partial(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
+                                 softmax_scale: float, q_pe: Tensor | None = None,
+                                 k_pe: Tensor | None = None,
+                                 block_table_row: Tensor | None = None,
+                                 written: Tensor | None = None,
+                                 write_offset: Tensor | None = None,
+                                 page_size: int = 0) -> tuple[Tensor, Tensor]:
+    """One DCP rank's sparse MLA attention over the columns it owns: the partial contract.
+
+    The arguments are :func:`mla_sparse_attention`'s. ``q_lift`` carries every head of the
+    CP group, ``[S, Hq, L]`` with ``Hq = CP * H``, and ``topk_indices`` this rank's columns
+    only: a column another rank owns is :data:`SENTINEL_INDEX`.
+
+    Returns:
+        ``(partial, lse)``. ``partial`` ``[Hq, S, L]`` float32: the attention normalised
+        over the row's valid columns, head-major so the all-to-all splits it on dim 0.
+        ``lse`` ``[Hq, S]`` float32: ``softmax_scale * m + ln(l)`` over the same columns.
+        A row with no valid column returns ``partial`` exactly 0 and ``lse`` exactly
+        :data:`~vllm_neuron.functional.attention.dcp_merge.EMPTY_LSE`.
+        ``dcp_merge.dcp_lse_merge`` combines the ranks.
+
+    Every body runs its fp32 arithmetic; the low-precision one-head body does not serve
+    partial mode (see :func:`mla_sparse_attention_nope_partial_kernel`).
+
+    Raises:
+        MlaSparseAttentionError: for a RoPE half (this checkpoint's width is 0 and partial
+            mode has no RoPE entry), and for everything :func:`mla_sparse_attention`
+            refuses.
+    """
+    if q_pe is not None or k_pe is not None:
+        raise MlaSparseAttentionError(
+            "partial mode (decode context parallelism) serves the NoPE geometry only: this "
+            "checkpoint's RoPE width is 0 and there is no RoPE partial entry; pass no "
+            "q_pe/k_pe"
+        )
+    seq, heads, latent, _s_kv, topk, _rope = _checked_geometry(
+        q_lift, c_kv, topk_indices, softmax_scale, None, None, block_table_row, written,
+        write_offset, page_size)
+
+    _count_nki_dispatch()
+    if latent % LATENT_TILE != 0 or latent > MOVING_MAX:
+        _count_tiled_nki_dispatch()
+    if topk > MOVING_MAX:
+        _count_row_tiled_nki_dispatch()
+
+    call = wrap_nki(mla_sparse_attention_nope_partial_kernel)
+    if partial_programs(seq, heads, topk, latent) == 2:
+        call = call[2]
+    table = rows = at = None
+    if block_table_row is not None:
+        overlaid = written is not None and int(written.shape[0]) > 0
+        rows = _kernel_operand(written) if overlaid else None
+        at = write_offset.contiguous().to(torch.int32) if overlaid else None
+        table = block_table_row.contiguous().to(torch.int32)
+    return call(
+        _kernel_operand(q_lift), _kernel_operand(c_kv),
+        topk_indices.contiguous().to(torch.int32), float(softmax_scale), table, rows, at,
+        int(page_size) if block_table_row is not None else 0, MOVING_MAX, True,
+        _query_buffers(), SOURCE_DIGEST
+    )
+
+
 def mla_sparse_attention_torch_oracle(q_lift: Tensor, c_kv: Tensor,
                                       topk_indices: Tensor, softmax_scale: float,
                                       q_pe: Tensor | None = None,
@@ -2185,7 +2436,8 @@ def mla_sparse_kernel_identity() -> tuple[tuple[str, str], ...]:
                   mla_sparse_attention_nope_tiled_kernel,
                   mla_sparse_attention_rope_tiled_kernel,
                   mla_sparse_attention_nope_row_tiled_kernel,
-                  mla_sparse_attention_rope_row_tiled_kernel):
+                  mla_sparse_attention_rope_row_tiled_kernel,
+                  mla_sparse_attention_nope_partial_kernel):
         func = getattr(entry, "func", None)
         target = func if func is not None else entry
         identities.append((target.__module__, target.__qualname__))

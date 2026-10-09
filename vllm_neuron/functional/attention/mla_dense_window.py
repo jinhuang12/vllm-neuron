@@ -25,6 +25,17 @@ stored 2-byte query and cache (exact products) into fp32 PSUM; the softmax runs 
 over the whole row with its global maximum; MM2 contracts a bf16 hi/lo split of the
 normalised fp32 probabilities (about 16 significand bits) against the stored cache.
 
+Partial mode (:func:`mla_dense_window_attention_partial`) serves decode context
+parallelism (DCP). The CP ranks of a group interleave the latent cache in 128-token blocks
+(block ``b`` is rank ``b % CP``'s), so rank c's block table names its own pages and its
+staged window is its own blocks in order. The global causal set ``t < seq_len`` is then a
+prefix of that window, of length ``own_c(seq_len)``, which the caller passes per query. A
+non-owner rank in a request's first block has length 0. Every head of the group (``Hq =
+CP * H``) is attended, and the kernel returns the partial contract of ``dcp_merge``:
+``partial [Hq, S, L]`` float32 normalised over this rank's columns, head-major, and ``lse
+[Hq, S]`` float32 ``= softmax_scale * m + ln(l)``; a query with length 0 returns 0 and
+``EMPTY_LSE`` exactly.
+
 This module never decides the regime and holds no model dial: the caller passes the
 window and each row's causal length. The call site is
 ``vllm_neuron/model/glm5_next/dsa_dense_window.py``; its kill switch is
@@ -49,6 +60,8 @@ from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
 from vllm_neuron.functional.attention import mla_sparse as _ms
 from vllm_neuron.utils.neuron_utils import values_are_readable
+# The partial contract's empty lse lives with the merge that reads it.
+from vllm_neuron.functional.attention.dcp_merge import EMPTY_LSE
 
 #: Partition extent. Query rows (queries x heads) are tiled to it for MM1 and the
 #: softmax; window rows are chunked to it for MM2; the latent is tiled to it for MM1.
@@ -127,9 +140,15 @@ def _col(parts, dtype):
 
 
 def _row_tile(q_hbm, limits_hbm, out_hbm, c_t, c_rows, cols_f, softmax_scale,
-              key_rows, r0, rt):
-    """One tile of ``rt`` query rows starting at row ``r0``: MM1, softmax, MM2, store."""
-    latent = q_hbm.shape[1]
+              key_rows, rt, q_stride, q_off, lim_off, out_off, lse_hbm, lse_off):
+    """One tile of ``rt`` query rows: MM1, softmax, MM2, store.
+
+    Row ``p`` of the tile reads its query at element ``q_off + p * q_stride`` of ``q_hbm``
+    and its limit at ``lim_off + p`` of ``limits_hbm``, and writes its output at element
+    ``out_off + p * L`` of ``out_hbm``. With ``lse_hbm`` (partial mode) it also writes its
+    lse at ``lse_off + p``: ``ln(sum) - bias``, and exactly EMPTY_LSE when the limit is 0.
+    """
+    latent = c_rows.shape[2]
     n_lat = latent // LATENT_TILE
     n_chunks = c_rows.shape[1]
     width = n_chunks * KEY_CHUNK
@@ -141,7 +160,7 @@ def _row_tile(q_hbm, limits_hbm, out_hbm, c_t, c_rows, cols_f, softmax_scale,
     # the PE) and rounded back, losslessly, to its own dtype -- mla_decode's rule.
     q_nat = _sb((ROW_TILE, latent), q_hbm.dtype)
     nisa.dma_copy(dst=q_nat[0:rt, :],
-                  src=q_hbm.ap(pattern=[[latent, rt], [1, latent]], offset=r0 * latent))
+                  src=q_hbm.ap(pattern=[[q_stride, rt], [1, latent]], offset=q_off))
     q_f = _sb((ROW_TILE, latent), nl.float32)
     nisa.tensor_copy(dst=q_f[0:rt, :], src=q_nat[0:rt, :])
     q_ps = nl.ndarray((LATENT_TILE, n_lat * ROW_TILE), dtype=nl.float32, buffer=nl.psum)
@@ -154,7 +173,8 @@ def _row_tile(q_hbm, limits_hbm, out_hbm, c_t, c_rows, cols_f, softmax_scale,
 
     # ---- which window rows each query row may see: j < min(seq_len, key_rows) ------
     lim_i = _col(ROW_TILE, nl.int32)
-    nisa.dma_copy(dst=lim_i[0:rt, :], src=limits_hbm.ap(pattern=[[1, rt], [1, 1]], offset=r0))
+    nisa.dma_copy(dst=lim_i[0:rt, :],
+                  src=limits_hbm.ap(pattern=[[1, rt], [1, 1]], offset=lim_off))
     lim_f = _col(ROW_TILE, nl.float32)
     nisa.tensor_copy(dst=lim_f[0:rt, :], src=lim_i[0:rt, :])
     nisa.tensor_scalar(dst=lim_f[0:rt, :], data=lim_f[0:rt, :], op0=nl.minimum,
@@ -192,6 +212,10 @@ def _row_tile(q_hbm, limits_hbm, out_hbm, c_t, c_rows, cols_f, softmax_scale,
                     reduce_res=row_sum[0:rt, :], reduce_cmd=nisa.reduce_cmd.reset_reduce)
     nisa.tensor_scalar(dst=row_sum[0:rt, :], data=row_sum[0:rt, :], op0=nl.maximum,
                        operand0=_TOTAL_FLOOR)
+    if lse_hbm is not None:
+        # The floored sum: an empty row's raw sum is 0, whose log the select below would
+        # turn into NaN; its floored lse is finite and the select replaces it.
+        _lse_rows(lse_hbm, lse_off, row_sum, neg_top, lim_f, rt)
     recip = _col(ROW_TILE, nl.float32)
     nisa.reciprocal(dst=recip[0:rt, :], data=row_sum[0:rt, :])
     nisa.tensor_scalar(dst=scores[0:rt, :], data=scores[0:rt, :], op0=nl.multiply,
@@ -226,21 +250,47 @@ def _row_tile(q_hbm, limits_hbm, out_hbm, c_t, c_rows, cols_f, softmax_scale,
                        moving=c_rows[:, ck, :], accumulate=True)
     out_sb = _sb((ROW_TILE, latent), nl.float32)
     nisa.tensor_copy(dst=out_sb[0:rt, :], src=pv_ps[0:rt, :])
-    nisa.dma_copy(dst=out_hbm.ap(pattern=[[latent, rt], [1, latent]], offset=r0 * latent),
+    nisa.dma_copy(dst=out_hbm.ap(pattern=[[latent, rt], [1, latent]], offset=out_off),
                   src=out_sb[0:rt, :])
 
 
-def _dense_body(q_hbm, window_hbm, limits_hbm, softmax_scale, key_rows, active_rows,
-                out_hbm):
-    """Attend ``window_hbm`` rows ``0 .. min(limit, key_rows) - 1`` for query rows
-    ``0 .. active_rows - 1``, and write zero rows from ``active_rows`` on.
+def _lse_rows(lse_hbm, lse_off, row_sum, neg_top, lim_f, rt):
+    """Store ``lse = ln(row_sum) - neg_top`` of ``rt`` rows at ``lse_off``; EMPTY_LSE at limit 0.
 
-    ``q_hbm`` is ``[rows, L]`` (queries x heads, row-major), ``limits_hbm`` ``[rows]``
-    int32, ``out_hbm`` ``[rows, L]`` fp32. ``key_rows`` is a trace-time int no larger
-    than the staged window; ``active_rows`` a trace-time int in ``1 .. rows``. The limits
-    of the rows past ``active_rows`` are not read.
+    ``neg_top`` is the exp's bias, ``-softmax_scale * max``, so this is ``softmax_scale * m +
+    ln(l)``. ``lim_f`` is the row's limit, a non-negative whole number: ``live_m1 = min(limit,
+    1) - 1`` is 0.0 or -1.0, and ``lse * (live_m1 + 1) + live_m1 * 1e30`` is exactly the lse
+    or exactly EMPTY_LSE (every factor is 0, 1 or -1).
     """
-    rows, latent = q_hbm.shape
+    live_m1 = _col(ROW_TILE, nl.float32)
+    nisa.tensor_scalar(dst=live_m1[0:rt, :], data=lim_f[0:rt, :], op0=nl.minimum, operand0=1.0,
+                       op1=nl.add, operand1=-1.0, engine=nisa.engine.vector)
+    ln_sum = _col(ROW_TILE, nl.float32)
+    nisa.activation(dst=ln_sum[0:rt, :], op=nl.log, data=row_sum[0:rt, :])
+    raw = _col(ROW_TILE, nl.float32)
+    nisa.tensor_tensor(dst=raw[0:rt, :], data1=ln_sum[0:rt, :], data2=neg_top[0:rt, :],
+                       op=nl.subtract)
+    dead = _col(ROW_TILE, nl.float32)
+    nisa.tensor_scalar(dst=dead[0:rt, :], data=live_m1[0:rt, :], op0=nl.multiply,
+                       operand0=-EMPTY_LSE, engine=nisa.engine.vector)
+    live = _col(ROW_TILE, nl.float32)
+    nisa.tensor_scalar(dst=live[0:rt, :], data=live_m1[0:rt, :], op0=nl.add, operand0=1.0,
+                       engine=nisa.engine.vector)
+    lse = _col(ROW_TILE, nl.float32)
+    nisa.scalar_tensor_tensor(dst=lse[0:rt, :], data=raw[0:rt, :], op0=nl.multiply,
+                              operand0=live[0:rt, :], op1=nl.add, operand1=dead[0:rt, :])
+    nisa.dma_copy(dst=lse_hbm.ap(pattern=[[1, rt], [1, 1]], offset=lse_off), src=lse[0:rt, :])
+
+
+# Positions in the list :func:`_window_operands` returns (the kernel front end resolves
+# plain names and integer subscripts, not tuple targets).
+_W_ROWS = 0     # the window, keys on partitions: MM2's moving operand
+_W_T = 1        # the window transposed, latent on partitions: MM1's moving operand
+_W_COLS = 2     # every window row's column index, the same on every partition
+
+
+def _window_operands(window_hbm, key_rows, latent):
+    """The window in SBUF twice (keys on partitions, and transposed) and its column index."""
     n_lat = latent // LATENT_TILE
     n_chunks = (key_rows + KEY_CHUNK - 1) // KEY_CHUNK
     width = n_chunks * KEY_CHUNK
@@ -270,6 +320,28 @@ def _dense_body(q_hbm, window_hbm, limits_hbm, softmax_scale, key_rows, active_r
     # ---- the column index of every window row, the same on every partition -----------
     cols_f = _sb((ROW_TILE, width), nl.float32)
     nisa.iota(dst=cols_f, pattern=[[1, width]], offset=0)
+    ops = []
+    ops.append(c_rows)
+    ops.append(c_t)
+    ops.append(cols_f)
+    return ops
+
+
+def _dense_body(q_hbm, window_hbm, limits_hbm, softmax_scale, key_rows, active_rows,
+                out_hbm):
+    """Attend ``window_hbm`` rows ``0 .. min(limit, key_rows) - 1`` for query rows
+    ``0 .. active_rows - 1``, and write zero rows from ``active_rows`` on.
+
+    ``q_hbm`` is ``[rows, L]`` (queries x heads, row-major), ``limits_hbm`` ``[rows]``
+    int32, ``out_hbm`` ``[rows, L]`` fp32. ``key_rows`` is a trace-time int no larger
+    than the staged window; ``active_rows`` a trace-time int in ``1 .. rows``. The limits
+    of the rows past ``active_rows`` are not read.
+    """
+    rows, latent = q_hbm.shape
+    ops = _window_operands(window_hbm, key_rows, latent)
+    c_rows = ops[_W_ROWS]
+    c_t = ops[_W_T]
+    cols_f = ops[_W_COLS]
 
     # Work is dealt round-robin over the programs: the whole tiles of active rows, then
     # the partial tile, then the zero-row chunks. ``program_id`` is a trace-time int (the
@@ -279,13 +351,15 @@ def _dense_body(q_hbm, window_hbm, limits_hbm, softmax_scale, key_rows, active_r
     n_prgs = nl.num_programs(axes=0)
     prg = nl.program_id(0)
     for qt in nl.affine_range(prg, n_full, n_prgs):
+        r0 = qt * ROW_TILE
         _row_tile(q_hbm, limits_hbm, out_hbm, c_t, c_rows, cols_f, softmax_scale,
-                  key_rows, qt * ROW_TILE, ROW_TILE)
+                  key_rows, ROW_TILE, latent, r0 * latent, r0, r0 * latent, None, 0)
     job = n_full
     if tail > 0:
         if job % n_prgs == prg:
+            r0 = n_full * ROW_TILE
             _row_tile(q_hbm, limits_hbm, out_hbm, c_t, c_rows, cols_f, softmax_scale,
-                      key_rows, n_full * ROW_TILE, tail)
+                      key_rows, tail, latent, r0 * latent, r0, r0 * latent, None, 0)
         job += 1
     if active_rows < rows:
         zero = _sb((ROW_TILE, latent), nl.float32)
@@ -336,6 +410,88 @@ def mla_dense_window_kernel(q_hbm, bank_hbm, table_hbm, limits_hbm, written_hbm,
     _dense_body(q_hbm, window_hbm, limits_hbm, softmax_scale, key_rows, active_rows,
                 out_hbm)
     return out_hbm
+
+
+def _dense_partial_body(q_hbm, window_hbm, limits_hbm, softmax_scale, key_rows, active,
+                        out_hbm, lse_hbm):
+    """Partial mode: attend window rows ``0 .. min(limit, key_rows) - 1`` per query, every head.
+
+    ``q_hbm`` is ``[S, Hq, L]``, ``limits_hbm`` ``[S]`` int32 (one length per query, shared by
+    its heads; 0 allowed), ``out_hbm`` ``[Hq, S, L]`` and ``lse_hbm`` ``[Hq, S]`` float32.
+    ``active`` is a trace-time int in ``1 .. S``: queries from it on are written as 0 with
+    lse EMPTY_LSE, and their limits are not read.
+
+    The rows are taken head by head, in tiles of 128 queries of one head, so a tile's query
+    rows are one strided DMA (``Hq * L`` apart) and its output rows and lses are contiguous
+    in the head-major outputs. The jobs are numbered head by head (every head's whole
+    tiles, then every head's partial tile, then the zero-row chunks) and dealt round-robin
+    over the programs. ``program_id`` is a trace-time int, so each program keeps its own.
+    """
+    seq, heads, latent = q_hbm.shape
+    ops = _window_operands(window_hbm, key_rows, latent)
+    c_rows = ops[_W_ROWS]
+    c_t = ops[_W_T]
+    cols_f = ops[_W_COLS]
+    n_full = active // ROW_TILE
+    tail = active - n_full * ROW_TILE
+    n_prgs = nl.num_programs(axes=0)
+    prg = nl.program_id(0)
+    q_stride = heads * latent
+    for h in range(heads):
+        # Job h * n_full + qt is this program's when it is prg modulo n_prgs.
+        first = (prg - h * n_full) % n_prgs
+        if first < n_full:
+            for qt in nl.affine_range(first, n_full, n_prgs):
+                s0 = qt * ROW_TILE
+                _row_tile(q_hbm, limits_hbm, out_hbm, c_t, c_rows, cols_f, softmax_scale,
+                          key_rows, ROW_TILE, q_stride, (s0 * heads + h) * latent, s0,
+                          (h * seq + s0) * latent, lse_hbm, h * seq + s0)
+    job = heads * n_full
+    if tail > 0:
+        s0 = n_full * ROW_TILE
+        for h in range(heads):
+            if job % n_prgs == prg:
+                _row_tile(q_hbm, limits_hbm, out_hbm, c_t, c_rows, cols_f, softmax_scale,
+                          key_rows, tail, q_stride, (s0 * heads + h) * latent, s0,
+                          (h * seq + s0) * latent, lse_hbm, h * seq + s0)
+            job += 1
+    if active < seq:
+        zero = _sb((ROW_TILE, latent), nl.float32)
+        nisa.memset(dst=zero, value=0.0)
+        empty = _col(ROW_TILE, nl.float32)
+        nisa.memset(dst=empty, value=EMPTY_LSE)
+        for h in range(heads):
+            for z0 in range(active, seq, ROW_TILE):
+                if job % n_prgs == prg:
+                    zn = min(ROW_TILE, seq - z0)
+                    nisa.dma_copy(dst=out_hbm.ap(pattern=[[latent, zn], [1, latent]],
+                                                 offset=(h * seq + z0) * latent),
+                                  src=zero[0:zn, :])
+                    nisa.dma_copy(dst=lse_hbm.ap(pattern=[[1, zn], [1, 1]],
+                                                 offset=h * seq + z0),
+                                  src=empty[0:zn, :])
+                job += 1
+
+
+@nki.jit
+def mla_dense_window_partial_kernel(q_hbm, bank_hbm, table_hbm, limits_hbm, written_hbm,
+                                    write_offset_hbm, softmax_scale, page_size, key_rows,
+                                    active_rows, source_digest=0, staging_digest=0):
+    """Partial mode: ``(partial [Hq, S, L], lse [Hq, S])`` float32 over this rank's window.
+
+    The operands are :func:`mla_dense_window_kernel`'s except ``q_hbm``, ``[S, Hq, L]``
+    (every head of the CP group), ``limits_hbm``, ``[S]`` int32 (each query's length in
+    this rank's own window, 0 allowed), and ``active_rows``, a count of queries. A query
+    whose length is 0, and every query from ``active_rows`` on, returns 0 and EMPTY_LSE.
+    """
+    seq, heads, latent = q_hbm.shape
+    out_hbm = nl.ndarray((heads, seq, latent), dtype=nl.float32, buffer=nl.shared_hbm)
+    lse_hbm = nl.ndarray((heads, seq), dtype=nl.float32, buffer=nl.shared_hbm)
+    window_hbm = _ms._staged_window(bank_hbm, table_hbm, written_hbm, write_offset_hbm,
+                                    page_size)
+    _dense_partial_body(q_hbm, window_hbm, limits_hbm, softmax_scale, key_rows, active_rows,
+                        out_hbm, lse_hbm)
+    return out_hbm, lse_hbm
 
 
 def dense_window_serves(q_dtype: torch.dtype, kv_dtype: torch.dtype, heads: int,
@@ -405,6 +561,53 @@ def _programs(rows: int) -> int:
     return 1
 
 
+def _checked_call(q_lift: Tensor, c_kv: Tensor, lens: Tensor, softmax_scale: float,
+                  block_table_row: Tensor, written: Tensor | None,
+                  write_offset: Tensor | None, page_size: int, active_rows: int | None,
+                  min_len: int, name: str) -> tuple[int, int, int, int, int]:
+    """Both seams' checks; returns ``(staged rows, S, heads, L, active queries)``.
+
+    ``lens`` (called ``name`` in the messages) is each query's length in the window; an
+    eager call's entries must be in ``[min_len, staged]``: 1 for the attention seam, 0 for
+    the partial seam, whose non-owner ranks see no row of a request's first block.
+    """
+    if not softmax_scale > 0:
+        raise MlaDenseWindowError(f"softmax_scale must be positive; got {softmax_scale}")
+    if block_table_row is None or block_table_row.ndim != 2:
+        raise MlaDenseWindowError(
+            "the dense window kernel reads a paged window only: pass block_table_row "
+            "[pages, 1]"
+        )
+    page = int(page_size)
+    table = block_table_row
+    try:
+        staged = _ms._require_paged(c_kv, table, written, write_offset, page, None)
+    except _ms.MlaSparseAttentionError as err:
+        raise MlaDenseWindowError(str(err)) from err
+    _require_geometry(q_lift, c_kv, staged)
+    seq, heads, latent = (int(d) for d in q_lift.shape)
+    if lens.ndim != 1 or int(lens.shape[0]) != seq:
+        raise MlaDenseWindowError(
+            f"{name} must be [seq] = [{seq}], one causal length per query; got "
+            f"{tuple(lens.shape)}"
+        )
+    active = seq if active_rows is None else int(active_rows)
+    if not 1 <= active <= seq:
+        raise MlaDenseWindowError(
+            f"active_rows must be in [1, {seq}], a prefix of the queries; got {active_rows!r}"
+        )
+    # Checked eagerly only, as the sparse seam checks its indices: a traced call has no
+    # values to read, and the kernel clamps each row's length at the staged rows.
+    if values_are_readable(lens):
+        lo, hi = int(lens[:active].min()), int(lens[:active].max())
+        if lo < min_len or hi > staged:
+            raise MlaDenseWindowError(
+                f"every {name} entry must be in [{min_len}, {staged}], the window rows this "
+                f"call stages; got the range [{lo}, {hi}]"
+            )
+    return staged, seq, heads, latent, active
+
+
 def mla_dense_window_attention(q_lift: Tensor, c_kv: Tensor, seq_lens: Tensor,
                                softmax_scale: float, block_table_row: Tensor,
                                written: Tensor | None = None,
@@ -434,41 +637,11 @@ def mla_dense_window_attention(q_lift: Tensor, c_kv: Tensor, seq_lens: Tensor,
     Raises:
         MlaDenseWindowError: for a malformed call or a geometry the kernel does not serve.
     """
-    if not softmax_scale > 0:
-        raise MlaDenseWindowError(f"softmax_scale must be positive; got {softmax_scale}")
-    if block_table_row is None or block_table_row.ndim != 2:
-        raise MlaDenseWindowError(
-            "the dense window kernel reads a paged window only: pass block_table_row "
-            "[pages, 1]"
-        )
+    staged, seq, heads, latent, active = _checked_call(
+        q_lift, c_kv, seq_lens, softmax_scale, block_table_row, written, write_offset,
+        page_size, active_rows, 1, "seq_lens")
     page = int(page_size)
     table = block_table_row
-    try:
-        staged = _ms._require_paged(c_kv, table, written, write_offset, page, None)
-    except _ms.MlaSparseAttentionError as err:
-        raise MlaDenseWindowError(str(err)) from err
-    _require_geometry(q_lift, c_kv, staged)
-    seq, heads, latent = (int(d) for d in q_lift.shape)
-    if seq_lens.ndim != 1 or int(seq_lens.shape[0]) != seq:
-        raise MlaDenseWindowError(
-            f"seq_lens must be [seq] = [{seq}], one causal length per query; got "
-            f"{tuple(seq_lens.shape)}"
-        )
-    active = seq if active_rows is None else int(active_rows)
-    if not 1 <= active <= seq:
-        raise MlaDenseWindowError(
-            f"active_rows must be in [1, {seq}], a prefix of the queries; got {active_rows!r}"
-        )
-    # Checked eagerly only, as the sparse seam checks its indices: a traced call has no
-    # values to read, and the kernel clamps each row's length at the staged rows.
-    if values_are_readable(seq_lens):
-        lo, hi = int(seq_lens[:active].min()), int(seq_lens[:active].max())
-        if lo < 1 or hi > staged:
-            raise MlaDenseWindowError(
-                f"every seq_lens entry must be in [1, {staged}], the window rows this call "
-                f"stages; got the range [{lo}, {hi}]"
-            )
-
     rows = seq * heads
     programs = _programs(rows)
     _count_dispatch(programs)
@@ -494,3 +667,61 @@ def mla_dense_window_attention(q_lift: Tensor, c_kv: Tensor, seq_lens: Tensor,
     )
     return out.reshape(seq, heads, latent)
 
+
+def mla_dense_window_attention_partial(q_lift: Tensor, c_kv: Tensor, owned_lens: Tensor,
+                                       softmax_scale: float, block_table_row: Tensor,
+                                       written: Tensor | None = None,
+                                       write_offset: Tensor | None = None,
+                                       page_size: int = 0,
+                                       active_rows: int | None = None
+                                       ) -> tuple[Tensor, Tensor]:
+    """One DCP rank's dense window attention: the partial contract of ``dcp_merge``.
+
+    Args:
+        q_lift: ``[S, Hq, L]`` bf16/fp16, every head of the CP group (``Hq = CP * H``).
+        c_kv: ``[slots, L]`` the whole latent bank, same dtype.
+        owned_lens: ``[S]`` int32, each query's causal length in this rank's own window
+            (its owned 128-token blocks in order): ``own_c(n) = sum over blocks b with
+            b % CP == c of min(128, max(0, n - 128 b))`` for global causal length n. 0 is
+            allowed: a non-owner rank in a request's first block sees no row.
+        softmax_scale, block_table_row, written, write_offset, page_size: as
+            :func:`mla_dense_window_attention`; the table names this rank's own pages.
+        active_rows: a trace-time int in ``1 .. S``, or None for ``S``: queries from it on
+            come back as 0 with lse EMPTY_LSE, and their ``owned_lens`` are not read.
+
+    Returns:
+        ``(partial [Hq, S, L], lse [Hq, S])`` float32: the attention normalised over this
+        rank's rows, head-major, and ``softmax_scale * m + ln(l)`` over them. A query of
+        length 0 returns 0 and :data:`~vllm_neuron.functional.attention.dcp_merge.EMPTY_LSE`.
+
+    Raises:
+        MlaDenseWindowError: for a malformed call or a geometry the kernel does not serve.
+    """
+    if owned_lens.dtype != torch.int32:
+        raise MlaDenseWindowError(
+            f"owned_lens must be int32, the dtype the kernel reads (no cast is traced here); "
+            f"got {owned_lens.dtype}"
+        )
+    staged, seq, heads, latent, active = _checked_call(
+        q_lift, c_kv, owned_lens, softmax_scale, block_table_row, written, write_offset,
+        page_size, active_rows, 0, "owned_lens")
+    programs = _programs(seq * heads)
+    _count_dispatch(programs)
+    overlaid = written is not None and int(written.shape[0]) > 0
+    call = wrap_nki(mla_dense_window_partial_kernel)
+    if programs == 2:
+        call = call[2]
+    return call(
+        q_lift.contiguous(),
+        c_kv.contiguous(),
+        block_table_row.contiguous().to(torch.int32),
+        owned_lens.contiguous(),
+        written.contiguous() if overlaid else None,
+        write_offset.contiguous().to(torch.int32) if overlaid else None,
+        float(softmax_scale),
+        int(page_size),
+        int(staged),
+        active,
+        SOURCE_DIGEST,
+        STAGING_DIGEST,
+    )
