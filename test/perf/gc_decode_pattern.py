@@ -156,7 +156,9 @@ def _percentile(values: list[float], q: float) -> float:
 
 def run_child(policy: str, args) -> dict:
     """One policy, in this process. Returns the measurement as a dict."""
-    import vllm_neuron  # noqa: F401  (the worker's module heap: torch, vLLM, plugin)
+    import torch
+
+    import vllm_neuron  # the worker's module heap: torch, vLLM, plugin
 
     rng = random.Random(args.seed)
     t_build = time.perf_counter()
@@ -256,6 +258,8 @@ def run_child(policy: str, args) -> dict:
     return {
         "policy": policy,
         "label": LABELS.get(policy, policy),
+        "vllm_neuron": vllm_neuron.__file__,
+        "torch_threads": torch.get_num_threads(),
         "python": sys.version.split()[0],
         "steps": steps,
         "heap_objects": args.heap,
@@ -396,6 +400,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     env.pop("VLLM_NEURON_GC_POLICY", None)
     env.pop("VLLM_GC_DEBUG", None)
+    print(f"[gc_decode_pattern] root {root} python {sys.version.split()[0]} "
+          f"OMP_NUM_THREADS={env.get('OMP_NUM_THREADS')}", flush=True)
     results: dict[str, dict] = {}
     for name in [p for p in args.policies.split(",") if p]:
         t = time.perf_counter()
@@ -407,7 +413,9 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write(out.stdout[-4000:] + out.stderr[-4000:])
             raise SystemExit(f"child {name} failed with rc={out.returncode}")
         results[name] = parse_child_output(out.stdout)
-        print(f"[{name}] done in {time.perf_counter() - t:.0f} s", flush=True)
+        print(f"[{name}] done in {time.perf_counter() - t:.0f} s (vllm_neuron.__file__ "
+              f"{results[name]['vllm_neuron']}, torch threads {results[name]['torch_threads']})",
+              flush=True)
 
     print(_table(results))
     verdict = None
