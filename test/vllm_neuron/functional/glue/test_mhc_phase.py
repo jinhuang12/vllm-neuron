@@ -116,21 +116,21 @@ def _speculative(k: int):
 
 
 @pytest.mark.parametrize("k", (1, 2, 3))
-def test_the_draft_count_is_the_speculative_configs(k, monkeypatch):
-    """``glue.speculative_draft_k`` is ``k`` under speculative method "mtp", and 0 under
-    another method, with no config, or with the shadow draft's knob alone."""
+def test_the_verify_step_has_the_draft_count_only_under_mtp(k, monkeypatch):
+    """``glue.verify_draft_k`` passes the model's draft count under speculative method
+    "mtp", and is 0 under another method, with no config, or for the shadow draft's knob
+    alone (the shadow draft runs no verify step)."""
     monkeypatch.delenv(mtp.SHADOW_DRAFT_ENV, raising=False)
     with _speculative(k):
-        assert glue.speculative_draft_k() == k
-        assert glue.verify_rows([1, 2]) == {1 + k, 2 * (1 + k)}
-    assert glue.speculative_draft_k() == 0
-    assert glue.verify_rows([1, 2]) == frozenset()
+        assert glue.verify_draft_k(mtp.shadow_draft_k()) == k
+    assert glue.verify_draft_k(k) == 0
     config = VllmConfig()
     config.speculative_config = SimpleNamespace(method="eagle", num_speculative_tokens=k)
     with set_current_vllm_config(config, check_compile=False):
-        assert glue.speculative_draft_k() == 0
+        assert glue.verify_draft_k(k) == 0
     monkeypatch.setenv(mtp.SHADOW_DRAFT_ENV, str(k))
-    assert glue.speculative_draft_k() == 0
+    assert mtp.shadow_draft_k() == k
+    assert glue.verify_draft_k(mtp.shadow_draft_k()) == 0
 
 
 @pytest.mark.parametrize("k", (1, 2, 3))
@@ -139,7 +139,7 @@ def test_the_layer_derives_the_verify_rows_from_the_speculative_config(k, max_nu
                                                                       monkeypatch):
     """Built inside the config context, the layer calls each decode bucket times ``1 + k``
     rows verify, and under ``mhc_pre:verify`` its mhc_pre site fuses them and its mhc_post
-    site does not. One-row draft calls and the prefill bucket keep their routes."""
+    site does not. One-row decode calls and the prefill bucket keep their routes."""
     monkeypatch.setenv(glue.GLUE_FUSED_ENV, VERIFY_ONLY)
     monkeypatch.delenv(mtp.SHADOW_DRAFT_ENV, raising=False)
     with _speculative(k):
@@ -162,7 +162,7 @@ def test_the_layer_derives_the_verify_rows_from_the_speculative_config(k, max_nu
 
 def test_the_verify_step_takes_the_fused_mhc_pre(monkeypatch):
     """bs=1 with 3 drafts under ``mhc_pre:verify``: the 4-row verify call runs the fused
-    mhc_pre (and the fp32 combine, mhc_post is not selected); the one-row draft call keeps
+    mhc_pre (and the fp32 combine, mhc_post is not selected); the one-row decode call keeps
     the torch route. The layer reads ``k`` at construction; the calls run outside the
     config context, as the forward does."""
     monkeypatch.setenv(glue.GLUE_FUSED_ENV, VERIFY_ONLY)
@@ -175,7 +175,7 @@ def test_the_verify_step_takes_the_fused_mhc_pre(monkeypatch):
 
 def test_under_the_default_the_verify_step_takes_the_fused_mhc_pre(monkeypatch):
     """The switch unset (``1``), bs=1 with 3 drafts: the 4-row verify call runs the fused
-    mhc_pre and the fp32 combine; the one-row draft call keeps the torch route."""
+    mhc_pre and the fp32 combine; the one-row decode call keeps the torch route."""
     monkeypatch.delenv(glue.GLUE_FUSED_ENV, raising=False)
     monkeypatch.delenv(mtp.SHADOW_DRAFT_ENV, raising=False)
     with _speculative(3):
@@ -184,9 +184,10 @@ def test_under_the_default_the_verify_step_takes_the_fused_mhc_pre(monkeypatch):
     assert _routes(site, cfg, 1, monkeypatch) == ((0, 1), torch.float32)
 
 
-def test_a_draft_call_of_a_verify_row_count_takes_the_verify_route(monkeypatch):
-    """k=1 at decode buckets [1, 2]: a 2-row call is one request's verify step or two
-    requests' draft call; both take the fused mhc_pre."""
+def test_a_decode_batch_of_a_verify_row_count_takes_the_verify_route(monkeypatch):
+    """k=1 at decode buckets [1, 2]: a 2-row call is one request's verify step or the
+    one-row-per-request decode step of two requests; the row count cannot tell them apart,
+    so both take the verify route, the fused mhc_pre."""
     monkeypatch.setenv(glue.GLUE_FUSED_ENV, VERIFY_ONLY)
     monkeypatch.delenv(mtp.SHADOW_DRAFT_ENV, raising=False)
     with _speculative(1):

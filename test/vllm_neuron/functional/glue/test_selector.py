@@ -136,10 +136,10 @@ def test_the_verify_step_is_each_decode_bucket_times_one_plus_k(k, max_seqs):
 
 
 def test_a_decode_batch_of_a_verify_row_count_is_the_verify_step():
-    """k=1 at decode buckets [1, 2]: one request's verify step and two requests' draft
-    call both have 2 rows. The stack runs no one-row-per-request decode step on a
-    speculative server, so the site calls 2 rows verify; the draft call takes that
-    route too."""
+    """k=1 at decode buckets [1, 2]: one request's verify step and the one-row-per-request
+    decode step of two requests (which a speculative server also runs) both have 2 rows.
+    The row count cannot tell them apart, so the site calls 2 rows verify, and that
+    decode batch takes the verify route."""
     rows = glue.verify_rows([1, 2], 1)
     assert rows == {2, 4}
     assert glue.phase_of_rows(2, 2, rows) == "verify"
@@ -208,6 +208,19 @@ def test_the_verify_value_routes_bs1_with_3_drafts_as_the_device_ab_did():
         for kernel in KERNELS:
             assert ab.selects(kernel, rows, before) == one.selects(kernel, rows, now), (
                 kernel, rows)
+
+
+def test_the_selector_does_not_import_the_model_package():
+    """Nothing under ``vllm_neuron/functional/`` imports ``vllm_neuron.model``: the mHC
+    layer passes the draft count in (:func:`glue.verify_draft_k`)."""
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(glue))
+    names = [node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)]
+    names += [alias.name for node in ast.walk(tree) if isinstance(node, ast.Import)
+              for alias in node.names]
+    assert not [n for n in names if n and n.startswith("vllm_neuron.model")], names
 
 
 def test_a_verify_rule_names_an_mhc_kernel_only():

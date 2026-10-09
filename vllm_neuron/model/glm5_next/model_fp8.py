@@ -895,8 +895,9 @@ class Glm5NextHyperConnection(nn.Module):
             Glm5NextHyperConnectionError: on a non-positive ``hc_mult``,
                 ``hidden_size`` or iteration count.
             ValueError: when ``VLLM_NEURON_GLUE_FUSED`` routes an mHC kernel by
-                phase at the row count of a prefill bucket that a decode batch can
-                also have (``functional.glue.require_rows_tell_phase``).
+                phase at the row count of a prefill bucket that a decode batch or the
+                verify step can also have, or a ``kernel:verify`` rule leaves out a
+                verify-step row count (``functional.glue.require_rows_tell_phase``).
         """
         super().__init__()
         hc_mult = int(text_config.hc_mult)
@@ -937,20 +938,23 @@ class Glm5NextHyperConnection(nn.Module):
 
         # The step's phase for the glue switch (``VLLM_NEURON_GLUE_FUSED``,
         # functional/glue). This layer sees only ``[T, S, H]`` streams, so it tells
-        # the phases apart by row count. The runner pads a decode batch to one of
-        # ``num_seqs_buckets``, one row per request (its layer carriers refuse a
-        # decode step of more tokens than requests), so a call of more rows than the
-        # largest bucket is a prefill chunk. A prefill bucket that a decode batch can also
-        # have is refused here when the switch routes it by phase. None when the
+        # the phases apart by row count (``functional.glue.phase_of_rows``): the
+        # speculative verify step's rows (each of ``num_seqs_buckets`` times 1 + k), then
+        # a decode batch of up to the largest bucket, then a prefill chunk. A prefill
+        # bucket that a decode batch or the verify step can also have is refused here
+        # when the switch routes it by phase. None when the
         # layer is built without the runner's buckets; then only a rule without a
         # phase selects a kernel here.
         decode_buckets = getattr(neuron_config, "num_seqs_buckets", None)
         self.max_decode_rows = max(decode_buckets) if decode_buckets else None
         self.verify_rows = frozenset()  # the verify step's rows: glue.verify_rows
         if self.max_decode_rows is not None:
-            from vllm_neuron.functional.glue import require_rows_tell_phase, verify_rows
+            from vllm_neuron.functional.glue import (
+                require_rows_tell_phase, verify_draft_k, verify_rows)
 
-            self.verify_rows = verify_rows(decode_buckets)
+            from .mtp import shadow_draft_k
+
+            self.verify_rows = verify_rows(decode_buckets, verify_draft_k(shadow_draft_k()))
             require_rows_tell_phase(
                 ("mhc_pre", "mhc_post"),
                 self.max_decode_rows,

@@ -46,13 +46,13 @@ Phase. The KDA layer passes the step's phase (``is_prefill``) to kda_projections
 kda_output; it calls the verify step decode. An mHC site sees only ``[T, S, H]``
 streams, so its layer (``Glm5NextHyperConnection``) tells the phases apart by row count
 (:func:`phase_of_rows`): the verify step's row counts (:func:`verify_rows`, the decode
-buckets times ``1 + k`` under speculative method "mtp", :func:`speculative_draft_k`) are
-``verify``, other calls of
-up to the largest decode batch its config declares (``neuron_config.num_seqs_buckets``)
-are ``decode``, and larger calls are ``prefill``. At construction it refuses a value that
-the row count cannot follow, or that fuses a kernel at some of the verify step's row
-counts and not at others (:func:`require_rows_tell_phase`). A call whose phase is not
-known (``phase=None``) is selected only by rules without a phase.
+buckets times ``1 + k`` under speculative method "mtp", :func:`verify_draft_k`) are
+``verify``, other calls of up to the largest decode batch its config declares
+(``neuron_config.num_seqs_buckets``) are ``decode``, and larger calls are ``prefill``. At
+construction it refuses a value that the row count cannot follow, or whose
+``kernel:verify`` rule leaves out one of the verify step's row counts
+(:func:`require_rows_tell_phase`). A call whose phase is not known (``phase=None``) is
+selected only by rules without a phase.
 
 Every kernel is also bounded by its own shape rules in its ``*_admits`` predicate,
 whatever the switch selects. A kernel may declare its own row bound (for example
@@ -197,14 +197,15 @@ def glue_selected(kernel: str, tokens: int, phase: str | None = None) -> bool:
     return glue_selection().selects(kernel, tokens, phase)
 
 
-def speculative_draft_k() -> int:
-    """``k`` of the speculative verify step: 0 without speculative method "mtp".
+def verify_draft_k(draft_k: int) -> int:
+    """``k`` of the speculative verify step: ``draft_k`` under speculative method "mtp",
+    otherwise 0.
 
-    ``k`` has one reader, ``mtp.shadow_draft_k`` (contract C1), and this returns that
-    reader's value. Its source is the current vLLM config's speculative config, which the
-    worker sets around ``load_model``, where the layers are built; outside that context
-    there is no config and this is 0. The shadow draft (the knob with no speculative
-    config) does not verify, so it is 0 here too.
+    ``draft_k`` is the model's draft count, from its one reader (``mtp.shadow_draft_k``,
+    contract C1), which the mHC layer passes in. The shadow draft (that knob with no
+    speculative config) runs no verify step, so it is 0 here. The speculative config is
+    the current vLLM config's, which the worker sets around ``load_model``, where the
+    layers are built; outside that context there is none, and this is 0.
     """
     from vllm.config import get_current_vllm_config_or_none
 
@@ -212,29 +213,21 @@ def speculative_draft_k() -> int:
     speculative = None if config is None else config.speculative_config
     if speculative is None or speculative.method != "mtp":
         return 0
-    # The reader lives with the draft head. It is imported at the call so that this
-    # package does not import the model package when it is loaded.
-    from vllm_neuron.model.glm5_next.mtp import shadow_draft_k
-
-    return int(shadow_draft_k())
+    return int(draft_k)
 
 
-def verify_rows(decode_buckets: Iterable[int],
-                draft_k: int | None = None) -> frozenset[int]:
+def verify_rows(decode_buckets: Iterable[int], draft_k: int) -> frozenset[int]:
     """The row counts of the speculative verify step: each decode bucket times ``1 + k``.
 
-    Under speculative method "mtp" the runner pads every decode step of the stack to
-    ``1 + k`` rows per request (``_decode_token_threshold``), so a decode bucket of ``B``
-    requests is a ``B * (1 + k)``-row call at an mHC site. ``draft_k`` None reads ``k``
-    (:func:`speculative_draft_k`). ``k`` 0 (no speculation, or the shadow draft, which
-    does not verify) has no verify step.
+    Under speculative method "mtp" the runner runs a verify step of ``1 + k`` rows per
+    request (``_decode_token_threshold``), so a decode bucket of ``B`` requests is a
+    ``B * (1 + k)``-row call at an mHC site. ``draft_k`` is the verify step's ``k``
+    (:func:`verify_draft_k`); 0 (no speculation, or the shadow draft) has no verify step.
 
     Raises:
-        ValueError: ``draft_k`` is negative, or a bucket is not a positive row count;
-            from ``mtp.shadow_draft_k``, a shadow-draft knob that disagrees with the
-            speculative config.
+        ValueError: ``draft_k`` is negative, or a bucket is not a positive row count.
     """
-    k = speculative_draft_k() if draft_k is None else int(draft_k)
+    k = int(draft_k)
     if k < 0:
         raise ValueError(f"{GLUE_FUSED_ENV}: draft count k={k} is negative; the verify "
                          f"step has 1 + k rows per request, k >= 0")
@@ -251,11 +244,13 @@ def phase_of_rows(rows: int, max_decode_rows: int, verify: Collection[int] = ())
     """The phase a site that sees only the row count gives a call of ``rows`` rows.
 
     A verify-step row count (``verify``, from :func:`verify_rows`) is ``verify``, also
-    where a decode batch can have it: on a speculative server the stack runs no decode
-    step of one row per request, so there such a call is always the verify step, and a
-    draft-head call of that row count takes the verify route too. Otherwise a call of at
-    most ``max_decode_rows`` rows (the largest decode batch) is ``decode``, and a larger
-    one is a ``prefill`` chunk.
+    where a decode step of one row per request has it: a speculative server also runs
+    that graph (the first decode step, a mixed step), and at ``B * (1 + k)`` requests it
+    has the row count of the ``B``-request verify step. The row count cannot tell the two
+    apart, so such a decode batch takes the verify route; the fused kernel and the torch
+    route serve either phase, so this choice changes the route only. Otherwise a call of
+    at most ``max_decode_rows`` rows (the largest decode batch) is ``decode``, and a
+    larger one is a ``prefill`` chunk.
     """
     rows = int(rows)
     if rows in verify:
@@ -302,14 +297,17 @@ def require_rows_tell_phase(kernels: Iterable[str], max_decode_rows: int,
         for kernel in kernels:
             if selection.selects(kernel, rows, "prefill") != selection.selects(
                     kernel, rows, seen_as):
-                like = ("a verify step" if seen_as == "verify" else
+                like = (f"a verify step (verify steps have {sorted(verify)} rows here: "
+                        f"each decode bucket times 1 + k)" if seen_as == "verify" else
                         f"a decode batch (decode batches reach {max_decode_rows} rows "
                         f"here)")
                 raise ValueError(
                     f"{GLUE_FUSED_ENV}={value!r} routes {kernel} at {rows} rows by "
                     f"phase, but at a site that sees only the row count a {rows}-row "
                     f"prefill chunk looks like {like}. Use a value whose {kernel} rules "
-                    f"do not depend on the phase at {rows} rows, for example 0 or all")
+                    f"do not depend on the phase at {rows} rows: for example "
+                    f"{kernel}@{rows} in place of its phase rules there, which fuses "
+                    f"both, or 0, or all")
     for kernel in kernels:
         if not any(rule.kernel == kernel and rule.phase == "verify"
                    for rule in selection.rules):
