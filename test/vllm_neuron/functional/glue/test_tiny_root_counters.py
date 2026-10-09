@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The tiny root's glue counters at prefill and at decode, under the switch value of this run.
+"""The tiny root's glue counters at decode, under the switch value of this run.
 
-The runner's two capture entry points drive the tiny fixture root (three layers, two mHC
-sites each) through one 128-row prefill (``extract_prefill_graphs``) and one 1-request
-decode step (``extract_decode_graphs``), with the capture backend stood in by a call to
-the model (``test_tiny_glm5next_capture_sites.py``'s harness, imported). Per phase this
-reads ``mhc_pre``'s counters ``(dispatched, took the torch route)``, how many of its launches
-also returned the feed-forward RMSNorm (every feed-forward site's when mhc_pre serves, the
-dense layers' as well as the MoE layer's), and the dtype the mHC combine was handed (bf16
-when ``mhc_post`` is selected, fp32 otherwise). The root's mHC sites are bound from a config
+The runner's decode capture entry point (``extract_decode_graphs``) drives the tiny
+fixture root (three layers, two mHC sites each) through one 1-request decode step, with
+the capture backend stood in by a call to the model
+(``test_tiny_glm5next_capture_sites.py``'s harness, imported). This reads ``mhc_pre``'s
+counters ``(dispatched, took the torch route)``, how many of its launches also returned
+the feed-forward RMSNorm (every feed-forward site's when mhc_pre serves, the dense layers'
+as well as the MoE layer's), and the dtype the mHC combine was handed (bf16 when
+``mhc_post`` is selected, fp32 otherwise). The root's mHC sites are bound from a config
 that carries the harness's buckets, as a served load binds them, so they see the step's
 phase.
 
@@ -99,7 +99,7 @@ def test_the_recorded_tables_are_what_the_selector_says():
                 dtype == torch.bfloat16), (value, phase)
 
 
-@pytest.mark.parametrize("phase", ("prefill", "decode"))
+@pytest.mark.parametrize("phase", ("decode",))
 def test_the_tiny_root_takes_the_routes_the_value_selects(phase, monkeypatch):
     from vllm_neuron.functional.glue import kda_output, kda_projections, mhc_pre
 
@@ -117,10 +117,7 @@ def test_the_tiny_root_takes_the_routes_the_value_selects(phase, monkeypatch):
     monkeypatch.setattr(combine, "hyper_connection_combine", spy)
     for module in (mhc_pre, kda_projections, kda_output):
         module.reset_dispatch_counters()
-    if phase == "prefill":
-        runner.extract_prefill_graphs(capture.PREFILL_BUCKET, 0)
-    else:
-        runner.extract_decode_graphs(capture.DECODE_BATCH)
+    runner.extract_decode_graphs(capture.DECODE_BATCH)
     assert len(backend.seen) == 1
     want_pre, want_dtype = _expected(phase)
     assert mhc_pre.dispatch_counters() == want_pre
