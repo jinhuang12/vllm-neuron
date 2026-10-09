@@ -184,8 +184,9 @@ def read_all_counters() -> dict[str, tuple[int, int]]:
     return out
 
 
-def read_route_counts() -> tuple[int, int, int]:
-    """``(ring_dispatch, scores_dispatch, two_program_dispatch)`` since the last reset."""
+def read_route_counts() -> tuple[int, int, int, int]:
+    """``(ring_dispatch, scores_dispatch, two_program_dispatch, select_dispatch)`` since the
+    last reset. The decode selection is one kernel (``decode_select``), counted here."""
     return tuple(int(v) for v in _decode_batch().decode_batch_route_counts())
 
 
@@ -960,11 +961,10 @@ def test_index_share_skips_the_indexer_only_when_set_and_selecting(regime, flag,
     assert fx["prefill"] + DRAFT_K <= bound
     reset_all_counters()
     got = _draft(fx, fx["prefill"], DRAFT_K)
-    ring, scores, _two = read_route_counts()
-    topk = read_all_counters()["topk_select"][0]
-    assert (ring, scores, topk) == want, (
-        f"{regime} flag={flag}: (ring, scores, topk) dispatches over a k={DRAFT_K} draft were "
-        f"{(ring, scores, topk)}, expected {want}"
+    ring, scores, _two, select = read_route_counts()
+    assert (ring, scores, select) == want, (
+        f"{regime} flag={flag}: (ring, scores, select) dispatches over a k={DRAFT_K} draft "
+        f"were {(ring, scores, select)}, expected {want}"
     )
     _k_tokens_per_request(got, 1, DRAFT_K, f"{regime}/{flag}")
     if regime == "selected":
@@ -997,7 +997,7 @@ def test_index_share_carrier_publishes_the_chain_s_selection_and_reuses_it() -> 
     carrier = IndexShare()
     reset_all_counters()
     shared = one_step(fixtures[1], index_share=carrier)
-    assert read_all_counters()["topk_select"][0] == 1, "an empty carrier runs the chain"
+    assert read_route_counts()[3] == 1, "an empty carrier runs the chain"
     assert torch.equal(plain, shared), "no carrier and an empty carrier are byte-identical"
     indices = carrier.topk_indices
     assert indices is not None and indices.dtype == torch.int32 and indices.ndim == 2
@@ -1008,7 +1008,7 @@ def test_index_share_carrier_publishes_the_chain_s_selection_and_reuses_it() -> 
     ), "the stored indices are the ones the chain produced (the block's collector saw them)"
     reset_all_counters()
     reused = one_step(fixtures[2], index_share=IndexShare(topk_indices=indices.clone()))
-    assert read_all_counters()["topk_select"][0] == 0, "a filled carrier skips the chain"
+    assert read_route_counts()[3] == 0, "a filled carrier skips the chain"
     assert torch.equal(reused, plain), "and attends the first iteration's selection"
     wrong = indices.clone()
     wrong[0, 0] = -1
@@ -1066,7 +1066,10 @@ def test_the_route_predicate_holds_over_populate_and_a_k5_draft() -> None:
         fallbacks = {f: v[1] for f, v in readings.items() if v[1] > 0}
         assert not fallbacks, f"[{phase}] a torch fallback ran: {readings}"
     assert draft_readings["decode_batch"][0] >= 2 * DRAFT_K, draft_readings
-    assert draft_readings["topk_select"][0] == DRAFT_K and draft_readings["index_expand"][0] == DRAFT_K
+    # One selection kernel per draft iteration does the top-k, the sentinel, the order and
+    # the expand; the four-kernel route's top-k and expand no longer run on the decode leg.
+    assert read_route_counts()[3] == DRAFT_K
+    assert draft_readings["topk_select"][0] == 0 and draft_readings["index_expand"][0] == 0
 
 
 def test_the_fallback_counter_reads_non_zero_when_a_fallback_is_provoked() -> None:
