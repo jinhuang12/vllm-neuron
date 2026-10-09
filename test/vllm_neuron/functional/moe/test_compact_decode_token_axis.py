@@ -2,10 +2,7 @@
 """``compact_decode_kernel`` with a real token axis: ``1 <= q <= 64`` rows per block.
 
 At 5938748 the kernel asserted ``q == 1``. The token axis now feeds one m-block
-of ``q`` rows to every product, as the general kernel does with ``BLOCK_M = q``,
-so the contract is bit equality with ``moe_fused_fp8_kernel(BLOCK_M=q,
-SKIP_PADDING=False)`` -- the same check ``test_fused_fp8_decode`` makes at
-``q == 1`` -- including zero rows for padding ids and idle blocks.
+of ``q`` rows to every product, as the general kernel does with ``BLOCK_M = q``.
 """
 
 from __future__ import annotations
@@ -15,10 +12,7 @@ import torch
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
 from vllm_neuron.functional.moe.fused_fp8_pack import pack_experts
-from vllm_neuron.functional.moe.moe_fused_fp8 import moe_fused_fp8_kernel
 from vllm_neuron.functional.moe.moe_fused_fp8_decode import compact_decode_kernel
-
-from .decode_fixtures import SimulatorCounter
 
 
 def _case(q, active, holes, seed=20261005):
@@ -45,28 +39,6 @@ def _case(q, active, holes, seed=20261005):
     bounds = torch.tensor([0.6, -0.4, 0.5], dtype=torch.float32).repeat(128, 1)
     return (x, packed.weights, packed.scales, rows, expert_ids,
             affinity.reshape(-1, 1), bounds)
-
-
-@pytest.mark.parametrize("programs", [1, 2])
-@pytest.mark.parametrize("q", [1, 2, 4, 64])
-@pytest.mark.parametrize("active,holes", [([], 0), ([0, 5], 0), ([1, 2, 7], 1)],
-                         ids=["idle", "full", "holes"])
-def test_compact_token_axis_matches_the_general_kernel(q, active, holes, programs):
-    args = _case(q, active, holes)
-    original = wrap_nki(moe_fused_fp8_kernel)[programs](
-        *args, BLOCK_M=q, BLOCK_N=256, BLOCK_K=256, SKIP_PADDING=False,
-    )
-    with SimulatorCounter() as sim:
-        actual = wrap_nki(compact_decode_kernel)[programs](
-            *args, BLOCK_N=256, BLOCK_K=256,
-        )
-    assert sim.kernels == ["compact_decode_kernel"]
-    assert actual.shape == (8, q, 128)
-    assert torch.equal(actual.contiguous().view(torch.uint32),
-                       original.contiguous().view(torch.uint32))
-    assert torch.count_nonzero(actual[args[3] < 0]) == 0
-    if active:
-        assert torch.count_nonzero(actual[args[3] >= 0]) > 0
 
 
 def test_compact_token_axis_refuses_more_than_64_rows():

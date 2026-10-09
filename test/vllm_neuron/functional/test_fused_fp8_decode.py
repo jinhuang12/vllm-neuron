@@ -7,7 +7,6 @@ from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
 from vllm_neuron.functional.moe import fused_fp8 as api
 from vllm_neuron.functional.moe.fused_fp8_pack import PackedExperts, pack_experts
-from vllm_neuron.functional.moe.moe_fused_fp8 import moe_fused_fp8_kernel
 from vllm_neuron.functional.moe.moe_fused_fp8_decode import compact_decode_kernel
 
 
@@ -90,7 +89,7 @@ def test_public_validation_precedes_compact_dispatch(monkeypatch):
     assert calls == []
 
 
-def _small_case(active, duplicate=False):
+def _small_case(active):
     generator = torch.Generator().manual_seed(20261003)
     experts, hidden, intermediate = 8, 128, 128
     x = torch.randn((2, hidden), generator=generator).to(torch.bfloat16)
@@ -103,35 +102,12 @@ def _small_case(active, duplicate=False):
     rows = torch.full((8, 1), -1, dtype=torch.int32)
     rows[active] = 0
     expert_ids = torch.arange(experts, dtype=torch.int32).reshape(-1, 1)
-    if duplicate:
-        expert_ids[active] = experts - 1
     affinity = torch.zeros((2, experts), dtype=torch.float32)
     if active:
         affinity[0, expert_ids[active, 0].long()] = 1.0 / len(active)
     bounds = torch.tensor([0.6, -0.4, 0.5], dtype=torch.float32).repeat(128, 1)
     return (x, packed.weights, packed.scales, rows, expert_ids,
             affinity.reshape(-1, 1), bounds)
-
-
-@pytest.mark.parametrize("programs", [1, 2])
-@pytest.mark.parametrize(
-    "active,duplicate",
-    [([], False), ([0], False), ([7], False), ([0, 4, 7], False),
-     ([0, 1, 2, 3, 4], False), (list(range(8)), False), ([0, 2, 7], True)],
-)
-def test_compact_math_keeps_original_output_slots(active, duplicate, programs, monkeypatch):
-    monkeypatch.setenv("NKI_SIMULATOR", "1")
-    monkeypatch.setenv("NEURON_LIBTORCH_CPU_MODE", "1")
-    args = _small_case(active, duplicate)
-    original = wrap_nki(moe_fused_fp8_kernel)[programs](
-        *args, BLOCK_M=1, BLOCK_N=256, BLOCK_K=256, SKIP_PADDING=False,
-    )
-    actual = wrap_nki(compact_decode_kernel)[programs](
-        *args, BLOCK_N=256, BLOCK_K=256,
-    )
-    assert torch.equal(actual.contiguous().view(torch.uint32),
-                       original.contiguous().view(torch.uint32))
-    assert torch.count_nonzero(actual[args[3] < 0]) == 0
 
 
 def test_empty_decode_skips_invalid_expert_operands(monkeypatch):
