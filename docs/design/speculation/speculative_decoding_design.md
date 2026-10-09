@@ -8,7 +8,7 @@
 
 ### What is Speculative Decoding?
 
-Speculative decoding is a technique for accelerating autoregressive LLM inference without changing the output distribution. The core idea: use a fast, lightweight **draft model** to predict several tokens ahead, then **verify** those predictions in parallel using the full **target model**.
+Speculative decoding is a technique for accelerating autoregressive LLM inference without changing the output distribution (for the GLM-5.3-Flash MTP drafter, greedy identity with the non-speculative run is measured, not guaranteed; see its section below). The core idea: use a fast, lightweight **draft model** to predict several tokens ahead, then **verify** those predictions in parallel using the full **target model**.
 
 In standard autoregressive decoding, the target model generates one token per forward pass. Each pass is memory-bandwidth-bound on accelerators — the model weights must be loaded from HBM for every single token. Speculative decoding amortizes this cost by verifying multiple draft tokens in a single target forward pass.
 
@@ -583,7 +583,7 @@ GLM-5.3-Flash carries its own draft head: the decoder layer past the stack
 (`num_nextn_predict_layers: 1`), built by the root as
 `Glm5NextForConditionalGeneration.mtp` and run inside the root's own forward. There
 is no second model, graph or launch (`vllm_neuron/vllm/spec_decode/mtp.py`): every
-decode step returns the sampled or accepted ids and the `k` ids drafted from the
+decode step returns the sampled or accepted ids and the `k` ids (`K` above) drafted from the
 last accepted row, and the verify step is a `1 + k`-row decode step per request
 whose on-device greedy rejection sampler (`vllm_neuron/nn/rejection_sampler.py`)
 accepts drafts by id equality until the first mismatch.
@@ -608,27 +608,36 @@ Contract of the opt-in (measured on trn2 at TP64/EP16, `k = 3`, 2026-10-09):
   are refused at admission (`vllm_neuron/vllm/admission.py`). Distribution-preserving
   sampling under this drafter is not a served configuration: the on-device rejection
   sampler compares ids, not probabilities.
-* **Greedy output can differ from non-speculative greedy decoding at near-ties.** The
-  `1 + k`-row verify graph and the one-token decode graph do not accumulate in the same
-  order (the MLA decode kernel routes one query row per request to its key-split kernel
-  and `T` rows per request to the general kernel,
-  `vllm_neuron/functional/attention/mla_decode.py::_route`; the DSA indexer advances a
-  ring by one token or by `T` rows through two kernels), so where the target's top two
-  logits are within rounding of each other the two graphs can pick different tokens.
-  Measured: 4 of 8 identity prompts (64 greedy tokens each) diverged from the
-  non-speculative run at tokens 15-41, every divergence a wording or whitespace
-  alternative; GSM8K@200 exact-match 0.99 unchanged; the three measured runs of one
-  prompt are identical to each other (each graph is deterministic). A server whose
-  consumers need token identity with non-speculative greedy decoding should leave the
-  drafter off. Each verify step is lossless by construction -- an accepted draft is
-  the id the target's own argmax returned for that row -- so the divergence is the
-  target's argmax, not the draft. The top-2 logit margin at a divergence cannot be
-  read from a server that samples on device (its sampler returns ids only and refuses
-  `logprobs`), so the tie is shown by the decoded alternatives, not measured; the
-  planned check is a non-speculative replay of the five divergence positions reading
-  the top-2 margins on the host.
+* **Greedy output is not guaranteed identical to non-speculative greedy decoding, and
+  before acbc5b0a it was not identical run to run.** Measured on the gate's r3 server
+  (before that fix): 4 of 8 identity prompts (64 greedy tokens each) diverged from the
+  non-speculative run at tokens 15-41 -- the first differing token a wording or
+  whitespace alternative, the continuations then differ (one prompt reaches different
+  arithmetic) -- GSM8K@200 exact-match 0.99 on both, response text identical for 90 of
+  the 200 documents (the two non-speculative arms: 200 of 200); and one six-run series of
+  the measure prompt produced two outputs, A/B/A/B/A/B, splitting at token 106
+  (`hostrec/measure_D.json`), while the non-speculative arms were 6/6 identical. The
+  run-to-run alternation's measured cause is a dropped write, not a tie: the draft layer
+  wrote its latent rows through a view (`latent_cache[:, 0, :].index_copy_`), which the
+  backend's in-place-to-out-of-place pass does not chain, so on device the verify rows
+  were never stored, the draft iterations attended what the request's pages held before
+  the step, and vLLM's two alternating block sets made consecutive identical requests
+  draft differently. Fixed in acbc5b0a (`model_fp8.py` `attend` / `_attend_requests`
+  write into the bank; pinned by `test/vllm_neuron/worker/test_glm5next_slot_residue.py`).
+  Run-to-run identity and the eight identity prompts are re-measured on the fixed tree by the gate's SLOT 2 replay; `reports/gate_packet_mtpB.md` records the result. Each verify step is lossless by construction -- an accepted draft is the id
+  the target's own argmax returned for that row -- so a divergence from the
+  non-speculative run is the target's argmax picking differently where its top two
+  logits are within rounding of each other; the likeliest carrier, under replay, is the
+  `1 + k`-row verify graph and the one-row decode graph accumulating in different orders
+  (in the dense regime the MLA decode kernel routes one query row per request to its
+  key-split kernel and `T` rows per request to the general kernel,
+  `vllm_neuron/functional/attention/mla_decode.py::_route`; past the selector bound the
+  one-row path is `mla_sparse_attention`). The top-2 logit margin at a divergence cannot
+  be read from a server that samples on device (its sampler returns ids only and refuses
+  `logprobs`), so the margins are not measured. A server whose consumers need token
+  identity with non-speculative greedy decoding should leave the drafter off.
 * **What does not move.** Acceptance on GSM8K@200: conditional per-position rates
-  0.932 / 0.853 / 0.716, mean acceptance length 3.30 tokens per step; the drafter adds
+  0.932 / 0.853 / 0.716, mean acceptance length 3.29 tokens per step; the drafter adds
   about one layer's work to a prefill (measured within the run-to-run spread of TTFT at
   1k tokens); the KV pool and block table are sized for the `1 + k` recurrent blocks a
   drafting request holds (`kv_group_blocks.draft_blocks_per_request`).
