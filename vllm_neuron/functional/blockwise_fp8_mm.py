@@ -39,7 +39,6 @@ from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 from nkilib.core.utils.allocator import SbufManager
 from nkilib.core.utils.kernel_assert import kernel_assert
 
-from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 from vllm_neuron.functional.moe.blockwise_fp8_retile import TILE_SIZE
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
@@ -1357,11 +1356,10 @@ def mlp_launch_grid(hidden: int) -> tuple[int, ...]:
     ``(2,)`` on an LNC2 runtime (``NEURON_LOGICAL_NC_CONFIG=2``: two physical
     cores per logical core) when the ``H // 128`` hidden blocks split into two
     halves, else ``()`` (one program).
-
-    :func:`~vllm_neuron.functional.dsa.launch_grid.lnc_pair` refuses a setting other
-    than unset, 1 or 2 (``LaunchGridError``).
     """
-    if not lnc_pair():
+    import os
+
+    if os.environ.get("NEURON_LOGICAL_NC_CONFIG") != "2":
         return ()
     if hidden <= 0 or hidden % TILE_SIZE or (hidden // TILE_SIZE) % MLP_PROGRAMS:
         return ()

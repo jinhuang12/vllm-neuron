@@ -2,8 +2,12 @@
 """``get_efa_interface`` finds a logical core's Neuron device from ``NEURON_LOGICAL_NC_CONFIG``.
 
 The device index is ``core * setting // PHYSICAL_CORES_PER_DEVICE``, and an unset setting
-means the runtime's default grouping, ``_DEFAULT_LNC_CONFIG``. The device node is never
-opened: ``os.stat`` of ``/dev/neuron*`` is refused here, and the refusal names the path.
+means the runtime's default grouping, ``_DEFAULT_LNC_CONFIG`` (2). That differs from
+:func:`~vllm_neuron.functional.dsa.launch_grid.lnc_pair`, where unset means one program:
+a kernel asks whether it may use both cores of a pair, but the device map needs the
+grouping the runtime applies. So this seam reads ``vllm_neuron.envs`` and not ``lnc_pair``.
+The device node is never opened: ``os.stat`` of ``/dev/neuron*`` is refused here, and the
+refusal names the path.
 """
 
 import os

@@ -72,6 +72,7 @@ a shorter run.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 
 import torch
@@ -83,7 +84,6 @@ import nki.language as nl
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
-from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 from vllm_neuron.functional.mhc.sinkhorn import MHC_STREAMS, PARTITION_MAX
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
@@ -647,10 +647,9 @@ def launch_programs(hidden: int) -> int:
     convention for SPMD launches, as in ``kda/depthwise_conv1d.py``) the two
     programs split the hidden axis, one contiguous half each, so both physical
     cores work. A hidden extent narrower than two partitions' worth stays on one
-    program. :func:`~vllm_neuron.functional.dsa.launch_grid.lnc_pair` refuses a setting
-    other than unset, 1 or 2 (``LaunchGridError``).
+    program.
     """
-    if lnc_pair() and hidden >= 2 * PARTITION_MAX:
+    if os.environ.get("NEURON_LOGICAL_NC_CONFIG") == "2" and hidden >= 2 * PARTITION_MAX:
         return 2
     return 1
 

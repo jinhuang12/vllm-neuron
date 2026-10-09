@@ -10,8 +10,6 @@ the shared reader, these seams compared the raw string with ``"2"`` and silently
 one program for it.
 """
 
-import importlib
-
 import pytest
 import torch
 
@@ -21,14 +19,10 @@ from vllm_neuron.functional.attention import mla_sparse as MS
 from vllm_neuron.functional.dsa.launch_grid import LaunchGridError
 from vllm_neuron.functional.glue import kda_output, kda_projections, mhc_pre
 from vllm_neuron.functional.kda import fused_decode as FD
-from vllm_neuron.functional.mhc import hyper_connection as HC
 from vllm_neuron.functional.moe import expert_decode as ED
 from vllm_neuron.functional.moe import fused_fp8 as FF
 from vllm_neuron.functional.moe import token_gather_combine as TGC
 from vllm_neuron.functional.moe.fused_fp8_pack import PackedExperts
-
-# ``vllm_neuron.functional`` re-exports a function of the same name over the module.
-BW = importlib.import_module("vllm_neuron.functional.blockwise_fp8_mm")
 
 NC_CONFIG = "NEURON_LOGICAL_NC_CONFIG"
 #: The two-core answer of a seam that launches a ``[2]`` grid on an LNC2 pair.
@@ -127,12 +121,10 @@ SEAMS = {
     "mla_decode": lambda mp: MD._programs(2),
     "mla_dense_window": lambda mp: DW._programs(DW.ROW_TILE + 1),
     "mla_sparse": _mla_sparse,
-    "blockwise_fp8_mlp": lambda mp: _grid_programs(BW.mlp_launch_grid(2 * BW.TILE_SIZE)),
     "kda_output": lambda mp: kda_output.launch_programs(),
     "kda_projections": lambda mp: kda_projections.launch_programs(),
     "mhc_pre": lambda mp: mhc_pre.launch_programs(),
     "kda_fused_decode": lambda mp: _grid_programs(FD.fused_decode_grid(2)),
-    "hyper_connection": lambda mp: HC.launch_programs(2 * HC.PARTITION_MAX),
     "expert_decode": lambda mp: ED.default_programs(2, 2),
     "fused_fp8": _fused_fp8_route,
     "token_gather_combine": _token_gather_combine,

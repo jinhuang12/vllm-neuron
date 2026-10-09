@@ -11,9 +11,7 @@ says they may:
 - ``kda``: ``chunked_recurrence`` (the prefill chunk kernels), ``depthwise_conv1d`` and
   ``fused_decode``;
 - ``attention``: ``mla_decode``, ``mla_dense_window`` and ``mla_sparse``;
-- ``blockwise_fp8_mm`` (the small-M fused MLP);
 - ``glue``: ``kda_output``, ``kda_projections`` and ``mhc_pre``;
-- ``mhc``: ``hyper_connection``;
 - ``moe``: ``expert_decode``, ``fused_fp8`` and ``token_gather_combine``.
 
 They read it once per trace and never per step. An ordinary read inside a
