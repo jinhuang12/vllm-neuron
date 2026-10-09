@@ -1,11 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The launch grid of the DSA decode kernels: one program, or both cores of an LNC2 pair.
+"""The launch grid of the LNC-aware kernels: one program, or both cores of an LNC2 pair.
 
 The launcher sets ``NEURON_LOGICAL_NC_CONFIG`` for the runtime and the compiler before the
-worker starts, so the setting is a property of the process. The decode kernels read it
-through :func:`lnc_pair`, once per trace and never per step. An ordinary read inside a
+worker starts, so the setting is a property of the process. These kernel seams in
+``vllm_neuron/functional`` split their work over an LNC2 pair only when :func:`lnc_pair`
+says they may:
+
+- ``dsa``: the decode kernels (``decode_batch``, ``decode_select``), ``kpool_hadamard``
+  and ``score_gemm``;
+- ``kda``: ``chunked_recurrence`` (the prefill chunk kernels), ``depthwise_conv1d`` and
+  ``fused_decode``;
+- ``attention``: ``mla_decode``, ``mla_dense_window`` and ``mla_sparse``;
+- ``blockwise_fp8_mm`` (the small-M fused MLP);
+- ``glue``: ``kda_output``, ``kda_projections`` and ``mhc_pre``;
+- ``mhc``: ``hyper_connection``;
+- ``moe``: ``expert_decode``, ``fused_fp8`` and ``token_gather_combine``.
+
+They read it once per trace and never per step. An ordinary read inside a
 traced function becomes a Dynamo guard, and that guard reads the environment again
-(``vllm_neuron.envs.__getattr__``, then ``os.getenv``) before every decode step.
+(``vllm_neuron.envs.__getattr__``, then ``os.getenv``) before every step.
 :func:`lnc_pair` is folded instead (``torch._dynamo.assume_constant_result``): Dynamo calls
 it while it traces and keeps the answer as a constant of the graph, with no guard. A graph
 keeps the grid of the setting it was traced under; a new setting needs a new trace
