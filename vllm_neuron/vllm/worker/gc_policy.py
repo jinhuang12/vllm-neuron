@@ -35,8 +35,11 @@ With ``off`` the first two points came back; the late point and the barrier stay
 at the level of the launches with the policy. At runtime ``off`` is the same as the
 code removed: the code that stays imports this module (about 90 GC-tracked objects,
 once), reads the knob and logs one line. It changes no threshold, freezes nothing,
-attaches no callback, and adds no barrier or warmup step. So the difference between
-those two launches is launch-to-launch variance, not this code.
+attaches no callback, and adds no barrier or warmup step. So what separates those two
+launches comes from the launch or the host, not from this code. The cost of the
+policy also depends on the host: on a second server of the same type, the tree with
+``freeze_rare_gen2`` on served bs=1 at 19.3 ms (18.9 ms later), the level of the run
+without the code.
 
 The freeze alone (``freeze``) was rejected earlier for a bs=1 cost of the same kind
 (+1.4 ms per step, barrier 0.04 -> 3.05 ms). So the default keeps CPython's GC until
