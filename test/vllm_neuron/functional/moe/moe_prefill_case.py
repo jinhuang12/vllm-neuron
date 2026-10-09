@@ -20,9 +20,11 @@ Collectives are the identity: no process group is initialised, so
 
 Weights. Checkpoint layer 3 (the first MoE layer, the one the served-graph evidence
 names): the mHC leaves, both norm gains, the router weight and its correction bias are
-read from the served checkpoint when it is on this host (as stored), and drawn at the
-same scale otherwise. The expert banks are random fp8 inside +-224 with random block
-grids, at EP rank 0's 18 experts and ``I = 2048 / 4``. The attention module is not
+read, as stored, from the checkpoint ``VLLM_NEURON_GLM5NEXT_CHECKPOINT_DIR`` names
+(``test/vllm_neuron/artifacts.py``). Where that checkpoint is absent the calling test
+skips, naming the path; ``_Source`` draws these leaves at random only when asked to
+(``use_checkpoint=False``). The expert banks are random fp8 inside +-224 with random
+block grids, at EP rank 0's 18 experts and ``I = 2048 / 4``. The attention module is not
 built: the block starts at the attention output.
 """
 
@@ -35,7 +37,8 @@ from types import MethodType, SimpleNamespace
 
 import torch
 
-CHECKPOINT = Path("/home/ubuntu/glm53f-campaign/lane-serve/models/GLM-5.3-Flash-04c4e9e9")
+from test.vllm_neuron import artifacts
+
 CONFIG_FIXTURE = (
     Path(__file__).resolve().parents[2] / "model/glm5_next/fixtures/config.json"
 )
@@ -61,23 +64,32 @@ def quant_config(model):
 
 
 class _Source:
-    """A checkpoint tensor as stored, or a random tensor of that shape."""
+    """A served-checkpoint tensor as stored, or a random tensor of that shape when asked for.
+
+    ``use_checkpoint=True`` (the default) reads the checkpoint
+    ``artifacts.require_checkpoint`` resolves, which skips the calling test, naming the
+    path, when it is absent; a leaf the checkpoint does not hold is a ``KeyError``.
+    ``use_checkpoint=False`` draws every leaf from ``seed`` at ``get``'s ``scale`` and
+    ``offset`` and reads no checkpoint.
+    """
 
     def __init__(self, seed: int, use_checkpoint: bool = True):
         self.gen = torch.Generator().manual_seed(int(seed))
-        index = CHECKPOINT / "model.safetensors.index.json"
-        self.map = (json.loads(index.read_text())["weight_map"]
-                    if use_checkpoint and index.exists() else None)
+        self.root = artifacts.require_checkpoint() if use_checkpoint else None
+        self.map = (None if self.root is None else json.loads(
+            (self.root / artifacts.CHECKPOINT_INDEX).read_text())["weight_map"])
 
     @property
     def real(self) -> bool:
         return self.map is not None
 
     def get(self, key: str, shape, dtype, scale=1.0, offset=0.0):
-        if self.map is not None and key in self.map:
+        if self.map is not None:
+            if key not in self.map:
+                raise KeyError(f"{key} is not in the checkpoint at {self.root}")
             from safetensors import safe_open
 
-            with safe_open(str(CHECKPOINT / self.map[key]), framework="pt") as f:
+            with safe_open(str(self.root / self.map[key]), framework="pt") as f:
                 tensor = f.get_tensor(key).to(dtype)
             if tuple(tensor.shape) != tuple(shape):
                 raise ValueError(f"{key}: checkpoint {tuple(tensor.shape)} != {shape}")

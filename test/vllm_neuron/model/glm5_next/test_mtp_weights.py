@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import struct
 from pathlib import Path
 
@@ -44,17 +43,10 @@ from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
     scale_keys,
 )
 
+from test.vllm_neuron import artifacts
+
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 REAL_CONFIG_PATH = FIXTURES_DIR / "hf-config.json"
-
-#: The published checkpoint on this host; override with ``GLM53F_MODEL_DIR``.
-MODEL_DIR = Path(
-    os.environ.get(
-        "GLM53F_MODEL_DIR",
-        "/home/ubuntu/glm53f-campaign/lane-serve/models/GLM-5.3-Flash-04c4e9e9",
-    )
-)
-INDEX_PATH = MODEL_DIR / "model.safetensors.index.json"
 
 MTP_KNOB = "VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT"
 CKPT_LAYER_PREFIX = "model.language_model.layers."
@@ -77,9 +69,11 @@ HEADER_DTYPES = {
     "F8_E4M3": torch.float8_e4m3fn,
 }
 
-needs_checkpoint = pytest.mark.skipif(
-    not INDEX_PATH.exists(), reason=f"no published checkpoint index at {INDEX_PATH}"
-)
+def checkpoint_root() -> Path:
+    """The served checkpoint ``VLLM_NEURON_GLM5NEXT_CHECKPOINT_DIR`` names
+    (``test/vllm_neuron/artifacts.py``); skips the calling test by name, with the resolved
+    path, where it holds no index."""
+    return artifacts.require_checkpoint()
 
 
 def _read_header(path: Path) -> dict:
@@ -114,8 +108,10 @@ def sibling_layer(real_config) -> int:
 def real_headers(
     draft_layer, sibling_layer
 ) -> dict[str, tuple[torch.dtype, tuple[int, ...]]]:
-    """``{key: (dtype, shape)}`` for every draft-layer and sibling tensor, headers only."""
-    weight_map = json.loads(INDEX_PATH.read_text())["weight_map"]
+    """``{key: (dtype, shape)}`` for every draft-layer and sibling tensor, headers only;
+    skips by name where the served checkpoint is absent."""
+    root = checkpoint_root()
+    weight_map = json.loads((root / artifacts.CHECKPOINT_INDEX).read_text())["weight_map"]
     wanted = {
         key: shard
         for key, shard in weight_map.items()
@@ -124,7 +120,7 @@ def real_headers(
     }
     headers: dict[str, tuple[torch.dtype, tuple[int, ...]]] = {}
     for shard in sorted(set(wanted.values())):
-        for key, entry in _read_header(MODEL_DIR / shard).items():
+        for key, entry in _read_header(root / shard).items():
             if key in wanted:
                 headers[key] = (HEADER_DTYPES[entry["dtype"]], tuple(entry["shape"]))
     assert set(headers) == set(wanted), "a wanted key is missing from its shard header"
@@ -242,7 +238,6 @@ def test_knob_on_builds_the_head_and_maps_every_declared_mtp_parameter(
 # --------------------------------------------------------------------------- #
 
 
-@needs_checkpoint
 def test_every_draft_layer_header_key_is_mapped_as_often_as_the_sibling_maps_its_leaf(
     monkeypatch, real_config, real_headers, draft_layer, sibling_layer
 ) -> None:
@@ -271,7 +266,6 @@ def test_every_draft_layer_header_key_is_mapped_as_often_as_the_sibling_maps_its
         assert count == expected, f"{name}: referenced {count}x, sibling {expected}x"
 
 
-@needs_checkpoint
 def test_every_mtp_parameter_matches_the_header_dtype_and_its_sibling_shard_geometry(
     monkeypatch, real_config, real_headers, draft_layer, sibling_layer
 ) -> None:
