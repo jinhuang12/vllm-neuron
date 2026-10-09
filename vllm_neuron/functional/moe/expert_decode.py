@@ -49,7 +49,6 @@ reaches the other tokens of its items through those products (``0 * NaN``);
 from __future__ import annotations
 
 import hashlib
-import os
 from pathlib import Path
 
 import torch
@@ -60,6 +59,7 @@ import nki.isa as nisa
 import nki.language as nl
 from nkilib.core.utils.kernel_assert import kernel_assert
 
+from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 from .fused_fp8_pack import PackedExperts
@@ -811,8 +811,12 @@ def can_run_expert_decode(hidden_states: Tensor, expert_affinities: Tensor,
 
 
 def default_programs(ni: int, nh: int) -> int:
-    """2 programs (both LNC2 cores) when the runtime is LNC2 and I, H split evenly."""
-    if os.environ.get("NEURON_LOGICAL_NC_CONFIG") == "2" and ni % 2 == 0 and nh % 2 == 0:
+    """2 programs (both LNC2 cores) when the runtime is LNC2 and I, H split evenly.
+
+    :func:`~vllm_neuron.functional.dsa.launch_grid.lnc_pair` refuses a setting other
+    than unset, 1 or 2 (``LaunchGridError``).
+    """
+    if lnc_pair() and ni % 2 == 0 and nh % 2 == 0:
         return 2
     return 1
 

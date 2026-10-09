@@ -19,8 +19,6 @@ two-program grid partitions the token tiles across the two PNCs of one LNC2 core
 
 from __future__ import annotations
 
-import os
-
 import torch
 from torch import Tensor
 
@@ -30,6 +28,7 @@ import nki.language as nl
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
+from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 #: Tokens per tile: the partition count.
@@ -130,7 +129,7 @@ def token_gather_combine(contribution: Tensor, index: Tensor, valid: Tensor) -> 
     if not can_run_token_gather_combine(contribution, index):
         return token_gather_combine_torch(contribution, index, valid)
     call = wrap_nki(token_gather_combine_kernel)
-    if os.environ.get("NEURON_LOGICAL_NC_CONFIG") == "2" and index.shape[0] >= 2 * TOKEN_TILE:
+    if lnc_pair() and index.shape[0] >= 2 * TOKEN_TILE:
         call = call[2]
     return call(
         contribution.contiguous(),

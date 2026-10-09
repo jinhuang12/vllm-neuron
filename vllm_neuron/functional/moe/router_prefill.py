@@ -120,12 +120,12 @@ def prefill_route_admits(hidden_states, router_weights, top_k: int) -> bool:
     return (
         prefill_router_enabled()
         and tokens > DECODE_ROUTE_MAX_TOKENS
-        and int(top_k) == _router_seam.NOAUX_TC_K
+        and int(top_k) == _router_seam.NOAUX_TC_MAX8_WIDTH
         and hidden_states.dtype == torch.bfloat16
         and router_weights.dtype == torch.bfloat16
         and hidden % _H_BLOCK == 0
         and tuple(router_weights.shape) == (hidden, experts)
-        and _router_seam.NOAUX_TC_K <= experts <= _router_seam._NOAUX_TC_F_MAX
+        and _router_seam.NOAUX_TC_MAX8_WIDTH <= experts <= _router_seam._NOAUX_TC_F_MAX
         and can_run_kernel(hidden_states)
     )
 
@@ -257,13 +257,13 @@ def noaux_tc_router_prefill_kernel(
     norm_output = nl.ndarray((t_extent, h_extent), dtype=scaled.dtype,
                              buffer=nl.shared_hbm)
     # The nkilib router's own uncorrected outputs: written, not returned.
-    substrate_index = nl.ndarray((t_extent, _router_seam.NOAUX_TC_K), dtype=nl.int32,
-                                 buffer=nl.shared_hbm)
+    substrate_index = nl.ndarray((t_extent, _router_seam.NOAUX_TC_MAX8_WIDTH),
+                                 dtype=nl.int32, buffer=nl.shared_hbm)
     substrate_affinities = nl.ndarray((t_extent, e_extent), dtype=nl.bfloat16,
                                       buffer=nl.shared_hbm)
     # The corrected outputs.
-    expert_index = nl.ndarray((t_extent, _router_seam.NOAUX_TC_K), dtype=nl.uint32,
-                              buffer=nl.shared_hbm)
+    expert_index = nl.ndarray((t_extent, _router_seam.NOAUX_TC_MAX8_WIDTH),
+                              dtype=nl.uint32, buffer=nl.shared_hbm)
     expert_affinities = nl.ndarray((t_extent, e_extent), dtype=nl.float32,
                                    buffer=nl.shared_hbm)
 
@@ -281,7 +281,7 @@ def noaux_tc_router_prefill_kernel(
         expert_affinities=substrate_affinities,
         expert_index=substrate_index,
         act_fn=RouterActFnType.SIGMOID,
-        k=_router_seam.NOAUX_TC_K,
+        k=_router_seam.NOAUX_TC_MAX8_WIDTH,
         x_hbm_layout=_X_HBM_LAYOUT_FUSED,
         x_sb_layout=XSBLayout_tp102__0,
         router_pre_norm=False,
@@ -314,7 +314,7 @@ def noaux_tc_router_prefill(
     gamma: Tensor,
     router_weights: Tensor,
     correction_bias: Tensor,
-    top_k: int = _router_seam.NOAUX_TC_K,
+    top_k: int = _router_seam.NOAUX_TC_MAX8_WIDTH,
     eps: float = 1e-6,
     norm_topk_prob: bool = True,
     routed_scaling_factor: float = 1.0,

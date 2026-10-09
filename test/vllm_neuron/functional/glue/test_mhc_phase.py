@@ -81,6 +81,22 @@ def test_a_decode_batch_past_a_prefill_row_count_keeps_the_decode_route(monkeypa
     assert _routes(site, cfg, ROWS, monkeypatch) == ((1, 0), torch.bfloat16)
 
 
+#: A chunk between the default's 1024- and 2048-row rules.
+BETWEEN_ROWS = 1536
+
+
+def test_the_default_fuses_the_uncapped_prefill_chunk(monkeypatch):
+    """Under ``1`` (``envs.DEFAULT_GLUE_FUSED_SPEC``) a site on the uncapped line's buckets
+    (decode batches up to ``SERVED_MAX_NUM_SEQS``, 2048-row prefill chunks) takes both
+    fused kernels for a 2048-row chunk: the fused mhc_pre, and the bf16 operands into the
+    combine. A chunk of a row count the default does not name keeps the torch route."""
+    monkeypatch.setenv(glue.GLUE_FUSED_ENV, "1")
+    chunk = glue_case.UNCAPPED_PREFILL_CHUNK
+    site, cfg = _site(_neuron_config(glue_case.SERVED_MAX_NUM_SEQS, prefill=(chunk,)))
+    assert _routes(site, cfg, chunk, monkeypatch) == ((1, 0), torch.bfloat16)
+    assert _routes(site, cfg, BETWEEN_ROWS, monkeypatch) == ((0, 1), torch.float32)
+
+
 def test_without_the_runner_buckets_only_a_rule_without_a_phase_selects(monkeypatch):
     site, cfg = _site(NeuronConfig())
     monkeypatch.setenv(glue.GLUE_FUSED_ENV, PREFILL_ONLY)

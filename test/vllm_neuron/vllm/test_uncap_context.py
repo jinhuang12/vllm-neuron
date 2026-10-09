@@ -15,7 +15,10 @@ runs ``NeuronPlatform.check_and_update_config``) and the real runner constructor
   and still refuse them for the other families;
 * a server with ``max_model_len`` 65,536 or 262,144, chunk 8192 and one segment of
   ``max_model_len`` refuses no prompt below ``max_model_len`` (admission's only length
-  rule is prompt + 1 <= max_model_len), and the runner serves that one segment;
+  rule is prompt + 1 <= max_model_len);
+* the runner serves that one segment while the decode candidate row (``max_model_len``
+  / ``index_kpool``) fits the decode select kernel, and refuses a longer line at start
+  (``DecodeSelectError``, naming ``MAX_DECODE_INDEX_CANDIDATES``);
 * the old cap line (segment 8192 + chunk 8192 at ``max_model_len`` 65,536, a 16,384-token
   window) does not start: the runner names the window and the segment to add.
 """
@@ -32,6 +35,8 @@ import torch
 from vllm.engine.arg_utils import EngineArgs
 from vllm.sampling_params import SamplingParams
 
+from vllm_neuron.functional.dsa import decode_select as DS
+from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
 from vllm_neuron.utils import bucket_utils as BU
 from vllm_neuron.vllm.platform import NeuronPlatform
 from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
@@ -42,12 +47,24 @@ pytestmark = [pytest.mark.fast]
 
 KNOB = "VLLM_NEURON_GLM5NEXT_ON_DEVICE_SAMPLING"
 SERVED_BLOCK = 128
-CHUNK = 8192
+#: The largest segment the segmented attention kernel takes, the old cap.
+OLD_SEGMENT_MAX = max(BU.SUPPORTED_KV_SEGMENT_SIZES)
+#: A chunk as wide as the old cap, so ``2 * CHUNK + 1`` tokens is past the old window.
+CHUNK = OLD_SEGMENT_MAX
 LONG_LINES = (65536, 262144)
+#: Tokens per decode candidate pool, GLM-5.3-Flash's.
+POOL = Glm5NextTextConfig().index_kpool
+#: The long lines whose decode candidate row fits the decode select kernel, and the rest.
+STARTED_LINES = tuple(n for n in LONG_LINES if n // POOL <= DS.MAX_DECODE_INDEX_CANDIDATES)
+REFUSED_LINES = tuple(n for n in LONG_LINES if n not in STARTED_LINES)
 
 
 def _long_line(max_model_len: int) -> dict:
-    """The serve line of reports/uncap.md: bs=1, chunk 8192, one segment of max_model_len."""
+    """A long line: bs=1, chunk ``CHUNK``, one segment of ``max_model_len``.
+
+    The GLM-5.3-Flash long-context lines were served at TP 64 in this form: max_model_len
+    65,536 at chunk 2048, and max_model_len 262,144 at chunk 512. Each had one KV segment
+    and a mamba block size of max_model_len."""
     return dict(
         max_model_len=max_model_len,
         max_num_seqs=1,
@@ -150,7 +167,7 @@ def test_a_long_line_refuses_no_prompt_below_max_model_len(served_model_dir, mon
             {"type": "token", "prompt_token_ids": [11] * max_model_len}, greedy)
 
 
-@pytest.mark.parametrize("max_model_len", LONG_LINES)
+@pytest.mark.parametrize("max_model_len", STARTED_LINES)
 def test_the_runner_builds_a_long_line_with_one_segment_of_max_model_len(
         served_model_dir, monkeypatch, tmp_path, max_model_len):
     monkeypatch.setenv(KNOB, "1")
@@ -164,16 +181,36 @@ def test_the_runner_builds_a_long_line_with_one_segment_of_max_model_len(
         [max_model_len], [CHUNK], SERVED_BLOCK) >= max_model_len
 
 
-def test_the_old_cap_line_does_not_start(served_model_dir, monkeypatch, tmp_path):
-    """Segment 8192 + chunk 8192 at max_model_len 65536 is a 16,384-token window: the
-    runner refuses the line at startup and names the segment to add, so no server serves
-    a window below max_model_len."""
+@pytest.mark.parametrize("max_model_len", REFUSED_LINES)
+def test_the_runner_refuses_a_line_past_the_decode_select_kernel(
+        served_model_dir, monkeypatch, tmp_path, max_model_len):
+    """Admission accepts the line (its only length rule is prompt + 1 <= max_model_len),
+    but its decode candidate row is wider than the decode select kernel takes, so the
+    runner refuses it at start and names the bound."""
     monkeypatch.setenv(KNOB, "1")
-    line = _long_line(65536)
-    line["neuron_config"] = dict(line["neuron_config"], kv_segment_size_buckets=[8192])
+    config = _serve(served_model_dir, _long_line(max_model_len))
+    assert NeuronPlatform._admission.prompt.tokens == max_model_len - 1
+    with fr._parallel_state(tmp_path, config), pytest.raises(
+            DS.DecodeSelectError, match="MAX_DECODE_INDEX_CANDIDATES"):
+        NeuronModelRunner(config, device=torch.device("cpu"))
+
+
+def test_the_old_cap_line_does_not_start(served_model_dir, monkeypatch, tmp_path):
+    """The old largest segment + one chunk at max_model_len 65,536: its window of
+    segment + chunk tokens is below max_model_len, so the runner refuses the line at
+    startup and names the segment to add. No server serves a window below max_model_len."""
+    monkeypatch.setenv(KNOB, "1")
+    max_model_len = LONG_LINES[0]
+    line = _long_line(max_model_len)
+    line["neuron_config"] = dict(line["neuron_config"],
+                                 kv_segment_size_buckets=[OLD_SEGMENT_MAX])
     config = _serve(served_model_dir, line)
     with fr._parallel_state(tmp_path, config), pytest.raises(ValueError) as refused:
         NeuronModelRunner(config, device=torch.device("cpu"))
     message = str(refused.value)
-    assert "16384" in message and "65536" in message, message
-    assert "at least 57344 tokens" in message, message
+    # The window rule: largest segment + largest query bucket, rounded up to whole pages.
+    window = SERVED_BLOCK * -(-(OLD_SEGMENT_MAX + CHUNK) // SERVED_BLOCK)
+    assert window < max_model_len
+    assert f"prefill window of {window} tokens" in message, message
+    assert f"max_model_len={max_model_len}" in message, message
+    assert f"at least {max_model_len - CHUNK} tokens" in message, message

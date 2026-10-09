@@ -7,7 +7,8 @@ This module provides centralized environment variable management for vLLM Neuron
 All environment variables are:
 - Lazily evaluated when accessed
 - Type-safe with proper validation
-- Prefixed with VLLM_NEURON_ for namespace isolation
+- Prefixed with VLLM_NEURON_ for namespace isolation, except the Neuron SDK
+  settings vLLM Neuron reads, which keep the SDK's own names
 """
 
 import functools
@@ -87,13 +88,15 @@ if TYPE_CHECKING:
     # Build the GLM-5.3-Flash step's attention metadata on the host only: no per-step
     # block-table / slot-mapping uploads that its graph never reads.
     VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA: bool = False
+    # Neuron SDK settings read here (the runtime and the compiler own them).
+    NEURON_LOGICAL_NC_CONFIG: Optional[int] = None
     # Where the GLM-5.3-Flash shadow draft (MTP stage A) writes its per-step scoring
     # records (JSONL, rank 0). Empty = no log, no scoring.
     VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG: str = ""
     # Worker GC policy after warmup (vllm_neuron/vllm/worker/gc_policy.py):
-    # "off" (CPython's GC), "freeze_rare_gen2" (freeze + gen-2 threshold 100000), or
-    # "freeze".
-    VLLM_NEURON_GC_POLICY: str = "off"
+    # "rare_gen2" (gen-2 threshold 100000, no freeze), "off" (CPython's GC),
+    # "freeze_rare_gen2" (freeze + gen-2 threshold 100000), or "freeze".
+    VLLM_NEURON_GC_POLICY: str = "rare_gen2"
     # GLM-5.3-Flash row-parallel all-reduce. Both defaults are the as-built path.
     # The dtype a row-parallel partial crosses the wire in: "fp32" or "bf16".
     VLLM_NEURON_TP_ALLREDUCE_DTYPE: str = "fp32"
@@ -215,7 +218,8 @@ DEFAULT_DEVICE_GRAPH_RESERVE_GIB = 5.0
 #: (``test/hardware/benchmark_glue_block.py``) measured a win. It runs one
 #: GLM-5.3-Flash KDA + MoE layer per graph at one TP=64 rank's shapes on trn2, and
 #: compares each value with ``0``; ``reports/glue.md`` (round 2, the in-graph A/B
-#: section) and ``reports/glue-c.md`` have the tables. Per layer:
+#: section), ``reports/glue-c.md`` and ``reports/glue_spec_2048.md`` have the tables.
+#: Per layer:
 #:
 #: * ``mhc_pre:prefill@128`` and ``mhc_pre:prefill@1024``: the fused mHC pre-mix and
 #:   collapse at both mHC sites, with the feed-forward RMSNorm at the feed-forward
@@ -226,6 +230,10 @@ DEFAULT_DEVICE_GRAPH_RESERVE_GIB = 5.0
 #:   45.2 us faster at 128 rows and 275.0 us faster on a 16.0 ms 1024-row layer, but
 #:   197.1 us slower on a 9.07 ms 512-row layer. So the default names the measured
 #:   buckets, not a range, and a row count that was not measured keeps the torch route.
+#: * ``mhc_pre:prefill@2048`` and ``mhc_post:prefill@2048``: both kernels at the
+#:   2048-row chunk of the uncapped prefill line, measured together (at ab4f37f, not
+#:   each alone): 995.5 us faster on a 9.80 ms 2048-row layer, faster in each of 5
+#:   rounds by 989 to 1003 us.
 #:
 #: Two loads of one graph have measured up to 11 us apart, so a gain of 11 us or less
 #: is not a win. kda_projections was 7.1 us faster at 128 rows, and 0.3 us slower when
@@ -239,7 +247,8 @@ DEFAULT_DEVICE_GRAPH_RESERVE_GIB = 5.0
 #: ``python test/hardware/benchmark_glue_block.py --output <json> --cases
 #: kda:prefill:<rows> --variants off aa=0 <kernel> default``.
 DEFAULT_GLUE_FUSED_SPEC = (
-    "mhc_pre:prefill@128,mhc_pre:prefill@1024,mhc_post:prefill@128,mhc_post:prefill@1024")
+    "mhc_pre:prefill@128,mhc_pre:prefill@1024,mhc_pre:prefill@2048,"
+    "mhc_post:prefill@128,mhc_post:prefill@1024,mhc_post:prefill@2048")
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
@@ -458,18 +467,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
         maybe_convert_bool(os.getenv("VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA"))
         or False
     ),
+    # ================== Neuron SDK ==================
+    # Physical NeuronCores per logical core (trn2: 1 or 2), set by the launcher for
+    # the runtime and the compiler. A kernel that splits its work over an LNC2 pair
+    # launches a grid of two programs only when this is 2. Unset: None, and such
+    # kernels launch one program.
+    "NEURON_LOGICAL_NC_CONFIG": lambda: maybe_convert_int(
+        os.getenv("NEURON_LOGICAL_NC_CONFIG")
+    ),
     # JSONL path for the GLM-5.3-Flash shadow-draft scoring records (MTP stage A);
     # empty = no log. Read with VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT (the draft count).
     "VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG": lambda: (
         os.getenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG", "") or ""
     ),
-    # GC policy each worker applies once after warmup. "off" (the default) keeps
-    # CPython's default GC: the freezing policies made every bs=1 decode step slower
-    # on TP=64 (gc_policy.py). "freeze_rare_gen2" freezes the heap and raises only
-    # the gen-2 threshold, so bs=64 decode has no full-pass stalls, at that bs=1
-    # cost; "freeze" is the freeze alone. Any other value is refused when the policy
-    # is applied.
-    "VLLM_NEURON_GC_POLICY": lambda: os.getenv("VLLM_NEURON_GC_POLICY", "off"),
+    # GC policy each worker applies once after warmup. "rare_gen2" (the default)
+    # raises only the gen-2 threshold, so bs=64 decode has no full-pass stalls, and
+    # neither collects nor freezes: the freezing policies made every bs=1 decode step
+    # slower on TP=64 (gc_policy.py). "off" keeps CPython's default GC;
+    # "freeze_rare_gen2" freezes, then raises, at that bs=1 cost; "freeze" is the
+    # freeze alone. Any other value is refused when the policy is applied.
+    "VLLM_NEURON_GC_POLICY": lambda: os.getenv("VLLM_NEURON_GC_POLICY", "rare_gen2"),
     # ================== GLM-5.3-Flash Row-Parallel All-Reduce ==================
     # The wire dtype of the tensor-parallel all-reduce at GLM-5.3-Flash's
     # row-parallel sites (``model/glm5_next/collective_policy.py``). "fp32" (the

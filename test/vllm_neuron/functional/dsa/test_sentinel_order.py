@@ -148,6 +148,16 @@ def test_an_int64_input_takes_the_torch_path_and_still_orders_correctly():
     assert torch.equal(got, _reference_order(pool_ids))
 
 
+def test_the_ceiling_width_takes_the_kernel_and_one_column_more_the_torch_path():
+    """``SEARCH_MAX_FREE`` columns run the kernel and one more column falls back; both are exact."""
+    for k, dispatch in ((SEARCH_MAX_FREE, (1, 0)), (SEARCH_MAX_FREE + 1, (0, 1))):
+        reset_sentinel_order_dispatch_counters()
+        pool_ids = dict(_patterns(4, k))["mixed"]
+        got = _ordering(pool_ids)
+        assert sentinel_order_dispatch_counters() == dispatch, k
+        assert torch.equal(got, _reference_order(pool_ids)), k
+
+
 def test_the_kernel_receives_pool_ids_as_stored(monkeypatch):
     """At the kernel boundary the one operand is ``pool_ids`` itself, uncopied and untransposed."""
     seen = _capture(monkeypatch, seam_mod)

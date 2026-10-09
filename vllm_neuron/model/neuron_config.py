@@ -205,7 +205,10 @@ class NeuronConfig:
     _model_supports_independent_prefill_buckets: bool = False
     # Whether the model reads a prefill chunk's prior KV through a gathered window
     # rather than the segmented attention kernel, so any segment size is served.
-    # Resolved by the platform from the model class, as the flag above.
+    # Resolved by the platform from the model class's ``supports_windowed_prefill``
+    # hook, as the flag above, and overwriting any caller value. Read by the model
+    # runner, which passes it as ``windowed_prefill=`` to the segment, chunk and
+    # prefill-window checks in ``bucket_utils``.
     _model_supports_windowed_prefill: bool = False
 
     @classmethod

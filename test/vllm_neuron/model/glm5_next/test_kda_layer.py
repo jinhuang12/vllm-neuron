@@ -41,10 +41,11 @@ DECLARED_GATE_LOWER_BOUND = -5.0
 #: Per-rank head count at that degree: the block's ``H = 1``.
 DECLARED_PER_RANK_HEADS = 1
 
-#: The chunk width the layer resolves for itself, and the reason it is 8: the
-#: intra-chunk seam needs a power of two, and both chunked seams refuse a
-#: chunk-local cumulative gate above 60, which a gate bounded by -5 reaches at
-#: 12 tokens. 8 is the largest power of two below that.
+#: The chunk width these cases pass to the layer. The layer resolves 16 for
+#: itself: the intra-chunk seam needs a power of two, and both chunked seams
+#: refuse a chunk-local cumulative gate above ``GATE_CUMSUM_ABS_LIMIT``, which a
+#: gate bounded by -5 passes at 17 tokens. 8 is passed explicitly so that the
+#: prefill case below still holds two whole chunks and a one-token remainder.
 DECLARED_CHUNK = 8
 
 #: 2 whole chunks and a one-token remainder. Every seam is entered once per

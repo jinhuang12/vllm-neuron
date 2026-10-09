@@ -24,7 +24,12 @@ image-baseline nkilib and the vendored source for the symbols used here.
 
 SYNC: when the on-device rotational kernel lands in the consumed nkilib image,
 this subpackage should be deleted and ``functional/topk.py`` reverted to import
-``rotational_topk`` from ``nkilib.core.topk.rotational_topk``.
+``rotational_topk`` from ``nkilib.core.topk.rotational_topk``. The vendored copy
+carries a local patch (its gathers write columns their sources do not occupy:
+per-tile ``indices`` columns in the rotational core, ``index_buf`` halves in
+``sort``; see ``test_rotational_topk_gather_alias.py``), so dropping this
+subpackage requires nkilib's kernel to give the same guarantee, or that test to
+be pointed at nkilib's kernel.
 """
 
 from .rotational_topk import rotational_topk
