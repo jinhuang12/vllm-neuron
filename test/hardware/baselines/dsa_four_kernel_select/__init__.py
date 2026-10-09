@@ -62,7 +62,7 @@ SOURCES: dict[str, tuple[str, str]] = {
                   "6d21beaea7f956cd4db27d1d22d6a8bd647de774"),
 }
 
-PACKAGE = "dsa_0a08ff4_snapshot"
+PACKAGE = "dsa_four_kernel_select_snapshot"
 
 #: Live module paths the snapshot's own copies replace inside every snapshot file. Each
 #: is a full dotted module path, so no rewrite is a prefix of a module this change keeps
@@ -96,7 +96,7 @@ def load() -> types.SimpleNamespace:
     global _LOADED
     if _LOADED is not None:
         return _LOADED
-    where = pathlib.Path(tempfile.mkdtemp(prefix="dsa_0a08ff4_"))
+    where = pathlib.Path(tempfile.mkdtemp(prefix="dsa_four_kernel_select_"))
     package = where / PACKAGE
     (package / "rotational_topk").mkdir(parents=True)
     (package / "__init__.py").write_text('"""Commit 0a08ff4, read by git show."""\n')

@@ -7105,7 +7105,7 @@ class Glm5NextMLAAttention(nn.Module):
                 state_slots,
                 seq_lens,
                 position,
-                max_seq_len=bound if dense else int(max_seq_len),
+                max_seq_len=bound,
                 indices_wanted=not dense,
                 projected=projected,
             )

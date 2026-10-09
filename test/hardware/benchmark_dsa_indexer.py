@@ -7,7 +7,7 @@ Two subcommands.
 selects none). For each ``B:ctx`` case (default ``1:8192 4:8192 64:8192 64:2051``) it
 builds ``--layers`` (default 11, the model's DSA layer count) layers of operands at the
 per-rank TP=64 indexer shape (32 heads of 128, ``index_topk`` 2048, ``index_kpool`` 4)
-and times, for ``before`` (0a08ff4, ``test/hardware/baselines/dsa_0a08ff4``) and
+and times, for ``before`` (0a08ff4, ``test/hardware/baselines/dsa_four_kernel_select``) and
 ``after`` (this tree):
 
 * ``chain`` -- the decode indexer chain as ``Glm5NextMLAAttention._forward_requests``

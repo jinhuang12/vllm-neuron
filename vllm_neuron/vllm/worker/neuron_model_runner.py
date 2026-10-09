@@ -701,6 +701,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             self.vocab_size = hf_config.vocab_size
         self.max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.max_model_len = vllm_config.model_config.max_model_len
+        # The DSA decode indexer serves up to its verified selection width; refuse a
+        # longer max_model_len here, before any graph compiles.
+        from vllm_neuron.functional.dsa.decode_select import check_decode_index_context
+        check_decode_index_context(
+            self.max_model_len,
+            getattr(getattr(hf_config, "text_config", hf_config), "index_kpool", None),
+        )
 
         # Initialize persistent batch and request tracking
         # Use provided device or default to neuron:0

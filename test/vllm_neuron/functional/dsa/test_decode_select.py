@@ -31,8 +31,8 @@ import functools
 import pytest
 import torch
 
-from test.hardware.baselines.dsa_0a08ff4 import chain as chain_0a08ff4
-from test.hardware.baselines.dsa_0a08ff4 import load as load_0a08ff4
+from test.hardware.baselines.dsa_four_kernel_select import chain as chain_0a08ff4
+from test.hardware.baselines.dsa_four_kernel_select import load as load_0a08ff4
 from test.vllm_neuron.functional.dsa.dsa_decode_case import decode_config
 from vllm_neuron.functional.dsa import decode_batch as DB
 from vllm_neuron.functional.dsa import decode_select as DS
