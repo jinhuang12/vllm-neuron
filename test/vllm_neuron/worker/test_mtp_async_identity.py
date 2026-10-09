@@ -191,7 +191,8 @@ def _generate_async_to_the_limit(runner, req: str, prompt: list[int], *, finishe
     schedules one-row steps, so vLLM's own trim (``num_new = min(1 + k, max_model_len - 1 -
     num_computed)``) never shortens a step. The request is held while no row fits until its
     output lands (``scheduler.py:504``); the handed count is pulled back one step late as in
-    ``_generate_async``. Returns ``(ids, steps, widths, async steps, sync fallbacks)``.
+    ``_generate_async``. Returns ``(ids, steps, widths, async steps, sync fallbacks, the
+    indices of the steps the runner counted as fallbacks)``.
     """
     groups = fr._groups(runner)
     blocks = list(range(spec.FIRST_BLOCK, spec.FIRST_BLOCK + -(-len(prompt) // spec.PAGE)))
@@ -202,6 +203,7 @@ def _generate_async_to_the_limit(runner, req: str, prompt: list[int], *, finishe
     disabled = handed > safe
     generated: list[int] = []
     widths: list[int] = []
+    fallback_steps: list[int] = []
     steps = 0
     async_before, sync_before = runner._async_steps, runner._sync_fallback_steps
     while True:
@@ -221,7 +223,10 @@ def _generate_async_to_the_limit(runner, req: str, prompt: list[int], *, finishe
         needed = -(-(handed + rows) // spec.PAGE)
         new = list(range(spec.FIRST_BLOCK + len(blocks), spec.FIRST_BLOCK + needed))
         blocks += new
+        fallbacks_before = runner._sync_fallback_steps
         _, output = fr._step(runner, spec._decode(req, handed, len(generated), groups, drafts, new))
+        if runner._sync_fallback_steps != fallbacks_before:
+            fallback_steps.append(steps)
         steps += 1
         widths.append(rows)
         handed += rows
@@ -236,18 +241,21 @@ def _generate_async_to_the_limit(runner, req: str, prompt: list[int], *, finishe
     return (
         generated, steps, widths,
         runner._async_steps - async_before, runner._sync_fallback_steps - sync_before,
+        fallback_steps,
     )
 
 
 def test_the_async_drafter_reaches_the_context_limit_with_the_synchronous_drafters_ids(tmp_path, monkeypatch):
     """The last steps of a request are the scheduler's, not the drafter's: under async
-    scheduling the proposal is never consulted, the served scheduler switches the request to
-    one-row steps near ``max_model_len`` on its own, and that transition step must take its
-    input id from the carried future (its prefix, ``_glm5next_async_prefix``) -- not the
-    generic fallback, which reads the future back and reconciles the handed start the
-    correction then pulls back a second time. The ids to the last position are the
-    synchronous drafter's, which stops proposing early (``_spec_decode_limit``) and ends in
-    one-row steps too."""
+    scheduling the proposal is never consulted and the served scheduler switches the request
+    to one-row steps near ``max_model_len`` on its own. The first one-row step is the generic
+    spec-to-non-spec transition (``_prepare_model_input``): the device-side last accepted
+    token is its input and the previous step's output is read on the host, which the
+    generic accounting counts as one sync fallback -- exactly one, at that step; every other
+    step stays on the async path, and the correction pulls the handed start back at the
+    carry's own width throughout. The ids to the last position are the synchronous
+    drafter's, which stops proposing early (``_spec_decode_limit``) and ends in one-row
+    steps too."""
     e2e._require_cpu_mode()
     fr._declaring_a_sampler(monkeypatch)
     prompt = spec._prompts()[LIMIT_PROMPT]
@@ -266,12 +274,15 @@ def test_the_async_drafter_reaches_the_context_limit_with_the_synchronous_drafte
     with fr._parallel_state(tmp_path / "async", _async_config(K)):
         root, _ = spec._root()
         runner = spec._runner(_async_config(K), root)
-        ids, steps, widths, async_steps, fallbacks = _generate_async_to_the_limit(
+        ids, steps, widths, async_steps, fallbacks, fallback_steps = _generate_async_to_the_limit(
             runner, "async-limit", prompt, finished=set()
         )
     assert ids == control, (ids, control)
     # Verify steps, then the sticky transition to one-row steps, nothing in between.
     assert widths[0] == T and widths[-1] == 1 and set(widths) == {1, T}, widths
     assert widths == sorted(widths, reverse=True), widths
-    assert fallbacks == 0 and async_steps == steps, (async_steps, fallbacks, steps)
-    print("limit steps (sync, async, widths):", control_steps, steps, widths)
+    # One generic transition step, the first one-row one; the rest on the async path.
+    transition = widths.index(1)
+    assert fallback_steps == [transition], (fallback_steps, transition, widths)
+    assert fallbacks == 1 and async_steps == steps - 1, (async_steps, fallbacks, steps)
+    print("limit steps (sync, async, widths, transition):", control_steps, steps, widths, transition)

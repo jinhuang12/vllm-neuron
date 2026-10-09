@@ -8312,19 +8312,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 if (
                     drafts_only_future is not None
                     and drafts_only_future.ndim == 2
-                    and spec_decode_metadata.draft_token_ids.shape[0] % drafts_only_future.shape[0] == 0
-                    and self._glm5next_async_drafter()
-                ):
-                    # A step the scheduler clipped: its ``w - 1`` drafts are the carried
-                    # drafts' prefix (``_glm5next_async_prefix``).
-                    drafts_only_future = self._glm5next_async_prefix(
-                        drafts_only_future,
-                        spec_decode_metadata.draft_token_ids.shape[0] // drafts_only_future.shape[0],
-                        name="drafts",
-                    )
-                if (
-                    drafts_only_future is not None
-                    and drafts_only_future.ndim == 2
                     and drafts_only_future.numel()
                     == spec_decode_metadata.draft_token_ids.shape[0]
                 ):
@@ -8857,18 +8844,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         future = self.async_execution_buffer["futures_sampled_token_ids"]
         draft_future = self.async_execution_buffer.get("futures_draft_token_ids")
-        if (
-            draft_future is not None
-            and draft_future.ndim == 2
-            and input_ids.shape[0] % draft_future.shape[0] == 0
-            and self._glm5next_async_drafter()
-        ):
-            # The async drafter at the context limit: the scheduler clipped this step to
-            # fewer rows than the carried future has columns (``_glm5next_async_prefix``).
-            draft_future = self._glm5next_async_prefix(
-                draft_future, input_ids.shape[0] // draft_future.shape[0], name="next input ids"
-            )
-
         assembled = self._try_assemble_spec_input_ids(input_ids, draft_future)
         if assembled is not None:
             self._async_steps += 1
@@ -11092,38 +11067,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         drafter = self.drafter
         return isinstance(drafter, MtpProposer) and bool(drafter.async_steps)
 
-    def _glm5next_async_prefix(self, future: torch.Tensor, columns: int, *, name: str) -> torch.Tensor:
-        """The carried future at this step's width: whole, or its first ``columns`` per request.
-
-        vLLM's async scheduler re-arms ``k`` placeholders every step whatever the runner
-        proposes (``async_scheduler.py:23-25,44``) and clips the last steps of a request to
-        ``max_model_len`` itself (``scheduler.py:474-479``), so a step of ``w < 1 + k`` rows
-        arrives with a ``[rows, 1 + k]`` next-input future and ``[rows, k]`` drafts carried
-        from the previous step. The step takes their first ``w`` and ``w - 1`` columns: for
-        one request (the async drafter's contract) that prefix is a contiguous view of the
-        future -- no copy, no launch, the generic swap's ``view(-1)`` applies -- and nothing
-        is read back. A prefix that is not contiguous (more than one request) or a step
-        wider than the carry is refused by name.
-        """
-        width = int(future.shape[1])
-        if columns == width:
-            return future
-        if columns < 1 or columns > width:
-            raise ValueError(
-                f"this step takes {columns} column(s) of {name} per request and the carried "
-                f"future has {width}; a step is never wider than the carry (the scheduler "
-                f"schedules at most 1 + k rows) and never empty"
-            )
-        prefix = future[:, :columns]
-        if not prefix.is_contiguous():
-            raise ValueError(
-                f"the first {columns} of {width} {name} columns are not one contiguous row: "
-                f"the future holds {int(future.shape[0])} request rows and the async drafter "
-                f"serves one request (``MtpProposer`` refuses max_num_seqs > 1), whose prefix "
-                f"is a view; a copy here would be a device launch the step does not budget"
-            )
-        return prefix
-
     def _glm5next_async_settle(self, sampled_token_ids) -> None:
         """The async drafter's state hook: take the step's output on device into the carry.
 
@@ -11371,10 +11314,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         the ``[rows, k]`` drafts are set aside for that step's rejection sampler
         (``_futures_drafts_only``). A partial prefill chunk (``scheduler_output`` says
         whether this chunk is the prompt's last) proposes nothing. Near ``max_model_len``
-        the proposal is still the tensor: vLLM's async scheduler never consults it (it
-        re-arms ``k`` placeholders every step, ``async_scheduler.py:23-25,44``) and clips
-        the last steps itself (``scheduler.py:474-479``); the clipped step takes the
-        future's prefix (``_glm5next_async_prefix``).
+        the proposal is still the tensor: the served async scheduler
+        (``NeuronAsyncScheduler._update_after_schedule``, ``vllm/core/scheduler.py``) never
+        consults it -- it re-arms ``k`` placeholders every step until the request's count
+        passes ``max_model_len - 3 - 2k``, then schedules one-row steps for good. The
+        first one-row step is the generic spec-to-non-spec transition
+        (``_prepare_model_input``): the previous step's output is read on the host --
+        the read a finishing request makes anyway -- and the device-side
+        ``futures_last_accepted_token`` is its input id, counted as a sync fallback by
+        the generic accounting; the one-row steps after it reuse the sampler's ``[rows]``
+        future (``_try_reuse_nonspec_future``). The correction pulls the handed start
+        back at the carry's own width on each of them (``_glm5next_async_correction``).
 
         Returns:
             ``num_reqs`` lists of ``k`` or 0 ints; under the async drafter the
@@ -11412,7 +11362,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         return MtpProposer.take_drafts(drafts[:num_reqs].cpu())
 
     def _glm5next_propose_drafts_async(self, record: dict, num_reqs: int, scheduler_output):
-        """The async drafter's proposal: the carry's next input ids, or nothing (see above)."""
+        """The async drafter's proposal: the carry's ``[rows, 1 + k]`` next input ids on every
+        decode step and after a complete prefill; nothing for a partial prefill chunk
+        (``_glm5next_propose_drafts`` above)."""
         carry = self._glm5next_async_carry
         if carry is None:
             raise ValueError(

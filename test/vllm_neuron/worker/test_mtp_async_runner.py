@@ -268,56 +268,6 @@ def test_near_max_model_len_the_proposal_is_still_the_carrys_tensor(no_commit, p
         assert runner._futures_drafts_only is drafts, start
 
 
-def _swapping_runner(proposer, *, next_ids, drafts_only, sampled):
-    """A runner at the generic input-id swap with the previous step's futures buffered."""
-    runner = _async_runner(proposer, record=_record(width=T), drafts=drafts_only)
-    runner.async_execution_buffer = {
-        "futures_sampled_token_ids": sampled, "futures_draft_token_ids": next_ids,
-        "futures_drafts_only": drafts_only, "prev_req_ids_ordered": [REQ],
-    }
-    runner._batch_composition_changed = False
-    runner._transition_bonus_tensor = None
-    runner._is_decode = lambda: True
-    runner._async_steps = runner._sync_fallback_steps = 0
-    _bind(runner, "_maybe_swap_async_input_ids", "_try_assemble_spec_input_ids",
-          "_try_reuse_nonspec_future", "_glm5next_async_prefix")
-    return runner
-
-
-def test_a_step_narrower_than_the_carry_takes_the_futures_first_ids(no_commit, proposer):
-    """At the context limit the async scheduler clips a step to ``w < 1 + k`` rows
-    (``scheduler.py:474-479``; no proposal can stop it, the placeholders are re-armed every
-    step). The swap takes the first ``w`` ids of the carried ``[rows, 1 + k]`` future -- the
-    contiguous prefix of one request's row: no copy, no launch -- and counts an async step,
-    never the host-built fallback that would read the future back; a full step takes it whole."""
-    next_ids = torch.tensor([[5, 7, 8, 9]], dtype=torch.int32)
-    runner = _swapping_runner(proposer, next_ids=next_ids, drafts_only=next_ids[:, 1:].clone(),
-                              sampled=torch.tensor([[5, -1, -1, -1]], dtype=torch.int32))
-    for width in (T, 3, 2, 1):
-        runner._async_steps = runner._sync_fallback_steps = 0
-        swapped = runner._maybe_swap_async_input_ids(torch.full((width,), -1, dtype=torch.int32))
-        assert swapped.tolist() == [5, 7, 8, 9][:width], width
-        assert swapped.data_ptr() == next_ids.data_ptr(), "a view of the future, not a copy"
-        assert (runner._async_steps, runner._sync_fallback_steps) == (1, 0), width
-
-
-def test_the_carried_futures_prefix_is_one_requests_contiguous_row(no_commit, proposer):
-    """``_glm5next_async_prefix`` hands a future through whole at its own width, the prefix
-    view when the step is narrower, and refuses by name a step wider than the carry or a
-    prefix that is not contiguous (more than one request: the async drafter serves one)."""
-    runner = _async_runner(proposer, record=_record(width=T), drafts=None)
-    _bind(runner, "_glm5next_async_prefix")
-    drafts = torch.tensor([[7, 8, 9]], dtype=torch.int32)
-    assert runner._glm5next_async_prefix(drafts, K, name="drafts") is drafts
-    narrowed = runner._glm5next_async_prefix(drafts, 1, name="drafts")
-    assert narrowed.tolist() == [[7]] and narrowed.is_contiguous()
-    assert narrowed.data_ptr() == drafts.data_ptr()
-    with pytest.raises(ValueError, match="wider"):
-        runner._glm5next_async_prefix(drafts, K + 1, name="drafts")
-    with pytest.raises(ValueError, match="one request"):
-        runner._glm5next_async_prefix(torch.zeros((2, K), dtype=torch.int32), 1, name="drafts")
-
-
 def test_a_synthetic_step_proposes_nothing(no_commit, proposer):
     runner = _async_runner(proposer, record=None, drafts=None)
     assert runner._glm5next_propose_drafts(None, None) == [[]]
