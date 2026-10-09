@@ -31,15 +31,19 @@ barrier of a captured step, which is where the time went (device compute was
 * that tree with the policy's code removed (1 launch): 19.6 (19.6 / 18.7), barrier
   1.95.
 
-``off`` removes most of the cost at the first point. Its late points and barrier
-are still above the run without the code; one launch does not separate launch
-variance from a cost of the remaining code, which does nothing per step with
-``off``. The freeze alone (``freeze``) was rejected earlier for a bs=1 cost of the
-same kind (+1.4 ms per step, barrier 0.04 -> 3.05 ms). So the default keeps
-CPython's GC until a policy that removes the bs=64 stalls passes its own bs=1
-measurement. The trade: with ``off``, bs=64 decode has its full-pass stalls again
-(3.8-6 s each, several per 120 steps); ``VLLM_NEURON_GC_POLICY=freeze_rare_gen2``
-removes them and has the bs=1 cost above.
+With ``off`` the first two points came back; the late point and the barrier stayed
+at the level of the launches with the policy. At runtime ``off`` is the same as the
+code removed: the code that stays imports this module (about 90 GC-tracked objects,
+once), reads the knob and logs one line. It changes no threshold, freezes nothing,
+attaches no callback, and adds no barrier or warmup step. So the difference between
+those two launches is launch-to-launch variance, not this code.
+
+The freeze alone (``freeze``) was rejected earlier for a bs=1 cost of the same kind
+(+1.4 ms per step, barrier 0.04 -> 3.05 ms). So the default keeps CPython's GC until
+a policy that removes the bs=64 stalls passes its own bs=1 measurement. The trade:
+with ``off``, bs=64 decode has its full-pass stalls again (3.8-6 s each, several per
+120 steps); ``VLLM_NEURON_GC_POLICY=freeze_rare_gen2`` removes them and has the bs=1
+cost above.
 
 Policies (``VLLM_NEURON_GC_POLICY``)
 ------------------------------------
