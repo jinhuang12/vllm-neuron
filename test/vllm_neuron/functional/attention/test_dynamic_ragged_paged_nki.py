@@ -66,7 +66,7 @@ def _logical_cache(key_pages, value_pages, table, req, length):
     v = []
     for idx in table[req, :blocks].tolist():
         assert idx >= 0
-        k.append(key_pages[idx].permute(1, 2, 0))   # [head, page, dim]
+        k.append(key_pages[idx].permute(0, 2, 1))   # [head, page, dim]
         v.append(value_pages[idx])
     if not k:
         return None, None
