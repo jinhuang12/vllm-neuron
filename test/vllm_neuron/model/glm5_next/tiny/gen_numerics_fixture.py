@@ -22,12 +22,11 @@ head pins the argmax, so they are not evidence.
 Producing command (from the base worktree, so both ``vllm_neuron`` and the test helpers
 resolve to the base tree; this file is the only one read from the new tree)::
 
-    cd /home/ubuntu/glm53f-wt2/hostpath-base && NKI_SIMULATOR=1 VLLM_NEURON_CPU_MODE=1 \\
+    cd <base worktree> && NKI_SIMULATOR=1 VLLM_NEURON_CPU_MODE=1 \\
         NEURON_PLATFORM_TARGET_OVERRIDE=trn2 OMP_NUM_THREADS=4 \\
-        PYTHONPATH=/home/ubuntu/glm53f-wt2/hostpath-base \\
-        /home/ubuntu/glm53f-campaign/venv/bin/python \\
-        /home/ubuntu/glm53f-wt2/hostpath/test/vllm_neuron/model/glm5_next/tiny/gen_numerics_fixture.py \\
-        --out /home/ubuntu/glm53f-wt2/hostpath/test/vllm_neuron/model/glm5_next/tiny/fixtures/numerics_0a08ff4.json
+        PYTHONPATH=<base worktree> <venv>/bin/python \\
+        <worktree>/test/vllm_neuron/model/glm5_next/tiny/gen_numerics_fixture.py \\
+        --out <worktree>/test/vllm_neuron/model/glm5_next/tiny/fixtures/numerics_0a08ff4.json
 """
 
 from __future__ import annotations

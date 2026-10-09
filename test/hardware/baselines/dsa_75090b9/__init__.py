@@ -1,29 +1,33 @@
 # SPDX-License-Identifier: Apache-2.0
 """The DSA/MLA decode code exactly as commit 75090b9 (wt/dsa) shipped it, beside HEAD.
 
-:func:`load` reads each file below with ``git show 75090b9:<path>``, checks it against
-the pinned blob id, rewrites the attention-kernel imports to point at the snapshot's own
-copies, and imports the result from a temporary directory outside the worktree. Every
-other import (configs, loaders, the DSA kernels) resolves to the live tree, where this
-change adds ``decode_batch.py`` and edits none of them.
+The three files beside this one are byte copies of ``git show 75090b9:<path>`` for the
+paths in :data:`SOURCES`. :func:`load` checks each copy against the pinned git blob id
+(computed from the bytes, as ``git hash-object`` does, so neither the 75090b9 object
+nor a ``.git`` directory is needed), rewrites the attention-kernel imports to point at
+the snapshot's own copies, and imports the result from a temporary directory outside the
+worktree. Every other import (configs, loaders, the DSA kernels) resolves to the live
+tree, where this change adds ``decode_batch.py`` and edits none of them.
 
-The snapshot is read rather than committed so the baseline is the commit itself and not
-a hand-made copy of it; the blob ids make a silently different baseline impossible. The
-layout is ``dsa_5938748``'s.
+75090b9 is not an ancestor of the integration branch (it lives on wt/dsa and the
+``baseline-dsa-75090b9`` tag), so the copies are committed: a clone of the branch alone,
+or an exported tree, holds the baseline. The blob ids make a silently different baseline
+impossible. The layout is ``dsa_5938748``'s.
 """
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import pathlib
-import subprocess
 import sys
 import tempfile
 import types
 
 COMMIT = "75090b9"
 
-#: module name -> (repository path, git blob id at :data:`COMMIT`).
+#: module name -> (repository path, git blob id at :data:`COMMIT`). The byte copy of
+#: each is ``<module name>.py`` beside this file.
 SOURCES: dict[str, tuple[str, str]] = {
     "mla_sparse": ("vllm_neuron/functional/attention/mla_sparse.py",
                    "1dd9443bb66c5966483ef7a35335488cb87a87ea"),
@@ -40,16 +44,13 @@ _REWRITES = {
 }
 
 PACKAGE = "dsa_75090b9_snapshot"
+HERE = pathlib.Path(__file__).resolve().parent
 _LOADED: types.SimpleNamespace | None = None
 
 
-def _repo_root() -> pathlib.Path:
-    return pathlib.Path(__file__).resolve().parents[4]
-
-
-def _git(*args: str) -> str:
-    return subprocess.run(["git", "-C", str(_repo_root()), *args], check=True,
-                          capture_output=True, text=True).stdout
+def _blob_id(data: bytes) -> str:
+    """The git blob id of ``data``: sha1 over ``blob <size>\\0`` and the bytes."""
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
 
 
 def load() -> types.SimpleNamespace:
@@ -63,12 +64,14 @@ def load() -> types.SimpleNamespace:
     where = pathlib.Path(tempfile.mkdtemp(prefix="dsa_75090b9_"))
     package = where / PACKAGE
     package.mkdir()
-    (package / "__init__.py").write_text('"""Commit 75090b9, read by git show."""\n')
+    (package / "__init__.py").write_text('"""Commit 75090b9, from the committed copies."""\n')
     for name, (path, blob) in SOURCES.items():
-        found = _git("rev-parse", f"{COMMIT}:{path}").strip()
+        copy = HERE / f"{name}.py"
+        data = copy.read_bytes()
+        found = _blob_id(data)
         if found != blob:
-            raise RuntimeError(f"{COMMIT}:{path} is blob {found}, pinned {blob}")
-        text = _git("show", f"{COMMIT}:{path}")
+            raise RuntimeError(f"{copy} is blob {found}, not {COMMIT}:{path} ({blob})")
+        text = data.decode()
         for live, local in _REWRITES.items():
             text = text.replace(live, f"{PACKAGE}.{local}")
         (package / f"{name}.py").write_text(text)

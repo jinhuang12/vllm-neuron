@@ -3,10 +3,9 @@
 
 Run through the device lease on slice ``host`` (one trn2 chip, 4 logical cores):
 
-    PATH=/home/ubuntu/glm53f-campaign/venv/bin:$PATH \\
-    NEURON_LIBTORCH_CACHE_ROOT=/home/ubuntu/glm53f-wt2/hostpath-cache-r3 \\
-    python3 /home/ubuntu/glm53f-wt/devlease.py slice host -- \\
-        /home/ubuntu/glm53f-campaign/venv/bin/python test/hardware/bank_input_contiguity.py \\
+    PATH=<venv>/bin:$PATH NEURON_LIBTORCH_CACHE_ROOT=<compile cache> \\
+    python3 <devlease.py> slice host -- \\
+        <venv>/bin/python test/hardware/bank_input_contiguity.py \\
         --tree <worktree> --json <out> --form both --batches 2 64
 
 The gate's bs=64-line server failed its first bank-form decode warmup (b2/s2048) in

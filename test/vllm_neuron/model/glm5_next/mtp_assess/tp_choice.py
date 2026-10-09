@@ -29,8 +29,8 @@ MiB, so the measured 654 us per draft iteration is latency, not bandwidth, and i
 Usage::
 
     python -m test.vllm_neuron.model.glm5_next.mtp_assess.tp_choice \
-        --bytes /home/ubuntu/glm53f-wt2/reports/mtp-logs/checkpoint_bytes_by_class.json \
-        --output /home/ubuntu/glm53f-wt2/reports/mtp-logs/tp_choice.json
+        --bytes <reports>/mtp-logs/checkpoint_bytes_by_class.json \
+        --output <reports>/mtp-logs/tp_choice.json
 """
 
 from __future__ import annotations

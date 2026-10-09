@@ -33,8 +33,7 @@ executor runs each worker.
 
     NKI_SIMULATOR=1 VLLM_NEURON_CPU_MODE=1 OMP_NUM_THREADS=4 PYTHONPATH=$PWD \\
         python test/perf/host_slot_reset_bs64.py \\
-        --json /home/ubuntu/glm53f-wt2/reports/slotreset_harness.json \\
-        --base-tree /home/ubuntu/glm53f-wt2/slotreset-base
+        --json <reports>/slotreset_harness.json --base-tree <3098da3 worktree>
 """
 
 from __future__ import annotations
@@ -345,7 +344,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--json", type=pathlib.Path, required=False)
     parser.add_argument("--base-tree", type=pathlib.Path,
-                        default=pathlib.Path("/home/ubuntu/glm53f-wt2/slotreset-base"))
+                        help="read-only worktree of the base revision; needed for --trees base")
     parser.add_argument("--samples", type=int, default=24)
     parser.add_argument("--trees", nargs="+", default=["base", "head"])
     parser.add_argument("--child")
@@ -356,8 +355,12 @@ def main() -> int:
     if args.samples < 20:
         parser.error("--samples must be at least 20")
 
+    if "base" in args.trees and args.base_tree is None:
+        parser.error("--trees base needs --base-tree")
     script = pathlib.Path(__file__).resolve()
-    trees = {"base": args.base_tree.resolve(), "head": script.parents[2]}
+    trees = {"head": script.parents[2]}
+    if args.base_tree is not None:
+        trees["base"] = args.base_tree.resolve()
     revs = {name: subprocess.run(["git", "-C", str(path), "rev-parse", "--short", "HEAD"],
                                  check=True, capture_output=True, text=True).stdout.strip()
             for name, path in trees.items() if name in args.trees}

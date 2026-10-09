@@ -10,14 +10,14 @@ elsewhere; with the squeeze off it is bitwise the checkpoint's.
 
 Three readings, all through the weight map the model builds and the loaders it picks: a
 synthetic weight and grid written under one sparse-attention leaf's real checkpoint keys,
-the same pair with the squeeze off, and, when ``GLM53F_CHECKPOINT_DIR`` names a
-checkpoint, that leaf out of the checkpoint itself.
+the same pair with the squeeze off, and that leaf out of the served checkpoint itself
+(``VLLM_NEURON_GLM5NEXT_CHECKPOINT_DIR``, through ``test/vllm_neuron/artifacts.py``;
+skipped by name where it is absent).
 """
 
 from __future__ import annotations
 
 import json
-import os
 import pathlib
 from typing import NamedTuple
 
@@ -26,6 +26,7 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
+from test.vllm_neuron import artifacts
 from vllm_neuron.model.glm5_next import weight_loaders_fp8 as loaders
 from vllm_neuron.model.glm5_next.config import Glm5NextConfig
 
@@ -175,18 +176,16 @@ def test_without_the_squeeze_the_loaded_pair_is_the_checkpoint_value(synthetic, 
 def test_the_real_leaf_dequantises_to_its_checkpoint_value_under_the_squeeze(monkeypatch):
     """The checkpoint's own leaf through the same route, under the same bound.
 
-    Skipped unless ``GLM53F_CHECKPOINT_DIR`` names a checkpoint on disk.
+    Skips, naming the resolved path, where the served checkpoint is absent; the
+    synthetic readings stand alone there.
     """
-    checkpoint = os.environ.get("GLM53F_CHECKPOINT_DIR")
-    if not checkpoint:
-        pytest.skip(
-            "GLM53F_CHECKPOINT_DIR names no checkpoint; the synthetic readings stand alone"
-        )
+    checkpoint = artifacts.require_checkpoint()
     monkeypatch.setattr(loaders, "needs_240_downscale", lambda: True)
-    mapping = _mapping(pathlib.Path(checkpoint))
+    mapping = _mapping(checkpoint)
     _, weight_keys, _, _ = _entries(mapping)
-    shard = json.load(open(os.path.join(checkpoint, "model.safetensors.index.json")))["weight_map"][weight_keys[0]]
-    with safe_open(os.path.join(checkpoint, shard), "pt") as handle:
+    index = json.loads((checkpoint / artifacts.CHECKPOINT_INDEX).read_text())
+    shard = index["weight_map"][weight_keys[0]]
+    with safe_open(str(checkpoint / shard), "pt") as handle:
         reading = _read(handle, mapping, "checkpoint")
     ok, row = _within_one_quantum(reading)
     assert ok, f"{reading.message}; {row}"

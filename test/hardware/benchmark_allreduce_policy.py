@@ -10,7 +10,7 @@ Run the device stage ONLY through the device lease. The lease pins the cores
 (``NEURON_RT_VISIBLE_CORES``) and sets LNC2; this script refuses to time without the
 pinned cores and does not select cores itself::
 
-    python3 /home/ubuntu/glm53f-wt/devlease.py slice spare2 -- timeout 900 \\
+    python3 <devlease.py> slice spare2 -- timeout 900 \\
         /opt/aws_neuronx_venv_pytorch_inference_vllm_0_24_0_1_1_0/bin/python \\
         test/hardware/benchmark_allreduce_policy.py --output-dir <records dir>
 
