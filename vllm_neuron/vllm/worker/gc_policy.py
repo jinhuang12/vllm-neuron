@@ -36,8 +36,11 @@ The default, ``rare_gen2``, sets only ``threshold2`` to :data:`GEN2_THRESHOLD`. 
 full pass then needs that many gen-1 passes: about one per 100 k bs=64 steps (4-6 h
 of continuous bs=64 decode), none in practice at bs=1. Gen-0/1 thresholds do not
 change, so those passes still collect the per-step cyclic garbage. It does not call
-``freeze_gc_heap()``, the one call at the end of warmup that the bs=1 cost above
-follows: at bs=1 a worker ran ~20 gen-0 passes and one gen-1 pass in a whole launch
+``freeze_gc_heap()``. On this host the early bs=1 cost above followed that one call
+at the end of warmup: the three launches without it served the first point at
+19.3-20.1 ms, the three with it at 22.4-24.8 ms. The later points and the barrier
+vary between launches (below). The decode steps do the same GC work either way: at
+bs=1 a worker ran ~20 gen-0 passes and one gen-1 pass in a whole launch
 (``VLLM_GC_DEBUG``), and on CPU (``test/perf/gc_step_cost.py``) a decode step makes
 the same collections, callbacks and host calls with and without the call. A freeze
 only shortens full passes, and with ``threshold2`` raised there are none to shorten.
