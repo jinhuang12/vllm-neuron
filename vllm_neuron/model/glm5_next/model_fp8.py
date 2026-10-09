@@ -5787,14 +5787,19 @@ class Glm5NextDSAIndexer(nn.Module):
         The stores arrive in one of two forms:
 
         * whole banks and a slot per request: ``pool_bank`` ``[slots, rows,
-          index_head_dim]``, ``tail_bank`` ``[slots, 2, depth, index_head_dim]``,
-          ``slots`` ``[B]`` int, distinct. Written in place on the banks.
-        * the runner's carrier: ``pool_bank`` and ``tail_bank`` are tuples of one view
-          per request (``[rows, index_head_dim]`` and ``[2, depth, index_head_dim]``,
-          disjoint, which the runner guarantees, padding rows included) and ``slots``
-          is None. The kernels read a bank, so ``B > 1`` views are stacked (one read of
-          each store) and ``B = 1`` is its view with a leading axis (no copy); the
-          writes land in each view, the forms the one-request leg writes with.
+          index_head_dim]``, or the same store flat, ``[slots * rows, index_head_dim]``
+          (the runner's bank form; the slot count is then read off ``tail_bank``),
+          ``tail_bank`` ``[slots, 2, depth, index_head_dim]``, ``slots`` ``[B]`` int,
+          distinct. Written in place on the banks. A graph that runs this more than
+          once on one store (the MTP draft layer: ``populate``, then its draft
+          iterations) keeps every write only with the flat store; see the write.
+        * the runner's per-request carrier: ``pool_bank`` and ``tail_bank`` are tuples
+          of one view per request (``[rows, index_head_dim]`` and ``[2, depth,
+          index_head_dim]``, disjoint, which the runner guarantees, padding rows
+          included) and ``slots`` is None. The kernels read a bank, so ``B > 1`` views
+          are stacked (one read of each store) and ``B = 1`` is its view with a leading
+          axis (no copy); the writes land in each view, the forms the one-request leg
+          writes with.
 
         ``depth`` is the ring's rows: ``index_kpool`` for a config that decodes one
         token per step, and ``decode_tail_update.ring_depth_for(index_kpool, 1 + k)``
@@ -5835,6 +5840,7 @@ class Glm5NextDSAIndexer(nn.Module):
         pool, dim = self.index_kpool, self.index_head_dim
         total = int(hidden_states.shape[0])
         views = isinstance(pool_bank, (tuple, list))
+        pool_flat = None
         if views:
             pool_views, tail_views = tuple(pool_bank), tuple(tail_bank)
             batch = len(pool_views)
@@ -5855,6 +5861,22 @@ class Glm5NextDSAIndexer(nn.Module):
                     f"slots must be a [B] tensor, one slot per request; got {slots!r}"
                 )
             batch = int(slots.shape[0])
+            if torch.is_tensor(pool_bank) and pool_bank.ndim == 2:
+                # The flat store: the kernels read it as [slots, rows, dim], one ring
+                # per store slot giving the slot count.
+                stores = (int(tail_bank.shape[0])
+                          if torch.is_tensor(tail_bank) and tail_bank.ndim == 4 else 0)
+                if (stores < 1 or int(pool_bank.shape[0]) % stores
+                        or int(pool_bank.shape[1]) != dim):
+                    tail_shape = (tuple(tail_bank.shape) if torch.is_tensor(tail_bank)
+                                  else repr(tail_bank))
+                    raise Glm5NextDSAIndexerError(
+                        f"a flat pool_bank must be [slots * rows, {dim}] beside a "
+                        f"[slots, 2, depth, {dim}] tail_bank; got pool_bank "
+                        f"{tuple(pool_bank.shape)} and tail_bank {tail_shape}"
+                    )
+                pool_flat = pool_bank
+                pool_bank = pool_flat.view(stores, -1, dim)
         if total < batch or total % batch:
             raise Glm5NextDSAIndexerError(
                 f"hidden_states must hold a whole number of rows per request: {total} "
@@ -5978,9 +6000,18 @@ class Glm5NextDSAIndexer(nn.Module):
             # device compiler's access-conflict pass did not take at B = 4.
             tail_bank.index_copy_(0, slots.to(torch.int64), rings.to(tail_bank.dtype))
             store_rows = int(pool_bank.shape[1])
-            pool_bank.view(-1, dim).index_copy_(
-                0, slot_index * store_rows + row, pooled.to(pool_bank.dtype)
-            )
+            destinations = slot_index * store_rows + row
+            if pool_flat is not None:
+                # On the flat store itself, the graph input: the backend's in-place pass
+                # moves every later use of a write's own target onto its result, so the
+                # next run on this store in the graph reads this write and keeps it.
+                pool_flat.index_copy_(0, destinations, pooled.to(pool_flat.dtype))
+            else:
+                # Through a view made for this write, which nothing after it sees: the
+                # bank keeps only the graph's last write (one write per graph is fine).
+                pool_bank.view(-1, dim).index_copy_(
+                    0, destinations, pooled.to(pool_bank.dtype)
+                )
         if bounded is None:
             if not indices_wanted:
                 return None
