@@ -619,7 +619,13 @@ Contract of the opt-in (measured on trn2 at TP64/EP16, `k = 3`, 2026-10-09):
   alternative; GSM8K@200 exact-match 0.99 unchanged; the three measured runs of one
   prompt are identical to each other (each graph is deterministic). A server whose
   consumers need token identity with non-speculative greedy decoding should leave the
-  drafter off.
+  drafter off. Each verify step is lossless by construction -- an accepted draft is
+  the id the target's own argmax returned for that row -- so the divergence is the
+  target's argmax, not the draft. The top-2 logit margin at a divergence cannot be
+  read from a server that samples on device (its sampler returns ids only and refuses
+  `logprobs`), so the tie is shown by the decoded alternatives, not measured; the
+  planned check is a non-speculative replay of the five divergence positions reading
+  the top-2 margins on the host.
 * **What does not move.** Acceptance on GSM8K@200: conditional per-position rates
   0.932 / 0.853 / 0.716, mean acceptance length 3.30 tokens per step; the drafter adds
   about one layer's work to a prefill (measured within the run-to-run spread of TTFT at

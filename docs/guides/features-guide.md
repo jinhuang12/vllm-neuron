@@ -604,8 +604,10 @@ served greedy only (sampling knobs are refused at admission) and its greedy outp
 can differ from non-speculative greedy decoding at near-ties, because the
 `1 + k`-row verify graph and the one-token decode graph accumulate in different
 orders (measured: 4 of 8 identity prompts diverged on wording or whitespace
-alternatives; GSM8K@200 exact-match 0.99 unchanged). Leave it off where token
-identity with non-speculative decoding is required. Details:
+alternatives; GSM8K@200 exact-match 0.99 unchanged; each step is lossless by id
+equality, and an on-device-sampling server returns no logprobs with which to read
+the margins). Leave it off where token identity with non-speculative decoding is
+required. Details:
 [`docs/design/speculation/speculative_decoding_design.md`](../design/speculation/speculative_decoding_design.md#glm-53-flash-mtp-drafter-method-mtp).
 
 ### On-device vs CPU sampling
