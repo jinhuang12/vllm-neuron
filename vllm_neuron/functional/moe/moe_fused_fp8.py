@@ -26,7 +26,7 @@ _CHUNK_ROWS = 64
 # Scalar Engine's queue: the split moves about 1 TB/s of 4-panel weight DMAs
 # per core (MEASURED). Row ids, row gathers and the output scatter use the
 # GpSimd engine's software descriptors, the only ones that take a per-row
-# index.
+# index, so padding rows move nothing.
 _HWDGE = nisa.dge_mode.hwdge
 _SWDGE = nisa.dge_mode.swdge
 _DMA_QUEUE = nisa.engine.sync
@@ -387,44 +387,53 @@ def _list_end(sbm, routed, item_experts, items, slots):
 
 
 def _gather_buffers(sbm, width, experts):
-    """SBUF of one chunk's gather: ``(ids, bump, resolved, starts, affinities, routing)``.
+    """SBUF of one chunk's gather: ``(ids, bump, resolved, starts, affinities, routing, target)``.
 
-    ``routing`` takes the rows' routing weights.
+    ``routing`` takes the rows' routing weights and ``target`` their output rows.
     """
     ids, bump = _tile(sbm, width, 1, nl.int32), _tile(sbm, width, 1, nl.int32)
     resolved, starts = _tile(sbm, width, 1, nl.int32), _tile(sbm, width, 1, nl.int32)
     affinities = sbm.alloc_stack((width, max(experts, 8)), dtype=nl.float32)
-    return ids, bump, resolved, starts, affinities, _tile(sbm, width, 1)
+    return (ids, bump, resolved, starts, affinities, _tile(sbm, width, 1),
+            _tile(sbm, width, 1, nl.int32))
 
 
-def _gather_rows(compute, item, rows, gather):
+def _gather_rows(compute, item, base, rows, gather):
     """Gather the hidden rows of ``item`` into ``rows`` and their affinities into ``gather``.
 
-    ``item`` is a dynamic offset, ``rows`` BF16 [width, H] and ``gather``
-    _gather_buffers; _down reads the routing weights from its affinities. An
-    invalid id (-1) moves to the last hidden row, which is zero, and its zero
-    affinities, so its output row is zero. The GpSimd engine runs every step.
+    ``item`` is a dynamic offset, ``base`` the int32 [width, 1] output rows of
+    the item's store (_store_bases), ``rows`` BF16 [width, H] and ``gather``
+    _gather_buffers; _down reads the routing weights from its affinities and
+    stores to its targets. An invalid id (-1) moves one past the last hidden
+    row, and its target past the last output row, so its gathers and its store
+    are skipped and its row of ``rows`` keeps stale data. The GpSimd engine
+    runs every step.
     """
-    hidden, row_ids, affinity = compute[0], compute[1], compute[2]
+    hidden, row_ids, affinity, out = compute[0], compute[1], compute[2], compute[4]
     tokens, h = hidden.shape
     width = rows.shape[0]
     experts = affinity.shape[0] // tokens
     ids, bump, resolved, starts = gather[0], gather[1], gather[2], gather[3]
-    affinities = gather[4]
+    affinities, target = gather[4], gather[6]
     nisa.dma_copy(dst=ids, src=row_ids.ap(pattern=[[1, width], [1, 1]], scalar_offset=item,
                                           indirect_dim=0), dge_mode=_SWDGE)
     nisa.tensor_scalar(dst=bump, data=ids, op0=nl.less, operand0=0, op1=nl.multiply,
-                       operand1=tokens, engine=nisa.engine.gpsimd)
+                       operand1=tokens + 1, engine=nisa.engine.gpsimd)
     nisa.tensor_tensor(dst=resolved, data1=ids, data2=bump, op=nl.add,
                        engine=nisa.engine.gpsimd)
     nisa.dma_copy(dst=rows, src=hidden.ap(pattern=[[h, width], [1, h]], vector_offset=resolved,
-                                          indirect_dim=0), dge_mode=_SWDGE)
+                                          indirect_dim=0), oob_mode=nisa.oob_mode.skip,
+                  dge_mode=_SWDGE)
     nisa.tensor_scalar(dst=starts, data=resolved, op0=nl.multiply, operand0=experts,
                        engine=nisa.engine.gpsimd)
     # Each row's affinities for every expert; the expert's column is a dynamic read.
     nisa.dma_copy(dst=affinities[:, :experts], src=affinity.ap(
         pattern=[[1, width], [1, experts]], vector_offset=starts, indirect_dim=0),
-        dge_mode=_SWDGE)
+        oob_mode=nisa.oob_mode.skip, dge_mode=_SWDGE)
+    nisa.tensor_scalar(dst=target, data=ids, op0=nl.less, operand0=0, op1=nl.multiply,
+                       operand1=out.shape[0], engine=nisa.engine.gpsimd)
+    nisa.tensor_tensor(dst=target, data1=target, data2=base, op=nl.add,
+                       engine=nisa.engine.gpsimd)
 
 
 def _interleave(nh):
@@ -551,11 +560,10 @@ def _gate_up_last(compute, slot, turns, accumulators):
     _swiglu(gated, temps, accumulators[2 * ni - 1], clamp, ni - 1)
 
 
-def _down(compute, slot, gather, expert, base, turns, result, width):
-    """Down products of ``slot``'s SwiGLU output into ``result``; store its rows to ``base``.
+def _down(compute, slot, gather, expert, turns, result, width):
+    """Down products of ``slot``'s SwiGLU output into ``result``; store its routed rows.
 
-    ``gather`` is the chunk's _gather_buffers, ``expert`` a dynamic offset and
-    ``base`` the int32 [width, 1] output rows of the chunk (_store_bases).
+    ``gather`` is the chunk's _gather_buffers and ``expert`` a dynamic offset.
     ``result`` is one of _turn_buffers' FP32 output rows. The FP32 SwiGLU output times the
     FP32 scales of a part of the hidden tiles, rounded once to BF16, is the
     stationary of one 128x128 product, so each hidden tile's contraction
@@ -566,7 +574,7 @@ def _down(compute, slot, gather, expert, base, turns, result, width):
     _dynamic_read(gather[5], gather[4], 0, expert)
     for index in range(_down_parts(slot)):
         _down_products(slot, gather, turns, result, width, index)
-    _store(compute, result, base)
+    _store(compute, result, gather[6])
 
 
 def _down_parts(slot):
@@ -618,7 +626,7 @@ def _down_products(slot, gather, turns, result, width, index):
 def _store(compute, result, target):
     """Scatter the FP32 rows ``result`` [width, H/128, 128] to the output rows ``target``.
 
-    ``target`` is int32 [width, 1] (_store_bases); a row past the output is skipped.
+    ``target`` is _gather_buffers' int32 [width, 1]; a row past the output is skipped.
     """
     out = compute[4]
     width, h = result.shape[0], result.shape[1] * result.shape[2]
@@ -666,44 +674,36 @@ def _slot_expert(experts, item_experts, read, s):
     _dynamic_read(experts[:, s:s + 1], item_experts, 0, read[:, s:s + 1])
 
 
-def _zero_unrouted(sbm, out, routed, width):
-    """Write zeros to every chunk without a routed row, one DMA per chunk.
+def _zero_row0(sbm, out, row_ids):
+    """Write zeros to row 0 of ``out`` [rows, H] when ``row_ids[0, 0]`` is invalid.
 
-    A routed chunk's target is the out-of-range item, whose DMA the engine
-    skips, so every output row has exactly one writer. Program ``p`` takes
-    every ``nprograms``-th chunk from chunk ``p``. A chunk is ``width * H``
-    contiguous FP32 words, written from 128 partitions.
+    Program 0 only. Only routed rows are stored; the combine reads row 0 for
+    every invalid slot (weighted by zero), so row 0 must be finite. The
+    target is row 0, or the out-of-range row, whose DMA the engine skips, so
+    row 0 has exactly one writer.
     """
-    items, columns = out.shape[0], out.shape[1] // _PMAX
-    nprograms, program = nl.num_programs(0), nl.program_id(0)
-    zeros = sbm.alloc_stack((_PMAX, columns), dtype=nl.float32)
-    nisa.memset(dst=zeros, value=0.0)
-    index = _tile(sbm, 1, items, nl.int32)
-    nisa.iota(dst=index, pattern=[[1, items]], offset=0)
-    # target = index + routed * (items - index): the chunk itself, or items.
-    away = _tile(sbm, 1, items)
-    nisa.tensor_scalar(dst=away, data=index, op0=nl.multiply, operand0=-1,
-                       op1=nl.add, operand1=items)
-    nisa.tensor_tensor(dst=away, data1=away, data2=routed[:, :items], op=nl.multiply)
-    targets = _tile(sbm, 1, items, nl.int32)
-    nisa.tensor_tensor(dst=targets, data1=away, data2=index, op=nl.add)
-    # The two hardware queues take turns, idle once the products are done.
-    queues = (_DMA_QUEUE, _DOWN_QUEUE)
-    turn = 0
-    for item in range(program, items, nprograms):
-        nisa.dma_copy(dst=out.ap(pattern=[[columns, _PMAX], [1, columns]],
-                                 scalar_offset=_register(targets[:, item:item + 1]),
-                                 indirect_dim=0),
+    if nl.program_id(0) == 0:
+        rows, h = out.shape[0], out.shape[1]
+        kernel_assert(h % _PMAX == 0, "Row 0 must split over the partitions")
+        zeros = sbm.alloc_stack((_PMAX, h // _PMAX), dtype=nl.float32)
+        nisa.memset(dst=zeros, value=0.0)
+        first = _tile(sbm, 1, 1, nl.int32)
+        nisa.dma_copy(dst=first, src=row_ids[0:1, 0:1], dge_mode=_HWDGE, engine=_DOWN_QUEUE)
+        target = _tile(sbm, 1, 1, nl.int32)
+        # target = (row_ids[0, 0] >= 0) * rows: row 0, or the out-of-range row.
+        nisa.tensor_scalar(dst=target, data=first, op0=nl.greater_equal, operand0=0,
+                           op1=nl.multiply, operand1=rows)
+        nisa.dma_copy(dst=out.ap(pattern=[[h // _PMAX, _PMAX], [1, h // _PMAX]],
+                                 scalar_offset=target, indirect_dim=0),
                       src=zeros, oob_mode=nisa.oob_mode.skip, dge_mode=_HWDGE,
-                      engine=queues[turn % len(queues)])
-        turn += 1
+                      engine=_DOWN_QUEUE)
 
 
 @nki.jit
 def moe_fused_fp8_kernel(hidden, weights, scales, row_ids, expert_ids, affinity,
                          bounds, BLOCK_M=_PMAX, BLOCK_N=1024, BLOCK_K=4096,
                          SKIP_PADDING=True):
-    """Return FP32 [blocks,q,H] contributions from device routing.
+    """Return FP32 [blocks,q,H] contributions of the routed rows, from device routing.
 
     Args:
         hidden: BF16 [T+1,H], final row zero.
@@ -718,21 +718,22 @@ def moe_fused_fp8_kernel(hidden, weights, scales, row_ids, expert_ids, affinity,
         BLOCK_N/K: Hidden columns per down / gate and up weight DMA; every
             product stays one 128x128 scaled block.
         SKIP_PADDING: Compute only the chunks of a block that hold a routed
-            row. The false setting computes every row, for comparisons.
+            row. The false setting computes every chunk, for comparisons.
 
     Notes:
-        Padding rows are zero. Each 128x128 block scale multiplies one BF16
-        operand of its product, rounded once, and every contraction
-        accumulates in FP32 in PSUM, so the result is a tolerance-defined FP32
-        sum, not a fixed reference order. Program ``p``
+        Only routed rows and row 0 are defined: a padding row's value is
+        undefined, and row 0 holds its routed row or zeros, so a reader that
+        sends every invalid slot to row 0 reads finite values. Each 128x128
+        block scale multiplies one BF16 operand of its product, rounded once,
+        and every contraction accumulates in FP32 in PSUM, so the result is a
+        tolerance-defined FP32 sum, not a fixed reference order. Program ``p``
         owns the experts ``e`` with ``e % nprograms == p`` and lists their
         routed chunks of at most _CHUNK_ROWS rows. Each program runs E //
         nprograms slots in line: each loads its chunk's expert weights, by a
         dynamic address, and gathers its rows while the previous slot
         computes, so a short list computes a chunk that it stores nowhere.
         Entries past the slots run in one dynamic loop at the end, which every
-        program runs up to the longest program list. Chunks without a routed row
-        are written with zeros after the products; every output row has
+        program runs up to the longest program list. Every defined row has
         exactly one writer. All routing decisions remain on device.
     """
     blocks, q = row_ids.shape
@@ -761,6 +762,7 @@ def moe_fused_fp8_kernel(hidden, weights, scales, row_ids, expert_ids, affinity,
     out_rows = out.reshape((items * width, h))
     sbm = SbufManager(sb_lower_bound=0, sb_upper_bound=nl.tile_size.sbuf_fmax_bytes)
     sbm.open_scope(name="moe_fused_fp8")
+    _zero_row0(sbm, out_rows, row_ids)
     clamp = sbm.alloc_stack((_PMAX, 3), dtype=nl.float32)
     nisa.dma_copy(dst=clamp, src=bounds, dge_mode=_HWDGE, engine=_DMA_QUEUE)
     experts_row = sbm.alloc_stack((1, max(blocks, 8)), dtype=nl.int32)
@@ -813,7 +815,7 @@ def moe_fused_fp8_kernel(hidden, weights, scales, row_ids, expert_ids, affinity,
         _load_gate_up(weights, expert, expert_slots[s])
         if s == 0:
             _load_down(weights, expert, expert_slots[0])
-        _gather_rows(compute, read[:, s:s + 1], rows[s], gathers[s])
+        _gather_rows(compute, read[:, s:s + 1], bases[:, s:s + 1], rows[s], gathers[s])
     for s in range(min(2, slots)):
         _transposed(rows[s], expert_slots[s][4], turns[4])
     if slots > 0:
@@ -826,7 +828,8 @@ def moe_fused_fp8_kernel(hidden, weights, scales, row_ids, expert_ids, affinity,
             _slot_expert(slot_experts, item_experts, read, s + 2)
             _load_scales(scales, slot_experts[:, s + 2:s + 3], ahead)
             _load_gate_up(weights, slot_experts[:, s + 2:s + 3], ahead)
-            _gather_rows(compute, read[:, s + 2:s + 3], rows[s % 2], gathers[(s + 2) % 3])
+            _gather_rows(compute, read[:, s + 2:s + 3], bases[:, s + 2:s + 3], rows[s % 2],
+                         gathers[(s + 2) % 3])
         current, upcoming = expert_slots[s % 6], expert_slots[(s + 1) % 6]
         result = turns[2][s % _RESULTS]
         _dynamic_read(gathers[s % 3][5], gathers[s % 3][4], 0, slot_experts[:, s:s + 1])
@@ -839,7 +842,7 @@ def moe_fused_fp8_kernel(hidden, weights, scales, row_ids, expert_ids, affinity,
                 _down_products(current, gathers[s % 3], turns, result, width, k)
         if s + 1 < slots:
             _gate_up_last(compute, upcoming, turns, accumulators)
-        _store(compute, result, bases[:, s:s + 1])
+        _store(compute, result, gathers[s % 3][6])
         if s + 2 < slots:
             _transposed(rows[s % 2], expert_slots[(s + 2) % 6][4], turns[4])
 
@@ -860,14 +863,11 @@ def moe_fused_fp8_kernel(hidden, weights, scales, row_ids, expert_ids, affinity,
         loop_turns = (turns[0], turns[1], turns[2], gate_up_banks, transpose_bank, down_banks,
                       turns[6])
         _load_expert(weights, scales, expert, slot)
-        _gather_rows(compute, item, rows[0], gathers[0])
+        _gather_rows(compute, item, _store_bases(sbm, entry, width), rows[0], gathers[0])
         _transposed(rows[0], slot[4], transpose_bank)
         _gate_up(compute, slot, loop_turns, width)
-        _down(compute, slot, gathers[0], expert, _store_bases(sbm, entry, width), loop_turns,
-              turns[2][0], width)
+        _down(compute, slot, gathers[0], expert, loop_turns, turns[2][0], width)
     nl.fori_loop(slots, _register(end), later)
-    # The zero fill reuses the chunks' SBUF.
     sbm.close_scope()
-    _zero_unrouted(sbm, out.reshape((items, width * h)), routed, width)
     sbm.close_scope()
     return out

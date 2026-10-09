@@ -63,7 +63,7 @@ def fused_fp8_experts(hidden, packed, row_ids, expert_ids, affinity, bounds,
     row zero. ``bounds`` is FP32 [128,3], repeating gate upper, up lower, and
     up upper limits. Use infinities for an unbounded side.
 
-    The returned FP32 [blocks*q,H] tensor includes zero padding rows.
+    The returned FP32 [blocks*q,H] tensor defines only routed rows and row 0.
     BLOCK_M/N/K specialize the compiled schedule; H/I and q come from shapes.
     BLOCK_N/K group 128-channel tiles without merging quantization scales.
     Routing values stay on device. Pack model-prepared CPU weights and their

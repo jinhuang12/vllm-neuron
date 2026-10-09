@@ -1271,7 +1271,8 @@ def _token_gather_combine(
     hands the kernel once each block is cut to its first ``rows`` rows. A token
     selects at most ``top_k`` of this rank's experts, so its rows follow from the
     routing mask alone and are gathered into ``top_k`` slots in expert order, the
-    order the scatter-add met them in.
+    order the scatter-add met them in. The kernel defines only routed rows and row 0,
+    so every gathered index is a routed row or row 0.
 
     Args:
         contribution: ``[blocks * rows, H]`` fp32 kernel emission.
@@ -1303,8 +1304,8 @@ def _token_gather_combine(
     slot_ids = torch.arange(slots, dtype=torch.float32, device=device)
     pick = mask.unsqueeze(2) * (rank.unsqueeze(2) == slot_ids).to(torch.float32)
     valid = pick.sum(dim=1)  # [T, k], 0/1
-    # An invalid slot reads row 0 and weighs it 0; row 0 is a real or a zero padding
-    # row, so it is finite.
+    # An invalid slot reads row 0 and weighs it 0. The kernel leaves padding rows
+    # undefined but always writes row 0, as a routed row or a zero row, so it is finite.
     index = (pick * row.unsqueeze(2)).sum(dim=1).to(torch.int32)  # [T, k]
     return token_gather_combine(contribution, index, valid)
 
