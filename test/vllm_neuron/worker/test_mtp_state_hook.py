@@ -21,6 +21,7 @@ commit function is monkeypatched onto its module here.
 
 from __future__ import annotations
 
+import functools
 from types import SimpleNamespace
 
 import pytest
@@ -49,14 +50,18 @@ def _recurrent_banks() -> list[dict]:
 
 
 def _runner(*, record, banks=None):
-    """A runner holding only what the hook reads and writes."""
-    return SimpleNamespace(
+    """A runner holding only what the hook reads and writes (a synchronous drafter: the
+    hook's first question, ``_glm5next_async_drafter``, is the real method, answering False
+    for a runner that is not an mtp server with the async proposer)."""
+    runner = SimpleNamespace(
         _glm5next_step_record=record,
         _glm5next_side_cache_positions={slot: start + T for slot, start in zip(SLOTS, STARTS)},
         _glm5next_checkpoint_rows={slot: 2 for slot in SLOTS},
         model=SimpleNamespace(glm5next_layer_banks=[] if banks is None else banks),
         drafter=SimpleNamespace(num_speculative_tokens=K),
     )
+    runner._glm5next_async_drafter = functools.partial(NeuronModelRunner._glm5next_async_drafter, runner)
+    return runner
 
 
 def _verify_record(width: int = T) -> dict:

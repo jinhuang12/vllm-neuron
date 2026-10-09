@@ -93,6 +93,12 @@ if TYPE_CHECKING:
     # Where the GLM-5.3-Flash shadow draft (MTP stage A) writes its per-step scoring
     # records (JSONL, rank 0). Empty = no log, no scoring.
     VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG: str = ""
+    # GLM-5.3-Flash speculative method "mtp" under --async-scheduling: the verify
+    # step's position corrections run on device one step late
+    # (functional/mtp/async_step.py) and the drafter accepts the async scheduler for
+    # one sequence (max_num_seqs = 1). Off = the shipped synchronous drafter, which
+    # refuses async scheduling by name.
+    VLLM_NEURON_GLM5NEXT_MTP_ASYNC: bool = False
     # Worker GC policy after warmup (vllm_neuron/vllm/worker/gc_policy.py):
     # "rare_gen2" (gen-2 threshold 100000, no freeze), "off" (CPython's GC),
     # "freeze_rare_gen2" (freeze + gen-2 threshold 100000), or "freeze".
@@ -505,6 +511,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # empty = no log. Read with VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT (the draft count).
     "VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG": lambda: (
         os.getenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT_LOG", "") or ""
+    ),
+    # Serve speculative method "mtp" on GLM-5.3-Flash under --async-scheduling (one
+    # sequence): the verify step's host corrections move on device. Off by default;
+    # the drafter refuses a set knob the scheduler cannot use (synchronous scheduling,
+    # max_num_seqs > 1) by name.
+    "VLLM_NEURON_GLM5NEXT_MTP_ASYNC": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_GLM5NEXT_MTP_ASYNC")) or False
     ),
     # GC policy each worker applies once after warmup. "rare_gen2" (the default)
     # raises only the gen-2 threshold, so bs=64 decode has no full-pass stalls, and

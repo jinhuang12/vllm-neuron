@@ -49,7 +49,13 @@ def _runner(*, record, drafts, async_scheduling: bool = False, pad_token_id=PAD)
     runner._spec_decode_limit = lambda: NeuronModelRunner._spec_decode_limit(runner)
     runner._placeholder_drafts = lambda: NeuronModelRunner._placeholder_drafts(runner)
     runner._glm5next_propose_drafts = (
-        lambda sampled: NeuronModelRunner._glm5next_propose_drafts(runner, sampled)
+        lambda sampled, scheduler_output=None: NeuronModelRunner._glm5next_propose_drafts(
+            runner, sampled, scheduler_output
+        )
+    )
+    # A synchronous drafter: the real question, answering False for a fake proposer.
+    runner._glm5next_async_drafter = (
+        lambda: NeuronModelRunner._glm5next_async_drafter(runner)
     )
     return runner
 
