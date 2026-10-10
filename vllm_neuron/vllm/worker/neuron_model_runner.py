@@ -6610,13 +6610,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             device = latent.device
             if device not in sparse_step_operands:
                 if async_correction is not None:
-                    # One request, one row: the correction's ``[1]`` operands as they
-                    # are; the layer's operand helper shapes the one-row start inside
-                    # its graph (``_int64_scalar``), so no view is taken here.
+                    # One request, one row: the correction's operands, its ``[1]`` start
+                    # viewed as the 0-d tensor this form hands (a registered device
+                    # view), so the graph compiled at warmup from the synchronous form
+                    # keeps its input signature.
                     cls._glm5next_correction_on(async_correction, device, name=bank["name"])
                     shared = {
                         "seq_lens": async_correction.seq_lens,
-                        "start_position": async_correction.start_position,
+                        "start_position": async_correction.start_position.reshape(()),
                     }
                 else:
                     shared = {

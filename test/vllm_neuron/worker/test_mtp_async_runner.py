@@ -357,10 +357,10 @@ def test_a_one_row_decode_is_laid_out_at_the_true_position(proposer):
     for carrier in translator._sparse(world, converted["layer_carriers"]):
         assert carrier["seq_lens"].tolist() == [true + 1]
         assert carrier["latent_slots"].tolist() == [translator._slot(world, 0, true)]
-        # The correction's ``[1]`` start as it is: the layer's ``_int64_scalar`` shapes the
-        # one-row start inside its graph, so no view of a device tensor is taken here.
-        assert carrier["start_position"].numel() == 1 and int(carrier["start_position"]) == true
-        assert carrier["position"].numel() == 1 and int(carrier["position"]) == true
+        # The 0-d start the synchronous one-ring form hands, so the graph compiled at
+        # warmup serves this step; the correction's ``[1]`` start is viewed, not copied.
+        assert carrier["start_position"].dim() == 0 and int(carrier["start_position"]) == true
+        assert carrier["position"].dim() == 0 and int(carrier["position"]) == true
         assert tuple(carrier["block_table_row"].shape) == (translator.WINDOW_BLOCKS, 1)
         assert torch.is_tensor(carrier["tail"]), "the one-ring form"
     # And the one-row step after it: nothing to pull back.
@@ -368,6 +368,74 @@ def test_a_one_row_decode_is_laid_out_at_the_true_position(proposer):
     converted = translator._convert(world, [0], cached=[start + T + 1], tokens=1, real=[1], width=1)
     for carrier in translator._sparse(world, converted["layer_carriers"]):
         assert int(carrier["position"]) == start + T + 1
+
+
+def _signatures(carriers: list[dict]) -> list[dict[str, tuple]]:
+    """Per carrier, every tensor operand's ``(shape, dtype)``: the part of a compiled graph's
+    input signature the translator's operands set (a different shape is a new graph)."""
+    return [
+        {key: (tuple(value.shape), value.dtype) for key, value in carrier.items() if torch.is_tensor(value)}
+        for carrier in carriers
+    ]
+
+
+def _assert_same_signatures(form: str, want: list[dict], got: list[dict]) -> None:
+    """Carrier by carrier and operand by operand, so a failure names the operand."""
+    assert want and len(got) == len(want), (form, len(got), len(want))
+    for index, (sync, under_async) in enumerate(zip(want, got)):
+        assert set(under_async) == set(sync), (form, index, sorted(set(under_async) ^ set(sync)))
+        for key in sync:
+            assert under_async[key] == sync[key], (form, index, key, under_async[key], sync[key])
+
+
+def test_the_async_sparse_carriers_hand_the_warmed_graphs_the_synchronous_signatures(proposer):
+    """Every warmup converts the synchronous form (no correction exists at warmup), so the
+    decode graphs compiled at warmup take the synchronous translator's operand signatures. The
+    async translator must hand the same ``(shape, dtype)`` per operand, for the verify form and
+    for the one-ring one-row form, or the first served step of that form compiles a graph the
+    warmup did not."""
+    sync_world = translator._world(1)
+    translator._mtp_server(sync_world.runner)
+    start = sync_world.lengths[0]
+    sync_verify = translator._convert(sync_world, [0], cached=[start], tokens=T, real=[T])
+    sync_one_row = translator._convert(sync_world, [0], cached=[start + T], tokens=1, real=[1], width=1)
+    world = translator._world(1)
+    runner = world.runner
+    _async_server(runner, proposer)
+    runner._glm5next_async_carry = _carry(world.req_ids, prev_width=1, checkpoint_rows=[0])
+    async_verify = translator._convert(world, [0], cached=[start], tokens=T, real=[T])
+    runner._glm5next_async_carry = _carry(world.req_ids, prev_width=T, checkpoint_rows=[1])
+    async_one_row = translator._convert(world, [0], cached=[start + T], tokens=1, real=[1], width=1)
+    for form, sync, under_async in (
+        ("verify", sync_verify, async_verify), ("one-row", sync_one_row, async_one_row),
+    ):
+        _assert_same_signatures(
+            form,
+            _signatures(translator._sparse(sync_world, sync["layer_carriers"])),
+            _signatures(translator._sparse(world, under_async["layer_carriers"])),
+        )
+
+
+def test_the_async_recurrent_carriers_hand_the_warmed_graphs_the_synchronous_signatures(proposer):
+    """The recurrent form, two requests: the carried ``linear_start`` and ``checkpoint_rows``
+    take the host builders' shapes and dtypes at a verify step, at a bucket-padded verify
+    step (a padding row) and at a one-row step."""
+    starts = list(kda.PROMPTS[:2])
+    forms = (
+        ("verify", dict(cached=starts, tokens=2 * T, real=[T, T])),
+        ("padded verify", dict(cached=starts, tokens=3 * T, real=[T, T])),
+        ("one-row", dict(cached=starts, tokens=2, real=[1, 1], width=1)),
+    )
+    for form, step in forms:
+        # Fresh worlds per form: each is the first decode step after the prefill.
+        sync_world = kda._world(2)
+        translator._mtp_server(sync_world.runner)
+        sync = translator._kda_convert(sync_world, [0, 1], **step)
+        world = kda._world(2)
+        _async_server(world.runner, proposer)
+        world.runner._glm5next_async_carry = _carry(world.req_ids, prev_width=1, checkpoint_rows=[0, 0])
+        under_async = translator._kda_convert(world, [0, 1], **step)
+        _assert_same_signatures(form, _signatures(sync), _signatures(under_async))
 
 
 def test_the_handed_width_is_the_steps_own_and_only_one_or_the_full_width(proposer):

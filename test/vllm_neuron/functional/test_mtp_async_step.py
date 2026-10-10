@@ -396,7 +396,7 @@ def test_the_graph_launch_satisfies_the_device_dispatch_rule(fresh_dynamo, monke
                                                       width=T, page_size=PAGE, padding=1)
     eager_take = device_dispatch_rule(monkeypatch, "_TAKE_KERNEL")
     eager_correct = device_dispatch_rule(monkeypatch, "_CORRECT_KERNEL")
-    # Eager, as 2196f291 launched on the device: no kernel to dispatch to.
+    # Eager, as the first device serve launched: no kernel to dispatch to.
     with pytest.raises(NotImplementedError, match="nki_kernel_wrapper"):
         async_step.mtp_async_take(accepted, drafts)
     with pytest.raises(NotImplementedError, match="nki_kernel_wrapper"):
