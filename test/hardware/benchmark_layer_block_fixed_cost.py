@@ -28,16 +28,22 @@ all-reduce's (the payload is the same f32 ``[ROWS, hidden]``, but no peer ring r
 
 What is measured is ``benchmark_glue_block.py``'s list (device ms per execution over
 interleaved rounds, the A/A floor, one profile per variant, each variant's output against
-``off``'s), per case. A variant whose name starts with ``torchslots`` (for example
-``torchslots=1``) is traced and called with the MoE combine's slot build on its torch route
-(``combine_slots.combine_slots_torch``, the construction the kernel replaced), so one run
-holds a kernel's before and after under the same glue switch value; a second such variant
-(``torchslots_aa=1``) is the before side's A/A floor. Each case also records whether each
-variant's first output is bit-equal to each ``torchslots`` variant's
-(``bit_equal_to_torch_slots``). The per-op split of a profile is not done here: give the compile a
-known working directory (``--work-dir``) and keep the compiler's intermediates from it while
-the graphs compile; the op inventory's tools (graph map, debug map, attribution) join a
-profile's instructions to the HLO ops and NKI calls through them.
+``off``'s), per case. A variant whose name starts with a prefix of :data:`ROUTES` (for
+example ``torchslots=1``) is traced and called with that site on its other route, so one run
+holds a fold's before and after under the same glue switch value; a second such variant
+(``torchslots_aa=1``) is that side's A/A floor:
+
+* ``torchslots``: the MoE combine's slot build on its torch route
+  (``combine_slots.combine_slots_torch``, the construction the kernel replaced);
+* ``fusedrouter``: the prefill router on 8aa22fa's fused kernel
+  (``router.noaux_tc_rmsnorm_router_topk``, its RMSNorm in the kernel) instead of
+  ``router_prefill`` (its RMSNorm scale in XLA).
+
+Each case also records whether each variant's first output is bit-equal to each such
+variant's (``bit_equal_to_route_variants``). The per-op split of a profile is not done
+here: give the compile a known working directory (``--work-dir``) and keep the compiler's
+intermediates from it while the graphs compile; the op inventory's tools (graph map, debug
+map, attribution) join a profile's instructions to the HLO ops and NKI calls through them.
 
 The compile cache is used (``NEURON_LIBTORCH_CACHE_ROOT``); its keys fold the digest of the
 kernel sources each graph reaches (``vllm_neuron.compile_cache_key``), so a kernel edit
@@ -69,7 +75,7 @@ from test.hardware import benchmark_glue_block as block
 from test.vllm_neuron.functional.dsa import dsa_batch_case
 from test.vllm_neuron.functional.glue import glue_case
 from vllm_neuron import envs
-from vllm_neuron.functional.moe import combine_slots
+from vllm_neuron.functional.moe import combine_slots, router_prefill
 from vllm_neuron.model.glm5_next import model_fp8 as live
 
 DEVICE = block.DEVICE
@@ -206,33 +212,44 @@ class ServedRankGroup(block._OneRankGroup):
         return torch.cat([tensor] * self.world_size, dim=dim)
 
 
-#: Variant-name prefix of the variants that take the torch slot build.
-TORCH_SLOTS_PREFIX = "torchslots"
+#: Variant-name prefixes that put one site on its other route while the variant is traced
+#: and called: prefix -> (module, predicate). The predicate answers False meanwhile.
+ROUTES = {
+    "torchslots": (combine_slots, "can_run_combine_slots"),
+    "fusedrouter": (router_prefill, "prefill_router_enabled"),
+}
 
-#: Whether the variant being traced or called takes the torch slot build. The trace reads
-#: it (dynamo guards on its value), so every call sets it to its variant's value first.
-_TORCH_SLOTS = [False]
-
-_KERNEL_ADMITS = combine_slots.can_run_combine_slots
-
-
-def _slots_admits(*args) -> bool:
-    """``combine_slots.can_run_combine_slots``, False while a ``torchslots`` variant runs."""
-    return not _TORCH_SLOTS[0] and _KERNEL_ADMITS(*args)
+#: The route prefix of the variant being traced or called, or None. The trace reads it
+#: (dynamo guards on its value), so every call sets it to its variant's value first.
+_ROUTE = [None]
 
 
-def _slot_routed(build_variant, torch_tags: set, firsts: dict):
-    """``build_variant`` that traces and calls the variants tagged ``torch_tags`` with the
-    torch slot build, and keeps each variant's first output in ``firsts`` by tag."""
+def route_of(name: str) -> str | None:
+    """The :data:`ROUTES` prefix ``name`` starts with, or None."""
+    return next((prefix for prefix in ROUTES if name.startswith(prefix)), None)
+
+
+def _routed_predicate(prefix: str, predicate):
+    """``predicate``, False while a variant of route ``prefix`` runs."""
+
+    def admits(*args):
+        return _ROUTE[0] != prefix and predicate(*args)
+
+    return admits
+
+
+def _route_build(build_variant, routes: dict, firsts: dict):
+    """``build_variant`` that traces and calls each variant on the route ``routes`` gives
+    its tag (None: the tree's own), and keeps each variant's first output in ``firsts``."""
 
     def build(case, layers, spec, tag, args):
-        torch_slots = tag in torch_tags
-        _TORCH_SLOTS[0] = torch_slots
+        route = routes.get(tag)
+        _ROUTE[0] = route
         call, *rest = build_variant(case, layers, spec, tag, args)
         firsts[tag] = rest[1]
 
         def routed_call(*inputs):
-            _TORCH_SLOTS[0] = torch_slots
+            _ROUTE[0] = route
             return call(*inputs)
 
         return (routed_call, *rest)
@@ -246,11 +263,11 @@ def run_case(case: dict, collectives: str, specs: dict, args) -> dict:
     That function builds every variant's operands through its module's ``carriers_for``,
     which serves decode and KDA prefill only, so the DSA prefill carriers are handed to it
     for the duration of the case; a DSA case also runs with :class:`ServedRankGroup` as
-    its one-rank group. The ``torchslots`` variants take the torch slot build.
+    its one-rank group. A variant named for a :data:`ROUTES` prefix runs on that route.
     """
     prefix = block.case_key(case, collectives, args)
     tags = {name: f"{prefix}_{name}" for name in specs}
-    torch_names = [name for name in specs if name.startswith(TORCH_SLOTS_PREFIX)]
+    routed = [name for name in specs if route_of(name)]
     firsts: dict = {}
     with contextlib.ExitStack() as patches:
         patches.enter_context(mock.patch.object(block, "carriers_for", carriers_for))
@@ -258,13 +275,14 @@ def run_case(case: dict, collectives: str, specs: dict, args) -> dict:
             patches.enter_context(mock.patch.object(block, "_OneRankGroup", ServedRankGroup))
         patches.enter_context(mock.patch.object(
             block, "build_variant",
-            _slot_routed(block.build_variant, {tags[n] for n in torch_names}, firsts)))
-        patches.enter_context(mock.patch.object(
-            combine_slots, "can_run_combine_slots", _slots_admits))
+            _route_build(block.build_variant, {tags[n]: route_of(n) for n in routed}, firsts)))
+        for route, (module, predicate) in ROUTES.items():
+            patches.enter_context(mock.patch.object(
+                module, predicate, _routed_predicate(route, getattr(module, predicate))))
         result = block.run_case(case, collectives, specs, args)
-    result["bit_equal_to_torch_slots"] = {
+    result["bit_equal_to_route_variants"] = {
         ref: {name: bool(torch.equal(firsts[tags[name]], firsts[tags[ref]])) for name in specs}
-        for ref in torch_names}
+        for ref in routed}
     if case["family"] == "dsa":
         line = SERVED_LINES[case["line"]]
         result["window_rows"] = glue_case.PAGE * dsa_window_pages(
@@ -280,7 +298,8 @@ def main() -> None:
     parser.add_argument("--cases", nargs="+", default=list(CASES))
     parser.add_argument("--variants", nargs="*", default=["aa=0", "default"],
                         help="benchmark_glue_block.py's variants; off is always added; a "
-                             "name starting with torchslots takes the torch slot build")
+                             "name starting with a ROUTES prefix runs that site's other "
+                             "route")
     parser.add_argument("--collectives", nargs="+", default=["one-rank"],
                         choices=block.COLLECTIVES)
     parser.add_argument("--rounds", type=int, default=5)
