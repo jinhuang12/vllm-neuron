@@ -8,7 +8,9 @@ window rows of an 8192-row window, 64 pages). Each case runs at B in {1, 4, 64} 
 programs (LNC2, the served grid) and, at B in {1, 4}, on one program, and compares the
 result with the 0a08ff4 kernel loaded from ``test/hardware/baselines/mla_0a08ff4`` and
 with the fp32 torch oracle. Every case reads the dispatch counters, so neither a torch
-answer nor the general kernel can pass for the split kernel.
+answer nor the general kernel can pass for the split kernel. The width a selecting decode
+step hands the kernel adds the incomplete pool's tail chunk to those 2048 columns; its
+chunk count is odd, so a one-row call there takes the general kernel, which two tests pin.
 
 Tolerance. Both kernels form the same bf16 products with fp32 sums for the scores and
 carry the probabilities to ~16 significand bits (a bf16 hi/lo split) into the value
@@ -26,6 +28,8 @@ import torch
 
 from test.hardware.baselines.mla_0a08ff4 import load as load_0a08ff4
 from vllm_neuron.functional.attention import mla_decode as MD
+from vllm_neuron.functional.dsa.index_expand import index_expand_width
+from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
 
 REL = 2e-5
 HEADS, LATENT, PAGE = 1, 512, 128
@@ -158,6 +162,34 @@ def test_shapes_outside_the_split_kernel_keep_the_general_kernel(monkeypatch):
     written = torch.randn(2, 256, generator=gen).to(torch.bfloat16)
     args = (q, bank, table, pos, written, 256 ** -0.5, 128, None)
     out = run(MD, args, monkeypatch, "2")
+    assert MD.mla_decode_split_counts() == (0, 0)
+    check(out, MD.mla_decode_attention_torch_oracle(*args), "general kernel vs oracle")
+
+
+def _served_selected_width() -> int:
+    """A selecting decode step's index width, from the checkpoint's config: the top-k
+    pools expanded to tokens plus the incomplete pool's tail, in whole key chunks."""
+    cfg = Glm5NextTextConfig()
+    pool = int(cfg.index_kpool)
+    return index_expand_width(int(cfg.index_topk) // pool, pool)
+
+
+def test_the_served_selected_width_is_outside_the_split_kernel():
+    # The tail makes the chunk count odd, and the LNC2 pair splits whole chunks evenly;
+    # the top-k tokens alone (one chunk fewer) are a width the split kernel serves.
+    width = _served_selected_width()
+    assert (width // MD.KEY_CHUNK) % 2 == 1
+    assert MD._split_serves(HEADS, LATENT, PAGE, width, 2) is False
+    assert MD._split_serves(HEADS, LATENT, PAGE, width - MD.KEY_CHUNK, 2) is True
+
+
+def test_a_one_row_call_at_the_served_selected_width_takes_the_general_kernel(monkeypatch):
+    q, bank, table, pos, written, scale, page, topk = served_case(1, 8192, seed=37)
+    tail = torch.full((1, _served_selected_width() - topk.shape[1]), -1, dtype=torch.int32)
+    tail[0, 0] = int(pos[0])
+    args = (q, bank, table, pos, written, scale, page, torch.cat([topk, tail], dim=1))
+    out = run(MD, args, monkeypatch, "2")
+    assert MD.mla_decode_route_counts() == (0, 1, 0)
     assert MD.mla_decode_split_counts() == (0, 0)
     check(out, MD.mla_decode_attention_torch_oracle(*args), "general kernel vs oracle")
 
