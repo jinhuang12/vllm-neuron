@@ -85,7 +85,7 @@ def group_blocks_per_request(spec: KVCacheSpec, max_model_len: int, where: str, 
     ``cdiv(max_model_len, block_size)`` pages plus its draft blocks at every ``dcp``.
     This models the served line, where ``--mamba-block-size`` is ``max_model_len``: a
     recurrent group then holds one block (plus its draft blocks) per request at any
-    ``dcp``, as the hybrid DCP block-size patch of commit a23eeb2 resolves it. Off
+    ``dcp``, as the hybrid DCP block-size patch resolves it. Off
     that line, with a shorter recurrent block, vLLM's managers and block table divide
     a recurrent group by ``dcp`` as well (the same patch's caveat); this figure is
     then larger than the blocks vLLM hands out, never smaller, so a pool or a

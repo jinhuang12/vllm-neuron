@@ -6,8 +6,8 @@ The kernel output is compared bit for bit with the f3a833f kernel
 blockwise FP8 reference built from the unpacked weights, at tilings that split
 the gate/up and down loads and use every row class. The simulator accepts PE
 operand access patterns that the hardware does not: a stationary with two free
-dimensions passes here and gives wrong products on Trn2 (records of the
-5debd95 device run). A separate test therefore checks that every stationary
+dimensions passes here and gives wrong products on Trn2 (records of a
+device run). A separate test therefore checks that every stationary
 the kernel passes to ``nc_matmul`` has one free dimension.
 """
 

@@ -26,14 +26,14 @@ hybrid block 128; the side caches are the runner's own, ``[65, 2049, 128]`` and
    written (an in-place op's output is the tensor it wrote) and the bytes of their inputs
    that share a side cache's storage are the bytes read from the side caches.
 
-The base tree is a read-only ``git worktree`` (``--base-tree``, default 3098da3); each
+The base tree is a read-only ``git worktree`` (``--base-tree``); each
 case runs in its own process with ``PYTHONPATH`` and the working directory set to its
 tree, so the two trees' modules never mix. One torch thread per case, as vLLM's multiproc
 executor runs each worker.
 
     NKI_SIMULATOR=1 VLLM_NEURON_CPU_MODE=1 OMP_NUM_THREADS=4 PYTHONPATH=$PWD \\
         python test/perf/host_slot_reset_bs64.py \\
-        --json <reports>/slotreset_harness.json --base-tree <3098da3 worktree>
+        --json <reports>/slotreset_harness.json --base-tree <base worktree>
 """
 
 from __future__ import annotations

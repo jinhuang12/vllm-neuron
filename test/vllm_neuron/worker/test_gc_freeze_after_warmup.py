@@ -4,7 +4,7 @@
 Each TP=64 worker of the bs=64 GLM-5.3-Flash line tracks 5.2-5.4 M objects in
 generation 2 after warmup, so one gen-2 pass takes 3.5-6.0 s. The rank in GC does
 not submit its step and the other 63 ranks wait for it: that is the 3.8-6 s decode
-stall (DECODE_BREAKDOWN_v2.md 5.2). ``rare_gen2`` (``gc_policy.py``) raises the
+stall. ``rare_gen2`` (``gc_policy.py``) raises the
 gen-2 threshold so those passes stop, and runs no collection and no freeze: vLLM's
 ``freeze_gc_heap()`` (``gc.collect(0/1/2)`` then ``gc.freeze()``), which vLLM's GPU
 worker calls at the end of its own ``compile_or_warm_up_model``, slowed every later

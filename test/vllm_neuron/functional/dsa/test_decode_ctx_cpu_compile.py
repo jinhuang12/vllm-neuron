@@ -19,7 +19,7 @@ child process per kernel call (``benchmark_dsa_decode_ctx.py compile-one --full`
   device loop, so the NEFF is the same size at all three; and at B = 1 on two programs
   for 262144 and for two axes where each core's run of blocks takes the loop and one core
   also takes a block past it (45156 candidates; 16385 with ``unroll_blocks`` 1, where
-  23f167a's split of the blocks put the loop on one core only and the backend refused
+  an earlier split of the blocks put the loop on one core only and the backend refused
   it: ``NCC_IXGM002 Expected function sg0000 in subgraph 0 to have 5 basic blocks, but
   on core 1 it has 1``).
 

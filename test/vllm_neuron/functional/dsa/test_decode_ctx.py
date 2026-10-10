@@ -153,7 +153,7 @@ def _lnc(monkeypatch, lnc):
 @pytest.mark.parametrize("candidates", [512, 2048, BASE_CEILING])
 def test_scores_equal_the_base_bit_for_bit_where_it_served(monkeypatch, batch, candidates,
                                                           lnc):
-    """453a5eb's equality claim, against e3f38f8's kernel: blocks score each tile with the
+    """The ported equality claim, against e3f38f8's kernel: blocks score each tile with the
     same instructions, on one program or two (B = 1: two halves of the blocks)."""
     _lnc(monkeypatch, lnc)
     base = load_base().decode_batch
@@ -173,7 +173,7 @@ def test_scores_equal_the_base_bit_for_bit_where_it_served(monkeypatch, batch, c
                                         4 * BASE_CEILING])
 def test_scores_past_the_ceiling_match_the_oracle_and_the_stand_in(monkeypatch, batch,
                                                                     candidates, lnc):
-    """453a5eb's oracle claim at 16385, 32768 and 65536 candidates (the inline walk, the
+    """The ported oracle claim at 16385, 32768 and 65536 candidates (the inline walk, the
     device loop, both), and this step's pool at its own column past the first block."""
     _lnc(monkeypatch, lnc)
     case = _score_case(batch, seed=candidates + 3 * batch, candidates=candidates,

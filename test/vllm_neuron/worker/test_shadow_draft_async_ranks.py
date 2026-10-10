@@ -41,7 +41,7 @@ its evidence:
   waiting on one incomplete future is the case the runner's lock exists for, and here it
   leaves one of them waiting forever, which is what the server did.
 
-On the glue that read the previous step back on the main thread (``b654dc1``) this test
+On the glue that read the previous step back on the main thread this test
 fails by the 60 s step bound with rank 0's progress stopping at ``dispatched 1`` (its main
 thread) or its output thread never reporting step 0; on the fix every step is materialized, the
 sampled ids agree across the two ranks, rank 0's log holds the two draft records (the

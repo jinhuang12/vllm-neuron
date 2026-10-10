@@ -30,7 +30,7 @@ the sparse-attention family refuses more than one request per forward
 sizes compare on one geometry.
 
 In CPU mode device work is a no-op, so what the device path pays per step for it
-(DECODE_BREAKDOWN phase E1, 1.63 ms) costs almost nothing here. The script therefore
+(the decode breakdown's phase E1, 1.63 ms) costs almost nothing here. The script therefore
 also counts it, in a separate untimed pass with the runner's device set to ``meta``
 (a read back from the device would raise there): host->device copies, device factories
 and device ops, by call name, and the sentinel remaps by name.

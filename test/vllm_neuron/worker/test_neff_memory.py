@@ -9,8 +9,7 @@ instruction streams (``*.bin``) and the DMA descriptors (``dma`` arrays).
 The runtime's own breakdown, printed per physical core at every NEFF load with
 ``NEURON_RT_LOG_LEVEL=INFO`` (``TDRV:dml_log_dev_neff_mem``), is the reference the
 recorded and real-NEFF tests compare against. The figures are from the server log
-of the recorded bs=64 @ 8k serve run (rank 0: ND 0 NC 0 / NC 1, runtime 2.34.10, the bs=64 @ 8k
-line).
+of the recorded bs=64 @ 8k serve run (rank 0: ND 0 NC 0 / NC 1, runtime 2.34.10).
 
 Three kinds of test:
 

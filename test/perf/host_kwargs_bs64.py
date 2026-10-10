@@ -57,8 +57,8 @@ import sys
 import tempfile
 import time
 
-#: Input counts of the decode graphs served from 0a08ff4 (compile cache
-#: 816ef60b6a5632fa5a4a9d3746ca2c87 for bs=64; DECODE_BREAKDOWN_v2.md section 3 for bs=1).
+#: Input counts of the decode graphs served from 0a08ff4, read from the compiled graphs
+#: (the bs=64 compile cache; the bs=1 decode breakdown).
 SERVED_INPUTS = {64: 7298, 1: 1630}
 BATCHES = (1, 64)
 VOCAB = 154880
