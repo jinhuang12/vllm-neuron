@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """A side-cache slot hand-out drains the pending async step before its first device read.
 
-The gate run dsa8k-pc (2026-10-08 10:41, ``reports/prefill-cores-hang.md`` §worker-59) hung
+A served 8k-context prefill run (2026-10-08 10:41) hung
 because two host threads waited on one in-flight execution: the async-output thread draining
 an aborted request's intermediate prefill chunk (``AsyncNeuronModelRunnerOutput.get_output``,
 ``neuron_model_runner.py`` line 206) and the submit thread's one-element ordering read in

@@ -218,9 +218,7 @@ DEFAULT_DEVICE_GRAPH_RESERVE_GIB = 5.0
 #: The buckets are the ones where the in-graph device A/B
 #: (``test/hardware/benchmark_glue_block.py``) measured a win. It runs one
 #: GLM-5.3-Flash KDA + MoE layer per graph at one TP=64 rank's shapes on trn2, and
-#: compares each value with ``0``; ``reports/glue.md`` (round 2, the in-graph A/B
-#: section), ``reports/glue-c.md`` and ``reports/glue_spec_2048.md`` have the tables.
-#: Per layer:
+#: compares each value with ``0``. The measured deltas, per layer:
 #:
 #: * ``mhc_pre:prefill@128`` and ``mhc_pre:prefill@1024``: the fused mHC pre-mix and
 #:   collapse at both mHC sites, with the feed-forward RMSNorm at the feed-forward
@@ -232,16 +230,16 @@ DEFAULT_DEVICE_GRAPH_RESERVE_GIB = 5.0
 #:   197.1 us slower on a 9.07 ms 512-row layer. So the default names the measured
 #:   buckets, not a range, and a row count that was not measured keeps the torch route.
 #: * ``mhc_pre:prefill@2048`` and ``mhc_post:prefill@2048``: both kernels at the
-#:   2048-row chunk of the uncapped prefill line, measured together (at ab4f37f, not
-#:   each alone): 995.5 us faster on a 9.80 ms 2048-row layer, faster in each of 5
+#:   2048-row chunk of the uncapped prefill line, measured together (not each
+#:   alone): 995.5 us faster on a 9.80 ms 2048-row layer, faster in each of 5
 #:   rounds by 989 to 1003 us.
 #: * ``mhc_pre:verify``: the fused mHC pre-mix at the speculative verify step, whose
 #:   row counts the mHC sites derive from the speculative config: each decode bucket
 #:   times ``1 + k`` (``functional/glue``, ``verify_rows``). At 4 rows (bs=1, 3 drafts)
 #:   the torch route runs its dots as 2-row pieces, and at the MoE feed-forward site
 #:   the collapse that the router reads as a per-token loop: the feed-forward sites'
-#:   XLA before their consumer grows 2.54 ms over the one-token step
-#:   (``reports/mtpB_verify_cost.md``). On the served TP=64 line the kernel made the
+#:   XLA before their consumer grows 2.54 ms over the one-token step. On the
+#:   served TP=64 line the kernel made the
 #:   bs=1, 3-draft verify step's device compute 24.24 ms, against 28.13 ms without it,
 #:   at the 2048-token context bucket (measured as ``mhc_pre:prefill@4`` on a tree that
 #:   called those 4 rows prefill; the 4096-token bucket's graph was not timed). A

@@ -8,7 +8,7 @@
 (ii) a kernel-by-kernel estimate from the per-kernel microbenchmarks at B=1 and B=4
 (B requests of one token each stand in for one request of T tokens: identical weight
 traffic and activation rows; attention differs only in reading one context instead of
-four, which makes (ii) an upper bound for attention) and the DECODE_BREAKDOWN_v2 point-A
+four, which makes (ii) an upper bound for attention) and the decode breakdown's point-A
 in-model buckets for the parts no microbenchmark covers (glue, waits, collectives).
 
 Every input number is a constant below with its source. Writes JSON to ``--output``.
@@ -21,11 +21,11 @@ import json
 from pathlib import Path
 
 # --- inputs ----------------------------------------------------------------------------
-ITL_TODAY_MS = 16.96            # bs=1 ctx~1k standard line, tip 8aa22fa (00_brief.md / gate_admission)
-DEVICE_STEP_MS = 16.63          # unprofiled device period, point A (DECODE_BREAKDOWN_v2 §2)
+ITL_TODAY_MS = 16.96            # bs=1 ctx~1k standard line, tip 8aa22fa
+DEVICE_STEP_MS = 16.63          # unprofiled device period, point A
 HOST_SLACK_MS = ITL_TODAY_MS - DEVICE_STEP_MS
 
-# point-A in-model buckets (DECODE_BREAKDOWN_v2 master table, profiled step 18.34 ms)
+# point-A in-model buckets (the decode breakdown's master table, profiled step 18.34 ms)
 POINT_A = {
     "compiler ops (glue)": 5.01, "wait: collective": 2.55, "idle": 1.98, "wait: DMA": 1.56,
     "mhc/sinkhorn": 1.36, "moe/expert_decode": 0.90, "kda/fused_decode": 0.69,
@@ -57,7 +57,7 @@ KERNELS = {
 }
 
 # the draft step (one MTP layer = DSA attention half + MoE half + head extras), us per step at B=1,
-# filled in from benchmark_mtp_draft.py (device) + the MoE/dense microbenchmarks; see mtp.md §3.
+# filled in from benchmark_mtp_draft.py (device) + the MoE/dense microbenchmarks.
 DRAFT_DEFAULT_US = {"head_block_measured_or_estimated": None}
 
 

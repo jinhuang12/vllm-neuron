@@ -30,7 +30,7 @@ Graphs, each compiled on its own; a sample is one dispatch with the output copie
 
 The device time of a sample is the runtime system trace's ``nc_exec_running`` interval, the
 two physical cores merged. Each case carries its ENTITLEMENT at the rates of
-``glm53f-wt3/reports/entitlement.json`` (meta.hardware, per logical core): the op roofline
+the hardware entitlement table (per logical core): the op roofline
 (causal FLOPs ``4 * latent * sum(seq_lens)`` at peak, or the bytes of the query, the
 attended rows and the fp32 output at HBM bandwidth, whichever is longer) and the kernel's
 own Tensor-engine instruction time (PE columns per 128-row tile, the tiles dealt over the

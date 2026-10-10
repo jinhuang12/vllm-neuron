@@ -738,9 +738,9 @@ def test_editing_the_wrapper_of_an_nkilib_kernel_changes_only_its_graph_key(
 
 
 def test_editing_the_nkilib_predicate_patch_moves_the_nkilib_mlp_digest(tmp_path):
-    """da-14's round-1 probe: flip the forced-TKG predicate inside mlp.py:18-35.
+    """Flip the forced-TKG predicate inside mlp.py:18-35.
 
-    At 5f90590 the nkilib kernel folded the empty file set and kept its digest.
+    Before the fix the nkilib kernel folded the empty file set and kept its digest.
     """
     copy = _copy_tree(tmp_path)
     refs = (
@@ -830,7 +830,7 @@ def test_the_dotted_path_separates_a_package_kernel_from_its_nkilib_namesake():
 
 
 # Each row: a kernel module, a file an edit of which must move that kernel's
-# digest, and the reason the closure reaches it (file:line at 866f8c4).
+# digest, and the reason the closure reaches it.
 TRAP_ROWS = [
     # A kernel called inside another traced kernel.
     ("moe.hierarchical_all2all_combine_reduce", "functional/moe/topk_reduce.py"),  # :18/:139

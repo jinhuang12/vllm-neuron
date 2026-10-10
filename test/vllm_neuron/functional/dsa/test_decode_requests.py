@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """``Glm5NextDSAIndexer.forward_requests``: one DSA/MLA layer's decode step for ``B``
-requests at once, against the wave-1 layer run once per request.
+requests at once, against the one-request layer run once per request.
 
 The reference is 75090b9's ``Glm5NextMLAAttention.forward`` (the git-show snapshot in
 ``test/hardware/baselines/dsa_75090b9``, same weights) -- the one-request indexer chain
@@ -18,7 +18,7 @@ What is compared, and how closely:
   different orders and agree to fp32 rounding (``test_decode_batch.py``); no seed here
   has two pools that close at the cut. The written banks -- every ring and every
   stored pool -- agree bit for bit.
-* (b) Output: the attention output (before absorb-out) to ``ATTENDED_ATOL``, worker-4's
+* (b) Output: the attention output (before absorb-out) to ``ATTENDED_ATOL``, the
   tolerance between the two attention kernels, and the layer output to one bf16 ulp of
   its largest entry: the attention is cast to bf16 before absorb-out, and two fp32
   values that agree to 1e-7 can still round to neighbouring bf16 values.
@@ -73,7 +73,7 @@ def _module():
 
 @functools.lru_cache(maxsize=1)
 def _reference():
-    """75090b9's layer with the same weights: the wave-1 one-request decode."""
+    """75090b9's layer with the same weights: the one-request decode."""
     return build_attention(load_75090b9().model_fp8,
                            decode_config(hidden_size=512, q_lora_rank=256))
 

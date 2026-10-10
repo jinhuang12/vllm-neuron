@@ -103,7 +103,7 @@ def test_a_non_merged_candidate_does_not_count_below_its_own_tree(gate_dir, tmp_
 
 
 def test_a_gated_tree_runs_every_candidate_in_it_whatever_the_verdict(gate_dir, tmp_path):
-    # team-lead ruling, round 2: a sha with a gate record of any verdict uses the kernels of the
+    # a sha with a gate record of any verdict uses the kernels of the
     # tree that gate measured; the MERGE-only ancestry rule is for "current" and ungated shas
     for f in gate_dir.iterdir():
         shutil.copy2(f, tmp_path / f.name)

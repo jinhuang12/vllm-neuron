@@ -4,12 +4,12 @@
   - ``current``: every wave-1 kernel ("after"); compared with the latest gate run.
   - a commit with no gate record (``5938748``, a merge sha, ...): a family runs "after"
     when a gate run of its branch (``name``) has verdict MERGE and its gated candidate
-    (``gate_sha``) is an ancestor of the commit (team-lead ruling). The gated candidate is
+    (``gate_sha``) is an ancestor of the commit. The gated candidate is
     the rebased head that the merge brings in, so this is the same test as "merge sha is
     an ancestor" for every commit at or after the merge. The rest run 5938748.
   - a commit with a gate record (a gate run whose measured ``head`` is the commit), any
     verdict: the kernels of that tree, i.e. every gated candidate that is the commit or
-    an ancestor of it, whatever its verdict (team-lead ruling, round 2). The latest gate
+    an ancestor of it, whatever its verdict. The latest gate
     run is often such a tree (``gate_mhc.json``, BLOCKED, tree f083375). A REJECTed or
     BLOCKED candidate never counts for a commit without a gate record.
   - The gate run for the commit is the newest gate whose measured tree head is the

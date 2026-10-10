@@ -232,7 +232,7 @@ def test_a_one_row_decode_and_a_prefill_are_recorded_for_the_hook_too():
     converted = _convert(world, [0], cached=[start], tokens=1, real=[1], width=1)
     record = world.runner._glm5next_step_record
     assert (record["is_prefill"], record["width"], record["counts"]) == (False, 1, [1])
-    # The plain one-row step of one request keeps the one-ring form (the Stage-A carrier).
+    # The plain one-row step of one request keeps the one-ring form (the plain decode carrier).
     for carrier in _sparse(world, converted["layer_carriers"]):
         assert torch.is_tensor(carrier["tail"]) and int(carrier["position"]) == start
     plain = shadow._world()
@@ -308,7 +308,7 @@ def test_without_the_mtp_spec_the_recurrent_carriers_carry_no_checkpoint_operand
 def test_a_padding_row_resumes_from_its_slots_own_row():
     """A padding row names a slot no scheduled request holds; when that slot is owned by a
     request this step does not schedule, its row is the owner's live one, so the layer
-    rewrites the slot with its own bytes (worker-57's checkpoint hazard)."""
+    rewrites the slot with its own bytes (the checkpoint hazard)."""
     runner = SimpleNamespace(
         is_mtp_spec=True, drafter=SimpleNamespace(num_speculative_tokens=K),
         _glm5next_checkpoint_rows={1: 2, 5: 3},
@@ -336,7 +336,7 @@ def _kda_prefill_convert(world, req_id: str, tokens: int) -> list[dict]:
 
 
 def test_a_prefill_on_a_checkpoint_bank_hands_the_one_row_carrier_and_a_decode_the_slots_rows():
-    """worker-57's banks hold ``1 + k`` state rows per slot (``[slots, 1 + k, ...]``) and the
+    """The checkpoint banks hold ``1 + k`` state rows per slot (``[slots, 1 + k, ...]``) and the
     bank record names it (``state_checkpoints``): a prefill writes row 0, so its view is the
     plain per-slot state at row 0 of the request's slot and no checkpoint keyword rides
     along; a one-request decode's view is the slot's rows whole (the eager-view form) with

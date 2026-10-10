@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The command line: the acceptance invocations (as restated by team-lead) and the shape emitter."""
+"""The command line: the acceptance invocations and the shape emitter."""
 
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ def test_5938748_reconciliation_verdicts_follow_the_ruling(base_run):
 
 
 def test_kda_verdict_prints_its_scope_range(base_run):
-    # da-2 round 1 #1: the KDA PASS depends on how much KDA-layer glue is in scope
+    # the KDA PASS depends on how much KDA-layer glue is in scope
     out, doc = base_run
     kda = next(r for r in doc["reconciliation"]["rows"] if r["bucket"] == "KDA")
     assert (round(kda["reference_ms"], 2), round(kda["delta_pct"], 1), kda["verdict"]) == (12.3, -10.4, "PASS")

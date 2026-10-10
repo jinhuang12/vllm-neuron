@@ -13,7 +13,7 @@ What is read for every bucket:
    and one ring/pooled-store view per sequence, and the views are disjoint (the graph's
    inputs must not alias, or a served batch, whose views are disjoint, would not match);
 3. the decode attention took one launch per layer: the batched decode kernel at B > 1,
-   the one-request sparse kernel at B = 1, which is wave 1's unchanged path;
+   the one-request sparse kernel at B = 1, the unchanged one-request path;
 4. a synthetic step takes no slot claim and moves no cursor.
 
     NKI_SIMULATOR=1 VLLM_NEURON_CPU_MODE=1 python -m pytest \\
@@ -37,7 +37,7 @@ from test.vllm_neuron.model.glm5_next.tiny import test_tiny_glm5next_forward as 
 
 pytestmark = [pytest.mark.fast, pytest.mark.forked]
 
-#: The gate's concurrency bound and the buckets the worker compiles for it.
+#: The served concurrency bound and the buckets the worker compiles for it.
 MAX_NUM_SEQS = 64
 BUCKETS = [1, 2, 4, 8, 16, 32, 64]
 

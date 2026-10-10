@@ -1,6 +1,6 @@
 """The shadow draft under async scheduling, two ranks on the CPU: every step's output comes back.
 
-The incident this pins (gate/mtp-A run of 2026-10-08, ``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT=5``,
+The incident this pins (a served run of 2026-10-08, ``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT=5``,
 TP=64): the server hung at the first decode step. Every device execution had completed; no
 rank raised; the engine core timed out waiting for a free broadcast block because rank 0
 never returned from ``sample_tokens``. Rank 0 is the one rank that scores drafts, and the
@@ -41,7 +41,7 @@ its evidence:
   waiting on one incomplete future is the case the runner's lock exists for, and here it
   leaves one of them waiting forever, which is what the server did.
 
-On the glue that read the previous step back on the main thread (``b654dc1``) this test
+On the glue that read the previous step back on the main thread this test
 fails by the 60 s step bound with rank 0's progress stopping at ``dispatched 1`` (its main
 thread) or its output thread never reporting step 0; on the fix every step is materialized, the
 sampled ids agree across the two ranks, rank 0's log holds the two draft records (the
@@ -87,7 +87,7 @@ DEVICE_STEP_SECONDS = 10.0
 STEPS = 3
 # Both ranks build the tiny root and warm the runner (about 30 s on this machine) within the
 # setup bound; from the moment both are warm, the three steps, their outputs and the shutdown
-# must finish within the step bound (team-lead's 60 s). A rank that has not reported by then
+# must finish within the step bound (60 s). A rank that has not reported by then
 # is hung: its progress file says where, its stack file (dumped shortly before the bound) says
 # on which line.
 SETUP_TIMEOUT_SECONDS = 240.0

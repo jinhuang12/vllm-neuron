@@ -525,7 +525,7 @@ class _Oracle:
 
     def populate(self, hidden_rows, next_ids, positions, **kwargs):
         """The head's state write at ``T`` rows (its attention layer's ``T``-row leg is
-        worker-58's); the drafts come from this oracle, so the state is never read."""
+        covered elsewhere); the drafts come from this oracle, so the state is never read."""
         assert hidden_rows.shape[0] == next_ids.numel() == positions.numel()
         self.populated += 1
 
@@ -639,7 +639,7 @@ def test_greedy_speculative_output_is_token_identical_to_the_plain_run(tmp_path,
                                            finished=finished, oracle=oracle)
                 finished = {f"mtp-{k}-{i}"}
                 assert ids == references[i][:GENERATED], (k, name, i)
-                # The prefill leg populates the head once (Stage A); every verify step
+                # The prefill leg populates the head once; every verify step
                 # populates once and drafts once.
                 assert (oracle.populated, oracle.calls) == (steps + 1, steps), (k, name, steps)
                 report.append((k, name, steps))

@@ -7,7 +7,7 @@ layer, each fed the carriers the previous one wrote. ``tstep`` is one
 :func:`kda_fused_decode_tstep` launch per layer, which writes the ``T`` per-token
 checkpoints of both carriers. ``one_token`` is the plain decode step (one
 :func:`kda_fused_decode` per layer on the first token of each request), the number
-the round-1 microbenchmark (``benchmark_kda_decode.py``, ``after``) reported, so a
+the decode microbenchmark (``benchmark_kda_decode.py``, ``after``) reported, so a
 change to the shared kernel body shows up here as a change to that line.
 
 Each timed graph holds ``L`` independent layers (own carriers, shared weights),

@@ -9,8 +9,7 @@ instruction streams (``*.bin``) and the DMA descriptors (``dma`` arrays).
 The runtime's own breakdown, printed per physical core at every NEFF load with
 ``NEURON_RT_LOG_LEVEL=INFO`` (``TDRV:dml_log_dev_neff_mem``), is the reference the
 recorded and real-NEFF tests compare against. The figures are from the server log
-of gate run tip-b64-C (rank 0: ND 0 NC 0 / NC 1, runtime 2.34.10, the bs=64 @ 8k
-line).
+of the recorded bs=64 @ 8k serve run (rank 0: ND 0 NC 0 / NC 1, runtime 2.34.10).
 
 Three kinds of test:
 
@@ -19,7 +18,7 @@ Three kinds of test:
   that line reduced to what the reader reads (``fixtures/record_neff_fixture.py``
   says what is kept and how it was made), and beside it the runtime's breakdown for
   that graph (``*.provenance.json``). These two kinds run anywhere;
-* real cache: the 15 NEFFs of the tip-b64-C compile cache. They run only when the
+* real cache: the 15 NEFFs of the recorded run's compile cache. They run only when the
   test-only variable ``VLLM_NEURON_TEST_COMPILE_CACHE_ROOT`` names that cache's
   ``neuron/compile_cache`` directory, and are skipped when it is unset. It is a test
   knob, not a serving knob, so it is read here and is not registered in
@@ -366,7 +365,7 @@ def _mb(value: int) -> float:
 # ---------------------------------------------------------------------------
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
-#: The 1-sequence decode graph at context bucket 2048, recorded from the tip-b64-C
+#: The 1-sequence decode graph at context bucket 2048, recorded from that run's
 #: compile cache by ``fixtures/record_neff_fixture.py``.
 DECODE_NEFF = FIXTURES / "glm53f_bs64x8k_decode_b1_ctx2048.neff"
 DECODE_PROVENANCE = json.loads(
@@ -436,10 +435,10 @@ def test_a_cache_holding_two_serve_lines_is_split_by_the_kv_input(tmp_path) -> N
 
 
 # ---------------------------------------------------------------------------
-# The real compile cache of gate run tip-b64-C
+# The real compile cache of the recorded bs=64 @ 8k serve run
 # ---------------------------------------------------------------------------
 
-#: Test-only knob (see the module docstring): the tip-b64-C compile cache.
+#: Test-only knob (see the module docstring): the recorded run's compile cache.
 COMPILE_CACHE_ROOT_ENV = "VLLM_NEURON_TEST_COMPILE_CACHE_ROOT"
 needs_compile_cache = pytest.mark.skipif(
     not os.environ.get(COMPILE_CACHE_ROOT_ENV),
@@ -465,12 +464,12 @@ def _cache_neff(key: str) -> Path:
 TIP_B64_GRAPHS = 15
 #: The runtime log names each NEFF by its compile cache key; this is the prefill graph.
 PREFILL_KEY = "7d0ae663f1c6c0f94be5612ed2ce6d4f"
-# The runtime's breakdown for the prefill graph (tip-b64-C, ND 0 NC 0 / NC 1).
+# The runtime's breakdown for the prefill graph (recorded run, ND 0 NC 0 / NC 1).
 RT_PREFILL_CODE_MB = (93.147, 70.647)
 RT_PREFILL_CONSTANTS_KB = 579.008
 RT_PREFILL_RINGS_MB = (0.957 + 36.263 + 0.004, 1.289 + 10.806 + 0.004)
 RT_SHARED_SCRATCHPAD_MB = 768.0
-# After all 15 loads (tip-b64-C rank 0): NC 0 14.457 GB total of which 13.378 GB
+# After all 15 loads (recorded run, rank 0): NC 0 14.457 GB total of which 13.378 GB
 # tensors, NC 1 0.196 GB. The graphs' share is everything but the tensors.
 RT_B64_GRAPH_MB = 14803.97 - 13.378 * 1024 + 200.88
 

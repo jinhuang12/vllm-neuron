@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """``functional/mtp/tail_out.py``: the draft iteration's output tail as one NKI kernel.
 
-The kernel replaces the traced tail of Stage A's draft loop (``mtp.py``)::
+The kernel replaces the traced tail of the head's draft loop (``mtp.py``)::
 
     mixed = attended + ffn                                    # bf16 add
     hidden = rms(mixed, shared_head_norm)                     # fp32 math, bf16 out
@@ -23,7 +23,7 @@ checks start at the norm:
   (asserted from ``DECISIVE_SAMPLE`` rows up), so the check reads the argmax and not
   only its neighbourhood;
 * ties: two identical head rows produce identical logits, and the reported index is
-  the lower one, the convention of ``torch.argmax`` the Stage A route had.
+  the lower one, the convention of ``torch.argmax`` the traced route had.
 
 Shapes: the tiny fixture's H=512 with 64 head rows and the served H=4096 with the
 TP=64 shard of 2420 rows; B in {1, 4, 64} and 130 (two partition tiles); one program
@@ -163,7 +163,7 @@ def test_two_partition_tiles_equal_the_tiles_run_apart() -> None:
 
 
 def test_the_torch_route_is_stage_a_arithmetic_bit_for_bit() -> None:
-    """``mtp_tail_out_torch`` is the draft loop's tail as Stage A wrote it."""
+    """``mtp_tail_out_torch`` is the draft loop's tail as the traced head wrote it."""
     ops = _operands(7_901, 5, TINY_HIDDEN, TINY_ROWS)
     hidden, pair = tail_out.mtp_tail_out_torch(**ops, eps=EPS)
     mixed = ops["attended"] + ops["ffn"]

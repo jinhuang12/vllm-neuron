@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """The arithmetic of the query-sharded selection's cost model (``indexer_shard_cost.py``).
 
-These pin what the report's numbers rest on: the baseline is worker-3's calibrated model
+These pin what the report's numbers rest on: the baseline is the calibrated model
 unchanged, degree 1 changes nothing, the top-k fit reproduces its two measured points, the
 all-gather is the calibrated all-reduce's own half, and the committed report JSON is what
-the model computes today. They read worker-3's directory and never write to it.
+the model computes today. They read the calibration directory and never write to it.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ def cost():
 
 
 def _published_rows() -> dict:
-    """worker-3's published rows, TP = 64 colocated, bs = 1, chunk 1024, keyed by
+    """The published calibrated rows, TP = 64 colocated, bs = 1, chunk 1024, keyed by
     ``(context, prompt)``."""
     with open(PUBLISHED_JSON) as handle:
         rows = json.load(handle)["rows"]
@@ -46,7 +46,7 @@ def _published_rows() -> dict:
 
 
 def test_the_baseline_is_the_published_calibrated_table(cost):
-    """"before" is worker-3's own number wherever ``prefill_calibrated.json`` has the row."""
+    """"before" is the calibrated table's own number wherever ``prefill_calibrated.json`` has the row."""
     published = _published_rows()
     checked = 0
     for prompt in cost_model.TTFT_PROMPTS.values():

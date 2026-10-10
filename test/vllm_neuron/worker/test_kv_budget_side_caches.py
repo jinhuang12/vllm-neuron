@@ -9,7 +9,7 @@ decode ring ``tail [slots, 2, index_kpool, index_head_dim]`` and the padding rin
 ``NeuronWorker._kv_cache_footprint_bytes``: 0.3466 GiB per rank at 64 x 8192.
 
 Hand computation at TP=64, block 128, 11 DSA + 34 KDA layers (bf16 KV, fp32 state),
-the gate's serve line (``--no-enable-prefix-caching --mamba-block-size 8192``):
+the served TP=64 configuration (``--no-enable-prefix-caching --mamba-block-size 8192``):
 
 * vLLM pool: (64 x (8192 / 128 + 4) + 1) = 4353 blocks x 131072 B x 11 = 6276120576 B
 * KDA banks: 34 layers x 64 slots x 67840 B = 147619840 B
@@ -177,8 +177,8 @@ def test_a_point_that_fits_only_without_side_caches_is_refused_naming_the_shortf
     """64 x 8k against a budget between the KV tensors and the footprint: refused.
 
     The graph-need override puts the budget midway between the KV tensors
-    (5.983 GiB) and the footprint with the side caches (6.329 GiB). Until
-    wt2/kvbudget the 5938748 residency put it there by itself (6.04 GiB, the
+    (5.983 GiB) and the footprint with the side caches (6.329 GiB). Before the
+    budget change the 5938748 residency put it there by itself (6.04 GiB, the
     per-physical-core bound, short by 0.289 GiB); that bound is gone.
     """
     from vllm_neuron.vllm.worker.neuron_model_runner import kv_cache_allocations
@@ -212,7 +212,7 @@ def test_the_0a08ff4_residency_admits_64_by_8k_with_the_side_caches(monkeypatch)
     """On the measured tip the 6.33 GiB footprint fits with 5.6 GiB to spare.
 
     A cold cache (the fake worker reads none) assumes the 5 GiB default reserve:
-    24 - 6.79 resident - 5 - 0.25 margin = 11.96 GiB. Until wt2/kvbudget the 0.30
+    24 - 6.79 resident - 5 - 0.25 margin = 11.96 GiB. Before the budget change the 0.30
     cap bound by default at 6.62 GiB, 0.295 GiB above the footprint.
     """
     from vllm_neuron.vllm.worker.neuron_worker import KV_BUDGET_MARGIN_BYTES

@@ -2,7 +2,7 @@
 """A decode step of the tiny root runs the DSA indexer as one launch per stage per layer.
 
 The tiny root (three sparse-attention layers) is driven through the runner's own
-carrier builder, with worker-9's harness (``test_tiny_glm5next_batch_decode``): the
+carrier builder, with the tiny batch-decode harness (``test_tiny_glm5next_batch_decode``): the
 requests are prefilled alone into their own pages and slots, the caches are
 snapshotted, and two decode steps of all requests run on each arm.
 

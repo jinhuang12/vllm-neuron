@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shadow-draft scoring: drafts are scored against the tokens sampled k steps later.
 
-Stage A of MTP for GLM-5.3-Flash runs the layer-45 draft beside the decode graph and
+The traced MTP head of GLM-5.3-Flash runs the layer-45 draft beside the decode graph and
 never uses its output; the runner buffers the k drafts a step emits and scores them
 against the tokens the trunk samples at the following k steps. The scorer here is the
 pure-Python core (``Glm5NextShadowDraftScorer``) and the runner glue around it
@@ -341,7 +341,7 @@ def test_the_rank_is_read_on_the_host_from_the_tensor_parallel_group(monkeypatch
 def test_under_async_scheduling_the_main_thread_reads_no_future_and_the_output_scores_the_step(
     monkeypatch, tmp_path
 ):
-    """The gate's knob-5 server hung at the first decode: the glue read the previous step's
+    """A knob-5 server hung at the first decode: the glue read the previous step's
     sampled ids back from the device on the worker's main thread while the output thread was
     reading the same future inside ``get_output()``. Now the main thread stashes the step
     (its bookkeeping and its draft future, unread); the step's ``AsyncNeuronModelRunnerOutput``

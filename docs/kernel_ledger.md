@@ -6,7 +6,7 @@ residual. The residual is the part of the step that no kernel benchmark explains
 compiler glue, waits between kernels, and launch skew.
 
 The ledger uses no device time. It reads the benchmark JSON files and the gate JSON
-files in `/home/ubuntu/glm53f-wt/reports/`.
+files in the reports directory it is pointed at.
 
 ## 1. Commands
 
@@ -92,7 +92,7 @@ the kernel of the branch.
   REJECT, BLOCKED): the ledger uses the kernels of that tree. A family uses "after" when
   its gated candidate is the commit or an ancestor of the commit, for all verdicts. The
   latest gate run is frequently such a tree (`gate_mhc.json`, BLOCKED, tree f083375).
-- Team-lead ruling (round 2): the MERGE-only rule applies to `current` and to commits
+- The MERGE-only rule applies to `current` and to commits
   with no gate record. A commit with a gate record uses the kernels of the tree that the
   gate measured. A BLOCKED or REJECT candidate never counts for a commit with no gate
   record.
@@ -136,7 +136,7 @@ PASS when the difference is 15% or less.
 | dense | blockwise_fp8_mm 1.705 + norms 0.082 + dense glue 0.129 ms (engine-active) | FAIL |
 | collectives | AR transfer 0.83 + late-rank wait 2.07 ms | FAIL |
 
-KDA (team-lead ruling, round 2): the verdict uses the as-built KDA bound of the
+KDA: the verdict uses the as-built KDA bound of the
 breakdown, 12.3 ms (`attention.md`). The ledger also prints the two other readings with
 their delta and verdict. No reference is removed from the output:
 

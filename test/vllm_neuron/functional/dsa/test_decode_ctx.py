@@ -134,7 +134,7 @@ def test_scores_of_one_request_split_over_both_cores_equal_one_program(
 
 
 def _ported_lengths(candidates: int) -> list[int]:
-    """origin/wt3/uncap 453a5eb's lengths: the whole axis, a pool closed mid-axis, a short
+    """The ported lengths: the whole axis, a pool closed mid-axis, a short
     one, a ragged tail. A multiple of the pool closes a pool this step, so the stand-in
     lands at column ``length / 4 - 1`` -- past the first block for the long requests."""
     full = candidates * POOL
@@ -153,7 +153,7 @@ def _lnc(monkeypatch, lnc):
 @pytest.mark.parametrize("candidates", [512, 2048, BASE_CEILING])
 def test_scores_equal_the_base_bit_for_bit_where_it_served(monkeypatch, batch, candidates,
                                                           lnc):
-    """453a5eb's equality claim, against e3f38f8's kernel: blocks score each tile with the
+    """The ported equality claim, against e3f38f8's kernel: blocks score each tile with the
     same instructions, on one program or two (B = 1: two halves of the blocks)."""
     _lnc(monkeypatch, lnc)
     base = load_base().decode_batch
@@ -173,7 +173,7 @@ def test_scores_equal_the_base_bit_for_bit_where_it_served(monkeypatch, batch, c
                                         4 * BASE_CEILING])
 def test_scores_past_the_ceiling_match_the_oracle_and_the_stand_in(monkeypatch, batch,
                                                                     candidates, lnc):
-    """453a5eb's oracle claim at 16385, 32768 and 65536 candidates (the inline walk, the
+    """The ported oracle claim at 16385, 32768 and 65536 candidates (the inline walk, the
     device loop, both), and this step's pool at its own column past the first block."""
     _lnc(monkeypatch, lnc)
     case = _score_case(batch, seed=candidates + 3 * batch, candidates=candidates,
@@ -372,7 +372,7 @@ def test_selected_pools_concentrated_in_one_segment():
 def test_the_rows_the_base_served_are_compacted_whole():
     """Up to e3f38f8's widest axis (16384 candidates) a mask row is compacted whole, as
     e3f38f8 did: two segments and a merge cost 663 -> 873 us per layer at B = 64, ctx
-    65536 on the device (worker-47's J4). Past it the row is cut in segments."""
+    65536 on the device. Past it the row is cut in segments."""
     assert DS.segments(BASE_CEILING) == (1, BASE_CEILING)
     count, width = DS.segments(BASE_CEILING + 1)
     assert count > 1 and width <= DS.SEGMENT_COLUMNS

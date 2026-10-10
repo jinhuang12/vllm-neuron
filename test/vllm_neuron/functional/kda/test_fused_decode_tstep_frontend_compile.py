@@ -3,7 +3,7 @@
 
 The simulator runs a kernel body as plain Python, so it cannot see a call form the
 compiler's front end refuses. This compiles ``kda_fused_decode_tstep_kernel`` at
-``T`` in {2, 4, 6} tokens per request (``T = 1 + k`` around the gate's k = 3) and
+``T`` in {2, 4, 6} tokens per request (``T = 1 + k`` around the served k = 3) and
 ``B`` in {1, 64} requests, on one and two programs, in both conv layouts and with
 and without the padding operands, and the one-token ``kda_fused_decode_kernel`` at
 the same batches, inside a child process that pins the platform target, opens no

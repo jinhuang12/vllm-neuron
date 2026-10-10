@@ -6,7 +6,7 @@ random head so greedy tokens discriminate) is driven the way a served request re
 the runner's own metadata builder (``_build_attention_metadata``, which picks the KV
 segment per request), its converter (``_glm5next_model_kwargs``, which sizes the window
 and the block-table row from that segment) and the root, chunk by chunk of 1024 query
-rows at the gate's KV page of 128 tokens.
+rows at the served KV page of 128 tokens.
 
 1. The standard line (``max_model_len`` 4096, ``kv_segment_size_buckets`` [1024, 2048,
    4096], ``num_batched_tokens_buckets`` [1024]): prompts of 700, 1500, 3000 and 4095
@@ -47,7 +47,7 @@ from test.vllm_neuron.model.glm5_next.tiny import test_tiny_glm5next_forward as 
 
 pytestmark = [pytest.mark.forked]
 
-#: The gate's hybrid_kv_block_size and num_batched_tokens bucket.
+#: The served hybrid_kv_block_size and num_batched_tokens bucket.
 PAGE = 128
 QUERY = 1024
 SEED = 20261007

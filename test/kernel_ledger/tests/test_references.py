@@ -26,7 +26,7 @@ def test_every_reconciled_bucket_is_a_ledger_bucket_with_a_reference():
 
 
 def test_expected_failures_carry_their_cause():
-    # team-lead ruling: mHC, KDA, DSA, lm_head must pass; MoE, dense, collectives fail with the scope cause
+    # mHC, KDA, DSA, lm_head must pass; MoE, dense, collectives fail with the scope cause
     assert {b for b, r in REFERENCES.items() if r.expect == "FAIL"} == {"MoE", "dense", "collectives"}
     for r in REFERENCES.values():
         assert (r.expect == "FAIL") == bool(r.cause)
@@ -44,7 +44,7 @@ def test_reference_sums():
 
 
 def test_kda_is_judged_on_the_breakdown_bound_and_keeps_every_other_reading():
-    # team-lead ruling, round 2: PASS/FAIL against the 12.3 ms bound; no reference is dropped;
+    # PASS/FAIL against the 12.3 ms bound; no reference is dropped;
     # the 0.975 ms KDA-layer glue is an un-modeled term that lands in the residual
     kda = REFERENCES["KDA"]
     assert [round(a.ms, 3) for a in kda.alternatives] == [12.472, 13.447]

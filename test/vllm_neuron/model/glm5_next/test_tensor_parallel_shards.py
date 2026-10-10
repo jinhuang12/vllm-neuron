@@ -827,7 +827,7 @@ def test_shard_a_load_without_a_tensor_parallel_group_binds_the_loaders_rank(
     The indexer's rank operand (``Glm5NextDSAIndexer.SHARD_RANK_ATTR``) is then the rank
     the loader sliced this rank's weights with -- the patched ``_resolve_rank`` -- as a
     ``[1]`` int32 tensor on the prepared weights' device, so the query-row shard stays
-    aligned with the weight shards; at one rank it is None. Regression: bbf0f6d refused
+    aligned with the weight shards; at one rank it is None. Regression: an earlier revision refused
     the whole load with vllm's "tensor model parallel group is not initialized".
     """
     directory, _, _ = _shard_checkpoint(tmp_path, MINI_ALL_DENSE_FIRST_K)

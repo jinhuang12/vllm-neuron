@@ -5887,8 +5887,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # last owner can have left a step in flight that the output thread is
             # draining, and ``empty_slot``'s ordering read would be a second device
             # wait on that execution, which the runtime's single completion handle
-            # per execution turns into a hang (reports/prefill-cores-hang.md
-            # §worker-59). O(1) when nothing is pending; a no-op once read back.
+            # per execution turns into a hang. O(1) when nothing is pending; a no-op
+            # once read back.
             if side_caches:
                 pending = getattr(self, "async_execution_buffer", None)
                 pending = pending.get("async_output") if pending else None
@@ -6433,7 +6433,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 # on the bank) hands a prefill the one-row carrier ``bank[slot, 0]`` -- a
                 # prefill writes row 0 -- and a decode the slot's rows whole. A plain
                 # bank's record carries no ``state_checkpoints`` key (absent = 1, the
-                # Stage-A record) and hands ``bank[slot]`` on both legs.
+                # plain record) and hands ``bank[slot]`` on both legs.
                 prefill_row = bool(is_prefill) and int(bank.get("state_checkpoints", 1)) > 1
 
                 def state_view(key, one_slot):
@@ -6457,7 +6457,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # rows) is the sparse layer's ``T``-row leg: a step of several requests, or
             # one request's verify step of ``1 + k`` rows. The one-ring form below
             # serves exactly one token (the layer's ``tail_step``), so a one-request
-            # step keeps it only on the plain decode leg -- the Stage-A carrier, bit
+            # step keeps it only on the plain decode leg -- the plain decode carrier, bit
             # for bit -- and on the prefill leg.
             if len(state_slots) > 1 or (not is_prefill and request_width > 1):
                 carriers.append(
@@ -12379,8 +12379,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         Under async scheduling ``sampled`` is a device future that the output thread reads
         back inside ``AsyncNeuronModelRunnerOutput.get_output()``, and ``drafts`` is a
         second output of the same execution. A read here would make this thread a second
-        reader of that future, and the runtime delivers a future's completion once: the
-        gate's knob-5 server hung at its first decode step exactly there (rank 0's main
+        reader of that future, and the runtime delivers a future's completion once: a
+        knob-5 server hung at its first decode step exactly there (rank 0's main
         thread, in ``execute_model``'s forward epilogue ``_execute_model_forward``; the
         engine core timed out behind it). So the step is stashed -- its bookkeeping and
         its unread draft tensor -- for the output object ``sample_tokens`` builds next to

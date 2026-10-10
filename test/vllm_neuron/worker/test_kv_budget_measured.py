@@ -12,10 +12,10 @@
 
 ``VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION`` caps the budget only when set. There is
 no per-physical-core bound: the runtime accounts every tensor of a rank on the
-even physical core (14.46 GiB on ND 0 NC 0 at tip-b64-C, more than half the
+even physical core (14.46 GiB on ND 0 NC 0 in the recorded bs=64 @ 8k serve run, more than half the
 logical core's 24 GiB), so the logical core is the only capacity there is.
 
-The served figures are the bs=64 @ 8k gate line at b17526a, gate run tip-b64-C
+The served figures are the bs=64 @ 8k line as measured
 server log (every rank): "Neuron HBM: 7.06 GiB used, 16.94 GiB free", parameters
 1.63 GiB, resident 6.79 GiB, need 5.845 GiB, allocated 6.329 GiB (side caches
 0.347 GiB).
@@ -24,7 +24,7 @@ A warm compile cache is built in a temporary directory from the recorded decode
 graph of that line (``fixtures/glm53f_bs64x8k_decode_b1_ctx2048.neff``, see
 ``test_neff_memory.py``). One test reads the line's real 15-graph cache; it runs
 only when the test-only variable ``VLLM_NEURON_TEST_COMPILE_CACHE_ROOT`` names the
-tip-b64-C compile cache (its ``neuron/compile_cache`` directory) and is skipped when
+recorded run's compile cache (its ``neuron/compile_cache`` directory) and is skipped when
 it is unset. It is a test knob, not a serving knob, so it is not registered in
 ``vllm_neuron/envs.py``.
 
@@ -54,10 +54,10 @@ TIP_USED_BYTES = int(7.06 * GIB)
 TIP_FREE_BYTES = kv.TOTAL_HBM_BYTES - TIP_USED_BYTES
 TIP_PARAM_BYTES = kv.TIP_PARAM_BYTES
 TIP_RESIDENT_BYTES = kv.TIP_RESIDENT_BYTES
-#: 64 x 8192 on the gate line (test_kv_budget_side_caches.py's hand total).
+#: 64 x 8192 on the served line (test_kv_budget_side_caches.py's hand total).
 TIP_FOOTPRINT_BYTES = 6795902976
 TIP_NEED_BYTES = 6276120576
-#: The two figures the old budget took at tip-b64-C: 0.30 x 0.92 x 24 GiB and
+#: The two figures the old budget took in the recorded run: 0.30 x 0.92 x 24 GiB and
 #: 24 / 2 - 5 GiB.
 OLD_CAP_BYTES = int(int(kv.TOTAL_HBM_BYTES * kv.GPU_MEMORY_UTILIZATION) * 0.30)
 OLD_CORE_BOUND_BYTES = kv.TOTAL_HBM_BYTES // 2 - 5 * GIB
@@ -114,7 +114,7 @@ def _margin() -> int:
 
 
 def test_the_budget_is_free_memory_less_graph_need_less_margin(model_specs) -> None:
-    """At tip-b64-C: 16.94 GiB free, a 1.31 GiB graph need, the margin: 15.4 GiB."""
+    """In the recorded run: 16.94 GiB free, a 1.31 GiB graph need, the margin: 15.4 GiB."""
     graph_bytes = int(1.31 * GIB)
     worker = _graph(_tip_worker(model_specs), graph_bytes)
 
@@ -378,7 +378,7 @@ def test_upstream_still_defaults_max_num_seqs_to_256_on_24_gib(monkeypatch) -> N
 
 
 def test_the_largest_max_num_seqs_that_fits_is_derived_from_the_budget(model_specs) -> None:
-    """At 8192 tokens and the tip-b64-C budget: the S whose footprint fits, and not S + 1."""
+    """At 8192 tokens and the recorded run's budget: the S whose footprint fits, and not S + 1."""
     worker = _graph(_tip_worker(model_specs, seqs=256), int(1.31 * GIB))
     budget = worker._determine_available_memory_neuron(kv.GPU_MEMORY_UTILIZATION)
 

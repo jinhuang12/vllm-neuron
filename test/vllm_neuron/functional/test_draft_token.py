@@ -3,7 +3,7 @@
 
 At TP=64 each rank holds ``154880 / 64 = 2420`` rows of the head. A rank's local
 ``argmax`` is an index into its own shard, so handing it on as a token id is wrong on
-63 of 64 ranks (mtp.md H2). The route under test takes the shard's ``(max, argmax)``
+63 of 64 ranks. The route under test takes the shard's ``(max, argmax)``
 pair -- the output tail kernel's second result (``functional/mtp/tail_out.py``), here
 built by its torch route ``shard_pair`` from the shard logits -- all-gathers that
 ``[B, 2]`` pair once over the group and resolves the global id as

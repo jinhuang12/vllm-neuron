@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Device repro and check of the bank-form KDA graph inputs (worker-32, wt2/hostpath round 3).
+"""Device repro and check of the bank-form KDA graph inputs.
 
 Run through the device lease on slice ``host`` (one trn2 chip, 4 logical cores):
 
@@ -8,10 +8,10 @@ Run through the device lease on slice ``host`` (one trn2 chip, 4 logical cores):
         <venv>/bin/python test/hardware/bank_input_contiguity.py \\
         --tree <worktree> --json <out> --form both --batches 2 64
 
-The gate's bs=64-line server failed its first bank-form decode warmup (b2/s2048) in
+A bs=64 server failed its first bank-form decode warmup (b2/s2048) in
 ``libtorch_neuronx_lite/compile/backend.py:552 executor.execute`` with "Detected
 non-contiguous slicing for requested Device Tensor". The bank form hands each KDA layer its
-two WHOLE state banks as graph inputs; at 3098da3 the KV allocation built them as
+two WHOLE state banks as graph inputs; an earlier KV allocation built them as
 slot-strided ``torch.as_strided`` views of one raw buffer (both states side by side in
 every slot), and the executor accepts only a contiguous slice of a storage.
 
@@ -20,7 +20,7 @@ What runs here, on one KDA layer's raw buffer at the bs=64 line's real geometry 
 ``[1, 128, 128]`` fp32, one head per rank at TP=64), with the production gather/scatter
 (:mod:`vllm_neuron.functional.state_banks`) as the captured graph:
 
-* ``--form old``: the banks are built exactly as 3098da3's allocation built them (the
+* ``--form old``: the banks are built exactly as the earlier allocation built them (the
   loop is copied below, same strides and offsets). Expected: the graph compiles and its
   first execution raises the executor's non-contiguous-slicing error (the repro);
 * ``--form new``: the banks are built by the fixed allocation
@@ -95,7 +95,7 @@ def say(text: str) -> None:
 
 
 def strided_slot_banks(raw: torch.Tensor) -> list[torch.Tensor]:
-    """3098da3's allocation (neuron_model_runner.py:10581-10616): slot-strided views."""
+    """The earlier allocation: slot-strided views of one raw buffer."""
     num_slots = raw.numel() // SLOT_BYTES
     state_tensors = []
     state_offset_bytes = 0

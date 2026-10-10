@@ -3,17 +3,17 @@
 
 An mtp server's runner allocates the two DSA indexer rings (``tail``, ``pad_tail``;
 ``NeuronModelRunner._glm5next_side_caches``) ``R = indexer_ring_depth(index_kpool, k)``
-rows deep instead of ``index_kpool`` (worker-58's table: 8 for k in 2..5 against a pool
+rows deep instead of ``index_kpool`` (the depth table: 8 for k in 2..5 against a pool
 of 4), so a slot's side caches grow by ``2 rings x 2 x (R - index_kpool) x
 index_head_dim x 2 B`` per sparse layer. ``neuron_worker._indexer_side_cache_bytes``
 prices the side caches for the fit check (``_kv_cache_footprint_bytes``,
 ``determine_available_memory``) and must hand the pricer the server's ``k``
 (``num_speculative_tokens`` of the runner's ``method == "mtp"`` speculative config, 0 otherwise),
-or the check under-prices exactly that growth (CLEANUP R.4; team-lead's wave-2 grant).
+or the check under-prices exactly that growth.
 
 Expectations are derived from the fixture's layer count, the config's indexer dials and
-the ring depth the runner's own helper returns. The depth helper is worker-58's
-(``vllm_neuron.functional.dsa.decode_trow``); on a tree without it the plumbing is
+the ring depth the runner's own helper returns. The depth helper lives in
+``vllm_neuron.functional.dsa.decode_trow``; on a tree without it the plumbing is
 pinned with a fixed stand-in depth and the served-figure test is a strict xfail.
 
     NKI_SIMULATOR=1 VLLM_NEURON_CPU_MODE=1 python -m pytest \\
@@ -134,8 +134,8 @@ def test_the_fit_check_counts_the_deeper_rings(monkeypatch) -> None:
 
 @SEAM
 def test_the_served_bs64_line_prices_the_tables_growth_at_k_3() -> None:
-    """With worker-58's depth table (8 rows at k = 3 against a pool of 4) the bs=64 line's
-    fit check prices 2.75 MiB more per rank; per slot the figure worker-58's table states
+    """With the depth table (8 rows at k = 3 against a pool of 4) the bs=64 line's
+    fit check prices 2.75 MiB more per rank; per slot the figure the table states
     at 65 slots (+2.79 MiB)."""
     from vllm_neuron.functional.dsa.decode_trow import indexer_ring_depth
 

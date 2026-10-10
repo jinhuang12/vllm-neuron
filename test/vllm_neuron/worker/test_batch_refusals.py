@@ -36,7 +36,7 @@ RUNNER = ROOT / "vllm_neuron/vllm/worker/neuron_model_runner.py"
 MODEL = ROOT / "vllm_neuron/model/glm5_next/model_fp8.py"
 MOE_DECODE = ROOT / "vllm_neuron/functional/moe/moe_fused_fp8_decode.py"
 
-#: The refusal text of each wave-1 site, verbatim from 594d425 + the wave-1 kernel branches.
+#: The refusal text of each site that declines a batch, verbatim.
 REFUSALS = {
     RUNNER: (
         "if len(state_slots) != 1:",
@@ -51,7 +51,7 @@ REFUSALS = {
     MOE_DECODE: ("assert q == 1",),
 }
 
-#: The gate's bs=64 point.
+#: The served bs=64 point.
 MAX_NUM_SEQS = 64
 NUM_SEQS_BUCKETS = [1, 2, 4, 8, 16, 32, 64]
 MAX_MODEL_LEN = 8192

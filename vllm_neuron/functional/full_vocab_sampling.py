@@ -7,7 +7,7 @@ So this sampler reads no process group: each rank samples the same rows it holds
 the GLM root's logits -> token hand-off; it returns ``[B]`` int32 token ids, the form the
 async runner feeds back as the next step's ``input_ids``.
 
-B is any batch the decode graph is compiled for (wave 2 goes to 64). Each request brings
+B is any batch the decode graph is compiled for (up to 64). Each request brings
 its own ``[top_k, top_p, temperature]`` row, the layout
 ``build_sampling_params_tensor`` builds.
 

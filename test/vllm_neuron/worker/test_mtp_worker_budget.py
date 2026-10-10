@@ -4,7 +4,7 @@
 ``NeuronWorker._get_byte_used_from_model`` adds the drafter's parameters to the
 target's; the mtp head is a submodule of the GLM-5.3-Flash root, so a drafter that
 declares ``shares_target_parameters`` is skipped, or its bytes would be counted twice
-and the KV budget shrink by the head's size (team-lead ruling 10:10Z, hunk 3). An
+and the KV budget shrink by the head's size. An
 eagle drafter, a model of its own, is still counted.
 
     NKI_SIMULATOR=1 VLLM_NEURON_CPU_MODE=1 python -m pytest \\

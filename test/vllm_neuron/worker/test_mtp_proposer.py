@@ -2,7 +2,7 @@
 """The MTP proposer and the runner's ``method == "mtp"`` branch.
 
 ``vllm_neuron/vllm/spec_decode/mtp.py`` holds ``MtpProposer``: the GLM-5.3-Flash
-draft served from the target graph (the root's own ``mtp`` head, Stage A), so the
+draft served from the target graph (the root's own ``mtp`` head), so the
 proposer owns no model, compiles no graph, and hands the runner the ``[B, k]`` draft
 ids the root returned. Covered here: the runner builds it from a ``method: mtp``
 engine config and keys its decode threshold on ``k``; the two configurations the
@@ -37,7 +37,7 @@ from test.vllm_neuron.model.glm5_next.tiny import test_tiny_glm5next_first_reque
 pytestmark = [pytest.mark.forked]
 
 FIXTURE = pathlib.Path(__file__).resolve().parents[2] / "vllm_neuron" / "model" / "glm5_next" / "fixtures"
-#: The first k the packet serves.
+#: The served draft count.
 DRAFT_K = 3
 KNOB = head_module.SHADOW_DRAFT_ENV
 
@@ -162,7 +162,7 @@ def test_the_eagle_only_hooks_are_no_ops():
     assert proposer.graph_extract(num_tokens=4, num_reqs=1, attn_metadata={}, device=None) is None
 
 
-# ── the head's reader of k honours the speculative config (team-lead ruling 10:10Z, hunk 1) ──
+# ── the head's reader of k honours the speculative config ──
 
 
 def test_the_reader_takes_k_from_the_current_speculative_config(monkeypatch):

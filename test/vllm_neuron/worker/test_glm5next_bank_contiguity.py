@@ -4,8 +4,8 @@
 The Neuron executor refuses a graph input that is not a contiguous slice of its storage
 ("Detected non-contiguous slicing for requested Device Tensor", ``libtorchneuron.so``,
 ``csrc/neuron_op/storage.h``). The bank form hands each recurrent (KDA) layer its two
-WHOLE state banks, so the banks themselves, not just their rows, must be contiguous. At
-3098da3 the KV allocation built each state as a slot-strided ``torch.as_strided`` view of
+WHOLE state banks, so the banks themselves, not just their rows, must be contiguous. An
+earlier KV allocation built each state as a slot-strided ``torch.as_strided`` view of
 one raw buffer (both states side by side inside every slot): one row ``bank[slot]`` was
 contiguous, so the per-request view form ran, and the whole bank was not, so the first
 bank-form warmup (b2/s2048) failed on device. CPU tensors accept any strides, so no CPU
@@ -254,7 +254,7 @@ def test_a_bank_form_carrier_refuses_a_strided_bank_by_name(monkeypatch: pytest.
     monkeypatch.delenv(runner_side.STATE_BANKS_ENV, raising=False)
     monkeypatch.delenv("VLLM_NEURON_KDA_FUSED_DECODE", raising=False)
     banks, side, geometries = _stack(linear=2, sparse=1)
-    # 3098da3's layout for the second recurrent layer: both states in one buffer, one slot
+    # The earlier layout for the second recurrent layer: both states in one buffer, one slot
     # (conv row + recurrent row) per stride, so the whole bank is not contiguous.
     conv_row, recurrent_row = 2 * 3, 1 * 2 * 2
     raw = torch.zeros(8 * (conv_row + recurrent_row), dtype=torch.float32)

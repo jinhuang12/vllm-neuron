@@ -7,8 +7,8 @@ every ``linear_attn`` bank is ``[slots, 1 + k, *state]`` (the per-slot state the
 spec declares, one row per verify-step token) and the bank record names the axis
 (``state_checkpoints == 1 + k``), which the translator reads for the prefill leg's
 one-row carrier ``bank[slot, 0]``; with speculation off the banks are ``[slots, *state]``
-and the record carries no ``state_checkpoints`` key (absent = 1, the Stage-A record; team-lead
-ruling (a)). Expectations come
+and the record carries no ``state_checkpoints`` key (absent = 1, the
+plain record). Expectations come
 from the layer spec the runner reports and from ``k``; no shape is pinned here.
 
 The model is a double whose ``bind_kv_cache`` IS ``Glm5NextForConditionalGeneration``'s
@@ -16,11 +16,11 @@ The model is a double whose ``bind_kv_cache`` IS ``Glm5NextForConditionalGenerat
 ``Glm5NextKDAAttention`` layer's spec: the tiny root fixture materialises DSA stacks only.
 
 Seam: the bank allocation (``state_bank_regions(checkpoints=1 + k)``) and the bind's
-acceptance of the axis are worker-57's (``wt2/mtpB-kda``, bind hunk granted by team-lead
-13:4xZ). On a tree whose allocator has no ``checkpoints`` parameter the two speculative
+acceptance of the axis are the KDA bank allocator's own. On a tree whose allocator has
+no ``checkpoints`` parameter the two speculative
 cases are a strict ``xfail`` naming that seam (plain banks, no record); on the merged tree
 the condition drops and the cases must pass -- a bind that still refuses the axis, or a
-record without ``state_checkpoints``, fails them. Named in the round-1 brief.
+record without ``state_checkpoints``, fails them.
 """
 
 from __future__ import annotations
@@ -43,7 +43,7 @@ BLOCKS = 4
 
 
 def _tree_carves_checkpoint_banks() -> bool:
-    """True once the allocator takes ``checkpoints`` (worker-57's ``state_bank_regions``)."""
+    """True once the allocator takes ``checkpoints`` (the allocator's ``state_bank_regions``)."""
     import inspect
 
     from vllm_neuron.vllm.worker.glm5next_state_banks import state_bank_regions

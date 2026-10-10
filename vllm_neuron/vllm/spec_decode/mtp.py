@@ -4,7 +4,7 @@
 ``--speculative-config '{"method": "mtp", "num_speculative_tokens": k}'`` names the
 draft the checkpoint carries itself: the decoder layer past the stack, which the
 root model builds as ``Glm5NextForConditionalGeneration.mtp``
-(``vllm_neuron/model/glm5_next/mtp.py``, Stage A) and runs inside its own forward.
+(``vllm_neuron/model/glm5_next/mtp.py``) and runs inside its own forward.
 Every decode step of the root therefore already returns ``(sampled_or_accepted,
 draft_ids)``: on the one-token decode leg the ``[B, k]`` ids drafted from the row
 it sampled, on the verify leg (``1 + k`` rows per request) the ``[B, k + 1]``

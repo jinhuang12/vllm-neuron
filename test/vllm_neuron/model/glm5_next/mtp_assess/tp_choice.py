@@ -15,9 +15,9 @@ constants per LOGICAL core (LNC2): 24 GiB HBM, 716 GB/s. For TP in {8, 16, 32, 6
   state is per sequence and shards by head (64 heads -> 1 head/rank at TP=64);
 * KV budget per rank = min(user budget = GMU x HBM - weights, cap = GMU x HBM x 0.30, physical-core bound =
   min(HBM/2 - 5 GiB reserve, 2 x (HBM/2 - 5 GiB) - weights)), the worker's own formula (``neuron_worker.py:1116-1135``
-  ``_physical_core_kv_bound`` and ``:1273-1290`` ``_compute_kv_budget``; inputs as the gate line logs them:
+  ``_physical_core_kv_bound`` and ``:1273-1290`` ``_compute_kv_budget``; inputs as the served configuration logs them:
   ``total_hbm=24.00 GiB``, ``gpu_memory_utilization`` 0.92, ``cap=6.62 GiB``, ``physical_core_bound=7.00 GiB``,
-  tip-b64-C ``server.log:6032``). ``free after the 5 GiB reserve`` (HBM - 5 GiB - weights) is reported too: it is
+  the recorded bs=64 @ 8k serve run's server log). ``free after the 5 GiB reserve`` (HBM - 5 GiB - weights) is reported too: it is
   the memory left, not the code's bound (section 10 A1 names the per-core term as a software heuristic);
 * ITL byte term = active bytes / 716 GB/s; the fixed part of the step (collectives, launch, glue)
   is taken from today's measured 16.96 ms at TP=64 and held constant, which is what makes the
@@ -40,17 +40,17 @@ import json
 from pathlib import Path
 
 GIB = 2**30
-HBM_PER_LOGICAL_CORE = 24 * GIB          # total_hbm=24.00 GiB as the worker logs it (tip-b64-C server.log:6032)
-GPU_MEM_UTIL = 0.92                      # the gate line's gpu_memory_utilization (total_budget=22.08 GiB = 0.92 x 24.00)
+HBM_PER_LOGICAL_CORE = 24 * GIB          # total_hbm=24.00 GiB as the worker logs it (the recorded bs=64 @ 8k serve run)
+GPU_MEM_UTIL = 0.92                      # the served configuration's gpu_memory_utilization (total_budget=22.08 GiB = 0.92 x 24.00)
 HBM_BW = 716e9                           # bytes/s per logical core
 GRAPH_RESERVE = 5 * GIB                  # envs.py VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB default
 KV_CAP_FRACTION = 0.30                   # envs.py VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION default
-ITL_TODAY_MS = 16.96                     # TP=64 EP=16 bs=1 ctx~1k, b17526a
+ITL_TODAY_MS = 16.96                     # TP=64 EP=16 bs=1 ctx~1k
 N_EXPERTS, TOPK = 288, 8
 N_DSA, N_KDA = 11, 34
 KV_LORA, ROPE = 512, 0                   # MLA latent per token (bf16)
 KDA_HEADS, KDA_HEAD_DIM = 64, 128        # recurrent state per head: 128 x 128 fp32; conv state 4 x 3 x 128 x ... small
-INDEXER_SIDE_BYTES_PER_TOKEN = 0.3466 * GIB / (64 * 8192)   # kv.md: 0.3466 GiB for 64 x 8k at TP=64 (per rank)
+INDEXER_SIDE_BYTES_PER_TOKEN = 0.3466 * GIB / (64 * 8192)   # 0.3466 GiB for 64 x 8k at TP=64 (per rank)
 MLA_HEADS = 64                           # TP ceiling (query heads); KDA also 64 heads
 EP_TODAY = 16
 

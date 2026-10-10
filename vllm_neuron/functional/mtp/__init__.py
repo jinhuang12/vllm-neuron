@@ -8,6 +8,6 @@
   GEMV and the local ``(max, argmax)`` pair the draft-token gather consumes.
 
 Each module exposes ``<name>_kernel`` (the ``nki.jit`` kernel), ``<name>`` (the
-dispatching entry point) and ``<name>_torch`` (the Stage A arithmetic, the CPU
+dispatching entry point) and ``<name>_torch`` (the traced head's arithmetic, the CPU
 route and the tests' reference), plus dispatch counters the tests read.
 """

@@ -112,8 +112,8 @@ Limits of the class:
 # 2026-10-08 ~06:45Z  engine ALL (AllEngineBarrier, GroupResetSemaphores) orders every engine;
 #                     GroupResetSemaphores zeroes its group in the wait audit (REPORT.md 10, 11).
 # 2026-10-08 07:50Z   the repository check is test/vllm_neuron/functional/dsa/sbuf_order.py
-#                     (equal on 313 dumps, w47/sbuf_order/validate_port.json).
-# 2026-10-08 10:05Z   (trn2-2 08:50Z notes, team-lead 09:25Z) three defects fixed; CHANGELOG.md:
+#                     (equal on 313 dumps).
+# 2026-10-08 10:05Z   three defects fixed; CHANGELOG.md:
 #                     (1) a `register_ap` operand (runtime address) was dropped, so a dump
 #                     with one reported fewer pairs, down to 0, as if checked. DRAM: the whole
 #                     tensor is its footprint now. SBUF/PSUM: the dump is UNDECIDED, with the
