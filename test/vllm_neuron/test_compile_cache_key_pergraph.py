@@ -830,7 +830,7 @@ def test_the_dotted_path_separates_a_package_kernel_from_its_nkilib_namesake():
 
 
 # Each row: a kernel module, a file an edit of which must move that kernel's
-# digest, and the reason the closure reaches it (file:line at 866f8c4).
+# digest, and the reason the closure reaches it.
 TRAP_ROWS = [
     # A kernel called inside another traced kernel.
     ("moe.hierarchical_all2all_combine_reduce", "functional/moe/topk_reduce.py"),  # :18/:139

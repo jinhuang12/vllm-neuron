@@ -1,6 +1,6 @@
 """The shadow draft under async scheduling, two ranks on the CPU: every step's output comes back.
 
-The incident this pins (gate/mtp-A run of 2026-10-08, ``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT=5``,
+The incident this pins (a served run of 2026-10-08, ``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT=5``,
 TP=64): the server hung at the first decode step. Every device execution had completed; no
 rank raised; the engine core timed out waiting for a free broadcast block because rank 0
 never returned from ``sample_tokens``. Rank 0 is the one rank that scores drafts, and the

@@ -639,7 +639,7 @@ def test_greedy_speculative_output_is_token_identical_to_the_plain_run(tmp_path,
                                            finished=finished, oracle=oracle)
                 finished = {f"mtp-{k}-{i}"}
                 assert ids == references[i][:GENERATED], (k, name, i)
-                # The prefill leg populates the head once (Stage A); every verify step
+                # The prefill leg populates the head once; every verify step
                 # populates once and drafts once.
                 assert (oracle.populated, oracle.calls) == (steps + 1, steps), (k, name, steps)
                 report.append((k, name, steps))

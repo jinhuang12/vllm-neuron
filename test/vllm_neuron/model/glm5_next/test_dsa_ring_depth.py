@@ -23,7 +23,7 @@ from vllm_neuron.functional.dsa.decode_trow import indexer_ring_depth
 
 #: Slots per pool: the model constant the depth is derived from.
 POOL = layer_half.POOL_SIZE
-#: The depth :func:`indexer_ring_depth` answers for the gate's draft count, and the one
+#: The depth :func:`indexer_ring_depth` answers for the served draft count, and the one
 #: every deep-ring case below runs at.
 GATE_DRAFTS = 3
 #: Chunk ends that leave 1, 2 and 3 rows in the open pool, straddling the deep ring's
@@ -66,7 +66,7 @@ def test_the_depth_is_todays_pool_when_nothing_drafts(drafts) -> None:
 
 @pytest.mark.parametrize("drafts", [1, 2, GATE_DRAFTS, 4, 5, 6])
 def test_the_depth_holds_every_verify_row_and_the_rollback_window(drafts: int) -> None:
-    """The ruling's closed form: the next power of two at or above
+    """The closed form: the next power of two at or above
     ``max(index_kpool, drafts + 3)``; a verify step of ``1 + drafts`` rows fits, and
     half the depth would not."""
     depth = indexer_ring_depth(POOL, drafts)

@@ -27,7 +27,7 @@ in column chunks of 512 through the DMA engines' transpose
 rounded to bf16 on the copy out of PSUM. Under two programs (LNC2) each program
 takes half of the shard's rows (its output columns) and writes its own slice.
 
-The torch route (:func:`mtp_tail_in_torch`) is the Stage A expression verbatim: the
+The torch route (:func:`mtp_tail_in_torch`) is the traced head's expression verbatim: the
 CPU-mode and kill-switch path, and the reference the kernel is tested against.
 """
 
@@ -219,7 +219,7 @@ def _checked(token_ids: Tensor, table: Tensor, positions: Tensor, previous: Tens
 def mtp_tail_in_torch(token_ids: Tensor, table: Tensor, positions: Tensor, previous: Tensor,
                       enorm: Tensor, hnorm: Tensor, eh_proj_rows: Tensor, *, eps: float
                       ) -> Tensor:
-    """The tail as torch ops, the Stage A ``_layer_input`` arithmetic bit for bit.
+    """The tail as torch ops, the traced head's ``_layer_input`` arithmetic bit for bit.
 
     Each norm is ``(x32 * rsqrt(mean(x32**2) + eps)) * gain32`` cast to the input
     dtype; the GEMV is ``linear`` over the bf16 concatenation.

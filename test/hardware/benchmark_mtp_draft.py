@@ -4,7 +4,7 @@
 Run it through the device lease (``devlease.py slice dense -- ...``); this script does
 not select cores. One graph per ``k`` in ``--ks``:
 ``Glm5NextMultiTokenPredictor.draft_tokens`` for one request, the ``k`` iterations
-unrolled in that one graph (the fused form of mtp.md 8.5), each iteration the whole of
+unrolled in that one graph (the fused form), each iteration the whole of
 layer 45 at this rank's share:
 
 * the head's own arithmetic as its two kernels (``functional/mtp/``): K1' ``mtp_tail_in``
@@ -23,7 +23,7 @@ layer 45 at this rank's share:
 Geometry notes. ``vocab_size`` is set to the shard's 2420 rows, so the head is "whole" at
 one rank and the token is the plain ``argmax``: the same GEMV as the sharded route without
 the 2 x 64-value all-gather, which one rank cannot run. The request's next page is
-allocated in the block table (what Stage B's lookahead allocation does): iterations
+allocated in the block table (what the lookahead allocation does): iterations
 ``1 .. k-1`` write rows 1024..1027, and without that page they would land on the null
 block. ``index_share_for_mtp_iteration`` stays the checkpoint's ``True``; in the bypass
 regime the carrier stays empty, so every iteration runs the indexer's write stage.
@@ -211,7 +211,7 @@ class _LayerInputGatherEmulation:
 
     ``all_gather`` of the layer-input slice ``[B, H / world]`` tiles it ``world`` times to
     ``[B, H]`` -- the bytes and shapes of the served rank's work without the collective
-    (the real 8 KiB per-rank all-gather is the TP=64 gate's to measure); the drafted ids
+    (the real 8 KiB per-rank all-gather is for a TP=64 run to measure); the drafted ids
     are therefore a timing proxy, not the model's. Any other tensor (the draft token's
     ``[B, 2]`` pair) passes through unchanged, and the object carries no ``world_size``,
     so ``draft_token_ids`` keeps its one-rank form (the owner select over 64 pairs is O(B)
@@ -371,10 +371,10 @@ def run_ops(args, cfg, qc, device) -> dict:
     ``mtp_tail_in`` (embedding gather, mask, ``enorm``/``hnorm``, concat, ``eh_proj``) and
     K2 ``mtp_tail_out`` (residual add, shared-head norm, this rank's 2420 head rows,
     ``(max, argmax)``). K1' is timed twice: as the chain runs it at one rank (the whole
-    ``[H, 2H]`` ``eh_proj``, the same bytes Stage A's replicated tail streamed, so the
+    ``[H, 2H]`` ``eh_proj``, the same bytes the traced head's replicated tail streamed, so the
     chain compares like for like) and standalone at the served per-rank shape (the
     64-row shard, the kernel's own entitlement; its all-gather needs the 64-rank group
-    and is the gate trace's). Each weight-streaming piece carries its bytes and its
+    and is the served trace's). Each weight-streaming piece carries its bytes and its
     entitlement, ``bytes / HBM_BYTES_PER_US_PER_CORE``; the device run adds the measured
     median and the ratio. Each piece also carries its own launch floor (the ``null``
     graph), so the floor is reported beside the raw medians; the fused k=1 graph timed

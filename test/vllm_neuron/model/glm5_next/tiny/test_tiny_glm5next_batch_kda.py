@@ -9,7 +9,7 @@ served step reaches them:
 2. the banks are snapshotted;
 3. the batched arm decodes all B requests together for two steps (one row per request);
 4. the reference arm restores the snapshot and decodes the same requests one at a time
-   (B one-request steps per decode step), the path wave 1 served.
+   (B one-request steps per decode step), the one-request path.
 
 Both arms must leave every bank row bit-identical. The batched arm must take ONE
 ``kda_fused_decode`` dispatch per layer per step, where the reference takes one per

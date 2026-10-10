@@ -207,7 +207,7 @@ def test_two_steps_leave_each_recurrent_sharer_its_own_state(
     """A prefill and one decode leave each sharer its own state, equal to its solo run.
 
     Run twice: at the attention block size, and with ``--mamba-block-size`` set to
-    ``max_model_len`` (the gate's serve line), where the recurrent group's block spans
+    ``max_model_len`` (the served TP=64 configuration), where the recurrent group's block spans
     the sequence and its block table is one entry wide.
     """
     e2e._require_cpu_mode()

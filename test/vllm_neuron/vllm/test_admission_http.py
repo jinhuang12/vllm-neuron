@@ -10,7 +10,7 @@ greedy tokens, so "the engine was not touched" is a count of what crossed that s
 
 Before this change the same harness returns 200 for a prompt past the window and for
 ``top_k=50`` (both reach the engine), 500 ``list index out of range`` for ``logprobs=5``
-(the gate's server.log), and 200 with an error event for a streamed refusal.
+(as the server log records), and 200 with an error event for a streamed refusal.
 
     NKI_SIMULATOR=1 VLLM_NEURON_CPU_MODE=1 PYTHONPATH=$PWD python -m pytest \\
         test/vllm_neuron/vllm/test_admission_http.py

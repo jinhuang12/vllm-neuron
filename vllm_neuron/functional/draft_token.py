@@ -3,8 +3,8 @@
 
 At TP=64 each rank holds ``154880 / 64 = 2420`` rows of the head
 (``functional/lm_head.py``). A rank's local ``argmax`` over its shard logits is an
-index into its own shard, so handing it on as a token id is wrong on 63 of 64 ranks
-(mtp.md H2). The route here keeps the head sharded and moves two numbers per row:
+index into its own shard, so handing it on as a token id is wrong on 63 of 64 ranks.
+The route here keeps the head sharded and moves two numbers per row:
 
     shard logits [B, rows]  ->  (max, argmax) per row [B, 2]   (the output tail
                                  kernel's epilogue, functional/mtp/tail_out.py)

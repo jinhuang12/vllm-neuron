@@ -9,7 +9,7 @@ tiny MoE fixture's torch reference (``_routed_output`` + ``_dense_output`` on th
 router oracle's affinities); the residual adds and the shared-head norm in torch; the
 greedy token as the ``argmax`` over the whole tiny vocabulary's bf16 logits.
 
-Pinned by the tests below (mtp.md H1, H2, H4, H8, H9 and the Stage A contract):
+Pinned by the tests below:
 
 * ``populate(hidden_rows, next_ids, positions)``: row ``t`` consumes ``h_t`` and
   ``embed(x_{t+1})``, position 0's embedding is masked, and the layer-45 state those

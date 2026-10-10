@@ -21,8 +21,8 @@ import json
 from pathlib import Path
 
 # --- inputs ----------------------------------------------------------------------------
-ITL_TODAY_MS = 16.96            # bs=1 ctx~1k standard line, tip 8aa22fa (00_brief.md / gate_admission)
-DEVICE_STEP_MS = 16.63          # unprofiled device period, point A (DECODE_BREAKDOWN_v2 §2)
+ITL_TODAY_MS = 16.96            # bs=1 ctx~1k standard line, tip 8aa22fa
+DEVICE_STEP_MS = 16.63          # unprofiled device period, point A
 HOST_SLACK_MS = ITL_TODAY_MS - DEVICE_STEP_MS
 
 # point-A in-model buckets (DECODE_BREAKDOWN_v2 master table, profiled step 18.34 ms)
@@ -57,7 +57,7 @@ KERNELS = {
 }
 
 # the draft step (one MTP layer = DSA attention half + MoE half + head extras), us per step at B=1,
-# filled in from benchmark_mtp_draft.py (device) + the MoE/dense microbenchmarks; see mtp.md §3.
+# filled in from benchmark_mtp_draft.py (device) + the MoE/dense microbenchmarks.
 DRAFT_DEFAULT_US = {"head_block_measured_or_estimated": None}
 
 

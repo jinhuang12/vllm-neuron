@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """K2: the MTP draft iteration's output tail as one NKI kernel.
 
-Stage A's draft loop (``model/glm5_next/mtp.py``) ends each iteration with::
+The traced head's draft loop (``model/glm5_next/mtp.py``) ends each iteration with::
 
     mixed = attended + ffn                       # bf16 add
     hidden = rms(mixed, shared_head_norm)        # fp32 interior, bf16 out
@@ -27,7 +27,7 @@ half of the shard rows, offsets its index by its first row, and the two pairs ar
 exchanged (``sendrecv``) and combined with the same rule: the larger max, the lower
 index on a tie. Program 0 writes both outputs.
 
-The torch route (:func:`mtp_tail_out_torch`) is the Stage A expression verbatim: the
+The torch route (:func:`mtp_tail_out_torch`) is the traced head's expression verbatim: the
 CPU-mode and kill-switch path, and the reference the kernel is tested against.
 """
 
@@ -261,7 +261,7 @@ def _checked(attended: Tensor, ffn: Tensor, gain: Tensor, head_rows: Tensor,
 
 def mtp_tail_out_torch(attended: Tensor, ffn: Tensor, gain: Tensor, head_rows: Tensor, *,
                        eps: float) -> tuple[Tensor, Tensor]:
-    """The tail as torch ops, the Stage A draft loop's arithmetic bit for bit.
+    """The tail as torch ops, the traced head's draft loop arithmetic bit for bit.
 
     ``hidden = rms(attended + ffn, gain)`` (fp32 interior, cast to the inputs' dtype);
     ``pair = shard_pair(linear(hidden, head_rows).float())``.

@@ -154,7 +154,7 @@ def test_router_rms_scale_is_the_first_rounding_only():
 
     On the device neuronx-cc folds a ``bf16 -> fp32`` convert that follows an
     ``fp32 -> bf16`` one, so a torch ``bf16(bf16(x * rstd) * gamma)`` runs there as one
-    rounding (``/tmp/w28/exp/exp9.py``: 99.99% of elements equal ``bf16(x * rstd *
+    rounding (measured: 99.99% of elements equal ``bf16(x * rstd *
     gamma)``, 78% equal the two-rounding value). With nothing after the first rounding in
     XLA there is no pair to fold, and the kernel's gamma multiply rounds the way the
     fused kernel's norm stage does (same ``tensor_tensor`` on the same SBUF tile).

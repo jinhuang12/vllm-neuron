@@ -232,7 +232,7 @@ def test_a_one_row_decode_and_a_prefill_are_recorded_for_the_hook_too():
     converted = _convert(world, [0], cached=[start], tokens=1, real=[1], width=1)
     record = world.runner._glm5next_step_record
     assert (record["is_prefill"], record["width"], record["counts"]) == (False, 1, [1])
-    # The plain one-row step of one request keeps the one-ring form (the Stage-A carrier).
+    # The plain one-row step of one request keeps the one-ring form (the plain decode carrier).
     for carrier in _sparse(world, converted["layer_carriers"]):
         assert torch.is_tensor(carrier["tail"]) and int(carrier["position"]) == start
     plain = shadow._world()

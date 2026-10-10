@@ -8,7 +8,7 @@ Run through the device lease on slice ``host`` (one trn2 chip, 4 logical cores):
         <venv>/bin/python test/hardware/bank_input_contiguity.py \\
         --tree <worktree> --json <out> --form both --batches 2 64
 
-The gate's bs=64-line server failed its first bank-form decode warmup (b2/s2048) in
+A bs=64 server failed its first bank-form decode warmup (b2/s2048) in
 ``libtorch_neuronx_lite/compile/backend.py:552 executor.execute`` with "Detected
 non-contiguous slicing for requested Device Tensor". The bank form hands each KDA layer its
 two WHOLE state banks as graph inputs; at 3098da3 the KV allocation built them as

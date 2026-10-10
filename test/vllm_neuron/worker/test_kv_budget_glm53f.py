@@ -44,7 +44,7 @@ BLOCK_SIZE_TOKENS = 128
 MLA_LAYERS = 11
 KDA_LAYERS = 34
 
-#: The served point the gate needs.
+#: The served point.
 SERVED_MAX_NUM_SEQS = 64
 SERVED_MAX_MODEL_LEN = 8192
 MAX_NUM_BATCHED_TOKENS = 1024
@@ -74,7 +74,7 @@ MEASURED_PARAM_BYTES = int(2.79 * GIB)
 MEASURED_RESIDENT_BYTES = int(7.96 * GIB)
 
 #: The measured device at 0a08ff4 on the bs=64 @ 8k serve line, every rank
-#: (``gate/runs/indexer-A/server.log``): "bytes_used=1.63 GiB, resident=6.79 GiB ...
+#: (server log): "bytes_used=1.63 GiB, resident=6.79 GiB ...
 #: effective=6.62 GiB".
 TIP_PARAM_BYTES = int(1.63 * GIB)
 TIP_RESIDENT_BYTES = int(6.79 * GIB)
@@ -187,7 +187,7 @@ def served_vllm_config(
 ):
     """The engine config fields vLLM's KV-cache code and the worker read.
 
-    ``gate_knobs`` is the gate's serve line: ``--no-enable-prefix-caching
+    ``gate_knobs`` is the served TP=64 configuration: ``--no-enable-prefix-caching
     --mamba-block-size <max_model_len>``. Without it the config is the 5938748 serve
     line's (prefix caching on, no mamba block size).
     """
@@ -435,7 +435,7 @@ def test_the_budget_reproduces_the_as_built_serve_log(monkeypatch) -> None:
     """The serve log's cap still binds where its knob is set; by default it is gone.
 
     ``server_decode.log`` (5938748): "cap=6.62 GiB, physical_core_bound=6.04 GiB ...
-    effective=6.04 GiB" with the default knobs of the time. Since wt2/kvbudget the
+    effective=6.04 GiB" with the default knobs of the time. Now the
     0.30 cap applies only when ``VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION`` is set and
     the per-physical-core bound not at all (``test_kv_budget_measured.py``). The
     default budget is the free memory (24 - 7.96 resident) less the graph need (the
@@ -472,7 +472,7 @@ def test_the_default_line_prices_bs1_at_4k_exactly_as_5938748() -> None:
     The 5938748 serve log: "KV cache need: 0.216 GiB for 1 sequence(s) of 4096 tokens
     (161 blocks of 131072 B, 160 allocator block(s) per request, 5 group(s), 11
     layer(s) per pool)". The specs, the groups, the block count, the need and the
-    pool tensors are those numbers, so the gate's bs=1 point needs no flag change.
+    pool tensors are those numbers, so the served bs=1 point needs no flag change.
     The one difference is the fix itself: each of the 34 KDA layers now holds one
     67840 B request slot instead of a copy of a 161-block pool tensor.
     """
@@ -498,7 +498,7 @@ def test_the_default_line_prices_bs1_at_4k_exactly_as_5938748() -> None:
     slot = RECURRENT_STATE_BYTES + 3 * 384 * 2
     footprint = worker._kv_cache_footprint_bytes(need)
     before = before_fix_footprint_bytes(max_num_seqs=1, max_model_len=4096)
-    # Since wt2/kvseg the footprint also counts the DSA indexer side caches, which
+    # The footprint now also counts the DSA indexer side caches, which
     # 5938748 did not price.
     side = side_cache_bytes(_real_text_config(), max_num_seqs=1, max_model_len=4096)
     assert footprint == need + KDA_LAYERS * 1 * slot + side
@@ -665,7 +665,7 @@ def test_the_recurrent_banks_follow_max_num_seqs_and_the_pool_follows_max_model_
 def test_vllms_allocator_admits_64_full_length_requests_in_the_priced_pool(served) -> None:
     """vLLM's own KV cache manager holds 64 requests of 8191 tokens, and no 65th.
 
-    The gate's serve line is used: prefix caching off, the full-input admission
+    The served TP=64 configuration is used: prefix caching off, the full-input admission
     gate, the 1024-token chunk. A recurrent group costs one pool block per request,
     so the need the worker returns is exactly enough for the served concurrency.
     """
@@ -758,7 +758,7 @@ def test_the_worker_does_not_refuse_64_sequences_at_8k_with_the_default_knobs(
     """On the measured 0a08ff4 residency the default knobs admit the served point.
 
     Even on a cold cache, where the 5 GiB reserve stands in for the graph need. A
-    budget between the KV tensors and the footprint is refused since wt2/kvseg:
+    budget between the KV tensors and the footprint is refused:
     ``test_kv_budget_side_caches.py::test_a_point_that_fits_only_without_side_caches_is_refused_naming_the_shortfall``.
     """
     monkeypatch.delenv("VLLM_NEURON_CPU_MODE", raising=False)

@@ -11,7 +11,7 @@ served step reaches it:
 3. the batched arm decodes all B requests together for two steps, each step feeding back
    its own greedy tokens;
 4. the reference arm restores the snapshot and decodes the same requests one at a time,
-   which is the path wave 1 served.
+   the one-request path.
 
 Read at B in {4, 64} in the selecting regime (the context exceeds the selection's
 bound, so the indexer scores and selects per request) and at B = 4 in the dense regime

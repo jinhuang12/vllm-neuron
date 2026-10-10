@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The DSA/MLA decode code exactly as commit 75090b9 (wt/dsa) shipped it, beside HEAD.
+"""The DSA/MLA decode code exactly as commit 75090b9 shipped it, beside HEAD.
 
 The three files beside this one are byte copies of ``git show 75090b9:<path>`` for the
 paths in :data:`SOURCES`. :func:`load` checks each copy against the pinned git blob id
@@ -9,7 +9,7 @@ the snapshot's own copies, and imports the result from a temporary directory out
 worktree. Every other import (configs, loaders, the DSA kernels) resolves to the live
 tree, where this change adds ``decode_batch.py`` and edits none of them.
 
-75090b9 is not an ancestor of the integration branch (it lives on wt/dsa and the
+75090b9 is not an ancestor of this branch (it lives on the
 ``baseline-dsa-75090b9`` tag), so the copies are committed: a clone of the branch alone,
 or an exported tree, holds the baseline. The blob ids make a silently different baseline
 impossible. The layout is ``dsa_5938748``'s.

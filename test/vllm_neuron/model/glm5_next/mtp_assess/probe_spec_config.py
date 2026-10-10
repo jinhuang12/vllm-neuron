@@ -12,7 +12,7 @@ by stage and records the exact outcome of each stage:
 * D. one prefill, then one decode step that schedules one draft token
 
 A fifth row, ``mtp[bypass]``, is an EXPERIMENT ONLY: it lifts the two method checks that
-stand in front of the model so the walk reaches the GLM-specific code behind them. Stage A
+stand in front of the model so the walk reaches the GLM-specific code behind them. The head module
 spells ``glm5_next`` into vLLM's ``MTPModelTypes`` for the duration of ``create_engine_config``
 (``vllm/config/speculative.py`` raises ``NotImplementedError`` for a target whose
 ``model_type`` is not in that list); stage B spells the method ``eagle3`` while the runner's

@@ -25,8 +25,8 @@ round, so drift in machine load hits before and after alike; the step samples of
 rounds are pooled, and the JSON keeps each round's median and the 1-minute load average.
 
 B=1 runs the real layer mix. B=4 runs a KDA-only stack of the same 45 layers, because
-the sparse-attention family refuses more than one request per forward until wave 2
-lifts it (``_glm5next_layer_carriers``); B=1 is also run on that stack so the two batch
+the sparse-attention family refuses more than one request per forward
+(``_glm5next_layer_carriers``); B=1 is also run on that stack so the two batch
 sizes compare on one geometry.
 
 In CPU mode device work is a no-op, so what the device path pays per step for it

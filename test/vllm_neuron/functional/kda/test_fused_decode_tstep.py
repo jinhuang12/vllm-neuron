@@ -27,7 +27,7 @@ KDIM = 128
 TAPS = 4
 LOWER = -5.0
 
-#: The served speculative widths: ``T = 1 + k`` for the k the gate chose (3) and
+#: The served speculative widths: ``T = 1 + k`` for the served k (3) and
 #: its neighbours, plus the one-token form the non-speculative path uses.
 TOKEN_COUNTS = (1, 2, 4, 6)
 BATCHES = (1, 4)

@@ -17,7 +17,7 @@ Three request classes are refused, each with a message that names the problem:
 * logprobs / prompt_logprobs under on-device sampling (today HTTP 500, IndexError in
   ``_create_completion_logprobs``).
 
-Everything else is accepted: greedy requests, the gate's requests, an OpenAI request that
+Everything else is accepted: greedy requests, the benchmark's requests, an OpenAI request that
 leaves every sampling knob at the server default, a 3000-token prompt on the standard line
 (refused with HTTP 400 before this change, when the window was 2048), an 8000-token
 prompt on the bs=64 line, and every one of the refused requests on a server that samples
@@ -62,7 +62,7 @@ SERVED_GENERATION_CONFIG = {
     "top_p": 0.95,
 }
 SERVED_BLOCK = 128
-# The gate's standard line (gate/serve.sh, GATE_RECIPE=host, with the three segments that
+# The served standard line (with the three segments that
 # cover max_model_len 4096: one 1024 segment alone served a 2048-token window) and its
 # bs=64 @ 8k line.
 STANDARD_LINE = dict(
@@ -140,7 +140,7 @@ def _serve(model_dir, line: dict, *, sampler, async_scheduling: bool | None = No
 
 @pytest.fixture
 def greedy_server(served_model_dir, monkeypatch):
-    """The gate's fast recipe: knob on, all_greedy, async scheduling, standard line."""
+    """The fast recipe: knob on, all_greedy, async scheduling, standard line."""
     monkeypatch.setenv(KNOB, "1")
     return _serve(served_model_dir, STANDARD_LINE, sampler=ALL_GREEDY, async_scheduling=True)
 

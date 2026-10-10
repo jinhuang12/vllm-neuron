@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The DSA decode indexer chain exactly as commit e3f38f8 (b17526a + dsa8k) shipped it.
+"""The DSA decode indexer chain exactly as commit e3f38f8 shipped it.
 
 :func:`load` reads each file below with ``git show e3f38f8:<path>``, checks it against the
 pinned blob id, rewrites the imports between these files to point at the snapshot's own

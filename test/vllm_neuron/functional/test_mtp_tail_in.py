@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """``functional/mtp/tail_in.py``: the draft iteration's input tail as one NKI kernel.
 
-The kernel replaces the head's traced ``_layer_input`` (Stage A, ``mtp.py``)::
+The kernel replaces the head's traced ``_layer_input`` (``mtp.py``)::
 
     embeds = table[token_ids]; embeds[positions == 0] = 0
     e = rms(embeds, enorm); h = rms(previous, hnorm)          # fp32 math, bf16 out
@@ -147,7 +147,7 @@ def test_two_partition_tiles_equal_the_tiles_run_apart() -> None:
 
 
 def test_the_torch_route_is_stage_a_arithmetic_bit_for_bit() -> None:
-    """``mtp_tail_in_torch`` is the head's Stage A ``_layer_input`` expression, restricted
+    """``mtp_tail_in_torch`` is the head's traced ``_layer_input`` expression, restricted
     to the shard rows: the CPU route and the reference the kernel is held to."""
     ops = _operands(5_901, 5, TINY_HIDDEN, TINY_VOCAB, 1, 0, zero_positions=(2,))
     got = tail_in.mtp_tail_in_torch(**ops, eps=EPS)

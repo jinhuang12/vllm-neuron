@@ -90,7 +90,7 @@ SAFE_POINT_GEN2_EVERY = 4096
 REFREEZE_EVERY = 1000
 RESULT_MARK = "GC_HARNESS_RESULT "
 
-#: Acceptance for the chosen policy (task packet).
+#: Acceptance for the chosen policy.
 MAX_GEN2_PER_1000 = 1.0
 MAX_PAUSE_MS = 20.0
 MAX_RSS_GROWTH_VS_NO_FREEZE = 2.0

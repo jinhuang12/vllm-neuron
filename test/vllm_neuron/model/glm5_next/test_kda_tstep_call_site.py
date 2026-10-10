@@ -31,7 +31,7 @@ from vllm_neuron.functional.kda import fused_decode as fused
 TP_WORLD_SIZE = 64
 SLOTS = (5, 2, 7, 0)
 BANK_SLOTS = 8
-#: ``T = 1 + k`` at the gate's ``k = 3``.
+#: ``T = 1 + k`` at the served ``k = 3``.
 TOKENS = 4
 
 OUT_RTOL = 1e-4

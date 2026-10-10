@@ -7,15 +7,15 @@ Two questions, both for TP=64 EP=16 on this fork:
     5 GiB graph reserve are gone?  Per-rank KV need from the kvseg hand formula
     (the KV-segment budget record, checked here against its three measured points) for
     the recipe line as written (prefix caching on, no ``--mamba-block-size``) and for the
-    two-flag variant the bs=64 gate line uses (``--no-enable-prefix-caching
-    --mamba-block-size <max_model_len>``, kv.md:153).
+    two-flag variant the bs=64 served configuration uses (``--no-enable-prefix-caching
+    --mamba-block-size <max_model_len>``).
 
 (b) How the verify step (T = k+1 rows) and the draft iterations grow with context C:
     DSA indexer (query rotation + ring + scores + top-k select; bypassed at C <= 2051),
     sparse MLA (reads min(C, 2048) latent rows per query row), KDA (independent of C).
     Anchors are the dsa8k and mla slice microbenchmarks (B requests of one row stand in for
-    one request of T rows); 32k is an extrapolation (no device shape above 8192 until
-    wt2/indexer-ctx lands).  The 1k rows reproduce ``projection.py``'s pessimistic bound
+    one request of T rows); 32k is an extrapolation (no device shape above 8192 is
+    measured yet).  The 1k rows reproduce ``projection.py``'s pessimistic bound
     ((ii) + KDA sequential) exactly, as a self-check.
 
 Writes JSON to ``--output`` and prints the tables.
@@ -43,14 +43,14 @@ KDA_SLOT_BYTES = 67840       # conv + recurrent state per layer per request slot
 INDEX_KPOOL = 4
 INDEX_HEAD_DIM = 128
 SIDE_ELEM_BYTES = 2          # latent bank dtype (bf16)
-HBM_PER_RANK_GIB = 24.00     # neuron_worker log: total_hbm=24.00 GiB (gate runs)
+HBM_PER_RANK_GIB = 24.00     # neuron_worker log: total_hbm=24.00 GiB
 FREE_AT_BUDGET_GIB = 16.94   # the bs=64 tip: 24.00 total, 7.06 used at budget time
 CAP_TODAY_GIB = 6.62         # min(user, 0.30 x 22.08, 12 - 5 reserve) today
 ASSUMED_UNCAPPED_GIB = (12.0, 15.0)   # KV budget study: free - graphs' real need - margin (16.94 - 5 / - 2, rounded)
 # Today's per-physical-core staging bound (neuron_worker.py:1116-1135 `_physical_core_kv_bound`):
-# min(HBM/2 - reserve, 2 x (HBM/2 - reserve) - used) = min(12 - 5, 14 - 1.63) = 7.00 GiB (tip-b64-C server.log:6032).
-# A1 assumes wave 4 drops that term too; the alternative keeps it with the measured prefill graph need
-# (4.567 GiB on one physical core, kv.md) in place of the 5 GiB placeholder: 12 - 4.567 = 7.43 GiB.
+# min(HBM/2 - reserve, 2 x (HBM/2 - reserve) - used) = min(12 - 5, 14 - 1.63) = 7.00 GiB (the recorded bs=64 @ 8k serve run).
+# A1 assumes that term is dropped too; the alternative keeps it with the measured prefill graph need
+# (4.567 GiB on one physical core, measured) in place of the 5 GiB placeholder: 12 - 4.567 = 7.43 GiB.
 GRAPH_NEED_MEASURED_GIB = 4.567
 PER_CORE_TERM_KEPT_GIB = HBM_PER_RANK_GIB / 2 - GRAPH_NEED_MEASURED_GIB
 MTP_LAYER_PER_RANK_GIB = 6.979 / 64   # the draft layer's weights, sharded (tp_choice.py)
@@ -113,7 +113,7 @@ def check_against_kvseg_points() -> list[dict]:
 
 # --- (b) context-dependent kernels, us per DSA layer -------------------------------------
 # dsa8k_micro.json (slice, 11-layer graphs, medians): chain = hadamard + ring + scores + select.
-# 'tip' = 0a08ff4 code (= b17526a for these kernels), 'after' = wt2/dsa8k 342e93e (DONE, gate queue).
+# 'tip' = 0a08ff4 code (= b17526a for these kernels), 'after' = the 8k indexer kernels.
 INDEXER = {
     "tip":   {"bypass_b1": 99.4, "bypass_b64": 100.7,
               "chain_8k": {1: 411.7, 4: 438.7, 64: 861.5},
@@ -156,8 +156,8 @@ def indexer_us(C: int, T: int, variant: str, select_scales_with_ctx: bool = True
     C = 8192: the measured chain, rows interpolated between B = 1, 4, 64.
     C > 8192: the C-dependent kernels extrapolated linearly in C/8192: scores (T rows x C/4
     pooled keys) always; select (whole-row counts over C/4 candidates) when
-    ``select_scales_with_ctx`` (pessimistic) else held flat.  Device shapes above 8192 exist
-    only once wt2/indexer-ctx lands; these rows are to be replaced by its measurements.
+    ``select_scales_with_ctx`` (pessimistic) else held flat.  Device shapes above 8192 are not
+    measured yet; these rows are to be replaced by measurements.
     """
     v = INDEXER[variant]
     if C <= INDEXER_BYPASS_MAX_CTX:

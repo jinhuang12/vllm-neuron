@@ -28,7 +28,7 @@ the four and the arithmetic around the layer:
 * the greedy token, TP-correct: one all-gather of the pair over the group and the
   global id of the winning rank (``functional/draft_token.py``).
 
-Two entry points, the Stage A contract (C3):
+Two entry points, the head's contract:
 
 * :meth:`Glm5NextMultiTokenPredictor.populate` -- ``T`` rows of the prefill (or a
   real decode step): row ``t`` consumes ``h_t`` and ``embed(x_{t+1})`` and writes
@@ -66,7 +66,7 @@ from torch import nn
 
 from .config import Glm5NextTextConfig
 
-#: The knob (Stage A contract C1). Its one definition is ``envs.py``'s; this is the
+#: The knob. Its one definition is ``envs.py``'s; this is the
 #: name error messages and tests spell.
 SHADOW_DRAFT_ENV = "VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT"
 
@@ -84,7 +84,7 @@ HEAD_PARAMETER_NAMES: tuple[str, ...] = (
     "shared_head_norm_weight",
 )
 
-#: Stage A contract C2: every parameter path the head declares, relative to the
+#: Every parameter path the head declares, relative to the
 #: head (``mtp.`` on the root). The loader maps ``layers.45.*`` onto exactly these.
 #: The block's paths are a layer-43 DSA layer's minus the six ``hc_*`` leaves, which
 #: the checkpoint does not give layer 45 and the block therefore never declares.
@@ -421,7 +421,7 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         for padding writes, which no live request holds. Such a row is then not the
         draft's to read back either (the attention clamps a ``-1`` page onto page 0
         and masks it), so the draft degrades for that iteration and corrupts
-        nothing; Stage B's lookahead allocation removes the case.
+        nothing; the lookahead allocation removes the case.
         """
         device = block_table_row.device
         if torch.is_tensor(position):

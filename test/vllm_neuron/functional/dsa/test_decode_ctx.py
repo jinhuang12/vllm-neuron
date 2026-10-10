@@ -134,7 +134,7 @@ def test_scores_of_one_request_split_over_both_cores_equal_one_program(
 
 
 def _ported_lengths(candidates: int) -> list[int]:
-    """origin/wt3/uncap 453a5eb's lengths: the whole axis, a pool closed mid-axis, a short
+    """The ported lengths: the whole axis, a pool closed mid-axis, a short
     one, a ragged tail. A multiple of the pool closes a pool this step, so the stand-in
     lands at column ``length / 4 - 1`` -- past the first block for the long requests."""
     full = candidates * POOL

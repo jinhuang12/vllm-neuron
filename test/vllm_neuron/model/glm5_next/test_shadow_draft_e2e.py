@@ -49,7 +49,7 @@ from test.vllm_neuron.model.glm5_next.tiny import test_tiny_glm5next_forward as 
 
 pytestmark = [pytest.mark.fast, pytest.mark.forked]
 
-#: The recipe's draft count (mtp.md section 8): the gate measures alpha at k = 5.
+#: The recipe's draft count: acceptance is measured at k = 5.
 K = 5
 SEED = 20261007
 SEED_HEAD = 63_200_001

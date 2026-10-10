@@ -33,7 +33,7 @@ from test.vllm_neuron.worker import test_kv_budget_glm53f as kv
 from test.vllm_neuron.worker.test_mtp_kv_budget import _mtp
 
 K = 3
-#: The gate's bs=1 line.
+#: The served bs=1 line.
 SEQS, LENGTH = 1, 4096
 #: The bs=64 @ 8k line.
 B64_SEQS, B64_LENGTH = 64, 8192

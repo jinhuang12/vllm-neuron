@@ -37,7 +37,7 @@ BASELINE_FILE = (
 )
 HIDDEN = 4096
 SWIGLU_LIMIT = 10.0
-#: ``|got - ref| <= TOLERANCE * max|ref|``, the round-1 dense bound.
+#: ``|got - ref| <= TOLERANCE * max|ref|``, the dense bound.
 TOLERANCE = 2e-3
 KERNEL = "blockwise_fp8_mlp_small_m_kernel"
 
@@ -91,7 +91,7 @@ def grid_spy(monkeypatch):
 
 
 def _operands(tokens: int, intermediate: int, seed: int, hidden: int = HIDDEN):
-    """Decode-like operands, the generator of the round-1 tests.
+    """Decode-like operands, the generator of the small-M tests.
 
     Distinct non-power-of-two block scales, sized so both clamps are active.
     """

@@ -12,7 +12,7 @@ select cores. Three tables are written, each as before (5938748) and after (this
   distinct layers (default 11, the model's DSA layer count), each layer's output
   feeding the next one's input, and the reported figure is the graph's time divided by
   the layer count. B=4 is four requests, one forward each per layer: the layer seam
-  takes one request in both trees (the runner's batch-one refusal is wave 2's).
+  takes one request in both trees (the runner refuses a batch there).
 * ``attention`` -- the decode attention kernel alone, batched: ``mla_decode_attention``
   at B in {1, 4} in one call against 5938748's ``mla_sparse_attention`` once per
   request.

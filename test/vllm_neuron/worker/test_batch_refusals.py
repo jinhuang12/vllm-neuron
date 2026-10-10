@@ -51,7 +51,7 @@ REFUSALS = {
     MOE_DECODE: ("assert q == 1",),
 }
 
-#: The gate's bs=64 point.
+#: The served bs=64 point.
 MAX_NUM_SEQS = 64
 NUM_SEQS_BUCKETS = [1, 2, 4, 8, 16, 32, 64]
 MAX_MODEL_LEN = 8192

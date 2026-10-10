@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The runner's draft proposal under method "mtp": ``_glm5next_propose_drafts``.
 
-The root drafts inside the target graph (Stage A head), so proposing is bookkeeping:
+The root drafts inside the target graph (the traced head), so proposing is bookkeeping:
 after a decode step the ``[B, k]`` draft ids the root returned are the next step's
 drafts; after a prefill the request gets ``k`` placeholder drafts (the model's pad id,
 as the DI bootstrap does) so its first decode is a verify step of the same width as

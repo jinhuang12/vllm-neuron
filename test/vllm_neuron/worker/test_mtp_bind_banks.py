@@ -20,7 +20,7 @@ acceptance of the axis are the KDA bank allocator's own. On a tree whose allocat
 no ``checkpoints`` parameter the two speculative
 cases are a strict ``xfail`` naming that seam (plain banks, no record); on the merged tree
 the condition drops and the cases must pass -- a bind that still refuses the axis, or a
-record without ``state_checkpoints``, fails them. Named in the round-1 brief.
+record without ``state_checkpoints``, fails them.
 """
 
 from __future__ import annotations
