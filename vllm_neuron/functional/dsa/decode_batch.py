@@ -38,10 +38,8 @@ positions, carried in fp32, must be exact (``candidates * pool_size <= 2**24`` t
 
 from __future__ import annotations
 
-import hashlib
 import logging
 from dataclasses import dataclass
-from pathlib import Path
 
 import torch
 from torch import Tensor
@@ -61,6 +59,7 @@ from vllm_neuron.functional.dsa.kpool_hadamard import (
     _fwht128_blocks,
 )
 from vllm_neuron.functional.dsa.launch_grid import lnc_pair
+from vllm_neuron.source_digest import source_digest
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 logger = logging.getLogger(__name__)
@@ -94,9 +93,7 @@ FP32_EXACT_INTEGERS = 1 << 24
 #: step calls), handed to both kernels as a trace-time int: the compiled kernel cache keys
 #: on a kernel's own source and its arguments, and both kernels call helpers whose edits it
 #: would otherwise not see.
-SOURCE_DIGEST = int(hashlib.sha256(
-    Path(__file__).read_bytes() + Path(_kpool_hadamard.__file__).read_bytes()
-).hexdigest()[:7], 16)
+SOURCE_DIGEST = source_digest(__file__, _kpool_hadamard.__file__)
 
 
 class DecodeBatchError(ValueError):

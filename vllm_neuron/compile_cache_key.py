@@ -23,6 +23,11 @@ set: the key is the graph's dependency set, and such a graph compiles from its
 FX text alone, which the library key already holds. No kernel edit can change
 what it compiles to, so none recompiles it.
 
+A file enters a digest as the digest of its code
+(:func:`vllm_neuron.source_digest.code_digest`): its syntax tree without
+docstrings, comments or layout. A comment or docstring edit therefore moves no
+key; any code edit moves every key that reaches the file.
+
 "Reached" is static: the kernel's defining module, then the transitive closure
 of its ``import`` / ``from ... import`` statements (read with :mod:`ast`, never
 by importing) that stay inside the snapshot, plus every snapshot file that
@@ -91,6 +96,8 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple, Optional
+
+from vllm_neuron.source_digest import code_digest
 
 logger = logging.getLogger(__name__)
 
@@ -172,12 +179,13 @@ def digest_files(root: Path | str = PACKAGE_ROOT) -> list[str]:
 
 
 def _digest_sources(sources: Mapping[str, bytes], rels: Iterable[str]) -> str:
-    """sha256 over ``rels`` in sorted order: path, length, then the bytes."""
+    """sha256 over ``rels`` in sorted order: the path, then the fixed-width digest of
+    the file's code (:func:`vllm_neuron.source_digest.code_digest`), so a comment or
+    docstring edit moves no key and recompiles nothing."""
     digest = hashlib.sha256()
     for rel in sorted(set(rels)):
-        data = sources[rel]
-        digest.update(f"{rel}\0{len(data)}\0".encode())
-        digest.update(data)
+        digest.update(f"{rel}\0".encode())
+        digest.update(code_digest(sources[rel], rel))
     return digest.hexdigest()
 
 
@@ -191,9 +199,10 @@ def _compute_digest(root: Path) -> str:
 def kernel_digest(root: Path | str | None = None) -> str:
     """The 64-hex sha256 of every kernel source under ``root`` (default: this package).
 
-    Relative paths and contents feed the hash, so a rename or a one-byte edit
-    changes it and two checkouts of one commit at different paths share it. The
-    default root is read once per process (:func:`default_resolver`).
+    Relative paths and each file's code feed the hash, so a rename or a code edit
+    changes it, a comment or docstring edit does not, and two checkouts of one
+    commit at different paths share it. The default root is read once per process
+    (:func:`default_resolver`).
     """
     if root is None:
         return default_resolver().package_digest

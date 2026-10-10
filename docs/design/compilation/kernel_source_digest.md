@@ -2,7 +2,7 @@
 
 <!-- meta: description: How a per-graph digest of the NKI kernel sources is folded into the compile cache keys -->
 <!-- meta: content_type: conceptual-deep-dive -->
-<!-- meta: date_updated: 2026-10-08 -->
+<!-- meta: date_updated: 2026-10-10 -->
 
 ## Problem
 
@@ -42,8 +42,9 @@ silent: the server starts fast and runs stale code.
    kernel files import from elsewhere in the package (`KERNEL_SOURCE_FILES`:
    `parallel/neuron_parallel_state.py`, `utils/bucket_utils.py`,
    `utils/dtype_utils.py`, `utils/neuron_utils.py`). The process keeps these
-   bytes, so every key it computes reads the same snapshot. 104 files, about
-   7 ms, once per process.
+   bytes, so every key it computes reads the same snapshot, and digests each
+   file's code once (see [What a file's digest reads](#what-a-files-digest-reads)).
+   112 files, about 700 ms on a host at load average 85, once per process.
 2. A graph's kernels come from its FX nodes:
    - each NKI kernel node (`torch.ops.higher_order.nki_kernel_wrapper`) gives
      its kernel function through the library's kernel registry
@@ -62,8 +63,9 @@ silent: the server starts fast and runs stale code.
    statements at any depth (also inside functions), except under
    `if TYPE_CHECKING:`, and stops at files outside the snapshot. Files that
    patch a reached module join the closure (see [Patches](#patches)).
-4. The digest is sha256 over the sorted file set: path, length, then bytes,
-   the same stream as the whole-package digest. The key is
+4. The digest is sha256 over the sorted file set: for each file, its path and
+   then the 32-byte digest of its code. The whole-package digest is the same
+   stream over every file. The key is
    `sha256(library_key + "|kernel_digest:" + digest)[:32]`, so the cache
    directory layout (`<root>/neuron/compile_cache/<key>/`) does not change.
 
@@ -71,6 +73,27 @@ The result: an edit to kernel X recompiles only the graphs that call X (or a
 kernel that imports X). An edit to a file no kernel reaches, for example torch
 code around a kernel call, recompiles no graph for kernel reasons; its effect
 on the graph is in the FX text, which the library already keys on.
+
+### What a file's digest reads
+
+`vllm_neuron/source_digest.py` holds the one rule for both digests that read
+kernel source: the digests these keys fold and the `SOURCE_DIGEST` integers of
+the kernel files (see [Relation to SOURCE_DIGEST](#relation-to-source_digest-in-kernel-files)).
+`code_digest` parses the file with `ast`, drops every statement that is a lone
+string literal, and takes the sha256 of `ast.dump(tree, include_attributes=False)`.
+
+| Edit to a file | Moves its digest |
+| --- | --- |
+| a comment, a blank line, other layout | no |
+| a docstring: of the module, a class, a function, or after an assignment | no |
+| a name, a number, a string that code uses, an operator, a decorator, a default | yes |
+| any edit to a file that does not parse | yes: the file is read as raw bytes, and a WARNING names it |
+
+A lone string statement runs no code. Only a leading one sets a `__doc__`, and
+no kernel reads one. An f-string statement stays, because it evaluates the
+expressions in it. The `ast.dump` format belongs to the interpreter, so another
+Python minor version can digest the same code differently. That costs one
+recompile and never serves a stale kernel.
 
 ### Closure rules
 
@@ -85,7 +108,7 @@ on the graph is in the FX text, which the library already keys on.
 | `import importlib` or `__import__` in any snapshot file | nothing: every key folds the package digest |
 | an import under `if TYPE_CHECKING:` | nothing: it never runs |
 | an import of another package | not that package's source (it is versioned with its package), but every snapshot file that patches that package |
-| an import of `vllm_neuron.envs` or `vllm_neuron.accuracy.tensor_capture` | nothing: these files hold no kernel code (a kernel's trace-time branch on a knob is in the FX graph text; tensor capture is host-side debug code), so the snapshot excludes them |
+| an import of `vllm_neuron.envs`, `vllm_neuron.accuracy.tensor_capture` or `vllm_neuron.source_digest` | nothing: these files hold no kernel code (a kernel's trace-time branch on a knob is in the FX graph text; tensor capture is host-side debug code; the digest rule's output, a `SOURCE_DIGEST`, is in the FX graph text and the NKI kernel key, and a change to the rule moves every file's digest), so the snapshot excludes them |
 
 A package `__init__.py` is reached only when a reached file imports from it.
 Python also runs every parent package `__init__.py` when it imports a
@@ -214,7 +237,7 @@ the installed library version.
 ## Startup log
 
 ``` text
-INFO - compile_cache_key.py - VLLM_NEURON_KERNEL_DIGEST=f3e81b81...94ee29 files=104 digest_ms=7.1 keys=per-graph
+INFO - compile_cache_key.py - VLLM_NEURON_KERNEL_DIGEST=d00f2669...362842 files=112 digest_ms=685.0 keys=per-graph
 INFO - compile_cache_key.py - kernel digest: graph key <32-hex key> folds files=25 modules=vllm_neuron.functional.attention.mla_absorb,... resolve_ms=<ms> (graphs per-graph=1 fallback=0)
 ```
 
@@ -250,31 +273,47 @@ earlier whole-package scheme). Startup uses `install_per_graph_digest_key`.
 
 ## What it costs
 
-- One recompile of each graph that reaches an edited file, including
-  comment-only edits. On the stack-1b served set (20 graphs), 64 of the 104
-  files reach no graph, and a decode-only kernel edit recompiles the decode
-  graphs only. `functional/mlp.py` (an nkilib patch) reaches every graph.
+- One recompile of each graph that reaches a code edit. A comment, docstring
+  or layout edit recompiles nothing. On the stack-1b served set (20 graphs),
+  64 of the 104 files the snapshot then held reach no graph, and a decode-only
+  kernel edit recompiles the decode graphs only. `functional/mlp.py` (an nkilib
+  patch) reaches every graph.
+- About 700 ms of CPU in each process at startup, to parse and digest
+  the snapshot (about 8 ms when the digest read raw bytes).
 - No change to a cache root that was filled with the same tree: the digests
   are deterministic across processes and hosts.
-- Cache roots filled **before** this change miss once (the key changed); the
-  old directories are not deleted.
+- Cache roots filled **before** this change, or before the code-digest rule,
+  miss once (the key changed); the old directories are not deleted. A change to
+  the output of `vllm_neuron/source_digest.py` does the same once.
 
 ## Relation to `SOURCE_DIGEST` in kernel files
 
-Four kernels (`functional/dsa/decode_batch.py`, `functional/attention/mla_decode.py`)
-already pass a digest of their own file into the kernel as a trace-time
-integer. That still works and is now redundant; the per-graph digest covers
-those files too.
+Eight kernel files pass a digest of their own source into their kernels as a
+trace-time integer, `SOURCE_DIGEST = source_digest(__file__)`.
+`functional/dsa/decode_batch.py` also digests `functional/dsa/_kpool_hadamard.py`,
+the butterfly its kernels call. The integer is in the FX graph text and in the
+NKI kernel key. It reads each file through the same rule as the keys, so a
+comment or docstring edit moves neither. `test/vllm_neuron/test_source_digest.py`
+lists these files and fails when one of them computes its digest another way.
+The per-graph digest covers these files too.
+
+The library's NKI kernel key also hashes the text of the kernel function
+(`inspect.getsource`, comments included). A comment edit inside a kernel
+function therefore still moves that kernel's NKI key. It moves no graph key: a
+warm root serves every graph, and a graph that compiles for another reason
+compiles that kernel again instead of reading the kernel cache.
 
 ## Manual device check
 
 1. Start the server with an empty `NEURON_LIBTORCH_CACHE_ROOT=/tmp/root-A`.
    Record each `kernel digest: graph key` line and
    `ls /tmp/root-A/neuron/compile_cache/`.
-2. Edit one comment line in a decode-only kernel file, for example
-   `vllm_neuron/functional/dsa/decode_batch.py`.
+2. Add one statement, for example `_PROBE = 1`, at the end of a decode-only
+   kernel file such as `vllm_neuron/functional/dsa/decode_batch.py`.
 3. Run `python -m vllm_neuron.compile_cache_key --graph <entry>` for each
    entry. Write down the entries whose file list holds the edited file.
 4. Restart with the same root. Only those entries report a cache miss; every
    other graph is a local cache hit.
 5. Restart once more without an edit: every graph is a local cache hit.
+6. Edit one comment line and one docstring in the same file, then restart:
+   every graph is a local cache hit.

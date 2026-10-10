@@ -48,8 +48,6 @@ reaches the other tokens of its items through those products (``0 * NaN``);
 
 from __future__ import annotations
 
-import hashlib
-from pathlib import Path
 
 import torch
 from torch import Tensor
@@ -60,6 +58,7 @@ import nki.language as nl
 from nkilib.core.utils.kernel_assert import kernel_assert
 
 from vllm_neuron.functional.dsa.launch_grid import lnc_pair
+from vllm_neuron.source_digest import source_digest
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 from .fused_fp8_pack import PackedExperts
@@ -84,7 +83,7 @@ assert 1 << GROUP_SHIFT == GROUP_TOKENS, "GROUP_TOKENS is a power of two"
 #: compile caches key on a kernel's own source and its arguments; the kernel's
 #: body lives in the helpers below, so without it an edit to a helper would be
 #: served the previous build.
-_SOURCE_DIGEST = int(hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:7], 16)
+_SOURCE_DIGEST = source_digest(__file__)
 
 
 def decode_plan(tokens: int):

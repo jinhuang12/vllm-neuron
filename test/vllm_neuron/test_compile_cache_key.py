@@ -41,7 +41,13 @@ NOT_KERNEL_SOURCE = {
     # branch taken is in the FX graph text the library already keys on. The
     # file itself holds no kernel code.
     "vllm_neuron.envs",
+    # The digest rule: a kernel file's SOURCE_DIGEST is its value, which the FX
+    # graph text and the NKI kernel key already hold. The file holds no kernel code.
+    "vllm_neuron.source_digest",
 }
+
+#: A code edit any covered file takes: the digest reads code, not bytes.
+APPENDED_STATEMENT = b"\n_DIGEST_PROBE = 1\n"
 
 
 class _Graph(torch.nn.Module):
@@ -176,8 +182,12 @@ def test_digest_does_not_depend_on_where_the_tree_lives(tmp_path):
     assert ck.kernel_digest(copy) == ck.kernel_digest(PACKAGE_ROOT)
 
 
-def test_one_appended_byte_in_any_covered_file_changes_the_digest(tmp_path):
-    """(b) Every file under functional/ and in the allowlist feeds the digest."""
+def test_one_appended_statement_in_any_covered_file_changes_the_digest(tmp_path):
+    """(b) Every file under functional/ and in the allowlist feeds the digest.
+
+    The edit is code: the digest reads a file's code, so a comment or blank line
+    would move nothing (``test_source_digest.py``).
+    """
     copy = _copy_tree(tmp_path)
     base = ck.kernel_digest(copy)
     files = ck.digest_files(copy)
@@ -187,7 +197,7 @@ def test_one_appended_byte_in_any_covered_file_changes_the_digest(tmp_path):
     for rel in files:
         path = copy / rel
         original = path.read_bytes()
-        path.write_bytes(original + b"\n")
+        path.write_bytes(original + APPENDED_STATEMENT)
         try:
             if ck.kernel_digest(copy) == base:
                 unchanged.append(rel)
@@ -271,7 +281,7 @@ def test_capture_cache_dir_name_changes_with_the_kernel_digest(
     copy = _copy_tree(tmp_path)
     digest_a = ck.kernel_digest(copy)
     kernel = copy / "functional" / "dsa" / "decode_batch.py"
-    kernel.write_bytes(kernel.read_bytes() + b"\n")
+    kernel.write_bytes(kernel.read_bytes() + APPENDED_STATEMENT)
     digest_b = ck.kernel_digest(copy)
     assert digest_a != digest_b
 

@@ -18,10 +18,8 @@ operand.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 from dataclasses import dataclass
-from pathlib import Path
 
 import torch
 from torch import Tensor
@@ -34,6 +32,7 @@ from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
 from vllm_neuron.functional.dsa.causal_bound import BOUND_FILL
 from vllm_neuron.functional.dsa.launch_grid import lnc_pair
+from vllm_neuron.source_digest import source_digest
 from vllm_neuron.utils.neuron_utils import can_run_kernel, values_are_readable
 
 logger = logging.getLogger(__name__)
@@ -48,7 +47,7 @@ tiles share one."""
 _LINE = 8
 """Elements of the one-partition line a scalar slot is read into."""
 
-SOURCE_DIGEST = int(hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:7], 16)
+SOURCE_DIGEST = source_digest(__file__)
 """A digest of this file, passed to the kernel so the kernel cache keys on its source."""
 
 
