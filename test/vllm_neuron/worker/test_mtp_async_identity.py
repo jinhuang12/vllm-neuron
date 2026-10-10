@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The async drafter's greedy output is the synchronous drafter's, token for token.
 
-The round-3 control is the synchronous drafter (``reports/mtpB_async.md`` §0): the same
+The control is the synchronous drafter: the same
 tiny root, the same prompts, the same ``k``, served once with ``--no-async-scheduling``
 (the shipped opt-in path, ``test_mtp_e2e_spec``'s ``_generate``) and once with
 ``--async-scheduling`` and ``VLLM_NEURON_GLM5NEXT_MTP_ASYNC=1``, driven the way the async
@@ -9,8 +9,9 @@ engine drives the worker: the scheduler hands each step the position it would st
 had the previous step kept every row, reserves ``k`` placeholder drafts, and applies a
 step's rejections to its count only after the next step was scheduled; the worker's
 outputs are device futures materialised one step late. Both runs must return the plain
-run's ids (greedy rejection sampling is lossless per step by id equality) and the same
-number of steps per prompt (the same rows kept at every step).
+run's ids (greedy rejection sampling is lossless per step by id equality) with the same
+rows kept at every step; the async run schedules one step more per prompt -- the step in
+flight when the finishing output is applied.
 
     NKI_SIMULATOR=1 VLLM_NEURON_CPU_MODE=1 python -m pytest \\
         test/vllm_neuron/worker/test_mtp_async_identity.py
@@ -249,7 +250,7 @@ def test_the_async_drafter_reaches_the_context_limit_with_the_synchronous_drafte
     """The last steps of a request are the scheduler's, not the drafter's: under async
     scheduling the proposal is never consulted and the served scheduler switches the request
     to one-row steps near ``max_model_len`` on its own. The first one-row step is the generic
-    spec-to-non-spec transition (``_prepare_model_input``): the device-side last accepted
+    spec-to-non-spec transition (``execute_model``): the device-side last accepted
     token is its input and the previous step's output is read on the host, which the
     generic accounting counts as one sync fallback -- exactly one, at that step; every other
     step stays on the async path, and the correction pulls the handed start back at the

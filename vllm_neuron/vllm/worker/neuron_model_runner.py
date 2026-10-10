@@ -11319,7 +11319,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         consults it -- it re-arms ``k`` placeholders every step until the request's count
         passes ``max_model_len - 3 - 2k``, then schedules one-row steps for good. The
         first one-row step is the generic spec-to-non-spec transition
-        (``_prepare_model_input``): the previous step's output is read on the host --
+        (``execute_model``): the previous step's output is read on the host --
         the read a finishing request makes anyway -- and the device-side
         ``futures_last_accepted_token`` is its input id, counted as a sync fallback by
         the generic accounting; the one-row steps after it reuse the sampler's ``[rows]``

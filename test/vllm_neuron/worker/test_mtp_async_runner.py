@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The runner under the async drafter (method "mtp", ``VLLM_NEURON_GLM5NEXT_MTP_ASYNC``).
 
-Three host corrections of the synchronous drafter move on device, one step late
-(``reports/mtpB_async.md``): the state hook no longer pulls the indexer-ring cursor back,
+Three host corrections of the synchronous drafter move on device, one step late: the state hook no longer pulls the indexer-ring cursor back,
 commits the recurrent checkpoints or records the resume row from host ints -- it takes the
 step's output on device (``functional/mtp/async_step.mtp_async_take``) into a carry of
 device tensors and reads nothing back; the draft proposal hands the scheduler the carry's
