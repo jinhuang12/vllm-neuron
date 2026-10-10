@@ -42,6 +42,7 @@ intermediates, so a run whose profiles are to be split per op needs a fresh root
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -173,14 +174,43 @@ def carriers_for(case: dict, layer_case, device: str = DEVICE) -> dict:
     return glue_case.kda_prefill_carriers(layer_case, case["rows"], device=device)
 
 
+class ServedRankGroup(block._OneRankGroup):
+    """``benchmark_glue_block``'s one-rank group, as the last rank of the served group.
+
+    The DSA indexer divides its prefill selection over the tensor-parallel ranks
+    (``vllm_neuron/functional/dsa/indexer_shard.py``): rank ``rank_in_group`` of
+    ``world_size`` selects ``ceil(rows / world_size)`` of the chunk's rows, and the
+    group's ``all_gather`` puts every rank's rows back in order. This group answers as
+    rank ``world_size - 1`` of ``glue_case.TP_WORLD``, so the selection runs on the rows
+    one served rank selects. Its ``all_gather`` is no collective: it repeats this rank's
+    rows once per rank, a device copy of the gathered size. The ids every row then
+    attends with are those of the chunk's last rows, which see the most pooled keys, so
+    each row selects as many real pools as the served chunk's last rows (a full top-k
+    once the context holds that many pools); the values are not the served ones.
+
+    A chunk whose selection is a no-op (the dense-window path) selects nothing, and the
+    group gives the indexer only its rank at load.
+    """
+
+    world_size = glue_case.TP_WORLD
+    rank_in_group = glue_case.TP_WORLD - 1
+
+    def all_gather(self, tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
+        return torch.cat([tensor] * self.world_size, dim=dim)
+
+
 def run_case(case: dict, collectives: str, specs: dict, args) -> dict:
     """``benchmark_glue_block.run_case`` with this module's prefill carriers.
 
     That function builds every variant's operands through its module's ``carriers_for``,
     which serves decode and KDA prefill only, so the DSA prefill carriers are handed to it
-    for the duration of the case.
+    for the duration of the case; a DSA case also runs with :class:`ServedRankGroup` as
+    its one-rank group.
     """
-    with mock.patch.object(block, "carriers_for", carriers_for):
+    with contextlib.ExitStack() as patches:
+        patches.enter_context(mock.patch.object(block, "carriers_for", carriers_for))
+        if case["family"] == "dsa":
+            patches.enter_context(mock.patch.object(block, "_OneRankGroup", ServedRankGroup))
         result = block.run_case(case, collectives, specs, args)
     if case["family"] == "dsa":
         line = SERVED_LINES[case["line"]]
