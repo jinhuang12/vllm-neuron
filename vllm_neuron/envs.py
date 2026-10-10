@@ -212,9 +212,9 @@ def maybe_measured_float(value: str | None) -> float | None:
 #: (:mod:`vllm_neuron.vllm.worker.neff_memory`). On a cold cache, where warmup
 #: has yet to compile some of those graphs, and for graphs the cache cannot tie
 #: to the configuration (a drafter's, a vision encoder's), this figure stands in.
-#: It is the September measurement rounded up: a GLM-5.3-Flash prefill graph at
-#: bucket 1024 held 4.567 GiB per rank (3.875 GiB of shared scratchpad plus 705
-#: MiB of graph). ``VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB`` overrides both the
+#: It is the device memory that a GLM-5.3-Flash prefill graph at bucket 1024 held
+#: per rank (the shared scratchpad plus the graph's own memory), rounded up to a
+#: whole GiB. ``VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB`` overrides both the
 #: measured need and this figure.
 DEFAULT_DEVICE_GRAPH_RESERVE_GIB = 5.0
 
@@ -338,19 +338,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The served GLM-5.3-Flash checkpoint directory (the one that holds
     # model.safetensors.index.json) that tests and benchmarks under test/ read
     # real weights from, through test/vllm_neuron/artifacts.py only. Unset or
-    # empty: _artifact_paths.CHECKPOINT_DEFAULT, the serving host's campaign
-    # checkpoint /home/ubuntu/glm53f-campaign/lane-serve/models/GLM-5.3-Flash-04c4e9e9.
+    # empty: _artifact_paths.CHECKPOINT_DEFAULT, the checkpoint directory on the
+    # serving host.
     # A test that needs the checkpoint skips, naming the resolved path, when the
     # index is absent; it never substitutes random weights. The server does not
     # read this knob.
     "VLLM_NEURON_GLM5NEXT_CHECKPOINT_DIR": _artifact_paths.checkpoint_dir,
-    # The directory the GLM-5.3-Flash performance campaign keeps its worktrees and
-    # records under (glm53f-wt*/reports, glm53f-wt3/calib, the decode breakdown,
-    # device profiles). Report scaffolding, perf harnesses and hardware benchmarks
+    # The directory below which the GLM-5.3-Flash performance records are kept (the
+    # reports, the calibration records, the decode breakdown, the device profiles).
+    # Report scaffolding, perf harnesses and hardware benchmarks
     # under test/ resolve their default inputs and outputs below it, through
     # test/vllm_neuron/artifacts.py only. Unset or empty:
-    # _artifact_paths.CAMPAIGN_DEFAULT, /home/ubuntu, the campaign hosts'
-    # directory. A test whose record is absent below it skips or fails naming the
+    # _artifact_paths.CAMPAIGN_DEFAULT, that directory on the serving hosts. A test
+    # whose record is absent below it skips or fails naming the
     # resolved path. The server does not read this knob.
     "VLLM_NEURON_GLM5NEXT_CAMPAIGN_DIR": _artifact_paths.campaign_dir,
     # Golden cache directory (disk tier)
@@ -521,10 +521,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         maybe_convert_bool(os.getenv("VLLM_NEURON_GLM5NEXT_MTP_ASYNC")) or False
     ),
     # GC policy each worker applies once after warmup. "rare_gen2" (the default)
-    # raises only the gen-2 threshold, so bs=64 decode has no full-pass stalls, and
-    # neither collects nor freezes: the freezing policies made every bs=1 decode step
-    # slower on TP=64 (gc_policy.py). "off" keeps CPython's default GC;
-    # "freeze_rare_gen2" freezes, then raises, at that bs=1 cost; "freeze" is the
+    # raises only the gen-2 threshold, so a batch-64 decode has no full-pass stalls,
+    # and neither collects nor freezes: the freezing policies made every batch-1 decode
+    # step slower on TP=64 (gc_policy.py). "off" keeps CPython's default GC;
+    # "freeze_rare_gen2" freezes, then raises, at that batch-1 cost; "freeze" is the
     # freeze alone. Any other value is refused when the policy is applied.
     "VLLM_NEURON_GC_POLICY": lambda: os.getenv("VLLM_NEURON_GC_POLICY", "rare_gen2"),
     # ================== GLM-5.3-Flash Row-Parallel All-Reduce ==================

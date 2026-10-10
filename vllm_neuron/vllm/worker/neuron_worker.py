@@ -68,9 +68,9 @@ PREPARED_OPERAND_ATTR_PREFIX = "_prepared_"
 #: need, per logical NeuronCore. It covers what the budget-time figures do not:
 #: the per-step input and output tensors the runtime allocates around every
 #: execution (under 16 MiB at 64 x 8192 on GLM-5.3-Flash), the error of the graph
-#: need read from the NEFFs (it over-reads the runtime's own figure by 1.6% and
-#: 3.2% on the two serve runs it was checked against, so 256 MiB also covers an
-#: under-read of 20% of a 1.3 GiB need), and runtime buffers such as the
+#: need read from the NEFFs (it over-reads the runtime's own figure by a few
+#: percent on the servers it was checked against, and the margin also covers an
+#: under-read several times that size), and runtime buffers such as the
 #: profiler's that a serve may add later. About 1% of a trn2 logical core.
 KV_BUDGET_MARGIN_BYTES = 256 * 1024**2
 
@@ -1945,9 +1945,9 @@ class NeuronWorker(WorkerBase):
 
         # Every return below serves: apply the post-warmup GC policy there
         # (gc_policy.py). The default, "rare_gen2", raises the gen-2 threshold, which
-        # stops the bs=64 full-pass stalls (3.5-6 s each on TP=64) without freezing
+        # stops the batch-64 full-pass stalls (seconds each on TP=64) without freezing
         # the heap; "freeze_rare_gen2" also freezes it as vLLM's GPU worker does,
-        # which made every bs=1 decode step slower there; "off" keeps CPython's GC.
+        # which made every batch-1 decode step slower there; "off" keeps CPython's GC.
         from vllm_neuron.vllm.worker.gc_policy import apply_post_warmup_gc_policy
 
         # SyntheticNeuronModel: skip warmup (no compiled graphs needed)

@@ -628,16 +628,15 @@ It is
 served greedy only (under this recipe, sampling knobs are refused at admission). Its
 greedy output is not guaranteed identical to non-speculative greedy decoding: with
 the draft layer's earlier view-form latent write, consecutive identical requests
-drafted differently on device (one six-run series gave two alternating outputs; fixed
-by writing into the bank itself: 12 of 12 repeated generations and 8 of 8 prompts
-identical across two passes against the same server). Output still differs from
-non-speculative greedy decoding, deterministically within a configuration (3 of 8
-identity prompts on the bank-write configuration, 4 of 8 on the earlier one): the
-likeliest carrier is the `1 + k`-row verify graph and the one-row decode graph
-accumulating in different orders (each step is lossless by id equality, and an
-on-device-sampling server returns no logprobs with which to read the margins).
-GSM8K@200 exact-match is 0.985 on this configuration (0.99 on the earlier one; one
-question flipped, cause under investigation). Leave it off where token identity with
+drafted differently on device (a series of runs of one prompt gave two alternating
+outputs; fixed by writing into the bank itself: repeated generations and identity
+prompts were identical across two passes against the same server). Output still
+differs from non-speculative greedy decoding for some identity prompts, on both
+configurations and deterministically within each: the likeliest carrier is the
+`1 + k`-row verify graph and the one-row decode graph accumulating in different orders
+(each step is lossless by id equality, and an on-device-sampling server returns no
+logprobs with which to read the margins). One benchmark question flipped between the
+two configurations (cause under investigation). Leave it off where token identity with
 non-speculative decoding is required. Details:
 [`docs/design/speculation/speculative_decoding_design.md`](../design/speculation/speculative_decoding_design.md#glm-53-flash-mtp-drafter-method-mtp).
 
