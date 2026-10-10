@@ -71,8 +71,7 @@ class MtpProposer:
 
         Raises:
             ValueError: method other than "mtp", host sampling, or async scheduling
-                (the accepted count would reach the host one step late; the async
-                series lifts this).
+                (the accepted count would reach the host one step late).
         """
         self.vllm_config = vllm_config
         self.speculative_config = vllm_config.speculative_config
