@@ -139,6 +139,31 @@ def _col(parts, dtype):
     return nl.ndarray((parts, _LINE), dtype=dtype, buffer=nl.sbuf)[:, 0:1]
 
 
+def _query_columns(q_hbm, rt, q_stride, q_off, latent):
+    """``rt`` query rows transposed onto the latent axis: ``[128, L / 128, 128]``, q's dtype.
+
+    Row ``p`` is read at element ``q_off + p * q_stride`` of ``q_hbm``; column ``p`` of
+    latent tile ``li`` holds it. A PE transpose writes PSUM in its input's dtype and a
+    PSUM write must be whole 4-byte words, so an odd row count of a 2-byte dtype is
+    transposed in fp32 (exact on the PE) and rounded back, losslessly, to its own dtype
+    -- mla_decode's rule.
+    """
+    n_lat = latent // LATENT_TILE
+    q_nat = _sb((ROW_TILE, latent), q_hbm.dtype)
+    nisa.dma_copy(dst=q_nat[0:rt, :],
+                  src=q_hbm.ap(pattern=[[q_stride, rt], [1, latent]], offset=q_off))
+    q_f = _sb((ROW_TILE, latent), nl.float32)
+    nisa.tensor_copy(dst=q_f[0:rt, :], src=q_nat[0:rt, :])
+    q_ps = nl.ndarray((LATENT_TILE, n_lat * ROW_TILE), dtype=nl.float32, buffer=nl.psum)
+    for li in range(n_lat):
+        nisa.nc_transpose(dst=q_ps[:, li * ROW_TILE:li * ROW_TILE + rt],
+                          data=q_f[0:rt, li * LATENT_TILE:(li + 1) * LATENT_TILE])
+    q_t = _sb((LATENT_TILE, n_lat, ROW_TILE), q_hbm.dtype)
+    for li in range(n_lat):
+        nisa.tensor_copy(dst=q_t[:, li, 0:rt], src=q_ps[:, li * ROW_TILE:li * ROW_TILE + rt])
+    return q_t
+
+
 def _row_tile(q_hbm, limits_hbm, out_hbm, c_t, c_rows, cols_f, softmax_scale,
               key_rows, rt, q_stride, q_off, lim_off, out_off, lse_hbm, lse_off):
     """One tile of ``rt`` query rows: MM1, softmax, MM2, store.
@@ -153,23 +178,7 @@ def _row_tile(q_hbm, limits_hbm, out_hbm, c_t, c_rows, cols_f, softmax_scale,
     n_chunks = c_rows.shape[1]
     width = n_chunks * KEY_CHUNK
     kv_dtype = c_rows.dtype
-
-    # ---- the query rows, transposed onto the latent axis --------------------------
-    # A PE transpose writes PSUM in its input's dtype and a PSUM write must be whole
-    # 4-byte words, so an odd row count of a 2-byte dtype is transposed in fp32 (exact on
-    # the PE) and rounded back, losslessly, to its own dtype -- mla_decode's rule.
-    q_nat = _sb((ROW_TILE, latent), q_hbm.dtype)
-    nisa.dma_copy(dst=q_nat[0:rt, :],
-                  src=q_hbm.ap(pattern=[[q_stride, rt], [1, latent]], offset=q_off))
-    q_f = _sb((ROW_TILE, latent), nl.float32)
-    nisa.tensor_copy(dst=q_f[0:rt, :], src=q_nat[0:rt, :])
-    q_ps = nl.ndarray((LATENT_TILE, n_lat * ROW_TILE), dtype=nl.float32, buffer=nl.psum)
-    for li in range(n_lat):
-        nisa.nc_transpose(dst=q_ps[:, li * ROW_TILE:li * ROW_TILE + rt],
-                          data=q_f[0:rt, li * LATENT_TILE:(li + 1) * LATENT_TILE])
-    q_t = _sb((LATENT_TILE, n_lat, ROW_TILE), q_hbm.dtype)
-    for li in range(n_lat):
-        nisa.tensor_copy(dst=q_t[:, li, 0:rt], src=q_ps[:, li * ROW_TILE:li * ROW_TILE + rt])
+    q_t = _query_columns(q_hbm, rt, q_stride, q_off, latent)
 
     # ---- which window rows each query row may see: j < min(seq_len, key_rows) ------
     lim_i = _col(ROW_TILE, nl.int32)
@@ -291,6 +300,22 @@ _W_COLS = 2     # every window row's column index, the same on every partition
 
 def _window_operands(window_hbm, key_rows, latent):
     """The window in SBUF twice (keys on partitions, and transposed) and its column index."""
+    ops = _window_rows(window_hbm, key_rows, latent)
+    width = ops[_W_T].shape[2]
+    # ---- the column index of every window row, the same on every partition -----------
+    cols_f = _sb((ROW_TILE, width), nl.float32)
+    nisa.iota(dst=cols_f, pattern=[[1, width]], offset=0)
+    ops.append(cols_f)
+    return ops
+
+
+def _window_rows(window_hbm, key_rows, latent):
+    """The window in SBUF twice: ``[c_rows, c_t]``, keys on partitions and transposed.
+
+    ``c_rows`` is ``[128, chunks, L]`` (row ``ck * 128 + p`` on partition ``p``, the last
+    chunk's pad rows zeroed) and ``c_t`` ``[128, L / 128, chunks * 128]`` (latent tile
+    ``li`` on the partitions).
+    """
     n_lat = latent // LATENT_TILE
     n_chunks = (key_rows + KEY_CHUNK - 1) // KEY_CHUNK
     width = n_chunks * KEY_CHUNK
@@ -316,14 +341,9 @@ def _window_operands(window_hbm, key_rows, latent):
         for li in range(n_lat):
             nisa.tensor_copy(dst=c_t[:, li, ck * KEY_CHUNK:(ck + 1) * KEY_CHUNK],
                              src=t_ps[:, li * KEY_CHUNK:(li + 1) * KEY_CHUNK])
-
-    # ---- the column index of every window row, the same on every partition -----------
-    cols_f = _sb((ROW_TILE, width), nl.float32)
-    nisa.iota(dst=cols_f, pattern=[[1, width]], offset=0)
     ops = []
     ops.append(c_rows)
     ops.append(c_t)
-    ops.append(cols_f)
     return ops
 
 
@@ -524,6 +544,17 @@ def _require_geometry(q_lift: Tensor, c_kv: Tensor, key_rows: int) -> None:
 
 def _require_values(seq: int, heads: int, latent: int, cache_latent: int,
                     q_dtype: torch.dtype, kv_dtype: torch.dtype, key_rows: int) -> None:
+    _require_operands(seq, heads, latent, cache_latent, q_dtype, kv_dtype)
+    if key_rows < 1 or key_rows > MAX_KEY_ROWS:
+        raise MlaDenseWindowError(
+            f"the kernel holds the window in SBUF twice, so it reads at most "
+            f"{MAX_KEY_ROWS} key rows; got key rows={key_rows}"
+        )
+
+
+def _require_operands(seq: int, heads: int, latent: int, cache_latent: int,
+                      q_dtype: torch.dtype, kv_dtype: torch.dtype) -> None:
+    """The query, cache and head checks, without the window bound: each kernel bounds its own."""
     if cache_latent != latent:
         raise MlaDenseWindowError(
             f"q_lift and c_kv must share the latent rank; got {latent} against "
@@ -544,11 +575,6 @@ def _require_values(seq: int, heads: int, latent: int, cache_latent: int,
         raise MlaDenseWindowError(
             f"the latent must be a whole number of {LATENT_TILE}-wide tiles and at most "
             f"{LATENT_MAX} (one fp32 PSUM bank per MM2 row); got latent={latent}"
-        )
-    if key_rows < 1 or key_rows > MAX_KEY_ROWS:
-        raise MlaDenseWindowError(
-            f"the kernel holds the window in SBUF twice, so it reads at most "
-            f"{MAX_KEY_ROWS} key rows; got key rows={key_rows}"
         )
 
 
