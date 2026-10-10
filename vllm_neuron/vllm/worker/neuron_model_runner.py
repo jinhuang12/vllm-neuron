@@ -6820,7 +6820,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         and the column marks the pages past a request's with ``-1``
         (``_glm5next_block_table_column``).
         """
-        return cdiv(int(self.max_model_len), int(page_size))
+        page_size = int(page_size)
+        return (int(self.max_model_len) + page_size - 1) // page_size
 
     def _glm5next_async_launch(self):
         """This runner's :class:`~vllm_neuron.functional.mtp.async_step.DeviceLaunch`.
