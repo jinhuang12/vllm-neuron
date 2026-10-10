@@ -617,6 +617,12 @@ scheduling forms:
   same host and recipe, a 1k-token context; mean per-token gap 10.17 against 15.45 ms; 77.7
   against 55.6 tokens/s) (2026-10-10); the 8-prompt greedy outputs identical to the
   synchronous drafter's; the same GSM8K@200 strict score and wrong set.
+  Known limitation: on a host saturated enough to stall one rank's runtime completion
+  thread, the 32-deep execution queue (`NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS`) fills
+  about three times sooner than with the synchronous drafter (three executions per decode
+  step instead of one), and the step fails with `status=7` (Execution Queue Full), after
+  which the remaining ranks time out on the next collective. Until the launch-depth guard
+  lands, enable the drafter only on an unsaturated host.
 
 It is
 served greedy only (under this recipe, sampling knobs are refused at admission). Its

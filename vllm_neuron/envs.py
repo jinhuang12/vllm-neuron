@@ -98,6 +98,7 @@ if TYPE_CHECKING:
     # (functional/mtp/async_step.py) and the drafter accepts the async scheduler for
     # one sequence (max_num_seqs = 1). Off = the shipped synchronous drafter, which
     # refuses async scheduling by name.
+    # Unsaturated hosts only: 3 executions a step can fill the 32-deep queue (status=7).
     VLLM_NEURON_GLM5NEXT_MTP_ASYNC: bool = False
     # Worker GC policy after warmup (vllm_neuron/vllm/worker/gc_policy.py):
     # "rare_gen2" (gen-2 threshold 100000, no freeze), "off" (CPython's GC),
