@@ -246,8 +246,7 @@ def test_seam_passes_precision_buffers_digest_and_grid(
 
 
 def test_source_digest_keys_on_this_file():
-    import hashlib
+    from vllm_neuron.source_digest import source_digest
 
-    digest = int(hashlib.sha256(pathlib.Path(MS.__file__).read_bytes()).hexdigest()[:7], 16)
-    assert MS.SOURCE_DIGEST == digest
+    assert MS.SOURCE_DIGEST == source_digest(MS.__file__)
     assert load_baseline().mla_sparse_attention_torch_oracle is not MS.mla_sparse_attention_torch_oracle
