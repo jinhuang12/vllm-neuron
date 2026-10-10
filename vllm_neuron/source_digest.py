@@ -10,7 +10,7 @@ Both read a file through :func:`code_digest`, the one owner of the rule:
 * the file is parsed with :mod:`ast` and every statement that is a lone string
   literal is dropped: the docstrings of the module, its classes and functions, and
   the attribute docstrings written after an assignment. Such a statement runs no
-  code; only a leading one sets a ``__doc__``, which no kernel reads;
+  code;
 * the rest is digested as ``ast.dump(tree, include_attributes=False)``, which keeps
   every code token (names, literal values, operators, decorators, defaults) and
   holds no comment, blank line, line number or layout.
@@ -20,6 +20,12 @@ So a comment, docstring or formatting edit moves no compile cache key and no
 format is the interpreter's: another Python minor version may digest the same code
 differently, which costs a recompile and never serves a stale kernel. A file that
 does not parse is digested as its raw bytes, and a WARNING names it.
+
+The digest does not see two things that code can read: a ``__doc__`` (a leading
+string statement sets one) and line numbers (a comment, blank line or docstring
+edit moves the line numbers of the code after it). No kernel reads either. So a
+kernel that the cache serves after such an edit computes the same values; only
+its traceback and debug line numbers can be those from before the edit.
 """
 
 from __future__ import annotations

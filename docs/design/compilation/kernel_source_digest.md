@@ -89,11 +89,15 @@ string literal, and takes the sha256 of `ast.dump(tree, include_attributes=False
 | a name, a number, a string that code uses, an operator, a decorator, a default | yes |
 | any edit to a file that does not parse | yes: the file is read as raw bytes, and a WARNING names it |
 
-A lone string statement runs no code. Only a leading one sets a `__doc__`, and
-no kernel reads one. An f-string statement stays, because it evaluates the
-expressions in it. The `ast.dump` format belongs to the interpreter, so another
-Python minor version can digest the same code differently. That costs one
-recompile and never serves a stale kernel.
+A lone string statement runs no code. The digest does not see two things that
+code can read: a `__doc__` (a leading string statement sets one) and line
+numbers (a comment, blank line or docstring edit moves the line numbers of the
+code after it). No kernel reads either. So a kernel that the cache serves after
+such an edit computes the same values; only its traceback and debug line numbers
+can be those from before the edit. An f-string statement stays, because it
+evaluates the expressions in it. The `ast.dump` format belongs to the
+interpreter, so another Python minor version can digest the same code
+differently. That costs one recompile and never serves a stale kernel.
 
 ### Closure rules
 
@@ -290,7 +294,7 @@ earlier whole-package scheme). Startup uses `install_per_graph_digest_key`.
 
 Eight kernel files pass a digest of their own source into their kernels as a
 trace-time integer, `SOURCE_DIGEST = source_digest(__file__)`.
-`functional/dsa/decode_batch.py` also digests `functional/dsa/_kpool_hadamard.py`,
+`functional/dsa/decode_batch.py` also digests `functional/dsa/kpool_hadamard.py`,
 the butterfly its kernels call. The integer is in the FX graph text and in the
 NKI kernel key. It reads each file through the same rule as the keys, so a
 comment or docstring edit moves neither. `test/vllm_neuron/test_source_digest.py`

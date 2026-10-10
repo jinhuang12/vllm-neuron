@@ -48,7 +48,6 @@ reaches the other tokens of its items through those products (``0 * NaN``);
 
 from __future__ import annotations
 
-
 import torch
 from torch import Tensor
 
