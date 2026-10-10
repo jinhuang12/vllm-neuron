@@ -40,15 +40,24 @@ Forms (the ``form`` of an arm):
 * ``split``: the token split: :data:`SPLIT_PARTS` token blocks, each with its own matmul,
   all-reduce and consumer; block ``k + 1``'s matmul does not read block ``k``'s sum.
 
-Two variants of a form with independent work differ only in one dependency. In the free
-variant the independent work reads a scalar from the partial (row 0, summed); in ``dep`` it
-reads the same scalar from the reduced sum, so it must wait for the collective. The two
-graphs have the same ops and the same cost, so ``dep`` wall minus free wall is the time the
-scheduler saved by overlapping (``hidden``). In ``split``, block ``k + 1``'s input reads
-that scalar from block ``k``. Each form also runs without the collective (``nocc``, the
-identity in its place) as the reference for the exposed time. Every arm runs on the fp32
-wire (as built) and on the bf16 wire (the partial cast to bf16 before the collective,
-``VLLM_NEURON_TP_ALLREDUCE_DTYPE=bf16``).
+The variants of a form with independent work (:data:`VARIANTS`) differ only in where
+one scalar comes from: the sum of row 0 of a tensor, broadcast and multiplied into the
+independent work's input (in ``split``, into block ``k + 1``'s input). The tensor is
+
+* ``free``: an input of the graph, so the independent work depends on nothing the site
+  computes;
+* ``xcore``: the site's partial. Under LNC2 the two physical cores each hold part of that
+  row, so the sum needs a cross-core exchange: each core's program has one more
+  cross-core copy and four more core barriers than ``free``, and the compiler's schedule
+  places the sum after the all-reduce, so the work may wait for the collective without
+  depending on it. Kept as the case of work that needs one cross-core exchange;
+* ``dep``: the reduced sum, so the work must wait for the collective.
+
+The variants have the same ops but for that source, so ``dep`` wall minus ``free`` wall is
+the time the scheduler saved by overlapping (``hidden``). Each form also runs ``free``
+without the collective (``nocc``, the identity in its place) as the reference for the
+exposed time. Every arm runs on the fp32 wire (as built) and on the bf16 wire (the partial
+cast to bf16 before the collective, ``VLLM_NEURON_TP_ALLREDUCE_DTYPE=bf16``).
 
 Flag sets (``flagset``): ``served`` is ``NeuronModelRunner.load_model``'s neuronx-cc
 arguments at ``-O1`` (its fp8 cast option concerns fp8 kernels, which these graphs do not
@@ -74,8 +83,9 @@ What is read (``summarize``):
 * exposed (wall): a ``cc`` arm's wall minus its ``nocc`` partner's. The compiler may
   schedule the graph without the collective differently, so this is a reference, not the
   verdict. Its noise floor is the sum of the two arms' ranges over the repeats.
-* hidden: the ``dep`` wall minus the free wall (same form, wire and flags). ``overlap`` is
-  a hidden time above its noise floor, the sum of the two arms' ranges over the repeats.
+* hidden: the ``dep`` wall minus the ``free`` wall (same form, wire and flags); for
+  ``xcore`` the same against ``xcore``. ``overlap`` is a ``free`` hidden time above its
+  noise floor, the sum of the two arms' ranges over the repeats.
 * exposed (profile): rank 0's device profile of one warm execution; the time a
   collective is in flight while no compute engine (Tensor, Vector, Scalar, GpSimd) of
   either physical core is active. A busy engine is not proof of a hidden collective: the
@@ -181,6 +191,15 @@ OPTION_SETS = (
 #: and the token split.
 OPTION_FORMS = ("base", "indep_mm", "split")
 FORMS = ("base", "indep_mm", "indep_mhc", "split")
+#: The variants of each form in the core table; ``base`` has no independent work.
+VARIANTS = {
+    "base": ("",),
+    "indep_mm": ("free", "xcore", "dep"),
+    "indep_mhc": ("free", "dep"),
+    "split": ("free", "dep"),
+}
+#: The variants of the option sweep: the pair that decides overlap.
+OPTION_VARIANTS = ("free", "dep")
 WIRES = ("f32", "bf16")
 #: Profile engines that count as compute; ``sync`` (queue issue) and the collective
 #: trigger instructions do not.
@@ -237,10 +256,12 @@ def _span(start: int, stop: int) -> dict:
     return {"start": start, "limit": stop, "stride": 1}
 
 
-def build_graph(form: str, wire: str, cc: bool, dep: bool, geo: dict) -> bytes:
+def build_graph(form: str, wire: str, cc: bool, variant: str, geo: dict) -> bytes:
     """The serialized ``HloModuleProto`` of one arm (see the module docstring)."""
     from libtorch_neuronx_lite.pyhlo.scribe import HloScribe
 
+    if variant not in VARIANTS[form]:
+        raise ValueError(f"form {form!r} has no variant {variant!r}")
     t, h, s, k = geo["tokens"], geo["hidden"], geo["streams"], geo["contraction"]
     groups = [list(range(geo["ranks"]))]
 
@@ -265,12 +286,13 @@ def build_graph(form: str, wire: str, cc: bool, dep: bool, geo: dict) -> bytes:
 
         w = param(bf16[k, h])
         zero = None if form == "base" else param(f32[()])
+        source_row = param(f32[1, h]) if variant == "free" else None
 
         def gate(partial, total, shape, dtype):
-            """A scalar broadcast to ``shape``: the sum of row 0 of the reduced sum
-            (``dep``) or of the partial (free), so ``dep`` alone orders the independent
-            work after the collective, at the same cost."""
-            source = total if dep else partial
+            """A scalar broadcast to ``shape``: the sum of row 0 of the graph input
+            (``free``), of the partial (``xcore``) or of the reduced sum (``dep``), so
+            the variants differ in that one dependency, at the same cost."""
+            source = {"free": source_row, "xcore": partial, "dep": total}[variant]
             row = f32[1, h].Slice(source, slice_dimensions=[_span(0, 1), _span(0, h)])
             scalar = f32[()].Reduce(row, zero, dimensions=[0, 1], to_apply=_add(f32))
             return dtype[shape].Broadcast(dtype[()].Convert(scalar), dimensions=[])
@@ -334,7 +356,7 @@ def build_graph(form: str, wire: str, cc: bool, dep: bool, geo: dict) -> bytes:
             return bf16[t, s, h].Concatenate(*mixed, dimensions=[1])
         raise ValueError(f"unknown form {form!r}")
 
-    graph.__name__ = arm_name(form, dep, wire, cc, "graph")
+    graph.__name__ = arm_name(form, variant, wire, cc, "graph")
     return HloScribe()(graph).module_proto.SerializeToString()
 
 
@@ -388,30 +410,33 @@ def flagsets() -> dict[str, tuple[str, ...]]:
     return out
 
 
-def arm_name(form: str, dep: bool, wire: str, cc: bool, flagset: str) -> str:
-    """``<form>[_dep]_<wire>_<cc|nocc>_<flagset>``."""
-    variant = f"{form}_dep" if dep else form
-    return f"{variant}_{wire}_{'cc' if cc else 'nocc'}_{flagset}"
+def arm_name(form: str, variant: str, wire: str, cc: bool, flagset: str) -> str:
+    """``<form>[_<variant>]_<wire>_<cc|nocc>_<flagset>``."""
+    stem = f"{form}_{variant}" if variant else form
+    return f"{stem}_{wire}_{'cc' if cc else 'nocc'}_{flagset}"
 
 
 def arms() -> list[dict]:
     """Every timed arm, the core table and then the option sweep.
 
-    A form with independent work runs free and ``dep`` (``cc``). In the core table each
-    form also runs free without the collective (``nocc``: there the two variants are the
-    same graph), and a ``cc`` arm's ``nocc`` partner is that arm at its flag set without
-    ``_fuse`` (no collective, nothing for the flag to change). The option sweep has no
-    ``nocc`` arms: its verdict is the free/``dep`` pair alone.
+    A form with independent work runs each of its variants with the collective (``cc``).
+    In the core table each form also runs its first variant (``free``) without the
+    collective (``nocc``), and a ``cc`` arm's ``nocc`` partner is that arm at its flag set
+    without ``_fuse`` (no collective, nothing for the flag to change). The option sweep
+    runs :data:`OPTION_VARIANTS` and no ``nocc`` arms: its verdict is the ``free`` /
+    ``dep`` pair alone.
     """
 
-    def arm(form, dep, wire, cc, flagset, partnered):
+    def arm(form, variant, wire, cc, flagset, partnered):
         partner = None
         if cc and partnered:
-            partner = arm_name(form, False, wire, False, flagset.removesuffix("_fuse"))
+            partner = arm_name(
+                form, VARIANTS[form][0], wire, False, flagset.removesuffix("_fuse")
+            )
         return {
-            "name": arm_name(form, dep, wire, cc, flagset),
+            "name": arm_name(form, variant, wire, cc, flagset),
             "form": form,
-            "dep": dep,
+            "variant": variant,
             "wire": wire,
             "cc": cc,
             "flagset": flagset,
@@ -419,24 +444,28 @@ def arms() -> list[dict]:
             "table": "core" if flagset in CORE_FLAGSETS else "options",
         }
 
-    def form_arms(form, wire, cc_flagsets, nocc_flagsets):
-        variants = (False,) if form == "base" else (False, True)
+    def form_arms(form, variants, wire, cc_flagsets, nocc_flagsets):
         partnered = bool(nocc_flagsets)
         out = [
-            arm(form, dep, wire, True, f, partnered)
-            for dep in variants
+            arm(form, v, wire, True, f, partnered)
+            for v in variants
             for f in cc_flagsets
         ]
-        return out + [arm(form, False, wire, False, f, False) for f in nocc_flagsets]
+        return out + [
+            arm(form, variants[0], wire, False, f, False) for f in nocc_flagsets
+        ]
 
     out = []
     for wire in WIRES:
         for form in FORMS:
-            out += form_arms(form, wire, CORE_FLAGSETS, ("served", "single"))
+            out += form_arms(
+                form, VARIANTS[form], wire, CORE_FLAGSETS, ("served", "single")
+            )
     for base, option in OPTION_SETS:
         flagset = f"{base}_{option}"
         for form in OPTION_FORMS:
-            out += form_arms(form, "f32", (flagset,), ())
+            variants = VARIANTS[form] if form == "base" else OPTION_VARIANTS
+            out += form_arms(form, variants, "f32", (flagset,), ())
     return out
 
 
@@ -687,9 +716,11 @@ def summarize(output_dir: Path) -> dict:
     """``summary.json`` from ``manifest.json`` and the records under ``raw/``.
 
     ``rows`` holds every arm's numbers; ``table`` one line per (form, wire, flag set):
-    the free and ``dep`` walls, what the collective exposes in each, and ``hidden``, the
-    ``dep`` wall minus the free one (the time the scheduler saves where it may overlap),
-    with its noise floor (the two arms' ranges over the repeats added) and the verdict.
+    each variant's wall, what the collective exposes in it and the profile's compute
+    share of the collective, and ``hidden``, the ``dep`` wall minus the ``free`` one (the
+    time the scheduler saves where it may overlap), with its noise floor (the two arms'
+    ranges over the repeats added) and the verdict; ``xcore_hidden`` the same for
+    ``xcore``.
     """
     manifest = json.loads((output_dir / "manifest.json").read_text())
     failed = [
@@ -707,7 +738,7 @@ def summarize(output_dir: Path) -> dict:
         walls = [r["wall_us"] for r in reps]
         row = {
             key: record[key]
-            for key in ("form", "dep", "wire", "cc", "flagset", "partner", "table")
+            for key in ("form", "variant", "wire", "cc", "flagset", "partner", "table")
         }
         row.update(
             allreduces_compiled=record["allreduces_compiled"],
@@ -741,27 +772,37 @@ def summarize(output_dir: Path) -> dict:
     shutil.rmtree(output_dir / "scratch", ignore_errors=True)
     table = []
     for name, row in rows.items():
-        if not row["cc"] or row["dep"]:
+        if not row["cc"] or row["variant"] != VARIANTS[row["form"]][0]:
             continue
         line = {
             key: row[key] for key in ("table", "form", "wire", "flagset", "modules")
         }
-        line.update(
-            collectives=row["collectives_per_execution"],
-            wall_us=row["wall_us"],
-            exposed_us=row.get("exposed_us"),
-            exposed_noise_us=row.get("exposed_noise_us"),
-            compute_share_of_collective=_compute_share(row),
-        )
-        dep = rows.get(arm_name(row["form"], True, row["wire"], True, row["flagset"]))
-        if dep is not None:
-            line.update(
-                dep_wall_us=dep["wall_us"],
-                dep_exposed_us=dep.get("exposed_us"),
-                dep_compute_share_of_collective=_compute_share(dep),
-                hidden_us=dep["wall_us"] - row["wall_us"],
-                hidden_noise_us=dep["wall_range_us"] + row["wall_range_us"],
+        line["collectives"] = row["collectives_per_execution"]
+        variants = {}
+        for variant in VARIANTS[row["form"]]:
+            arm = rows.get(
+                arm_name(row["form"], variant, row["wire"], True, row["flagset"])
             )
+            if arm is not None:
+                variants[variant] = {
+                    "wall_us": arm["wall_us"],
+                    "wall_range_us": arm["wall_range_us"],
+                    "collective_us": arm["collective_us"],
+                    "exposed_us": arm.get("exposed_us"),
+                    "exposed_noise_us": arm.get("exposed_noise_us"),
+                    "compute_share_of_collective": _compute_share(arm),
+                }
+        line["variants"] = variants
+        dep = variants.get("dep")
+        for variant, prefix in (("free", ""), ("xcore", "xcore_")):
+            if dep is None or variant not in variants:
+                continue
+            other = variants[variant]
+            line[f"{prefix}hidden_us"] = dep["wall_us"] - other["wall_us"]
+            line[f"{prefix}hidden_noise_us"] = (
+                dep["wall_range_us"] + other["wall_range_us"]
+            )
+        if "hidden_us" in line:
             line["overlap"] = line["hidden_us"] > line["hidden_noise_us"]
         table.append(line)
     return {
@@ -806,7 +847,7 @@ def compile_all(out: Path, timed: list[dict], jobs: int) -> dict:
         futures = {
             pool.submit(
                 compile_graph,
-                build_graph(a["form"], a["wire"], a["cc"], a["dep"], geo),
+                build_graph(a["form"], a["wire"], a["cc"], a["variant"], geo),
                 flags[a["flagset"]],
                 raw / a["name"] / "compile",
             ): a
