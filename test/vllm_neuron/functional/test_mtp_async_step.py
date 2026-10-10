@@ -459,6 +459,29 @@ def test_the_correction_takes_the_previous_steps_rows_and_reads_its_first_b_as_t
                                      page_size=PAGE, padding=0)
 
 
+def test_the_corrections_fields_have_unit_stride_on_both_routes_at_every_width():
+    """The layers' graphs are compiled from the synchronous translator's operands, fresh
+    contiguous tensors, and their guards read each operand's strides: a one-element row that
+    keeps the stride of the view it was read through (the slots' low word of an int32 pair) is
+    another signature, a recompile the serve refuses. Every field of the correction has unit
+    stride on both routes, at the one-row step as at the verify step, with and without a
+    padding row."""
+    tables = _tables(71, 1, 3)
+    for route in (async_step.mtp_async_correct_torch, async_step.mtp_async_correct):
+        for padding in (0, 1):
+            column = _column(tables, 3, padding)
+            for width in (1, T):
+                correction = route(
+                    torch.tensor([0], dtype=torch.int32), torch.tensor([PAGE + 3], dtype=torch.int32),
+                    column, prev_width=1, width=width, page_size=PAGE, padding=padding,
+                )
+                for name in correction._fields:
+                    field = getattr(correction, name)
+                    assert field.stride() == (1,), (
+                        route.__name__, name, width, padding, tuple(field.shape), field.stride()
+                    )
+
+
 def test_a_strided_operand_is_refused_by_name_instead_of_copied_on_device():
     """The producers hand fresh contiguous tensors; a strided view would become a device
     copy inside the launch (and another compiled signature), so each operand is refused

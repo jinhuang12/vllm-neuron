@@ -19,13 +19,18 @@ flight when the finishing output is applied.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
+import torch
 from vllm.engine.arg_utils import EngineArgs
 
 from vllm_neuron.vllm.worker.neuron_model_runner import (
     AsyncNeuronModelRunnerOutput,
     NeuronModelRunner,
 )
+
+from vllm_neuron.vllm.worker.neuron_worker import NeuronWorker
 
 from test.vllm_neuron.model.glm5_next import test_mtp_e2e_spec as spec
 from test.vllm_neuron.model.glm5_next.tiny import test_tiny_glm5next_e2e as e2e
@@ -292,3 +297,161 @@ def test_the_async_drafter_reaches_the_context_limit_with_the_synchronous_drafte
     assert fallback_steps == [transition], (fallback_steps, transition, widths)
     assert fallbacks == 1 and async_steps == steps - 1, (async_steps, fallbacks, steps)
     print("limit steps (sync, async, widths, transition):", control_steps, steps, widths, transition)
+
+
+# ── every served step runs in a graph the warmup compiled ───────────────────
+
+
+def _graph_signature(kwargs: dict) -> tuple:
+    """What the compiled root's guards read of one call's kwargs: every tensor's path, shape,
+    dtype and strides; every number; and, among the carriers, the paths that hold one tensor
+    object (the guards keep inputs compiled as distinct tensors distinct objects, and one tensor
+    compiled under two paths one object). The carriers are the translator's operands, the ones a
+    drafter form changes; the generic kwargs are the generic runner's, read by the root under
+    their own names (``spec_decode_metadata`` by three fields the rejection sampler names), so
+    they are compared by shape, dtype and value. Hashable, so a served step's signature can be
+    looked up among the warmup's."""
+    leaves: list[tuple[str, object]] = []
+
+    def walk(value, path: str) -> None:
+        if torch.is_tensor(value):
+            leaves.append((path, value))
+        elif isinstance(value, dict):
+            for key in value:
+                walk(value[key], f"{path}[{key!r}]")
+        elif isinstance(value, (list, tuple)):
+            for index, item in enumerate(value):
+                walk(item, f"{path}[{index}]")
+        elif value is None or isinstance(value, (bool, int, float, str)):
+            leaves.append((path, value))
+        else:
+            for key, item in vars(value).items():
+                walk(item, f"{path}.{key}")
+
+    for key in sorted(kwargs):
+        walk(kwargs[key], key)
+    shapes = tuple(
+        (path, (tuple(value.shape), value.dtype, tuple(value.stride())) if torch.is_tensor(value) else value)
+        for path, value in leaves
+    )
+    holders: dict[int, list[str]] = {}
+    for path, value in leaves:
+        if torch.is_tensor(value) and path.startswith("layer_carriers["):
+            holders.setdefault(id(value), []).append(path)
+    shared = tuple(sorted(tuple(paths) for paths in holders.values() if len(paths) > 1))
+    return shapes, shared
+
+
+#: ``warmup_decode``'s two synthetic builds per target: the verify form, then the one-row form.
+WARMUP_FORMS = (
+    ("verify", dict(spec_decode_enabled=True)),
+    ("one-row", dict(spec_decode_enabled=False, decode_token_threshold=1)),
+)
+
+
+def _warmup_signatures(runner: NeuronModelRunner) -> dict[str, tuple]:
+    """The decode graphs the warmup compiles for this runner: ``warmup_decode``'s builds
+    (:data:`WARMUP_FORMS`) per target of ``NeuronWorker._decode_compile_targets`` (batch bucket
+    by context bucket), each through the translator, as graph signatures keyed by form and
+    target."""
+    targets = NeuronWorker._decode_compile_targets(SimpleNamespace(model_runner=runner))
+    assert targets, "the runner's config names no batch bucket, so no decode graph is warmed"
+    return {
+        f"{form} batch {batch_size} context {ctx_bucket}": _graph_signature(
+            runner._glm5next_model_kwargs(
+                runner._build_decode_synthetic_inputs(
+                    batch_size, ctx_bucket=ctx_bucket, compiled_graph_input=True, **build
+                )
+            )
+        )
+        for batch_size, ctx_bucket in targets
+        for form, build in WARMUP_FORMS
+    }
+
+
+def _recording_every_model_call(runner: NeuronModelRunner, monkeypatch) -> list[tuple]:
+    """Record the graph signature of every call the runner makes into the root (each goes
+    through ``_glm5next_model_kwargs``), leaving the call in place."""
+    recorded: list[tuple] = []
+    original = runner._glm5next_model_kwargs
+
+    def recording(kwargs: dict) -> dict:
+        converted = original(kwargs)
+        recorded.append(_graph_signature(converted))
+        return converted
+
+    monkeypatch.setattr(runner, "_glm5next_model_kwargs", recording)
+    return recorded
+
+
+def _is_prefill(signature: tuple) -> bool:
+    """A prefill's carriers carry ``prefill_tail`` (sparse) or ``is_prefill`` True (recurrent)."""
+    shapes, _ = signature
+    return any(
+        path.endswith("['prefill_tail']") or (path.endswith("['is_prefill']") and value is True)
+        for path, value in shapes
+    )
+
+
+def _differences(warmed: tuple, step: tuple) -> dict:
+    """Per path, ``(warmed, step)`` where they differ; under ``shared objects`` the object
+    groups only one side has."""
+    warmed_shapes, step_shapes = dict(warmed[0]), dict(step[0])
+    out = {
+        path: (warmed_shapes.get(path), step_shapes.get(path))
+        for path in sorted(set(warmed_shapes) | set(step_shapes))
+        if warmed_shapes.get(path) != step_shapes.get(path)
+    }
+    if set(warmed[1]) != set(step[1]):
+        out["shared objects"] = (sorted(set(warmed[1]) - set(step[1])), sorted(set(step[1]) - set(warmed[1])))
+    return out
+
+
+def _assert_every_decode_call_is_warmed(drafter: str, recorded: list[tuple], warmed: dict[str, tuple]) -> None:
+    """Every decode call's signature is one of the warmed graphs'; a failure names the call, the
+    nearest warmed graph and what differs from it."""
+    decode_calls = [signature for signature in recorded if not _is_prefill(signature)]
+    assert decode_calls, (drafter, len(recorded))
+    for index, signature in enumerate(decode_calls):
+        if signature in warmed.values():
+            continue
+        nearest = min(warmed, key=lambda name: len(_differences(warmed[name], signature)))
+        raise AssertionError(
+            f"{drafter} drafter, decode call {index} of {len(decode_calls)}: no warmed graph takes "
+            f"this step; against '{nearest}' it differs in {_differences(warmed[nearest], signature)}"
+        )
+
+
+def test_every_decode_step_to_the_limit_runs_in_a_graph_the_warmup_compiled(tmp_path, monkeypatch):
+    """The serve refuses a recompile (``fail_on_recompile``), so a decode step whose graph
+    signature no warmed graph takes fails the request. Both drafters are driven to
+    ``max_model_len`` -- the verify steps, the switch to one-row steps, the one-row steps to the
+    last position -- and every decode call's signature (shapes, dtypes, numbers, and which
+    operands are one object) is one ``warmup_decode`` compiles: the verify form or the one-row
+    form of a target."""
+    e2e._require_cpu_mode()
+    fr._declaring_a_sampler(monkeypatch)
+    prompt = spec._prompts()[LIMIT_PROMPT]
+    tokens = spec.MAX_MODEL_LEN - len(prompt)
+    monkeypatch.delenv(proposer_tests.ASYNC_KNOB, raising=False)
+    monkeypatch.setenv(spec.KNOB, str(K))
+    (tmp_path / "sync").mkdir()
+    with fr._parallel_state(tmp_path / "sync", spec._config(K)):
+        root, _ = spec._root()
+        runner = spec._runner(spec._config(K), root)
+        warmed = _warmup_signatures(runner)
+        recorded = _recording_every_model_call(runner, monkeypatch)
+        ids, _ = spec._generate(runner, "sync-limit", prompt, tokens=tokens, finished=set())
+    assert len(ids) == tokens
+    _assert_every_decode_call_is_warmed("synchronous", recorded, warmed)
+
+    monkeypatch.setenv(proposer_tests.ASYNC_KNOB, "1")
+    (tmp_path / "async").mkdir()
+    with fr._parallel_state(tmp_path / "async", _async_config(K)):
+        root, _ = spec._root()
+        runner = spec._runner(_async_config(K), root)
+        warmed = _warmup_signatures(runner)
+        recorded = _recording_every_model_call(runner, monkeypatch)
+        ids, *_ = _generate_async_to_the_limit(runner, "async-limit", prompt, finished=set())
+    assert len(ids) == tokens
+    _assert_every_decode_call_is_warmed("async", recorded, warmed)

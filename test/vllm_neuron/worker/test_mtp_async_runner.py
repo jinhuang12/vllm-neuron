@@ -25,6 +25,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch._dynamo as dynamo
 
 from vllm_neuron.functional.kda import fused_decode
 from vllm_neuron.functional.mtp import async_step
@@ -371,12 +372,22 @@ def test_a_one_row_decode_is_laid_out_at_the_true_position(proposer):
 
 
 def _signatures(carriers: list[dict]) -> list[dict[str, tuple]]:
-    """Per carrier, every tensor operand's ``(shape, dtype)``: the part of a compiled graph's
-    input signature the translator's operands set (a different shape is a new graph)."""
-    return [
-        {key: (tuple(value.shape), value.dtype) for key, value in carrier.items() if torch.is_tensor(value)}
-        for carrier in carriers
-    ]
+    """Per carrier, every tensor operand's ``(shape, dtype, holder)``: what a compiled graph's
+    guards read of the translator's operands. A different shape or dtype is another graph. So is
+    another object structure: the guards keep two operands compiled as distinct tensors distinct
+    objects (Dynamo's no-aliasing guard) and one tensor compiled in two places one object. The
+    holder is the ``(carrier index, key)`` the operand's object first appears at: an operand
+    handed once per layer is its own holder, one shared across the layers reads as the first
+    layer's, one handed under two keys reads as the first key's."""
+    holders: dict[int, tuple[int, str]] = {}
+    signatures = []
+    for index, carrier in enumerate(carriers):
+        signature = {}
+        for key, value in carrier.items():
+            if torch.is_tensor(value):
+                signature[key] = (tuple(value.shape), value.dtype, holders.setdefault(id(value), (index, key)))
+        signatures.append(signature)
+    return signatures
 
 
 def _assert_same_signatures(form: str, want: list[dict], got: list[dict]) -> None:
@@ -391,9 +402,9 @@ def _assert_same_signatures(form: str, want: list[dict], got: list[dict]) -> Non
 def test_the_async_sparse_carriers_hand_the_warmed_graphs_the_synchronous_signatures(proposer):
     """Every warmup converts the synchronous form (no correction exists at warmup), so the
     decode graphs compiled at warmup take the synchronous translator's operand signatures. The
-    async translator must hand the same ``(shape, dtype)`` per operand, for the verify form and
-    for the one-ring one-row form, or the first served step of that form compiles a graph the
-    warmup did not."""
+    async translator must hand the same ``(shape, dtype)`` per operand and the same object
+    structure (which operands are one tensor), for the verify form and for the one-ring one-row
+    form, or the first served step of that form is a recompile the serve refuses."""
     sync_world = translator._world(1)
     translator._mtp_server(sync_world.runner)
     start = sync_world.lengths[0]
@@ -436,6 +447,53 @@ def test_the_async_recurrent_carriers_hand_the_warmed_graphs_the_synchronous_sig
         world.runner._glm5next_async_carry = _carry(world.req_ids, prev_width=1, checkpoint_rows=[0, 0])
         under_async = translator._kda_convert(world, [0, 1], **step)
         _assert_same_signatures(form, _signatures(sync), _signatures(under_async))
+
+
+def _reading_every_operand(layer_carriers: list[dict]) -> torch.Tensor:
+    """Stands in for the root forward under ``torch.compile``: reads every tensor operand and
+    every number of every carrier, so the compiled graph guards each as the root's graph does
+    (shape, dtype and object identity per tensor; value per number)."""
+    total = torch.zeros((), dtype=torch.float32)
+    for carrier in layer_carriers:
+        for value in carrier.values():
+            for item in value if isinstance(value, (tuple, list)) else (value,):
+                if torch.is_tensor(item):
+                    total = total + item.reshape(-1)[0].to(torch.float32)
+                elif isinstance(item, (bool, int, float)):
+                    total = total + float(item)
+    return total
+
+
+@pytest.mark.parametrize("form", ["verify", "one-row"])
+def test_an_async_step_runs_in_the_graph_the_warmup_compiled_from_the_synchronous_form(proposer, form):
+    """The warmup compiles each decode form from the synchronous translator, and the serve
+    refuses a recompile (``fail_on_recompile``), so a step the async translator hands in another
+    structure than the synchronous one -- a shape, a dtype, or one object where the compiled
+    form took two -- fails the request. Both served widths, compiled from the synchronous step
+    and then handed the async step: the verify step after the prefill, and the one-row step
+    after it (the scheduler's switch near ``max_model_len``; the table column is the bucket's
+    width at every position, so the step at the limit has this signature)."""
+    sync_world = translator._world(1)
+    translator._mtp_server(sync_world.runner)
+    world = translator._world(1)
+    _async_server(world.runner, proposer)
+    start = sync_world.lengths[0]
+    verify = dict(cached=[start], tokens=T, real=[T])
+    world.runner._glm5next_async_carry = _carry(world.req_ids, prev_width=1, checkpoint_rows=[0])
+    compiled_from = translator._convert(sync_world, [0], **verify)["layer_carriers"]
+    handed = translator._convert(world, [0], **verify)["layer_carriers"]
+    if form == "one-row":
+        # The verify step moved each world's ring cursor to ``start + T``; the one-row step
+        # continues from there, the carry naming the verify step's one kept draft.
+        one_row = dict(cached=[start + T], tokens=1, real=[1], width=1)
+        world.runner._glm5next_async_carry = _carry(world.req_ids, prev_width=T, checkpoint_rows=[1])
+        compiled_from = translator._convert(sync_world, [0], **one_row)["layer_carriers"]
+        handed = translator._convert(world, [0], **one_row)["layer_carriers"]
+    dynamo.reset()
+    graph = torch.compile(_reading_every_operand, backend="eager", fullgraph=True, dynamic=False)
+    graph(compiled_from)
+    with torch.compiler.set_stance("fail_on_recompile"):
+        graph(handed)
 
 
 def test_the_handed_width_is_the_steps_own_and_only_one_or_the_full_width(proposer):

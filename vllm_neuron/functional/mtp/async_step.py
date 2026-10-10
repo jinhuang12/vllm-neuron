@@ -183,7 +183,10 @@ def _correct_launch(
     operands are contiguous by refusal), the outputs
     reshaped to their :class:`StepCorrection` shapes, and the slots' low words converted
     to the int64 the layers consume (the kernel writes int32 pairs with a zero high word;
-    NKI has no int64). Returns the fields in order, ``latent_slots`` None without a table.
+    NKI has no int64), laid out with unit stride: the layers' graphs were compiled from
+    the synchronous translator's fresh contiguous tensors and guard each operand's strides,
+    and a one-element row would otherwise keep the pair's stride of 2. Returns the fields in
+    order, ``latent_slots`` None without a table.
     """
     batch = starts.shape[0]
     rows = batch + PADDING
@@ -195,7 +198,9 @@ def _correct_launch(
         WITH_SLOTS=WITH_SLOTS,
     )
     latent = (
-        slots.reshape(rows, WIDTH, INT64_WORDS)[:, :, 0].to(torch.int64).reshape(-1)
+        slots.reshape(rows * WIDTH, INT64_WORDS)[:, 0].to(
+            torch.int64, memory_format=torch.contiguous_format
+        )
         if WITH_SLOTS else None
     )
     return start.reshape(rows), linear.reshape(rows), seq.reshape(-1), latent, resume.reshape(rows)

@@ -6610,10 +6610,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             device = latent.device
             if device not in sparse_step_operands:
                 if async_correction is not None:
-                    # One request, one row: the correction's operands, its ``[1]`` start
-                    # viewed as the 0-d tensor this form hands (a registered device
-                    # view), so the graph compiled at warmup from the synchronous form
-                    # keeps its input signature.
+                    # One request, one row: the correction's operands. The graph that serves
+                    # this form was compiled at warmup from the synchronous translator, whose
+                    # operands are distinct tensors (a 0-d start, a position of its own, and a
+                    # table column and slots per layer), and a compiled graph's guards keep the
+                    # inputs compiled as distinct tensors distinct objects: one object handed
+                    # in two places is a recompile, which the serve refuses. So the ``[1]``
+                    # start is viewed as 0-d once here and once more for ``position`` below,
+                    # and the column and the slots are handed as one view per layer
+                    # (``_glm5next_own_view``); nothing is copied or read on the host.
                     cls._glm5next_correction_on(async_correction, device, name=bank["name"])
                     shared = {
                         "seq_lens": async_correction.seq_lens,
@@ -6640,7 +6645,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     )
                 else:
                     shared["position"] = (
-                        shared["start_position"]
+                        async_correction.start_position.reshape(())
                         if async_correction is not None
                         else cls._glm5next_start_position(start_position, device)
                     )
@@ -6655,7 +6660,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         [ids], window_blocks=window_blocks, padding=0, device=device
                     )
                     if block_table_column is None
-                    else block_table_column
+                    else cls._glm5next_own_view(block_table_column)
                 ),
                 # Each token's physical bank row. A chunk's padded rows repeat the
                 # last real token's slot, matching the clamp the layer applies to the
@@ -6670,7 +6675,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         device=device,
                     )
                     if async_correction is None
-                    else async_correction.latent_slots
+                    else cls._glm5next_own_view(async_correction.latent_slots)
                 ),
                 # This request's own row of each side cache, so two requests in one
                 # batch reach disjoint views.
@@ -6711,6 +6716,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             ],
             dtype=torch.int32,
         ).to(device)
+
+    @staticmethod
+    def _glm5next_own_view(tensor: torch.Tensor) -> torch.Tensor:
+        """The tensor as a view of its own: another tensor object over the same storage, the
+        same shape and strides; nothing is copied or read on the host.
+
+        The decode graphs are compiled at warmup from the synchronous translator, which builds
+        a table column and a slot mapping per layer, and a compiled graph's guards keep the
+        inputs compiled as distinct tensors distinct objects (one object handed in two places
+        is a recompile, which the serve refuses). The async drafter's correction holds one
+        tensor per operand for the step, so each layer is handed its own view of it.
+        """
+        return tensor.view(tensor.shape)
 
     @staticmethod
     def _glm5next_correction_on(correction, device, *, name: str) -> None:
