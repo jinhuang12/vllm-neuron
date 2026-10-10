@@ -31,14 +31,12 @@ if TYPE_CHECKING:
     VLLM_NEURON_DEBUG_MODE: bool = False
     VLLM_NEURON_BARRIER_TIMEOUT: int = 3600
     VLLM_NEURON_DISABLE_PARALLEL_TRACE: bool = False
-    #: Skip graph extraction, its barriers and the parallel compile at start-up when
-    #: the compile cache holds every graph the start loads; the warm-ups run as before.
-    #: A full start writes a manifest of its graphs to
-    #: ``<cache root>/neuron/warm_start/``; a later start of the same identity skips
-    #: only if every entry it names is complete on every TP rank. Otherwise, and on
-    #: starts the check does not cover (logged by name), the full pass runs. On one
-    #: 64-rank warm start the skipped work was 463 s of 1242 s to ready (derived from
-    #: that start's log, not measured). ``0`` forces the full pass.
+    #: Skip the compile-target extraction pass, its barriers and the parallel compile
+    #: at start-up on a warm root: a manifest under ``<cache root>/neuron/warm_start/``
+    #: matches the start's identity, and every entry it names is complete on every TP
+    #: rank. The cost removed is the extraction pass itself; the warm-ups run as
+    #: before. A full start writes the manifest. Otherwise, and on starts the check
+    #: does not cover (logged by name), the full pass runs. ``0`` forces the full pass.
     VLLM_NEURON_SKIP_EXTRACTION_WHEN_CACHED: bool = True
     # Renderer thread-pool size for the EPD Router's HF preprocessing offload.
     # vLLM defaults this to 1; >1 parallelizes the GIL-releasing native image
