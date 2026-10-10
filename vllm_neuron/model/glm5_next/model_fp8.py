@@ -1283,29 +1283,12 @@ def _token_gather_combine(
     Returns:
         ``[T, H]`` fp32.
     """
-    from vllm_neuron.functional.moe.moe_blockwise import _cumsum_matmul
+    from vllm_neuron.functional.moe.combine_slots import combine_slots
     from vllm_neuron.functional.moe.token_gather_combine import token_gather_combine
 
-    tokens, experts = expert_affinities.shape
-    device = expert_affinities.device
-    mask = (expert_affinities != 0).to(torch.float32)  # [T, E]
-    # Token t's place among expert e's tokens, and the first block expert e owns.
-    place = _cumsum_matmul(mask) - 1.0
-    blocks = torch.ceil(mask.sum(dim=0) / block)
-    first_block = _cumsum_matmul(blocks.unsqueeze(1)).squeeze(1) - blocks
-    row = first_block.unsqueeze(0) * rows + place  # [T, E], exact in fp32
-    # Token t's j-th selected expert, one-hot over E for each slot j.
-    upper = torch.triu(
-        torch.ones(experts, experts, dtype=torch.float32, device=device)
-    )
-    rank = torch.matmul(mask, upper) - 1.0  # [T, E]
-    slots = min(top_k, experts)
-    slot_ids = torch.arange(slots, dtype=torch.float32, device=device)
-    pick = mask.unsqueeze(2) * (rank.unsqueeze(2) == slot_ids).to(torch.float32)
-    valid = pick.sum(dim=1)  # [T, k], 0/1
-    # An invalid slot reads row 0 and weighs it 0; row 0 is a real or a zero padding
-    # row, so it is finite.
-    index = (pick * row.unsqueeze(2)).sum(dim=1).to(torch.int32)  # [T, k]
+    index, valid = combine_slots(expert_affinities, block, rows, top_k)  # [T, k] each
+    # An invalid slot reads row 0 and weighs it 0. The kernel leaves padding rows
+    # undefined but always writes row 0, as a routed row or a zero row, so it is finite.
     return token_gather_combine(contribution, index, valid)
 
 
