@@ -81,6 +81,9 @@ if TYPE_CHECKING:
     # GLM-5.3-Flash shadow draft (MTP stage A): run the layer-45 draft head k times
     # per decode step beside the trunk and return the k draft ids; 0 = off. The
     # sampled tokens never read the draft. Read through ``mtp.shadow_draft_k()``.
+    # Diagnostic (shadow) path: with ``--speculative-config '{"method": "mtp", ...}'``
+    # the speculative config is the production reader of k, and a set knob must
+    # agree with it.
     VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT: int = 0
     # Build the GLM-5.3-Flash step's attention metadata on the host only: no per-step
     # block-table / slot-mapping uploads that its graph never reads.
@@ -209,7 +212,8 @@ def maybe_measured_float(value: str | None) -> float | None:
 DEFAULT_DEVICE_GRAPH_RESERVE_GIB = 5.0
 
 #: What ``VLLM_NEURON_GLUE_FUSED=1``, and an unset switch, selects: each fused glue
-#: kernel at the prefill row buckets where it beat its torch route, and nothing else.
+#: kernel at the prefill row buckets where it beat its torch route, mhc_pre at the
+#: speculative verify step, and nothing else.
 #:
 #: The buckets are the ones where the in-graph device A/B
 #: (``test/hardware/benchmark_glue_block.py``) measured a win. It runs one
@@ -231,21 +235,36 @@ DEFAULT_DEVICE_GRAPH_RESERVE_GIB = 5.0
 #:   2048-row chunk of the uncapped prefill line, measured together (at ab4f37f, not
 #:   each alone): 995.5 us faster on a 9.80 ms 2048-row layer, faster in each of 5
 #:   rounds by 989 to 1003 us.
+#: * ``mhc_pre:verify``: the fused mHC pre-mix at the speculative verify step, whose
+#:   row counts the mHC sites derive from the speculative config: each decode bucket
+#:   times ``1 + k`` (``functional/glue``, ``verify_rows``). At 4 rows (bs=1, 3 drafts)
+#:   the torch route runs its dots as 2-row pieces, and at the MoE feed-forward site
+#:   the collapse that the router reads as a per-token loop: the feed-forward sites'
+#:   XLA before their consumer grows 2.54 ms over the one-token step
+#:   (``reports/mtpB_verify_cost.md``). On the served TP=64 line the kernel made the
+#:   bs=1, 3-draft verify step's device compute 24.24 ms, against 28.13 ms without it,
+#:   at the 2048-token context bucket (measured as ``mhc_pre:prefill@4`` on a tree that
+#:   called those 4 rows prefill; the 4096-token bucket's graph was not timed). A
+#:   server without speculation has no verify step, so its graphs are unchanged.
 #:
 #: Two loads of one graph have measured up to 11 us apart, so a gain of 11 us or less
 #: is not a win. kda_projections was 7.1 us faster at 128 rows, and 0.3 us slower when
 #: the layer's two reductions were chains of 4 and 8 all-reduces: inside that bound, so
 #: it is not in the default. kda_output was 24.1 us slower at 128 rows. No kernel is
-#: selected at decode: on the served TP=64 line, ``all`` made the bs=1 decode step
-#: 1.75 ms longer, while the single-rank benchmark (no tensor-parallel collectives)
-#: measured it shorter. So every decode graph under ``1`` is the graph ``0`` traces.
+#: selected at decode (one row per request): on the served TP=64 line, ``all`` made
+#: the bs=1 decode step 1.75 ms longer, while the single-rank benchmark (no
+#: tensor-parallel collectives) measured it shorter. So without speculation every
+#: decode graph under ``1`` is the graph ``0`` traces. A speculative server's verify
+#: graphs differ, and so does its one-row-per-request decode graph (the first decode
+#: step, a mixed step) of ``B * (1 + k)`` requests, whose row count is a verify step's:
+#: an mHC site cannot tell the two apart, so that graph takes the verify route too.
 #:
 #: Measure a bucket before adding it, on a device lease, with
 #: ``python test/hardware/benchmark_glue_block.py --output <json> --cases
 #: kda:prefill:<rows> --variants off aa=0 <kernel> default``.
 DEFAULT_GLUE_FUSED_SPEC = (
     "mhc_pre:prefill@128,mhc_pre:prefill@1024,mhc_pre:prefill@2048,"
-    "mhc_post:prefill@128,mhc_post:prefill@1024,mhc_post:prefill@2048")
+    "mhc_post:prefill@128,mhc_post:prefill@1024,mhc_post:prefill@2048,mhc_pre:verify")
 
 
 environment_variables: dict[str, Callable[[], Any]] = {

@@ -167,6 +167,11 @@ class DecodeSelectError(ValueError):
 
 
 def _ceil_div(a, b):
+    """``ceil(a / b)`` for ints ``a >= 0`` and ``b > 0``, in integer arithmetic.
+
+    Plain Python, so the host geometry helpers and the kernel bodies (trace-time ints)
+    share it.
+    """
     return (a + b - 1) // b
 
 
@@ -215,6 +220,7 @@ def segments(width: int) -> tuple[int, int]:
 
 
 def _sb(shape, dtype):
+    """A new kernel-local SBUF tile, ``shape`` (partitions first) of ``dtype``."""
     return nl.ndarray(shape, dtype=dtype, buffer=nl.sbuf)
 
 
@@ -674,6 +680,17 @@ def check_decode_index_context(max_model_len: int, pool_size: int | None) -> Non
 
 
 def _validate(bounded: Tensor, seq_lens: Tensor, select_k, pool_size) -> tuple[int, int]:
+    """Check the operands of :func:`dsa_decode_select`; ``(B, C)`` of ``bounded``.
+
+    Args:
+        bounded: ``[B, C]`` candidate scores, ``B >= 1``, ``C <= MAX_SELECT_CANDIDATES``.
+        seq_lens: ``[B]`` request lengths.
+        select_k: a Python int, ``0 < select_k < C``.
+        pool_size: a Python int, a power of two.
+
+    Raises:
+        DecodeSelectError: naming the first operand outside that contract.
+    """
     if bounded.ndim != 2:
         raise DecodeSelectError(f"bounded must be [B, C]; got {tuple(bounded.shape)}")
     batch, width = int(bounded.shape[0]), int(bounded.shape[1])

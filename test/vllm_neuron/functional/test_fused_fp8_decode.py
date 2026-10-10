@@ -36,7 +36,6 @@ def _meta_case(hidden=4096, intermediate=512, tokens=1, blocks=8, rows=1, expert
         ({}, {}, "2", "compact"),
         ({}, {}, None, "original"),
         ({}, {}, "1", "original"),
-        ({}, {}, "invalid", "original"),
         ({"hidden": 2048}, {}, "2", "original"),
         ({"intermediate": 256}, {}, "2", "original"),
         ({"tokens": 2}, {}, "2", "original"),

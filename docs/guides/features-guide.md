@@ -595,6 +595,24 @@ outputs = llm.generate(["Explain quantum computing"], sampling_params)
 | `num_speculative_tokens`    | Number of tokens the draft proposes per step (typically 3-7) |
 | `on_device_sampling_config` | Required for on-device rejection sampling                    |
 
+### GLM-5.3-Flash MTP drafter (`method: "mtp"`)
+
+GLM-5.3-Flash drafts from its own multi-token-prediction head (no draft model):
+`--speculative-config '{"method": "mtp", "num_speculative_tokens": 3}'` with
+`--no-async-scheduling`, `on_device_sampling_config: {"all_greedy": true}` and the
+environment variable `VLLM_NEURON_GLM5NEXT_ON_DEVICE_SAMPLING=1`, which turns on
+GLM-5.3-Flash's on-device sampler (without it the server refuses the
+`on_device_sampling_config`). It is
+served greedy only (sampling knobs are refused at admission) and its greedy output
+can differ from non-speculative greedy decoding at near-ties, because the
+`1 + k`-row verify graph and the one-token decode graph accumulate in different
+orders (measured: 4 of 8 identity prompts diverged on wording or whitespace
+alternatives; GSM8K@200 exact-match 0.99 unchanged; each step is lossless by id
+equality, and an on-device-sampling server returns no logprobs with which to read
+the margins). Leave it off where token identity with non-speculative decoding is
+required. Details:
+[`docs/design/speculation/speculative_decoding_design.md`](../design/speculation/speculative_decoding_design.md#glm-53-flash-mtp-drafter-method-mtp).
+
 ### On-device vs CPU sampling
 
 Speculative decoding uses **on-device sampling** for the rejection step.

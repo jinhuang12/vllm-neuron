@@ -172,7 +172,9 @@ def _indexer_side_cache_bytes(vllm_config, model_runner, kv_cache_spec=None) -> 
     """Return the bytes of the DSA indexer side caches the runner allocates.
 
     ``pool_cache``, ``tail`` and ``pad_tail`` of every sparse-attention layer, one
-    set per request slot (``max_num_seqs``), sized by ``max_model_len``:
+    set per request slot (``max_num_seqs``), sized by ``max_model_len``; on a server
+    drafting ``k`` mtp tokens (``model_runner.speculative_config``) the two rings are
+    ``indexer_ring_depth(index_kpool, k)`` rows deep, ``index_kpool`` otherwise:
     :func:`~vllm_neuron.vllm.worker.neuron_model_runner.indexer_side_cache_bytes`.
     0 for a model with no indexer.
     """
@@ -180,11 +182,17 @@ def _indexer_side_cache_bytes(vllm_config, model_runner, kv_cache_spec=None) -> 
 
     if kv_cache_spec is None:
         kv_cache_spec = model_runner.get_kv_cache_spec()
+    speculative_config = model_runner.speculative_config
     return indexer_side_cache_bytes(
         kv_cache_spec,
         getattr(model_runner.model, "text_config", None),
         max_seq_len=vllm_config.model_config.max_model_len,
         request_slots=vllm_config.scheduler_config.max_num_seqs,
+        speculative_tokens=(
+            int(speculative_config.num_speculative_tokens)
+            if speculative_config is not None and speculative_config.method == "mtp"
+            else 0
+        ),
     )
 
 
@@ -1341,7 +1349,14 @@ class NeuronWorker(WorkerBase):
         ``max_model_len`` tokens for each of ``max_num_seqs`` sequences, rounded
         up to whole blocks. Block size, page size and the group layout all come
         from the runner's own KV cache specs through vLLM's grouping, so a hybrid
-        recurrent/attention cache is measured the way it will be allocated.
+        recurrent/attention cache is measured the way it will be allocated. A
+        recurrent (``MambaSpec``) group of a speculative server is priced with its
+        ``num_speculative_blocks`` draft blocks per request, the blocks vLLM's own
+        group-based admission check (``_check_enough_kv_cache_memory``) counts; an
+        attention group has none; a uniform-type group holds what its members hold
+        (:func:`~vllm_neuron.vllm.worker.kv_group_blocks.draft_blocks_per_request`). In the recurrent cache modes the
+        plugin serves (``mamba_cache_mode`` ``none``, the default, or ``all``) the
+        need is not below that check's figure for the real layers.
 
         Args:
             log: Log the need. Off where candidate points are priced
@@ -1350,12 +1365,20 @@ class NeuronWorker(WorkerBase):
         Returns:
             The bytes needed, or None when the model reports no cache to size,
             which leaves the memory heuristic to stand on its own.
+
+        Raises:
+            ValueError: A KV cache group's spec is of a class the pool has no
+                pricing for (neither attention, nor ``MambaSpec``, nor a
+                uniform-type group of those); it is refused by class name rather
+                than priced as attention.
         """
         from vllm.utils.math_utils import cdiv
         from vllm.v1.core.kv_cache_utils import (
             get_kv_cache_groups,
             get_uniform_page_size,
         )
+
+        from .kv_group_blocks import draft_blocks_per_request
 
         kv_cache_spec = self.model_runner.get_kv_cache_spec()
         if not kv_cache_spec:
@@ -1381,9 +1404,18 @@ class NeuronWorker(WorkerBase):
         # admission arithmetic said would fit. Where a recurrent block does span
         # the sequence this expression reads one block, so it is right either way.
         # Context parallelism would let a rank keep fewer tokens; no discount is
-        # taken for it here.
+        # taken for it here. A recurrent group of a speculative server also holds
+        # its draft blocks per request (one state row per draft token; the
+        # scheduler hands them out), counted as vLLM's admission check counts
+        # them; :func:`~vllm_neuron.vllm.worker.kv_group_blocks.draft_blocks_per_request` prices them per spec class and
+        # refuses a class it cannot price.
         blocks_per_request = sum(
-            cdiv(max_model_len, group.kv_cache_spec.block_size) for group in groups
+            cdiv(max_model_len, group.kv_cache_spec.block_size)
+            + draft_blocks_per_request(
+                group.kv_cache_spec,
+                f"KV cache group {index} ({', '.join(group.layer_names)})",
+            )
+            for index, group in enumerate(groups)
         )
         # Plus the pool's null block, which no request can be given.
         num_blocks = blocks_per_request * max_num_seqs + 1
@@ -1660,14 +1692,13 @@ class NeuronWorker(WorkerBase):
         """
         bytes_used_params = sum(p.nbytes for p in self.model_runner.model.parameters())
         bytes_used_buffers = sum(b.nbytes for b in self.model_runner.model.buffers())
-        # Add spec decode model weights.
-        if self.model_runner.drafter is not None:
-            bytes_used_params += sum(
-                p.nbytes for p in self.model_runner.drafter.model.parameters()
-            )
-            bytes_used_buffers += sum(
-                b.nbytes for b in self.model_runner.drafter.model.buffers()
-            )
+        # Add spec decode model weights -- unless the drafter is a head of the
+        # target (speculative method "mtp": ``MtpProposer.shares_target_parameters``),
+        # whose bytes the target's sums already hold.
+        drafter = self.model_runner.drafter
+        if drafter is not None and not getattr(drafter, "shares_target_parameters", False):
+            bytes_used_params += sum(p.nbytes for p in drafter.model.parameters())
+            bytes_used_buffers += sum(b.nbytes for b in drafter.model.buffers())
         return bytes_used_params + bytes_used_buffers
 
     def _estimate_available_memory_neuron(

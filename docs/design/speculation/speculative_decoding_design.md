@@ -20,7 +20,7 @@ The algorithm proceeds as follows:
 4. A **rejection sampler** compares draft predictions against target logits. Tokens are accepted sequentially until the first mismatch. The corrected token at the mismatch position (or a bonus token if all are accepted) is emitted.
 5. The process repeats from step 1.
 
-This guarantees the output distribution is identical to the target model alone (for greedy decoding, outputs are bit-exact). The speedup depends on the draft model's **acceptance rate** — how often its predictions match the target.
+This guarantees the output distribution is identical to the target model alone (for greedy decoding, outputs are bit-exact when the verify graph and the one-token decode graph compute the same argmax; the GLM-5.3-Flash MTP drafter is the measured exception, see [GLM-5.3-Flash MTP drafter](#glm-53-flash-mtp-drafter-method-mtp)). The speedup depends on the draft model's **acceptance rate** — how often its predictions match the target.
 
 ### What is EAGLE3?
 
@@ -576,6 +576,62 @@ Checklist summary:
 | \[ \] | `get_kv_spec()` and `bind_kv_cache()` on draft model |
 | \[ \] | Auxiliary layer IDs configured (config or default) |
 | \[ \] | Integration test verifies bit-exact greedy output |
+
+## GLM-5.3-Flash MTP drafter (`method: "mtp"`)
+
+GLM-5.3-Flash carries its own draft head: the decoder layer past the stack
+(`num_nextn_predict_layers: 1`), built by the root as
+`Glm5NextForConditionalGeneration.mtp` and run inside the root's own forward. There
+is no second model, graph or launch (`vllm_neuron/vllm/spec_decode/mtp.py`): every
+decode step returns the sampled or accepted ids and the `k` ids drafted from the
+last accepted row, and the verify step is a `1 + k`-row decode step per request
+whose on-device greedy rejection sampler (`vllm_neuron/nn/rejection_sampler.py`)
+accepts drafts by id equality until the first mismatch.
+
+```bash
+VLLM_NEURON_GLM5NEXT_ON_DEVICE_SAMPLING=1 \
+python3 -m vllm.entrypoints.openai.api_server \
+    --model <GLM-5.3-Flash checkpoint> \
+    --tensor-parallel-size 64 --enable-expert-parallel \
+    --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}' \
+    --no-async-scheduling \
+    --additional-config '{"neuron_config": {"on_device_sampling_config": {"all_greedy": true}, ...}}'
+```
+
+Contract of the opt-in (measured on trn2 at TP64/EP16, `k = 3`, 2026-10-09):
+
+* **Served greedy, synchronously.** The proposer needs on-device sampling and refuses
+  async scheduling by name (the accepted count would reach the host one step late and
+  the indexer-ring cursor and recurrent-state commit would run on stale counts). The
+  recipe runs the on-device sampler with `all_greedy: true`; sampling knobs the greedy
+  sampler cannot apply (`temperature > 0`, `top_k`, `top_p`, `min_p`, `seed`, `n > 1`)
+  are refused at admission (`vllm_neuron/vllm/admission.py`). Distribution-preserving
+  sampling under this drafter is not a served configuration: the on-device rejection
+  sampler compares ids, not probabilities.
+* **Greedy output can differ from non-speculative greedy decoding at near-ties.** The
+  `1 + k`-row verify graph and the one-token decode graph do not accumulate in the same
+  order (the MLA decode kernel routes one query row per request to its key-split kernel
+  and `T` rows per request to the general kernel,
+  `vllm_neuron/functional/attention/mla_decode.py::_route`; the DSA indexer advances a
+  ring by one token or by `T` rows through two kernels), so where the target's top two
+  logits are within rounding of each other the two graphs can pick different tokens.
+  Measured: 4 of 8 identity prompts (64 greedy tokens each) diverged from the
+  non-speculative run at tokens 15-41, every divergence a wording or whitespace
+  alternative; GSM8K@200 exact-match 0.99 unchanged; the three measured runs of one
+  prompt are identical to each other (each graph is deterministic). A server whose
+  consumers need token identity with non-speculative greedy decoding should leave the
+  drafter off. Each verify step is lossless by construction -- an accepted draft is
+  the id the target's own argmax returned for that row -- so the divergence is the
+  target's argmax, not the draft. The top-2 logit margin at a divergence cannot be
+  read from a server that samples on device (its sampler returns ids only and refuses
+  `logprobs`), so the tie is shown by the decoded alternatives, not measured; the
+  planned check is a non-speculative replay of the five divergence positions reading
+  the top-2 margins on the host.
+* **What does not move.** Acceptance on GSM8K@200: conditional per-position rates
+  0.932 / 0.853 / 0.716, mean acceptance length 3.30 tokens per step; the drafter adds
+  about one layer's work to a prefill (measured within the run-to-run spread of TTFT at
+  1k tokens); the KV pool and block table are sized for the `1 + k` recurrent blocks a
+  drafting request holds (`kv_group_blocks.draft_blocks_per_request`).
 
 ## Performance Considerations
 

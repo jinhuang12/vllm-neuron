@@ -68,6 +68,7 @@ from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 from vllm_neuron.utils.weight_loader import set_weight_loader
 
 if TYPE_CHECKING:
+    from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
     # Annotation only: this module imports no vllm symbol at runtime, so the
     # guard keeps the return type of ``_resolve_tp_group`` a real class name.
     from vllm.distributed.parallel_state import GroupCoordinator
@@ -894,8 +895,9 @@ class Glm5NextHyperConnection(nn.Module):
             Glm5NextHyperConnectionError: on a non-positive ``hc_mult``,
                 ``hidden_size`` or iteration count.
             ValueError: when ``VLLM_NEURON_GLUE_FUSED`` routes an mHC kernel by
-                phase at the row count of a prefill bucket that a decode batch can
-                also have (``functional.glue.require_rows_tell_phase``).
+                phase at the row count of a prefill bucket that a decode batch or the
+                verify step can also have, or a ``kernel:verify`` rule leaves out a
+                verify-step row count (``functional.glue.require_rows_tell_phase``).
         """
         super().__init__()
         hc_mult = int(text_config.hc_mult)
@@ -936,22 +938,28 @@ class Glm5NextHyperConnection(nn.Module):
 
         # The step's phase for the glue switch (``VLLM_NEURON_GLUE_FUSED``,
         # functional/glue). This layer sees only ``[T, S, H]`` streams, so it tells
-        # the phases apart by row count. The runner pads a decode batch to one of
-        # ``num_seqs_buckets``, one row per request (its layer carriers refuse a
-        # decode step of more tokens than requests), so a call of more rows than the
-        # largest bucket is a prefill chunk. A prefill bucket that a decode batch can also
-        # have is refused here when the switch routes it by phase. None when the
+        # the phases apart by row count (``functional.glue.phase_of_rows``): the
+        # speculative verify step's rows (each of ``num_seqs_buckets`` times 1 + k), then
+        # a decode batch of up to the largest bucket, then a prefill chunk. A prefill
+        # bucket that a decode batch or the verify step can also have is refused here
+        # when the switch routes it by phase. None when the
         # layer is built without the runner's buckets; then only a rule without a
         # phase selects a kernel here.
         decode_buckets = getattr(neuron_config, "num_seqs_buckets", None)
         self.max_decode_rows = max(decode_buckets) if decode_buckets else None
+        self.verify_rows = frozenset()  # the verify step's rows: glue.verify_rows
         if self.max_decode_rows is not None:
-            from vllm_neuron.functional.glue import require_rows_tell_phase
+            from vllm_neuron.functional.glue import (
+                require_rows_tell_phase, verify_draft_k, verify_rows)
 
+            from .mtp import shadow_draft_k
+
+            self.verify_rows = verify_rows(decode_buckets, verify_draft_k(shadow_draft_k()))
             require_rows_tell_phase(
                 ("mhc_pre", "mhc_post"),
                 self.max_decode_rows,
                 getattr(neuron_config, "num_batched_tokens_buckets", None) or (),
+                verify=self.verify_rows,
             )
 
         # ``hc_mult3`` is the base's own name for the projection's output width:
@@ -988,7 +996,9 @@ class Glm5NextHyperConnection(nn.Module):
         """The glue switch's phase for a call of ``tokens`` rows (``max_decode_rows``)."""
         if self.max_decode_rows is None:
             return None
-        return "decode" if tokens <= self.max_decode_rows else "prefill"
+        from vllm_neuron.functional.glue import phase_of_rows
+
+        return phase_of_rows(tokens, self.max_decode_rows, self.verify_rows)
 
     # ── mHC pre: the folded input, and one Sinkhorn call ──────────────────
     def mhc_pre(
@@ -3160,6 +3170,64 @@ def _start_is_zero(start_position: torch.Tensor | int, device: torch.device):
     return _int64_scalar(start_position, device) == 0
 
 
+def _checkpoint_row_tensor(checkpoint_rows, requests: int, device: torch.device) -> torch.Tensor:
+    """``checkpoint_rows`` as a ``[B]`` int64 tensor on ``device``; ``None`` is all zeros.
+
+    The checkpoint row each request starts from. A tensor is reshaped and cast and
+    never read on the host, so the device tensor the previous step's commit
+    returned serves; one int for every request is factory-built (``torch.full``) so a
+    trace keeps it fake. Per-request host numbers are refused: a tensor built from
+    python data on the traced path is real under graph extraction, so the caller
+    builds that tensor (the runner hands a ``[B]`` int32 tensor on every step).
+    """
+    if checkpoint_rows is None:
+        return torch.zeros((requests,), dtype=torch.int64, device=device)
+    if isinstance(checkpoint_rows, int):
+        return torch.full((requests,), int(checkpoint_rows), dtype=torch.int64, device=device)
+    if torch.is_tensor(checkpoint_rows):
+        if int(checkpoint_rows.numel()) != requests:
+            raise ValueError(
+                f"checkpoint_rows carries {int(checkpoint_rows.numel())} value(s) for "
+                f"{requests} request(s); one per request"
+            )
+        return checkpoint_rows.reshape(requests).to(device=device, dtype=torch.int64)
+    raise ValueError(
+        f"checkpoint_rows is None, one int for every request, or a [B] int tensor (the "
+        f"previous step's commit); got {type(checkpoint_rows).__name__}: per-request host "
+        f"numbers are handed as a tensor the caller builds, not built here on the traced path"
+    )
+
+
+def _pad_token_rows(rows: torch.Tensor, requests: int, tokens: int, total: int) -> torch.Tensor:
+    """``[B*tokens, W]`` request-major rows padded to ``[B*total, W]`` with zero rows after each
+    request's real ones (the kernel's masked padding rows)."""
+    width = int(rows.shape[1])
+    kept = rows.reshape(requests, tokens, width)
+    pad = rows.new_zeros((requests, total - tokens, width))
+    return torch.cat([kept, pad], dim=1).reshape(requests * total, width)
+
+
+def _checkpoint_rows_of_views(views, checkpoint_rows) -> torch.Tensor:
+    """Row ``checkpoint_rows[b]`` of each request's ``[T, ...]`` checkpoint view, as ``[B, ...]``.
+
+    ``None`` or one host int slices (a free view; one request returns the view itself,
+    so the bs=1 line adds no device work and nothing is read); a tensor gathers by
+    ``index_select``, never read; anything else is refused by ``_checkpoint_row_tensor``.
+    """
+    requests = len(views)
+    if checkpoint_rows is None or isinstance(checkpoint_rows, int):
+        row = 0 if checkpoint_rows is None else int(checkpoint_rows)
+        if requests == 1:
+            return views[0][row : row + 1]
+        return torch.stack([view[row] for view in views])
+    rows = _checkpoint_row_tensor(checkpoint_rows, requests, views[0].device)
+    if requests == 1:
+        return views[0].index_select(0, rows)
+    return torch.stack(
+        [view.index_select(0, rows[b : b + 1]).squeeze(0) for b, view in enumerate(views)]
+    )
+
+
 class Glm5NextKDAAttention(nn.Module):
     """Gated-delta linear attention at ``self_attn``.
 
@@ -3339,6 +3407,8 @@ class Glm5NextKDAAttention(nn.Module):
         real_tokens: torch.Tensor | int | None = None,
         row_mask: torch.Tensor | None = None,
         state_slots: torch.Tensor | None = None,
+        checkpoint_rows: torch.Tensor | int | None = None,
+        state_checkpoints: int | None = None,
     ) -> torch.Tensor:
         """One KDA layer's gated-delta linear attention over ``[T, hidden]``.
 
@@ -3379,6 +3449,29 @@ class Glm5NextKDAAttention(nn.Module):
                 at ``state_slots[b]``. Served by the fused decode launch alone,
                 which gathers the rows and writes them back onto the banks
                 (:mod:`vllm_neuron.functional.state_banks`).
+            state_checkpoints: ``1 + k`` on a speculative server, the state rows one
+                slot of the bank holds (``glm5next_state_banks.state_bank_regions``
+                with ``checkpoints``): a view carrier is then ``[1 + k, ...]`` and a
+                bank ``[slots, 1 + k, ...]``, and a decode step carries exactly
+                ``1 + k`` tokens per request (the last sampled token and the ``k``
+                drafts, request-major rows), or fewer. The step reads the row of
+                ``checkpoint_rows`` and writes every row as that token's checkpoint
+                (:func:`~vllm_neuron.functional.kda.fused_decode.kda_fused_decode_tstep`).
+                A step carries ``1 .. 1 + k`` tokens per request (a short one is padded
+                inside; the slot is always written whole, a bucket padding row's slot
+                included -- so a padding row's ``checkpoint_rows`` entry is its slot's
+                recorded live row, ``0`` when the slot has none; see
+                ``_fused_decode_requests``). ``None`` is the plain server: one row per
+                slot, one token per request.
+            checkpoint_rows: with ``state_checkpoints``, the checkpoint row each
+                request starts from -- what the previous verify step's
+                :func:`~vllm_neuron.functional.kda.fused_decode.commit_kda_checkpoints`
+                returned (its accepted tokens minus one), ``0`` after a prefill -- as a
+                ``[B]`` int tensor (a device tensor is never read on the host) or one
+                int for every request; ``None`` means ``0`` for every request. Per-request
+                host numbers are refused: the caller hands them as a tensor, because a
+                tensor built from python data on the traced path is real under graph
+                extraction.
 
         Returns:
             ``[T, hidden]`` at the input dtype.
@@ -3395,6 +3488,16 @@ class Glm5NextKDAAttention(nn.Module):
         rows. Each request is then served one at a time by this same method, on
         its own entry of all five, and a concurrent prefill is refused, because
         the carrier says nothing about where one request's tokens end.
+
+        Device contract for the carriers: they are inputs of the compiled step --
+        the whole banks with ``state_slots``, or ``bank[slot]`` views sliced eagerly
+        OUTSIDE the compiled region and passed in. The backend keeps a write-back
+        only as a mutation of one of its inputs (``aliasing_output_rewrite``'s
+        ``io_map``); a view sliced inside the traced region is an intermediate, its
+        ``copy_`` reaches no device memory, and the output is still right, so the
+        stale state is silent. Eager CPU and the simulator cannot show the
+        difference; ``test_kda_carrier_write_back_contract.py`` pins the backend
+        property on the three forms.
 
         A prefill enters with a zero state only when it opens the sequence. A
         prompt longer than one batch of tokens is prefilled in segments, and the
@@ -3466,6 +3569,8 @@ class Glm5NextKDAAttention(nn.Module):
                 real_tokens=real_tokens,
                 row_mask=row_mask,
                 state_slots=state_slots,
+                checkpoint_rows=checkpoint_rows,
+                state_checkpoints=state_checkpoints,
             )
         # One carrier per request. Concurrent requests hold their states at
         # different slots of one bank, so what arrives here is a tuple of views --
@@ -3503,11 +3608,13 @@ class Glm5NextKDAAttention(nn.Module):
                     f"over the whole batch's tokens. Concurrent DECODE is what this "
                     f"layer serves"
                 )
-            if int(hidden_states.shape[0]) != requests:
+            rows = int(hidden_states.shape[0])
+            if rows % requests or (rows != requests and state_checkpoints is None):
                 raise ValueError(
-                    f"a decode step advances each sequence by one token, so this call "
-                    f"carries one token per request; it holds "
-                    f"{int(hidden_states.shape[0])} token(s) for {requests} request(s)"
+                    f"a decode step carries the same number of tokens for every "
+                    f"request: one, or the 1 + k of a speculative verify step on "
+                    f"checkpoint carriers (state_checkpoints); it holds {rows} "
+                    f"token(s) for {requests} request(s)"
                 )
         # The row operands are stacked rather than tupled, for the same reason the
         # states are tupled: a tuple carries what must not be copied, and these two
@@ -3533,8 +3640,16 @@ class Glm5NextKDAAttention(nn.Module):
                 start_position=start_position,
                 real_tokens=real_tokens,
                 row_mask=row_mask,
+                checkpoint_rows=checkpoint_rows,
+                state_checkpoints=state_checkpoints,
             )
         if requests > 1:
+            if int(hidden_states.shape[0]) != requests:
+                raise ValueError(
+                    "the switched-off stage path (VLLM_NEURON_KDA_FUSED_DECODE=0) serves "
+                    "one token per request; a speculative verify step is the fused "
+                    "launch's"
+                )
             return torch.cat(
                 [
                     self.forward(
@@ -3555,6 +3670,31 @@ class Glm5NextKDAAttention(nn.Module):
             )
         conv_state, recurrent_state, start_position = (part[0] for part in states)
         real_tokens, row_mask = reals[0], masks[0]
+        if state_checkpoints is not None:
+            # The speculative form at one request: ``1 + k`` tokens on the slot's
+            # ``[1 + k, ...]`` checkpoint carriers, the one-request case of the
+            # concurrent launch. A prefill never takes it: it writes the one-row
+            # carrier ``bank[slot, 0]``, which the plain route below serves.
+            if is_prefill:
+                raise ValueError(
+                    "a prefill writes the one-row carrier bank[slot, 0]; the "
+                    "checkpoint carrier (state_checkpoints) is a speculative decode's"
+                )
+            if not fused_decode_enabled():
+                raise ValueError(
+                    "a speculative verify step is served by the fused KDA decode "
+                    "launch, which VLLM_NEURON_KDA_FUSED_DECODE=0 switched off"
+                )
+            return self._fused_decode_requests(
+                hidden_states,
+                convs=(conv_state,),
+                recurrents=(recurrent_state,),
+                start_position=start_position,
+                real_tokens=real_tokens,
+                row_mask=row_mask,
+                checkpoint_rows=checkpoint_rows,
+                state_checkpoints=state_checkpoints,
+            )
         tokens = int(hidden_states.shape[0])
         heads = int(self.num_kv_heads_per_rank)
         kdim = int(self.head_dim)
@@ -3807,22 +3947,49 @@ class Glm5NextKDAAttention(nn.Module):
         real_tokens: torch.Tensor | None,
         row_mask: torch.Tensor | None,
         state_slots: torch.Tensor | None = None,
+        checkpoint_rows: torch.Tensor | int | None = None,
+        state_checkpoints: int | None = None,
     ) -> torch.Tensor:
-        """A concurrent decode, one token per request, in one ``kda_fused_decode`` launch.
+        """A concurrent decode of ``B`` requests in one fused KDA launch.
 
-        The bank views are stacked into the kernel's ``[B, ...]`` carriers (it serves
-        32 requests per pass at one head per rank), and each request's advanced rows
-        are copied back through its own view. ``start_position`` is ``[B]``,
-        ``real_tokens`` ``[B, 1]`` and ``row_mask`` ``[B, 1, 1]``, as the runner builds
-        them; a padding row (``real_tokens`` 0, mask 0, a non-zero start) gets its
-        carriers back unchanged.
+        One token per request takes ``kda_fused_decode``; ``1 + k`` tokens per request
+        -- a speculative verify step, request-major rows -- take
+        ``kda_fused_decode_tstep``, which writes every token's carriers as a checkpoint.
+        The bank views are stacked into the kernel's ``[B, ...]`` carriers (it serves 32
+        requests per pass at one head per rank), and each request's advanced rows are
+        copied back through its own view. ``start_position`` is ``[B]``, ``real_tokens``
+        ``[B, 1]`` and ``row_mask`` ``[B, T, 1]``, as the runner builds them; a padding
+        row (``real_tokens`` 0, mask 0, a non-zero start) gets its carriers back
+        unchanged.
 
         With ``state_slots`` (``[B]`` int) ``convs`` and ``recurrents`` are the whole
         banks: the rows are gathered by slot into the same ``[B, ...]`` carriers and
         written back onto the banks themselves, in place, which is the write the
         backend keeps as a whole-bank aliased output.
+
+        Checkpoint carriers (``state_checkpoints = 1 + k``): a slot holds ``1 + k``
+        state rows, so a view carrier is ``[1 + k, ...]`` and a bank
+        ``[slots, 1 + k, ...]``. The step gathers row ``checkpoint_rows[b]`` of each
+        request (``fused_decode.kda_checkpoint_rows``; a read through a flat view) and
+        writes all ``1 + k`` rows of the slot -- a whole-view ``copy_`` or a whole-slot
+        ``index_copy_`` on the bank, the two writes the backend keeps -- when the view or
+        the bank is an input of the compiled step; a view sliced inside the traced region
+        is not written back on device (the forward's device contract). A step carries
+        ``1 .. 1 + k`` tokens per request; a short step (no drafts after a prefill, or
+        the drafts trimmed at ``max_model_len``) runs the kernel at ``1 + k`` rows with
+        masked padding rows, so the slot is still written whole and the rows past the
+        last token repeat its checkpoint (the runner records row ``tokens - 1``). The
+        whole-slot write means a bucket padding row's slot is rewritten too, with the
+        state of the row it read, so the runner's rule for a padding row is: its
+        ``checkpoint_rows`` entry is the slot's recorded live row (the stored kept
+        count minus one; ``0`` when the slot has none), so the slot is rewritten with
+        its own bytes. Never a slot with a different row than its live one.
         """
-        from vllm_neuron.functional.kda.fused_decode import kda_fused_decode
+        from vllm_neuron.functional.kda.fused_decode import (
+            kda_checkpoint_rows,
+            kda_fused_decode,
+            kda_fused_decode_tstep,
+        )
         from vllm_neuron.functional.state_banks import (
             bank_rows_problem,
             gather_bank_rows,
@@ -3831,43 +3998,62 @@ class Glm5NextKDAAttention(nn.Module):
 
         heads = int(self.num_kv_heads_per_rank)
         kdim = int(self.head_dim)
+        requests = len(convs) if state_slots is None else int(state_slots.shape[0])
+        rows = int(hidden_states.shape[0])
+        tokens = rows // requests if requests > 0 and rows % requests == 0 else 0
+        if tokens < 1:
+            raise ValueError(
+                f"a decode step carries the same number of tokens for every request; "
+                f"it holds {rows} token(s) for {requests} request(s)"
+            )
+        if state_checkpoints is None:
+            if tokens != 1:
+                raise ValueError(
+                    f"a decode step of {tokens} tokens per request is a speculative "
+                    f"verify step and needs checkpoint carriers (state_checkpoints); "
+                    f"without them a step carries one token per request"
+                )
+            lead: tuple[int, ...] = ()
+        else:
+            checkpoints = int(state_checkpoints)
+            if not 1 <= tokens <= checkpoints:
+                raise ValueError(
+                    f"a slot holds state_checkpoints = {checkpoints} checkpoint row(s), one "
+                    f"per token of a verify step, so a step on checkpoint carriers carries "
+                    f"1 .. {checkpoints} token(s) per request; this call holds {tokens}"
+                )
+            lead = (checkpoints,)
+        conv_row = (*lead, *self.kda_conv_state_shape)
+        rec_row = (*lead, heads, kdim, kdim)
         if state_slots is None:
-            requests = len(convs)
             for conv, recurrent in zip(convs, recurrents):
-                if tuple(recurrent.shape) != (heads, kdim, kdim):
+                if tuple(recurrent.shape) != rec_row:
                     raise ValueError(
-                        f"recurrent_state {tuple(recurrent.shape)} must be "
-                        f"{(heads, kdim, kdim)} for this rank's geometry"
+                        f"recurrent_state {tuple(recurrent.shape)} must be {rec_row} "
+                        f"for this rank's geometry"
                     )
-                if tuple(conv.shape) != tuple(self.kda_conv_state_shape):
+                if tuple(conv.shape) != conv_row:
                     raise ValueError(
-                        f"conv_state {tuple(conv.shape)} must be the shape get_kv_spec "
-                        f"reports, {tuple(self.kda_conv_state_shape)}"
+                        f"conv_state {tuple(conv.shape)} must be {conv_row}, the shape "
+                        f"get_kv_spec reports under the slot's checkpoint rows"
                     )
         else:
             for name, bank, row_shape in (
-                ("conv_state", convs, tuple(self.kda_conv_state_shape)),
-                ("recurrent_state", recurrents, (heads, kdim, kdim)),
+                ("conv_state", convs, conv_row),
+                ("recurrent_state", recurrents, rec_row),
             ):
                 problem = bank_rows_problem(bank, state_slots, row_shape, name=name)
                 if problem is not None:
                     raise ValueError(problem)
-            requests = int(state_slots.shape[0])
-        if int(hidden_states.shape[0]) != requests:
-            raise ValueError(
-                f"a decode step advances each sequence by one token, so this call "
-                f"carries one token per request; it holds "
-                f"{int(hidden_states.shape[0])} token(s) for {requests} request(s)"
-            )
         if (row_mask is None) != (real_tokens is None):
             raise ValueError(
                 "real_tokens and row_mask are one fact in two operands -- which rows "
                 "carry a token -- and this call passed one of them"
             )
-        if row_mask is not None and int(row_mask.numel()) != requests:
+        if row_mask is not None and int(row_mask.numel()) != requests * tokens:
             raise ValueError(
                 f"row_mask carries {int(row_mask.numel())} value(s) for {requests} "
-                f"one-token request(s)"
+                f"request(s) of {tokens} token(s)"
             )
         if isinstance(start_position, (tuple, list)):
             # One entry per request; a number is factory-built so a trace keeps it fake.
@@ -3883,20 +4069,30 @@ class Glm5NextKDAAttention(nn.Module):
 
         q_in, k_in, v_in, raw_gate, raw_beta, out_gate = kda_projections(
             hidden_states, self, phase="decode")
-        fused = kda_fused_decode(
-            q_in,
-            k_in,
-            v_in,
-            raw_gate,
-            raw_beta,
-            conv_state=(
-                torch.stack(convs) if state_slots is None
-                else gather_bank_rows(convs, state_slots)
-            ),
-            recurrent_state=(
-                torch.stack(recurrents) if state_slots is None
-                else gather_bank_rows(recurrents, state_slots)
-            ),
+        if state_checkpoints is None:
+            if state_slots is None:
+                entering = (torch.stack(convs), torch.stack(recurrents))
+            else:
+                entering = (
+                    gather_bank_rows(convs, state_slots),
+                    gather_bank_rows(recurrents, state_slots),
+                )
+        elif state_slots is None:
+            entering = tuple(
+                _checkpoint_rows_of_views(bank, checkpoint_rows) for bank in (convs, recurrents)
+            )
+        else:
+            read_rows = kda_checkpoint_rows(
+                state_slots,
+                _checkpoint_row_tensor(checkpoint_rows, requests, state_slots.device),
+                checkpoints,
+            )
+            entering = tuple(
+                bank.flatten(0, 1).index_select(0, read_rows) for bank in (convs, recurrents)
+            )
+        operands = dict(
+            conv_state=entering[0],
+            recurrent_state=entering[1],
             q_conv1d_weight=self.q_conv1d_weight,
             k_conv1d_weight=self.k_conv1d_weight,
             v_conv1d_weight=self.v_conv1d_weight,
@@ -3908,14 +4104,48 @@ class Glm5NextKDAAttention(nn.Module):
             real_tokens=real_tokens,
             row_mask=row_mask,
         )
-        if state_slots is None:
-            for index in range(requests):
-                convs[index].copy_(fused.conv_state[index])
-                recurrents[index].copy_(fused.recurrent_state[index])
+        projections = (q_in, k_in, v_in, raw_gate, raw_beta)
+        if state_checkpoints is None:
+            fused = kda_fused_decode(*projections, **operands)
+            core = fused.core
+            advanced = (fused.conv_state, fused.recurrent_state)
         else:
-            scatter_bank_rows(convs, state_slots, fused.conv_state)
-            scatter_bank_rows(recurrents, state_slots, fused.recurrent_state)
-        return self._gated_output(fused.core, out_gate, hidden_states, phase="decode")
+            if tokens < checkpoints:
+                # A short step (fewer tokens than the slot holds rows): the kernel is
+                # run at the slot's row count with masked padding rows after the real
+                # ones, so the slot is still written whole and the rows past the last
+                # token repeat its checkpoint. The padding rows' operands are zeros;
+                # masked, they leave the state and the conv history where they stand.
+                projections = tuple(
+                    _pad_token_rows(one, requests, tokens, checkpoints) for one in projections
+                )
+                real = operands["real_tokens"]
+                operands["real_tokens"] = (
+                    hidden_states.new_full((requests, 1), tokens, dtype=torch.int32)
+                    if real is None else real
+                )
+                mask = operands["row_mask"]
+                mask = (
+                    hidden_states.new_ones((requests, tokens), dtype=torch.float32)
+                    if mask is None else mask.reshape(requests, tokens).to(torch.float32)
+                )
+                operands["row_mask"] = torch.cat(
+                    [mask, mask.new_zeros((requests, checkpoints - tokens))], dim=1
+                )
+            fused = kda_fused_decode_tstep(*projections, **operands)
+            core = fused.core
+            if tokens < checkpoints:
+                core = core.reshape(requests, checkpoints, -1)[:, :tokens].reshape(
+                    requests * tokens, -1
+                )
+            advanced = (fused.conv_checkpoints, fused.recurrent_checkpoints)
+        for bank, new_rows in zip((convs, recurrents), advanced):
+            if state_slots is None:
+                for index in range(requests):
+                    bank[index].copy_(new_rows[index])
+            else:
+                scatter_bank_rows(bank, state_slots, new_rows)
+        return self._gated_output(core, out_gate, hidden_states, phase="decode")
 
     def _gated_output(
         self, core: torch.Tensor, out_gate: torch.Tensor, hidden_states: torch.Tensor,
@@ -4030,6 +4260,8 @@ class Glm5NextKDALayer(nn.Module):
         streams: torch.Tensor | None = None,
         collector: list[torch.Tensor] | None = None,
         state_slots: torch.Tensor | None = None,
+        checkpoint_rows: torch.Tensor | int | None = None,
+        state_checkpoints: int | None = None,
     ) -> torch.Tensor:
         """The linear-attention half, mixed either by mHC or by a plain add.
 
@@ -4085,6 +4317,11 @@ class Glm5NextKDALayer(nn.Module):
                 real_tokens=real_tokens,
                 row_mask=row_mask,
                 **({"state_slots": state_slots} if state_slots is not None else {}),
+                **(
+                    {"checkpoint_rows": checkpoint_rows, "state_checkpoints": state_checkpoints}
+                    if state_checkpoints is not None
+                    else {}
+                ),
             )
             if collector is not None:
                 collector.append(attended)
@@ -4700,11 +4937,15 @@ class Glm5NextDSAIndexer(nn.Module):
         before the first decode step -- otherwise the next completion pools zeros in
         their place and no check notices.
 
-        The ring slot of an absolute position is ``position % index_kpool``. With
+        The ring row of an absolute position is ``position % depth``, with ``depth``
+        the ring's own row count: ``index_kpool`` on a server that drafts nothing,
+        a power-of-two multiple of it on one that does
+        (``decode_trow.indexer_ring_depth``), so a pool never wraps mid-way. With
         ``end_position`` the sequence length after this chunk, the open pool holds
         positions ``end_position - r`` through ``end_position - 1`` for
-        ``r = end_position % index_kpool``, and those are slots ``0`` through
-        ``r - 1``. Half 0 is keys and half 1 is gate scores, the halves
+        ``r = end_position % index_kpool``, and those are rows ``e - r`` through
+        ``e - 1`` for ``e = end_position % depth`` (``0 .. r - 1`` at today's
+        depth). Half 0 is keys and half 1 is gate scores, the halves
         :meth:`tail_step` declares and refuses on.
 
         A chunked prefill writes only its own share: when the open pool started in
@@ -4730,12 +4971,18 @@ class Glm5NextDSAIndexer(nn.Module):
         anyway.
         """
         pool = self.index_kpool
-        want_tail = (2, pool, self.index_head_dim)
-        if tail.ndim != 3 or tuple(tail.shape) != want_tail:
+        # The ring's depth is read off its shape: ``index_kpool`` on a server that
+        # drafts nothing, a power-of-two multiple of it on one that does
+        # (``decode_trow.indexer_ring_depth``). The ring row of a position is
+        # ``position % depth`` either way.
+        depth = int(tail.shape[1]) if tail.ndim == 3 else 0
+        deep_enough = depth >= pool and depth % pool == 0 and depth & (depth - 1) == 0
+        if not deep_enough or tuple(tail.shape) != (2, depth, self.index_head_dim):
             raise Glm5NextDSAIndexerError(
-                f"prefill_tail must be [2, index_kpool, index_head_dim] = "
-                f"{want_tail} -- half 0 keys, half 1 gate scores; got "
-                f"{tuple(tail.shape)}"
+                f"prefill_tail must be [2, depth, index_head_dim] with depth a "
+                f"power-of-two multiple of index_kpool {pool} (today's ring is "
+                f"{(2, pool, self.index_head_dim)}) -- half 0 keys, half 1 gate scores; "
+                f"got {tuple(tail.shape)}"
             )
         if key.ndim != 2 or int(key.shape[1]) != self.index_head_dim:
             raise Glm5NextDSAIndexerError(
@@ -4766,8 +5013,11 @@ class Glm5NextDSAIndexer(nn.Module):
                 f"{int(end_position)} is shorter than the chunk's own {real} "
                 f"token(s)"
             )
-        rows = int(end_position) % pool
-        take = min(rows, real)
+        # The open pool's ``r = end % pool`` positions sit at ring rows ``end % depth
+        # - r .. end % depth - 1``: ``depth`` is a multiple of ``pool``, so the pool's
+        # first position is at a multiple-of-``pool`` row and never wraps mid-pool.
+        rows = int(end_position) % depth
+        take = min(int(end_position) % pool, real)
         if take <= 0:
             return 0
         # ``take`` and ``rows`` are python ints, so these are trace-time addresses --
@@ -4795,12 +5045,12 @@ class Glm5NextDSAIndexer(nn.Module):
     ) -> torch.Tensor:
         """:meth:`seed_tail`'s write with the chunk's end as a tensor. The same slots.
 
-        The same three numbers, none of them read: ``r = end_position %
-        index_kpool`` is the open pool's row count, the written slots are
-        ``r - take`` through ``r - 1`` for ``take = min(r, real)``, and slot ``s``
-        takes the key at row ``real - r + s``. All three are arithmetic on a 0-d
-        tensor here, so the write's addresses are values rather than trace-time
-        constants.
+        The same numbers, none of them read: ``r = end_position % index_kpool`` is
+        the open pool's row count, ``e = end_position % depth`` the ring row after
+        its last one, the written rows are ``e - take`` through ``e - 1`` for
+        ``take = min(r, real)``, and row ``s`` takes the key at ``real - e + s``.
+        All of them are arithmetic on a 0-d tensor here, so the write's addresses
+        are values rather than trace-time constants.
 
         ``real`` is the chunk's own length, ``end_position - start_position``, and
         it is the operand's width only when nothing was padded. The remainder
@@ -4810,8 +5060,8 @@ class Glm5NextDSAIndexer(nn.Module):
 
         The whole ring is copied to write part of it, because a slice needs its
         bounds as host ints and a boolean index produces a data-dependent shape --
-        the graph break in another costume. ``torch.where`` over all
-        ``index_kpool`` rows has one shape at every position, and the rows outside
+        the graph break in another costume. ``torch.where`` over all ``depth``
+        rows has one shape at every position, and the rows outside
         the window take their own old value, which is what "an earlier chunk's rows
         stay" means as an op. Nothing is written when the sequence divides evenly,
         because the mask is then empty everywhere.
@@ -4821,14 +5071,17 @@ class Glm5NextDSAIndexer(nn.Module):
         would read out of bounds to produce values nothing uses.
         """
         pool = self.index_kpool
+        depth = int(tail.shape[1])
         device = tail.device
-        rows = torch.remainder(_int64_scalar(end_position, device), pool)
-        slots = torch.arange(pool, device=device)
+        end = _int64_scalar(end_position, device)
+        rows = torch.remainder(end, depth)
+        slots = torch.arange(depth, device=device)
         real = _int64_scalar(tokens, device)
         if start_position is not None:
             began = _int64_scalar(start_position, device)
-            real = _int64_scalar(end_position, device) - began
-        write = ((slots >= (rows - real).clamp_min(0)) & (slots < rows))[:, None]
+            real = end - began
+        take = torch.minimum(torch.remainder(end, pool), real)
+        write = ((slots >= rows - take) & (slots < rows))[:, None]
         source = (slots - rows + real).clamp_min(0).minimum(real - 1)
         tail[0].copy_(
             torch.where(write, key.index_select(0, source).to(tail.dtype), tail[0])
@@ -5525,64 +5778,98 @@ class Glm5NextDSAIndexer(nn.Module):
         indices_wanted: bool = True,
         projected: tuple | None = None,
     ) -> torch.Tensor | None:
-        """:meth:`forward`'s decode leg for ``B`` requests, one token each, in one pass.
+        """:meth:`forward`'s decode leg for ``B`` requests, ``T`` tokens each, in one pass.
 
-        Request ``b`` is row ``b`` of ``hidden_states`` and ``q_latent`` and entry
-        ``b`` of ``seq_lens`` and ``position``. Returns ``[B, width]`` token indices,
-        the same rows :meth:`forward` returns one request at a time, or None (or the
-        causal fill) when ``max_seq_len`` does not select. The kernels serve every
-        request in one launch per stage, each on its own ring and pooled store, so no
-        request can read another's rows.
+        Request ``b``'s token ``t`` is row ``b * T + t`` of ``hidden_states``,
+        ``q_latent`` and ``seq_lens`` (request-major) and sits at position
+        ``position[b] + t`` with causal length ``seq_lens[b * T + t] = position[b] + t
+        + 1``; ``position`` is ``[B]``, row 0's position per request. ``T`` is read
+        off the shapes: the rows over the requests (the bank form's ``slots``, or the
+        carrier's views). ``T = 1`` is the one-token decode step; ``T = 1 + k`` is a
+        speculative verify step. Returns
+        ``[B * T, width]`` token indices, row ``b * T + t`` what :meth:`forward` returns
+        for request ``b`` at position ``position[b] + t``, or None (or the causal fill)
+        when ``max_seq_len`` does not select. The kernels serve every request in one
+        launch per stage, each on its own ring and pooled store, so no request can read
+        another's rows.
 
         The stores arrive in one of two forms:
 
         * whole banks and a slot per request: ``pool_bank`` ``[slots, rows,
-          index_head_dim]``, ``tail_bank`` ``[slots, 2, index_kpool,
-          index_head_dim]``, ``slots`` ``[B]`` int, distinct. Written in place on the
-          banks.
+          index_head_dim]``, ``tail_bank`` ``[slots, 2, depth, index_head_dim]``,
+          ``slots`` ``[B]`` int, distinct. Written in place on the banks.
         * the runner's carrier: ``pool_bank`` and ``tail_bank`` are tuples of one view
-          per request (``[rows, index_head_dim]`` and ``[2, index_kpool,
-          index_head_dim]``, disjoint, which the runner guarantees, padding rows
-          included) and ``slots`` is None. The kernels read a bank, so ``B > 1`` views
-          are stacked (one read of each store) and ``B = 1`` is its view with a leading
-          axis (no copy); the writes land in each view, the forms the one-request leg
-          writes with.
+          per request (``[rows, index_head_dim]`` and ``[2, depth, index_head_dim]``,
+          disjoint, which the runner guarantees, padding rows included) and ``slots``
+          is None. The kernels read a bank, so ``B > 1`` views are stacked (one read of
+          each store) and ``B = 1`` is its view with a leading axis (no copy); the
+          writes land in each view, the forms the one-request leg writes with.
+
+        ``depth`` is the ring's rows: ``index_kpool`` for a config that decodes one
+        token per step, and ``decode_tail_update.ring_depth_for(index_kpool, 1 + k)``
+        for one that verifies ``1 + k``. A step may hand a ring at most
+        ``max_rows_for(depth, index_kpool)`` tokens: with more, a rejected token's stash
+        would overwrite a ring row the next step's pools still need, so the step is
+        refused by name. The deeper ring changes nothing else: ring row ``p % depth``
+        holds position ``p`` and a pool's members are the ``index_kpool`` positions
+        before and including the one that closes it.
 
         ``rows > max_seq_len // index_kpool`` either way: the last row of a store is
-        its write trash. ``position`` must be ``seq_lens - 1``: the bound reads the
-        length and this step's stand-in pool reads the position. Both rules, and
-        distinct bank slots, are checked where the values are readable (eager); in a
-        traced step they are the runner's, which builds both from one start.
+        its write trash, where every row that closes no pool writes. ``seq_lens[b * T
+        + t]`` must be ``position[b] + t + 1``: the bound reads each row's length and
+        the stand-in pools read the positions. Both rules, and distinct bank slots, are
+        checked where the values are readable (eager); in a traced step they are the
+        runner's, which builds both from one start.
 
-        The score kernel takes this step's completed pool from the ring step's output
-        rather than from the store, so the selection does not depend on when the
-        store write lands.
+        Every row's completed pool comes to the score kernel from the ring step's output
+        rather than from the store -- including the pools this step's earlier rows
+        close, which no write has landed for -- so the selection does not depend on
+        when the store write lands. The one-token step at the served depth keeps
+        :mod:`decode_batch`'s kernels; every other form runs the ``T``-row kernels.
         """
         from vllm_neuron.functional.dsa.decode_batch import (
             decode_pool_destinations,
             dsa_decode_ring_step,
             dsa_decode_scores,
         )
+        from vllm_neuron.functional.dsa.decode_tail_update import (
+            dsa_decode_ring_rows,
+            max_rows_for,
+        )
+        from vllm_neuron.functional.dsa.decode_trow import dsa_decode_scores_rows
         from vllm_neuron.functional.state_banks import shared_store_problem
         from vllm_neuron.utils.neuron_utils import values_are_readable
 
         self.require_dials()
         pool, dim = self.index_kpool, self.index_head_dim
-        batch = int(hidden_states.shape[0])
+        total = int(hidden_states.shape[0])
         views = isinstance(pool_bank, (tuple, list))
         if views:
             pool_views, tail_views = tuple(pool_bank), tuple(tail_bank)
-            if slots is not None or len(pool_views) != batch or len(tail_views) != batch:
+            batch = len(pool_views)
+            if slots is not None or batch < 1 or len(tail_views) != batch:
                 raise Glm5NextDSAIndexerError(
                     f"the carrier form takes one pooled store and one ring per request "
                     f"and no slots; got {len(pool_views)} store(s), {len(tail_views)} "
-                    f"ring(s) and slots={slots!r} for {batch} row(s)"
+                    f"ring(s) and slots={slots!r} for {total} row(s)"
                 )
             pool_bank = (pool_views[0].unsqueeze(0) if batch == 1
                          else torch.stack(pool_views))
             tail_bank = (tail_views[0].unsqueeze(0) if batch == 1
                          else torch.stack(tail_views))
             slots = torch.arange(batch, dtype=torch.int32, device=pool_bank.device)
+        else:
+            if not torch.is_tensor(slots) or slots.ndim != 1 or int(slots.shape[0]) < 1:
+                raise Glm5NextDSAIndexerError(
+                    f"slots must be a [B] tensor, one slot per request; got {slots!r}"
+                )
+            batch = int(slots.shape[0])
+        if total < batch or total % batch:
+            raise Glm5NextDSAIndexerError(
+                f"hidden_states must hold a whole number of rows per request: {total} "
+                f"row(s) do not split over {batch} request(s)"
+            )
+        rows = total // batch
         if pool_bank.ndim != 3 or int(pool_bank.shape[2]) != dim:
             raise Glm5NextDSAIndexerError(
                 f"pool_bank must be [slots, rows, {dim}]; got {tuple(pool_bank.shape)}"
@@ -5592,24 +5879,51 @@ class Glm5NextDSAIndexer(nn.Module):
         candidates, _trash, selects = self._require_serviceable(
             int(max_seq_len), 1, pool_bank[0]
         )
-        want_tail = (int(pool_bank.shape[0]), 2, pool, dim)
-        if tuple(tail_bank.shape) != want_tail:
+        if (
+            tail_bank.ndim != 4
+            or tuple(tail_bank.shape[:2]) != (int(pool_bank.shape[0]), 2)
+            or int(tail_bank.shape[3]) != dim
+            or int(tail_bank.shape[2]) < pool
+            or int(tail_bank.shape[2]) % pool
+            or int(tail_bank.shape[2]) & (int(tail_bank.shape[2]) - 1)
+        ):
             raise Glm5NextDSAIndexerError(
-                f"tail_bank must be [slots, 2, index_kpool, index_head_dim] = "
-                f"{want_tail}, one ring per pool_bank slot; got {tuple(tail_bank.shape)}"
+                f"tail_bank must be [slots, 2, depth, index_head_dim] = "
+                f"[{int(pool_bank.shape[0])}, 2, depth, {dim}], one ring per pool_bank "
+                f"slot with depth a power-of-two multiple of index_kpool {pool}; got "
+                f"{tuple(tail_bank.shape)}"
             )
-        for name, value in (("slots", slots), ("seq_lens", seq_lens), ("position", position)):
-            if not torch.is_tensor(value) or tuple(value.shape) != (batch,):
-                raise Glm5NextDSAIndexerError(
-                    f"{name} must be a [{batch}] tensor, one entry per request; got "
-                    f"{value!r}"
-                )
+        depth = int(tail_bank.shape[2])
+        if rows > max_rows_for(depth, pool):
+            raise Glm5NextDSAIndexerError(
+                f"{rows} rows per request exceed the {max_rows_for(depth, pool)} a ring "
+                f"of depth {depth} takes back on rollback (depth - index_kpool + 2): a "
+                f"rejected row's stash would overwrite a token the next step's pools "
+                f"still need; allocate the ring at decode_trow.indexer_ring_depth("
+                f"index_kpool, rows - 1)"
+            )
+        if not torch.is_tensor(position) or tuple(position.shape) != (batch,):
+            raise Glm5NextDSAIndexerError(
+                f"position must be a [{batch}] tensor, row 0's position per request "
+                f"(one entry per slot in slots); "
+                f"got {position!r}"
+            )
+        if not torch.is_tensor(seq_lens) or tuple(seq_lens.shape) != (total,):
+            raise Glm5NextDSAIndexerError(
+                f"seq_lens must be a [{total}] tensor, one causal length per row "
+                f"({batch} request(s) x {rows} row(s), request-major); got {seq_lens!r}"
+            )
+        # Row b * rows + t sits at position[b] + t. O(B * T) index bookkeeping, no
+        # kernel.
+        offsets = torch.arange(rows, device=position.device, dtype=torch.int64)
+        row_positions = (position.to(torch.int64)[:, None] + offsets[None, :]).reshape(-1)
         if values_are_readable(position) and values_are_readable(seq_lens):
-            if not torch.equal(position.to(torch.int64), seq_lens.to(torch.int64) - 1):
+            if not torch.equal(row_positions + 1, seq_lens.to(torch.int64)):
                 raise Glm5NextDSAIndexerError(
-                    f"position must be seq_lens - 1 for a decode step of one token per "
-                    f"request; got position {position.tolist()} and seq_lens "
-                    f"{seq_lens.tolist()}"
+                    f"seq_lens[b * rows + t] must be position[b] + t + 1 (position must "
+                    f"be seq_lens - 1 at one token per request); got position "
+                    f"{position.tolist()} and seq_lens {seq_lens.tolist()} at {rows} "
+                    f"row(s) per request"
                 )
         if not views and values_are_readable(slots):
             # Distinct stores, except the scratch store (the last slot, which no
@@ -5631,29 +5945,51 @@ class Glm5NextDSAIndexer(nn.Module):
             )
         query, key, weights, gate_score = projected
 
-        pooled, rings = dsa_decode_ring_step(
-            tail_bank, slots, key, gate_score, ape.to(torch.float32), position
-        )
+        one_token = rows == 1 and depth == pool
+        if one_token:
+            pooled, rings = dsa_decode_ring_step(
+                tail_bank, slots, key, gate_score, ape.to(torch.float32), position
+            )
+        else:
+            pooled, rings = dsa_decode_ring_rows(
+                tail_bank, slots, key, gate_score, ape.to(torch.float32), position
+            )
         slot_index, row = decode_pool_destinations(
-            slots, position, rows=int(pool_bank.shape[1]), pool_size=pool
+            slots.repeat_interleave(rows), row_positions, rows=int(pool_bank.shape[1]),
+            pool_size=pool,
         )
         bounded = None
         if selects:
-            bounded = dsa_decode_scores(
-                query, weights, pool_bank, slots, seq_lens, position, pooled,
-                candidates=candidates, pool_size=pool,
-            )
-        # The writes after the read: the kernel stands this step's pool in itself,
-        # and the store rows it reads are the pools before this step.
+            if one_token:
+                bounded = dsa_decode_scores(
+                    query, weights, pool_bank, slots, seq_lens, position, pooled,
+                    candidates=candidates, pool_size=pool,
+                )
+            else:
+                bounded = dsa_decode_scores_rows(
+                    query, weights, pool_bank, slots, position, pooled,
+                    candidates=candidates, pool_size=pool,
+                )
+        # The writes after the read: the kernel stands every pool this step closes in
+        # itself, and the store rows it reads are the pools before this step. A row
+        # that closes no pool writes the slot's trash row (several rows may).
         if views:
             for b in range(batch):
                 tail_views[b].copy_(rings[b].to(tail_views[b].dtype))
                 pool_views[b].index_copy_(
-                    0, row[b:b + 1], pooled[b:b + 1].to(pool_views[b].dtype)
+                    0, row[b * rows:(b + 1) * rows],
+                    pooled[b * rows:(b + 1) * rows].to(pool_views[b].dtype),
                 )
         else:
-            tail_bank.index_copy_(0, slot_index, rings.to(tail_bank.dtype))
-            pool_bank.index_put_((slot_index, row), pooled.to(pool_bank.dtype))
+            # One ring per request at its slot; one pooled row per step row at its
+            # flat store address. Both are 1-D ``index_copy_`` scatters (the latent
+            # write's form): no strided index slice and no multi-index put, which the
+            # device compiler's access-conflict pass did not take at B = 4.
+            tail_bank.index_copy_(0, slots.to(torch.int64), rings.to(tail_bank.dtype))
+            store_rows = int(pool_bank.shape[1])
+            pool_bank.view(-1, dim).index_copy_(
+                0, slot_index * store_rows + row, pooled.to(pool_bank.dtype)
+            )
         if bounded is None:
             if not indices_wanted:
                 return None
@@ -5847,12 +6183,14 @@ class IndexShare:
       pooled-store write, no scores.
 
     ``topk_indices`` is what :meth:`Glm5NextDSAIndexer.forward_requests` returns for
-    a selecting step: ``[B, width]`` int32 row indices into the request's latent
-    window (``-1`` = masked), one row per request, on the step's device. A step
-    whose selection is a no-op (the bypass regime,
-    ``decode_bypass.selection_is_a_no_op``) returns ``None`` and stores nothing, so
-    every iteration of such a step runs the write stage and the carrier changes
-    nothing there.
+    a selecting step: ``[B * T, width]`` int32 row indices into the request's latent
+    window (``-1`` = masked), one row per query row (``T`` per request,
+    request-major), on the step's device. An iteration that reuses it must present
+    the same ``B * T`` rows; one with another row count is refused by name, because
+    row ``b * T + t`` is one position's selection. A step whose selection is a no-op
+    (the bypass regime, ``decode_bypass.selection_is_a_no_op``) returns ``None`` and
+    stores nothing, so every iteration of such a step runs the write stage and the
+    carrier changes nothing there.
     """
 
     topk_indices: torch.Tensor | None = None
@@ -6892,17 +7230,20 @@ class Glm5NextMLAAttention(nn.Module):
         page_size: int,
         dense: bool,
     ) -> torch.Tensor:
-        """:meth:`attend` for a decode step of ``batch`` requests, one token each.
+        """:meth:`attend` for a decode step of ``batch`` requests, ``T`` tokens each.
 
-        Request ``b`` is row ``b`` of ``hidden_states``, column ``b`` of
-        ``block_table_row`` (``[pages, batch]``, ``-1`` past its pages), entry ``b``
-        of ``latent_slots`` and of ``start_position`` (``[batch]``), and row ``b``
-        of ``topk_indices`` -- window rows of its own window -- unless ``dense``.
-        The projections, the cache write, both absorbs and the output projection are
-        the one-request chain on ``batch`` rows. The attention is
+        Request ``b``'s token ``t`` is row ``b * T + t`` of ``hidden_states``,
+        ``latent_slots`` (``[batch * T]``) and ``topk_indices`` -- window rows of its
+        own window -- unless ``dense``; the request is column ``b`` of
+        ``block_table_row`` (``[pages, batch]``, ``-1`` past its pages) and entry
+        ``b`` of ``start_position`` (``[batch]``, row 0's position), so its row ``t``
+        sits at window row ``start_position[b] + t``. ``T`` is the rows over
+        ``batch``. The projections, the cache write, both absorbs and the output
+        projection are the one-request chain on ``batch * T`` rows. The attention is
         ``mla_decode_attention``, which reads each request's window through its own
-        table column and stands each request's ``written`` row in at its position,
-        so the result does not depend on when the cache write lands.
+        table column and stands this step's ``written`` rows in at their positions
+        (row ``t`` sees rows ``0 .. t`` of its request), so the result does not
+        depend on when the cache write lands.
         """
         from vllm_neuron.functional.attention.mla_absorb import mla_absorb
         from vllm_neuron.functional.attention.mla_decode import mla_decode_attention
@@ -6913,12 +7254,18 @@ class Glm5NextMLAAttention(nn.Module):
                 f"each; a prefill chunk (prefill_end_position) and an active query "
                 f"prefix (active_mla_query_rows) belong to one request's prefill"
             )
-        if tuple(hidden_states.shape) != (batch, self.hidden_size):
+        if (
+            hidden_states.ndim != 2
+            or int(hidden_states.shape[1]) != self.hidden_size
+            or int(hidden_states.shape[0]) < batch
+            or int(hidden_states.shape[0]) % batch
+        ):
             raise Glm5NextMLADecodeError(
-                f"hidden_states must be [batch_size, {self.hidden_size}] = "
-                f"[{batch}, {self.hidden_size}], one decode row per request; got "
+                f"hidden_states must be [batch_size * rows, {self.hidden_size}], a whole "
+                f"number of rows per request over batch_size={batch}; got "
                 f"{tuple(hidden_states.shape)}"
             )
+        total = int(hidden_states.shape[0])
         want_cache = (self.NUM_LATENT_KV_HEADS, self.head_size)
         if latent_cache.ndim != 3 or tuple(latent_cache.shape[1:]) != want_cache:
             raise Glm5NextMLADecodeError(
@@ -6940,10 +7287,10 @@ class Glm5NextMLAAttention(nn.Module):
                 f"block_table_row must be [pages, batch_size={batch}], one column per "
                 f"request; got {tuple(block_table_row.shape)}"
             )
-        if tuple(latent_slots.shape) != (batch,):
+        if tuple(latent_slots.shape) != (total,):
             raise Glm5NextMLADecodeError(
-                f"latent_slots must carry one physical bank row per request, "
-                f"[{batch}]; got {tuple(latent_slots.shape)}"
+                f"latent_slots must carry one physical bank row per row of the step, "
+                f"[{total}]; got {tuple(latent_slots.shape)}"
             )
         if not torch.is_tensor(start_position) or tuple(start_position.shape) != (batch,):
             raise Glm5NextMLADecodeError(
@@ -6953,11 +7300,11 @@ class Glm5NextMLAAttention(nn.Module):
         if not dense and (
             topk_indices is None
             or topk_indices.ndim != 2
-            or int(topk_indices.shape[0]) != batch
+            or int(topk_indices.shape[0]) != total
         ):
             raise Glm5NextMLADecodeError(
-                f"a selecting decode step of batch_size={batch} needs "
-                f"[{batch}, width] topk_indices; got "
+                f"a selecting decode step of batch_size={batch} x {total // batch} "
+                f"row(s) needs [{total}, width] topk_indices, one row per query row; got "
                 f"{None if topk_indices is None else tuple(topk_indices.shape)}"
             )
 
@@ -7013,19 +7360,27 @@ class Glm5NextMLAAttention(nn.Module):
         state_slots: torch.Tensor | None = None,
         index_share: IndexShare | None = None,
     ) -> torch.Tensor:
-        """:meth:`forward` for a decode step of ``len(tail)`` requests, one row each.
+        """:meth:`forward` for a decode step of ``B`` requests, ``T`` rows each.
 
-        ``tail`` and ``pool_cache`` are one bank view per request and ``seq_lens``,
-        ``start_position`` and ``position`` are ``[batch]``. With ``state_slots``
-        (``[B]`` int) they are instead the layer's whole ring and pooled-store banks,
-        row ``b`` of the step being the request at ``state_slots[b]``, and the indexer
-        writes them back in place on the banks. The query latent and the
-        indexer's four projections run once on all rows. The indexer's write stage
-        and selection run in one :meth:`Glm5NextDSAIndexer.forward_requests` pass,
-        each request on its own ring and pooled store. :meth:`attend` then serves
-        every request in one batched call. A one-request decode step is the
-        ``batch = 1`` case of this method (see :meth:`forward`); there :meth:`attend`
-        serves ``batch_size`` 1 with its one-request attention.
+        ``normed_hidden_states`` is ``[B * T, hidden]``, request-major: request ``b``'s
+        row ``t`` is row ``b * T + t`` and sits at position ``position[b] + t``.
+        ``T = 1`` is the one-token decode step and ``T = 1 + k`` a speculative verify
+        step; ``T`` is the rows over the requests. ``tail`` and ``pool_cache`` are
+        one bank view per request, ``start_position`` and ``position`` are ``[B]``
+        (row 0's position per request, the same tensor) and ``seq_lens`` is ``[B *
+        T]``, row ``b * T + t`` the causal length ``position[b] + t + 1``. With
+        ``state_slots`` (``[B]`` int) they are
+        instead the layer's whole ring and pooled-store banks, request ``b`` of the
+        step being the one at ``state_slots[b]``, and the indexer writes them back in
+        place on the banks. ``latent_slots`` is ``[B * T]``, one bank row per row of
+        the step. The query latent and the indexer's four projections run once on
+        all rows. The indexer's write stage and selection run in one
+        :meth:`Glm5NextDSAIndexer.forward_requests` pass, each request on its own
+        ring and pooled store, each row at its own causal length. :meth:`attend` then
+        serves every row in one batched call (rows ``> 1`` go to
+        :meth:`_attend_requests` directly, whatever ``B``). A one-request decode step
+        is the ``B = 1, T = 1`` case of this method (see :meth:`forward`); there
+        :meth:`attend` serves ``batch_size`` 1 with its one-request attention.
 
         ``index_share`` is the draft head's :class:`IndexShare` carrier for
         ``index_share_for_mtp_iteration`` (config.py; upstream's ``skip_topk``).
@@ -7049,14 +7404,14 @@ class Glm5NextMLAAttention(nn.Module):
             selection_is_a_no_op,
         )
 
+        total = int(normed_hidden_states.shape[0])
         if state_slots is None:
             batch = len(tail)
             pools = tuple(pool_cache) if isinstance(pool_cache, (tuple, list)) else ()
-            if len(pools) != batch or int(normed_hidden_states.shape[0]) != batch:
+            if len(pools) != batch or batch < 1:
                 raise Glm5NextMLADecodeError(
                     f"a decode step of {batch} request ring(s) needs one pooled store "
-                    f"per request and one row per request; got {len(pools)} store(s) "
-                    f"and {int(normed_hidden_states.shape[0])} row(s)"
+                    f"per request; got {len(pools)} store(s)"
                 )
             stores, rings = pools, tuple(tail)
         else:
@@ -7064,21 +7419,31 @@ class Glm5NextMLAAttention(nn.Module):
             if (
                 isinstance(pool_cache, (tuple, list))
                 or isinstance(tail, (tuple, list))
-                or int(normed_hidden_states.shape[0]) != batch
+                or batch < 1
             ):
                 raise Glm5NextMLADecodeError(
                     f"the bank form takes the whole pooled-store and ring banks beside "
-                    f"{batch} slot(s) and one row per slot; got pool_cache "
-                    f"{type(pool_cache).__name__}, tail {type(tail).__name__} and "
-                    f"{int(normed_hidden_states.shape[0])} row(s)"
+                    f"{batch} slot(s); got pool_cache {type(pool_cache).__name__} and "
+                    f"tail {type(tail).__name__}"
                 )
             stores, rings = pool_cache, tail
-        for name, value in (("seq_lens", seq_lens), ("position", position)):
-            if not torch.is_tensor(value) or tuple(value.shape) != (batch,):
+        if total < batch or total % batch:
+            raise Glm5NextMLADecodeError(
+                f"a decode step of {batch} request(s) takes a whole number of rows per "
+                f"request; got {total} row(s)"
+            )
+        rows = total // batch
+        for name, value in (("latent_slots", latent_slots), ("seq_lens", seq_lens)):
+            if not torch.is_tensor(value) or tuple(value.shape) != (total,):
                 raise Glm5NextMLADecodeError(
-                    f"{name} must be a [{batch}] tensor, one entry per request; got "
-                    f"{value!r}"
+                    f"{name} must be a [{total}] tensor, one entry per row of the step "
+                    f"({batch} request(s) x {rows} row(s)); got {value!r}"
                 )
+        if not torch.is_tensor(position) or tuple(position.shape) != (batch,):
+            raise Glm5NextMLADecodeError(
+                f"position must be a [{batch}] tensor, row 0's position per request; "
+                f"got {position!r}"
+            )
         bound = selection_bound(
             int(max_seq_len), int(block_table_row.shape[0]) * int(page_size)
         )
@@ -7088,7 +7453,16 @@ class Glm5NextMLAAttention(nn.Module):
         shared = None if index_share is None else index_share.topk_indices
         if shared is not None:
             # A later draft iteration of the same speculative step: the selection is
-            # the first iteration's, and the indexer chain is skipped whole.
+            # the first iteration's, and the indexer chain is skipped whole. It is one
+            # row per query row, so the iteration must present the rows it was made
+            # for.
+            if shared.ndim != 2 or int(shared.shape[0]) != total:
+                raise Glm5NextMLADecodeError(
+                    f"index_share holds a [{None if shared.ndim != 2 else int(shared.shape[0])}"
+                    f", width] selection, one row per query row of the step that "
+                    f"published it; this step has {total} row(s) ({batch} request(s) x "
+                    f"{rows}), so it cannot reuse that selection"
+                )
             topk_indices = shared
         else:
             q_latent = self.project_query_latent(normed_hidden_states)
@@ -7116,6 +7490,24 @@ class Glm5NextMLAAttention(nn.Module):
         if collector is not None:
             collector.append(
                 (self.indexer._bypass_indices(seq_lens) if dense else topk_indices)[:5]
+            )
+        if rows > 1:
+            # Several rows per request: the batched attention whatever the batch (at
+            # batch_size 1 :meth:`attend` would read the rows as a prefill chunk).
+            return self._attend_requests(
+                normed_hidden_states,
+                latent_cache,
+                start_position,
+                topk_indices,
+                float(softmax_scale),
+                batch,
+                prefill_end_position=None,
+                collector=collector,
+                active_mla_query_rows=None,
+                block_table_row=block_table_row,
+                latent_slots=latent_slots,
+                page_size=int(page_size),
+                dense=dense,
             )
         return self.attend(
             normed_hidden_states,
@@ -8682,6 +9074,24 @@ _SHARD_GEOMETRY["Glm5NextForConditionalGeneration"] = {
 }
 
 
+def _eh_proj_row_shard_width(module: nn.Module, world_size: int) -> int:
+    from vllm_neuron.functional.mtp.tail_in import eh_proj_shard_rows
+
+    return eh_proj_shard_rows(int(module.hidden_size), world_size)
+
+
+# The draft head's eh_proj: each rank loads its H / world rows of the checkpoint's
+# [H, 2H] tensor, computes that slice of layer_input and the slices are all-gathered
+# in rank order (``functional/mtp/tail_in.py``). The head's other three leaves stay
+# replicated. Registered here, in the one table the loader reads; the class lives in
+# ``mtp.py``, which the root imports lazily.
+_SHARD_GEOMETRY["Glm5NextMultiTokenPredictor"] = {
+    "eh_proj_weight": _DeclaredShard(
+        0, _eh_proj_row_shard_width, "row-parallel -- the layer_input slices are all-gathered"
+    ),
+}
+
+
 class Glm5NextForConditionalGeneration(nn.Module):
     """The blockwise-FP8 glm-5.3-Flash implementation.
 
@@ -8722,8 +9132,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
         # import either way would be a cycle.
         from .mtp import Glm5NextMultiTokenPredictor, shadow_draft_k
 
+        # Read once, here, inside the worker's config context: the forward runs
+        # outside it, where the reader would fall back to the knob and a served
+        # speculative root would silently draft nothing.
+        self.draft_k = int(shadow_draft_k())
         self.mtp = None
-        if shadow_draft_k() > 0:
+        if self.draft_k > 0:
             self.mtp = Glm5NextMultiTokenPredictor(
                 self.text_config,
                 embed_tokens=lambda: self.model.embed_tokens_weight,
@@ -9588,8 +10002,16 @@ class Glm5NextForConditionalGeneration(nn.Module):
             ValueError: the spec and the stack plus the draft head's layer disagree on
                 how many layers there are, a layer's spec name is absent from
                 ``kv_caches``, a bank's shape disagrees with the spec that asked for
-                it, a layer reports part of its recurrent geometry, or a latent bank
+                it, a layer reports part of its recurrent geometry, a layer's two
+                state banks disagree on their checkpoint rows, or a latent bank
                 declares more than one KV head.
+
+        A speculative server's linear-attention record carries ``state_checkpoints``:
+        the ``1 + k`` state rows one slot holds, read off the ``[slots, 1 + k, ...]``
+        banks the runner carved. A plain bank's record has no such key (the record a
+        plain server built before speculation existed is unchanged; readers take an
+        absent key as one row) -- bind is the one place that reads the axis, so the
+        carrier translator asks the record, not the config.
         """
         spec_layers = self.get_kv_spec().layers
         stack = len(self.model.layers)
@@ -9628,18 +10050,35 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     "layer_index": layer_idx,
                     "family": "linear_attn",
                 }
+                checkpoint_rows: dict[str, int] = {}
                 for key, tensor, want in (
                     ("conv_state", tensors[0], recurrent[0]),
                     ("recurrent_state", tensors[1], recurrent[1]),
                 ):
-                    if tuple(tensor.shape[1:]) != tuple(want):
+                    shape, want = tuple(tensor.shape[1:]), tuple(want)
+                    if shape == want:
+                        checkpoint_rows[key] = 1
+                    elif shape[1:] == want:
+                        checkpoint_rows[key] = int(shape[0])
+                    else:
+                        per_slot = ", ".join(str(v) for v in want)
                         raise ValueError(
                             f"KV layer '{name}' has a {key} bank of "
                             f"{tuple(tensor.shape)}; the spec asked for one "
-                            f"{tuple(want)} state per slot, so the bank must be "
-                            f"[slots, {', '.join(str(v) for v in want)}]"
+                            f"{want} state per slot, so the bank must be "
+                            f"[slots, {per_slot}] or, with 1 + k checkpoint rows per "
+                            f"slot, [slots, 1 + k, {per_slot}]"
                         )
                     record[key] = tensor
+                if checkpoint_rows["conv_state"] != checkpoint_rows["recurrent_state"]:
+                    raise ValueError(
+                        f"KV layer '{name}' has {checkpoint_rows['conv_state']} checkpoint "
+                        f"row(s) per conv_state slot against "
+                        f"{checkpoint_rows['recurrent_state']} per recurrent_state slot; the "
+                        f"two states of one request hold the same 1 + k rows"
+                    )
+                if checkpoint_rows["conv_state"] > 1:
+                    record["state_checkpoints"] = checkpoint_rows["conv_state"]
                 if int(tensors[0].shape[0]) != int(tensors[1].shape[0]):
                     raise ValueError(
                         f"KV layer '{name}' has {int(tensors[0].shape[0])} "
@@ -9753,6 +10192,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
         device_sampling_params: torch.Tensor | None = None,
         device_logit_mask: torch.Tensor | None = None,
         shadow_boundary_ids: torch.Tensor | None = None,
+        draft_k: int | None = None,
+        spec_decode_metadata: "SpecDecodeMetadata | None" = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Logits for the rows the caller wants sampled: stack, select, project.
 
@@ -9783,18 +10224,21 @@ class Glm5NextForConditionalGeneration(nn.Module):
         projection the selection exists to prevent.
 
         There is no ``**kwargs`` sink, deliberately, and this is where the family
-        precedent is not followed. The runner passes eight keys today plus up to four
-        conditional ones, and three of them -- ``sampling_params``, ``logit_mask`` and
-        ``spec_decode_metadata`` -- carry on-device sampling, which this tree
-        implements nowhere: there is no sampler on this class and no
-        ``on_device_sampling_config``. A sink would accept those three silently and
-        return unsampled logits while reporting success. Naming the parameters instead
-        makes an unconsumed key a ``TypeError`` at the call. On-device sampling arrives
-        under this root's own names, ``device_sampling_params`` and
-        ``device_logit_mask``, which the runner sets only for a root built with an
-        ``on_device_sampling_config``; the logits then go to
+        precedent is not followed. The runner's generic keys (``sampling_params``,
+        ``logit_mask``, ``positions``, ``rank``, ...) are translated or dropped by
+        ``NeuronModelRunner._glm5next_model_kwargs``; a sink would accept an
+        untranslated one silently and return unsampled logits while reporting
+        success. Naming the parameters instead makes an unconsumed key a
+        ``TypeError`` at the call. On-device sampling arrives under this root's own
+        names, ``device_sampling_params`` and ``device_logit_mask``, which the runner
+        sets only for a root built with an ``on_device_sampling_config``; the logits
+        then go to
         :func:`~vllm_neuron.functional.full_vocab_sampling.sample_full_vocab` and the
-        root returns ``[len(sampling_positions)]`` int32 token ids instead.
+        root returns ``[len(sampling_positions)]`` int32 token ids instead. The
+        speculative verify step's ``spec_decode_metadata`` is the one generic key
+        handed over under its own name, because this root consumes it: the rejection
+        sampler runs here, on the sampled ids, so that the draft can start from the
+        accepted row inside the same graph.
 
         The quantisation policy is resolved here, once per call, and threaded down as
         an argument -- the convention every compute method in this file follows. It is
@@ -9838,6 +10282,22 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 draft layer is populated -- the next prompt token when more of the
                 prompt follows, ``-1`` when this chunk ends the prompt, in which case
                 the token sampled in this graph is taken. ``None`` means ``-1``.
+            spec_decode_metadata: speculative decoding's verify step (method "mtp"):
+                the runner's ``SpecDecodeMetadata`` for this batch, with
+                ``draft_token_ids`` (flat, int32), ``cu_num_draft_tokens`` (``[B]``)
+                and ``max_spec_len`` (``k``) read on device. Decode leg only, with the
+                head built: the forward then carries ``T = 1 + k`` rows per request,
+                row ``b * T + t`` being request ``b``'s token ``t`` at position
+                ``start_b + t``, and ``sampling_positions`` selects all of them.
+                ``None`` is the plain decode leg (one row per request) or a prefill.
+            draft_k: the draft's iteration count for this forward, a Python int the
+                runner names explicitly (the proposer's ``num_speculative_tokens``
+                under speculative method "mtp", the knob's value under the shadow
+                draft). ``None`` reads the knob's one reader, ``mtp.shadow_draft_k``,
+                which is what the shadow draft's direct callers rely on. A count
+                without a head, or a count below 1, is refused by name: a forward
+                that silently drafted nothing would return the bare ids and the
+                caller would read a missing draft as a shape change.
 
         Shadow draft (``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT=k``, ``self.mtp`` built):
         ``layer_carriers`` then holds one more mapping than the stack has layers, the
@@ -9849,16 +10309,38 @@ class Glm5NextForConditionalGeneration(nn.Module):
         ``k`` unrolled iterations from the selected rows and the sampled ids and the
         output is ``[rows, k]`` global token ids. The sampled ids never read the draft.
 
+        Verify leg (``spec_decode_metadata`` given, head built, decode carrier): every
+        row is sampled on device and
+        :func:`~vllm_neuron.nn.rejection_sampler.rejection_sampler` keeps, per
+        request, the drafts that match the trunk's ids up to the first mismatch, that
+        mismatch's corrected id, and the bonus id when every draft matched
+        (``[B, k + 1]`` int32, ``-1`` past the kept ids). The draft layer is populated
+        at every verify row with the id the trunk sampled there (the draft itself on an
+        accepted row, the correction on the mismatch row, an id never read on the rows
+        past it, which the next step's real tokens rewrite before anything reads
+        them), and ``k`` tokens are drafted from the last kept row -- row
+        ``kept_b - 1`` of request ``b``, with the id kept there, at position
+        ``start_b + kept_b - 1`` -- through a one-row carrier derived from the step's
+        own: the same banks, rings, pooled stores and block table, with ``position``,
+        ``start_position`` and ``seq_lens`` moved to that row and ``latent_slots``
+        gathered from the step's. The bookkeeping is O(B * T) index operations on
+        device; no value is read back to the host.
+
         Returns:
             ``[len(sampling_positions), vocab_size]`` logits, in the dtype the head
             weight and the stack output share -- or, under ``collect_layer_streams``,
             that tensor first and then one ``[T, hc_mult, H]`` carrier per layer of the
             stack. With the shadow draft on, the ``[rows, k]`` int32 draft ids follow
-            the logits (or sampled ids) and precede the layer streams.
+            the logits (or sampled ids) and precede the layer streams. On the verify
+            leg the first output is the rejection sampler's ``[B, k + 1]`` accepted
+            ids instead of the sampled ids, and the draft ids are ``[B, k]``.
 
         Raises:
-            ValueError: when the head tensor this call needs was never loaded, or when
-                the stack refuses its own inputs.
+            ValueError: when the head tensor this call needs was never loaded, when the
+                stack refuses its own inputs, when a decode step carries more rows than
+                requests without ``spec_decode_metadata`` (a verify step that would be
+                drafted from as if each row were a request), or when the metadata's
+                width disagrees with the rows.
         """
         head = self._head_weight()
         sampling_config = (
@@ -9874,13 +10356,22 @@ class Glm5NextForConditionalGeneration(nn.Module):
         # stack must not see it (it refuses a count that disagrees with its layers).
         draft_head = self.mtp
         shadow_k = 0
-        if draft_head is not None:
-            # The knob's one reader (contract C1); lazily, as the head is imported
-            # everywhere in this module, so the two modules never import each other
-            # at load time.
-            from . import mtp as mtp_module
-
-            shadow_k = int(mtp_module.shadow_draft_k())
+        if draft_k is not None:
+            if draft_head is None:
+                raise ValueError(
+                    f"this forward was handed draft_k={int(draft_k)} and the root built "
+                    f"no draft head (its 'mtp' attribute is None); the head is built at "
+                    f"construction when the head's reader of k is above 0"
+                )
+            shadow_k = int(draft_k)
+            if shadow_k < 1:
+                raise ValueError(
+                    f"draft_k={shadow_k} names no draft; leave the keyword out to draft "
+                    f"nothing, or hand the head's k >= 1"
+                )
+        elif draft_head is not None:
+            # The k the head was built for, recorded at construction (``draft_k``).
+            shadow_k = int(self.draft_k)
         draft_carrier: dict | None = None
         if shadow_k > 0:
             stack_depth = len(self.model.layers)
@@ -9990,17 +10481,112 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 (rows_out, shadow_k), -1, dtype=torch.int32, device=input_ids.device
             )
         else:
-            # Decode leg: the selected rows are one per request, at the request's
-            # position; iteration 0 of the draft populates the draft layer there.
             position = draft_carrier["position"]
             if not torch.is_tensor(position):
                 position = _int64_scalar(position, input_ids.device)
             positions = position.reshape(-1).to(device=input_ids.device, dtype=torch.int32)
-            if positions.numel() == 1 and rows_out > 1:
-                positions = positions.expand(rows_out)
-            draft_ids = draft_head.draft_tokens(
-                rows, sampled_ids, positions, shadow_k, **ffn_keywords, **draft_carrier
-            )
+            requests = int(positions.shape[0])
+            if spec_decode_metadata is None:
+                # Decode leg: the selected rows are one per request, at the request's
+                # position; iteration 0 of the draft populates the draft layer there.
+                if rows_out != requests:
+                    raise ValueError(
+                        f"this decode step samples {rows_out} row(s) for {requests} "
+                        f"request(s) and carries no spec_decode_metadata; a decode step "
+                        f"with more rows than requests is speculative decoding's verify "
+                        f"step, and drafting from its rows as if each were a request "
+                        f"would advance every ring from a token the trunk did not accept"
+                    )
+                draft_ids = draft_head.draft_tokens(
+                    rows, sampled_ids, positions, shadow_k, **ffn_keywords, **draft_carrier
+                )
+            else:
+                logits, draft_ids = self._verify_and_draft(
+                    draft_head,
+                    spec_decode_metadata,
+                    rows=rows,
+                    sampled_ids=sampled_ids,
+                    positions=positions,
+                    k=shadow_k,
+                    ffn_keywords=ffn_keywords,
+                    draft_carrier=draft_carrier,
+                )
         if collect_layer_streams:
             return (logits, draft_ids, *layer_streams)
         return logits, draft_ids
+
+    @staticmethod
+    def _verify_and_draft(
+        draft_head,
+        spec_decode_metadata,
+        *,
+        rows: torch.Tensor,
+        sampled_ids: torch.Tensor,
+        positions: torch.Tensor,
+        k: int,
+        ffn_keywords: dict,
+        draft_carrier: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The verify leg of :meth:`forward`: accept, populate every row, draft from the last kept row.
+
+        Args:
+            draft_head: the root's ``mtp`` head.
+            spec_decode_metadata: the step's ``SpecDecodeMetadata`` (see :meth:`forward`).
+            rows: ``[B * T, H]`` the sampled rows of the stack output, request-major.
+            sampled_ids: ``[B * T]`` int32, the id the trunk sampled at each row.
+            positions: ``[B]`` int32, each request's position of row 0 (its cached length).
+            k: the draft's iteration count; ``T = 1 + k``.
+            ffn_keywords: the stack's five feed-forward keywords.
+            draft_carrier: the draft layer's decode carrier for the ``T``-row step.
+
+        Returns:
+            ``(accepted [B, k + 1] int32, draft_ids [B, k] int32)``.
+        """
+        from vllm_neuron.nn.rejection_sampler import PLACEHOLDER_TOKEN_ID, rejection_sampler
+
+        device = sampled_ids.device
+        requests = int(positions.shape[0])
+        rows_out = int(sampled_ids.shape[0])
+        width = 1 + int(spec_decode_metadata.max_spec_len)
+        if rows_out != requests * width or width != 1 + int(k):
+            raise ValueError(
+                f"a verify step carries 1 + k rows per request and this one samples "
+                f"{rows_out} row(s) for {requests} request(s) with max_spec_len="
+                f"{int(spec_decode_metadata.max_spec_len)} and a head drafting k={int(k)}; "
+                f"the runner pads every request to the full draft, so the three agree or "
+                f"the rows pair with the wrong requests"
+            )
+        accepted = rejection_sampler(spec_decode_metadata, sampled_ids)
+        if tuple(accepted.shape) != (requests, width):
+            raise ValueError(
+                f"the rejection sampler returned {tuple(accepted.shape)} for {requests} "
+                f"request(s) of width {width}; its batch is cu_num_draft_tokens' length, "
+                f"which must be this step's request count"
+            )
+        # Every verify row populates the draft layer with the id the trunk sampled
+        # there (see ``forward``); row t of request b sits at start_b + t.
+        row_offsets = torch.arange(width, dtype=torch.int32, device=device)
+        row_positions = positions.repeat_interleave(width) + row_offsets.repeat(requests)
+        draft_head.populate(rows, sampled_ids, row_positions, **ffn_keywords, **draft_carrier)
+        # The last kept row of each request: kept ids are the non-placeholders, at
+        # least one (the correction or the first draft) and at most T (all drafts and
+        # the bonus); the draft starts from that row, with the id kept there.
+        kept = (accepted != PLACEHOLDER_TOKEN_ID).to(torch.int64).sum(dim=1)
+        last = kept - 1
+        row_index = torch.arange(requests, dtype=torch.int64, device=device) * width + last
+        rows_last = torch.index_select(rows, 0, row_index)
+        ids_last = torch.gather(accepted, 1, last.reshape(-1, 1)).reshape(-1).to(torch.int32)
+        positions_last = positions + last.to(torch.int32)
+        # A one-row carrier at the kept row: the same state objects, with the three
+        # per-request position operands moved and the per-row slot gathered. The
+        # positions stay ``[B]`` at one request too: the carrier is the request form
+        # (a tuple of ring views), whose sparse leg reads a ``[B]`` position.
+        one_row = dict(draft_carrier)
+        one_row["position"] = positions_last
+        one_row["start_position"] = positions_last
+        one_row["seq_lens"] = (positions_last + 1).to(torch.int32)
+        one_row["latent_slots"] = torch.index_select(draft_carrier["latent_slots"], 0, row_index)
+        draft_ids = draft_head.draft_tokens(
+            rows_last, ids_last, positions_last, k, **ffn_keywords, **one_row
+        )
+        return accepted, draft_ids

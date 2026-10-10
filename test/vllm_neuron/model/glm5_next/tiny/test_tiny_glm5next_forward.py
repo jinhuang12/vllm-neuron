@@ -142,6 +142,9 @@ _SEAM_REGISTRY = {
     "dsa_decode_tail_update": (
         "vllm_neuron.functional.dsa.decode_tail_update",
         "decode_tail_dispatch_counters", "reset_decode_tail_dispatch_counters"),
+    "dsa_decode_trow": (
+        "vllm_neuron.functional.dsa.decode_trow",
+        "decode_trow_dispatch_counters", "reset_decode_trow_dispatch_counters"),
     "dsa_ragged_pack": (
         "vllm_neuron.functional.dsa.ragged_pack",
         "ragged_pack_dispatch_counters", "reset_ragged_pack_dispatch_counters"),
@@ -182,6 +185,12 @@ _SEAM_REGISTRY = {
         "dispatch_counters", "reset_dispatch_counters"),
     "mhc_sinkhorn": (
         "vllm_neuron.functional.mhc.sinkhorn",
+        "dispatch_counters", "reset_dispatch_counters"),
+    "mtp_tail_in": (
+        "vllm_neuron.functional.mtp.tail_in",
+        "dispatch_counters", "reset_dispatch_counters"),
+    "mtp_tail_out": (
+        "vllm_neuron.functional.mtp.tail_out",
         "dispatch_counters", "reset_dispatch_counters"),
     "vision_patch_embed": (
         "vllm_neuron.functional.vision.patch_embed",
