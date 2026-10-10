@@ -27,8 +27,9 @@ it bit for bit. Every value is an int32 count, id or position below ``2 ** 24``,
 engines' fp32 arithmetic is exact; the latent slots leave the kernel as int32 pairs
 (``[rows, 2]``: low word, zero high word) and are bit-viewed as the int64 the layers'
 ``index_copy_`` takes, since NKI has no 64-bit integer and a dtype cast on a device
-tensor is a device op of its own. Dispatch counters (``dispatch_counters``) tell the
-tests which route served.
+tensor is a device op of its own. The dispatch counters (``dispatch_counters``,
+``reset_dispatch_counters``) are test instrumentation: they tell the tests which route
+served, and nothing on the step path reads them.
 """
 
 from __future__ import annotations
@@ -37,7 +38,11 @@ from typing import NamedTuple
 
 import torch
 
-from vllm_neuron.nn.rejection_sampler import PLACEHOLDER_TOKEN_ID
+#: The rejection sampler's marker for a rejected row
+#: (``vllm_neuron.nn.rejection_sampler.PLACEHOLDER_TOKEN_ID``), restated here so that
+#: ``functional`` does not import ``nn`` (``nn`` imports ``functional``); the module's tests
+#: pin the two equal.
+PLACEHOLDER_TOKEN_ID = -1
 from torch import Tensor
 
 import nki
@@ -90,7 +95,8 @@ class MtpAsyncStepError(ValueError):
 class StepTake(NamedTuple):
     """What :func:`mtp_async_take` reads off one step's output, all int32 on its device."""
 
-    #: ``[B]``: rows kept per request, ``1 .. W`` (the kept prefix of the sampler's row).
+    #: ``[B]``: rows kept per request, ``1 .. W`` (the kept prefix of the sampler's row); the
+    #: runner takes ``checkpoint_rows``, the tests read this.
     valid_count: Tensor
     #: ``[B]``: ``valid_count - 1``, the checkpoint row the request resumes from.
     checkpoint_rows: Tensor
@@ -132,7 +138,8 @@ class StepCarry(NamedTuple):
     prev_width: int
     #: ``[rows]`` int32: ``kept - 1`` per row of the step (real requests first).
     checkpoint_rows: Tensor
-    #: ``[rows]`` int32: the last kept id per row.
+    #: ``[rows]`` int32: the last kept id per row (the runner hands the take's copy to the
+    #: generic swap as ``futures_last_accepted_token``; the carry's copy is read by the tests).
     last_accepted: Tensor
     #: ``[rows, 1 + k]`` int32: the next verify step's input ids.
     next_input_ids: Tensor
@@ -622,10 +629,11 @@ _count_torch_route = count_torch_route(_COUNTERS)
 
 
 def reset_dispatch_counters() -> None:
-    """Zero both counters."""
+    """Zero both counters (test instrumentation)."""
     _COUNTERS.reset()
 
 
 def dispatch_counters() -> tuple[int, int]:
-    """``(kernel launches that returned, torch-route calls)`` since the last reset."""
+    """``(kernel launches that returned, torch-route calls)`` since the last reset -- test
+    instrumentation; nothing on the step path reads it."""
     return _COUNTERS.pair()

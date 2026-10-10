@@ -275,3 +275,8 @@ def test_a_position_whose_page_the_table_does_not_name_is_refused_by_name():
         async_step.mtp_async_correct_torch(torch.tensor([3], dtype=torch.int32),
                                            torch.tensor([PAGE - 1], dtype=torch.int32), column,
                                            prev_width=T, width=T, page_size=PAGE, padding=0)
+
+
+def test_the_placeholder_marker_is_the_rejection_samplers():
+    """``functional`` restates the marker rather than import ``nn``; the two must agree."""
+    assert async_step.PLACEHOLDER_TOKEN_ID == PLACEHOLDER_TOKEN_ID

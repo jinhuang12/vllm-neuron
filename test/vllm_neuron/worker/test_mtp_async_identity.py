@@ -186,12 +186,12 @@ LIMIT_PROMPT = 5  # the longest prompt (44 tokens): the limit comes soonest
 def _generate_async_to_the_limit(runner, req: str, prompt: list[int], *, finished: set):
     """Prefill, then decode as the served async scheduler drives it until ``max_model_len``.
 
-    ``NeuronAsyncScheduler._update_after_schedule`` (``vllm/core/scheduler.py``) re-arms ``k``
+    ``NeuronAsyncScheduler._update_after_schedule`` (the plugin's ``vllm/core/scheduler.py``) re-arms ``k``
     placeholder drafts after every step whatever the runner proposed, until the request's
     (optimistic) count passes ``max_model_len - 3 - 2 k``; from then on, stickily, it
     schedules one-row steps, so vLLM's own trim (``num_new = min(1 + k, max_model_len - 1 -
     num_computed)``) never shortens a step. The request is held while no row fits until its
-    output lands (``scheduler.py:504``); the handed count is pulled back one step late as in
+    output lands (vLLM's ``scheduler.py``); the handed count is pulled back one step late as in
     ``_generate_async``. Returns ``(ids, steps, widths, async steps, sync fallbacks, the
     indices of the steps the runner counted as fallbacks)``.
     """

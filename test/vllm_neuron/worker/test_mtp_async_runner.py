@@ -154,8 +154,9 @@ def no_commit(monkeypatch):
 
 
 def test_a_verify_step_settles_on_device_and_reads_nothing_back(no_commit, proposer):
-    """C1, C2, C3 moved on device: the cursor stays where the translator put it (the device
-    carries the true position), nothing is committed, the resume row is carried as a tensor."""
+    """The three host corrections moved on device: the cursor stays where the translator put
+    it (the device carries the true position), nothing is committed, the resume row is carried
+    as a tensor."""
     drafts = torch.arange(2 * K, dtype=torch.int32).reshape(2, K) + 100
     runner = _async_runner(proposer, record=_record(width=T), drafts=drafts)
     sampled = _Unreadable.of(torch.tensor([[5, 6, 7, -1], [9, -1, -1, -1]], dtype=torch.int32))
@@ -255,11 +256,12 @@ def test_a_partial_prefill_chunk_proposes_nothing(no_commit, proposer):
 
 
 def test_near_max_model_len_the_proposal_is_still_the_carrys_tensor(no_commit, proposer):
-    """vLLM's async scheduler never consults the proposal (``async_scheduler.py:23-25,44``
-    re-arms ``k`` placeholders every step) and clips the last steps of a request itself
-    (``scheduler.py:474-479``), so proposing nothing near ``max_model_len`` would only lose
-    the device future the clipped step takes its input ids from: the proposal is the
-    carry's tensor on every decode step, however close to the limit."""
+    """The served async scheduler (the plugin's ``NeuronAsyncScheduler``) never consults the
+    proposal -- it re-arms ``k`` placeholders every step and switches the request to one-row
+    steps near ``max_model_len`` on its own, before vLLM's trim could shorten a step -- so
+    proposing nothing near the limit would only lose the device future the next step takes
+    its input ids from: the proposal is the carry's tensor on every decode step, however
+    close to the limit."""
     drafts = torch.ones((1, K), dtype=torch.int32)
     for start in (MAX_MODEL_LEN - 2 * T, MAX_MODEL_LEN - T, MAX_MODEL_LEN - 2):
         runner = _settled(proposer, _record(width=T, start=start), drafts, torch.tensor([[5, -1, -1, -1]], dtype=torch.int32))
