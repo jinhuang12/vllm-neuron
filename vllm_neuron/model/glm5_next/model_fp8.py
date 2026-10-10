@@ -1397,8 +1397,6 @@ class Glm5NextRoutedExperts(nn.Module):
         gamma: torch.Tensor,
         text_config: Glm5NextTextConfig,
         eps: float | None = None,
-        *,
-        prenorm_from_kernel: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Route ``[B, S, H]`` tokens to the top-``k`` experts with ``noaux_tc``.
 
@@ -1409,16 +1407,6 @@ class Glm5NextRoutedExperts(nn.Module):
             eps: RMSNorm epsilon. ``None``, the default, resolves it from
                 ``text_config.rms_norm_eps`` -- the checkpoint's ``1e-05``. Pass
                 a float to override it.
-            prenorm_from_kernel: True when ``hidden_states`` is an NKI kernel's
-                stored output: the feed-forward mHC site's ``mhc_pre_norm_kernel``
-                (``functional/glue/mhc_pre.py``), which the caller knows served
-                because it also returned the normalised rows. A prefill call then
-                takes the fused router, which reads those rows once and applies
-                its RMSNorm in the kernel. ``router_prefill``'s RMSNorm in XLA
-                exists so that the torch mHC collapse feeding the router fuses
-                into XLA; with no collapse left in XLA it is extra work. False,
-                the default, keeps the prefill router for rows the torch mHC
-                route made (the glue switch off, or a shape the kernel declines).
 
         Returns:
             ``(router_logits [T, E], expert_index [T, k] int32,
@@ -1457,17 +1445,14 @@ class Glm5NextRoutedExperts(nn.Module):
                 routed_scaling_factor=float(text_config.routed_scaling_factor),
             )
 
-        # Prefill (T > 64) on rows the torch mHC route made: the router's RMSNorm in
-        # XLA, beside the experts' norm on the same pre-norm rows, so the mHC collapse
-        # feeding both fuses instead of running as a per-token matmul loop; then the
-        # router GEMM and noaux_tc top-8 in one launch (router_prefill.py). Rows an NKI
-        # kernel stored (``prenorm_from_kernel``) have no collapse in XLA, so they go
-        # to the fused router below, which reads them with its RMSNorm in the kernel.
-        # Same three outputs, same seam counters; any call the prefill route declines
-        # keeps the fused router too.
+        # Prefill (T > 64): the router's RMSNorm in XLA, beside the experts' norm on
+        # the same pre-norm rows, so the mHC collapse feeding both fuses instead of
+        # running as a per-token matmul loop; then the router GEMM and noaux_tc top-8
+        # in one launch (router_prefill.py). Same three outputs, same seam counters;
+        # any call it declines keeps the fused router below.
         from vllm_neuron.functional.moe import router_prefill
 
-        if not prenorm_from_kernel and router_prefill.prefill_route_admits(
+        if router_prefill.prefill_route_admits(
             hidden_states, self.router_weight, int(text_config.num_experts_per_tok)
         ):
             return router_prefill.noaux_tc_router_prefill(
@@ -2794,7 +2779,6 @@ class Glm5NextMoEBlock(nn.Module):
         tp_degree: int = 1,
         expert_parallel_rank: int | torch.Tensor = 0,
         collector: list[torch.Tensor] | None = None,
-        prenorm_from_kernel: bool = False,
     ) -> torch.Tensor:
         """One sparse layer's MLP: route, run this rank's experts, add the shared.
 
@@ -2814,9 +2798,6 @@ class Glm5NextMoEBlock(nn.Module):
             tp_degree: ranks sharding each expert's intermediate dimension.
             expert_parallel_rank: which rank's expert slice to select, as an
                 int64 device tensor (one graph for every rank) or a python int.
-            prenorm_from_kernel: ``hidden_states`` is the feed-forward mHC
-                kernel's stored output; forwarded to ``route_tokens``, which then
-                takes the fused router at prefill.
 
         Returns:
             ``[T, H]`` in the kernels' own dtype. The residual dtype is the layer
@@ -2833,8 +2814,7 @@ class Glm5NextMoEBlock(nn.Module):
         # affinities are consumed: the logits are the oracle's and the index set is
         # the affinities' own support.
         _logits, _expert_index, expert_affinities = self.experts.route_tokens(
-            hidden_states.unsqueeze(0), router_gamma, text_config,
-            prenorm_from_kernel=prenorm_from_kernel,
+            hidden_states.unsqueeze(0), router_gamma, text_config
         )
         if collector is not None:
             # Both forms of the weights: the whole table as the bank returns it,
@@ -7735,9 +7715,6 @@ class Glm5NextModel(nn.Module):
         gain, the config's ``rms_norm_eps``) when the feed-forward mHC site fused it
         into its mhc_pre kernel, and None when this method must normalise, with
         :meth:`_rms_norm`. The site never hands a normed tensor on its torch route.
-        So a ``normed`` tensor also says that ``hidden_states`` is that kernel's
-        stored output, and the MoE branch's router reads it with its RMSNorm in the
-        fused kernel (``route_tokens``' ``prenorm_from_kernel``).
 
         Returns:
             ``[T, H]`` in ``hidden_states``' dtype. Both routes return their own
@@ -7751,7 +7728,6 @@ class Glm5NextModel(nn.Module):
                 f"post_attention_layernorm_weight; the FFN norm's gain is a "
                 f"mapped checkpoint tensor and nothing was loaded onto it"
             )
-        prenorm_from_kernel = normed is not None
         if normed is None:
             normed = rms_norm(hidden_states, gain)
         if collector is not None:
@@ -7769,7 +7745,6 @@ class Glm5NextModel(nn.Module):
                 moe_group=moe_group,
                 tp_degree=tp_degree,
                 expert_parallel_rank=expert_parallel_rank,
-                prenorm_from_kernel=prenorm_from_kernel,
             )
         elif isinstance(mlp, Glm5NextDenseMLP):
             out = mlp(normed, quant_config=quant_config)
