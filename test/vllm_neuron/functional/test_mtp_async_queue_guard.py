@@ -15,7 +15,9 @@ raise":
   its launches unprocessed per rank (derived from the runtime's queue depth the worker
   sets, ``NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS``) and waits on the oldest before issuing
   another, so a rank whose completion thread stalls stops enqueuing instead of filling the
-  queue; a queue too small for the drafter's steady state is refused by name.
+  queue; a read that returns at once retires a processed launch silently, a read that
+  blocks is a wait, counted (``bound_waits``) and logged once; a queue too small for the
+  drafter's steady state is refused by name.
 
 The device is stood in for on the host as ``test_mtp_async_launch`` does: every operand
 counts as off-host, a launch object runs the eager launch functions (the simulator answers)
@@ -285,8 +287,9 @@ def _stalled_graph(real, release: threading.Event, issued: list, reads: list):
 def test_the_launch_holds_at_most_the_depth_of_unprocessed_launches(step_tests_fresh_dynamo, monkeypatch, caplog):
     """With the runtime processing nothing, a thread issuing ``depth + 2`` takes gets exactly
     ``depth`` of them enqueued and blocks in the oldest's read; releasing the runtime lets the
-    rest through, the launch holds no more than ``depth``, and each wait is logged once as a
-    warning with the launches held and the time waited."""
+    rest through and the launch holds no more than ``depth``. The one blocked read is the one
+    wait: counted once and logged once with the launches outstanding and the time waited; the
+    read after the release returns at once and is neither."""
     monkeypatch.setattr(async_step, "_launches_in_a_graph", lambda tensor: True)
     queue = _workers_queue_setting()
     launch = async_step.DeviceLaunch("eager", execution_queue=queue)
@@ -296,6 +299,7 @@ def test_the_launch_holds_at_most_the_depth_of_unprocessed_launches(step_tests_f
     depth = launch.depth
     assert depth == async_step.launch_depth(queue)
     results: list = []
+    async_step.reset_dispatch_counters()
     caplog.set_level(logging.WARNING, logger=async_step.__name__)
 
     def issue():
@@ -319,14 +323,21 @@ def test_the_launch_holds_at_most_the_depth_of_unprocessed_launches(step_tests_f
     assert len(results) == depth + 2
     assert launch.outstanding <= depth
     assert launch.calls == {"take": depth + 2, "correct": 0}
+    assert len(reads) == 2, reads  # one read per launch past the depth
     waits = [record.getMessage() for record in caplog.records if record.name == async_step.__name__]
-    assert len(waits) == 2, waits  # the two launches past the depth each waited on the oldest
-    assert all(f"{depth} launches unprocessed" in text and " ms" in text for text in waits), waits
+    assert len(waits) == 1 and async_step.bound_waits() == 1, waits
+    assert f"{depth} launches outstanding" in waits[0] and "the bound waited" in waits[0], waits
+    waited_ms = float(waits[0].split("waited ")[1].split(" ms")[0])
+    assert waited_ms >= 200.0 > async_step.WAIT_THRESHOLD_MS, waited_ms
 
 
-def test_a_processed_launch_is_let_through_without_a_wait(step_tests_fresh_dynamo, monkeypatch):
-    """Outputs the runtime has processed read back at once: ``depth + 2`` takes in a row
-    complete with one read of the oldest per launch past the depth."""
+LAUNCHES_OF_A_HEALTHY_RUN = 120
+
+
+def test_a_processed_launch_is_let_through_without_a_wait(step_tests_fresh_dynamo, monkeypatch, caplog):
+    """A healthy host: every launch is processed before the next arrives. Over
+    ``LAUNCHES_OF_A_HEALTHY_RUN`` takes the bound reads one processed output per launch past
+    the depth, retires it at once, counts no wait and logs nothing."""
     monkeypatch.setattr(async_step, "_launches_in_a_graph", lambda tensor: True)
     launch = async_step.DeviceLaunch("eager", execution_queue=_workers_queue_setting())
     release, issued, reads = threading.Event(), [], []
@@ -334,11 +345,15 @@ def test_a_processed_launch_is_let_through_without_a_wait(step_tests_fresh_dynam
     launch._take = _stalled_graph(async_step._take_launch, release, issued, reads)
     accepted, drafts = _take_operands(42)
     depth = launch.depth
-    for _ in range(depth + 2):
+    async_step.reset_dispatch_counters()
+    caplog.set_level(logging.WARNING, logger=async_step.__name__)
+    for _ in range(LAUNCHES_OF_A_HEALTHY_RUN):
         async_step.mtp_async_take(accepted, drafts, launch=launch)
-    assert len(issued) == depth + 2
-    assert len(reads) == 2
+    assert len(issued) == LAUNCHES_OF_A_HEALTHY_RUN
+    assert len(reads) == LAUNCHES_OF_A_HEALTHY_RUN - depth
     assert launch.outstanding == depth
+    assert async_step.bound_waits() == 0
+    assert [record.getMessage() for record in caplog.records if record.name == async_step.__name__] == []
 
 
 def test_a_launch_without_an_execution_queue_has_no_bound(step_tests_fresh_dynamo, monkeypatch):
@@ -399,7 +414,23 @@ def _executions_held_by_enumeration(launches: int) -> int:
 
 @pytest.mark.parametrize("launches", range(1, 13))
 def test_the_executions_a_rank_holds_for_its_unprocessed_launches(launches):
+    assert async_step.DECODE_STEP_ENQUEUES == ("correct", "forward", "take")
     assert async_step.executions_held(launches) == _executions_held_by_enumeration(launches)
+
+
+def test_the_healthy_hosts_outstanding_launches_derive_from_the_step_and_the_engines_batches(monkeypatch):
+    """A healthy host holds the previous step's take (read only by the next launch) plus the
+    launches of every batch the engine keeps in flight; the drafter's launches per step come
+    from the step's enqueue order, the batches from the async drafter's engine config
+    (``max_concurrent_batches`` under async scheduling)."""
+    launches_per_step = sum(1 for enqueue in async_step.DECODE_STEP_ENQUEUES if enqueue != "forward")
+    assert async_step.LAUNCHES_PER_STEP == launches_per_step == 2
+    fr._declaring_a_sampler(monkeypatch)
+    monkeypatch.setenv(proposer_tests.ASYNC_KNOB, "1")
+    config = identity._async_config(identity.K)
+    assert config.scheduler_config.async_scheduling is True
+    assert async_step.ENGINE_BATCHES_IN_FLIGHT == config.max_concurrent_batches == 2
+    assert async_step.STEADY_STATE_LAUNCHES == 1 + launches_per_step * async_step.ENGINE_BATCHES_IN_FLIGHT == 5
 
 
 @pytest.mark.parametrize("queue", range(2, 65))

@@ -98,7 +98,8 @@ if TYPE_CHECKING:
     # (functional/mtp/async_step.py) and the drafter accepts the async scheduler for
     # one sequence (max_num_seqs = 1). Off = the shipped synchronous drafter, which
     # refuses async scheduling by name.
-    # Unsaturated hosts only: 3 executions a step can fill the 32-deep queue (status=7).
+    # 3 executions a step: a rank holds at most launch_depth(queue) launches outstanding (10
+    # under the worker's 32), a launch refused with status=7 is served on the host, queue < 16 refused.
     VLLM_NEURON_GLM5NEXT_MTP_ASYNC: bool = False
     # The Neuron runtime's per-core execution queue depth. The worker sets it before the
     # first step (an operator's preset wins); the async drafter derives its launch bound

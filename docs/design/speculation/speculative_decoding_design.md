@@ -623,13 +623,16 @@ Contract of the opt-in (measured on trn2 at TP64/EP16, `k = 3`, `max_num_seqs 1`
   (`async_step.DeviceLaunch`) keeps at most `async_step.launch_depth(queue)` of its launches
   unprocessed per rank -- the most whose executions, with the forwards between them
   (`executions_held`: D + ceil(D / 2)), fit half the queue the worker set; 10 under the
-  worker's 32 -- reading the oldest back before it issues another (one warning per wait), so
-  a rank whose completion thread stalls waits instead of filling the queue. A healthy host
-  holds at most 5 launches unprocessed (the previous step's take, the correction and take of
-  the two steps the engine keeps in flight), so the wait never comes on one; a queue below
-  `async_step.MINIMUM_EXECUTION_QUEUE` (16), whose depth is under those 5, is refused by
-  name when the launch is built at warm-up. No knob: both are the default; the queue depth
-  is the runtime's existing setting.
+  worker's 32 -- reading the oldest back before it issues another. On a healthy host that
+  read returns at once (the launch was processed steps ago) and retires it silently; a read
+  that blocks past `async_step.WAIT_THRESHOLD_MS` (1 ms) is a wait, counted
+  (`async_step.bound_waits()`) and logged once, and it is what makes a rank whose completion
+  thread stalls wait instead of filling the queue. A healthy host holds at most 5 launches
+  outstanding (the previous step's take plus the correction and take of the two steps the
+  engine keeps in flight: `1 + LAUNCHES_PER_STEP * ENGINE_BATCHES_IN_FLIGHT`), so the wait
+  never comes on one; a queue below `async_step.MINIMUM_EXECUTION_QUEUE` (16), whose depth is
+  under those 5, is refused by name when the launch is built at warm-up. No knob: both are
+  the default; the queue depth is the runtime's existing setting.
   The recipe runs the on-device sampler with `all_greedy: true`; sampling knobs the greedy
   sampler cannot apply (`temperature > 0`, `top_k`, `top_p`, `min_p`, `seed`, `n > 1`)
   are refused at admission (`vllm_neuron/vllm/admission.py`). Distribution-preserving
