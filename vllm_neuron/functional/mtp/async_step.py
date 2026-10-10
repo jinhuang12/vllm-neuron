@@ -316,12 +316,12 @@ class DeviceLaunch:
     The launch bounds its run-ahead when it is built with ``execution_queue``, the runtime's
     per-core queue depth (:data:`EXECUTION_QUEUE_ENV`, the worker sets it): it keeps the
     first output of each launch it issued and, before issuing one at ``depth``
-    (:func:`launch_depth`) unprocessed, reads the oldest to the host. By the framework's
-    design that read returns when the runtime has processed the execution's completion --
-    the point at which the runtime also frees the execution's queue slot -- so a rank whose
-    completion thread stalls waits here instead of enqueuing into a full queue; the pairing
-    of the read with the slot's release is the framework's design, not yet measured on a
-    device. Once ``depth`` launches have been issued the read is one small output per
+    (:func:`launch_depth`) unprocessed, reads the oldest to the host. The runtime's
+    completion callback resolves that output's future, and the same completion processing
+    frees the execution's queue slot, so the read returns once the slot is free and a rank
+    whose completion thread stalls waits here instead of enqueuing into a full queue; that
+    pairing is the framework's design, not yet measured on a device. Once ``depth``
+    launches have been issued the read is one small output per
     launch (processed long before, on a healthy host). A queue below
     :data:`MINIMUM_EXECUTION_QUEUE` is refused by name: its depth is below the launches a
     healthy host holds, so the bound would wait on every step. Without ``execution_queue``

@@ -481,29 +481,29 @@ def test_the_runner_hands_the_launch_the_runtimes_execution_queue_or_refuses_by_
 
 
 class _RefusingDeviceLaunch(async_step.DeviceLaunch):
-    """The runner's :class:`DeviceLaunch` on the eager backend whose ``fail_at``-th launch
-    (1-based over take and correct together, in the order the runner issues them) raises
-    ``error`` in place of launching; ``issued`` counts every launch asked for, ``calls`` (the
-    base class's) only those that launched."""
+    """The runner's :class:`DeviceLaunch` on the eager backend, bounded by the worker's queue,
+    whose ``fail_at``-th launch (1-based over take and correct together, in the order the
+    runner issues them) raises ``error`` from the compiled launch call -- where the executor
+    raises it -- so the base class's admission and ``calls`` run as they do in the product
+    (``calls`` counts the refused launch too: the count precedes the call); ``issued`` counts
+    every launch call made."""
 
     def __init__(self, fail_at: int, error: Exception) -> None:
         super().__init__("eager", execution_queue=_workers_queue_setting())
         self.fail_at = fail_at
         self.error = error
         self.issued = 0
+        self._take = self._refusing(self._take)
+        self._correct = self._refusing(self._correct)
 
-    def _refuse_the_chosen_launch(self) -> None:
-        self.issued += 1
-        if self.issued == self.fail_at:
-            raise self.error
+    def _refusing(self, graph):
+        def launch(*args, **kwargs):
+            self.issued += 1
+            if self.issued == self.fail_at:
+                raise self.error
+            return graph(*args, **kwargs)
 
-    def take(self, accepted, drafts):
-        self._refuse_the_chosen_launch()
-        return super().take(accepted, drafts)
-
-    def correct(self, prev_rows, starts, table, **constants):
-        self._refuse_the_chosen_launch()
-        return super().correct(prev_rows, starts, table, **constants)
+        return launch
 
 
 #: The runner's launches in order: the prefill's take at ``sample_tokens``, then per decode
@@ -538,7 +538,8 @@ def test_a_full_queue_at_one_launch_of_a_served_sequence_leaves_the_synchronous_
     ``test_mtp_async_launch`` does, with the launch at ``site`` refused by a full queue: no
     raise, the ids are the synchronous drafter's, every step stayed an async step (the runner
     counted no synchronous fallback), the refused launch is the one queue-full event and the
-    one torch-route call, every other launch reached the device launch, none ran eagerly."""
+    one torch-route call, every other launch returned from the device launch (the kernel
+    count), none ran eagerly, and the launch never held more than its depth."""
     config, prompt = launch_tests._async_runner(tmp_path, monkeypatch)
     control = _synchronous_drafters_ids(tmp_path, monkeypatch, prompt)
     monkeypatch.setenv(proposer_tests.ASYNC_KNOB, "1")
@@ -556,7 +557,8 @@ def test_a_full_queue_at_one_launch_of_a_served_sequence_leaves_the_synchronous_
     assert fallbacks == 0 and async_steps == steps, (site, steps, async_steps, fallbacks)
     launches = 1 + 2 * steps
     assert LAUNCH_SITES[site] <= launches, (site, launches)
-    assert launch.issued == launches and sum(launch.calls.values()) == launches - 1, (launch.issued, launch.calls)
+    assert launch.issued == launches and launch.calls == {"take": steps + 1, "correct": steps}, (launch.issued, launch.calls)
+    assert launch.depth == async_step.launch_depth(_workers_queue_setting()) and launch.outstanding <= launch.depth
     assert seen["take"] == {"eager": 0} and seen["correct"] == {"eager": 0}
     assert async_step.queue_full_fallbacks() == 1
     assert async_step.dispatch_counters() == (launches - 1, 1), async_step.dispatch_counters()
