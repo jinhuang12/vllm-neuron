@@ -634,8 +634,8 @@ Contract of the opt-in (measured on trn2 at TP64/EP16, `k = 3`, `max_num_seqs 1`
   With the bank write, repeated greedy generations of the same prompt were identical
   across two passes, and so were the identity prompts against the same server. On the
   bank-write configuration some identity prompts still differ from the non-speculative
-  run (a different set from the earlier configuration's), and one benchmark question
-  flipped against the earlier configuration; the cause is under investigation. Output
+  run (a different set from the earlier configuration's), and one fewer benchmark question
+  is correct than with the earlier configuration; the cause is under investigation. Output
   differs from non-speculative greedy decoding deterministically within a configuration.
   Each verify step is lossless by construction -- an accepted draft is the id
   the target's own argmax returned for that row -- so a divergence from the

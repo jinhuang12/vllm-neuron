@@ -38,7 +38,8 @@ and host calls with and without the call. A freeze only shortens full passes, an
 with ``threshold2`` raised there are none to shorten.
 
 The cost of the freeze also depends on the host: on a second server of the same
-type it was smaller. The barrier time also varies between launches without the
+type it was smaller at the times measured there; its first decode steps after startup
+were not measured. The barrier time also varies between launches without the
 freeze; that spread comes from the launch or the host, not from this code: ``off``
 imports this module, reads the knob and logs one line, and changes no GC state. The
 freeze alone (``freeze``) was rejected earlier for a batch-1 cost of the same kind.

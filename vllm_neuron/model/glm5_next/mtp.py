@@ -205,7 +205,7 @@ class Glm5NextMultiTokenPredictor(nn.Module):
             because the table is materialised by the weight load, after this
             constructor runs.
         lm_head: a callable returning the head weight: this rank's vocab shard
-            ``[vocab / world, H]`` on the sharded serve line, or the whole
+            ``[vocab / world, H]`` on a tensor-parallel server, or the whole
             ``[vocab, H]`` head. Layer 45 ships no head tensor; the root's is shared.
         world_size: the tensor-parallel degree, handed to the block exactly as the
             root hands it to its layers.

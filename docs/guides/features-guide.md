@@ -634,9 +634,9 @@ differs from non-speculative greedy decoding for some identity prompts, on both
 configurations and deterministically within each: the likeliest carrier is the
 `1 + k`-row verify graph and the one-row decode graph accumulating in different orders
 (each step is lossless by id equality, and an on-device-sampling server returns no
-logprobs with which to read the margins). One benchmark question flipped between the
-two configurations (cause under investigation). Leave it off where token identity with
-non-speculative decoding is required. Details:
+logprobs with which to read the margins). With the bank write, one fewer benchmark
+question is correct than with the view-form write (cause under investigation). Leave
+it off where token identity with non-speculative decoding is required. Details:
 [`docs/design/speculation/speculative_decoding_design.md`](../design/speculation/speculative_decoding_design.md#glm-53-flash-mtp-drafter-method-mtp).
 
 By default (`VLLM_NEURON_GLUE_FUSED` unset or `1`) GLM-5.3-Flash's fused glue
