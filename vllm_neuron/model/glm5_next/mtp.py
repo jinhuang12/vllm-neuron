@@ -136,7 +136,7 @@ def shadow_draft_k() -> int:
     ``num_speculative_tokens``; the worker sets that config around ``load_model``
     (``set_current_vllm_config``), where the root reads this once at construction.
     The diagnostic one is :data:`SHADOW_DRAFT_ENV` through ``envs``, which holds the
-    knob's one definition: the shadow draft (stage A) with no speculative config.
+    knob's one definition: the shadow draft with no speculative config.
     Both set and disagreeing is refused by name: the root builds one head for one
     k, and the alpha the shadow log measures would otherwise be labelled with the
     wrong k. Unset, with no config, is 0. A negative knob is refused rather than
