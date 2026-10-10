@@ -282,3 +282,13 @@ apply_kv_spec_patch()
 from vllm_neuron.vllm.patches.spec_config_patch import apply_spec_config_patch
 
 apply_spec_config_patch()
+
+# vLLM starts its workers one at a time, and a spawn start waits until the child
+# has read its pickled start-up payload, which the child does only after its own
+# imports, so TP=64 workers start strictly one after another. Payloads larger than
+# their pipe are written from a background thread instead. It must be live in the
+# EngineCore subprocess, which starts the workers, so it is applied here at import
+# time too. See the patch module docstring.
+from vllm_neuron.vllm.patches.worker_spawn_patch import apply_worker_spawn_patch
+
+apply_worker_spawn_patch()
