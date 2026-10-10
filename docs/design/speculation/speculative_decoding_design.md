@@ -633,6 +633,26 @@ Contract of the opt-in (measured on trn2 at TP64/EP16, `k = 3`, 2026-10-09):
   1k tokens); the KV pool and block table are sized for the `1 + k` recurrent blocks a
   drafting request holds (`kv_group_blocks.draft_blocks_per_request`).
 
+**The verify step's glue fusion is opt-in.** By default (`VLLM_NEURON_GLUE_FUSED`
+unset or `1`, `vllm_neuron/functional/glue`) the fused glue kernels serve the mHC
+sites at the prefill buckets only, so every verify graph takes its torch route. To
+fuse the mHC pre-mix at the verify step too, add `mhc_pre:verify` to the default's
+rules:
+
+```bash
+VLLM_NEURON_GLUE_FUSED=mhc_pre:prefill@128,mhc_pre:prefill@1024,mhc_pre:prefill@2048,mhc_post:prefill@128,mhc_post:prefill@1024,mhc_post:prefill@2048,mhc_pre:verify
+```
+
+It is faster, but it changes answers. Measured on a trn2 TP=64 serve of GLM-5.3-Flash
+at batch size 1 with 3 drafts, GSM8K 500 questions (strict match), against the same
+server without speculation (exact match 0.978): with the rule, exact match 0.974 and
+median ITL 10.291 ms, with 3 answers wrong that the server without speculation got
+right and 1 right that it got wrong; without the rule (the default), 0.982 and
+11.113 ms, with none wrong that it got right and 2 right that it got wrong. The
+fusion is worth 0.8 ms per token in these medians and about 1.0 ms at steady state.
+The default gives up that time: without the rule the drafter lost no answer that the
+server without speculation got right.
+
 ## Performance Considerations
 
 ### Acceptance Rate and Speedup

@@ -23,8 +23,9 @@ The switch is registered in :mod:`vllm_neuron.envs`. It names four sites
 Values:
 
 * ``0``: nothing is fused. Every site takes its torch route.
-* ``1`` or unset: :data:`vllm_neuron.envs.DEFAULT_GLUE_FUSED_SPEC`: prefill buckets, and
-  mhc_pre at the verify step. Its docstring gives the measurements it rests on.
+* ``1`` or unset: :data:`vllm_neuron.envs.DEFAULT_GLUE_FUSED_SPEC`: prefill buckets
+  only. mhc_pre at the verify step is the opt-in rule ``mhc_pre:verify``, added to the
+  default's rules. Its docstring gives the measurements both rest on.
 * ``all``: every kernel at every phase and row count.
 * otherwise a comma list of rules ``kernel[:phase][@rows]``:
 

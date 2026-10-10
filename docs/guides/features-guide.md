@@ -613,6 +613,17 @@ the margins). Leave it off where token identity with non-speculative decoding is
 required. Details:
 [`docs/design/speculation/speculative_decoding_design.md`](../design/speculation/speculative_decoding_design.md#glm-53-flash-mtp-drafter-method-mtp).
 
+By default (`VLLM_NEURON_GLUE_FUSED` unset or `1`) GLM-5.3-Flash's fused glue
+kernels serve the mHC sites at the prefill buckets only, not at the verify step. To
+fuse the mHC pre-mix at the verify step too, add `mhc_pre:verify` to the default's
+rules:
+`VLLM_NEURON_GLUE_FUSED=mhc_pre:prefill@128,mhc_pre:prefill@1024,mhc_pre:prefill@2048,mhc_post:prefill@128,mhc_post:prefill@1024,mhc_post:prefill@2048,mhc_pre:verify`.
+This saves 0.8 to 1.0 ms per token but changes answers. Measured on a trn2 TP=64 serve
+of GLM-5.3-Flash at batch size 1 with 3 drafts, GSM8K 500 questions: with the rule,
+exact match 0.974 at a median ITL of 10.291 ms, with 3 answers wrong that the server
+without speculation (0.978) got right; with the default, 0.982 at 11.113 ms, with
+none.
+
 ### On-device vs CPU sampling
 
 Speculative decoding uses **on-device sampling** for the rejection step.
