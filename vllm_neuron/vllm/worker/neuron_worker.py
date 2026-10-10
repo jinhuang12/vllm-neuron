@@ -2557,7 +2557,12 @@ class NeuronWorker(WorkerBase):
             return (
                 "NEURON_LIBTORCH_REMOTE_CACHE is set; the check covers the local cache"
             )
-        if not skip_vision or self.model_runner.vision_capture_backend is not None:
+        # A vision config alone is not vision work: a model without a vision encoder
+        # (no vision capture backend, no vision warm-up interface) traces no vision
+        # graph, and its vision warm-up does nothing.
+        if self.model_runner.vision_capture_backend is not None or (
+            not skip_vision and self._unwrap_vision_model() is not None
+        ):
             return "a vision encoder is extracted and warmed up"
         parallel_config = getattr(self.vllm_config, "parallel_config", None)
         pipeline_size = getattr(parallel_config, "pipeline_parallel_size", 1)

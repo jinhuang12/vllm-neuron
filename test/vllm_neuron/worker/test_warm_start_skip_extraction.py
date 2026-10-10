@@ -28,9 +28,12 @@ import json
 import os
 import shutil
 import types
+from pathlib import Path
 
 import pytest
+import torch
 from libtorch_neuronx_lite.compile import backend, cache
+from transformers import PretrainedConfig
 
 from test.vllm_neuron.worker.test_cold_start_call_sequence import (
     BASELINE,
@@ -43,6 +46,10 @@ from test.vllm_neuron.worker.test_cold_start_call_sequence import (
     graph_key,
     make_worker,
 )
+from vllm_neuron import envs
+from vllm_neuron.model.glm5_next.factory import Glm5NextForConditionalGeneration
+from vllm_neuron.model.neuron_config import VisionNeuronConfig
+from vllm_neuron.vllm.platform import NeuronPlatform
 from vllm_neuron.vllm.worker import gc_policy, neuron_worker
 from vllm_neuron.vllm.worker.neuron_worker import NeuronWorker
 
@@ -72,7 +79,17 @@ VISION_FULL = [
     ("warmup_vision",),
     *FULL[6:],
 ]
+#: A warm start with a vision config: the vision warm-up runs after the decode warm-up.
+WARM_VISION = [*WARM[:2], ("warmup_vision",), *WARM[2:]]
 TP_SIZE = 64
+#: The published GLM-5.3-Flash config, byte for byte (``test_config.py`` pins it).
+GLM5_NEXT_CONFIG = (
+    Path(__file__).resolve().parents[1]
+    / "model"
+    / "glm5_next"
+    / "fixtures"
+    / "hf-config.json"
+)
 
 
 class Rows:
@@ -704,6 +721,60 @@ def _vision(worker, monkeypatch):
     worker.model_runner.vision_neuron_config = types.SimpleNamespace()
 
 
+class _VisionModel:
+    """A model with the vision warm-up interface (``SupportsVisionWarmup``)."""
+
+    def build_vision_synthetic_inputs(self, bucket, vision_neuron_config, device):
+        return {}
+
+
+def _vision_buckets() -> VisionNeuronConfig:
+    return VisionNeuronConfig.from_dict({"num_vision_tokens_buckets": [2048]})
+
+
+def _vision_warm_up(worker, monkeypatch):
+    """A vision encoder that the warm-up runs, with no vision capture backend."""
+    worker.model_runner.model = _VisionModel()
+    worker.model_runner.vision_neuron_config = _vision_buckets()
+
+
+def _vision_config_only(worker):
+    """A vision config and no vision work: no vision capture backend, and a model
+    without the vision warm-up interface."""
+    worker.model_runner.vision_neuron_config = _vision_buckets()
+
+
+def _glm5_next(worker):
+    """The vision parts of a GLM-5.3-Flash model runner, as ``load_model`` builds them.
+
+    The published config has a ``vision_config``, so the platform resolves vision
+    buckets for it. The runner builds the vision config, builds the root on the meta
+    device and wraps it in ``torch.compile``. The root has no ``visual`` module, so the
+    runner builds no vision capture backend.
+    """
+    vllm_config = worker.vllm_config
+    hf_config = PretrainedConfig(**json.loads(GLM5_NEXT_CONFIG.read_text()))
+    vllm_config.model_config.hf_config = hf_config
+    NeuronPlatform._resolve_vision_auto_config(vllm_config, vllm_config.model_config)
+    vision = VisionNeuronConfig.from_dict(
+        vllm_config.additional_config["vision_neuron_config"]
+    )
+    vision.resolve_tp_dp(TP_SIZE)
+    with torch.device("meta"):
+        root = Glm5NextForConditionalGeneration.from_configs(
+            hf_config=hf_config,
+            text_neuron_config=None,
+            vision_neuron_config=vision,
+        )
+    model = torch.compile(root, backend=envs.get_compile_backend_name(), fullgraph=True)
+    # The condition of ``load_model`` for a vision capture backend.
+    assert getattr(model, "visual", None) is None
+    worker.model_runner.model = model
+    worker.model_runner.vision_neuron_config = vision
+    worker.model_runner.vision_capture_backend = None
+    return vision
+
+
 def _no_compile_options(worker, monkeypatch):
     del worker.model_runner.compile_options
 
@@ -716,6 +787,7 @@ def _no_compile_options(worker, monkeypatch):
         (_remote_cache, "NEURON_LIBTORCH_REMOTE_CACHE"),
         (_pipeline, "pipeline"),
         (_vision, "vision"),
+        (_vision_warm_up, "vision"),
         (_no_compile_options, "compile options"),
     ],
     ids=[
@@ -724,6 +796,7 @@ def _no_compile_options(worker, monkeypatch):
         "remote-cache",
         "pipeline-parallel",
         "vision",
+        "vision-warm-up",
         "no-compile-options",
     ],
 )
@@ -738,9 +811,79 @@ def test_an_unsupported_start_keeps_the_full_pass_without_a_vote(
     second = starts.run(edit=lambda worker: precondition(worker, monkeypatch))
 
     assert second.sums == []
-    assert second.events == (VISION_FULL if precondition is _vision else FULL)
+    vision = precondition in (_vision, _vision_warm_up)
+    assert second.events == (VISION_FULL if vision else FULL)
     assert starts.manifests() == []
     assert reason in starts.log.text("info")
+
+
+def test_a_vision_config_without_vision_work_keeps_the_skip(starts):
+    """No vision capture backend and no vision warm-up model: the start is covered.
+
+    The full pass and the warm start keep their call sequence, vision warm-up included.
+    """
+    first = starts.run(edit=_vision_config_only)
+
+    assert first.events == VISION_FULL
+    assert first.sums == [1]
+    assert len(starts.manifests()) == 1
+
+    second = starts.run(edit=_vision_config_only)
+
+    assert second.events == WARM_VISION
+    assert second.sums == [0]
+    assert "Warm start: not used" not in starts.log.text()
+
+
+def test_a_skipped_vision_warm_up_keeps_the_skip(starts, monkeypatch):
+    """``VLLM_NEURON_SKIP_ENCODER_WARMUP=1``: the vision encoder is neither extracted
+    nor warmed up, so the start is covered."""
+    monkeypatch.setenv("VLLM_NEURON_SKIP_ENCODER_WARMUP", "1")
+
+    def edit(worker):
+        _vision_warm_up(worker, monkeypatch)
+
+    first = starts.run(edit=edit)
+
+    assert first.events == FULL
+    assert len(starts.manifests()) == 1
+
+    second = starts.run(edit=edit)
+
+    assert second.events == WARM
+    assert second.sums == [0]
+
+
+def test_the_glm5_next_start_is_not_refused(starts):
+    """GLM-5.3-Flash has a ``vision_config`` and no vision encoder to extract."""
+    worker = make_worker(Steps(starts.cache))
+
+    vision = _glm5_next(worker)
+
+    assert vision.num_vision_tokens_buckets == [2048]
+    # The model has no vision warm-up interface: the vision warm-up runs no graph.
+    assert NeuronWorker._unwrap_vision_model(worker) is None
+    assert (
+        NeuronWorker._warm_start_refusal(
+            worker, skip_vision=False, native_compile_only=False
+        )
+        is None
+    )
+
+
+def test_a_glm5_next_warm_root_skips_extraction(starts):
+    """The second GLM-5.3-Flash start on the same root runs the warm-ups only."""
+    first = starts.run(edit=_glm5_next)
+
+    assert first.events == VISION_FULL
+    assert len(starts.manifests()) == 1
+
+    second = starts.run(edit=_glm5_next)
+
+    assert second.events == WARM_VISION
+    assert second.sums == [0]
+    assert "skipping graph extraction" in starts.log.text("info")
+    assert "Warm start: not used" not in starts.log.text()
 
 
 def test_the_knob_forces_the_full_pass_on_a_warm_root(starts, monkeypatch):
