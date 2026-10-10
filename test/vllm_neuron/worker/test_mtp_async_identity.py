@@ -25,6 +25,7 @@ import pytest
 import torch
 from vllm.engine.arg_utils import EngineArgs
 
+from vllm_neuron.utils.bucket_utils import get_bucket_for_count
 from vllm_neuron.vllm.worker.neuron_model_runner import (
     AsyncNeuronModelRunnerOutput,
     NeuronModelRunner,
@@ -131,29 +132,60 @@ def _generate_async(runner, req: str, prompt: list[int], *, tokens: int, finishe
     )
 
 
+#: Two of ``test_mtp_e2e_spec``'s prompts: 7 (31 tokens) ends inside a page, so the first
+#: decode writes into a partial page, and 5 (44) ends on a page boundary, so it opens a new
+#: one. The synchronous drafter on all eight prompts is ``test_mtp_e2e_spec``'s.
+IDENTITY_PROMPTS = (7, 5)
+assert {spec.PROMPT_LENGTHS[i] % spec.PAGE == 0 for i in IDENTITY_PROMPTS} == {True, False}
+#: Tokens generated per prompt; from either prompt they cross at least two page boundaries.
+IDENTITY_TOKENS = 12
+
+
+def _plain_references(tmp_path, prompts: dict[int, list[int]], *, tokens: int) -> dict[int, list[int]]:
+    """The plain run's first ``tokens`` ids per prompt, served one after the other on one
+    runner as ``test_mtp_e2e_spec._plain_references`` serves them (which runs past
+    ``GENERATED`` for its oracle; nothing here reads past ``tokens``)."""
+    plain_config = spec._config(None)
+    references: dict[int, list[int]] = {}
+    (tmp_path / "plain").mkdir()
+    with fr._parallel_state(tmp_path / "plain", plain_config):
+        runner = spec._runner(plain_config, spec._root()[0])
+        assert runner.drafter is None
+        finished: set = set()
+        for i, prompt in prompts.items():
+            ids, steps = spec._generate(runner, f"plain-{i}", prompt, tokens=tokens, finished=finished)
+            assert steps == tokens - 1
+            references[i] = ids
+            finished = {f"plain-{i}"}
+    return references
+
+
 def test_the_async_drafters_greedy_output_is_the_synchronous_drafters(tmp_path, monkeypatch):
     e2e._require_cpu_mode()
     fr._declaring_a_sampler(monkeypatch)
-    prompts = spec._prompts()
+    every_prompt = spec._prompts()
+    prompts = {i: every_prompt[i] for i in IDENTITY_PROMPTS}
     monkeypatch.delenv(spec.KNOB, raising=False)
     monkeypatch.delenv(proposer_tests.ASYNC_KNOB, raising=False)
-    references = spec._plain_references(tmp_path, prompts)
+    references = _plain_references(tmp_path, prompts, tokens=IDENTITY_TOKENS)
 
     # The control: the synchronous drafter, the shipped opt-in path.
     monkeypatch.setenv(spec.KNOB, str(K))
     sync_config = spec._config(K)
     (tmp_path / "sync").mkdir()
-    control = []
+    control: dict[int, tuple[list[int], int]] = {}
     with fr._parallel_state(tmp_path / "sync", sync_config):
         root, _ = spec._root()
         runner = spec._runner(sync_config, root)
         assert runner.drafter.async_steps is False
         finished: set = set()
-        for i, prompt in enumerate(prompts):
-            ids, steps = spec._generate(runner, f"sync-{i}", prompt, tokens=spec.GENERATED, finished=finished)
+        for i, prompt in prompts.items():
+            ids, steps = spec._generate(
+                runner, f"sync-{i}", prompt, tokens=IDENTITY_TOKENS, finished=finished
+            )
             finished = {f"sync-{i}"}
-            assert ids == references[i][:spec.GENERATED], i
-            control.append((ids, steps))
+            assert ids == references[i][:IDENTITY_TOKENS], i
+            control[i] = (ids, steps)
 
     # The async drafter.
     monkeypatch.setenv(proposer_tests.ASYNC_KNOB, "1")
@@ -166,9 +198,9 @@ def test_the_async_drafters_greedy_output_is_the_synchronous_drafters(tmp_path, 
         assert runner.use_async_scheduling and runner.drafter.async_steps is True
         finished = set()
         counts: list[tuple[int, int, int]] = []
-        for i, prompt in enumerate(prompts):
+        for i, prompt in prompts.items():
             ids, steps, async_steps, fallbacks = _generate_async(
-                runner, f"async-{i}", prompt, tokens=spec.GENERATED, finished=finished
+                runner, f"async-{i}", prompt, tokens=IDENTITY_TOKENS, finished=finished
             )
             finished = {f"async-{i}"}
             assert ids == control[i][0], (i, ids, control[i][0])
@@ -183,14 +215,42 @@ def test_the_async_drafters_greedy_output_is_the_synchronous_drafters(tmp_path, 
             assert fallbacks == 0, (i, async_steps, fallbacks)
             assert async_steps == steps, (i, async_steps, steps)
     # Per prompt: (prompt, the synchronous drafter's decode steps, the async drafter's);
-    # ``GENERATED - 1`` synchronous steps means no draft was accepted on that prompt.
+    # ``IDENTITY_TOKENS - 1`` synchronous steps means no draft was accepted on that prompt.
     print("identity steps (prompt, sync, async):", counts)
 
 
 # ── the context limit: the served scheduler ends a request in one-row steps ─────
 
 
-LIMIT_PROMPT = 5  # the longest prompt (44 tokens): the limit comes soonest
+#: The limit drive's prompt length. Past the first prefill bucket, so the prompt is
+#: prefilled in one chunk at the last one (``_prefill_in_the_last_bucket``); the drive's
+#: verify steps start from it, and its one-row steps run from the scheduler's switch to the
+#: last position whatever the prompt's length.
+LIMIT_PROMPT_TOKENS = 104
+
+
+def _limit_prompt() -> list[int]:
+    """A ``LIMIT_PROMPT_TOKENS`` prompt, seeded as ``test_mtp_e2e_spec._prompts`` seeds its
+    prompts, at the index after the last of them."""
+    generator = torch.Generator().manual_seed(spec.SEED_PROMPTS + len(spec.PROMPT_LENGTHS))
+    prompt = torch.randint(0, spec.VOCAB, (LIMIT_PROMPT_TOKENS,), generator=generator, dtype=torch.int64)
+    return prompt.tolist()
+
+
+def _prefill_in_the_last_bucket(
+    runner, req: str, prompt: list[int], groups: int, blocks: list[int], finished: set
+):
+    """The limit prompt's prefill, one chunk padded as the served scheduler pads it: to the
+    smallest of the runner's ``num_batched_tokens_buckets`` that holds it
+    (``_calculate_padded_count``), which is the last bucket, ``max_model_len``.
+    ``test_mtp_e2e_spec._prefill`` pads to the first bucket, which this prompt does not fit."""
+    buckets = runner.neuron_config.num_batched_tokens_buckets
+    padded = get_bucket_for_count(len(prompt), buckets)
+    assert padded == spec.MAX_MODEL_LEN, (len(prompt), buckets)
+    step = spec._prefill(req, prompt, groups, blocks, finished)
+    step.num_scheduled_tokens_padded = {req: padded}
+    _, output = fr._step(runner, step)
+    return output
 
 
 def _generate_async_to_the_limit(runner, req: str, prompt: list[int], *, finished: set):
@@ -202,12 +262,13 @@ def _generate_async_to_the_limit(runner, req: str, prompt: list[int], *, finishe
     schedules one-row steps, so vLLM's own trim (``num_new = min(1 + k, max_model_len - 1 -
     num_computed)``) never shortens a step. The request is held while no row fits until its
     output lands (vLLM's ``scheduler.py``); the handed count is pulled back one step late as in
-    ``_generate_async``. Returns ``(ids, steps, widths, async steps, sync fallbacks, the
-    indices of the steps the runner counted as fallbacks)``.
+    ``_generate_async``. The prefill is ``_prefill_in_the_last_bucket``'s. Returns ``(ids,
+    steps, widths, async steps, sync fallbacks, the indices of the steps the runner counted
+    as fallbacks)``.
     """
     groups = fr._groups(runner)
     blocks = list(range(spec.FIRST_BLOCK, spec.FIRST_BLOCK + -(-len(prompt) // spec.PAGE)))
-    _, pending = fr._step(runner, spec._prefill(req, prompt, groups, blocks, finished))
+    pending = _prefill_in_the_last_bucket(runner, req, prompt, groups, blocks, finished)
     pending_rows = 1
     handed = len(prompt)
     safe = spec.MAX_MODEL_LEN - 3 - 2 * K
@@ -269,7 +330,7 @@ def test_the_async_drafter_reaches_the_context_limit_with_the_synchronous_drafte
     steps too."""
     e2e._require_cpu_mode()
     fr._declaring_a_sampler(monkeypatch)
-    prompt = spec._prompts()[LIMIT_PROMPT]
+    prompt = _limit_prompt()
     tokens = spec.MAX_MODEL_LEN - len(prompt)  # every position to the last one
     monkeypatch.delenv(proposer_tests.ASYNC_KNOB, raising=False)
     monkeypatch.setenv(spec.KNOB, str(K))
@@ -277,7 +338,9 @@ def test_the_async_drafter_reaches_the_context_limit_with_the_synchronous_drafte
     with fr._parallel_state(tmp_path / "sync", spec._config(K)):
         root, _ = spec._root()
         runner = spec._runner(spec._config(K), root)
-        control, control_steps = spec._generate(runner, "sync-limit", prompt, tokens=tokens, finished=set())
+        control, control_steps = spec._generate(
+            runner, "sync-limit", prompt, tokens=tokens, finished=set(), prefill=_prefill_in_the_last_bucket
+        )
     assert len(control) == tokens
 
     monkeypatch.setenv(proposer_tests.ASYNC_KNOB, "1")
@@ -431,7 +494,7 @@ def test_every_decode_step_to_the_limit_runs_in_a_graph_the_warmup_compiled(tmp_
     form of a target."""
     e2e._require_cpu_mode()
     fr._declaring_a_sampler(monkeypatch)
-    prompt = spec._prompts()[LIMIT_PROMPT]
+    prompt = _limit_prompt()
     tokens = spec.MAX_MODEL_LEN - len(prompt)
     monkeypatch.delenv(proposer_tests.ASYNC_KNOB, raising=False)
     monkeypatch.setenv(spec.KNOB, str(K))
@@ -441,7 +504,9 @@ def test_every_decode_step_to_the_limit_runs_in_a_graph_the_warmup_compiled(tmp_
         runner = spec._runner(spec._config(K), root)
         warmed = _warmup_signatures(runner)
         recorded = _recording_every_model_call(runner, monkeypatch)
-        ids, _ = spec._generate(runner, "sync-limit", prompt, tokens=tokens, finished=set())
+        ids, _ = spec._generate(
+            runner, "sync-limit", prompt, tokens=tokens, finished=set(), prefill=_prefill_in_the_last_bucket
+        )
     assert len(ids) == tokens
     _assert_every_decode_call_is_warmed("synchronous", recorded, warmed)
 
