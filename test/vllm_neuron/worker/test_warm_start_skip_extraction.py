@@ -333,6 +333,13 @@ def _package(worker, monkeypatch):
     monkeypatch.setattr(neuron_worker, "_warm_start_package_digest", lambda: "0" * 64)
 
 
+def _versions(worker, monkeypatch):
+    versions = neuron_worker._warm_start_versions()
+    monkeypatch.setattr(
+        neuron_worker, "_warm_start_versions", lambda: {**versions, "torch": "0.0.0"}
+    )
+
+
 def _parallel(worker, monkeypatch):
     worker.vllm_config.parallel_config.compute_hash = lambda: "parallel-hash-tp32"
 
@@ -353,6 +360,7 @@ def _hf_config(worker, monkeypatch):
     "change, component",
     [
         (_package, "package"),
+        (_versions, "versions:torch"),
         (_set_env("VLLM_NEURON_GLUE_FUSED", "0"), "env:VLLM_NEURON_GLUE_FUSED"),
         (_scheduler, "scheduler"),
         (_compile_options, "compile_options"),
@@ -364,6 +372,7 @@ def _hf_config(worker, monkeypatch):
     ],
     ids=[
         "package",
+        "versions",
         "env",
         "scheduler",
         "compile-options",
@@ -408,11 +417,19 @@ def test_a_manifest_whose_identity_does_not_match_its_name_is_refused(starts):
     [
         _set_env("NEURON_RT_VISIBLE_CORES", "17"),
         _set_env("NEURON_RT_ROOT_COMM_ID", "10.0.0.1:62182"),
+        _set_env("NEURON_PJRT_PROCESS_INDEX", "5"),
+        _set_env("NEURON_VISIBLE_DEVICES", "4-7"),
+        _set_env("VLLM_PORT", "18200"),
+        _set_env("VLLM_HOST_IP", "10.0.0.2"),
+        _set_env("VLLM_RPC_BASE_PATH", "/tmp/rpc-2"),
+        _set_env("VLLM_CACHE_ROOT", "/tmp/vllm-cache-2"),
         _set_env("VLLM_NEURON_NEFF_LOAD_RUN", "run-2"),
         _set_env("VLLM_NEURON_NEFF_LOAD_SIGNAL_DIR", "/runs/2/neff_load"),
         _set_env("VLLM_DP_MASTER_PORT", "40123"),
         _set_env("NEURON_LIBTORCH_COMPILATION_TIMEOUT", "1200"),
         _set_env("VLLM_NEURON_DISABLE_PARALLEL_TRACE", "1"),
+        _set_env("VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME", "VLLM_OBJECT_STORAGE_SHM_BUFFER_2"),
+        _set_env("XLA_FNTRACKER_FILE", "/tmp/tmp2.ptxla"),
         lambda worker, monkeypatch: worker.vllm_config.additional_config.update(
             neuron_profiler={"output_dir": "/runs/2/nrt_profile"}
         ),
@@ -420,11 +437,19 @@ def test_a_manifest_whose_identity_does_not_match_its_name_is_refused(starts):
     ids=[
         "visible-cores",
         "root-comm-id",
+        "pjrt-process-index",
+        "visible-devices",
+        "vllm-port",
+        "host-ip",
+        "rpc-base-path",
+        "vllm-cache-root",
         "neff-load-run",
         "neff-load-signal-dir",
         "dp-port",
         "compile-timeout",
         "parallel-trace",
+        "shm-buffer-name",
+        "xla-fn-tracker-file",
         "profiler-output-dir",
     ],
 )
@@ -434,6 +459,38 @@ def test_a_per_run_value_keeps_the_root_warm(starts, monkeypatch, per_run):
 
     second = starts.run(edit=lambda worker: per_run(worker, monkeypatch))
 
+    assert second.events == WARM
+
+
+def test_the_env_a_vllm_worker_process_caches_keeps_the_root_warm(starts, monkeypatch):
+    """vLLM's worker process caches its env before the warm-up. That reads every
+    vLLM variable, and some of them set a new per-process value when unset; each
+    start here does the same on the env it started with, as a new process would."""
+    from vllm import envs as vllm_envs
+
+    monkeypatch.delenv("VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME", raising=False)
+    set_by_vllm = []
+
+    def start_as_a_worker_process():
+        before = dict(os.environ)
+        vllm_envs.disable_envs_cache()
+        vllm_envs.enable_envs_cache()
+        try:
+            set_by_vllm.append({k: v for k, v in os.environ.items() if before.get(k) != v})
+            return starts.run()
+        finally:
+            vllm_envs.disable_envs_cache()
+            for name in set(os.environ) - set(before):
+                del os.environ[name]
+            os.environ.update(before)
+
+    start_as_a_worker_process()
+    second = start_as_a_worker_process()
+
+    # The two starts saw different per-process values, as two processes do.
+    first_set, second_set = set_by_vllm
+    assert first_set and first_set.keys() == second_set.keys()
+    assert any(first_set[name] != second_set[name] for name in first_set)
     assert second.events == WARM
 
 

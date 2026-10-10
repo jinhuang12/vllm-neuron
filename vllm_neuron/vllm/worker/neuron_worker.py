@@ -565,6 +565,10 @@ _IDENTITY_ENV_IGNORED = frozenset(
         "VLLM_HOST_IP",
         "VLLM_PORT",
         "VLLM_RPC_BASE_PATH",
+        # Set per process, before the warm-up, when unset: vLLM names a shared memory
+        # buffer with a new uuid, and torch-xla names a trace file with PT_XLA_DEBUG.
+        "VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME",
+        "XLA_FNTRACKER_FILE",
     }
 )
 _IDENTITY_ENV_IGNORED_PREFIXES = (
@@ -709,6 +713,30 @@ def _read_warm_start_manifest(path: str) -> tuple[dict | None, str]:
 @dataclass
 class _WarmStart:
     """One start's warm-start decision, and the cache lookups made under it.
+
+    Without the skip, every graph is traced twice at start-up: graph extraction
+    traces it and writes its HLO, the parallel compile turns new HLOs into NEFFs,
+    and the graph's warm-up traces it again and loads the NEFF. On a warm compile
+    cache, extraction, its two barriers and the parallel compile find nothing to do.
+
+    The test for "warm" traces nothing. After a start whose extraction ran and whose
+    warm-ups all succeeded, local rank 0 of each node writes a manifest to
+    ``<cache root>/neuron/warm_start/<identity>.json``, beside the ``compile_cache``
+    directory. It names the cache key of every graph the start looked up, and the
+    start's identity (``NeuronWorker._warm_start_identity``): the package files, the
+    library versions, vLLM's config hashes, the scheduler limits, the HF model config,
+    ``additional_config`` less the profiler's output directory, the compile options,
+    the compile targets, the KV cache shape and the env that can change a graph. A
+    later start skips extraction only when the manifest of its own identity is well
+    formed and names complete entries only, and when every rank of the TP group finds
+    the same (one summed vote). The kernel digest that the cache keys fold in is
+    read from package files, so a change to it is a new identity: a cold start.
+
+    If a skipped start's warm-up still misses the cache, the graph compiles in place
+    as it would without the skip, and the manifest is removed, so the next start runs
+    the full pass. Nothing here sets ``NEURON_LIBTORCH_ASSERT_CACHE_HIT``. The
+    completeness test (``cache._is_cache_complete``) and the lookup wrapper around
+    ``cache.get_local`` are the only hooks the compile cache library offers for this.
 
     ``active`` is False when the start is not one the check covers: it then records
     nothing and writes nothing. ``skip`` is True only when every rank of the TP
