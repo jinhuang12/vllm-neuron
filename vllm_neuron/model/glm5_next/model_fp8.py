@@ -5947,12 +5947,21 @@ class Glm5NextDSAIndexer(nn.Module):
                 f"seq_lens must be a [{total}] tensor, one causal length per row "
                 f"({batch} request(s) x {rows} row(s), request-major); got {seq_lens!r}"
             )
-        # Row b * rows + t sits at position[b] + t. O(B * T) index bookkeeping, no
-        # kernel.
-        offsets = torch.arange(rows, device=position.device, dtype=torch.int64)
-        row_positions = (position.to(torch.int64)[:, None] + offsets[None, :]).reshape(-1)
+        # Row b * rows + t sits at position[b] + t and writes through slots[b]: O(B * T)
+        # index bookkeeping, no kernel. At one row per request the rows are the
+        # requests, so the row positions are position and the row slots are slots; that
+        # step takes both as they are rather than trace, per layer, an arange and a
+        # repeat_interleave that compute the identity.
+        if rows == 1:
+            row_positions = position
+        else:
+            offsets = torch.arange(rows, device=position.device, dtype=torch.int64)
+            row_positions = (
+                position.to(torch.int64)[:, None] + offsets[None, :]
+            ).reshape(-1)
         if values_are_readable(position) and values_are_readable(seq_lens):
-            if not torch.equal(row_positions + 1, seq_lens.to(torch.int64)):
+            if not torch.equal(row_positions.to(torch.int64) + 1,
+                               seq_lens.to(torch.int64)):
                 raise Glm5NextDSAIndexerError(
                     f"seq_lens[b * rows + t] must be position[b] + t + 1 (position must "
                     f"be seq_lens - 1 at one token per request); got position "
@@ -5989,8 +5998,8 @@ class Glm5NextDSAIndexer(nn.Module):
                 tail_bank, slots, key, gate_score, ape.to(torch.float32), position
             )
         slot_index, row = decode_pool_destinations(
-            slots.repeat_interleave(rows), row_positions, rows=int(pool_bank.shape[1]),
-            pool_size=pool,
+            slots if rows == 1 else slots.repeat_interleave(rows), row_positions,
+            rows=int(pool_bank.shape[1]), pool_size=pool,
         )
         bounded = None
         if selects:
