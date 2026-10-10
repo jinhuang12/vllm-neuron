@@ -160,7 +160,12 @@ def _plain_references(tmp_path, prompts: dict[int, list[int]], *, tokens: int) -
     return references
 
 
-def test_the_async_drafters_greedy_output_is_the_synchronous_drafters(tmp_path, monkeypatch):
+def _serve_both_drafters(tmp_path, monkeypatch, *, draft_tokens=None):
+    """Serve :data:`IDENTITY_PROMPTS` plain, then with the synchronous drafter, then with the
+    async one, each on one runner, and check the async run's ids, steps and input path against
+    the synchronous run's. ``draft_tokens`` replaces the draft head's own drafts (the root's
+    ``mtp.draft_tokens``) on both drafters. Returns the plain ids per prompt and, per prompt,
+    ``(prompt, the synchronous drafter's decode steps, the async drafter's)``."""
     e2e._require_cpu_mode()
     fr._declaring_a_sampler(monkeypatch)
     every_prompt = spec._prompts()
@@ -177,6 +182,8 @@ def test_the_async_drafters_greedy_output_is_the_synchronous_drafters(tmp_path, 
     with fr._parallel_state(tmp_path / "sync", sync_config):
         root, _ = spec._root()
         runner = spec._runner(sync_config, root)
+        if draft_tokens is not None:
+            monkeypatch.setattr(root.mtp, "draft_tokens", draft_tokens)
         assert runner.drafter.async_steps is False
         finished: set = set()
         for i, prompt in prompts.items():
@@ -195,6 +202,8 @@ def test_the_async_drafters_greedy_output_is_the_synchronous_drafters(tmp_path, 
     with fr._parallel_state(tmp_path / "async", async_config):
         root, _ = spec._root()
         runner = spec._runner(async_config, root)
+        if draft_tokens is not None:
+            monkeypatch.setattr(root.mtp, "draft_tokens", draft_tokens)
         assert runner.use_async_scheduling and runner.drafter.async_steps is True
         finished = set()
         counts: list[tuple[int, int, int]] = []
@@ -214,9 +223,37 @@ def test_the_async_drafters_greedy_output_is_the_synchronous_drafters(tmp_path, 
             # prefill's take carries the placeholders).
             assert fallbacks == 0, (i, async_steps, fallbacks)
             assert async_steps == steps, (i, async_steps, steps)
+    return references, counts
+
+
+def test_the_async_drafters_greedy_output_is_the_synchronous_drafters(tmp_path, monkeypatch):
+    _, counts = _serve_both_drafters(tmp_path, monkeypatch)
     # Per prompt: (prompt, the synchronous drafter's decode steps, the async drafter's);
     # ``IDENTITY_TOKENS - 1`` synchronous steps means no draft was accepted on that prompt.
     print("identity steps (prompt, sync, async):", counts)
+
+
+def _drafting_the_token_it_is_handed(hidden_rows, sampled_ids, positions, k, **kwargs):
+    """A draft head that drafts the token it is handed, ``k`` times."""
+    return sampled_ids.reshape(-1, 1).to(torch.int32).expand(-1, int(k)).contiguous()
+
+
+def test_the_async_drafter_keeps_every_draft_the_synchronous_drafter_keeps(tmp_path, monkeypatch):
+    """The accept path. The tiny head's own drafts are all rejected (the test above), so here
+    the head drafts the token it is handed. The tiny trunk's greedy run repeats one token, so
+    each such draft is the trunk's next token and is kept: every verify step after the first
+    keeps all ``k`` drafts and the bonus (the first carries the prefill's placeholders). The
+    async drafter keeps the same rows per step, on its device path throughout."""
+    references, counts = _serve_both_drafters(
+        tmp_path, monkeypatch, draft_tokens=_drafting_the_token_it_is_handed
+    )
+    assert all(len(set(ids)) == 1 for ids in references.values()), (
+        f"the plain runs {references} do not repeat one token; drafting the handed token "
+        f"is the accept path only on a trunk that repeats it"
+    )
+    accepting = 1 + -(-(IDENTITY_TOKENS - 2) // T)
+    assert all(sync_steps == accepting for _, sync_steps, _ in counts), (counts, accepting)
+    print("accept steps (prompt, sync, async):", counts)
 
 
 # ── the context limit: the served scheduler ends a request in one-row steps ─────
