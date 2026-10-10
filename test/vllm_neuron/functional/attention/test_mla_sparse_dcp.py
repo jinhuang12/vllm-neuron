@@ -936,6 +936,44 @@ def test_with_owned_step_rows_the_sparse_partials_merge_to_the_cp1_overlaid_outp
     assert bool((err <= tol).all()), f"max err/tol {float((err / tol.clamp_min(1e-300)).max()):.3g}"
 
 
+@pytest.mark.parametrize("cp", (2, 4))
+def test_the_whole_step_on_every_rank_misses_the_cp1_overlaid_output_where_it_fits(cp):
+    """The negative control of the overlay contract, sparse, untiled K 256: every rank passes
+    the whole 136-row step at ``own_c(636)`` (the every-row reading), not its owned rows.
+
+    At CP 2 and 4 the whole step fits every rank's window, so no seam refuses it. A rank's
+    overlay then puts other ranks' step rows on its own window rows: those key rows count
+    on two ranks, and the rows they overwrite count on none. The merge misses the CP 1
+    output by more than the merge tolerance, which the owned rows of the same step meet.
+    """
+    q, bank, table, written, idx = overlay_case(cp, 256, seed=260 + cp)
+    scale = scale_of(LATENT)
+    full = MS.mla_sparse_attention_partial(
+        q, bank, idx, scale, block_table_row=table, written=written,
+        write_offset=torch.tensor([[OVERLAY_START]], dtype=torch.int32), page_size=DCP_BLOCK)[0]
+    runs, live = {"owned": [], "whole": []}, []
+    for rank in range(cp):
+        cols, mine = local_columns(idx, cp, rank), rank_table(table, cp, rank)
+        at = own_c(OVERLAY_START, cp, rank)
+        assert at + OVERLAY_TOKENS <= mine.shape[0] * DCP_BLOCK
+        overlays = {"owned": owned_step(written, OVERLAY_START, cp, rank),
+                    "whole": dict(written=written,
+                                  write_offset=torch.tensor([[at]], dtype=torch.int32))}
+        for name, overlay in overlays.items():
+            runs[name].append(MS.mla_sparse_attention_partial(
+                q, bank, cols, scale, block_table_row=mine, page_size=DCP_BLOCK, **overlay))
+        live.append((owned(idx, cp, rank) >= 0).any(dim=1).unsqueeze(0).expand(q.shape[1], -1))
+    window = window_of(patched_bank(bank, table, OVERLAY_START, written), table)
+    tol = merged_tolerance(body_bounds(q, window, idx, scale, tiles_of(256)),
+                           [body_bounds(q, window, owned(idx, cp, r), scale, tiles_of(256))
+                            for r in range(cp)], torch.stack(live))
+    over = {name: float(((merge64(torch.stack([p for p, _ in got]),
+                                  torch.stack([lse for _, lse in got])) - full.double()).abs()
+                         / tol.clamp_min(1e-300)).max()) for name, got in runs.items()}
+    assert over["owned"] <= 1.0, f"the owned rows: max err/tol {over['owned']:.3g}"
+    assert over["whole"] > 1.0, f"the whole step met the tolerance: max err/tol {over['whole']:.3g}"
+
+
 @pytest.mark.parametrize("cp", (2, 4, 8))
 def test_with_owned_step_rows_the_dense_window_partials_merge_to_the_cp1_overlaid_output(cp):
     """The DCP overlay contract, dense window: a 150-query chunk at tokens 600 .. 749 over 6
