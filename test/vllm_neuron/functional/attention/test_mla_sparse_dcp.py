@@ -24,6 +24,12 @@ blocks in order, so a query's causal set is a prefix of that window, ``own_c(seq
 long, and 0 rows for a non-owner rank in a request's first block. Its tests are in the last
 section and hold it to the same contract and the same derived bounds, with the term its MM2
 adds (a bf16 hi/lo split of the weights).
+
+Under DCP each rank passes in ``written`` only its owned rows of the step, compacted, at
+``write_offset = own_c`` of the step's first token; the kernels do not mask the overlay. The
+overlay section holds both kernels to that contract at CP 2/4/8: a rank's partial is that of
+its window once the step's write has landed, bit for bit, and the merged partials are the
+CP = 1 overlaid output within the merge tolerance.
 """
 
 from __future__ import annotations
@@ -624,17 +630,24 @@ def dense_bounds(q, window, lens) -> BodyBounds:
                        split=True)
 
 
-def dense_ranks(q, bank, table, lens, cp):
-    """Every rank's dense ``(partial, lse)``, its window and owned lengths, and [CP, Hq, S] live."""
+def dense_ranks(q, bank, table, lens, cp, written=None, start=0):
+    """Every rank's dense ``(partial, lse)``, its window and owned lengths, and [CP, Hq, S] live.
+
+    With ``written``, the step's rows at tokens ``start ..``, each rank passes its owned rows
+    of the step (:func:`owned_step`), and its window is read from the bank once the step's
+    write has landed.
+    """
     partials, lses, windows, owns, live = [], [], [], [], []
+    landed = bank if written is None else patched_bank(bank, table, start, written)
     for rank in range(cp):
         mine = rank_table(table, cp, rank)
         own = own_lens(lens, cp, rank, table.shape[0])
+        step = {} if written is None else owned_step(written, start, cp, rank)
         partial, lse = DW.mla_dense_window_attention_partial(q, bank, own, scale_of(LATENT),
-                                                             mine, page_size=DCP_BLOCK)
+                                                             mine, page_size=DCP_BLOCK, **step)
         partials.append(partial)
         lses.append(lse)
-        windows.append(window_of(bank, mine))
+        windows.append(window_of(landed, mine))
         owns.append(own)
         live.append((own > 0).unsqueeze(0).expand(q.shape[1], -1))
     return torch.stack(partials), torch.stack(lses), windows, owns, torch.stack(live)
@@ -803,6 +816,180 @@ def test_the_dense_window_partial_seam_refuses_a_malformed_length_by_name(named)
     with pytest.raises(DW.MlaDenseWindowError, match=match):
         DW.mla_dense_window_attention_partial(q, bank, lens, scale_of(LATENT), table,
                                               page_size=DCP_BLOCK)
+
+
+# --------------------------------------------------------------------------- #
+# The step's overlay under DCP: each rank passes its owned rows of the step only
+# --------------------------------------------------------------------------- #
+#: Bank pages of the sparse overlay cases.
+OVERLAY_BANK_PAGES = 40
+#: Blocks of the sparse overlay cases' request: 2048 tokens.
+OVERLAY_BLOCKS = 16
+#: The sparse overlay cases' step: 136 rows at tokens 636 .. 771, that is the last 4 rows of
+#: block 4, all of block 5 and the first 4 of block 6. At CP 2 rank 0 owns two runs of the
+#: step (blocks 4 and 6), which are one run of its window; at CP 4 rank 3 owns none.
+OVERLAY_START, OVERLAY_TOKENS = 636, 136
+
+
+def own_c(position: int, cp: int, rank: int) -> int:
+    """Rank ``rank``'s owned tokens before ``position``: an owned position's window row."""
+    blocks = torch.div(torch.arange(position), DCP_BLOCK, rounding_mode="floor")
+    return int((blocks % cp == rank).sum())
+
+
+def owned_step(written: torch.Tensor, start: int, cp: int, rank: int) -> dict:
+    """The overlay rank ``rank`` passes for a step at tokens ``start ..`` (the DCP contract):
+    its owned rows of the step, compacted in window order, at ``write_offset = own_c(start)``.
+    A rank that owns no row of the step passes none."""
+    pos = torch.arange(start, start + written.shape[0])
+    mine = torch.div(pos, DCP_BLOCK, rounding_mode="floor") % cp == rank
+    offset = torch.tensor([[own_c(start, cp, rank)]], dtype=torch.int32)
+    return dict(written=written[mine].contiguous(), write_offset=offset)
+
+
+def patched_bank(bank: torch.Tensor, table: torch.Tensor, start: int,
+                 written: torch.Tensor) -> torch.Tensor:
+    """``bank`` once the step's own write has landed: each row at its token's page."""
+    out = bank.clone()
+    pos = torch.arange(start, start + written.shape[0])
+    page = table[:, 0].long()[torch.div(pos, DCP_BLOCK, rounding_mode="floor")]
+    out[page * DCP_BLOCK + pos % DCP_BLOCK] = written
+    return out
+
+
+def local_columns(idx: torch.Tensor, cp: int, rank: int) -> torch.Tensor:
+    """Token columns as rank ``rank``'s window rows: an owned token's ``own_c``, else -1."""
+    block = torch.div(idx, DCP_BLOCK, rounding_mode="floor")
+    local = torch.div(block, cp, rounding_mode="floor") * DCP_BLOCK + idx % DCP_BLOCK
+    keep = (idx >= 0) & (block % cp == rank)
+    return torch.where(keep, local, torch.full_like(local, MS.SENTINEL_INDEX)).to(torch.int32)
+
+
+def overlay_case(hq: int, topk: int, seed: int):
+    """``(q [4, hq, L], bank, table [OVERLAY_BLOCKS, 1], written, idx [4, topk])``.
+
+    ``written`` is the step's fresh rows; the bank holds stale rows at their tokens. Each
+    query's ``topk`` distinct token columns hold every token of the step, the first token of
+    every block (so row 0 of every rank's window) and random others.
+    """
+    gen = torch.Generator().manual_seed(seed)
+    q = (torch.randn(4, hq, LATENT, generator=gen) * 2.0).to(torch.bfloat16)
+    bank = torch.randn(OVERLAY_BANK_PAGES * DCP_BLOCK, LATENT, generator=gen).to(torch.bfloat16)
+    table = torch.randperm(OVERLAY_BANK_PAGES, generator=gen)[:OVERLAY_BLOCKS]
+    written = torch.randn(OVERLAY_TOKENS, LATENT, generator=gen).to(torch.bfloat16)
+    tokens = OVERLAY_BLOCKS * DCP_BLOCK
+    always = torch.unique(torch.cat([torch.arange(OVERLAY_START, OVERLAY_START + OVERLAY_TOKENS),
+                                     torch.arange(0, tokens, DCP_BLOCK)]))
+    rest = torch.ones(tokens, dtype=torch.bool)
+    rest[always] = False
+    others = torch.arange(tokens)[rest]
+    idx = []
+    for _ in range(4):
+        pick = others[torch.randperm(others.numel(), generator=gen)[:topk - always.numel()]]
+        cols = torch.cat([always, pick])
+        idx.append(cols[torch.randperm(topk, generator=gen)])
+    return q, bank, table.to(torch.int32).unsqueeze(1), written, torch.stack(idx).to(torch.int32)
+
+
+def dense_step(seed: int, tokens: int) -> torch.Tensor:
+    """The step's fresh latent rows."""
+    gen = torch.Generator().manual_seed(seed)
+    return torch.randn(tokens, LATENT, generator=gen).to(torch.bfloat16)
+
+
+@pytest.mark.parametrize("cp", (2, 4, 8))
+@pytest.mark.parametrize("topk", (256, 640), ids=("untiled", "row_tiled"))
+def test_with_owned_step_rows_the_sparse_partials_merge_to_the_cp1_overlaid_output(topk, cp):
+    """The DCP overlay contract, sparse: each rank passes only its owned rows of the step,
+    compacted, at ``own_c`` of the step's first token; CP 1 passes the whole step.
+
+    Each rank's partial is, bit for bit, the partial of its window once the step's write has
+    landed, and the float64 merge is the CP = 1 overlaid partial within the merge tolerance,
+    so each key row of the step counts once. Every query selects every token of the step and
+    row 0 of every window. At CP 4 rank 3 owns no row of the step and passes none.
+    """
+    q, bank, table, written, idx = overlay_case(cp, topk, seed=230 + cp + topk)
+    scale = scale_of(LATENT)
+    landed = patched_bank(bank, table, OVERLAY_START, written)
+    full = MS.mla_sparse_attention_partial(
+        q, bank, idx, scale, block_table_row=table, written=written,
+        write_offset=torch.tensor([[OVERLAY_START]], dtype=torch.int32), page_size=DCP_BLOCK)[0]
+    partials, lses, live = [], [], []
+    for rank in range(cp):
+        cols, mine = local_columns(idx, cp, rank), rank_table(table, cp, rank)
+        got = MS.mla_sparse_attention_partial(q, bank, cols, scale, block_table_row=mine,
+                                              page_size=DCP_BLOCK,
+                                              **owned_step(written, OVERLAY_START, cp, rank))
+        want = MS.mla_sparse_attention_partial(q, landed, cols, scale, block_table_row=mine,
+                                               page_size=DCP_BLOCK)
+        torch.testing.assert_close(got[0], want[0], rtol=0.0, atol=0.0)
+        torch.testing.assert_close(got[1], want[1], rtol=0.0, atol=0.0)
+        partials.append(got[0])
+        lses.append(got[1])
+        live.append((owned(idx, cp, rank) >= 0).any(dim=1).unsqueeze(0).expand(q.shape[1], -1))
+    window = window_of(landed, table)
+    tiles = tiles_of(topk)
+    tol = merged_tolerance(body_bounds(q, window, idx, scale, tiles),
+                           [body_bounds(q, window, owned(idx, cp, r), scale, tiles)
+                            for r in range(cp)], torch.stack(live))
+    err = (merge64(torch.stack(partials), torch.stack(lses)) - full.double()).abs()
+    assert bool((err <= tol).all()), f"max err/tol {float((err / tol.clamp_min(1e-300)).max()):.3g}"
+
+
+@pytest.mark.parametrize("cp", (2, 4, 8))
+def test_with_owned_step_rows_the_dense_window_partials_merge_to_the_cp1_overlaid_output(cp):
+    """The DCP overlay contract, dense window: a 150-query chunk at tokens 600 .. 749 over 6
+    blocks, its own rows the step's overlay. Each rank passes only its owned rows of the step,
+    compacted, at ``own_c(600)``; CP 1 passes the whole step at 600.
+
+    Each rank's partial is, bit for bit, that of its window once the step's write has landed,
+    and the float64 merge is the CP = 1 overlaid partial within the merge tolerance, so each
+    key row of the chunk counts once. The chunk is blocks 4 and 5: at CP 8 six ranks own none
+    of its rows, and ranks 6 and 7 no block at all.
+    """
+    q, bank, table, lens = dense_case(150, 600, 6, cp, seed=240 + cp)
+    written = dense_step(241 + cp, 150)
+    landed = patched_bank(bank, table, 600, written)
+    partials, lses, windows, owns, live = dense_ranks(q, bank, table, lens, cp, written, 600)
+    for rank in range(cp):
+        want = DW.mla_dense_window_attention_partial(q, landed, owns[rank], scale_of(LATENT),
+                                                     rank_table(table, cp, rank),
+                                                     page_size=DCP_BLOCK)
+        torch.testing.assert_close(partials[rank], want[0], rtol=0.0, atol=0.0)
+        torch.testing.assert_close(lses[rank], want[1], rtol=0.0, atol=0.0)
+    full = DW.mla_dense_window_attention_partial(
+        q, bank, lens, scale_of(LATENT), table, written=written,
+        write_offset=torch.tensor([[600]], dtype=torch.int32), page_size=DCP_BLOCK)[0]
+    tol = merged_tolerance(dense_bounds(q, window_of(landed, table), lens),
+                           [dense_bounds(q, w, n) for w, n in zip(windows, owns)], live)
+    err = (merge64(partials, lses) - full.double()).abs()
+    assert bool((err <= tol).all()), f"max err/tol {float((err / tol).max()):.3g}"
+
+
+@pytest.mark.parametrize("seam", ("sparse", "dense"))
+def test_a_partial_seam_names_the_owned_rows_contract_when_a_whole_step_overruns_the_window(
+        seam):
+    """Rank 0 of CP 2 handed the whole 150-row step at ``own_c(600) = 344`` instead of its
+    40 owned rows: 494 rows past its 384-row window, refused with the contract in the text."""
+    q, bank, table, lens = dense_case(150, 600, 6, 2, seed=250)
+    mine, written = rank_table(table, 2, 0), dense_step(251, 150)
+    at = torch.tensor([[own_c(600, 2, 0)]], dtype=torch.int32)
+    assert int(at) == 344 and int(owned_step(written, 600, 2, 0)["written"].shape[0]) == 40
+    match = "only this rank's owned rows of the step"
+    if seam == "sparse":
+        gen = torch.Generator().manual_seed(252)
+        idx = torch.stack([torch.randperm(3 * DCP_BLOCK, generator=gen)[:128] for _ in range(4)])
+        with pytest.raises(MS.MlaSparseAttentionError, match=match):
+            MS.mla_sparse_attention_partial(q[:4, :2], bank, idx.to(torch.int32),
+                                            scale_of(LATENT), block_table_row=mine,
+                                            written=written, write_offset=at,
+                                            page_size=DCP_BLOCK)
+    else:
+        own = own_lens(lens, 2, 0, 6)
+        with pytest.raises(DW.MlaDenseWindowError, match=match):
+            DW.mla_dense_window_attention_partial(q, bank, own, scale_of(LATENT), mine,
+                                                  written=written, write_offset=at,
+                                                  page_size=DCP_BLOCK)
 
 
 def _dense_child(rows: int, hq: int, pages: int, active: int) -> None:

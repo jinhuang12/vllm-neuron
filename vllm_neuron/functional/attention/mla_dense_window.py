@@ -684,8 +684,18 @@ def mla_dense_window_attention_partial(q_lift: Tensor, c_kv: Tensor, owned_lens:
             (its owned 128-token blocks in order): ``own_c(n) = sum over blocks b with
             b % CP == c of min(128, max(0, n - 128 b))`` for global causal length n. 0 is
             allowed: a non-owner rank in a request's first block sees no row.
-        softmax_scale, block_table_row, written, write_offset, page_size: as
-            :func:`mla_dense_window_attention`; the table names this rank's own pages.
+        softmax_scale, block_table_row, page_size: as :func:`mla_dense_window_attention`;
+            the table names this rank's own pages.
+        written: ``[T, L]`` only this rank's owned rows of the step, compacted in window
+            order; at CP 1 the whole step. Under DCP each chunk key row is attended on
+            exactly one rank: its owner, ``(position // 128) % CP``. The owned rows of a
+            contiguous step are one contiguous run of the window, and the kernel does not
+            mask the overlay: a row of another rank's in ``written`` is attended here. T is
+            ``n / CP`` at every step start when ``128 * CP`` divides the step's n rows;
+            otherwise it varies, and pad rows of a static T need window rows too.
+        write_offset: ``[1, 1]`` int32, ``own_c`` of the first owned position: the window
+            row of ``written[0]``. ``write_offset + T`` must stay inside the window
+            (refused eagerly, unchecked in a traced graph).
         active_rows: a trace-time int in ``1 .. S``, or None for ``S``: queries from it on
             come back as 0 with lse EMPTY_LSE, and their ``owned_lens`` are not read.
 

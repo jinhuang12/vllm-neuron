@@ -2101,7 +2101,11 @@ def _require_paged(c_kv: Tensor, block_table_row: Tensor, written: Tensor | None
             if at < 0 or at + tokens > window:
                 raise MlaSparseAttentionError(
                     f"this step's {tokens} written rows must land inside the window; got "
-                    f"write_offset={at} against a window of {window}"
+                    f"write_offset={at} against a window of {window}. Under decode context "
+                    f"parallelism written holds only this rank's owned rows of the step, "
+                    f"compacted in window order, from write_offset = own_c(first owned "
+                    f"position). The whole step passed on every rank is refused here only "
+                    f"when it overruns the window"
                 )
     return window
 
@@ -2342,7 +2346,18 @@ def mla_sparse_attention_partial(q_lift: Tensor, c_kv: Tensor, topk_indices: Ten
 
     The arguments are :func:`mla_sparse_attention`'s. ``q_lift`` carries every head of the
     CP group, ``[S, Hq, L]`` with ``Hq = CP * H``, and ``topk_indices`` this rank's columns
-    only: a column another rank owns is :data:`SENTINEL_INDEX`.
+    only, as rows of its window: a column another rank owns is :data:`SENTINEL_INDEX`.
+
+    Under DCP each chunk key row is attended on exactly one rank: its owner,
+    ``(position // 128) % CP``. So ``written`` holds only this rank's owned rows of the
+    step, compacted in window order, and ``write_offset`` is ``own_c`` of the first owned
+    position, its row in this rank's window; at CP 1 ``written`` is the whole step. The
+    owned rows of a contiguous step are one contiguous run of the window, so one offset
+    places them all. The kernel does not mask the overlay: a row of another rank's in
+    ``written`` is attended here. The owned count T is ``n / CP`` at every step start when
+    ``128 * CP`` divides the step's n rows; otherwise it varies with the start, and a
+    caller that pads ``written`` to a static T needs window rows for the pad rows too
+    (``write_offset + T`` inside the window: refused eagerly, unchecked in a traced graph).
 
     Returns:
         ``(partial, lse)``. ``partial`` ``[Hq, S, L]`` float32: the attention normalised

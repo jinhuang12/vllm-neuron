@@ -46,6 +46,18 @@ trace time from ``program_id`` (at an odd tile count the first program takes one
 more). Its compiled programs hold no barrier and no branch instruction on either core at
 CP 2, 4 and 8, so neither core waits on the other. The script catches no exception: an
 execution error the runtime raises ends the run before the next case.
+
+DEPENDENCY CHECK (``reports/dcp_item4.md`` sections 10 and 13): the merge at its served
+shapes (R 2048, CP 2, 4 and 8) is CLEAN, one-pass and loop-carried, on both cores, with 0
+unsynchronized and 0 queue-order-only pairs. The served sparse partial launches (R 1024 and
+2048, 18 dumps) were not checked: checker 785b879 is infeasible there (at least 21.8 h per
+dump). Stand-ins of the same launch at R 128 (Hq 1, 2, 4, 8) and R 64 (Hq 1) are CLEAN on
+both cores, 0 unsynchronized. They hold 0 to 36 pairs per core that are ordered only if DMAs
+on one queue complete in issue order: write-after-read pairs of the per-query output store
+(``_store_query``, a DMA on qSPIO0 that reads ``out_sb``) against a later SBUF write to bytes
+the allocator reuses. The DCP-off body of the base d92592e has the same class (6 pairs per
+core at R 64, 13 at R 128). So those pairs are safe only if same-queue DMAs complete in issue
+order.
 """
 
 from __future__ import annotations
