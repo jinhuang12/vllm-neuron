@@ -40,7 +40,8 @@ holds a fold's before and after under the same glue switch value; a second such 
   ``router_prefill`` (its RMSNorm scale in XLA).
 
 Each case also records whether each variant's first output is bit-equal to each such
-variant's (``bit_equal_to_route_variants``). The per-op split of a profile is not done
+variant's (``bit_equal_to_route_variants``), and how far apart they are
+(``agreement_vs_route_variants``, ``benchmark_glue_block.agreement``). The per-op split of a profile is not done
 here: give the compile a known working directory (``--work-dir``) and keep the compiler's
 intermediates from it while the graphs compile; the op inventory's tools (graph map, debug
 map, attribution) join a profile's instructions to the HLO ops and NKI calls through them.
@@ -282,6 +283,9 @@ def run_case(case: dict, collectives: str, specs: dict, args) -> dict:
         result = block.run_case(case, collectives, specs, args)
     result["bit_equal_to_route_variants"] = {
         ref: {name: bool(torch.equal(firsts[tags[name]], firsts[tags[ref]])) for name in specs}
+        for ref in routed}
+    result["agreement_vs_route_variants"] = {
+        ref: {name: block.agreement(firsts[tags[name]], firsts[tags[ref]]) for name in specs}
         for ref in routed}
     if case["family"] == "dsa":
         line = SERVED_LINES[case["line"]]
