@@ -197,6 +197,7 @@ For conceptual overview, see [Compilation](features-guide.md#compilation).
 | `NEURON_LIBTORCH_DISABLE_COMPILE_CACHE` | bool | 0 | Disable compilation cache entirely. Forces recompilation on every startup. |
 | `NEURON_LIBTORCH_COMPILATION_TIMEOUT` | int | -- | Timeout in seconds for individual NEFF compilation. |
 | `VLLM_NEURON_DISABLE_WARMUP_COMPILE` | bool | 0 | Treat cache miss as fatal error. Use when all graphs must be pre-compiled. |
+| `VLLM_NEURON_SKIP_EXTRACTION_WHEN_CACHED` | bool | 1 | Skip graph extraction and the parallel compile at startup when the compile cache holds every graph of the start. The proof is the manifest that the last full startup with the same package, versions, configuration and environment wrote under `<cache root>/neuron/warm_start/`, and a complete cache entry for each graph it names. A cold, partial or changed cache runs the full pass, and writes the manifest for the next startup. Set `0` to force the full pass. |
 | `VLLM_CACHE_ROOT` | str | `~/.cache/vllm` | Root directory for vLLM cache storage. |
 
 ### What triggers recompilation

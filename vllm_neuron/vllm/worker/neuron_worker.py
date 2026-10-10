@@ -6,13 +6,16 @@ This provides the main worker class that implements vLLM's WorkerBase interface
 for AWS Neuron/Trainium hardware integration through vLLM Neuron.
 """
 
+import hashlib
+import json
 import logging
 import os
 import math
 import re
 import sys
 import time
-from dataclasses import dataclass
+from contextlib import contextmanager, suppress
+from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -526,6 +529,381 @@ def run_warmup_on_all_ranks(phase: str, bucket: str, work) -> None:
         time.perf_counter() - started,
     )
     _exchange_warmup_status(phase, bucket, "all ranks", failure)
+
+
+# === Warm start: skip graph extraction on a compile cache that holds every graph ===
+# VLLM_NEURON_SKIP_EXTRACTION_WHEN_CACHED (vllm_neuron/envs.py) documents the design.
+
+#: Format of a warm-start manifest. A manifest of another format is refused.
+WARM_START_FORMAT = 1
+#: Directory, beside the compile cache directory, that holds the warm-start manifests.
+WARM_START_DIR = "warm_start"
+#: A compile cache key, which is also the name of its cache entry directory.
+_CACHE_KEY = re.compile(r"[0-9a-f]{16,128}")
+#: Env prefixes whose variables can change a traced graph or its compile.
+_IDENTITY_ENV_PREFIXES = ("VLLM_", "NEURON_", "NKI_", "XLA_")
+#: Variables under those prefixes that change per rank or per run, or that change how
+#: a start runs or waits, but never which graphs it traces.
+_IDENTITY_ENV_IGNORED = frozenset(
+    {
+        "NEURON_LIBTORCH_CACHE_ROOT",  # the root itself: the manifest is under it
+        "VLLM_CACHE_ROOT",
+        "NEURON_VISIBLE_DEVICES",  # per rank
+        "NEURON_LIBTORCH_ASSERT_CACHE_HIT",  # what a miss does, not what is traced
+        "VLLM_NEURON_ASSERT_CACHE_HIT",  # (the library's older name of each)
+        "NEURON_LIBTORCH_COMPILATION_TIMEOUT",
+        "VLLM_NEURON_COMPILATION_TIMEOUT",
+        "NEURON_LIBTORCH_PARALLEL_COMPILE_WORKERS",
+        "VLLM_NEURON_PARALLEL_COMPILE_WORKERS",
+        "NEURON_LIBTORCH_PARALLEL_TRACE_WORKERS",  # how extraction runs
+        "VLLM_NEURON_DISABLE_PARALLEL_TRACE",
+        "VLLM_NEURON_SKIP_EXTRACTION_WHEN_CACHED",
+        "VLLM_NEURON_BARRIER_TIMEOUT",
+        "VLLM_NEURON_WORKER_TERMINATION_TIMEOUT",
+        "VLLM_NEURON_LOG_LEVEL",
+        "VLLM_LOGGING_LEVEL",
+        "VLLM_HOST_IP",
+        "VLLM_PORT",
+        "VLLM_RPC_BASE_PATH",
+    }
+)
+_IDENTITY_ENV_IGNORED_PREFIXES = (
+    "NEURON_RT_",  # the runtime: visible cores, root communicator, logging
+    "NEURON_PJRT_",  # the per-rank process index
+    "VLLM_DP_",  # the data-parallel rank and ports
+    "VLLM_NEURON_NEFF_LOAD_",  # how loads are staged: per-run token, signal directory
+)
+#: The vLLM configs whose hashes enter the identity: the list of
+#: ``VllmConfig.compute_hash``, taken one by one because that hash also takes the
+#: whole ``additional_config``.
+_IDENTITY_CONFIGS = (
+    "model_config",
+    "cache_config",
+    "parallel_config",
+    "scheduler_config",
+    "device_config",
+    "load_config",
+    "offload_config",
+    "attention_config",
+    "lora_config",
+    "speculative_config",
+    "structured_outputs_config",
+    "profiler_config",
+    "observability_config",
+    "compilation_config",
+    "kernel_config",
+    "kv_transfer_config",
+    "ec_transfer_config",
+)
+#: ``additional_config`` keys that name where a run writes, not what it traces.
+_IDENTITY_ADDITIONAL_IGNORED = ("neuron_profiler",)
+#: Distributions whose versions enter the identity.
+_IDENTITY_DISTRIBUTIONS = (
+    "torch",
+    "torch-xla",
+    "libtorch-neuronx-lite",
+    "neuronx-cc",
+    "vllm",
+)
+
+
+def _sha256_json(value: Any) -> str:
+    """sha256 of ``value`` as canonical JSON; a value JSON cannot hold raises."""
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+
+
+def _json_type_name(value: Any) -> str:
+    """A value JSON cannot hold, by its type only (an object's repr is not stable)."""
+    return f"<{type(value).__module__}.{type(value).__qualname__}>"
+
+
+def _warm_start_hf_config(hf_config: Any) -> str | None:
+    """sha256 of the HF model config as loaded, after vLLM's overrides."""
+    if hf_config is None:
+        return None
+    data = hf_config.to_dict() if hasattr(hf_config, "to_dict") else vars(hf_config)
+    text = json.dumps(data, sort_keys=True, default=_json_type_name)
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _warm_start_package_digest() -> str:
+    """sha256 over every file of the ``vllm_neuron`` package: path, size and bytes."""
+    import vllm_neuron
+
+    root = Path(vllm_neuron.__file__).resolve().parent
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*")):
+        rel = path.relative_to(root)
+        if path.is_dir() or "__pycache__" in rel.parts or path.suffix == ".pyc":
+            continue
+        data = path.read_bytes()
+        digest.update(f"{rel.as_posix()}\0{len(data)}\0".encode())
+        digest.update(data)
+    return digest.hexdigest()
+
+
+def _warm_start_versions() -> dict[str, str | None]:
+    from importlib import metadata
+
+    versions: dict[str, str | None] = {}
+    for name in _IDENTITY_DISTRIBUTIONS:
+        try:
+            versions[name] = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            versions[name] = None
+    return versions
+
+
+def _warm_start_env() -> dict[str, str]:
+    """The graph-relevant variables, each value as the first 16 hex of its sha256."""
+    return {
+        name: hashlib.sha256(value.encode()).hexdigest()[:16]
+        for name, value in sorted(os.environ.items())
+        if name.startswith(_IDENTITY_ENV_PREFIXES)
+        and name not in _IDENTITY_ENV_IGNORED
+        and not name.startswith(_IDENTITY_ENV_IGNORED_PREFIXES)
+    }
+
+
+def _identity_differences(stored: dict, current: dict) -> list[str]:
+    """Names of the identity parts that differ, ``part:entry`` inside a mapping."""
+    names = []
+    for part in sorted(set(stored) | set(current)):
+        old, new = stored.get(part), current.get(part)
+        if old == new:
+            continue
+        if isinstance(old, dict) and isinstance(new, dict):
+            names += [
+                f"{part}:{entry}"
+                for entry in sorted(set(old) | set(new))
+                if old.get(entry) != new.get(entry)
+            ]
+        else:
+            names.append(part)
+    return names
+
+
+def _read_warm_start_manifest(path: str) -> tuple[dict | None, str]:
+    """The manifest at ``path``, or None and the defect it is refused for."""
+    with open(path, encoding="utf-8") as manifest:
+        text = manifest.read()
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        return None, f"not JSON ({exc})"
+    if not isinstance(data, dict):
+        return None, f"not a JSON object ({type(data).__name__})"
+    if data.get("format") != WARM_START_FORMAT:
+        return None, f"format {data.get('format')!r}, expected {WARM_START_FORMAT}"
+    if not isinstance(data.get("identity"), dict):
+        return None, "no identity object"
+    keys = data.get("keys")
+    if not isinstance(keys, list) or not keys:
+        return None, "keys is not a non-empty list"
+    for key in keys:
+        if not isinstance(key, str) or not _CACHE_KEY.fullmatch(key):
+            return None, f"key {key!r} is not a compile cache key"
+    return data, ""
+
+
+@dataclass
+class _WarmStart:
+    """One start's warm-start decision, and the cache lookups made under it.
+
+    ``active`` is False when the start is not one the check covers: it then records
+    nothing and writes nothing. ``skip`` is True only when every rank of the TP
+    group found the compile cache warm. ``writer`` marks the one rank per node (local
+    rank 0) that writes the node's manifest.
+    """
+
+    active: bool = False
+    writer: bool = False
+    compile_dir: str = ""
+    manifest_path: str = ""
+    identity: dict | None = None
+    keys: tuple[str, ...] = ()
+    skip: bool = False
+    #: key -> whether a lookup of it found a complete entry
+    looked_up: dict[str, bool] = field(default_factory=dict)
+    other_dirs: set[str] = field(default_factory=set)
+    missed: list[str] = field(default_factory=list)
+
+    def check(self, identity: dict) -> tuple[bool, str]:
+        """Whether this rank finds the cache warm for ``identity``, and why not."""
+        from libtorch_neuronx_lite.compile import cache
+
+        self.identity = identity
+        name = _sha256_json({"format": WARM_START_FORMAT, "identity": identity})[:32]
+        directory = os.path.join(os.path.dirname(self.compile_dir), WARM_START_DIR)
+        self.manifest_path = os.path.join(directory, f"{name}.json")
+        if not os.path.exists(self.manifest_path):
+            return False, self._no_manifest(directory)
+        data, defect = _read_warm_start_manifest(self.manifest_path)
+        if data is None:
+            logger.warning(
+                "Warm start: manifest %s refused: %s", self.manifest_path, defect
+            )
+            return False, f"manifest {self.manifest_path} refused: {defect}"
+        if data["identity"] != identity:
+            changed = ", ".join(_identity_differences(data["identity"], identity))
+            return False, f"stale manifest {self.manifest_path}: differs in {changed}"
+        keys = tuple(data["keys"])
+        incomplete = [
+            key
+            for key in keys
+            if not cache._is_cache_complete(os.path.join(self.compile_dir, key))
+        ]
+        if incomplete:
+            return False, (
+                f"partial root: {len(incomplete)} of {len(keys)} graphs of manifest "
+                f"{self.manifest_path} are incomplete in {self.compile_dir} "
+                f"(first: {incomplete[0]})"
+            )
+        self.keys = keys
+        return True, ""
+
+    def _no_manifest(self, directory: str) -> str:
+        reason = f"no manifest {self.manifest_path} for this start"
+        others = []
+        if os.path.isdir(directory):
+            others = [
+                os.path.join(directory, entry)
+                for entry in os.listdir(directory)
+                if entry.endswith(".json")
+            ]
+        if not others:
+            return reason
+        try:
+            newest = max(others, key=os.path.getmtime)
+            data, _ = _read_warm_start_manifest(newest)
+        except OSError:
+            return reason
+        if data is None:
+            return reason
+        changed = ", ".join(_identity_differences(data["identity"], self.identity))
+        return f"{reason}; the newest manifest {newest} differs in {changed}"
+
+    @contextmanager
+    def recording(self):
+        """Record the compile cache lookups of the enclosed steps (active only)."""
+        if not self.active:
+            yield
+            return
+        from libtorch_neuronx_lite.compile import cache
+
+        original = cache.get_local
+
+        def get_local(hash_key, local_cache_dir, *args, **kwargs):
+            found = original(hash_key, local_cache_dir, *args, **kwargs)
+            try:
+                self._looked_up(hash_key, local_cache_dir, found is not None)
+            except Exception as exc:  # recording must never change a lookup
+                logger.warning(
+                    "Warm start: lookup of %s not recorded: %r", hash_key, exc
+                )
+            return found
+
+        cache.get_local = get_local
+        try:
+            yield
+        finally:
+            if cache.get_local is get_local:
+                cache.get_local = original
+
+    def _looked_up(self, key: str, directory: str, found: bool) -> None:
+        if os.path.normpath(directory) != os.path.normpath(self.compile_dir):
+            self.other_dirs.add(directory)
+            return
+        self.looked_up[key] = self.looked_up.get(key, False) or found
+        if self.skip and not found:
+            self._miss(key)
+
+    def _miss(self, key: str) -> None:
+        self.missed.append(key)
+        logger.warning(
+            "Warm start: compile cache miss for key %s in the warm-up of a start "
+            "that skipped graph extraction; the graph compiles now, and manifest %s "
+            "is removed so that the next start runs the full pass",
+            key,
+            self.manifest_path,
+        )
+        if len(self.missed) > 1:
+            return
+        try:
+            os.remove(self.manifest_path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.warning(
+                "Warm start: manifest %s not removed: %s", self.manifest_path, exc
+            )
+
+    def finish(self) -> None:
+        """After every warm-up succeeded: the writer writes the full pass's manifest.
+
+        The warm-ups have succeeded, so nothing here may fail the start: an error is
+        logged instead.
+        """
+        if not self.active or self.skip or not self.writer or self.identity is None:
+            return
+        try:
+            self._write()
+        except Exception as exc:
+            logger.warning(
+                "Warm start: manifest %s not written: %r", self.manifest_path, exc
+            )
+
+    def _write(self) -> None:
+        from libtorch_neuronx_lite.compile import cache
+
+        keys = sorted(self.looked_up)
+        incomplete = [
+            key
+            for key in keys
+            if not cache._is_cache_complete(os.path.join(self.compile_dir, key))
+        ]
+        if not keys:
+            logger.info(
+                "Warm start: no manifest written: no graph was looked up in %s",
+                self.compile_dir,
+            )
+            return
+        reason = ""
+        if self.other_dirs:
+            reason = f"graphs were looked up in {sorted(self.other_dirs)} too"
+        elif incomplete:
+            reason = (
+                f"{len(incomplete)} of {len(keys)} graphs are incomplete in "
+                f"{self.compile_dir} (first: {incomplete[0]})"
+            )
+        if reason:
+            logger.warning(
+                "Warm start: manifest %s not written: %s", self.manifest_path, reason
+            )
+            return
+        data = {
+            "format": WARM_START_FORMAT,
+            "identity": self.identity,
+            "keys": keys,
+            "written_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        partial = f"{self.manifest_path}.{os.getpid()}.tmp"
+        try:
+            os.makedirs(os.path.dirname(self.manifest_path), exist_ok=True)
+            with open(partial, "w", encoding="utf-8") as manifest:
+                json.dump(data, manifest, indent=1, sort_keys=True)
+                manifest.write("\n")
+            os.replace(partial, self.manifest_path)
+        except OSError as exc:
+            logger.warning(
+                "Warm start: manifest %s not written: %s", self.manifest_path, exc
+            )
+            with suppress(OSError):
+                os.remove(partial)
+            return
+        logger.info(
+            "Warm start: wrote manifest %s (%d graphs)", self.manifest_path, len(keys)
+        )
 
 
 class NeuronWorker(WorkerBase):
@@ -2027,59 +2405,74 @@ class NeuronWorker(WorkerBase):
         # The native route has no graph-capture sidecar: it precompiles the
         # torch.compile wrapper directly to StableHLO/NEFF.
         native_compile_only = envs.is_native_backend()
+        # On a compile cache that holds every graph of this start, extraction, its
+        # barriers and the parallel compile do no work the warm-ups use: skip them
+        # (VLLM_NEURON_SKIP_EXTRACTION_WHEN_CACHED). Any other start runs the full
+        # pass below unchanged.
+        warm_start = _WarmStart()
         if has_capture_backend or native_compile_only:
-            if skip_prefill_warmup:
-                logger.info(
-                    "Skipping prefill graph extraction (kv_role=%s, decode-only server)",
-                    kv_cfg.kv_role if kv_cfg is not None else "kv_consumer",
-                )
-            if skip_decode_warmup:
-                logger.info(
-                    "Skipping decode graph extraction (kv_role=%s, prefill-only server)",
-                    kv_cfg.kv_role if kv_cfg is not None else "kv_producer",
-                )
-            self._extract_graphs(
+            warm_start = self._plan_warm_start(
                 skip_prefill=skip_prefill_warmup,
                 skip_decode=skip_decode_warmup,
                 skip_vision=skip_vision_warmup,
                 native_compile_only=native_compile_only,
             )
-            logger.info("Barrier: waiting for all ranks to finish graph extraction")
-            tp_barrier()
-            if not native_compile_only:
-                # graph.hlo -> XLA compilation. Native fork workers have
-                # already persisted their StableHLO-derived NEFFs.
-                self.model_runner.parallel_compile()
-            logger.info("Barrier: waiting for all ranks to finish compilation")
-            tp_barrier()
+        with warm_start.recording():
+            if (has_capture_backend or native_compile_only) and not warm_start.skip:
+                if skip_prefill_warmup:
+                    logger.info(
+                        "Skipping prefill graph extraction (kv_role=%s, decode-only server)",
+                        kv_cfg.kv_role if kv_cfg is not None else "kv_consumer",
+                    )
+                if skip_decode_warmup:
+                    logger.info(
+                        "Skipping decode graph extraction (kv_role=%s, prefill-only server)",
+                        kv_cfg.kv_role if kv_cfg is not None else "kv_producer",
+                    )
+                self._extract_graphs(
+                    skip_prefill=skip_prefill_warmup,
+                    skip_decode=skip_decode_warmup,
+                    skip_vision=skip_vision_warmup,
+                    native_compile_only=native_compile_only,
+                )
+                logger.info("Barrier: waiting for all ranks to finish graph extraction")
+                tp_barrier()
+                if not native_compile_only:
+                    # graph.hlo -> XLA compilation. Native fork workers have
+                    # already persisted their StableHLO-derived NEFFs.
+                    self.model_runner.parallel_compile()
+                logger.info("Barrier: waiting for all ranks to finish compilation")
+                tp_barrier()
 
-        # === Prefill warmup ===
-        if skip_prefill_warmup:
-            logger.info(
-                "Skipping prefill warmup (kv_role=%s, this is a decode-only server)",
-                kv_cfg.kv_role if kv_cfg is not None else "kv_consumer",
-            )
-        elif not envs.VLLM_NEURON_CPU_COMPILE:
-            self._warmup_prefill()
-
-        # === Decode warmup ===
-        if skip_decode_warmup:
-            logger.info(
-                "Skipping decode warmup (kv_role=%s, this is a prefill-only server)",
-                kv_cfg.kv_role if kv_cfg is not None else "kv_producer",
-            )
-        elif not envs.VLLM_NEURON_CPU_COMPILE:
-            self._warmup_decode()
-
-        # === Vision encoder warmup ===
-        if skip_vision_warmup:
-            if self.model_runner.vision_neuron_config is not None:
+            # === Prefill warmup ===
+            if skip_prefill_warmup:
                 logger.info(
-                    "Skipping vision warmup (kv_role=%s, this is a decode-only server)",
+                    "Skipping prefill warmup (kv_role=%s, this is a decode-only server)",
                     kv_cfg.kv_role if kv_cfg is not None else "kv_consumer",
                 )
-        elif not envs.VLLM_NEURON_CPU_COMPILE:
-            self._warmup_vision_encoder()
+            elif not envs.VLLM_NEURON_CPU_COMPILE:
+                self._warmup_prefill()
+
+            # === Decode warmup ===
+            if skip_decode_warmup:
+                logger.info(
+                    "Skipping decode warmup (kv_role=%s, this is a prefill-only server)",
+                    kv_cfg.kv_role if kv_cfg is not None else "kv_producer",
+                )
+            elif not envs.VLLM_NEURON_CPU_COMPILE:
+                self._warmup_decode()
+
+            # === Vision encoder warmup ===
+            if skip_vision_warmup:
+                if self.model_runner.vision_neuron_config is not None:
+                    logger.info(
+                        "Skipping vision warmup (kv_role=%s, this is a decode-only server)",
+                        kv_cfg.kv_role if kv_cfg is not None else "kv_consumer",
+                    )
+            elif not envs.VLLM_NEURON_CPU_COMPILE:
+                self._warmup_vision_encoder()
+        # The manifest of a full pass is written only after every warm-up succeeded.
+        warm_start.finish()
 
         # Enable tensor capture after warmup (skip warmup captures)
         if self.model_runner.neuron_config.tensor_capture:
@@ -2113,6 +2506,166 @@ class NeuronWorker(WorkerBase):
         return CompilationTimes(
             language_model=time.perf_counter() - warmup_start, encoder=0.0
         )
+
+    def _warm_start_refusal(
+        self, *, skip_vision: bool, native_compile_only: bool
+    ) -> str | None:
+        """Why this start is not one the warm-start check covers, or None.
+
+        Every reason is a configuration value, the same on every rank, so a refused
+        start runs the full pass on every rank without a vote.
+        """
+        from libtorch_neuronx_lite import envs as libtorch_envs
+
+        if not envs.VLLM_NEURON_SKIP_EXTRACTION_WHEN_CACHED:
+            return "VLLM_NEURON_SKIP_EXTRACTION_WHEN_CACHED=0"
+        if native_compile_only:
+            return "the native backend compiles its graphs during extraction"
+        if envs.VLLM_NEURON_CPU_COMPILE:
+            return "VLLM_NEURON_CPU_COMPILE=1 runs no warm-up"
+        if libtorch_envs.NEURON_LIBTORCH_DISABLE_COMPILE_CACHE:
+            return "NEURON_LIBTORCH_DISABLE_COMPILE_CACHE=1"
+        if libtorch_envs.NEURON_LIBTORCH_REMOTE_CACHE:
+            return (
+                "NEURON_LIBTORCH_REMOTE_CACHE is set; the check covers the local cache"
+            )
+        if not skip_vision or self.model_runner.vision_capture_backend is not None:
+            return "a vision encoder is extracted and warmed up"
+        parallel_config = getattr(self.vllm_config, "parallel_config", None)
+        pipeline_size = getattr(parallel_config, "pipeline_parallel_size", 1)
+        if pipeline_size > 1:
+            return f"pipeline parallel size {pipeline_size}"
+        if not isinstance(getattr(self.model_runner, "compile_options", None), dict):
+            return "the model runner has no compile options to locate the compile cache"
+        return None
+
+    def _warm_start_identity(self, *, skip_prefill: bool, skip_decode: bool) -> dict:
+        """What decides which graphs this start traces, as JSON values."""
+        vllm_config = self.vllm_config
+        model_config = vllm_config.model_config
+        scheduler_config = vllm_config.scheduler_config
+        configs = {}
+        for name in _IDENTITY_CONFIGS:
+            config = getattr(vllm_config, name, None)
+            configs[name] = None if config is None else config.compute_hash()
+        additional = getattr(vllm_config, "additional_config", None)
+        if isinstance(additional, dict):
+            additional = {
+                key: value
+                for key, value in additional.items()
+                if key not in _IDENTITY_ADDITIONAL_IGNORED
+            }
+        elif additional is not None:
+            additional = additional.compute_hash()
+        # The KV cache shape is in the graphs' inputs; vLLM's cache config hash
+        # leaves out the block count.
+        kv_cache_config = getattr(self.model_runner, "kv_cache_config", None)
+        kv_cache = None
+        if kv_cache_config is not None:
+            kv_cache = {
+                "num_blocks": kv_cache_config.num_blocks,
+                "tensor_sizes": [t.size for t in kv_cache_config.kv_cache_tensors],
+            }
+        return {
+            "package": _warm_start_package_digest(),
+            "versions": _warm_start_versions(),
+            "vllm_config": configs,
+            "scheduler": {
+                "max_num_seqs": scheduler_config.max_num_seqs,
+                "max_num_batched_tokens": scheduler_config.max_num_batched_tokens,
+                "async_scheduling": scheduler_config.async_scheduling,
+                "max_model_len": model_config.max_model_len,
+            },
+            "hf_config": _warm_start_hf_config(
+                getattr(model_config, "hf_config", None)
+            ),
+            "kv_cache": kv_cache,
+            "additional_config": _sha256_json(additional),
+            "compile_options": _sha256_json(self.model_runner.compile_options),
+            "compile_targets": {
+                "prefill": []
+                if skip_prefill
+                else [list(target) for target in self._prefill_compile_targets()],
+                "decode": []
+                if skip_decode
+                else [list(target) for target in self._decode_compile_targets()],
+            },
+            "env": _warm_start_env(),
+        }
+
+    def _plan_warm_start(
+        self,
+        *,
+        skip_prefill: bool,
+        skip_decode: bool,
+        skip_vision: bool,
+        native_compile_only: bool,
+    ) -> _WarmStart:
+        """Decide, on every rank at once, whether this start skips graph extraction.
+
+        Each rank checks the manifest and the cache entries it names, then the TP
+        group sums one vote per rank (1 = cold). Extraction is skipped only when the
+        sum is 0, so every rank takes the same branch: a rank that extracted while
+        another warmed up would wait for it in a barrier forever. An error inside a
+        rank's check is a cold vote, never an exception before the vote.
+        """
+        try:
+            refusal = self._warm_start_refusal(
+                skip_vision=skip_vision, native_compile_only=native_compile_only
+            )
+        except Exception as exc:  # a configuration error: the same on every rank
+            refusal = f"the precondition check failed: {exc!r}"
+        if refusal is not None:
+            logger.info("Warm start: not used (%s); running graph extraction", refusal)
+            return _WarmStart()
+        from libtorch_neuronx_lite import envs as libtorch_envs
+
+        plan = _WarmStart(
+            active=True,
+            writer=self.local_rank == 0,
+            compile_dir=os.path.normpath(
+                self.model_runner.compile_options.get(
+                    "compiler_workdir", libtorch_envs.get_neuron_compile_cache_dir()
+                )
+            ),
+        )
+        try:
+            identity = self._warm_start_identity(
+                skip_prefill=skip_prefill, skip_decode=skip_decode
+            )
+            warm, reason = plan.check(identity)
+        except Exception as exc:  # this rank cannot tell: it votes cold
+            plan.identity = None
+            warm, reason = False, f"the check failed: {exc!r}"
+        cold_ranks = tp_sum_int(0 if warm else 1)
+        plan.skip = cold_ranks == 0
+        group = get_tp_group()
+        if plan.skip:
+            if group.rank_in_group == 0:
+                logger.info(
+                    "Warm start: skipping graph extraction and the parallel compile: "
+                    "on every rank the compile cache %s holds all %d graphs of "
+                    "manifest %s",
+                    plan.compile_dir,
+                    len(plan.keys),
+                    plan.manifest_path,
+                )
+        elif group.rank_in_group == 0:
+            logger.info(
+                "Warm start: running graph extraction: %s",
+                reason
+                or f"{cold_ranks} of {group.world_size} ranks found the compile cache "
+                "cold",
+            )
+        elif not warm and cold_ranks < group.world_size:
+            logger.warning(
+                "Warm start: this rank found the compile cache cold (%s); %d of %d "
+                "ranks did",
+                reason,
+                cold_ranks,
+                group.world_size,
+            )
+        return plan
 
     def _prefill_buckets(self) -> tuple[list[int], list[int]]:
         num_batched_tokens_buckets = (

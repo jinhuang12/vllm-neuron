@@ -31,6 +31,51 @@ if TYPE_CHECKING:
     VLLM_NEURON_DEBUG_MODE: bool = False
     VLLM_NEURON_BARRIER_TIMEOUT: int = 3600
     VLLM_NEURON_DISABLE_PARALLEL_TRACE: bool = False
+    #: Skip graph extraction when the compile cache already holds every graph the
+    #: start will load. On by default; ``0`` forces the full pass on every start.
+    #:
+    #: Without the skip, every graph is traced twice at start-up: graph extraction
+    #: traces it and writes its HLO, the parallel compile turns new HLOs into NEFFs,
+    #: and then the graph's warm-up traces it again and loads the NEFF. On a warm
+    #: compile cache, extraction, its two barriers and the parallel compile find
+    #: nothing to do. On one warm start of the TP=64 GLM-5.3-Flash serve (bs=1,
+    #: MTP k=3, async scheduling) that work was 463 s of 1242 s to ready: 446.5 s
+    #: of extraction, 16.5 s of extraction barrier, 0.0 s of parallel compile and
+    #: 0.0 s of compile barrier, read from the time stamps of the server log. That
+    #: is a figure derived from one start's phases, not a start measured with and
+    #: without the skip.
+    #:
+    #: The test for "warm" traces nothing. After a start whose extraction ran and
+    #: whose warm-ups all succeeded, local rank 0 of each node writes a manifest to
+    #: ``<cache root>/neuron/warm_start/<identity>.json`` (beside the
+    #: ``compile_cache`` directory, never inside it). It names the compile cache key
+    #: of every graph that the start looked up, and the start's identity: the sha256
+    #: of every file of the ``vllm_neuron`` package, the versions of torch,
+    #: torch-xla, libtorch-neuronx-lite, neuronx-cc and vLLM, the hashes of vLLM's
+    #: configs, the scheduler limits, the HF model config, ``additional_config``
+    #: (less ``neuron_profiler``, which names a per-run directory), the compile
+    #: options, the prefill and decode compile targets, and the ``VLLM_*``,
+    #: ``NEURON_*``, ``NKI_*`` and ``XLA_*`` variables that can change a graph. A
+    #: later start skips extraction only when the manifest of its own identity
+    #: exists, is well formed, and every key it names has a complete cache entry
+    #: (HLO, NEFF, metadata, completion marker), and when every rank of the TP
+    #: group finds the same: the ranks sum one vote each before extraction. A
+    #: package digest that kernel-source changes fold into the cache keys is
+    #: covered: any change to a package file is a new identity.
+    #:
+    #: The skip does not apply, and the full pass runs as before, when: no manifest
+    #: of the start's identity exists (a cold root, a new tree, a changed config or
+    #: env; the first start after such a change writes it); an entry it names is
+    #: missing or incomplete; it is malformed (refused and logged by name); a rank
+    #: votes cold; or the start is one the check does not cover, refused by name:
+    #: this switch at ``0``, the native backend, ``VLLM_NEURON_CPU_COMPILE``,
+    #: ``NEURON_LIBTORCH_DISABLE_COMPILE_CACHE``, ``NEURON_LIBTORCH_REMOTE_CACHE``,
+    #: a vision encoder warm-up, or pipeline parallelism. If a skipped start's
+    #: warm-up still misses the cache, the graph compiles in place as it would
+    #: without the skip, and the manifest is removed so that the next start runs
+    #: the full pass. The skip never sets ``NEURON_LIBTORCH_ASSERT_CACHE_HIT``, so a
+    #: graph first seen after the server is ready compiles as before.
+    VLLM_NEURON_SKIP_EXTRACTION_WHEN_CACHED: bool = True
     # Renderer thread-pool size for the EPD Router's HF preprocessing offload.
     # vLLM defaults this to 1; >1 parallelizes the GIL-releasing native image
     # decode/transform. Only safe because the Router disables the mm processor
@@ -312,6 +357,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # graph extraction sequentially in the parent process.
     "VLLM_NEURON_DISABLE_PARALLEL_TRACE": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_DISABLE_PARALLEL_TRACE")) or False
+    ),
+    # Skip graph extraction when the compile cache holds every graph the start
+    # loads (the doc block at the variable's annotation above). On by default.
+    "VLLM_NEURON_SKIP_EXTRACTION_WHEN_CACHED": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_SKIP_EXTRACTION_WHEN_CACHED"))
+        is not False
     ),
     # Minimum KV budget (GiB) guardrail
     "VLLM_NEURON_MIN_KV_BUDGET_GIB": lambda: (
