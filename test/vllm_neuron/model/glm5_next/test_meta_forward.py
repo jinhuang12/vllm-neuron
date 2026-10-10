@@ -272,7 +272,28 @@ def _where_the_arm_still_stands() -> list[tuple]:
         dispatch = getattr(module, "wrap_nki", None)
         if dispatch is not None and dispatch is not REAL_WRAP_NKI:
             standing.append((module, "wrap_nki", REAL_WRAP_NKI, name))
+        # A module imported while the dispatch was held may also have wrapped its kernels at
+        # import, into a module-level name or a table keyed by launch grid
+        # (``glue/mhc_pre.py``'s ``_KERNELS``). Those entries are held boundaries, which
+        # hand their outputs back on ``meta``, and rebinding ``wrap_nki`` does not reach them.
+        for field, value in list(vars(module).items()):
+            if isinstance(value, _HeldBoundary):
+                standing.append((module, field, _released(value), name))
+            elif isinstance(value, dict) and any(
+                isinstance(entry, _HeldBoundary) for entry in value.values()
+            ):
+                real = {
+                    key: _released(entry) if isinstance(entry, _HeldBoundary) else entry
+                    for key, entry in value.items()
+                }
+                standing.append((module, field, real, name))
     return standing
+
+
+def _released(held: _HeldBoundary):
+    """The vendor dispatch ``held`` stands in for, on the launch grid it was given."""
+    real = REAL_WRAP_NKI(held.kernel)
+    return real if held.grid is None else real[held.grid]
 
 
 def _hand_back_what_a_late_import_took() -> list[str]:
@@ -280,7 +301,12 @@ def _hand_back_what_a_late_import_took() -> list[str]:
     """
     handed_back = []
     for module, field, real, name in _where_the_arm_still_stands():
-        setattr(module, field, real)
+        table = getattr(module, field)
+        if isinstance(table, dict):
+            # In place, so a reference to the table taken while it was held sees it too.
+            table.update(real)
+        else:
+            setattr(module, field, real)
         handed_back.append(f"{name}.{field}")
     return handed_back
 
