@@ -7520,10 +7520,29 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 metadata["decode_token_threshold"]
             )
             segment = int(metadata.get("kv_segment_size", 0))
+            # Under DCP a prefill chunk overlays each rank's owned rows of the PADDED
+            # chunk, padded to their static count, at the rank's owned length before
+            # the chunk (``Glm5NextMLAAttention._dcp_attention``); the rows past the
+            # chunk's real end are rows too. A traced graph refuses no overlay that
+            # overruns its window (under LNC2 the overrunning 128-row piece is dropped
+            # whole, in silence), so the window is sized over the padded chunk.
+            dcp_chunk = (
+                max(tokens, int(metadata["max_query_len"]))
+                if leg_is_prefill and dcp_size > 1 else None
+            )
             if not leg_is_prefill:
                 # A decode group's table is its context bucket, chosen so the
                 # longest sequence in it fits, so the whole table is the span.
                 span_blocks = table_width
+            elif segment > 0 and dcp_chunk is not None:
+                # An entry covers ``ownership_stride`` positions, the per-rank block
+                # rule of the table's own width (``group_blocks_per_request(...,
+                # dcp=)``), so a rank needs ``ceil((segment + chunk) / stride)``
+                # entries for any start in the segment: a start a whole number of
+                # strides in (the DCP prefill rule) puts every rank's owned length
+                # at ``start / dcp_size``, and the chunk adds at most
+                # ``ceil(chunk / stride)`` blocks of owned rows.
+                span_blocks = -(-(segment + dcp_chunk) // stride)
             elif segment > 0:
                 span_blocks = -(
                     -(segment + int(metadata["max_query_len"])) // block_size
@@ -7534,6 +7553,28 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 # the ``max_model_len`` fallback and the expensive case.
                 span_blocks = table_width
             window_blocks = min(table_width, max(1, span_blocks))
+            if dcp_chunk is not None:
+                from vllm_neuron.utils.dcp_ownership import (
+                    owned_length,
+                    owned_step_count,
+                )
+
+                # Every rank overlays the same static row count at its own owned
+                # length before this step, so the window must hold the largest owned
+                # length plus that count.
+                reach = max(
+                    int(owned_length(torch.tensor(request_starts[0]), rank,
+                                     block_size=block_size, dcp_size=dcp_size))
+                    for rank in range(dcp_size)
+                ) + owned_step_count(dcp_chunk, block_size=block_size, dcp_size=dcp_size)
+                if reach > window_blocks * block_size:
+                    raise ValueError(
+                        f"KV layer '{name}' prefills a {dcp_chunk}-row chunk at position "
+                        f"{request_starts[0]} under decode_context_parallel_size="
+                        f"{dcp_size}, which overlays up to window row {reach} on a rank, "
+                        f"and the window is {window_blocks} block(s) of {block_size}; a "
+                        f"traced overlay past the window is dropped in silence"
+                    )
             geometry = {
                 # The first request's pages, which a one-request step reads, and
                 # every request's own, which a decode step of several reads.
