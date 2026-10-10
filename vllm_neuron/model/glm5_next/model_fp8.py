@@ -7043,11 +7043,13 @@ class Glm5NextMLAAttention(nn.Module):
         sibling casts back to the model dtype at its own return because that is what
         its callers consume. A caller that needs another dtype casts once, itself.
 
-        Recorded cost: ``attend()`` recomputes this latent inside
-        ``project_query_and_latent``, so a DSA layer that calls the indexer and then
-        ``attend()`` computes it twice -- one call of a
-        ``[tokens, 4096] x [4096, 1536]`` projection per layer per phase. Threading
-        the latent into ``attend()`` would change a signature with its own callers.
+        A selecting decode step hands this latent to ``attend()`` as ``q_latent``
+        (:meth:`_forward_requests`), so the step computes it once. Two legs let
+        ``attend()`` compute its own: the bypass decode step, whose indexer reads no
+        query side (its copy has no reader, and the compiled graph drops it), and the
+        route :meth:`forward` keeps for a prefill chunk (and a float32 decode step),
+        which computes it twice -- one ``[tokens, hidden_size] x [hidden_size,
+        q_lora_rank]`` projection per layer per call.
         """
         from vllm_neuron.functional.attention.mla_projections import (
             mla_projection_prepared,
@@ -7065,13 +7067,19 @@ class Glm5NextMLAAttention(nn.Module):
         return self._latent_norm(q_latent, self.q_a_layernorm_weight)
 
     def project_query_and_latent(
-        self, hidden_states: torch.Tensor
+        self, hidden_states: torch.Tensor, *, q_latent: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Query and the normalised KV latent. Three kernel calls, not four.
 
         ``hidden_states`` is ``[tokens, hidden_size]``. The returns are
         ``query [tokens, heads, qk_nope_head_dim]`` and
         ``kv_latent [tokens, kv_lora_rank]``.
+
+        ``q_latent`` is :meth:`project_query_latent` of these ``hidden_states``
+        (``[tokens, q_lora_rank]`` float32) when the caller already holds it, as a
+        selecting decode step does for its indexer; the query is then projected from
+        it and the call makes two kernel calls. None projects it here. A latent of
+        another shape or dtype is refused: it cannot be these rows' latent.
 
         This is the absorbed path's entry into the projections: the query at the
         head width, and the compressed KV latent before any expansion. The expansion
@@ -7108,7 +7116,16 @@ class Glm5NextMLAAttention(nn.Module):
         tokens = int(x.shape[0])
         heads = self._heads_per_rank()
 
-        q_latent = self.project_query_latent(hidden_states)
+        if q_latent is None:
+            q_latent = self.project_query_latent(hidden_states)
+        elif tuple(q_latent.shape) != (tokens, self.q_lora_rank) or (
+            q_latent.dtype != torch.float32
+        ):
+            raise Glm5NextMLADecodeError(
+                f"q_latent must be [tokens, q_lora_rank] = "
+                f"{(tokens, self.q_lora_rank)} float32, project_query_latent of these "
+                f"hidden states; got {tuple(q_latent.shape)} {q_latent.dtype}"
+            )
         query = mla_projection_prepared(
             q_latent, self._prepared_weight("q_b_proj"), self._lowp_operand("q_b_proj")
         )
@@ -7241,6 +7258,7 @@ class Glm5NextMLAAttention(nn.Module):
         page_size: int,
         dense: bool = False,
         dense_window_seq_lens: torch.Tensor | None = None,
+        q_latent: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """One layer's MLA attention. Returns ``[tokens, hidden_size]``.
 
@@ -7295,6 +7313,9 @@ class Glm5NextMLAAttention(nn.Module):
         of each of ``batch_size`` requests and one request's prefill chunk of as many
         tokens have the same ``hidden_states`` shape. ``batch_size > 1`` is a decode
         step of that many requests, one token each, served by :meth:`_attend_requests`.
+
+        ``q_latent`` is the query latent of ``hidden_states`` when the caller already
+        holds it (:meth:`project_query_and_latent` says which); None projects it here.
         """
         if int(batch_size) < 1:
             raise Glm5NextMLADecodeError(
@@ -7316,6 +7337,7 @@ class Glm5NextMLAAttention(nn.Module):
                 latent_slots=latent_slots,
                 page_size=page_size,
                 dense=dense,
+                q_latent=q_latent,
             )
         if hidden_states.ndim != 2 or int(hidden_states.shape[1]) != self.hidden_size:
             raise Glm5NextMLADecodeError(
@@ -7380,7 +7402,9 @@ class Glm5NextMLAAttention(nn.Module):
             )
         start = _int64_scalar(start_position, latent_cache.device)
 
-        query, kv_latent = self.project_query_and_latent(hidden_states)
+        query, kv_latent = self.project_query_and_latent(
+            hidden_states, q_latent=q_latent
+        )
 
         # The cache write. One latent per token, into this layer's single KV head.
         # Done before the read below, so a decode step attends to its own token as
@@ -7557,6 +7581,7 @@ class Glm5NextMLAAttention(nn.Module):
         latent_slots: torch.Tensor,
         page_size: int,
         dense: bool,
+        q_latent: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """:meth:`attend` for a decode step of ``batch`` requests, ``T`` tokens each.
 
@@ -7571,7 +7596,7 @@ class Glm5NextMLAAttention(nn.Module):
         ``mla_decode_attention``, which reads each request's window through its own
         table column and stands this step's ``written`` rows in at their positions
         (row ``t`` sees rows ``0 .. t`` of its request), so the result does not
-        depend on when the cache write lands.
+        depend on when the cache write lands. ``q_latent`` is :meth:`attend`'s.
         """
         from vllm_neuron.functional.attention.mla_absorb import mla_absorb
         from vllm_neuron.functional.attention.mla_decode import mla_decode_attention
@@ -7636,7 +7661,9 @@ class Glm5NextMLAAttention(nn.Module):
                 f"{None if topk_indices is None else tuple(topk_indices.shape)}"
             )
 
-        query, kv_latent = self.project_query_and_latent(hidden_states)
+        query, kv_latent = self.project_query_and_latent(
+            hidden_states, q_latent=q_latent
+        )
         rows = latent_slots
         if collector is not None:
             collector.extend([kv_latent, rows.to(torch.int32)])
@@ -7705,7 +7732,8 @@ class Glm5NextMLAAttention(nn.Module):
         step being the one at ``state_slots[b]``, and the indexer writes them back in
         place on the banks. ``latent_slots`` is ``[B * T]``, one bank row per row of
         the step. The query latent and the indexer's four projections run once on
-        all rows. The indexer's write stage and selection run in one
+        all rows, and a selecting step's attention reads that same latent. The
+        indexer's write stage and selection run in one
         :meth:`Glm5NextDSAIndexer.forward_requests` pass, each request on its own
         ring and pooled store, each row at its own causal length. :meth:`attend` then
         serves every row in one batched call (rows ``> 1`` go to
@@ -7782,6 +7810,7 @@ class Glm5NextMLAAttention(nn.Module):
             bound, self.indexer.index_topk, self.indexer.index_kpool
         )
         shared = None if index_share is None else index_share.topk_indices
+        attention_latent = None
         if shared is not None:
             # A later draft iteration of the same speculative step: the selection is
             # the first iteration's, and the indexer chain is skipped whole. It is one
@@ -7819,6 +7848,12 @@ class Glm5NextMLAAttention(nn.Module):
                 # Only a selecting step has indices to share; the bypass regime's
                 # None is never stored, so its later iterations keep writing.
                 index_share.topk_indices = topk_indices
+            if not dense:
+                # The attention's q_b_proj reads the latent the indexer's wq_b read.
+                # The bypass step's indexer reads no query side, so its latent has no
+                # reader and the compiled graph drops it; the attention projects its
+                # own there, one projection either way.
+                attention_latent = q_latent
         if collector is not None:
             collector.append(
                 (self.indexer._bypass_indices(seq_lens) if dense else topk_indices)[:5]
@@ -7847,6 +7882,7 @@ class Glm5NextMLAAttention(nn.Module):
                 latent_slots=latent_slots,
                 page_size=int(page_size),
                 dense=dense,
+                q_latent=attention_latent,
             )
         return self.attend(
             normed_hidden_states,
@@ -7860,6 +7896,7 @@ class Glm5NextMLAAttention(nn.Module):
             latent_slots=latent_slots,
             page_size=int(page_size),
             dense=dense,
+            q_latent=attention_latent,
         )
 
     def forward(
@@ -7907,12 +7944,13 @@ class Glm5NextMLAAttention(nn.Module):
         indexer and ``attend()`` -- this hands over exactly what the indexer
         returned.
 
-        Recorded cost, not paid here: ``attend()`` recomputes the query latent
+        Recorded cost, not paid here: on the route below the decode legs (a prefill
+        chunk, or a float32 decode step) ``attend()`` recomputes the query latent
         inside :meth:`project_query_and_latent`, so the latent this method computes
         for the indexer is computed a second time -- one
         ``[tokens, hidden_size] x [hidden_size, q_lora_rank]`` dispatch per layer
-        per phase. Paying it means threading the latent into ``attend()``, which
-        changes a signature its callers use positionally.
+        per call. Handing it over (``attend(..., q_latent=...)``, as the decode
+        step does) is a change of its own: it changes every prefill graph.
 
         The two carriers are the caller's and both are written in place:
         ``latent_cache`` is ``attend()``'s own contract and ``pool_cache``, ``tail``

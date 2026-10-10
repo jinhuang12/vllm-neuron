@@ -27,7 +27,7 @@ def attention_path(monkeypatch):
     # the table would still look right in `calls` alone.
     paged_calls = []
 
-    def project(value):
+    def project(value, *, q_latent=None):
         calls.append(("project", value.clone()))
         return value[:, None, :], value
 
