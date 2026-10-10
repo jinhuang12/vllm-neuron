@@ -278,10 +278,10 @@ earlier whole-package scheme). Startup uses `install_per_graph_digest_key`.
 ## What it costs
 
 - One recompile of each graph that reaches a code edit. A comment, docstring
-  or layout edit recompiles nothing. On the stack-1b served set (20 graphs),
-  64 of the 104 files the snapshot then held reach no graph, and a decode-only
-  kernel edit recompiles the decode graphs only. `functional/mlp.py` (an nkilib
-  patch) reaches every graph.
+  or layout edit recompiles nothing. The stack-1b served set (20 graphs) was
+  measured when the snapshot held 104 files (it holds 112 now): 64 of those 104
+  files reach no graph, and a decode-only kernel edit recompiles the decode
+  graphs only. `functional/mlp.py` (an nkilib patch) reaches every graph.
 - About 700 ms of CPU in each process at startup, to parse and digest
   the snapshot (about 8 ms when the digest read raw bytes).
 - No change to a cache root that was filled with the same tree: the digests
@@ -306,6 +306,12 @@ The library's NKI kernel key also hashes the text of the kernel function
 function therefore still moves that kernel's NKI key. It moves no graph key: a
 warm root serves every graph, and a graph that compiles for another reason
 compiles that kernel again instead of reading the kernel cache.
+
+The other way round, the digest does not see line numbers. After a comment,
+blank line or docstring edit outside a kernel function, every key hits, so the
+debug line numbers in a cached build can be those from before the edit. The
+computed values are the same
+(see [What a file's digest reads](#what-a-files-digest-reads)).
 
 ## Manual device check
 
