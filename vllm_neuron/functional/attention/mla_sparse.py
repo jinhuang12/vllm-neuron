@@ -2308,7 +2308,7 @@ def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
                          block_table_row: Tensor | None = None,
                          written: Tensor | None = None,
                          write_offset: Tensor | None = None,
-                         page_size: int = 0) -> Tensor:
+                         page_size: int = 0, pool_size: int = 0) -> Tensor:
     """Sparse MLA attention over each query's selected cache rows.
 
     Args:
@@ -2329,6 +2329,13 @@ def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
             row ``write_offset``.
         write_offset: ``[1, 1]`` int32 -- read on device.
         page_size: rows per page; a trace-time constant.
+        pool_size: 0, or the rows per pool of the indexer's selection, a trace-time
+            constant. A positive value states that ``topk_indices`` is
+            ``dsa_index_expand``'s output for pools of that many rows, or the
+            short-sequence bypass's causal prefix; a paged NoPE call may then take
+            ``mla_dense_window.mla_masked_window_attention``, which reads the selection
+            as a bias over the whole window instead of gathering it, wherever
+            ``mla_dense_window.masked_window_serves`` says it beats the gather.
 
     Returns:
         ``[S, H, L]`` float32.
@@ -2343,6 +2350,18 @@ def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
         write_offset, page_size)
 
     _count_nki_dispatch()
+
+    if int(pool_size) > 0 and block_table_row is not None:
+        # Imported here: mla_dense_window stages its window with this module's helpers,
+        # so a module-level import would be circular.
+        from vllm_neuron.functional.attention import mla_dense_window
+
+        if mla_dense_window.masked_window_serves(seq, heads, latent, s_kv, int(pool_size),
+                                                 topk, q_lift.dtype, c_kv.dtype):
+            return mla_dense_window.mla_masked_window_attention(
+                q_lift, c_kv, topk_indices, softmax_scale, block_table_row,
+                written=written, write_offset=write_offset, page_size=page_size,
+                pool_size=pool_size)
 
     # The body is chosen from the shapes alone; no caller passes a flag. An exact-fit
     # latent keeps the untiled body; a ragged or wider-than-one-tile latent takes the
