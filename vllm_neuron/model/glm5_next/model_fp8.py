@@ -287,6 +287,49 @@ def _tp_group_if_initialized() -> GroupCoordinator | None:
     return _resolve_tp_group()
 
 
+def _resolve_dcp_size() -> int | None:
+    """Ranks in this rank's decode-context-parallel (DCP) group, or None when unknown.
+
+    The value the DSA indexer and attention bind in the constructor and again in
+    ``prepare_projection_weights``, so the one they hold is this function's at the
+    later of the two: 1 at a world size of one, and vllm's
+    ``get_dcp_group().world_size`` at any larger world, with no other source. vllm
+    builds that group in the same ``initialize_model_parallel`` call as the
+    tensor-parallel group, so it exists whenever ``model_parallel_is_initialized``
+    holds. A larger world without that state (a class built before it exists, or one
+    rank loaded out of process, as the shard tests do) reads None, which a forward
+    refuses by name (:func:`_require_bound_dcp_size`) rather than serving as 1. A
+    single-rank process never imports vllm here. The value is the same on every rank.
+    """
+    if _resolve_world_size() <= 1:
+        return 1
+    from vllm.distributed.parallel_state import (
+        get_dcp_group,
+        model_parallel_is_initialized,
+    )
+
+    if not model_parallel_is_initialized():
+        return None
+    return int(get_dcp_group().world_size)
+
+
+def _require_bound_dcp_size(module: nn.Module, error: type[ValueError]) -> None:
+    """Refuse a forward of ``module`` whose ``dcp_size`` is not bound.
+
+    ``dcp_size`` is None only at a world size above one while vllm's model-parallel
+    state is missing (:func:`_resolve_dcp_size`). Served as 1, it would trace the
+    single-rank path and drop the DCP owner gating, so the forward refuses instead. The
+    test reads a python value bound outside the trace and adds no graph node.
+    """
+    if module.dcp_size is None:
+        raise error(
+            f"{type(module).__name__}.dcp_size is unbound: "
+            f"prepare_projection_weights() binds it at load from vllm's "
+            f"decode-context-parallel group, and either it has not run or vllm's "
+            f"model-parallel state did not exist when it ran"
+        )
+
+
 # --------------------------------------------------------------------------- #
 # which parameter families are sharded, and on which dim.
 #
@@ -4500,6 +4543,15 @@ class Glm5NextDSAIndexer(nn.Module):
         self.index_kpool_always_select_tail = bool(
             text_config.index_kpool_always_select_tail
         )
+        # Ranks in this rank's decode-context-parallel group, from
+        # :func:`_resolve_dcp_size`: 1 at one rank, None at a larger world until vllm's
+        # parallel state exists, which may be after this constructor, so
+        # :meth:`prepare_projection_weights` binds it again; a forward refuses None
+        # (:func:`_require_bound_dcp_size`). A plain attribute and not a property,
+        # because dynamo guards a property read in the traced forward on the class and
+        # then checks this module's whole guard subtree on every call, where an
+        # attribute keeps the module a tag-safe root.
+        self.dcp_size = _resolve_dcp_size()
 
         # The weight map's seven, in its own order: the four scaled projections,
         # then ``k_norm_bias``, then the two bare compress tensors.
@@ -4598,6 +4650,10 @@ class Glm5NextDSAIndexer(nn.Module):
             {name: getattr(self, self.PROJECTION_PARAMETERS[name])
              for name, _, _ in self.projection_widths()}, {}))
         self._bind_shard_rank(prepared["wq_b"].device)
+        # Bound here for the reason :meth:`_bind_shard_rank` gives: preparation runs
+        # once per rank at load, after the parallel state exists, outside any trace.
+        # :func:`_resolve_dcp_size` states the value this holds from here on.
+        self.dcp_size = _resolve_dcp_size()
         return len(prepared)
 
     def _bind_shard_rank(self, device: torch.device) -> None:
@@ -4632,25 +4688,6 @@ class Glm5NextDSAIndexer(nn.Module):
             self.SHARD_RANK_ATTR,
             torch.full((1,), index, dtype=torch.int32, device=device),
         )
-
-    @property
-    def dcp_size(self) -> int:
-        """Ranks in this rank's decode-context-parallel (DCP) group; 1 without DCP.
-
-        Read per call and not bound in the constructor, on the ground
-        :func:`_resolve_tp_group` states: the classes are built before the parallel
-        state exists. vllm's DCP group is consulted only at a world size above one, so
-        a single-rank process never imports vllm here, and a process with no DCP group
-        reads 1. The value is the same on every rank, so a trace may fold it.
-        """
-        if _resolve_world_size() <= 1:
-            return 1
-        from vllm.distributed.parallel_state import get_dcp_group
-
-        try:
-            return int(get_dcp_group().world_size)
-        except AssertionError:
-            return 1
 
     def _dcp_owned_position(
         self, position: torch.Tensor, block_size: int
@@ -5806,6 +5843,7 @@ class Glm5NextDSAIndexer(nn.Module):
         from vllm_neuron.functional.dsa.decode_tail_update import decode_pool_address
 
         self.require_dials()
+        _require_bound_dcp_size(self, Glm5NextDSAIndexerError)
 
         pool = self.index_kpool
         candidates, trash, selects = self._require_serviceable(
@@ -6014,6 +6052,7 @@ class Glm5NextDSAIndexer(nn.Module):
         from vllm_neuron.utils.neuron_utils import values_are_readable
 
         self.require_dials()
+        _require_bound_dcp_size(self, Glm5NextDSAIndexerError)
         pool, dim = self.index_kpool, self.index_head_dim
         total = int(hidden_states.shape[0])
         views = isinstance(pool_bank, (tuple, list))
@@ -6498,6 +6537,10 @@ class Glm5NextMLAAttention(nn.Module):
             *(f"{leaf}_{FP8_SCALE_SUFFIX}" for leaf in DSA_SCALED_PROJECTIONS),
         )
         self.indexer = Glm5NextDSAIndexer(text_config)
+        # The decode-context-parallel group size the forward branches on, bound here
+        # and again by :meth:`prepare_projection_weights` for the reasons the
+        # indexer's constructor gives.
+        self.dcp_size = _resolve_dcp_size()
 
     # The one place this class turns heads into its heads. It sits in the class
     # preamble because both halves below read it: the projections' widths and the
@@ -6529,11 +6572,6 @@ class Glm5NextMLAAttention(nn.Module):
         needs the division here because its attribute is not.
         """
         return _per_rank(self.num_attention_heads, _resolve_world_size())
-
-    @property
-    def dcp_size(self) -> int:
-        """Ranks in this rank's decode-context-parallel group, read where the indexer reads it."""
-        return self.indexer.dcp_size
 
     def _dcp_write_latent_then_refuse(
         self,
@@ -6721,6 +6759,9 @@ class Glm5NextMLAAttention(nn.Module):
             {name: getattr(self, f"{name}_{FP8_SCALE_SUFFIX}", None)
              for name in self.LOWP_SITES},
         ))
+        # Resolved here and not copied from the indexer: the prep walk reaches this
+        # module before its indexer, whose own binding at load has not run yet.
+        self.dcp_size = _resolve_dcp_size()
         return len(prepared)
 
     def _lowp_operand(self, name: str):
@@ -7906,6 +7947,7 @@ class Glm5NextMLAAttention(nn.Module):
             selection_is_a_no_op,
         )
 
+        _require_bound_dcp_size(self, Glm5NextMLADecodeError)
         if isinstance(tail, (tuple, list)) or state_slots is not None:
             # A decode step of several requests: one ring per request, or the whole
             # ring and pooled-store banks beside one slot per request.
