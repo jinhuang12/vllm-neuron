@@ -5066,6 +5066,16 @@ class Glm5NextDSAIndexer(nn.Module):
         stay" means as an op. Nothing is written when the sequence divides evenly,
         because the mask is then empty everywhere.
 
+        Both halves land in one write on ``tail`` itself, not one write per half
+        through ``tail[0]`` and ``tail[1]``. The served prefill graph is lowered by
+        libtorch_neuronx_lite's aliasing and in-place passes, which hand a written
+        graph input back to the runtime as one aliased output. They do not trace an
+        integer-indexed view such as ``tail[0]`` back to its input, so a write
+        through it is dropped: the device keeps the ring the runner emptied, and
+        the next completion pools zeros for this chunk's remainder. Of several
+        writes to one input they keep only the last, so this is the ring's one
+        write in a prefill graph.
+
         The source is clamped, not masked, and the clamp is not a correction: rows
         the mask discards still have to name a legal source row, or the gather
         would read out of bounds to produce values nothing uses.
@@ -5083,14 +5093,16 @@ class Glm5NextDSAIndexer(nn.Module):
         take = torch.minimum(torch.remainder(end, pool), real)
         write = ((slots >= rows - take) & (slots < rows))[:, None]
         source = (slots - rows + real).clamp_min(0).minimum(real - 1)
-        tail[0].copy_(
-            torch.where(write, key.index_select(0, source).to(tail.dtype), tail[0])
-        )
-        tail[1].copy_(
-            torch.where(
-                write, gate_score.index_select(0, source).to(tail.dtype), tail[1]
+        seeded = torch.stack(
+            (
+                key.index_select(0, source).to(tail.dtype),
+                gate_score.index_select(0, source).to(tail.dtype),
             )
         )
+        # The target is the ring itself, not a view of it: the backend's passes do not
+        # trace ``tail[0]`` back to the graph input, so a write there would never
+        # reach the runtime's copy of the ring (docstring above).
+        tail.copy_(torch.where(write, seeded, tail))
         return write.sum().to(torch.int32)
 
     def score_pools(
