@@ -217,7 +217,7 @@ def delta_verify_ms(C: int, T: int, variant: str, residual: str = "flat", **kw) 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--draft-us", type=float, default=654.0, help="fused draft iteration, us (mtp.md 3.3)")
+    ap.add_argument("--draft-us", type=float, default=654.0, help="fused draft iteration, us")
     ap.add_argument("--draft-fixed-us", type=float, default=162.0, help="one draft graph launch per verify step, us")
     ap.add_argument("--verify-overhead-us", type=float, default=200.0)
     ap.add_argument("--ks", type=int, nargs="+", default=[3, 5])

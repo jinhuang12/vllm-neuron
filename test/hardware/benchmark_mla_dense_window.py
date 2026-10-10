@@ -380,7 +380,7 @@ def main() -> int:
                   "dtype": "bfloat16"},
         "rates": {"te_peak_flops": TE_PEAK_FLOPS, "hbm_bytes_per_s": HBM_BYTES_PER_S,
                   "pe_column_ns": PE_COLUMN_NS,
-                  "source": "glm53f-wt3/reports/entitlement.json meta.hardware"},
+                  "source": "entitlement.json meta.hardware"},
         "timing": {"warmup": args.warmup, "iterations": args.iterations,
                    "repeats": args.repeats,
                    "device": "system trace nc_exec_running, physical cores merged",

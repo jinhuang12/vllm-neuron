@@ -24,7 +24,7 @@ PUBLISHED_JSON = str(artifacts.campaign_path("glm53f-wt3", "reports",
 
 pytestmark = pytest.mark.skipif(
     not (cost_model.calibration_available() and os.path.exists(PUBLISHED_JSON)),
-    reason=(f"worker-3's calibrated prefill model is not on this host: needs "
+    reason=(f"the calibrated prefill model is not on this host: needs "
             f"{cost_model.CALIB_DIR}, {cost_model.CAL_CONSTANTS}, "
             f"{cost_model.ENTITLEMENT_JSON}, {cost_model.DEVICE_RECORDS_DIR} and "
             f"{PUBLISHED_JSON} ({artifacts.CAMPAIGN_KNOB})"))
