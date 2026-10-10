@@ -100,6 +100,10 @@ if TYPE_CHECKING:
     # refuses async scheduling by name.
     # Unsaturated hosts only: 3 executions a step can fill the 32-deep queue (status=7).
     VLLM_NEURON_GLM5NEXT_MTP_ASYNC: bool = False
+    # The Neuron runtime's per-core execution queue depth. The worker sets it before the
+    # first step (an operator's preset wins); the async drafter derives its launch bound
+    # from it (functional/mtp/async_step.py ``launch_depth``). None when unset.
+    NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS: Optional[int] = None
     # Worker GC policy after warmup (vllm_neuron/vllm/worker/gc_policy.py):
     # "rare_gen2" (gen-2 threshold 100000, no freeze), "off" (CPython's GC),
     # "freeze_rare_gen2" (freeze + gen-2 threshold 100000), or "freeze".
@@ -519,6 +523,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # max_num_seqs > 1) by name.
     "VLLM_NEURON_GLM5NEXT_MTP_ASYNC": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_GLM5NEXT_MTP_ASYNC")) or False
+    ),
+    # The Neuron runtime's per-core execution queue depth, as the worker set it (or an
+    # operator preset); None when unset. Read by the async drafter's launch bound.
+    "NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS": lambda: maybe_convert_int(
+        os.getenv("NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS")
     ),
     # GC policy each worker applies once after warmup. "rare_gen2" (the default)
     # raises only the gen-2 threshold, so bs=64 decode has no full-pass stalls, and

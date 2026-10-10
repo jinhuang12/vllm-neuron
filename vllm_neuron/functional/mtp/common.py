@@ -129,18 +129,14 @@ def launch_programs() -> int:
 
 @dataclass
 class DispatchCounters:
-    """``kernel``: launches that returned; ``torch_route``: calls the torch formula served;
-    ``queue_full``: of those, the steps served on the host because the runtime refused the
-    launch with a full execution queue (``pair`` reports the first two)."""
+    """``kernel``: launches that returned; ``torch_route``: calls the torch formula served."""
 
     kernel: int = 0
     torch_route: int = 0
-    queue_full: int = 0
 
     def reset(self) -> None:
         self.kernel = 0
         self.torch_route = 0
-        self.queue_full = 0
 
     def pair(self) -> tuple[int, int]:
         return self.kernel, self.torch_route
@@ -157,14 +153,4 @@ def count_torch_route(counters: DispatchCounters):
     @torch._dynamo.assume_constant_result
     def bump() -> None:
         counters.torch_route += 1
-    return bump
-
-
-def count_queue_full(counters: DispatchCounters):
-    """One degraded step: the torch route served it (``torch_route``) because the runtime
-    refused the launch with a full execution queue (``queue_full``). Called outside any
-    compiled region, after the launch raised."""
-    def bump() -> None:
-        counters.torch_route += 1
-        counters.queue_full += 1
     return bump

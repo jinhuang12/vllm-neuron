@@ -38,15 +38,20 @@ which the executor raises as a ``RuntimeError``. The drafter never raises on it:
 launch is served by the torch route on the host for that step (:func:`_take_on_the_host`,
 :func:`_correct_on_the_host` -- the operands read back once, the fields moved back once,
 the values the synchronous drafter builds) and counted once; every other ``RuntimeError``
-is re-raised unchanged. And :class:`DeviceLaunch` keeps at most :data:`LAUNCH_DEPTH` of
-its launches unprocessed per rank, waiting on the oldest before it issues another, so a
-rank whose completion thread stalls stops enqueuing instead of filling the queue.
+is re-raised unchanged. And :class:`DeviceLaunch` keeps at most :func:`launch_depth` of its
+launches unprocessed per rank -- derived from the queue depth the worker sets -- waiting on
+the oldest before it issues another, so a rank whose completion thread stalls stops
+enqueuing instead of filling the queue; a queue too small for the drafter to run without
+that wait on a healthy host is refused by name.
 """
 
 from __future__ import annotations
 
+import logging
 import re
+import time
 from collections import deque
+from dataclasses import dataclass
 from typing import NamedTuple
 
 import torch
@@ -68,21 +73,24 @@ from vllm_neuron.functional.mtp.common import (
     PARTITIONS,
     DispatchCounters,
     count_kernel,
-    count_queue_full,
     count_torch_route,
 )
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 __all__ = [
-    "LAUNCH_DEPTH",
+    "EXECUTION_QUEUE_ENV",
+    "MINIMUM_EXECUTION_QUEUE",
     "QUEUE_FULL_MESSAGE",
     "QUEUE_FULL_STATUS",
+    "STEADY_STATE_LAUNCHES",
     "DeviceLaunch",
     "MtpAsyncStepError",
     "StepCarry",
     "StepCorrection",
     "StepTake",
     "dispatch_counters",
+    "executions_held",
+    "launch_depth",
     "mtp_async_correct",
     "mtp_async_correct_kernel",
     "mtp_async_correct_torch",
@@ -101,14 +109,52 @@ QUEUE_FULL_STATUS = 7
 #: The executor's message for that status: it raises
 #: ``RuntimeError("Failed to schedule neff execution. status=7 message=Execution Queue Full")``.
 QUEUE_FULL_MESSAGE = "Execution Queue Full"
-#: Launches a :class:`DeviceLaunch` keeps unprocessed per rank before it waits on the oldest.
-#: The drafter's launches are two of every three executions of a decode step (the correction,
-#: the forward, the take), so D unprocessed launches hold at most ``D + D // 2 + 1`` of the
-#: runtime's queue slots; 8 holds 13 of the 32 the worker configures (half, with margin).
-#: A healthy host holds at most 5 (the previous step's take, the correction and take of the
-#: two steps the engine keeps in flight), so the wait never comes on a healthy host.
-LAUNCH_DEPTH = 8
+#: The runtime's per-core execution queue depth. The worker sets it before the first step
+#: (an operator's preset wins); the runner hands the value to :class:`DeviceLaunch`.
+EXECUTION_QUEUE_ENV = "NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS"
+#: The drafter's launches a healthy host holds unprocessed at once: the previous step's take
+#: and the correction and take of the two steps the engine keeps in flight.
+STEADY_STATE_LAUNCHES = 5
 _QUEUE_FULL_STATUS_TOKEN = re.compile(rf"(?<![\w.])status={QUEUE_FULL_STATUS}(?![\w.])")
+logger = logging.getLogger(__name__)
+
+
+def executions_held(launches: int) -> int:
+    """The most executions a rank has enqueued but not seen processed while ``launches`` of
+    the drafter's launches are unprocessed.
+
+    A decode step enqueues the correction launch, the forward, the take launch, in that
+    order, and the runtime processes completions in enqueue order, so the unprocessed
+    executions are one span of that sequence: the ``launches``, a forward after each
+    correction among them, and -- when the launch that would wait is a take -- the forward
+    its step already enqueued. The span is longest when it starts at a correction:
+    ``launches + ceil(launches / 2)``.
+    """
+    return launches + (launches + 1) // 2
+
+
+def launch_depth(execution_queue: int) -> int:
+    """Unprocessed launches a :class:`DeviceLaunch` may hold under a queue of
+    ``execution_queue`` slots: the largest count whose executions (:func:`executions_held`)
+    fit half the queue. The other half stays free for executions this count does not
+    include. 32 slots give 10 (15 executions); the runtime's own default of 8 gives 2."""
+    depth = 0
+    while executions_held(depth + 1) <= execution_queue // 2:
+        depth += 1
+    return depth
+
+
+def _minimum_execution_queue() -> int:
+    """The least queue whose depth reaches :data:`STEADY_STATE_LAUNCHES`, so the bound never
+    waits on a healthy host."""
+    queue = 1
+    while launch_depth(queue) < STEADY_STATE_LAUNCHES:
+        queue += 1
+    return queue
+
+
+#: Below this queue depth the async drafter is refused: its bound would wait on every step.
+MINIMUM_EXECUTION_QUEUE = _minimum_execution_queue()
 
 
 def _on_the_host(tensor: Tensor) -> bool:
@@ -123,6 +169,19 @@ def _on_the_host(tensor: Tensor) -> bool:
 
 class MtpAsyncStepError(ValueError):
     """An operand that is not a verify step's: wrong geometry, dtype, or a value outside its range."""
+
+
+@dataclass
+class StepCounters(DispatchCounters):
+    """:class:`DispatchCounters` plus ``queue_full``: of the torch-route calls, the steps
+    served on the host because the runtime refused the launch with a full execution queue
+    (test instrumentation; ``pair`` reports the two routes as before)."""
+
+    queue_full: int = 0
+
+    def reset(self) -> None:
+        super().reset()
+        self.queue_full = 0
 
 
 class StepTake(NamedTuple):
@@ -254,15 +313,23 @@ class DeviceLaunch:
     launches per graph (test instrumentation and the warmup's log; nothing on the step
     path reads it).
 
-    The launch bounds its run-ahead: it keeps the first output of each launch it issued and,
-    before issuing one at :data:`LAUNCH_DEPTH` unprocessed, reads the oldest to the host --
-    a read of a NEFF output returns when the runtime has processed that execution's
-    completion, which is also when the runtime frees the execution's queue slot. A rank
-    whose completion thread stalls therefore waits here instead of enqueuing into a full
-    queue (``outstanding`` is the count held).
+    The launch bounds its run-ahead when it is built with ``execution_queue``, the runtime's
+    per-core queue depth (:data:`EXECUTION_QUEUE_ENV`, the worker sets it): it keeps the
+    first output of each launch it issued and, before issuing one at ``depth``
+    (:func:`launch_depth`) unprocessed, reads the oldest to the host. By the framework's
+    design that read returns when the runtime has processed the execution's completion --
+    the point at which the runtime also frees the execution's queue slot -- so a rank whose
+    completion thread stalls waits here instead of enqueuing into a full queue; the pairing
+    of the read with the slot's release is the framework's design, not yet measured on a
+    device. Once ``depth`` launches have been issued the read is one small output per
+    launch (processed long before, on a healthy host). A queue below
+    :data:`MINIMUM_EXECUTION_QUEUE` is refused by name: its depth is below the launches a
+    healthy host holds, so the bound would wait on every step. Without ``execution_queue``
+    (a host backend: launches run eagerly, nothing is queued) there is no bound and
+    ``depth`` is None. ``outstanding`` is the count held.
     """
 
-    def __init__(self, backend, options: dict | None = None) -> None:
+    def __init__(self, backend, options: dict | None = None, *, execution_queue: int | None = None) -> None:
         if not backend:
             raise MtpAsyncStepError(
                 "DeviceLaunch: a torch.compile backend is required (the model's, "
@@ -272,6 +339,15 @@ class DeviceLaunch:
         self.options = dict(options) if options else None
         self.calls = {"take": 0, "correct": 0}
         self._outstanding: deque[Tensor] = deque()
+        self.depth: int | None = None if execution_queue is None else launch_depth(execution_queue)
+        if self.depth is not None and self.depth < STEADY_STATE_LAUNCHES:
+            raise MtpAsyncStepError(
+                f"{EXECUTION_QUEUE_ENV}={execution_queue}: the async drafter's launch depth "
+                f"derived from it is {self.depth}, below the {STEADY_STATE_LAUNCHES} launches a "
+                f"healthy host holds, so it would wait on every step; set "
+                f"{EXECUTION_QUEUE_ENV} to at least {MINIMUM_EXECUTION_QUEUE} or serve the "
+                f"synchronous drafter"
+            )
         self._take = torch.compile(
             _take_launch, backend=backend, fullgraph=True, dynamic=False, options=self.options
         )
@@ -285,13 +361,22 @@ class DeviceLaunch:
         return len(self._outstanding)
 
     def _admit(self) -> None:
-        """Wait until fewer than :data:`LAUNCH_DEPTH` launches are unprocessed."""
-        while len(self._outstanding) >= LAUNCH_DEPTH:
+        """Wait until fewer than ``depth`` launches are unprocessed; log each wait."""
+        if self.depth is None or len(self._outstanding) < self.depth:
+            return
+        held = len(self._outstanding)
+        started = time.perf_counter()
+        while len(self._outstanding) >= self.depth:
             self._outstanding[0].cpu()
             self._outstanding.popleft()
+        logger.warning(
+            "mtp async: %d launches unprocessed; waited %.1f ms on the oldest before launching",
+            held, (time.perf_counter() - started) * 1e3,
+        )
 
     def _issued(self, fields):
-        self._outstanding.append(fields[0])
+        if self.depth is not None:
+            self._outstanding.append(fields[0])
         return fields
 
     def take(self, accepted: Tensor, drafts: Tensor):
@@ -318,7 +403,7 @@ def _take_on_the_host(accepted: Tensor, drafts: Tensor) -> StepTake:
     degraded step."""
     device = accepted.device
     take = mtp_async_take_torch(accepted.cpu(), drafts.cpu())
-    _count_queue_full()
+    _degraded("take")
     return StepTake(*(field.to(device) for field in take))
 
 
@@ -334,9 +419,20 @@ def _correct_on_the_host(
         None if block_table_row is None else block_table_row.cpu(),
         prev_width=prev_width, width=width, page_size=page_size, padding=padding,
     )
-    _count_queue_full()
+    _degraded("correction")
     return StepCorrection(
         *(None if field is None else field.to(device) for field in correction)
+    )
+
+
+def _degraded(launch: str) -> None:
+    """Count (as a torch-route call and a queue-full step) and log one step served on the
+    host after the runtime refused its launch."""
+    _count_torch_route()
+    _COUNTERS.queue_full += 1
+    logger.warning(
+        "mtp async: the runtime refused the %s launch with a full execution queue; the step is "
+        "served on the host (%d such steps)", launch, _COUNTERS.queue_full,
     )
 
 
@@ -883,10 +979,9 @@ def mtp_async_correct(
 
 _TAKE_KERNEL = wrap_nki(mtp_async_take_kernel)
 _CORRECT_KERNEL = wrap_nki(mtp_async_correct_kernel)
-_COUNTERS = DispatchCounters()
+_COUNTERS = StepCounters()
 _count_kernel = count_kernel(_COUNTERS)
 _count_torch_route = count_torch_route(_COUNTERS)
-_count_queue_full = count_queue_full(_COUNTERS)
 
 
 def reset_dispatch_counters() -> None:

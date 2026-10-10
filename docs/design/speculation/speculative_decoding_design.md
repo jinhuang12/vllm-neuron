@@ -618,12 +618,18 @@ Contract of the opt-in (measured on trn2 at TP64/EP16, `k = 3`, `max_num_seqs 1`
   finds no slot with `NRT_QUEUE_FULL` (status 7). The drafter never raises on it: a refused
   take or correction is served by the torch route on the host for that step (the operands
   read back once, the fields moved back once, the values the synchronous drafter builds) and
-  counted (`async_step.queue_full_fallbacks()`), every other `RuntimeError` propagates
-  unchanged; and the compiled launch holder (`async_step.DeviceLaunch`) keeps at most
-  `async_step.LAUNCH_DEPTH` (8) of its launches unprocessed per rank, reading the oldest back
-  before it issues another, so a rank whose completion thread stalls waits instead of filling
-  the queue (8 launches hold at most 13 of the 32 slots; a healthy host holds at most 5, so
-  the wait never comes on one). No knob: both are the default.
+  counted and logged (`async_step.queue_full_fallbacks()`; one warning per such step), every
+  other `RuntimeError` propagates unchanged; and the compiled launch holder
+  (`async_step.DeviceLaunch`) keeps at most `async_step.launch_depth(queue)` of its launches
+  unprocessed per rank -- the most whose executions, with the forwards between them
+  (`executions_held`: D + ceil(D / 2)), fit half the queue the worker set; 10 under the
+  worker's 32 -- reading the oldest back before it issues another (one warning per wait), so
+  a rank whose completion thread stalls waits instead of filling the queue. A healthy host
+  holds at most 5 launches unprocessed (the previous step's take, the correction and take of
+  the two steps the engine keeps in flight), so the wait never comes on one; a queue below
+  `async_step.MINIMUM_EXECUTION_QUEUE` (16), whose depth is under those 5, is refused by
+  name when the launch is built at warm-up. No knob: both are the default; the queue depth
+  is the runtime's existing setting.
   The recipe runs the on-device sampler with `all_greedy: true`; sampling knobs the greedy
   sampler cannot apply (`temperature > 0`, `top_k`, `top_p`, `min_p`, `seed`, `n > 1`)
   are refused at admission (`vllm_neuron/vllm/admission.py`). Distribution-preserving

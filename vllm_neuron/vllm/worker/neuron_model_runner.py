@@ -6857,11 +6857,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             return None
         launch = self._glm5next_async_launch_instance
         if launch is None:
-            from vllm_neuron.envs import get_compile_backend_name
+            from vllm_neuron import envs
             from vllm_neuron.functional.mtp import async_step as mtp_async
 
+            execution_queue = envs.NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS
+            if execution_queue is None:
+                raise mtp_async.MtpAsyncStepError(
+                    f"{mtp_async.EXECUTION_QUEUE_ENV} is unset: the worker sets the runtime's "
+                    "execution queue depth before the first step, and the async drafter's launch "
+                    "bound derives from it"
+                )
             launch = mtp_async.DeviceLaunch(
-                get_compile_backend_name(), options=self.compile_options
+                envs.get_compile_backend_name(), options=self.compile_options,
+                execution_queue=execution_queue,
             )
             self._glm5next_async_launch_instance = launch
         return launch

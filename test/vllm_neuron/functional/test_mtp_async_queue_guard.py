@@ -11,9 +11,11 @@ raise":
   the torch route on the host for that step (the operands read back once, the fields moved
   back once), with values the synchronous drafter builds, and counted once
   (``queue_full_fallbacks``); every other ``RuntimeError`` is re-raised unchanged;
-* **the bound** -- :class:`DeviceLaunch` keeps at most ``LAUNCH_DEPTH`` of its launches
-  unprocessed per rank and waits on the oldest before issuing another, so a rank whose
-  completion thread stalls stops enqueuing instead of filling the queue.
+* **the bound** -- :class:`DeviceLaunch` keeps at most ``launch_depth(execution_queue)`` of
+  its launches unprocessed per rank (derived from the runtime's queue depth the worker
+  sets, ``NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS``) and waits on the oldest before issuing
+  another, so a rank whose completion thread stalls stops enqueuing instead of filling the
+  queue; a queue too small for the drafter's steady state is refused by name.
 
 The device is stood in for on the host as ``test_mtp_async_launch`` does: every operand
 counts as off-host, a launch object runs the eager launch functions (the simulator answers)
@@ -28,15 +30,18 @@ unprocessed execution blocks.
 from __future__ import annotations
 
 import ast
+import logging
 import pathlib
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from vllm_neuron.functional.mtp import async_step
 from vllm_neuron.vllm.worker import neuron_worker
+from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
 
 from test.vllm_neuron.functional import test_mtp_async_step as step_tests
 from test.vllm_neuron.model.glm5_next import test_mtp_e2e_spec as spec
@@ -99,6 +104,9 @@ def _assert_same_fields(got, want, where: str) -> None:
             assert value is None, (where, name)
             continue
         assert value.dtype == expected.dtype, (where, name, value.dtype, expected.dtype)
+        assert value.shape == expected.shape, (where, name, value.shape, expected.shape)
+        assert value.device == expected.device, (where, name, value.device, expected.device)
+        assert value.is_contiguous() and expected.is_contiguous(), (where, name, value.stride(), expected.stride())
         assert value.tolist() == expected.tolist(), (where, name)
 
 
@@ -106,19 +114,25 @@ def _assert_same_fields(got, want, where: str) -> None:
 
 
 @pytest.mark.parametrize("fail_at", [1, 2, 3])
-def test_a_full_queue_at_a_take_serves_the_step_from_the_host_and_counts_once(monkeypatch, fail_at):
+def test_a_full_queue_at_a_take_serves_the_step_from_the_host_and_counts_once(monkeypatch, caplog, fail_at):
     """Three takes, the ``fail_at``-th refused with the queue-full error: no raise, every take
-    equals the torch route bit for bit, the two others launched, the refused one counted."""
+    equals the torch route bit for bit, the two others launched, the refused one counted and
+    logged once as a warning that names the full queue and the launch."""
     monkeypatch.setattr(async_step, "_launches_in_a_graph", lambda tensor: True)
     launch = _RefusingLaunch(fail_at, RuntimeError(QUEUE_FULL))
     async_step.reset_dispatch_counters()
-    for seed in (11, 12, 13):
-        accepted, drafts = _take_operands(seed)
-        got = async_step.mtp_async_take(accepted, drafts, launch=launch)
-        _assert_same_fields(got, async_step.mtp_async_take_torch(accepted, drafts), f"take seed {seed}")
+    with caplog.at_level(logging.WARNING, logger=async_step.__name__):
+        for seed in (11, 12, 13):
+            accepted, drafts = _take_operands(seed)
+            got = async_step.mtp_async_take(accepted, drafts, launch=launch)
+            _assert_same_fields(got, async_step.mtp_async_take_torch(accepted, drafts), f"take seed {seed}")
     assert launch.calls == {"take": 3, "correct": 0}
     assert async_step.queue_full_fallbacks() == 1
     assert async_step.dispatch_counters() == (2, 1), async_step.dispatch_counters()
+    warnings = [record for record in caplog.records if record.name == async_step.__name__]
+    assert len(warnings) == 1, [record.getMessage() for record in warnings]
+    assert warnings[0].levelno == logging.WARNING
+    assert "full execution queue" in warnings[0].getMessage() and "take" in warnings[0].getMessage()
 
 
 @pytest.mark.parametrize("fail_at", [1, 2, 3])
@@ -268,17 +282,21 @@ def _stalled_graph(real, release: threading.Event, issued: list, reads: list):
     return graph
 
 
-def test_the_launch_holds_at_most_launch_depth_unprocessed_launches(step_tests_fresh_dynamo, monkeypatch):
-    """With the runtime processing nothing, a thread issuing ``LAUNCH_DEPTH + 2`` takes gets
-    exactly ``LAUNCH_DEPTH`` of them enqueued and blocks in the oldest's read; releasing the
-    runtime lets the rest through, and the launch holds no more than ``LAUNCH_DEPTH``."""
+def test_the_launch_holds_at_most_the_depth_of_unprocessed_launches(step_tests_fresh_dynamo, monkeypatch, caplog):
+    """With the runtime processing nothing, a thread issuing ``depth + 2`` takes gets exactly
+    ``depth`` of them enqueued and blocks in the oldest's read; releasing the runtime lets the
+    rest through, the launch holds no more than ``depth``, and each wait is logged once as a
+    warning with the launches held and the time waited."""
     monkeypatch.setattr(async_step, "_launches_in_a_graph", lambda tensor: True)
-    launch = async_step.DeviceLaunch("eager")
+    queue = _workers_queue_setting()
+    launch = async_step.DeviceLaunch("eager", execution_queue=queue)
     release, issued, reads = threading.Event(), [], []
     launch._take = _stalled_graph(async_step._take_launch, release, issued, reads)
     accepted, drafts = _take_operands(41)
-    depth = async_step.LAUNCH_DEPTH
+    depth = launch.depth
+    assert depth == async_step.launch_depth(queue)
     results: list = []
+    caplog.set_level(logging.WARNING, logger=async_step.__name__)
 
     def issue():
         for _ in range(depth + 2):
@@ -301,22 +319,41 @@ def test_the_launch_holds_at_most_launch_depth_unprocessed_launches(step_tests_f
     assert len(results) == depth + 2
     assert launch.outstanding <= depth
     assert launch.calls == {"take": depth + 2, "correct": 0}
+    waits = [record.getMessage() for record in caplog.records if record.name == async_step.__name__]
+    assert len(waits) == 2, waits  # the two launches past the depth each waited on the oldest
+    assert all(f"{depth} launches unprocessed" in text and " ms" in text for text in waits), waits
 
 
 def test_a_processed_launch_is_let_through_without_a_wait(step_tests_fresh_dynamo, monkeypatch):
-    """Outputs the runtime has processed read back at once: ``LAUNCH_DEPTH + 2`` takes in a
-    row complete with one read of the oldest per launch past the depth."""
+    """Outputs the runtime has processed read back at once: ``depth + 2`` takes in a row
+    complete with one read of the oldest per launch past the depth."""
     monkeypatch.setattr(async_step, "_launches_in_a_graph", lambda tensor: True)
-    launch = async_step.DeviceLaunch("eager")
+    launch = async_step.DeviceLaunch("eager", execution_queue=_workers_queue_setting())
     release, issued, reads = threading.Event(), [], []
     release.set()
     launch._take = _stalled_graph(async_step._take_launch, release, issued, reads)
     accepted, drafts = _take_operands(42)
-    for _ in range(async_step.LAUNCH_DEPTH + 2):
+    depth = launch.depth
+    for _ in range(depth + 2):
         async_step.mtp_async_take(accepted, drafts, launch=launch)
-    assert len(issued) == async_step.LAUNCH_DEPTH + 2
+    assert len(issued) == depth + 2
     assert len(reads) == 2
-    assert launch.outstanding == async_step.LAUNCH_DEPTH
+    assert launch.outstanding == depth
+
+
+def test_a_launch_without_an_execution_queue_has_no_bound(step_tests_fresh_dynamo, monkeypatch):
+    """A launch built without a queue (a host backend: launches run eagerly, nothing is
+    queued) has no depth and never reads an output back: twenty takes whose outputs would
+    block in a read all issue."""
+    monkeypatch.setattr(async_step, "_launches_in_a_graph", lambda tensor: True)
+    launch = async_step.DeviceLaunch("eager")
+    assert launch.depth is None
+    release, issued, reads = threading.Event(), [], []
+    launch._take = _stalled_graph(async_step._take_launch, release, issued, reads)
+    accepted, drafts = _take_operands(43)
+    for _ in range(20):
+        async_step.mtp_async_take(accepted, drafts, launch=launch)
+    assert len(issued) == 20 and reads == [] and launch.outstanding == 0
 
 
 @pytest.fixture
@@ -344,17 +381,100 @@ def _workers_queue_setting() -> int:
     return values[0]
 
 
-def test_the_launch_depth_fits_the_workers_execution_queue_with_a_factor_two_margin():
-    """The drafter's launches are two of every three executions of a decode step, so D
-    unprocessed launches hold at most ``D + D // 2 + 1`` queue slots; that must fit half the
-    queue the worker configures. The depth exceeds the five launches a healthy host holds
-    (take N, correct and take of N+1 and N+2 under the engine's two batches), so the bound
-    never waits on a healthy host, and is a whole number of launch pairs."""
+def _executions_held_by_enumeration(launches: int) -> int:
+    """The most executions a rank has enqueued but not seen processed while ``launches`` of
+    the drafter's launches are unprocessed, by walking the enqueue order of a served
+    sequence -- the prefill's take, then per step the correction, the forward, the take --
+    over every window of ``launches`` launches: the launches, the forwards between them, and
+    the forward already enqueued when the launch that waits is a take."""
+    order = ["take"] + ["correct", "forward", "take"] * 8
+    launch_sites = [i for i, kind in enumerate(order) if kind != "forward"]
+    held = []
+    for first in range(len(launch_sites) - launches):
+        waiting = launch_sites[first + launches]
+        # executions from the oldest unprocessed launch up to, not including, the waiting launch
+        held.append(waiting - launch_sites[first])
+    return max(held)
+
+
+@pytest.mark.parametrize("launches", range(1, 13))
+def test_the_executions_a_rank_holds_for_its_unprocessed_launches(launches):
+    assert async_step.executions_held(launches) == _executions_held_by_enumeration(launches)
+
+
+@pytest.mark.parametrize("queue", range(2, 65))
+def test_the_launch_depth_is_the_largest_whose_executions_fit_half_the_queue(queue):
+    """The depth is the most unprocessed launches whose executions (with the forwards
+    between them) fit half the execution queue; one more would not. The other half stays free
+    for executions this count does not include."""
+    depth = async_step.launch_depth(queue)
+    assert depth >= 0
+    assert async_step.executions_held(depth) <= queue // 2 < async_step.executions_held(depth + 1), (queue, depth)
+
+
+def test_the_launch_depth_at_the_workers_queue_and_at_the_runtimes_default():
+    """The worker's queue (read from its source) admits the drafter with a depth above the
+    launches a healthy host holds; the runtime's own default of 8 derives a depth below it."""
     queue = _workers_queue_setting()
-    depth = async_step.LAUNCH_DEPTH
-    assert depth + depth // 2 + 1 <= queue // 2, (depth, queue)
-    assert depth > 5
-    assert depth % 2 == 0
+    assert async_step.launch_depth(queue) == 10 and queue == 32, (queue, async_step.launch_depth(queue))
+    assert async_step.launch_depth(queue) >= async_step.STEADY_STATE_LAUNCHES
+    assert async_step.launch_depth(8) == 2 < async_step.STEADY_STATE_LAUNCHES
+    assert async_step.DeviceLaunch("eager", execution_queue=queue).depth == 10
+
+
+def test_the_minimum_execution_queue_is_the_smallest_that_never_waits_on_a_healthy_host():
+    """``MINIMUM_EXECUTION_QUEUE`` is the least queue whose depth reaches the launches a
+    healthy host holds (take N, the correction and take of N+1 and N+2 under the engine's two
+    batches): one below it derives a smaller depth."""
+    minimum = async_step.MINIMUM_EXECUTION_QUEUE
+    assert async_step.launch_depth(minimum) == async_step.STEADY_STATE_LAUNCHES == 5
+    assert async_step.launch_depth(minimum - 1) < async_step.STEADY_STATE_LAUNCHES
+    assert async_step.DeviceLaunch("eager", execution_queue=minimum).depth == async_step.STEADY_STATE_LAUNCHES
+
+
+@pytest.mark.parametrize("below", [0, 1, 7])
+def test_a_queue_too_small_for_the_drafters_steady_state_is_refused_by_name(below):
+    """A launch under a queue whose depth is below the launches a healthy host holds would
+    wait on every step; it is refused with the setting's name, its value and the minimum."""
+    queue = async_step.MINIMUM_EXECUTION_QUEUE - 1 - below
+    assert queue >= 1
+    with pytest.raises(async_step.MtpAsyncStepError) as raised:
+        async_step.DeviceLaunch("eager", execution_queue=queue)
+    text = str(raised.value)
+    assert async_step.EXECUTION_QUEUE_ENV in text and f"={queue}" in text, text
+    assert str(async_step.MINIMUM_EXECUTION_QUEUE) in text, text
+    assert async_step.EXECUTION_QUEUE_ENV == "NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS"
+
+
+class _RecordingLaunch:
+    """Stands in for :class:`DeviceLaunch` at the runner's builder: records the arguments."""
+
+    built: list = []
+
+    def __init__(self, backend, options=None, *, execution_queue=None) -> None:
+        self.backend, self.options, self.execution_queue = backend, options, execution_queue
+        _RecordingLaunch.built.append(self)
+
+
+def test_the_runner_hands_the_launch_the_runtimes_execution_queue_or_refuses_by_name(monkeypatch):
+    """The runner's launch builder names the execution queue the worker set for the runtime
+    (``NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS``) to the launch it builds; with the setting
+    absent it refuses by name instead of building an unbounded launch."""
+    monkeypatch.setattr(async_step, "DeviceLaunch", _RecordingLaunch)
+    _RecordingLaunch.built.clear()
+    runner = SimpleNamespace(
+        device=torch.device("meta"), _glm5next_async_launch_instance=None, compile_options={"option": 1}
+    )
+    monkeypatch.setenv(async_step.EXECUTION_QUEUE_ENV, "24")
+    launch = NeuronModelRunner._glm5next_async_launch(runner)
+    assert isinstance(launch, _RecordingLaunch) and launch.execution_queue == 24
+    assert launch.options == {"option": 1} and runner._glm5next_async_launch_instance is launch
+    assert NeuronModelRunner._glm5next_async_launch(runner) is launch and len(_RecordingLaunch.built) == 1
+    runner._glm5next_async_launch_instance = None
+    monkeypatch.delenv(async_step.EXECUTION_QUEUE_ENV)
+    with pytest.raises(async_step.MtpAsyncStepError, match=async_step.EXECUTION_QUEUE_ENV):
+        NeuronModelRunner._glm5next_async_launch(runner)
+    assert len(_RecordingLaunch.built) == 1
 
 
 # ── the degradation inside the served runner ──────────────────────────────────────────
@@ -367,7 +487,7 @@ class _RefusingDeviceLaunch(async_step.DeviceLaunch):
     base class's) only those that launched."""
 
     def __init__(self, fail_at: int, error: Exception) -> None:
-        super().__init__("eager")
+        super().__init__("eager", execution_queue=_workers_queue_setting())
         self.fail_at = fail_at
         self.error = error
         self.issued = 0
