@@ -20,7 +20,8 @@ Run the device stage ONLY through the device lease, which pins the cores and set
 ``--stage run`` then times and profiles those NEFFs under the lease (``--stage all`` does
 both). ``--stage summarize`` re-derives ``summary.json`` from the records of an earlier run
 (``neuron-explorer view`` reads the kept profiles again; it needs no device).
-``--table``, ``--wire`` and ``--form`` select a part of the arms, for a shorter lease.
+``--table``, ``--wire``, ``--form`` and ``--flagset`` select a part of the arms, for a
+shorter lease.
 ``--stop-check <command>`` runs the command (a check of the kernel log for device faults,
 say) before every device case, and stops the run at the first non-zero exit.
 
@@ -809,6 +810,7 @@ def summarize(output_dir: Path) -> dict:
         "kind": "MEASURED",
         "script": manifest["script"],
         "script_sha256": manifest["script_sha256"],
+        "script_sha256_run": manifest.get("script_sha256_run"),
         "environment": manifest["environment"],
         "window": [manifest.get("bench_start"), manifest.get("bench_end")],
         "geometry": manifest["geometry"],
@@ -919,6 +921,15 @@ def main() -> int:
         help="the arms of one form only (a shorter lease)",
     )
     parser.add_argument(
+        "--flagset",
+        nargs="+",
+        choices=("all",)
+        + CORE_FLAGSETS
+        + tuple(f"{base}_{option}" for base, option in OPTION_SETS),
+        default=["all"],
+        help="the arms of these flag sets only (a shorter lease)",
+    )
+    parser.add_argument(
         "--stop-check",
         help="a command run before every device case; a non-zero exit stops the run "
         "there, with the records made so far",
@@ -956,6 +967,7 @@ def main() -> int:
         if args.table in ("all", a["table"])
         and args.wire in ("all", a["wire"])
         and args.form in ("all", a["form"])
+        and ("all" in args.flagset or a["flagset"] in args.flagset)
     ]
     if args.stage == "run":
         manifest = json.loads(manifest_path.read_text())
@@ -970,6 +982,7 @@ def main() -> int:
             return 0
     manifest.update(
         argv_run=sys.argv,
+        script_sha256_run=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         iterations=args.iterations,
         warmup=args.warmup,
         repeats=args.repeats,
