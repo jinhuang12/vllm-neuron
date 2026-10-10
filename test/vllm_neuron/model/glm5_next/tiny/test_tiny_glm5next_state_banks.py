@@ -155,7 +155,11 @@ def test_a_b64_bank_form_decode_over_scattered_slots_matches_the_one_request_ste
     # The bank form reached the layers: the banks themselves and the scattered slots.
     sides = world.runner._glm5next_side_cache_set
     for index, carrier in enumerate(carriers[0]):
-        assert carrier["pool_cache"] is sides[index]["pool_cache"]
+        # The pooled store goes flat: the bank's own storage, [slots * rows, dim].
+        pool, flat = sides[index]["pool_cache"], carrier["pool_cache"]
+        assert flat.untyped_storage().data_ptr() == pool.untyped_storage().data_ptr()
+        assert flat.storage_offset() == 0
+        assert tuple(flat.shape) == (pool.shape[0] * pool.shape[1], pool.shape[2])
         assert carrier["tail"] is sides[index]["tail"]
         assert carrier["state_slots"].tolist() == slot_map
         assert int(sides[index]["pool_cache"].shape[0]) == CAPACITY + 1
@@ -491,7 +495,11 @@ def test_a_synthetic_bank_form_decode_names_slots_zero_to_b_and_takes_no_claim()
         assert carrier["state_slots"].tolist() == [0, 1, 2, 3], (index, carrier["state_slots"])
         if "tail" in carrier:
             assert carrier["tail"] is sides[index]["tail"]
-            assert carrier["pool_cache"] is sides[index]["pool_cache"]
+            # The pooled store goes flat: the bank's own storage, [slots * rows, dim].
+            pool, flat = sides[index]["pool_cache"], carrier["pool_cache"]
+            assert flat.untyped_storage().data_ptr() == pool.untyped_storage().data_ptr()
+            assert flat.storage_offset() == 0
+            assert tuple(flat.shape) == (pool.shape[0] * pool.shape[1], pool.shape[2])
             read += 1
         else:
             assert carrier["conv_state"] is banks[index]["conv_state"]

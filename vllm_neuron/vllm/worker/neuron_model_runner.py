@@ -5973,11 +5973,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         request's rows all name the null block. The checks are the one-request
         carrier's, per request.
 
-        Two forms of the two side caches. ``banked`` hands the whole ``pool_cache`` and
-        ``tail`` banks beside a ``[B]`` int64 ``state_slots`` tensor (two graph inputs
-        per layer whatever ``B`` is; the layer gathers and writes back by slot, in place
-        on the bank). Otherwise each is a tuple of one disjoint bank view per request,
-        the per-request form, which the layer stacks and writes back view by view.
+        Two forms of the two side caches. ``banked`` hands the whole ``pool_cache`` (flat,
+        ``[slots * rows, index_head_dim]``) and ``tail`` banks beside a ``[B]`` int64
+        ``state_slots`` tensor (two graph inputs per layer whatever ``B`` is; the layer
+        gathers and writes back by slot, in place on the bank). Otherwise each is a tuple
+        of one disjoint bank view per request, the per-request form, which the layer
+        stacks and writes back view by view.
 
         A padding request (the last ``padding``) is a sequence of one token in the
         null block: position 0, a table column naming block ``NULL_BLOCK_ID`` and
@@ -6145,7 +6146,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 )
                 if problem is not None:
                     raise ValueError(problem)
-            carrier["pool_cache"] = side["pool_cache"]
+            # The pooled store goes flat ([slots * rows, index_head_dim], the same
+            # storage) so the layer writes this graph input itself: a write through a
+            # view the layer made would keep only the graph's last write, and the MTP
+            # draft layer writes its store more than once per verify graph.
+            pool = side["pool_cache"]
+            carrier["pool_cache"] = pool.view(-1, int(pool.shape[-1]))
             carrier["tail"] = side["tail"]
             carrier["state_slots"] = operands[slots_key]
         else:
