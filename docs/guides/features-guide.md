@@ -610,14 +610,13 @@ scheduling forms:
   scheduling by name, because the accepted count would reach the host one step late.
 - **Async drafter (opt-in):** `VLLM_NEURON_GLM5NEXT_MTP_ASYNC=1` with `--async-scheduling`
   and `--max-num-seqs 1`. The verify step's position corrections run on device one step
-  late, so the scheduler's host work overlaps the device; the drafter refuses the knob
-  with synchronous scheduling (it would change nothing) or with `max_num_seqs > 1` (it
-  serves one sequence). Measured on trn2 at tensor parallel 64, expert parallel 16,
-  `k = 3`, batch size 1: inter-token latency 7.565 ms against 11.377 ms synchronous (median
-  per-token gap on the same tree, a 1k-token context; mean per-token gap 10.17 against 15.45
-  ms; 77.7 against 55.6 tokens/s)
-  (2026-10-10); the 8-prompt greedy outputs identical to the synchronous drafter's; the same
-  GSM8K@200 strict score and wrong set.
+  late, so the scheduler's host work overlaps the device; the drafter refuses the knob with
+  synchronous scheduling (it would change nothing) or with `max_num_seqs > 1` (it serves one
+  sequence). Measured on trn2 at tensor parallel 64, expert parallel 16, `k = 3`, batch size
+  1: inter-token latency 7.565 ms against 11.377 ms synchronous (median per-token gap on the
+  same host and recipe, a 1k-token context; mean per-token gap 10.17 against 15.45 ms; 77.7
+  against 55.6 tokens/s) (2026-10-10); the 8-prompt greedy outputs identical to the
+  synchronous drafter's; the same GSM8K@200 strict score and wrong set.
 
 It is
 served greedy only (under this recipe, sampling knobs are refused at admission). Its
