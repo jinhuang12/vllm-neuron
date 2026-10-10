@@ -17,7 +17,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from test.vllm_neuron.model.glm5_next.tiny import test_tiny_glm5next_e2e as tiny_e2e
+
+# Device-free, like the two files it runs. Not ``forked``: it starts its own interpreter for
+# them, so nothing in this process decides the outcome.
+pytestmark = [pytest.mark.fast]
 
 #: The repository root, where ``python -m pytest`` imports this checkout's packages from.
 REPO = Path(__file__).resolve().parents[5]
