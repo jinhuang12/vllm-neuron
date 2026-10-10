@@ -162,7 +162,7 @@ def test_two_partition_tiles_equal_the_tiles_run_apart() -> None:
     assert torch.equal(pair, torch.cat([p[1] for p in parts]))
 
 
-def test_the_torch_route_is_stage_a_arithmetic_bit_for_bit() -> None:
+def test_the_torch_route_is_the_traced_heads_arithmetic_bit_for_bit() -> None:
     """``mtp_tail_out_torch`` is the draft loop's tail as the traced head wrote it."""
     ops = _operands(7_901, 5, TINY_HIDDEN, TINY_ROWS)
     hidden, pair = tail_out.mtp_tail_out_torch(**ops, eps=EPS)

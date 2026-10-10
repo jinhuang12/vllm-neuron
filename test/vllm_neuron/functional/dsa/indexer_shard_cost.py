@@ -845,13 +845,13 @@ def perf(ab: dict, cost: IndexerCost) -> dict:
 #: The kind and source of every field of the report JSON, by field name. A value's label
 #: is that of the deepest field on its path that is listed here (so ``as_built_ms`` labels
 #: every bucket under it). INPUT marks an operating point or shape, not a measurement.
-_BUCKETS = f"worker-3 calibrated buckets ({CALIB_DIR}), per chunk for the 11 DSA layers"
+_BUCKETS = f"the calibrated buckets ({CALIB_DIR}), per chunk for the 11 DSA layers"
 LABELS = {
     "dsa_layers": f"INPUT: the calibrated model's DSA layer count ({CALIB_DIR})",
     "context": "INPUT: max_model_len priced",
     "cands": "INPUT: candidate pools, context // index_kpool",
     "prompt": "INPUT: prompt tokens",
-    "column": "INPUT: worker-3 TTFT column (asbuilt, withbranches)",
+    "column": "INPUT: the calibration's TTFT column (asbuilt, withbranches)",
     "degree": "INPUT: ranks sharing the selection",
     "design": "INPUT: design name",
     "n_chunks": "DERIVED: ceil(prompt / 1024)",
@@ -872,24 +872,24 @@ LABELS = {
     "net_saved_ms": "DERIVED: compute_saved_ms - comm_added_ms - glue_added_ms",
     "query_d64_net_saved_band_ms": "DERIVED: net_saved_ms at the two ends of glue_band_us",
     "memory_per_rank_per_layer_bytes": "DERIVED: buffer shapes x 4 bytes",
-    "before_ms": f"DERIVED: worker-3 prefill_model.py ({CALIB_DIR}); equal to "
+    "before_ms": f"DERIVED: the calibration's prefill_model.py ({CALIB_DIR}); equal to "
                  "prefill_calibrated.json where that file has the row",
     "saved_per_chunk_ms": "DERIVED: net_saved_ms of query_d64 at the prompt's cands",
     "after_ms": "DERIVED: before_ms - n_chunks x saved_per_chunk_ms",
-    "servable_as_built": f"DERIVED: worker-3 prefill_model.py admission ({CALIB_DIR})",
+    "servable_as_built": f"DERIVED: the calibration's prefill_model.py admission ({CALIB_DIR})",
     "fixed_c_ms": "DERIVED: compute_after_ms summed over the chunks at the full cands",
     "prefix_sized_ms": "DERIVED: compute_after_ms summed over the chunks at prefix cands",
     "saved_ms": "DERIVED: fixed_c_ms - prefix_sized_ms",
     "alpha_ms_per_call_layer": "DERIVED: top-k fit to the two MEASURED as-built points",
     "beta_ms_per_mcycle": "DERIVED: top-k fit to the two MEASURED as-built points",
-    "tok_scale": f"DERIVED: worker-3 calibration token scale ({CALIB_DIR})",
+    "tok_scale": f"DERIVED: the calibration's token scale ({CALIB_DIR})",
     "collective": f"DERIVED: calibrated collective constants ({CAL_CONSTANTS})",
-    "fit_intercepts_ms": f"DERIVED: per-call intercepts of worker-3's fits ({CALIB_DIR})",
+    "fit_intercepts_ms": f"DERIVED: per-call intercepts of the calibration's fits ({CALIB_DIR})",
     "glue_us_per_layer": f"MEASURED: the row cut's segment in the profiled cut graph, us, "
                          f"median over the profiled runs ({DEVICE_RECORDS_DIR})",
     "glue_band_us": "MEASURED: the lowest and highest sharded - precut of every device "
                     "repeat (the cut and every other difference of the two compiled chains)",
-    "sentinel_order_measured_ms": "MEASURED: round-2 breakdown master table, by cands",
+    "sentinel_order_measured_ms": "MEASURED: the prefill breakdown's master table, by cands",
     # device_ab: indexer_shard_device.py records in DEVICE_RECORDS_DIR, one chip (lease dsa)
     "with_causal_bound": "INPUT: whether the run's chain has the causal bound",
     "repeats": "INPUT: device runs (processes) per width",
@@ -1017,7 +1017,7 @@ def report(cost: IndexerCost | None = None) -> dict:
     out = {
         "what": "The query-sharded DSA prefill selection: its DERIVED cost per 1024-row "
                 "chunk, TP=64, all 11 DSA layers (per_layer = /11; source of every as-built "
-                f"value: {CALIB_DIR}, worker-3 calibrated buckets), its MEASURED device A/B "
+                f"value: {CALIB_DIR}, the calibrated buckets), its MEASURED device A/B "
                 f"on one chip (device_ab), its per-op device time against entitlement "
                 f"(perf) and a two-rank all-gather check (allgather_two_ranks), all from "
                 f"{DEVICE_RECORDS_DIR}. This is the evidence file of "

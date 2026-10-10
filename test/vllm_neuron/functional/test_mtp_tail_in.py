@@ -146,7 +146,7 @@ def test_two_partition_tiles_equal_the_tiles_run_apart() -> None:
     assert torch.equal(whole, apart), "a 130-row call must equal a 128-row and a 2-row call"
 
 
-def test_the_torch_route_is_stage_a_arithmetic_bit_for_bit() -> None:
+def test_the_torch_route_is_the_traced_heads_arithmetic_bit_for_bit() -> None:
     """``mtp_tail_in_torch`` is the head's traced ``_layer_input`` expression, restricted
     to the shard rows: the CPU route and the reference the kernel is held to."""
     ops = _operands(5_901, 5, TINY_HIDDEN, TINY_VOCAB, 1, 0, zero_positions=(2,))

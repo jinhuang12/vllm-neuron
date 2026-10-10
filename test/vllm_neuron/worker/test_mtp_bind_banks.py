@@ -53,8 +53,8 @@ def _tree_carves_checkpoint_banks() -> bool:
 
 SEAM = pytest.mark.xfail(
     condition=not _tree_carves_checkpoint_banks(),
-    reason="this tree allocates one state row per slot: worker-57's state_bank_regions(checkpoints=1 + k) "
-    "and bind_kv_cache hunk (wt2/mtpB-kda) are not merged in yet",
+    reason="this tree allocates one state row per slot: state_bank_regions(checkpoints=1 + k) "
+    "and the bind_kv_cache checkpoint-bank hunk are not in it",
     strict=True,
 )
 

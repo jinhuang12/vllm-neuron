@@ -43,7 +43,7 @@ RING_HELPER_PRESENT = (
 )
 SEAM = pytest.mark.xfail(
     condition=not RING_HELPER_PRESENT,
-    reason="worker-58's indexer_ring_depth (wt2/mtpB-dsa) is not in this tree; the runner's "
+    reason="indexer_ring_depth is not in this tree; the runner's "
     "ring helper cannot price a speculative server here",
     strict=True,
 )

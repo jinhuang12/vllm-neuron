@@ -442,8 +442,8 @@ def test_a_cache_holding_two_serve_lines_is_split_by_the_kv_input(tmp_path) -> N
 COMPILE_CACHE_ROOT_ENV = "VLLM_NEURON_TEST_COMPILE_CACHE_ROOT"
 needs_compile_cache = pytest.mark.skipif(
     not os.environ.get(COMPILE_CACHE_ROOT_ENV),
-    reason=f"{COMPILE_CACHE_ROOT_ENV} unset: it names the tip-b64-C compile cache "
-    "(bs=64 @ 8k line, 15 graphs) the runtime figures are from",
+    reason=f"{COMPILE_CACHE_ROOT_ENV} unset: it names the compile cache of the recorded "
+    "bs=64 @ 8k serve run (15 graphs) the runtime figures are from",
 )
 
 
@@ -456,7 +456,7 @@ def compile_cache_root() -> Path:
 
 def _cache_neff(key: str) -> Path:
     path = compile_cache_root() / key / f"graph_{key}.neff"
-    assert path.is_file(), f"{path}: not in {COMPILE_CACHE_ROOT_ENV}; is it the tip-b64-C cache?"
+    assert path.is_file(), f"{path}: not in {COMPILE_CACHE_ROOT_ENV}; is it the recorded bs=64 @ 8k run's cache?"
     return path
 
 
