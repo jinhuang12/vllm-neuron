@@ -521,7 +521,8 @@ forward pass.
 
 :::{note}
 **Mutually exclusive with async scheduling.** Setting `--speculative-config`
-disables async scheduling automatically with a startup warning.
+disables async scheduling automatically with a startup warning (the GLM-5.3-Flash MTP drafter instead refuses async scheduling by name: pass
+`--no-async-scheduling`).
 
 EAGLE3 and DFlash are supported speculative methods. The examples below use
 EAGLE3. For per-model compatibility, see the
@@ -603,14 +604,20 @@ GLM-5.3-Flash drafts from its own multi-token-prediction head (no draft model):
 environment variable `VLLM_NEURON_GLM5NEXT_ON_DEVICE_SAMPLING=1`, which turns on
 GLM-5.3-Flash's on-device sampler (without it the server refuses the
 `on_device_sampling_config`). It is
-served greedy only (sampling knobs are refused at admission) and its greedy output
-can differ from non-speculative greedy decoding at near-ties, because the
-`1 + k`-row verify graph and the one-token decode graph accumulate in different
-orders (measured: 4 of 8 identity prompts diverged on wording or whitespace
-alternatives; GSM8K@200 exact-match 0.99 unchanged; each step is lossless by id
-equality, and an on-device-sampling server returns no logprobs with which to read
-the margins). Leave it off where token identity with non-speculative decoding is
-required. Details:
+served greedy only (under this recipe, sampling knobs are refused at admission). Its
+greedy output is not guaranteed identical to non-speculative greedy decoding: with
+the draft layer's earlier view-form latent write, consecutive identical requests
+drafted differently on device (one six-run series gave two alternating outputs; fixed
+by writing into the bank itself: 12 of 12 repeated generations and 8 of 8 prompts
+identical across two passes against the same server). Output still differs from
+non-speculative greedy decoding, deterministically within a configuration (3 of 8
+identity prompts on the bank-write configuration, 4 of 8 on the earlier one): the
+likeliest carrier is the `1 + k`-row verify graph and the one-row decode graph
+accumulating in different orders (each step is lossless by id equality, and an
+on-device-sampling server returns no logprobs with which to read the margins).
+GSM8K@200 exact-match is 0.985 on this configuration (0.99 on the earlier one; one
+question flipped, cause under investigation). Leave it off where token identity with
+non-speculative decoding is required. Details:
 [`docs/design/speculation/speculative_decoding_design.md`](../design/speculation/speculative_decoding_design.md#glm-53-flash-mtp-drafter-method-mtp).
 
 By default (`VLLM_NEURON_GLUE_FUSED` unset or `1`) GLM-5.3-Flash's fused glue

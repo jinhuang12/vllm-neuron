@@ -101,6 +101,10 @@ def _drive(kv_cache_config, layers, monkeypatch: pytest.MonkeyPatch) -> dict:
             ),
             model_config=SimpleNamespace(dtype=torch.bfloat16),
         ),
+        # One rank: the real ``__init__`` reads it from
+        # ``parallel_config.decode_context_parallel_size``; ``initialize_kv_cache``
+        # sizes each block-table row for that rank's share of the sequence.
+        _dcp_size=1,
         neuron_config=SimpleNamespace(fp8_packed_kv=False),
         speculative_config=None,
         drafter=None,

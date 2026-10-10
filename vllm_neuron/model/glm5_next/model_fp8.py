@@ -7107,21 +7107,29 @@ class Glm5NextMLAAttention(nn.Module):
         # One cast, used twice, so the value that persists and the value this step
         # reads back cannot differ.
         written = kv_latent.to(latent_cache.dtype)
-        # The persisting write, through the window view into the caller's bank, for
-        # the steps that come after this one.
-        latent_cache[:, 0, :].index_copy_(0, rows, written)
+        # The persisting write, into the caller's bank itself (``[slots, 1,
+        # head_size]``, so the source takes the single head's axis), for the reads
+        # after it in this graph and for the steps that come after this one. Not
+        # through a view such as ``latent_cache[:, 0, :]``: the backend's
+        # ``InPlaceToOutOfPlacePass`` makes each in-place op out of place and moves
+        # only the later uses of that op's own first argument onto the result, so a
+        # write through a view reaches no other view of the bank, and of several such
+        # writes in one graph only the last reaches the bank's aliased output. The
+        # draft layer writes its bank ``1 + k`` times in one verify step (``populate``,
+        # then one row per draft iteration); through a view it kept one draft row.
+        latent_cache.index_copy_(0, rows, written.unsqueeze(1))
 
         # The cache read. The whole bank, as a view, with the block table beside it.
         # The kernel assembles the window the table names and no copy of it is made
         # here: a window-sized copy per layer per step is exactly the cost the paging
         # removes, and the table is what makes the pages it gathers the request's own.
         #
-        # This step's rows travel beside the bank rather than inside it. Reading them
-        # back out of the bank would leave the kernel depending on when the write
-        # above becomes visible inside one graph, and on device it observed the rows
-        # from before the write. ``written`` and the position hand the kernel the
-        # same values the write carries, and it overlays them on the window it
-        # assembles, so what it attends is right whether or not the write has landed.
+        # This step's rows also travel beside the bank. ``written`` and the position
+        # hand the kernel the same values the write carries, and it overlays them on
+        # the window it assembles. The view is taken after the write above, so it
+        # holds those rows as well; the overlay dates from the view-form write, whose
+        # rows a later view never saw (the device read the rows from before the
+        # write), and it gives the kernel the same values either way.
         c_kv = latent_cache[:, 0, :]
         at = start.reshape(1, 1).to(torch.int32)
         if collector is not None:
@@ -7313,7 +7321,10 @@ class Glm5NextMLAAttention(nn.Module):
         if collector is not None:
             collector.extend([kv_latent, rows.to(torch.int32)])
         written = kv_latent.to(latent_cache.dtype)
-        latent_cache[:, 0, :].index_copy_(0, rows, written)
+        # Into the bank itself, not a view of it, for the reason given in
+        # :meth:`attend`: a write through a view is not seen by the view below, and
+        # only the last of several reaches the bank.
+        latent_cache.index_copy_(0, rows, written.unsqueeze(1))
         c_kv = latent_cache[:, 0, :]
         if collector is not None:
             collector.append(c_kv.detach().clone())

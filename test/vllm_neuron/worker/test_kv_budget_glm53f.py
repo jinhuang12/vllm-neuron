@@ -246,12 +246,16 @@ def fake_runner(
     """
     from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
 
+    vllm_config = served_vllm_config(
+        max_num_seqs=max_num_seqs,
+        max_model_len=max_model_len,
+        gate_knobs=gate_knobs,
+    )
     fake = SimpleNamespace(
-        vllm_config=served_vllm_config(
-            max_num_seqs=max_num_seqs,
-            max_model_len=max_model_len,
-            gate_knobs=gate_knobs,
-        ),
+        vllm_config=vllm_config,
+        # Set as the real ``__init__`` sets it; ``initialize_kv_cache`` sizes each
+        # block-table row for one rank's share of the sequence.
+        _dcp_size=vllm_config.parallel_config.decode_context_parallel_size,
         neuron_config=SimpleNamespace(fp8_packed_kv=False),
         speculative_config=None,
         drafter=None,
