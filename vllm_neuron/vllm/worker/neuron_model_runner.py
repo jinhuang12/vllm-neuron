@@ -1095,6 +1095,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # hook and the mtp draft proposal; None until a step is converted and after
         # a synthetic one.
         self._glm5next_step_record = None
+        # The async drafter's carry between two steps (``functional/mtp/async_step.
+        # StepCarry``): written by the state hook from the step's device output, read
+        # once by the next step's translator and by its draft proposal. None on the
+        # synchronous drafter and after a step consumed it.
+        self._glm5next_async_carry = None
+        # The async drafter's compiled kernel launches for this runner's device
+        # (``functional/mtp/async_step.DeviceLaunch``), built once by
+        # ``_glm5next_async_launch``; None on the host and before the first use.
+        self._glm5next_async_launch_instance = None
+        # The drafts-only tensor the next step's rejection sampler reads under async
+        # scheduling (``futures_drafts_only``); set by the draft proposal.
+        self._futures_drafts_only = None
         self._draft_token_ids = None
         # Async EAGLE3 draft rows by req_id. Only used at batch-composition
         # changes (e.g. several prefills merging into the first bs-wide decode).
@@ -5177,6 +5189,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 self._tensor_replacer.warmup_context(bucket_size, self.device)
             )
         model_output = self.model(**self._glm5next_model_kwargs(warmup_kwargs))
+        if self._glm5next_async_drafter():
+            self._glm5next_async_warmup(model_output, batch_size=1, is_prefill=True)
         if self.use_async_scheduling:
             self._materialize_warmup_output(model_output)
         if self._tensor_replacer is not None:
@@ -5959,6 +5973,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         operands: dict,
         banked: bool = False,
         width: int = 1,
+        correction=None,
+        column=None,
     ) -> dict:
         """One sparse (DSA) layer's carrier for a request-major decode step: ``B > 1``
         requests, or one request's verify step of ``width > 1`` rows (the layer's
@@ -6046,14 +6062,24 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         latent = bank["latent_cache"]
         device = latent.device
         if device not in operands:
-            positions = cls._glm5next_start_positions(starts, device)
-            operands[device] = {
-                "seq_lens": cls._glm5next_batch_row_seq_lens(
-                    [(int(width), start) for start in starts], device=device
-                ),
-                "start_position": positions,
-                "position": positions,
-            }
+            if correction is not None:
+                # The async drafter: the device's operands at the true positions
+                # (``functional/mtp/async_step.StepCorrection``), one per device.
+                cls._glm5next_correction_on(correction, device, name=name)
+                operands[device] = {
+                    "seq_lens": correction.seq_lens,
+                    "start_position": correction.start_position,
+                    "position": correction.start_position,
+                }
+            else:
+                positions = cls._glm5next_start_positions(starts, device)
+                operands[device] = {
+                    "seq_lens": cls._glm5next_batch_row_seq_lens(
+                        [(int(width), start) for start in starts], device=device
+                    ),
+                    "start_position": positions,
+                    "position": positions,
+                }
         rows = geometry.get("request_block_ids", ())
         pages_key = ("pages", device, id(rows), window_blocks, block_size)
         paged = operands.get(pages_key)
@@ -6087,28 +6113,31 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         f"sequence; a request longer than its bucket cannot be served by "
                         f"this window"
                     )
-            tables += [[NULL_BLOCK_ID]] * int(padding)
-            paged = {
-                # One column per request, ``-1`` past its pages, built on the host and
-                # moved once.
-                "block_table_row": torch.tensor(
-                    [
-                        [ids[page] if page < len(ids) else -1 for ids in tables]
-                        for page in range(window_blocks)
-                    ],
-                    dtype=torch.int32,
-                ).to(device),
-                # ``width`` physical bank rows per request: its own tokens' slots, a
-                # padding request's (no real token) all clamped to the null block.
-                "latent_slots": cls._glm5next_latent_slot_mapping(
-                    rows=tables,
-                    starts=starts,
-                    tokens=int(width),
-                    block_size=block_size,
-                    reals=[max(1, int(one)) for one in reals],
-                    device=device,
-                ),
-            }
+            if correction is not None:
+                paged = {
+                    # The column the correction gathered through, and its slots.
+                    "block_table_row": column,
+                    "latent_slots": correction.latent_slots,
+                }
+            else:
+                paged = {
+                    # One column per request, ``-1`` past its pages, built on the host
+                    # and moved once.
+                    "block_table_row": cls._glm5next_block_table_column(
+                        tables, window_blocks=window_blocks, padding=int(padding),
+                        device=device,
+                    ),
+                    # ``width`` physical bank rows per request: its own tokens' slots, a
+                    # padding request's (no real token) all clamped to the null block.
+                    "latent_slots": cls._glm5next_latent_slot_mapping(
+                        rows=tables + [[NULL_BLOCK_ID]] * int(padding),
+                        starts=starts,
+                        tokens=int(width),
+                        block_size=block_size,
+                        reals=[max(1, int(one)) for one in reals],
+                        device=device,
+                    ),
+                }
             operands[pages_key] = paged
         carrier = {
             "latent_cache": latent,
@@ -6185,8 +6214,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         padded_requests: int = 0,
         state_checkpoints: int | None = None,
         checkpoint_rows=None,
+        async_correction=None,
+        block_table_column=None,
     ) -> list[dict]:
         """Build one kwargs mapping per layer, in spec order, holding that layer's own state.
+
+        ``async_correction`` (the async drafter, decode leg; a
+        :class:`~vllm_neuron.functional.mtp.async_step.StepCorrection`) replaces every
+        position-derived operand the host would build from ``request_starts`` with the
+        device's: the recurrent carriers' ``start_position`` and ``checkpoint_rows``, the
+        sparse carriers' ``seq_lens``, ``start_position``/``position`` and
+        ``latent_slots``; ``block_table_column`` is the ``[pages, R]`` table the
+        correction gathered through, handed to the sparse carriers as their
+        ``block_table_row`` (one upload). The host ints still drive every check.
 
         ``state_checkpoints`` / ``checkpoint_rows`` (speculative method "mtp", decode
         leg): the recurrent layers' banks hold ``1 + k`` state rows per slot, one
@@ -6392,13 +6432,21 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         )
                 device = bank["recurrent_state"].device
                 if device not in linear_step_operands:
+                    if async_correction is not None:
+                        cls._glm5next_correction_on(async_correction, device, name=bank["name"])
                     linear_step_operands[device] = {
-                        "start_position": cls._glm5next_start_positions(
-                            linear_starts, device
+                        "start_position": (
+                            cls._glm5next_start_positions(linear_starts, device)
+                            if async_correction is None
+                            else async_correction.linear_start
                         ),
                         **cls._glm5next_checkpoint_operands(
                             state_checkpoints,
-                            checkpoint_rows,
+                            (
+                                checkpoint_rows
+                                if async_correction is None
+                                else async_correction.checkpoint_rows
+                            ),
                             rows=len(linear_starts),
                             device=device,
                         ),
@@ -6493,6 +6541,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         operands=sparse_step_operands,
                         banked=banked,
                         width=request_width,
+                        correction=async_correction,
+                        column=block_table_column,
                     )
                 )
                 continue
@@ -6559,14 +6609,30 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             latent = bank["latent_cache"]
             device = latent.device
             if device not in sparse_step_operands:
-                shared = {
-                    "seq_lens": cls._glm5next_batch_row_seq_lens(
-                        [(tokens, start_position)], device=device
-                    ),
-                    "start_position": cls._glm5next_start_position(
-                        start_position, device
-                    ),
-                }
+                if async_correction is not None:
+                    # One request, one row: the correction's operands. The graph that serves
+                    # this form was compiled at warmup from the synchronous translator, whose
+                    # operands are distinct tensors (a 0-d start, a position of its own, and a
+                    # table column and slots per layer), and a compiled graph's guards keep the
+                    # inputs compiled as distinct tensors distinct objects: one object handed
+                    # in two places is a recompile, which the serve refuses. So the ``[1]``
+                    # start is viewed as 0-d once here and once more for ``position`` below,
+                    # and the column and the slots are handed as one view per layer
+                    # (``_glm5next_own_view``); nothing is copied or read on the host.
+                    cls._glm5next_correction_on(async_correction, device, name=bank["name"])
+                    shared = {
+                        "seq_lens": async_correction.seq_lens,
+                        "start_position": async_correction.start_position.reshape(()),
+                    }
+                else:
+                    shared = {
+                        "seq_lens": cls._glm5next_batch_row_seq_lens(
+                            [(tokens, start_position)], device=device
+                        ),
+                        "start_position": cls._glm5next_start_position(
+                            start_position, device
+                        ),
+                    }
                 if is_prefill:
                     shared["slot_mapping"] = cls._glm5next_batch_pool_slot_mapping(
                         [(tokens, start_position)],
@@ -6578,29 +6644,38 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         int(start_position) + real, device
                     )
                 else:
-                    shared["position"] = cls._glm5next_start_position(
-                        start_position, device
+                    shared["position"] = (
+                        async_correction.start_position.reshape(())
+                        if async_correction is not None
+                        else cls._glm5next_start_position(start_position, device)
                     )
                 sparse_step_operands[device] = shared
             carrier = {
                 "latent_cache": latent,
                 # The block table as a ``[pages, 1]`` int32 column padded with
-                # ``-1`` to the bucket's width; built on the host and moved once.
-                "block_table_row": torch.tensor(
-                    [[one] for one in ids]
-                    + [[-1]] * (window_blocks - len(ids)),
-                    dtype=torch.int32,
-                ).to(device),
+                # ``-1`` to the bucket's width; built on the host and moved once
+                # (under the async drafter, the column the correction gathered through).
+                "block_table_row": (
+                    cls._glm5next_block_table_column(
+                        [ids], window_blocks=window_blocks, padding=0, device=device
+                    )
+                    if block_table_column is None
+                    else cls._glm5next_own_view(block_table_column)
+                ),
                 # Each token's physical bank row. A chunk's padded rows repeat the
                 # last real token's slot, matching the clamp the layer applies to the
                 # values it writes, so the repeat is idempotent.
-                "latent_slots": cls._glm5next_latent_slot_mapping(
-                    rows=[ids],
-                    starts=[start_position],
-                    tokens=int(tokens),
-                    block_size=block_size,
-                    reals=[real],
-                    device=device,
+                "latent_slots": (
+                    cls._glm5next_latent_slot_mapping(
+                        rows=[ids],
+                        starts=[start_position],
+                        tokens=int(tokens),
+                        block_size=block_size,
+                        reals=[real],
+                        device=device,
+                    )
+                    if async_correction is None
+                    else cls._glm5next_own_view(async_correction.latent_slots)
                 ),
                 # This request's own row of each side cache, so two requests in one
                 # batch reach disjoint views.
@@ -6630,6 +6705,276 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         return carriers
 
     @staticmethod
+    def _glm5next_block_table_column(rows, *, window_blocks: int, padding: int, device) -> torch.Tensor:
+        """``[window_blocks, R]`` int32: one block-table column per request, then ``padding``
+        null-block columns; ``-1`` past a request's pages. Built on the host, moved once."""
+        tables = [[int(value) for value in row] for row in rows] + [[NULL_BLOCK_ID]] * int(padding)
+        return torch.tensor(
+            [
+                [ids[page] if page < len(ids) else -1 for ids in tables]
+                for page in range(int(window_blocks))
+            ],
+            dtype=torch.int32,
+        ).to(device)
+
+    @staticmethod
+    def _glm5next_own_view(tensor: torch.Tensor) -> torch.Tensor:
+        """The tensor as a view of its own: another tensor object over the same storage, the
+        same shape and strides; nothing is copied or read on the host.
+
+        The decode graphs are compiled at warmup from the synchronous translator, which builds
+        a table column and a slot mapping per layer, and a compiled graph's guards keep the
+        inputs compiled as distinct tensors distinct objects (one object handed in two places
+        is a recompile, which the serve refuses). The async drafter's correction holds one
+        tensor per operand for the step, so each layer is handed its own view of it.
+        """
+        return tensor.view(tensor.shape)
+
+    @staticmethod
+    def _glm5next_correction_on(correction, device, *, name: str) -> None:
+        """Refuse a correction computed on another device than the layer's bank."""
+        if correction.start_position.device != device:
+            raise ValueError(
+                f"KV layer '{name}'s bank lives on {device} and this step's on-device "
+                f"correction on {correction.start_position.device}; the operands feed the "
+                f"layer's graph on its own device"
+            )
+
+    def _glm5next_async_correction(
+        self, banks, geometries, request_ids, request_starts, *, width: int, padding: int
+    ):
+        """The async drafter's decode step: correct the scheduler's positions on device.
+
+        The scheduler advanced every request by the whole previous step and learns its
+        rejections one step late, so the handed ``request_starts`` stand ahead of the truth
+        by the rows that step did not keep (``prev_width - 1 - kept_minus_one``; the width is
+        the step's own, ``1 + k`` or 1 -- ``_glm5next_async_handed_width``). The previous step's carry (``_glm5next_async_carry``: its resume
+        rows) and these starts go through
+        :func:`~vllm_neuron.functional.mtp.async_step.mtp_async_correct` once per step,
+        together with the sparse family's block-table ids (the first sparse bank's
+        geometry, as a table at the fixed page count of ``_glm5next_async_column_pages``;
+        a stack with no sparse bank gets no slots), and the returned
+        :class:`~vllm_neuron.functional.mtp.async_step.StepCorrection` is what every
+        layer's carrier takes as its position-derived operands. The carry is consumed:
+        the next step needs its own.
+
+        Returns:
+            ``(correction, column)``: the column is the ``[pages, R]`` int32 table the
+            correction gathered through (``None`` without a sparse bank).
+
+        Raises:
+            ValueError: no carry (a decode step the hook never settled before), or a
+                carry naming other requests than this step's.
+        """
+        carry = self._glm5next_async_carry
+        if carry is None:
+            raise ValueError(
+                "this decode step has no carry under the async drafter; the state hook "
+                "(``_glm5next_async_settle``) takes every step's output before the next "
+                "step is built, so a decode step without one does not continue a step "
+                "this runner served"
+            )
+        if tuple(carry.req_ids) != tuple(request_ids):
+            raise ValueError(
+                f"the carry describes request(s) {list(carry.req_ids)} and this step names "
+                f"{list(request_ids)}; the async drafter serves one sequence, and a step's "
+                f"positions are corrected by the previous step of the same request(s)"
+            )
+        requests = len(request_ids)
+        device = carry.checkpoint_rows.device
+        column, table, page_size = None, None, 1
+        for bank, geometry in zip(banks, geometries):
+            if bank["family"] == "self_attn":
+                page_size = int(bank["block_size"])
+                pages = self._glm5next_async_column_pages(page_size)
+                block_ids = geometry["request_block_ids"]
+                longest = max((len(row) for row in block_ids), default=0)
+                if longest > pages:
+                    raise ValueError(
+                        f"a request holds {longest} page(s) of the latent bank and the "
+                        f"async correction's table has {pages} (max_model_len "
+                        f"{self.max_model_len} over pages of {page_size}); a sequence "
+                        f"longer than max_model_len is not this server's"
+                    )
+                # The carriers' column keeps the step's window: it is a layer graph's
+                # operand and has that graph's shape. The correction reads the same
+                # ids through its own table at the fixed page count, so its graph has
+                # one shape per width pair (``_glm5next_async_column_pages``).
+                column = self._glm5next_block_table_column(
+                    block_ids,
+                    window_blocks=int(geometry["window_blocks"]),
+                    padding=int(padding),
+                    device=device,
+                )
+                table = self._glm5next_block_table_column(
+                    block_ids, window_blocks=pages, padding=int(padding), device=device
+                )
+                break
+        optimistic = torch.tensor(
+            [int(start) for start in request_starts[:requests]], dtype=torch.int32
+        ).to(device)
+        from vllm_neuron.functional.mtp import async_step as mtp_async
+
+        # The carry whole: its first ``requests`` rows are this step's requests, read
+        # inside the launch (no slice of a device tensor outside it).
+        correction = mtp_async.mtp_async_correct(
+            carry.checkpoint_rows,
+            optimistic,
+            table,
+            prev_width=self._glm5next_async_handed_width(int(carry.prev_width)),
+            width=int(width),
+            page_size=page_size,
+            padding=int(padding),
+            launch=self._glm5next_async_launch(),
+        )
+        self._glm5next_async_carry = None
+        return correction, column
+
+    def _glm5next_async_column_pages(self, page_size: int) -> int:
+        """The correction column's page count: ``max_model_len`` over the latent page.
+
+        Fixed whatever the step's window, so the correction's compiled graph
+        (``DeviceLaunch``) sees one operand shape per width pair and compiles at warmup
+        only; no request holds more pages than a sequence of ``max_model_len`` tokens,
+        and the column marks the pages past a request's with ``-1``
+        (``_glm5next_block_table_column``).
+        """
+        page_size = int(page_size)
+        return (int(self.max_model_len) + page_size - 1) // page_size
+
+    def _glm5next_async_launch(self):
+        """This runner's :class:`~vllm_neuron.functional.mtp.async_step.DeviceLaunch`.
+
+        The async drafter's two kernels run on the sampler's device future and the
+        step's position tensors; on a device they launch inside a compiled graph only
+        (the NKI wrapper has no eager device kernel), so the runner compiles each
+        launch once, with the model's backend and compiler options, and hands it to
+        every take and correction. On the host (CPU mode) there is none: the
+        simulator answers an eager launch, and the kernels run as they do in the
+        tests.
+        """
+        if self.device.type == "cpu":
+            return None
+        launch = self._glm5next_async_launch_instance
+        if launch is None:
+            from vllm_neuron.envs import get_compile_backend_name
+            from vllm_neuron.functional.mtp import async_step as mtp_async
+
+            launch = mtp_async.DeviceLaunch(
+                get_compile_backend_name(), options=self.compile_options
+            )
+            self._glm5next_async_launch_instance = launch
+        return launch
+
+    def _glm5next_async_warmup(self, model_output, *, batch_size: int, is_prefill: bool) -> None:
+        """Compile the async drafter's launches on this warmup's operand signatures.
+
+        A served step must compile nothing, so each graph the step would launch is
+        launched here first, on the shapes it will see: ``mtp_async_take`` on this
+        forward's own sampled rows (the tensor the state hook receives) beside the
+        drafts the step carries -- the root's from the output tuple on a decode, the
+        placeholders after a prefill -- and, on a decode warmup, ``mtp_async_correct``
+        at the four width pairs a served sequence meets: ``1 + k`` after ``1 + k``
+        (verify after verify), ``1 + k`` after ``1`` (the first verify after the
+        prefill), ``1`` after ``1 + k`` (the transition at the context limit) and ``1``
+        after ``1`` (the one-row steps there). The column has the fixed page count of a
+        served step. Nothing here is a sequence step: no carry is written. The outputs
+        are read back so their futures resolve, as the warmup forward's are.
+
+        Raises:
+            ValueError: the root returned no draft rows (the async drafter reads them
+                from every forward's output).
+        """
+        launch = self._glm5next_async_launch()
+        if launch is None:
+            return
+        from vllm_neuron.functional.mtp import async_step as mtp_async
+
+        if not isinstance(model_output, tuple) or len(model_output) < 2:
+            raise ValueError(
+                "the async drafter's warmup needs the root's (sampled, drafts, ...) output "
+                f"tuple and the forward returned {type(model_output).__name__}; the root "
+                "drafts k tokens on every forward under speculative method \"mtp\""
+            )
+        sampled, drafts = model_output[0], model_output[1]
+        rows = int(sampled.shape[0])
+        if is_prefill:
+            drafts = torch.tensor(
+                [self._placeholder_drafts()] * rows, dtype=torch.int32
+            ).to(sampled.device)
+        before = dict(launch.calls)
+        take = mtp_async.mtp_async_take(sampled, drafts, launch=launch)
+        self._materialize_warmup_output(tuple(take))
+        if not is_prefill:
+            k = int(self.drafter.num_speculative_tokens)
+            padding = rows - 1
+            page_size, column = None, None
+            for bank in self.model.glm5next_layer_banks:
+                if bank["family"] == "self_attn":
+                    page_size = int(bank["block_size"])
+                    column = self._glm5next_block_table_column(
+                        [[NULL_BLOCK_ID] * self._glm5next_async_column_pages(page_size)],
+                        window_blocks=self._glm5next_async_column_pages(page_size),
+                        padding=padding,
+                        device=sampled.device,
+                    )
+                    break
+            # A start the correction can pull back at every pair: the warmup take kept
+            # one row, so a previous step ``1 + k`` wide rejected ``k`` rows. The take's
+            # rows go whole, as a served step hands its carry.
+            starts = torch.full((1,), k, dtype=torch.int32).to(sampled.device)
+            for prev_width, width in ((1 + k, 1 + k), (1, 1 + k), (1 + k, 1), (1, 1)):
+                correction = mtp_async.mtp_async_correct(
+                    take.checkpoint_rows,
+                    starts,
+                    column,
+                    prev_width=prev_width,
+                    width=width,
+                    page_size=page_size if page_size is not None else 1,
+                    padding=padding,
+                    launch=launch,
+                )
+                self._materialize_warmup_output(
+                    tuple(value for value in correction if value is not None)
+                )
+        logger.info(
+            "Async drafter launches warmed (%s, batch %d): take %d, correct %d",
+            "prefill" if is_prefill else "decode",
+            batch_size,
+            launch.calls["take"] - before["take"],
+            launch.calls["correct"] - before["correct"],
+        )
+
+    def _glm5next_async_handed_width(self, prev_width: int) -> int:
+        """The width the handed start counts the previous step at: its own, ``1 + k`` or 1.
+
+        The scheduler hands ``s + (w - kept)`` after a step of ``w`` rows that kept ``kept``
+        (it advanced by ``w`` and pulls the rejections back one step late), and the runner's
+        generic async bookkeeping (``_update_states``: ``num_rejected = prev_num_draft_len -
+        num_accepted`` with the full-acceptance count ``_get_valid_sampled_token_count``
+        returns) is a no-op at ``w = 1 + k`` (``prev_num_draft_len`` is ``k``) and skipped at
+        ``w = 1`` (no drafts). Those are the two widths the served scheduler produces:
+        ``NeuronAsyncScheduler._update_after_schedule`` (``vllm/core/scheduler.py``) clears a
+        request's draft placeholders, stickily, once its count passes
+        ``max_model_len - 3 - 2 k``, so vLLM's own trim (``v1/core/sched/scheduler.py``,
+        ``num_new = min(1 + k, max_model_len - 1 - num_computed)``) never shortens a step to
+        ``2 .. k`` rows. Were one to arrive anyway, the input builder pads it to ``1 + k``
+        rows and the translator refuses the ragged step by name before any carry is made
+        (``_glm5next_model_kwargs``); the bookkeeping would then have moved the handed start
+        forward by ``k - (w - 1)``, i.e. counted the step at ``1 + k`` -- recorded here so the
+        derivation is not lost, and refused rather than assumed.
+        """
+        full = 1 + int(self.drafter.num_speculative_tokens)
+        if int(prev_width) in (1, full):
+            return int(prev_width)
+        raise ValueError(
+            f"the carry says the previous step had {prev_width} row(s) per request; the async "
+            f"drafter's steps have 1 or {full} (the served scheduler clears the draft "
+            f"placeholders before vLLM's trim could shorten a step), and a step of another "
+            f"width is refused by the translator before it is carried"
+        )
+
+    @staticmethod
     def _glm5next_checkpoint_operands(
         state_checkpoints, checkpoint_rows, *, rows: int, device
     ) -> dict:
@@ -6648,6 +6993,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 )
             return {}
         checkpoints = int(state_checkpoints)
+        if torch.is_tensor(checkpoint_rows):
+            # The async drafter's rows, corrected on device: the shape is the one host
+            # fact; the values are the previous step's and are not read.
+            if tuple(checkpoint_rows.shape) != (int(rows),) or checkpoint_rows.dtype != torch.int32:
+                raise ValueError(
+                    f"this step carries {int(rows)} row(s) and the device checkpoint rows "
+                    f"are {tuple(checkpoint_rows.shape)} {checkpoint_rows.dtype}; each row's "
+                    f"slot resumes from its own int32 row"
+                )
+            return {
+                "state_checkpoints": checkpoints,
+                "checkpoint_rows": checkpoint_rows.to(device),
+            }
         resume = [int(one) for one in (checkpoint_rows if checkpoint_rows is not None else [])]
         if len(resume) != int(rows):
             raise ValueError(
@@ -7032,17 +7390,28 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             pass
         else:
             # Each request is classified on its own position: one may be opening
-            # while another continues.
+            # while another continues. Under the async drafter a decode step's
+            # position is the scheduler's, which lags the cursor by the previous
+            # step's rejections (at most k); the device corrects it.
+            async_decode = self._glm5next_async_drafter() and not is_prefill
             for one_slot, one_start in zip(state_slots, request_starts):
                 self._glm5next_position_arm(
                     int(one_slot),
                     int(one_start),
                     side_caches=side_caches,
                     is_prefill=is_prefill,
+                    lag=int(self.drafter.num_speculative_tokens) if async_decode else 0,
                 )
         checkpoints = self._glm5next_recurrent_checkpoints(
             list(state_slots) + padding_slots, is_prefill=is_prefill
         )
+        # The async drafter: this decode step's position-derived operands come from the
+        # device, corrected by the previous step's carry (``_glm5next_async_correction``).
+        async_correction, async_column = None, None
+        if not synthetic_step and not is_prefill and self._glm5next_async_drafter():
+            async_correction, async_column = self._glm5next_async_correction(
+                banks, geometries, request_ids, request_starts, width=width, padding=padding,
+            )
         carriers = self._glm5next_layer_carriers(
             banks,
             side_caches,
@@ -7080,6 +7449,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # on a prefill or a plain server.
             state_checkpoints=None if checkpoints is None else checkpoints[0],
             checkpoint_rows=None if checkpoints is None else checkpoints[1],
+            async_correction=async_correction,
+            block_table_column=async_column,
         )
         # The cursor advances only once the carriers exist: the call above can still
         # refuse (paging disagreement, slot out of range), and a refused step must
@@ -7193,7 +7564,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         }
 
     def _glm5next_position_arm(
-        self, slot: int, start_position: int, *, side_caches, is_prefill: bool
+        self, slot: int, start_position: int, *, side_caches, is_prefill: bool, lag: int = 0
     ) -> None:
         """Open one request's ring at position 0, or require it to continue its sequence.
 
@@ -7201,6 +7572,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         that has computed nothing is opening whatever number of tokens it was given,
         so a one-token prompt and a resumed request open here like any other. The leg
         is only used to name the refusal.
+
+        ``lag`` (the async drafter, ``k``): the handed position may stand up to ``lag``
+        rows behind the cursor -- the scheduler learns a verify step's rejections one
+        step after the cursor advanced past every row of it -- and the device corrects
+        it; 0 (the synchronous drafter and every other serve) requires equality.
         """
         if int(start_position) == 0:
             # A fresh sequence must not inherit the previous owner's partial pool:
@@ -7244,13 +7620,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     f"{int(start_position)}. Serving it would read whatever the "
                     f"previous owner of this slot left in the ring"
                 )
-            if int(start_position) != int(stood_at):
+            behind = int(stood_at) - int(start_position)
+            if not 0 <= behind <= int(lag):
+                allowed = (
+                    f"at most {int(lag)} row(s) behind it (the previous step's rejections, "
+                    f"which the scheduler learns one step late and the device corrects)"
+                    if int(lag) else "at that position"
+                )
                 raise ValueError(
                     f"this step is a {leg} at position {int(start_position)} and slot "
-                    f"{slot}'s indexer ring stands at position {int(stood_at)}; the "
-                    f"rows carry no position of their own, so serving a step that does "
-                    f"not continue this slot's sequence would read another point of it "
-                    f"silently"
+                    f"{slot}'s indexer ring stands at position {int(stood_at)}; this step "
+                    f"continues the slot's sequence only {allowed}, and the rows carry no "
+                    f"position of their own, so serving a step that does not continue it "
+                    f"would read another point of it silently"
                 )
 
     def _build_decode_synthetic_inputs(
@@ -7534,6 +7916,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 )
             )
         model_output = self.model(**self._glm5next_model_kwargs(kwargs))
+        if self._glm5next_async_drafter():
+            self._glm5next_async_warmup(model_output, batch_size=batch_size, is_prefill=False)
         if self.use_async_scheduling:
             self._materialize_warmup_output(model_output)
         if self._tensor_replacer is not None:
@@ -7578,6 +7962,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     )
                 )
             model_output = self.model(**self._glm5next_model_kwargs(kwargs))
+            if self._glm5next_async_drafter():
+                self._glm5next_async_warmup(model_output, batch_size=batch_size, is_prefill=False)
             if self.use_async_scheduling:
                 self._materialize_warmup_output(model_output)
             if self._tensor_replacer is not None:
@@ -8624,7 +9010,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         future = self.async_execution_buffer["futures_sampled_token_ids"]
         draft_future = self.async_execution_buffer.get("futures_draft_token_ids")
-
         assembled = self._try_assemble_spec_input_ids(input_ids, draft_future)
         if assembled is not None:
             self._async_steps += 1
@@ -10789,6 +11174,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         record = self._glm5next_step_record
         if record is None:
             return
+        if self._glm5next_async_drafter():
+            # The async drafter: the rows are a device future. The three corrections
+            # above move on device (``_glm5next_async_settle``); nothing is read here.
+            self._glm5next_async_settle(sampled_token_ids)
+            return
         slots, starts, width = record["slots"], record["starts"], record["width"]
         rows = list(sampled_token_ids)
         if len(rows) < len(slots):
@@ -10830,6 +11220,99 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     kept_counts,
                     state_checkpoints=1 + int(self.drafter.num_speculative_tokens),
                 )
+
+    def _glm5next_async_drafter(self) -> bool:
+        """True when speculative method "mtp" serves under ``VLLM_NEURON_GLM5NEXT_MTP_ASYNC``.
+
+        The fact is the proposer's (``MtpProposer.async_steps``, checked against the
+        scheduler at construction); a runner with another drafter, or none, is never on
+        the async paths.
+        """
+        if not getattr(self, "is_mtp_spec", False):
+            return False
+        drafter = self.drafter
+        return isinstance(drafter, MtpProposer) and bool(drafter.async_steps)
+
+    def _glm5next_async_settle(self, sampled_token_ids) -> None:
+        """The async drafter's state hook: take the step's output on device into the carry.
+
+        ``sampled_token_ids`` is the sampler's device tensor for the step the translator
+        recorded (``_glm5next_step_record``): ``[rows, 1 + k]`` with ``-1`` after the kept
+        prefix on a verify step, ``[rows]`` (or ``[rows, 1]``) after a prefill or a one-row
+        decode, ``rows`` the batch bucket's. :func:`~vllm_neuron.functional.mtp.async_step.
+        mtp_async_take` reads the kept count, the resume row ``kept - 1`` (what the
+        synchronous hook recorded on the host and committed to the checkpoint banks), the
+        last kept id and the next verify step's input ids -- that id followed by the
+        root's drafts of this step (a prefill's are ``k`` copies of the pad id, the
+        placeholders ``_glm5next_propose_drafts`` hands the synchronous scheduler) -- all
+        as device tensors, and the carry (:class:`~vllm_neuron.functional.mtp.async_step.
+        StepCarry`) keeps them for the next step's translator and draft proposal. The
+        indexer-ring cursor stays where the translator put it (past every row); the
+        next step corrects its own positions on device, and the host keeps a bound
+        check (``_glm5next_position_arm``). The last kept id is also the generic
+        spec-to-non-spec transition's ``futures_last_accepted_token``. No device value is
+        read: the one host value here is the shape.
+
+        Raises:
+            ValueError: a host list instead of the device tensor; fewer rows than the
+                step's requests; a decode step whose root output carried no drafts.
+        """
+        record = self._glm5next_step_record
+        if not torch.is_tensor(sampled_token_ids):
+            raise ValueError(
+                "the async drafter settles a step from the sampler's device tensor and was "
+                f"handed a {type(sampled_token_ids).__name__}; under async scheduling the "
+                "rows reach the host one step late, so a host list here is the synchronous "
+                "path's and would stall the device to build"
+            )
+        requests = len(record["slots"])
+        rows = int(sampled_token_ids.shape[0])
+        if rows < requests:
+            raise ValueError(
+                f"this step named {requests} request(s) and the sampler returned {rows} "
+                f"row(s); the state hook reads one row per request, in batch order"
+            )
+        k = int(self.drafter.num_speculative_tokens)
+        if record["is_prefill"]:
+            # The placeholders, as a device tensor: built on the host and moved once.
+            drafts = torch.tensor(
+                [self._placeholder_drafts()] * rows, dtype=torch.int32
+            ).to(sampled_token_ids.device)
+            width = 1
+        else:
+            drafts = self._glm5next_shadow_last_drafts
+            if drafts is None:
+                raise ValueError(
+                    "this decode step's root output carried no draft ids under speculative "
+                    "method \"mtp\"; the GLM-5.3-Flash root drafts k tokens on every decode "
+                    "step and the runner takes them off its output "
+                    "(``_glm5next_shadow_take_output``)"
+                )
+            if int(drafts.shape[0]) != rows or int(drafts.shape[1]) != k:
+                raise ValueError(
+                    f"the root returned drafts of shape {tuple(drafts.shape)} for a step of "
+                    f"{rows} row(s) with k={k}; the drafts are the next step's input beside "
+                    f"the sampled ids, row for row"
+                )
+            width = int(record["width"])
+        # Imported here: the module's ``@nki.jit`` kernels are built on first use, by the
+        # one runner that serves the async drafter, not at every runner's import.
+        from vllm_neuron.functional.mtp import async_step as mtp_async
+
+        take = mtp_async.mtp_async_take(
+            sampled_token_ids, drafts, launch=self._glm5next_async_launch()
+        )
+        self._glm5next_async_carry = mtp_async.StepCarry(
+            req_ids=tuple(list(self.input_batch.req_ids)[:requests]),
+            prev_width=width,
+            checkpoint_rows=take.checkpoint_rows,
+            last_accepted=take.last_accepted,
+            next_input_ids=take.next_input_ids,
+            drafts=drafts,
+        )
+        # The generic spec-to-non-spec transition's input ids (``_maybe_swap_async_
+        # input_ids``): the root hands no ``last_accepted_token``, so it is set here.
+        self.async_execution_buffer["futures_last_accepted_token"] = take.last_accepted
 
     def _update_batch_state_with_samples(
         self,
@@ -10968,7 +11451,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             pad_token_id = 0
         return [int(pad_token_id)] * int(self.drafter.num_speculative_tokens)
 
-    def _glm5next_propose_drafts(self, sampled_token_ids) -> list[list[int]]:
+    def _glm5next_propose_drafts(
+        self, sampled_token_ids, scheduler_output=None
+    ) -> list[list[int]] | torch.Tensor:
         """Speculative method "mtp": this step's drafts for the scheduler, one list per request.
 
         The root drafted inside the target graph, so nothing runs here; the host
@@ -10989,16 +11474,40 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
           none, so the scheduler never trims a draft and the next step runs the
           one-row graph for the whole batch.
 
+        Under the async drafter (``VLLM_NEURON_GLM5NEXT_MTP_ASYNC``) the drafts are device
+        tensors the state hook carried (``_glm5next_async_settle``): the ``[rows, 1 + k]``
+        next input ids are returned whole, which ``take_draft_token_ids`` turns into the
+        scheduler's ``k`` placeholders per request and the generic async swap
+        (``_maybe_swap_async_input_ids``) feeds to the next step as its input ids, and
+        the ``[rows, k]`` drafts are set aside for that step's rejection sampler
+        (``_futures_drafts_only``). A partial prefill chunk (``scheduler_output`` says
+        whether this chunk is the prompt's last) proposes nothing. Near ``max_model_len``
+        the proposal is still the tensor: the served async scheduler
+        (``NeuronAsyncScheduler._update_after_schedule``, ``vllm/core/scheduler.py``) never
+        consults it -- it re-arms ``k`` placeholders every step until the request's count
+        passes ``max_model_len - 3 - 2k``, then schedules one-row steps for good. The
+        first one-row step is the generic spec-to-non-spec transition
+        (``execute_model``): the previous step's output is read on the host --
+        the read a finishing request makes anyway -- and the device-side
+        ``futures_last_accepted_token`` is its input id, counted as a sync fallback by
+        the generic accounting; the one-row steps after it reuse the sampler's ``[rows]``
+        future (``_try_reuse_nonspec_future``). The correction pulls the handed start
+        back at the carry's own width on each of them (``_glm5next_async_correction``).
+
         Returns:
-            ``num_reqs`` lists of ``k`` or 0 ints.
+            ``num_reqs`` lists of ``k`` or 0 ints; under the async drafter the
+            ``[rows, 1 + k]`` int32 device tensor instead.
 
         Raises:
-            ValueError: a decode step whose root output carried no draft ids.
+            ValueError: a decode step whose root output carried no draft ids; under the
+                async drafter, a decode step with no carry.
         """
         num_reqs = int(self.input_batch.num_reqs)
         record = self._glm5next_step_record
         if record is None:
             return [[] for _ in range(num_reqs)]
+        if self._glm5next_async_drafter():
+            return self._glm5next_propose_drafts_async(record, num_reqs, scheduler_output)
         if record["is_prefill"]:
             rows = list(sampled_token_ids)[:num_reqs]
             rows += [[] for _ in range(num_reqs - len(rows))]
@@ -11020,6 +11529,26 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             )
         return MtpProposer.take_drafts(drafts[:num_reqs].cpu())
 
+    def _glm5next_propose_drafts_async(self, record: dict, num_reqs: int, scheduler_output):
+        """The async drafter's proposal: the carry's ``[rows, 1 + k]`` next input ids on every
+        decode step and after a complete prefill; nothing for a partial prefill chunk
+        (``_glm5next_propose_drafts`` above)."""
+        carry = self._glm5next_async_carry
+        if carry is None:
+            raise ValueError(
+                "this step has no carry under the async drafter; the state hook "
+                "(``_glm5next_async_settle``) takes every step's output before its drafts "
+                "are proposed, so a step without one was never settled"
+            )
+        if record["is_prefill"]:
+            partial = self._get_partial_prefill_req_ids(
+                scheduler_output, list(self.input_batch.req_ids)
+            )
+            if partial:
+                return [[] for _ in range(num_reqs)]
+        self._futures_drafts_only = carry.drafts
+        return carry.next_input_ids
+
     def _propose_draft_token_ids(
         self,
         scheduler_output: Any,
@@ -11035,7 +11564,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if getattr(self, "is_mtp_spec", False):
             # Speculative method "mtp": the drafts are the root's own output; none
             # of the eagle operands are read.
-            return self._glm5next_propose_drafts(sampled_token_ids)
+            return self._glm5next_propose_drafts(sampled_token_ids, scheduler_output)
         assert isinstance(self.drafter, EagleProposer)
 
         num_reqs = self.input_batch.num_reqs

@@ -521,8 +521,9 @@ forward pass.
 
 :::{note}
 **Mutually exclusive with async scheduling.** Setting `--speculative-config`
-disables async scheduling automatically with a startup warning (the GLM-5.3-Flash MTP drafter instead refuses async scheduling by name: pass
-`--no-async-scheduling`).
+disables async scheduling automatically with a startup warning. The GLM-5.3-Flash MTP
+drafter instead refuses async scheduling by name unless its async form is selected
+(`VLLM_NEURON_GLM5NEXT_MTP_ASYNC=1`, one sequence; see its section below).
 
 EAGLE3 and DFlash are supported speculative methods. The examples below use
 EAGLE3. For per-model compatibility, see the
@@ -600,10 +601,30 @@ outputs = llm.generate(["Explain quantum computing"], sampling_params)
 
 GLM-5.3-Flash drafts from its own multi-token-prediction head (no draft model):
 `--speculative-config '{"method": "mtp", "num_speculative_tokens": 3}'` with
-`--no-async-scheduling`, `on_device_sampling_config: {"all_greedy": true}` and the
-environment variable `VLLM_NEURON_GLM5NEXT_ON_DEVICE_SAMPLING=1`, which turns on
-GLM-5.3-Flash's on-device sampler (without it the server refuses the
-`on_device_sampling_config`). It is
+`on_device_sampling_config: {"all_greedy": true}` and the environment variable
+`VLLM_NEURON_GLM5NEXT_ON_DEVICE_SAMPLING=1`, which turns on GLM-5.3-Flash's on-device
+sampler (without it the server refuses the `on_device_sampling_config`), and one of two
+scheduling forms:
+
+- **Synchronous (the default):** `--no-async-scheduling`. The drafter refuses async
+  scheduling by name, because the accepted count would reach the host one step late.
+- **Async drafter (opt-in):** `VLLM_NEURON_GLM5NEXT_MTP_ASYNC=1` with `--async-scheduling`
+  and `--max-num-seqs 1`. The verify step's position corrections run on device one step
+  late, so the scheduler's host work overlaps the device; the drafter refuses the knob with
+  synchronous scheduling (it would change nothing) or with `max_num_seqs > 1` (it serves one
+  sequence). Measured on trn2 at tensor parallel 64, expert parallel 16, `k = 3`, batch size
+  1: inter-token latency 7.565 ms against 11.377 ms synchronous (median per-token gap on the
+  same host and recipe, a 1k-token context; mean per-token gap 10.17 against 15.45 ms; 77.7
+  against 55.6 tokens/s) (2026-10-10); the 8-prompt greedy outputs identical to the
+  synchronous drafter's; the same GSM8K@200 strict score and wrong set.
+  Known limitation: on a host saturated enough to stall one rank's runtime completion
+  thread, the 32-deep execution queue (`NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS`) fills
+  about three times sooner than with the synchronous drafter (three executions per decode
+  step instead of one), and the step fails with `status=7` (Execution Queue Full), after
+  which the remaining ranks time out on the next collective. Until the launch-depth guard
+  lands, enable the drafter only on an unsaturated host.
+
+It is
 served greedy only (under this recipe, sampling knobs are refused at admission). Its
 greedy output is not guaranteed identical to non-speculative greedy decoding: with
 the draft layer's earlier view-form latent write, consecutive identical requests

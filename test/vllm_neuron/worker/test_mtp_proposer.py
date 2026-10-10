@@ -27,6 +27,7 @@ import torch
 from vllm.config import set_current_vllm_config
 from vllm.engine.arg_utils import EngineArgs
 
+from vllm_neuron import envs
 from vllm_neuron.model.glm5_next import mtp as head_module
 from vllm_neuron.vllm.spec_decode.mtp import MtpProposer
 from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
@@ -40,10 +41,13 @@ FIXTURE = pathlib.Path(__file__).resolve().parents[2] / "vllm_neuron" / "model" 
 #: The served draft count.
 DRAFT_K = 3
 KNOB = head_module.SHADOW_DRAFT_ENV
+#: The async drafter's opt-in (envs.py); off = the shipped synchronous drafter.
+ASYNC_KNOB = "VLLM_NEURON_GLM5NEXT_MTP_ASYNC"
 
 
 def _engine_config(spec: dict | None, *, async_scheduling: bool | None = False,
-                   on_device_sampling: bool | None = None):
+                   on_device_sampling: bool | None = None,
+                   max_num_seqs: int = e2e.E2E_MAX_NUM_SEQS):
     """The tiny first-request engine config, with a speculative config.
 
     Async scheduling is off unless a test turns it on: with a declared sampler the
@@ -53,7 +57,7 @@ def _engine_config(spec: dict | None, *, async_scheduling: bool | None = False,
     """
     neuron_config: dict = {
         "num_batched_tokens_buckets": [fr.PREFILL_BUCKET, e2e.E2E_MAX_SEQ_LEN],
-        "num_seqs_buckets": [fr.DECODE_BATCH],
+        "num_seqs_buckets": [max(fr.DECODE_BATCH, int(max_num_seqs))],
     }
     if on_device_sampling is not None:
         neuron_config["on_device_sampling_config"] = {} if on_device_sampling else None
@@ -61,7 +65,7 @@ def _engine_config(spec: dict | None, *, async_scheduling: bool | None = False,
         model=str(FIXTURE),
         skip_tokenizer_init=True,
         max_model_len=e2e.E2E_MAX_SEQ_LEN,
-        max_num_seqs=e2e.E2E_MAX_NUM_SEQS,
+        max_num_seqs=int(max_num_seqs),
         max_num_batched_tokens=e2e.E2E_MAX_SEQ_LEN,
         block_size=fr.tiny.MLA_PAGE_SIZE,
         enforce_eager=True,
@@ -101,13 +105,66 @@ def test_mtp_without_on_device_sampling_is_refused_by_name(tmp_path):
 
 
 def test_mtp_with_async_scheduling_is_refused_by_name(tmp_path, monkeypatch):
-    """Async scheduling is the second series (the accepted count arrives one step late)."""
+    """With the knob off, async scheduling is refused and the refusal names the knob that
+    selects the async drafter (the accepted count arrives one step late otherwise)."""
     e2e._require_cpu_mode()
     fr._declaring_a_sampler(monkeypatch)
+    monkeypatch.delenv(ASYNC_KNOB, raising=False)
     config = _engine_config(_mtp(), async_scheduling=True, on_device_sampling=True)
     assert config.scheduler_config.async_scheduling is True
-    with fr._parallel_state(tmp_path, config), pytest.raises(ValueError, match="async scheduling"):
+    with fr._parallel_state(tmp_path, config), pytest.raises(ValueError, match=ASYNC_KNOB):
         NeuronModelRunner(config, device=torch.device("cpu"))
+
+
+def test_the_async_knob_defaults_off(monkeypatch):
+    """Unset, the knob reads False: the shipped opt-in drafter is the synchronous one."""
+    monkeypatch.delenv(ASYNC_KNOB, raising=False)
+    assert envs.VLLM_NEURON_GLM5NEXT_MTP_ASYNC is False
+    monkeypatch.setenv(ASYNC_KNOB, "1")
+    assert envs.VLLM_NEURON_GLM5NEXT_MTP_ASYNC is True
+
+
+def test_the_async_knob_admits_async_scheduling_for_one_sequence(tmp_path, monkeypatch):
+    """Knob on, ``--async-scheduling``, ``max_num_seqs = 1``: the drafter runs its async steps."""
+    e2e._require_cpu_mode()
+    fr._declaring_a_sampler(monkeypatch)
+    monkeypatch.setenv(ASYNC_KNOB, "1")
+    config = _engine_config(_mtp(), async_scheduling=True, on_device_sampling=True)
+    assert config.scheduler_config.async_scheduling is True
+    with fr._parallel_state(tmp_path, config):
+        runner = NeuronModelRunner(config, device=torch.device("cpu"))
+    assert runner.is_mtp_spec is True
+    assert runner.drafter.async_steps is True
+    assert runner.drafter.num_speculative_tokens == DRAFT_K
+
+
+def test_the_async_knob_with_synchronous_scheduling_is_refused_by_name(tmp_path, monkeypatch):
+    """The knob names a path the synchronous scheduler never takes; a set knob that would
+    be ignored is refused rather than silently dropped."""
+    e2e._require_cpu_mode()
+    fr._declaring_a_sampler(monkeypatch)
+    monkeypatch.setenv(ASYNC_KNOB, "1")
+    config = _engine_config(_mtp(), async_scheduling=False, on_device_sampling=True)
+    with fr._parallel_state(tmp_path, config), pytest.raises(ValueError, match=ASYNC_KNOB):
+        NeuronModelRunner(config, device=torch.device("cpu"))
+
+
+def test_the_async_knob_with_more_than_one_sequence_is_refused_by_name(tmp_path, monkeypatch):
+    """The async drafter serves bs = 1; a server that could batch two is refused by name."""
+    e2e._require_cpu_mode()
+    fr._declaring_a_sampler(monkeypatch)
+    monkeypatch.setenv(ASYNC_KNOB, "1")
+    config = _engine_config(_mtp(), async_scheduling=True, on_device_sampling=True, max_num_seqs=2)
+    with fr._parallel_state(tmp_path, config), pytest.raises(ValueError, match="max_num_seqs"):
+        NeuronModelRunner(config, device=torch.device("cpu"))
+
+
+def test_the_synchronous_drafter_records_no_async_steps(tmp_path, monkeypatch):
+    """Knob off and synchronous scheduling: the shipped path, ``async_steps`` False."""
+    e2e._require_cpu_mode()
+    monkeypatch.delenv(ASYNC_KNOB, raising=False)
+    proposer = MtpProposer(_engine_config(_mtp()), torch.device("cpu"), True)
+    assert proposer.async_steps is False
 
 
 def test_other_methods_keep_the_runners_refusal_text(tmp_path, monkeypatch):

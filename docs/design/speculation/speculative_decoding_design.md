@@ -601,10 +601,17 @@ python3 -m vllm.entrypoints.openai.api_server \
 Contract of the opt-in (measured on trn2 at TP64/EP16, `k = 3`, `max_num_seqs 1`, `max_model_len 4096`,
 `VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA=1`, 2026-10-09):
 
-* **Served greedy, synchronously.** The proposer needs on-device sampling and refuses
-  async scheduling by name (the accepted count would reach the host one step late and
-  the indexer-ring cursor and recurrent-state commit would run on stale counts). The
-  recipe runs the on-device sampler with `all_greedy: true`; sampling knobs the greedy
+* **Served greedy; synchronously by default.** The proposer needs on-device sampling and
+  refuses async scheduling by name (the accepted count would reach the host one step late
+  and the indexer-ring cursor and recurrent-state commit would run on stale counts) unless
+  the async drafter is selected: `VLLM_NEURON_GLM5NEXT_MTP_ASYNC=1` with
+  `--async-scheduling` and `--max-num-seqs 1` moves the host corrections (the indexer-ring
+  cursor, the checkpoint commit and the resume row) and the position-derived operands on
+  device, one step late (`vllm_neuron/functional/mtp/async_step.py`; measured 7.565 ms
+  against 11.377 ms synchronous (median per-token gap on the same host and recipe, a
+  1k-token context; mean per-token gap 10.17 against 15.45 ms; 77.7 against 55.6 tokens/s)
+  at `k = 3`, batch size 1, 2026-10-10).
+  The recipe runs the on-device sampler with `all_greedy: true`; sampling knobs the greedy
   sampler cannot apply (`temperature > 0`, `top_k`, `top_p`, `min_p`, `seed`, `n > 1`)
   are refused at admission (`vllm_neuron/vllm/admission.py`). Distribution-preserving
   sampling under this drafter is not a served configuration: the on-device rejection

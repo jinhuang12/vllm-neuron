@@ -27,11 +27,13 @@ owns nothing the worker has to load, warm, capture or bind:
   ``-1``; those become "no drafts", and the first decode after a prefill runs as a
   one-token step whose in-graph draft opens the verify loop.
 
-Served with synchronous scheduling only. Under async scheduling the accepted count
-reaches the host one step late, and the indexer-ring cursor and the recurrent-state
-commit (``NeuronModelRunner._update_states_after_model_execute``) are corrected on
-the host from that count, so that path is a second series and is refused here by
-name rather than served with stale state.
+Scheduling: the synchronous drafter is the shipped opt-in. Under async scheduling the
+accepted count reaches the host one step late, so the host corrections of
+``NeuronModelRunner._update_states_after_model_execute`` (indexer-ring cursor, recurrent
+checkpoint commit, resume rows) cannot run on the step's own output; that path is served
+only by the async drafter (``VLLM_NEURON_GLM5NEXT_MTP_ASYNC=1``, one sequence), which takes
+the step's output and corrects the next step's positions on device
+(``functional/mtp/async_step``), and is refused here by name otherwise.
 """
 
 from __future__ import annotations
@@ -40,6 +42,8 @@ import logging
 
 import torch
 from vllm.config import VllmConfig
+
+from vllm_neuron import envs
 
 logger = logging.getLogger(__name__)
 
@@ -70,8 +74,11 @@ class MtpProposer:
                 drafts inside the target graph, so a host sampler is refused.
 
         Raises:
-            ValueError: method other than "mtp", host sampling, or async scheduling
-                (the accepted count would reach the host one step late).
+            ValueError: method other than "mtp"; host sampling; async scheduling with
+                ``VLLM_NEURON_GLM5NEXT_MTP_ASYNC`` unset (the accepted count reaches the
+                host one step late and the synchronous drafter corrects on the host);
+                the knob set with synchronous scheduling (it would be ignored) or with
+                ``max_num_seqs > 1`` (the async drafter serves one sequence).
         """
         self.vllm_config = vllm_config
         self.speculative_config = vllm_config.speculative_config
@@ -87,15 +94,35 @@ class MtpProposer:
                 "row run inside the target graph, which a host sampler cannot feed; "
                 "serve with an on_device_sampling_config"
             )
-        if vllm_config.scheduler_config.async_scheduling:
+        async_scheduling = bool(vllm_config.scheduler_config.async_scheduling)
+        async_knob = bool(envs.VLLM_NEURON_GLM5NEXT_MTP_ASYNC)
+        if async_scheduling and not async_knob:
             raise ValueError(
                 "speculative method 'mtp' on GLM-5.3-Flash is served with synchronous "
                 "scheduling only: under async scheduling the accepted count reaches the "
                 "host one step late and the indexer-ring cursor and recurrent-state "
-                "commit would run on stale counts; serve with --no-async-scheduling"
+                "commit would run on stale counts; serve with --no-async-scheduling, or "
+                "set VLLM_NEURON_GLM5NEXT_MTP_ASYNC=1 for the async drafter, which "
+                "corrects on device (one sequence)"
+            )
+        if async_knob and not async_scheduling:
+            raise ValueError(
+                "VLLM_NEURON_GLM5NEXT_MTP_ASYNC=1 selects the async drafter and the "
+                "scheduler is synchronous, so the knob would change nothing; unset it "
+                "or pass --async-scheduling"
+            )
+        max_num_seqs = int(vllm_config.scheduler_config.max_num_seqs)
+        if async_knob and max_num_seqs > 1:
+            raise ValueError(
+                f"VLLM_NEURON_GLM5NEXT_MTP_ASYNC=1 serves one sequence (its on-device "
+                f"corrections carry one request's positions between steps) and the server "
+                f"has max_num_seqs={max_num_seqs}; serve with --max-num-seqs 1"
             )
         self.device = device
         self.on_device_sampling = on_device_sampling
+        #: True when the async drafter serves: positions are corrected on device one
+        #: step late and the runner feeds the next step from the previous one's output.
+        self.async_steps = async_knob
         self.num_speculative_tokens = int(self.speculative_config.num_speculative_tokens)
         #: The root's head once :meth:`load_model` ran; ``None`` before.
         self.model = None

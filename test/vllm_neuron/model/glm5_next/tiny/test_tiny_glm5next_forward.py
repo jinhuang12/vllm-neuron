@@ -192,6 +192,12 @@ _SEAM_REGISTRY = {
     "mtp_tail_out": (
         "vllm_neuron.functional.mtp.tail_out",
         "dispatch_counters", "reset_dispatch_counters"),
+    # The async drafter's per-step device corrections (take and correct kernels). A
+    # drive that does not select the async drafter leaves both counters at 0, which
+    # the route predicates allow; a torch-route call on a checked drive fails them.
+    "mtp_async_step": (
+        "vllm_neuron.functional.mtp.async_step",
+        "dispatch_counters", "reset_dispatch_counters"),
     "vision_patch_embed": (
         "vllm_neuron.functional.vision.patch_embed",
         "dispatch_counters", "reset_dispatch_counters"),

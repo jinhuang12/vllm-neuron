@@ -29,6 +29,8 @@ DTYPES = frozenset({
 
 #: The helper whose mappings are the carriers, read by name rather than by position.
 CARRIER_HELPER = "_glm5next_layer_carriers"
+# The helper that hands a layer its own view of a tensor another layer also reads.
+OWN_VIEW_HELPER = "_glm5next_own_view"
 
 #: The two keys the sparse carrier gained with the paged latent bank: the request's block
 #: table, and each token's physical row of that bank.
@@ -141,6 +143,56 @@ def _carrier_entries(path: pathlib.Path) -> dict[str, ast.AST]:
     return entries
 
 
+def _helper_return(path: pathlib.Path, name: str) -> ast.AST:
+    """The one expression the runner's ``name`` helper returns."""
+    returns = [
+        node.value
+        for helper in ast.walk(ast.parse(path.read_text()))
+        if isinstance(helper, ast.FunctionDef) and helper.name == name
+        for node in ast.walk(helper)
+        if isinstance(node, ast.Return) and node.value is not None
+    ]
+    assert len(returns) == 1, (
+        f"{name} returns at {len(returns)} site(s) in {path}; the construction is read from "
+        f"its one return"
+    )
+    return returns[0]
+
+
+def _building_branch(entry: ast.AST) -> ast.AST:
+    """The branch of a carrier entry that builds its tensor: the entry itself, or the
+    ``body`` of a conditional whose ``orelse`` re-views a tensor handed in
+    (``OWN_VIEW_HELPER``) -- the one form in which a carrier entry may not build.
+    """
+    if not isinstance(entry, ast.IfExp):
+        return entry
+    other = entry.orelse
+    assert (
+        isinstance(other, ast.Call)
+        and isinstance(other.func, ast.Attribute)
+        and other.func.attr == OWN_VIEW_HELPER
+    ), (
+        f"the entry's other branch is not {OWN_VIEW_HELPER}; a tensor handed to the "
+        f"carrier is re-viewed, never rebuilt, cast or copied"
+    )
+    return entry.body
+
+
+def _construction(path: pathlib.Path, entry: ast.AST) -> ast.AST:
+    """The expression that constructs a carrier entry's tensor: its building branch
+    and, when that delegates to a ``_glm5next_`` helper of the runner, the helper's
+    return expression.
+    """
+    entry = _building_branch(entry)
+    if (
+        isinstance(entry, ast.Call)
+        and isinstance(entry.func, ast.Attribute)
+        and entry.func.attr.startswith("_glm5next_")
+    ):
+        entry = _helper_return(path, entry.func.attr)
+    return entry
+
+
 def _runner_path() -> pathlib.Path:
     """The file the runner under test was imported from."""
     import vllm_neuron.vllm.worker.neuron_model_runner as runner
@@ -202,7 +254,8 @@ def test_the_pool_slots_are_int32_and_hold_at_a_chunked_start() -> None:
 
 
 def test_the_paged_carrier_operands_are_built_on_the_host_and_moved_once() -> None:
-    """The two operands the paged latent bank added, read where they are constructed.
+    """The two operands the paged latent bank added, read where they are constructed:
+    through the carrier's conditional and the helper it delegates the build to.
     """
     _require_cpu_mode()
     path = _runner_path()
@@ -214,7 +267,7 @@ def test_the_paged_carrier_operands_are_built_on_the_host_and_moved_once() -> No
         f"takes these as keywords, so a missing one is served as a default in {path}"
     )
 
-    table = entries["block_table_row"]
+    table = _construction(path, entries["block_table_row"])
     assert (
         isinstance(table, ast.Call)
         and isinstance(table.func, ast.Attribute)
@@ -234,7 +287,7 @@ def test_the_paged_carrier_operands_are_built_on_the_host_and_moved_once() -> No
         "copy of a tensor already on the device is what the eager backend refuses"
     )
 
-    slots = entries["latent_slots"]
+    slots = _building_branch(entries["latent_slots"])
     assert isinstance(slots, ast.Call) and getattr(slots.func, "attr", "") == SLOTS_HELPER, (
         f"the physical rows do not come from {SLOTS_HELPER}, so they are outside the "
         f"census this file makes over every _glm5next_ helper"

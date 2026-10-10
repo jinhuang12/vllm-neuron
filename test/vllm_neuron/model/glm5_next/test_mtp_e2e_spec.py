@@ -558,11 +558,19 @@ def _proposal(runner) -> list[int]:
     return [] if proposed is None else [int(value) for value in proposed.draft_token_ids[0]]
 
 
-def _generate(runner, req: str, prompt: list[int], *, tokens: int, finished: set, oracle=None):
-    """Prefill, then decode until ``tokens`` are generated; returns (ids, decode steps)."""
+def _generate(runner, req: str, prompt: list[int], *, tokens: int, finished: set, oracle=None,
+              prefill=None):
+    """Prefill, then decode until ``tokens`` are generated; returns (ids, decode steps).
+
+    ``prefill(runner, req, prompt, groups, blocks, finished)`` drives the prefill and returns
+    its output; the default is the one-chunk prefill of ``_prefill``.
+    """
     groups = fr._groups(runner)
     blocks = list(range(FIRST_BLOCK, FIRST_BLOCK + -(-len(prompt) // PAGE)))
-    _, out = fr._step(runner, _prefill(req, prompt, groups, blocks, finished))
+    if prefill is None:
+        _, out = fr._step(runner, _prefill(req, prompt, groups, blocks, finished))
+    else:
+        out = prefill(runner, req, prompt, groups, blocks, finished)
     generated = [int(value) for value in out.sampled_token_ids[0]]
     assert len(generated) == 1
     position = len(prompt)

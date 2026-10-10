@@ -14,6 +14,7 @@ Run with ``VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1 NKI_PRECISE_FP=1
 NEURON_PLATFORM_TARGET_OVERRIDE=trn2``.
 """
 
+import functools
 import re
 import threading
 import types
@@ -132,10 +133,13 @@ def _capture_stub(model_calls, capture_calls):
         capture_calls.append(kwargs)
         raise CaptureComplete()
 
-    return types.SimpleNamespace(
+    from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
+
+    runner = types.SimpleNamespace(
         model=model,
         capture_backend_model=capture_backend_model,
         drafter=None,
+        is_mtp_spec=False,
         kv_cache_config=object(),
         use_async_scheduling=False,
         _tensor_replacer=None,
@@ -147,6 +151,12 @@ def _capture_stub(model_calls, capture_calls):
             model_config=types.SimpleNamespace(model="test-model")
         ),
     )
+    # The warmups ask the real ``_glm5next_async_drafter`` (False here: no drafter), as
+    # the state-hook tests' stand-ins bind it.
+    runner._glm5next_async_drafter = functools.partial(
+        NeuronModelRunner._glm5next_async_drafter, runner
+    )
+    return runner
 
 
 def test_the_all_rank_runner_completes_an_all_rank_collective(monkeypatch):
