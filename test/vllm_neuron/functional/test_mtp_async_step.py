@@ -280,3 +280,222 @@ def test_a_position_whose_page_the_table_does_not_name_is_refused_by_name():
 def test_the_placeholder_marker_is_the_rejection_samplers():
     """``functional`` restates the marker rather than import ``nn``; the two must agree."""
     assert async_step.PLACEHOLDER_TOKEN_ID == PLACEHOLDER_TOKEN_ID
+
+
+# ── the device launch: the kernels as compiled graphs ────────────────────────────────
+
+
+def device_dispatch_rule(monkeypatch, name: str) -> dict[str, int]:
+    """Stand in for the device dispatcher on the host.
+
+    ``nki_kernel_wrapper`` has no eager device kernel: a launch on a device tensor outside
+    a traced graph raises ``NotImplementedError: could not find kernel for
+    HigherOrderOperator nki_kernel_wrapper at dispatch key DispatchKey.PrivateUse1``; inside
+    ``torch.compile`` the launch is traced into the graph. The simulator answers both on the
+    host, so this gate on the module's launcher ``name`` (``_TAKE_KERNEL`` or
+    ``_CORRECT_KERNEL``) raises the device's error when called outside tracing and counts
+    those eager calls in the returned ``{"eager": n}``. A launch that returned was traced.
+    Nothing is recorded inside tracing: a Python side effect in a compiled function is
+    replayed under a guard on the record, which recompiles the graph on every call.
+    """
+    real = getattr(async_step, name)
+    eager = {"eager": 0}
+
+    def gated(**operands):
+        if not torch.compiler.is_compiling():
+            eager["eager"] += 1
+            raise NotImplementedError(
+                "could not find kernel for HigherOrderOperator nki_kernel_wrapper at "
+                "dispatch key DispatchKey.PrivateUse1"
+            )
+        return real(**operands)
+
+    monkeypatch.setattr(async_step, name, gated)
+    return eager
+
+
+def counting_backend(compiles: list):
+    """A ``torch.compile`` backend that runs the traced graph eagerly and records each
+    compile as ``(input count, shapes, dtypes)``: the take launch has two tensor inputs,
+    the correction launch three."""
+
+    def backend(graph_module, example_inputs):
+        compiles.append((
+            len(example_inputs),
+            tuple(tuple(value.shape) for value in example_inputs),
+            tuple(value.dtype for value in example_inputs),
+        ))
+        return graph_module.forward
+
+    return backend
+
+
+@pytest.fixture
+def fresh_dynamo():
+    torch._dynamo.reset()
+    yield
+    torch._dynamo.reset()
+
+
+def _correct_operands():
+    column = _column(_tables(51, 3, 4), 4, 1)
+    prev = torch.tensor([0, 3, 1], dtype=torch.int32)
+    optimistic = torch.tensor([PAGE + 3, 2 * PAGE, 9], dtype=torch.int32)
+    return prev, optimistic, column
+
+
+def test_a_device_launch_runs_the_take_as_a_compiled_graph_bit_for_bit(fresh_dynamo, monkeypatch):
+    accepted, _ = _accepted(41, 5, T)
+    drafts = _drafts(43, 5)
+    want = async_step.mtp_async_take(accepted, drafts)
+    monkeypatch.setattr(async_step, "_launches_in_a_graph", lambda tensor: True)
+    launch = async_step.DeviceLaunch("eager")
+    got = async_step.mtp_async_take(accepted, drafts, launch=launch)
+    for name in want._fields:
+        assert torch.equal(getattr(got, name), getattr(want, name)), name
+    assert launch.calls == {"take": 1, "correct": 0}
+
+
+def test_a_device_launch_runs_the_correction_as_a_compiled_graph_bit_for_bit(fresh_dynamo, monkeypatch):
+    prev, optimistic, column = _correct_operands()
+    want = async_step.mtp_async_correct(prev, optimistic, column, prev_width=T, width=T,
+                                        page_size=PAGE, padding=1)
+    monkeypatch.setattr(async_step, "_launches_in_a_graph", lambda tensor: True)
+    launch = async_step.DeviceLaunch("eager")
+    got = async_step.mtp_async_correct(prev, optimistic, column, prev_width=T, width=T,
+                                       page_size=PAGE, padding=1, launch=launch)
+    for name in want._fields:
+        assert torch.equal(getattr(got, name), getattr(want, name)), name
+    assert launch.calls == {"take": 0, "correct": 1}
+
+
+def test_a_device_operand_without_a_launch_is_refused_by_name(monkeypatch):
+    monkeypatch.setattr(async_step, "_launches_in_a_graph", lambda tensor: True)
+    accepted, _ = _accepted(41, 2, T)
+    with pytest.raises(async_step.MtpAsyncStepError, match="no DeviceLaunch"):
+        async_step.mtp_async_take(accepted, _drafts(43, 2))
+    prev, optimistic, column = _correct_operands()
+    with pytest.raises(async_step.MtpAsyncStepError, match="no DeviceLaunch"):
+        async_step.mtp_async_correct(prev, optimistic, column, prev_width=T, width=T,
+                                     page_size=PAGE, padding=1)
+
+
+def test_a_launch_needs_a_backend():
+    with pytest.raises(async_step.MtpAsyncStepError, match="backend"):
+        async_step.DeviceLaunch("")
+
+
+def test_the_graph_launch_satisfies_the_device_dispatch_rule(fresh_dynamo, monkeypatch):
+    """The device's rule, on the host: an eager launch has no kernel and raises what the
+    device raised; the same launch through ``DeviceLaunch`` is traced and answered."""
+    accepted, _ = _accepted(41, 3, T)
+    drafts = _drafts(43, 3)
+    prev, optimistic, column = _correct_operands()
+    want_take = async_step.mtp_async_take_torch(accepted, drafts)
+    want_correct = async_step.mtp_async_correct_torch(prev, optimistic, column, prev_width=T,
+                                                      width=T, page_size=PAGE, padding=1)
+    eager_take = device_dispatch_rule(monkeypatch, "_TAKE_KERNEL")
+    eager_correct = device_dispatch_rule(monkeypatch, "_CORRECT_KERNEL")
+    # Eager, as 2196f291 launched on the device: no kernel to dispatch to.
+    with pytest.raises(NotImplementedError, match="nki_kernel_wrapper"):
+        async_step.mtp_async_take(accepted, drafts)
+    with pytest.raises(NotImplementedError, match="nki_kernel_wrapper"):
+        async_step.mtp_async_correct(prev, optimistic, column, prev_width=T, width=T,
+                                     page_size=PAGE, padding=1)
+    assert eager_take == {"eager": 1} and eager_correct == {"eager": 1}
+    # Through the launch: traced, answered, and the torch route's values.
+    monkeypatch.setattr(async_step, "_launches_in_a_graph", lambda tensor: True)
+    launch = async_step.DeviceLaunch("eager")
+    take = async_step.mtp_async_take(accepted, drafts, launch=launch)
+    correction = async_step.mtp_async_correct(prev, optimistic, column, prev_width=T, width=T,
+                                              page_size=PAGE, padding=1, launch=launch)
+    for name in want_take._fields:
+        assert torch.equal(getattr(take, name), getattr(want_take, name)), name
+    for name in want_correct._fields:
+        assert torch.equal(getattr(correction, name), getattr(want_correct, name)), name
+    assert eager_take == {"eager": 1} and eager_correct == {"eager": 1}
+    assert launch.calls == {"take": 1, "correct": 1}
+
+
+def test_a_launch_compiles_once_per_operand_signature(fresh_dynamo, monkeypatch):
+    """Shapes, dtypes and the kernel's compile-time ints make the signature; a repeated one
+    compiles nothing, so a warmup that launched the served signatures leaves no step to
+    compile."""
+    monkeypatch.setattr(async_step, "_launches_in_a_graph", lambda tensor: True)
+    compiles: list = []
+    launch = async_step.DeviceLaunch(counting_backend(compiles))
+    verify, _ = _accepted(41, 1, T)
+    drafts = _drafts(43, 1)
+    async_step.mtp_async_take(verify, drafts, launch=launch)
+    async_step.mtp_async_take(verify, drafts, launch=launch)
+    assert len(compiles) == 1 and compiles[0][0] == 2, compiles
+    one_row = torch.tensor([7], dtype=torch.int32)
+    async_step.mtp_async_take(one_row, drafts, launch=launch)
+    assert len(compiles) == 2, compiles
+    prev = torch.tensor([0], dtype=torch.int32)  # a resume row every width keeps
+    optimistic = torch.tensor([PAGE + 3], dtype=torch.int32)
+    column = _column(_tables(61, 1, 2), 2, 0)
+    for prev_width, width in ((T, T), (1, T), (T, 1), (1, 1)):
+        for _ in range(2):
+            async_step.mtp_async_correct(prev, optimistic, column, prev_width=prev_width,
+                                         width=width, page_size=PAGE, padding=0, launch=launch)
+    assert len(compiles) == 6 and all(entry[0] == 3 for entry in compiles[2:]), compiles
+    assert launch.calls == {"take": 3, "correct": 8}
+
+
+def test_the_correction_takes_the_previous_steps_rows_and_reads_its_first_b_as_the_requests():
+    """The carry is the previous step's ``[R]`` resume rows, handed whole (no slice on a
+    device tensor outside the launch); the correction reads the first ``B`` of them."""
+    prev = torch.tensor([2, 0, 1], dtype=torch.int32)
+    optimistic = torch.tensor([PAGE + 3, 2 * PAGE], dtype=torch.int32)
+    column = _column(_tables(71, 2, 3), 3, 0)
+    for route in (async_step.mtp_async_correct_torch, async_step.mtp_async_correct):
+        whole = route(prev, optimistic, column, prev_width=T, width=T, page_size=PAGE, padding=0)
+        first = route(prev[:2], optimistic, column, prev_width=T, width=T, page_size=PAGE, padding=0)
+        for name in whole._fields:
+            assert torch.equal(getattr(whole, name), getattr(first, name)), (route.__name__, name)
+    with pytest.raises(async_step.MtpAsyncStepError, match="prev_checkpoint_rows"):
+        async_step.mtp_async_correct(prev[:1], optimistic, column, prev_width=T, width=T,
+                                     page_size=PAGE, padding=0)
+
+
+def test_a_strided_operand_is_refused_by_name_instead_of_copied_on_device():
+    """The producers hand fresh contiguous tensors; a strided view would become a device
+    copy inside the launch (and another compiled signature), so each operand is refused
+    by name on a stride read, before any launch, on both routes."""
+    accepted, _ = _accepted(41, 3, 2 * T)
+    drafts = _drafts(43, 3)
+    strided_rows = accepted[:, ::2]  # [3, T]
+    strided_drafts = drafts.repeat(1, 2)[:, ::2]  # [3, k]
+    assert not strided_rows.is_contiguous() and not strided_drafts.is_contiguous()
+    with pytest.raises(async_step.MtpAsyncStepError, match="accepted.*contiguous"):
+        async_step.mtp_async_take(strided_rows, drafts)
+    with pytest.raises(async_step.MtpAsyncStepError, match="drafts.*contiguous"):
+        async_step.mtp_async_take(accepted[:, :T].contiguous(), strided_drafts)
+    prev, optimistic, column = _correct_operands()
+    for name, operands in (
+        ("prev_checkpoint_rows", (torch.stack([prev, prev], dim=-1)[:, 0], optimistic, column)),
+        ("optimistic_starts", (prev, torch.stack([optimistic, optimistic], dim=-1)[:, 0], column)),
+        ("block_table_row", (prev, optimistic, torch.stack([column, column], dim=-1)[:, :, 0])),
+    ):
+        assert not operands[["prev_checkpoint_rows", "optimistic_starts", "block_table_row"].index(name)].is_contiguous()
+        with pytest.raises(async_step.MtpAsyncStepError, match=f"{name}.*contiguous"):
+            async_step.mtp_async_correct(*operands, prev_width=T, width=T, page_size=PAGE, padding=1)
+
+
+def test_a_one_row_take_launches_on_the_samplers_b_rows_without_a_reshape_outside_the_launch(
+    fresh_dynamo, monkeypatch
+):
+    """The sampler's ``[B]`` rows after a prefill or a one-row decode go to the launch as
+    they are (the reshape to ``[B, 1]`` happens inside the compiled function), so the
+    compiled signature is the sampler's shape."""
+    monkeypatch.setattr(async_step, "_launches_in_a_graph", lambda tensor: True)
+    compiles: list = []
+    launch = async_step.DeviceLaunch(counting_backend(compiles))
+    one_row = torch.tensor([7, 9], dtype=torch.int32)
+    drafts = _drafts(43, 2)
+    take = async_step.mtp_async_take(one_row, drafts, launch=launch)
+    want = async_step.mtp_async_take_torch(one_row, drafts)
+    for name in want._fields:
+        assert torch.equal(getattr(take, name), getattr(want, name)), name
+    assert [entry[1] for entry in compiles] == [((2,), (2, K))], compiles

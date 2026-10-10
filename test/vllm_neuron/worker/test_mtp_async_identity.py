@@ -75,7 +75,7 @@ def _scheduler_drafts(runner: NeuronModelRunner) -> list[int]:
     return [] if proposed is None else [int(value) for value in proposed.draft_token_ids[0]]
 
 
-def _generate_async(runner, req: str, prompt: list[int], *, tokens: int, finished: set):
+def _generate_async(runner, req: str, prompt: list[int], *, tokens: int, finished: set, prefill=None):
     """Prefill, then decode until ``tokens`` are generated, as the async engine drives it.
 
     ``handed`` is the scheduler's count: advanced by the whole step when it is scheduled,
@@ -85,10 +85,15 @@ def _generate_async(runner, req: str, prompt: list[int], *, tokens: int, finishe
     scheduled are one more than the steps whose output reached ``tokens``: when that
     output is applied, the next step is already in flight -- the async scheduler
     dispatched it before it could know the request was finished.
+    ``prefill(runner, req, prompt, groups, blocks, finished)`` drives the prefill and returns
+    its (pending) output; the default is the one-chunk prefill of ``spec._prefill``.
     """
     groups = fr._groups(runner)
     blocks = list(range(spec.FIRST_BLOCK, spec.FIRST_BLOCK + -(-len(prompt) // spec.PAGE)))
-    _, pending = fr._step(runner, spec._prefill(req, prompt, groups, blocks, finished))
+    if prefill is None:
+        _, pending = fr._step(runner, spec._prefill(req, prompt, groups, blocks, finished))
+    else:
+        pending = prefill(runner, req, prompt, groups, blocks, finished)
     pending_rows = 1
     handed = len(prompt)
     generated: list[int] = []

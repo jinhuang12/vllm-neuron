@@ -25,7 +25,7 @@ device, one authored kernel each, so no host read sits between two steps:
 The torch route (``*_torch``) is the contract and the CPU route; the kernels are held to
 it bit for bit. Every value is an int32 count, id or position below ``2 ** 24``, so the
 engines' fp32 arithmetic is exact; the latent slots leave the kernel as int32 pairs
-(``[rows, 2]``: low word, zero high word) and are bit-viewed as the int64 the layers'
+(``[rows, 2]``: low word, zero high word); the launch converts the low words to the int64 the layers'
 ``index_copy_`` takes, since NKI has no 64-bit integer and a dtype cast on a device
 tensor is a device op of its own. The dispatch counters (``dispatch_counters``,
 ``reset_dispatch_counters``) are test instrumentation: they tell the tests which route
@@ -60,6 +60,7 @@ from vllm_neuron.functional.mtp.common import (
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 __all__ = [
+    "DeviceLaunch",
     "MtpAsyncStepError",
     "StepCarry",
     "StepCorrection",
@@ -147,14 +148,130 @@ class StepCarry(NamedTuple):
     drafts: Tensor
 
 
+def _launches_in_a_graph(tensor: Tensor) -> bool:
+    """True for an operand off the host: its NKI launch has no eager kernel.
+
+    ``nki_kernel_wrapper`` (what :func:`wrap_nki` calls) dispatches under a traced graph
+    only; on a device tensor outside one it raises ``NotImplementedError: could not find
+    kernel for HigherOrderOperator nki_kernel_wrapper at dispatch key PrivateUse1``. A CPU
+    tensor launches eagerly: the simulator answers the same wrapper on the host.
+    """
+    return tensor.device.type != "cpu"
+
+
+def _take_launch(accepted: Tensor, drafts: Tensor):
+    """The take kernel's launch, the unit :class:`DeviceLaunch` compiles.
+
+    Every tensor op of the launch is here -- the sampler's ``[B]`` rows reshaped to the
+    kernel's ``[B, 1]`` (a view: the operands are contiguous by refusal), the outputs
+    reshaped to ``[B]`` -- so a device operand meets no eager op outside the compiled
+    function. Returns the :class:`StepTake` fields in order.
+    """
+    batch = accepted.shape[0]
+    valid, rows, last, nxt = _TAKE_KERNEL(accepted=accepted.reshape(batch, -1), drafts=drafts)
+    return valid.reshape(batch), rows.reshape(batch), last.reshape(batch), nxt
+
+
+def _correct_launch(
+    prev_rows: Tensor, starts: Tensor, table: Tensor, *,
+    PREV_WIDTH: int, WIDTH: int, PAGE_SHIFT: int, PADDING: int, WITH_SLOTS: bool,
+):
+    """The correction kernel's launch, the unit :class:`DeviceLaunch` compiles.
+
+    Every tensor op of the launch is here: the carry's first ``B`` rows (``prev_rows`` is
+    the previous step's ``[R]``) and the starts as the kernel's ``[B, 1]`` (views: the
+    operands are contiguous by refusal), the outputs
+    reshaped to their :class:`StepCorrection` shapes, and the slots' low words converted
+    to the int64 the layers consume (the kernel writes int32 pairs with a zero high word;
+    NKI has no int64). Returns the fields in order, ``latent_slots`` None without a table.
+    """
+    batch = starts.shape[0]
+    rows = batch + PADDING
+    start, linear, seq, slots, resume = _CORRECT_KERNEL(
+        prev_rows=prev_rows[:batch].reshape(batch, 1),
+        starts=starts.reshape(batch, 1),
+        table=table,
+        PREV_WIDTH=PREV_WIDTH, WIDTH=WIDTH, PAGE_SHIFT=PAGE_SHIFT, PADDING=PADDING,
+        WITH_SLOTS=WITH_SLOTS,
+    )
+    latent = (
+        slots.reshape(rows, WIDTH, INT64_WORDS)[:, :, 0].to(torch.int64).reshape(-1)
+        if WITH_SLOTS else None
+    )
+    return start.reshape(rows), linear.reshape(rows), seq.reshape(-1), latent, resume.reshape(rows)
+
+
+class DeviceLaunch:
+    """The two kernel launches as compiled graphs, for operands on a device.
+
+    Inside ``torch.compile`` the NKI wrapper lowers to the kernel's custom call, as every
+    kernel of the traced model does; outside one a device operand cannot launch at all
+    (:func:`_launches_in_a_graph`). So :func:`mtp_async_take` and :func:`mtp_async_correct`
+    send a device operand through ``take`` or ``correct`` here, as the producers hand it
+    (the compiled functions hold every reshape and conversion). Each graph compiles once
+    per operand signature -- shapes, dtypes and the kernel's compile-time ints -- on its
+    first call, so the runner's warmup launches every served signature before a request
+    arrives and no step compiles. ``backend`` and ``options`` are the model's
+    (``envs.get_compile_backend_name()``, the runner's ``compile_options``), so the graphs
+    build in the same compile cache with the same compiler flags. ``calls`` counts the
+    launches per graph (test instrumentation and the warmup's log; nothing on the step
+    path reads it).
+    """
+
+    def __init__(self, backend, options: dict | None = None) -> None:
+        if not backend:
+            raise MtpAsyncStepError(
+                "DeviceLaunch: a torch.compile backend is required (the model's, "
+                "envs.get_compile_backend_name())"
+            )
+        self.backend = backend
+        self.options = dict(options) if options else None
+        self.calls = {"take": 0, "correct": 0}
+        self._take = torch.compile(
+            _take_launch, backend=backend, fullgraph=True, dynamic=False, options=self.options
+        )
+        self._correct = torch.compile(
+            _correct_launch, backend=backend, fullgraph=True, dynamic=False, options=self.options
+        )
+
+    def take(self, accepted: Tensor, drafts: Tensor):
+        self.calls["take"] += 1
+        return self._take(accepted, drafts)
+
+    def correct(self, prev_rows: Tensor, starts: Tensor, table: Tensor, **constants):
+        self.calls["correct"] += 1
+        return self._correct(prev_rows, starts, table, **constants)
+
+
+def _check_contiguous(name: str, operand: str, tensor: Tensor) -> None:
+    """Refuse a strided operand by name: inside the launch it would become a device copy
+    (and another compiled signature); the producers hand fresh contiguous tensors."""
+    if not tensor.is_contiguous():
+        raise MtpAsyncStepError(
+            f"{name}: {operand} must be contiguous (the producer's own tensor is; a strided "
+            f"view would be copied on device inside the launch); got strides "
+            f"{tuple(tensor.stride())} for shape {tuple(tensor.shape)}"
+        )
+
+
+def _no_launch(name: str, operand: Tensor) -> MtpAsyncStepError:
+    return MtpAsyncStepError(
+        f"{name}: the operands are on {operand.device} and no DeviceLaunch was handed; an "
+        "NKI launch on a device tensor dispatches inside a compiled graph only "
+        "(nki_kernel_wrapper has no eager device kernel), so the caller passes the runner's "
+        "launch"
+    )
+
+
 # ── take ───────────────────────────────────────────────────────────────────────────────
 
 
-def _check_take(accepted: Tensor, drafts: Tensor) -> Tensor:
-    """Return ``accepted`` as ``[B, W]`` int32 or raise naming the operand."""
-    if accepted.dim() == 1:
-        accepted = accepted.reshape(-1, 1)
-    if accepted.dim() != 2 or accepted.dtype != torch.int32 or accepted.shape[0] < 1 or accepted.shape[1] < 1:
+def _check_take(accepted: Tensor, drafts: Tensor) -> int:
+    """Return ``B`` or raise naming the operand; shape and dtype reads only, no reshape."""
+    if (
+        accepted.dim() not in (1, 2) or accepted.dtype != torch.int32 or accepted.shape[0] < 1
+        or (accepted.dim() == 2 and accepted.shape[1] < 1)
+    ):
         raise MtpAsyncStepError(
             f"mtp_async_take: accepted must be the sampler's [B, W] int32 rows (or [B] for a "
             f"one-row step); got {tuple(accepted.shape)} {accepted.dtype}"
@@ -169,18 +286,22 @@ def _check_take(accepted: Tensor, drafts: Tensor) -> Tensor:
             f"mtp_async_take: drafts carry {int(drafts.shape[0])} row(s) for "
             f"{int(accepted.shape[0])} accepted row(s); one row per request"
         )
-    if _on_the_host(accepted) and bool((accepted[:, 0] == PLACEHOLDER_TOKEN_ID).any()):
+    _check_contiguous("mtp_async_take", "accepted", accepted)
+    _check_contiguous("mtp_async_take", "drafts", drafts)
+    if _on_the_host(accepted) and bool(
+        (accepted.reshape(accepted.shape[0], -1)[:, 0] == PLACEHOLDER_TOKEN_ID).any()
+    ):
         raise MtpAsyncStepError(
             "mtp_async_take: a verify step keeps at least its first row (the correction or "
             "the first draft), and a row here starts with the placeholder"
         )
-    return accepted
+    return int(accepted.shape[0])
 
 
 def mtp_async_take_torch(accepted: Tensor, drafts: Tensor) -> StepTake:
     """The take as torch ops: the contract, and the CPU route."""
-    accepted = _check_take(accepted, drafts)
-    batch = int(accepted.shape[0])
+    batch = _check_take(accepted, drafts)
+    accepted = accepted.reshape(batch, -1)
     valid_count = (accepted != PLACEHOLDER_TOKEN_ID).sum(dim=1).to(torch.int32)
     checkpoint_rows = valid_count - 1
     last_accepted = accepted[torch.arange(batch, device=accepted.device), checkpoint_rows.to(torch.int64)]
@@ -244,7 +365,9 @@ def mtp_async_take_kernel(accepted, drafts):
     return valid_out, rows_out, last_out, next_out
 
 
-def mtp_async_take(accepted: Tensor, drafts: Tensor) -> StepTake:
+def mtp_async_take(
+    accepted: Tensor, drafts: Tensor, *, launch: DeviceLaunch | None = None
+) -> StepTake:
     """:class:`StepTake` of one step's output; the kernel where kernels run, else the torch route.
 
     Args:
@@ -252,20 +375,26 @@ def mtp_async_take(accepted: Tensor, drafts: Tensor) -> StepTake:
             step; ``[B]`` or ``[B, 1]`` after a prefill or a one-row decode), a kept prefix
             of ids and ``-1`` after it. A device future is read by the kernel only.
         drafts: ``[B, k]`` int32, the root's drafts for the same requests, ``k >= 1``.
+        launch: the :class:`DeviceLaunch` a device operand launches through; a host
+            operand launches eagerly and ignores it.
 
     Raises:
-        MtpAsyncStepError: another geometry or dtype, or (when the values are on the host)
-            a row that keeps nothing.
+        MtpAsyncStepError: another geometry or dtype, a strided operand, a device operand
+            without a launch, or (when the values are on the host) a row that keeps nothing.
     """
-    accepted = _check_take(accepted, drafts)
+    _check_take(accepted, drafts)
     if not can_run_kernel(accepted):
         take = mtp_async_take_torch(accepted, drafts)
         _count_torch_route()
         return take
-    batch = int(accepted.shape[0])
-    valid, rows, last, nxt = _TAKE_KERNEL(accepted=accepted.contiguous(), drafts=drafts.contiguous())
+    if _launches_in_a_graph(accepted):
+        if launch is None:
+            raise _no_launch("mtp_async_take", accepted)
+        fields = launch.take(accepted, drafts)
+    else:
+        fields = _take_launch(accepted, drafts)
     _count_kernel()
-    return StepTake(valid.reshape(batch), rows.reshape(batch), last.reshape(batch), nxt)
+    return StepTake(*fields)
 
 
 # ── correct ────────────────────────────────────────────────────────────────────────────
@@ -293,16 +422,20 @@ def _check_correct(
         )
     if int(padding) < 0:
         raise MtpAsyncStepError(f"mtp_async_correct: padding must be >= 0; got {padding!r}")
-    if prev_checkpoint_rows.dim() != 1 or prev_checkpoint_rows.dtype != torch.int32 or prev_checkpoint_rows.shape[0] < 1:
+    if optimistic_starts.dim() != 1 or optimistic_starts.dtype != torch.int32 or optimistic_starts.shape[0] < 1:
         raise MtpAsyncStepError(
-            f"mtp_async_correct: prev_checkpoint_rows must be [B] int32, B >= 1; got "
-            f"{tuple(prev_checkpoint_rows.shape)} {prev_checkpoint_rows.dtype}"
-        )
-    batch = int(prev_checkpoint_rows.shape[0])
-    if tuple(optimistic_starts.shape) != (batch,) or optimistic_starts.dtype != torch.int32:
-        raise MtpAsyncStepError(
-            f"mtp_async_correct: optimistic_starts must be [B={batch}] int32; got "
+            f"mtp_async_correct: optimistic_starts must be [B] int32, B >= 1; got "
             f"{tuple(optimistic_starts.shape)} {optimistic_starts.dtype}"
+        )
+    batch = int(optimistic_starts.shape[0])
+    if (
+        prev_checkpoint_rows.dim() != 1 or prev_checkpoint_rows.dtype != torch.int32
+        or prev_checkpoint_rows.shape[0] < batch
+    ):
+        raise MtpAsyncStepError(
+            f"mtp_async_correct: prev_checkpoint_rows must be int32 with at least B={batch} "
+            f"rows (the previous step's [R] resume rows, whose first B are this step's "
+            f"requests); got {tuple(prev_checkpoint_rows.shape)} {prev_checkpoint_rows.dtype}"
         )
     rows = batch + int(padding)
     if block_table_row is not None and (
@@ -322,8 +455,12 @@ def _check_correct(
     pages = 0 if block_table_row is None else int(block_table_row.shape[0])
     if block_table_row is not None and pages < 1:
         raise MtpAsyncStepError("mtp_async_correct: block_table_row names no page")
+    _check_contiguous("mtp_async_correct", "prev_checkpoint_rows", prev_checkpoint_rows)
+    _check_contiguous("mtp_async_correct", "optimistic_starts", optimistic_starts)
+    if block_table_row is not None:
+        _check_contiguous("mtp_async_correct", "block_table_row", block_table_row)
     if _on_the_host(prev_checkpoint_rows) and _on_the_host(optimistic_starts):
-        _check_values(prev_checkpoint_rows, optimistic_starts, block_table_row,
+        _check_values(prev_checkpoint_rows[:batch], optimistic_starts, block_table_row,
                       prev_width=int(prev_width), width=int(width), page_size=int(page_size))
     return batch, rows, pages
 
@@ -391,7 +528,7 @@ def mtp_async_correct_torch(
     page = 1 << shift
     device = optimistic_starts.device
     width = int(width)
-    rejected = (int(prev_width) - 1) - prev_checkpoint_rows.to(torch.int64)
+    rejected = (int(prev_width) - 1) - prev_checkpoint_rows[:batch].to(torch.int64)
     true_start = optimistic_starts.to(torch.int64) - rejected
     pad = int(padding)
     start_position = torch.cat([true_start, torch.zeros(pad, dtype=torch.int64, device=device)])
@@ -413,7 +550,7 @@ def mtp_async_correct_torch(
         latent_slots = (blocks * page + (positions & (page - 1))).reshape(-1)
     seq_lens = (seq_positions + 1).to(torch.int32).reshape(-1)
     checkpoint_rows = torch.cat([
-        prev_checkpoint_rows, torch.zeros(pad, dtype=torch.int32, device=device)
+        prev_checkpoint_rows[:batch], torch.zeros(pad, dtype=torch.int32, device=device)
     ])
     return StepCorrection(
         start_position.to(torch.int32), linear_start.to(torch.int32), seq_lens, latent_slots,
@@ -563,13 +700,16 @@ def mtp_async_correct_kernel(prev_rows, starts, table, PREV_WIDTH: int, WIDTH: i
 def mtp_async_correct(
     prev_checkpoint_rows: Tensor, optimistic_starts: Tensor, block_table_row: Tensor | None, *,
     prev_width: int, width: int, page_size: int, padding: int,
+    launch: DeviceLaunch | None = None,
 ) -> StepCorrection:
     """:class:`StepCorrection` for the step being built; the kernel where kernels run, else the torch route.
 
     Args:
-        prev_checkpoint_rows: ``[B]`` int32, each request's resume row from the previous
-            step's take (``kept - 1``; 0 when that step was a prefill or a one-row decode,
-            with ``prev_width = 1``). A device future is read by the kernel only.
+        prev_checkpoint_rows: int32, each request's resume row from the previous step's
+            take (``kept - 1``; 0 when that step was a prefill or a one-row decode, with
+            ``prev_width = 1``): the carry's ``[R]`` rows handed whole, of which the first
+            ``B`` are this step's requests (a ``[B]`` tensor serves too). A device future
+            is read by the kernel only.
         optimistic_starts: ``[B]`` int32, the scheduler's cached length per request, which
             counts every row of the previous step as accepted.
         block_table_row: ``[pages, R]`` int32, the sparse carrier's column form: one column
@@ -584,10 +724,13 @@ def mtp_async_correct(
             records an idle slot's last row there instead -- unserved either way: the async
             drafter serves one request (``MtpProposer`` refuses ``max_num_seqs > 1``), so a
             bucket with padding is laid out but never run.
+        launch: the :class:`DeviceLaunch` a device operand launches through; a host
+            operand launches eagerly and ignores it.
 
     Raises:
-        MtpAsyncStepError: another geometry or dtype, a page size that is not a power of
-            two, or (when the values are on the host) a resume row outside its step, a
+        MtpAsyncStepError: another geometry or dtype, a strided operand, a page size that
+            is not a power of two, a device operand without a launch, or (when the values are on the host)
+            a resume row outside its step, a
             corrected position below zero, or a position whose page the table does not name.
     """
     batch, rows, _pages = _check_correct(
@@ -603,22 +746,24 @@ def mtp_async_correct(
         _count_torch_route()
         return correction
     with_slots = block_table_row is not None
+    # Without a latent bank the kernel still takes a table operand: one built on the host
+    # and copied over (the only eager op a device operand meets outside the launch).
     table = (
-        block_table_row.contiguous() if with_slots
-        else torch.zeros((1, rows), dtype=torch.int32, device=optimistic_starts.device)
+        block_table_row if with_slots
+        else torch.zeros((1, rows), dtype=torch.int32).to(optimistic_starts.device)
     )
-    start, linear, seq, slots, resume = _CORRECT_KERNEL(
-        prev_rows=prev_checkpoint_rows.reshape(batch, 1).contiguous(),
-        starts=optimistic_starts.reshape(batch, 1).contiguous(),
-        table=table,
+    constants = dict(
         PREV_WIDTH=int(prev_width), WIDTH=int(width), PAGE_SHIFT=shift, PADDING=int(padding),
         WITH_SLOTS=with_slots,
     )
+    if _launches_in_a_graph(optimistic_starts):
+        if launch is None:
+            raise _no_launch("mtp_async_correct", optimistic_starts)
+        fields = launch.correct(prev_checkpoint_rows, optimistic_starts, table, **constants)
+    else:
+        fields = _correct_launch(prev_checkpoint_rows, optimistic_starts, table, **constants)
     _count_kernel()
-    return StepCorrection(
-        start.reshape(rows), linear.reshape(rows), seq.reshape(-1),
-        slots.view(torch.int64).reshape(-1) if with_slots else None, resume.reshape(rows),
-    )
+    return StepCorrection(*fields)
 
 
 _TAKE_KERNEL = wrap_nki(mtp_async_take_kernel)

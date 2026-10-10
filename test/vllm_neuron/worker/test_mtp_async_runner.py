@@ -127,11 +127,13 @@ def _async_runner(proposer, *, record, drafts, req_ids=(REQ,), banks=None):
         _glm5next_checkpoint_rows={SLOT: 2},
         _glm5next_shadow_last_drafts=drafts,
         _glm5next_async_carry=None,
+        _glm5next_async_launch_instance=None,
         _futures_drafts_only=None,
+        device=torch.device("cpu"),
     )
     _bind(runner, "_update_states_after_model_execute", "_glm5next_async_drafter",
-          "_glm5next_async_settle", "_glm5next_propose_drafts", "_glm5next_propose_drafts_async",
-          "_spec_decode_limit", "_placeholder_drafts")
+          "_glm5next_async_settle", "_glm5next_async_launch", "_glm5next_propose_drafts",
+          "_glm5next_propose_drafts_async", "_spec_decode_limit", "_placeholder_drafts")
     runner._get_partial_prefill_req_ids = lambda scheduler_output, req_ids: set()
     return runner
 
@@ -295,8 +297,12 @@ def _carry(req_ids, *, prev_width: int, checkpoint_rows: list[int]) -> async_ste
 
 
 def _async_server(runner, proposer) -> None:
+    """Make the translator world's runner serve the async drafter: the proposer, and the
+    host launch state the real ``__init__`` sets (no device: the kernels launch eagerly)."""
     runner.is_mtp_spec = True
     runner.drafter = proposer
+    runner.device = torch.device("cpu")
+    runner._glm5next_async_launch_instance = None
 
 
 def test_a_one_request_verify_step_is_laid_out_at_the_true_position(proposer):
@@ -351,8 +357,10 @@ def test_a_one_row_decode_is_laid_out_at_the_true_position(proposer):
     for carrier in translator._sparse(world, converted["layer_carriers"]):
         assert carrier["seq_lens"].tolist() == [true + 1]
         assert carrier["latent_slots"].tolist() == [translator._slot(world, 0, true)]
-        assert carrier["start_position"].dim() == 0 and int(carrier["start_position"]) == true
-        assert carrier["position"].dim() == 0 and int(carrier["position"]) == true
+        # The correction's ``[1]`` start as it is: the layer's ``_int64_scalar`` shapes the
+        # one-row start inside its graph, so no view of a device tensor is taken here.
+        assert carrier["start_position"].numel() == 1 and int(carrier["start_position"]) == true
+        assert carrier["position"].numel() == 1 and int(carrier["position"]) == true
         assert tuple(carrier["block_table_row"].shape) == (translator.WINDOW_BLOCKS, 1)
         assert torch.is_tensor(carrier["tail"]), "the one-ring form"
     # And the one-row step after it: nothing to pull back.
@@ -420,7 +428,10 @@ def test_the_translator_uses_the_device_correction_not_the_host_formulas(monkeyp
     (prev, optimistic, column), kwargs = calls[0]
     assert prev.tolist() == [0] and optimistic.tolist() == [start]
     assert tuple(column.shape) == (translator.WINDOW_BLOCKS, 1) and column.dtype == torch.int32
-    assert kwargs == {"prev_width": 1, "width": T, "page_size": translator.PAGE, "padding": 0}
+    # The runner hands its launch with every correction; on the host there is none.
+    assert kwargs == {
+        "prev_width": 1, "width": T, "page_size": translator.PAGE, "padding": 0, "launch": None,
+    }
 
 
 def test_a_decode_step_without_a_carry_is_refused_by_the_translator_by_name(proposer):
