@@ -4,7 +4,7 @@
 ``decode_batch`` serves ``B`` decode requests in one launch per stage: the ring step
 (``dsa_decode_ring_step``) and the candidate scores with the causal bound applied
 (``dsa_decode_scores``). Each request reads its own slot of the two side-cache banks,
-so the reference here is the wave-1 chain run once per request on that request's own
+so the reference here is the one-request chain run once per request on that request's own
 slot view: ``dsa_decode_tail_update_at`` for the ring, and the pool write, the
 candidate read, ``dsa_score_gemm`` and ``dsa_causal_bound`` for the scores.
 
@@ -191,7 +191,7 @@ def _score_case(batch: int, seed: int, *, candidates: int, heads: int = 32,
 
 
 def _per_request_scores(query, weights, bank, slots, seq_lens, position, pooled, candidates):
-    """The wave-1 chain on one request's own slot: write, read, score, bound."""
+    """The one-request chain on one request's own slot: write, read, score, bound."""
     out = []
     for b in range(int(slots.shape[0])):
         store = bank[int(slots[b])].clone()

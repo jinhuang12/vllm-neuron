@@ -6,14 +6,14 @@ will accept, so a verify step advances every request's indexer-ring cursor past 
 ``T = 1 + k`` of its rows and records the step (``_glm5next_step_record``). Once the
 host holds the rejection sampler's rows, the hook pulls each request's cursor back to
 ``start + kept``, commits the kept counts to the KDA checkpoint banks
-(``fused_decode.commit_kda_checkpoints``, worker-57's pointer commit: no bytes move)
+(``fused_decode.commit_kda_checkpoints``, a pointer commit: no bytes move)
 and records ``kept - 1`` -- the checkpoint row the request resumes from -- for the
 request's slot, which the next step's recurrent carriers read as ``checkpoint_rows``.
 A one-row decode or a prefill records 0 for its slots, commits nothing and leaves the
 cursor the translator set. Covered here on a bare runner: the bookkeeping writes, the
 commit call and its arguments, the zeroing steps, the refusals (a row kept outside
 ``1 .. T``, fewer sampler rows than requests) and the no-op on a synthetic step. The
-commit function is worker-57's and is monkeypatched onto its module here.
+commit function is monkeypatched onto its module here.
 
     NKI_SIMULATOR=1 VLLM_NEURON_CPU_MODE=1 python -m pytest \\
         test/vllm_neuron/worker/test_mtp_state_hook.py

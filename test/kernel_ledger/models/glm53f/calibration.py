@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Calibrated column: a PREDICTOR, not a test (written new; team-lead ruling).
+"""Calibrated column: a PREDICTOR, not a test (written new).
 
     k_bucket = in-model ms of the bucket at 5938748 / ledger raw sum at 5938748 ("before")
     calibrated_bucket = k_bucket x ledger raw sum of any kernel set

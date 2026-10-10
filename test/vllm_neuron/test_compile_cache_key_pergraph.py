@@ -738,9 +738,9 @@ def test_editing_the_wrapper_of_an_nkilib_kernel_changes_only_its_graph_key(
 
 
 def test_editing_the_nkilib_predicate_patch_moves_the_nkilib_mlp_digest(tmp_path):
-    """da-14's round-1 probe: flip the forced-TKG predicate inside mlp.py:18-35.
+    """Flip the forced-TKG predicate inside mlp.py:18-35.
 
-    At 5f90590 the nkilib kernel folded the empty file set and kept its digest.
+    Before the fix the nkilib kernel folded the empty file set and kept its digest.
     """
     copy = _copy_tree(tmp_path)
     refs = (

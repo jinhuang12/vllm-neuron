@@ -77,7 +77,7 @@ LOCAL_INTERMEDIATE = 2048 // 4  # 512
 SHARED_INTERMEDIATE = 128  # 2048 / 64 = 32 rows, padded to one 128-wide scale block
 EXPERT_RANK = 5
 #: HBM bandwidth one LNC2 core draws, 716 GB/s: the basis of every entitlement in
-#: ``reports/mtp-head.md`` 9.2 (a weight-streaming kernel's entitlement is its bytes over it).
+#: the draft head's entitlements (a weight-streaming kernel's entitlement is its bytes over it).
 HBM_BYTES_PER_US_PER_CORE = 716e9 / 1e6
 #: The pinned checkpoint config the quantisation policy (fp8, 128x128 blocks) is read from.
 FIXTURE_CONFIG = ROOT / "test" / "vllm_neuron" / "model" / "glm5_next" / "fixtures" / "config.json"

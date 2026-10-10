@@ -6,7 +6,7 @@ select and update, the ``nkilib`` depthwise conv, silu, the gate clamp, the
 recurrent carrier select, the decode-state step and the carrier write-backs),
 run on the 5938748 kernel snapshots one request at a time, as the model ran it.
 "After" is :func:`kda_fused_decode` over all ``B`` requests, plus the two
-carrier copies the model call site makes. "After (loop)" is the wave-1 model
+carrier copies the model call site makes. "After (loop)" is the per-request model
 form: the fused kernel once per request, ``B`` launches.
 
 Each timed graph holds ``L`` independent layers (own carriers, shared weights),

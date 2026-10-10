@@ -67,7 +67,7 @@ from vllm_neuron.functional.dsa import score_gemm as current  # noqa: E402
 
 DEVICE = "neuron:0"
 MODULE_PATH = "vllm_neuron/functional/dsa/score_gemm.py"
-#: ``[tokens, cands]`` of the served prefill calls (reports/op_inventory.json, family
+#: ``[tokens, cands]`` of the served prefill calls (the served graphs' op inventory, family
 #: "DSA attention | _score_gemm_nki #0": a 1024-token chunk at max_model_len 8192, and a
 #: 2048-token chunk of a 65534-token prompt at max_model_len 65536).
 SHAPES = {"1k": (1024, 2048), "64k": (2048, 16384)}

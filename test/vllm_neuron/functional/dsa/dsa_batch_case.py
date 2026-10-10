@@ -15,7 +15,7 @@ the same composition.
   the tests can tap the projections, the indices and the attention output.
 * :func:`per_request_layer` is a module's ``Glm5NextMLAAttention.forward`` once per
   request on that request's own bank views. Given 75090b9's module (the git-show
-  snapshot) it is the wave-1 one-request decode; this tree's one-request decode is the
+  snapshot) it is the one-request decode; this tree's one-request decode is the
   batch-of-one case of the batched step.
 """
 

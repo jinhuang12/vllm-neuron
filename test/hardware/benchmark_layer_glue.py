@@ -25,8 +25,8 @@ What is measured, per (layer, B, variant):
    physical cores' intervals merged), ``--iterations`` timed calls after ``--warmup``,
    before/after interleaved. Median and p90.
 2. A device profile of ``--profile-iterations`` calls, ingested with ``neuron-explorer``
-   and bucketed with the rules of ``/home/ubuntu/glm53f-wt2/profile/breakdown.py`` (the
-   serving profile's own tool, frozen in :func:`bucket_main`): every 2 us sample is labelled per physical core, and compiler-op
+   and bucketed with the rules of the serving-profile breakdown tool (frozen in
+   :func:`bucket_main`): every 2 us sample is labelled per physical core, and compiler-op
    (unnamed XLA) time is owned by the last NKI kernel that ran before it on that core.
    Kernel labels are normalised to the live tree's file names, so the 0a08ff4 snapshot's
    kernels carry the same owner names as the served profile.
@@ -61,9 +61,8 @@ import time
 def bucket_main(name: str, out_path: str, global_dir: str) -> None:
     """Bucket one ingested profile; runs under a python that has duckdb (no torch).
 
-    The sample rules of ``/home/ubuntu/glm53f-wt2/profile/breakdown.py`` (worker-13's
-    serving-profile tool, as of 2026-10-07 02:00Z), frozen here so a later edit of that
-    file cannot move this benchmark's numbers: 2 us samples; per physical core the
+    The sample rules of the serving-profile breakdown tool (as of 2026-10-07 02:00Z),
+    frozen here so a later edit of that tool cannot move this benchmark's numbers: 2 us samples; per physical core the
     highest-priority instruction covering the sample (NKI kernel by source file / unnamed
     compiler op > DMA issue > semaphore > core barrier); a sample where both cores compute
     is split 0.5/0.5, one core computing gets 1.0; a compiler op is owned by the last NKI

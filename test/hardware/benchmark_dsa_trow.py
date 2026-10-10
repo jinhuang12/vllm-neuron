@@ -65,8 +65,7 @@ DEVICE = "neuron:0"
 ROWS = 4
 """Tokens per request of the verify step timed here: ``1 + k`` at ``k = 3``."""
 HBM_BYTES_PER_S = 716.0e9
-"""The per-rank HBM bandwidth every entitlement in the campaign's reports uses
-(``reports/mtp.md``, section 3: a 64 MiB GEMV in ~94 us)."""
+"""The per-rank HBM bandwidth every entitlement uses (a 64 MiB GEMV in ~94 us)."""
 ENTITLEMENT_RATIO_LIMIT = 1.5
 """The NKI mandate's ceiling on measured time over the bytes/bandwidth entitlement."""
 LATENT, INDEX_DIM, INDEX_HEADS, POOL, TOPK = 512, 128, 32, 4, 2048

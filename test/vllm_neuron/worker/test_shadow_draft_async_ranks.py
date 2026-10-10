@@ -87,7 +87,7 @@ DEVICE_STEP_SECONDS = 10.0
 STEPS = 3
 # Both ranks build the tiny root and warm the runner (about 30 s on this machine) within the
 # setup bound; from the moment both are warm, the three steps, their outputs and the shutdown
-# must finish within the step bound (team-lead's 60 s). A rank that has not reported by then
+# must finish within the step bound (60 s). A rank that has not reported by then
 # is hung: its progress file says where, its stack file (dumped shortly before the bound) says
 # on which line.
 SETUP_TIMEOUT_SECONDS = 240.0

@@ -4,7 +4,7 @@
 Every number is cited by an exact text snippet of its source file; ``test_references``
 checks that each snippet is still in the file.
 
-Per bucket (team-lead ruling on acceptance 2):
+Per bucket:
   - ``reference``: the same-scope in-model time of the work the ledger's measured units
     cover. It is a wall time (call span, kernel wall) where the breakdown gives one.
     PASS when the ledger's raw benchmark sum is within ``TOLERANCE`` of it.

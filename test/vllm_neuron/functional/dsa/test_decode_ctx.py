@@ -372,7 +372,7 @@ def test_selected_pools_concentrated_in_one_segment():
 def test_the_rows_the_base_served_are_compacted_whole():
     """Up to e3f38f8's widest axis (16384 candidates) a mask row is compacted whole, as
     e3f38f8 did: two segments and a merge cost 663 -> 873 us per layer at B = 64, ctx
-    65536 on the device (worker-47's J4). Past it the row is cut in segments."""
+    65536 on the device. Past it the row is cut in segments."""
     assert DS.segments(BASE_CEILING) == (1, BASE_CEILING)
     count, width = DS.segments(BASE_CEILING + 1)
     assert count > 1 and width <= DS.SEGMENT_COLUMNS

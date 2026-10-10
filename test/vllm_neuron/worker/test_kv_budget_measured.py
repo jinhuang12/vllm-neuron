@@ -15,7 +15,7 @@ no per-physical-core bound: the runtime accounts every tensor of a rank on the
 even physical core (14.46 GiB on ND 0 NC 0 at tip-b64-C, more than half the
 logical core's 24 GiB), so the logical core is the only capacity there is.
 
-The served figures are the bs=64 @ 8k gate line at b17526a, gate run tip-b64-C
+The served figures are the bs=64 @ 8k line as measured
 server log (every rank): "Neuron HBM: 7.06 GiB used, 16.94 GiB free", parameters
 1.63 GiB, resident 6.79 GiB, need 5.845 GiB, allocated 6.329 GiB (side caches
 0.347 GiB).

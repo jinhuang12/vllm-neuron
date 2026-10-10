@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Device repro and check of the bank-form KDA graph inputs (worker-32, wt2/hostpath round 3).
+"""Device repro and check of the bank-form KDA graph inputs.
 
 Run through the device lease on slice ``host`` (one trn2 chip, 4 logical cores):
 

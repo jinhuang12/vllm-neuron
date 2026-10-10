@@ -5887,8 +5887,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # last owner can have left a step in flight that the output thread is
             # draining, and ``empty_slot``'s ordering read would be a second device
             # wait on that execution, which the runtime's single completion handle
-            # per execution turns into a hang (reports/prefill-cores-hang.md
-            # §worker-59). O(1) when nothing is pending; a no-op once read back.
+            # per execution turns into a hang. O(1) when nothing is pending; a no-op
+            # once read back.
             if side_caches:
                 pending = getattr(self, "async_execution_buffer", None)
                 pending = pending.get("async_output") if pending else None

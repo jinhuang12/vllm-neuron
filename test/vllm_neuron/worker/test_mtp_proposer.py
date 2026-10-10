@@ -162,7 +162,7 @@ def test_the_eagle_only_hooks_are_no_ops():
     assert proposer.graph_extract(num_tokens=4, num_reqs=1, attn_metadata={}, device=None) is None
 
 
-# ── the head's reader of k honours the speculative config (team-lead ruling 10:10Z, hunk 1) ──
+# ── the head's reader of k honours the speculative config ──
 
 
 def test_the_reader_takes_k_from_the_current_speculative_config(monkeypatch):

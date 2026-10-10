@@ -6,7 +6,7 @@ What it prices, per 1024-row prefill chunk on TP = 64 (every chunk runs 1024 ope
 
 * **as built** -- every rank runs the score GEMM, the causal bound, the top-k and the
   sentinel ordering on all ``T`` rows over ``C = max_model_len // 4`` candidates. The
-  values are worker-3's calibrated buckets (:data:`CALIB_DIR`, read only): MEASURED at
+  values are the calibrated prefill buckets (:data:`CALIB_DIR`, read only): MEASURED at
   ``C`` 1024 and 2048, a stated linear extrapolation above.
 * **query-sharded at degree d** -- each rank runs the same chain on ``R = ceil(T / d)``
   rows, then one all-gather of the ``[R, select_k]`` ids per layer.
@@ -119,13 +119,13 @@ def _id_bytes() -> int:
 
 
 ID_BYTES = _id_bytes()
-#: The two candidate widths the round-2 breakdown measured the indexer at: p1
-#: (max_model_len 4096) and p2 / p3 (8192). worker-3's fits and the top-k fit use both.
+#: The two candidate widths the prefill breakdown measured the indexer at: p1
+#: (max_model_len 4096) and p2 / p3 (8192). The calibrated fits and the top-k fit use both.
 FIT_CANDS = (1024, 2048)
-#: Score and causal-bound buckets carry a per-call intercept in worker-3's fit.
+#: Score and causal-bound buckets carry a per-call intercept in the calibrated fit.
 FIT_BUCKETS = ("score_gemm", "causal_bound")
-#: The sentinel ordering's measured per-chunk ms (11 layers, T = 1024), from the round-2
-#: breakdown's master table (``/home/ubuntu/glm53f-wt2/reports/prefill_breakdown.json``):
+#: The sentinel ordering's measured per-chunk ms (11 layers, T = 1024), from the prefill
+#: breakdown's master table:
 #: p1 at C = 1024; p2 and p3 at C = 2048.
 SENTINEL_KEY = "dsa/sentinel_order.py"
 #: The device runs the report summarises, by name: ``(cands, causal bound)``. Each has
@@ -210,7 +210,7 @@ def calibration_available() -> bool:
 
 
 def load_model():
-    """worker-3's calibrated prefill model, imported read-only from its own directory."""
+    """The calibrated prefill model, imported read-only from its own directory."""
     return _load("_w3_prefill_model", os.path.join(CALIB_DIR, "prefill_model.py")).Model()
 
 

@@ -574,7 +574,7 @@ def cmd_run(args) -> None:
 
 #: ``select`` cases, ``B:C``: the selection's request-major tiles of 2 to 8 requests, the
 #: segment path (C > 16384) with one to eight requests a GpSimd call, nine segments, and
-#: the widest axis. 16:32768 is where worker-47's D3 found the segment lists read back
+#: the widest axis. 16:32768 is where the segment lists were first seen read back
 #: as zeros on the device.
 SELECT_CASES = ("1:2048", "4:2048", "64:2048", "4:8192", "16:16384", "64:16384",
                 "4:20480", "8:32768", "16:32768", "64:32768", "4:65536", "8:65536",

@@ -33,7 +33,7 @@ What is measured, per (T, variant):
    before/after interleaved. Median and p90.
 2. A device profile of ``--profile-iterations`` calls, ingested with ``neuron-explorer``
    and sampled every 2 us with the serving profile's rules (``benchmark_layer_glue.
-   bucket_main``, frozen there from ``/home/ubuntu/glm53f-wt2/profile/breakdown.py``):
+   bucket_main``, frozen there from the serving-profile breakdown tool):
    per physical core the highest-priority instruction covering the sample (NKI kernel
    by source file / unnamed compiler op > DMA issue > semaphore > core barrier); a sample
    where both cores compute is split 0.5/0.5. The goal's window is the PREFILL_BREAKDOWN

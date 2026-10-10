@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MTP on GLM-5.3-Flash with the wave-4 caps removed (mtp.md section 10).
+"""MTP on GLM-5.3-Flash with the KV budget caps removed.
 
-Two questions, both for TP=64 EP=16 on this fork (b17526a):
+Two questions, both for TP=64 EP=16 on this fork:
 
 (a) Does the GPU recipe line, unchanged, fit the KV budget once the 0.30 cap and the fixed
     5 GiB graph reserve are gone?  Per-rank KV need from the kvseg hand formula
-    (``reports/kvseg_budget.json``, checked here against its three measured points) for
+    (the KV-segment budget record, checked here against its three measured points) for
     the recipe line as written (prefix caching on, no ``--mamba-block-size``) and for the
     two-flag variant the bs=64 gate line uses (``--no-enable-prefix-caching
     --mamba-block-size <max_model_len>``, kv.md:153).
@@ -44,9 +44,9 @@ INDEX_KPOOL = 4
 INDEX_HEAD_DIM = 128
 SIDE_ELEM_BYTES = 2          # latent bank dtype (bf16)
 HBM_PER_RANK_GIB = 24.00     # neuron_worker log: total_hbm=24.00 GiB (gate runs)
-FREE_AT_BUDGET_GIB = 16.94   # tip-b64-C (team-lead ruling 2): 24.00 total, 7.06 used at budget time
+FREE_AT_BUDGET_GIB = 16.94   # the bs=64 tip: 24.00 total, 7.06 used at budget time
 CAP_TODAY_GIB = 6.62         # min(user, 0.30 x 22.08, 12 - 5 reserve) today
-ASSUMED_UNCAPPED_GIB = (12.0, 15.0)   # worker-37 wt2/kvbudget: free - graphs' real need - margin (16.94 - 5 / - 2, rounded)
+ASSUMED_UNCAPPED_GIB = (12.0, 15.0)   # KV budget study: free - graphs' real need - margin (16.94 - 5 / - 2, rounded)
 # Today's per-physical-core staging bound (neuron_worker.py:1116-1135 `_physical_core_kv_bound`):
 # min(HBM/2 - reserve, 2 x (HBM/2 - reserve) - used) = min(12 - 5, 14 - 1.63) = 7.00 GiB (tip-b64-C server.log:6032).
 # A1 assumes wave 4 drops that term too; the alternative keeps it with the measured prefill graph need
@@ -94,7 +94,7 @@ def largest_bs(L: int, budget_bytes: int, **kw) -> int:
 
 
 def check_against_kvseg_points() -> list[dict]:
-    """The formula must reproduce reports/kvseg_budget.json's three measured points."""
+    """The formula must reproduce the KV-segment budget record's three measured points."""
     pts = [
         # (S, L, mamba_block_is_L, need_bytes, footprint_kvseg_bytes)
         (1, 4096, False, 232128512, 237366528),
@@ -179,7 +179,7 @@ def mla_us(C: int, T: int, variant: str) -> float:
     return v["fixed_us"] + T * v["per_row_per_1k_us"] * rows_read / 1024.0
 
 
-# Whole-layer cross-check (reports/indexer_micro.json, round 1, indexer tree = the tip's DSA layer code; the
+# Whole-layer cross-check (the indexer microbenchmark, indexer tree = the tip's DSA layer code; the
 # same "one layer's decode step" unit as dsa_micro.json): one DSA layer in the SELECTED regime at B=1 takes
 # 671.4 us at 4k and 711.2 us at 8k (B=4 939.8, B=16 2141.2 at 8k); the BYPASS layer at 1k B=1 takes 286.64 us
 # (dsa_micro.json, the number projection.py's attention half rests on). Composing the tip chain and MLA above

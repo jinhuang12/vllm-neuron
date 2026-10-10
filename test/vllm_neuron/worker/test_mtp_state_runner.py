@@ -73,7 +73,7 @@ DIGEST_MAX_BYTES = 1 << 20
 #: The knob value stage A's shadow draft serves.
 DRAFT_K = 5
 
-#: The two serve lines (``/home/ubuntu/glm53f-wt2/00_brief.md``, "Serving facts").
+#: The two served configurations.
 LINES = {
     # Fast bs=1 recipe: max_model_len 4096, one sequence, segments 1024 / 2048 / 4096
     # (the largest segment plus the 1024-row query must cover max_model_len, the bucket

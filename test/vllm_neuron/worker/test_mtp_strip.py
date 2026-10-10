@@ -7,8 +7,8 @@ request's first decode after prefill (0 drafts) scheduled beside requests carryi
 ``k``, and a request near ``max_model_len`` whose drafts vLLM's scheduler truncated.
 The runner's existing disaggregated-inference guard (``_local_step_forces_nonspec``
 -> ``_maybe_strip_spec_for_nonspec_step``) already strips a step to one token per
-request; the vote is extended by ``_local_force_nonspec`` to a mixed mtp step
-(team-lead ruling 12:05Z, hunk 6), narrowed to steps whose per-request draft counts
+request; the vote is extended by ``_local_force_nonspec`` to a mixed mtp step,
+narrowed to steps whose per-request draft counts
 differ: a uniform step keeps its drafts. Covered on bare stubs.
 
     NKI_SIMULATOR=1 VLLM_NEURON_CPU_MODE=1 python -m pytest \\

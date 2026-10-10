@@ -13,7 +13,7 @@ expert) and 256 (dense MLP), M in {1, 4, 64} plus the chunk edges 33 and 127 and
 the narrow/wide path edge 15/16. M=1 and M=4 run the narrow path, M=64 the wide
 path.
 
-Tolerance (round 1, ``test_blockwise_fp8_mlp_small_m.py``): elementwise
+Tolerance (as in ``test_blockwise_fp8_mlp_small_m.py``): elementwise
 ``|got - ref| <= 2e-3 * max|ref|``.
 """
 

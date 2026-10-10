@@ -3,12 +3,12 @@
 
 A verify step of ``T = 1 + k`` rows writes ``T`` ring rows ahead of the request's
 position; on the 4-row ring a row of an accepted position is overwritten once
-``T >= 3`` (worker-58's proof, team-lead ruling 10:20Z). The depth comes from
-worker-58's one helper, ``functional.dsa.decode_trow.indexer_ring_depth(index_kpool,
+``T >= 3``. The depth comes from
+one helper, ``functional.dsa.decode_trow.indexer_ring_depth(index_kpool,
 num_speculative_tokens)``, and the runner allocates ``tail`` and ``pad_tail`` as
 ``[slots, 2, R, index_head_dim]`` with it; a server that drafts nothing keeps today's
 ``index_kpool`` rows, bit-identical, without importing the helper. The KV budget's
-side-cache price follows the same depth. The helper is worker-58's and is stood in
+side-cache price follows the same depth. The helper is stood in
 for here by a module stub.
 
     NKI_SIMULATOR=1 VLLM_NEURON_CPU_MODE=1 python -m pytest \\
@@ -36,7 +36,7 @@ K = 3
 
 @pytest.fixture
 def helper(monkeypatch):
-    """worker-58's helper, stood in: twice the pool on a drafting server."""
+    """The depth helper, stood in: twice the pool on a drafting server."""
     monkeypatch.setitem(
         sys.modules, HELPER_MODULE,
         SimpleNamespace(indexer_ring_depth=lambda pool, k: 2 * int(pool) if k > 0 else int(pool)),

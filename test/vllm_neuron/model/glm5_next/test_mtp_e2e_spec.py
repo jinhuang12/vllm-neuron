@@ -525,7 +525,7 @@ class _Oracle:
 
     def populate(self, hidden_rows, next_ids, positions, **kwargs):
         """The head's state write at ``T`` rows (its attention layer's ``T``-row leg is
-        worker-58's); the drafts come from this oracle, so the state is never read."""
+        covered elsewhere); the drafts come from this oracle, so the state is never read."""
         assert hidden_rows.shape[0] == next_ids.numel() == positions.numel()
         self.populated += 1
 

@@ -39,7 +39,7 @@ def test_interpolation_is_linear_inside_and_nearest_within_half_a_hit():
 
 
 def test_a_repeat_case_is_shown_but_not_used(cur):
-    # team-lead round 2: no duplicate averaging for DSA; the repeat stays visible in the note
+    # no duplicate averaging for DSA; the repeat stays visible in the note
     row = cur.row("mla_sparse")
     assert row.source == "dsa_micro.json#layer/bypass/B1"
     assert row.measured_us == pytest.approx(286.63827272727275)
