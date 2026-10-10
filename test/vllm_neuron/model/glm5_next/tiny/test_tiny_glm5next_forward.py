@@ -165,6 +165,10 @@ _SEAM_REGISTRY = {
     "dsa_shard_rows": (
         "vllm_neuron.functional.dsa.shard_rows",
         "shard_rows_dispatch_counters", "reset_shard_rows_dispatch_counters"),
+    "dsa_dcp_merge_select": (
+        "vllm_neuron.functional.dsa.dcp_candidate_merge",
+        "dcp_merge_select_dispatch_counters",
+        "reset_dcp_merge_select_dispatch_counters"),
     "kda_chunked_recurrence": (
         "vllm_neuron.functional.kda.chunked_recurrence",
         "dispatch_counters", "reset_dispatch_counters"),

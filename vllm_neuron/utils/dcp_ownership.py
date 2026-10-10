@@ -222,3 +222,59 @@ def local_context_capacity(context: int, *, block_size: int, dcp_size: int) -> i
     if not isinstance(context, int) or context < 0:
         raise ValueError(f"context must be a non-negative int; got {context!r}")
     return -(-context // stride) * block_size
+
+
+def owned_step_count(step_tokens: int, *, block_size: int, dcp_size: int) -> int:
+    """Return the most rows one rank owns of any ``step_tokens`` consecutive positions.
+
+    A step of ``step_tokens`` positions is ``step_tokens // ownership_stride`` whole
+    strides, each giving every rank ``block_size`` rows, and a remainder shorter than a
+    stride. A rank owns at most ``min(remainder, block_size)`` rows of that remainder: a
+    run shorter than ``dcp_size`` blocks meets two of one rank's blocks only at its two
+    ends, and those two pieces are less than one block together. So the count is
+    ``(step_tokens // ownership_stride) * block_size + min(step_tokens %
+    ownership_stride, block_size)``, and it is reached: by the rank whose block starts
+    the step at a stride boundary.
+
+    It is the static row count of a step's compacted owned rows
+    (:func:`owned_step_rows`): ``step_tokens / dcp_size`` exactly when the stride divides
+    ``step_tokens``, and more than any one rank owns at some starts otherwise.
+    """
+    stride = ownership_stride(block_size=block_size, dcp_size=dcp_size)
+    if not isinstance(step_tokens, int) or step_tokens < 1:
+        raise ValueError(f"step_tokens must be a positive int; got {step_tokens!r}")
+    return (step_tokens // stride) * block_size + min(step_tokens % stride, block_size)
+
+
+def owned_step_rows(
+    start: Tensor, rank: int | Tensor, *, step_tokens: int, block_size: int, dcp_size: int
+) -> tuple[Tensor, Tensor]:
+    """Return which rows of a step rank ``rank`` owns, compacted, and where they go.
+
+    The step is the ``step_tokens`` consecutive positions from ``start``. The positions
+    a rank owns there hold one run of its local rows, the run from its
+    :func:`owned_length` at ``start``: each local row holds the rank's next owned
+    position. So one offset places them all.
+
+    Args:
+        start: the step's first position, an integer tensor of one element.
+        rank: the rank, an int or a one-element tensor.
+        step_tokens: the step's positions, a python int.
+        block_size: tokens per KV block.
+        dcp_size: ranks in the DCP group.
+
+    Returns:
+        ``(rows, offset)``. ``rows`` is ``[owned_step_count(step_tokens)]`` int64: entry
+        ``j`` is the step row (``0 .. step_tokens - 1``) of the position at the rank's
+        local row ``offset + j``, for every ``j`` below the rank's own count. The
+        entries after that repeat the step's last row: they are pad rows, placed past
+        every row the rank holds. ``offset`` is ``owned_length(start, rank)``, the local
+        row of the rank's first owned position of the step, ``[1]`` int64.
+    """
+    count = owned_step_count(step_tokens, block_size=block_size, dcp_size=dcp_size)
+    _check_rank(rank, dcp_size)
+    at = start.reshape(1).to(torch.int64)
+    offset = owned_length(at, rank, block_size=block_size, dcp_size=dcp_size)
+    local = offset + torch.arange(count, dtype=torch.int64, device=at.device)
+    positions = token_position(local, rank, block_size=block_size, dcp_size=dcp_size)
+    return torch.clamp(positions - at, max=step_tokens - 1), offset
