@@ -22,22 +22,25 @@ neuronx-cc lowers as reduces over a middle axis; at ``T`` = 1024, ``E`` = 18, ``
 build is 0.232 ms of compiler ops per MoE layer, 65x its ENTITLEMENT, most of it one
 ``reduce f32[1024, 8]`` (MEASURED, ``reports/prefill_fixed_cost.md`` section 5).
 
-Method. 128 tokens on the partitions; a last tile of fewer tokens is zero-filled, and its
-empty partitions select nothing. The token-order count is two 0/1 products on the tensor
-engine: a lower-triangular ``[128, 128]`` product with the tile's mask, plus an all-ones
-product with the sum of the earlier tiles' masks. ``blocks`` counts thresholds instead of
-dividing, ``ceil(c / block) = #{m >= 0 : m * block < c}`` with ``m < ceil(T / block)``, and
-one product with a strictly upper-triangular ``[E, E]`` takes ``first`` to every token
-partition. The slots need no one-hot: each selected expert gets the key
-``(E - e) * scale + row[t, e]`` (unselected: 0), with ``scale`` (:func:`key_scale`) a power
-of two above every row, and the vector engine's ``max8`` returns each token's 8 largest keys
-in descending order: its selected experts in expert order, then zeros. So
-``valid = key != 0`` and ``index = key mod scale``, an integer ``and``.
+Method. Partition ``q`` holds the ``per = ceil(T / 128)`` consecutive tokens
+``q * per + i``, so each partition's rows move as one contiguous piece in and out; partitions
+past the last token are zero-filled and select nothing. ``place`` is the inclusive count
+along ``i`` within the partition (vector engine) plus the count on the earlier partitions,
+one strictly lower-triangular ``[128, 128]`` product with each partition's total (tensor
+engine). ``blocks`` counts thresholds instead of dividing,
+``ceil(c / block) = #{m >= 0 : m * block < c}`` with ``m < ceil(T / block)``, and one product
+with a strictly upper-triangular ``[E, E]`` takes ``first`` to every partition. The slots need
+no one-hot: each selected expert gets the key ``(E - e) * scale + row[t, e]`` (unselected: 0),
+with ``scale`` (:func:`key_scale`) a power of two above every row, and the vector engine's
+``max8`` returns each token's 8 largest keys in descending order: its selected experts in
+expert order, then zeros. So ``valid = key != 0`` and ``index = key mod scale``, an integer
+``and``.
 
-Numerics. Every value is an integer below ``2**24``, and every product operand is 0, 1, a
-sum of at most ``ceil(T / 128)`` masks or a block count, so each product, sum, ``max8`` and
-convert is exact in fp32: the outputs are bit-equal to the torch construction
-(:func:`combine_slots_torch`) in any summation order.
+Numerics. Every value is an integer below ``2**24``. The three products take bf16 operands
+that are all integers of at most 256 (0/1 masks and triangles, counts of at most ``per``
+tokens, block counts of at most ``ceil(T / block)``), which bf16 holds exactly, and sum them in
+fp32 PSUM; every other step runs in fp32 or int32. So each step is exact and the outputs are
+bit-equal to the torch construction (:func:`combine_slots_torch`) in any summation order.
 
 LNC2: one program, and every loop runs over trace-time ints (fully unrolled), so there is no
 register-bounded loop and no data-dependent branch.
@@ -62,17 +65,17 @@ from torch import Tensor
 from vllm_neuron import envs
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
-#: Tokens per tile: the partition count; also the most experts one tile holds.
+#: Partitions: the token rows of one pass; also the most experts one tile holds.
 TOKEN_TILE = nl.tile_size.pmax
 
 #: Values per partition that ``max8`` reads at least and returns: the most slots a token has.
 MAX8_WIDTH = 8
 
-#: fp32 values per partition of one PSUM bank: one tensor-engine product writes within it.
-PSUM_BANK_FP32 = nl.tile_size.psum_fmax
-
 #: fp32 holds every integer up to this bound exactly.
 FP32_EXACT_INTEGERS = 2**24
+
+#: bf16 holds every integer up to this bound exactly.
+BF16_EXACT_INTEGERS = 2**8
 
 
 def _tile(rows, cols, dtype=nl.float32):
@@ -80,30 +83,47 @@ def _tile(rows, cols, dtype=nl.float32):
     return nl.ndarray((rows, max(cols, 8)), dtype=dtype, buffer=nl.sbuf)[:, :cols]
 
 
-def _triangle(size, strict):
-    """``[size, size]`` fp32 0/1: ``tri[p, c] = p < c`` (``strict``) or ``p <= c``."""
+def _triangle(size, strict, dtype):
+    """``[size, size]`` 0/1: ``tri[p, c] = p < c`` (``strict``) or ``p <= c``."""
     row = _tile(size, size)
     nisa.iota(dst=row, pattern=[[0, size]], offset=0, channel_multiplier=1)
     col = _tile(size, size)
     nisa.iota(dst=col, pattern=[[1, size]], offset=0, channel_multiplier=0)
-    tri = _tile(size, size)
+    tri = _tile(size, size, dtype)
     nisa.tensor_tensor(dst=tri, data1=row, data2=col, op=nl.less if strict else nl.less_equal)
     return tri
 
 
-def _store_by_tile(out_hbm, sbuf, slots):
-    """``out_hbm[i * 128 + q, j] = sbuf[q, i, j]`` for ``j < slots``: one DMA for the whole
-    tiles, one for the last tile's tokens."""
-    tokens = out_hbm.shape[0]
-    p = TOKEN_TILE
-    full = tokens // p
-    tail = tokens % p
+def _load_by_partition(sbuf, hbm, per):
+    """``sbuf[q, i, :] = hbm[q * per + i, :]``: one DMA for the whole partitions, one for the
+    last partition's remaining tokens."""
+    tokens = hbm.shape[0]
+    width = hbm.shape[1]
+    full = tokens // per
+    rest = tokens % per
     if full:
-        nisa.dma_copy(dst=out_hbm.ap(pattern=[[slots, p], [p * slots, full], [1, slots]],
-                                     offset=0), src=sbuf[:, 0:full, 0:slots])
-    if tail:
-        nisa.dma_copy(dst=out_hbm.ap(pattern=[[slots, tail], [1, slots]],
-                                     offset=full * p * slots), src=sbuf[0:tail, full, 0:slots])
+        nisa.dma_copy(dst=sbuf[0:full, :, :],
+                      src=hbm.ap(pattern=[[per * width, full], [width, per], [1, width]],
+                                 offset=0))
+    if rest:
+        nisa.dma_copy(dst=sbuf[full:full + 1, 0:rest, :],
+                      src=hbm.ap(pattern=[[per * width, 1], [width, rest], [1, width]],
+                                 offset=full * per * width))
+
+
+def _store_by_partition(hbm, sbuf, per):
+    """``hbm[q * per + i, j] = sbuf[q, i, j]`` for ``j`` below ``hbm``'s width: one DMA for the
+    whole partitions, one for the last partition's remaining tokens."""
+    tokens = hbm.shape[0]
+    width = hbm.shape[1]
+    full = tokens // per
+    rest = tokens % per
+    if full:
+        nisa.dma_copy(dst=hbm.ap(pattern=[[per * width, full], [width, per], [1, width]],
+                                 offset=0), src=sbuf[0:full, :, 0:width])
+    if rest:
+        nisa.dma_copy(dst=hbm.ap(pattern=[[per * width, 1], [width, rest], [1, width]],
+                                 offset=full * per * width), src=sbuf[full:full + 1, 0:rest, 0:width])
 
 
 def key_scale(tokens: int, experts: int, block: int, rows: int) -> int:
@@ -127,56 +147,48 @@ def combine_slots_kernel(affinities_hbm, block, rows, slots, scale):
     """
     tokens, experts = affinities_hbm.shape
     p = TOKEN_TILE
+    per = -(-tokens // p)
+    thresholds = -(-tokens // block)
     kernel_assert(MAX8_WIDTH <= experts <= p, "8 <= E <= 128: max8 reads at least 8 keys")
     kernel_assert(1 <= slots <= MAX8_WIDTH, "1 <= K <= 8")
-    thresholds = -(-tokens // block)
     kernel_assert(scale & (scale - 1) == 0 and scale >= experts * thresholds * rows,
                   "scale is a power of two above every emission row")
     kernel_assert((experts + 1) * scale <= FP32_EXACT_INTEGERS, "every key is exact in fp32")
-    full = tokens // p
-    tail = tokens % p
-    tiles = -(-tokens // p)
-    # Tiles whose [128, E] fp32 counts share one PSUM bank.
-    group = PSUM_BANK_FP32 // experts
+    kernel_assert(per <= BF16_EXACT_INTEGERS and thresholds <= BF16_EXACT_INTEGERS,
+                  "every product operand is exact in bf16")
     index_out = nl.ndarray((tokens, slots), dtype=nl.int32, buffer=nl.shared_hbm)
     valid_out = nl.ndarray((tokens, slots), dtype=nl.float32, buffer=nl.shared_hbm)
 
     # ---- Constants. -------------------------------------------------------- #
-    ones = _tile(p, p)
+    ones = _tile(p, p, nl.bfloat16)
     nisa.memset(dst=ones, value=1.0)
-    lower = _triangle(p, strict=False)          # lower[t', t] = t' <= t
-    before = _triangle(experts, strict=True)    # before[e', e] = e' < e
+    earlier = _triangle(p, strict=True, dtype=nl.bfloat16)        # earlier[q', q] = q' < q
+    before = _triangle(experts, strict=True, dtype=nl.bfloat16)   # before[e', e] = e' < e
     # threshold[e, m] = m * block.
     threshold = _tile(experts, thresholds)
     nisa.iota(dst=threshold, pattern=[[block, thresholds]], offset=0, channel_multiplier=0)
-    # order[t, e] = (E - e) * scale: the high part of the key, larger for a lower expert.
+    # order[q, e] = (E - e) * scale: the high part of the key, larger for a lower expert.
     order = nl.ndarray((p, experts), dtype=nl.float32, buffer=nl.sbuf)
     nisa.iota(dst=order, pattern=[[-scale, experts]], offset=experts * scale,
               channel_multiplier=0)
 
-    # ---- The mask of every tile; earlier[:, i] = the sum of tiles 0 .. i-1. #
-    # Token i * 128 + q on partition q of tile i: one DMA for the whole tiles, one for the
-    # last tile's tokens (the rest of that tile stays zero).
-    scores = nl.ndarray((p, tiles, experts), dtype=affinities_hbm.dtype, buffer=nl.sbuf)
-    if full:
-        nisa.dma_copy(dst=scores[:, 0:full, :], src=affinities_hbm.ap(
-            pattern=[[experts, p], [p * experts, full], [1, experts]], offset=0))
-    if tail:
-        nisa.memset(dst=scores[:, full, :], value=0.0)
-        nisa.dma_copy(dst=scores[0:tail, full, :], src=affinities_hbm.ap(
-            pattern=[[experts, tail], [1, experts]], offset=full * p * experts))
-    mask = nl.ndarray((p, tiles, experts), dtype=nl.float32, buffer=nl.sbuf)
+    # ---- The mask, and the inclusive count along each partition's tokens. -- #
+    scores = nl.ndarray((p, per, experts), dtype=affinities_hbm.dtype, buffer=nl.sbuf)
+    if tokens != p * per:
+        nisa.memset(dst=scores, value=0.0)
+    _load_by_partition(scores, affinities_hbm, per)
+    mask = nl.ndarray((p, per, experts), dtype=nl.bfloat16, buffer=nl.sbuf)
     nisa.tensor_scalar(dst=mask, data=scores, op0=nl.not_equal, operand0=0.0)
-    earlier = nl.ndarray((p, tiles + 1, experts), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.memset(dst=earlier[:, 0, :], value=0.0)
-    for i in range(tiles):
-        nisa.tensor_tensor(dst=earlier[:, i + 1, :], data1=earlier[:, i, :],
+    counted = nl.ndarray((p, per, experts), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=counted[:, 0, :], src=mask[:, 0, :])
+    for i in range(1, per):
+        nisa.tensor_tensor(dst=counted[:, i, :], data1=counted[:, i - 1, :],
                            data2=mask[:, i, :], op=nl.add)
+    held = counted[:, per - 1, :]   # each partition's tokens per expert
 
     # ---- Per expert: its token count, blocks and first emission row. -------- #
-    # count[e] = sum over partitions of earlier[:, tiles, e], with e on the partitions.
     count_ps = nl.ndarray((experts, 1), dtype=nl.float32, buffer=nl.psum)
-    nisa.nc_matmul(dst=count_ps, stationary=earlier[:, tiles, :], moving=ones[:, 0:1],
+    nisa.nc_matmul(dst=count_ps, stationary=held, moving=ones[:, 0:1],
                    is_moving_onezero=True, accumulate=False)
     count = _tile(experts, 1)
     nisa.tensor_copy(dst=count, src=count_ps)
@@ -184,47 +196,41 @@ def combine_slots_kernel(affinities_hbm, block, rows, slots, scale):
     nisa.tensor_scalar(dst=above, data=threshold, op0=nl.less, operand0=count)
     blocks = _tile(experts, 1)
     nisa.tensor_reduce(dst=blocks, op=nl.add, data=above, axis=1)
-    # blocks[e'] on every column, then first[t, e] = sum over e' < e, on every token.
-    spread = _tile(experts, p)
+    # blocks[e'] on every column, then first[q, e] = sum over e' < e, on every partition.
+    spread = _tile(experts, p, nl.bfloat16)
     nisa.tensor_scalar(dst=spread, data=ones[0:experts, :], op0=nl.multiply, operand0=blocks)
     first_ps = nl.ndarray((p, experts), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_matmul(dst=first_ps, stationary=spread, moving=before, is_moving_onezero=True,
                    accumulate=False)
-    # base = order + first * rows - 1, so a key is (base + the inclusive token count) * mask.
+    # Each expert's tokens on the earlier partitions.
+    prior_ps = nl.ndarray((p, experts), dtype=nl.float32, buffer=nl.psum)
+    nisa.nc_matmul(dst=prior_ps, stationary=earlier, moving=held, is_stationary_onezero=True,
+                   accumulate=False)
+    # base = order + first * rows - 1 + prior, so a key is (base + counted) * mask.
     base = nl.ndarray((p, experts), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_scalar(dst=base, data=first_ps, op0=nl.multiply, operand0=float(rows),
                        op1=nl.add, operand1=-1.0)
     nisa.tensor_tensor(dst=base, data1=base, data2=order, op=nl.add)
+    nisa.tensor_tensor(dst=base, data1=base, data2=prior_ps, op=nl.add)
 
-    # ---- Keys and each token's 8 largest, a PSUM bank of tiles at a time. ---- #
-    top = nl.ndarray((p, tiles, MAX8_WIDTH), dtype=nl.float32, buffer=nl.sbuf)
-    for g0 in range(0, tiles, group):
-        n = min(group, tiles - g0)
-        counted_ps = nl.ndarray((p, n, experts), dtype=nl.float32, buffer=nl.psum)
-        for i in range(g0, g0 + n):
-            if i > 0:
-                nisa.nc_matmul(dst=counted_ps[:, i - g0, :], stationary=ones,
-                               moving=earlier[:, i, :], is_stationary_onezero=True,
-                               accumulate=False)
-            nisa.nc_matmul(dst=counted_ps[:, i - g0, :], stationary=lower, moving=mask[:, i, :],
-                           is_stationary_onezero=True, is_moving_onezero=True,
-                           accumulate=i > 0)
-        key = nl.ndarray((p, n, experts), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(dst=key, data1=counted_ps, data2=base.ap(
-            pattern=[[experts, p], [0, n], [1, experts]]), op=nl.add)
-        nisa.tensor_tensor(dst=key, data1=key, data2=mask[:, g0:g0 + n, :], op=nl.multiply)
-        for i in range(g0, g0 + n):
-            nisa.max8(dst=top[:, i, :], src=key[:, i - g0, :])
+    # ---- Keys, and each token's 8 largest. ---------------------------------- #
+    key = nl.ndarray((p, per, experts), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=key, data1=counted, data2=base.ap(
+        pattern=[[experts, p], [0, per], [1, experts]]), op=nl.add)
+    nisa.tensor_tensor(dst=key, data1=key, data2=mask, op=nl.multiply)
+    top = nl.ndarray((p, per, MAX8_WIDTH), dtype=nl.float32, buffer=nl.sbuf)
+    for i in range(per):
+        nisa.max8(dst=top[:, i, :], src=key[:, i, :])
 
-    # ---- valid = key != 0, index = key mod scale; out by the same tiling. ---- #
-    valid = nl.ndarray((p, tiles, MAX8_WIDTH), dtype=nl.float32, buffer=nl.sbuf)
+    # ---- valid = key != 0, index = key mod scale. ---------------------------- #
+    valid = nl.ndarray((p, per, MAX8_WIDTH), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_scalar(dst=valid, data=top, op0=nl.not_equal, operand0=0.0)
-    whole = nl.ndarray((p, tiles, MAX8_WIDTH), dtype=nl.int32, buffer=nl.sbuf)
+    whole = nl.ndarray((p, per, MAX8_WIDTH), dtype=nl.int32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=whole, src=top)
-    index = nl.ndarray((p, tiles, MAX8_WIDTH), dtype=nl.int32, buffer=nl.sbuf)
+    index = nl.ndarray((p, per, MAX8_WIDTH), dtype=nl.int32, buffer=nl.sbuf)
     nisa.tensor_scalar(dst=index, data=whole, op0=nl.bitwise_and, operand0=scale - 1)
-    _store_by_tile(index_out, index, slots)
-    _store_by_tile(valid_out, valid, slots)
+    _store_by_partition(valid_out, valid, per)
+    _store_by_partition(index_out, index, per)
     return index_out, valid_out
 
 
@@ -257,7 +263,8 @@ def combine_slots_torch(expert_affinities: Tensor, block: int, rows: int,
 def can_run_combine_slots(expert_affinities: Tensor, block: int, rows: int, top_k: int) -> bool:
     """A device that runs NKI, not a graph captured in CPU mode (whose simulator dispatch drops
     the int arguments), and the kernel's tile limits: ``8 <= E <= 128`` (``max8``'s least read,
-    one partition tile), at most 8 slots (``max8``'s width), every key exact in fp32."""
+    one partition tile), at most 8 slots (``max8``'s width), every key exact in fp32 (which
+    also bounds ``T`` well inside bf16's exact counts)."""
     tokens, experts = (int(n) for n in expert_affinities.shape)
     return (
         can_run_kernel(expert_affinities)
