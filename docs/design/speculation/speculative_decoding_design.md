@@ -611,6 +611,19 @@ Contract of the opt-in (measured on trn2 at TP64/EP16, `k = 3`, `max_num_seqs 1`
   against 11.377 ms synchronous (median per-token gap on the same host and recipe, a
   1k-token context; mean per-token gap 10.17 against 15.45 ms; 77.7 against 55.6 tokens/s)
   at `k = 3`, batch size 1, 2026-10-10).
+  The async drafter enqueues three NEFF executions per decode step and rank (the correction
+  launch, the forward, the take launch) against the synchronous drafter's one; the runtime
+  frees an execution-queue slot (`NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS`, set by the
+  worker) when its completion thread has processed the completion, and refuses a launch that
+  finds no slot with `NRT_QUEUE_FULL` (status 7). The drafter never raises on it: a refused
+  take or correction is served by the torch route on the host for that step (the operands
+  read back once, the fields moved back once, the values the synchronous drafter builds) and
+  counted (`async_step.queue_full_fallbacks()`), every other `RuntimeError` propagates
+  unchanged; and the compiled launch holder (`async_step.DeviceLaunch`) keeps at most
+  `async_step.LAUNCH_DEPTH` (8) of its launches unprocessed per rank, reading the oldest back
+  before it issues another, so a rank whose completion thread stalls waits instead of filling
+  the queue (8 launches hold at most 13 of the 32 slots; a healthy host holds at most 5, so
+  the wait never comes on one). No knob: both are the default.
   The recipe runs the on-device sampler with `all_greedy: true`; sampling knobs the greedy
   sampler cannot apply (`temperature > 0`, `top_k`, `top_p`, `min_p`, `seed`, `n > 1`)
   are refused at admission (`vllm_neuron/vllm/admission.py`). Distribution-preserving
