@@ -7613,6 +7613,20 @@ class Glm5NextMLAAttention(nn.Module):
             pool=self.indexer.index_kpool,
         )
 
+    def _padded_split_serves(self, width: int, page_size: int) -> bool:
+        """Whether ``mla_decode_padded_split_attention`` serves this layer's selecting
+        decode step of one row per request at a selected ``width``."""
+        from vllm_neuron.functional.attention.mla_decode_masked import (
+            mla_decode_padded_split_serves,
+        )
+
+        return mla_decode_padded_split_serves(
+            heads=self._heads_per_rank(),
+            latent=self.kv_lora_rank,
+            page=int(page_size),
+            width=int(width),
+        )
+
     def _attend_requests(
         self,
         hidden_states: torch.Tensor,
@@ -7650,7 +7664,10 @@ class Glm5NextMLAAttention(nn.Module):
         A selecting step may hand ``pool_scores`` (``[batch * T, candidates]`` fp32, the
         indexer's ``pool_scores`` form) in place of ``topk_indices``;
         ``mla_decode_masked_attention`` then selects from them and attends the same
-        token set from one pass over each window.
+        token set from one pass over each window. A selecting step of one request and
+        one row attends its ``topk_indices`` through ``mla_decode_padded_split_attention``
+        where that serves the width (an odd count of 128-row chunks, which
+        ``mla_decode_attention`` would run on one program).
         """
         from vllm_neuron.functional.attention.mla_absorb import mla_absorb
         from vllm_neuron.functional.attention.mla_decode import mla_decode_attention
@@ -7760,6 +7777,25 @@ class Glm5NextMLAAttention(nn.Module):
                 pool_scores,
                 self.indexer.index_kpool,
                 select_k=self.indexer.select_k(),
+            )
+        elif (
+            total == batch == 1
+            and not dense
+            and self._padded_split_serves(int(topk_indices.shape[1]), page)
+        ):
+            from vllm_neuron.functional.attention.mla_decode_masked import (
+                mla_decode_padded_split_attention,
+            )
+
+            attended = mla_decode_padded_split_attention(
+                q_lift,
+                c_kv,
+                block_table_row.t(),
+                start_position,
+                written,
+                softmax_scale,
+                page,
+                topk_indices,
             )
         else:
             attended = mla_decode_attention(
@@ -7963,7 +7999,16 @@ class Glm5NextMLAAttention(nn.Module):
                 latent_slots,
                 start_position=start_position,
             )
-        if rows > 1:
+        # A selecting step of one request and one row takes the batched attention too
+        # where the padded key-split form serves its width; :meth:`attend` would run
+        # the one-request sparse kernel on one program.
+        one_row_split = (
+            not dense
+            and batch == 1
+            and rows == 1
+            and self._padded_split_serves(int(selection.shape[1]), page_size)
+        )
+        if rows > 1 or one_row_split:
             # Several rows per request: the batched attention whatever the batch (at
             # batch_size 1 :meth:`attend` would read the rows as a prefill chunk).
             return self._attend_requests(

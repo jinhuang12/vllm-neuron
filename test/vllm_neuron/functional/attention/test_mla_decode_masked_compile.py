@@ -15,6 +15,8 @@ every core's dump is checked:
 * ``mla_decode_masked_kernel``: one request of 2, 4 and 6 rows (the verify step at
   ``k`` in {1, 3, 5}) over the selecting bucket's 4096-row window (32 pages of 128, 1024
   pools of 4), each row selecting 512 of the pools on chip;
+* ``mla_decode_padded_split_kernel``: one request of one row over the served selection's
+  2176 token indices (17 chunks of 128, padded to 18 for the pair);
 * ``dsa_decode_scores_rows_kernel`` with ``rotate``: the same rows and the one-row step,
   32 heads of 128 over the same 1024 candidates.
 
@@ -41,6 +43,8 @@ _HERE = pathlib.Path(__file__).resolve()
 _ROOT = _HERE.parents[4]
 
 LATENT, PAGE, POOL, SELECT_K = 512, 128, 4, 512
+#: The one-row selection: 512 pools of 4 tokens and one 128-row tail chunk.
+ONE_ROW_WIDTH = SELECT_K * POOL + 128
 WINDOW_PAGES, BANK_PAGES = 32, 64
 CANDIDATES = WINDOW_PAGES * PAGE // POOL
 MASKED_ROWS = (2, 4, 6)
@@ -72,6 +76,10 @@ def _programs(monkeypatch, kernel: str, rows: int) -> int:
         assert MM.mla_decode_masked_serves(heads=1, latent=LATENT, page=PAGE,
                                            window=WINDOW_PAGES * PAGE, rows=rows, pool=POOL)
         return MM._programs()
+    if kernel == "padded_split":
+        assert MM.mla_decode_padded_split_serves(heads=1, latent=LATENT, page=PAGE,
+                                                 width=ONE_ROW_WIDTH)
+        return MM._programs()
     return TR._programs(1)
 
 
@@ -99,6 +107,7 @@ def _compile(kernel: str, rows: int, programs: int):
 @_needs_compiler
 def test_the_served_shapes_compile_with_every_access_ordered(monkeypatch):
     shapes = [("masked", rows, _programs(monkeypatch, "masked", rows)) for rows in MASKED_ROWS]
+    shapes += [("padded_split", 1, _programs(monkeypatch, "padded_split", 1))]
     shapes += [("scores_rotated", rows, _programs(monkeypatch, "scores_rotated", rows))
                for rows in SCORE_ROWS]
     with concurrent.futures.ThreadPoolExecutor(len(shapes)) as pool:
@@ -137,6 +146,15 @@ def _arguments(kernel: str, rows: int) -> tuple:
             "scores_hbm": ((rows, CANDIDATES), "float32"), "softmax_scale": 0.0625,
             "page_size": PAGE, "pool_size": POOL, "select_k": SELECT_K,
             "fold_cap": int(DS.select_fold_cap(CANDIDATES)), "source_digest": MM.SOURCE_DIGEST}
+    if kernel == "padded_split":
+        return MM.mla_decode_padded_split_kernel, {
+            "q_hbm": ((rows, 1, LATENT), "bfloat16"),
+            "bank_hbm": ((BANK_PAGES * PAGE, LATENT), "bfloat16"),
+            "table_hbm": ((rows, WINDOW_PAGES), "int32"), "pos_hbm": ((rows,), "int32"),
+            "written_hbm": ((rows, LATENT), "bfloat16"),
+            "topk_hbm": ((rows, ONE_ROW_WIDTH), "int32"), "softmax_scale": 0.0625,
+            "page_size": PAGE, "padded": MM._padded_width(ONE_ROW_WIDTH, SERVED_LNC),
+            "source_digest": MM.SOURCE_DIGEST}
     raise ValueError(f"no served shape for kernel {kernel!r}")
 
 

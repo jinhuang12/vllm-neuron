@@ -251,3 +251,71 @@ def test_refusals_name_the_operand(monkeypatch):
     with pytest.raises(MD.MlaDecodeAttentionError, match="heads=2"):
         _attend((two_heads, bank, table, pos, written), bounded)
     assert MM.mla_decode_masked_dispatch_counters() == (0, 0)
+
+
+# ---------------------------------------------------------------------------------------
+# The one-row key-split form at a width of an odd chunk count
+# ---------------------------------------------------------------------------------------
+
+#: The served one-row selection: 512 pools of 4 tokens and one 128-row tail chunk.
+ONE_ROW_WIDTH = 2176
+
+
+def _one_row(start, *, seed, width=ONE_ROW_WIDTH):
+    """One request, one row at ``start``: the operands and its token indices, cut to
+    ``width`` columns."""
+    args, _bounded_rows, _mask, topk = _case(1, 1, [start], seed=seed)
+    assert int(topk.shape[1]) == ONE_ROW_WIDTH
+    return args, topk[:, :width].contiguous()
+
+
+@pytest.mark.parametrize("start, width", [
+    (2049, ONE_ROW_WIDTH),   # the first selecting position: fewer complete pools than k
+    (3001, ONE_ROW_WIDTH),
+    (4095, ONE_ROW_WIDTH),   # the window's last row
+    (3001, 9 * 128),         # 9 chunks: the selected pools' first tokens only
+])
+def test_the_padded_split_attends_one_row_as_the_oracle(start, width, monkeypatch):
+    _lnc(monkeypatch, "2")
+    args, topk = _one_row(start, seed=53 + start, width=width)
+    assert (width // 128) % 2 == 1
+    assert not MD._split_serves(1, LATENT, PAGE, width, 2)
+    got = MM.mla_decode_padded_split_attention(*args, SCALE, PAGE, topk)
+    assert MM.mla_decode_padded_split_count() == 1
+    assert MM.mla_decode_masked_dispatch_counters() == (0, 0)
+    want = MD.mla_decode_attention_torch_oracle(*args, SCALE, PAGE, topk)
+    _check(got, want, f"padded split start={start} width={width} vs oracle")
+    # The kernel mla_decode picks at this width: the general selected kernel.
+    MD.reset_mla_decode_dispatch_counters()
+    general = MD.mla_decode_attention(*args, SCALE, PAGE, topk_indices=topk)
+    assert MD.mla_decode_route_counts()[:2] == (0, 1) and MD.mla_decode_split_counts()[0] == 0
+    _check(got, general, f"padded split start={start} width={width} vs the general kernel")
+
+
+def test_the_padded_split_serves_an_odd_chunk_count_on_an_lnc2_pair_only(monkeypatch):
+    def serves(**changed):
+        geometry = dict(heads=1, latent=LATENT, page=PAGE, width=ONE_ROW_WIDTH)
+        geometry.update(changed)
+        return MM.mla_decode_padded_split_serves(**geometry)
+
+    _lnc(monkeypatch, "2")
+    assert serves() and serves(width=9 * 128)
+    # An even chunk count is mla_decode's key-split kernel's.
+    assert MD._split_serves(1, LATENT, PAGE, 2048, 2) and not serves(width=2048)
+    assert not serves(heads=2) and not serves(latent=384)
+    # One program splits nothing: mla_decode's key-split kernel serves every width there.
+    _lnc(monkeypatch, None)
+    assert not serves()
+
+
+def test_the_padded_split_refuses_what_it_does_not_serve(monkeypatch):
+    _lnc(monkeypatch, "2")
+    args, topk = _one_row(3001, seed=5)
+    with pytest.raises(MD.MlaDecodeAttentionError, match="width"):
+        MM.mla_decode_padded_split_attention(*args, SCALE, PAGE, topk[:, :2048].contiguous())
+    rows4, _bounded_rows, _mask, topk4 = _case(1, 4, [3001], seed=5)
+    with pytest.raises(MD.MlaDecodeAttentionError, match="one query row"):
+        MM.mla_decode_padded_split_attention(*rows4, SCALE, PAGE, topk4)
+    with pytest.raises(MD.MlaDecodeAttentionError, match="multiple of 128"):
+        MM.mla_decode_padded_split_attention(*args, SCALE, PAGE, topk[:, :100].contiguous())
+    assert MM.mla_decode_padded_split_count() == 0

@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Selecting-step forms of the batched MLA decode attention that read the window once.
+"""Selecting-step forms of the batched MLA decode attention that :mod:`mla_decode` does
+not serve.
 
 :mod:`mla_decode`'s selected mode gathers each query row's ``K`` selected window rows on
 its own. When a request's window holds fewer rows than its ``T`` query rows gather
 between them (``T * K``), reading the window once per request and masking, per row, the
-columns outside that row's selection attends the same rows from fewer bytes. The kernels
-of that form live in this file, beside :mod:`mla_decode` and not in it, and reuse its
-helpers by import.
+columns outside that row's selection attends the same rows from fewer bytes. A one-row
+step's ``K`` rows split over an LNC2 pair only at an even count of 128-row chunks, and
+the served ``K`` holds an odd count. The kernels of both forms live in this file, beside
+:mod:`mla_decode` and not in it, and reuse its helpers by import.
 
 **The selection as a pool mask.** The DSA selection picks whole pools of ``pool`` tokens:
 the ``k`` best of each row's bounded candidate pool scores (``[B * T, C]`` fp32, ``C *
@@ -46,6 +48,15 @@ runs under its own max and the merge rescales each once, so the result differs f
 selected kernel by fp32 summation order (``test_mla_decode_masked.py`` holds it to the
 oracle at relative L2 ``2e-5``).
 
+**The one-row key-split form at an odd chunk count**
+(:func:`mla_decode_padded_split_attention`). A selecting step of one row per request
+takes ``K`` token indices, ``K / 128`` chunks; the served ``K`` (``k`` pools and one tail
+chunk) is an odd count, which :mod:`mla_decode`'s key-split kernel does not split over
+the pair, so it would run the general kernel on one program. This kernel copies the
+indices into a private scratch of whole chunks per program, ``-1`` (no token) past
+them, and runs :mod:`mla_decode`'s key-split body on it: the same token set, one more
+chunk of masked keys.
+
 The file is kept out of every other graph's compile cache key
 (:mod:`vllm_neuron.compile_cache_key` folds into a graph's key the kernel files the
 graph's kernels reach), and three rules keep it so
@@ -83,11 +94,14 @@ from vllm_neuron.functional.attention.mla_decode import (
     LATENT_TILE,
     MASKED_SCORE,
     MOVING_MAX,
+    SENTINEL_INDEX,
     MlaDecodeAttentionError,
     _col,
     _log2,
     _require,
     _sb,
+    _split_body,
+    _split_serves,
 )
 from vllm_neuron.functional.dsa import decode_select
 from vllm_neuron.functional.dsa.causal_bound import BOUND_FILL
@@ -112,6 +126,7 @@ SOURCE_DIGEST = source_digest(__file__, mla_decode.__file__, decode_select.__fil
 class _MaskedDispatchCounters:
     nki_dispatch: int = 0
     two_program_dispatch: int = 0
+    padded_split_dispatch: int = 0
 
 
 _COUNTERS = _MaskedDispatchCounters()
@@ -121,6 +136,7 @@ def reset_mla_decode_masked_dispatch_counters() -> None:
     """Zero every count this module keeps."""
     _COUNTERS.nki_dispatch = 0
     _COUNTERS.two_program_dispatch = 0
+    _COUNTERS.padded_split_dispatch = 0
 
 
 def mla_decode_masked_dispatch_counters() -> tuple[int, int]:
@@ -134,11 +150,22 @@ def mla_decode_masked_two_program_count() -> int:
     return _COUNTERS.two_program_dispatch
 
 
+def mla_decode_padded_split_count() -> int:
+    """:func:`mla_decode_padded_split_attention` calls since the last reset (each runs on
+    both programs of an LNC2 pair)."""
+    return _COUNTERS.padded_split_dispatch
+
+
 @torch._dynamo.assume_constant_result
 def _count_dispatch(programs: int) -> None:
     _COUNTERS.nki_dispatch += 1
     if programs == 2:
         _COUNTERS.two_program_dispatch += 1
+
+
+@torch._dynamo.assume_constant_result
+def _count_padded_split() -> None:
+    _COUNTERS.padded_split_dispatch += 1
 
 
 def _iota_f(shape, pattern, offset, channel_multiplier):
@@ -644,3 +671,99 @@ def mla_decode_masked_attention(q_lift: Tensor, bank: Tensor, block_table: Tenso
                 position.contiguous().to(torch.int32), written.contiguous(),
                 pool_scores.contiguous(), float(softmax_scale), int(page_size), pool,
                 int(select_k), int(select_fold_cap(cands)), SOURCE_DIGEST)
+
+
+@nki.jit
+def mla_decode_padded_split_kernel(q_hbm, bank_hbm, table_hbm, pos_hbm, written_hbm, topk_hbm,
+                                   softmax_scale, page_size, padded, source_digest):
+    """Selected decode attention, one query row per request, keys split over the programs,
+    at a selected width whose 128-row chunks do not split evenly over them.
+
+    The token indices go into a private scratch ``padded`` columns wide, ``-1`` (no token)
+    past them, and :mod:`mla_decode`'s key-split body attends the scratch.
+    ``source_digest`` is :data:`SOURCE_DIGEST`; it only keys the kernel cache.
+    """
+    batch, heads, latent = q_hbm.shape
+    width = topk_hbm.shape[1]
+    ids = _sb((batch, padded), nl.int32)
+    nisa.memset(dst=ids, value=SENTINEL_INDEX)
+    nisa.dma_copy(dst=ids[:, 0:width], src=topk_hbm)
+    ids_hbm = nl.ndarray((batch, padded), dtype=nl.int32, buffer=nl.private_hbm)
+    nisa.dma_copy(dst=ids_hbm, src=ids)
+    out = nl.ndarray((batch, heads, latent), dtype=nl.float32, buffer=nl.shared_hbm)
+    _split_body(q_hbm, bank_hbm, table_hbm, pos_hbm, written_hbm, ids_hbm, softmax_scale,
+                page_size, False, out)
+    return out
+
+
+def _padded_width(width: int, programs: int) -> int:
+    """``width`` rounded up to a whole number of 128-row chunks per program."""
+    step = KEY_CHUNK * programs
+    return -(-int(width) // step) * step
+
+
+def mla_decode_padded_split_serves(*, heads: int, latent: int, page: int,
+                                   width: int) -> bool:
+    """True when :func:`mla_decode_padded_split_attention` serves the geometry.
+
+    An LNC2 pair; a selected width of whole 128-row chunks that do not split evenly over
+    it (an even count is :mod:`mla_decode`'s key-split kernel's, and one program splits
+    nothing); and a padded width the key-split body serves
+    (:func:`mla_decode._split_serves`).
+    """
+    programs = _programs()
+    padded = _padded_width(width, programs)
+    return (programs == 2 and width % KEY_CHUNK == 0 and padded != width
+            and _split_serves(heads, latent, page, padded, programs))
+
+
+def mla_decode_padded_split_attention(q_lift: Tensor, bank: Tensor, block_table: Tensor,
+                                      position: Tensor, written: Tensor,
+                                      softmax_scale: float, page_size: int,
+                                      topk_indices: Tensor) -> Tensor:
+    """Selected decode attention for ``B`` requests, one query row each, keys split over an
+    LNC2 pair at a width of an odd count of 128-row chunks. ``[B, H, L]`` fp32.
+
+    The operands and the result are :func:`mla_decode.mla_decode_attention`'s; at such a
+    width that function runs the general kernel on one program, and this one the
+    key-split body on both, at the width padded with ``-1`` to whole chunks per program.
+
+    Args:
+        q_lift: ``[B, H, L]`` bf16/fp16, the absorbed queries.
+        bank: ``[slots, L]`` the whole latent bank, same dtype.
+        block_table: ``[B, pages]`` int, each request's pages (``-1`` pads).
+        position: ``[B]`` int, each request's window row this step.
+        written: ``[B, L]`` this step's own latent rows.
+        softmax_scale: positive.
+        page_size: rows per page, a trace-time int.
+        topk_indices: ``[B, K]`` int window rows per request, ``-1`` for "no token".
+
+    Raises:
+        MlaDecodeAttentionError: naming the first operand or geometry outside that
+            contract.
+    """
+    _require(q_lift, bank, block_table, position, written, page_size, topk_indices,
+             float(softmax_scale))
+    total, heads, latent = (int(d) for d in q_lift.shape)
+    batch = int(block_table.shape[0])
+    if total != batch:
+        raise MlaDecodeAttentionError(
+            f"the padded key-split form attends one query row per request; got {total} "
+            f"rows over {batch} request(s)"
+        )
+    width = int(topk_indices.shape[1])
+    if not mla_decode_padded_split_serves(heads=heads, latent=latent, page=int(page_size),
+                                          width=width):
+        raise MlaDecodeAttentionError(
+            f"the padded key-split form serves one head on an LNC2 pair at a selected "
+            f"width of an odd count of {KEY_CHUNK}-row chunks; got heads={heads}, "
+            f"latent={latent}, page_size={page_size}, width={width}, "
+            f"programs={_programs()}"
+        )
+    _count_padded_split()
+    call = wrap_nki(mla_decode_padded_split_kernel)[2]
+    return call(q_lift.contiguous(), bank.contiguous(),
+                block_table.contiguous().to(torch.int32),
+                position.contiguous().to(torch.int32), written.contiguous(),
+                topk_indices.contiguous().to(torch.int32), float(softmax_scale),
+                int(page_size), _padded_width(width, 2), SOURCE_DIGEST)
