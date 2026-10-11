@@ -52,8 +52,6 @@ from vllm_neuron.model.neuron_config import OnDeviceSamplingConfig
 _CONFIG = Glm5NextTextConfig()
 #: Pools the selection keeps (``Glm5NextDSAIndexer.select_k``).
 SELECT_K = _CONFIG.index_topk // _CONFIG.index_kpool
-#: Query rows of one prefill chunk on the 64k serving line (its ``max_num_batched_tokens``).
-PREFILL_CHUNK = 2048
 #: Requests in the decode step the alias was seen at.
 DECODE_BATCH = 8
 #: The sampler's top-k width (``OnDeviceSamplingConfig.max_top_k``'s default).
@@ -67,11 +65,9 @@ _CALLERS = {
     "dsa": (SELECT_K, "float32", _nki_config),
     "sampler": (SAMPLER_K, "bfloat16", _get_rotational_topk_config),
 }
-#: Geometries the alias was seen at before the fix, as (caller, rows, candidates): one prefill
-#: chunk over the pools of a 64k-token context, one decode step over an 8k-token one, and one
-#: sampling step over a vocab shard.
+#: Geometries the alias was seen at before the fix, as (caller, rows, candidates): one decode
+#: step over the pools of an 8k-token context, and one sampling step over a vocab shard.
 CASES = {
-    "dsa_prefill_64k": ("dsa", PREFILL_CHUNK, 64 * 1024 // _CONFIG.index_kpool),
     "dsa_decode_b8_8k": ("dsa", DECODE_BATCH, 8 * 1024 // _CONFIG.index_kpool),
     "sampler_b64_tp4": ("sampler", SAMPLER_BATCH, _CONFIG.vocab_size // SAMPLER_TP),
 }

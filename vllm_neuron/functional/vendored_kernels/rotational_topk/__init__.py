@@ -29,7 +29,10 @@ carries a local patch (its gathers write columns their sources do not occupy:
 per-tile ``indices`` columns in the rotational core, ``index_buf`` halves in
 ``sort``; see ``test_rotational_topk_gather_alias.py``), so dropping this
 subpackage requires nkilib's kernel to give the same guarantee, or that test to
-be pointed at nkilib's kernel.
+be pointed at nkilib's kernel. It also sorts consecutive row tiles in one
+``sort`` (a row on every partition), which upstream does per row tile: the
+output is the same, in fewer vector-engine passes (``rotational_topk``'s module
+docstring).
 """
 
 from .rotational_topk import rotational_topk

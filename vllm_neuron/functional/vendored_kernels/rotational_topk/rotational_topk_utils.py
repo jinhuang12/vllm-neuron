@@ -20,6 +20,9 @@ Vendored from nkilib ``core/topk`` (KaenaNeuronKernelLibrary 88ffd98c, see this 
 in the two halves of one tile, so its gather never writes SBUF its sources occupy (a gather
 dst/src alias, which the device's pieced gather turns into wrong indices). Carry the patch
 upstream, or apply it again, before nkilib's copy replaces this one.
+
+``reshape_with_dma`` takes the destination rather than its dtype, so that several row tiles'
+results reach one ``sort`` tile, each on its own partitions (see ``rotational_topk``).
 """
 
 import math
@@ -1140,27 +1143,27 @@ def sort(data_sbuf, indices, true_k):
     return topk_val_buf[:, :true_k], global_topk_idx_buf[:, :true_k]
 
 
-def reshape_with_dma(src, fold_factor, dtype):
+def reshape_with_dma(src, fold_factor, dst):
     """
     Reshape tensor using DMA operations.
 
     Reshapes from stages layout [s*b, n/s] to original layout [b, n] using HBM as intermediate.
 
     Args:
-        src (nl.NkiTensor): Source tensor in SBUF
-        fold_factor (int): Folding factor
-        dtype: Target data type
+        src (nl.NkiTensor): [s*b, n/s], Source tensor in SBUF
+        fold_factor (int): Folding factor s
+        dst (nl.NkiTensor): [b, n], Destination in SBUF, of the target data type: a tile or
+            partitions of one
 
     Returns:
-        nl.NkiTensor: Reshaped tensor in SBUF
+        nl.NkiTensor: dst
     """
     m, n = src.shape
     data_hbm = nl.ndarray(src.shape, dtype=src.dtype, buffer=nl.private_hbm)
     nisa.dma_copy(src=src, dst=data_hbm)
     data_hbm = data_hbm.reshape((m // fold_factor, n * fold_factor))
-    out_sbuf = nl.ndarray(data_hbm.shape, dtype=dtype, buffer=nl.sbuf)
-    nisa.dma_copy(src=data_hbm, dst=out_sbuf)
-    return out_sbuf
+    nisa.dma_copy(src=data_hbm, dst=dst)
+    return dst
 
 
 def get_ceil_aligned_size(size: int, alignment: int) -> int:
