@@ -193,6 +193,7 @@ For conceptual overview, see [Compilation](features-guide.md#compilation).
 | `VLLM_NEURON_CPU_COMPILE` | bool | 0 | Enable CPU-only compilation mode (compile NEFFs without Neuron hardware). |
 | `NEURON_PLATFORM_TARGET_OVERRIDE` | str | -- | Target platform for CPU compile mode (e.g., `trn2`). Required when `VLLM_NEURON_CPU_COMPILE=1`. |
 | `NEURON_LIBTORCH_PARALLEL_COMPILE_WORKERS` | int | -- | Number of parallel compilation workers. |
+| `VLLM_NEURON_DISABLE_PARALLEL_TRACE` | bool | 0 | Run graph extraction in the worker process, not in the parallel trace pool. Graph extraction and the warm-up then share one Dynamo trace per graph, except with tensor replacement or the native backend. |
 | `NEURON_LIBTORCH_REMOTE_CACHE` | str | -- | Path to NFS/FSx mount for shared persistent cache across nodes. |
 | `NEURON_LIBTORCH_DISABLE_COMPILE_CACHE` | bool | 0 | Disable compilation cache entirely. Forces recompilation on every startup. |
 | `NEURON_LIBTORCH_COMPILATION_TIMEOUT` | int | -- | Timeout in seconds for individual NEFF compilation. |
