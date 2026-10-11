@@ -47,9 +47,6 @@ contract. Change them only together with those callers.
 
 from __future__ import annotations
 
-import hashlib
-from pathlib import Path
-
 import torch
 from torch import Tensor
 
@@ -60,6 +57,7 @@ import nki.language as nl
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
 from vllm_neuron.functional.dsa.launch_grid import lnc_pair
+from vllm_neuron.source_digest import source_digest
 
 #: The lse of an empty partial: no column of the row is this rank's. The magnitude of the
 #: masked score elsewhere in this tree (``mla_decode.MASKED_SCORE``), and finite so that a
@@ -83,7 +81,7 @@ PARTIAL_DTYPES = (torch.float32, torch.bfloat16)
 
 #: This file's content digest, handed to the entry point as a trace-time int: the compiled
 #: kernel cache keys on the entry's own source, and the arithmetic lives in a helper.
-SOURCE_DIGEST = int(hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:7], 16)
+SOURCE_DIGEST = source_digest(__file__)
 
 
 class DcpMergeError(ValueError):

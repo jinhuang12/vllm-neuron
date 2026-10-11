@@ -45,9 +45,11 @@ PACKAGE_ROOT = Path(vllm_neuron.__file__).resolve().parent
 #: Every kernel file that hands its kernels a digest of its own source, and the names
 #: it binds. A new one joins this table and so every test below.
 SOURCE_DIGEST_FILES = {
+    "functional/attention/dcp_merge.py": ("SOURCE_DIGEST",),
     "functional/attention/mla_decode.py": ("SOURCE_DIGEST",),
     "functional/attention/mla_dense_window.py": ("SOURCE_DIGEST",),
     "functional/attention/mla_sparse.py": ("SOURCE_DIGEST",),
+    "functional/dsa/dcp_candidate_merge.py": ("SOURCE_DIGEST",),
     "functional/dsa/decode_batch.py": ("SOURCE_DIGEST",),
     "functional/dsa/decode_select.py": ("SOURCE_DIGEST",),
     "functional/dsa/decode_tail_update.py": ("ROWS_SOURCE_DIGEST",),
