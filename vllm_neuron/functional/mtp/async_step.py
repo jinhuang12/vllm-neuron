@@ -323,8 +323,10 @@ def _correct_launch(
     to the int64 the layers consume (the kernel writes int32 pairs with a zero high word;
     NKI has no int64), laid out with unit stride: the layers' graphs were compiled from
     the synchronous translator's fresh contiguous tensors and guard each operand's strides,
-    and a one-element row would otherwise keep the pair's stride of 2. Returns the fields in
-    order, ``latent_slots`` None without a table.
+    and on the eager routes (the CPU simulator, a launch outside a graph) a one-element row
+    would otherwise keep the pair's stride of 2; a compiled launch's outputs are allocated
+    contiguous by the backend. Returns the fields in order, ``latent_slots`` None without a
+    table.
     """
     batch = starts.shape[0]
     rows = batch + PADDING

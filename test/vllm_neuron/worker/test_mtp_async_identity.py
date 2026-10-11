@@ -308,9 +308,10 @@ def _graph_signature(kwargs: dict) -> tuple:
     object (the guards keep inputs compiled as distinct tensors distinct objects, and one tensor
     compiled under two paths one object). The carriers are the translator's operands, the ones a
     drafter form changes; the generic kwargs are the generic runner's, read by the root under
-    their own names (``spec_decode_metadata`` by three fields the rejection sampler names), so
-    they are compared by shape, dtype and value. Hashable, so a served step's signature can be
-    looked up among the warmup's."""
+    their own names (of ``spec_decode_metadata``'s seven fields, all walked here, the root reads
+    three: ``max_spec_len``, ``draft_token_ids``, ``cu_num_draft_tokens``), so they are
+    compared by shape, dtype and value. Hashable, so a served step's signature can be looked
+    up among the warmup's."""
     leaves: list[tuple[str, object]] = []
 
     def walk(value, path: str) -> None:
