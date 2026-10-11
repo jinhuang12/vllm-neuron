@@ -31,6 +31,13 @@ if TYPE_CHECKING:
     VLLM_NEURON_DEBUG_MODE: bool = False
     VLLM_NEURON_BARRIER_TIMEOUT: int = 3600
     VLLM_NEURON_DISABLE_PARALLEL_TRACE: bool = False
+    #: Skip the compile-target extraction pass, its barriers and the parallel compile
+    #: at start-up on a warm root: a manifest under ``<cache root>/neuron/warm_start/``
+    #: matches the start's identity, and every entry it names is complete on every TP
+    #: rank. The cost removed is the extraction pass itself; the warm-ups run as
+    #: before. A full start writes the manifest. Otherwise, and on starts the check
+    #: does not cover (logged by name), the full pass runs. ``0`` forces the full pass.
+    VLLM_NEURON_SKIP_EXTRACTION_WHEN_CACHED: bool = True
     # Renderer thread-pool size for the EPD Router's HF preprocessing offload.
     # vLLM defaults this to 1; >1 parallelizes the GIL-releasing native image
     # decode/transform. Only safe because the Router disables the mm processor
@@ -312,6 +319,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # graph extraction sequentially in the parent process.
     "VLLM_NEURON_DISABLE_PARALLEL_TRACE": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_DISABLE_PARALLEL_TRACE")) or False
+    ),
+    # Skip graph extraction when the compile cache holds every graph the start
+    # loads (the doc block at the variable's annotation above). On by default.
+    "VLLM_NEURON_SKIP_EXTRACTION_WHEN_CACHED": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_SKIP_EXTRACTION_WHEN_CACHED"))
+        is not False
     ),
     # Minimum KV budget (GiB) guardrail
     "VLLM_NEURON_MIN_KV_BUDGET_GIB": lambda: (
