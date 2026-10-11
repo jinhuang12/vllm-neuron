@@ -217,6 +217,55 @@ def test_refusals():
 
 
 # ---------------------------------------------------------------------------------------
+# The mask entry: the same pools, before the compaction and the expansion
+# ---------------------------------------------------------------------------------------
+
+
+def _listed_pools(indices):
+    """Each row's selected pools, read off the index entry's pool columns."""
+    return [set(int(v) // POOL for v in row[:K * POOL].tolist() if v >= 0)
+            for row in indices]
+
+
+@pytest.mark.parametrize("lengths, candidates, levels", [
+    ([4093, 4094, 4095, 4096], 1024, None),  # a verify step's rows at the window's end
+    ([2052, 2053, 2054, 2055], 1024, 3),     # just past the bypass bound, tied scores
+    ([3001], 1024, None),
+    ([300, 2047, 2049], 1024, None),         # fewer complete pools than k
+    ([8191 - b % 4 for b in range(64)], 2048, 7),
+])
+def test_the_mask_entry_selects_the_pools_the_index_entry_lists(lengths, candidates,
+                                                                 levels):
+    bounded = _bounded(lengths, candidates, seed=len(lengths) + candidates, levels=levels)
+    mask = DS.dsa_decode_select_mask(bounded, select_k=K)
+    assert _select_counts() == (1, 0)
+    assert mask.dtype == torch.float32 and tuple(mask.shape) == (len(lengths), candidates)
+    assert torch.equal(mask, DS.dsa_decode_select_mask_torch_oracle(bounded, select_k=K))
+    assert set(torch.unique(mask).tolist()) <= {0.0, 1.0}
+    DB.reset_decode_batch_dispatch_counters()
+    listed = _listed_pools(_kernel(bounded, lengths))
+    assert [set(torch.nonzero(row).flatten().tolist()) for row in mask] == listed
+
+
+def test_the_mask_entry_on_two_programs_equals_one(monkeypatch):
+    lengths = [4096 - 3 * b for b in range(8)]
+    bounded = _bounded(lengths, 1024, seed=8)
+    one = DS.dsa_decode_select_mask(bounded, select_k=K)
+    monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", "2")
+    assert DS.decode_select_programs(len(lengths)) == 2
+    assert torch.equal(DS.dsa_decode_select_mask(bounded, select_k=K), one)
+
+
+def test_the_mask_entry_refuses_what_the_index_entry_refuses():
+    bounded = _bounded([4000], 1024, seed=2)
+    for select_k in (1024, 0):
+        with pytest.raises(DS.DecodeSelectError, match="select_k"):
+            DS.dsa_decode_select_mask(bounded, select_k=select_k)
+    with pytest.raises(DS.DecodeSelectError, match="bounded"):
+        DS.dsa_decode_select_mask(bounded[0], select_k=K)
+
+
+# ---------------------------------------------------------------------------------------
 # The kernel against 0a08ff4's four selection kernels, on the same bounded scores
 # ---------------------------------------------------------------------------------------
 

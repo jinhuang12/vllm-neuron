@@ -500,9 +500,9 @@ def _compact_segments(mask_hbm, ids_hbm, zeros_hbm, r0, n, width, select_k):
                      0, False)
 
 
-def _select_tile(bounded_hbm, lens_hbm, out_hbm, mask_hbm, ids_hbm, zeros_hbm, tok_hbm,
-                 r0, n, select_k, pool_size, out_cols, fold_cap):
-    """Requests ``r0 .. r0 + n - 1``: select, compact, expand."""
+def _select_rows(bounded_hbm, mask_hbm, r0, n, select_k, fold_cap):
+    """Requests ``r0 .. r0 + n - 1``: their selection, 1.0 or 0.0 per candidate, into
+    their rows of ``mask_hbm`` (``[B, C]`` fp32)."""
     width = bounded_hbm.shape[1]
     fold, chunk, request_major = fold_layout(n, width, fold_cap)
     parts = fold * n
@@ -514,9 +514,16 @@ def _select_tile(bounded_hbm, lens_hbm, out_hbm, mask_hbm, ids_hbm, zeros_hbm, t
     _fold_copy(bounded_hbm, scores, r0, n, width, chunk, fold, request_major, True)
     same, below = _request_matrices(n, fold, request_major)
 
-    # ---- the selection, out to the scratch row by row -----------------------------------
+    # ---- the selection, out row by row --------------------------------------------------
     mask = _select_mask(scores, same, below, parts, chunk, select_k)
     _fold_copy(mask_hbm, mask, r0, n, width, chunk, fold, request_major, False)
+
+
+def _select_tile(bounded_hbm, lens_hbm, out_hbm, mask_hbm, ids_hbm, zeros_hbm, tok_hbm,
+                 r0, n, select_k, pool_size, out_cols, fold_cap):
+    """Requests ``r0 .. r0 + n - 1``: select (into the scratch), compact, expand."""
+    width = bounded_hbm.shape[1]
+    _select_rows(bounded_hbm, mask_hbm, r0, n, select_k, fold_cap)
 
     # ---- compaction: rows on the GpSimd cores' first partitions -------------------------
     count, _seg = segments(width)
@@ -624,19 +631,52 @@ def dsa_decode_select_kernel(bounded_hbm, lens_hbm, select_k, pool_size, out_col
         nisa.memset(dst=zero_sb, value=0.0)
         nisa.dma_copy(dst=zeros_hbm.ap(pattern=[[zero_cols, PARTITIONS], [1, zero_cols]],
                                        offset=0), src=zero_sb)
-    n_prgs = nl.num_programs(axes=0)
-    prg = nl.program_id(0)
-    share = (batch + n_prgs - 1) // n_prgs
-    lo = prg * share
-    hi = min(batch, lo + share)
-    per_tile = tile_requests(width)
-    n_tiles = (hi - lo + per_tile - 1) // per_tile
+    lo, hi, per_tile, n_tiles = _program_share(batch, width)
     for t in range(n_tiles):
         r0 = lo + t * per_tile
         n = min(per_tile, hi - r0)
         _select_tile(bounded_hbm, lens_hbm, out_hbm, mask_hbm, ids_hbm, zeros_hbm, tok_hbm,
                      r0, n, select_k, pool_size, out_cols, fold_cap)
     return out_hbm
+
+
+@nki.jit
+def dsa_decode_select_mask_kernel(bounded_hbm, select_k, fold_cap, source_digest):
+    """Selected candidates for ``B`` decode requests, as a mask.
+
+    Args:
+        bounded_hbm: ``[B, C]`` fp32, each request's bounded candidate scores.
+        select_k: python int, pools selected per request, ``< C``.
+        fold_cap: python int, the most partitions a request folds over
+            (:func:`select_fold_cap`).
+        source_digest: :data:`SOURCE_DIGEST`; it only keys the kernel cache.
+
+    Returns:
+        ``[B, C]`` fp32, 1.0 where the request selects the candidate and 0.0 elsewhere:
+        the candidates :func:`dsa_decode_select_kernel` lists, before its compaction
+        and expansion.
+    """
+    batch = bounded_hbm.shape[0]
+    width = bounded_hbm.shape[1]
+    mask_hbm = nl.ndarray((batch, width), dtype=nl.float32, buffer=nl.shared_hbm)
+    lo, hi, per_tile, n_tiles = _program_share(batch, width)
+    for t in range(n_tiles):
+        r0 = lo + t * per_tile
+        _select_rows(bounded_hbm, mask_hbm, r0, min(per_tile, hi - r0), select_k, fold_cap)
+    return mask_hbm
+
+
+def _program_share(batch, width):
+    """This program's requests ``lo .. hi - 1`` and their tiles, ``(lo, hi, per_tile,
+    n_tiles)``: the requests split evenly over the programs of the launch grid, each
+    share in tiles of up to :func:`tile_requests` requests."""
+    n_prgs = nl.num_programs(axes=0)
+    prg = nl.program_id(0)
+    share = (batch + n_prgs - 1) // n_prgs
+    lo = prg * share
+    hi = min(batch, lo + share)
+    per_tile = tile_requests(width)
+    return lo, hi, per_tile, (hi - lo + per_tile - 1) // per_tile
 
 
 # ---------------------------------------------------------------------------------------
@@ -677,14 +717,12 @@ def check_decode_index_context(max_model_len: int, pool_size: int | None) -> Non
             f"defect, indexer report section 4.3). Lower max_model_len.")
 
 
-def _validate(bounded: Tensor, seq_lens: Tensor, select_k, pool_size) -> tuple[int, int]:
-    """Check the operands of :func:`dsa_decode_select`; ``(B, C)`` of ``bounded``.
+def _validate_scores(bounded: Tensor, select_k) -> tuple[int, int]:
+    """Check the scores and ``select_k`` of a selection; ``(B, C)`` of ``bounded``.
 
     Args:
         bounded: ``[B, C]`` candidate scores, ``B >= 1``, ``C <= MAX_SELECT_CANDIDATES``.
-        seq_lens: ``[B]`` request lengths.
         select_k: a Python int, ``0 < select_k < C``.
-        pool_size: a Python int, a power of two.
 
     Raises:
         DecodeSelectError: naming the first operand outside that contract.
@@ -698,14 +736,30 @@ def _validate(bounded: Tensor, seq_lens: Tensor, select_k, pool_size) -> tuple[i
         raise DecodeSelectError(
             f"select_k must be a python int in (0, C) = (0, {width}); at C <= k there is "
             f"nothing to select and the caller bypasses; got {select_k!r}")
-    if not isinstance(pool_size, int) or not is_power_of_two(pool_size):
-        raise DecodeSelectError(f"pool_size must be a power-of-two python int; got "
-                                f"{pool_size!r}")
     if width > MAX_SELECT_CANDIDATES:
         raise DecodeSelectError(
             f"a {width}-wide candidate axis folds into more than {FOLD_COLUMNS_LIMIT} "
             f"columns per partition, past what one partition's SBUF holds; the widest "
             f"served is {MAX_SELECT_CANDIDATES} pools")
+    return batch, width
+
+
+def _validate(bounded: Tensor, seq_lens: Tensor, select_k, pool_size) -> tuple[int, int]:
+    """Check the operands of :func:`dsa_decode_select`; ``(B, C)`` of ``bounded``.
+
+    Args:
+        bounded: ``[B, C]`` candidate scores, ``B >= 1``, ``C <= MAX_SELECT_CANDIDATES``.
+        seq_lens: ``[B]`` request lengths.
+        select_k: a Python int, ``0 < select_k < C``.
+        pool_size: a Python int, a power of two.
+
+    Raises:
+        DecodeSelectError: naming the first operand outside that contract.
+    """
+    if not isinstance(pool_size, int) or not is_power_of_two(pool_size):
+        raise DecodeSelectError(f"pool_size must be a power-of-two python int; got "
+                                f"{pool_size!r}")
+    batch, width = _validate_scores(bounded, select_k)
     if seq_lens.ndim != 1 or int(seq_lens.shape[0]) != batch:
         raise DecodeSelectError(f"seq_lens must be [B] = [{batch}]; got "
                                 f"{tuple(seq_lens.shape)}")
@@ -714,6 +768,11 @@ def _validate(bounded: Tensor, seq_lens: Tensor, select_k, pool_size) -> tuple[i
 
 def can_run_dsa_decode_select(bounded: Tensor, select_k: int, pool_size: int) -> bool:
     """Whether the kernel serves this call; ``False`` sends it to the torch oracle."""
+    return _kernel_serves(bounded, select_k)
+
+
+def _kernel_serves(bounded: Tensor, select_k: int) -> bool:
+    """Whether a selection kernel serves these scores (either entry)."""
     if not can_run_kernel(bounded):
         return False
     if bounded.dtype not in _SUPPORTED_DTYPES:
@@ -754,24 +813,66 @@ def dsa_decode_select(bounded: Tensor, seq_lens: Tensor, *, select_k: int,
                 SOURCE_DIGEST)
 
 
+def dsa_decode_select_mask(bounded: Tensor, *, select_k: int) -> Tensor:
+    """Each request's selected candidate pools as a mask. ``[B, C]`` fp32.
+
+    Args:
+        bounded: ``[B, C]`` fp32, the bounded candidate scores (``dsa_decode_scores``).
+        select_k: pools selected per request, ``0 < select_k < C``.
+
+    Returns:
+        1.0 where the request selects candidate ``c`` and 0.0 elsewhere: the pools
+        :func:`dsa_decode_select` expands to tokens (the ``select_k`` largest scores,
+        ties to the lowest index, never a pool at ``BOUND_FILL``). The tail tokens of
+        the incomplete final pool are not in it; the reader adds them from the row's
+        length (``mla_decode_masked``).
+    """
+    batch, width = _validate_scores(bounded, select_k)
+    if not _kernel_serves(bounded, select_k):
+        _count_torch_fallback()
+        return dsa_decode_select_mask_torch_oracle(bounded, select_k=select_k)
+    programs = decode_select_programs(batch)
+    _count_dispatch("select", programs, batch)
+    call = wrap_nki(dsa_decode_select_mask_kernel)
+    if programs == 2:
+        call = call[2]
+    return call(bounded.contiguous(), int(select_k), int(select_fold_cap(width)),
+                SOURCE_DIGEST)
+
+
 # ---------------------------------------------------------------------------------------
 # Torch oracle
 # ---------------------------------------------------------------------------------------
 
 
-def dsa_decode_select_torch_oracle(bounded: Tensor, seq_lens: Tensor, *, select_k: int,
-                                   pool_size: int) -> Tensor:
-    """CPU reference and fallback: a stable descending sort spells the tie rule.
-
-    A stable sort keeps equal values in index order, so the first ``select_k`` of it are
-    the ``select_k`` largest with ties to the lowest index. The masked pools among them
-    become ``-1`` (the ``dsa_causal_sentinel`` rule), the real ones go to ascending
-    order, and ``dsa_index_expand``'s torch reference lays out the tokens.
-    """
+def _selected_pools_torch(bounded: Tensor, select_k: int) -> Tensor:
+    """``[B, select_k]`` int64: each request's selected candidates in ascending order,
+    ``C`` after them. A stable descending sort spells the tie rule: it keeps equal values
+    in index order, so its first ``select_k`` are the ``select_k`` largest with ties to the
+    lowest index; the masked pools among them are dropped (the ``dsa_causal_sentinel``
+    rule)."""
     width = int(bounded.shape[1])
     top = torch.sort(bounded.to(torch.float32), dim=1, descending=True, stable=True)
     values, ids = top.values[:, :select_k], top.indices[:, :select_k]
     keep = values > BOUND_FILL_MARK
-    ids = torch.where(keep, ids, torch.full_like(ids, width)).sort(dim=1).values
+    return torch.where(keep, ids, torch.full_like(ids, width)).sort(dim=1).values
+
+
+def dsa_decode_select_torch_oracle(bounded: Tensor, seq_lens: Tensor, *, select_k: int,
+                                   pool_size: int) -> Tensor:
+    """CPU reference and fallback: :func:`_selected_pools_torch`'s pools, ``-1`` after
+    them, laid out as tokens by ``dsa_index_expand``'s torch reference."""
+    width = int(bounded.shape[1])
+    ids = _selected_pools_torch(bounded, select_k)
     pool_ids = torch.where(ids < width, ids, torch.full_like(ids, SENTINEL)).to(torch.int32)
     return _dsa_index_expand_torch(pool_ids, seq_lens.to(torch.int32), pool_size)
+
+
+def dsa_decode_select_mask_torch_oracle(bounded: Tensor, *, select_k: int) -> Tensor:
+    """CPU reference and fallback of :func:`dsa_decode_select_mask`: the same pools as a
+    ``[B, C]`` fp32 mask."""
+    batch, width = int(bounded.shape[0]), int(bounded.shape[1])
+    ids = _selected_pools_torch(bounded, select_k)
+    mask = torch.zeros(batch, width + 1, dtype=torch.float32)
+    mask.scatter_(1, ids, 1.0)
+    return mask[:, :width]
