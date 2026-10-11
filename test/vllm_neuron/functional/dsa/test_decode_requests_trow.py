@@ -260,14 +260,16 @@ def test_the_rows_step_equals_sequential_one_token_steps_bit_for_bit(rows, batch
     # only, the scores (decode_trow) and the selection; then the attention (mla_decode).
     # The selection is one kernel, decode_select.dsa_decode_select (top-k, causal
     # sentinel, order and expansion together), and it counts in decode_batch's family,
-    # so that family reads one launch here, its select entry, and no ring or scores.
+    # so that family reads one launch here, its select entry, and no ring or scores. The
+    # masked kernel (one request, T > 1) selects on chip, so there the family reads none.
     selecting = regime == "selecting"
+    masked = batch == 1 and rows > 1 and selecting
+    selects = int(selecting and not masked)
     assert TU.decode_tail_dispatch_counters() == (1, 0)
     assert TR.decode_trow_dispatch_counters() == ((1, 0) if selecting else (0, 0))
-    assert DB.decode_batch_dispatch_counters() == ((1, 0) if selecting else (0, 0))
+    assert DB.decode_batch_dispatch_counters() == (selects, 0)
     ring, scores, _, select = DB.decode_batch_route_counts()
-    assert (ring, scores, select) == (0, 0, int(selecting))
-    masked = batch == 1 and rows > 1 and selecting
+    assert (ring, scores, select) == (0, 0, selects)
     assert MM.mla_decode_masked_dispatch_counters() == ((1, 0) if masked else (0, 0))
     if batch == 1 and selecting:
         # The one-request one-token step keeps its one-request sparse attention; the

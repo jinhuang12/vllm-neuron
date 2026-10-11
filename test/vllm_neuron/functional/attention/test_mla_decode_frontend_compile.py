@@ -39,8 +39,8 @@ QUERY_ROWS = (1, 2, 4, 6)
 SPLIT_DENSE_PAGES, SPLIT_SELECTED_PAGES = 16, 64
 SPLIT_BATCHES = (1, 4, 64)
 #: The masked kernel's served steps: one request, the verify step's rows, a 4096-row window
-#: of 4-token pools.
-MASKED_PAGES, MASKED_ROWS, POOL = 32, QUERY_ROWS[1:], 4
+#: of 4-token pools, 512 of its 1024 pools selected on chip.
+MASKED_PAGES, MASKED_ROWS, POOL, SELECT_K = 32, QUERY_ROWS[1:], 4, 512
 SITES = ((4096, 1536, True), (1536, 256, True), (4096, 512, True), (256, 4096, True),
          (1536, 4096, False), (4096, 128, False), (4096, 32, False))
 
@@ -68,6 +68,7 @@ def _compile_each_entry() -> None:
     from vllm_neuron.functional.attention import mla_decode as MD
     from vllm_neuron.functional.attention import mla_decode_masked as MM
     from vllm_neuron.functional.attention import mla_projections as MP
+    from vllm_neuron.functional.dsa.decode_select import select_fold_cap
 
     bf, f32, i32 = torch.bfloat16, torch.float32, torch.int32
 
@@ -113,8 +114,8 @@ def _compile_each_entry() -> None:
                 MM.mla_decode_masked_kernel, g)(
                 fake((t, 1, LATENT), bf), fake((BANK_PAGES * PAGE, LATENT), bf),
                 fake((1, MASKED_PAGES), i32), fake((1,), i32), fake((t, LATENT), bf),
-                fake((t, MASKED_PAGES * PAGE // POOL), f32), 0.0625, PAGE, POOL,
-                MM.SOURCE_DIGEST)))
+                fake((t, MASKED_PAGES * PAGE // POOL), f32), 0.0625, PAGE, POOL, SELECT_K,
+                select_fold_cap(MASKED_PAGES * PAGE // POOL), MM.SOURCE_DIGEST)))
     for rows in (1, 4):
         for idim, odim, fp8 in SITES:
             for programs in (1, 2):

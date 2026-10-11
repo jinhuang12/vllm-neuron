@@ -153,9 +153,9 @@ def _step(ops: dict, *, index_share=None) -> torch.Tensor:
 def _two_projection_step(ops: dict) -> torch.Tensor:
     """The same chain with the attention projecting its own latent from the same rows.
 
-    The selection takes the step's own form: a pool mask where the step attends through
-    ``mla_decode_masked`` (one request of several rows that selects), token indices
-    elsewhere.
+    The selection takes the step's own form: the rows' pool scores where the step attends
+    through ``mla_decode_masked`` (one request of several rows that selects), token
+    indices elsewhere.
     """
     module = _module()
     indexer = module.indexer
@@ -170,7 +170,7 @@ def _two_projection_step(ops: dict) -> torch.Tensor:
     selection = indexer.forward_requests(
         hidden, q_latent, ops["pool_bank"], ops["tail_bank"], ops["state_slots"],
         ops["seq_lens"], ops["start"], max_seq_len=bound, indices_wanted=not dense,
-        projected=projected, pool_mask=masked)
+        projected=projected, pool_scores=masked)
     common = {
         "block_table_row": table_row,
         "latent_slots": ops["latent_slots"],
@@ -181,7 +181,7 @@ def _two_projection_step(ops: dict) -> torch.Tensor:
         return module._attend_requests(
             hidden, ops["latent_cache"], ops["start"], None if masked else selection,
             ops["softmax_scale"], ops["batch"], prefill_end_position=None, collector=None,
-            active_mla_query_rows=None, pool_mask=selection if masked else None, **common)
+            active_mla_query_rows=None, pool_scores=selection if masked else None, **common)
     return module.attend(hidden, ops["latent_cache"], ops["start"], selection,
                          ops["softmax_scale"], batch_size=ops["batch"], collector=None,
                          **common)

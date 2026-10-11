@@ -8,10 +8,13 @@ columns outside that row's selection attends the same rows from fewer bytes. The
 of that form live in this file, beside :mod:`mla_decode` and not in it, and reuse its
 helpers by import.
 
-**The selection as a pool mask.** The DSA selection picks whole pools of ``pool`` tokens
-(``dsa_decode_select_mask``: ``[B * T, C]`` fp32, 1.0 where row ``r``'s candidate pool is
-selected, ``C * pool`` the window). Row ``t`` of request ``b`` sits at position
-``p = position[b] + t`` and attends window column ``j`` when ``j <= p`` and either
+**The selection as a pool mask.** The DSA selection picks whole pools of ``pool`` tokens:
+the ``k`` best of each row's bounded candidate pool scores (``[B * T, C]`` fp32, ``C *
+pool`` the window), ties to the lowest candidates. The kernel selects them itself, with
+:mod:`decode_select`'s search on the request's rows (the pools
+``dsa_decode_select_mask_torch_oracle`` marks 1.0), while the window's pages are in
+flight. Row ``t`` of request ``b`` sits at position ``p = position[b] + t`` and attends
+window column ``j`` when ``j <= p`` and either
 
 * the pool ``j // pool`` is selected for the row, or
 * ``j`` is a token of the row's incomplete pool, ``j >= (p + 1) & -pool`` (the tail
@@ -86,13 +89,23 @@ from vllm_neuron.functional.attention.mla_decode import (
     _require,
     _sb,
 )
+from vllm_neuron.functional.dsa import decode_select
+from vllm_neuron.functional.dsa.causal_bound import BOUND_FILL
+from vllm_neuron.functional.dsa.decode_select import (
+    _fold_copy,
+    _request_matrices,
+    _select_mask,
+    fold_layout,
+    select_fold_cap,
+    tile_requests,
+)
 from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 from vllm_neuron.source_digest import source_digest
 
-#: This file's and :mod:`mla_decode`'s content, handed to the kernel as a trace-time int:
-#: the compiled-kernel cache keys on a kernel's own source and its arguments, and the
-#: kernel's body reuses :mod:`mla_decode`'s helpers.
-SOURCE_DIGEST = source_digest(__file__, mla_decode.__file__)
+#: This file's, :mod:`mla_decode`'s and :mod:`decode_select`'s content, handed to the
+#: kernel as a trace-time int: the compiled-kernel cache keys on a kernel's own source and
+#: its arguments, and the kernel's body reuses the two modules' helpers.
+SOURCE_DIGEST = source_digest(__file__, mla_decode.__file__, decode_select.__file__)
 
 
 @dataclass
@@ -159,12 +172,17 @@ def _latent_major(nat, rows, n_lat):
     return out
 
 
-def _masked_body(q_hbm, bank_hbm, table_hbm, pos_hbm, written_hbm, sel_hbm,
-                 softmax_scale, page_size, pool_size, out_hbm):
+def _masked_body(q_hbm, bank_hbm, table_hbm, pos_hbm, written_hbm, scores_hbm,
+                 softmax_scale, page_size, pool_size, select_k, fold_cap, out_hbm):
     total, heads, latent = q_hbm.shape
     batch, pages = table_hbm.shape
     rows = total // batch
-    cands = sel_hbm.shape[1]
+    cands = scores_hbm.shape[1]
+    # The rows' pool masks, selected below and read back as the window's and the own
+    # rows' masks; each program selects every row of the request on its own copy.
+    sel_hbm = nl.ndarray((total, cands), dtype=nl.float32, buffer=nl.private_hbm)
+    fold, chunk, request_major = fold_layout(rows, cands, fold_cap)
+    parts = fold * rows
     n_lat = latent // LATENT_TILE
     n_chunks = pages * page_size // KEY_CHUNK
     n_prgs = nl.num_programs(axes=0)
@@ -216,9 +234,16 @@ def _masked_body(q_hbm, bank_hbm, table_hbm, pos_hbm, written_hbm, sel_hbm,
     # [wide - ck, 2 * wide - ck) puts row t in score column t * nck + ck alone.
     hot = _sb((LATENT_TILE, n_lat, 2 * wide), q_hbm.dtype)
     nisa.memset(dst=hot, value=0.0)
+    same, below = _request_matrices(rows, fold, request_major)
 
     for b in range(batch):
         first = b * rows
+        # ---- the rows' pool scores, in the selection's fold layout ------------------
+        # First on their DMA queue, so the search below runs while the pages arrive.
+        scored = _sb((parts, chunk), nl.float32)
+        if cands < fold * chunk:
+            nisa.memset(dst=scored, value=BOUND_FILL)
+        _fold_copy(scores_hbm, scored, first, rows, cands, chunk, fold, request_major, True)
         # ---- the request's start, its rows' tail starts ----------------------------
         start_i = _col(KEY_CHUNK, nl.int32)
         nisa.dma_copy(dst=start_i, src=pos_hbm.ap(pattern=[[0, KEY_CHUNK], [1, 1]],
@@ -275,6 +300,10 @@ def _masked_body(q_hbm, bank_hbm, table_hbm, pos_hbm, written_hbm, sel_hbm,
             else:
                 nisa.dma_copy(dst=c_rows[:, ck, :], src=src, dge_mode=nisa.dge_mode.hwdge,
                               engine=nisa.engine.sync if ck % 3 == 0 else nisa.engine.scalar)
+
+        # ---- the rows' selections, onto the scratch ---------------------------------
+        picked = _select_mask(scored, same, below, parts, chunk, select_k)
+        _fold_copy(sel_hbm, picked, first, rows, cands, chunk, fold, request_major, False)
 
         # ---- MM1: every row against every key chunk, keys on the partitions ---------
         s_ps = nl.ndarray((KEY_CHUNK, wide), dtype=nl.float32, buffer=nl.psum)
@@ -502,16 +531,20 @@ def _masked_body(q_hbm, bank_hbm, table_hbm, pos_hbm, written_hbm, sel_hbm,
 
 
 @nki.jit
-def mla_decode_masked_kernel(q_hbm, bank_hbm, table_hbm, pos_hbm, written_hbm, sel_hbm,
-                             softmax_scale, page_size, pool_size, source_digest):
-    """Selecting decode attention by pool mask, keys split over the programs (one head).
+def mla_decode_masked_kernel(q_hbm, bank_hbm, table_hbm, pos_hbm, written_hbm, scores_hbm,
+                             softmax_scale, page_size, pool_size, select_k, fold_cap,
+                             source_digest):
+    """Selecting decode attention by pool mask, keys split over the programs (one head),
+    the mask selected on chip from ``scores_hbm``.
 
-    ``source_digest`` is :data:`SOURCE_DIGEST`; it only keys the kernel cache.
+    ``select_k`` pools per row; ``fold_cap`` is
+    :func:`decode_select.select_fold_cap` of the candidate axis; ``source_digest`` is
+    :data:`SOURCE_DIGEST`, which only keys the kernel cache.
     """
     total, heads, latent = q_hbm.shape
     out = nl.ndarray((total, heads, latent), dtype=nl.float32, buffer=nl.shared_hbm)
-    _masked_body(q_hbm, bank_hbm, table_hbm, pos_hbm, written_hbm, sel_hbm,
-                 softmax_scale, page_size, pool_size, out)
+    _masked_body(q_hbm, bank_hbm, table_hbm, pos_hbm, written_hbm, scores_hbm,
+                 softmax_scale, page_size, pool_size, select_k, fold_cap, out)
     return out
 
 
@@ -525,8 +558,9 @@ def mla_decode_masked_serves(*, heads: int, latent: int, page: int, window: int,
 
     One head, a latent of whole 128-column tiles per program, pages of whole 128-row
     chunks that split evenly over the programs, a power-of-two pool that divides a key
-    chunk, every row's scores within one moving operand, and a program's window rows
-    within :data:`mla_decode._ROW_BUDGET` bytes per partition (2-byte rows).
+    chunk, every row's scores within one moving operand, a request's rows within one
+    tile of the selection (:func:`decode_select.tile_requests`), and a program's window
+    rows within :data:`mla_decode._ROW_BUDGET` bytes per partition (2-byte rows).
     """
     programs = _programs()
     chunks = window // KEY_CHUNK
@@ -535,19 +569,20 @@ def mla_decode_masked_serves(*, heads: int, latent: int, page: int, window: int,
             and latent % (LATENT_TILE * programs) == 0 and chunks % programs == 0
             and nck % (page // KEY_CHUNK) == 0 and nck * latent * 2 <= _ROW_BUDGET
             and pool >= 1 and pool & (pool - 1) == 0 and KEY_CHUNK % pool == 0
-            and rows * nck <= MOVING_MAX)
+            and rows * nck <= MOVING_MAX and rows <= tile_requests(window // pool))
 
 
 def mla_decode_masked_attention(q_lift: Tensor, bank: Tensor, block_table: Tensor,
                                 position: Tensor, written: Tensor, softmax_scale: float,
-                                page_size: int, pool_mask: Tensor, pool_size: int) -> Tensor:
+                                page_size: int, pool_scores: Tensor, pool_size: int, *,
+                                select_k: int) -> Tensor:
     """Selecting decode attention for ``B`` requests, ``T`` query rows each, by pool mask.
     ``[B * T, H, L]`` fp32.
 
     The module docstring's rule: row ``t`` of request ``b`` (row ``b * T + t`` of every
     row-major operand) sits at window row ``position[b] + t`` and attends the tokens of
-    its selected pools and of its incomplete pool up to its own row, which is the token
-    set ``dsa_decode_select`` lists for it.
+    its ``select_k`` best candidate pools and of its incomplete pool up to its own row,
+    which is the token set ``dsa_decode_select`` lists for it from the same scores.
 
     Args:
         q_lift: ``[B * T, 1, L]`` bf16/fp16, the absorbed queries, request-major.
@@ -557,9 +592,11 @@ def mla_decode_masked_attention(q_lift: Tensor, bank: Tensor, block_table: Tenso
         written: ``[B * T, L]`` this step's own latent rows, request-major.
         softmax_scale: positive.
         page_size: rows per page, a trace-time int.
-        pool_mask: ``[B * T, C]`` fp32, 1.0 where the row selects candidate pool ``c``
-            (``dsa_decode_select_mask``); ``C * pool_size`` is the window.
+        pool_scores: ``[B * T, C]`` fp32, each row's bounded candidate pool scores (the
+            score kernel's output: ``BOUND_FILL`` on a pool not complete at the row);
+            ``C * pool_size`` is the window.
         pool_size: tokens per pool, a power of two that divides 128.
+        select_k: pools each row selects, ``1 <= select_k < C``.
 
     Raises:
         MlaDecodeAttentionError: naming the first operand or geometry outside that
@@ -577,12 +614,18 @@ def mla_decode_masked_attention(q_lift: Tensor, bank: Tensor, block_table: Tenso
             f"pool_size must be a power of two that divides the {window}-row window; "
             f"got {pool_size}"
         )
-    if (pool_mask.ndim != 2 or tuple(pool_mask.shape) != (total, window // pool)
-            or pool_mask.dtype != torch.float32):
+    cands = window // pool
+    if (pool_scores.ndim != 2 or tuple(pool_scores.shape) != (total, cands)
+            or pool_scores.dtype != torch.float32):
         raise MlaDecodeAttentionError(
-            f"pool_mask must be [batch * rows, window // pool_size] = "
-            f"{(total, window // pool)} float32, one candidate pool per column; got "
-            f"{tuple(pool_mask.shape)} {pool_mask.dtype}"
+            f"pool_scores must be [batch * rows, window // pool_size] = {(total, cands)} "
+            f"float32, one candidate pool per column; got {tuple(pool_scores.shape)} "
+            f"{pool_scores.dtype}"
+        )
+    if not 1 <= int(select_k) < cands:
+        raise MlaDecodeAttentionError(
+            f"select_k must lie in [1, {cands}), below the {cands} candidate pools; got "
+            f"{select_k}"
         )
     if not mla_decode_masked_serves(heads=heads, latent=latent, page=int(page_size),
                                     window=window, rows=rows, pool=pool):
@@ -599,5 +642,5 @@ def mla_decode_masked_attention(q_lift: Tensor, bank: Tensor, block_table: Tenso
     return call(q_lift.contiguous(), bank.contiguous(),
                 block_table.contiguous().to(torch.int32),
                 position.contiguous().to(torch.int32), written.contiguous(),
-                pool_mask.contiguous(), float(softmax_scale), int(page_size), pool,
-                SOURCE_DIGEST)
+                pool_scores.contiguous(), float(softmax_scale), int(page_size), pool,
+                int(select_k), int(select_fold_cap(cands)), SOURCE_DIGEST)

@@ -2,8 +2,9 @@
 """Which decode steps attend through ``mla_decode_masked``, and what they keep.
 
 A selecting step of one request and several rows (the speculative verify step at
-``B = 1``) takes its selection as a pool mask (``dsa_decode_select_mask``) and attends
-through ``mla_decode_masked_attention``, which reads the window once for all the rows.
+``B = 1``) hands its rows' bounded pool scores to ``mla_decode_masked_attention``, which
+selects the pools on chip and reads the window once for all the rows: no selection
+kernel runs for the step.
 Every other step keeps its route: one row, several requests, the bypass window, and a
 draft iteration that shares the first iteration's token indices.
 
@@ -54,13 +55,15 @@ def test_a_one_request_verify_step_that_selects_attends_by_pool_mask():
     out = _step(mine)
     assert MM.mla_decode_masked_dispatch_counters() == (1, 0)
     assert MD.mla_decode_dispatch_counters() == (0, 0)
-    # One selection launch, the mask entry, in decode_batch's family.
-    assert DB.decode_batch_route_counts()[3] == 1
+    # The masked kernel selects; decode_batch's family launches no selection.
+    assert DB.decode_batch_route_counts()[3] == 0
+    assert DB.decode_batch_dispatch_counters()[1] == 0
     _reset()
     with _index_form():
         want = _step(ref)
     assert MM.mla_decode_masked_dispatch_counters() == (0, 0)
     assert MD.mla_decode_route_counts()[:2] == (0, 1)
+    assert DB.decode_batch_route_counts()[3] == 1
     _assert_banks_equal(mine, ref)
     torch.testing.assert_close(out.float(), want.float(), rtol=2e-2, atol=2e-3)
 
@@ -87,15 +90,15 @@ def test_a_draft_head_carrier_keeps_token_indices():
     assert share.topk_indices is not None and share.topk_indices.dtype == torch.int32
 
 
-def test_a_pool_mask_of_a_step_that_does_not_select_is_refused_before_any_write():
+def test_pool_scores_of_a_step_that_does_not_select_are_refused_before_any_write():
     module = _module()
     ops = _operands("bypass", 1, 4, seed=101)
     before = _cloned(ops)
     hidden = ops["hidden"]
     q_latent = module.project_query_latent(hidden)
-    with pytest.raises(model_fp8.Glm5NextDSAIndexerError, match="pool mask"):
+    with pytest.raises(model_fp8.Glm5NextDSAIndexerError, match="pool scores"):
         module.indexer.forward_requests(
             hidden, q_latent, ops["pool_bank"], ops["tail_bank"], ops["state_slots"],
             ops["seq_lens"], ops["start"], max_seq_len=ops["window"],
-            indices_wanted=False, pool_mask=True)
+            indices_wanted=False, pool_scores=True)
     _assert_banks_equal(ops, before)
