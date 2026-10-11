@@ -481,9 +481,10 @@ def _degraded(launch: str) -> None:
 
 @torch._dynamo.assume_constant_result
 def _note_queue_full(launch: str) -> None:
-    """Bump the queue-full counter and log the step. Folded: a store to module state or a log
-    line must not stand in a function Dynamo may trace (a compiled forward runs twice under
-    ``fail_on_recompile``), so both sit here, like :func:`count_torch_route`'s bump."""
+    """Bump the queue-full counter and log the step. Folded like the file's other host-side
+    counters (:func:`count_kernel` / :func:`count_torch_route` in ``mtp/common.py``): this path
+    runs on the host after the compiled launch was refused, where the decorator is inert; the
+    census readers over ``functional/`` require the fold. The family question is open."""
     _COUNTERS.queue_full += 1
     logger.warning(
         "mtp async: the runtime refused the %s launch with a full execution queue; the step is "
@@ -495,7 +496,8 @@ def _note_queue_full(launch: str) -> None:
 def _note_bound_wait(outstanding: int, read_ms: float, age_ms: float, step_ms: float, *, backlog: bool) -> None:
     """Count a retire read over :data:`WAIT_THRESHOLD_MS`; a backlog (the read outlasted the
     host's step period) is counted again and warned, a shorter read leaves a debug record.
-    Folded for the same reason as :func:`_note_queue_full`."""
+    Folded like :func:`_note_queue_full`: the retire runs on the host before the compiled
+    launch, where the decorator is inert; the census readers require the fold."""
     _COUNTERS.bound_waits += 1
     if backlog:
         _COUNTERS.backlog_waits += 1
