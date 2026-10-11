@@ -63,9 +63,11 @@ PROMPTS = [13, 18, 27, 34]
 
 def _per_request_indexer(self, hidden_states, q_latent, pool_bank, tail_bank, slots,
                          seq_lens, position, *, max_seq_len, indices_wanted=True,
-                         projected=None):
-    """e75995b's indexer loop: one-request ``forward`` per request, on its own views."""
+                         projected=None, pool_mask=False):
+    """e75995b's indexer loop: one-request ``forward`` per request, on its own views. It
+    hands over token indices only (a tiny step is not one the masked kernel serves)."""
     assert slots is None and isinstance(pool_bank, tuple) and isinstance(tail_bank, tuple)
+    assert not pool_mask
     selected = []
     for b in range(int(hidden_states.shape[0])):
         rows = slice(b, b + 1)

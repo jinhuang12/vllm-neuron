@@ -5962,6 +5962,7 @@ class Glm5NextDSAIndexer(nn.Module):
         indices_wanted: bool = True,
         projected: tuple | None = None,
         page_size: int | None = None,
+        pool_mask: bool = False,
     ) -> torch.Tensor | None:
         """:meth:`forward`'s decode leg for ``B`` requests, ``T`` tokens each, in one pass.
 
@@ -5974,9 +5975,12 @@ class Glm5NextDSAIndexer(nn.Module):
         speculative verify step. Returns
         ``[B * T, width]`` token indices, row ``b * T + t`` what :meth:`forward` returns
         for request ``b`` at position ``position[b] + t``, or None (or the causal fill)
-        when ``max_seq_len`` does not select. The kernels serve every request in one
-        launch per stage, each on its own ring and pooled store, so no request can read
-        another's rows.
+        when ``max_seq_len`` does not select. With ``pool_mask`` a selecting step
+        returns the selection as ``[B * T, candidates]`` fp32 instead, 1.0 where row
+        ``b * T + t`` selects a pool (``dsa_decode_select_mask``: the same pools, with
+        no tail tokens; ``mla_decode_masked`` reads it); a step that does not select is
+        refused then. The kernels serve every request in one launch per stage, each on
+        its own ring and pooled store, so no request can read another's rows.
 
         The stores arrive in one of two forms:
 
@@ -6092,6 +6096,12 @@ class Glm5NextDSAIndexer(nn.Module):
         candidates, _trash, selects = self._require_serviceable(
             int(max_seq_len), 1, pool_bank[0]
         )
+        if pool_mask and not selects:
+            raise Glm5NextDSAIndexerError(
+                f"a pool mask is the selection of a selecting step; "
+                f"max_seq_len={max_seq_len} gives {candidates} candidate pool(s), which "
+                f"select_k={self.select_k()} keeps whole"
+            )
         if (
             tail_bank.ndim != 4
             or tuple(tail_bank.shape[:2]) != (int(pool_bank.shape[0]), 2)
@@ -6247,6 +6257,11 @@ class Glm5NextDSAIndexer(nn.Module):
             if not indices_wanted:
                 return None
             return self._bypass_indices(seq_lens)
+        if pool_mask:
+            # The selected pools, before the compaction and expansion to tokens.
+            from vllm_neuron.functional.dsa.decode_select import dsa_decode_select_mask
+
+            return dsa_decode_select_mask(bounded, select_k=self.select_k())
         # One kernel for top-k, sentinel, order and expand: the same token set, real
         # pools in ascending order (functional/dsa/decode_select.py).
         from vllm_neuron.functional.dsa.decode_select import dsa_decode_select
@@ -7565,6 +7580,24 @@ class Glm5NextMLAAttention(nn.Module):
         )
         return self.project_output(reduced, collector)
 
+    def _masked_attention_serves(
+        self, rows: int, block_table_row: torch.Tensor, page_size: int
+    ) -> bool:
+        """Whether ``mla_decode_masked_attention`` serves this layer's decode step of
+        ``rows`` rows per request on a ``[pages, B]`` ``block_table_row``."""
+        from vllm_neuron.functional.attention.mla_decode_masked import (
+            mla_decode_masked_serves,
+        )
+
+        return mla_decode_masked_serves(
+            heads=self._heads_per_rank(),
+            latent=self.kv_lora_rank,
+            page=int(page_size),
+            window=int(block_table_row.shape[0]) * int(page_size),
+            rows=int(rows),
+            pool=self.indexer.index_kpool,
+        )
+
     def _attend_requests(
         self,
         hidden_states: torch.Tensor,
@@ -7582,6 +7615,7 @@ class Glm5NextMLAAttention(nn.Module):
         page_size: int,
         dense: bool,
         q_latent: torch.Tensor | None = None,
+        pool_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """:meth:`attend` for a decode step of ``batch`` requests, ``T`` tokens each.
 
@@ -7597,6 +7631,11 @@ class Glm5NextMLAAttention(nn.Module):
         table column and stands this step's ``written`` rows in at their positions
         (row ``t`` sees rows ``0 .. t`` of its request), so the result does not
         depend on when the cache write lands. ``q_latent`` is :meth:`attend`'s.
+
+        A selecting step may hand its selection as ``pool_mask`` (``[batch * T,
+        candidates]`` fp32, the indexer's ``pool_mask`` form) in place of
+        ``topk_indices``; ``mla_decode_masked_attention`` then attends it, the same
+        token set read from one pass over each window.
         """
         from vllm_neuron.functional.attention.mla_absorb import mla_absorb
         from vllm_neuron.functional.attention.mla_decode import mla_decode_attention
@@ -7650,15 +7689,23 @@ class Glm5NextMLAAttention(nn.Module):
                 f"start_position must be a [batch_size={batch}] tensor, each request's "
                 f"own position; got {start_position!r}"
             )
+        selection = topk_indices if pool_mask is None else pool_mask
         if not dense and (
-            topk_indices is None
-            or topk_indices.ndim != 2
-            or int(topk_indices.shape[0]) != total
+            (topk_indices is None) == (pool_mask is None)
+            or selection.ndim != 2
+            or int(selection.shape[0]) != total
         ):
             raise Glm5NextMLADecodeError(
                 f"a selecting decode step of batch_size={batch} x {total // batch} "
-                f"row(s) needs [{total}, width] topk_indices, one row per query row; got "
-                f"{None if topk_indices is None else tuple(topk_indices.shape)}"
+                f"row(s) needs one selection, [{total}, width] topk_indices or a "
+                f"[{total}, candidates] pool_mask, one row per query row; got "
+                f"topk_indices "
+                f"{None if topk_indices is None else tuple(topk_indices.shape)} and "
+                f"pool_mask {None if pool_mask is None else tuple(pool_mask.shape)}"
+            )
+        if dense and pool_mask is not None:
+            raise Glm5NextMLADecodeError(
+                "a dense decode step attends its causal prefix; it takes no pool_mask"
             )
 
         query, kv_latent = self.project_query_and_latent(
@@ -7682,16 +7729,33 @@ class Glm5NextMLAAttention(nn.Module):
                 f"absorb-in produced a width of {int(q_lift.shape[2])}; the decode "
                 f"kernel contracts {self.kv_lora_rank}"
             )
-        attended = mla_decode_attention(
-            q_lift,
-            c_kv,
-            block_table_row.t(),
-            start_position,
-            written,
-            softmax_scale,
-            page,
-            topk_indices=None if dense else topk_indices,
-        )
+        if pool_mask is not None:
+            from vllm_neuron.functional.attention.mla_decode_masked import (
+                mla_decode_masked_attention,
+            )
+
+            attended = mla_decode_masked_attention(
+                q_lift,
+                c_kv,
+                block_table_row.t(),
+                start_position,
+                written,
+                softmax_scale,
+                page,
+                pool_mask,
+                self.indexer.index_kpool,
+            )
+        else:
+            attended = mla_decode_attention(
+                q_lift,
+                c_kv,
+                block_table_row.t(),
+                start_position,
+                written,
+                softmax_scale,
+                page,
+                topk_indices=None if dense else topk_indices,
+            )
         if collector is not None:
             collector.extend([attended, q_lift])
         reduced = mla_absorb(
@@ -7737,9 +7801,11 @@ class Glm5NextMLAAttention(nn.Module):
         :meth:`Glm5NextDSAIndexer.forward_requests` pass, each request on its own
         ring and pooled store, each row at its own causal length. :meth:`attend` then
         serves every row in one batched call (rows ``> 1`` go to
-        :meth:`_attend_requests` directly, whatever ``B``). A one-request decode step
-        is the ``B = 1, T = 1`` case of this method (see :meth:`forward`); there
-        :meth:`attend` serves ``batch_size`` 1 with its one-request attention.
+        :meth:`_attend_requests` directly, whatever ``B``); a selecting step of one
+        request and several rows hands it the selection as a pool mask, which
+        ``mla_decode_masked`` attends from one read of the window. A one-request
+        decode step is the ``B = 1, T = 1`` case of this method (see :meth:`forward`);
+        there :meth:`attend` serves ``batch_size`` 1 with its one-request attention.
 
         ``index_share`` is the draft head's :class:`IndexShare` carrier for
         ``index_share_for_mtp_iteration`` (config.py; upstream's ``skip_topk``).
@@ -7811,6 +7877,17 @@ class Glm5NextMLAAttention(nn.Module):
         )
         shared = None if index_share is None else index_share.topk_indices
         attention_latent = None
+        # A selecting step of one request and several rows reads its selection as a pool
+        # mask: the masked kernel reads the window once for all the rows instead of
+        # gathering each row's selection (mla_decode_masked). A draft head's carrier
+        # hands the selection to later iterations as token indices, so it keeps them.
+        masked = (
+            not dense
+            and index_share is None
+            and batch == 1
+            and rows > 1
+            and self._masked_attention_serves(rows, block_table_row, page_size)
+        )
         if shared is not None:
             # A later draft iteration of the same speculative step: the selection is
             # the first iteration's, and the indexer chain is skipped whole. It is one
@@ -7823,15 +7900,16 @@ class Glm5NextMLAAttention(nn.Module):
                     f"published it; this step has {total} row(s) ({batch} request(s) x "
                     f"{rows}), so it cannot reuse that selection"
                 )
-            topk_indices = shared
+            selection = shared
         else:
             q_latent = self.project_query_latent(normed_hidden_states)
             projected = self.indexer.project_stage(
                 normed_hidden_states, q_latent, query_side=not dense
             )
             # Every request's ring step, write and selection in one indexer pass: one
-            # launch per stage for the whole batch, each request on its own views.
-            topk_indices = self.indexer.forward_requests(
+            # launch per stage for the whole batch, each request on its own views. The
+            # selection is token indices, or the pool mask when ``masked``.
+            selection = self.indexer.forward_requests(
                 normed_hidden_states,
                 q_latent,
                 stores,
@@ -7842,12 +7920,13 @@ class Glm5NextMLAAttention(nn.Module):
                 max_seq_len=bound,
                 indices_wanted=not dense,
                 projected=projected,
+                pool_mask=masked,
                 **({"page_size": int(page_size)} if self.dcp_size > 1 else {}),
             )
-            if index_share is not None and topk_indices is not None:
+            if index_share is not None and selection is not None:
                 # Only a selecting step has indices to share; the bypass regime's
                 # None is never stored, so its later iterations keep writing.
-                index_share.topk_indices = topk_indices
+                index_share.topk_indices = selection
             if not dense:
                 # The attention's q_b_proj reads the latent the indexer's wq_b read.
                 # The bypass step's indexer reads no query side, so its latent has no
@@ -7856,7 +7935,7 @@ class Glm5NextMLAAttention(nn.Module):
                 attention_latent = q_latent
         if collector is not None:
             collector.append(
-                (self.indexer._bypass_indices(seq_lens) if dense else topk_indices)[:5]
+                (self.indexer._bypass_indices(seq_lens) if dense else selection)[:5]
             )
         if self.dcp_size > 1:
             self._dcp_write_latent_then_refuse(
@@ -7872,7 +7951,7 @@ class Glm5NextMLAAttention(nn.Module):
                 normed_hidden_states,
                 latent_cache,
                 start_position,
-                topk_indices,
+                None if masked else selection,
                 float(softmax_scale),
                 batch,
                 prefill_end_position=None,
@@ -7883,12 +7962,13 @@ class Glm5NextMLAAttention(nn.Module):
                 page_size=int(page_size),
                 dense=dense,
                 q_latent=attention_latent,
+                pool_mask=selection if masked else None,
             )
         return self.attend(
             normed_hidden_states,
             latent_cache,
             start_position,
-            topk_indices,
+            selection,
             float(softmax_scale),
             batch_size=batch,
             collector=collector,

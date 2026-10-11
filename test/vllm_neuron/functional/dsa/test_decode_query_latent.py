@@ -151,30 +151,38 @@ def _step(ops: dict, *, index_share=None) -> torch.Tensor:
 
 
 def _two_projection_step(ops: dict) -> torch.Tensor:
-    """The same chain with the attention projecting its own latent from the same rows."""
+    """The same chain with the attention projecting its own latent from the same rows.
+
+    The selection takes the step's own form: a pool mask where the step attends through
+    ``mla_decode_masked`` (one request of several rows that selects), token indices
+    elsewhere.
+    """
     module = _module()
     indexer = module.indexer
     hidden = ops["hidden"]
     bound = selection_bound(ops["window"], ops["window"])
     dense = _dense(ops["window"])
+    table_row = ops["block_table"].t().contiguous()
+    masked = (not dense and ops["batch"] == 1 and ops["rows"] > 1
+              and module._masked_attention_serves(ops["rows"], table_row, PAGE))
     q_latent = module.project_query_latent(hidden)
     projected = indexer.project_stage(hidden, q_latent, query_side=not dense)
-    topk = indexer.forward_requests(
+    selection = indexer.forward_requests(
         hidden, q_latent, ops["pool_bank"], ops["tail_bank"], ops["state_slots"],
         ops["seq_lens"], ops["start"], max_seq_len=bound, indices_wanted=not dense,
-        projected=projected)
+        projected=projected, pool_mask=masked)
     common = {
-        "block_table_row": ops["block_table"].t().contiguous(),
+        "block_table_row": table_row,
         "latent_slots": ops["latent_slots"],
         "page_size": PAGE,
         "dense": dense,
     }
     if ops["rows"] > 1:
         return module._attend_requests(
-            hidden, ops["latent_cache"], ops["start"], topk, ops["softmax_scale"],
-            ops["batch"], prefill_end_position=None, collector=None,
-            active_mla_query_rows=None, **common)
-    return module.attend(hidden, ops["latent_cache"], ops["start"], topk,
+            hidden, ops["latent_cache"], ops["start"], None if masked else selection,
+            ops["softmax_scale"], ops["batch"], prefill_end_position=None, collector=None,
+            active_mla_query_rows=None, pool_mask=selection if masked else None, **common)
+    return module.attend(hidden, ops["latent_cache"], ops["start"], selection,
                          ops["softmax_scale"], batch_size=ops["batch"], collector=None,
                          **common)
 
