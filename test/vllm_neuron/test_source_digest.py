@@ -47,6 +47,7 @@ PACKAGE_ROOT = Path(vllm_neuron.__file__).resolve().parent
 SOURCE_DIGEST_FILES = {
     "functional/attention/dcp_merge.py": ("SOURCE_DIGEST",),
     "functional/attention/mla_decode.py": ("SOURCE_DIGEST",),
+    "functional/attention/mla_decode_masked.py": ("SOURCE_DIGEST",),
     "functional/attention/mla_dense_window.py": ("SOURCE_DIGEST",),
     "functional/attention/mla_sparse.py": ("SOURCE_DIGEST",),
     "functional/dsa/dcp_candidate_merge.py": ("SOURCE_DIGEST",),
