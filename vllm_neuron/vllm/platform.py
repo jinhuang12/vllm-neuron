@@ -1103,6 +1103,8 @@ class NeuronPlatform(Platform):
         if dcp_size <= 1:
             return
 
+        cls._refuse_speculative_decoding_under_dcp(vllm_config)
+
         tp_size = vllm_config.parallel_config.tensor_parallel_size
         model_config = vllm_config.model_config
         num_kv_heads = cls._dcp_kv_cache_heads(model_config)
@@ -1166,6 +1168,30 @@ class NeuronPlatform(Platform):
                 "sequence across more DCP ranks for long-context workloads.",
                 tp_size,
                 num_q_heads,
+            )
+
+    @classmethod
+    def _refuse_speculative_decoding_under_dcp(cls, vllm_config) -> None:
+        """Refuse speculative decoding at decode_context_parallel_size > 1.
+
+        The DCP partial-attention kernel entry refuses more than one query row
+        per request, and a verify step carries ``1 + num_speculative_tokens``
+        rows. The multi-row DCP attention entry (item 5a, T > 1 follow-up)
+        lifts this refusal. Callers check ``dcp_size > 1`` first.
+        """
+        speculative_config = vllm_config.speculative_config
+        if speculative_config is None:
+            return
+        num_speculative_tokens = speculative_config.num_speculative_tokens
+        if num_speculative_tokens > 0:
+            raise ValueError(
+                "Speculative decoding is not supported with "
+                "decode_context_parallel_size > 1 "
+                f"(dcp={vllm_config.parallel_config.decode_context_parallel_size}, "
+                f"num_speculative_tokens={num_speculative_tokens}): "
+                "spec decode under DCP (item 5a T > 1 follow-up) is not "
+                "implemented. Disable speculative decoding or set "
+                "decode_context_parallel_size=1."
             )
 
     @classmethod
