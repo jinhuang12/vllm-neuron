@@ -2957,6 +2957,8 @@ class NeuronWorker(WorkerBase):
         # Disable tensor capture to prevent writes during teardown
         if self.model_runner is not None:
             self.model_runner.disable_capture()
+            # the async drafter's launch bound logs its last summary (a no-op without one)
+            self.model_runner._glm5next_async_launch_close()
 
         self.model_runner.ensure_kv_transfer_shutdown()
 

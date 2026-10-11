@@ -6874,6 +6874,21 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             self._glm5next_async_launch_instance = launch
         return launch
 
+    def _glm5next_async_launch_close(self) -> None:
+        """Flush the async drafter's launch bound at the worker's shutdown: its open summary
+        window (:meth:`~vllm_neuron.functional.mtp.async_step.DeviceLaunch.close`, once).
+        Nothing without a launch -- CPU mode, the synchronous drafter, a worker that never
+        built one. An error here is logged at DEBUG with its traceback and not raised, so the
+        worker's shutdown completes.
+        """
+        launch = self._glm5next_async_launch_instance
+        if launch is None:
+            return
+        try:
+            launch.close()
+        except Exception:
+            logger.debug("mtp async: the launch bound's shutdown summary failed", exc_info=True)
+
     def _glm5next_async_warmup(self, model_output, *, batch_size: int, is_prefill: bool) -> None:
         """Compile the async drafter's launches on this warmup's operand signatures.
 

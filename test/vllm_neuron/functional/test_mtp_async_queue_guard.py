@@ -767,6 +767,54 @@ def test_the_runner_hands_the_launch_the_runtimes_execution_queue_or_refuses_by_
     assert len(_RecordingLaunch.built) == 1
 
 
+class _ClosingLaunch:
+    """Stands in for :class:`DeviceLaunch` at the runner's shutdown flush: counts the ``close``
+    calls and raises ``error`` from each when one is given."""
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self.closes = 0
+        self.error = error
+
+    def close(self) -> None:
+        self.closes += 1
+        if self.error is not None:
+            raise self.error
+
+
+def test_the_runners_shutdown_flush_closes_the_launch_once_and_never_raises(caplog):
+    """The runner's shutdown flush closes its launch (the bound's last summary) when one was
+    built, does nothing without one (CPU mode, the synchronous drafter), and lets no error out
+    of the worker's shutdown: a failing ``close`` is logged at DEBUG with its traceback."""
+    runner = SimpleNamespace(_glm5next_async_launch_instance=None)
+    NeuronModelRunner._glm5next_async_launch_close(runner)
+    launch = _ClosingLaunch()
+    runner._glm5next_async_launch_instance = launch
+    NeuronModelRunner._glm5next_async_launch_close(runner)
+    assert launch.closes == 1
+    failing = _ClosingLaunch(RuntimeError("the runtime is gone"))
+    runner._glm5next_async_launch_instance = failing
+    caplog.set_level(logging.DEBUG, logger=NeuronModelRunner.__module__)
+    NeuronModelRunner._glm5next_async_launch_close(runner)
+    assert failing.closes == 1
+    records = [r for r in caplog.records if r.name == NeuronModelRunner.__module__]
+    assert [r.levelno for r in records] == [logging.DEBUG], [(r.levelname, r.getMessage()) for r in records]
+    assert records[0].exc_info is not None and records[0].exc_info[1] is failing.error
+
+
+def test_the_workers_shutdown_flushes_the_launch_bound_after_disabling_capture():
+    """``NeuronWorker.shutdown`` calls the runner's flush once, after the capture is disabled and
+    before the KV-transfer shutdown, so the bound's last summary is logged while the worker's
+    runner is whole."""
+    calls: list[str] = []
+    runner = SimpleNamespace(
+        disable_capture=lambda: calls.append("disable_capture"),
+        _glm5next_async_launch_close=lambda: calls.append("async_launch_close"),
+        ensure_kv_transfer_shutdown=lambda: calls.append("kv_transfer_shutdown"),
+    )
+    neuron_worker.NeuronWorker.shutdown(SimpleNamespace(_profiler=None, model_runner=runner))
+    assert calls == ["disable_capture", "async_launch_close", "kv_transfer_shutdown"]
+
+
 # ── the degradation inside the served runner ──────────────────────────────────────────
 
 
