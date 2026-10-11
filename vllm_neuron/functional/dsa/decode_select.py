@@ -7,12 +7,24 @@ token indices the sparse attention reads. The earlier route took four kernels fo
 (the rotational top-k, the causal sentinel, the sentinel order and the index expand).
 Here it is one kernel, :func:`dsa_decode_select`, which needs no sort:
 
-1. **The ``k``-th largest score, by its bits.** Request ``b``'s threshold is found one bit
-   at a time, most significant first, on the order-preserving integer key of an fp32 value
-   (sign bit flipped for a positive value, every bit flipped for a negative one): bit ``i``
-   is set when at least ``k`` scores are ``>=`` the value whose key is the bits found so
-   far with bit ``i`` set. Each step is one count over the request's scores, compared as
-   fp32 values, so the result is the exact ``k``-th largest value ``v`` after 32 steps.
+1. **The ``k``-th largest score, by its bits.** Request ``b``'s threshold is found on the
+   order-preserving integer key of an fp32 value (sign bit flipped for a positive value,
+   every bit flipped for a negative one), most significant bits first. The sign bit is set
+   when at least ``k`` scores are ``>= +0.0``. Below it, a chunk of up to
+   :data:`RADIX_COLUMNS` columns (see Layout) takes the 31 bits as seven four-bit digits
+   and a three-bit one: a digit is the number of its nonzero values ``t`` for which at
+   least ``k`` scores are ``>=`` the value whose key is the bits found so far with the
+   digit at ``t``, its trials counted together. A longer chunk takes the bits one at a
+   time: bit ``i`` is set when at least ``k`` scores are ``>=`` the value whose key is the
+   bits found so far with bit ``i`` set. Each trial is one count over the request's
+   scores, compared as fp32 values, so the result is the exact ``k``-th largest value
+   ``v`` either way, and the two searches select the same candidates. A step ends in a
+   cross-partition sum whatever its trials, so a short chunk, whose counts cost little,
+   takes 8 digit steps rather than 31 bit steps. The second digit ends at bit 23, the
+   exponent's lowest: the keys below ``-FLT_MAX``'s are negative NaNs, which no score
+   reaches, so a digit with a trial among them would count short of its value; with that
+   cut, the first two digits' trials are finite, and every later trial carries a nonzero
+   bit above 23 when ``v`` is negative and finite.
 2. **The selection.** Every score ``> v`` is selected, and of the scores ``== v`` the
    lowest-indexed ``k - #{> v}``: the **tie rule**, lowest candidate index first. A score
    ``<= BOUND_FILL_MARK`` is never selected, which is the causal sentinel: a row with fewer
@@ -46,10 +58,12 @@ with the cap :func:`select_fold_cap` sets for ``C``. The partitions run chunk-ma
 request-major (partition ``r * f + j``, one DMA per request and one for its partial last
 chunk), whichever needs fewer DMAs; every DMA is two-dimensional with the partitions
 outermost, the form the device compiler aligns (a three-dimensional HBM access pattern
-onto a partition range is refused there, though the simulator takes it). A count is then one
-vector instruction over ``F`` columns and a cross-partition sum per request, one matmul by
-the ``[P, P]`` same-request matrix; the tie rank adds the lower chunks' ties by the
-strictly-lower same-request matrix. Neither depends on the layout.
+onto a partition range is refused there, though the simulator takes it). A bit step's
+count is then one vector instruction over ``F`` columns and a cross-partition sum per
+request, one matmul by the ``[P, P]`` same-request matrix; a digit step counts its trials
+in two vector instructions over ``15 F`` columns and sums them in one matmul. The tie
+rank adds the lower chunks' ties by the strictly-lower same-request matrix. None of it
+depends on the layout.
 
 The compaction needs a row on one partition of a GpSimd core (partitions
 ``0, 16, ..., 112``), so the mask goes through an HBM scratch on its way there. A row of
@@ -142,6 +156,16 @@ MAX_SELECT_CANDIDATES = PARTITIONS * FOLD_COLUMNS_LIMIT
 #: device results are not yet trusted (module docstring); the runner refuses a
 #: ``max_model_len`` past it (:func:`check_decode_index_context`).
 MAX_DECODE_INDEX_CANDIDATES = WHOLE_ROW_COLUMNS
+#: The longest chunk (columns per partition) whose ``k``-th search takes four-bit digits;
+#: a longer one takes single bits (module docstring, step 1). A digit step counts 15
+#: trials where a bit step counts one, and both end in one cross-partition sum: on a
+#: short chunk the sums and their engine hand-offs dominate, on a long one the counts.
+RADIX_COLUMNS = 128
+#: The trials of a four-bit digit, its nonzero values.
+RADIX_TRIALS = 15
+#: The four-bit digits below the sign bit, their lowest bits ``27, 23, .., 3``; a
+#: three-bit digit takes bits ``2 .. 0``.
+RADIX_STEPS = 7
 #: fp32 columns of a ``[P, 1]`` scratch tile: one whole 32-byte line.
 _LINE = 8
 #: The sign bit as an int32. Every immediate here is a power of two or ``-1``, so it is
@@ -334,9 +358,11 @@ def _fold_copy(hbm, tile, r0, n, width, chunk, fold, request_major, into_tile):
 def _kth_largest(scores, same, parts, chunk, select_k):
     """Each partition's request's ``select_k``-th largest score, ``[parts, 1]`` fp32.
 
-    The MSB-first bit search the module docstring describes. Step 0 tests ``+0.0``,
-    whose key is the sign bit alone; it fixes the key-to-bits map of every later trial:
-    XOR with the sign bit for a non-negative result, with ``-1`` for a negative one.
+    The MSB-first search the module docstring describes: four-bit digits on a chunk of up
+    to :data:`RADIX_COLUMNS` columns (:func:`_digit_search`), single bits past it. Step 0
+    tests ``+0.0``, whose key is the sign bit alone; it fixes the key-to-bits map of every
+    later trial: XOR with the sign bit for a non-negative result, with ``-1`` for a
+    negative one.
     """
     junk = _sb((parts, chunk), nl.float32)
     count = _col(parts, nl.float32)
@@ -346,6 +372,8 @@ def _kth_largest(scores, same, parts, chunk, select_k):
     taken = _col(parts, nl.int32)  # -1 where the bit is taken, else 0
     nisa.tensor_scalar(dst=taken, data=total, op0=nl.greater_equal,
                        operand0=float(select_k), op1=nl.multiply, operand1=-1.0)
+    if chunk <= RADIX_COLUMNS:
+        return _digit_search(scores, same, taken, parts, chunk, select_k), junk
     key = _col(parts, nl.int32)
     nisa.tensor_scalar(dst=key, data=taken, op0=nl.bitwise_and, operand0=_SIGN_BIT)
     flip = _col(parts, nl.int32)
@@ -371,6 +399,61 @@ def _kth_largest(scores, same, parts, chunk, select_k):
     bits = _col(parts, nl.int32)
     nisa.tensor_scalar(dst=bits, data=key, op0=nl.bitwise_xor, operand0=flip)
     return bits.view(nl.float32), junk
+
+
+def _digit_search(scores, same, taken, parts, chunk, select_k):
+    """The four-bit search below the sign bit, ``[parts, 1]`` fp32: the ``k``-th value.
+
+    The search carries the bits found so far XOR the result's key-to-bits map, ``-1`` for
+    a negative result and 0 for a non-negative one (``taken`` inverted), so that a trial
+    is that value XOR ``t << shift`` (the digit's bits are clear in it) and the value is
+    the result's bits after the last digit.
+    """
+    digits = _sb((parts, RADIX_TRIALS + 1), nl.int32)  # 1 .. 15 on every partition
+    nisa.iota(dst=digits[:, 0:RADIX_TRIALS], pattern=[[1, RADIX_TRIALS]], offset=1,
+              channel_multiplier=0)
+    found = _col(parts, nl.int32)
+    nisa.tensor_scalar(dst=found, data=taken, op0=nl.bitwise_xor, operand0=-1)
+    for step in range(RADIX_STEPS):  # bits 30 .. 3, four at a time
+        found = _digit_step(scores, same, digits, found, parts, chunk, select_k,
+                            27 - 4 * step, RADIX_TRIALS)
+    # Bits 2 .. 0: a three-bit digit, seven trials.
+    found = _digit_step(scores, same, digits, found, parts, chunk, select_k, 0, 7)
+    return found.view(nl.float32)
+
+
+def _digit_step(scores, same, digits, found, parts, chunk, select_k, shift, trials):
+    """``found`` with the digit at ``shift`` (``trials`` nonzero values) decided,
+    ``[parts, 1]`` int32 (:func:`_digit_search`).
+
+    A request's count of scores ``>=`` a trial falls as the trial rises, so the digit is
+    the number of trials that at least ``select_k`` scores reach.
+    """
+    trial = _sb((parts, RADIX_TRIALS + 1), nl.int32)
+    nisa.tensor_scalar(dst=trial[:, 0:trials], data=digits[:, 0:trials], op0=nl.left_shift,
+                       operand0=shift, op1=nl.bitwise_xor, operand1=found)
+    reach = _sb((parts, trials * chunk), nl.float32)  # score >= trial, trial-major
+    nisa.tensor_tensor(
+        dst=reach, data1=scores.ap(pattern=[[chunk, parts], [0, trials], [1, chunk]]),
+        data2=trial.view(nl.float32).ap(pattern=[[RADIX_TRIALS + 1, parts], [1, trials],
+                                                 [0, chunk]]),
+        op=nl.greater_equal)
+    count = _sb((parts, RADIX_TRIALS + 1), nl.float32)
+    nisa.tensor_reduce(dst=count[:, 0:trials], op=nl.add,
+                       data=reach.reshape((parts, trials, chunk)), axis=2)
+    total = nl.ndarray((parts, RADIX_TRIALS + 1), dtype=nl.float32, buffer=nl.psum)
+    nisa.nc_matmul(dst=total[:, 0:trials], stationary=same, moving=count[:, 0:trials])
+    met = _sb((parts, RADIX_TRIALS + 1), nl.float32)
+    digit = _col(parts, nl.float32)
+    nisa.tensor_scalar_reduce(dst=met[:, 0:trials], data=total[:, 0:trials],
+                              op0=nl.greater_equal, operand0=float(select_k),
+                              reduce_op=nl.add, reduce_res=digit)
+    digit_i = _col(parts, nl.int32)  # a count of at most 15: exact
+    nisa.tensor_copy(dst=digit_i, src=digit)
+    grown = _col(parts, nl.int32)
+    nisa.tensor_scalar(dst=grown, data=digit_i, op0=nl.left_shift, operand0=shift,
+                       op1=nl.bitwise_xor, operand1=found)
+    return grown
 
 
 def _select_mask(scores, same, below, parts, chunk, select_k):

@@ -159,6 +159,114 @@ def test_extreme_finite_scores():
     assert torch.equal(got, _oracle(bounded, lengths))
 
 
+# ---------------------------------------------------------------------------------------
+# The k-th search: four-bit digits on a short chunk, single bits on a long one
+# ---------------------------------------------------------------------------------------
+
+
+def _full(rows, candidates, *, seed):
+    """``rows`` requests whose every pool is complete, random scores."""
+    return _bounded([POOL * candidates + 1] * rows, candidates, seed=seed)
+
+
+def _counting_matmuls(monkeypatch):
+    """A list that grows by one per ``nc_matmul`` the kernel body issues."""
+    calls = []
+    real = DS.nisa.nc_matmul
+
+    def counted(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+    monkeypatch.setattr(DS.nisa, "nc_matmul", counted)
+    return calls
+
+
+@pytest.mark.parametrize("entry, rows, candidates, matmuls", [
+    # The verify step at the served width (16 partitions of 64 columns a row) and the
+    # one-row step: the request matrix, the sign, 8 digits and the mask's two sums.
+    ("mask", 4, 1024, 12),
+    ("index", 1, 1024, 12),
+    # 32 requests of 4096 candidates fold to 4 partitions of 1024 columns: 31 single bits.
+    ("mask", 32, 4096, 35),
+])
+def test_the_kth_search_takes_four_bits_a_step_on_a_short_chunk(monkeypatch, entry, rows,
+                                                                candidates, matmuls):
+    """Each step of the search ends in a cross-partition sum, one matmul, so the
+    matmuls count the steps."""
+    bounded = _full(rows, candidates, seed=rows + candidates)
+    lengths = [POOL * candidates + 1] * rows
+    calls = _counting_matmuls(monkeypatch)
+    if entry == "mask":
+        got = DS.dsa_decode_select_mask(bounded, select_k=K)
+        want = DS.dsa_decode_select_mask_torch_oracle(bounded, select_k=K)
+    else:
+        got, want = _kernel(bounded, lengths), _oracle(bounded, lengths)
+    assert len(calls) == matmuls
+    assert torch.equal(got, want)
+    n = min(rows, DS.tile_requests(candidates))
+    _fold, chunk, _major = DS.fold_layout(n, candidates, DS.select_fold_cap(candidates))
+    assert (chunk <= DS.RADIX_COLUMNS) == (matmuls == 12)
+
+
+def _bits(keys: torch.Tensor) -> torch.Tensor:
+    """fp32 values from their bit patterns (int64 values in the int32 range)."""
+    return keys.to(torch.int32).view(torch.float32)
+
+
+def _cut_rows(candidates: int, *, seed: int) -> torch.Tensor:
+    """Rows whose ``K``-th value sits where a digit search could stop short, each row's
+    values in random positions.
+
+    Runs of adjacent floats, where every bit of the key decides the cut: around 1.0
+    (across the exponent's lowest bit), around -1.0, and at the bottom of the finite
+    range, just above ``-FLT_MAX``. Then rows of ``K + 88`` copies of one value and
+    ``candidates - K - 88`` others, cut at that value: ``-FLT_MAX`` (whose key is just
+    above the negative NaNs'), the negative and the positive subnormal nearest zero and
+    ``-0.0`` under larger others, and ``+FLT_MAX`` over smaller ones.
+    """
+    gen = torch.Generator().manual_seed(seed)
+    span = torch.arange(candidates)
+    big, tiny = 3.4028234663852886e38, 1.401298464324817e-45
+    others = candidates - K - 88
+    rows = [_bits(0x3F800000 - candidates // 2 + span),    # 1.0, +- half the row
+            _bits(-0x40800000 - candidates // 2 + span),   # 0xBF800000: -1.0
+            _bits(-0x00800001 - span)]                     # 0xFF7FFFFF: -FLT_MAX, up
+    for cut, other in ((-big, torch.rand(others, generator=gen) * 2e38 - 1e38),
+                       (-tiny, torch.rand(others, generator=gen) + 0.5),
+                       (tiny, torch.rand(others, generator=gen) + 0.5),
+                       (-0.0, torch.rand(others, generator=gen) + 0.5),
+                       (big, -torch.rand(others, generator=gen) - 0.5)):
+        row = torch.full((candidates,), cut, dtype=torch.float32)
+        row[:others] = other
+        rows.append(row)
+    out = torch.stack(rows)
+    order = torch.argsort(torch.rand(out.shape, generator=gen), dim=1)
+    return torch.gather(out, 1, order).contiguous()
+
+
+@pytest.mark.parametrize("entry", ["mask", "index"])
+def test_both_searches_select_the_same_candidates(monkeypatch, entry):
+    """The digit search and the bit search find the same ``k``-th value, so they
+    select the same candidates, on rows cut where a digit could stop short."""
+    bounded = _cut_rows(1024, seed=21)
+    rows = int(bounded.shape[0])
+    lengths = [POOL * 1024 + 1] * rows
+
+    def run():
+        DB.reset_decode_batch_dispatch_counters()
+        if entry == "mask":
+            return DS.dsa_decode_select_mask(bounded, select_k=K)
+        return _kernel(bounded, lengths)
+
+    digits = run()
+    monkeypatch.setattr(DS, "RADIX_COLUMNS", 0)
+    bits = run()
+    assert torch.equal(digits, bits)
+    want = (DS.dsa_decode_select_mask_torch_oracle(bounded, select_k=K) if entry == "mask"
+            else _oracle(bounded, lengths))
+    assert torch.equal(digits, want)
+
+
 @pytest.mark.parametrize("batch", [2, 4, 19, 64])
 def test_two_programs_split_the_requests_and_equal_one(monkeypatch, batch):
     lengths = [8191 - 37 * b for b in range(batch)]
