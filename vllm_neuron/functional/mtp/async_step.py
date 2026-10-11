@@ -403,11 +403,7 @@ class DeviceLaunch:
             waited_ms = (time.perf_counter() - started) * 1e3
             self._outstanding.popleft()
             if waited_ms > WAIT_THRESHOLD_MS:
-                _COUNTERS.bound_waits += 1
-                logger.warning(
-                    "mtp async: %d launches outstanding; the bound waited %.1f ms for the oldest "
-                    "to be processed", outstanding, waited_ms,
-                )
+                _note_bound_wait(outstanding, waited_ms)
 
     def _issued(self, fields):
         if self.depth is not None:
@@ -464,10 +460,29 @@ def _degraded(launch: str) -> None:
     """Count (as a torch-route call and a queue-full step) and log one step served on the
     host after the runtime refused its launch."""
     _count_torch_route()
+    _note_queue_full(launch)
+
+
+@torch._dynamo.assume_constant_result
+def _note_queue_full(launch: str) -> None:
+    """Bump the queue-full counter and log the step. Folded: a store to module state or a log
+    line must not stand in a function Dynamo may trace (a compiled forward runs twice under
+    ``fail_on_recompile``), so both sit here, like :func:`count_torch_route`'s bump."""
     _COUNTERS.queue_full += 1
     logger.warning(
         "mtp async: the runtime refused the %s launch with a full execution queue; the step is "
         "served on the host (%d such steps)", launch, _COUNTERS.queue_full,
+    )
+
+
+@torch._dynamo.assume_constant_result
+def _note_bound_wait(outstanding: int, waited_ms: float) -> None:
+    """Bump the bound-wait counter and log the wait; folded for the same reason as
+    :func:`_note_queue_full`."""
+    _COUNTERS.bound_waits += 1
+    logger.warning(
+        "mtp async: %d launches outstanding; the bound waited %.1f ms for the oldest "
+        "to be processed", outstanding, waited_ms,
     )
 
 
