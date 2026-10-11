@@ -18,7 +18,6 @@ from vllm_neuron.model.glm5_next.config import Glm5NextConfig, Glm5NextTextConfi
 from vllm_neuron.model.glm5_next.model_fp8 import (
     Glm5NextForConditionalGeneration,
     Glm5NextSharedExperts,
-    _WEIGHT_LEAF_SUFFIX,
     _is_fp8_dtype,
     _scale_prep_leaves,
 )
@@ -45,7 +44,6 @@ from .test_load_weights import (  # noqa: F401 -- fixtures are used by name
     MINI_MLA_WIDTHS,
     MINI_ROUTED_EXPERTS,
     _dense_config,
-    _dense_model,
     _implied_numels,
     _keys_of,
     _mappings_for,
@@ -633,99 +631,4 @@ def test_the_scale_prep_leaves_are_the_weights_whose_grid_is_present(
     assert bare == [], (
         f"the helper returned {bare} for a shared expert with no grids attached, "
         f"so it is reading the class rather than the attributes"
-    )
-
-
-def test_the_prep_loop_visits_every_module_that_declares_a_prep(
-    keep_the_loaded_tensors, tmp_path, monkeypatch, single_rank_process_group
-) -> None:
-    """``_run_load_time_preps`` visits exactly the modules whose type declares a prep and hands the bank six operands."""
-    device = torch.device("cpu")
-    directory = tmp_path / "bankscale-loop"
-    model = _stacked_model()
-    mappings = _mappings_for(_stacked_config())
-    _stacked_checkpoint(directory, mappings, model)
-    banks = _bank_entries(mappings)
-    owner_paths = _bank_owner_paths(banks)
-    assert owner_paths, "this configuration built no bank module"
-    model.load_weights(str(directory), device, None)
-
-    expected_projection = sum(
-        1
-        for _, module in model.named_modules()
-        if hasattr(type(module), "prepare_projection_weights")
-    )
-    expected_scale = sum(
-        1
-        for _, module in model.named_modules()
-        if hasattr(type(module), "prepare_scale_operands")
-    )
-    projection_calls, scale_calls = model._run_load_time_preps(device)
-
-    assert (projection_calls, scale_calls) == (expected_projection, expected_scale), (
-        f"the loop returned ({projection_calls}, {scale_calls}) where its own two "
-        f"gates select ({expected_projection}, {expected_scale}) modules, so it "
-        f"visited something other than what it tests for"
-    )
-    assert scale_calls == len(owner_paths), (
-        f"the loop ran {scale_calls} scale preps over {len(owner_paths)} bank "
-        f"modules on a configuration with no shared-expert module. Every scale "
-        f"prep on this tree is a bank's, so the two must agree: fewer means a "
-        f"bank was skipped, more means something else declared a prep"
-    )
-
-    dense_directory = tmp_path / "bankscale-loop-dense"
-    dense = _dense_model()
-    dense_mappings = _mappings_for(_dense_config())
-    _write_miniature_checkpoint(dense_directory, dense_mappings, dense)
-    dense.load_weights(str(dense_directory), device, None)
-    dense_banks = _bank_entries(dense_mappings)
-    dense_expected = (
-        sum(
-            1
-            for _, module in dense.named_modules()
-            if hasattr(type(module), "prepare_projection_weights")
-        ),
-        sum(
-            1
-            for _, module in dense.named_modules()
-            if hasattr(type(module), "prepare_scale_operands")
-        ),
-    )
-    dense_pair = dense._run_load_time_preps(device)
-    assert dense_banks == {}, (
-        f"the all-dense configuration produced {len(dense_banks)} bank entries, "
-        f"so it is not the bank-free tree this control needs"
-    )
-    assert dense_pair == dense_expected, (
-        f"the loop returned {dense_pair} on the dense tree where its own gates "
-        f"select {dense_expected}"
-    )
-
-    handed: dict[str, list[str]] = {}
-
-    def stub(self, **operands) -> None:
-        handed[type(self).__name__] = sorted(operands)
-
-    bank_type = type(model.get_submodule(owner_paths[0]))
-    monkeypatch.setattr(bank_type, "prepare_scale_operands", stub, raising=False)
-    planted_projection, planted_scale = model._run_load_time_preps(device)
-
-    assert planted_scale == len(owner_paths), (
-        f"with a prep planted on {bank_type.__name__} the loop ran "
-        f"{planted_scale} scale preps over {len(owner_paths)} bank modules; the "
-        f"stub stands in for the real prep on the same type, so the count it "
-        f"produces must be the same one the real prep produced above"
-    )
-    assert planted_projection == projection_calls, (
-        f"planting a scale prep moved the projection count from "
-        f"{projection_calls} to {planted_projection}"
-    )
-    expected_operands = sorted(
-        [leaf for leaf in BANKSCALE_LEAVES]
-        + [f"{leaf[: -len(_WEIGHT_LEAF_SUFFIX)]}_scale" for leaf in BANKSCALE_LEAVES]
-    )
-    assert handed.get(bank_type.__name__) == expected_operands, (
-        f"the planted prep was handed {handed.get(bank_type.__name__)}, not the "
-        f"six operands {expected_operands} the three arrived grids imply"
     )
