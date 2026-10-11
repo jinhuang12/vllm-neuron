@@ -274,6 +274,18 @@ from vllm_neuron.vllm.patches.kv_spec_patch import apply_kv_spec_patch
 
 apply_kv_spec_patch()
 
+# vLLM's engine refuses decode context parallelism for any KV cache of more than
+# one group, so a hybrid recurrent + attention model cannot start with
+# decode_context_parallel_size > 1; this resolves the block sizes for that case and
+# is a no-op at DCP=1. It runs in the EngineCore subprocess, so it is applied here
+# at import time too. Kept after apply_kv_spec_patch(): the two wrap different
+# functions of one module and share no state, but when both have to defer to an
+# import hook this order makes this patch's hook the outer one, which runs
+# kv_spec_patch's hook exactly once. See the patch module docstring.
+from vllm_neuron.vllm.patches.dcp_hybrid_patch import apply_dcp_hybrid_patch
+
+apply_dcp_hybrid_patch()
+
 # GLM-5.3-Flash carries its own multi-token-prediction draft layer, but vLLM's
 # SpeculativeConfig knows no MTP family for its architecture and refuses
 # --speculative-config method "mtp". The retyping must be live before the engine
