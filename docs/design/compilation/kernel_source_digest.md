@@ -2,7 +2,7 @@
 
 <!-- meta: description: How a per-graph digest of the NKI kernel sources is folded into the compile cache keys -->
 <!-- meta: content_type: conceptual-deep-dive -->
-<!-- meta: date_updated: 2026-10-10 -->
+<!-- meta: date_updated: 2026-10-11 -->
 
 ## Problem
 
@@ -44,8 +44,6 @@ silent: the server starts fast and runs stale code.
    `utils/dtype_utils.py`, `utils/neuron_utils.py`). The process keeps these
    bytes, so every key it computes reads the same snapshot, and digests each
    file's code once (see [What a file's digest reads](#what-a-files-digest-reads)).
-   Reading and digesting the snapshot takes about 700 ms on a host at load
-   average 85, once per process.
 2. A graph's kernels come from its FX nodes:
    - each NKI kernel node (`torch.ops.higher_order.nki_kernel_wrapper`) gives
      its kernel function through the library's kernel registry
@@ -158,8 +156,8 @@ The decorator allowlist (`NON_REGISTERING_DECORATOR_ROOTS`) holds `nki`,
 `torch`, `functools`, `dataclasses`, `typing`, `abc`, `contextlib` and `enum`:
 their decorators wrap or describe the function and register it nowhere another
 file reads. The package uses `@nki.jit`, `@torch._dynamo.assume_constant_result`
-and `@dataclass` today. A test pins the allowlist, and another test pins that no
-snapshot file has such a form today.
+and `@dataclass`. A test pins the allowlist, and another test pins that no
+snapshot file has such a form.
 
 Not detected: a mutation inside a function the file calls
 (`mod.set_mode(1)`) or of an object a call returns (`mod.get_table().append(x)`;
@@ -172,7 +170,7 @@ alias another module re-exports (for example `SbufManager` for
 `allocator.BufferManager`) is not seen as imported there. If no other file
 imports the kernel, its key falls back. If another file imports it by its own
 name, the key folds that file's closure only, and an edit to the aliasing file
-does not move the key. No served kernel is imported this way today: every
+does not move the key. No served kernel is imported this way: every
 served nkilib kernel's importers include the file that wraps it.
 
 ### Kernels of other packages
@@ -218,7 +216,7 @@ INFO - compile_cache_key.py - kernel digest fallback: custom op ns::op has no en
 
 `CUSTOM_OP_KERNEL_MODULES` maps `"namespace::op"` to the modules that define
 the op's kernels. A `torch.library` op is opaque in the FX graph, so the table
-names its kernels. The package registers no custom op today, so the table is
+names its kernels. The package registers no custom op, so the table is
 empty. `test/vllm_neuron/test_compile_cache_key_pergraph.py` scans the package
 (including `model/glm5_next/model_fp8.py`) for op registrations and fails when
 a registered op has no entry.
@@ -242,16 +240,14 @@ the installed library version.
 ## Startup log
 
 ``` text
-INFO - compile_cache_key.py - VLLM_NEURON_KERNEL_DIGEST=d00f2669...362842 files=<n> digest_ms=685.0 keys=per-graph
-INFO - compile_cache_key.py - kernel digest: graph key <32-hex key> folds files=25 modules=vllm_neuron.functional.attention.mla_absorb,... resolve_ms=<ms> (graphs per-graph=1 fallback=0)
+INFO - compile_cache_key.py - VLLM_NEURON_KERNEL_DIGEST=<64-hex digest> files=<n> digest_ms=<ms> keys=per-graph
+INFO - compile_cache_key.py - kernel digest: graph key <32-hex key> folds files=<n> modules=vllm_neuron.functional.attention.mla_absorb,... resolve_ms=<ms> (graphs per-graph=1 fallback=0)
 ```
 
 The first line comes once per process. The second line comes once for each
 new graph, at the rate of the library's own `Compilation cache key:` line. The
 first graph of a process also parses every snapshot file once to find the
-patches (about 1.7 s on a host at load average 217, at nice 10). A served-size
-graph (13 436 nodes, 552 kernel calls) then takes about 160 ms on the same
-host; the library's own `deepcopy` of that graph takes about 580 ms.
+patches.
 
 Print the digests without starting a server:
 
@@ -273,27 +269,28 @@ process-local `kernel_idx` of each kernel, so the kernel names come from the
 | --- | --- | --- |
 | `VLLM_NEURON_DISABLE_KERNEL_DIGEST_KEY` | `0` | `1` keeps the library's own keys. A warm cache may then serve a stale kernel. The log line still prints the package digest. |
 
-`install_kernel_digest_key(digest)` still folds one digest into every key (the
-earlier whole-package scheme). Startup uses `install_per_graph_digest_key`.
+`install_kernel_digest_key(digest)` folds one digest into every key (the
+whole-package scheme). Startup uses `install_per_graph_digest_key`.
 
 ## What it costs
 
 - One recompile of each graph that reaches a code edit. A comment, docstring
-  or layout edit recompiles nothing. The stack-1b served set (20 graphs) was
-  measured when the snapshot held 104 files: 64 of those 104
-  files reach no graph, and a decode-only kernel edit recompiles the decode
-  graphs only. `functional/mlp.py` (an nkilib patch) reaches every graph.
-- About 700 ms of CPU in each process at startup, to parse and digest
-  the snapshot (about 8 ms when the digest read raw bytes).
+  or layout edit recompiles nothing. An edit to a file that no served kernel
+  reaches recompiles no served graph, and a decode-only kernel edit recompiles
+  the decode graphs only. `functional/mlp.py` (an nkilib patch) reaches every
+  graph.
+- CPU time at startup, once per process, to parse and digest the snapshot;
+  parsing every file costs more than hashing its raw bytes.
 - No change to a cache root that was filled with the same tree: the digests
   are deterministic across processes and hosts.
-- Cache roots filled **before** this change, or before the code-digest rule,
-  miss once (the key changed); the old directories are not deleted. A change to
-  the output of `vllm_neuron/source_digest.py` does the same once.
+- A cache root filled by a tree without the kernel digest, or with the
+  raw-byte file digest, misses once (the key changed); the old directories are
+  not deleted. A change to the output of `vllm_neuron/source_digest.py` does the
+  same once.
 
 ## Relation to `SOURCE_DIGEST` in kernel files
 
-Eight kernel files pass a digest of their own source into their kernels as a
+Several kernel files pass a digest of their own source into their kernels as a
 trace-time integer, `SOURCE_DIGEST = source_digest(__file__)`.
 `functional/dsa/decode_batch.py` also digests `functional/dsa/kpool_hadamard.py`,
 the butterfly its kernels call. The integer is in the FX graph text and in the
