@@ -21,11 +21,10 @@ What this changes. The RMSNorm's scale moves out of the kernel into torch
 (``Glm5NextModel._rms_norm``), which already reads the same pre-norm tensor. The
 collapse then feeds only XLA elementwise consumers, the reduce fuses, and the router
 kernel (:func:`noaux_tc_router_prefill_kernel`) reads the scaled rows instead. The
-kernel is the fused kernel with its norm stage cut after the ``rstd`` multiply:
-:func:`_gamma_stage_dloc` is ``rmsnorm_tkg._rmsnorm_tkg_dloc`` from its gamma multiply
-on (the same ``tensor_tensor`` on the same bf16 tile, the same store, ``pe_transpose``
-and core exchange), then the same nkilib ``router_topk`` call and the same ``noaux_tc``
-stage (``router._noaux_tc_stage``).
+kernel is the fused kernel's computation from the gain multiply on: per 128-row tile,
+the gain multiply, the router GEMM in nkilib ``router_topk``'s contraction order, and
+the ``noaux_tc`` selection (``router._noaux_tc_select``) on the logits in PSUM, with
+no HBM round trip and no data shared between the two cores.
 
 Numerics. The fused kernel reads the collapse as bf16 rows from HBM; here the rows
 stay in the graph, and neuronx-cc folds the ``.to(float32)`` that reads them into the
@@ -54,9 +53,8 @@ route, the fused kernel). The launch counts into the ``noaux_tc`` router seam's 
 (``router.noaux_tc_dispatch_counters``), as the decode router does; the kernel name
 tells the two kernels apart.
 
-Both LNC2 cores: yes. The launch is ``[2]``; nkilib's router shards the token rows
-over the two programs (``shard_on_tokens``) and the noaux_tc stage covers the same
-rows on each core, as in the fused kernel.
+Both LNC2 cores: yes. The launch is ``[2]``; each program takes ``T // 2`` rows
+(``router._noaux_tc_shard_range``) and runs every step on them.
 """
 
 from __future__ import annotations
@@ -70,15 +68,8 @@ from torch import Tensor
 import nki
 import nki.isa as nisa
 import nki.language as nl
-from nkilib.core.router_topk.router_topk import XSBLayout_tp102__0
-from nkilib.core.router_topk.router_topk import router_topk as _substrate_router_topk
-from nkilib.core.subkernels.norm_tkg_utils import _DGE_MODE_NONE, pe_transpose
-from nkilib.core.subkernels.rmsnorm_tkg import _DLOC_T_TILE_SIZE
-from nkilib.core.utils.allocator import SbufManager
-from nkilib.core.utils.common_types import RouterActFnType
 from nkilib.core.utils.kernel_assert import kernel_assert
 from nkilib.core.utils.kernel_helpers import get_verified_program_sharding_info
-from nkilib.core.utils.logging import get_logger
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 from vllm_neuron.utils.neuron_utils import can_run_kernel
@@ -89,10 +80,8 @@ from .router_decode import DECODE_ROUTE_MAX_TOKENS
 #: ``0`` keeps 8aa22fa's prefill route (the fused kernel on the pre-norm rows).
 PREFILL_ROUTER_ENV = "VLLM_NEURON_MOE_PREFILL_ROUTER"
 
-#: The fused kernel's ``x_hbm_layout`` (``x`` arrives in SBUF from the norm stage).
-_X_HBM_LAYOUT_FUSED = 0
-
-#: Hidden extents come in whole 128-row partition blocks (nkilib ``router_topk``).
+#: Hidden extents come in whole 128-row partition blocks: the router GEMM contracts
+#: ``H`` as 128 partitions times ``H / 128`` columns.
 _H_BLOCK = 128
 
 
@@ -167,70 +156,6 @@ def router_rms_scale(hidden_states: Tensor, eps: float) -> Tensor:
     return (x * rstd).to(hidden_states.dtype)
 
 
-def _gamma_stage_dloc(scaled_hbm, gamma, output_hbm, output_sb):
-    """``rmsnorm_tkg._rmsnorm_tkg_dloc`` from its gamma multiply on, ``sync_output=True``.
-
-    ``scaled_hbm`` ``[T, H]`` holds ``bf16(x * rstd)``, the value nkilib's tile holds at
-    that point. Each LNC core takes ``T // 2`` rows in 128-row tiles: the gain multiply
-    (bf16 tile in place, as nkilib), the ``[T, H]`` store, the PE transpose into
-    ``output_sb`` ``[128, T, H // 128]`` at the core's shard, then the exchange that gives
-    each core the whole ``[128, T, H // 128]``. The lines are nkilib's, minus the
-    ``activation_reduce`` / ``rsqrt`` / ``tensor_scalar`` that made ``x * rstd``.
-    """
-    t_rows, hidden = scaled_hbm.shape
-    h0 = nl.tile_size.pmax
-    h1 = hidden // h0
-    tile_size = _DLOC_T_TILE_SIZE
-
-    _, lnc, shard_id = get_verified_program_sharding_info("gamma_stage_dloc", (0, 1))
-    kernel_assert(lnc == 2, "gamma_stage_dloc requires LNC=2")
-    kernel_assert(t_rows % 2 == 0, "T must be even for LNC=2 sharding")
-    t_shard = t_rows // 2
-    kernel_assert(t_shard % tile_size == 0, f"T//2 must be divisible by {tile_size}")
-
-    sbm = SbufManager(
-        sb_lower_bound=0,
-        sb_upper_bound=nl.tile_size.total_available_sbuf_size,
-        logger=get_logger("gamma_stage_dloc"),
-        use_auto_alloc=True,
-    )
-    sbm.open_scope(name="gamma_stage_dloc")
-    num_tiles = t_shard // tile_size
-    sb_shard_offset = shard_id * t_shard
-
-    tile_buf = sbm.alloc_heap((tile_size, hidden), dtype=scaled_hbm.dtype, buffer=nl.sbuf)
-    gamma_sb = sbm.alloc_heap((tile_size, hidden), dtype=gamma.dtype, buffer=nl.sbuf)
-    nisa.dma_copy(dst=gamma_sb, src=gamma.broadcast(dim=0, size=tile_size),
-                  dge_mode=_DGE_MODE_NONE)
-
-    for tile_idx in range(num_tiles):
-        t_start = shard_id * t_shard + tile_idx * tile_size
-        sb_t_start = sb_shard_offset + tile_idx * tile_size
-        nisa.dma_copy(dst=tile_buf,
-                      src=scaled_hbm.slice(dim=0, start=t_start, end=t_start + tile_size),
-                      dge_mode=_DGE_MODE_NONE)
-        nisa.tensor_tensor(tile_buf[...], tile_buf[...], gamma_sb[...], nl.multiply)
-        nisa.dma_copy(dst=output_hbm.slice(dim=0, start=t_start, end=t_start + tile_size),
-                      src=tile_buf, dge_mode=_DGE_MODE_NONE)
-        src_3d = tile_buf.reshape_dim(dim=1, shape=[h0, h1])
-        dst_3d = output_sb.slice(dim=1, start=sb_t_start, end=sb_t_start + tile_size)
-        pe_transpose(src=src_3d, dst=dst_3d, tile_size=h0, dtype=scaled_hbm.dtype, sbm=sbm)
-
-    sbm.pop_heap()  # gamma_sb
-    sbm.pop_heap()  # tile_buf
-    nisa.core_barrier(output_hbm, (0, 1))
-
-    other_offset = (1 - shard_id) * t_shard
-    nisa.sendrecv(
-        dst=output_sb.slice(dim=1, start=other_offset, end=other_offset + t_shard),
-        src=output_sb.slice(dim=1, start=sb_shard_offset, end=sb_shard_offset + t_shard),
-        send_to_rank=1 - shard_id,
-        recv_from_rank=1 - shard_id,
-        pipe_id=0,
-    )
-    sbm.close_scope()
-
-
 @nki.jit
 def noaux_tc_router_prefill_kernel(
     scaled,
@@ -242,69 +167,67 @@ def noaux_tc_router_prefill_kernel(
 ):
     """The gain, the router GEMM and the ``noaux_tc`` stage on ``[T, H]`` scaled rows.
 
-    ``router._noaux_tc_rmsnorm_router_topk_nki`` with its norm stage started after the
-    ``rstd`` multiply (:func:`_gamma_stage_dloc`); the router call and the ``noaux_tc``
-    stage are the fused kernel's, argument for argument.
+    Args:
+        scaled: ``[T, H]`` bf16 rows ``bf16(x * rstd)`` (:func:`router_rms_scale`),
+            ``T`` a multiple of 256, ``H`` a multiple of 128.
+        gamma: ``[1, H]`` bf16 RMSNorm gain.
+        router_weights: ``[H, E]`` bf16, ``8 <= E <= 512``.
+        correction_bias: ``[1, E]`` fp32 ``e_score_correction_bias``.
+
+    Returns:
+        ``(router_logits [T, E] fp32, expert_index [T, 8] uint32,
+        expert_affinities [T, E] fp32)``, the affinities scattered.
+
+    Each of the two programs takes ``T // 2`` rows in 128-row tiles. A tile is loaded,
+    multiplied by the gain and transposed (``router._noaux_tc_gained_columns``),
+    multiplied by the weights on the tensor engine (``router._noaux_tc_router_matmul``),
+    and its selection runs on the logits in PSUM (``router._noaux_tc_select``). The
+    next tile's load is issued before the current tile's compute, so it overlaps it.
+    No tile is read by the other core, so the programs share nothing but the inputs.
     """
     t_extent, h_extent = scaled.shape
-    _, e_extent = router_weights.shape
+    w_rows, e_extent = router_weights.shape
+    tile = _router_seam.NOAUX_TC_TILE
+    kernel_assert(w_rows == h_extent, f"router_weights must be [H, E] with H={h_extent}")
+    kernel_assert(h_extent % _H_BLOCK == 0, f"H must be a multiple of {_H_BLOCK}")
+    kernel_assert(
+        _router_seam.NOAUX_TC_MAX8_WIDTH <= e_extent <= _router_seam._NOAUX_TC_F_MAX,
+        f"E must be in [{_router_seam.NOAUX_TC_MAX8_WIDTH}, {_router_seam._NOAUX_TC_F_MAX}]")
+    _, n_prgs, prg_id = get_verified_program_sharding_info(
+        "noaux_tc_router_prefill", (0, 1), 2)
+    kernel_assert(n_prgs == 2, "noaux_tc_router_prefill_kernel is launched on two programs")
+    kernel_assert(t_extent % (n_prgs * tile) == 0,
+                  f"T must be a multiple of {n_prgs * tile}: a whole tile per program")
+    t_offset, t_local = _router_seam._noaux_tc_shard_range(t_extent, n_prgs, prg_id)
 
-    # One shard decision for the router and the `noaux_tc` stage, as in the fused kernel.
-    shard_on_tokens = t_extent > 1
-
-    router_logits = nl.ndarray((t_extent, e_extent), dtype=nl.float32,
-                               buffer=nl.shared_hbm)
-    norm_output = nl.ndarray((t_extent, h_extent), dtype=scaled.dtype,
-                             buffer=nl.shared_hbm)
-    # The nkilib router's own uncorrected outputs: written, not returned.
-    substrate_index = nl.ndarray((t_extent, _router_seam.NOAUX_TC_MAX8_WIDTH),
-                                 dtype=nl.int32, buffer=nl.shared_hbm)
-    substrate_affinities = nl.ndarray((t_extent, e_extent), dtype=nl.bfloat16,
-                                      buffer=nl.shared_hbm)
-    # The corrected outputs.
+    router_logits = nl.ndarray((t_extent, e_extent), dtype=nl.float32, buffer=nl.shared_hbm)
     expert_index = nl.ndarray((t_extent, _router_seam.NOAUX_TC_MAX8_WIDTH),
                               dtype=nl.uint32, buffer=nl.shared_hbm)
     expert_affinities = nl.ndarray((t_extent, e_extent), dtype=nl.float32,
                                    buffer=nl.shared_hbm)
 
-    norm_sb = nl.ndarray((nl.tile_size.pmax, t_extent, h_extent // nl.tile_size.pmax),
-                         dtype=scaled.dtype, buffer=nl.sbuf)
-    _gamma_stage_dloc(scaled, gamma, norm_output, norm_sb)
+    n_tiles = t_local // tile
+    gamma_rows = _router_seam._noaux_tc_gain_rows(gamma, h_extent)
+    # All loads go on the sync engine's queue in the order they are needed: the gain and
+    # tile 0's rows before the weights, each later tile's rows one tile ahead of its use.
+    x_next = _router_seam._noaux_tc_token_rows(scaled, t_offset, tile)
+    w_sb = _router_seam._noaux_tc_router_weights(router_weights)
+    bias_bc = _router_seam._noaux_tc_bias_tile(correction_bias, e_extent)
 
-    # `w_bias=None`: the correction bias is not a projection bias; it enters the
-    # selection score after the sigmoid, in the stage below.
-    _substrate_router_topk(
-        x=norm_sb,
-        w=router_weights,
-        w_bias=None,
-        router_logits=router_logits,
-        expert_affinities=substrate_affinities,
-        expert_index=substrate_index,
-        act_fn=RouterActFnType.SIGMOID,
-        k=_router_seam.NOAUX_TC_MAX8_WIDTH,
-        x_hbm_layout=_X_HBM_LAYOUT_FUSED,
-        x_sb_layout=XSBLayout_tp102__0,
-        router_pre_norm=False,
-        norm_topk_prob=False,
-        use_column_tiling=True,
-        use_indirect_dma_scatter=True,
-        use_PE_broadcast_w_bias=True,
-        shard_on_tokens=shard_on_tokens,
-        skip_store_expert_index=False,
-        skip_store_router_logits=False,
-    )
-
-    _router_seam._noaux_tc_stage(
-        router_logits_hbm=router_logits,
-        correction_bias_hbm=correction_bias,
-        expert_index_hbm=expert_index,
-        expert_affinities_hbm=expert_affinities,
-        num_tokens=t_extent,
-        num_experts=e_extent,
-        norm_topk_prob=norm_topk_prob,
-        routed_scaling_factor=routed_scaling_factor,
-        shard_on_tokens=shard_on_tokens,
-    )
+    for t_tile in range(n_tiles):
+        t0 = t_offset + t_tile * tile
+        x = x_next
+        if t_tile + 1 < n_tiles:
+            x_next = _router_seam._noaux_tc_token_rows(scaled, t0 + tile, tile)
+        xt = _router_seam._noaux_tc_gained_columns(x, gamma_rows)
+        logits_ps = _router_seam._noaux_tc_router_matmul(xt, w_sb)
+        logits = nl.ndarray((tile, e_extent), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=logits, src=logits_ps, engine=nisa.engine.scalar)
+        nisa.dma_copy(dst=router_logits[t0:t0 + tile, :], src=logits)
+        idx8, weights = _router_seam._noaux_tc_select(logits_ps, bias_bc, norm_topk_prob,
+                                                      routed_scaling_factor)
+        nisa.dma_copy(dst=expert_affinities[t0:t0 + tile, :], src=weights)
+        nisa.dma_copy(dst=expert_index[t0:t0 + tile, :], src=idx8)
 
     return router_logits, expert_index, expert_affinities
 
