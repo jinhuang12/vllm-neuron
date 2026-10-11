@@ -623,8 +623,10 @@ scheduling forms:
   (`NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS`, 32 by the worker's default) about three times
   sooner. Two guards hold it: each rank keeps at most `launch_depth(queue)` of its launches
   outstanding -- the most whose executions fit half the queue, 10 under 32 -- and reads the
-  oldest back before issuing another, so a stalled rank waits (one warning per wait,
-  `async_step.bound_waits()`) instead of filling the queue; and a launch the runtime still
+  oldest back before issuing another, so a stalled rank waits instead of filling the queue
+  (a read over 1 ms is counted, `async_step.bound_waits()`; one that outlasts the host's step
+  period is a completion backlog, counted and warned once, `async_step.backlog_waits()`); and
+  a launch the runtime still
   refuses with `status=7` (Execution Queue Full) is served on the host for that step with the
   synchronous drafter's values (one warning per such step, `async_step.queue_full_fallbacks()`).
   A queue below 16, whose depth is under the five launches a healthy host holds, is refused by

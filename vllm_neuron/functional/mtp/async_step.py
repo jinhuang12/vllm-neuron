@@ -94,6 +94,7 @@ __all__ = [
     "StepCarry",
     "StepCorrection",
     "StepTake",
+    "backlog_waits",
     "bound_waits",
     "dispatch_counters",
     "executions_held",
@@ -132,10 +133,15 @@ ENGINE_BATCHES_IN_FLIGHT = 2
 #: The drafter's launches a healthy host holds outstanding at once: the previous step's take
 #: (its output is read only by the next launch) plus the launches of the steps in flight.
 STEADY_STATE_LAUNCHES = 1 + LAUNCHES_PER_STEP * ENGINE_BATCHES_IN_FLIGHT
-#: A read of a launch output that takes longer than this was a wait on an unprocessed
-#: execution: a processed output of a few bytes reads back in microseconds, an unprocessed one
-#: waits for at least the remainder of a decode step (milliseconds). Reads under it retire a
-#: processed launch silently; reads over it are counted (``bound_waits``) and logged.
+#: A retire read of a launch output longer than this is counted (``bound_waits``): a
+#: processed output of a few bytes reads back in microseconds, so a longer read is either the
+#: read's own host cost (a scheduling or runtime-lock delay of a few milliseconds, which a loaded
+#: host shows on a small share of reads) or a wait on an unprocessed execution. The two are
+#: told apart by the host's step period: the oldest of ``depth`` launches was issued
+#: ``(depth - 1) / LAUNCHES_PER_STEP`` steps ago, so its age over that count is the period this
+#: host has been running steps at, and a read that outlasts it waited for the device and the
+#: completion thread -- a completion backlog, counted (``backlog_waits``) and warned once per
+#: event. A read over this threshold but under the period leaves a debug record only.
 WAIT_THRESHOLD_MS = 1.0
 _QUEUE_FULL_STATUS_TOKEN = re.compile(rf"(?<![\w.])status={QUEUE_FULL_STATUS}(?![\w.])")
 logger = logging.getLogger(__name__)
@@ -202,14 +208,16 @@ class StepCounters(DispatchCounters):
     oldest was processed (test instrumentation; ``pair`` reports the two routes as before)."""
 
     queue_full: int = 0
-    #: Launches held because the oldest outstanding launch was still unprocessed (a read
-    #: longer than :data:`WAIT_THRESHOLD_MS`).
+    #: Retire reads longer than :data:`WAIT_THRESHOLD_MS` (the read's own cost or a backlog).
     bound_waits: int = 0
+    #: Of those, the reads that outlasted the host's step period: a completion backlog.
+    backlog_waits: int = 0
 
     def reset(self) -> None:
         super().reset()
         self.queue_full = 0
         self.bound_waits = 0
+        self.backlog_waits = 0
 
 
 class StepTake(NamedTuple):
@@ -351,9 +359,11 @@ class DeviceLaunch:
     ``depth`` launches was processed steps ago; one small read per launch from then on), and
     only after the stall on a rank whose completion thread stalled, which therefore waits
     here instead of enqueuing into a full queue. A read longer than
-    :data:`WAIT_THRESHOLD_MS` is that wait, counted and logged once; a shorter one is a
-    retirement and leaves no record. That pairing of the read with the slot's release is the
-    framework's design, not yet measured on a device. A queue below
+    :data:`WAIT_THRESHOLD_MS` is counted; one that also outlasts the host's step period
+    (the oldest launch's age over the steps it spans) is that wait, counted again and warned
+    once with the read, the launch's age and the period; a shorter one is a retirement and
+    leaves no record. That pairing of the read with the slot's release is the framework's
+    design, not yet measured on a device. A queue below
     :data:`MINIMUM_EXECUTION_QUEUE` is refused by name: its depth is below the launches a
     healthy host holds, so the bound would wait on every step. Without ``execution_queue``
     (a host backend: launches run eagerly, nothing is queued) there is no bound and
@@ -369,8 +379,10 @@ class DeviceLaunch:
         self.backend = backend
         self.options = dict(options) if options else None
         self.calls = {"take": 0, "correct": 0}
-        self._outstanding: deque[Tensor] = deque()
+        self._outstanding: deque[tuple[Tensor, float]] = deque()
         self.depth: int | None = None if execution_queue is None else launch_depth(execution_queue)
+        #: Decode steps between the oldest of ``depth`` outstanding launches and the newest.
+        self._steps_spanned = None if self.depth is None else (self.depth - 1) / LAUNCHES_PER_STEP
         if self.depth is not None and self.depth < STEADY_STATE_LAUNCHES:
             raise MtpAsyncStepError(
                 f"{EXECUTION_QUEUE_ENV}={execution_queue}: the async drafter's launch depth "
@@ -393,21 +405,25 @@ class DeviceLaunch:
 
     def _admit(self) -> None:
         """Retire the oldest launches until fewer than ``depth`` are outstanding; a read that
-        blocks past :data:`WAIT_THRESHOLD_MS` is a wait, counted and logged."""
+        blocks past :data:`WAIT_THRESHOLD_MS` is counted, and one that outlasts the host's
+        step period (the oldest launch's age over the steps it spans) is a backlog, warned."""
         if self.depth is None:
             return
         while len(self._outstanding) >= self.depth:
             outstanding = len(self._outstanding)
+            oldest, issued_at = self._outstanding[0]
             started = time.perf_counter()
-            self._outstanding[0].cpu()
-            waited_ms = (time.perf_counter() - started) * 1e3
+            oldest.cpu()
+            read_ms = (time.perf_counter() - started) * 1e3
             self._outstanding.popleft()
-            if waited_ms > WAIT_THRESHOLD_MS:
-                _note_bound_wait(outstanding, waited_ms)
+            if read_ms > WAIT_THRESHOLD_MS:
+                age_ms = (started - issued_at) * 1e3
+                step_ms = max(age_ms / self._steps_spanned, WAIT_THRESHOLD_MS)
+                _note_bound_wait(outstanding, read_ms, age_ms, step_ms, backlog=read_ms > step_ms)
 
     def _issued(self, fields):
         if self.depth is not None:
-            self._outstanding.append(fields[0])
+            self._outstanding.append((fields[0], time.perf_counter()))
         return fields
 
     def take(self, accepted: Tensor, drafts: Tensor):
@@ -476,14 +492,24 @@ def _note_queue_full(launch: str) -> None:
 
 
 @torch._dynamo.assume_constant_result
-def _note_bound_wait(outstanding: int, waited_ms: float) -> None:
-    """Bump the bound-wait counter and log the wait; folded for the same reason as
-    :func:`_note_queue_full`."""
+def _note_bound_wait(outstanding: int, read_ms: float, age_ms: float, step_ms: float, *, backlog: bool) -> None:
+    """Count a retire read over :data:`WAIT_THRESHOLD_MS`; a backlog (the read outlasted the
+    host's step period) is counted again and warned, a shorter read leaves a debug record.
+    Folded for the same reason as :func:`_note_queue_full`."""
     _COUNTERS.bound_waits += 1
-    logger.warning(
-        "mtp async: %d launches outstanding; the bound waited %.1f ms for the oldest "
-        "to be processed", outstanding, waited_ms,
-    )
+    if backlog:
+        _COUNTERS.backlog_waits += 1
+        logger.warning(
+            "mtp async: the bound's retire read waited %.1f ms for the oldest of %d launches, "
+            "issued %.1f ms ago (%.1f ms a step on this host): a completion backlog",
+            read_ms, outstanding, age_ms, step_ms,
+        )
+    else:
+        logger.debug(
+            "mtp async: the bound's retire read took %.1f ms for the oldest of %d launches, "
+            "issued %.1f ms ago (%.1f ms a step on this host): the read's own cost",
+            read_ms, outstanding, age_ms, step_ms,
+        )
 
 
 def _check_contiguous(name: str, operand: str, tensor: Tensor) -> None:
@@ -1053,6 +1079,12 @@ def queue_full_fallbacks() -> int:
 
 
 def bound_waits() -> int:
-    """Launches the bound held until the oldest outstanding launch was processed (a read
-    longer than :data:`WAIT_THRESHOLD_MS`), since the last reset -- test instrumentation."""
+    """Retire reads longer than :data:`WAIT_THRESHOLD_MS` (the read's own cost or a backlog),
+    since the last reset -- test instrumentation."""
     return _COUNTERS.bound_waits
+
+
+def backlog_waits() -> int:
+    """Retire reads that outlasted the host's step period -- the launches the bound held
+    until a completion backlog cleared -- since the last reset; test instrumentation."""
+    return _COUNTERS.backlog_waits

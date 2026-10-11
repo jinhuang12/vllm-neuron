@@ -325,10 +325,98 @@ def test_the_launch_holds_at_most_the_depth_of_unprocessed_launches(step_tests_f
     assert launch.calls == {"take": depth + 2, "correct": 0}
     assert len(reads) == 2, reads  # one read per launch past the depth
     waits = [record.getMessage() for record in caplog.records if record.name == async_step.__name__]
-    assert len(waits) == 1 and async_step.bound_waits() == 1, waits
-    assert f"{depth} launches outstanding" in waits[0] and "the bound waited" in waits[0], waits
+    assert len(waits) == 1 and async_step.bound_waits() == 1 and async_step.backlog_waits() == 1, waits
+    assert f"the oldest of {depth} launches" in waits[0] and "a completion backlog" in waits[0], waits
     waited_ms = float(waits[0].split("waited ")[1].split(" ms")[0])
     assert waited_ms >= 200.0 > async_step.WAIT_THRESHOLD_MS, waited_ms
+    # the launches were issued back to back, so the host's step period derived from the oldest
+    # launch's age is far under the 200 ms read: the read outlasted a step
+    age_ms = float(waits[0].split("issued ")[1].split(" ms ago")[0])
+    step_ms = float(waits[0].split("ago (")[1].split(" ms a step")[0])
+    assert 0.0 <= age_ms < waited_ms and step_ms < waited_ms, (age_ms, step_ms, waited_ms)
+
+
+class _Delayed(torch.Tensor):
+    """A launch's output whose host read costs ``delay_s`` (the runtime processed the
+    execution long ago; the read itself is slow): the host-side read cost, not a backlog."""
+
+    __torch_function__ = torch._C._disabled_torch_function_impl
+    delay_s: float
+    reads: list
+
+    @staticmethod
+    def of(tensor: torch.Tensor, delay_s: float, reads: list) -> "_Delayed":
+        delayed = tensor.as_subclass(_Delayed)
+        delayed.delay_s = delay_s
+        delayed.reads = reads
+        return delayed
+
+    def cpu(self):
+        self.reads.append(time.monotonic())
+        time.sleep(self.delay_s)
+        return torch.Tensor.cpu(self.as_subclass(torch.Tensor))
+
+
+def _delayed_graph(real, delay_s: float, reads: list):
+    """The compiled launch function with every first output's read costing ``delay_s``."""
+
+    def graph(*args, **kwargs):
+        fields = real(*args, **kwargs)
+        return (_Delayed.of(fields[0], delay_s, reads), *fields[1:])
+
+    return graph
+
+
+AGED_S = 0.1  # the deque's launches are this old when the retire read happens: ~22 ms a step at depth 10
+
+
+def _aged_launch_at_depth(monkeypatch, delay_s: float):
+    """A launch holding ``depth`` launches issued ``AGED_S`` ago, whose first-output reads cost
+    ``delay_s``; the next take retires the oldest."""
+    monkeypatch.setattr(async_step, "_launches_in_a_graph", lambda tensor: True)
+    launch = async_step.DeviceLaunch("eager", execution_queue=_workers_queue_setting())
+    reads: list = []
+    launch._take = _delayed_graph(async_step._take_launch, delay_s, reads)
+    accepted, drafts = _take_operands(43)
+    for _ in range(launch.depth):
+        async_step.mtp_async_take(accepted, drafts, launch=launch)
+    assert launch.outstanding == launch.depth and not reads
+    time.sleep(AGED_S)
+    return launch, accepted, drafts, reads
+
+
+def test_a_retire_read_under_the_step_period_is_counted_without_a_warning(step_tests_fresh_dynamo, monkeypatch, caplog):
+    """A retire read of a few milliseconds on a launch issued steps ago is the read's own host
+    cost: counted (``bound_waits``) and not a backlog (``backlog_waits`` 0, no warning)."""
+    launch, accepted, drafts, reads = _aged_launch_at_depth(monkeypatch, delay_s=0.005)
+    async_step.reset_dispatch_counters()
+    caplog.set_level(logging.WARNING, logger=async_step.__name__)
+    async_step.mtp_async_take(accepted, drafts, launch=launch)
+    assert len(reads) == 1 and launch.outstanding == launch.depth
+    assert async_step.bound_waits() == 1 and async_step.backlog_waits() == 0
+    assert not [r for r in caplog.records if r.name == async_step.__name__], caplog.records
+
+
+def test_a_retire_read_that_outlasts_the_step_period_is_a_backlog_warning(step_tests_fresh_dynamo, monkeypatch, caplog):
+    """A retire read longer than the host's step period (the oldest launch's age over the steps
+    it spans) is a completion backlog: counted in both counts and warned once with the read,
+    the launch's age and the period."""
+    launch, accepted, drafts, reads = _aged_launch_at_depth(monkeypatch, delay_s=0.06)
+    async_step.reset_dispatch_counters()
+    caplog.set_level(logging.WARNING, logger=async_step.__name__)
+    async_step.mtp_async_take(accepted, drafts, launch=launch)
+    assert len(reads) == 1
+    assert async_step.bound_waits() == 1 and async_step.backlog_waits() == 1
+    waits = [r.getMessage() for r in caplog.records if r.name == async_step.__name__]
+    assert len(waits) == 1 and "a completion backlog" in waits[0], waits
+    waited_ms = float(waits[0].split("waited ")[1].split(" ms")[0])
+    age_ms = float(waits[0].split("issued ")[1].split(" ms ago")[0])
+    step_ms = float(waits[0].split("ago (")[1].split(" ms a step")[0])
+    spanned = (launch.depth - 1) / async_step.LAUNCHES_PER_STEP
+    assert waited_ms >= 60.0 and age_ms >= AGED_S * 1e3, (waited_ms, age_ms)
+    assert abs(step_ms - age_ms / spanned) < 0.1 and waited_ms > step_ms, (step_ms, age_ms, spanned)
+    async_step.reset_dispatch_counters()
+    assert async_step.backlog_waits() == 0
 
 
 LAUNCHES_OF_A_HEALTHY_RUN = 120

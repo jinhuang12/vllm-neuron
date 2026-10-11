@@ -625,9 +625,13 @@ Contract of the opt-in (measured on trn2 at TP64/EP16, `k = 3`, `max_num_seqs 1`
   (`executions_held`: D + ceil(D / 2)), fit half the queue the worker set; 10 under the
   worker's 32 -- reading the oldest back before it issues another. On a healthy host that
   read returns at once (the launch was processed steps ago) and retires it silently; a read
-  that blocks past `async_step.WAIT_THRESHOLD_MS` (1 ms) is a wait, counted
-  (`async_step.bound_waits()`) and logged once, and it is what makes a rank whose completion
-  thread stalls wait instead of filling the queue. A healthy host holds at most 5 launches
+  that blocks past `async_step.WAIT_THRESHOLD_MS` (1 ms) is counted (`async_step.bound_waits()`),
+  and one that also outlasts the host's step period -- the oldest launch's age over the
+  `(depth - 1) / LAUNCHES_PER_STEP` steps it spans -- is a completion backlog, counted
+  (`async_step.backlog_waits()`) and warned once with the read, the age and the period; a few
+  milliseconds on a launch issued steps ago is the read's own host cost and is only counted.
+  The backlog wait is what makes a rank whose completion thread stalls wait instead of
+  filling the queue. A healthy host holds at most 5 launches
   outstanding (the previous step's take plus the correction and take of the two steps the
   engine keeps in flight: `1 + LAUNCHES_PER_STEP * ENGINE_BATCHES_IN_FLIGHT`), so the wait
   never comes on one; a queue below `async_step.MINIMUM_EXECUTION_QUEUE` (16), whose depth is
