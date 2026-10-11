@@ -629,7 +629,12 @@ Contract of the opt-in (measured on trn2 at TP64/EP16, `k = 3`, `max_num_seqs 1`
   and one that also outlasts the host's step period -- the oldest launch's age over the
   `(depth - 1) / LAUNCHES_PER_STEP` steps it spans -- is a completion backlog, counted
   (`async_step.backlog_waits()`) and warned once with the read, the age and the period; a few
-  milliseconds on a launch issued steps ago is the read's own host cost, counted and logged at INFO.
+  milliseconds on a launch issued steps ago is the read's own host cost, counted with a DEBUG record.
+  A served line logs at INFO, so the counts' surface there is the bound's summary: every
+  `async_step.SUMMARY_EVERY_LAUNCHES` launches (and the open window at the worker's shutdown,
+  `DeviceLaunch.close`) one INFO line with the window's launches and wall span, counted reads and
+  backlogs, longest read, oldest launch's age and derived-period range, queue-full steps, and the
+  three counts since the start.
   The backlog wait is what makes a rank whose completion thread stalls wait instead of
   filling the queue. A healthy host holds at most 5 launches
   outstanding (the previous step's take plus the correction and take of the two steps the

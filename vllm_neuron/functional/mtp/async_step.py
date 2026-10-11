@@ -88,6 +88,7 @@ __all__ = [
     "QUEUE_FULL_MESSAGE",
     "QUEUE_FULL_STATUS",
     "STEADY_STATE_LAUNCHES",
+    "SUMMARY_EVERY_LAUNCHES",
     "WAIT_THRESHOLD_MS",
     "DeviceLaunch",
     "MtpAsyncStepError",
@@ -142,9 +143,17 @@ STEADY_STATE_LAUNCHES = 1 + LAUNCHES_PER_STEP * ENGINE_BATCHES_IN_FLIGHT
 #: host has been running steps at (a prefill inside the span raises it, so that one retire is
 #: judged more leniently, never more strictly), and a read that outlasts it waited for the device
 #: and the completion thread -- a completion backlog, counted (``backlog_waits``) and warned once
-#: per event. A read over this threshold but under the period is counted and recorded at INFO,
-#: the level a served line prints, so the count keeps a surface in the log.
+#: per event. A read over this threshold but under the period is counted and recorded at DEBUG;
+#: its count's surface on a served line, which logs at INFO, is the bound's summary
+#: (:data:`SUMMARY_EVERY_LAUNCHES`).
 WAIT_THRESHOLD_MS = 1.0
+#: Launches between two INFO summaries of the bound (:meth:`DeviceLaunch.close` prints the open
+#: window's at shutdown): the window's launches and wall span, its counted reads and backlogs
+#: with the longest read, the oldest launch's age and the range of the derived step period, its
+#: queue-full steps, and the three counts since the start. One line per a few thousand decode
+#: steps (two launches a step) per rank -- a served line logs at INFO, where the per-event DEBUG
+#: records do not print and a line per counted read would be noise; the backlog warning does print.
+SUMMARY_EVERY_LAUNCHES = 4096
 _QUEUE_FULL_STATUS_TOKEN = re.compile(rf"(?<![\w.])status={QUEUE_FULL_STATUS}(?![\w.])")
 logger = logging.getLogger(__name__)
 
@@ -335,6 +344,33 @@ def _correct_launch(
     return start.reshape(rows), linear.reshape(rows), seq.reshape(-1), latent, resume.reshape(rows)
 
 
+@dataclass
+class _Window:
+    """One summary window of a launch's bound: its launches, the counted retire reads with their
+    extremes, and the queue-full count the window opened at (its steps are the delta)."""
+
+    opened_at: float
+    queue_full_at_open: int
+    launches: int = 0
+    reads: int = 0
+    backlogs: int = 0
+    longest_read_ms: float = 0.0
+    oldest_launch_ms: float = 0.0
+    least_step_ms: float = 0.0
+    most_step_ms: float = 0.0
+
+    def note(self, read_ms: float, age_ms: float, step_ms: float, *, backlog: bool) -> None:
+        """Fold one counted read into the window's extremes."""
+        if self.reads == 0:
+            self.least_step_ms = step_ms
+        self.reads += 1
+        self.backlogs += backlog
+        self.longest_read_ms = max(self.longest_read_ms, read_ms)
+        self.oldest_launch_ms = max(self.oldest_launch_ms, age_ms)
+        self.least_step_ms = min(self.least_step_ms, step_ms)
+        self.most_step_ms = max(self.most_step_ms, step_ms)
+
+
 class DeviceLaunch:
     """The two kernel launches as compiled graphs, for operands on a device.
 
@@ -363,9 +399,11 @@ class DeviceLaunch:
     here instead of enqueuing into a full queue. A read longer than
     :data:`WAIT_THRESHOLD_MS` is counted; one that also outlasts the host's step period
     (the oldest launch's age over the steps it spans) is that wait, counted again and warned
-    once with the read, the launch's age and the period; a shorter one is a retirement and
-    leaves no record. That pairing of the read with the slot's release is the framework's
-    design, not yet measured on a device. A queue below
+    once with the read, the launch's age and the period; a shorter one is a retirement that
+    leaves a DEBUG record. Every :data:`SUMMARY_EVERY_LAUNCHES` launches the bound logs one
+    INFO summary of the window (counts, extremes and the totals; ``close`` logs the open
+    window's at shutdown), the counts' surface on a served line. That pairing of the read with
+    the slot's release is the framework's design, not yet measured on a device. A queue below
     :data:`MINIMUM_EXECUTION_QUEUE` is refused by name: its depth is below the launches a
     healthy host holds, so the bound would wait on every step. Without ``execution_queue``
     (a host backend: launches run eagerly, nothing is queued) there is no bound and
@@ -385,6 +423,8 @@ class DeviceLaunch:
         self.depth: int | None = None if execution_queue is None else launch_depth(execution_queue)
         #: Decode steps between the oldest of ``depth`` outstanding launches and the newest.
         self._steps_spanned = None if self.depth is None else (self.depth - 1) / LAUNCHES_PER_STEP
+        self._window = _Window(opened_at=time.perf_counter(), queue_full_at_open=_COUNTERS.queue_full)
+        self._closed = False
         if self.depth is not None and self.depth < STEADY_STATE_LAUNCHES:
             raise MtpAsyncStepError(
                 f"{EXECUTION_QUEUE_ENV}={execution_queue}: the async drafter's launch depth "
@@ -408,7 +448,9 @@ class DeviceLaunch:
     def _admit(self) -> None:
         """Retire the oldest launches until fewer than ``depth`` are outstanding; a read that
         blocks past :data:`WAIT_THRESHOLD_MS` is counted, and one that outlasts the host's
-        step period (the oldest launch's age over the steps it spans) is a backlog, warned."""
+        step period (the oldest launch's age over the steps it spans) is a backlog, warned.
+        The admission counts toward the window; the window's :data:`SUMMARY_EVERY_LAUNCHES`-th
+        closes it with the INFO summary."""
         if self.depth is None:
             return
         while len(self._outstanding) >= self.depth:
@@ -421,7 +463,26 @@ class DeviceLaunch:
             if read_ms > WAIT_THRESHOLD_MS:
                 age_ms = (started - issued_at) * 1e3
                 step_ms = max(age_ms / self._steps_spanned, WAIT_THRESHOLD_MS)
-                _note_bound_wait(outstanding, read_ms, age_ms, step_ms, backlog=read_ms > step_ms)
+                backlog = read_ms > step_ms
+                self._window.note(read_ms, age_ms, step_ms, backlog=backlog)
+                _note_bound_wait(outstanding, read_ms, age_ms, step_ms, backlog=backlog)
+        self._window.launches += 1
+        if self._window.launches >= SUMMARY_EVERY_LAUNCHES:
+            self._summarize(f"every {SUMMARY_EVERY_LAUNCHES} launches")
+
+    def _summarize(self, occasion: str) -> None:
+        """Log the window's INFO summary and open the next."""
+        now = time.perf_counter()
+        _note_summary(occasion, self._window, now - self._window.opened_at)
+        self._window = _Window(opened_at=now, queue_full_at_open=_COUNTERS.queue_full)
+
+    def close(self) -> None:
+        """Log the open window's summary as the bound's last line (the worker's shutdown calls
+        this); once, and never for a launch without a bound."""
+        if self.depth is None or self._closed:
+            return
+        self._closed = True
+        self._summarize("at shutdown")
 
     def _issued(self, fields):
         if self.depth is not None:
@@ -497,9 +558,10 @@ def _note_queue_full(launch: str) -> None:
 @torch._dynamo.assume_constant_result
 def _note_bound_wait(outstanding: int, read_ms: float, age_ms: float, step_ms: float, *, backlog: bool) -> None:
     """Count a retire read over :data:`WAIT_THRESHOLD_MS`; a backlog (the read outlasted the
-    host's step period) is counted again and warned, a shorter read leaves an INFO record.
-    Folded like :func:`_note_queue_full`: the retire runs on the host before the compiled
-    launch, where the decorator is inert; the census readers require the fold."""
+    host's step period) is counted again and warned, a shorter read leaves a DEBUG record (the
+    bound's summary carries its count to a served line). Folded like :func:`_note_queue_full`:
+    the retire runs on the host before the compiled launch, where the decorator is inert; the
+    census readers require the fold."""
     _COUNTERS.bound_waits += 1
     if backlog:
         _COUNTERS.backlog_waits += 1
@@ -509,10 +571,35 @@ def _note_bound_wait(outstanding: int, read_ms: float, age_ms: float, step_ms: f
             read_ms, outstanding, age_ms, step_ms,
         )
     else:
-        logger.info(
+        logger.debug(
             "mtp async: the bound's retire read took %.1f ms for the oldest of %d launches, "
             "issued %.1f ms ago (%.1f ms a step on this host): the read's own cost",
             read_ms, outstanding, age_ms, step_ms,
+        )
+
+
+@torch._dynamo.assume_constant_result
+def _note_summary(occasion: str, window: _Window, span_s: float) -> None:
+    """Log one INFO summary of the bound's window and the counts since the start. Folded like
+    :func:`_note_bound_wait`: the census readers require the fold."""
+    queue_full = _COUNTERS.queue_full - window.queue_full_at_open
+    if window.reads:
+        logger.info(
+            "mtp async: launch bound summary (%s): %d launches in %.1f s, %d retire reads over "
+            "%.1f ms (%d completion backlogs; longest read %.1f ms; oldest launch %.1f ms, "
+            "%.1f-%.1f ms a step on this host), %d queue-full steps; since start %d reads, "
+            "%d backlogs, %d queue-full steps",
+            occasion, window.launches, span_s, window.reads, WAIT_THRESHOLD_MS, window.backlogs,
+            window.longest_read_ms, window.oldest_launch_ms, window.least_step_ms,
+            window.most_step_ms, queue_full, _COUNTERS.bound_waits, _COUNTERS.backlog_waits,
+            _COUNTERS.queue_full,
+        )
+    else:
+        logger.info(
+            "mtp async: launch bound summary (%s): %d launches in %.1f s, no retire read over "
+            "%.1f ms, %d queue-full steps; since start %d reads, %d backlogs, %d queue-full steps",
+            occasion, window.launches, span_s, WAIT_THRESHOLD_MS, queue_full,
+            _COUNTERS.bound_waits, _COUNTERS.backlog_waits, _COUNTERS.queue_full,
         )
 
 

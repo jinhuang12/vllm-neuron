@@ -624,8 +624,11 @@ scheduling forms:
   sooner. Two guards hold it: each rank keeps at most `launch_depth(queue)` of its launches
   outstanding -- the most whose executions fit half the queue, 10 under 32 -- and reads the
   oldest back before issuing another, so a stalled rank waits instead of filling the queue
-  (a read over 1 ms is counted and logged at INFO, `async_step.bound_waits()`; one that outlasts the host's step
-  period is a completion backlog, counted and warned once, `async_step.backlog_waits()`); and
+  (a read over 1 ms is counted, `async_step.bound_waits()`, with a DEBUG record; one that outlasts the host's
+  step period is a completion backlog, counted and warned once, `async_step.backlog_waits()`; every
+  `async_step.SUMMARY_EVERY_LAUNCHES` launches, and at the worker's shutdown, the bound logs one INFO summary
+  of the window -- its counted reads, backlogs and queue-full steps, the longest read, the oldest launch's age
+  with the derived step period, and the totals -- the counts' surface on a served line); and
   a launch the runtime still
   refuses with `status=7` (Execution Queue Full) is served on the host for that step with the
   synchronous drafter's values (one warning per such step, `async_step.queue_full_fallbacks()`).

@@ -33,7 +33,12 @@ from __future__ import annotations
 
 import ast
 import logging
+import os
 import pathlib
+import re
+import subprocess
+import sys
+import textwrap
 import threading
 import time
 from types import SimpleNamespace
@@ -387,18 +392,180 @@ def _aged_launch_at_depth(monkeypatch, delay_s: float):
 
 def test_a_retire_read_under_the_step_period_is_counted_without_a_warning(step_tests_fresh_dynamo, monkeypatch, caplog):
     """A retire read of a few milliseconds on a launch issued steps ago is the read's own host
-    cost: counted (``bound_waits``), recorded at INFO, and not a backlog (``backlog_waits`` 0,
-    no warning)."""
+    cost: counted (``bound_waits``), recorded at DEBUG only -- a served line logs at INFO, where
+    the count's surface is the bound's summary, not a line per event -- and not a backlog
+    (``backlog_waits`` 0, no warning)."""
     launch, accepted, drafts, reads = _aged_launch_at_depth(monkeypatch, delay_s=0.005)
     async_step.reset_dispatch_counters()
-    caplog.set_level(logging.INFO, logger=async_step.__name__)
+    caplog.set_level(logging.DEBUG, logger=async_step.__name__)
     async_step.mtp_async_take(accepted, drafts, launch=launch)
     assert len(reads) == 1 and launch.outstanding == launch.depth
     assert async_step.bound_waits() == 1 and async_step.backlog_waits() == 0
     records = [r for r in caplog.records if r.name == async_step.__name__]
-    # the record is kept at INFO -- the level a served line prints -- so the count has a surface in the log
-    assert [r.levelno for r in records] == [logging.INFO], [(r.levelname, r.getMessage()) for r in records]
+    assert [r.levelno for r in records] == [logging.DEBUG], [(r.levelname, r.getMessage()) for r in records]
     assert "the read's own cost" in records[0].getMessage() and "issued" in records[0].getMessage(), records[0].getMessage()
+
+
+SUMMARY = re.compile(
+    r"mtp async: launch bound summary \((?P<occasion>[^)]+)\): (?P<launches>\d+) launches in (?P<span>[\d.]+) s, "
+    r"(?:no retire read over (?P<threshold0>[\d.]+) ms"
+    r"|(?P<reads>\d+) retire reads over (?P<threshold>[\d.]+) ms \((?P<backlogs>\d+) completion backlogs; "
+    r"longest read (?P<longest>[\d.]+) ms; oldest launch (?P<oldest>[\d.]+) ms, (?P<least>[\d.]+)-(?P<most>[\d.]+) ms "
+    r"a step on this host\)), (?P<queue_full>\d+) queue-full steps; "
+    r"since start (?P<total_reads>\d+) reads, (?P<total_backlogs>\d+) backlogs, (?P<total_queue_full>\d+) queue-full steps$"
+)
+
+
+def _summaries(caplog) -> list[dict]:
+    """The bound's INFO summaries in ``caplog``, parsed; fails on any other INFO-or-above record
+    of the module (a served line prints those, so a per-event record there is the defect)."""
+    out = []
+    for record in caplog.records:
+        if record.name != async_step.__name__ or record.levelno < logging.INFO:
+            continue
+        assert record.levelno == logging.INFO, (record.levelname, record.getMessage())
+        match = SUMMARY.match(record.getMessage())
+        assert match, record.getMessage()
+        fields = match.groupdict()
+        fields["reads"] = int(fields["reads"] or 0)
+        fields["backlogs"] = int(fields["backlogs"] or 0)
+        out.append(fields)
+    return out
+
+
+def _summarising_launch(monkeypatch, every: int, delay_s: float):
+    """A launch whose summary comes every ``every`` launches and whose first-output reads cost
+    ``delay_s``; the counters start from zero."""
+    monkeypatch.setattr(async_step, "SUMMARY_EVERY_LAUNCHES", every)
+    monkeypatch.setattr(async_step, "_launches_in_a_graph", lambda tensor: True)
+    async_step.reset_dispatch_counters()
+    launch = async_step.DeviceLaunch("eager", execution_queue=_workers_queue_setting())
+    reads: list = []
+    launch._take = _delayed_graph(async_step._take_launch, delay_s, reads)
+    accepted, drafts = _take_operands(44)
+    return launch, accepted, drafts, reads
+
+
+def test_the_bound_prints_an_info_summary_every_fixed_count_of_launches(step_tests_fresh_dynamo, monkeypatch, caplog):
+    """Every ``SUMMARY_EVERY_LAUNCHES`` launches the bound prints one INFO line and nothing else at
+    INFO: the window's launches, counted reads and backlogs (the reads past the depth, every one
+    over the threshold here), its queue-full steps, and the totals since the start -- the counts'
+    surface on a served line, which logs at INFO and never prints the per-event DEBUG records."""
+    every = async_step.launch_depth(_workers_queue_setting()) + 4
+    launch, accepted, drafts, reads = _summarising_launch(monkeypatch, every, delay_s=0.003)
+    caplog.set_level(logging.DEBUG, logger=async_step.__name__)
+    for _ in range(3 * every - 1):
+        async_step.mtp_async_take(accepted, drafts, launch=launch)
+    summaries = _summaries(caplog)
+    assert [int(s["launches"]) for s in summaries] == [every, every], summaries
+    assert [s["occasion"] for s in summaries] == [f"every {every} launches"] * 2
+    # window 1 retires the launches past the depth, window 2 one per launch; each read is 3 ms, counted
+    assert [s["reads"] for s in summaries] == [every - launch.depth, every]
+    assert [int(s["total_reads"]) for s in summaries] == [every - launch.depth, 2 * every - launch.depth]
+    assert async_step.bound_waits() == len(reads) == 3 * every - 1 - launch.depth
+    assert all(s["backlogs"] == 0 and int(s["queue_full"]) == 0 and int(s["total_backlogs"]) == 0 for s in summaries)
+    assert all(float(s["threshold"]) == async_step.WAIT_THRESHOLD_MS and float(s["span"]) >= 0.0 for s in summaries)
+    debug = [r for r in caplog.records if r.name == async_step.__name__ and r.levelno == logging.DEBUG]
+    assert len(debug) == len(reads) and all("the read's own cost" in r.getMessage() for r in debug)
+
+
+def test_the_bounds_summary_carries_the_windows_longest_read_and_oldest_launch(step_tests_fresh_dynamo, monkeypatch, caplog):
+    """The summary's extremes are the window's counted reads': the longest read, the oldest
+    launch's age at its read and the range of the step period derived from the ages -- what a
+    served line needs to check the bound's ages against the host's step cadence without the
+    per-event records."""
+    every = async_step.launch_depth(_workers_queue_setting()) + 1
+    launch, accepted, drafts, reads = _summarising_launch(monkeypatch, every, delay_s=0.005)
+    for _ in range(launch.depth):
+        async_step.mtp_async_take(accepted, drafts, launch=launch)
+    assert not reads
+    time.sleep(AGED_S)
+    caplog.set_level(logging.INFO, logger=async_step.__name__)
+    async_step.mtp_async_take(accepted, drafts, launch=launch)
+    (summary,) = _summaries(caplog)
+    spanned = (launch.depth - 1) / async_step.LAUNCHES_PER_STEP
+    assert summary["reads"] == 1 and len(reads) == 1
+    assert float(summary["longest"]) >= 5.0, summary
+    assert float(summary["oldest"]) >= AGED_S * 1e3, summary
+    assert abs(float(summary["least"]) - float(summary["oldest"]) / spanned) < 0.1, summary
+    assert summary["least"] == summary["most"], summary
+
+
+def test_a_quiet_window_says_no_read_was_over_the_threshold(step_tests_fresh_dynamo, monkeypatch, caplog):
+    """A healthy host's window -- every retire read under the threshold -- prints the summary
+    with no read counted, so a quiet served line shows the count was zero, not absent."""
+    every = async_step.launch_depth(_workers_queue_setting()) + 2
+    launch, accepted, drafts, reads = _summarising_launch(monkeypatch, every, delay_s=0.0)
+    caplog.set_level(logging.INFO, logger=async_step.__name__)
+    for _ in range(every):
+        async_step.mtp_async_take(accepted, drafts, launch=launch)
+    (summary,) = _summaries(caplog)
+    assert summary["reads"] == 0 and summary["longest"] is None, summary
+    assert float(summary["threshold0"]) == async_step.WAIT_THRESHOLD_MS and int(summary["launches"]) == every
+
+
+def test_close_prints_the_open_windows_summary_once_at_shutdown(step_tests_fresh_dynamo, monkeypatch, caplog):
+    """``close`` (the worker's shutdown) prints the open window -- the launches since the last
+    summary -- as the bound's last line, once; a launch without a bound has nothing to print."""
+    every = async_step.launch_depth(_workers_queue_setting()) + 10
+    launch, accepted, drafts, reads = _summarising_launch(monkeypatch, every, delay_s=0.003)
+    caplog.set_level(logging.INFO, logger=async_step.__name__)
+    for _ in range(launch.depth + 3):
+        async_step.mtp_async_take(accepted, drafts, launch=launch)
+    assert _summaries(caplog) == []
+    launch.close()
+    launch.close()
+    (summary,) = _summaries(caplog)
+    assert summary["occasion"] == "at shutdown" and int(summary["launches"]) == launch.depth + 3
+    assert summary["reads"] == 3 == int(summary["total_reads"]) == async_step.bound_waits()
+    unbounded = async_step.DeviceLaunch("eager")
+    unbounded.close()
+    assert len(_summaries(caplog)) == 1
+
+
+def test_the_summary_prints_at_the_packages_default_log_level(tmp_path):
+    """The served form: ``VLLM_NEURON_LOG_LEVEL`` unset, so importing the package configures its
+    logger at INFO (``envs`` default). In a fresh interpreter the bound's summary reaches the
+    package's stream handlers and the per-event record does not -- the proof that the counts
+    have a surface on a served line without a logging change."""
+    code = textwrap.dedent(
+        f"""
+        import logging, os, sys, time
+        assert os.environ.get("VLLM_NEURON_LOG_LEVEL") is None, os.environ.get("VLLM_NEURON_LOG_LEVEL")
+        import vllm_neuron  # configures the package logger at the default level
+        import torch
+        from vllm_neuron import envs
+        from vllm_neuron.functional.mtp import async_step
+        from test.vllm_neuron.functional import test_mtp_async_queue_guard as guard
+        print("VLLM_NEURON_LOG_LEVEL", os.environ.get("VLLM_NEURON_LOG_LEVEL"), envs.VLLM_NEURON_LOG_LEVEL)
+        print("package logger level", logging.getLevelName(logging.getLogger("vllm_neuron").level))
+        every = async_step.launch_depth(guard._workers_queue_setting()) + 2
+        async_step.SUMMARY_EVERY_LAUNCHES = every
+        async_step._launches_in_a_graph = lambda tensor: True
+        launch = async_step.DeviceLaunch("eager", execution_queue=guard._workers_queue_setting())
+        reads = []
+        launch._take = guard._delayed_graph(async_step._take_launch, 0.003, reads)
+        accepted, drafts = guard._take_operands(45)
+        for _ in range(every):
+            async_step.mtp_async_take(accepted, drafts, launch=launch)
+        launch.close()
+        print("COUNTS", len(reads), async_step.bound_waits(), async_step.backlog_waits())
+        """
+    )
+    env = {name: value for name, value in os.environ.items() if name != "VLLM_NEURON_LOG_LEVEL"}
+    root = pathlib.Path(async_step.__file__).resolve().parents[3]
+    done = subprocess.run([sys.executable, "-c", code], cwd=root, env=env, capture_output=True, text=True, timeout=900)
+    (tmp_path / "probe.out").write_text(done.stdout)
+    (tmp_path / "probe.err").write_text(done.stderr)
+    print("probe stdout:\n" + done.stdout)
+    assert done.returncode == 0, (done.stdout[-2000:], done.stderr[-4000:])
+    assert "package logger level INFO" in done.stdout, done.stdout
+    streams = done.stdout + done.stderr
+    summaries = [line for line in streams.splitlines() if "mtp async: launch bound summary" in line]
+    assert len(summaries) >= 2 and any("(at shutdown)" in line for line in summaries), summaries  # the root's stdout handler and the package's stderr handler both print
+    assert "the read's own cost" not in streams
+    assert "COUNTS 2 2 0" in done.stdout, done.stdout  # the two reads past the depth, both counted, no backlog
+    assert all("2 retire reads over" in line for line in summaries if "every " in line), summaries
 
 
 def test_a_retire_read_that_outlasts_the_step_period_is_a_backlog_warning(step_tests_fresh_dynamo, monkeypatch, caplog):
