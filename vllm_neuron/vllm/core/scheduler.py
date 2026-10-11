@@ -886,6 +886,20 @@ class NeuronScheduler(Scheduler):
                             blocks = 2 + spec.num_speculative_blocks
                         else:
                             blocks = 1 + spec.num_speculative_blocks
+                    elif getattr(self, "dcp_world_size", 1) > 1:
+                        # Under decode context parallelism a rank holds one block
+                        # per ``block_size * dcp_size`` tokens of a sequence, the
+                        # allocator's own per-rank rule
+                        # (``SingleTypeKVCacheManager.__init__``).
+                        from vllm_neuron.utils.dcp_ownership import ownership_stride
+
+                        blocks = cdiv(
+                            self.max_model_len,
+                            ownership_stride(
+                                block_size=spec.block_size,
+                                dcp_size=self.dcp_world_size,
+                            ),
+                        )
                     else:
                         blocks = cdiv(self.max_model_len, spec.block_size)
                     blocks_per_request += blocks

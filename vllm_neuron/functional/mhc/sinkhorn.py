@@ -90,7 +90,8 @@ instructions per iteration: two matrix-vector products on the Tensor engine,
 against the blocks laid on one diagonal, and two reciprocals. Above that, tokens
 ride the partition axis (``ceil(T / 128)`` per partition),
 the block's two axes are both free, and an iteration is six Vector-engine
-instructions on the whole tile. See the kernel's docstring.
+instructions on the whole tile; from 128 tokens an LNC2 pair splits the tokens
+over its two cores. See the kernel's docstring.
 
 Both kernels stay. The square one is the general ``[M, N]`` normalisation; the
 batched one is what the mHC layer calls. They share the targets, the denominator
@@ -132,6 +133,7 @@ import nki.language as nl
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
+from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 logger = logging.getLogger(__name__)
@@ -165,6 +167,10 @@ MOVING_FMAX = 512
 #: 27.3 at T = 1, 24.3 vs 27.2 at 2, 25.6 vs 27.2 at 4, 27.7 vs 28.3 at 8,
 #: 32.9 vs 28.5 at 16, 43.4 vs 28.5 at 32.
 SCALING_VECTORS_MAX_TOKENS = 8
+
+#: Physical cores behind one logical core on an LNC2 runtime, and so the programs
+#: of a two-program launch of :func:`sinkhorn_blocks_kernel`.
+_LNC2_PROGRAMS = 2
 
 __all__ = [
     "MHC_STREAMS",
@@ -517,6 +523,18 @@ def sinkhorn_blocks_kernel(affinity_blocks, iters: int = SINKHORN_ITERS):
     5938748 issued 31 per iteration (one ``[T, S]`` tile per block row, a
     reciprocal and two multiplies per pass), 624 for the 20 iterations.
 
+    SPMD, tokens on the partitions only. Under a launch of ``P`` programs each
+    program normalises one contiguous ``ceil(T / P)`` share of the tokens (at
+    least one each), so under an LNC2 pair both physical cores work on half the
+    tokens. The blocks are independent, so a token's arithmetic is the same
+    instruction sequence whichever program, partition or slot holds it, and the
+    result is the one-program result bit for bit. The loop's instructions, six
+    per iteration, are a dependent chain on the Vector engine, and each one costs
+    a fixed issue time (about 0.2 us on trn2) plus a term that grows with the
+    values per partition and, more weakly, with the partitions it spans; a split
+    shrinks only the second part. :func:`sinkhorn_normalise_blocks` picks the
+    grid. The scaling-vector form refuses a launch of more than one program.
+
     :data:`SINKHORN_DENOM_EPS` moves from the denominators to one add on the
     entries before the loop: an exact zero entry becomes ``eps``, so no sum can
     be zero, and every entry above ~1e-23 is unchanged in fp32, so for the
@@ -558,8 +576,9 @@ def sinkhorn_blocks_kernel(affinity_blocks, iters: int = SINKHORN_ITERS):
 def _blocks_by_scaling_vectors(affinity_blocks, out, iters: int) -> None:
     """:func:`sinkhorn_blocks_kernel` at decode: ``u``/``v`` on the Tensor engine.
 
-    Traced inside the kernel. Writes ``out``.
+    Traced inside the kernel. Writes ``out``, as the one program of its launch.
     """
+    assert nl.num_programs(axes=0) == 1, "the scaling-vector form runs as one program"
     t_extent, rows_per_block, cols_per_block = affinity_blocks.shape
     block_rows = t_extent * rows_per_block
     # k_rows[t*S + i, j] = K[t, i, j]: one block row per partition, one
@@ -652,13 +671,23 @@ def _blocks_by_scaling_vectors(affinity_blocks, out, iters: int) -> None:
 def _blocks_by_token_partitions(affinity_blocks, out, iters: int) -> None:
     """:func:`sinkhorn_blocks_kernel` above decode sizes: tokens on the partitions.
 
-    Traced inside the kernel. Writes ``out``.
+    Traced inside the kernel, once per program. Normalises this program's
+    contiguous share of the tokens, ``[t_lo, t_lo + t_count)``, and writes it to
+    ``out``.
     """
     t_extent, rows_per_block, cols_per_block = affinity_blocks.shape
+    n_prog = nl.num_programs(axes=0)
+    share = (t_extent + n_prog - 1) // n_prog
+    t_lo = nl.program_id(0) * share
+    t_count = t_extent - t_lo
+    if t_count > share:
+        t_count = share
+    assert t_count >= 1, "a launch of more programs than token shares"
     block_elems = rows_per_block * cols_per_block
-    per_part = (t_extent + PARTITION_MAX - 1) // PARTITION_MAX
-    full_parts = t_extent // per_part
-    tail = t_extent - full_parts * per_part
+    base = t_lo * block_elems
+    per_part = (t_count + PARTITION_MAX - 1) // PARTITION_MAX
+    full_parts = t_count // per_part
+    tail = t_count - full_parts * per_part
     parts = full_parts
     if tail > 0:
         parts = full_parts + 1
@@ -698,7 +727,7 @@ def _blocks_by_token_partitions(affinity_blocks, out, iters: int) -> None:
                 [cols_per_block, rows_per_block],
                 [1, cols_per_block],
             ],
-            offset=0,
+            offset=base,
         ),
     )
     if tail > 0:
@@ -711,7 +740,7 @@ def _blocks_by_token_partitions(affinity_blocks, out, iters: int) -> None:
                     [cols_per_block, rows_per_block],
                     [1, cols_per_block],
                 ],
-                offset=full_parts * run,
+                offset=base + full_parts * run,
             ),
         )
     # The divide-by-zero guard, once on the entries (see the docstring).
@@ -746,7 +775,7 @@ def _blocks_by_token_partitions(affinity_blocks, out, iters: int) -> None:
                 [cols_per_block, rows_per_block],
                 [1, cols_per_block],
             ],
-            offset=0,
+            offset=base,
         ),
         src=work[0:full_parts, 0:per_part, 0:rows_per_block, 0:cols_per_block],
     )
@@ -759,7 +788,7 @@ def _blocks_by_token_partitions(affinity_blocks, out, iters: int) -> None:
                     [cols_per_block, rows_per_block],
                     [1, cols_per_block],
                 ],
-                offset=full_parts * run,
+                offset=base + full_parts * run,
             ),
             src=work[full_parts:parts, 0:tail, 0:rows_per_block, 0:cols_per_block],
         )
@@ -982,7 +1011,8 @@ def sinkhorn_normalise_blocks(
             block per token.
         iters: normalisation iterations, default :data:`SINKHORN_ITERS`, passed to
             the kernel as a trace-time constant. One call is one dispatch however
-            many token tiles ``T`` needs.
+            many token tiles ``T`` needs; under an LNC2 pair a call over at least
+            :data:`PARTITION_MAX` tokens launches it as two programs, one per core.
 
     Returns:
         ``[T, S, S]`` fp32. Each block has row sums :func:`row_target` and column
@@ -1016,9 +1046,27 @@ def sinkhorn_normalise_blocks(
         )
 
     _count_nki_dispatch()
-    return wrap_nki(sinkhorn_blocks_kernel)(
-        affinity_blocks=affinity_blocks, iters=iters
-    )
+    call = wrap_nki(sinkhorn_blocks_kernel)
+    programs = _blocks_launch_programs(tokens)
+    if programs > 1:
+        call = call[programs]
+    return call(affinity_blocks=affinity_blocks, iters=iters)
+
+
+def _blocks_launch_programs(tokens: int) -> int:
+    """SPMD programs for one :func:`sinkhorn_blocks_kernel` launch over ``tokens``.
+
+    Two, one per core, under an LNC2 pair once the tokens fill every partition
+    (``tokens >= PARTITION_MAX``); otherwise one. On trn2 the split saves about
+    1.0 us of 29.6 at 128 tokens and 10.9 of 48.3 at 1024, but under 0.5 us at
+    64 and below, where an instruction spans few partitions and holds one token
+    per partition, so the decode batches keep one program. The scaling-vector
+    form (``tokens <= SCALING_VECTORS_MAX_TOKENS``) is one program by
+    construction.
+    """
+    if lnc_pair() and tokens >= PARTITION_MAX:
+        return _LNC2_PROGRAMS
+    return 1
 
 
 def sinkhorn_torch_oracle(affinity: Tensor, iters: int = SINKHORN_ITERS) -> Tensor:

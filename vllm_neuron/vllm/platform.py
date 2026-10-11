@@ -1075,16 +1075,39 @@ class NeuronPlatform(Platform):
                 f"multiple DP ranks to function."
             )
 
+    @staticmethod
+    def _dcp_kv_cache_heads(model_config) -> int:
+        """Return the KV heads one token holds in the cache, the count DCP replicates.
+
+        A multi-head latent attention model (``kv_lora_rank`` set on the text
+        config) caches one compressed latent per token: one KV head at every
+        tensor-parallel degree. Its ``num_key_value_heads`` counts the heads that
+        latent is expanded into, not heads the cache holds. vLLM reads the latent
+        head only for the model types its MLA list names, so the field is read
+        here. Every other model holds ``get_total_num_kv_heads()`` heads.
+        """
+        if getattr(model_config.hf_text_config, "kv_lora_rank", None) is not None:
+            return 1
+        return model_config.get_total_num_kv_heads()
+
     @classmethod
     def _validate_dcp_config(cls, vllm_config) -> None:
-        """Validate all constraints for decode_context_parallel_size > 1."""
+        """Validate all constraints for decode_context_parallel_size > 1.
+
+        The head rules count the KV heads the cache holds
+        (:meth:`_dcp_kv_cache_heads`) and the query heads of the text config,
+        which is the model config itself for a text-only model.
+        """
         dcp_size = vllm_config.parallel_config.decode_context_parallel_size
         if dcp_size <= 1:
             return
 
+        cls._refuse_speculative_decoding_under_dcp(vllm_config)
+
         tp_size = vllm_config.parallel_config.tensor_parallel_size
-        num_kv_heads = vllm_config.model_config.get_total_num_kv_heads()
-        num_q_heads = vllm_config.model_config.hf_config.num_attention_heads
+        model_config = vllm_config.model_config
+        num_kv_heads = cls._dcp_kv_cache_heads(model_config)
+        num_q_heads = model_config.hf_text_config.num_attention_heads
 
         block_size = vllm_config.cache_config.block_size
         long_prefill_token_threshold = (
@@ -1144,6 +1167,30 @@ class NeuronPlatform(Platform):
                 "sequence across more DCP ranks for long-context workloads.",
                 tp_size,
                 num_q_heads,
+            )
+
+    @classmethod
+    def _refuse_speculative_decoding_under_dcp(cls, vllm_config) -> None:
+        """Refuse speculative decoding at decode_context_parallel_size > 1.
+
+        The DCP partial-attention kernel entry refuses more than one query row
+        per request, and a verify step carries ``1 + num_speculative_tokens``
+        rows. The multi-row DCP attention entry (item 5a, T > 1 follow-up)
+        lifts this refusal. Callers check ``dcp_size > 1`` first.
+        """
+        speculative_config = vllm_config.speculative_config
+        if speculative_config is None:
+            return
+        num_speculative_tokens = speculative_config.num_speculative_tokens
+        if num_speculative_tokens > 0:
+            raise ValueError(
+                "Speculative decoding is not supported with "
+                "decode_context_parallel_size > 1 "
+                f"(dcp={vllm_config.parallel_config.decode_context_parallel_size}, "
+                f"num_speculative_tokens={num_speculative_tokens}): "
+                "spec decode under DCP (item 5a T > 1 follow-up) is not "
+                "implemented. Disable speculative decoding or set "
+                "decode_context_parallel_size=1."
             )
 
     @classmethod

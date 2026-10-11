@@ -93,6 +93,7 @@ def test_the_live_set_of_a_speculative_runner_is_as_deep_as_the_helper_says(help
         max_model_len=MAX_SEQ_LEN,
         max_num_reqs=SLOTS,
         _glm5next_request_slot_capacity=lambda banks: SLOTS,
+        _glm5next_indexer_context=lambda: MAX_SEQ_LEN,
         # The class's own allocator and depth helpers, bound to the stub.
         _glm5next_side_caches=NeuronModelRunner._glm5next_side_caches,
         _glm5next_indexer_ring_rows=NeuronModelRunner._glm5next_indexer_ring_rows,

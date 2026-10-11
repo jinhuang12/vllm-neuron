@@ -287,6 +287,49 @@ def _tp_group_if_initialized() -> GroupCoordinator | None:
     return _resolve_tp_group()
 
 
+def _resolve_dcp_size() -> int | None:
+    """Ranks in this rank's decode-context-parallel (DCP) group, or None when unknown.
+
+    The value the DSA indexer and attention bind in the constructor and again in
+    ``prepare_projection_weights``, so the one they hold is this function's at the
+    later of the two: 1 at a world size of one, and vllm's
+    ``get_dcp_group().world_size`` at any larger world, with no other source. vllm
+    builds that group in the same ``initialize_model_parallel`` call as the
+    tensor-parallel group, so it exists whenever ``model_parallel_is_initialized``
+    holds. A larger world without that state (a class built before it exists, or one
+    rank loaded out of process, as the shard tests do) reads None, which a forward
+    refuses by name (:func:`_require_bound_dcp_size`) rather than serving as 1. A
+    single-rank process never imports vllm here. The value is the same on every rank.
+    """
+    if _resolve_world_size() <= 1:
+        return 1
+    from vllm.distributed.parallel_state import (
+        get_dcp_group,
+        model_parallel_is_initialized,
+    )
+
+    if not model_parallel_is_initialized():
+        return None
+    return int(get_dcp_group().world_size)
+
+
+def _require_bound_dcp_size(module: nn.Module, error: type[ValueError]) -> None:
+    """Refuse a forward of ``module`` whose ``dcp_size`` is not bound.
+
+    ``dcp_size`` is None only at a world size above one while vllm's model-parallel
+    state is missing (:func:`_resolve_dcp_size`). Served as 1, it would trace the
+    single-rank path and drop the DCP owner gating, so the forward refuses instead. The
+    test reads a python value bound outside the trace and adds no graph node.
+    """
+    if module.dcp_size is None:
+        raise error(
+            f"{type(module).__name__}.dcp_size is unbound: "
+            f"prepare_projection_weights() binds it at load from vllm's "
+            f"decode-context-parallel group, and either it has not run or vllm's "
+            f"model-parallel state did not exist when it ran"
+        )
+
+
 # --------------------------------------------------------------------------- #
 # which parameter families are sharded, and on which dim.
 #
@@ -2295,7 +2338,9 @@ class Glm5NextSharedExperts(nn.Module):
         operand inside the per-forward path costs 128 device writes per
         projection at this dense geometry. A block scale is a weight-loader
         product that never changes after a load, so the operand it implies is
-        built here, once, and held on this module.
+        built here, once, and held on this module. Only the three-call fallback
+        of :func:`~vllm_neuron.functional.blockwise_fp8_mm.blockwise_fp8_mlp`
+        reads them; the served shapes run its fused kernels on the public grids.
 
         The argument list mirrors :meth:`shared_expert_mm`'s own -- same operands,
         same order -- because the two methods consume the same things and a
@@ -2316,47 +2361,25 @@ class Glm5NextSharedExperts(nn.Module):
         Raises:
             Glm5NextSharedExpertRouteError: if an operand is missing or a weight
                 is not 2-D. The grid's own agreement with the weight extents is
-                checked by ``to_kernel_scale_layout`` below rather than here, so
-                there is one authority for it and not two that can drift.
+                checked by ``to_kernel_scale_layout`` rather than here, so there
+                is one authority for it and not two that can drift.
 
         The extents come from the weights and not from the grid's own shape:
         deriving them from the grid would make this method unable to detect a
         transposed grid, because the kernel's replacement check pins only the
         element count.
-        """
-        from vllm_neuron.functional.blockwise_fp8_mm import to_kernel_scale_layout
 
-        prepared: dict[str, torch.Tensor] = {}
-        for name, weight, scale in (
-            ("gate_proj", gate_proj_weight, gate_proj_scale),
-            ("up_proj", up_proj_weight, up_proj_scale),
-            ("down_proj", down_proj_weight, down_proj_scale),
-        ):
-            if weight is None or scale is None:
-                raise Glm5NextSharedExpertRouteError(
-                    f"prepare_scale_operands needs both {name}_weight and "
-                    f"{name}_scale; load the checkpoint before preparing the "
-                    f"scale operands"
-                )
-            if weight.dim() != 2:
-                raise Glm5NextSharedExpertRouteError(
-                    f"{name}_weight must be 2-D to give the scale operand its "
-                    f"extents, got shape {tuple(weight.shape)}"
-                )
-            rows, cols = int(weight.shape[0]), int(weight.shape[1])
-            # The producer runs on a host copy and its result moves back once, the
-            # same rule the routed bank's prep follows. ``to_kernel_scale_layout``
-            # broadcasts the flat grid across the partition axis with
-            # ``expand(...).contiguous()``, and the Neuron backend has no strided
-            # copy to make that dense, so on a device-resident grid it raises
-            # ``Expected self.is_contiguous() to be true, but got false``. Nothing
-            # about the operand changes: the grid check it performs is on shapes,
-            # which the copy preserves.
-            (host_scale,) = _on_the_host(scale)
-            (operand,) = _on_the_device(
-                scale.device, to_kernel_scale_layout(host_scale, rows, cols)
-            )
-            prepared[name] = operand
+        The body is :func:`_build_scale_operands`, which the dense MLP's prep
+        shares.
+        """
+        prepared = _build_scale_operands(
+            Glm5NextSharedExpertRouteError,
+            (
+                ("gate_proj", gate_proj_weight, gate_proj_scale),
+                ("up_proj", up_proj_weight, up_proj_scale),
+                ("down_proj", down_proj_weight, down_proj_scale),
+            ),
+        )
         setattr(self, self.PREPARED_SCALE_OPERANDS_ATTR, prepared)
         return len(prepared)
 
@@ -2391,9 +2414,11 @@ class Glm5NextSharedExperts(nn.Module):
         The SwiGLU the checkpoint stores, which clamps both projections before the
         product: ``down(silu(min(gate(x), L)) * clip(up(x), -L, L))``, where ``L``
         is ``self.swiglu_limit``, the checkpoint's own bound resolved from the
-        config when this object was built. Each of the three projections is a
-        separate entry into
-        :func:`~vllm_neuron.functional.blockwise_fp8_mm.blockwise_fp8_mm`.
+        config when this object was built. The whole MLP is one call of
+        :func:`~vllm_neuron.functional.blockwise_fp8_mm.blockwise_fp8_mlp`: one
+        NKI kernel for a short step and one for whole-tile prefill, or its three
+        :func:`~vllm_neuron.functional.blockwise_fp8_mm.blockwise_fp8_mm` calls
+        where neither kernel applies.
 
         Args:
             hidden_states: ``[T, H]`` activations, ``bfloat16``. ``T`` may be any
@@ -2496,8 +2521,9 @@ class Glm5NextSharedExperts(nn.Module):
         # down. The clamp bound is ``self.swiglu_limit`` (``text_config``), the
         # gate clamped above only and up on both sides, as the reference does; the
         # SwiGLU product is cast to the activation dtype before down, as before.
-        # ``1 <= T < 128`` runs one small-M NKI kernel; whole-tile prefill keeps
-        # the three ``blockwise_fp8_mm`` calls, which take the prebuilt operands.
+        # ``1 <= T < 128`` runs one small-M NKI kernel and whole-tile prefill one
+        # prefill NKI kernel, both on the public grids; the prebuilt operands
+        # serve the three ``blockwise_fp8_mm`` calls of the fallback alone.
         return _unpad_rows(
             blockwise_fp8_mlp(
                 hidden_states,
@@ -2896,6 +2922,19 @@ class Glm5NextDenseMLP(nn.Module):
     #: finds a record knows which module wrote it.
     DENSE_RETILE_HEALTH_ATTR = "_dense_mlp_retile_health"
 
+    #: Where :meth:`prepare_scale_operands` leaves its three operands, under the
+    #: name the shared expert uses for the same three.
+    PREPARED_SCALE_OPERANDS_ATTR = "_prepared_scale_operands"
+
+    #: The projections with a kernel scale operand, in the order
+    #: ``blockwise_fp8_mlp`` takes them.
+    SCALE_OPERAND_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
+
+    #: Nothing: :meth:`forward` still reads the weights and the public grids (the
+    #: small-M decode kernel takes the grids directly), so the load releases no
+    #: tensor of this class.
+    RELEASED_AFTER_PREP: tuple[str, ...] = ()
+
     def retile_checkpoint_scale_grids(self) -> int:
         """Publish this module's grids at the kernel's granularity and set the frame.
 
@@ -2926,17 +2965,89 @@ class Glm5NextDenseMLP(nn.Module):
             self, Glm5NextDenseMLPRouteError, self.DENSE_RETILE_HEALTH_ATTR
         )
 
+    def prepare_scale_operands(
+        self,
+        gate_proj_weight: torch.Tensor,
+        up_proj_weight: torch.Tensor,
+        down_proj_weight: torch.Tensor,
+        gate_proj_scale: torch.Tensor,
+        up_proj_scale: torch.Tensor,
+        down_proj_scale: torch.Tensor,
+    ) -> int:
+        """Build the three kernel scale operands once. Returns how many.
+
+        Without them each three-call :meth:`forward` would build every operand
+        from its grid inside the traced graph, one scalar write per ``128``
+        block: 192 writes per call at the served geometry. The grids
+        never change after a load, so the operands are built here, once, by the
+        shared expert's own builder, :func:`_build_scale_operands`; their bytes
+        are those of the per-call build. ``_run_load_time_preps`` enrols this
+        method by ``hasattr`` and passes the operands by keyword, after
+        :meth:`retile_checkpoint_scale_grids` has put them in the frame
+        :meth:`forward` consumes. Only the three-call fallback of
+        :func:`~vllm_neuron.functional.blockwise_fp8_mm.blockwise_fp8_mlp` reads
+        them: at the served shapes a short step runs its small-M kernel and a
+        whole-tile prefill its prefill kernel, both on the public grids.
+
+        Args:
+            gate_proj_weight: ``[H, I]`` fp8-e4m3. Read for its extents only.
+            up_proj_weight: ``[H, I]`` fp8-e4m3.
+            down_proj_weight: ``[I, H]`` fp8-e4m3.
+            gate_proj_scale: ``[H//128, I//128]`` fp32, the published grid.
+            up_proj_scale: the same, for ``up_proj_weight``.
+            down_proj_scale: ``[I//128, H//128]`` fp32, for ``down_proj_weight``.
+
+        Returns:
+            How many operands were built: ``3``, or ``0`` on a miniature whose
+            extents are not whole ``128`` blocks. Such a module has no kernel
+            operand to build -- :meth:`retile_checkpoint_scale_grids` leaves it as
+            loaded and ``blockwise_fp8_mm`` refuses its whole-tile geometry -- so
+            nothing is stored and only a short step can run it.
+
+        Raises:
+            Glm5NextDenseMLPRouteError: if an operand is missing or a weight is
+                not 2-D.
+        """
+        from vllm_neuron.functional.blockwise_fp8_mm import SCALE_BLOCK_SIZE
+
+        projections = tuple(
+            zip(
+                self.SCALE_OPERAND_PROJECTIONS,
+                (gate_proj_weight, up_proj_weight, down_proj_weight),
+                (gate_proj_scale, up_proj_scale, down_proj_scale),
+            )
+        )
+        if any(
+            weight is not None
+            and weight.dim() == 2
+            and any(int(extent) % SCALE_BLOCK_SIZE for extent in weight.shape)
+            for _, weight, _ in projections
+        ):
+            return 0
+        prepared = _build_scale_operands(Glm5NextDenseMLPRouteError, projections)
+        setattr(self, self.PREPARED_SCALE_OPERANDS_ATTR, prepared)
+        return len(prepared)
+
+    def _prebuilt_scale_operands(self) -> tuple[torch.Tensor, ...] | None:
+        """The operands :meth:`prepare_scale_operands` built, or ``None``.
+
+        ``None`` when it stored none: a module bound without the load path (a
+        fixture that sets the weights itself) or a miniature whose extents are
+        not whole ``128`` blocks. ``blockwise_fp8_mm`` then builds each operand
+        inside the call, as it did before this prep existed, and counts each
+        build it traces
+        (:func:`~vllm_neuron.functional.blockwise_fp8_mm.scale_layout_builds`),
+        so a load that skipped the prep reads non-zero there.
+        """
+        prepared = getattr(self, self.PREPARED_SCALE_OPERANDS_ATTR, None)
+        if not prepared:
+            return None
+        return tuple(prepared[name] for name in self.SCALE_OPERAND_PROJECTIONS)
+
     # The shared expert's ``shared_expert_mm`` is the same arithmetic on the same
     # kernel, and it is not called from here because it reads that class's prepared
-    # scale operands off ``self`` and this class has no prep. Reaching into it
-    # would either move that method or bind this forward to another module's
-    # instance state.
-    #
-    # ``blockwise_fp8_mm``'s ``prebuilt_scale_t`` is optional and keyword-only, so
-    # omitting it makes the call behave exactly as it did before the load-time prep
-    # existed. ``_run_load_time_preps`` reaches a prep through
-    # ``hasattr(type(module), "prepare_scale_operands")``, a per-class opt-in this
-    # class does not take: adding it would change what the load path does.
+    # scale operands off ``self``. Reaching into it would either move that method or
+    # bind this forward to another module's instance state.
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -2947,11 +3058,13 @@ class Glm5NextDenseMLP(nn.Module):
 
         ``down(silu(min(gate(x), L)) * clip(up(x), -L, L))``, where ``L`` is
         ``self.swiglu_limit``, the checkpoint's own bound resolved from the config
-        when this object was built. Each of the three projections is a separate
-        entry into
-        :func:`~vllm_neuron.functional.blockwise_fp8_mm.blockwise_fp8_mm`, the
+        when this object was built. The whole MLP is one call of
+        :func:`~vllm_neuron.functional.blockwise_fp8_mm.blockwise_fp8_mlp`, the
         dense blockwise route this fork uses for the dense MLP and the shared
-        expert alike.
+        expert alike: one NKI kernel for a short step and one for whole-tile
+        prefill, or its three
+        :func:`~vllm_neuron.functional.blockwise_fp8_mm.blockwise_fp8_mm` calls
+        where neither kernel applies.
 
         The weights must arrive in the frame the kernel multiplies in -- gate and
         up ``[H, I]``, down ``[I, H]``, each with its ``128`` grid beside it --
@@ -3062,8 +3175,14 @@ class Glm5NextDenseMLP(nn.Module):
 
         # ---- One fused call: gate, up, the checkpoint's clamps (gate above only,
         # up on both sides), SwiGLU, the bf16 cast and down. ``1 <= T < 128`` runs
-        # one small-M NKI kernel; whole-tile prefill keeps the three
-        # ``blockwise_fp8_mm`` calls. The slice back is the last thing that happens.
+        # one small-M NKI kernel on the public grids, and passes nothing else, as
+        # it did before the load-time prep existed; whole-tile prefill runs one
+        # prefill NKI kernel on the public grids, and the prebuilt operands it is
+        # passed serve the three ``blockwise_fp8_mm`` calls of the fallback alone.
+        # The slice back is the last thing that happens.
+        prebuilt_scale_t = None
+        if int(hidden_states.shape[0]) >= TILE_SIZE:
+            prebuilt_scale_t = self._prebuilt_scale_operands()
         return _unpad_rows(
             blockwise_fp8_mlp(
                 hidden_states,
@@ -3074,6 +3193,7 @@ class Glm5NextDenseMLP(nn.Module):
                 scale_grid("up_proj_weight"),
                 scale_grid("down_proj_weight"),
                 swiglu_limit=self.swiglu_limit,
+                prebuilt_scale_t=prebuilt_scale_t,
             ),
             tokens,
         )
@@ -4407,6 +4527,15 @@ class Glm5NextDSAIndexer(nn.Module):
         self.index_kpool_always_select_tail = bool(
             text_config.index_kpool_always_select_tail
         )
+        # Ranks in this rank's decode-context-parallel group, from
+        # :func:`_resolve_dcp_size`: 1 at one rank, None at a larger world until vllm's
+        # parallel state exists, which may be after this constructor, so
+        # :meth:`prepare_projection_weights` binds it again; a forward refuses None
+        # (:func:`_require_bound_dcp_size`). A plain attribute and not a property,
+        # because dynamo guards a property read in the traced forward on the class and
+        # then checks this module's whole guard subtree on every call, where an
+        # attribute keeps the module a tag-safe root.
+        self.dcp_size = _resolve_dcp_size()
 
         # The weight map's seven, in its own order: the four scaled projections,
         # then ``k_norm_bias``, then the two bare compress tensors.
@@ -4505,6 +4634,10 @@ class Glm5NextDSAIndexer(nn.Module):
             {name: getattr(self, self.PROJECTION_PARAMETERS[name])
              for name, _, _ in self.projection_widths()}, {}))
         self._bind_shard_rank(prepared["wq_b"].device)
+        # Bound here for the reason :meth:`_bind_shard_rank` gives: preparation runs
+        # once per rank at load, after the parallel state exists, outside any trace.
+        # :func:`_resolve_dcp_size` states the value this holds from here on.
+        self.dcp_size = _resolve_dcp_size()
         return len(prepared)
 
     def _bind_shard_rank(self, device: torch.device) -> None:
@@ -4539,6 +4672,42 @@ class Glm5NextDSAIndexer(nn.Module):
             self.SHARD_RANK_ATTR,
             torch.full((1,), index, dtype=torch.int32, device=device),
         )
+
+    def _dcp_owned_position(
+        self, position: torch.Tensor, block_size: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Under DCP: each decode position's row on its owner, and whether this rank owns it.
+
+        Returns ``(local, owned)`` in ``position``'s shape: ``local`` is int64, the
+        position's row in its owner's local store
+        (:func:`~vllm_neuron.utils.dcp_ownership.token_local_row`), and ``owned`` is
+        bool, true where this rank is the owner. ``index_kpool`` divides
+        ``block_size`` (refused otherwise), so ``local`` closes a pool exactly where
+        ``position`` does, and that pool's id on its owner is ``local // index_kpool``.
+
+        This rank is ``tp_rank % dcp_size``, the runner's ``cp_rank``, computed on
+        device from the tensor-parallel index :meth:`_bind_shard_rank` binds at load:
+        a tensor, so one graph serves every rank of the group.
+        """
+        from vllm_neuron.utils.dcp_ownership import (
+            pools_per_block,
+            token_local_row,
+            token_owner,
+        )
+
+        pools_per_block(block_size=int(block_size), index_kpool=self.index_kpool)
+        rank = getattr(self, self.SHARD_RANK_ATTR, None)
+        if rank is None:
+            raise Glm5NextDSAIndexerError(
+                f"decode_context_parallel_size={self.dcp_size} gates the pooled-key "
+                f"write by owner, which needs this rank's tensor-parallel index; it is "
+                f"bound at load by prepare_projection_weights, which has not run"
+            )
+        dcp_size = self.dcp_size
+        at = position.to(torch.int64)
+        local = token_local_row(at, block_size=int(block_size), dcp_size=dcp_size)
+        owner = token_owner(at, block_size=int(block_size), dcp_size=dcp_size)
+        return local, owner == torch.remainder(rank.to(torch.int64), dcp_size)
 
     def _lowp_operand(self, name: str):
         """``(weight, scale)`` for the low-precision route, or None for the fp32 one."""
@@ -5658,6 +5827,7 @@ class Glm5NextDSAIndexer(nn.Module):
         from vllm_neuron.functional.dsa.decode_tail_update import decode_pool_address
 
         self.require_dials()
+        _require_bound_dcp_size(self, Glm5NextDSAIndexerError)
 
         pool = self.index_kpool
         candidates, trash, selects = self._require_serviceable(
@@ -5668,6 +5838,13 @@ class Glm5NextDSAIndexer(nn.Module):
             raise Glm5NextDSAIndexerError(
                 "the decode leg needs both tail and position; got a tail with "
                 "no position"
+            )
+        if is_decode and self.dcp_size > 1 and not torch.is_tensor(position):
+            raise Glm5NextDSAIndexerError(
+                f"decode_context_parallel_size={self.dcp_size} gates the pooled-key "
+                f"write by owner on device, so the decode position must be a tensor, "
+                f"as the runner hands it; a python int position is the eager "
+                f"single-rank route"
             )
         if not is_decode and slot_mapping is None:
             raise Glm5NextDSAIndexerError(
@@ -5704,9 +5881,20 @@ class Glm5NextDSAIndexer(nn.Module):
                 # branches below, for the same reason: a write the graph performs at
                 # every position beats a write whose existence was decided when the
                 # graph was captured.
-                pool_index, completes = decode_pool_address(
-                    position, pool, pool_cache.device
-                )
+                if self.dcp_size > 1:
+                    # Under DCP the pool is its block owner's to store, at its local
+                    # id; on every other rank the write lands on the trash row. The
+                    # ring above stays replicated. ``page_size`` is the latent bank's
+                    # block, the DCP interleave (Glm5NextMLAAttention.forward).
+                    local, owned = self._dcp_owned_position(position, int(page_size))
+                    pool_index, completes = decode_pool_address(
+                        local, pool, pool_cache.device
+                    )
+                    completes = completes & owned
+                else:
+                    pool_index, completes = decode_pool_address(
+                        position, pool, pool_cache.device
+                    )
                 # ``new_full`` and not ``torch.tensor``: a tensor built from python data
                 # stays real while the rest of the trace is fake, and graph extraction
                 # refuses that mix. Both pool writes below take the same form.
@@ -5773,6 +5961,7 @@ class Glm5NextDSAIndexer(nn.Module):
         max_seq_len: int,
         indices_wanted: bool = True,
         projected: tuple | None = None,
+        page_size: int | None = None,
     ) -> torch.Tensor | None:
         """:meth:`forward`'s decode leg for ``B`` requests, ``T`` tokens each, in one pass.
 
@@ -5827,6 +6016,11 @@ class Glm5NextDSAIndexer(nn.Module):
         close, which no write has landed for -- so the selection does not depend on
         when the store write lands. The one-token step at the served depth keeps
         :mod:`decode_batch`'s kernels; every other form runs the ``T``-row kernels.
+
+        ``page_size`` is the latent bank's block, the decode-context-parallel (DCP)
+        interleave, and is read only at ``dcp_size > 1``: there a closed pool is stored
+        by its block's owner at its local id, and every other rank writes the trash row
+        (:meth:`_dcp_owned_position`). The ring step stays replicated.
         """
         from vllm_neuron.functional.dsa.decode_batch import (
             decode_pool_destinations,
@@ -5842,6 +6036,7 @@ class Glm5NextDSAIndexer(nn.Module):
         from vllm_neuron.utils.neuron_utils import values_are_readable
 
         self.require_dials()
+        _require_bound_dcp_size(self, Glm5NextDSAIndexerError)
         pool, dim = self.index_kpool, self.index_head_dim
         total = int(hidden_states.shape[0])
         views = isinstance(pool_bank, (tuple, list))
@@ -5931,6 +6126,17 @@ class Glm5NextDSAIndexer(nn.Module):
                 f"seq_lens must be a [{total}] tensor, one causal length per row "
                 f"({batch} request(s) x {rows} row(s), request-major); got {seq_lens!r}"
             )
+        if self.dcp_size > 1 and page_size is None:
+            raise Glm5NextDSAIndexerError(
+                f"decode_context_parallel_size={self.dcp_size} assigns pools to ranks "
+                f"by KV block, so the decode step needs page_size, the latent bank's "
+                f"block; got none"
+            )
+        if self.dcp_size > 1 and rows > 1:
+            raise Glm5NextDSAIndexerError(
+                f"decode_context_parallel_size={self.dcp_size} stores one row per request "
+                f"(the platform refuses speculative decoding at DCP > 1); got {rows} rows"
+            )
         # Row b * rows + t sits at position[b] + t and writes through slots[b]: O(B * T)
         # index bookkeeping, no kernel. At one row per request the rows are the
         # requests, so the row positions are position and the row slots are slots; that
@@ -5981,10 +6187,21 @@ class Glm5NextDSAIndexer(nn.Module):
             pooled, rings = dsa_decode_ring_rows(
                 tail_bank, slots, key, gate_score, ape.to(torch.float32), position
             )
-        slot_index, row = decode_pool_destinations(
-            slots if rows == 1 else slots.repeat_interleave(rows), row_positions,
-            rows=int(pool_bank.shape[1]), pool_size=pool,
-        )
+        if self.dcp_size > 1:
+            # Under DCP each closed pool is its block owner's to store, at its local
+            # id; every other rank writes its trash row.
+            # One row per request here (the guard above), so row_positions == position.
+            local, owned = self._dcp_owned_position(position, int(page_size))
+            slot_index, row = decode_pool_destinations(
+                slots, local, rows=int(pool_bank.shape[1]), pool_size=pool
+            )
+            trash = torch.full_like(row, int(pool_bank.shape[1]) - 1)
+            row = torch.where(owned, row, trash)
+        else:
+            slot_index, row = decode_pool_destinations(
+                slots if rows == 1 else slots.repeat_interleave(rows), row_positions,
+                rows=int(pool_bank.shape[1]), pool_size=pool,
+            )
         bounded = None
         if selects:
             if one_token:
@@ -6304,6 +6521,10 @@ class Glm5NextMLAAttention(nn.Module):
             *(f"{leaf}_{FP8_SCALE_SUFFIX}" for leaf in DSA_SCALED_PROJECTIONS),
         )
         self.indexer = Glm5NextDSAIndexer(text_config)
+        # The decode-context-parallel group size the forward branches on, bound here
+        # and again by :meth:`prepare_projection_weights` for the reasons the
+        # indexer's constructor gives.
+        self.dcp_size = _resolve_dcp_size()
 
     # The one place this class turns heads into its heads. It sits in the class
     # preamble because both halves below read it: the projections' widths and the
@@ -6335,6 +6556,52 @@ class Glm5NextMLAAttention(nn.Module):
         needs the division here because its attribute is not.
         """
         return _per_rank(self.num_attention_heads, _resolve_world_size())
+
+    def _dcp_write_latent_then_refuse(
+        self,
+        hidden_states: torch.Tensor,
+        latent_cache: torch.Tensor,
+        latent_slots: torch.Tensor,
+        *,
+        start_position: torch.Tensor | int,
+        prefill_end_position: torch.Tensor | int | None = None,
+    ) -> None:
+        """Write this step's latent rows, then refuse the attention by name.
+
+        Called in place of :meth:`attend` at ``dcp_size > 1`` only, after the indexer
+        has stored its pooled keys. The write is :meth:`attend`'s own: one latent per
+        token at the physical bank row the runner computed, which under decode context
+        parallelism is owner-gated (a row this rank does not own goes to the null
+        block), with a padded prefill chunk's trailing rows clamped onto its last real
+        row. So every DCP write has landed on its owner and no attention kernel has
+        run.
+
+        Raises:
+            Glm5NextMLADecodeError: always, naming "DCP attention (item 2b)". A rank
+                holds only its own blocks of the latent window, so its attention is a
+                partial that needs the softmax merge across the DCP group; item 2b
+                replaces this call with that path.
+        """
+        _query, kv_latent = self.project_query_and_latent(hidden_states)
+        if prefill_end_position is not None:
+            start = _int64_scalar(start_position, latent_cache.device)
+            end = _int64_scalar(prefill_end_position, latent_cache.device)
+            offsets = torch.arange(
+                int(hidden_states.shape[0]), device=latent_cache.device
+            )
+            kv_latent = kv_latent.index_select(
+                0, torch.minimum(offsets, end - start - 1)
+            )
+        latent_cache[:, 0, :].index_copy_(
+            0, latent_slots, kv_latent.to(latent_cache.dtype)
+        )
+        raise Glm5NextMLADecodeError(
+            f"DCP attention (item 2b) is not implemented: at "
+            f"decode_context_parallel_size={self.dcp_size} this rank holds only its own "
+            f"blocks of the latent window, and attending them needs the partial-attention "
+            f"merge across the DCP group. The latent and pooled-key writes have run; use "
+            f"decode_context_parallel_size=1 until item 2b lands"
+        )
 
     # The five low-rank projections run on the ``mla_projection`` NKI kernel,
     # because both substrate candidates refuse this checkpoint's widths. Every
@@ -6476,6 +6743,9 @@ class Glm5NextMLAAttention(nn.Module):
             {name: getattr(self, f"{name}_{FP8_SCALE_SUFFIX}", None)
              for name in self.LOWP_SITES},
         ))
+        # Resolved here and not copied from the indexer: the prep walk reaches this
+        # module before its indexer, whose own binding at load has not run yet.
+        self.dcp_size = _resolve_dcp_size()
         return len(prepared)
 
     def _lowp_operand(self, name: str):
@@ -6823,6 +7093,8 @@ class Glm5NextMLAAttention(nn.Module):
         never mentions.
         """
         from vllm_neuron.functional.attention.mla_projections import (
+            mla_latent_projection,
+            mla_latent_projection_admits,
             mla_projection_prepared,
         )
 
@@ -6842,14 +7114,24 @@ class Glm5NextMLAAttention(nn.Module):
         )
         query = query.reshape(tokens, heads, widths["q_b_proj"][1] // heads)
 
-        kv_latent = mla_projection_prepared(
-            x, self._prepared_weight("kv_a_proj_with_mqa"),
-            self._lowp_operand("kv_a_proj_with_mqa"),
-        )
-        kv_latent = self._latent_norm(kv_latent, self.kv_a_layernorm_weight)
-
         out_dtype = hidden_states.dtype
-        return query.to(out_dtype), kv_latent.to(out_dtype)
+        lowp = self._lowp_operand("kv_a_proj_with_mqa")
+        if lowp is not None and mla_latent_projection_admits(x, *lowp):
+            # A prefill chunk: the projection, :meth:`_latent_norm` and the cast in one
+            # launch. The projection is the same bits; the norm runs the same fp32 steps
+            # in order, so it differs only by its square sum's summation order before
+            # the one rounding (functional/attention/mla_projections.py
+            # ``_lowp_rms_norm``).
+            kv_latent = mla_latent_projection(
+                x, *lowp, self.kv_a_layernorm_weight, self.rms_norm_eps
+            )
+        else:
+            kv_latent = mla_projection_prepared(
+                x, self._prepared_weight("kv_a_proj_with_mqa"), lowp
+            )
+            kv_latent = self._latent_norm(kv_latent, self.kv_a_layernorm_weight)
+            kv_latent = kv_latent.to(out_dtype)
+        return query.to(out_dtype), kv_latent
 
     def project_output(
         self,
@@ -7531,6 +7813,7 @@ class Glm5NextMLAAttention(nn.Module):
                 max_seq_len=bound,
                 indices_wanted=not dense,
                 projected=projected,
+                **({"page_size": int(page_size)} if self.dcp_size > 1 else {}),
             )
             if index_share is not None and topk_indices is not None:
                 # Only a selecting step has indices to share; the bypass regime's
@@ -7539,6 +7822,13 @@ class Glm5NextMLAAttention(nn.Module):
         if collector is not None:
             collector.append(
                 (self.indexer._bypass_indices(seq_lens) if dense else topk_indices)[:5]
+            )
+        if self.dcp_size > 1:
+            self._dcp_write_latent_then_refuse(
+                normed_hidden_states,
+                latent_cache,
+                latent_slots,
+                start_position=start_position,
             )
         if rows > 1:
             # Several rows per request: the batched attention whatever the batch (at
@@ -7643,6 +7933,7 @@ class Glm5NextMLAAttention(nn.Module):
             selection_is_a_no_op,
         )
 
+        _require_bound_dcp_size(self, Glm5NextMLADecodeError)
         if isinstance(tail, (tuple, list)) or state_slots is not None:
             # A decode step of several requests: one ring per request, or the whole
             # ring and pooled-store banks beside one slot per request.
@@ -7774,6 +8065,14 @@ class Glm5NextMLAAttention(nn.Module):
                 # rather than becoming a float. A shorter batch yields the rows it has.
             collector.append(
                 (self.indexer._bypass_indices(seq_lens) if no_select else topk_indices)[:5]
+            )
+        if self.dcp_size > 1:
+            self._dcp_write_latent_then_refuse(
+                normed_hidden_states,
+                latent_cache,
+                latent_slots,
+                start_position=start_position,
+                prefill_end_position=prefill_end_position,
             )
         return self.attend(
             normed_hidden_states,
@@ -7918,8 +8217,13 @@ class Glm5NextDSALayer(nn.Module):
         unchanged.
         """
 
-        def attention_half(single_stream: torch.Tensor) -> torch.Tensor:
-            normed = self._input_norm(single_stream)
+        def attention_half(
+            single_stream: torch.Tensor, normed: torch.Tensor | None = None
+        ) -> torch.Tensor:
+            # ``normed`` is the input norm the mHC site's fused kernel computed, or
+            # None: then the norm runs here.
+            if normed is None:
+                normed = self._input_norm(single_stream)
             if collector is not None:
                 # What the attention half was actually handed: the stream the
                 # hyper-connection site collapsed, and that stream normalised. The
@@ -7959,7 +8263,13 @@ class Glm5NextDSALayer(nn.Module):
         site = _mhc_attention_site(self, streams)
         if site is None:
             return hidden_states + attention_half(hidden_states)
-        return site.forward(streams, attention_half)
+        # The input norm's gain and epsilon go to the site, as the feed-forward site's
+        # do, so a fused mhc_pre computes the norm beside the collapse it reads.
+        return site.forward(
+            streams,
+            attention_half,
+            norm=(self.input_layernorm_weight, float(self.rms_norm_eps)),
+        )
 
 
 def _build_layer(
@@ -8697,6 +9007,59 @@ def _publish_compute_frame_operands(
     # whole 128-wide block but not a whole 256-wide one -- 384, for one -- now counts
     # instead of being skipped.
     return published
+
+
+def _build_scale_operands(
+    error_cls: type[ValueError],
+    projections: tuple[tuple[str, torch.Tensor | None, torch.Tensor | None], ...],
+) -> dict[str, torch.Tensor]:
+    """The kernel scale operand of each ``(name, weight, grid)``, keyed by name.
+
+    One definition for the dense MLP and the shared expert, whose
+    ``prepare_scale_operands`` build the operands of the same three projections
+    for the same kernel. Each operand is
+    :func:`~vllm_neuron.functional.blockwise_fp8_mm.to_kernel_scale_layout` of the
+    projection's public grid, the operand ``blockwise_fp8_mm`` builds on every call
+    when it is given none; built here, once, its bytes are the same.
+
+    Every operand is built before any is returned, so a refusal leaves the caller
+    nothing half-built to store.
+
+    Raises:
+        error_cls: if a weight or grid is missing, or a weight is not 2-D. The
+            grid's agreement with the weight extents is checked by
+            ``to_kernel_scale_layout``, which takes the extents from the weight.
+    """
+    from vllm_neuron.functional.blockwise_fp8_mm import to_kernel_scale_layout
+
+    prepared: dict[str, torch.Tensor] = {}
+    for name, weight, scale in projections:
+        if weight is None or scale is None:
+            raise error_cls(
+                f"prepare_scale_operands needs both {name}_weight and "
+                f"{name}_scale; load the checkpoint before preparing the "
+                f"scale operands"
+            )
+        if weight.dim() != 2:
+            raise error_cls(
+                f"{name}_weight must be 2-D to give the scale operand its "
+                f"extents, got shape {tuple(weight.shape)}"
+            )
+        rows, cols = int(weight.shape[0]), int(weight.shape[1])
+        # The producer runs on a host copy and its result moves back once, the
+        # same rule the routed bank's prep follows. ``to_kernel_scale_layout``
+        # broadcasts the flat grid across the partition axis with
+        # ``expand(...).contiguous()``, and the Neuron backend has no strided
+        # copy to make that dense, so on a device-resident grid it raises
+        # ``Expected self.is_contiguous() to be true, but got false``. Nothing
+        # about the operand changes: the grid check it performs is on shapes,
+        # which the copy preserves.
+        (host_scale,) = _on_the_host(scale)
+        (operand,) = _on_the_device(
+            scale.device, to_kernel_scale_layout(host_scale, rows, cols)
+        )
+        prepared[name] = operand
+    return prepared
 
 
 # ---------------------------------------------------------------------------
