@@ -9,6 +9,10 @@ every such pool in from the ring step's ``pooled`` rows and bounds each row at i
 length. The reference is the path it must equal: ``T`` sequential one-row
 ``decode_batch.dsa_decode_scores`` calls, each step's pool written into the bank before
 the next one scores. Same matmul shapes, so the comparison is bit for bit.
+
+The kernel also takes the query as projected and rotates it on chip
+(``rotate_query=True``): the reference is the same kernel handed the query that
+``dsa_hadamard128`` rotates, bit for bit, with no rotation kernel launched.
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ import torch
 
 from vllm_neuron.functional.dsa import decode_batch as DB
 from vllm_neuron.functional.dsa import decode_trow as TR
+from vllm_neuron.functional.dsa import kpool_hadamard as KH
 from vllm_neuron.functional.dsa.causal_bound import BOUND_FILL
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
@@ -64,15 +69,22 @@ def _sequential(query, weights, bank, slots, position, pooled, candidates):
     return out
 
 
-def _run(case, candidates, monkeypatch, lnc=None):
+def _run(case, candidates, monkeypatch, lnc=None, **options):
     if lnc is None:
         monkeypatch.delenv("NEURON_LOGICAL_NC_CONFIG", raising=False)
     else:
         monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", lnc)
     TR.reset_decode_trow_dispatch_counters()
-    out = TR.dsa_decode_scores_rows(*case, candidates=candidates, pool_size=POOL)
+    out = TR.dsa_decode_scores_rows(*case, candidates=candidates, pool_size=POOL, **options)
     assert TR.decode_trow_dispatch_counters() == (1, 0)
     return out
+
+
+def _rotated(query):
+    """``query`` as ``dsa_hadamard128`` rotates it: the form the kernel takes by default."""
+    total, heads, head_dim = query.shape
+    flat = query.reshape(total * heads, head_dim).contiguous()
+    return KH.dsa_hadamard128(flat).reshape(total, heads, head_dim)
 
 
 @pytest.fixture(autouse=True)
@@ -136,6 +148,58 @@ def test_few_heads_and_a_ragged_candidate_axis(monkeypatch):
             torch.tensor([1190, 1100], dtype=torch.int32), pooled)
     want = _sequential(*case, candidates)
     assert torch.equal(_run(case, candidates, monkeypatch), want)
+
+
+@pytest.mark.parametrize("candidates", sorted(CASES))
+@pytest.mark.parametrize("batch, rows", [(1, 1), (1, 4), (4, 1), (4, 4)])
+def test_a_projected_query_is_rotated_on_chip_as_the_rotation_kernel_rotates_it(
+        batch, rows, candidates, monkeypatch):
+    case = _case(batch, rows, candidates, seed=90 + rows + 10 * batch + candidates)
+    want = _run((_rotated(case[0]),) + case[1:], candidates, monkeypatch)
+    KH.reset_kpool_hadamard_dispatch_counters()
+    got = _run(case, candidates, monkeypatch, rotate_query=True)
+    assert KH.kpool_hadamard_dispatch_counters() == (0, 0)
+    assert torch.equal(got, want)
+
+
+def test_the_on_chip_rotation_splits_over_an_lnc2_pair(monkeypatch):
+    case = _case(4, 4, 1024, seed=91)
+    one = _run(case, 1024, monkeypatch, rotate_query=True)
+    two = _run(case, 1024, monkeypatch, lnc="2", rotate_query=True)
+    assert TR.decode_trow_route_counts()[1] == 1
+    assert torch.equal(one, two)
+
+
+@pytest.mark.parametrize("batch, rows", [(1, 4), (4, 1)])
+def test_the_oracle_rotates_a_projected_query_as_the_rotation_kernel_s_torch_path(
+        batch, rows):
+    case = _case(batch, rows, 1024, seed=92 + rows + 10 * batch)
+    total, heads, head_dim = case[0].shape
+    rotated = (case[0].float().reshape(-1, head_dim) @ KH.hadamard_matrix(head_dim).t()
+               * KH.HADAMARD_SCALE).to(torch.bfloat16).reshape(total, heads, head_dim)
+    want = TR.dsa_decode_scores_rows_torch_oracle(
+        rotated, *case[1:], candidates=1024, pool_size=POOL)
+    got = TR.dsa_decode_scores_rows_torch_oracle(
+        *case, candidates=1024, pool_size=POOL, rotate_query=True)
+    assert torch.equal(got, want)
+
+
+def test_a_query_the_rotation_does_not_fit_is_refused_by_name():
+    query, weights, bank, slots, position, pooled = _case(1, 2, 1024, seed=93)
+    narrow = (query[:, :, :64].contiguous(), weights, bank[:, :, :64].contiguous(), slots,
+              position, pooled[:, :64].contiguous())
+    with pytest.raises(TR.DecodeTrowError, match="128"):
+        TR.dsa_decode_scores_rows(*narrow, candidates=1024, pool_size=POOL,
+                                  rotate_query=True)
+
+
+def test_the_kernel_key_covers_the_rotation_constants_the_kernel_reads():
+    """The kernel's cache key is a digest over this module and ``kpool_hadamard.py``,
+    whose rotation size and scale the on-chip rotation reads: an edit to either re-keys
+    the kernel."""
+    from vllm_neuron.source_digest import source_digest
+
+    assert TR.SOURCE_DIGEST == source_digest(TR.__file__, KH.__file__)
 
 
 def test_refusals_name_the_operand():

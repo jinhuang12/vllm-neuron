@@ -14,6 +14,13 @@ slot are read once per request; each row runs the one-row kernel's matmul shapes
 The ring advance for ``T`` rows is :func:`decode_tail_update.dsa_decode_ring_rows`, whose
 ``pooled`` output (``[B * T, head_dim]``, request-major) is this kernel's ``pooled``
 operand.
+
+The query may come as projected, unrotated (``rotate_query=True``): the kernel then
+applies the indexer's rotation ``FWHT_128(q) / sqrt(128)`` itself, as one Tensor Engine
+multiply by ``H_128`` per row with the scale applied while the product leaves PSUM. Those
+are the products, the contraction axis and the single rounding of
+:func:`kpool_hadamard.dsa_hadamard128`; on the simulator the scores equal the scores of
+the query that kernel rotates, bit for bit. The step then launches no rotation kernel.
 """
 
 from __future__ import annotations
@@ -30,7 +37,13 @@ import nki.language as nl
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
+from vllm_neuron.functional.dsa import kpool_hadamard as _kpool_hadamard
 from vllm_neuron.functional.dsa.causal_bound import BOUND_FILL
+from vllm_neuron.functional.dsa.kpool_hadamard import (
+    HADAMARD_SCALE,
+    INDEX_HEAD_DIM,
+    hadamard_matrix,
+)
 from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 from vllm_neuron.source_digest import source_digest
 from vllm_neuron.utils.neuron_utils import can_run_kernel, values_are_readable
@@ -47,8 +60,9 @@ tiles share one."""
 _LINE = 8
 """Elements of the one-partition line a scalar slot is read into."""
 
-SOURCE_DIGEST = source_digest(__file__)
-"""A digest of this file, passed to the kernel so the kernel cache keys on its source."""
+SOURCE_DIGEST = source_digest(__file__, _kpool_hadamard.__file__)
+"""A digest of this file and of ``kpool_hadamard.py`` (whose rotation size and scale the
+on-chip rotation reads), passed to the kernel so the kernel cache keys on both."""
 
 
 class DecodeTrowError(ValueError):
@@ -139,15 +153,44 @@ def _log2(value):
     return shift
 
 
+def _hadamard_signs(dtype):
+    """``H_128`` in ``dtype`` on chip: entry ``(i, j)`` is ``(-1) ** popcount(i & j)``.
+
+    That is the Sylvester matrix :func:`kpool_hadamard.hadamard_matrix` builds by
+    doubling (symmetric, every entry ``+-1``, exact in any float dtype). The parity of the
+    seven bits of ``i & j`` folds in three shift-and-xor steps, so the matrix costs a few
+    element passes rather than a butterfly over the identity.
+    """
+    size = INDEX_HEAD_DIM
+    row_i = _sb((size, size), nl.int32)
+    nisa.iota(dst=row_i, pattern=[[0, size]], offset=0, channel_multiplier=1)
+    col_i = _sb((size, size), nl.int32)
+    nisa.iota(dst=col_i, pattern=[[1, size]], offset=0, channel_multiplier=0)
+    bits = _sb((size, size), nl.int32)
+    nisa.tensor_tensor(dst=bits, data1=row_i, data2=col_i, op=nl.bitwise_and)
+    for shift in (4, 2, 1):
+        half = _sb((size, size), nl.int32)
+        nisa.tensor_scalar(dst=half, data=bits, op0=nl.right_shift, operand0=shift)
+        nisa.tensor_tensor(dst=bits, data1=bits, data2=half, op=nl.bitwise_xor)
+    nisa.tensor_scalar(dst=bits, data=bits, op0=nl.bitwise_and, operand0=1)
+    odd = _sb((size, size), nl.float32)
+    nisa.tensor_copy(dst=odd, src=bits)
+    signs = _sb((size, size), dtype)
+    nisa.tensor_scalar(dst=signs, data=odd, op0=nl.multiply, operand0=-2.0, op1=nl.add,
+                       operand1=1.0)
+    return signs
+
+
 @nki.jit
 def dsa_decode_scores_rows_kernel(q_hbm, w_hbm, bank_hbm, slots_hbm, pos_hbm, pooled_hbm,
-                                  candidates, pool_size, rows, source_digest):
+                                  candidates, pool_size, rows, rotate, source_digest):
     """Bounded candidate scores for ``B`` requests x ``rows`` query rows, each request on
     its own slot.
 
     Args:
-        q_hbm: ``[B * rows, heads, head_dim]`` bf16, the rotated indexer queries,
-            request-major: request ``b``'s row ``t`` is row ``b * rows + t``.
+        q_hbm: ``[B * rows, heads, head_dim]`` bf16, the indexer queries, request-major:
+            request ``b``'s row ``t`` is row ``b * rows + t``. Rotated, or as projected
+            when ``rotate``.
         w_hbm: ``[B * rows, heads]`` fp32, the head weights, every scale folded in.
         bank_hbm: ``[slots, store_rows, head_dim]`` bf16, the pooled-key bank.
         slots_hbm / pos_hbm: ``[B, 1]`` int32, each request's slot and the position of
@@ -159,6 +202,8 @@ def dsa_decode_scores_rows_kernel(q_hbm, w_hbm, bank_hbm, slots_hbm, pos_hbm, po
         candidates: python int, the candidate axis (``max_seq_len // pool_size``).
         pool_size: python int, a power of two.
         rows: python int, query rows per request.
+        rotate: python bool; apply ``FWHT_128(q) / sqrt(128)`` to each query row first
+            (``head_dim`` 128 only).
         source_digest: :data:`SOURCE_DIGEST`; it only keys the kernel cache.
 
     Returns:
@@ -198,6 +243,9 @@ def dsa_decode_scores_rows_kernel(q_hbm, w_hbm, bank_hbm, slots_hbm, pos_hbm, po
                        op1=nl.add, operand1=float(pool_size))
     fill = _sb((PARTITIONS, n_tiles), nl.float32)
     nisa.memset(dst=fill, value=BOUND_FILL)
+    signs = None
+    if rotate:
+        signs = _hadamard_signs(q_hbm.dtype)
 
     n_prgs = nl.num_programs(axes=0)
     prg = nl.program_id(0)
@@ -301,6 +349,13 @@ def dsa_decode_scores_rows_kernel(q_hbm, w_hbm, bank_hbm, slots_hbm, pos_hbm, po
             nisa.nc_transpose(dst=qt_ps, data=q_f)
             q_t = _sb((head_dim, heads), q_hbm.dtype)
             nisa.tensor_copy(dst=q_t, src=qt_ps)
+            if rotate:
+                # ``q @ H`` with the head dimension contracted on the partitions, as
+                # ``dsa_hadamard128`` contracts it; scaled and rounded once on the way out.
+                rot_ps = nl.ndarray((head_dim, heads), dtype=nl.float32, buffer=nl.psum)
+                nisa.nc_matmul(dst=rot_ps, stationary=signs, moving=q_t)
+                q_t = _sb((head_dim, heads), q_hbm.dtype)
+                nisa.activation(dst=q_t, op=nl.copy, data=rot_ps, scale=HADAMARD_SCALE)
             w_rep = _sb((PARTITIONS, heads), nl.float32)
             nisa.dma_copy(dst=w_rep, src=w_hbm.ap(pattern=[[0, PARTITIONS], [1, heads]],
                                                   offset=row * heads))
@@ -374,7 +429,7 @@ def _programs(batch: int) -> int:
 
 
 def _require(query, weights, pool_bank, slots, position, pooled, candidates,
-             pool_size) -> tuple[int, int]:
+             pool_size, rotate_query) -> tuple[int, int]:
     """Check a :func:`dsa_decode_scores_rows` call; return ``(batch, rows)``."""
     if pool_bank.ndim != 3:
         raise DecodeTrowError(f"pool_bank must be [slots, rows, head_dim]; got "
@@ -414,6 +469,10 @@ def _require(query, weights, pool_bank, slots, position, pooled, candidates,
             f"rows per slot (the last row is the write trash); got {candidates}")
     if 1 <= heads and heads > PSUM_FP32:
         raise DecodeTrowError(f"heads must fit one PSUM bank ({PSUM_FP32}); got {heads}")
+    if rotate_query and head_dim != INDEX_HEAD_DIM:
+        raise DecodeTrowError(
+            f"rotate_query applies the {INDEX_HEAD_DIM}-point Hadamard rotation; the query's "
+            f"head_dim is {head_dim}")
     if values_are_readable(position):
         lo, hi = int(position.min()), int(position.max())
         if lo < 0 or hi + rows - 1 >= cands * pool:
@@ -425,11 +484,12 @@ def _require(query, weights, pool_bank, slots, position, pooled, candidates,
 
 def dsa_decode_scores_rows(query: Tensor, weights: Tensor, pool_bank: Tensor, slots: Tensor,
                            position: Tensor, pooled: Tensor, *, candidates: int,
-                           pool_size: int) -> Tensor:
+                           pool_size: int, rotate_query: bool = False) -> Tensor:
     """Bounded candidate scores for ``B`` requests x ``rows`` query rows in one launch.
 
     Args:
-        query: ``[B * rows, heads, head_dim]`` bf16, request-major.
+        query: ``[B * rows, heads, head_dim]`` bf16, request-major: rotated, or as
+            projected when ``rotate_query``.
         weights: ``[B * rows, heads]`` fp32, every scale folded in.
         pool_bank: ``[slots, store_rows, head_dim]`` bf16, read at ``slots`` only,
             candidates ``0 .. candidates - 1`` of each.
@@ -440,20 +500,23 @@ def dsa_decode_scores_rows(query: Tensor, weights: Tensor, pool_bank: Tensor, sl
         candidates: the candidate axis (``max_seq_len // pool_size``), below the bank's
             rows per slot.
         pool_size: a power of two.
+        rotate_query: the query is as projected; rotate it (``FWHT_128 / sqrt(128)``,
+            ``head_dim`` 128) before scoring, as :func:`kpool_hadamard.dsa_hadamard128`
+            would.
 
     Returns:
         ``[B * rows, candidates]`` fp32, row ``b * rows + t`` the scores of request
         ``b``'s row ``t``, ``BOUND_FILL`` past its length ``position[b] + t + 1``.
     """
     batch, rows = _require(query, weights, pool_bank, slots, position, pooled, candidates,
-                           pool_size)
+                           pool_size, rotate_query)
     usable = (can_run_kernel(query) and query.dtype == torch.bfloat16
               and pool_bank.dtype == torch.bfloat16 and pooled.dtype == torch.bfloat16)
     if not usable:
         _count_torch_fallback()
         return dsa_decode_scores_rows_torch_oracle(
             query, weights, pool_bank, slots, position, pooled, candidates=candidates,
-            pool_size=pool_size)
+            pool_size=pool_size, rotate_query=rotate_query)
     programs = _programs(batch)
     _count_dispatch(programs, batch, rows)
     call = wrap_nki(dsa_decode_scores_rows_kernel)
@@ -462,15 +525,20 @@ def dsa_decode_scores_rows(query: Tensor, weights: Tensor, pool_bank: Tensor, sl
     return call(query.contiguous(), weights.to(torch.float32).contiguous(),
                 pool_bank.contiguous(), slots.reshape(batch, 1).to(torch.int32).contiguous(),
                 position.reshape(batch, 1).to(torch.int32).contiguous(), pooled.contiguous(),
-                int(candidates), int(pool_size), rows, SOURCE_DIGEST)
+                int(candidates), int(pool_size), rows, bool(rotate_query), SOURCE_DIGEST)
 
 
 def dsa_decode_scores_rows_torch_oracle(query, weights, pool_bank, slots, position, pooled, *,
-                                        candidates, pool_size):
-    """The ``T``-row score stage in torch: gather each slot, stand in every pool this step
-    closes up to the row, score, bound at the row's own length."""
+                                        candidates, pool_size, rotate_query=False):
+    """The ``T``-row score stage in torch: rotate the query if asked (the rotation
+    kernel's torch path), gather each slot, stand in every pool this step closes up to
+    the row, score, bound at the row's own length."""
     batch, rows = _require(query, weights, pool_bank, slots, position, pooled, candidates,
-                           pool_size)
+                           pool_size, rotate_query)
+    if rotate_query:
+        total, heads, head_dim = (int(n) for n in query.shape)
+        rotated = query.float().reshape(total * heads, head_dim) @ hadamard_matrix(head_dim).t()
+        query = (rotated * HADAMARD_SCALE).to(query.dtype).reshape(total, heads, head_dim)
     cands, pool = int(candidates), int(pool_size)
     out = torch.empty(batch * rows, cands, dtype=torch.float32)
     column = torch.arange(cands)

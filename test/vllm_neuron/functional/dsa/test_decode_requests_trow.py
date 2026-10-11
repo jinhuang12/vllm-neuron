@@ -31,6 +31,11 @@ general kernel: a selecting step of one request attends by pool mask
 (``test_mla_decode_masked.py``); that step is matched to the reference at that rounding,
 banks bit for bit, and the same step in the index form (the masked kernel declined) bit
 for bit.
+
+A selecting step that scores through the ``T``-row kernel hands it the indexer's query as
+projected, and the kernel rotates it on chip; the one-token kernel is handed the query
+the rotation kernel rotates. Either way the step equals the same step with the rotation
+kernel in front of the score kernel, bit for bit.
 """
 
 from __future__ import annotations
@@ -54,6 +59,7 @@ from vllm_neuron.functional.attention import mla_decode_masked as MM
 from vllm_neuron.functional.dsa import decode_batch as DB
 from vllm_neuron.functional.dsa import decode_tail_update as TU
 from vllm_neuron.functional.dsa import decode_trow as TR
+from vllm_neuron.functional.dsa import kpool_hadamard as KH
 from vllm_neuron.functional.dsa.launch_grid import LaunchGridError
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
@@ -366,6 +372,55 @@ def test_rollback_leaves_no_rejected_state_the_next_step_reads(accepted):
         out2, spec, ops, rows, hidden=hidden2, start=start2, latent_slots=slots2,
         before=lambda clone: _sequential(clone, ops["hidden"][picked], ops["start"],
                                          ops["latent_slots"][picked], accepted, general=False))
+
+
+@contextlib.contextmanager
+def _rotation_kernel_first(seen):
+    """The ``T``-row score kernel with ``dsa_hadamard128`` in front of it: a query handed
+    as projected (``rotate_query=True``) is rotated by the rotation kernel, and the score
+    kernel takes it rotated. ``seen`` receives each call's ``rotate_query``."""
+    own = TR.dsa_decode_scores_rows
+
+    def rotated_first(query, *args, rotate_query=False, **kwargs):
+        seen.append(rotate_query)
+        if rotate_query:
+            total, heads, head_dim = query.shape
+            query = KH.dsa_hadamard128(query.reshape(total * heads, head_dim).contiguous()
+                                       ).reshape(total, heads, head_dim)
+        return own(query, *args, **kwargs)
+
+    with mock.patch.object(TR, "dsa_decode_scores_rows", rotated_first):
+        yield
+
+
+@pytest.mark.parametrize("batch, rows", [(1, 4), (4, 4), (4, 1)])
+def test_the_row_scores_rotate_the_query_on_chip(batch, rows):
+    max_seq_len, starts = REGIMES["selecting"]
+    depth = TU.ring_depth_for(int(_module().indexer.index_kpool), max(ROWS))
+    ops = _operands(batch, rows, max_seq_len, starts, depth=depth, seed=91 + batch + rows)
+    mine, ref = _cloned(ops), _cloned(ops)
+    KH.reset_kpool_hadamard_dispatch_counters()
+    out = _rows_step(mine)
+    assert KH.kpool_hadamard_dispatch_counters() == (0, 0)
+    seen = []
+    with _rotation_kernel_first(seen):
+        want = _rows_step(ref)
+    assert seen == [True]
+    assert KH.kpool_hadamard_dispatch_counters() == (1, 0)
+    assert torch.equal(out, want)
+    _assert_banks_equal(mine, ref)
+
+
+@pytest.mark.parametrize("rows", (1, 2))
+def test_the_one_token_scores_take_the_rotation_kernel_s_query(rows):
+    """At depth ``index_kpool`` one row scores through decode_batch, which takes the query
+    rotated: the step runs the rotation kernel once. Two rows rotate on chip."""
+    max_seq_len, starts = REGIMES["selecting"]
+    pool = int(_module().indexer.index_kpool)
+    ops = _operands(4, rows, max_seq_len, starts, depth=pool, seed=95 + rows)
+    KH.reset_kpool_hadamard_dispatch_counters()
+    _rows_step(ops)
+    assert KH.kpool_hadamard_dispatch_counters() == ((1, 0) if rows == 1 else (0, 0))
 
 
 def test_a_shared_selection_must_match_the_rows():

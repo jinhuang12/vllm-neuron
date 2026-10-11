@@ -4802,13 +4802,15 @@ class Glm5NextDSAIndexer(nn.Module):
 
     def project_stage(
         self, hidden_states: torch.Tensor, q_latent: torch.Tensor,
-        query_side: bool = True,
+        query_side: bool = True, *, rotate_query: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """The indexer's four projections, its key norm and its query rotation.
 
         Returns ``(query, key, weights, gate_score)``:
 
-        * ``query`` ``[tokens, index_n_heads, index_head_dim]`` bf16, rotated.
+        * ``query`` ``[tokens, index_n_heads, index_head_dim]`` bf16, rotated; as
+          projected with ``rotate_query=False``, for a caller whose score kernel
+          rotates it (:meth:`forward_requests` with ``query_rotated=False``).
         * ``key`` ``[tokens, index_head_dim]`` bf16, normalised.
         * ``weights`` ``[tokens, index_n_heads]`` float32, scale already folded.
         * ``gate_score`` ``[tokens, index_head_dim]`` bf16.
@@ -4819,7 +4821,7 @@ class Glm5NextDSAIndexer(nn.Module):
 
         Five kernel calls: four to ``mla_projection``, one per site in
         :meth:`projection_widths`, and one to ``dsa_hadamard128`` for the
-        rotation.
+        rotation (four with ``rotate_query=False``).
 
         The dtype ladder is forced by the kernels' own gates, not chosen.
         ``mla_projection`` returns float32 by contract. ``dsa_hadamard128`` and
@@ -4868,12 +4870,12 @@ class Glm5NextDSAIndexer(nn.Module):
         #    step whose selection is a no-op: nothing reads the query or the weights.
         query = weights = None
         if query_side:
-            query = project(q_latent, "wq_b")
-            query = dsa_hadamard128(
-                query.reshape(tokens * self.index_n_heads, self.index_head_dim).to(
-                    torch.bfloat16
-                )
-            ).reshape(tokens, self.index_n_heads, self.index_head_dim)
+            query = project(q_latent, "wq_b").reshape(
+                tokens * self.index_n_heads, self.index_head_dim
+            ).to(torch.bfloat16)
+            if rotate_query:
+                query = dsa_hadamard128(query)
+            query = query.reshape(tokens, self.index_n_heads, self.index_head_dim)
 
         # 2. The key, then its LayerNorm. The cast to bf16 happens before the norm
         #    so the norm's own cast-back lands on bf16, which is upstream's order:
@@ -5963,6 +5965,7 @@ class Glm5NextDSAIndexer(nn.Module):
         projected: tuple | None = None,
         page_size: int | None = None,
         pool_mask: bool = False,
+        query_rotated: bool = True,
     ) -> torch.Tensor | None:
         """:meth:`forward`'s decode leg for ``B`` requests, ``T`` tokens each, in one pass.
 
@@ -6025,6 +6028,13 @@ class Glm5NextDSAIndexer(nn.Module):
         interleave, and is read only at ``dcp_size > 1``: there a closed pool is stored
         by its block's owner at its local id, and every other rank writes the trash row
         (:meth:`_dcp_owned_position`). The ring step stays replicated.
+
+        ``query_rotated=False`` says ``projected``'s query is as projected
+        (:meth:`project_stage` with ``rotate_query=False``; the stage this method runs
+        itself when ``projected`` is None is then the same). The ``T``-row score kernel
+        rotates it on chip, so no rotation kernel runs; the one-token score kernel takes
+        it from ``dsa_hadamard128``. On the simulator the scores are the same either way,
+        bit for bit.
         """
         from vllm_neuron.functional.dsa.decode_batch import (
             decode_pool_destinations,
@@ -6036,6 +6046,7 @@ class Glm5NextDSAIndexer(nn.Module):
             max_rows_for,
         )
         from vllm_neuron.functional.dsa.decode_trow import dsa_decode_scores_rows
+        from vllm_neuron.functional.dsa.kpool_hadamard import dsa_hadamard128
         from vllm_neuron.functional.state_banks import shared_store_problem
         from vllm_neuron.utils.neuron_utils import values_are_readable
 
@@ -6184,7 +6195,8 @@ class Glm5NextDSAIndexer(nn.Module):
             )
         if projected is None:
             projected = self.project_stage(
-                hidden_states, q_latent, query_side=selects or indices_wanted
+                hidden_states, q_latent, query_side=selects or indices_wanted,
+                rotate_query=query_rotated,
             )
         query, key, weights, gate_score = projected
 
@@ -6215,6 +6227,10 @@ class Glm5NextDSAIndexer(nn.Module):
         bounded = None
         if selects:
             if one_token:
+                if not query_rotated:
+                    query = dsa_hadamard128(
+                        query.reshape(-1, dim).contiguous()
+                    ).reshape(query.shape)
                 bounded = dsa_decode_scores(
                     query, weights, pool_bank, slots, seq_lens, position, pooled,
                     candidates=candidates, pool_size=pool,
@@ -6223,6 +6239,7 @@ class Glm5NextDSAIndexer(nn.Module):
                 bounded = dsa_decode_scores_rows(
                     query, weights, pool_bank, slots, position, pooled,
                     candidates=candidates, pool_size=pool,
+                    rotate_query=not query_rotated,
                 )
         # The writes after the read: the kernel stands every pool this step closes in
         # itself, and the store rows it reads are the pools before this step. A row
@@ -7903,8 +7920,9 @@ class Glm5NextMLAAttention(nn.Module):
             selection = shared
         else:
             q_latent = self.project_query_latent(normed_hidden_states)
+            # The query as projected: the score kernel rotates it (forward_requests).
             projected = self.indexer.project_stage(
-                normed_hidden_states, q_latent, query_side=not dense
+                normed_hidden_states, q_latent, query_side=not dense, rotate_query=False
             )
             # Every request's ring step, write and selection in one indexer pass: one
             # launch per stage for the whole batch, each request on its own views. The
@@ -7921,6 +7939,7 @@ class Glm5NextMLAAttention(nn.Module):
                 indices_wanted=not dense,
                 projected=projected,
                 pool_mask=masked,
+                query_rotated=False,
                 **({"page_size": int(page_size)} if self.dcp_size > 1 else {}),
             )
             if index_share is not None and selection is not None:

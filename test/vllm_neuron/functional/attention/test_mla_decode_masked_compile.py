@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""neuronx-cc builds the masked decode attention and the selection's mask entry at the
-served shapes, and each compiled program orders every pair of instructions that touch
-the same bytes (:mod:`sbuf_order`).
+"""neuronx-cc builds the masked decode attention, the selection's mask entry and the
+``T``-row scores with the query rotated on chip at the served shapes, and each compiled
+program orders every pair of instructions that touch the same bytes (:mod:`sbuf_order`).
 
 The simulator runs a kernel body as numpy and the front-end compile
 (``test_mla_decode_frontend_compile.py``) stops before the backend, so neither sees a
@@ -16,7 +16,9 @@ every core's dump is checked:
   ``k`` in {1, 3, 5}) over the selecting bucket's 4096-row window (32 pages of 128, 1024
   pools of 4);
 * ``dsa_decode_select_mask_kernel``: the same rows, one selection each over the
-  window's 1024 candidate pools, 512 selected.
+  window's 1024 candidate pools, 512 selected;
+* ``dsa_decode_scores_rows_kernel`` with ``rotate``: the same rows and the one-row step,
+  32 heads of 128 over the same 1024 candidates.
 
 Each compile runs in a child process that sees no Neuron device node (``bwrap`` with a
 fresh ``/dev`` on a device host), as ``test_decode_ctx_cpu_compile.py`` does.
@@ -44,6 +46,8 @@ LATENT, PAGE, POOL, SELECT_K = 512, 128, 4, 512
 WINDOW_PAGES, BANK_PAGES = 32, 64
 CANDIDATES = WINDOW_PAGES * PAGE // POOL
 MASKED_ROWS = (2, 4, 6)
+SCORE_ROWS = (1, 2, 4, 6)
+HEADS, HEAD_DIM, SLOTS = 32, 128, 8
 #: The served logical core: both physical cores of an LNC2 core.
 SERVED_LNC = 2
 
@@ -65,11 +69,14 @@ def _programs(monkeypatch, kernel: str, rows: int) -> int:
     """The launch grid each kernel's host side picks at the served LNC."""
     from vllm_neuron.functional.attention import mla_decode_masked as MM
     from vllm_neuron.functional.dsa import decode_select as DS
+    from vllm_neuron.functional.dsa import decode_trow as TR
     monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", str(SERVED_LNC))
     if kernel == "masked":
         assert MM.mla_decode_masked_serves(heads=1, latent=LATENT, page=PAGE,
                                            window=WINDOW_PAGES * PAGE, rows=rows, pool=POOL)
         return MM._programs()
+    if kernel == "scores_rotated":
+        return TR._programs(1)
     return DS.decode_select_programs(rows)
 
 
@@ -99,6 +106,8 @@ def test_the_served_shapes_compile_with_every_access_ordered(monkeypatch):
     shapes = [("masked", rows, _programs(monkeypatch, "masked", rows)) for rows in MASKED_ROWS]
     shapes += [("select_mask", rows, _programs(monkeypatch, "select_mask", rows))
                for rows in MASKED_ROWS]
+    shapes += [("scores_rotated", rows, _programs(monkeypatch, "scores_rotated", rows))
+               for rows in SCORE_ROWS]
     with concurrent.futures.ThreadPoolExecutor(len(shapes)) as pool:
         results = dict(zip(shapes, pool.map(lambda s: _compile(*s), shapes)))
     bad = {}
@@ -118,6 +127,14 @@ def _arguments(kernel: str, rows: int) -> tuple:
     """``(jitted kernel, {parameter: shape and dtype or python value})`` at the served shape."""
     from vllm_neuron.functional.attention import mla_decode_masked as MM
     from vllm_neuron.functional.dsa import decode_select as DS
+    from vllm_neuron.functional.dsa import decode_trow as TR
+    if kernel == "scores_rotated":
+        return TR.dsa_decode_scores_rows_kernel, {
+            "q_hbm": ((rows, HEADS, HEAD_DIM), "bfloat16"), "w_hbm": ((rows, HEADS), "float32"),
+            "bank_hbm": ((SLOTS, CANDIDATES + 1, HEAD_DIM), "bfloat16"),
+            "slots_hbm": ((1, 1), "int32"), "pos_hbm": ((1, 1), "int32"),
+            "pooled_hbm": ((rows, HEAD_DIM), "bfloat16"), "candidates": CANDIDATES,
+            "pool_size": POOL, "rows": rows, "rotate": True, "source_digest": TR.SOURCE_DIGEST}
     if kernel == "masked":
         return MM.mla_decode_masked_kernel, {
             "q_hbm": ((rows, 1, LATENT), "bfloat16"),
