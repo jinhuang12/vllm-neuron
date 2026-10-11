@@ -14,7 +14,7 @@ float32. The untiled and latent-tiled bodies compute in fp32 throughout. The row
 body (the served geometry: K = 2176 selected columns) feeds the PE the stored 2-byte
 query and cache rows with fp32 accumulation and contracts a bf16 hi/lo split of the fp32
 probabilities (about 16 significand bits); ``VLLM_NEURON_MLA_SPARSE_FP32=1`` restores
-the fp32 arithmetic of commit 8aa22fa bit for bit.
+the fp32 arithmetic of baseline ``mla_sparse_8aa22fa`` bit for bit.
 
 The latent rides the partition axis because ``nc_matmul`` contracts that axis and
 ``nc_n_gather`` gathers within a partition, so one gather per latent tile selects K
@@ -123,7 +123,8 @@ _SENTINEL_EXP_FLOOR = 200.0
 SOURCE_DIGEST = int(hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:7], 16)
 
 #: Kill switch for the low-precision PE path of the row-tiled body: ``1`` restores the
-#: fp32 arithmetic of commit 8aa22fa bit for bit. Read at trace time, like the LNC flag.
+#: fp32 arithmetic of baseline ``mla_sparse_8aa22fa`` bit for bit. Read at trace time,
+#: like the LNC flag.
 FP32_ENV = "VLLM_NEURON_MLA_SPARSE_FP32"
 #: Per-query SBUF working sets the row-tiled body rotates through, so one query's
 #: gathers and transposes can run while the previous query's softmax and MM2 finish.
@@ -1245,8 +1246,8 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
     whatever the flag:
 
     * fp32 (``False``, and the kill switch :data:`FP32_ENV`): the gathered rows and the
-      query are widened to fp32 before the PE, as commit 8aa22fa did. Bitwise that
-      commit's output.
+      query are widened to fp32 before the PE, as baseline ``mla_sparse_8aa22fa`` did.
+      Bitwise that baseline's output.
     * low precision (``True``): MM1 contracts the stored bf16/fp16 query against the
       stored bf16/fp16 cache rows -- every product is exact, the PSUM accumulation is
       fp32, and the widening copies disappear. MM2 contracts a hi/lo split of the fp32
