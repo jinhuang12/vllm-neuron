@@ -115,16 +115,15 @@ def _sentinel_order_nki(pool_ids_hbm):
 
     Serves any width up to ``SEARCH_MAX_FREE``.
 
-    The gather must not write SBUF its sources occupy (the gather dst/src alias, hazard class (c)
-    of trn2-1's 2026-10-08 pipeline notice): the device runs ``nc_n_gather`` in pieces that each
-    read their part of ``data`` and the indices from SBUF, so a piece would read what an earlier
-    piece wrote. The backend's ``address_rotation_sb`` pass may place a tile that is born at the
-    gather on a source that dies there, and its ``tensor_copy_elim`` pass removes a plain copy,
-    so a fresh destination tile, or a fresh copy of ``ids``, is no guarantee. Here the ids and
-    their order are the two halves of one tile, loaded by DMA straight into the first half: the
-    gather reads one half of a memory location and writes the other, which no placement of that
-    location can overlap, and the tile is live from the load to the store, so it is never placed
-    on the indices, which are born and die inside that span.
+    The gather must not write SBUF its sources occupy (the gather dst/src alias hazard): the device
+    runs ``nc_n_gather`` in pieces that each read their part of ``data`` and the indices from SBUF,
+    so a piece would read what an earlier piece wrote. The backend's ``address_rotation_sb`` pass
+    may place a tile that is born at the gather on a source that dies there, and its
+    ``tensor_copy_elim`` pass removes a plain copy, so a fresh destination tile, or a fresh copy of
+    ``ids``, is no guarantee. Here the ids and their order are the two halves of one tile, loaded by
+    DMA straight into the first half: the gather reads one half of a memory location and writes the
+    other, which no placement of that location can overlap, and the tile is live from the load to
+    the store, so it is never placed on the indices, which are born and die inside that span.
     """
     rows = pool_ids_hbm.shape[0]
     k = pool_ids_hbm.shape[1]

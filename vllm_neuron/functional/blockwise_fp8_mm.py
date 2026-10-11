@@ -289,7 +289,7 @@ MLP_PREFILL_MAX_INTERMEDIATE = 256
 MLP_PREFILL_WEIGHT_DTYPE = torch.float8_e4m3fn
 
 # DMA modes, from the slice profiles. The default (software DGE) generates
-# descriptors on GpSimd at ~0.65 us per DMA and starts packets 2-3 us after
+# descriptors on GpSimd for each DMA and starts packets microseconds after
 # issue. The weights go through the Sync engine's hardware DGE ring (narrow
 # path) or as static descriptors (wide path); x and the output go as static
 # descriptors, whose trigger writes also run on Sync. The two scale-grid rows

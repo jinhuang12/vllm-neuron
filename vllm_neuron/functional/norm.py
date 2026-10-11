@@ -2,10 +2,11 @@
 """Fused RMSNorm for decode rows: one NKI call instead of a chain of fp32 glue.
 
 ``out = (x * rsqrt(mean(x**2) + eps) * gain).to(x.dtype)``, computed in fp32,
-exactly the formula of every decoder norm site at 5938748. Torch lowers that
-formula to a handful of compiler ops over one ``[1, 4096]`` row (upcast, square,
-mean, rsqrt, two multiplies, downcast), each with a fixed cost and each running
-on a single partition. The kernel spreads the row over all 128 partitions
+exactly the formula of the decoder's torch norms (``Glm5NextModel._rms_norm`` and
+the ``_input_norm`` of both layer classes). Torch lowers that formula to a handful
+of compiler ops over one ``[1, 4096]`` row (upcast, square, mean, rsqrt, two
+multiplies, downcast), each with a fixed cost and each running on a single
+partition. The kernel spreads the row over all 128 partitions
 (``h = p * (H // 128) + j``), so every op touches ``H // 128`` elements per
 partition, and the cross-partition sum is one Tensor Engine matmul by ones.
 
@@ -15,9 +16,9 @@ instructions long and an LNC2 split would only add a cross-core handoff.
 
 Not wired into the decoder (measured, ``test/hardware/benchmark_dense_decode.py``):
 as a standalone call it does not beat the compiler's lowering of the same formula
-at decode rows. A bare NKI copy kernel of the same ``[1, 4096]`` row already costs
-~5.5 us per call in a chain, about what the compiler spends on the whole norm, so
-a norm only pays as a stage inside a neighbouring kernel.
+at decode rows. A bare NKI copy kernel of the same ``[1, 4096]`` row already costs,
+per call in a chain, about what the compiler spends on the whole norm, so a norm
+only pays as a stage inside a neighbouring kernel.
 """
 
 from __future__ import annotations
@@ -147,7 +148,7 @@ def _count_torch() -> None:
 
 
 def rms_norm_torch(hidden_states: Tensor, gain: Tensor, eps: float) -> Tensor:
-    """The 5938748 formula, unchanged: fp32 interior, cast back at the end."""
+    """The decoder's torch RMSNorm, unchanged: fp32 interior, cast back at the end."""
     x = hidden_states.to(torch.float32)
     variance = x.pow(2).mean(dim=-1, keepdim=True)
     normed = x * torch.rsqrt(variance + eps)

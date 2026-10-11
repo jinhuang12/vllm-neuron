@@ -36,8 +36,8 @@ TOKEN_TILE = 128
 
 #: Hidden elements per gathered row piece. 4096 fp32 elements are 16 KB per partition,
 #: so one DMA moves 2 MB, and a tile's eight slot buffers and its accumulator fit SBUF
-#: together. Measured at T=1024, K=8, H=4096 on one LNC2 core: 0.46 ms, against
-#: 0.48 ms at 2048 and 0.63 ms for the torch gather.
+#: together. Measured at T=1024, K=8, H=4096 on one LNC2 core: faster than 2048
+#: elements per piece and than the torch gather.
 HIDDEN_TILE = 4096
 
 #: int32 elements per 32-byte line. Each index tile is one whole line wide and uses

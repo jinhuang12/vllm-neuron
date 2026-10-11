@@ -47,9 +47,9 @@ import nki.language as nl
 PARTITION_MAX = 128
 
 #: Output columns per tile, at most. Measured on trn2 at the served ``[1, 384, 1,
-#: 2051]`` call: one 1024-column tile per program costs 21.0 us a call, 512-column
-#: tiles 18.3 us, because the first tile's passes start while later tiles load.
-#: Narrower tiles add per-instruction overhead (342 columns: 19.4 us).
+#: 2051]`` call: 512-column tiles are faster than one 1024-column tile per program,
+#: because the first tile's passes start while later tiles load. Narrower tiles add
+#: per-instruction overhead.
 COL_TILE = 512
 
 #: Input columns one tile's window may span per partition, ``(cn - 1) * stride_w +
