@@ -70,6 +70,14 @@ the kernel and that the compiled-program ordering check does not see, so a model
 
 Both physical cores of an LNC2 core split the requests (``[2]`` grid at ``B >= 2``).
 
+Decode context parallelism (DCP): each rank of a group selects over its own pools, and the
+group merges the ranks' lists (trn2-2's item 3). :func:`dsa_decode_select_pools` is this
+selection with, beside the tokens, the local top-``k`` before the expansion: the selected
+pool ids in ascending order and their scores, the pads (:data:`POOL_PAD_ID`,
+:data:`POOL_PAD_VALUE`) after them. The ids are local; the DCP ownership map
+(``vllm_neuron.utils.dcp_ownership``) maps them to the global pool axis and the merged ids
+back to the rank's own bank rows.
+
 Dispatches count in ``decode_batch``'s family (``decode_batch_dispatch_counters`` and the
 fourth entry of ``decode_batch_route_counts``): this is the batched decode indexer's third
 stage, after that module's ring step and scores.
@@ -144,6 +152,14 @@ MAX_SELECT_CANDIDATES = PARTITIONS * FOLD_COLUMNS_LIMIT
 #: device results are not yet trusted (module docstring); the runner refuses a
 #: ``max_model_len`` past it (:func:`check_decode_index_context`).
 MAX_DECODE_INDEX_CANDIDATES = WHOLE_ROW_COLUMNS
+#: What a row of :func:`dsa_decode_select_pools`' local top-``k`` holds past its real
+#: entries, beside the id :data:`POOL_PAD_ID`: the causal sentinel value, ``BOUND_FILL``
+#: (-1.0e30), which the score kernel writes at every pool that is not complete. Every real
+#: entry is above :data:`BOUND_FILL_MARK`, so a pad ranks after every real entry in the
+#: merge whatever its tie rule.
+POOL_PAD_VALUE = BOUND_FILL
+#: The pool id of a pad entry: the selection's ``SENTINEL`` (-1).
+POOL_PAD_ID = SENTINEL
 #: fp32 columns of a ``[P, 1]`` scratch tile: one whole 32-byte line.
 _LINE = 8
 #: The sign bit as an int32. Every immediate here is a power of two or ``-1``, so it is
@@ -502,11 +518,75 @@ def _compact_segments(mask_hbm, ids_hbm, zeros_hbm, r0, n, width, select_k):
                      0, False)
 
 
-def _select_tile(bounded_hbm, lens_hbm, out_hbm, mask_hbm, ids_hbm, zeros_hbm, tok_hbm,
-                 r0, n, select_k, pool_size, out_cols, fold_cap):
-    """Requests ``r0 .. r0 + n - 1``: select, compact, expand."""
+def _rows_past_pad(tile, hbm, row0, m, cols):
+    """:func:`_gpsimd_copy` of the first ``cols`` columns of rows ``row0 .. row0 + m - 1``
+    of ``hbm`` into columns ``[1, cols + 1)`` of partitions ``0, 16, .., 16 (m - 1)`` of
+    ``tile``, past its column 0."""
+    row_cols = hbm.shape[1]
+    for i in range(m):
+        part = GPSIMD_STRIDE * i
+        _dma(tile[part:part + 1, 1:cols + 1],
+             hbm.ap(pattern=[[row_cols, 1], [1, cols]], offset=(row0 + i) * row_cols), True)
+
+
+def _compact_pool_rows(mask_hbm, bounded_hbm, ids_hbm, values_hbm, r0, n, span, select_k):
+    """:func:`_compact_whole_rows` with each id's score read beside it: requests ``r0 .. r0 +
+    n - 1``' ids to ``ids_hbm`` (ascending, :data:`POOL_PAD_ID` after them) and their scores
+    to ``values_hbm`` (:data:`POOL_PAD_VALUE` after them).
+
+    The mask rows come into columns ``1 .. span`` of a tile whose column 0 holds
+    :data:`POOL_PAD_VALUE`, and the compaction writes the ids out as it finds them, a pad
+    as :data:`POOL_PAD_ID` (``-1``). After it the score rows come into the same columns, on
+    the same GpSimd partitions, and one ``nc_n_gather`` per eight requests reads column
+    ``id + 1`` for every id: the score at a real id, column 0 at a pad. The partitions
+    between the rows gather column 0 too. Every value is a copy of a score, so the list
+    holds the scores bit for bit. The one immediate, ``1``, is exact in any width, and every
+    gather index is at least 0, so the unsigned view reads it as it is.
+
+    One tile for both rows, at 16384 candidates the only room there is beside the
+    compaction's (a third row-wide tile does not fit a partition). The pad column is written
+    before the mask rows and read by the gather after the score rows, so the score rows are
+    a later write to the same tile, ordered after the compaction's read of the mask rows; a
+    tile whose every read follows the new write is given a second address by the device
+    compiler, which put it over the mask rows without that order (the ordering check, one
+    request at 16384 candidates).
+    """
     width = bounded_hbm.shape[1]
-    fold, chunk, request_major = fold_layout(n, width, fold_cap)
+    for g in range(_ceil_div(n, COMPACT_ROWS)):
+        m = min(COMPACT_ROWS, n - g * COMPACT_ROWS)
+        row0 = r0 + g * COMPACT_ROWS
+        # Partitions 0 .. 16 (m - 1): every compute instruction here starts on partition 0.
+        parts = GPSIMD_STRIDE * (m - 1) + 1
+        rows = _sb((PARTITIONS, span + 1), nl.float32)
+        nisa.memset(dst=rows[:, 0:1], value=POOL_PAD_VALUE)
+        found = _gpsimd_dst((PARTITIONS, span + 1), nl.int32)
+        nisa.memset(dst=found[0:parts, 0:select_k], value=POOL_PAD_ID)
+        _rows_past_pad(rows, mask_hbm, row0, m, span)
+        nisa.nonzero_with_count(dst=found, src=rows[:, 1:span + 1], index_offset=0,
+                                padding_val=POOL_PAD_ID)
+        _gpsimd_copy(found, ids_hbm, row0, m, select_k, select_k, 0, False)
+        at = _sb((PARTITIONS, select_k), nl.int32)  # id + 1: the column of its score
+        nisa.tensor_scalar(dst=at[0:parts, 0:select_k], data=found[0:parts, 0:select_k],
+                           op0=nl.add, operand0=1)
+        # ---- the score rows over the mask rows: every id is below the width -------------
+        _rows_past_pad(rows, bounded_hbm, row0, m, width)
+        values = _gpsimd_dst((PARTITIONS, select_k), nl.float32)
+        nisa.nc_n_gather(dst=values[0:parts, 0:select_k], data=rows[0:parts, 0:span + 1],
+                         indices=at[0:parts, 0:select_k].view(nl.uint32))
+        _gpsimd_copy(values, values_hbm, row0, m, select_k, select_k, 0, False)
+
+
+def _select_tile(bounded_hbm, lens_hbm, out_hbm, mask_hbm, ids_hbm, zeros_hbm, tok_hbm,
+                 r0, n, select_k, pool_size, out_cols, fold_cap, span, values_hbm):
+    """Requests ``r0 .. r0 + n - 1``: select, compact, expand.
+
+    ``span``: the mask width, the candidate axis or (:func:`dsa_decode_select_pools` on an
+    axis of at most ``k`` pools) wider, the columns past the axis at ``BOUND_FILL``.
+    ``values_hbm``: ``None``, or where the selected scores go beside the ids
+    (:func:`_compact_pool_rows`, the whole-row path only).
+    """
+    width = bounded_hbm.shape[1]
+    fold, chunk, request_major = fold_layout(n, span, fold_cap)
     parts = fold * n
 
     # ---- the scores in the fold layout, pads at BOUND_FILL ------------------------------
@@ -518,14 +598,16 @@ def _select_tile(bounded_hbm, lens_hbm, out_hbm, mask_hbm, ids_hbm, zeros_hbm, t
 
     # ---- the selection, out to the scratch row by row -----------------------------------
     mask = _select_mask(scores, same, below, parts, chunk, select_k)
-    _fold_copy(mask_hbm, mask, r0, n, width, chunk, fold, request_major, False)
+    _fold_copy(mask_hbm, mask, r0, n, span, chunk, fold, request_major, False)
 
     # ---- compaction: rows on the GpSimd cores' first partitions -------------------------
-    count, _seg = segments(width)
-    if count == 1:
-        _compact_whole_rows(mask_hbm, ids_hbm, r0, n, width, select_k)
+    count, _seg = segments(span)
+    if values_hbm is not None:
+        _compact_pool_rows(mask_hbm, bounded_hbm, ids_hbm, values_hbm, r0, n, span, select_k)
+    elif count == 1:
+        _compact_whole_rows(mask_hbm, ids_hbm, r0, n, span, select_k)
     else:
-        _compact_segments(mask_hbm, ids_hbm, zeros_hbm, r0, n, width, select_k)
+        _compact_segments(mask_hbm, ids_hbm, zeros_hbm, r0, n, span, select_k)
 
     # ---- expansion: pool p -> tokens p * pool + t; -1 stays -1 --------------------------
     spread = 1
@@ -637,8 +719,53 @@ def dsa_decode_select_kernel(bounded_hbm, lens_hbm, select_k, pool_size, out_col
         r0 = lo + t * per_tile
         n = min(per_tile, hi - r0)
         _select_tile(bounded_hbm, lens_hbm, out_hbm, mask_hbm, ids_hbm, zeros_hbm, tok_hbm,
-                     r0, n, select_k, pool_size, out_cols, fold_cap)
+                     r0, n, select_k, pool_size, out_cols, fold_cap, width, None)
     return out_hbm
+
+
+@nki.jit
+def dsa_decode_select_pools_kernel(bounded_hbm, lens_hbm, select_k, pool_size, out_cols,
+                                   fold_cap, span, source_digest):
+    """:func:`dsa_decode_select_kernel` and, beside its tokens, the local top-``k`` before
+    the expansion (the decode context parallel merge's input).
+
+    Args:
+        bounded_hbm / lens_hbm / select_k / pool_size / out_cols / source_digest: as
+            :func:`dsa_decode_select_kernel`.
+        fold_cap: python int, :func:`select_fold_cap` of ``span``.
+        span: python int, :func:`select_span`: the candidate axis, or ``select_k + 1`` on
+            an axis of at most ``select_k`` pools (every pool there is selected); at most
+            :data:`WHOLE_ROW_COLUMNS`.
+
+    Returns:
+        ``(tokens, values, pool_ids)``: ``[B, out_cols]`` int32, the selection kernel's
+        layout; ``[B, select_k]`` fp32, the selected scores, then :data:`POOL_PAD_VALUE`;
+        ``[B, select_k]`` int32, their pool ids (candidate-axis indices) in ascending
+        order, then :data:`POOL_PAD_ID`. Entry ``j`` of ``values`` is the score of entry
+        ``j`` of ``pool_ids``.
+    """
+    batch = bounded_hbm.shape[0]
+    out_hbm = nl.ndarray((batch, out_cols), dtype=nl.int32, buffer=nl.shared_hbm)
+    values_hbm = nl.ndarray((batch, select_k), dtype=nl.float32, buffer=nl.shared_hbm)
+    # The compacted ids: an output, and the expansion's input.
+    pool_ids_hbm = nl.ndarray((batch, select_k), dtype=nl.int32, buffer=nl.shared_hbm)
+    mask_hbm = nl.ndarray((batch, span), dtype=nl.float32, buffer=nl.private_hbm)
+    tok_hbm = nl.ndarray((batch, select_k * pool_size), dtype=nl.int32,
+                         buffer=nl.private_hbm)
+    n_prgs = nl.num_programs(axes=0)
+    prg = nl.program_id(0)
+    share = (batch + n_prgs - 1) // n_prgs
+    lo = prg * share
+    hi = min(batch, lo + share)
+    per_tile = tile_requests(span)
+    n_tiles = (hi - lo + per_tile - 1) // per_tile
+    for t in range(n_tiles):
+        r0 = lo + t * per_tile
+        n = min(per_tile, hi - r0)
+        # No segment scratch: the whole-row path only.
+        _select_tile(bounded_hbm, lens_hbm, out_hbm, mask_hbm, pool_ids_hbm, None, tok_hbm,
+                     r0, n, select_k, pool_size, out_cols, fold_cap, span, values_hbm)
+    return out_hbm, values_hbm, pool_ids_hbm
 
 
 # ---------------------------------------------------------------------------------------
@@ -757,6 +884,90 @@ def dsa_decode_select(bounded: Tensor, seq_lens: Tensor, *, select_k: int,
 
 
 # ---------------------------------------------------------------------------------------
+# Decode context parallelism: the local top-k before the expansion
+# ---------------------------------------------------------------------------------------
+
+
+def select_span(width: int, select_k: int) -> int:
+    """The mask width :func:`dsa_decode_select_pools` selects over: the candidate axis, or
+    ``select_k + 1`` columns (the ones past the axis at ``BOUND_FILL``) when the axis holds
+    no more than ``select_k`` pools, where every complete pool is selected."""
+    return max(int(width), int(select_k) + 1)
+
+
+def _validate_pools(bounded: Tensor, seq_lens: Tensor, select_k, pool_size) -> tuple[int, int]:
+    if bounded.ndim != 2:
+        raise DecodeSelectError(f"bounded must be [B, C]; got {tuple(bounded.shape)}")
+    batch, width = int(bounded.shape[0]), int(bounded.shape[1])
+    if batch < 1 or width < 1:
+        raise DecodeSelectError(f"bounded must carry at least one request and one pool; got "
+                                f"{tuple(bounded.shape)}")
+    if not isinstance(select_k, int) or isinstance(select_k, bool) or select_k < 1:
+        raise DecodeSelectError(f"select_k must be a positive python int; got {select_k!r}")
+    if not isinstance(pool_size, int) or not is_power_of_two(pool_size):
+        raise DecodeSelectError(f"pool_size must be a power-of-two python int; got "
+                                f"{pool_size!r}")
+    span = select_span(width, select_k)
+    if span > MAX_DECODE_INDEX_CANDIDATES:
+        raise DecodeSelectError(
+            f"a {width}-wide candidate axis is past MAX_DECODE_INDEX_CANDIDATES="
+            f"{MAX_DECODE_INDEX_CANDIDATES}, the whole-row width; wider rows take the segment "
+            f"merge, an open defect on trn2 (module docstring)")
+    if seq_lens.ndim != 1 or int(seq_lens.shape[0]) != batch:
+        raise DecodeSelectError(f"seq_lens must be [B] = [{batch}]; got "
+                                f"{tuple(seq_lens.shape)}")
+    return batch, width
+
+
+def dsa_decode_select_pools(bounded: Tensor, seq_lens: Tensor, *, select_k: int,
+                            pool_size: int) -> tuple[Tensor, Tensor, Tensor]:
+    """:func:`dsa_decode_select`'s tokens and the local top-``k`` before the expansion.
+
+    The input of trn2-2's decode context parallel merge (item 3): each rank selects over
+    its own pools and the ``CP`` lists merge into the global one. Rows are requests
+    (``R = B`` at one decode token each). The list is in pool order, not score order: the
+    merge ranks the ``CP * k`` entries by score and global pool id, which does not depend on
+    the order they come in, and this selection never sorts.
+
+    Args:
+        bounded: ``[B, C]`` fp32, a rank's bounded candidate scores over its local pool
+            axis (``dsa_decode_scores`` with the rank's operands).
+        seq_lens: ``[B]`` int, each request's length on this rank (its owned length).
+        select_k: pools selected per request, a positive python int. ``C <= select_k`` is
+            served: every complete pool is selected.
+        pool_size: tokens per pool, a power of two.
+
+    Returns:
+        ``(tokens, values, pool_ids)``:
+
+        * ``tokens``: ``[B, index_expand_width(select_k, pool_size)]`` int32, the
+          selection's expanded token indices, :func:`dsa_decode_select`'s where ``C >
+          select_k``;
+        * ``values``: ``[B, select_k]`` fp32, the score of each entry of ``pool_ids``
+          (bit for bit ``bounded[b, pool_ids[b, j]]``), :data:`POOL_PAD_VALUE` at a pad;
+        * ``pool_ids``: ``[B, select_k]`` int32, the selected local candidate-axis indices
+          in ascending order (the ``k`` largest scores, ties at the ``k``-th value to the
+          lowest index), :data:`POOL_PAD_ID` after them in a row with fewer than
+          ``select_k`` complete pools.
+    """
+    batch, width = _validate_pools(bounded, seq_lens, select_k, pool_size)
+    span = select_span(width, select_k)
+    out_cols = int(index_expand_width(select_k, pool_size))
+    if not (can_run_kernel(bounded) and bounded.dtype in _SUPPORTED_DTYPES):
+        _count_torch_fallback()
+        return dsa_decode_select_pools_torch_oracle(bounded, seq_lens, select_k=select_k,
+                                                    pool_size=pool_size)
+    programs = decode_select_programs(batch)
+    _count_dispatch("select", programs, batch)
+    call = wrap_nki(dsa_decode_select_pools_kernel)
+    if programs == 2:
+        call = call[2]
+    return call(bounded.contiguous(), seq_lens.reshape(batch, 1).to(torch.int32).contiguous(),
+                int(select_k), int(pool_size), out_cols, int(select_fold_cap(span)), int(span),
+                SOURCE_DIGEST)
+
+
+# ---------------------------------------------------------------------------------------
 # Torch oracle
 # ---------------------------------------------------------------------------------------
 
@@ -777,3 +988,28 @@ def dsa_decode_select_torch_oracle(bounded: Tensor, seq_lens: Tensor, *, select_
     ids = torch.where(keep, ids, torch.full_like(ids, width)).sort(dim=1).values
     pool_ids = torch.where(ids < width, ids, torch.full_like(ids, SENTINEL)).to(torch.int32)
     return _dsa_index_expand_torch(pool_ids, seq_lens.to(torch.int32), pool_size)
+
+
+def dsa_decode_select_pools_torch_oracle(bounded: Tensor, seq_lens: Tensor, *,
+                                         select_k: int, pool_size: int
+                                         ) -> tuple[Tensor, Tensor, Tensor]:
+    """CPU reference and fallback of :func:`dsa_decode_select_pools`: the scores padded with
+    ``BOUND_FILL`` to :func:`select_span`, a stable descending sort (equal values in index
+    order), its first ``select_k`` that are complete pools, back in ascending index order,
+    the pads after them."""
+    batch, width = int(bounded.shape[0]), int(bounded.shape[1])
+    scores = bounded.to(torch.float32)
+    span = select_span(width, select_k)
+    if span > width:
+        scores = torch.cat([scores, scores.new_full((batch, span - width), BOUND_FILL)], dim=1)
+    top = torch.sort(scores, dim=1, descending=True, stable=True)
+    first = top.indices[:, :select_k]
+    keep = top.values[:, :select_k] > BOUND_FILL_MARK
+    ids = torch.where(keep, first, torch.full_like(first, span)).sort(dim=1).values
+    real = ids < span
+    values = torch.gather(scores, 1, torch.where(real, ids, torch.zeros_like(ids)))
+    values = torch.where(real, values, torch.full_like(values, POOL_PAD_VALUE))
+    pool_ids = torch.where(real, ids, torch.full_like(ids, POOL_PAD_ID)).to(torch.int32)
+    tokens = dsa_decode_select_torch_oracle(scores, seq_lens, select_k=select_k,
+                                            pool_size=pool_size)
+    return tokens, values, pool_ids
