@@ -7220,6 +7220,7 @@ class Glm5NextMLAAttention(nn.Module):
                 written=written,
                 write_offset=at,
                 page_size=page,
+                pool_size=self.indexer.index_kpool,
             )
         else:
             attended = mla_sparse_attention(
@@ -7231,6 +7232,7 @@ class Glm5NextMLAAttention(nn.Module):
                 written=written,
                 write_offset=at,
                 page_size=page,
+                pool_size=self.indexer.index_kpool,
             )
             # The kernel returns float32, so the padding is restored in that dtype
             # before the model-dtype cast and absorb-out below.
