@@ -14,6 +14,7 @@ import pytest
 import torch
 
 from vllm_neuron.functional.attention import mla_decode as MD
+from vllm_neuron.functional.attention import mla_decode_masked as MM
 from vllm_neuron.functional.attention import mla_dense_window as DW
 from vllm_neuron.functional.attention import mla_sparse as MS
 from vllm_neuron.functional.dsa.launch_grid import LaunchGridError
@@ -120,6 +121,7 @@ def _fused_fp8_route(monkeypatch) -> int:
 #: (seam, programs of one launch at a geometry that splits under LNC2).
 SEAMS = {
     "mla_decode": lambda mp: MD._programs(2),
+    "mla_decode_masked": lambda mp: MM._programs(),
     "mla_dense_window": lambda mp: DW._programs(DW.ROW_TILE + 1),
     "mla_sparse": _mla_sparse,
     "kda_output": lambda mp: kda_output.launch_programs(),
