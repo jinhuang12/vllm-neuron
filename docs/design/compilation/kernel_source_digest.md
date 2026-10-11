@@ -44,7 +44,8 @@ silent: the server starts fast and runs stale code.
    `utils/dtype_utils.py`, `utils/neuron_utils.py`). The process keeps these
    bytes, so every key it computes reads the same snapshot, and digests each
    file's code once (see [What a file's digest reads](#what-a-files-digest-reads)).
-   112 files, about 700 ms on a host at load average 85, once per process.
+   Reading and digesting the snapshot takes about 700 ms on a host at load
+   average 85, once per process.
 2. A graph's kernels come from its FX nodes:
    - each NKI kernel node (`torch.ops.higher_order.nki_kernel_wrapper`) gives
      its kernel function through the library's kernel registry
@@ -241,7 +242,7 @@ the installed library version.
 ## Startup log
 
 ``` text
-INFO - compile_cache_key.py - VLLM_NEURON_KERNEL_DIGEST=d00f2669...362842 files=112 digest_ms=685.0 keys=per-graph
+INFO - compile_cache_key.py - VLLM_NEURON_KERNEL_DIGEST=d00f2669...362842 files=<n> digest_ms=685.0 keys=per-graph
 INFO - compile_cache_key.py - kernel digest: graph key <32-hex key> folds files=25 modules=vllm_neuron.functional.attention.mla_absorb,... resolve_ms=<ms> (graphs per-graph=1 fallback=0)
 ```
 
@@ -279,7 +280,7 @@ earlier whole-package scheme). Startup uses `install_per_graph_digest_key`.
 
 - One recompile of each graph that reaches a code edit. A comment, docstring
   or layout edit recompiles nothing. The stack-1b served set (20 graphs) was
-  measured when the snapshot held 104 files (it holds 112 now): 64 of those 104
+  measured when the snapshot held 104 files: 64 of those 104
   files reach no graph, and a decode-only kernel edit recompiles the decode
   graphs only. `functional/mlp.py` (an nkilib patch) reaches every graph.
 - About 700 ms of CPU in each process at startup, to parse and digest
