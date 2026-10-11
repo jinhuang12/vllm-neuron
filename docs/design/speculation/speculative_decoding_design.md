@@ -599,7 +599,7 @@ python3 -m vllm.entrypoints.openai.api_server \
 ```
 
 Contract of the opt-in (measured on trn2 at TP64/EP16, `k = 3`, `max_num_seqs 1`, `max_model_len 4096`,
-`VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA=1`, 2026-10-09):
+`VLLM_NEURON_GLM5NEXT_HOST_ONLY_METADATA=1`):
 
 * **Served greedy; synchronously by default.** The proposer needs on-device sampling and
   refuses async scheduling by name (the accepted count would reach the host one step late
@@ -618,13 +618,12 @@ Contract of the opt-in (measured on trn2 at TP64/EP16, `k = 3`, `max_num_seqs 1`
   sampler compares ids, not probabilities.
 * **Greedy output is not guaranteed identical to non-speculative greedy decoding, and
   with the draft layer's earlier view-form latent write it was not identical run to
-  run.** Measured with that write form (trn2, TP64/EP16, bs = 1, `k = 3`): 4 of 8 identity prompts (64 greedy tokens each) diverged from the
-  non-speculative run at tokens 15-41 -- the first differing token a wording or
-  whitespace alternative, the continuations then differ (one prompt reaches different
-  arithmetic) -- GSM8K@200 exact-match 0.99 on both, response text identical for 90 of
-  the 200 documents (the two non-speculative arms: 200 of 200); and one six-run series of
-  the measure prompt produced two outputs, A/B/A/B/A/B, splitting at token 106,
-  while the non-speculative arms were 6/6 identical. The
+  run.** Measured with that write form (trn2, TP64/EP16, batch size 1, `k = 3`): some
+  identity prompts diverged from the non-speculative run after some tens of tokens -- the
+  first differing token a wording or whitespace alternative, the continuations then
+  differ (one prompt reaches different arithmetic) -- at the same benchmark exact-match
+  score as the non-speculative run; and a series of runs of one prompt alternated
+  between two outputs, while the non-speculative runs were identical. The
   run-to-run alternation's cause is a dropped write (the drafts differed between runs; a
   draft difference reaches the output only through the carrier below): the draft layer
   wrote its latent rows through a view (`latent_cache[:, 0, :].index_copy_`), which the
@@ -633,17 +632,12 @@ Contract of the opt-in (measured on trn2 at TP64/EP16, `k = 3`, `max_num_seqs 1`
   the step, and vLLM's two alternating block sets made consecutive identical requests
   draft differently. Fixed by writing into the bank itself (`model_fp8.py` `attend` /
   `_attend_requests`; pinned by `test/vllm_neuron/worker/test_glm5next_slot_residue.py`).
-  With the bank write, 12 of 12 repeated greedy generations of the same prompt were
-  identical across two passes, and 8 of 8 identity prompts were identical across two
-  passes against the same server. On the bank-write configuration 3 of 8 identity
-  prompts differ from the non-speculative run (first differing token at 12-36; a
-  different set of prompts from the earlier configuration's 4), 57 of 200 GSM8K response
-  texts are identical to it, and GSM8K@200 exact-match is 0.985 (197 of 200) against
-  0.99 for the earlier configuration -- one question flipped; the cause is under
-  investigation. Per-position draft acceptance on GSM8K@200 is 0.933 / 0.887 / 0.814
-  (conditional), mean acceptance length 3.43 (2.43 of 3 drafts accepted per step); the
-  earlier configuration's is in the next bullet. Output differs from non-speculative
-  greedy decoding deterministically within a configuration.
+  With the bank write, repeated greedy generations of the same prompt were identical
+  across two passes, and so were the identity prompts against the same server. On the
+  bank-write configuration some identity prompts still differ from the non-speculative
+  run (a different set from the earlier configuration's), and one benchmark question
+  flipped against the earlier configuration; the cause is under investigation. Output
+  differs from non-speculative greedy decoding deterministically within a configuration.
   Each verify step is lossless by construction -- an accepted draft is the id
   the target's own argmax returned for that row -- so a divergence from the
   non-speculative run is the target's argmax picking differently where its top two
@@ -657,12 +651,11 @@ Contract of the opt-in (measured on trn2 at TP64/EP16, `k = 3`, `max_num_seqs 1`
   be read from a server that samples on device (its sampler returns ids only and refuses
   `logprobs`), so the margins are not measured. A server whose consumers need token
   identity with non-speculative greedy decoding should leave the drafter off.
-* **What does not move.** Acceptance on GSM8K@200 (earlier configuration): conditional
-  per-position rates 0.932 / 0.853 / 0.716, mean acceptance length 3.29 tokens per step
-  (bank-write configuration: 0.933 / 0.887 / 0.814, 3.43); the drafter adds
-  about one layer's work to a prefill (measured within the run-to-run spread of TTFT at
-  1k tokens); the KV pool and block table are sized for the `1 + k` recurrent blocks a
-  drafting request holds (`kv_group_blocks.draft_blocks_per_request`).
+* **What does not move.** Draft acceptance per position is no lower on the bank-write
+  configuration than on the earlier one; the drafter adds about one layer's work to a
+  prefill (measured within the run-to-run spread of TTFT at 1k tokens); the KV pool and
+  block table are sized for the `1 + k` recurrent blocks a drafting request holds
+  (`kv_group_blocks.draft_blocks_per_request`).
 
 **The verify step's glue fusion is opt-in.** By default (`VLLM_NEURON_GLUE_FUSED`
 unset or `1`, `vllm_neuron/functional/glue`) the fused glue kernels serve the mHC

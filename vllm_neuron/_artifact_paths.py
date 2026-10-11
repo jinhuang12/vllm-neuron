@@ -16,12 +16,12 @@ import os
 #: Names the served GLM-5.3-Flash checkpoint directory (it holds
 #: ``model.safetensors.index.json``).
 CHECKPOINT_KNOB = "VLLM_NEURON_GLM5NEXT_CHECKPOINT_DIR"
-#: The serving host's campaign checkpoint.
+#: The checkpoint directory on the serving host.
 CHECKPOINT_DEFAULT = "/home/ubuntu/glm53f-campaign/lane-serve/models/GLM-5.3-Flash-04c4e9e9"
 
-#: Names the directory the performance campaign keeps its worktrees and records under.
+#: Names the directory below which the performance records and their worktrees are kept.
 CAMPAIGN_KNOB = "VLLM_NEURON_GLM5NEXT_CAMPAIGN_DIR"
-#: The campaign hosts' directory (``glm53f-wt*``, ``glm53f-decode-breakdown-*`` below it).
+#: That directory on the serving hosts.
 CAMPAIGN_DEFAULT = "/home/ubuntu"
 
 

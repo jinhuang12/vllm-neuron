@@ -20,16 +20,14 @@ How the runtime holds them, as printed per physical core at every load with
 * one shared scratchpad per logical core, the largest any loaded graph needs and
   page-rounded (the runtime library's own message: "Total HBM scratchpad usage is
   the max across loaded NEFFs, rounded up to page size"). Two serve runs pin the
-  rounding: 688.29 + 28.07 MiB took 768 MiB, 508.04 + 18.13 MiB took 576 MiB. Both
-  are each core's high-water mark rounded up to a 64 MiB page and summed; no other
-  page size reproduces both;
+  rounding: in both, the scratchpad held is each core's high-water mark rounded up
+  to a 64 MiB page and summed; no other page size reproduces both;
 * per graph, for as long as it stays loaded (every warmed graph does): its code,
   its constants and its descriptor rings, on each core.
 
 The estimate is checked against the runtime's own figures in
-``test/vllm_neuron/worker/test_neff_memory.py``: on the bs=64 @ 8k serve line (15
-graphs) the runtime held 1305.8 MiB per rank for graphs and this module estimates
-1347 MiB.
+``test/vllm_neuron/worker/test_neff_memory.py``: on a batch-64, 8k-context server
+(15 graphs) it is a few percent above what the runtime held per rank for graphs.
 """
 
 from __future__ import annotations
@@ -58,13 +56,12 @@ DMA_DESCRIPTOR_BYTES = 16
 DMA_SEMAPHORE_DESCRIPTORS = 16
 
 #: Runtime memory per loaded graph beyond its code, constants and rings: the
-#: runtime's own ``runtime`` and ``collectives`` items (0.43 MiB and 0.07 MiB per
-#: core) plus what each graph's first execution adds on the two cores (2.0 MiB
-#: and 0.8 MiB measured across 15 loads). 3.7 MiB measured, rounded up.
+#: runtime's own ``runtime`` and ``collectives`` items plus what each graph's first
+#: execution adds on the two cores, as measured across 15 loads, rounded up.
 RUNTIME_BYTES_PER_GRAPH = 4 * MIB
-#: Runtime memory per logical core independent of the graph count: 7.6 MiB
-#: before the first load plus 62.4 MiB at the first execution, measured alike on
-#: the bs=64 line (15 graphs) and the standard line (3 graphs). 70 MiB, rounded up.
+#: Runtime memory per logical core independent of the graph count: what the
+#: runtime holds before the first load plus what the first execution adds, measured
+#: alike on a 15-graph and a 3-graph server, rounded up.
 RUNTIME_FIXED_BYTES = 72 * MIB
 
 _ENGINE_FILE_KEYS = ("act", "dve", "pe", "pool", "sp")

@@ -63,12 +63,12 @@ more than `window_tokens`, the runner stops the engine. Thus the policy refuses 
 than `window_tokens`. If `window_tokens` is not less than `max_model_len`, vLLM's own
 `max_model_len` check is sufficient, and the policy adds no limit.
 
-| Serve line | Segment | Query bucket | max_model_len | Window |
+| Configuration | Segment | Query bucket | max_model_len | Window |
 |---|---|---|---|---|
-| Standard (bs=1) | 1024 | 1024 | 4096 | 2048 tokens |
-| bs=64 @ 8k | 8192 | 1024 | 8192 | none (max_model_len) |
+| Standard (batch 1) | 1024 | 1024 | 4096 | 2048 tokens |
+| Batch 64, 8k context | 8192 | 1024 | 8192 | none (max_model_len) |
 
-To serve longer prompts on the standard line, increase `kv_segment_size_buckets`.
+To serve longer prompts on the standard configuration, increase `kv_segment_size_buckets`.
 
 ## Default sampling parameters
 

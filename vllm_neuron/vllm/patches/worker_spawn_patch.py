@@ -12,8 +12,8 @@ the rest -- and the child reads its process object only after it has imported
 its parent's main module (``vllm.entrypoints.openai.api_server`` for
 ``python -m``). So every start waits for one child's interpreter start and
 imports, and a TP=64 engine pays that 64 times in a row before the first worker
-can initialise. The served GLM-5.3-Flash payload is 71,320 bytes (the
-``VllmConfig`` is 69,139 of them); a pipe holds 64 KiB, and only 8 KiB once the
+can initialise. The served GLM-5.3-Flash payload is larger than a pipe (the
+``VllmConfig`` is most of it); a pipe holds 64 KiB, and only 8 KiB once the
 user is over ``/proc/sys/fs/pipe-user-pages-soft``.
 
 This patch gives ``popen_spawn_posix`` its own ``open``, which ``_launch`` looks

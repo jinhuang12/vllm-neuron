@@ -3,8 +3,8 @@
 
 At ``B > 1`` the carrier builder hands every recurrent (KDA) layer its two whole state
 banks and every sparse (DSA) layer its whole pooled store and ring bank, each beside one
-``[B]`` int64 slot tensor, instead of ``B`` per-request views of each bank. The served
-bs=64 graph had 7298 inputs, 5760 of them such views (34 KDA layers x 64 x 2 states +
+``[B]`` int64 slot tensor, instead of ``B`` per-request views of each bank. At ``B = 64``
+those views are most of the decode graph's inputs (34 KDA layers x 64 x 2 states +
 11 DSA layers x 64 x 2 side caches); in the bank form a layer's state costs two inputs
 whatever ``B`` is, and the NRT submit, whose cost is per input, shrinks with it. The
 layers gather the rows they step and write them back onto the bank itself
@@ -14,8 +14,8 @@ aliased outputs.
 Which steps take the form (:func:`bank_form`):
 
 * a decode of two or more requests, only. One request keeps the per-request view form:
-  the bs=1 graph is the measured production line and a gather/scatter per layer would
-  add device work to a device-bound step. A prefill serves one sequence and its state
+  the one-request graph is a device-bound step, and a gather/scatter per layer would
+  add device work to it. A prefill serves one sequence and its state
   writes are the layer's own;
 * the kill switch ``VLLM_NEURON_GLM5NEXT_STATE_BANKS=0`` keeps the view form at every
   ``B`` (today's graphs, unchanged);

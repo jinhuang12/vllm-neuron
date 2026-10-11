@@ -3211,7 +3211,7 @@ def _checkpoint_rows_of_views(views, checkpoint_rows) -> torch.Tensor:
     """Row ``checkpoint_rows[b]`` of each request's ``[T, ...]`` checkpoint view, as ``[B, ...]``.
 
     ``None`` or one host int slices (a free view; one request returns the view itself,
-    so the bs=1 line adds no device work and nothing is read); a tensor gathers by
+    so a one-request decode adds no device work and nothing is read); a tensor gathers by
     ``index_select``, never read; anything else is refused by ``_checkpoint_row_tensor``.
     """
     requests = len(views)
