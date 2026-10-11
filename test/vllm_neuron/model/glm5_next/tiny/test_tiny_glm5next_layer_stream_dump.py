@@ -792,47 +792,39 @@ def test_the_latent_cache_taps_hold_the_write_its_rows_and_the_bank(tmp_path, mo
     )
 
 
-class _ViewThatDefersItsWrite:
-    """A bank view whose in-place write is only recorded, so the bank keeps its old rows."""
-
-    def __init__(self, view, pending):
-        self._view = view
-        self._pending = pending
-
-    def index_copy_(self, dim, index, source):
-        self._pending.append((dim, index.detach().clone(), source.detach().clone()))
-        return self
-
-
 class _BankThatDefersItsWrite:
     """A bank double for a device where an in-place write is not visible in its own graph.
 
-    The first view it hands out only records its write; every later one is the bank's own,
-    unwritten. The layer takes one view to write this step's rows through and one to hand
-    the seam, in that order, so the seam is given a bank that does not carry them yet. Both
-    counts are asserted, so a layer that took the views in the other order fails on the
-    count instead of the deferral passing silently.
+    The layer writes this step's rows into the bank itself and then takes one view of the
+    bank to hand the seam. Here the write is only recorded, so that view is the bank's own
+    real tensor, still without this step's rows. Each write and each view is recorded in
+    order, and the test asserts that record: a layer that wrote through a view, so that the
+    write landed at once, or that took the seam's view before it wrote, fails on the record
+    instead of the deferral passing silently.
     """
 
     def __init__(self, bank):
         self._bank = bank
         self.pending: list = []
-        self.views = 0
+        self.record: list[str] = []
 
     def __getattr__(self, name):
         return getattr(self._bank, name)
 
+    def index_copy_(self, dim, index, source):
+        self.record.append("write")
+        self.pending.append((dim, index.detach().clone(), source.detach().clone()))
+        return self
+
     def __getitem__(self, key):
-        self.views += 1
-        if self.views == 1:
-            return _ViewThatDefersItsWrite(self._bank[key], self.pending)
+        self.record.append("view")
         return self._bank[key]
 
     def let_the_deferred_writes_land(self):
         """Apply what the forward only recorded, as a step boundary would."""
         with torch.no_grad():
             for dim, index, source in self.pending:
-                self._bank[:, 0, :].index_copy_(dim, index, source)
+                self._bank.index_copy_(dim, index, source)
 
 
 def test_the_seam_reads_this_steps_rows_even_when_the_bank_write_lands_later(tmp_path, monkeypatch):
@@ -893,13 +885,13 @@ def test_the_seam_reads_this_steps_rows_even_when_the_bank_write_lands_later(tmp
     expected = written.to(bank_dtype).float()
     handed = cached[rows.long()]
     assert double.pending, (
-        f"the double recorded no write, so the layer never wrote through the bank and a "
+        f"the double recorded no write, so the layer never wrote into the bank itself and a "
         f"write that lands late is not what is being read"
     )
-    assert double.views == 2, (
-        f"the layer took {double.views} view(s) of the bank; it takes one to write this step's "
-        f"rows through and one to hand the seam, so any other count means the deferral did not "
-        f"cover the write or the operand is not the bank"
+    assert double.record == ["write", "view"], (
+        f"the layer did {double.record} on the bank; it writes this step's rows into the bank "
+        f"once and then takes one view to hand the seam, so any other record means the "
+        f"deferral did not cover the write or the operand is not the bank"
     )
     assert len(dispatches) == 1, (
         f"the tapped layer entered the seam {len(dispatches)} time(s); one dispatch assembles "
