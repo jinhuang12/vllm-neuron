@@ -139,9 +139,11 @@ STEADY_STATE_LAUNCHES = 1 + LAUNCHES_PER_STEP * ENGINE_BATCHES_IN_FLIGHT
 #: host shows on a small share of reads) or a wait on an unprocessed execution. The two are
 #: told apart by the host's step period: the oldest of ``depth`` launches was issued
 #: ``(depth - 1) / LAUNCHES_PER_STEP`` steps ago, so its age over that count is the period this
-#: host has been running steps at, and a read that outlasts it waited for the device and the
-#: completion thread -- a completion backlog, counted (``backlog_waits``) and warned once per
-#: event. A read over this threshold but under the period leaves a debug record only.
+#: host has been running steps at (a prefill inside the span raises it, so that one retire is
+#: judged more leniently, never more strictly), and a read that outlasts it waited for the device
+#: and the completion thread -- a completion backlog, counted (``backlog_waits``) and warned once
+#: per event. A read over this threshold but under the period is counted and recorded at INFO,
+#: the level a served line prints, so the count keeps a surface in the log.
 WAIT_THRESHOLD_MS = 1.0
 _QUEUE_FULL_STATUS_TOKEN = re.compile(rf"(?<![\w.])status={QUEUE_FULL_STATUS}(?![\w.])")
 logger = logging.getLogger(__name__)
@@ -495,7 +497,7 @@ def _note_queue_full(launch: str) -> None:
 @torch._dynamo.assume_constant_result
 def _note_bound_wait(outstanding: int, read_ms: float, age_ms: float, step_ms: float, *, backlog: bool) -> None:
     """Count a retire read over :data:`WAIT_THRESHOLD_MS`; a backlog (the read outlasted the
-    host's step period) is counted again and warned, a shorter read leaves a debug record.
+    host's step period) is counted again and warned, a shorter read leaves an INFO record.
     Folded like :func:`_note_queue_full`: the retire runs on the host before the compiled
     launch, where the decorator is inert; the census readers require the fold."""
     _COUNTERS.bound_waits += 1
@@ -507,7 +509,7 @@ def _note_bound_wait(outstanding: int, read_ms: float, age_ms: float, step_ms: f
             read_ms, outstanding, age_ms, step_ms,
         )
     else:
-        logger.debug(
+        logger.info(
             "mtp async: the bound's retire read took %.1f ms for the oldest of %d launches, "
             "issued %.1f ms ago (%.1f ms a step on this host): the read's own cost",
             read_ms, outstanding, age_ms, step_ms,

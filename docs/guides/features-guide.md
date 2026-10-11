@@ -624,7 +624,7 @@ scheduling forms:
   sooner. Two guards hold it: each rank keeps at most `launch_depth(queue)` of its launches
   outstanding -- the most whose executions fit half the queue, 10 under 32 -- and reads the
   oldest back before issuing another, so a stalled rank waits instead of filling the queue
-  (a read over 1 ms is counted, `async_step.bound_waits()`; one that outlasts the host's step
+  (a read over 1 ms is counted and logged at INFO, `async_step.bound_waits()`; one that outlasts the host's step
   period is a completion backlog, counted and warned once, `async_step.backlog_waits()`); and
   a launch the runtime still
   refuses with `status=7` (Execution Queue Full) is served on the host for that step with the

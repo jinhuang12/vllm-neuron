@@ -387,14 +387,18 @@ def _aged_launch_at_depth(monkeypatch, delay_s: float):
 
 def test_a_retire_read_under_the_step_period_is_counted_without_a_warning(step_tests_fresh_dynamo, monkeypatch, caplog):
     """A retire read of a few milliseconds on a launch issued steps ago is the read's own host
-    cost: counted (``bound_waits``) and not a backlog (``backlog_waits`` 0, no warning)."""
+    cost: counted (``bound_waits``), recorded at INFO, and not a backlog (``backlog_waits`` 0,
+    no warning)."""
     launch, accepted, drafts, reads = _aged_launch_at_depth(monkeypatch, delay_s=0.005)
     async_step.reset_dispatch_counters()
-    caplog.set_level(logging.WARNING, logger=async_step.__name__)
+    caplog.set_level(logging.INFO, logger=async_step.__name__)
     async_step.mtp_async_take(accepted, drafts, launch=launch)
     assert len(reads) == 1 and launch.outstanding == launch.depth
     assert async_step.bound_waits() == 1 and async_step.backlog_waits() == 0
-    assert not [r for r in caplog.records if r.name == async_step.__name__], caplog.records
+    records = [r for r in caplog.records if r.name == async_step.__name__]
+    # the record is kept at INFO -- the level a served line prints -- so the count has a surface in the log
+    assert [r.levelno for r in records] == [logging.INFO], [(r.levelname, r.getMessage()) for r in records]
+    assert "the read's own cost" in records[0].getMessage() and "issued" in records[0].getMessage(), records[0].getMessage()
 
 
 def test_a_retire_read_that_outlasts_the_step_period_is_a_backlog_warning(step_tests_fresh_dynamo, monkeypatch, caplog):
