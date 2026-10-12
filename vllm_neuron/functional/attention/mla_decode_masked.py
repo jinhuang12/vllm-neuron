@@ -692,7 +692,7 @@ def mla_decode_padded_split_kernel(q_hbm, bank_hbm, table_hbm, pos_hbm, written_
     nisa.dma_copy(dst=ids_hbm, src=ids)
     out = nl.ndarray((batch, heads, latent), dtype=nl.float32, buffer=nl.shared_hbm)
     _split_body(q_hbm, bank_hbm, table_hbm, pos_hbm, written_hbm, ids_hbm, softmax_scale,
-                page_size, False, out)
+                page_size, False, out, None, None)
     return out
 
 
