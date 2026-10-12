@@ -361,6 +361,11 @@ class Glm5NextVisionConfig:
 
     neuron_config: VisionNeuronConfig | None = None
 
+    @property
+    def patch_dim(self) -> int:
+        """Values per patch row: every channel of every temporal slice of one patch."""
+        return self.in_channels * self.temporal_patch_size * self.patch_size**2
+
     @classmethod
     def from_hf_config(cls, hf_vision_config, neuron_config: VisionNeuronConfig = None):
         """Build the vision config from the ``vision_config`` sub-object."""

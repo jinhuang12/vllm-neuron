@@ -15,9 +15,11 @@ reference stage                        where it lives here
 ``merger``                             ``vision_adapter.py``
 =====================================  ==================================
 
-:meth:`Glm5NextVisionEncoder.forward` therefore returns the reference's ``pooler_output``, the
-merged ``out_hidden_size``-wide embeddings the encoder cache stores, not its
-``last_hidden_state``.
+:meth:`Glm5NextVisionEncoder.encode_block` therefore returns the reference's ``pooler_output``,
+the merged ``out_hidden_size``-wide embeddings the encoder cache stores, not its
+``last_hidden_state``. :meth:`Glm5NextVisionEncoder.forward`, the compiled graph, encodes a bucket
+of fixed-size attention blocks and writes those rows into the encoder cache;
+:func:`pack_images_into_blocks` lays the images out for it, one image per block.
 
 Three facts make that delegation exact:
 
@@ -36,8 +38,9 @@ Three facts make that delegation exact:
    block. That lets the vision adapter treat every ``spatial_merge_size ** 2`` consecutive tokens as
    one merge block, and it is the order the rope's position ids use.
 
-The tower is single-rank: neither the adapter nor the rope is sharded, and this module exposes no
-tensor-parallel surface. The reference's split points, for when it gains one, are ``qkv`` and
+The tower has no tensor-parallel surface: neither the adapter nor the rope is sharded, and every
+rank holds the whole tower. Ranks split a bucket's blocks by vision data parallelism instead. The
+reference's tensor-parallel split points, for when the tower gains them, are ``qkv`` and
 ``gate``/``up`` by column, ``proj`` and ``down`` by row.
 """
 
@@ -396,6 +399,7 @@ class Glm5NextVisionEncoder(nn.Module):
         self.spatial_merge_size = config.spatial_merge_size
         self.hidden_size = config.hidden_size
         self.head_dim = config.hidden_size // config.num_heads
+        self.patch_dim = config.patch_dim
 
         # Held in the seam's own filter layout rather than as an ``nn.Conv3d``, so
         # no weight is reshaped on the forward path.
@@ -437,14 +441,11 @@ class Glm5NextVisionEncoder(nn.Module):
                 f"pixel_values must be 2-D [total_patches, patch_dim], got "
                 f"{pixel_values.dim()}-D {tuple(pixel_values.shape)}"
             )
-        patch_dim = (
-            self.in_channels * self.temporal_patch_size * self.patch_size**2
-        )
-        if pixel_values.shape[-1] != patch_dim:
+        if pixel_values.shape[-1] != self.patch_dim:
             raise Glm5NextVisionEncoderError(
                 f"pixel_values row width {pixel_values.shape[-1]} does not equal "
                 f"in_channels * temporal_patch_size * patch_size ** 2 = "
-                f"{patch_dim}"
+                f"{self.patch_dim}"
             )
 
         total_patches = pixel_values.shape[0]
@@ -474,36 +475,182 @@ class Glm5NextVisionEncoder(nn.Module):
             embedded.append(out.reshape(chunk.shape[0], self.hidden_size))
         return torch.cat(embedded, dim=0)
 
-    def forward(
-        self, pixel_values: torch.Tensor, grid_thw: torch.Tensor
+    def encode_block(
+        self,
+        pixel_values: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        bound_min: torch.Tensor,
+        bound_max: torch.Tensor,
     ) -> torch.Tensor:
-        """Run the tower.
+        """Run the tower over one attention block.
 
         Args:
-            pixel_values: ``[total_patches, patch_dim]`` flat patch rows, in the
-                processor's block-major order.
-            grid_thw: ``[num_items, 3]`` of (temporal, height, width) patch
-                counts, one row per image or video.
+            pixel_values: ``[block_size, patch_dim]`` flat patch rows, in the processor's
+                block-major order.
+            cos: ``[block_size, head_dim]``, in the tower dtype.
+            sin: ``[block_size, head_dim]``, in the tower dtype.
+            bound_min: ``[block_size, 1]`` int32, each row's first key.
+            bound_max: ``[block_size, 1]`` int32, one past each row's last key.
 
         Returns:
-            ``[num_merged_tokens, out_hidden_size]``, the reference's ``pooler_output``.
+            ``[block_size // spatial_merge_size ** 2, out_hidden_size]``, the reference's
+            ``pooler_output`` for the rows of the block.
         """
         hidden_states = self.patch_embed(pixel_values)
-        cos, sin = compute_vision_rotary_pos_emb(
-            grid_thw, self.head_dim, self.spatial_merge_size
-        )
-        cos = cos.to(device=hidden_states.device, dtype=hidden_states.dtype)
-        sin = sin.to(device=hidden_states.device, dtype=hidden_states.dtype)
-        bound_min, bound_max = compute_attention_bounds(grid_thw)
-        bound_min = bound_min.to(hidden_states.device)
-        bound_max = bound_max.to(hidden_states.device)
-
-        if cos.shape[0] != hidden_states.shape[0]:
-            raise Glm5NextVisionEncoderError(
-                f"grid_thw describes {cos.shape[0]} patches but pixel_values "
-                f"carries {hidden_states.shape[0]}"
-            )
-
         for block in self.blocks:
             hidden_states = block(hidden_states, cos, sin, bound_min, bound_max)
         return self.adapter(hidden_states)
+
+    def forward(
+        self,
+        pixel_values: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        bound_min: torch.Tensor,
+        bound_max: torch.Tensor,
+        encoder_cache_buffer: torch.Tensor,
+        write_block_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Encode a bucket of attention blocks and write the result into the encoder cache.
+
+        Every shape is fixed by the bucket, so one compiled graph serves every call of that
+        bucket; :func:`pack_images_into_blocks` lays the images out. Under vision data
+        parallelism each rank encodes its own run of blocks and the ranks gather the results,
+        so every rank's cache holds every block.
+
+        Args:
+            pixel_values: ``[num_blocks, block_size, patch_dim]`` in the tower dtype.
+            cos: ``[num_blocks, block_size, head_dim]`` in the tower dtype.
+            sin: ``[num_blocks, block_size, head_dim]`` in the tower dtype.
+            bound_min: ``[num_blocks, block_size, 1]`` int32, block-local.
+            bound_max: ``[num_blocks, block_size, 1]`` int32, block-local.
+            encoder_cache_buffer: ``[num_cache_blocks, block_size // spatial_merge_size ** 2,
+                out_hidden_size]``, written in place.
+            write_block_ids: ``[num_blocks]`` int64, the cache block each encoded block goes
+                to; padding blocks go to the cache's scratch block.
+
+        Returns:
+            ``encoder_cache_buffer``, the same tensor.
+
+        Raises:
+            Glm5NextVisionEncoderError: a block count that the vision DP ranks cannot split
+                evenly.
+        """
+        # Vision data parallelism: the ranks of one vision DP group split the
+        # bucket's blocks (``VisionNeuronConfig.resolve_tp_dp`` pads the block count
+        # to a multiple of the group). The group is None with one vision DP rank,
+        # which encodes every block. Resolved here, at the call, as this package
+        # resolves every group.
+        from vllm_neuron.parallel.neuron_parallel_state import (
+            get_neuron_vision_dp_group,
+        )
+
+        dp_group = get_neuron_vision_dp_group()
+        dp_size = dp_group.world_size if dp_group is not None else 1
+        if dp_size > 1:
+            if pixel_values.shape[0] % dp_size:
+                raise Glm5NextVisionEncoderError(
+                    f"{pixel_values.shape[0]} attention blocks do not split over "
+                    f"{dp_size} vision DP ranks; a rank would drop blocks"
+                )
+            blocks_per_rank = pixel_values.shape[0] // dp_size
+            start = dp_group.rank_in_group * blocks_per_rank
+            local = slice(start, start + blocks_per_rank)
+            pixel_values, cos, sin = pixel_values[local], cos[local], sin[local]
+            bound_min, bound_max = bound_min[local], bound_max[local]
+        merged = torch.stack(
+            [
+                self.encode_block(
+                    pixel_values[b], cos[b], sin[b], bound_min[b], bound_max[b]
+                )
+                for b in range(pixel_values.shape[0])
+            ]
+        )
+        if dp_size > 1:
+            merged = dp_group.all_gather(merged, dim=0)
+        encoder_cache_buffer.index_put_((write_block_ids,), merged)
+        return encoder_cache_buffer
+
+
+def pack_images_into_blocks(
+    pixel_values: torch.Tensor,
+    grid_thw: torch.Tensor,
+    *,
+    block_size: int,
+    num_blocks: int,
+    config: Glm5NextVisionConfig,
+    dtype: torch.dtype,
+) -> dict[str, torch.Tensor]:
+    """Lay images out one per attention block, as :meth:`Glm5NextVisionEncoder.forward` takes them.
+
+    Image ``i`` fills the first ``t * h * w`` rows of block ``i``, so its attention bounds,
+    its rope rows and its patch-embed calls start at row 0 of the block, as they start at row 0
+    of the image. The rest of each block, and every block past the last image, is padding: zero
+    pixels and zero rope, and each padding row attends to itself alone. An empty key range would
+    drive that row's softmax to NaN; its merged rows land in the cache block's tail or in the
+    scratch block, where no position reads them.
+
+    Args:
+        pixel_values: ``[total_patches, patch_dim]``, the processor's rows of every image in turn.
+        grid_thw: ``[num_images, 3]`` of (temporal, height, width) patch counts.
+        block_size: rows per attention block, ``vision_attention_block_size``.
+        num_blocks: blocks of the bucket; at least the number of images.
+        config: the tower config, for the patch width, head width and merge size.
+        dtype: the tower dtype. The processor emits float32 rows, and the patch-embed seam takes
+            its input in the filters' dtype.
+
+    Returns:
+        ``pixel_values``, ``cos``, ``sin``, ``bound_min`` and ``bound_max``, each with a leading
+        ``[num_blocks, block_size]``.
+
+    Raises:
+        Glm5NextVisionEncoderError: more images than blocks, an image with more rows than a block,
+            or rows that disagree with the grid. An image is never truncated.
+    """
+    head_dim = config.hidden_size // config.num_heads
+    rows_per_image = [int(t * h * w) for t, h, w in grid_thw.tolist()]
+    if len(rows_per_image) > num_blocks:
+        raise Glm5NextVisionEncoderError(
+            f"{len(rows_per_image)} images do not fit a bucket of {num_blocks} attention "
+            f"blocks; the tower places one image per block"
+        )
+    too_large = [rows for rows in rows_per_image if rows > block_size]
+    if too_large:
+        raise Glm5NextVisionEncoderError(
+            f"an image of {too_large[0]} patch rows is larger than one attention block of "
+            f"{block_size} rows (vision_attention_block_size); it would be cut, so it is "
+            f"refused"
+        )
+    if sum(rows_per_image) != pixel_values.shape[0]:
+        raise Glm5NextVisionEncoderError(
+            f"grid_thw describes {sum(rows_per_image)} patch rows but pixel_values carries "
+            f"{pixel_values.shape[0]}"
+        )
+
+    rows = torch.arange(block_size, dtype=torch.int32).reshape(1, block_size, 1)
+    packed = {
+        "pixel_values": torch.zeros(
+            num_blocks, block_size, config.patch_dim, dtype=dtype
+        ),
+        "cos": torch.zeros(num_blocks, block_size, head_dim, dtype=dtype),
+        "sin": torch.zeros(num_blocks, block_size, head_dim, dtype=dtype),
+        "bound_min": rows.repeat(num_blocks, 1, 1),
+        "bound_max": (rows + 1).repeat(num_blocks, 1, 1),
+    }
+    start = 0
+    for block, image_rows in enumerate(rows_per_image):
+        grid = grid_thw[block : block + 1]
+        cos, sin = compute_vision_rotary_pos_emb(
+            grid, head_dim, config.spatial_merge_size
+        )
+        bound_min, bound_max = compute_attention_bounds(grid)
+        packed["pixel_values"][block, :image_rows] = pixel_values[
+            start : start + image_rows
+        ].to(dtype)
+        packed["cos"][block, :image_rows] = cos.to(dtype)
+        packed["sin"][block, :image_rows] = sin.to(dtype)
+        packed["bound_min"][block, :image_rows] = bound_min
+        packed["bound_max"][block, :image_rows] = bound_max
+        start += image_rows
+    return packed
