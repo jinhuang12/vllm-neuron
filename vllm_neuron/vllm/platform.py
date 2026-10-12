@@ -717,6 +717,9 @@ class NeuronPlatform(Platform):
 
         cls._admission = admission.policy_from_config(vllm_config)
         admission.install_eager_validation()
+        # Only a server that admits multimodal input fetches media.
+        if model_config.multimodal_config is not None:
+            admission.install_client_media_errors()
 
         if envs.VLLM_NEURON_RUNTIME_INPUT_SNAPSHOT_ENABLE:
             # Capture copies a forward's inputs to host via a standalone op run

@@ -39,6 +39,10 @@ encoder budget). Such an image fits no compiled bucket, and the scheduler can ne
 schedule it. The refusal is a ``VLLMValidationError`` naming the content part, so the 400
 carries it as ``param``.
 
+A media URL the client got wrong is answered with HTTP 400 too, not 500
+(:func:`install_client_media_errors`): a ``file://`` URL on a server that loads no local
+files, and an ``http(s)`` URL that cannot be fetched.
+
 ``validate_request`` alone answers a refused *streamed* request with HTTP 200 and an
 error event: vLLM's ``AsyncLLM.generate`` is an async generator, so its body (where
 ``process_inputs`` runs) starts only once the response stream is iterated.
@@ -82,6 +86,16 @@ _WARNED: set[str] = set()
 
 #: Marks the wrapped ``AsyncLLM.generate`` so a second install is a no-op.
 _EAGER_MARK = "_vllm_neuron_eager_validation"
+
+#: Marks the wrapped ``MediaConnector`` loaders so a second install is a no-op.
+_MEDIA_MARK = "_vllm_neuron_client_media_errors"
+
+#: The content part each of vLLM's media readers loads, for a refusal's ``param``.
+_MEDIA_PARAMETERS = {
+    "ImageMediaIO": "image_url",
+    "VideoMediaIO": "video_url",
+    "AudioMediaIO": "audio_url",
+}
 
 
 # ── prompt length ────────────────────────────────────────────────────────────────
@@ -427,3 +441,106 @@ def install_eager_validation() -> None:
 
     setattr(generate, _EAGER_MARK, True)
     AsyncLLM.generate = generate
+
+
+# ── client media errors ──────────────────────────────────────────────────────────
+
+
+def _fetch_errors() -> tuple[type[BaseException], ...]:
+    """What a failed ``http(s)`` media fetch raises: ``aiohttp`` on the async path,
+    ``requests`` on the sync path, and the built-in timeout and connection errors."""
+    import aiohttp
+    import requests
+
+    return (
+        aiohttp.ClientError,
+        requests.exceptions.RequestException,
+        TimeoutError,
+        ConnectionError,
+    )
+
+
+def client_media_error(connector, url: str, media_io, exc: BaseException):
+    """The HTTP 400 refusal for a media URL the client got wrong, or None to let
+    ``exc`` propagate as it is.
+
+    Two cases are the client's: a ``file://`` URL on a server started without
+    ``--allowed-local-media-path`` (vLLM raises ``RuntimeError``), and an ``http(s)``
+    URL that cannot be fetched (connection refused, an HTTP error status, a timeout).
+    vLLM answers both with HTTP 500, as it answers anything that is not a
+    ``ValueError``. A ``ValueError`` is already a 400 and is left alone, as is every
+    other error, which stays a server error.
+    """
+    if isinstance(exc, ValueError):
+        return None
+    from urllib3.util import parse_url
+    from vllm.exceptions import VLLMValidationError
+
+    try:
+        url_spec = parse_url(url)
+    except Exception:  # an unparsable URL raised before the fetch; leave its error
+        return None
+    scheme = (url_spec.scheme or "").lower()
+    parameter = _MEDIA_PARAMETERS.get(type(media_io).__name__)
+    if (
+        scheme == "file"
+        and isinstance(exc, RuntimeError)
+        and connector.allowed_local_media_path is None
+    ):
+        return VLLMValidationError(
+            f"{exc} This server loads no local files: send the media as an http(s) URL "
+            f"or a base64 data URL.",
+            parameter=parameter,
+        )
+    if scheme.startswith("http") and isinstance(exc, _fetch_errors()):
+        reason = type(exc).__name__ + (f": {exc}" if str(exc) else "")
+        return VLLMValidationError(
+            f"The media URL could not be fetched from {url_spec.host} ({reason}). Send "
+            f"a URL this server can reach, or the media as a base64 data URL.",
+            parameter=parameter,
+        )
+    return None
+
+
+def install_client_media_errors() -> None:
+    """Answer a media URL the client got wrong with HTTP 400 instead of 500.
+
+    Wraps vLLM's ``MediaConnector.load_from_url`` and ``load_from_url_async``, which
+    every image, video and audio URL goes through, so that :func:`client_media_error`
+    re-raises the client's two cases as a ``VLLMValidationError`` naming the content
+    part. vLLM's error handler answers that with 400 and the part as ``param``.
+    Idempotent.
+    """
+    try:
+        from vllm.multimodal.media import MediaConnector
+    except ImportError:  # a vLLM without the media connector fetches no media
+        return
+    if getattr(MediaConnector.load_from_url_async, _MEDIA_MARK, False):
+        return
+    load = MediaConnector.load_from_url
+    load_async = MediaConnector.load_from_url_async
+
+    @functools.wraps(load)
+    def load_from_url(self, url, media_io, *args, **kwargs):
+        try:
+            return load(self, url, media_io, *args, **kwargs)
+        except Exception as exc:
+            refusal = client_media_error(self, url, media_io, exc)
+            if refusal is None:
+                raise
+            raise refusal from exc
+
+    @functools.wraps(load_async)
+    async def load_from_url_async(self, url, media_io, *args, **kwargs):
+        try:
+            return await load_async(self, url, media_io, *args, **kwargs)
+        except Exception as exc:
+            refusal = client_media_error(self, url, media_io, exc)
+            if refusal is None:
+                raise
+            raise refusal from exc
+
+    setattr(load_from_url, _MEDIA_MARK, True)
+    setattr(load_from_url_async, _MEDIA_MARK, True)
+    MediaConnector.load_from_url = load_from_url
+    MediaConnector.load_from_url_async = load_from_url_async
