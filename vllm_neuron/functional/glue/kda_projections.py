@@ -84,6 +84,7 @@ __all__ = [
     "KDA_PROJECTIONS_MAX_TOKENS",
     "PREFILL_OPERANDS_ATTR",
     "dispatch_counters",
+    "input_rms_norm",
     "kda_projections",
     "kda_projections_admits",
     "kda_projections_kernel",
@@ -259,6 +260,34 @@ def kda_projections_kernel(x, q_w, k_w, v_w, b_w, f_a_w, f_b_w, g_a_w, g_b_w,
     return q_out, k_out, v_out, gate_out, beta_out, og_out
 
 
+def _rms_norm_rows(rows, gain_rows, eps):
+    """Norm ``rows`` in place: ``bf16((x * rsqrt(mean(x^2) + eps)) * gain)``, fp32 inside.
+
+    Args:
+        rows: ``[128, H]`` bf16 SBUF rows of the un-normed layer input; they are
+            overwritten with the normed rows.
+        gain_rows: ``[128, H]`` bf16 SBUF tile, the norm gain on every partition.
+        eps: the norm epsilon.
+
+    The steps are :func:`input_rms_norm`'s, in its order: the squares summed in fp32
+    (Scalar, one pass), the mean as a multiply by ``1 / H`` (exact for the power-of-two
+    ``H`` the model has), rsqrt on GpSimd (the higher-precision engine for it, as in
+    ``kda_output``), then ``x * rstd`` and ``* gain`` in fp32 with one bf16 rounding
+    (Vector, one pass).
+    """
+    parts, hidden = rows.shape
+    squares = nl.ndarray((parts, hidden), dtype=nl.float32, buffer=nl.sbuf)
+    rstd = _tile(parts, 1)
+    nisa.activation_reduce(dst=squares, op=nl.square, data=rows, reduce_op=nl.add,
+                           reduce_res=rstd)
+    nisa.tensor_scalar(dst=rstd, data=rstd, op0=nl.multiply, operand0=1.0 / float(hidden),
+                       op1=nl.add, operand1=float(eps))
+    nisa.tensor_scalar(dst=rstd, data=rstd, op0=nl.rsqrt, operand0=0.0,
+                       engine=nisa.engine.gpsimd)
+    nisa.scalar_tensor_tensor(dst=rows, data=rows, op0=nl.multiply, operand0=rstd,
+                              op1=nl.multiply, operand1=gain_rows)
+
+
 def _psum_reader(index):
     """The engine of the ``index``-th PSUM read: Vector and Scalar (the two that read PSUM)
     take turns."""
@@ -266,7 +295,7 @@ def _psum_reader(index):
 
 
 @nki.jit
-def kda_projections_prefill_kernel(x, wt, expand_t):
+def kda_projections_prefill_kernel(x, wt, expand_t, gain=None, EPS=None):
     """``(q_in, k_in, v_in, raw_gate, raw_beta, out_gate)``, fp32, ``[T, *]`` (prefill shapes).
 
     Args:
@@ -274,6 +303,12 @@ def kda_projections_prefill_kernel(x, wt, expand_t):
         wt: ``[H, C]`` bf16, the six first-stage weights contraction-major, columns
             ``q | k | v | b | f_a | g_a`` (``C = 3 W + heads + 2 R``).
         expand_t: ``[R, 2 W]`` bf16, the two expansions transposed, ``f_b^T | g_b^T``.
+        gain: None, or ``[H]`` bf16, the layer's input RMSNorm gain. Then ``x`` is the
+            un-normed layer input and each row is normed on chip first, as
+            :func:`input_rms_norm` does (:func:`_rms_norm_rows`), so the normed
+            activations never go to HBM.
+        EPS: None, or the input RMSNorm epsilon, the checkpoint's ``rms_norm_eps``.
+            Given with ``gain`` and only with it; read only with ``gain``.
 
     Each program takes ``T / programs`` contiguous rows, in groups of up to 512 tokens
     (the bottlenecks' moving operand fills one fp32 PSUM bank). Per group: ``x^T`` by
@@ -300,6 +335,9 @@ def kda_projections_prefill_kernel(x, wt, expand_t):
     kernel_assert(direct <= _BANK, "q|k|v|b fit one PSUM bank")
     kernel_assert(x.dtype == nl.bfloat16 and wt.dtype == nl.bfloat16
                   and expand_t.dtype == nl.bfloat16, "bf16 operands")
+    kernel_assert(gain is None or (tuple(gain.shape) == (hidden,) and gain.dtype == nl.bfloat16),
+                  "gain is [H] bf16")
+    kernel_assert((gain is None) == (EPS is None), "EPS is given with gain, and only with it")
     rows = tokens // programs
     r0 = program * rows
     blocks = hidden // _P
@@ -325,6 +363,10 @@ def kda_projections_prefill_kernel(x, wt, expand_t):
     nisa.dma_copy(dst=e_rows, src=expand_t)
     expand = nl.ndarray((rank, expand_cols), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=expand, src=e_rows)  # exact: bf16 values in fp32
+    if gain is not None:
+        # The norm gain on every partition: one stride-0 read of the [H] vector.
+        gain_rows = nl.ndarray((_P, hidden), dtype=gain.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=gain_rows, src=gain.ap(pattern=[[0, _P], [1, hidden]], offset=0))
 
     reads = 0
     for g0 in range(0, rows, _BANK):
@@ -337,6 +379,8 @@ def kda_projections_prefill_kernel(x, wt, expand_t):
             nisa.dma_copy(dst=x_rows[:, i, :],
                           src=x.ap(pattern=[[hidden, _P], [1, hidden]],
                                    offset=(t0 + i * _P) * hidden))
+            if gain is not None:
+                _rms_norm_rows(x_rows[:, i, :], gain_rows, EPS)
         xt = nl.ndarray((_P, blocks, span), dtype=x.dtype, buffer=nl.sbuf)
         for i in range(tiles):
             for k0 in range(0, blocks, _PER_BF16_BANK):
@@ -549,28 +593,54 @@ def kda_projections_torch(hidden_states: Tensor, attn) -> tuple[Tensor, ...]:
     return q_in, k_in, v_in, raw_gate, raw_beta, out_gate
 
 
-def kda_projections(hidden_states: Tensor, attn,
-                    phase: str | None = None) -> tuple[Tensor, ...]:
+def input_rms_norm(hidden_states: Tensor, weight: Tensor, eps: float) -> Tensor:
+    """The KDA layer's pre-attention RMSNorm, ``x / sqrt(mean(x**2) + eps) * gain``.
+
+    The expression of ``Glm5NextKDALayer._input_norm``, step for step: fp32 inside,
+    the result in the input's dtype.
+    """
+    x = hidden_states.to(torch.float32)
+    variance = x.pow(2).mean(dim=-1, keepdim=True)
+    normed = x * torch.rsqrt(variance + eps)
+    normed = normed * weight.to(torch.float32)
+    return normed.to(hidden_states.dtype)
+
+
+def kda_projections(hidden_states: Tensor, attn, phase: str | None = None,
+                    norm: tuple[Tensor, float] | None = None) -> tuple[Tensor, ...]:
     """The six KDA input projections of ``hidden_states``, on a kernel or in torch.
 
     Args:
-        hidden_states: ``[T, H]`` activations, bf16 or fp32.
+        hidden_states: ``[T, H]`` activations, bf16 or fp32; with ``norm``, the
+            un-normed layer input.
         attn: the KDA attention module (its projection weights, and above
             ``KDA_PROJECTIONS_MAX_TOKENS`` rows the operands its load-time prep stored).
         phase: the step's ``"prefill"`` or ``"decode"``, for ``VLLM_NEURON_GLUE_FUSED``.
+        norm: None, or the layer's input RMSNorm ``(gain [H], eps)``. Then the
+            projections are of :func:`input_rms_norm` of ``hidden_states``: on the
+            prefill kernel, which norms the rows on chip, when it serves the call and
+            the gain is bf16; otherwise normed here first, then as without ``norm``.
 
     Returns:
         ``(q_in, k_in, v_in, raw_gate, raw_beta, out_gate)``, each ``[T, rows]`` fp32,
         ``rows`` the weight's output rows. When :func:`kda_projections_admits` says no,
         these are the torch expressions (:func:`kda_projections_torch`).
     """
-    if not kda_projections_admits(hidden_states, attn, phase):
+    admitted = kda_projections_admits(hidden_states, attn, phase)
+    prefill = admitted and int(hidden_states.shape[0]) > KDA_PROJECTIONS_MAX_TOKENS
+    if norm is not None and not (prefill and norm[0].dtype == torch.bfloat16
+                                 and tuple(norm[0].shape) == (int(hidden_states.shape[1]),)):
+        hidden_states = input_rms_norm(hidden_states, *norm)
+        norm = None
+    if not admitted:
         return kda_projections_torch(hidden_states, attn)
     _count_nki_dispatch()
-    if int(hidden_states.shape[0]) > KDA_PROJECTIONS_MAX_TOKENS:
+    if prefill:
         wt, expand_t = getattr(attn, PREFILL_OPERANDS_ATTR)
+        fused_norm = {} if norm is None else {"gain": norm[0].contiguous(),
+                                              "EPS": float(norm[1])}
         return _PREFILL_KERNELS[launch_programs()](
-            x=hidden_states.contiguous(), wt=wt, expand_t=expand_t)
+            x=hidden_states.contiguous(), wt=wt, expand_t=expand_t, **fused_norm)
     q_w, k_w, v_w, b_w, f_a, f_b, g_a, g_b = (w.contiguous() for w in _weights(attn))
     q_in, k_in, v_in, raw_gate, raw_beta, out_gate = _KERNELS[launch_programs()](
         x=hidden_states.contiguous(), q_w=q_w, k_w=k_w, v_w=v_w, b_w=b_w,

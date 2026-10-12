@@ -3621,6 +3621,7 @@ class Glm5NextKDAAttention(nn.Module):
         state_slots: torch.Tensor | None = None,
         checkpoint_rows: torch.Tensor | int | None = None,
         state_checkpoints: int | None = None,
+        input_norm: tuple[torch.Tensor, float] | None = None,
     ) -> torch.Tensor:
         """One KDA layer's gated-delta linear attention over ``[T, hidden]``.
 
@@ -3684,6 +3685,10 @@ class Glm5NextKDAAttention(nn.Module):
                 host numbers are refused: the caller hands them as a tensor, because a
                 tensor built from python data on the traced path is real under graph
                 extraction.
+            input_norm: at a prefill, ``(gain, eps)`` of the layer's input RMSNorm
+                when ``hidden_states`` arrives un-normalised, else None. The
+                projections apply it, on chip when their kernel serves, beside its
+                own read of the rows. A decode step's input arrives normed.
 
         Returns:
             ``[T, hidden]`` at the input dtype.
@@ -3755,6 +3760,11 @@ class Glm5NextKDAAttention(nn.Module):
             raise ValueError(
                 f"hidden_states must be [tokens, hidden]; got shape "
                 f"{tuple(hidden_states.shape)}"
+            )
+        if input_norm is not None and not is_prefill:
+            # A decode's fused routes do not call the projections, which apply the norm.
+            raise ValueError(
+                "input_norm is a prefill argument: a decode step's input arrives normed"
             )
         if state_slots is not None:
             # The bank form: whole banks beside one slot per request, a decode only,
@@ -3944,7 +3954,7 @@ class Glm5NextKDAAttention(nn.Module):
         # (``VLLM_NEURON_GLUE_FUSED``, functional/glue).
         phase = "prefill" if is_prefill else "decode"
         q_in, k_in, v_in, raw_gate, raw_beta, out_gate = kda_projections(
-            hidden_states, self, phase=phase)
+            hidden_states, self, phase=phase, norm=input_norm)
 
         # A sequence that has computed nothing enters with a zero state, and this is
         # the one predicate that says so. A sequence at position 0 carries no
@@ -4450,13 +4460,14 @@ class Glm5NextKDALayer(nn.Module):
         """Pre-attention RMSNorm: ``x / sqrt(mean(x**2) + eps) * gain``.
 
         The epsilon is the checkpoint's ``rms_norm_eps``, resolved at
-        construction.
+        construction. The expression is
+        :func:`~vllm_neuron.functional.glue.kda_projections.input_rms_norm`. The
+        forward calls this method at a decode step. At a prefill it hands the gain
+        and the epsilon to the attention instead, whose projections apply the norm.
         """
-        x = hidden_states.to(torch.float32)
-        variance = x.pow(2).mean(dim=-1, keepdim=True)
-        normed = x * torch.rsqrt(variance + self.rms_norm_eps)
-        normed = normed * self.input_layernorm_weight.to(torch.float32)
-        return normed.to(hidden_states.dtype)
+        from vllm_neuron.functional.glue.kda_projections import input_rms_norm
+
+        return input_rms_norm(hidden_states, self.input_layernorm_weight, self.rms_norm_eps)
 
     def forward(
         self,
@@ -4519,8 +4530,13 @@ class Glm5NextKDALayer(nn.Module):
         """
 
         def attention_half(single_stream: torch.Tensor) -> torch.Tensor:
+            # At a prefill the input norm's gain and epsilon go to the attention,
+            # whose projection kernel computes the norm beside its read of the rows.
             attended = self.attention(
-                self._input_norm(single_stream),
+                single_stream if is_prefill else self._input_norm(single_stream),
+                input_norm=(
+                    (self.input_layernorm_weight, self.rms_norm_eps) if is_prefill else None
+                ),
                 conv_state=conv_state,
                 recurrent_state=recurrent_state,
                 is_prefill=is_prefill,

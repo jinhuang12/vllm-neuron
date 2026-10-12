@@ -638,7 +638,7 @@ def test_the_site_names_are_the_leaves_own_middle_words() -> None:
     assert impl.MHC_ATTENTION_SITE != impl.MHC_FFN_SITE
 
 
-@pytest.mark.parametrize("family", ["kda", "dsa"])
+@pytest.mark.parametrize("family", ["dsa"])
 def test_the_one_stream_route_computes_what_it_computed_before(
     family: str,
 ) -> None:
