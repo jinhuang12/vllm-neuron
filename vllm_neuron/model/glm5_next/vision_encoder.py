@@ -52,6 +52,7 @@ import torch.nn.functional as F
 
 import vllm_neuron.functional as NF
 from vllm_neuron.functional.vision.patch_embed import BATCH_RANGE, patch_embed
+from vllm_neuron.utils.weight_loader import SafetensorsWeightLoader, set_weight_loader
 
 from .config import Glm5NextVisionConfig
 from .utils.vision_rope import compute_vision_rotary_pos_emb
@@ -70,6 +71,21 @@ _PATCH_ROWS_PER_CALL = BATCH_RANGE[1]
 # Mirrors the map of the same name in ``vision_adapter.py``, which is private to
 # that module.
 _ACTIVATIONS: dict[str, type[nn.Module]] = {"silu": nn.SiLU, "gelu": nn.GELU}
+
+#: The checkpoint prefix of every tower tensor.
+VISION_CHECKPOINT_PREFIX = "model.visual."
+
+# The tower parameters whose checkpoint name is not their own name. Every other
+# parameter is named as in the checkpoint, except that the adapter's stages sit
+# at the checkpoint's top level (``post_layernorm.*``, ``merger.*``) rather than
+# under ``adapter.``.
+_CHECKPOINT_RENAMES: dict[str, str] = {
+    "patch_embed_filters": "patch_embed.proj.weight",
+    "patch_embed_bias": "patch_embed.proj.bias",
+    "adapter.downsample_weight": "downsample.weight",
+    "adapter.downsample_bias": "downsample.bias",
+}
+_ADAPTER_PREFIX = "adapter."
 
 
 class Glm5NextVisionEncoderError(ValueError):
@@ -422,6 +438,71 @@ class Glm5NextVisionEncoder(nn.Module):
             [Glm5NextVisionBlock(config, dtype=dtype) for _ in range(config.depth)]
         )
         self.adapter = Glm5NextVisionAdapter(config, dtype=dtype)
+
+        # The two parameters held in another layout than the checkpoint's convert
+        # as they load. Each converter casts to the tower dtype first, so the
+        # patch-embed kernel is summed over its temporal axis in that dtype.
+        set_weight_loader(
+            self.patch_embed_filters,
+            SafetensorsWeightLoader(
+                transform=lambda slices, rank: patch_embed_filters_from_conv3d(
+                    slices[0][:].to(dtype)
+                )
+            ),
+        )
+        set_weight_loader(
+            self.adapter.downsample_weight,
+            SafetensorsWeightLoader(
+                transform=lambda slices, rank: self.adapter.downsample_weight_from_conv(
+                    slices[0][:].to(dtype)
+                )
+            ),
+        )
+
+    def checkpoint_mappings(self, prefix: str = "") -> dict[str, str]:
+        """Map every tower parameter to its checkpoint key.
+
+        The map has the form the checkpoint reader takes: parameter name, under ``prefix``, to
+        checkpoint key. The tower is replicated, so every key loads whole on every rank. A
+        parameter whose key the checkpoint lacks is refused by the reader, by name.
+
+        Args:
+            prefix: this module's path in the model that loads it, with the trailing dot.
+
+        Returns:
+            ``{prefix + parameter name: checkpoint key}`` for every parameter of the tower.
+        """
+        return {
+            prefix + name: VISION_CHECKPOINT_PREFIX
+            + _CHECKPOINT_RENAMES.get(name, name.removeprefix(_ADAPTER_PREFIX))
+            for name, _ in self.named_parameters()
+        }
+
+    def refuse_unmapped_checkpoint_keys(self, checkpoint_names: set[str]) -> None:
+        """Refuse a checkpoint tower tensor that no parameter of this tower loads.
+
+        The reader refuses the other direction, a parameter with no tensor. Together the two
+        checks mean the loaded tower is the checkpoint's whole tower.
+
+        Args:
+            checkpoint_names: every tensor name in the checkpoint.
+
+        Raises:
+            Glm5NextVisionEncoderError: a checkpoint tensor under
+                :data:`VISION_CHECKPOINT_PREFIX` has no parameter here.
+        """
+        mapped = set(self.checkpoint_mappings().values())
+        unused = sorted(
+            key
+            for key in checkpoint_names
+            if key.startswith(VISION_CHECKPOINT_PREFIX) and key not in mapped
+        )
+        if unused:
+            raise Glm5NextVisionEncoderError(
+                f"{len(unused)} checkpoint tensors under {VISION_CHECKPOINT_PREFIX!r} have no "
+                f"vision tower parameter, for example {unused[:4]}; the tower would load "
+                f"without them"
+            )
 
     def patch_embed(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """Embed flat patch rows through the NKI patch-embed seam.

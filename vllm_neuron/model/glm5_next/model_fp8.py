@@ -10107,6 +10107,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 world_size=self.world_size,
                 tp_group=_resolve_tp_group,
             )
+        # The vision tower. This root serves text and holds none; the image root
+        # (``model_image.py``), which the factory selects when the server admits
+        # images, sets it after this constructor. ``load_weights`` loads it when set.
+        self.visual: nn.Module | None = None
 
     # ── construction ─────────────────────────────────────────────────────
 
@@ -10470,10 +10474,23 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 f"{len(self.declared_parameter_names())} names"
             )
 
+        # The reader walks every parameter of the tree and reads an unmapped one
+        # under its own name, so a vision tower's parameters are mapped in this same
+        # pass. Its key check waits for the pass: the reader builds the checkpoint's
+        # key index as it streams the files, and listing the keys before it would
+        # build the index up front and defeat that pipelining.
+        reader_mappings = mappings
+        if self.visual is not None:
+            reader_mappings = {
+                **mappings,
+                **self.visual.checkpoint_mappings(prefix="visual."),
+            }
         rank_sharded = checkpoint.load_sharded_pipelined(
-            rank, self.world_size, self, mappings, device
+            rank, self.world_size, self, reader_mappings, device
         ).state_dict
         self.load_state_dict(rank_sharded, strict=False, assign=True)
+        if self.visual is not None:
+            self.visual.refuse_unmapped_checkpoint_keys(checkpoint.get_tensor_names())
 
         # Everything below runs after the line above, and that is the whole ordering
         # contract of this method: the line above is what turns a shape-free
