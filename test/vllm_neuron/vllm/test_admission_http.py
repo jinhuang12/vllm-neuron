@@ -217,6 +217,17 @@ def test_top_k_under_all_greedy_is_a_400_the_engine_never_sees(greedy_server):
     assert greedy_server[1].requests == []
 
 
+@pytest.mark.parametrize("stream", [False, True], ids=["plain", "streamed"])
+def test_a_penalty_under_on_device_sampling_is_a_400_the_engine_never_sees(greedy_server,
+                                                                           stream):
+    response = _complete(greedy_server, 10, temperature=0.0, presence_penalty=1.0,
+                         stream=stream)
+    assert response.status_code == 400, response.text
+    assert "presence_penalty=1" in _error(response)
+    assert "device sampler does not apply" in _error(response)
+    assert greedy_server[1].requests == []
+
+
 def test_a_valid_greedy_request_after_each_refusal_is_served(greedy_server):
     """Refused, refused, refused, then served: the engine sees exactly the one request it
     can serve, and returns its tokens."""
@@ -260,17 +271,23 @@ SPEC_DECODE_REFUSAL = "not yet supported with speculative decoding"
 
 
 @pytest.mark.parametrize("stream", [False, True], ids=["plain", "streamed"])
-def test_logit_bias_under_speculative_decoding_is_a_400_the_engine_never_sees(
-    speculative_server, stream
-):
-    """vLLM refuses ``logit_bias`` with speculative decoding inside ``process_inputs``,
-    which a streamed request reaches only after HTTP 200. The eager validation runs the
-    same check first, so both forms get vLLM's 400."""
-    response = _complete(speculative_server, 10, temperature=0.0, stream=stream,
+@pytest.mark.parametrize(
+    "form, refusal",
+    [("speculative_server", SPEC_DECODE_REFUSAL),
+     ("greedy_server", "the device sampler does not apply logit_bias")],
+    ids=["speculative", "no-drafting"],
+)
+def test_logit_bias_is_a_400_the_engine_never_sees(request, form, refusal, stream):
+    """Both refusals of ``logit_bias`` come before a stream starts. With speculative
+    decoding vLLM refuses it inside ``process_inputs``, which a streamed request reaches
+    only after HTTP 200; the eager validation runs that check first. Without drafting the
+    platform refuses it, because the device sampler never reads a bias."""
+    server = request.getfixturevalue(form)
+    response = _complete(server, 10, temperature=0.0, stream=stream,
                          logit_bias={"11": -100})
     assert response.status_code == 400, response.text
-    assert SPEC_DECODE_REFUSAL in _error(response)
-    assert speculative_server[1].requests == []
+    assert refusal in _error(response)
+    assert server[1].requests == []
 
 
 @pytest.mark.parametrize("stream", [False, True], ids=["plain", "streamed"])

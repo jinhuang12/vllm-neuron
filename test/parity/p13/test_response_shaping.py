@@ -355,28 +355,26 @@ def test_a_streamed_logit_bias_is_a_400(server):
     server.refuses(SPEC_DECODE_REFUSAL, stream=True, **LOGIT_BIAS)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="admission refuses only temperature/top_k/top_p/min_p/seed/n and logprobs "
-    "(vllm_neuron/vllm/admission.py), while the async on-device path returns the device "
-    "tokens without vLLM's Sampler (neuron_model_runner.py:11359-11366) and the input "
-    "batch has no logits processors (neuron_model_runner.py:12097), so penalties, "
-    "bad_words, allowed_token_ids and min_tokens are admitted and ignored",
-)
-@pytest.mark.parametrize("body", [
-    {"presence_penalty": 1.0},
-    {"frequency_penalty": 1.0},
-    {"repetition_penalty": 1.2},
-    {"min_tokens": 4},
-    {"bad_words": ["Paris"]},
-    {"allowed_token_ids": [1000, 1001]},
-], ids=lambda body: next(iter(body)))
-def test_sampling_controls_the_device_sampler_ignores_are_refused(server, body):
-    server.core.plans.append((encode(server.tokenizer, ANSWER), FinishReason.LENGTH, None))
-    try:
-        server.refuses(**body)
-    finally:
-        server.core.plans.clear()
+#: The refusal of a sampling control the device sampler does not apply.
+NOT_APPLIED = "the device sampler does not apply"
+
+
+@pytest.mark.parametrize("body, refusal", [
+    ({"presence_penalty": 1.0}, NOT_APPLIED),
+    ({"frequency_penalty": 1.0}, NOT_APPLIED),
+    ({"repetition_penalty": 1.2}, NOT_APPLIED),
+    ({"min_tokens": 4}, "does not keep the EOS and stop token ids out of the first min_tokens"),
+    ({"bad_words": ["Paris"]}, NOT_APPLIED),
+    ({"allowed_token_ids": [1000, 1001]}, NOT_APPLIED),
+], ids=["presence_penalty", "frequency_penalty", "repetition_penalty", "min_tokens",
+        "bad_words", "allowed_token_ids"])
+def test_sampling_controls_the_device_sampler_ignores_are_refused(server, body, refusal):
+    """The on-device sampler reads one [top_k, top_p, temperature] row per request and the
+    structured-output mask, and the runner's input batch has no logits processors, so
+    the platform's admission refuses each of these by name before the engine sees it.
+    ``min_tokens`` without ``ignore_eos`` is refused because EOS is then a stop token,
+    and the device sampler does not mask it inside the first ``min_tokens`` tokens."""
+    server.refuses(next(iter(body)), refusal, **body)
 
 
 # ── parsers: tool calls and reasoning in the OpenAI shape ──────────────────────────
