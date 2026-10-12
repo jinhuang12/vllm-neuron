@@ -49,16 +49,19 @@ the ``c = k - #{value > v*}`` lowest global ids among the ties, the same search 
 :data:`ID_BITS` bits of the id, and reselects. The count passes are the kernel's cost: 32
 for the value at one bit a step, 24 more for the id on the branch (see the benchmark report).
 
-Layout: rows ride the partitions, a tile of up to 128 rows, :data:`_TILES_IN_FLIGHT` tiles a
-group. A tile of ``n < 128`` rows folds each row over ``f`` partitions (``n * f <= 128``,
-:func:`tile_fold`) as whole ranks' inputs or equal pieces of one rank's input
-(:func:`fold_groups`), so each rank's ``n`` rows are one run of partitions that one DMA loads;
-a per-partition count is summed over a row's partitions by one matmul with the same-row
-matrix. Both cores of an LNC2 pair split the rows.
+Layout: rows ride the partitions, a tile of up to :func:`tile_rows` rows,
+:data:`_TILES_IN_FLIGHT` tiles a group. A tile of ``n < 128`` rows folds each row over ``f``
+partitions (``n * f <= 128``, :func:`tile_fold`) as whole ranks' inputs or equal pieces of one
+rank's input (:func:`fold_groups`), so each rank's ``n`` rows are one run of partitions that
+one DMA loads; a per-partition count is summed over a row's partitions by one matmul with the
+same-row matrix. A row of up to :data:`MAX_CANDIDATES` candidates fits one partition, and its
+tiles carry 128 rows. A wider row is served by tiles of fewer rows, so that each row folds over
+enough partitions for every partition's columns to fit (:func:`tile_fits`). Both cores of an
+LNC2 pair split the rows.
 
 **Invariant: every loop trip count and branch condition is identical on both cores by
 construction.** Every static loop is fixed by the shapes, and both cores run as many groups
-(:func:`program_groups`). The one data-dependent branch, a group's tie step, runs on the pair's
+(:func:`program_groups_at`). The one data-dependent branch, a group's tie step, runs on the pair's
 joint flag, which both cores hold after swapping their counts (:func:`_any_excess`). A core
 alone in a loop body would wait for good on the barrier of both cores that ends it.
 
@@ -108,8 +111,13 @@ _BYTES_PER_CANDIDATE = 4 + 4 + 1 + 1 + 4 + 4 + 7
 #: Tiles one group selects together, so one tile's dependent search steps fill the gaps of the
 #: other's; their SBUF fits at once.
 _TILES_IN_FLIGHT = 2
-#: Candidates per row served at the most: the widest ``CP * k`` whose tiles fit one partition.
+#: Candidates per row a 128-row tile serves at the most: the widest ``CP * k`` whose tiles fit
+#: one partition unfolded. A wider row folds over more partitions (:func:`tile_rows`).
 MAX_CANDIDATES = SBUF_BYTES_PER_PARTITION // (_TILES_IN_FLIGHT * _BYTES_PER_CANDIDATE)
+#: SBUF bytes per partition a folded tile holds besides its candidate columns: the same-row
+#: matrix ``[P, P]`` and the two ``[n, P]`` operands it is built from, fp32
+#: (:func:`_same_row_matrix`).
+_FOLD_BYTES = 3 * 4 * SBUF_PARTITIONS
 #: fp32 columns of a ``[P, 1]`` scratch tile: one whole 32-byte line.
 _LINE = 8
 #: The lowest exponent bit of an fp32. :data:`LOWEST`'s order-preserving key is ``1 << 23``
@@ -187,9 +195,41 @@ def tile_fold(rows: int, cp: int, k: int) -> int:
     """
     best = 1
     for f in range(1, PARTITIONS // int(rows) + 1):
-        if cp % f == 0 or (f % cp == 0 and k % (f // cp) == 0):
+        if _admissible_fold(f, cp, k):
             best = f
     return best
+
+
+def _admissible_fold(f: int, cp: int, k: int) -> bool:
+    """Whether a row may fold over ``f`` partitions: ``f`` divides ``cp``, or is ``cp * d``
+    for a divisor ``d`` of ``k`` (:func:`tile_fold`)."""
+    return cp % f == 0 or (f % cp == 0 and k % (f // cp) == 0)
+
+
+def tile_fits(width: int, folded: bool) -> bool:
+    """Whether :data:`_TILES_IN_FLIGHT` tiles of ``width`` candidate columns a partition fit
+    one partition's SBUF, with the fold's own operands when the tile is ``folded``."""
+    per_tile = width * _BYTES_PER_CANDIDATE
+    if folded:
+        per_tile += _FOLD_BYTES
+    return _TILES_IN_FLIGHT * per_tile <= SBUF_BYTES_PER_PARTITION
+
+
+def tile_rows(cp: int, k: int) -> int | None:
+    """Rows a tile carries at the most for rows of ``cp * k`` candidates.
+
+    :data:`PARTITIONS` while an unfolded tile fits (``cp * k <= MAX_CANDIDATES``). Past that,
+    ``PARTITIONS // f`` for the smallest admissible fold ``f`` whose ``cp * k // f`` columns
+    fit (:func:`tile_fits`): a tile of at most that many rows folds each row over ``f`` or more
+    partitions (:func:`tile_fold` takes the largest admissible fold), so each of its
+    partitions holds at most that many columns. ``None`` when no fold fits.
+    """
+    if tile_fits(cp * k, False):
+        return PARTITIONS
+    for f in range(2, PARTITIONS + 1):
+        if _admissible_fold(f, cp, k) and tile_fits((cp * k) // f, True):
+            return PARTITIONS // f
+    return None
 
 
 def fold_groups(f: int, cp: int) -> tuple[int, int, int]:
@@ -213,8 +253,14 @@ def rank_slot(f: int, cp: int, k: int, n: int, rank: int) -> tuple[int, int, int
 
 
 def program_groups(rows: int, programs: int) -> list[list[tuple[bool, list[tuple[int, int]]]]]:
+    """:func:`program_groups_at` in tiles of up to :data:`PARTITIONS` rows."""
+    return program_groups_at(rows, programs, PARTITIONS)
+
+
+def program_groups_at(rows: int, programs: int,
+                      rows_per_tile: int) -> list[list[tuple[bool, list[tuple[int, int]]]]]:
     """Per program, its ``(stores, tiles)`` groups: an even share of the rows each, in tiles of up
-    to :data:`PARTITIONS` rows, :data:`_TILES_IN_FLIGHT` ``(first row, rows)`` tiles a group.
+    to ``rows_per_tile`` rows, :data:`_TILES_IN_FLIGHT` ``(first row, rows)`` tiles a group.
 
     Every group breaks its ties on a device branch, and the two cores of an LNC2 pair must
     branch alike, so every program runs as many groups as the first: one with fewer repeats the
@@ -227,8 +273,8 @@ def program_groups(rows: int, programs: int) -> list[list[tuple[bool, list[tuple
         lo = program * share
         hi = min(rows, lo + share)
         tiles = []
-        for start in range(lo, hi, PARTITIONS):
-            tiles.append((start, min(PARTITIONS, hi - start)))
+        for start in range(lo, hi, rows_per_tile):
+            tiles.append((start, min(rows_per_tile, hi - start)))
         groups = []
         for g0 in range(0, len(tiles), _TILES_IN_FLIGHT):
             groups.append((True, tiles[g0:g0 + _TILES_IN_FLIGHT]))
@@ -703,7 +749,8 @@ def dsa_dcp_merge_select_kernel(values_hbm, ids_hbm, cp_rank, pools_per_block, s
         ascending, over the ``CP * k`` candidates that are not pads), ``-1`` in every other slot.
         Nothing is compacted.
 
-    The rows split over the programs of the launch grid as :func:`program_groups` plans them.
+    The rows split over the programs of the launch grid as :func:`program_groups_at` plans
+    them, in tiles of up to :func:`tile_rows` rows.
     A group breaks ties, on the device's own branch, only when one of its rows has an excess
     tie; under two programs, a row of either program's group (:func:`_any_excess`), so both
     cores take the branch or neither (the module docstring's invariant).
@@ -714,7 +761,7 @@ def dsa_dcp_merge_select_kernel(values_hbm, ids_hbm, cp_rank, pools_per_block, s
     out_hbm = nl.ndarray((rows, k), dtype=nl.int32, buffer=nl.shared_hbm)
     programs = nl.num_programs(axes=0)
     program = nl.program_id(0)
-    for group in program_groups(rows, programs)[program]:
+    for group in program_groups_at(rows, programs, tile_rows(cp, k))[program]:
         states = []
         for tile in group[1]:
             states.append(_threshold_tile(values_hbm, ids_hbm, tile[0], tile[1], cp_rank))
@@ -737,7 +784,7 @@ def dsa_dcp_merge_select_kernel(values_hbm, ids_hbm, cp_rank, pools_per_block, s
 
 
 def merge_programs() -> int:
-    """Programs the merge launches: both cores of an LNC2 pair (:func:`program_groups`)."""
+    """Programs the merge launches: both cores of an LNC2 pair (:func:`program_groups_at`)."""
     if lnc_pair():
         return 2
     return 1
@@ -767,11 +814,11 @@ def _validate(values: Tensor, local_ids: Tensor, cp_rank, pools_per_block) -> tu
         raise DcpCandidateMergeError(
             f"pools_per_block (block_size // index_kpool) must be a power-of-two python int; "
             f"got {pools_per_block!r}")
-    if cp * k > MAX_CANDIDATES:
+    if tile_rows(cp, k) is None:
         raise DcpCandidateMergeError(
-            f"DCP top-k merge: CP * k = {cp} * {k} = {cp * k} candidates per row is past the "
-            f"MAX_CANDIDATES={MAX_CANDIDATES} whose tiles fit one SBUF partition; a wider merge "
-            f"needs the candidate axis tiled (not served)")
+            f"DCP top-k merge: CP * k = {cp} * {k} = {cp * k} candidates per row fit no tile: "
+            f"no fold of a row over at most {PARTITIONS} partitions leaves each partition few "
+            f"enough columns for its tiles to fit SBUF (tile_fits)")
     return cp, rows, k
 
 
