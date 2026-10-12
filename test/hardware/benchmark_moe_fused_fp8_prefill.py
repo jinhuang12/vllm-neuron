@@ -16,8 +16,8 @@ see ``kernel_sources`` in the output); "after" is this tree's.
 Inputs. Each token picks ``TOP_K`` distinct experts of ``EXPERTS`` uniformly at
 random (seeded) with normalized weights times the routed scaling factor; this
 rank keeps its ``LOCAL_EXPERTS`` columns. The model's own block mapping
-(``_build_blockwise_mapping_torch``) and padding order then build ``row_ids``,
-``expert_ids`` and the affinities exactly as ``block_quant_expert_mm`` does. The
+(``_build_blockwise_mapping_torch``) then builds ``row_ids``, ``expert_ids`` and
+the affinities exactly as ``block_quant_expert_mm`` does. The
 realised routed pairs (``row_ids >= 0``) are reported per seed beside the
 expectation ``T * TOP_K * LOCAL_EXPERTS / EXPERTS``. ``--skewed-seeds`` add
 seeds whose routing sends most tokens to a few local experts, which exercises
@@ -176,7 +176,7 @@ def local_affinities(tokens: int, seed: int, skewed: bool) -> torch.Tensor:
 
 
 def routing(tokens: int, seed: int, skewed: bool):
-    """``row_ids``, ``expert_ids`` and padded affinities as the model builds them."""
+    """``row_ids``, ``expert_ids`` and ``[T, E_local]`` affinities, as the model builds them."""
     affinities = local_affinities(tokens, seed, skewed)
     mask = (affinities != 0).to(torch.float32)
     positions, block_to_expert, blocks = _build_blockwise_mapping_torch(
@@ -185,17 +185,15 @@ def routing(tokens: int, seed: int, skewed: bool):
     rows = min(tokens, BLOCK_QUANT_SIZE)
     row_ids = positions.to(torch.int32).reshape(-1, BLOCK_QUANT_SIZE)[:, :rows].contiguous()
     expert_ids = block_to_expert.to(torch.int32).reshape(-1, 1).contiguous()
-    padded = torch.cat([affinities, torch.zeros(1, LOCAL_EXPERTS)]).contiguous()
-    return row_ids, expert_ids, padded, blocks
+    return row_ids, expert_ids, affinities, blocks
 
 
 def hidden_states(tokens: int, seed: int) -> torch.Tensor:
+    """``[T, HIDDEN]`` BF16 activations, 24 columns scaled 20x as outliers."""
     gen = torch.Generator().manual_seed(seed)
     scale = torch.ones(HIDDEN)
     scale[torch.randperm(HIDDEN, generator=gen)[:24]] = 20.0
-    x = (torch.randn(tokens + 1, HIDDEN, generator=gen) * scale).to(torch.bfloat16)
-    x[-1].zero_()
-    return x
+    return (torch.randn(tokens, HIDDEN, generator=gen) * scale).to(torch.bfloat16)
 
 
 # ---- Graphs ----------------------------------------------------------------- #
@@ -393,7 +391,7 @@ def bucket_case(tokens: int, entries: dict, args) -> dict:
                 if index == 0:
                     outputs[variant] = emission.to("cpu")
                     if combine is not None:
-                        layer[variant] = combine(emission, dev[3][:-1]).to("cpu")
+                        layer[variant] = combine(emission, dev[3]).to("cpu")
                 else:
                     identical &= torch.equal(emission.to("cpu")[defined].view(torch.int32),
                                              outputs[variant][defined].view(torch.int32))

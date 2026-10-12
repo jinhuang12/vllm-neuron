@@ -700,12 +700,14 @@ def moe_fused_fp8_kernel(hidden, weights, scales, row_ids, expert_ids, affinity,
     """Return FP32 [blocks,q,H] contributions of the routed rows, from device routing.
 
     Args:
-        hidden: BF16 [T+1,H], final row zero.
+        hidden: BF16 [T,H], one row per token. A row id of -1 resolves one
+            past the last row, so neither of its gathers reads a row
+            (_gather_rows).
         weights: Prepared finite FP8 [E,3*(I/128),128,H/128,128].
         scales: Matching FP32 [E,3*(I/128),H/128].
         row_ids: int32 [blocks,q], token IDs or -1 (holes are allowed).
         expert_ids: int32 [blocks,1], expert for each block, in [0, E).
-        affinity: FP32 [(T+1)*E,1], final E entries zero.
+        affinity: FP32 [T*E,1], token-major [T,E].
         bounds: FP32 [128,3], gate upper, up lower, up upper, the same on
             every row.
         BLOCK_M: Bounds the rows of one chunk, with _CHUNK_ROWS.

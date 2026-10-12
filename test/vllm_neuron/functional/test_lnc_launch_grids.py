@@ -21,9 +21,7 @@ from vllm_neuron.functional.dsa.launch_grid import LaunchGridError
 from vllm_neuron.functional.glue import kda_output, kda_projections, mhc_pre
 from vllm_neuron.functional.kda import fused_decode as FD
 from vllm_neuron.functional.moe import expert_decode as ED
-from vllm_neuron.functional.moe import fused_fp8 as FF
 from vllm_neuron.functional.moe import token_gather_combine as TGC
-from vllm_neuron.functional.moe.fused_fp8_pack import PackedExperts
 from vllm_neuron.functional.mtp import common as mtp_common
 
 NC_CONFIG = "NEURON_LOGICAL_NC_CONFIG"
@@ -86,38 +84,6 @@ def _token_gather_combine(monkeypatch) -> int:
             torch.ones(tokens, slots)))
 
 
-def _fused_fp8_route(monkeypatch) -> int:
-    """The measured decode geometry: two programs on the compact LNC2 kernel, else one.
-
-    Both entries are ``[2]`` launches; only the compact decode kernel is the LNC2 pair
-    route, so it answers :data:`PAIR` and the generic entry :data:`ONE`.
-    """
-    hidden, intermediate, experts, blocks = 4096, 512, 18, 8
-    routes = []
-
-    def entry(answer):
-        def run(hidden_states, weights, scales, rows, *rest, **tiles):
-            routes.append(answer)
-            return torch.empty((*rows.shape, hidden_states.shape[1]), device="meta")
-        return run
-
-    monkeypatch.setattr(FF, "_FUSED_DECODE_EXPERTS", entry(PAIR))
-    monkeypatch.setattr(FF, "_FUSED_EXPERTS", entry(ONE))
-    panels, blocks_h = 3 * (intermediate // 128), hidden // 128
-    FF.fused_fp8_experts(
-        torch.empty((2, hidden), dtype=torch.bfloat16, device="meta"),
-        PackedExperts(
-            torch.empty((experts, panels, 128, blocks_h, 128), dtype=torch.float8_e4m3fn,
-                        device="meta"),
-            torch.empty((experts, panels, blocks_h), dtype=torch.float32, device="meta")),
-        torch.empty((blocks, 1), dtype=torch.int32, device="meta"),
-        torch.empty((blocks, 1), dtype=torch.int32, device="meta"),
-        torch.empty((2, experts), dtype=torch.float32, device="meta"),
-        torch.empty((128, 3), dtype=torch.float32, device="meta"))
-    assert len(routes) == 1
-    return routes[0]
-
-
 #: (seam, programs of one launch at a geometry that splits under LNC2).
 SEAMS = {
     "mla_decode": lambda mp: MD._programs(2),
@@ -129,7 +95,6 @@ SEAMS = {
     "mhc_pre": lambda mp: mhc_pre.launch_programs(),
     "kda_fused_decode": lambda mp: _grid_programs(FD.fused_decode_grid(2)),
     "expert_decode": lambda mp: ED.default_programs(2, 2),
-    "fused_fp8": _fused_fp8_route,
     "token_gather_combine": _token_gather_combine,
     "mtp_tail": lambda mp: mtp_common.launch_programs(),
 }
