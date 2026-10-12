@@ -171,6 +171,10 @@ _SEAM_REGISTRY = {
     "dsa_shard_rows": (
         "vllm_neuron.functional.dsa.shard_rows",
         "shard_rows_dispatch_counters", "reset_shard_rows_dispatch_counters"),
+    "dsa_dcp_merge_select": (
+        "vllm_neuron.functional.dsa.dcp_candidate_merge",
+        "dcp_merge_select_dispatch_counters",
+        "reset_dcp_merge_select_dispatch_counters"),
     "kda_chunked_recurrence": (
         "vllm_neuron.functional.kda.chunked_recurrence",
         "dispatch_counters", "reset_dispatch_counters"),
@@ -690,6 +694,53 @@ def test_tiny_dense_mlp_forward_matches_the_reference() -> None:
             torch.testing.assert_close(
                 got_wrong.float(), reference["out"].float(), rtol=RTOL, atol=ATOL
             )
+
+
+DCP_RANKS = 2
+DCP_ROWS = 2
+DCP_K = 8
+DCP_POOLS = 64
+SEED_DCP_MERGE = 5491
+
+
+def test_the_dcp_merge_select_takes_its_kernel_at_two_ranks() -> None:
+    """The DCP candidate merge at two ranks: its NKI kernel, never the torch oracle.
+
+    No forward in this directory calls the merge, so this drive is the route check
+    that totals its counter family: one kernel dispatch, no torch fallback, and the
+    rank's selection equal to the oracle's bit for bit.
+    """
+    from vllm_neuron.functional.dsa import dcp_candidate_merge as merge
+
+    generator = torch.Generator().manual_seed(SEED_DCP_MERGE)
+    values = torch.randn(DCP_RANKS, DCP_ROWS, DCP_K, generator=generator)
+    local_ids = torch.stack([
+        torch.stack([
+            torch.randperm(DCP_POOLS, generator=generator)[:DCP_K]
+            for _ in range(DCP_ROWS)
+        ])
+        for _ in range(DCP_RANKS)
+    ]).to(torch.int32)
+    rank = 1
+    want = merge.dsa_dcp_merge_select_torch_oracle(
+        values, local_ids, cp_rank=rank, pools_per_block=1
+    )
+    kept = int((want >= 0).sum())
+    if kept in (0, DCP_ROWS * DCP_K):
+        raise VacuousControlError(
+            f"the oracle keeps {kept} of rank {rank}'s {DCP_ROWS * DCP_K} "
+            f"candidates, so a merge that keeps all or none of them would pass"
+        )
+
+    _reset_seam_counters()
+    before = _read_seam_counters()
+    got = merge.dsa_dcp_merge_select(values, local_ids, cp_rank=rank, pools_per_block=1)
+    after = _read_seam_counters()
+    _assert_route_predicate(
+        "dcp merge select", {"dsa_dcp_merge_select": 1}, before, after
+    )
+
+    assert torch.equal(got, want)
 
 
 ROUTED_HIDDEN_SIZE = 512
