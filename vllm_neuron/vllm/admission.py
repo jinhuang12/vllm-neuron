@@ -34,9 +34,11 @@ Three request classes are refused:
 
 ``validate_request`` alone answers a refused *streamed* request with HTTP 200 and an
 error event: vLLM's ``AsyncLLM.generate`` is an async generator, so its body (where
-``process_inputs`` runs) starts only once the response stream is iterated.
-:func:`install_eager_validation` runs the same validation when ``generate`` is called,
-before the stream begins, so streamed and plain requests both get a 400.
+``process_inputs`` runs) starts only once the response stream is iterated. vLLM's own
+``SamplingParams.verify`` checks (for example ``logit_bias`` under speculative decoding)
+run there too, before ``validate_request``. :func:`install_eager_validation` runs both,
+in that order, when ``generate`` is called, before the stream begins, so streamed and
+plain requests get the same 400.
 """
 
 from __future__ import annotations
@@ -281,14 +283,32 @@ def policy_from_config(vllm_config) -> AdmissionPolicy:
 # ── eager validation for streamed requests ───────────────────────────────────────
 
 
-def install_eager_validation() -> None:
-    """Run the platform's request validation when ``AsyncLLM.generate`` is called.
+def _verify_sampling_params(engine, params) -> None:
+    """vLLM's ``SamplingParams.verify``, with the configs ``process_inputs`` passes it.
 
-    ``generate`` is an async generator: ``process_inputs`` (and so ``validate_request``)
-    runs on the first iteration, which for a streamed response is after vLLM has sent
-    HTTP 200. Validating at the call instead makes the ``ValueError`` propagate out of
-    the endpoint handler, where vLLM's exception handler returns 400, for streamed and
-    plain requests alike. ``process_inputs`` validates again as before. Only a processed
+    The structured-outputs config is passed as None, so the grammar check (which also
+    records the backend on the request) stays in ``process_inputs`` and runs once; every
+    other check in ``verify`` only reads the request."""
+    from vllm.sampling_params import SamplingParams
+
+    if not isinstance(params, SamplingParams):
+        return
+    processor = engine.input_processor
+    params.verify(
+        processor.model_config, processor.speculative_config, None, processor.tokenizer
+    )
+
+
+def install_eager_validation() -> None:
+    """Run the request checks of ``process_inputs`` when ``AsyncLLM.generate`` is called.
+
+    ``generate`` is an async generator: ``process_inputs`` (and so vLLM's
+    ``SamplingParams.verify`` and the platform's ``validate_request``) runs on the first
+    iteration, which for a streamed response is after vLLM has sent HTTP 200. Validating
+    at the call instead makes the ``ValueError`` propagate out of the endpoint handler,
+    where vLLM's exception handler returns 400, for streamed and plain requests alike.
+    The two checks run in the order ``process_inputs`` runs them, so the first refusal is
+    the same either way. ``process_inputs`` validates again as before. Only a processed
     prompt (``EngineInput``, what every OpenAI endpoint passes) is checked here; anything
     else is left to ``process_inputs``. Idempotent.
     """
@@ -307,6 +327,7 @@ def install_eager_validation() -> None:
         if isinstance(prompt, Mapping) and "type" in prompt and params is not None:
             from vllm.platforms import current_platform
 
+            _verify_sampling_params(self, params)
             current_platform.validate_request(prompt, params)
         return lazy_generate(self, *args, **kwargs)
 

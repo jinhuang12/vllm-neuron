@@ -112,7 +112,7 @@ class _AsyncLLM(AsyncLLM):
         self.profiler = None
 
 
-def _cli(model_dir: pathlib.Path, line: dict, sampler) -> list[str]:
+def _cli(model_dir: pathlib.Path, line: dict, sampler, *extra: str) -> list[str]:
     neuron_config = dict(line["neuron_config"], on_device_sampling_config=sampler)
     async_flag = "--async-scheduling" if sampler is not None else "--no-async-scheduling"
     return [
@@ -122,6 +122,7 @@ def _cli(model_dir: pathlib.Path, line: dict, sampler) -> list[str]:
         "--max-num-batched-tokens", str(line["max_num_batched_tokens"]),
         "--block-size", str(SERVED_BLOCK), "--enforce-eager", "--no-enable-prefix-caching",
         async_flag, "--additional-config", json.dumps({"neuron_config": neuron_config}),
+        *extra,
     ]
 
 
@@ -134,12 +135,12 @@ def served_model_dir():
     shutil.rmtree(root, ignore_errors=True)
 
 
-def _server(model_dir, monkeypatch, sampler):
+def _server(model_dir, monkeypatch, sampler, *extra: str):
     """vLLM's OpenAI app for the standard line; yields (client, engine core stand-in)."""
     monkeypatch.setenv(KNOB, "1")
     monkeypatch.setattr(NeuronPlatform, "_admission", NeuronPlatform._admission)
     args = make_arg_parser(FlexibleArgumentParser()).parse_args(
-        _cli(model_dir, STANDARD_LINE, sampler))
+        _cli(model_dir, STANDARD_LINE, sampler, *extra))
     config = AsyncEngineArgs.from_cli_args(args).create_engine_config()
     engine = _AsyncLLM(config)
     app = build_app(args, TASKS, config.model_config)
@@ -150,6 +151,16 @@ def _server(model_dir, monkeypatch, sampler):
 @pytest.fixture
 def greedy_server(served_model_dir, monkeypatch):
     client, core, model = _server(served_model_dir, monkeypatch, {"all_greedy": True})
+    with client:
+        yield client, core, model
+
+
+@pytest.fixture
+def speculative_server(served_model_dir, monkeypatch):
+    """The greedy server with MTP drafting, as served: three draft tokens per step."""
+    client, core, model = _server(
+        served_model_dir, monkeypatch, {"all_greedy": True}, "--speculative-config",
+        json.dumps({"method": "mtp", "num_speculative_tokens": 3}))
     with client:
         yield client, core, model
 
@@ -238,3 +249,42 @@ def test_host_sampling_admits_top_k_to_the_engine(host_server):
     response = _complete(host_server, 10, top_k=50, return_token_ids=True)
     assert response.status_code == 200, response.text
     assert len(host_server[1].requests) == 1
+
+
+# ── vLLM's own parameter checks, before the stream starts ────────────────────────────
+
+
+#: vLLM's refusal of ``logit_bias`` under speculative decoding
+#: (``SamplingParams._validate_spec_decode``).
+SPEC_DECODE_REFUSAL = "not yet supported with speculative decoding"
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["plain", "streamed"])
+def test_logit_bias_under_speculative_decoding_is_a_400_the_engine_never_sees(
+    speculative_server, stream
+):
+    """vLLM refuses ``logit_bias`` with speculative decoding inside ``process_inputs``,
+    which a streamed request reaches only after HTTP 200. The eager validation runs the
+    same check first, so both forms get vLLM's 400."""
+    response = _complete(speculative_server, 10, temperature=0.0, stream=stream,
+                         logit_bias={"11": -100})
+    assert response.status_code == 400, response.text
+    assert SPEC_DECODE_REFUSAL in _error(response)
+    assert speculative_server[1].requests == []
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["plain", "streamed"])
+def test_an_out_of_vocabulary_logit_bias_is_a_400_with_vllms_message(greedy_server, stream):
+    response = _complete(greedy_server, 10, temperature=0.0, stream=stream,
+                         logit_bias={str(10**9): 1.0})
+    assert response.status_code == 400, response.text
+    assert "out-of-vocab" in _error(response) and "logit_bias" in _error(response)
+    assert greedy_server[1].requests == []
+
+
+def test_a_speculative_greedy_request_reaches_the_engine(speculative_server):
+    """The eager check refuses only what vLLM refuses: a plain greedy request is served."""
+    response = _complete(speculative_server, 10, temperature=0.0, stream=True,
+                         return_token_ids=True)
+    assert response.status_code == 200, response.text
+    assert len(speculative_server[1].requests) == 1

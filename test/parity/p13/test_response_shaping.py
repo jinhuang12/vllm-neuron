@@ -348,25 +348,10 @@ def test_logit_bias_is_refused_under_speculative_decoding(server):
     server.refuses(SPEC_DECODE_REFUSAL, **LOGIT_BIAS)
 
 
-def test_a_streamed_logit_bias_is_refused_inside_the_stream(server):
-    """vLLM validates ``logit_bias`` against speculative decoding in ``process_inputs``,
-    after the stream has started, so the refusal arrives as an error event."""
-    reached = len(server.core.requests)
-    response = server.chat(stream=True, **LOGIT_BIAS)
-    assert response.status_code == 200, response.text
-    (error,) = [chunk["error"] for chunk in events(response) if "error" in chunk]
-    assert error["code"] == 400 and SPEC_DECODE_REFUSAL in error["message"], error
-    assert len(server.core.requests) == reached
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason="the speculative-decoding check on logit_bias runs in vLLM's "
-    "InputProcessor.process_inputs (vllm/sampling_params.py:848-860), inside the stream "
-    "generator, and the platform's eager validation does not cover it, so a streamed "
-    "request gets 200 and an error event instead of the 400 the other refusals get",
-)
 def test_a_streamed_logit_bias_is_a_400(server):
+    """vLLM checks ``logit_bias`` against speculative decoding in ``process_inputs``, which a
+    stream reaches only after HTTP 200; the plugin's eager validation runs vLLM's check
+    when the request is handed over, so the stream gets the same 400 before it starts."""
     server.refuses(SPEC_DECODE_REFUSAL, stream=True, **LOGIT_BIAS)
 
 
