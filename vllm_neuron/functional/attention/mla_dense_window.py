@@ -40,17 +40,16 @@ Masked mode (:func:`mla_masked_window_attention`) serves the sparse regime past 
 one: it attends the indexer's selection without gathering it. The sparse kernel gathers
 each query's selected rows one query at a time, and the gathers are serial on the
 software DMA queue. Here the whole window stays resident in SBUF and the selection
-becomes an additive bias on the window's scores: 0.0 on a selected row, a large negative
-power of two elsewhere, so the softmax gives the rows outside the selection exactly 0.0.
-There is no SBUF scatter on this core, so the bias is built from the selected pool ids
-by ``nc_match_replace8`` passes over the pool axis, once per 128-query block, shared by
-its heads. The softmax and MM2 keep the arithmetic of the sparse low-precision body: the
-same MM1 products, the global row maximum, ``p`` normalised before a bf16 hi/lo split.
-Only the order of the sums changes: the row sum and MM2 run over the window in row order
-rather than over the selection in its column order. Every window row is read, selected
-or not, so every row must be finite (see :func:`mla_masked_window_attention`).
-:func:`masked_window_serves` decides from shapes alone whether a call is cheaper here than
-gathered, and whether the window fits.
+becomes a predicate over the window's rows, built once per 128-query block and shared by
+its heads. There is no SBUF scatter on this core, so the PE counts each query's selected
+pools from one-hot rows of their ids. A row outside the selection reads a large negative
+power of two in place of its score, so the softmax gives it exactly 0.0. The softmax and
+MM2 keep the arithmetic of the sparse low-precision body: the same MM1 products, the
+global row maximum, ``p`` normalised before a bf16 hi/lo split. Only the order of the sums
+changes: the row sum and MM2 run over the window in row order rather than over the
+selection in its column order. Every window row is read, selected or not, so every row
+must be finite (see :func:`mla_masked_window_attention`). :func:`masked_window_serves` decides from
+shapes alone whether a call is cheaper here than gathered, and whether the window fits.
 
 This module never decides the regime and holds no model dial: the caller passes the
 window and each row's causal length. The call site is
@@ -89,6 +88,8 @@ MOVING_MAX = 512
 LATENT_MAX = 512
 #: PE transposes of 128 fp32 columns that fill one 2 KB PSUM bank.
 _TRANSPOSES_PER_BANK = MOVING_MAX // ROW_TILE
+#: PSUM bytes per partition of one bank, the extent of one matmul or transpose output.
+_PSUM_BANK_BYTES = 2048
 #: The most window rows one call stages: 20 chunks of 128. The kernel holds the window
 #: in SBUF twice (rows on partitions and transposed) plus fp32 score rows of the window's
 #: width: 33 bytes per window row per partition plus 6336 bytes. At 2560 rows that is
@@ -327,7 +328,7 @@ _W_COLS = 2     # every window row's column index, the same on every partition
 
 def _window_operands(window_hbm, key_rows, latent):
     """The window in SBUF twice (keys on partitions, and transposed) and its column index."""
-    ops = _window_rows(window_hbm, key_rows, latent)
+    ops = _window_rows(window_hbm, key_rows, latent, False)
     width = ops[_W_T].shape[2]
     # ---- the column index of every window row, the same on every partition -----------
     cols_f = _sb((ROW_TILE, width), nl.float32)
@@ -336,12 +337,15 @@ def _window_operands(window_hbm, key_rows, latent):
     return ops
 
 
-def _window_rows(window_hbm, key_rows, latent):
+def _window_rows(window_hbm, key_rows, latent, banked):
     """The window in SBUF twice: ``[c_rows, c_t]``, keys on partitions and transposed.
 
     ``c_rows`` is ``[128, chunks, L]`` (row ``ck * 128 + p`` on partition ``p``, the last
     chunk's pad rows zeroed) and ``c_t`` ``[128, L / 128, chunks * 128]`` (latent tile
-    ``li`` on the partitions).
+    ``li`` on the partitions). ``c_t`` is built by PE transposes of 128 x 128 blocks. With
+    ``banked``, the transposes of as many chunks as fill one PSUM bank reach ``c_t`` in one
+    copy on the scalar engine (the masked kernel, whose Vector engine binds); without it,
+    each block is copied by itself on the engine the compiler picks (the dense kernels).
     """
     n_lat = latent // LATENT_TILE
     n_chunks = (key_rows + KEY_CHUNK - 1) // KEY_CHUNK
@@ -360,14 +364,30 @@ def _window_rows(window_hbm, key_rows, latent):
 
     # ---- the window again, latent on partitions: MM1's moving operand ----------------
     c_t = _sb((LATENT_TILE, n_lat, width), kv_dtype)
-    for ck in range(n_chunks):
-        t_ps = nl.ndarray((LATENT_TILE, n_lat * KEY_CHUNK), dtype=kv_dtype, buffer=nl.psum)
-        for li in range(n_lat):
-            nisa.nc_transpose(dst=t_ps[:, li * KEY_CHUNK:(li + 1) * KEY_CHUNK],
-                              data=c_rows[:, ck, li * LATENT_TILE:(li + 1) * LATENT_TILE])
-        for li in range(n_lat):
-            nisa.tensor_copy(dst=c_t[:, li, ck * KEY_CHUNK:(ck + 1) * KEY_CHUNK],
-                             src=t_ps[:, li * KEY_CHUNK:(li + 1) * KEY_CHUNK])
+    if banked:
+        # A 2-byte chunk transposed is L / 128 blocks of 128 x 128: 2 L bytes per partition.
+        per_bank = _PSUM_BANK_BYTES // (2 * latent)
+        for c0 in range(0, n_chunks, per_bank):
+            nc = min(per_bank, n_chunks - c0)
+            t_ps = nl.ndarray((LATENT_TILE, n_lat, per_bank * KEY_CHUNK), dtype=kv_dtype,
+                              buffer=nl.psum)
+            for j in range(nc):
+                for li in range(n_lat):
+                    nisa.nc_transpose(
+                        dst=t_ps[:, li, j * KEY_CHUNK:(j + 1) * KEY_CHUNK],
+                        data=c_rows[:, c0 + j, li * LATENT_TILE:(li + 1) * LATENT_TILE])
+            nisa.tensor_copy(dst=c_t[:, :, c0 * KEY_CHUNK:(c0 + nc) * KEY_CHUNK],
+                             src=t_ps[:, :, 0:nc * KEY_CHUNK], engine=nisa.engine.scalar)
+    else:
+        for ck in range(n_chunks):
+            t_ps = nl.ndarray((LATENT_TILE, n_lat * KEY_CHUNK), dtype=kv_dtype,
+                              buffer=nl.psum)
+            for li in range(n_lat):
+                nisa.nc_transpose(dst=t_ps[:, li * KEY_CHUNK:(li + 1) * KEY_CHUNK],
+                                  data=c_rows[:, ck, li * LATENT_TILE:(li + 1) * LATENT_TILE])
+            for li in range(n_lat):
+                nisa.tensor_copy(dst=c_t[:, li, ck * KEY_CHUNK:(ck + 1) * KEY_CHUNK],
+                                 src=t_ps[:, li * KEY_CHUNK:(li + 1) * KEY_CHUNK])
     ops = []
     ops.append(c_rows)
     ops.append(c_t)
@@ -793,46 +813,223 @@ def mla_dense_window_attention_partial(q_lift: Tensor, c_kv: Tensor, owned_lens:
 
 
 # --------------------------------------------------------------------------- #
-# Masked mode: the sparse selection as a bias over the resident window.
+# Masked mode: the sparse selection as a predicate over the resident window.
 #
 # Work is dealt by 128-query block, and a block's tiles are head-major (128 queries of
-# one head), so a block's heads share its bias:
-# * the bias. The last column of the g-th group of P columns names a complete selected
-#   pool (or holds -1); each such pool id marks itself in a ramp of the pool ids, 8 ids per
-#   ``nc_match_replace8``. A marked pool keeps its P rows; the open pool (the one holding
-#   the query's last row, ``seq - 1``) keeps ``seq % P``; every other pool keeps none. Row
-#   ``P * p + r`` is biased by 0.0 where ``r < keep[p]`` and by _UNSELECTED_BIAS elsewhere,
-#   as one tile of the window's dtype.
-# * per head: MM1 of every 512-row block of the window into fp32 PSUM, with the bias added
-#   by one identity matmul into the same accumulation (+0.0 on a selected row, exact).
-#   Pass 1 takes the row maximum, pass 2 the exp and its sum, pass 3 the exp again,
-#   normalised, put on the key partitions by PE transposes, split hi/lo, and MM2 into one
-#   PSUM bank over the whole window.
-# The scores are recomputed rather than kept: a window-wide fp32 row (32 KiB per partition
-# at 8192 rows) would crowd the resident window out of SBUF, and the PE has the slack (the
-# bias's Vector-engine passes bound a block).
+# one head), so a block's heads share its predicate:
+# * which pools a query selects. The last column of the g-th group of P columns names a
+#   complete selected pool (or holds -1). A pool id is split as a count row, a word of
+#   that row and a bit of that word (:func:`_pool_split`), and the PE sums, per query, the
+#   one-hot row of each group's count row times its word weighted 2 ** bit: ``count[row,
+#   word] = sum_g [row_g == row] [word_g == word] 2 ** bit_g``, whose set bits are the
+#   selected pools, exact in fp32. The groups ride the contraction partitions (one PE
+#   transpose of the ids per 128 groups), so a group costs ``row_width + 2 * words``
+#   elements on the Vector engine instead of a compare against every pool. A selected pool
+#   keeps its P rows; the open pool (the one holding the query's last row, ``seq - 1``)
+#   keeps its first ``seq % P``; every other pool keeps none: one uint8 predicate tile
+#   over the window.
+# * per head: MM1 of every 512-row block of the window into fp32 PSUM, copied into one fp32
+#   score row by the predicate (an unselected row reads _UNSELECTED_SCORE), the block
+#   maximum taken by the same instruction; then the exp of the row against its maximum, in
+#   place, with its block sums; then p normalised, put on the key partitions by PE
+#   transposes, split hi/lo, and MM2 into one PSUM bank over the whole window.
+# The score row is kept (4 bytes per window row per partition) so MM1 runs once.
 # --------------------------------------------------------------------------- #
 
-#: Ids one ``nc_match_replace8`` matches per partition: a Vector-engine fact.
-MATCH_WIDTH = 8
-#: The bias of a window row outside the selection: a power of two, exact in bf16, and so
-#: far below any score that ``exp(scale * (s + bias - max))`` is exactly 0.0.
-_UNSELECTED_BIAS = -(2.0 ** 30)
+#: The score a window row outside the selection reads: a power of two so far below any
+#: score that ``exp(scale * (_UNSELECTED_SCORE - max))`` is exactly 0.0.
+_UNSELECTED_SCORE = -(2.0 ** 30)
 #: The row-max floor: a query that selects no row exponentiates every row to 0.0 and
 #: returns zeros (its sum is floored at _TOTAL_FLOOR).
-_SELECTED_MAX_FLOOR = _UNSELECTED_BIAS / 2
-#: The value a matched pool id is replaced by: below -1, the id of an empty group.
-_MATCHED = -2.0
+_SELECTED_MAX_FLOOR = _UNSELECTED_SCORE / 2
+#: Queries whose one-hot rows and pool counts one pass of the selection count builds.
+_COUNT_QUERIES = 128
+#: Pools per count word: pool ``b`` of a word weighs ``2 ** b`` in the count's fp8 e5m2
+#: operand, which holds 2**0 .. 2**15 exactly, and a word's count, a sum of distinct
+#: weights, is at most 2**16 - 1: exact in fp32 (PSUM and SBUF) and in int32.
+_WORD_BITS = 16
 #: SBUF bytes per partition on this core (224 KiB).
 SBUF_PARTITION_BYTES = 229376
 
 
-def _selection_bias(index_hbm, s0, qn, pool_size, pool_ids, bias):
-    """Fill ``bias[q, p, r]`` (window row ``p * P + r``) for queries ``s0 .. s0 + qn - 1``.
+def _pool_split(pools: int) -> tuple[int, int]:
+    """``(row_width, words)``: with ``B`` = _WORD_BITS, pool ``p`` is bit ``p % B`` of word
+    ``(p // B) % words`` of count row ``p // (B * words)``.
 
-    ``index_hbm`` is the selection ``[S, cols]`` int32, ``pool_ids`` the fp32 ramp
-    ``0 .. pools - 1`` on every partition, and ``bias`` a ``[128, pools, P]`` tile of the
-    window's dtype: 0.0 on a row the query selects, :data:`_UNSELECTED_BIAS` elsewhere.
+    A group costs the Vector engine ``row_width`` one-hot elements and ``2 * words``
+    encoded ones (:func:`_selected_pools`), with ``B * row_width * words >= pools``.
+    ``words`` is the largest power of two with ``2 * B * words ** 2 <= pools``, which keeps
+    the sum within about 1.25x of its least, ``sqrt(8 * pools / B)``, and both widths at
+    most ``sqrt(2 * pools / B) + 1``: below 256, so every field and ramp value is an integer
+    exact in bf16, for any window below 65536 pools, far past what SBUF holds.
+    """
+    words = 1
+    for k in range(1, 16):
+        if 2 * _WORD_BITS * (1 << (2 * k)) <= pools:
+            words = 1 << k
+    return -(-pools // (_WORD_BITS * words)), words
+
+
+def _log2(n: int) -> int:
+    """``log2(n)`` of a power of two ``n`` below 2**31 (a loop the kernel front end traces)."""
+    k = 0
+    for i in range(1, 31):
+        if (1 << i) <= n:
+            k = i
+    return k
+
+
+# Fields of a group's pool id in the count's id tiles (:func:`_selected_pools`).
+_ID_ROW = 0         # the count row, one-hot over row_width
+_ID_WORD = 1        # the word of the row, one-hot over words
+_ID_WEIGHT = 2      # 2 ** bit, the pool's weight in its word
+_ID_FIELDS = 3
+
+
+def _selected_pools(rows_i, qn, pool_size, row_ramp, word_ramp, sel_i):
+    """Fill ``sel_i[q, p]`` with 1 where query row ``q`` selects complete pool ``p``, else 0.
+
+    ``rows_i`` holds the block's selection rows ``[128, cols]`` int32 (rows ``0 .. qn -
+    1``); ``row_ramp`` and ``word_ramp`` are the bf16 ramps ``[128, row_width, Q]`` and
+    ``[128, words, Q]`` (value ``v`` at ``[:, v, :]``, every partition and query column
+    alike; ``Q`` is _COUNT_QUERIES); ``sel_i`` is a ``[128, B * row_width * words]`` int32
+    tile, ``B`` being _WORD_BITS.
+
+    The last column of group ``g`` holds ``P * id + P - 1`` for a complete pool ``id`` and
+    -1 otherwise (:func:`_selection_predicate`). Shifted right by ``log2 P`` it is the id,
+    split as count row, word and bit (:func:`_pool_split`); from a -1 the count row is a
+    value no ramp holds (-1, or a large value if the shift is logical), so the group's
+    one-hot row is zero. Per query the PE sums ``count[row, word] = sum_g [row_g == row]
+    [word_g == word] 2 ** bit_g``. A query names each pool at most once
+    (:func:`mla_masked_window_kernel`), so a word's count is a sum of distinct powers of
+    two, and its set bits are the pools the query selects. Every field is a small integer,
+    exact in bf16 (:func:`_pool_split`), every weight a power of two at most 2**15, exact in
+    bf16 and fp8 e5m2, and every count at most 2**16 - 1, exact in fp32 and int32. Every PE
+    transpose is bit-accurate on this core, so the counts reach the query partitions exact.
+
+    No count accumulates in PSUM: each group tile's matmul writes its partial count whole,
+    and the partial counts, sums over disjoint groups, are added on the query partitions.
+    The Tensor Engine tracks accumulation per PSUM bank, and a matmul that starts a group
+    resets the bank, so the chains of the queries sharing one, which the scheduler
+    interleaves, would lose terms; the NKI simulator, running the program order, does not
+    show it. The matmuls are plain: in double-row mode the PE adds a partition's two
+    products before the column sum and keeps only the larger when their exponents differ
+    by 11 or more, which a count of distinct powers of two cannot afford.
+    """
+    cols = rows_i.shape[1]
+    groups_n = cols // pool_size
+    row_width = row_ramp.shape[1]
+    words = word_ramp.shape[1]
+    n_gt = -(-groups_n // ROW_TILE)
+    pool_shift = _log2(pool_size)
+    bit_shift = _log2(_WORD_BITS)
+
+    # ---- each group's pool id as count row, word and 2 ** bit, in fp32 for the PE ---------
+    last = rows_i.reshape((ROW_TILE, groups_n, pool_size))[0:qn, :, pool_size - 1]
+    part_i = _sb((ROW_TILE, groups_n), nl.int32)
+    ids_f = _sb((ROW_TILE, _ID_FIELDS, groups_n), nl.float32)
+    nisa.tensor_scalar(dst=part_i[0:qn, :], data=last, op0=nl.right_shift,
+                       operand0=pool_shift + bit_shift + _log2(words),
+                       engine=nisa.engine.vector)
+    nisa.tensor_copy(dst=ids_f[0:qn, _ID_ROW, :], src=part_i[0:qn, :],
+                     engine=nisa.engine.vector)
+    nisa.tensor_scalar(dst=part_i[0:qn, :], data=last, op0=nl.right_shift,
+                       operand0=pool_shift + bit_shift, op1=nl.bitwise_and,
+                       operand1=words - 1, engine=nisa.engine.vector)
+    nisa.tensor_copy(dst=ids_f[0:qn, _ID_WORD, :], src=part_i[0:qn, :],
+                     engine=nisa.engine.vector)
+    nisa.tensor_scalar(dst=part_i[0:qn, :], data=last, op0=nl.right_shift,
+                       operand0=pool_shift, op1=nl.bitwise_and, operand1=_WORD_BITS - 1,
+                       engine=nisa.engine.vector)
+    nisa.tensor_scalar(dst=part_i[0:qn, :], data=part_i[0:qn, :], op0=nl.left_shift,
+                       operand0=1, reverse0=True, engine=nisa.engine.vector)
+    nisa.tensor_copy(dst=ids_f[0:qn, _ID_WEIGHT, :], src=part_i[0:qn, :],
+                     engine=nisa.engine.vector)
+
+    # ---- the groups onto the partitions: [group, field, tile, query], 128 groups a tile ---
+    ids_t = _sb((ROW_TILE, _ID_FIELDS, n_gt, ROW_TILE), nl.bfloat16)
+    for t in range(n_gt):
+        g0 = t * ROW_TILE
+        gt = min(ROW_TILE, groups_n - g0)
+        ids_ps = nl.ndarray((ROW_TILE, _ID_FIELDS, ROW_TILE), dtype=nl.float32,
+                            buffer=nl.psum)
+        for f in range(_ID_FIELDS):
+            nisa.nc_transpose(dst=ids_ps[0:gt, f, 0:qn], data=ids_f[0:qn, f, g0:g0 + gt])
+        nisa.tensor_copy(dst=ids_t[0:gt, :, t, 0:qn], src=ids_ps[0:gt, :, 0:qn],
+                         engine=nisa.engine.scalar)
+
+    # ---- count[row, (q, word)]: per query, its groups' one-hot rows times weighted words ---
+    # The one-hot and word tiles are [group, tile, value, query], the query innermost: the
+    # ids broadcast over the value axis and the ramps are materialised, so every operand
+    # streams with unit stride. Every operand is exact in fp8 (the one-hot rows in e4m3,
+    # the weighted words in e5m2). Per query, each group tile's matmul writes its partial
+    # count whole (accumulate=False); a PSUM bank holds every tile's partial counts of
+    # ``bank_queries`` queries, copied out together.
+    bank_queries = _PSUM_BANK_BYTES // (4 * n_gt * words)
+    counts = _sb((ROW_TILE, n_gt, ROW_TILE, words), nl.float32)
+    for qs0 in range(0, qn, _COUNT_QUERIES):
+        qs_n = min(_COUNT_QUERIES, qn - qs0)
+        oh_row = _sb((ROW_TILE, n_gt, row_width, _COUNT_QUERIES), nl.float8_e4m3)
+        weighted = _sb((ROW_TILE, n_gt, words, _COUNT_QUERIES), nl.float8_e5m2)
+        hit = _sb((ROW_TILE, words, _COUNT_QUERIES), nl.bfloat16)
+        for t in range(n_gt):
+            gt = min(ROW_TILE, groups_n - t * ROW_TILE)
+            nisa.tensor_tensor(
+                dst=oh_row[0:gt, t, :, 0:qs_n],
+                data1=ids_t[0:gt, _ID_ROW, t, qs0:qs0 + qs_n].expand_dim(1).broadcast(
+                    1, row_width),
+                data2=row_ramp[0:gt, :, 0:qs_n], op=nl.equal, engine=nisa.engine.vector)
+            nisa.tensor_tensor(
+                dst=hit[0:gt, :, 0:qs_n],
+                data1=ids_t[0:gt, _ID_WORD, t, qs0:qs0 + qs_n].expand_dim(1).broadcast(
+                    1, words),
+                data2=word_ramp[0:gt, :, 0:qs_n], op=nl.equal, engine=nisa.engine.vector)
+            nisa.tensor_tensor(
+                dst=weighted[0:gt, t, :, 0:qs_n], data1=hit[0:gt, :, 0:qs_n],
+                data2=ids_t[0:gt, _ID_WEIGHT, t, qs0:qs0 + qs_n].expand_dim(1).broadcast(
+                    1, words),
+                op=nl.multiply, engine=nisa.engine.vector)
+        for qb0 in range(0, qs_n, bank_queries):
+            qb_n = min(bank_queries, qs_n - qb0)
+            count_ps = nl.ndarray((row_width, n_gt, bank_queries, words), dtype=nl.float32,
+                                  buffer=nl.psum)
+            for j in range(qb_n):
+                qq = qb0 + j
+                for t in range(n_gt):
+                    gt = min(ROW_TILE, groups_n - t * ROW_TILE)
+                    nisa.nc_matmul(dst=count_ps[:, t, j, :], stationary=oh_row[0:gt, t, :, qq],
+                                   moving=weighted[0:gt, t, :, qq], accumulate=False)
+            q0 = qs0 + qb0
+            nisa.tensor_copy(dst=counts[0:row_width, :, q0:q0 + qb_n, :],
+                             src=count_ps[:, :, 0:qb_n, :], engine=nisa.engine.scalar)
+
+    # ---- back onto the query partitions, the partial counts added; bit b of word w of row r:
+    # pool (r, w, b). A PSUM bank takes every tile's transposes of ``per_bank`` words.
+    mask_i = _sb((ROW_TILE, row_width, words), nl.int32)
+    per_bank = _PSUM_BANK_BYTES // (4 * n_gt * row_width)
+    for w0 in range(0, words, per_bank):
+        nw = min(per_bank, words - w0)
+        back_ps = nl.ndarray((ROW_TILE, n_gt, per_bank, row_width), dtype=nl.float32,
+                             buffer=nl.psum)
+        for j in range(nw):
+            for t in range(n_gt):
+                nisa.nc_transpose(dst=back_ps[0:qn, t, j, :],
+                                  data=counts[0:row_width, t, 0:qn, w0 + j])
+        nisa.tensor_reduce(dst=mask_i[0:qn, :, w0:w0 + nw].permute((0, 2, 1)), op=nl.add,
+                           data=back_ps[0:qn, :, 0:nw, :].permute((0, 2, 3, 1)), axis=3)
+    sel4 = sel_i.reshape((ROW_TILE, row_width, words, _WORD_BITS))
+    for b in range(_WORD_BITS):
+        nisa.tensor_scalar(dst=sel4[0:qn, :, :, b], data=mask_i[0:qn, :, :], op0=nl.right_shift,
+                           operand0=b, op1=nl.bitwise_and, operand1=1, engine=nisa.engine.vector)
+
+
+def _selection_predicate(index_hbm, s0, qn, pool_size, row_ramp, word_ramp, pool_ids, ranks,
+                         pred):
+    """Fill ``pred[q, p, r]`` (window row ``p * P + r``) for queries ``s0 .. s0 + qn - 1``.
+
+    ``pool_ids`` is the fp32 ramp ``1 .. pools`` on every partition (pool ``p`` at column
+    ``p``, valued ``p + 1``), ``ranks`` the fp32 ramp ``1 .. P`` and ``pred`` a ``[128,
+    pools, P]`` uint8 tile: 1 on a row the query selects, 0 elsewhere.
 
     Two layouts reach here, and both are read the same way, one group of ``P`` columns at a
     time. ``dsa_index_expand`` writes the g-th selected pool's rows ``P * id + o`` at
@@ -842,42 +1039,27 @@ def _selection_bias(index_hbm, s0, qn, pool_size, pool_ids, bias):
     holds a row names a complete pool (``row // P``), any other group's last column is -1,
     every row is below the query's causal length ``seq``, and the open pool's rows ``P *
     (seq // P) .. seq - 1`` are all present, so ``seq`` is the largest row plus one whenever
-    that pool is not empty. Every group is matched, so the count of selected pools is not
+    that pool is not empty. Every group is counted, so the count of selected pools is not
     needed. Every row is far below 2**24, so its fp32 value is exact, and ``P`` is a power
-    of two, so the scalings by ``1 / P`` are exact.
-    """
-    cols = index_hbm.shape[1]
-    groups_n = cols // pool_size
-    pools = pool_ids.shape[1]
-    inv_pool = 1.0 / pool_size
+    of two, so the scalings by ``1 / P`` are exact. The open pool is found first, so the
+    selection rows are dead before the count's one-hot tiles are allocated.
 
+    A complete pool lies below ``seq``, so it is never the open pool, and row ``r`` of pool
+    ``p`` is attended when ``p`` is selected or is the open pool with ``r < seq % P``: per
+    row, one compare of the 1-based pool ids against ``open + 1`` (against 0, which no id
+    holds, where ``r >= seq % P``), taken with the larger of the selection bit.
+    """
+    pools = pool_ids.shape[1]
+    row_width, words = row_ramp.shape[1], word_ramp.shape[1]
+    cols = index_hbm.shape[1]
+    inv_pool = 1.0 / pool_size
     rows_i = _sb((ROW_TILE, cols), nl.int32)
     nisa.dma_copy(dst=rows_i[0:qn, :],
                   src=index_hbm.ap(pattern=[[cols, qn], [1, cols]], offset=s0 * cols))
-    rows_f = _sb((ROW_TILE, cols), nl.float32)
-    nisa.tensor_copy(dst=rows_f[0:qn, :], src=rows_i[0:qn, :], engine=nisa.engine.vector)
-
-    # ---- each group's complete pool: (last + 1) / P - 1, and -1 for an empty group -------
-    groups = rows_f.reshape((ROW_TILE, groups_n, pool_size))
-    picked = _sb((ROW_TILE, groups_n), nl.float32)
-    nisa.tensor_scalar(dst=picked[0:qn, :], data=groups[0:qn, :, pool_size - 1],
-                       op0=nl.multiply, operand0=inv_pool, op1=nl.add,
-                       operand1=inv_pool - 1.0, engine=nisa.engine.vector)
-
-    # ---- keep[q, p]: P where the query selects pool p, by marking its id ----------------
-    # The mark is below -1, the value of an empty group, so no id matches a mark.
-    keep = _sb((ROW_TILE, pools), nl.float32)
-    nisa.tensor_copy(dst=keep[0:qn, :], src=pool_ids[0:qn, :], engine=nisa.engine.vector)
-    for g in range(groups_n // MATCH_WIDTH):
-        nisa.nc_match_replace8(dst=keep[0:qn, :], data=keep[0:qn, :],
-                               vals=picked[0:qn, g * MATCH_WIDTH:(g + 1) * MATCH_WIDTH],
-                               imm=_MATCHED)
-    nisa.tensor_scalar(dst=keep[0:qn, :], data=keep[0:qn, :], op0=nl.less, operand0=-1.0,
-                       op1=nl.multiply, operand1=float(pool_size), engine=nisa.engine.vector)
 
     # ---- the open pool keeps its rows below seq: seq % P of them --------------------------
     seq_f = _col(ROW_TILE, nl.float32)
-    nisa.tensor_reduce(dst=seq_f[0:qn, :], op=nl.maximum, data=rows_f[0:qn, :], axis=1)
+    nisa.tensor_reduce(dst=seq_f[0:qn, :], op=nl.maximum, data=rows_i[0:qn, :], axis=1)
     nisa.tensor_scalar(dst=seq_f[0:qn, :], data=seq_f[0:qn, :], op0=nl.add, operand0=1.0,
                        engine=nisa.engine.vector)
     seq_i = _col(ROW_TILE, nl.int32)
@@ -887,60 +1069,64 @@ def _selection_bias(index_hbm, s0, qn, pool_size, pool_ids, bias):
                        operand0=pool_size - 1, engine=nisa.engine.vector)
     count = _col(ROW_TILE, nl.float32)
     nisa.tensor_copy(dst=count[0:qn, :], src=rem_i[0:qn, :], engine=nisa.engine.vector)
-    open_id = _col(ROW_TILE, nl.float32)
-    nisa.tensor_tensor(dst=open_id[0:qn, :], data1=seq_f[0:qn, :], data2=count[0:qn, :],
+    # open + 1 = (seq - seq % P) / P + 1, the open pool's 1-based id
+    open_1 = _col(ROW_TILE, nl.float32)
+    nisa.tensor_tensor(dst=open_1[0:qn, :], data1=seq_f[0:qn, :], data2=count[0:qn, :],
                        op=nl.subtract, engine=nisa.engine.vector)
-    nisa.tensor_scalar(dst=open_id[0:qn, :], data=open_id[0:qn, :], op0=nl.multiply,
-                       operand0=inv_pool, engine=nisa.engine.vector)
-    opened = _sb((ROW_TILE, pools), bias.dtype)
-    nisa.tensor_scalar(dst=opened[0:qn, :], data=pool_ids[0:qn, :], op0=nl.equal,
-                       operand0=open_id[0:qn, :], op1=nl.multiply, operand1=count[0:qn, :],
+    nisa.tensor_scalar(dst=open_1[0:qn, :], data=open_1[0:qn, :], op0=nl.multiply,
+                       operand0=inv_pool, op1=nl.add, operand1=1.0, engine=nisa.engine.vector)
+
+    sel_i = _sb((ROW_TILE, _WORD_BITS * row_width * words), nl.int32)
+    _selected_pools(rows_i, qn, pool_size, row_ramp, word_ramp, sel_i)
+
+    # ---- row r of a pool: its bit, or the open pool's while r < seq % P -------------------
+    # target[q, r] = open + 1 where r + 1 <= seq % P, else 0 (no pool's 1-based id)
+    target = _sb((ROW_TILE, pool_size), nl.float32)
+    nisa.tensor_scalar(dst=target[0:qn, :], data=ranks[0:qn, :], op0=nl.less_equal,
+                       operand0=count[0:qn, :], op1=nl.multiply, operand1=open_1[0:qn, :],
                        engine=nisa.engine.vector)
-    nisa.tensor_tensor(dst=keep[0:qn, :], data1=keep[0:qn, :], data2=opened[0:qn, :],
-                       op=nl.add, engine=nisa.engine.vector)
-
-    # ---- the bias of row P * p + r: 0.0 while r < keep[p] ---------------------------------
     for r in range(pool_size):
-        nisa.tensor_scalar(dst=bias[0:qn, :, r], data=keep[0:qn, :], op0=nl.less_equal,
-                           operand0=float(r), op1=nl.multiply, operand1=_UNSELECTED_BIAS,
-                           engine=nisa.engine.vector)
+        nisa.scalar_tensor_tensor(dst=pred[0:qn, :, r], data=pool_ids[0:qn, :], op0=nl.equal,
+                                  operand0=target[0:qn, r:r + 1], op1=nl.maximum,
+                                  operand1=sel_i[0:qn, 0:pools])
 
 
-def _biased_scores(q_t, k_t, bias_rows, ident, rt, t0, tw):
-    """``[128, 512]`` fp32 PSUM: rows ``0 .. rt - 1`` hold ``q . window + bias`` over rows
-    ``t0 .. t0 + tw - 1``. The bias rides the same accumulation as one identity matmul."""
+def _window_scores(q_t, k_t, rt, t0, tw):
+    """``[128, 512]`` fp32 PSUM: rows ``0 .. rt - 1`` hold ``q . window`` over rows
+    ``t0 .. t0 + tw - 1``."""
     n_lat = q_t.shape[1]
     s_ps = nl.ndarray((ROW_TILE, MOVING_MAX), dtype=nl.float32, buffer=nl.psum)
     for li in range(n_lat):
         nisa.nc_matmul(dst=s_ps[0:rt, 0:tw], stationary=q_t[:, li, 0:rt],
                        moving=k_t[:, li, t0:t0 + tw], accumulate=(li > 0))
-    nisa.nc_matmul(dst=s_ps[0:rt, 0:tw], stationary=ident[0:rt, 0:rt],
-                   moving=bias_rows[0:rt, t0:t0 + tw], accumulate=True)
     return s_ps
 
 
-def _masked_tile(q_hbm, out_hbm, k_t, v_rows, bias_rows, ident, softmax_scale, rt,
-                 row_stride, row_off):
+def _masked_tile(q_hbm, out_hbm, k_t, v_rows, pred_rows, softmax_scale, rt, row_stride,
+                 row_off):
     """One tile of ``rt`` query rows of one head over the whole window: softmax, MM2, store.
 
     Row ``p`` of the tile reads its query at element ``row_off + p * row_stride`` of
-    ``q_hbm`` and writes its output at the same element of ``out_hbm``; ``bias_rows[p]``
-    is its query's bias over the window.
+    ``q_hbm`` and writes its output at the same element of ``out_hbm``; ``pred_rows[p]``
+    is its query's predicate over the window.
     """
     latent = v_rows.shape[2]
-    width = bias_rows.shape[1]
+    width = pred_rows.shape[1]
     kv_dtype = v_rows.dtype
     n_blocks = (width + MOVING_MAX - 1) // MOVING_MAX
     q_t = _query_columns(q_hbm, rt, row_stride, row_off, latent)
 
-    # ---- pass 1: the row maximum over the selected rows ------------------------------
+    # ---- MM1 once: the selected scores and the block maxima -------------------------
+    scores = _sb((ROW_TILE, width), nl.float32)
     block_max = _sb((ROW_TILE, n_blocks), nl.float32)
     for b in range(n_blocks):
         t0 = b * MOVING_MAX
         tw = min(MOVING_MAX, width - t0)
-        s_ps = _biased_scores(q_t, k_t, bias_rows, ident, rt, t0, tw)
-        nisa.tensor_reduce(dst=block_max[0:rt, b:b + 1], op=nl.maximum, data=s_ps[0:rt, 0:tw],
-                           axis=1)
+        s_ps = _window_scores(q_t, k_t, rt, t0, tw)
+        nisa.select_reduce(dst=scores[0:rt, t0:t0 + tw], predicate=pred_rows[0:rt, t0:t0 + tw],
+                           on_true=s_ps[0:rt, 0:tw], on_false=_UNSELECTED_SCORE,
+                           reduce_res=block_max[0:rt, b:b + 1],
+                           reduce_cmd=nisa.reduce_cmd.reset_reduce, reduce_op=nl.maximum)
     row_max = _col(ROW_TILE, nl.float32)
     nisa.tensor_reduce(dst=row_max[0:rt, :], op=nl.maximum, data=block_max[0:rt, :], axis=1)
     nisa.tensor_scalar(dst=row_max[0:rt, :], data=row_max[0:rt, :], op0=nl.maximum,
@@ -949,14 +1135,12 @@ def _masked_tile(q_hbm, out_hbm, k_t, v_rows, bias_rows, ident, softmax_scale, r
     nisa.tensor_scalar(dst=neg_top[0:rt, :], data=row_max[0:rt, :], op0=nl.multiply,
                        operand0=-softmax_scale, engine=nisa.engine.vector)
 
-    # ---- pass 2: the sum of the exps -----------------------------------------------------
+    # ---- the exps in place and their block sums --------------------------------------
     block_sum = _sb((ROW_TILE, n_blocks), nl.float32)
     for b in range(n_blocks):
         t0 = b * MOVING_MAX
         tw = min(MOVING_MAX, width - t0)
-        s_ps = _biased_scores(q_t, k_t, bias_rows, ident, rt, t0, tw)
-        p_sum = _sb((ROW_TILE, MOVING_MAX), nl.float32)
-        nisa.activation(dst=p_sum[0:rt, 0:tw], op=nl.exp, data=s_ps[0:rt, 0:tw],
+        nisa.activation(dst=scores[0:rt, t0:t0 + tw], op=nl.exp, data=scores[0:rt, t0:t0 + tw],
                         bias=neg_top[0:rt, :], scale=softmax_scale, reduce_op=nl.add,
                         reduce_res=block_sum[0:rt, b:b + 1],
                         reduce_cmd=nisa.reduce_cmd.reset_reduce)
@@ -967,16 +1151,13 @@ def _masked_tile(q_hbm, out_hbm, k_t, v_rows, bias_rows, ident, softmax_scale, r
     recip = _col(ROW_TILE, nl.float32)
     nisa.reciprocal(dst=recip[0:rt, :], data=row_sum[0:rt, :])
 
-    # ---- pass 3: p normalised, onto the key partitions, hi/lo, MM2 ---------------------
+    # ---- p normalised, onto the key partitions, hi/lo, MM2 ---------------------------
     pv_ps = nl.ndarray((ROW_TILE, latent), dtype=nl.float32, buffer=nl.psum)
     for b in range(n_blocks):
         t0 = b * MOVING_MAX
         tw = min(MOVING_MAX, width - t0)
-        s_ps = _biased_scores(q_t, k_t, bias_rows, ident, rt, t0, tw)
-        p = _sb((ROW_TILE, MOVING_MAX), nl.float32)
-        nisa.activation(dst=p[0:rt, 0:tw], op=nl.exp, data=s_ps[0:rt, 0:tw],
-                        bias=neg_top[0:rt, :], scale=softmax_scale)
-        nisa.tensor_scalar(dst=p[0:rt, 0:tw], data=p[0:rt, 0:tw], op0=nl.multiply,
+        p = scores[:, t0:t0 + tw]
+        nisa.tensor_scalar(dst=p[0:rt, :], data=p[0:rt, :], op0=nl.multiply,
                            operand0=recip[0:rt, :], engine=nisa.engine.vector)
         n_ck = tw // KEY_CHUNK
         pt_ps = nl.ndarray((KEY_CHUNK, _TRANSPOSES_PER_BANK * ROW_TILE), dtype=nl.float32,
@@ -1012,16 +1193,21 @@ def _masked_tile(q_hbm, out_hbm, k_t, v_rows, bias_rows, ident, softmax_scale, r
                   src=out_sb[0:rt, :])
 
 
-def _masked_block(q_hbm, index_hbm, out_hbm, k_t, v_rows, pool_ids, ident, softmax_scale,
-                  pool_size, s0, qn):
-    """Queries ``s0 .. s0 + qn - 1``, every head: their bias once, then one tile per head."""
+def _masked_block(q_hbm, index_hbm, out_hbm, k_t, v_rows, consts, softmax_scale, pool_size,
+                  s0, qn):
+    """Queries ``s0 .. s0 + qn - 1``, every head: their predicate once, then one tile per head.
+
+    ``consts`` is ``[row_ramp, word_ramp, pool_ids, ranks]`` (:func:`_masked_body`).
+    """
     heads, latent = q_hbm.shape[1], q_hbm.shape[2]
+    pool_ids = consts[2]
     pools = pool_ids.shape[1]
-    bias = _sb((ROW_TILE, pools, pool_size), v_rows.dtype)
-    _selection_bias(index_hbm, s0, qn, pool_size, pool_ids, bias)
-    bias_rows = bias.reshape((ROW_TILE, pools * pool_size))
+    pred = _sb((ROW_TILE, pools, pool_size), nl.uint8)
+    _selection_predicate(index_hbm, s0, qn, pool_size, consts[0], consts[1], pool_ids,
+                         consts[3], pred)
+    pred_rows = pred.reshape((ROW_TILE, pools * pool_size))
     for h in range(heads):
-        _masked_tile(q_hbm, out_hbm, k_t, v_rows, bias_rows, ident, softmax_scale, qn,
+        _masked_tile(q_hbm, out_hbm, k_t, v_rows, pred_rows, softmax_scale, qn,
                      heads * latent, (s0 * heads + h) * latent)
 
 
@@ -1035,22 +1221,33 @@ def _masked_body(q_hbm, window_hbm, index_hbm, softmax_scale, key_rows, pool_siz
     trace-time int.
     """
     seq, latent = q_hbm.shape[0], q_hbm.shape[2]
-    ops = _window_rows(window_hbm, key_rows, latent)
+    ops = _window_rows(window_hbm, key_rows, latent, True)
     v_rows = ops[_W_ROWS]
     k_t = ops[_W_T]
     pools = key_rows // pool_size
+    row_width, words = _pool_split(pools)
+    row_ramp = _sb((ROW_TILE, row_width, _COUNT_QUERIES), nl.bfloat16)
+    nisa.iota(dst=row_ramp, pattern=[[1, row_width], [0, _COUNT_QUERIES]], offset=0)
+    word_ramp = _sb((ROW_TILE, words, _COUNT_QUERIES), nl.bfloat16)
+    nisa.iota(dst=word_ramp, pattern=[[1, words], [0, _COUNT_QUERIES]], offset=0)
     pool_ids = _sb((ROW_TILE, pools), nl.float32)
-    nisa.iota(dst=pool_ids, pattern=[[1, pools]], offset=0)
-    ident = nl.shared_identity_matrix(n=ROW_TILE, dtype=window_hbm.dtype)
+    nisa.iota(dst=pool_ids, pattern=[[1, pools]], offset=1)
+    ranks = _sb((ROW_TILE, pool_size), nl.float32)
+    nisa.iota(dst=ranks, pattern=[[1, pool_size]], offset=1)
+    consts = []
+    consts.append(row_ramp)
+    consts.append(word_ramp)
+    consts.append(pool_ids)
+    consts.append(ranks)
     n_full = seq // ROW_TILE
     tail = seq - n_full * ROW_TILE
     n_prgs = nl.num_programs(axes=0)
     prg = nl.program_id(0)
     for qb in nl.affine_range(prg, n_full, n_prgs):
-        _masked_block(q_hbm, index_hbm, out_hbm, k_t, v_rows, pool_ids, ident, softmax_scale,
+        _masked_block(q_hbm, index_hbm, out_hbm, k_t, v_rows, consts, softmax_scale,
                       pool_size, qb * ROW_TILE, ROW_TILE)
     if tail > 0 and n_full % n_prgs == prg:
-        _masked_block(q_hbm, index_hbm, out_hbm, k_t, v_rows, pool_ids, ident, softmax_scale,
+        _masked_block(q_hbm, index_hbm, out_hbm, k_t, v_rows, consts, softmax_scale,
                       pool_size, n_full * ROW_TILE, tail)
 
 
@@ -1058,7 +1255,7 @@ def _masked_body(q_hbm, window_hbm, index_hbm, softmax_scale, key_rows, pool_siz
 def mla_masked_window_kernel(q_hbm, bank_hbm, table_hbm, index_hbm, written_hbm,
                              write_offset_hbm, softmax_scale, page_size, key_rows, pool_size,
                              source_digest=0, staging_digest=0):
-    """Attention of each query over its selected rows, as a bias over the whole window.
+    """Attention of each query over its selected rows, as a predicate over the whole window.
 
     Args:
         q_hbm: ``[S, H, L]`` bf16 or fp16, the absorbed queries. ``L`` is a multiple of
@@ -1067,9 +1264,10 @@ def mla_masked_window_kernel(q_hbm, bank_hbm, table_hbm, index_hbm, written_hbm,
         table_hbm: ``[pages, 1]`` int32, the window's pages in order (``-1`` pads).
         index_hbm: ``[S, cols]`` int32, each query's selected rows (-1 pads), in
             ``dsa_index_expand``'s layout or the short-sequence bypass's
-            (:func:`_selection_bias`): whole pools of ``P`` rows in groups of ``P``
-            columns, and the open pool's rows below the query's causal length. ``cols``
-            is a multiple of ``MATCH_WIDTH * P``. Every selected row lies in the window.
+            (:func:`_selection_predicate`): whole pools of ``P`` rows in groups of ``P``
+            columns, each pool at most once, and the open pool's rows below the query's
+            causal length. ``cols`` is a multiple of ``P``. Every selected row lies in the
+            window.
         written_hbm: ``[tokens, L]`` or None, this step's rows, overlaid on the window.
         write_offset_hbm: ``[1, 1]`` int32 or None, the window row ``written`` starts at.
         softmax_scale: python float applied to the scores before the softmax.
@@ -1105,9 +1303,16 @@ def mla_masked_window_kernel(q_hbm, bank_hbm, table_hbm, index_hbm, written_hbm,
 #: (``reports/rotational_topk.md`` section 4): 170 ns + 1.04 ns per element.
 DVE_PASS_NS = 170.0
 DVE_FP32_NS = 1.04
-#: The PE streams one 2-byte moving column per 2.4 GHz cycle; fp32 data takes 4 passes.
+#: The Vector engine's 2x mode: a bf16 ``tensor_tensor`` with every operand in SBUF takes
+#: two elements per cycle (DOCUMENTED, the architecture guide's 512 bf16 against 256 fp32
+#: input elements per cycle; ``reports/dsa_score_gemm.md`` section 5).
+DVE_BF16_NS = DVE_FP32_NS / 2
+#: The scalar engine: one element per 1.2 GHz cycle, MEASURED for ``activation`` from PSUM
+#: (``reports/dsa_score_gemm.md`` section 5: 1017-1030 ns at 1024 elements, 1878 ns at
+#: 2048), whose fixed cost, DERIVED from the same two sizes, is about DVE_PASS_NS.
+ACT_ELEMENT_NS = 0.834
+#: The PE streams one 2-byte moving column per 2.4 GHz cycle.
 PE_COLUMN_NS = 1.0 / 2.4
-PE_FP32_PASSES = 4
 #: One query's serial gather of the sparse kernel, MEASURED for 2176 rows of 1 KiB
 #: (``reports/mla_8k.md``, profile of 2026-10-10 02:35Z): descriptor generation 8.72 us and
 #: DMA 8.05 us. The sparse kernel's other costs (block waits, MM1, softmax) are left out,
@@ -1121,51 +1326,97 @@ HBM_BYTES_PER_NS = 716.0
 
 def masked_window_sbuf_bytes(key_rows: int, latent: int, pool_size: int, index_cols: int,
                              kv_bytes: int) -> int:
-    """SBUF bytes per partition of every tile the masked kernel allocates, none reused.
+    """SBUF bytes per partition at the masked kernel's peak, its tiles counted by lifetime.
 
-    The window held twice (``c_rows`` and ``c_t``), the pool ramp, the identity and the
-    staging tiles; one query block's selection rows, group ids, match and bias tiles; one
-    head tile's query, block statistics, exps, hi/lo halves and output row. An upper bound:
-    the compiler may share the transient tiles.
+    For the whole call: the window twice (``c_rows`` and ``c_t``), the staging tiles and the
+    constants (ramps, pool ids, ranks). Per query block: its predicate and
+    the open pool's targets, held while its heads run, plus the largest of three phases
+    whose tiles are dead before the next phase allocates, the selection bits ``sel`` live
+    through the first two: loading the selection (its rows, the group ids and their
+    fields), the count (the transposed fields, the one-hot and weighted tiles, the partial
+    counts and the words read back), and one head tile (query, scores, statistics, one bank's hi
+    and lo halves, output row).
     """
     pools = key_rows // pool_size
-    n_lat = latent // LATENT_TILE
+    row_width, words = _pool_split(pools)
+    groups = index_cols // pool_size
+    n_gt = -(-groups // ROW_TILE)
     n_blocks = -(-key_rows // MOVING_MAX)
     line = _LINE * 4
-    resident = (2 * key_rows * latent * kv_bytes // ROW_TILE + pools * 4 + ROW_TILE * kv_bytes
-                + 2 * latent * kv_bytes)
-    block = (index_cols * 8 + index_cols // pool_size * 4 + pools * (4 + kv_bytes)
-             + key_rows * kv_bytes + 5 * line)
-    tile = (latent * (kv_bytes + 4) + n_lat * ROW_TILE * kv_bytes + 2 * n_blocks * 4 + 4 * line
-            + 2 * MOVING_MAX * 4 + 2 * _TRANSPOSES_PER_BANK * ROW_TILE * kv_bytes + latent * 4)
-    return resident + block + tile
+    ids_t = _ID_FIELDS * n_gt * ROW_TILE * 2
+    sel = _WORD_BITS * row_width * words * 4
+    resident = (2 * key_rows * latent * kv_bytes // ROW_TILE + 2 * latent * kv_bytes
+                + (row_width + words) * _COUNT_QUERIES * 2 + pools * 4 + pool_size * 4)
+    predicate = pools * pool_size + pool_size * 4
+    load = sel + index_cols * 4 + groups * (1 + _ID_FIELDS) * 4 + ids_t
+    count = (sel + ids_t + n_gt * (row_width + words) * _COUNT_QUERIES
+             + words * _COUNT_QUERIES * 2 + n_gt * ROW_TILE * words * 4
+             + row_width * words * 4)
+    tile = (latent * (2 * kv_bytes + 4) + key_rows * 4 + 2 * n_blocks * 4
+            + 2 * _TRANSPOSES_PER_BANK * ROW_TILE * kv_bytes + 4 * line + latent * 4)
+    return resident + predicate + max(load, count, tile)
 
 
 def masked_window_cost_us(seq: int, heads: int, latent: int, key_rows: int, pool_size: int,
                           index_cols: int, kv_bytes: int, programs: int) -> float:
     """DERIVED device time of one masked call, from the rates above.
 
-    Per 128-query block the Vector engine runs the bias (one match pass per 8 groups of
-    ``P`` columns and ``P + 3`` passes over the pool axis) and, per head, the block maxima,
-    the normalising multiply and the hi/lo split; the PE runs, per head, three MM1 passes
-    with the bias matmul, the fp32 transposes of p and MM2 over both halves. A block costs
-    its busier engine. The window is staged and loaded once per program (three HBM passes).
+    Each engine's work per program is summed, and the call costs the busiest engine's sum
+    after the window is staged and loaded (three HBM passes). Once per program: the PE
+    transposes the window and the scalar engine copies it out of PSUM. Per query block,
+    priced as the fullest one (``min(seq, 128)`` queries), the predicate: on the Vector
+    engine one pass over the selection columns (the causal length), seven over the groups
+    (each group's pool id as count row, word and weight), the one-hot and weighted tiles
+    of every group tile in 2x mode with the queries on the free axis, the partial counts
+    added out of PSUM, one pass over the words per bit and ``P`` passes over the pool axis (the
+    predicate's rows of each pool); on the scalar engine the copies of the fields and the
+    counts out of PSUM; on the PE the transposes of the fields and the counts and the count
+    matmuls. Per head: the Vector engine takes the selected scores and their block maxima
+    from PSUM, normalises p, splits it hi/lo out of PSUM and copies the output row; the
+    scalar engine runs the exp with its block sums; the PE runs MM1, the fp32 transposes of
+    p and MM2 over both halves. The ``[128, 1]`` column ops, the waits between engines and
+    the PE's per-instruction issue cost are left out.
     """
     pools = key_rows // pool_size
+    row_width, words = _pool_split(pools)
+    groups = index_cols // pool_size
+    n_gt = -(-groups // ROW_TILE)
     n_lat = latent // LATENT_TILE
     n_blocks = -(-key_rows // MOVING_MAX)
     chunks = key_rows // KEY_CHUNK
-    match_passes = index_cols // (pool_size * MATCH_WIDTH)
-    bias_ns = (match_passes + pool_size + 3) * (DVE_PASS_NS + pools * DVE_FP32_NS)
-    head_dve_ns = (2 * n_blocks * (DVE_PASS_NS + MOVING_MAX * DVE_FP32_NS)
-                   + 2 * chunks * (DVE_PASS_NS + ROW_TILE * DVE_FP32_NS))
-    head_pe_ns = PE_COLUMN_NS * (3 * (n_lat + 1) * key_rows
-                                 + PE_FP32_PASSES * chunks * ROW_TILE
-                                 + 2 * chunks * latent)
-    block_ns = max(bias_ns + heads * head_dve_ns, heads * head_pe_ns)
-    window_ns = 3 * key_rows * latent * kv_bytes / HBM_BYTES_PER_NS
+    rows = min(seq, ROW_TILE)
+    sub_blocks = -(-rows // _COUNT_QUERIES)
     q_blocks = -(-seq // ROW_TILE)
-    return (window_ns + -(-q_blocks // programs) * block_ns) / 1000.0
+    blocks = -(-q_blocks // programs)
+    window_per_bank = _PSUM_BANK_BYTES // (2 * latent)
+    window_act_ns = (-(-chunks // window_per_bank)
+                     * (DVE_PASS_NS + window_per_bank * latent * ACT_ELEMENT_NS))
+    window_pe_ns = PE_COLUMN_NS * chunks * n_lat * KEY_CHUNK
+    back_passes = -(-words // (_PSUM_BANK_BYTES // (4 * n_gt * row_width)))
+    count_copies = -(-rows // (_PSUM_BANK_BYTES // (4 * n_gt * words)))
+    word_pass_ns = DVE_PASS_NS + row_width * words * DVE_FP32_NS
+    predicate_dve_ns = (DVE_PASS_NS + index_cols * DVE_FP32_NS
+                        + 7 * (DVE_PASS_NS + groups * DVE_FP32_NS)
+                        + n_gt * (3 * sub_blocks * DVE_PASS_NS
+                                  + (row_width + 2 * words) * rows * DVE_BF16_NS)
+                        + back_passes * DVE_PASS_NS + n_gt * row_width * words * DVE_FP32_NS
+                        + _WORD_BITS * word_pass_ns
+                        + pool_size * (DVE_PASS_NS + pools * DVE_FP32_NS))
+    predicate_act_ns = (n_gt * (DVE_PASS_NS + _ID_FIELDS * rows * ACT_ELEMENT_NS)
+                        + count_copies * DVE_PASS_NS + n_gt * rows * words * ACT_ELEMENT_NS)
+    # A PE transpose streams one column per partition of its input; a query's count takes
+    # one matmul per group tile, each tile's partial counts transposed back on their own.
+    predicate_pe_ns = PE_COLUMN_NS * (_ID_FIELDS * n_gt * rows + n_gt * words * row_width
+                                      + rows * n_gt * words)
+    head_dve_ns = (4 * n_blocks * (DVE_PASS_NS + MOVING_MAX * DVE_FP32_NS)
+                   + DVE_PASS_NS + latent * DVE_FP32_NS)
+    head_act_ns = n_blocks * (DVE_PASS_NS + MOVING_MAX * ACT_ELEMENT_NS)
+    head_pe_ns = PE_COLUMN_NS * (n_blocks * n_lat * MOVING_MAX + chunks * (rows + 2 * latent))
+    dve_ns = blocks * (predicate_dve_ns + heads * head_dve_ns)
+    act_ns = window_act_ns + blocks * (predicate_act_ns + heads * head_act_ns)
+    pe_ns = window_pe_ns + blocks * (predicate_pe_ns + heads * head_pe_ns)
+    window_ns = 3 * key_rows * latent * kv_bytes / HBM_BYTES_PER_NS
+    return (window_ns + max(dve_ns, act_ns, pe_ns)) / 1000.0
 
 
 def gather_cost_us(seq: int, latent: int, index_cols: int, kv_bytes: int) -> float:
@@ -1184,11 +1435,12 @@ def masked_window_serves(seq: int, heads: int, latent: int, key_rows: int, pool_
     (:func:`masked_window_sbuf_bytes`) fits a partition, and its DERIVED cost
     (:func:`masked_window_cost_us`) is below the gather path's floor
     (:func:`gather_cost_us`). The gather keeps every other call. Two kinds always stay
-    there. A decode call of one or two rows: the gather's floor is one query's gather, and
-    the masked cost is at least 1.06x of it at every window and head count, since the
-    bias's passes over the whole window are paid for a block of 128 queries whatever its
-    fill. A window too wide to hold resident: at latent 512 in bf16, with 4-row pools and
-    2176 selection columns, the footprint passes 224 KiB above 9472 rows (74 pages of 128),
+    there, at latent 512 in bf16 with 4-row pools and 2176 selection columns. A decode call
+    of one or two rows: the gather's floor is one query's gather, and the masked cost is at
+    least 2.4x of it at every window of 17 pages or more (the sparse regime's) and every
+    head count, since the window's staging and transposes and the predicate's passes over
+    the selection columns and the pool axis are paid whatever a block's fill. A window too
+    wide to hold resident: the footprint passes 224 KiB above 9216 rows (72 pages of 128),
     the largest multiple of 128 that :func:`masked_window_sbuf_bytes` admits.
     """
     try:
@@ -1216,11 +1468,10 @@ def _require_masked(seq: int, heads: int, latent: int, cache_latent: int,
             f"pool_size must be a power of two, so a pool id is P * id / P exactly in "
             f"fp32; got {pool_size}"
         )
-    if index_cols < 1 or index_cols % (pool_size * MATCH_WIDTH) != 0:
+    if index_cols < 1 or index_cols % pool_size != 0:
         raise MlaDenseWindowError(
-            f"the selection is read in groups of P = {pool_size} columns, matched "
-            f"{MATCH_WIDTH} groups at a time, so its width must be a positive multiple of "
-            f"{pool_size * MATCH_WIDTH}; got {index_cols} columns"
+            f"the selection is read in groups of P = {pool_size} columns, so its width "
+            f"must be a positive multiple of {pool_size}; got {index_cols} columns"
         )
     if key_rows < KEY_CHUNK or key_rows % KEY_CHUNK != 0 or key_rows % pool_size != 0:
         raise MlaDenseWindowError(
@@ -1233,6 +1484,14 @@ def _require_masked(seq: int, heads: int, latent: int, cache_latent: int,
         raise MlaDenseWindowError(
             f"the masked kernel holds the window resident: {key_rows} rows of latent "
             f"{latent} need {need} SBUF bytes per partition, above {SBUF_PARTITION_BYTES}"
+        )
+    row_width, words = _pool_split(key_rows // pool_size)
+    group_tiles = -(-(index_cols // pool_size) // ROW_TILE)
+    if 4 * group_tiles * max(row_width, words) > _PSUM_BANK_BYTES:
+        raise MlaDenseWindowError(
+            f"the selection count keeps one partial count per {ROW_TILE}-group tile in a "
+            f"PSUM bank: {group_tiles} tiles of {max(row_width, words)} fp32 values exceed "
+            f"its {_PSUM_BANK_BYTES} bytes"
         )
 
 
@@ -1252,7 +1511,8 @@ def mla_masked_window_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tens
         c_kv: ``[slots, L]`` the whole latent bank, same dtype.
         topk_indices: ``[S, cols]`` int, ``dsa_index_expand``'s output for pools of
             ``pool_size`` rows, or the short-sequence bypass's causal prefix: every
-            selected pool complete and inside the window, and the open pool's rows.
+            selected pool complete, inside the window and named once, and the open
+            pool's rows.
         softmax_scale: positive.
         block_table_row: ``[pages, 1]`` int32, the window's pages in order, ``-1`` pads.
         written: ``[tokens, L]`` this step's own rows, overlaid at ``write_offset``.
@@ -1263,12 +1523,12 @@ def mla_masked_window_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tens
     Returns:
         ``[S, H, L]`` fp32, the sparse kernel's answer up to the order of its fp32 sums.
 
-    Every window row is read, selected or not: the bias drops an unselected row's score
-    only while that score is finite, and MM2 multiplies the row by its zero probability. So
-    every row of the window must be finite, where the gather path needs only the selected
-    ones. The bank is allocated zeroed (``NeuronModelRunner.initialize_kv_cache``) and
-    holds only latents the model wrote, so a non-finite window row means the model already
-    wrote a non-finite latent.
+    Every window row is read, selected or not: the predicate drops an unselected row's
+    score whatever its value, but MM2 multiplies the row by its zero probability, and zero
+    times a non-finite value is NaN. So every row of the window must be finite, where the
+    gather path needs only the selected ones. The bank is allocated zeroed
+    (``NeuronModelRunner.initialize_kv_cache``) and holds only latents the model wrote, so
+    a non-finite window row means the model already wrote a non-finite latent.
 
     The DCP partial mode (``mla_sparse_attention_partial``) has no masked form: it stays
     on the gather path, which ``dcp_merge`` and its gate are measured against.
@@ -1303,13 +1563,22 @@ def mla_masked_window_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tens
     _require_masked(seq, heads, latent, int(c_kv.shape[1]), q_lift.dtype, c_kv.dtype,
                     int(staged), int(pool_size), cols)
     # Checked eagerly only, as the sparse seam checks its indices: a traced call relies on
-    # the indexer's contract (every selected pool complete, inside the window).
+    # the indexer's contract (every selected pool complete, inside the window, and named
+    # once: the top-k's nc_match_replace8 pairs tied scores with distinct positions).
     if values_are_readable(topk_indices):
         lo, hi = int(topk_indices.min()), int(topk_indices.max())
         if lo < -1 or hi >= staged:
             raise MlaDenseWindowError(
                 f"every selected row must be in [0, {staged}) or the -1 sentinel; got the "
                 f"range [{lo}, {hi}]"
+            )
+        pool = int(pool_size)
+        named = topk_indices.reshape(seq, cols // pool, pool)[:, :, pool - 1]
+        ordered = named.sort(dim=1).values
+        if bool(((ordered[:, 1:] == ordered[:, :-1]) & (ordered[:, 1:] >= 0)).any()):
+            raise MlaDenseWindowError(
+                "a query names a selected pool twice; the masked kernel counts each pool "
+                "a query selects once"
             )
     programs = _masked_programs(seq)
     _count_masked_dispatch()
