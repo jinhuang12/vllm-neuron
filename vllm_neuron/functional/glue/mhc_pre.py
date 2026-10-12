@@ -30,8 +30,8 @@ stores, so no torch op is left between the streams and the sub-block.
 Shapes and layout. ``residual`` is ``[T, S, H]`` (row-major, so token ``t``'s stream
 ``s`` is one contiguous ``H`` run), ``fn`` is ``[M, S*H]``, ``hc_scale`` ``[3]``,
 ``hc_base`` ``[M]`` and the norm gain ``[H]``. The outputs are ``post [T, S, 1]`` and
-``comb_start [T, S, S]`` in fp32, and ``layer_input`` and ``normed`` ``[T, H]`` in the
-streams' dtype.
+``comb_start [T, S, S]`` in fp32, and ``layer_input``, ``normed`` and ``scaled``
+``[T, H]`` in the streams' dtype.
 
 Method. ``P`` programs split the hidden axis (``Hp = H / P``), and the tokens are walked
 in tiles of :data:`MHC_PRE_TOKEN_TILE` rows (the last tile may be shorter). Once per
@@ -66,6 +66,8 @@ columns of the SBUF tile ``mov[128 (h), Hp/128, S, M + tile]``. Then, per token 
    transposed to hidden-major), the two programs' halves are swapped and added as in
    step 3, and each row is scaled by ``rsqrt(sum * (1/H) + norm_eps)`` and then by the
    gain in one fp32 instruction, in ``_rms_norm``'s operation order, and rounded once.
+   With ``ROUTER_SCALE`` the rows are also scaled by the same ``rsqrt`` alone and rounded
+   once: ``scaled``, the MoE router's input (its gain is applied in the router).
 
 Both LNC2 cores: yes. Each program does half the contraction (step 2), half the
 transposes, half the collapse and half the norm; steps 3-4 are ``rows x (M + rows)``
@@ -190,8 +192,11 @@ def _transpose_into(dst, rows_t, col0, rows_n, nhb, group):
 
 
 def _mhc_pre(residual, fn, hc_scale, hc_base, norm_gain, rms_eps, hc_eps, post_mult,
-             norm_eps):
-    """The body of both kernels; ``norm_gain`` None skips step 6 (see the module doc)."""
+             norm_eps, router_scale=False):
+    """The body of both kernels; ``norm_gain`` None skips step 6 (see the module doc).
+
+    ``router_scale`` (with ``norm_gain`` only) adds step 6's ``scaled`` output.
+    """
     tokens, streams, hidden = residual.shape
     mix, width = fn.shape
     programs = nl.num_programs(0)
@@ -204,6 +209,7 @@ def _mhc_pre(residual, fn, hc_scale, hc_base, norm_gain, rms_eps, hc_eps, post_m
     kernel_assert(hidden % (_P * programs) == 0, "H splits into 128-blocks per program")
     if norm_gain is not None:
         kernel_assert(tuple(norm_gain.shape) == (hidden,), "the norm gain is [H]")
+    kernel_assert(norm_gain is not None or not router_scale, "scaled comes with the norm")
     hp = hidden // programs
     h0 = program * hp
     nhb = hp // _P
@@ -220,6 +226,8 @@ def _mhc_pre(residual, fn, hc_scale, hc_base, norm_gain, rms_eps, hc_eps, post_m
     x_out = nl.ndarray((tokens, hidden), dtype=residual.dtype, buffer=nl.shared_hbm)
     normed_out = None if norm_gain is None else nl.ndarray(
         (tokens, hidden), dtype=residual.dtype, buffer=nl.shared_hbm)
+    scaled_out = nl.ndarray((tokens, hidden), dtype=residual.dtype,
+                            buffer=nl.shared_hbm) if router_scale else None
 
     # ---- Once per call: fn^T, the head rows, the constants. --------------- #
     # mov[:, hb, s, 0:mix] = fn[:, s*H + h0 + hb*128 + p]^T; step 1 of each tile fills
@@ -377,8 +385,18 @@ def _mhc_pre(residual, fn, hc_scale, hc_base, norm_gain, rms_eps, hc_eps, post_m
             nisa.dma_copy(dst=normed_out.ap(pattern=[[hidden, rows_n], [1, hp]],
                                             offset=t0 * hidden + h0),
                           src=normed_rows)
+            if router_scale:
+                scaled_rows = nl.ndarray((rows_n, hp), dtype=residual.dtype,
+                                         buffer=nl.sbuf)
+                nisa.tensor_scalar(dst=scaled_rows, data=out_rows, op0=nl.multiply,
+                                   operand0=norm_rstd[:, 0:1])
+                nisa.dma_copy(dst=scaled_out.ap(pattern=[[hidden, rows_n], [1, hp]],
+                                                offset=t0 * hidden + h0),
+                              src=scaled_rows)
     if norm_gain is None:
         return post_out, comb_out, x_out
+    if router_scale:
+        return post_out, comb_out, x_out, normed_out, scaled_out
     return post_out, comb_out, x_out, normed_out
 
 
@@ -403,21 +421,29 @@ def mhc_pre_kernel(residual, fn, hc_scale, hc_base, RMS_EPS: float = 1e-6,
 
 @nki.jit
 def mhc_pre_norm_kernel(residual, fn, hc_scale, hc_base, norm_gain, RMS_EPS: float,
-                        HC_EPS: float, POST_MULT: float, NORM_EPS: float):
-    """:func:`mhc_pre_kernel`'s three outputs, then ``normed [T, H]``.
+                        HC_EPS: float, POST_MULT: float, NORM_EPS: float,
+                        ROUTER_SCALE: bool = False):
+    """:func:`mhc_pre_kernel`'s three outputs, then ``normed [T, H]`` (and ``scaled``).
 
     ``normed = layer_input * rsqrt(mean(layer_input**2) + NORM_EPS) * norm_gain``,
     computed in fp32 from the returned (rounded) ``layer_input`` and returned in the
     streams' dtype: ``Glm5NextModel._rms_norm`` of ``layer_input``.
+
+    With ``ROUTER_SCALE`` a fifth output, ``scaled [T, H]`` in the streams' dtype, is
+    ``layer_input * rsqrt(mean(layer_input**2) + NORM_EPS)`` rounded once: the same fp32
+    ``rsqrt`` as ``normed``'s, one fp32 multiply, no gain. It is
+    :func:`~vllm_neuron.functional.moe.router_prefill.router_rms_scale` of
+    ``layer_input``, the router's input up to the order of the square sum.
 
     Args:
         residual, fn, hc_scale, hc_base, RMS_EPS, HC_EPS, POST_MULT: as
             :func:`mhc_pre_kernel`.
         norm_gain: ``[H]`` bf16 or fp32 gain of the sub-block's input RMSNorm.
         NORM_EPS: that norm's epsilon.
+        ROUTER_SCALE: also return ``scaled``.
     """
     return _mhc_pre(residual, fn, hc_scale, hc_base, norm_gain, RMS_EPS, HC_EPS,
-                    POST_MULT, NORM_EPS)
+                    POST_MULT, NORM_EPS, ROUTER_SCALE)
 
 
 _KERNELS = {1: wrap_nki(mhc_pre_kernel), 2: wrap_nki(mhc_pre_kernel)[2]}
@@ -534,20 +560,25 @@ def mhc_pre_admits(residual: Tensor, fn: Tensor, hc_scale: Tensor, hc_base: Tens
 
 def mhc_pre_fused(residual: Tensor, fn: Tensor, hc_scale: Tensor, hc_base: Tensor, *,
                   rms_eps: float, hc_eps: float, post_mult: float,
-                  norm_gain: Tensor | None = None, norm_eps: float | None = None
-                  ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
+                  norm_gain: Tensor | None = None, norm_eps: float | None = None,
+                  router_scale: bool = False) -> tuple[Tensor | None, ...]:
     """``(post_mix [T, S, 1] fp32, comb_start [T, S, S] fp32, layer_input [T, H], normed)``.
 
     ``comb_start`` is the softmax plus ``hc_eps``, the Sinkhorn's input; the caller
     runs the Sinkhorn. ``layer_input`` is in the streams' dtype. ``normed`` is
     ``layer_input``'s RMSNorm with ``norm_gain`` and ``norm_eps``
     (:func:`mhc_pre_norm_kernel`), in the same dtype, or None without ``norm_gain``.
+    With ``router_scale`` a fifth value follows: ``scaled [T, H]``, the same norm
+    without the gain (``mhc_pre_norm_kernel``'s ``ROUTER_SCALE`` output).
 
     Raises:
-        ValueError: on a ``norm_gain`` without its ``norm_eps``.
+        ValueError: on a ``norm_gain`` without its ``norm_eps``, or ``router_scale``
+            without ``norm_gain``.
     """
     if norm_gain is not None and norm_eps is None:
         raise ValueError("mhc_pre_fused: norm_gain needs its norm_eps")
+    if router_scale and norm_gain is None:
+        raise ValueError("mhc_pre_fused: router_scale needs norm_gain")
     operands = dict(
         residual=residual.contiguous(),
         fn=fn.contiguous(),
@@ -561,7 +592,8 @@ def mhc_pre_fused(residual: Tensor, fn: Tensor, hc_scale: Tensor, hc_base: Tenso
         outputs = (*_KERNELS[launch_programs()](**operands), None)
     else:
         outputs = tuple(_NORM_KERNELS[launch_programs()](
-            **operands, norm_gain=norm_gain.contiguous(), NORM_EPS=float(norm_eps)))
+            **operands, norm_gain=norm_gain.contiguous(), NORM_EPS=float(norm_eps),
+            ROUTER_SCALE=bool(router_scale)))
         _count_normed()
     # Counted once the launch has returned: a launch that raises served nothing.
     _count_nki_dispatch()
