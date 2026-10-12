@@ -123,15 +123,18 @@ EDGE_WIDTHS = ((8, 531), (2, 2124))
 
 
 def merge_refuses(cp: int, k: int) -> bool:
-    """True when the host refuses ``cp`` ranks of ``k`` candidates a row: ``CP * k`` past
-    ``MAX_CANDIDATES``, the candidates of two tiles in flight that one SBUF partition holds."""
-    return cp * k > merge.MAX_CANDIDATES
+    """True when the host refuses ``cp`` ranks of ``k`` candidates a row: no tile serves
+    ``CP * k`` (``merge.tile_rows`` is ``None``), because no fold of a row over the partitions
+    leaves each partition few enough columns for two tiles in flight to fit its SBUF."""
+    return merge.tile_rows(cp, k) is None
 
 
 #: Text every refusal of a width carries.
-REFUSAL_TEXT = f"MAX_CANDIDATES={merge.MAX_CANDIDATES}"
+REFUSAL_TEXT = "fit no tile"
 #: ``(CP, rows, k)``: a build past the SBUF budget, so the allocator must take a second pass and
-#: spill; it shows that the build test can tell a fitting build from a spilling one.
+#: spill; it shows that the build test can tell a fitting build from a spilling one. The merge
+#: serves this width in tiles of fewer rows, so the control is built in 128-row tiles
+#: (:func:`unfolded_tile_rows`).
 CONTROL_BUILD = (16, 1024, SELECT_K)
 
 #: Sizes at which the refusal test probes the width rule's edge (:func:`first_refused_k`).
@@ -772,7 +775,7 @@ def test_cpu_simulator_decode_select_then_merge_equals_the_one_rank_selection(
 
 #: ``(CP, rows, k)`` builds: the served widths at a decode row and a prefill chunk, the edge
 #: widths, ``k = 532`` at CP 8 (4256 candidates, one ``k`` past the edge, still one SBUF
-#: pass), and :data:`CONTROL_BUILD`.
+#: pass), and :data:`CONTROL_BUILD` in 128-row tiles.
 BUILDS = ([(cp, rows, SELECT_K) for cp in DCP_SIZES for rows in (1, 1024)]
           + [(cp, 1024, k) for cp, k in EDGE_WIDTHS] + [(8, 1024, 532), CONTROL_BUILD])
 _BUILD_ROW = "dcp_merge_build"
@@ -781,8 +784,15 @@ _PIN = {"VLLM_NEURON_CPU_COMPILE": "1", "NEURON_PLATFORM_TARGET_OVERRIDE": "trn2
         "NEURON_LOGICAL_NC_CONFIG": "2", "PYTHONDONTWRITEBYTECODE": "1"}
 
 
-def _build_one(cp: int, rows: int, k: int, work: str) -> None:
-    """Trace and build the kernel on the LNC2 grid to ``work/kernel.neff``; print one row."""
+def unfolded_tile_rows(cp: int, k: int) -> int:
+    """The control's tile height: 128 rows whatever the width. A module-level function, so the
+    NKI front end resolves it by name."""
+    return merge.PARTITIONS
+
+
+def _build_one(cp: int, rows: int, k: int, work: str, unfolded: bool) -> None:
+    """Trace and build the kernel on the LNC2 grid to ``work/kernel.neff``; print one row.
+    ``unfolded`` builds 128-row tiles whatever the width."""
     from dataclasses import replace
 
     from nki.compiler.driver import _compile_bir_to_neff
@@ -793,6 +803,8 @@ def _build_one(cp: int, rows: int, k: int, work: str) -> None:
               "ids_hbm": np.zeros((cp, rows, k), dtype=np.int32), "cp_rank": cp - 1,
               "pools_per_block": PPB, "source_digest": merge.SOURCE_DIGEST}
     print(f"{_BUILD_ROW}|tree|module={merge.__file__}", flush=True)
+    if unfolded:
+        merge.tile_rows = unfolded_tile_rows
     frontend = resolve_frontend_cls()
     compiling = merge.dsa_dcp_merge_select_kernel[2]._to_subclass(CompileKernel,
                                                                   _frontend_cls=frontend)
@@ -839,7 +851,9 @@ def run_builds(builds) -> dict:
             os.makedirs(work)
             children.append(((cp, rows, k), work, subprocess.Popen(
                 [sys.executable, "-B", str(pathlib.Path(__file__).resolve()), "build-one",
-                 str(cp), str(rows), str(k), work], cwd=work, env=environment,
+                 str(cp), str(rows), str(k), work,
+                 *(["--unfolded"] if (cp, rows, k) == CONTROL_BUILD else [])],
+                cwd=work, env=environment,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)))
         for key, work, child in children:
             out, err = child.communicate(timeout=1800)
@@ -855,8 +869,8 @@ def test_cpu_neuronx_cc_builds_the_merge_at_the_served_and_edge_widths() -> None
     facts = run_builds(BUILDS)
     control = facts.pop(CONTROL_BUILD)
     assert control["allocator_retry"] and max(control["spill_traffic_reduced"]) > 0, (
-        f"the build past the cap shows no second allocation pass, so the probe cannot "
-        f"tell a fitting build from a spilling one: {control}")
+        f"the 128-row-tile build past the cap shows no second allocation pass, so the "
+        f"probe cannot tell a fitting build from a spilling one: {control}")
     for key, fact in facts.items():
         assert not fact["allocator_retry"], (key, fact)
         assert fact["spill_traffic_reduced"] and max(fact["spill_traffic_reduced"]) == 0, (
@@ -1167,6 +1181,8 @@ def device_parser() -> argparse.ArgumentParser:
     build.add_argument("rows", type=int)
     build.add_argument("k", type=int)
     build.add_argument("work")
+    build.add_argument("--unfolded", action="store_true",
+                       help="128-row tiles whatever the width (the build test's control)")
     return parser
 
 
@@ -1193,7 +1209,7 @@ def test_cpu_sandbox_runs_the_device_entry(tmp_path, monkeypatch) -> None:
 def main() -> None:
     args = device_parser().parse_args()
     if args.mode == "build-one":
-        _build_one(args.cp, args.rows, args.k, args.work)
+        _build_one(args.cp, args.rows, args.k, args.work, args.unfolded)
         return
     if args.time_limit:
         # A hung device call would hold the cores; SIGALRM's default action ends the run.
