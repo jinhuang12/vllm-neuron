@@ -3404,6 +3404,8 @@ class Glm5NextKDAAttention(nn.Module):
         # counts); the state width per head does not shard.
         self.num_kv_heads_per_rank = _per_rank(self.num_heads, world_size)
         self.head_size = self.head_dim
+        # The input projections' contraction width, for ``projection_widths``.
+        self.hidden_size = int(text_config.hidden_size)
         self.cache_dtype = _resolve_kda_state_dtype(text_config)
         # The gate's lower bound is the checkpoint's, read through the same
         # checked accessor as the rest of ``linear_attn_config`` so a missing key
@@ -3490,6 +3492,71 @@ class Glm5NextKDAAttention(nn.Module):
             "A_log",
             "dt_bias",
         )
+
+    def projection_widths(self) -> tuple[tuple[str, int, int], ...]:
+        """The eight input projections as ``(name, in_features, out_features)``, closed form.
+
+        The widths are this rank's. ``q``, ``k``, ``v`` and the two gate expansions
+        are this rank's heads times ``head_dim`` wide and ``b`` is one value per head.
+        The two gate bottlenecks are one head wide, ``hidden_size -> head_dim``, as the
+        reference model builds ``f_a_proj`` and ``g_a_proj``. They are replicated over
+        the ranks, not sharded.
+        """
+        width = self.num_kv_heads_per_rank * self.head_dim
+        rank = self.head_dim
+        return (
+            ("q_proj", self.hidden_size, width),
+            ("k_proj", self.hidden_size, width),
+            ("v_proj", self.hidden_size, width),
+            ("b_proj", self.hidden_size, self.num_kv_heads_per_rank),
+            ("f_a_proj", self.hidden_size, rank),
+            ("f_b_proj", rank, width),
+            ("g_a_proj", self.hidden_size, rank),
+            ("g_b_proj", rank, width),
+        )
+
+    def prepare_projection_weights(self) -> int:
+        """Lay the eight input projections out once for the prefill kernel. Returns how many.
+
+        The prefill projection kernel contracts ``hidden_size`` over the tensor
+        engine's partitions. So it reads the six first-stage weights contraction-major,
+        as one ``[hidden_size, C]`` operand, and the two expansions transposed side by
+        side. A checkpoint stores each weight ``[out_features, in_features]``. A weight
+        never changes, so this relayout is done here once, at load, and not per call
+        (:func:`~vllm_neuron.functional.glue.kda_projections.prefill_operands`).
+        The operands are stored under that module's ``PREFILL_OPERANDS_ATTR``. The
+        checkpoint tensors stay, because decode and the torch route read them.
+
+        Each weight is checked against the closed-form widths first. So a checkpoint
+        of another geometry fails here, with the site named.
+        """
+        from vllm_neuron.functional.glue.kda_projections import (
+            PREFILL_OPERANDS_ATTR,
+            prefill_operands,
+        )
+
+        weights: dict[str, torch.Tensor] = {}
+        for name, idim, odim in self.projection_widths():
+            weight = getattr(self, f"{name}_weight", None)
+            if weight is None:
+                raise ValueError(
+                    f"{name}_weight is declared but not materialised; load the "
+                    f"checkpoint before preparing the projection weights"
+                )
+            if tuple(weight.shape) != (odim, idim):
+                raise ValueError(
+                    f"{name}_weight is {tuple(weight.shape)}; this config's "
+                    f"closed form is [out_features, in_features] = "
+                    f"{(odim, idim)}"
+                )
+            weights[name] = weight
+        # The relayout is a transposed copy, which a device tensor refuses, so it is
+        # built on host copies and moved back in one step per operand.
+        device = weights["q_proj"].device
+        host = dict(zip(weights, _on_the_host(*weights.values())))
+        setattr(self, PREFILL_OPERANDS_ATTR,
+                _on_the_device(device, *prefill_operands(**host)))
+        return len(weights)
 
     # ── the conv carrier's extent order, handled in one place ─────────────
     def _conv_history(self, conv_state: torch.Tensor) -> torch.Tensor:

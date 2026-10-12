@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The KDA decode input projections in one NKI launch, on the bf16 weights as stored.
+"""The KDA input projections in one NKI launch, at decode and at prefill.
 
-Baseline ``glue_0a08ff4`` (``Glm5NextKDAAttention.forward`` at one token, and
+Baseline ``glue_0a08ff4`` (``Glm5NextKDAAttention.forward``, and
 ``_fused_decode_requests``) computes, with ``x = hidden_states.float()``::
 
     q_in, k_in, v_in = x @ q_w.float().t(), x @ k_w.float().t(), x @ v_w.float().t()
@@ -9,12 +9,21 @@ Baseline ``glue_0a08ff4`` (``Glm5NextKDAAttention.forward`` at one token, and
     raw_gate = (x @ f_a_w.float().t()) @ f_b_w.float().t()
     out_gate = (x @ g_a_w.float().t()) @ g_b_w.float().t()
 
-so every step casts and transposes 641 x 4096 weight values to fp32 and runs fp32
-matmuls on them. This kernel reads the bf16 activations and weights as they are. fp32
-operands (the CPU fixtures' dtype) run the same steps on fp32 tiles, with the weights'
-transposes on the tensor engine.
+so every call casts and transposes 641 x 4096 weight values to fp32 and runs fp32
+matmuls on them. The kernels read bf16 activations and weights instead:
 
-Method. Both programs (``P`` under LNC2) take ``H / P`` of the contraction:
+* :func:`kda_projections_kernel` (``T <= KDA_PROJECTIONS_MAX_TOKENS``) reads the eight
+  weights as stored. fp32 operands (the CPU fixtures' dtype) run the same steps on fp32
+  tiles, with the weights' transposes on the tensor engine.
+* :func:`kda_projections_prefill_kernel` (a larger ``T`` in 128-row tiles per program,
+  bf16 only) reads the weights contraction-major, as :func:`prefill_operands` lays
+  them out once at load (the model's ``prepare_projection_weights`` stores them on the
+  module under :data:`PREFILL_OPERANDS_ATTR`). Each program takes half of the rows and
+  all of the weights, so the programs exchange nothing; the method is in its
+  docstring.
+
+Method of the decode kernel. Both programs (``P`` under LNC2) take ``H / P`` of the
+contraction:
 
 1. ``x^T`` by tensor-engine transposes; the weights' transposes ``W^T[h, r]`` are
    loaded straight from HBM by DMA transposes (16 weight rows per DMA, the hardware
@@ -27,7 +36,8 @@ Method. Both programs (``P`` under LNC2) take ``H / P`` of the contraction:
    reference's own precision): program 0 forms ``raw_gate``, program 1 ``out_gate``
    (one program forms both).
 
-Both LNC2 cores: yes; steps 1-2 split the contraction, step 3 splits the two gates.
+Both LNC2 cores: yes, in both kernels. The decode kernel's steps 1-2 split the
+contraction and step 3 splits the two gates; the prefill kernel splits the rows.
 """
 
 from __future__ import annotations
@@ -49,8 +59,14 @@ from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 from vllm_neuron.functional.glue import glue_selected
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
-#: Largest token count served (the activations' transpose is the matmul stationary).
+#: Largest token count the decode kernel serves (the activations' transpose is its
+#: matmul stationary); larger calls take the prefill kernel.
 KDA_PROJECTIONS_MAX_TOKENS = 128
+
+#: The module attribute the load-time prep stores the prefill kernel's operands on:
+#: ``(wt, expand_t)`` from :func:`prefill_operands`. A plain attribute, not a buffer,
+#: so ``state_dict()`` does not carry a second copy of the weights.
+PREFILL_OPERANDS_ATTR = "_prepared_prefill_projection_operands"
 
 #: The switch (registered in :mod:`vllm_neuron.envs`): ``1`` loads the weights'
 #: transposes by DMA transpose, ``0`` by a plain DMA and tensor-engine transposes.
@@ -61,13 +77,18 @@ _BANK = 512  # fp32 columns per PSUM bank
 _DGE_ROWS = 16  # weight rows per hardware-DGE transpose
 _BANK_BYTES = 2048  # bytes per partition of one PSUM bank
 _XBAR_STEP = 16  # a DMA transpose's output row stride: a multiple of 32 bytes of bf16
+_PER_BF16_BANK = 8  # 128-column bf16 transposes per PSUM bank
+_WEIGHT_BLOCKS_PER_DMA = 4  # contraction blocks of the prefill weights per load DMA
 
 __all__ = [
     "KDA_PROJECTIONS_MAX_TOKENS",
+    "PREFILL_OPERANDS_ATTR",
     "dispatch_counters",
     "kda_projections",
     "kda_projections_admits",
     "kda_projections_kernel",
+    "kda_projections_prefill_kernel",
+    "prefill_operands",
     "reset_dispatch_counters",
 ]
 
@@ -238,7 +259,150 @@ def kda_projections_kernel(x, q_w, k_w, v_w, b_w, f_a_w, f_b_w, g_a_w, g_b_w,
     return q_out, k_out, v_out, gate_out, beta_out, og_out
 
 
+def _psum_reader(index):
+    """The engine of the ``index``-th PSUM read: Vector and Scalar (the two that read PSUM)
+    take turns."""
+    return nisa.engine.vector if index % 2 == 0 else nisa.engine.scalar
+
+
+@nki.jit
+def kda_projections_prefill_kernel(x, wt, expand_t):
+    """``(q_in, k_in, v_in, raw_gate, raw_beta, out_gate)``, fp32, ``[T, *]`` (prefill shapes).
+
+    Args:
+        x: ``[T, H]`` bf16 activations, ``T`` a multiple of ``128 * programs``.
+        wt: ``[H, C]`` bf16, the six first-stage weights contraction-major, columns
+            ``q | k | v | b | f_a | g_a`` (``C = 3 W + heads + 2 R``).
+        expand_t: ``[R, 2 W]`` bf16, the two expansions transposed, ``f_b^T | g_b^T``.
+
+    Each program takes ``T / programs`` contiguous rows, in groups of up to 512 tokens
+    (the bottlenecks' moving operand fills one fp32 PSUM bank). Per group: ``x^T`` by
+    tensor-engine transposes (``x`` arrives row-major and the tensor engine contracts
+    over the partitions), then, contraction block by block, ``x @ [q|k|v|b]^T`` with
+    ``x^T`` stationary (tokens on the output partitions, the call's layout) and the two
+    bottlenecks ``f_a x^T``, ``g_a x^T`` with the weight stationary (the bottleneck on
+    the partitions, which is the second stage's stationary layout, so it needs no
+    transpose). The second stage is an fp32 matmul on the fp32 bottleneck, the
+    reference's own precision.
+    """
+    tokens, hidden = x.shape
+    contraction, cols = wt.shape
+    rank, expand_cols = expand_t.shape
+    width = expand_cols // 2
+    heads = cols - 3 * width - 2 * rank
+    direct = 3 * width + heads
+    programs = nl.num_programs(0)
+    program = nl.program_id(0)
+    kernel_assert(programs in (1, 2), "one or two programs")
+    kernel_assert(contraction == hidden and hidden % _P == 0, "wt is [H, C], H in 128-blocks")
+    kernel_assert(tokens % (_P * programs) == 0, "T splits into 128-row tiles per program")
+    kernel_assert(width <= _P and rank <= _P and heads >= 1, "W, R <= 128, heads >= 1")
+    kernel_assert(direct <= _BANK, "q|k|v|b fit one PSUM bank")
+    kernel_assert(x.dtype == nl.bfloat16 and wt.dtype == nl.bfloat16
+                  and expand_t.dtype == nl.bfloat16, "bf16 operands")
+    rows = tokens // programs
+    r0 = program * rows
+    blocks = hidden // _P
+
+    q_out = nl.ndarray((tokens, width), dtype=nl.float32, buffer=nl.shared_hbm)
+    k_out = nl.ndarray((tokens, width), dtype=nl.float32, buffer=nl.shared_hbm)
+    v_out = nl.ndarray((tokens, width), dtype=nl.float32, buffer=nl.shared_hbm)
+    gate_out = nl.ndarray((tokens, width), dtype=nl.float32, buffer=nl.shared_hbm)
+    beta_out = nl.ndarray((tokens, heads), dtype=nl.float32, buffer=nl.shared_hbm)
+    og_out = nl.ndarray((tokens, width), dtype=nl.float32, buffer=nl.shared_hbm)
+    direct_outs = [q_out, k_out, v_out, beta_out]
+    direct_cols = [width, width, width, heads]
+    gate_outs = [gate_out, og_out]
+
+    # ---- Weights, once per program: wt_sb[p, kb, c] = wt[128 kb + p, c]. ---- #
+    wt_sb = nl.ndarray((_P, blocks, cols), dtype=wt.dtype, buffer=nl.sbuf)
+    for k0 in range(0, blocks, _WEIGHT_BLOCKS_PER_DMA):
+        kn = min(_WEIGHT_BLOCKS_PER_DMA, blocks - k0)
+        nisa.dma_copy(dst=wt_sb[:, k0:k0 + kn, :],
+                      src=wt.ap(pattern=[[cols, _P], [_P * cols, kn], [1, cols]],
+                                offset=k0 * _P * cols))
+    e_rows = nl.ndarray((rank, expand_cols), dtype=expand_t.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=e_rows, src=expand_t)
+    expand = nl.ndarray((rank, expand_cols), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=expand, src=e_rows)  # exact: bf16 values in fp32
+
+    reads = 0
+    for g0 in range(0, rows, _BANK):
+        span = min(_BANK, rows - g0)
+        tiles = span // _P
+        t0 = r0 + g0
+        # ---- x^T [128, blocks, span] by tensor-engine transposes. ---------- #
+        x_rows = nl.ndarray((_P, tiles, hidden), dtype=x.dtype, buffer=nl.sbuf)
+        for i in range(tiles):
+            nisa.dma_copy(dst=x_rows[:, i, :],
+                          src=x.ap(pattern=[[hidden, _P], [1, hidden]],
+                                   offset=(t0 + i * _P) * hidden))
+        xt = nl.ndarray((_P, blocks, span), dtype=x.dtype, buffer=nl.sbuf)
+        for i in range(tiles):
+            for k0 in range(0, blocks, _PER_BF16_BANK):
+                kn = min(_PER_BF16_BANK, blocks - k0)
+                flipped = nl.ndarray((_P, kn, _P), dtype=x.dtype, buffer=nl.psum)
+                for j in range(kn):
+                    nisa.nc_transpose(dst=flipped[:, j, :],
+                                      data=x_rows[:, i, (k0 + j) * _P:(k0 + j + 1) * _P])
+                nisa.tensor_copy(dst=xt[:, k0:k0 + kn, i * _P:(i + 1) * _P], src=flipped,
+                                 engine=_psum_reader(reads))
+                reads += 1
+
+        # ---- First stage, contraction-outer: one PSUM bank per accumulation group. #
+        acc_direct = []
+        for i in range(tiles):
+            acc_direct.append(nl.ndarray((_P, _BANK), dtype=nl.float32, buffer=nl.psum))
+        acc_low = []
+        for which in range(2):
+            acc_low.append(nl.ndarray((rank, _BANK), dtype=nl.float32, buffer=nl.psum))
+        for kb in range(blocks):
+            for i in range(tiles):
+                nisa.nc_matmul(dst=acc_direct[i][:, 0:direct],
+                               stationary=xt[:, kb, i * _P:(i + 1) * _P],
+                               moving=wt_sb[:, kb, 0:direct], accumulate=(kb > 0))
+            for which in range(2):
+                low = direct + which * rank
+                nisa.nc_matmul(dst=acc_low[which][:, 0:span],
+                               stationary=wt_sb[:, kb, low:low + rank],
+                               moving=xt[:, kb, :], accumulate=(kb > 0))
+
+        # ---- q | k | v | b rows out. -------------------------------------- #
+        for i in range(tiles):
+            res = nl.ndarray((_P, direct), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=res, src=acc_direct[i][:, 0:direct],
+                             engine=_psum_reader(reads))
+            reads += 1
+            for which in range(4):
+                c0 = which * width
+                cn = direct_cols[which]
+                nisa.dma_copy(dst=direct_outs[which].ap(pattern=[[cn, _P], [1, cn]],
+                                                        offset=(t0 + i * _P) * cn),
+                              src=res[:, c0:c0 + cn])
+
+        # ---- Second stage, fp32: (bottleneck^T)^T @ expand^T, per 128-row tile. #
+        for which in range(2):
+            bt = nl.ndarray((rank, span), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=bt, src=acc_low[which][:, 0:span],
+                             engine=_psum_reader(reads))
+            reads += 1
+            for i in range(tiles):
+                g_ps = nl.ndarray((_P, width), dtype=nl.float32, buffer=nl.psum)
+                nisa.nc_matmul(dst=g_ps, stationary=bt[:, i * _P:(i + 1) * _P],
+                               moving=expand[:, which * width:(which + 1) * width],
+                               accumulate=False)
+                g_sb = nl.ndarray((_P, width), dtype=nl.float32, buffer=nl.sbuf)
+                nisa.tensor_copy(dst=g_sb, src=g_ps, engine=_psum_reader(reads))
+                reads += 1
+                nisa.dma_copy(dst=gate_outs[which].ap(pattern=[[width, _P], [1, width]],
+                                                      offset=(t0 + i * _P) * width),
+                              src=g_sb)
+    return q_out, k_out, v_out, gate_out, beta_out, og_out
+
+
 _KERNELS = {1: wrap_nki(kda_projections_kernel), 2: wrap_nki(kda_projections_kernel)[2]}
+_PREFILL_KERNELS = {1: wrap_nki(kda_projections_prefill_kernel),
+                    2: wrap_nki(kda_projections_prefill_kernel)[2]}
 
 
 @dataclass
@@ -285,20 +449,59 @@ def _weights(attn) -> tuple[Tensor, ...]:
             attn.g_a_proj_weight, attn.g_b_proj_weight)
 
 
+def prefill_operands(q_proj: Tensor, k_proj: Tensor, v_proj: Tensor, b_proj: Tensor,
+                     f_a_proj: Tensor, f_b_proj: Tensor, g_a_proj: Tensor,
+                     g_b_proj: Tensor) -> tuple[Tensor, Tensor]:
+    """The prefill kernel's two operands, dense, from the eight ``[out, in]`` weights.
+
+    Returns:
+        ``(wt, expand_t)``: ``wt [H, C]`` is ``q | k | v | b | f_a | g_a`` stacked on
+        the output axis and transposed (``C = 3 W + heads + 2 R``); ``expand_t
+        [R, 2 W]`` is ``f_b^T | g_b^T``. Same dtype as the weights.
+
+    It runs where the weights are; the load-time prep passes host copies, because a
+    device tensor refuses the transposed copy.
+    """
+    wt = torch.cat((q_proj, k_proj, v_proj, b_proj, f_a_proj, g_a_proj), dim=0)
+    return wt.t().contiguous(), torch.cat((f_b_proj.t(), g_b_proj.t()), dim=1).contiguous()
+
+
+def _serves_prefill(hidden_states: Tensor, attn, width: int, heads: int, rank: int) -> bool:
+    """True when the prefill kernel takes this call (above the decode bound).
+
+    It needs bf16 activations in 128-row tiles per program and the operands the
+    load-time prep stored, of the shapes :func:`prefill_operands` builds from these
+    weights; ``q | k | v | b`` must fit one fp32 PSUM bank.
+    """
+    tokens, hidden = (int(v) for v in hidden_states.shape)
+    operands = getattr(attn, PREFILL_OPERANDS_ATTR, None)
+    if operands is None:
+        return False
+    wt, expand_t = operands
+    return (tokens > KDA_PROJECTIONS_MAX_TOKENS and tokens % (_P * launch_programs()) == 0
+            and hidden % _P == 0 and 3 * width + heads <= _BANK
+            and hidden_states.dtype == wt.dtype == expand_t.dtype == torch.bfloat16
+            and tuple(wt.shape) == (hidden, 3 * width + heads + 2 * rank)
+            and tuple(expand_t.shape) == (rank, 2 * width))
+
+
 def kda_projections_admits(hidden_states: Tensor, attn, phase: str | None = None) -> bool:
-    """True when :func:`kda_projections` serves this call.
+    """True when :func:`kda_projections` serves this call on a kernel.
 
     Args:
         hidden_states: ``[T, H]`` activations, bf16 (served) or fp32.
-        attn: the KDA attention module; its eight projection weights are read.
+        attn: the KDA attention module; its eight projection weights are read, and
+            at prefill the operands its load-time prep stored.
         phase: the step's ``"prefill"`` or ``"decode"``; None when it is not known,
             and then only a rule without a phase selects the kernel.
 
-    The kernel serves ``1 <= T <= KDA_PROJECTIONS_MAX_TOKENS``, bf16 or fp32 weights of
-    the shapes ``kda_projections_torch`` multiplies (``q/k/v [W, H]``, ``b [Bw, H]``,
-    the gates' ``[R, H]`` then ``[W, R]``, with ``W``, ``Bw`` and ``R`` at most 128),
-    ``H`` in 128-blocks per program, on an NKI device or the simulator, when
+    Either kernel serves weights of the shapes ``kda_projections_torch`` multiplies
+    (``q/k/v [W, H]``, ``b [Bw, H]``, the gates' ``[R, H]`` then ``[W, R]``, with
+    ``W``, ``Bw`` and ``R`` at most 128), on an NKI device or the simulator, when
     ``VLLM_NEURON_GLUE_FUSED`` selects ``kda_projections`` for this row count and phase.
+    The decode kernel takes ``1 <= T <= KDA_PROJECTIONS_MAX_TOKENS``, bf16 or fp32, with
+    ``H`` in 128-blocks per program; the prefill kernel takes a larger ``T`` in 128-row
+    tiles per program, bf16, with the prepared operands (:func:`_serves_prefill`).
     Anything else is counted as declined.
     """
     ok = False
@@ -306,14 +509,15 @@ def kda_projections_admits(hidden_states: Tensor, attn, phase: str | None = None
     if hidden_states.dim() == 2 and all(w.dim() == 2 for w in weights):
         tokens, hidden = (int(v) for v in hidden_states.shape)
         q_w, k_w, v_w, b_w, f_a, f_b, g_a, g_b = weights
-        width, rank = int(q_w.shape[0]), int(f_a.shape[0])
+        width, rank, heads = int(q_w.shape[0]), int(f_a.shape[0]), int(b_w.shape[0])
         ok = (
             glue_selected("kda_projections", tokens, phase)
             and hidden_states.dtype in (torch.bfloat16, torch.float32)
             and all(w.dtype in (torch.bfloat16, torch.float32) for w in weights)
-            and 1 <= tokens <= KDA_PROJECTIONS_MAX_TOKENS
-            and hidden % (_P * launch_programs()) == 0
-            and width <= _P and rank <= _P and int(b_w.shape[0]) <= _P
+            and ((1 <= tokens <= KDA_PROJECTIONS_MAX_TOKENS
+                  and hidden % (_P * launch_programs()) == 0)
+                 or _serves_prefill(hidden_states, attn, width, heads, rank))
+            and width <= _P and rank <= _P and heads <= _P
             and all(tuple(w.shape) == (width, hidden) for w in (q_w, k_w, v_w))
             and int(b_w.shape[1]) == hidden
             and all(tuple(w.shape) == (rank, hidden) for w in (f_a, g_a))
@@ -347,11 +551,12 @@ def kda_projections_torch(hidden_states: Tensor, attn) -> tuple[Tensor, ...]:
 
 def kda_projections(hidden_states: Tensor, attn,
                     phase: str | None = None) -> tuple[Tensor, ...]:
-    """The six KDA input projections of ``hidden_states``, on the kernel or in torch.
+    """The six KDA input projections of ``hidden_states``, on a kernel or in torch.
 
     Args:
         hidden_states: ``[T, H]`` activations, bf16 or fp32.
-        attn: the KDA attention module (its projection weights).
+        attn: the KDA attention module (its projection weights, and above
+            ``KDA_PROJECTIONS_MAX_TOKENS`` rows the operands its load-time prep stored).
         phase: the step's ``"prefill"`` or ``"decode"``, for ``VLLM_NEURON_GLUE_FUSED``.
 
     Returns:
@@ -362,6 +567,10 @@ def kda_projections(hidden_states: Tensor, attn,
     if not kda_projections_admits(hidden_states, attn, phase):
         return kda_projections_torch(hidden_states, attn)
     _count_nki_dispatch()
+    if int(hidden_states.shape[0]) > KDA_PROJECTIONS_MAX_TOKENS:
+        wt, expand_t = getattr(attn, PREFILL_OPERANDS_ATTR)
+        return _PREFILL_KERNELS[launch_programs()](
+            x=hidden_states.contiguous(), wt=wt, expand_t=expand_t)
     q_w, k_w, v_w, b_w, f_a, f_b, g_a, g_b = (w.contiguous() for w in _weights(attn))
     q_in, k_in, v_in, raw_gate, raw_beta, out_gate = _KERNELS[launch_programs()](
         x=hidden_states.contiguous(), q_w=q_w, k_w=k_w, v_w=v_w, b_w=b_w,
