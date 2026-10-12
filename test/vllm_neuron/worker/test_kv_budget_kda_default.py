@@ -43,6 +43,8 @@ ONE_M = 1024 * 1024
 #: The worker's footprint at 1 x 1M before and after the default.
 ONE_M_PC_ON_FOOTPRINT_GIB = 56.38
 ONE_M_ONE_BLOCK_FOOTPRINT_GIB = 12.38
+#: The 1 x 1M point with prefix caching on in vLLM's "align" KDA cache mode.
+ONE_M_ALIGN_FOOTPRINT_GIB = 12.389
 
 DEFAULTS_MARKER = "Glm5NextForConditionalGeneration KV cache defaults"
 PC_FLAG_ON = "--enable-prefix-caching"
@@ -316,6 +318,143 @@ def test_prefix_caching_on_prices_every_kda_block(model_specs, monkeypatch) -> N
     assert round(worker._kv_cache_footprint_bytes(need) / GIB, 2) == ONE_M_PC_ON_FOOTPRINT_GIB
 
 
+def _in_cache_mode(worker, mode: str, *, draft_blocks: int = 0):
+    """The worker, its runner reporting every KDA spec in vLLM's ``mode`` cache mode."""
+    import dataclasses
+
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    specs = {
+        name: dataclasses.replace(spec, mamba_cache_mode=mode, num_speculative_blocks=draft_blocks)
+        if isinstance(spec, MambaSpec)
+        else spec
+        for name, spec in worker.model_runner.get_kv_cache_spec().items()
+    }
+    worker.model_runner.get_kv_cache_spec = lambda: specs
+    return worker
+
+
+@pytest.mark.parametrize("draft_blocks", [0, 3], ids=["plain", "mtp-3"])
+def test_align_mode_prices_two_kda_blocks_and_the_draft_blocks_per_request(
+    model_specs, monkeypatch, draft_blocks
+) -> None:
+    """vLLM's "align" mode keeps a request's running KDA block, the block before it and
+    its draft blocks in each KDA group (``MambaSpec.max_memory_usage_bytes``), however
+    long the sequence. At 1 x 1M that is the one-block footprint plus one block per KDA
+    group; the per-slot banks and the side caches do not change."""
+    cfg, _ = _resolve_past_the_refusal(monkeypatch, [PC_FLAG_ON], max_model_len=ONE_M)
+    worker = _in_cache_mode(_priced_worker(model_specs, cfg, seqs=1, length=ONE_M), "align",
+                            draft_blocks=draft_blocks)
+    page = kv.BLOCK_SIZE_TOKENS * kv.LATENT_BYTES_PER_TOKEN
+    kda_groups = math.ceil(kv.KDA_LAYERS / kv.MLA_LAYERS)
+    pages = math.ceil(ONE_M / kv.BLOCK_SIZE_TOKENS)
+
+    need = worker._kv_cache_need_bytes(log=False)
+
+    assert need == kv.MLA_LAYERS * page * (pages + kda_groups * (2 + draft_blocks) + 1)
+    if not draft_blocks:
+        default_cfg, _ = _resolve(monkeypatch, [], max_model_len=ONE_M)
+        one_block = _priced_worker(model_specs, default_cfg, seqs=1, length=ONE_M)
+        one_block_bytes = one_block._kv_cache_footprint_bytes(
+            one_block._kv_cache_need_bytes(log=False))
+        footprint = worker._kv_cache_footprint_bytes(need)
+        assert footprint == one_block_bytes + kda_groups * kv.MLA_LAYERS * page
+        assert round(footprint / GIB, 3) == ONE_M_ALIGN_FOOTPRINT_GIB
+
+
+@pytest.mark.parametrize("mode", ["none", "all"])
+def test_the_other_cache_modes_keep_every_kda_block_priced(model_specs, monkeypatch, mode):
+    cfg, _ = _resolve_past_the_refusal(monkeypatch, [PC_FLAG_ON], max_model_len=ONE_M)
+    worker = _in_cache_mode(_priced_worker(model_specs, cfg, seqs=1, length=ONE_M), mode)
+    assert round(worker._kv_cache_footprint_bytes(worker._kv_cache_need_bytes(log=False))
+                 / GIB, 2) == ONE_M_PC_ON_FOOTPRINT_GIB
+
+
+@pytest.mark.parametrize("draft_blocks", [0, 3], ids=["plain", "mtp-3"])
+def test_vllms_align_mode_manager_never_holds_more_kda_blocks_than_priced(
+    model_specs, monkeypatch, draft_blocks
+) -> None:
+    """vLLM's own manager, stepped through a chunked prefill, a prefix hit and decode
+    across block boundaries: in each KDA group a request holds at most the blocks the
+    worker prices per request, 2 + k, and it does reach that figure, so the price is
+    the allocation."""
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.core.kv_cache_utils import (
+        get_kv_cache_configs,
+        get_request_block_hasher,
+        init_none_hash,
+        resolve_kv_cache_block_sizes,
+    )
+    from vllm.utils.hashing import sha256
+    from vllm.v1.kv_cache_interface import MambaSpec
+    from vllm.v1.request import Request
+
+    from vllm_neuron.vllm.worker.neuron_worker import pool_blocks_per_request
+
+    length, block = 2048, kv.BLOCK_SIZE_TOKENS
+    cfg, _ = _resolve_past_the_refusal(monkeypatch, [PC_FLAG_ON], max_model_len=length)
+    worker = _in_cache_mode(_priced_worker(model_specs, cfg, seqs=2, length=length), "align",
+                            draft_blocks=draft_blocks)
+    vllm_config = worker.vllm_config
+    vllm_config.cache_config.mamba_cache_mode = "align"
+    specs = worker.model_runner.get_kv_cache_spec()
+    config = get_kv_cache_configs(vllm_config, [specs], [worker._kv_cache_need_bytes(log=False)])[0]
+    scheduler_block, hash_block = resolve_kv_cache_block_sizes(config, vllm_config)
+    manager = KVCacheManager(
+        kv_cache_config=config, max_model_len=length, scheduler_block_size=scheduler_block,
+        hash_block_size=hash_block, max_num_batched_tokens=kv.MAX_NUM_BATCHED_TOKENS,
+        enable_caching=True, use_eagle=bool(draft_blocks),
+    )
+    kda = [i for i, g in enumerate(config.kv_cache_groups) if isinstance(g.kv_cache_spec, MambaSpec)]
+    managers = manager.coordinator.single_type_managers
+    init_none_hash(sha256)
+    hasher = get_request_block_hasher(hash_block, sha256)
+    held: list[int] = []
+    hits: list[int] = []
+
+    def step(request, tokens: int, **kwargs) -> None:
+        manager.new_step_starts()  # as the scheduler does before each schedule
+        assert manager.allocate_slots(request, tokens, num_lookahead_tokens=draft_blocks,
+                                      **kwargs) is not None
+        held.extend(sum(not b.is_null for b in managers[g].req_to_blocks[request.request_id])
+                    for g in kda)
+        request.num_computed_tokens += tokens + kwargs.get("num_new_computed_tokens", 0)
+
+    def serve(request_id: str, prompt: list[int], decode: int) -> None:
+        request = Request(request_id=request_id, prompt_token_ids=prompt,
+                          sampling_params=SamplingParams(max_tokens=decode),
+                          pooling_params=None, block_hasher=hasher)
+        hit_blocks, hit = manager.get_computed_blocks(request)
+        hits.append(hit)
+        left = len(prompt) - hit
+        first = True
+        while left:  # legs of whole blocks, then the tail
+            tokens = min(left, 4 * block) if left >= block else left
+            tokens = tokens // block * block or tokens
+            extra = {"num_new_computed_tokens": hit, "new_computed_blocks": hit_blocks} if first else {}
+            step(request, tokens, **extra)
+            first, left = False, left - tokens
+        for index in range(decode):
+            request.append_output_token_ids(index)
+            step(request, 1)
+        manager.free(request)
+
+    prompt = list(range(5 * block + 17))
+    serve("cold", prompt, decode=2 * block)
+    serve("hit", prompt + list(range(3 * block)), decode=block)
+
+    priced = {pool_blocks_per_request(config.kv_cache_groups[g].kv_cache_spec, length, "KDA")
+              for g in kda}
+    assert priced == {2 + draft_blocks}
+    assert max(held) == 2 + draft_blocks
+    # The second request hits 7 blocks, and its last KDA block was filled by the first
+    # request's decode: in this mode vLLM caches such a block as it caches the end of a
+    # prefill leg, so it must hold its checkpoint before it is a hit source.
+    assert hits == [0, 7 * block]
+    assert 7 * block > len(prompt)
+
+
 def test_prefix_caching_on_names_both_footprints_in_one_line(
     model_specs, monkeypatch, caplog
 ) -> None:
@@ -343,6 +482,22 @@ def test_prefix_caching_on_names_both_footprints_in_one_line(
     # The configuration is left as it was priced.
     assert worker.cache_config.enable_prefix_caching is True
     assert worker.cache_config.mamba_block_size is None
+
+
+def test_align_mode_names_two_kda_blocks_per_request_in_the_line(
+    model_specs, monkeypatch, caplog
+) -> None:
+    cfg, _ = _resolve_past_the_refusal(monkeypatch, [PC_FLAG_ON], max_model_len=ONE_M)
+    worker = _in_cache_mode(_priced_worker(model_specs, cfg, seqs=1, length=ONE_M), "align",
+                            draft_blocks=3)
+    footprint = worker._kv_cache_footprint_bytes(worker._kv_cache_need_bytes(log=False))
+
+    with caplog.at_level(logging.INFO):
+        worker._log_recurrent_blocks(footprint)
+
+    (line,) = [r.getMessage() for r in caplog.records if "recurrent (KDA) group" in r.getMessage()]
+    assert "4 recurrent (KDA) group(s) keeps 128-token blocks, 2 block(s) per request" in line
+    assert f"footprint {footprint / GIB:.3f} GiB" in line
 
 
 def test_one_block_per_group_logs_no_kda_line(model_specs, monkeypatch, caplog) -> None:
