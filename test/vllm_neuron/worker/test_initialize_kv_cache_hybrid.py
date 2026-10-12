@@ -97,7 +97,8 @@ def _drive(kv_cache_config, layers, monkeypatch: pytest.MonkeyPatch) -> dict:
     fake = SimpleNamespace(
         vllm_config=SimpleNamespace(
             cache_config=SimpleNamespace(
-                block_size=HYBRID_BLOCK_SIZE, cache_dtype="auto"
+                block_size=HYBRID_BLOCK_SIZE, cache_dtype="auto",
+                enable_prefix_caching=False,
             ),
             model_config=SimpleNamespace(dtype=torch.bfloat16),
         ),

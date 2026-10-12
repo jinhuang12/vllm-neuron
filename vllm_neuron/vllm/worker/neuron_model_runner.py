@@ -424,6 +424,62 @@ def kv_cache_allocations(
     return allocations
 
 
+def kda_checkpoint_page_views(
+    kv_cache_config: KVCacheConfig,
+    raw_tensors: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    """Return each recurrent layer's checkpoint pages, by layer name, with no allocation.
+
+    With prefix caching on, a recurrent (KDA) layer keeps the checkpoint of its group's
+    block ``b`` in page ``b`` of the ``KVCacheTensor`` it shares (``glm5next_state_banks``,
+    "The KDA checkpoint store"). :func:`kv_cache_allocations` allocates that tensor whole
+    for the attention layer on it, so the pages are a view of that layer's raw buffer
+    (``raw_tensors``, by layer name). The recurrent layers on one tensor get the same
+    view object, so their checkpoint writes chain on one graph input. A tensor with no
+    attention layer has no buffer, and pages of another size than a recurrent layer's
+    page cannot hold its checkpoint: both are refused by name.
+    """
+    from vllm_neuron.vllm.worker.glm5next_state_banks import (
+        kda_checkpoint_layout,
+        kda_checkpoint_pages,
+    )
+
+    spec_of = {
+        name: group.kv_cache_spec
+        for group in kv_cache_config.kv_cache_groups
+        for name in group.layer_names
+    }
+    views: dict[str, torch.Tensor] = {}
+    for tensor in kv_cache_config.kv_cache_tensors:
+        recurrent = [
+            name
+            for name in tensor.shared_by
+            if isinstance(spec_of.get(name), MambaSpec)
+        ]
+        if not recurrent:
+            continue
+        shared = [name for name in tensor.shared_by if name not in recurrent]
+        if not shared:
+            raise ValueError(
+                f"recurrent layer(s) {recurrent} share a KV cache tensor with no "
+                f"attention layer, so no buffer backs the pages their block "
+                f"checkpoints are kept in"
+            )
+        page_bytes = int(tensor.size) // int(kv_cache_config.num_blocks)
+        for name in recurrent:
+            layout = kda_checkpoint_layout(spec_of[name])
+            if layout.page_bytes != page_bytes:
+                raise ValueError(
+                    f"recurrent layer {name} has {layout.page_bytes}-byte pages and the "
+                    f"KV cache tensor it shares has {page_bytes}-byte pages "
+                    f"({tensor.size} bytes over {kv_cache_config.num_blocks} blocks)"
+                )
+        pages = kda_checkpoint_pages(raw_tensors[shared[0]], layout)
+        for name in recurrent:
+            views[name] = pages
+    return views
+
+
 def indexer_context_per_rank(vllm_config: Any) -> int:
     """Return the context one rank's DSA indexer covers: its pooled-key rows and decode candidates.
 
@@ -12286,6 +12342,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 raise NotImplementedError(
                     f"Unsupported Attention spec type: {type(kv_cache_spec)}"
                 )
+
+        # With prefix caching on, each recurrent layer's block checkpoints are kept in
+        # the pages of the KV cache tensor it shares: views of the buffers allocated
+        # above, so the allocation and ``kv_caches`` are the same with it off.
+        self.kda_checkpoint_pages = (
+            kda_checkpoint_page_views(kv_cache_config, kv_cache_raw_tensors)
+            if self.vllm_config.cache_config.enable_prefix_caching
+            else {}
+        )
 
         # This binds the cache tensors to the model
         self.model.bind_kv_cache(kv_caches)
