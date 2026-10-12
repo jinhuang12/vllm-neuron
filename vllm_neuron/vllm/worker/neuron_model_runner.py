@@ -2425,10 +2425,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
-        # Free per-request cache state only on the scheduler's finished set: a live
-        # request that was not scheduled this step also leaves the persistent batch
-        # below, and it keeps its state.
+        # Free per-request cache state only on the scheduler's finished and preempted
+        # sets: a live request that was not scheduled this step also leaves the
+        # persistent batch below, and it keeps its state.
         self._glm5next_note_finished_requests(scheduler_output.finished_req_ids)
+        self._glm5next_note_preempted_requests(scheduler_output.preempted_req_ids)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -6000,13 +6001,28 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         Absence from a batch does not mean finished: the runner also drops a live
         request from the persistent batch when it gets no tokens in a step, and that
-        request keeps its state. Only the engine's own finished set releases a slot.
+        request keeps its state. Only the scheduler's own finished and preempted sets
+        release a slot (``_glm5next_note_preempted_requests``).
         """
         noted = getattr(self, "_glm5next_finished_request_ids", None)
         if noted is None:
             noted = set()
             self._glm5next_finished_request_ids = noted
         noted.update(finished_req_ids or ())
+
+    def _glm5next_note_preempted_requests(self, preempted_req_ids) -> None:
+        """Record the scheduler's preempted request ids so the slot table frees them too.
+
+        vLLM bounds only its running requests by ``max_num_seqs``. A preempted request
+        waits outside that bound, and FCFS can schedule a skipped-waiting request
+        before it, so a slot it kept could leave the request admitted in its place
+        with no slot. The preempted request does not need its slot's state again:
+        vLLM restarts it from computed length 0, where it is handed a slot like a new
+        request and opens its sequence. A preemption made outside ``schedule()``
+        (``reset_prefix_cache`` with ``reset_running_requests``) is not reported; that
+        request keeps its slot and reopens it at position 0.
+        """
+        self._glm5next_note_finished_requests(preempted_req_ids)
 
     def _glm5next_request_slots(
         self, banks, request_ids, *, synthetic: bool, side_caches=None
@@ -6020,13 +6036,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         recurrence. Zeroing at hand-out rather than at release means a crash between
         the two cannot leave a dirty slot looking clean.
 
-        Only ids the scheduler reported finished release a slot; a running request
-        that gets no tokens in a step leaves the batch but keeps its state. A
-        synthetic step (warmup, idle dummy step) is served from slot 0 without reading
-        or writing the table, so a warmup between two real steps of one sequence
-        cannot evict it. A synthetic step of several rows (a decode warmup of a batch
-        bucket) takes that many distinct slots, slots no request owns first, so the
-        captured graph sees the disjoint per-request views a served batch hands it.
+        Only ids the scheduler reported finished or preempted release a slot; a
+        running request that gets no tokens in a step leaves the batch but keeps its
+        state. A synthetic step (warmup, idle dummy step) is served from slot 0
+        without reading or writing the table, so a warmup between two real steps of
+        one sequence cannot evict it. A synthetic step of several rows (a decode
+        warmup of a batch bucket) takes that many distinct slots, slots no request
+        owns first, so the captured graph sees the disjoint per-request views a
+        served batch hands it.
         """
         from vllm_neuron.vllm.worker.glm5next_state_banks import empty_slot
 
