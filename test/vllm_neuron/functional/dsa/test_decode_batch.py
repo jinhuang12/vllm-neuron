@@ -113,12 +113,10 @@ def test_ring_step_two_programs_split_the_requests_and_equal_one(monkeypatch, ba
 def test_the_kernel_key_covers_the_butterfly_the_kernels_call():
     """Both kernels' cache key is a digest over this module and ``kpool_hadamard.py``,
     whose butterfly the ring step calls: an edit to either re-keys the kernels."""
-    import hashlib
-    from pathlib import Path
-
     from vllm_neuron.functional.dsa import kpool_hadamard as KH
-    data = Path(DB.__file__).read_bytes() + Path(KH.__file__).read_bytes()
-    assert DB.SOURCE_DIGEST == int(hashlib.sha256(data).hexdigest()[:7], 16)
+    from vllm_neuron.source_digest import source_digest
+
+    assert DB.SOURCE_DIGEST == source_digest(DB.__file__, KH.__file__)
 
 
 def test_ring_step_torch_oracle_agrees():

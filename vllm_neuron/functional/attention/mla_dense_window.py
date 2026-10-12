@@ -60,9 +60,7 @@ window and each row's causal length. The call site is
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass
-from pathlib import Path
 
 import torch
 from torch import Tensor
@@ -75,6 +73,7 @@ from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
 from vllm_neuron.functional.attention import mla_sparse as _ms
 from vllm_neuron.functional.dsa.launch_grid import lnc_pair
+from vllm_neuron.source_digest import source_digest
 from vllm_neuron.utils.neuron_utils import values_are_readable
 # The partial contract's empty lse lives with the merge that reads it.
 from vllm_neuron.functional.attention.dcp_merge import EMPTY_LSE
@@ -105,7 +104,7 @@ _LINE = 8
 
 #: This file's digest, and the staging helper's (``mla_sparse.py``), as trace-time ints:
 #: the compiled-kernel cache keys on the entry's own source and arguments only.
-SOURCE_DIGEST = int(hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:7], 16)
+SOURCE_DIGEST = source_digest(__file__)
 STAGING_DIGEST = int(_ms.SOURCE_DIGEST)
 
 

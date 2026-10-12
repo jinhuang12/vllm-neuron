@@ -49,10 +49,8 @@ and a single request runs on one core.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 from dataclasses import dataclass
-from pathlib import Path
 
 import torch
 from torch import Tensor
@@ -64,6 +62,7 @@ import nki.language as nl
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
 from vllm_neuron.functional.dsa.launch_grid import lnc_pair
+from vllm_neuron.source_digest import source_digest
 from vllm_neuron.utils.neuron_utils import values_are_readable
 
 logger = logging.getLogger(__name__)
@@ -97,7 +96,7 @@ _LINE = 8
 #: compiled-kernel cache keys on a kernel's own source and its arguments, and both
 #: entry points below are thin wrappers over :func:`_decode_body`: without this, an
 #: edit to the body or its helpers would be served the previous build.
-SOURCE_DIGEST = int(hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:7], 16)
+SOURCE_DIGEST = source_digest(__file__)
 
 
 class MlaDecodeAttentionError(ValueError):

@@ -70,10 +70,8 @@ exactly). A pad needs nothing: its value and id are replaced before anything rea
 
 from __future__ import annotations
 
-import hashlib
 import logging
 from dataclasses import dataclass
-from pathlib import Path
 
 import nki
 import nki.isa as nisa
@@ -84,6 +82,7 @@ from torch import Tensor
 
 from vllm_neuron.functional.dsa.causal_bound import BOUND_FILL_MARK, SENTINEL
 from vllm_neuron.functional.dsa.launch_grid import lnc_pair
+from vllm_neuron.source_digest import source_digest
 from vllm_neuron.utils.neuron_utils import (
     SBUF_BYTES_PER_PARTITION,
     SBUF_PARTITIONS,
@@ -124,7 +123,7 @@ _ID_DTYPES = (torch.int32,)
 #: This file's content digest, handed to the kernel as a trace-time int: the compiled kernel
 #: cache keys on a kernel's own source and its arguments, and the kernel calls helpers whose
 #: edits it would otherwise not see.
-SOURCE_DIGEST = int(hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:7], 16)
+SOURCE_DIGEST = source_digest(__file__)
 
 
 class DcpCandidateMergeError(ValueError):

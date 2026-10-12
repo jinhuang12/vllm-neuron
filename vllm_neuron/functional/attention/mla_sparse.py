@@ -38,11 +38,9 @@ across the ranks. A row with no valid column returns 0 and ``dcp_merge.EMPTY_LSE
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 from dataclasses import dataclass
-from pathlib import Path
 
 import torch
 from torch import Tensor
@@ -54,6 +52,7 @@ import nki.language as nl
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
 from vllm_neuron.functional.dsa.launch_grid import lnc_pair
+from vllm_neuron.source_digest import source_digest
 from vllm_neuron.utils.neuron_utils import can_run_kernel, values_are_readable
 # The partial contract's empty lse lives with the merge that reads it.
 from vllm_neuron.functional.attention.dcp_merge import EMPTY_LSE
@@ -120,7 +119,7 @@ _SENTINEL_EXP_FLOOR = 200.0
 #: compiled-kernel cache keys on an entry point's own source and its arguments, and the
 #: entry points are thin wrappers over the bodies: without this, an edit to a body or a
 #: helper would be served the previous build (``mla_decode.py`` keys itself the same way).
-SOURCE_DIGEST = int(hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:7], 16)
+SOURCE_DIGEST = source_digest(__file__)
 
 #: Kill switch for the low-precision PE path of the row-tiled body: ``1`` restores the
 #: fp32 arithmetic of commit 8aa22fa bit for bit. Read at trace time, like the LNC flag.

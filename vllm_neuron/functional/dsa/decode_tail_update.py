@@ -29,10 +29,8 @@ entry points agree bit for bit wherever the pooled value means anything.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 from dataclasses import dataclass
-from pathlib import Path
 
 import torch
 from torch import Tensor
@@ -49,6 +47,7 @@ from vllm_neuron.functional.dsa.kpool_hadamard import (
     _fwht128_inplace,
     hadamard_matrix,
 )
+from vllm_neuron.source_digest import source_digest
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 logger = logging.getLogger(__name__)
@@ -926,7 +925,7 @@ def dsa_decode_ring_rows_kernel(tail_hbm, slots_hbm, key_hbm, score_hbm, ape_hbm
     return pooled_hbm, rings_hbm
 
 
-ROWS_SOURCE_DIGEST = int(hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:7], 16)
+ROWS_SOURCE_DIGEST = source_digest(__file__)
 """A digest of this file, passed to the rows kernel so the kernel cache keys on its source."""
 
 

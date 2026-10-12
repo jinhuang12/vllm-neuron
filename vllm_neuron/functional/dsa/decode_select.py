@@ -77,9 +77,6 @@ stage, after that module's ring step and scores.
 
 from __future__ import annotations
 
-import hashlib
-from pathlib import Path
-
 import torch
 from torch import Tensor
 
@@ -101,6 +98,7 @@ from vllm_neuron.functional.dsa.index_expand import (
     is_power_of_two,
 )
 from vllm_neuron.functional.dsa.launch_grid import lnc_pair
+from vllm_neuron.source_digest import source_digest
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 #: ``nonzero_with_count`` reads and writes partition ``16 i`` of each 16-partition group.
@@ -154,7 +152,7 @@ _SUPPORTED_DTYPES = (torch.float32,)
 #: This file's content digest, handed to the kernel as a trace-time int: the compiled
 #: kernel cache keys on a kernel's own source and its arguments, and the kernel calls
 #: helpers whose edits it would otherwise not see.
-SOURCE_DIGEST = int(hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:7], 16)
+SOURCE_DIGEST = source_digest(__file__)
 
 
 class DecodeSelectError(ValueError):

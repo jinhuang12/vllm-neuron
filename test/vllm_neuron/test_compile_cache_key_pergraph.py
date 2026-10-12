@@ -29,6 +29,7 @@ import pytest
 import torch
 
 import vllm_neuron
+from test.vllm_neuron.test_source_digest import CODE_EDITS, reword_comments_and_docstrings
 from vllm_neuron import compile_cache_key as ck
 
 REPO_ROOT = Path(vllm_neuron.__file__).resolve().parent.parent
@@ -103,8 +104,13 @@ def _write_tree(dst_parent: Path, files: dict[str, str]) -> Path:
     return root
 
 
-def _append_byte(path: Path) -> None:
-    path.write_bytes(path.read_bytes() + b"\n")
+#: A code edit any digested file takes: the digest reads code, so a comment or a
+#: blank line would move nothing (``test_source_digest.py``).
+APPENDED_STATEMENT = b"\n_DIGEST_PROBE = 1\n"
+
+
+def _append_statement(path: Path) -> None:
+    path.write_bytes(path.read_bytes() + APPENDED_STATEMENT)
 
 
 def _kernel_entry(module: str, name: str):
@@ -221,13 +227,37 @@ def test_editing_one_kernel_file_changes_only_the_graph_that_calls_it(
     graph_b = _kernel_graph(_kernel_entry(ROUTER, "noaux_router_decode_kernel"))
 
     before = _graph_keys(lib, copy, graph_a, graph_b)
-    _append_byte(copy / _rel(SINKHORN))
+    _append_statement(copy / _rel(SINKHORN))
     after_a = _graph_keys(lib, copy, graph_a, graph_b)
-    _append_byte(copy / _rel(ROUTER))
+    _append_statement(copy / _rel(ROUTER))
     after_b = _graph_keys(lib, copy, graph_a, graph_b)
 
     assert after_a[0] != before[0] and after_a[1] == before[1]
     assert after_b[0] == after_a[0] and after_b[1] != after_a[1]
+
+
+def test_a_comment_or_docstring_edit_moves_no_graph_key_and_a_code_edit_one(
+    tmp_path, lib, restore_keys, no_kernel_compile
+):
+    """The installed graph key reads a kernel file's code: a comment or docstring edit
+    to the Sinkhorn kernel moves neither graph's key; each code edit moves graph A's."""
+    copy = _copy_tree(tmp_path)
+    graph_a = _kernel_graph(_kernel_entry(SINKHORN, "sinkhorn_blocks_kernel"))
+    graph_b = _kernel_graph(_kernel_entry(ROUTER, "noaux_router_decode_kernel"))
+    path = copy / _rel(SINKHORN)
+    original = path.read_text()
+
+    before = _graph_keys(lib, copy, graph_a, graph_b)
+    path.write_text(reword_comments_and_docstrings(original))
+    reworded = _graph_keys(lib, copy, graph_a, graph_b)
+    moved = {}
+    for name, edit in CODE_EDITS.items():
+        path.write_text(edit(original))
+        after = _graph_keys(lib, copy, graph_a, graph_b)
+        moved[name] = (after[0] != before[0], after[1] != before[1])
+
+    assert reworded == before
+    assert moved == {name: (True, False) for name in CODE_EDITS}
 
 
 def test_the_per_graph_key_is_the_library_key_with_the_closure_digest_folded(
@@ -264,7 +294,7 @@ def test_editing_a_shared_import_changes_every_graph_reaching_it_and_no_other(
     assert _rel(CAUSAL_BOUND) not in _module_files(resolver, SINKHORN)
 
     before = _graph_keys(lib, copy, *graphs)
-    _append_byte(copy / _rel(CAUSAL_BOUND))
+    _append_statement(copy / _rel(CAUSAL_BOUND))
     after = _graph_keys(lib, copy, *graphs)
 
     assert after[0] != before[0]
@@ -285,7 +315,7 @@ def test_each_digested_file_moves_exactly_the_graphs_that_reach_it(tmp_path):
     for rel in base.files:
         path = copy / rel
         original = path.read_bytes()
-        path.write_bytes(original + b"\n")
+        path.write_bytes(original + APPENDED_STATEMENT)
         try:
             edited = ck.KernelDigestResolver(copy)
             for m in modules:
@@ -314,7 +344,7 @@ def test_editing_a_torch_only_file_changes_no_graph_key(
     assert torch_only in resolver.files and torch_only not in reached
 
     before = _graph_keys(lib, copy, *graphs)
-    _append_byte(copy / torch_only)
+    _append_statement(copy / torch_only)
     after = _graph_keys(lib, copy, *graphs)
 
     assert after == before
@@ -341,7 +371,7 @@ def test_a_kernel_edit_does_not_change_a_kernel_free_graph_key(
     kernel = _kernel_graph(_kernel_entry(DECODE_BATCH, "dsa_decode_scores_kernel"))
 
     before = _graph_keys(lib, copy, kernel_free, kernel)
-    _append_byte(copy / _rel(DECODE_BATCH))
+    _append_statement(copy / _rel(DECODE_BATCH))
     after = _graph_keys(lib, copy, kernel_free, kernel)
 
     assert after[0] == before[0]
@@ -728,9 +758,9 @@ def test_editing_the_wrapper_of_an_nkilib_kernel_changes_only_its_graph_key(
     graph_sinkhorn = _kernel_graph(_kernel_entry(SINKHORN, "sinkhorn_blocks_kernel"))
 
     before = _graph_keys(lib, copy, graph_mlp, graph_sinkhorn)
-    _append_byte(copy / _rel(MLP))
+    _append_statement(copy / _rel(MLP))
     after_mlp = _graph_keys(lib, copy, graph_mlp, graph_sinkhorn)
-    _append_byte(copy / _rel(SINKHORN))
+    _append_statement(copy / _rel(SINKHORN))
     after_sinkhorn = _graph_keys(lib, copy, graph_mlp, graph_sinkhorn)
 
     assert after_mlp[0] != before[0] and after_mlp[1] == before[1]
@@ -876,7 +906,7 @@ def test_an_edit_to_a_file_a_kernel_reaches_indirectly_moves_its_digest(
 
     path = trap_tree / reached
     original = path.read_bytes()
-    path.write_bytes(original + b"\n")
+    path.write_bytes(original + APPENDED_STATEMENT)
     try:
         after = ck.KernelDigestResolver(trap_tree)
         assert after.digest_of(_module_files(after, module)) != before.digest_of(files)
@@ -1035,7 +1065,7 @@ def test_the_nki_key_folds_only_its_kernels_closure(tmp_path, lib, restore_keys)
         return [nki_cache.create_nki_cache_key(f, args, (1,)) for f in (sinkhorn, router)]
 
     before = keys()
-    _append_byte(copy / _rel(SINKHORN))
+    _append_statement(copy / _rel(SINKHORN))
     after = keys()
 
     assert None not in before
@@ -1060,9 +1090,9 @@ def test_the_nki_key_of_an_nkilib_kernel_moves_with_its_wrapper_module(
         return nki_cache.create_nki_cache_key(nkilib_mlp, args, (1,))
 
     before = key()
-    _append_byte(copy / _rel(SINKHORN))
+    _append_statement(copy / _rel(SINKHORN))
     unrelated = key()
-    _append_byte(copy / "functional/mlp.py")
+    _append_statement(copy / "functional/mlp.py")
     after = key()
 
     assert before is not None
