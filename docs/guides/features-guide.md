@@ -612,11 +612,10 @@ scheduling forms:
   and `--max-num-seqs 1`. The verify step's position corrections run on device one step
   late, so the scheduler's host work overlaps the device; the drafter refuses the knob with
   synchronous scheduling (it would change nothing) or with `max_num_seqs > 1` (it serves one
-  sequence). Measured on trn2 at tensor parallel 64, expert parallel 16, `k = 3`, batch size
-  1: inter-token latency 7.565 ms against 11.377 ms synchronous (median per-token gap on the
-  same host and recipe, a 1k-token context; mean per-token gap 10.17 against 15.45 ms; 77.7
-  against 55.6 tokens/s) (2026-10-10); the 8-prompt greedy outputs identical to the
-  synchronous drafter's; the same GSM8K@200 strict score and wrong set.
+  sequence). On trn2 at tensor parallel 64, expert parallel 16, `k = 3`, batch size 1, it
+  shortens the inter-token latency against the synchronous drafter on the same host and
+  recipe, with greedy outputs identical to the synchronous drafter's and the same
+  benchmark score and wrong answers.
   Execution queue: the async drafter enqueues three executions per decode step (the
   correction launch, the forward, the take launch) against the synchronous drafter's one, so a
   rank whose runtime completion thread stalls fills the execution queue
@@ -646,9 +645,9 @@ differs from non-speculative greedy decoding for some identity prompts, on both
 configurations and deterministically within each: the likeliest carrier is the
 `1 + k`-row verify graph and the one-row decode graph accumulating in different orders
 (each step is lossless by id equality, and an on-device-sampling server returns no
-logprobs with which to read the margins). One benchmark question flipped between the
-two configurations (cause under investigation). Leave it off where token identity with
-non-speculative decoding is required. Details:
+logprobs with which to read the margins). With the bank write, one fewer benchmark
+question is correct than with the view-form write (cause under investigation). Leave
+it off where token identity with non-speculative decoding is required. Details:
 [`docs/design/speculation/speculative_decoding_design.md`](../design/speculation/speculative_decoding_design.md#glm-53-flash-mtp-drafter-method-mtp).
 
 By default (`VLLM_NEURON_GLUE_FUSED` unset or `1`) GLM-5.3-Flash's fused glue
@@ -656,11 +655,9 @@ kernels serve the mHC sites at the prefill buckets only, not at the verify step.
 fuse the mHC pre-mix at the verify step too, add `mhc_pre:verify` to the default's
 rules:
 `VLLM_NEURON_GLUE_FUSED=mhc_pre:prefill@128,mhc_pre:prefill@1024,mhc_pre:prefill@2048,mhc_post:prefill@128,mhc_post:prefill@1024,mhc_post:prefill@2048,mhc_pre:verify`.
-This saves 0.8 to 1.0 ms per token but changes answers. Measured on a trn2 TP=64 serve
-of GLM-5.3-Flash at batch size 1 with 3 drafts, GSM8K 500 questions: with the rule,
-exact match 0.974 at a median ITL of 10.291 ms, with 3 answers wrong that the server
-without speculation (0.978) got right; with the default, 0.982 at 11.113 ms, with
-none.
+This saves time per token but changes answers: on a trn2 TP=64 server of
+GLM-5.3-Flash at batch size 1 with 3 drafts, the rule got wrong some answers that the
+server without speculation got right, and the default got none of those wrong.
 
 ### On-device vs CPU sampling
 

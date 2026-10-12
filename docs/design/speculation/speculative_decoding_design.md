@@ -607,10 +607,9 @@ Contract of the opt-in (measured on trn2 at TP64/EP16, `k = 3`, `max_num_seqs 1`
   the async drafter is selected: `VLLM_NEURON_GLM5NEXT_MTP_ASYNC=1` with
   `--async-scheduling` and `--max-num-seqs 1` moves the host corrections (the indexer-ring
   cursor, the checkpoint commit and the resume row) and the position-derived operands on
-  device, one step late (`vllm_neuron/functional/mtp/async_step.py`; measured 7.565 ms
-  against 11.377 ms synchronous (median per-token gap on the same host and recipe, a
-  1k-token context; mean per-token gap 10.17 against 15.45 ms; 77.7 against 55.6 tokens/s)
-  at `k = 3`, batch size 1, 2026-10-10).
+  device, one step late (`vllm_neuron/functional/mtp/async_step.py`), which shortens
+  the per-token gap against the synchronous drafter on the same host and recipe at
+  `k = 3`, batch size 1.
   The async drafter enqueues three NEFF executions per decode step and rank (the correction
   launch, the forward, the take launch) against the synchronous drafter's one; the runtime
   frees an execution-queue slot (`NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS`, set by the
@@ -666,8 +665,8 @@ Contract of the opt-in (measured on trn2 at TP64/EP16, `k = 3`, `max_num_seqs 1`
   With the bank write, repeated greedy generations of the same prompt were identical
   across two passes, and so were the identity prompts against the same server. On the
   bank-write configuration some identity prompts still differ from the non-speculative
-  run (a different set from the earlier configuration's), and one benchmark question
-  flipped against the earlier configuration; the cause is under investigation. Output
+  run (a different set from the earlier configuration's), and one fewer benchmark question
+  is correct than with the earlier configuration; the cause is under investigation. Output
   differs from non-speculative greedy decoding deterministically within a configuration.
   Each verify step is lossless by construction -- an accepted draft is the id
   the target's own argmax returned for that row -- so a divergence from the
@@ -698,15 +697,11 @@ rules:
 VLLM_NEURON_GLUE_FUSED=mhc_pre:prefill@128,mhc_pre:prefill@1024,mhc_pre:prefill@2048,mhc_post:prefill@128,mhc_post:prefill@1024,mhc_post:prefill@2048,mhc_pre:verify
 ```
 
-It is faster, but it changes answers. Measured on a trn2 TP=64 serve of GLM-5.3-Flash
-at batch size 1 with 3 drafts, GSM8K 500 questions (strict match), against the same
-server without speculation (exact match 0.978): with the rule, exact match 0.974 and
-median ITL 10.291 ms, with 3 answers wrong that the server without speculation got
-right and 1 right that it got wrong; without the rule (the default), 0.982 and
-11.113 ms, with none wrong that it got right and 2 right that it got wrong. The
-fusion is worth 0.8 ms per token in these medians and about 1.0 ms at steady state.
-The default gives up that time: without the rule the drafter lost no answer that the
-server without speculation got right.
+It is faster, but it changes answers. On a trn2 TP=64 server of GLM-5.3-Flash at
+batch size 1 with 3 drafts, against the same server without speculation, the rule
+got wrong some answers that the server without speculation got right; without the
+rule (the default) the drafter got none of those wrong. The default gives up the
+time per token that the fusion saves.
 
 ## Performance Considerations
 
