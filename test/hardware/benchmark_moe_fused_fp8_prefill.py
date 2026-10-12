@@ -34,8 +34,9 @@ call = ``(t_L - t_1) / (L - 1)`` per paired sample, with device time taken from
 the runtime system trace (LNC2 physical-core intervals merged). Repetitions
 (``--reps``) are interleaved before/after; each repetition times all four graphs
 with interleaved calls. The noise floor is the spread of the per-repetition
-medians of one variant. Numerics: the 1-call graphs' full emissions are saved
-per seed and compared bitwise (``torch.equal``).
+medians of one variant. The graphs are timed on the first routing: the first
+``--seeds`` seed, else the first ``--skewed-seeds`` seed. Numerics: the 1-call
+graphs' full emissions are saved per seed and compared bitwise (``torch.equal``).
 
 More variants. ``--variant-module LABEL=DIR`` adds a variant ``LABEL`` from
 another snapshot package (loaded as ``bench_LABEL``), compared with "before"
@@ -450,11 +451,11 @@ def bucket_case(tokens: int, entries: dict, args) -> dict:
                 record[f"layer_{variant}_pt"] = str(path)
         case["seeds"].append(record)
         print(json.dumps({"tokens": tokens, **record}), flush=True)
-        if timing_inputs is None and kind == "uniform":
-            timing_inputs = (dev, record["realised_pairs"])
+        if timing_inputs is None:
+            timing_inputs = (dev, record["realised_pairs"], f"{kind} {seed}")
     if timing_inputs is None or args.reps == 0:
         return case
-    dev, pairs = timing_inputs
+    dev, pairs, case["timed_routing"] = timing_inputs
     case["timed_seed_realised_pairs"] = pairs
     inputs = {name: (*dev, bounds, *bank_dev[:2 * (1 if name.endswith("_k1") else layers)])
               for name in graphs}
