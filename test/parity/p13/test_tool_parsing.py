@@ -292,6 +292,15 @@ def test_an_answer_without_a_call_is_split_into_reasoning_and_content(tokenizer,
     assert tool_calls is None
 
 
+def test_a_second_end_of_reasoning_is_dropped_from_content(tokenizer, parser_cls):
+    """Only the first ``</think>`` ends the reasoning; a later one is removed from the
+    content, so content never carries the tag."""
+    output = f"{REASONING}{THINK_END}Answer{THINK_END} more"
+    assert parse(parser_cls, tokenizer, output)[:2] == (REASONING, "Answer more")
+    streamed = assemble(stream(parser_cls, tokenizer, encode(tokenizer, output), [1]))
+    assert (streamed["reasoning"], streamed["content"]) == (REASONING, "Answer more")
+
+
 def _recorded():
     return json.loads((FIXTURES / "recorded_chat_outputs.json").read_text())["outputs"]
 

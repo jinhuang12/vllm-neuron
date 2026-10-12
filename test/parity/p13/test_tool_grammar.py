@@ -8,6 +8,15 @@ outputs enabled compiles it with vLLM's ``XgrammarBackend`` and masks every step
 to the tokens it allows; a server without them refuses the request. These tests compile
 the exact constraint with that backend over the checkpoint's tokenizer and vocabulary
 size, then ask it which tokens it allows and which outputs it accepts.
+
+These are facts about the compiled constraint alone. On a server started with
+``--reasoning-parser``, vLLM's ``StructuredOutputManager`` fills an all-true mask and
+does not advance the grammar until the reasoning has ended (``should_fill_bitmask``,
+``should_advance``), so with thinking on the constraint binds only after ``</think>``.
+It binds from the first token when the server counts the reasoning as already ended:
+``include_reasoning: false``, or thinking turned off (``reasoning_effort: "none"``,
+``enable_thinking: false``), which this checkpoint's template ignores, so the prompt
+has still opened ``<think>``.
 """
 
 from __future__ import annotations
@@ -100,8 +109,8 @@ AUTO_STRICT = {"tools": [strict(WEATHER), PING]}
 
 @pytest.mark.parametrize("fields", [REQUIRED, NAMED_PING], ids=["required", "named"])
 def test_a_forced_call_must_open_at_the_first_token(backend, grammar, tokenizer, fields):
-    """The constraint is built without reasoning, so the first token must start a call:
-    the model cannot write reasoning or close the ``<think>`` the prompt opened."""
+    """The constraint is built without reasoning, so its first token must start a call:
+    no reasoning and no ``</think>`` before it."""
     first = allowed(backend, grammar(**fields))
     assert encode(tokenizer, TOOL_START)[0] in first
     assert encode(tokenizer, THINK_END)[0] not in first
@@ -141,8 +150,8 @@ def test_the_constraint_holds_values_to_the_parameter_types(grammar, tokenizer):
 
 
 def test_a_constrained_call_parses_with_no_reasoning(grammar, tokenizer, parser_cls):
-    """What the constraint lets through parses into the call; the reasoning the prompt
-    opened is empty because the call ends it at once."""
+    """A call the constraint lets through parses into the call, with no reasoning and
+    no content, when it is the whole output."""
     output = tool_call("get_weather", city="Paris", days="3")
     assert accepts(grammar(**REQUIRED), tokenizer, output)
     reasoning, content, tool_calls = parse(parser_cls, tokenizer, output, **REQUIRED)
@@ -162,9 +171,11 @@ def test_auto_with_a_strict_tool_still_allows_free_text_and_a_call(backend, gram
     reason="Parser._apply_structural_tag asks for the constraint with reasoning=False "
     "(vllm/parser/abstract_parser.py:487-490), so xgrammar's glm_4_7 tag leaves out "
     "its reasoning prefix (xgrammar/builtin_structural_tag.py:1687-1696) and its free "
-    "text excludes </think> (:1627), while the generation prompt has already opened "
-    "<think> (chat_template.jinja:255-256): with a strict tool and tool_choice=auto the "
-    "model can never end its reasoning, so a plain answer comes back as reasoning",
+    "text excludes </think> (:1627). When the server counts the reasoning as ended "
+    "from the start (include_reasoning=false, or thinking off, which the template "
+    "ignores: chat_template.jinja:255-256 still opens <think>), the mask applies from "
+    "the first token, and with a strict tool and tool_choice=auto the model can never "
+    "close the <think> the prompt opened",
 )
 def test_auto_with_a_strict_tool_lets_the_model_end_its_reasoning(backend, grammar, tokenizer):
     assert encode(tokenizer, THINK_END)[0] in allowed(backend, grammar(**AUTO_STRICT))
