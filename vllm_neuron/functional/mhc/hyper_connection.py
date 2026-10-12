@@ -132,8 +132,10 @@ TENSOR_ENGINE_PIECES = 3
 
 #: Token groups whose stationary operands the tensor-engine form builds at once. A
 #: group's bf16 pieces take ``2 * TENSOR_ENGINE_PIECES * G * S`` bytes of each
-#: partition, so a bounded span keeps the kernel's SBUF use independent of ``T``, and
-#: the first span's build is all that runs before the first matmul.
+#: partition and two spans are live at once (the next span's pieces are built while
+#: the tensor engine runs the current one), so a bounded span keeps the kernel's SBUF
+#: use independent of ``T``, and the first span's build is all that runs before the
+#: first matmul.
 TENSOR_ENGINE_GROUP_SPAN = 16
 
 # `MHC_STREAMS` (the target's `hc_mult`) and `PARTITION_MAX` are imported from
@@ -524,13 +526,15 @@ def _combine_on_tensor_engine(
 
     The stationaries are built :data:`TENSOR_ENGINE_GROUP_SPAN` groups at a time (see
     :func:`_stationary_pieces`), each split into :data:`TENSOR_ENGINE_PIECES` bf16
-    pieces. Each piece is one matmul pass into the group's fp32 PSUM banks (one per
-    ``gemm_moving_fmax`` hidden columns), largest piece first. A bf16 product is
-    exact in fp32, and every result element sums ``S + 1`` nonzero products per
-    piece, so the result is the exact ``post_j * x + sum_i comb_ij * res_i`` up to
-    fp32 additions in the engine's order, rounded once into the output dtype when
-    the banks are copied out (even banks by the scalar engine, odd by the vector
-    engine; the two read different banks concurrently).
+    pieces; the next span's pieces are issued before the current span's groups, so
+    they are built while the tensor engine runs the current span. Each piece is one
+    matmul pass into the group's fp32 PSUM banks (one per ``gemm_moving_fmax`` hidden
+    columns), largest piece first. A bf16 product is exact in fp32, and every result
+    element sums ``S + 1`` nonzero products per piece, so the result is the exact
+    ``post_j * x + sum_i comb_ij * res_i`` up to fp32 additions in the engine's
+    order, rounded once into the output dtype when the scalar engine copies the
+    banks out (the vector engine, which builds the pieces, is left out of the
+    per-group path).
 
     A short last group zeroes its moving tile first, so rows past ``T`` contribute
     exact zeros, and its rows past ``T`` are never stored.
@@ -569,11 +573,22 @@ def _combine_on_tensor_engine(
     nisa.tensor_scalar(dst=x_rows, data=x_ramp, op0=nl.equal, operand0=0.0)
     nisa.tensor_tensor(dst=mask, data1=mask, data2=x_rows, op=nl.add)
 
+    first = n_groups
+    if first > TENSOR_ENGINE_GROUP_SPAN:
+        first = TENSOR_ENGINE_GROUP_SPAN
+    upcoming = _stationary_pieces(post_layer_mix, comb_res_mix, mask, 0, first)
     for g0 in range(0, n_groups, TENSOR_ENGINE_GROUP_SPAN):
         span = n_groups - g0
         if span > TENSOR_ENGINE_GROUP_SPAN:
             span = TENSOR_ENGINE_GROUP_SPAN
-        pieces = _stationary_pieces(post_layer_mix, comb_res_mix, mask, g0, span)
+        pieces = upcoming
+        # The next span's pieces, issued ahead of this span's groups.
+        g1 = g0 + TENSOR_ENGINE_GROUP_SPAN
+        if g1 < n_groups:
+            later = n_groups - g1
+            if later > TENSOR_ENGINE_GROUP_SPAN:
+                later = TENSOR_ENGINE_GROUP_SPAN
+            upcoming = _stationary_pieces(post_layer_mix, comb_res_mix, mask, g1, later)
         for g in range(g0, g0 + span):
             tokens = t_extent - g * group
             if tokens > group:
@@ -612,13 +627,8 @@ def _combine_on_tensor_engine(
                 w = width - b * bank
                 if w > bank:
                     w = bank
-                if b % 2 == 0:
-                    nisa.activation(dst=mixed[0:rows_out, b * bank:b * bank + w],
-                                    op=nl.copy, data=accs[b][0:rows_out, 0:w])
-                else:
-                    nisa.tensor_copy(dst=mixed[0:rows_out, b * bank:b * bank + w],
-                                     src=accs[b][0:rows_out, 0:w],
-                                     engine=nisa.engine.vector)
+                nisa.activation(dst=mixed[0:rows_out, b * bank:b * bank + w],
+                                op=nl.copy, data=accs[b][0:rows_out, 0:w])
             nisa.dma_copy(
                 dst=out.ap(pattern=[[h_extent, tokens * s_extent], [1, width]],
                            offset=g * rows_out * h_extent + h_lo),
@@ -640,6 +650,10 @@ def _stationary_pieces(post_layer_mix, comb_res_mix, mask, g0, span):
     split runs on the ``S`` weights of a row, ``1 / G`` of the elements of the
     ``G * S`` columns the mask then spreads them over; a product with a 0/1 mask is
     exact, so the pieces are those of the masked weights.
+
+    The weight loads move one ``S``-value element per contraction row and group, and
+    their descriptors are built before the launch (``dge_mode.none``), off the queues
+    that carry the streams.
     """
     t_extent, s_extent, _ = comb_res_mix.shape
     rows_in, group = mask.shape
@@ -657,6 +671,7 @@ def _stationary_pieces(post_layer_mix, comb_res_mix, mask, g0, span):
         nisa.memset(dst=weights, value=0.0)
     if full > 0:
         nisa.dma_copy(
+            dge_mode=nisa.dge_mode.none,
             dst=weights[0:rows_out, 0:full, 0:s_extent],
             src=comb_res_mix.ap(
                 pattern=[[s_extent, rows_out], [rows_out * s_extent, full],
@@ -665,6 +680,7 @@ def _stationary_pieces(post_layer_mix, comb_res_mix, mask, g0, span):
             ),
         )
         nisa.dma_copy(
+            dge_mode=nisa.dge_mode.none,
             dst=weights[rows_out:rows_in, 0:full, 0:s_extent],
             src=post_layer_mix.ap(
                 pattern=[[s_extent, group], [group * s_extent, full], [1, s_extent]],
@@ -674,11 +690,13 @@ def _stationary_pieces(post_layer_mix, comb_res_mix, mask, g0, span):
     if tail > 0:
         last = first + full * group
         nisa.dma_copy(
+            dge_mode=nisa.dge_mode.none,
             dst=weights[0:tail * s_extent, full, 0:s_extent],
             src=comb_res_mix.ap(pattern=[[s_extent, tail * s_extent], [1, s_extent]],
                                 offset=last * s_extent * s_extent),
         )
         nisa.dma_copy(
+            dge_mode=nisa.dge_mode.none,
             dst=weights[rows_out:rows_out + tail, full, 0:s_extent],
             src=post_layer_mix.ap(pattern=[[s_extent, tail], [1, s_extent]],
                                   offset=last * s_extent),
