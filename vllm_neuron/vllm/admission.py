@@ -32,12 +32,13 @@ Three request classes are refused:
   runner then has no logits on the host; vLLM's completions endpoint indexes an empty
   logprobs list and answers HTTP 500.
 
-An image is refused as well when it has more embeddings than the compiled vision encoder
-holds: more than the largest ``num_vision_tokens_buckets`` entry divided by the model's
-merge factor (``vision_utils.get_vision_embed_limit``, which also caps the scheduler's
-encoder budget). Such an image fits no compiled bucket, and the scheduler can never
-schedule it. The refusal is a ``VLLMValidationError`` naming the content part, so the 400
-carries it as ``param``.
+Beyond the token and sampling rules above, one more request class is refused: an image
+with more embeddings than the compiled vision encoder holds, that is, more than the
+largest ``num_vision_tokens_buckets`` entry divided by the model's merge factor
+(``vision_utils.get_vision_embed_limit``, which also caps the scheduler's encoder
+budget). Such an image fits no compiled bucket, and the scheduler can never schedule it.
+The refusal is a ``VLLMValidationError`` naming the content part, so the 400 carries it
+as ``param``.
 
 A media URL the client got wrong is answered with HTTP 400 too, not 500
 (:func:`install_client_media_errors`): a ``file://`` URL on a server that loads no local
@@ -402,7 +403,10 @@ def policy_from_config(vllm_config) -> AdmissionPolicy:
         prompt.max_model_len,
         "off" if sampler is None
         else f"on (all_greedy={sampler.all_greedy}, logprobs={sampling.logprobs})",
-        "" if image is None else f"; images up to {image.limit} embeddings",
+        # A model class without multimodal input gets no image, so its image rule is idle.
+        ""
+        if image is None or model_config.multimodal_config is None
+        else f"; images up to {image.limit} embeddings",
     )
     return policy
 
@@ -467,9 +471,9 @@ def client_media_error(connector, url: str, media_io, exc: BaseException):
     Two cases are the client's: a ``file://`` URL on a server started without
     ``--allowed-local-media-path`` (vLLM raises ``RuntimeError``), and an ``http(s)``
     URL that cannot be fetched (connection refused, an HTTP error status, a timeout).
-    vLLM answers both with HTTP 500, as it answers anything that is not a
-    ``ValueError``. A ``ValueError`` is already a 400 and is left alone, as is every
-    other error, which stays a server error.
+    Both fall to the internal-error branch of vLLM's error handler, which answers HTTP
+    500. A ``ValueError`` is already a 400 and is left alone, as is every other error,
+    which keeps the status vLLM gives it.
     """
     if isinstance(exc, ValueError):
         return None

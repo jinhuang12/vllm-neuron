@@ -75,7 +75,11 @@ def test_a_model_whose_bridge_offers_video_is_not_refused():
 
 
 def test_the_image_only_list_matches_the_bridge():
+    """Every architecture in the list has a bridge, and that bridge offers no video."""
     from vllm_neuron.model.glm5_next.utils.vision_preprocessing import Glm5NextProcessingInfo
 
-    assert "Glm5NextForConditionalGeneration" in NeuronPlatform._IMAGE_ONLY_ARCHS
-    assert "video" not in Glm5NextProcessingInfo.get_supported_mm_limits(None)
+    bridges = {"Glm5NextForConditionalGeneration": Glm5NextProcessingInfo}
+    assert NeuronPlatform._IMAGE_ONLY_ARCHS
+    for arch in NeuronPlatform._IMAGE_ONLY_ARCHS:
+        assert arch in bridges, f"{arch} is image-only, but this test names no bridge for it"
+        assert "video" not in bridges[arch].get_supported_mm_limits(None)

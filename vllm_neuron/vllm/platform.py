@@ -717,7 +717,7 @@ class NeuronPlatform(Platform):
 
         cls._admission = admission.policy_from_config(vllm_config)
         admission.install_eager_validation()
-        # Only a server that admits multimodal input fetches media.
+        # Only a multimodal model class builds a media connector.
         if model_config.multimodal_config is not None:
             admission.install_client_media_errors()
 
@@ -1145,7 +1145,8 @@ class NeuronPlatform(Platform):
         vLLM reads ``--limit-mm-per-prompt`` only for the modalities the bridge
         offers, so such a limit would be ignored without a word, and every video
         request would still be refused (``Glm5NextProcessingInfo.validate_num_items``).
-        A limit the operator leaves out, or sets to 0, starts.
+        This refusal does not stop a server whose operator leaves the video limit out
+        or sets it to 0.
         """
         model_config = vllm_config.model_config
         multimodal_config = getattr(model_config, "multimodal_config", None)
@@ -1230,8 +1231,7 @@ class NeuronPlatform(Platform):
             f"reports a merge factor of {merge_factor}, so the per-image limit and the "
             f"vision encoder budget would be {size}. Implement "
             f"SupportsSpatialMerge.get_vision_token_merge_factor on the model class to "
-            f"return {expected}, or serve text only with --limit-mm-per-prompt "
-            f"'{{\"image\": 0}}'."
+            f"return {expected}, or serve text only with --language-model-only."
         )
 
     @classmethod
@@ -1267,8 +1267,9 @@ class NeuronPlatform(Platform):
         stops at an image start (when the encoder budget or cache cannot take the
         image that step) would begin the next DCP prefill chunk at a cached length
         that is not a multiple of ``decode_context_parallel_size * block_size``,
-        which the runner refuses in the step, after the engine is serving. A server
-        that admits no image or video starts. Callers check ``dcp_size > 1`` first.
+        which the runner refuses in the step, after the engine is serving. This refusal
+        does not stop a server that admits no image or video input. Callers check
+        ``dcp_size > 1`` first.
         """
         model_config = vllm_config.model_config
         modalities = [

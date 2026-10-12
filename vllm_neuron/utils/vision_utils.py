@@ -79,7 +79,7 @@ class VisionEmbedLimit:
 
     @property
     def embeds(self) -> int:
-        """The limit, in embeddings (the unit of a multimodal placeholder)."""
+        """The limit, in embeddings: what ``PlaceholderRange.get_num_embeds`` counts."""
         return max(1, self.max_bucket // self.merge_factor)
 
 

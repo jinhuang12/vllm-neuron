@@ -25,6 +25,7 @@ from types import SimpleNamespace
 
 import pytest
 from vllm.config.multimodal import MultiModalConfig
+from vllm.multimodal.media import MediaConnector
 
 from vllm_neuron.model.glm5_next import Glm5NextForConditionalGeneration
 from vllm_neuron.model.interfaces import SupportsSpatialMerge
@@ -43,12 +44,15 @@ REFUSAL = "cannot serve image input"
 
 @pytest.fixture(autouse=True)
 def _isolated(monkeypatch):
-    """Keep the class-level state and the OMP default a multimodal config sets."""
+    """Keep the class-level state, the OMP default a multimodal config sets, and vLLM's
+    ``MediaConnector``, which a server that admits multimodal input wraps."""
     monkeypatch.setenv("OMP_NUM_THREADS", os.environ.get("OMP_NUM_THREADS", "1"))
     saved = NeuronPlatform._admission
+    connector = (MediaConnector.load_from_url, MediaConnector.load_from_url_async)
     with _isolated_platform_class_state():
         yield
     NeuronPlatform._admission = saved
+    MediaConnector.load_from_url, MediaConnector.load_from_url_async = connector
 
 
 @pytest.fixture

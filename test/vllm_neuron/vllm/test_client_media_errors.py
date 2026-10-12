@@ -42,14 +42,6 @@ FILE_URL = "file:///etc/hostname"
 HTTP_URL = "http://media.invalid/cat.png"
 
 
-@pytest.fixture(autouse=True)
-def _restore_media_connector():
-    """The mapping wraps vLLM's class; give every test the class as vLLM ships it."""
-    saved = (MediaConnector.load_from_url, MediaConnector.load_from_url_async)
-    yield
-    MediaConnector.load_from_url, MediaConnector.load_from_url_async = saved
-
-
 @pytest.fixture
 def multimodal_server(merge_factor_4):
     """A server that admits images: check_and_update_config installs the mapping."""
