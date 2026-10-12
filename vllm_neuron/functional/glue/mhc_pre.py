@@ -69,6 +69,11 @@ columns of the SBUF tile ``mov[128 (h), Hp/128, S, M + tile]``. Then, per token 
    With ``ROUTER_SCALE`` the rows are also scaled by the same ``rsqrt`` alone and rounded
    once: ``scaled``, the MoE router's input (its gain is applied in the router).
 
+Step 6 of a tile is issued after steps 1-5 of the next tile. Each engine runs its
+instructions in program order, and the norm's transposes wait for the collapse on the
+vector engine; issued after the next tile's transposes and matmuls, they no longer
+hold the tensor engine idle while the collapse runs.
+
 Both LNC2 cores: yes. Each program does half the contraction (step 2), half the
 transposes, half the collapse and half the norm; steps 3-4 are ``rows x (M + rows)``
 values, done on both.
@@ -191,6 +196,43 @@ def _transpose_into(dst, rows_t, col0, rows_n, nhb, group):
             turn += 1
 
 
+def _norm_rows(out_rows, t0, gain_rows, ident, normed_out, scaled_out, norm_eps,
+               programs, program):
+    """Step 6 for one token tile: the norm, and the router scale, of its layer_input.
+
+    ``out_rows`` is the tile's rounded ``[rows, Hp]`` layer_input and ``t0`` its first
+    token; ``scaled_out`` is None unless the kernel returns ``scaled``. :func:`_mhc_pre`
+    issues it one tile late (see the module doc).
+    """
+    rows_n, hp = out_rows.shape
+    hidden = normed_out.shape[1]
+    h0 = program * hp
+    nhb = hp // _P
+    collapsed = nl.ndarray((_P, nhb, 1, rows_n), dtype=out_rows.dtype, buffer=nl.sbuf)
+    _transpose_into(collapsed, out_rows.reshape((rows_n, 1, hp)), 0, rows_n, nhb,
+                    _group(out_rows.dtype))
+    gram = nl.ndarray((rows_n, rows_n), dtype=nl.float32, buffer=nl.psum)
+    for hb in range(nhb):
+        nisa.nc_matmul(dst=gram, stationary=collapsed[:, hb, 0, :],
+                       moving=collapsed[:, hb, 0, :], accumulate=(hb > 0))
+    sqrsum = _swap_add(_diagonal_sum(gram, rows_n, ident), rows_n, 1, programs, program)
+    norm_rstd = _rstd(sqrsum, rows_n, 1.0 / float(hidden), norm_eps)
+    normed_rows = nl.ndarray((rows_n, hp), dtype=out_rows.dtype, buffer=nl.sbuf)
+    nisa.scalar_tensor_tensor(dst=normed_rows, data=out_rows, op0=nl.multiply,
+                              operand0=norm_rstd[:, 0:1], op1=nl.multiply,
+                              operand1=gain_rows[0:rows_n, :])
+    nisa.dma_copy(dst=normed_out.ap(pattern=[[hidden, rows_n], [1, hp]],
+                                    offset=t0 * hidden + h0),
+                  src=normed_rows)
+    if scaled_out is not None:
+        scaled_rows = nl.ndarray((rows_n, hp), dtype=out_rows.dtype, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=scaled_rows, data=out_rows, op0=nl.multiply,
+                           operand0=norm_rstd[:, 0:1])
+        nisa.dma_copy(dst=scaled_out.ap(pattern=[[hidden, rows_n], [1, hp]],
+                                        offset=t0 * hidden + h0),
+                      src=scaled_rows)
+
+
 def _mhc_pre(residual, fn, hc_scale, hc_base, norm_gain, rms_eps, hc_eps, post_mult,
              norm_eps, router_scale=False):
     """The body of both kernels; ``norm_gain`` None skips step 6 (see the module doc).
@@ -274,6 +316,10 @@ def _mhc_pre(residual, fn, hc_scale, hc_base, norm_gain, rms_eps, hc_eps, post_m
                                                       offset=h0))
 
     r_group = _group(residual.dtype)
+    # The tile whose step 6 is still to be issued: its layer_input rows (None: no tile
+    # yet) and its first token.
+    held_out = None
+    held_t0 = 0
     for t0 in range(0, tokens, MHC_PRE_TOKEN_TILE):
         rows_n = min(MHC_PRE_TOKEN_TILE, tokens - t0)
         cols = mix + rows_n
@@ -365,34 +411,16 @@ def _mhc_pre(residual, fn, hc_scale, hc_base, norm_gain, rms_eps, hc_eps, post_m
                                    offset=t0 * hidden + h0),
                       src=out_rows)
 
-        # ---- 6. The FFN norm of the rounded layer_input. ------------------- #
+        # ---- 6. The FFN norm, one tile late (see the module doc). --------- #
         if norm_gain is not None:
-            collapsed = nl.ndarray((_P, nhb, 1, rows_n), dtype=residual.dtype,
-                                   buffer=nl.sbuf)
-            _transpose_into(collapsed, out_rows.reshape((rows_n, 1, hp)), 0, rows_n, nhb,
-                            r_group)
-            gram = nl.ndarray((rows_n, rows_n), dtype=nl.float32, buffer=nl.psum)
-            for hb in range(nhb):
-                nisa.nc_matmul(dst=gram, stationary=collapsed[:, hb, 0, :],
-                               moving=collapsed[:, hb, 0, :], accumulate=(hb > 0))
-            sqrsum = _swap_add(_diagonal_sum(gram, rows_n, ident), rows_n, 1, programs,
-                               program)
-            norm_rstd = _rstd(sqrsum, rows_n, 1.0 / float(hidden), norm_eps)
-            normed_rows = nl.ndarray((rows_n, hp), dtype=residual.dtype, buffer=nl.sbuf)
-            nisa.scalar_tensor_tensor(dst=normed_rows, data=out_rows, op0=nl.multiply,
-                                      operand0=norm_rstd[:, 0:1], op1=nl.multiply,
-                                      operand1=gain_rows[0:rows_n, :])
-            nisa.dma_copy(dst=normed_out.ap(pattern=[[hidden, rows_n], [1, hp]],
-                                            offset=t0 * hidden + h0),
-                          src=normed_rows)
-            if router_scale:
-                scaled_rows = nl.ndarray((rows_n, hp), dtype=residual.dtype,
-                                         buffer=nl.sbuf)
-                nisa.tensor_scalar(dst=scaled_rows, data=out_rows, op0=nl.multiply,
-                                   operand0=norm_rstd[:, 0:1])
-                nisa.dma_copy(dst=scaled_out.ap(pattern=[[hidden, rows_n], [1, hp]],
-                                                offset=t0 * hidden + h0),
-                              src=scaled_rows)
+            if held_out is not None:
+                _norm_rows(held_out, held_t0, gain_rows, ident, normed_out, scaled_out,
+                           norm_eps, programs, program)
+            held_t0 = t0
+            held_out = out_rows
+    if held_out is not None:
+        _norm_rows(held_out, held_t0, gain_rows, ident, normed_out, scaled_out, norm_eps,
+                   programs, program)
     if norm_gain is None:
         return post_out, comb_out, x_out
     if router_scale:
