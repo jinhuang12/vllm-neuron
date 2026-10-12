@@ -19,7 +19,8 @@ the bs=64 @ 8k line), every index and count derived from the fixture's config:
    contiguity, and the bytes of every operand up to 1 MiB) are EQUAL to the knob-off
    record ``glm5next_state_lists_knob_off.json`` beside this file, taken on the tree its
    ``base_commit`` names (regenerate with ``main``, see its docstring); the worker's KV
-   need and footprint at both lines too;
+   need and footprint at both lines too, the footprint plus the scratch slot's side
+   caches, which the record predates;
 2. knob 5: exactly one more DSA spec, side caches for one more DSA layer, the draft
    layer's carrier equal in structure (keys, kinds, dtypes, shapes, contiguity) to the
    trunk's last DSA layer's on every leg, on its own storage; at B >= 2 the bank form
@@ -379,6 +380,7 @@ def footprint(line: str) -> dict:
     from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
 
     from test.vllm_neuron.worker import test_kv_budget_glm53f as budget
+    from vllm_neuron.vllm.worker.glm5next_state_banks import SCRATCH_SLOTS
     from vllm_neuron.vllm.worker.neuron_model_runner import indexer_side_cache_bytes
 
     spec = LINES[line]
@@ -395,7 +397,7 @@ def footprint(line: str) -> dict:
     groups = get_kv_cache_groups(runner.vllm_config, kv_spec)
     side = indexer_side_cache_bytes(
         kv_spec, text_config, max_seq_len=spec["max_model_len"],
-        request_slots=spec["max_num_seqs"],
+        request_slots=spec["max_num_seqs"] + SCRATCH_SLOTS,
     )
     return {
         "layers": len(layers),
@@ -450,8 +452,15 @@ def test_knob_off_everything_the_runner_builds_is_the_recorded_list(
 
 @pytest.mark.parametrize("line", sorted(LINES))
 def test_knob_off_the_worker_footprint_is_the_recorded_one(line, monkeypatch) -> None:
+    from vllm_neuron.vllm.worker.glm5next_state_banks import SCRATCH_SLOTS
+
     set_draft_k(monkeypatch, 0)
-    assert footprint(line) == _knob_off()["footprint"][line]
+    want = dict(_knob_off()["footprint"][line])
+    # The record predates the scratch-slot pricing: it prices max_num_seqs side-cache slots.
+    scratch = SCRATCH_SLOTS * want["side_cache_bytes"] // LINES[line]["max_num_seqs"]
+    want["side_cache_bytes"] += scratch
+    want["footprint_bytes"] += scratch
+    assert footprint(line) == want
 
 
 def test_the_record_names_its_tree_and_covers_both_lines() -> None:
@@ -641,11 +650,13 @@ def _hand_footprint(line: str, layers, text_config) -> dict:
     bank of ``max_num_seqs`` slots per recurrent layer (a slot is both states, rounded up
     to ``RECURRENT_SLOT_ALIGN_BYTES``), and the side caches of every DSA layer
     (``pool_cache`` ``[S, L // index_kpool + 1, index_head_dim]``, ``tail`` and
-    ``pad_tail`` ``[S, 2, index_kpool, index_head_dim]``, the latent dtype).
+    ``pad_tail`` ``[S, 2, index_kpool, index_head_dim]``, the latent dtype) at
+    ``S = max_num_seqs + SCRATCH_SLOTS`` slots.
     """
     from vllm.utils.math_utils import cdiv
 
     from vllm_neuron.vllm.patches.kv_spec_patch import RECURRENT_SLOT_ALIGN_BYTES
+    from vllm_neuron.vllm.worker.glm5next_state_banks import SCRATCH_SLOTS
 
     spec = LINES[line]
     seqs, length = spec["max_num_seqs"], spec["max_model_len"]
@@ -672,7 +683,8 @@ def _hand_footprint(line: str, layers, text_config) -> dict:
     )
     slot_bytes = cdiv(state_bytes, RECURRENT_SLOT_ALIGN_BYTES) * RECURRENT_SLOT_ALIGN_BYTES
     pool, width = int(text_config.index_kpool), int(text_config.index_head_dim)
-    side_per_layer = seqs * ((length // pool + 1) * width + 2 * (2 * pool * width)) * one.dtype.itemsize
+    side_slots = seqs + SCRATCH_SLOTS
+    side_per_layer = side_slots * ((length // pool + 1) * width + 2 * (2 * pool * width)) * one.dtype.itemsize
     return {
         "groups": latent_groups + recurrent_groups,
         "layers_per_pool": size,

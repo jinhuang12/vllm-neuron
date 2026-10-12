@@ -18,7 +18,8 @@ logical core's 24 GiB), so the logical core is the only capacity there is.
 The served figures are the bs=64 @ 8k line as measured
 server log (every rank): "Neuron HBM: 7.06 GiB used, 16.94 GiB free", parameters
 1.63 GiB, resident 6.79 GiB, need 5.845 GiB, allocated 6.329 GiB (side caches
-0.347 GiB).
+0.347 GiB at 64 slots). With the runner's scratch slot priced as well the side caches
+are 0.352 GiB and the footprint 6.335 GiB.
 
 A warm compile cache is built in a temporary directory from the recorded decode
 graph of that line (``fixtures/glm53f_bs64x8k_decode_b1_ctx2048.neff``, see
@@ -55,7 +56,7 @@ TIP_FREE_BYTES = kv.TOTAL_HBM_BYTES - TIP_USED_BYTES
 TIP_PARAM_BYTES = kv.TIP_PARAM_BYTES
 TIP_RESIDENT_BYTES = kv.TIP_RESIDENT_BYTES
 #: 64 x 8192 on the served line (test_kv_budget_side_caches.py's hand total).
-TIP_FOOTPRINT_BYTES = 6795902976
+TIP_FOOTPRINT_BYTES = 6801718016
 TIP_NEED_BYTES = 6276120576
 #: The two figures the old budget took in the recorded run: 0.30 x 0.92 x 24 GiB and
 #: 24 / 2 - 5 GiB.
@@ -282,15 +283,15 @@ def test_the_budget_log_prints_every_term(model_specs, caplog) -> None:
         f"margin={_margin() / GIB:.2f} GiB",
         "budget=15.38 GiB",
         "need=5.845 GiB",
-        "side caches 0.347 GiB",
-        "allocated=6.329 GiB",
+        "side caches 0.352 GiB",
+        "allocated=6.335 GiB",
         "admitted=yes",
     ):
         assert term in line, (term, line)
 
 
 def test_a_point_over_the_budget_is_refused_naming_every_term(model_specs) -> None:
-    """64 x 8192 against a 12 GiB graph need: the 6.329 GiB footprint does not fit."""
+    """64 x 8192 against a 12 GiB graph need: the 6.335 GiB footprint does not fit."""
     graph_bytes = 12 * GIB
     worker = _graph(_tip_worker(model_specs), graph_bytes, source="fixture source")
     budget = TIP_FREE_BYTES - graph_bytes - _margin()
