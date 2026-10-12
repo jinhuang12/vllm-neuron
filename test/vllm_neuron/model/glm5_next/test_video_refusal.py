@@ -55,7 +55,8 @@ def test_the_video_refusal_is_a_400_with_param_video_url():
 
 
 def test_a_video_limit_the_operator_sets_does_not_admit_a_video():
-    """The bridge offers no video, so a video limit above 0 changes nothing here."""
+    """The bridge offers no video, so a video limit above 0 changes nothing here; the
+    platform refuses such a limit at startup (``test_video_startup_refusal.py``)."""
     with pytest.raises(VLLMValidationError) as refused:
         _info(image=1, video=4).validate_num_items("video", 1)
     assert refused.value.parameter == "video_url"

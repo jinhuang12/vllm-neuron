@@ -498,7 +498,8 @@ class Glm5NextProcessingInfo(BaseProcessingInfo):
 
         vLLM's chat parser calls this for each content part before it fetches the media, so a video gets HTTP
         400 naming the content part, and nothing is fetched. A video limit the operator sets does not change
-        this: the bridge offers no video.
+        this: the bridge offers no video, and the platform refuses such a limit at startup
+        (``NeuronPlatform._refuse_video_input``).
         """
         if modality == "video" and num_items > 0:
             from vllm.exceptions import VLLMValidationError

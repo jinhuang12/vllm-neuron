@@ -706,6 +706,7 @@ class NeuronPlatform(Platform):
 
         if hasattr(model_config.hf_config, "vision_config"):
             cls._resolve_vision_auto_config(vllm_config, model_config)
+        cls._refuse_video_input(vllm_config)
         cls._refuse_vision_merge_factor_mismatch(vllm_config)
 
         cls._resolve_sampling_from_the_model_class(vllm_config)
@@ -1128,6 +1129,39 @@ class NeuronPlatform(Platform):
                 tp_size,
                 num_q_heads,
             )
+
+    #: Architectures whose multimodal bridge offers image input and no video
+    #: (``Glm5NextProcessingInfo.get_supported_mm_limits``).
+    _IMAGE_ONLY_ARCHS = ("Glm5NextForConditionalGeneration",)
+
+    @classmethod
+    def _refuse_video_input(cls, vllm_config) -> None:
+        """Refuse a video limit above 0 for a model whose bridge offers images only.
+
+        vLLM reads ``--limit-mm-per-prompt`` only for the modalities the bridge
+        offers, so such a limit would be ignored without a word, and every video
+        request would still be refused (``Glm5NextProcessingInfo.validate_num_items``).
+        A limit the operator leaves out, or sets to 0, starts.
+        """
+        model_config = vllm_config.model_config
+        multimodal_config = getattr(model_config, "multimodal_config", None)
+        if multimodal_config is None or "video" not in multimodal_config.limit_per_prompt:
+            return
+        num_videos = multimodal_config.get_limit_per_prompt("video")
+        if num_videos <= 0:
+            return
+        architectures = getattr(model_config.hf_config, "architectures", None) or ()
+        image_only = [arch for arch in architectures if arch in cls._IMAGE_ONLY_ARCHS]
+        if not image_only:
+            return
+        raise ValueError(
+            f"--limit-mm-per-prompt asks for {num_videos} video(s) per prompt, but "
+            f"{image_only[0]} serves image input only on Neuron: its multimodal "
+            f"processor offers no video, so every video request would be refused. Set "
+            f"the video limit to 0 (for example --limit-mm-per-prompt "
+            f"'{{\"image\": 1, \"video\": 0}}') or leave video out of "
+            f"--limit-mm-per-prompt."
+        )
 
     @staticmethod
     def _admits_images(model_config) -> bool:
