@@ -29,6 +29,13 @@ whatever the slot order. The adds run in slot order from zero, the order of
 A two-program grid splits each hidden piece's columns across the two PNCs of one LNC2
 core. Every program takes every token tile, so all of them run the same loop trips (a
 device loop under LNC2 passes a core barrier at every trip).
+
+Every SBUF tensor has a fixed address from one ``SbufManager`` stack, and the token counts a
+fixed PSUM address, as in the fused expert kernel, whose emission this kernel reads. neuronx-cc
+inlines a kernel with fixed addresses after its allocator and one without before it. In one
+graph with the expert kernel's device loop, a device loop inlined first splits the graph's block
+out of order, and the compile fails (NCC_ICFG001 in a modular-flow subgraph, NCC_IGCA024 in a
+one-function graph). With fixed addresses both kernels are inlined in one pass, in graph order.
 """
 
 from __future__ import annotations
@@ -41,6 +48,7 @@ import nki.isa as nisa
 import nki.language as nl
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+from nkilib.core.utils.allocator import SbufManager
 from nkilib.core.utils.kernel_assert import kernel_assert
 
 from vllm_neuron.functional.dsa.launch_grid import lnc_pair
@@ -78,26 +86,26 @@ def _register(src):
     return register
 
 
-def _tile_tables(index_hbm, valid_hbm, t0: int):
+def _tile_tables(sbm, index_hbm, valid_hbm, t0: int):
     """Tokens ``t0 .. t0 + 127``'s ``(index, weights)``: whole ``[128, lines]`` int32 and
-    fp32 tensors whose first ``K`` columns hold the slots, so a device loop reads a column
-    by offset."""
+    fp32 tensors from ``sbm`` whose first ``K`` columns hold the slots, so a device loop reads
+    a column by offset."""
     slots = index_hbm.shape[1]
     lines = _lines(slots)
-    index = nl.ndarray((TOKEN_TILE, lines), dtype=nl.int32, buffer=nl.sbuf)
+    index = sbm.alloc_stack((TOKEN_TILE, lines), dtype=nl.int32)
     nisa.dma_copy(dst=index[:, 0:slots],
                   src=index_hbm.ap(pattern=[[slots, TOKEN_TILE], [1, slots]], offset=t0 * slots),
                   dge_mode=_HWDGE, engine=_QUEUE)
-    weights = nl.ndarray((TOKEN_TILE, lines), dtype=nl.float32, buffer=nl.sbuf)
+    weights = sbm.alloc_stack((TOKEN_TILE, lines), dtype=nl.float32)
     nisa.dma_copy(dst=weights[:, 0:slots],
                   src=valid_hbm.ap(pattern=[[slots, TOKEN_TILE], [1, slots]], offset=t0 * slots),
                   dge_mode=_HWDGE, engine=_QUEUE)
     return index, weights
 
 
-def _unit_rows(index, weights, slots: int, piece: int, pieces: int, banked_rows: int):
+def _unit_rows(sbm, index, weights, slots: int, piece: int, pieces: int, banked_rows: int):
     """A tile's rows of banked piece ``piece`` (of ``pieces`` per row): a whole ``[128, lines]``
-    int32 tensor.
+    int32 tensor from ``sbm``.
 
     Column ``j`` holds ``index * pieces + piece`` for slot 0, for a valid slot, and on
     partition 0 (the tile's first token, so a gather moves at least one row); an invalid
@@ -105,13 +113,13 @@ def _unit_rows(index, weights, slots: int, piece: int, pieces: int, banked_rows:
     """
     lines = index.shape[1]
     # past = (1 - valid) * banked_rows + piece, then slot 0 and partition 0 keep their rows.
-    past = nl.ndarray((TOKEN_TILE, lines), dtype=nl.int32, buffer=nl.sbuf)
+    past = sbm.alloc_stack((TOKEN_TILE, lines), dtype=nl.int32)
     nisa.tensor_scalar(dst=past[:, 0:slots], data=weights[:, 0:slots], op0=nl.multiply,
                        operand0=-float(banked_rows), op1=nl.add,
                        operand1=float(banked_rows + piece))
     nisa.memset(dst=past[:, 0:1], value=piece)
     nisa.memset(dst=past[0:1, 0:slots], value=piece)
-    rows = nl.ndarray((TOKEN_TILE, lines), dtype=nl.int32, buffer=nl.sbuf)
+    rows = sbm.alloc_stack((TOKEN_TILE, lines), dtype=nl.int32)
     nisa.scalar_tensor_tensor(dst=rows[:, 0:slots], data=index[:, 0:slots], op0=nl.multiply,
                               operand0=float(pieces), op1=nl.add, operand1=past[:, 0:slots])
     return rows
@@ -124,24 +132,24 @@ def _slot_groups(table, tiles: int, slots: int):
                     offset=0)
 
 
-def _batch_end(counts, scores, tiles: int, slots: int):
-    """``[1, 1]`` int32 on partition 0: one past the last slot that some token of the batch's
-    ``tiles`` token tiles fills, and at least 1.
+def _batch_end(sbm, counts, scores, tiles: int, slots: int):
+    """``[1, 1]`` int32 on partition 0 (in a whole line from ``sbm``): one past the last slot
+    that some token of the batch's ``tiles`` token tiles fills, and at least 1.
 
     ``counts`` holds each tile's tokens per slot, ``scores`` the slot numbers plus one; a
     filled slot scores its number plus one, and the end is the greatest score.
     """
-    filled = nl.ndarray((1, tiles * _lines(slots)), dtype=nl.float32, buffer=nl.sbuf)
+    filled = sbm.alloc_stack((1, tiles * _lines(slots)), dtype=nl.float32)
     nisa.scalar_tensor_tensor(dst=_slot_groups(filled, tiles, slots),
                               data=_slot_groups(counts, tiles, slots), op0=nl.minimum,
                               operand0=1.0, op1=nl.multiply,
                               operand1=_slot_groups(scores, tiles, slots))
-    best = nl.ndarray((1, _lines(tiles)), dtype=nl.float32, buffer=nl.sbuf)
+    best = sbm.alloc_stack((1, _lines(tiles)), dtype=nl.float32)
     nisa.tensor_reduce(dst=best[:, 0:tiles], data=_slot_groups(filled, tiles, slots),
                        op=nl.maximum, axis=2)
-    most = nl.ndarray((1, _LINE), dtype=nl.float32, buffer=nl.sbuf)
+    most = sbm.alloc_stack((1, _LINE), dtype=nl.float32)
     nisa.tensor_reduce(dst=most[:, 0:1], data=best[:, 0:tiles], op=nl.maximum, axis=1)
-    end = nl.ndarray((1, _LINE), dtype=nl.int32, buffer=nl.sbuf)
+    end = sbm.alloc_stack((1, _LINE), dtype=nl.int32)
     nisa.tensor_scalar(dst=end[:, 0:1], data=most[:, 0:1], op0=nl.maximum, operand0=1.0)
     return end
 
@@ -194,19 +202,29 @@ def token_gather_combine_kernel(contribution_hbm, index_hbm, valid_hbm):
     lines = _lines(slots)
     # An accumulator and a gather buffer per unit.
     batch_tiles = max(1, _BATCH_BYTES // (2 * share * tile_h * 4))
-    zero = nl.ndarray((TOKEN_TILE, _LINE), dtype=nl.float32, buffer=nl.sbuf)
+    sbm = SbufManager(sb_lower_bound=0, sb_upper_bound=nl.tile_size.sbuf_fmax_bytes)
+    sbm.open_scope(name="token_gather_combine")
+    zero = sbm.alloc_stack((TOKEN_TILE, _LINE), dtype=nl.float32)
     nisa.memset(dst=zero, value=0.0)
-    ones = nl.ndarray((TOKEN_TILE, _LINE), dtype=nl.float32, buffer=nl.sbuf)
+    ones = sbm.alloc_stack((TOKEN_TILE, _LINE), dtype=nl.float32)
     nisa.memset(dst=ones, value=1.0)
-    scores = nl.ndarray((1, batch_tiles * lines), dtype=nl.float32, buffer=nl.sbuf)
+    scores = sbm.alloc_stack((1, batch_tiles * lines), dtype=nl.float32)
     nisa.iota(dst=scores, pattern=[[0, batch_tiles], [1, lines]], offset=1, channel_multiplier=0)
     for first in range(0, tiles, batch_tiles):
         count = min(batch_tiles, tiles - first)
-        counts = nl.ndarray((1, count * lines), dtype=nl.float32, buffer=nl.psum)
+        # A batch's tensors are freed after its output stores; the next batch reuses them.
+        sbm.open_scope(name="batch")
+        counts = nl.ndarray((1, count * lines), dtype=nl.float32, buffer=nl.psum, address=(0, 0))
+        # The batch's gather buffers and accumulators take the scope's first addresses.
+        buffers = []
+        for _ in range(count * share):
+            picked = sbm.alloc_stack((TOKEN_TILE, tile_h), dtype=nl.float32)
+            acc = sbm.alloc_stack((TOKEN_TILE, tile_h), dtype=nl.float32)
+            buffers.append((picked, acc))
         work = []
         for b in range(count):
             tb = first + b
-            tables = _tile_tables(index_hbm, valid_hbm, tb * TOKEN_TILE)
+            tables = _tile_tables(sbm, index_hbm, valid_hbm, tb * TOKEN_TILE)
             index = tables[0]
             weights = tables[1]
             # Each slot's token count: a product with a ones column, exact for 0/1.
@@ -216,9 +234,9 @@ def token_gather_combine_kernel(contribution_hbm, index_hbm, valid_hbm):
             units = []
             for part in range(share):
                 piece = part * n_prgs + prg_id
-                rows = _unit_rows(index, weights, slots, piece, pieces, banked_rows)
-                picked = nl.ndarray((TOKEN_TILE, tile_h), dtype=nl.float32, buffer=nl.sbuf)
-                acc = nl.ndarray((TOKEN_TILE, tile_h), dtype=nl.float32, buffer=nl.sbuf)
+                rows = _unit_rows(sbm, index, weights, slots, piece, pieces, banked_rows)
+                picked = buffers[b * share + part][0]
+                acc = buffers[b * share + part][1]
                 _gather(picked, banked, rows[:, 0:1], False)
                 # The scalar engine starts the accumulator, so the vector engine carries only
                 # the later slots; + 0 turns an empty slot's -0 (a negative row weighed zero)
@@ -227,15 +245,15 @@ def token_gather_combine_kernel(contribution_hbm, index_hbm, valid_hbm):
                                 bias=zero[:, 0:1])
                 units.append((tb * TOKEN_TILE * hidden + piece * tile_h, rows, picked, acc))
             work.append((weights, units))
-        end = _batch_end(counts, scores, count, slots)
+        end = _batch_end(sbm, counts, scores, count, slots)
 
         def add_slot(slot):
             """Slot ``slot`` (a register) of every unit of the batch."""
             for tile in work:
-                weight = nl.ndarray((TOKEN_TILE, 1), dtype=nl.float32, buffer=nl.sbuf)
+                weight = sbm.alloc_stack((TOKEN_TILE, _LINE), dtype=nl.float32)[:, 0:1]
                 _column(weight, tile[0], slot)
                 for unit in tile[1]:
-                    row = nl.ndarray((TOKEN_TILE, 1), dtype=nl.int32, buffer=nl.sbuf)
+                    row = sbm.alloc_stack((TOKEN_TILE, _LINE), dtype=nl.int32)[:, 0:1]
                     _column(row, unit[1], slot)
                     _gather(unit[2], banked, row, True)
                     nisa.scalar_tensor_tensor(dst=unit[3], data=unit[2], op0=nl.multiply,
@@ -247,6 +265,8 @@ def token_gather_combine_kernel(contribution_hbm, index_hbm, valid_hbm):
                 nisa.dma_copy(dst=out_hbm.ap(pattern=[[hidden, TOKEN_TILE], [1, tile_h]],
                                              offset=unit[0]), src=unit[3], dge_mode=_HWDGE,
                               engine=_QUEUE)
+        sbm.close_scope()
+    sbm.close_scope()
     return out_hbm
 
 
