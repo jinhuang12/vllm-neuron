@@ -490,8 +490,10 @@ def mhc_pre_admits(residual: Tensor, fn: Tensor, hc_scale: Tensor, hc_base: Tens
         fn: ``[M, S*H]`` projection, ``M = 2S + S*S``, bf16 or fp32.
         hc_scale: ``[3]`` fp32 head scales.
         hc_base: ``[M]`` fp32 head biases.
-        phase: the step's ``"prefill"`` or ``"decode"``; None when it is not known,
-            and then only a rule without a phase selects the kernel.
+        phase: the step's ``"prefill"``, ``"decode"`` or ``"verify"``, which the mHC
+            layer tells from the row count
+            (:func:`~vllm_neuron.functional.glue.phase_of_rows`); None when it is not
+            known, and then only a rule without a phase selects the kernel.
         norm_gain: the ``[H]`` gain the call also asks the norm with, or None.
 
     The kernel serves any ``T >= 1`` (in tiles of :data:`MHC_PRE_TOKEN_TILE` rows),

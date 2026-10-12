@@ -85,7 +85,7 @@ VERIFY_KERNELS = ("mhc_pre", "mhc_post")
 
 @dataclass(frozen=True)
 class _Rule:
-    """One ``kernel[:phase][@rows]`` rule. ``phase`` None: both. ``hi`` None: no bound."""
+    """One ``kernel[:phase][@rows]`` rule. ``phase`` None: every phase. ``hi`` None: no bound."""
 
     kernel: str
     phase: str | None
