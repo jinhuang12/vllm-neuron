@@ -28,12 +28,32 @@ engines' fp32 arithmetic is exact; the latent slots leave the kernel as int32 pa
 (``[rows, 2]``: low word, zero high word); the launch converts the low words to the int64 the layers'
 ``index_copy_`` takes, since NKI has no 64-bit integer and a dtype cast on a device
 tensor is a device op of its own. The dispatch counters (``dispatch_counters``,
-``reset_dispatch_counters``) are test instrumentation: they tell the tests which route
-served, and nothing on the step path reads them.
+``reset_dispatch_counters``, ``queue_full_fallbacks``) are test instrumentation: they tell
+the tests which route served, and nothing on the step path reads them.
+
+The runtime queues each rank's NEFF executions (``NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS``
+slots, set by the worker) and frees a slot when its completion thread has processed the
+completion. A launch that finds no slot is refused with ``NRT_QUEUE_FULL`` (status 7),
+which the executor raises as a ``RuntimeError``. The drafter never raises on it: a refused
+launch is served by the torch route on the host for that step (:func:`_take_on_the_host`,
+:func:`_correct_on_the_host` -- the operands read back once, the fields moved back once,
+the values the synchronous drafter builds) and counted once; every other ``RuntimeError``
+is re-raised unchanged. And :class:`DeviceLaunch` keeps at most :func:`launch_depth` of its
+launches outstanding per rank -- derived from the queue depth the worker sets -- reading the
+oldest back before it issues another: on a healthy host that read returns at once (the
+launch was processed steps ago) and retires it; a read that blocks is a wait, counted and
+logged, and it is what stops a rank whose completion thread stalls from enqueuing into a
+full queue. A queue too small for the drafter to run without that wait on a healthy host
+is refused by name.
 """
 
 from __future__ import annotations
 
+import logging
+import re
+import time
+from collections import deque
+from dataclasses import dataclass
 from typing import NamedTuple
 
 import torch
@@ -60,23 +80,121 @@ from vllm_neuron.functional.mtp.common import (
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 __all__ = [
+    "DECODE_STEP_ENQUEUES",
+    "ENGINE_BATCHES_IN_FLIGHT",
+    "EXECUTION_QUEUE_ENV",
+    "LAUNCHES_PER_STEP",
+    "MINIMUM_EXECUTION_QUEUE",
+    "QUEUE_FULL_MESSAGE",
+    "QUEUE_FULL_STATUS",
+    "STEADY_STATE_LAUNCHES",
+    "SUMMARY_EVERY_LAUNCHES",
+    "WAIT_THRESHOLD_MS",
     "DeviceLaunch",
     "MtpAsyncStepError",
     "StepCarry",
     "StepCorrection",
     "StepTake",
+    "backlog_waits",
+    "bound_waits",
     "dispatch_counters",
+    "executions_held",
+    "launch_depth",
     "mtp_async_correct",
     "mtp_async_correct_kernel",
     "mtp_async_correct_torch",
     "mtp_async_take",
     "mtp_async_take_kernel",
     "mtp_async_take_torch",
+    "queue_full_fallbacks",
     "reset_dispatch_counters",
 ]
 
 #: Two int32 words make the int64 the latent slots are consumed as (NKI has no int64).
 INT64_WORDS = 2
+
+#: ``NRT_QUEUE_FULL`` (``nrt/nrt_status.h``: "not enough space in the execution input queue").
+QUEUE_FULL_STATUS = 7
+#: The executor's message for that status: it raises
+#: ``RuntimeError("Failed to schedule neff execution. status=7 message=Execution Queue Full")``.
+QUEUE_FULL_MESSAGE = "Execution Queue Full"
+#: The runtime's per-core execution queue depth. The worker sets it before the first step
+#: (an operator's preset wins); the runner hands the value to :class:`DeviceLaunch`.
+EXECUTION_QUEUE_ENV = "NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS"
+#: What a decode step enqueues on a rank under the async drafter, in order: the drafter's
+#: correction launch, the model's forward, the drafter's take launch. The forward needs the
+#: correction's outputs, the take the forward's; the runtime processes completions in this
+#: order too.
+DECODE_STEP_ENQUEUES = ("correct", "forward", "take")
+#: The drafter's launches per decode step (the step's enqueues that are not the forward).
+LAUNCHES_PER_STEP = sum(1 for enqueue in DECODE_STEP_ENQUEUES if enqueue != "forward")
+#: Batches the engine keeps in flight under async scheduling (vLLM's ``max_concurrent_batches``
+#: at pipeline parallel 1): the step whose output is being read and the step scheduled behind it.
+ENGINE_BATCHES_IN_FLIGHT = 2
+#: The drafter's launches a healthy host holds outstanding at once: the previous step's take
+#: (its output is read only by the next launch) plus the launches of the steps in flight.
+STEADY_STATE_LAUNCHES = 1 + LAUNCHES_PER_STEP * ENGINE_BATCHES_IN_FLIGHT
+#: A retire read of a launch output longer than this is counted (``bound_waits``): a
+#: processed output of a few bytes reads back in microseconds, so a longer read is either the
+#: read's own host cost (a scheduling or runtime-lock delay of a few milliseconds, which a loaded
+#: host shows on a small share of reads) or a wait on an unprocessed execution. The two are
+#: told apart by the host's step period: the oldest of ``depth`` launches was issued
+#: ``(depth - 1) / LAUNCHES_PER_STEP`` steps ago, so its age over that count is the period this
+#: host has been running steps at (a prefill inside the span raises it, so that one retire is
+#: judged more leniently, never more strictly), and a read that outlasts it waited for the device
+#: and the completion thread -- a completion backlog, counted (``backlog_waits``) and warned once
+#: per event. A read over this threshold but under the period is counted and recorded at DEBUG;
+#: its count's surface on a served line, which logs at INFO, is the bound's summary
+#: (:data:`SUMMARY_EVERY_LAUNCHES`).
+WAIT_THRESHOLD_MS = 1.0
+#: Launches between two INFO summaries of the bound (:meth:`DeviceLaunch.close` prints the open
+#: window's at shutdown): the window's launches and wall span, its counted reads and backlogs
+#: with the longest read, the oldest launch's age and the range of the derived step period, its
+#: queue-full steps, and the three counts since the start. One line per a few thousand decode
+#: steps (two launches a step) per rank -- a served line logs at INFO, where the per-event DEBUG
+#: records do not print and a line per counted read would be noise; the backlog warning does print.
+SUMMARY_EVERY_LAUNCHES = 4096
+_QUEUE_FULL_STATUS_TOKEN = re.compile(rf"(?<![\w.])status={QUEUE_FULL_STATUS}(?![\w.])")
+logger = logging.getLogger(__name__)
+
+
+def executions_held(launches: int) -> int:
+    """The most executions a rank has enqueued but not seen processed while ``launches`` of
+    the drafter's launches are unprocessed.
+
+    A decode step enqueues :data:`DECODE_STEP_ENQUEUES` in order and the runtime processes
+    completions in enqueue order, so the unprocessed executions are one span of that
+    sequence: the ``launches``, a forward after each correction among them, and -- when the
+    launch that would wait is a take -- the forward its step already enqueued. The span is
+    longest when it starts at a correction: ``launches + ceil(launches / LAUNCHES_PER_STEP)``.
+    A prefill that runs in several chunk graphs adds its further forwards to a span that
+    contains it; the launch depth leaves half the queue free for such executions.
+    """
+    return launches + -(-launches // LAUNCHES_PER_STEP)
+
+
+def launch_depth(execution_queue: int) -> int:
+    """Unprocessed launches a :class:`DeviceLaunch` may hold under a queue of
+    ``execution_queue`` slots: the largest count whose executions (:func:`executions_held`)
+    fit half the queue. The other half stays free for executions this count does not
+    include. 32 slots give 10 (15 executions); the runtime's own default of 8 gives 2."""
+    depth = 0
+    while executions_held(depth + 1) <= execution_queue // 2:
+        depth += 1
+    return depth
+
+
+def _minimum_execution_queue() -> int:
+    """The least queue whose depth reaches :data:`STEADY_STATE_LAUNCHES`, so the bound never
+    waits on a healthy host."""
+    queue = 1
+    while launch_depth(queue) < STEADY_STATE_LAUNCHES:
+        queue += 1
+    return queue
+
+
+#: Below this queue depth the async drafter is refused: its bound would wait on every step.
+MINIMUM_EXECUTION_QUEUE = _minimum_execution_queue()
 
 
 def _on_the_host(tensor: Tensor) -> bool:
@@ -91,6 +209,26 @@ def _on_the_host(tensor: Tensor) -> bool:
 
 class MtpAsyncStepError(ValueError):
     """An operand that is not a verify step's: wrong geometry, dtype, or a value outside its range."""
+
+
+@dataclass
+class StepCounters(DispatchCounters):
+    """:class:`DispatchCounters` plus the guard's two counts: ``queue_full``, of the
+    torch-route calls, the steps served on the host because the runtime refused the launch
+    with a full execution queue; ``bound_waits``, the launches the bound held until the
+    oldest was processed (test instrumentation; ``pair`` reports the two routes as before)."""
+
+    queue_full: int = 0
+    #: Retire reads longer than :data:`WAIT_THRESHOLD_MS` (the read's own cost or a backlog).
+    bound_waits: int = 0
+    #: Of those, the reads that outlasted the host's step period: a completion backlog.
+    backlog_waits: int = 0
+
+    def reset(self) -> None:
+        super().reset()
+        self.queue_full = 0
+        self.bound_waits = 0
+        self.backlog_waits = 0
 
 
 class StepTake(NamedTuple):
@@ -185,8 +323,10 @@ def _correct_launch(
     to the int64 the layers consume (the kernel writes int32 pairs with a zero high word;
     NKI has no int64), laid out with unit stride: the layers' graphs were compiled from
     the synchronous translator's fresh contiguous tensors and guard each operand's strides,
-    and a one-element row would otherwise keep the pair's stride of 2. Returns the fields in
-    order, ``latent_slots`` None without a table.
+    and on the eager routes (the CPU simulator, a launch outside a graph) a one-element row
+    would otherwise keep the pair's stride of 2; a compiled launch's outputs are allocated
+    contiguous by the backend. Returns the fields in order, ``latent_slots`` None without a
+    table.
     """
     batch = starts.shape[0]
     rows = batch + PADDING
@@ -206,6 +346,33 @@ def _correct_launch(
     return start.reshape(rows), linear.reshape(rows), seq.reshape(-1), latent, resume.reshape(rows)
 
 
+@dataclass
+class _Window:
+    """One summary window of a launch's bound: its launches, the counted retire reads with their
+    extremes, and the queue-full count the window opened at (its steps are the delta)."""
+
+    opened_at: float
+    queue_full_at_open: int
+    launches: int = 0
+    reads: int = 0
+    backlogs: int = 0
+    longest_read_ms: float = 0.0
+    oldest_launch_ms: float = 0.0
+    least_step_ms: float = 0.0
+    most_step_ms: float = 0.0
+
+    def note(self, read_ms: float, age_ms: float, step_ms: float, *, backlog: bool) -> None:
+        """Fold one counted read into the window's extremes."""
+        if self.reads == 0:
+            self.least_step_ms = step_ms
+        self.reads += 1
+        self.backlogs += backlog
+        self.longest_read_ms = max(self.longest_read_ms, read_ms)
+        self.oldest_launch_ms = max(self.oldest_launch_ms, age_ms)
+        self.least_step_ms = min(self.least_step_ms, step_ms)
+        self.most_step_ms = max(self.most_step_ms, step_ms)
+
+
 class DeviceLaunch:
     """The two kernel launches as compiled graphs, for operands on a device.
 
@@ -221,9 +388,31 @@ class DeviceLaunch:
     build in the same compile cache with the same compiler flags. ``calls`` counts the
     launches per graph (test instrumentation and the warmup's log; nothing on the step
     path reads it).
+
+    The launch bounds its run-ahead when it is built with ``execution_queue``, the runtime's
+    per-core queue depth (:data:`EXECUTION_QUEUE_ENV`, the worker sets it): it keeps the
+    first output of each launch it issued -- ``outstanding`` counts those not yet read back
+    -- and, before issuing one at ``depth`` (:func:`launch_depth`) outstanding, reads the
+    oldest to the host and retires it. The runtime's completion callback resolves that
+    output's future, and the same completion processing frees the execution's queue slot,
+    so the read returns once the slot is free: at once on a healthy host (the oldest of
+    ``depth`` launches was processed steps ago; one small read per launch from then on), and
+    only after the stall on a rank whose completion thread stalled, which therefore waits
+    here instead of enqueuing into a full queue. A read longer than
+    :data:`WAIT_THRESHOLD_MS` is counted; one that also outlasts the host's step period
+    (the oldest launch's age over the steps it spans) is that wait, counted again and warned
+    once with the read, the launch's age and the period; a shorter one is a retirement that
+    leaves a DEBUG record. Every :data:`SUMMARY_EVERY_LAUNCHES` launches the bound logs one
+    INFO summary of the window (counts, extremes and the totals; ``close`` logs the open
+    window's at shutdown), the counts' surface on a served line. That pairing of the read with
+    the slot's release is the framework's design, not yet measured on a device. A queue below
+    :data:`MINIMUM_EXECUTION_QUEUE` is refused by name: its depth is below the launches a
+    healthy host holds, so the bound would wait on every step. Without ``execution_queue``
+    (a host backend: launches run eagerly, nothing is queued) there is no bound and
+    ``depth`` is None.
     """
 
-    def __init__(self, backend, options: dict | None = None) -> None:
+    def __init__(self, backend, options: dict | None = None, *, execution_queue: int | None = None) -> None:
         if not backend:
             raise MtpAsyncStepError(
                 "DeviceLaunch: a torch.compile backend is required (the model's, "
@@ -232,6 +421,20 @@ class DeviceLaunch:
         self.backend = backend
         self.options = dict(options) if options else None
         self.calls = {"take": 0, "correct": 0}
+        self._outstanding: deque[tuple[Tensor, float]] = deque()
+        self.depth: int | None = None if execution_queue is None else launch_depth(execution_queue)
+        #: Decode steps between the oldest of ``depth`` outstanding launches and the newest.
+        self._steps_spanned = None if self.depth is None else (self.depth - 1) / LAUNCHES_PER_STEP
+        self._window = _Window(opened_at=time.perf_counter(), queue_full_at_open=_COUNTERS.queue_full)
+        self._closed = False
+        if self.depth is not None and self.depth < STEADY_STATE_LAUNCHES:
+            raise MtpAsyncStepError(
+                f"{EXECUTION_QUEUE_ENV}={execution_queue}: the async drafter's launch depth "
+                f"derived from it is {self.depth}, below the {STEADY_STATE_LAUNCHES} launches a "
+                f"healthy host holds, so it would wait on every step; set "
+                f"{EXECUTION_QUEUE_ENV} to at least {MINIMUM_EXECUTION_QUEUE} or serve the "
+                f"synchronous drafter"
+            )
         self._take = torch.compile(
             _take_launch, backend=backend, fullgraph=True, dynamic=False, options=self.options
         )
@@ -239,13 +442,167 @@ class DeviceLaunch:
             _correct_launch, backend=backend, fullgraph=True, dynamic=False, options=self.options
         )
 
+    @property
+    def outstanding(self) -> int:
+        """Launches issued whose first output this launch has not yet read back."""
+        return len(self._outstanding)
+
+    def _admit(self) -> None:
+        """Retire the oldest launches until fewer than ``depth`` are outstanding; a read that
+        blocks past :data:`WAIT_THRESHOLD_MS` is counted, and one that outlasts the host's
+        step period (the oldest launch's age over the steps it spans) is a backlog, warned.
+        The admission counts toward the window; the window's :data:`SUMMARY_EVERY_LAUNCHES`-th
+        closes it with the INFO summary."""
+        if self.depth is None:
+            return
+        while len(self._outstanding) >= self.depth:
+            outstanding = len(self._outstanding)
+            oldest, issued_at = self._outstanding[0]
+            started = time.perf_counter()
+            oldest.cpu()
+            read_ms = (time.perf_counter() - started) * 1e3
+            self._outstanding.popleft()
+            if read_ms > WAIT_THRESHOLD_MS:
+                age_ms = (started - issued_at) * 1e3
+                step_ms = max(age_ms / self._steps_spanned, WAIT_THRESHOLD_MS)
+                backlog = read_ms > step_ms
+                self._window.note(read_ms, age_ms, step_ms, backlog=backlog)
+                _note_bound_wait(outstanding, read_ms, age_ms, step_ms, backlog=backlog)
+        self._window.launches += 1
+        if self._window.launches >= SUMMARY_EVERY_LAUNCHES:
+            self._summarize(f"every {SUMMARY_EVERY_LAUNCHES} launches")
+
+    def _summarize(self, occasion: str) -> None:
+        """Log the window's INFO summary and open the next."""
+        now = time.perf_counter()
+        _note_summary(occasion, self._window, now - self._window.opened_at)
+        self._window = _Window(opened_at=now, queue_full_at_open=_COUNTERS.queue_full)
+
+    def close(self) -> None:
+        """Log the open window's summary as the bound's last line (the worker's shutdown calls
+        this); once, and never for a launch without a bound."""
+        if self.depth is None or self._closed:
+            return
+        self._closed = True
+        self._summarize("at shutdown")
+
+    def _issued(self, fields):
+        if self.depth is not None:
+            self._outstanding.append((fields[0], time.perf_counter()))
+        return fields
+
     def take(self, accepted: Tensor, drafts: Tensor):
+        self._admit()
         self.calls["take"] += 1
-        return self._take(accepted, drafts)
+        return self._issued(self._take(accepted, drafts))
 
     def correct(self, prev_rows: Tensor, starts: Tensor, table: Tensor, **constants):
+        self._admit()
         self.calls["correct"] += 1
-        return self._correct(prev_rows, starts, table, **constants)
+        return self._issued(self._correct(prev_rows, starts, table, **constants))
+
+
+def _is_queue_full(error: RuntimeError) -> bool:
+    """True for the executor's refusal of a launch with a full execution queue: the text
+    carries ``status=7`` as a whole token and ``Execution Queue Full``; nothing else."""
+    text = str(error)
+    return QUEUE_FULL_MESSAGE in text and _QUEUE_FULL_STATUS_TOKEN.search(text) is not None
+
+
+def _take_on_the_host(accepted: Tensor, drafts: Tensor) -> StepTake:
+    """The take served by the torch route after the runtime refused its launch: the operands
+    read to the host once, the fields the contract computes, moved back once. Counted as one
+    degraded step."""
+    device = accepted.device
+    take = mtp_async_take_torch(accepted.cpu(), drafts.cpu())
+    _degraded("take")
+    return StepTake(*(field.to(device) for field in take))
+
+
+def _correct_on_the_host(
+    prev_checkpoint_rows: Tensor, optimistic_starts: Tensor, block_table_row: Tensor | None, *,
+    prev_width: int, width: int, page_size: int, padding: int,
+) -> StepCorrection:
+    """The correction served by the torch route after the runtime refused its launch; as
+    :func:`_take_on_the_host`."""
+    device = optimistic_starts.device
+    correction = mtp_async_correct_torch(
+        prev_checkpoint_rows.cpu(), optimistic_starts.cpu(),
+        None if block_table_row is None else block_table_row.cpu(),
+        prev_width=prev_width, width=width, page_size=page_size, padding=padding,
+    )
+    _degraded("correction")
+    return StepCorrection(
+        *(None if field is None else field.to(device) for field in correction)
+    )
+
+
+def _degraded(launch: str) -> None:
+    """Count (as a torch-route call and a queue-full step) and log one step served on the
+    host after the runtime refused its launch."""
+    _count_torch_route()
+    _note_queue_full(launch)
+
+
+@torch._dynamo.assume_constant_result
+def _note_queue_full(launch: str) -> None:
+    """Bump the queue-full counter and log the step. Folded like the file's other host-side
+    counters (:func:`count_kernel` / :func:`count_torch_route` in ``mtp/common.py``): this path
+    runs on the host after the compiled launch was refused, where the decorator is inert; the
+    census readers over ``functional/`` require the fold. The family question is open."""
+    _COUNTERS.queue_full += 1
+    logger.warning(
+        "mtp async: the runtime refused the %s launch with a full execution queue; the step is "
+        "served on the host (%d such steps)", launch, _COUNTERS.queue_full,
+    )
+
+
+@torch._dynamo.assume_constant_result
+def _note_bound_wait(outstanding: int, read_ms: float, age_ms: float, step_ms: float, *, backlog: bool) -> None:
+    """Count a retire read over :data:`WAIT_THRESHOLD_MS`; a backlog (the read outlasted the
+    host's step period) is counted again and warned, a shorter read leaves a DEBUG record (the
+    bound's summary carries its count to a served line). Folded like :func:`_note_queue_full`:
+    the retire runs on the host before the compiled launch, where the decorator is inert; the
+    census readers require the fold."""
+    _COUNTERS.bound_waits += 1
+    if backlog:
+        _COUNTERS.backlog_waits += 1
+        logger.warning(
+            "mtp async: the bound's retire read waited %.1f ms for the oldest of %d launches, "
+            "issued %.1f ms ago (%.1f ms a step on this host): a completion backlog",
+            read_ms, outstanding, age_ms, step_ms,
+        )
+    else:
+        logger.debug(
+            "mtp async: the bound's retire read took %.1f ms for the oldest of %d launches, "
+            "issued %.1f ms ago (%.1f ms a step on this host): the read's own cost",
+            read_ms, outstanding, age_ms, step_ms,
+        )
+
+
+@torch._dynamo.assume_constant_result
+def _note_summary(occasion: str, window: _Window, span_s: float) -> None:
+    """Log one INFO summary of the bound's window and the counts since the start. Folded like
+    :func:`_note_bound_wait`: the census readers require the fold."""
+    queue_full = _COUNTERS.queue_full - window.queue_full_at_open
+    if window.reads:
+        logger.info(
+            "mtp async: launch bound summary (%s): %d launches in %.1f s, %d retire reads over "
+            "%.1f ms (%d completion backlogs; longest read %.1f ms; oldest launch %.1f ms, "
+            "%.1f-%.1f ms a step on this host), %d queue-full steps; since start %d reads, "
+            "%d backlogs, %d queue-full steps",
+            occasion, window.launches, span_s, window.reads, WAIT_THRESHOLD_MS, window.backlogs,
+            window.longest_read_ms, window.oldest_launch_ms, window.least_step_ms,
+            window.most_step_ms, queue_full, _COUNTERS.bound_waits, _COUNTERS.backlog_waits,
+            _COUNTERS.queue_full,
+        )
+    else:
+        logger.info(
+            "mtp async: launch bound summary (%s): %d launches in %.1f s, no retire read over "
+            "%.1f ms, %d queue-full steps; since start %d reads, %d backlogs, %d queue-full steps",
+            occasion, window.launches, span_s, WAIT_THRESHOLD_MS, queue_full,
+            _COUNTERS.bound_waits, _COUNTERS.backlog_waits, _COUNTERS.queue_full,
+        )
 
 
 def _check_contiguous(name: str, operand: str, tensor: Tensor) -> None:
@@ -381,7 +738,10 @@ def mtp_async_take(
             of ids and ``-1`` after it. A device future is read by the kernel only.
         drafts: ``[B, k]`` int32, the root's drafts for the same requests, ``k >= 1``.
         launch: the :class:`DeviceLaunch` a device operand launches through; a host
-            operand launches eagerly and ignores it.
+            operand launches eagerly and ignores it. A launch the runtime refuses with a
+            full execution queue (``status=7 message=Execution Queue Full``) is served by
+            the torch route on the host for this step (:func:`_take_on_the_host`); every
+            other ``RuntimeError`` propagates unchanged.
 
     Raises:
         MtpAsyncStepError: another geometry or dtype, a strided operand, a device operand
@@ -395,7 +755,12 @@ def mtp_async_take(
     if _launches_in_a_graph(accepted):
         if launch is None:
             raise _no_launch("mtp_async_take", accepted)
-        fields = launch.take(accepted, drafts)
+        try:
+            fields = launch.take(accepted, drafts)
+        except RuntimeError as error:
+            if not _is_queue_full(error):
+                raise
+            return _take_on_the_host(accepted, drafts)
     else:
         fields = _take_launch(accepted, drafts)
     _count_kernel()
@@ -730,7 +1095,9 @@ def mtp_async_correct(
             drafter serves one request (``MtpProposer`` refuses ``max_num_seqs > 1``), so a
             bucket with padding is laid out but never run.
         launch: the :class:`DeviceLaunch` a device operand launches through; a host
-            operand launches eagerly and ignores it.
+            operand launches eagerly and ignores it. A launch the runtime refuses with a
+            full execution queue is served by the torch route on the host for this step
+            (:func:`_correct_on_the_host`); every other ``RuntimeError`` propagates unchanged.
 
     Raises:
         MtpAsyncStepError: another geometry or dtype, a strided operand, a page size that
@@ -764,7 +1131,15 @@ def mtp_async_correct(
     if _launches_in_a_graph(optimistic_starts):
         if launch is None:
             raise _no_launch("mtp_async_correct", optimistic_starts)
-        fields = launch.correct(prev_checkpoint_rows, optimistic_starts, table, **constants)
+        try:
+            fields = launch.correct(prev_checkpoint_rows, optimistic_starts, table, **constants)
+        except RuntimeError as error:
+            if not _is_queue_full(error):
+                raise
+            return _correct_on_the_host(
+                prev_checkpoint_rows, optimistic_starts, block_table_row,
+                prev_width=prev_width, width=width, page_size=page_size, padding=padding,
+            )
     else:
         fields = _correct_launch(prev_checkpoint_rows, optimistic_starts, table, **constants)
     _count_kernel()
@@ -773,7 +1148,7 @@ def mtp_async_correct(
 
 _TAKE_KERNEL = wrap_nki(mtp_async_take_kernel)
 _CORRECT_KERNEL = wrap_nki(mtp_async_correct_kernel)
-_COUNTERS = DispatchCounters()
+_COUNTERS = StepCounters()
 _count_kernel = count_kernel(_COUNTERS)
 _count_torch_route = count_torch_route(_COUNTERS)
 
@@ -785,5 +1160,24 @@ def reset_dispatch_counters() -> None:
 
 def dispatch_counters() -> tuple[int, int]:
     """``(kernel launches that returned, torch-route calls)`` since the last reset -- test
-    instrumentation; nothing on the step path reads it."""
+    instrumentation; nothing on the step path reads it. A step served on the host after a
+    refused launch counts as a torch-route call (and in :func:`queue_full_fallbacks`)."""
     return _COUNTERS.pair()
+
+
+def queue_full_fallbacks() -> int:
+    """Steps served on the host because the runtime refused the launch with a full execution
+    queue, since the last reset -- test instrumentation."""
+    return _COUNTERS.queue_full
+
+
+def bound_waits() -> int:
+    """Retire reads longer than :data:`WAIT_THRESHOLD_MS` (the read's own cost or a backlog),
+    since the last reset -- test instrumentation."""
+    return _COUNTERS.bound_waits
+
+
+def backlog_waits() -> int:
+    """Retire reads that outlasted the host's step period -- the launches the bound held
+    until a completion backlog cleared -- since the last reset; test instrumentation."""
+    return _COUNTERS.backlog_waits

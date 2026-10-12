@@ -7102,14 +7102,37 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             return None
         launch = self._glm5next_async_launch_instance
         if launch is None:
-            from vllm_neuron.envs import get_compile_backend_name
+            from vllm_neuron import envs
             from vllm_neuron.functional.mtp import async_step as mtp_async
 
+            execution_queue = envs.NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS
+            if execution_queue is None:
+                raise mtp_async.MtpAsyncStepError(
+                    f"{mtp_async.EXECUTION_QUEUE_ENV} is unset: the worker sets the runtime's "
+                    "execution queue depth before the first step, and the async drafter's launch "
+                    "bound derives from it"
+                )
             launch = mtp_async.DeviceLaunch(
-                get_compile_backend_name(), options=self.compile_options
+                envs.get_compile_backend_name(), options=self.compile_options,
+                execution_queue=execution_queue,
             )
             self._glm5next_async_launch_instance = launch
         return launch
+
+    def _glm5next_async_launch_close(self) -> None:
+        """Flush the async drafter's launch bound at the worker's shutdown: its open summary
+        window (:meth:`~vllm_neuron.functional.mtp.async_step.DeviceLaunch.close`, once).
+        Nothing without a launch -- CPU mode, the synchronous drafter, a worker that never
+        built one. An error here is logged at DEBUG with its traceback and not raised, so the
+        worker's shutdown completes.
+        """
+        launch = self._glm5next_async_launch_instance
+        if launch is None:
+            return
+        try:
+            launch.close()
+        except Exception:
+            logger.debug("mtp async: the launch bound's shutdown summary failed", exc_info=True)
 
     def _glm5next_async_warmup(self, model_output, *, batch_size: int, is_prefill: bool) -> None:
         """Compile the async drafter's launches on this warmup's operand signatures.

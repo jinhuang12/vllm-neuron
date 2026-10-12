@@ -617,12 +617,23 @@ scheduling forms:
   same host and recipe, a 1k-token context; mean per-token gap 10.17 against 15.45 ms; 77.7
   against 55.6 tokens/s) (2026-10-10); the 8-prompt greedy outputs identical to the
   synchronous drafter's; the same GSM8K@200 strict score and wrong set.
-  Known limitation: on a host saturated enough to stall one rank's runtime completion
-  thread, the 32-deep execution queue (`NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS`) fills
-  about three times sooner than with the synchronous drafter (three executions per decode
-  step instead of one), and the step fails with `status=7` (Execution Queue Full), after
-  which the remaining ranks time out on the next collective. Until the launch-depth guard
-  lands, enable the drafter only on an unsaturated host.
+  Execution queue: the async drafter enqueues three executions per decode step (the
+  correction launch, the forward, the take launch) against the synchronous drafter's one, so a
+  rank whose runtime completion thread stalls fills the execution queue
+  (`NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS`, 32 by the worker's default) about three times
+  sooner. Two guards hold it: each rank keeps at most `launch_depth(queue)` of its launches
+  outstanding -- the most whose executions fit half the queue, 10 under 32 -- and reads the
+  oldest back before issuing another, so a stalled rank waits instead of filling the queue
+  (a read over 1 ms is counted, `async_step.bound_waits()`, with a DEBUG record; one that outlasts the host's
+  step period is a completion backlog, counted and warned once, `async_step.backlog_waits()`; every
+  `async_step.SUMMARY_EVERY_LAUNCHES` launches, and at the worker's shutdown, the bound logs one INFO summary
+  of the window -- its counted reads, backlogs and queue-full steps, the longest read, the oldest launch's age
+  with the derived step period, and the totals -- the counts' surface on a served line); and
+  a launch the runtime still
+  refuses with `status=7` (Execution Queue Full) is served on the host for that step with the
+  synchronous drafter's values (one warning per such step, `async_step.queue_full_fallbacks()`).
+  A queue below 16, whose depth is under the five launches a healthy host holds, is refused by
+  name at warm-up. Neither guard has a knob.
 
 It is
 served greedy only (under this recipe, sampling knobs are refused at admission). Its

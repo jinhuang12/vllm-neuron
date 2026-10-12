@@ -611,6 +611,37 @@ Contract of the opt-in (measured on trn2 at TP64/EP16, `k = 3`, `max_num_seqs 1`
   against 11.377 ms synchronous (median per-token gap on the same host and recipe, a
   1k-token context; mean per-token gap 10.17 against 15.45 ms; 77.7 against 55.6 tokens/s)
   at `k = 3`, batch size 1, 2026-10-10).
+  The async drafter enqueues three NEFF executions per decode step and rank (the correction
+  launch, the forward, the take launch) against the synchronous drafter's one; the runtime
+  frees an execution-queue slot (`NEURON_RT_XU_COMPUTE_MAX_QUEUED_REQUESTS`, set by the
+  worker) when its completion thread has processed the completion, and refuses a launch that
+  finds no slot with `NRT_QUEUE_FULL` (status 7). The drafter never raises on it: a refused
+  take or correction is served by the torch route on the host for that step (the operands
+  read back once, the fields moved back once, the values the synchronous drafter builds) and
+  counted and logged (`async_step.queue_full_fallbacks()`; one warning per such step), every
+  other `RuntimeError` propagates unchanged; and the compiled launch holder
+  (`async_step.DeviceLaunch`) keeps at most `async_step.launch_depth(queue)` of its launches
+  unprocessed per rank -- the most whose executions, with the forwards between them
+  (`executions_held`: D + ceil(D / 2)), fit half the queue the worker set; 10 under the
+  worker's 32 -- reading the oldest back before it issues another. On a healthy host that
+  read returns at once (the launch was processed steps ago) and retires it silently; a read
+  that blocks past `async_step.WAIT_THRESHOLD_MS` (1 ms) is counted (`async_step.bound_waits()`),
+  and one that also outlasts the host's step period -- the oldest launch's age over the
+  `(depth - 1) / LAUNCHES_PER_STEP` steps it spans -- is a completion backlog, counted
+  (`async_step.backlog_waits()`) and warned once with the read, the age and the period; a few
+  milliseconds on a launch issued steps ago is the read's own host cost, counted with a DEBUG record.
+  A served line logs at INFO, so the counts' surface there is the bound's summary: every
+  `async_step.SUMMARY_EVERY_LAUNCHES` launches (and the open window at the worker's shutdown,
+  `DeviceLaunch.close`) one INFO line with the window's launches and wall span, counted reads and
+  backlogs, longest read, oldest launch's age and derived-period range, queue-full steps, and the
+  three counts since the start.
+  The backlog wait is what makes a rank whose completion thread stalls wait instead of
+  filling the queue. A healthy host holds at most 5 launches
+  outstanding (the previous step's take plus the correction and take of the two steps the
+  engine keeps in flight: `1 + LAUNCHES_PER_STEP * ENGINE_BATCHES_IN_FLIGHT`), so the wait
+  never comes on one; a queue below `async_step.MINIMUM_EXECUTION_QUEUE` (16), whose depth is
+  under those 5, is refused by name when the launch is built at warm-up. No knob: both are
+  the default; the queue depth is the runtime's existing setting.
   The recipe runs the on-device sampler with `all_greedy: true`; sampling knobs the greedy
   sampler cannot apply (`temperature > 0`, `top_k`, `top_p`, `min_p`, `seed`, `n > 1`)
   are refused at admission (`vllm_neuron/vllm/admission.py`). Distribution-preserving
