@@ -148,18 +148,15 @@ class NeuronPlatform(Platform):
     device_control_env_var: str = "NEURON_VISIBLE_DEVICES"
     _device_count: int = -1
     _termination_timeout_patched: bool = False
-    # Max embeds a single image can produce. Set once in check_and_update_config.
-    # None means "no vision validation". In embed (post-merge) space so
-    # validate_request can compare directly against mm_pos.length.
-    _max_embeds_per_image: int | None = None
     # Structured outputs are request-level, while the SO-off perf mode is a
     # server-level compile choice. Validate requests before they reach the
     # engine so a bad request returns a normal request error.
     _enable_structured_outputs: bool = False
     # What this server refuses before a request reaches the engine: prompts past the
     # prefill window, sampling knobs the on-device sampler cannot apply, logprobs it
-    # cannot return (vllm_neuron/vllm/admission.py). Set in check_and_update_config;
-    # None admits everything.
+    # cannot return, images larger than the compiled vision encoder holds
+    # (vllm_neuron/vllm/admission.py). Set in check_and_update_config; None admits
+    # everything.
     _admission = None
 
     @classmethod
@@ -710,20 +707,6 @@ class NeuronPlatform(Platform):
         if hasattr(model_config.hf_config, "vision_config"):
             cls._resolve_vision_auto_config(vllm_config, model_config)
 
-        # Compute per-image embed limit for request validation.
-        # Buckets are in raw-token space; mm_pos.length is in embed space.
-        # Convert once here: max_embeds = max_bucket / merge_factor.
-        vision_config_dict = vllm_config.additional_config.get("vision_neuron_config")
-        if vision_config_dict:
-            buckets = vision_config_dict.get("num_vision_tokens_buckets")
-            if buckets:
-                from vllm_neuron.utils.vision_utils import (
-                    get_vision_token_merge_factor,
-                )
-
-                merge_factor = get_vision_token_merge_factor(model_config.hf_config)
-                cls._max_embeds_per_image = max(buckets) // max(merge_factor, 1)
-
         cls._resolve_sampling_from_the_model_class(vllm_config)
 
         # After the sampling resolution above settles on_device_sampling_config, a
@@ -885,9 +868,10 @@ class NeuronPlatform(Platform):
 
         Called per-request before scheduling. Raises ValueError before model
         execution so SO-off servers do not enter the SO mask path, and so a prompt
-        that leaves no room for a generated token (``prompt + 1 > max_model_len``) or
-        a sampling request the on-device sampler cannot serve never reaches the
-        engine (see ``vllm_neuron/vllm/admission.py``).
+        that leaves no room for a generated token (``prompt + 1 > max_model_len``), a
+        sampling request the on-device sampler cannot serve, or an image larger than
+        the compiled vision encoder holds never reaches the engine (see
+        ``vllm_neuron/vllm/admission.py``).
         """
         if (
             not cls._enable_structured_outputs
@@ -897,31 +881,6 @@ class NeuronPlatform(Platform):
 
         if cls._admission is not None:
             cls._admission.check(processed_inputs, params)
-
-        if cls._max_embeds_per_image is None:
-            return
-
-        mm_placeholders = processed_inputs.get("mm_placeholders")
-        if not mm_placeholders:
-            return
-
-        for modality, positions in mm_placeholders.items():
-            for mm_pos in positions:
-                # Use get_num_embeds(), not length: a video placeholder span
-                # interleaves timestamp TEXT tokens with the vision embeds
-                # (is_embed mask), so length overcounts what the vision
-                # encoder actually produces. For images they are equal.
-                num_embeds = mm_pos.get_num_embeds()
-                if num_embeds > cls._max_embeds_per_image:
-                    raise ValueError(
-                        f"A {modality} in this request produces "
-                        f"{num_embeds} embedding tokens, which exceeds "
-                        f"the maximum supported by the compiled vision "
-                        f"encoder ({cls._max_embeds_per_image}). Reduce the "
-                        f"image resolution (e.g. set max_pixels in "
-                        f"mm_processor_kwargs) or increase "
-                        f"num_vision_tokens_buckets in vision_neuron_config."
-                    )
 
     @classmethod
     def _validate_quantization_config(cls, vllm_config) -> None:

@@ -32,6 +32,13 @@ Three request classes are refused:
   runner then has no logits on the host; vLLM's completions endpoint indexes an empty
   logprobs list and answers HTTP 500.
 
+An image is refused as well when it has more embeddings than the compiled vision encoder
+holds: more than the largest ``num_vision_tokens_buckets`` entry divided by the model's
+merge factor (``vision_utils.get_vision_embed_limit``, which also caps the scheduler's
+encoder budget). Such an image fits no compiled bucket, and the scheduler can never
+schedule it. The refusal is a ``VLLMValidationError`` naming the content part, so the 400
+carries it as ``param``.
+
 ``validate_request`` alone answers a refused *streamed* request with HTTP 200 and an
 error event: vLLM's ``AsyncLLM.generate`` is an async generator, so its body (where
 ``process_inputs`` runs) starts only once the response stream is iterated.
@@ -45,7 +52,10 @@ import functools
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from vllm_neuron.utils.vision_utils import VisionEmbedLimit
 
 logger = logging.getLogger(__name__)
 
@@ -193,6 +203,96 @@ class SamplingAdmission:
         return knobs
 
 
+# ── image size ───────────────────────────────────────────────────────────────────
+
+
+#: The ``mm_processor_kwargs`` key that caps an image's placeholder tokens, for each
+#: architecture whose image processor reads one. transformers' GLM-5.3-Flash image
+#: processor shrinks an image to at most ``max_image_tokens`` placeholder tokens, the unit
+#: of the per-image limit, and does not read ``max_pixels``.
+IMAGE_TOKEN_CAP_KWARGS = {"Glm5NextForConditionalGeneration": "max_image_tokens"}
+
+
+def image_resize_kwarg(hf_config) -> str | None:
+    """The ``mm_processor_kwargs`` key a client can send to shrink an image on this
+    model, or None when the model reads none."""
+    architectures = tuple(getattr(hf_config, "architectures", None) or ())
+    for arch in architectures:
+        if arch in IMAGE_TOKEN_CAP_KWARGS:
+            return IMAGE_TOKEN_CAP_KWARGS[arch]
+    from vllm_neuron.model.interfaces import SupportsMaxPixels
+    from vllm_neuron.model.registry import get_models
+
+    models = dict(get_models())
+    for arch in architectures:
+        model_cls = models.get(arch)
+        if model_cls is not None and issubclass(model_cls, SupportsMaxPixels):
+            return "max_pixels"
+    return None
+
+
+@dataclass(frozen=True)
+class ImageEmbeds:
+    """The image rule: the most embeddings one multimodal item may produce, and the key
+    a client can send to shrink an image."""
+
+    #: The per-image limit; the scheduler's encoder budget reads the same value.
+    embed_limit: VisionEmbedLimit
+    #: The ``mm_processor_kwargs`` key that shrinks an image on this model, if any.
+    resize_kwarg: str | None = None
+
+    @property
+    def limit(self) -> int:
+        return self.embed_limit.embeds
+
+    def refusal(self, modality: str, num_embeds: int) -> str:
+        fixes = [f"Send a smaller {modality}"]
+        if self.resize_kwarg == "max_pixels":
+            fixes.append("send a smaller max_pixels in mm_processor_kwargs")
+        elif self.resize_kwarg is not None:
+            fixes.append(
+                f'send mm_processor_kwargs {{"{self.resize_kwarg}": {self.limit}}} to have '
+                f"the server shrink it"
+            )
+        return (
+            f"The {modality} in this request produces {num_embeds} embedding tokens, and "
+            f"this server admits at most {self.limit} per {modality}: the largest "
+            f"num_vision_tokens_buckets entry in vision_neuron_config "
+            f"({self.embed_limit.max_bucket} vision tokens) divided by the merge factor "
+            f"{self.embed_limit.merge_factor}. "
+            f"{', or '.join(fixes)}."
+        )
+
+    def first_refusal(self, processed_inputs: Any):
+        """``(message, parameter, num_embeds)`` for the first item above the limit, or
+        None. ``parameter`` is the content part that carried the item (``image_url``)."""
+        if not isinstance(processed_inputs, Mapping):
+            return None
+        placeholders = processed_inputs.get("mm_placeholders") or {}
+        for modality, positions in placeholders.items():
+            for position in positions:
+                # get_num_embeds, not length: a video placeholder interleaves timestamp
+                # text tokens with the embeddings (is_embed), so length overcounts what
+                # the vision encoder produces. For an image the two are equal.
+                num_embeds = position.get_num_embeds()
+                if num_embeds > self.limit:
+                    return self.refusal(modality, num_embeds), f"{modality}_url", num_embeds
+        return None
+
+
+def image_embeds_from_config(vllm_config) -> ImageEmbeds | None:
+    """The image rule for this served config, or None when it has no vision buckets."""
+    from vllm_neuron.utils.vision_utils import get_vision_embed_limit
+
+    limit = get_vision_embed_limit(vllm_config)
+    if limit is None:
+        return None
+    return ImageEmbeds(
+        embed_limit=limit,
+        resize_kwarg=image_resize_kwarg(vllm_config.model_config.hf_config),
+    )
+
+
 # ── the policy ───────────────────────────────────────────────────────────────────
 
 
@@ -200,9 +300,14 @@ class SamplingAdmission:
 class AdmissionPolicy:
     prompt: PromptLength | None = None
     sampling: SamplingAdmission = field(default_factory=SamplingAdmission)
+    image: ImageEmbeds | None = None
 
     def check(self, processed_inputs: Any, params: Any) -> None:
-        """Raise ``ValueError`` naming every reason this request cannot be served."""
+        """Raise ``ValueError`` naming every reason this request cannot be served.
+
+        A request refused for one oversized image alone gets a ``VLLMValidationError``
+        that names the content part, so vLLM's 400 carries it as ``param``.
+        """
         refusals = []
         # PoolingParams carry no sampling knobs and generate no token, so neither the
         # length rule nor the sampling rules apply to them.
@@ -212,6 +317,14 @@ class AdmissionPolicy:
                 if tokens is not None and tokens > self.prompt.tokens:
                     refusals.append(self.prompt.refusal(tokens))
             refusals.extend(self.sampling.refusals(params))
+        image = None if self.image is None else self.image.first_refusal(processed_inputs)
+        if image is not None and not refusals:
+            from vllm.exceptions import VLLMValidationError
+
+            message, parameter, num_embeds = image
+            raise VLLMValidationError(message, parameter=parameter, value=num_embeds)
+        if image is not None:
+            refusals.append(image[0])
         if refusals:
             raise ValueError(" ".join(refusals))
 
@@ -266,14 +379,16 @@ def policy_from_config(vllm_config) -> AdmissionPolicy:
             prompt_logprobs=False,
             defaults=_server_defaults(model_config),
         )
-    policy = AdmissionPolicy(prompt=prompt, sampling=sampling)
+    image = image_embeds_from_config(vllm_config)
+    policy = AdmissionPolicy(prompt=prompt, sampling=sampling, image=image)
     logger.info(
         "Request admission: prompts up to %d tokens (max_model_len %d less one generated "
-        "token); on-device sampling %s",
+        "token); on-device sampling %s%s",
         prompt.tokens,
         prompt.max_model_len,
         "off" if sampler is None
         else f"on (all_greedy={sampler.all_greedy}, logprobs={sampling.logprobs})",
+        "" if image is None else f"; images up to {image.limit} embeddings",
     )
     return policy
 

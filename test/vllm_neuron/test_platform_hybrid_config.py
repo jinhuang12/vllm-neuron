@@ -71,7 +71,6 @@ FIXTURE_CONFIG = (
 # every call so no test can read another test's residue.
 _MUTATED_CLASS_ATTRS = (
     "_enable_structured_outputs",
-    "_max_embeds_per_image",
     "_termination_timeout_patched",
 )
 
