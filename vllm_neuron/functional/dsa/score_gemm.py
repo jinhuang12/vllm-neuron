@@ -385,14 +385,14 @@ def _psum_slot(columns):
     return slot
 
 
-def _score_sweep(k_hbm, qt, w_cols, out, n0, blocks, width, tokens, heads, head_dim):
-    """Scores of candidates ``n0 .. n0 + blocks * width`` for every token, written to ``out``.
+def _score_sweep_rectify(k_hbm, qt, n0, blocks, width, tokens, heads, head_dim):
+    """Rectified scores of candidates ``n0 .. n0 + blocks * width``: ``[width, blocks, (head,
+    token)]`` fp32 in SBUF. The first of a sweep's three stages (:data:`_SUM_LAG`).
 
-    ``qt`` is the query turned to ``[head_dim, (head, token)]``, token fastest; ``w_cols`` the gate
-    on every partition as ``[128, (head, token)]``. Per block the PE writes ``[width, (head,
-    token)]``: candidate on the partition, so the head sum below runs on ``width`` lanes. Each
-    stage spans the whole sweep: one rectify per ``_SCORE_GROUP_BANKS`` banks, one multiply by the
-    gate, then one add per head in head order.
+    ``qt`` is the query turned to ``[head_dim, (head, token)]``, token fastest. Per block the PE
+    writes ``[width, (head, token)]``: candidate on the partition, so the head sum
+    (:func:`_score_sweep_sum`) runs on ``width`` lanes. One rectify per ``_SCORE_GROUP_BANKS``
+    banks.
     """
     cols = heads * tokens
     span = blocks * width
@@ -430,7 +430,16 @@ def _score_sweep(k_hbm, qt, w_cols, out, n0, blocks, width, tokens, heads, head_
                          offset=piece * slot)
             nisa.activation(dst=rect[0:width, b0:b0 + bn, h0 * tokens:(h0 + hn) * tokens],
                             op=nl.relu, data=data)
+    return rect
 
+
+def _score_sweep_sum(rect, w_cols, blocks, width, tokens, heads):
+    """The weighted head sum of one sweep's rectified scores ``rect``: ``[width, blocks, tokens]``.
+
+    ``w_cols`` is the gate on every partition as ``[128, (head, token)]``. One multiply by the gate
+    for the whole sweep, then one add per head in head order.
+    """
+    cols = heads * tokens
     # The weight, every (block, head, token) of the sweep in one instruction: rect * w.
     nisa.tensor_tensor(dst=rect, data1=rect,
                        data2=w_cols.ap(pattern=[[cols, width], [0, blocks], [1, cols]], offset=0),
@@ -442,8 +451,12 @@ def _score_sweep(k_hbm, qt, w_cols, out, n0, blocks, width, tokens, heads, head_
     for h in range(1, heads):
         nisa.tensor_tensor(dst=acc, data1=rect[0:width, 0:blocks, h * tokens:(h + 1) * tokens],
                            data2=acc, op=nl.add, engine=nisa.vector_engine)
+    return acc
 
-    # Back to rows: one PE turn per block, up to a bank of them per drain and per store.
+
+def _score_sweep_store(out, acc, n0, blocks, width, tokens):
+    """One sweep's sums ``acc`` (:func:`_score_sweep_sum`) back to rows, into ``out`` at candidate
+    ``n0``: one PE turn per block, up to a bank of them per drain and per store."""
     per_bank = max(1, _PSUM_BANK_COLUMNS // width)
     for b0 in range(0, blocks, per_bank):
         bn = min(per_bank, blocks - b0)
@@ -457,6 +470,25 @@ def _score_sweep(k_hbm, qt, w_cols, out, n0, blocks, width, tokens, heads, head_
         c0 = n0 + b0 * width
         nisa.dma_copy(dst=out[0:tokens, c0:c0 + bn * width], src=o_sb[0:tokens, 0:bn * width],
                       dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync)
+
+
+_SUM_LAG = 1
+"""Sweeps a program's head sum is issued after its rectify (see :func:`_score_gemm_cand_major_nki`).
+
+The tile allocator places SBUF buffers by their live ranges in program order, not by when the
+engines run. Issued one sweep late, a sweep's rectified scores are still live when the next
+sweep's are written, so the two get separate SBUF and the scalar engine rectifies one sweep while
+the vector engine sums the other. Issued in sweep order, the allocator gave both the same
+address, and every rectify waited for the previous sweep's last add (MEASURED, profile
+operands): the sweep ran at about 1.5 times the vector engine's busy time. Two sweeps of
+``_SWEEP_ELEMENTS`` fp32 take 128 KiB of a partition's SBUF."""
+
+_STORE_LAG = 3
+"""Sweeps a program's store is issued after its rectify.
+
+The PE runs its instructions in program order, and a store's PE turns wait for the sweep's last
+add. At this lag that sweep's head sum was issued two sweeps earlier, so the turns do not hold
+the next rectify's matmuls behind a head sum the vector engine is still running."""
 
 
 @nki.jit
@@ -508,10 +540,27 @@ def _score_gemm_cand_major_nki(q_hbm, k_hbm, w_hbm):
                                    offset=0),
                      engine=nisa.vector_engine)
 
+    # Three stages per sweep, issued apart: the rectify of sweep i, then the head sum of sweep
+    # i - _SUM_LAG, then the store of sweep i - _STORE_LAG (see the two constants).
     plan = _sweep_plan(cands, cols, programs)
+    rectified = []
+    summed = []
     for s in range(program, len(plan), programs):
         n0, blocks, width = plan[s]
-        _score_sweep(k_hbm, qt, w_cols, out, n0, blocks, width, tokens, heads, head_dim)
+        rect = _score_sweep_rectify(k_hbm, qt, n0, blocks, width, tokens, heads, head_dim)
+        rectified.append((rect, n0, blocks, width))
+        if len(rectified) > _SUM_LAG:
+            ready = rectified.pop(0)
+            acc = _score_sweep_sum(ready[0], w_cols, ready[2], ready[3], tokens, heads)
+            summed.append((acc, ready[1], ready[2], ready[3]))
+        if len(summed) > _STORE_LAG - _SUM_LAG:
+            done = summed.pop(0)
+            _score_sweep_store(out, done[0], done[1], done[2], done[3], tokens)
+    for ready in rectified:
+        acc = _score_sweep_sum(ready[0], w_cols, ready[2], ready[3], tokens, heads)
+        summed.append((acc, ready[1], ready[2], ready[3]))
+    for done in summed:
+        _score_sweep_store(out, done[0], done[1], done[2], done[3], tokens)
 
     return out
 
