@@ -175,7 +175,11 @@ def _indexer_side_cache_bytes(vllm_config, model_runner, kv_cache_spec=None) -> 
     """Return the bytes of the DSA indexer side caches the runner allocates.
 
     ``pool_cache``, ``tail`` and ``pad_tail`` of every sparse-attention layer, one
-    set per request slot (``max_num_seqs``), sized by ``max_model_len``, or under
+    set per request slot (``max_num_seqs``) and one per scratch slot
+    (:data:`~vllm_neuron.vllm.worker.glm5next_state_banks.SCRATCH_SLOTS`, the store
+    every padding row of a bank-form decode step names), as
+    :meth:`~vllm_neuron.vllm.worker.neuron_model_runner.NeuronModelRunner._glm5next_live_side_caches`
+    allocates them; sized by ``max_model_len``, or under
     decode context parallelism by this rank's share of it
     (:func:`~vllm_neuron.vllm.worker.neuron_model_runner.indexer_context_per_rank`);
     on a server drafting ``k`` mtp tokens (``model_runner.speculative_config``) the two
@@ -184,6 +188,7 @@ def _indexer_side_cache_bytes(vllm_config, model_runner, kv_cache_spec=None) -> 
     :func:`~vllm_neuron.vllm.worker.neuron_model_runner.indexer_side_cache_bytes`.
     0 for a model with no indexer.
     """
+    from .glm5next_state_banks import SCRATCH_SLOTS
     from .neuron_model_runner import indexer_side_cache_bytes
 
     if kv_cache_spec is None:
@@ -198,7 +203,7 @@ def _indexer_side_cache_bytes(vllm_config, model_runner, kv_cache_spec=None) -> 
         kv_cache_spec,
         getattr(model_runner.model, "text_config", None),
         max_seq_len=max_seq_len,
-        request_slots=vllm_config.scheduler_config.max_num_seqs,
+        request_slots=vllm_config.scheduler_config.max_num_seqs + SCRATCH_SLOTS,
         speculative_tokens=(
             int(speculative_config.num_speculative_tokens)
             if speculative_config is not None and speculative_config.method == "mtp"

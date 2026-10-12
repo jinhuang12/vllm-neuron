@@ -29,6 +29,7 @@ import pytest
 from vllm.config import SpeculativeConfig
 
 from vllm_neuron.vllm.worker import neuron_worker
+from vllm_neuron.vllm.worker.glm5next_state_banks import SCRATCH_SLOTS
 from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner, indexer_side_cache_bytes
 
 from test.vllm_neuron.worker import test_kv_budget_glm53f as kv
@@ -36,6 +37,8 @@ from test.vllm_neuron.worker import test_kv_budget_side_caches as side
 
 K = 3
 SEQS = 64
+#: The side-cache slots the runner allocates: one per request and the scratch slot.
+SLOTS = SEQS + SCRATCH_SLOTS
 LENGTH = 8192
 MIB = 1024**2
 RING_HELPER_PRESENT = (
@@ -97,12 +100,12 @@ def test_an_mtp_server_prices_the_rings_the_runner_allocates(monkeypatch) -> Non
     plain = _priced(worker)
     _mtp(worker.model_runner, K)
     speculative = _priced(worker)
-    assert speculative - plain == _ring_growth_bytes(slots=SEQS, ring_rows=ring_rows)
+    assert speculative - plain == _ring_growth_bytes(slots=SLOTS, ring_rows=ring_rows)
     # The same price the pricer gives when handed k directly: the caller forwards k, nothing else.
     runner = worker.model_runner
     assert speculative == indexer_side_cache_bytes(
         runner.get_kv_cache_spec(), runner.model.text_config,
-        max_seq_len=LENGTH, request_slots=SEQS, speculative_tokens=K,
+        max_seq_len=LENGTH, request_slots=SLOTS, speculative_tokens=K,
     )
 
 
@@ -128,15 +131,14 @@ def test_the_fit_check_counts_the_deeper_rings(monkeypatch) -> None:
     ring_rows = 2 * side.INDEX_KPOOL
     _fixed_depth(monkeypatch, ring_rows)
     assert worker._kv_cache_footprint_bytes(need) - pool_deep == _ring_growth_bytes(
-        slots=SEQS, ring_rows=ring_rows
+        slots=SLOTS, ring_rows=ring_rows
     )
 
 
 @SEAM
 def test_the_served_bs64_line_prices_the_tables_growth_at_k_3() -> None:
     """With the depth table (8 rows at k = 3 against a pool of 4) the bs=64 line's
-    fit check prices 2.75 MiB more per rank; per slot the figure the table states
-    at 65 slots (+2.79 MiB)."""
+    fit check prices 2.79 MiB more per rank over its 65 side-cache slots."""
     from vllm_neuron.functional.dsa.decode_trow import indexer_ring_depth
 
     worker = side._worker(seqs=SEQS, length=LENGTH)
@@ -145,6 +147,5 @@ def test_the_served_bs64_line_prices_the_tables_growth_at_k_3() -> None:
     growth = _priced(worker) - plain
     ring_rows = NeuronModelRunner._glm5next_indexer_ring_rows(side.INDEX_KPOOL, K)
     assert ring_rows == indexer_ring_depth(side.INDEX_KPOOL, K) > side.INDEX_KPOOL
-    assert growth == _ring_growth_bytes(slots=SEQS, ring_rows=ring_rows)
-    per_slot = growth / SEQS
-    assert round(65 * per_slot / MIB, 2) == 2.79
+    assert growth == _ring_growth_bytes(slots=SLOTS, ring_rows=ring_rows)
+    assert round(growth / MIB, 2) == 2.79

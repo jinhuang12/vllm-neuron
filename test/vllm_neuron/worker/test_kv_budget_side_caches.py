@@ -13,20 +13,24 @@ the served TP=64 configuration (``--no-enable-prefix-caching --mamba-block-size 
 
 * vLLM pool: (64 x (8192 / 128 + 4) + 1) = 4353 blocks x 131072 B x 11 = 6276120576 B
 * KDA banks: 34 layers x 64 slots x 67840 B = 147619840 B
-* side caches: 11 x 64 x (2049 x 128 + 2 x (2 x 4 x 128)) x 2 B = 372162560 B
-* footprint: 6795902976 B = 6.3292 GiB (6.0 GiB = 6423740416 B without the side caches)
-
-The same numbers are in the kvseg-footprint gate report's budget table (``kvseg_budget.json``).
+* side caches: 11 x (64 + 1) x (2049 x 128 + 2 x (2 x 4 x 128)) x 2 B = 377977600 B,
+  one set per request slot and one for the scratch slot (``SCRATCH_SLOTS``) the
+  runner allocates past them
+* footprint: 6801718016 B = 6.3346 GiB (6.0 GiB = 6423740416 B without the side caches)
 
 Run with ``VLLM_NEURON_CPU_MODE=1`` (``test/conftest.py`` pins it).
 """
 
 from __future__ import annotations
 
+import types
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from test.vllm_neuron.worker import test_kv_budget_glm53f as kv
+from vllm_neuron.vllm.worker.glm5next_state_banks import SCRATCH_SLOTS
 
 GIB = 1024**3
 
@@ -50,11 +54,14 @@ def hand_need_bytes(*, seqs: int, length: int, gate_line: bool) -> int:
 
 
 def hand_side_cache_bytes(*, seqs: int, length: int) -> int:
-    """``pool_cache`` + ``tail`` + ``pad_tail`` of every DSA layer, by hand."""
+    """``pool_cache`` + ``tail`` + ``pad_tail`` of every DSA layer, by hand.
+
+    One set per request slot (``seqs``) and one per scratch slot (``SCRATCH_SLOTS``).
+    """
     pool_rows = length // INDEX_KPOOL + 1
     ring_rows = 2 * INDEX_KPOOL
     per_slot = (pool_rows + 2 * ring_rows) * INDEX_HEAD_DIM * BF16_BYTES
-    return kv.MLA_LAYERS * seqs * per_slot
+    return kv.MLA_LAYERS * (seqs + SCRATCH_SLOTS) * per_slot
 
 
 def hand_footprint_bytes(*, seqs: int, length: int, gate_line: bool) -> int:
@@ -86,11 +93,11 @@ def _clear_knobs(monkeypatch) -> None:
 
 
 def test_the_hand_computation_at_64_by_8k() -> None:
-    """The numbers in the module docstring and in kvseg_budget.json."""
+    """The numbers in the module docstring."""
     assert hand_need_bytes(seqs=64, length=8192, gate_line=True) == 6276120576
-    assert hand_side_cache_bytes(seqs=64, length=8192) == 372162560
-    assert round(hand_side_cache_bytes(seqs=64, length=8192) / GIB, 4) == 0.3466
-    assert hand_footprint_bytes(seqs=64, length=8192, gate_line=True) == 6795902976
+    assert hand_side_cache_bytes(seqs=64, length=8192) == 377977600
+    assert round(hand_side_cache_bytes(seqs=64, length=8192) / GIB, 4) == 0.352
+    assert hand_footprint_bytes(seqs=64, length=8192, gate_line=True) == 6801718016
 
 
 def test_the_footprint_at_64_by_8k_includes_the_side_caches_and_pad_tail() -> None:
@@ -106,7 +113,7 @@ def test_the_footprint_at_64_by_8k_includes_the_side_caches_and_pad_tail() -> No
     assert need == hand_need_bytes(seqs=64, length=8192, gate_line=True)
     assert kv_tensors == 6423740416
     assert footprint == hand_footprint_bytes(seqs=64, length=8192, gate_line=True)
-    assert footprint - kv_tensors == 372162560
+    assert footprint - kv_tensors == 377977600
 
 
 def test_the_side_cache_price_is_the_runners_own_allocation() -> None:
@@ -136,7 +143,7 @@ def test_the_side_cache_price_is_the_runners_own_allocation() -> None:
         index_kpool=int(text_config.index_kpool),
         index_head_dim=int(text_config.index_head_dim),
         max_seq_len=length,
-        request_slots=seqs,
+        request_slots=seqs + SCRATCH_SLOTS,
     )
     sparse = [entry for entry in allocated if entry]
 
@@ -145,11 +152,80 @@ def test_the_side_cache_price_is_the_runners_own_allocation() -> None:
         ("pad_tail", "pool_cache", "tail")
     }
     assert indexer_side_cache_bytes(
-        specs, text_config, max_seq_len=length, request_slots=seqs
+        specs, text_config, max_seq_len=length, request_slots=seqs + SCRATCH_SLOTS
     ) == sum(tensor.nbytes for entry in sparse for tensor in entry.values())
     assert indexer_side_cache_bytes(
-        specs, text_config, max_seq_len=length, request_slots=seqs
+        specs, text_config, max_seq_len=length, request_slots=seqs + SCRATCH_SLOTS
     ) == hand_side_cache_bytes(seqs=seqs, length=length)
+
+
+def _live_side_cache_bytes(runner) -> int:
+    """The nbytes of the set ``NeuronModelRunner._glm5next_live_side_caches`` allocates.
+
+    The class's own allocation path, bound to the fake runner, over one bank per KV
+    spec; the latent banks are on the meta device, so the set takes no memory.
+    """
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
+
+    banks = [
+        {"family": "linear_attn", "state_slots": runner.max_num_reqs}
+        if isinstance(spec, MambaSpec)
+        else {
+            "family": "self_attn",
+            "latent_cache": torch.empty((0,), dtype=spec.dtype, device="meta"),
+        }
+        for spec in runner.get_kv_cache_spec().values()
+    ]
+    for name in (
+        "_glm5next_indexer_context",
+        "_glm5next_request_slot_capacity",
+        "_glm5next_state_slot_count",
+        "_glm5next_speculative_tokens",
+    ):
+        setattr(runner, name, types.MethodType(getattr(NeuronModelRunner, name), runner))
+    runner._glm5next_side_caches = NeuronModelRunner._glm5next_side_caches
+    runner._glm5next_indexer_ring_rows = NeuronModelRunner._glm5next_indexer_ring_rows
+    live = NeuronModelRunner._glm5next_live_side_caches(runner, banks)
+    return sum(tensor.nbytes for entry in live for tensor in entry.values())
+
+
+@pytest.mark.parametrize(
+    "seqs,length,draft_tokens,slot_bytes",
+    [
+        # One sequence of 4096 tokens drafting 3 mtp tokens: 12 sparse layers (the
+        # draft head's included), rings 8 rows deep;
+        # per slot 12 x (1025 x 128 + 2 x (2 x 8 x 128)) x 2 B.
+        (1, 4096, 3, 3247104),
+        # 64 sequences of 8192 tokens, no draft: 11 sparse layers, rings 4 rows deep;
+        # per slot 11 x (2049 x 128 + 2 x (2 x 4 x 128)) x 2 B.
+        (64, 8192, 0, 5815040),
+    ],
+)
+def test_the_price_is_every_slot_the_runners_live_set_allocates(
+    seqs, length, draft_tokens, slot_bytes, monkeypatch
+) -> None:
+    """The fit check prices the runner's live side caches, the scratch slot included."""
+    from vllm.config import SpeculativeConfig
+
+    from vllm_neuron.model.glm5_next import mtp
+    from vllm_neuron.vllm.worker.neuron_worker import _indexer_side_cache_bytes
+
+    monkeypatch.setenv(mtp.SHADOW_DRAFT_ENV, str(draft_tokens))
+    worker = _worker(seqs=seqs, length=length)
+    runner = worker.model_runner
+    if draft_tokens:
+        spec = SimpleNamespace(method="mtp", num_speculative_tokens=draft_tokens)
+        spec.use_eagle = lambda: SpeculativeConfig.use_eagle(spec)
+        runner.speculative_config = spec
+        runner.is_mtp_spec = True
+        runner.drafter = SimpleNamespace(num_speculative_tokens=draft_tokens)
+
+    priced = _indexer_side_cache_bytes(worker.vllm_config, runner)
+
+    assert priced == _live_side_cache_bytes(runner)
+    assert priced == (seqs + SCRATCH_SLOTS) * slot_bytes
 
 
 def test_a_model_with_no_indexer_prices_no_side_caches() -> None:
@@ -177,7 +253,7 @@ def test_a_point_that_fits_only_without_side_caches_is_refused_naming_the_shortf
     """64 x 8k against a budget between the KV tensors and the footprint: refused.
 
     The graph-need override puts the budget midway between the KV tensors
-    (5.983 GiB) and the footprint with the side caches (6.329 GiB). Before the
+    (5.983 GiB) and the footprint with the side caches (6.335 GiB). Before the
     budget change the 5938748 residency put it there by itself (6.04 GiB, the
     per-physical-core bound, short by 0.289 GiB); that bound is gone.
     """
@@ -203,7 +279,7 @@ def test_a_point_that_fits_only_without_side_caches_is_refused_naming_the_shortf
 
     message = str(refusal.value)
     assert f"{footprint / GIB:.3f} GiB" in message
-    assert f"side caches {372162560 / GIB:.3f} GiB" in message
+    assert f"side caches {377977600 / GIB:.3f} GiB" in message
     assert f"short by {(footprint - budget) / GIB:.3f} GiB" in message
     assert "VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB override" in message
 
@@ -243,13 +319,13 @@ def test_the_0a08ff4_residency_admits_64_by_8k_with_the_side_caches(monkeypatch)
     "seqs,length,gate_line,before,after",
     [
         # bs=1 recipe: max_model_len 4096, prefix caching on (no --mamba-block-size).
-        (1, 4096, False, 234435072, 237366528),
-        (64, 8192, True, 6423740416, 6795902976),
-        (119, 4096, True, 6452559360, 6801402624),
+        (1, 4096, False, 234435072, 240297984),
+        (64, 8192, True, 6423740416, 6801718016),
+        (119, 4096, True, 6452559360, 6804334080),
     ],
 )
 def test_the_budget_table_points(seqs, length, gate_line, before, after) -> None:
-    """The (bs, ctx) rows of kvseg_budget.json: 0a08ff4 footprint and this footprint."""
+    """Per (bs, ctx) point: the KV tensors alone and the footprint with the side caches."""
     from vllm_neuron.vllm.worker.neuron_model_runner import kv_cache_allocations
 
     worker = _worker(seqs=seqs, length=length, gate_line=gate_line)

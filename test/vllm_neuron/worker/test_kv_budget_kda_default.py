@@ -7,8 +7,8 @@ group keeps the 128-token attention block, and vLLM's mamba "none" mode reserves
 ``cdiv(max_model_len, 128)`` of them per request in every one of the four KDA
 groups. The runner keeps the KDA state in a bank addressed by request slot, so
 those blocks hold no data, and it refuses a prefix-cache hit on a recurrent stack
-(``kv_spec_patch.recurrent_spec_block_size``). At 1 x 1M that is 55.69 GiB per rank
-for 11.70 GiB of real need.
+(``kv_spec_patch.recurrent_spec_block_size``). At 1 x 1M that is 56.38 GiB per rank
+for 12.38 GiB of real need.
 
 ``NeuronPlatform.check_and_update_config`` therefore sets, for this architecture on
 the hybrid KV cache:
@@ -37,9 +37,9 @@ from vllm_neuron.vllm.platform import NeuronPlatform
 
 GIB = 1024**3
 ONE_M = 1024 * 1024
-#: The 1 x 1M point before and after the default (``kvbudget-logs/derived.json``).
-ONE_M_PC_ON_FOOTPRINT_GIB = 55.69
-ONE_M_ONE_BLOCK_FOOTPRINT_GIB = 11.70
+#: The worker's footprint at 1 x 1M before and after the default.
+ONE_M_PC_ON_FOOTPRINT_GIB = 56.38
+ONE_M_ONE_BLOCK_FOOTPRINT_GIB = 12.38
 
 DEFAULTS_MARKER = "Glm5NextForConditionalGeneration KV cache defaults"
 PC_FLAG_ON = "--enable-prefix-caching"
@@ -214,7 +214,7 @@ def _kda_slot_bytes(worker) -> list[int]:
 def test_one_sequence_at_1m_needs_its_attention_pages_plus_one_kda_state_per_layer(
     model_specs, monkeypatch
 ) -> None:
-    """The default's 1 x 1M point: 11.70 GiB per rank, from 55.69 GiB.
+    """The default's 1 x 1M point: 12.38 GiB per rank, from 56.38 GiB.
 
     Pool: one latent layer per pool tensor (11), each holding the request's
     ``cdiv(L, 128)`` attention pages, one block per KDA group (4) and the null
@@ -264,6 +264,7 @@ def test_prefix_caching_on_names_both_footprints_in_one_line(
     one_block_bytes = one_block._kv_cache_footprint_bytes(one_block._kv_cache_need_bytes(log=False))
     cfg, _ = _resolve(monkeypatch, [PC_FLAG_ON], max_model_len=ONE_M)
     worker = _priced_worker(model_specs, cfg, seqs=1, length=ONE_M)
+    pc_on_bytes = worker._kv_cache_footprint_bytes(worker._kv_cache_need_bytes(log=False))
 
     with caplog.at_level(logging.INFO), pytest.raises(RuntimeError):
         worker.determine_available_memory()
@@ -273,7 +274,8 @@ def test_prefix_caching_on_names_both_footprints_in_one_line(
     line = lines[0]
     assert "4 recurrent (KDA) group(s)" in line
     assert "8192 block(s) per request in each" in line
-    assert f"footprint {ONE_M_PC_ON_FOOTPRINT_GIB:.2f}" in line
+    assert f"footprint {pc_on_bytes / GIB:.3f} GiB" in line
+    assert round(pc_on_bytes / GIB, 2) == ONE_M_PC_ON_FOOTPRINT_GIB
     assert f"it is {one_block_bytes / GIB:.3f} GiB" in line
     assert round(one_block_bytes / GIB, 2) == ONE_M_ONE_BLOCK_FOOTPRINT_GIB
     assert "--no-enable-prefix-caching" in line

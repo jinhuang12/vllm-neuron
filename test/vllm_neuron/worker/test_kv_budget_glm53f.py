@@ -329,9 +329,11 @@ def served_kv_cache_config(runner, worker):
 def side_cache_bytes(text_config, *, max_num_seqs: int, max_model_len: int) -> int:
     """Bytes of the indexer side caches the runner allocates, read off its own builder.
 
-    The builder allocates on the latent bank's device, so a meta latent bank sizes
-    them without touching memory.
+    One set per request slot (``max_num_seqs``) and one per scratch slot
+    (``SCRATCH_SLOTS``). The builder allocates on the latent bank's device, so a meta
+    latent bank sizes them without touching memory.
     """
+    from vllm_neuron.vllm.worker.glm5next_state_banks import SCRATCH_SLOTS
     from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
 
     latent = torch.empty((0,), dtype=torch.bfloat16, device="meta")
@@ -343,7 +345,7 @@ def side_cache_bytes(text_config, *, max_num_seqs: int, max_model_len: int) -> i
         index_kpool=int(text_config.index_kpool),
         index_head_dim=int(text_config.index_head_dim),
         max_seq_len=max_model_len,
-        request_slots=max_num_seqs,
+        request_slots=max_num_seqs + SCRATCH_SLOTS,
     )
     return sum(t.nbytes for entry in side for t in entry.values())
 
@@ -571,6 +573,8 @@ def test_mla_bytes_per_token_per_layer_are_the_latent_plus_indexer_layout(served
     """1088 B per token per MLA layer: 1024 latent in the page plus 64 indexer."""
     from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
+    from vllm_neuron.vllm.worker.glm5next_state_banks import SCRATCH_SLOTS
+
     mla = [s for s in served.specs.values() if isinstance(s, MLAAttentionSpec)]
     assert len(mla) == MLA_LAYERS
     latent = {s.page_size_bytes // s.block_size for s in mla}
@@ -584,7 +588,7 @@ def test_mla_bytes_per_token_per_layer_are_the_latent_plus_indexer_layout(served
     side_longer = side_cache_bytes(
         served.text_config, max_num_seqs=1, max_model_len=2 * length
     )
-    indexer = (side_longer - side) // (MLA_LAYERS * length)
+    indexer = (side_longer - side) // ((1 + SCRATCH_SLOTS) * MLA_LAYERS * length)
 
     assert latent == {LATENT_BYTES_PER_TOKEN}
     assert indexer == INDEXER_BYTES_PER_TOKEN
