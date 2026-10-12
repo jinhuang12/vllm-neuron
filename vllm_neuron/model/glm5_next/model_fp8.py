@@ -4868,14 +4868,22 @@ class Glm5NextDSAIndexer(nn.Module):
         #    the rotation kernel takes a 2-D ``[rows, 128]``, so the view is flat
         #    for the call and restored after it. ``query_side=False`` is the decode
         #    step whose selection is a no-op: nothing reads the query or the weights.
+        #    The rotating branch keeps the statements it had before ``rotate_query``:
+        #    a compiled graph's cache key reads its FX text, node names included, so
+        #    another spelling would re-key every graph whose indexer rotates here.
         query = weights = None
         if query_side:
-            query = project(q_latent, "wq_b").reshape(
-                tokens * self.index_n_heads, self.index_head_dim
-            ).to(torch.bfloat16)
+            query = project(q_latent, "wq_b")
             if rotate_query:
-                query = dsa_hadamard128(query)
-            query = query.reshape(tokens, self.index_n_heads, self.index_head_dim)
+                query = dsa_hadamard128(
+                    query.reshape(tokens * self.index_n_heads, self.index_head_dim).to(
+                        torch.bfloat16
+                    )
+                ).reshape(tokens, self.index_n_heads, self.index_head_dim)
+            else:
+                query = query.reshape(
+                    tokens, self.index_n_heads, self.index_head_dim
+                ).to(torch.bfloat16)
 
         # 2. The key, then its LayerNorm. The cast to bf16 happens before the norm
         #    so the norm's own cast-back lands on bf16, which is upstream's order:
