@@ -39,10 +39,12 @@ call, ``fn``'s ``[M*S, Hp]`` slice is loaded with (row, stream) on the partition
 transposed on the tensor engine, 128 hidden values at a time, into the first ``M``
 columns of the SBUF tile ``mov[128 (h), Hp/128, S, M + tile]``. Then, per token tile:
 
-1. The tile's ``[rows*S, Hp]`` streams are loaded with (token, stream) on the partitions
-   -- every DMA row is one contiguous ``Hp`` run -- and transposed into the last
-   columns of ``mov``: for each contraction block ``(hb, s)`` the ``M`` columns of
-   ``fn^T`` followed by the tile's columns of ``residual^T``.
+1. The tile's streams are loaded with the token on the partition, ``R[rows, S, Hp]``
+   -- every DMA row is ``S`` contiguous ``Hp`` runs -- and each ``[rows, 128]`` block
+   ``R[:, s, hb]`` is transposed into the last columns of ``mov``: for each contraction
+   block ``(hb, s)`` the ``M`` columns of ``fn^T`` followed by the tile's columns of
+   ``residual^T``. The copies out of PSUM alternate between the scalar and the vector
+   engine.
 2. ``acc[rows, M + rows] += mov[:, hb, s, M:]^T @ mov[:, hb, s, :]`` over the
    ``S * Hp/128`` blocks: columns ``:M`` are this program's partial ``mixes``, the
    ``[rows, rows]`` rest is the streams' Gram block, whose diagonal is the square sum.
@@ -54,17 +56,16 @@ columns of the SBUF tile ``mov[128 (h), Hp/128, S, M + tile]``. Then, per token 
    number, so the two programs agree bit for bit.
 4. The RMS scale, the gates and the softmax run with tokens on the partitions, in the
    torch expression's operation order. Program 0 stores ``post`` and ``comb_start``.
-5. The collapse runs with hidden on the partitions, on the transposed streams already
-   in ``mov``: ``pre`` is broadcast to all 128 partitions by a ones matmul (1.0 * a plus
-   zeros, exact in fp32), each product is one fp32 multiply and the four streams are
-   summed in fp32 and rounded once to the streams' dtype, as the torch expression does.
-   The result goes back through the tensor engine to token rows and is stored as this
-   program's hidden half.
+5. The collapse runs on ``R``, tokens on the partitions, with ``pre[t, s]`` a
+   per-partition scalar: ``acc = R[:, 0] * pre_0``, then ``acc = R[:, s] * pre_s + acc``
+   for ``s = 1..S-1``, each product one fp32 multiply and each sum one fp32 add, the
+   last rounded once to the streams' dtype, as the torch expression does. The result
+   rows are this program's hidden half of ``layer_input``, stored as they are.
 6. The norm (:func:`mhc_pre_norm_kernel` only): the square sum of the rounded
-   ``layer_input`` is the diagonal of its Gram block (step 2's method, on step 5's
-   hidden-major result), the two programs' halves are swapped and added as in step 3,
-   and each row is scaled by ``rsqrt(sum * (1/H) + norm_eps)`` and then by the gain in
-   one fp32 instruction, in ``_rms_norm``'s operation order, and rounded once.
+   ``layer_input`` is the diagonal of its Gram block (step 2's method, on step 5's rows
+   transposed to hidden-major), the two programs' halves are swapped and added as in
+   step 3, and each row is scaled by ``rsqrt(sum * (1/H) + norm_eps)`` and then by the
+   gain in one fp32 instruction, in ``_rms_norm``'s operation order, and rounded once.
 
 Both LNC2 cores: yes. Each program does half the contraction (step 2), half the
 transposes, half the collapse and half the norm; steps 3-4 are ``rows x (M + rows)``
@@ -94,9 +95,6 @@ _P = nl.tile_size.pmax
 #: Tokens per tile: a tile's ``residual^T`` block is the stationary operand of step 2,
 #: and steps 4-6 hold the tile's tokens on the partitions.
 MHC_PRE_TOKEN_TILE = min(nl.tile_size.gemm_stationary_fmax, _P)
-
-#: Tokens per transpose input: ``S * 32 = 128`` partitions at ``S = 4``.
-_CHUNK = 32
 
 #: Hidden blocks per PSUM tile of transposes (at most one 2 KiB bank of bf16).
 _GROUP = 8
@@ -162,6 +160,35 @@ def _rstd(sqrsum, rows, inv_count, eps):
     return rstd
 
 
+def _transpose_into(dst, rows_t, col0, rows_n, nhb, group):
+    """``dst[:, hb, s, col0 + t] = rows_t[t, s, hb*128 + p]`` on partition ``p``.
+
+    ``rows_t`` is ``[rows_n, S, nhb*128]`` with the token on the partition. Each
+    ``[rows_n, 128]`` block goes through the tensor engine (exact), ``group`` blocks per
+    PSUM tile, and each tile's copy into ``dst`` alternates between the scalar and the
+    vector engine. A block's PSUM columns are padded to an even count, so every block
+    starts 4-byte aligned (a tensor-engine write rule) for an odd ``rows_n`` too.
+    """
+    streams = rows_t.shape[1]
+    padded = rows_n + rows_n % 2
+    turn = 0
+    for s in range(streams):
+        for g0 in range(0, nhb, group):
+            gn = min(group, nhb - g0)
+            flipped = nl.ndarray((_P, gn, padded), dtype=rows_t.dtype, buffer=nl.psum)
+            for j in range(gn):
+                hb = g0 + j
+                nisa.nc_transpose(dst=flipped[:, j, 0:rows_n],
+                                  data=rows_t[:, s, hb * _P:(hb + 1) * _P])
+            target = dst[:, g0:g0 + gn, s, col0:col0 + rows_n]
+            if turn % 2 == 0:
+                nisa.activation(dst=target, op=nl.copy, data=flipped[:, :, 0:rows_n])
+            else:
+                nisa.tensor_copy(dst=target, src=flipped[:, :, 0:rows_n],
+                                 engine=nisa.engine.vector)
+            turn += 1
+
+
 def _mhc_pre(residual, fn, hc_scale, hc_base, norm_gain, rms_eps, hc_eps, post_mult,
              norm_eps):
     """The body of both kernels; ``norm_gain`` None skips step 6 (see the module doc)."""
@@ -172,7 +199,7 @@ def _mhc_pre(residual, fn, hc_scale, hc_base, norm_gain, rms_eps, hc_eps, post_m
     kernel_assert(tokens >= 1, "T >= 1")
     kernel_assert(mix == 2 * streams + streams * streams, "fn rows are 2S + S*S")
     kernel_assert(width == streams * hidden, "fn columns are S*H")
-    kernel_assert(mix * streams <= _P and streams * _CHUNK <= _P, "S <= 4")
+    kernel_assert(mix * streams <= _P, "S <= 4")
     kernel_assert(programs in (1, 2), "one or two programs")
     kernel_assert(hidden % (_P * programs) == 0, "H splits into 128-blocks per program")
     if norm_gain is not None:
@@ -214,7 +241,7 @@ def _mhc_pre(residual, fn, hc_scale, hc_base, norm_gain, rms_eps, hc_eps, post_m
             src=flipped.reshape((_P, gn, mix, streams)).permute((0, 1, 3, 2)))
 
     ident = nl.shared_identity_matrix(n=_P, dtype=nl.float32)
-    ones = nl.ndarray((_P, _P), dtype=nl.float32, buffer=nl.sbuf)
+    ones = nl.ndarray((1, _P), dtype=nl.float32, buffer=nl.sbuf)
     nisa.memset(dst=ones, value=1.0)
     # scale[head(m)] and base[m] as rows on partition 0, broadcast to a tile's tokens by
     # a K=1 ones matmul (1.0 * a, exact).
@@ -243,25 +270,13 @@ def _mhc_pre(residual, fn, hc_scale, hc_base, norm_gain, rms_eps, hc_eps, post_m
         rows_n = min(MHC_PRE_TOKEN_TILE, tokens - t0)
         cols = mix + rows_n
 
-        # ---- 1. This tile's residual^T, hidden on the partitions. ---------- #
-        for c0 in range(0, rows_n, _CHUNK):
-            cn = min(_CHUNK, rows_n - c0)
-            rows = streams * cn
-            # Streams rows (t, s) on partition t*S + s: one stride, H.
-            r_rows = nl.ndarray((rows, hp), dtype=residual.dtype, buffer=nl.sbuf)
-            nisa.dma_copy(dst=r_rows,
-                          src=residual.ap(pattern=[[hidden, rows], [1, hp]],
-                                          offset=(t0 + c0) * streams * hidden + h0))
-            for g0 in range(0, nhb, r_group):
-                gn = min(r_group, nhb - g0)
-                flipped = nl.ndarray((_P, gn, rows), dtype=residual.dtype, buffer=nl.psum)
-                for j in range(gn):
-                    hb = g0 + j
-                    nisa.nc_transpose(dst=flipped[:, j, :],
-                                      data=r_rows[:, hb * _P:(hb + 1) * _P])
-                nisa.tensor_copy(
-                    dst=mov[:, g0:g0 + gn, :, mix + c0:mix + c0 + cn],
-                    src=flipped.reshape((_P, gn, cn, streams)).permute((0, 1, 3, 2)))
+        # ---- 1. This tile's streams, token rows, and their transposes. ------- #
+        streams_t = nl.ndarray((rows_n, streams, hp), dtype=residual.dtype, buffer=nl.sbuf)
+        nisa.dma_copy(dst=streams_t,
+                      src=residual.ap(pattern=[[streams * hidden, rows_n], [hidden, streams],
+                                               [1, hp]],
+                                      offset=t0 * streams * hidden + h0))
+        _transpose_into(mov, streams_t, mix, rows_n, nhb, r_group)
 
         # ---- 2. Partial mixes and the Gram block over this program's K. ---- #
         acc = nl.ndarray((rows_n, cols), dtype=nl.float32, buffer=nl.psum)
@@ -326,46 +341,32 @@ def _mhc_pre(residual, fn, hc_scale, hc_base, norm_gain, rms_eps, hc_eps, post_m
                                                    [1, streams]], offset=t0 * ss),
                           src=comb)
 
-        # ---- 5. Collapse with hidden on the partitions. -------------------- #
-        # spread_pre[p, s, t] = pre[t, s] on every partition: ones^T @ diag(pre[:, s]).
-        eye_pre = nl.ndarray((rows_n, streams, rows_n), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(
-            dst=eye_pre,
-            data1=ident[0:rows_n, 0:rows_n].expand_dim(1).broadcast(1, streams),
-            data2=pre.expand_dim(2).broadcast(2, rows_n), op=nl.multiply)
-        pre_ps = nl.ndarray((_P, streams * rows_n), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_matmul(dst=pre_ps, stationary=ones[0:rows_n, :],
-                       moving=eye_pre.reshape((rows_n, streams * rows_n)), accumulate=False)
-        pre_all = nl.ndarray((_P, streams, rows_n), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=pre_all, src=pre_ps.reshape((_P, streams, rows_n)))
-
-        terms = nl.ndarray((_P, nhb, rows_n, streams), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(
-            dst=terms,
-            data1=mov[:, :, :, mix:cols].permute((0, 1, 3, 2)),
-            data2=pre_all.permute((0, 2, 1)).expand_dim(1).broadcast(1, nhb),
-            op=nl.multiply)
-        collapsed = nl.ndarray((_P, nhb, rows_n), dtype=residual.dtype, buffer=nl.sbuf)
-        nisa.tensor_reduce(dst=collapsed, op=nl.add, data=terms, axis=(3,))
-
+        # ---- 5. Collapse with tokens on the partitions. --------------------- #
+        acc_li = nl.ndarray((rows_n, hp), dtype=nl.float32, buffer=nl.sbuf)
         out_rows = nl.ndarray((rows_n, hp), dtype=residual.dtype, buffer=nl.sbuf)
-        for g0 in range(0, nhb, r_group):
-            gn = min(r_group, nhb - g0)
-            flipped = nl.ndarray((rows_n, gn * _P), dtype=residual.dtype, buffer=nl.psum)
-            for j in range(gn):
-                nisa.nc_transpose(dst=flipped[:, j * _P:(j + 1) * _P],
-                                  data=collapsed[:, g0 + j, :])
-            nisa.tensor_copy(dst=out_rows[:, g0 * _P:(g0 + gn) * _P], src=flipped)
+        for s_i in range(streams):
+            into = out_rows if s_i == streams - 1 else acc_li
+            if s_i == 0:
+                nisa.tensor_scalar(dst=into, data=streams_t[:, 0, :], op0=nl.multiply,
+                                   operand0=pre[:, 0:1])
+            else:
+                nisa.scalar_tensor_tensor(dst=into, data=streams_t[:, s_i, :],
+                                          op0=nl.multiply, operand0=pre[:, s_i:s_i + 1],
+                                          op1=nl.add, operand1=acc_li)
         nisa.dma_copy(dst=x_out.ap(pattern=[[hidden, rows_n], [1, hp]],
                                    offset=t0 * hidden + h0),
                       src=out_rows)
 
         # ---- 6. The FFN norm of the rounded layer_input. ------------------- #
         if norm_gain is not None:
+            collapsed = nl.ndarray((_P, nhb, 1, rows_n), dtype=residual.dtype,
+                                   buffer=nl.sbuf)
+            _transpose_into(collapsed, out_rows.reshape((rows_n, 1, hp)), 0, rows_n, nhb,
+                            r_group)
             gram = nl.ndarray((rows_n, rows_n), dtype=nl.float32, buffer=nl.psum)
             for hb in range(nhb):
-                nisa.nc_matmul(dst=gram, stationary=collapsed[:, hb, :],
-                               moving=collapsed[:, hb, :], accumulate=(hb > 0))
+                nisa.nc_matmul(dst=gram, stationary=collapsed[:, hb, 0, :],
+                               moving=collapsed[:, hb, 0, :], accumulate=(hb > 0))
             sqrsum = _swap_add(_diagonal_sum(gram, rows_n, ident), rows_n, 1, programs,
                                program)
             norm_rstd = _rstd(sqrsum, rows_n, 1.0 / float(hidden), norm_eps)
@@ -497,12 +498,12 @@ def mhc_pre_admits(residual: Tensor, fn: Tensor, hc_scale: Tensor, hc_base: Tens
         norm_gain: the ``[H]`` gain the call also asks the norm with, or None.
 
     The kernel serves any ``T >= 1`` (in tiles of :data:`MHC_PRE_TOKEN_TILE` rows),
-    streams that fit its partition layout (``S * 32 <= 128`` and ``M * S <= 128``, so
-    ``S <= 4``), ``H`` in 128-blocks per program and ``S * H`` a power of two (so ``S``
-    and ``H`` are too, and the kernel's ``* (1/K)`` and ``* (1/H)`` are the reference's
-    ``/ K`` and ``/ H``), and a bf16 or fp32 ``[H]`` norm gain, on an NKI device or the
-    simulator, when ``VLLM_NEURON_GLUE_FUSED`` selects ``mhc_pre`` for this row count and
-    phase. Anything else keeps the torch route and is counted as declined.
+    streams that fit its partition layout (``M * S <= 128``, so ``S <= 4``), ``H`` in
+    128-blocks per program and ``S * H`` a power of two (so ``S`` and ``H`` are too, and
+    the kernel's ``* (1/K)`` and ``* (1/H)`` are the reference's ``/ K`` and ``/ H``), and
+    a bf16 or fp32 ``[H]`` norm gain, on an NKI device or the simulator, when
+    ``VLLM_NEURON_GLUE_FUSED`` selects ``mhc_pre`` for this row count and phase.
+    Anything else keeps the torch route and is counted as declined.
     """
     ok = False
     if residual.dim() == 3 and fn.dim() == 2:
@@ -516,7 +517,7 @@ def mhc_pre_admits(residual: Tensor, fn: Tensor, hc_scale: Tensor, hc_base: Tens
             and hc_scale.dtype == torch.float32
             and hc_base.dtype == torch.float32
             and tokens >= 1
-            and streams >= 1 and streams * _CHUNK <= _P and mix * streams <= _P
+            and streams >= 1 and mix * streams <= _P
             and hidden % (_P * programs) == 0
             and (streams * hidden) & (streams * hidden - 1) == 0
             and tuple(fn.shape) == (mix, streams * hidden)
