@@ -254,9 +254,11 @@ DEFAULT_DEVICE_GRAPH_RESERVE_GIB = 5.0
 #: ``mhc_pre:verify`` fuses the mHC pre-mix at the speculative verify step, whose row
 #: counts the mHC sites derive from the speculative config: each decode bucket times
 #: ``1 + k`` (``functional/glue``, ``verify_rows``). A server without speculation has no
-#: verify step, so the rule changes none of its graphs. At the verify step mhc_post is
-#: not selected, so the mHC combine keeps its fp32 operands, and the KDA layer, which
-#: calls the verify step decode, keeps its torch routes. At 4 rows (batch 1, 3 drafts)
+#: verify step, so the rule changes none of its graphs. At the verify step the mHC
+#: combine still widens its operands to fp32, as on its torch route, since the
+#: default's mhc_post rules are prefill rules; and the KDA layer, which calls the verify
+#: step decode, keeps its torch routes, since the default has no kda_projections or
+#: kda_output rule. At 4 rows (batch 1, 3 drafts)
 #: the torch route runs its dots as 2-row pieces, and at the MoE feed-forward site the
 #: collapse that the router reads as a per-token loop, so the feed-forward sites' XLA
 #: before their consumer grows over the one-token step. On a TP=64 server the kernel
@@ -589,7 +591,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # DEFAULT_GLUE_FUSED_SPEC. ``all``: every kernel at every phase and row count.
     # Otherwise a comma list of rules ``kernel[:phase][@rows]``: ``kernel`` is one
     # of mhc_pre, kda_projections, kda_output, mhc_post; ``phase`` is prefill,
-    # decode or all (the default); ``rows`` is N, N-M, N- or -M (inclusive, N >= 1).
+    # decode, verify (the speculative verify step; mhc_pre and mhc_post only) or all
+    # (the default); ``rows`` is N, N-M, N- or -M (inclusive, N >= 1).
     # A call is fused when any rule selects it, and when the kernel's own shape
     # rules admit it. Read when a graph is traced; a malformed value raises
     # ValueError there. Example: ``mhc_post:prefill,mhc_pre:decode@2-64``.
