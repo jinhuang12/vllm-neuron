@@ -668,6 +668,43 @@ def _slot_expert(experts, item_experts, read, s):
     _dynamic_read(experts[:, s:s + 1], item_experts, 0, read[:, s:s + 1])
 
 
+def _loop_entry(sbm, listing, items, item_experts, offset, index):
+    """List entry ``index + offset`` of _program_list's ``listing``: ``(entry, item, expert)``.
+
+    ``index`` is a register. ``entry`` is the uint32 [1, 1] listed item;
+    ``item`` and ``expert`` are registers with the item the entry reads and
+    its expert. An entry past the list's end reads the last item, as a slot
+    does (_slot_items); its store (the listed entry itself) writes nothing.
+    """
+    # uint32: the entry indexes dynamic SBUF reads, which take an unsigned offset.
+    entry = _tile(sbm, 1, 1, nl.uint32)
+    _dynamic_read(entry, listing, items + offset, index)
+    read = _tile(sbm, 1, 1, nl.uint32)
+    nisa.tensor_scalar(dst=read, data=entry, op0=nl.minimum, operand0=items - 1)
+    item = _register(read)
+    return entry, item, _entry(sbm, item_experts, 0, item)
+
+
+def _loop_turns(turns, width):
+    """_turn_buffers' ``turns`` with PSUM banks of one device-loop trip's own (_psum_banks)."""
+    gate_up_banks, transpose_bank, down_banks = _psum_banks(width)
+    return (turns[0], turns[1], turns[2], gate_up_banks, transpose_bank, down_banks, turns[6])
+
+
+def _pairs_end(sbm, end, slots):
+    """The end of the two-entry loop, int32 [1, 1]: ``end``, less one when ``end - slots`` is odd.
+
+    Computed from the loop end alone, so every program gets the same trips (_list_end).
+    """
+    span = _tile(sbm, 1, 1, nl.int32)
+    nisa.tensor_scalar(dst=span, data=end, op0=nl.subtract, operand0=slots)
+    odd = _tile(sbm, 1, 1, nl.int32)
+    nisa.tensor_scalar(dst=odd, data=span, op0=nl.bitwise_and, operand0=1)
+    pairs_end = _tile(sbm, 1, 1, nl.int32)
+    nisa.tensor_tensor(dst=pairs_end, data1=end, data2=odd, op=nl.subtract)
+    return pairs_end
+
+
 def _zero_row0(sbm, out, row_ids):
     """Write zeros to row 0 of ``out`` [rows, H] when ``row_ids[0, 0]`` is invalid.
 
@@ -728,8 +765,10 @@ def moe_fused_fp8_kernel(hidden, weights, scales, row_ids, expert_ids, affinity,
         nprograms slots in line: each loads its chunk's expert weights, by a
         dynamic address, and gathers its rows while the previous slot
         computes, so a short list computes a chunk that it stores nowhere.
-        Entries past the slots run in one dynamic loop at the end, which every
-        program runs up to the longest program list. Every defined row has
+        Entries past the slots run in dynamic loops at the end, which every
+        program runs up to the longest program list: two entries a trip in
+        two buffers, so the second entry's weights load while the first entry
+        computes, and an odd count's last entry alone. Every defined row has
         exactly one writer. All routing decisions remain on device.
     """
     blocks, q = row_ids.shape
@@ -842,28 +881,54 @@ def moe_fused_fp8_kernel(hidden, weights, scales, row_ids, expert_ids, affinity,
         if s + 2 < slots:
             _transposed(rows[s % 2], expert_slots[(s + 2) % 6][4], turns[4])
 
-    # Entries past the slots reuse the first slot's buffers, one at a time, up
-    # to the longest program list.
-    def later(index):
-        # uint32: the entry indexes dynamic SBUF reads, which take an unsigned offset.
-        entry = _tile(sbm, 1, 1, nl.uint32)
-        _dynamic_read(entry, listing, items, index)
-        # An entry past this program's list loads the last item, as a slot does
-        # (_slot_items); its store (the listed entry itself) writes nothing.
-        read = _tile(sbm, 1, 1, nl.uint32)
-        nisa.tensor_scalar(dst=read, data=entry, op0=nl.minimum, operand0=items - 1)
-        item = _register(read)
-        expert = _entry(sbm, item_experts, 0, item)
-        slot = expert_slots[0]
-        gate_up_banks, transpose_bank, down_banks = _psum_banks(width)
-        loop_turns = (turns[0], turns[1], turns[2], gate_up_banks, transpose_bank, down_banks,
-                      turns[6])
-        _load_expert(weights, scales, expert, slot)
+    # Entries past the slots run two a trip, in two of the slots' buffers, the
+    # one the last slot leaves free first: both entries' weights load at the
+    # start of the trip, so the second entry's load overlaps the first entry's
+    # products. A trip loads every tile that it reads, so no read relies on
+    # the loop back-edge alone to follow its write. An odd count ends in a
+    # loop of at most one trip.
+    first, second = expert_slots[slots % 6], expert_slots[(slots + 1) % 6]
+
+    def pair(index):
+        # Entry ``index + 1``'s gate/up pairs interleave with entry ``index``'s
+        # down products, as a slot's do with the next slot's.
+        entry, item, expert = _loop_entry(sbm, listing, items, item_experts, 0, index)
+        entry_next, item_next, expert_next = _loop_entry(sbm, listing, items, item_experts, 1,
+                                                         index)
+        _load_expert(weights, scales, expert, first)
+        _load_expert(weights, scales, expert_next, second)
+        loop_turns = _loop_turns(turns, width)
         _gather_rows(compute, item, _store_bases(sbm, entry, width), rows[0], gathers[0])
-        _transposed(rows[0], slot[4], transpose_bank)
-        _gate_up(compute, slot, loop_turns, width)
-        _down(compute, slot, gathers[0], expert, loop_turns, turns[2][0], width)
-    nl.fori_loop(slots, _register(end), later)
+        _gather_rows(compute, item_next, _store_bases(sbm, entry_next, width), rows[1],
+                     gathers[1])
+        _transposed(rows[0], first[4], loop_turns[4])
+        _gate_up(compute, first, loop_turns, width)
+        _transposed(rows[1], second[4], loop_turns[4])
+        _dynamic_read(gathers[0][5], gathers[0][4], 0, expert)
+        accumulators = []
+        parts = _down_parts(first)
+        for k in range(max(ni, parts)):
+            if k < ni:
+                _gate_up_pair(compute, second, loop_turns, width, k, accumulators)
+            if k < parts:
+                _down_products(first, gathers[0], loop_turns, turns[2][0], width, k)
+        _gate_up_last(compute, second, loop_turns, accumulators)
+        _store(compute, turns[2][0], gathers[0][6])
+        _down(compute, second, gathers[1], expert_next, loop_turns, turns[2][1], width)
+
+    def last(index):
+        # The odd count's last entry, in ``first``.
+        entry, item, expert = _loop_entry(sbm, listing, items, item_experts, 0, index)
+        _load_expert(weights, scales, expert, first)
+        loop_turns = _loop_turns(turns, width)
+        _gather_rows(compute, item, _store_bases(sbm, entry, width), rows[0], gathers[0])
+        _transposed(rows[0], first[4], loop_turns[4])
+        _gate_up(compute, first, loop_turns, width)
+        _down(compute, first, gathers[0], expert, loop_turns, turns[2][0], width)
+
+    pairs_end = _pairs_end(sbm, end, slots)
+    nl.fori_loop(slots, _register(pairs_end), pair, step=2)
+    nl.fori_loop(_register(pairs_end), _register(end), last)
     sbm.close_scope()
     sbm.close_scope()
     return out
