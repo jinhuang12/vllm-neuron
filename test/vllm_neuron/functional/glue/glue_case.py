@@ -55,6 +55,10 @@ SERVED_PREFILL_BUCKETS = (1024,)
 #: (``num_batched_tokens_buckets [2048]``, the uncapped prefill line). The default glue
 #: value fuses mhc_pre and mhc_post there too (``envs.DEFAULT_GLUE_FUSED_SPEC``).
 UNCAPPED_PREFILL_CHUNK = 2048
+#: The default's six prefill rules without ``mhc_pre:verify``, written out: the value that
+#: keeps the prefill kernels and the torch route at the speculative verify step.
+PREFILL_RULES = ("mhc_pre:prefill@128,mhc_pre:prefill@1024,mhc_pre:prefill@2048,"
+                 "mhc_post:prefill@128,mhc_post:prefill@1024,mhc_post:prefill@2048")
 
 
 def served_decode_buckets() -> list[int]:

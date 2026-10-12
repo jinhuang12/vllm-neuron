@@ -231,9 +231,10 @@ def maybe_measured_float(value: str | None) -> float | None:
 DEFAULT_DEVICE_GRAPH_RESERVE_GIB = 5.0
 
 #: What ``VLLM_NEURON_GLUE_FUSED=1``, and an unset switch, selects: each fused glue
-#: kernel at the prefill row buckets where it beat its torch route, and nothing else.
+#: kernel at the prefill row buckets where it beat its torch route, and the fused mHC
+#: pre-mix at the speculative verify step (``mhc_pre:verify``). Nothing else.
 #:
-#: The buckets are the ones where the in-graph device A/B
+#: The prefill buckets are the ones where the in-graph device A/B
 #: (``test/hardware/benchmark_glue_block.py``) measured a win. It runs one
 #: GLM-5.3-Flash KDA + MoE layer per graph at one TP=64 rank's shapes on trn2, and
 #: compares each value with ``0``. Per rule:
@@ -250,23 +251,31 @@ DEFAULT_DEVICE_GRAPH_RESERVE_GIB = 5.0
 #:   2048-row chunk of an uncapped prefill, measured together (not each alone),
 #:   faster in each repeat.
 #:
-#: ``mhc_pre:verify`` is not in the default; add it to the six rules above to select
-#: it. It fuses the mHC pre-mix at the speculative verify step, whose row counts the
-#: mHC sites derive from the speculative config: each decode bucket times ``1 + k``
-#: (``functional/glue``, ``verify_rows``). At 4 rows (batch 1, 3 drafts) the torch
-#: route runs its dots as 2-row pieces, and at the MoE feed-forward site the collapse
-#: that the router reads as a per-token loop, so the feed-forward sites' XLA before
-#: their consumer grows over the one-token step. On a TP=64 server the kernel made
-#: that verify step's device compute shorter at the 2048-token context bucket (the
+#: ``mhc_pre:verify`` fuses the mHC pre-mix at the speculative verify step, whose row
+#: counts the mHC sites derive from the speculative config: each decode bucket times
+#: ``1 + k`` (``functional/glue``, ``verify_rows``). A server without speculation has no
+#: verify step, so the rule changes none of its graphs. At the verify step mhc_post is
+#: not selected, so the mHC combine keeps its fp32 operands, and the KDA layer, which
+#: calls the verify step decode, keeps its torch routes. At 4 rows (batch 1, 3 drafts)
+#: the torch route runs its dots as 2-row pieces, and at the MoE feed-forward site the
+#: collapse that the router reads as a per-token loop, so the feed-forward sites' XLA
+#: before their consumer grows over the one-token step. On a TP=64 server the kernel
+#: made that verify step's device compute shorter at the 2048-token context bucket (the
 #: 4096-token bucket was not measured).
-#: It is faster, but it changed answers. On a trn2 TP=64 server of GLM-5.3-Flash at
-#: batch 1 with 3 drafts, against the same server without speculation, the rule lost
-#: answers that the server without speculation got right; without the rule (this
-#: default) the speculative server lost none. So the default keeps the answers and
-#: gives up the time per token that the rule saves. Under the rule a speculative
-#: server's one-row-per-request decode graph (the first decode step, a mixed step) of
-#: ``B * (1 + k)`` requests takes the verify route too: its row count is a verify
-#: step's, and an mHC site cannot tell the two apart.
+#:
+#: It is faster, and it changes answers. On a TP=64 server of GLM-5.3-Flash at batch 1
+#: with 3 drafts, with the synchronous drafter and with the asynchronous one, the rule
+#: shortened the inter-token latency and got wrong some benchmark answers that the same
+#: server without the rule got right. The default takes the time per token. To keep
+#: those answers instead, set the switch to the six prefill rules above without
+#: ``mhc_pre:verify``:
+#: ``mhc_pre:prefill@128,mhc_pre:prefill@1024,mhc_pre:prefill@2048,mhc_post:prefill@128,mhc_post:prefill@1024,mhc_post:prefill@2048``.
+#: The verify step then takes its torch route, and the prefill kernels stay. ``0``
+#: turns every fused glue kernel off.
+#:
+#: With the rule a speculative server's one-row-per-request decode graph (the first
+#: decode step, a mixed step) of ``B * (1 + k)`` requests takes the verify route too: its
+#: row count is a verify step's, and an mHC site cannot tell the two apart.
 #:
 #: Two loads of one graph do not time the same, so a gain inside the spread between
 #: two loads is not a win. kda_projections was faster at 128 rows by less than that
@@ -274,16 +283,16 @@ DEFAULT_DEVICE_GRAPH_RESERVE_GIB = 5.0
 #: all-reduces, so it is not in the default. kda_output was slower at 128 rows. No
 #: kernel is selected at decode (one row per request): on a TP=64 server, ``all``
 #: made the batch-1 decode step longer, while the single-rank benchmark (no
-#: tensor-parallel collectives) measured it shorter. No kernel is selected at the
-#: verify step either. So every decode and verify graph under ``1`` is the graph ``0``
-#: traces.
+#: tensor-parallel collectives) measured it shorter. So every decode graph under ``1``,
+#: except such a mixed step, is the graph ``0`` traces.
 #:
 #: Measure a bucket before adding it, on a device lease, with
 #: ``python test/hardware/benchmark_glue_block.py --output <json> --cases
 #: kda:prefill:<rows> --variants off aa=0 <kernel> default``.
 DEFAULT_GLUE_FUSED_SPEC = (
     "mhc_pre:prefill@128,mhc_pre:prefill@1024,mhc_pre:prefill@2048,"
-    "mhc_post:prefill@128,mhc_post:prefill@1024,mhc_post:prefill@2048")
+    "mhc_post:prefill@128,mhc_post:prefill@1024,mhc_post:prefill@2048,"
+    "mhc_pre:verify")
 
 
 environment_variables: dict[str, Callable[[], Any]] = {

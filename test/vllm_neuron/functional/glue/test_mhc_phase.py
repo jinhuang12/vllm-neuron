@@ -22,7 +22,6 @@ from vllm.config import VllmConfig, set_current_vllm_config
 
 from test.vllm_neuron.functional.glue import glue_case
 from test.vllm_neuron.functional.glue import test_mhc_pre as pre_case
-from vllm_neuron import envs
 from vllm_neuron.functional import glue
 from vllm_neuron.functional.glue import mhc_pre
 from vllm_neuron.functional.mhc import hyper_connection as combine
@@ -190,28 +189,32 @@ def test_the_verify_step_takes_the_fused_mhc_pre(monkeypatch):
     assert _routes(site, cfg, 1, monkeypatch) == ((0, 1), torch.float32)
 
 
-def test_under_the_default_the_verify_step_keeps_the_torch_route(monkeypatch):
+def test_under_the_default_the_verify_step_takes_the_fused_mhc_pre(monkeypatch):
     """The switch unset (``1``), bs=1 with 3 drafts: the layer calls the 4-row call the
-    verify step, and it keeps the torch route (the torch mhc_pre and the fp32 combine), as
-    the one-row decode call does: the default fuses no verify step."""
+    verify step, and it runs the fused mhc_pre and the fp32 combine (mhc_post is not
+    selected there); the one-row decode call keeps the torch route, and a prefill chunk
+    takes both fused kernels."""
     monkeypatch.delenv(glue.GLUE_FUSED_ENV, raising=False)
     monkeypatch.delenv(mtp.SHADOW_DRAFT_ENV, raising=False)
     with _speculative(3):
         site, cfg = _site(_neuron_config(1))
     assert site._glue_phase(4) == "verify"
-    assert _routes(site, cfg, 4, monkeypatch) == ((0, 1), torch.float32)
+    assert _routes(site, cfg, 4, monkeypatch) == ((1, 0), torch.float32)
     assert _routes(site, cfg, 1, monkeypatch) == ((0, 1), torch.float32)
+    chunk = glue_case.SERVED_PREFILL_BUCKETS[0]
+    assert _routes(site, cfg, chunk, monkeypatch) == ((1, 0), torch.bfloat16)
 
 
-def test_the_opt_in_verify_value_fuses_mhc_pre_at_the_verify_step(monkeypatch):
-    """The default's rules and ``mhc_pre:verify``, bs=1 with 3 drafts: the 4-row verify
-    call runs the fused mhc_pre and the fp32 combine; the one-row decode call keeps the
-    torch route, and a prefill chunk takes the default's routes."""
-    monkeypatch.setenv(glue.GLUE_FUSED_ENV, f"{envs.DEFAULT_GLUE_FUSED_SPEC},mhc_pre:verify")
+def test_the_prefill_rules_keep_the_torch_route_at_the_verify_step(monkeypatch):
+    """The default's six prefill rules without ``mhc_pre:verify``, bs=1 with 3 drafts:
+    the 4-row verify call keeps the torch route (the torch mhc_pre and the fp32 combine),
+    as the one-row decode call does, and a prefill chunk takes both fused kernels."""
+    monkeypatch.setenv(glue.GLUE_FUSED_ENV, glue_case.PREFILL_RULES)
     monkeypatch.delenv(mtp.SHADOW_DRAFT_ENV, raising=False)
     with _speculative(3):
         site, cfg = _site(_neuron_config(1))
-    assert _routes(site, cfg, 4, monkeypatch) == ((1, 0), torch.float32)
+    assert site._glue_phase(4) == "verify"
+    assert _routes(site, cfg, 4, monkeypatch) == ((0, 1), torch.float32)
     assert _routes(site, cfg, 1, monkeypatch) == ((0, 1), torch.float32)
     chunk = glue_case.SERVED_PREFILL_BUCKETS[0]
     assert _routes(site, cfg, chunk, monkeypatch) == ((1, 0), torch.bfloat16)
