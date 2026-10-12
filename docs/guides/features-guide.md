@@ -174,6 +174,11 @@ that share a prompt prefix automatically reuse the cached KV.
 To disable it, pass `--no-enable-prefix-caching` (CLI) or
 `enable_prefix_caching=False` (`LLM` constructor).
 
+GLM-5.3-Flash is the exception. Prefix caching is off by default for it, and
+`--enable-prefix-caching` is refused at startup. The runner keeps each request's
+KDA recurrent state and DSA indexer side caches per request slot, not per KV
+block, and does not restore them for a cached prefix.
+
 ### Sizing the KV cache
 
 Prefix caching only helps when there are enough KV cache blocks to retain
