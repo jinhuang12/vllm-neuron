@@ -283,7 +283,9 @@ def init_one_rank_world() -> None:
     ports = []
     for _ in range(2):
         with socket.socket() as sock:
-            sock.bind(("127.0.0.1", 0))
+            # torch's TCPStore binds every address, so probe every address: a port
+            # another process holds on the host address is free on loopback alone.
+            sock.bind(("", 0))
             ports.append(sock.getsockname()[1])
     os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(ports[0]),
                       NEURON_RT_ROOT_COMM_ID=f"127.0.0.1:{ports[1]}")
