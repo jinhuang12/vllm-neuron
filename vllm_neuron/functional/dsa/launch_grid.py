@@ -7,7 +7,7 @@ worker starts, so the setting is a property of the process. These kernel seams i
 says they may:
 
 - ``dsa``: the decode kernels (``decode_batch``, ``decode_select``, ``decode_trow``),
-  ``kpool_hadamard``, ``causal_bound`` and ``score_gemm``;
+  ``kpool_hadamard``, ``causal_bound``, ``index_expand`` and ``score_gemm``;
 - ``kda``: ``chunked_recurrence`` (the prefill chunk kernels), ``depthwise_conv1d`` and
   ``fused_decode``;
 - ``attention``: ``mla_decode``, ``mla_dense_window`` and ``mla_sparse``;
