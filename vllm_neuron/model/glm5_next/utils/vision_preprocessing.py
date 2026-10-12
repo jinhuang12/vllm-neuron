@@ -61,6 +61,13 @@ from vllm.multimodal.processing import (
 #: below can say what to install; ``requirements/core.txt`` is where the floor is enforced.
 GLM5_NEXT_TRANSFORMERS_FLOOR = "5.16.1"
 
+#: The refusal a video content part gets. This bridge offers images only (``get_supported_mm_limits``), and
+#: vLLM's own answer, "At most 0 video(s) may be provided in one prompt.", names neither the reason nor the fix.
+VIDEO_INPUT_REFUSAL = (
+    "This server serves image input only: GLM-5.3-Flash video input (video_url) is not supported. Remove the "
+    "video_url content part, or send still images as image_url."
+)
+
 #: The three regimes, spelled once. A caller comparing against these gets a name, not a magic string.
 REGIME_PLAIN = "A"
 REGIME_BELOW_FLOOR = "B"
@@ -485,6 +492,19 @@ class Glm5NextProcessingInfo(BaseProcessingInfo):
         silently.
         """
         return {"image": None}
+
+    def validate_num_items(self, modality: str, num_items: int) -> None:
+        """Refuse a video by name, with ``video_url`` as the parameter; every other modality as vLLM does.
+
+        vLLM's chat parser calls this for each content part before it fetches the media, so a video gets HTTP
+        400 naming the content part, and nothing is fetched. A video limit the operator sets does not change
+        this: the bridge offers no video.
+        """
+        if modality == "video" and num_items > 0:
+            from vllm.exceptions import VLLMValidationError
+
+            raise VLLMValidationError(VIDEO_INPUT_REFUSAL, parameter="video_url")
+        super().validate_num_items(modality, num_items)
 
     def get_grid_constants(self, **kwargs: object) -> GridConstants:
         """The image grid constants, read off the resolved image processor."""
