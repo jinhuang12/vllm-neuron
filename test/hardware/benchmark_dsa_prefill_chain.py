@@ -86,13 +86,13 @@ def import_tree(tree: Path):
     return torch, model_fp8
 
 
-def chunk_lengths(cands: int, pool: int, rows: int, tokens: int, torch):
-    """``(rank_lengths [rows], chunk_lengths [tokens])`` int32 of the chunk ending at ``cands * pool``.
+def chunk_lengths(end: int, rows: int, tokens: int, torch):
+    """``(rank_lengths [rows], chunk_lengths [tokens])`` int32 of the chunk ending at ``end``
+    tokens.
 
     The rank's rows are the chunk's last ``rows``; row ``i`` of the chunk has length
     ``end - tokens + 1 + i``.
     """
-    end = int(cands) * int(pool)
     chunk = torch.arange(end - tokens + 1, end + 1, dtype=torch.int32)
     return chunk[tokens - rows:].clone(), chunk
 
@@ -252,7 +252,12 @@ def cmd_run(args) -> None:
     scratch = Path(os.environ.get("NEURON_LIBTORCH_CACHE_ROOT") or records) / "benchmark_cwd"
     scratch.mkdir(parents=True, exist_ok=True)
     os.chdir(scratch)
-    lengths, chunk_lens = chunk_lengths(args.cands, pool, rows, args.tokens, torch)
+    end = args.chunk_end or args.cands * pool
+    store = args.store_cands or args.cands
+    if not end // pool <= args.cands <= store:
+        raise ValueError(f"need the chunk's complete pools ({end // pool}) <= --cands "
+                         f"({args.cands}) <= --store-cands ({store})")
+    lengths, chunk_lens = chunk_lengths(end, rows, args.tokens, torch)
     graph = build_graph(indexer, args.graph, args.layers, args.cands, torch)
     tag = f"{args.label}_{args.graph}_C{args.cands}"
     report = {
@@ -262,6 +267,7 @@ def cmd_run(args) -> None:
             "NEURON_LIBTORCH_DISABLE_COMPILE_CACHE")},
         "tree": {"root": str(tree), "head": head, "vllm_neuron_modified_vs_head": dirty},
         "label": args.label, "graph": args.graph, "cands": args.cands, "rows": rows, "tokens": args.tokens,
+        "chunk_end": end, "store_cands": store,
         "layers": args.layers, "select_k": indexer.select_k(),
         "args": {key: (str(value) if isinstance(value, Path) else value)
                  for key, value in vars(args).items()},
@@ -271,7 +277,7 @@ def cmd_run(args) -> None:
     for seed in args.seeds:
         cpu = []
         for layer in range(args.layers):
-            ops = layer_operands(cfg, args.cands, rows, args.tokens, seed, layer, torch)
+            ops = layer_operands(cfg, store, rows, args.tokens, seed, layer, torch)
             ops["lengths"] = lengths
             ops["chunk_ids"] = chunk_pool_ids(indexer.select_k(), args.tokens, torch)
             ops["chunk_lens"] = chunk_lens
@@ -284,7 +290,7 @@ def cmd_run(args) -> None:
         entry = {"seed": seed, "outputs": str(saved)}
         if args.reference is not None:
             reference = torch.load(args.reference / f"{args.reference_label}_{args.graph}"
-                                   f"_C{args.cands}_seed{seed}.pt")
+                                   f"_C{args.reference_cands or args.cands}_seed{seed}.pt")
             equal = [bool(torch.equal(a, b)) for a, b in zip(outputs, reference)]
             entry["equals_reference"] = equal
             if not all(equal):
@@ -423,6 +429,13 @@ def main() -> None:
     run.add_argument("--label", required=True, help="names the saved outputs and profiles")
     run.add_argument("--graph", choices=("chain", "scores"), default="chain")
     run.add_argument("--cands", type=int, required=True, help="candidate pools scanned")
+    run.add_argument("--chunk-end", type=int,
+                     help="tokens the chunk ends at (default cands * index_kpool)")
+    run.add_argument("--store-cands", type=int,
+                     help="pools the drawn store holds (default --cands): a scan of fewer "
+                          "candidates than a wider window's store reads the same keys")
+    run.add_argument("--reference-cands", type=int,
+                     help="--cands of the reference run (default --cands)")
     run.add_argument("--rows", type=int, help="rows one rank selects (default tokens / 64)")
     run.add_argument("--tokens", type=int, default=1024, help="the chunk's rows")
     run.add_argument("--layers", type=int, default=11)

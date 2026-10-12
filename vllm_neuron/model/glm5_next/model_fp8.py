@@ -8595,13 +8595,26 @@ class Glm5NextMLAAttention(nn.Module):
             latent=self.kv_lora_rank,
         )
         no_select = dense or dense_window
+        # A selecting chunk scans the pools its window holds rather than every pool of the
+        # model length: no row of the chunk reaches past the window, so the selection is the
+        # same, and a graph compiled for a shorter window scans fewer candidates. A window that
+        # would not select keeps the model length, because the indexer would answer it with the
+        # short regime's causal order instead of the selection's order; so does a window of
+        # fewer pools than the narrowest axis the selector ranks (``MAX8_WIDTH``).
+        from vllm_neuron.functional.dsa.topk_select import MAX8_WIDTH
+
+        window_pools, _, window_selects = self.indexer._require_serviceable(
+            bound, int(page_size), pool_cache
+        )
+        window_scans = window_selects and window_pools >= MAX8_WIDTH
+        scan = bound if no_select or window_scans else int(max_seq_len)
         q_latent = self.project_query_latent(normed_hidden_states)
         topk_indices = self.indexer(
             normed_hidden_states,
             q_latent,
             pool_cache,
             seq_lens,
-            max_seq_len=bound if no_select else int(max_seq_len),
+            max_seq_len=scan,
             page_size=int(page_size),
             indices_wanted=not no_select,
             slot_mapping=slot_mapping,
