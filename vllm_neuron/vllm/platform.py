@@ -706,6 +706,7 @@ class NeuronPlatform(Platform):
 
         if hasattr(model_config.hf_config, "vision_config"):
             cls._resolve_vision_auto_config(vllm_config, model_config)
+        cls._refuse_vision_merge_factor_mismatch(vllm_config)
 
         cls._resolve_sampling_from_the_model_class(vllm_config)
 
@@ -1127,6 +1128,61 @@ class NeuronPlatform(Platform):
                 tp_size,
                 num_q_heads,
             )
+
+    @staticmethod
+    def _admits_images(model_config) -> bool:
+        """Whether this server accepts image input: vLLM built a multimodal config for
+        the model class and the image limit per prompt is above 0 (vLLM's default for
+        a modality the operator leaves out is 999)."""
+        multimodal_config = getattr(model_config, "multimodal_config", None)
+        return (
+            multimodal_config is not None
+            and multimodal_config.get_limit_per_prompt("image") > 0
+        )
+
+    @classmethod
+    def _refuse_vision_merge_factor_mismatch(cls, vllm_config) -> None:
+        """Refuse image input when the model class's merge factor disagrees with its
+        vision config.
+
+        The per-image limit and the encoder budget divide the largest vision bucket
+        by ``get_vision_token_merge_factor`` (``vision_utils.get_vision_embed_limit``),
+        which is 1 for a class that does not implement ``SupportsSpatialMerge``. A
+        vision config that merges ``spatial_merge_size`` x ``spatial_merge_size`` raw
+        tokens into one embedding would then get a limit that many times too large,
+        and an image above the real limit would reach the encoder. Only a server that
+        admits images is refused; a text-only server never computes the limit.
+        """
+        model_config = vllm_config.model_config
+        if not cls._admits_images(model_config):
+            return
+        hf_config = model_config.hf_config
+        vision_config = getattr(hf_config, "vision_config", None)
+        merge_size = getattr(vision_config, "spatial_merge_size", None)
+        if not isinstance(merge_size, int) or merge_size <= 1:
+            return
+        from vllm_neuron.utils.vision_utils import get_vision_token_merge_factor
+
+        expected = merge_size * merge_size
+        merge_factor = get_vision_token_merge_factor(hf_config)
+        if merge_factor == expected:
+            return
+        arch = (getattr(hf_config, "architectures", None) or ["The model"])[0]
+        size = (
+            f"{expected // merge_factor} times too large"
+            if merge_factor < expected and expected % merge_factor == 0
+            else "wrong"
+        )
+        raise ValueError(
+            f"{arch} cannot serve image input on Neuron: its vision config merges "
+            f"{merge_size} x {merge_size} vision tokens into one embedding "
+            f"(vision_config.spatial_merge_size={merge_size}), but the model class "
+            f"reports a merge factor of {merge_factor}, so the per-image limit and the "
+            f"vision encoder budget would be {size}. Implement "
+            f"SupportsSpatialMerge.get_vision_token_merge_factor on the model class to "
+            f"return {expected}, or serve text only with --limit-mm-per-prompt "
+            f"'{{\"image\": 0}}'."
+        )
 
     @classmethod
     def _refuse_speculative_decoding_under_dcp(cls, vllm_config) -> None:
