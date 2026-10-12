@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """KDA decode in one NKI launch: conv carrier update, gate, and state step.
 
-At 5938748 one decode token cost each KDA layer three kernels and a dozen torch
-ops between them: the ``nkilib`` depthwise conv (384 per-channel DMA round trips,
-192 in series per core, ~350 us), the gate clamp and the decode-state step, plus
+In baseline ``kda_5938748`` one decode token cost each KDA layer three kernels and a
+dozen torch ops between them: the ``nkilib`` depthwise conv (384 per-channel DMA
+round trips, 192 in series per core), the gate clamp and the decode-state step, plus
 the carrier selects, casts, transposes and copies of the model glue. This module
 does that whole region for ``B`` requests in one dispatch::
 
@@ -93,7 +93,7 @@ PMAX = 128
 PSUM_BANK_F32 = 512
 
 #: Environment switch for the model call site; ``0`` routes decode back to the
-#: three 5938748 kernels.
+#: three separate kernels (depthwise conv, gate clamp, decode-state step).
 FUSED_DECODE_ENV = "VLLM_NEURON_KDA_FUSED_DECODE"
 
 __all__ = [

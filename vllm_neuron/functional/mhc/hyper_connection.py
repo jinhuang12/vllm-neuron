@@ -44,13 +44,13 @@ row. Tokens and streams ride the free axes. Each token's ``S + S*S`` mixing
 scalars are the same for every hidden index, so one DMA broadcasts them to all
 partitions and stride-0 views broadcast them along ``HF``. A token chunk is then
 ``1 + 2*S`` vector instructions (9 at ``S = 4``), each over
-``[128, tokens, S, HF]``. 5938748 put the token on the partition axis, which at
-decode (``T = 1``) ran 72 instructions of 2048 elements on one lane of 128.
+``[128, tokens, S, HF]``. Baseline ``mhc_5938748`` put the token on the partition axis,
+which at decode (``T = 1``) ran 72 instructions of 2048 elements on one lane of 128.
 
 Above that token count the short ``HF`` runs make the DMAs the bottleneck, so
 the tokens go back on the partitions, where every DMA row is a long contiguous
 hidden run, and each multiply-add is one instruction: ``S * (1 + S)`` per tile
-where 5938748 issued ``S * (1 + 2*S)``.
+where baseline ``mhc_5938748`` issued ``S * (1 + 2*S)``.
 
 Under an LNC2 launch (``NEURON_LOGICAL_NC_CONFIG=2``, the serving setting) the
 kernel runs as two SPMD programs, each on one contiguous half of the hidden axis,
@@ -95,17 +95,16 @@ logger = logging.getLogger(__name__)
 #: per chunk (HF = 32), two programs 71 (HF = 16), so decode is one chunk.
 SBUF_CHUNK_ELEMS = 16384
 
-#: Retired: 5938748 tiled the hidden axis 2048 wide on the free axis. The kernel
-#: no longer has that tile; the name stays because
+#: Retired: baseline ``mhc_5938748`` tiled the hidden axis 2048 wide on the free axis.
+#: The kernel no longer has that tile; the name stays because
 #: ``test/hardware/benchmark_sparse_mla_mhc.py`` reports it.
 HIDDEN_TILE = None
 
 #: The largest token count served with hidden on the partitions. Above it the
 #: kernel puts tokens on the partitions, where every DMA row is a long contiguous
 #: run; below it, few tokens on the partitions would leave most lanes idle.
-#: Measured on trn2 at H = 4096, two programs, device us per call (hidden layout
-#: vs tokens layout): 10.4 vs 48.9 at T = 4, 27.6 vs 50.4 at 16, 44.5 vs 50.8 at
-#: 32, 88.7 vs 53.3 at 64, 172.6 vs 59.6 at 128.
+#: Measured on trn2 at H = 4096, two programs: the hidden layout is faster up to 32
+#: tokens and the tokens layout from 64.
 HIDDEN_ON_PARTITIONS_MAX_TOKENS = 32
 
 #: Hidden slice width, in fp32 values, of the tokens-on-partitions layout: each
@@ -161,7 +160,7 @@ def hyper_connection_kernel(x, residual, post_layer_mix, comb_res_mix):
         ``out_j = post_layer_mix_j * x + sum_i comb_ij * res_i``, computed in fp32
         and rounded once. ``x`` and ``residual`` may be fp32 or bf16.
 
-    The arithmetic is the 5938748 kernel's, in its order and rounding:
+    The arithmetic is that of baseline ``mhc_5938748``, in its order and rounding:
     ``acc = post_j * x`` and then ``acc = acc + comb_ij * res_i`` for
     ``i = 0..S-1``, each product rounded to fp32 before its add. What changed is
     the layout, picked at trace time from ``T``:
@@ -169,8 +168,8 @@ def hyper_connection_kernel(x, residual, post_layer_mix, comb_res_mix):
     * ``T <= HIDDEN_ON_PARTITIONS_MAX_TOKENS`` (decode): hidden on the
       partitions, see :func:`_combine_hidden_on_partitions`. All 128 lanes work
       however few tokens there are, and a token chunk is ``1 + 2*S``
-      instructions, where 5938748 issued ``S * (1 + 2*S)`` per 2048-wide hidden
-      tile on ``T`` lanes (72 at decode, on 1 lane).
+      instructions, where baseline ``mhc_5938748`` issued ``S * (1 + 2*S)`` per
+      2048-wide hidden tile on ``T`` lanes (72 at decode, on 1 lane).
     * Larger ``T`` (prefill, big batches): tokens on the partitions, see
       :func:`_combine_tokens_on_partitions`. Every DMA moves long contiguous
       hidden runs, which the hidden-on-partitions layout cannot (its run is
@@ -386,8 +385,9 @@ def _combine_tokens_on_partitions(
     stream ``j``: ``acc_j = post_j * x`` (``tensor_scalar``), then
     ``acc_j = comb_ij * res_i + acc_j`` for each ``i`` in one
     ``scalar_tensor_tensor`` (multiply, then add), so a slice is ``S * (1 + S)``
-    instructions where 5938748 issued ``S * (1 + 2*S)``. The tiles are allocated
-    per slice so the compiler can overlap one slice's DMA with another's compute.
+    instructions where baseline ``mhc_5938748`` issued ``S * (1 + 2*S)``. The tiles are
+    allocated per slice so the compiler can overlap one slice's DMA with another's
+    compute.
     """
     t_extent, s_extent, h_extent = residual.shape
     n_tiles = (t_extent + PARTITION_MAX - 1) // PARTITION_MAX

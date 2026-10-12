@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Decode-time routed experts: ``T <= 64`` tokens, one launch, no mapping.
 
-The 5938748 decode path routed through ``build_blockwise_mapping`` (XLA), padded
-the hidden and affinity tensors, ran ``compact_decode_kernel`` (``q == 1``) or
-the general kernel per 128-row block, and combined the per-block rows with an
-fp32 token gather. That kernel applied the block-fp8 scale after every 128x128
-product: 384 vector instructions per expert at I=512, H=4096, ~80 us of the
-~125 us one hit cost. This kernel reads the router's global ``[T, E]`` output
-and this rank's group id, and does the rest itself:
+Baseline ``moe_5938748``'s decode path routed through ``build_blockwise_mapping``
+(XLA), padded the hidden and affinity tensors, ran ``compact_decode_kernel``
+(``q == 1``) or the general kernel per 128-row block, and combined the per-block
+rows with an fp32 token gather. That kernel applied the block-fp8 scale after every
+128x128 product: 384 vector instructions per expert at I=512, H=4096, most of what
+one hit cost. This kernel reads the router's global ``[T, E]`` output and this
+rank's group id, and does the rest itself:
 
 * **Distinct experts only.** The local affinity slice is summed over tokens and
   compacted with ``nonzero_with_count``; a dynamic loop visits each expert with
@@ -35,15 +35,15 @@ and this rank's group id, and does the rest itself:
   ``[128, H/128, T]`` tile, in ascending local expert order; the result is
   transposed once and stored in the output dtype.
 
-Numerics against 5938748: the same fp32 128x128 products, the same SwiGLU
-instruction sequence and bf16 activation. Partial sums are associated
+Numerics against baseline ``moe_5938748``: the same fp32 128x128 products, the same
+SwiGLU instruction sequence and bf16 activation. Partial sums are associated
 differently (hidden blocks in one reduce, two I halves, experts before the
 cast), so results agree to fp32 round-off and, rarely, one bf16 activation step.
-Against 0a08ff4 the grouped path takes the same products in the same order
-(the gather, the gate broadcast and the scatter are exact one-hot products).
+Against baseline ``moe_0a08ff4`` the grouped path takes the same products in the same
+order (the gather, the gate broadcast and the scatter are exact one-hot products).
 One difference: a NaN or Inf in one token's hidden row or expert output
 reaches the other tokens of its items through those products (``0 * NaN``);
-0a08ff4 keeps it in that token's row.
+baseline ``moe_0a08ff4`` keeps it in that token's row.
 """
 
 from __future__ import annotations
@@ -69,7 +69,8 @@ EXPERT_DECODE_MAX_TOKENS = 64
 _BANK = 512
 
 #: Largest token count that streams every token through each visited expert
-#: (the 0a08ff4 schedule). Above it, each expert sees only its own tokens.
+#: (baseline ``moe_0a08ff4``'s schedule). Above it, each expert sees only its own
+#: tokens.
 TOKEN_AXIS_MAX = 16
 
 #: Tokens of one expert per grouped work item: the moving width of every
@@ -89,8 +90,9 @@ def decode_plan(tokens: int):
     """The kernel's schedule for ``tokens`` rows: ``(name, moving width)``.
 
     ``("token_axis", T)`` for ``T <= TOKEN_AXIS_MAX``: every visited expert
-    streams all ``T`` tokens (0a08ff4). ``("grouped", GROUP_TOKENS)`` above:
-    each visited expert streams only its own tokens, ``GROUP_TOKENS`` at a time.
+    streams all ``T`` tokens (baseline ``moe_0a08ff4``). ``("grouped", GROUP_TOKENS)``
+    above: each visited expert streams only its own tokens, ``GROUP_TOKENS`` at a
+    time.
     """
     if tokens <= TOKEN_AXIS_MAX:
         return "token_axis", tokens
@@ -182,8 +184,8 @@ def _expert_contribution(moving, gate, stationaries, down, flat_scale, clamp,
 
     ``moving`` is ``x^T`` as ``[128 (h mod 128), H/128, columns]`` bf16 and
     ``gate`` the ``[128, columns]`` fp32 gate weight of each column (0 for a
-    column that did not choose the expert). The 0a08ff4 arithmetic: fp32
-    128x128 products, block scales applied per PSUM bank, hidden blocks summed
+    column that did not choose the expert). The arithmetic of baseline ``moe_0a08ff4``:
+    fp32 128x128 products, block scales applied per PSUM bank, hidden blocks summed
     in one reduce, the clamped SwiGLU in bf16, the down projection's scale
     multiplied by the gate weight, intermediate blocks summed in one reduce.
     ``out``, if given, is the ``[128, H/128, columns]`` fp32 tile to write.
@@ -213,7 +215,7 @@ def _expert_contribution(moving, gate, stationaries, down, flat_scale, clamp,
         [gate_up_slots * columns, 128], [nh * columns, 2 * nic], [1, columns],
         [columns, nh]]), op=nl.add, axis=(3,))
 
-    # SwiGLU, the 5938748 instruction sequence: clamp, sigmoid, two products.
+    # SwiGLU, baseline ``moe_5938748``'s instruction sequence: clamp, sigmoid, two products.
     g = nl.ndarray((128, nic, columns), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_scalar(dst=g, data=pre[:, 0:nic, :], op0=nl.minimum,
                        operand0=clamp[:, 0:1])
@@ -258,7 +260,7 @@ def _expert_contribution(moving, gate, stationaries, down, flat_scale, clamp,
 
 
 def _token_axis_experts(hidden, local, weights, scales, clamp, acc, i0, nic, fp8):
-    """``T <= TOKEN_AXIS_MAX``: every token through each visited expert (0a08ff4).
+    """``T <= TOKEN_AXIS_MAX``: every token through each visited expert (baseline ``moe_0a08ff4``).
 
     Adds, in ascending local expert order, each visited expert's contribution
     for all ``T`` tokens into ``acc`` ``[128, H/128, T]``; a token that did not
@@ -401,7 +403,7 @@ def _grouped_compute(state, tables, p, operands):
     # transpose), then acc[h, b', t] += sum_(b, j) C^T[(b, j), h] * scatter[(b, j),
     # (b', t)] -- one nonzero term per token column of the item, 0 elsewhere,
     # so each token's acc column gets exactly its expert's column added, in
-    # ascending expert order, as in 0a08ff4.
+    # ascending expert order, as in baseline ``moe_0a08ff4``.
     per_bank = max(1, _BANK // 128)
     for c0 in range(0, blocks, per_bank):
         cn = min(per_bank, blocks - c0)

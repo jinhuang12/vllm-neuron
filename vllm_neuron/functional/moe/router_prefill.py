@@ -1,20 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 """The prefill router: its RMSNorm in torch, the router GEMM and noaux_tc in one launch.
 
-Why this exists. At 8aa22fa every MoE layer of the prefill graph hands the fused
-router kernel (``router._noaux_tc_rmsnorm_router_topk_nki``) the layer's PRE-norm
+Why this exists. In baseline ``moe_prefill_8aa22fa`` (the torch collapse, before the
+``mhc_pre`` prefill glue) every MoE layer of the prefill graph handed the fused router
+kernel (``router._noaux_tc_rmsnorm_router_topk_nki``) the layer's PRE-norm
 activations, which are the feed-forward mHC site's collapse
 ``(pre_mix[..., None] * streams.float()).sum(1).to(bf16)``
-(``Glm5NextHyperConnection.mhc_pre``). In the served 1k graph 240a08a9 that is HLO
-``multiply.7392`` ``f32[1024,4,4096]`` -> ``reduce.7399`` (dims ``{1}``) ->
-``convert.7400`` bf16 -> the router custom call ``call.7537`` (layer 3; every MoE layer
-repeats it). A custom-call operand cannot fuse into its consumer, so neuronx-cc
-materialises the collapse by itself and lowers the multiply + reduce as a batched dot:
-for each token and each 512-column chunk of H, one fp32 matmul contracting the 4
-streams (``LDWEIGHTS`` + ``MATMUL`` of 2,048 FLOP, then a cast and a DMA out), 8,192
-matmuls per layer at 1024 tokens, about 8.8 ms of "compiler ops" per MoE layer.
-The attention half and the dense layers run the same collapse in about 1 ms because
-its only consumer there is the XLA RMSNorm, so the reduce fuses into the norm.
+(``Glm5NextHyperConnection.mhc_pre``). In that tree's 1024-token prefill graph the
+collapse was HLO ``multiply.7392`` ``f32[1024,4,4096]`` -> ``reduce.7399`` (dims
+``{1}``) -> ``convert.7400`` bf16 -> the router custom call ``call.7537`` (layer 3;
+every MoE layer repeated it). A custom-call operand cannot fuse into its consumer, so
+neuronx-cc materialised the collapse by itself and lowered the multiply + reduce as a
+batched dot: for each token and each 512-column chunk of H, one fp32 matmul
+contracting the 4 streams (``LDWEIGHTS`` + ``MATMUL`` of 2,048 FLOP, then a cast and
+a DMA out), 8,192 matmuls per layer at 1024 tokens, most of the MoE layer's
+"compiler ops" time. The attention half and the dense layers ran the same collapse
+much faster because its only consumer there was the XLA RMSNorm, so the reduce fused
+into the norm.
 
 What this changes. The RMSNorm's scale moves out of the kernel into torch
 (:func:`router_rms_scale`, ``bf16(x * rstd)``), next to the experts' own norm
@@ -48,10 +50,10 @@ Envelope. ``Glm5NextRoutedExperts.route_tokens`` asks :func:`prefill_route_admit
 after its decode branch, so ``route_tokens`` stays the block's one routing authority.
 Prefill only: every call of at most ``router_decode.DECODE_ROUTE_MAX_TOKENS`` rows has
 already taken the decode router there, and :func:`prefill_route_admits` declines such
-a call anyway; ``VLLM_NEURON_MOE_PREFILL_ROUTER=0`` declines everything (8aa22fa's
-route, the fused kernel). The launch counts into the ``noaux_tc`` router seam's family
-(``router.noaux_tc_dispatch_counters``), as the decode router does; the kernel name
-tells the two kernels apart.
+a call anyway; ``VLLM_NEURON_MOE_PREFILL_ROUTER=0`` declines everything (baseline
+``moe_prefill_8aa22fa``'s route, the fused kernel). The launch counts into the
+``noaux_tc`` router seam's family (``router.noaux_tc_dispatch_counters``), as the
+decode router does; the kernel name tells the two kernels apart.
 
 Both LNC2 cores: yes. The launch is ``[2]``; each program takes ``T // 2`` rows
 (``router._noaux_tc_shard_range``) and runs every step on them.
@@ -77,7 +79,8 @@ from vllm_neuron.utils.neuron_utils import can_run_kernel
 from . import router as _router_seam
 from .router_decode import DECODE_ROUTE_MAX_TOKENS
 
-#: ``0`` keeps 8aa22fa's prefill route (the fused kernel on the pre-norm rows).
+#: ``0`` keeps baseline ``moe_prefill_8aa22fa``'s prefill route (the fused kernel on
+#: the pre-norm rows).
 PREFILL_ROUTER_ENV = "VLLM_NEURON_MOE_PREFILL_ROUTER"
 
 #: Hidden extents come in whole 128-row partition blocks: the router GEMM contracts
@@ -95,7 +98,8 @@ def prefill_route_admits(hidden_states, router_weights, top_k: int) -> bool:
 
     More than ``DECODE_ROUTE_MAX_TOKENS`` rows (prefill), bf16 activations and router
     weights, ``top_k == 8``, ``H`` in 128-row blocks, ``8 <= E <= 512``, on an NKI
-    device or the simulator, with the switch on. Anything else keeps 8aa22fa's route.
+    device or the simulator, with the switch on. Anything else keeps baseline
+    ``moe_prefill_8aa22fa``'s route.
     """
     if not isinstance(hidden_states, Tensor) or not isinstance(router_weights, Tensor):
         return False
@@ -248,8 +252,8 @@ def noaux_tc_router_prefill(
     [T, E] fp32, expert_index [T, K] int32, expert_affinities [T, E] fp32)``, the
     affinities scattered (gate weight at each selected expert, zero elsewhere).
 
-    A call :func:`prefill_route_admits` declines takes 8aa22fa's route
-    (``router.noaux_tc_rmsnorm_router_topk``), which has its own torch fallback.
+    A call :func:`prefill_route_admits` declines takes baseline ``moe_prefill_8aa22fa``'s
+    route (``router.noaux_tc_rmsnorm_router_topk``), which has its own torch fallback.
 
     Raises:
         NoauxTcRouterError: for a ``top_k`` or ``E`` the noaux_tc stage cannot serve,
@@ -277,8 +281,9 @@ def noaux_tc_router_prefill(
 
     scaled = router_rms_scale(rows, eps)
     # Whole 128-row tiles per core under the [2] launch. The pad repeats the last
-    # real row (router._noaux_tc_pad_tokens), as 8aa22fa pads its pre-norm rows: the
-    # norm is per row, so this is the same padded tensor scaled.
+    # real row (router._noaux_tc_pad_tokens), as baseline ``moe_prefill_8aa22fa`` pads
+    # its pre-norm rows: the norm is per row, so this is the same padded tensor
+    # scaled.
     t_pad = _router_seam._noaux_tc_pad_target(tokens, _router_seam._NOAUX_TC_T_MULTIPLE)
     padded = _router_seam._noaux_tc_pad_tokens(scaled, t_pad)
     # [1, H], as the fused kernel's wrapper legalises it for nkilib.

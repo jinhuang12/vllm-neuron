@@ -511,7 +511,7 @@ def sinkhorn_blocks_kernel(affinity_blocks, iters: int = SINKHORN_ITERS):
     row-then-column normalisation of :func:`sinkhorn_kernel` reordered: after
     ``n`` iterations both give ``diag(u_n) K diag(v_n)``, so they differ only in
     fp32 rounding (operands fp32, Tensor engine accumulation fp32; 6e-8 from
-    5938748 on trn2 at ``T = 1``).
+    baseline ``mhc_5938748`` on trn2 at ``T = 1``).
 
     **Tokens on the partitions, larger ``T``.** ``ceil(T / 128)`` consecutive
     tokens per partition, each partition holding its tokens' whole ``S x S``
@@ -520,8 +520,8 @@ def sinkhorn_blocks_kernel(affinity_blocks, iters: int = SINKHORN_ITERS):
     whole tile: per pass a ``tensor_reduce``, a ``reciprocal`` and a
     ``tensor_tensor`` multiply by the stride-0 broadcast of the reciprocal.
 
-    5938748 issued 31 per iteration (one ``[T, S]`` tile per block row, a
-    reciprocal and two multiplies per pass), 624 for the 20 iterations.
+    Baseline ``mhc_5938748`` issued 31 per iteration (one ``[T, S]`` tile per block
+    row, a reciprocal and two multiplies per pass), 624 for the 20 iterations.
 
     SPMD, tokens on the partitions only. Under a launch of ``P`` programs each
     program normalises one contiguous ``ceil(T / P)`` share of the tokens (at

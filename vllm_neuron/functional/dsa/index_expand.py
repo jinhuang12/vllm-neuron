@@ -242,8 +242,8 @@ def _index_expand_nki(pool_ids_hbm, seq_lens_hbm, pool_size, pool_mask):
     value for one offset on a full-width tile and copies it into the columns of stride
     ``pool_size`` that own it, so the loop is ``pool_size`` long however many pools were
     selected. Walking columns instead would be ``n_groups * pool_size`` iterations on tiles one
-    element wide -- roughly 4096 instructions at the production width, measured at 8x the emit
-    cost of this form.
+    element wide -- roughly 4096 instructions at the production width, measured at several
+    times the emit cost of this form.
 
     The query-row axis is walked in tiles of at most :data:`PARTITION_MAX` rows, each tile
     reading only its own rows of both inputs. Without that bound a taller call dies inside the
