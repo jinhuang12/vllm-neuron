@@ -1067,6 +1067,7 @@ class NeuronPlatform(Platform):
             return
 
         cls._refuse_speculative_decoding_under_dcp(vllm_config)
+        cls._refuse_multimodal_input_under_dcp(vllm_config)
 
         tp_size = vllm_config.parallel_config.tensor_parallel_size
         model_config = vllm_config.model_config
@@ -1178,6 +1179,18 @@ class NeuronPlatform(Platform):
         )
 
     @classmethod
+    def _admits_videos(cls, model_config) -> bool:
+        """Whether this server accepts video input: the video limit per prompt is
+        above 0 and the model's bridge offers video."""
+        multimodal_config = getattr(model_config, "multimodal_config", None)
+        if multimodal_config is None:
+            return False
+        architectures = getattr(model_config.hf_config, "architectures", None) or ()
+        return multimodal_config.get_limit_per_prompt("video") > 0 and not any(
+            arch in cls._IMAGE_ONLY_ARCHS for arch in architectures
+        )
+
+    @classmethod
     def _refuse_vision_merge_factor_mismatch(cls, vllm_config) -> None:
         """Refuse image input when the model class's merge factor disagrees with its
         vision config.
@@ -1244,6 +1257,38 @@ class NeuronPlatform(Platform):
                 "implemented. Disable speculative decoding or set "
                 "decode_context_parallel_size=1."
             )
+
+    @classmethod
+    def _refuse_multimodal_input_under_dcp(cls, vllm_config) -> None:
+        """Refuse image and video input at decode_context_parallel_size > 1.
+
+        Image prefill under DCP is not implemented: the runner's multimodal
+        embedding gather has no DCP path, and a prefill chunk that the scheduler
+        stops at an image start (when the encoder budget or cache cannot take the
+        image that step) would begin the next DCP prefill chunk at a cached length
+        that is not a multiple of ``decode_context_parallel_size * block_size``,
+        which the runner refuses in the step, after the engine is serving. A server
+        that admits no image or video starts. Callers check ``dcp_size > 1`` first.
+        """
+        model_config = vllm_config.model_config
+        modalities = [
+            name
+            for name, admitted in (
+                ("image", cls._admits_images(model_config)),
+                ("video", cls._admits_videos(model_config)),
+            )
+            if admitted
+        ]
+        if not modalities:
+            return
+        raise ValueError(
+            f"This server admits {' and '.join(modalities)} input, which is not "
+            f"supported with decode_context_parallel_size > 1 "
+            f"(dcp={vllm_config.parallel_config.decode_context_parallel_size}): "
+            f"multimodal prefill under decode context parallelism is not implemented. "
+            f"Serve text only with --language-model-only, or set "
+            f"decode_context_parallel_size=1."
+        )
 
     @classmethod
     def is_pin_memory_available(cls) -> bool:
