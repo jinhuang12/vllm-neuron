@@ -58,6 +58,9 @@ from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
     ShardGeometry,
     stacked_expert_scale_loader,
 )
+from vllm_neuron.model.glm5_next.utils.merge_vision_embeds import (
+    merge_vision_embeddings,
+)
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.functional.full_vocab_sampling import (
     device_sampling_config,
@@ -9131,6 +9134,8 @@ class Glm5NextModel(nn.Module):
         tp_degree: int = 1,
         expert_parallel_rank: int | torch.Tensor = 0,
         collect_layer_streams: bool = False,
+        vision_embedding_blocks: tuple[torch.Tensor, ...] | None = None,
+        vision_positions: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         """The whole decoder stack: embed, expand to streams, every layer in config
         order, collapse, final norm.
@@ -9187,6 +9192,14 @@ class Glm5NextModel(nn.Module):
                 this method performs no I/O, holds no file path and reads no
                 environment, because a save call inside a traced forward is a graph
                 break rather than a dump.
+            vision_embedding_blocks: an image-serving prefill only: the encoder-cache
+                blocks this chunk reads, each ``[cache_block_size, H]``. The image rows
+                they hold replace the embedded placeholder rows before the expand, so
+                every stream starts from the image embedding, as the reference's
+                ``inputs_embeds`` does. Given with ``vision_positions`` or not at all.
+            vision_positions: ``[num_blocks, cache_block_size]`` int64, the chunk row
+                each cached row goes to; a row past the chunk is a padding slot, which
+                the merge discards.
 
         Returns:
             ``[T, H]`` after the final RMSNorm, in the embedding table's dtype -- or,
@@ -9203,8 +9216,9 @@ class Glm5NextModel(nn.Module):
 
         Raises:
             ValueError: when the carrier count disagrees with the layer count, when
-                a mapped parameter this forward reads was never loaded, or when the
-                checkpoint's ``hc_mult`` is not a positive stream count.
+                a mapped parameter this forward reads was never loaded, when the
+                checkpoint's ``hc_mult`` is not a positive stream count, or when one
+                of the two vision keywords comes without the other.
             Glm5NextHyperConnectionError: from :func:`_mhc_site` when a layer's mHC
                 weights disagree with the streams route this method takes.
         """
@@ -9224,6 +9238,18 @@ class Glm5NextModel(nn.Module):
                 "table is a mapped checkpoint tensor and nothing was loaded onto it"
             )
         embedded = table[input_ids]
+        if (vision_embedding_blocks is None) != (vision_positions is None):
+            raise ValueError(
+                "Glm5NextModel.forward takes vision_embedding_blocks and "
+                "vision_positions together or not at all; one without the other "
+                "cannot place an image row"
+            )
+        if vision_embedding_blocks is not None:
+            # rank 0: every rank embeds the whole chunk, since the text prefill is
+            # not sequence-parallel, so the chunk's rows are this rank's rows.
+            embedded = merge_vision_embeddings(
+                embedded, vision_embedding_blocks, vision_positions, rank=0
+            )
         hc_mult = int(self.text_config.hc_mult)
         if hc_mult <= 0:
             raise ValueError(
@@ -11173,6 +11199,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
         shadow_boundary_ids: torch.Tensor | None = None,
         draft_k: int | None = None,
         spec_decode_metadata: "SpecDecodeMetadata | None" = None,
+        vision_embedding_blocks: tuple[torch.Tensor, ...] | None = None,
+        vision_positions: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Logits for the rows the caller wants sampled: stack, select, project.
 
@@ -11277,6 +11305,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 without a head, or a count below 1, is refused by name: a forward
                 that silently drafted nothing would return the bare ids and the
                 caller would read a missing draft as a shape change.
+            vision_embedding_blocks: a prefill of a server that admits images: the
+                encoder-cache blocks the chunk reads, forwarded unread to
+                :meth:`Glm5NextModel.forward`, which merges them into the embedded
+                rows. ``None`` on every other step.
+            vision_positions: the chunk row of every cached row of those blocks,
+                forwarded with them.
 
         Shadow draft (``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT=k``, ``self.mtp`` built):
         ``layer_carriers`` then holds one more mapping than the stack has layers, the
@@ -11331,6 +11365,17 @@ class Glm5NextForConditionalGeneration(nn.Module):
         # The keyword is added, not passed as False, so an ordinary forward hands its
         # stack the six keywords it always handed over and no seventh.
         collecting = {"collect_layer_streams": True} if collect_layer_streams else {}
+        # The same rule for the image rows: a step without them hands its stack no
+        # vision keyword, so the text-only prefill and the decode trace what they
+        # traced. The stack refuses one keyword without the other.
+        image_rows = (
+            {
+                "vision_embedding_blocks": vision_embedding_blocks,
+                "vision_positions": vision_positions,
+            }
+            if vision_embedding_blocks is not None or vision_positions is not None
+            else {}
+        )
         # Shadow draft: the draft layer's carrier rides at the end of the list and the
         # stack must not see it (it refuses a count that disagrees with its layers).
         draft_head = self.mtp
@@ -11374,6 +11419,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             tp_degree=tp_degree,
             expert_parallel_rank=expert_parallel_rank,
             **collecting,
+            **image_rows,
         )
         if collect_layer_streams:
             hidden_states, layer_streams = stack_output
