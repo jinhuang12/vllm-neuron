@@ -562,19 +562,19 @@ def check_dcp_decode_index_context(vllm_config: Any, index_kpool: int | None) ->
     """Refuse a DCP run whose per-rank decode candidate axis is past the served width.
 
     Under DCP each rank's decode indexer scores only its own pools. So
-    :func:`~vllm_neuron.functional.dsa.decode_select.check_decode_index_context`
+    :func:`~vllm_neuron.functional.dsa.decode_select.check_decode_pools_context`
     reads the context that rank covers (:func:`indexer_context_per_rank`), not
     ``max_model_len``. A refusal names both lengths, followed by the check's own
     message.
     """
     from vllm_neuron.functional.dsa.decode_select import (
         DecodeSelectError,
-        check_decode_index_context,
+        check_decode_pools_context,
     )
 
     per_rank = indexer_context_per_rank(vllm_config)
     try:
-        check_decode_index_context(per_rank, index_kpool)
+        check_decode_pools_context(per_rank, index_kpool)
     except DecodeSelectError as exc:
         raise DecodeSelectError(
             f"decode_context_parallel_size="

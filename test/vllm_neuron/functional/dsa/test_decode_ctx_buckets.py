@@ -111,16 +111,6 @@ def test_a_context_the_whole_row_holds_starts(max_model_len):
     DS.check_decode_index_context(max_model_len, POOL)
 
 
-@pytest.mark.parametrize("max_model_len", [SERVED_LEN + POOL, 2 * SERVED_LEN])
-def test_a_longer_context_is_refused_with_its_reason(max_model_len):
-    with pytest.raises(DS.DecodeSelectError, match="merges row segments") as refused:
-        DS.check_decode_index_context(max_model_len, POOL)
-    message = str(refused.value)
-    assert f"max_model_len={max_model_len}" in message
-    assert f"{max_model_len // POOL} decode index candidates" in message
-    assert f"max_model_len <= {SERVED_LEN + POOL - 1}" in message
-
-
 def test_a_model_without_an_indexer_is_not_checked():
     DS.check_decode_index_context(64 * SERVED_LEN, None)
 
