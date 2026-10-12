@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""``mhc_post`` on bf16 streams against 0a08ff4's ``mhc_post``, decode and prefill rows.
+"""``mhc_post`` on bf16 streams against 0a08ff4's ``mhc_post`` at decode batches.
 
 0a08ff4 casts ``x`` and the streams to fp32, runs the combine kernel in fp32 and
 casts the fp32 result back to the streams' bf16. This tree hands the combine the bf16
-operands: the kernel upcasts them on chip (bf16 -> fp32 is exact), does the same fp32
-products and adds in the same order, and rounds the last add to bf16 once, which is
-the cast 0a08ff4 does after the kernel. So the result is asserted bit for bit, in both
-of the kernel's layouts (hidden on the partitions up to 32 tokens, tokens above) and
-under one and two programs: at the decode batches B in {1, 4, 33, 64} and at the
-2048-row chunk of the uncapped prefill line (16 token tiles).
+operands: up to 32 tokens the kernel upcasts them on chip (bf16 -> fp32 is exact),
+does the same fp32 products and adds in the same order, and rounds the last add to
+bf16 once, which is the cast 0a08ff4 does after the kernel. So the result is asserted
+bit for bit, with the hidden axis on the partitions and under one and two programs,
+at the decode batches B in {1, 4}. Above 32 tokens bf16 operands take the
+tensor-engine form, which is held to a tolerance instead.
 """
 
 from __future__ import annotations
@@ -21,9 +21,7 @@ from test.vllm_neuron.functional.glue import glue_case
 from vllm_neuron.functional.mhc import hyper_connection as combine
 from vllm_neuron.model.glm5_next import model_fp8
 
-BATCHES = (1, 4, 33, 64)
-#: The decode batches and the uncapped line's prefill chunk.
-ROWS = BATCHES + (glue_case.UNCAPPED_PREFILL_CHUNK,)
+BATCHES = (1, 4)
 
 
 @pytest.fixture(scope="module")
@@ -44,7 +42,7 @@ def _operands(cfg, batch):
 
 
 @pytest.mark.parametrize("lnc", ("1", "2"))
-@pytest.mark.parametrize("batch", ROWS)
+@pytest.mark.parametrize("batch", BATCHES)
 def test_bf16_combine_matches_0a08ff4_bit_for_bit(sites, batch, lnc, monkeypatch):
     monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", lnc)
     live, old, cfg = sites
