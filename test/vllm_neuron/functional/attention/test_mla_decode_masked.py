@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""``mla_decode_masked_attention``: a selecting decode step's attention by pool mask.
+"""``mla_decode_masked_attention``: a selecting decode step's attention by pool mask,
+selected on chip from the rows' bounded pool scores.
 
 The served per-rank shape is TP=64 of GLM-5.3-Flash: one head, latent 512, page 128,
 pool 4, 512 pools selected, bf16 query and bank. The window is the selecting decode
@@ -9,7 +10,9 @@ bucket's 4096 rows (32 pages; 1024 candidate pools), where a verify step's 4 row
 * **The token set.** The module docstring's rule (a selected pool's tokens and the
   incomplete pool's tokens, up to the row's own position) is the set
   ``dsa_decode_select`` lists, at every position of the window, with tied scores and
-  pools the bound masks.
+  pools the bound masks. The kernel selects the pools itself, as
+  ``dsa_decode_select_mask_torch_oracle`` does; scores quantised to a few levels put
+  ties at every row's cut.
 * **The attention.** Against ``mla_decode_attention_torch_oracle`` on the index form of
   the same selection, at relative L2 :data:`REL` (the bound ``test_mla_decode_split.py``
   holds the key-split kernel to), and against the served selected kernel at the same
@@ -100,9 +103,10 @@ def test_the_rule_is_the_index_set_at_every_selecting_position(levels):
     assert torch.equal(listed.sum(dim=1), counts)
 
 
-def _case(batch, rows, starts, *, seed, force=()):
+def _case(batch, rows, starts, *, seed, force=(), levels=None):
     """Operands at the served shape: ``batch`` requests of ``rows`` rows from ``starts``,
-    disjoint pages, and one selection in both forms (pool mask and token indices)."""
+    disjoint pages, the rows' bounded pool scores, and their selection in both forms
+    (pool mask and token indices)."""
     gen = torch.Generator().manual_seed(seed)
     bank_pages = batch * PAGES + 5
     bank = (torch.randn(bank_pages * PAGE, LATENT, generator=gen) * 0.5).to(torch.bfloat16)
@@ -114,11 +118,11 @@ def _case(batch, rows, starts, *, seed, force=()):
     for b in range(batch):
         table[b, (int(pos[b]) + rows - 1) // PAGE + 1:] = -1
     lengths = [int(pos[b]) + t + 1 for b in range(batch) for t in range(rows)]
-    bounded = _bounded(lengths, seed=seed, force=force)
+    bounded = _bounded(lengths, seed=seed, levels=levels, force=force)
     mask = DS.dsa_decode_select_mask_torch_oracle(bounded, select_k=K)
     topk = DS.dsa_decode_select_torch_oracle(bounded, torch.tensor(lengths, dtype=torch.int32),
                                              select_k=K, pool_size=POOL)
-    return (q, bank, table, pos, written), mask, topk
+    return (q, bank, table, pos, written), bounded, mask, topk
 
 
 def _check(got, want, label):
@@ -145,11 +149,16 @@ CASES = [
 ]
 
 
+def _attend(args, bounded):
+    return MM.mla_decode_masked_attention(*args, SCALE, PAGE, bounded, POOL, select_k=K)
+
+
 @pytest.mark.parametrize("batch, rows, starts, lnc, force", CASES)
 def test_the_kernel_attends_the_index_form(batch, rows, starts, lnc, force, monkeypatch):
     _lnc(monkeypatch, lnc)
-    args, mask, topk = _case(batch, rows, starts, seed=17 + sum(starts) + rows, force=force)
-    got = MM.mla_decode_masked_attention(*args, SCALE, PAGE, mask, POOL)
+    args, bounded, _mask, topk = _case(batch, rows, starts, seed=17 + sum(starts) + rows,
+                                       force=force)
+    got = _attend(args, bounded)
     assert MM.mla_decode_masked_dispatch_counters() == (1, 0)
     assert MM.mla_decode_masked_two_program_count() == (1 if lnc == "2" else 0)
     want = MD.mla_decode_attention_torch_oracle(*args, SCALE, PAGE, topk)
@@ -158,15 +167,29 @@ def test_the_kernel_attends_the_index_form(batch, rows, starts, lnc, force, monk
 
 def test_a_forced_pool_reaches_the_rows_it_was_forced_for():
     # The CLOSE case's premise: row 0 does not select pool 750, row 1 does.
-    _args, mask, _topk = _case(1, 4, [3003], seed=17 + 3003 + 4, force=CLOSE)
+    _args, _bounded_rows, mask, _topk = _case(1, 4, [3003], seed=17 + 3003 + 4, force=CLOSE)
     assert float(mask[0, 750]) == 0.0 and float(mask[1, 750]) == 1.0
+
+
+@pytest.mark.parametrize("starts, lnc", [([3001], "2"), ([2600], "2"), ([4092], None)])
+def test_tied_scores_select_as_the_index_selection_does(starts, lnc, monkeypatch):
+    # Three score levels: every row's cut falls inside a run of ties, which the kernel
+    # breaks as the selection does (the lowest candidates first).
+    _lnc(monkeypatch, lnc)
+    args, bounded, mask, topk = _case(1, 4, starts, seed=41 + starts[0], levels=3)
+    kth = bounded.sort(dim=1, descending=True).values[:, K - 1:K]
+    above, ties = (bounded > kth).sum(dim=1), (bounded == kth).sum(dim=1)
+    assert bool((above + ties > K).all()), "the cut must split a run of ties in every row"
+    got = _attend(args, bounded)
+    want = MD.mla_decode_attention_torch_oracle(*args, SCALE, PAGE, topk)
+    _check(got, want, f"ties starts={starts} lnc={lnc} vs oracle")
 
 
 @pytest.mark.parametrize("starts", [[3001], [4092]])
 def test_the_kernel_agrees_with_the_served_selected_kernel(starts, monkeypatch):
     _lnc(monkeypatch, "2")
-    args, mask, topk = _case(1, 4, starts, seed=29 + starts[0])
-    got = MM.mla_decode_masked_attention(*args, SCALE, PAGE, mask, POOL)
+    args, bounded, _mask, topk = _case(1, 4, starts, seed=29 + starts[0])
+    got = _attend(args, bounded)
     MD.reset_mla_decode_dispatch_counters()
     want = MD.mla_decode_attention(*args, SCALE, PAGE, topk_indices=topk)
     assert MD.mla_decode_route_counts()[:2] == (0, 1)
@@ -191,18 +214,108 @@ def test_a_geometry_outside_the_kernel_is_not_served(field, value, monkeypatch):
     assert not MM.mla_decode_masked_serves(**geometry)
 
 
+def test_the_kernel_key_covers_the_selection_the_kernel_runs():
+    """The kernel's cache key is a digest over this module, ``mla_decode.py`` and
+    ``decode_select.py``, whose helpers the body runs: an edit to any re-keys the
+    kernel."""
+    from vllm_neuron.source_digest import source_digest
+
+    assert MM.SOURCE_DIGEST == source_digest(MM.__file__, MD.__file__, DS.__file__)
+
+
+def test_more_rows_than_one_selection_tile_are_not_served(monkeypatch):
+    # A two-page window leaves the moving operand room for 33 rows, but the kernel
+    # selects a request's rows in one tile of the selection.
+    _lnc(monkeypatch, "2")
+    short = dict(heads=1, latent=LATENT, page=PAGE, window=2 * PAGE, pool=POOL)
+    tile = DS.tile_requests(2 * PAGE // POOL)
+    assert MM.mla_decode_masked_serves(rows=tile, **short)
+    assert not MM.mla_decode_masked_serves(rows=tile + 1, **short)
+
+
 def test_refusals_name_the_operand(monkeypatch):
     _lnc(monkeypatch, "2")
-    args, mask, _topk = _case(1, 4, [3001], seed=5)
-    for wrong, name in ((mask[:, :-1], "pool_mask"), (mask[:3], "pool_mask"),
-                        (mask.to(torch.bfloat16), "pool_mask")):
+    args, bounded, _mask, _topk = _case(1, 4, [3001], seed=5)
+    for wrong, name in ((bounded[:, :-1], "pool_scores"), (bounded[:3], "pool_scores"),
+                        (bounded.to(torch.bfloat16), "pool_scores")):
         with pytest.raises(MD.MlaDecodeAttentionError, match=name):
-            MM.mla_decode_masked_attention(*args, SCALE, PAGE, wrong, POOL)
+            _attend(args, wrong)
+    for select_k in (0, CANDIDATES):
+        with pytest.raises(MD.MlaDecodeAttentionError, match="select_k"):
+            MM.mla_decode_masked_attention(*args, SCALE, PAGE, bounded, POOL,
+                                           select_k=select_k)
     with pytest.raises(MD.MlaDecodeAttentionError, match="pool_size"):
-        MM.mla_decode_masked_attention(*args, SCALE, PAGE, mask, 3)
+        MM.mla_decode_masked_attention(*args, SCALE, PAGE, bounded, 3, select_k=K)
     q, bank, table, pos, written = args
     two_heads = torch.cat([q, q], dim=1)
     with pytest.raises(MD.MlaDecodeAttentionError, match="heads=2"):
-        MM.mla_decode_masked_attention(two_heads, bank, table, pos, written, SCALE, PAGE,
-                                       mask, POOL)
+        _attend((two_heads, bank, table, pos, written), bounded)
     assert MM.mla_decode_masked_dispatch_counters() == (0, 0)
+
+
+# ---------------------------------------------------------------------------------------
+# The one-row key-split form at a width of an odd chunk count
+# ---------------------------------------------------------------------------------------
+
+#: The served one-row selection: 512 pools of 4 tokens and one 128-row tail chunk.
+ONE_ROW_WIDTH = 2176
+
+
+def _one_row(start, *, seed, width=ONE_ROW_WIDTH):
+    """One request, one row at ``start``: the operands and its token indices, cut to
+    ``width`` columns."""
+    args, _bounded_rows, _mask, topk = _case(1, 1, [start], seed=seed)
+    assert int(topk.shape[1]) == ONE_ROW_WIDTH
+    return args, topk[:, :width].contiguous()
+
+
+@pytest.mark.parametrize("start, width", [
+    (2049, ONE_ROW_WIDTH),   # the first selecting position: fewer complete pools than k
+    (3001, ONE_ROW_WIDTH),
+    (4095, ONE_ROW_WIDTH),   # the window's last row
+    (3001, 9 * 128),         # 9 chunks: the selected pools' first tokens only
+])
+def test_the_padded_split_attends_one_row_as_the_oracle(start, width, monkeypatch):
+    _lnc(monkeypatch, "2")
+    args, topk = _one_row(start, seed=53 + start, width=width)
+    assert (width // 128) % 2 == 1
+    assert not MD._split_serves(1, LATENT, PAGE, width, 2)
+    got = MM.mla_decode_padded_split_attention(*args, SCALE, PAGE, topk)
+    assert MM.mla_decode_padded_split_count() == 1
+    assert MM.mla_decode_masked_dispatch_counters() == (0, 0)
+    want = MD.mla_decode_attention_torch_oracle(*args, SCALE, PAGE, topk)
+    _check(got, want, f"padded split start={start} width={width} vs oracle")
+    # The kernel mla_decode picks at this width: the general selected kernel.
+    MD.reset_mla_decode_dispatch_counters()
+    general = MD.mla_decode_attention(*args, SCALE, PAGE, topk_indices=topk)
+    assert MD.mla_decode_route_counts()[:2] == (0, 1) and MD.mla_decode_split_counts()[0] == 0
+    _check(got, general, f"padded split start={start} width={width} vs the general kernel")
+
+
+def test_the_padded_split_serves_an_odd_chunk_count_on_an_lnc2_pair_only(monkeypatch):
+    def serves(**changed):
+        geometry = dict(heads=1, latent=LATENT, page=PAGE, width=ONE_ROW_WIDTH)
+        geometry.update(changed)
+        return MM.mla_decode_padded_split_serves(**geometry)
+
+    _lnc(monkeypatch, "2")
+    assert serves() and serves(width=9 * 128)
+    # An even chunk count is mla_decode's key-split kernel's.
+    assert MD._split_serves(1, LATENT, PAGE, 2048, 2) and not serves(width=2048)
+    assert not serves(heads=2) and not serves(latent=384)
+    # One program splits nothing: mla_decode's key-split kernel serves every width there.
+    _lnc(monkeypatch, None)
+    assert not serves()
+
+
+def test_the_padded_split_refuses_what_it_does_not_serve(monkeypatch):
+    _lnc(monkeypatch, "2")
+    args, topk = _one_row(3001, seed=5)
+    with pytest.raises(MD.MlaDecodeAttentionError, match="width"):
+        MM.mla_decode_padded_split_attention(*args, SCALE, PAGE, topk[:, :2048].contiguous())
+    rows4, _bounded_rows, _mask, topk4 = _case(1, 4, [3001], seed=5)
+    with pytest.raises(MD.MlaDecodeAttentionError, match="one query row"):
+        MM.mla_decode_padded_split_attention(*rows4, SCALE, PAGE, topk4)
+    with pytest.raises(MD.MlaDecodeAttentionError, match="multiple of 128"):
+        MM.mla_decode_padded_split_attention(*args, SCALE, PAGE, topk[:, :100].contiguous())
+    assert MM.mla_decode_padded_split_count() == 0

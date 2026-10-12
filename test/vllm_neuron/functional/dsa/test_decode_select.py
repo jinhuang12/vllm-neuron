@@ -181,28 +181,24 @@ def _counting_matmuls(monkeypatch):
     return calls
 
 
-@pytest.mark.parametrize("entry, rows, candidates, matmuls", [
+@pytest.mark.parametrize("rows, candidates, matmuls", [
     # The verify step at the served width (16 partitions of 64 columns a row) and the
     # one-row step: the request matrix, the sign, 8 digits and the mask's two sums.
-    ("mask", 4, 1024, 12),
-    ("index", 1, 1024, 12),
+    (4, 1024, 12),
+    (1, 1024, 12),
     # 32 requests of 4096 candidates fold to 4 partitions of 1024 columns: 31 single bits.
-    ("mask", 32, 4096, 35),
+    (32, 4096, 35),
 ])
-def test_the_kth_search_takes_four_bits_a_step_on_a_short_chunk(monkeypatch, entry, rows,
+def test_the_kth_search_takes_four_bits_a_step_on_a_short_chunk(monkeypatch, rows,
                                                                 candidates, matmuls):
     """Each step of the search ends in a cross-partition sum, one matmul, so the
     matmuls count the steps."""
     bounded = _full(rows, candidates, seed=rows + candidates)
     lengths = [POOL * candidates + 1] * rows
     calls = _counting_matmuls(monkeypatch)
-    if entry == "mask":
-        got = DS.dsa_decode_select_mask(bounded, select_k=K)
-        want = DS.dsa_decode_select_mask_torch_oracle(bounded, select_k=K)
-    else:
-        got, want = _kernel(bounded, lengths), _oracle(bounded, lengths)
+    got = _kernel(bounded, lengths)
     assert len(calls) == matmuls
-    assert torch.equal(got, want)
+    assert torch.equal(got, _oracle(bounded, lengths))
     n = min(rows, DS.tile_requests(candidates))
     _fold, chunk, _major = DS.fold_layout(n, candidates, DS.select_fold_cap(candidates))
     assert (chunk <= DS.RADIX_COLUMNS) == (matmuls == 12)
@@ -244,27 +240,18 @@ def _cut_rows(candidates: int, *, seed: int) -> torch.Tensor:
     return torch.gather(out, 1, order).contiguous()
 
 
-@pytest.mark.parametrize("entry", ["mask", "index"])
-def test_both_searches_select_the_same_candidates(monkeypatch, entry):
+def test_both_searches_select_the_same_candidates(monkeypatch):
     """The digit search and the bit search find the same ``k``-th value, so they
     select the same candidates, on rows cut where a digit could stop short."""
     bounded = _cut_rows(1024, seed=21)
     rows = int(bounded.shape[0])
     lengths = [POOL * 1024 + 1] * rows
-
-    def run():
-        DB.reset_decode_batch_dispatch_counters()
-        if entry == "mask":
-            return DS.dsa_decode_select_mask(bounded, select_k=K)
-        return _kernel(bounded, lengths)
-
-    digits = run()
+    digits = _kernel(bounded, lengths)
+    DB.reset_decode_batch_dispatch_counters()
     monkeypatch.setattr(DS, "RADIX_COLUMNS", 0)
-    bits = run()
+    bits = _kernel(bounded, lengths)
     assert torch.equal(digits, bits)
-    want = (DS.dsa_decode_select_mask_torch_oracle(bounded, select_k=K) if entry == "mask"
-            else _oracle(bounded, lengths))
-    assert torch.equal(digits, want)
+    assert torch.equal(digits, _oracle(bounded, lengths))
 
 
 @pytest.mark.parametrize("batch", [2, 4, 19, 64])
@@ -325,7 +312,7 @@ def test_refusals():
 
 
 # ---------------------------------------------------------------------------------------
-# The mask entry: the same pools, before the compaction and the expansion
+# The mask oracle: the same pools, before the compaction and the expansion
 # ---------------------------------------------------------------------------------------
 
 
@@ -342,35 +329,14 @@ def _listed_pools(indices):
     ([300, 2047, 2049], 1024, None),         # fewer complete pools than k
     ([8191 - b % 4 for b in range(64)], 2048, 7),
 ])
-def test_the_mask_entry_selects_the_pools_the_index_entry_lists(lengths, candidates,
-                                                                 levels):
+def test_the_mask_oracle_marks_the_pools_the_kernel_lists(lengths, candidates, levels):
+    """``mla_decode_masked``'s tests hold its on-chip selection to this mask."""
     bounded = _bounded(lengths, candidates, seed=len(lengths) + candidates, levels=levels)
-    mask = DS.dsa_decode_select_mask(bounded, select_k=K)
-    assert _select_counts() == (1, 0)
+    mask = DS.dsa_decode_select_mask_torch_oracle(bounded, select_k=K)
     assert mask.dtype == torch.float32 and tuple(mask.shape) == (len(lengths), candidates)
-    assert torch.equal(mask, DS.dsa_decode_select_mask_torch_oracle(bounded, select_k=K))
     assert set(torch.unique(mask).tolist()) <= {0.0, 1.0}
-    DB.reset_decode_batch_dispatch_counters()
     listed = _listed_pools(_kernel(bounded, lengths))
     assert [set(torch.nonzero(row).flatten().tolist()) for row in mask] == listed
-
-
-def test_the_mask_entry_on_two_programs_equals_one(monkeypatch):
-    lengths = [4096 - 3 * b for b in range(8)]
-    bounded = _bounded(lengths, 1024, seed=8)
-    one = DS.dsa_decode_select_mask(bounded, select_k=K)
-    monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", "2")
-    assert DS.decode_select_programs(len(lengths)) == 2
-    assert torch.equal(DS.dsa_decode_select_mask(bounded, select_k=K), one)
-
-
-def test_the_mask_entry_refuses_what_the_index_entry_refuses():
-    bounded = _bounded([4000], 1024, seed=2)
-    for select_k in (1024, 0):
-        with pytest.raises(DS.DecodeSelectError, match="select_k"):
-            DS.dsa_decode_select_mask(bounded, select_k=select_k)
-    with pytest.raises(DS.DecodeSelectError, match="bounded"):
-        DS.dsa_decode_select_mask(bounded[0], select_k=K)
 
 
 # ---------------------------------------------------------------------------------------

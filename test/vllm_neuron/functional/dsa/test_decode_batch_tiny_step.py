@@ -63,11 +63,19 @@ PROMPTS = [13, 18, 27, 34]
 
 def _per_request_indexer(self, hidden_states, q_latent, pool_bank, tail_bank, slots,
                          seq_lens, position, *, max_seq_len, indices_wanted=True,
-                         projected=None, pool_mask=False):
+                         projected=None, pool_scores=False, query_rotated=True):
     """e75995b's indexer loop: one-request ``forward`` per request, on its own views. It
-    hands over token indices only (a tiny step is not one the masked kernel serves)."""
+    hands over token indices only (a tiny step is not one the masked kernel serves). The
+    one-request ``forward`` takes the query rotated, so a query handed as projected is
+    rotated first, by the rotation kernel."""
+    from vllm_neuron.functional.dsa.kpool_hadamard import dsa_hadamard128
+
     assert slots is None and isinstance(pool_bank, tuple) and isinstance(tail_bank, tuple)
-    assert not pool_mask
+    assert not pool_scores
+    if not query_rotated and projected[0] is not None:
+        query = projected[0]
+        rotated = dsa_hadamard128(query.reshape(-1, int(query.shape[-1])).contiguous())
+        projected = (rotated.reshape(query.shape),) + tuple(projected[1:])
     selected = []
     for b in range(int(hidden_states.shape[0])):
         rows = slice(b, b + 1)

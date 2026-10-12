@@ -6,7 +6,8 @@ compiler's front end refuses. This compiles ``dsa_decode_ring_rows_kernel`` at r
 4 (T in {1, 2}) and 8 (T in {1, 2, 4, 6}) at B in {1, 4, 130} (130 spans two partition
 tiles), and ``dsa_decode_scores_rows_kernel`` at ctx 4096 and 8192 (1024 and 2048
 candidates) and a ragged 300, at T in {1, 2, 4, 6} x B in {1, 4} on one and two
-programs, and both at B=1 on a one-slot bank (the one-request carrier's view, read
+programs, the scores again with the query rotated on chip at both windows' T in {1, 4} x
+B in {1, 4}, and both at B=1 on a one-slot bank (the one-request carrier's view, read
 statically), inside a child process that pins the platform target, opens no device node,
 and proves it parsed bodies by refusing one that reads an undefined name. The pattern is
 ``test_decode_batch_frontend_compile.py``'s.
@@ -38,6 +39,8 @@ SCORE_CANDIDATES = (1024, 2048, 300)
 SCORE_ROWS = (1, 2, 4, 6)
 SCORE_BATCHES = (1, 4)
 ONE_SLOT_CANDIDATES = (1024, 300)
+ROTATED_CANDIDATES = (1024, 2048)
+ROTATED_ROWS = (1, 4)
 
 
 @nki.jit
@@ -78,11 +81,11 @@ def _compile_each_entry() -> None:
             fake((batch * rows, DIM), bf), fake((batch * rows, DIM), bf),
             fake((POOL, DIM), f32), fake((batch, 1), i32), POOL, rows, TU.ROWS_SOURCE_DIGEST)
 
-    def scores(slots, cands, rows, batch, programs):
+    def scores(slots, cands, rows, batch, programs, rotate=False):
         return grid(TR.dsa_decode_scores_rows_kernel, programs)(
             fake((batch * rows, HEADS, DIM), bf), fake((batch * rows, HEADS), f32),
             fake((slots, cands + 1, DIM), bf), fake((batch, 1), i32), fake((batch, 1), i32),
-            fake((batch * rows, DIM), bf), cands, POOL, rows, TR.SOURCE_DIGEST)
+            fake((batch * rows, DIM), bf), cands, POOL, rows, rotate, TR.SOURCE_DIGEST)
 
     built = []
     for depth, rows in RING_FORMS:
@@ -96,6 +99,13 @@ def _compile_each_entry() -> None:
                     built.append((f"scores_c{cands}_t{rows}_b{batch}_g{programs}",
                                   lambda c=cands, t=rows, b=batch, g=programs: scores(
                                       SLOTS, c, t, b, g)))
+    for cands in ROTATED_CANDIDATES:
+        for rows in ROTATED_ROWS:
+            for batch in SCORE_BATCHES:
+                for programs in (1, 2):
+                    built.append((f"scores_rotated_c{cands}_t{rows}_b{batch}_g{programs}",
+                                  lambda c=cands, t=rows, b=batch, g=programs: scores(
+                                      SLOTS, c, t, b, g, rotate=True)))
     built.append(("ring_d8_t4_b1_one_slot", lambda: ring(1, 8, 4, 1)))
     for cands in ONE_SLOT_CANDIDATES:
         built.append((f"scores_c{cands}_t4_b1_one_slot", lambda c=cands: scores(1, c, 4, 1, 1)))
@@ -146,6 +156,7 @@ def test_the_front_end_accepts_both_row_kernels_at_the_served_shapes() -> None:
     entries = [row for row in rows if row["entry"] != "undefined_name_body"]
     want = (len(RING_FORMS) * len(RING_BATCHES)
             + len(SCORE_CANDIDATES) * len(SCORE_ROWS) * len(SCORE_BATCHES) * 2
+            + len(ROTATED_CANDIDATES) * len(ROTATED_ROWS) * len(SCORE_BATCHES) * 2
             + 1 + len(ONE_SLOT_CANDIDATES))
     assert len(entries) == want, (len(entries), want)
     refused = [f"{row['entry']}: {row['diagnostic']}" for row in entries

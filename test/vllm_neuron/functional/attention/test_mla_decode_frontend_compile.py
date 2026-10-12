@@ -39,8 +39,10 @@ QUERY_ROWS = (1, 2, 4, 6)
 SPLIT_DENSE_PAGES, SPLIT_SELECTED_PAGES = 16, 64
 SPLIT_BATCHES = (1, 4, 64)
 #: The masked kernel's served steps: one request, the verify step's rows, a 4096-row window
-#: of 4-token pools.
-MASKED_PAGES, MASKED_ROWS, POOL = 32, QUERY_ROWS[1:], 4
+#: of 4-token pools, 512 of its 1024 pools selected on chip.
+MASKED_PAGES, MASKED_ROWS, POOL, SELECT_K = 32, QUERY_ROWS[1:], 4, 512
+#: The padded key-split form's served step: one row of the selection's 2176 token indices.
+PADDED_WIDTH = SELECT_K * POOL + 128
 SITES = ((4096, 1536, True), (1536, 256, True), (4096, 512, True), (256, 4096, True),
          (1536, 4096, False), (4096, 128, False), (4096, 32, False))
 
@@ -68,6 +70,7 @@ def _compile_each_entry() -> None:
     from vllm_neuron.functional.attention import mla_decode as MD
     from vllm_neuron.functional.attention import mla_decode_masked as MM
     from vllm_neuron.functional.attention import mla_projections as MP
+    from vllm_neuron.functional.dsa.decode_select import select_fold_cap
 
     bf, f32, i32 = torch.bfloat16, torch.float32, torch.int32
 
@@ -113,8 +116,13 @@ def _compile_each_entry() -> None:
                 MM.mla_decode_masked_kernel, g)(
                 fake((t, 1, LATENT), bf), fake((BANK_PAGES * PAGE, LATENT), bf),
                 fake((1, MASKED_PAGES), i32), fake((1,), i32), fake((t, LATENT), bf),
-                fake((t, MASKED_PAGES * PAGE // POOL), f32), 0.0625, PAGE, POOL,
-                MM.SOURCE_DIGEST)))
+                fake((t, MASKED_PAGES * PAGE // POOL), f32), 0.0625, PAGE, POOL, SELECT_K,
+                select_fold_cap(MASKED_PAGES * PAGE // POOL), MM.SOURCE_DIGEST)))
+    built.append(("padded_split_b1_g2", lambda: grid(MM.mla_decode_padded_split_kernel, 2)(
+        fake((1, 1, LATENT), bf), fake((BANK_PAGES * PAGE, LATENT), bf),
+        fake((1, MASKED_PAGES), i32), fake((1,), i32), fake((1, LATENT), bf),
+        fake((1, PADDED_WIDTH), i32), 0.0625, PAGE, MM._padded_width(PADDED_WIDTH, 2),
+        MM.SOURCE_DIGEST)))
     for rows in (1, 4):
         for idim, odim, fp8 in SITES:
             for programs in (1, 2):
@@ -199,7 +207,7 @@ def test_the_front_end_accepts_every_new_entry_at_the_served_shapes() -> None:
         f"the child accepted a body that reads an undefined name, so it parsed none: {control}")
     entries = [row for row in rows if row["entry"] != "undefined_name_body"]
     assert len(entries) == (2 * 2 * len(QUERY_ROWS) * 2 + 2 * len(SPLIT_BATCHES) * 2
-                            + len(MASKED_ROWS) * 2 + 2 * len(SITES) * 2), len(entries)
+                            + len(MASKED_ROWS) * 2 + 1 + 2 * len(SITES) * 2), len(entries)
     refused = [f"{row['entry']}: {row['diagnostic']}" for row in entries
                if row["refused"] != "False"]
     assert not refused, refused
