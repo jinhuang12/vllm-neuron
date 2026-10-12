@@ -378,7 +378,8 @@ def _call_get_kv_cache_spec(layers: list[LayerSpec]) -> dict:
     fake_self = types.SimpleNamespace(
         vllm_config=types.SimpleNamespace(
             cache_config=types.SimpleNamespace(
-                block_size=HYBRID_BLOCK_SIZE, cache_dtype="auto"
+                block_size=HYBRID_BLOCK_SIZE, cache_dtype="auto",
+                mamba_cache_mode="none",
             ),
             model_config=types.SimpleNamespace(dtype=torch.bfloat16),
         ),

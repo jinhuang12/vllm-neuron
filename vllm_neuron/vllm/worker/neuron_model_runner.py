@@ -12431,6 +12431,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 # and the next step start from the accepted one
                 # (``functional.kda.fused_decode``, "Checkpoint banks"). Upstream's
                 # field, read from the speculative config, never a literal.
+                # ``mamba_cache_mode``: vLLM's ``MambaManager`` reads the mode from
+                # the spec, so the cache config's mode is carried here.
                 spec = MambaSpec(
                     block_size=recurrent_block_size,
                     shapes=(
@@ -12441,6 +12443,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         layer.kda_conv_state_dtype,
                         layer.kda_recurrent_state_dtype,
                     ),
+                    mamba_cache_mode=self.vllm_config.cache_config.mamba_cache_mode,
                     num_speculative_blocks=(
                         int(self.speculative_config.num_speculative_tokens)
                         if self.speculative_config is not None
