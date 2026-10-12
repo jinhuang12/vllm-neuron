@@ -9,7 +9,8 @@ callers compute today, ``cdiv(max_model_len, block_size) + draft_blocks_per_requ
 Under decode context parallelism (``dcp > 1``) an attention group keeps ``1 / dcp`` of
 the tokens on each rank, vLLM's own per-rank rule (``FullAttentionSpec.
 max_memory_usage_bytes``); a recurrent (``MambaSpec``) group keeps one state slot per
-sequence on every rank and is not divided.
+sequence on every rank and is not divided. Which groups are divided is
+``kv_group_blocks.is_token_paged``, which the runner's prefill slot interleave also follows.
 
 Expectations are derived from vLLM's own grouping and per-spec figures on the served
 model's layer specs (``test_kv_budget_glm53f``) and on synthetic specs of every class
@@ -209,3 +210,17 @@ def test_a_group_of_attention_and_recurrent_layers_is_refused_past_dcp_one() -> 
     for dcp in DCPS:
         with pytest.raises(ValueError, match="UniformTypeKVCacheSpecs"):
             KB.group_blocks_per_request(mixed, 4096, where, dcp=dcp)
+
+
+@pytest.mark.parametrize("name, spec", SYNTHETIC, ids=[name for name, _ in SYNTHETIC])
+def test_attention_groups_are_token_paged_and_recurrent_groups_are_not(name, spec) -> None:
+    """An attention group's blocks hold a sequence's tokens; a ``MambaSpec`` group's hold
+    one request's state; a uniform-type group is token-paged as its layers are."""
+    recurrent = name.startswith(("mamba_", "uniform_mamba_"))
+    assert KB.is_token_paged(spec, name) is not recurrent
+
+
+def test_is_token_paged_refuses_a_group_of_attention_and_recurrent_layers() -> None:
+    mixed = _uniform(_attention(128), _mamba(128, 0))
+    with pytest.raises(ValueError, match="UniformTypeKVCacheSpecs"):
+        KB.is_token_paged(mixed, "KV cache group 0")

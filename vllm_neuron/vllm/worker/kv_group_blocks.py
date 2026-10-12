@@ -8,7 +8,8 @@ and the per-group rows of the runner's ``InputBatch`` block table
 (``NeuronModelRunner.initialize_kv_cache``). Both read the figure from here, so a
 spec class is priced once. :func:`draft_blocks_per_request` gives the blocks beyond the
 sequence's pages; :func:`group_blocks_per_request` gives the whole figure on one rank,
-pages included, at any decode context parallel size.
+pages included, at any decode context parallel size. :func:`is_token_paged` says which
+groups a decode context parallel rank keeps only its share of.
 """
 from __future__ import annotations
 
@@ -115,20 +116,37 @@ def group_blocks_per_request(spec: KVCacheSpec, max_model_len: int, where: str, 
             f"got {dcp!r}"
         )
     draft_blocks = draft_blocks_per_request(spec, where)
-    ranks = dcp if dcp > 1 and _divided_over_ranks(spec, where) else 1
+    ranks = dcp if dcp > 1 and is_token_paged(spec, where) else 1
     return cdiv(max_model_len, spec.block_size * ranks) + draft_blocks
 
 
-def _divided_over_ranks(spec: KVCacheSpec, where: str) -> bool:
-    """Whether a decode context parallel rank keeps only its share of the group's tokens.
+def is_token_paged(spec: KVCacheSpec, where: str) -> bool:
+    """Whether a KV cache group's blocks hold a sequence's tokens, ``block_size`` to a block.
+
+    Under decode context parallelism a rank keeps only its share of a token-paged group:
+    every ``dcp``-th ``block_size`` run of a sequence's tokens. Two consumers follow this
+    one rule, so they agree on every group: the block-table rows
+    (:func:`group_blocks_per_request` divides a token-paged group's pages over the
+    ranks) and the runner's prefill slot interleave (``_build_attention_metadata`` and
+    ``_build_warmup_attention_metadata`` of ``NeuronModelRunner`` keep a token-paged
+    group's slots at this rank's positions only).
 
     ``spec`` is of a class :func:`draft_blocks_per_request` prices: an attention spec is
-    divided, a ``MambaSpec`` is not, and a uniform-type group is divided as all of its
-    layers are.
+    token-paged; a ``MambaSpec`` is not, as the runner keeps each recurrent layer's
+    state in a bank of one slot per request on every rank; a uniform-type group is
+    token-paged as all of its layers are.
+
+    Args:
+        spec: The group's KV cache spec.
+        where: The group, named for the refusal.
+
+    Raises:
+        ValueError: ``spec`` is a uniform-type group of token-paged layers and layers
+            that are not.
     """
     if isinstance(spec, UniformTypeKVCacheSpecs):
         per_member = {
-            _divided_over_ranks(member, f"{where}, layer {name!r}")
+            is_token_paged(member, f"{where}, layer {name!r}")
             for name, member in spec.kv_cache_specs.items()
         }
         if len(per_member) != 1:
