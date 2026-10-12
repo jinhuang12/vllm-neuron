@@ -3746,7 +3746,10 @@ class Glm5NextKDAAttention(nn.Module):
             kda_intra_chunk,
         )
         from vllm_neuron.functional.kda.decode_state import kda_decode_step
-        from vllm_neuron.functional.kda.depthwise_conv1d import depthwise_conv1d
+        from vllm_neuron.functional.kda.depthwise_conv1d import (
+            carried_rows,
+            depthwise_conv1d_rows,
+        )
         from vllm_neuron.functional.kda.fused_decode import (
             fused_decode_enabled,
             kda_fused_decode,
@@ -3921,7 +3924,6 @@ class Glm5NextKDAAttention(nn.Module):
         heads = int(self.num_kv_heads_per_rank)
         kdim = int(self.head_dim)
         width = heads * kdim
-        state_rows = int(self.short_conv_kernel_size) - 1
 
         expected_recurrent = (heads, kdim, kdim)
         if tuple(recurrent_state.shape) != expected_recurrent:
@@ -4007,16 +4009,14 @@ class Glm5NextKDAAttention(nn.Module):
         # --- 1: the short convolution, one call for q, k and v ---------------
         # The three streams are convolved together as one channel block, which is
         # the same channel extent the state calculator reports
-        # (``conv_dim = proj + 2 * proj_k``). Padding is carried by the state rather
-        # than by the kernel, which refuses non-zero width padding.
-        conv_in = torch.cat((q_in, k_in, v_in), dim=-1)
+        # (``conv_dim = proj + 2 * proj_k``). The kernel reads them token-major, as
+        # the projections write them, after the carried rows, so no image of the
+        # window is built here. Padding is carried by the state rather than by the
+        # kernel, which takes none.
+        streams = (q_in, k_in, v_in)
         history = self._conv_history(conv_state)
         history = torch.where(opening, torch.zeros_like(history), history)
-        padded = torch.cat((history, conv_in), dim=0)
         channels = 3 * width
-        img = (
-            padded.t().contiguous().reshape(1, channels, 1, state_rows + tokens)
-        )
         filt = torch.cat(
             (
                 self.q_conv1d_weight.to(torch.float32).reshape(width, 1, 1, -1),
@@ -4025,7 +4025,7 @@ class Glm5NextKDAAttention(nn.Module):
             ),
             dim=0,
         ).contiguous()
-        conv_out = depthwise_conv1d(img, filt)
+        conv_out = depthwise_conv1d_rows(history, streams, filt)
         conv_out = conv_out.reshape(channels, tokens).t()
         conv_out = torch.nn.functional.silu(conv_out)
         q_conv, k_conv, v_conv = conv_out.split(width, dim=-1)
@@ -4034,14 +4034,15 @@ class Glm5NextKDAAttention(nn.Module):
         # index is derived from the real length rather than read from it, and a step
         # whose real length is below the history width keeps the older rows it still
         # needs. On an opening chunk -- where the history rows are zeroed -- a chunk
-        # of fewer than ``state_rows`` rows leaves a window whose leading rows are
+        # of fewer than ``kernel_size - 1`` rows leaves a window whose leading rows are
         # zero, which is the padding a sequence with no history has, rather than the
         # previous owner's rows or this chunk's rows repeated.
         real_length = _int64_scalar(
-            tokens if real_tokens is None else real_tokens, padded.device
+            tokens if real_tokens is None else real_tokens, history.device
         )
-        history_index = torch.arange(state_rows, device=padded.device) + real_length
-        self._store_conv_history(conv_state, padded.index_select(0, history_index))
+        self._store_conv_history(
+            conv_state, carried_rows(history, streams, real_length)
+        )
 
         # --- 2: the gate clamp, one call per head per token tile --------------
         # The kernel takes one head per call: it refuses an ``a_log`` holding more
