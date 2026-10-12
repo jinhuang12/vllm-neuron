@@ -232,8 +232,8 @@ def _record_one_tapped_layer(layer, monkeypatch) -> tuple[dict, list]:
         # gathers its rows and the raw latent would then not be what the write carried.
         project_latent = layer.attention.project_query_and_latent
 
-        def _record_latent(hidden_states):
-            query, kv_latent = project_latent(hidden_states)
+        def _record_latent(hidden_states, **kwargs):
+            query, kv_latent = project_latent(hidden_states, **kwargs)
             seen["latent_written"] = kv_latent.detach().clone()
             return query, kv_latent
 

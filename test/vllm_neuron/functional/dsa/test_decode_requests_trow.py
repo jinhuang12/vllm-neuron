@@ -25,7 +25,12 @@ reference therefore takes its one-token steps through the general kernel
 every attention launch -- is matched to the two kernels' rounding through the bf16 cast
 before ``W_UV`` (the bound ``test_mla_decode_split.py`` holds the kernels to is 2e-5
 relative; the cast turns that into single bf16 ulps), and its banks bit for bit (no bank
-row depends on the attention output within a step).
+row depends on the attention output within a step). One ``T``-row step does not run the
+general kernel: a selecting step of one request attends by pool mask
+(``mla_decode_masked``), which agrees with the general kernel to the same bound
+(``test_mla_decode_masked.py``); that step is matched to the reference at that rounding,
+banks bit for bit, and the same step in the index form (the masked kernel declined) bit
+for bit.
 """
 
 from __future__ import annotations
@@ -45,6 +50,7 @@ from test.vllm_neuron.functional.dsa.dsa_decode_case import (
     decode_config,
 )
 from vllm_neuron.functional.attention import mla_decode as MD
+from vllm_neuron.functional.attention import mla_decode_masked as MM
 from vllm_neuron.functional.dsa import decode_batch as DB
 from vllm_neuron.functional.dsa import decode_tail_update as TU
 from vllm_neuron.functional.dsa import decode_trow as TR
@@ -231,6 +237,7 @@ def _reset_counters():
     TU.reset_decode_tail_dispatch_counters()
     TR.reset_decode_trow_dispatch_counters()
     MD.reset_mla_decode_dispatch_counters()
+    MM.reset_mla_decode_masked_dispatch_counters()
 
 
 @pytest.mark.parametrize("regime", sorted(REGIMES))
@@ -254,8 +261,11 @@ def test_the_rows_step_equals_sequential_one_token_steps_bit_for_bit(rows, batch
     assert DB.decode_batch_dispatch_counters() == ((1, 0) if selecting else (0, 0))
     ring, scores, _, select = DB.decode_batch_route_counts()
     assert (ring, scores, select) == (0, 0, int(selecting))
-    if batch == 1 and rows == 1 and regime == "selecting":
-        # The one-request one-token step keeps its one-request sparse attention.
+    masked = batch == 1 and rows > 1 and selecting
+    assert MM.mla_decode_masked_dispatch_counters() == ((1, 0) if masked else (0, 0))
+    if batch == 1 and selecting:
+        # The one-request one-token step keeps its one-request sparse attention; the
+        # one-request T-row step attends by pool mask.
         assert MD.mla_decode_dispatch_counters() == (0, 0)
     else:
         assert MD.mla_decode_dispatch_counters() == (1, 0)
@@ -267,14 +277,18 @@ def test_the_rows_step_equals_sequential_one_token_steps_bit_for_bit(rows, batch
                        general=rows > 1)
     assert out.shape == (batch * rows, int(_module().hidden_size))
     if batch == 1 and regime == "selecting":
-        # Kernel for kernel the rows step equals the sequence; the production
-        # one-token path at B = 1 attends through the one-request sparse kernel, so
-        # against it the output agrees to the two kernels' rounding, and every bank is
-        # the same bit for bit (the indexer chain is one and the same).
-        if rows == 1:
-            torch.testing.assert_close(out.float(), want.float(), rtol=2e-2, atol=2e-3)
-        else:
-            assert torch.equal(out, want)
+        # The rows step's kernel (the masked kernel at T > 1) is not the sequence's, and
+        # the production one-token path at B = 1 attends through the one-request sparse
+        # kernel, so against both the output agrees to the kernels' rounding, and every
+        # bank is the same bit for bit (the indexer chain is one and the same). Kernel
+        # for kernel, the index form of the T-row step equals the sequence.
+        torch.testing.assert_close(out.float(), want.float(), rtol=2e-2, atol=2e-3)
+        if masked:
+            index_form = _cloned(ops)
+            with mock.patch.object(model_fp8.Glm5NextMLAAttention,
+                                   "_masked_attention_serves", lambda *_: False):
+                assert torch.equal(_rows_step(index_form), want)
+            _assert_banks_equal(index_form, mine)
         prod = _cloned(ops)
         want_prod = _sequential(prod, ops["hidden"], ops["start"], ops["latent_slots"], rows,
                                 production=True)

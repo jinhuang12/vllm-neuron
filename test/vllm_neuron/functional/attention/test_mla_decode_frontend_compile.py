@@ -5,9 +5,10 @@ The simulator runs a kernel body as plain Python, so it cannot see a call form t
 compiler's front end refuses. This file compiles every new entry at the served shapes --
 decode attention dense and selected at B in {1, 4} x T in {1, 2, 4, 6} query rows per
 request on one and two programs, the key-split decode attention dense (ctx 1024) and
-selected (ctx 8192) at B in {1, 4, 64} on one and two programs, and the low-precision
-projection at each DSA site's TP=64 width at M in {1, 4} on one and two
-programs -- inside a child process that pins the platform target, opens no device node,
+selected (ctx 8192) at B in {1, 4, 64} on one and two programs, the masked decode
+attention at the selecting bucket's window (4096 rows) for one request of each verify
+step's rows on one and two programs, and the low-precision projection at each DSA site's
+TP=64 width at M in {1, 4} on one and two programs -- inside a child process that pins the platform target, opens no device node,
 and proves it parsed bodies by refusing one that reads an undefined name. The pattern is
 ``test_mla_sparse_frontend_compile.py``'s.
 """
@@ -37,6 +38,9 @@ QUERY_ROWS = (1, 2, 4, 6)
 #: The key-split kernel's served windows: ctx 1024 dense, ctx 8192 selected.
 SPLIT_DENSE_PAGES, SPLIT_SELECTED_PAGES = 16, 64
 SPLIT_BATCHES = (1, 4, 64)
+#: The masked kernel's served steps: one request, the verify step's rows, a 4096-row window
+#: of 4-token pools.
+MASKED_PAGES, MASKED_ROWS, POOL = 32, QUERY_ROWS[1:], 4
 SITES = ((4096, 1536, True), (1536, 256, True), (4096, 512, True), (256, 4096, True),
          (1536, 4096, False), (4096, 128, False), (4096, 32, False))
 
@@ -62,9 +66,10 @@ def _compile_each_entry() -> None:
     from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
     from vllm_neuron.functional.attention import mla_decode as MD
+    from vllm_neuron.functional.attention import mla_decode_masked as MM
     from vllm_neuron.functional.attention import mla_projections as MP
 
-    bf, i32 = torch.bfloat16, torch.int32
+    bf, f32, i32 = torch.bfloat16, torch.float32, torch.int32
 
     def fake(shape, dtype):
         return torch.empty(shape, dtype=dtype, device="meta")
@@ -102,6 +107,14 @@ def _compile_each_entry() -> None:
                               fake((b, SPLIT_SELECTED_PAGES), i32), fake((b,), i32),
                               fake((b, LATENT), bf), fake((b, TOPK_ROWS), i32), 0.0625, PAGE,
                               MD.SOURCE_DIGEST)))
+    for rows in MASKED_ROWS:
+        for programs in (1, 2):
+            built.append((f"masked_t{rows}_g{programs}", lambda t=rows, g=programs: grid(
+                MM.mla_decode_masked_kernel, g)(
+                fake((t, 1, LATENT), bf), fake((BANK_PAGES * PAGE, LATENT), bf),
+                fake((1, MASKED_PAGES), i32), fake((1,), i32), fake((t, LATENT), bf),
+                fake((t, MASKED_PAGES * PAGE // POOL), f32), 0.0625, PAGE, POOL,
+                MM.SOURCE_DIGEST)))
     for rows in (1, 4):
         for idim, odim, fp8 in SITES:
             for programs in (1, 2):
@@ -186,7 +199,7 @@ def test_the_front_end_accepts_every_new_entry_at_the_served_shapes() -> None:
         f"the child accepted a body that reads an undefined name, so it parsed none: {control}")
     entries = [row for row in rows if row["entry"] != "undefined_name_body"]
     assert len(entries) == (2 * 2 * len(QUERY_ROWS) * 2 + 2 * len(SPLIT_BATCHES) * 2
-                            + 2 * len(SITES) * 2), len(entries)
+                            + len(MASKED_ROWS) * 2 + 2 * len(SITES) * 2), len(entries)
     refused = [f"{row['entry']}: {row['diagnostic']}" for row in entries
                if row["refused"] != "False"]
     assert not refused, refused

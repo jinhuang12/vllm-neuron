@@ -108,6 +108,12 @@ _SEAM_REGISTRY = {
     "mla_decode": (
         "vllm_neuron.functional.attention.mla_decode",
         "mla_decode_dispatch_counters", "reset_mla_decode_dispatch_counters"),
+    # A one-request selecting verify step's attention by pool mask. It has no torch
+    # route (a call it does not serve is refused), so its fallback count stays 0.
+    "mla_decode_masked": (
+        "vllm_neuron.functional.attention.mla_decode_masked",
+        "mla_decode_masked_dispatch_counters",
+        "reset_mla_decode_masked_dispatch_counters"),
     "mla_sparse": (
         "vllm_neuron.functional.attention.mla_sparse",
         "mla_sparse_dispatch_counters", "reset_mla_sparse_dispatch_counters"),
