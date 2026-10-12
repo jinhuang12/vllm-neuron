@@ -349,8 +349,9 @@ def _pad_bounds(
 class Glm5NextVisionBlock(nn.Module):
     """Pre-norm residual block, matching the reference.
 
-    Both norms are RMSNorm on the vision config's own epsilon. The qwen3_vl template uses
-    ``nn.LayerNorm`` here; this reference does not.
+    Both norms are RMSNorm on the vision config's ``block_norm_eps``, which is not the epsilon
+    of the attention's q_norm and k_norm. The qwen3_vl template uses ``nn.LayerNorm`` here; this
+    reference does not.
     """
 
     def __init__(
@@ -358,10 +359,10 @@ class Glm5NextVisionBlock(nn.Module):
     ) -> None:
         super().__init__()
         self.norm1 = Glm5NextVisionRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
+            config.hidden_size, eps=config.block_norm_eps, dtype=dtype
         )
         self.norm2 = Glm5NextVisionRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, dtype=dtype
+            config.hidden_size, eps=config.block_norm_eps, dtype=dtype
         )
         self.attn = Glm5NextVisionAttention(config, dtype=dtype)
         self.mlp = Glm5NextVisionMLP(config, dtype=dtype)
