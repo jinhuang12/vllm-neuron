@@ -651,13 +651,16 @@ it off where token identity with non-speculative decoding is required. Details:
 [`docs/design/speculation/speculative_decoding_design.md`](../design/speculation/speculative_decoding_design.md#glm-53-flash-mtp-drafter-method-mtp).
 
 By default (`VLLM_NEURON_GLUE_FUSED` unset or `1`) GLM-5.3-Flash's fused glue
-kernels serve the mHC sites at the prefill buckets only, not at the verify step. To
-fuse the mHC pre-mix at the verify step too, add `mhc_pre:verify` to the default's
-rules:
-`VLLM_NEURON_GLUE_FUSED=mhc_pre:prefill@128,mhc_pre:prefill@1024,mhc_pre:prefill@2048,mhc_post:prefill@128,mhc_post:prefill@1024,mhc_post:prefill@2048,mhc_pre:verify`.
-This saves time per token but changes answers: on a trn2 TP=64 server of
-GLM-5.3-Flash at batch size 1 with 3 drafts, the rule got wrong some answers that the
-server without speculation got right, and the default got none of those wrong.
+kernels serve the mHC sites at the prefill buckets, and the fused mHC pre-mix serves the
+verify step too (`mhc_pre:verify`); at the verify step the mHC combine and the KDA sites
+keep their torch routes. The verify rule saves time per token but changes answers: on a
+TP=64 server of GLM-5.3-Flash at batch size 1 with 3 drafts, with the synchronous
+drafter and with the async drafter, the rule got wrong some benchmark answers that the
+same server without the rule got right. The async drafter's comparisons with the
+synchronous drafter above were made without the rule. To keep those answers, set the six
+prefill rules, which keep the prefill kernels and give the verify step its torch route:
+`VLLM_NEURON_GLUE_FUSED=mhc_pre:prefill@128,mhc_pre:prefill@1024,mhc_pre:prefill@2048,mhc_post:prefill@128,mhc_post:prefill@1024,mhc_post:prefill@2048`;
+`VLLM_NEURON_GLUE_FUSED=0` turns every fused glue kernel off.
 
 ### On-device vs CPU sampling
 
