@@ -9288,6 +9288,12 @@ class Glm5NextModel(nn.Module):
         tap_layers = dump_tap_layers(layers) if collect_layer_streams else ()
         from vllm_neuron.functional.moe import router_prefill
 
+        # The forward's leg, which decides whether the feed-forward sites ask for the
+        # router's input scale (below). The runner steps every layer of one forward on
+        # one leg and hands it to each linear-attention layer as ``is_prefill``; the
+        # sparse-attention carriers do not carry it. A forward with no linear-attention
+        # carrier names no leg, and its sites ask for nothing.
+        prefill_leg = any(bool(carrier.get("is_prefill", False)) for carrier in carriers)
         for index, (layer, carrier) in enumerate(zip(layers, carriers)):
             # One tensor, passed as both arguments on purpose. The streams are this
             # layer's input; the keyword is this tree's route selector and the
@@ -9303,9 +9309,11 @@ class Glm5NextModel(nn.Module):
             # ``_ffn_half`` the single ``[T, H]`` stream it has always taken, with that
             # stream's feed-forward RMSNorm when the fused mhc_pre kernel computed it
             # (else ``_ffn_half`` normalises it), and mixes its return back. On a MoE
-            # layer, for a call the prefill router can take, it also asks the kernel
-            # for that norm without its gain, the router's input (``scaled``); every
-            # other call is the site call it was.
+            # layer, on the prefill leg, for a call the prefill router can take, it also
+            # asks the kernel for that norm without its gain, the router's input
+            # (``scaled``); every other call is the site call it was. The leg, not the
+            # row count, keeps the verify step out: its ``B * (1 + k)`` rows can exceed
+            # the prefill router's floor too.
             # ``streams`` is never ``None`` here, so this is a site or a refusal,
             # never the plain add.
             site = _mhc_ffn_site(layer, streams)
@@ -9333,7 +9341,8 @@ class Glm5NextModel(nn.Module):
                 ),
                 **(
                     {"router_scale": True}
-                    if isinstance(getattr(layer, "mlp", None), Glm5NextMoEBlock)
+                    if prefill_leg
+                    and isinstance(getattr(layer, "mlp", None), Glm5NextMoEBlock)
                     and router_prefill.prefill_route_takes_rows(streams.shape[0])
                     else {}
                 ),
