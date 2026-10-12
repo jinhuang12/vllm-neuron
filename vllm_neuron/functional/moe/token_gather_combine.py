@@ -14,12 +14,14 @@ The kernel puts 128 tokens on the partitions and keeps an fp32 accumulator and a
 gather buffer per token tile and program's part of a hidden piece (a unit).
 Slot 0 gathers every token's row (an invalid slot names a finite row; the caller
 points it at row 0), and the scalar engine starts the accumulator as ``row * valid + 0``.
-The vector engine adds the later slots, in one device loop per token tile that ends
-after the last slot some token of the tile fills. A rank holds a few of the experts,
-so a token fills few of its ``K`` slots, and ``combine_slots`` fills them from slot 0,
-so the loop of a tile runs only the slots its tokens fill. In a later slot, an invalid
-slot gets an index past the last row, so its gather moves no bytes for that token and
-leaves the token's previous row in the buffer, which the vector engine weighs by zero.
+The vector engine adds the later slots, in one device loop per batch of token tiles
+that ends after the last slot some token of the batch fills; each trip gathers one slot
+of every unit of the batch, so the batch's gathers are in flight together. A rank holds
+a few of the experts, so a token fills few of its ``K`` slots, and ``combine_slots``
+fills them from slot 0, so the loop runs only the slots the batch's tokens fill. In a
+later slot, an invalid slot gets an index past the last row, so its gather moves no
+bytes for that token and leaves the token's previous row in the buffer, which the
+vector engine weighs by zero.
 The tile's first token reads its named row instead, so no gather skips every row,
 whatever the slot order. The adds run in slot order from zero, the order of
 ``token_gather_combine_torch``.
@@ -122,9 +124,9 @@ def _slot_groups(table, tiles: int, slots: int):
                     offset=0)
 
 
-def _tile_ends(counts, scores, tiles: int, slots: int):
-    """``[1, tiles]`` int32 on partition 0: per tile, one past the last slot that some token
-    of the tile fills, and at least 1.
+def _batch_end(counts, scores, tiles: int, slots: int):
+    """``[1, 1]`` int32 on partition 0: one past the last slot that some token of the batch's
+    ``tiles`` token tiles fills, and at least 1.
 
     ``counts`` holds each tile's tokens per slot, ``scores`` the slot numbers plus one; a
     filled slot scores its number plus one, and the end is the greatest score.
@@ -137,10 +139,11 @@ def _tile_ends(counts, scores, tiles: int, slots: int):
     best = nl.ndarray((1, _lines(tiles)), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_reduce(dst=best[:, 0:tiles], data=_slot_groups(filled, tiles, slots),
                        op=nl.maximum, axis=2)
-    ends = nl.ndarray((1, _lines(tiles)), dtype=nl.int32, buffer=nl.sbuf)
-    nisa.tensor_scalar(dst=ends[:, 0:tiles], data=best[:, 0:tiles], op0=nl.maximum,
-                       operand0=1.0)
-    return ends
+    most = nl.ndarray((1, _LINE), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_reduce(dst=most[:, 0:1], data=best[:, 0:tiles], op=nl.maximum, axis=1)
+    end = nl.ndarray((1, _LINE), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=end[:, 0:1], data=most[:, 0:1], op0=nl.maximum, operand0=1.0)
+    return end
 
 
 def _column(dst, table, slot):
@@ -224,25 +227,23 @@ def token_gather_combine_kernel(contribution_hbm, index_hbm, valid_hbm):
                                 bias=zero[:, 0:1])
                 units.append((tb * TOKEN_TILE * hidden + piece * tile_h, rows, picked, acc))
             work.append((weights, units))
-        ends = _tile_ends(counts, scores, count, slots)
+        end = _batch_end(counts, scores, count, slots)
 
-        for b in range(count):
-            weights = work[b][0]
-            units = work[b][1]
-
-            def add_slot(slot):
-                """Slot ``slot`` (a register) of every unit of the tile."""
+        def add_slot(slot):
+            """Slot ``slot`` (a register) of every unit of the batch."""
+            for tile in work:
                 weight = nl.ndarray((TOKEN_TILE, 1), dtype=nl.float32, buffer=nl.sbuf)
-                _column(weight, weights, slot)
-                for unit in units:
+                _column(weight, tile[0], slot)
+                for unit in tile[1]:
                     row = nl.ndarray((TOKEN_TILE, 1), dtype=nl.int32, buffer=nl.sbuf)
                     _column(row, unit[1], slot)
                     _gather(unit[2], banked, row, True)
                     nisa.scalar_tensor_tensor(dst=unit[3], data=unit[2], op0=nl.multiply,
                                               operand0=weight, op1=nl.add, operand1=unit[3])
 
-            nl.fori_loop(1, _register(ends[:, b:b + 1]), add_slot)
-            for unit in units:
+        nl.fori_loop(1, _register(end[:, 0:1]), add_slot)
+        for tile in work:
+            for unit in tile[1]:
                 nisa.dma_copy(dst=out_hbm.ap(pattern=[[hidden, TOKEN_TILE], [1, tile_h]],
                                              offset=unit[0]), src=unit[3], dge_mode=_HWDGE,
                               engine=_QUEUE)
