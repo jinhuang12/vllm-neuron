@@ -687,23 +687,23 @@ Contract of the opt-in (measured on trn2 at TP64/EP16, `k = 3`, `max_num_seqs 1`
   block table are sized for the `1 + k` recurrent blocks a drafting request holds
   (`kv_group_blocks.draft_blocks_per_request`).
 
-**The verify step's glue fusion is in the default.** By default (`VLLM_NEURON_GLUE_FUSED`
-unset or `1`, `vllm_neuron/functional/glue`) the fused glue kernels serve the mHC
-sites at the prefill buckets, and the fused mHC pre-mix serves the verify step too
-(`mhc_pre:verify`); at the verify step the mHC combine and the KDA sites keep their
-torch routes. A server without speculation has no verify step, so the rule changes none
-of its graphs. The async drafter's comparison with the synchronous drafter above was
-made without the rule.
+**The verify step's glue fusion is in the default.** By default
+(`VLLM_NEURON_GLUE_FUSED` unset or `1`, `vllm_neuron/functional/glue`) the fused glue
+kernels serve the mHC sites at the prefill buckets and the KDA sites at the 1024-row
+prefill chunk, and the fused mHC pre-mix serves the verify step too (`mhc_pre:verify`);
+at the verify step the mHC combine and the KDA sites keep their torch routes. A server
+without speculation has no verify step, so the rule changes none of its graphs. The
+async drafter's comparison with the synchronous drafter above was made without the rule.
 
 It is faster, and it changes answers. On a TP=64 server of GLM-5.3-Flash at batch size
 1 with `k = 3`, with the synchronous drafter and with the async drafter, the rule
 shortened the inter-token latency and got wrong some benchmark answers that the same
 server without the rule got right. The default takes the time per token. To keep those
-answers instead, set the switch to the six prefill rules, which keep the prefill
+answers instead, set the switch to the eight prefill rules, which keep the prefill
 kernels and give the verify step its torch route:
 
 ```bash
-VLLM_NEURON_GLUE_FUSED=mhc_pre:prefill@128,mhc_pre:prefill@1024,mhc_pre:prefill@2048,mhc_post:prefill@128,mhc_post:prefill@1024,mhc_post:prefill@2048
+VLLM_NEURON_GLUE_FUSED=mhc_pre:prefill@128,mhc_pre:prefill@1024,mhc_pre:prefill@2048,mhc_post:prefill@128,mhc_post:prefill@1024,mhc_post:prefill@2048,kda_projections:prefill@1024,kda_output:prefill@1024
 ```
 
 `VLLM_NEURON_GLUE_FUSED=0` turns every fused glue kernel off.
