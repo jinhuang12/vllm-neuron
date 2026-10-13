@@ -29,7 +29,10 @@ from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.sampling_params import SamplingType
 from vllm.tasks import SupportedTask
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm_neuron.vllm.worker.kv_group_blocks import group_blocks_per_request
+from vllm_neuron.vllm.worker.kv_group_blocks import (
+    group_blocks_per_request,
+    is_token_paged,
+)
 from vllm_neuron.utils.dtype_utils import kv_cache_dtype_str_to_dtype
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -4803,7 +4806,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # using the same interleave pattern. Size is always S/DCP
             # (deterministic, no recompile).
             # Slice on CPU (Neuron tensors don't support .contiguous()) then move back.
-            if not is_decode and self.cp_world_size > 1:
+            # Only a token-paged group has a per-rank token shard; any other group
+            # keeps the step's slot mapping as is.
+            if (
+                not is_decode
+                and self.cp_world_size > 1
+                and is_token_paged(spec, f"KV cache group {kv_cache_group_id}")
+            ):
                 # Hybrid KV manager scales block_size per KV group. We need
                 # to always use an interleave size equal to block_size
                 I = block_size
@@ -5001,7 +5010,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         is_prefill = (num_tokens // num_reqs) > decode_token_threshold
 
-        for _, kv_cache_group_spec in enumerate(self.kv_cache_config.kv_cache_groups):
+        for kv_cache_group_id, kv_cache_group_spec in enumerate(
+            self.kv_cache_config.kv_cache_groups
+        ):
             spec = kv_cache_group_spec.kv_cache_spec
             block_size = spec.block_size
             # Block-table seq dim. Defaults to max_model_len; overridden by
@@ -5085,8 +5096,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 .to(device)
             )
 
-            # Dummy slot_mapping: [num_tokens] or [num_tokens/DCP] for DCP prefill
-            if is_prefill and self.cp_world_size > 1:
+            # Dummy slot_mapping: [num_tokens], or [num_tokens/DCP] for a DCP prefill
+            # of a token-paged group. Any other group keeps [num_tokens], as the
+            # serving builder does (_build_attention_metadata).
+            if (
+                is_prefill
+                and self.cp_world_size > 1
+                and is_token_paged(spec, f"KV cache group {kv_cache_group_id}")
+            ):
                 # Hybrid KV manager scales block_size per KV group. We need
                 # to always use an interleave size equal to block_size
                 I = block_size
