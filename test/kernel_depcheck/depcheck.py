@@ -144,9 +144,15 @@ Limits of the class:
 #                     and ran out of memory on a large dump. The output is the same on an
 #                     acyclic graph. A cycle now stops the pair classification: the pair
 #                     section names one cycle, and the dump is UNDECIDED as before.
+# 2026-10-13          Model.conflicts finds the overlapping pairs with a sweep: per space, the
+#                     footprints in order of address, each against the open ones only. The
+#                     loop over every pair of access nodes took hours on a large dump. main()
+#                     classifies the pairs as they come, and keeps only the ones it prints
+#                     (all of them with --all or --pairs). The output is the same.
 
 import bisect
 import collections
+import heapq
 import json
 import re
 import sys
@@ -367,6 +373,14 @@ def overlap(a, b):
     if a["parts"] is not None and not (a["parts"] & b["parts"]):
         return False
     return ivs_overlap(a.get("ivs"), b.get("ivs"))
+
+
+#: The pair of an earlier node's footprint and a later node's, by their roles (read, write):
+#: (group, rank, kind). `Model.conflicts` lists one producer/consumer pair's footprint pairs
+#: in the order of these keys: the producer's writes first, each against the consumer's reads
+#: (RAW) and then its writes (WAW); then the producer's reads against the consumer's writes
+#: (WAR). Two reads are not a pair.
+PAIR_ROLES = {("w", "r"): (0, 0, "RAW"), ("w", "w"): (0, 1, "WAW"), ("r", "w"): (1, 0, "WAR")}
 
 
 def fp_str(fp):
@@ -754,30 +768,58 @@ class Model:
         dbg = i.get("debug") or {}
         return f"{a['name']} {i['opcode']}@{a['engine']} L{dbg.get('lineno')} {dbg.get('op_name')}"
 
-    def conflicts(self, lo=None, hi=None):
-        out = []
+    def overlapping_pairs(self, lo=None, hi=None):
+        """Every overlapping footprint pair (key, kind, P, C, fp, fc) of two access nodes, P
+        before C in program order and `fp` P's footprint, in no fixed order. Sorted by `key`,
+        they are the list of `conflicts`. With `lo`, `hi`: only the pairs with P or C on a
+        source line in [lo, hi].
+
+        Per space, the footprints are visited in order of `lo`. Each one meets only the open
+        footprints of the other role or roles (PAIR_ROLES): those whose `hi` is above its `lo`,
+        which is the bounding-box test of `overlap`. `overlap` then decides, with P's footprint
+        first. The work is the sort plus one step per bounding-box pair, not one per pair of
+        access nodes."""
         acc = self.acc
-        for x in range(len(acc)):
-            P = acc[x]
-            for y in range(x + 1, len(acc)):
-                C = acc[y]
-                if lo is not None:
-                    lp = (P["i"].get("debug") or {}).get("lineno") or 0
-                    lc = (C["i"].get("debug") or {}).get("lineno") or 0
-                    if not (lo <= lp <= hi or lo <= lc <= hi):
-                        continue
-                for pw in P["writes"]:
-                    for cr in C["reads"]:
-                        if overlap(pw, cr):
-                            out.append(("RAW", P, C, pw, cr))
-                    for cw in C["writes"]:
-                        if overlap(pw, cw):
-                            out.append(("WAW", P, C, pw, cw))
-                for pr in P["reads"]:
-                    for cw in C["writes"]:
-                        if overlap(pr, cw):
-                            out.append(("WAR", P, C, pr, cw))
-        return out
+        if lo is not None:
+            in_range = [lo <= ((a["i"].get("debug") or {}).get("lineno") or 0) <= hi for a in acc]
+        by_space = collections.defaultdict(list)
+        for x, a in enumerate(acc):
+            for role, fps in (("r", a["reads"]), ("w", a["writes"])):
+                for index, f in enumerate(fps):
+                    by_space[f["space"]].append((f["lo"], x, role, index, f))
+        for items in by_space.values():
+            items.sort(key=lambda item: (item[0], item[1]))
+            open_fps = {"r": {}, "w": {}}
+            closing = []   # heap of (hi, sequence number, role) of the open footprints
+            for seq, item in enumerate(items):
+                f_lo, x, role, index, f = item
+                while closing and closing[0][0] <= f_lo:
+                    _, done, done_role = heapq.heappop(closing)
+                    del open_fps[done_role][done]
+                for other in ("w",) if role == "r" else ("r", "w"):
+                    for _, ox, o_role, o_index, of in open_fps[other].values():
+                        if ox == x:
+                            continue
+                        if ox < x:
+                            px, p_role, p_index, pf, cx, c_role, c_index, cf = (
+                                ox, o_role, o_index, of, x, role, index, f)
+                        else:
+                            px, p_role, p_index, pf, cx, c_role, c_index, cf = (
+                                x, role, index, f, ox, o_role, o_index, of)
+                        if lo is not None and not (in_range[px] or in_range[cx]):
+                            continue
+                        if overlap(pf, cf):
+                            group, rank, kind = PAIR_ROLES[p_role, c_role]
+                            yield ((px, cx, group, p_index, rank, c_index), kind, acc[px], acc[cx],
+                                   pf, cf)
+                open_fps[role][seq] = item
+                heapq.heappush(closing, (f["hi"], seq, role))
+
+    def conflicts(self, lo=None, hi=None):
+        """The overlapping footprint pairs (kind, P, C, fp, fc) of `overlapping_pairs`, ordered by
+        P, then C, then the footprints (PAIR_ROLES)."""
+        pairs = sorted(self.overlapping_pairs(lo, hi), key=lambda pair: pair[0])
+        return [pair[1:] for pair in pairs]
 
     def check_sem_arith(self):
         """Every wait against its producer's semaphore count: (status, waiter, producer,
@@ -1072,27 +1114,34 @@ def main():
             print(f"  {st}: {waiter} waits sem{sid}>={v} for {src}; producer's count = {exp}")
     print(f"  {len(M.waits)} waits checked, {bad} not OK")
     print("\n## conflicting pairs (producer -> consumer) lacking happens-before")
-    conf = M.conflicts(lo, hi)
     cycle = M.one_cycle() if M.undecided_class["cycle"] else []
-    if cycle:   # Model.reach has no closure on a cycle (CycleError): classify no pair
-        print(f"  not classified: the happens-before graph has a cycle, {' -> '.join(cycle)}; "
-              f"no pair's order can be read off it")
-    classified = [] if cycle else conf
-    n_ok = n_bad = 0
-    seen = set()
-    n_q = 0
-    unsync = []
-    for kind, P, C, fa, fb in classified:
+    # The pairs are classified as the sweep finds them. Only those this output prints are
+    # kept (every pair with --all or --pairs), then sorted into the order of Model.conflicts.
+    keep_all = show_all or "--pairs" in sys.argv
+    n_pairs = n_ok = n_bad = n_q = 0
+    classified = []
+    for order, kind, P, C, fa, fb in M.overlapping_pairs(lo, hi):
+        n_pairs += 1
+        if cycle:   # Model.reach has no closure on a cycle (CycleError): classify no pair
+            continue
         ok = M.ordered(P, C)
         okq = ok or M.ordered(P, C, True)
-        key = (P["name"], C["name"], kind)
         if ok:
             n_ok += 1
         elif okq:
             n_q += 1
         else:
             n_bad += 1
-            unsync.append((kind, P, C, fa, fb))
+        if keep_all or not ok:
+            classified.append((order, kind, P, C, fa, fb, ok, okq))
+    classified.sort(key=lambda pair: pair[0])
+    if cycle:
+        print(f"  not classified: the happens-before graph has a cycle, {' -> '.join(cycle)}; "
+              f"no pair's order can be read off it")
+    seen = set()
+    unsync = [(kind, P, C, fa, fb) for _, kind, P, C, fa, fb, _, okq in classified if not okq]
+    for _, kind, P, C, fa, fb, ok, okq in classified:
+        key = (P["name"], C["name"], kind)
         if (not ok) or show_all:
             if key in seen and not verbose:
                 continue
@@ -1110,12 +1159,11 @@ def main():
     if "--pairs" in sys.argv:
         print("\n## every overlapping pair in the selected line range, with its ordering path")
         seen2 = set()
-        for kind, P, C, fa, fb in classified:
+        for _, kind, P, C, fa, fb, ok, okq in classified:
             key = (P["name"], C["name"], kind)
             if key in seen2:
                 continue
             seen2.add(key)
-            ok = M.ordered(P, C); okq = ok or M.ordered(P, C, True)
             tag = "OK" if ok else ("QUEUE-ORDER-ONLY" if okq else "UNSYNC")
             same_eng = P["engine"] == C["engine"] and "DMA" not in P["engine"]
             path = M.path(P["done"], C["issue"], not ok) if okq else None
@@ -1124,9 +1172,9 @@ def main():
             print(f"        -> {M.label(C)} {fp_str(fb)}")
             print(f"        via: {how}")
     if cycle:
-        print(f"\n  {len(conf)} overlapping pairs, not classified (the graph has a cycle)")
+        print(f"\n  {n_pairs} overlapping pairs, not classified (the graph has a cycle)")
     else:
-        print(f"\n  {len(conf)} overlapping pairs: {n_ok} ordered by engine order + semaphores, "
+        print(f"\n  {n_pairs} overlapping pairs: {n_ok} ordered by engine order + semaphores, "
               f"{n_q} ordered only if same-queue DMAs complete in order, {n_bad} UNSYNCHRONIZED")
     runtime = sum(1 for a in M.acc for f in a["reads"] + a["writes"] if f.get("runtime"))
     if runtime:
