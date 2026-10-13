@@ -419,12 +419,16 @@ def write_kda_checkpoints(pages, block_ids, rows, layout) -> torch.Tensor:
     conversion in a graph); ``rows`` one ``[n, *shape]`` tensor per carrier, in the
     layout's carrier order. Each carrier's bytes go to its offset of the page, and the
     page's other bytes are left as they are. Rows naming one block more than once leave
-    one of them; only padding rows, which name the null block 0, may repeat.
+    one of them; only padding rows, which name the null block 0, may repeat. The write
+    finds page ``b`` at byte ``b * layout.page_bytes`` of ``pages``, whatever the tensor's
+    row size: a ``[2 * n, page_bytes // 2]`` int8 tensor is taken as ``n`` pages. The
+    read and the restore take ``[num_blocks, ...]`` tensors of whole-page rows only.
 
-    Returns the written pages. On the device the write is one NKI kernel launch, and in a
-    traced graph the backend hands this tensor to every later operation on the same graph
-    input (module docstring). On CPU tensors, eager, the write is in place and returns
-    ``pages``. The checks read shapes and dtypes only.
+    Returns the written pages. On the device the write is one NKI kernel launch inside a
+    compiled graph (there is no eager device form), and the backend hands this tensor to
+    every later operation on the same graph input (module docstring). On CPU tensors,
+    eager, the write is in place and returns ``pages``. The checks read shapes and dtypes
+    only.
     """
     problem = _block_ids_problem(block_ids)
     if problem is not None:

@@ -164,6 +164,9 @@ def write_page_rows(pages: Tensor, block_ids: Tensor, rows: Sequence[Tensor],
                     offsets: Sequence[int], page_bytes: int) -> Tensor:
     """Write row ``i`` of each ``rows[c]`` into page ``block_ids[i]`` of ``pages``.
 
+    On the device the write runs only inside a compiled graph: the kernel has no eager
+    implementation for device tensors.
+
     Args:
         pages: a contiguous tensor of whole ``page_bytes``-byte pages, of any dtype and
             shape; written in place.

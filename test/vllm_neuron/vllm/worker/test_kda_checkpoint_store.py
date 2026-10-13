@@ -22,7 +22,8 @@ Read here, with the served TP 64 specs (no model weights):
 5. aliasing: the page a write fills is the latent layer's page of the same block id,
    byte for byte, and a latent write to another block leaves it as it was;
 6. a write then a read returns what was written and moves no other page; padding rows
-   may name the null block;
+   may name the null block; the write finds its pages by bytes, whatever the tensor's
+   row size;
 7. a restore writes only the slot's entering row;
 8. traced on meta tensors (the device route), a write is one NKI kernel call on the page
    view itself with no dtype view in the graph, and the graph returns its result; a read
@@ -358,6 +359,24 @@ def test_a_padding_row_may_name_the_null_block(kda_spec):
     write_kda_checkpoints(pages, _ids(3, 0, 0), rows, layout)
     got = read_kda_checkpoints(pages, _ids(3), layout)
     assert all(torch.equal(g[0], r[0]) for g, r in zip(got, rows, strict=True))
+
+
+def test_a_write_finds_its_pages_by_bytes_whatever_the_row_size(kda_spec):
+    """The write takes any contiguous tensor of whole pages (the latent layer's cache view
+    is one): rows of half a page are two rows per page."""
+    layout = kda_checkpoint_layout(kda_spec)
+    raw = _raw()
+    _noise(raw, seed=14)
+    before = kda_checkpoint_pages(raw, layout).clone()
+    rows = _rows(layout, 1, seed=15)
+
+    write_kda_checkpoints(raw.view(2 * BLOCKS, PAGE_BYTES // 2), _ids(4), rows, layout)
+
+    pages = kda_checkpoint_pages(raw, layout)
+    for got, want in zip(read_kda_checkpoints(pages, _ids(4), layout), rows, strict=True):
+        assert torch.equal(got, want)
+    assert torch.equal(pages[4, CHECKPOINT_BYTES:], before[4, CHECKPOINT_BYTES:])
+    assert torch.equal(pages[[0, 1, 2, 3, 5]], before[[0, 1, 2, 3, 5]])
 
 
 # ── 7. restore ──────────────────────────────────────────────────────────────────────
