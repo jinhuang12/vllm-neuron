@@ -83,18 +83,22 @@ instructions in program order, and the norm's transposes wait for the collapse o
 vector engine; issued after the next tile's transposes and matmuls, they no longer
 hold the tensor engine idle while the collapse runs.
 
-Gate groups (:func:`mhc_pre_kernel` only). The full tiles go in groups of
-:func:`_gate_group` tiles (4 at the served 1024 and 2048 tokens), each tile's streams
-held in SBUF until its collapse. Steps 1-2 run per tile; step 3 is one ``sendrecv`` per
-group and step 4 runs once per group, on ``[rows, tiles, ...]`` tiles. The scalar
-engine's ``sigmoid`` and ``exp`` have no table set in common, so a call loads a table
-twice per group instead of twice per tile. Each element takes the same instructions in
-the same order as in a tile of its own, so the outputs do not change by a bit. A group's
-step 5 is issued tile by tile, each after steps 1-2 of the next group's tile at the same
-position: the collapse runs on the vector engine beside the next group's transposes and
-matmuls.
-The norm form and the other tiles (the last, shorter tile and the short ones) keep the
-per-tile order.
+Gate groups (both kernels). The full tiles go in groups of :func:`_gate_group` tiles (4
+at the served 1024 and 2048 tokens), each tile's streams held in SBUF until its
+collapse. Steps 1-2 run per tile; step 3 is one ``sendrecv`` per group and step 4 runs
+once per group, on ``[rows, tiles, ...]`` tiles. The scalar engine's ``sigmoid`` and
+``exp`` have no table set in common, so a call loads a table twice per group instead of
+twice per tile. Each element takes the same instructions in the same order as in a tile
+of its own, so the outputs do not change by a bit. A group's step 5 is issued tile by
+tile, each after steps 1-2 of the next group's tile at the same position: the collapse
+runs on the vector engine beside the next group's transposes and matmuls.
+In the norm form, step 6 of a group is split (:func:`_norm_hold`, :func:`_norm_group`).
+Each tile's square sums (its transposes, Gram block and diagonal) are issued one tile
+late, as above, into the tile's column of a ``[rows, tiles]`` tile. After the next
+group's step 4, the group's sums take one ``sendrecv`` and one ``rsqrt``, and each
+tile's rows are scaled and stored; the layer_input rows wait in SBUF until then. Each
+element again takes the instructions of a tile of its own.
+The other tiles (the last, shorter tile and the short ones) keep the per-tile order.
 
 Both LNC2 cores: yes. Each program does half the contraction (step 2), half the
 transposes, half the collapse and half the norm; steps 3-4 are ``rows x (M + rows)``
@@ -136,20 +140,20 @@ def _group(dtype):
 
 
 #: The share of the usable SBUF partition (``nl.tile_size.sbuf_fmax_bytes``) that the
-#: gate groups' streams tiles may hold: one group's tiles and the next group's first.
-#: The rest holds ``mov``, the collapse buffers, the group's mixes and the compiler's
-#: double buffering.
+#: gate groups' tiles may hold: one group's tiles and the next group's first (in the norm
+#: form each tile's streams and its layer_input rows). The rest holds ``mov``, the
+#: collapse buffers, the group's mixes, the norm gain and the compiler's double buffering.
 _STREAMS_SBUF_SHARE = 0.5
 
 
 def _gate_group(full_tiles, tile_bytes):
-    """Full token tiles per gate group of :func:`mhc_pre_kernel` (see the module doc).
+    """Full token tiles per gate group (see the module doc).
 
     The largest power of two that leaves at least two groups, so that each group's
-    collapse runs beside the next group's matmuls, and whose streams tiles of
-    ``tile_bytes`` per partition, with the next group's first, fit in
-    :data:`_STREAMS_SBUF_SHARE` of the partition. The served token counts are powers of
-    two, so their groups are equal. 1 (no groups) below two full tiles.
+    collapse runs beside the next group's matmuls, and whose tiles of ``tile_bytes`` per
+    partition (the bytes a tile holds until its group is done), with the next group's
+    first, fit in :data:`_STREAMS_SBUF_SHARE` of the partition. The served token counts
+    are powers of two, so their groups are equal. 1 (no groups) below two full tiles.
     """
     fits = int(nl.tile_size.sbuf_fmax_bytes * _STREAMS_SBUF_SHARE) // tile_bytes - 1
     limit = min(full_tiles // 2, fits)
@@ -189,11 +193,15 @@ def _swap_add(mine, rows, cols, programs, program):
     return total
 
 
-def _diagonal_sum(gram, rows, ident):
-    """``[rows, 1]``: the diagonal of a ``[rows, rows]`` Gram block (times 1, plus 0s)."""
+def _diagonal_sum(gram, rows, ident, total=None):
+    """``[rows, 1]``: the diagonal of a ``[rows, rows]`` Gram block (times 1, plus 0s).
+
+    The sums go into ``total`` (a ``[rows, 1]`` view) when it is given, else a new tile.
+    """
     diag = _tile(rows, rows)
     nisa.tensor_tensor(dst=diag, data1=gram, data2=ident[0:rows, 0:rows], op=nl.multiply)
-    total = _tile(rows, 1)
+    if total is None:
+        total = _tile(rows, 1)
     nisa.tensor_reduce(dst=total, op=nl.add, data=diag, axis=(1,))
     return total
 
@@ -253,9 +261,21 @@ def _norm_rows(out_rows, t0, gain_rows, ident, normed_out, scaled_out, norm_eps,
     tile); else they are transposed from ``out_rows``. :func:`_mhc_pre` issues a long
     tile's step 6 one tile late (see the module doc).
     """
-    rows_n, hp = out_rows.shape
+    rows_n = out_rows.shape[0]
     hidden = normed_out.shape[1]
-    h0 = program * hp
+    mine = _norm_square_sum(out_rows, ident, collapsed=collapsed)
+    sqrsum = _swap_add(mine, rows_n, 1, programs, program)
+    norm_rstd = _rstd(sqrsum, rows_n, 1.0 / float(hidden), norm_eps)
+    _norm_scale(out_rows, t0, norm_rstd[:, 0:1], gain_rows, normed_out, scaled_out, program)
+
+
+def _norm_square_sum(out_rows, ident, sqrsum=None, collapsed=None):
+    """Step 6's first half for one tile: this program's square sums of ``out_rows``.
+
+    The ``[rows, 1]`` sums are the diagonal of the Gram block of the rows' hidden-major
+    copy (``collapsed`` as in :func:`_norm_rows`), into ``sqrsum`` when it is given.
+    """
+    rows_n, hp = out_rows.shape
     nhb = hp // _P
     if collapsed is None:
         collapsed = nl.ndarray((_P, nhb, rows_n), dtype=out_rows.dtype, buffer=nl.sbuf)
@@ -266,11 +286,20 @@ def _norm_rows(out_rows, t0, gain_rows, ident, normed_out, scaled_out, norm_eps,
     for hb in range(nhb):
         nisa.nc_matmul(dst=gram, stationary=collapsed[:, hb, :],
                        moving=collapsed[:, hb, :], accumulate=(hb > 0))
-    sqrsum = _swap_add(_diagonal_sum(gram, rows_n, ident), rows_n, 1, programs, program)
-    norm_rstd = _rstd(sqrsum, rows_n, 1.0 / float(hidden), norm_eps)
+    return _diagonal_sum(gram, rows_n, ident, total=sqrsum)
+
+
+def _norm_scale(out_rows, t0, norm_rstd, gain_rows, normed_out, scaled_out, program):
+    """Step 6's second half for one tile: its ``normed`` (and ``scaled``) rows, stored.
+
+    ``norm_rstd`` is the tile's ``[rows, 1]`` whole-``H`` reciprocal RMS.
+    """
+    rows_n, hp = out_rows.shape
+    hidden = normed_out.shape[1]
+    h0 = program * hp
     normed_rows = nl.ndarray((rows_n, hp), dtype=out_rows.dtype, buffer=nl.sbuf)
     nisa.scalar_tensor_tensor(dst=normed_rows, data=out_rows, op0=nl.multiply,
-                              operand0=norm_rstd[:, 0:1], op1=nl.multiply,
+                              operand0=norm_rstd, op1=nl.multiply,
                               operand1=gain_rows[0:rows_n, :])
     nisa.dma_copy(dst=normed_out.ap(pattern=[[hidden, rows_n], [1, hp]],
                                     offset=t0 * hidden + h0),
@@ -278,10 +307,41 @@ def _norm_rows(out_rows, t0, gain_rows, ident, normed_out, scaled_out, norm_eps,
     if scaled_out is not None:
         scaled_rows = nl.ndarray((rows_n, hp), dtype=out_rows.dtype, buffer=nl.sbuf)
         nisa.tensor_scalar(dst=scaled_rows, data=out_rows, op0=nl.multiply,
-                           operand0=norm_rstd[:, 0:1])
+                           operand0=norm_rstd)
         nisa.dma_copy(dst=scaled_out.ap(pattern=[[hidden, rows_n], [1, hp]],
                                         offset=t0 * hidden + h0),
                       src=scaled_rows)
+
+
+def _norm_hold(held, sqrsums, ident, out_rows):
+    """Step 6 of a gate group, tile by tile: hold ``out_rows`` in ``held``.
+
+    The previous held tile's square sums are issued here, one tile late, into its column
+    of the group's ``[rows, tiles]`` ``sqrsums`` (see the module doc).
+    """
+    if held:
+        j = len(held) - 1
+        _norm_square_sum(held[j], ident, sqrsum=sqrsums[:, j:j + 1])
+    held.append(out_rows)
+
+
+def _norm_group(held, g_t0, sqrsums, ident, gain_rows, normed_out, scaled_out, norm_eps,
+                programs, program):
+    """The rest of a gate group's step 6, after :func:`_norm_hold` took all its tiles.
+
+    The last tile's square sums, one swap and one reciprocal RMS for the group, then each
+    tile's scale and store; the group's first token is ``g_t0``. Each element takes the
+    instructions of a tile of its own (:func:`_norm_rows`).
+    """
+    rows_n, tiles = sqrsums.shape
+    kernel_assert(len(held) == tiles, "a gate group's step 6 has all its tiles")
+    hidden = normed_out.shape[1]
+    _norm_square_sum(held[tiles - 1], ident, sqrsum=sqrsums[:, tiles - 1:tiles])
+    sqrsum = _swap_add(sqrsums, rows_n, tiles, programs, program)
+    norm_rstd = _rstd(sqrsum, rows_n, 1.0 / float(hidden), norm_eps, cols=tiles)
+    for j in range(tiles):
+        _norm_scale(held[j], g_t0 + j * rows_n, norm_rstd[:, j:j + 1], gain_rows,
+                    normed_out, scaled_out, program)
 
 
 def _load_short(mov, residual, t0, rows_n, col0, h0, nhb, group):
@@ -543,20 +603,27 @@ def _mhc_pre(residual, fn, hc_scale, hc_base, norm_gain, rms_eps, hc_eps, post_m
 
     r_group = _group(residual.dtype)
 
-    # ---- The full tiles in gate groups (see the module doc): no norm only. ---- #
+    # ---- The full tiles in gate groups (see the module doc). --------------------- #
     full_tiles = tokens // MHC_PRE_TOKEN_TILE
-    gate_group = 1 if norm_gain is not None else _gate_group(
-        full_tiles, streams * hp * sizeinbytes(residual.dtype))
+    # A tile holds its streams until its collapse and, in the norm form, its
+    # layer_input rows until its group's step 6.
+    row_bytes = hp * sizeinbytes(residual.dtype)
+    gate_group = _gate_group(full_tiles, streams * row_bytes
+                             + (row_bytes if norm_gain is not None else 0))
     grouped = full_tiles - full_tiles % gate_group if gate_group > 1 else 0
     rows_n = MHC_PRE_TOKEN_TILE
     cols = mix + rows_n
     group_rows = gate_group * rows_n
-    # The previous group's streams tiles and pre: its step 5 runs a group late.
+    # The previous group's streams tiles and pre: its step 5 runs a group late, and its
+    # step 6 (the norm form) after the next group's step 4.
     lagged = []
     lagged_pre = None
     for g0 in range(0, grouped, gate_group):
         mine = nl.ndarray((rows_n, gate_group * cols), dtype=nl.float32, buffer=nl.sbuf)
         resident = []
+        # The previous group's layer_input rows and their square sums (the norm form).
+        held = []
+        sqrsums = _tile(rows_n, gate_group) if norm_gain is not None and lagged else None
         for j in range(gate_group):
             t0 = (g0 + j) * rows_n
             streams_t = _load_long(residual, t0, rows_n, h0, hp)
@@ -564,8 +631,10 @@ def _mhc_pre(residual, fn, hc_scale, hc_base, norm_gain, rms_eps, hc_eps, post_m
             _project(mov, rows_n, mix, mine=mine[:, j * cols:(j + 1) * cols])
             resident.append(streams_t)
             if lagged_pre is not None:
-                _store_rows(x_out, t0 - group_rows, h0,
-                            _collapse_long(lagged[j], lagged_pre[:, j, :], residual.dtype))
+                out_rows = _collapse_long(lagged[j], lagged_pre[:, j, :], residual.dtype)
+                _store_rows(x_out, t0 - group_rows, h0, out_rows)
+                if sqrsums is not None:
+                    _norm_hold(held, sqrsums, ident, out_rows)
         total = _swap_add(mine, rows_n, gate_group * cols, programs, program)
         pre, post, comb = _group_gates(total.reshape_dim(1, (gate_group, cols)), streams,
                                        spread, ident, width, rms_eps, hc_eps, post_mult)
@@ -579,11 +648,21 @@ def _mhc_pre(residual, fn, hc_scale, hc_base, norm_gain, rms_eps, hc_eps, post_m
                                                    [streams, streams], [1, streams]],
                                           offset=g_t0 * ss),
                           src=comb)
+        if sqrsums is not None:
+            _norm_group(held, g0 * rows_n - group_rows, sqrsums, ident, gain_rows,
+                        normed_out, scaled_out, norm_eps, programs, program)
         lagged = resident
         lagged_pre = pre
+    held = []
+    sqrsums = _tile(rows_n, gate_group) if norm_gain is not None and lagged else None
     for j in range(len(lagged)):
-        _store_rows(x_out, (grouped - gate_group + j) * rows_n, h0,
-                    _collapse_long(lagged[j], lagged_pre[:, j, :], residual.dtype))
+        out_rows = _collapse_long(lagged[j], lagged_pre[:, j, :], residual.dtype)
+        _store_rows(x_out, (grouped - gate_group + j) * rows_n, h0, out_rows)
+        if sqrsums is not None:
+            _norm_hold(held, sqrsums, ident, out_rows)
+    if sqrsums is not None:
+        _norm_group(held, (grouped - gate_group) * rows_n, sqrsums, ident, gain_rows,
+                    normed_out, scaled_out, norm_eps, programs, program)
 
     # ---- The other tiles, one at a time. ---------------------------------- #
     # The tile whose step 6 is still to be issued: its layer_input rows (None: no tile
@@ -613,7 +692,7 @@ def _mhc_pre(residual, fn, hc_scale, hc_base, norm_gain, rms_eps, hc_eps, post_m
         # ---- 4. RMS scale, gates, softmax: tokens on the partitions. ------- #
         # The work of _group_gates() on one tile, in 2-D tiles. Through _group_gates()
         # the instructions would take 3-D and 4-D access patterns, and the compiled
-        # programs of the norm form and of the short tiles would change.
+        # programs of the tiles that run here would change.
         rstd = _rstd(_diagonal_sum(total[:, mix:cols], rows_n, ident), rows_n,
                      1.0 / float(width), rms_eps)
         mixes = _tile(rows_n, mix)
