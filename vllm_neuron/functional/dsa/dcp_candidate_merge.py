@@ -44,10 +44,13 @@ order-preserving integer key of an fp32 value, a ``b``-bit digit a step
 (:func:`radix_bits`): ``2**b - 1`` independent trial counts, then the digit in one dependent
 hop. A count is one Vector Engine ``tensor_scalar_reduce`` over a partition's candidates.
 Every candidate ``>= v*`` is the selection unless a row holds more than ``k`` of them, an
-excess tie at ``v*``. Only a group of tiles with such a row takes a device branch that finds
-the ``c = k - #{value > v*}`` lowest global ids among the ties, the same search over
-:data:`ID_BITS` bits of the id, and reselects. The count passes are the kernel's cost: 32
-for the value at one bit a step, 24 more for the id on the branch (see the benchmark report).
+excess tie at ``v*``. The tie step finds the ``c = k - #{value > v*}`` lowest global ids
+among the ties, the same search over :data:`ID_BITS` bits of the id, and reselects; a row
+without an excess tie comes out of it as the threshold selected it. Where a program runs one
+group of tiles, only a group with such a row takes the tie step, on a device branch; where it
+runs more than one, every group takes it, with no branch. The count passes are the kernel's
+cost: 32 for the value at one bit a step, 24 more for the id in the tie step (see the
+benchmark report).
 
 Layout: rows ride the partitions, a tile of up to :func:`tile_rows` rows,
 :data:`_TILES_IN_FLIGHT` tiles a group. A tile of ``n < 128`` rows folds each row over ``f``
@@ -61,9 +64,10 @@ LNC2 pair split the rows.
 
 **Invariant: every loop trip count and branch condition is identical on both cores by
 construction.** Every static loop is fixed by the shapes, and both cores run as many groups
-(:func:`program_groups_at`). The one data-dependent branch, a group's tie step, runs on the pair's
-joint flag, which both cores hold after swapping their counts (:func:`_any_excess`). A core
-alone in a loop body would wait for good on the barrier of both cores that ends it.
+(:func:`program_groups_at`). The one data-dependent branch, the tie step of a program of one
+group, runs on the pair's joint flag, which both cores hold after swapping their counts
+(:func:`_any_excess`). A core alone in a loop body would wait for good on the barrier of both
+cores that ends it.
 
 Preconditions the kernel reads no value to check: a real candidate's value is finite, a
 rank's real local ids in one row are distinct, and every global id is below
@@ -262,8 +266,9 @@ def program_groups_at(rows: int, programs: int,
     """Per program, its ``(stores, tiles)`` groups: an even share of the rows each, in tiles of up
     to ``rows_per_tile`` rows, :data:`_TILES_IN_FLIGHT` ``(first row, rows)`` tiles a group.
 
-    Every group breaks its ties on a device branch, and the two cores of an LNC2 pair must
-    branch alike, so every program runs as many groups as the first: one with fewer repeats the
+    A one-group program breaks its group's ties on a device branch, the two cores of an LNC2
+    pair must branch alike, and both choose the branch from their group count, so every
+    program runs as many groups as the first: one with fewer repeats the
     first program's last group with ``stores`` false (computed, not stored). A program with no
     rows of its own, the second one of a single-row call, is the case that needs it.
     """
@@ -751,9 +756,11 @@ def dsa_dcp_merge_select_kernel(values_hbm, ids_hbm, cp_rank, pools_per_block, s
 
     The rows split over the programs of the launch grid as :func:`program_groups_at` plans
     them, in tiles of up to :func:`tile_rows` rows.
-    A group breaks ties, on the device's own branch, only when one of its rows has an excess
-    tie; under two programs, a row of either program's group (:func:`_any_excess`), so both
-    cores take the branch or neither (the module docstring's invariant).
+    A program of one group breaks its ties, on the device's own branch, only when one of the
+    group's rows has an excess tie; under two programs, a row of either program's group
+    (:func:`_any_excess`), so both cores take the branch or neither (the module docstring's
+    invariant). A program of more than one group breaks every group's ties with no branch,
+    which selects the same; both cores run as many groups, so both make the same choice.
     """
     cp = values_hbm.shape[0]
     rows = values_hbm.shape[1]
@@ -761,17 +768,28 @@ def dsa_dcp_merge_select_kernel(values_hbm, ids_hbm, cp_rank, pools_per_block, s
     out_hbm = nl.ndarray((rows, k), dtype=nl.int32, buffer=nl.shared_hbm)
     programs = nl.num_programs(axes=0)
     program = nl.program_id(0)
-    for group in program_groups_at(rows, programs, tile_rows(cp, k))[program]:
+    groups = program_groups_at(rows, programs, tile_rows(cp, k))[program]
+    for group in groups:
         states = []
         for tile in group[1]:
             states.append(_threshold_tile(values_hbm, ids_hbm, tile[0], tile[1], cp_rank))
 
-        # fori_loop traces the body here, in this iteration, so ``states`` is this group's.
-        def break_group_ties(_iteration):
-            for state in states:  # noqa: B023
+        if len(groups) > 1:
+            # No branch, a workaround for neuronx-cc 2.27: it lowers each branch to a dynamic
+            # loop, one a group here, and can reject a prefill graph whose subgraph holds
+            # these beside other kernels' dynamic loops (NCC_ICFG001: a control-flow graph
+            # with more than one exit), though the kernel alone builds. The tie step leaves a
+            # row without an excess tie as the threshold selected it, so the selection is the
+            # same; every group pays the id search's count passes.
+            for state in states:
                 _break_ties(state, cp, k, cp_rank, pools_per_block)
+        else:
+            # fori_loop traces the body here, in this iteration, so ``states`` is this group's.
+            def break_group_ties(_iteration):
+                for state in states:  # noqa: B023
+                    _break_ties(state, cp, k, cp_rank, pools_per_block)
 
-        nl.fori_loop(0, _any_excess(states, programs, program), break_group_ties)
+            nl.fori_loop(0, _any_excess(states, programs, program), break_group_ties)
         if group[0]:
             for state in states:
                 _store(state, out_hbm, cp, k, cp_rank)

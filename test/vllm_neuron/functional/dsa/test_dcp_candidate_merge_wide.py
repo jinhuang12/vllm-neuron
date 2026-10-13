@@ -338,13 +338,14 @@ _DROP = ("NKI_SIMULATOR", "NKI_PRECISE_FP", "VLLM_NEURON_CPU_MODE", "NEURON_RT_V
 _PIN = {"VLLM_NEURON_CPU_COMPILE": "1", "NEURON_PLATFORM_TARGET_OVERRIDE": "trn2",
         "NEURON_LOGICAL_NC_CONFIG": "2", "PYTHONDONTWRITEBYTECODE": "1"}
 #: ``(CP, rows, k, unfolded)`` builds: DCP16 at a decode row and at both prefill chunks, the
-#: first width past an unfolded tile and the folded edge at a chunk; and the control, DCP16 at
-#: a chunk in 128-row tiles, which must take a second SBUF allocation pass, so the probe tells
-#: a fitting build from a spilling one.
+#: first width past an unfolded tile and the folded edge at a chunk; and the control, 32 ranks at
+#: a chunk in 128-row tiles, which must take a second SBUF allocation pass and spill, so the
+#: probe tells a fitting build from a spilling one (at DCP16 that build takes the second pass
+#: but logs no spill traffic).
 BUILDS = ((16, 1, SELECT_K, False), (16, CHUNK_ROWS, SELECT_K, False),
           (16, DCP16_CHUNK_ROWS, SELECT_K, False), (2, CHUNK_ROWS, 2125, False),
           (FOLDED_EDGE[0], CHUNK_ROWS, FOLDED_EDGE[1], False))
-CONTROL_BUILD = (16, CHUNK_ROWS, SELECT_K, True)
+CONTROL_BUILD = (32, CHUNK_ROWS, SELECT_K, True)
 
 
 def unfolded_tile_rows(cp: int, k: int) -> int:
@@ -430,7 +431,7 @@ def test_neuronx_cc_builds_the_wide_merge_in_one_sbuf_pass() -> None:
     facts = run_builds((*BUILDS, CONTROL_BUILD))
     control = facts.pop(CONTROL_BUILD)
     assert control["allocator_retry"] and max(control["spill_traffic_reduced"]) > 0, (
-        f"the 128-row-tile build at 8192 candidates shows no second allocation pass, so the "
+        f"the 128-row-tile build at 16384 candidates shows no second allocation pass, so the "
         f"probe cannot tell a fitting build from a spilling one: {control}")
     for key, fact in facts.items():
         assert not fact["allocator_retry"], (key, fact)

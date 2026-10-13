@@ -27,7 +27,8 @@ the boundary; pads by id, by value, at ``BOUND_FILL_MARK`` itself and next to it
 whose value is above every score; rows with fewer than ``k`` real candidates and rows with
 none; values from the finite extremes of fp32; ties in only the rows the second core of an
 LNC2 pair owns, so the two cores' tie-branch conditions differ; and ties in only one of the two
-tiles a core selects together, so the tiles' tie-branch conditions differ.
+tiles a core selects together, so the tie step runs over a tile with no excess tie beside one
+with them.
 
 **Reference.** A numpy ``lexsort`` over each row's ``CP * k`` candidates: real before pad,
 value descending (``-0.0 == +0.0``), global pool id ascending; the first ``k`` real ones are
@@ -43,8 +44,9 @@ Two modes:
   under the LNC2 grid at the shapes above; the reference, the patterns and the host
   refusals are checked; and neuronx-cc, in child processes that open no device, builds the
   kernel at the served and edge widths, every matmul a single fp32 instruction outside the
-  double-row mode, with no second SBUF allocation pass (:data:`CONTROL_BUILD` is the control
-  that takes one).
+  double-row mode (none where a program runs more than one group of unfolded tiles), with no
+  second SBUF allocation pass
+  (:data:`CONTROL_BUILD` is the control that takes one).
 * **Device** (``python test/hardware/test_dcp_candidate_merge_qualification.py device
   --out OUT.json --cache-root EMPTY_DIR``, with ``NEURON_RT_VISIBLE_CORES`` naming the cores
   and ``NEURON_LOGICAL_NC_CONFIG=2``). One compiled graph per shape and rank, built with the
@@ -134,8 +136,9 @@ REFUSAL_TEXT = "fit no tile"
 #: ``(CP, rows, k)``: a build past the SBUF budget, so the allocator must take a second pass and
 #: spill; it shows that the build test can tell a fitting build from a spilling one. The merge
 #: serves this width in tiles of fewer rows, so the control is built in 128-row tiles
-#: (:func:`unfolded_tile_rows`).
-CONTROL_BUILD = (16, 1024, SELECT_K)
+#: (:func:`unfolded_tile_rows`). At CP 16 that build takes the second pass but logs no spill
+#: traffic, so the control is CP 32.
+CONTROL_BUILD = (32, 1024, SELECT_K)
 
 #: Sizes at which the refusal test probes the width rule's edge (:func:`first_refused_k`).
 PROBE_SIZES = (2, 4, 8, 16)
@@ -875,6 +878,14 @@ def test_cpu_neuronx_cc_builds_the_merge_at_the_served_and_edge_widths() -> None
         assert not fact["allocator_retry"], (key, fact)
         assert fact["spill_traffic_reduced"] and max(fact["spill_traffic_reduced"]) == 0, (
             key, fact)
+        # A build sums by matmul a folded tile's row counts and a one-group program's joint
+        # tie flag; a program of more groups of unfolded tiles has neither.
+        cp, rows, k = key
+        groups = merge.program_groups_at(rows, 2, merge.tile_rows(cp, k))[0]
+        if len(groups) > 1 and all(merge.tile_fold(n, cp, k) == 1
+                                   for _, tiles in groups for _, n in tiles):
+            assert fact["matmuls"] == 0, (key, fact)
+            continue
         assert fact["matmuls"] > 0, (key, fact)
         assert fact["perf_modes"] == ["none_"], (key, fact)
         assert fact["operand_dtypes"] == ["f32"], (key, fact)
