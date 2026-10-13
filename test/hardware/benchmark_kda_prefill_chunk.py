@@ -5,10 +5,13 @@ Times :func:`kda_intra_chunk` (stages 1 to 3), :func:`kda_inter_chunk` (stages 4
 and 5) and the two chained, intra-chunk outputs into the inter-chunk call as a
 prefill layer runs them, at the served prefill sizes, 512, 1024 and 2048 tokens per
 call. The variants are the baseline revision, this checkout and any
-``--variant NAME=REV``. Each variant runs at the chunk width ``C`` the KDA layer
-resolves when it runs that variant's kernels, so its call shape is
-``[NC, C, K] = [tokens / C, C, 128]``: ``[128, 8, 128]`` for a 1024-token call at
-``C = 8`` and ``[64, 16, 128]`` at ``C = 16``.
+``--variant NAME=REV``. Each variant runs at the chunk width ``C`` and the gate
+block the KDA layer resolves when it runs that variant's kernels, so its call shape
+is ``[NC, C, K] = [tokens / C, C, 128]``: ``[128, 8, 128]`` for a 1024-token call
+at ``C = 8``, ``[64, 16, 128]`` at ``C = 16`` and ``[32, 32, 128]`` at ``C = 32``
+with gate blocks of 16. A revision whose intra-chunk entry takes no gate block runs
+at the widest chunk of one gate block, the width its own layer resolved
+(:func:`layer_widths`).
 
 A revision's variant is its ``chunked_recurrence.py`` plus every module of the
 KDA package it imports, at any depth, read with ``git show``. Those modules
@@ -65,6 +68,7 @@ import contextlib
 import hashlib
 import importlib.machinery
 import importlib.util
+import inspect
 import json
 import os
 import statistics
@@ -108,7 +112,7 @@ SERVED_PREFILL_TOKENS = (512, 1024, 2048)
 
 #: The per-rank key and value widths at TP=64 (one head per rank), which
 #: ``test_chunked_recurrence`` reads off the layer too. The chunk width is not a
-#: constant here: :func:`layer_chunk` asks the layer, per variant.
+#: constant here: :func:`layer_widths` asks the layer, per variant.
 SERVED_KDIM = 128
 SERVED_VDIM = 128
 
@@ -121,8 +125,8 @@ GATE_LOWER_BOUND = -5.0
 
 #: The gate draws the numerics run: ``served`` spreads each log gate over
 #: ``(GATE_LOWER_BOUND, 0)`` as the timing operands do; ``bound`` puts every entry
-#: at ``GATE_LOWER_BOUND``, the largest chunk-local cumulative gate the layer can
-#: send at its chunk width.
+#: at ``GATE_LOWER_BOUND``, the largest cumulative gate over one gate block the
+#: layer can send at its widths.
 GATES = ("served", "bound")
 
 #: The timed and checked graphs: the two entry points and the two chained.
@@ -212,13 +216,21 @@ def _checkout_has(leaf: str) -> bool:
 
 @dataclass
 class Variant:
-    """One revision of the kernel module: its entry points and the sources loaded."""
+    """One revision of the kernel module: its entry points and the sources loaded.
+
+    ``chunk`` and ``gate_block`` are the widths it runs at (:func:`layer_widths`).
+    """
 
     name: str
     rev: str
     module: ModuleType
     sha256: dict[str, str]
     chunk: int
+    gate_block: int
+
+    def intra_keywords(self) -> dict:
+        """The gate block for ``kda_intra_chunk``, passed only for a chunk of two."""
+        return {} if self.gate_block == self.chunk else {"gate_block": self.gate_block}
 
 
 def load_revision(name: str, rev: str, workdir: Path) -> Variant:
@@ -265,27 +277,32 @@ def load_revision(name: str, rev: str, workdir: Path) -> Variant:
     for leaf in sorted(kept):
         sys.modules[f"{KDA_PACKAGE}.{leaf}"] = modules[leaf]
         setattr(package, leaf, modules[leaf])
+    chunk, gate_block = layer_widths(modules[KERNEL_LEAF])
     return Variant(
         name=name, rev=rev, module=modules[KERNEL_LEAF],
         sha256={leaf: hashlib.sha256(s.encode()).hexdigest() for leaf, s in sources.items()},
-        chunk=layer_chunk(modules[KERNEL_LEAF]),
+        chunk=chunk, gate_block=gate_block,
     )
 
 
 def checkout_variant() -> Variant:
     path = Path(live.__file__)
+    chunk, gate_block = layer_widths(live)
     return Variant(name=CHECKOUT, rev="checkout", module=live,
                    sha256={KERNEL_LEAF: hashlib.sha256(path.read_bytes()).hexdigest()},
-                   chunk=layer_chunk(live))
+                   chunk=chunk, gate_block=gate_block)
 
 
-def layer_chunk(module: ModuleType) -> int:
-    """The chunk width the KDA layer resolves when ``module`` is its kernel module.
+def layer_widths(module: ModuleType) -> tuple[int, int]:
+    """``(chunk, gate_block)`` the KDA layer resolves when ``module`` is its kernel module.
 
-    The layer derives the width (``_resolve_chunk_size``) from the kernel module's
-    gate limit, which it imports by package name when it resolves, so it is asked
-    with ``module`` bound to that name. Its gate lower bound must be the one this
-    benchmark draws gates from, or the width would be for other inputs.
+    The layer derives both (``_resolve_chunk_size``, ``_resolve_gate_block``) from
+    the kernel module's gate limit, which it imports by package name when it
+    resolves, so it is asked with ``module`` bound to that name. Its gate lower bound
+    must be the one this benchmark draws gates from, or the widths would be for
+    other inputs. A module whose ``kda_intra_chunk`` takes no ``gate_block`` serves
+    chunks of one gate block only, so it runs at the gate block: the widest chunk
+    of one block, which is the width the layer resolved before chunks of two.
     """
     from vllm_neuron.model.glm5_next.config import Glm5NextTextConfig
     from vllm_neuron.model.glm5_next.model_fp8 import Glm5NextKDAAttention
@@ -295,7 +312,11 @@ def layer_chunk(module: ModuleType) -> int:
         raise ValueError(f"the layer's gate lower bound is {layer.gate_lower_bound}, "
                          f"not the {GATE_LOWER_BOUND} the operands are drawn from")
     with bound({KERNEL_LEAF: module}):
-        return int(layer._resolve_chunk_size(None))
+        chunk = int(layer._resolve_chunk_size(None))
+        gate_block = int(layer._resolve_gate_block(chunk))
+    if "gate_block" not in inspect.signature(module.kda_intra_chunk).parameters:
+        chunk = gate_block
+    return chunk, gate_block
 
 
 def flat_inputs(tokens: int, seed: int, gate: str = "served") -> tuple:
@@ -355,21 +376,22 @@ def sequential_float64(flat: tuple) -> tuple[torch.Tensor, torch.Tensor]:
     return o, state
 
 
-def graph_fn(kernel: str, module, layers: int):
-    """``layers`` independent calls of ``kernel`` from ``module``, one graph."""
+def graph_fn(kernel: str, variant: Variant, layers: int):
+    """``layers`` independent calls of ``kernel`` from ``variant``'s module, one graph."""
     width = OPERANDS[kernel]
+    module, keywords = variant.module, variant.intra_keywords()
 
     def run(*args):
         outs = []
         for layer in range(layers):
             call = args[width * layer: width * (layer + 1)]
             if kernel == "intra":
-                outs.extend(module.kda_intra_chunk(*call))
+                outs.extend(module.kda_intra_chunk(*call, **keywords))
             elif kernel == "inter":
                 outs.extend(module.kda_inter_chunk(*call[:6], state=call[6]))
             else:
                 q, k, v, beta, gk, state = call
-                intra = module.kda_intra_chunk(q, k, v, beta, gk)
+                intra = module.kda_intra_chunk(q, k, v, beta, gk, **keywords)
                 outs.extend(module.kda_inter_chunk(
                     intra.kg, intra.w, intra.u, gk, q, intra.aqk, state=state))
         return tuple(outs)
@@ -431,7 +453,7 @@ def bench_shape(tokens: int, variants: list[Variant], args) -> dict:
         for kernel in KERNELS:
             inputs[(kernel, chunk)] = to_device([t for c in cases for t in c[kernel]])
     graphs = {
-        (kernel, variant.name): (compiled(graph_fn(kernel, variant.module, layers)),
+        (kernel, variant.name): (compiled(graph_fn(kernel, variant, layers)),
                                  inputs[(kernel, variant.chunk)])
         for kernel in KERNELS for variant in variants
     }
@@ -510,7 +532,7 @@ def numerics_shape(tokens: int, variants: list[Variant], args) -> list[dict]:
     """One-call graphs of every variant on ``--seeds`` x ``--gates`` operands; outputs saved."""
     torch._dynamo.reset()
     models = {
-        (kernel, variant.name): compiled(graph_fn(kernel, variant.module, 1))
+        (kernel, variant.name): compiled(graph_fn(kernel, variant, 1))
         for kernel in KERNELS for variant in variants
     }
     baseline = next(variant for variant in variants if variant.name == BASELINE)
@@ -648,7 +670,8 @@ def main() -> None:
                         "NEURON_LIBTORCH_CACHE_ROOT")
         },
         "tree": {"head": head, "kernel_file_dirty": bool(dirty)},
-        "variants": {v.name: {"rev": v.rev, "sha256": v.sha256, "chunk": v.chunk}
+        "variants": {v.name: {"rev": v.rev, "sha256": v.sha256, "chunk": v.chunk,
+                               "gate_block": v.gate_block}
                      for v in variants},
         "shape": {"kdim": SERVED_KDIM, "vdim": SERVED_VDIM},
         "timing_unit": (
