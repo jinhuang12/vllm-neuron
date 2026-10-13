@@ -29,7 +29,10 @@ pad's value replaced by a large positive number, which the merge must not read.
 ``one_core_ties`` plants the two-rank tie only in the rows the second core of an LNC2 pair
 owns, so at ``R >= 2`` one core's tie branch is taken and the other's is not: the two cores
 must still take the branch together (a core alone in it waits on the loop's two-core barrier
-for good). Every case records each core's own branch condition and ``cores_disagree``.
+for good). Every case records each core's own branch condition and ``cores_disagree``. Only a
+launch of one group a program has the branch (``merge.program_groups``); at more groups, as at
+``R = 1024``, both cores run the tie step on every group, and the two fields record the
+inputs' conditions, not a branch taken.
 ``value_pads`` is ``short`` with every pad given a real local id the row does not hold, so
 only its ``BOUND_FILL`` value marks it. Every case records its pads per row (id ``-1`` or a
 value at or below ``BOUND_FILL_MARK``) and ``pads_emitted``, the output slots that hold an id
@@ -54,7 +57,8 @@ check runs on the device outputs and on the oracle's; the tie statistics are rec
 ``all_gather`` concatenates every rank's operands, and must equal the kernel's output.
 
 **Time.** Per shape, on inputs without an excess tie (``fast``) and with one in every row
-(``ties``, the tie-break branch taken): a one-call graph, an ``--links``-call graph of
+(``ties``, the tie-break branch taken; at more than one group a program the tie step runs on
+both inputs, so the two time the same code): a one-call graph, an ``--links``-call graph of
 independent calls on distinct operand copies, and an A/A copy of the one-call graph whose
 difference from the first is the noise floor. Per call = ``(T_L - T_1) / (L - 1)``, paired per
 iteration, from the runtime system trace (LNC2 physical-core intervals merged). Floors, timed
@@ -138,7 +142,8 @@ def second_program_rows(rows: int) -> list[int]:
 def branch_flags(values: torch.Tensor, ids: torch.Tensor, k: int) -> list[list[bool]]:
     """Per program of an LNC2 launch, per group, whether a row of the group has an excess tie
     (more than ``k`` candidates at or above a ``k``-th value some valid candidate holds): the
-    kernel's tie-branch condition on each core before the two cores combine it."""
+    kernel's tie-branch condition on each core before the two cores combine it. A program of
+    more than one group has no branch: it runs the tie step whatever its flags."""
     cp, rows, _ = values.shape
     vals = values.permute(1, 0, 2).reshape(rows, cp * k)
     valid = ids.permute(1, 0, 2).reshape(rows, cp * k) >= 0
