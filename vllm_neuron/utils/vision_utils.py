@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from transformers import PretrainedConfig
@@ -59,6 +60,43 @@ def get_max_pixels_token_count(
     if model_cls and issubclass(model_cls, SupportsMaxPixels):
         return model_cls.get_max_pixels_token_count(hf_config, max_pixels)
     return None
+
+
+@dataclass(frozen=True)
+class VisionEmbedLimit:
+    """The most embeddings one image may produce on this server.
+
+    The vision encoder is compiled for the ``num_vision_tokens_buckets`` sizes, which
+    count raw (pre-merge) vision tokens. The language model receives one embedding per
+    ``merge_factor`` raw tokens, so an image with more than
+    ``max_bucket // merge_factor`` embeddings fits no compiled bucket.
+    """
+
+    #: Largest entry of ``vision_neuron_config.num_vision_tokens_buckets``.
+    max_bucket: int
+    #: Raw vision tokens per embedding (:func:`get_vision_token_merge_factor`).
+    merge_factor: int
+
+    @property
+    def embeds(self) -> int:
+        """The limit, in embeddings: what ``PlaceholderRange.get_num_embeds`` counts."""
+        return max(1, self.max_bucket // self.merge_factor)
+
+
+def get_vision_embed_limit(vllm_config) -> VisionEmbedLimit | None:
+    """The per-image embedding limit for a served config, or None without vision buckets.
+
+    The one source for both places that enforce the limit: the request check
+    (``NeuronPlatform.validate_request``, through the admission policy) and the
+    scheduler's per-step encoder budget (``NeuronScheduler``). Read after the platform
+    has resolved ``vision_neuron_config``.
+    """
+    vision_config = (vllm_config.additional_config or {}).get("vision_neuron_config")
+    buckets = vision_config.get("num_vision_tokens_buckets") if vision_config else None
+    if not buckets:
+        return None
+    merge_factor = get_vision_token_merge_factor(vllm_config.model_config.hf_config)
+    return VisionEmbedLimit(max_bucket=max(buckets), merge_factor=max(merge_factor, 1))
 
 
 def get_epd_kwargs(

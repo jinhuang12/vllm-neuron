@@ -344,21 +344,18 @@ class NeuronScheduler(Scheduler):
         defer excess images to subsequent prefill steps automatically.
 
         Budget is in embed (post-merge) space; buckets are in raw (pre-merge)
-        token space. Conversion: raw_tokens = embeds * merge_factor.
+        token space. Conversion: raw_tokens = embeds * merge_factor. The cap is the
+        per-image limit the request check enforces (``get_vision_embed_limit``).
         """
-        vision_config_dict = vllm_config.additional_config.get("vision_neuron_config")
-        if not vision_config_dict or self.max_num_encoder_input_tokens <= 0:
+        if self.max_num_encoder_input_tokens <= 0:
             return
 
-        buckets = vision_config_dict.get("num_vision_tokens_buckets")
-        if not buckets:
+        from vllm_neuron.utils.vision_utils import get_vision_embed_limit
+
+        limit = get_vision_embed_limit(vllm_config)
+        if limit is None:
             return
-
-        from vllm_neuron.utils.vision_utils import get_vision_token_merge_factor
-
-        max_bucket = max(buckets)
-        merge_factor = get_vision_token_merge_factor(vllm_config.model_config.hf_config)
-        cap = max(1, max_bucket // merge_factor)
+        cap = limit.embeds
 
         if self.max_num_encoder_input_tokens > cap:
             logger.info(
@@ -366,8 +363,8 @@ class NeuronScheduler(Scheduler):
                 "(max_vision_bucket=%d, merge_factor=%d)",
                 self.max_num_encoder_input_tokens,
                 cap,
-                max_bucket,
-                merge_factor,
+                limit.max_bucket,
+                limit.merge_factor,
             )
             self.max_num_encoder_input_tokens = cap
 

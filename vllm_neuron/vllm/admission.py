@@ -49,6 +49,18 @@ Five request classes are refused:
   runner then has no logits on the host; vLLM's completions endpoint indexes an empty
   logprobs list and answers HTTP 500.
 
+Beyond the token and sampling rules above, one more request class is refused: an image
+with more embeddings than the compiled vision encoder holds, that is, more than the
+largest ``num_vision_tokens_buckets`` entry divided by the model's merge factor
+(``vision_utils.get_vision_embed_limit``, which also caps the scheduler's encoder
+budget). Such an image fits no compiled bucket, and the scheduler can never schedule it.
+The refusal is a ``VLLMValidationError`` naming the content part, so the 400 carries it
+as ``param``.
+
+A media URL the client got wrong is answered with HTTP 400 too, not 500
+(:func:`install_client_media_errors`): a ``file://`` URL on a server that loads no local
+files, and an ``http(s)`` URL that cannot be fetched.
+
 ``validate_request`` alone answers a refused *streamed* request with HTTP 200 and an
 error event: vLLM's ``AsyncLLM.generate`` is an async generator, so its body (where
 ``process_inputs`` runs) starts only once the response stream is iterated. vLLM's own
@@ -64,7 +76,10 @@ import functools
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from vllm_neuron.utils.vision_utils import VisionEmbedLimit
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +107,16 @@ _WARNED: set[str] = set()
 
 #: Marks the wrapped ``AsyncLLM.generate`` so a second install is a no-op.
 _EAGER_MARK = "_vllm_neuron_eager_validation"
+
+#: Marks the wrapped ``MediaConnector`` loaders so a second install is a no-op.
+_MEDIA_MARK = "_vllm_neuron_client_media_errors"
+
+#: The content part each of vLLM's media readers loads, for a refusal's ``param``.
+_MEDIA_PARAMETERS = {
+    "ImageMediaIO": "image_url",
+    "VideoMediaIO": "video_url",
+    "AudioMediaIO": "audio_url",
+}
 
 
 # ── prompt length ────────────────────────────────────────────────────────────────
@@ -255,6 +280,96 @@ class SamplingAdmission:
         return knobs
 
 
+# ── image size ───────────────────────────────────────────────────────────────────
+
+
+#: The ``mm_processor_kwargs`` key that caps an image's placeholder tokens, for each
+#: architecture whose image processor reads one. transformers' GLM-5.3-Flash image
+#: processor shrinks an image to at most ``max_image_tokens`` placeholder tokens, the unit
+#: of the per-image limit, and does not read ``max_pixels``.
+IMAGE_TOKEN_CAP_KWARGS = {"Glm5NextForConditionalGeneration": "max_image_tokens"}
+
+
+def image_resize_kwarg(hf_config) -> str | None:
+    """The ``mm_processor_kwargs`` key a client can send to shrink an image on this
+    model, or None when the model reads none."""
+    architectures = tuple(getattr(hf_config, "architectures", None) or ())
+    for arch in architectures:
+        if arch in IMAGE_TOKEN_CAP_KWARGS:
+            return IMAGE_TOKEN_CAP_KWARGS[arch]
+    from vllm_neuron.model.interfaces import SupportsMaxPixels
+    from vllm_neuron.model.registry import get_models
+
+    models = dict(get_models())
+    for arch in architectures:
+        model_cls = models.get(arch)
+        if model_cls is not None and issubclass(model_cls, SupportsMaxPixels):
+            return "max_pixels"
+    return None
+
+
+@dataclass(frozen=True)
+class ImageEmbeds:
+    """The image rule: the most embeddings one multimodal item may produce, and the key
+    a client can send to shrink an image."""
+
+    #: The per-image limit; the scheduler's encoder budget reads the same value.
+    embed_limit: VisionEmbedLimit
+    #: The ``mm_processor_kwargs`` key that shrinks an image on this model, if any.
+    resize_kwarg: str | None = None
+
+    @property
+    def limit(self) -> int:
+        return self.embed_limit.embeds
+
+    def refusal(self, modality: str, num_embeds: int) -> str:
+        fixes = [f"Send a smaller {modality}"]
+        if self.resize_kwarg == "max_pixels":
+            fixes.append("send a smaller max_pixels in mm_processor_kwargs")
+        elif self.resize_kwarg is not None:
+            fixes.append(
+                f'send mm_processor_kwargs {{"{self.resize_kwarg}": {self.limit}}} to have '
+                f"the server shrink it"
+            )
+        return (
+            f"The {modality} in this request produces {num_embeds} embedding tokens, and "
+            f"this server admits at most {self.limit} per {modality}: the largest "
+            f"num_vision_tokens_buckets entry in vision_neuron_config "
+            f"({self.embed_limit.max_bucket} vision tokens) divided by the merge factor "
+            f"{self.embed_limit.merge_factor}. "
+            f"{', or '.join(fixes)}."
+        )
+
+    def first_refusal(self, processed_inputs: Any):
+        """``(message, parameter, num_embeds)`` for the first item above the limit, or
+        None. ``parameter`` is the content part that carried the item (``image_url``)."""
+        if not isinstance(processed_inputs, Mapping):
+            return None
+        placeholders = processed_inputs.get("mm_placeholders") or {}
+        for modality, positions in placeholders.items():
+            for position in positions:
+                # get_num_embeds, not length: a video placeholder interleaves timestamp
+                # text tokens with the embeddings (is_embed), so length overcounts what
+                # the vision encoder produces. For an image the two are equal.
+                num_embeds = position.get_num_embeds()
+                if num_embeds > self.limit:
+                    return self.refusal(modality, num_embeds), f"{modality}_url", num_embeds
+        return None
+
+
+def image_embeds_from_config(vllm_config) -> ImageEmbeds | None:
+    """The image rule for this served config, or None when it has no vision buckets."""
+    from vllm_neuron.utils.vision_utils import get_vision_embed_limit
+
+    limit = get_vision_embed_limit(vllm_config)
+    if limit is None:
+        return None
+    return ImageEmbeds(
+        embed_limit=limit,
+        resize_kwarg=image_resize_kwarg(vllm_config.model_config.hf_config),
+    )
+
+
 # ── the policy ───────────────────────────────────────────────────────────────────
 
 
@@ -262,9 +377,14 @@ class SamplingAdmission:
 class AdmissionPolicy:
     prompt: PromptLength | None = None
     sampling: SamplingAdmission = field(default_factory=SamplingAdmission)
+    image: ImageEmbeds | None = None
 
     def check(self, processed_inputs: Any, params: Any) -> None:
-        """Raise ``ValueError`` naming every reason this request cannot be served."""
+        """Raise ``ValueError`` naming every reason this request cannot be served.
+
+        A request refused for one oversized image alone gets a ``VLLMValidationError``
+        that names the content part, so vLLM's 400 carries it as ``param``.
+        """
         refusals = []
         # PoolingParams carry no sampling knobs and generate no token, so neither the
         # length rule nor the sampling rules apply to them.
@@ -274,6 +394,14 @@ class AdmissionPolicy:
                 if tokens is not None and tokens > self.prompt.tokens:
                     refusals.append(self.prompt.refusal(tokens))
             refusals.extend(self.sampling.refusals(params))
+        image = None if self.image is None else self.image.first_refusal(processed_inputs)
+        if image is not None and not refusals:
+            from vllm.exceptions import VLLMValidationError
+
+            message, parameter, num_embeds = image
+            raise VLLMValidationError(message, parameter=parameter, value=num_embeds)
+        if image is not None:
+            refusals.append(image[0])
         if refusals:
             raise ValueError(" ".join(refusals))
 
@@ -329,14 +457,19 @@ def policy_from_config(vllm_config) -> AdmissionPolicy:
             prompt_logprobs=False,
             defaults=_server_defaults(model_config),
         )
-    policy = AdmissionPolicy(prompt=prompt, sampling=sampling)
+    image = image_embeds_from_config(vllm_config)
+    policy = AdmissionPolicy(prompt=prompt, sampling=sampling, image=image)
     logger.info(
         "Request admission: prompts up to %d tokens (max_model_len %d less one generated "
-        "token); on-device sampling %s",
+        "token); on-device sampling %s%s",
         prompt.tokens,
         prompt.max_model_len,
         "off" if sampler is None
         else f"on (all_greedy={sampler.all_greedy}, logprobs={sampling.logprobs})",
+        # A model class without multimodal input gets no image, so its image rule is idle.
+        ""
+        if image is None or model_config.multimodal_config is None
+        else f"; images up to {image.limit} embeddings",
     )
     return policy
 
@@ -394,3 +527,106 @@ def install_eager_validation() -> None:
 
     setattr(generate, _EAGER_MARK, True)
     AsyncLLM.generate = generate
+
+
+# ── client media errors ──────────────────────────────────────────────────────────
+
+
+def _fetch_errors() -> tuple[type[BaseException], ...]:
+    """What a failed ``http(s)`` media fetch raises: ``aiohttp`` on the async path,
+    ``requests`` on the sync path, and the built-in timeout and connection errors."""
+    import aiohttp
+    import requests
+
+    return (
+        aiohttp.ClientError,
+        requests.exceptions.RequestException,
+        TimeoutError,
+        ConnectionError,
+    )
+
+
+def client_media_error(connector, url: str, media_io, exc: BaseException):
+    """The HTTP 400 refusal for a media URL the client got wrong, or None to let
+    ``exc`` propagate as it is.
+
+    Two cases are the client's: a ``file://`` URL on a server started without
+    ``--allowed-local-media-path`` (vLLM raises ``RuntimeError``), and an ``http(s)``
+    URL that cannot be fetched (connection refused, an HTTP error status, a timeout).
+    Both fall to the internal-error branch of vLLM's error handler, which answers HTTP
+    500. A ``ValueError`` is already a 400 and is left alone, as is every other error,
+    which keeps the status vLLM gives it.
+    """
+    if isinstance(exc, ValueError):
+        return None
+    from urllib3.util import parse_url
+    from vllm.exceptions import VLLMValidationError
+
+    try:
+        url_spec = parse_url(url)
+    except Exception:  # an unparsable URL raised before the fetch; leave its error
+        return None
+    scheme = (url_spec.scheme or "").lower()
+    parameter = _MEDIA_PARAMETERS.get(type(media_io).__name__)
+    if (
+        scheme == "file"
+        and isinstance(exc, RuntimeError)
+        and connector.allowed_local_media_path is None
+    ):
+        return VLLMValidationError(
+            f"{exc} This server loads no local files: send the media as an http(s) URL "
+            f"or a base64 data URL.",
+            parameter=parameter,
+        )
+    if scheme.startswith("http") and isinstance(exc, _fetch_errors()):
+        reason = type(exc).__name__ + (f": {exc}" if str(exc) else "")
+        return VLLMValidationError(
+            f"The media URL could not be fetched from {url_spec.host} ({reason}). Send "
+            f"a URL this server can reach, or the media as a base64 data URL.",
+            parameter=parameter,
+        )
+    return None
+
+
+def install_client_media_errors() -> None:
+    """Answer a media URL the client got wrong with HTTP 400 instead of 500.
+
+    Wraps vLLM's ``MediaConnector.load_from_url`` and ``load_from_url_async``, which
+    every image, video and audio URL goes through, so that :func:`client_media_error`
+    re-raises the client's two cases as a ``VLLMValidationError`` naming the content
+    part. vLLM's error handler answers that with 400 and the part as ``param``.
+    Idempotent.
+    """
+    try:
+        from vllm.multimodal.media import MediaConnector
+    except ImportError:  # a vLLM without the media connector fetches no media
+        return
+    if getattr(MediaConnector.load_from_url_async, _MEDIA_MARK, False):
+        return
+    load = MediaConnector.load_from_url
+    load_async = MediaConnector.load_from_url_async
+
+    @functools.wraps(load)
+    def load_from_url(self, url, media_io, *args, **kwargs):
+        try:
+            return load(self, url, media_io, *args, **kwargs)
+        except Exception as exc:
+            refusal = client_media_error(self, url, media_io, exc)
+            if refusal is None:
+                raise
+            raise refusal from exc
+
+    @functools.wraps(load_async)
+    async def load_from_url_async(self, url, media_io, *args, **kwargs):
+        try:
+            return await load_async(self, url, media_io, *args, **kwargs)
+        except Exception as exc:
+            refusal = client_media_error(self, url, media_io, exc)
+            if refusal is None:
+                raise
+            raise refusal from exc
+
+    setattr(load_from_url, _MEDIA_MARK, True)
+    setattr(load_from_url_async, _MEDIA_MARK, True)
+    MediaConnector.load_from_url = load_from_url
+    MediaConnector.load_from_url_async = load_from_url_async

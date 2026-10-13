@@ -148,18 +148,15 @@ class NeuronPlatform(Platform):
     device_control_env_var: str = "NEURON_VISIBLE_DEVICES"
     _device_count: int = -1
     _termination_timeout_patched: bool = False
-    # Max embeds a single image can produce. Set once in check_and_update_config.
-    # None means "no vision validation". In embed (post-merge) space so
-    # validate_request can compare directly against mm_pos.length.
-    _max_embeds_per_image: int | None = None
     # Structured outputs are request-level, while the SO-off perf mode is a
     # server-level compile choice. Validate requests before they reach the
     # engine so a bad request returns a normal request error.
     _enable_structured_outputs: bool = False
     # What this server refuses before a request reaches the engine: prompts past the
     # prefill window, sampling knobs the on-device sampler cannot apply, logprobs it
-    # cannot return (vllm_neuron/vllm/admission.py). Set in check_and_update_config;
-    # None admits everything.
+    # cannot return, images larger than the compiled vision encoder holds
+    # (vllm_neuron/vllm/admission.py). Set in check_and_update_config; None admits
+    # everything.
     _admission = None
 
     @classmethod
@@ -751,20 +748,8 @@ class NeuronPlatform(Platform):
 
         if hasattr(model_config.hf_config, "vision_config"):
             cls._resolve_vision_auto_config(vllm_config, model_config)
-
-        # Compute per-image embed limit for request validation.
-        # Buckets are in raw-token space; mm_pos.length is in embed space.
-        # Convert once here: max_embeds = max_bucket / merge_factor.
-        vision_config_dict = vllm_config.additional_config.get("vision_neuron_config")
-        if vision_config_dict:
-            buckets = vision_config_dict.get("num_vision_tokens_buckets")
-            if buckets:
-                from vllm_neuron.utils.vision_utils import (
-                    get_vision_token_merge_factor,
-                )
-
-                merge_factor = get_vision_token_merge_factor(model_config.hf_config)
-                cls._max_embeds_per_image = max(buckets) // max(merge_factor, 1)
+        cls._refuse_video_input(vllm_config)
+        cls._refuse_vision_merge_factor_mismatch(vllm_config)
 
         cls._resolve_sampling_from_the_model_class(vllm_config)
 
@@ -774,6 +759,9 @@ class NeuronPlatform(Platform):
 
         cls._admission = admission.policy_from_config(vllm_config)
         admission.install_eager_validation()
+        # Only a multimodal model class builds a media connector.
+        if model_config.multimodal_config is not None:
+            admission.install_client_media_errors()
 
         if envs.VLLM_NEURON_RUNTIME_INPUT_SNAPSHOT_ENABLE:
             # Capture copies a forward's inputs to host via a standalone op run
@@ -927,9 +915,10 @@ class NeuronPlatform(Platform):
 
         Called per-request before scheduling. Raises ValueError before model
         execution so SO-off servers do not enter the SO mask path, and so a prompt
-        that leaves no room for a generated token (``prompt + 1 > max_model_len``) or
-        a sampling request the on-device sampler cannot serve never reaches the
-        engine (see ``vllm_neuron/vllm/admission.py``).
+        that leaves no room for a generated token (``prompt + 1 > max_model_len``), a
+        sampling request the on-device sampler cannot serve, or an image larger than
+        the compiled vision encoder holds never reaches the engine (see
+        ``vllm_neuron/vllm/admission.py``).
         """
         if (
             not cls._enable_structured_outputs
@@ -939,31 +928,6 @@ class NeuronPlatform(Platform):
 
         if cls._admission is not None:
             cls._admission.check(processed_inputs, params)
-
-        if cls._max_embeds_per_image is None:
-            return
-
-        mm_placeholders = processed_inputs.get("mm_placeholders")
-        if not mm_placeholders:
-            return
-
-        for modality, positions in mm_placeholders.items():
-            for mm_pos in positions:
-                # Use get_num_embeds(), not length: a video placeholder span
-                # interleaves timestamp TEXT tokens with the vision embeds
-                # (is_embed mask), so length overcounts what the vision
-                # encoder actually produces. For images they are equal.
-                num_embeds = mm_pos.get_num_embeds()
-                if num_embeds > cls._max_embeds_per_image:
-                    raise ValueError(
-                        f"A {modality} in this request produces "
-                        f"{num_embeds} embedding tokens, which exceeds "
-                        f"the maximum supported by the compiled vision "
-                        f"encoder ({cls._max_embeds_per_image}). Reduce the "
-                        f"image resolution (e.g. set max_pixels in "
-                        f"mm_processor_kwargs) or increase "
-                        f"num_vision_tokens_buckets in vision_neuron_config."
-                    )
 
     @classmethod
     def _validate_quantization_config(cls, vllm_config) -> None:
@@ -1145,6 +1109,7 @@ class NeuronPlatform(Platform):
             return
 
         cls._refuse_speculative_decoding_under_dcp(vllm_config)
+        cls._refuse_multimodal_input_under_dcp(vllm_config)
 
         tp_size = vllm_config.parallel_config.tensor_parallel_size
         model_config = vllm_config.model_config
@@ -1211,6 +1176,106 @@ class NeuronPlatform(Platform):
                 num_q_heads,
             )
 
+    #: Architectures whose multimodal bridge offers image input and no video
+    #: (``Glm5NextProcessingInfo.get_supported_mm_limits``).
+    _IMAGE_ONLY_ARCHS = ("Glm5NextForConditionalGeneration",)
+
+    @classmethod
+    def _refuse_video_input(cls, vllm_config) -> None:
+        """Refuse a video limit above 0 for a model whose bridge offers images only.
+
+        vLLM reads ``--limit-mm-per-prompt`` only for the modalities the bridge
+        offers, so such a limit would be ignored without a word, and every video
+        request would still be refused (``Glm5NextProcessingInfo.validate_num_items``).
+        This refusal does not stop a server whose operator leaves the video limit out
+        or sets it to 0.
+        """
+        model_config = vllm_config.model_config
+        multimodal_config = getattr(model_config, "multimodal_config", None)
+        if multimodal_config is None or "video" not in multimodal_config.limit_per_prompt:
+            return
+        num_videos = multimodal_config.get_limit_per_prompt("video")
+        if num_videos <= 0:
+            return
+        architectures = getattr(model_config.hf_config, "architectures", None) or ()
+        image_only = [arch for arch in architectures if arch in cls._IMAGE_ONLY_ARCHS]
+        if not image_only:
+            return
+        raise ValueError(
+            f"--limit-mm-per-prompt asks for {num_videos} video(s) per prompt, but "
+            f"{image_only[0]} serves image input only on Neuron: its multimodal "
+            f"processor offers no video, so every video request would be refused. Set "
+            f"the video limit to 0 (for example --limit-mm-per-prompt "
+            f"'{{\"image\": 1, \"video\": 0}}') or leave video out of "
+            f"--limit-mm-per-prompt."
+        )
+
+    @staticmethod
+    def _admits_images(model_config) -> bool:
+        """Whether this server accepts image input: vLLM built a multimodal config for
+        the model class and the image limit per prompt is above 0 (vLLM's default for
+        a modality the operator leaves out is 999)."""
+        multimodal_config = getattr(model_config, "multimodal_config", None)
+        return (
+            multimodal_config is not None
+            and multimodal_config.get_limit_per_prompt("image") > 0
+        )
+
+    @classmethod
+    def _admits_videos(cls, model_config) -> bool:
+        """Whether this server accepts video input: the video limit per prompt is
+        above 0 and the model's bridge offers video."""
+        multimodal_config = getattr(model_config, "multimodal_config", None)
+        if multimodal_config is None:
+            return False
+        architectures = getattr(model_config.hf_config, "architectures", None) or ()
+        return multimodal_config.get_limit_per_prompt("video") > 0 and not any(
+            arch in cls._IMAGE_ONLY_ARCHS for arch in architectures
+        )
+
+    @classmethod
+    def _refuse_vision_merge_factor_mismatch(cls, vllm_config) -> None:
+        """Refuse image input when the model class's merge factor disagrees with its
+        vision config.
+
+        The per-image limit and the encoder budget divide the largest vision bucket
+        by ``get_vision_token_merge_factor`` (``vision_utils.get_vision_embed_limit``),
+        which is 1 for a class that does not implement ``SupportsSpatialMerge``. A
+        vision config that merges ``spatial_merge_size`` x ``spatial_merge_size`` raw
+        tokens into one embedding would then get a limit that many times too large,
+        and an image above the real limit would reach the encoder. Only a server that
+        admits images is refused; a text-only server never computes the limit.
+        """
+        model_config = vllm_config.model_config
+        if not cls._admits_images(model_config):
+            return
+        hf_config = model_config.hf_config
+        vision_config = getattr(hf_config, "vision_config", None)
+        merge_size = getattr(vision_config, "spatial_merge_size", None)
+        if not isinstance(merge_size, int) or merge_size <= 1:
+            return
+        from vllm_neuron.utils.vision_utils import get_vision_token_merge_factor
+
+        expected = merge_size * merge_size
+        merge_factor = get_vision_token_merge_factor(hf_config)
+        if merge_factor == expected:
+            return
+        arch = (getattr(hf_config, "architectures", None) or ["The model"])[0]
+        size = (
+            f"{expected // merge_factor} times too large"
+            if merge_factor < expected and expected % merge_factor == 0
+            else "wrong"
+        )
+        raise ValueError(
+            f"{arch} cannot serve image input on Neuron: its vision config merges "
+            f"{merge_size} x {merge_size} vision tokens into one embedding "
+            f"(vision_config.spatial_merge_size={merge_size}), but the model class "
+            f"reports a merge factor of {merge_factor}, so the per-image limit and the "
+            f"vision encoder budget would be {size}. Implement "
+            f"SupportsSpatialMerge.get_vision_token_merge_factor on the model class to "
+            f"return {expected}, or serve text only with --language-model-only."
+        )
+
     @classmethod
     def _refuse_speculative_decoding_under_dcp(cls, vllm_config) -> None:
         """Refuse speculative decoding at decode_context_parallel_size > 1.
@@ -1234,6 +1299,39 @@ class NeuronPlatform(Platform):
                 "implemented. Disable speculative decoding or set "
                 "decode_context_parallel_size=1."
             )
+
+    @classmethod
+    def _refuse_multimodal_input_under_dcp(cls, vllm_config) -> None:
+        """Refuse image and video input at decode_context_parallel_size > 1.
+
+        Image prefill under DCP is not implemented: the runner's multimodal
+        embedding gather has no DCP path, and a prefill chunk that the scheduler
+        stops at an image start (when the encoder budget or cache cannot take the
+        image that step) would begin the next DCP prefill chunk at a cached length
+        that is not a multiple of ``decode_context_parallel_size * block_size``,
+        which the runner refuses in the step, after the engine is serving. This refusal
+        does not stop a server that admits no image or video input. Callers check
+        ``dcp_size > 1`` first.
+        """
+        model_config = vllm_config.model_config
+        modalities = [
+            name
+            for name, admitted in (
+                ("image", cls._admits_images(model_config)),
+                ("video", cls._admits_videos(model_config)),
+            )
+            if admitted
+        ]
+        if not modalities:
+            return
+        raise ValueError(
+            f"This server admits {' and '.join(modalities)} input, which is not "
+            f"supported with decode_context_parallel_size > 1 "
+            f"(dcp={vllm_config.parallel_config.decode_context_parallel_size}): "
+            f"multimodal prefill under decode context parallelism is not implemented. "
+            f"Serve text only with --language-model-only, or set "
+            f"decode_context_parallel_size=1."
+        )
 
     @classmethod
     def is_pin_memory_available(cls) -> bool:
