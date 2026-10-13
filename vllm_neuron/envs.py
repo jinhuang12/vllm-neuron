@@ -87,7 +87,8 @@ if TYPE_CHECKING:
     VLLM_NEURON_GLM5NEXT_ON_DEVICE_SAMPLING: bool = False
     # GLM-5.3-Flash shadow draft (MTP stage A): run the layer-45 draft head k times
     # per decode step beside the trunk and return the k draft ids; 0 = off. The
-    # sampled tokens never read the draft. Read through ``mtp.shadow_draft_k()``.
+    # sampled tokens never read the draft. Read through ``mtp.shadow_draft_k()``; the
+    # platform also reads it at startup and refuses it at decode_context_parallel_size > 1.
     # Diagnostic (shadow) path: with ``--speculative-config '{"method": "mtp", ...}'``
     # the speculative config is the production reader of k, and a set knob must
     # agree with it.
@@ -508,8 +509,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         or False
     ),
     # The GLM-5.3-Flash shadow draft's iteration count k (MTP stage A); 0 = off.
-    # The one definition of the knob: everything else calls ``mtp.shadow_draft_k()``,
-    # which bounds the value, rather than reading the environment itself.
+    # The one definition of the knob. Every reader but the platform calls
+    # ``mtp.shadow_draft_k()``, which bounds the value; the platform reads it at
+    # startup to refuse it at decode_context_parallel_size > 1.
     "VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT": lambda: (
         maybe_convert_int(os.getenv("VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT")) or 0
     ),

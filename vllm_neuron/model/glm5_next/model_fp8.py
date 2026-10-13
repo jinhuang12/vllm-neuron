@@ -11255,7 +11255,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             draft_k: the draft's iteration count for this forward, a Python int the
                 runner names explicitly (the proposer's ``num_speculative_tokens``
                 under speculative method "mtp", the knob's value under the shadow
-                draft). ``None`` reads the knob's one reader, ``mtp.shadow_draft_k``,
+                draft). ``None`` calls the one reader of k, ``mtp.shadow_draft_k``,
                 which is what the shadow draft's direct callers rely on. A count
                 without a head, or a count below 1, is refused by name: a forward
                 that silently drafted nothing would return the bare ids and the
