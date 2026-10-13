@@ -83,8 +83,9 @@ offsets do.
 
 The decode indexer serves candidate axes up to :data:`MAX_DECODE_INDEX_CANDIDATES` and
 refuses a longer ``max_model_len`` when the runner starts
-(:func:`check_decode_index_context`). Decode context parallelism selects with
-:func:`dsa_decode_select_pools`, on the whole-row path only, up to
+(:func:`check_decode_index_context`). A runner that batches more than one decode request
+is served up to :data:`MAX_BATCHED_DECODE_INDEX_CANDIDATES`, one whole row. Decode context
+parallelism selects with :func:`dsa_decode_select_pools`, on the whole-row path only, up to
 :data:`MAX_DECODE_POOLS_CANDIDATES` per rank (:func:`check_decode_pools_context`).
 
 Both physical cores of an LNC2 core split the requests (``[2]`` grid at ``B >= 2``).
@@ -162,11 +163,18 @@ MAX_SELECT_CANDIDATES = PARTITIONS * FOLD_COLUMNS_LIMIT
 #: chunk's first candidate (below ``MAX_SELECT_CANDIDATES``), so the join's maximum never
 #: takes it over an id. A power of two, exact as an immediate.
 _LIST_PAD = -MAX_SELECT_CANDIDATES
-#: The widest candidate axis the decode indexer serves; the runner refuses a
-#: ``max_model_len`` past it (:func:`check_decode_index_context`). The whole-row width:
-#: the widest axis whose selection has run on trn2 inside a served decode graph. The
-#: chunk walk past it is checked against the torch oracle in the NKI simulator.
-MAX_DECODE_INDEX_CANDIDATES = WHOLE_ROW_COLUMNS
+#: The whole-row chunks of the widest candidate axis whose chunk walk has run on trn2 in a
+#: decode graph: the capture build of the served graph (the same nodes plus copies of the
+#: selection), at one request per step, selected the torch oracle's ids on every DSA layer
+#: and rank. The walk is also checked against the torch oracle in the NKI simulator.
+DEVICE_CHECKED_ROW_CHUNKS = 4
+#: The widest candidate axis the decode indexer serves at one request per decode step; the
+#: runner refuses a ``max_model_len`` past it (:func:`check_decode_index_context`).
+MAX_DECODE_INDEX_CANDIDATES = DEVICE_CHECKED_ROW_CHUNKS * WHOLE_ROW_COLUMNS
+#: The widest candidate axis the decode indexer serves when a decode step batches more
+#: than one request (``max_num_seqs > 1``): the whole-row width. The chunk walk has run on
+#: trn2 at one request per step only.
+MAX_BATCHED_DECODE_INDEX_CANDIDATES = WHOLE_ROW_COLUMNS
 #: The widest per-rank candidate axis decode context parallelism serves
 #: (:func:`dsa_decode_select_pools`, :func:`check_decode_pools_context`): the whole-row
 #: width, the only path that reads each selected id's score.
@@ -890,18 +898,26 @@ def decode_select_programs(batch: int) -> int:
     return 1
 
 
-def check_decode_index_context(max_model_len: int, pool_size: int | None) -> None:
+def check_decode_index_context(max_model_len: int, pool_size: int | None,
+                               max_num_seqs: int) -> None:
     """Refuse a ``max_model_len`` whose decode candidate axis is past the served width.
 
     Args:
         max_model_len: the longest context the runner serves.
         pool_size: the model's tokens per pool (``index_kpool``); ``None`` for a model
             with no DSA indexer, which is not checked.
+        max_num_seqs: the most requests one decode step batches.
 
     Raises:
         DecodeSelectError: ``max_model_len // pool_size`` (the candidate axis of the
-            ``max_model_len`` decode graph) is above :data:`MAX_DECODE_INDEX_CANDIDATES`.
+            ``max_model_len`` decode graph) is above :data:`MAX_DECODE_INDEX_CANDIDATES`,
+            or above :data:`MAX_BATCHED_DECODE_INDEX_CANDIDATES` at ``max_num_seqs > 1``.
     """
+    if int(max_num_seqs) > 1:
+        _check_context(max_model_len, pool_size, MAX_BATCHED_DECODE_INDEX_CANDIDATES,
+                       "MAX_BATCHED_DECODE_INDEX_CANDIDATES",
+                       f"the DSA decode indexer at max_num_seqs={max_num_seqs}",
+                       "Lower max_model_len or set max_num_seqs=1.")
     _check_context(max_model_len, pool_size, MAX_DECODE_INDEX_CANDIDATES,
                    "MAX_DECODE_INDEX_CANDIDATES", "the DSA decode indexer")
 
@@ -922,10 +938,11 @@ def check_decode_pools_context(rank_context: int, pool_size: int | None) -> None
                    "MAX_DECODE_POOLS_CANDIDATES", "the decode context parallel selection")
 
 
-def _check_context(context, pool_size, limit, limit_name, selection):
+def _check_context(context, pool_size, limit, limit_name, selection,
+                   remedy="Lower max_model_len."):
     """Raise :class:`DecodeSelectError` when ``context // pool_size`` candidates exceed
-    ``limit`` (named ``limit_name``, served by ``selection``); no check at ``pool_size``
-    ``None``."""
+    ``limit`` (named ``limit_name``, served by ``selection``; the message ends with
+    ``remedy``); no check at ``pool_size`` ``None``."""
     if pool_size is None:
         return
     candidates = int(context) // int(pool_size)
@@ -934,7 +951,7 @@ def _check_context(context, pool_size, limit, limit_name, selection):
         raise DecodeSelectError(
             f"max_model_len={context} needs {candidates} decode index candidates "
             f"(index_kpool={pool_size}); {selection} serves up to {limit_name}={limit} "
-            f"(max_model_len <= {longest}). Lower max_model_len.")
+            f"(max_model_len <= {longest}). {remedy}")
 
 
 def _validate_scores(bounded: Tensor, select_k) -> tuple[int, int]:

@@ -953,6 +953,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             check_decode_index_context(
                 self.max_model_len,
                 getattr(getattr(hf_config, "text_config", hf_config), "index_kpool", None),
+                self.max_num_reqs,
             )
 
         # Initialize persistent batch and request tracking
