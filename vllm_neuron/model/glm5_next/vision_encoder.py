@@ -18,8 +18,9 @@ reference stage                        where it lives here
 :meth:`Glm5NextVisionEncoder.encode_block` therefore returns the reference's ``pooler_output``,
 the merged ``out_hidden_size``-wide embeddings the encoder cache stores, not its
 ``last_hidden_state``. :meth:`Glm5NextVisionEncoder.forward`, the compiled graph, encodes a bucket
-of fixed-size attention blocks and writes those rows into the encoder cache;
-:func:`pack_images_into_blocks` lays the images out for it, one image per block.
+of fixed-size attention blocks, one rank's run of them under vision data parallelism, and writes
+those rows into the encoder cache; :func:`pack_rank_blocks` lays the images out for it, one image
+per block.
 
 Three facts make that delegation exact:
 
@@ -593,30 +594,33 @@ class Glm5NextVisionEncoder(nn.Module):
         encoder_cache_buffer: torch.Tensor,
         write_block_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """Encode a bucket of attention blocks and write the result into the encoder cache.
+        """Encode this rank's blocks of a bucket and write every block into the encoder cache.
 
         Every shape is fixed by the bucket, so one compiled graph serves every call of that
-        bucket; :func:`pack_images_into_blocks` lays the images out. Under vision data
-        parallelism each rank encodes its own run of blocks and the ranks gather the results,
-        so every rank's cache holds every block.
+        bucket; :func:`pack_rank_blocks` lays the images out. Under vision data parallelism
+        each rank takes only its own run of blocks, so every rank's graph has the same shapes
+        and one compiled graph serves every rank. The ranks gather the encoded runs, in rank
+        order, so every rank's cache holds every block.
 
         Args:
-            pixel_values: ``[num_blocks, block_size, patch_dim]`` in the tower dtype.
-            cos: ``[num_blocks, block_size, head_dim]`` in the tower dtype.
-            sin: ``[num_blocks, block_size, head_dim]`` in the tower dtype.
-            bound_min: ``[num_blocks, block_size, 1]`` int32, block-local.
-            bound_max: ``[num_blocks, block_size, 1]`` int32, block-local.
+            pixel_values: ``[blocks_per_rank, block_size, patch_dim]`` in the tower dtype,
+                where ``blocks_per_rank`` is the bucket's block count over the vision DP size.
+            cos: ``[blocks_per_rank, block_size, head_dim]`` in the tower dtype.
+            sin: ``[blocks_per_rank, block_size, head_dim]`` in the tower dtype.
+            bound_min: ``[blocks_per_rank, block_size, 1]`` int32, block-local.
+            bound_max: ``[blocks_per_rank, block_size, 1]`` int32, block-local.
             encoder_cache_buffer: ``[num_cache_blocks, block_size // spatial_merge_size ** 2,
                 out_hidden_size]``, written in place.
-            write_block_ids: ``[num_blocks]`` int64, the cache block each encoded block goes
-                to; padding blocks go to the cache's scratch block.
+            write_block_ids: ``[num_blocks]`` int64, the cache block each block of the bucket
+                goes to, every rank's run in rank order; padding blocks go to the cache's
+                scratch block.
 
         Returns:
             ``encoder_cache_buffer``, the same tensor.
 
         Raises:
-            Glm5NextVisionEncoderError: a block count that the vision DP ranks cannot split
-                evenly.
+            Glm5NextVisionEncoderError: ``write_block_ids`` that does not name one cache block
+                for each block of every rank's run.
         """
         # Vision data parallelism: the ranks of one vision DP group split the
         # bucket's blocks (``VisionNeuronConfig.resolve_tp_dp`` pads the block count
@@ -629,17 +633,11 @@ class Glm5NextVisionEncoder(nn.Module):
 
         dp_group = get_neuron_vision_dp_group()
         dp_size = dp_group.world_size if dp_group is not None else 1
-        if dp_size > 1:
-            if pixel_values.shape[0] % dp_size:
-                raise Glm5NextVisionEncoderError(
-                    f"{pixel_values.shape[0]} attention blocks do not split over "
-                    f"{dp_size} vision DP ranks; a rank would drop blocks"
-                )
-            blocks_per_rank = pixel_values.shape[0] // dp_size
-            start = dp_group.rank_in_group * blocks_per_rank
-            local = slice(start, start + blocks_per_rank)
-            pixel_values, cos, sin = pixel_values[local], cos[local], sin[local]
-            bound_min, bound_max = bound_min[local], bound_max[local]
+        if write_block_ids.shape[0] != pixel_values.shape[0] * dp_size:
+            raise Glm5NextVisionEncoderError(
+                f"{write_block_ids.shape[0]} cache block ids for {dp_size} vision DP "
+                f"ranks of {pixel_values.shape[0]} attention blocks each"
+            )
         merged = torch.stack(
             [
                 self.encode_block(
@@ -690,25 +688,9 @@ def pack_images_into_blocks(
             or rows that disagree with the grid. An image is never truncated.
     """
     head_dim = config.hidden_size // config.num_heads
-    rows_per_image = [int(t * h * w) for t, h, w in grid_thw.tolist()]
-    if len(rows_per_image) > num_blocks:
-        raise Glm5NextVisionEncoderError(
-            f"{len(rows_per_image)} images do not fit a bucket of {num_blocks} attention "
-            f"blocks; the tower places one image per block"
-        )
-    too_large = [rows for rows in rows_per_image if rows > block_size]
-    if too_large:
-        raise Glm5NextVisionEncoderError(
-            f"an image of {too_large[0]} patch rows is larger than one attention block of "
-            f"{block_size} rows (vision_attention_block_size); it would be cut, so it is "
-            f"refused"
-        )
-    if sum(rows_per_image) != pixel_values.shape[0]:
-        raise Glm5NextVisionEncoderError(
-            f"grid_thw describes {sum(rows_per_image)} patch rows but pixel_values carries "
-            f"{pixel_values.shape[0]}"
-        )
-
+    rows_per_image = _rows_per_image(
+        pixel_values, grid_thw, block_size=block_size, num_blocks=num_blocks
+    )
     rows = torch.arange(block_size, dtype=torch.int32).reshape(1, block_size, 1)
     packed = {
         "pixel_values": torch.zeros(
@@ -735,3 +717,106 @@ def pack_images_into_blocks(
         packed["bound_max"][block, :image_rows] = bound_max
         start += image_rows
     return packed
+
+
+def pack_rank_blocks(
+    pixel_values: torch.Tensor,
+    grid_thw: torch.Tensor,
+    *,
+    block_size: int,
+    num_blocks: int,
+    config: Glm5NextVisionConfig,
+    dtype: torch.dtype,
+) -> dict[str, torch.Tensor]:
+    """Lay out this vision DP rank's run of a bucket's blocks, the tower's input on this rank.
+
+    The ranks of a vision DP group split the bucket's blocks in rank order, and
+    :meth:`Glm5NextVisionEncoder.forward` takes the rank's run: each rank packs and sends to its
+    device only its own run, and every rank's graph has the same shapes. Image ``i`` goes to
+    block ``i`` (:func:`pack_images_into_blocks`), so a rank's run holds a run of the images.
+    The layout is checked over every image first: every rank then refuses the same batch, and no
+    rank waits in the tower's gather for a rank that refused. With one vision DP rank, the run is
+    the whole bucket.
+
+    Args:
+        pixel_values: ``[total_patches, patch_dim]``, the processor's rows of every image in turn.
+        grid_thw: ``[num_images, 3]`` of (temporal, height, width) patch counts.
+        block_size: rows per attention block, ``vision_attention_block_size``.
+        num_blocks: blocks of the bucket over every rank; at least the number of images.
+        config: the tower config, for the patch width, head width and merge size.
+        dtype: the tower dtype.
+
+    Returns:
+        :func:`pack_images_into_blocks`'s tensors for this rank's run, each with a leading
+        ``[num_blocks // vision_dp_size, block_size]``.
+
+    Raises:
+        Glm5NextVisionEncoderError: a block count the vision DP ranks cannot split evenly, or a
+            batch :func:`pack_images_into_blocks` refuses.
+    """
+    from vllm_neuron.parallel.neuron_parallel_state import get_neuron_vision_dp_group
+
+    dp_group = get_neuron_vision_dp_group()
+    if dp_group is None:
+        return pack_images_into_blocks(
+            pixel_values,
+            grid_thw,
+            block_size=block_size,
+            num_blocks=num_blocks,
+            config=config,
+            dtype=dtype,
+        )
+    if num_blocks % dp_group.world_size:
+        raise Glm5NextVisionEncoderError(
+            f"{num_blocks} attention blocks do not split over {dp_group.world_size} "
+            f"vision DP ranks; a rank would drop blocks"
+        )
+    rows_per_image = _rows_per_image(
+        pixel_values, grid_thw, block_size=block_size, num_blocks=num_blocks
+    )
+    blocks_per_rank = num_blocks // dp_group.world_size
+    first = dp_group.rank_in_group * blocks_per_rank
+    images = slice(first, first + blocks_per_rank)
+    start = sum(rows_per_image[:first])
+    stop = start + sum(rows_per_image[images])
+    return pack_images_into_blocks(
+        pixel_values[start:stop],
+        grid_thw[images],
+        block_size=block_size,
+        num_blocks=blocks_per_rank,
+        config=config,
+        dtype=dtype,
+    )
+
+
+def _rows_per_image(
+    pixel_values: torch.Tensor,
+    grid_thw: torch.Tensor,
+    *,
+    block_size: int,
+    num_blocks: int,
+) -> list[int]:
+    """Each image's patch rows, once the batch is known to fit one image per block.
+
+    Raises:
+        Glm5NextVisionEncoderError: as :func:`pack_images_into_blocks`.
+    """
+    rows_per_image = [int(t * h * w) for t, h, w in grid_thw.tolist()]
+    if len(rows_per_image) > num_blocks:
+        raise Glm5NextVisionEncoderError(
+            f"{len(rows_per_image)} images do not fit a bucket of {num_blocks} attention "
+            f"blocks; the tower places one image per block"
+        )
+    too_large = [rows for rows in rows_per_image if rows > block_size]
+    if too_large:
+        raise Glm5NextVisionEncoderError(
+            f"an image of {too_large[0]} patch rows is larger than one attention block of "
+            f"{block_size} rows (vision_attention_block_size); it would be cut, so it is "
+            f"refused"
+        )
+    if sum(rows_per_image) != pixel_values.shape[0]:
+        raise Glm5NextVisionEncoderError(
+            f"grid_thw describes {sum(rows_per_image)} patch rows but pixel_values carries "
+            f"{pixel_values.shape[0]}"
+        )
+    return rows_per_image

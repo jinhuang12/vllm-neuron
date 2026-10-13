@@ -28,7 +28,7 @@ from .model_fp8 import Glm5NextForConditionalGeneration
 from .vision_encoder import (
     Glm5NextVisionEncoder,
     Glm5NextVisionEncoderError,
-    pack_images_into_blocks,
+    pack_rank_blocks,
 )
 
 #: The tower's dtype. The checkpoint stores every tower tensor in bf16, and the encoder cache
@@ -103,7 +103,7 @@ class Glm5NextImageForConditionalGeneration(Glm5NextForConditionalGeneration):
             Glm5NextVisionEncoderError: a field of another modality, a hash count that differs
                 from the image count, a cache whose block is not one attention block's merged
                 rows, more images than the largest bucket holds, or an image the layout
-                refuses (:func:`~.vision_encoder.pack_images_into_blocks`). No cache block is
+                refuses (:func:`~.vision_encoder.pack_rank_blocks`). No cache block is
                 allocated before every check passes.
         """
         present = sorted(
@@ -137,7 +137,8 @@ class Glm5NextImageForConditionalGeneration(Glm5NextForConditionalGeneration):
                 f"bucket has {max(vnc.num_total_vision_attention_blocks)}"
             )
         num_blocks = min(fitting)
-        packed = pack_images_into_blocks(
+        # This rank's run of the bucket's blocks: the tower takes no other rank's pixels.
+        packed = pack_rank_blocks(
             pixel_values,
             image_grid_thw,
             block_size=block_size,
@@ -173,8 +174,10 @@ class Glm5NextImageForConditionalGeneration(Glm5NextForConditionalGeneration):
     ) -> dict[str, torch.Tensor]:
         """The tower's inputs for one bucket, for the worker's warm-up and graph capture.
 
-        Every block is a padding block, so the shapes are the bucket's and the values are the
-        ones padding carries. The worker adds ``encoder_cache_buffer`` and ``write_block_ids``.
+        Every block is a padding block, so the shapes are those of this rank's run of the
+        bucket's blocks (:func:`~.vision_encoder.pack_rank_blocks`) and the values are the ones
+        padding carries. The worker adds ``encoder_cache_buffer`` and ``write_block_ids``, which
+        name every block of the bucket.
 
         Args:
             bucket: one entry of ``num_vision_tokens_buckets``.
@@ -186,7 +189,7 @@ class Glm5NextImageForConditionalGeneration(Glm5NextForConditionalGeneration):
             :meth:`~.vision_encoder.Glm5NextVisionEncoder.forward`.
         """
         index = vision_neuron_config.num_vision_tokens_buckets.index(bucket)
-        packed = pack_images_into_blocks(
+        packed = pack_rank_blocks(
             torch.empty(0, self.vision_config.patch_dim),
             torch.empty(0, _GRID_THW_COLUMNS, dtype=torch.int64),
             block_size=vision_neuron_config.vision_attention_block_size,
