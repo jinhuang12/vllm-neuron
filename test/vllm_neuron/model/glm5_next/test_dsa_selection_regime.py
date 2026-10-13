@@ -251,7 +251,7 @@ def test_forward_bounds_the_selecting_regime_to_each_rows_own_position(
     _check_two_instruments_agree("selecting", spy, readings)
     identity = causal_bound_mod.causal_bound_kernel_identity()
     sentinel_identity = causal_bound_mod.causal_sentinel_kernel_identity()
-    assert identity is not None and identity[1].endswith("_causal_bound_nki"), identity
+    assert identity is not None and identity[1].endswith("_causal_bound_folded_nki"), identity
     assert sentinel_identity is not None and sentinel_identity[1].endswith(
         "_causal_sentinel_nki"
     ), sentinel_identity
