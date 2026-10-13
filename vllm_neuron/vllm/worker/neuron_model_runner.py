@@ -14,6 +14,7 @@ import os
 import threading
 import time
 from copy import copy, deepcopy
+from collections.abc import Iterable
 from typing import Any, NamedTuple, cast
 
 import numpy as np
@@ -2579,6 +2580,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         reqs_to_add: list[CachedRequestState] = []
         # Add new requests to the cached states.
         for new_req_data in scheduler_output.scheduled_new_reqs:
+            self._glm5next_forget_stored_blocks(
+                new_req_data.block_ids, new_req_data.num_computed_tokens
+            )
             req_id = new_req_data.req_id
             if req_id in self.requests:
                 # For streaming case only.
@@ -2653,6 +2657,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             num_computed_tokens = req_data.num_computed_tokens[i]
             new_block_ids = req_data.new_block_ids[i]
             resumed_from_preemption = req_id in req_data.resumed_req_ids
+            self._glm5next_forget_stored_blocks(
+                new_block_ids, num_computed_tokens if resumed_from_preemption else 0
+            )
             num_output_tokens = req_data.num_output_tokens[i]
             req_index = self.input_batch.req_id_to_index.get(req_id)
 
@@ -6029,6 +6036,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # Per slot, the KDA checkpoint row the next step resumes from: the accepted
         # draft count of the last verify step served from the slot; absent is 0.
         self._glm5next_checkpoint_rows = {}
+        # The KV blocks whose stores hold the state a prefill wrote for them
+        # (``_glm5next_record_stored_blocks``).
+        self._glm5next_stored_blocks = set()
         return live
 
     def _glm5next_batch_request_ids(self) -> list:
@@ -7851,6 +7861,26 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # request owns that slot; at start-up the rows are fresh zeros anyway.
             pass
         else:
+            # A prefix-cache hit: a request admitted at a cached length above zero on a
+            # slot that holds no sequence is restored from the prefix-cache stores
+            # first (``_glm5next_restore_prefix``), so the position check below finds
+            # it at its own cursor. With nothing to restore from, the check refuses it.
+            for index, (one_slot, one_start) in enumerate(
+                zip(state_slots, request_starts)
+            ):
+                if (
+                    int(one_start) > 0
+                    and int(one_slot) not in self._glm5next_side_cache_positions
+                ):
+                    self._glm5next_restore_prefix(
+                        banks,
+                        side_caches,
+                        geometries,
+                        request=index,
+                        request_id=request_ids[index],
+                        slot=int(one_slot),
+                        start_position=int(one_start),
+                    )
             # Each request is classified on its own position: one may be opening
             # while another continues. Under the async drafter a decode step's
             # position is the scheduler's, which lags the cursor by the previous
@@ -8098,6 +8128,207 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     f"position of their own, so serving a step that does not continue it "
                     f"would read another point of it silently"
                 )
+
+    def _glm5next_restore_prefix(
+        self,
+        banks,
+        side_caches,
+        geometries,
+        *,
+        request: int,
+        request_id,
+        slot: int,
+        start_position: int,
+    ) -> None:
+        """Restore a prefix-cache hit's stored state into its slot and set its cursor.
+
+        vLLM admits a request at a cached length ``P`` when it holds the request's first
+        ``P`` positions as whole cached blocks. The slot the request was handed holds no
+        sequence. The runner's stores have room for the state a cold prefill leaves
+        after ``P`` tokens, per block (``glm5next_state_banks``): each recurrent layer's
+        checkpoint in the page of its KDA group's block ``P // block_size - 1``, the
+        hit's last block, and each sparse layer's pool rows in ``dsa_pool_store`` under
+        the latent group's blocks ``0 .. P // block_size - 1``. No code in this tree
+        writes them. This copies the stored state into the slot: the
+        checkpoint into the slot's entering row (``restore_kda_slot``) and pool rows
+        ``0 .. P // index_kpool - 1`` into its ``pool_cache``. It drops the slot's
+        resume row and sets the cursor to ``P``. The ring is left as it is, empty: a
+        request's slot holds no cursor only after its hand-out
+        (``_glm5next_request_slots``) or an opening (``_glm5next_position_arm``), both
+        of which empty the ring, and a hit ends on a whole pool, so it leaves none open.
+        The slot then stands where the first segment of a cold prefill of ``P`` tokens
+        leaves it, and the step is served as that prefill's second segment. Only this
+        slot is written, by host copies after the pending step is drained. The recurrent
+        rows are written by an eager ``copy_`` into the bank's view, a write the slot
+        hand-out does not make on the recurrent banks (``_glm5next_request_slots``).
+
+        Nothing is restored when the runner has no store (prefix caching off) or ``P``
+        is not a whole number of blocks, which no hit is; the position check then
+        refuses the step by name. A hit is restored only from blocks a prefill has
+        recorded writing since vLLM last handed them out
+        (``_glm5next_record_stored_blocks``). A hit whose stored state is missing (a
+        layer without its store, a hit block that is the null block or that no prefill
+        recorded) is refused here by name, before anything is written.
+        """
+        from vllm_neuron.vllm.worker.glm5next_state_banks import (
+            kda_checkpoint_layout,
+            restore_kda_slot,
+        )
+
+        position = int(start_position)
+        if any(position % int(geometry["page_size"]) for geometry in geometries):
+            return
+        if not self.kda_checkpoint_pages and not self.dsa_pool_store:
+            return
+        hit = f"the prefix-cache hit of request {request_id!r} at position {position}"
+        dcp_size = int(getattr(self, "_dcp_size", 1))
+        if dcp_size > 1:
+            raise ValueError(
+                f"{hit} is not restored at decode_context_parallel_size={dcp_size}: a "
+                f"block-table entry then covers block_size x {dcp_size} positions; "
+                f"prefix caching is refused under DCP"
+            )
+        spec_of = {
+            name: group.kv_cache_spec
+            for group in self.kv_cache_config.kv_cache_groups
+            for name in group.layer_names
+        }
+        index_kpool = int(self.model.text_config.index_kpool)
+        stored = self._glm5next_stored_blocks
+        # Every layer's source is found and checked before any slot row is written, so
+        # a refused restore leaves the slot as the hand-out left it.
+        kda_restores, pool_restores = [], []
+        for bank, side, geometry in zip(banks, side_caches, geometries, strict=True):
+            name = bank["name"]
+            blocks = position // int(geometry["page_size"])
+            row = [int(block) for block in geometry["request_block_ids"][int(request)]]
+            if bank["family"] == "linear_attn":
+                pages = self.kda_checkpoint_pages.get(name)
+                if pages is None:
+                    raise ValueError(
+                        f"recurrent layer {name} has no checkpoint pages, so {hit} has "
+                        f"no stored state for it"
+                    )
+                if row[blocks - 1] == NULL_BLOCK_ID:
+                    raise ValueError(
+                        f"recurrent layer {name}'s block {blocks - 1} in {hit} is the "
+                        f"null block, which holds no checkpoint"
+                    )
+                if row[blocks - 1] not in stored:
+                    raise ValueError(
+                        f"recurrent layer {name}'s block {row[blocks - 1]} in {hit} "
+                        f"holds no stored checkpoint: no prefill has recorded writing "
+                        f"it since vLLM handed it out"
+                    )
+                kda_restores.append(
+                    (
+                        (bank["conv_state"], bank["recurrent_state"]),
+                        pages,
+                        row[blocks - 1],
+                        kda_checkpoint_layout(spec_of[name]),
+                    )
+                )
+            elif side:
+                store = self.dsa_pool_store.get(name)
+                if store is None:
+                    raise ValueError(
+                        f"sparse layer {name} has no pool store, so {hit} has no "
+                        f"stored pool rows for it"
+                    )
+                if NULL_BLOCK_ID in row[:blocks]:
+                    raise ValueError(
+                        f"sparse layer {name}'s blocks {row[:blocks]} in {hit} include "
+                        f"the null block, which holds no pool rows"
+                    )
+                unrecorded = [block for block in row[:blocks] if block not in stored]
+                if unrecorded:
+                    raise ValueError(
+                        f"sparse layer {name}'s blocks {unrecorded} in {hit} hold no "
+                        f"stored pool rows: no prefill has recorded writing them since "
+                        f"vLLM handed them out"
+                    )
+                pool_cache = side["pool_cache"]
+                if (
+                    blocks * int(store.shape[1]) * index_kpool != position
+                    or store.shape[-1] != pool_cache.shape[-1]
+                    or store.dtype != pool_cache.dtype
+                ):
+                    raise ValueError(
+                        f"sparse layer {name}'s pool store {tuple(store.shape)} "
+                        f"{store.dtype} does not hold the {position // index_kpool} "
+                        f"pool rows of {hit} in the form of its pool_cache "
+                        f"{tuple(pool_cache.shape)} {pool_cache.dtype}"
+                    )
+                pool_restores.append((side, store, row[:blocks]))
+        # Drain the pending step first, through ``get_output``'s lock, as the slot
+        # hand-out does (``_glm5next_request_slots``): a step still in flight is drained
+        # by the output thread, and a second device wait on it here would hang.
+        pending = getattr(self, "async_execution_buffer", None)
+        pending = pending.get("async_output") if pending else None
+        if pending is not None:
+            pending.get_output()
+        for bank_rows, pages, block, layout in kda_restores:
+            restore_kda_slot(bank_rows, slot, pages, block, layout)
+        for side, store, blocks in pool_restores:
+            rows = torch.cat([store[block].to("cpu", copy=True) for block in blocks])
+            target = side["pool_cache"][slot, : int(rows.shape[0])]
+            if not target.is_meta:
+                # The ordering read (``empty_slot``): after any step writing the bank.
+                target.reshape(-1)[:1].to("cpu", copy=True)
+            target.copy_(rows)
+        self._glm5next_checkpoint_rows.pop(slot, None)
+        self._glm5next_side_cache_positions[slot] = position
+        if self._glm5next_shadow_rank() == 0:
+            logger.info(
+                "glm5next request %r restored request slot %d at its cached length %d",
+                request_id, slot, position,
+            )
+
+    def _glm5next_record_stored_blocks(self, block_ids: Iterable[int]) -> None:
+        """Record KV blocks whose stores now hold their prefix's state.
+
+        No code in this tree writes the stores, so nothing calls this. Its caller is a
+        step that writes them: it names every block whose stores the step writes (the
+        KDA block a leg ends in, whose page takes each recurrent layer's checkpoint, and
+        each latent block the leg completes, whose store page takes each sparse layer's
+        pool rows), and it may name them when the step is enqueued: a restore drains
+        the pending step before it reads the stores, and its host reads wait for any
+        execution still writing them. A prefix-cache hit is restored only from recorded
+        blocks and is refused by name on any other (``_glm5next_restore_prefix``), so
+        until a prefill records its blocks here every hit is refused. A block loses its
+        record when vLLM hands it out again (``_glm5next_forget_stored_blocks``). Block
+        ids come from vLLM's one block pool and a block belongs to one KV cache group at
+        a time, so one set serves every group. The null block holds no state: naming it
+        is refused, and then nothing is recorded.
+        """
+        ids = [int(block) for block in block_ids]
+        if NULL_BLOCK_ID in ids:
+            raise ValueError(
+                f"blocks {ids} name the null block {NULL_BLOCK_ID}, which holds no "
+                f"stored state, so a write to it is no block's state"
+            )
+        self._glm5next_stored_blocks.update(ids)
+
+    def _glm5next_forget_stored_blocks(
+        self, block_ids: tuple[list[int], ...] | None, computed_tokens: int
+    ) -> None:
+        """Drop the blocks vLLM hands one request in this step from the record.
+
+        ``block_ids`` are the blocks the scheduler hands the request, per KV cache
+        group, and ``computed_tokens`` its prefix-cache hit: the first
+        ``computed_tokens // block_size`` blocks of each group hold the hit and keep
+        their record. Every later block comes fresh from the block pool, and its new
+        owner rewrites its pages; a running request's new blocks are all fresh, so it
+        passes 0. With nothing recorded (prefix caching off, or no prefill recorded
+        yet) there is nothing to drop.
+        """
+        stored = getattr(self, "_glm5next_stored_blocks", None)
+        if not stored or block_ids is None:
+            return
+        groups = self.kv_cache_config.kv_cache_groups
+        for group, ids in zip(groups, block_ids, strict=True):
+            hit = int(computed_tokens) // int(group.kv_cache_spec.block_size)
+            stored.difference_update(ids[hit:])
 
     def _build_decode_synthetic_inputs(
         self,
