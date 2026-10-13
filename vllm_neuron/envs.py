@@ -128,6 +128,10 @@ if TYPE_CHECKING:
     # Divide the GLM-5.3-Flash DSA prefill selection's query rows over the
     # tensor-parallel ranks. On by default; 0 restores the replicated selection.
     VLLM_NEURON_DSA_INDEXER_SHARD: bool = True
+    # Under that shard, project the indexer's query side (query, rotation, head
+    # weights) on each rank's own rows only. On by default; 0 projects every row
+    # and cuts the projections.
+    VLLM_NEURON_DSA_QUERY_ROW_CUT: bool = True
     # Let a GLM-5.3-Flash DSA prefill selection that only the masked-window attention
     # reads come back as a set: no top-k sort, no sentinel order. On by default; 0
     # restores the ordered selection.
@@ -588,6 +592,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the replicated selection on every rank.
     "VLLM_NEURON_DSA_INDEXER_SHARD": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_DSA_INDEXER_SHARD", "1"))
+    ),
+    # Under the shard above, cut each rank's rows of the indexer's two query-side
+    # inputs (``q_latent`` and ``hidden_states``) before its query projection, query
+    # rotation and head-weight projection, so they run on the rank's rows only; the
+    # key and the kpool gate still project every row, for the pool write
+    # (``functional/dsa/indexer_shard.py``). Read at trace time; a change needs a new
+    # compile. On by default; 0 projects the query side on every row and cuts its
+    # outputs.
+    "VLLM_NEURON_DSA_QUERY_ROW_CUT": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_DSA_QUERY_ROW_CUT")) is not False
     ),
     # Skip the top-k's sort and the sentinel order on a DSA prefill selection whose
     # only reader is the masked-window attention, which counts each row's pool ids as
