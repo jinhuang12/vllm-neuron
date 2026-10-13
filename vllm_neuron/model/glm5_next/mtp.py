@@ -48,8 +48,9 @@ map of ``layers.45.*`` onto :data:`MTP_PARAMETER_NAMES` (the loader); layer 45's
 latent bank, pooled store and tail ring, which arrive in ``**block_kwargs`` from the
 same per-layer lookup the trunk uses for layer 43, at index 45 (the runner); the
 decision to call either method (the root's forward). The knob that turns all of it
-on, ``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT``, is defined once in ``envs.py`` and read
-once, by :func:`shadow_draft_k`.
+on, ``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT``, is defined once in ``envs.py``. Every
+reader but the platform calls :func:`shadow_draft_k`; the platform reads it at
+startup to refuse it under decode context parallelism.
 
 Importing this module loads no model tree: the block is built inside the
 constructor, from a lazy import, so the root can import the head and the head can

@@ -1278,15 +1278,38 @@ class NeuronPlatform(Platform):
 
     @classmethod
     def _refuse_speculative_decoding_under_dcp(cls, vllm_config) -> None:
-        """Refuse speculative decoding at decode_context_parallel_size > 1.
+        """Refuse speculative decoding and the shadow draft under decode context parallelism.
 
         The DCP partial-attention kernel entry refuses more than one query row
         per request, and a verify step carries ``1 + num_speculative_tokens``
         rows. The multi-row DCP attention entry (item 5a, T > 1 follow-up)
         lifts this refusal. Callers check ``dcp_size > 1`` first.
+
+        With no speculative config, ``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT`` >= 1
+        still runs the GLM-5.3-Flash MTP head's draft iterations, so for that
+        architecture it is refused here by name. A draft iteration past the
+        first computes the MTP layer's KV slot from the sequence's page index
+        over the rank's block table, and under DCP that table lists only the
+        rank's own pages. No other architecture reads the knob.
         """
         speculative_config = vllm_config.speculative_config
         if speculative_config is None:
+            architectures = (
+                getattr(vllm_config.model_config.hf_config, "architectures", None) or ()
+            )
+            if "Glm5NextForConditionalGeneration" in architectures:
+                shadow_draft = int(envs.VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT)
+                if shadow_draft >= 1:
+                    raise ValueError(
+                        f"VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT={shadow_draft} is not "
+                        "supported with decode_context_parallel_size="
+                        f"{vllm_config.parallel_config.decode_context_parallel_size}: "
+                        "from its second draft iteration on, the shadow draft "
+                        "computes the MTP layer's KV slots from the sequence's page "
+                        "index, and a decode context parallel rank holds only its "
+                        "own pages. Unset VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT or set "
+                        "decode_context_parallel_size=1."
+                    )
             return
         num_speculative_tokens = speculative_config.num_speculative_tokens
         if num_speculative_tokens > 0:

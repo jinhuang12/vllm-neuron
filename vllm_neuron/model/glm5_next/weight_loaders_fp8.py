@@ -340,8 +340,8 @@ def mtp_layer_indices_for(
     """The draft layers to map: ``()`` with the knob off, else those past the stack.
 
     ``draft_k`` is the knob's value, read through the head's own
-    :func:`~vllm_neuron.model.glm5_next.mtp.shadow_draft_k` -- the knob's one
-    reader, contract C1 -- when not given. The indices start at
+    :func:`~vllm_neuron.model.glm5_next.mtp.shadow_draft_k` -- the one reader
+    of k, contract C1 -- when not given. The indices start at
     ``num_hidden_layers``, the first index the stack does not use (the config pins
     ``len(layer_types)`` to it), and run for the checkpoint's own
     ``num_nextn_predict_layers``.

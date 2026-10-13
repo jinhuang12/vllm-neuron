@@ -13176,7 +13176,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         speculative method "mtp" the count is the proposer's
         (``num_speculative_tokens``), which the proposer checked against the head's at
         load; otherwise it is the ``draft_k`` the root read once at construction from
-        the knob's one reader (``mtp.shadow_draft_k``, contract C1) -- never re-read
+        the one reader of k (``mtp.shadow_draft_k``, contract C1) -- never re-read
         here, where the worker's config context is gone and the reader would fall
         back to the knob.
         """
