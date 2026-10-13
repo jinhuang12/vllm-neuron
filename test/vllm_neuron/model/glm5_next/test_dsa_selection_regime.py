@@ -40,7 +40,7 @@ SELECTING_SEQ_LEN = POOL_SIZE * max(MAX8_ELEMENTS, TOPK_POOLS + 1)
 #: `causal_fill` is deliberately not here: it is the bypass seam and owes a zero on
 #: this case, which is a different claim and is read as such below.
 SELECTING_ONE_FAMILIES: tuple[str, ...] = (
-    "paged_gather", "score_gemm", "topk_select", "index_expand",
+    "score_gemm", "topk_select", "index_expand",
 )
 
 

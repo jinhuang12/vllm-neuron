@@ -99,13 +99,14 @@ ENTRY_POINTS: dict[str, str] = {
 FAMILIES: tuple[str, ...] = tuple(sorted(set(ENTRY_POINTS.values())))
 
 #: Calls per layer, per phase, per entry point in the layer case: ``(prefill, decode)``.
-#: Each figure's reason is in a separate measurement; the three zeros are the two
-#: phase-exclusive entries plus the pack pair upstream does not reach at batch one.
+#: Each figure's reason is in a separate measurement; the zeros are the two
+#: phase-exclusive entries, the pack pair upstream does not reach at batch one, and the
+#: paged gather, which in-place candidate keys replace.
 DECLARED_PER_LAYER: dict[str, tuple[int, int]] = {
     "dsa_decode_tail_update": (0, 1),   # decode-only: the tail ring advances one token per step
     "dsa_kpool_hadamard": (1, 0),       # prefill-only: prefill sees whole pools
     "dsa_hadamard128": (1, 1),          # the indexer query is rotated every step; never pooled
-    "dsa_paged_gather": (1, 1),         # the selected rows are read out of paged storage
+    "dsa_paged_gather": (0, 0),         # the candidate keys are read in place
     "dsa_ragged_pack": (0, 0),          # Declared zero: batch one is uniform, so no padding
     "dsa_ragged_unpack": (0, 0),        # and nothing to unpack
     "dsa_score_gemm": (1, 1),           # the indexer scores candidates
@@ -129,7 +130,7 @@ DECLARED_PER_LAYER_RAGGED_ARM: dict[str, tuple[int, int]] = {
                                         # uniform case's business and advances there
     "dsa_kpool_hadamard": (0, 0),       # no prefill in the arm, so no whole pools to pool
     "dsa_hadamard128": (0, 1),          # the query is still rotated
-    "dsa_paged_gather": (0, 1),
+    "dsa_paged_gather": (0, 0),
     "dsa_ragged_pack": (0, 1),          # The query alone: the fp32 weights cannot pack
     "dsa_ragged_unpack": (0, 0),        # Declared zero; the round-trip test covers it
     "dsa_score_gemm": (0, 1),
@@ -150,7 +151,7 @@ DECLARED_FAMILY_TOTALS: dict[str, int] = {
     "decode_tail_update": 3,
     "index_expand": 6,
     "kpool_hadamard": 9,
-    "paged_gather": 6,
+    "paged_gather": 0,
     "ragged_pack": 0,
     "score_gemm": 6,
     "topk_select": 6,
@@ -163,7 +164,7 @@ DECLARED_FAMILY_TOTALS_RAGGED_ARM: dict[str, int] = {
     "decode_tail_update": 0,
     "index_expand": 3,
     "kpool_hadamard": 3,
-    "paged_gather": 3,
+    "paged_gather": 0,
     "ragged_pack": 3,
     "score_gemm": 3,
     "topk_select": 3,
@@ -533,13 +534,14 @@ def test_the_declared_table_is_internally_consistent() -> None:
     arm = declared_family_totals(LAYERS, DECLARED_PER_LAYER_RAGGED_ARM)
     assert arm == DECLARED_FAMILY_TOTALS_RAGGED_ARM, (arm, DECLARED_FAMILY_TOTALS_RAGGED_ARM)
 
-    # 7/7 is read over the union, which is what the two-case shape of part 1 is for.
+    # 6/7 is read over the union, which is what the two-case shape of part 1 is for; the
+    # paged gather is a declared zero on both cases, because the candidate keys are read in place.
     union_zero = sorted(f for f in FAMILIES if totals[f] == 0 and arm[f] == 0)
-    assert union_zero == [], f"families no case reaches: {union_zero}"
+    assert union_zero == ["paged_gather"], f"families no case reaches: {union_zero}"
 
-    # The layer case's one zero is declared, and naming it here is what stops a silent miss
+    # The layer case's zeros are declared, and naming them here is what stops a silent miss
     # from passing as a declaration later.
-    assert sorted(f for f, v in totals.items() if v == 0) == ["ragged_pack"]
+    assert sorted(f for f, v in totals.items() if v == 0) == ["paged_gather", "ragged_pack"]
     assert arm["ragged_pack"] > 0, "the arm exists to reach the family the layer case declares zero"
 
     # The one-third moving control holds separately on each case, over the families that case
@@ -560,7 +562,11 @@ def test_the_declared_table_is_internally_consistent() -> None:
             "payload -- the fp32 gate weights cannot enter a bf16-only pack, and "
             "mla_sparse_attention refuses a rank-3 index tensor by name. The direction's own "
             "coverage is the declared bit-identical round-trip test"
-        )
+        ),
+        "dsa_paged_gather": (
+            "neither leg of Glm5NextDSAIndexer.forward nor forward_ragged dispatches it: the "
+            "candidate keys are read in place, and the zero guards that"
+        ),
     }
     unreached = sorted(
         e
@@ -572,7 +578,7 @@ def test_the_declared_table_is_internally_consistent() -> None:
         f"{sorted(RULED_DECLARED_ZERO)}"
     )
     reached = len(ENTRY_POINTS) - len(unreached)
-    assert reached == 8, reached
+    assert reached == 7, reached
 
     # The arm's own declared zero is a family, and the union is what covers it: the arm never
     # advances the ring, and the layer case's decode step does it three times.
@@ -1769,8 +1775,9 @@ def test_run_1_a_dsa_stack_matches_the_torch_reference_and_moves_every_seam(
         f"call it was not compared against"
     )
 
-    # Part 1 of the route predicate, over this case: six of the seven families move here and the
-    # pack pair is the declared zero entry `aa` ruled. The seventh is run 2's.
+    # Part 1 of the route predicate, over this case: five of the seven families move here, the
+    # pack pair is the declared zero entry `aa` ruled and the paged gather is a declared zero
+    # (in-place keys). The pack is run 2's.
     per_family = spy.per_family()
     expected = declared_family_totals(int(layers))
     assert per_family == expected, (
@@ -1943,7 +1950,7 @@ def test_run_2_the_ragged_arm_packs_and_each_request_matches_itself_run_alone(
     )
     assert readings["ragged_pack"][0] > 0, (
         "the ragged arm did not move the pack family, which is the ONLY reason this second run "
-        "exists -- part 1 reads 7/7 over the union of the two runs and this is the seventh"
+        "exists -- part 1 reads 6/7 over the union of the two runs and this is the sixth"
     )
 
     # The arm's projection reading, with its terms. One term, because the arm calls the indexer

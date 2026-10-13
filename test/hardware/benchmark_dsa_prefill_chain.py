@@ -9,7 +9,7 @@ layer count) layers of the prefill indexer chain at ``--cands`` candidate pools,
 ``Glm5NextDSAIndexer`` runs it on one rank after the row cut, with every operand drawn
 per layer:
 
-    keys    = indexer._gather_candidates(pool_cache, cands, page_size)   [cands, D]
+    keys    = candidate_keys(indexer, pool_cache, cands)                 [cands, D]
     ids     = indexer._select_pool_ids(query, keys, weights, lengths,
                                        shardable=False)                  [R, k]
               (score GEMM with the head sum, causal bound, top-k, sentinel, order)
@@ -34,9 +34,9 @@ after ``--warmup`` calls; device time per execution comes from the runtime syste
 (the LNC2 physical-core intervals of an execution merged). With ``--profile-dir`` one
 more execution per seed runs under the device profiler for the per-kernel split.
 
-``split`` (CPU only; any python with ``duckdb``). Reads a profile ingested with
-``neuron-explorer view -d <profile dir> --ingest-only --data-path <D> --display-name
-<name>`` and reports, per execution, each kernel's active time (the union of its
+``split`` (CPU only; any python with ``duckdb``). Reads a profile written by
+``neuron-explorer view -d <profile dir> --output-format parquet --output-file <P>`` and
+reports, per execution, each kernel's active time (the union of its
 instruction intervals) on each physical core, labelled ``file.py:function`` by the
 enclosing top-level function of the instruction's source line, and the Vector-engine
 busy time of the score kernel (the head sum). Each source file's instructions are also
@@ -57,8 +57,9 @@ import sys
 from pathlib import Path
 
 DEVICE = "neuron:0"
-#: Rows of the pooled-key store per page. The prefill gather's page table is arithmetic
-#: (``Glm5NextDSAIndexer._gather_candidates``), so any page size names the same rows.
+#: Rows of the pooled-key store per page, for a tree whose prefill keys still go through
+#: ``Glm5NextDSAIndexer._gather_candidates``: its page table is arithmetic, so any page size
+#: names the same rows.
 PAGE_SIZE = 128
 #: Ranks a chunk's selection rows divide over at the served TP=64
 #: (``indexer_shard.shard_degree``); ``--rows`` defaults to ``--tokens`` over this.
@@ -117,13 +118,24 @@ def chunk_pool_ids(k: int, tokens: int, torch):
     return torch.arange(k, dtype=torch.int32).repeat(tokens, 1).contiguous()
 
 
+def candidate_keys(indexer, pool_cache, cands: int):
+    """The prefill indexer's candidate keys, as the tree under test reads them.
+
+    A tree with ``_candidate_keys`` reads the store's prefix in place; an older one (the
+    base of this series) copies it through ``_gather_candidates`` and ``dsa_paged_gather``.
+    """
+    if hasattr(indexer, "_candidate_keys"):
+        return indexer._candidate_keys(pool_cache, cands)
+    return indexer._gather_candidates(pool_cache, cands, PAGE_SIZE)
+
+
 def build_graph(indexer, kind: str, layers: int, cands: int, torch):
     """The timed graph: ``chain`` (gather, selection, expansion) or ``scores`` (gather, scores)."""
     def chain(*flat):
         ids_out, expanded = [], []
         for layer in range(layers):
             query, weights, pool_cache, lengths, chunk_ids, chunk_lens = flat[6 * layer:6 * layer + 6]
-            keys = indexer._gather_candidates(pool_cache, cands, PAGE_SIZE)
+            keys = candidate_keys(indexer, pool_cache, cands)
             ids_out.append(indexer._select_pool_ids(query, keys, weights, lengths,
                                                     shardable=False))
             expansion = indexer.expand_indices(chunk_ids, chunk_lens)
@@ -134,7 +146,7 @@ def build_graph(indexer, kind: str, layers: int, cands: int, torch):
         out = []
         for layer in range(layers):
             query, weights, pool_cache = flat[6 * layer:6 * layer + 3]
-            keys = indexer._gather_candidates(pool_cache, cands, PAGE_SIZE)
+            keys = candidate_keys(indexer, pool_cache, cands)
             score = indexer.score_pools(query, keys, weights)
             out.append(score if layer == 0 else score[0:1, 0:TAIL])
         return tuple(out)
@@ -231,9 +243,9 @@ def cmd_run(args) -> None:
     rows = args.rows or -(-args.tokens // SERVED_RANKS)
     head = subprocess.run(["git", "-C", str(tree), "rev-parse", "HEAD"], check=True,
                           capture_output=True, text=True).stdout.strip()
-    dirty = subprocess.run(["git", "-C", str(tree), "status", "--porcelain", "--",
-                            "vllm_neuron"], check=True, capture_output=True,
-                           text=True).stdout.strip()
+    dirty = subprocess.run(["git", "-C", str(tree), "status", "--porcelain",
+                            "--untracked-files=no", "--", "vllm_neuron"], check=True,
+                           capture_output=True, text=True).stdout.strip()
     records = args.records.resolve()
     records.mkdir(parents=True, exist_ok=True)
     out = args.out.resolve()
@@ -358,12 +370,13 @@ def _labeler():
 
 def cmd_split(args) -> None:
     import duckdb
-    found = sorted(glob.glob(f"{args.data}/profiles/global/{args.name}_*_session_*@latest"))
+    found = sorted(glob.glob(f"{args.parquet}/*_session_*"))
     if not found:
-        raise ValueError(f"no ingested profile {args.name} under {args.data}")
+        raise ValueError(f"no parquet session directory under {args.parquet}")
     path = found[0]
-    con = duckdb.connect()
-    con.sql(f"SET threads TO {args.threads}")
+    # The thread count is fixed at connect: the default pool starts one thread per host CPU,
+    # which stalls under a taskset of a few cores.
+    con = duckdb.connect(config={"threads": args.threads})
     q = lambda t: f"'{path}/{t}.parquet'"
     execs = con.sql(f"SELECT execution_index, execution_start_ts, execution_end_ts "
                     f"FROM {q('ExecutionInfo')} ORDER BY 2").fetchall()
@@ -423,8 +436,8 @@ def main() -> None:
     run.add_argument("--profile-dir", type=Path)
     run.add_argument("--use-compile-cache", action="store_true")
     split = sub.add_parser("split")
-    split.add_argument("--data", required=True, help="explorer --data-path")
-    split.add_argument("--name", required=True, help="explorer --display-name")
+    split.add_argument("--parquet", required=True,
+                       help="explorer --output-format parquet --output-file directory")
     split.add_argument("--threads", type=int, default=8)
     args = parser.parse_args()
     if args.cmd == "run":
