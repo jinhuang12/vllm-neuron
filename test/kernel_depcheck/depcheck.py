@@ -780,6 +780,7 @@ class Model:
         first. The work is the sort plus one step per bounding-box pair, not one per pair of
         access nodes."""
         acc = self.acc
+        in_range = None
         if lo is not None:
             in_range = [lo <= ((a["i"].get("debug") or {}).get("lineno") or 0) <= hi for a in acc]
         by_space = collections.defaultdict(list)
