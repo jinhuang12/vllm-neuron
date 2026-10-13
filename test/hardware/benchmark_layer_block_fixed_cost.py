@@ -37,7 +37,10 @@ holds a fold's before and after under the same glue switch value; a second such 
   (``combine_slots.combine_slots_torch``, the construction the kernel replaced);
 * ``fusedrouter``: the prefill router on 8aa22fa's fused kernel
   (``router.noaux_tc_rmsnorm_router_topk``, its RMSNorm in the kernel) instead of
-  ``router_prefill`` (its RMSNorm scale in XLA).
+  ``router_prefill`` (its RMSNorm scale in XLA);
+* ``orderedselect``: the DSA prefill selection in order (the top-k's sort and the sentinel
+  order) where the masked-window attention would read it as a set
+  (``dsa_set_selection.prefill_selects_a_set``).
 
 Each case also records whether each variant's first output is bit-equal to each such
 variant's (``bit_equal_to_route_variants``), and how far apart they are
@@ -50,6 +53,9 @@ The compile cache is used (``NEURON_LIBTORCH_CACHE_ROOT``); its keys fold the di
 kernel sources each graph reaches (``vllm_neuron.compile_cache_key``), so a kernel edit
 recompiles the graphs that call it. A graph served from the cache leaves no compiler
 intermediates, so a run whose profiles are to be split per op needs a fresh root.
+
+``--seed`` seeds a DSA case's random banks (the latent, pooled-key and ring rows), so a run
+can repeat a case on other operands; the weights are the checkpoint's in every run.
 """
 
 from __future__ import annotations
@@ -77,10 +83,13 @@ from test.vllm_neuron.functional.dsa import dsa_batch_case
 from test.vllm_neuron.functional.glue import glue_case
 from vllm_neuron import envs
 from vllm_neuron.functional.moe import combine_slots, router_prefill
+from vllm_neuron.model.glm5_next import dsa_set_selection
 from vllm_neuron.model.glm5_next import model_fp8 as live
 
 DEVICE = block.DEVICE
 CASES = ("kda:prefill:1024", "dsa:prefill:1024:std", "dsa:prefill:1024:8k@7168")
+#: ``dsa_prefill_carriers``' seed when ``--seed`` is not given.
+DEFAULT_SEED = 37
 
 
 @dataclass(frozen=True)
@@ -100,8 +109,11 @@ SERVED_LINES = {
 }
 
 
-def parse_case(text: str) -> dict:
-    """``family:prefill:rows[:line][@start]`` -> the case dict ``benchmark_glue_block`` takes."""
+def parse_case(text: str, seed: int = DEFAULT_SEED) -> dict:
+    """``family:prefill:rows[:line][@start]`` -> the case dict ``benchmark_glue_block`` takes.
+
+    ``seed`` is the DSA carriers' (``dsa_prefill_carriers``); a KDA case ignores it.
+    """
     head, _, start = text.partition("@")
     family, phase, rows, *line = head.split(":")
     if family not in block.FAMILY_KERNELS or phase != "prefill" or int(rows) < 1:
@@ -112,7 +124,7 @@ def parse_case(text: str) -> dict:
         raise ValueError(f"case {text!r}: a kda case is one opening request; it takes no "
                          f"line or start (its carriers do not depend on the context)")
     return {"family": family, "phase": phase, "rows": int(rows), "tag": text,
-            "line": line[0] if line else "std", "start": int(start or 0)}
+            "line": line[0] if line else "std", "start": int(start or 0), "seed": int(seed)}
 
 
 def dsa_window_pages(line: ServedLine, end: int, rows: int, page: int) -> int:
@@ -126,7 +138,7 @@ def dsa_window_pages(line: ServedLine, end: int, rows: int, page: int) -> int:
     return min(-(-line.max_model_len // page), -(-(segment + rows) // page))
 
 
-def dsa_prefill_carriers(layer_case, case: dict, *, seed: int = 37,
+def dsa_prefill_carriers(layer_case, case: dict, *, seed: int = DEFAULT_SEED,
                          device: str = DEVICE) -> dict:
     """The runner's prefill carriers for one request's ``case['rows']``-row DSA chunk.
 
@@ -184,7 +196,7 @@ def dsa_prefill_carriers(layer_case, case: dict, *, seed: int = 37,
 def carriers_for(case: dict, layer_case, device: str = DEVICE) -> dict:
     """Prefill carriers of either family (``benchmark_glue_block.carriers_for``'s role)."""
     if case["family"] == "dsa":
-        return dsa_prefill_carriers(layer_case, case, device=device)
+        return dsa_prefill_carriers(layer_case, case, seed=case["seed"], device=device)
     return glue_case.kda_prefill_carriers(layer_case, case["rows"], device=device)
 
 
@@ -218,6 +230,7 @@ class ServedRankGroup(block._OneRankGroup):
 ROUTES = {
     "torchslots": (combine_slots, "can_run_combine_slots"),
     "fusedrouter": (router_prefill, "prefill_router_enabled"),
+    "orderedselect": (dsa_set_selection, "prefill_selects_a_set"),
 }
 
 #: The route prefix of the variant being traced or called, or None. The trace reads it
@@ -233,8 +246,8 @@ def route_of(name: str) -> str | None:
 def _routed_predicate(prefix: str, predicate):
     """``predicate``, False while a variant of route ``prefix`` runs."""
 
-    def admits(*args):
-        return _ROUTE[0] != prefix and predicate(*args)
+    def admits(*args, **kwargs):
+        return _ROUTE[0] != prefix and predicate(*args, **kwargs)
 
     return admits
 
@@ -300,6 +313,8 @@ def main() -> None:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--cases", nargs="+", default=list(CASES))
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED,
+                        help="the seed of a DSA case's random banks")
     parser.add_argument("--variants", nargs="*", default=["aa=0", "default"],
                         help="benchmark_glue_block.py's variants; off is always added; a "
                              "name starting with a ROUTES prefix runs that site's other "
@@ -342,7 +357,7 @@ def main() -> None:
     if not Path(live.__file__).resolve().is_relative_to(ROOT):
         raise RuntimeError(f"model_fp8 imported from {live.__file__}, not {ROOT}")
     plans = [(case, block.variant_specs(case, args.variants))
-             for case in (parse_case(c) for c in args.cases)]
+             for case in (parse_case(c, args.seed) for c in args.cases)]
     work = args.work_dir or Path(tempfile.mkdtemp(prefix="layer-block-bench-cwd-"))
     work.mkdir(parents=True, exist_ok=True)
     os.chdir(work)
@@ -358,6 +373,7 @@ def main() -> None:
         "served_lines": {k: {"max_model_len": v.max_model_len,
                              "kv_segments": list(v.kv_segments)}
                          for k, v in SERVED_LINES.items()},
+        "seed": args.seed,
         "rounds": args.rounds, "warmup": args.warmup, "iterations": args.iterations,
         "profile_iterations": args.profile_iterations,
         "cases": [],
