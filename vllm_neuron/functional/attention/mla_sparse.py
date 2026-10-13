@@ -1659,8 +1659,13 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
 #   PE transposes, which are bit-exact from NeuronCore-v3 on, rather than gathered a
 #   second time: the second gather is one indirect DMA per 128-row chunk, and the
 #   software descriptor generator that issues every indirect DMA is the body's busiest
-#   engine. A gather waits on its offsets, so each group's offsets are computed while
-#   the group before it is in flight.
+#   engine.
+# * The software DGE starts a gather only once every DMA before it on its queue has
+#   completed, so the gathers run one at a time and set the body's pace
+#   (``reports/mla_sparse.md``). Nothing else should hold one back. A gather waits on
+#   its offsets, so each group's offsets are computed while the group before it is in
+#   flight, the next block's first group's included. It waits on its row buffer, so
+#   the buffers rotate over the program's queries, not each block's, in whole groups.
 # * The softmax runs for a group of :data:`SOFTMAX_ROWS` queries at once, one query
 #   per partition. A query's MM1 stationary is a ``[128, rows]`` tile whose only
 #   non-zero column is the query's own, so its scores accumulate into its own PSUM row
@@ -1688,9 +1693,9 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
 
 #: Queries whose softmax shares one set of row instructions, one query per partition.
 #: Used when it divides the query block (:func:`_queries_per_block`), else a group is
-#: one query. A group's queries keep their gathered rows until the group's softmax is
-#: done, so the body holds ``SOFTMAX_ROWS + QUERY_BUFFERS`` gathered-row buffers of
-#: ``n_latent * K`` 2-byte elements per partition.
+#: one query. A group's queries keep their gathered rows until the group's MM2 is done,
+#: so the body holds ``SOFTMAX_ROWS + QUERY_BUFFERS`` gathered-row buffers, rounded up
+#: to whole groups, of ``n_latent * K`` 2-byte elements per partition.
 SOFTMAX_ROWS = 4
 
 
@@ -1763,8 +1768,8 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
     Preconditions (:func:`_lowp_serves`): one head, no RoPE limb, more than one query,
     the query and the cache in the same 2-byte float, and the row-tiled gate's own: the
     latent an exact multiple of 128 within one MM2 moving tile, K a multiple of 128.
-    ``QUERY_BUFFERS`` gathered-row buffers beyond one group's let the next group's
-    gathers start while a group finishes; scheduling only.
+    ``QUERY_BUFFERS`` gathered-row buffers beyond one group's, rounded up to whole
+    groups, let the next group's gathers start while a group finishes; scheduling only.
     """
     seq, heads, latent = q_lift_hbm.shape
     topk = topk_hbm.shape[1]
@@ -1793,8 +1798,13 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
         nisa.memset(dst=slot, value=0.0, engine=nisa.engine.vector)
         q_masked.append(slot)
 
-    # ---- the per-query gathered rows, rotated across consecutive queries ------------
-    ring = group + QUERY_BUFFERS
+    # ---- the per-query gathered rows, rotated across the program's queries ---------
+    # The n-th query of this program, counted across its blocks, uses buffer n % ring
+    # and so waits for the MM2 of query n - ring. With whole groups (at least two, as
+    # QUERY_BUFFERS >= 1), that query's group has its MM2 before the previous group's
+    # softmax in program order, and a block's first group waits on no more than any
+    # other group does.
+    ring = _aligned(group + QUERY_BUFFERS, group)
     scratch = []
     for _ in range(ring):
         scratch.append(_lowp_scratch(topk, n_latent, n_chunks, c_kv_hbm.dtype))
@@ -1834,23 +1844,30 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
 
     n_prgs = nl.num_programs(axes=0)
     prg_id = nl.program_id(0)
-    for qb in nl.affine_range(prg_id, seq // qpb, n_prgs):
+    n_blocks = seq // qpb
+    # The block loop unrolls at trace time, so a block can compute the next block's
+    # first offsets.
+    for qb in range(prg_id, n_blocks, n_prgs):
         q0 = qb * qpb
+        # The program's count of queries before this block.
+        n0 = (qb - prg_id) // n_prgs * qpb
         for li in range(n_latent):
             _transpose_rows(q_stage[li], q_lift_hbm, latent, block, LATENT_TILE,
                             q0 * heads * latent + li * LATENT_TILE)
         # Each group's gather offsets are computed while the group before it is still in
         # flight, ahead of that group's softmax in the Vector engine's program order: the
         # engine runs its instructions in that order, and a gather waits on its offsets.
-        for r in range(group):
-            _lowp_offsets(scratch[r % ring], topk_hbm, q0 + r)
+        # Only the program's first group has no group before it.
+        if qb == prg_id:
+            for r in range(group):
+                _lowp_offsets(scratch[r % ring], topk_hbm, q0 + r)
         for g0 in range(0, qpb, group):
             scores_ps = []
             for ti in range(len(tiles)):
                 scores_ps.append(_psum(group, tiles[ti][1]))
             for r in range(group):
                 qi = g0 + r
-                ws = scratch[qi % ring]
+                ws = scratch[(n0 + qi) % ring]
                 c_t = ws[_LP_C_T]
                 offsets = ws[_LP_OFFSET]
 
@@ -1878,10 +1895,15 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
                                        stationary=q_masked[r][:, li, 0:group],
                                        moving=c_t[:, 0, li, ks:ks + extent],
                                        accumulate=(r > 0 or li > 0))
+            # The next group's offsets: the next block's first group after a block's last.
             if g0 + group < qpb:
                 for r in range(group):
                     qi = g0 + group + r
-                    _lowp_offsets(scratch[qi % ring], topk_hbm, q0 + qi)
+                    _lowp_offsets(scratch[(n0 + qi) % ring], topk_hbm, q0 + qi)
+            elif qb + n_prgs < n_blocks:
+                for r in range(group):
+                    _lowp_offsets(scratch[(n0 + qpb + r) % ring], topk_hbm,
+                                  (qb + n_prgs) * qpb + r)
 
             # ---- the group's mask, from its index rows ---------------------------------
             # ``index >= 0`` in fp32 (every index is far below 2**24, so the conversion
@@ -1944,7 +1966,7 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
             # sums, which the simulator does not show (``reports/mla_sparse.md``).
             for r in range(group):
                 qi = g0 + r
-                c_t = scratch[qi % ring][_LP_C_T]
+                c_t = scratch[(n0 + qi) % ring][_LP_C_T]
                 pv_ps = []
                 for _ in range(n_latent):
                     pv_ps.append(_psum(LATENT_TILE, 2))
