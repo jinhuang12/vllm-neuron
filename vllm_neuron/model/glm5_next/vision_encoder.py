@@ -237,12 +237,41 @@ class Glm5NextVisionMLP(nn.Module):
         return self.down_proj(self.act_fn(gate) * up)
 
 
+class Glm5NextVisionHeadRMSNorm(Glm5NextVisionRMSNorm):
+    """The attention's per-head RMSNorm of the query or key, ``[seq, heads, head_dim]`` in and out.
+
+    It computes :class:`Glm5NextVisionRMSNorm` over ``head_dim``, with one change: each row's sum of
+    squares per head is one float32 matmul of the squares, flattened to ``[seq, heads * head_dim]``,
+    with a 0/1 head indicator ``[heads * head_dim, heads]``. Neuron lowers the reduce over the
+    ``head_dim`` axis to float32 Tensor Engine transposes, which took most of the tower's device time;
+    the matmul form needs none of those transposes.
+
+    The products are the same float32 squares and only their sum order changes, so the class against the
+    reference is SUM-ORDER, not bit-equal. The tower output, measured against the reduce form, stays within
+    the device bound of ``test/hardware/benchmark_glue_block.py``: ``agreement(layers=depth)``, rel-L2
+    ``DEVICE_REL_L2_TOL`` per layer.
+    """
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        h = hidden_states.to(torch.float32)
+        seq, heads, head_dim = h.shape
+        # ind[lane, head] is 1 where lane // head_dim == head: the 0/1 head indicator.
+        lanes = torch.arange(heads * head_dim, device=h.device) // head_dim
+        ind = (lanes[:, None] == torch.arange(heads, device=h.device)[None, :]).to(
+            torch.float32
+        )
+        variance = ((h * h).reshape(seq, heads * head_dim) @ ind) / head_dim
+        h = h * torch.rsqrt(variance + self.variance_epsilon).unsqueeze(-1)
+        return self.weight * h.to(input_dtype)
+
+
 class Glm5NextVisionAttention(nn.Module):
     """Bidirectional per-frame attention, matching the reference.
 
     Two things separate this tower's attention from the qwen3_vl template the package otherwise
-    follows: the query and key are RMS-normalised per head before the rotary embedding, and the fused
-    ``qkv`` carries ``config.attention_bias``.
+    follows: the query and key are RMS-normalised per head before the rotary embedding
+    (:class:`Glm5NextVisionHeadRMSNorm`), and the fused ``qkv`` carries ``config.attention_bias``.
     """
 
     def __init__(
@@ -269,10 +298,10 @@ class Glm5NextVisionAttention(nn.Module):
             bias=config.attention_bias,
             dtype=dtype,
         )
-        self.q_norm = Glm5NextVisionRMSNorm(
+        self.q_norm = Glm5NextVisionHeadRMSNorm(
             self.head_dim, eps=config.rms_norm_eps, dtype=dtype
         )
-        self.k_norm = Glm5NextVisionRMSNorm(
+        self.k_norm = Glm5NextVisionHeadRMSNorm(
             self.head_dim, eps=config.rms_norm_eps, dtype=dtype
         )
 
