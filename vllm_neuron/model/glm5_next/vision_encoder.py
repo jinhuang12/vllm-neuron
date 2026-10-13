@@ -7,7 +7,7 @@ surrounding stages live elsewhere:
 =====================================  ==================================
 reference stage                        where it lives here
 =====================================  ==================================
-``patch_embed``                        the NKI patch-embed seam
+``patch_embed``                        :meth:`Glm5NextVisionEncoder.patch_embed`
 ``rotary_pos_emb`` + ``cos``/``sin``   ``utils/vision_rope.py``
 ``blocks`` loop                        this module
 ``post_layernorm``                     ``vision_adapter.py``
@@ -28,8 +28,8 @@ Three facts make that delegation exact:
    expands every patch row over ``temporal_patch_size``, so all its temporal slices are the same
    pixels. The reference's ``nn.Conv3d`` over kernel depth ``temporal_patch_size`` then computes
    ``sum_t W[:, :, t] * x_0``, which equals a depth-1 convolution whose weight is ``W`` summed over
-   ``t``. :func:`patch_embed_filters_from_conv3d` performs that sum, and the tower feeds the seam a
-   single temporal slice.
+   ``t``. :func:`patch_embed_filters_from_conv3d` performs that sum, and
+   :meth:`Glm5NextVisionEncoder.patch_embed` multiplies a single temporal slice by the result.
 2. **Attention is bidirectional within one frame.** The reference groups ``cu_seqlens`` with
    ``merge_temporal=False``, so each frame is its own attention segment of ``h * w`` tokens.
    :func:`compute_attention_bounds` expresses that as the per-row key ranges
@@ -52,7 +52,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import vllm_neuron.functional as NF
-from vllm_neuron.functional.vision.patch_embed import BATCH_RANGE, patch_embed
 from vllm_neuron.utils.weight_loader import SafetensorsWeightLoader, set_weight_loader
 
 from .config import Glm5NextVisionConfig
@@ -64,10 +63,6 @@ from .vision_adapter import Glm5NextVisionAdapter, Glm5NextVisionRMSNorm
 # this and sliced back after. ``qwen3_vl/vision_encoder_bf16.py`` pads the same
 # kernel the same way.
 _ATTN_SEQ_ALIGN = 128
-
-# The most patch rows one seam call may carry. Read off the seam's own batch range
-# so it cannot drift away from what the seam admits.
-_PATCH_ROWS_PER_CALL = BATCH_RANGE[1]
 
 # Mirrors the map of the same name in ``vision_adapter.py``, which is private to
 # that module.
@@ -94,12 +89,12 @@ class Glm5NextVisionEncoderError(ValueError):
 
 
 def patch_embed_filters_from_conv3d(conv_weight: torch.Tensor) -> torch.Tensor:
-    """Convert the reference's patch-embed convolution to the seam's layout.
+    """Convert the reference's patch-embed convolution to the tower's filter layout.
 
-    The reference holds ``[C_out, C_in, temporal_patch_size, P, P]``; the patch-embed seam takes
-    ``[K_d, K_h, K_w, C_in, C_out]`` with ``K_d == 1``. Summing over the temporal axis is exact
-    rather than an approximation, because the input's temporal slices are identical copies -- see
-    fact 1 in this module's docstring.
+    The reference holds ``[C_out, C_in, temporal_patch_size, P, P]``; the tower holds
+    ``[K_d, K_h, K_w, C_in, C_out]`` with ``K_d == 1``, the layout of the NKI patch-embed seam.
+    Summing over the temporal axis is exact rather than an approximation, because the input's
+    temporal slices are identical copies -- see fact 1 in this module's docstring.
 
     Args:
         conv_weight: ``[C_out, C_in, temporal_patch_size, P, P]``.
@@ -418,8 +413,9 @@ class Glm5NextVisionEncoder(nn.Module):
         self.head_dim = config.hidden_size // config.num_heads
         self.patch_dim = config.patch_dim
 
-        # Held in the seam's own filter layout rather than as an ``nn.Conv3d``, so
-        # no weight is reshaped on the forward path.
+        # Held in the NKI patch-embed seam's filter layout rather than as an
+        # ``nn.Conv3d``; :meth:`patch_embed` flattens it to its matmul's
+        # ``[in_channels * patch_size ** 2, hidden_size]``.
         # :func:`patch_embed_filters_from_conv3d` converts a reference checkpoint
         # into it once.
         self.patch_embed_filters = nn.Parameter(
@@ -506,7 +502,12 @@ class Glm5NextVisionEncoder(nn.Module):
             )
 
     def patch_embed(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        """Embed flat patch rows through the NKI patch-embed seam.
+        """Embed flat patch rows as one matmul plus the bias.
+
+        The reference's convolution has a window equal to its stride, so each patch row gives one
+        output pixel: ``bias + x @ W``, where ``x`` is the row's single temporal slice flattened in
+        ``(in_channels, patch_size, patch_size)`` order and ``W`` holds the filters in that order.
+        All rows go through one ``addmm``.
 
         Args:
             pixel_values: ``[total_patches, patch_dim]`` where ``patch_dim`` is
@@ -531,31 +532,27 @@ class Glm5NextVisionEncoder(nn.Module):
             )
 
         total_patches = pixel_values.shape[0]
+        # One temporal slice: they are copies of each other (fact 1 in this
+        # module's docstring) and the filters already carry the sum over that
+        # axis.
         rows = pixel_values.reshape(
             total_patches,
             self.in_channels,
             self.temporal_patch_size,
             self.patch_size,
             self.patch_size,
+        )[:, :, 0]
+        rows = rows.reshape(
+            total_patches, self.in_channels * self.patch_size * self.patch_size
         )
-        # One temporal slice: they are copies of each other (fact 1 in this
-        # module's docstring) and the filters already carry the sum over that
-        # axis. This is the ``D == 1`` input the seam requires.
-        rows = rows[:, :, :1]
-
-        # The seam refuses a batch above its own range, and one patch row is one
-        # batch element, so a real image is embedded in chunks.
-        embedded = []
-        for start in range(0, total_patches, _PATCH_ROWS_PER_CALL):
-            chunk = rows[start : start + _PATCH_ROWS_PER_CALL]
-            out = patch_embed(
-                chunk,
-                self.patch_embed_filters,
-                self.patch_size,
-                bias=self.patch_embed_bias,
-            )
-            embedded.append(out.reshape(chunk.shape[0], self.hidden_size))
-        return torch.cat(embedded, dim=0)
+        # [1, P, P, C_in, C_out] -> [C_in, P, P, C_out] -> [C_in * P * P, C_out],
+        # the order of ``rows``.
+        weight = (
+            self.patch_embed_filters[0]
+            .permute(2, 0, 1, 3)
+            .reshape(rows.shape[1], self.hidden_size)
+        )
+        return torch.addmm(self.patch_embed_bias, rows, weight)
 
     def encode_block(
         self,
@@ -676,8 +673,8 @@ def pack_images_into_blocks(
         block_size: rows per attention block, ``vision_attention_block_size``.
         num_blocks: blocks of the bucket; at least the number of images.
         config: the tower config, for the patch width, head width and merge size.
-        dtype: the tower dtype. The processor emits float32 rows, and the patch-embed seam takes
-            its input in the filters' dtype.
+        dtype: the tower dtype. The processor emits float32 rows, and the patch embed takes its
+            input in the filters' dtype.
 
     Returns:
         ``pixel_values``, ``cos``, ``sin``, ``bound_min`` and ``bound_max``, each with a leading
