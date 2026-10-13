@@ -139,6 +139,11 @@ Limits of the class:
 #                     pair is now FINDINGS (Model.one_pass_verdict); pairs only through a
 #                     runtime address are UNDECIDED (were FINDINGS); one register saved by
 #                     each engine into one slot is not a finding (was FINDINGS).
+# 2026-10-13          Model.reach reads a bit-set closure, one per relation, built once in
+#                     reverse topological order: the DFS memo kept one set per producer node
+#                     and ran out of memory on a large dump. The output is the same on an
+#                     acyclic graph. A cycle now stops the pair classification: the pair
+#                     section names one cycle, and the dump is UNDECIDED as before.
 
 import bisect
 import collections
@@ -233,6 +238,26 @@ def verdict_line(word, n):
 
 class Undecided(Exception):
     """An operand the check cannot place in memory."""
+
+
+class CycleError(Exception):
+    """The happens-before graph has a cycle (the message names one), so it has no closure."""
+
+
+class _Reach:
+    """The nodes one node happens before, for `in` tests (Model.reach): bit x of the node's
+    closure row, the node itself left out (a closure row holds its own bit)."""
+
+    __slots__ = ("index", "node", "row")
+
+    def __init__(self, node, row, index):
+        self.node, self.row, self.index = node, row, index
+
+    def __contains__(self, x):
+        k = self.index.get(x)
+        if k is None or x == self.node or k // 8 >= len(self.row):
+            return False
+        return bool(self.row[k // 8] >> (k % 8) & 1)
 
 
 def runtime_footprint(op, memlocs):
@@ -499,7 +524,7 @@ class Model:
         if cyc:
             self.undecided.append(f"happens-before graph has a cycle through {cyc} nodes: no pair's order can be read off it")
             self.undecided_class["cycle"] += 1
-        # reachability (DFS memo)
+        # reachability: {with_queue: the relation's bit-set closure}, built on first use (reach)
         self._reach = {}
         self._loop_pairs = None
         self._body_updates = {}
@@ -576,13 +601,19 @@ class Model:
                 return n
         return nodes[-1]
 
-    def cycle_nodes(self):
-        """Number of nodes on or behind a cycle of the happens-before graph (0: acyclic)."""
+    def _graph(self, with_queue):
+        """({node: its successors}, every node) of one relation: `edges`, plus `qedges` when
+        `with_queue` (same-queue DMAs complete in order)."""
         succ = collections.defaultdict(set)
-        for e in (self.edges, self.qedges):
+        for e in (self.edges, self.qedges) if with_queue else (self.edges,):
             for n, after in e.items():
                 succ[n] |= after
-        nodes = set(succ).union(*succ.values()) if succ else set()
+        return succ, set(succ).union(*succ.values()) if succ else set()
+
+    @staticmethod
+    def _topological(succ, nodes):
+        """Kahn's order of the graph: every node after its predecessors. The nodes on or
+        behind a cycle are not in it."""
         indeg = dict.fromkeys(nodes, 0)
         for after in succ.values():
             for n in after:
@@ -593,7 +624,31 @@ class Model:
                 indeg[m] -= 1
                 if not indeg[m]:
                     order.append(m)
-        return len(nodes) - len(order)
+        return order
+
+    def cycle_nodes(self):
+        """Number of nodes on or behind a cycle of the happens-before graph (0: acyclic)."""
+        succ, nodes = self._graph(True)
+        return len(nodes) - len(self._topological(succ, nodes))
+
+    def one_cycle(self):
+        """One cycle of the happens-before graph, its nodes in order ([]: acyclic). Each node
+        Kahn's order leaves out has a predecessor it also leaves out, so a walk back through
+        them repeats a node; the walk between the two visits is a cycle."""
+        succ, nodes = self._graph(True)
+        left = nodes - set(self._topological(succ, nodes))
+        if not left:
+            return []
+        pred = {}
+        for n in sorted(left):
+            for m in sorted(succ.get(n, ())):
+                if m in left:
+                    pred.setdefault(m, n)
+        walk, seen = [min(left)], set()
+        while walk[-1] not in seen:
+            seen.add(walk[-1])
+            walk.append(pred[walk[-1]])
+        return list(reversed(walk[walk.index(walk[-1]):]))
 
     def succ(self, n, with_queue):
         out = set(self.edges.get(n, ()))
@@ -601,19 +656,33 @@ class Model:
             out |= self.qedges.get(n, set())
         return out
 
+    def _closure(self, with_queue):
+        """(index, rows) of one relation: a node's index is its place in reverse topological
+        order, so its descendants have smaller indices; its row is its own bit OR its
+        successors' rows, built sinks first, as little-endian bytes (index // 8 + 1 of them).
+        Memory: about N^2 / 16 bytes for N nodes. A cycle raises CycleError."""
+        succ, nodes = self._graph(with_queue)
+        order = self._topological(succ, nodes)
+        if len(order) != len(nodes):
+            raise CycleError(" -> ".join(self.one_cycle()))
+        order.reverse()
+        index = {n: k for k, n in enumerate(order)}
+        closure = {}
+        for n in order:
+            row = 1 << index[n]
+            for m in succ.get(n, ()):
+                row |= closure[m]
+            closure[n] = row
+        return index, {n: closure.pop(n).to_bytes(index[n] // 8 + 1, "little") for n in order}
+
     def reach(self, a, with_queue=False):
-        key = (a, with_queue)
-        if key in self._reach:
-            return self._reach[key]
-        seen, stack = set(), [a]
-        while stack:
-            n = stack.pop()
-            for m in self.succ(n, with_queue):
-                if m not in seen:
-                    seen.add(m)
-                    stack.append(m)
-        self._reach[key] = seen
-        return seen
+        """The nodes `a` happens before (not `a` itself), for `in` tests only (`ordered`):
+        a view of the relation's closure (`_closure`). Raises CycleError on a cycle."""
+        if with_queue not in self._reach:
+            self._reach[with_queue] = self._closure(with_queue)
+        index, rows = self._reach[with_queue]
+        row = rows.get(a)
+        return _Reach(a, row, index) if row is not None else frozenset()
 
     def ordered(self, p, c, with_queue=False):
         """producer's completion happens-before consumer's start?"""
@@ -1004,11 +1073,16 @@ def main():
     print(f"  {len(M.waits)} waits checked, {bad} not OK")
     print("\n## conflicting pairs (producer -> consumer) lacking happens-before")
     conf = M.conflicts(lo, hi)
+    cycle = M.one_cycle() if M.undecided_class["cycle"] else []
+    if cycle:   # Model.reach has no closure on a cycle (CycleError): classify no pair
+        print(f"  not classified: the happens-before graph has a cycle, {' -> '.join(cycle)}; "
+              f"no pair's order can be read off it")
+    classified = [] if cycle else conf
     n_ok = n_bad = 0
     seen = set()
     n_q = 0
     unsync = []
-    for kind, P, C, fa, fb in conf:
+    for kind, P, C, fa, fb in classified:
         ok = M.ordered(P, C)
         okq = ok or M.ordered(P, C, True)
         key = (P["name"], C["name"], kind)
@@ -1036,7 +1110,7 @@ def main():
     if "--pairs" in sys.argv:
         print("\n## every overlapping pair in the selected line range, with its ordering path")
         seen2 = set()
-        for kind, P, C, fa, fb in conf:
+        for kind, P, C, fa, fb in classified:
             key = (P["name"], C["name"], kind)
             if key in seen2:
                 continue
@@ -1049,8 +1123,11 @@ def main():
             print(f"  [{tag}] {kind} {M.label(P)} {fp_str(fa)}")
             print(f"        -> {M.label(C)} {fp_str(fb)}")
             print(f"        via: {how}")
-    print(f"\n  {len(conf)} overlapping pairs: {n_ok} ordered by engine order + semaphores, "
-          f"{n_q} ordered only if same-queue DMAs complete in order, {n_bad} UNSYNCHRONIZED")
+    if cycle:
+        print(f"\n  {len(conf)} overlapping pairs, not classified (the graph has a cycle)")
+    else:
+        print(f"\n  {len(conf)} overlapping pairs: {n_ok} ordered by engine order + semaphores, "
+              f"{n_q} ordered only if same-queue DMAs complete in order, {n_bad} UNSYNCHRONIZED")
     runtime = sum(1 for a in M.acc for f in a["reads"] + a["writes"] if f.get("runtime"))
     if runtime:
         print(f"  {runtime} DRAM footprints are runtime-address operands, taken as their whole tensor "
