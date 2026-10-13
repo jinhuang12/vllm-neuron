@@ -429,7 +429,10 @@ def select_kv_segment_size(buckets: list[int], tokens: int) -> int:
     window of ``segment + query_bucket`` tokens that holds its whole sequence, through the
     graph compiled for that segment. A request longer than every segment takes the largest:
     the validator (:func:`validate_kv_segment_size_buckets`) has proved that segment's
-    window covers ``max_model_len``, which bounds every request.
+    window covers ``max_model_len``, which bounds every request. The runner asks a
+    windowed-prefill chunk for the segment of its start instead (``tokens`` = the tokens
+    cached before it), so the chunk's window holds its own end and no more
+    (``NeuronModelRunner._build_attention_metadata``).
     """
     for segment in buckets:
         if int(tokens) <= int(segment):
@@ -518,8 +521,9 @@ def validate_kv_segment_size_buckets(
     """Validate kv_segment_size_buckets configuration for segmented prefill.
 
     A segment is how much of a request's sequence one prefill chunk's compiled graph
-    may address: a request is prefilled on the smallest segment at least as long as it
-    (:func:`select_kv_segment_size`), and its chunks read a window of
+    may address: a request is prefilled on the smallest segment at least as long as it,
+    a windowed-prefill chunk on the smallest that holds its start
+    (:func:`select_kv_segment_size`), and a chunk reads a window of
     ``segment + query bucket`` tokens.
 
     Validates the following interface constraints (always enforced):

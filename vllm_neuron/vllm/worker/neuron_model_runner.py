@@ -4686,11 +4686,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         return (ctx_for_blocks + dcp_block_size - 1) // dcp_block_size
 
     def _prefill_kv_segment_size(self, request_tokens: int) -> int:
-        """Return the KV segment a request of ``request_tokens`` tokens is prefilled with.
+        """Return the smallest KV segment that holds ``request_tokens`` tokens.
 
-        The smallest of ``neuron_config.kv_segment_size_buckets`` at least as long as
-        the request (:func:`vllm_neuron.utils.bucket_utils.select_kv_segment_size`), or
-        the largest, whose window the validator proved covers ``max_model_len``; 0 when
+        The caller passes a request's whole length, or, for a chunk of a
+        windowed-prefill model, the tokens cached before the chunk: that chunk takes
+        the segment of its start (:meth:`_build_attention_metadata`). The smallest of
+        ``neuron_config.kv_segment_size_buckets`` at least that long
+        (:func:`vllm_neuron.utils.bucket_utils.select_kv_segment_size`), or the
+        largest, whose window the validator proved covers ``max_model_len``; 0 when
         segmented prefill is off. Warmup compiles one prefill graph per configured
         segment, so every value returned here has its graph.
         """
@@ -4713,6 +4716,43 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if lengths is not None and len(lengths) > 0:
             return int(lengths[0])
         return int(cached_seq_len) + int(scheduled_rows)
+
+    @staticmethod
+    def _require_prefill_chunk_window(
+        segment: int, query_tokens: int, chunk_end: int, page_sizes
+    ) -> None:
+        """Refuse a windowed prefill chunk whose KV window stops short of its end.
+
+        The chunk-window invariant: the window ``segment + query_tokens``, in whole
+        pages of each page size in ``page_sizes``
+        (:func:`vllm_neuron.utils.bucket_utils.prefill_window_tokens`, the block table
+        ``_glm5next_model_kwargs`` builds), reaches ``chunk_end``, since a chunk reads
+        every position below its end: the tokens cached before it and its own. A chunk
+        takes the smallest segment that holds its start, so ``segment + query_tokens``
+        reaches its end whenever its start lies within a segment; past the largest
+        segment the paged window reaches ``max_model_len``, which the segment
+        validator (``bucket_utils.validate_kv_segment_size_buckets``, rule 6) requires.
+
+        ``page_sizes`` are the block sizes of the token-paged (attention) KV cache
+        groups. A recurrent-state (``MambaSpec``) group is not paged by token: its
+        block-table row names the request's state slot, and its block size
+        (``--mamba-block-size``, up to ``max_model_len``) only prices its share of the
+        block pool, so it bounds no window.
+
+        Raises:
+            ValueError: the window stops short of ``chunk_end``.
+        """
+        from vllm_neuron.utils.bucket_utils import prefill_window_tokens
+
+        for page in sorted(page_sizes):
+            window = prefill_window_tokens([segment], [query_tokens], page)
+            if window < int(chunk_end):
+                raise ValueError(
+                    f"prefill chunk window invariant: KV segment {segment} + query "
+                    f"bucket {query_tokens} in pages of {page} is a {window}-token "
+                    f"window, short of the chunk's end at {chunk_end} tokens; "
+                    f"kv_segment_size_buckets needs a segment whose window reaches it"
+                )
 
     def _build_attention_metadata(
         self,
@@ -4751,11 +4791,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         decode_token_threshold = 1 + max_num_draft_tokens
         is_decode = max_query_len <= decode_token_threshold
         # The KV segment this step's graph is compiled for. A prefill chunk (one
-        # request per step) takes the smallest segment at least as long as its
-        # request, so every chunk of the request reads a window that holds its whole
-        # sequence; a decode step keeps the first segment, the one its warmup graph
-        # was built with (the decode converter does not read it). 0 when segmented
-        # prefill is off.
+        # request per step) of a windowed-prefill model takes the smallest segment
+        # that holds its start, the tokens cached before it (the segment a request
+        # ending there would take): its window, segment plus query bucket in whole
+        # pages, reaches the chunk's end (``_require_prefill_chunk_window``), and a
+        # chunk early in a long request reads a narrower window than the request's
+        # last one. The start, not the end, because the DCP window rule
+        # (``_glm5next_model_kwargs``) sizes a rank's entries for a start inside the
+        # segment. Another model's chunk takes the smallest segment at least as long
+        # as its request. A decode step keeps the first segment, the one its warmup
+        # graph was built with (the decode converter does not read it). 0 when
+        # segmented prefill is off.
         segments = self.neuron_config.kv_segment_size_buckets
         if is_decode or not segments:
             kv_segment_size = segments[0] if segments else 0
@@ -4763,7 +4809,28 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             request_tokens = self._prefill_request_tokens(
                 cached_seq_len, total_num_scheduled_tokens
             )
-            kv_segment_size = self._prefill_kv_segment_size(request_tokens)
+            if self.neuron_config._model_supports_windowed_prefill:
+                kv_segment_size = self._prefill_kv_segment_size(cached_seq_len)
+                query_bucket = max(
+                    self.neuron_config.num_batched_tokens_buckets or [max_query_len]
+                )
+                self._require_prefill_chunk_window(
+                    kv_segment_size,
+                    query_bucket,
+                    min(
+                        request_tokens,
+                        int(cached_seq_len) + int(total_num_scheduled_tokens),
+                    ),
+                    {
+                        group.kv_cache_spec.block_size
+                        for group in self.kv_cache_config.kv_cache_groups
+                        if isinstance(
+                            group.kv_cache_spec, (FullAttentionSpec, SlidingWindowSpec)
+                        )
+                    },
+                )
+            else:
+                kv_segment_size = self._prefill_kv_segment_size(request_tokens)
             req_ids = list(getattr(self.input_batch, "req_ids", None) or ())
             logger.info(
                 "Prefill chunk of request %s: %s of %s tokens cached, KV segment %s of %s",
