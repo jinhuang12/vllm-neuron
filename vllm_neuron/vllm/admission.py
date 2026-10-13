@@ -8,7 +8,7 @@ served config, in the API server process. ``NeuronPlatform.validate_request`` ca
 A refusal is a ``ValueError``, which vLLM's OpenAI server returns as HTTP 400; the engine
 never sees the request.
 
-Three request classes are refused:
+Five request classes are refused:
 
 * **A prompt that leaves no room for a generated token** (``prompt + 1 > max_model_len``).
   Every sampling request generates at least one token (``max_tokens >= 1``), and the KV
@@ -28,15 +28,34 @@ Three request classes are refused:
   ignored in silence. A request whose knobs all equal the server defaults is admitted
   and served greedy: vLLM fills unset knobs from the model's generation config before
   this check runs, so "left unset" and "set to the default" look the same here.
+* **A sampling control the on-device sampler does not apply**, set to a value other than
+  its default: ``presence_penalty``, ``frequency_penalty``, ``repetition_penalty``,
+  ``logit_bias``, ``bad_words`` and ``allowed_token_ids``. The device sampler reads one
+  ``[top_k, top_p, temperature]`` row per request and the structured-output mask
+  (``functional/full_vocab_sampling.py``); with it, the runner returns the device tokens
+  and calls vLLM's ``Sampler`` only for logprobs, and its input batch has no logits
+  processors (vLLM applies ``logit_bias`` and ``min_tokens`` in its built-in ones). So
+  none of these reaches the tokens, greedy or not.
+* **``min_tokens`` while a stop token id applies** (``ignore_eos`` false, so EOS is a
+  stop, or ``stop_token_ids`` set). vLLM's scheduler does not stop a request before
+  ``min_tokens`` and its detokenizer holds stop strings until then, but it is vLLM's
+  min-tokens logits processor that keeps the EOS and stop ids out of those first tokens,
+  and the device sampler has none. So the output can hold a stop token with more text
+  after it. With ``ignore_eos`` and no ``stop_token_ids`` the request asks for text past
+  EOS, and ``min_tokens`` is admitted. The gap left: with ``ignore_eos`` an EOS id may
+  appear inside the first ``min_tokens`` tokens where a masking sampler would have
+  excluded it.
 * **logprobs / prompt_logprobs when the device sampler returns token ids only.** The
   runner then has no logits on the host; vLLM's completions endpoint indexes an empty
   logprobs list and answers HTTP 500.
 
 ``validate_request`` alone answers a refused *streamed* request with HTTP 200 and an
 error event: vLLM's ``AsyncLLM.generate`` is an async generator, so its body (where
-``process_inputs`` runs) starts only once the response stream is iterated.
-:func:`install_eager_validation` runs the same validation when ``generate`` is called,
-before the stream begins, so streamed and plain requests both get a 400.
+``process_inputs`` runs) starts only once the response stream is iterated. vLLM's own
+``SamplingParams.verify`` checks (for example ``logit_bias`` under speculative decoding)
+run there too, before ``validate_request``. :func:`install_eager_validation` runs both,
+in that order, when ``generate`` is called, before the stream begins, so streamed and
+plain requests get the same 400.
 """
 
 from __future__ import annotations
@@ -65,6 +84,7 @@ _PROTOCOL_DEFAULTS: dict[str, float] = {
     "top_p": 1.0,
     "top_k": 0,
     "min_p": 0.0,
+    "repetition_penalty": 1.0,
 }
 
 #: Warnings already logged in this process, so each is logged once.
@@ -122,11 +142,13 @@ def _same(value: float, default: float) -> bool:
 class SamplingAdmission:
     """What the served sampler can honour.
 
-    ``all_greedy``: every token is the argmax. ``logprobs``: the host receives logits to
-    compute logprobs from. ``prompt_logprobs``: likewise for the prompt. ``defaults``: the
-    knob values a request carries when the client sets none of them.
+    ``on_device``: the tokens come from the on-device sampler. ``all_greedy``: every
+    token is the argmax. ``logprobs``: the host receives logits to compute logprobs from.
+    ``prompt_logprobs``: likewise for the prompt. ``defaults``: the knob values a request
+    carries when the client sets none of them.
     """
 
+    on_device: bool = False
     all_greedy: bool = False
     logprobs: bool = True
     prompt_logprobs: bool = True
@@ -158,7 +180,47 @@ class SamplingAdmission:
                 f"sampling parameters at the server defaults, or restart the server "
                 f"without all_greedy to sample."
             )
+        controls = self._controls_the_device_ignores(params)
+        if controls:
+            refusals.append(
+                f"This server samples on device (on_device_sampling_config is set), and "
+                f"the device sampler does not apply {', '.join(controls)}. Leave these "
+                f"parameters unset."
+            )
+        if self._min_tokens_a_stop_token_can_break(params):
+            refusals.append(
+                f"This server samples on device (on_device_sampling_config is set), and "
+                f"the device sampler does not keep the EOS and stop token ids out of the "
+                f"first min_tokens={params.min_tokens} tokens, so the output can hold a "
+                f"stop token with more text after it. Leave min_tokens unset; it is "
+                f"admitted with ignore_eos=true and no stop_token_ids."
+            )
         return refusals
+
+    def _controls_the_device_ignores(self, params) -> list[str]:
+        if not self.on_device:
+            return []
+        controls = []
+        if not _same(params.presence_penalty, 0.0):
+            controls.append(f"presence_penalty={params.presence_penalty:g}")
+        if not _same(params.frequency_penalty, 0.0):
+            controls.append(f"frequency_penalty={params.frequency_penalty:g}")
+        if not _same(params.repetition_penalty, self.defaults["repetition_penalty"]):
+            controls.append(f"repetition_penalty={params.repetition_penalty:g}")
+        if params.logit_bias:
+            controls.append("logit_bias")
+        if params.bad_words:
+            controls.append("bad_words")
+        if params.allowed_token_ids is not None:
+            controls.append("allowed_token_ids")
+        return controls
+
+    def _min_tokens_a_stop_token_can_break(self, params) -> bool:
+        return (
+            self.on_device
+            and params.min_tokens > 0
+            and (not params.ignore_eos or bool(params.stop_token_ids))
+        )
 
     def _knobs_argmax_ignores(self, params) -> list[str]:
         if not self.all_greedy:
@@ -259,6 +321,7 @@ def policy_from_config(vllm_config) -> AdmissionPolicy:
             or any(arch in TOKEN_ONLY_SAMPLER_ARCHS for arch in architectures)
         )
         sampling = SamplingAdmission(
+            on_device=True,
             all_greedy=sampler.all_greedy,
             logprobs=logprobs,
             # The runner never fills prompt logprobs, and with the sampler on the
@@ -281,14 +344,32 @@ def policy_from_config(vllm_config) -> AdmissionPolicy:
 # ── eager validation for streamed requests ───────────────────────────────────────
 
 
-def install_eager_validation() -> None:
-    """Run the platform's request validation when ``AsyncLLM.generate`` is called.
+def _verify_sampling_params(engine, params) -> None:
+    """vLLM's ``SamplingParams.verify``, with the configs ``process_inputs`` passes it.
 
-    ``generate`` is an async generator: ``process_inputs`` (and so ``validate_request``)
-    runs on the first iteration, which for a streamed response is after vLLM has sent
-    HTTP 200. Validating at the call instead makes the ``ValueError`` propagate out of
-    the endpoint handler, where vLLM's exception handler returns 400, for streamed and
-    plain requests alike. ``process_inputs`` validates again as before. Only a processed
+    The structured-outputs config is passed as None, so the grammar check (which also
+    records the backend on the request) stays in ``process_inputs`` and runs once; every
+    other check in ``verify`` only reads the request."""
+    from vllm.sampling_params import SamplingParams
+
+    if not isinstance(params, SamplingParams):
+        return
+    processor = engine.input_processor
+    params.verify(
+        processor.model_config, processor.speculative_config, None, processor.tokenizer
+    )
+
+
+def install_eager_validation() -> None:
+    """Run the request checks of ``process_inputs`` when ``AsyncLLM.generate`` is called.
+
+    ``generate`` is an async generator: ``process_inputs`` (and so vLLM's
+    ``SamplingParams.verify`` and the platform's ``validate_request``) runs on the first
+    iteration, which for a streamed response is after vLLM has sent HTTP 200. Validating
+    at the call instead makes the ``ValueError`` propagate out of the endpoint handler,
+    where vLLM's exception handler returns 400, for streamed and plain requests alike.
+    The two checks run in the order ``process_inputs`` runs them, so the first refusal is
+    the same either way. ``process_inputs`` validates again as before. Only a processed
     prompt (``EngineInput``, what every OpenAI endpoint passes) is checked here; anything
     else is left to ``process_inputs``. Idempotent.
     """
@@ -307,6 +388,7 @@ def install_eager_validation() -> None:
         if isinstance(prompt, Mapping) and "type" in prompt and params is not None:
             from vllm.platforms import current_platform
 
+            _verify_sampling_params(self, params)
             current_platform.validate_request(prompt, params)
         return lazy_generate(self, *args, **kwargs)
 

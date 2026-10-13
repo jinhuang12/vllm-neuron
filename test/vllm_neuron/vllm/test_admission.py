@@ -371,6 +371,109 @@ def test_logprobs_are_refused_under_the_full_on_device_sampler(served_model_dir,
     _validate(100, SamplingParams(temperature=0.8, top_k=50))
 
 
+# ── sampling controls the on-device sampler does not apply ─────────────────────────
+
+
+#: Each control the device sampler does not apply, set to a non-default value, with the
+#: text its refusal must carry. The device sampler reads one [top_k, top_p, temperature]
+#: row per request and the structured-output mask; nothing else reaches its tokens.
+#: Built as SamplingParams: the completions protocol has no bad_words (chat has).
+DEVICE_IGNORED = [
+    ({"presence_penalty": 1.0}, "presence_penalty=1"),
+    ({"frequency_penalty": -0.5}, "frequency_penalty=-0.5"),
+    ({"repetition_penalty": 1.2}, "repetition_penalty=1.2"),
+    ({"logit_bias": {11: -100.0}}, "logit_bias"),
+    ({"bad_words": ["Paris"]}, "bad_words"),
+    ({"allowed_token_ids": [1000, 1001]}, "allowed_token_ids"),
+]
+DEVICE_IGNORED_IDS = [next(iter(body)) for body, _ in DEVICE_IGNORED]
+
+#: The refusal of a min_tokens that a stop token could otherwise cut short.
+MIN_TOKENS_REFUSAL = "does not keep the EOS and stop token ids out of the first min_tokens"
+
+
+@pytest.mark.parametrize("body, control", DEVICE_IGNORED, ids=DEVICE_IGNORED_IDS)
+def test_a_control_the_device_sampler_does_not_apply_is_refused_by_name(greedy_server, body,
+                                                                       control):
+    """Greedy too: a penalty, a bias or a token restriction changes which token is the
+    argmax."""
+    with pytest.raises(ValueError) as refused:
+        _validate(100, SamplingParams(temperature=0.0, max_tokens=16, **body))
+    message = str(refused.value)
+    assert control in message and "device sampler does not apply" in message, message
+
+
+@pytest.mark.parametrize(
+    "body, control",
+    DEVICE_IGNORED + [({"min_tokens": 4}, "min_tokens=4")],
+    ids=DEVICE_IGNORED_IDS + ["min_tokens"],
+)
+def test_the_full_device_sampler_refuses_them_too(served_model_dir, monkeypatch, body,
+                                                  control):
+    """Not only all_greedy: the full on-device sampler reads the same three-value row."""
+    monkeypatch.setenv(KNOB, "1")
+    _serve(served_model_dir, STANDARD_LINE, sampler={}, async_scheduling=False)
+    with pytest.raises(ValueError, match=control):
+        _validate(100, SamplingParams(temperature=0.8, max_tokens=16, **body))
+
+
+def test_every_ignored_control_is_named_in_one_refusal(greedy_server):
+    with pytest.raises(ValueError) as refused:
+        _validate(100, SamplingParams(temperature=0.0, max_tokens=16, presence_penalty=1.0,
+                                      bad_words=["Paris"], min_tokens=4))
+    message = str(refused.value)
+    for control in ("presence_penalty=1", "bad_words", "min_tokens=4"):
+        assert control in message, message
+
+
+@pytest.mark.parametrize(
+    "body",
+    [{"presence_penalty": 0.0}, {"frequency_penalty": 0.0}, {"repetition_penalty": 1.0},
+     {"logit_bias": {}}, {"logit_bias": None}, {"bad_words": []}, {"bad_words": None},
+     {"allowed_token_ids": None}, {"min_tokens": 0}],
+    ids=["presence_penalty", "frequency_penalty", "repetition_penalty", "logit_bias-empty",
+         "logit_bias-none", "bad_words-empty", "bad_words-none", "allowed_token_ids",
+         "min_tokens"],
+)
+def test_the_default_values_are_admitted(greedy_server, body):
+    _validate(100, SamplingParams(temperature=0.0, max_tokens=16, **body))
+
+
+def test_min_tokens_with_ignore_eos_and_no_stop_token_ids_is_admitted(greedy_server):
+    """The request asks for text past the EOS token, and vLLM's scheduler does not stop it
+    before min_tokens, so min_tokens holds; only an EOS id inside the first min_tokens
+    tokens can differ from a sampler that masks it."""
+    _validate(100, _openai(greedy_server, temperature=0.0, max_tokens=64, min_tokens=64,
+                           ignore_eos=True))
+
+
+@pytest.mark.parametrize(
+    "body",
+    [{"min_tokens": 8}, {"min_tokens": 8, "ignore_eos": True, "stop_token_ids": [42]}],
+    ids=["eos-is-a-stop", "a-stop-token-id"],
+)
+def test_min_tokens_is_refused_while_a_stop_token_id_applies(greedy_server, body):
+    with pytest.raises(ValueError) as refused:
+        _validate(100, _openai(greedy_server, temperature=0.0, max_tokens=64, **body))
+    message = str(refused.value)
+    assert "min_tokens=8" in message and MIN_TOKENS_REFUSAL in message, message
+
+
+def test_the_repetition_penalty_default_is_the_models(tmp_path, monkeypatch):
+    """A generation config that sets repetition_penalty makes that value the default: a
+    request that leaves it unset is admitted, another value is refused."""
+    shutil.copy(fr.FIXTURE / "config.json", tmp_path / "config.json")
+    (tmp_path / "generation_config.json").write_text(
+        json.dumps(dict(SERVED_GENERATION_CONFIG, repetition_penalty=1.05)))
+    monkeypatch.setenv(KNOB, "1")
+    config = _serve(tmp_path, STANDARD_LINE, sampler=ALL_GREEDY, async_scheduling=True)
+    params = _openai(config, temperature=0.0)
+    assert params.repetition_penalty == pytest.approx(1.05)
+    _validate(100, params)
+    with pytest.raises(ValueError, match="repetition_penalty=1"):
+        _validate(100, _openai(config, temperature=0.0, repetition_penalty=1.0))
+
+
 # ── the same requests on a host-sampling server ─────────────────────────────────────
 
 
@@ -382,6 +485,15 @@ def test_logprobs_are_refused_under_the_full_on_device_sampler(served_model_dir,
 )
 def test_host_sampling_accepts_what_all_greedy_refuses(host_server, body):
     _validate(100, _openai(host_server, **body))
+
+
+@pytest.mark.parametrize("body", [body for body, _ in DEVICE_IGNORED] + [{"min_tokens": 4}],
+                         ids=DEVICE_IGNORED_IDS + ["min_tokens"])
+def test_host_sampling_does_not_refuse_the_controls_the_device_sampler_ignores(host_server,
+                                                                               body):
+    """These refusals belong to the on-device sampler; a host-sampling server leaves the
+    request to vLLM."""
+    _validate(100, SamplingParams(temperature=0.0, max_tokens=16, **body))
 
 
 def test_host_sampling_with_the_knob_unset_accepts_them_too(served_model_dir, monkeypatch):
