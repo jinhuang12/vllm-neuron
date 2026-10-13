@@ -3754,10 +3754,6 @@ class Glm5NextKDAAttention(nn.Module):
             fused_decode_enabled,
             kda_fused_decode,
         )
-        from vllm_neuron.functional.kda.gate_clamp import (
-            MAX_TILE as GATE_MAX_TILE,
-            kda_gate_clamp,
-        )
 
         if hidden_states.dim() != 2:
             raise ValueError(
@@ -3955,8 +3951,12 @@ class Glm5NextKDAAttention(nn.Module):
         # selects the glue kernels here and at the output projection
         # (``VLLM_NEURON_GLUE_FUSED``, functional/glue).
         phase = "prefill" if is_prefill else "decode"
-        q_in, k_in, v_in, raw_gate, raw_beta, out_gate = kda_projections(
-            hidden_states, self, phase=phase, norm=input_norm)
+        # The fused decode launch applies the KDA gate in its own kernel, so it takes
+        # the projected gate. Every other step takes the gate itself from the
+        # projections, which apply it on chip when the prefill kernel serves them.
+        fused_step = not is_prefill and tokens == 1 and fused_decode_enabled()
+        q_in, k_in, v_in, gate, raw_beta, out_gate = kda_projections(
+            hidden_states, self, phase=phase, norm=input_norm, gate=not fused_step)
 
         # A sequence that has computed nothing enters with a zero state, and this is
         # the one predicate that says so. A sequence at position 0 carries no
@@ -3982,12 +3982,12 @@ class Glm5NextKDAAttention(nn.Module):
         # opening request from the same position. Its carriers come back as new
         # tensors and are written through the bank views here, as stages 1 and 5
         # below write them. VLLM_NEURON_KDA_FUSED_DECODE=0 restores the stages.
-        if not is_prefill and tokens == 1 and fused_decode_enabled():
+        if fused_step:
             fused = kda_fused_decode(
                 q_in,
                 k_in,
                 v_in,
-                raw_gate,
+                gate,
                 raw_beta,
                 conv_state=conv_state.unsqueeze(0),
                 recurrent_state=recurrent_state.unsqueeze(0),
@@ -4044,42 +4044,9 @@ class Glm5NextKDAAttention(nn.Module):
             conv_state, carried_rows(history, streams, real_length)
         )
 
-        # --- 2: the gate clamp, one call per head per token tile --------------
-        # The kernel takes one head per call: it refuses an ``a_log`` holding more
-        # than one value, because the decay rate is per head while the bias and the
-        # gate are per key channel.
-        #
-        # It also refuses more than ``GATE_MAX_TILE`` tokens in one call, because
-        # both of its axes pass through a transpose that serves that width. So a
-        # prompt longer than one tile is handed over in tiles and reassembled here,
-        # in the caller, rather than the kernel growing a quiet fallback.
-        #
-        # Tiling is exact here, not approximate. The gate applies a per-channel
-        # bias, one scalar decay rate and a sigmoid, with no reduction along the
-        # token axis, so tile boundaries cannot move a value: a tiled call and a
-        # whole call agree bit for bit.
-        a_log = self.A_log.to(torch.float32).reshape(-1)
-        dt_bias = self.dt_bias.to(torch.float32).reshape(-1)
-
-        def clamp_one_head(h: int) -> torch.Tensor:
-            """One head's gate over the whole prompt, in tiles the kernel accepts."""
-            span = slice(h * kdim, (h + 1) * kdim)
-            head_bias = dt_bias[span]
-            head_decay = a_log[h]
-            tiles = [
-                kda_gate_clamp(
-                    raw_gate[start : start + GATE_MAX_TILE, span].contiguous(),
-                    head_decay,
-                    bias=head_bias,
-                    lower=self.gate_lower_bound,
-                )
-                for start in range(0, tokens, GATE_MAX_TILE)
-            ]
-            # A prompt that already fits is returned as the single tile it is, so it
-            # still costs exactly one call and no concatenation.
-            return tiles[0] if len(tiles) == 1 else torch.cat(tiles, dim=0)
-
-        gate_parts = [clamp_one_head(h) for h in range(heads)]
+        # --- 2: the gate, per head -----------------------------------------
+        # The projections returned the gate itself (``gate=True`` above).
+        gate_parts = [gate[:, h * kdim : (h + 1) * kdim] for h in range(heads)]
         beta = torch.sigmoid(raw_beta)
         # The mask goes on after the clamp and after the sigmoid, on the two values
         # the recurrence reads per row: a zero log-decay is a decay of one and a zero

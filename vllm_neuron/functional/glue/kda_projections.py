@@ -57,6 +57,7 @@ from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 from vllm_neuron import envs
 from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 from vllm_neuron.functional.glue import glue_selected
+from vllm_neuron.functional.kda.gate_clamp import kda_gate
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 #: Largest token count the decode kernel serves (the activations' transpose is its
@@ -288,6 +289,35 @@ def _rms_norm_rows(rows, gain_rows, eps):
                               op1=nl.multiply, operand1=gain_rows)
 
 
+def _gate_rows(dst, raw, bias_rows, decay, heads, lower):
+    """``dst = lower * sigmoid(exp(a_log_h) * (raw + bias))`` on ``[128, W]`` token rows.
+
+    Args:
+        dst: ``[128, W]`` fp32 SBUF tile, the gate rows.
+        raw: ``[128, W]`` fp32 PSUM tile, the same rows of ``raw_gate``.
+        bias_rows: ``[128, W]`` fp32 SBUF tile, the gate bias on every partition.
+        decay: ``[128, heads]`` fp32 SBUF tile, ``exp(a_log_h)`` on every partition.
+        heads: the head count; head ``h`` takes columns ``h * W / heads`` to
+            ``(h + 1) * W / heads``.
+        lower: the checkpoint's ``gate_lower_bound``.
+
+    The steps of :func:`~vllm_neuron.functional.kda.gate_clamp.kda_gate_clamp_kernel`, in
+    its order and in fp32: the bias added (here on the PSUM read, Vector), each head's
+    columns scaled by its decay rate, the sigmoid (Scalar), then the bound as a factor.
+    That kernel holds its tile transposed, so that the per-channel bias is a
+    per-partition scalar. Here the partitions are tokens: the bias is a row on every
+    partition and the decay rate is the per-partition scalar, so no transpose is paid.
+    """
+    kdim = dst.shape[1] // heads
+    nisa.tensor_tensor(dst=dst, data1=raw, data2=bias_rows, op=nl.add,
+                       engine=nisa.engine.vector)
+    for h in range(heads):
+        cols = dst[:, h * kdim:(h + 1) * kdim]
+        nisa.tensor_scalar(dst=cols, data=cols, op0=nl.multiply, operand0=decay[:, h:h + 1])
+    nisa.activation(dst=dst, data=dst, op=nl.sigmoid)
+    nisa.tensor_scalar(dst=dst, data=dst, op0=nl.multiply, operand0=lower)
+
+
 def _psum_reader(index):
     """The engine of the ``index``-th PSUM read: Vector and Scalar (the two that read PSUM)
     take turns."""
@@ -295,8 +325,11 @@ def _psum_reader(index):
 
 
 @nki.jit
-def kda_projections_prefill_kernel(x, wt, expand_t, gain=None, EPS=None):
+def kda_projections_prefill_kernel(x, wt, expand_t, gain=None, EPS=None, a_log=None,
+                                   gate_bias=None, LOWER=None):
     """``(q_in, k_in, v_in, raw_gate, raw_beta, out_gate)``, fp32, ``[T, *]`` (prefill shapes).
+
+    With the gate operands the fourth output is the KDA gate instead of ``raw_gate``.
 
     Args:
         x: ``[T, H]`` bf16 activations, ``T`` a multiple of ``128 * programs``.
@@ -309,6 +342,12 @@ def kda_projections_prefill_kernel(x, wt, expand_t, gain=None, EPS=None):
             activations never go to HBM.
         EPS: None, or the input RMSNorm epsilon, the checkpoint's ``rms_norm_eps``.
             Given with ``gain`` and only with it; read only with ``gain``.
+        a_log: None, or ``[1, heads]`` fp32, each head's decay exponent ``A_log``. Given
+            with ``gate_bias`` and ``LOWER``, and only with them. Then each gate tile is
+            gated on chip before it is stored (:func:`_gate_rows`), so ``raw_gate`` never
+            goes to HBM.
+        gate_bias: None, or ``[1, W]`` fp32, the per-key-channel gate bias (``dt_bias``).
+        LOWER: None, or the checkpoint's ``gate_lower_bound``, a compile-time scalar.
 
     Each program takes ``T / programs`` contiguous rows, in groups of up to 512 tokens
     (the bottlenecks' moving operand fills one fp32 PSUM bank). Per group: ``x^T`` by
@@ -338,6 +377,13 @@ def kda_projections_prefill_kernel(x, wt, expand_t, gain=None, EPS=None):
     kernel_assert(gain is None or (tuple(gain.shape) == (hidden,) and gain.dtype == nl.bfloat16),
                   "gain is [H] bf16")
     kernel_assert((gain is None) == (EPS is None), "EPS is given with gain, and only with it")
+    gated = a_log is not None
+    kernel_assert(gated == (gate_bias is not None) == (LOWER is not None),
+                  "a_log, gate_bias and LOWER are given together")
+    kernel_assert(not gated or (tuple(a_log.shape) == (1, heads) and a_log.dtype == nl.float32
+                                and tuple(gate_bias.shape) == (1, width)
+                                and gate_bias.dtype == nl.float32 and width % heads == 0),
+                  "a_log is [1, heads] fp32, gate_bias [1, W] fp32, W in heads blocks")
     rows = tokens // programs
     r0 = program * rows
     blocks = hidden // _P
@@ -367,6 +413,15 @@ def kda_projections_prefill_kernel(x, wt, expand_t, gain=None, EPS=None):
         # The norm gain on every partition: one stride-0 read of the [H] vector.
         gain_rows = nl.ndarray((_P, hidden), dtype=gain.dtype, buffer=nl.sbuf)
         nisa.dma_copy(dst=gain_rows, src=gain.ap(pattern=[[0, _P], [1, hidden]], offset=0))
+    if gated:
+        # The gate's per-channel bias and each head's decay rate on every partition, by
+        # stride-0 reads: the rows here are tokens, so both are the same on every row.
+        bias_rows = nl.ndarray((_P, width), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=bias_rows, src=gate_bias.ap(pattern=[[0, _P], [1, width]], offset=0))
+        a_rows = _tile(_P, heads)
+        nisa.dma_copy(dst=a_rows, src=a_log.ap(pattern=[[0, _P], [1, heads]], offset=0))
+        decay = _tile(_P, heads)
+        nisa.activation(dst=decay, data=a_rows, op=nl.exp)
 
     reads = 0
     for g0 in range(0, rows, _BANK):
@@ -436,7 +491,10 @@ def kda_projections_prefill_kernel(x, wt, expand_t, gain=None, EPS=None):
                                moving=expand[:, which * width:(which + 1) * width],
                                accumulate=False)
                 g_sb = nl.ndarray((_P, width), dtype=nl.float32, buffer=nl.sbuf)
-                nisa.tensor_copy(dst=g_sb, src=g_ps, engine=_psum_reader(reads))
+                if gated and which == 0:
+                    _gate_rows(g_sb, g_ps, bias_rows, decay, heads, LOWER)
+                else:
+                    nisa.tensor_copy(dst=g_sb, src=g_ps, engine=_psum_reader(reads))
                 reads += 1
                 nisa.dma_copy(dst=gate_outs[which].ap(pattern=[[width, _P], [1, width]],
                                                       offset=(t0 + i * _P) * width),
@@ -606,8 +664,23 @@ def input_rms_norm(hidden_states: Tensor, weight: Tensor, eps: float) -> Tensor:
     return normed.to(hidden_states.dtype)
 
 
+def _gate_operands(attn, heads: int, width: int) -> dict:
+    """The prefill kernel's gate operands from the module's ``A_log``, ``dt_bias`` and
+    ``gate_lower_bound``: ``[1, heads]`` and ``[1, W]`` fp32, and the bound."""
+    a_log, bias = attn.A_log, attn.dt_bias
+    if a_log.numel() != heads or bias.numel() != width:
+        raise ValueError(
+            f"the gate needs one A_log per head and one dt_bias per key channel: "
+            f"{heads} and {width}; got {a_log.numel()} and {bias.numel()}"
+        )
+    return {"a_log": a_log.to(torch.float32).reshape(1, heads).contiguous(),
+            "gate_bias": bias.to(torch.float32).reshape(1, width).contiguous(),
+            "LOWER": float(attn.gate_lower_bound)}
+
+
 def kda_projections(hidden_states: Tensor, attn, phase: str | None = None,
-                    norm: tuple[Tensor, float] | None = None) -> tuple[Tensor, ...]:
+                    norm: tuple[Tensor, float] | None = None,
+                    gate: bool = False) -> tuple[Tensor, ...]:
     """The six KDA input projections of ``hidden_states``, on a kernel or in torch.
 
     Args:
@@ -620,11 +693,16 @@ def kda_projections(hidden_states: Tensor, attn, phase: str | None = None,
             projections are of :func:`input_rms_norm` of ``hidden_states``: on the
             prefill kernel, which norms the rows on chip, when it serves the call and
             the gain is bf16; otherwise normed here first, then as without ``norm``.
+        gate: whether the fourth output is the KDA gate of ``raw_gate``, with the
+            module's ``A_log``, ``dt_bias`` and ``gate_lower_bound``
+            (:func:`~vllm_neuron.functional.kda.gate_clamp.kda_gate`). On the prefill
+            kernel it is applied on chip; on every other route, by ``kda_gate``.
 
     Returns:
         ``(q_in, k_in, v_in, raw_gate, raw_beta, out_gate)``, each ``[T, rows]`` fp32,
-        ``rows`` the weight's output rows. When :func:`kda_projections_admits` says no,
-        these are the torch expressions (:func:`kda_projections_torch`).
+        ``rows`` the weight's output rows; with ``gate``, the gate in place of
+        ``raw_gate``. When :func:`kda_projections_admits` says no, these are the torch
+        expressions (:func:`kda_projections_torch`).
     """
     admitted = kda_projections_admits(hidden_states, attn, phase)
     prefill = admitted and int(hidden_states.shape[0]) > KDA_PROJECTIONS_MAX_TOKENS
@@ -633,18 +711,30 @@ def kda_projections(hidden_states: Tensor, attn, phase: str | None = None,
         hidden_states = input_rms_norm(hidden_states, *norm)
         norm = None
     if not admitted:
-        return kda_projections_torch(hidden_states, attn)
-    _count_nki_dispatch()
-    if prefill:
+        projected = kda_projections_torch(hidden_states, attn)
+    elif prefill:
+        _count_nki_dispatch()
         wt, expand_t = getattr(attn, PREFILL_OPERANDS_ATTR)
         fused_norm = {} if norm is None else {"gain": norm[0].contiguous(),
                                               "EPS": float(norm[1])}
+        fused_gate = {}
+        if gate:
+            width = int(expand_t.shape[1]) // 2
+            fused_gate = _gate_operands(attn, int(attn.b_proj_weight.shape[0]), width)
         return _PREFILL_KERNELS[launch_programs()](
-            x=hidden_states.contiguous(), wt=wt, expand_t=expand_t, **fused_norm)
-    q_w, k_w, v_w, b_w, f_a, f_b, g_a, g_b = (w.contiguous() for w in _weights(attn))
-    q_in, k_in, v_in, raw_gate, raw_beta, out_gate = _KERNELS[launch_programs()](
-        x=hidden_states.contiguous(), q_w=q_w, k_w=k_w, v_w=v_w, b_w=b_w,
-        f_a_w=f_a, f_b_w=f_b, g_a_w=g_a, g_b_w=g_b,
-        DMA_TRANSPOSE=envs.VLLM_NEURON_GLUE_KDA_DMA_TRANSPOSE,
-    )
-    return q_in, k_in, v_in, raw_gate, raw_beta, out_gate
+            x=hidden_states.contiguous(), wt=wt, expand_t=expand_t, **fused_norm,
+            **fused_gate)
+    else:
+        _count_nki_dispatch()
+        q_w, k_w, v_w, b_w, f_a, f_b, g_a, g_b = (w.contiguous() for w in _weights(attn))
+        projected = _KERNELS[launch_programs()](
+            x=hidden_states.contiguous(), q_w=q_w, k_w=k_w, v_w=v_w, b_w=b_w,
+            f_a_w=f_a, f_b_w=f_b, g_a_w=g_a, g_b_w=g_b,
+            DMA_TRANSPOSE=envs.VLLM_NEURON_GLUE_KDA_DMA_TRANSPOSE,
+        )
+    if not gate:
+        return projected
+    q_in, k_in, v_in, raw_gate, raw_beta, out_gate = projected
+    return (q_in, k_in, v_in,
+            kda_gate(raw_gate, attn.A_log, lower=attn.gate_lower_bound, bias=attn.dt_bias),
+            raw_beta, out_gate)
