@@ -64,12 +64,26 @@ def hand_side_cache_bytes(*, seqs: int, length: int) -> int:
     return kv.MLA_LAYERS * (seqs + SCRATCH_SLOTS) * per_slot
 
 
+def hand_dsa_pool_store_bytes(*, seqs: int, length: int, gate_line: bool) -> int:
+    """The DSA pool store: one ``[block_size // index_kpool, index_head_dim]`` bf16 page
+    per pool block per DSA layer, built with prefix caching on only, so none when
+    ``gate_line`` (``--no-enable-prefix-caching``)."""
+    if gate_line:
+        return 0
+    blocks = hand_need_bytes(seqs=seqs, length=length, gate_line=gate_line) // (
+        POOL_PAGE_BYTES * kv.MLA_LAYERS
+    )
+    page = (kv.BLOCK_SIZE_TOKENS // INDEX_KPOOL) * INDEX_HEAD_DIM * BF16_BYTES
+    return kv.MLA_LAYERS * blocks * page
+
+
 def hand_footprint_bytes(*, seqs: int, length: int, gate_line: bool) -> int:
-    """Pool + KDA banks + side caches: what the worker check now compares."""
+    """Pool + KDA banks + side caches + DSA pool store: what the worker check now compares."""
     return (
         hand_need_bytes(seqs=seqs, length=length, gate_line=gate_line)
         + kv.KDA_LAYERS * seqs * KDA_SLOT_BYTES
         + hand_side_cache_bytes(seqs=seqs, length=length)
+        + hand_dsa_pool_store_bytes(seqs=seqs, length=length, gate_line=gate_line)
     )
 
 
@@ -319,7 +333,8 @@ def test_the_0a08ff4_residency_admits_64_by_8k_with_the_side_caches(monkeypatch)
     "seqs,length,gate_line,before,after",
     [
         # bs=1 recipe: max_model_len 4096, prefix caching on (no --mamba-block-size).
-        (1, 4096, False, 234435072, 240297984),
+        # Its footprint includes the DSA pool store: 161 blocks x 11 layers x 8192 B.
+        (1, 4096, False, 234435072, 254806016),
         (64, 8192, True, 6423740416, 6801718016),
         (119, 4096, True, 6452559360, 6804334080),
     ],

@@ -7,8 +7,8 @@ group keeps the 128-token attention block, and vLLM's mamba "none" mode reserves
 ``cdiv(max_model_len, 128)`` of them per request in every one of the four KDA
 groups. The runner keeps the KDA state in a bank addressed by request slot, so
 those blocks hold no data, and it refuses a prefix-cache hit on a recurrent stack
-(``kv_spec_patch.recurrent_spec_block_size``). At 1 x 1M that is 56.38 GiB per rank
-for 12.38 GiB of real need.
+(``kv_spec_patch.recurrent_spec_block_size``). At 1 x 1M that is 59.82 GiB per rank
+(with the DSA pool store that prefix caching adds) for 12.38 GiB of real need.
 
 ``NeuronPlatform.check_and_update_config`` therefore sets, for this architecture:
 
@@ -23,8 +23,10 @@ Each default yields to its own flag. One log line always says what was applied a
 why. An explicit ``--enable-prefix-caching`` is then refused at startup, on every
 form: the runner has no restore of a request's KDA state and DSA side caches for a
 cached prefix.
-With that refusal set aside, the worker prices every KDA block and one log line
-names that footprint next to the one-block footprint.
+With that refusal set aside, the worker prices every KDA block and the DSA pool
+store (one ``[num_blocks, block_size // index_kpool, index_head_dim]`` buffer per
+sparse layer, ``runner.dsa_pool_store``), and one log line names that footprint next
+to the one-block footprint.
 """
 
 from __future__ import annotations
@@ -40,11 +42,12 @@ from vllm_neuron.vllm.platform import NeuronPlatform
 
 GIB = 1024**3
 ONE_M = 1024 * 1024
-#: The worker's footprint at 1 x 1M before and after the default.
-ONE_M_PC_ON_FOOTPRINT_GIB = 56.38
+#: The worker's footprint at 1 x 1M before and after the default. With prefix caching
+#: on it includes the DSA pool store: 8,192 B per block per sparse layer.
+ONE_M_PC_ON_FOOTPRINT_GIB = 59.82
 ONE_M_ONE_BLOCK_FOOTPRINT_GIB = 12.38
 #: The 1 x 1M point with prefix caching on in vLLM's "align" KDA cache mode.
-ONE_M_ALIGN_FOOTPRINT_GIB = 12.389
+ONE_M_ALIGN_FOOTPRINT_GIB = 13.078
 
 DEFAULTS_MARKER = "Glm5NextForConditionalGeneration KV cache defaults"
 PC_FLAG_ON = "--enable-prefix-caching"
@@ -341,7 +344,8 @@ def test_align_mode_prices_two_kda_blocks_and_the_draft_blocks_per_request(
     """vLLM's "align" mode keeps a request's running KDA block, the block before it and
     its draft blocks in each KDA group (``MambaSpec.max_memory_usage_bytes``), however
     long the sequence. At 1 x 1M that is the one-block footprint plus one block per KDA
-    group; the per-slot banks and the side caches do not change."""
+    group, plus the DSA pool store of the pool's blocks, which prefix caching adds; the
+    per-slot banks and the side caches do not change."""
     cfg, _ = _resolve_past_the_refusal(monkeypatch, [PC_FLAG_ON], max_model_len=ONE_M)
     worker = _in_cache_mode(_priced_worker(model_specs, cfg, seqs=1, length=ONE_M), "align",
                             draft_blocks=draft_blocks)
@@ -358,7 +362,12 @@ def test_align_mode_prices_two_kda_blocks_and_the_draft_blocks_per_request(
         one_block_bytes = one_block._kv_cache_footprint_bytes(
             one_block._kv_cache_need_bytes(log=False))
         footprint = worker._kv_cache_footprint_bytes(need)
-        assert footprint == one_block_bytes + kda_groups * kv.MLA_LAYERS * page
+        _, text = model_specs
+        num_blocks = need // (kv.MLA_LAYERS * page)
+        store_bytes_per_block = (kv.BLOCK_SIZE_TOKENS // text.index_kpool) * text.index_head_dim * 2
+        store = kv.MLA_LAYERS * num_blocks * store_bytes_per_block
+        assert store_bytes_per_block == 8192
+        assert footprint == one_block_bytes + kda_groups * kv.MLA_LAYERS * page + store
         assert round(footprint / GIB, 3) == ONE_M_ALIGN_FOOTPRINT_GIB
 
 
