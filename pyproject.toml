@@ -54,6 +54,7 @@ markers = [
     "fast: cheap and device-free; safe to run on every change",
     "forked: must run in its own process (import-time state does not reset)",
     "quarantined: vendored from upstream ahead of the code it exercises; skipped",
+    "slow: runs for more than 15 minutes on the CPU simulator; deselect with -m 'not slow'",
 ]
 
 [tool.coverage.run]
