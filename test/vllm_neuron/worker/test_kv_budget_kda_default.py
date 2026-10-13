@@ -10,17 +10,20 @@ those blocks hold no data, and it refuses a prefix-cache hit on a recurrent stac
 (``kv_spec_patch.recurrent_spec_block_size``). At 1 x 1M that is 56.38 GiB per rank
 for 12.38 GiB of real need.
 
-``NeuronPlatform.check_and_update_config`` therefore sets, for this architecture on
-the hybrid KV cache:
+``NeuronPlatform.check_and_update_config`` therefore sets, for this architecture:
 
 * ``enable_prefix_caching=False`` unless ``--enable-prefix-caching`` or
-  ``--no-enable-prefix-caching`` is on the command line;
-* ``mamba_block_size=max_model_len`` (upstream's own default for a hybrid model
-  with prefix caching off) unless a mamba block size is set, or prefix caching is
-  on, where vLLM's hybrid coordinator needs the 128-token block.
+  ``--no-enable-prefix-caching`` is on the command line, on every form;
+* on the hybrid KV cache, ``mamba_block_size=max_model_len`` (upstream's own
+  default for a hybrid model with prefix caching off) unless a mamba block size is
+  set, or prefix caching is on, where vLLM's hybrid coordinator needs the 128-token
+  block.
 
 Each default yields to its own flag. One log line always says what was applied and
-why. With prefix caching on, the worker prices every KDA block and one log line
+why. An explicit ``--enable-prefix-caching`` is then refused at startup, on every
+form: the runner has no restore of a request's KDA state and DSA side caches for a
+cached prefix.
+With that refusal set aside, the worker prices every KDA block and one log line
 names that footprint next to the one-block footprint.
 """
 
@@ -84,6 +87,22 @@ def _resolve(monkeypatch, argv: list[str], *, max_model_len: int = 8192, **build
     return cfg, hybrid._marker_records(handler, DEFAULTS_MARKER)
 
 
+def _resolve_past_the_refusal(monkeypatch, argv: list[str], **kwargs):
+    """``_resolve`` with the startup refusal of prefix caching set aside.
+
+    The platform refuses an explicit ``--enable-prefix-caching`` for this model
+    (``NeuronPlatform._refuse_glm5next_prefix_caching``). The worker still prices the
+    configuration the default leaves under that flag, so these tests reach it this way.
+    """
+    monkeypatch.setattr(
+        NeuronPlatform,
+        "_refuse_glm5next_prefix_caching",
+        classmethod(lambda cls, vllm_config: None),
+        raising=False,
+    )
+    return _resolve(monkeypatch, argv, **kwargs)
+
+
 # ---------------------------------------------------------------------------
 # The platform default
 # ---------------------------------------------------------------------------
@@ -104,12 +123,39 @@ def test_without_either_flag_prefix_caching_is_off_and_a_kda_block_spans_the_seq
     assert "no --mamba-block-size given" in line
 
 
+@pytest.mark.parametrize(
+    "build",
+    [{}, {"tp": hybrid.UNSUPPORTED_TP_DEGREE}],
+    ids=["hybrid-kv-cache", "no-hybrid-kv-cache"],
+)
 @pytest.mark.parametrize("spelling", [PC_FLAG_ON, "--enable_prefix_caching"])
-def test_an_explicit_prefix_caching_on_keeps_the_128_token_kda_block(
-    monkeypatch, spelling
+def test_an_explicit_prefix_caching_on_is_refused_at_startup(
+    monkeypatch, spelling, build
 ) -> None:
-    """The operator's prefix caching stands; the mamba block is not set under it."""
-    cfg, records = _resolve(monkeypatch, [spelling])
+    """The refusal comes from the platform's config hook, before an engine or a device exists.
+
+    The runner refuses a prefix-cache hit on every form of this architecture, with or
+    without the hybrid KV cache, so the refusal covers both. It names the flag, the
+    state that has no restore, and the way to serve.
+    """
+    with pytest.raises(ValueError) as refused:
+        _resolve(monkeypatch, [spelling], **build)
+
+    message = str(refused.value)
+    assert "--enable-prefix-caching" in message
+    assert "KDA recurrent state" in message
+    assert "DSA indexer side caches" in message
+    assert "--no-enable-prefix-caching" in message
+
+
+def test_the_refusal_follows_the_default_that_keeps_the_128_token_kda_block(
+    monkeypatch,
+) -> None:
+    """With the refusal set aside, the default still keeps an explicit flag and the attention block.
+
+    The worker prices that configuration (below), so the default's own outcome stays pinned.
+    """
+    cfg, records = _resolve_past_the_refusal(monkeypatch, [PC_FLAG_ON])
 
     assert cfg.cache_config.enable_prefix_caching is True
     assert cfg.cache_config.mamba_block_size is None
@@ -167,16 +213,31 @@ def test_the_bs64_line_resolves_byte_identically(monkeypatch) -> None:
     assert "mamba_block_size=8192 as given" in records[0]
 
 
-def test_the_default_needs_the_architecture_and_the_hybrid_cache(monkeypatch) -> None:
-    """Other architectures, and GLM at a degree without the hybrid cache, keep vLLM's."""
+def test_other_architectures_keep_vllms_defaults(monkeypatch) -> None:
+    """Even on the hybrid KV cache, another architecture keeps vLLM's settings."""
     other = hybrid._other_archs()[0]
-    for build in ({"arch": other, "neuron_config": {"enable_hybrid_kv_cache": True}},
-                  {"tp": hybrid.UNSUPPORTED_TP_DEGREE}):
-        cfg, records = _resolve(monkeypatch, [], **build)
+    cfg, records = _resolve(
+        monkeypatch, [], arch=other, neuron_config={"enable_hybrid_kv_cache": True}
+    )
 
-        assert cfg.cache_config.enable_prefix_caching is True, build
-        assert cfg.cache_config.mamba_block_size is None, build
-        assert records == [], build
+    assert cfg.cache_config.enable_prefix_caching is True
+    assert cfg.cache_config.mamba_block_size is None
+    assert records == []
+
+
+def test_without_the_hybrid_cache_prefix_caching_is_still_defaulted_off(monkeypatch) -> None:
+    """GLM at a degree without the hybrid KV cache: prefix caching off, mamba block kept.
+
+    The runner refuses a prefix-cache hit there too, so the prefix-caching default holds.
+    The one-block mamba default is the hybrid KV cache's, so it is not applied.
+    """
+    cfg, records = _resolve(monkeypatch, [], tp=hybrid.UNSUPPORTED_TP_DEGREE)
+
+    assert cfg.cache_config.enable_prefix_caching is False
+    assert cfg.cache_config.mamba_block_size is None
+    assert len(records) == 1
+    assert "prefix caching defaulted off" in records[0]
+    assert "mamba_block_size left unset (the hybrid KV cache is off)" in records[0]
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +304,7 @@ def test_one_sequence_at_1m_needs_its_attention_pages_plus_one_kda_state_per_lay
 
 def test_prefix_caching_on_prices_every_kda_block(model_specs, monkeypatch) -> None:
     """Explicit prefix caching at 1 x 1M: each KDA group reserves cdiv(L, 128) blocks."""
-    cfg, _ = _resolve(monkeypatch, [PC_FLAG_ON], max_model_len=ONE_M)
+    cfg, _ = _resolve_past_the_refusal(monkeypatch, [PC_FLAG_ON], max_model_len=ONE_M)
     worker = _priced_worker(model_specs, cfg, seqs=1, length=ONE_M)
     page = kv.BLOCK_SIZE_TOKENS * kv.LATENT_BYTES_PER_TOKEN
     kda_groups = math.ceil(kv.KDA_LAYERS / kv.MLA_LAYERS)
@@ -262,7 +323,7 @@ def test_prefix_caching_on_names_both_footprints_in_one_line(
     default_cfg, _ = _resolve(monkeypatch, [], max_model_len=ONE_M)
     one_block = _priced_worker(model_specs, default_cfg, seqs=1, length=ONE_M)
     one_block_bytes = one_block._kv_cache_footprint_bytes(one_block._kv_cache_need_bytes(log=False))
-    cfg, _ = _resolve(monkeypatch, [PC_FLAG_ON], max_model_len=ONE_M)
+    cfg, _ = _resolve_past_the_refusal(monkeypatch, [PC_FLAG_ON], max_model_len=ONE_M)
     worker = _priced_worker(model_specs, cfg, seqs=1, length=ONE_M)
     pc_on_bytes = worker._kv_cache_footprint_bytes(worker._kv_cache_need_bytes(log=False))
 

@@ -220,22 +220,23 @@ class NeuronPlatform(Platform):
         * ``enable_prefix_caching=False`` unless the command line gives
           ``--enable-prefix-caching`` or ``--no-enable-prefix-caching``;
         * ``mamba_block_size=max_model_len`` unless a mamba block size is set,
-          or prefix caching is on (vLLM's hybrid coordinator then needs the
-          attention block).
+          prefix caching is on (vLLM's hybrid coordinator then needs the
+          attention block), or the hybrid KV cache is off.
 
         Each default yields to its own flag. vLLM keeps no record of a given
         prefix-caching flag, so it is read from ``sys.argv`` as
         :meth:`apply_config_platform_defaults` reads ``--optimization-level``;
         an offline ``LLM(enable_prefix_caching=True)`` is not seen and is
-        defaulted off, which the log line says. Only this architecture on the
-        hybrid KV cache is changed. One log line always states the outcome.
+        defaulted off, which the log line says. Only this architecture is
+        changed: prefix caching on every form of it, because the runner refuses
+        a prefix-cache hit on every form, and the mamba block size only on the
+        hybrid KV cache. One log line always states the outcome.
         """
         architectures = getattr(vllm_config.model_config.hf_config, "architectures", None) or ()
-        neuron_config = vllm_config.additional_config.get("neuron_config", {})
-        if "Glm5NextForConditionalGeneration" not in architectures or not neuron_config.get(
-            "enable_hybrid_kv_cache", False
-        ):
+        if "Glm5NextForConditionalGeneration" not in architectures:
             return
+        neuron_config = vllm_config.additional_config.get("neuron_config", {})
+        hybrid = neuron_config.get("enable_hybrid_kv_cache", False)
 
         def given(flag: str) -> bool:
             spellings = {flag, flag.replace("-", "_").replace("__", "--", 1)}
@@ -257,6 +258,8 @@ class NeuronPlatform(Platform):
             )
         if cache_config.mamba_block_size is not None:
             recurrent = f"mamba_block_size={cache_config.mamba_block_size} as given"
+        elif not hybrid:
+            recurrent = "mamba_block_size left unset (the hybrid KV cache is off)"
         elif cache_config.enable_prefix_caching:
             recurrent = (
                 f"mamba_block_size left unset, so each KDA group keeps the "
@@ -276,6 +279,41 @@ class NeuronPlatform(Platform):
             "Glm5NextForConditionalGeneration KV cache defaults: %s; %s.",
             prefix,
             recurrent,
+        )
+
+    @classmethod
+    def _refuse_glm5next_prefix_caching(cls, vllm_config: "VllmConfig") -> None:
+        """Refuse prefix caching for GLM-5.3-Flash at startup.
+
+        The runner keeps each request's KDA recurrent state (the state banks) and its
+        DSA indexer side caches (pooled keys and ring) per request slot, not per KV
+        block, and nothing restores them for a cached prefix. A request that vLLM
+        admits with a cached prefix starts past position 0 on a slot that does not
+        hold that state, and the runner refuses the step
+        (``NeuronModelRunner._glm5next_position_arm``) while the engine is serving,
+        which stops the engine. Refusing the configuration here moves that failure
+        to startup, before any engine or device state exists.
+
+        The runner's refusal depends on the architecture alone: every form of it binds
+        the cache banks the runner checks, with or without the hybrid KV cache and at
+        any tensor parallel degree. So this check is on the architecture alone too.
+        :meth:`_default_glm5next_recurrent_blocks` runs first and leaves prefix
+        caching on only when ``--enable-prefix-caching`` was given, so this refuses
+        that flag.
+        """
+        architectures = getattr(vllm_config.model_config.hf_config, "architectures", None) or ()
+        if "Glm5NextForConditionalGeneration" not in architectures:
+            return
+        if not vllm_config.cache_config.enable_prefix_caching:
+            return
+        raise ValueError(
+            "--enable-prefix-caching is not supported for "
+            "Glm5NextForConditionalGeneration: the "
+            "runner keeps each request's KDA recurrent state and DSA indexer side "
+            "caches per request slot, not per KV block, and has no restore of that "
+            "state for a cached prefix, so a request admitted with a cached prefix "
+            "could not be served. Serve without --enable-prefix-caching, or with "
+            "--no-enable-prefix-caching."
         )
 
     @classmethod
@@ -657,7 +695,11 @@ class NeuronPlatform(Platform):
                 tp_size,
                 kv_cache_dtype,
             )
-            cls._default_glm5next_recurrent_blocks(vllm_config)
+
+        # GLM-5.3-Flash on every form, after the hybrid page above so the defaults
+        # read the block size the KV cache will use.
+        cls._default_glm5next_recurrent_blocks(vllm_config)
+        cls._refuse_glm5next_prefix_caching(vllm_config)
 
         # Component DP on dense models needs the MoE/DP engine path to
         # preserve data_parallel_size across engine core subprocesses.

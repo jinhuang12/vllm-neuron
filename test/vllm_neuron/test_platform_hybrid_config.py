@@ -477,10 +477,15 @@ def test_bfloat16_guard_is_reached_on_the_default_path() -> None:
 
 
 def test_unsupported_tp_degree_leaves_the_cache_config_unchanged() -> None:
-    """With no knob set at TP != 64, nothing raises and nothing moves."""
+    """With no knob set at TP != 64, nothing raises and nothing moves but one default.
+
+    That default is prefix caching off, which holds for this architecture on every
+    form (``test_kv_budget_kda_default.py``).
+    """
     cfg = _build_config(tp=UNSUPPORTED_TP_DEGREE)
     assert cfg.additional_config == {}
     before = _cache_snapshot(cfg)
+    assert before.pop("enable_prefix_caching") == "True"
 
     raised = None
     with _isolated_platform_class_state(), _capture_platform_log() as handler:
@@ -491,7 +496,9 @@ def test_unsupported_tp_degree_leaves_the_cache_config_unchanged() -> None:
         engaged = _marker_records(handler, HYBRID_MARKER)
 
     assert raised is None, f"the non-engagement path raised: {raised}"
-    assert _cache_snapshot(cfg) == before
+    after = _cache_snapshot(cfg)
+    assert after.pop("enable_prefix_caching") == "False"
+    assert after == before
     assert cfg.cache_config.user_specified_block_size is False
     assert engaged == []
     # The hybrid write-back happens only on engagement, so nothing downstream can
