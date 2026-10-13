@@ -11,12 +11,17 @@ case, so most rows are padding. Gathering each token's ``K`` rows reads at most
 serial GpSimd accumulate.
 
 The kernel puts 128 tokens on the partitions and keeps an fp32 accumulator and a
-gather buffer per token tile and program's part of a hidden piece (a unit).
+gather buffer per token tile and program's part of a hidden piece (a unit). In a batch
+of ``n`` token tiles, partition ``p`` of tile ``b`` holds the batch's token ``p * n + b``, so
+each partition's index and weight entries for the whole batch are one contiguous piece:
+one load per table per batch, and tile ``b``'s slots are line group ``b`` of the table.
 Slot 0 gathers every token's row (an invalid slot names a finite row; the caller
 points it at row 0), and the scalar engine starts the accumulator as ``row * valid + 0``.
 The vector engine adds the later slots, in one device loop per batch of token tiles
 that ends after the last slot some token of the batch fills; each trip gathers one slot
-of every unit of the batch, so the batch's gathers are in flight together. A rank holds
+of every unit of the batch, so the batch's gathers are in flight together. A trip reads
+its slot's weight of every tile, and its row of every unit, as one strided copy per
+table at the loop register's offset. A rank holds
 a few of the experts, so a token fills few of its ``K`` slots, and ``combine_slots``
 fills them from slot 0, so the loop runs only the slots the batch's tokens fill. In a
 later slot, an invalid slot gets an index past the last row, so its gather moves no
@@ -86,50 +91,68 @@ def _register(src):
     return register
 
 
-def _tile_tables(sbm, index_hbm, valid_hbm, t0: int):
-    """Tokens ``t0 .. t0 + 127``'s ``(index, weights)``: whole ``[128, lines]`` int32 and
-    fp32 tensors from ``sbm`` whose first ``K`` columns hold the slots, so a device loop reads
-    a column by offset."""
+def _slot_groups(table, tiles: int, slots: int, width: int | None = None,
+                 partitions: int | None = None):
+    """``table`` (``[P, tiles * lines]``) as ``[partitions, tiles, width]``: per tile, the first
+    ``width`` (default ``K``) columns of its line group, on the first ``partitions`` (default all)."""
+    if width is None:
+        width = slots
+    if partitions is None:
+        partitions = table.shape[0]
+    return table.ap(pattern=[[table.shape[1], partitions], [_lines(slots), tiles], [1, width]],
+                    offset=0)
+
+
+def _batch_tables(sbm, index_hbm, valid_hbm, t0: int, tiles: int):
+    """The ``(index, weights)`` of the batch's tokens ``t0 .. t0 + 128 * tiles - 1``: whole
+    ``[128, tiles * lines]`` int32 and fp32 tensors from ``sbm``, one load each.
+
+    Partition ``p`` holds tokens ``t0 + p * tiles + b``, tile ``b``'s, whose ``K`` slots fill the
+    first columns of line group ``b``; a device loop reads one slot of every tile by one offset.
+    """
     slots = index_hbm.shape[1]
     lines = _lines(slots)
-    index = sbm.alloc_stack((TOKEN_TILE, lines), dtype=nl.int32)
-    nisa.dma_copy(dst=index[:, 0:slots],
-                  src=index_hbm.ap(pattern=[[slots, TOKEN_TILE], [1, slots]], offset=t0 * slots),
-                  dge_mode=_HWDGE, engine=_QUEUE)
-    weights = sbm.alloc_stack((TOKEN_TILE, lines), dtype=nl.float32)
-    nisa.dma_copy(dst=weights[:, 0:slots],
-                  src=valid_hbm.ap(pattern=[[slots, TOKEN_TILE], [1, slots]], offset=t0 * slots),
-                  dge_mode=_HWDGE, engine=_QUEUE)
+    index = sbm.alloc_stack((TOKEN_TILE, tiles * lines), dtype=nl.int32)
+    _load_groups(index, index_hbm, t0, tiles)
+    weights = sbm.alloc_stack((TOKEN_TILE, tiles * lines), dtype=nl.float32)
+    _load_groups(weights, valid_hbm, t0, tiles)
     return index, weights
 
 
-def _unit_rows(sbm, index, weights, slots: int, piece: int, pieces: int, banked_rows: int):
-    """A tile's rows of banked piece ``piece`` (of ``pieces`` per row): a whole ``[128, lines]``
-    int32 tensor from ``sbm``.
+def _load_groups(table, hbm, t0: int, tiles: int):
+    """Load ``hbm`` rows ``t0 + p * tiles + b`` (``[T, K]``) into line group ``b`` of ``table``'s
+    partition ``p``: one contiguous piece per partition."""
+    slots = hbm.shape[1]
+    nisa.dma_copy(dst=_slot_groups(table, tiles, slots),
+                  src=hbm.ap(pattern=[[tiles * slots, TOKEN_TILE], [slots, tiles], [1, slots]],
+                             offset=t0 * slots),
+                  dge_mode=_HWDGE, engine=_QUEUE)
 
-    Column ``j`` holds ``index * pieces + piece`` for slot 0, for a valid slot, and on
-    partition 0 (the tile's first token, so a gather moves at least one row); an invalid
+
+def _unit_rows(sbm, index, weights, tiles: int, slots: int, piece: int, pieces: int,
+               banked_rows: int):
+    """The batch's rows of banked piece ``piece`` (of ``pieces`` per row): a whole
+    ``[128, tiles * lines]`` int32 tensor from ``sbm``, tile ``b``'s in line group ``b``.
+
+    Column ``j`` of a group holds ``index * pieces + piece`` for slot 0, for a valid slot, and
+    on partition 0 (the tile's first token, so a gather moves at least one row); an invalid
     later slot of any other token is past the last row.
     """
-    lines = index.shape[1]
+    lines = index.shape[1] // tiles
     # past = (1 - valid) * banked_rows + piece, then slot 0 and partition 0 keep their rows.
-    past = sbm.alloc_stack((TOKEN_TILE, lines), dtype=nl.int32)
-    nisa.tensor_scalar(dst=past[:, 0:slots], data=weights[:, 0:slots], op0=nl.multiply,
+    past = sbm.alloc_stack((TOKEN_TILE, tiles * lines), dtype=nl.int32)
+    nisa.tensor_scalar(dst=_slot_groups(past, tiles, slots),
+                       data=_slot_groups(weights, tiles, slots), op0=nl.multiply,
                        operand0=-float(banked_rows), op1=nl.add,
                        operand1=float(banked_rows + piece))
-    nisa.memset(dst=past[:, 0:1], value=piece)
-    nisa.memset(dst=past[0:1, 0:slots], value=piece)
-    rows = sbm.alloc_stack((TOKEN_TILE, lines), dtype=nl.int32)
-    nisa.scalar_tensor_tensor(dst=rows[:, 0:slots], data=index[:, 0:slots], op0=nl.multiply,
-                              operand0=float(pieces), op1=nl.add, operand1=past[:, 0:slots])
+    nisa.memset(dst=_slot_groups(past, tiles, slots, width=1), value=piece)
+    nisa.memset(dst=_slot_groups(past, tiles, slots, partitions=1), value=piece)
+    rows = sbm.alloc_stack((TOKEN_TILE, tiles * lines), dtype=nl.int32)
+    nisa.scalar_tensor_tensor(dst=_slot_groups(rows, tiles, slots),
+                              data=_slot_groups(index, tiles, slots), op0=nl.multiply,
+                              operand0=float(pieces), op1=nl.add,
+                              operand1=_slot_groups(past, tiles, slots))
     return rows
-
-
-def _slot_groups(table, tiles: int, slots: int):
-    """``table`` (``[1, tiles * lines]`` on partition 0) as ``[1, tiles, K]``: per tile, the
-    first ``K`` columns of its line group."""
-    return table.ap(pattern=[[table.shape[1], 1], [_lines(slots), tiles], [1, slots]],
-                    offset=0)
 
 
 def _batch_end(sbm, counts, scores, tiles: int, slots: int):
@@ -154,13 +177,15 @@ def _batch_end(sbm, counts, scores, tiles: int, slots: int):
     return end
 
 
-def _column(dst, table, slot):
-    """Copy column ``slot`` (a register) of the whole ``[128, n]`` SBUF ``table`` to ``dst``.
+def _columns(dst, table, tiles: int, slot):
+    """Copy column ``slot`` (a register) of each of the ``tiles`` line groups of the whole
+    ``[128, tiles * lines]`` SBUF ``table`` to ``dst`` (``[128, tiles]``): one strided copy.
 
     The scalar engine copies: a dynamic SBUF read runs on the vector or scalar engine,
     and the vector engine carries the adds.
     """
-    nisa.tensor_copy(dst=dst, src=table.ap(pattern=[[table.shape[1], TOKEN_TILE], [1, 1]],
+    lines = table.shape[1] // tiles
+    nisa.tensor_copy(dst=dst, src=table.ap(pattern=[[table.shape[1], TOKEN_TILE], [lines, tiles]],
                                            offset=0, scalar_offset=slot, indirect_dim=1),
                      engine=nisa.engine.scalar)
 
@@ -221,50 +246,57 @@ def token_gather_combine_kernel(contribution_hbm, index_hbm, valid_hbm):
             picked = sbm.alloc_stack((TOKEN_TILE, tile_h), dtype=nl.float32)
             acc = sbm.alloc_stack((TOKEN_TILE, tile_h), dtype=nl.float32)
             buffers.append((picked, acc))
-        work = []
+        t0 = first * TOKEN_TILE
+        tables = _batch_tables(sbm, index_hbm, valid_hbm, t0, count)
+        index = tables[0]
+        weights = tables[1]
+        # Per part of the program's hidden share, the batch's rows of its banked piece.
+        rows = []
+        for part in range(share):
+            rows.append(_unit_rows(sbm, index, weights, count, slots, part * n_prgs + prg_id,
+                                   pieces, banked_rows))
         for b in range(count):
-            tb = first + b
-            tables = _tile_tables(sbm, index_hbm, valid_hbm, tb * TOKEN_TILE)
-            index = tables[0]
-            weights = tables[1]
             # Each slot's token count: a product with a ones column, exact for 0/1.
             nisa.nc_matmul(dst=counts[:, b * lines:b * lines + slots], stationary=ones[:, 0:1],
-                           moving=weights[:, 0:slots], is_stationary_onezero=True,
-                           is_moving_onezero=True, accumulate=False)
-            units = []
+                           moving=weights[:, b * lines:b * lines + slots],
+                           is_stationary_onezero=True, is_moving_onezero=True, accumulate=False)
             for part in range(share):
-                piece = part * n_prgs + prg_id
-                rows = _unit_rows(sbm, index, weights, slots, piece, pieces, banked_rows)
                 picked = buffers[b * share + part][0]
                 acc = buffers[b * share + part][1]
-                _gather(picked, banked, rows[:, 0:1], False)
+                _gather(picked, banked, rows[part][:, b * lines:b * lines + 1], False)
                 # The scalar engine starts the accumulator, so the vector engine carries only
                 # the later slots; + 0 turns an empty slot's -0 (a negative row weighed zero)
                 # into +0, as torch.
-                nisa.activation(dst=acc, op=nl.copy, data=picked, scale=weights[:, 0:1],
-                                bias=zero[:, 0:1])
-                units.append((tb * TOKEN_TILE * hidden + piece * tile_h, rows, picked, acc))
-            work.append((weights, units))
+                nisa.activation(dst=acc, op=nl.copy, data=picked,
+                                scale=weights[:, b * lines:b * lines + 1], bias=zero[:, 0:1])
         end = _batch_end(sbm, counts, scores, count, slots)
+        # A trip's slot columns: every tile's weight, every unit's row.
+        weight_cols = sbm.alloc_stack((TOKEN_TILE, _lines(count)), dtype=nl.float32)
+        row_cols = []
+        for _ in range(share):
+            row_cols.append(sbm.alloc_stack((TOKEN_TILE, _lines(count)), dtype=nl.int32))
 
         def add_slot(slot):
             """Slot ``slot`` (a register) of every unit of the batch."""
-            for tile in work:
-                weight = sbm.alloc_stack((TOKEN_TILE, _LINE), dtype=nl.float32)[:, 0:1]
-                _column(weight, tile[0], slot)
-                for unit in tile[1]:
-                    row = sbm.alloc_stack((TOKEN_TILE, _LINE), dtype=nl.int32)[:, 0:1]
-                    _column(row, unit[1], slot)
-                    _gather(unit[2], banked, row, True)
-                    nisa.scalar_tensor_tensor(dst=unit[3], data=unit[2], op0=nl.multiply,
-                                              operand0=weight, op1=nl.add, operand1=unit[3])
+            _columns(weight_cols[:, 0:count], weights, count, slot)
+            for part in range(share):
+                _columns(row_cols[part][:, 0:count], rows[part], count, slot)
+            for b in range(count):
+                for part in range(share):
+                    unit = buffers[b * share + part]
+                    _gather(unit[0], banked, row_cols[part][:, b:b + 1], True)
+                    nisa.scalar_tensor_tensor(dst=unit[1], data=unit[0], op0=nl.multiply,
+                                              operand0=weight_cols[:, b:b + 1], op1=nl.add,
+                                              operand1=unit[1])
 
         nl.fori_loop(1, _register(end[:, 0:1]), add_slot)
-        for tile in work:
-            for unit in tile[1]:
-                nisa.dma_copy(dst=out_hbm.ap(pattern=[[hidden, TOKEN_TILE], [1, tile_h]],
-                                             offset=unit[0]), src=unit[3], dge_mode=_HWDGE,
-                              engine=_QUEUE)
+        for b in range(count):
+            for part in range(share):
+                # Tile b's partition p is token t0 + p * count + b.
+                nisa.dma_copy(dst=out_hbm.ap(pattern=[[count * hidden, TOKEN_TILE], [1, tile_h]],
+                                             offset=(t0 + b) * hidden
+                                             + (part * n_prgs + prg_id) * tile_h),
+                              src=buffers[b * share + part][1], dge_mode=_HWDGE, engine=_QUEUE)
         sbm.close_scope()
     sbm.close_scope()
     return out_hbm
