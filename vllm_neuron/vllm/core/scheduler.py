@@ -124,6 +124,17 @@ class NeuronScheduler(Scheduler):
             log_stats=log_stats,
         )
 
+        # GLM-5.3-Flash with prefix caching: hash a block only if it ends inside its
+        # request's prompt, so a hit covers prompt tokens only (prefix_cache_mask).
+        # Any other engine neither imports nor installs the mask.
+        if vllm_config.cache_config.enable_prefix_caching and (
+            "Glm5NextForConditionalGeneration"
+            in (vllm_config.model_config.architectures or ())
+        ):
+            from vllm_neuron.vllm.patches import prefix_cache_mask
+
+            prefix_cache_mask.install(self.kv_cache_manager)
+
         self.log_stats = log_stats
         self.max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         self.max_model_len = vllm_config.model_config.max_model_len
