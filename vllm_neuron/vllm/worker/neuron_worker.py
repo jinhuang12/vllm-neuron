@@ -2583,18 +2583,20 @@ class NeuronWorker(WorkerBase):
                         "Skipping decode graph extraction (kv_role=%s, prefill-only server)",
                         kv_cfg.kv_role if kv_cfg is not None else "kv_producer",
                     )
-                self._extract_graphs(
-                    skip_prefill=skip_prefill_warmup,
-                    skip_decode=skip_decode_warmup,
-                    skip_vision=skip_vision_warmup,
-                    native_compile_only=native_compile_only,
-                )
+                with self.model_runner.recording_graph_captures() as graph_keys:
+                    self._extract_graphs(
+                        skip_prefill=skip_prefill_warmup,
+                        skip_decode=skip_decode_warmup,
+                        skip_vision=skip_vision_warmup,
+                        native_compile_only=native_compile_only,
+                    )
                 logger.info("Barrier: waiting for all ranks to finish graph extraction")
                 tp_barrier()
                 if not native_compile_only:
-                    # graph.hlo -> XLA compilation. Native fork workers have
-                    # already persisted their StableHLO-derived NEFFs.
-                    self.model_runner.parallel_compile()
+                    # graph.hlo -> XLA compilation of this start's graphs only.
+                    # Native fork workers have already persisted their
+                    # StableHLO-derived NEFFs.
+                    self.model_runner.parallel_compile(graph_keys)
                 logger.info("Barrier: waiting for all ranks to finish compilation")
                 tp_barrier()
 

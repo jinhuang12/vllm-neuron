@@ -882,6 +882,71 @@ def _eagle_drafter_has_its_own_model(speculative_config) -> bool:
     )
 
 
+def _hlo_stamps(compile_dir: str, rank_dir: str) -> dict[str, tuple[int, int, int]]:
+    """Inode, size and mtime (ns) of each entry's ``<rank_dir>/graph.hlo``."""
+    stamps = {}
+    try:
+        entries = os.listdir(compile_dir)
+    except FileNotFoundError:
+        return stamps
+    for key in entries:
+        try:
+            stat = os.stat(os.path.join(compile_dir, key, rank_dir, "graph.hlo"))
+        except OSError:
+            continue
+        stamps[key] = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+    return stamps
+
+
+def _tp_union(keys: Iterable[str], tp_group) -> frozenset[str]:
+    """The keys of every rank of the TP group (each rank passes its own)."""
+    if tp_group.world_size <= 1:
+        return frozenset(keys)
+    gathered: list[Any] = [None] * tp_group.world_size
+    torch.distributed.all_gather_object(
+        gathered, sorted(keys), group=tp_group.cpu_group
+    )
+    return frozenset(key for rank_keys in gathered for key in rank_keys)
+
+
+@contextmanager
+def _compiling_only(keys: frozenset[str]):
+    """Limit ``libtorch_neuronx_lite``'s parallel compile to the entries ``keys`` names.
+
+    The library compiles every entry of the compile cache that holds an HLO of this
+    server and no NEFF, and then removes this server's rank directories from every
+    entry. A cache can hold such entries from an earlier start that stopped before
+    its compile finished: they are not this start's graphs. The library has no
+    argument to limit either step to a set of keys, so for the call both of its
+    per-entry steps (``_has_hlo`` and ``_cleanup_prefix_subdirs``) pass over the
+    entries outside ``keys``. Yields the list that the incomplete entries passed
+    over are added to.
+    """
+    from libtorch_neuronx_lite.compile import parallel_compile as library
+    from libtorch_neuronx_lite.compile.cache import _is_cache_complete
+
+    has_hlo, cleanup = library._has_hlo, library._cleanup_prefix_subdirs
+    passed_over: list[str] = []
+
+    def _has_hlo(hlo_dir, *args, **kwargs):
+        if os.path.basename(hlo_dir) in keys:
+            return has_hlo(hlo_dir, *args, **kwargs)
+        if has_hlo(hlo_dir, *args, **kwargs) and not _is_cache_complete(hlo_dir):
+            passed_over.append(os.path.basename(hlo_dir))
+        return False
+
+    def _cleanup_prefix_subdirs(workdir, *args, **kwargs):
+        if os.path.basename(workdir) in keys:
+            cleanup(workdir, *args, **kwargs)
+
+    library._has_hlo = _has_hlo
+    library._cleanup_prefix_subdirs = _cleanup_prefix_subdirs
+    try:
+        yield passed_over
+    finally:
+        library._has_hlo, library._cleanup_prefix_subdirs = has_hlo, cleanup
+
+
 # TODO: Inherit from LoRAModelRunnerMixin to support LoRA
 class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunnerMixin):
     """
@@ -8694,13 +8759,43 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 attn_metadata=draft_attn_metadata,
             )
 
-    def parallel_compile(self):
+    @contextmanager
+    def recording_graph_captures(self):
+        """Record the graphs that the enclosed graph extraction captures on this rank.
+
+        The capture backend writes each graph that misses the compile cache to
+        ``<compile dir>/<key>/<server prefix>.rank<TP rank>/graph.hlo`` (or
+        ``rank<TP rank>`` without a prefix), in this process or in a forked trace
+        child. When the block ends, the keys whose file of this rank is new or
+        rewritten are added to the yielded set.
+        """
+        from libtorch_neuronx_lite import envs as libtorch_envs
+        from libtorch_neuronx_lite.compile.platform import get_server_prefix
+        from vllm.distributed.parallel_state import get_tp_group
+
+        compile_dir = self.compile_options.get(
+            "compiler_workdir", libtorch_envs.get_neuron_compile_cache_dir()
+        )
+        prefix = get_server_prefix()
+        rank = get_tp_group().rank_in_group
+        rank_dir = f"{prefix}.rank{rank}" if prefix else f"rank{rank}"
+        before = _hlo_stamps(compile_dir, rank_dir)
+        keys: set[str] = set()
+        yield keys
+        after = _hlo_stamps(compile_dir, rank_dir)
+        keys.update(key for key, stamp in after.items() if before.get(key) != stamp)
+
+    def parallel_compile(self, graph_keys: Iterable[str]):
         """Deterministic parallel compile — requires a barrier before and after.
 
         Assumes all ranks in the TP group have finished graph extraction and
         been synchronized via a TP-scoped barrier, so the cache directory
         contains the complete set of HLOs for this model replica. Only
         TP-rank 0 performs compilation.
+
+        Only the graphs this start captured are compiled: ``graph_keys`` are this
+        rank's captures (``recording_graph_captures``), and those of all ranks of
+        the TP group are gathered first, so every rank calls this.
         """
         logger.info("Initiating parallel compile for captured graphs")
         from vllm.distributed.parallel_state import get_tp_group
@@ -8708,6 +8803,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         tp_group = get_tp_group()
         rank = tp_group.rank_in_group if tp_group.world_size >= 1 else None
         world_size = tp_group.world_size if tp_group.world_size >= 1 else None
+        keys = _tp_union(graph_keys, tp_group)
 
         from libtorch_neuronx_lite.compile.parallel_compile import (
             parallel_compile as neuron_parallel_compile,
@@ -8715,12 +8811,21 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         from libtorch_neuronx_lite import envs as libtorch_envs
 
-        neuron_parallel_compile(
-            options=self.compile_options,
-            rank=rank,
-            world_size=world_size,
-            remote_cache_dir=libtorch_envs.NEURON_LIBTORCH_REMOTE_CACHE,
-        )
+        with _compiling_only(keys) as passed_over:
+            neuron_parallel_compile(
+                options=self.compile_options,
+                rank=rank,
+                world_size=world_size,
+                remote_cache_dir=libtorch_envs.NEURON_LIBTORCH_REMOTE_CACHE,
+            )
+        if passed_over and rank == 0:
+            logger.warning(
+                "Parallel compile: %d incomplete compile cache entries were not "
+                "compiled, as no rank captured them in this start's graph "
+                "extraction (first: %s); they are left as they are",
+                len(passed_over),
+                sorted(passed_over)[0],
+            )
 
     # ------------------------------------------------------------------------
     # MODEL EXECUTION

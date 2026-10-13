@@ -6,7 +6,8 @@ cache. Graph extraction, the parallel compile and the warm-up steps are replaced
 fakes that act on a real cache directory the way the real steps do:
 
 * extraction looks each graph up in the cache, then writes its ``graph.hlo``;
-* the parallel compile completes every entry that has a ``graph.hlo`` only;
+* the runner's capture recorder yields the keys that extraction captured inside it;
+* the parallel compile completes each entry it is passed that has a ``graph.hlo`` only;
 * a warm-up step looks each of its graphs up and, on a miss, compiles it in place.
 
 Each case compares the recorded calls, with their arguments, with ``BASELINE``: the
@@ -25,6 +26,7 @@ import hashlib
 import json
 import os
 import types
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -100,6 +102,7 @@ class Steps:
         self.events: list[tuple] = []
         self.sums: list[int] = []
         self.lookups: list[tuple[str, bool]] = []
+        self.captured: list[str] = []
 
     def look_up(self, key: str):
         # Through the module attribute, as the compile backends call it.
@@ -114,10 +117,18 @@ class Steps:
         for key in keys:
             if self.look_up(key) is None:
                 self.cache.capture(key)
+                self.captured.append(key)
 
-    def parallel_compile(self) -> None:
+    @contextmanager
+    def recording_graph_captures(self):
+        start = len(self.captured)
+        keys: set[str] = set()
+        yield keys
+        keys.update(self.captured[start:])
+
+    def parallel_compile(self, graph_keys) -> None:
         self.events.append(("parallel_compile",))
-        for key in os.listdir(self.cache.dir):
+        for key in sorted(graph_keys):
             if (self.cache.entry(key) / "graph.hlo").exists() and not self.cache.is_complete(
                 key
             ):
@@ -210,6 +221,7 @@ def make_worker(steps: Steps, *, capture_backend=True, pooling=False, tensor_cap
             num_seqs_buckets=[1],
             decode_context_length_buckets=[2048],
         ),
+        recording_graph_captures=steps.recording_graph_captures,
         parallel_compile=steps.parallel_compile,
         enable_capture=lambda: steps.events.append(("enable_capture",)),
         maybe_register_ec_cache=lambda: steps.events.append(("register_ec_cache",)),

@@ -21,6 +21,7 @@ real calls here would change the pytest process.
 Run with ``VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1``.
 """
 
+import contextlib
 import gc
 import types
 
@@ -114,7 +115,8 @@ def _worker(record: list[str], *, model=None, enforce_eager: bool = False):
             num_batched_tokens_buckets=[1024],
             num_seqs_buckets=[1, 64],
         ),
-        parallel_compile=lambda: record.append("parallel_compile"),
+        recording_graph_captures=lambda: contextlib.nullcontext(set()),
+        parallel_compile=lambda graph_keys: record.append("parallel_compile"),
         maybe_register_ec_cache=lambda: record.append("register_ec_cache"),
     )
     worker.vllm_config = types.SimpleNamespace(
