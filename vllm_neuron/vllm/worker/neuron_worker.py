@@ -212,6 +212,47 @@ def _indexer_side_cache_bytes(vllm_config, model_runner, kv_cache_spec=None) -> 
     )
 
 
+def _kv_cache_config_at(vllm_config, model_runner, need_bytes: int):
+    """Return the KV cache config vLLM builds for the runner's specs from ``need_bytes``."""
+    from vllm.v1.core.kv_cache_utils import (
+        get_kv_cache_config_from_groups,
+        get_kv_cache_groups,
+    )
+
+    groups = get_kv_cache_groups(vllm_config, model_runner.get_kv_cache_spec())
+    return get_kv_cache_config_from_groups(vllm_config, groups, need_bytes)
+
+
+def _dsa_pool_store_bytes(
+    vllm_config, model_runner, need_bytes: int, kv_cache_config=None
+) -> int:
+    """Return the bytes of the DSA pool store the runner allocates at ``need_bytes``.
+
+    With prefix caching on, every sparse-attention layer has a buffer for its pooled keys
+    per KV block beside vLLM's KV cache tensors (``NeuronModelRunner.dsa_pool_store``),
+    sized by the config's block count. The bytes
+    are read off the shapes the runner allocates from,
+    :func:`~vllm_neuron.vllm.worker.neuron_model_runner.dsa_pool_store_shapes`, so the
+    price is the allocation. 0 with prefix caching off, or for a model with no indexer.
+    ``kv_cache_config``, when given, is vLLM's config at ``need_bytes``
+    (:func:`_kv_cache_config_at`), already built by the caller; with prefix caching
+    off none is built.
+    """
+    if not vllm_config.cache_config.enable_prefix_caching:
+        return 0
+    from .neuron_model_runner import dsa_pool_store_shapes
+
+    if kv_cache_config is None:
+        kv_cache_config = _kv_cache_config_at(vllm_config, model_runner, need_bytes)
+
+    shapes = dsa_pool_store_shapes(
+        kv_cache_config, getattr(model_runner.model, "text_config", None)
+    )
+    return sum(
+        math.prod(shape) * dtype.itemsize for shape, dtype in shapes.values()
+    )
+
+
 def pool_blocks_per_request(spec: KVCacheSpec, max_model_len: int, where: str) -> int:
     """Return the pool blocks a request holds at once in a KV cache group, at DCP 1.
 
@@ -1678,27 +1719,24 @@ class NeuronWorker(WorkerBase):
         )
         return count, None
 
-    def _kv_cache_allocation_sizes(self, need_bytes: int) -> list[int]:
+    def _kv_cache_allocation_sizes(
+        self, need_bytes: int, kv_cache_config=None
+    ) -> list[int]:
         """Byte sizes of the KV cache tensors the runner allocates at ``need_bytes``.
 
         vLLM shares one tensor across the same-index layer of every group and
         sizes its blocks from ``need_bytes``; the runner then gives each recurrent
         layer its own bank of one request slot per concurrent sequence
         (``max_num_seqs``), because a recurrent bank is addressed by request slot
-        rather than by block.
+        rather than by block. ``kv_cache_config``, when given, is vLLM's config at
+        ``need_bytes`` (:func:`_kv_cache_config_at`), already built by the caller.
         """
-        from vllm.v1.core.kv_cache_utils import (
-            get_kv_cache_config_from_groups,
-            get_kv_cache_groups,
-        )
-
         from .neuron_model_runner import kv_cache_allocations
 
-        kv_cache_spec = self.model_runner.get_kv_cache_spec()
-        groups = get_kv_cache_groups(self.vllm_config, kv_cache_spec)
-        kv_cache_config = get_kv_cache_config_from_groups(
-            self.vllm_config, groups, need_bytes
-        )
+        if kv_cache_config is None:
+            kv_cache_config = _kv_cache_config_at(
+                self.vllm_config, self.model_runner, need_bytes
+            )
         return [
             size
             for size, _owners in kv_cache_allocations(
@@ -1908,15 +1946,29 @@ class NeuronWorker(WorkerBase):
 
         The KV cache tensors (:meth:`_kv_cache_allocation_sizes`) plus the DSA
         indexer side caches every sparse-attention layer holds, which no KV cache
-        spec declares (:func:`_indexer_side_cache_bytes`). This total, not
-        ``need_bytes``, is what has to fit the device. No bank is grown beyond it:
-        a latent layer reads only the pages its block table names, so nothing
-        reads past the blocks the scheduler handed out.
+        spec declares (:func:`_indexer_side_cache_bytes`), plus, with prefix caching
+        on, the DSA pool store sized by the same config's blocks
+        (:func:`_dsa_pool_store_bytes`). This total, not ``need_bytes``, is what has
+        to fit the device: vLLM turns ``need_bytes`` into blocks, so the bytes
+        outside its KV cache tensors are counted here and not there. No bank is
+        grown beyond it: a latent layer reads only the pages its block table names,
+        so nothing reads past the blocks the scheduler handed out.
         """
         kv_cache_spec = self.model_runner.get_kv_cache_spec()
-        kv_tensor_bytes = sum(self._kv_cache_allocation_sizes(need_bytes))
-        return kv_tensor_bytes + _indexer_side_cache_bytes(
-            self.vllm_config, self.model_runner, kv_cache_spec
+        kv_cache_config = _kv_cache_config_at(
+            self.vllm_config, self.model_runner, need_bytes
+        )
+        kv_tensor_bytes = sum(
+            self._kv_cache_allocation_sizes(need_bytes, kv_cache_config)
+        )
+        return (
+            kv_tensor_bytes
+            + _indexer_side_cache_bytes(
+                self.vllm_config, self.model_runner, kv_cache_spec
+            )
+            + _dsa_pool_store_bytes(
+                self.vllm_config, self.model_runner, need_bytes, kv_cache_config
+            )
         )
 
     def _max_num_seqs_that_fit(self, budget_bytes: int) -> int:
@@ -2266,6 +2318,18 @@ class NeuronWorker(WorkerBase):
         side_cache_bytes = _indexer_side_cache_bytes(
             self.vllm_config, self.model_runner
         )
+        pool_store_bytes = _dsa_pool_store_bytes(
+            self.vllm_config, self.model_runner, need_bytes
+        )
+        # The pool store is named only where prefix caching builds it, so with prefix
+        # caching off the line and the refusal read as before the store existed.
+        side_cache_gib = side_cache_bytes / (1024**3)
+        pool_store_gib = pool_store_bytes / (1024**3)
+        outside_kv_tensors = f"DSA indexer side caches {side_cache_gib:.3f} GiB"
+        counted = f"the DSA indexer side caches {side_cache_gib:.3f} GiB"
+        if pool_store_bytes:
+            outside_kv_tensors += f", DSA pool store {pool_store_gib:.3f} GiB"
+            counted += f" and the DSA pool store {pool_store_gib:.3f} GiB"
         max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
         max_model_len = self.vllm_config.model_config.max_model_len
         admitted = footprint_bytes <= heuristic_bytes
@@ -2273,15 +2337,15 @@ class NeuronWorker(WorkerBase):
         log = logger.info if admitted else logger.error
         log(
             "KV cache budget in %s mode: %s; need=%.3f GiB for %d sequence(s) of "
-            "%d tokens, allocated=%.3f GiB (DSA indexer side caches %.3f GiB), "
-            "admitted=%s; the largest max_num_seqs that fits at %d tokens is %d",
+            "%d tokens, allocated=%.3f GiB (%s), admitted=%s; the largest "
+            "max_num_seqs that fits at %d tokens is %d",
             mode,
             budget.describe(),
             need_bytes / (1024**3),
             max_num_seqs,
             max_model_len,
             footprint_bytes / (1024**3),
-            side_cache_bytes / (1024**3),
+            outside_kv_tensors,
             "yes" if admitted else "no",
             max_model_len,
             seqs_that_fit,
@@ -2318,8 +2382,8 @@ class NeuronWorker(WorkerBase):
                 f"device in {mode} mode. {max_num_seqs} sequence(s) of "
                 f"{max_model_len} tokens need {need_bytes / (1024**3):.3f} GiB, "
                 f"allocated as {footprint_bytes / (1024**3):.3f} GiB once every "
-                f"recurrent layer holds its own state bank and the DSA indexer "
-                f"side caches {side_cache_bytes / (1024**3):.3f} GiB are counted; "
+                f"recurrent layer holds its own state bank and {counted} are "
+                f"counted; "
                 f"budget {heuristic_bytes / (1024**3):.3f} GiB, short by "
                 f"{(footprint_bytes - heuristic_bytes) / (1024**3):.3f} GiB. "
                 f"The budget is the least of: free "

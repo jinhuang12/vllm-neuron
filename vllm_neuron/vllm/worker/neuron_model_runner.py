@@ -483,6 +483,53 @@ def kda_checkpoint_page_views(
     return views
 
 
+def dsa_pool_store_shapes(
+    kv_cache_config: KVCacheConfig,
+    text_config: Any,
+) -> dict[str, tuple[tuple[int, int, int], torch.dtype]]:
+    """Return the shape and dtype of each sparse layer's DSA pool store, by layer name.
+
+    With prefix caching on, a sparse (DSA) layer gets a store, beside the request-slot
+    ``pool_cache``, for the pooled keys of each cached block: block ``b`` is for the pool
+    rows of tokens ``b * block_size .. (b + 1) * block_size - 1``,
+    ``block_size // index_kpool`` rows of ``index_head_dim``. It is indexed by the block
+    id of the layer's latent group, so it has ``kv_cache_config.num_blocks`` blocks, and
+    it is in the layer's latent cache dtype, the dtype of ``pool_cache``. No
+    ``KVCacheSpec`` declares it, so it is allocated beside vLLM's KV cache tensors, and
+    the worker prices it from these shapes.
+
+    A layer gets a store when its spec is not a ``MambaSpec``, the rule the side caches
+    follow (:func:`indexer_side_cache_bytes`). A model whose text config declares no
+    indexer (``index_kpool`` and ``index_head_dim``) has none: ``{}``. A block size that
+    ``index_kpool`` does not divide would split a pool row across two blocks, and is
+    refused by name.
+    """
+    index_kpool = getattr(text_config, "index_kpool", None)
+    index_head_dim = getattr(text_config, "index_head_dim", None)
+    if index_kpool is None or index_head_dim is None:
+        return {}
+    shapes: dict[str, tuple[tuple[int, int, int], torch.dtype]] = {}
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        if isinstance(spec, MambaSpec):
+            continue
+        if spec.block_size % int(index_kpool):
+            raise ValueError(
+                f"KV cache group of {group.layer_names} has block size {spec.block_size}, "
+                f"which index_kpool {index_kpool} does not divide: a DSA pool row of "
+                f"{index_kpool} tokens would span two blocks, so no block-indexed pool "
+                f"store can hold it"
+            )
+        shape = (
+            int(kv_cache_config.num_blocks),
+            spec.block_size // int(index_kpool),
+            int(index_head_dim),
+        )
+        for name in group.layer_names:
+            shapes[name] = (shape, spec.dtype)
+    return shapes
+
+
 def indexer_context_per_rank(vllm_config: Any) -> int:
     """Return the context one rank's DSA indexer covers: its pooled-key rows and decode candidates.
 
@@ -12382,6 +12429,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # above, so the allocation and ``kv_caches`` are the same with it off.
         self.kda_checkpoint_pages = (
             kda_checkpoint_page_views(kv_cache_config, kv_cache_raw_tensors)
+            if self.vllm_config.cache_config.enable_prefix_caching
+            else {}
+        )
+        # With prefix caching on, each sparse layer's pooled keys are kept per block as
+        # well, in a buffer of its own beside the KV cache tensors (the worker prices it
+        # from the same shapes).
+        self.dsa_pool_store = (
+            {
+                name: torch.zeros(shape, dtype=dtype, device=self.device)
+                for name, (shape, dtype) in dsa_pool_store_shapes(
+                    kv_cache_config, getattr(self.model, "text_config", None)
+                ).items()
+            }
             if self.vllm_config.cache_config.enable_prefix_caching
             else {}
         )

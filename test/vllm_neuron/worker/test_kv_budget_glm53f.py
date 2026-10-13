@@ -507,8 +507,13 @@ def test_the_default_line_prices_bs1_at_4k_exactly_as_5938748() -> None:
     # The footprint now also counts the DSA indexer side caches, which
     # 5938748 did not price.
     side = side_cache_bytes(_real_text_config(), max_num_seqs=1, max_model_len=4096)
-    assert footprint == need + KDA_LAYERS * 1 * slot + side
-    assert before - (footprint - side) == KDA_LAYERS * (161 * page - slot)
+    # With prefix caching on it also counts the DSA pool store: one
+    # [block_size // index_kpool, index_head_dim] bf16 page per block per sparse layer.
+    text = _real_text_config()
+    store = MLA_LAYERS * 161 * (BLOCK_SIZE_TOKENS // text.index_kpool) * text.index_head_dim * 2
+    assert store == 14_508_032
+    assert footprint == need + KDA_LAYERS * 1 * slot + side + store
+    assert before - (footprint - side - store) == KDA_LAYERS * (161 * page - slot)
 
 
 def test_the_opt_in_line_prices_one_block_per_kda_group_per_request() -> None:

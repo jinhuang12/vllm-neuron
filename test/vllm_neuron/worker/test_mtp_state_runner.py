@@ -460,6 +460,16 @@ def test_knob_off_the_worker_footprint_is_the_recorded_one(line, monkeypatch) ->
     scratch = SCRATCH_SLOTS * want["side_cache_bytes"] // LINES[line]["max_num_seqs"]
     want["side_cache_bytes"] += scratch
     want["footprint_bytes"] += scratch
+    # The record also predates the DSA pool store, which the footprint counts with
+    # prefix caching on.
+    from test.vllm_neuron.worker import test_kv_budget_glm53f as budget
+
+    layers, text_config = budget.glm53f_layer_specs()
+    latent = [layer for layer in layers if layer.latent_kv]
+    assert len(latent) == want["dsa_layers"]
+    want["footprint_bytes"] += _hand_pool_store_bytes(
+        line, want["need_bytes"], latent, text_config, want["layers_per_pool"]
+    )
     assert footprint(line) == want
 
 
@@ -651,7 +661,8 @@ def _hand_footprint(line: str, layers, text_config) -> dict:
     to ``RECURRENT_SLOT_ALIGN_BYTES``), and the side caches of every DSA layer
     (``pool_cache`` ``[S, L // index_kpool + 1, index_head_dim]``, ``tail`` and
     ``pad_tail`` ``[S, 2, index_kpool, index_head_dim]``, the latent dtype) at
-    ``S = max_num_seqs + SCRATCH_SLOTS`` slots.
+    ``S = max_num_seqs + SCRATCH_SLOTS`` slots, and with prefix caching on the DSA pool
+    store (:func:`_hand_pool_store_bytes`).
     """
     from vllm.utils.math_utils import cdiv
 
@@ -685,13 +696,32 @@ def _hand_footprint(line: str, layers, text_config) -> dict:
     pool, width = int(text_config.index_kpool), int(text_config.index_head_dim)
     side_slots = seqs + SCRATCH_SLOTS
     side_per_layer = side_slots * ((length // pool + 1) * width + 2 * (2 * pool * width)) * one.dtype.itemsize
+    store = _hand_pool_store_bytes(line, need, latent, text_config, size)
     return {
         "groups": latent_groups + recurrent_groups,
         "layers_per_pool": size,
         "need_bytes": need,
-        "footprint_bytes": need + len(recurrent) * seqs * slot_bytes + len(latent) * side_per_layer,
+        "footprint_bytes": (
+            need + len(recurrent) * seqs * slot_bytes + len(latent) * side_per_layer + store
+        ),
         "side_cache_bytes": len(latent) * side_per_layer,
     }
+
+
+def _hand_pool_store_bytes(line: str, need: int, latent, text_config, size: int) -> int:
+    """The DSA pool store by hand: none with prefix caching off.
+
+    With prefix caching on (vLLM's default, the bs1 line), every DSA layer keeps one
+    ``[BLOCK // index_kpool, index_head_dim]`` page per pool block, in the latent dtype.
+    The pool has ``need // (page * size)`` blocks.
+    """
+    if LINES[line]["enable_prefix_caching"] is False:
+        return 0
+    one = latent[0]
+    page = BLOCK * one.num_kv_heads * one.head_size * one.dtype.itemsize
+    blocks = need // (page * size)
+    rows = BLOCK // int(text_config.index_kpool)
+    return len(latent) * blocks * rows * int(text_config.index_head_dim) * one.dtype.itemsize
 
 
 @pytest.mark.parametrize("line", sorted(LINES))
