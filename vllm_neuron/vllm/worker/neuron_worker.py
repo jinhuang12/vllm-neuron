@@ -212,6 +212,29 @@ def _indexer_side_cache_bytes(vllm_config, model_runner, kv_cache_spec=None) -> 
     )
 
 
+def pool_blocks_per_request(spec: KVCacheSpec, max_model_len: int, where: str) -> int:
+    """Return the pool blocks a request holds at once in a KV cache group, at DCP 1.
+
+    One block per ``block_size`` tokens of the sequence plus the group's draft blocks
+    (:func:`~vllm_neuron.vllm.worker.kv_group_blocks.draft_blocks_per_request`), except
+    for a ``MambaSpec`` group in vLLM's ``"align"`` cache mode. Its manager keeps only the
+    running block, the block the previous step left the state in, and the draft blocks,
+    and frees the blocks before them (``MambaManager.allocate_new_blocks`` and
+    ``remove_skipped_blocks``). That is the ``2 + num_speculative_blocks`` pages
+    ``MambaSpec.max_memory_usage_bytes`` gives in that mode. The mode is read from the
+    spec, because that is what the manager reads.
+    """
+    from vllm.utils.math_utils import cdiv
+    from vllm.v1.kv_cache_interface import MambaSpec
+
+    from .kv_group_blocks import draft_blocks_per_request
+
+    draft_blocks = draft_blocks_per_request(spec, where)
+    if isinstance(spec, MambaSpec) and spec.mamba_cache_mode == "align":
+        return 2 + draft_blocks
+    return cdiv(max_model_len, spec.block_size) + draft_blocks
+
+
 def validate_cross_node_master_addr(
     nnodes: int,
     master_addr: str | None,
@@ -1773,9 +1796,10 @@ class NeuronWorker(WorkerBase):
         ``num_speculative_blocks`` draft blocks per request, the blocks vLLM's own
         group-based admission check (``_check_enough_kv_cache_memory``) counts; an
         attention group has none; a uniform-type group holds what its members hold
-        (:func:`~vllm_neuron.vllm.worker.kv_group_blocks.draft_blocks_per_request`). In the recurrent cache modes the
-        plugin serves (``mamba_cache_mode`` ``none``, the default, or ``all``) the
-        need is not below that check's figure for the real layers.
+        (:func:`~vllm_neuron.vllm.worker.kv_group_blocks.draft_blocks_per_request`). In every
+        recurrent cache mode (``mamba_cache_mode`` ``none``, the default, ``all`` or
+        ``align``, :func:`pool_blocks_per_request`) the need is not below that check's
+        figure for the real layers.
 
         Args:
             log: Log the need. Off where candidate points are priced
@@ -1796,8 +1820,6 @@ class NeuronWorker(WorkerBase):
             get_kv_cache_groups,
             get_uniform_page_size,
         )
-
-        from .kv_group_blocks import draft_blocks_per_request
 
         kv_cache_spec = self.model_runner.get_kv_cache_spec()
         if not kv_cache_spec:
@@ -1850,10 +1872,12 @@ class NeuronWorker(WorkerBase):
             # scheduler hands them out), counted as vLLM's admission check counts
             # them; :func:`~vllm_neuron.vllm.worker.kv_group_blocks.draft_blocks_per_request` prices them per spec class and
             # refuses a class it cannot price.
+            # A recurrent group in vLLM's "align" cache mode holds a fixed number of
+            # blocks instead (:func:`pool_blocks_per_request`).
             blocks_per_request = sum(
-                cdiv(max_model_len, group.kv_cache_spec.block_size)
-                + draft_blocks_per_request(
+                pool_blocks_per_request(
                     group.kv_cache_spec,
+                    max_model_len,
                     f"KV cache group {index} ({', '.join(group.layer_names)})",
                 )
                 for index, group in enumerate(groups)
@@ -1950,20 +1974,19 @@ class NeuronWorker(WorkerBase):
 
         With prefix caching on, a recurrent (KDA) group keeps the attention block,
         so a request reserves ``cdiv(max_model_len, block_size)`` blocks in each
-        group, and those blocks hold no data (the state lives in the per-slot
-        banks). One line names the footprint and the footprint with one block per
-        group (``--no-enable-prefix-caching``, ``--mamba-block-size
-        <max_model_len>``), priced by the same code with those two fields set for
-        the call and restored after it.
+        group, or 2 in vLLM's "align" cache mode (:func:`pool_blocks_per_request`,
+        draft blocks not counted here). One line names the footprint and the
+        footprint with one block per group (``--no-enable-prefix-caching``,
+        ``--mamba-block-size <max_model_len>``), priced by the same code with those
+        two fields set for the call and restored after it.
         """
-        from vllm.utils.math_utils import cdiv
         from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
         from vllm.v1.kv_cache_interface import MambaSpec
 
         max_model_len = self.vllm_config.model_config.max_model_len
         kv_cache_spec = self.model_runner.get_kv_cache_spec()
         short = [
-            group.kv_cache_spec.block_size
+            group.kv_cache_spec
             for group in get_kv_cache_groups(self.vllm_config, kv_cache_spec)
             if isinstance(group.kv_cache_spec, MambaSpec)
             and group.kv_cache_spec.block_size < max_model_len
@@ -1996,8 +2019,12 @@ class NeuronWorker(WorkerBase):
             "on" if cache_config.enable_prefix_caching else "off",
             cache_config.mamba_block_size,
             len(short),
-            min(short),
-            max(cdiv(max_model_len, size) for size in short),
+            min(spec.block_size for spec in short),
+            max(
+                pool_blocks_per_request(spec, max_model_len, "a recurrent group")
+                - int(spec.num_speculative_blocks)
+                for spec in short
+            ),
             footprint_bytes / (1024**3),
             self.vllm_config.scheduler_config.max_num_seqs,
             max_model_len,

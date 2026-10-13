@@ -157,7 +157,8 @@ def _call(layers: list[LayerSpec]) -> dict:
     fake_self = SimpleNamespace(
         vllm_config=SimpleNamespace(
             cache_config=SimpleNamespace(
-                block_size=HYBRID_BLOCK_SIZE, cache_dtype="auto"
+                block_size=HYBRID_BLOCK_SIZE, cache_dtype="auto",
+                mamba_cache_mode="none",
             ),
             model_config=SimpleNamespace(dtype=torch.bfloat16),
         ),
