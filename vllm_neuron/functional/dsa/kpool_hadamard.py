@@ -17,12 +17,19 @@ with ``H_128`` on the Tensor Engine, and both build that matrix on chip by runni
 butterfly (``_fwht128_inplace``) over ``I_128``; the decode kernels run the same
 butterfly on their pooled vectors directly, so every path applies one transform.
 
-Under LNC2 (``NEURON_LOGICAL_NC_CONFIG=2``, the serving setting) both kernels launch
-two programs, one per physical core, and each program serves a contiguous half of the
-rows or pools.
+The prefill indexer pools a sliding window at every position: position ``p``'s pool is
+the ``pool_size`` keys ending at ``p``, clamped at row 0 (``sliding_windows``). With
+``windows=True``, ``dsa_kpool_hadamard`` takes ``key[tokens, 128]`` and the gate's score
+as they are, and its kernel (``_kpool_hadamard_window_nki``) reads each window from them
+in place, into the same tiles the fused kernel loads from ``slot_k``. So it skips the
+gather that builds ``slot_k`` and computes the same bits.
 
-The kernel only ever sees complete pools; pool formation, the sliding window, slot
-mapping and the trailing partial pool belong to the indexer, and the fp8
+Under LNC2 (``NEURON_LOGICAL_NC_CONFIG=2``, the serving setting) every kernel here
+launches two programs, one per physical core, and each program serves a contiguous half
+of the rows or pools.
+
+The kernels only ever see complete pools; pool formation, slot mapping and the trailing
+partial pool belong to the indexer, and the fp8
 quantisation, its scale and the cache write belong to the adapter. ``n_pools`` and
 ``pool_size`` are python ints because they select the tile count and the number of
 unrolled slot loads, so a tensor would force a data-dependent trace; the compiled
@@ -42,6 +49,7 @@ import nki.isa as nisa
 import nki.language as nl
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+from nkilib.core.utils.kernel_assert import kernel_assert
 
 from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 from vllm_neuron.utils.neuron_utils import can_run_kernel
@@ -344,9 +352,85 @@ def _slot_fold(values, op, pool_size: int):
     return steps[:, pool_size - 2, :, :]
 
 
-def _pool_block(slot_k_hbm, slot_score_hbm, out_hbm, biases, transform, block, pool_size: int):
+def _load_slots(tile, hbm, block):
+    """One block's pools of a flattened ``[n_pools * pool_size, head_dim]`` buffer, into ``tile``.
+
+    ``tile`` is the block's ``[partitions, columns, pool_size, head_dim]`` tile; partition ``p``
+    gets the ``columns`` whole pools from ``row0 + p * columns``, one contiguous run.
+    """
+    nisa.dma_copy(dst=tile, src=_block_rows(hbm, block, (tile.shape[2], tile.shape[3])))
+
+
+def _window_head(block, pool_size: int) -> int:
+    """How many leading partitions of ``block`` hold pools whose windows clamp at row 0.
+
+    Pool ``p``'s window starts at row ``p - (pool_size - 1)``; below ``p = pool_size - 1``
+    that start is clamped to row 0 (``sliding_windows``), so the window is rows
+    ``0 .. pool_size - 1``. A partition holds ``columns`` consecutive pools, so these pools
+    fill the partitions whose first pool is below ``pool_size - 1``. ``_window_head_fits``
+    says whether every pool on those partitions has that same window.
+    """
+    row0, partitions, columns = block
+    short = pool_size - 1 - row0
+    if short <= 0:
+        return 0
+    return min(partitions, (short + columns - 1) // columns)
+
+
+def _window_head_fits(block, pool_size: int) -> bool:
+    """Whether every pool on ``block``'s head partitions has the window ``0 .. pool_size - 1``.
+
+    True when the head's last pool is at most ``pool_size - 1``: the clamped pools and pool
+    ``pool_size - 1`` read that window, and a later pool does not.
+    """
+    head = _window_head(block, pool_size)
+    return head == 0 or block[0] + head * block[2] <= pool_size
+
+
+def _load_windows(tile, hbm, block):
+    """One block's sliding windows of ``hbm[tokens, head_dim]``, read in place into ``tile``.
+
+    ``tile`` is the block's ``[partitions, columns, pool_size, head_dim]`` tile, the one
+    ``_load_slots`` fills from the gathered windows, and it gets the same values: slot ``s`` of
+    pool ``p`` is row ``max(p - (pool_size - 1), 0) + s``. An unclamped window is
+    ``pool_size`` consecutive rows ending at row ``p``, and pool ``p + 1``'s window starts one
+    row later, so one access pattern reads the block: pool and slot strides of one row (the
+    windows overlap), and a partition stride of ``columns`` rows. The head partitions
+    (``_window_head``) all read rows ``0 .. pool_size - 1``, by a second pattern with zero
+    partition and pool strides. Both patterns stay inside rows ``0 .. row0 + partitions *
+    columns - 1``.
+    """
+    row0, partitions, columns = block
+    pool_size, head_dim = tile.shape[2], tile.shape[3]
+    kernel_assert(
+        _window_head_fits(block, pool_size),
+        f"block {block}: a head partition holds a pool past {pool_size - 1}, whose window "
+        f"is not rows 0 .. {pool_size - 1}",
+    )
+    head = _window_head(block, pool_size)
+    if head > 0:
+        nisa.dma_copy(
+            dst=tile[0:head, :, :, :],
+            src=hbm.ap(pattern=[[0, head], [0, columns], [head_dim, pool_size], [1, head_dim]],
+                       offset=0),
+        )
+    if head < partitions:
+        first = row0 + head * columns
+        nisa.dma_copy(
+            dst=tile[head:partitions, :, :, :],
+            src=hbm.ap(
+                pattern=[[columns * head_dim, partitions - head], [head_dim, columns],
+                         [head_dim, pool_size], [1, head_dim]],
+                offset=(first - (pool_size - 1)) * head_dim,
+            ),
+        )
+
+
+def _pool_block(load, key_hbm, score_hbm, out_hbm, biases, transform, block, pool_size: int):
     """Pool, rotate, scale and store one block of ``_row_blocks`` over the pools.
 
+    ``load`` fills the block's key and score tiles from ``key_hbm`` and ``score_hbm``:
+    ``_load_slots`` from gathered pools, ``_load_windows`` from the keys in place.
     ``biases`` holds one ``(pmax, head_dim)`` fp32 tile of ``ape`` per slot and ``transform`` is
     the fp32 ``H_128`` of ``_transform_matrix``. Every Vector Engine step is one instruction
     over the whole block, so a block of ``columns`` pools per partition costs the instructions
@@ -358,13 +442,12 @@ def _pool_block(slot_k_hbm, slot_score_hbm, out_hbm, biases, transform, block, p
     """
     rows = block[1]
     columns = block[2]
-    head_dim = slot_k_hbm.shape[1]
+    head_dim = key_hbm.shape[1]
     shape = (rows, columns, pool_size, head_dim)
-    unit = (pool_size, head_dim)
-    score = nl.ndarray(shape, dtype=slot_score_hbm.dtype, buffer=nl.sbuf)
-    nisa.dma_copy(dst=score, src=_block_rows(slot_score_hbm, block, unit))
-    key = nl.ndarray(shape, dtype=slot_k_hbm.dtype, buffer=nl.sbuf)
-    nisa.dma_copy(dst=key, src=_block_rows(slot_k_hbm, block, unit))
+    score = nl.ndarray(shape, dtype=score_hbm.dtype, buffer=nl.sbuf)
+    load(score, score_hbm, block)
+    key = nl.ndarray(shape, dtype=key_hbm.dtype, buffer=nl.sbuf)
+    load(key, key_hbm, block)
 
     # Softmax over the slots, per (pool, channel), shifted by the max for stability.
     total = nl.ndarray(shape, dtype=nl.float32, buffer=nl.sbuf)
@@ -398,7 +481,7 @@ def _pool_block(slot_k_hbm, slot_score_hbm, out_hbm, biases, transform, block, p
     # because the Vector Engine is this kernel's busy one.
     group = _tile_groups([block], columns)[0]
     transposed = _transpose_group(pooled, block, group, nisa.scalar_engine)
-    result = nl.ndarray((rows, columns, head_dim), dtype=slot_k_hbm.dtype, buffer=nl.sbuf)
+    result = nl.ndarray((rows, columns, head_dim), dtype=key_hbm.dtype, buffer=nl.sbuf)
     _rotate_group(transposed, result, block, group, transform)
     nisa.dma_copy(dst=_block_rows(out_hbm, block, (head_dim,)), src=result)
 
@@ -497,6 +580,21 @@ def _rotate_group(transposed, rows_out, block, group, transform):
 # ---------------------------------------------------------------------------------------------
 
 
+def _kpool_hadamard_body(load, key_hbm, score_hbm, ape_hbm, n_pools, pool_size):
+    """The pooling kernels' shared body: ``load`` fills each block's key and score tiles."""
+    head_dim = key_hbm.shape[1]
+    out_hbm = nl.ndarray((n_pools, head_dim), dtype=key_hbm.dtype, buffer=nl.shared_hbm)
+    pmax = nl.tile_size.pmax
+    first, owned = _program_share(n_pools)
+    biases = []
+    for slot in range(pool_size):
+        biases.append(_broadcast_row(ape_hbm, pmax, head_dim, slot))
+    transform = _transform_matrix(head_dim, nl.float32)
+    for block in _row_blocks(first, owned, pmax, _POOL_TILE_COLUMNS):
+        _pool_block(load, key_hbm, score_hbm, out_hbm, biases, transform, block, pool_size)
+    return out_hbm
+
+
 @nki.jit
 def _kpool_hadamard_nki(slot_k_hbm, slot_score_hbm, ape_hbm, n_pools, pool_size):
     """Fused per-(pool, channel) softmax-weighted pooling and Hadamard-128 rotation.
@@ -524,17 +622,30 @@ def _kpool_hadamard_nki(slot_k_hbm, slot_score_hbm, ape_hbm, n_pools, pool_size)
     the Tensor Engine with the rotation kernel's ``H`` in fp32, so the two kernels apply one
     transform.
     """
-    head_dim = slot_k_hbm.shape[1]
-    out_hbm = nl.ndarray((n_pools, head_dim), dtype=slot_k_hbm.dtype, buffer=nl.shared_hbm)
-    pmax = nl.tile_size.pmax
-    first, owned = _program_share(n_pools)
-    biases = []
-    for slot in range(pool_size):
-        biases.append(_broadcast_row(ape_hbm, pmax, head_dim, slot))
-    transform = _transform_matrix(head_dim, nl.float32)
-    for block in _row_blocks(first, owned, pmax, _POOL_TILE_COLUMNS):
-        _pool_block(slot_k_hbm, slot_score_hbm, out_hbm, biases, transform, block, pool_size)
-    return out_hbm
+    return _kpool_hadamard_body(_load_slots, slot_k_hbm, slot_score_hbm, ape_hbm, n_pools,
+                                pool_size)
+
+
+@nki.jit
+def _kpool_hadamard_window_nki(key_hbm, score_hbm, ape_hbm, n_pools, pool_size):
+    """``_kpool_hadamard_nki`` over every position's sliding window, read in place.
+
+    Args:
+        key_hbm: ``[n_pools, head_dim]`` -- one key per position; pool ``p`` is the window of
+            ``pool_size`` rows ending at row ``p``, clamped at row 0. bf16 on the shipped path.
+        score_hbm: ``[n_pools, head_dim]`` -- the gate's per-token score, one row per position.
+        ape_hbm: ``[pool_size, head_dim]`` fp32 -- the per-slot additive bias.
+        n_pools: positions, one pool each. A compile-time constant, at least ``pool_size``.
+        pool_size: tokens per pool. A compile-time constant.
+
+    Returns:
+        ``[n_pools, head_dim]`` in ``key_hbm``'s dtype.
+
+    The fused kernel's programs, blocks and steps, with each block's key and score tiles read
+    from the windows in place (``_load_windows``) instead of from a gathered copy: the tiles
+    hold the same values, so the output is the same bits.
+    """
+    return _kpool_hadamard_body(_load_windows, key_hbm, score_hbm, ape_hbm, n_pools, pool_size)
 
 
 @nki.jit
@@ -612,7 +723,9 @@ def _record_nki_dispatch(entry: str, n_pools: int, pool_size: int, head_dim: int
     and an ``@nki.jit`` kernel is a frozen dataclass it cannot reconstruct. The entry
     point therefore arrives as a ``str`` and each kernel is read as a module global.
     """
-    kernel = _kpool_hadamard_nki if entry == "fused" else _hadamard128_nki
+    kernel = {"fused": _kpool_hadamard_nki, "window": _kpool_hadamard_window_nki}.get(
+        entry, _hadamard128_nki
+    )
     _COUNTERS.last_kernel = _kernel_identity_of(kernel)
     logger.info(
         "[dsa-kpool-hadamard] kernel=nki entry=%s n_pools=%d pool_size=%d head_dim=%d",
@@ -668,7 +781,7 @@ def _validate(slot_k: Tensor, slot_score: Tensor, ape: Tensor) -> tuple[int, int
 
 
 def can_run_dsa_kpool_hadamard(slot_k: Tensor, slot_score: Tensor, ape: Tensor) -> bool:
-    """Whether the fused NKI kernel serves this call. ``False`` sends it to the torch path."""
+    """Whether the fused NKI kernel serves a slot-form call. ``False`` sends it to the torch path."""
     if not can_run_kernel():
         return False
     if slot_k.dtype not in _SUPPORTED_DTYPES:
@@ -687,24 +800,121 @@ def can_run_dsa_hadamard128(x: Tensor) -> bool:
     return x.ndim == 2 and int(x.shape[1]) == INDEX_HEAD_DIM
 
 
-def dsa_kpool_hadamard(slot_k: Tensor, slot_score: Tensor, ape: Tensor) -> Tensor:
+def sliding_windows(tokens: int, pool_size: int, device=None) -> Tensor:
+    """``[tokens, pool_size]`` row indices: position ``p``'s pool, clamped at row 0.
+
+    Row ``p`` is ``max(p - (pool_size - 1), 0) + [0 .. pool_size - 1]``: the ``pool_size``
+    positions ending at ``p``, and for the first ``pool_size - 1`` positions the first
+    ``pool_size`` rows. ``key[sliding_windows(...)]`` is the ``slot_k`` of every position.
+    """
+    positions = torch.arange(tokens, device=device)
+    offsets = torch.arange(pool_size, device=device)
+    return (positions - (pool_size - 1)).clamp_min(0)[:, None] + offsets[None, :]
+
+
+def _validate_window(key: Tensor, gate_score: Tensor, ape: Tensor) -> tuple[int, int, int]:
+    """``_validate`` for the window entry. Returns ``(tokens, pool_size, head_dim)``."""
+    if key.ndim != 2:
+        raise KpoolHadamardError(
+            f"key must be 2-D [tokens, head_dim]; got shape {tuple(key.shape)}"
+        )
+    if tuple(gate_score.shape) != tuple(key.shape):
+        raise KpoolHadamardError(
+            f"gate_score must match key; got {tuple(gate_score.shape)} against "
+            f"{tuple(key.shape)}"
+        )
+    tokens, head_dim = int(key.shape[0]), int(key.shape[1])
+    if head_dim != INDEX_HEAD_DIM:
+        raise KpoolHadamardError(
+            f"the Hadamard path is a {INDEX_HEAD_DIM}-point transform; got head_dim {head_dim}"
+        )
+    if ape.ndim != 2 or int(ape.shape[1]) != head_dim or int(ape.shape[0]) <= 0:
+        raise KpoolHadamardError(
+            f"ape must be [pool_size, head_dim] with pool_size >= 1 and head_dim {head_dim}; "
+            f"got {tuple(ape.shape)}"
+        )
+    pool_size = int(ape.shape[0])
+    if tokens < pool_size:
+        raise KpoolHadamardError(f"no window of {pool_size} rows fits in {tokens} token(s)")
+    return tokens, pool_size, head_dim
+
+
+def _window_blocks_fit(tokens: int, pool_size: int, programs: int) -> bool:
+    """Whether every block the window kernel reads has a head ``_load_windows`` can read.
+
+    The blocks are the kernel's own: each program's share (``_program_share``) as
+    ``_row_blocks``, computed here from the same ints.
+    """
+    share = (tokens + programs - 1) // programs
+    for program in range(programs):
+        first = program * share
+        owned = min(share, tokens - first)
+        for block in _row_blocks(first, owned, nl.tile_size.pmax, _POOL_TILE_COLUMNS):
+            if not _window_head_fits(block, pool_size):
+                return False
+    return True
+
+
+def _can_run_window_kernel(key: Tensor, ape: Tensor) -> bool:
+    """Whether the window kernel serves a ``windows=True`` call. ``False`` gathers the windows
+    and takes the slot form's routes."""
+    if not can_run_kernel():
+        return False
+    if key.dtype not in _SUPPORTED_DTYPES:
+        return False
+    tokens, pool_size = int(key.shape[0]), int(ape.shape[0])
+    return _window_blocks_fit(tokens, pool_size, _programs(tokens))
+
+
+def dsa_kpool_hadamard(
+    slot_k: Tensor, slot_score: Tensor, ape: Tensor, *, windows: bool = False
+) -> Tensor:
     """Pool ``pool_size`` keys into one per pool and rotate the result.
 
     Args:
         slot_k: ``[n_pools, pool_size, head_dim]`` -- raw per-token indexer keys, one complete pool
             per row of the first axis. ``bfloat16`` takes the NKI route; any other dtype is served
-            by the torch path.
-        slot_score: ``[n_pools, pool_size, head_dim]`` -- the gate's per-token score.
+            by the torch path. With ``windows``, ``[tokens, head_dim]``: one key per position.
+        slot_score: the gate's per-token score, in ``slot_k``'s form.
         ape: ``[pool_size, head_dim]`` -- the per-slot additive position bias.
+        windows: pool every position's sliding window: pool ``p`` is the ``pool_size`` rows of
+            ``slot_k`` and ``slot_score`` ending at row ``p``, clamped at row 0
+            (``sliding_windows``). The result is the same bits as the slot form on the gathered
+            windows, ``slot_k[w]`` and ``slot_score[w]`` with ``w = sliding_windows(tokens,
+            pool_size)``: the NKI route reads each window in place into the tiles the slot form's
+            kernel loads (``_kpool_hadamard_window_nki``), and the other routes gather.
 
     Returns:
-        ``[n_pools, head_dim]`` in ``slot_k``'s dtype: the pooled, rotated key per pool. No fp8
-        output and no scale -- the adapter owns that half.
+        ``[n_pools, head_dim]`` (``[tokens, head_dim]`` with ``windows``) in ``slot_k``'s dtype: the
+        pooled, rotated key per pool. No fp8 output and no scale -- the adapter owns that half.
 
     Raises:
-        KpoolHadamardError: for a malformed call -- a non-3D ``slot_k``, a ``slot_score`` that does
-            not match it, an ``ape`` of the wrong shape, or a head dimension that is not 128.
+        KpoolHadamardError: for a malformed call -- a ``slot_k`` of the wrong rank, a ``slot_score``
+            that does not match it, an ``ape`` of the wrong shape, a head dimension that is not
+            128, or with ``windows`` fewer tokens than one pool.
     """
+    if windows:
+        return _pool_windows(slot_k, slot_score, ape)
+    return _pool_slots(slot_k, slot_score, ape)
+
+
+def _pool_windows(key: Tensor, gate_score: Tensor, ape: Tensor) -> Tensor:
+    """``dsa_kpool_hadamard(..., windows=True)``."""
+    tokens, pool_size, head_dim = _validate_window(key, gate_score, ape)
+
+    if not _can_run_window_kernel(key, ape):
+        windows = sliding_windows(tokens, pool_size, key.device)
+        return _pool_slots(key[windows], gate_score[windows], ape)
+
+    _count_nki_dispatch()
+    _record_nki_dispatch("window", tokens, pool_size, head_dim)
+    return wrap_nki(_kpool_hadamard_window_nki)[_programs(tokens)](
+        key.contiguous(), gate_score.contiguous(), ape.contiguous(), tokens, pool_size
+    )
+
+
+def _pool_slots(slot_k: Tensor, slot_score: Tensor, ape: Tensor) -> Tensor:
+    """``dsa_kpool_hadamard`` on complete pools."""
     n_pools, pool_size, head_dim = _validate(slot_k, slot_score, ape)
 
     if not can_run_dsa_kpool_hadamard(slot_k, slot_score, ape):
