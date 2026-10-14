@@ -27,7 +27,9 @@ from transformers import PretrainedConfig
 
 from vllm_neuron.model.glm5_next.collective_policy import (
     RowParallelSite,
+    gather_sequence,
     reduce_row_parallel,
+    scatter_row_parallel,
 )
 from vllm_neuron.model.glm5_next.config import (
     DSA_LAYER_TYPE,
@@ -288,6 +290,184 @@ def _tp_group_if_initialized() -> GroupCoordinator | None:
         if not model_parallel_is_initialized():
             return None
     return _resolve_tp_group()
+
+
+#: Attribute :meth:`Glm5NextModel.bind_prefill_sequence_shard` binds the
+#: :class:`PrefillSequenceShard` on at load: the stack, each of its layers, each layer's
+#: attention module and both of its mHC sites. None, or no attribute at all (the draft
+#: head's layer), means the route is off for that module.
+SEQUENCE_SHARD_ATTR = "_prefill_sequence_shard"
+
+#: Attribute the stack's tensor-parallel index is bound on under the route, a ``[1]``
+#: int32 device tensor. A tensor and not a python int because one prefill graph serves
+#: every rank (:data:`Glm5NextDSAIndexer.SHARD_RANK_ATTR` gives the same reason): an int
+#: would be folded into the graph as rank 0's rows.
+SEQUENCE_RANK_ATTR = "_prefill_sequence_rank"
+
+
+class Glm5NextSequenceShardError(ValueError):
+    """A prefill sequence-parallel configuration :class:`PrefillSequenceShard` refuses."""
+
+
+@dataclass(frozen=True)
+class PrefillSequenceShard:
+    """Which prefill chunks run their mHC site work split by rows over the ranks.
+
+    Under ``VLLM_NEURON_GLM5NEXT_PREFILL_SP`` a prefill chunk of ``T`` rows is cut after
+    the embedding into ``world`` blocks of ``R = T / world`` rows, rank ``r`` holding rows
+    ``r * R .. r * R + R - 1``. Every mHC site then runs its pre-mix, Sinkhorn and combine
+    on its rank's ``R`` rows, where today every rank runs the same ``T``. The sub-block
+    between them still needs all ``T`` rows: the site all-gathers what the sub-block reads
+    (``collective_policy.gather_sequence``), and the sub-block's row-parallel partial is
+    reduce-scattered (``collective_policy.scatter_row_parallel``) instead of all-reduced,
+    which hands each rank the sum of its own rows. The stack gathers its final ``[R, H]``
+    rows back to ``[T, H]`` before the root reads them. Decode and verify steps are not
+    split.
+
+    Every decision is by row count, as the mHC sites already tell the step's phase
+    (``functional.glue.phase_of_rows``): a call over a whole chunk of one of
+    :attr:`chunk_rows` is split, and a call over one of :attr:`rank_rows` is one rank's
+    share of such a chunk. :meth:`of_server` refuses a server where either count could
+    also be a decode batch's or the verify step's, so the two never name another step.
+
+    Attributes:
+        world: the tensor-parallel world size the rows divide over.
+        chunk_rows: the prefill buckets the route splits, each a multiple of ``world``.
+    """
+
+    world: int
+    chunk_rows: frozenset[int]
+
+    @property
+    def rank_rows(self) -> frozenset[int]:
+        """The per-rank row count of each bucket, ``T / world``."""
+        return frozenset(rows // self.world for rows in self.chunk_rows)
+
+    def shards(self, rows: int) -> bool:
+        """True for a call over a whole prefill chunk the route splits."""
+        return int(rows) in self.chunk_rows
+
+    def holds(self, rows: int) -> bool:
+        """True for a call over one rank's rows of such a chunk."""
+        return int(rows) in self.rank_rows
+
+    @classmethod
+    def of_server(
+        cls, neuron_config: NeuronConfig | None, group: GroupCoordinator | None
+    ) -> PrefillSequenceShard | None:
+        """The plan for the server ``neuron_config`` describes, or None when it is off.
+
+        None when ``VLLM_NEURON_GLM5NEXT_PREFILL_SP`` is off or the world is one rank.
+        Called at load, after the parallel state exists, with the tensor-parallel group
+        the row-parallel sites reduce over.
+
+        Raises:
+            Glm5NextSequenceShardError: with the switch on, when the world is larger
+                than one rank but no tensor-parallel group exists; when the runner's
+                prefill buckets or decode buckets are absent; when a bucket is not a
+                multiple of the world; when a bucket or a per-rank row count is also a
+                decode batch's or the verify step's row count, or a per-rank count is
+                also a bucket; or when the glue switch does not fuse ``mhc_pre`` and
+                ``mhc_post`` at a per-rank count, which would leave the split sites on
+                the unmeasured torch route.
+        """
+        from vllm_neuron import envs
+
+        if not envs.VLLM_NEURON_GLM5NEXT_PREFILL_SP:
+            return None
+        if group is None:
+            if _resolve_world_size() > 1:
+                raise Glm5NextSequenceShardError(
+                    "VLLM_NEURON_GLM5NEXT_PREFILL_SP splits a prefill chunk over the "
+                    "tensor-parallel group, and none is initialized at this load"
+                )
+            return None
+        world = int(group.world_size)
+        if world == 1:
+            return None
+        buckets = tuple(
+            getattr(neuron_config, "num_batched_tokens_buckets", None) or ()
+        )
+        decode_buckets = tuple(getattr(neuron_config, "num_seqs_buckets", None) or ())
+        if not buckets or not decode_buckets:
+            raise Glm5NextSequenceShardError(
+                f"VLLM_NEURON_GLM5NEXT_PREFILL_SP needs the runner's prefill and decode "
+                f"buckets to tell a split chunk from a decode batch; got "
+                f"num_batched_tokens_buckets={buckets or None}, "
+                f"num_seqs_buckets={decode_buckets or None}"
+            )
+        uneven = sorted(int(rows) for rows in buckets if int(rows) % world)
+        if uneven:
+            raise Glm5NextSequenceShardError(
+                f"VLLM_NEURON_GLM5NEXT_PREFILL_SP gives each of {world} ranks the same "
+                f"rows of a chunk, and the prefill buckets {uneven} are not multiples of "
+                f"{world}"
+            )
+        shard = cls(world=world, chunk_rows=frozenset(int(rows) for rows in buckets))
+
+        from vllm_neuron.functional.glue import (
+            glue_selected,
+            phase_of_rows,
+            verify_draft_k,
+            verify_rows,
+        )
+
+        from .mtp import shadow_draft_k
+
+        max_decode_rows = max(int(rows) for rows in decode_buckets)
+        verify = verify_rows(decode_buckets, verify_draft_k(shadow_draft_k()))
+        other_step = sorted(
+            rows
+            for rows in shard.chunk_rows | shard.rank_rows
+            if phase_of_rows(rows, max_decode_rows, verify) != "prefill"
+        )
+        both = sorted(shard.chunk_rows & shard.rank_rows)
+        if other_step or both:
+            raise Glm5NextSequenceShardError(
+                f"VLLM_NEURON_GLM5NEXT_PREFILL_SP tells a split chunk ({sorted(shard.chunk_rows)} "
+                f"rows) and one rank's share of it ({sorted(shard.rank_rows)} rows) by row "
+                f"count; {other_step or both} rows also name "
+                f"{'a decode batch or the verify step' if other_step else 'a whole chunk'} "
+                f"(largest decode batch {max_decode_rows}, verify rows {sorted(verify)})"
+            )
+        unfused = sorted(
+            rows
+            for rows in shard.rank_rows
+            if not (
+                glue_selected("mhc_pre", rows, "prefill")
+                and glue_selected("mhc_post", rows, "prefill")
+            )
+        )
+        if unfused:
+            rules = ",".join(
+                f"{kernel}:prefill@{rows}"
+                for rows in unfused
+                for kernel in ("mhc_pre", "mhc_post")
+            )
+            raise Glm5NextSequenceShardError(
+                f"VLLM_NEURON_GLM5NEXT_PREFILL_SP runs the mHC sites at {unfused} rows per "
+                f"rank, where VLLM_NEURON_GLUE_FUSED does not fuse mhc_pre and mhc_post; add "
+                f"{rules} to its value"
+            )
+        return shard
+
+
+def _row_parallel_sum(
+    partial: torch.Tensor, *, site: RowParallelSite, module: nn.Module
+) -> torch.Tensor:
+    """This rank's share of a row-parallel ``partial``'s sum over the ranks.
+
+    ``reduce_row_parallel``'s whole sum, or, for a whole prefill chunk under the
+    :class:`PrefillSequenceShard` bound on ``module``, ``scatter_row_parallel``'s
+    reduce-scatter: the sum of this rank's own rows, which is all the rank's mHC site
+    combines. The one call every row-parallel site makes, so the choice lives here and
+    not at each site.
+    """
+    shard = getattr(module, SEQUENCE_SHARD_ATTR, None)
+    group = _resolve_tp_group()
+    if shard is not None and shard.shards(int(partial.shape[0])):
+        return scatter_row_parallel(partial, site=site, group=group)
+    return reduce_row_parallel(partial, site=site, group=group)
 
 
 def _resolve_dcp_size() -> int | None:
@@ -1059,7 +1239,15 @@ class Glm5NextHyperConnection(nn.Module):
         )
 
     def _glue_phase(self, tokens: int) -> str | None:
-        """The glue switch's phase for a call of ``tokens`` rows (``max_decode_rows``)."""
+        """The glue switch's phase for a call of ``tokens`` rows (``max_decode_rows``).
+
+        One rank's rows of a split prefill chunk (:class:`PrefillSequenceShard`) are
+        ``prefill`` by name: :meth:`PrefillSequenceShard.of_server` refused every server
+        where a decode batch or the verify step has that row count.
+        """
+        shard = getattr(self, SEQUENCE_SHARD_ATTR, None)
+        if shard is not None and shard.holds(tokens):
+            return "prefill"
         if self.max_decode_rows is None:
             return None
         from vllm_neuron.functional.glue import phase_of_rows
@@ -1274,6 +1462,7 @@ class Glm5NextHyperConnection(nn.Module):
         sublayer: object,
         norm: tuple[torch.Tensor | None, float] | None = None,
         router_scale: bool = False,
+        reads_layer_input: bool = True,
     ) -> torch.Tensor:
         """One mHC layer call: pre, then the sub-block, then post.
 
@@ -1289,6 +1478,13 @@ class Glm5NextHyperConnection(nn.Module):
             router_scale: with ``norm``, call ``sublayer(layer_input, normed,
                 scaled=scaled)``, ``scaled`` from :meth:`mhc_pre_normed` (None when
                 the router must scale its input itself).
+            reads_layer_input: whether the sub-block reads ``layer_input``'s values
+                when it is handed ``normed`` too. Read only on one rank's rows of a
+                split prefill chunk (:class:`PrefillSequenceShard`), where the site
+                all-gathers what the sub-block reads and nothing else: ``layer_input``
+                when there is no ``normed`` or this is True, and ``normed`` and
+                ``scaled`` when they exist. The sub-block then runs on the whole chunk
+                and returns this rank's rows, from its reduce-scatter.
 
         Returns:
             ``[T, S, H]`` in the streams' own dtype -- the re-mixed streams,
@@ -1306,22 +1502,62 @@ class Glm5NextHyperConnection(nn.Module):
         gain, eps = (None, None) if norm is None else norm
         post_mix, comb_mix, layer_input, normed, *scaled = self.mhc_pre_normed(
             residual, gain, eps, router_scale)
+        extents = (int(residual.shape[0]), int(residual.shape[2]))
+        shard = getattr(self, SEQUENCE_SHARD_ATTR, None)
+        if shard is not None and shard.holds(extents[0]):
+            layer_input, normed, scaled = self._gather_sub_block_inputs(
+                layer_input, normed, scaled, reads_layer_input
+            )
         if norm is None:
             x = sublayer(layer_input)
         elif router_scale:
             x = sublayer(layer_input, normed, scaled=scaled[0])
         else:
             x = sublayer(layer_input, normed)
-        if not isinstance(x, torch.Tensor) or tuple(x.shape) != tuple(
-            layer_input.shape
-        ):
+        if not isinstance(x, torch.Tensor) or tuple(x.shape) != extents:
             got = tuple(x.shape) if isinstance(x, torch.Tensor) else type(x).__name__
             raise Glm5NextHyperConnectionError(
-                f"sublayer returned {got}, expected the [T, H] shape it was "
-                f"given, {tuple(layer_input.shape)} -- the combine reads x and "
-                f"the streams on the same token and hidden extents"
+                f"sublayer returned {got}, expected the streams' [T, H], {extents} -- "
+                f"the combine reads x and the streams on the same token and hidden "
+                f"extents"
             )
         return self.mhc_post(x, residual, post_mix, comb_mix)
+
+    @staticmethod
+    def _gather_sub_block_inputs(
+        layer_input: torch.Tensor,
+        normed: torch.Tensor | None,
+        scaled: list[torch.Tensor | None],
+        reads_layer_input: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor | None]]:
+        """The whole chunk's rows of what the sub-block reads, in one all-gather.
+
+        ``layer_input`` when there is no ``normed`` (the sub-block normalises it) or
+        ``reads_layer_input`` holds, then ``normed`` and ``scaled`` where they exist. A
+        tensor the sub-block does not read keeps this rank's rows: the sub-block reads
+        no more than its dtype. One call, so the site pays one collective's fixed cost
+        whatever it gathers (``collective_policy.gather_sequence``).
+        """
+        named = (
+            [("layer_input", layer_input)]
+            if normed is None or reads_layer_input
+            else []
+        )
+        named += [("normed", normed)] if normed is not None else []
+        named += [("scaled", scaled[0])] if scaled and scaled[0] is not None else []
+        gathered = dict(
+            zip(
+                (name for name, _ in named),
+                gather_sequence(
+                    [tensor for _, tensor in named], group=_resolve_tp_group()
+                ),
+            )
+        )
+        return (
+            gathered.get("layer_input", layer_input),
+            gathered.get("normed", normed),
+            [gathered["scaled"]] if "scaled" in gathered else scaled,
+        )
 
     # ── layout helpers ────────────────────────────────────────────────────
     def _require_streams(self, residual: torch.Tensor) -> tuple[int, int, int]:
@@ -4414,8 +4650,8 @@ class Glm5NextKDAAttention(nn.Module):
         # in; ``VLLM_NEURON_TP_ALLREDUCE_DTYPE=bf16`` rounds each rank's partial to
         # bfloat16 first, to halve the bytes. In place is safe -- ``attn_out`` is a
         # fresh matmul result, not a view of a cached weight or of the residual.
-        attn_out = reduce_row_parallel(
-            attn_out, site=RowParallelSite.KDA_O_PROJ, group=_resolve_tp_group()
+        attn_out = _row_parallel_sum(
+            attn_out, site=RowParallelSite.KDA_O_PROJ, module=self
         )
         return attn_out.to(hidden_states.dtype)
 
@@ -7699,8 +7935,8 @@ class Glm5NextMLAAttention(nn.Module):
         # Sum this rank's partial with every other rank's, in the wire dtype
         # ``collective_policy`` names (fp32 as built). ``None`` means one rank, where
         # the partial already is the whole sum.
-        projected = reduce_row_parallel(
-            projected, site=RowParallelSite.MLA_O_PROJ, group=_resolve_tp_group()
+        projected = _row_parallel_sum(
+            projected, site=RowParallelSite.MLA_O_PROJ, module=self
         )
         whole = projected.to(attn_out.dtype)
         if collector is not None:
@@ -9212,6 +9448,8 @@ class Glm5NextDSALayer(nn.Module):
             streams,
             attention_half,
             norm=(self.input_layernorm_weight, float(self.rms_norm_eps)),
+            # The attention reads ``normed`` only; ``single_stream`` goes to the tap.
+            reads_layer_input=False,
         )
 
 
@@ -9351,6 +9589,39 @@ class Glm5NextModel(nn.Module):
                 for layer_idx, layer_type in enumerate(layer_types)
             ]
         )
+
+    def bind_prefill_sequence_shard(
+        self, neuron_config: NeuronConfig | None, device: torch.device
+    ) -> PrefillSequenceShard | None:
+        """Bind the server's :class:`PrefillSequenceShard`, or None, and return it.
+
+        Bound on this stack, each of its layers, each layer's attention module and both
+        of its mHC sites: the modules whose calls the route changes. The draft head's
+        layer is not this stack's and gets nothing, so it runs as it does today. Under
+        the route the stack also binds its tensor-parallel index, ``rank_in_group`` of
+        the group the sites gather and reduce-scatter over, as a ``[1]`` int32 tensor on
+        ``device`` (:data:`SEQUENCE_RANK_ATTR`), so the rows the stack cuts are the
+        rows that group's order gathers back. Called once at load, after the mHC bind,
+        by the root's ``_run_load_time_preps``.
+        """
+        group = _tp_group_if_initialized()
+        shard = PrefillSequenceShard.of_server(neuron_config, group)
+        modules: list[nn.Module] = [self]
+        for layer in self.layers:
+            modules += [
+                layer,
+                layer.attention,
+                *getattr(layer, MHC_SITES_ATTR, {}).values(),
+            ]
+        for module in modules:
+            setattr(module, SEQUENCE_SHARD_ATTR, shard)
+        rank = None
+        if shard is not None:
+            rank = torch.full(
+                (1,), int(group.rank_in_group), dtype=torch.int32, device=device
+            )
+        setattr(self, SEQUENCE_RANK_ATTR, rank)
+        return shard
 
     def _rms_norm(self, hidden_states: torch.Tensor, gain: torch.Tensor) -> torch.Tensor:
         """``x / sqrt(mean(x**2) + eps) * gain``, computed in fp32 and cast back.
@@ -9513,9 +9784,7 @@ class Glm5NextModel(nn.Module):
         # The wire dtype is ``collective_policy``'s: fp32 as built (the ordering
         # above holds), or bfloat16 under ``VLLM_NEURON_TP_ALLREDUCE_DTYPE=bf16``,
         # which rounds each rank's partial before the sum to halve the bytes.
-        out = reduce_row_parallel(
-            out, site=RowParallelSite.FFN, group=_resolve_tp_group()
-        )
+        out = _row_parallel_sum(out, site=RowParallelSite.FFN, module=layer)
         mixed = out.to(hidden_states.dtype)
         if collector is not None:
             collector.append(mixed)
@@ -9643,10 +9912,30 @@ class Glm5NextModel(nn.Module):
                 "cannot place an image row"
             )
         if vision_embedding_blocks is not None:
-            # rank 0: every rank embeds the whole chunk, since the text prefill is
-            # not sequence-parallel, so the chunk's rows are this rank's rows.
+            # rank 0: every rank embeds and merges the whole chunk, so the chunk's rows
+            # are this rank's rows; the sequence cut below comes after the merge.
             embedded = merge_vision_embeddings(
                 embedded, vision_embedding_blocks, vision_positions, rank=0
+            )
+        # Under the prefill sequence shard (:class:`PrefillSequenceShard`) each rank keeps
+        # its own rows of a split chunk from here to the final norm, and the mHC sites
+        # gather and scatter around each sub-block. The cut takes a device rank, so one
+        # graph serves every rank.
+        shard = getattr(self, SEQUENCE_SHARD_ATTR, None)
+        sharded = shard is not None and shard.shards(int(embedded.shape[0]))
+        if sharded:
+            if collect_layer_streams:
+                raise Glm5NextSequenceShardError(
+                    "collect_layer_streams dumps whole-chunk carriers, and under "
+                    "VLLM_NEURON_GLM5NEXT_PREFILL_SP each rank holds its own rows of a "
+                    "prefill chunk; dump with the switch off"
+                )
+            from vllm_neuron.functional.dsa.shard_rows import dsa_take_rank_rows
+
+            (embedded,) = dsa_take_rank_rows(
+                [embedded],
+                getattr(self, SEQUENCE_RANK_ATTR),
+                int(embedded.shape[0]) // shard.world,
             )
         hc_mult = int(self.text_config.hc_mult)
         if hc_mult <= 0:
@@ -9723,9 +10012,17 @@ class Glm5NextModel(nn.Module):
                     layer.post_attention_layernorm_weight,
                     float(self.text_config.rms_norm_eps),
                 ),
+                # A MoE layer's router reads the pre-norm stream; a dense MLP only
+                # ``normed``. Under the sequence shard the site gathers what is read.
+                reads_layer_input=isinstance(
+                    getattr(layer, "mlp", None), Glm5NextMoEBlock
+                ),
+                # Under the sequence shard the router scales the gathered rows itself,
+                # so the site gathers two tensors and asks its kernel for no scale.
                 **(
                     {"router_scale": True}
                     if prefill_leg
+                    and not sharded
                     and isinstance(getattr(layer, "mlp", None), Glm5NextMoEBlock)
                     and router_prefill.prefill_route_takes_rows(streams.shape[0])
                     else {}
@@ -9743,6 +10040,10 @@ class Glm5NextModel(nn.Module):
         # that order, which is the order the reference composes them.
         collapsed = streams.mean(dim=1).to(embedded.dtype)
         normed = self._rms_norm(collapsed, gain)
+        if sharded:
+            # The root selects and projects rows of the whole chunk, and the draft's
+            # prefill leg reads every row: gather the ranks' rows back in order.
+            (normed,) = gather_sequence([normed], group=_resolve_tp_group())
         if collect_layer_streams:
             return normed, (*collected, *taps)
         return normed
@@ -11222,6 +11523,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
             # this load put it.
             if hasattr(type(module), "bind_hyper_connection_sites"):
                 module.bind_hyper_connection_sites(self.text_config, device)
+        # The prefill sequence shard, after the walk because it binds on the mHC sites
+        # the walk bound. With its switch off it binds None and nothing reads it.
+        self.model.bind_prefill_sequence_shard(self.text_config.neuron_config, device)
         return projection_calls, scale_calls
 
     def _require_prep_operands_on_device(

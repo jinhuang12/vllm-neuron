@@ -123,6 +123,9 @@ if TYPE_CHECKING:
     # Keep every all-reduce one collective instead of the compiler's 8 MiB tiles.
     # On by default; 0 restores the tiles.
     VLLM_NEURON_TP_ALLREDUCE_FUSE: bool = True
+    # GLM-5.3-Flash prefill sequence parallelism: each rank runs the mHC site work of
+    # its own rows of a prefill chunk. Off by default.
+    VLLM_NEURON_GLM5NEXT_PREFILL_SP: bool = False
     # GLM-5.3-Flash DSA prefill: a chunk whose top-k selection provably keeps every
     # token attends its latent window densely (mla_dense_window.py) instead of
     # selecting and gathering. On by default; 0 restores the sparse path.
@@ -588,6 +591,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # into up to four. Read by ``collective_policy.fuse_compiler_args``.
     "VLLM_NEURON_TP_ALLREDUCE_FUSE": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_TP_ALLREDUCE_FUSE")) is not False
+    ),
+    # ================== GLM-5.3-Flash Prefill Sequence Parallelism ==================
+    # "1" splits each prefill chunk's rows over the tensor-parallel ranks around the
+    # mHC sites (``model/glm5_next/model_fp8.py``, ``PrefillSequenceShard``): each rank
+    # runs the mHC pre-mix, Sinkhorn and combine on its own rows, every sub-block's
+    # input is all-gathered, and its row-parallel partial is reduce-scattered instead
+    # of all-reduced. Decode and verify steps are unchanged. Read once at load; it
+    # needs every prefill bucket to be a multiple of the tensor-parallel world and the
+    # glue switch to fuse mhc_pre and mhc_post at the per-rank row count. Off by
+    # default ("0").
+    "VLLM_NEURON_GLM5NEXT_PREFILL_SP": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_GLM5NEXT_PREFILL_SP")) or False
     ),
     # ================== GLM-5.3-Flash DSA Prefill ==================
     # Attend a prefill chunk densely over its latent window when the bound its graph
