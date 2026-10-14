@@ -36,6 +36,7 @@ The two kernels split the work over the LNC2 pair differently:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import torch
@@ -62,6 +63,9 @@ DMA_TRANSPOSE_ENV = "VLLM_NEURON_GLUE_KDA_DMA_TRANSPOSE"
 
 _P = 128
 _BANK = 512  # fp32 columns per PSUM bank
+#: PSUM banks per output store in the prefill kernel: each partition then writes one
+#: contiguous 4 x 512 fp32 = 8 KiB run per store instead of four 2 KiB runs.
+_STORE_BANKS = 4
 _DGE_ROWS = 16
 
 __all__ = [
@@ -231,10 +235,13 @@ def kda_output_prefill_kernel(core, out_gate, o_norm, o_proj, HEADS: int = 1,
     Each program takes ``T / programs`` contiguous rows in 128-row tiles: the gated
     RMSNorm of all its tiles at once (tokens on the partitions, the tiles side by side
     on the free axis), and per tile ``g^T`` as ``hi``/``lo`` bf16 by tensor-engine
-    transposes. Then, per 512-column PSUM bank of the output: that bank's columns of
-    ``o_proj^T`` are loaded, and each tile takes the two passes and writes its
-    ``[128, 512]`` block. So the output stream, which bounds the call, starts after one
-    bank of ``o_proj^T`` and not after all of it.
+    transposes. Then, per group of ``_STORE_BANKS`` 512-column PSUM banks of the output:
+    that group's columns of ``o_proj^T`` are loaded, and each tile takes the two passes
+    per bank and writes its ``[128, 512 * _STORE_BANKS]`` block in one store. The output
+    stream bounds the call; it starts after one group of ``o_proj^T`` and not after all of
+    it, and each partition's store is one contiguous run of the group's columns (8 KiB
+    for four banks), not one 2 KiB run per bank (with one bank per store, a profile
+    reads 2 KiB DMA packets keeping all 16 DMA engines busy).
 
     Args:
         core: ``[T, W]`` fp32 recurrence output, ``W = HEADS * kdim <= 128``, ``T`` a
@@ -281,21 +288,28 @@ def kda_output_prefill_kernel(core, out_gate, o_norm, o_proj, HEADS: int = 1,
         nisa.nc_transpose(dst=gt_ps[:, 1, :], data=lo[:, i * width:(i + 1) * width])
         nisa.tensor_copy(dst=gt[:, i, :, :], src=gt_ps)
 
-    for b in range(hidden // _BANK):
-        c0 = b * _BANK
-        # o_proj^T [W, 512] for this bank's output columns.
-        ot = nl.ndarray((width, _BANK), dtype=o_proj.dtype, buffer=nl.sbuf)
+    banks = hidden // _BANK
+    group = math.gcd(banks, _STORE_BANKS)
+    for g0 in range(0, banks, group):
+        c0 = g0 * _BANK
+        # o_proj^T [W, 512 * group] for this group's output columns.
+        ot = nl.ndarray((width, group * _BANK), dtype=o_proj.dtype, buffer=nl.sbuf)
         _load_o_proj_t(ot, o_proj, c0, DMA_TRANSPOSE)
         for i in range(tiles):
-            acc = nl.ndarray((_P, _BANK), dtype=nl.float32, buffer=nl.psum)
-            for part in range(2):
-                nisa.nc_matmul(dst=acc, stationary=gt[:, i, part, :], moving=ot,
-                               accumulate=(part > 0))
-            # The PSUM reads alternate Vector and Scalar, the two engines that read PSUM.
-            block = nl.ndarray((_P, _BANK), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_copy(dst=block, src=acc, engine=nisa.engine.vector
-                             if (b * tiles + i) % 2 == 0 else nisa.engine.scalar)
-            nisa.dma_copy(dst=out.ap(pattern=[[hidden, _P], [1, _BANK]],
+            # Each bank's accumulator takes the same two passes in the same order as one
+            # bank per store; only the store grouping changes, so every output bit is kept.
+            block = nl.ndarray((_P, group * _BANK), dtype=nl.float32, buffer=nl.sbuf)
+            for j in range(group):
+                acc = nl.ndarray((_P, _BANK), dtype=nl.float32, buffer=nl.psum)
+                for part in range(2):
+                    nisa.nc_matmul(dst=acc, stationary=gt[:, i, part, :],
+                                   moving=ot[:, j * _BANK:(j + 1) * _BANK],
+                                   accumulate=(part > 0))
+                # The PSUM reads alternate Vector and Scalar, the two engines that read PSUM.
+                nisa.tensor_copy(dst=block[:, j * _BANK:(j + 1) * _BANK], src=acc,
+                                 engine=nisa.engine.vector
+                                 if ((g0 + j) * tiles + i) % 2 == 0 else nisa.engine.scalar)
+            nisa.dma_copy(dst=out.ap(pattern=[[hidden, _P], [1, group * _BANK]],
                                      offset=(r0 + i * _P) * hidden + c0), src=block)
     return out
 
