@@ -11,11 +11,29 @@ sha256 digests, per batch size, of:
   output and both state banks of every layer after the last step.
 
 This tree runs the identical scenarios -- the bank-form carriers at ``B > 1`` and the
-untouched one-request path at ``B = 1`` -- and every digest must be equal, but for the four
-values :data:`SELECTION_ORDER_DIGESTS` pins instead (in the DSA world at ``B = 64``, which
-the decode selection's pool order moves) and the KDA values :data:`KDA_CONV1D_DIGESTS` pins
-(which the in-tree prefill conv1d kernel moves). Two negative controls show the
+untouched one-request path at ``B = 1`` -- and every digest must be equal, but for the values
+three maps pin instead: :data:`SELECTION_ORDER_DIGESTS` (three DSA values at ``B = 64``, which
+the decode selection's pool order moves), :data:`POOLED_STORE_DIGESTS` (the DSA pooled stores
+at ``B = 64``, which the in-tree pooling kernel moves) and :data:`KDA_CONV1D_DIGESTS` (which the
+in-tree prefill conv1d kernel moves). Two negative controls show the
 digests have power: a broken bank gather and a broken ring write each change them.
+
+The DSA pins are not the only guard on the pooling. The DSA test also records every
+``dsa_kpool_hadamard`` call, checks that no call took the torch fallback, and holds each
+result to the pooling kernel's derived error bound against the exact fp64 pooling
+(``pooling_error_bound`` and ``exact_pooling`` in ``test_kpool_hadamard_error_bound.py``,
+whose docstring derives the bound step by step). Derivation: this test's own pooling calls
+were recorded at OMP 4 and replayed through 0a08ff4's kernel (the blob the hardware
+benchmark pins). Per batch size: calls that differ / calls, outputs that differ / outputs,
+max ``|delta|``, and each kernel's max error over the bound:
+
+* ``B = 1``: 0 / 3, 0 / 1,920, 0, 0.91 for both kernels;
+* ``B = 4``: 2 / 12, 2 / 13,824, 3.91e-03, 0.94 for both;
+* ``B = 64``: 37 / 192, 55 / 270,336, 7.81e-03, 0.94 for both.
+
+Every output of both kernels is within the bound (0 over, at every ``B``), and the two
+kernels differ by at most 0.89 of twice the bound. At ``B = 4`` the two differing rows leave
+every digest the base's.
 
 The KDA pins are not the only guard on the conv1d. The KDA test also records every prefill
 conv1d call, checks that each one ran the NKI kernel, and checks each output against the
@@ -57,32 +75,54 @@ import json
 import pytest
 import torch
 
+from test.vllm_neuron.functional.dsa import test_kpool_hadamard_error_bound as pooling_bound
 from test.vllm_neuron.model.glm5_next.tiny import gen_numerics_fixture as gen
 from test.vllm_neuron.model.glm5_next.tiny import test_tiny_glm5next_e2e as e2e
+from vllm_neuron.functional.dsa import kpool_hadamard
 
 pytestmark = [pytest.mark.fast, pytest.mark.forked]
 
 BASE_REV = "0a08ff4"
 
 #: The digests this tree's decode selection moves from the base, by batch size: in the DSA
-#: world at B = 64, the final logits and the last DSA layer's pooled store, ring and KV
-#: cache. The one-kernel selection (``decode_select.py``) lists a request's selected pools
-#: in ascending pool order, where the base's four-kernel route listed them by descending
-#: score. The selected sets are the same (``test_decode_select.py`` pins them against the
-#: base's chain); the sparse attention sums the selected rows in column order, so its bf16
-#: output rounds apart in the last bits from the second layer on. The first two layers'
-#: state keeps the base's digests; the third layer's input is the second layer's output,
-#: so what it writes moves, and the logits after it. The greedy ids stay the base's. Each
-#: value is this tree's own, bitwise, so any further move fails. B = 1 and B = 4 move
-#: nothing.
+#: world at B = 64, the final logits and the last DSA layer's ring and KV cache. (Its pooled
+#: store moves too, and also carries the pooling kernel's move, so it is pinned in
+#: :data:`POOLED_STORE_DIGESTS`.) The one-kernel selection (``decode_select.py``) lists a
+#: request's selected pools in ascending pool order, where the base's four-kernel route
+#: listed them by descending score. The selected sets are the same (``test_decode_select.py``
+#: pins them against the base's chain); the sparse attention sums the selected rows in column
+#: order, so its bf16 output rounds apart in the last bits from the second layer on. The
+#: first two layers' rings and KV caches keep the base's digests; the third layer's input is
+#: the second layer's output, so what it writes moves, and the logits after it. The greedy
+#: ids stay the base's. Each value is this tree's own, bitwise, so any further move fails.
+#: B = 1 and B = 4 move nothing.
 SELECTION_ORDER_DIGESTS = {
     64: {
         "final_logits": "c9c5a400f85df1c43c1c35aad8cf24b47e77923260111cb873f538b35f90aa21",
-        "side.2.pool_cache[:B]":
-            "f2270e6ad69a9c5e19e8e57f73e23dd0496387bb6f128d585dd8616e56a2d42a",
         "side.2.tail[:B]": "955d01bff2d68a2a96624205827f0264b83f16bb82eff2797d239c795c74cbf6",
         "kv.layers.2.self_attn.0":
             "8a3f808a04c7cc026db25badd23b8abf56070d39ca247cd7e914e01950d0a0a1",
+    },
+}
+
+#: The DSA pooled stores this tree's pooling kernel moves from the base, by batch size.
+#: 11e6157d (wt6/hadamard) pools on the Tensor Engine (the rotation) and the Scalar Engine
+#: (the reciprocal), so its sums run in another order than 0a08ff4's kernel. At B = 64, 37 of
+#: the world's 192 pooling calls round a pooled row to another bf16 value (the module
+#: docstring gives the measured differences and the bound). The check that came with that
+#: kernel (7ee41ea2) was dropped by the merge that took the selection-order pins (35fdd69e);
+#: this map and the bound check in the DSA test replace it. The last layer's store carries
+#: both this move and the selection order's. Each value is this tree's own, bitwise, so any
+#: further move fails. B = 1 and B = 4 move nothing.
+POOLED_STORE_DIGESTS = {
+    # 11e6157d: the in-tree pooling kernel's summation order moves these 3 of 10.
+    64: {
+        "side.0.pool_cache[:B]":
+            "bd95248977b7d3355671d77dd0c37f29ffe8089442bc5bacd1ba494f3c95c950",
+        "side.1.pool_cache[:B]":
+            "103ad1218fb3ed885fbb4f2baf082ab79bb7151d9834287a6d71283417300e96",
+        "side.2.pool_cache[:B]":
+            "337858a41c5da4cc7807f754cd760496f08c304c7113a5f6e4026c8d65f77bbe",
     },
 }
 
@@ -157,6 +197,45 @@ def _assert_same_digests(got: dict, want: dict, label: str) -> None:
     assert not mismatched, f"{label}: digests differ from {BASE_REV} at {mismatched}"
 
 
+def _dsa_digests(batch: int, want: dict) -> dict:
+    """The fixture's DSA digests with this tree's two DSA pin maps merged over them."""
+    selection = SELECTION_ORDER_DIGESTS.get(batch, {})
+    pooled = POOLED_STORE_DIGESTS.get(batch, {})
+    assert not set(selection) & set(pooled), sorted(set(selection) & set(pooled))
+    moved = {**selection, **pooled}
+    assert set(moved) <= set(want), sorted(set(moved) - set(want))
+    return {**want, **moved}
+
+
+def _record_pooling(monkeypatch) -> list:
+    """Keeps the operands and result of every ``dsa_kpool_hadamard`` call; each call is unchanged.
+
+    The model imports the function from its module at each call, so the hook sees every call.
+    """
+    served = kpool_hadamard.dsa_kpool_hadamard
+    calls = []
+
+    def recording(slot_k, slot_score, ape):
+        pooled = served(slot_k, slot_score, ape)
+        calls.append(tuple(t.detach().clone() for t in (slot_k, slot_score, ape, pooled)))
+        return pooled
+
+    monkeypatch.setattr(kpool_hadamard, "dsa_kpool_hadamard", recording)
+    return calls
+
+
+def _assert_pooling_within_the_derived_bound(calls: list, label: str) -> None:
+    """Each pooled result is within ``pooling_error_bound`` of the exact fp64 pooling."""
+    for index, (slot_k, slot_score, ape, pooled) in enumerate(calls):
+        exact = pooling_bound.exact_pooling(slot_k, slot_score, ape)
+        limit = pooling_bound.pooling_error_bound(slot_k, slot_score, ape)
+        ratio = pooling_bound.error_over_bound(pooled, exact, limit)
+        assert bool((ratio <= 1).all()), (
+            f"{label}: pooling call {index}: {int((ratio > 1).sum())} of {ratio.numel()} "
+            f"outputs outside the derived bound, worst at {ratio.max().item():.4f} of it"
+        )
+
+
 def _kda_digests(batch: int, want: dict) -> dict:
     """The fixture's KDA digests with this tree's conv1d pins merged over them."""
     moved = KDA_CONV1D_DIGESTS[batch]
@@ -206,15 +285,21 @@ def _assert_conv1d_within_the_float32_bound(calls: list, label: str) -> None:
 
 
 @pytest.mark.parametrize("batch", list(gen.BATCHES))
-def test_the_dsa_world_is_bitwise_the_base_revision(batch):
+def test_the_dsa_world_is_bitwise_the_base_revision(batch, monkeypatch):
     e2e._require_cpu_mode()
     want = _fixture()["dsa"][str(batch)]
     assert want["steps"] >= 8
+    calls = _record_pooling(monkeypatch)
+    kpool_hadamard.reset_kpool_hadamard_dispatch_counters()
     got = gen.dsa_numerics(batch, want["steps"])
     assert got["prompts"] == want["prompts"]
-    moved = SELECTION_ORDER_DIGESTS.get(batch, {})
-    assert set(moved) <= set(want["digests"]), sorted(set(moved) - set(want["digests"]))
-    _assert_same_digests(got["digests"], {**want["digests"], **moved}, f"DSA B={batch}")
+    _assert_same_digests(got["digests"], _dsa_digests(batch, want["digests"]), f"DSA B={batch}")
+    # The second guard: the world pooled on the NKI kernels (the counters sum the pooling
+    # and the rotation entry points, so the pooling calls are a lower bound), never on the
+    # torch fallback, and every pooled result is within the derived bound.
+    nki, fallback = kpool_hadamard.kpool_hadamard_dispatch_counters()
+    assert calls and nki >= len(calls) and fallback == 0, (nki, fallback, len(calls))
+    _assert_pooling_within_the_derived_bound(calls, f"DSA B={batch}")
     # Information, not evidence (the seeded head pins the argmax): still equal.
     assert got["ids"] == want["ids"]
 
