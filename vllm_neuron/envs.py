@@ -137,6 +137,9 @@ if TYPE_CHECKING:
     # reads come back as a set: no top-k sort, no sentinel order. On by default; 0
     # restores the ordered selection.
     VLLM_NEURON_DSA_SET_SELECTION: bool = True
+    # Let the GLM-5.3-Flash DSA prefill key pooling read each position's window
+    # from the keys in place, with no gather. On by default; 0 gathers the windows.
+    VLLM_NEURON_DSA_KPOOL_WINDOW_READ: bool = True
     # GLM-5.3-Flash fused glue kernels (``vllm_neuron/functional/glue``): which
     # kernel serves which call, and how the KDA kernels load their weights.
     VLLM_NEURON_GLUE_FUSED: str = "1"
@@ -619,6 +622,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # default; 0 keeps the ordered selection on every route.
     "VLLM_NEURON_DSA_SET_SELECTION": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_DSA_SET_SELECTION")) is not False
+    ),
+    # Pool the DSA prefill indexer's sliding windows (each position's ``index_kpool``
+    # keys and gate scores, ending at it) with a kernel that reads them from the keys
+    # in place, instead of gathering them first; the pooled keys are the same bits
+    # (``functional/dsa/kpool_hadamard.py``). Read at trace time by
+    # ``model/glm5_next/dsa_kpool_window.py``; a change needs a new compile. On by
+    # default; 0 gathers the windows.
+    "VLLM_NEURON_DSA_KPOOL_WINDOW_READ": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_DSA_KPOOL_WINDOW_READ")) is not False
     ),
     # ================== GLM-5.3-Flash Fused Glue Kernels ==================
     # Which fused glue kernel (``vllm_neuron/functional/glue``) serves which call.

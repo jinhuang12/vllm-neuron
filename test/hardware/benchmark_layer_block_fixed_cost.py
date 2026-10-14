@@ -43,7 +43,9 @@ holds a fold's before and after under the same glue switch value; a second such 
   (``dsa_set_selection.prefill_selects_a_set``);
 * ``fullquery``: the sharded DSA prefill selection's query side projected on every row of
   the chunk and cut after, instead of on the rank's rows alone
-  (``indexer_shard.query_row_cut_enabled``).
+  (``indexer_shard.query_row_cut_enabled``);
+* ``windowgather``: the DSA prefill key pooling on its gathered windows instead of reading
+  them from the keys in place (``dsa_kpool_window.prefill_reads_windows``).
 
 Each case also records whether each variant's first output is bit-equal to each such
 variant's (``bit_equal_to_route_variants``), and how far apart they are
@@ -87,7 +89,7 @@ from test.vllm_neuron.functional.glue import glue_case
 from vllm_neuron import envs
 from vllm_neuron.functional.dsa import indexer_shard
 from vllm_neuron.functional.moe import combine_slots, router_prefill
-from vllm_neuron.model.glm5_next import dsa_set_selection
+from vllm_neuron.model.glm5_next import dsa_kpool_window, dsa_set_selection
 from vllm_neuron.model.glm5_next import model_fp8 as live
 
 DEVICE = block.DEVICE
@@ -236,6 +238,7 @@ ROUTES = {
     "fusedrouter": (router_prefill, "prefill_router_enabled"),
     "orderedselect": (dsa_set_selection, "prefill_selects_a_set"),
     "fullquery": (indexer_shard, "query_row_cut_enabled"),
+    "windowgather": (dsa_kpool_window, "prefill_reads_windows"),
 }
 
 #: The route prefix of the variant being traced or called, or None. The trace reads it

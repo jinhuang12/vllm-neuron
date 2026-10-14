@@ -5127,10 +5127,17 @@ class Glm5NextDSAIndexer(nn.Module):
         caller could do it, because the key and the gate for those positions exist
         only inside this class's forward.
 
-        One kernel call, on ``dsa_kpool_hadamard``. The sliding window is index
-        arithmetic and carries no call of its own.
+        One kernel call, on ``dsa_kpool_hadamard``. The window route
+        (``dsa_kpool_window``, on by default) hands it ``key`` and ``gate_score`` with
+        ``windows=True``, and its kernel reads each sliding window in place; the gather
+        route builds the windows as copies, ``key[windows]``, and hands it those. The
+        pooled keys are the same bits on both routes.
         """
-        from vllm_neuron.functional.dsa.kpool_hadamard import dsa_kpool_hadamard
+        from vllm_neuron.functional.dsa.kpool_hadamard import (
+            dsa_kpool_hadamard,
+            sliding_windows,
+        )
+        from vllm_neuron.model.glm5_next import dsa_kpool_window
 
         if key.ndim != 2 or int(key.shape[1]) != self.index_head_dim:
             raise Glm5NextDSAIndexerError(
@@ -5171,16 +5178,17 @@ class Glm5NextDSAIndexer(nn.Module):
             )
 
         pos = torch.arange(tokens, device=key.device)
-        offsets = torch.arange(pool, device=key.device)
-        window = (pos - (pool - 1)).clamp_min(0)[:, None] + offsets[None, :]
         write_mask = (slot_mapping >= 0) & (pos >= pool - 1)
 
         # The ape is float32 for the kernel's inner contract even though the
         # checkpoint leaf is bf16; it is [4, 128], so the cast is free and is
         # done here rather than cached, unlike the projection weights.
-        pooled = dsa_kpool_hadamard(
-            key[window], gate_score[window], ape.to(torch.float32)
-        )
+        ape = ape.to(torch.float32)
+        if dsa_kpool_window.prefill_reads_windows():
+            pooled = dsa_kpool_hadamard(key, gate_score, ape, windows=True)
+        else:
+            window = sliding_windows(tokens, pool, key.device)
+            pooled = dsa_kpool_hadamard(key[window], gate_score[window], ape)
         return pooled, write_mask
 
     def tail_step(
