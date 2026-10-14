@@ -2,12 +2,15 @@
 """The row-parallel all-reduce entry point and its two switches.
 
 ``collective_policy.reduce_row_parallel`` is the one call every row-parallel site makes.
-Two switches, registered in ``vllm_neuron.envs`` and read when a site runs:
+Three switches, registered in ``vllm_neuron.envs`` and read when a site runs:
 
-* ``VLLM_NEURON_TP_ALLREDUCE_DTYPE`` = ``fp32`` (default) | ``bf16``: the dtype the
-  partial crosses the wire in. ``fp32`` is the as-built path, bit for bit: the
-  coordinator is handed the very partial and reduces it in place. ``bf16`` reduces a
-  bfloat16 copy and returns it.
+* ``VLLM_NEURON_TP_ALLREDUCE_DTYPE`` = ``bf16`` (default) | ``fp32``: the dtype the
+  partial crosses the wire in, at the steps the next switch names. ``bf16`` reduces a
+  bfloat16 copy and returns it. ``fp32`` is the full-width path, bit for bit: the
+  coordinator is handed the very partial and reduces it in place.
+* ``VLLM_NEURON_TP_ALLREDUCE_DTYPE_PHASES`` = ``prefill`` (default) | ``all`` | a comma
+  list: the steps that use that dtype; every other step takes the fp32 path. A site
+  tells its step by its partial's row count (``collective_policy.StepRows``).
 * ``VLLM_NEURON_TP_ALLREDUCE_FUSE`` = ``1`` (default) | ``0``: names the neuronx-cc
   argument that keeps each all-reduce one collective, for the runner to append.
 
@@ -36,8 +39,14 @@ from vllm_neuron.model.glm5_next.config import Glm5NextConfig
 pytestmark = [pytest.mark.fast]
 
 DTYPE_ENV = "VLLM_NEURON_TP_ALLREDUCE_DTYPE"
+DTYPE_PHASES_ENV = "VLLM_NEURON_TP_ALLREDUCE_DTYPE_PHASES"
 FUSE_ENV = "VLLM_NEURON_TP_ALLREDUCE_FUSE"
 SITE = policy.RowParallelSite.FFN
+#: The rows of every partial below (:func:`_partial`).
+PARTIAL_ROWS = 8
+#: A server whose largest decode batch is one row short of a partial, so every partial
+#: here reads as a prefill chunk, the step the wire dtype applies to by default.
+PREFILL = policy.StepRows(max_decode_rows=PARTIAL_ROWS - 1)
 
 
 class _RecordingGroup:
@@ -55,13 +64,16 @@ class _RecordingGroup:
 
 def _partial(dtype: torch.dtype = torch.float32) -> torch.Tensor:
     gen = torch.Generator().manual_seed(20261007)
-    return torch.randn(8, 16, generator=gen, dtype=torch.float32).to(dtype)
+    return torch.randn(PARTIAL_ROWS, 16, generator=gen, dtype=torch.float32).to(dtype)
 
 
 # ── the switches ──────────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("name, default", [(DTYPE_ENV, "fp32"), (FUSE_ENV, True)])
+@pytest.mark.parametrize(
+    "name, default",
+    [(DTYPE_ENV, "bf16"), (DTYPE_PHASES_ENV, "prefill"), (FUSE_ENV, True)],
+)
 def test_the_switches_are_registered_in_envs(monkeypatch, name, default):
     monkeypatch.delenv(name, raising=False)
     assert name in envs.environment_variables
@@ -69,13 +81,20 @@ def test_the_switches_are_registered_in_envs(monkeypatch, name, default):
 
 
 def test_the_policy_names_the_registered_switches():
-    assert (policy.DTYPE_ENV, policy.FUSE_ENV) == (DTYPE_ENV, FUSE_ENV)
+    assert (policy.DTYPE_ENV, policy.DTYPE_PHASES_ENV, policy.FUSE_ENV) == (
+        DTYPE_ENV,
+        DTYPE_PHASES_ENV,
+        FUSE_ENV,
+    )
 
 
-def test_the_defaults_are_the_as_built_path(monkeypatch):
-    monkeypatch.delenv(DTYPE_ENV, raising=False)
-    monkeypatch.delenv(FUSE_ENV, raising=False)
-    assert policy.allreduce_wire_dtype() is torch.float32
+def test_the_defaults_are_the_bf16_prefill_wire_and_one_collective(monkeypatch):
+    for name in (DTYPE_ENV, DTYPE_PHASES_ENV, FUSE_ENV):
+        monkeypatch.delenv(name, raising=False)
+    assert policy.allreduce_wire_dtype("prefill") is torch.bfloat16
+    # A decode or verify step, or one a site cannot tell, keeps the fp32 path.
+    for phase in ("decode", "verify", None):
+        assert policy.allreduce_wire_dtype(phase) is torch.float32
     assert policy.allreduce_fuse_enabled() is True
     assert policy.fuse_compiler_args() == [policy.FUSE_COMPILER_ARG]
 
@@ -86,14 +105,14 @@ def test_the_defaults_are_the_as_built_path(monkeypatch):
 )
 def test_the_dtype_switch_reads_its_two_values(monkeypatch, value, dtype):
     monkeypatch.setenv(DTYPE_ENV, value)
-    assert policy.allreduce_wire_dtype() is dtype
+    assert policy.allreduce_wire_dtype("prefill") is dtype
 
 
 @pytest.mark.parametrize("value", ["fp16", "float32", "1", ""])
 def test_an_unknown_dtype_is_refused_by_name(monkeypatch, value):
     monkeypatch.setenv(DTYPE_ENV, value)
     with pytest.raises(policy.CollectivePolicyError, match=DTYPE_ENV):
-        policy.allreduce_wire_dtype()
+        policy.allreduce_wire_dtype("prefill")
 
 
 @pytest.mark.parametrize("value, enabled", [("0", False), ("1", True)])
@@ -206,19 +225,19 @@ def test_one_rank_is_untouched_in_either_setting(monkeypatch, value):
     monkeypatch.setenv(DTYPE_ENV, value)
     partial = _partial()
     before = partial.clone()
-    out = policy.reduce_row_parallel(partial, site=SITE, group=None)
+    out = policy.reduce_row_parallel(partial, site=SITE, group=None, steps=PREFILL)
     assert out is partial
     assert torch.equal(out, before)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_fp32_hands_the_coordinator_the_partial_itself(monkeypatch, dtype):
-    """The as-built path: the partial is reduced in place, in its own dtype."""
+    """The fp32 wire: the partial is reduced in place, in its own dtype."""
     monkeypatch.setenv(DTYPE_ENV, "fp32")
     group = _RecordingGroup()
     partial = _partial(dtype)
     expected = partial * 2
-    out = policy.reduce_row_parallel(partial, site=SITE, group=group)
+    out = policy.reduce_row_parallel(partial, site=SITE, group=group, steps=PREFILL)
     assert len(group.handed) == 1
     assert group.handed[0] is partial
     assert out is partial
@@ -231,7 +250,7 @@ def test_bf16_reduces_a_bf16_copy_and_leaves_the_partial_alone(monkeypatch):
     group = _RecordingGroup()
     partial = _partial()
     before = partial.clone()
-    out = policy.reduce_row_parallel(partial, site=SITE, group=group)
+    out = policy.reduce_row_parallel(partial, site=SITE, group=group, steps=PREFILL)
     assert len(group.handed) == 1
     handed = group.handed[0]
     assert handed.dtype is torch.bfloat16
@@ -247,7 +266,7 @@ def test_bf16_reduces_a_bf16_partial_in_place(monkeypatch):
     monkeypatch.setenv(DTYPE_ENV, "bf16")
     group = _RecordingGroup()
     partial = _partial(torch.bfloat16)
-    out = policy.reduce_row_parallel(partial, site=SITE, group=group)
+    out = policy.reduce_row_parallel(partial, site=SITE, group=group, steps=PREFILL)
     assert group.handed == [partial]
     assert out is partial
 
@@ -256,7 +275,9 @@ def test_the_switch_is_read_per_call(monkeypatch):
     """A trace takes whichever value is set when it runs, not when the module loaded."""
     for value, dtype in (("bf16", torch.bfloat16), ("fp32", torch.float32)):
         monkeypatch.setenv(DTYPE_ENV, value)
-        out = policy.reduce_row_parallel(_partial(), site=SITE, group=_RecordingGroup())
+        out = policy.reduce_row_parallel(
+            _partial(), site=SITE, group=_RecordingGroup(), steps=PREFILL
+        )
         assert out.dtype is dtype
 
 
@@ -264,7 +285,7 @@ def test_every_site_is_accepted(monkeypatch):
     monkeypatch.setenv(DTYPE_ENV, "fp32")
     for site in policy.RowParallelSite:
         group = _RecordingGroup()
-        policy.reduce_row_parallel(_partial(), site=site, group=group)
+        policy.reduce_row_parallel(_partial(), site=site, group=group, steps=PREFILL)
         assert len(group.handed) == 1
 
 
@@ -272,7 +293,9 @@ def test_every_site_is_accepted(monkeypatch):
 def test_a_site_that_is_not_a_member_is_refused(site):
     """Only a :class:`RowParallelSite` member names a site, not its string value."""
     with pytest.raises(policy.CollectivePolicyError, match="RowParallelSite"):
-        policy.reduce_row_parallel(_partial(), site=site, group=_RecordingGroup())
+        policy.reduce_row_parallel(
+            _partial(), site=site, group=_RecordingGroup(), steps=PREFILL
+        )
 
 
 @pytest.mark.parametrize("value", ["fp32", "bf16"])
@@ -287,13 +310,19 @@ def test_the_entry_point_traces_as_one_graph(monkeypatch, value, group):
 
     def site(partial):
         return policy.reduce_row_parallel(
-            partial.clone(), site=policy.RowParallelSite.FFN, group=group
+            partial.clone(),
+            site=policy.RowParallelSite.FFN,
+            group=group,
+            steps=PREFILL,
         )
 
     partial = _partial()
     out = torch.compile(site, fullgraph=True, backend="eager")(partial)
     expected = policy.reduce_row_parallel(
-        partial.clone(), site=SITE, group=None if group is None else _RecordingGroup()
+        partial.clone(),
+        site=SITE,
+        group=None if group is None else _RecordingGroup(),
+        steps=PREFILL,
     )
     assert out.dtype is expected.dtype
     assert torch.equal(out, expected)
@@ -302,7 +331,9 @@ def test_the_entry_point_traces_as_one_graph(monkeypatch, value, group):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float64])
 def test_a_partial_outside_the_contract_is_refused_by_site(dtype):
     with pytest.raises(policy.CollectivePolicyError, match=SITE.value):
-        policy.reduce_row_parallel(_partial(dtype), site=SITE, group=None)
+        policy.reduce_row_parallel(
+            _partial(dtype), site=SITE, group=None, steps=PREFILL
+        )
 
 
 # ── what the entry point adds to a traced site ────────────────────────────────
@@ -344,7 +375,10 @@ def _as_built_site(partial: torch.Tensor) -> torch.Tensor:
 def _policy_site(partial: torch.Tensor) -> torch.Tensor:
     """A site through the entry point, as the layer code writes it."""
     reduced = policy.reduce_row_parallel(
-        partial, site=policy.RowParallelSite.FFN, group=_TracedGroup()
+        partial,
+        site=policy.RowParallelSite.FFN,
+        group=_TracedGroup(),
+        steps=PREFILL,
     )
     return reduced.to(CARRIER)
 
@@ -385,7 +419,7 @@ def test_this_module_imports_twice_in_one_process():
 
 
 def test_the_fp32_wire_adds_no_op_to_a_traced_site(monkeypatch):
-    """The default traces to the as-built site's ops, one for one."""
+    """The fp32 wire traces to the as-built site's ops, one for one."""
     monkeypatch.setenv(DTYPE_ENV, "fp32")
     as_built = _aten_ops(_as_built_site, _partial())
     assert _aten_ops(_policy_site, _partial()) == as_built
@@ -398,7 +432,7 @@ def test_the_bf16_wire_moves_the_carrier_cast_ahead_of_the_collective(monkeypatc
     monkeypatch.setenv(DTYPE_ENV, "bf16")
     # The move holds because the wire dtype is the model's own: the site's cast to its
     # carrier then has nothing left to do.
-    assert CARRIER is policy.allreduce_wire_dtype()
+    assert CARRIER is policy.allreduce_wire_dtype("prefill")
     as_built = _aten_ops(_as_built_site, _partial())
     ops = _aten_ops(_policy_site, _partial())
     assert as_built[-1] == ops[0] == (CAST, CARRIER)

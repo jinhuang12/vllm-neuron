@@ -164,9 +164,13 @@ def _dependencies(text_config) -> dict:
 
 
 def _layer(mlp, gain: torch.Tensor):
-    """A layer stand-in holding the two attributes ``_ffn_half`` reads off one."""
+    """A layer stand-in holding the attributes ``_ffn_half`` reads off one."""
+    from vllm_neuron.model.glm5_next.collective_policy import StepRows
+
     layer = torch.nn.Module()
     layer.mlp = mlp
+    # No runner buckets: the step is unknown, and the fp32 wire these checks pin holds.
+    layer.step_rows = StepRows(max_decode_rows=None)
     layer.post_attention_layernorm_weight = torch.nn.Parameter(
         gain.clone(), requires_grad=False
     )

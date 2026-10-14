@@ -27,6 +27,7 @@ from transformers import PretrainedConfig
 
 from vllm_neuron.model.glm5_next.collective_policy import (
     RowParallelSite,
+    StepRows,
     gather_sequence,
     reduce_row_parallel,
     scatter_row_parallel,
@@ -461,13 +462,17 @@ def _row_parallel_sum(
     :class:`PrefillSequenceShard` bound on ``module``, ``scatter_row_parallel``'s
     reduce-scatter: the sum of this rank's own rows, which is all the rank's mHC site
     combines. The one call every row-parallel site makes, so the choice lives here and
-    not at each site.
+    not at each site. Either collective takes its wire dtype from ``module.step_rows``
+    (``collective_policy.StepRows``), the step rule the module was built with, so the
+    reduce-scatter of a split chunk crosses the wire in the dtype the chunk's all-reduce
+    would.
     """
     shard = getattr(module, SEQUENCE_SHARD_ATTR, None)
     group = _resolve_tp_group()
+    steps = module.step_rows
     if shard is not None and shard.shards(int(partial.shape[0])):
-        return scatter_row_parallel(partial, site=site, group=group)
-    return reduce_row_parallel(partial, site=site, group=group)
+        return scatter_row_parallel(partial, site=site, group=group, steps=steps)
+    return reduce_row_parallel(partial, site=site, group=group, steps=steps)
 
 
 def _resolve_dcp_size() -> int | None:
@@ -1191,16 +1196,12 @@ class Glm5NextHyperConnection(nn.Module):
         # when the switch routes it by phase. None when the
         # layer is built without the runner's buckets; then only a rule without a
         # phase selects a kernel here.
-        decode_buckets = getattr(neuron_config, "num_seqs_buckets", None)
-        self.max_decode_rows = max(decode_buckets) if decode_buckets else None
-        self.verify_rows = frozenset()  # the verify step's rows: glue.verify_rows
+        steps = StepRows.of_server(neuron_config)
+        self.max_decode_rows = steps.max_decode_rows
+        self.verify_rows = steps.verify_rows  # the verify step's rows: glue.verify_rows
         if self.max_decode_rows is not None:
-            from vllm_neuron.functional.glue import (
-                require_rows_tell_phase, verify_draft_k, verify_rows)
+            from vllm_neuron.functional.glue import require_rows_tell_phase
 
-            from .mtp import shadow_draft_k
-
-            self.verify_rows = verify_rows(decode_buckets, verify_draft_k(shadow_draft_k()))
             require_rows_tell_phase(
                 ("mhc_pre", "mhc_post"),
                 self.max_decode_rows,
@@ -3692,6 +3693,9 @@ class Glm5NextKDAAttention(nn.Module):
         self.cache_chunk_size = getattr(
             text_config.neuron_config, "kda_state_chunk_size", None
         )
+        # How the output reduction tells a prefill chunk from a decode or verify step:
+        # by its row count, against the runner's buckets (``collective_policy``).
+        self.step_rows = StepRows.of_server(text_config.neuron_config)
 
         # The four recurrent-state values ``get_kv_spec`` reports for this family.
         # They come from this layer's own state geometry.
@@ -4646,10 +4650,12 @@ class Glm5NextKDAAttention(nn.Module):
         attn_out = kda_gated_projection(core, out_gate, self, phase=phase)
         # ``o_proj_weight`` is row-parallel, so this is one rank's partial sum.
         # Reduce it before the cast below, in the wire dtype ``collective_policy``
-        # names: fp32 as built, where partials add at the width they were computed
-        # in; ``VLLM_NEURON_TP_ALLREDUCE_DTYPE=bf16`` rounds each rank's partial to
-        # bfloat16 first, to halve the bytes. In place is safe -- ``attn_out`` is a
-        # fresh matmul result, not a view of a cached weight or of the residual.
+        # names for this step: by default bf16 at a prefill chunk, which rounds each
+        # rank's partial to bfloat16 first, to halve the bytes, and fp32 at a decode or
+        # verify step (and everywhere under ``VLLM_NEURON_TP_ALLREDUCE_DTYPE=fp32``),
+        # which adds the partials at the width they were computed in, in place. That is
+        # safe: ``attn_out`` is a fresh matmul result, not a view of a cached weight or
+        # of the residual.
         attn_out = _row_parallel_sum(
             attn_out, site=RowParallelSite.KDA_O_PROJ, module=self
         )
@@ -4693,6 +4699,8 @@ class Glm5NextKDALayer(nn.Module):
             "hc_ffn_scale",
         )
         self.self_attn = Glm5NextKDAAttention(text_config, world_size)
+        # The layer's two reductions tell the step by one rule (``_ffn_half`` reads it).
+        self.step_rows = self.self_attn.step_rows
         self.mlp = _build_mlp(text_config, layer_idx)
         self.rms_norm_eps = float(text_config.rms_norm_eps)
 
@@ -7262,6 +7270,9 @@ class Glm5NextMLAAttention(nn.Module):
         self.head_size = _resolve_mla_head_size(text_config)
         self.cache_dtype = _resolve_model_dtype(text_config)
         self.cache_chunk_size = None
+        # How the output reduction tells a prefill chunk from a decode or verify step:
+        # by its row count, against the runner's buckets (``collective_policy``).
+        self.step_rows = StepRows.of_server(text_config.neuron_config)
 
         _declare_parameters(
             self,
@@ -7898,15 +7909,16 @@ class Glm5NextMLAAttention(nn.Module):
         performs no collective and imports no vllm symbol.
 
         Two readings worth stating, because both could be wrong in a way tests would
-        not catch. The reduction is in place: the statement form discards a return
-        value, so it assumes ``all_reduce`` writes through its argument -- which is
-        what every shipped row-parallel site assumes, and which is safe against
-        aliasing here because ``mla_projection`` returns a fresh tensor rather than a
-        view of a cached weight. And the sum happens before the cast back to the
-        input dtype, because rounding each rank's fraction to bfloat16 first and
-        adding after would round the parts instead of the whole. That holds at the
-        default fp32 wire; ``VLLM_NEURON_TP_ALLREDUCE_DTYPE=bf16`` makes the trade on
-        purpose, for half the bytes (``collective_policy``).
+        not catch. On the fp32 wire the reduction is in place: the statement form
+        discards a return value, so it assumes ``all_reduce`` writes through its
+        argument -- which is what every shipped row-parallel site assumes, and which is
+        safe against aliasing here because ``mla_projection`` returns a fresh tensor
+        rather than a view of a cached weight. And the sum happens before the cast
+        back to the input dtype, because rounding each rank's fraction to bfloat16
+        first and adding after would round the parts instead of the whole. That holds
+        on the fp32 wire, which a decode or verify step takes by default; a prefill
+        chunk's default bf16 wire makes the trade on purpose, for half the bytes
+        (``collective_policy``).
         """
         from vllm_neuron.functional.attention.mla_projections import (
             mla_projection_prepared,
@@ -7928,13 +7940,14 @@ class Glm5NextMLAAttention(nn.Module):
             x.contiguous(), self._prepared_weight("o_proj"), lowp
         )
         if collector is not None:
-            # The partial is cloned and the input is not. The reduction below writes
-            # through its argument, so a tap holding ``projected`` would come back
-            # holding the sum instead of this rank's share.
+            # The partial is cloned and the input is not. On the fp32 wire the reduction
+            # below writes through its argument, so a tap holding ``projected`` would
+            # come back holding the sum instead of this rank's share.
             collector += [x.to(torch.float32), projected.clone()]
         # Sum this rank's partial with every other rank's, in the wire dtype
-        # ``collective_policy`` names (fp32 as built). ``None`` means one rank, where
-        # the partial already is the whole sum.
+        # ``collective_policy`` names for this step (by default bf16 at a prefill
+        # chunk, fp32 at a decode or verify step). ``None`` means one rank, where the
+        # partial already is the whole sum.
         projected = _row_parallel_sum(
             projected, site=RowParallelSite.MLA_O_PROJ, module=self
         )
@@ -9307,6 +9320,8 @@ class Glm5NextDSALayer(nn.Module):
             "hc_ffn_scale",
         )
         self.self_attn = Glm5NextMLAAttention(text_config)
+        # The layer's two reductions tell the step by one rule (``_ffn_half`` reads it).
+        self.step_rows = self.self_attn.step_rows
         self.mlp = _build_mlp(text_config, layer_idx)
         # Resolved at construction, on the same ground the KDA sibling states.
         self.rms_norm_eps = float(text_config.rms_norm_eps)
@@ -9671,8 +9686,9 @@ class Glm5NextModel(nn.Module):
         MTP draft head (``mtp.py``) share one body. What it needs it takes by name:
 
         * ``layer``: the module holding ``post_attention_layernorm_weight`` (``[H]``,
-          the FFN norm's gain) and ``mlp`` (a ``Glm5NextMoEBlock`` or a
-          ``Glm5NextDenseMLP``);
+          the FFN norm's gain), ``mlp`` (a ``Glm5NextMoEBlock`` or a
+          ``Glm5NextDenseMLP``) and ``step_rows`` (the ``collective_policy.StepRows``
+          the reduction tells the step by);
         * ``hidden_states``: ``[T, H]`` in the stack's activation dtype, the
           attention half's output after its residual add -- the FFN norm's input and
           the fused router's pre-norm input;
@@ -9776,19 +9792,22 @@ class Glm5NextModel(nn.Module):
         # called as a statement whose return is discarded -- the form every shipped
         # row-parallel site uses.
         #
-        # Before the cast, and that ordering is the load-bearing part. ``out`` is the
-        # kernel's own dtype here (fp32 on the dense route), so the partial sums are
-        # added at the width they were computed in; reducing after the cast below
-        # would round each rank's fraction to the caller's dtype and add the rounded
-        # parts instead of rounding the whole.
+        # Before the cast, and on the fp32 wire that ordering is the load-bearing part.
+        # ``out`` is the kernel's own dtype here (fp32 on the dense route), so the
+        # partial sums are added at the width they were computed in; reducing after the
+        # cast below would round each rank's fraction to the caller's dtype and add the
+        # rounded parts instead of rounding the whole.
         #
-        # In place is safe against aliasing for the same reason it is at
-        # ``project_output``: both branches return a freshly allocated tensor, so
-        # neither is a view of a cached weight or of the residual the caller holds.
+        # The fp32 wire reduces in place, which is safe against aliasing for the same
+        # reason it is at ``project_output``: both branches return a freshly allocated
+        # tensor, so neither is a view of a cached weight or of the residual the caller
+        # holds.
         #
-        # The wire dtype is ``collective_policy``'s: fp32 as built (the ordering
-        # above holds), or bfloat16 under ``VLLM_NEURON_TP_ALLREDUCE_DTYPE=bf16``,
-        # which rounds each rank's partial before the sum to halve the bytes.
+        # The wire dtype is ``collective_policy``'s, for this step: by default
+        # bfloat16 at a prefill chunk, which rounds each rank's partial before the sum
+        # to halve the bytes (the trade the ordering above avoids, made on purpose),
+        # and fp32 at a decode or verify step, or at every step under
+        # ``VLLM_NEURON_TP_ALLREDUCE_DTYPE=fp32``.
         out = _row_parallel_sum(out, site=RowParallelSite.FFN, module=layer)
         mixed = out.to(hidden_states.dtype)
         if collector is not None:
