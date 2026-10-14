@@ -1659,8 +1659,17 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
 #   PE transposes, which are bit-exact from NeuronCore-v3 on, rather than gathered a
 #   second time: the second gather is one indirect DMA per 128-row chunk, and the
 #   software descriptor generator that issues every indirect DMA is the body's busiest
-#   engine. A gather waits on its offsets, so each group's offsets are computed while
-#   the group before it is in flight.
+#   engine.
+# * The software DGE starts a gather only once every DMA before it on its queue has
+#   completed, so the gathers run one at a time and set the body's pace
+#   (``reports/mla_sparse.md``). Nothing else should hold one back. A gather waits on
+#   its offsets, and the Vector engine reaches the offsets placed after a group's MM1
+#   only once the MM2 of the group before it is done, so they are the offsets of the
+#   group :data:`OFFSET_GROUPS_AHEAD` groups on, across blocks. A gather waits on its
+#   row buffer, so the buffers rotate over the program's queries, not each block's, in
+#   whole groups. The compiler orders every transposing DMA after the transposing DMA
+#   before it, on any queue, so the query tiles are not DMA transposes: each block's
+#   rows are copied a block ahead and put on the latent partitions by PE transposes.
 # * The softmax runs for a group of :data:`SOFTMAX_ROWS` queries at once, one query
 #   per partition. A query's MM1 stationary is a ``[128, rows]`` tile whose only
 #   non-zero column is the query's own, so its scores accumulate into its own PSUM row
@@ -1688,10 +1697,14 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
 
 #: Queries whose softmax shares one set of row instructions, one query per partition.
 #: Used when it divides the query block (:func:`_queries_per_block`), else a group is
-#: one query. A group's queries keep their gathered rows until the group's softmax is
-#: done, so the body holds ``SOFTMAX_ROWS + QUERY_BUFFERS`` gathered-row buffers of
-#: ``n_latent * K`` 2-byte elements per partition.
+#: one query. A group's queries keep their gathered rows until the group's MM2 is done,
+#: so the body holds ``SOFTMAX_ROWS + QUERY_BUFFERS`` gathered-row buffers, rounded up
+#: to whole groups, of ``n_latent * K`` 2-byte elements per partition.
 SOFTMAX_ROWS = 4
+#: Groups between a group and the group whose gather offsets are computed after its MM1.
+#: At 1, the queue reached a group's first gather before its offsets were done. The
+#: offsets rotate over this many groups plus one. Scheduling only.
+OFFSET_GROUPS_AHEAD = 2
 
 
 def _lowp_serves(q_lift_hbm, c_kv_hbm, heads: int, rope: int, STREAM_KV: bool) -> bool:
@@ -1706,20 +1719,18 @@ def _softmax_rows(queries_per_block: int) -> int:
     return SOFTMAX_ROWS if queries_per_block % SOFTMAX_ROWS == 0 else 1
 
 
-_LP_C_T = 0        # the selected rows transposed, latent on partitions: [128, 1, n_latent, K]
-_LP_RAW = 1        # the chunk-major indices, signed
-_LP_FILL = 2       # max(first chunk's index, 0) per partition, fp32: a sentinel's row
-_LP_SHIFT = 3      # (index < 0) * fill
-_LP_OFFSET = 4     # the gather's offsets, uint32: max(index, shift)
-_LP_COUNT = 5
+_LP_RAW = 0        # the chunk-major indices, signed
+_LP_FILL = 1       # max(first chunk's index, 0) per partition, fp32: a sentinel's row
+_LP_SHIFT = 2      # (index < 0) * fill
+_LP_OFFSET = 3     # the gather's offsets, uint32: max(index, shift)
+_LP_COUNT = 4
 
 
-def _lowp_scratch(topk, n_latent, n_chunks, dtype):
-    """One per-query working set of the low-precision body: its gathered rows and their offsets."""
+def _lowp_scratch(n_chunks):
+    """One per-query working set of the low-precision body: its index row and gather offsets."""
     ws = []
     for _ in range(_LP_COUNT):
         ws.append(None)
-    ws[_LP_C_T] = nl.ndarray((LATENT_TILE, 1, n_latent, topk), dtype=dtype, buffer=nl.sbuf)
     ws[_LP_RAW] = _sbuf_i32(KEY_CHUNK, _aligned(n_chunks))
     ws[_LP_FILL] = _scalar(KEY_CHUNK)
     ws[_LP_SHIFT] = _sbuf_i32(KEY_CHUNK, _aligned(n_chunks))
@@ -1756,6 +1767,47 @@ def _lowp_offsets(ws, topk_hbm, row):
                        engine=nisa.engine.vector)
 
 
+def _program_row(m: int, prg_id: int, n_prgs: int, qpb: int, n_blocks: int) -> int:
+    """The query row of program ``prg_id``'s ``m``-th query, counted across its blocks.
+
+    A program takes every ``n_prgs``-th block of ``qpb`` queries from block ``prg_id`` on;
+    -1 when its ``m``-th query lies past its last block.
+    """
+    qb = prg_id + m // qpb * n_prgs
+    if qb >= n_blocks:
+        return -1
+    return qb * qpb + m % qpb
+
+
+def _lowp_load_queries(dst, q_lift_hbm, q0: int, block: int):
+    """Copy the ``block`` query rows from query ``q0`` on into ``dst``, one row per partition.
+
+    A plain copy on the Sync engine's hardware DGE, not a DMA transpose: the compiler orders
+    every transposing DMA after the one before it, the gathers' included.
+    """
+    heads = q_lift_hbm.shape[1]
+    latent = q_lift_hbm.shape[2]
+    nisa.dma_copy(dst=dst[0:block, 0:latent],
+                  src=q_lift_hbm.ap(pattern=[[latent, block], [1, latent]],
+                                    offset=q0 * heads * latent),
+                  dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync)
+
+
+def _lowp_stage_queries(dst, rows, n_latent: int, block: int, dtype):
+    """Put ``block`` query rows of ``rows`` on the latent partitions of ``dst``.
+
+    Column ``li * block + q`` of ``dst`` holds latent tile ``li`` of row ``q``: one PE
+    transpose per latent tile into one PSUM tile, then one copy. The PE transposes are
+    bit-exact, so ``dst`` holds the bytes a DMA transpose of the rows would.
+    """
+    rows_t_ps = nl.ndarray((LATENT_TILE, n_latent * block), dtype=dtype, buffer=nl.psum)
+    for li in range(n_latent):
+        nisa.nc_transpose(dst=rows_t_ps[:, li * block:(li + 1) * block],
+                          data=rows[0:block, li * LATENT_TILE:(li + 1) * LATENT_TILE],
+                          engine=nisa.engine.tensor)
+    nisa.tensor_copy(dst=dst[:, 0:n_latent * block], src=rows_t_ps, engine=nisa.engine.vector)
+
+
 def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
                                    QUERY_BUFFERS=QUERY_BUFFERS_DEFAULT):
     """The low-precision streaming body; see the section comment above.
@@ -1763,8 +1815,8 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
     Preconditions (:func:`_lowp_serves`): one head, no RoPE limb, more than one query,
     the query and the cache in the same 2-byte float, and the row-tiled gate's own: the
     latent an exact multiple of 128 within one MM2 moving tile, K a multiple of 128.
-    ``QUERY_BUFFERS`` gathered-row buffers beyond one group's let the next group's
-    gathers start while a group finishes; scheduling only.
+    ``QUERY_BUFFERS`` gathered-row buffers beyond one group's, rounded up to whole
+    groups, let the next group's gathers start while a group finishes; scheduling only.
     """
     seq, heads, latent = q_lift_hbm.shape
     topk = topk_hbm.shape[1]
@@ -1773,12 +1825,19 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
     tiles = _score_tiles(topk, MOVING_MAX)
     assert QUERY_BUFFERS >= 1, "QUERY_BUFFERS must be at least 1"
 
-    # ---- the per-block query tiles: the staged 2-byte rows -------------------------
+    # ---- the per-block query tiles: the 2-byte rows, then latent on partitions -----
+    # The program's b-th block has its rows in q_rows[b % 2] and its tiles in
+    # q_stage[b % 2] (column li * block + q: latent tile li of row q). A block's rows are
+    # copied during the block two before it and staged during the block before it; the
+    # program's first block does that for itself and copies its second block's rows.
     qpb = _queries_per_block(seq, heads)
     block = qpb * heads
+    q_rows = []
     q_stage = []
-    for _ in range(n_latent):
-        q_stage.append(_stage(q_lift_hbm, LATENT_TILE, block))
+    for _ in range(2):
+        q_rows.append(nl.ndarray((block, latent), dtype=q_lift_hbm.dtype, buffer=nl.sbuf))
+        q_stage.append(nl.ndarray((LATENT_TILE, _aligned(n_latent * block, STAGE_ALIGN)),
+                                  dtype=q_lift_hbm.dtype, buffer=nl.sbuf))
 
     # ---- MM1's stationaries: slot r carries query r of a group in column r ----------
     # Every other column is zero for the whole call: only column r of slot r is ever
@@ -1793,11 +1852,26 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
         nisa.memset(dst=slot, value=0.0, engine=nisa.engine.vector)
         q_masked.append(slot)
 
-    # ---- the per-query gathered rows, rotated across consecutive queries ------------
-    ring = group + QUERY_BUFFERS
-    scratch = []
+    # ---- the per-query gathered rows, rotated across the program's queries ---------
+    # The n-th query of this program, counted across its blocks, uses buffer n % ring
+    # and so waits for the MM2 of query n - ring. With whole groups (at least two, as
+    # QUERY_BUFFERS >= 1), that query's group has its MM2 before the previous group's
+    # softmax in program order, and a block's first group waits on no more than any
+    # other group does.
+    ring = _aligned(group + QUERY_BUFFERS, group)
+    rows_t = []
     for _ in range(ring):
-        scratch.append(_lowp_scratch(topk, n_latent, n_chunks, c_kv_hbm.dtype))
+        rows_t.append(nl.ndarray((LATENT_TILE, 1, n_latent, topk), dtype=c_kv_hbm.dtype,
+                                 buffer=nl.sbuf))
+    # ---- the per-query index rows and gather offsets, rotated the same way ----------
+    # Query n's offsets are in scratch[n % index_ring]. They are written after the MM1
+    # of query n - ahead's group, while the gathers of that group and of the groups
+    # between still read theirs: the ring holds those groups and the one written.
+    ahead = OFFSET_GROUPS_AHEAD * group
+    index_ring = ahead + group
+    scratch = []
+    for _ in range(index_ring):
+        scratch.append(_lowp_scratch(n_chunks))
     # MM2's stationaries, one chunk of keys on partitions at a time.
     c_rows = []
     for _ in range(2):
@@ -1834,25 +1908,34 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
 
     n_prgs = nl.num_programs(axes=0)
     prg_id = nl.program_id(0)
-    for qb in nl.affine_range(prg_id, seq // qpb, n_prgs):
+    n_blocks = seq // qpb
+    # The block loop unrolls at trace time, so a block can prepare the blocks and groups
+    # after it.
+    for qb in range(prg_id, n_blocks, n_prgs):
         q0 = qb * qpb
-        for li in range(n_latent):
-            _transpose_rows(q_stage[li], q_lift_hbm, latent, block, LATENT_TILE,
-                            q0 * heads * latent + li * LATENT_TILE)
-        # Each group's gather offsets are computed while the group before it is still in
-        # flight, ahead of that group's softmax in the Vector engine's program order: the
-        # engine runs its instructions in that order, and a gather waits on its offsets.
-        for r in range(group):
-            _lowp_offsets(scratch[r % ring], topk_hbm, q0 + r)
+        # The program's count of blocks before this block, and of queries.
+        nb = (qb - prg_id) // n_prgs
+        n0 = nb * qpb
+        q_tiles = q_stage[nb % 2]
+        # The program's first block prepares what no block before it did: its own query
+        # tiles, the next block's rows, and the offsets of its first `ahead` queries.
+        if qb == prg_id:
+            _lowp_load_queries(q_rows[0], q_lift_hbm, q0, block)
+            if qb + n_prgs < n_blocks:
+                _lowp_load_queries(q_rows[1], q_lift_hbm, q0 + n_prgs * qpb, block)
+            _lowp_stage_queries(q_stage[0], q_rows[0], n_latent, block, q_lift_hbm.dtype)
+            for m in range(ahead):
+                row = _program_row(m, prg_id, n_prgs, qpb, n_blocks)
+                if row >= 0:
+                    _lowp_offsets(scratch[m % index_ring], topk_hbm, row)
         for g0 in range(0, qpb, group):
             scores_ps = []
             for ti in range(len(tiles)):
                 scores_ps.append(_psum(group, tiles[ti][1]))
             for r in range(group):
                 qi = g0 + r
-                ws = scratch[qi % ring]
-                c_t = ws[_LP_C_T]
-                offsets = ws[_LP_OFFSET]
+                c_t = rows_t[(n0 + qi) % ring]
+                offsets = scratch[(n0 + qi) % index_ring][_LP_OFFSET]
 
                 # ---- gather-transpose: the selected rows with the latent on partitions --
                 # ``dst[l, 0, li, k] = cache[idx[k], li * 128 + l]`` for every selected
@@ -1868,8 +1951,9 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
 
                 # ---- MM1 per score tile into the group's PSUM rows ---------------------
                 for li in range(n_latent):
+                    col = li * block + qi
                     nisa.tensor_copy(dst=q_masked[r][:, li, r:r + 1],
-                                     src=q_stage[li][:, qi:qi + 1], engine=nisa.engine.vector)
+                                     src=q_tiles[:, col:col + 1], engine=nisa.engine.vector)
                 for ti in range(len(tiles)):
                     ks = tiles[ti][0]
                     extent = tiles[ti][1]
@@ -1878,10 +1962,20 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
                                        stationary=q_masked[r][:, li, 0:group],
                                        moving=c_t[:, 0, li, ks:ks + extent],
                                        accumulate=(r > 0 or li > 0))
-            if g0 + group < qpb:
-                for r in range(group):
-                    qi = g0 + group + r
-                    _lowp_offsets(scratch[qi % ring], topk_hbm, q0 + qi)
+            # The offsets of the group `OFFSET_GROUPS_AHEAD` on, in this block or the next.
+            for r in range(group):
+                m = n0 + g0 + ahead + r
+                row = _program_row(m, prg_id, n_prgs, qpb, n_blocks)
+                if row >= 0:
+                    _lowp_offsets(scratch[m % index_ring], topk_hbm, row)
+            # After the block's first MM1: the next block's query tiles from the rows
+            # copied a block ago, then the rows of the block after it into the buffer
+            # those tiles' block read.
+            if g0 == 0 and qb + n_prgs < n_blocks:
+                _lowp_stage_queries(q_stage[(nb + 1) % 2], q_rows[(nb + 1) % 2], n_latent,
+                                    block, q_lift_hbm.dtype)
+                if qb + 2 * n_prgs < n_blocks:
+                    _lowp_load_queries(q_rows[nb % 2], q_lift_hbm, q0 + 2 * n_prgs * qpb, block)
 
             # ---- the group's mask, from its index rows ---------------------------------
             # ``index >= 0`` in fp32 (every index is far below 2**24, so the conversion
@@ -1944,7 +2038,7 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
             # sums, which the simulator does not show (``reports/mla_sparse.md``).
             for r in range(group):
                 qi = g0 + r
-                c_t = scratch[qi % ring][_LP_C_T]
+                c_t = rows_t[(n0 + qi) % ring]
                 pv_ps = []
                 for _ in range(n_latent):
                     pv_ps.append(_psum(LATENT_TILE, 2))
