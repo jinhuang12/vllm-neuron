@@ -43,8 +43,15 @@ Two kernels serve it. One head (the served per-rank shape), a latent of whole
 kernel (:func:`_split_serves`): under LNC2 both physical cores take
 half of every request's keys, B=1 included, and swap softmax partials (max, exp-sum,
 value sum) over ``sendrecv`` to merge them; see :func:`_split_body`. Any other shape
-takes the general kernel, where both physical cores split the requests (``[2]`` grid)
-and a single request runs on one core.
+takes the general kernel. Under LNC2 it runs on both physical cores (``[2]`` grid) when
+there is work for two (:func:`_programs`): two or more requests split over the cores,
+each request whole to one core; one request of ``T >= 2`` rows (the verify step at B=1)
+splits its rows instead -- program ``p`` takes rows ``p * ceil(T / 2)`` up to
+``min(T, (p + 1) * ceil(T / 2))`` (:func:`_row_share`; 2 + 2 at ``T = 4``), and each
+program loads, overlays and transposes the request's window for its own rows. A row's
+instruction stream does not depend on the program that runs it, so the two-program
+result equals the one-program result bit for bit. A single request of one row runs on
+one core.
 
 **DCP mode** (:func:`mla_decode_partial_attention`). Under decode context parallelism
 each of ``CP`` ranks holds every ``CP``-th 128-token block of a sequence's latent KV
@@ -361,9 +368,34 @@ def _transpose_keys(c_t, c_rows, width, n_lat):
         _transpose_block(c_t, c_rows, t0, tw, n_lat, t0)
 
 
+def _row_share(batch, rows, programs, program):
+    """``(first, end)``: the rows ``first .. end - 1`` of each of its requests that program
+    ``program`` of ``programs`` attends.
+
+    With at least as many requests as programs, the requests split over the programs and
+    each program attends every row of its own (``(0, rows)``). One request on two programs
+    splits its rows: program ``p`` takes ``ceil(rows / 2)`` of them from row
+    ``p * ceil(rows / 2)``, the last share cut at ``rows``.
+    """
+    if batch >= programs:
+        return 0, rows
+    share = (rows + programs - 1) // programs
+    first = program * share
+    end = first + share
+    if end > rows:
+        end = rows
+    return first, end
+
+
 def _decode_body(q_hbm, bank_hbm, table_hbm, pos_hbm, written_hbm, topk_hbm,
                  softmax_scale, page_size, dense, rows, out_hbm):
-    """``rows`` query rows per request; request ``b``'s rows are ``b * rows + t``."""
+    """``rows`` query rows per request; request ``b``'s rows are ``b * rows + t``.
+
+    Two or more requests split over the programs, each request whole to one program. One
+    request on two programs (``batch < n_prgs``) runs on both, each program attending its
+    :func:`_row_share` of the rows; the window, the overlay of the step's own rows and the
+    transposed keys are each program's own copy, built as the one-program form builds them.
+    """
     heads, latent = q_hbm.shape[1], q_hbm.shape[2]
     batch = table_hbm.shape[0]
     pages = table_hbm.shape[1]
@@ -386,7 +418,13 @@ def _decode_body(q_hbm, bank_hbm, table_hbm, pos_hbm, written_hbm, topk_hbm,
 
     n_prgs = nl.num_programs(axes=0)
     prg = nl.program_id(0)
-    for b in nl.affine_range(prg, batch, n_prgs):
+    first_row, end_row = _row_share(batch, rows, n_prgs, prg)
+    req0, req_step = prg, n_prgs
+    if batch < n_prgs:
+        # One request on both programs: each program takes the request, and its share of
+        # the rows below.
+        req0, req_step = 0, 1
+    for b in nl.affine_range(req0, batch, req_step):
         # ---- this request's start position, on the heads and on the key partitions --
         start_i = _col(heads, nl.int32)
         nisa.dma_copy(dst=start_i, src=pos_hbm.ap(pattern=[[0, heads], [1, 1]], offset=b))
@@ -413,8 +451,9 @@ def _decode_body(q_hbm, bank_hbm, table_hbm, pos_hbm, written_hbm, topk_hbm,
         # One row per request (today's served line) keeps the one-row kernel's instruction
         # stream: the row's position is the start itself, the window is loaded after the
         # query and transposed block by block inside the score loop. Every T-row addition
-        # below is under ``rows > 1`` / ``t > 0``.
-        for t in range(rows):
+        # below is under ``rows > 1`` / ``t > 0``. ``t`` is the row's index in the request
+        # whichever program attends it, so its stream is the one-program stream.
+        for t in range(first_row, end_row):
             row = b * rows + t
             if t == 0:
                 pos_f = start_f
@@ -1318,13 +1357,15 @@ def mla_decode_partial_attention(q_lift: Tensor, bank: Tensor, block_table: Tens
                 int(page_size), SOURCE_DIGEST)
 
 
-def _programs(batch: int) -> int:
-    """Programs of the general kernel: 2 (an LNC2 pair) for two or more requests, else 1.
+def _programs(batch: int, rows: int = 1) -> int:
+    """Programs of the general kernel: 2 (an LNC2 pair) for two or more requests, which
+    split over the pair, or for one request of two or more rows, whose rows split over it
+    (:func:`_row_share`); else 1.
 
     :func:`~vllm_neuron.functional.dsa.launch_grid.lnc_pair` refuses a setting other
     than unset, 1 or 2 (``LaunchGridError``).
     """
-    if lnc_pair() and batch >= 2:
+    if lnc_pair() and (batch >= 2 or rows >= 2):
         return 2
     return 1
 
@@ -1441,13 +1482,15 @@ def _route(batch: int, rows: int, heads: int, latent: int, page: int, width: int
     softmax partials, cross-program exchange and own-row merge are laid out one row per
     request, and ``T`` rows per request would index the table past the batch. A ``T``-row
     step (``rows > 1``, the speculative verify step's ``1 + k`` rows) therefore runs the
-    general kernel, which gives each request whole to one program and attends its ``T``
-    rows with per-row causal limits. Tests pin both routes at the served shard shape
-    (``test_mla_decode_frontend_compile.py``, ``test_mla_decode_trow.py``).
+    general kernel, which attends each request's ``T`` rows with per-row causal limits;
+    under LNC2 it runs on both programs, two or more requests split over them and one
+    request's rows split over them (:func:`_programs`, :func:`_row_share`). Tests pin both
+    routes at the served shard shape (``test_mla_decode_frontend_compile.py``,
+    ``test_mla_decode_trow.py``).
     """
     split_programs = 2 if lnc_pair() else 1
     split = rows == 1 and _split_serves(heads, latent, page, width, split_programs)
-    programs = split_programs if split else _programs(batch)
+    programs = split_programs if split else _programs(batch, rows)
     if split:
         entry = mla_decode_dense_split_kernel if dense else mla_decode_selected_split_kernel
     else:

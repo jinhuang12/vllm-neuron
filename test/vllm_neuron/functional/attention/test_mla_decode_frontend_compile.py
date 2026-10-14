@@ -181,8 +181,10 @@ def test_the_served_shard_shape_routes_one_row_to_the_key_split_kernel_and_rows_
         dense, lnc, monkeypatch) -> None:
     """The dispatch at TP=64's per-rank shape (one head, latent 512, 128-row pages; ctx 1024
     dense / ctx 8192 selected): one query row per request is the key-split kernel on every
-    program of the core; ``1 + k`` rows per request is the general kernel. Pinned here, beside
-    the compiled entries, so a kernel change cannot flip either route unnoticed."""
+    program of the core; ``1 + k`` rows per request is the general kernel on every program of
+    the core too -- two or more requests split over an LNC2 pair, and one request (the served
+    verify step, B = 1) splits its rows over it. Pinned here, beside the compiled entries, so a
+    kernel change cannot flip either route unnoticed."""
     from vllm_neuron.functional.attention import mla_decode as MD
     if lnc is None:
         monkeypatch.delenv("NEURON_LOGICAL_NC_CONFIG", raising=False)
@@ -196,7 +198,7 @@ def test_the_served_shard_shape_routes_one_row_to_the_key_split_kernel_and_rows_
             split_entry, 2 if lnc == "2" else 1, True), (batch, dense, lnc)
         for rows in QUERY_ROWS[1:]:
             assert MD._route(batch, rows, 1, LATENT, PAGE, width, dense) == (
-                general, 2 if lnc == "2" and batch >= 2 else 1, False), (batch, rows, dense, lnc)
+                general, 2 if lnc == "2" else 1, False), (batch, rows, dense, lnc)
 
 
 def test_the_front_end_accepts_every_new_entry_at_the_served_shapes() -> None:
