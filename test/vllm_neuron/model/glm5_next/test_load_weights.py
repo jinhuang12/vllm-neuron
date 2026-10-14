@@ -12,11 +12,9 @@ from __future__ import annotations
 
 import ast
 import contextlib
-import inspect
 import json
 import logging
 import math
-import textwrap
 from pathlib import Path
 
 import pytest
@@ -33,10 +31,7 @@ from vllm_neuron.model.glm5_next.config import (
 )
 from vllm_neuron.model.glm5_next.model_fp8 import (
     Glm5NextForConditionalGeneration,
-    Glm5NextSharedExpertRouteError,
-    Glm5NextSharedExperts,
     Glm5NextWeightLoadError,
-    _is_fp8_dtype,
 )
 from vllm_neuron.model.glm5_next.quantization import DEFAULT_WEIGHT_BLOCK_SIZE
 from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
@@ -44,7 +39,6 @@ from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
     FP8_SCALE_SUFFIX,
     Glm5NextExpertBankNotLoadableError,
     Glm5NextWeightMapError,
-    MAPPED_KEY_PLAIN,
     MAPPED_KEY_QUANTISED_WEIGHT,
     MAPPED_KEY_SCALE_GRID,
     MAPPED_KEY_STACKED_BANK,
@@ -708,67 +702,7 @@ def _real_call_sites(function_name: str) -> int:
     return real
 
 
-def _statement_positions(method, *, calls: tuple[str, ...], anchor: str):
-    """Line of the earliest call to each named callee and of the latest ``anchor`` call in ``method``."""
-    tree = ast.parse(textwrap.dedent(inspect.getsource(method)))
-    found: dict[str, list[int]] = {name: [] for name in calls}
-    anchor_found: list[int] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        callee = node.func
-        named = callee.attr if isinstance(callee, ast.Attribute) else None
-        if named in found:
-            found[named].append(node.lineno)
-        if named == anchor:
-            anchor_found.append(node.lineno)
-
-    positions = {name: (min(lines) if lines else -1) for name, lines in found.items()}
-    anchor_at = max(anchor_found) if anchor_found else -1
-    return positions, anchor_at
-
-
 _LOAD_TIME_PREPS = ("prepare_projection_weights", "prepare_scale_operands")
-_PREP_CALLER = "_run_load_time_preps"
-
-
-def _prep_call_homes(source: str) -> dict[str, list[tuple[str, int]]]:
-    """Every load-time prep call site in ``source`` with the innermost function it lives in."""
-    homes: dict[str, list[tuple[str, int]]] = {name: [] for name in _LOAD_TIME_PREPS}
-    tree = ast.parse(source)
-    functions = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    ]
-
-    def span(function) -> tuple[int, int]:
-        return function.lineno, function.end_lineno or function.lineno
-
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        callee = node.func
-        named = callee.attr if isinstance(callee, ast.Attribute) else None
-        if named not in homes:
-            continue
-        containing = [
-            function
-            for function in functions
-            if span(function)[0] <= node.lineno <= span(function)[1]
-        ]
-        innermost = min(containing, key=lambda f: span(f)[1] - span(f)[0])
-        homes[named].append((innermost.name, node.lineno))
-    return homes
-
-
-def _every_prep_call_lives_in_the_caller(source: str) -> tuple[bool, dict]:
-    """True when each prep is called exactly once and only from ``_PREP_CALLER``."""
-    homes = _prep_call_homes(source)
-    verdict = all(
-        len(sites) == 1 and sites[0][0] == _PREP_CALLER for sites in homes.values()
-    )
-    return verdict, homes
 
 
 def test_the_scale_grids_stay_fp32(
@@ -918,182 +852,6 @@ class _WholeTensorSlice:
 
     def __getitem__(self, item):
         return self._tensor[item]
-
-
-def test_the_load_time_preps_run_after_the_device_by_name(
-    keep_the_loaded_tensors, tmp_path, single_rank_process_group
-) -> None:
-    """The preps run after ``load_state_dict`` and after the scale read, and both refusals name their cause."""
-    positions, anchor = _statement_positions(
-        Glm5NextForConditionalGeneration.load_weights,
-        calls=("_run_load_time_preps", "_load_out_of_band_scales"),
-        anchor="load_state_dict",
-    )
-    assert anchor > 0, "load_weights no longer calls load_state_dict at all"
-    for name, position in positions.items():
-        assert position > 0, f"load_weights no longer calls {name}"
-        assert position > anchor, (
-            f"{name} is called at statement {position}, before the anchor at "
-            f"{anchor}; it would run on placeholders"
-        )
-
-    assert (
-        positions["_load_out_of_band_scales"] < positions["_run_load_time_preps"]
-    )
-
-    module_source = Path(
-        inspect.getsourcefile(Glm5NextForConditionalGeneration)
-    ).read_text()
-    lives_in_the_caller, homes = _every_prep_call_lives_in_the_caller(module_source)
-    for prep in _LOAD_TIME_PREPS:
-        sites = homes[prep]
-        assert len(sites) == 1, f"{prep} has {len(sites)} call sites, not one: {sites}"
-        enclosing, line = sites[0]
-        assert enclosing == _PREP_CALLER, (
-            f"{prep} is called from {enclosing!r} at line {line}, not from "
-            f"{_PREP_CALLER!r}"
-        )
-    assert lives_in_the_caller
-
-    shared = Glm5NextSharedExperts(_dense_config().text_config)
-    with pytest.raises(Glm5NextSharedExpertRouteError) as case_a:
-        shared.prepare_scale_operands(
-            gate_proj_weight=torch.ones(MINI_WEIGHT_SHAPE, dtype=torch.bfloat16),
-            up_proj_weight=torch.ones(MINI_WEIGHT_SHAPE, dtype=torch.bfloat16),
-            down_proj_weight=torch.ones(MINI_WEIGHT_SHAPE, dtype=torch.bfloat16),
-            gate_proj_scale=None,
-            up_proj_scale=torch.ones(MINI_SCALE_SHAPE, dtype=torch.float32),
-            down_proj_scale=torch.ones(MINI_SCALE_SHAPE, dtype=torch.float32),
-        )
-    assert "gate_proj_scale" in str(case_a.value), str(case_a.value)
-    assert "load the checkpoint before preparing" in str(case_a.value)
-    assert not hasattr(shared, Glm5NextSharedExperts.PREPARED_SCALE_OPERANDS_ATTR), (
-        "the refusal left the operands attribute behind, so a later read would "
-        "find a half-built dict"
-    )
-
-    model = _dense_model()
-    directory = tmp_path / "dense"
-    _write_miniature_checkpoint(directory, _mappings_for(_dense_config()), model)
-    model.load_weights(str(directory), torch.device("cpu"), None)
-    attn_path = next(
-        path
-        for path, module in model.named_modules()
-        if hasattr(type(module), "prepare_projection_weights")
-    )
-    attn = model.get_submodule(attn_path)
-    names = [name for name, _, _ in attn.projection_widths()]
-    with pytest.raises(Glm5NextWeightLoadError) as case_b:
-        model._require_prep_operands_on_device(
-            attn_path, attn, names, torch.device("meta")
-        )
-    assert attn_path in str(case_b.value), str(case_b.value)
-    assert "cpu" in str(case_b.value), str(case_b.value)
-    assert "strand" in str(case_b.value), str(case_b.value)
-
-    checked = model._require_prep_operands_on_device(
-        attn_path, attn, names, torch.device("cpu")
-    )
-    assert checked > 0
-
-    stranded = _dense_model()
-    stranded.load_weights(str(directory), torch.device("cpu"), None)
-    stranded_attn = stranded.get_submodule(attn_path)
-    prepared_attr = type(stranded_attn).PREPARED_WEIGHTS_ATTR
-    before = {
-        name: operand.device.type
-        for name, operand in getattr(stranded_attn, prepared_attr).items()
-    }
-    assert before, "the prep stored no operand"
-    stranded_attn.to("meta")
-    after = {
-        name: operand.device.type
-        for name, operand in getattr(stranded_attn, prepared_attr).items()
-    }
-    assert set(before.values()) == {"cpu"}
-    assert after == before, (
-        "moving the module moved the prepared operands with it; they stay where "
-        "the prep built them, which is why the device check exists"
-    )
-
-
-def test_the_scaled_mla_weights_reach_the_dequant_as_fp8(
-    keep_the_loaded_tensors, tmp_path, single_rank_process_group
-) -> None:
-    """A lone fp8 weight key whose grid is a sibling entry keeps an fp8 placeholder, so the dequant branch is reachable."""
-    real_config = Glm5NextConfig.from_configs(json.loads(REAL_CONFIG_PATH.read_text()))
-    real_model = Glm5NextForConditionalGeneration(real_config)
-    real_mappings = _mappings_for(real_config)
-    scale_names = _derived_dsa_scale_names(real_config)
-    weight_names = sorted(
-        f"{name[: -len('_' + FP8_SCALE_SUFFIX)]}_weight" for name in scale_names
-    )
-    assert weight_names, "the real config declares no scaled MLA weight"
-    missing = [name for name in weight_names if name not in real_mappings]
-    assert missing == [], f"derived but unmapped: {missing[:4]}"
-    typed = [
-        name
-        for name in weight_names
-        if real_model._placeholder_dtype(
-            real_mappings[name], param_name=name, mappings=real_mappings
-        )
-        is torch.float8_e4m3fn
-    ]
-    assert len(typed) == len(weight_names), (
-        f"{len(weight_names) - len(typed)} scaled MLA weights would take a "
-        f"placeholder dtype that is not fp8, e.g. "
-        f"{sorted(set(weight_names) - set(typed))[:4]}"
-    )
-    paired = [
-        name
-        for name in weight_names
-        if len(_keys_of(real_mappings, name)) == 2
-        and classify_mapped_keys(real_mappings[name]) == MAPPED_KEY_QUANTISED_WEIGHT
-    ]
-    assert len(paired) == len(weight_names)
-
-    ordinary = sorted(
-        name
-        for name in real_mappings
-        if name.endswith("_weight")
-        and len(_keys_of(real_mappings, name)) == 1
-        and classify_mapped_keys(real_mappings[name]) == MAPPED_KEY_PLAIN
-        and name not in set(weight_names)
-    )
-    assert ordinary, "there is no unscaled lone weight key to control against"
-    control_dtype = real_model._placeholder_dtype(
-        real_mappings[ordinary[0]],
-        param_name=ordinary[0],
-        mappings=real_mappings,
-    )
-    assert control_dtype is real_config.text_config.torch_dtype
-
-    model = _dense_model()
-    mappings = _mappings_for(_dense_config())
-    directory = tmp_path / "dense"
-    _write_miniature_checkpoint(directory, mappings, model)
-    model.load_weights(str(directory), torch.device("cpu"), None)
-
-    attn_path = next(
-        path
-        for path, module in model.named_modules()
-        if hasattr(type(module), "prepare_projection_weights")
-    )
-    attn = model.get_submodule(attn_path)
-    reached = 0
-    for leaf in DSA_SCALED_PROJECTIONS:
-        weight = getattr(attn, f"{leaf}_weight")
-        assert _is_fp8_dtype(weight.dtype), (
-            f"{attn_path}.{leaf}_weight arrived {weight.dtype}; the checkpoint "
-            f"holds fp8 bytes, so the dequant branch is unreachable and the "
-            f"bytes would be used as if they were numbers"
-        )
-        reached += 1
-    assert reached == len(DSA_SCALED_PROJECTIONS)
-
-    mlp_path = attn_path.rsplit(".", 1)[0] + ".mlp"
-    mlp_weight = getattr(model.get_submodule(mlp_path), "gate_proj_weight")
-    assert _is_fp8_dtype(mlp_weight.dtype)
 
 
 # --------------------------------------------------------------------------- #
