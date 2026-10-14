@@ -241,8 +241,11 @@ class _OneRankGroup:
     work that depends on no reduced value can run under them. ``--ar-chain A F`` issues
     ``A`` (attention site) or ``F`` (FFN site) dependent one-rank all-reduces in a row,
     each the identity on the values, so the wait lasts about as long as the served one
-    while the compute engines stay free.
+    while the compute engines stay free. ``rank_in_group`` is the one-rank world's: the
+    DSA indexer binds its shard rank from it at load.
     """
+
+    rank_in_group = 0
 
     def all_reduce(self, tensor):
         import torch.distributed as dist
