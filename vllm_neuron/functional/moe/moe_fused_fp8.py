@@ -319,68 +319,62 @@ def _item_experts(sbm, experts_row, items, chunks):
     return table
 
 
-def _program_list(sbm, routed, experts_row, experts, items, chunks):
-    """List the routed chunks of this program's experts: int32 [1, 2 * items + 1].
+def _program_list(sbm, routed, items):
+    """List the routed chunks this program computes: int32 [1, 2 * items + 1].
 
-    Program ``p`` owns the experts ``e`` with ``e % nprograms == p``. Columns
-    [0, items) hold the flags of their chunks; ``nonzero_with_count`` writes
-    the list of their items, in item order, from column ``items`` on, padded
-    with the out-of-range item ``items`` and ended by the count, which the
-    kernel does not read (_list_end). Source and destination are disjoint
-    column ranges of one tile, so no placement can alias them.
+    The routed items, in item order, are dealt over the programs in turn:
+    program ``p`` takes the routed items ``p, p + nprograms, ...`` of the
+    whole list, so the program lists differ in length by at most one.
+    ``nonzero_with_count`` writes the whole list to a scratch row, padded with
+    the out-of-range item ``items`` and ended by the routed count; this
+    program's items move from there to column ``items`` on, padded with
+    ``items``, and column ``2 * items`` takes the routed count (_list_end).
     """
-    blocks = items // chunks
     nprograms, program = nl.num_programs(0), nl.program_id(0)
     listing = sbm.alloc_stack((1, max(2 * items + 1, 8)), dtype=nl.int32)
     sbm.open_scope(name="program_list")
-    match = sbm.alloc_stack((1, max(blocks, 8)), dtype=nl.float32)
-    nisa.tensor_scalar(dst=match[:, :blocks], data=experts_row[:, :blocks], op0=nl.equal,
-                       operand0=program)
-    for expert in range(program + nprograms, experts, nprograms):
-        nisa.scalar_tensor_tensor(dst=match[:, :blocks], data=experts_row[:, :blocks],
-                                  op0=nl.equal, operand0=expert + 0.0, op1=nl.add,
-                                  operand1=match[:, :blocks])
-    # flags[b, c] = routed[b, c] * match[b], the match repeated over the chunks.
-    nisa.tensor_tensor(
-        dst=listing.ap(pattern=[[listing.shape[1], 1], [chunks, blocks], [1, chunks]]),
-        data1=routed.ap(pattern=[[routed.shape[1], 1], [chunks, blocks], [1, chunks]]),
-        data2=match.ap(pattern=[[match.shape[1], 1], [1, blocks], [0, chunks]]),
-        op=nl.multiply)
-    nisa.nonzero_with_count(dst=listing[:, items:2 * items + 1], src=listing[:, :items],
-                            padding_val=items)
+    flags = _tile(sbm, 1, items, nl.int32)
+    nisa.tensor_copy(dst=flags, src=routed[:, :items])
+    # A whole allocated row, not a column view of one: the partition step of
+    # the strided read below must equal the row's allocated width.
+    whole = sbm.alloc_stack((1, max(items + 1, 8)), dtype=nl.int32)
+    nisa.nonzero_with_count(dst=whole[:, :items + 1], src=flags, padding_val=items)
+    # Positions program, program + nprograms, ... below items: this program's share.
+    entries = (items - program + nprograms - 1) // nprograms
+    nisa.tensor_copy(dst=listing[:, items:items + entries],
+                     src=whole.ap(pattern=[[whole.shape[1], 1], [nprograms, entries]],
+                                  offset=program))
+    if entries < items:
+        nisa.memset(dst=listing[:, items + entries:2 * items], value=items)
+    nisa.tensor_copy(dst=listing[:, 2 * items:2 * items + 1], src=whole[:, items:items + 1])
     sbm.close_scope()
     return listing
 
 
-def _list_end(sbm, routed, item_experts, items, slots):
+def _list_end(sbm, listing, items, slots):
     """The end of the dynamic loop, int32 [1, 1]: the longest program list, at least ``slots``.
 
     Under LNC2 both cores pass a core barrier at every trip of a device loop,
     so every program must run the same number of trips: a core with more
     trips waits at the barrier for ever (MEASURED: HANG_ON_COMPUTE with lists
-    of 12 and 24 entries past the slots). Every program counts every
-    program's list, the routed items whose expert ``e`` has
-    ``e % nprograms == q`` (_program_list), from the same data and with the
-    same instructions, so all programs get the same end. The owner is
-    ``e & (nprograms - 1)``: the compiler has no integer remainder operator.
+    of 12 and 24 entries past the slots). Program 0's list is the longest,
+    ``ceil(count / nprograms)`` of the ``count`` routed items (_program_list's
+    column ``2 * items``, the same on every program), counted without a
+    division as ``#{m >= 0 : m * nprograms < count}``.
     """
     nprograms = nl.num_programs(0)
-    kernel_assert(nprograms & (nprograms - 1) == 0, "The program count must be a power of two")
+    most = (items + nprograms - 1) // nprograms
     end = _tile(sbm, 1, 1, nl.int32)
     sbm.open_scope(name="list_end")
-    owner = _tile(sbm, 1, items, nl.int32)
-    nisa.tensor_scalar(dst=owner, data=item_experts[:, :items], op0=nl.bitwise_and,
-                       operand0=nprograms - 1)
-    # tagged = (owner + 1) * routed: the owner plus one, or 0 when unrouted.
-    tagged = _tile(sbm, 1, items)
-    nisa.scalar_tensor_tensor(dst=tagged, data=owner, op0=nl.add, operand0=1.0,
-                              op1=nl.multiply, operand1=routed[:, :items])
-    lengths = _tile(sbm, 1, nprograms + 1)
-    nisa.memset(dst=lengths[:, nprograms:nprograms + 1], value=float(slots))
-    matches = _tile(sbm, 1, items)
-    for q in range(nprograms):
-        nisa.tensor_scalar_reduce(dst=matches, data=tagged, op0=nl.equal, operand0=q + 1.0,
-                                  reduce_op=nl.add, reduce_res=lengths[:, q:q + 1])
+    count = _tile(sbm, 1, 1)
+    nisa.tensor_copy(dst=count, src=listing[:, 2 * items:2 * items + 1])
+    starts = _tile(sbm, 1, most)
+    nisa.iota(dst=starts, pattern=[[nprograms, most]], offset=0, channel_multiplier=0)
+    lengths = _tile(sbm, 1, 2)
+    nisa.memset(dst=lengths[:, 1:2], value=float(slots))
+    below = _tile(sbm, 1, most)
+    nisa.tensor_scalar_reduce(dst=below, data=starts, op0=nl.less, operand0=count,
+                              reduce_op=nl.add, reduce_res=lengths[:, 0:1])
     nisa.tensor_reduce(dst=end, data=lengths, op=nl.maximum, axis=(1,))
     sbm.close_scope()
     return end
@@ -674,6 +668,43 @@ def _slot_expert(experts, item_experts, read, s):
     _dynamic_read(experts[:, s:s + 1], item_experts, 0, read[:, s:s + 1])
 
 
+def _loop_entry(sbm, listing, items, item_experts, offset, index):
+    """List entry ``index + offset`` of _program_list's ``listing``: ``(entry, item, expert)``.
+
+    ``index`` is a register. ``entry`` is the uint32 [1, 1] listed item;
+    ``item`` and ``expert`` are registers with the item the entry reads and
+    its expert. An entry past the list's end reads the last item, as a slot
+    does (_slot_items); its store (the listed entry itself) writes nothing.
+    """
+    # uint32: the entry indexes dynamic SBUF reads, which take an unsigned offset.
+    entry = _tile(sbm, 1, 1, nl.uint32)
+    _dynamic_read(entry, listing, items + offset, index)
+    read = _tile(sbm, 1, 1, nl.uint32)
+    nisa.tensor_scalar(dst=read, data=entry, op0=nl.minimum, operand0=items - 1)
+    item = _register(read)
+    return entry, item, _entry(sbm, item_experts, 0, item)
+
+
+def _loop_turns(turns, width):
+    """_turn_buffers' ``turns`` with PSUM banks of one device-loop trip's own (_psum_banks)."""
+    gate_up_banks, transpose_bank, down_banks = _psum_banks(width)
+    return (turns[0], turns[1], turns[2], gate_up_banks, transpose_bank, down_banks, turns[6])
+
+
+def _pairs_end(sbm, end, slots):
+    """The end of the two-entry loop, int32 [1, 1]: ``end``, less one when ``end - slots`` is odd.
+
+    Computed from the loop end alone, so every program gets the same trips (_list_end).
+    """
+    span = _tile(sbm, 1, 1, nl.int32)
+    nisa.tensor_scalar(dst=span, data=end, op0=nl.subtract, operand0=slots)
+    odd = _tile(sbm, 1, 1, nl.int32)
+    nisa.tensor_scalar(dst=odd, data=span, op0=nl.bitwise_and, operand0=1)
+    pairs_end = _tile(sbm, 1, 1, nl.int32)
+    nisa.tensor_tensor(dst=pairs_end, data1=end, data2=odd, op=nl.subtract)
+    return pairs_end
+
+
 def _zero_row0(sbm, out, row_ids):
     """Write zeros to row 0 of ``out`` [rows, H] when ``row_ids[0, 0]`` is invalid.
 
@@ -706,12 +737,14 @@ def moe_fused_fp8_kernel(hidden, weights, scales, row_ids, expert_ids, affinity,
     """Return FP32 [blocks,q,H] contributions of the routed rows, from device routing.
 
     Args:
-        hidden: BF16 [T+1,H], final row zero.
+        hidden: BF16 [T,H], one row per token. A row id of -1 resolves one
+            past the last row, so neither of its gathers reads a row
+            (_gather_rows).
         weights: Prepared finite FP8 [E,3*(I/128),128,H/128,128].
         scales: Matching FP32 [E,3*(I/128),H/128].
         row_ids: int32 [blocks,q], token IDs or -1 (holes are allowed).
         expert_ids: int32 [blocks,1], expert for each block, in [0, E).
-        affinity: FP32 [(T+1)*E,1], final E entries zero.
+        affinity: FP32 [T*E,1], token-major [T,E].
         bounds: FP32 [128,3], gate upper, up lower, up upper, the same on
             every row.
         BLOCK_M: Bounds the rows of one chunk, with _CHUNK_ROWS.
@@ -726,14 +759,16 @@ def moe_fused_fp8_kernel(hidden, weights, scales, row_ids, expert_ids, affinity,
         sends every invalid slot to row 0 reads finite values. Each 128x128
         block scale multiplies one BF16 operand of its product, rounded once,
         and every contraction accumulates in FP32 in PSUM, so the result is a
-        tolerance-defined FP32 sum, not a fixed reference order. Program ``p``
-        owns the experts ``e`` with ``e % nprograms == p`` and lists their
-        routed chunks of at most _CHUNK_ROWS rows. Each program runs E //
+        tolerance-defined FP32 sum, not a fixed reference order. The routed
+        chunks of at most _CHUNK_ROWS rows are dealt over the programs in
+        turn, in item order (_program_list). Each program runs E //
         nprograms slots in line: each loads its chunk's expert weights, by a
         dynamic address, and gathers its rows while the previous slot
         computes, so a short list computes a chunk that it stores nowhere.
-        Entries past the slots run in one dynamic loop at the end, which every
-        program runs up to the longest program list. Every defined row has
+        Entries past the slots run in dynamic loops at the end, which every
+        program runs up to the longest program list: two entries a trip in
+        two buffers, so the second entry's weights load while the first entry
+        computes, and an odd count's last entry alone. Every defined row has
         exactly one writer. All routing decisions remain on device.
     """
     blocks, q = row_ids.shape
@@ -770,13 +805,13 @@ def moe_fused_fp8_kernel(hidden, weights, scales, row_ids, expert_ids, affinity,
                   dge_mode=_HWDGE, engine=_DMA_QUEUE)
     routed = _routed_chunks(sbm, row_ids, width, SKIP_PADDING)
     item_experts = _item_experts(sbm, experts_row, items, chunks)
-    listing = _program_list(sbm, routed, experts_row, experts, items, chunks)
+    listing = _program_list(sbm, routed, items)
     compute = (hidden, row_ids.reshape((items, width)), affinity, clamp, out_rows)
 
     # The same slot count on every program, so every program starts its dynamic
     # loop at the same entry (_list_end).
     slots = min(experts // nprograms, items)
-    end = _list_end(sbm, routed, item_experts, items, slots)
+    end = _list_end(sbm, listing, items, slots)
     tokens = hidden.shape[0]
     affinity_experts = affinity.shape[0] // tokens
     # Slot ``s`` uses the expert buffers and rows ``s % 2``, and the scales and
@@ -846,28 +881,54 @@ def moe_fused_fp8_kernel(hidden, weights, scales, row_ids, expert_ids, affinity,
         if s + 2 < slots:
             _transposed(rows[s % 2], expert_slots[(s + 2) % 6][4], turns[4])
 
-    # Entries past the slots reuse the first slot's buffers, one at a time, up
-    # to the longest program list.
-    def later(index):
-        # uint32: the entry indexes dynamic SBUF reads, which take an unsigned offset.
-        entry = _tile(sbm, 1, 1, nl.uint32)
-        _dynamic_read(entry, listing, items, index)
-        # An entry past this program's list loads the last item, as a slot does
-        # (_slot_items); its store (the listed entry itself) writes nothing.
-        read = _tile(sbm, 1, 1, nl.uint32)
-        nisa.tensor_scalar(dst=read, data=entry, op0=nl.minimum, operand0=items - 1)
-        item = _register(read)
-        expert = _entry(sbm, item_experts, 0, item)
-        slot = expert_slots[0]
-        gate_up_banks, transpose_bank, down_banks = _psum_banks(width)
-        loop_turns = (turns[0], turns[1], turns[2], gate_up_banks, transpose_bank, down_banks,
-                      turns[6])
-        _load_expert(weights, scales, expert, slot)
+    # Entries past the slots run two a trip, in two of the slots' buffers, the
+    # one the last slot leaves free first: both entries' weights load at the
+    # start of the trip, so the second entry's load overlaps the first entry's
+    # products. A trip loads every tile that it reads, so no read relies on
+    # the loop back-edge alone to follow its write. An odd count ends in a
+    # loop of at most one trip.
+    first, second = expert_slots[slots % 6], expert_slots[(slots + 1) % 6]
+
+    def pair(index):
+        # Entry ``index + 1``'s gate/up pairs interleave with entry ``index``'s
+        # down products, as a slot's do with the next slot's.
+        entry, item, expert = _loop_entry(sbm, listing, items, item_experts, 0, index)
+        entry_next, item_next, expert_next = _loop_entry(sbm, listing, items, item_experts, 1,
+                                                         index)
+        _load_expert(weights, scales, expert, first)
+        _load_expert(weights, scales, expert_next, second)
+        loop_turns = _loop_turns(turns, width)
         _gather_rows(compute, item, _store_bases(sbm, entry, width), rows[0], gathers[0])
-        _transposed(rows[0], slot[4], transpose_bank)
-        _gate_up(compute, slot, loop_turns, width)
-        _down(compute, slot, gathers[0], expert, loop_turns, turns[2][0], width)
-    nl.fori_loop(slots, _register(end), later)
+        _gather_rows(compute, item_next, _store_bases(sbm, entry_next, width), rows[1],
+                     gathers[1])
+        _transposed(rows[0], first[4], loop_turns[4])
+        _gate_up(compute, first, loop_turns, width)
+        _transposed(rows[1], second[4], loop_turns[4])
+        _dynamic_read(gathers[0][5], gathers[0][4], 0, expert)
+        accumulators = []
+        parts = _down_parts(first)
+        for k in range(max(ni, parts)):
+            if k < ni:
+                _gate_up_pair(compute, second, loop_turns, width, k, accumulators)
+            if k < parts:
+                _down_products(first, gathers[0], loop_turns, turns[2][0], width, k)
+        _gate_up_last(compute, second, loop_turns, accumulators)
+        _store(compute, turns[2][0], gathers[0][6])
+        _down(compute, second, gathers[1], expert_next, loop_turns, turns[2][1], width)
+
+    def last(index):
+        # The odd count's last entry, in ``first``.
+        entry, item, expert = _loop_entry(sbm, listing, items, item_experts, 0, index)
+        _load_expert(weights, scales, expert, first)
+        loop_turns = _loop_turns(turns, width)
+        _gather_rows(compute, item, _store_bases(sbm, entry, width), rows[0], gathers[0])
+        _transposed(rows[0], first[4], loop_turns[4])
+        _gate_up(compute, first, loop_turns, width)
+        _down(compute, first, gathers[0], expert, loop_turns, turns[2][0], width)
+
+    pairs_end = _pairs_end(sbm, end, slots)
+    nl.fori_loop(slots, _register(pairs_end), pair, step=2)
+    nl.fori_loop(_register(pairs_end), _register(end), last)
     sbm.close_scope()
     sbm.close_scope()
     return out
