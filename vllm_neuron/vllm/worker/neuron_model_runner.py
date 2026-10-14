@@ -8079,6 +8079,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 device=input_ids.device,
                 sampling_rows=int(kwargs["sampling_positions"].shape[0]),
             ),
+            # The image rows of a prefill on a server that admits images; {} on every
+            # other step, so the decode and text-only signatures are unchanged.
+            **self._glm5next_vision_kwargs(kwargs, rows=tokens),
         }
 
     def _glm5next_parallel_kwargs(self, device: torch.device | None = None) -> dict:
@@ -13499,6 +13502,40 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if is_prefill or metadata is None:
             return {}
         return {"spec_decode_metadata": metadata}
+
+    @staticmethod
+    def _glm5next_vision_kwargs(kwargs: dict, *, rows: int) -> dict:
+        """The root's two image keywords on a step that carries them, else ``{}``.
+
+        ``_gather_mm_embeddings`` adds ``vision_embedding_blocks`` and
+        ``vision_positions`` to every prefill step of a server that admits images,
+        and the prefill warm-up adds the same pair; no other step carries them.
+
+        An unused position holds the step's row count before the translator pads
+        the chunk to the largest query bucket. After that pad, the count is a real
+        row, so such a position is moved to ``rows``, the padded count, which the
+        merge reads as past the chunk and discards.
+
+        Args:
+            kwargs: the step's generic model kwargs, with the unpadded ``input_ids``.
+            rows: the translator's row count after its pad.
+
+        Raises:
+            ValueError: one of the two keys without the other.
+        """
+        blocks = kwargs.get("vision_embedding_blocks")
+        positions = kwargs.get("vision_positions")
+        if blocks is None and positions is None:
+            return {}
+        if blocks is None or positions is None:
+            raise ValueError(
+                "a GLM-5.3-Flash prefill takes vision_embedding_blocks and "
+                "vision_positions together; this call site handed one of them"
+            )
+        unpadded = int(kwargs["input_ids"].shape[0])
+        if rows > unpadded:
+            positions = positions.masked_fill(positions >= unpadded, rows)
+        return {"vision_embedding_blocks": blocks, "vision_positions": positions}
 
     def _glm5next_draft_kwargs(self) -> dict:
         """The root's ``draft_k`` keyword for this step: ``{}`` when nothing drafts.

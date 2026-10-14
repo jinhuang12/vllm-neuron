@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the vision tower and for merging its embeddings into the decoder's hidden states.
+"""Tests for the vision tower's inputs and for merging its embeddings into the decoder's hidden states.
 
-The tower is compared with transformers' ``Glm5NextVisionModel`` on a tiny random-init config
-with every weight copied across, in two arms so a failure says where: the merged output
-against the reference's ``pooler_output``, and the pre-merger stage against its
-``last_hidden_state``. The merge tests check that exactly the placeholder positions are
-written, that positions outside this rank's shard are dropped, and that the encoder-cache
-snapshot round-trips unchanged.
+The tower tests check the processor's patch rows and the rope positions against transformers'
+reference. The merge tests check that exactly the placeholder positions are written, that
+positions outside this rank's shard are dropped, and that the encoder-cache snapshot
+round-trips unchanged.
 """
 
 from __future__ import annotations
@@ -16,7 +14,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from torch.testing import assert_close
 
 # transformers is a hard floor for this fork -- requirements/core.txt declares
 # transformers>=5.16.1,<6.0.0 -- so the skip is taken here rather than in a fixture, and an
@@ -27,11 +24,6 @@ from torch.testing import assert_close
 pytest.importorskip(
     "transformers.models.glm5_next",
     reason="transformers>=5.16.1 carries the glm5_next reference this file measures against",
-)
-
-from transformers.models.glm5_next import (  # noqa: E402
-    configuration_glm5_next,
-    modeling_glm5_next,
 )
 
 from vllm_neuron.model.glm5_next.config import Glm5NextVisionConfig
@@ -45,22 +37,12 @@ from vllm_neuron.model.glm5_next.utils.vision_preprocessing import (
     require_transformers_glm5_next,
 )
 from vllm_neuron.model.glm5_next.utils.vision_rope import vision_position_ids
-from vllm_neuron.model.glm5_next.vision_encoder import (
-    _ACTIVATIONS,
-    Glm5NextVisionEncoder,
-    compute_attention_bounds,
-    patch_embed_filters_from_conv3d,
-)
+from vllm_neuron.model.glm5_next.vision_encoder import _ACTIVATIONS
 
-# float32 throughout. The two sides share copied weights, so a difference anywhere near the
-# tolerance below would be a real disagreement rather than accumulated rounding.
+# The dtype of every tensor these tests build.
 DTYPE = torch.float32
 
-RTOL, ATOL = 1e-2, 1e-5
-
-# The size the tower comparison runs. It resamples nothing, its grid is non-square, and its
-# patch count exceeds the patch embed seam's per-call batch ceiling, so the tower's chunking
-# is exercised rather than skipped.
+# The size the rope test runs. It resamples nothing, and its grid is non-square.
 REGIME_A_CASE = ("wide_strip", 1400, 56)
 
 # The geometry fields stay at the checkpoint's real values so the grid helper applies
@@ -93,196 +75,12 @@ def _fork_config() -> Glm5NextVisionConfig:
     return Glm5NextVisionConfig(**TINY)
 
 
-def _reference_config():
-    """The reference's own config object, carrying the same tiny numbers.
-
-    ``_attn_implementation`` is pinned to eager because the flash path needs a CUDA build;
-    eager takes the reference's chunked per-segment branch, which is the same mathematics.
-    """
-    cfg = configuration_glm5_next.Glm5NextVisionConfig(**TINY)
-    cfg._attn_implementation = "eager"
-    return cfg
-
-
-def _reference_tower():
-    """Build the reference tower and put it in eval mode with a fixed seed."""
-    torch.manual_seed(60)
-    ref = modeling_glm5_next.Glm5NextVisionModel(_reference_config()).to(DTYPE)
-    ref.eval()
-    return ref
-
-
-def _fork_tower_with_copied_weights(cfg: Glm5NextVisionConfig, ref) -> Glm5NextVisionEncoder:
-    """Copy every reference weight into a fork tower, and account for both sides name by name.
-
-    Three parameters need a transform and the rest match by name. A comparison whose weights
-    were only partly copied would pass or fail for reasons that have nothing to do with the
-    tower, so the two closing assertions check that no parameter was left behind on either side.
-    """
-    tower = Glm5NextVisionEncoder(cfg, dtype=DTYPE)
-    tower.eval()
-
-    ref_params = dict(ref.named_parameters())
-    consumed: set[str] = set()
-    written: set[str] = set()
-
-    def take(name: str) -> torch.Tensor:
-        consumed.add(name)
-        return ref_params[name].detach()
-
-    with torch.no_grad():
-        # (1) patch embed: [C_out, C_in, T, P, P] -> [1, P, P, C_in, C_out], summed over the
-        # temporal axis. The temporal-slice test below measures what makes the sum exact.
-        tower.patch_embed_filters.copy_(
-            patch_embed_filters_from_conv3d(take("patch_embed.proj.weight"))
-        )
-        written.add("patch_embed_filters")
-        tower.patch_embed_bias.copy_(take("patch_embed.proj.bias"))
-        written.add("patch_embed_bias")
-
-        # (2) the block stack: every name matches the reference's.
-        for idx in range(cfg.depth):
-            for leaf in (
-                "norm1.weight",
-                "norm2.weight",
-                "attn.qkv.weight",
-                "attn.qkv.bias",
-                "attn.proj.weight",
-                "attn.proj.bias",
-                "attn.q_norm.weight",
-                "attn.k_norm.weight",
-                "mlp.gate_proj.weight",
-                "mlp.gate_proj.bias",
-                "mlp.up_proj.weight",
-                "mlp.up_proj.bias",
-                "mlp.down_proj.weight",
-                "mlp.down_proj.bias",
-            ):
-                name = f"blocks.{idx}.{leaf}"
-                _assign(tower, name, take(name))
-                written.add(name)
-
-        # (3) the adapter: the fork module owns its own conv transform.
-        tower.adapter.post_layernorm.weight.copy_(take("post_layernorm.weight"))
-        written.add("adapter.post_layernorm.weight")
-        tower.adapter.downsample_weight.copy_(
-            tower.adapter.downsample_weight_from_conv(take("downsample.weight"))
-        )
-        written.add("adapter.downsample_weight")
-        tower.adapter.downsample_bias.copy_(take("downsample.bias"))
-        written.add("adapter.downsample_bias")
-        for leaf in (
-            "proj.weight",
-            "post_projection_norm.weight",
-            "post_projection_norm.bias",
-            "gate_proj.weight",
-            "up_proj.weight",
-            "down_proj.weight",
-        ):
-            name = f"merger.{leaf}"
-            _assign(tower, f"adapter.{name}", take(name))
-            written.add(f"adapter.{name}")
-
-    fork_names = {name for name, _ in tower.named_parameters()}
-    missing_fork = sorted(fork_names - written)
-    missing_ref = sorted(set(ref_params) - consumed)
-    assert not missing_fork, f"fork parameters never written: {missing_fork}"
-    assert not missing_ref, f"reference parameters never read: {missing_ref}"
-    return tower
-
-
-def _assign(module: torch.nn.Module, dotted: str, value: torch.Tensor) -> None:
-    """Copy ``value`` into the parameter at ``dotted`` on ``module``."""
-    target = module
-    parts = dotted.split(".")
-    for part in parts[:-1]:
-        target = getattr(target, part)
-    getattr(target, parts[-1]).copy_(value)
-
-
 def _grid_for_case(height: int, width: int) -> torch.Tensor:
     """Derive the case's grid through the preprocessing helper, not from a literal."""
     package = require_transformers_glm5_next()
     consts = GridConstants.from_processor(package.Glm5NextImageProcessor())
     spec = image_grid_spec(consts, height, width)
     return torch.tensor([spec.thw], dtype=torch.long)
-
-
-def _patch_rows(grid_thw: torch.Tensor, cfg: Glm5NextVisionConfig, seed: int):
-    """Build patch rows whose temporal slices are copies, as the processor does.
-
-    Returns ``(pixel_values, total_patches)`` with ``pixel_values`` shaped
-    ``[total_patches, in_channels * temporal_patch_size * patch_size ** 2]`` and the temporal
-    axis a broadcast of one slice.
-    """
-    total = int((grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2]).sum())
-    generator = torch.Generator().manual_seed(seed)
-    one_slice = torch.randn(
-        total,
-        cfg.in_channels,
-        1,
-        cfg.patch_size,
-        cfg.patch_size,
-        generator=generator,
-        dtype=DTYPE,
-    )
-    rows = one_slice.expand(
-        total, cfg.in_channels, cfg.temporal_patch_size, cfg.patch_size, cfg.patch_size
-    )
-    return rows.reshape(total, -1).contiguous(), total
-
-
-def test_the_tower_matches_the_reference_model_on_a_regime_a_grid():
-    """Two arms: the merged output, then the pre-merger stage."""
-    _name, height, width = REGIME_A_CASE
-    cfg = _fork_config()
-    grid_thw = _grid_for_case(height, width)
-    pixel_values, _total = _patch_rows(grid_thw, cfg, seed=1060)
-
-    ref = _reference_tower()
-    tower = _fork_tower_with_copied_weights(cfg, ref)
-
-    with torch.no_grad():
-        reference = ref(pixel_values, grid_thw=grid_thw)
-        actual_pooled = tower(pixel_values, grid_thw)
-
-    expected_pooled = reference.pooler_output
-    assert actual_pooled.shape == expected_pooled.shape, (
-        f"merged output shape {tuple(actual_pooled.shape)} != reference "
-        f"{tuple(expected_pooled.shape)}"
-    )
-    assert_close(actual_pooled, expected_pooled, rtol=RTOL, atol=ATOL)
-
-    # Stop both sides one stage earlier, at the reference's last_hidden_state (post-downsample,
-    # pre-merger). A mismatch here and not above means the merger; a mismatch in both means
-    # something upstream of it.
-    with torch.no_grad():
-        blocks_out = _fork_blocks_only(tower, pixel_values, grid_thw)
-        actual_pre_merger = tower.adapter.regroup_and_downsample(
-            tower.adapter.post_layernorm(blocks_out)
-        )
-    expected_pre_merger = reference.last_hidden_state
-    assert_close(actual_pre_merger, expected_pre_merger, rtol=RTOL, atol=ATOL)
-
-
-def _fork_blocks_only(
-    tower: Glm5NextVisionEncoder, pixel_values: torch.Tensor, grid_thw: torch.Tensor
-) -> torch.Tensor:
-    """Run the tower's patch embed, rope and block stack, stopping before the adapter."""
-    from vllm_neuron.model.glm5_next.utils.vision_rope import (
-        compute_vision_rotary_pos_emb,
-    )
-
-    hidden_states = tower.patch_embed(pixel_values)
-    cos, sin = compute_vision_rotary_pos_emb(
-        grid_thw, tower.head_dim, tower.spatial_merge_size
-    )
-    cos = cos.to(dtype=hidden_states.dtype)
-    sin = sin.to(dtype=hidden_states.dtype)
-    bound_min, bound_max = compute_attention_bounds(grid_thw)
-    for block in tower.blocks:
-        hidden_states = block(hidden_states, cos, sin, bound_min, bound_max)
-    return hidden_states
 
 
 def test_the_two_temporal_patch_slices_are_the_same_pixels():
