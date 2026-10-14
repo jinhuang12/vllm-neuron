@@ -83,6 +83,23 @@ instructions in program order, and the norm's transposes wait for the collapse o
 vector engine; issued after the next tile's transposes and matmuls, they no longer
 hold the tensor engine idle while the collapse runs.
 
+Gate groups (both kernels). The full tiles go in groups of :func:`_gate_group` tiles (4
+at the served 1024 and 2048 tokens), each tile's streams held in SBUF until its
+collapse. Steps 1-2 run per tile; step 3 is one ``sendrecv`` per group and step 4 runs
+once per group, on ``[rows, tiles, ...]`` tiles. The scalar engine's ``sigmoid`` and
+``exp`` have no table set in common, so a call loads a table twice per group instead of
+twice per tile. Each element takes the same instructions in the same order as in a tile
+of its own, so the outputs do not change by a bit. A group's step 5 is issued tile by
+tile, each after steps 1-2 of the next group's tile at the same position: the collapse
+runs on the vector engine beside the next group's transposes and matmuls.
+In the norm form, step 6 of a group is split (:func:`_norm_hold`, :func:`_norm_group`).
+Each tile's square sums (its transposes, Gram block and diagonal) are issued one tile
+late, as above, into the tile's column of a ``[rows, tiles]`` tile. After the next
+group's step 4, the group's sums take one ``sendrecv`` and one ``rsqrt``, and each
+tile's rows are scaled and stored; the layer_input rows wait in SBUF until then. Each
+element again takes the instructions of a tile of its own.
+The other tiles (the last, shorter tile and the short ones) keep the per-tile order.
+
 Both LNC2 cores: yes. Each program does half the contraction (step 2), half the
 transposes, half the collapse and half the norm; steps 3-4 are ``rows x (M + rows)``
 values, done on both.
@@ -98,6 +115,7 @@ from torch import Tensor
 import nki
 import nki.isa as nisa
 import nki.language as nl
+from nkilib.core.utils.allocator import sizeinbytes
 from nkilib.core.utils.kernel_assert import kernel_assert
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
@@ -119,6 +137,30 @@ _GROUP = 8
 def _group(dtype):
     """Hidden blocks of ``dtype`` per 2 KiB PSUM bank of transposes: 8 bf16, 4 fp32."""
     return _GROUP if dtype == nl.bfloat16 else _GROUP // 2
+
+
+#: The share of the usable SBUF partition (``nl.tile_size.sbuf_fmax_bytes``) that the
+#: gate groups' tiles may hold: one group's tiles and the next group's first (in the norm
+#: form each tile's streams and its layer_input rows). The rest holds ``mov``, the
+#: collapse buffers, the group's mixes, the norm gain and the compiler's double buffering.
+_STREAMS_SBUF_SHARE = 0.5
+
+
+def _gate_group(full_tiles, tile_bytes):
+    """Full token tiles per gate group (see the module doc).
+
+    The largest power of two that leaves at least two groups, so that each group's
+    collapse runs beside the next group's matmuls, and whose tiles of ``tile_bytes`` per
+    partition (the bytes a tile holds until its group is done), with the next group's
+    first, fit in :data:`_STREAMS_SBUF_SHARE` of the partition. The served token counts
+    are powers of two, so their groups are equal. 1 (no groups) below two full tiles.
+    """
+    fits = int(nl.tile_size.sbuf_fmax_bytes * _STREAMS_SBUF_SHARE) // tile_bytes - 1
+    limit = min(full_tiles // 2, fits)
+    group = 1
+    while 2 * group <= limit:
+        group *= 2
+    return group
 
 
 __all__ = [
@@ -151,23 +193,27 @@ def _swap_add(mine, rows, cols, programs, program):
     return total
 
 
-def _diagonal_sum(gram, rows, ident):
-    """``[rows, 1]``: the diagonal of a ``[rows, rows]`` Gram block (times 1, plus 0s)."""
+def _diagonal_sum(gram, rows, ident, total=None):
+    """``[rows, 1]``: the diagonal of a ``[rows, rows]`` Gram block (times 1, plus 0s).
+
+    The sums go into ``total`` (a ``[rows, 1]`` view) when it is given, else a new tile.
+    """
     diag = _tile(rows, rows)
     nisa.tensor_tensor(dst=diag, data1=gram, data2=ident[0:rows, 0:rows], op=nl.multiply)
-    total = _tile(rows, 1)
+    if total is None:
+        total = _tile(rows, 1)
     nisa.tensor_reduce(dst=total, op=nl.add, data=diag, axis=(1,))
     return total
 
 
-def _rstd(sqrsum, rows, inv_count, eps):
-    """``[rows, 1]``: ``rsqrt(sqrsum * inv_count + eps)``.
+def _rstd(sqrsum, rows, inv_count, eps, cols=1):
+    """``[rows, cols]``: ``rsqrt(sqrsum * inv_count + eps)``.
 
     ``* inv_count`` stands for the reference's ``/ count``: the front end has no
     tensor_scalar divide, and ``1 / count`` is exact (so the product is the quotient)
     for a power-of-two count, the only kind :func:`mhc_pre_admits` admits.
     """
-    rstd = _tile(rows, 1)
+    rstd = _tile(rows, cols)
     nisa.tensor_scalar(dst=rstd, data=sqrsum, op0=nl.multiply, operand0=inv_count,
                        op1=nl.add, operand1=float(eps))
     # rsqrt on GpSimd, the higher-precision engine for it (see functional/norm.py).
@@ -215,9 +261,21 @@ def _norm_rows(out_rows, t0, gain_rows, ident, normed_out, scaled_out, norm_eps,
     tile); else they are transposed from ``out_rows``. :func:`_mhc_pre` issues a long
     tile's step 6 one tile late (see the module doc).
     """
-    rows_n, hp = out_rows.shape
+    rows_n = out_rows.shape[0]
     hidden = normed_out.shape[1]
-    h0 = program * hp
+    mine = _norm_square_sum(out_rows, ident, collapsed=collapsed)
+    sqrsum = _swap_add(mine, rows_n, 1, programs, program)
+    norm_rstd = _rstd(sqrsum, rows_n, 1.0 / float(hidden), norm_eps)
+    _norm_scale(out_rows, t0, norm_rstd[:, 0:1], gain_rows, normed_out, scaled_out, program)
+
+
+def _norm_square_sum(out_rows, ident, sqrsum=None, collapsed=None):
+    """Step 6's first half for one tile: this program's square sums of ``out_rows``.
+
+    The ``[rows, 1]`` sums are the diagonal of the Gram block of the rows' hidden-major
+    copy (``collapsed`` as in :func:`_norm_rows`), into ``sqrsum`` when it is given.
+    """
+    rows_n, hp = out_rows.shape
     nhb = hp // _P
     if collapsed is None:
         collapsed = nl.ndarray((_P, nhb, rows_n), dtype=out_rows.dtype, buffer=nl.sbuf)
@@ -228,11 +286,20 @@ def _norm_rows(out_rows, t0, gain_rows, ident, normed_out, scaled_out, norm_eps,
     for hb in range(nhb):
         nisa.nc_matmul(dst=gram, stationary=collapsed[:, hb, :],
                        moving=collapsed[:, hb, :], accumulate=(hb > 0))
-    sqrsum = _swap_add(_diagonal_sum(gram, rows_n, ident), rows_n, 1, programs, program)
-    norm_rstd = _rstd(sqrsum, rows_n, 1.0 / float(hidden), norm_eps)
+    return _diagonal_sum(gram, rows_n, ident, total=sqrsum)
+
+
+def _norm_scale(out_rows, t0, norm_rstd, gain_rows, normed_out, scaled_out, program):
+    """Step 6's second half for one tile: its ``normed`` (and ``scaled``) rows, stored.
+
+    ``norm_rstd`` is the tile's ``[rows, 1]`` whole-``H`` reciprocal RMS.
+    """
+    rows_n, hp = out_rows.shape
+    hidden = normed_out.shape[1]
+    h0 = program * hp
     normed_rows = nl.ndarray((rows_n, hp), dtype=out_rows.dtype, buffer=nl.sbuf)
     nisa.scalar_tensor_tensor(dst=normed_rows, data=out_rows, op0=nl.multiply,
-                              operand0=norm_rstd[:, 0:1], op1=nl.multiply,
+                              operand0=norm_rstd, op1=nl.multiply,
                               operand1=gain_rows[0:rows_n, :])
     nisa.dma_copy(dst=normed_out.ap(pattern=[[hidden, rows_n], [1, hp]],
                                     offset=t0 * hidden + h0),
@@ -240,10 +307,41 @@ def _norm_rows(out_rows, t0, gain_rows, ident, normed_out, scaled_out, norm_eps,
     if scaled_out is not None:
         scaled_rows = nl.ndarray((rows_n, hp), dtype=out_rows.dtype, buffer=nl.sbuf)
         nisa.tensor_scalar(dst=scaled_rows, data=out_rows, op0=nl.multiply,
-                           operand0=norm_rstd[:, 0:1])
+                           operand0=norm_rstd)
         nisa.dma_copy(dst=scaled_out.ap(pattern=[[hidden, rows_n], [1, hp]],
                                         offset=t0 * hidden + h0),
                       src=scaled_rows)
+
+
+def _norm_hold(held, sqrsums, ident, out_rows):
+    """Step 6 of a gate group, tile by tile: hold ``out_rows`` in ``held``.
+
+    The previous held tile's square sums are issued here, one tile late, into its column
+    of the group's ``[rows, tiles]`` ``sqrsums`` (see the module doc).
+    """
+    if held:
+        j = len(held) - 1
+        _norm_square_sum(held[j], ident, sqrsum=sqrsums[:, j:j + 1])
+    held.append(out_rows)
+
+
+def _norm_group(held, g_t0, sqrsums, ident, gain_rows, normed_out, scaled_out, norm_eps,
+                programs, program):
+    """The rest of a gate group's step 6, after :func:`_norm_hold` took all its tiles.
+
+    The last tile's square sums, one swap and one reciprocal RMS for the group, then each
+    tile's scale and store; the group's first token is ``g_t0``. Each element takes the
+    instructions of a tile of its own (:func:`_norm_rows`).
+    """
+    rows_n, tiles = sqrsums.shape
+    kernel_assert(len(held) == tiles, "a gate group's step 6 has all its tiles")
+    hidden = normed_out.shape[1]
+    _norm_square_sum(held[tiles - 1], ident, sqrsum=sqrsums[:, tiles - 1:tiles])
+    sqrsum = _swap_add(sqrsums, rows_n, tiles, programs, program)
+    norm_rstd = _rstd(sqrsum, rows_n, 1.0 / float(hidden), norm_eps, cols=tiles)
+    for j in range(tiles):
+        _norm_scale(held[j], g_t0 + j * rows_n, norm_rstd[:, j:j + 1], gain_rows,
+                    normed_out, scaled_out, program)
 
 
 def _load_short(mov, residual, t0, rows_n, col0, h0, nhb, group):
@@ -304,6 +402,121 @@ def _collapse_short(mov, pre, ones, ident, rows_n, col0, nhb, dtype, group):
                               data=collapsed[:, g0 + j, :])
         nisa.tensor_copy(dst=out_rows[:, g0 * _P:(g0 + gn) * _P], src=flipped)
     return collapsed, out_rows
+
+
+def _load_long(residual, t0, rows_n, h0, hp):
+    """Step 1's load of a long tile: ``[rows, S, Hp]``, the token on the partition."""
+    streams, hidden = residual.shape[1], residual.shape[2]
+    streams_t = nl.ndarray((rows_n, streams, hp), dtype=residual.dtype, buffer=nl.sbuf)
+    nisa.dma_copy(dst=streams_t,
+                  src=residual.ap(pattern=[[streams * hidden, rows_n],
+                                           [hidden, streams], [1, hp]],
+                                  offset=t0 * streams * hidden + h0))
+    return streams_t
+
+
+def _project(mov, rows_n, mix, mine=None):
+    """Step 2 into ``mine`` ``[rows, M + rows]``, a new tile when None; returns ``mine``."""
+    nhb, streams = mov.shape[1], mov.shape[2]
+    cols = mix + rows_n
+    acc = nl.ndarray((rows_n, cols), dtype=nl.float32, buffer=nl.psum)
+    for hb in range(nhb):
+        for s in range(streams):
+            k = hb * streams + s
+            nisa.nc_matmul(dst=acc, stationary=mov[:, hb, s, mix:cols],
+                           moving=mov[:, hb, s, 0:cols], accumulate=(k > 0))
+    if mine is None:
+        mine = _tile(rows_n, cols)
+    nisa.tensor_copy(dst=mine, src=acc)
+    return mine
+
+
+def _collapse_long(streams_t, pre, dtype):
+    """Step 5 of a long tile: its ``[rows, Hp]`` layer_input rows in ``dtype``.
+
+    ``pre`` is the tile's ``[rows, S]``; the products and sums are the module doc's.
+    """
+    rows_n, streams, hp = streams_t.shape
+    acc_li = nl.ndarray((rows_n, hp), dtype=nl.float32, buffer=nl.sbuf)
+    out_rows = nl.ndarray((rows_n, hp), dtype=dtype, buffer=nl.sbuf)
+    for s_i in range(streams):
+        into = out_rows if s_i == streams - 1 else acc_li
+        if s_i == 0:
+            nisa.tensor_scalar(dst=into, data=streams_t[:, 0, :], op0=nl.multiply,
+                               operand0=pre[:, 0:1])
+        else:
+            nisa.scalar_tensor_tensor(dst=into, data=streams_t[:, s_i, :],
+                                      op0=nl.multiply, operand0=pre[:, s_i:s_i + 1],
+                                      op1=nl.add, operand1=acc_li)
+    return out_rows
+
+
+def _store_rows(x_out, t0, h0, out_rows):
+    """Store a tile's ``[rows, Hp]`` layer_input rows at token ``t0``, column ``h0``."""
+    rows_n, hp = out_rows.shape
+    hidden = x_out.shape[1]
+    nisa.dma_copy(dst=x_out.ap(pattern=[[hidden, rows_n], [1, hp]],
+                               offset=t0 * hidden + h0),
+                  src=out_rows)
+
+
+def _group_gates(total, streams, spread, ident, width, rms_eps, hc_eps, post_mult):
+    """Step 4 of a gate group: ``(pre, post, comb)`` from its ``[rows, tiles, M + rows]``.
+
+    ``total`` holds each tile's whole-K mixes and Gram block. ``pre`` and ``post`` are
+    ``[rows, tiles, S]`` and ``comb`` ``[rows, tiles, S, S]``. Each element takes the
+    per-tile step 4's instructions in their order, with the same operands: one RMS scale
+    instruction per tile (its scale is a per-partition operand), the others once.
+    """
+    rows_n, tiles, cols = total.shape
+    mix = cols - rows_n
+    ss = streams * streams
+    diag = nl.ndarray((rows_n, tiles, rows_n), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=diag, data1=total[:, :, mix:cols],
+                       data2=ident[0:rows_n, 0:rows_n].expand_dim(1).broadcast(1, tiles),
+                       op=nl.multiply)
+    sqrsum = _tile(rows_n, tiles)
+    nisa.tensor_reduce(dst=sqrsum, op=nl.add, data=diag, axis=(2,))
+    rstd = _rstd(sqrsum, rows_n, 1.0 / float(width), rms_eps, cols=tiles)
+    mixes = nl.ndarray((rows_n, tiles, mix), dtype=nl.float32, buffer=nl.sbuf)
+    for j in range(tiles):
+        nisa.tensor_scalar(dst=mixes[:, j, :], data=total[:, j, 0:mix], op0=nl.multiply,
+                           operand0=rstd[:, j:j + 1])
+    logits = nl.ndarray((rows_n, tiles, mix), dtype=nl.float32, buffer=nl.sbuf)
+    scale_rows = spread[0:rows_n, 0:mix].expand_dim(1).broadcast(1, tiles)
+    base_rows = spread[0:rows_n, mix:2 * mix].expand_dim(1).broadcast(1, tiles)
+    nisa.tensor_tensor(dst=logits, data1=mixes, data2=scale_rows, op=nl.multiply)
+    nisa.tensor_tensor(dst=logits, data1=logits, data2=base_rows, op=nl.add)
+
+    gates = nl.ndarray((rows_n, tiles, 2 * streams), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(dst=gates, op=nl.sigmoid, data=logits[:, :, 0:2 * streams])
+    pre = nl.ndarray((rows_n, tiles, streams), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=pre, data=gates[:, :, 0:streams], op0=nl.add,
+                       operand0=float(hc_eps))
+    post = nl.ndarray((rows_n, tiles, streams), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=post, data=gates[:, :, streams:2 * streams], op0=nl.multiply,
+                       operand0=float(post_mult))
+
+    scores = nl.ndarray((rows_n, tiles, streams, streams), dtype=nl.float32,
+                        buffer=nl.sbuf)
+    nisa.tensor_copy(dst=scores.reshape((rows_n, tiles, ss)),
+                     src=logits[:, :, 2 * streams:mix])
+    peak = nl.ndarray((rows_n, tiles, streams), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_reduce(dst=peak, op=nl.maximum, data=scores, axis=(3,))
+    shifted = nl.ndarray((rows_n, tiles, streams, streams), dtype=nl.float32,
+                         buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=shifted, data1=scores,
+                       data2=peak.expand_dim(3).broadcast(3, streams), op=nl.subtract)
+    nisa.activation(dst=shifted, op=nl.exp, data=shifted)
+    denom = nl.ndarray((rows_n, tiles, streams), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_reduce(dst=denom, op=nl.add, data=shifted, axis=(3,))
+    inv_denom = nl.ndarray((rows_n, tiles, streams), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.reciprocal(dst=inv_denom, data=denom)
+    comb = nl.ndarray((rows_n, tiles, streams, streams), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=comb, data1=shifted,
+                       data2=inv_denom.expand_dim(3).broadcast(3, streams), op=nl.multiply)
+    nisa.tensor_scalar(dst=comb, data=comb, op0=nl.add, operand0=float(hc_eps))
+    return pre, post, comb
 
 
 def _mhc_pre(residual, fn, hc_scale, hc_base, norm_gain, rms_eps, hc_eps, post_mult,
@@ -389,11 +602,74 @@ def _mhc_pre(residual, fn, hc_scale, hc_base, norm_gain, rms_eps, hc_eps, post_m
                                                       offset=h0))
 
     r_group = _group(residual.dtype)
+
+    # ---- The full tiles in gate groups (see the module doc). --------------------- #
+    full_tiles = tokens // MHC_PRE_TOKEN_TILE
+    # A tile holds its streams until its collapse and, in the norm form, its
+    # layer_input rows until its group's step 6.
+    row_bytes = hp * sizeinbytes(residual.dtype)
+    gate_group = _gate_group(full_tiles, streams * row_bytes
+                             + (row_bytes if norm_gain is not None else 0))
+    grouped = full_tiles - full_tiles % gate_group if gate_group > 1 else 0
+    rows_n = MHC_PRE_TOKEN_TILE
+    cols = mix + rows_n
+    group_rows = gate_group * rows_n
+    # The previous group's streams tiles and pre: its step 5 runs a group late, and its
+    # step 6 (the norm form) after the next group's step 4.
+    lagged = []
+    lagged_pre = None
+    for g0 in range(0, grouped, gate_group):
+        mine = nl.ndarray((rows_n, gate_group * cols), dtype=nl.float32, buffer=nl.sbuf)
+        resident = []
+        # The previous group's layer_input rows and their square sums (the norm form).
+        held = []
+        sqrsums = _tile(rows_n, gate_group) if norm_gain is not None and lagged else None
+        for j in range(gate_group):
+            t0 = (g0 + j) * rows_n
+            streams_t = _load_long(residual, t0, rows_n, h0, hp)
+            _transpose_into(mov, streams_t, mix, rows_n, nhb, r_group)
+            _project(mov, rows_n, mix, mine=mine[:, j * cols:(j + 1) * cols])
+            resident.append(streams_t)
+            if lagged_pre is not None:
+                out_rows = _collapse_long(lagged[j], lagged_pre[:, j, :], residual.dtype)
+                _store_rows(x_out, t0 - group_rows, h0, out_rows)
+                if sqrsums is not None:
+                    _norm_hold(held, sqrsums, ident, out_rows)
+        total = _swap_add(mine, rows_n, gate_group * cols, programs, program)
+        pre, post, comb = _group_gates(total.reshape_dim(1, (gate_group, cols)), streams,
+                                       spread, ident, width, rms_eps, hc_eps, post_mult)
+        if program == 0:
+            g_t0 = g0 * rows_n
+            nisa.dma_copy(dst=post_out.ap(pattern=[[streams, rows_n],
+                                                   [rows_n * streams, gate_group],
+                                                   [1, streams]], offset=g_t0 * streams),
+                          src=post)
+            nisa.dma_copy(dst=comb_out.ap(pattern=[[ss, rows_n], [rows_n * ss, gate_group],
+                                                   [streams, streams], [1, streams]],
+                                          offset=g_t0 * ss),
+                          src=comb)
+        if sqrsums is not None:
+            _norm_group(held, g0 * rows_n - group_rows, sqrsums, ident, gain_rows,
+                        normed_out, scaled_out, norm_eps, programs, program)
+        lagged = resident
+        lagged_pre = pre
+    held = []
+    sqrsums = _tile(rows_n, gate_group) if norm_gain is not None and lagged else None
+    for j in range(len(lagged)):
+        out_rows = _collapse_long(lagged[j], lagged_pre[:, j, :], residual.dtype)
+        _store_rows(x_out, (grouped - gate_group + j) * rows_n, h0, out_rows)
+        if sqrsums is not None:
+            _norm_hold(held, sqrsums, ident, out_rows)
+    if sqrsums is not None:
+        _norm_group(held, (grouped - gate_group) * rows_n, sqrsums, ident, gain_rows,
+                    normed_out, scaled_out, norm_eps, programs, program)
+
+    # ---- The other tiles, one at a time. ---------------------------------- #
     # The tile whose step 6 is still to be issued: its layer_input rows (None: no tile
     # yet) and its first token.
     held_out = None
     held_t0 = 0
-    for t0 in range(0, tokens, MHC_PRE_TOKEN_TILE):
+    for t0 in range(grouped * MHC_PRE_TOKEN_TILE, tokens, MHC_PRE_TOKEN_TILE):
         rows_n = min(MHC_PRE_TOKEN_TILE, tokens - t0)
         cols = mix + rows_n
 
@@ -404,28 +680,19 @@ def _mhc_pre(residual, fn, hc_scale, hc_base, norm_gain, rms_eps, hc_eps, post_m
         if short:
             _load_short(mov, residual, t0, rows_n, mix, h0, nhb, r_group)
         else:
-            streams_t = nl.ndarray((rows_n, streams, hp), dtype=residual.dtype,
-                                   buffer=nl.sbuf)
-            nisa.dma_copy(dst=streams_t,
-                          src=residual.ap(pattern=[[streams * hidden, rows_n],
-                                                   [hidden, streams], [1, hp]],
-                                          offset=t0 * streams * hidden + h0))
+            streams_t = _load_long(residual, t0, rows_n, h0, hp)
             _transpose_into(mov, streams_t, mix, rows_n, nhb, r_group)
 
         # ---- 2. Partial mixes and the Gram block over this program's K. ---- #
-        acc = nl.ndarray((rows_n, cols), dtype=nl.float32, buffer=nl.psum)
-        for hb in range(nhb):
-            for s in range(streams):
-                k = hb * streams + s
-                nisa.nc_matmul(dst=acc, stationary=mov[:, hb, s, mix:cols],
-                               moving=mov[:, hb, s, 0:cols], accumulate=(k > 0))
-        mine = _tile(rows_n, cols)
-        nisa.tensor_copy(dst=mine, src=acc)
+        mine = _project(mov, rows_n, mix)
 
         # ---- 3. Whole-K values on both programs. --------------------------- #
         total = _swap_add(mine, rows_n, cols, programs, program)
 
         # ---- 4. RMS scale, gates, softmax: tokens on the partitions. ------- #
+        # The work of _group_gates() on one tile, in 2-D tiles. Through _group_gates()
+        # the instructions would take 3-D and 4-D access patterns, and the compiled
+        # programs of the tiles that run here would change.
         rstd = _rstd(_diagonal_sum(total[:, mix:cols], rows_n, ident), rows_n,
                      1.0 / float(width), rms_eps)
         mixes = _tile(rows_n, mix)
@@ -481,20 +748,8 @@ def _mhc_pre(residual, fn, hc_scale, hc_base, norm_gain, rms_eps, hc_eps, post_m
             collapsed, out_rows = _collapse_short(mov, pre, ones, ident, rows_n, mix, nhb,
                                                   residual.dtype, r_group)
         else:
-            acc_li = nl.ndarray((rows_n, hp), dtype=nl.float32, buffer=nl.sbuf)
-            out_rows = nl.ndarray((rows_n, hp), dtype=residual.dtype, buffer=nl.sbuf)
-            for s_i in range(streams):
-                into = out_rows if s_i == streams - 1 else acc_li
-                if s_i == 0:
-                    nisa.tensor_scalar(dst=into, data=streams_t[:, 0, :], op0=nl.multiply,
-                                       operand0=pre[:, 0:1])
-                else:
-                    nisa.scalar_tensor_tensor(dst=into, data=streams_t[:, s_i, :],
-                                              op0=nl.multiply, operand0=pre[:, s_i:s_i + 1],
-                                              op1=nl.add, operand1=acc_li)
-        nisa.dma_copy(dst=x_out.ap(pattern=[[hidden, rows_n], [1, hp]],
-                                   offset=t0 * hidden + h0),
-                      src=out_rows)
+            out_rows = _collapse_long(streams_t, pre, residual.dtype)
+        _store_rows(x_out, t0, h0, out_rows)
 
         # ---- 6. The FFN norm: a long tile's one tile late (see the module doc).
         if norm_gain is not None:
