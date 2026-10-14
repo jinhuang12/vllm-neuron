@@ -1043,20 +1043,29 @@ def _load_x_chunk(x, c0, m_rows):
     return x_t
 
 
-#: Of every ``den`` gate/up multiply-adds of the prefill kernel, ``num`` run as
-#: a Scalar multiply and a GpSimd add, the rest as one Vector instruction.
+#: Of the gate/up accumulator columns of the prefill kernel, ``num`` of every
+#: ``den`` take their multiply-adds after the first contraction block as a
+#: Scalar multiply and a GpSimd add, the rest as one Vector instruction.
 #: 3 / 8 balances the two routes at the slice profiles' fp32 ``[128, 512]``
 #: rates: Vector multiply-add 0.75 us, Scalar multiply 0.68 us, GpSimd add
 #: 1.27 us.
 _PREFILL_GPSIMD_SHARE = (3, 8)
 
 
-def _prefill_add_engine(step):
-    """The engine of the add of gate/up multiply-add number ``step``: GpSimd
-    for ``num`` of every ``den`` steps (:data:`_PREFILL_GPSIMD_SHARE`), spread
-    evenly, else ``None`` (one Vector multiply-add)."""
+def _prefill_vector_columns(acc_index, n_accs, width):
+    """How many leading columns of gate/up accumulator ``acc_index`` take the
+    Vector multiply-add after the first block.
+
+    The ``n_accs`` accumulators of ``width`` columns each are counted in order
+    (gate blocks, then up blocks); the last ``num / den`` of all their columns
+    (:data:`_PREFILL_GPSIMD_SHARE`) take the Scalar multiply and GpSimd add.
+    Each column keeps its engines for the whole contraction, so every step
+    waits only on the matmul and on its own engines' earlier steps.
+    """
     num, den = _PREFILL_GPSIMD_SHARE
-    return nisa.engine.gpsimd if (step * num) % den < num else None
+    total = n_accs * width
+    vector = total - total * num // den
+    return min(max(vector - acc_index * width, 0), width)
 
 
 def _load_blocked_rows(dst, weight):
@@ -1073,49 +1082,55 @@ def _load_blocked_rows(dst, weight):
     )
 
 
-def _prefill_projection_block(acc, weights_sb, grid, x_t, kb, ib, col, add_engine):
+def _prefill_projection_block(acc, ib, weights_sb, grid, x_t, kb, col, split):
     """One contraction block of one gate or up block, transposed and scaled.
 
-    ``acc[i, m] (+)= grid[col] * sum_p W[kb * 128 + p, ib * 128 + i] x_t[p, kb, m]``
+    ``acc[i, ib, m] (+)= grid[col] * sum_p W[kb * 128 + p, ib * 128 + i] x_t[p, kb, m]``
     in fp32: the matmul of :func:`blockwise_fp8_mm_kernel`'s block ``(kb, ib)``
     with the weight stationary, then its scale step -- a multiply on the first
-    block, a multiply-add onto ``acc`` after it. ``add_engine`` ``None`` runs
-    the multiply-add as one Vector ``scalar_tensor_tensor``; an engine runs it
-    as its two fp32 steps, the multiply on the Scalar engine and the add on
-    that engine. Both compute ``fl(fl(part * s) + acc)``: the Vector
-    instruction rounds the product to fp32 before the add.
+    block, a multiply-add onto ``acc`` after it. After the first block the
+    columns ``m < split`` (:func:`_prefill_vector_columns`) take one Vector
+    ``scalar_tensor_tensor``, the others the two fp32 steps, the multiply on
+    the Scalar engine and the add on the GpSimd engine. Both compute
+    ``fl(fl(part * s) + acc)``: the Vector instruction rounds the product to
+    fp32 before the add.
     """
-    part = nl.ndarray((TILE_SIZE, acc.shape[1]), dtype=nl.float32, buffer=nl.psum)
+    width = acc.shape[2]
+    part = nl.ndarray((TILE_SIZE, width), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_matmul(
         dst=part,
         stationary=weights_sb[:, kb, ib * TILE_SIZE:(ib + 1) * TILE_SIZE],
         moving=x_t[:, kb, :],
         accumulate=False,
     )
+    scale = grid[:, col:col + 1]
     if kb == 0:
-        nisa.tensor_scalar(
-            dst=acc, data=part, op0=nl.multiply, operand0=grid[:, col:col + 1]
+        nisa.tensor_scalar(dst=acc[:, ib, :], data=part, op0=nl.multiply, operand0=scale)
+        return
+    if split > 0:
+        nisa.scalar_tensor_tensor(
+            dst=acc[:, ib, 0:split],
+            data=part[:, 0:split],
+            op0=nl.multiply,
+            operand0=scale,
+            op1=nl.add,
+            operand1=acc[:, ib, 0:split],
         )
-    elif add_engine is not None:
-        scaled = nl.ndarray(acc.shape, dtype=nl.float32, buffer=nl.sbuf)
+    if split < width:
+        scaled = nl.ndarray((TILE_SIZE, width - split), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(
             dst=scaled,
-            data=part,
+            data=part[:, split:width],
             op0=nl.multiply,
-            operand0=grid[:, col:col + 1],
+            operand0=scale,
             engine=nisa.engine.scalar,
         )
         nisa.tensor_tensor(
-            dst=acc, data1=scaled, data2=acc, op=nl.add, engine=add_engine
-        )
-    else:
-        nisa.scalar_tensor_tensor(
-            dst=acc,
-            data=part,
-            op0=nl.multiply,
-            operand0=grid[:, col:col + 1],
-            op1=nl.add,
-            operand1=acc,
+            dst=acc[:, ib, split:width],
+            data1=scaled,
+            data2=acc[:, ib, split:width],
+            op=nl.add,
+            engine=nisa.engine.gpsimd,
         )
 
 
@@ -1149,9 +1164,10 @@ def blockwise_fp8_mlp_prefill_kernel(
 
     Launch: one program, or a ``[2]`` grid (:func:`mlp_prefill_launch_grid`)
     that gives each physical core of an LNC2 core one contiguous half of the
-    token tiles. Each program loads all three weights; no value crosses the
-    cores, and the engine of every step depends on its block alone, so every
-    output element is computed by the same instructions on either launch.
+    token tiles. Each program loads all three weights and no value crosses the
+    cores. Which engines run a later block's multiply-add depends on the
+    chunk's width, but both routes compute ``fl(fl(part * s) + acc)``, so every
+    output element is the same on either launch.
 
     The arithmetic is :func:`blockwise_fp8_mm_kernel`'s, element for element.
     Each ``128``-deep contraction block is one ``nc_matmul`` into PSUM, multiplied
@@ -1166,10 +1182,11 @@ def blockwise_fp8_mlp_prefill_kernel(
     per matmul, each ``128``-column block scaled by its own grid entry.
 
     Engines: the fp32 scale steps, not the matmuls, bound the kernel, so they
-    are spread over three engines (:data:`_PREFILL_GPSIMD_SHARE`; the down
-    multiplies alternate Scalar and Vector when ``I = 128``). The next chunk
-    of ``x`` is loaded before the current chunk's down projection, so its
-    transposing DMA runs under that work.
+    are spread over three engines, each accumulator column on one route for
+    the whole contraction (:data:`_PREFILL_GPSIMD_SHARE`; the down multiplies
+    alternate Scalar and Vector when ``I = 128``). The next chunk of ``x`` is
+    loaded before the current chunk's down projection, so its transposing DMA
+    runs under that work.
     """
     m_total, hidden = x.shape
     _, inter = gate_weight.shape
@@ -1227,12 +1244,12 @@ def blockwise_fp8_mlp_prefill_kernel(
             for ib in range(n_inter_blocks):
                 col = kb * n_inter_blocks + ib
                 _prefill_projection_block(
-                    gate[:, ib, :], gate_sb, gate_grid, x_t, kb, ib, col,
-                    _prefill_add_engine(2 * col),
+                    gate, ib, gate_sb, gate_grid, x_t, kb, col,
+                    _prefill_vector_columns(ib, 2 * n_inter_blocks, m_rows),
                 )
                 _prefill_projection_block(
-                    up[:, ib, :], up_sb, up_grid, x_t, kb, ib, col,
-                    _prefill_add_engine(2 * col + 1),
+                    up, ib, up_sb, up_grid, x_t, kb, col,
+                    _prefill_vector_columns(n_inter_blocks + ib, 2 * n_inter_blocks, m_rows),
                 )
 
         if ci + 1 < n_chunks:
