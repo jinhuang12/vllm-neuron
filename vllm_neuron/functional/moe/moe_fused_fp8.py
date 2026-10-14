@@ -51,7 +51,7 @@ _GATE_UP_BANKS = 3
 _STAGED = 4
 # The same for the wide items (_wide_flags): each holds twice a chunk's
 # columns, so two keep the Vector Engine's lead of four chunk-wide ones, and
-# the wide loops fit SBUF beside two entries' weights.
+# the wide loop fits SBUF beside two entries' weights.
 _WIDE_STAGED = 2
 # FP32 output rows of consecutive chunks in turn: one is stored while the next
 # is evacuated.
@@ -323,23 +323,28 @@ def _item_experts(sbm, experts_row, items, chunks):
     return table
 
 
-def _wide_flags(sbm, routed, items, fill):
+def _wide_flags(sbm, routed, items, slots, nprograms):
     """Merge the two routed chunks of a half block into one wide item: FP32 [1, items / 2].
 
     Half block ``w`` holds chunks ``2w`` and ``2w + 1`` of one block, so it
     has one expert, and wide item ``w`` times ``2 * width`` is its first row
     in the flattened output. It is wide when both of its chunks hold a routed
     row, and ``routed`` (_routed_chunks) is rewritten in place to flag the
-    routed chunks outside a wide item. The chunks fill the programs' ``fill``
-    inline slots first: while fewer chunks are flagged, the first wide items
-    in item order go back to two chunks each, ceil((fill - chunks) / 2) of
-    them or every wide item, since an inline slot that a chunk does not take
-    computes nothing it stores, and a wide item runs in a device loop. One
-    more goes back when an odd count of wide items is left, so the programs
-    get the same count and no program computes a wide item it stores nowhere.
+    routed chunks outside a wide item. The chunks fill the ``nprograms``
+    programs' ``slots`` inline slots each first: while fewer chunks are
+    flagged, the first wide items in item order go back to two chunks each,
+    ceil((fill - chunks) / 2) of them or every wide item, since an inline
+    slot that a chunk does not take computes nothing it stores, and a wide
+    item runs in a device loop. One more goes back when an odd count of wide
+    items is left, so the programs get the same count and no program
+    computes a wide item it stores nowhere. Under two programs,
+    _whole_trips then gives the chunks' loop and the wide loop whole trips
+    of two entries.
     """
+    kernel_assert(nprograms <= 2, "The wide items' loop takes at most two programs")
     halves = items // 2
     stride = routed.shape[1]
+    fill = slots * nprograms
     wide = sbm.alloc_stack((1, max(halves, 8)), dtype=nl.float32)
     sbm.open_scope(name="wide_flags")
     # The rule's constants first: they do not wait for the flags.
@@ -375,6 +380,8 @@ def _wide_flags(sbm, routed, items, fill):
     odd = _tile(sbm, 1, 1, nl.int32)
     nisa.tensor_scalar(dst=odd, data=rest, op0=nl.bitwise_and, operand0=1)
     nisa.tensor_tensor(dst=undo, data1=undo, data2=odd, op=nl.add)
+    if nprograms == 2:
+        threshold = _whole_trips(sbm, counts, undo, slots, items)
     # rank = the inclusive count of wide items up to each half block; the
     # first ``undo`` (rank <= undo) go back to chunks.
     rank = _tile(sbm, 1, halves)
@@ -387,8 +394,105 @@ def _wide_flags(sbm, routed, items, fill):
                        data1=routed.ap(pattern=[[stride, 1], [2, halves], [1, 2]]),
                        data2=wide.ap(pattern=[[wide.shape[1], 1], [1, halves], [0, 2]]),
                        op=nl.subtract)
+    if nprograms == 2:
+        _half_entries(sbm, routed, wide, halves, threshold, zeros)
     sbm.close_scope()
     return wide
+
+
+def _whole_trips(sbm, counts, undo, slots, items):
+    """Rules that give both programs' loops whole two-entry trips; returns _half_entries' threshold.
+
+    ``counts`` is _wide_flags' FP32 [1, 2] count of routed chunks and of wide
+    items, and ``undo`` its FP32 [1, 1] count of wide items sent back to
+    chunks. They leave ``n`` chunks and an even count 2V of wide items, so
+    each program lists V wide items, and the longer chunk list holds N =
+    ceil(n / 2) - slots entries past the inline slots. Both device loops run
+    two entries a trip, and neither runs a trip for a lone entry:
+
+      N even, V odd: two more wide items go back to chunks (``undo`` += 2),
+        so N + 2 and V - 1, both even;
+      N odd, V odd: the half block of the last chunk of each list that holds
+        N entries becomes a wide item (_half_entries), so N - 1 and V + 1,
+        both even;
+      N odd, V even: the chunks' loop pairs its last entry with one that
+        stores nowhere (_pairs_end);
+      N even, V even: as is.
+
+    Returns the FP32 [1, 1] chunk rank past which _half_entries converts:
+    n + (n & 1) - 2 under the second rule, the last chunk of each longest
+    list, as the lists deal the chunks in turn (_program_list), and
+    otherwise at least ``2 * items - 2``, past every rank. Every value is a
+    small integer, and the bit tests run on int32 copies.
+    """
+    # left = 2V; wbit = 2 when V is odd.
+    left = _tile(sbm, 1, 1, nl.int32)
+    nisa.tensor_tensor(dst=left, data1=counts[:, 1:2], data2=undo, op=nl.subtract)
+    wbit = _tile(sbm, 1, 1, nl.int32)
+    nisa.tensor_scalar(dst=wbit, data=left, op0=nl.bitwise_and, operand0=2)
+    # n = routed - 2 x left. N = ceil(n / 2) - slots is odd when bit 1 of
+    # n + 1 + 2 * (slots & 1) is set: nbit = 2 when N is odd.
+    chunks = _tile(sbm, 1, 1, nl.int32)
+    nisa.tensor_scalar(dst=chunks, data=left, op0=nl.multiply, operand0=-2.0, op1=nl.add,
+                       operand1=counts[:, 0:1])
+    shifted = _tile(sbm, 1, 1, nl.int32)
+    nisa.tensor_scalar(dst=shifted, data=chunks, op0=nl.add, operand0=1 + 2 * (slots % 2))
+    nbit = _tile(sbm, 1, 1, nl.int32)
+    nisa.tensor_scalar(dst=nbit, data=shifted, op0=nl.bitwise_and, operand0=2)
+    # The first rule: undo += max(wbit - nbit, 0), 2 when V is odd and N even.
+    more = _tile(sbm, 1, 1)
+    nisa.tensor_tensor(dst=more, data1=wbit, data2=nbit, op=nl.subtract)
+    nisa.tensor_scalar(dst=more, data=more, op0=nl.maximum, operand0=0.0)
+    nisa.tensor_tensor(dst=undo, data1=undo, data2=more, op=nl.add)
+    # The second rule: both = wbit * nbit, 4 when V and N are odd; threshold =
+    # n + (n & 1) - 2 + 2 * items * (1 - both / 4).
+    both = _tile(sbm, 1, 1)
+    nisa.tensor_tensor(dst=both, data1=wbit, data2=nbit, op=nl.multiply)
+    odd = _tile(sbm, 1, 1, nl.int32)
+    nisa.tensor_scalar(dst=odd, data=chunks, op0=nl.bitwise_and, operand0=1)
+    even = _tile(sbm, 1, 1)
+    nisa.tensor_tensor(dst=even, data1=chunks, data2=odd, op=nl.add)
+    threshold = _tile(sbm, 1, 1)
+    nisa.tensor_scalar(dst=threshold, data=both, op0=nl.multiply, operand0=-items / 2,
+                       op1=nl.add, operand1=float(2 * items - 2))
+    nisa.tensor_tensor(dst=threshold, data1=threshold, data2=even, op=nl.add)
+    return threshold
+
+
+def _half_entries(sbm, routed, wide, halves, threshold, zeros):
+    """The half blocks of the chunks ranked past ``threshold`` become wide items (_whole_trips).
+
+    ``routed`` flags the chunks outside a wide item and ``wide`` the wide
+    items (_wide_flags); both are rewritten in place. A half block's rank is
+    the count of flagged chunks up to its second chunk, so it holds a chunk
+    ranked past ``threshold`` when its rank exceeds it and it holds a flagged
+    chunk. Such a wide item computes 128 rows, of which the unrouted ones
+    store nowhere (_gather_rows); its other chunk, when flagged, leaves the
+    chunk list with it, so every row keeps one writer. ``zeros`` is the
+    scan's FP32 [1, halves] zero row.
+    """
+    stride = routed.shape[1]
+    held = _tile(sbm, 1, halves)
+    nisa.tensor_tensor(dst=held, data1=routed.ap(pattern=[[stride, 1], [2, halves]], offset=0),
+                       data2=routed.ap(pattern=[[stride, 1], [2, halves]], offset=1),
+                       op=nl.add)
+    rank = _tile(sbm, 1, halves)
+    nisa.tensor_tensor_scan(dst=rank, data0=held, data1=zeros, initial=0.0, op0=nl.add,
+                            op1=nl.add)
+    late = _tile(sbm, 1, halves)
+    nisa.tensor_scalar(dst=late, data=rank, op0=nl.greater, operand0=threshold)
+    # convert = min(held, late): 1 when the half block holds a flagged chunk
+    # and ranks past the threshold.
+    convert = sbm.alloc_stack((1, max(halves, 8)), dtype=nl.float32)
+    nisa.tensor_tensor(dst=convert[:, :halves], data1=held, data2=late, op=nl.minimum)
+    nisa.tensor_tensor(dst=wide[:, :halves], data1=wide[:, :halves], data2=convert[:, :halves],
+                       op=nl.add)
+    # Both chunks of a converted half block leave the chunk list: on 0 / 1
+    # flags, flag > convert is flag * (1 - convert).
+    nisa.tensor_tensor(dst=routed.ap(pattern=[[stride, 1], [2, halves], [1, 2]]),
+                       data1=routed.ap(pattern=[[stride, 1], [2, halves], [1, 2]]),
+                       data2=convert.ap(pattern=[[convert.shape[1], 1], [1, halves], [0, 2]]),
+                       op=nl.greater)
 
 
 def _program_list(sbm, routed, items):
@@ -764,16 +868,21 @@ def _loop_turns(turns, width):
 
 
 def _pairs_end(sbm, end, slots):
-    """The end of the two-entry loop, int32 [1, 1]: ``end``, less one when ``end - slots`` is odd.
+    """The end of the two-entry loop, int32 [1, 1]: ``end``, plus one when ``end - slots`` is odd.
 
-    Computed from the loop end alone, so every program gets the same trips (_list_end).
+    The odd count's last trip pairs the last entry with the entry after it,
+    the list's padding item, which stores nowhere (_loop_entry), so no loop
+    runs a lone entry. A list reaches column ``2 * items`` only when one
+    program lists every item; that column's count is then ``items``, the
+    padding item too (_program_list). Computed from the loop end alone, so
+    every program gets the same trips (_list_end).
     """
     span = _tile(sbm, 1, 1, nl.int32)
     nisa.tensor_scalar(dst=span, data=end, op0=nl.subtract, operand0=slots)
     odd = _tile(sbm, 1, 1, nl.int32)
     nisa.tensor_scalar(dst=odd, data=span, op0=nl.bitwise_and, operand0=1)
     pairs_end = _tile(sbm, 1, 1, nl.int32)
-    nisa.tensor_tensor(dst=pairs_end, data1=end, data2=odd, op=nl.subtract)
+    nisa.tensor_tensor(dst=pairs_end, data1=end, data2=odd, op=nl.add)
     return pairs_end
 
 
@@ -816,29 +925,16 @@ def _pair_trip(trip, index):
     _down(compute, second, gathers[1], expert_next, loop_turns, turns[2][1], width)
 
 
-def _last_trip(trip, index):
-    """List entry ``index`` alone in one device-loop trip, in _pair_trip's ``first``."""
-    (sbm, weights, scales, compute, listing, items, item_experts, first, _, turns, rows,
-     gathers, width) = trip
-    entry, item, expert = _loop_entry(sbm, listing, items, item_experts, 0, index)
-    _load_expert(weights, scales, expert, first)
-    loop_turns = _loop_turns(turns, width)
-    _gather_rows(compute, item, _store_bases(sbm, entry, width), rows[0], gathers[0])
-    _transposed(rows[0], first[4], loop_turns[4])
-    _gate_up(compute, first, loop_turns, width)
-    _down(compute, first, gathers[0], expert, loop_turns, turns[2][0], width)
-
-
-def _wide_loops(sbm, weights, scales, compute, listing, halves, item_experts, end, pairs_end,
-                width, kstep, nstep):
-    """Compute the wide items (_wide_flags) in device loops: two a trip, an odd count's last alone.
+def _wide_loop(sbm, weights, scales, compute, listing, halves, item_experts, end, width, kstep,
+               nstep):
+    """Compute the wide items (_wide_flags) in one device loop, two a trip.
 
     ``width`` is a wide item's rows, twice a chunk's, and ``compute`` the
     kernel's compute tuple with the row ids in rows of ``width``; ``listing``
-    is _program_list's list of the wide items, ``end`` its _list_end and
-    ``pairs_end`` its _pairs_end, with no inline slots. The loops run after
-    the chunks' loops in buffers of their own, which reuse the chunks'
-    addresses, _WIDE_STAGED moving operands and stationaries.
+    is _program_list's list of the wide items and ``end`` its _list_end, with
+    no inline slots, an even count (_wide_flags). The loop runs after the
+    chunks' loop in buffers of its own, which reuse the chunks' addresses,
+    _WIDE_STAGED moving operands and stationaries.
     """
     hidden, affinity = compute[0], compute[2]
     nh, ni = weights.shape[3], weights.shape[1] // 3
@@ -857,11 +953,7 @@ def _wide_loops(sbm, weights, scales, compute, listing, halves, item_experts, en
     def pair(index):
         _pair_trip(trip, index)
 
-    def last(index):
-        _last_trip(trip, index)
-
-    nl.fori_loop(0, _register(pairs_end), pair, step=2)
-    nl.fori_loop(_register(pairs_end), _register(end), last)
+    nl.fori_loop(0, _register(end), pair, step=2)
     sbm.close_scope()
 
 
@@ -925,15 +1017,18 @@ def moe_fused_fp8_kernel(hidden, weights, scales, row_ids, expert_ids, affinity,
         nprograms slots in line: each loads its chunk's expert weights, by a
         dynamic address, and gathers its rows while the previous slot
         computes, so a short list computes a chunk that it stores nowhere.
-        Entries past the slots run in dynamic loops at the end, which every
+        Entries past the slots run in a dynamic loop at the end, which every
         program runs up to the longest program list: two entries a trip in
         two buffers, so the second entry's weights load while the first entry
-        computes, and an odd count's last entry alone. A half block whose two
-        chunks both hold a routed row is one wide item of twice the rows,
-        which loads its expert's weights once; the wide items run in loops of
-        the same form after the chunks', except where the chunks would leave
-        inline slots empty (_wide_flags). Every defined row has exactly one
-        writer. All routing decisions remain on device.
+        computes, and an odd count's last entry with one that stores nowhere.
+        A half block whose two chunks both hold a routed row is one wide item
+        of twice the rows, which loads its expert's weights once; the wide
+        items run in a loop of the same form after the chunks', except where
+        the chunks would leave inline slots empty. Both loops run whole trips
+        of two entries, as the base's two loops: the half block of a last
+        chunk can run as a wide item whose unrouted rows store nowhere
+        (_wide_flags). Every defined row has exactly one writer. All routing
+        decisions remain on device.
     """
     blocks, q = row_ids.shape
     experts, panels, contraction, nh, channels = weights.shape
@@ -973,10 +1068,10 @@ def moe_fused_fp8_kernel(hidden, weights, scales, row_ids, expert_ids, affinity,
     # loop at the same entry (_list_end).
     slots = min(experts // nprograms, items)
     # Half blocks whose two chunks are both routed run as wide items of
-    # 2 * width rows, in loops of their own after the chunks (_wide_flags).
+    # 2 * width rows, in a loop of their own after the chunks (_wide_flags).
     halves = items // 2 if chunks % 2 == 0 and 2 * width <= _PMAX else 0
     if halves:
-        wide = _wide_flags(sbm, routed, items, slots * nprograms)
+        wide = _wide_flags(sbm, routed, items, slots, nprograms)
     listing = _program_list(sbm, routed, items)
     compute = (hidden, row_ids.reshape((items, width)), affinity, clamp, out_rows)
     end = _list_end(sbm, listing, items, slots)
@@ -985,7 +1080,6 @@ def moe_fused_fp8_kernel(hidden, weights, scales, row_ids, expert_ids, affinity,
         wide_experts = _item_experts(sbm, experts_row, halves, chunks // 2)
         wide_listing = _program_list(sbm, wide, halves)
         wide_end = _list_end(sbm, wide_listing, halves, 0)
-        wide_pairs_end = _pairs_end(sbm, wide_end, 0)
     tokens = hidden.shape[0]
     affinity_experts = affinity.shape[0] // tokens
     # Slot ``s`` uses the expert buffers and rows ``s % 2``, and the scales and
@@ -1059,24 +1153,20 @@ def moe_fused_fp8_kernel(hidden, weights, scales, row_ids, expert_ids, affinity,
     # one the last slot leaves free first: both entries' weights load at the
     # start of the trip, so the second entry's load overlaps the first entry's
     # products. A trip loads every tile that it reads, so no read relies on
-    # the loop back-edge alone to follow its write. An odd count ends in a
-    # loop of at most one trip.
+    # the loop back-edge alone to follow its write. An odd count's last trip
+    # pairs its last entry with one that stores nowhere (_pairs_end).
     trip = (sbm, weights, scales, compute, listing, items, item_experts,
             expert_slots[slots % 6], expert_slots[(slots + 1) % 6], turns, rows, gathers, width)
 
     def pair(index):
         _pair_trip(trip, index)
 
-    def last(index):
-        _last_trip(trip, index)
-
     pairs_end = _pairs_end(sbm, end, slots)
     nl.fori_loop(slots, _register(pairs_end), pair, step=2)
-    nl.fori_loop(_register(pairs_end), _register(end), last)
     sbm.close_scope()
     if halves:
         wide_compute = (hidden, row_ids.reshape((halves, 2 * width)), affinity, clamp, out_rows)
-        _wide_loops(sbm, weights, scales, wide_compute, wide_listing, halves, wide_experts,
-                    wide_end, wide_pairs_end, 2 * width, kstep, nstep)
+        _wide_loop(sbm, weights, scales, wide_compute, wide_listing, halves, wide_experts,
+                   wide_end, 2 * width, kstep, nstep)
     sbm.close_scope()
     return out
