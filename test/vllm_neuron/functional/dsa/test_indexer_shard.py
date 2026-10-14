@@ -16,6 +16,10 @@ What this file pins:
    assumed away (see :func:`test_the_tie_census_is_recorded`).
 3. The kill switch (``envs.VLLM_NEURON_DSA_INDEXER_SHARD``) is on unless set to ``0``.
 
+The matrix of item 2 runs its calls in a ``spawn`` process pool of one process per two
+CPUs, at most 48. ``DSA_INDEXER_SHARD_WORKERS=<n>`` sets the pool size instead
+(:func:`pool_workers`).
+
 The model-level wiring (the rank operand, the gate, the gather at the indexer's forward)
 is pinned by ``test/vllm_neuron/model/glm5_next/test_indexer_shard_forward.py``.
 """
@@ -37,6 +41,10 @@ DEGREES = (1, 8, 64)
 SEED = 20261007
 CASES = [(t, c, d) for t in TOKENS for c in CANDS for d in DEGREES]
 SHARD_ENV = "VLLM_NEURON_DSA_INDEXER_SHARD"
+#: The matrix pool's size when set to a positive integer; unset or empty, one process
+#: per two CPUs, at most :data:`MAX_WORKERS`.
+WORKERS_ENV = "DSA_INDEXER_SHARD_WORKERS"
+MAX_WORKERS = 48
 
 
 # ---------------------------------------------------------------------------------------
@@ -239,14 +247,49 @@ def test_the_score_kernel_is_row_independent_bit_for_bit():
 # ---------------------------------------------------------------------------------------
 
 
+def pool_workers(supplied: str | None, cpus: int | None) -> int:
+    """The matrix pool's size: ``supplied``, the text of :data:`WORKERS_ENV`, when it is
+    set; unset or empty, one process per two of ``cpus``, at least one and at most
+    :data:`MAX_WORKERS`."""
+    if not supplied:
+        return max(1, min(MAX_WORKERS, (cpus or 2) // 2))
+    try:
+        workers = int(supplied)
+    except ValueError:
+        workers = 0
+    if workers < 1:
+        raise ValueError(f"{WORKERS_ENV}={supplied!r}: the pool size must be a positive integer")
+    return workers
+
+
+@pytest.mark.parametrize("cpus,want", [(192, MAX_WORKERS), (2 * MAX_WORKERS - 2, MAX_WORKERS - 1),
+                                       (10, 5), (3, 1), (1, 1), (None, 1)])
+def test_the_pool_takes_one_process_per_two_cpus_when_the_knob_is_unset(cpus, want):
+    assert pool_workers(None, cpus) == want
+    assert pool_workers("", cpus) == want
+
+
+@pytest.mark.parametrize("supplied,want", [("4", 4), ("1", 1), (" 64 ", 64), ("200", 200)])
+def test_the_knob_sets_the_pool_size_whatever_the_cpu_count(supplied, want):
+    for cpus in (1, 10, 192, None):
+        assert pool_workers(supplied, cpus) == want, cpus
+
+
+@pytest.mark.parametrize("supplied", ["0", "-2", "four", "4.5"])
+def test_a_knob_that_is_not_a_positive_integer_is_refused(supplied):
+    with pytest.raises(ValueError, match=WORKERS_ENV):
+        pool_workers(supplied, 192)
+
+
 @pytest.fixture(scope="module")
 def matrix():
-    """Run every replicated case and every rank of every sharded case once, in parallel."""
+    """Run every replicated case and every rank of every sharded case once, in parallel
+    over :func:`pool_workers` processes."""
     if os.environ.get("NKI_SIMULATOR") != "1":
         pytest.skip("the NKI simulator is off, so the kernels under test would not run")
+    workers = pool_workers(os.environ.get(WORKERS_ENV), os.cpu_count())
     saved = {k: os.environ.get(k) for k in case.worker_environment()}
     os.environ.update(case.worker_environment())
-    workers = max(1, min(48, (os.cpu_count() or 2) // 2))
     results = {"replicated": {}, "ranks": {}}
     try:
         with ProcessPoolExecutor(workers, mp_context=multiprocessing.get_context("spawn")) as pool:
