@@ -8,7 +8,7 @@ Two switches, registered in ``vllm_neuron.envs`` and read when a site runs:
   partial crosses the wire in. ``fp32`` is the as-built path, bit for bit: the
   coordinator is handed the very partial and reduces it in place. ``bf16`` reduces a
   bfloat16 copy and returns it.
-* ``VLLM_NEURON_TP_ALLREDUCE_FUSE`` = ``0`` (default) | ``1``: names the neuronx-cc
+* ``VLLM_NEURON_TP_ALLREDUCE_FUSE`` = ``1`` (default) | ``0``: names the neuronx-cc
   argument that keeps each all-reduce one collective, for the runner to append.
 
     VLLM_NEURON_CPU_MODE=1 python -m pytest \\
@@ -61,7 +61,7 @@ def _partial(dtype: torch.dtype = torch.float32) -> torch.Tensor:
 # ── the switches ──────────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("name, default", [(DTYPE_ENV, "fp32"), (FUSE_ENV, False)])
+@pytest.mark.parametrize("name, default", [(DTYPE_ENV, "fp32"), (FUSE_ENV, True)])
 def test_the_switches_are_registered_in_envs(monkeypatch, name, default):
     monkeypatch.delenv(name, raising=False)
     assert name in envs.environment_variables
@@ -76,8 +76,8 @@ def test_the_defaults_are_the_as_built_path(monkeypatch):
     monkeypatch.delenv(DTYPE_ENV, raising=False)
     monkeypatch.delenv(FUSE_ENV, raising=False)
     assert policy.allreduce_wire_dtype() is torch.float32
-    assert policy.allreduce_fuse_enabled() is False
-    assert policy.fuse_compiler_args() == []
+    assert policy.allreduce_fuse_enabled() is True
+    assert policy.fuse_compiler_args() == [policy.FUSE_COMPILER_ARG]
 
 
 @pytest.mark.parametrize(
@@ -190,14 +190,11 @@ def _runner_compiler_args(monkeypatch, fuse: str | None) -> list[str]:
 
 
 def test_the_runner_appends_the_fuse_flag_only_when_the_switch_is_on(monkeypatch):
-    """Unset or ``0`` leaves the compiler arguments as they were; ``1`` adds the flag."""
-    unset = _runner_compiler_args(monkeypatch, None)
-    assert not any(arg.startswith("--tensorizer-options") for arg in unset)
-    assert _runner_compiler_args(monkeypatch, "0") == unset
-    assert _runner_compiler_args(monkeypatch, "1") == [
-        *unset,
-        policy.FUSE_COMPILER_ARG,
-    ]
+    """``0`` leaves the compiler arguments as they were; unset or ``1`` adds the flag."""
+    off = _runner_compiler_args(monkeypatch, "0")
+    assert not any(arg.startswith("--tensorizer-options") for arg in off)
+    assert _runner_compiler_args(monkeypatch, None) == [*off, policy.FUSE_COMPILER_ARG]
+    assert _runner_compiler_args(monkeypatch, "1") == [*off, policy.FUSE_COMPILER_ARG]
 
 
 # ── the entry point ───────────────────────────────────────────────────────────
