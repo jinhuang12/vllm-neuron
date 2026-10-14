@@ -272,9 +272,13 @@ def _rms_norm_rows(rows, gain_rows, eps):
 
     The steps are :func:`input_rms_norm`'s, in its order: the squares summed in fp32
     (Scalar, one pass), the mean as a multiply by ``1 / H`` (exact for the power-of-two
-    ``H`` the model has), rsqrt on GpSimd (the higher-precision engine for it, as in
-    ``kda_output``), then ``x * rstd`` and ``* gain`` in fp32 with one bf16 rounding
-    (Vector, one pass).
+    ``H`` the model has) plus ``eps``, rsqrt (both on GpSimd, the higher-precision
+    engine for rsqrt, as in ``kda_output``), then ``x * rstd`` and ``* gain`` in fp32
+    with one bf16 rounding (Vector, one pass).
+
+    The mean and ``eps`` are on GpSimd, not on the default engine: the compiler
+    gives that step to Scalar, where it waits behind the squares of every later
+    tile, and the Vector pass of the first tile waits with it.
     """
     parts, hidden = rows.shape
     squares = nl.ndarray((parts, hidden), dtype=nl.float32, buffer=nl.sbuf)
@@ -282,7 +286,7 @@ def _rms_norm_rows(rows, gain_rows, eps):
     nisa.activation_reduce(dst=squares, op=nl.square, data=rows, reduce_op=nl.add,
                            reduce_res=rstd)
     nisa.tensor_scalar(dst=rstd, data=rstd, op0=nl.multiply, operand0=1.0 / float(hidden),
-                       op1=nl.add, operand1=float(eps))
+                       op1=nl.add, operand1=float(eps), engine=nisa.engine.gpsimd)
     nisa.tensor_scalar(dst=rstd, data=rstd, op0=nl.rsqrt, operand0=0.0,
                        engine=nisa.engine.gpsimd)
     nisa.scalar_tensor_tensor(dst=rows, data=rows, op0=nl.multiply, operand0=rstd,
