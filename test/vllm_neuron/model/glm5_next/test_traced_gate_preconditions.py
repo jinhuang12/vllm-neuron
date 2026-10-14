@@ -140,17 +140,22 @@ def decode_operands(gate: float) -> tuple[torch.Tensor, ...]:
 
 
 def traced_call(subject, operands, keywords=None) -> tuple[bool, str, str]:
-    """``(raised, text, scalars)`` for one subject compiled as the worker compiles. """
+    """``(raised, text, scalars)`` for one subject compiled as the worker compiles.
+
+    ``capture_scalar_outputs`` is the process's dynamo flag. It is set for this call only:
+    ``config.patch`` puts the caller's value back on return and on raise, so no later test
+    in the process traces with it.
+    """
     found = torch._dynamo.config.capture_scalar_outputs
-    torch._dynamo.config.capture_scalar_outputs = True
-    torch._dynamo.reset()
-    compiled = torch.compile(subject, backend="eager", fullgraph=True)
-    scalars = f"found={found},used=True"
-    try:
-        compiled(*operands, **(keywords or {}))
-    except Exception as error:  # the tracer's refusal is this file's reading
-        return True, str(error), scalars
-    return False, "", scalars
+    with torch._dynamo.config.patch(capture_scalar_outputs=True):
+        torch._dynamo.reset()
+        compiled = torch.compile(subject, backend="eager", fullgraph=True)
+        scalars = f"found={found},used=True"
+        try:
+            compiled(*operands, **(keywords or {}))
+        except Exception as error:  # the tracer's refusal is this file's reading
+            return True, str(error), scalars
+        return False, "", scalars
 
 
 def test_every_value_read_on_the_traced_path_is_guarded() -> None:
@@ -181,6 +186,30 @@ def test_the_traced_seams_read_no_gate_value() -> None:
     }
     for phase, (raised, text, _) in readings.items():
         assert not raised, f"the {phase} seam did not compile: {text}"
+
+
+def _refused(rows: torch.Tensor) -> torch.Tensor:
+    """A subject whose traced call raises: the reading's refusal path."""
+    raise ValueError(f"refused at {tuple(rows.shape)}")
+
+
+def test_a_traced_reading_leaves_the_tracer_flag_as_it_found_it() -> None:
+    """The flag is the process's: a reading, returned or refused, does not reach a later test."""
+    require_cpu_mode()
+    subjects = {
+        "returned": (kda_decode_step, decode_operands(GATE_OK)),
+        "raised": (_refused, (torch.zeros(1, KDIM),)),
+    }
+    for found in (False, True):
+        for path, (subject, operands) in subjects.items():
+            with torch._dynamo.config.patch(capture_scalar_outputs=found):
+                raised, text, _ = traced_call(subject, operands)
+                left = torch._dynamo.config.capture_scalar_outputs
+            assert raised == (path == "raised"), f"the {path} subject read {raised}: {text}"
+            assert left is found, (
+                f"capture_scalar_outputs was {found} before a {path} traced call "
+                f"and {left} after it"
+            )
 
 
 def _kda_layer_case():
