@@ -539,6 +539,16 @@ def _combine_on_tensor_engine(
     A short last group zeroes its moving tile first, so rows past ``T`` contribute
     exact zeros, and its rows past ``T`` are never stored.
 
+    The stream loads and the output stores use static DMA descriptors
+    (``dge_mode=nisa.dge_mode.none``): their descriptors are built before the launch,
+    not during the call by the software descriptor generator on the GpSimd engine,
+    which would otherwise build them for most of the call's bytes and pace the call.
+    This is correct for every shape the kernel takes, because each copy's offset and
+    access pattern are trace-time constants (``g``, ``tokens``, ``h_lo``, ``width`` and
+    the shapes are Python integers): a static descriptor moves the same bytes as a
+    generated one, and a copy does not change a value. A program issues one load and
+    one store per group, ``ceil(T / G)`` of each.
+
     The bound. Let ``y`` be the exact ``post_j * x + sum_i comb_ij * res_i``,
     ``m = |post_j * x| + sum_i |comb_ij * res_i|``, ``u = 2**-24`` and
     ``g = (P * (S + 1) - 1) * u`` with ``P =`` :data:`TENSOR_ENGINE_PIECES`. This
@@ -597,6 +607,7 @@ def _combine_on_tensor_engine(
             if tokens < group:
                 nisa.memset(dst=moving, value=0.0)
             nisa.dma_copy(
+                dge_mode=nisa.dge_mode.none,
                 dst=moving[0:tokens * s_extent, 0:width],
                 src=residual.ap(pattern=[[h_extent, tokens * s_extent], [1, width]],
                                 offset=g * rows_out * h_extent + h_lo),
@@ -630,6 +641,7 @@ def _combine_on_tensor_engine(
                 nisa.activation(dst=mixed[0:rows_out, b * bank:b * bank + w],
                                 op=nl.copy, data=accs[b][0:rows_out, 0:w])
             nisa.dma_copy(
+                dge_mode=nisa.dge_mode.none,
                 dst=out.ap(pattern=[[h_extent, tokens * s_extent], [1, width]],
                            offset=g * rows_out * h_extent + h_lo),
                 src=mixed[0:tokens * s_extent, 0:width],
