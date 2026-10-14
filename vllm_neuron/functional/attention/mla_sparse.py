@@ -1700,13 +1700,16 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
 #   columns, so MM2 streams 2 columns per stationary rather than 512 per chunk. The
 #   halves accumulate over the chunks in their own fp32 PSUM columns, and one fp32 add
 #   sums them; p is normalised before MM2. One PE transpose per latent tile puts a
-#   block's output rows back. A query's turns, its last reads of its gathered rows, run
-#   before the previous query's matmuls, into the other of two chunk sets, so the
-#   gathered-row buffer that a later query's gather reuses is free one query's matmuls
-#   earlier.
+#   block's output rows back. In the staged form a query's turns, its last reads of its
+#   gathered rows, run before the previous query's matmuls, into the other of two chunk
+#   sets, so the gathered-row buffer that a later query's gather reuses is free one
+#   query's matmuls earlier. The bank form turns and multiplies one chunk at a time
+#   through two one-chunk buffers (:func:`_lowp_mm2_per_chunk`): there the gathers wait
+#   on the bank lookups between them, not on the buffer, and the two-set order made the
+#   call slower.
 #
 # A query's values pass the same instructions in the same order whatever its group,
-# so the grouping changes no bit; nor does the MM2 order (:func:`_lowp_mm2_matmuls`).
+# so the grouping changes no bit; nor does either MM2 order (:func:`_lowp_mm2_matmuls`).
 # The arithmetic differs from the fp32 body in the operand precision of MM1 (exact
 # products of the stored 2-byte values, fp32 accumulation) and MM2 (hi/lo split of p,
 # about 16 significand bits), in the softmax being taken against the global row maximum
@@ -1925,8 +1928,8 @@ def _lowp_mm2_matmuls(out_t, chunks, p_hl, qi: int, r: int, group: int, n_chunks
     different column ranges of one 3D PSUM tile give wrong sums, which the simulator does
     not show (``reports/mla_sparse.md``).
 
-    The body issues the next query's turns before these matmuls, into the other chunk
-    set, so ``chunks`` keeps this query's rows until its matmuls have read them. That
+    The staged form issues the next query's turns before these matmuls, into the other
+    chunk set, so ``chunks`` keeps this query's rows until its matmuls have read them. That
     order changes no bit: the matmuls read the same values, each latent tile's
     accumulation still starts at chunk 0 (``accumulate=False``) and adds the chunks in
     chunk order, and the add of the two halves is the same.
@@ -1939,6 +1942,46 @@ def _lowp_mm2_matmuls(out_t, chunks, p_hl, qi: int, r: int, group: int, n_chunks
         for li in range(n_latent):
             nisa.nc_matmul(dst=pv_ps[li],
                            stationary=chunks[ck][:, li * LATENT_TILE:(li + 1) * LATENT_TILE],
+                           moving=p_hl[:, col, 0:2], accumulate=(ck > 0))
+    for li in range(n_latent):
+        nisa.tensor_reduce(dst=out_t[:, li, qi:qi + 1], op=nl.add, data=pv_ps[li], axis=1)
+
+
+def _lowp_mm2_per_chunk(out_t, c_pair, c_t, p_hl, qi: int, r: int, group: int, n_chunks: int,
+                        n_latent: int, latent: int, dtype):
+    """One query's MM2 a chunk at a time, through the two one-chunk buffers ``c_pair``.
+
+    Chunk ``ck`` of the gathered rows ``c_t`` is put back on the key partitions by one PE
+    transpose per latent tile, evacuated into ``c_pair[ck % 2]`` alternately by the Vector
+    and the Scalar engine, and multiplied at once: each latent tile is one matmul's
+    stationary and the query's two p halves (column ``ck * group + r`` of ``p_hl``) are its
+    moving columns. The sums are :func:`_lowp_mm2_matmuls`'s, in the same order, so the
+    output bits are the same.
+
+    The bank form runs MM2 in this order. With the bank lookups between its gathers in
+    GpSimd's stream (:func:`_lowp_offsets`), freeing a gathered-row buffer one query's
+    matmuls earlier (the staged form's two-set order) did not start the gathers earlier
+    on device: they waited on the lookups instead. Device rows at the served prefill
+    chunk (1,024 queries, 2,048 pages of 128 rows, LNC2, one logical core): the bank-form
+    call took 11,168.1 us in this order and 11,497.1 us in the two-set order.
+    """
+    pv_ps = []
+    for _ in range(n_latent):
+        pv_ps.append(_psum(LATENT_TILE, 2))
+    for ck in range(n_chunks):
+        rows_ps = nl.ndarray((KEY_CHUNK, latent), dtype=dtype, buffer=nl.psum)
+        for li in range(n_latent):
+            nisa.nc_transpose(
+                dst=rows_ps[:, li * LATENT_TILE:(li + 1) * LATENT_TILE],
+                data=c_t[:, 0, li, ck * KEY_CHUNK:(ck + 1) * KEY_CHUNK],
+                engine=nisa.engine.tensor)
+        chunk = c_pair[ck % 2]
+        nisa.tensor_copy(dst=chunk, src=rows_ps,
+                         engine=nisa.engine.vector if ck % 2 == 0 else nisa.engine.scalar)
+        col = ck * group + r
+        for li in range(n_latent):
+            nisa.nc_matmul(dst=pv_ps[li],
+                           stationary=chunk[:, li * LATENT_TILE:(li + 1) * LATENT_TILE],
                            moving=p_hl[:, col, 0:2], accumulate=(ck > 0))
     for li in range(n_latent):
         nisa.tensor_reduce(dst=out_t[:, li, qi:qi + 1], op=nl.add, data=pv_ps[li], axis=1)
@@ -1957,8 +2000,9 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
 
     With ``table_hbm`` (the bank form) ``c_kv_hbm`` is the whole bank, which must already
     hold this step's rows, and each query's offsets are translated to bank rows through
-    the table (:func:`_lowp_offsets`); ``page_size`` is then a power of two. Every
-    instruction after the offsets is the same in both forms.
+    the table (:func:`_lowp_offsets`); ``page_size`` is then a power of two. After the
+    offsets the two forms differ only in MM2's order and its chunk buffers (the section
+    comment above); both orders give the same bits.
     """
     seq, heads, latent = q_lift_hbm.shape
     topk = topk_hbm.shape[1]
@@ -2017,16 +2061,21 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
         scratch.append(_lowp_scratch(n_chunks, banked))
     # The bank form's block table, on every key partition, read once per program.
     table = _lowp_bank_table(table_hbm, page_size) if banked else None
-    # MM2's stationaries: every chunk of one query's keys on partitions, in two sets by
-    # the query's place in its group, so a query's turns into one set can run while the
-    # query before it still reads the other (the MM2 order below). The two sets hold
-    # 2 * n_chunks * latent 2-byte elements per partition (34 KiB at top-k 2,176).
+    # MM2's stationaries. The staged form keeps every chunk of one query's keys on
+    # partitions, in two sets by the query's place in its group, so a query's turns into
+    # one set can run while the query before it still reads the other (the MM2 order
+    # below); the two sets hold 2 * n_chunks * latent 2-byte elements per partition (34 KiB
+    # at top-k 2,176). The bank form keeps one chunk at a time, in two one-chunk buffers.
     c_rows = []
     for _ in range(2):
-        chunks = []
-        for _ in range(n_chunks):
-            chunks.append(nl.ndarray((KEY_CHUNK, latent), dtype=c_kv_hbm.dtype, buffer=nl.sbuf))
-        c_rows.append(chunks)
+        if banked:
+            c_rows.append(nl.ndarray((KEY_CHUNK, latent), dtype=c_kv_hbm.dtype, buffer=nl.sbuf))
+        else:
+            chunks = []
+            for _ in range(n_chunks):
+                chunks.append(nl.ndarray((KEY_CHUNK, latent), dtype=c_kv_hbm.dtype,
+                                         buffer=nl.sbuf))
+            c_rows.append(chunks)
 
     # ---- the group's softmax rows, one query per partition ------------------------
     # Each [group, K] fp32 tile costs its full row of every partition's address space,
@@ -2178,19 +2227,27 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
                                engine=nisa.engine.vector)
 
             # ---- MM2 per query, latent on partitions: out[L] = sum_k c[k, L] * p[k] -----
-            # Query r's turns put its gathered rows back on the key partitions; they are
-            # its last reads of its gathered-row buffer, which the gather `ring` queries
-            # on waits for. Each query after the group's first has its turns before the
-            # previous query's matmuls, so that buffer is free one query's matmuls
-            # earlier. Every sum keeps its order: only the program order changes.
-            for r in range(group):
-                _lowp_mm2_turns(c_rows[r % 2], rows_t[(n0 + g0 + r) % ring], n_chunks, n_latent,
-                                latent, c_kv_hbm.dtype)
-                if r > 0:
-                    _lowp_mm2_matmuls(out_t, c_rows[(r - 1) % 2], p_hl, g0 + r - 1, r - 1, group,
-                                      n_chunks, n_latent)
-            _lowp_mm2_matmuls(out_t, c_rows[(group - 1) % 2], p_hl, g0 + group - 1, group - 1,
-                              group, n_chunks, n_latent)
+            # The bank form: each query a chunk at a time (:func:`_lowp_mm2_per_chunk`).
+            # The staged form: query r's turns put its gathered rows back on the key
+            # partitions; they are its last reads of its gathered-row buffer, which the
+            # gather `ring` queries on waits for. Each query after the group's first has
+            # its turns before the previous query's matmuls, so that buffer is free one
+            # query's matmuls earlier. Every sum keeps its order: only the program order
+            # changes.
+            if banked:
+                for r in range(group):
+                    _lowp_mm2_per_chunk(out_t, c_rows, rows_t[(n0 + g0 + r) % ring], p_hl,
+                                        g0 + r, r, group, n_chunks, n_latent, latent,
+                                        c_kv_hbm.dtype)
+            else:
+                for r in range(group):
+                    _lowp_mm2_turns(c_rows[r % 2], rows_t[(n0 + g0 + r) % ring], n_chunks,
+                                    n_latent, latent, c_kv_hbm.dtype)
+                    if r > 0:
+                        _lowp_mm2_matmuls(out_t, c_rows[(r - 1) % 2], p_hl, g0 + r - 1, r - 1,
+                                          group, n_chunks, n_latent)
+                _lowp_mm2_matmuls(out_t, c_rows[(group - 1) % 2], p_hl, g0 + group - 1,
+                                  group - 1, group, n_chunks, n_latent)
 
         # ---- the block's rows: one PE transpose per latent tile, one store -------------
         rows_out_ps = _psum(qpb, latent)
