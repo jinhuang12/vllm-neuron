@@ -153,8 +153,9 @@ def _record_one_tapped_layer(layer, monkeypatch) -> tuple[dict, list]:
 
     The attention output, the expert block's two ends and the routed half come from module
     hooks. ``route_tokens`` and ``shared_expert_mm`` are methods called directly, so each is
-    wrapped and its return recorded on the way out. The token mapping needs no reference of
-    its own: it is read against its own property below.
+    wrapped and its return recorded on the way out. The token mapping and the combine's
+    dropped-pair count need no reference of their own: each is read against its own property
+    below.
     """
     seen: dict[str, torch.Tensor] = {}
 
@@ -385,6 +386,14 @@ def test_a_configured_dump_writes_one_file_per_declared_name_bit_equal_to_the_la
                 assert torch.equal(counts, torch.full_like(counts, top_k)), (
                     f"layer{tap} routed its real tokens {counts.tolist()} times against the "
                     f"{top_k} experts each was given"
+                )
+                continue
+            if suffix == "combine_dropped":
+                # A top-k routing fits the emission the mapping sizes for it, so the combine
+                # holds every routed pair and drops none.
+                assert dumped.reshape(-1).tolist() == [0.0], (
+                    f"layer{tap} dropped {dumped.reshape(-1).tolist()} routed pairs of a top-"
+                    f"{top_k} routing, which the emission holds by construction"
                 )
                 continue
             if suffix == "o_proj_partial":
