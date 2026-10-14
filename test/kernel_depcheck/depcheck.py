@@ -104,6 +104,66 @@ Limits of the class:
     the body) is part of the back-edge sequence by the definition above;
   - `Drain` (`is_reset_sema`) is a plain instruction: its effect on semaphores is not
     modelled. `GroupResetSemaphores` zeroes its `sema_group`.
+
+Linked dumps (`Program`). A dump of a linked program holds several functions: the kernels and
+`main`. Each of `main`'s `Call` instructions runs the function its `target` names and binds
+the function's parameters to locations of `main` (`arguments`: {a set name of the function: a
+set name of `main`}, a set name being an allocation's `name`). `main` can call a function more
+than once. Each call is checked as a one-function dump is, and its VERDICT lines name the
+function and the call: `VERDICT (<function> <call>): ...` (the counts of `VERDICT_LINE`) and
+`VERDICT (<function> <call> loop-carried): ...`. `main` is checked too, and so is a function
+that `main` does not call, with its parameters unbound. In the check of a call:
+  - an operand's location is looked up in the allocations of the function its
+    `memref_owner_func` names (`main`, its own function or another one), else of its own
+    function, never by its name in another function: the functions of one program often have
+    locations of one name at different addresses;
+  - a location of the function that the call binds is the location of `main` it binds it to;
+    a parameter of another function is the location of `main` that function's one call binds
+    it to (UNDECIDED, other-operand, when `main` calls that function more than once);
+  - a DMATrigger whose `dma_blocks` has one block per call of its function starts the block
+    of this call (block k of call k), and a wait on any of those blocks waits on that one
+    (walrus names the first call's block in the wait). A list of another length than 1 starts
+    every block, and the call is UNDECIDED (other-operand).
+In a linked dump the local DRAM arena, the functions' `Internal` locations and the
+`InternalInterface` locations of `main`, is one space by address; another DRAM tensor is a
+space of its owner (`DRAM:<owner>:<name>`). The heading of each check counts its operands by
+owner: its function's own locations, `main`'s (named by `memref_owner_func` or bound by the
+call's arguments) and each other function's. The functions' section also counts each
+function's operands in the dump by `memref_owner_func` (`Program.census`; an operand without
+one is its function's own): over its instructions and each DMA block its DMATriggers name,
+once per name in a `dma_blocks` list.
+
+Cross-function pairs. The accesses of two calls to memory of more than one function are paired
+as the accesses of one function are, the earlier call's access first; two calls of one function
+are paired too. That memory (`Program.in_scope`) is: `main`'s locations (after the bindings), a
+location that a function other than its owner and `main` names by `memref_owner_func` (the
+owner's accesses to it too), and the bytes of the local arena those locations hold (any
+location there on those bytes). The happens-before graph of the program is the graphs of the
+calls, joined in call order by the program-order rules of one function: an engine runs its
+instructions in order across calls, an all-engine instruction orders every engine, and the
+DMAs of one queue complete in issue order (QUEUE-ORDER-ONLY), except on a queue that `main`
+switches (`SwitchQueueInstance`). The check does not build that graph: from call to call it
+carries which last nodes of the engines, of the all-engine instructions and of the queues an
+access reaches (`JoinedOrder`), so its memory is that of the largest call. `main`'s own
+instructions are not in the order; they can only add order. Without a call order (no `main`, a
+Call of a function the dump does not have, no Call) every pair is UNCHECKED (each is listed),
+and so is every pair when a call's graph has a cycle. `VERDICT (cross-function)` is FINDINGS
+when an UNSYNC pair is confirmed (as in the one-pass verdict), UNDECIDED without a call order
+(also with no pair: an unbound parameter's memory is not known) or when a pair is UNCHECKED or
+goes through a runtime address, else CLEAN. `VERDICT (program)` is FINDINGS when a VERDICT line
+of the dump is FINDINGS, else UNDECIDED when one is UNDECIDED, else CLEAN. A linked dump prints
+no `VERDICT:` line, so a reader of `VERDICT_LINE` cannot take one call's verdict for the dump's.
+
+Limits of the linked check:
+  - memory that one kernel uses alone is not paired across calls: SBUF/PSUM locations and a
+    kernel's own DRAM that no other function names, off the arena bytes above, are checked
+    inside each call only, also when two calls (or two kernels) reuse them;
+  - a `Const` location is a space of its owner (`DRAM:<owner>:<name>`), as in a one-function
+    dump, also when it lies in the local arena: another function's location on its bytes is
+    not paired with it;
+  - a wait binds to a producer of its own call only, and the semaphore counts of each call
+    start at zero;
+  - a DMA that its call does not wait for stays unordered after the call.
 """
 
 # CHANGELOG
@@ -149,10 +209,22 @@ Limits of the class:
 #                     loop over every pair of access nodes took hours on a large dump. main()
 #                     classifies the pairs as they come, and keeps only the ones it prints
 #                     (all of them with --all or --pairs). The output is the same.
+# 2026-10-14          A dump of several functions was read as its first function only, and an
+#                     operand's location was looked up by name in that function's allocations:
+#                     a location of another function (`memref_owner_func`) whose name the
+#                     function also has was read at the wrong address, and one whose name it
+#                     does not have raised KeyError. Now (Program) every call of main is
+#                     checked with its bindings and its own DMA blocks, each operand in its
+#                     owner's allocations (main's or another function's), and the pairs of two
+#                     calls on memory of more than one function in main's call order
+#                     (UNCHECKED without one); each check counts its operands by owner.
+#                     Model.classify holds the one-pass classification that main() printed.
+#                     A one-function dump gives the same output.
 
 import bisect
 import collections
 import heapq
+import itertools
 import json
 import re
 import sys
@@ -161,9 +233,9 @@ DSZ = {"float32": 4, "int32": 4, "uint32": 4, "bfloat16": 2, "float16": 2, "int1
        "uint16": 2, "int8": 1, "uint8": 1, "float8e4": 1, "float8e5": 1, "bool": 1}
 
 
-def load(path):
-    d = json.load(open(path))
-    f = d["functions"][0]
+def memory_locations(f):
+    """{name: memory location} of the allocations of function `f`. `set`: the name of the
+    location's allocation (a memory location set), which a Call's `arguments` name."""
     memlocs = {}
     for a in f["allocations"]:
         for m in a.get("memorylocations", []):
@@ -172,7 +244,77 @@ def load(path):
                 kind=a["kind"], tensor_name=a.get("debug", {}).get("tensor_name"),
                 shape=a.get("debug", {}).get("shape"), bank=m.get("bank"),
                 base=m.get("base"), table_entry_id=m.get("table_entry_id"),
-                tensor_id=m.get("tensor_id"), runtime_reserved=m.get("runtime_reserved"))
+                tensor_id=m.get("tensor_id"), runtime_reserved=m.get("runtime_reserved"),
+                set=a.get("name"))
+    return memlocs
+
+
+#: The kinds of DRAM location in the local arena of a linked dump: a function's own, main's.
+LOCAL_ARENA_KINDS = ("Internal", "InternalInterface")
+
+
+class Memlocs(dict):
+    """The memory locations of `function` by name. `owners` holds every function's locations
+    by function name (module docstring, "Linked dumps"); `linked`: the dump has more than one
+    function. `binding`: in a call of the function, {the set name of a location the call
+    binds: (main's location or None, its name, main, True)} (Program.binding). `params`: {a
+    function main calls: (the binding of its call when main calls it once, else None; the
+    number of its calls; the set names its calls bind)} (Program.params)."""
+
+    def __init__(self, f, owners, binding=None, params=None):
+        super().__init__(memory_locations(f))
+        self.function, self.owners, self.linked = f.get("name"), owners, len(owners) > 1
+        self.binding, self.params = binding or {}, params or {}
+
+    def locate(self, op, ref, strip_set=False):
+        """(location or None, its name, the function that owns it, whether this call binds it)
+        of `ref`, which operand `op` names: a location of the function `memref_owner_func`
+        names (main, this function or another one), else of this function. A location of this
+        function that the call binds is main's location it binds it to; a parameter of another
+        function is main's location that function's one call binds it to, and Undecided when
+        main calls that function more than once. With `strip_set`, a `ref` no location has is
+        read as a set name (`<location>_set`)."""
+        owner = op.get("memref_owner_func") or self.function
+        table = self if owner == self.function else self.owners.get(owner, {})
+        if strip_set and ref not in table and ref.endswith("_set"):
+            ref = ref[:-len("_set")]
+        m = table.get(ref)
+        if m is None:
+            return m, ref, owner, False
+        if owner == self.function:
+            if m["set"] in self.binding:
+                return self.binding[m["set"]]
+        elif owner in self.params and m["set"] in self.params[owner][2]:
+            binding, calls = self.params[owner][:2]
+            if binding is None:
+                raise Undecided(f"operand on {self.name(ref, owner)}, a parameter of {owner}, "
+                                f"which main calls {calls} times: which call's location it "
+                                f"is is not known")
+            theirs, name, caller, _ = binding[m["set"]]
+            return theirs, name, caller, False
+        return m, ref, owner, False
+
+    def name(self, ref, owner):
+        """`ref` of `owner` for a message: the bare name for this function's own location."""
+        return repr(ref) if owner == self.function else f"{ref!r} of {owner}"
+
+    def dram_space(self, m, ref, owner):
+        """The space of DRAM location `m` (named `ref`, owned by `owner`): the internal arena,
+        else the tensor; in a linked dump, the local arena or the tensor of its owner."""
+        if not self.linked:
+            return "DRAM:" + ("INTERNAL" if m["kind"] == "Internal" else ref)
+        return "DRAM:INTERNAL" if m["kind"] in LOCAL_ARENA_KINDS else f"DRAM:{owner}:{ref}"
+
+
+def load(path, function=0, d=None, binding=None, params=None):
+    """(the dump, its function number `function`, that function's Memlocs, its instructions in
+    program order, every DMA block of the dump by name). `d`: the dump, already read;
+    `binding`, `params`: Memlocs's, for a call of the function."""
+    if d is None:
+        d = json.load(open(path))
+    f = d["functions"][function]
+    memlocs = Memlocs(f, {g.get("name"): memory_locations(g) for g in d["functions"]}, binding,
+                      params)
     ins = [i for b in f["blocks"] for i in b["instructions"]]
     blocks = {}
     for q in d["queues"]:
@@ -269,21 +411,19 @@ class _Reach:
 def runtime_footprint(op, memlocs):
     """A `register_ap` operand: its address is a register the program sets. DRAM: the whole
     tensor (conservative: it overlaps every access to that tensor). SBUF/PSUM: Undecided."""
-    ref = op.get("memref") or op.get("memsetref") or ""
-    if ref not in memlocs and ref.endswith("_set"):
-        ref = ref[:-len("_set")]
-    if ref not in memlocs:
-        raise Undecided(f"runtime-address operand on {ref!r}: no memory location")
-    m = memlocs[ref]
+    m, ref, owner, bound = memlocs.locate(op, op.get("memref") or op.get("memsetref") or "",
+                                          strip_set=True)
+    if m is None:
+        raise Undecided(f"runtime-address operand on {memlocs.name(ref, owner)}: "
+                        f"no memory location")
     if m["type"] != "DRAM":
         raise Undecided(f"runtime-address {m['type']} operand on {ref}")
     size = 1
     for n in m["dims"]:
         size *= n
-    space = "DRAM:" + ("INTERNAL" if m["kind"] == "Internal" else ref)
-    return dict(space=space, parts=None, lo=m["addr"], hi=m["addr"] + size, cross=False,
-                ivs=None, memref=ref, tensor=m["tensor_name"], ap=op.get("ap"), off=None,
-                runtime=True)
+    return dict(space=memlocs.dram_space(m, ref, owner), parts=None, lo=m["addr"],
+                hi=m["addr"] + size, cross=False, ivs=None, memref=ref, tensor=m["tensor_name"],
+                ap=op.get("ap"), off=None, runtime=True, owner=owner, bound=bound)
 
 
 def whole_location(op, memlocs):
@@ -292,10 +432,11 @@ def whole_location(op, memlocs):
     The loop-carried class uses it; it assumes the runtime address stays inside."""
     if op.get("kind") != "register_ap":
         return None
-    ref = op.get("memref") or op.get("memsetref") or ""
-    if ref not in memlocs and ref.endswith("_set"):
-        ref = ref[:-len("_set")]
-    m = memlocs.get(ref)
+    try:
+        m, ref, owner, bound = memlocs.locate(op, op.get("memref") or op.get("memsetref") or "",
+                                              strip_set=True)
+    except Undecided:
+        return None
     if m is None or m["type"] not in ("SB", "PSUM"):
         return None
     pbase = m.get("base") or 0
@@ -303,7 +444,7 @@ def whole_location(op, memlocs):
     space = m["type"] if m["type"] == "SB" else f"PSUM.bank{m['bank']}"
     return dict(space=space, parts=frozenset(range(pbase, pbase + m["dims"][0])), lo=lo, hi=hi,
                 cross=False, ivs=[(lo, hi)], memref=ref, tensor=m["tensor_name"],
-                ap=op.get("ap"), off=None, runtime=True)
+                ap=op.get("ap"), off=None, runtime=True, owner=owner, bound=bound)
 
 
 def covers(a, b):
@@ -336,7 +477,9 @@ def footprint(op, memlocs):
         return runtime_footprint(op, memlocs)
     if kind != "physical_ap":
         raise Undecided(f"operand of kind {kind!r}")
-    m = memlocs[op["memref"]]
+    m, ref, owner, bound = memlocs.locate(op, op["memref"])
+    if m is None:
+        raise Undecided(f"operand on {memlocs.name(ref, owner)}: no memory location")
     dsz = DSZ[op["dtype"]]
     ap, off = op["ap"], op["offset"]
     if m["type"] in ("SB", "PSUM"):
@@ -354,15 +497,16 @@ def footprint(op, memlocs):
         ivs = expand(inner, m["addr"] // dsz + col0, ) if inner else [(m["addr"] // dsz + col0, m["addr"] // dsz + col0 + 1)]
         ivs = None if ivs is None else [(a * dsz, b * dsz) for a, b in ivs]
         return dict(space=space, parts=parts, lo=lo, hi=hi, cross=cross, ivs=ivs,
-                    memref=op["memref"], tensor=m["tensor_name"], ap=ap, off=off)
+                    memref=ref, tensor=m["tensor_name"], ap=ap, off=off, owner=owner,
+                    bound=bound)
     maxoff = sum((n - 1) * s for s, n in ap)
-    space = "DRAM:" + ("INTERNAL" if m["kind"] == "Internal" else op["memref"])
+    space = memlocs.dram_space(m, ref, owner)
     lo = m["addr"] + off * dsz
     hi = m["addr"] + (off + maxoff + 1) * dsz
     ivs = expand(ap, m["addr"] // dsz + off)
     ivs = None if ivs is None else [(a * dsz, b * dsz) for a, b in ivs]
-    return dict(space=space, parts=None, lo=lo, hi=hi, cross=False, ivs=ivs, memref=op["memref"],
-                tensor=m["tensor_name"], ap=ap, off=off)
+    return dict(space=space, parts=None, lo=lo, hi=hi, cross=False, ivs=ivs, memref=ref,
+                tensor=m["tensor_name"], ap=ap, off=off, owner=owner, bound=bound)
 
 
 def overlap(a, b):
@@ -394,9 +538,26 @@ def fp_str(fp):
 
 
 class Model:
-    def __init__(self, path):
-        self.d, self.f, self.memlocs, self.ins, self.blocks = load(path)
+    """The check of one function of a dump (function number `function`; `d`: the dump, already
+    read). `call`: a call of the function (Call; module docstring, "Linked dumps"), with
+    `binding` its Memlocs binding; `params`: Memlocs's, the parameters of the functions main
+    calls."""
+
+    def __init__(self, path, function=0, d=None, call=None, binding=None, params=None):
+        self.d, self.f, self.memlocs, self.ins, self.blocks = load(path, function, d, binding,
+                                                                   params)
+        self.function = self.f.get("name")
+        self.call = call
         self.build()
+
+    @classmethod
+    def graph_of(cls, edges, qedges, acc):
+        """A Model of a happens-before graph (`edges`, `qedges`) and access nodes `acc` only,
+        not of a function: `ordered`, `path`, `overlapping_pairs` and `unconfirmed_because`
+        work on it (Program's pairs of two calls)."""
+        graph = cls.__new__(cls)
+        graph.edges, graph.qedges, graph.acc, graph._reach = edges, qedges, acc, {}
+        return graph
 
     def build(self):
         ins, blocks, memlocs = self.ins, self.blocks, self.memlocs
@@ -408,9 +569,19 @@ class Model:
         self.undecided = []    # operands / edges the check cannot model: the dump is UNDECIDED
         self.undecided_class = collections.Counter()   # their causes (module docstring)
         self.loop_undecided = []   # (block or None for the dump, why): the loop-carried class's
+        # operands with memory by owner: `memref_owner_func` names another function (by
+        # owner), or the call binds the location (to main's), or else the function's own
+        self.foreign_operands = collections.Counter()   # owner -> operands on its locations
+        self.foreign_names = collections.defaultdict(set)   # owner -> the location names
+        self.bound_operands = 0          # operands on a location the call binds (main's)
+        self.bound_names = set()         # main's names of those locations
+        self.own_operands = 0            # the others: on the function's own locations
+        self.own_names = set()
+        self.alias = {}                  # DMA block a wait names -> the block this call starts
+        started = [self._dma_blocks(i) for i in ins]   # the DMA blocks each instruction starts
         # Nodes are positions: an instruction (or DMA block) name that repeats gets `name@k`.
         icount = collections.Counter(i["name"] for i in ins)
-        bcount = collections.Counter(b for i in ins for b in i.get("dma_blocks", []))
+        bcount = collections.Counter(b for blocks in started for b in blocks)
         seen = collections.Counter()
         self.ids_of = collections.defaultdict(list)
         self.block_of = {}     # node -> name of the block holding it (a DMA's: its issuer's)
@@ -427,9 +598,23 @@ class Model:
             """(footprints, runtime-address SBUF/PSUM operands as their whole locations)"""
             out, whole = [], []
             for x in ops:
+                owner = x.get("memref_owner_func")
+                foreign = bool(owner) and owner != self.function
+                if foreign:
+                    self.foreign_operands[owner] += 1
+                    self.foreign_names[owner].add(x.get("memref") or x.get("memsetref"))
                 try:
                     f = footprint(x, memlocs)
+                    if f and f["bound"]:
+                        self.bound_operands += 1
+                        self.bound_names.add(f["memref"])
+                    elif f and not foreign:
+                        self.own_operands += 1
+                        self.own_names.add(f["memref"])
                 except Undecided as why:
+                    if not foreign:
+                        self.own_operands += 1
+                        self.own_names.add(x.get("memref") or x.get("memsetref"))
                     dbg = i.get("debug") or {}
                     text = f"{node} {i['opcode']}@{i['engine']} L{dbg.get('lineno')}: {why}"
                     self.undecided.append(text)
@@ -450,6 +635,7 @@ class Model:
         last_on_engine = {}
         done_of = {}
         self.qedges = collections.defaultdict(set)   # extra: same-queue in-order completion
+        self.queue_order = []  # (instruction index, queue, completion node) of each DMA, in order
         last_on_queue = {}
         last_barrier = None   # engine "ALL" instructions (AllEngineBarrier, GroupResetSemaphores): every
         self.barriers = []    # engine's earlier instructions precede it, it precedes every engine's later ones
@@ -489,8 +675,9 @@ class Model:
                 if q in last_on_queue:
                     self.qedges[last_on_queue[q]].add(done)
                 last_on_queue[q] = done
+                self.queue_order.append((k, q, done))
             elif op == "DMATrigger":
-                for bname in i.get("dma_blocks", []):
+                for bname in started[k]:
                     bn = node_of(bname, bcount, blk)
                     self.edges[name].add(bn)
                     self.pos[bn] = k
@@ -514,6 +701,7 @@ class Model:
                     if q in last_on_queue:
                         self.qedges[last_on_queue[q]].add(bn)
                     last_on_queue[q] = bn
+                    self.queue_order.append((k, q, bn))
             else:
                 reads, whole_reads = fps(i, name, i.get("ins", []), blk)
                 writes, whole_writes = fps(i, name, i.get("outs", []), blk)
@@ -542,6 +730,64 @@ class Model:
         self._reach = {}
         self._loop_pairs = None
         self._body_updates = {}
+
+    def _dma_blocks(self, i):
+        """The DMA blocks instruction `i` starts: its `dma_blocks`. In call k of the function's
+        n calls, a list of n blocks starts its block k, and a wait on any of them waits on
+        that one (`alias`); a list of another length than 1 or n starts every block, and the
+        check of the call is UNDECIDED (module docstring, "Linked dumps")."""
+        blocks = i.get("dma_blocks", [])
+        if self.call is None or len(blocks) <= 1:
+            return blocks
+        if len(blocks) == self.call.calls:
+            mine = blocks[self.call.number]
+            self.alias.update((b, mine) for b in blocks)
+            return [mine]
+        dbg = i.get("debug") or {}
+        self.undecided.append(
+            f"{i['name']} {i['opcode']}@{i['engine']} L{dbg.get('lineno')}: names "
+            f"{len(blocks)} DMA blocks for the {self.call.calls} calls of {self.function}: "
+            f"which one a call starts is not known")
+        self.undecided_class["other-operand"] += 1
+        return blocks
+
+    def junction(self, engines, barrier, queues):
+        """How the graph of this call joins the graph of the calls before it: (targets, exits),
+        by the program-order rules of `build`. `engines`, `queues`: the engines and queues with
+        a last node before the call; `barrier`: an all-engine instruction is before it. A slot
+        is ("engine", e), ("barrier",) or ("queue", q). `targets`: {slot: the nodes of this
+        call that get an edge from the slot's last node before the call} (a queue slot's edges
+        are qedges); `exits`: {slot: the slot's last node in this call}."""
+        targets, last, bar, last_q = collections.defaultdict(set), {}, None, {}
+        queue_at = collections.defaultdict(list)
+        for k, q, node in self.queue_order:
+            queue_at[k].append((q, node))
+        for k, (name, i) in enumerate(zip(self.node, self.ins)):
+            eng = i["engine"]
+            if eng == "ALL":
+                for e in engines | set(last):
+                    if e not in last:
+                        targets[("engine", e)].add(name)
+                    last[e] = name
+                if bar is None and barrier:
+                    targets[("barrier",)].add(name)
+                bar = name
+            elif eng != "Unassigned":
+                if eng not in last and bar is None:
+                    if eng in engines:
+                        targets[("engine", eng)].add(name)
+                    elif barrier:
+                        targets[("barrier",)].add(name)
+                last[eng] = name
+            for q, node in queue_at[k]:
+                if q not in last_q and q in queues:
+                    targets[("queue", q)].add(node)
+                last_q[q] = node
+        exits = {("engine", e): n for e, n in last.items()}
+        if bar is not None:
+            exits[("barrier",)] = bar
+        exits.update((("queue", q), n) for q, n in last_q.items())
+        return targets, exits
 
     def _find_loops(self, block_at):
         """{loop body: its instruction nodes in program order}: the blocks holding a branch
@@ -595,8 +841,9 @@ class Model:
         the wait value, else the last. None when no instance comes before the waiter
         (LATER-PRODUCER); the name itself when no instruction has it (NO-UPDATE-FOUND). A wait
         in a loop body whose own body holds the name only after it also waits for the previous
-        iteration's instance, which the loop-carried class does not model."""
-        inst = self.ids_of.get(w["from"])
+        iteration's instance, which the loop-carried class does not model. In a call, a wait
+        on a DMA block waits on the block the call starts (`alias`)."""
+        inst = self.ids_of.get(self.alias.get(w["from"], w["from"]))
         if not inst:
             return w["from"]
         k, blk = self.pos[waiter], self.block_of[waiter]
@@ -762,6 +1009,36 @@ class Model:
         else:
             word = "CLEAN"
         return word, counts
+
+    def classify(self, lo=None, hi=None, keep_all=False):
+        """The one-pass check of the function (`Classified`; main prints it). The pairs are
+        the overlapping pairs (with `lo`, `hi`: those with P or C on a source line in [lo, hi]),
+        classified as the sweep finds them. Only those main prints are kept: the pairs not
+        ordered, or every pair with `keep_all`, in the order of `conflicts`. On a cycle no pair
+        is classified (`reach` raises CycleError)."""
+        waits = self.check_sem_arith()
+        cycle = self.one_cycle() if self.undecided_class["cycle"] else []
+        n_pairs = n_ok = n_bad = n_q = 0
+        kept = []
+        for order, kind, P, C, fa, fb in self.overlapping_pairs(lo, hi):
+            n_pairs += 1
+            if cycle:
+                continue
+            ok = self.ordered(P, C)
+            okq = ok or self.ordered(P, C, True)
+            if ok:
+                n_ok += 1
+            elif okq:
+                n_q += 1
+            else:
+                n_bad += 1
+            if keep_all or not ok:
+                kept.append((order, kind, P, C, fa, fb, ok, okq))
+        kept.sort(key=lambda pair: pair[0])
+        unsync = [(kind, P, C, fa, fb) for _, kind, P, C, fa, fb, _, okq in kept if not okq]
+        bad = sum(1 for status in waits if status[0] != "OK")
+        return Classified(waits, bad, cycle, n_pairs, n_ok, n_q, n_bad,
+                          [pair[1:] for pair in kept], unsync, *self.one_pass_verdict(unsync, bad))
 
     def label(self, a):
         i = a["i"]
@@ -1091,57 +1368,418 @@ the exact footprint. `runtime`: a footprint is a runtime-address operand taken w
 `listed`: the compiler's `loop_carried_dependencies` on `dst` names `src`'s instruction with
 the pair's kind."""
 
+Classified = collections.namedtuple(
+    "Classified", "waits waits_not_ok cycle pairs ordered queue_only unsync_count kept unsync "
+                  "word counts")
+Classified.__doc__ = """The one-pass check of one function (`Model.classify`).
+
+`waits`: the rows of `check_sem_arith`; `waits_not_ok`: how many are not OK. `cycle`: one cycle
+of the graph, [] when it has none. `pairs`: the number of overlapping pairs; `ordered`,
+`queue_only`, `unsync_count`: how many are ordered by engine order and semaphores, ordered only
+if same-queue DMAs complete in order, not ordered. `kept`: (kind, P, C, fp, fc, ok, okq) of the
+pairs main prints. `unsync`: (kind, P, C, fp, fc) of the UNSYNC pairs. `word`, `counts`: the
+VERDICT line's (`Model.one_pass_verdict`)."""
+
+Call = collections.namedtuple("Call", "name function number calls arguments position")
+Call.__doc__ = """One of main's Calls (module docstring, "Linked dumps"): `name`, the instruction's
+name; `function`, its `target`; `number`, its place (from 0) among the `calls` of the function;
+`arguments`, {a set name of the function: a set name of main}; `position`, its place in main's
+call order."""
+
+Check = collections.namedtuple(
+    "Check", "label function call instructions word loop_word pairs ordered queue_only "
+             "unsync_count owner_field owner_field_names bound bound_names own own_names "
+             "siblings cycle")
+Check.__doc__ = """The check of main, of one call (`call`) or of a function main does not call
+(`Program.check`). `label`: the name its VERDICT lines carry, `<function> <call>` for a call.
+`word`, `loop_word`: its one-pass and loop-carried verdicts; `pairs`, `ordered`, `queue_only`,
+`unsync_count`: the counts of its one-pass pairs (Classified). Its operands with memory by
+owner, and `*_names` the number of their locations: `owner_field`, on locations of main named
+by `memref_owner_func`; `bound`, on locations the call binds to main's; `siblings`, ((another
+function, operands, locations), ...) named by `memref_owner_func`; `own`, the others, on the
+function's own locations. `cycle`: its graph has a cycle."""
+
+CrossPair = collections.namedtuple(
+    "CrossPair", "kind src_label dst_label src_function dst_function tag src dst src_fp dst_fp "
+                 "because")
+CrossPair.__doc__ = """One cross-function pair (module docstring, "Cross-function pairs").
+
+`src`, an access of the check `src_label` (of `src_function`) with footprint `src_fp`, is
+earlier in the program than `dst`, an access of the check `dst_label` with footprint `dst_fp`.
+`tag`: OK, QUEUE-ORDER-ONLY, UNSYNC or UNCHECKED. `because`: why an UNSYNC pair is not
+confirmed (`Model.unconfirmed_because`), else None."""
+
+#: The tags of a cross-function pair, in the order the counts print.
+CROSS_TAGS = ("OK", "QUEUE-ORDER-ONLY", "UNSYNC", "UNCHECKED")
+
+
+class JoinedOrder:
+    """The order across calls (module docstring, "Cross-function pairs"), read without the
+    program's graph. A slot (`Model.junction`) holds the last node of an engine, of the
+    all-engine instructions or of a queue. For each call and relation (`with_queue` False,
+    True), `add` keeps, as bits of the slots: for an access, the slots after its call whose
+    last node it reaches (`out`) and the slots before its call whose last node reaches it
+    (`into`); for the call, which slots after it each slot before it reaches (`transfer`).
+    `switched`: the queues that main switches, which carry no order across calls."""
+
+    def __init__(self, switched=()):
+        self.switched = frozenset(switched)
+        self.engines, self.barrier, self.queues = set(), False, set()
+        self.bit = {}          # slot -> its bit
+        self.transfer = []     # per call: {with_queue: {bit of a slot before it: bits after it}}
+        self._memo = {}
+
+    def add(self, M, accs):
+        """Join the next call, Model `M`; `accs`: its accesses that cross-function pairs take,
+        which get the masks and `call`, the call's place here."""
+        targets, exits = M.junction(self.engines, self.barrier, self.queues)
+        exits = {s: n for s, n in exits.items() if s[0] != "queue" or s[1] not in self.switched}
+        before = list(self.bit)
+        for slot in exits:
+            self.bit.setdefault(slot, 1 << len(self.bit))
+
+        def mask(slots, test):
+            out = 0
+            for s in slots:
+                if test(s):
+                    out |= self.bit[s]
+            return out
+
+        transfer = {}
+        for with_queue in (False, True):
+            def reaches(x, y):
+                return x == y or y in M.reach(x, with_queue)
+
+            sources = {s: targets.get(s, ()) if with_queue or s[0] != "queue" else ()
+                       for s in before}
+            transfer[with_queue] = {
+                self.bit[s]: (0 if s in exits else self.bit[s]) | mask(
+                    exits, lambda t: any(reaches(n, exits[t]) for n in sources[s]))
+                for s in before}
+            for a in accs:
+                a[("out", with_queue)] = mask(exits, lambda t: reaches(a["done"], exits[t]))
+                a[("into", with_queue)] = mask(
+                    before, lambda s: any(reaches(n, a["issue"]) for n in sources[s]))
+        for a in accs:
+            a["call"] = len(self.transfer)
+        self.transfer.append(transfer)
+        self.engines |= {s[1] for s in exits if s[0] == "engine"}
+        self.barrier = self.barrier or ("barrier",) in exits
+        self.queues |= {s[1] for s in exits if s[0] == "queue"}
+
+    def ordered(self, p, c, with_queue=False):
+        """Access `p`'s completion happens-before access `c`'s start, `c` in a later call."""
+        key = (p["call"], c["call"], p[("out", with_queue)], with_queue)
+        v = self._memo.get(key)
+        if v is None:
+            v = p[("out", with_queue)]
+            for k in range(p["call"] + 1, c["call"]):
+                t, after = self.transfer[k][with_queue], 0
+                while v:
+                    low = v & -v
+                    after |= t[low]
+                    v ^= low
+                v = after
+            self._memo[key] = v
+        return bool(v & c[("into", with_queue)])
+
+
+class Program:
+    """The check of a dump of several functions (module docstring, "Linked dumps"): main's
+    calls; then (`check`) main, each call, each function main does not call, and the
+    cross-function pairs. `d`: the dump, already read; `lo`, `hi`: the source lines of
+    `--lines`; `keep_all`: keep every pair of a check for printing (`Model.classify`)."""
+
+    #: The function whose calls run the others.
+    CALLER = "main"
+
+    def __init__(self, path, d=None, lo=None, hi=None, keep_all=False):
+        self.path, self.lo, self.hi, self.keep_all = path, lo, hi, keep_all
+        self.d = json.load(open(path)) if d is None else d
+        self.names = [f.get("name") for f in self.d["functions"]]
+        if len(set(self.names)) != len(self.names):
+            raise ValueError(f"{path}: function names repeat: {self.names}")
+        self.calls, self.order_unknown = self._calls()
+        caller = (self.d["functions"][self.names.index(self.CALLER)]
+                  if self.CALLER in self.names else dict(allocations=[], blocks=[]))
+        self.caller_locations = memory_locations(caller)
+        self._caller_sets = collections.defaultdict(list)
+        for name, m in self.caller_locations.items():
+            self._caller_sets[m["set"]].append(name)
+        #: The queues main switches (SwitchQueueInstance): they carry no order across calls.
+        self.switched = {i.get("queue") for b in caller["blocks"] for i in b["instructions"]
+                         if i.get("opcode") == "SwitchQueueInstance"}
+        #: Memlocs's `params`: {a function main calls: (the binding of its call when main calls
+        #: it once, else None; the number of its calls; the set names its calls bind)}.
+        self.params = {}
+        for c in self.calls or ():
+            one = self.binding(c) if c.calls == 1 else None
+            sets = self.params.get(c.function, (None, 0, frozenset()))[2]
+            self.params[c.function] = (one, c.calls, sets | frozenset(c.arguments))
+        #: {function: {owner: its operands that name the owner's locations}}, by
+        #: `memref_owner_func` (an operand without one is the function's own), over the
+        #: function's instructions and every DMA block its DMATriggers name, once per name in a
+        #: `dma_blocks` list; and the (owner, location) pairs that a function other than the
+        #: owner and main names (module docstring, "Cross-function pairs").
+        self.census, self.cross_owned = self._census()
+        self._arena = self._arena_bytes()
+        self.checks, self.models, self.verdicts = [], {}, {}
+        #: Why the cross-function pairs are UNCHECKED (None: they are classified).
+        self.unchecked = self.order_unknown
+        self._accesses, self._join, self._cross = [], JoinedOrder(self.switched), None
+
+    @property
+    def order(self):
+        """The functions main calls, in call order (None without a call order)."""
+        return None if self.calls is None else [c.function for c in self.calls]
+
+    def _calls(self):
+        """(main's Calls in order, None), or (None, why the dump gives no call order)."""
+        if self.CALLER not in self.names:
+            return None, f"the dump has no function named {self.CALLER}"
+        caller = self.d["functions"][self.names.index(self.CALLER)]
+        found = []
+        for i in (i for b in caller["blocks"] for i in b["instructions"]):
+            if i.get("opcode") != "Call":
+                continue
+            target = i.get("target")
+            if target not in self.names or target == self.CALLER:
+                return None, (f"{self.CALLER}'s {i.get('name')} calls {target!r}, which is "
+                              f"not a function of the dump")
+            found.append((i.get("name"), target, i.get("arguments") or {}))
+        if not found:
+            return None, f"{self.CALLER} has no Call"
+        if len({name for name, _, _ in found}) != len(found):
+            return None, f"the names of {self.CALLER}'s Calls repeat"
+        calls, number = collections.Counter(t for _, t, _ in found), collections.Counter()
+        out = []
+        for position, (name, target, arguments) in enumerate(found):
+            out.append(Call(name, target, number[target], calls[target], arguments, position))
+            number[target] += 1
+        return out, None
+
+    def binding(self, call):
+        """The Memlocs binding of `call`: {each set name of the function in the call's
+        arguments: (main's location in the set it binds it to, else None, its name, main,
+        True)}."""
+        out = {}
+        for own, theirs in call.arguments.items():
+            names = self._caller_sets.get(theirs, [])
+            if len(names) == 1:
+                out[own] = (self.caller_locations[names[0]], names[0], self.CALLER, True)
+            else:
+                ref = theirs[:-len("_set")] if theirs.endswith("_set") else theirs
+                out[own] = (None, ref, self.CALLER, True)
+        return out
+
+    def _census(self):
+        """(`census`, `cross_owned`): see __init__."""
+        descs = {}
+        for q in self.d.get("queues", []):
+            for blk in q["blocks"]:
+                for b in blk["instructions"]:
+                    descs[b["name"]] = [x for sub in b.get("blocks", [])
+                                        for x in sub["instructions"]]
+        self._tables = {f.get("name"): memory_locations(f) for f in self.d["functions"]}
+        census, named = {}, set()
+        for f in self.d["functions"]:
+            name, count = f.get("name"), collections.Counter()
+            for i in (i for b in f["blocks"] for i in b["instructions"]):
+                for x in [i] + [x for bn in i.get("dma_blocks") or () for x in descs.get(bn, ())]:
+                    for op in (x.get("ins") or []) + (x.get("outs") or []):
+                        ref = op.get("memref") or op.get("memsetref")
+                        if not ref:
+                            continue
+                        owner = op.get("memref_owner_func") or name
+                        count[owner] += 1
+                        if owner not in (name, self.CALLER):
+                            table = self._tables.get(owner, {})
+                            if ref not in table and ref.endswith("_set"):
+                                ref = ref[:-len("_set")]
+                            named.add((owner, ref))
+            census[name] = count
+        return census, named
+
+    def _arena_bytes(self):
+        """(starts, ends) of the byte ranges, merged and in order, of the local arena that
+        cross-function pairs are on: main's locations there and the locations there of
+        `cross_owned`."""
+        spans = []
+        for m in itertools.chain(
+                self.caller_locations.values(),
+                (self._tables.get(owner, {}).get(ref) for owner, ref in self.cross_owned)):
+            if m is not None and m["type"] == "DRAM" and m["kind"] in LOCAL_ARENA_KINDS:
+                size = 1
+                for n in m["dims"]:
+                    size *= n
+                spans.append((m["addr"], m["addr"] + size))
+        merged = []
+        for lo, hi in sorted(spans):
+            if merged and lo <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], hi)
+            else:
+                merged.append([lo, hi])
+        return [lo for lo, _ in merged], [hi for _, hi in merged]
+
+    def in_scope(self, check, fp):
+        """Footprint `fp` of an access of `check` is on memory that cross-function pairs are on
+        (module docstring, "Cross-function pairs"): a location of another function (main's,
+        bound or named, or a sibling's), a location of its own that another function names,
+        or bytes of the local arena (`_arena_bytes`)."""
+        if fp["owner"] != check.function or (fp["owner"], fp["memref"]) in self.cross_owned:
+            return True
+        if fp["space"] != "DRAM:INTERNAL":
+            return False
+        starts, ends = self._arena
+        k = bisect.bisect_right(starts, fp["lo"]) - 1
+        if k >= 0 and ends[k] > fp["lo"]:
+            return True
+        return k + 1 < len(starts) and starts[k + 1] < fp["hi"]
+
+    def scope(self):
+        """The memory of `in_scope`, for the output."""
+        return ("memory of more than one function (main's, a location another function names, "
+                "their local arena bytes)")
+
+    def check(self, on_check=None, keep_models=False):
+        """Check main, each call in call order (without a call order: each function, its
+        parameters unbound) and each function main does not call; keep the accesses that
+        cross-function pairs take. `on_check(check, model, classified)` runs after each check
+        (main() prints it there). A check's Model is dropped after it, so the memory is that
+        of the largest check; `keep_models` keeps each in `models` by label. Returns self."""
+        jobs = [(self.CALLER, None)] if self.CALLER in self.names else []
+        if self.calls is not None:
+            called = {c.function for c in self.calls}
+            jobs += [(c.function, c) for c in self.calls]
+            jobs += [(n, None) for n in self.names if n != self.CALLER and n not in called]
+        else:
+            jobs += [(n, None) for n in self.names if n != self.CALLER]
+        for function, call in jobs:
+            M = Model(self.path, self.names.index(function), self.d, call,
+                      None if call is None else self.binding(call), self.params)
+            cl = M.classify(self.lo, self.hi, self.keep_all)
+            label = function if call is None else f"{function} {call.name}"
+            siblings = tuple((owner, n, len(M.foreign_names[owner]))
+                             for owner, n in sorted(M.foreign_operands.items())
+                             if owner != self.CALLER)
+            check = Check(label, function, call, len(M.ins), cl.word, M.loop_carried_verdict(),
+                          cl.pairs, cl.ordered, cl.queue_only, cl.unsync_count,
+                          M.foreign_operands[self.CALLER], len(M.foreign_names[self.CALLER]),
+                          M.bound_operands, len(M.bound_names), M.own_operands,
+                          len(M.own_names), siblings, bool(cl.cycle))
+            self.checks.append(check)
+            self.verdicts[label] = (check.word, check.loop_word)
+            if on_check is not None:
+                on_check(check, M, cl)
+            if keep_models:
+                self.models[label] = M
+            if function != self.CALLER and (call is not None or self.calls is None):
+                self._keep_accesses(M, check)
+        return self
+
+    def _keep_accesses(self, M, check):
+        """Keep the accesses of `check` on the memory of `in_scope`, and, in a call order, join
+        the call (JoinedOrder). A call whose graph has a cycle leaves every pair UNCHECKED."""
+        accs = []
+        for a in M.acc:
+            reads = [f for f in a["reads"] if self.in_scope(check, f)]
+            writes = [f for f in a["writes"] if self.in_scope(check, f)]
+            if reads or writes:
+                accs.append(dict(name=a["name"], engine=a["engine"], i=a["i"], issue=a["issue"],
+                                 done=a["done"], reads=reads, writes=writes, check=check))
+        if check.cycle and not self.unchecked:
+            self.unchecked = f"the happens-before graph of {check.label} has a cycle"
+        if not self.unchecked:
+            self._join.add(M, accs)
+        self._accesses += accs
+
+    def cross_pairs(self):
+        """Every cross-function pair (CrossPair; with `lo`, `hi`: those with an access on a
+        source line in [lo, hi]), in program order: the call order's, else, without one, the
+        dump's order of the functions."""
+        if self._cross is None:
+            self._cross = self._cross_pairs()
+        return self._cross
+
+    def _cross_pairs(self):
+        graph = Model.graph_of({}, {}, self._accesses)
+        pairs = []
+        for _, kind, P, C, fp, fc in sorted(graph.overlapping_pairs(self.lo, self.hi),
+                                            key=lambda pair: pair[0]):
+            if P["check"] is C["check"]:
+                continue        # a pair of one check: the check's own
+            tag, because = "UNCHECKED", None
+            if not self.unchecked:
+                ok = self._join.ordered(P, C)
+                okq = ok or self._join.ordered(P, C, True)
+                tag = "OK" if ok else ("QUEUE-ORDER-ONLY" if okq else "UNSYNC")
+                if tag == "UNSYNC":
+                    because = graph.unconfirmed_because(P, C, fp, fc)
+            pairs.append(CrossPair(kind, P["check"].label, C["check"].label, P["check"].function,
+                                   C["check"].function, tag, P, C, fp, fc, because))
+        return pairs
+
+    def cross_verdict(self):
+        """FINDINGS when an UNSYNC cross-function pair is confirmed; else UNDECIDED when the
+        pairs are UNCHECKED (also when there is none: an unbound parameter's memory is not
+        known) or one goes through a runtime address; else CLEAN."""
+        pairs = self.cross_pairs()
+        if any(p.tag == "UNSYNC" and p.because is None for p in pairs):
+            return "FINDINGS"
+        if self.unchecked or any(p.because == "runtime-address" for p in pairs):
+            return "UNDECIDED"
+        return "CLEAN"
+
+    def verdict(self):
+        """FINDINGS when a VERDICT line of the dump is FINDINGS (each check's one-pass and
+        loop-carried lines, the cross-function line), else UNDECIDED when one is, else CLEAN."""
+        words = [w for pair in self.verdicts.values() for w in pair] + [self.cross_verdict()]
+        for word in ("FINDINGS", "UNDECIDED"):
+            if word in words:
+                return word
+        return "CLEAN"
+
 
 def main():
     path = sys.argv[1]
     lo = hi = None
     verbose = "--verbose" in sys.argv
     show_all = "--all" in sys.argv
+    pairs = "--pairs" in sys.argv
     for a in sys.argv[2:]:
         if a.startswith("--lines"):
             rng = a.split("=")[1] if "=" in a else sys.argv[sys.argv.index(a) + 1]
             lo, hi = map(int, rng.split("-"))
-    M = Model(path)
+    d = json.load(open(path))
+    if len(d["functions"]) > 1:
+        program = Program(path, d, lo, hi, show_all or pairs)
+        print(f"# {path}")
+        print_program(program, verbose, show_all, pairs)
+        return
+    M = Model(path, 0, d)
     print(f"# {path}")
+    report(M, M.classify(lo, hi, show_all or pairs), verbose, show_all, pairs)
+
+
+def report(M, cl, verbose=False, show_all=False, pairs=False, name=None):
+    """Print the one-pass check of `M` (`cl`: its `Model.classify`) and its loop-carried class.
+    `pairs`: also every kept pair with its ordering path (`--pairs`). `name`: the function's
+    name for its VERDICT lines in a linked dump (module docstring, "Linked dumps")."""
     print(f"instructions={len(M.ins)} access-nodes={len(M.acc)} waits={len(M.waits)}")
     crosses = [(a['name'], fp_str(f)) for a in M.acc for f in a['reads'] + a['writes'] if f['cross']]
     if crosses:
         print("WARNING: inner AP crosses partition pitch (footprint approx):", crosses[:5])
     print("\n## semaphore wait arithmetic")
-    bad = 0
-    for st, waiter, src, sid, v, exp in M.check_sem_arith():
+    for st, waiter, src, sid, v, exp in cl.waits:
         if st != "OK":
-            bad += 1
             print(f"  {st}: {waiter} waits sem{sid}>={v} for {src}; producer's count = {exp}")
-    print(f"  {len(M.waits)} waits checked, {bad} not OK")
+    print(f"  {len(M.waits)} waits checked, {cl.waits_not_ok} not OK")
     print("\n## conflicting pairs (producer -> consumer) lacking happens-before")
-    cycle = M.one_cycle() if M.undecided_class["cycle"] else []
-    # The pairs are classified as the sweep finds them. Only those this output prints are
-    # kept (every pair with --all or --pairs), then sorted into the order of Model.conflicts.
-    keep_all = show_all or "--pairs" in sys.argv
-    n_pairs = n_ok = n_bad = n_q = 0
-    classified = []
-    for order, kind, P, C, fa, fb in M.overlapping_pairs(lo, hi):
-        n_pairs += 1
-        if cycle:   # Model.reach has no closure on a cycle (CycleError): classify no pair
-            continue
-        ok = M.ordered(P, C)
-        okq = ok or M.ordered(P, C, True)
-        if ok:
-            n_ok += 1
-        elif okq:
-            n_q += 1
-        else:
-            n_bad += 1
-        if keep_all or not ok:
-            classified.append((order, kind, P, C, fa, fb, ok, okq))
-    classified.sort(key=lambda pair: pair[0])
-    if cycle:
-        print(f"  not classified: the happens-before graph has a cycle, {' -> '.join(cycle)}; "
+    if cl.cycle:
+        print(f"  not classified: the happens-before graph has a cycle, {' -> '.join(cl.cycle)}; "
               f"no pair's order can be read off it")
     seen = set()
-    unsync = [(kind, P, C, fa, fb) for _, kind, P, C, fa, fb, _, okq in classified if not okq]
-    for _, kind, P, C, fa, fb, ok, okq in classified:
+    for kind, P, C, fa, fb, ok, okq in cl.kept:
         key = (P["name"], C["name"], kind)
         if (not ok) or show_all:
             if key in seen and not verbose:
@@ -1157,10 +1795,10 @@ def main():
                   f"{f'; not confirmed: {because}' if because else ''})")
             if okq and (verbose or not ok):
                 print(f"         via {' -> '.join(M.path(P['done'], C['issue'], not ok) or [])}")
-    if "--pairs" in sys.argv:
+    if pairs:
         print("\n## every overlapping pair in the selected line range, with its ordering path")
         seen2 = set()
-        for _, kind, P, C, fa, fb, ok, okq in classified:
+        for kind, P, C, fa, fb, ok, okq in cl.kept:
             key = (P["name"], C["name"], kind)
             if key in seen2:
                 continue
@@ -1172,11 +1810,12 @@ def main():
             print(f"  [{tag}] {kind} {M.label(P)} {fp_str(fa)}")
             print(f"        -> {M.label(C)} {fp_str(fb)}")
             print(f"        via: {how}")
-    if cycle:
-        print(f"\n  {n_pairs} overlapping pairs, not classified (the graph has a cycle)")
+    if cl.cycle:
+        print(f"\n  {cl.pairs} overlapping pairs, not classified (the graph has a cycle)")
     else:
-        print(f"\n  {n_pairs} overlapping pairs: {n_ok} ordered by engine order + semaphores, "
-              f"{n_q} ordered only if same-queue DMAs complete in order, {n_bad} UNSYNCHRONIZED")
+        print(f"\n  {cl.pairs} overlapping pairs: {cl.ordered} ordered by engine order + semaphores, "
+              f"{cl.queue_only} ordered only if same-queue DMAs complete in order, "
+              f"{cl.unsync_count} UNSYNCHRONIZED")
     runtime = sum(1 for a in M.acc for f in a["reads"] + a["writes"] if f.get("runtime"))
     if runtime:
         print(f"  {runtime} DRAM footprints are runtime-address operands, taken as their whole tensor "
@@ -1185,13 +1824,139 @@ def main():
         print(f"\n## UNDECIDED: {len(M.undecided)} operands or edges the check cannot model")
         for u in M.undecided[:20]:
             print(f"  {u}")
-    print(verdict_line(*M.one_pass_verdict(unsync, bad)))
-    print_loop_carried(M, show_all)
+    line = verdict_line(cl.word, cl.counts)
+    print(line if name is None else f"VERDICT ({name}):" + line[len("VERDICT:"):])
+    print_loop_carried(M, show_all, name)
 
 
-def print_loop_carried(M, show_all=False):
+def print_program(program, verbose=False, show_all=False, pairs=False):
+    """Print the check of a linked dump (module docstring, "Linked dumps"): the functions and
+    main's calls; each check (`report`), as it ends; the functions' totals; the
+    cross-function pairs; the program's verdict."""
+    functions = program.d["functions"]
+    print(f"functions={len(functions)}: " + ", ".join(
+        f"{f.get('name')} ({sum(len(b['instructions']) for b in f['blocks'])} instructions)"
+        for f in functions))
+    if program.calls is None:
+        print(f"calls: UNKNOWN ({program.order_unknown})")
+    else:
+        print(f"calls={len(program.calls)}, in {program.CALLER}'s order: "
+              + ", ".join(f"{c.name} {c.function}" for c in program.calls))
+
+    def on_check(check, M, cl):
+        print(f"\n# {check_header(program, check)}")
+        report(M, cl, verbose, show_all, pairs, check.label)
+
+    program.check(on_check)
+    print_functions(program)
+    print_cross(program, verbose, show_all)
+    print(f"VERDICT (program): {program.verdict()} ("
+          + ", ".join(f"{label} {word}/{loop_word}"
+                      for label, (word, loop_word) in program.verdicts.items())
+          + f"; cross-function {program.cross_verdict()})")
+
+
+def _locations(n):
+    return f"{n} location" if n == 1 else f"{n} locations"
+
+
+def owners_text(program, check):
+    """A check's operands with memory by owner (Check): its own locations; main's, named by
+    memref_owner_func or bound by the call's arguments; each other function's."""
+    parts = [f"own {check.own} ({_locations(check.own_names)})"]
+    if check.function != program.CALLER:
+        parts.append(f"{program.CALLER} {check.owner_field} named by memref_owner_func "
+                     f"({_locations(check.owner_field_names)})"
+                     + (f", {check.bound} bound by the call's arguments "
+                        f"({_locations(check.bound_names)})" if check.call is not None else ""))
+    parts += [f"{owner} {n} named by memref_owner_func ({_locations(k)})"
+              for owner, n, k in check.siblings]
+    return "operands by owner: " + "; ".join(parts)
+
+
+def check_header(program, check):
+    """The heading of a check: what it checks, and its operands by owner."""
+    c = check.call
+    if c is not None:
+        return (f"call {c.name}: {c.function}, call {c.number + 1} of {c.calls}; "
+                f"{owners_text(program, check)}")
+    called = "" if program.calls is None or check.function == program.CALLER else ", not called"
+    return f"function {check.function}{called}; {owners_text(program, check)}"
+
+
+def print_functions(program):
+    """Each function's totals over its checks (one-pass pairs, verdicts, operands by owner),
+    and its operands by `memref_owner_func` in the dump (Program.census)."""
+    print("\n## functions: their checks' one-pass pairs, verdicts and operands by owner; the "
+          "dump's operands by memref_owner_func (the function's instructions and each DMA "
+          "block its DMATriggers name, once per name in a dma_blocks list)")
+    for name in program.names:
+        mine = [c for c in program.checks if c.function == name]
+        if not mine:
+            continue
+        calls = sum(1 for c in mine if c.call is not None)
+        words = collections.Counter(c.word for c in mine)
+        loop_words = collections.Counter(c.loop_word for c in mine)
+        siblings = collections.Counter()
+        for c in mine:
+            siblings.update({owner: n for owner, n, _ in c.siblings})
+        census = program.census.get(name, collections.Counter())
+        print(f"  {name}: {calls} {'call' if calls == 1 else 'calls'}; pairs "
+              f"{sum(c.pairs for c in mine)} ({sum(c.ordered for c in mine)} ordered, "
+              f"{sum(c.queue_only for c in mine)} queue-order only, "
+              f"{sum(c.unsync_count for c in mine)} UNSYNCHRONIZED); one-pass "
+              + " ".join(f"{w} {n}" for w, n in sorted(words.items())) + "; loop-carried "
+              + " ".join(f"{w} {n}" for w, n in sorted(loop_words.items()))
+              + f"; checks' operands: own {sum(c.own for c in mine)}"
+              + ("" if name == program.CALLER else
+                 f", {program.CALLER} {sum(c.owner_field for c in mine)} named + "
+                 f"{sum(c.bound for c in mine)} bound")
+              + "".join(f", {owner} {n}" for owner, n in sorted(siblings.items()))
+              + f"; dump's operands: own {census[name]}"
+              + "".join(f", {owner} {n}" for owner, n in sorted(census.items()) if owner != name))
+
+
+def print_cross(program, verbose=False, show_all=False):
+    """Print the cross-function pairs of `program`: each pair not OK (every pair with
+    `show_all`), once per pair of accesses and kind (each one with `verbose`); the counts by
+    function pair and tag; the cross-function verdict."""
+    pairs = program.cross_pairs()
+    graph = Model.graph_of({}, {}, [])
+    print(f"\n## cross-function pairs on {program.scope()} (the earlier call's access first)")
+    if program.unchecked:
+        print(f"  UNCHECKED: {program.unchecked}")
+    seen = set()
+    for p in pairs:
+        key = (p.src_label, p.src["name"], p.dst_label, p.dst["name"], p.kind)
+        if (p.tag == "OK" and not show_all) or (key in seen and not verbose):
+            continue
+        seen.add(key)
+        print(f"  [{p.tag}] {p.kind} {p.src_label}:{graph.label(p.src)}  ->  "
+              f"{p.dst_label}:{graph.label(p.dst)}")
+        print(f"         prod {p.src_fp['owner']}: {fp_str(p.src_fp)}")
+        print(f"         cons {p.dst_fp['owner']}: {fp_str(p.dst_fp)}"
+              + (f"   (not confirmed: {p.because})" if p.because else ""))
+    counts = collections.Counter((p.src_function, p.dst_function, p.tag) for p in pairs)
+    for src, dst in sorted({(p.src_function, p.dst_function) for p in pairs}):
+        print(f"  {src} -> {dst}: "
+              + ", ".join(f"{tag} {counts[src, dst, tag]}" for tag in CROSS_TAGS))
+    owners = collections.Counter((p.src_fp["owner"], p.dst_fp["owner"], p.tag) for p in pairs)
+    for src, dst in sorted({(p.src_fp["owner"], p.dst_fp["owner"]) for p in pairs}):
+        print(f"  on locations of {src} / {dst}: "
+              + ", ".join(f"{tag} {owners[src, dst, tag]}" for tag in CROSS_TAGS))
+    total = collections.Counter(p.tag for p in pairs)
+    confirmed = sum(1 for p in pairs if p.tag == "UNSYNC" and p.because is None)
+    print(f"\n  {len(pairs)} cross-function pairs: "
+          + ", ".join(f"{tag} {total[tag]}" for tag in CROSS_TAGS)
+          + f" (UNSYNC confirmed {confirmed})")
+    print(f"VERDICT (cross-function): {program.cross_verdict()} ({len(pairs)} pairs, "
+          f"{confirmed} confirmed, {total['UNCHECKED']} UNCHECKED)")
+
+
+def print_loop_carried(M, show_all=False, name=None):
     """The loop-carried class of `M` (module docstring): per loop, its pair counts by kind and
-    tag; each finding (every pair with `show_all`); the reasons it is undecided; its verdict."""
+    tag; each finding (every pair with `show_all`); the reasons it is undecided; its verdict.
+    `name`: the function's name for the VERDICT line in a linked dump."""
     print("\n## loop-carried pairs (iteration i -> i+1; module docstring)")
     pairs = M.loop_carried()
     findings = {id(p) for p in M.loop_carried_findings()}
@@ -1216,7 +1981,8 @@ def print_loop_carried(M, show_all=False):
         for why in reasons[:20]:
             print(f"    {why}")
     verdict = M.loop_carried_verdict()
-    print(f"VERDICT (loop-carried): {verdict} ({len(findings)} findings in {len(M.loops)} loops)")
+    label = "loop-carried" if name is None else f"{name} loop-carried"
+    print(f"VERDICT ({label}): {verdict} ({len(findings)} findings in {len(M.loops)} loops)")
 
 
 if __name__ == "__main__":
