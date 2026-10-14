@@ -43,10 +43,11 @@ columns of the SBUF tile ``mov[128 (h), Hp/128, S, M + tile]``. Then, per token 
    ``R[rows, S, Hp]`` -- every DMA row is ``S`` contiguous ``Hp`` runs -- and each
    ``[rows, 128]`` block ``R[:, s, hb]`` is transposed into the last columns of ``mov``:
    for each contraction block ``(hb, s)`` the ``M`` columns of ``fn^T`` followed by the
-   tile's columns of ``residual^T``. The copies out of PSUM alternate between the scalar
-   and the vector engine. A short tile (the verify and decode rows) is loaded with
-   (token, stream) on the partitions, ``[rows*S, Hp]``, and each ``[rows*S, 128]`` block
-   is transposed into the same columns: ``S`` times fewer transposes.
+   tile's columns of ``residual^T``. The copies out of PSUM are shared by the scalar
+   and the vector engine (:data:`_VECTOR_COPY_SHARE`). A short tile (the verify and
+   decode rows) is loaded with (token, stream) on the partitions, ``[rows*S, Hp]``, and
+   each ``[rows*S, 128]`` block is transposed into the same columns: ``S`` times fewer
+   transposes.
 2. ``acc[rows, M + rows] += mov[:, hb, s, M:]^T @ mov[:, hb, s, :]`` over the
    ``S * Hp/128`` blocks: columns ``:M`` are this program's partial ``mixes``, the
    ``[rows, rows]`` rest is the streams' Gram block, whose diagonal is the square sum.
@@ -139,6 +140,13 @@ _GROUP = 8
 def _group(dtype):
     """Hidden blocks of ``dtype`` per 2 KiB PSUM bank of transposes: 8 bf16, 4 fp32."""
     return _GROUP if dtype == nl.bfloat16 else _GROUP // 2
+
+
+#: The share of a :func:`_transpose_into` call's PSUM copies that the vector engine
+#: makes; the scalar engine makes the rest. A copy is exact on either engine, so the
+#: share moves only engine time: at the served shapes, 6 copies in 10 on the vector
+#: engine gave both kernel forms shorter calls than an even split.
+_VECTOR_COPY_SHARE = 0.6
 
 
 #: The share of the usable SBUF partition (``nl.tile_size.sbuf_fmax_bytes``) that the
@@ -253,12 +261,17 @@ def _transpose_into(dst, rows_t, col0, rows_n, nhb, group):
 
     ``rows_t`` is ``[rows_n, S, nhb*128]`` with the token on the partition. Each
     ``[rows_n, 128]`` block goes through the tensor engine (exact), ``group`` blocks per
-    PSUM tile, and each tile's copy into ``dst`` alternates between the scalar and the
-    vector engine. A block's PSUM columns are padded to an even count, so every block
-    starts 4-byte aligned (a tensor-engine write rule) for an odd ``rows_n`` too.
+    PSUM tile, and each tile is copied into ``dst`` by the scalar or the vector engine:
+    ``on_vector`` (``copies * _VECTOR_COPY_SHARE`` rounded half up) of the call's
+    ``copies`` tiles go to the vector engine, spread evenly (tile ``turn`` goes there when
+    ``(turn + 1) * on_vector // copies`` exceeds ``turn * on_vector // copies``). A
+    block's PSUM columns are padded to an even count, so every block starts 4-byte
+    aligned (a tensor-engine write rule) for an odd ``rows_n`` too.
     """
     streams = rows_t.shape[1]
     padded = rows_n + rows_n % 2
+    copies = streams * ((nhb + group - 1) // group)
+    on_vector = int(copies * _VECTOR_COPY_SHARE + 0.5)
     turn = 0
     for s in range(streams):
         for g0 in range(0, nhb, group):
@@ -269,7 +282,7 @@ def _transpose_into(dst, rows_t, col0, rows_n, nhb, group):
                 nisa.nc_transpose(dst=flipped[:, j, 0:rows_n],
                                   data=rows_t[:, s, hb * _P:(hb + 1) * _P])
             target = dst[:, g0:g0 + gn, s, col0:col0 + rows_n]
-            if turn % 2 == 0:
+            if (turn + 1) * on_vector // copies == turn * on_vector // copies:
                 nisa.activation(dst=target, op=nl.copy, data=flipped[:, :, 0:rows_n])
             else:
                 nisa.tensor_copy(dst=target, src=flipped[:, :, 0:rows_n],
