@@ -76,7 +76,9 @@ columns of the SBUF tile ``mov[128 (h), Hp/128, S, M + tile]``. Then, per token 
    ``rsqrt(sum * (1/H) + norm_eps)`` and then by the gain in one fp32 instruction, in
    ``_rms_norm``'s operation order, and rounded once.
    With ``ROUTER_SCALE`` the rows are also scaled by the same ``rsqrt`` alone and rounded
-   once: ``scaled``, the MoE router's input (its gain is applied in the router).
+   once: ``scaled``, the MoE router's input (its gain is applied in the router). A row
+   whose ``rsqrt`` is not positive is scaled by 0 (:func:`_router_rstd`), so a tile-mate's
+   NaN or Inf does not reach the row's router input.
 
 Step 6 of a long tile is issued after steps 1-5 of the next tile. Each engine runs its
 instructions in program order, and the norm's transposes wait for the collapse on the
@@ -222,6 +224,30 @@ def _rstd(sqrsum, rows, inv_count, eps, cols=1):
     return rstd
 
 
+def _router_rstd(rstd):
+    """``rstd`` with 0 on each element that is not positive: the router's scale.
+
+    ``rstd`` is ``[rows, cols]`` (one column per token tile). A NaN or an Inf in the square
+    sum, the row's own or a tile-mate's through the Gram diagonal (:func:`_diagonal_sum`),
+    gives a NaN or a zero ``rstd``. ``NaN > 0`` is false, so ``(rstd > 0) == 0`` selects
+    those elements, and the predicated copy writes 0 over them (a select: a multiply by a
+    0/1 mask would keep the NaN). Then ``x * rstd`` is a signed zero on a row whose own
+    ``x`` is finite, and NaN only on a row whose own ``x`` holds a NaN or an Inf, where
+    ``router_rms_scale`` gives NaN too. A positive ``rstd`` keeps its bits. (The compare
+    is not ``rstd <= 0``, which is false for a NaN too.)
+    """
+    rows_n, cols = rstd.shape
+    unscaled = _tile(rows_n, cols, nl.uint8)
+    nisa.tensor_scalar(dst=unscaled, data=rstd, op0=nl.greater, operand0=0.0,
+                       op1=nl.equal, operand1=0.0)
+    kept = _tile(rows_n, cols)
+    nisa.tensor_copy(dst=kept, src=rstd)
+    zeros = _tile(rows_n, cols)
+    nisa.memset(dst=zeros, value=0.0)
+    nisa.tensor_copy_predicated(dst=kept, src=zeros, predicate=unscaled)
+    return kept
+
+
 def _transpose_into(dst, rows_t, col0, rows_n, nhb, group):
     """``dst[:, hb, s, col0 + t] = rows_t[t, s, hb*128 + p]`` on partition ``p``.
 
@@ -266,7 +292,9 @@ def _norm_rows(out_rows, t0, gain_rows, ident, normed_out, scaled_out, norm_eps,
     mine = _norm_square_sum(out_rows, ident, collapsed=collapsed)
     sqrsum = _swap_add(mine, rows_n, 1, programs, program)
     norm_rstd = _rstd(sqrsum, rows_n, 1.0 / float(hidden), norm_eps)
-    _norm_scale(out_rows, t0, norm_rstd[:, 0:1], gain_rows, normed_out, scaled_out, program)
+    router_rstd = None if scaled_out is None else _router_rstd(norm_rstd)
+    _norm_scale(out_rows, t0, norm_rstd[:, 0:1], router_rstd, gain_rows, normed_out,
+                scaled_out, program)
 
 
 def _norm_square_sum(out_rows, ident, sqrsum=None, collapsed=None):
@@ -289,10 +317,13 @@ def _norm_square_sum(out_rows, ident, sqrsum=None, collapsed=None):
     return _diagonal_sum(gram, rows_n, ident, total=sqrsum)
 
 
-def _norm_scale(out_rows, t0, norm_rstd, gain_rows, normed_out, scaled_out, program):
+def _norm_scale(out_rows, t0, norm_rstd, router_rstd, gain_rows, normed_out, scaled_out,
+                program):
     """Step 6's second half for one tile: its ``normed`` (and ``scaled``) rows, stored.
 
-    ``norm_rstd`` is the tile's ``[rows, 1]`` whole-``H`` reciprocal RMS.
+    ``norm_rstd`` is the tile's ``[rows, 1]`` whole-``H`` reciprocal RMS, which ``normed``
+    uses; ``router_rstd`` is its :func:`_router_rstd`, which ``scaled`` uses (None without
+    ``scaled_out``).
     """
     rows_n, hp = out_rows.shape
     hidden = normed_out.shape[1]
@@ -307,7 +338,7 @@ def _norm_scale(out_rows, t0, norm_rstd, gain_rows, normed_out, scaled_out, prog
     if scaled_out is not None:
         scaled_rows = nl.ndarray((rows_n, hp), dtype=out_rows.dtype, buffer=nl.sbuf)
         nisa.tensor_scalar(dst=scaled_rows, data=out_rows, op0=nl.multiply,
-                           operand0=norm_rstd)
+                           operand0=router_rstd)
         nisa.dma_copy(dst=scaled_out.ap(pattern=[[hidden, rows_n], [1, hp]],
                                         offset=t0 * hidden + h0),
                       src=scaled_rows)
@@ -339,8 +370,10 @@ def _norm_group(held, g_t0, sqrsums, ident, gain_rows, normed_out, scaled_out, n
     _norm_square_sum(held[tiles - 1], ident, sqrsum=sqrsums[:, tiles - 1:tiles])
     sqrsum = _swap_add(sqrsums, rows_n, tiles, programs, program)
     norm_rstd = _rstd(sqrsum, rows_n, 1.0 / float(hidden), norm_eps, cols=tiles)
+    router_rstd = None if scaled_out is None else _router_rstd(norm_rstd)
     for j in range(tiles):
-        _norm_scale(held[j], g_t0 + j * rows_n, norm_rstd[:, j:j + 1], gain_rows,
+        _norm_scale(held[j], g_t0 + j * rows_n, norm_rstd[:, j:j + 1],
+                    None if router_rstd is None else router_rstd[:, j:j + 1], gain_rows,
                     normed_out, scaled_out, program)
 
 
@@ -806,7 +839,10 @@ def mhc_pre_norm_kernel(residual, fn, hc_scale, hc_base, norm_gain, RMS_EPS: flo
     ``layer_input * rsqrt(mean(layer_input**2) + NORM_EPS)`` rounded once: the same fp32
     ``rsqrt`` as ``normed``'s, one fp32 multiply, no gain. It is
     :func:`~vllm_neuron.functional.moe.router_prefill.router_rms_scale` of
-    ``layer_input``, the router's input up to the order of the square sum.
+    ``layer_input``, the router's input up to the order of the square sum, on every row
+    with a finite square sum. A row without one is scaled by 0: signed zeros where its own
+    ``layer_input`` is finite (a tile-mate's NaN or Inf does not reach it), NaN where its
+    own ``layer_input`` holds a NaN or an Inf (as ``router_rms_scale``).
 
     Args:
         residual, fn, hc_scale, hc_base, RMS_EPS, HC_EPS, POST_MULT: as
