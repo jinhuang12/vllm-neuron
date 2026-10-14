@@ -621,6 +621,7 @@ def _plain_references(tmp_path, prompts: list[list[int]]) -> list[list[int]]:
     return references
 
 
+@pytest.mark.slow
 def test_greedy_speculative_output_is_token_identical_to_the_plain_run(tmp_path, monkeypatch):
     e2e._require_cpu_mode()
     fr._declaring_a_sampler(monkeypatch)
@@ -660,6 +661,7 @@ def test_greedy_speculative_output_is_token_identical_to_the_plain_run(tmp_path,
     assert len(report) == 2 * len(POLICIES)
 
 
+@pytest.mark.slow
 def test_greedy_speculative_output_from_the_heads_own_drafts_is_token_identical_to_the_plain_run(
     tmp_path, monkeypatch
 ):

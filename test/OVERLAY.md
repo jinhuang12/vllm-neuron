@@ -18,7 +18,7 @@ Three properties keep that re-apply mechanical:
 
 ## Markers
 
-`pyproject.toml` registers three markers and this is where their meaning lives:
+`pyproject.toml` registers four markers and this is where their meaning lives:
 
 - `fast` — cheap, device-free, safe to run on every change.
 - `forked` — must run in its own process, because it depends on state that does
@@ -28,6 +28,9 @@ Three properties keep that re-apply mechanical:
   applies it to every item it collects there, and also skips those items, so a
   plain run reports them as skipped instead of failing against absent upstream
   behaviour.
+- `slow` — runs for more than 15 minutes on the CPU simulator, so a run with
+  a per-file time limit can read it as a hang. Deselect it with
+  `-m "not slow"` and run it on its own with a limit of three hours.
 
 ## Vendored upstream tests
 
