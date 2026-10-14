@@ -13,8 +13,31 @@ sha256 digests, per batch size, of:
 This tree runs the identical scenarios -- the bank-form carriers at ``B > 1`` and the
 untouched one-request path at ``B = 1`` -- and every digest must be equal, but for the four
 values :data:`SELECTION_ORDER_DIGESTS` pins instead (in the DSA world at ``B = 64``, which
-the decode selection's pool order moves). Two negative controls show the
+the decode selection's pool order moves) and the KDA values :data:`KDA_CONV1D_DIGESTS` pins
+(which the in-tree prefill conv1d kernel moves). Two negative controls show the
 digests have power: a broken bank gather and a broken ring write each change them.
+
+The KDA pins are not the only guard on the conv1d. The KDA test also records every prefill
+conv1d call, checks that each one ran the NKI kernel, and checks each output against the
+module's torch reference within a bound derived from float32 and the tap count, never
+fitted. Each output is a sum of ``S`` float32 products (``S = 4`` taps here). Any order of
+``S`` products and ``S - 1`` sums is within ``gamma_S * M`` of the exact sum, where
+``M = sum_s |w_s * x_s|``, ``gamma_S = S * u / (1 - S * u)`` and ``u = 2**-24`` (the
+dot-product bound). So two float32 forms of one output differ by at most ``2 * gamma_S * M``.
+
+Derivation: this test's own conv1d calls were recorded at OMP 4 and replayed through
+a01e99c2's kernel and through the base's nkilib implicit GEMM, both in the NKI simulator.
+Per batch size: outputs that differ / outputs, max ``|delta|``, and max ``|delta|`` over
+the bound:
+
+* ``B = 1``: 292 / 2,304, 5.96e-08, 0.44;
+* ``B = 4``: 7,603 / 23,808, 5.96e-08, 0.40;
+* ``B = 64``: 127,885 / 395,520, 8.94e-08, 0.43.
+
+Every output is within the bound (0 over, at every ``B``). Each kernel is also within
+``gamma_S * M`` of a float64 sum (max ratio 0.61 for a01e99c2's kernel, 0.59 for nkilib's).
+Against the torch reference, a01e99c2's kernel is at most 0.46 of the bound (0.44 / 0.44 /
+0.46 at ``B = 1 / 4 / 64``).
 
 The fixture was produced at ``OMP_NUM_THREADS=4`` (the producing command in
 ``gen_numerics_fixture.py``). Torch splits a CPU op's work by the intra-op thread count,
@@ -63,6 +86,49 @@ SELECTION_ORDER_DIGESTS = {
     },
 }
 
+#: The digests this tree's KDA prefill conv1d moves from the base, by batch size. a01e99c2
+#: moved the conv1d (four float32 taps) from nkilib's implicit GEMM to the in-tree kernel
+#: (``depthwise_conv1d_kernel.py``). The in-tree kernel adds the four tap products in a
+#: different order (two float32 chains), so its outputs round apart from the base's in the
+#: last bits (the module docstring gives the measured differences and their bound). The
+#: conv1d runs at prefill only; what moves is the decode-step outputs listed here and, at
+#: B = 4 and B = 64, the second layer's recurrent state. Each value is this tree's own,
+#: bitwise, so any further move fails.
+KDA_CONV1D_DIGESTS = {
+    # a01e99c2: the in-tree conv1d's tap summation order moves these 5 of 12.
+    1: {
+        "step.0.output": "ef0f07409807a3c21e7cb07695f165d49219f762fb4ab51493b3d3226b1d423e",
+        "step.1.output": "61c77420dae010753c18893991f8e006c3d07c5356129c8ad7fd6c7eb8868c41",
+        "step.2.output": "e60953bc338a6a5615b77994dd1abd220f3e2d26a03a8232e91f51b641a30853",
+        "step.3.output": "0624def209016bfc64ae5c3fa4d107848e6011c6b97828177218f540f6d98586",
+        "step.5.output": "925d9f30ef16a512598b6f3198866363134bfdf5eeedb7cc1d2e5c3ca101a118",
+    },
+    # a01e99c2: the in-tree conv1d's tap summation order moves these 6 of 12.
+    4: {
+        "step.0.output": "ad9b3a643caba8fe88b95465866a036a3696ffd1234234941ee8f49122fb0eb1",
+        "step.1.output": "0c26ac75520a5ea8d096247357d3987dd630517858ad9cda7536bed42f39b6e4",
+        "step.2.output": "9e45eb04178b2a24a5eaf53c641855b87c059abe8445352e2b84cd7837d7cf50",
+        "step.3.output": "60454d1883887308df111cd82c370873cfeccf464e3283ba97753f0eb0d7c669",
+        "step.6.output": "9622a6052a83691b1b1c10f46f7e0f4b67469896c429c66ee6d49033960ffe7c",
+        "bank.1.recurrent_state":
+            "41af9b6559ae2eefee17f0b0f2cf407d12a9ed410d0b2320e332eb9781a4b6f7",
+    },
+    # a01e99c2: the in-tree conv1d's tap summation order moves these 7 of 12.
+    64: {
+        "step.0.output": "802e86207b8993456869b79a75e1ec22239afe5436179792dfd5ab2bc0d850c1",
+        "step.1.output": "9109caea026902ee96fc9adf91eccc39792cdc2e90cd6c0c597ecb790d9fa931",
+        "step.2.output": "b1501327678fc790ff972f845b0b0872a59020f2bd6f15abcdd5316fbfda2504",
+        "step.3.output": "0bd3a093cd57085499bc4b7a18f731872ce52f5962ae54b9d501556f7a5971ca",
+        "step.4.output": "2a687b4f096e539ff1055b826f94f1ef2fe8462ce2ded657bc6c194932c798ec",
+        "step.5.output": "71281fcaf101067fe9cee317e05ddc11ee33de228ae0bc3ff1003fef5a895572",
+        "bank.1.recurrent_state":
+            "80e9817acc902fe2d1eb70452f64f200bc4765277d09b28f1f826f6c2f437ebc",
+    },
+}
+
+#: The unit roundoff of float32, for the conv1d bound (module docstring).
+FLOAT32_UNIT_ROUNDOFF = 2.0**-24
+
 #: The intra-op thread count the fixture was produced at; every test runs at it.
 FIXTURE_THREADS = 4
 
@@ -91,6 +157,54 @@ def _assert_same_digests(got: dict, want: dict, label: str) -> None:
     assert not mismatched, f"{label}: digests differ from {BASE_REV} at {mismatched}"
 
 
+def _kda_digests(batch: int, want: dict) -> dict:
+    """The fixture's KDA digests with this tree's conv1d pins merged over them."""
+    moved = KDA_CONV1D_DIGESTS[batch]
+    assert set(moved) <= set(want), sorted(set(moved) - set(want))
+    return {**want, **moved}
+
+
+def _record_conv1d_calls(monkeypatch) -> list:
+    """Keeps ``(img, filt, out)`` of every prefill conv1d call; the call itself is unchanged."""
+    from vllm_neuron.functional.kda import depthwise_conv1d as conv
+
+    calls = []
+    original = conv.depthwise_conv1d
+
+    def recording(img, filt, *args, **kwargs):
+        assert not args and not kwargs, (args, kwargs)
+        out = original(img, filt)
+        calls.append((img.detach().clone(), filt.detach().clone(), out.detach().clone()))
+        return out
+
+    monkeypatch.setattr(conv, "depthwise_conv1d", recording)
+    return calls
+
+
+def _assert_conv1d_within_the_float32_bound(calls: list, label: str) -> None:
+    """Each output is within ``2 * gamma_S * M`` of the torch reference (module docstring)."""
+    from vllm_neuron.functional.kda.depthwise_conv1d import depthwise_conv1d_torch_reference
+
+    u = FLOAT32_UNIT_ROUNDOFF
+    for index, (img, filt, out) in enumerate(calls):
+        assert img.dtype == filt.dtype == out.dtype == torch.float32, (img.dtype, out.dtype)
+        x, w = img.double()[:, :, 0, :], filt.double()[:, 0, 0, :]
+        taps = w.shape[1]
+        columns = x.shape[-1] - taps + 1
+        assert tuple(out.shape) == (x.shape[0], x.shape[1], 1, columns), tuple(out.shape)
+        magnitude = sum(
+            (w[None, :, s:s + 1] * x[:, :, s:s + columns]).abs() for s in range(taps)
+        )
+        bound = 2 * taps * u / (1 - taps * u) * magnitude
+        reference = depthwise_conv1d_torch_reference(img, filt).double()[:, :, 0, :]
+        excess = (out.double()[:, :, 0, :] - reference).abs() - bound
+        assert (excess <= 0).all(), (
+            f"{label}: conv1d call {index}: {int((excess > 0).sum())} of {excess.numel()} "
+            f"outputs outside 2 gamma_{taps} M of the torch reference, worst by "
+            f"{excess.max().item():.3e}"
+        )
+
+
 @pytest.mark.parametrize("batch", list(gen.BATCHES))
 def test_the_dsa_world_is_bitwise_the_base_revision(batch):
     e2e._require_cpu_mode()
@@ -106,13 +220,25 @@ def test_the_dsa_world_is_bitwise_the_base_revision(batch):
 
 
 @pytest.mark.parametrize("batch", list(gen.BATCHES))
-def test_the_kda_world_is_bitwise_the_base_revision(batch):
+def test_the_kda_world_is_bitwise_the_base_revision(batch, monkeypatch):
+    from vllm_neuron.functional.kda.depthwise_conv1d import (
+        dispatch_counters,
+        reset_dispatch_counters,
+    )
+
     e2e._require_cpu_mode()
     want = _fixture()["kda"][str(batch)]
     assert want["steps"] >= 8
+    calls = _record_conv1d_calls(monkeypatch)
+    reset_dispatch_counters()
     got = gen.kda_numerics(batch, want["steps"])
     assert got["prompts"] == want["prompts"]
-    _assert_same_digests(got["digests"], want["digests"], f"KDA B={batch}")
+    _assert_same_digests(got["digests"], _kda_digests(batch, want["digests"]), f"KDA B={batch}")
+    # The second guard: every conv1d call ran the NKI kernel (not the torch fallback, which
+    # would compare torch with itself), and each output is within the float32 bound.
+    assert calls, "the KDA world made no conv1d call"
+    assert dispatch_counters() == (len(calls), 0), (dispatch_counters(), len(calls))
+    _assert_conv1d_within_the_float32_bound(calls, f"KDA B={batch}")
 
 
 # ── negative controls: the digests must move when the bank form is broken ───────
@@ -128,8 +254,9 @@ def test_the_kda_digests_have_power_against_a_broken_bank_gather(monkeypatch):
         state_banks, "gather_bank_rows",
         lambda bank, slots: torch.zeros_like(bank.index_select(0, slots)),
     )
+    expected = _kda_digests(4, want["digests"])
     got = gen.kda_numerics(4, want["steps"])["digests"]
-    unchanged = [key for key in want["digests"] if got[key] == want["digests"][key]]
+    unchanged = [key for key in expected if got[key] == expected[key]]
     assert not unchanged, f"a zeroed gather left these digests equal: {unchanged}"
 
 
