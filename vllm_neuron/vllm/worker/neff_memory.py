@@ -38,7 +38,7 @@ import math
 import os
 import struct
 import tarfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterable
 
@@ -302,6 +302,29 @@ def graph_memory(graphs: Iterable[NeffMemory], *, page_bytes: int) -> GraphMemor
         scratchpad_bytes=max(graph.scratchpad_bytes(page_bytes) for graph in graphs),
         resident_bytes=sum(graph.persistent_bytes for graph in graphs),
         runtime_bytes=RUNTIME_FIXED_BYTES + RUNTIME_BYTES_PER_GRAPH * len(graphs),
+    )
+
+
+def rank_graph_memory(
+    graphs: Iterable[NeffMemory], *, loaded: int, page_bytes: int
+) -> GraphMemory:
+    """The most device memory one rank can hold for ``loaded`` of ``graphs``.
+
+    Every rank compiles into the same cache. Where the ranks' graphs differ (DCP
+    ranks do), the cache then holds every rank's graphs, all taking the same KV cache
+    tensor, while a rank loads only ``loaded`` of them, and which ones is not known
+    before warmup. The figure bounds any ``loaded`` of them: the largest scratchpad
+    of any graph, the code, constants and rings of the ``loaded`` largest, and the
+    runtime's bookkeeping for ``loaded`` graphs. With no more than ``loaded`` graphs
+    it is :func:`graph_memory`.
+    """
+    graphs = list(graphs)
+    if len(graphs) <= loaded:
+        return graph_memory(graphs, page_bytes=page_bytes)
+    largest = sorted(graphs, key=lambda graph: graph.persistent_bytes, reverse=True)
+    return replace(
+        graph_memory(largest[:loaded], page_bytes=page_bytes),
+        scratchpad_bytes=max(graph.scratchpad_bytes(page_bytes) for graph in graphs),
     )
 
 

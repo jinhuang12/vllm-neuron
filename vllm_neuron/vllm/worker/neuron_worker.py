@@ -1761,9 +1761,10 @@ class NeuronWorker(WorkerBase):
 
         1. ``VLLM_NEURON_DEVICE_GRAPH_RESERVE_GIB`` when set;
         2. read from the compile cache when it holds every graph warmup loads:
-           the largest shared scratchpad plus every graph's code, constants and
-           DMA rings plus the runtime's own bookkeeping
-           (:func:`~vllm_neuron.vllm.worker.neff_memory.graph_memory`);
+           the largest shared scratchpad plus the code, constants and DMA rings of
+           as many graphs as this rank loads, the largest ones, plus the runtime's
+           own bookkeeping. A cache every rank fills can hold more graphs than one
+           rank loads (:func:`~vllm_neuron.vllm.worker.neff_memory.rank_graph_memory`);
         3. otherwise, on a cold or partly compiled cache,
            :data:`~vllm_neuron.envs.DEFAULT_DEVICE_GRAPH_RESERVE_GIB`, and the
            source says so.
@@ -1811,12 +1812,19 @@ class NeuronWorker(WorkerBase):
                 f"cold cache, {len(scan.graphs)} of the {expected} graphs compiled "
                 f"in {root}"
             )
-        memory = neff_memory.graph_memory(
-            scan.graphs, page_bytes=neff_memory.scratchpad_page_bytes()
+        memory = neff_memory.rank_graph_memory(
+            scan.graphs, loaded=expected, page_bytes=neff_memory.scratchpad_page_bytes()
         )
+        if memory.num_graphs < len(scan.graphs):
+            found = (
+                f"the {memory.num_graphs} largest of {len(scan.graphs)} compiled graphs "
+                f"in {root} (this rank loads {expected})"
+            )
+        else:
+            found = f"{memory.num_graphs} compiled graphs in {root}"
         return GraphNeed(
             memory.total_bytes,
-            f"{memory.num_graphs} compiled graphs in {root}: shared scratchpad "
+            f"{found}: shared scratchpad "
             f"{memory.scratchpad_bytes / (1024**2):.0f} MiB, code, constants and "
             f"rings {memory.resident_bytes / (1024**2):.0f} MiB, runtime "
             f"{memory.runtime_bytes / (1024**2):.0f} MiB",

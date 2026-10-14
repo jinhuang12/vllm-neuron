@@ -269,6 +269,47 @@ def test_no_graph_needs_no_memory() -> None:
     assert need.num_graphs == 0
 
 
+def _graph(resident_mib: int, scratch_mib: int) -> neff_memory.NeffMemory:
+    """A one-core graph that holds ``resident_mib`` of code and ``scratch_mib`` of scratchpad."""
+    core = neff_memory.CoreMemory(
+        scratchpad_bytes=scratch_mib * MIB,
+        code_bytes=resident_mib * MIB,
+        constant_bytes=0,
+        dma_ring_bytes=0,
+    )
+    return neff_memory.NeffMemory(
+        path=f"graph_{resident_mib}_{scratch_mib}.neff", cores=(core,), input_bytes=frozenset()
+    )
+
+
+def test_one_rank_is_charged_the_largest_graphs_it_can_load() -> None:
+    """A cache that every rank fills holds every rank's graphs; a rank loads ``loaded`` of them.
+
+    Which ones is not known before warmup, so the charge is the most any ``loaded``
+    of them can hold: the largest scratchpad of any graph, the resident bytes of the
+    ``loaded`` largest, and the runtime's bookkeeping for ``loaded`` graphs.
+    """
+    graphs = [_graph(10, 200), _graph(50, 64), _graph(30, 64), _graph(40, 64)]
+
+    need = neff_memory.rank_graph_memory(graphs, loaded=2, page_bytes=64 * MIB)
+
+    assert need.num_graphs == 2
+    assert need.scratchpad_bytes == 256 * MIB  # the smallest graph's, page-rounded
+    assert need.resident_bytes == (50 + 40) * MIB
+    assert need.runtime_bytes == (
+        neff_memory.RUNTIME_FIXED_BYTES + 2 * neff_memory.RUNTIME_BYTES_PER_GRAPH
+    )
+
+
+@pytest.mark.parametrize("loaded", [4, 5])
+def test_a_cache_of_one_ranks_graphs_is_charged_in_full(loaded) -> None:
+    graphs = [_graph(10, 200), _graph(50, 64), _graph(30, 64), _graph(40, 64)]
+
+    need = neff_memory.rank_graph_memory(graphs, loaded=loaded, page_bytes=64 * MIB)
+
+    assert need == neff_memory.graph_memory(graphs, page_bytes=64 * MIB)
+
+
 @pytest.mark.parametrize(
     ("env", "value", "expected_mib"),
     [
