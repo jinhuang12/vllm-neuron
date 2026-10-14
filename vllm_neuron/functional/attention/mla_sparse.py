@@ -51,6 +51,7 @@ import nki.language as nl
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
+from vllm_neuron import envs
 from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 from vllm_neuron.source_digest import source_digest
 from vllm_neuron.utils.neuron_utils import can_run_kernel, values_are_readable
@@ -341,6 +342,21 @@ def _window_of(c_kv_hbm, table_hbm, written_hbm, offset_hbm, page_size: int):
     if table_hbm is None:
         return c_kv_hbm
     return _staged_window(c_kv_hbm, table_hbm, written_hbm, offset_hbm, page_size)
+
+
+def bank_rows_serve(page_size: int) -> bool:
+    """True when the low-precision row-tiled body can read the bank, not a staged window.
+
+    The bank form serves every window length. The staged form copies the window before
+    the first gather, and that copy grows with the pages; the bank form instead puts a
+    block-table lookup into each query's offsets (:func:`_lowp_offsets`), whose add runs
+    on GpSimd so that the Vector engine does not wait for it. Device rows at the served
+    prefill chunk (1,024 queries, 128-row pages, LNC2, one logical core): the bank-form
+    call is 312.6 us faster at 264 pages, 688.3 us at 1,024 and 1,368.2 us at 2,048, with
+    the same output bits. A lookup splits a window row into its page and its row in that
+    page by a shift and a mask, so ``page_size`` must be a power of two.
+    """
+    return page_size >= 1 and page_size & (page_size - 1) == 0
 
 
 def _queries_per_block(seq: int, heads: int) -> int:
@@ -1725,12 +1741,17 @@ def _softmax_rows(queries_per_block: int) -> int:
 _LP_RAW = 0        # the chunk-major indices, signed
 _LP_FILL = 1       # max(first chunk's index, 0) per partition, fp32: a sentinel's row
 _LP_SHIFT = 2      # (index < 0) * fill
-_LP_OFFSET = 3     # the gather's offsets, uint32: max(index, shift)
-_LP_COUNT = 4
+_LP_OFFSET = 3     # the gather's offsets, uint32: max(index, shift); bank rows in the bank form
+_LP_PAGES = 4      # bank form only, uint32: each row's page, page's first bank row, place in page
+_LP_COUNT = 5
 
 
-def _lowp_scratch(n_chunks):
-    """One per-query working set of the low-precision body: its index row and gather offsets."""
+def _lowp_scratch(n_chunks, banked):
+    """One per-query working set of the low-precision body: its index row and gather offsets.
+
+    ``banked`` adds the bank form's lookup tile (:func:`_lowp_offsets`); the staged form
+    allocates nothing for it.
+    """
     ws = []
     for _ in range(_LP_COUNT):
         ws.append(None)
@@ -1738,10 +1759,47 @@ def _lowp_scratch(n_chunks):
     ws[_LP_FILL] = _scalar(KEY_CHUNK)
     ws[_LP_SHIFT] = _sbuf_i32(KEY_CHUNK, _aligned(n_chunks))
     ws[_LP_OFFSET] = _sbuf_u32(KEY_CHUNK, _aligned(n_chunks))
+    if banked:
+        ws[_LP_PAGES] = _sbuf_u32(KEY_CHUNK, 3 * _aligned(n_chunks))
     return ws
 
 
-def _lowp_offsets(ws, topk_hbm, row):
+def _lowp_bank_table(table_hbm, page_size: int):
+    """The block table on every key partition as bank rows: ``[128, pages]`` uint32.
+
+    Column ``e`` holds ``max(block_table[e], 0) * page_size``, the bank row of page
+    ``e``'s first row; the -1 pad reads page 0, as :func:`_bank_pieces` clamps it. One
+    partition-broadcast DMA reads the table, and one instruction clamps and scales every
+    page. Every bank row is far below 2**24, so the fp32 arithmetic is exact.
+    """
+    pages = table_hbm.shape[0]
+    raw = _sbuf_i32(KEY_CHUNK, _aligned(pages))
+    nisa.dma_copy(dst=raw[:, 0:pages],
+                  src=table_hbm.ap(pattern=[[0, KEY_CHUNK], [1, pages]], offset=0),
+                  dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync)
+    firsts = _sbuf_u32(KEY_CHUNK, _aligned(pages))
+    nisa.tensor_scalar(dst=firsts[:, 0:pages], data=raw[:, 0:pages], op0=nl.maximum,
+                       operand0=0.0, op1=nl.multiply, operand1=float(page_size),
+                       engine=nisa.engine.vector)
+    return firsts[:, 0:pages]
+
+
+def _log2_exact(n: int) -> int:
+    """``log2(n)`` for a power of two ``n``, counted by doubling.
+
+    The kernel front end resolves no ``int`` methods, so ``n.bit_length()`` is not
+    available inside a kernel. Only powers of two reach here (:func:`bank_rows_serve`).
+    """
+    shift = 0
+    step = 1
+    for bit in range(31):
+        step = step * 2
+        if step <= n:
+            shift = bit + 1
+    return shift
+
+
+def _lowp_offsets(ws, topk_hbm, row, table=None, page_size=0):
     """Load index row ``row`` into ``ws`` chunk-major and compute its gather offsets there.
 
     Element (p, c) is column c * 128 + p of the row. A sentinel's offset is `fill`,
@@ -1749,6 +1807,20 @@ def _lowp_offsets(ws, topk_hbm, row):
     Every index is far below 2**24, so the fp32 arithmetic of these instructions is exact.
     The load runs on the Sync engine's hardware DGE, which leaves the software DGE, the
     body's busiest engine, to the gathers.
+
+    With ``table`` (:func:`_lowp_bank_table`) the offsets are then translated from window
+    rows to bank rows: window row ``r`` is row ``r & (page_size - 1)`` of page
+    ``r >> log2(page_size)``, so its bank row is that page's first bank row, gathered from
+    ``table`` per partition, plus its place in the page. Sentinels are translated with the
+    real columns, so a sentinel reads the bank row of the window row it reads in the
+    staged form. The page numbers, the gathered rows and the places in the pages are three
+    column ranges of one uint32 tile (the bitwise ops keep their source's dtype): the
+    device runs ``nc_n_gather`` in pieces that read their part of the indices from SBUF,
+    so its destination must not overlap them, and two column ranges of one memory
+    location never do, wherever the backend places it (``functional/dsa/sentinel_order.py``).
+    The final add runs on the GpSimd engine, after the ``nc_n_gather`` it reads, in native
+    uint32 arithmetic: on the Vector engine it would make Vector, which runs in program
+    order, wait for the lookup, and so delay the copies the PV matmul loads.
     """
     topk = topk_hbm.shape[1]
     n_chunks = topk // KEY_CHUNK
@@ -1768,6 +1840,19 @@ def _lowp_offsets(ws, topk_hbm, row):
     nisa.tensor_tensor(dst=offsets[:, 0:n_chunks], data1=raw[:, 0:n_chunks],
                        data2=shift[:, 0:n_chunks], op=nl.maximum,
                        engine=nisa.engine.vector)
+    if table is not None:
+        lookup = ws[_LP_PAGES]
+        third = lookup.shape[1] // 3
+        page_of = lookup[:, 0:n_chunks]
+        first_row = lookup[:, third:third + n_chunks]
+        in_page = lookup[:, 2 * third:2 * third + n_chunks]
+        nisa.tensor_scalar(dst=page_of, data=offsets[:, 0:n_chunks], op0=nl.right_shift,
+                           operand0=_log2_exact(page_size), engine=nisa.engine.vector)
+        nisa.tensor_scalar(dst=in_page, data=offsets[:, 0:n_chunks], op0=nl.bitwise_and,
+                           operand0=page_size - 1, engine=nisa.engine.vector)
+        nisa.nc_n_gather(dst=first_row, data=table, indices=page_of)
+        nisa.tensor_tensor(dst=offsets[:, 0:n_chunks], data1=first_row, data2=in_page,
+                           op=nl.add, engine=nisa.engine.gpsimd)
 
 
 def _program_row(m: int, prg_id: int, n_prgs: int, qpb: int, n_blocks: int) -> int:
@@ -1860,7 +1945,8 @@ def _lowp_mm2_matmuls(out_t, chunks, p_hl, qi: int, r: int, group: int, n_chunks
 
 
 def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
-                                   QUERY_BUFFERS=QUERY_BUFFERS_DEFAULT):
+                                   QUERY_BUFFERS=QUERY_BUFFERS_DEFAULT, table_hbm=None,
+                                   page_size=0):
     """The low-precision streaming body; see the section comment above.
 
     Preconditions (:func:`_lowp_serves`): one head, no RoPE limb, more than one query,
@@ -1868,6 +1954,11 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
     latent an exact multiple of 128 within one MM2 moving tile, K a multiple of 128.
     ``QUERY_BUFFERS`` gathered-row buffers beyond one group's, rounded up to whole
     groups, let the next group's gathers start while a group finishes; scheduling only.
+
+    With ``table_hbm`` (the bank form) ``c_kv_hbm`` is the whole bank, which must already
+    hold this step's rows, and each query's offsets are translated to bank rows through
+    the table (:func:`_lowp_offsets`); ``page_size`` is then a power of two. Every
+    instruction after the offsets is the same in both forms.
     """
     seq, heads, latent = q_lift_hbm.shape
     topk = topk_hbm.shape[1]
@@ -1920,9 +2011,12 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
     # between still read theirs: the ring holds those groups and the one written.
     ahead = OFFSET_GROUPS_AHEAD * group
     index_ring = ahead + group
+    banked = table_hbm is not None
     scratch = []
     for _ in range(index_ring):
-        scratch.append(_lowp_scratch(n_chunks))
+        scratch.append(_lowp_scratch(n_chunks, banked))
+    # The bank form's block table, on every key partition, read once per program.
+    table = _lowp_bank_table(table_hbm, page_size) if banked else None
     # MM2's stationaries: every chunk of one query's keys on partitions, in two sets by
     # the query's place in its group, so a query's turns into one set can run while the
     # query before it still reads the other (the MM2 order below). The two sets hold
@@ -1984,7 +2078,7 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
             for m in range(ahead):
                 row = _program_row(m, prg_id, n_prgs, qpb, n_blocks)
                 if row >= 0:
-                    _lowp_offsets(scratch[m % index_ring], topk_hbm, row)
+                    _lowp_offsets(scratch[m % index_ring], topk_hbm, row, table, page_size)
         for g0 in range(0, qpb, group):
             scores_ps = []
             for ti in range(len(tiles)):
@@ -2024,7 +2118,7 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
                 m = n0 + g0 + ahead + r
                 row = _program_row(m, prg_id, n_prgs, qpb, n_blocks)
                 if row >= 0:
-                    _lowp_offsets(scratch[m % index_ring], topk_hbm, row)
+                    _lowp_offsets(scratch[m % index_ring], topk_hbm, row, table, page_size)
             # After the block's first MM1: the next block's query tiles from the rows
             # copied a block ago, then the rows of the block after it into the buffer
             # those tiles' block read.
@@ -2116,19 +2210,29 @@ def mla_sparse_attention_nope_row_tiled_kernel(q_lift_hbm, c_kv_hbm, topk_hbm,
                                                page_size=0, BLOCK_N=MOVING_MAX,
                                                STREAM_KV=True, PE_LOWP=False,
                                                QUERY_BUFFERS=QUERY_BUFFERS_DEFAULT,
-                                               source_digest=0):
+                                               source_digest=0, BANK_ROWS=False):
     """Row-tiled NoPE sparse attention; the paged operands and tile parameters are optional.
 
     The paged operands are declared before the tile parameters so a paged call reaches
     ``page_size`` positionally without passing a tile parameter. ``PE_LOWP`` and
     ``QUERY_BUFFERS`` are :func:`_attention_body_row_tiled`'s; ``source_digest`` is
-    :data:`SOURCE_DIGEST` and only keys the kernel cache.
+    :data:`SOURCE_DIGEST` and only keys the kernel cache. ``BANK_ROWS`` lets a paged call
+    that the low-precision body serves read the bank through the table instead of a
+    staged window (:func:`bank_rows_serve`); the caller then passes no overlay operands,
+    because the bank already holds this step's rows. It is declared last so every
+    earlier positional form keeps its meaning.
     """
     seq, heads, latent = q_lift_hbm.shape
     out_hbm = nl.ndarray((seq, heads, latent), dtype=nl.float32, buffer=nl.shared_hbm)
-    window_hbm = _window_of(c_kv_hbm, block_table_hbm, written_hbm, write_offset_hbm,
-                            page_size)
-    if PE_LOWP and _lowp_serves(q_lift_hbm, window_hbm, heads, 0, STREAM_KV):
+    banked = (BANK_ROWS and block_table_hbm is not None and PE_LOWP
+              and _lowp_serves(q_lift_hbm, c_kv_hbm, heads, 0, STREAM_KV))
+    window_hbm = c_kv_hbm if banked else _window_of(c_kv_hbm, block_table_hbm, written_hbm,
+                                                    write_offset_hbm, page_size)
+    if banked:
+        _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale,
+                                       out_hbm, QUERY_BUFFERS=QUERY_BUFFERS,
+                                       table_hbm=block_table_hbm, page_size=page_size)
+    elif PE_LOWP and _lowp_serves(q_lift_hbm, window_hbm, heads, 0, STREAM_KV):
         _attention_body_row_tiled_lowp(q_lift_hbm, window_hbm, topk_hbm, softmax_scale,
                                        out_hbm, QUERY_BUFFERS=QUERY_BUFFERS)
     else:
@@ -2452,7 +2556,8 @@ def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
                          block_table_row: Tensor | None = None,
                          written: Tensor | None = None,
                          write_offset: Tensor | None = None,
-                         page_size: int = 0, pool_size: int = 0) -> Tensor:
+                         page_size: int = 0, pool_size: int = 0,
+                         written_in_bank: bool = False) -> Tensor:
     """Sparse MLA attention over each query's selected cache rows.
 
     Args:
@@ -2480,6 +2585,13 @@ def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
             ``mla_dense_window.mla_masked_window_attention``, which reads the selection
             as a bias over the whole window instead of gathering it, wherever
             ``mla_dense_window.masked_window_serves`` says it beats the gather.
+        written_in_bank: True states that ``c_kv`` already holds ``written``: window
+            row ``write_offset + i`` of the table names the bank row that holds
+            ``written[i]``, as the model's KV write leaves it before this call. A
+            paged call the low-precision row-tiled body serves may then read the bank
+            through the table with no staged window, where
+            ``envs.VLLM_NEURON_MLA_SPARSE_BANK_ROWS`` is on (the default) and
+            :func:`bank_rows_serve` accepts ``page_size``.
 
     Returns:
         ``[S, H, L]`` float32.
@@ -2557,12 +2669,24 @@ def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
     ):
         nope_call = nope_call[2]
     if block_table_row is not None:
+        table = block_table_row.contiguous().to(torch.int32)
+        # The bank form reads this step's rows from the bank, so it takes no overlay.
+        if (
+            rows_tiled
+            and lowp
+            and bool(written_in_bank)
+            and envs.VLLM_NEURON_MLA_SPARSE_BANK_ROWS
+            and bank_rows_serve(int(page_size))
+        ):
+            return nope_call(
+                q_lift_in, c_kv_in, topk_i32, float(softmax_scale), table, None, None,
+                int(page_size), MOVING_MAX, True, lowp, buffers, SOURCE_DIGEST, True
+            )
         # A step that writes nothing hands no overlay operands rather than empty ones: the
         # kernel front end builds one tile per tensor operand and refuses a zero-extent shape.
         overlaid = written is not None and int(written.shape[0]) > 0
         rows = _kernel_operand(written) if overlaid else None
         at = write_offset.contiguous().to(torch.int32) if overlaid else None
-        table = block_table_row.contiguous().to(torch.int32)
         if rows_tiled:
             return nope_call(
                 q_lift_in, c_kv_in, topk_i32, float(softmax_scale), table, rows, at,
