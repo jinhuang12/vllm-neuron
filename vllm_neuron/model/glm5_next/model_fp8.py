@@ -5152,6 +5152,86 @@ class Glm5NextDSAIndexer(nn.Module):
         )
         from vllm_neuron.model.glm5_next import dsa_kpool_window
 
+        ape = self._pool_operands(key, gate_score, slot_mapping)
+        tokens = int(key.shape[0])
+        pool = self.index_kpool
+        pos = torch.arange(tokens, device=key.device)
+        write_mask = (slot_mapping >= 0) & (pos >= pool - 1)
+
+        # The ape is float32 for the kernel's inner contract even though the
+        # checkpoint leaf is bf16; it is [4, 128], so the cast is free and is
+        # done here rather than cached, unlike the projection weights.
+        ape = ape.to(torch.float32)
+        if dsa_kpool_window.prefill_reads_windows():
+            pooled = dsa_kpool_hadamard(key, gate_score, ape, windows=True)
+        else:
+            window = sliding_windows(tokens, pool, key.device)
+            pooled = dsa_kpool_hadamard(key[window], gate_score[window], ape)
+        return pooled, write_mask
+
+    def store_pools(
+        self,
+        key: torch.Tensor,
+        gate_score: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        pool_cache: torch.Tensor,
+        trash: int,
+    ) -> torch.Tensor:
+        """Pool this chunk's complete pools and write them into ``pool_cache``. The prefill
+        leg's store. Returns the written pool cache.
+
+        The rows written are :meth:`pool_window`'s: row ``slot_mapping[p]`` of ``pool_cache``
+        gets position ``p``'s pooled key wherever ``write_mask[p]`` holds, and every other
+        position writes the trash row ``trash``, which no candidate gather reads. A slot at or
+        past ``trash`` writes the trash row too: every destination is then a row of the cache,
+        which the kernel route needs (an out-of-range dynamic offset drops a whole tile under
+        LNC2).
+
+        One kernel call on the store route (``dsa_kpool_store``, on by default):
+        ``dsa_kpool_hadamard_store`` pools the windows in place and writes each pooled row
+        straight to its cache row, so the pooled keys never go to HBM and back and the graph
+        holds no scatter. Otherwise :meth:`pool_window` pools and ``index_copy_`` writes, the
+        same rows. The return is the kernel's result on the store route, which the backend
+        hands to every later operation on ``pool_cache``; the caller reads the cache through
+        it.
+        """
+        from vllm_neuron.functional.dsa.kpool_hadamard import dsa_kpool_hadamard_store
+        from vllm_neuron.model.glm5_next import dsa_kpool_store
+
+        if not dsa_kpool_store.prefill_stores_pools():
+            pooled, write_mask = self.pool_window(key, gate_score, slot_mapping)
+            destination = torch.where(
+                write_mask,
+                slot_mapping.to(torch.int64),
+                pool_cache.new_full((), trash, dtype=torch.int64),
+            )
+            pool_cache.index_copy_(0, destination, pooled.to(pool_cache.dtype))
+            return pool_cache
+
+        ape = self._pool_operands(key, gate_score, slot_mapping)
+        pos = torch.arange(int(key.shape[0]), device=key.device)
+        writes = (
+            (slot_mapping >= 0) & (pos >= self.index_kpool - 1) & (slot_mapping < trash)
+        )
+        destination = torch.where(
+            writes,
+            slot_mapping.to(torch.int32),
+            pool_cache.new_full((), trash, dtype=torch.int32),
+        )
+        return dsa_kpool_hadamard_store(
+            key, gate_score, ape.to(torch.float32), pool_cache, destination
+        )
+
+    def _pool_operands(
+        self,
+        key: torch.Tensor,
+        gate_score: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> torch.Tensor:
+        """Check the prefill pooling's operands. Returns the ape leaf, as stored.
+
+        Shared by :meth:`pool_window` and :meth:`store_pools`, which pool the same operands.
+        """
         if key.ndim != 2 or int(key.shape[1]) != self.index_head_dim:
             raise Glm5NextDSAIndexerError(
                 f"key must be [tokens, {self.index_head_dim}]; got "
@@ -5189,20 +5269,7 @@ class Glm5NextDSAIndexer(nn.Module):
                 f"index_head_dim] = {(pool, self.index_head_dim)}; got "
                 f"{tuple(ape.shape)}"
             )
-
-        pos = torch.arange(tokens, device=key.device)
-        write_mask = (slot_mapping >= 0) & (pos >= pool - 1)
-
-        # The ape is float32 for the kernel's inner contract even though the
-        # checkpoint leaf is bf16; it is [4, 128], so the cast is free and is
-        # done here rather than cached, unlike the projection weights.
-        ape = ape.to(torch.float32)
-        if dsa_kpool_window.prefill_reads_windows():
-            pooled = dsa_kpool_hadamard(key, gate_score, ape, windows=True)
-        else:
-            window = sliding_windows(tokens, pool, key.device)
-            pooled = dsa_kpool_hadamard(key[window], gate_score[window], ape)
-        return pooled, write_mask
+        return ape
 
     def tail_step(
         self,
@@ -6166,7 +6233,9 @@ class Glm5NextDSAIndexer(nn.Module):
 
         What is torch here is orchestration, and it is named so a reader can check
         it: shape validation, index arithmetic for the gather and for the two write
-        addresses, one ``index_copy_`` per leg, one ring copy on the decode leg, and
+        addresses, one ``index_copy_`` on the decode leg (the prefill leg's write is in
+        its pooling kernel, :meth:`store_pools`, on the store route and an
+        ``index_copy_`` otherwise), one ring copy on the decode leg, and
         one ring copy on the prefill leg -- masked over the whole ring when the
         chunk's end arrives as a tensor. When the prefill selection shards, an NKI row
         cut (``shard_rows``) takes this rank's rows of the query side's two inputs and
@@ -6276,13 +6345,7 @@ class Glm5NextDSAIndexer(nn.Module):
                 )
                 pool_cache.index_copy_(0, pool_slot, pooled.to(pool_cache.dtype))
         else:
-            pooled, write_mask = self.pool_window(key, gate_score, slot_mapping)
-            destination = torch.where(
-                write_mask,
-                slot_mapping.to(torch.int64),
-                pool_cache.new_full((), trash, dtype=torch.int64),
-            )
-            pool_cache.index_copy_(0, destination, pooled.to(pool_cache.dtype))
+            pool_cache = self.store_pools(key, gate_score, slot_mapping, pool_cache, trash)
             if prefill_tail is not None:
                 # The remainder is this leg's to persist: the pooled store took the
                 # complete pools above, and the open pool's rows exist only here.

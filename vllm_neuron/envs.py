@@ -141,6 +141,9 @@ if TYPE_CHECKING:
     # Let the GLM-5.3-Flash DSA prefill key pooling read each position's window
     # from the keys in place, with no gather. On by default; 0 gathers the windows.
     VLLM_NEURON_DSA_KPOOL_WINDOW_READ: bool = True
+    # Let that window kernel write the pooled keys into the pool cache itself,
+    # with no scatter after it. On by default; 0 scatters with index_copy_.
+    VLLM_NEURON_DSA_KPOOL_STORE: bool = True
     # GLM-5.3-Flash fused glue kernels (``vllm_neuron/functional/glue``): which
     # kernel serves which call, and how the KDA kernels load their weights.
     VLLM_NEURON_GLUE_FUSED: str = "1"
@@ -632,6 +635,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # default; 0 gathers the windows.
     "VLLM_NEURON_DSA_KPOOL_WINDOW_READ": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_DSA_KPOOL_WINDOW_READ")) is not False
+    ),
+    # Write the DSA prefill indexer's pooled keys into the layer's pool cache from
+    # the window kernel itself, by indirect DMA to each position's cache row, instead
+    # of storing them and scattering them with ``index_copy_``; the written rows are
+    # the same bits (``functional/dsa/kpool_hadamard.py``,
+    # ``dsa_kpool_hadamard_store``). Only on the window route above. Read at trace
+    # time by ``model/glm5_next/dsa_kpool_store.py``; a change needs a new compile.
+    # On by default; 0 scatters with ``index_copy_``.
+    "VLLM_NEURON_DSA_KPOOL_STORE": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_DSA_KPOOL_STORE")) is not False
     ),
     # ================== GLM-5.3-Flash Fused Glue Kernels ==================
     # Which fused glue kernel (``vllm_neuron/functional/glue``) serves which call.

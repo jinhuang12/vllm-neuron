@@ -28,9 +28,14 @@ Under LNC2 (``NEURON_LOGICAL_NC_CONFIG=2``, the serving setting) every kernel he
 launches two programs, one per physical core, and each program serves a contiguous half
 of the rows or pools.
 
+``dsa_kpool_hadamard_store`` is the window route with the pool-cache write in the same kernel
+(``_kpool_hadamard_window_store_nki``): each pooled row goes by indirect DMA straight to the
+cache row the indexer names for it, so the pooled rows never go to HBM and back and the graph
+has no scatter of its own.
+
 The kernels only ever see complete pools; pool formation, slot mapping and the trailing
-partial pool belong to the indexer, and the fp8
-quantisation, its scale and the cache write belong to the adapter. ``n_pools`` and
+partial pool belong to the indexer, which also computes each row's cache destination, and the
+fp8 quantisation and its scale belong to the adapter. ``n_pools`` and
 ``pool_size`` are python ints because they select the tile count and the number of
 unrolled slot loads, so a tensor would force a data-dependent trace; the compiled
 graph specialises on the exact ``(n_pools, pool_size, head_dim, dtype)`` tuple.
@@ -426,11 +431,42 @@ def _load_windows(tile, hbm, block):
         )
 
 
-def _pool_block(load, key_hbm, score_hbm, out_hbm, biases, transform, block, pool_size: int):
+def _store_rows(cache_hbm, dest_hbm, result, block):
+    """Write one block's pooled rows into their cache rows: pool ``p`` to row ``dest_hbm[p]``.
+
+    ``result`` is the block's ``[partitions, columns, head_dim]`` tile and ``dest_hbm`` the
+    ``[n_pools, 1]`` int32 destinations. The block's destinations land in one
+    ``[partitions, columns]`` tile by one DMA, in the block's own order (partition ``p``,
+    column ``c`` is pool ``row0 + p * columns + c``), and each column goes out by one indirect
+    DMA on the cache's row axis. Every destination must be a row of ``cache_hbm``: under LNC2
+    an out-of-range dynamic offset drops the whole tile, not one row
+    (``vllm_neuron.functional.dsa.ragged_pack``), so the caller routes every row that writes
+    nothing to a real trash row. Rows that share a destination leave one of them there; the
+    compiler's own lowering of ``index_copy_`` is the same indirect store of 128-row tiles with
+    the same destinations.
+    """
+    row0, partitions, columns = block
+    head_dim = cache_hbm.shape[1]
+    index = nl.ndarray((partitions, columns), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=index, src=dest_hbm.ap(pattern=[[columns, partitions], [1, columns]],
+                                             offset=row0))
+    for column in range(columns):
+        nisa.dma_copy(
+            dst=cache_hbm.ap(pattern=[[head_dim, partitions], [1, head_dim]], offset=0,
+                             vector_offset=index[:, column:column + 1], indirect_dim=0),
+            src=result[:, column, :],
+        )
+
+
+def _pool_block(load, key_hbm, score_hbm, out_hbm, dest_hbm, biases, transform, block,
+                pool_size: int):
     """Pool, rotate, scale and store one block of ``_row_blocks`` over the pools.
 
     ``load`` fills the block's key and score tiles from ``key_hbm`` and ``score_hbm``:
-    ``_load_slots`` from gathered pools, ``_load_windows`` from the keys in place.
+    ``_load_slots`` from gathered pools, ``_load_windows`` from the keys in place. With
+    ``dest_hbm`` None the block's rows go to the same rows of ``out_hbm``; otherwise
+    ``out_hbm`` is the pool cache and each row goes to its destination row
+    (``_store_rows``).
     ``biases`` holds one ``(pmax, head_dim)`` fp32 tile of ``ape`` per slot and ``transform`` is
     the fp32 ``H_128`` of ``_transform_matrix``. Every Vector Engine step is one instruction
     over the whole block, so a block of ``columns`` pools per partition costs the instructions
@@ -483,7 +519,10 @@ def _pool_block(load, key_hbm, score_hbm, out_hbm, biases, transform, block, poo
     transposed = _transpose_group(pooled, block, group, nisa.scalar_engine)
     result = nl.ndarray((rows, columns, head_dim), dtype=key_hbm.dtype, buffer=nl.sbuf)
     _rotate_group(transposed, result, block, group, transform)
-    nisa.dma_copy(dst=_block_rows(out_hbm, block, (head_dim,)), src=result)
+    if dest_hbm is None:
+        nisa.dma_copy(dst=_block_rows(out_hbm, block, (head_dim,)), src=result)
+    else:
+        _store_rows(out_hbm, dest_hbm, result, block)
 
 
 def _transform_matrix(head_dim: int, dtype):
@@ -580,10 +619,19 @@ def _rotate_group(transposed, rows_out, block, group, transform):
 # ---------------------------------------------------------------------------------------------
 
 
-def _kpool_hadamard_body(load, key_hbm, score_hbm, ape_hbm, n_pools, pool_size):
-    """The pooling kernels' shared body: ``load`` fills each block's key and score tiles."""
+def _kpool_hadamard_body(load, key_hbm, score_hbm, ape_hbm, n_pools, pool_size, cache_hbm,
+                         dest_hbm):
+    """The pooling kernels' shared body: ``load`` fills each block's key and score tiles.
+
+    With ``cache_hbm`` None it returns a new ``[n_pools, head_dim]`` buffer of the pooled rows.
+    Otherwise it writes pool ``p`` into row ``dest_hbm[p]`` of ``cache_hbm`` and returns
+    ``cache_hbm``, written in place.
+    """
     head_dim = key_hbm.shape[1]
-    out_hbm = nl.ndarray((n_pools, head_dim), dtype=key_hbm.dtype, buffer=nl.shared_hbm)
+    if cache_hbm is None:
+        out_hbm = nl.ndarray((n_pools, head_dim), dtype=key_hbm.dtype, buffer=nl.shared_hbm)
+    else:
+        out_hbm = cache_hbm
     pmax = nl.tile_size.pmax
     first, owned = _program_share(n_pools)
     biases = []
@@ -591,7 +639,8 @@ def _kpool_hadamard_body(load, key_hbm, score_hbm, ape_hbm, n_pools, pool_size):
         biases.append(_broadcast_row(ape_hbm, pmax, head_dim, slot))
     transform = _transform_matrix(head_dim, nl.float32)
     for block in _row_blocks(first, owned, pmax, _POOL_TILE_COLUMNS):
-        _pool_block(load, key_hbm, score_hbm, out_hbm, biases, transform, block, pool_size)
+        _pool_block(load, key_hbm, score_hbm, out_hbm, dest_hbm, biases, transform, block,
+                    pool_size)
     return out_hbm
 
 
@@ -623,7 +672,7 @@ def _kpool_hadamard_nki(slot_k_hbm, slot_score_hbm, ape_hbm, n_pools, pool_size)
     transform.
     """
     return _kpool_hadamard_body(_load_slots, slot_k_hbm, slot_score_hbm, ape_hbm, n_pools,
-                                pool_size)
+                                pool_size, None, None)
 
 
 @nki.jit
@@ -645,7 +694,32 @@ def _kpool_hadamard_window_nki(key_hbm, score_hbm, ape_hbm, n_pools, pool_size):
     from the windows in place (``_load_windows``) instead of from a gathered copy: the tiles
     hold the same values, so the output is the same bits.
     """
-    return _kpool_hadamard_body(_load_windows, key_hbm, score_hbm, ape_hbm, n_pools, pool_size)
+    return _kpool_hadamard_body(_load_windows, key_hbm, score_hbm, ape_hbm, n_pools, pool_size,
+                                None, None)
+
+
+@nki.jit
+def _kpool_hadamard_window_store_nki(key_hbm, score_hbm, ape_hbm, cache_hbm, dest_hbm, n_pools,
+                                     pool_size):
+    """``_kpool_hadamard_window_nki`` that writes each pooled row into its pool-cache row.
+
+    Args:
+        key_hbm, score_hbm, ape_hbm, n_pools, pool_size: as ``_kpool_hadamard_window_nki``.
+        cache_hbm: ``[cache_rows, head_dim]`` in ``key_hbm``'s dtype, contiguous: the pool
+            cache, written in place.
+        dest_hbm: ``[n_pools, 1]`` int32: pool ``p``'s cache row, every one a row of
+            ``cache_hbm`` (a trash row for a position that completes no pool).
+
+    Returns:
+        ``cache_hbm``, written in place: the backend records the operand alias and hands the
+        written cache to every later operation on that graph input.
+
+    The window kernel's programs, blocks and steps up to each block's rotated rows, which go
+    out by indirect DMA to their destinations (``_store_rows``) instead of to a pooled buffer
+    that the graph then loads back and scatters. The rows are the window kernel's bits.
+    """
+    return _kpool_hadamard_body(_load_windows, key_hbm, score_hbm, ape_hbm, n_pools, pool_size,
+                                cache_hbm, dest_hbm)
 
 
 @nki.jit
@@ -723,9 +797,11 @@ def _record_nki_dispatch(entry: str, n_pools: int, pool_size: int, head_dim: int
     and an ``@nki.jit`` kernel is a frozen dataclass it cannot reconstruct. The entry
     point therefore arrives as a ``str`` and each kernel is read as a module global.
     """
-    kernel = {"fused": _kpool_hadamard_nki, "window": _kpool_hadamard_window_nki}.get(
-        entry, _hadamard128_nki
-    )
+    kernel = {
+        "fused": _kpool_hadamard_nki,
+        "window": _kpool_hadamard_window_nki,
+        "store": _kpool_hadamard_window_store_nki,
+    }.get(entry, _hadamard128_nki)
     _COUNTERS.last_kernel = _kernel_identity_of(kernel)
     logger.info(
         "[dsa-kpool-hadamard] kernel=nki entry=%s n_pools=%d pool_size=%d head_dim=%d",
@@ -911,6 +987,65 @@ def _pool_windows(key: Tensor, gate_score: Tensor, ape: Tensor) -> Tensor:
     return wrap_nki(_kpool_hadamard_window_nki)[_programs(tokens)](
         key.contiguous(), gate_score.contiguous(), ape.contiguous(), tokens, pool_size
     )
+
+
+def dsa_kpool_hadamard_store(
+    key: Tensor, gate_score: Tensor, ape: Tensor, cache: Tensor, destination: Tensor
+) -> Tensor:
+    """Pool every position's sliding window, rotate it, and write it into its cache row.
+
+    Args:
+        key, gate_score, ape: as ``dsa_kpool_hadamard(key, gate_score, ape, windows=True)``.
+        cache: ``[cache_rows, head_dim]`` in ``key``'s dtype: the pool cache, written in place.
+        destination: ``[tokens]`` int32: position ``p``'s cache row. Every value must be a row
+            of ``cache``; a position that completes no pool names a trash row that nothing
+            reads, and positions may share it.
+
+    Returns:
+        The written cache: row ``destination[p]`` holds position ``p``'s pooled key, the bits
+        of ``dsa_kpool_hadamard(key, gate_score, ape, windows=True)[p]``, and every row that no
+        destination names is unchanged. Where positions share a row, one of their keys is
+        left there. In a traced graph this is the kernel's result, which the backend hands
+        to every later operation on the cache; on any other route, and eager on CPU tensors
+        (the NKI simulator writes the operand in place and returns a copy of it), it is
+        ``cache`` itself.
+
+    Raises:
+        KpoolHadamardError: as ``dsa_kpool_hadamard`` with ``windows``, and for a ``cache``
+            that is not 2-D of ``key``'s width and dtype or a ``destination`` that is not a
+            ``[tokens]`` int32 vector.
+
+    The NKI route is ``_kpool_hadamard_window_store_nki`` on a contiguous cache, where the
+    window kernel serves the call. Every other route pools with ``dsa_kpool_hadamard`` and
+    writes with ``index_copy_``, which is the graph this kernel replaces.
+    """
+    tokens, pool_size, head_dim = _validate_window(key, gate_score, ape)
+    if cache.ndim != 2 or int(cache.shape[1]) != head_dim or cache.dtype != key.dtype:
+        raise KpoolHadamardError(
+            f"cache must be [cache_rows, {head_dim}] {key.dtype}; got {tuple(cache.shape)} "
+            f"{cache.dtype}"
+        )
+    if (destination.ndim != 1 or int(destination.shape[0]) != tokens
+            or destination.dtype != torch.int32):
+        raise KpoolHadamardError(
+            f"destination must be [{tokens}] int32, one cache row per position; got "
+            f"{tuple(destination.shape)} {destination.dtype}"
+        )
+
+    if not (_can_run_window_kernel(key, ape) and cache.is_contiguous()):
+        pooled = _pool_windows(key, gate_score, ape)
+        cache.index_copy_(0, destination.to(torch.int64), pooled)
+        return cache
+
+    _count_nki_dispatch()
+    _record_nki_dispatch("store", tokens, pool_size, head_dim)
+    written = wrap_nki(_kpool_hadamard_window_store_nki)[_programs(tokens)](
+        key.contiguous(), gate_score.contiguous(), ape.contiguous(), cache,
+        destination.reshape(tokens, 1), tokens, pool_size
+    )
+    if cache.device.type == "cpu" and not torch.compiler.is_compiling():
+        return cache
+    return written
 
 
 def _pool_slots(slot_k: Tensor, slot_score: Tensor, ape: Tensor) -> Tensor:
