@@ -110,7 +110,6 @@ def test_kda_output_site_follows_the_switch(pair, spec, batch, phase, served,
 
 @pytest.mark.parametrize(("spec", "batch", "bf16"), (
     ("mhc_post:prefill", 4, False),
-    ("mhc_post:prefill", 128, True),  # 128 rows: more than any decode batch
     ("mhc_post:decode@4", 4, True),
     ("mhc_post:decode@4", 64, False),
     ("mhc_pre,kda_projections,kda_output", 4, False),

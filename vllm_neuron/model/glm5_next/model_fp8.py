@@ -1103,7 +1103,8 @@ class Glm5NextHyperConnection(nn.Module):
         residual: torch.Tensor,
         norm_gain: torch.Tensor | None = None,
         norm_eps: float | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        router_scale: bool = False,
+    ) -> tuple[torch.Tensor | None, ...]:
         """:meth:`mhc_pre`, and the sub-block's input RMSNorm where the kernel has it.
 
         Args:
@@ -1111,19 +1112,28 @@ class Glm5NextHyperConnection(nn.Module):
             norm_gain: ``[H]`` gain of the RMSNorm the sub-block applies to
                 ``layer_input`` first, or None.
             norm_eps: that norm's epsilon, with ``norm_gain``.
+            router_scale: also return ``scaled`` (with ``norm_gain`` only).
 
         Returns:
             ``(post_mix, comb_mix, layer_input, normed)``: :meth:`mhc_pre`'s three,
             and ``layer_input * rsqrt(mean(layer_input**2) + norm_eps) * norm_gain``
             in ``layer_input``'s dtype when the fused kernel serves this call
             (``functional/glue/mhc_pre.py``). Otherwise ``normed`` is None, and the
-            sub-block normalises ``layer_input`` itself.
+            sub-block normalises ``layer_input`` itself. With ``router_scale`` a fifth
+            value follows, ``scaled``: the same norm without the gain, the MoE
+            router's input (``router_prefill.router_rms_scale``), from the same
+            launch, or None where ``normed`` is None.
 
         Raises:
-            As :meth:`mhc_pre`.
+            Glm5NextHyperConnectionError: on ``router_scale`` without ``norm_gain``.
+            Otherwise as :meth:`mhc_pre`.
         """
         from vllm_neuron.functional.mhc.sinkhorn import sinkhorn_normalise_blocks
 
+        if router_scale and norm_gain is None:
+            raise Glm5NextHyperConnectionError(
+                "router_scale is the norm without its gain; it needs norm_gain"
+            )
         tokens, streams, hidden = self._require_streams(residual)
 
         from vllm_neuron.functional.glue import mhc_pre as glue_mhc_pre
@@ -1131,12 +1141,12 @@ class Glm5NextHyperConnection(nn.Module):
         if glue_mhc_pre.mhc_pre_admits(residual, self.fn, self.hc_scale, self.hc_base,
                                        phase=self._glue_phase(tokens),
                                        norm_gain=norm_gain):
-            post_mix, comb_start, layer_input, normed = glue_mhc_pre.mhc_pre_fused(
+            post_mix, comb_start, layer_input, *norms = glue_mhc_pre.mhc_pre_fused(
                 residual, self.fn, self.hc_scale, self.hc_base, rms_eps=self.rms_eps,
                 hc_eps=self.hc_eps, post_mult=self.post_mult_value,
-                norm_gain=norm_gain, norm_eps=norm_eps)
+                norm_gain=norm_gain, norm_eps=norm_eps, router_scale=router_scale)
             comb_mix = sinkhorn_normalise_blocks(comb_start, iters=self.sinkhorn_iters)
-            return post_mix, comb_mix, layer_input, normed
+            return post_mix, comb_mix, layer_input, *norms
 
         flat = residual.reshape(tokens, streams * hidden).to(torch.float32)
         mixes = flat @ self.fn.to(torch.float32).t()
@@ -1202,6 +1212,7 @@ class Glm5NextHyperConnection(nn.Module):
             comb_mix,
             layer_input.to(residual.dtype),
             None,
+            *((None,) if router_scale else ()),
         )
 
     # ── mHC post: one combine call ────────────────────────────────────────
@@ -1259,6 +1270,7 @@ class Glm5NextHyperConnection(nn.Module):
         residual: torch.Tensor,
         sublayer: object,
         norm: tuple[torch.Tensor | None, float] | None = None,
+        router_scale: bool = False,
     ) -> torch.Tensor:
         """One mHC layer call: pre, then the sub-block, then post.
 
@@ -1271,6 +1283,9 @@ class Glm5NextHyperConnection(nn.Module):
                 first, or None. With it, ``sublayer`` is called as
                 ``sublayer(layer_input, normed)``, ``normed`` from
                 :meth:`mhc_pre_normed` (None when the sub-block must normalise).
+            router_scale: with ``norm``, call ``sublayer(layer_input, normed,
+                scaled=scaled)``, ``scaled`` from :meth:`mhc_pre_normed` (None when
+                the router must scale its input itself).
 
         Returns:
             ``[T, S, H]`` in the streams' own dtype -- the re-mixed streams,
@@ -1286,8 +1301,14 @@ class Glm5NextHyperConnection(nn.Module):
                 f"{type(sublayer).__name__}"
             )
         gain, eps = (None, None) if norm is None else norm
-        post_mix, comb_mix, layer_input, normed = self.mhc_pre_normed(residual, gain, eps)
-        x = sublayer(layer_input) if norm is None else sublayer(layer_input, normed)
+        post_mix, comb_mix, layer_input, normed, *scaled = self.mhc_pre_normed(
+            residual, gain, eps, router_scale)
+        if norm is None:
+            x = sublayer(layer_input)
+        elif router_scale:
+            x = sublayer(layer_input, normed, scaled=scaled[0])
+        else:
+            x = sublayer(layer_input, normed)
         if not isinstance(x, torch.Tensor) or tuple(x.shape) != tuple(
             layer_input.shape
         ):
