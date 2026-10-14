@@ -170,3 +170,107 @@ def test_refusals_name_the_rows_and_the_depth():
         TU.dsa_decode_ring_rows(bank[:, :, :3], slots, key, score, ape, position)
     with pytest.raises(TU.DecodeTailUpdateError, match="ape"):
         TU.dsa_decode_ring_rows(bank, slots, key, score, ape[:3], position)
+
+
+# ---- the LNC2 launch: two programs from two rows per request --------------------------
+#
+# Under LNC2 (``NEURON_LOGICAL_NC_CONFIG=2``, the serving setting) a step of two or more rows
+# splits each request's work over both cores of the pair: program ``p`` compresses the
+# pools of its run of rows and writes back its half of the ring rows. The served verify step
+# is one request on a one-slot bank at depth 8 with four rows; the one-row step keeps one
+# program. Both forms must give the same pooled rows (every row, closing or not) and the
+# same rings, bit for bit.
+
+SERVED_STARTS = (2040, 2041, 2042, 2043, 2044, 2045, 2046, 2047, 4092)
+"""Row 0's position: every residue mod the depth, and the 4096 window's last pool."""
+
+
+def _set_lnc(monkeypatch, setting):
+    if setting is None:
+        monkeypatch.delenv("NEURON_LOGICAL_NC_CONFIG", raising=False)
+    else:
+        monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", setting)
+
+
+def _both_forms(monkeypatch, bank, slots, key, score, ape, position):
+    """The step under one program (setting unset) and under the LNC2 setting, with the
+    route counts of each."""
+    forms = {}
+    for setting in (None, "2"):
+        _set_lnc(monkeypatch, setting)
+        TU.reset_decode_tail_dispatch_counters()
+        pooled, rings = TU.dsa_decode_ring_rows(bank, slots, key, score, ape, position)
+        forms[setting] = (pooled, rings, TU.decode_ring_rows_route_counts())
+    return forms[None], forms["2"]
+
+
+@pytest.mark.parametrize("start", SERVED_STARTS)
+@pytest.mark.parametrize("rows", (1, 4))
+def test_the_served_step_takes_two_programs_at_four_rows_bit_for_bit(rows, start,
+                                                                     monkeypatch):
+    bank, slots, key, score, ape, position = _case(1, rows, DEEP, seed=500 + start % DEEP,
+                                                   starts=(start,), slots_total=1)
+    one, pair = _both_forms(monkeypatch, bank, slots, key, score, ape, position)
+    assert one[2] == (1, 0)
+    assert pair[2] == ((0, 1) if rows == 4 else (1, 0))
+    assert torch.equal(pair[0], one[0]), "pooled rows"
+    assert torch.equal(pair[1], one[1]), "rings"
+    want_pooled, want_rings = TU.dsa_decode_ring_rows_torch_oracle(bank, slots, key, score,
+                                                                   ape, position)
+    assert torch.equal(pair[1], want_rings)
+    closing = _closing(position, rows)
+    torch.testing.assert_close(pair[0][closing].float(), want_pooled[closing].float(),
+                               rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.parametrize("batch", BATCHES)
+@pytest.mark.parametrize("rows", (2, 3, 4, 6))
+def test_two_programs_equal_one_program_bit_for_bit(rows, batch, monkeypatch):
+    bank, slots, key, score, ape, position = _case(batch, rows, DEEP, seed=600 + rows + batch)
+    one, pair = _both_forms(monkeypatch, bank, slots, key, score, ape, position)
+    assert (one[2], pair[2]) == ((1, 0), (0, 1))
+    assert torch.equal(pair[0], one[0]), "pooled rows"
+    assert torch.equal(pair[1], one[1]), "rings"
+
+
+def _launch_grids(monkeypatch, rows: int) -> list:
+    """The grid of every launch of the ring kernel during one step: ``1`` for a launch
+    without a grid."""
+    seen = []
+    real = TU.wrap_nki
+
+    def spy(kernel):
+        call = real(kernel)
+
+        class _Spy:
+            def __getitem__(self, grid):
+                seen.append(grid)
+                return call[grid]
+
+            def __call__(self, *a):
+                seen.append(1)
+                return call(*a)
+        return _Spy()
+
+    monkeypatch.setattr(TU, "wrap_nki", spy)
+    TU.dsa_decode_ring_rows(*_case(1, rows, DEEP, seed=7, starts=(2045,), slots_total=1))
+    return seen
+
+
+@pytest.mark.parametrize("setting, four_rows", [(None, 1), ("1", 1), ("2", 2)],
+                         ids=["unset", "lnc1", "lnc2"])
+def test_the_ring_grid_follows_the_lnc_setting_and_one_row_takes_one_program(
+        setting, four_rows, monkeypatch):
+    _set_lnc(monkeypatch, setting)
+    assert _launch_grids(monkeypatch, 4) == [four_rows]
+    assert _launch_grids(monkeypatch, 1) == [1]
+
+
+@pytest.mark.parametrize("setting", ["3", "abc"])
+def test_an_lnc_setting_the_ring_kernel_does_not_serve_is_refused_by_name(setting,
+                                                                          monkeypatch):
+    from vllm_neuron.functional.dsa.launch_grid import LaunchGridError
+
+    monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", setting)
+    with pytest.raises(LaunchGridError, match="NEURON_LOGICAL_NC_CONFIG"):
+        TU._rows_programs(4)
