@@ -62,20 +62,26 @@ offsets of the page (:func:`kda_checkpoint_layout`); a speculative step's draft 
 never stored.
 
 The page view and the write form (:func:`kda_checkpoint_pages`,
-:func:`write_kda_checkpoints`). A write is ONE ``index_copy_`` of whole pages onto a
-``[num_blocks, page_bytes]`` view of the pool tensor, the view the graph is handed, so it
-is a contiguous input and the write persists: the backend makes an in-place op out of
-place and moves only the later uses of that op's own first argument onto its result, so
-a write through a view of a graph input reaches no other view of it, and of several
-such writes only the last reaches the input's aliased output (the latent cache write in
-``model/glm5_next/model_fp8.py``, "The persisting write"). A per-carrier view of the
-pages would be neither: its rows are a page apart, so it is not contiguous, and a write
-into it is a write through a view. The KDA layers that share one pool tensor are handed
-one page view, so their writes, to their own groups' blocks, chain on one input.
+:func:`write_kda_checkpoints`). On the device a write is one NKI kernel launch
+(:mod:`vllm_neuron.functional.kda.checkpoint_write`): indirect DMAs move each carrier's
+bytes into their pages, and the kernel returns the pages, so the backend makes the whole
+tensor an aliased output. The operand is the page view or any other contiguous view of
+the same pool tensor's whole pages, such as the latent layer's cache view itself, so a
+graph that writes both has one written input per storage. The backend's aliasing pass
+hands the kernel's result to every later operation on the same graph input, as it moves
+the later uses of an in-place op's own first argument onto that op's result, so the
+writes to one input run in order, each on the one before. The KDA layers that share one
+pool tensor are handed one page view, so their writes, to their own groups' blocks,
+chain on that one input whether or not a layer uses the pages a write returns. Another
+view of the same buffer is another graph input, outside that chain (the latent cache
+write in ``model/glm5_next/model_fp8.py``, "The persisting write"). On CPU tensors the
+torch path writes the same bytes, eager.
 Block id 0 is vLLM's null block: the pool never hands it out as a real block and it is
 never the last entry of a hit, so no restore reads it and a padding row may name it.
 Reads (:func:`read_kda_checkpoints`, :func:`restore_kda_slot`) gather whole pages and
-cut the carriers out of them.
+cut the carriers out of them with dtype views. They are eager only on this backend: the
+backend refuses an in-graph dtype view when it lowers a graph to HLO, so a traced caller
+is refused there.
 """
 
 from __future__ import annotations
@@ -86,6 +92,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
+
+from vllm_neuron.functional.kda.checkpoint_write import write_page_rows
 
 __all__ = [
     "SCRATCH_SLOTS",
@@ -354,11 +362,8 @@ def _block_ids_problem(block_ids) -> str | None:
             "block ids are a [n] tensor, one id per checkpoint; got "
             f"{block_ids if not torch.is_tensor(block_ids) else tuple(block_ids.shape)}"
         )
-    if block_ids.dtype != torch.int64:
-        return (
-            f"block ids must be int64 (index_copy_ takes a LongTensor index, as "
-            f"slot_tensor builds one); got {block_ids.dtype}"
-        )
+    if block_ids.dtype not in (torch.int64, torch.int32):
+        return f"block ids must be int64 or int32; got {block_ids.dtype}"
     return None
 
 
@@ -371,16 +376,16 @@ def _pages_problem(pages, layout) -> str | None:
     return None
 
 
-def _pack(rows: Sequence[torch.Tensor], layout, count: int, dtype) -> torch.Tensor:
-    """Whole pages ``[count, page_bytes]`` as ``dtype`` elements, carriers at their offsets."""
+def _carrier_rows(rows: Sequence[torch.Tensor], layout, count: int) -> list[torch.Tensor]:
+    """``rows`` checked against the layout, each as its carrier's dtype."""
     if len(rows) != len(layout.shapes):
         raise ValueError(
             f"a checkpoint has one row tensor per state carrier: the layout has "
             f"{len(layout.shapes)} carrier(s) and {len(rows)} row tensor(s) were given"
         )
-    parts, end = [], 0
-    for carrier, (carrier_rows, shape, carrier_dtype, offset) in enumerate(
-        zip(rows, layout.shapes, layout.dtypes, layout.offsets)
+    checked = []
+    for carrier, (carrier_rows, shape, carrier_dtype) in enumerate(
+        zip(rows, layout.shapes, layout.dtypes)
     ):
         if tuple(carrier_rows.shape) != (count, *shape):
             raise ValueError(
@@ -388,13 +393,8 @@ def _pack(rows: Sequence[torch.Tensor], layout, count: int, dtype) -> torch.Tens
                 f"{count} block id(s) the write takes {(count, *shape)}, got "
                 f"{tuple(carrier_rows.shape)}"
             )
-        if offset > end:
-            parts.append(carrier_rows.new_zeros((count, offset - end), dtype=torch.int8))
-        parts.append(carrier_rows.to(carrier_dtype).reshape(count, -1).view(torch.int8))
-        end = offset + math.prod(shape) * carrier_dtype.itemsize
-    if layout.page_bytes > end:
-        parts.append(rows[0].new_zeros((count, layout.page_bytes - end), dtype=torch.int8))
-    return torch.cat(parts, dim=1).view(dtype)
+        checked.append(carrier_rows.to(carrier_dtype))
+    return checked
 
 
 def _unpack(pages: torch.Tensor, layout) -> list[torch.Tensor]:
@@ -409,32 +409,41 @@ def _unpack(pages: torch.Tensor, layout) -> list[torch.Tensor]:
     ]
 
 
-def write_kda_checkpoints(pages, block_ids, rows, layout) -> None:
+def write_kda_checkpoints(pages, block_ids, rows, layout) -> torch.Tensor:
     """Write one checkpoint per block: ``rows[c][i]`` into page ``block_ids[i]`` of ``pages``.
 
     ``pages`` is the page view of the pool tensor the layer shares
-    (:func:`kda_checkpoint_pages`), ``block_ids`` a ``[n]`` int64 tensor of the layer's
-    own group's blocks, ``rows`` one ``[n, *shape]`` tensor per carrier, in the
-    layout's carrier order. The whole pages are written by one ``index_copy_`` on
-    ``pages`` itself, never through a view of it (module docstring), so in a traced
-    graph ``pages`` becomes a whole-tensor aliased output; the page's unused bytes are
-    written as zeros. The checks read shapes and dtypes only, so the function is safe
-    in a traced region. Rows naming one block more than once leave one of them; only
-    padding rows, which name the null block 0, may repeat.
+    (:func:`kda_checkpoint_pages`), or any other contiguous view of that tensor's whole
+    pages, such as the latent layer's cache view; ``block_ids`` a ``[n]`` int64 or int32
+    tensor of the layer's own group's blocks (int32 ids built on the host take no
+    conversion in a graph); ``rows`` one ``[n, *shape]`` tensor per carrier, in the
+    layout's carrier order. Each carrier's bytes go to its offset of the page, and the
+    page's other bytes are left as they are. Rows naming one block more than once leave
+    one of them; only padding rows, which name the null block 0, may repeat. The write
+    finds page ``b`` at byte ``b * layout.page_bytes`` of ``pages``, whatever the tensor's
+    row size: a ``[2 * n, page_bytes // 2]`` int8 tensor is taken as ``n`` pages. The
+    read and the restore take ``[num_blocks, ...]`` tensors of whole-page rows only.
+
+    Returns the written pages. On the device the write is one NKI kernel launch inside a
+    compiled graph (there is no eager device form), and the backend hands this tensor to
+    every later operation on the same graph input (module docstring). On CPU tensors,
+    eager, the write is in place and returns ``pages``. The checks read shapes and dtypes
+    only.
     """
-    problem = _block_ids_problem(block_ids) or _pages_problem(pages, layout)
+    problem = _block_ids_problem(block_ids)
     if problem is not None:
         raise ValueError(problem)
     count = int(block_ids.shape[0])
-    packed = _pack(rows, layout, count, pages.dtype)
-    pages.index_copy_(0, block_ids, packed.view(count, *pages.shape[1:]))
+    carriers = _carrier_rows(rows, layout, count)
+    return write_page_rows(pages, block_ids, carriers, layout.offsets, layout.page_bytes)
 
 
 def read_kda_checkpoints(pages, block_ids, layout) -> list[torch.Tensor]:
     """The checkpoints of ``block_ids``: one ``[n, *shape]`` tensor per carrier, in order.
 
-    One gather of whole pages, then each carrier cut out of them; safe in a traced
-    region.
+    One gather of whole pages, then each carrier cut out of them with dtype views. Eager
+    only on this backend: a traced caller is refused when the backend lowers its graph to
+    HLO, which has no lowering for an in-graph dtype view.
     """
     problem = _block_ids_problem(block_ids) or _pages_problem(pages, layout)
     if problem is not None:

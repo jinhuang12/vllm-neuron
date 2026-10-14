@@ -439,7 +439,9 @@ def kda_checkpoint_page_views(
     "The KDA checkpoint store"). :func:`kv_cache_allocations` allocates that tensor whole
     for the attention layer on it, so the pages are a view of that layer's raw buffer
     (``raw_tensors``, by layer name). The recurrent layers on one tensor get the same
-    view object, so their checkpoint writes chain on one graph input. A tensor with no
+    view object, so their checkpoint writes are to one graph input, and the backend
+    chains NKI writes to one input, each on the one before (``glm5next_state_banks``,
+    "The page view and the write form"). A tensor with no
     attention layer has no buffer, and pages of another size than a recurrent layer's
     page cannot hold its checkpoint: both are refused by name.
     """

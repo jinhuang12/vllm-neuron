@@ -22,10 +22,12 @@ Read here, with the served TP 64 specs (no model weights):
 5. aliasing: the page a write fills is the latent layer's page of the same block id,
    byte for byte, and a latent write to another block leaves it as it was;
 6. a write then a read returns what was written and moves no other page; padding rows
-   may name the null block;
+   may name the null block; the write finds its pages by bytes, whatever the tensor's
+   row size;
 7. a restore writes only the slot's entering row;
-8. traced, a write is ONE ``index_copy_`` on the page view itself and a read one
-   ``index_select``;
+8. traced on meta tensors (the device route), a write is one NKI kernel call on the page
+   view itself with no dtype view in the graph, and the graph returns its result; a read
+   traces to one ``index_select`` and dtype views, so it runs eager;
 9. refusals by name.
 
     NKI_SIMULATOR=1 VLLM_NEURON_CPU_MODE=1 python -m pytest \\
@@ -298,7 +300,8 @@ def test_a_checkpoint_fills_the_latent_layers_page_of_the_same_block_id(kda_spec
     page = latent[4].reshape(-1).view(torch.int8)
     assert torch.equal(page[:CONV_BYTES], rows[0].reshape(-1).view(torch.int8))
     assert torch.equal(page[CONV_BYTES:CHECKPOINT_BYTES], rows[1].reshape(-1).view(torch.int8))
-    assert not page[CHECKPOINT_BYTES:].any()
+    assert _same_bytes(page[CHECKPOINT_BYTES:],
+                       before[4].reshape(-1).view(torch.int8)[CHECKPOINT_BYTES:])
     others = [0, 1, 2, 3, 5]
     assert torch.equal(latent[others].view(torch.int8), before[others].view(torch.int8))
 
@@ -358,6 +361,24 @@ def test_a_padding_row_may_name_the_null_block(kda_spec):
     assert all(torch.equal(g[0], r[0]) for g, r in zip(got, rows, strict=True))
 
 
+def test_a_write_finds_its_pages_by_bytes_whatever_the_row_size(kda_spec):
+    """The write takes any contiguous tensor of whole pages (the latent layer's cache view
+    is one): rows of half a page are two rows per page."""
+    layout = kda_checkpoint_layout(kda_spec)
+    raw = _raw()
+    _noise(raw, seed=14)
+    before = kda_checkpoint_pages(raw, layout).clone()
+    rows = _rows(layout, 1, seed=15)
+
+    write_kda_checkpoints(raw.view(2 * BLOCKS, PAGE_BYTES // 2), _ids(4), rows, layout)
+
+    pages = kda_checkpoint_pages(raw, layout)
+    for got, want in zip(read_kda_checkpoints(pages, _ids(4), layout), rows, strict=True):
+        assert torch.equal(got, want)
+    assert torch.equal(pages[4, CHECKPOINT_BYTES:], before[4, CHECKPOINT_BYTES:])
+    assert torch.equal(pages[[0, 1, 2, 3, 5]], before[[0, 1, 2, 3, 5]])
+
+
 # ── 7. restore ──────────────────────────────────────────────────────────────────────
 
 
@@ -389,29 +410,48 @@ def test_a_restore_writes_only_the_slots_entering_row(kda_spec, draft_rows):
 # ── 8. traced ───────────────────────────────────────────────────────────────────────
 
 
-def test_traced_a_write_is_one_index_copy_on_the_page_view_itself(kda_spec):
-    """One whole-page write on the graph input: the backend keeps an in-place op on a
-    graph input as its aliased output, and drops a write through a view of it."""
+def test_traced_a_write_is_one_kernel_call_on_the_page_view_itself(kda_spec):
+    """On the device route (meta tensors), the write is one NKI kernel call whose page
+    operand is the graph input itself, and the graph returns the kernel's result, which
+    the backend aliases to that input (``test_checkpoint_write_compile``)."""
+    from vllm_neuron.functional.kda import checkpoint_write
+
     layout = kda_checkpoint_layout(kda_spec)
-    pages = kda_checkpoint_pages(_raw(), layout)
+    if not checkpoint_write.can_run_kernel(torch.empty(1, device="meta")):
+        pytest.skip("NKI kernels are off on this route (NKI_SIMULATOR=1 with CPU mode)")
+    seen = []
+
+    def record(gm, example_inputs):
+        seen.append(gm)
+        return gm.forward
 
     def step(pages, block_ids, conv_rows, recurrent_rows):
-        write_kda_checkpoints(pages, block_ids, [conv_rows, recurrent_rows], layout)
-        return pages
+        return write_kda_checkpoints(pages, block_ids, [conv_rows, recurrent_rows], layout)
 
-    graph = make_fx(step)(pages, _ids(1, 2), *_rows(layout, 2, seed=10)).graph
-    placeholders = [node for node in graph.nodes if node.op == "placeholder"]
-    copies = [node for node in graph.nodes
-              if node.op == "call_function" and "index_copy" in str(node.target)]
-    assert len(copies) == 1
-    assert copies[0].args[:3] == (placeholders[0], 0, placeholders[1])
-    writes = [node for node in graph.nodes if node.op == "call_function"
-              and str(node.target).endswith("_.default") and node.args
-              and node.args[0] is placeholders[0]]
-    assert writes == copies
+    meta = torch.device("meta")
+    rows = [torch.empty(2, *shape, dtype=dtype, device=meta)
+            for shape, dtype in zip(layout.shapes, layout.dtypes, strict=True)]
+    torch._dynamo.reset()
+    torch.compile(step, backend=record, fullgraph=True)(
+        torch.empty(BLOCKS, PAGE_BYTES, dtype=torch.int8, device=meta),
+        torch.empty(2, dtype=torch.int64, device=meta), *rows)
+    torch._dynamo.reset()
+
+    (graph,) = [gm.graph for gm in seen]
+    pages = next(node for node in graph.nodes if node.op == "placeholder"
+                 and tuple(node.meta["example_value"].shape) == (BLOCKS, PAGE_BYTES))
+    kernels = [node for node in graph.nodes if "nki_kernel_wrapper" in str(node.target)]
+    assert len(kernels) == 1
+    assert kernels[0].kwargs["args"][0] is pages
+    (output,) = [node for node in graph.nodes if node.op == "output"]
+    assert kernels[0] in output.args[0]
+    assert not [node for node in graph.nodes if "view" in str(node.target)
+                and any(isinstance(a, torch.dtype) for a in (*node.args, *node.kwargs.values()))]
 
 
 def test_traced_a_read_is_one_index_select_of_whole_pages(kda_spec):
+    """The carriers are dtype views of the gathered pages, which the device backend
+    refuses when it lowers a graph, so a read runs eager (``read_kda_checkpoints``)."""
     layout = kda_checkpoint_layout(kda_spec)
     pages = kda_checkpoint_pages(_raw(), layout)
 
@@ -433,12 +473,11 @@ def test_a_write_of_rows_of_another_shape_is_refused_by_carrier(kda_spec):
         write_kda_checkpoints(kda_checkpoint_pages(_raw(), layout), _ids(1), rows, layout)
 
 
-def test_block_ids_must_be_an_int64_vector(kda_spec):
+def test_block_ids_must_be_an_int64_or_int32_vector(kda_spec):
     layout = kda_checkpoint_layout(kda_spec)
-    with pytest.raises(ValueError, match="int64"):
+    with pytest.raises(ValueError, match="int64 or int32"):
         write_kda_checkpoints(kda_checkpoint_pages(_raw(), layout),
-                              torch.tensor([1], dtype=torch.int32),
-                              _rows(layout, 1, seed=12), layout)
+                              torch.tensor([1.0]), _rows(layout, 1, seed=12), layout)
 
 
 def test_a_write_with_a_missing_carrier_is_refused(kda_spec):
