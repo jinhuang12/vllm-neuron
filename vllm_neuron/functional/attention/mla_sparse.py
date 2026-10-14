@@ -1684,14 +1684,17 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
 #   columns, so MM2 streams 2 columns per stationary rather than 512 per chunk. The
 #   halves accumulate over the chunks in their own fp32 PSUM columns, and one fp32 add
 #   sums them; p is normalised before MM2. One PE transpose per latent tile puts a
-#   block's output rows back.
+#   block's output rows back. A query's turns, its last reads of its gathered rows, run
+#   before the previous query's matmuls, into the other of two chunk sets, so the
+#   gathered-row buffer that a later query's gather reuses is free one query's matmuls
+#   earlier.
 #
 # A query's values pass the same instructions in the same order whatever its group,
-# so the grouping changes no bit. The arithmetic differs from the fp32 body in the
-# operand precision of MM1 (exact products of the stored 2-byte values, fp32
-# accumulation) and MM2 (hi/lo split of p, about 16 significand bits), in the softmax
-# being taken against the global row maximum rather than merged tile by tile, and in
-# where the normalisation lands.
+# so the grouping changes no bit; nor does the MM2 order (:func:`_lowp_mm2_matmuls`).
+# The arithmetic differs from the fp32 body in the operand precision of MM1 (exact
+# products of the stored 2-byte values, fp32 accumulation) and MM2 (hi/lo split of p,
+# about 16 significand bits), in the softmax being taken against the global row maximum
+# rather than merged tile by tile, and in where the normalisation lands.
 # --------------------------------------------------------------------------- #
 
 
@@ -1808,6 +1811,54 @@ def _lowp_stage_queries(dst, rows, n_latent: int, block: int, dtype):
     nisa.tensor_copy(dst=dst[:, 0:n_latent * block], src=rows_t_ps, engine=nisa.engine.vector)
 
 
+def _lowp_mm2_turns(chunks, c_t, n_chunks: int, n_latent: int, latent: int, dtype):
+    """Put one query's gathered rows ``c_t`` back on the key partitions, one chunk at a time.
+
+    Chunk ``ck`` of the ``n_chunks`` is one PE transpose per latent tile into PSUM, evacuated into
+    ``chunks[ck]`` alternately by the Vector and the Scalar engine. These are the query's
+    last reads of ``c_t``, so its gathered-row buffer is free once they end.
+    """
+    for ck in range(n_chunks):
+        rows_ps = nl.ndarray((KEY_CHUNK, latent), dtype=dtype, buffer=nl.psum)
+        for li in range(n_latent):
+            nisa.nc_transpose(
+                dst=rows_ps[:, li * LATENT_TILE:(li + 1) * LATENT_TILE],
+                data=c_t[:, 0, li, ck * KEY_CHUNK:(ck + 1) * KEY_CHUNK],
+                engine=nisa.engine.tensor)
+        nisa.tensor_copy(dst=chunks[ck], src=rows_ps,
+                         engine=nisa.engine.vector if ck % 2 == 0 else nisa.engine.scalar)
+
+
+def _lowp_mm2_matmuls(out_t, chunks, p_hl, qi: int, r: int, group: int, n_chunks: int,
+                      n_latent: int):
+    """One query's MM2 from its turned chunks: ``out_t[:, li, qi] = sum_k c[k, L] * p[k]``.
+
+    Each latent tile of a chunk is one matmul's stationary, and the query's two p halves
+    (column ``ck * group + r`` of ``p_hl``) are its moving columns. The halves accumulate in
+    two PSUM columns over the chunks, in chunk order; one fp32 add sums them. Each latent
+    tile accumulates in a PSUM tile of its own: on device, matmuls accumulating into
+    different column ranges of one 3D PSUM tile give wrong sums, which the simulator does
+    not show (``reports/mla_sparse.md``).
+
+    The body issues the next query's turns before these matmuls, into the other chunk
+    set, so ``chunks`` keeps this query's rows until its matmuls have read them. That
+    order changes no bit: the matmuls read the same values, each latent tile's
+    accumulation still starts at chunk 0 (``accumulate=False``) and adds the chunks in
+    chunk order, and the add of the two halves is the same.
+    """
+    pv_ps = []
+    for _ in range(n_latent):
+        pv_ps.append(_psum(LATENT_TILE, 2))
+    for ck in range(n_chunks):
+        col = ck * group + r
+        for li in range(n_latent):
+            nisa.nc_matmul(dst=pv_ps[li],
+                           stationary=chunks[ck][:, li * LATENT_TILE:(li + 1) * LATENT_TILE],
+                           moving=p_hl[:, col, 0:2], accumulate=(ck > 0))
+    for li in range(n_latent):
+        nisa.tensor_reduce(dst=out_t[:, li, qi:qi + 1], op=nl.add, data=pv_ps[li], axis=1)
+
+
 def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
                                    QUERY_BUFFERS=QUERY_BUFFERS_DEFAULT):
     """The low-precision streaming body; see the section comment above.
@@ -1872,10 +1923,16 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
     scratch = []
     for _ in range(index_ring):
         scratch.append(_lowp_scratch(n_chunks))
-    # MM2's stationaries, one chunk of keys on partitions at a time.
+    # MM2's stationaries: every chunk of one query's keys on partitions, in two sets by
+    # the query's place in its group, so a query's turns into one set can run while the
+    # query before it still reads the other (the MM2 order below). The two sets hold
+    # 2 * n_chunks * latent 2-byte elements per partition (34 KiB at top-k 2,176).
     c_rows = []
     for _ in range(2):
-        c_rows.append(nl.ndarray((KEY_CHUNK, latent), dtype=c_kv_hbm.dtype, buffer=nl.sbuf))
+        chunks = []
+        for _ in range(n_chunks):
+            chunks.append(nl.ndarray((KEY_CHUNK, latent), dtype=c_kv_hbm.dtype, buffer=nl.sbuf))
+        c_rows.append(chunks)
 
     # ---- the group's softmax rows, one query per partition ------------------------
     # Each [group, K] fp32 tile costs its full row of every partition's address space,
@@ -2027,41 +2084,19 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
                                engine=nisa.engine.vector)
 
             # ---- MM2 per query, latent on partitions: out[L] = sum_k c[k, L] * p[k] -----
-            # Each chunk of the gathered rows is put back on the key partitions by one
-            # PE transpose per latent tile, evacuated alternately by the Vector and the
-            # Scalar engine. Each latent tile of the chunk is then one matmul's
-            # stationary, and the query's two p halves are its moving columns, so a chunk
-            # costs four stationary loads and eight moving columns. The halves
-            # accumulate in two PSUM columns over the chunks; one fp32 add sums them.
-            # Each latent tile accumulates in a PSUM tile of its own: on device, matmuls
-            # accumulating into different column ranges of one 3D PSUM tile give wrong
-            # sums, which the simulator does not show (``reports/mla_sparse.md``).
+            # Query r's turns put its gathered rows back on the key partitions; they are
+            # its last reads of its gathered-row buffer, which the gather `ring` queries
+            # on waits for. Each query after the group's first has its turns before the
+            # previous query's matmuls, so that buffer is free one query's matmuls
+            # earlier. Every sum keeps its order: only the program order changes.
             for r in range(group):
-                qi = g0 + r
-                c_t = rows_t[(n0 + qi) % ring]
-                pv_ps = []
-                for _ in range(n_latent):
-                    pv_ps.append(_psum(LATENT_TILE, 2))
-                for ck in range(n_chunks):
-                    rows_ps = nl.ndarray((KEY_CHUNK, latent), dtype=c_kv_hbm.dtype,
-                                         buffer=nl.psum)
-                    for li in range(n_latent):
-                        nisa.nc_transpose(
-                            dst=rows_ps[:, li * LATENT_TILE:(li + 1) * LATENT_TILE],
-                            data=c_t[:, 0, li, ck * KEY_CHUNK:(ck + 1) * KEY_CHUNK],
-                            engine=nisa.engine.tensor)
-                    chunk = c_rows[ck % 2]
-                    nisa.tensor_copy(dst=chunk, src=rows_ps,
-                                     engine=nisa.engine.vector if ck % 2 == 0
-                                     else nisa.engine.scalar)
-                    col = ck * group + r
-                    for li in range(n_latent):
-                        nisa.nc_matmul(dst=pv_ps[li],
-                                       stationary=chunk[:, li * LATENT_TILE:(li + 1) * LATENT_TILE],
-                                       moving=p_hl[:, col, 0:2], accumulate=(ck > 0))
-                for li in range(n_latent):
-                    nisa.tensor_reduce(dst=out_t[:, li, qi:qi + 1], op=nl.add, data=pv_ps[li],
-                                       axis=1)
+                _lowp_mm2_turns(c_rows[r % 2], rows_t[(n0 + g0 + r) % ring], n_chunks, n_latent,
+                                latent, c_kv_hbm.dtype)
+                if r > 0:
+                    _lowp_mm2_matmuls(out_t, c_rows[(r - 1) % 2], p_hl, g0 + r - 1, r - 1, group,
+                                      n_chunks, n_latent)
+            _lowp_mm2_matmuls(out_t, c_rows[(group - 1) % 2], p_hl, g0 + group - 1, group - 1,
+                              group, n_chunks, n_latent)
 
         # ---- the block's rows: one PE transpose per latent tile, one store -------------
         rows_out_ps = _psum(qpb, latent)
