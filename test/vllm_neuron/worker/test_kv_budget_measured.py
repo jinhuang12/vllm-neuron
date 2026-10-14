@@ -36,6 +36,7 @@ it where they drive the device path.
 from __future__ import annotations
 
 import logging
+import types
 
 import pytest
 
@@ -233,6 +234,66 @@ def test_a_warm_cache_supplies_the_need_from_its_graphs(model_specs, tmp_path) -
     )
     assert graph.bytes == expected.total_bytes
     assert "2 compiled graphs" in graph.source
+
+
+def _fill_shared_cache(root, *, ranks: int, pool_bytes: int) -> None:
+    """Each rank compiles its own prefill and decode graph into one shared cache.
+
+    GLM-5.3-Flash at DCP 2 (form 2) does this: 6 graphs per rank, 322 in the cache
+    after the 64 ranks of two runs had compiled theirs.
+    """
+    for rank in range(ranks):
+        for graph in ("prefill", "decode"):
+            _cache_entry(root, f"{graph}{rank:02d}", kv_bytes=pool_bytes)
+
+
+@pytest.mark.parametrize("ranks", [1, 4])
+def test_a_cache_every_rank_fills_charges_one_ranks_graphs(model_specs, tmp_path, ranks) -> None:
+    worker = _tip_worker(model_specs, graph_cache_dir=tmp_path, expected_graphs=2)
+    pool_bytes = worker._kv_cache_largest_tensor_bytes(worker._kv_cache_need_bytes())
+    _fill_shared_cache(tmp_path, ranks=ranks, pool_bytes=pool_bytes)
+    scan = neff_memory.scan_compile_cache(tmp_path, kv_input_bytes=pool_bytes)
+
+    graph = worker._graph_need(worker._kv_cache_need_bytes())
+
+    one_rank = neff_memory.graph_memory(
+        scan.graphs[:2], page_bytes=neff_memory.scratchpad_page_bytes()
+    )
+    assert len(scan.graphs) == 2 * ranks
+    assert graph.bytes == one_rank.total_bytes
+
+
+def test_the_budget_line_names_the_graphs_charged_and_the_graphs_found(
+    model_specs, tmp_path
+) -> None:
+    worker = _tip_worker(model_specs, graph_cache_dir=tmp_path, expected_graphs=2)
+    pool_bytes = worker._kv_cache_largest_tensor_bytes(worker._kv_cache_need_bytes())
+    _fill_shared_cache(tmp_path, ranks=4, pool_bytes=pool_bytes)
+
+    graph = worker._graph_need(worker._kv_cache_need_bytes())
+
+    assert f"the 2 largest of 8 compiled graphs in {tmp_path}" in graph.source
+    assert "this rank loads 2" in graph.source
+
+
+def test_a_drafter_keeps_the_reserve_on_a_cache_every_rank_fills(model_specs, tmp_path) -> None:
+    """The cache scan cannot tie a drafter's graphs to the configuration: the reserve stands."""
+    from vllm_neuron.vllm.worker.neuron_worker import NeuronWorker
+
+    worker = _tip_worker(model_specs, graph_cache_dir=tmp_path, expected_graphs=2)
+    need_bytes = worker._kv_cache_need_bytes()
+    _fill_shared_cache(
+        tmp_path, ranks=4, pool_bytes=worker._kv_cache_largest_tensor_bytes(need_bytes)
+    )
+    worker.model_runner.drafter = object()
+    worker._graphs_to_load = types.MethodType(NeuronWorker._graphs_to_load, worker)
+
+    graph = worker._graph_need(need_bytes)
+
+    assert graph.bytes == 5 * GIB
+    assert graph.source == (
+        "default 5 GiB reserve: the drafter's graphs are not read from the compile cache"
+    )
 
 
 def test_an_unreadable_cache_assumes_the_reserve(model_specs, tmp_path, monkeypatch) -> None:
