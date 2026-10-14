@@ -87,10 +87,34 @@ the intra-chunk kernel splits the whole tiles between them
 (:func:`intra_chunk_grid`), the inter-chunk kernel the value columns of the
 state (:func:`inter_chunk_grid`).
 
+Gate blocks
+-----------
+The two chunk-local products factorise the gate difference as
+``exp(gc[t]) * exp(-gc[j])`` so that one matmul contracts the channel axis, and
+both factors must stay inside fp32's range (:data:`GATE_CUMSUM_ABS_LIMIT`). The
+limit applies to one gate block of ``S`` tokens, where ``S`` is ``C`` or ``C / 2``
+(the ``gate_block`` of :func:`kda_intra_chunk`). With two blocks, ``gs`` is the
+cumulative gate restarted at each block, and for ``t`` in the second block and
+``j`` in the first::
+
+    exp(gc[t] - gc[j]) = exp(gs[t]) * exp(gs[S - 1] - gs[j])
+
+The second factor gives ``f[j] = k[j] * exp(gs[S - 1] - gs[j])``, which is ``kg``
+at the block width. So the cross block of ``A`` and of ``Aqk`` is one more matmul
+against ``f``, and inside a block the products are the factorised ones at ``gs``.
+For a non-positive gate, which the KDA gate is, every other exponential here
+(``exp(gc)`` in ``w``, ``exp(gc[C - 1] - gc)`` in ``kg`` and both factors of the
+cross block) is at most 1, so only the block's gate sum needs the limit. A chunk
+of two blocks gives half as many chunks, so the inter-chunk half's chain of
+dependent steps is half as long.
+
 Four ``[C, C]`` constants are built on the host by :func:`chunk_constants` and
 passed in as tensors: the upper-inclusive ones matrix that turns the cumulative
 sum into a matmul, the identity that seeds the doubling series, the strictly
-lower mask, and a row selector that broadcasts the chunk's last gate row. Passing
+lower mask, and a row selector that broadcasts the chunk's last gate row. A chunk
+of two gate blocks also takes three of them at the block width: the ones matrix,
+the strictly lower mask and the row selector, which restart the gate at each
+block, mask the in-block products and select each block's last gate row. Passing
 masks in follows ``nkilib``'s own convention -- its ``ssd`` asserts a
 non-``None`` ``causal_mask`` rather than building one -- and these are 0/1
 constants, not numerics.
@@ -146,15 +170,18 @@ FP32_LOG_MAX = math.log(torch.finfo(torch.float32).max)
 #: a sum of ``MAX_TILE`` terms of the larger factor finite.
 GATE_EXPONENT_MARGIN = math.log(MAX_TILE)
 
-#: Largest ``|gc|`` this kernel accepts, where ``gc`` is the inclusive cumulative
-#: gate. The two chunk-local products are formed as ``exp(gc[t]) * exp(-gc[j])``
-#: so that one matmul contracts the channel axis. That factorisation is exact, but
-#: it evaluates both signs of the exponent, so a cumulative gate far from zero
-#: takes one factor out of fp32's range even where the product itself is moderate.
-#: The limit is the narrower side of that range less ``GATE_EXPONENT_MARGIN``,
-#: about 82.48. Upstream keeps the same quantity small differently, by blocking to
-#: 16 or 64 and re-referencing the gate per block; this kernel does not tile, so
-#: the limit is checked instead.
+#: Largest ``|gc|`` the intra-chunk kernel accepts, where ``gc`` is the inclusive
+#: cumulative gate over one gate block (module docstring, Gate blocks). The two
+#: chunk-local products are formed as ``exp(gc[t]) * exp(-gc[j])`` so that one
+#: matmul contracts the channel axis. That factorisation is exact, but it evaluates
+#: both signs of the exponent, so a cumulative gate far from zero takes one factor
+#: out of fp32's range even where the product itself is moderate. The limit is the
+#: narrower side of that range less ``GATE_EXPONENT_MARGIN``, about 82.48. Upstream
+#: keeps the same quantity small by blocking to 16 or 64 tokens and re-referencing
+#: the gate per block; this kernel re-references it at most once per chunk, at the
+#: gate block, and checks the limit on one block's sum. The inter-chunk kernel
+#: exponentiates the cumulative gate with one sign only, so it checks the limit on
+#: the largest value rather than on the size.
 GATE_CUMSUM_ABS_LIMIT = min(-FP32_LOG_TINY, FP32_LOG_MAX) - GATE_EXPONENT_MARGIN
 
 #: Physical cores behind one logical core on an LNC2 runtime, and so the programs
@@ -499,6 +526,60 @@ def _emit_intra_layout(triu_hbm, eye_hbm, mask_lower_hbm, last_row_hbm, rows, ch
     return _IntraLayout(triu, neg_mask_lower, causal, last_row, same, eye_packed)
 
 
+@dataclass(frozen=True)
+class _GateBlockLayout(nl.NKIObject):
+    """The gate-block constants of one packed tile, for a chunk of two gate blocks.
+
+    ``triu`` restarts the cumulative gate at every block, and ``last_row`` selects
+    every block's last gate row. ``neg_mask_lower`` and ``causal`` mask ``N`` and
+    ``Aqk`` inside a block. ``cross`` is 1 where ``t`` is in a chunk's second block
+    and ``j`` in its first, and ``neg_cross`` is ``-cross`` (module docstring, Gate
+    blocks).
+    """
+
+    triu: object
+    last_row: object
+    neg_mask_lower: object
+    causal: object
+    cross: object
+    neg_cross: object
+
+
+def _emit_gate_block_layout(
+    triu_hbm, mask_lower_hbm, last_row_hbm, chunk_layout, rows, block
+):
+    """:class:`_GateBlockLayout` from the three ``[S, S]`` constants of the block width.
+
+    Two tokens of one chunk are either in one block or in the cross block. So
+    ``neg_cross`` is ``chunk_layout``'s ``neg_mask_lower`` less the blocks', and the
+    blocks' ``causal`` is ``chunk_layout``'s less ``cross``: 0/1 arithmetic, exact.
+    """
+    same = _emit_same_chunk(rows, block)
+    rep = _emit_replicator(rows, block)
+    block_rows = _emit_chunk_rows(
+        (triu_hbm, mask_lower_hbm, last_row_hbm), rep, rows, block, nisa.engine.sync
+    )
+    triu = _emit_block_diagonal(block_rows, 0, same, rows, block)
+    mask_lower = _emit_block_diagonal(block_rows, 1, same, rows, block)
+    last_row = _emit_block_diagonal(block_rows, 2, same, rows, block)
+    neg_mask_lower = _sbuf(rows, rows)
+    nisa.tensor_scalar(
+        dst=neg_mask_lower, data=mask_lower, op0=nl.multiply, operand0=-1.0
+    )
+    neg_cross = _sbuf(rows, rows)
+    nisa.tensor_tensor(
+        dst=neg_cross, data1=chunk_layout.neg_mask_lower, data2=neg_mask_lower,
+        op=nl.subtract,
+    )
+    cross = _sbuf(rows, rows)
+    nisa.tensor_scalar(dst=cross, data=neg_cross, op0=nl.multiply, operand0=-1.0)
+    causal = _sbuf(rows, rows)
+    nisa.tensor_tensor(
+        dst=causal, data1=chunk_layout.causal, data2=cross, op=nl.subtract
+    )
+    return _GateBlockLayout(triu, last_row, neg_mask_lower, causal, cross, neg_cross)
+
+
 def _emit_unit_lower_inverse(dst, n_bd, eye_packed, rows, chunk):
     """``dst = (I - N)**-1 = (I + A)**-1`` in the packed layout, by doubling.
 
@@ -728,7 +809,8 @@ def _store_tiles(tensor_rows, src3, r0, n_tiles, rows, width, engine):
 @nki.jit
 def kda_intra_chunk_kernel(
     q_hbm, k_hbm, v_hbm, beta_hbm, gk_hbm, triu_hbm, eye_hbm, mask_lower_hbm,
-    last_row_hbm,
+    last_row_hbm, block_triu_hbm=None, block_mask_lower_hbm=None,
+    block_last_row_hbm=None,
 ):
     """Stages 1 to 3 for every chunk, in one dispatch.
 
@@ -736,6 +818,11 @@ def kda_intra_chunk_kernel(
     is ``[NC, C, 1]``; the four constants are ``[C, C]``; all float32. Returns
     ``w [NC, C, K]``, ``u [NC, C, V]``, ``kg [NC, C, K]``, ``a_inv [NC, C, C]`` and
     ``aqk [NC, C, C]``, float32.
+
+    The three ``block_*`` constants are :func:`chunk_constants`'s ``triu_ones``,
+    ``mask_lower`` and ``last_row`` at the gate block width ``S = C / 2``, for a
+    chunk of two gate blocks (module docstring, Gate blocks), or all ``None`` for a
+    chunk of one.
 
     Tokens are packed ``MAX_TILE // C`` chunks to a tile (:func:`tile_rows`), and
     every chunk-local ``[C, C]`` product of the tile is a diagonal block of one
@@ -750,6 +837,14 @@ def kda_intra_chunk_kernel(
     scale = float(kdim) ** -0.5
     rows = n_chunks * chunk
     layout_rows = min(tile_rows(chunk), rows)
+    blocked = block_triu_hbm is not None
+    # The NKI front end admits ``assert`` and no ``raise``.
+    assert blocked == (block_mask_lower_hbm is not None) == (
+        block_last_row_hbm is not None
+    ), "the three gate-block constants come together"
+    assert not blocked or 2 * block_triu_hbm.shape[0] == chunk, (
+        "a chunk of gate blocks holds exactly two"
+    )
 
     w_hbm = nl.ndarray((n_chunks, chunk, kdim), dtype=nl.float32, buffer=nl.shared_hbm)
     u_hbm = nl.ndarray((n_chunks, chunk, vdim), dtype=nl.float32, buffer=nl.shared_hbm)
@@ -768,21 +863,28 @@ def kda_intra_chunk_kernel(
     layout = _emit_intra_layout(
         triu_hbm, eye_hbm, mask_lower_hbm, last_row_hbm, layout_rows, chunk
     )
+    block = None
+    if blocked:
+        block = _emit_gate_block_layout(
+            block_triu_hbm, block_mask_lower_hbm, block_last_row_hbm, layout,
+            layout_rows, block_triu_hbm.shape[0],
+        )
     per_prog, first, tail = _program_tiles(rows, layout_rows)
     if per_prog:
         _emit_intra_tiles(
-            sinks, sources, layout, first * layout_rows, per_prog, layout_rows,
-            chunk, kdim, vdim, scale,
+            sinks, sources, layout, block, first * layout_rows, per_prog,
+            layout_rows, chunk, kdim, vdim, scale,
         )
     if tail:
         _emit_intra_tiles(
-            sinks, sources, layout, rows - tail, 1, tail, chunk, kdim, vdim, scale
+            sinks, sources, layout, block, rows - tail, 1, tail, chunk, kdim, vdim,
+            scale,
         )
     return w_hbm, u_hbm, kg_hbm, ainv_hbm, aqk_hbm
 
 
 def _emit_intra_tiles(
-    sinks, sources, layout, r0, n_tiles, rows, chunk, kdim, vdim, scale
+    sinks, sources, layout, block, r0, n_tiles, rows, chunk, kdim, vdim, scale
 ):
     """Stages 1 to 3 for ``n_tiles`` packed tiles of ``rows`` rows from row ``r0``.
 
@@ -791,6 +893,10 @@ def _emit_intra_tiles(
     products run per tile, so one tile's products overlap the next one's
     elementwise steps. The normalisation's reciprocal root runs before every
     exponential, so the Scalar engine switches activation tables once.
+
+    ``block`` is the :class:`_GateBlockLayout` of a chunk of two gate blocks, or
+    ``None``; with ``None`` the gate blocks are the chunks, and the program is the
+    one-block program unchanged.
     """
     q_rows, k_rows, v_rows, beta_rows, gk_rows = sources
     w_rows, u_rows, kg_rows, ainv_rows, aqk_rows = sinks
@@ -817,12 +923,26 @@ def _emit_intra_tiles(
     # contracts the channel axis: exp(gc[t]) on the left rows, exp(-gc[j]) on
     # the right rows. GATE_CUMSUM_ABS_LIMIT is what bounds both factors, and
     # pairs from different chunks are bounded the same way before the mask
-    # zeroes them.
+    # zeroes them. With gate blocks the factorised gate ``gs`` restarts at every
+    # block, the cross block reads ``f``, and ``w`` and ``kg`` read the chunk's
+    # own ``gc`` (module docstring, Gate blocks).
     gc_sb = _sbuf(rows, wk)
     egc_sb = _sbuf(rows, wk)
-    emgc_sb = _sbuf(rows, wk)
-    _emit_gate_terms(gc_sb, ((egc_sb, 1.0), (emgc_sb, -1.0)), gk_sb,
-                     layout.triu[0:rows, 0:rows], rows, wk)
+    if block is None:
+        gs_sb, egs_sb, in_block = gc_sb, egc_sb, layout
+        emgs_sb = _sbuf(rows, wk)
+        _emit_gate_terms(gc_sb, ((egc_sb, 1.0), (emgs_sb, -1.0)), gk_sb,
+                         layout.triu[0:rows, 0:rows], rows, wk)
+    else:
+        gs_sb, egs_sb, emgs_sb, in_block = (
+            _sbuf(rows, wk), _sbuf(rows, wk), _sbuf(rows, wk), block
+        )
+        _emit_gate_terms(gs_sb, ((egs_sb, 1.0), (emgs_sb, -1.0)), gk_sb,
+                         block.triu[0:rows, 0:rows], rows, wk)
+        _emit_gate_terms(gc_sb, ((egc_sb, 1.0),), gk_sb, layout.triu[0:rows, 0:rows],
+                         rows, wk)
+        f_sb = _sbuf(rows, wk)
+        _emit_kg(f_sb, k_sb, gs_sb, block.last_row, rows, wk)
 
     ainv_sb = _sbuf(rows, n_tiles * chunk)
     aqk_sb = _sbuf(rows, n_tiles * chunk)
@@ -832,14 +952,15 @@ def _emit_intra_tiles(
         c0 = t * chunk
         k_t = k_sb[0:rows, k0 : k0 + kdim]
         egc_t = egc_sb[0:rows, k0 : k0 + kdim]
+        egs_t = egs_sb[0:rows, k0 : k0 + kdim]
         beta_col = beta_sb[0:rows, t : t + 1]
         kp_sb = _sbuf(rows, kdim)
         km_sb = _sbuf(rows, kdim)
         qp_sb = _sbuf(rows, kdim)
-        nisa.tensor_tensor(dst=kp_sb, data1=k_t, data2=egc_t, op=nl.multiply)
-        nisa.tensor_tensor(dst=km_sb, data1=k_t, data2=emgc_sb[0:rows, k0 : k0 + kdim],
+        nisa.tensor_tensor(dst=kp_sb, data1=k_t, data2=egs_t, op=nl.multiply)
+        nisa.tensor_tensor(dst=km_sb, data1=k_t, data2=emgs_sb[0:rows, k0 : k0 + kdim],
                            op=nl.multiply)
-        nisa.tensor_tensor(dst=qp_sb, data1=q_sb[0:rows, k0 : k0 + kdim], data2=egc_t,
+        nisa.tensor_tensor(dst=qp_sb, data1=q_sb[0:rows, k0 : k0 + kdim], data2=egs_t,
                            op=nl.multiply)
         km_t = _sbuf(kdim, rows)
         kp_t = _sbuf(kdim, rows)
@@ -854,15 +975,45 @@ def _emit_intra_tiles(
         n_bd = _sbuf(rows, rows)
         nisa.scalar_tensor_tensor(
             dst=n_bd, data=ps_kk, op0=nl.multiply, operand0=beta_col,
-            op1=nl.multiply, operand1=layout.neg_mask_lower[0:rows, 0:rows],
+            op1=nl.multiply, operand1=in_block.neg_mask_lower[0:rows, 0:rows],
         )
+        if block is not None:
+            # The cross block: N += -(beta * kp f^T) * cross.
+            f_t = _sbuf(kdim, rows)
+            _emit_transpose(f_t, f_sb[0:rows, k0 : k0 + kdim], rows, kdim)
+            ps_kf = _psum(rows, rows)
+            nisa.nc_matmul(dst=ps_kf, stationary=kp_t, moving=f_t, accumulate=False)
+            n_cross = _sbuf(rows, rows)
+            nisa.tensor_tensor(
+                dst=n_cross, data1=ps_kf, data2=block.neg_cross[0:rows, 0:rows],
+                op=nl.multiply,
+            )
+            n_all = _sbuf(rows, rows)
+            nisa.scalar_tensor_tensor(
+                dst=n_all, data=n_cross, op0=nl.multiply, operand0=beta_col,
+                op1=nl.add, operand1=n_bd,
+            )
+            n_bd = n_all
 
         ps_qk = _psum(rows, rows)
         nisa.nc_matmul(dst=ps_qk, stationary=qp_t, moving=km_t, accumulate=False)
         aqk_bd = _sbuf(rows, rows)
         nisa.tensor_tensor(
-            dst=aqk_bd, data1=ps_qk, data2=layout.causal[0:rows, 0:rows], op=nl.multiply
+            dst=aqk_bd, data1=ps_qk, data2=in_block.causal[0:rows, 0:rows],
+            op=nl.multiply,
         )
+        if block is not None:
+            # The cross block: Aqk += (qp f^T) * cross.
+            ps_qf = _psum(rows, rows)
+            nisa.nc_matmul(dst=ps_qf, stationary=qp_t, moving=f_t, accumulate=False)
+            aqk_cross = _sbuf(rows, rows)
+            nisa.tensor_tensor(
+                dst=aqk_cross, data1=ps_qf, data2=block.cross[0:rows, 0:rows],
+                op=nl.multiply,
+            )
+            aqk_all = _sbuf(rows, rows)
+            nisa.tensor_tensor(dst=aqk_all, data1=aqk_bd, data2=aqk_cross, op=nl.add)
+            aqk_bd = aqk_all
         _emit_pack(aqk_sb[0:rows, c0 : c0 + chunk], aqk_bd, rows, chunk)
         a_inv_t = ainv_sb[0:rows, c0 : c0 + chunk]
         _emit_unit_lower_inverse(a_inv_t, n_bd, layout.eye_packed, rows, chunk)
@@ -976,9 +1127,21 @@ def kda_stage3_kernel(
 
 
 def _require_admissible(
-    n_chunks: int, chunk: int, kdim: int, vdim: int, gate_abs_max: float
+    n_chunks: int,
+    chunk: int,
+    kdim: int,
+    vdim: int,
+    gate_abs_max: float,
+    gate_block: int | None = None,
+    gate_max: float = 0.0,
 ) -> None:
-    """Raise unless this kernel serves the input, naming every cause at once."""
+    """Raise unless this kernel serves the input, naming every cause at once.
+
+    ``gate_abs_max`` is the largest ``|gc|`` over one gate block of ``gate_block``
+    tokens (``chunk`` when ``None``), and ``gate_max`` the largest gate; the module
+    docstring's Gate blocks says why a chunk of two blocks needs both.
+    """
+    block = chunk if gate_block is None else gate_block
     problems: list[str] = []
     if n_chunks < 1:
         problems.append(f"n_chunks={n_chunks} must be at least 1")
@@ -1001,12 +1164,24 @@ def _require_admissible(
         problems.append(
             f"vdim={vdim} must be in [1, {MAX_TILE}]; it is one matmul operand width"
         )
+    if block != chunk and (block < 2 or 2 * block != chunk):
+        problems.append(
+            f"gate_block={block} must be chunk={chunk} or half of it, and at least "
+            f"2; the products re-reference the gate at most once per chunk"
+        )
     if gate_abs_max > GATE_CUMSUM_ABS_LIMIT:
         problems.append(
             f"max|cumulative gate|={gate_abs_max:.3f} exceeds "
             f"{GATE_CUMSUM_ABS_LIMIT}; the chunk-local products factorise the gate "
-            f"difference as exp(gc[t]) * exp(-gc[j]), so a cumulative gate this "
-            f"far from zero would overflow fp32 in the larger factor"
+            f"difference over one gate block as exp(gc[t]) * exp(-gc[j]), so a "
+            f"cumulative gate this far from zero would overflow fp32 in the larger "
+            f"factor"
+        )
+    if block != chunk and gate_max > 0:
+        problems.append(
+            f"max gate={gate_max:.3f} is above 0; a chunk of two gate blocks "
+            f"exponentiates gate sums over the whole chunk, which stay at most 0, "
+            f"and so inside fp32, only for a non-positive gate"
         )
     if problems:
         raise ChunkedRecurrenceError(
@@ -1038,19 +1213,29 @@ def can_run_intra_chunk(
     kdim: int,
     vdim: int,
     gate_abs_max: float,
+    gate_block: int | None = None,
+    gate_max: float = 0.0,
 ) -> bool:
     """Is the NKI path available *and* admissible for this input?
 
     Two independent conditions: ``can_run_kernel`` answers whether a device or
     simulator exists, :func:`_require_admissible` whether this kernel accepts
-    these extents and this gate range.
+    these extents, this gate block and this gate range.
     """
-    _require_admissible(n_chunks, chunk, kdim, vdim, gate_abs_max)
+    _require_admissible(
+        n_chunks, chunk, kdim, vdim, gate_abs_max, gate_block, gate_max
+    )
     return can_run_kernel(reference)
 
 
 def kda_intra_chunk(
-    q: Tensor, k: Tensor, v: Tensor, beta: Tensor, gk: Tensor
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    beta: Tensor,
+    gk: Tensor,
+    *,
+    gate_block: int | None = None,
 ) -> IntraChunkOutputs:
     """Stages 1 to 3 over every chunk, in one kernel dispatch.
 
@@ -1059,6 +1244,9 @@ def kda_intra_chunk(
             not yet accumulated; the kernel forms the cumulative sum.
         v: ``[NC, C, V]`` fp32.
         beta: ``[NC, C]`` fp32, one scalar per token.
+        gate_block: the tokens of one gate block, ``C`` or ``C / 2`` (module
+            docstring, Gate blocks); ``None`` is ``C``. The gate limit applies to
+            one block's gate sum, and ``C / 2`` also needs a non-positive gate.
 
     Returns:
         :class:`IntraChunkOutputs`.
@@ -1097,12 +1285,16 @@ def kda_intra_chunk(
     # gate values. A traced or meta-built call has none to read and passes 0.0,
     # which is inside the limit and refuses nothing. Only `can_run_kernel` decides
     # the path, so a graph build loses the diagnostic message and nothing else.
-    gate_abs_max = (
-        float(gk.float().cumsum(dim=1).abs().max().item())
-        if values_are_readable(gk)
-        else 0.0
-    )
-    if not can_run_intra_chunk(q, n_chunks, chunk, kdim, vdim, gate_abs_max):
+    block = chunk if gate_block is None else int(gate_block)
+    gate_abs_max = gate_max = 0.0
+    if values_are_readable(gk) and block >= 1 and chunk % block == 0:
+        blocks = gk.float().reshape(n_chunks, chunk // block, block, kdim)
+        gate_abs_max = float(blocks.cumsum(dim=2).abs().max().item())
+        if block != chunk:
+            gate_max = float(gk.max().item())
+    if not can_run_intra_chunk(
+        q, n_chunks, chunk, kdim, vdim, gate_abs_max, block, gate_max
+    ):
         _count_torch_fallback()
         logger.debug(
             "kda_intra_chunk: NKI route unavailable, using the torch path "
@@ -1111,6 +1303,15 @@ def kda_intra_chunk(
         return kda_intra_chunk_torch_oracle(q, k, v, beta, gk)
 
     consts = chunk_constants(chunk, device=q.device, dtype=q.dtype)
+    # One gate block passes no block operands, so that call is the one-block call.
+    blocked = {}
+    if block != chunk:
+        block_consts = chunk_constants(block, device=q.device, dtype=q.dtype)
+        blocked = {
+            "block_triu_hbm": block_consts.triu_ones,
+            "block_mask_lower_hbm": block_consts.mask_lower,
+            "block_last_row_hbm": block_consts.last_row,
+        }
     _count_nki_dispatch()
     call = wrap_nki(kda_intra_chunk_kernel)
     grid = intra_chunk_grid(n_chunks, chunk)
@@ -1126,6 +1327,7 @@ def kda_intra_chunk(
         eye_hbm=consts.eye,
         mask_lower_hbm=consts.mask_lower,
         last_row_hbm=consts.last_row,
+        **blocked,
     )
     return IntraChunkOutputs(w=w, u=u, kg=kg, a_inv=a_inv, aqk=aqk)
 
@@ -1137,10 +1339,11 @@ def kda_intra_chunk_torch_oracle(
 
     Not mirroring the kernel is the point, so three differences are deliberate:
 
-    * the gate difference is evaluated directly as ``exp(gc[t] - gc[j])``, where
-      the kernel factorises it into ``exp(gc[t]) * exp(-gc[j])`` so one matmul can
-      contract the channel axis. That makes this the better-conditioned of the
-      two, which is what :data:`GATE_CUMSUM_ABS_LIMIT` keeps honest;
+    * the gate difference is evaluated directly as ``exp(gc[t] - gc[j])`` over the
+      whole chunk (:func:`_causal_gate_decay`), where the kernel factorises it into
+      ``exp(gc[t]) * exp(-gc[j])`` over one gate block so one matmul can contract
+      the channel axis. That makes this the better-conditioned of the two, which
+      is what :data:`GATE_CUMSUM_ABS_LIMIT` keeps honest;
     * the inverse comes from ``torch.linalg.solve_triangular``, forward
       substitution, where the kernel sums a terminating Neumann series by
       doubling;
@@ -1156,8 +1359,8 @@ def kda_intra_chunk_torch_oracle(
     qn = qn * (float(kdim) ** -0.5)
 
     gc = gk32.cumsum(dim=1)
-    # decay[n, t, j, c] = exp(gc[n, t, c] - gc[n, j, c]) -- formed directly.
-    decay = torch.exp(gc.unsqueeze(2) - gc.unsqueeze(1))
+    # decay[n, t, j, c] = exp(gc[n, t, c] - gc[n, j, c]) for t >= j -- formed directly.
+    decay = _causal_gate_decay(gc)
 
     idx = torch.arange(chunk, device=q32.device)
     strictly_lower = (idx.unsqueeze(0) < idx.unsqueeze(1)).to(q32.dtype)
@@ -1179,6 +1382,20 @@ def kda_intra_chunk_torch_oracle(
     return IntraChunkOutputs(w=w, u=u, kg=kg, a_inv=a_inv, aqk=aqk)
 
 
+def _causal_gate_decay(gc: Tensor) -> Tensor:
+    """``exp(gc[t] - gc[j])`` for ``t >= j`` and 0 above the diagonal.
+
+    ``gc`` is ``[NC, C, K]``; returns ``[NC, C, C, K]``. The exponent is masked
+    before it is exponentiated: above the diagonal it is a gate sum with the sign
+    reversed, which a wide chunk takes out of fp32's range, and an infinite
+    entry would turn the mask's zero into NaN.
+    """
+    idx = torch.arange(gc.shape[1], device=gc.device)
+    above = (idx.unsqueeze(0) > idx.unsqueeze(1)).unsqueeze(-1)
+    diff = gc.unsqueeze(2) - gc.unsqueeze(1)
+    return torch.exp(diff.masked_fill(above, float("-inf")))
+
+
 def rebuild_i_plus_a(k: Tensor, beta: Tensor, gk: Tensor) -> Tensor:
     """``I + A`` from the same inputs, for checking an inverse.
 
@@ -1190,7 +1407,7 @@ def rebuild_i_plus_a(k: Tensor, beta: Tensor, gk: Tensor) -> Tensor:
     _, chunk, _ = k32.shape
     kn = k32 / torch.sqrt((k32 * k32).sum(-1, keepdim=True) + L2_NORM_EPS)
     gc = gk32.cumsum(dim=1)
-    decay = torch.exp(gc.unsqueeze(2) - gc.unsqueeze(1))
+    decay = _causal_gate_decay(gc)
     idx = torch.arange(chunk, device=k32.device)
     strictly_lower = (idx.unsqueeze(0) < idx.unsqueeze(1)).to(k32.dtype)
     kk = (kn.unsqueeze(2) * kn.unsqueeze(1) * decay).sum(-1)
@@ -1573,7 +1790,7 @@ def kda_inter_chunk_kernel(
 
 
 def _require_inter_admissible(
-    n_chunks: int, chunk: int, kdim: int, vdim: int, gate_abs_max: float
+    n_chunks: int, chunk: int, kdim: int, vdim: int, gate_peak: float
 ) -> None:
     """Raise unless the inter-chunk kernel serves the input.
 
@@ -1581,10 +1798,12 @@ def _require_inter_admissible(
     power of two: that requirement comes from the doubling series, and this kernel
     sums no series.
 
-    ``gate_abs_max`` is the largest absolute chunk-local cumulative gate, so the
-    bound applies to one chunk's gate sum and not to the whole sequence's. See
+    ``gate_peak`` is the largest chunk-local cumulative gate, signed, so the bound
+    applies to one chunk's gate sum and not to the whole sequence's. See
     :func:`kda_inter_chunk` for why that distinction keeps the state carry inside
-    fp32.
+    fp32. The size of a negative sum is not bounded: this kernel exponentiates the
+    cumulative gate with one sign only, and a negative exponent goes toward zero,
+    which is the value it approximates.
     """
     problems: list[str] = []
     if n_chunks < 1:
@@ -1604,12 +1823,12 @@ def _require_inter_admissible(
             f"vdim={vdim} must be in [1, {MAX_TILE}]; it is the carried state's "
             f"free extent"
         )
-    if gate_abs_max > GATE_CUMSUM_ABS_LIMIT:
+    if gate_peak > GATE_CUMSUM_ABS_LIMIT:
         problems.append(
-            f"max|chunk-local cumulative gate|={gate_abs_max:.3f} exceeds "
+            f"max chunk-local cumulative gate={gate_peak:.3f} exceeds "
             f"{GATE_CUMSUM_ABS_LIMIT}; the state decay and the output gate are "
             f"both exp of that quantity, so a chunk-local cumulative gate this "
-            f"far from zero would overflow fp32"
+            f"far above zero would overflow fp32"
         )
     if problems:
         raise ChunkedRecurrenceError(
@@ -1635,7 +1854,7 @@ def can_run_inter_chunk(
     chunk: int,
     kdim: int,
     vdim: int,
-    gate_abs_max: float,
+    gate_peak: float,
 ) -> bool:
     """Is the NKI path available *and* admissible for this inter-chunk input?
 
@@ -1643,7 +1862,7 @@ def can_run_inter_chunk(
     simulator exists, :func:`_require_inter_admissible` whether this kernel
     accepts these extents and this gate range.
     """
-    _require_inter_admissible(n_chunks, chunk, kdim, vdim, gate_abs_max)
+    _require_inter_admissible(n_chunks, chunk, kdim, vdim, gate_peak)
     return can_run_kernel(reference)
 
 
@@ -1689,7 +1908,8 @@ def kda_inter_chunk(
     decays by ``exp(gc[C - 1])`` where ``gc`` is re-referenced from zero inside
     every chunk, which is upstream's own convention, so the exponent is bounded by
     one chunk's gate sum however long the sequence is, and
-    :data:`GATE_CUMSUM_ABS_LIMIT` is checked against exactly that quantity.
+    :data:`GATE_CUMSUM_ABS_LIMIT` is checked against exactly that quantity's
+    largest value (:func:`_require_inter_admissible`).
     """
     ranks = (
         ("kg", kg, 3), ("w", w, 3), ("u", u, 3), ("gk", gk, 3), ("q", q, 3),
@@ -1738,12 +1958,12 @@ def kda_inter_chunk(
 
     # Read on an eager call and 0.0 under a graph build, for the reason
     # `kda_intra_chunk` gives above.
-    gate_abs_max = (
-        float(gk.float().cumsum(dim=1).abs().max().item())
+    gate_peak = (
+        float(gk.float().cumsum(dim=1).max().item())
         if values_are_readable(gk)
         else 0.0
     )
-    if not can_run_inter_chunk(q, n_chunks, chunk, kdim, vdim, gate_abs_max):
+    if not can_run_inter_chunk(q, n_chunks, chunk, kdim, vdim, gate_peak):
         _count_inter_torch_fallback()
         logger.debug(
             "kda_inter_chunk: NKI route unavailable, using the torch path "

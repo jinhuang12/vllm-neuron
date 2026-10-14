@@ -3580,23 +3580,42 @@ class Glm5NextKDAAttention(nn.Module):
 
         ``NeuronConfig.kda_state_chunk_size`` is a dial whose ``None`` means "let
         the layer choose", so this is where the layer chooses. The choice is
-        derived from the two declared bounds it has to satisfy rather than picked:
-        the intra-chunk kernel needs a power of two in ``[2, 128]``, and both
-        chunked kernels refuse a chunk-local cumulative gate above
-        ``GATE_CUMSUM_ABS_LIMIT``. The gate this layer produces lies in
-        ``[gate_lower_bound, 0]``, so one chunk's cumulative gate cannot exceed
-        ``chunk * |gate_lower_bound|`` -- and the largest power of two that keeps
-        that product inside the limit is the widest chunk that cannot be refused
-        for gate range at any input.
+        derived from the declared bounds it has to satisfy rather than picked: the
+        intra-chunk kernel needs a power of two in ``[2, 128]`` made of one or two
+        gate blocks, and refuses a cumulative gate over one block above
+        ``GATE_CUMSUM_ABS_LIMIT`` (:meth:`_widest_gate_block`). So two of the
+        widest blocks, at most ``MAX_TILE``, are the widest chunk that cannot be
+        refused for gate range at any input. Two blocks rather than one halve the
+        inter-chunk kernel's chain of dependent steps.
+        """
+        from vllm_neuron.functional.kda.chunked_recurrence import MAX_TILE
+
+        requested = chunk_size if chunk_size is not None else self.cache_chunk_size
+        if requested is not None:
+            return int(requested)
+        return min(2 * self._widest_gate_block(), MAX_TILE)
+
+    def _resolve_gate_block(self, chunk: int) -> int:
+        """The gate block the intra-chunk kernel factorises the gate over, for ``chunk``.
+
+        ``chunk`` itself when no input can refuse it for gate range, else half of
+        it: the kernel takes a chunk of one gate block or of two
+        (``kda_intra_chunk``'s ``gate_block``).
+        """
+        return chunk if chunk <= self._widest_gate_block() else chunk // 2
+
+    def _widest_gate_block(self) -> int:
+        """The widest gate block that cannot be refused for gate range at any input.
+
+        The gate this layer produces lies in ``[gate_lower_bound, 0]``, so one
+        block's cumulative gate cannot exceed ``block * |gate_lower_bound|``, and
+        the largest power of two that keeps that product inside
+        ``GATE_CUMSUM_ABS_LIMIT`` is the widest block.
         """
         from vllm_neuron.functional.kda.chunked_recurrence import (
             GATE_CUMSUM_ABS_LIMIT,
             MAX_TILE,
         )
-
-        requested = chunk_size if chunk_size is not None else self.cache_chunk_size
-        if requested is not None:
-            return int(requested)
 
         bound = abs(self.gate_lower_bound)
         widest = 2
@@ -4059,6 +4078,7 @@ class Glm5NextKDAAttention(nn.Module):
 
         # --- 3 to 5: the recurrence, per head --------------------------------
         chunk = self._resolve_chunk_size(chunk_size)
+        gate_block = self._resolve_gate_block(chunk)
         n_chunks = tokens // chunk if is_prefill else 0
         chunked = n_chunks * chunk
         # An allocation on the traced path follows the activation it is combined
@@ -4094,6 +4114,7 @@ class Glm5NextKDAAttention(nn.Module):
                     v_h[:chunked].reshape(shape).contiguous(),
                     beta_h[:chunked].reshape(n_chunks, chunk).contiguous(),
                     gk_h[:chunked].reshape(shape).contiguous(),
+                    gate_block=gate_block,
                 )
                 inter = kda_inter_chunk(
                     intra.kg,

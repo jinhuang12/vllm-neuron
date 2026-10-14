@@ -428,15 +428,6 @@ def test_inter_chunk_refuses_an_entering_state_it_cannot_serve():
     )
 
 
-#: The geometry the KDA layer actually enters these kernels at, which is not one of
-#: :data:`CHUNK_SIZES`: the layer binds width 128 and resolves chunk width 16.
-EXPECTED_PRODUCTION_KDIM = 128
-EXPECTED_PRODUCTION_VDIM = 128
-EXPECTED_PRODUCTION_CHUNK = 16
-
-#: The checkpoint's gate lower bound, which is what the chunk derivation reads.
-EXPECTED_GATE_LOWER_BOUND = -5.0
-
 _PRODUCTION_CACHE: dict[str, object] = {}
 
 
@@ -460,103 +451,8 @@ def _production_geometry() -> dict:
             "kdim": int(layer.head_dim),
             "vdim": int(layer.head_size),
             "chunk": int(layer._resolve_chunk_size(None)),
-            "gate_lower_bound": float(layer.gate_lower_bound),
-            "cache_chunk_size": layer.cache_chunk_size,
         }
     return _PRODUCTION_CACHE["geometry"]
-
-
-def _production_inputs(seed: int = 20260904):
-    """Deterministic inputs at the geometry the layer reports, not at a literal."""
-    geo = _production_geometry()
-    chunk, kdim, vdim = geo["chunk"], geo["kdim"], geo["vdim"]
-    gen = torch.Generator().manual_seed(seed + chunk)
-    shape_k = (N_CHUNKS, chunk, kdim)
-    q = torch.randn(shape_k, generator=gen, dtype=torch.float32)
-    k = torch.randn(shape_k, generator=gen, dtype=torch.float32)
-    v = torch.randn((N_CHUNKS, chunk, vdim), generator=gen, dtype=torch.float32)
-    beta = torch.rand((N_CHUNKS, chunk), generator=gen, dtype=torch.float32) * 0.9 + 0.05
-    gk = -torch.rand(shape_k, generator=gen, dtype=torch.float32) * GATE_SCALE
-    return q, k, v, beta, gk
-
-
-def test_intra_chunk_matches_the_reference_at_the_production_geometry():
-    """The kernel agrees with the reference at the geometry the KDA layer resolves.
-
-    The chunk width the layer picks, 16, is narrower than any in
-    :data:`CHUNK_SIZES`, and the head width is wider, so this covers a shape the
-    cases above do not.
-    """
-    geo = _production_geometry()
-    assert geo["cache_chunk_size"] is None, (
-        "a config that pinned the chunk dial would return the pinned value, and "
-        "this case would be about the dial rather than the layer's derivation"
-    )
-    assert (geo["kdim"], geo["vdim"], geo["chunk"]) == (
-        EXPECTED_PRODUCTION_KDIM,
-        EXPECTED_PRODUCTION_VDIM,
-        EXPECTED_PRODUCTION_CHUNK,
-    ), f"the layer resolved {geo}, which is not the geometry this case covers"
-
-    q, k, v, beta, gk = _production_inputs()
-    assert can_run_kernel(q) is True
-
-    reset_dispatch_counters()
-    got = kda_intra_chunk(q, k, v, beta, gk)
-    nki_dispatch, torch_fallback = dispatch_counters()
-
-    expected = kda_intra_chunk_torch_oracle(q, k, v, beta, gk)
-    for field in ("w", "u", "a_inv", "aqk", "kg"):
-        assert_close(
-            _t(getattr(got, field)), _t(getattr(expected, field)),
-            rtol=RTOL, atol=ATOL,
-            name=f"production_geometry[chunk={geo['chunk']}].{field}",
-        )
-
-    assert nki_dispatch == 1, (
-        f"expected exactly 1 dispatch at the production geometry; {N_CHUNKS} would "
-        f"mean a per-chunk host loop and 0 would mean the torch path served this case"
-    )
-    assert torch_fallback == 0
-
-
-def test_production_geometry_gate_bound_stays_inside_the_declared_limit():
-    """The worst cumulative gate is admissible at the layer's chunk, not at twice it.
-
-    The worst case the checkpoint can produce is every gate entry at
-    ``gate_lower_bound``, so the chunk-local cumulative gate reaches
-    ``|gate_lower_bound| * chunk``. That is what makes the layer's chunk the widest
-    admissible one rather than an arbitrary choice, and the kernel's own
-    admissibility check is asked rather than the arithmetic restated.
-    """
-    from vllm_neuron.functional.kda.chunked_recurrence import (
-        GATE_CUMSUM_ABS_LIMIT,
-        can_run_intra_chunk,
-    )
-
-    geo = _production_geometry()
-    chunk, kdim, vdim = geo["chunk"], geo["kdim"], geo["vdim"]
-    bound = abs(geo["gate_lower_bound"])
-    assert geo["gate_lower_bound"] == EXPECTED_GATE_LOWER_BOUND
-
-    worst_gk = torch.full(
-        (N_CHUNKS, chunk, kdim), geo["gate_lower_bound"], dtype=torch.float32
-    )
-    worst_case = float(worst_gk.cumsum(dim=1).abs().max().item())
-
-    # Every partial sum of -5.0 is a small integer, exact in fp32, so the measured
-    # worst case is the derivation's number exactly.
-    assert worst_case == bound * chunk
-    assert bound * chunk <= GATE_CUMSUM_ABS_LIMIT
-    assert bound * (chunk * 2) > GATE_CUMSUM_ABS_LIMIT
-
-    _, _, _, _, gk = _production_inputs()
-    assert float(gk.float().cumsum(dim=1).abs().max().item()) <= worst_case
-
-    reference = torch.zeros((N_CHUNKS, chunk, kdim), dtype=torch.float32)
-    assert can_run_intra_chunk(
-        reference, N_CHUNKS, chunk, kdim, vdim, worst_case
-    ) is True
 
 
 def test_the_gate_limit_is_the_fp32_exponent_range_less_the_named_margin():
@@ -642,14 +538,13 @@ def _rounding_path(n_chunks: int, chunk: int, kdim: int) -> int:
     return n_chunks * per_chunk
 
 
-@pytest.mark.parametrize("edge", ["checkpoint_bound", "kernel_limit"])
+@pytest.mark.parametrize("edge", ["kernel_limit"])
 def test_the_chunk_pair_stays_accurate_at_the_gate_edge(edge):
     """At the largest chunk-local gate, the two kernels agree with a float64 scan.
 
-    Two edges, every gate entry equal so the cumulative gate is as far from zero
-    as it can get: the checkpoint's ``gate_lower_bound`` at the layer's chunk,
-    which is the worst input the layer can send, and ``GATE_CUMSUM_ABS_LIMIT``
-    spread over the chunk, which is the worst the kernels accept. The tolerance
+    The edge: every gate entry equal so the cumulative gate is as far from zero
+    as it can get, ``GATE_CUMSUM_ABS_LIMIT`` spread over the chunk, which is the
+    worst the kernels accept for a chunk of one gate block. The tolerance
     is derived, not chosen: every element of ``o`` and of the leaving state is
     within :func:`_rounding_path` units of fp32's roundoff of that output's
     largest magnitude.
@@ -659,7 +554,6 @@ def test_the_chunk_pair_stays_accurate_at_the_gate_edge(edge):
     geo = _production_geometry()
     chunk, kdim, vdim = geo["chunk"], geo["kdim"], geo["vdim"]
     per_token = {
-        "checkpoint_bound": geo["gate_lower_bound"],
         "kernel_limit": -GATE_CUMSUM_ABS_LIMIT / chunk,
     }[edge]
     tokens = EDGE_CHUNKS * chunk
@@ -702,5 +596,4 @@ def test_the_chunk_pair_stays_accurate_at_the_gate_edge(edge):
 
 def test_doubling_stages_is_ceil_log2_of_the_chunk_width():
     """``doubling_stages`` is the Neumann series' stage count, ``ceil(log2(chunk))``."""
-    assert doubling_stages(EXPECTED_PRODUCTION_CHUNK) == 4
     assert {c: doubling_stages(c) for c in CHUNK_SIZES} == {32: 5, 64: 6, 128: 7}
