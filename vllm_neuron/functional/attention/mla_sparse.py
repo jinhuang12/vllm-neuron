@@ -232,29 +232,26 @@ def _transpose_rows(dst, src_hbm, row_stride, rows, width, offset):
 STAGE_ROWS = LATENT_TILE
 
 
-def _clamped_page(table_hbm, entry: int):
-    """A ``[1, 1]`` int32 tile holding ``block_table[entry]``, the -1 pad clamped onto page 0.
+def _bank_pieces(table_hbm, pieces: int):
+    """A ``[1, pieces * pages]`` int32 tile: which whole piece of the bank each window piece reads.
 
-    Each tile is declared a whole 32-byte line wide and one column of it is used: the
-    allocator packs tiles back to back per partition, so a four-byte row would move
-    every tile placed after it off the line.
+    Column ``piece * pages + entry`` holds ``max(block_table[entry], 0) * pieces + piece``,
+    so the -1 pad reads page 0. The table is read in one DMA, and every page is clamped and
+    scaled at once. Every page index is far below 2**24, so the fp32 arithmetic of these
+    instructions is exact. The tile rows are whole 32-byte lines: the allocator packs tiles
+    back to back per partition, so a ragged row would move every tile placed after it off
+    the line.
     """
-    raw = _sbuf_i32(1, _aligned(1))[:, 0:1]
-    nisa.dma_copy(dst=raw, src=table_hbm.ap(pattern=[[1, 1], [1, 1]], offset=entry))
-    floor = _sbuf_i32(1, _aligned(1))[:, 0:1]
-    nisa.memset(dst=floor, value=SENTINEL_INDEX)
-    live = _sbuf_i32(1, _aligned(1))[:, 0:1]
-    nisa.tensor_tensor(dst=live, data1=floor, data2=raw, op=nl.less)
-    held = _sbuf_i32(1, _aligned(1))[:, 0:1]
-    nisa.tensor_tensor(dst=held, data1=raw, data2=live, op=nl.multiply)
-    return held
-
-
-def _piece_of_page(page, pieces: int, piece: int):
-    """A ``[1, 1]`` int32 tile holding ``page * pieces + piece``: which whole piece of the bank to read."""
-    held = _sbuf_i32(1, _aligned(1))[:, 0:1]
-    nisa.tensor_scalar(dst=held, data=page, op0=nl.multiply, operand0=pieces)
-    nisa.tensor_scalar(dst=held, data=held, op0=nl.add, operand0=piece)
+    pages = table_hbm.shape[0]
+    raw = _sbuf_i32(1, _aligned(pages))[:, 0:pages]
+    nisa.dma_copy(dst=raw, src=table_hbm.ap(pattern=[[pages, 1], [1, pages]], offset=0))
+    held = _sbuf_i32(1, _aligned(pieces * pages))
+    nisa.tensor_scalar(dst=held[:, 0:pages], data=raw, op0=nl.maximum, operand0=0,
+                       op1=nl.multiply, operand1=pieces, engine=nisa.engine.vector)
+    for piece in range(1, pieces):
+        nisa.tensor_scalar(dst=held[:, piece * pages:(piece + 1) * pages],
+                           data=held[:, 0:pages], op0=nl.add, operand0=piece,
+                           engine=nisa.engine.vector)
     return held
 
 
@@ -290,6 +287,13 @@ def _staged_window(bank_hbm, table_hbm, written_hbm, offset_hbm, page_size: int)
     the page reads and the overlay alike. The pages are read before the overlay: this
     step's rows sit at positions the pages also cover, so a page copy issued afterwards
     would put stale cache back over them.
+
+    A two-program launch stages one window in shared HBM for both physical cores of the
+    LNC2 pair. Each program copies every second page and every second overlay block,
+    from its program id on. A ``core_barrier`` on the window after the pages keeps every
+    page copy ahead of the overlay. A second one after the overlay gives each program the
+    whole window before its body reads it. A one-program launch stages the whole window
+    in its private HBM, with no barrier.
     """
     latent = bank_hbm.shape[1]
     pages = table_hbm.shape[0]
@@ -297,20 +301,29 @@ def _staged_window(bank_hbm, table_hbm, written_hbm, offset_hbm, page_size: int)
     span = page_size if page_size < STAGE_ROWS else STAGE_ROWS
     pieces = page_size // span
     banked = bank_hbm.reshape((bank_hbm.shape[0] // span, span, latent))
+    n_prgs = nl.num_programs(axes=0)
+    prg_id = nl.program_id(0)
+    paired = n_prgs > 1
     staged = nl.ndarray((pages * page_size + STAGE_PAD, latent), dtype=bank_hbm.dtype,
-                        buffer=nl.private_hbm)
-    for entry in range(pages):
-        page = _clamped_page(table_hbm, entry)
+                        buffer=nl.shared_hbm if paired else nl.private_hbm,
+                        name="staged_window")
+    bank_piece = _bank_pieces(table_hbm, pieces)
+    for entry in range(prg_id, pages, n_prgs):
         for piece in range(pieces):
+            column = piece * pages + entry
             hold = nl.ndarray((span, latent), dtype=bank_hbm.dtype, buffer=nl.sbuf)
             nisa.dma_copy(dst=hold,
                           src=banked.ap(pattern=[[latent, span], [1, latent]], offset=0,
-                                        scalar_offset=_piece_of_page(page, pieces, piece),
+                                        scalar_offset=bank_piece[:, column:column + 1],
                                         indirect_dim=0))
             nisa.dma_copy(dst=staged.ap(pattern=[[latent, span], [1, latent]],
                                         offset=(entry * page_size + piece * span) * latent),
                           src=hold)
-    for start in range(0, tokens, STAGE_ROWS):
+    if paired:
+        nisa.core_barrier(data=staged, cores=(0, 1))
+    if tokens == 0:
+        return staged
+    for start in range(prg_id * STAGE_ROWS, tokens, n_prgs * STAGE_ROWS):
         rows = tokens - start if tokens - start < STAGE_ROWS else STAGE_ROWS
         fresh = nl.ndarray((rows, latent), dtype=bank_hbm.dtype, buffer=nl.sbuf)
         nisa.dma_copy(dst=fresh, src=written_hbm.ap(pattern=[[latent, rows], [1, latent]],
@@ -318,6 +331,8 @@ def _staged_window(bank_hbm, table_hbm, written_hbm, offset_hbm, page_size: int)
         nisa.dma_copy(dst=staged.ap(pattern=[[latent, rows], [1, latent]], offset=0,
                                     scalar_offset=_write_row(offset_hbm, start), indirect_dim=0),
                       src=fresh)
+    if paired:
+        nisa.core_barrier(data=staged, cores=(0, 1))
     return staged
 
 
@@ -1381,8 +1396,8 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
     # One transpose per latent tile lands the block's Q rows in the source dtype and,
     # in the fp32 path, one copy widens them; each query then reads its own columns of
     # the block tile. A two-program grid partitions independent query blocks across the
-    # two PNCs of one LNC2 core. Each program owns its SBUF and optional private-HBM
-    # window, and writes disjoint query rows into the entry's shared-HBM output.
+    # two PNCs of one LNC2 core. Each program owns its SBUF; a paged pair reads the one
+    # window both staged (`_staged_window`). Each writes disjoint rows of the shared output.
     n_prgs = nl.num_programs(axes=0)
     prg_id = nl.program_id(0)
     for qb in nl.affine_range(prg_id, seq // qpb, n_prgs):
