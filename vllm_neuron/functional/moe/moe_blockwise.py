@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from vllm.distributed.parallel_state import GroupCoordinator
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 from vllm_neuron import envs
+from vllm_neuron.functional.moe.gather_flatten import gather_flatten
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 from vllm.distributed.parallel_state import get_world_group
 from vllm_neuron.parallel.neuron_parallel_state import rank_to_col
@@ -219,7 +220,7 @@ def _build_blockwise_mapping_kernel(
         tp_degree: tensor parallelism degree
         total_tokens: total number of tokens (T)
         chunk_size: chunk size for find_nonzero_indices kernel
-        f_len: flatten length for indexed_flatten kernel
+        f_len: row length of the flatten kernels (indexed_flatten, gather_flatten)
         moe_group: GroupCoordinator for MoE collectives
         rank: optional runtime rank tensor (see build_blockwise_mapping)
 
@@ -321,13 +322,12 @@ def _build_blockwise_mapping_kernel(
             group=moe_group.device_group,
         )
     else:
-        # [E_local, T] --> [N * block_size,]
-        token_position_to_id_padded = indexed_flatten_nki[2](
+        # [E_local, T] --> [N * block_size,]: each program gathers its own output rows
+        token_position_to_id_padded = wrap_nki(gather_flatten)[2](
             input_tensor=indices,
             f_len=f_len,
             output_len=num_blocks * block_size + total_tokens,
             row_offsets=row_offsets.reshape(-1).to(torch.int32),
-            row_offsets_start=torch.tensor([0], dtype=torch.int32, device=device),
             padding_val=-1,
         )
         token_position_to_id = token_position_to_id_padded[
