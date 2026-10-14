@@ -23,6 +23,14 @@ at trace time would compile rank 0's rows into every rank's graph. A slice canno
 device start row, so the cut is an NKI kernel (``shard_rows.dsa_take_rank_rows``) that
 builds the row index on device and gathers the rows by indirect DMA.
 
+The query side's cut: the selection reads its query and gate weights row by row, and each
+row of them is a function of its own row of the indexer's two inputs, ``q_latent`` and
+``hidden_states`` (a projection, a cast and a per-row rotation). So a rank cuts its rows of
+those inputs first (:func:`take_query_rows`) and projects the query side on ``R`` rows, not
+``T``; the key and the kpool gate still project every row, because the pool write stores
+them all. ``VLLM_NEURON_DSA_QUERY_ROW_CUT=0`` projects every row and cuts the projections
+(:func:`select_local_rows`), as before.
+
 The all-gather contract: the ids cross the collective as the selector's own int32, in the
 group's ``rank_in_group`` order. An all-gather only moves bytes, so no cast is needed on
 either side; when ``d * R == T`` the gathered block is the chunk as it stands, and only a
@@ -62,6 +70,12 @@ class IndexerShardError(ValueError):
 def indexer_shard_enabled() -> bool:
     """Whether the prefill selection may shard (``envs.VLLM_NEURON_DSA_INDEXER_SHARD``)."""
     return bool(envs.VLLM_NEURON_DSA_INDEXER_SHARD)
+
+
+def query_row_cut_enabled() -> bool:
+    """Whether a sharded selection projects its query side on the rank's rows only
+    (``envs.VLLM_NEURON_DSA_QUERY_ROW_CUT``): see :func:`take_query_rows`."""
+    return bool(envs.VLLM_NEURON_DSA_QUERY_ROW_CUT)
 
 
 @dataclass(frozen=True)
@@ -147,6 +161,42 @@ def select_local_rows(
                 f"{name} has {int(operand.shape[0])} rows; the plan is for {shard.tokens}"
             )
     return select(*dsa_take_rank_rows((query, weights, seq_lens), rank, shard.rows))
+
+
+def take_query_rows(
+    hidden_states: Tensor,
+    q_latent: Tensor,
+    seq_lens: Tensor,
+    shard: RowShard,
+    rank: Tensor | int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """This rank's rows of the query side's two inputs and the lengths, before projecting.
+
+    Args:
+        hidden_states: ``[T, hidden]``, the input of the head-weight projection.
+        q_latent: ``[T, q_lora_rank]``, the input of the query projection.
+        seq_lens: ``[T]`` (or ``[T, 1]``) per-row causal length.
+        shard: the chunk's plan; ``T`` must be ``shard.tokens``.
+        rank: this rank's index, see :func:`local_row_index`.
+
+    Returns:
+        ``(hidden_states, q_latent, seq_lens)``, each ``[R, ...]``: rows
+        ``rank * R .. rank * R + R - 1`` (pad rows clamped), cut on device by
+        ``shard_rows.dsa_take_rank_rows`` in one NKI launch.
+
+    The query and the gate weights projected from these rows are the rows
+    :func:`select_local_rows` would cut from the projections of every row: the projection
+    kernel computes each output element with the same products in the same order at any
+    row count, and the cast and the rotation work per row. So the selection on them is the
+    same, and only ``T - R`` rows' projections are no longer computed.
+    """
+    for name, operand in (("hidden_states", hidden_states), ("q_latent", q_latent),
+                          ("seq_lens", seq_lens)):
+        if int(operand.shape[0]) != shard.tokens:
+            raise IndexerShardError(
+                f"{name} has {int(operand.shape[0])} rows; the plan is for {shard.tokens}"
+            )
+    return dsa_take_rank_rows((hidden_states, q_latent, seq_lens), rank, shard.rows)
 
 
 def gather_rows(local: Tensor, group, shard: RowShard) -> Tensor:

@@ -3,8 +3,9 @@
 
 The indexer scores every candidate context position for a query token and then keeps only
 the highest-scoring ones; this module is that selection. It takes a score tensor whose last
-axis is the candidate axis and returns the selected values and their indices, highest first.
-The selection itself is done by ``rotational_topk``, the vendored ``@nki.jit`` kernel; this
+axis is the candidate axis and returns the selected values and their indices: highest first,
+or in no stated order for a caller that reads each row as a set (``ordered=False``). The
+selection itself is done by ``rotational_topk``, the vendored ``@nki.jit`` kernel; this
 module adds only a dispatch seam, a route gate and a torch reference.
 
 Which geometries the kernel serves is decided by its own config factories, not by a cap here.
@@ -129,24 +130,28 @@ def _nki_dtype_of(scores: Tensor):
 
 
 @torch._dynamo.assume_constant_result
-def _nki_config(n_rows: int, width: int, k: int, nki_dtype):
+def _nki_config(n_rows: int, width: int, k: int, nki_dtype, ordered: bool = True):
     """Build the kernel's compile-time config once per distinct geometry.
 
     The factories are host-side Python that emits log records, which Dynamo cannot trace under
     ``fullgraph=True``; folding the result to a constant runs them eagerly, off the compiled
-    graph.
+    graph. ``ordered`` is the factory's ``sorted``: False drops the kernel's final sort of the
+    ``k`` winners, and the stages that choose them are the same. Where the stages pad ``k``,
+    the rotational factory keeps the sort, because the sort is then what trims the padded
+    winners to ``k``; so both values give the same set.
     """
     topk_config = create_topk_config(
         inp_shape=(n_rows, width),
         inp_dtype=nki_dtype,
         k=k,
         num_programs=_NUM_PROGRAMS,
+        sorted=ordered,
     )
     return create_rotational_topk_config(inp_shape=(n_rows, width), topk_config=topk_config)
 
 
 @torch._dynamo.assume_constant_result
-def _config_builds(n_rows: int, width: int, k: int, nki_dtype) -> bool:
+def _config_builds(n_rows: int, width: int, k: int, nki_dtype, ordered: bool = True) -> bool:
     """True when the kernel's own factories accept this geometry.
 
     ``kernel_assert`` inside them raises ``AssertionError`` for an unsupported geometry, and
@@ -159,7 +164,7 @@ def _config_builds(n_rows: int, width: int, k: int, nki_dtype) -> bool:
     is not run under ``-O``.
     """
     try:
-        _nki_config(n_rows, width, k, nki_dtype)
+        _nki_config(n_rows, width, k, nki_dtype, ordered)
         return True
     except AssertionError:
         return False
@@ -183,13 +188,14 @@ def _record_nki_dispatch(n_rows: int, width: int, k: int) -> None:
     )
 
 
-def can_run_dsa_topk_select(scores: Tensor, k: int) -> bool:
+def can_run_dsa_topk_select(scores: Tensor, k: int, ordered: bool = True) -> bool:
     """True when the NKI route is available and the kernel serves this geometry.
 
     Five necessary conditions, then the factory dry-run: the runtime gate, the rank, the dtype,
     ``0 < k < width`` and ``width >= MAX8_WIDTH``. The last two pre-filters are load-bearing --
     the kernel refuses ``k == width`` for sorted output, and a stage narrower than one ``max8``,
     from asserts in its body rather than in the factories, so the dry-run cannot catch them.
+    ``ordered`` is :func:`dsa_topk_select`'s, so the dry-run builds the config the call uses.
     """
     if not can_run_kernel(scores):
         return False
@@ -203,10 +209,10 @@ def can_run_dsa_topk_select(scores: Tensor, k: int) -> bool:
     n_rows = 1
     for d in scores.shape[:-1]:
         n_rows *= int(d)
-    return _config_builds(n_rows, width, k, _nki_dtype_of(scores))
+    return _config_builds(n_rows, width, k, _nki_dtype_of(scores), bool(ordered))
 
 
-def dsa_topk_select(scores: Tensor, k: int) -> tuple[Tensor, Tensor]:
+def dsa_topk_select(scores: Tensor, k: int, *, ordered: bool = True) -> tuple[Tensor, Tensor]:
     """Select the ``k`` highest scores along the last axis.
 
     Args:
@@ -214,11 +220,14 @@ def dsa_topk_select(scores: Tensor, k: int) -> tuple[Tensor, Tensor]:
             is flattened into rows. ``float32`` or ``bfloat16`` -- read the module
             docstring on why ``bfloat16`` makes an index-set comparison ill-defined.
         k: how many candidates to keep. ``0 < k < width``.
+        ordered: True returns each row highest first. False lets the kernel skip its final
+            sort: each row holds the same ``(value, index)`` pairs in no stated order (the
+            torch path keeps its order). Pass False only where every reader of the result
+            treats a row as a set.
 
     Returns:
-        ``(values, indices)`` shaped ``[..., k]``, highest first, indices ``int64`` to
-        match ``torch.topk``; the kernel emits unsigned indices and they are cast once,
-        here.
+        ``(values, indices)`` shaped ``[..., k]``, indices ``int64`` to match
+        ``torch.topk``; the kernel emits unsigned indices and they are cast once, here.
     """
     _require_2d_or_more(scores)
     width = int(scores.shape[-1])
@@ -235,13 +244,13 @@ def dsa_topk_select(scores: Tensor, k: int) -> tuple[Tensor, Tensor]:
             f"has no float16 branch."
         )
 
-    if not can_run_dsa_topk_select(scores, k):
+    if not can_run_dsa_topk_select(scores, k, ordered):
         return _dsa_topk_select_torch(scores, k)
 
     leading = tuple(scores.shape[:-1])
     flat = scores.reshape(-1, width)
     n_rows = int(flat.shape[0])
-    config = _nki_config(n_rows, width, k, _nki_dtype_of(scores))
+    config = _nki_config(n_rows, width, k, _nki_dtype_of(scores), bool(ordered))
 
     _count_nki_dispatch()
     _record_nki_dispatch(n_rows, width, k)
