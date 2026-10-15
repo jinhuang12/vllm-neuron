@@ -4,11 +4,12 @@
 The simulator runs a kernel body as plain Python, so it cannot see a call form the
 compiler's front end refuses. This compiles ``dsa_decode_ring_rows_kernel`` at ring depth
 4 (T in {1, 2}) and 8 (T in {1, 2, 4, 6}) at B in {1, 4, 130} (130 spans two partition
-tiles), and ``dsa_decode_scores_rows_kernel`` at ctx 4096 and 8192 (1024 and 2048
-candidates) and a ragged 300, at T in {1, 2, 4, 6} x B in {1, 4} on one and two
-programs, the scores again with the query rotated on chip at both windows' T in {1, 4} x
-B in {1, 4}, and both at B=1 on a one-slot bank (the one-request carrier's view, read
-statically), inside a child process that pins the platform target, opens no device node,
+tiles) on one program, and from T = 2 on two programs as well, and
+``dsa_decode_scores_rows_kernel`` at ctx 4096 and 8192 (1024 and 2048 candidates) and a
+ragged 300, at T in {1, 2, 4, 6} x B in {1, 4} on one and two programs, the scores again
+with the query rotated on chip at both windows' T in {1, 4} x B in {1, 4}, and both at
+B=1 on a one-slot bank (the one-request carrier's view, read statically; the ring on one
+and two programs), inside a child process that pins the platform target, opens no device node,
 and proves it parsed bodies by refusing one that reads an undefined name. The pattern is
 ``test_decode_batch_frontend_compile.py``'s.
 """
@@ -75,8 +76,8 @@ def _compile_each_entry() -> None:
         call = wrap_nki(entry)
         return call[2] if programs == 2 else call
 
-    def ring(slots, depth, rows, batch):
-        return wrap_nki(TU.dsa_decode_ring_rows_kernel)(
+    def ring(slots, depth, rows, batch, programs=1):
+        return grid(TU.dsa_decode_ring_rows_kernel, programs)(
             fake((slots, 2 * depth * DIM), bf), fake((batch, 1), i32),
             fake((batch * rows, DIM), bf), fake((batch * rows, DIM), bf),
             fake((POOL, DIM), f32), fake((batch, 1), i32), POOL, rows, TU.ROWS_SOURCE_DIGEST)
@@ -92,6 +93,9 @@ def _compile_each_entry() -> None:
         for batch in RING_BATCHES:
             built.append((f"ring_d{depth}_t{rows}_b{batch}",
                           lambda d=depth, t=rows, b=batch: ring(SLOTS, d, t, b)))
+            if rows >= 2:
+                built.append((f"ring_d{depth}_t{rows}_b{batch}_g2",
+                              lambda d=depth, t=rows, b=batch: ring(SLOTS, d, t, b, 2)))
     for cands in SCORE_CANDIDATES:
         for rows in SCORE_ROWS:
             for batch in SCORE_BATCHES:
@@ -107,6 +111,7 @@ def _compile_each_entry() -> None:
                                   lambda c=cands, t=rows, b=batch, g=programs: scores(
                                       SLOTS, c, t, b, g, rotate=True)))
     built.append(("ring_d8_t4_b1_one_slot", lambda: ring(1, 8, 4, 1)))
+    built.append(("ring_d8_t4_b1_one_slot_g2", lambda: ring(1, 8, 4, 1, 2)))
     for cands in ONE_SLOT_CANDIDATES:
         built.append((f"scores_c{cands}_t4_b1_one_slot", lambda c=cands: scores(1, c, 4, 1, 1)))
     built.append(("undefined_name_body", lambda: wrap_nki(body_that_reads_an_undefined_name)(
@@ -154,10 +159,11 @@ def test_the_front_end_accepts_both_row_kernels_at_the_served_shapes() -> None:
     assert control and control[0]["refused"] == "True", (
         f"the child accepted a body that reads an undefined name, so it parsed none: {control}")
     entries = [row for row in rows if row["entry"] != "undefined_name_body"]
-    want = (len(RING_FORMS) * len(RING_BATCHES)
+    two_program_rings = len([form for form in RING_FORMS if form[1] >= 2])
+    want = ((len(RING_FORMS) + two_program_rings) * len(RING_BATCHES)
             + len(SCORE_CANDIDATES) * len(SCORE_ROWS) * len(SCORE_BATCHES) * 2
             + len(ROTATED_CANDIDATES) * len(ROTATED_ROWS) * len(SCORE_BATCHES) * 2
-            + 1 + len(ONE_SLOT_CANDIDATES))
+            + 2 + len(ONE_SLOT_CANDIDATES))
     assert len(entries) == want, (len(entries), want)
     refused = [f"{row['entry']}: {row['diagnostic']}" for row in entries
                if row["refused"] != "False"]

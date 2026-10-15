@@ -38,6 +38,7 @@ from torch import Tensor
 import nki
 import nki.isa as nisa
 import nki.language as nl
+from nkilib.core.utils.kernel_assert import kernel_assert
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
@@ -47,6 +48,7 @@ from vllm_neuron.functional.dsa.kpool_hadamard import (
     _fwht128_inplace,
     hadamard_matrix,
 )
+from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 from vllm_neuron.source_digest import source_digest
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
@@ -78,6 +80,8 @@ class _DecodeTailDispatchCounters:
     nki_dispatch: int = 0
     torch_fallback: int = 0
     last_kernel: tuple[str, str] | None = None
+    one_program: int = 0
+    two_programs: int = 0
 
 
 _COUNTERS = _DecodeTailDispatchCounters()
@@ -88,11 +92,19 @@ def reset_decode_tail_dispatch_counters() -> None:
     _COUNTERS.nki_dispatch = 0
     _COUNTERS.torch_fallback = 0
     _COUNTERS.last_kernel = None
+    _COUNTERS.one_program = 0
+    _COUNTERS.two_programs = 0
 
 
 def decode_tail_dispatch_counters() -> tuple[int, int]:
     """``(nki_dispatch, torch_fallback)`` since the last reset."""
     return (_COUNTERS.nki_dispatch, _COUNTERS.torch_fallback)
+
+
+def decode_ring_rows_route_counts() -> tuple[int, int]:
+    """``(one_program, two_programs)`` launches of the ``T``-row ring kernel since the last
+    reset."""
+    return (_COUNTERS.one_program, _COUNTERS.two_programs)
 
 
 @torch._dynamo.assume_constant_result
@@ -774,6 +786,16 @@ def dsa_decode_ring_rows_kernel(tail_hbm, slots_hbm, key_hbm, score_hbm, ape_hbm
     stash may land on a row a later pool of the same step no longer needs. The compression
     is :func:`decode_batch.dsa_decode_ring_step_kernel`'s instruction sequence per row, so
     at ``depth == pool_size`` the two agree bit for bit, row by row.
+
+    Programs: one, or two on an LNC2 pair (:func:`_rows_programs`). Two programs split the
+    work of each request with no exchange between them. Program ``p`` compresses the pools
+    of its run of the step's rows, ``ceil(rows / 2)`` long in program order (rows 0-1 and
+    2-3 at ``rows = 4``). It stashes the tokens into its half of the ring rows, ``depth / 2``
+    rows of each half in program order (ring rows 0-3 and 4-7 at depth 8). Each program
+    loads the whole ring and every token, because a pool reads ring rows anywhere and a
+    token can land on any ring row. It writes only its own pooled rows and ring rows. Each
+    row is computed by the same instructions in either form, so the two forms agree bit for
+    bit.
     """
     batch = slots_hbm.shape[0]
     head_dim = key_hbm.shape[1]
@@ -782,6 +804,15 @@ def dsa_decode_ring_rows_kernel(tail_hbm, slots_hbm, key_hbm, score_hbm, ape_hbm
     groups = depth // pool_size
     shift = _log2(pool_size)
     last = pool_size - 1
+    programs = nl.num_programs(0)
+    program = nl.program_id(0)
+    kernel_assert(programs in (1, 2), "one program, or one per core of an LNC2 pair")
+    kernel_assert(programs == 1 or rows >= 2, "two programs split the rows: at least 2")
+    row_share = (rows + programs - 1) // programs
+    row_first = program * row_share
+    row_end = min(rows, row_first + row_share)
+    ring_share = depth // programs
+    ring_first = program * ring_share
     pooled_hbm = nl.ndarray((batch * rows, head_dim), dtype=tail_hbm.dtype,
                             buffer=nl.shared_hbm)
     rings_hbm = nl.ndarray((batch, width), dtype=tail_hbm.dtype, buffer=nl.shared_hbm)
@@ -807,20 +838,22 @@ def dsa_decode_ring_rows_kernel(tail_hbm, slots_hbm, key_hbm, score_hbm, ape_hbm
             nisa.dma_copy(dst=score_bf,
                           src=score_hbm.ap(pattern=[[rows * head_dim, h], [1, head_dim]],
                                            offset=(r0 * rows + t) * head_dim))
-            key_f = _sb((h, head_dim), nl.float32)
-            nisa.tensor_copy(dst=key_f, src=key_bf)
-            score_f = _sb((h, head_dim), nl.float32)
-            nisa.tensor_copy(dst=score_f, src=score_bf)
             keys_bf.append(key_bf)
             scores_bf.append(score_bf)
-            keys_f.append(key_f)
-            scores_f.append(score_f)
+            # A pool of this program's rows reads members at or before its own row only.
+            if t < row_end:
+                key_f = _sb((h, head_dim), nl.float32)
+                nisa.tensor_copy(dst=key_f, src=key_bf)
+                score_f = _sb((h, head_dim), nl.float32)
+                nisa.tensor_copy(dst=score_f, src=score_bf)
+                keys_f.append(key_f)
+                scores_f.append(score_f)
         pos_i = _col(h, nl.int32)
         nisa.dma_copy(dst=pos_i, src=pos_hbm.ap(pattern=[[1, h], [1, 1]], offset=r0))
         ones = _sb((h, head_dim), nl.float32)
         nisa.memset(dst=ones, value=1.0)
 
-        for t in range(rows):
+        for t in range(row_first, row_end):
             # ---- which of the ring's pools this row's position falls in -----------------
             at_i = _col(h, nl.int32)
             nisa.tensor_scalar(dst=at_i, data=pos_i, op0=nl.add, operand0=t)
@@ -910,7 +943,7 @@ def dsa_decode_ring_rows_kernel(tail_hbm, slots_hbm, key_hbm, score_hbm, ape_hbm
             nisa.tensor_scalar(dst=at_i, data=pos_t, op0=nl.bitwise_and, operand0=depth - 1)
             at_f = _col(h, nl.float32)
             nisa.tensor_copy(dst=at_f, src=at_i)
-            for row in range(depth):
+            for row in range(ring_first, ring_first + ring_share):
                 hit = _col(h, nl.float32)
                 nisa.tensor_scalar(dst=hit, data=at_f, op0=nl.equal, operand0=float(row))
                 mask = _sb((h, head_dim), nl.uint8)
@@ -920,8 +953,14 @@ def dsa_decode_ring_rows_kernel(tail_hbm, slots_hbm, key_hbm, score_hbm, ape_hbm
                     nisa.tensor_copy_predicated(dst=ring[:, row0:row0 + head_dim],
                                                 src=keys_bf[t] if half == 0 else scores_bf[t],
                                                 predicate=mask)
-        nisa.dma_copy(dst=rings_hbm.ap(pattern=[[width, h], [1, width]], offset=r0 * width),
-                      src=ring)
+        # One program writes the whole ring. Two programs write their ring rows of each
+        # half; the other program writes the rest.
+        cols = width if programs == 1 else ring_share * head_dim
+        for half in range(1 if programs == 1 else TAIL_HALVES):
+            col0 = 0 if programs == 1 else (half * depth + ring_first) * head_dim
+            nisa.dma_copy(dst=rings_hbm.ap(pattern=[[width, h], [1, cols]],
+                                           offset=r0 * width + col0),
+                          src=ring if programs == 1 else ring[:, col0:col0 + cols])
     return pooled_hbm, rings_hbm
 
 
@@ -974,18 +1013,37 @@ def _require_rows(tail_bank, slots, key, score, ape, position) -> tuple[int, int
     return batch, rows, pool, depth
 
 
+def _rows_programs(rows: int) -> int:
+    """Programs of the ``T``-row ring kernel: 2 (an LNC2 pair) for two or more rows per
+    request, else 1. The served shapes are ``rows = 4`` (the verify step: 2 programs) and
+    ``rows = 1`` (one program).
+
+    :func:`~vllm_neuron.functional.dsa.launch_grid.lnc_pair` refuses a setting other
+    than unset, 1 or 2 (``LaunchGridError``).
+    """
+    if lnc_pair() and rows >= 2:
+        return 2
+    return 1
+
+
 @torch._dynamo.assume_constant_result
-def _record_rows_dispatch(batch: int, rows: int, pool_size: int, depth: int) -> None:
+def _record_rows_dispatch(batch: int, rows: int, pool_size: int, depth: int,
+                          programs: int) -> None:
     """Count the T-row ring kernel's dispatch and record it, off the compiled graph.
 
-    One folded helper for the count and the kernel identity: a store to module state from
+    One folded helper for the counts and the kernel identity: a store to module state from
     the traced seam itself would recompile the graph (``test_dispatch_counters_off_the_trace``).
     """
     _COUNTERS.nki_dispatch += 1
+    if programs == 2:
+        _COUNTERS.two_programs += 1
+    else:
+        _COUNTERS.one_program += 1
     _COUNTERS.last_kernel = _kernel_identity_of(dsa_decode_ring_rows_kernel)
     logger.info(
-        "[dsa-decode-tail-update] kernel=nki entry=ring_rows batch=%d rows=%d pool_size=%d depth=%d",
-        batch, rows, pool_size, depth,
+        "[dsa-decode-tail-update] kernel=nki entry=ring_rows batch=%d rows=%d pool_size=%d "
+        "depth=%d programs=%d",
+        batch, rows, pool_size, depth, programs,
     )
 
 
@@ -1012,6 +1070,10 @@ def dsa_decode_ring_rows(tail_bank: Tensor, slots: Tensor, key: Tensor, score: T
 
     Refuses ``rows > depth - pool_size + 2``: a rejected row's stash would then alias a
     ring row the next step's pools still need.
+
+    Under LNC2 a step of two or more rows per request launches two programs, one per core
+    of the pair (:func:`_rows_programs`); the results are the one-program results bit for
+    bit.
     """
     batch, rows, pool, depth = _require_rows(tail_bank, slots, key, score, ape, position)
     usable = (can_run_kernel(key) and tail_bank.dtype == torch.bfloat16
@@ -1019,9 +1081,13 @@ def dsa_decode_ring_rows(tail_bank: Tensor, slots: Tensor, key: Tensor, score: T
     if not usable:
         _count_torch_fallback()
         return dsa_decode_ring_rows_torch_oracle(tail_bank, slots, key, score, ape, position)
-    _record_rows_dispatch(batch, rows, pool, depth)
+    programs = _rows_programs(rows)
+    _record_rows_dispatch(batch, rows, pool, depth, programs)
     width = TAIL_HALVES * depth * int(tail_bank.shape[3])
-    pooled, rings = wrap_nki(dsa_decode_ring_rows_kernel)(
+    call = wrap_nki(dsa_decode_ring_rows_kernel)
+    if programs == 2:
+        call = call[2]
+    pooled, rings = call(
         tail_bank.reshape(int(tail_bank.shape[0]), width).contiguous(),
         slots.reshape(batch, 1).to(torch.int32).contiguous(),
         key.contiguous(), score.contiguous(), ape.to(torch.float32).contiguous(),
