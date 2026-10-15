@@ -16,6 +16,12 @@ kernel, which is commit ea04c81's bit for bit. A T-row step always runs the gene
 kernel, so it equals ``T`` sequential general-kernel steps bit for bit and ``T``
 sequential key-split steps within that kernel's own bound (:data:`REL`, the bound
 ``test_mla_decode_split.py`` holds it to against the general kernel).
+
+Under LNC2 the T-row step runs on both programs of the pair: two or more requests split
+over them, and one request (the served verify step, ``B = 1``) splits its rows, program
+``p`` taking rows ``p * ceil(T / 2)`` on (:func:`~vllm_neuron.functional.attention.
+mla_decode._row_share`). Each row keeps its one-program instruction stream, so one and two
+programs agree bit for bit over every row of the result.
 """
 
 from __future__ import annotations
@@ -180,6 +186,47 @@ def test_two_programs_agree_with_one_at_rows(selected, monkeypatch):
     two = _run(args, monkeypatch, lnc="2")
     assert MD.mla_decode_route_counts()[2] == 1
     assert torch.equal(one, two)
+
+
+#: One request's rows on the pair: the served verify step (k = 3), k in {1, 5}, and an odd
+#: count, whose second share is the shorter.
+SPLIT_ROWS = (2, 3, 4, 6)
+
+
+@pytest.mark.parametrize("rows", SPLIT_ROWS)
+def test_one_request_splits_its_rows_over_the_pair(rows):
+    half = (rows + 1) // 2
+    assert [MD._row_share(1, rows, 2, p) for p in (0, 1)] == [(0, half), (half, rows)]
+    # Two or more requests, or one program: each program takes its requests' rows whole.
+    assert [MD._row_share(4, rows, 2, p) for p in (0, 1)] == [(0, rows), (0, rows)]
+    assert MD._row_share(1, rows, 1, 0) == (0, rows)
+
+
+@pytest.mark.parametrize("selected", [False, True])
+@pytest.mark.parametrize("rows", SPLIT_ROWS)
+def test_one_request_on_two_programs_equals_one_program_bit_for_bit(rows, selected,
+                                                                    monkeypatch):
+    # The served per-rank shape: the bypass bucket's 2048-row window (dense), and the
+    # selecting bucket's 4096-row window with 2048 selected rows.
+    pages, width, start = (32, 2048, 4096 - rows) if selected else (16, None, 1017)
+    args = _case(1, rows, 1, LATENT, pages, PAGE, seed=81 + rows, selected=selected,
+                 width=width, starts=[start])
+    one = _run(args, monkeypatch)
+    assert MD.mla_decode_route_counts()[2] == 0
+    two = _run(args, monkeypatch, lnc="2")
+    assert MD.mla_decode_route_counts()[2] == 1
+    assert MD.mla_decode_split_counts() == (0, 0)
+    # Every row of the result -- both programs' shares -- against one program and against
+    # the T sequential single-row steps.
+    assert torch.equal(two, one)
+    assert torch.equal(two, _sequential_general(monkeypatch, *args))
+
+
+def test_one_row_of_one_request_keeps_one_program(monkeypatch):
+    # Two heads: the general kernel's one-row step, which has no rows to split.
+    args = _case(1, 1, 2, LATENT, 16, PAGE, seed=91, selected=False)
+    _run(args, monkeypatch, lnc="2")
+    assert MD.mla_decode_route_counts()[2] == 0
 
 
 @pytest.mark.parametrize("selected", [False, True])
