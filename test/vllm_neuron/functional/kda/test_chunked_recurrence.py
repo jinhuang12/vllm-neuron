@@ -526,11 +526,13 @@ def _rounding_path(n_chunks: int, chunk: int, kdim: int) -> int:
     Every contraction and single rounding one chunk performs is counted once,
     whether or not one path passes through all of them: four contractions over
     the key axis (the L2 norm, ``A`` / ``Aqk``, ``w @ h`` and ``qg @ h``) and,
-    over the chunk axis, the cumulative gate, two per doubling stage of the
-    inverse (the power and the partial sum), the inverse's application to ``u`` /
-    ``w``, ``kg^T @ v_new`` and ``aqk @ v_new``. A length-``n`` contraction rounds
-    ``n`` times. Each stage adds one more rounding, its partial sum, to
-    :data:`FIXED_ROUNDINGS`. The state carries every earlier chunk's path into
+    over the chunk axis, the cumulative gate, two per merge level of the
+    inverse (the product with ``N`` and the one with ``T``), the inverse's
+    application to ``u`` / ``w``, ``kg^T @ v_new`` and ``aqk @ v_new``. A
+    length-``n`` contraction rounds ``n`` times. Each level adds one more
+    rounding, its sum ``T + T N T``, to :data:`FIXED_ROUNDINGS`. The count takes
+    all ``doubling_stages`` levels, the exact first one (``I + N``) included, so
+    it stays an upper bound. The state carries every earlier chunk's path into
     the next, so the count is per chunk times the chunk count.
     """
     stages = doubling_stages(chunk)
@@ -595,5 +597,5 @@ def test_the_chunk_pair_stays_accurate_at_the_gate_edge(edge):
 
 
 def test_doubling_stages_is_ceil_log2_of_the_chunk_width():
-    """``doubling_stages`` is the Neumann series' stage count, ``ceil(log2(chunk))``."""
+    """``doubling_stages`` is the block merge's level count, ``ceil(log2(chunk))``."""
     assert {c: doubling_stages(c) for c in CHUNK_SIZES} == {32: 5, 64: 6, 128: 7}

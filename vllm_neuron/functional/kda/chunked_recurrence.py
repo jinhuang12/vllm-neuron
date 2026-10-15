@@ -46,19 +46,33 @@ and it holds no raw ``k`` from which to rebuild ``kg``.
 
 The inverse, without a token loop
 ---------------------------------
-``N = -A`` is strictly lower triangular and therefore nilpotent with
-``N**C == 0``, so the Neumann series terminates exactly::
+``N = -A`` is strictly lower triangular, so ``(I + A)**-1 = (I - N)**-1`` is
+unit lower triangular. Split a block of ``2w`` tokens into halves, so that its
+``N`` is ``[[N11, 0], [N21, N22]]``; then exactly::
 
-    (I + A)**-1 = (I - N)**-1 = I + N + N**2 + ... + N**(C-1)
+    (I - N)**-1 = [[T1, 0], [T2 N21 T1, T2]]     T1 = (I - N11)**-1, T2 = (I - N22)**-1
 
-and its partial sums obey the doubling identity ``S_2m = (I + N**m) S_m``. The
-kernel therefore reaches the full inverse in :func:`doubling_stages` ==
-``log2(C)`` matmul stages rather than ``C`` substitution steps, and no loop in
-this module walks the token axis: the cumulative sum is a matmul against a
-triangular ones matrix, both chunk-local products are matmuls, and ``w`` / ``u``
-are matmuls against the returned inverse. The torch oracle below reaches the
-same value by a different route, ``torch.linalg.solve_triangular``, which is what
-makes their agreement informative rather than circular.
+With ``T_w`` the block-diagonal of the inverses of width ``w`` and ``N_x`` the
+cross blocks ``N21``, that is ``T_2w = T_w + T_w N_x T_w``. The kernel starts at
+width 1, where ``T_1 = I``, and merges the blocks in pairs for
+:func:`doubling_stages` == ``log2(C)`` levels of at most three matmuls each,
+rather than ``C`` substitution steps. No loop in this module walks the token
+axis: the cumulative sum is a matmul against a triangular ones matrix, both
+chunk-local products are matmuls, and ``w`` / ``u`` are matmuls against the
+returned inverse.
+
+Every term a level adds is an entry of the exact inverse, so no sum cancels.
+The terminating Neumann series ``I + N + ... + N**(C-1)`` reaches the same value
+in exact arithmetic, but not in fp32: ``|A[t, j]| <= 1``, so an entry of
+``N**m`` can reach the path count ``binomial(C - 2, m - 1)``, about 1.6e8 at
+``C = 32``. Aligned keys, ``beta`` near 1 and a slow gate come close to that
+bound, and such terms carry rounding errors of order 1 into an inverse whose
+entries are not large. The state the inter-chunk half carries then grows from
+chunk to chunk.
+
+The torch oracle below reaches the same value by a different route,
+``torch.linalg.solve_triangular``, which is what makes their agreement
+informative rather than circular.
 
 Entry points
 ------------
@@ -110,14 +124,16 @@ dependent steps is half as long.
 
 Four ``[C, C]`` constants are built on the host by :func:`chunk_constants` and
 passed in as tensors: the upper-inclusive ones matrix that turns the cumulative
-sum into a matmul, the identity that seeds the doubling series, the strictly
-lower mask, and a row selector that broadcasts the chunk's last gate row. A chunk
-of two gate blocks also takes three of them at the block width: the ones matrix,
-the strictly lower mask and the row selector, which restart the gate at each
-block, mask the in-block products and select each block's last gate row. Passing
-masks in follows ``nkilib``'s own convention -- its ``ssd`` asserts a
-non-``None`` ``causal_mask`` rather than building one -- and these are 0/1
-constants, not numerics.
+sum into a matmul, the identity, the strictly lower mask, and a row selector that
+broadcasts the chunk's last gate row. A chunk of two gate blocks also takes three
+of them at the block width: the ones matrix, the strictly lower mask and the row
+selector, which restart the gate at each block, mask the in-block products and
+select each block's last gate row. Passing masks in follows ``nkilib``'s own
+convention -- its ``ssd`` asserts a non-``None`` ``causal_mask`` rather than
+building one -- and these are 0/1 constants, not numerics. The inverse's level
+masks are not passed: each is the difference of two of the block-diagonal masks
+the kernel builds to lay the constants out (:func:`_emit_merge_masks`), so the
+kernel entries keep their arguments.
 
 On this image the tiles ``wrap_nki`` hands a kernel carry no Python operator
 overloads, so ``a * b`` on two tiles raises ``TypeError``. Every elementwise step
@@ -269,10 +285,10 @@ def _count_nki_dispatch() -> None:
 
 
 def doubling_stages(chunk: int) -> int:
-    """Matmul stages the Neumann series needs for a ``chunk``-wide tile.
+    """Levels the block-merge inverse needs for a ``chunk``-wide tile.
 
-    ``log2(chunk)``, because stage ``j`` holds the partial sum of the first
-    ``2**j`` terms and ``N**chunk == 0`` makes term ``chunk`` onwards vanish.
+    ``log2(chunk)``, because level ``j`` doubles the width of the solved
+    diagonal blocks to ``2**j`` (module docstring, The inverse).
     """
     return int(math.ceil(math.log2(chunk)))
 
@@ -288,7 +304,7 @@ def chunk_constants(
     * ``triu_ones[s, t] = 1 for s <= t`` -- used as the matmul **stationary**
       operand, whose transpose is the lower-inclusive ones matrix, so
       ``triu_ones^T @ gk`` is the inclusive cumulative sum along tokens.
-    * ``eye`` seeds the doubling series at ``S_1 = I``.
+    * ``eye`` -- the identity, which the inverse's first level adds to ``N``.
     * ``mask_lower[t, j] = 1 for j < t`` -- strictly lower, matching upstream's
       ``A``. The causal mask ``Aqk`` needs is ``mask_lower + eye`` and is formed
       in the kernel rather than passed, so one fewer constant travels.
@@ -489,6 +505,8 @@ class _IntraLayout(nl.NKIObject):
     """The block-diagonal constants of one packed tile, built once per launch.
 
     An ``NKIObject``, because the NKI front end admits no other user class.
+    ``merge_masks`` holds one ``[rows, rows]`` tile per level of the inverse
+    (:func:`_emit_merge_masks`).
     """
 
     triu: object
@@ -496,15 +514,16 @@ class _IntraLayout(nl.NKIObject):
     causal: object
     last_row: object
     same_chunk: object
-    eye_packed: object
+    eye: object
+    merge_masks: tuple
 
 
 def _emit_intra_layout(triu_hbm, eye_hbm, mask_lower_hbm, last_row_hbm, rows, chunk):
     """The four ``[C, C]`` constants, laid on the diagonal of a packed tile.
 
     ``neg_mask_lower`` is ``-mask_lower``, so the inverse's ``N = -A`` is one
-    product; ``causal`` is ``mask_lower + eye``; ``eye_packed`` is the identity
-    in the packed ``[rows, C]`` layout, the doubling series' first term.
+    product; ``causal`` is ``mask_lower + eye``; ``merge_masks`` are the
+    inverse's level masks.
     """
     same = _emit_same_chunk(rows, chunk)
     rep = _emit_replicator(rows, chunk)
@@ -522,8 +541,45 @@ def _emit_intra_layout(triu_hbm, eye_hbm, mask_lower_hbm, last_row_hbm, rows, ch
     )
     causal = _sbuf(rows, rows)
     nisa.tensor_tensor(dst=causal, data1=mask_lower, data2=eye, op=nl.add)
-    eye_packed = chunk_rows[0:rows, chunk : 2 * chunk]
-    return _IntraLayout(triu, neg_mask_lower, causal, last_row, same, eye_packed)
+    merge_masks = _emit_merge_masks(same, rows, chunk)
+    return _IntraLayout(
+        triu, neg_mask_lower, causal, last_row, same, eye, merge_masks
+    )
+
+
+def _emit_merge_masks(same_chunk, rows, chunk):
+    """One ``[rows, rows]`` 0/1 mask per level of :func:`_emit_unit_lower_inverse`.
+
+    Level ``l`` joins the solved diagonal blocks of width ``w = 2**(l - 1)`` in
+    pairs, and its mask is 1 where two tokens share a ``2w``-aligned block of
+    their chunk but not a ``w``-aligned one: :func:`_emit_same_chunk` at ``2w``
+    less the same at ``w``, 0/1 arithmetic and exact. Every pair of distinct
+    tokens of a chunk is in exactly one level's mask, the level of the highest
+    bit in which their positions differ. At level 1 the ``w`` block is one token,
+    the diagonal, where the product level 1 masks is zero, so its mask is the
+    ``2``-block one alone. At the top level the ``2w`` block is the chunk,
+    ``same_chunk``.
+
+    The masks are symmetric: the products they mask are triangular already
+    (:func:`_emit_unit_lower_inverse`), so a mask only has to pick the level.
+    """
+    levels = doubling_stages(chunk)
+    masks = []
+    inner = None
+    for level in range(1, levels + 1):
+        width = 2**level
+        if width == chunk:
+            outer = same_chunk.reshape((rows, rows))
+        else:
+            outer = _emit_same_chunk(rows, width).reshape((rows, rows))
+        if inner is None:
+            masks.append(outer)
+        else:
+            mask = _sbuf(rows, rows)
+            nisa.tensor_tensor(dst=mask, data1=outer, data2=inner, op=nl.subtract)
+            masks.append(mask)
+        inner = outer
+    return tuple(masks)
 
 
 @dataclass(frozen=True)
@@ -580,48 +636,72 @@ def _emit_gate_block_layout(
     return _GateBlockLayout(triu, last_row, neg_mask_lower, causal, cross, neg_cross)
 
 
-def _emit_unit_lower_inverse(dst, n_bd, eye_packed, rows, chunk):
-    """``dst = (I - N)**-1 = (I + A)**-1`` in the packed layout, by doubling.
+def _emit_unit_lower_inverse(dst, n_bd, layout, rows, chunk):
+    """``dst = (I - N)**-1 = (I + A)**-1`` in the packed layout, by block merge.
 
     ``n_bd`` is ``N = -A``, block-diagonal ``[rows, rows]`` and strictly lower in
-    every block. The partial sum ``s`` stays packed ``[rows, chunk]``: with the
-    block-diagonal ``N**m`` transposed as the stationary operand, ``N**m @ s``
-    contracts only within each chunk, so it streams ``chunk`` columns instead of
-    ``rows``. The powers themselves are squared block-diagonal. The loop runs
-    :func:`doubling_stages` == ``log2(chunk)`` stages and walks no tokens; the
-    last stage needs no further power and the one before it only the transposed
-    one.
+    every block. ``t`` is the inverse solved on diagonal blocks of width ``w``,
+    and ``tt`` its transpose, both block-diagonal ``[rows, rows]``. Level 1 is
+    ``t = I + N`` on the level's mask, and each later level merges the blocks in
+    pairs (module docstring, The inverse)::
+
+        t <- t + t N_x t
+
+    with ``N_x`` the level's cross block. ``t`` is zero outside its own ``w``
+    blocks, so ``t N`` and ``t N_x`` agree on the cross block, and
+    ``y = (N^T tt) * mask`` is ``(t N_x)^T`` exactly without a masked copy of
+    ``N``. ``t`` and ``tt`` both stay current because the next level needs ``t``
+    as the moving operand and ``tt`` as the stationary one:
+    ``nc_matmul(stationary=y, moving=t)`` is ``t N_x t`` and
+    ``nc_matmul(stationary=t, moving=y)`` its transpose. The last level needs no
+    transpose and streams the packed ``t``, ``chunk`` columns rather than
+    ``rows``. :func:`doubling_stages` == ``log2(chunk)`` levels, and no loop walks
+    the tokens.
+
+    ``N`` and every ``t`` are exactly zero above the diagonal, so ``N^T tt`` is
+    exactly zero below it, and each level's symmetric mask
+    (:func:`_emit_merge_masks`) only has to select the level.
 
     ``dst`` receives the packed inverse, which is the ``[NC, C, C]`` HBM layout
     as rows.
     """
-    stages = doubling_stages(chunk)
-    n_cur = n_bd
-    nt_cur = _sbuf(rows, rows)
-    _emit_transpose(nt_cur, n_bd, rows, rows)
-    s_cur = eye_packed[0:rows]
-    for stage in range(stages):
-        # s <- s + n @ s, which doubles the number of series terms summed.
-        ps_s = _psum(rows, chunk)
-        nisa.nc_matmul(dst=ps_s, stationary=nt_cur, moving=s_cur, accumulate=False)
-        s_next = dst if stage == stages - 1 else _sbuf(rows, chunk)
-        nisa.tensor_tensor(dst=s_next, data1=s_cur, data2=ps_s, op=nl.add)
-        s_cur = s_next
-        if stage < stages - 1:
-            # nt <- nt @ nt always; n <- n @ n only while a later stage needs it.
-            ps_t = _psum(rows, rows)
-            nisa.nc_matmul(dst=ps_t, stationary=n_cur, moving=nt_cur, accumulate=False)
-            if stage < stages - 2:
-                ps_n = _psum(rows, rows)
-                nisa.nc_matmul(
-                    dst=ps_n, stationary=nt_cur, moving=n_cur, accumulate=False
-                )
-                n_next = _sbuf(rows, rows)
-                nisa.tensor_copy(dst=n_next, src=ps_n)
-                n_cur = n_next
-            nt_next = _sbuf(rows, rows)
-            nisa.tensor_copy(dst=nt_next, src=ps_t)
-            nt_cur = nt_next
+    masks = layout.merge_masks
+    eye = layout.eye[0:rows, 0:rows]
+    first = _sbuf(rows, rows)
+    nisa.tensor_tensor(dst=first, data1=n_bd, data2=masks[0][0:rows, 0:rows],
+                       op=nl.multiply)
+    t_cur = _sbuf(rows, rows)
+    nisa.tensor_tensor(dst=t_cur, data1=first, data2=eye, op=nl.add)
+    levels = len(masks)
+    if levels == 1:
+        _emit_pack(dst, t_cur, rows, chunk)
+        return
+    tt_cur = _sbuf(rows, rows)
+    _emit_transpose(tt_cur, t_cur, rows, rows)
+    for level in range(1, levels):
+        # y = (t N_x)^T: the stationary N contracts its rows, so this is N^T tt.
+        ps_y = _psum(rows, rows)
+        nisa.nc_matmul(dst=ps_y, stationary=n_bd, moving=tt_cur, accumulate=False)
+        y_sb = _sbuf(rows, rows)
+        nisa.tensor_tensor(dst=y_sb, data1=ps_y,
+                           data2=masks[level][0:rows, 0:rows], op=nl.multiply)
+        if level == levels - 1:
+            t_packed = _sbuf(rows, chunk)
+            _emit_pack(t_packed, t_cur, rows, chunk)
+            ps_x = _psum(rows, chunk)
+            nisa.nc_matmul(dst=ps_x, stationary=y_sb, moving=t_packed,
+                           accumulate=False)
+            nisa.tensor_tensor(dst=dst, data1=t_packed, data2=ps_x, op=nl.add)
+        else:
+            ps_x = _psum(rows, rows)
+            nisa.nc_matmul(dst=ps_x, stationary=y_sb, moving=t_cur, accumulate=False)
+            ps_xt = _psum(rows, rows)
+            nisa.nc_matmul(dst=ps_xt, stationary=t_cur, moving=y_sb, accumulate=False)
+            t_next = _sbuf(rows, rows)
+            nisa.tensor_tensor(dst=t_next, data1=t_cur, data2=ps_x, op=nl.add)
+            tt_next = _sbuf(rows, rows)
+            nisa.tensor_tensor(dst=tt_next, data1=tt_cur, data2=ps_xt, op=nl.add)
+            t_cur, tt_cur = t_next, tt_next
 
 
 def _blocks(tile, rows, n_blocks, width):
@@ -1016,7 +1096,7 @@ def _emit_intra_tiles(
             aqk_bd = aqk_all
         _emit_pack(aqk_sb[0:rows, c0 : c0 + chunk], aqk_bd, rows, chunk)
         a_inv_t = ainv_sb[0:rows, c0 : c0 + chunk]
-        _emit_unit_lower_inverse(a_inv_t, n_bd, layout.eye_packed, rows, chunk)
+        _emit_unit_lower_inverse(a_inv_t, n_bd, layout, rows, chunk)
         _emit_uw(uw_sb[0:rows, t * width : (t + 1) * width], k_t,
                  v_sb[0:rows, t * vdim : (t + 1) * vdim], beta_col, egc_t, a_inv_t,
                  layout.same_chunk, rows, chunk, kdim, vdim)
@@ -1153,8 +1233,8 @@ def _require_admissible(
         )
     elif chunk & (chunk - 1):
         problems.append(
-            f"chunk={chunk} must be a power of two; each doubling stage of the "
-            f"terminating Neumann series reaches exactly 2**stage series terms"
+            f"chunk={chunk} must be a power of two; each level of the block-merge "
+            f"inverse doubles the width of the solved blocks, from 1 to the chunk"
         )
     if kdim < 1 or kdim > MAX_TILE:
         problems.append(
@@ -1345,8 +1425,7 @@ def kda_intra_chunk_torch_oracle(
       the channel axis. That makes this the better-conditioned of the two, which
       is what :data:`GATE_CUMSUM_ABS_LIMIT` keeps honest;
     * the inverse comes from ``torch.linalg.solve_triangular``, forward
-      substitution, where the kernel sums a terminating Neumann series by
-      doubling;
+      substitution, where the kernel merges solved diagonal blocks;
     * the two products are formed by broadcast sums rather than by transposes and
       matmuls.
     """
@@ -1795,8 +1874,8 @@ def _require_inter_admissible(
     """Raise unless the inter-chunk kernel serves the input.
 
     Unlike :func:`_require_admissible` this does not require ``chunk`` to be a
-    power of two: that requirement comes from the doubling series, and this kernel
-    sums no series.
+    power of two: that requirement comes from the intra-chunk kernel's block-merge
+    inverse, and this kernel inverts nothing.
 
     ``gate_peak`` is the largest chunk-local cumulative gate, signed, so the bound
     applies to one chunk's gate sum and not to the whole sequence's. See
