@@ -139,6 +139,9 @@ if TYPE_CHECKING:
     # Windows with at least this many pages route to the block-shared kernel when
     # VLLM_NEURON_MLA_BLOCK_SHARED is on; 0 routes every selecting window.
     VLLM_NEURON_MLA_BLOCK_SHARED_MIN_PAGES: int = 0
+    # GLM-5.3-Flash DSA prefill: let the dense-masked sparse MLA kernel
+    # (mla_dense_masked.py) be called. Off by default; no call site sets it.
+    VLLM_NEURON_MLA_DENSE_MASKED: bool = False
     # Let the GLM-5.3-Flash DSA prefill's sparse MLA body gather its rows from the
     # latent bank through the block table, with no staged window. On by default; 0
     # restores the staged window.
@@ -650,6 +653,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # sets the crossover here. Read at trace time by the call site.
     "VLLM_NEURON_MLA_BLOCK_SHARED_MIN_PAGES": lambda: (
         maybe_convert_int(os.getenv("VLLM_NEURON_MLA_BLOCK_SHARED_MIN_PAGES")) or 0
+    ),
+    # Allow ``functional/attention/mla_dense_masked.py``'s entry: the sparse prefill
+    # attention as one dense pass over the window with each query's selection as a
+    # mask. The entry refuses a call while this is unset. It has no call site yet;
+    # read at trace time. Off by default.
+    "VLLM_NEURON_MLA_DENSE_MASKED": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_MLA_DENSE_MASKED")) or False
     ),
     # Let the sparse MLA prefill's low-precision row-tiled body
     # (``functional/attention/mla_sparse.py``) gather each query's selected rows
