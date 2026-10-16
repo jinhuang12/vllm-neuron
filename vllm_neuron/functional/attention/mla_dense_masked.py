@@ -6,7 +6,7 @@ time, and those gathers are serial on the software DMA queue. This kernel reads 
 window row once per program instead, scores 128 queries per matmul against it, and
 keeps each query's selection as a per-row predicate ahead of the softmax::
 
-    scores[q, w] = q_lift[q] . window[w]      where member[q, w], else _UNSELECTED_SCORE
+    scores[q, w] = q_lift[q] . window[w]      where w % R < count[q, w // R], else _UNSELECTED_SCORE
     out[q]       = softmax(scale * scores[q]) @ window
 
 The window is read through the block table straight from the latent bank, a superblock
@@ -32,10 +32,21 @@ MM2 contracts every row of the window whatever its probability, and ``0 * NaN`` 
 so a non-finite row would reach every query of the tile. Each superblock's MM2 operand
 therefore has its non-finite elements set to 0.0 first.
 
-``member`` is a ``[S, window]`` uint8 row mask. How the selection reaches it (a bitmap
-from the top-k, or the indexer's scores against each query's k-th score) is the
-caller's; this kernel only applies it. It has no call site: its entry refuses a call
-unless ``VLLM_NEURON_MLA_DENSE_MASKED`` (``vllm_neuron/envs.py``) is set.
+The selection is a pool mask: one uint8 per ``R``-row pool of the window (``R`` the
+indexer's pool size), the count of the pool's leading rows the query selects.
+:func:`selection_pool_counts` builds it from the index rows the sparse call takes, and
+the kernel reads it through a stride-0 view, each count against its ``R`` rows' ranks
+in the pool. One byte per pool is the exact selection because the indexer selects whole
+pools. ``dsa_index_expand`` lays each query's index row out in groups of ``R``
+columns: a selected pool's ``R`` rows, or ``R`` times ``-1``, then the open pool (the
+one holding the query's own position) as its leading rows up to that position, then
+``-1``. So every group names the leading rows of one pool, and its count of
+non-negative columns says which. A row mask holds the same bits at ``R`` times the
+bytes, and it costs its producer one scattered element per selected row.
+
+The entry, :func:`mla_dense_masked_attention`, takes that pool mask. It has no call
+site: it refuses a call unless ``VLLM_NEURON_MLA_DENSE_MASKED`` (``vllm_neuron/envs.py``)
+is set.
 """
 
 from __future__ import annotations
@@ -71,10 +82,11 @@ _PSUM_BANK_BYTES = 2048
 #: Pages per superblock: the window rows one pass of MM1, the softmax and MM2 covers
 #: before the running statistics are folded. Per partition a superblock holds its rows
 #: twice (keys on partitions and transposed: 2 x 16 x 1 KiB at latent 512 in bf16) and
-#: its guard mask (8 KiB), and each query tile adds its predicate (2 KiB), scores
-#: (8 KiB) and one bank of hi/lo halves (2 KiB): about 54 KiB, with each program's
-#: accumulators (2 KiB per tile), far below the 224 KiB of a partition, which leaves
-#: the compiler room to double-buffer the superblocks.
+#: its guard mask (8 KiB), and each query tile adds its pool counts (0.5 KiB at 4-row
+#: pools), predicate (2 KiB), scores (8 KiB) and one bank of hi/lo halves (2 KiB): about
+#: 57 KiB, with each program's accumulators (2 KiB per tile) and pool ranks (2 KiB), far
+#: below the 224 KiB of a partition, which leaves the compiler room to double-buffer the
+#: superblocks.
 SUPERBLOCK_PAGES = 16
 #: The score an unselected row reads: a power of two so far below any score that
 #: ``exp(scale * (_UNSELECTED_SCORE - max))`` is exactly 0.0.
@@ -84,6 +96,12 @@ _UNSELECTED_SCORE = -(2.0 ** 30)
 _SELECTED_MAX_FLOOR = _UNSELECTED_SCORE / 2
 #: The row-sum floor of the final division.
 _TOTAL_FLOOR = 1.0e-30
+#: Index groups per scatter of the pool-mask producer: it scatters the largest whole
+#: multiple of this many groups first, then the rest. One scatter over a group count off
+#: that multiple (544 at the served index width) had its group axis tiled to 1,024 in
+#: the compiled graph, twice the DMA instances: the compiler's estimate was 2.7 ms per
+#: call against 1.5 ms for the same groups scattered as 512, then 32.
+_SCATTER_GROUPS = 128
 
 #: This file's digest as a trace-time int: the compiled-kernel cache keys on the entry's
 #: own source and arguments only.
@@ -147,26 +165,50 @@ def _superblock_rows(banked, bank_page, page0, pages, latent):
     return ops
 
 
-def _superblock_tile(member_hbm, q_t, rows_t, rows, run_max, run_sum, acc, softmax_scale,
+def _pool_ranks(pools, pool_rows):
+    """``[128, pools, pool_rows]`` uint8: each row's rank in its pool, ``0 .. pool_rows - 1``."""
+    rank = _sb((ROW_TILE, pools, pool_rows), nl.uint8)
+    nisa.iota(dst=rank, pattern=[[0, pools], [1, pool_rows]], offset=0)
+    return rank
+
+
+def _selected_rows(pool_hbm, rank, r0, w0, width):
+    """``[128, width]`` uint8: 1 on window rows ``w0 .. w0 + width - 1`` query ``r0 + p`` selects.
+
+    Row ``w`` is selected where its rank in its pool is below the pool's count. The counts
+    of the superblock's pools come in one DMA, then one Vector compare reads each through a
+    stride-0 view, once per row of its pool. The pool mask's trailing column (the
+    producer's trash) is never read.
+    """
+    pool_rows = rank.shape[2]
+    stride = pool_hbm.shape[1]
+    pools = width // pool_rows
+    counts = _sb((ROW_TILE, pools), nl.uint8)
+    nisa.dma_copy(dst=counts, src=pool_hbm.ap(pattern=[[stride, ROW_TILE], [1, pools]],
+                                              offset=r0 * stride + w0 // pool_rows))
+    pred = _sb((ROW_TILE, pools, pool_rows), nl.uint8)
+    nisa.tensor_tensor(dst=pred, data1=counts.expand_dim(2).broadcast(2, pool_rows),
+                       data2=rank[:, 0:pools, :], op=nl.greater, engine=nisa.engine.vector)
+    return pred.reshape((ROW_TILE, width))
+
+
+def _superblock_tile(pool_hbm, rank, q_t, rows_t, rows, run_max, run_sum, acc, softmax_scale,
                      r0, w0):
     """Fold window rows ``w0 ..`` (one superblock) into query rows ``r0 .. r0 + 127``.
 
-    ``q_t`` is the tile's queries with the latent on the partitions
-    (``mla_dense_window._query_columns``); ``run_max``, ``run_sum`` (``[128, 1]`` fp32)
-    and ``acc`` (``[128, L]`` fp32) are the tile's running statistics, updated in place:
-    the raw-score maximum, the sum of ``exp(scale * (score - run_max))`` and the
-    unnormalised output against that maximum.
+    ``rank`` is :func:`_pool_ranks` for the longest superblock. ``q_t`` is the tile's
+    queries with the latent on the partitions (``mla_dense_window._query_columns``);
+    ``run_max``, ``run_sum`` (``[128, 1]`` fp32) and ``acc`` (``[128, L]`` fp32) are the
+    tile's running statistics, updated in place: the raw-score maximum, the sum of
+    ``exp(scale * (score - run_max))`` and the unnormalised output against that maximum.
     """
-    window = member_hbm.shape[1]
     width = rows_t.shape[2]
     latent = rows.shape[2]
     kv_dtype = rows.dtype
     n_blocks = width // MOVING_MAX
 
     # ---- MM1 per 512 rows, the selected scores and their block maxima ------------------
-    pred = _sb((ROW_TILE, width), nl.uint8)
-    nisa.dma_copy(dst=pred, src=member_hbm.ap(pattern=[[window, ROW_TILE], [1, width]],
-                                              offset=r0 * window + w0))
+    pred = _selected_rows(pool_hbm, rank, r0, w0, width)
     scores = _sb((ROW_TILE, width), nl.float32)
     block_max = _sb((ROW_TILE, n_blocks), nl.float32)
     for b in range(n_blocks):
@@ -238,8 +280,8 @@ def _store_tile(out_hbm, acc, run_sum, r0):
                   src=out_sb)
 
 
-def _dense_masked_body(q_hbm, bank_hbm, table_hbm, member_hbm, softmax_scale, page_size,
-                       superblock_pages, out_hbm):
+def _dense_masked_body(q_hbm, bank_hbm, table_hbm, pool_hbm, softmax_scale, page_size,
+                       pool_rows, superblock_pages, out_hbm):
     """Every 128-query tile of this program over every superblock of the window.
 
     The tiles are dealt round-robin over the programs; ``program_id`` is a trace-time int
@@ -254,6 +296,7 @@ def _dense_masked_body(q_hbm, bank_hbm, table_hbm, member_hbm, softmax_scale, pa
     prg = nl.program_id(0)
     banked = bank_hbm.reshape((bank_hbm.shape[0] // page_size, page_size, latent))
     bank_page = _ms._bank_pieces(table_hbm, 1)
+    rank = _pool_ranks(superblock_pages * page_size // pool_rows, pool_rows)
 
     q_cols = []
     run_max = []
@@ -280,16 +323,16 @@ def _dense_masked_body(q_hbm, bank_hbm, table_hbm, member_hbm, softmax_scale, pa
         n_pages = min(superblock_pages, pages - page0)
         ops = _superblock_rows(banked, bank_page, page0, n_pages, latent)
         for j in range(mine):
-            _superblock_tile(member_hbm, q_cols[j], ops[_SB_T], ops[_SB_ROWS], run_max[j],
+            _superblock_tile(pool_hbm, rank, q_cols[j], ops[_SB_T], ops[_SB_ROWS], run_max[j],
                              run_sum[j], acc[j], softmax_scale, starts[j], page0 * page_size)
     for j in range(mine):
         _store_tile(out_hbm, acc[j], run_sum[j], starts[j])
 
 
 @nki.jit
-def mla_dense_masked_kernel(q_hbm, bank_hbm, table_hbm, member_hbm, softmax_scale, page_size,
-                            superblock_pages, source_digest=0, staging_digest=0):
-    """Attention of each query over the window rows its mask selects, in one dense pass.
+def mla_dense_masked_kernel(q_hbm, bank_hbm, table_hbm, pool_hbm, softmax_scale, page_size,
+                            pool_rows, superblock_pages, source_digest=0, staging_digest=0):
+    """Attention of each query over the window rows its pool mask selects, in one dense pass.
 
     Args:
         q_hbm: ``[S, 1, L]`` bf16 or fp16, the absorbed queries; ``S`` a multiple of 128,
@@ -298,10 +341,13 @@ def mla_dense_masked_kernel(q_hbm, bank_hbm, table_hbm, member_hbm, softmax_scal
             holds this step's rows (the sparse kernel's bank form).
         table_hbm: ``[pages, 1]`` int32, the window's pages in order (``-1`` pads read
             bank page 0, as the sparse kernel's do).
-        member_hbm: ``[S, pages * page_size]`` uint8: 1 where query ``s`` attends window
-            row ``w``, 0 elsewhere.
+        pool_hbm: ``[S, pools + 1]`` uint8, ``pools = pages * page_size / pool_rows``
+            (:func:`selection_pool_counts`): for query ``s`` and window pool ``g`` the
+            count of the pool's leading rows the query selects; the last column is never
+            read.
         softmax_scale: python float applied to the scores before the softmax.
         page_size: python int, rows per page: :data:`KEY_CHUNK`.
+        pool_rows: python int, rows per pool, a divisor of ``page_size``.
         superblock_pages: python int, pages per superblock (:data:`SUPERBLOCK_PAGES`), a
             multiple of ``MOVING_MAX // page_size``.
         source_digest, staging_digest: python ints that only key the compiled-kernel cache
@@ -316,24 +362,77 @@ def mla_dense_masked_kernel(q_hbm, bank_hbm, table_hbm, member_hbm, softmax_scal
     """
     seq, heads, latent = q_hbm.shape
     out_hbm = nl.ndarray((seq, heads, latent), dtype=nl.float32, buffer=nl.shared_hbm)
-    _dense_masked_body(q_hbm, bank_hbm, table_hbm, member_hbm, softmax_scale, page_size,
-                       superblock_pages, out_hbm)
+    _dense_masked_body(q_hbm, bank_hbm, table_hbm, pool_hbm, softmax_scale, page_size,
+                       pool_rows, superblock_pages, out_hbm)
     return out_hbm
 
 
-def _require_call(q_lift: Tensor, c_kv: Tensor, member: Tensor, softmax_scale: float,
-                  block_table_row: Tensor, page_size: int, superblock_pages: int) -> None:
+def _scatter_pool_counts(mask: Tensor, part: Tensor, pool_rows: int, pools: int) -> Tensor:
+    """``mask`` with the counts of ``part``'s index groups scattered in (:func:`selection_pool_counts`)."""
+    seq = int(part.shape[0])
+    groups = part.reshape(seq, int(part.shape[1]) // pool_rows, pool_rows)
+    counts = (groups >= 0).to(torch.int32).sum(dim=2, dtype=torch.int32).to(torch.uint8)
+    first = groups[:, :, 0]
+    pool = torch.where(first >= 0, first // pool_rows, torch.full_like(first, pools))
+    return mask.scatter(1, pool.long(), counts)
+
+
+def selection_pool_counts(indices: Tensor, pool_rows: int, pools: int) -> Tensor:
+    """The pool mask of index rows in ``dsa_index_expand``'s layout: ``[S, pools + 1]`` uint8.
+
+    Each group of ``pool_rows`` columns of ``indices`` names the leading rows of one window
+    pool, or no row (the module docstring). The group's count of non-negative columns is
+    scattered to its pool's column, the pool of its first index; a group of ``-1`` sends
+    its count, 0, to the trailing trash column instead, so no pool's column is written by
+    an empty group. This rests on the layout's two facts: the pools of one row are
+    distinct, and each index is a window row, below ``pools * pool_rows``. The groups go
+    in two scatters (:data:`_SCATTER_GROUPS`); they write distinct pools, so the order
+    does not change the mask.
+
+    Args:
+        indices: ``[S, width]`` int32 window rows, ``-1`` for none; ``width`` a multiple
+            of ``pool_rows``.
+        pool_rows: rows per pool, the indexer's pool size.
+        pools: the window's pools, ``pages * page_size / pool_rows``.
+
+    Returns:
+        ``[S, pools + 1]`` uint8: each selected pool's count (1 to ``pool_rows``), 0
+        elsewhere and in the trash column.
+
+    Raises:
+        MlaDenseMaskedError: for index rows that are not whole groups of ``pool_rows``
+            int32 columns.
+    """
+    if indices.ndim != 2 or indices.dtype != torch.int32 or int(pool_rows) <= 0 \
+            or int(indices.shape[1]) % int(pool_rows) != 0:
+        raise MlaDenseMaskedError(
+            f"indices must be [seq, width] int32 with width a multiple of the pool size; got "
+            f"{tuple(indices.shape)} {indices.dtype} and pool size {pool_rows}"
+        )
+    pool_rows, pools = int(pool_rows), int(pools)
+    width = int(indices.shape[1])
+    head = width // pool_rows // _SCATTER_GROUPS * _SCATTER_GROUPS * pool_rows
+    mask = torch.zeros(int(indices.shape[0]), pools + 1, dtype=torch.uint8, device=indices.device)
+    for start, stop in ((0, head), (head, width)):
+        if stop > start:
+            mask = _scatter_pool_counts(mask, indices[:, start:stop], pool_rows, pools)
+    return mask
+
+
+def _require_call(q_lift: Tensor, c_kv: Tensor, pool_mask: Tensor, softmax_scale: float,
+                  block_table_row: Tensor, pool_rows: int, page_size: int,
+                  superblock_pages: int) -> None:
     if not envs.VLLM_NEURON_MLA_DENSE_MASKED:
         raise MlaDenseMaskedError(
             "the dense-masked MLA kernel is off: set VLLM_NEURON_MLA_DENSE_MASKED=1 to call it"
         )
     if not softmax_scale > 0:
         raise MlaDenseMaskedError(f"softmax_scale must be positive; got {softmax_scale}")
-    if q_lift.ndim != 3 or c_kv.ndim != 2 or member.ndim != 2 or block_table_row.ndim != 2:
+    if q_lift.ndim != 3 or c_kv.ndim != 2 or pool_mask.ndim != 2 or block_table_row.ndim != 2:
         raise MlaDenseMaskedError(
-            f"q_lift must be [seq, 1, latent], c_kv [slots, latent], member [seq, window] "
+            f"q_lift must be [seq, 1, latent], c_kv [slots, latent], pool_mask [seq, pools + 1] "
             f"and block_table_row [pages, 1]; got {tuple(q_lift.shape)}, {tuple(c_kv.shape)}, "
-            f"{tuple(member.shape)} and {tuple(block_table_row.shape)}"
+            f"{tuple(pool_mask.shape)} and {tuple(block_table_row.shape)}"
         )
     seq, heads, latent = (int(d) for d in q_lift.shape)
     pages = int(block_table_row.shape[0])
@@ -350,16 +449,21 @@ def _require_call(q_lift: Tensor, c_kv: Tensor, member: Tensor, softmax_scale: f
         raise MlaDenseMaskedError(
             f"q_lift and c_kv must share a 2-byte float dtype; got {q_lift.dtype} and {c_kv.dtype}"
         )
-    if member.dtype != torch.uint8 or tuple(member.shape) != (seq, pages * int(page_size)):
-        raise MlaDenseMaskedError(
-            f"member must be [seq, pages * page_size] = [{seq}, {pages * int(page_size)}] uint8; "
-            f"got {tuple(member.shape)} {member.dtype}"
-        )
     blocks = MOVING_MAX // KEY_CHUNK
     if int(page_size) != KEY_CHUNK or pages % blocks != 0:
         raise MlaDenseMaskedError(
             f"a page is one {KEY_CHUNK}-row chunk and the window whole {MOVING_MAX}-row "
             f"blocks; got page_size {page_size} and {pages} pages"
+        )
+    if int(pool_rows) <= 0 or int(page_size) % int(pool_rows) != 0:
+        raise MlaDenseMaskedError(
+            f"a pool must divide the {page_size}-row page; got {pool_rows} rows per pool"
+        )
+    pools = pages * int(page_size) // int(pool_rows)
+    if pool_mask.dtype != torch.uint8 or tuple(pool_mask.shape) != (seq, pools + 1):
+        raise MlaDenseMaskedError(
+            f"pool_mask must be [seq, pools + 1] = [{seq}, {pools + 1}] uint8 "
+            f"(selection_pool_counts); got {tuple(pool_mask.shape)} {pool_mask.dtype}"
         )
     if superblock_pages < blocks or superblock_pages % blocks != 0:
         raise MlaDenseMaskedError(
@@ -371,22 +475,24 @@ def _require_call(q_lift: Tensor, c_kv: Tensor, member: Tensor, softmax_scale: f
         )
 
 
-def mla_dense_masked_attention(q_lift: Tensor, c_kv: Tensor, member: Tensor,
-                               softmax_scale: float, block_table_row: Tensor,
+def mla_dense_masked_attention(q_lift: Tensor, c_kv: Tensor, pool_mask: Tensor,
+                               softmax_scale: float, block_table_row: Tensor, pool_rows: int,
                                page_size: int = KEY_CHUNK,
                                superblock_pages: int = SUPERBLOCK_PAGES) -> Tensor:
     """Sparse MLA prefill attention over each query's selection as a dense masked pass.
 
     The operands are ``mla_sparse.mla_sparse_attention``'s paged bank-form call, with the
-    selection given as a row mask over the window instead of index rows.
+    selection as its pool mask (:func:`selection_pool_counts` of the index rows) and the
+    indexer's pool size.
 
     Args:
         q_lift: ``[S, 1, L]`` bf16/fp16, the absorbed query; ``S`` a multiple of 128.
         c_kv: ``[slots, L]`` the whole latent bank, same dtype, already holding this
             step's rows.
-        member: ``[S, pages * page_size]`` uint8, 1 on each window row the query attends.
+        pool_mask: ``[S, pools + 1]`` uint8, :func:`selection_pool_counts`.
         softmax_scale: positive.
         block_table_row: ``[pages, 1]`` int32, the window's pages in order, ``-1`` pads.
+        pool_rows: rows per pool, a divisor of ``page_size``.
         page_size: rows per page, :data:`KEY_CHUNK`.
         superblock_pages: pages per superblock.
 
@@ -398,7 +504,7 @@ def mla_dense_masked_attention(q_lift: Tensor, c_kv: Tensor, member: Tensor,
         MlaDenseMaskedError: while ``VLLM_NEURON_MLA_DENSE_MASKED`` is unset, or for a
             malformed call or a geometry the kernel does not serve.
     """
-    _require_call(q_lift, c_kv, member, softmax_scale, block_table_row, page_size,
+    _require_call(q_lift, c_kv, pool_mask, softmax_scale, block_table_row, pool_rows, page_size,
                   superblock_pages)
     call = wrap_nki(mla_dense_masked_kernel)
     if lnc_pair() and int(q_lift.shape[0]) >= 2 * ROW_TILE:
@@ -407,9 +513,10 @@ def mla_dense_masked_attention(q_lift: Tensor, c_kv: Tensor, member: Tensor,
         q_lift.contiguous(),
         c_kv.contiguous(),
         block_table_row.contiguous().to(torch.int32),
-        member.contiguous(),
+        pool_mask.contiguous(),
         float(softmax_scale),
         int(page_size),
+        int(pool_rows),
         int(superblock_pages),
         SOURCE_DIGEST,
         int(_ms.SOURCE_DIGEST),
