@@ -133,8 +133,8 @@ if TYPE_CHECKING:
     # token attends its latent window densely (mla_dense_window.py) instead of
     # selecting and gathering. On by default; 0 restores the sparse path.
     VLLM_NEURON_MLA_DENSE_WINDOW: bool = True
-    # GLM-5.3-Flash DSA prefill: let the block-shared sparse MLA kernel
-    # (mla_block_shared.py) be called. Off by default; no call site sets it.
+    # GLM-5.3-Flash DSA prefill: let the block-shared sparse MLA kernel and its union
+    # producer (mla_block_shared.py) be called. Off by default; no call site sets it.
     VLLM_NEURON_MLA_BLOCK_SHARED: bool = False
     # Let the GLM-5.3-Flash DSA prefill's sparse MLA body gather its rows from the
     # latent bank through the block table, with no staged window. On by default; 0
@@ -632,11 +632,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NEURON_MLA_DENSE_WINDOW": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_MLA_DENSE_WINDOW")) is not False
     ),
-    # Allow ``functional/attention/mla_block_shared.py``'s entry: the sparse prefill
+    # Allow ``functional/attention/mla_block_shared.py``'s entries: the sparse prefill
     # attention with one gather per block of neighbouring queries (the union of their
-    # selections) and each query's selection as a mask over it. The entry refuses a
-    # call while this is unset. It has no call site yet; read at trace time. Off by
-    # default.
+    # selections) and each query's selection as a mask over it, and the producer that
+    # builds the union and the mask from the indexer's pool scores. Each entry refuses
+    # a call while this is unset. They have no call site yet; read at trace time. Off
+    # by default.
     "VLLM_NEURON_MLA_BLOCK_SHARED": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_MLA_BLOCK_SHARED")) or False
     ),
