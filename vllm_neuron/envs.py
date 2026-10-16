@@ -148,6 +148,9 @@ if TYPE_CHECKING:
     # latent bank through the block table, with no staged window. On by default; 0
     # restores the staged window.
     VLLM_NEURON_MLA_SPARSE_BANK_ROWS: bool = True
+    # The number of DMAs the sparse MLA prefill bank form issues per query's gather:
+    # 1, 2 or 4, each over an equal run of its latent tiles. 1 (one DMA) by default.
+    VLLM_NEURON_MLA_SPARSE_GATHER_SPLIT: int = 1
     # Divide the GLM-5.3-Flash DSA prefill selection's query rows over the
     # tensor-parallel ranks. On by default; 0 restores the replicated selection.
     VLLM_NEURON_DSA_INDEXER_SHARD: bool = True
@@ -693,6 +696,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # window.
     "VLLM_NEURON_MLA_SPARSE_BANK_ROWS": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_MLA_SPARSE_BANK_ROWS")) is not False
+    ),
+    # Issue each query's gather-transpose in the sparse MLA prefill's bank form
+    # (``functional/attention/mla_sparse.py``) as this many DMAs on the software DGE,
+    # each over an equal run of the latent tiles, instead of one. The same bits; the
+    # queue issues each DMA without waiting for the one before it. 1, 2 or 4; the seam
+    # refuses any other count (``mla_sparse.gather_split``). Read at trace time; a
+    # change needs a new compile. 1 by default.
+    "VLLM_NEURON_MLA_SPARSE_GATHER_SPLIT": lambda: (
+        maybe_convert_int(os.getenv("VLLM_NEURON_MLA_SPARSE_GATHER_SPLIT")) or 1
     ),
     # ================== GLM-5.3-Flash DSA Indexer ==================
     # Shard the DSA prefill selection (score GEMM, causal bound, top-k, sentinel
