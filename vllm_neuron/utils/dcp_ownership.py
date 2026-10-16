@@ -278,3 +278,65 @@ def owned_step_rows(
     local = offset + torch.arange(count, dtype=torch.int64, device=at.device)
     positions = token_position(local, rank, block_size=block_size, dcp_size=dcp_size)
     return torch.clamp(positions - at, max=step_tokens - 1), offset
+
+
+def owned_latent_slots(
+    block_table: Tensor,
+    positions: Tensor,
+    rank: int | Tensor,
+    *,
+    block_size: int,
+    dcp_size: int,
+    null_block: int,
+) -> Tensor:
+    """Return the latent slot rank ``rank`` writes each request's position to.
+
+    Column ``r`` of ``block_table`` is request ``r``'s block-table row on this rank: entry
+    ``e`` names the rank's block that holds its share of positions ``e *
+    ownership_stride .. (e + 1) * ownership_stride - 1``, and ``-1`` pads. A position the
+    rank owns (:func:`token_owner`) lands at ``block_table[e, r] * block_size + local %
+    block_size``, with ``local`` its :func:`token_local_row` and ``e = local //
+    block_size``. A position another rank owns, or whose entry is ``-1`` or past the
+    table, lands at offset 0 of block ``null_block``, which no request holds. So a rank
+    writes only the rows it owns, and a write keeps the step's shape.
+
+    Integer torch with no host read, so a traced step computes it on device. At
+    ``dcp_size == 1`` it is ``block * block_size + position % block_size`` through the
+    request's own table.
+
+    Args:
+        block_table: ``[entries, R]`` integer tensor.
+        positions: ``[R]`` integer tensor of absolute positions, one per column.
+        rank: this rank's index in the DCP group, an int or a one-element tensor.
+        block_size: tokens per KV block (the DCP interleave).
+        dcp_size: ranks in the DCP group.
+        null_block: the block a write that has no slot of this rank's goes to.
+
+    Returns:
+        ``[R]`` int64.
+
+    Raises:
+        ValueError: ``block_table`` is not 2-D, or ``positions`` does not hold one entry
+            per column.
+    """
+    _check_geometry(block_size, dcp_size)
+    _check_rank(rank, dcp_size)
+    if block_table.ndim != 2 or positions.numel() != int(block_table.shape[1]):
+        raise ValueError(
+            f"block_table must be [entries, R] with one position per column; got "
+            f"block_table {tuple(block_table.shape)} and positions "
+            f"{tuple(positions.shape)}"
+        )
+    table = block_table.to(torch.int64)
+    at = positions.to(device=table.device, dtype=torch.int64).reshape(-1)
+    null = torch.full_like(at, int(null_block) * block_size)
+    entries = int(table.shape[0])
+    if entries == 0:
+        return null
+    local = token_local_row(at, block_size=block_size, dcp_size=dcp_size)
+    entry = local // block_size
+    blocks = torch.gather(table, 0, entry.clamp(min=0, max=entries - 1).reshape(1, -1))
+    blocks = blocks.reshape(-1)
+    owned = token_owner(at, block_size=block_size, dcp_size=dcp_size) == rank
+    held = owned & (entry < entries) & (blocks >= 0)
+    return torch.where(held, blocks * block_size + local % block_size, null)

@@ -8117,14 +8117,18 @@ class Glm5NextMLAAttention(nn.Module):
         *,
         topk_indices: torch.Tensor | None,
     ) -> torch.Tensor:
-        """One decode token per request under DCP: ``[B, H, L]`` bf16.
+        """``T`` decode rows per request under DCP: ``[B * T, H, L]`` bf16.
 
-        ``mla_decode_partial_attention`` (5a) over this rank's window: ``position`` is
-        handed as the step's owned length on this rank (its local row where the rank
-        owns the step, else the rows it holds before the step's block) and ``owner``
-        as whether it owns the step, so the own row in ``written`` counts on its owner
-        only. ``block_table`` is ``[B, pages]``; ``topk_indices`` the indexer's rows of
-        this rank's window, or None for the dense prefix.
+        ``mla_decode_partial_attention`` (5a) over this rank's window. Row ``t`` of
+        request ``b`` (row ``b * T + t`` of ``q_lift`` and ``written``) sits at position
+        ``position[b] + t``; ``T`` is ``q_lift``'s rows over the requests, 1 on the plain
+        decode step and ``1 + k`` on a speculative verify step. Each row's position is
+        handed as its owned length on this rank (its local row where the rank owns it,
+        else the rows the rank holds before it) and ``owner`` as whether the rank owns
+        it, so each own row in ``written`` counts on its owner only. At ``T = 1`` both
+        are ``[B]`` and read ``position`` directly. ``block_table`` is ``[B, pages]``;
+        ``topk_indices`` the indexer's rows of this rank's window, one per query row, or
+        None for the dense prefix.
 
         The key-split kernel cuts its window into 128-row chunks shared evenly by the
         two programs of an LNC2 pair (``mla_decode._split_serves``), and the served
@@ -8151,8 +8155,19 @@ class Glm5NextMLAAttention(nn.Module):
             pad = -int(topk_indices.shape[1]) % (2 * page_size)
             if pad:
                 topk_indices = torch.cat(
-                    (topk_indices, topk_indices.new_full((batch, pad), SENTINEL)), dim=1
+                    (
+                        topk_indices,
+                        topk_indices.new_full((int(topk_indices.shape[0]), pad), SENTINEL),
+                    ),
+                    dim=1,
                 )
+        # ``position`` is read before ``q_lift``: dynamo orders a graph's inputs by their
+        # first read, so the one-row graph keeps its input order.
+        requests = int(position.shape[0])
+        rows = int(q_lift.shape[0]) // requests
+        if rows > 1:
+            offsets = torch.arange(rows, device=position.device, dtype=torch.int64)
+            position = (position.to(torch.int64)[:, None] + offsets[None, :]).reshape(-1)
         owner = token_owner(
             position.to(torch.int64), block_size=page_size, dcp_size=self.dcp_size
         ) == rank
@@ -8311,7 +8326,8 @@ class Glm5NextMLAAttention(nn.Module):
         # draft head's carrier hands the selection to later iterations as token
         # indices, so it keeps them.
         masked = (
-            not dense
+            self.dcp_size == 1
+            and not dense
             and index_share is None
             and batch == 1
             and rows > 1

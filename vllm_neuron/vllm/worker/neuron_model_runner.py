@@ -617,9 +617,9 @@ def _dcp_owned_latent_slots(
             any rank.
     """
     from vllm_neuron.utils.dcp_ownership import (
+        owned_latent_slots,
         ownership_stride,
         token_local_row,
-        token_owner,
     )
 
     local = token_local_row(positions, block_size=block_size, dcp_size=dcp_size)
@@ -632,10 +632,16 @@ def _dcp_owned_latent_slots(
             f"decode_context_parallel_size={dcp_size} one entry covers {stride} "
             f"positions, and a position outside the row has no slot"
         )
-    owned = token_owner(positions, block_size=block_size, dcp_size=dcp_size) == cp_rank
-    slots = torch.tensor(row, dtype=torch.int64)[pages] * block_size + local % block_size
-    return torch.where(
-        owned, slots, torch.full_like(slots, NULL_BLOCK_ID * block_size)
+    # One column per position, all of them this request's row.
+    table = torch.tensor(row, dtype=torch.int64).reshape(-1, 1)
+    table = table.expand(-1, positions.numel())
+    return owned_latent_slots(
+        table,
+        positions,
+        cp_rank,
+        block_size=block_size,
+        dcp_size=dcp_size,
+        null_block=NULL_BLOCK_ID,
     ).tolist()
 
 
