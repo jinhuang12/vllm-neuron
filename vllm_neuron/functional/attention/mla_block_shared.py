@@ -62,15 +62,13 @@ score, as on the gather path; the predicate drops it for every other query. MM2 
 every union row whatever its probability, and ``0 * NaN`` is NaN, so each superblock's
 MM2 operand has its non-finite elements set to 0.0 first.
 
-The exact path. A block whose shared pools do not fit its cap has a cut union (its
-overflow flag in ``totals`` is 1). After the program's last block, the attention kernel
-runs one dynamic loop per round of blocks (one block per program): its trip count is the
-largest flag of the round, so both programs of an LNC2 pair run it alike, and when it is 1
-each program reruns its block of the round by today's per-query gather
-(``mla_block_shared_exact``), whose stores replace the block's rows. A round without a cut
-union pays its loop's entry and exit only. The block-shared body itself runs outside every
-dynamic loop: each loop's basic blocks end on a drain of every engine, which would break
-the two-block overlap.
+A block whose shared pools do not fit its cap has a cut union (its overflow flag in
+``totals`` is 1); this kernel still writes rows for it from what fits. The caller runs
+``mla_block_shared_exact`` right after it on every call: a kernel of its own, with fixed
+addresses and the device loops, which rewrites those blocks' rows by today's per-query
+gather. This kernel holds no device loop: in one graph a fixed-address kernel with a
+device loop (the served MoE combine) before a device loop without fixed addresses does
+not compile.
 
 Both entries refuse a call unless ``VLLM_NEURON_MLA_BLOCK_SHARED`` (``vllm_neuron/envs.py``)
 is set. They have no call site. ``mla_block_shared_serves`` and ``mla_block_shared_union_cap``
@@ -89,7 +87,6 @@ import nki.language as nl
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
 from vllm_neuron import envs
-from vllm_neuron.functional.attention import mla_block_shared_exact as _exact
 from vllm_neuron.functional.attention import mla_dense_window as _dw
 from vllm_neuron.functional.attention import mla_sparse as _ms
 from vllm_neuron.functional.dsa.launch_grid import lnc_pair
@@ -128,8 +125,6 @@ _TOTAL_FLOOR = 1.0e-30
 #: This file's digest as a trace-time int: the compiled-kernel cache keys on the entry's
 #: own source and arguments only.
 SOURCE_DIGEST = source_digest(__file__)
-#: Keys the compiled-kernel cache on the exact path's source (the companion module's helpers).
-EXACT_DIGEST = source_digest(_exact.__file__)
 
 _sb = _dw._sb
 _col = _dw._col
@@ -383,7 +378,7 @@ def _tile_state(q_hbm, r0):
     return state
 
 
-def _block_shared_body(q_hbm, bank_hbm, bank_rows, union_hbm, member_hbm, softmax_scale,
+def _block_shared_body(q_hbm, bank_hbm, table_hbm, union_hbm, member_hbm, softmax_scale,
                        page_size, block_queries, union_cap, out_hbm):
     """Every block of this program over every superblock of its union, :data:`_PAIR` at a time.
 
@@ -400,6 +395,7 @@ def _block_shared_body(q_hbm, bank_hbm, bank_rows, union_hbm, member_hbm, softma
     tiles = block_queries // ROW_TILE
     n_prgs = nl.num_programs(axes=0)
     prg = nl.program_id(0)
+    bank_rows = _ms._lowp_bank_table(table_hbm, page_size)
 
     for first in range(prg, n_blocks, _PAIR * n_prgs):
         n_group = min(_PAIR, (n_blocks - first + n_prgs - 1) // n_prgs)
@@ -435,39 +431,10 @@ def _block_shared_body(q_hbm, bank_hbm, bank_rows, union_hbm, member_hbm, softma
                             states[gi][ti][_ST_ROW])
 
 
-def _exact_rounds(q_hbm, bank_hbm, bank_rows, totals_hbm, topk_hbm, softmax_scale, page_size,
-                  block_queries, out_hbm):
-    """Rerun each round of blocks with a cut union by today's per-query gather.
-
-    A round is one block per program, the blocks the programs run side by side; the call's
-    blocks are a whole number of rounds. The trip counts of every round are read before the
-    first loop. Each is the largest overflow flag of its round's ``totals`` rows (one per
-    128 queries), so both programs of an LNC2 pair run every loop the same number of times:
-    each basic block of a dynamic loop ends on a barrier of both cores. A round with a cut
-    union reruns both programs' blocks; the exact path is right for any block.
-    """
-    n_blocks = q_hbm.shape[0] // block_queries
-    n_prgs = nl.num_programs(axes=0)
-    prg = nl.program_id(0)
-    flag_rows = block_queries // ROW_TILE
-    n_rounds = n_blocks // n_prgs
-    trips = []
-    for ri in range(n_rounds):
-        trips.append(_exact.exact_trip_count(totals_hbm, ri * n_prgs * flag_rows,
-                                             n_prgs * flag_rows))
-    for ri in range(n_rounds):
-        # fori_loop traces the body here, in this iteration, so ``ri`` is this round's.
-        def rerun_block(_iteration):
-            _exact.exact_block(q_hbm, bank_hbm, topk_hbm, bank_rows, softmax_scale, page_size,
-                               ri * n_prgs + prg, block_queries, out_hbm)  # noqa: B023
-
-        nl.fori_loop(0, trips[ri], rerun_block)
-
-
 @nki.jit
-def mla_block_shared_kernel(q_hbm, bank_hbm, table_hbm, union_hbm, member_hbm, totals_hbm,
-                            topk_hbm, softmax_scale, page_size, block_queries, union_cap,
-                            source_digest=0, staging_digest=0, exact_digest=0):
+def mla_block_shared_kernel(q_hbm, bank_hbm, table_hbm, union_hbm, member_hbm, softmax_scale,
+                            page_size, block_queries, union_cap, source_digest=0,
+                            staging_digest=0):
     """Attention of each query over the union rows its mask selects, one gather per block.
 
     Args:
@@ -481,33 +448,24 @@ def mla_block_shared_kernel(q_hbm, bank_hbm, table_hbm, union_hbm, member_hbm, t
             queries select, ``-1`` past the last.
         member_hbm: ``[S, union_cap]`` uint8: 1 where query ``s`` selects position ``u`` of
             its block's union, 0 elsewhere (0 on every pad position).
-        totals_hbm: ``[S / 128, 2]`` int32, the union producer's totals: column 1 is 1 where
-            the 128-query block's union is cut.
-        topk_hbm: ``[S, K]`` int32, the call's top-k window rows (``-1`` = no row), ``K`` a
-            multiple of 128: the exact path's input.
         softmax_scale: python float applied to the scores before the softmax.
         page_size: python int, rows per page, a power of two.
         block_queries: python int, queries per block, a multiple of 128.
         union_cap: python int, union positions per block, a multiple of :data:`MOVING_MAX`.
-        source_digest, staging_digest, exact_digest: python ints that only key the
-            compiled-kernel cache on this file, on ``mla_sparse.py`` (the bank-table helpers)
-            and on ``mla_block_shared_exact.py`` (the exact path).
+        source_digest, staging_digest: python ints that only key the compiled-kernel cache
+            on this file and on ``mla_sparse.py`` (the bank-table helpers).
 
     Returns:
         ``[S, 1, L]`` fp32 in shared HBM: ``softmax(scale * q . k) @ k`` over the rows the
-        query selects; a query that selects no row returns zeros. A block of a round with a
-        cut union has the sparse kernel's output bits instead.
+        query selects; a query that selects no row returns zeros.
 
-    Under a two-program launch the blocks are dealt round-robin between the programs, each
-    program gathers its own blocks' unions, and the blocks are a whole number of rounds.
+    Under a two-program launch the blocks are dealt round-robin between the programs, and
+    each program gathers its own blocks' unions.
     """
     seq, heads, latent = q_hbm.shape
     out_hbm = nl.ndarray((seq, heads, latent), dtype=nl.float32, buffer=nl.shared_hbm)
-    bank_rows = _ms._lowp_bank_table(table_hbm, page_size)
-    _block_shared_body(q_hbm, bank_hbm, bank_rows, union_hbm, member_hbm, softmax_scale,
+    _block_shared_body(q_hbm, bank_hbm, table_hbm, union_hbm, member_hbm, softmax_scale,
                        page_size, block_queries, union_cap, out_hbm)
-    _exact_rounds(q_hbm, bank_hbm, bank_rows, totals_hbm, topk_hbm, softmax_scale, page_size,
-                  block_queries, out_hbm)
     return out_hbm
 
 
@@ -519,8 +477,8 @@ def _require_knob() -> None:
 
 
 def _require_call(q_lift: Tensor, c_kv: Tensor, union_rows: Tensor, member: Tensor,
-                  totals: Tensor, topk_indices: Tensor, softmax_scale: float,
-                  block_table_row: Tensor, page_size: int, block_queries: int) -> None:
+                  softmax_scale: float, block_table_row: Tensor, page_size: int,
+                  block_queries: int) -> None:
     _require_knob()
     if not softmax_scale > 0:
         raise MlaBlockSharedError(f"softmax_scale must be positive; got {softmax_scale}")
@@ -569,30 +527,16 @@ def _require_call(q_lift: Tensor, c_kv: Tensor, union_rows: Tensor, member: Tens
             f"the page size must be a power of two that divides the bank's {int(c_kv.shape[0])} "
             f"rows; got {page_size}"
         )
-    if totals.dtype != torch.int32 or tuple(totals.shape) != (seq // ROW_TILE, 2):
-        raise MlaBlockSharedError(
-            f"totals must be [seq / {ROW_TILE}, 2] = [{seq // ROW_TILE}, 2] int32; got "
-            f"{tuple(totals.shape)} {totals.dtype}"
-        )
-    if (topk_indices.dtype != torch.int32 or topk_indices.ndim != 2
-            or int(topk_indices.shape[0]) != seq or int(topk_indices.shape[1]) < KEY_CHUNK
-            or int(topk_indices.shape[1]) % KEY_CHUNK != 0):
-        raise MlaBlockSharedError(
-            f"topk_indices must be [seq, K] int32 with K a multiple of {KEY_CHUNK}; got "
-            f"{tuple(topk_indices.shape)} {topk_indices.dtype}"
-        )
 
 
 def mla_block_shared_attention(q_lift: Tensor, c_kv: Tensor, union_rows: Tensor,
-                               member: Tensor, totals: Tensor, topk_indices: Tensor,
-                               softmax_scale: float, block_table_row: Tensor,
+                               member: Tensor, softmax_scale: float, block_table_row: Tensor,
                                page_size: int = KEY_CHUNK,
                                block_queries: int = ROW_TILE) -> Tensor:
     """Sparse MLA prefill attention with one shared gather per block of queries.
 
     The operands are ``mla_sparse.mla_sparse_attention``'s paged bank-form call, with the
-    selection given per block as its union and a row mask over it; the index rows stay for
-    the exact path (the module docstring).
+    selection given per block as its union and a row mask over it instead of index rows.
 
     Args:
         q_lift: ``[S, 1, L]`` bf16/fp16, the absorbed query; ``S`` a multiple of
@@ -602,10 +546,6 @@ def mla_block_shared_attention(q_lift: Tensor, c_kv: Tensor, union_rows: Tensor,
         union_rows: ``[S / block_queries, cap]`` int32, each block's selected window rows,
             ``-1`` pads; ``cap`` a multiple of :data:`MOVING_MAX`.
         member: ``[S, cap]`` uint8, 1 on each union position the query attends.
-        totals: ``[S / 128, 2]`` int32, the union producer's totals (column 1: the block's
-            union is cut).
-        topk_indices: ``[S, K]`` int32, the top-k window rows today's sparse call takes
-            (``-1`` = no row; ``K`` a multiple of 128). Read by the exact path only.
         softmax_scale: positive.
         block_table_row: ``[pages, 1]`` int32, the window's pages in order, ``-1`` pads.
         page_size: rows per page, a power of two.
@@ -613,18 +553,18 @@ def mla_block_shared_attention(q_lift: Tensor, c_kv: Tensor, union_rows: Tensor,
 
     Returns:
         ``[S, 1, L]`` fp32, the sparse kernel's answer up to the order and rounding of its
-        fp32 sums (a value-equal class, not bit-equal); on a block of a round with a cut union,
-        the sparse kernel's own bits.
+        fp32 sums (a value-equal class, not bit-equal). A block with a cut union gets rows
+        from what fits; ``mla_block_shared_exact`` rewrites them.
 
     Raises:
         MlaBlockSharedError: while ``VLLM_NEURON_MLA_BLOCK_SHARED`` is unset, or for a
             malformed call or a geometry the kernel does not serve.
     """
-    _require_call(q_lift, c_kv, union_rows, member, totals, topk_indices, softmax_scale,
-                  block_table_row, page_size, block_queries)
+    _require_call(q_lift, c_kv, union_rows, member, softmax_scale, block_table_row, page_size,
+                  block_queries)
     call = wrap_nki(mla_block_shared_kernel)
     blocks = int(q_lift.shape[0]) // block_queries
-    # Two programs need an even block count: an exact-path round holds one block per program.
+    # Two programs for an even block count only, as the exact kernel that follows launches.
     if lnc_pair() and blocks >= 2 and blocks % 2 == 0:
         call = call[2]
     return call(
@@ -633,15 +573,12 @@ def mla_block_shared_attention(q_lift: Tensor, c_kv: Tensor, union_rows: Tensor,
         block_table_row.contiguous().to(torch.int32),
         union_rows.contiguous(),
         member.contiguous(),
-        totals.contiguous(),
-        topk_indices.contiguous(),
         float(softmax_scale),
         int(page_size),
         int(block_queries),
         int(union_rows.shape[1]),
         SOURCE_DIGEST,
         int(_ms.SOURCE_DIGEST),
-        EXACT_DIGEST,
     )
 
 
