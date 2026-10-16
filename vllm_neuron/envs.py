@@ -139,9 +139,11 @@ if TYPE_CHECKING:
     # Windows with at least this many pages route to the block-shared kernel when
     # VLLM_NEURON_MLA_BLOCK_SHARED is on; 0 routes every selecting window.
     VLLM_NEURON_MLA_BLOCK_SHARED_MIN_PAGES: int = 0
-    # GLM-5.3-Flash DSA prefill: let the dense-masked sparse MLA kernel
-    # (mla_dense_masked.py) be called. Off by default; no call site sets it.
+    # GLM-5.3-Flash DSA prefill: let the sparse MLA seam give a paged NoPE call to
+    # the dense-masked kernel (mla_dense_masked.py). Off by default.
     VLLM_NEURON_MLA_DENSE_MASKED: bool = False
+    # The largest window, in pages, that the dense-masked route takes.
+    VLLM_NEURON_MLA_DENSE_MASKED_MAX_PAGES: int = 264
     # Let the GLM-5.3-Flash DSA prefill's sparse MLA body gather its rows from the
     # latent bank through the block table, with no staged window. On by default; 0
     # restores the staged window.
@@ -654,12 +656,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NEURON_MLA_BLOCK_SHARED_MIN_PAGES": lambda: (
         maybe_convert_int(os.getenv("VLLM_NEURON_MLA_BLOCK_SHARED_MIN_PAGES")) or 0
     ),
-    # Allow ``functional/attention/mla_dense_masked.py``'s entry: the sparse prefill
-    # attention as one dense pass over the window with each query's selection as a
-    # mask. The entry refuses a call while this is unset. It has no call site yet;
-    # read at trace time. Off by default.
+    # Let ``mla_sparse.mla_sparse_attention`` give a paged NoPE prefill call to
+    # ``functional/attention/mla_dense_masked.py``: one dense pass over the window,
+    # each query's selection a pool mask built from the top-k indices in the same
+    # graph. Taken where the bank already holds the step's rows and
+    # ``mla_dense_masked.dense_masked_serves`` accepts the shape and the window
+    # (VLLM_NEURON_MLA_DENSE_MASKED_MAX_PAGES); every other call keeps the gather.
+    # The entry refuses a call while this is unset. Read at trace time; a change
+    # needs a new compile. Off by default.
     "VLLM_NEURON_MLA_DENSE_MASKED": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_MLA_DENSE_MASKED")) or False
+    ),
+    # The largest window, in block-table pages, that the dense-masked route takes.
+    # The default is the largest window at which the route, its mask build included,
+    # took at most 0.8 of the gather's time with every smaller window also passing,
+    # in a kernel-alone device A/B on one trn2 core (1,024 query rows, 128-row pages,
+    # 4-row pools, real top-k selections, raw times). The route's time over the
+    # gather's: 0.71 at 264 pages, 0.84 at 520, 1.08 at 1,024, 1.34 at 1,500 and
+    # 1.58 at 2,048. The dense pass grows with the window and the gather does not.
+    # The mask build, a scatter of one byte per index group, costs 6.1-6.4 ms per
+    # call at every window and so sets the cap: the route's time less the build's
+    # stays under 0.8 of the gather's up to 1,500 pages. The served windows are 264,
+    # 520, 1,024, 1,032 and 2,048 pages, so any cap from 264 to 519 routes the same
+    # calls. Read at trace time; a change needs a new compile.
+    "VLLM_NEURON_MLA_DENSE_MASKED_MAX_PAGES": lambda: (
+        264
+        if os.getenv("VLLM_NEURON_MLA_DENSE_MASKED_MAX_PAGES") is None
+        else maybe_convert_int(os.getenv("VLLM_NEURON_MLA_DENSE_MASKED_MAX_PAGES"))
     ),
     # Let the sparse MLA prefill's low-precision row-tiled body
     # (``functional/attention/mla_sparse.py``) gather each query's selected rows

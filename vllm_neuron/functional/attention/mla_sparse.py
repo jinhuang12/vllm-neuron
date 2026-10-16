@@ -2648,7 +2648,11 @@ def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
             paged call the low-precision row-tiled body serves may then read the bank
             through the table with no staged window, where
             ``envs.VLLM_NEURON_MLA_SPARSE_BANK_ROWS`` is on (the default) and
-            :func:`bank_rows_serve` accepts ``page_size``.
+            :func:`bank_rows_serve` accepts ``page_size``. A paged NoPE call with a
+            positive ``pool_size`` that the masked window does not take may then take
+            ``mla_dense_masked.mla_dense_masked_attention``, one dense pass over the
+            window read through the table with the selection as a pool mask, wherever
+            ``mla_dense_masked.dense_masked_serves`` says so.
 
     Returns:
         ``[S, H, L]`` float32.
@@ -2675,6 +2679,24 @@ def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
                 q_lift, c_kv, topk_indices, softmax_scale, block_table_row,
                 written=written, write_offset=write_offset, page_size=page_size,
                 pool_size=pool_size)
+
+        # Imported here for the same reason: mla_dense_masked reads this module's digest.
+        from vllm_neuron.functional.attention import mla_dense_masked
+
+        pages = int(block_table_row.shape[0])
+        if (
+            rope == 0
+            and bool(written_in_bank)
+            and mla_dense_masked.dense_masked_serves(
+                seq, heads, latent, int(c_kv.shape[1]), int(c_kv.shape[0]), pages,
+                int(page_size), int(pool_size), topk, q_lift.dtype, c_kv.dtype)
+        ):
+            pool_mask = mla_dense_masked.selection_pool_counts(
+                topk_indices.contiguous().to(torch.int32), int(pool_size),
+                pages * int(page_size) // int(pool_size))
+            return mla_dense_masked.mla_dense_masked_attention(
+                q_lift, c_kv, pool_mask, softmax_scale, block_table_row, int(pool_size),
+                int(page_size))
 
     # The body is chosen from the shapes alone; no caller passes a flag. An exact-fit
     # latent keeps the untiled body; a ragged or wider-than-one-tile latent takes the

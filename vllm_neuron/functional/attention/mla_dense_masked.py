@@ -44,9 +44,11 @@ one holding the query's own position) as its leading rows up to that position, t
 non-negative columns says which. A row mask holds the same bits at ``R`` times the
 bytes, and it costs its producer one scattered element per selected row.
 
-The entry, :func:`mla_dense_masked_attention`, takes that pool mask. It has no call
-site: it refuses a call unless ``VLLM_NEURON_MLA_DENSE_MASKED`` (``vllm_neuron/envs.py``)
-is set.
+The entry, :func:`mla_dense_masked_attention`, takes that pool mask, and it refuses a
+call unless ``VLLM_NEURON_MLA_DENSE_MASKED`` (``vllm_neuron/envs.py``) is set. The sparse
+attention seam (``mla_sparse.mla_sparse_attention``) builds the mask and calls the entry
+for a paged NoPE call whose bank already holds the step's rows, wherever
+:func:`dense_masked_serves` says so; every other call keeps the gather.
 """
 
 from __future__ import annotations
@@ -419,6 +421,52 @@ def selection_pool_counts(indices: Tensor, pool_rows: int, pools: int) -> Tensor
     return mask
 
 
+def _geometry_refusal(seq: int, heads: int, latent: int, kv_latent: int, bank_rows: int,
+                      pages: int, q_dtype: torch.dtype, kv_dtype: torch.dtype, pool_rows: int,
+                      page_size: int, superblock_pages: int) -> str | None:
+    """Why the kernel does not serve this geometry, or None where it does."""
+    if heads != 1 or seq < ROW_TILE or seq % ROW_TILE != 0:
+        return f"queries come in whole {ROW_TILE}-row tiles of one head; got seq {seq}, heads {heads}"
+    if latent % LATENT_TILE != 0 or latent > LATENT_MAX or kv_latent != latent:
+        return (f"the latent must be a multiple of {LATENT_TILE} up to {LATENT_MAX}, the same in "
+                f"q_lift and c_kv; got {latent} and {kv_latent}")
+    if q_dtype not in (torch.bfloat16, torch.float16) or kv_dtype != q_dtype:
+        return f"q_lift and c_kv must share a 2-byte float dtype; got {q_dtype} and {kv_dtype}"
+    blocks = MOVING_MAX // KEY_CHUNK
+    if page_size != KEY_CHUNK or pages % blocks != 0:
+        return (f"a page is one {KEY_CHUNK}-row chunk and the window whole {MOVING_MAX}-row "
+                f"blocks; got page_size {page_size} and {pages} pages")
+    if pool_rows <= 0 or page_size % pool_rows != 0:
+        return f"a pool must divide the {page_size}-row page; got {pool_rows} rows per pool"
+    if superblock_pages < blocks or superblock_pages % blocks != 0:
+        return f"a superblock is whole {MOVING_MAX}-row blocks; got {superblock_pages} pages"
+    if bank_rows % KEY_CHUNK != 0:
+        return f"the bank must be whole pages of {KEY_CHUNK} rows; got {bank_rows} rows"
+    return None
+
+
+def dense_masked_serves(seq: int, heads: int, latent: int, kv_latent: int, bank_rows: int,
+                        pages: int, page_size: int, pool_rows: int, index_cols: int,
+                        q_dtype: torch.dtype, kv_dtype: torch.dtype) -> bool:
+    """True where the sparse attention seam (``mla_sparse.mla_sparse_attention``) hands a
+    paged NoPE call to :func:`mla_dense_masked_attention`.
+
+    Three conditions, each read at trace time: ``VLLM_NEURON_MLA_DENSE_MASKED`` is set; the
+    window is at most ``VLLM_NEURON_MLA_DENSE_MASKED_MAX_PAGES`` pages (``vllm_neuron/envs.py``
+    states where the dense pass beats the gather); and the kernel serves the geometry, with
+    index rows in whole groups of ``pool_rows`` columns (:func:`selection_pool_counts`).
+    """
+    return (
+        envs.VLLM_NEURON_MLA_DENSE_MASKED
+        and int(pages) <= envs.VLLM_NEURON_MLA_DENSE_MASKED_MAX_PAGES
+        and int(pool_rows) > 0
+        and int(index_cols) % int(pool_rows) == 0
+        and _geometry_refusal(int(seq), int(heads), int(latent), int(kv_latent), int(bank_rows),
+                              int(pages), q_dtype, kv_dtype, int(pool_rows), int(page_size),
+                              SUPERBLOCK_PAGES) is None
+    )
+
+
 def _require_call(q_lift: Tensor, c_kv: Tensor, pool_mask: Tensor, softmax_scale: float,
                   block_table_row: Tensor, pool_rows: int, page_size: int,
                   superblock_pages: int) -> None:
@@ -436,42 +484,16 @@ def _require_call(q_lift: Tensor, c_kv: Tensor, pool_mask: Tensor, softmax_scale
         )
     seq, heads, latent = (int(d) for d in q_lift.shape)
     pages = int(block_table_row.shape[0])
-    if heads != 1 or seq < ROW_TILE or seq % ROW_TILE != 0:
-        raise MlaDenseMaskedError(
-            f"queries come in whole {ROW_TILE}-row tiles of one head; got seq {seq}, heads {heads}"
-        )
-    if latent % LATENT_TILE != 0 or latent > LATENT_MAX or int(c_kv.shape[1]) != latent:
-        raise MlaDenseMaskedError(
-            f"the latent must be a multiple of {LATENT_TILE} up to {LATENT_MAX}, the same in "
-            f"q_lift and c_kv; got {latent} and {int(c_kv.shape[1])}"
-        )
-    if q_lift.dtype not in (torch.bfloat16, torch.float16) or c_kv.dtype != q_lift.dtype:
-        raise MlaDenseMaskedError(
-            f"q_lift and c_kv must share a 2-byte float dtype; got {q_lift.dtype} and {c_kv.dtype}"
-        )
-    blocks = MOVING_MAX // KEY_CHUNK
-    if int(page_size) != KEY_CHUNK or pages % blocks != 0:
-        raise MlaDenseMaskedError(
-            f"a page is one {KEY_CHUNK}-row chunk and the window whole {MOVING_MAX}-row "
-            f"blocks; got page_size {page_size} and {pages} pages"
-        )
-    if int(pool_rows) <= 0 or int(page_size) % int(pool_rows) != 0:
-        raise MlaDenseMaskedError(
-            f"a pool must divide the {page_size}-row page; got {pool_rows} rows per pool"
-        )
+    refusal = _geometry_refusal(seq, heads, latent, int(c_kv.shape[1]), int(c_kv.shape[0]), pages,
+                                q_lift.dtype, c_kv.dtype, int(pool_rows), int(page_size),
+                                int(superblock_pages))
+    if refusal is not None:
+        raise MlaDenseMaskedError(refusal)
     pools = pages * int(page_size) // int(pool_rows)
     if pool_mask.dtype != torch.uint8 or tuple(pool_mask.shape) != (seq, pools + 1):
         raise MlaDenseMaskedError(
             f"pool_mask must be [seq, pools + 1] = [{seq}, {pools + 1}] uint8 "
             f"(selection_pool_counts); got {tuple(pool_mask.shape)} {pool_mask.dtype}"
-        )
-    if superblock_pages < blocks or superblock_pages % blocks != 0:
-        raise MlaDenseMaskedError(
-            f"a superblock is whole {MOVING_MAX}-row blocks; got {superblock_pages} pages"
-        )
-    if int(c_kv.shape[0]) % KEY_CHUNK != 0:
-        raise MlaDenseMaskedError(
-            f"the bank must be whole pages of {KEY_CHUNK} rows; got {int(c_kv.shape[0])} rows"
         )
 
 
