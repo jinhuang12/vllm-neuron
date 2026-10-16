@@ -136,6 +136,9 @@ if TYPE_CHECKING:
     # GLM-5.3-Flash DSA prefill: let the block-shared sparse MLA kernel and its union
     # producer (mla_block_shared.py) be called. Off by default; no call site sets it.
     VLLM_NEURON_MLA_BLOCK_SHARED: bool = False
+    # Windows with at least this many pages route to the block-shared kernel when
+    # VLLM_NEURON_MLA_BLOCK_SHARED is on; 0 routes every selecting window.
+    VLLM_NEURON_MLA_BLOCK_SHARED_MIN_PAGES: int = 0
     # Let the GLM-5.3-Flash DSA prefill's sparse MLA body gather its rows from the
     # latent bank through the block table, with no staged window. On by default; 0
     # restores the staged window.
@@ -635,11 +638,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Allow ``functional/attention/mla_block_shared.py``'s entries: the sparse prefill
     # attention with one gather per block of neighbouring queries (the union of their
     # selections) and each query's selection as a mask over it, and the producer that
-    # builds the union and the mask from the indexer's pool scores. Each entry refuses
-    # a call while this is unset. They have no call site yet; read at trace time. Off
-    # by default.
+    # builds the union and the mask from the chunk's keep bits. Each entry refuses a
+    # call while this is unset. They have no call site yet; read at trace time. Off by
+    # default.
     "VLLM_NEURON_MLA_BLOCK_SHARED": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_MLA_BLOCK_SHARED")) or False
+    ),
+    # The smallest window, in pages, the DSA prefill routes to the block-shared kernel
+    # while VLLM_NEURON_MLA_BLOCK_SHARED is on: 0 routes every selecting window above
+    # the masked-window range; a deployment that also enables the dense-masked route
+    # sets the crossover here. Read at trace time by the call site.
+    "VLLM_NEURON_MLA_BLOCK_SHARED_MIN_PAGES": lambda: (
+        maybe_convert_int(os.getenv("VLLM_NEURON_MLA_BLOCK_SHARED_MIN_PAGES")) or 0
     ),
     # Let the sparse MLA prefill's low-precision row-tiled body
     # (``functional/attention/mla_sparse.py``) gather each query's selected rows

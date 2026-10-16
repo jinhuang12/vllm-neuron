@@ -16,24 +16,24 @@ position ``u`` of its block. A pad position reads window row 0 and no query sele
 so it adds exactly 0.0 to every sum.
 
 The union producer (``mla_block_shared_union``) builds both on the device from the
-indexer's bounded pool scores and each query's k-th score. Query ``s`` sits at window
-row ``query_start + s``; a pool is ``pool_size`` rows; the 128 queries of block ``b``
-own the page of rows ``b0 .. b0 + 127`` (``b0 = query_start + 128 b``), pools from
-``pb = b0 / pool_size``:
+chunk's keep bits: one bit per query and pool, set where the query's top-k pool ids name
+the pool (exact; built from the ids and gathered across ranks before the call). Query
+``s`` sits at window row ``query_start + s``; a pool is ``pool_size`` rows; the 128
+queries of block ``b`` own the page of rows ``b0 .. b0 + 127`` (``b0 = query_start + 128
+b``), pools from ``pb = b0 / pool_size``:
 
-* keep: ``keep[s, p] = not (score[s, p] < kth[s])``, the selection's pools and any pool
-  that ties the k-th score or scores NaN (a NaN k-th score keeps every pool);
+* keep: ``keep_bits`` ``[S, P / 8]`` uint8, bit-plane major: pool ``p`` is bit
+  ``p // (P / 8)`` of byte ``p % (P / 8)``, bit 0 the least significant. Only complete
+  pools at or below a query are set; the query's open pool is not (the member adds it);
 * union: positions ``0 .. 127`` the page rows ``b0 + j``; from 128, ``pool_size`` rows
   per shared pool (a pool below ``pb`` that some query of the block keeps), ascending,
   at most ``union_cap / pool_size - 128 / pool_size`` pools; ``-1`` after;
 * member: page row ``j`` for query ``q`` of the block where ``j <= q`` and its pool is
   ``q``'s open pool (or past it) or a complete pool ``q`` keeps; a shared row where
   ``q`` keeps its pool;
-* kept: per query, the kept shared pools plus the kept complete page pools: with no tie
-  and no NaN at the k-th score, ``select_k``;
-* totals: per block, the shared pools (past the cap the union is cut: an overflow) and
-  the queries whose kept is over ``select_k``. A block with either belongs to another
-  path; the producer reports it and decides nothing.
+* totals: per block, the shared pools (uncut) and an overflow flag, 1 where they are
+  more than the cap holds and the union is cut. The producer reports it and decides
+  nothing.
 
 Per block the union is read a superblock (:data:`SUPERBLOCK_ROWS` positions) at a time:
 the window rows are translated to bank rows through the block table, gathered by one
@@ -59,7 +59,8 @@ every union row whatever its probability, and ``0 * NaN`` is NaN, so each superb
 MM2 operand has its non-finite elements set to 0.0 first.
 
 Both entries refuse a call unless ``VLLM_NEURON_MLA_BLOCK_SHARED`` (``vllm_neuron/envs.py``)
-is set. They have no call site.
+is set. They have no call site. ``mla_block_shared_serves`` and ``mla_block_shared_union_cap``
+answer a call site's trace-time questions and read no knob.
 """
 
 from __future__ import annotations
@@ -510,8 +511,12 @@ def mla_block_shared_attention(q_lift: Tensor, c_kv: Tensor, union_rows: Tensor,
 #: ``_GROUP_STRIDE * k`` only, so a block's pools are listed in ``_GROUPS`` segments.
 _GROUPS = 8
 _GROUP_STRIDE = ROW_TILE // _GROUPS
-#: fp32 score columns per load of the keep pass.
-_SCORE_CHUNK = 4096
+#: Bits per keep byte: the bit planes of the keep table.
+_PLANES = 8
+#: The unpacked keep byte of a set bit: bit 3, which read as fp8 e4m3 is 2^-6 (its
+#: smallest normal value), so the count matmuls read the uint8 keep tile as fp8 with no
+#: cast; a block's count, at most 128 x 2^-6, is exact in fp32.
+_KEEP_SET_BIT = 3
 #: The most indices of one keep-bit gather. A gather's cost is set by the keep bits it
 #: reads, not by its index count (the compiler's schedule: about 25 us per 32,768 pools
 #: whether it gathers 32 bits or 2,048), so the gathers are as wide as they compile.
@@ -530,10 +535,8 @@ _UC_POOL_AT = 2    # [128, 512] fp32: the pool of count element (16 k, n), k seg
 _UC_FILL = 3       # [128, list width / 128] int32 -1: the pool list's first value
 _UC_PAGE_ROW = 4   # [128, 1] int32: page position j on partition j
 _UC_PAGE_POOL = 5  # [128, page pools] int32: page pool jj
-_UC_COMPLETE = 6   # [128, page pools] uint8: page pool jj is complete for query q
-_UC_OPEN = 7       # [128, page pools] uint8: page pool jj is q's open pool or past it
-_UC_CAUSAL = 8     # [128, page pools, pool] uint8: page position j <= q
-_UC_ONES = 9       # [128, 1] fp32: 1.0, the trip count's moving operand
+_UC_OPEN = 6       # [128, page pools] uint8: page pool jj is q's open pool or past it
+_UC_CAUSAL = 7     # [128, page pools, pool] uint8: page position j <= q
 
 
 def _list_width(list_cap, seg):
@@ -572,14 +575,10 @@ def _union_constants(pools, pool_size, list_width):
     page_pool = _sb((ROW_TILE, page_pools), nl.int32)
     nisa.iota(dst=page_pool, pattern=[[1, page_pools]], offset=0, channel_multiplier=0)
     out.append(page_pool)
-    # pool jj is complete for query q when its last row is at most q: pool (jj + 1) - 1 - q <= 0
+    # pool jj is open or past for query q when its last row is after q: pool (jj + 1) - 1 - q > 0
     last_past = _sb((ROW_TILE, page_pools), nl.int32)
     nisa.iota(dst=last_past, pattern=[[pool_size, page_pools]], offset=pool_size - 1,
               channel_multiplier=-1)
-    complete = _sb((ROW_TILE, page_pools), nl.uint8)
-    nisa.tensor_scalar(dst=complete, data=last_past, op0=nl.less_equal, operand0=0,
-                       engine=nisa.engine.vector)
-    out.append(complete)
     open_pool = _sb((ROW_TILE, page_pools), nl.uint8)
     nisa.tensor_scalar(dst=open_pool, data=last_past, op0=nl.greater, operand0=0,
                        engine=nisa.engine.vector)
@@ -591,37 +590,34 @@ def _union_constants(pools, pool_size, list_width):
     nisa.tensor_scalar(dst=causal, data=back, op0=nl.greater_equal, operand0=0,
                        engine=nisa.engine.vector)
     out.append(causal)
-    ones = _col(ROW_TILE, nl.float32)
-    nisa.memset(dst=ones, value=1.0)
-    out.append(ones)
     return out
 
 
-def _keep_bits(scores_hbm, kth_hbm, r0, keep):
-    """``keep[q, p] = 1 - (score[r0 + q, p] < kth[r0 + q])`` (fp8 1.0 or 0.0) on the query
-    partitions: a NaN score or a NaN k-th score compares false, so it keeps its pool."""
-    pools = scores_hbm.shape[1]
-    kth = _col(ROW_TILE, nl.float32)
-    nisa.dma_copy(dst=kth, src=kth_hbm.ap(pattern=[[1, ROW_TILE], [1, 1]], offset=r0))
-    for c0 in range(0, pools, _SCORE_CHUNK):
-        cw = min(_SCORE_CHUNK, pools - c0)
-        sc = _sb((ROW_TILE, _SCORE_CHUNK), nl.float32)
-        nisa.dma_copy(dst=sc[:, 0:cw],
-                      src=scores_hbm.ap(pattern=[[pools, ROW_TILE], [1, cw]],
-                                        offset=r0 * pools + c0),
-                      dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync)
-        nisa.tensor_scalar(dst=keep[:, c0:c0 + cw], data=sc[:, 0:cw], op0=nl.less, operand0=kth,
-                           op1=nl.subtract, operand1=1.0, reverse1=True,
-                           engine=nisa.engine.vector)
+def _unpack_keep(keep_hbm, r0, keep):
+    """``keep[q, b w + j]`` = bit ``b`` of ``keep_bits[r0 + q, j]`` moved to bit
+    :data:`_KEEP_SET_BIT` (uint8 8 or 0) on the query partitions, ``w`` the table's bytes
+    per row: one load, then one integer Vector instruction per bit plane (a shift, then a
+    mask), each writing one contiguous run of pools."""
+    width = keep_hbm.shape[1]
+    packed = _sb((ROW_TILE, width), nl.uint8)
+    nisa.dma_copy(dst=packed, src=keep_hbm.ap(pattern=[[width, ROW_TILE], [1, width]],
+                                              offset=r0 * width),
+                  dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync)
+    for b in range(_PLANES):
+        shift = nl.right_shift if b >= _KEEP_SET_BIT else nl.left_shift
+        nisa.tensor_scalar(dst=keep[:, b * width:(b + 1) * width], data=packed, op0=shift,
+                           operand0=abs(b - _KEEP_SET_BIT), op1=nl.bitwise_and,
+                           operand1=1 << _KEEP_SET_BIT, engine=nisa.engine.vector)
 
 
 def _shared_bits(keep, consts, pb):
-    """``[128, seg]`` fp32: on partition ``16 k``, 1.0 where some query keeps pool ``k seg + n``
-    and that pool is below the page (``pb``, every partition), 0.0 elsewhere.
+    """``[128, seg]`` fp32: on partition ``16 k``, positive where some query keeps pool
+    ``k seg + n`` and that pool is below the page (``pb``, every partition), 0.0 elsewhere.
 
-    Per 512 pools, one matmul per segment with a one-column stationary sums the keep bits
-    over the queries onto the segment's partition (at most 128: exact); the minimum with
-    the below-the-page bit makes it 0 or 1.
+    ``keep`` is the fp8 view of the unpacked keep tile (2^-6 or 0.0). Per 512 pools, one
+    matmul per segment with a one-column stationary sums the keep values over the queries
+    onto the segment's partition (the count times 2^-6, exact); the minimum with the
+    below-the-page bit (0.0 or 1.0) keeps it positive only below the page.
     """
     pools = keep.shape[1]
     seg = pools // _GROUPS
@@ -683,10 +679,9 @@ def _compact(shared, consts, list_cap, list_hbm):
     return prefix
 
 
-def _union_block(scores_hbm, kth_hbm, consts, start_f, blk, select_k, union_cap, pool_size,
-                 outs):
-    """Block ``blk``'s union rows, member bits, kept counts and totals into ``outs``."""
-    pools = scores_hbm.shape[1]
+def _union_block(keep_hbm, consts, start_f, blk, union_cap, pool_size, outs):
+    """Block ``blk``'s union rows, member bits and totals into ``outs``."""
+    pools = keep_hbm.shape[1] * _PLANES
     seg = pools // _GROUPS
     page_pools = ROW_TILE // pool_size
     list_cap = union_cap // pool_size - page_pools
@@ -694,8 +689,7 @@ def _union_block(scores_hbm, kth_hbm, consts, start_f, blk, select_k, union_cap,
     r0 = blk * ROW_TILE
     union_hbm = outs[0]
     member_hbm = outs[1]
-    kept_hbm = outs[2]
-    totals_hbm = outs[3]
+    totals_hbm = outs[2]
 
     # ---- the block's first row and first page pool on every partition (exact in fp32) ----
     b0 = _col(ROW_TILE, nl.float32)
@@ -713,11 +707,11 @@ def _union_block(scores_hbm, kth_hbm, consts, start_f, blk, select_k, union_cap,
     ext = list_cap + page_pools
     n_chunks = (ext + _GATHER_MAX - 1) // _GATHER_MAX
     width = (ext + n_chunks - 1) // n_chunks
-    keep_got = _sb((ROW_TILE, pools + width), nl.float8_e4m3)
+    keep_got = _sb((ROW_TILE, pools + width), nl.uint8)
     keep = keep_got[:, 0:pools]
     got = keep_got[:, pools:pools + width]
-    _keep_bits(scores_hbm, kth_hbm, r0, keep)
-    shared = _shared_bits(keep, consts, pb)
+    _unpack_keep(keep_hbm, r0, keep)
+    shared = _shared_bits(keep_got.view(nl.float8_e4m3)[:, 0:pools], consts, pb)
     list_hbm = nl.ndarray((1, _list_width(list_cap, seg)), dtype=nl.int32, buffer=nl.private_hbm)
     prefix = _compact(shared, consts, list_cap, list_hbm)
 
@@ -741,9 +735,7 @@ def _union_block(scores_hbm, kth_hbm, consts, start_f, blk, select_k, union_cap,
                                    offset=blk * union_cap + ROW_TILE),
                   src=rows)
 
-    # ---- member bits and kept counts: the list's pools, then the page's -------------------
-    kept = _col(ROW_TILE, nl.float32)
-    nisa.memset(dst=kept, value=0.0)
+    # ---- member bits: the list's pools, then the page's ------------------------------------
     page_keep = _sb((ROW_TILE, page_pools), nl.uint8)
     for g in range(n_chunks):
         g0 = g * width
@@ -759,7 +751,8 @@ def _union_block(scores_hbm, kth_hbm, consts, start_f, blk, select_k, union_cap,
             nisa.tensor_scalar(dst=lst[:, lw:gw], data=consts[_UC_PAGE_POOL][:, j0:j0 + gw - lw],
                                op0=nl.add, operand0=pb, engine=nisa.engine.vector)
         # bits[q, i] = keep[q, lst[i]]: per span the index is clamped into it and the bit
-        # counts only where the clamp left it unchanged (a -1 pad counts in no span)
+        # counts only where the clamp left it unchanged (a -1 pad counts in no span); the
+        # minimum of the gathered byte (0 or 8) and that inside bit (0 or 1) is 0 or 1
         bits = _sb((ROW_TILE, width), nl.uint8)
         for s0 in range(0, pools, _GATHER_SPAN):
             sw = min(_GATHER_SPAN, pools - s0)
@@ -784,10 +777,6 @@ def _union_block(scores_hbm, kth_hbm, consts, start_f, blk, select_k, union_cap,
                 nisa.tensor_tensor(dst=bits[:, 0:gw], data1=bits[:, 0:gw], data2=inside[:, 0:gw],
                                    op=nl.maximum, engine=nisa.engine.vector)
         if lw > 0:
-            part = _col(ROW_TILE, nl.float32)
-            nisa.tensor_reduce(dst=part, op=nl.add, data=bits[:, 0:lw], axis=1)
-            nisa.tensor_tensor(dst=kept, data1=kept, data2=part, op=nl.add,
-                               engine=nisa.engine.vector)
             mem_rows = _sb((ROW_TILE, width, pool_size), nl.uint8)
             nisa.tensor_copy(dst=mem_rows[:, 0:lw, :],
                              src=bits[:, 0:lw].expand_dim(2).broadcast(2, pool_size),
@@ -801,13 +790,7 @@ def _union_block(scores_hbm, kth_hbm, consts, start_f, blk, select_k, union_cap,
             nisa.tensor_copy(dst=page_keep[:, j0:j0 + gw - lw], src=bits[:, lw:gw],
                              engine=nisa.engine.vector)
 
-    # ---- the page: complete pools counted, member bits ---------------------------------------
-    complete_keep = _sb((ROW_TILE, page_pools), nl.uint8)
-    nisa.tensor_tensor(dst=complete_keep, data1=page_keep, data2=consts[_UC_COMPLETE],
-                       op=nl.minimum, engine=nisa.engine.vector)
-    part = _col(ROW_TILE, nl.float32)
-    nisa.tensor_reduce(dst=part, op=nl.add, data=complete_keep, axis=1)
-    nisa.tensor_tensor(dst=kept, data1=kept, data2=part, op=nl.add, engine=nisa.engine.vector)
+    # ---- the page: member bits ---------------------------------------------------------------
     # open pool or kept pool; a kept bit past the open pool is under the causal bound
     attend = _sb((ROW_TILE, page_pools), nl.uint8)
     nisa.tensor_tensor(dst=attend, data1=page_keep, data2=consts[_UC_OPEN], op=nl.maximum,
@@ -820,50 +803,41 @@ def _union_block(scores_hbm, kth_hbm, consts, start_f, blk, select_k, union_cap,
                                     offset=r0 * union_cap),
                   src=page_member)
 
-    # ---- kept counts, the block's shared pools and its queries over select_k ---------------
-    nisa.dma_copy(dst=kept_hbm.ap(pattern=[[1, ROW_TILE], [1, 1]], offset=r0), src=kept)
-    over = _col(ROW_TILE, nl.float32)
-    nisa.tensor_scalar(dst=over, data=kept, op0=nl.greater, operand0=float(select_k),
-                       engine=nisa.engine.vector)
-    over_ps = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.psum)
-    nisa.nc_matmul(dst=over_ps, stationary=over, moving=consts[_UC_ONES])
+    # ---- totals: the block's shared pools and its overflow flag -----------------------------
     totals = _sb((1, 2), nl.int32)
     nisa.tensor_copy(dst=totals[:, 0:1], src=prefix[:, ROW_TILE - 1:ROW_TILE],
                      engine=nisa.engine.vector)
-    nisa.tensor_copy(dst=totals[:, 1:2], src=over_ps, engine=nisa.engine.vector)
+    nisa.tensor_scalar(dst=totals[:, 1:2], data=prefix[:, ROW_TILE - 1:ROW_TILE], op0=nl.greater,
+                       operand0=list_cap, engine=nisa.engine.vector)
     nisa.dma_copy(dst=totals_hbm.ap(pattern=[[2, 1], [1, 2]], offset=2 * blk), src=totals)
 
 
 @nki.jit
-def mla_block_shared_union_kernel(scores_hbm, kth_hbm, start_hbm, select_k, union_cap,
-                                  pool_size, source_digest=0):
-    """Each 128-query block's union rows and member bits from the indexer's pool scores.
+def mla_block_shared_union_kernel(keep_hbm, start_hbm, union_cap, pool_size, source_digest=0):
+    """Each 128-query block's union rows and member bits from the chunk's keep bits.
 
     Args:
-        scores_hbm: ``[S, P]`` fp32, the bounded pool scores (a pool past the query holds
-            the bound's fill); ``S`` a multiple of 128, ``P`` a multiple of 128.
-        kth_hbm: ``[S, 1]`` fp32, each query's k-th score (``+inf`` keeps nothing).
+        keep_hbm: ``[S, P / 8]`` uint8, the keep bits in the module docstring's layout;
+            ``S`` a multiple of 128, ``P`` a multiple of 128.
         start_hbm: ``[1, 1]`` int32, the window row of query 0, a multiple of 128.
-        select_k: python int, the pools a query selects.
         union_cap: python int, union positions per block, a multiple of
             :data:`MOVING_MAX`.
         pool_size: python int, rows per pool, a power of two that divides 128.
         source_digest: python int that only keys the compiled-kernel cache on this file.
 
     Returns:
-        ``union [S / 128, union_cap]`` int32, ``member [S, union_cap]`` uint8,
-        ``kept [S, 1]`` fp32 and ``totals [S / 128, 2]`` int32, in shared HBM (the
-        module docstring states each).
+        ``union [S / 128, union_cap]`` int32, ``member [S, union_cap]`` uint8 and
+        ``totals [S / 128, 2]`` int32, in shared HBM (the module docstring states each).
 
     Under a two-program launch the blocks are dealt round-robin between the programs.
     """
-    seqs, pools = scores_hbm.shape
+    seqs = keep_hbm.shape[0]
+    pools = keep_hbm.shape[1] * _PLANES
     n_blocks = seqs // ROW_TILE
     page_pools = ROW_TILE // pool_size
     outs = []
     outs.append(nl.ndarray((n_blocks, union_cap), dtype=nl.int32, buffer=nl.shared_hbm))
     outs.append(nl.ndarray((seqs, union_cap), dtype=nl.uint8, buffer=nl.shared_hbm))
-    outs.append(nl.ndarray((seqs, 1), dtype=nl.float32, buffer=nl.shared_hbm))
     outs.append(nl.ndarray((n_blocks, 2), dtype=nl.int32, buffer=nl.shared_hbm))
     list_width = _list_width(union_cap // pool_size - page_pools, pools // _GROUPS)
     consts = _union_constants(pools, pool_size, list_width)
@@ -874,27 +848,24 @@ def mla_block_shared_union_kernel(scores_hbm, kth_hbm, start_hbm, select_k, unio
     n_prgs = nl.num_programs(axes=0)
     prg = nl.program_id(0)
     for blk in range(prg, n_blocks, n_prgs):
-        _union_block(scores_hbm, kth_hbm, consts, start_f, blk, select_k, union_cap, pool_size,
-                     outs)
-    return outs[0], outs[1], outs[2], outs[3]
+        _union_block(keep_hbm, consts, start_f, blk, union_cap, pool_size, outs)
+    return outs[0], outs[1], outs[2]
 
 
-def _require_union_call(scores: Tensor, kth: Tensor, query_start: Tensor, select_k: int,
-                        union_cap: int, pool_size: int) -> None:
+def _require_union_call(keep_bits: Tensor, query_start: Tensor, union_cap: int,
+                        pool_size: int) -> None:
     _require_knob()
-    if scores.ndim != 2 or scores.dtype != torch.float32:
+    if keep_bits.ndim != 2 or keep_bits.dtype != torch.uint8:
         raise MlaBlockSharedError(
-            f"scores must be [seq, pools] fp32; got {tuple(scores.shape)} {scores.dtype}"
+            f"keep_bits must be [seq, pools / {_PLANES}] uint8; got {tuple(keep_bits.shape)} "
+            f"{keep_bits.dtype}"
         )
-    seq, pools = (int(d) for d in scores.shape)
+    seq, width = (int(d) for d in keep_bits.shape)
+    pools = width * _PLANES
     if seq < ROW_TILE or seq % ROW_TILE != 0 or pools < ROW_TILE or pools % ROW_TILE != 0:
         raise MlaBlockSharedError(
-            f"scores must be whole {ROW_TILE}-query blocks over a multiple of {ROW_TILE} pools; "
-            f"got [{seq}, {pools}]"
-        )
-    if tuple(kth.shape) != (seq, 1) or kth.dtype != torch.float32:
-        raise MlaBlockSharedError(
-            f"kth must be [seq, 1] = [{seq}, 1] fp32; got {tuple(kth.shape)} {kth.dtype}"
+            f"keep_bits must be whole {ROW_TILE}-query blocks over a multiple of {ROW_TILE} pools; "
+            f"got [{seq}, {width}] bytes ({pools} pools)"
         )
     if tuple(query_start.shape) != (1, 1) or query_start.dtype != torch.int32:
         raise MlaBlockSharedError(
@@ -910,44 +881,67 @@ def _require_union_call(scores: Tensor, kth: Tensor, query_start: Tensor, select
             f"union_cap must be a multiple of {MOVING_MAX} over the block's {ROW_TILE}-row page; "
             f"got {union_cap}"
         )
-    if int(select_k) < 1:
-        raise MlaBlockSharedError(f"select_k must be positive; got {select_k}")
 
 
-def mla_block_shared_union(scores: Tensor, kth: Tensor, query_start: Tensor, select_k: int,
-                           union_cap: int, pool_size: int) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+def mla_block_shared_union(keep_bits: Tensor, query_start: Tensor, union_cap: int,
+                           pool_size: int) -> tuple[Tensor, Tensor, Tensor]:
     """Each 128-query block's union and member bits for :func:`mla_block_shared_attention`.
 
     Args:
-        scores: ``[S, P]`` fp32, the indexer's bounded pool scores of a chunk of ``S``
-            queries (a multiple of 128) over ``P`` pools (a multiple of 128).
-        kth: ``[S, 1]`` fp32, each query's k-th score.
+        keep_bits: ``[S, P / 8]`` uint8, the chunk's keep bits (the module docstring's
+            layout) for ``S`` queries (a multiple of 128) over ``P`` pools (a multiple of
+            128).
         query_start: ``[1, 1]`` int32, the window row of query 0, a multiple of 128.
-        select_k: the pools a query selects.
         union_cap: union positions per block, a multiple of :data:`MOVING_MAX`.
         pool_size: rows per pool, a power of two that divides 128.
 
     Returns:
-        ``(union_rows, member, kept, totals)``: ``[S / 128, union_cap]`` int32,
-        ``[S, union_cap]`` uint8, ``[S, 1]`` fp32 and ``[S / 128, 2]`` int32 (the module
-        docstring states each). A block whose ``totals`` row reads a shared count over
-        ``union_cap / pool_size - 128 / pool_size`` or any query over ``select_k`` is not
-        served by the union.
+        ``(union_rows, member, totals)``: ``[S / 128, union_cap]`` int32, ``[S, union_cap]``
+        uint8 and ``[S / 128, 2]`` int32 (the module docstring states each). A block whose
+        overflow flag (``totals[b, 1]``) is 1 is not served by its union.
 
     Raises:
         MlaBlockSharedError: while ``VLLM_NEURON_MLA_BLOCK_SHARED`` is unset, or for a
             malformed call.
     """
-    _require_union_call(scores, kth, query_start, select_k, union_cap, pool_size)
+    _require_union_call(keep_bits, query_start, union_cap, pool_size)
     call = wrap_nki(mla_block_shared_union_kernel)
-    if lnc_pair() and int(scores.shape[0]) >= 2 * ROW_TILE:
+    if lnc_pair() and int(keep_bits.shape[0]) >= 2 * ROW_TILE:
         call = call[2]
     return call(
-        scores.contiguous(),
-        kth.contiguous(),
+        keep_bits.contiguous(),
         query_start.contiguous(),
-        int(select_k),
         int(union_cap),
         int(pool_size),
         SOURCE_DIGEST,
     )
+
+
+# ---- call-site questions ------------------------------------------------------------------
+
+#: Window pages -> the static union cap in rows of that served window bucket. Sized from
+#: the recorded top-k selections of the served prompts: each cap holds the largest block
+#: union seen at its bucket, in whole superblocks (the 1,032-page bucket takes the
+#: 1,024-page cap). A block past it raises its overflow flag.
+_UNION_CAPS = {264: 20480, 520: 30720, 1024: 40960, 1032: 40960, 2048: 55296}
+
+
+def mla_block_shared_union_cap(window_pages: int) -> int | None:
+    """The static union cap, in rows, of a window of ``window_pages`` pages, or None for a
+    window with no cap (not served)."""
+    return _UNION_CAPS.get(int(window_pages))
+
+
+def mla_block_shared_serves(seq: int, heads: int, latent: int, window_pages: int,
+                            page_size: int, pool_size: int, q_dtype: torch.dtype,
+                            kv_dtype: torch.dtype) -> bool:
+    """Whether the two entries serve a NoPE paged call of these trace-time values: the
+    checks both entries make on them, and a union cap for the window. Reads no knob."""
+    page = int(page_size)
+    pool = int(pool_size)
+    return (int(seq) >= ROW_TILE and int(seq) % ROW_TILE == 0 and int(heads) == 1
+            and int(latent) % LATENT_TILE == 0 and 0 < int(latent) <= LATENT_MAX
+            and page >= 1 and page & (page - 1) == 0
+            and pool >= 1 and pool & (pool - 1) == 0 and ROW_TILE % pool == 0
+            and q_dtype in (torch.bfloat16, torch.float16) and kv_dtype == q_dtype
+            and mla_block_shared_union_cap(window_pages) is not None)
