@@ -118,6 +118,7 @@ KERNEL_SOURCE_DIR = "functional"
 KERNEL_SOURCE_FILES = (
     "parallel/neuron_parallel_state.py",
     "utils/bucket_utils.py",
+    "utils/dcp_ownership.py",
     "utils/dtype_utils.py",
     "utils/neuron_utils.py",
 )
