@@ -8146,7 +8146,7 @@ class Glm5NextMLAAttention(nn.Module):
         ``keep_route`` its reader, which the forward takes from ``prefill_keep_table_route``
         (``dsa_block_shared.py``); the two travel together. ``BLOCK_SHARED`` runs the
         full-width sparse call on the block-shared kernel instead of the per-query gather,
-        with ``topk_indices`` for the kernel's overflow path. ``DENSE_MASKED`` hands the
+        with ``topk_indices`` for the exact kernel's overflow path. ``DENSE_MASKED`` hands the
         table to ``mla_sparse_attention``, whose seam gives the call to the dense-masked
         pass. The table belongs to a full-width selecting prefill chunk without DCP, and
         this asks the route again with the real operands and refuses any other call.

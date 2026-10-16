@@ -13,9 +13,12 @@ The kernel reads the selection as a keep table, one bit per query and window poo
 indexer builds it from its own top-k ids, on the rank that selected those rows, and
 all-gathers it beside the ids (``functional/dsa/selection_keep.py``,
 ``functional/dsa/indexer_shard.py``). A block whose shared pools overflow the union cap
-runs today's per-query gather inside the kernel, from ``topk_indices``; nothing here
-branches on a device value. The dense-masked pass (``functional/attention/mla_dense_masked.py``)
-reads the same table as its mask, through the sparse attention seam.
+gets today's per-query gather, from ``topk_indices``, in a second kernel
+(``functional/attention/mla_block_shared_exact.py``). It runs after the block-shared
+kernel on every call and rewrites in place the rows of each such block and of the block
+that shares its round; nothing here branches on a device value. The dense-masked pass
+(``functional/attention/mla_dense_masked.py``) reads the same table as its mask, through
+the sparse attention seam.
 
 Routing, at trace time, per prefill chunk, in this order (:func:`prefill_keep_table_route`):
 
@@ -50,6 +53,7 @@ from vllm_neuron.functional.attention.mla_block_shared import (
     mla_block_shared_union,
     mla_block_shared_union_cap,
 )
+from vllm_neuron.functional.attention.mla_block_shared_exact import mla_block_shared_exact
 from vllm_neuron.functional.attention.mla_dense_masked import dense_masked_serves
 from vllm_neuron.functional.attention.mla_dense_window import masked_window_serves
 
@@ -104,12 +108,19 @@ def attend_block_shared(q_lift: Tensor, c_kv: Tensor, keep_bits: Tensor, topk_in
                         page_size: int, pool_size: int) -> Tensor:
     """The chunk's attention on the block-shared kernel: ``[S, 1, latent]`` float32.
 
+    Three kernels run, in this order, on every call: the union build, the block-shared
+    attention over every block, and the exact kernel. The exact kernel reads the union
+    build's overflow flags and takes the blocks in rounds of one block per program; for
+    each round that holds a flagged block it rewrites the round's rows in place with
+    today's per-query gather. A call with no flag keeps the block-shared rows. Every
+    call launches all three, so the graph does not depend on a device value.
+
     Args:
         q_lift: ``[S, 1, latent]``, the absorbed queries of the chunk.
         c_kv: ``[slots, latent]``, the whole latent bank; it already holds this step's rows.
         keep_bits: ``[S, P / 8]`` uint8, the chunk's keep table from the indexer.
-        topk_indices: ``[S, columns]`` int32, the expanded selection; the kernel reads it
-            only for a block whose union overflows its cap.
+        topk_indices: ``[S, columns]`` int32, the expanded selection; the exact kernel
+            reads it only for a block whose union overflows its cap.
         softmax_scale: the attention's scale.
         block_table_row: ``[pages, 1]`` int32, the window's pages.
         query_start: ``[1, 1]`` int32, the window row of the chunk's first query.
@@ -122,5 +133,7 @@ def attend_block_shared(q_lift: Tensor, c_kv: Tensor, keep_bits: Tensor, topk_in
     union_cap = mla_block_shared_union_cap(int(block_table_row.shape[0]))
     union_rows, member, totals = mla_block_shared_union(keep_bits, query_start, union_cap,
                                                         int(pool_size))
-    return mla_block_shared_attention(q_lift, c_kv, union_rows, member, totals, topk_indices,
-                                      softmax_scale, block_table_row, page_size=int(page_size))
+    out = mla_block_shared_attention(q_lift, c_kv, union_rows, member, softmax_scale,
+                                     block_table_row, page_size=int(page_size))
+    return mla_block_shared_exact(q_lift, c_kv, topk_indices, totals, out, softmax_scale,
+                                  block_table_row, page_size=int(page_size))
