@@ -36,19 +36,21 @@ The selection is the indexer's keep table: ``keep_bits`` ``[S, P / 8]`` uint8, o
 per query and ``R``-row pool of the window (``R`` the indexer's pool size, ``P`` the
 window's pools), bit-plane major: pool ``p`` is bit ``p // (P / 8)`` of byte
 ``p % (P / 8)``, bit 0 the least significant, so each bit plane of a row's bytes holds a
-contiguous run of pools. A set bit is a complete pool the query's top-k chose. One bit
-per pool is the exact selection because the indexer selects whole pools; the open pool
-(the incomplete one holding the query's own row) is never set, because
-``dsa_index_expand`` appends its rows up to the query's position after the selected
-pools. So with ``pos`` the query's window row (``query_start`` plus its row in the
-chunk), the query reads ``count[q, p]`` leading rows of pool ``p``: ``R`` for a set bit,
-``(pos + 1) % R`` for its open pool ``(pos + 1) // R``, and 0 elsewhere.
+contiguous run of pools. A set bit is a pool the query's top-k chose. One bit per pool is
+the exact selection because the indexer selects whole pools, and the query's open pool
+(the incomplete one holding its own row) is read up to the query's row whatever its bit,
+as ``dsa_index_expand`` appends those rows after the selected pools. The table's contract
+(block_shared/INTERFACE.md version 3, s2) lets the producer set the open pool's bit, and
+bits past it, so the kernel cuts every kept pool at the causal bound. With ``pos`` the
+query's window row (``query_start`` plus its row in the chunk) and ``(pos + 1) // R`` its
+open pool, the query reads ``count[q, p]`` leading rows of pool ``p``: ``R`` for a set bit
+before its open pool, ``(pos + 1) % R`` for its open pool, and 0 elsewhere.
 
 Each 128-query tile loads its rows of the table once. Per superblock, one integer Vector
 instruction per bit plane the superblock's pools fall in moves that plane's bit to the
-value ``R`` (the counts of the kept pools), three more add the open pool's count, and one
-Vector compare reads each count through a stride-0 view against its ``R`` rows' ranks in
-the pool.
+value ``R`` (the counts of the kept pools), one more keeps those counts only before each
+query's open pool, three more add the open pool's count, and one Vector compare reads
+each count through a stride-0 view against its ``R`` rows' ranks in the pool.
 
 The entry, :func:`mla_dense_masked_attention`, takes the keep table and the window row of
 the chunk's first query, and it refuses a call unless ``VLLM_NEURON_MLA_DENSE_MASKED``
@@ -233,9 +235,11 @@ def _selected_rows(sel, rank, numbers, pools, w0, width):
     Row ``w`` is selected where its rank in its pool is below the query's count of that
     pool (the module docstring). Each bit plane the superblock's pools fall in is one
     integer Vector instruction: a shift that moves the plane's bit to the bit of value
-    ``R``, then a mask. The open pool's count goes in by a compare of the pool numbers with
-    each query's open pool, scaled by its count, and an add. Then one Vector compare reads
-    each count through a stride-0 view, once per row of its pool.
+    ``R``, then a mask. One Vector instruction multiplies each count by whether its pool
+    comes before the query's open pool (the causal cut of a bit set at or past the open
+    pool). The open pool's count goes in by a compare of the pool numbers with each query's
+    open pool, scaled by its count, and an add. Then one Vector compare reads each count
+    through a stride-0 view, once per row of its pool.
     """
     pool_rows = rank.shape[2]
     set_bit = _ms._log2_exact(pool_rows)
@@ -254,6 +258,8 @@ def _selected_rows(sel, rank, numbers, pools, w0, width):
     open_here = _col(ROW_TILE, nl.float32)
     nisa.tensor_scalar(dst=open_here, data=sel[_SEL_OPEN], op0=nl.subtract, operand0=float(p0),
                        engine=nisa.engine.vector)
+    nisa.scalar_tensor_tensor(dst=counts, data=numbers[:, 0:n], op0=nl.less, operand0=open_here,
+                              op1=nl.multiply, operand1=counts)
     opened = _sb((ROW_TILE, n), nl.uint8)
     nisa.tensor_scalar(dst=opened, data=numbers[:, 0:n], op0=nl.equal, operand0=open_here,
                        op1=nl.multiply, operand1=sel[_SEL_OPEN_COUNT], engine=nisa.engine.vector)
