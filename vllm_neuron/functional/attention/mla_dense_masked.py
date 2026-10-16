@@ -174,8 +174,8 @@ def _superblock_rows(banked, bank_page, page0, pages, latent):
 
 # Positions in the list :func:`_tile_selection` returns.
 _SEL_KEEP = 0         # [128, P / 8] uint8: the tile's rows of the keep table
-_SEL_OPEN = 1         # [128, 1] int32: each query's open pool, (pos + 1) // R
-_SEL_OPEN_COUNT = 2   # [128, 1] int32: the rows of it the query reads, (pos + 1) % R
+_SEL_OPEN = 1         # [128, 1] fp32: each query's open pool, (pos + 1) // R
+_SEL_OPEN_COUNT = 2   # [128, 1] fp32: the rows of it the query reads, (pos + 1) % R
 
 
 def _pool_ranks(pools, pool_rows):
@@ -198,7 +198,9 @@ def _tile_selection(keep_hbm, start, r0, pool_rows):
     ``start`` is ``query_start`` on every partition (``[128, 1]`` int32). The tile's rows of
     the keep table come in one DMA. Query ``r0 + p`` sits at window row ``pos = start +
     r0 + p``: its open pool is ``(pos + 1) // R`` and it reads ``(pos + 1) % R`` rows of it,
-    none when its own row closes a pool.
+    none when its own row closes a pool. Both are found in int32, then kept as fp32: a
+    per-partition operand of a Vector arithmetic instruction must be fp32 (the compiler
+    refuses an int32 one), and they stay exact far below 2 ** 24.
     """
     width = keep_hbm.shape[1]
     keep = _sb((ROW_TILE, width), nl.uint8)
@@ -207,12 +209,16 @@ def _tile_selection(keep_hbm, start, r0, pool_rows):
     after = _col(ROW_TILE, nl.int32)
     nisa.iota(dst=after, pattern=[[0, 1]], offset=r0 + 1, channel_multiplier=1)
     nisa.tensor_tensor(dst=after, data1=after, data2=start, op=nl.add, engine=nisa.engine.vector)
-    open_pool = _col(ROW_TILE, nl.int32)
-    nisa.tensor_scalar(dst=open_pool, data=after, op0=nl.right_shift,
+    pool_int = _col(ROW_TILE, nl.int32)
+    nisa.tensor_scalar(dst=pool_int, data=after, op0=nl.right_shift,
                        operand0=_ms._log2_exact(pool_rows), engine=nisa.engine.vector)
-    open_count = _col(ROW_TILE, nl.int32)
-    nisa.tensor_scalar(dst=open_count, data=after, op0=nl.bitwise_and, operand0=pool_rows - 1,
+    count_int = _col(ROW_TILE, nl.int32)
+    nisa.tensor_scalar(dst=count_int, data=after, op0=nl.bitwise_and, operand0=pool_rows - 1,
                        engine=nisa.engine.vector)
+    open_pool = _col(ROW_TILE, nl.float32)
+    nisa.tensor_copy(dst=open_pool, src=pool_int, engine=nisa.engine.vector)
+    open_count = _col(ROW_TILE, nl.float32)
+    nisa.tensor_copy(dst=open_count, src=count_int, engine=nisa.engine.vector)
     sel = []
     sel.append(keep)
     sel.append(open_pool)
@@ -245,8 +251,8 @@ def _selected_rows(sel, rank, numbers, pools, w0, width):
                            data=sel[_SEL_KEEP][:, lo - b * plane:hi - b * plane], op0=shift,
                            operand0=abs(b - set_bit), op1=nl.bitwise_and, operand1=pool_rows,
                            engine=nisa.engine.vector)
-    open_here = _col(ROW_TILE, nl.int32)
-    nisa.tensor_scalar(dst=open_here, data=sel[_SEL_OPEN], op0=nl.subtract, operand0=p0,
+    open_here = _col(ROW_TILE, nl.float32)
+    nisa.tensor_scalar(dst=open_here, data=sel[_SEL_OPEN], op0=nl.subtract, operand0=float(p0),
                        engine=nisa.engine.vector)
     opened = _sb((ROW_TILE, n), nl.uint8)
     nisa.tensor_scalar(dst=opened, data=numbers[:, 0:n], op0=nl.equal, operand0=open_here,
