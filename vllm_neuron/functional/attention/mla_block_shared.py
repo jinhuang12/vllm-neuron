@@ -47,6 +47,10 @@ running maximum, put on the key partitions by fp32 PE transposes, split bf16 hi/
 contracted with the rows. The accumulator is rescaled by ``exp(scale * (old max - new
 max))`` before the superblock's sum is added, and divided by the row sum once, at the end.
 
+A program runs its blocks two at a time, one superblock of each in flight: the PE takes
+one block's MM1 and turns while the Vector and Scalar engines take the other's select and
+exp. Each block's own steps and their order do not change, so its output does not either.
+
 Arithmetic against the sparse low-precision body: the same MM1 products into fp32 PSUM
 and the same hi/lo split against the stored cache, but the probabilities are split before
 they are normalised, the sums run over the union in its order, and the maximum is a
@@ -99,7 +103,7 @@ _PSUM_BANK_BYTES = 2048
 #: indirect DMA may write per partition. Per partition a superblock holds its rows twice
 #: (latent on partitions and keys on partitions: 2 x 16 KiB at latent 512 in bf16) and its
 #: guard mask (8 KiB), and each query tile adds its predicate (2 KiB), scores (8 KiB) and
-#: one bank of hi/lo halves (2 KiB).
+#: one bank of hi/lo halves (2 KiB); a program has :data:`_PAIR` of them in flight.
 SUPERBLOCK_ROWS = 2048
 #: The score an unselected position reads: a power of two so far below any score that
 #: ``exp(scale * (_UNSELECTED_SCORE - max))`` is exactly 0.0.
@@ -122,10 +126,22 @@ class MlaBlockSharedError(ValueError):
     """Raised for a call this kernel does not serve. There is no fallback here."""
 
 
-# Positions in the list :func:`_union_rows` returns (the kernel front end resolves plain
-# names and integer subscripts, not tuple targets).
-_SB_ROWS = 0    # the superblock, keys on partitions: MM2's moving operand
-_SB_T = 1       # the superblock with the latent on partitions: MM1's moving operand
+#: Blocks a program runs together. Each superblock of the pair is emitted stage-major:
+#: both gathers, then per block MM1 and its turns, then per block the softmax and MM2. So
+#: while the Vector and Scalar engines take one block's select and exp, the PE has the
+#: other block's MM1 and turns, and the PE stop of a lone block (MM1 done, the exp not yet)
+#: has work in it.
+_PAIR = 2
+
+# Positions in the lists the stages return (the kernel front end resolves plain names and
+# integer subscripts, not tuple targets).
+_PART_SCORES = 0   # [128, superblock] fp32: the selected scores of one query tile
+_PART_MAX = 1      # [128, superblock / 512] fp32: their maximum per 512 positions
+_ST_Q = 0          # per tile: the queries with the latent on the partitions
+_ST_MAX = 1        # per tile: the running maximum
+_ST_SUM = 2        # per tile: the running sum
+_ST_ACC = 3        # per tile: the unnormalised output
+_ST_ROW = 4        # per tile: its first query row
 
 
 def _union_offsets(union_hbm, bank_rows, block, u0, n_chunks, page_size):
@@ -164,28 +180,39 @@ def _union_offsets(union_hbm, bank_rows, block, u0, n_chunks, page_size):
     return offsets
 
 
-def _union_rows(bank_hbm, offsets, n_chunks):
-    """The bank rows ``offsets`` names in SBUF twice: ``[rows, rows_t]``.
+def _gather_rows(bank_hbm, offsets, n_chunks):
+    """``rows_t`` ``[128, 1, L / 128, n_chunks * 128]``: the bank rows ``offsets`` names.
 
-    ``rows_t`` is ``[128, 1, L / 128, n_chunks * 128]``: one software-queue DMA transpose
-    gathers every row with the latent on the partitions (``rows_t[l, 0, li, k]`` = latent
-    element ``li * 128 + l`` of the row at position ``k``), the sparse kernel's gather.
-    ``rows`` is ``[128, n_chunks, L]`` (position ``c * 128 + p`` on partition ``p`` of chunk
-    ``c``), built by PE transposes, as many chunks as fill one PSUM bank copied out at once
-    on the scalar engine. Then every non-finite element of ``rows`` is set to 0.0: ``rows``
-    feeds MM2 only, ``rows_t`` keeps the row as stored for MM1.
+    One software-queue DMA transpose gathers every row with the latent on the partitions
+    (``rows_t[l, 0, li, k]`` = latent element ``li * 128 + l`` of the row at position
+    ``k``), the sparse kernel's gather. It is MM1's moving operand, the row as stored.
     """
     latent = bank_hbm.shape[1]
     n_lat = latent // LATENT_TILE
     n_rows = n_chunks * KEY_CHUNK
-    kv_dtype = bank_hbm.dtype
-    rows_t = nl.ndarray((LATENT_TILE, 1, n_lat, n_rows), dtype=kv_dtype, buffer=nl.sbuf)
+    rows_t = nl.ndarray((LATENT_TILE, 1, n_lat, n_rows), dtype=bank_hbm.dtype, buffer=nl.sbuf)
     nisa.dma_transpose(
         dst=rows_t,
         src=bank_hbm.ap(pattern=[[latent, n_rows], [0, 1], [LATENT_TILE, n_lat], [1, LATENT_TILE]],
                         vector_offset=offsets[:, 0:n_chunks], indirect_dim=0),
         dge_mode=nisa.dge_mode.swdge)
+    return rows_t
+
+
+def _turn_rows(rows_t):
+    """``rows`` ``[128, n_chunks, L]``: ``rows_t`` with the keys on the partitions, finite.
+
+    Position ``c * 128 + p`` sits on partition ``p`` of chunk ``c``. PE transposes build it,
+    as many chunks as fill one PSUM bank copied out at once on the scalar engine. Then every
+    non-finite element of those chunks is set to 0.0, bank by bank, so MM2 can start on the
+    first chunks: ``rows`` feeds MM2 only.
+    """
+    n_lat = rows_t.shape[2]
+    latent = n_lat * LATENT_TILE
+    n_chunks = rows_t.shape[3] // KEY_CHUNK
+    kv_dtype = rows_t.dtype
     rows = _sb((KEY_CHUNK, n_chunks, latent), kv_dtype)
+    finite = _sb((KEY_CHUNK, n_chunks, latent), nl.uint8)
     # A 2-byte chunk on the key partitions is 2 L bytes per partition.
     per_bank = _PSUM_BANK_BYTES // (2 * latent)
     for c0 in range(0, n_chunks, per_bank):
@@ -196,17 +223,14 @@ def _union_rows(bank_hbm, offsets, n_chunks):
             for li in range(n_lat):
                 nisa.nc_transpose(dst=t_ps[:, j, li * LATENT_TILE:(li + 1) * LATENT_TILE],
                                   data=rows_t[:, 0, li, k0:k0 + KEY_CHUNK])
-        nisa.tensor_copy(dst=rows[:, c0:c0 + nc, :], src=t_ps[:, 0:nc, :],
-                         engine=nisa.engine.scalar)
-    # x * 0 is 0 for a finite x and NaN for an infinite or NaN one.
-    finite = _sb((KEY_CHUNK, n_chunks, latent), nl.uint8)
-    nisa.tensor_scalar(dst=finite, data=rows, op0=nl.multiply, operand0=0.0, op1=nl.equal,
-                       operand1=0.0, engine=nisa.engine.vector)
-    nisa.select_reduce(dst=rows, predicate=finite, on_true=rows, on_false=0.0)
-    ops = []
-    ops.append(rows)
-    ops.append(rows_t)
-    return ops
+        got = rows[:, c0:c0 + nc, :]
+        nisa.tensor_copy(dst=got, src=t_ps[:, 0:nc, :], engine=nisa.engine.scalar)
+        # x * 0 is 0 for a finite x and NaN for an infinite or NaN one.
+        nisa.tensor_scalar(dst=finite[:, c0:c0 + nc, :], data=got, op0=nl.multiply, operand0=0.0,
+                           op1=nl.equal, operand1=0.0, engine=nisa.engine.vector)
+        nisa.select_reduce(dst=got, predicate=finite[:, c0:c0 + nc, :], on_true=got,
+                           on_false=0.0)
+    return rows
 
 
 def _union_scores(q_t, rows_t, t0):
@@ -220,23 +244,17 @@ def _union_scores(q_t, rows_t, t0):
     return s_ps
 
 
-def _superblock_tile(member_hbm, q_t, rows_t, rows, run_max, run_sum, acc, softmax_scale,
-                     r0, u0):
-    """Fold one superblock (union positions ``u0 ..``) into query rows ``r0 .. r0 + 127``.
+def _tile_scores(member_hbm, q_t, rows_t, r0, u0):
+    """MM1 of query rows ``r0 .. r0 + 127`` over one superblock (union positions ``u0 ..``).
 
     ``q_t`` is the tile's queries with the latent on the partitions
-    (``mla_dense_window._query_columns``); ``run_max``, ``run_sum`` (``[128, 1]`` fp32) and
-    ``acc`` (``[128, L]`` fp32) are the tile's running statistics, updated in place: the
-    raw-score maximum, the sum of ``exp(scale * (score - run_max))`` and the unnormalised
-    output against that maximum.
+    (``mla_dense_window._query_columns``). Returns ``[scores, block_max]`` (the
+    ``_PART_*`` positions): the scores where the tile's member bits select the position,
+    ``_UNSELECTED_SCORE`` elsewhere, and their maximum per 512 positions.
     """
     cap = member_hbm.shape[1]
     width = rows_t.shape[3]
-    latent = rows.shape[2]
-    kv_dtype = rows.dtype
     n_blocks = width // MOVING_MAX
-
-    # ---- MM1 per 512 positions, the selected scores and their block maxima -------------
     pred = _sb((ROW_TILE, width), nl.uint8)
     nisa.dma_copy(dst=pred, src=member_hbm.ap(pattern=[[cap, ROW_TILE], [1, width]],
                                               offset=r0 * cap + u0))
@@ -249,6 +267,29 @@ def _superblock_tile(member_hbm, q_t, rows_t, rows, run_max, run_sum, acc, softm
                            on_true=s_ps, on_false=_UNSELECTED_SCORE,
                            reduce_res=block_max[:, b:b + 1],
                            reduce_cmd=nisa.reduce_cmd.reset_reduce, reduce_op=nl.maximum)
+    part = []
+    part.append(scores)
+    part.append(block_max)
+    return part
+
+
+def _tile_fold(part, rows, state, softmax_scale):
+    """Fold one superblock's ``part`` (:func:`_tile_scores`) into one tile's ``state``.
+
+    ``rows`` is the superblock with the keys on the partitions (:func:`_turn_rows`).
+    ``state`` holds the tile's running statistics (the ``_ST_*`` positions), updated in
+    place: the raw-score maximum and the sum of ``exp(scale * (score - run_max))``
+    (``[128, 1]`` fp32), and the unnormalised output against that maximum (``[128, L]``
+    fp32).
+    """
+    scores = part[_PART_SCORES]
+    block_max = part[_PART_MAX]
+    run_max = state[_ST_MAX]
+    run_sum = state[_ST_SUM]
+    acc = state[_ST_ACC]
+    latent = rows.shape[2]
+    kv_dtype = rows.dtype
+    n_blocks = scores.shape[1] // MOVING_MAX
 
     # ---- the running maximum, the rescale of what came before, the exps and their sum --
     new_max = _col(ROW_TILE, nl.float32)
@@ -311,50 +352,75 @@ def _store_tile(out_hbm, acc, run_sum, r0):
                   src=out_sb)
 
 
+def _tile_state(q_hbm, r0):
+    """A query tile's state (the ``_ST_*`` positions) before its first superblock."""
+    latent = q_hbm.shape[2]
+    state = []
+    state.append(_dw._query_columns(q_hbm, ROW_TILE, latent, r0 * latent, latent))
+    run_max = _col(ROW_TILE, nl.float32)
+    nisa.memset(dst=run_max, value=_SELECTED_MAX_FLOOR)
+    state.append(run_max)
+    run_sum = _col(ROW_TILE, nl.float32)
+    nisa.memset(dst=run_sum, value=0.0)
+    state.append(run_sum)
+    acc = _sb((ROW_TILE, latent), nl.float32)
+    nisa.memset(dst=acc, value=0.0)
+    state.append(acc)
+    state.append(r0)
+    return state
+
+
 def _block_shared_body(q_hbm, bank_hbm, table_hbm, union_hbm, member_hbm, softmax_scale,
                        page_size, block_queries, union_cap, out_hbm):
-    """Every block of this program over every superblock of its union.
+    """Every block of this program over every superblock of its union, :data:`_PAIR` at a time.
 
     The blocks are dealt round-robin over the programs; ``program_id`` is a trace-time int
-    (the kernel is traced once per program), so each program keeps only its own blocks. A
-    block's tiles share each superblock's gather and transposes; the last superblock may
-    be shorter, by whole 512-position blocks.
+    (the kernel is traced once per program), so each program keeps only its own blocks,
+    and runs them in groups of :data:`_PAIR` (a last group may hold one). Per superblock a
+    group emits its stages block by block: the gathers, then MM1 and the turns, then the
+    softmax and MM2. A block's tiles share each superblock's gather and transposes; the
+    last superblock may be shorter, by whole 512-position blocks. Each block folds its
+    superblocks in the same order and by the same steps as when it runs alone.
     """
-    seq, latent = q_hbm.shape[0], q_hbm.shape[2]
+    seq = q_hbm.shape[0]
     n_blocks = seq // block_queries
     tiles = block_queries // ROW_TILE
     n_prgs = nl.num_programs(axes=0)
     prg = nl.program_id(0)
     bank_rows = _ms._lowp_bank_table(table_hbm, page_size)
 
-    for blk in range(prg, n_blocks, n_prgs):
-        q_cols = []
-        run_max = []
-        run_sum = []
-        acc = []
-        starts = []
-        for ti in range(tiles):
-            r0 = blk * block_queries + ti * ROW_TILE
-            q_cols.append(_dw._query_columns(q_hbm, ROW_TILE, latent, r0 * latent, latent))
-            m = _col(ROW_TILE, nl.float32)
-            nisa.memset(dst=m, value=_SELECTED_MAX_FLOOR)
-            run_max.append(m)
-            s = _col(ROW_TILE, nl.float32)
-            nisa.memset(dst=s, value=0.0)
-            run_sum.append(s)
-            a = _sb((ROW_TILE, latent), nl.float32)
-            nisa.memset(dst=a, value=0.0)
-            acc.append(a)
-            starts.append(r0)
+    for first in range(prg, n_blocks, _PAIR * n_prgs):
+        n_group = min(_PAIR, (n_blocks - first + n_prgs - 1) // n_prgs)
+        states = []
+        for gi in range(n_group):
+            blk_states = []
+            for ti in range(tiles):
+                blk_states.append(_tile_state(q_hbm, (first + gi * n_prgs) * block_queries
+                                              + ti * ROW_TILE))
+            states.append(blk_states)
         for u0 in range(0, union_cap, SUPERBLOCK_ROWS):
             n_chunks = min(SUPERBLOCK_ROWS, union_cap - u0) // KEY_CHUNK
-            offsets = _union_offsets(union_hbm, bank_rows, blk, u0, n_chunks, page_size)
-            ops = _union_rows(bank_hbm, offsets, n_chunks)
+            rows_t = []
+            for gi in range(n_group):
+                offsets = _union_offsets(union_hbm, bank_rows, first + gi * n_prgs, u0, n_chunks,
+                                         page_size)
+                rows_t.append(_gather_rows(bank_hbm, offsets, n_chunks))
+            parts = []
+            rows = []
+            for gi in range(n_group):
+                blk_parts = []
+                for ti in range(tiles):
+                    blk_parts.append(_tile_scores(member_hbm, states[gi][ti][_ST_Q], rows_t[gi],
+                                                  states[gi][ti][_ST_ROW], u0))
+                parts.append(blk_parts)
+                rows.append(_turn_rows(rows_t[gi]))
+            for gi in range(n_group):
+                for ti in range(tiles):
+                    _tile_fold(parts[gi][ti], rows[gi], states[gi][ti], softmax_scale)
+        for gi in range(n_group):
             for ti in range(tiles):
-                _superblock_tile(member_hbm, q_cols[ti], ops[_SB_T], ops[_SB_ROWS], run_max[ti],
-                                 run_sum[ti], acc[ti], softmax_scale, starts[ti], u0)
-        for ti in range(tiles):
-            _store_tile(out_hbm, acc[ti], run_sum[ti], starts[ti])
+                _store_tile(out_hbm, states[gi][ti][_ST_ACC], states[gi][ti][_ST_SUM],
+                            states[gi][ti][_ST_ROW])
 
 
 @nki.jit
