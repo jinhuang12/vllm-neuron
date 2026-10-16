@@ -152,6 +152,28 @@ def _query_buffers() -> int:
         return QUERY_BUFFERS_DEFAULT
 
 
+#: The DMA counts the bank form may issue per query's gather
+#: (``envs.VLLM_NEURON_MLA_SPARSE_GATHER_SPLIT``); 1 keeps the one DMA. 2 and 4 are the
+#: counts measured on device (:func:`_lowp_gather_split`).
+GATHER_SPLITS = (1, 2, 4)
+
+
+def gather_split(latent: int) -> int:
+    """The bank form's DMA count per query's gather, ``VLLM_NEURON_MLA_SPARSE_GATHER_SPLIT``.
+
+    Raises:
+        ValueError: the count is not one of :data:`GATHER_SPLITS`, or it does not divide
+            the ``latent // LATENT_TILE`` latent tiles that the DMAs share.
+    """
+    count = envs.VLLM_NEURON_MLA_SPARSE_GATHER_SPLIT
+    tiles = latent // LATENT_TILE
+    if count not in GATHER_SPLITS or tiles % count:
+        raise ValueError(
+            f"VLLM_NEURON_MLA_SPARSE_GATHER_SPLIT={count}: the bank form issues each gather "
+            f"as one of {GATHER_SPLITS} DMAs, a count that divides its {tiles} latent tiles")
+    return count
+
+
 class MlaSparseAttentionError(ValueError):
     """Raised for a geometry this kernel does not serve; there is no torch fallback."""
 
@@ -1870,6 +1892,40 @@ def _program_row(m: int, prg_id: int, n_prgs: int, qpb: int, n_blocks: int) -> i
     return qb * qpb + m % qpb
 
 
+def _lowp_gather_split(c_t, c_kv_hbm, offsets, n_chunks: int, n_latent: int, latent: int,
+                       n_split: int):
+    """One query's gather-transpose as ``n_split`` DMAs, each over an equal run of latent tiles.
+
+    DMA ``part`` takes the ``n_latent // n_split`` latent tiles from tile
+    ``part * (n_latent // n_split)`` on; ``n_split`` divides ``n_latent``
+    (:func:`gather_split`). Each DMA is the body's one gather
+    (``dst[l, 0, li, k] = cache[idx[k], li * 128 + l]``) over every selected key and its
+    own latent tiles, so ``c_t`` gets the same bits. All of them go on the software DGE
+    queue and none waits on another, so the queue can issue the next DMA at once, while
+    the earlier ones still move their data. Measured kernel-alone on trn2 (nki 0.6.0,
+    neuronx-cc 2.27), with the same bits, the bank-form call is 8.3 % faster with 2 DMAs
+    and 11.2 % faster with 4 at a 2,048-page window, and 10.1 % and 13.6 % faster at
+    1,024 pages. Those times fit a queue whose data transfer sets the time, with the fixed
+    cost of each DMA hidden; one that ran one DMA at a time would make the split slower.
+
+    The split is by latent tiles, not by key chunks, because a vector-offset DMA's SBUF
+    side must be one contiguous free range: ``c_t[:, :, l0:l0 + tiles, :]`` is one, while
+    a key-chunk slice ``c_t[:, :, :, k0:k1]`` steps over the other chunks at every latent
+    tile, which the graph compile refuses (NCC_IBVF082); the kernel-alone compile does
+    not run that check.
+    """
+    topk = n_chunks * KEY_CHUNK
+    tiles = n_latent // n_split
+    for part in range(n_split):
+        l0 = part * tiles
+        nisa.dma_transpose(
+            dst=c_t[:, :, l0:l0 + tiles, :],
+            src=c_kv_hbm.ap(pattern=[[latent, topk], [0, 1], [LATENT_TILE, tiles], [1, LATENT_TILE]],
+                            offset=l0 * LATENT_TILE, vector_offset=offsets[:, 0:n_chunks],
+                            indirect_dim=0),
+            dge_mode=nisa.dge_mode.swdge)
+
+
 def _lowp_load_queries(dst, q_lift_hbm, q0: int, block: int):
     """Copy the ``block`` query rows from query ``q0`` on into ``dst``, one row per partition.
 
@@ -1989,7 +2045,7 @@ def _lowp_mm2_per_chunk(out_t, c_pair, c_t, p_hl, qi: int, r: int, group: int, n
 
 def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out_hbm,
                                    QUERY_BUFFERS=QUERY_BUFFERS_DEFAULT, table_hbm=None,
-                                   page_size=0):
+                                   page_size=0, GATHER_SPLIT=1):
     """The low-precision streaming body; see the section comment above.
 
     Preconditions (:func:`_lowp_serves`): one head, no RoPE limb, more than one query,
@@ -2003,6 +2059,10 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
     the table (:func:`_lowp_offsets`); ``page_size`` is then a power of two. After the
     offsets the two forms differ only in MM2's order and its chunk buffers (the section
     comment above); both orders give the same bits.
+
+    ``GATHER_SPLIT`` is the number of DMAs that issue each query's gather; it divides
+    the latent tile count, and above 1 the DMAs share the tiles
+    (:func:`_lowp_gather_split`). The same bits at every count.
     """
     seq, heads, latent = q_lift_hbm.shape
     topk = topk_hbm.shape[1]
@@ -2142,12 +2202,16 @@ def _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale
                 # column k, read column-major from the chunk-major offset tile, which is
                 # the column order of the query's row. The source is viewed as
                 # ``[rows, 1, n_latent, 128]`` so one DMA lands every latent tile.
-                nisa.dma_transpose(
-                    dst=c_t,
-                    src=c_kv_hbm.ap(pattern=[[latent, topk], [0, 1],
-                                             [LATENT_TILE, n_latent], [1, LATENT_TILE]],
-                                    vector_offset=offsets[:, 0:n_chunks], indirect_dim=0),
-                    dge_mode=nisa.dge_mode.swdge)
+                if GATHER_SPLIT > 1:
+                    _lowp_gather_split(c_t, c_kv_hbm, offsets, n_chunks, n_latent, latent,
+                                       GATHER_SPLIT)
+                else:
+                    nisa.dma_transpose(
+                        dst=c_t,
+                        src=c_kv_hbm.ap(pattern=[[latent, topk], [0, 1],
+                                                 [LATENT_TILE, n_latent], [1, LATENT_TILE]],
+                                        vector_offset=offsets[:, 0:n_chunks], indirect_dim=0),
+                        dge_mode=nisa.dge_mode.swdge)
 
                 # ---- MM1 per score tile into the group's PSUM rows ---------------------
                 for li in range(n_latent):
@@ -2267,7 +2331,8 @@ def mla_sparse_attention_nope_row_tiled_kernel(q_lift_hbm, c_kv_hbm, topk_hbm,
                                                page_size=0, BLOCK_N=MOVING_MAX,
                                                STREAM_KV=True, PE_LOWP=False,
                                                QUERY_BUFFERS=QUERY_BUFFERS_DEFAULT,
-                                               source_digest=0, BANK_ROWS=False):
+                                               source_digest=0, BANK_ROWS=False,
+                                               GATHER_SPLIT=1):
     """Row-tiled NoPE sparse attention; the paged operands and tile parameters are optional.
 
     The paged operands are declared before the tile parameters so a paged call reaches
@@ -2276,8 +2341,9 @@ def mla_sparse_attention_nope_row_tiled_kernel(q_lift_hbm, c_kv_hbm, topk_hbm,
     :data:`SOURCE_DIGEST` and only keys the kernel cache. ``BANK_ROWS`` lets a paged call
     that the low-precision body serves read the bank through the table instead of a
     staged window (:func:`bank_rows_serve`); the caller then passes no overlay operands,
-    because the bank already holds this step's rows. It is declared last so every
-    earlier positional form keeps its meaning.
+    because the bank already holds this step's rows. ``GATHER_SPLIT`` is the bank form's
+    DMA count per query's gather (:func:`_attention_body_row_tiled_lowp`). They are
+    declared last so every earlier positional form keeps its meaning.
     """
     seq, heads, latent = q_lift_hbm.shape
     out_hbm = nl.ndarray((seq, heads, latent), dtype=nl.float32, buffer=nl.shared_hbm)
@@ -2288,7 +2354,8 @@ def mla_sparse_attention_nope_row_tiled_kernel(q_lift_hbm, c_kv_hbm, topk_hbm,
     if banked:
         _attention_body_row_tiled_lowp(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale,
                                        out_hbm, QUERY_BUFFERS=QUERY_BUFFERS,
-                                       table_hbm=block_table_hbm, page_size=page_size)
+                                       table_hbm=block_table_hbm, page_size=page_size,
+                                       GATHER_SPLIT=GATHER_SPLIT)
     elif PE_LOWP and _lowp_serves(q_lift_hbm, window_hbm, heads, 0, STREAM_KV):
         _attention_body_row_tiled_lowp(q_lift_hbm, window_hbm, topk_hbm, softmax_scale,
                                        out_hbm, QUERY_BUFFERS=QUERY_BUFFERS)
@@ -2737,7 +2804,8 @@ def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
         ):
             return nope_call(
                 q_lift_in, c_kv_in, topk_i32, float(softmax_scale), table, None, None,
-                int(page_size), MOVING_MAX, True, lowp, buffers, SOURCE_DIGEST, True
+                int(page_size), MOVING_MAX, True, lowp, buffers, SOURCE_DIGEST, True,
+                gather_split(latent)
             )
         # A step that writes nothing hands no overlay operands rather than empty ones: the
         # kernel front end builds one tile per tensor operand and refuses a zero-extent shape.
