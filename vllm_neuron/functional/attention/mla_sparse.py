@@ -2614,7 +2614,8 @@ def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
                          written: Tensor | None = None,
                          write_offset: Tensor | None = None,
                          page_size: int = 0, pool_size: int = 0,
-                         written_in_bank: bool = False) -> Tensor:
+                         written_in_bank: bool = False,
+                         keep_bits: Tensor | None = None) -> Tensor:
     """Sparse MLA attention over each query's selected cache rows.
 
     Args:
@@ -2648,10 +2649,13 @@ def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
             paged call the low-precision row-tiled body serves may then read the bank
             through the table with no staged window, where
             ``envs.VLLM_NEURON_MLA_SPARSE_BANK_ROWS`` is on (the default) and
-            :func:`bank_rows_serve` accepts ``page_size``. A paged NoPE call with a
-            positive ``pool_size`` that the masked window does not take may then take
-            ``mla_dense_masked.mla_dense_masked_attention``, one dense pass over the
-            window read through the table with the selection as a pool mask, wherever
+            :func:`bank_rows_serve` accepts ``page_size``.
+        keep_bits: ``[S, P / 8]`` uint8 or None -- the same selection as the indexer's
+            keep table over the window's ``P`` pools of ``pool_size`` rows
+            (``mla_dense_masked``'s module docstring gives the layout). With it, a paged
+            NoPE call with ``written_in_bank`` that the masked window does not take may
+            take ``mla_dense_masked.mla_dense_masked_attention``, one dense pass over the
+            window read through the table with the keep table as its mask, wherever
             ``mla_dense_masked.dense_masked_serves`` says so.
 
     Returns:
@@ -2683,20 +2687,19 @@ def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
         # Imported here for the same reason: mla_dense_masked reads this module's digest.
         from vllm_neuron.functional.attention import mla_dense_masked
 
-        pages = int(block_table_row.shape[0])
         if (
-            rope == 0
+            keep_bits is not None
+            and rope == 0
             and bool(written_in_bank)
+            and write_offset is not None
             and mla_dense_masked.dense_masked_serves(
-                seq, heads, latent, int(c_kv.shape[1]), int(c_kv.shape[0]), pages,
-                int(page_size), int(pool_size), topk, q_lift.dtype, c_kv.dtype)
+                seq, heads, latent, int(c_kv.shape[1]), int(c_kv.shape[0]),
+                int(block_table_row.shape[0]), int(page_size), int(pool_size), q_lift.dtype,
+                c_kv.dtype)
         ):
-            pool_mask = mla_dense_masked.selection_pool_counts(
-                topk_indices.contiguous().to(torch.int32), int(pool_size),
-                pages * int(page_size) // int(pool_size))
             return mla_dense_masked.mla_dense_masked_attention(
-                q_lift, c_kv, pool_mask, softmax_scale, block_table_row, int(pool_size),
-                int(page_size))
+                q_lift, c_kv, keep_bits, write_offset, softmax_scale, block_table_row,
+                int(pool_size), int(page_size))
 
     # The body is chosen from the shapes alone; no caller passes a flag. An exact-fit
     # latent keeps the untiled body; a ragged or wider-than-one-tile latent takes the
