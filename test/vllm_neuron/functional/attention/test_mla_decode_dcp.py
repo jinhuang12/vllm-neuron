@@ -395,29 +395,6 @@ def _refusal_case():
     return case, part
 
 
-@pytest.mark.parametrize("selected", [False, True])
-@pytest.mark.parametrize("rows", [2, 4])
-def test_spec_decode_under_dcp_is_refused_by_name(selected, rows):
-    # Stage B's T-row layout: q_lift, written and topk_indices carry B * T rows
-    # (request-major), block_table, position and owner B. Under DCP a step's rows can
-    # fall in two ranks' blocks, so the DCP entry refuses the step before any other
-    # check, and launches nothing.
-    case = global_case(2, 2, pages=4, positions=[300, 40], seed=83, selected=selected,
-                       width=128)
-    part = shard(case, 2, 0)
-    topk = None if part.topk is None else part.topk.repeat_interleave(rows, dim=0)
-    MD.reset_mla_decode_dispatch_counters()
-    with pytest.raises(MD.MlaDecodeAttentionError,
-                       match=r"speculative decoding \(T > 1 .*\) is not supported under "
-                             r"decode context parallelism.*follow-up: per-row DCP ownership"):
-        MD.mla_decode_partial_attention(
-            case.q.repeat_interleave(rows, dim=0), case.bank, part.table, part.position,
-            case.written.repeat_interleave(rows, dim=0), part.owner, SCALE, PAGE,
-            topk_indices=topk)
-    assert MD.mla_decode_dispatch_counters() == (0, 0)
-    assert MD.mla_decode_partial_counts() == (0, 0)
-
-
 def test_refusals_name_the_operand():
     case, part = _refusal_case()
     args = (case.q, case.bank, part.table, part.position, case.written)
