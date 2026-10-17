@@ -1276,34 +1276,82 @@ class NeuronPlatform(Platform):
             f"return {expected}, or serve text only with --language-model-only."
         )
 
+    #: The paths a speculative step of GLM-5.3-Flash needs under decode context
+    #: parallelism, each vouched for by a module attribute that is True where the path
+    #: is in the tree: (what it is, module, attribute, needed only with the async
+    #: drafter, ``VLLM_NEURON_GLM5NEXT_MTP_ASYNC``).
+    _DCP_SPECULATIVE_CAPABILITIES = (
+        (
+            "the T-row DCP partial-attention entry",
+            "vllm_neuron.functional.attention.mla_decode",
+            "DCP_SPECULATIVE_ROWS",
+            False,
+        ),
+        (
+            "the DSA indexer's T rows under DCP",
+            "vllm_neuron.functional.dsa.decode_trow",
+            "DCP_SPECULATIVE_ROWS",
+            False,
+        ),
+        (
+            "the async drafter's DCP latent slots",
+            "vllm_neuron.functional.mtp.async_step",
+            "DCP_LATENT_SLOTS",
+            True,
+        ),
+    )
+    #: The shadow draft's path under decode context parallelism: draft slots from the
+    #: DCP ownership map.
+    _DCP_DRAFT_SLOTS = ("vllm_neuron.model.glm5_next.mtp", "DCP_DRAFT_SLOTS")
+
+    @staticmethod
+    def _capability_present(module: str, attribute: str) -> bool:
+        """Whether ``module`` imports and its ``attribute`` is True: the path's vouch."""
+        import importlib
+
+        try:
+            imported = importlib.import_module(module)
+        except ImportError:
+            return False
+        return getattr(imported, attribute, None) is True
+
     @classmethod
     def _refuse_speculative_decoding_under_dcp(cls, vllm_config) -> None:
-        """Refuse speculative decoding and the shadow draft under decode context parallelism.
+        """Refuse speculative decoding and the shadow draft under decode context
+        parallelism unless the paths they need are in the tree.
 
-        The DCP partial-attention kernel entry refuses more than one query row
-        per request, and a verify step carries ``1 + num_speculative_tokens``
-        rows. The multi-row DCP attention entry (item 5a, T > 1 follow-up)
-        lifts this refusal. Callers check ``dcp_size > 1`` first.
+        A verify step carries ``1 + num_speculative_tokens`` rows per request, and those
+        rows can fall in two ranks' blocks. A speculative config is admitted for
+        GLM-5.3-Flash with method "mtp" when every capability in
+        :attr:`_DCP_SPECULATIVE_CAPABILITIES` that the server needs is present: the T-row
+        DCP partial-attention entry, the DSA indexer's T rows under DCP and, with the
+        async drafter, its DCP latent slots. Otherwise it is refused with the message
+        below, which names what is missing. Callers check ``dcp_size > 1`` first.
 
-        With no speculative config, ``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT`` >= 1
-        still runs the GLM-5.3-Flash MTP head's draft iterations, so for that
-        architecture it is refused here by name. A draft iteration past the
-        first computes the MTP layer's KV slot from the sequence's page index
-        over the rank's block table, and under DCP that table lists only the
-        rank's own pages. No other architecture reads the knob.
+        With no speculative config, ``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT`` >= 1 still runs
+        the GLM-5.3-Flash MTP head's draft iterations. A draft iteration past the first
+        computes the MTP layer's KV slot for a position no step has slotted, and under
+        DCP the rank's block table lists only its own pages, so the slot must come from
+        the DCP ownership map. The knob is admitted where the head says it does
+        (``mtp.DCP_DRAFT_SLOTS``) and refused by name otherwise. No other architecture
+        reads the knob.
         """
+        dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+        architectures = (
+            getattr(vllm_config.model_config.hf_config, "architectures", None) or ()
+        )
+        glm5_next = "Glm5NextForConditionalGeneration" in architectures
         speculative_config = vllm_config.speculative_config
         if speculative_config is None:
-            architectures = (
-                getattr(vllm_config.model_config.hf_config, "architectures", None) or ()
-            )
-            if "Glm5NextForConditionalGeneration" in architectures:
+            if glm5_next:
                 shadow_draft = int(envs.VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT)
-                if shadow_draft >= 1:
+                if shadow_draft >= 1 and not cls._capability_present(
+                    *cls._DCP_DRAFT_SLOTS
+                ):
                     raise ValueError(
-                        f"VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT={shadow_draft} is not "
-                        "supported with decode_context_parallel_size="
-                        f"{vllm_config.parallel_config.decode_context_parallel_size}: "
+                        f"VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT={shadow_draft} "
+                        "is not supported with decode_context_parallel_size="
+                        f"{dcp_size}: "
                         "from its second draft iteration on, the shadow draft "
                         "computes the MTP layer's KV slots from the sequence's page "
                         "index, and a decode context parallel rank holds only its "
@@ -1312,16 +1360,38 @@ class NeuronPlatform(Platform):
                     )
             return
         num_speculative_tokens = speculative_config.num_speculative_tokens
-        if num_speculative_tokens > 0:
-            raise ValueError(
-                "Speculative decoding is not supported with "
-                "decode_context_parallel_size > 1 "
-                f"(dcp={vllm_config.parallel_config.decode_context_parallel_size}, "
-                f"num_speculative_tokens={num_speculative_tokens}): "
-                "spec decode under DCP (item 5a T > 1 follow-up) is not "
-                "implemented. Disable speculative decoding or set "
-                "decode_context_parallel_size=1."
+        if num_speculative_tokens <= 0:
+            return
+        method = getattr(speculative_config, "method", None)
+        if not glm5_next or method != "mtp":
+            served = ", ".join(architectures) or "an unnamed architecture"
+            missing = (
+                f"Under decode context parallelism only speculative method 'mtp' on "
+                f"Glm5NextForConditionalGeneration has a multi-row decode path; this "
+                f"server asks for method '{method}' on {served}."
             )
+        else:
+            mtp_async = bool(envs.VLLM_NEURON_GLM5NEXT_MTP_ASYNC)
+            lacking = [
+                f"{label} ({module}.{attribute})"
+                for label, module, attribute, async_only in (
+                    cls._DCP_SPECULATIVE_CAPABILITIES
+                )
+                if (mtp_async or not async_only)
+                and not cls._capability_present(module, attribute)
+            ]
+            if not lacking:
+                return
+            missing = f"This tree lacks {', '.join(lacking)}."
+        raise ValueError(
+            "Speculative decoding "
+            "is not supported with decode_context_parallel_size > 1 "
+            f"(dcp={dcp_size}, "
+            f"num_speculative_tokens={num_speculative_tokens}): "
+            "spec decode under DCP (item 5a T > 1 follow-up) is not "
+            "implemented. Disable speculative decoding or set "
+            f"decode_context_parallel_size=1. {missing}"
+        )
 
     @classmethod
     def _refuse_multimodal_input_under_dcp(cls, vllm_config) -> None:

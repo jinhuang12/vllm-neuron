@@ -50,7 +50,7 @@ same per-layer lookup the trunk uses for layer 43, at index 45 (the runner); the
 decision to call either method (the root's forward). The knob that turns all of it
 on, ``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT``, is defined once in ``envs.py``. Every
 reader but the platform calls :func:`shadow_draft_k`; the platform reads it at
-startup to refuse it under decode context parallelism.
+startup and, under decode context parallelism, admits it on :data:`DCP_DRAFT_SLOTS`.
 
 Importing this module loads no model tree: the block is built inside the
 constructor, from a lazy import, so the root can import the head and the head can
@@ -122,6 +122,13 @@ MTP_PARAMETER_NAMES: tuple[str, ...] = (
     "block.mlp.shared_experts.up_proj_weight",
     "block.mlp.shared_experts.down_proj_weight",
 )
+
+#: Under decode context parallelism the draft iterations past the first take their
+#: latent slot from the DCP ownership map (``utils.dcp_ownership.owned_latent_slots``,
+#: the runner's rule) and clamp at the group's last position
+#: (:meth:`Glm5NextMultiTokenPredictor._iteration_carrier`). The platform admits the shadow
+#: draft at ``decode_context_parallel_size > 1`` only when this is True.
+DCP_DRAFT_SLOTS = True
 
 #: The block keywords that select the prefill leg. ``draft_tokens`` refuses them: a
 #: draft is a decode step, and the prefill carrier's ``[T]``-wide slot mapping has
@@ -407,8 +414,15 @@ class Glm5NextMultiTokenPredictor(nn.Module):
             return tuple(ring.clone() for ring in tail)
         return tail.clone()
 
+    @staticmethod
     def _latent_slots_at(
-        self, block_table_row: torch.Tensor, position, page_size: int, rows: int
+        block_table_row: torch.Tensor,
+        position,
+        page_size: int,
+        rows: int,
+        *,
+        dcp_size: int = 1,
+        dcp_rank: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """``[rows]`` int64: the physical latent-bank row of each request at ``position``.
 
@@ -423,6 +437,13 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         draft's to read back either (the attention clamps a ``-1`` page onto page 0
         and masks it), so the draft degrades for that iteration and corrupts
         nothing; the lookahead allocation removes the case.
+
+        Under decode context parallelism (``dcp_size > 1``) the table lists only this
+        rank's blocks, one per ``page_size * dcp_size`` positions, so the slot is the
+        runner's DCP rule (``utils.dcp_ownership.owned_latent_slots``): a position
+        ``dcp_rank`` owns lands at its local row through the table, and a position
+        another rank owns writes slot 0, as an unallocated page does. Its owner writes
+        it. ``dcp_rank`` is the layer's device rank (``Glm5NextDSAIndexer._dcp_rank``).
         """
         device = block_table_row.device
         if torch.is_tensor(position):
@@ -431,6 +452,22 @@ class Glm5NextMultiTokenPredictor(nn.Module):
             pos = torch.full((rows,), int(position), dtype=torch.int64, device=device)
         if int(pos.shape[0]) == 1 and rows > 1:
             pos = pos.expand(rows)
+        if int(dcp_size) > 1:
+            from vllm_neuron.utils.dcp_ownership import owned_latent_slots
+
+            if dcp_rank is None:
+                raise ValueError(
+                    f"decode_context_parallel_size={dcp_size} writes a draft position on "
+                    f"its owner only, which needs this rank's index in the group; got none"
+                )
+            return owned_latent_slots(
+                block_table_row,
+                pos,
+                dcp_rank,
+                block_size=int(page_size),
+                dcp_size=int(dcp_size),
+                null_block=0,
+            )
         table = block_table_row.to(torch.int64)
         pages, page = int(table.shape[0]), int(page_size)
         page_index = torch.div(pos, page, rounding_mode="floor").clamp(min=0, max=pages - 1)
@@ -457,10 +494,19 @@ class Glm5NextMultiTokenPredictor(nn.Module):
         never indexed past its trash row. The effect is the same: a draft that runs
         past the window writes nothing the trunk reads, and the ids it drafts there
         are what the trunk never uses, since a request at its last position ends.
+
+        Under decode context parallelism the carrier's ``max_seq_len`` is this rank's
+        share of the context and the positions are the sequence's, so the window's
+        last position is ``max_seq_len * dcp_size - 1`` (the layer reads the field the
+        same way), and the latent slot is the DCP rule's (:meth:`_latent_slots_at`).
+        Both read the layer's own DCP binding; iteration 0's forward has refused an
+        unbound one before any later iteration is built.
         """
         if iteration == 0:
             return block_kwargs
-        last = int(block_kwargs["max_seq_len"]) - 1
+        attention = getattr(self, BLOCK_ATTR).self_attn
+        dcp_size = int(attention.dcp_size)
+        last = int(block_kwargs["max_seq_len"]) * dcp_size - 1
         carrier = dict(block_kwargs)
         carrier["position"] = _advanced(block_kwargs["position"], iteration, last)
         carrier["seq_lens"] = _advanced(block_kwargs["seq_lens"], iteration, last + 1)
@@ -470,6 +516,11 @@ class Glm5NextMultiTokenPredictor(nn.Module):
             carrier["position"],
             int(block_kwargs["page_size"]),
             rows,
+            **(
+                {"dcp_size": dcp_size, "dcp_rank": attention.indexer._dcp_rank()}
+                if dcp_size > 1
+                else {}
+            ),
         )
         carrier["tail"] = scratch_ring
         return carrier
