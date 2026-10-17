@@ -1892,15 +1892,18 @@ class NeuronWorker(WorkerBase):
         # the sequence this expression reads one block, so it is right either way.
         dcp_size = self.vllm_config.parallel_config.decode_context_parallel_size
         if dcp_size > 1:
-            # Speculative decoding is refused at decode_context_parallel_size > 1
-            # (platform), so no draft blocks exist on this path: the DCP pricing is
-            # this rank's share of the sequence's pages, as before.
             # Under decode context parallelism the allocator gives a rank one block
             # per ``block_size * dcp_size`` tokens of a sequence: vLLM's KV cache
             # manager scales each group's block size by the DCP size
             # (``SingleTypeKVCacheManager.__init__``), so a rank keeps only its own
-            # blocks. The need is priced the same way, per rank.
+            # blocks. The need is priced the same way, per rank. A speculative server
+            # (admitted at decode_context_parallel_size > 1 where the platform finds
+            # its DCP paths) also holds a recurrent group's draft blocks per request,
+            # on every rank, the term the branch below adds:
+            # :func:`~vllm_neuron.vllm.worker.kv_group_blocks.draft_blocks_per_request`.
             from vllm_neuron.utils.dcp_ownership import ownership_stride
+
+            from .kv_group_blocks import draft_blocks_per_request
 
             blocks_per_request = sum(
                 cdiv(
@@ -1909,7 +1912,11 @@ class NeuronWorker(WorkerBase):
                         block_size=group.kv_cache_spec.block_size, dcp_size=dcp_size
                     ),
                 )
-                for group in groups
+                + draft_blocks_per_request(
+                    group.kv_cache_spec,
+                    f"KV cache group {index} ({', '.join(group.layer_names)})",
+                )
+                for index, group in enumerate(groups)
             )
         else:
             # At decode_context_parallel_size 1 a rank holds the whole sequence. A

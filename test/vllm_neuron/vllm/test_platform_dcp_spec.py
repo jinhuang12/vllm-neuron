@@ -8,9 +8,10 @@ the tree, each read as a module attribute that ``is True``:
 * the GLM-5.3-Flash shadow draft (``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT >= 1``, no speculative
   config) on ``mtp.DCP_DRAFT_SLOTS``: the draft iterations past the first take their latent
   slot from the DCP ownership map;
-* a speculative config (method "mtp", GLM-5.3-Flash) on the conjunction of three: the T-row
+* a speculative config (method "mtp", GLM-5.3-Flash) on the conjunction of four: the T-row
   DCP partial-attention entry (``mla_decode.DCP_SPECULATIVE_ROWS``), the DSA indexer's T rows
-  under DCP (``decode_trow.DCP_SPECULATIVE_ROWS``) and, with
+  under DCP (``decode_trow.DCP_SPECULATIVE_ROWS``), the draft head's DCP ownership slots
+  (``mtp.DCP_DRAFT_SLOTS``, which its draft iterations past the first take) and, with
   ``VLLM_NEURON_GLM5NEXT_MTP_ASYNC`` set, the async step's DCP latent slots
   (``async_step.DCP_LATENT_SLOTS``).
 
@@ -40,7 +41,7 @@ DRAFT_SLOTS = ("vllm_neuron.model.glm5_next.mtp", "DCP_DRAFT_SLOTS")
 ATTENTION_ROWS = ("vllm_neuron.functional.attention.mla_decode", "DCP_SPECULATIVE_ROWS")
 INDEXER_ROWS = ("vllm_neuron.functional.dsa.decode_trow", "DCP_SPECULATIVE_ROWS")
 ASYNC_SLOTS = ("vllm_neuron.functional.mtp.async_step", "DCP_LATENT_SLOTS")
-SPECULATIVE = (ATTENTION_ROWS, INDEXER_ROWS, ASYNC_SLOTS)
+SPECULATIVE = (ATTENTION_ROWS, INDEXER_ROWS, DRAFT_SLOTS, ASYNC_SLOTS)
 
 
 def shadow_message(k: int, dcp: int) -> str:
@@ -83,8 +84,9 @@ def _set(monkeypatch, capability: tuple[str, str], present: bool) -> None:
         monkeypatch.delattr(module, capability[1], raising=False)
 
 
-def _speculative_tree(monkeypatch, *, attention: bool, indexer: bool, slots: bool) -> None:
-    for capability, present in zip(SPECULATIVE, (attention, indexer, slots)):
+def _speculative_tree(monkeypatch, *, attention: bool, indexer: bool, draft: bool,
+                      slots: bool) -> None:
+    for capability, present in zip(SPECULATIVE, (attention, indexer, draft, slots), strict=True):
         _set(monkeypatch, capability, present)
 
 
@@ -133,37 +135,58 @@ def test_speculative_mtp_is_admitted_when_every_capability_is_present(monkeypatc
         monkeypatch.delenv(ASYNC_KNOB, raising=False)
     else:
         monkeypatch.setenv(ASYNC_KNOB, async_knob)
-    _speculative_tree(monkeypatch, attention=True, indexer=True, slots=True)
+    _speculative_tree(monkeypatch, attention=True, indexer=True, draft=True, slots=True)
     assert NeuronPlatform._refuse_speculative_decoding_under_dcp(_config(dcp, 3)) is None
 
 
 def test_the_async_slots_are_not_needed_without_the_async_knob(monkeypatch):
     monkeypatch.delenv(ASYNC_KNOB, raising=False)
-    _speculative_tree(monkeypatch, attention=True, indexer=True, slots=False)
+    _speculative_tree(monkeypatch, attention=True, indexer=True, draft=True, slots=False)
     assert NeuronPlatform._refuse_speculative_decoding_under_dcp(_config(2, 3)) is None
 
 
 @pytest.mark.parametrize(
-    "attention, indexer, slots",
+    "attention, indexer, draft, slots",
     [
-        (False, False, False),
-        (True, False, False),
-        (False, True, True),
-        (True, True, False),
-        (True, False, True),
+        (False, False, False, False),
+        (True, False, True, False),
+        (False, True, True, True),
+        (True, True, True, False),
+        (True, False, True, True),
+        (True, True, False, True),
+        (False, False, False, True),
     ],
 )
 def test_a_missing_capability_is_refused_with_todays_message_and_its_name(
-    monkeypatch, attention, indexer, slots
+    monkeypatch, attention, indexer, draft, slots
 ):
     monkeypatch.setenv(ASYNC_KNOB, "1")
-    _speculative_tree(monkeypatch, attention=attention, indexer=indexer, slots=slots)
+    _speculative_tree(monkeypatch, attention=attention, indexer=indexer, draft=draft,
+                      slots=slots)
     with pytest.raises(ValueError) as refused:
         NeuronPlatform._refuse_speculative_decoding_under_dcp(_config(2, 3))
     message = str(refused.value)
     assert message.startswith(speculative_message(3, 2))
-    for capability, present in zip(SPECULATIVE, (attention, indexer, slots)):
+    for capability, present in zip(SPECULATIVE, (attention, indexer, draft, slots),
+                                   strict=True):
         assert (_label(capability) in message) is (not present), (capability, message)
+
+
+@pytest.mark.parametrize("async_knob", [None, "1"])
+def test_the_draft_slots_are_needed_with_and_without_the_async_knob(monkeypatch, async_knob):
+    """The verify step's draft iterations past the first take their latent slots from the
+    draft head's DCP ownership path, so the speculative form names it when it is absent."""
+    if async_knob is None:
+        monkeypatch.delenv(ASYNC_KNOB, raising=False)
+    else:
+        monkeypatch.setenv(ASYNC_KNOB, async_knob)
+    _speculative_tree(monkeypatch, attention=True, indexer=True, draft=False, slots=True)
+    with pytest.raises(ValueError) as refused:
+        NeuronPlatform._refuse_speculative_decoding_under_dcp(_config(2, 3))
+    message = str(refused.value)
+    assert message.startswith(speculative_message(3, 2))
+    assert [capability for capability in SPECULATIVE if _label(capability) in message] == [
+        DRAFT_SLOTS]
 
 
 def test_the_tree_alone_names_what_it_lacks(monkeypatch):
@@ -189,7 +212,7 @@ def test_the_tree_alone_names_what_it_lacks(monkeypatch):
 )
 def test_other_methods_and_architectures_stay_refused(monkeypatch, method, architecture):
     monkeypatch.setenv(ASYNC_KNOB, "1")
-    _speculative_tree(monkeypatch, attention=True, indexer=True, slots=True)
+    _speculative_tree(monkeypatch, attention=True, indexer=True, draft=True, slots=True)
     config = _config(2, 3, method=method, architecture=architecture)
     with pytest.raises(ValueError) as refused:
         NeuronPlatform._refuse_speculative_decoding_under_dcp(config)
@@ -199,7 +222,7 @@ def test_other_methods_and_architectures_stay_refused(monkeypatch, method, archi
 
 
 def test_no_speculative_tokens_is_not_a_speculative_step(monkeypatch):
-    _speculative_tree(monkeypatch, attention=False, indexer=False, slots=False)
+    _speculative_tree(monkeypatch, attention=False, indexer=False, draft=False, slots=False)
     assert NeuronPlatform._refuse_speculative_decoding_under_dcp(_config(2, 0)) is None
 
 

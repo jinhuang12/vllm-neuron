@@ -1294,6 +1294,12 @@ class NeuronPlatform(Platform):
             False,
         ),
         (
+            "the draft head's DCP ownership slots",
+            "vllm_neuron.model.glm5_next.mtp",
+            "DCP_DRAFT_SLOTS",
+            False,
+        ),
+        (
             "the async drafter's DCP latent slots",
             "vllm_neuron.functional.mtp.async_step",
             "DCP_LATENT_SLOTS",
@@ -1324,8 +1330,9 @@ class NeuronPlatform(Platform):
         rows can fall in two ranks' blocks. A speculative config is admitted for
         GLM-5.3-Flash with method "mtp" when every capability in
         :attr:`_DCP_SPECULATIVE_CAPABILITIES` that the server needs is present: the T-row
-        DCP partial-attention entry, the DSA indexer's T rows under DCP and, with the
-        async drafter, its DCP latent slots. Otherwise it is refused with the message
+        DCP partial-attention entry, the DSA indexer's T rows under DCP, the draft head's
+        DCP ownership slots (its iterations past the first take them) and, with the async
+        drafter, its DCP latent slots. Otherwise it is refused with the message
         below, which names what is missing. Callers check ``dcp_size > 1`` first.
 
         With no speculative config, ``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT`` >= 1 still runs

@@ -1704,14 +1704,21 @@ def mla_decode_partial_attention(q_lift: Tensor, bank: Tensor, block_table: Tens
     call = wrap_nki(entry)
     if programs == 2:
         call = call[2]
-    args = (q_lift.contiguous(), bank.contiguous(),
-            block_table.contiguous().to(torch.int32),
-            position.contiguous().to(torch.int32), written.contiguous())
-    owned = owner.contiguous().to(torch.int32)
     if rows == 1:
-        # Today's kernels: the dense one takes owner, the selected one its ids instead.
-        lead = (owned,) if dense else (topk_indices.contiguous().to(torch.int32),)
+        # Today's kernels, with today's expressions and local names: dynamo names a graph
+        # node after the first local it is stored to, so a one-row step keeps the graph
+        # text of b5b516b3. The dense kernel takes owner, the selected one its ids instead.
+        checked = position
+        args = (q_lift.contiguous(), bank.contiguous(),
+                block_table.contiguous().to(torch.int32),
+                checked.contiguous().to(torch.int32), written.contiguous())
+        lead = ((owner.contiguous().to(torch.int32),) if dense
+                else (topk_indices.contiguous().to(torch.int32),))
     else:
+        args = (q_lift.contiguous(), bank.contiguous(),
+                block_table.contiguous().to(torch.int32),
+                position.contiguous().to(torch.int32), written.contiguous())
+        owned = owner.contiguous().to(torch.int32)
         lead = (owned,) if dense else (owned, topk_indices.contiguous().to(torch.int32))
     return call(*args, *lead, float(softmax_scale), int(page_size), SOURCE_DIGEST)
 

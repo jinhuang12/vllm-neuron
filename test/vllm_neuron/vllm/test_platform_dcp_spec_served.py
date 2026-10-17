@@ -24,7 +24,7 @@ Pinned:
    built for 3 iterations, and at the config's own geometry (block 128, the rank's share of
    131072 = 65536) its draft iterations take the ownership slots and clamp at 131071;
 3. the MTP k=3 form is refused by name, listing each capability the tree lacks, and is
-   admitted when all three are present; then a verify step of ``1 + k`` rows per request
+   admitted when all four are present; then a verify step of ``1 + k`` rows per request
    takes the T-row DCP operands at the attention.
 
 No test loads weights, starts a worker or touches a device.
@@ -165,7 +165,8 @@ def test_the_served_shadow_draft_form_is_admitted_and_drafts_on_ownership_slots(
 
 def test_the_served_mtp_form_is_refused_naming_every_missing_capability(monkeypatch, served_model):
     _served_env(monkeypatch, mtp_async=True)
-    admission._speculative_tree(monkeypatch, attention=False, indexer=False, slots=False)
+    admission._speculative_tree(monkeypatch, attention=False, indexer=False, draft=False,
+                                slots=False)
     with pytest.raises(ValueError) as refused:
         _engine_config(served_model, MTP)
     message = str(refused.value)
@@ -195,7 +196,8 @@ def test_the_served_mtp_form_is_admitted_and_its_verify_step_takes_the_t_row_pat
     monkeypatch, served_model
 ):
     _served_env(monkeypatch, mtp_async=True)
-    admission._speculative_tree(monkeypatch, attention=True, indexer=True, slots=True)
+    admission._speculative_tree(monkeypatch, attention=True, indexer=True, draft=True,
+                                slots=True)
     config = _engine_config(served_model, MTP)
     dcp = int(config.parallel_config.decode_context_parallel_size)
     block = int(config.cache_config.block_size)
