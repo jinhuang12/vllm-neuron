@@ -143,7 +143,7 @@ if TYPE_CHECKING:
     # the dense-masked kernel (mla_dense_masked.py). Off by default.
     VLLM_NEURON_MLA_DENSE_MASKED: bool = False
     # The largest window, in pages, that the dense-masked route takes.
-    VLLM_NEURON_MLA_DENSE_MASKED_MAX_PAGES: int = 264
+    VLLM_NEURON_MLA_DENSE_MASKED_MAX_PAGES: int = 1500
     # Let the GLM-5.3-Flash DSA prefill's sparse MLA body gather its rows from the
     # latent bank through the block table, with no staged window. On by default; 0
     # restores the staged window.
@@ -671,17 +671,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
         maybe_convert_bool(os.getenv("VLLM_NEURON_MLA_DENSE_MASKED")) or False
     ),
     # The largest window, in block-table pages, that the dense-masked route takes.
-    # The default is the largest window at which an earlier form of the route took at
-    # most 0.8 of the gather's time with every smaller window also passing, in a
-    # kernel-alone device A/B on one trn2 core (1,024 query rows, 128-row pages, 4-row
-    # pools, real top-k selections, raw times): that form built a byte per pool in the
-    # same graph by a scatter of one byte per index group, 6.1-6.4 ms per call at every
-    # window, and took 0.71 of the gather's time at 264 pages and 0.84 at 520. Its time
-    # less the scatter's stayed under 0.8 of the gather's up to 1,500 pages. The keep
-    # table replaces that scatter, so the default stands until the keep-table form's own
-    # A/B. Read at trace time; a change needs a new compile.
+    # The default is the largest window at which the keep-table form took at most 0.8
+    # of the gather's time with every smaller window also passing, in the round-5
+    # kernel-alone device A/B of record (dense_masked PREREG_ab5, kernel commit
+    # 72d847b0; one trn2 core, 1,024 query rows, 128-row pages, 4-row pools, real top-k
+    # selections, raw times). Its time plus the keep producer's estimated cost (93 us
+    # per call up to 1,024 pages, 133 us above; no device time yet) was 0.15 of the
+    # gather's time at 264 pages, 0.51 at 1,024, 0.76 at 1,500 and 0.996 at 2,048.
+    # Read at trace time; a change needs a new compile.
     "VLLM_NEURON_MLA_DENSE_MASKED_MAX_PAGES": lambda: (
-        264
+        1500
         if os.getenv("VLLM_NEURON_MLA_DENSE_MASKED_MAX_PAGES") is None
         else maybe_convert_int(os.getenv("VLLM_NEURON_MLA_DENSE_MASKED_MAX_PAGES"))
     ),
