@@ -22,6 +22,14 @@ device, one authored kernel each, so no host read sits between two steps:
   bucket's padding rows laid out as the host builder lays them (position 0 in the null
   block for the sparse family, position 1 and row 0 for the recurrent one).
 
+Under decode context parallelism (``dcp_size > 1``) a request's block-table column lists
+this rank's blocks, each holding the rank's share of ``page_size * dcp_size`` positions
+(:mod:`vllm_neuron.utils.dcp_ownership`, with the page as the DCP interleave), and the latent
+slots are owner-gated as the runner's synchronous translator gates them
+(``neuron_model_runner._dcp_owned_latent_slots``): a position this rank owns gets its local
+row, ``column[local // page] * page + local % page``, and a position another rank owns the
+null slot, offset 0 of :data:`NULL_BLOCK_ID`. The other fields do not depend on DCP.
+
 The torch route (``*_torch``) is the contract and the CPU route; the kernels are held to
 it bit for bit. Every value is an int32 count, id or position below ``2 ** 24``, so the
 engines' fp32 arithmetic is exact; the latent slots leave the kernel as int32 pairs
@@ -77,9 +85,11 @@ from vllm_neuron.functional.mtp.common import (
     count_kernel,
     count_torch_route,
 )
+from vllm_neuron.utils.dcp_ownership import token_local_row, token_owner
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 __all__ = [
+    "DCP_LATENT_SLOTS",
     "DECODE_STEP_ENQUEUES",
     "ENGINE_BATCHES_IN_FLIGHT",
     "EXECUTION_QUEUE_ENV",
@@ -112,6 +122,14 @@ __all__ = [
 
 #: Two int32 words make the int64 the latent slots are consumed as (NKI has no int64).
 INT64_WORDS = 2
+#: vLLM's null block (``neuron_model_runner.NULL_BLOCK_ID``, ``BlockPool.null_block``), which
+#: the allocator never gives a request: under DCP a position another rank owns writes offset 0
+#: of it. Restated so that ``functional`` does not import the worker; the tests pin the two equal.
+NULL_BLOCK_ID = 0
+#: The capability the platform's speculative-decoding check under DCP reads when the async
+#: drafter is on: :func:`mtp_async_correct` (torch route and kernel) owner-gates the latent
+#: slots by ``dcp_size`` / ``cp_rank``, as the synchronous translator does.
+DCP_LATENT_SLOTS = True
 
 #: ``NRT_QUEUE_FULL`` (``nrt/nrt_status.h``: "not enough space in the execution input queue").
 QUEUE_FULL_STATUS = 7
@@ -313,6 +331,7 @@ def _take_launch(accepted: Tensor, drafts: Tensor):
 def _correct_launch(
     prev_rows: Tensor, starts: Tensor, table: Tensor, *,
     PREV_WIDTH: int, WIDTH: int, PAGE_SHIFT: int, PADDING: int, WITH_SLOTS: bool,
+    DCP_SIZE: int, CP_RANK: int,
 ):
     """The correction kernel's launch, the unit :class:`DeviceLaunch` compiles.
 
@@ -335,7 +354,7 @@ def _correct_launch(
         starts=starts.reshape(batch, 1),
         table=table,
         PREV_WIDTH=PREV_WIDTH, WIDTH=WIDTH, PAGE_SHIFT=PAGE_SHIFT, PADDING=PADDING,
-        WITH_SLOTS=WITH_SLOTS,
+        WITH_SLOTS=WITH_SLOTS, DCP_SIZE=DCP_SIZE, CP_RANK=CP_RANK,
     )
     latent = (
         slots.reshape(rows * WIDTH, INT64_WORDS)[:, 0].to(
@@ -521,7 +540,7 @@ def _take_on_the_host(accepted: Tensor, drafts: Tensor) -> StepTake:
 
 def _correct_on_the_host(
     prev_checkpoint_rows: Tensor, optimistic_starts: Tensor, block_table_row: Tensor | None, *,
-    prev_width: int, width: int, page_size: int, padding: int,
+    prev_width: int, width: int, page_size: int, padding: int, dcp_size: int, cp_rank: int,
 ) -> StepCorrection:
     """The correction served by the torch route after the runtime refused its launch; as
     :func:`_take_on_the_host`."""
@@ -530,6 +549,7 @@ def _correct_on_the_host(
         prev_checkpoint_rows.cpu(), optimistic_starts.cpu(),
         None if block_table_row is None else block_table_row.cpu(),
         prev_width=prev_width, width=width, page_size=page_size, padding=padding,
+        dcp_size=dcp_size, cp_rank=cp_rank,
     )
     _degraded("correction")
     return StepCorrection(
@@ -780,11 +800,27 @@ def _page_shift(page_size: int) -> int:
     return page.bit_length() - 1
 
 
+def _check_dcp(dcp_size: int, cp_rank: int) -> None:
+    """Refuse a DCP geometry outside its group by name: the size is a positive int, the rank
+    one of its ranks."""
+    if isinstance(dcp_size, bool) or not isinstance(dcp_size, int) or dcp_size < 1:
+        raise MtpAsyncStepError(
+            f"mtp_async_correct: dcp_size must be a positive int, the ranks of the decode "
+            f"context parallel group; got {dcp_size!r}"
+        )
+    if isinstance(cp_rank, bool) or not isinstance(cp_rank, int) or not 0 <= cp_rank < dcp_size:
+        raise MtpAsyncStepError(
+            f"mtp_async_correct: cp_rank must lie in [0, dcp_size={dcp_size}), this rank's index "
+            f"in its decode context parallel group; got {cp_rank!r}"
+        )
+
+
 def _check_correct(
     prev_checkpoint_rows: Tensor, optimistic_starts: Tensor, block_table_row: Tensor | None, *,
-    prev_width: int, width: int, page_size: int, padding: int,
+    prev_width: int, width: int, page_size: int, padding: int, dcp_size: int, cp_rank: int,
 ) -> tuple[int, int, int]:
     """Return ``(B, R, pages)`` or raise naming the operand."""
+    _check_dcp(dcp_size, cp_rank)
     if int(prev_width) < 1 or int(width) < 1:
         raise MtpAsyncStepError(
             f"mtp_async_correct: prev_width and width are rows per request, at least 1; got "
@@ -831,18 +867,21 @@ def _check_correct(
         _check_contiguous("mtp_async_correct", "block_table_row", block_table_row)
     if _on_the_host(prev_checkpoint_rows) and _on_the_host(optimistic_starts):
         _check_values(prev_checkpoint_rows[:batch], optimistic_starts, block_table_row,
-                      prev_width=int(prev_width), width=int(width), page_size=int(page_size))
+                      prev_width=int(prev_width), width=int(width), page_size=int(page_size),
+                      dcp_size=dcp_size)
     return batch, rows, pages
 
 
 def _check_values(
     prev_checkpoint_rows: Tensor, optimistic_starts: Tensor, block_table_row: Tensor | None, *,
-    prev_width: int, width: int, page_size: int,
+    prev_width: int, width: int, page_size: int, dcp_size: int,
 ) -> None:
     """The host's checks on readable values: the resume row, the true start, the pages.
 
     Run on both routes when the operands are on the host (the CPU route, the tests); a
-    device future is not read, and the device computes without refusing.
+    device future is not read, and the device computes without refusing. Under DCP a
+    position's page is its rank-local table entry, for every position, owned or not: the
+    runner's ``_dcp_owned_latent_slots`` refuses a position past the row the same way.
     """
     if bool(((prev_checkpoint_rows < 0) | (prev_checkpoint_rows > prev_width - 1)).any()):
         raise MtpAsyncStepError(
@@ -862,25 +901,33 @@ def _check_values(
     pages = int(block_table_row.shape[0])
     positions = true_start.reshape(-1, 1) + torch.arange(width, dtype=torch.int64)
     page_index = positions >> shift
+    sharding = ""
+    if dcp_size > 1:
+        page_index = token_local_row(positions, block_size=page_size, dcp_size=dcp_size) >> shift
+        sharding = (
+            f" (under decode_context_parallel_size={dcp_size} an entry is this rank's block "
+            f"and covers {page_size * dcp_size} positions of the sequence)"
+        )
     if bool((page_index >= pages).any()):
         raise MtpAsyncStepError(
             f"mtp_async_correct: a position of {positions.tolist()} falls in a page past the "
-            f"table, which names {pages} page(s) per request; the row and the position come "
-            f"from one step and a position outside the row has no slot"
+            f"table, which names {pages} page(s) per request{sharding}; the row and the "
+            f"position come from one step and a position outside the row has no slot"
         )
     batch = int(true_start.shape[0])
     columns = block_table_row.to(torch.int64).t()[:batch]
     if bool((torch.gather(columns, 1, page_index) < 0).any()):
         raise MtpAsyncStepError(
             f"mtp_async_correct: a position of {positions.tolist()} falls in a page its "
-            f"request's block-table column does not name (-1); a position outside the row "
-            f"has no slot"
+            f"request's block-table column does not name (-1){sharding}; a position outside "
+            f"the row has no slot"
         )
 
 
 def mtp_async_correct_torch(
     prev_checkpoint_rows: Tensor, optimistic_starts: Tensor, block_table_row: Tensor | None, *,
-    prev_width: int, width: int, page_size: int, padding: int,
+    prev_width: int, width: int, page_size: int, padding: int, dcp_size: int = 1,
+    cp_rank: int = 0,
 ) -> StepCorrection:
     """The correction as torch ops: the contract, and the CPU route.
 
@@ -888,11 +935,16 @@ def mtp_async_correct_torch(
     row ``t`` of request ``r`` sits at ``start[r] + t`` with causal length one more and
     its slot is ``table[position // page, r] * page + position % page``. A padding row
     is one token at position 0 of its column's first (null) block, as
-    ``_glm5next_latent_slot_mapping`` lays it out with ``reals = [1]``.
+    ``_glm5next_latent_slot_mapping`` lays it out with ``reals = [1]``. Under DCP
+    (``dcp_size > 1``) the slot of a position rank ``cp_rank`` owns is
+    ``table[local // page, r] * page + local % page`` with ``local`` its rank-local row, and
+    every other position's is the null slot (``_dcp_owned_latent_slots``); a padding row's
+    position 0 is rank 0's.
     """
     batch, rows, pages = _check_correct(
         prev_checkpoint_rows, optimistic_starts, block_table_row,
         prev_width=prev_width, width=width, page_size=page_size, padding=padding,
+        dcp_size=dcp_size, cp_rank=cp_rank,
     )
     shift = _page_shift(page_size)
     page = 1 << shift
@@ -913,11 +965,20 @@ def mtp_async_correct_torch(
     ])
     positions = start_position.reshape(rows, 1) + offsets
     latent_slots = None
-    if block_table_row is not None:
+    if block_table_row is not None and dcp_size == 1:
         page_index = positions >> shift
         columns = block_table_row.to(torch.int64).t()
         blocks = torch.gather(columns, 1, page_index.clamp(min=0, max=pages - 1))
         latent_slots = (blocks * page + (positions & (page - 1))).reshape(-1)
+    elif block_table_row is not None:
+        local = token_local_row(positions, block_size=page, dcp_size=dcp_size)
+        owned = token_owner(positions, block_size=page, dcp_size=dcp_size) == cp_rank
+        columns = block_table_row.to(torch.int64).t()
+        blocks = torch.gather(columns, 1, (local >> shift).clamp(min=0, max=pages - 1))
+        slots = blocks * page + (local & (page - 1))
+        latent_slots = torch.where(
+            owned, slots, torch.full_like(slots, NULL_BLOCK_ID * page)
+        ).reshape(-1)
     seq_lens = (seq_positions + 1).to(torch.int32).reshape(-1)
     checkpoint_rows = torch.cat([
         prev_checkpoint_rows[:batch], torch.zeros(pad, dtype=torch.int32, device=device)
@@ -930,7 +991,8 @@ def mtp_async_correct_torch(
 
 @nki.jit
 def mtp_async_correct_kernel(prev_rows, starts, table, PREV_WIDTH: int, WIDTH: int,
-                             PAGE_SHIFT: int, PADDING: int, WITH_SLOTS: bool):
+                             PAGE_SHIFT: int, PADDING: int, WITH_SLOTS: bool,
+                             DCP_SIZE: int = 1, CP_RANK: int = 0):
     """``(start [R, 1], linear [R, 1], seq [R, W], slots [R, 2W], rows [R, 1])`` int32.
 
     ``WITH_SLOTS`` False (a stack with no latent bank; ``table`` is then a ``[1, R]``
@@ -946,6 +1008,15 @@ def mtp_async_correct_kernel(prev_rows, starts, table, PREV_WIDTH: int, WIDTH: i
     host's ``_torch`` route does): the scheduler allocates every page a step writes. The padding rows: position 0 (sparse), 1 (linear),
     resume row 0, causal lengths ``1 .. W`` and every slot at offset 0 of their column's
     first block.
+
+    ``DCP_SIZE`` > 1 (decode context parallelism; rank ``CP_RANK`` of the group): entry ``j``
+    of a column is this rank's block of the sequence's global block ``j * DCP_SIZE +
+    CP_RANK``, so the mask compares each row's global block with that iota instead of the
+    page index. A block another rank owns matches no entry, and the hit count -- 1 or 0 per
+    row -- gates the slot to the null slot (``NULL_BLOCK_ID * page``); within a block the
+    offset is the position's own. A padding row's position 0 is rank 0's, so on every other
+    rank it writes the null slot. At ``DCP_SIZE == 1`` the iota is the page index and no
+    gate is traced: the instructions are the single-rank kernel's.
     """
     batch = prev_rows.shape[0]
     pages, rows = table.shape
@@ -1006,17 +1077,24 @@ def mtp_async_correct_kernel(prev_rows, starts, table, PREV_WIDTH: int, WIDTH: i
         column_i = nl.ndarray((rows, pages), dtype=nl.int32, buffer=nl.sbuf)
         nisa.dma_copy(dst=column_i, src=table.ap(pattern=[[1, rows], [rows, pages]]))
         nisa.tensor_copy(dst=column_f, src=column_i)
+    # The global block each entry names: the page index at DCP 1, ``j * DCP_SIZE + CP_RANK``
+    # for this rank's entry ``j`` under DCP.
     page_index_f = nl.ndarray((batch, pages), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.iota(dst=page_index_f, pattern=[[1, pages]], offset=0, channel_multiplier=0)
+    nisa.iota(dst=page_index_f, pattern=[[DCP_SIZE, pages]], offset=CP_RANK, channel_multiplier=0)
     page_f = nl.ndarray((batch, WIDTH), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=page_f, src=page_i)
     block_f = nl.ndarray((batch, WIDTH), dtype=nl.float32, buffer=nl.sbuf)
+    if DCP_SIZE > 1:
+        # owned[b, t] = 1.0 when this rank holds row t's block: one entry matched, else none.
+        owned_f = nl.ndarray((batch, WIDTH), dtype=nl.float32, buffer=nl.sbuf)
     for t in range(WIDTH if WITH_SLOTS else 0):
         hit = nl.ndarray((batch, pages), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(dst=hit, data=page_index_f, op0=nl.equal, operand0=page_f[:, t:t + 1])
         picked = nl.ndarray((batch, pages), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_tensor(dst=picked, data1=column_f[0:batch, :], data2=hit, op=nl.multiply)
         nisa.tensor_reduce(dst=block_f[:, t:t + 1], op=nl.add, data=picked, axis=(1,))
+        if DCP_SIZE > 1:
+            nisa.tensor_reduce(dst=owned_f[:, t:t + 1], op=nl.add, data=hit, axis=(1,))
     if WITH_SLOTS:
         scaled_f = nl.ndarray((batch, WIDTH), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_scalar(dst=scaled_f, data=block_f, op0=nl.multiply, operand0=float(page))
@@ -1024,6 +1102,15 @@ def mtp_async_correct_kernel(prev_rows, starts, table, PREV_WIDTH: int, WIDTH: i
         nisa.tensor_copy(dst=within_f, src=within_i)
         slot_f = nl.ndarray((batch, WIDTH), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_tensor(dst=slot_f, data1=scaled_f, data2=within_f, op=nl.add)
+        if DCP_SIZE > 1:
+            # slot = owned ? slot : null, as (slot - null) * owned + null, exact in fp32.
+            null_slot = float(NULL_BLOCK_ID * page)
+            off_null_f = nl.ndarray((batch, WIDTH), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=off_null_f, data=slot_f, op0=nl.subtract, operand0=null_slot)
+            gated_f = nl.ndarray((batch, WIDTH), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=gated_f, data1=off_null_f, data2=owned_f, op=nl.multiply)
+            slot_f = nl.ndarray((batch, WIDTH), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=slot_f, data=gated_f, op0=nl.add, operand0=null_slot)
         slot_i = nl.ndarray((batch, WIDTH), dtype=nl.int32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=slot_i, src=slot_f)
         zero_i = nl.ndarray((batch, WIDTH), dtype=nl.int32, buffer=nl.sbuf)
@@ -1051,7 +1138,10 @@ def mtp_async_correct_kernel(prev_rows, starts, table, PREV_WIDTH: int, WIDTH: i
         pad_slot_i = nl.ndarray((PADDING, WIDTH), dtype=nl.int32, buffer=nl.sbuf)
         pad_zero_w = nl.ndarray((PADDING, WIDTH), dtype=nl.int32, buffer=nl.sbuf)
         nisa.memset(dst=pad_zero_w, value=0)
-        if WITH_SLOTS:
+        if WITH_SLOTS and DCP_SIZE > 1 and CP_RANK != 0:
+            # Position 0 is rank 0's: this rank writes the null slot.
+            nisa.memset(dst=pad_slot_i, value=NULL_BLOCK_ID * page)
+        elif WITH_SLOTS:
             pad_scaled_f = nl.ndarray((PADDING, 1), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_scalar(dst=pad_scaled_f, data=column_f[batch:rows, 0:1],
                                op0=nl.multiply, operand0=float(page))
@@ -1069,8 +1159,8 @@ def mtp_async_correct_kernel(prev_rows, starts, table, PREV_WIDTH: int, WIDTH: i
 
 def mtp_async_correct(
     prev_checkpoint_rows: Tensor, optimistic_starts: Tensor, block_table_row: Tensor | None, *,
-    prev_width: int, width: int, page_size: int, padding: int,
-    launch: DeviceLaunch | None = None,
+    prev_width: int, width: int, page_size: int, padding: int, dcp_size: int = 1,
+    cp_rank: int = 0, launch: DeviceLaunch | None = None,
 ) -> StepCorrection:
     """:class:`StepCorrection` for the step being built; the kernel where kernels run, else the torch route.
 
@@ -1088,12 +1178,15 @@ def mtp_async_correct(
             latent bank, which gets ``latent_slots`` None.
         prev_width: rows per request of the previous step (``1 + k`` after a verify step).
         width: rows per request of this step (``1 + k`` on a verify step, 1 on a one-row decode).
-        page_size: the latent bank's page, a power of two.
+        page_size: the latent bank's page, a power of two (under DCP also the interleave).
         padding: the bucket's padding rows past the ``B`` requests. A padding row starts at
             position 0 of the null block with checkpoint row 0; the synchronous builder
             records an idle slot's last row there instead -- unserved either way: the async
             drafter serves one request (``MtpProposer`` refuses ``max_num_seqs > 1``), so a
             bucket with padding is laid out but never run.
+        dcp_size: the ranks of the decode context parallel group (1 without DCP); the table
+            columns then list this rank's blocks, and the slots are owner-gated.
+        cp_rank: this rank's index in that group, ``0 .. dcp_size - 1``.
         launch: the :class:`DeviceLaunch` a device operand launches through; a host
             operand launches eagerly and ignores it. A launch the runtime refuses with a
             full execution queue is served by the torch route on the host for this step
@@ -1101,19 +1194,22 @@ def mtp_async_correct(
 
     Raises:
         MtpAsyncStepError: another geometry or dtype, a strided operand, a page size that
-            is not a power of two, a device operand without a launch, or (when the values are on the host)
+            is not a power of two, a DCP rank outside its group, a device operand without a
+            launch, or (when the values are on the host)
             a resume row outside its step, a
             corrected position below zero, or a position whose page the table does not name.
     """
     batch, rows, _pages = _check_correct(
         prev_checkpoint_rows, optimistic_starts, block_table_row,
         prev_width=prev_width, width=width, page_size=page_size, padding=padding,
+        dcp_size=dcp_size, cp_rank=cp_rank,
     )
     shift = _page_shift(page_size)
     if not can_run_kernel(optimistic_starts):
         correction = mtp_async_correct_torch(
             prev_checkpoint_rows, optimistic_starts, block_table_row,
             prev_width=prev_width, width=width, page_size=page_size, padding=padding,
+            dcp_size=dcp_size, cp_rank=cp_rank,
         )
         _count_torch_route()
         return correction
@@ -1126,7 +1222,7 @@ def mtp_async_correct(
     )
     constants = dict(
         PREV_WIDTH=int(prev_width), WIDTH=int(width), PAGE_SHIFT=shift, PADDING=int(padding),
-        WITH_SLOTS=with_slots,
+        WITH_SLOTS=with_slots, DCP_SIZE=dcp_size, CP_RANK=cp_rank,
     )
     if _launches_in_a_graph(optimistic_starts):
         if launch is None:
@@ -1139,6 +1235,7 @@ def mtp_async_correct(
             return _correct_on_the_host(
                 prev_checkpoint_rows, optimistic_starts, block_table_row,
                 prev_width=prev_width, width=width, page_size=page_size, padding=padding,
+                dcp_size=dcp_size, cp_rank=cp_rank,
             )
     else:
         fields = _correct_launch(prev_checkpoint_rows, optimistic_starts, table, **constants)
