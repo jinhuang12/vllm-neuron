@@ -44,9 +44,9 @@ window's pools), bit-plane major: pool ``p`` is bit ``p // (P / 8)`` of byte
 contiguous run of pools. A set bit is a pool the query's top-k chose. One bit per pool is
 the exact selection because the indexer selects whole pools, and the query's open pool
 (the incomplete one holding its own row) is read up to the query's row whatever its bit,
-as ``dsa_index_expand`` appends those rows after the selected pools. The table's contract
-(block_shared/INTERFACE.md version 3, s2) lets the producer set the open pool's bit, and
-bits past it, so the kernel cuts every kept pool at the causal bound. With ``pos`` the
+as ``dsa_index_expand`` appends those rows after the selected pools. A producer of the
+table may also set the open pool's bit, and bits past it, so the kernel cuts every kept
+pool at the causal bound. With ``pos`` the
 query's window row (``query_start`` plus its row in the chunk) and ``(pos + 1) // R`` its
 open pool, the query reads ``count[q, p]`` leading rows of pool ``p``: ``R`` for a set bit
 before its open pool, ``(pos + 1) % R`` for its open pool, and 0 elsewhere.
