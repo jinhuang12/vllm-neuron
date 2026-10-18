@@ -6670,6 +6670,10 @@ class Glm5NextDSAIndexer(nn.Module):
         if not keep_bits:
             return self.expand_indices(selection, seq_lens)
         pool_ids, bits = selection
+        # The ids are expanded beside the table on every keep-table route: the
+        # block-shared exact pass reads them, and the attention seam checks their shape
+        # on either route. The dense-masked pass reads only the table, so the expansion
+        # has no reader in its graphs, and their HLO holds none of it.
         return self.expand_indices(pool_ids, seq_lens), bits
 
     def _query_row_cut(
