@@ -25,6 +25,11 @@ What is checked, on the CPU simulator, against the fp32 CP=1 torch oracle
 * the bank holds garbage at every row of the step, so a row read from the bank instead of
   ``written`` fails; the owner gate's RED half (every rank counting every own row);
 * the served per-rank shape at DCP 2 (2176 selected rows padded to 2304, latent 512);
+* dense mode, per rank and bit for bit: each row of a T-row call is the one-row call at
+  that row's position (the T-row bank holds garbage at the step's rows, the one-row bank
+  holds them there, as the served cache write leaves it), a position's pair is the same
+  whichever row of the step it is (the row-index check of the D-1 diagnosis), and the
+  call repeats itself; a step selected mode refuses for its units is served;
 * one program as well as two; the production NKI merge ``dcp_lse_merge`` at ``R = B * T``;
 * ``T = 1`` through the entry is commit b5b516b3's partial kernel bit for bit;
 * the refusals name the operand; the NKI front end accepts both T-row kernels.
@@ -359,6 +364,120 @@ def test_only_each_rows_holder_counts_it(monkeypatch):
     assert err > 100 * ATOL * float(want.abs().max()), err
 
 
+# ---- a dense row is the one-row step at its position, bit for bit -----------------------------
+
+def sequential_ranks(step: Step, cp: int, monkeypatch, lnc="2"):
+    """Every rank's (partial, lse) of the ``T`` one-row steps a dense T-row call stands for,
+    stacked as :func:`run_ranks` stacks the T-row call's: row ``t`` of every request is the
+    one-row DCP call at its own position. Its bank holds the step's rows at their slots,
+    as the served cache write (``index_copy_`` before the attention) leaves it, where the
+    T-row call's bank holds :data:`POISON` there."""
+    _grid(monkeypatch, lnc)
+    rows = step.rows
+    bank = step.bank.clone()
+    for b in range(int(step.table.shape[0])):
+        for t in range(rows):
+            bank[_slot(step.table[b], int(step.start[b]) + t)] = step.written[b * rows + t]
+    partials, lses = [], []
+    for rank in range(cp):
+        part = shard(step, cp, rank)
+        partial = torch.empty(step.q.shape[1], step.q.shape[0], LATENT, dtype=torch.float32)
+        lse = torch.empty(step.q.shape[1], step.q.shape[0], dtype=torch.float32)
+        for t in range(rows):
+            MD.reset_mla_decode_dispatch_counters()
+            one, one_lse = MD.mla_decode_partial_attention(
+                step.q[t::rows], bank, part.table, part.position[t::rows],
+                step.written[t::rows], part.owner[t::rows], SCALE, PAGE)
+            assert MD.mla_decode_partial_row_counts() == (0, 0)
+            partial[:, t::rows] = one
+            lse[:, t::rows] = one_lse
+        partials.append(partial)
+        lses.append(lse)
+    return torch.stack(partials), torch.stack(lses)
+
+
+def _same(got, want, label):
+    """Bit-equality, with the count of differing elements and the largest difference
+    printed (``-s``) so a failure is readable."""
+    differ = int((got != want).sum())
+    worst = float((got - want).abs().max()) if differ else 0.0
+    print(f"DCP_TROW_SEQ|{label}|differing={differ}|of={got.numel()}|max_abs={worst:.3e}|"
+          f"bound=0", flush=True)
+    assert differ == 0, (label, differ, worst)
+
+
+@pytest.mark.parametrize("lnc", ["2", None])
+@pytest.mark.parametrize("batch", BATCHES)
+@pytest.mark.parametrize("rows", (2, 4))
+@pytest.mark.parametrize("cp", CPS)
+def test_a_dense_row_is_the_one_row_step_at_its_position(cp, rows, batch, lnc, monkeypatch):
+    # Request 0 crosses into block 9; request 1 ends at the window's last row.
+    starts = [_crossing(9, rows), 16 * PAGE - rows][:batch]
+    step = global_step(batch, rows, cp, pages=16, starts=starts,
+                       seed=1100 + 100 * cp + 10 * rows + batch)
+    partials, lses = run_ranks(step, cp, monkeypatch, lnc=lnc)
+    want, want_lse = sequential_ranks(step, cp, monkeypatch, lnc=lnc)
+    for rank in range(cp):
+        label = f"cp={cp} T={rows} B={batch} lnc={lnc} rank={rank}"
+        _same(partials[rank], want[rank], label + " partial")
+        _same(lses[rank], want_lse[rank], label + " lse")
+
+
+def _row_r_step(p, r, rows, heads, seed):
+    """The verify step whose row ``r`` is position ``p``: rows ``c = p - r .. c + rows - 1``
+    of one request, a 2048-row window. Every position up to ``p`` has the same latent row
+    and query whatever ``r`` is; the step's rows after ``p`` are drafts, different for each
+    ``r``. The bank holds the rows before ``c`` and :data:`POISON` at the step's rows."""
+    gen = torch.Generator().manual_seed(seed)
+    pages = 16
+    latents = torch.randn(p + rows, LATENT, generator=gen).to(torch.bfloat16)
+    queries = torch.randn(p + rows, heads, LATENT, generator=gen).to(torch.bfloat16)
+    bank = torch.randn((pages + 2) * PAGE, LATENT, generator=gen).to(torch.bfloat16)
+    table = torch.randperm(pages + 2, generator=gen)[:pages].reshape(1, pages).to(torch.int32)
+    c = p - r
+    written, q = latents[c:c + rows].clone(), queries[c:c + rows].clone()
+    drafts = torch.Generator().manual_seed(seed * 10 + r)
+    for t in range(r + 1, rows):
+        written[t] = torch.randn(LATENT, generator=drafts).to(torch.bfloat16)
+        q[t] = torch.randn(heads, LATENT, generator=drafts).to(torch.bfloat16)
+    for position in range(c):
+        bank[_slot(table[0], position)] = latents[position]
+    for t in range(rows):
+        bank[_slot(table[0], c + t)] = POISON
+    table[0, (c + rows - 1) // PAGE + 1:] = -1
+    return Step(q, bank, table, torch.tensor([c], dtype=torch.int32), written, None, rows)
+
+
+@pytest.mark.parametrize("p", [286, 1153, 1281])
+def test_a_positions_dense_result_does_not_depend_on_its_row_in_the_step(p, monkeypatch):
+    # DCP 2, T = 4: p on rank 0 (block 2), on rank 1 (block 9), and on rank 0 with the step
+    # crossing from rank 1's block 9 into block 10 for r = 2, 3. Which row serves p is set
+    # by how many drafts the steps before kept, so a result that moved with r would let
+    # greedy tokens depend on the drafts (D-1 test 4).
+    cp, rows = 2, 4
+    first = None
+    for r in range(rows):
+        step = _row_r_step(p, r, rows, cp, seed=1200 + p)
+        partials, lses = run_ranks(step, cp, monkeypatch)
+        got = (partials[:, :, r], lses[:, :, r], lse_merge(partials, lses)[:, r])
+        if first is None:
+            first = got
+            continue
+        for name, a, b in zip(("partial", "lse", "merged"), got, first):
+            _same(a, b, f"p={p} r={r} vs r=0 {name}")
+
+
+def test_the_dense_t_row_kernel_repeats_itself(monkeypatch):
+    step = global_step(1, 4, 2, pages=16, starts=[_crossing(9, 4)], seed=1301)
+    partials, lses = run_ranks(step, 2, monkeypatch)
+    for k in range(2):
+        again = Step(step.q.clone(), step.bank.clone(), step.table.clone(), step.start.clone(),
+                     step.written.clone(), None, step.rows)
+        more, more_lse = run_ranks(again, 2, monkeypatch)
+        _same(more, partials, f"repeat {k} partial")
+        _same(more_lse, lses, f"repeat {k} lse")
+
+
 # ---- T = 1 is commit b5b516b3's kernel ------------------------------------------------------
 
 @pytest.fixture(scope="module")
@@ -440,13 +559,22 @@ def test_a_selected_row_this_rank_does_not_hold_must_not_name_its_position():
 
 
 def test_too_many_row_units_for_one_score_tile_are_refused(monkeypatch):
-    # 8 heads x 9 rows = 72 (row, head) units: the value pass's hi/lo rows (144) do not fit
-    # 128 partitions.
+    # Selected mode: 8 heads x 9 rows = 72 (row, head) units, whose hi/lo rows (144) do not
+    # fit the value pass's 128 partitions.
     _grid(monkeypatch, "2")
-    step = global_step(1, 9, MD.GROUP, pages=4, starts=[200], seed=1003)
+    step = global_step(1, 9, MD.GROUP, pages=4, starts=[200], seed=1003, selected=True,
+                       width=256)
     part = shard(step, 2, 0)
     with pytest.raises(MD.MlaDecodeAttentionError, match="key-split kernel.*72 .row, head. units"):
         _call(step, part)
+
+
+def test_dense_mode_serves_the_step_selected_mode_refuses(monkeypatch):
+    # Dense mode runs one-row passes of 8 units each, so the 72-unit step is served and
+    # merges to the oracle.
+    step = global_step(1, 9, MD.GROUP, pages=4, starts=[200], seed=1004)
+    partials, lses = run_ranks(step, 2, monkeypatch)
+    check(lse_merge(partials, lses), oracle(step), "dense cp=2 T=9 Hq=8")
 
 
 def test_the_t1_messages_are_todays():

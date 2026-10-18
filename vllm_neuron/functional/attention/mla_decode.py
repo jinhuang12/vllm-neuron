@@ -72,8 +72,11 @@ DCP mode takes ``T`` query rows per request as well (the speculative verify step
 :data:`DCP_SPECULATIVE_ROWS`). A step's rows can fall in two ranks' blocks, so
 ``position`` and ``owner`` are per row, ``[B * T]`` (:func:`dcp_step_rows`): row ``t`` is
 the one-row step at its own position, and each rank attends every row over the rows it
-holds. The step's own rows a rank holds are ``T`` own columns per row, read from
-``written``. ``T = 1`` launches today's partial kernels; ``T >= 2`` two T-row ones on the
+holds. The step's own rows a rank holds are read from ``written``, never from the bank:
+dense mode runs row ``t`` as the one-row step at its position, over the window with the
+step's rows overlaid at their local rows, so row ``t`` equals that step bit for bit;
+selected mode takes them as ``T`` own columns per row. ``T = 1`` launches today's partial
+kernels; ``T >= 2`` two T-row ones on the
 same key-split body (:func:`mla_decode_dense_split_rows_partial_kernel`,
 :func:`mla_decode_selected_split_rows_partial_kernel`). With DCP off nothing changes:
 :func:`mla_decode_attention` launches today's kernels.
@@ -725,17 +728,31 @@ def mla_decode_selected_kernel(q_hbm, bank_hbm, table_hbm, pos_hbm, written_hbm,
 # ``(g * H + h) * nck + ck`` holds request ``g``'s head ``h`` on chunk ``ck``: from the
 # softmax on, (request, head) row ``v = g * H + h`` is the unit a one-head request is.
 #
-# ``T`` query rows per request (the DCP partial's verify step, ``rows > 1``): the unit is
-# the (request, row, head) triple ``v = (g * T + t) * H + h``, the order of ``q_lift``'s
-# rows, so one DMA still loads a group's queries. Keys are loaded per *entity*: in dense
-# mode the request (its window serves all its rows; its ``T * H`` queries ride the one-hot
-# operand as heads do), in selected mode the row (each row has its own selection; its
-# ``H`` queries ride it). From the score columns on everything is the multi-head body with
-# entities for requests and queries per entity for heads. The step's own rows this rank
-# holds are ``T`` own columns per unit (``s_self[v, s] = q[v] . written[b * T + s]``),
-# counted where the rank holds step row ``s`` -- dense: for ``s <= t``; selected: once per
-# id that names its local row -- and never read from the bank. Every T-row addition is
-# under ``rows > 1``, so ``rows == 1`` is today's instruction stream.
+# ``T`` query rows per request (the DCP partial's verify step, ``rows > 1``).
+#
+# Dense mode runs a group's rows as ``T`` *passes*, pass ``t`` being the one-row group
+# body for each request's row ``t``: its position, query, own row and owner, with every
+# tile in its one-row shape, so row ``t`` is the one-row step at its position bit for bit
+# (the CPU simulator's matmul rounds by operand shape) and a position's result does not
+# depend on which row of the step it is. The passes share one window per request, built in
+# pass 0: its pages, then the step's rows this rank holds copied in from ``written`` at
+# their local rows (:func:`_overlay_own_rows`, at the slots :func:`_step_slots` names),
+# then every chunk transposed for MM1. Pass ``t`` attends the rows below its position, so
+# it reads the step's rows ``s < t`` there, as the one-row step at row ``t`` reads them from
+# the bank, and its own row as its own column; the bank's rows at the step's slots never
+# reach the result. Each pass swaps its own partials over ``sendrecv``.
+#
+# Selected mode runs one pass: the unit is the (request, row, head) triple
+# ``v = (g * T + t) * H + h``, the order of ``q_lift``'s rows, so one DMA still loads a
+# group's queries, and keys are loaded per *entity*, the row (each row has its own
+# selection; its ``H`` queries ride the one-hot operand). From the score columns on
+# everything is the multi-head body with entities for requests and queries per entity for
+# heads. The step's own rows this rank holds are ``T`` own columns per unit
+# (``s_self[v, s] = q[v] . written[b * T + s]``), counted once per id that names its local
+# row, and never read from the bank.
+#
+# Every T-row addition is under ``rows > 1``: at ``rows == 1`` one pass of ``t = 0`` runs,
+# and every expression is today's, so ``rows == 1`` is today's instruction stream.
 # ---------------------------------------------------------------------------------- #
 
 #: (Request, head) rows whose softmax runs as one instruction set, at most. A request's
@@ -789,6 +806,66 @@ def _step_row_onto_units(dst, src_hbm, first, requests, units, rows, step, row):
                                      offset=((first + g) * rows + step) * row))
 
 
+def _step_targets(pos_hbm, owner_hbm, first, requests, rows):
+    """``[KEY_CHUNK, requests * rows]`` fp32, the same on every partition: per (request,
+    step row ``s``), the local row of step row ``s`` where this rank holds it
+    (``position``, where ``owner`` is 1), else -2, which no window row and no id equals
+    (ids are -1 or window rows)."""
+    cols = requests * rows
+    step_pos_i = _sb((KEY_CHUNK, cols), nl.int32)
+    nisa.dma_copy(dst=step_pos_i, src=pos_hbm.ap(
+        pattern=[[0, KEY_CHUNK], [1, cols]], offset=first * rows))
+    step_own_i = _sb((KEY_CHUNK, cols), nl.int32)
+    nisa.dma_copy(dst=step_own_i, src=owner_hbm.ap(
+        pattern=[[0, KEY_CHUNK], [1, cols]], offset=first * rows))
+    step_pos = _sb((KEY_CHUNK, cols), nl.float32)
+    nisa.tensor_copy(dst=step_pos, src=step_pos_i)
+    step_own = _sb((KEY_CHUNK, cols), nl.float32)
+    nisa.tensor_copy(dst=step_own, src=step_own_i)
+    target = _sb((KEY_CHUNK, cols), nl.float32)
+    nisa.tensor_tensor(dst=target, data1=step_pos, data2=step_own, op=nl.multiply)
+    miss = _sb((KEY_CHUNK, cols), nl.float32)
+    nisa.tensor_scalar(dst=miss, data=step_own, op0=nl.multiply, operand0=2.0,
+                       op1=nl.subtract, operand1=2.0)
+    nisa.tensor_tensor(dst=target, data1=target, data2=miss, op=nl.add)
+    return target
+
+
+def _step_slots(rows_f, target, request, rows):
+    """``rel [KEY_CHUNK, nck]`` fp32 for :func:`_overlay_own_rows`: ``s`` at the key slot
+    whose local row (``rows_f``) is request ``request``'s step row ``s``'s target, -1
+    elsewhere. The targets of held rows are distinct local rows and -2 matches no slot, so
+    at most one ``s`` hits a slot and ``rel = sum_s (s + 1) * [row == target_s] - 1``,
+    whichever rows the rank holds."""
+    nck = rows_f.shape[1]
+    hits = _sb((KEY_CHUNK, nck), nl.float32)
+    nisa.memset(dst=hits, value=0.0)
+    for s in range(rows):
+        col = request * rows + s
+        at = _sb((KEY_CHUNK, nck), nl.float32)
+        nisa.tensor_scalar(dst=at, data=rows_f, op0=nl.equal,
+                           operand0=target[:, col:col + 1])
+        nisa.tensor_scalar(dst=at, data=at, op0=nl.multiply, operand0=float(s + 1))
+        nisa.tensor_tensor(dst=hits, data1=hits, data2=at, op=nl.add)
+    rel = _sb((KEY_CHUNK, nck), nl.float32)
+    nisa.tensor_scalar(dst=rel, data=hits, op0=nl.subtract, operand0=1.0)
+    return rel
+
+
+def _transpose_chunk(rows_g, ck, n_lat):
+    """Key chunk ``ck`` of ``rows_g`` (keys on partitions) turned onto the latent axis for
+    MM1: ``[LATENT_TILE, n_lat * KEY_CHUNK]``, one PE transpose per latent tile and one copy
+    out of PSUM, on the Vector engine (the Scalar queue issues row loads)."""
+    kv_dtype = rows_g.dtype
+    t_ps = nl.ndarray((LATENT_TILE, n_lat * KEY_CHUNK), dtype=kv_dtype, buffer=nl.psum)
+    for li in range(n_lat):
+        nisa.nc_transpose(dst=t_ps[:, li * KEY_CHUNK:(li + 1) * KEY_CHUNK],
+                          data=rows_g[:, ck, li * LATENT_TILE:(li + 1) * LATENT_TILE])
+    c_t = _sb((LATENT_TILE, n_lat * KEY_CHUNK), kv_dtype)
+    nisa.tensor_copy(dst=c_t, src=t_ps, engine=nisa.engine.vector)
+    return c_t
+
+
 def _lse_tile(neg_top, total, live, parts):
     """``ln(total) - neg_top`` where ``live`` (0/1) holds, else EMPTY_LSE.
 
@@ -819,7 +896,10 @@ def _split_body(q_hbm, bank_hbm, table_hbm, pos_hbm, written_hbm, topk_hbm,
     dense mode instead of once; the partial computes every value today's kernel does, in
     the same order, so at one head and every owner 1 its ``out`` is today's bit for bit.
     ``rows > 1`` (the DCP partial only) reads ``pos_hbm`` / ``owner_hbm`` per row
-    (``[B * rows]``, :func:`mla_decode_partial_attention`'s operands).
+    (``[B * rows]``, :func:`mla_decode_partial_attention`'s operands). Dense mode then runs
+    ``rows`` one-row passes over each group, pass ``t`` for row ``t`` of each request, so
+    each row's result is the one-row partial at that row's position bit for bit; selected
+    mode runs one pass over every row's own selection.
     """
     _, heads, latent = q_hbm.shape
     batch = table_hbm.shape[0]
@@ -840,11 +920,16 @@ def _split_body(q_hbm, bank_hbm, table_hbm, pos_hbm, written_hbm, topk_hbm,
     their_c0 = (1 - prg) * half
     shift = _log2(page_size)
     banked = bank_hbm.reshape((bank_hbm.shape[0] // KEY_CHUNK, KEY_CHUNK, latent))
-    # Key entities per request, the queries each entity scores, (row, head) units per
-    # request. One row: a request is one entity of ``heads`` queries, today's.
+    # Passes per group: a dense request's ``T`` rows run as ``T`` one-row passes over one
+    # window; one row, or a selected request's ``T`` rows (its entities), run as one pass.
+    # Per pass: the query rows each request's units span, its key entities, the queries
+    # each entity scores and its (row, head) units. One row: one pass, a request is one
+    # entity of ``heads`` queries, today's.
+    passes = rows if dense else 1
+    span = 1 if dense else rows
     per_req = 1 if dense else rows
-    per = heads * rows if dense else heads
-    units = rows * heads
+    per = heads
+    units = span * heads
     group = _split_group(nck, latent, units, per_req)
 
     # ---- constants -------------------------------------------------------------
@@ -868,11 +953,11 @@ def _split_body(q_hbm, bank_hbm, table_hbm, pos_hbm, written_hbm, topk_hbm,
     nisa.tensor_tensor(dst=pair, data1=pair, data2=pair_lo, op=nl.multiply)
     # MM1's moving operands: entity e's query q in column wide + q * nck of slot e, zeros
     # elsewhere, so the slice [wide - jv, wide - jv + gvn) puts it in score column
-    # jv + q * nck alone (jv = e * per * nck + ck). Two copies, by group parity, so one
-    # group's MM1 need not wait for the previous group's.
+    # jv + q * nck alone (jv = e * per * nck + ck). Two copies, by group and pass parity,
+    # so one pass's MM1 need not wait for the previous pass's.
     wide = vmax * nck
     q_hot = []
-    for _ in range(2 if batch > group else 1):
+    for _ in range(2 if batch > group or passes > 1 else 1):
         hot = _sb((LATENT_TILE, gmax * per_req, n_lat, 2 * wide), q_hbm.dtype)
         nisa.memset(dst=hot, value=0.0)
         q_hot.append(hot)
@@ -885,21 +970,6 @@ def _split_body(q_hbm, bank_hbm, table_hbm, pos_hbm, written_hbm, topk_hbm,
             piece_i = _sb((1, gmax * nck), nl.int32)
             nisa.iota(dst=piece_i, pattern=[[0, gmax], [0, nck // pieces], [1, pieces]],
                       offset=0)
-        if rows > 1:
-            # causal[v, s] = 1 where step row s is at or before unit v's row t: the own
-            # rows a dense row attends. Unit v's row is built on one partition and turned
-            # onto the units' partitions by the PE (exact for these small integers).
-            row_of = _sb((1, vmax), nl.float32)
-            nisa.iota(dst=row_of, pattern=[[0, gmax], [1, rows], [0, heads]], offset=0)
-            row_ps = nl.ndarray((vmax, 1), dtype=nl.float32, buffer=nl.psum)
-            nisa.nc_transpose(dst=row_ps, data=row_of)
-            row_col = _col(vmax, nl.float32)
-            nisa.tensor_copy(dst=row_col, src=row_ps)
-            step_f = _cols(vmax, rows, nl.float32)
-            nisa.iota(dst=step_f, pattern=[[1, rows]], offset=0)
-            causal = _cols(vmax, rows, nl.float32)
-            nisa.tensor_scalar(dst=causal, data=step_f, op0=nl.less_equal,
-                               operand0=row_col)
 
     for b0 in range(0, batch, group):
         gs = group if b0 + group <= batch else batch - b0
@@ -909,454 +979,478 @@ def _split_body(q_hbm, bank_hbm, table_hbm, pos_hbm, written_hbm, topk_hbm,
         gn = ents * nck
         gv = gs * units
         gvn = gv * nck
+        # Pass ``t`` is the one-row group body for each request's row ``t`` (dense
+        # ``rows > 1``); its window, overlaid and transposed, is built in pass 0 and read by
+        # every pass. One pass otherwise, ``t = 0``: today's body.
+        for t in range(passes):
+            hot = q_hot[((b0 // group) * passes + t) % len(q_hot)]
+            # ---- per-request scalars, queries, own rows ----------------------------
+            if dense or rows == 1:
+                # Each request's position at this pass's row: one row, the step's; T rows
+                # (dense), row t's, its window bound.
+                pos_i = _sb((KEY_CHUNK, gs), nl.int32)
+                nisa.dma_copy(dst=pos_i, src=pos_hbm.ap(pattern=[[0, KEY_CHUNK], [rows, gs]],
+                                                        offset=b0 * rows + t))
+                pos_f = _sb((KEY_CHUNK, gs), nl.float32)
+                nisa.tensor_copy(dst=pos_f, src=pos_i)
+            if rows > 1 and t == 0:
+                target = _step_targets(pos_hbm, owner_hbm, b0, gs, rows)
 
-        # ---- per-request scalars, queries, own rows --------------------------------
-        if dense or rows == 1:
-            # Each request's first row's position: one row, the step's; T rows (dense),
-            # the rows the rank held before the step, every row's window bound.
-            pos_i = _sb((KEY_CHUNK, gs), nl.int32)
-            nisa.dma_copy(dst=pos_i, src=pos_hbm.ap(pattern=[[0, KEY_CHUNK], [rows, gs]],
-                                                    offset=b0 * rows))
-            pos_f = _sb((KEY_CHUNK, gs), nl.float32)
-            nisa.tensor_copy(dst=pos_f, src=pos_i)
-        else:
-            # Per (request, step row s): the local row of step row s where this rank holds
-            # it, else -2, which no id equals (ids are -1 or window rows).
-            step_pos_i = _sb((KEY_CHUNK, gs * rows), nl.int32)
-            nisa.dma_copy(dst=step_pos_i, src=pos_hbm.ap(
-                pattern=[[0, KEY_CHUNK], [1, gs * rows]], offset=b0 * rows))
-            step_own_i = _sb((KEY_CHUNK, gs * rows), nl.int32)
-            nisa.dma_copy(dst=step_own_i, src=owner_hbm.ap(
-                pattern=[[0, KEY_CHUNK], [1, gs * rows]], offset=b0 * rows))
-            step_pos = _sb((KEY_CHUNK, gs * rows), nl.float32)
-            nisa.tensor_copy(dst=step_pos, src=step_pos_i)
-            step_own = _sb((KEY_CHUNK, gs * rows), nl.float32)
-            nisa.tensor_copy(dst=step_own, src=step_own_i)
-            target = _sb((KEY_CHUNK, gs * rows), nl.float32)
-            nisa.tensor_tensor(dst=target, data1=step_pos, data2=step_own, op=nl.multiply)
-            miss = _sb((KEY_CHUNK, gs * rows), nl.float32)
-            nisa.tensor_scalar(dst=miss, data=step_own, op0=nl.multiply, operand0=2.0,
-                               op1=nl.subtract, operand1=2.0)
-            nisa.tensor_tensor(dst=target, data1=target, data2=miss, op=nl.add)
+            q_nat = _sb((gv, latent), q_hbm.dtype)
+            if passes == 1:
+                nisa.dma_copy(dst=q_nat, src=q_hbm.ap(pattern=[[latent, gv], [1, latent]],
+                                                      offset=b0 * units * latent))
+            else:
+                # Row t of each request, ``rows * heads`` query rows apart: one DMA each.
+                for g in range(gs):
+                    nisa.dma_copy(dst=q_nat[g * heads:(g + 1) * heads, :],
+                                  src=q_hbm.ap(pattern=[[latent, heads], [1, latent]],
+                                               offset=((b0 + g) * rows + t) * heads * latent))
+            q_f = _sb((gv, latent), nl.float32)
+            nisa.tensor_copy(dst=q_f, src=q_nat)
+            q_ps = nl.ndarray((LATENT_TILE, n_lat * gv), dtype=nl.float32, buffer=nl.psum)
+            for li in range(n_lat):
+                nisa.nc_transpose(dst=q_ps[:, li * gv:(li + 1) * gv],
+                                  data=q_f[:, li * LATENT_TILE:(li + 1) * LATENT_TILE])
+            q_t = _sb((LATENT_TILE, n_lat * gv), q_hbm.dtype)
+            nisa.tensor_copy(dst=q_t, src=q_ps)
+            if per == 1:
+                hot_q = hot[:, 0:ents, :, wide:wide + 1]
+            else:
+                hot_q = hot.ap(pattern=[[gmax * per_req * n_lat * 2 * wide, LATENT_TILE],
+                                        [n_lat * 2 * wide, ents], [2 * wide, n_lat],
+                                        [nck, per]],
+                               offset=wide)
+            nisa.tensor_copy(dst=hot_q,
+                             src=q_t.ap(pattern=_head_pattern(
+                                 [[n_lat * gv, LATENT_TILE], [per, ents], [gv, n_lat]],
+                                 [1, per], [[1, 1]] if per == 1 else [], per), offset=0))
 
-        q_nat = _sb((gv, latent), q_hbm.dtype)
-        nisa.dma_copy(dst=q_nat, src=q_hbm.ap(pattern=[[latent, gv], [1, latent]],
-                                              offset=b0 * units * latent))
-        q_f = _sb((gv, latent), nl.float32)
-        nisa.tensor_copy(dst=q_f, src=q_nat)
-        q_ps = nl.ndarray((LATENT_TILE, n_lat * gv), dtype=nl.float32, buffer=nl.psum)
-        for li in range(n_lat):
-            nisa.nc_transpose(dst=q_ps[:, li * gv:(li + 1) * gv],
-                              data=q_f[:, li * LATENT_TILE:(li + 1) * LATENT_TILE])
-        q_t = _sb((LATENT_TILE, n_lat * gv), q_hbm.dtype)
-        nisa.tensor_copy(dst=q_t, src=q_ps)
-        hot = q_hot[(b0 // group) % len(q_hot)]
-        if per == 1:
-            hot_q = hot[:, 0:ents, :, wide:wide + 1]
-        else:
-            hot_q = hot.ap(pattern=[[gmax * per_req * n_lat * 2 * wide, LATENT_TILE],
-                                    [n_lat * 2 * wide, ents], [2 * wide, n_lat], [nck, per]],
-                           offset=wide)
-        nisa.tensor_copy(dst=hot_q,
-                         src=q_t.ap(pattern=_head_pattern(
-                             [[n_lat * gv, LATENT_TILE], [per, ents], [gv, n_lat]],
-                             [1, per], [[1, 1]] if per == 1 else [], per), offset=0))
-
-        if rows == 1:
-            own = _sb((gv, latent), written_hbm.dtype)
-            _rows_onto_heads(own, written_hbm, b0, gs, heads, latent)
-            own_f = _sb((gv, half), nl.float32)
-            nisa.tensor_copy(dst=own_f, src=own[:, my_c0:my_c0 + half])
-            prod = _sb((gv, latent), nl.float32)
-            nisa.tensor_tensor(dst=prod, data1=q_nat, data2=own, op=nl.multiply)
-            s_self = _col(gv, nl.float32)
-            nisa.tensor_reduce(dst=s_self, op=nl.add, data=prod, axis=1)
-        else:
-            # Own column s of every unit: the score of its request's step row s.
-            s_self = _cols(gv, rows, nl.float32)
-            own_f = []
-            for s in range(rows):
+            if span == 1:
                 own = _sb((gv, latent), written_hbm.dtype)
-                _step_row_onto_units(own, written_hbm, b0, gs, units, rows, s, latent)
-                own_s = _sb((gv, half), nl.float32)
-                nisa.tensor_copy(dst=own_s, src=own[:, my_c0:my_c0 + half])
-                own_f.append(own_s)
+                if passes == 1:
+                    _rows_onto_heads(own, written_hbm, b0, gs, heads, latent)
+                else:
+                    _step_row_onto_units(own, written_hbm, b0, gs, heads, rows, t, latent)
+                own_f = _sb((gv, half), nl.float32)
+                nisa.tensor_copy(dst=own_f, src=own[:, my_c0:my_c0 + half])
                 prod = _sb((gv, latent), nl.float32)
                 nisa.tensor_tensor(dst=prod, data1=q_nat, data2=own, op=nl.multiply)
-                nisa.tensor_reduce(dst=s_self[:, s:s + 1], op=nl.add, data=prod, axis=1)
+                s_self = _col(gv, nl.float32)
+                nisa.tensor_reduce(dst=s_self, op=nl.add, data=prod, axis=1)
+            else:
+                # Own column s of every unit: the score of its request's step row s.
+                s_self = _cols(gv, rows, nl.float32)
+                own_f = []
+                for s in range(rows):
+                    own = _sb((gv, latent), written_hbm.dtype)
+                    _step_row_onto_units(own, written_hbm, b0, gs, units, rows, s, latent)
+                    own_s = _sb((gv, half), nl.float32)
+                    nisa.tensor_copy(dst=own_s, src=own[:, my_c0:my_c0 + half])
+                    own_f.append(own_s)
+                    prod = _sb((gv, latent), nl.float32)
+                    nisa.tensor_tensor(dst=prod, data1=q_nat, data2=own, op=nl.multiply)
+                    nisa.tensor_reduce(dst=s_self[:, s:s + 1], op=nl.add, data=prod, axis=1)
 
-        # ---- where each key slot's row lives -------------------------------------
-        if dense:
-            # Key slot (r, ck) holds window row (ck0 + ck) * 128 + r: one page piece per
-            # chunk. The table entries once, the -1 pad clamped onto page 0 (masked rows).
-            npg = nck // pieces
-            raw = _sb((1, gs * npg), nl.int32)
-            nisa.dma_copy(dst=raw, src=table_hbm.ap(pattern=[[gs * npg, 1], [pages, gs], [1, npg]],
-                                                    offset=b0 * pages + ck0 // pieces))
-            held = _sb((1, gn), nl.int32)
-            nisa.tensor_scalar(dst=held, data=raw.ap(pattern=[[gs * npg, 1], [1, gs * npg],
-                                                              [0, pieces]]),
-                               op0=nl.maximum, operand0=0, op1=nl.multiply, operand1=pieces)
-            if pieces > 1:
-                nisa.tensor_tensor(dst=held, data1=held, data2=piece_i[:, 0:gn], op=nl.add)
-        else:
-            # Key slot (r, ck) of entity e holds selected column ck0*128 + r*nck + ck:
-            # each partition reads nck contiguous indices.
-            idx = _sb((KEY_CHUNK, gn), nl.int32)
-            nisa.dma_copy(dst=idx, src=topk_hbm.ap(
-                pattern=[[nck, KEY_CHUNK], [width, ents], [1, nck]],
-                offset=b0 * rows * width + ck0 * KEY_CHUNK))
-            safe = _sb((KEY_CHUNK, gn), nl.int32)
-            nisa.tensor_scalar(dst=safe, data=idx, op0=nl.maximum, operand0=0)
-            page_no = _sb((KEY_CHUNK, gn), nl.int32)
-            nisa.tensor_scalar(dst=page_no, data=safe, op0=nl.right_shift, operand0=shift)
-            in_page = _sb((KEY_CHUNK, gn), nl.int32)
-            nisa.tensor_scalar(dst=in_page, data=safe, op0=nl.bitwise_and,
-                               operand0=page_size - 1)
-            # Each request's table row on every partition, then a per-partition gather
-            # of entry (g * pages + page_no) -- no DMA per lookup. A request's rows read
-            # its table.
-            tb = _sb((KEY_CHUNK, gs * pages), nl.int32)
-            nisa.dma_copy(dst=tb, src=table_hbm.ap(
-                pattern=[[0, KEY_CHUNK], [pages, gs], [1, pages]], offset=b0 * pages))
-            base = _sb((KEY_CHUNK, gn), nl.int32)
-            nisa.iota(dst=base, pattern=[[pages, gs], [0, per_req * nck]], offset=0)
-            entry = _sb((KEY_CHUNK, gn), nl.int32)
-            nisa.tensor_tensor(dst=entry, data1=page_no, data2=base, op=nl.add)
-            entry_u = _sb((KEY_CHUNK, gn), nl.uint32)
-            nisa.tensor_copy(dst=entry_u, src=entry)
-            page_id = _sb((KEY_CHUNK, gn), nl.int32)
-            nisa.nc_n_gather(dst=page_id, data=tb, indices=entry_u)
-            row = _sb((KEY_CHUNK, gn), nl.int32)
-            nisa.tensor_scalar(dst=row, data=page_id, op0=nl.maximum, operand0=0,
-                               op1=nl.multiply, operand1=page_size)
-            nisa.tensor_tensor(dst=row, data1=row, data2=in_page, op=nl.add)
+            # ---- where each key slot's row lives (once per group) --------------------
+            if t == 0 and dense:
+                # Key slot (r, ck) holds window row (ck0 + ck) * 128 + r: one page piece per
+                # chunk. The table entries once, the -1 pad clamped onto page 0 (masked rows).
+                npg = nck // pieces
+                raw = _sb((1, gs * npg), nl.int32)
+                nisa.dma_copy(dst=raw, src=table_hbm.ap(
+                    pattern=[[gs * npg, 1], [pages, gs], [1, npg]],
+                    offset=b0 * pages + ck0 // pieces))
+                held = _sb((1, gn), nl.int32)
+                nisa.tensor_scalar(dst=held, data=raw.ap(pattern=[[gs * npg, 1],
+                                                                  [1, gs * npg], [0, pieces]]),
+                                   op0=nl.maximum, operand0=0, op1=nl.multiply,
+                                   operand1=pieces)
+                if pieces > 1:
+                    nisa.tensor_tensor(dst=held, data1=held, data2=piece_i[:, 0:gn],
+                                       op=nl.add)
+            elif t == 0:
+                # Key slot (r, ck) of entity e holds selected column ck0*128 + r*nck + ck:
+                # each partition reads nck contiguous indices.
+                idx = _sb((KEY_CHUNK, gn), nl.int32)
+                nisa.dma_copy(dst=idx, src=topk_hbm.ap(
+                    pattern=[[nck, KEY_CHUNK], [width, ents], [1, nck]],
+                    offset=b0 * rows * width + ck0 * KEY_CHUNK))
+                safe = _sb((KEY_CHUNK, gn), nl.int32)
+                nisa.tensor_scalar(dst=safe, data=idx, op0=nl.maximum, operand0=0)
+                page_no = _sb((KEY_CHUNK, gn), nl.int32)
+                nisa.tensor_scalar(dst=page_no, data=safe, op0=nl.right_shift,
+                                   operand0=shift)
+                in_page = _sb((KEY_CHUNK, gn), nl.int32)
+                nisa.tensor_scalar(dst=in_page, data=safe, op0=nl.bitwise_and,
+                                   operand0=page_size - 1)
+                # Each request's table row on every partition, then a per-partition gather
+                # of entry (g * pages + page_no) -- no DMA per lookup. A request's rows read
+                # its table.
+                tb = _sb((KEY_CHUNK, gs * pages), nl.int32)
+                nisa.dma_copy(dst=tb, src=table_hbm.ap(
+                    pattern=[[0, KEY_CHUNK], [pages, gs], [1, pages]], offset=b0 * pages))
+                base = _sb((KEY_CHUNK, gn), nl.int32)
+                nisa.iota(dst=base, pattern=[[pages, gs], [0, per_req * nck]], offset=0)
+                entry = _sb((KEY_CHUNK, gn), nl.int32)
+                nisa.tensor_tensor(dst=entry, data1=page_no, data2=base, op=nl.add)
+                entry_u = _sb((KEY_CHUNK, gn), nl.uint32)
+                nisa.tensor_copy(dst=entry_u, src=entry)
+                page_id = _sb((KEY_CHUNK, gn), nl.int32)
+                nisa.nc_n_gather(dst=page_id, data=tb, indices=entry_u)
+                row = _sb((KEY_CHUNK, gn), nl.int32)
+                nisa.tensor_scalar(dst=row, data=page_id, op0=nl.maximum, operand0=0,
+                                   op1=nl.multiply, operand1=page_size)
+                nisa.tensor_tensor(dst=row, data1=row, data2=in_page, op=nl.add)
 
-        # ---- rows, then MM1: scores keys-on-partitions ---------------------------
-        # One accumulation group per PSUM tile throughout: on trn2 several groups in one
-        # tile go wrong once other kernels ran before in the graph (device-checked; the
-        # simulator and a lone call do not show it). So every chunk's MM1 writes all
-        # of s_ps, the one-hot query slice keeping the other columns unchanged.
-        s_ps = nl.ndarray((KEY_CHUNK, gvn), dtype=nl.float32, buffer=nl.psum)
-        c_rows = []
-        for e in range(ents):
-            rows_g = _sb((KEY_CHUNK, nck, latent), kv_dtype)
-            for ck in range(nck):
-                j = e * nck + ck
-                if dense:
-                    # One page piece per DMA; issuing them from one queue is the bound,
-                    # so they rotate over the Sync and Scalar hardware DGE queues and
-                    # the GpSimd software DGE.
-                    page_src = banked.ap(pattern=[[latent, KEY_CHUNK], [1, latent]], offset=0,
-                                         scalar_offset=held[0:1, j:j + 1], indirect_dim=0)
-                    if j % 3 == 2:
-                        nisa.dma_copy(dst=rows_g[:, ck, :], src=page_src,
-                                      dge_mode=nisa.dge_mode.swdge)
+            # ---- rows, then MM1: scores keys-on-partitions -------------------------
+            # One accumulation group per PSUM tile throughout: on trn2 several groups in
+            # one tile go wrong once other kernels ran before in the graph (device-checked;
+            # the simulator and a lone call do not show it). So every chunk's MM1 writes
+            # all of s_ps, the one-hot query slice keeping the other columns unchanged.
+            s_ps = nl.ndarray((KEY_CHUNK, gvn), dtype=nl.float32, buffer=nl.psum)
+            if t == 0:
+                c_rows = []
+                c_tiles = []
+            for e in range(ents):
+                if t == 0:
+                    rows_g = _sb((KEY_CHUNK, nck, latent), kv_dtype)
+                    for ck in range(nck):
+                        j = e * nck + ck
+                        if dense:
+                            # One page piece per DMA; issuing them from one queue is the
+                            # bound, so they rotate over the Sync and Scalar hardware DGE
+                            # queues and the GpSimd software DGE.
+                            page_src = banked.ap(pattern=[[latent, KEY_CHUNK], [1, latent]],
+                                                 offset=0, scalar_offset=held[0:1, j:j + 1],
+                                                 indirect_dim=0)
+                            if j % 3 == 2:
+                                nisa.dma_copy(dst=rows_g[:, ck, :], src=page_src,
+                                              dge_mode=nisa.dge_mode.swdge)
+                            else:
+                                nisa.dma_copy(dst=rows_g[:, ck, :], src=page_src,
+                                              dge_mode=nisa.dge_mode.hwdge,
+                                              engine=nisa.engine.sync if j % 3 == 0
+                                              else nisa.engine.scalar)
+                        else:
+                            nisa.dma_copy(
+                                dst=rows_g[:, ck, :],
+                                src=bank_hbm.ap(pattern=[[latent, KEY_CHUNK], [1, latent]],
+                                                vector_offset=row[:, j:j + 1],
+                                                indirect_dim=0))
+                    if passes > 1:
+                        # The step's rows this rank holds, at their local rows: pass t
+                        # attends rows s < t there, as the one-row step at row t reads
+                        # them from the bank.
+                        _overlay_own_rows(rows_g, written_hbm,
+                                          _step_slots(rows_f, target, e, rows), rows,
+                                          (b0 + e) * rows)
+                    c_rows.append(rows_g)
+                    if passes > 1:
+                        c_e = []
+                        for ck in range(nck):
+                            c_e.append(_transpose_chunk(rows_g, ck, n_lat))
+                        c_tiles.append(c_e)
+                for ck in range(nck):
+                    j = e * nck + ck
+                    jv = e * per * nck + ck
+                    if passes == 1:
+                        c_t = _transpose_chunk(c_rows[e], ck, n_lat)
                     else:
-                        nisa.dma_copy(dst=rows_g[:, ck, :], src=page_src,
-                                      dge_mode=nisa.dge_mode.hwdge,
-                                      engine=nisa.engine.sync if j % 3 == 0
-                                      else nisa.engine.scalar)
-                else:
-                    nisa.dma_copy(
-                        dst=rows_g[:, ck, :],
-                        src=bank_hbm.ap(pattern=[[latent, KEY_CHUNK], [1, latent]],
-                                        vector_offset=row[:, j:j + 1], indirect_dim=0))
-            c_rows.append(rows_g)
-            for ck in range(nck):
-                j = e * nck + ck
-                jv = e * per * nck + ck
-                t_ps = nl.ndarray((LATENT_TILE, n_lat * KEY_CHUNK), dtype=kv_dtype,
-                                  buffer=nl.psum)
-                for li in range(n_lat):
-                    nisa.nc_transpose(
-                        dst=t_ps[:, li * KEY_CHUNK:(li + 1) * KEY_CHUNK],
-                        data=rows_g[:, ck, li * LATENT_TILE:(li + 1) * LATENT_TILE])
-                c_t = _sb((LATENT_TILE, n_lat * KEY_CHUNK), kv_dtype)
-                # The Vector engine takes every copy: the Scalar queue issues row loads.
-                nisa.tensor_copy(dst=c_t, src=t_ps, engine=nisa.engine.vector)
-                for li in range(n_lat):
-                    nisa.nc_matmul(dst=s_ps,
-                                   stationary=c_t[:, li * KEY_CHUNK:(li + 1) * KEY_CHUNK],
-                                   moving=hot[:, e, li, wide - jv:wide - jv + gvn],
-                                   accumulate=(j > 0 or li > 0))
+                        c_t = c_tiles[e][ck]
+                    for li in range(n_lat):
+                        nisa.nc_matmul(dst=s_ps,
+                                       stationary=c_t[:, li * KEY_CHUNK:(li + 1) * KEY_CHUNK],
+                                       moving=hot[:, e, li, wide - jv:wide - jv + gvn],
+                                       accumulate=(j > 0 or li > 0))
 
-        # ---- which slots carry a token (per entity; its queries share them) -------
-        valid = _sb((KEY_CHUNK, gn), nl.float32)
-        if dense:
-            # T rows: the rows held before the step, for every row of the request (its own
-            # rows are its own columns).
-            nisa.tensor_tensor(dst=valid,
-                               data1=rows_f.ap(pattern=[[nck, KEY_CHUNK], [0, gs], [1, nck]]),
-                               data2=pos_f.ap(pattern=[[gs, KEY_CHUNK], [1, gs], [0, nck]]),
-                               op=nl.less)
-        elif rows == 1:
-            idx_f = _sb((KEY_CHUNK, gn), nl.float32)
-            nisa.tensor_copy(dst=idx_f, src=idx)
-            live = _sb((KEY_CHUNK, gn), nl.float32)
-            nisa.tensor_scalar(dst=live, data=idx_f, op0=nl.greater,
-                               operand0=float(SENTINEL_INDEX))
-            is_own = _sb((KEY_CHUNK, gn), nl.float32)
-            nisa.tensor_tensor(dst=is_own, data1=idx_f,
-                               data2=pos_f.ap(pattern=[[gs, KEY_CHUNK], [1, gs], [0, nck]]),
-                               op=nl.equal)
-            # valid = live and not own = live - is_own (is_own implies live).
-            nisa.tensor_tensor(dst=valid, data1=live, data2=is_own, op=nl.subtract)
-            own_rows = _sb((KEY_CHUNK, gs), nl.float32)
-            nisa.tensor_reduce(dst=own_rows, op=nl.add,
-                               data=is_own.reshape((KEY_CHUNK, gs, nck)), axis=2)
-        else:
-            # valid = live - sum_s is_own_s: the targets of held step rows are distinct
-            # window rows, and -2 matches nothing, so the is_own_s are disjoint.
-            idx_f = _sb((KEY_CHUNK, gn), nl.float32)
-            nisa.tensor_copy(dst=idx_f, src=idx)
-            live = _sb((KEY_CHUNK, gn), nl.float32)
-            nisa.tensor_scalar(dst=live, data=idx_f, op0=nl.greater,
-                               operand0=float(SENTINEL_INDEX))
-            own_rows = []
-            for s in range(rows):
+            # ---- which slots carry a token (per entity; its queries share them) -----
+            valid = _sb((KEY_CHUNK, gn), nl.float32)
+            if dense:
+                # The rows held before this pass's row (the earlier step rows are overlaid
+                # there; its own row is its own column).
+                nisa.tensor_tensor(dst=valid,
+                                   data1=rows_f.ap(pattern=[[nck, KEY_CHUNK], [0, gs],
+                                                            [1, nck]]),
+                                   data2=pos_f.ap(pattern=[[gs, KEY_CHUNK], [1, gs],
+                                                           [0, nck]]),
+                                   op=nl.less)
+            elif rows == 1:
+                idx_f = _sb((KEY_CHUNK, gn), nl.float32)
+                nisa.tensor_copy(dst=idx_f, src=idx)
+                live = _sb((KEY_CHUNK, gn), nl.float32)
+                nisa.tensor_scalar(dst=live, data=idx_f, op0=nl.greater,
+                                   operand0=float(SENTINEL_INDEX))
                 is_own = _sb((KEY_CHUNK, gn), nl.float32)
-                nisa.tensor_tensor(
-                    dst=is_own,
-                    data1=idx_f.ap(pattern=[[gn, KEY_CHUNK], [rows * nck, gs], [nck, rows],
-                                            [1, nck]], offset=0),
-                    data2=target.ap(pattern=[[gs * rows, KEY_CHUNK], [rows, gs], [0, rows],
-                                             [0, nck]], offset=s),
-                    op=nl.equal)
-                nisa.tensor_tensor(dst=valid, data1=live if s == 0 else valid, data2=is_own,
-                                   op=nl.subtract)
-                counted = _sb((KEY_CHUNK, ents), nl.float32)
-                nisa.tensor_reduce(dst=counted, op=nl.add,
-                                   data=is_own.reshape((KEY_CHUNK, ents, nck)), axis=2)
-                own_rows.append(counted)
-        pred = _sb((KEY_CHUNK, gvn), nl.uint8)
-        if per == 1:
-            nisa.tensor_copy(dst=pred, src=valid)
-        else:
-            nisa.tensor_copy(dst=pred.reshape((KEY_CHUNK, ents, per, nck)),
-                             src=valid.ap(pattern=[[gn, KEY_CHUNK], [nck, ents], [0, per],
-                                                   [1, nck]], offset=0))
-        scores = _sb((KEY_CHUNK, gvn), nl.float32)
-        nisa.memset(dst=scores, value=MASKED_SCORE)
-        nisa.tensor_copy_predicated(dst=scores, src=s_ps, predicate=pred)
+                nisa.tensor_tensor(dst=is_own, data1=idx_f,
+                                   data2=pos_f.ap(pattern=[[gs, KEY_CHUNK], [1, gs],
+                                                           [0, nck]]),
+                                   op=nl.equal)
+                # valid = live and not own = live - is_own (is_own implies live).
+                nisa.tensor_tensor(dst=valid, data1=live, data2=is_own, op=nl.subtract)
+                own_rows = _sb((KEY_CHUNK, gs), nl.float32)
+                nisa.tensor_reduce(dst=own_rows, op=nl.add,
+                                   data=is_own.reshape((KEY_CHUNK, gs, nck)), axis=2)
+            else:
+                # valid = live - sum_s is_own_s: the targets of held step rows are distinct
+                # window rows, and -2 matches nothing, so the is_own_s are disjoint.
+                idx_f = _sb((KEY_CHUNK, gn), nl.float32)
+                nisa.tensor_copy(dst=idx_f, src=idx)
+                live = _sb((KEY_CHUNK, gn), nl.float32)
+                nisa.tensor_scalar(dst=live, data=idx_f, op0=nl.greater,
+                                   operand0=float(SENTINEL_INDEX))
+                own_rows = []
+                for s in range(rows):
+                    is_own = _sb((KEY_CHUNK, gn), nl.float32)
+                    nisa.tensor_tensor(
+                        dst=is_own,
+                        data1=idx_f.ap(pattern=[[gn, KEY_CHUNK], [rows * nck, gs],
+                                                [nck, rows], [1, nck]], offset=0),
+                        data2=target.ap(pattern=[[gs * rows, KEY_CHUNK], [rows, gs],
+                                                 [0, rows], [0, nck]], offset=s),
+                        op=nl.equal)
+                    nisa.tensor_tensor(dst=valid, data1=live if s == 0 else valid,
+                                       data2=is_own, op=nl.subtract)
+                    counted = _sb((KEY_CHUNK, ents), nl.float32)
+                    nisa.tensor_reduce(dst=counted, op=nl.add,
+                                       data=is_own.reshape((KEY_CHUNK, ents, nck)), axis=2)
+                    own_rows.append(counted)
+            pred = _sb((KEY_CHUNK, gvn), nl.uint8)
+            if per == 1:
+                nisa.tensor_copy(dst=pred, src=valid)
+            else:
+                nisa.tensor_copy(dst=pred.reshape((KEY_CHUNK, ents, per, nck)),
+                                 src=valid.ap(pattern=[[gn, KEY_CHUNK], [nck, ents],
+                                                       [0, per], [1, nck]], offset=0))
+            scores = _sb((KEY_CHUNK, gvn), nl.float32)
+            nisa.memset(dst=scores, value=MASKED_SCORE)
+            nisa.tensor_copy_predicated(dst=scores, src=s_ps, predicate=pred)
 
-        # ---- this program's softmax partials, all gv rows at once ----------------
-        rmax = _sb((KEY_CHUNK, gv), nl.float32)
-        nisa.tensor_reduce(dst=rmax, op=nl.maximum, data=scores.reshape((KEY_CHUNK, gv, nck)),
-                           axis=2)
-        rm_ps = nl.ndarray((gv, KEY_CHUNK), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_transpose(dst=rm_ps, data=rmax)
-        m_c = _col(gv, nl.float32)
-        nisa.tensor_reduce(dst=m_c, op=nl.maximum, data=rm_ps, axis=1)
-        nisa.tensor_scalar(dst=m_c, data=m_c, op0=nl.maximum, operand0=_MAX_FLOOR)
-        diag = _sb((gv, gv), nl.float32)
-        nisa.tensor_scalar(dst=diag, data=eye[0:gv, 0:gv], op0=nl.multiply, operand0=m_c)
-        mb_ps = nl.ndarray((KEY_CHUNK, gv), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_matmul(dst=mb_ps, stationary=ones_row[0:gv, :], moving=diag,
-                       is_stationary_onezero=True)
-        diff = _sb((KEY_CHUNK, gvn), nl.float32)
-        nisa.tensor_tensor(dst=diff, data1=scores,
-                           data2=mb_ps.ap(pattern=[[gv, KEY_CHUNK], [1, gv], [0, nck]]),
-                           op=nl.subtract)
-        p = _sb((KEY_CHUNK, gvn), nl.float32)
-        nisa.activation(dst=p, op=nl.exp, data=diff, scale=softmax_scale)
-        rsum = _sb((KEY_CHUNK, gv), nl.float32)
-        nisa.tensor_reduce(dst=rsum, op=nl.add, data=p.reshape((KEY_CHUNK, gv, nck)), axis=2)
-        sum_ps = nl.ndarray((gv, 1), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_matmul(dst=sum_ps, stationary=rsum, moving=ones_col[:, 0:1],
-                       is_moving_onezero=True)
-        # hi = bf16(p), lo = bf16(p - hi), written straight into MM2's stationary
-        # operand: slot j = e * nck + ck holds unit v = e * per + q's pair in columns 2v,
-        # 2v + 1 and zeros elsewhere, so every chunk accumulates into one [2 gv, latent]
-        # tile.
-        w2 = _sb((KEY_CHUNK, gn, 2 * gv), nl.bfloat16)
-        nisa.memset(dst=w2, value=0.0)
-        pair_ap = _head_pattern([[gn * 2 * gv, KEY_CHUNK], [nck * 2 * gv + 2 * per, ents]],
-                                [2, per], [[2 * gv, nck]], per)
-        hi = w2.ap(pattern=pair_ap, offset=0)
-        lo = w2.ap(pattern=pair_ap, offset=1)
-        p_v = p.reshape(tuple(_head_pattern([KEY_CHUNK, ents], per, [nck], per)))
-        nisa.tensor_copy(dst=hi, src=p_v)
-        hi_f = _sb((KEY_CHUNK, gv, nck), nl.float32)
-        hi_f_v = hi_f if per == 1 else hi_f.reshape((KEY_CHUNK, ents, per, nck))
-        nisa.tensor_copy(dst=hi_f_v, src=hi)
-        nisa.tensor_tensor(dst=lo, data1=p_v, data2=hi_f_v, op=nl.subtract)
+            # ---- this program's softmax partials, all gv rows at once --------------
+            rmax = _sb((KEY_CHUNK, gv), nl.float32)
+            nisa.tensor_reduce(dst=rmax, op=nl.maximum,
+                               data=scores.reshape((KEY_CHUNK, gv, nck)), axis=2)
+            rm_ps = nl.ndarray((gv, KEY_CHUNK), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_transpose(dst=rm_ps, data=rmax)
+            m_c = _col(gv, nl.float32)
+            nisa.tensor_reduce(dst=m_c, op=nl.maximum, data=rm_ps, axis=1)
+            nisa.tensor_scalar(dst=m_c, data=m_c, op0=nl.maximum, operand0=_MAX_FLOOR)
+            diag = _sb((gv, gv), nl.float32)
+            nisa.tensor_scalar(dst=diag, data=eye[0:gv, 0:gv], op0=nl.multiply,
+                               operand0=m_c)
+            mb_ps = nl.ndarray((KEY_CHUNK, gv), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(dst=mb_ps, stationary=ones_row[0:gv, :], moving=diag,
+                           is_stationary_onezero=True)
+            diff = _sb((KEY_CHUNK, gvn), nl.float32)
+            nisa.tensor_tensor(dst=diff, data1=scores,
+                               data2=mb_ps.ap(pattern=[[gv, KEY_CHUNK], [1, gv], [0, nck]]),
+                               op=nl.subtract)
+            p = _sb((KEY_CHUNK, gvn), nl.float32)
+            nisa.activation(dst=p, op=nl.exp, data=diff, scale=softmax_scale)
+            rsum = _sb((KEY_CHUNK, gv), nl.float32)
+            nisa.tensor_reduce(dst=rsum, op=nl.add, data=p.reshape((KEY_CHUNK, gv, nck)),
+                               axis=2)
+            sum_ps = nl.ndarray((gv, 1), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(dst=sum_ps, stationary=rsum, moving=ones_col[:, 0:1],
+                           is_moving_onezero=True)
+            # hi = bf16(p), lo = bf16(p - hi), written straight into MM2's stationary
+            # operand: slot j = e * nck + ck holds unit v = e * per + q's pair in columns
+            # 2v, 2v + 1 and zeros elsewhere, so every chunk accumulates into one
+            # [2 gv, latent] tile.
+            w2 = _sb((KEY_CHUNK, gn, 2 * gv), nl.bfloat16)
+            nisa.memset(dst=w2, value=0.0)
+            pair_ap = _head_pattern([[gn * 2 * gv, KEY_CHUNK], [nck * 2 * gv + 2 * per, ents]],
+                                    [2, per], [[2 * gv, nck]], per)
+            hi = w2.ap(pattern=pair_ap, offset=0)
+            lo = w2.ap(pattern=pair_ap, offset=1)
+            p_v = p.reshape(tuple(_head_pattern([KEY_CHUNK, ents], per, [nck], per)))
+            nisa.tensor_copy(dst=hi, src=p_v)
+            hi_f = _sb((KEY_CHUNK, gv, nck), nl.float32)
+            hi_f_v = hi_f if per == 1 else hi_f.reshape((KEY_CHUNK, ents, per, nck))
+            nisa.tensor_copy(dst=hi_f_v, src=hi)
+            nisa.tensor_tensor(dst=lo, data1=p_v, data2=hi_f_v, op=nl.subtract)
 
-        # ---- MM2: value sums, (request, head) rows on partitions -----------------
-        hl_ps = nl.ndarray((2 * gv, latent), dtype=nl.float32, buffer=nl.psum)
-        for e in range(ents):
-            for ck in range(nck):
-                j = e * nck + ck
-                nisa.nc_matmul(dst=hl_ps, stationary=w2[:, j, :], moving=c_rows[e][:, ck, :],
-                               accumulate=(j > 0))
-        hl = _sb((2 * gv, latent), nl.float32)
-        nisa.tensor_copy(dst=hl, src=hl_ps)
-        a_ps = nl.ndarray((gv, latent), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_matmul(dst=a_ps, stationary=pair[0:2 * gv, 0:gv], moving=hl,
-                       is_stationary_onezero=True)
+            # ---- MM2: value sums, (request, head) rows on partitions ---------------
+            hl_ps = nl.ndarray((2 * gv, latent), dtype=nl.float32, buffer=nl.psum)
+            for e in range(ents):
+                for ck in range(nck):
+                    j = e * nck + ck
+                    nisa.nc_matmul(dst=hl_ps, stationary=w2[:, j, :],
+                                   moving=c_rows[e][:, ck, :], accumulate=(j > 0))
+            hl = _sb((2 * gv, latent), nl.float32)
+            nisa.tensor_copy(dst=hl, src=hl_ps)
+            a_ps = nl.ndarray((gv, latent), dtype=nl.float32, buffer=nl.psum)
+            nisa.nc_matmul(dst=a_ps, stationary=pair[0:2 * gv, 0:gv], moving=hl,
+                           is_stationary_onezero=True)
 
-        # ---- partials: [A for the other program's columns | M | T | own counts] ---
-        cnt_m = _cols(gv, rows, nl.float32)
-        t_m = _col(gv, nl.float32)
-        nisa.tensor_copy(dst=t_m, src=sum_ps)
-        if rows > 1 and dense:
-            # Own column s counts where the rank holds step row s and s <= t, owner /
-            # n_prgs per program.
-            owner_i = _cols(gv, rows, nl.int32)
-            _rows_onto_heads(owner_i, owner_hbm, b0, gs, units, rows)
-            owner_f = _cols(gv, rows, nl.float32)
-            nisa.tensor_copy(dst=owner_f, src=owner_i)
-            nisa.tensor_tensor(dst=owner_f, data1=owner_f, data2=causal[0:gv, :],
-                               op=nl.multiply)
-            nisa.tensor_scalar(dst=cnt_m, data=owner_f, op0=nl.multiply,
-                               operand0=1.0 / n_prgs)
-        elif rows > 1:
-            # Own column s counts the ids of this program's slots that name step row s.
-            for s in range(rows):
+            # ---- partials: [A for the other program's columns | M | T | own counts] -
+            cnt_m = _cols(gv, span, nl.float32)
+            t_m = _col(gv, nl.float32)
+            nisa.tensor_copy(dst=t_m, src=sum_ps)
+            if span > 1:
+                # Own column s counts the ids of this program's slots that name step row s.
+                for s in range(rows):
+                    if heads == 1:
+                        own_rows_v = own_rows[s]
+                    else:
+                        own_rows_v = _sb((KEY_CHUNK, gv), nl.float32)
+                        nisa.tensor_copy(dst=own_rows_v.reshape((KEY_CHUNK, ents, heads)),
+                                         src=own_rows[s].ap(pattern=[[ents, KEY_CHUNK],
+                                                                     [1, ents], [0, heads]],
+                                                            offset=0))
+                    own_ps = nl.ndarray((gv, 1), dtype=nl.float32, buffer=nl.psum)
+                    nisa.nc_matmul(dst=own_ps, stationary=own_rows_v,
+                                   moving=ones_col[:, 0:1], is_moving_onezero=True)
+                    nisa.tensor_copy(dst=cnt_m[:, s:s + 1], src=own_ps)
+            elif dense and partial:
+                # The own row counts on its owner rank only: owner / n_prgs per program.
+                owner_i = _col(gv, nl.int32)
+                if passes == 1:
+                    _rows_onto_heads(owner_i, owner_hbm, b0, gs, heads, 1)
+                else:
+                    _step_row_onto_units(owner_i, owner_hbm, b0, gs, heads, rows, t, 1)
+                owner_f = _col(gv, nl.float32)
+                nisa.tensor_copy(dst=owner_f, src=owner_i)
+                nisa.tensor_scalar(dst=cnt_m, data=owner_f, op0=nl.multiply,
+                                   operand0=1.0 / n_prgs)
+            elif dense:
+                nisa.memset(dst=cnt_m, value=1.0 / n_prgs)
+            else:
                 if heads == 1:
-                    own_rows_v = own_rows[s]
+                    own_rows_v = own_rows
                 else:
                     own_rows_v = _sb((KEY_CHUNK, gv), nl.float32)
-                    nisa.tensor_copy(dst=own_rows_v.reshape((KEY_CHUNK, ents, heads)),
-                                     src=own_rows[s].ap(pattern=[[ents, KEY_CHUNK],
-                                                                 [1, ents], [0, heads]],
-                                                        offset=0))
+                    nisa.tensor_copy(dst=own_rows_v.reshape((KEY_CHUNK, gs, heads)),
+                                     src=own_rows.ap(pattern=[[gs, KEY_CHUNK], [1, gs],
+                                                              [0, heads]], offset=0))
                 own_ps = nl.ndarray((gv, 1), dtype=nl.float32, buffer=nl.psum)
                 nisa.nc_matmul(dst=own_ps, stationary=own_rows_v, moving=ones_col[:, 0:1],
                                is_moving_onezero=True)
-                nisa.tensor_copy(dst=cnt_m[:, s:s + 1], src=own_ps)
-        elif dense and partial:
-            # The own row counts on its owner rank only: owner / n_prgs per program.
-            owner_i = _col(gv, nl.int32)
-            _rows_onto_heads(owner_i, owner_hbm, b0, gs, heads, 1)
-            owner_f = _col(gv, nl.float32)
-            nisa.tensor_copy(dst=owner_f, src=owner_i)
-            nisa.tensor_scalar(dst=cnt_m, data=owner_f, op0=nl.multiply,
-                               operand0=1.0 / n_prgs)
-        elif dense:
-            nisa.memset(dst=cnt_m, value=1.0 / n_prgs)
-        else:
-            if heads == 1:
-                own_rows_v = own_rows
+                nisa.tensor_copy(dst=cnt_m, src=own_ps)
+            a_mine = _sb((gv, half), nl.float32)
+            nisa.tensor_copy(dst=a_mine, src=a_ps[:, my_c0:my_c0 + half])
+            if n_prgs == 2:
+                # [A | M | T | count_0 .. count_{span-1}], whole 32-byte lines past A.
+                ext = _LINE * ((2 + span + _LINE - 1) // _LINE)
+                mine = _sb((gv, half + ext), nl.float32)
+                nisa.tensor_copy(dst=mine[:, 0:half], src=a_ps[:, their_c0:their_c0 + half])
+                nisa.tensor_copy(dst=mine[:, half:half + 1], src=m_c)
+                nisa.tensor_copy(dst=mine[:, half + 1:half + 2], src=t_m)
+                nisa.tensor_copy(dst=mine[:, half + 2:half + 2 + span], src=cnt_m)
+                theirs = _sb((gv, half + ext), nl.float32)
+                nisa.sendrecv(src=mine, dst=theirs, send_to_rank=1 - prg,
+                              recv_from_rank=1 - prg, pipe_id=0)
+                m_t = theirs[:, half:half + 1]
+                count = _cols(gv, span, nl.float32)
+                nisa.tensor_tensor(dst=count, data1=cnt_m,
+                                   data2=theirs[:, half + 2:half + 2 + span], op=nl.add)
             else:
-                own_rows_v = _sb((KEY_CHUNK, gv), nl.float32)
-                nisa.tensor_copy(dst=own_rows_v.reshape((KEY_CHUNK, gs, heads)),
-                                 src=own_rows.ap(pattern=[[gs, KEY_CHUNK], [1, gs], [0, heads]],
-                                                 offset=0))
-            own_ps = nl.ndarray((gv, 1), dtype=nl.float32, buffer=nl.psum)
-            nisa.nc_matmul(dst=own_ps, stationary=own_rows_v, moving=ones_col[:, 0:1],
-                           is_moving_onezero=True)
-            nisa.tensor_copy(dst=cnt_m, src=own_ps)
-        a_mine = _sb((gv, half), nl.float32)
-        nisa.tensor_copy(dst=a_mine, src=a_ps[:, my_c0:my_c0 + half])
-        if n_prgs == 2:
-            # [A | M | T | count_0 .. count_{rows-1}], whole 32-byte lines past A.
-            ext = _LINE * ((2 + rows + _LINE - 1) // _LINE)
-            mine = _sb((gv, half + ext), nl.float32)
-            nisa.tensor_copy(dst=mine[:, 0:half], src=a_ps[:, their_c0:their_c0 + half])
-            nisa.tensor_copy(dst=mine[:, half:half + 1], src=m_c)
-            nisa.tensor_copy(dst=mine[:, half + 1:half + 2], src=t_m)
-            nisa.tensor_copy(dst=mine[:, half + 2:half + 2 + rows], src=cnt_m)
-            theirs = _sb((gv, half + ext), nl.float32)
-            nisa.sendrecv(src=mine, dst=theirs, send_to_rank=1 - prg, recv_from_rank=1 - prg,
-                          pipe_id=0)
-            m_t = theirs[:, half:half + 1]
-            count = _cols(gv, rows, nl.float32)
-            nisa.tensor_tensor(dst=count, data1=cnt_m, data2=theirs[:, half + 2:half + 2 + rows],
-                               op=nl.add)
-        else:
-            count = cnt_m
+                count = cnt_m
 
-        # ---- merge: both halves and this step's own rows -------------------------
-        own_on = _cols(gv, rows, nl.float32)
-        nisa.tensor_scalar(dst=own_on, data=count, op0=nl.minimum, operand0=1.0)
-        own_off = _cols(gv, rows, nl.float32)
-        nisa.tensor_scalar(dst=own_off, data=own_on, op0=nl.subtract, operand0=1.0,
-                           op1=nl.multiply, operand1=-MASKED_SCORE)
-        s_own = _cols(gv, rows, nl.float32)
-        nisa.tensor_tensor(dst=s_own, data1=s_self, data2=own_on, op=nl.multiply)
-        nisa.tensor_tensor(dst=s_own, data1=s_own, data2=own_off, op=nl.add)
-        top = _col(gv, nl.float32)
-        if rows > 1:
-            s_top = _col(gv, nl.float32)
-            nisa.tensor_reduce(dst=s_top, op=nl.maximum, data=s_own, axis=1)
-            nisa.tensor_tensor(dst=top, data1=m_c, data2=s_top, op=nl.maximum)
-        else:
-            nisa.tensor_tensor(dst=top, data1=m_c, data2=s_own, op=nl.maximum)
-        if n_prgs == 2:
-            nisa.tensor_tensor(dst=top, data1=top, data2=m_t, op=nl.maximum)
-        nisa.tensor_scalar(dst=top, data=top, op0=nl.maximum, operand0=_MAX_FLOOR)
-        neg_top = _col(gv, nl.float32)
-        nisa.tensor_scalar(dst=neg_top, data=top, op0=nl.multiply, operand0=-softmax_scale)
-        f_m = _col(gv, nl.float32)
-        nisa.activation(dst=f_m, op=nl.exp, data=m_c, bias=neg_top, scale=softmax_scale)
-        e_own = _cols(gv, rows, nl.float32)
-        nisa.activation(dst=e_own, op=nl.exp, data=s_own, bias=neg_top, scale=softmax_scale)
-        p_own = _cols(gv, rows, nl.float32)
-        nisa.tensor_tensor(dst=p_own, data1=e_own, data2=count, op=nl.multiply)
-        if rows > 1:
-            p_sum = _col(gv, nl.float32)
-            nisa.tensor_reduce(dst=p_sum, op=nl.add, data=p_own, axis=1)
-        else:
-            p_sum = p_own
-        total = _col(gv, nl.float32)
-        nisa.scalar_tensor_tensor(dst=total, data=t_m, op0=nl.multiply, operand0=f_m,
-                                  op1=nl.add, operand1=p_sum)
-        if n_prgs == 2:
-            f_t = _col(gv, nl.float32)
-            nisa.activation(dst=f_t, op=nl.exp, data=m_t, bias=neg_top, scale=softmax_scale)
-            nisa.scalar_tensor_tensor(dst=total, data=theirs[:, half + 1:half + 2],
-                                      op0=nl.multiply, operand0=f_t, op1=nl.add,
-                                      operand1=total)
-        if partial:
-            live_rows = _col(gv, nl.float32)
-            nisa.tensor_scalar(dst=live_rows, data=total, op0=nl.greater_equal,
-                               operand0=_LIVE_TOTAL)
-        nisa.tensor_scalar(dst=total, data=total, op0=nl.maximum, operand0=_TOTAL_FLOOR)
-        recip = _col(gv, nl.float32)
-        nisa.reciprocal(dst=recip, data=total)
-        w_m = _col(gv, nl.float32)
-        nisa.tensor_tensor(dst=w_m, data1=f_m, data2=recip, op=nl.multiply)
-        if rows > 1:
-            w_o = _cols(gv, rows, nl.float32)
-            nisa.tensor_scalar(dst=w_o, data=p_own, op0=nl.multiply, operand0=recip)
-        else:
-            w_o = _col(gv, nl.float32)
-            nisa.tensor_tensor(dst=w_o, data1=p_own, data2=recip, op=nl.multiply)
-        res = _sb((gv, half), nl.float32)
-        if rows > 1:
-            nisa.tensor_scalar(dst=res, data=own_f[0], op0=nl.multiply, operand0=w_o[:, 0:1])
-            for s in range(1, rows):
-                nisa.scalar_tensor_tensor(dst=res, data=own_f[s], op0=nl.multiply,
-                                          operand0=w_o[:, s:s + 1], op1=nl.add, operand1=res)
-        else:
-            nisa.tensor_scalar(dst=res, data=own_f, op0=nl.multiply, operand0=w_o)
-        nisa.scalar_tensor_tensor(dst=res, data=a_mine, op0=nl.multiply, operand0=w_m,
-                                  op1=nl.add, operand1=res)
-        if n_prgs == 2:
-            w_t = _col(gv, nl.float32)
-            nisa.tensor_tensor(dst=w_t, data1=f_t, data2=recip, op=nl.multiply)
-            nisa.scalar_tensor_tensor(dst=res, data=theirs[:, 0:half], op0=nl.multiply,
-                                      operand0=w_t, op1=nl.add, operand1=res)
-        if partial:
-            # Head-major: query row r's heads land (batch * rows) * latent apart.
-            for r in range(gs * rows):
-                nisa.dma_copy(dst=out_hbm.ap(pattern=[[batch * rows * latent, heads],
-                                                      [1, half]],
-                                             offset=(b0 * rows + r) * latent + my_c0),
-                              src=res[r * heads:(r + 1) * heads, :])
-            # The lse is program 0's: program 1 normalised its half by the same sum added
-            # in its own order, which differs from program 0's by fp32 rounding only.
-            if prg == 0:
-                lse = _lse_tile(neg_top, total, live_rows, gv)
-                for r in range(gs * rows):
-                    nisa.dma_copy(dst=lse_hbm.ap(pattern=[[batch * rows, heads], [1, 1]],
-                                                 offset=b0 * rows + r),
-                                  src=lse[r * heads:(r + 1) * heads, :])
-        else:
-            nisa.dma_copy(dst=out_hbm.ap(pattern=[[heads * latent, gv], [1, half]],
-                                         offset=b0 * heads * latent + my_c0),
-                          src=res)
+            # ---- merge: both halves and this step's own rows -----------------------
+            own_on = _cols(gv, span, nl.float32)
+            nisa.tensor_scalar(dst=own_on, data=count, op0=nl.minimum, operand0=1.0)
+            own_off = _cols(gv, span, nl.float32)
+            nisa.tensor_scalar(dst=own_off, data=own_on, op0=nl.subtract, operand0=1.0,
+                               op1=nl.multiply, operand1=-MASKED_SCORE)
+            s_own = _cols(gv, span, nl.float32)
+            nisa.tensor_tensor(dst=s_own, data1=s_self, data2=own_on, op=nl.multiply)
+            nisa.tensor_tensor(dst=s_own, data1=s_own, data2=own_off, op=nl.add)
+            top = _col(gv, nl.float32)
+            if span > 1:
+                s_top = _col(gv, nl.float32)
+                nisa.tensor_reduce(dst=s_top, op=nl.maximum, data=s_own, axis=1)
+                nisa.tensor_tensor(dst=top, data1=m_c, data2=s_top, op=nl.maximum)
+            else:
+                nisa.tensor_tensor(dst=top, data1=m_c, data2=s_own, op=nl.maximum)
+            if n_prgs == 2:
+                nisa.tensor_tensor(dst=top, data1=top, data2=m_t, op=nl.maximum)
+            nisa.tensor_scalar(dst=top, data=top, op0=nl.maximum, operand0=_MAX_FLOOR)
+            neg_top = _col(gv, nl.float32)
+            nisa.tensor_scalar(dst=neg_top, data=top, op0=nl.multiply,
+                               operand0=-softmax_scale)
+            f_m = _col(gv, nl.float32)
+            nisa.activation(dst=f_m, op=nl.exp, data=m_c, bias=neg_top, scale=softmax_scale)
+            e_own = _cols(gv, span, nl.float32)
+            nisa.activation(dst=e_own, op=nl.exp, data=s_own, bias=neg_top,
+                            scale=softmax_scale)
+            p_own = _cols(gv, span, nl.float32)
+            nisa.tensor_tensor(dst=p_own, data1=e_own, data2=count, op=nl.multiply)
+            if span > 1:
+                p_sum = _col(gv, nl.float32)
+                nisa.tensor_reduce(dst=p_sum, op=nl.add, data=p_own, axis=1)
+            else:
+                p_sum = p_own
+            total = _col(gv, nl.float32)
+            nisa.scalar_tensor_tensor(dst=total, data=t_m, op0=nl.multiply, operand0=f_m,
+                                      op1=nl.add, operand1=p_sum)
+            if n_prgs == 2:
+                f_t = _col(gv, nl.float32)
+                nisa.activation(dst=f_t, op=nl.exp, data=m_t, bias=neg_top,
+                                scale=softmax_scale)
+                nisa.scalar_tensor_tensor(dst=total, data=theirs[:, half + 1:half + 2],
+                                          op0=nl.multiply, operand0=f_t, op1=nl.add,
+                                          operand1=total)
+            if partial:
+                live_rows = _col(gv, nl.float32)
+                nisa.tensor_scalar(dst=live_rows, data=total, op0=nl.greater_equal,
+                                   operand0=_LIVE_TOTAL)
+            nisa.tensor_scalar(dst=total, data=total, op0=nl.maximum, operand0=_TOTAL_FLOOR)
+            recip = _col(gv, nl.float32)
+            nisa.reciprocal(dst=recip, data=total)
+            w_m = _col(gv, nl.float32)
+            nisa.tensor_tensor(dst=w_m, data1=f_m, data2=recip, op=nl.multiply)
+            if span > 1:
+                w_o = _cols(gv, span, nl.float32)
+                nisa.tensor_scalar(dst=w_o, data=p_own, op0=nl.multiply, operand0=recip)
+            else:
+                w_o = _col(gv, nl.float32)
+                nisa.tensor_tensor(dst=w_o, data1=p_own, data2=recip, op=nl.multiply)
+            res = _sb((gv, half), nl.float32)
+            if span > 1:
+                nisa.tensor_scalar(dst=res, data=own_f[0], op0=nl.multiply,
+                                   operand0=w_o[:, 0:1])
+                for s in range(1, span):
+                    nisa.scalar_tensor_tensor(dst=res, data=own_f[s], op0=nl.multiply,
+                                              operand0=w_o[:, s:s + 1], op1=nl.add,
+                                              operand1=res)
+            else:
+                nisa.tensor_scalar(dst=res, data=own_f, op0=nl.multiply, operand0=w_o)
+            nisa.scalar_tensor_tensor(dst=res, data=a_mine, op0=nl.multiply, operand0=w_m,
+                                      op1=nl.add, operand1=res)
+            if n_prgs == 2:
+                w_t = _col(gv, nl.float32)
+                nisa.tensor_tensor(dst=w_t, data1=f_t, data2=recip, op=nl.multiply)
+                nisa.scalar_tensor_tensor(dst=res, data=theirs[:, 0:half], op0=nl.multiply,
+                                          operand0=w_t, op1=nl.add, operand1=res)
+            if partial:
+                # Head-major: query row r's heads land (batch * rows) * latent apart. Unit
+                # set g * span + s of this pass is request b0 + g's row t + s.
+                for g in range(gs):
+                    for s in range(span):
+                        r = (b0 + g) * rows + t + s
+                        u = g * span + s
+                        nisa.dma_copy(dst=out_hbm.ap(pattern=[[batch * rows * latent, heads],
+                                                              [1, half]],
+                                                     offset=r * latent + my_c0),
+                                      src=res[u * heads:(u + 1) * heads, :])
+                # The lse is program 0's: program 1 normalised its half by the same sum
+                # added in its own order, which differs from program 0's by fp32 rounding
+                # only.
+                if prg == 0:
+                    lse = _lse_tile(neg_top, total, live_rows, gv)
+                    for g in range(gs):
+                        for s in range(span):
+                            r = (b0 + g) * rows + t + s
+                            u = g * span + s
+                            nisa.dma_copy(dst=lse_hbm.ap(pattern=[[batch * rows, heads],
+                                                                  [1, 1]],
+                                                         offset=r),
+                                          src=lse[u * heads:(u + 1) * heads, :])
+            else:
+                nisa.dma_copy(dst=out_hbm.ap(pattern=[[heads * latent, gv], [1, half]],
+                                             offset=b0 * heads * latent + my_c0),
+                              src=res)
 
 
 @nki.jit
@@ -1426,7 +1520,9 @@ def mla_decode_dense_split_rows_partial_kernel(q_hbm, bank_hbm, table_hbm, pos_h
                                                page_size, source_digest):
     """DCP dense partial of ``T >= 2`` query rows per request, keys split over the
     programs: ``(out [H, B * T, L], lse [H, B * T])``. ``pos_hbm`` and ``owner_hbm`` are
-    per row, ``[B * T]`` (:func:`mla_decode_partial_attention`).
+    per row, ``[B * T]`` (:func:`mla_decode_partial_attention`). Row ``t`` of each request
+    is :func:`mla_decode_dense_split_partial_kernel`'s result at that row's position, bit
+    for bit: ``T`` one-row passes over one window per request.
 
     ``source_digest`` is :data:`SOURCE_DIGEST`; it only keys the kernel cache.
     """
@@ -1471,19 +1567,23 @@ def _split_partial_serves(heads: int, latent: int, page: int, width: int,
 
     Today's kernel keeps its one-head route (:func:`_split_serves`): its multi-head calls
     stay on the general kernel, so their results do not change. ``rows >= 2`` query rows
-    per request (the T-row kernels) also need a selected request's ``rows`` key sets
-    within :data:`_ROW_BUDGET` and a group's (request, row, head) units within the value
-    pass's partitions (``2 * units`` hi/lo rows on 128).
+    per request (the T-row kernels): dense mode runs one-row passes, so it needs the
+    one-row geometry and a request's keys of one program within :data:`_ROW_BUDGET` (they
+    stay resident for the passes, with their transposed copy beside them); selected mode
+    needs a request's ``rows`` key sets within :data:`_ROW_BUDGET` and a group's (request,
+    row, head) units within the value pass's partitions (``2 * units`` hi/lo rows on 128).
     """
     if not (1 <= heads <= GROUP and _split_serves(1, latent, page, width, programs)):
         return False
     nck = width // KEY_CHUNK // programs
+    one_row = _split_group(nck, latent, heads, 1) * heads * nck <= MOVING_MAX
     if rows == 1:
-        return _split_group(nck, latent, heads, 1) * heads * nck <= MOVING_MAX
-    entities = 1 if dense else rows
-    if entities * nck * latent * 2 > _ROW_BUDGET:
+        return one_row
+    if dense:
+        return one_row and nck * latent * 2 <= _ROW_BUDGET
+    if rows * nck * latent * 2 > _ROW_BUDGET:
         return False
-    units = _split_group(nck, latent, rows * heads, entities) * rows * heads
+    units = _split_group(nck, latent, rows * heads, rows) * rows * heads
     return units * nck <= MOVING_MAX and 2 * units <= KEY_CHUNK
 
 
@@ -1618,8 +1718,12 @@ def mla_decode_partial_attention(q_lift: Tensor, bank: Tensor, block_table: Tens
 
     Runs on the key-split kernel, both programs of an LNC2 pair splitting every row's keys
     (one request of ``T`` rows included). ``T = 1`` launches today's partial kernels, bit
-    for bit; ``T >= 2`` the T-row ones, where dense mode reads each request's window once
-    for all its rows and selected mode reads each row's own selection.
+    for bit; ``T >= 2`` the T-row ones. Dense mode reads each request's window once for all
+    its rows and runs row ``t`` as the one-row step at its position, so row ``t``'s pair is
+    bit for bit the ``T = 1`` call for that row alone (its ``position``, ``owner``,
+    ``written`` and query rows) on a bank that holds the step's rows before ``t`` at their
+    slots, as the served cache write leaves it; a position's result does not depend on
+    which row of the step it is. Selected mode reads each row's own selection.
 
     Args:
         q_lift: ``[B * T, Hq, L]`` bf16/fp16, the gathered queries of all ``Hq = CP * H``
@@ -1663,9 +1767,10 @@ def mla_decode_partial_attention(q_lift: Tensor, bank: Tensor, block_table: Tens
               heads, a latent of part ``128 * programs``-column tiles, a page of part
               128-row chunks, a window of part pages per program, a request's keys of one
               program past :data:`_ROW_BUDGET` bytes per partition (selected ``T``-row
-              steps hold ``T`` rows' keys), or, at ``T >= 2``, a request's ``T * Hq``
-              (row, head) units past one score tile (``units * chunks_per_program <=
-              512``) or past 64 units (the value pass's hi/lo rows on 128 partitions).
+              steps hold ``T`` rows' keys), or, at ``T >= 2`` in selected mode, a
+              request's ``T * Hq`` (row, head) units past one score tile
+              (``units * chunks_per_program <= 512``) or past 64 units (the value pass's
+              hi/lo rows on 128 partitions).
     """
     # Today's checks of every operand but the per-row pair, which the DCP checks take: a
     # non-owner's position (its owned length) may equal the window.
@@ -1682,7 +1787,7 @@ def mla_decode_partial_attention(q_lift: Tensor, bank: Tensor, block_table: Tens
     width = window if dense else int(topk_indices.shape[1])
     programs = 2 if lnc_pair() else 1
     if not _split_partial_serves(heads, latent, int(page_size), width, programs, rows, dense):
-        units = ("" if rows == 1 else
+        units = ("" if rows == 1 or dense else
                  f", and at {rows} rows a request's {rows * heads} (row, head) units within "
                  f"one score tile and {KEY_CHUNK // 2} units")
         raise MlaDecodeAttentionError(
