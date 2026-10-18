@@ -59,7 +59,7 @@ each count through a stride-0 view against its ``R`` rows' ranks in the pool.
 
 The entry, :func:`mla_dense_masked_attention`, takes the keep table and the window row of
 the chunk's first query, and it refuses a call while ``VLLM_NEURON_MLA_DENSE_MASKED``
-(``vllm_neuron/envs.py``, off by default) is off. The sparse attention seam
+(``vllm_neuron/envs.py``, on by default) is off. The sparse attention seam
 (``mla_sparse.mla_sparse_attention``) calls it for a paged NoPE call whose caller passes
 the keep table and whose bank already holds the step's rows, wherever
 :func:`dense_masked_serves` says so; every other call keeps the gather.
