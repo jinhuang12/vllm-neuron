@@ -144,6 +144,9 @@ if TYPE_CHECKING:
     VLLM_NEURON_MLA_DENSE_MASKED: bool = True
     # The largest window, in pages, that the dense-masked route takes.
     VLLM_NEURON_MLA_DENSE_MASKED_MAX_PAGES: int = 2048
+    # Let the dense-masked kernel contract its probabilities with the window rows as
+    # one bf16 pass instead of the hi/lo split. Off by default.
+    VLLM_NEURON_MLA_DENSE_MASKED_BF16_PROBS: bool = False
     # Let the GLM-5.3-Flash DSA prefill's sparse MLA body gather its rows from the
     # latent bank through the block table, with no staged window. On by default; 0
     # restores the staged window.
@@ -682,6 +685,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
         2048
         if os.getenv("VLLM_NEURON_MLA_DENSE_MASKED_MAX_PAGES") is None
         else maybe_convert_int(os.getenv("VLLM_NEURON_MLA_DENSE_MASKED_MAX_PAGES"))
+    ),
+    # Contract the dense-masked kernel's probabilities with the window rows
+    # (``functional/attention/mla_dense_masked.py``, MM2) as one bf16 pass, bf16(p),
+    # instead of two (bf16(p) and bf16(p - bf16(p))). It drops half of MM2's matmuls
+    # and one Vector subtract per probability. Each probability then carries one bf16
+    # rounding (relative error up to 2 ** -8) instead of about 2 ** -16, so the output
+    # is no longer value-equal to the split form: each element moves by at most 2 ** -8
+    # of the softmax-weighted sum of |value| over the query's selected rows. Read at
+    # trace time by the kernel's entry; a change needs a new compile. Off by default.
+    "VLLM_NEURON_MLA_DENSE_MASKED_BF16_PROBS": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_MLA_DENSE_MASKED_BF16_PROBS")) or False
     ),
     # Let the sparse MLA prefill's low-precision row-tiled body
     # (``functional/attention/mla_sparse.py``) gather each query's selected rows

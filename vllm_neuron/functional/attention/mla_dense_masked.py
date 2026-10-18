@@ -31,6 +31,15 @@ before they are normalised, the sums run over the window in row order, and the
 maximum is a running one. The answer is the sparse kernel's up to the order and the
 rounding of these fp32 steps: value-equal, not bit-equal.
 
+bf16 probabilities. With ``VLLM_NEURON_MLA_DENSE_MASKED_BF16_PROBS`` set, MM2 contracts
+``hi = bf16(p)`` alone: no lo half, so no Vector subtract and half the MM2 matmuls. Each
+probability then carries the relative error of one bf16 rounding (at most 2 ** -8 to
+nearest) in place of the split's 2 ** -16, while the row sum stays the fp32 sum of the
+unrounded ``p``. Output element ``j`` of a query moves by at most 2 ** -8 times
+``sum_i w_i |v_ij|`` (``w`` the softmax weights over its selected rows), and by about
+2 ** -8 / sqrt(3) times ``sqrt(sum_i w_i ** 2 v_ij ** 2)`` when the roundings are
+independent: a bf16-probability class, not value-equal. Off by default.
+
 Non-finite rows. MM1 keeps a non-finite row, so a query that selects it gets a
 non-finite score, as on the gather path; the predicate drops it for every other query.
 MM2 contracts every row of the window whatever its probability, and ``0 * NaN`` is NaN,
@@ -67,14 +76,12 @@ the keep table and whose bank already holds the step's rows, wherever
 
 from __future__ import annotations
 
-import torch
-from torch import Tensor
-
 import nki
 import nki.isa as nisa
 import nki.language as nl
-
+import torch
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+from torch import Tensor
 
 from vllm_neuron import envs
 from vllm_neuron.functional.attention import mla_dense_window as _dw
@@ -350,16 +357,19 @@ _P_HI = 0   # [128 keys, width] in the cache dtype: bf16(p), key chunk c at colu
 _P_LO = 1   # the same layout: bf16(p - hi)
 
 
-def _tile_probabilities(probs, kv_dtype):
+def _tile_probabilities(probs, kv_dtype, bf16_probabilities):
     """The item's probabilities (``[128 queries, width]`` fp32) on the key partitions, split hi/lo.
 
     Fp32 PE transposes, four per PSUM bank; hi = bf16(p) on the scalar engine and lo =
     bf16(p - hi) on the Vector engine (the difference is exact in fp32). Returns the
-    ``_P_*`` list: MM2's stationary operands.
+    ``_P_*`` list: MM2's stationary operands. With ``bf16_probabilities`` the list holds
+    hi alone and the Vector engine does no work here (the module docstring).
     """
     width = probs.shape[1]
-    p_hi = _sb((KEY_CHUNK, width), kv_dtype)
-    p_lo = _sb((KEY_CHUNK, width), kv_dtype)
+    split = []
+    split.append(_sb((KEY_CHUNK, width), kv_dtype))
+    if not bf16_probabilities:
+        split.append(_sb((KEY_CHUNK, width), kv_dtype))
     for b in range(width // MOVING_MAX):
         t0 = b * MOVING_MAX
         pt_ps = nl.ndarray((KEY_CHUNK, _TRANSPOSES_PER_BANK * ROW_TILE), dtype=nl.float32,
@@ -368,21 +378,21 @@ def _tile_probabilities(probs, kv_dtype):
             k0 = t0 + ck * KEY_CHUNK
             nisa.nc_transpose(dst=pt_ps[:, ck * ROW_TILE:(ck + 1) * ROW_TILE],
                               data=probs[:, k0:k0 + KEY_CHUNK])
-        nisa.tensor_copy(dst=p_hi[:, t0:t0 + MOVING_MAX], src=pt_ps, engine=nisa.engine.scalar)
-        nisa.tensor_tensor(dst=p_lo[:, t0:t0 + MOVING_MAX], data1=pt_ps,
-                           data2=p_hi[:, t0:t0 + MOVING_MAX], op=nl.subtract,
-                           engine=nisa.engine.vector)
-    split = []
-    split.append(p_hi)
-    split.append(p_lo)
+        nisa.tensor_copy(dst=split[_P_HI][:, t0:t0 + MOVING_MAX], src=pt_ps,
+                         engine=nisa.engine.scalar)
+        if not bf16_probabilities:
+            nisa.tensor_tensor(dst=split[_P_LO][:, t0:t0 + MOVING_MAX], data1=pt_ps,
+                               data2=split[_P_HI][:, t0:t0 + MOVING_MAX], op=nl.subtract,
+                               engine=nisa.engine.vector)
     return split
 
 
-def _tile_values(split, rows, acc, alpha):
+def _tile_values(split, rows, acc, alpha, bf16_probabilities):
     """MM2 of one item into PSUM, chunk by chunk hi then lo, and ``acc = acc * alpha + pv``.
 
     ``split`` is :func:`_tile_probabilities`'s list, ``rows`` the superblock's
-    :data:`_SB_ROWS` and ``acc`` (``[128, L]`` fp32) the tile's unnormalised output.
+    :data:`_SB_ROWS` and ``acc`` (``[128, L]`` fp32) the tile's unnormalised output. With
+    ``bf16_probabilities`` each chunk is one matmul, of hi alone.
     """
     latent = rows.shape[2]
     pv_ps = nl.ndarray((ROW_TILE, latent), dtype=nl.float32, buffer=nl.psum)
@@ -390,8 +400,9 @@ def _tile_values(split, rows, acc, alpha):
         c0 = chunk * KEY_CHUNK
         nisa.nc_matmul(dst=pv_ps, stationary=split[_P_HI][:, c0:c0 + KEY_CHUNK],
                        moving=rows[:, chunk, :], accumulate=(chunk > 0))
-        nisa.nc_matmul(dst=pv_ps, stationary=split[_P_LO][:, c0:c0 + KEY_CHUNK],
-                       moving=rows[:, chunk, :], accumulate=True)
+        if not bf16_probabilities:
+            nisa.nc_matmul(dst=pv_ps, stationary=split[_P_LO][:, c0:c0 + KEY_CHUNK],
+                           moving=rows[:, chunk, :], accumulate=True)
     nisa.scalar_tensor_tensor(dst=acc, data=acc, op0=nl.multiply, operand0=alpha, op1=nl.add,
                               operand1=pv_ps)
 
@@ -442,7 +453,7 @@ def _item_scores(preds, q_cols, sbs, tops, run_max0, softmax_scale, mine, item):
 
 
 def _dense_masked_body(q_hbm, bank_hbm, table_hbm, keep_hbm, start_hbm, softmax_scale,
-                       page_size, pool_rows, superblock_pages, out_hbm):
+                       page_size, pool_rows, superblock_pages, bf16_probabilities, out_hbm):
     """Every 128-query tile of this program over every superblock of the window, pipelined.
 
     The tiles are dealt round-robin over the programs; ``program_id`` is a trace-time int
@@ -525,12 +536,12 @@ def _dense_masked_body(q_hbm, bank_hbm, table_hbm, keep_hbm, start_hbm, softmax_
             _prep_piece(sbs, pages, superblock_pages, sb + 1, j, mine)
         if k + 1 < n_items:
             tops.append(_item_scores(preds, q_cols, sbs, tops, run_max0, softmax_scale, mine, k + 1))
-        split = _tile_probabilities(tops[k][_TOP_SCORES], q_hbm.dtype)
+        split = _tile_probabilities(tops[k][_TOP_SCORES], q_hbm.dtype, bf16_probabilities)
         if j < mine - 1 and has_next:
             _prep_piece(sbs, pages, superblock_pages, sb + 1, j, mine)
         if k + 1 < n_items:
             _tile_exp(tops[k + 1], run_sum[(k + 1) % mine], softmax_scale)
-        _tile_values(split, sbs[sb][_SB_ROWS], acc[j], tops[k][_TOP_ALPHA])
+        _tile_values(split, sbs[sb][_SB_ROWS], acc[j], tops[k][_TOP_ALPHA], bf16_probabilities)
         if k + 2 < n_items:
             preds.append(_item_pred(sels, rank, numbers, pools, page_size, pages, superblock_pages,
                                     mine, k + 2))
@@ -540,8 +551,8 @@ def _dense_masked_body(q_hbm, bank_hbm, table_hbm, keep_hbm, start_hbm, softmax_
 
 @nki.jit
 def mla_dense_masked_kernel(q_hbm, bank_hbm, table_hbm, keep_hbm, start_hbm, softmax_scale,
-                            page_size, pool_rows, superblock_pages, source_digest=0,
-                            staging_digest=0):
+                            page_size, pool_rows, superblock_pages, bf16_probabilities=0,
+                            source_digest=0, staging_digest=0):
     """Attention of each query over the window rows its keep bits select, in one dense pass.
 
     Args:
@@ -559,6 +570,9 @@ def mla_dense_masked_kernel(q_hbm, bank_hbm, table_hbm, keep_hbm, start_hbm, sof
         pool_rows: python int, rows per pool, a divisor of ``page_size``.
         superblock_pages: python int, pages per superblock (:data:`SUPERBLOCK_PAGES`), a
             multiple of ``MOVING_MAX // page_size``.
+        bf16_probabilities: python int, 1 for MM2 over bf16 probabilities alone (the module
+            docstring), 0 for the hi/lo split. A kernel argument, so each form has its own
+            compiled-kernel cache entry.
         source_digest, staging_digest: python ints that only key the compiled-kernel cache
             on this file and on ``mla_sparse.py`` (the bank-page helper).
 
@@ -572,7 +586,7 @@ def mla_dense_masked_kernel(q_hbm, bank_hbm, table_hbm, keep_hbm, start_hbm, sof
     seq, heads, latent = q_hbm.shape
     out_hbm = nl.ndarray((seq, heads, latent), dtype=nl.float32, buffer=nl.shared_hbm)
     _dense_masked_body(q_hbm, bank_hbm, table_hbm, keep_hbm, start_hbm, softmax_scale,
-                       page_size, pool_rows, superblock_pages, out_hbm)
+                       page_size, pool_rows, superblock_pages, bf16_probabilities, out_hbm)
     return out_hbm
 
 
@@ -681,9 +695,13 @@ def mla_dense_masked_attention(q_lift: Tensor, c_kv: Tensor, keep_bits: Tensor,
         page_size: rows per page, :data:`KEY_CHUNK`.
         superblock_pages: pages per superblock.
 
+    ``VLLM_NEURON_MLA_DENSE_MASKED_BF16_PROBS`` (read here, at trace time) selects the
+    bf16-probability form of MM2 (the module docstring).
+
     Returns:
         ``[S, 1, L]`` fp32, the sparse kernel's answer up to the order and rounding of its
-        fp32 sums (a value-equal class, not bit-equal).
+        fp32 sums (a value-equal class, not bit-equal); with the bf16-probability form, up to
+        one bf16 rounding of each probability as well.
 
     Raises:
         MlaDenseMaskedError: while ``VLLM_NEURON_MLA_DENSE_MASKED`` is off, or for a
@@ -704,6 +722,7 @@ def mla_dense_masked_attention(q_lift: Tensor, c_kv: Tensor, keep_bits: Tensor,
         int(page_size),
         int(pool_rows),
         int(superblock_pages),
+        int(envs.VLLM_NEURON_MLA_DENSE_MASKED_BF16_PROBS),
         SOURCE_DIGEST,
         int(_ms.SOURCE_DIGEST),
     )
