@@ -98,14 +98,15 @@ from vllm_neuron.source_digest import source_digest
 ROW_TILE = 128
 KEY_CHUNK = 128
 LATENT_TILE = 128
-#: Moving free-axis extent of one matmul: MM1 scores 512 union rows per instruction.
-MOVING_MAX = 512
-#: The widest latent one fp32 PSUM bank holds for the MM2 result row (2 KB).
-LATENT_MAX = 512
+#: The Tensor Engine and PSUM limits are the masked-window kernel's, whose tile helpers
+#: this kernel shares (``mla_dense_window.py`` owns them): the moving free-axis extent
+#: of one matmul (MM1 scores 512 union rows per instruction), the widest latent one fp32
+#: PSUM bank holds for the MM2 result row, and the PSUM bytes per partition of one bank.
+MOVING_MAX = _dw.MOVING_MAX
+LATENT_MAX = _dw.LATENT_MAX
+_PSUM_BANK_BYTES = _dw._PSUM_BANK_BYTES
 #: PE transposes of 128 fp32 columns that fill one PSUM bank.
 _TRANSPOSES_PER_BANK = MOVING_MAX // ROW_TILE
-#: PSUM bytes per partition of one bank.
-_PSUM_BANK_BYTES = 2048
 #: Union positions per superblock: the rows one gather, one pass of MM1, the softmax and
 #: MM2 cover before the running statistics are folded. One gather takes them all: 16
 #: chunks of 128 rows, 8,192 elements per partition at latent 512, half the 15,872 that one
