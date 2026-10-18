@@ -58,8 +58,8 @@ query's open pool, three more add the open pool's count, and one Vector compare 
 each count through a stride-0 view against its ``R`` rows' ranks in the pool.
 
 The entry, :func:`mla_dense_masked_attention`, takes the keep table and the window row of
-the chunk's first query, and it refuses a call unless ``VLLM_NEURON_MLA_DENSE_MASKED``
-(``vllm_neuron/envs.py``) is set. The sparse attention seam
+the chunk's first query, and it refuses a call while ``VLLM_NEURON_MLA_DENSE_MASKED``
+(``vllm_neuron/envs.py``, on by default) is off. The sparse attention seam
 (``mla_sparse.mla_sparse_attention``) calls it for a paged NoPE call whose caller passes
 the keep table and whose bank already holds the step's rows, wherever
 :func:`dense_masked_serves` says so; every other call keeps the gather.
@@ -607,7 +607,7 @@ def dense_masked_serves(seq: int, heads: int, latent: int, kv_latent: int, bank_
     """True where the sparse attention seam (``mla_sparse.mla_sparse_attention``) hands a
     paged NoPE call with a keep table to :func:`mla_dense_masked_attention`.
 
-    Three conditions, each read at trace time: ``VLLM_NEURON_MLA_DENSE_MASKED`` is set; the
+    Three conditions, each read at trace time: ``VLLM_NEURON_MLA_DENSE_MASKED`` is on; the
     window is at most ``VLLM_NEURON_MLA_DENSE_MASKED_MAX_PAGES`` pages (``vllm_neuron/envs.py``
     states where the dense pass beats the gather); and the kernel serves the geometry.
     """
@@ -684,7 +684,7 @@ def mla_dense_masked_attention(q_lift: Tensor, c_kv: Tensor, keep_bits: Tensor,
         fp32 sums (a value-equal class, not bit-equal).
 
     Raises:
-        MlaDenseMaskedError: while ``VLLM_NEURON_MLA_DENSE_MASKED`` is unset, or for a
+        MlaDenseMaskedError: while ``VLLM_NEURON_MLA_DENSE_MASKED`` is off, or for a
             malformed call or a geometry the kernel does not serve.
     """
     _require_call(q_lift, c_kv, keep_bits, query_start, softmax_scale, block_table_row,
