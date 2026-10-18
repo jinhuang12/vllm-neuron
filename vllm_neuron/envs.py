@@ -133,8 +133,8 @@ if TYPE_CHECKING:
     # token attends its latent window densely (mla_dense_window.py) instead of
     # selecting and gathering. On by default; 0 restores the sparse path.
     VLLM_NEURON_MLA_DENSE_WINDOW: bool = True
-    # GLM-5.3-Flash DSA prefill: let the block-shared sparse MLA kernel and its union
-    # producer (mla_block_shared.py) be called. Off by default; no call site sets it.
+    # GLM-5.3-Flash DSA prefill: route a selecting chunk's attention to the block-shared
+    # sparse MLA kernel and its union producer (mla_block_shared.py). Off by default.
     VLLM_NEURON_MLA_BLOCK_SHARED: bool = False
     # Windows with at least this many pages route to the block-shared kernel when
     # VLLM_NEURON_MLA_BLOCK_SHARED is on; 0 routes every selecting window.
@@ -647,8 +647,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # attention with one gather per block of neighbouring queries (the union of their
     # selections) and each query's selection as a mask over it, and the producer that
     # builds the union and the mask from the chunk's keep bits. Each entry refuses a
-    # call while this is unset. They have no call site yet; read at trace time. Off by
-    # default.
+    # call while this is unset. The DSA prefill routes a selecting chunk to them
+    # (``model/glm5_next/dsa_block_shared.py``); read at trace time. Off by default.
     "VLLM_NEURON_MLA_BLOCK_SHARED": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_MLA_BLOCK_SHARED")) or False
     ),

@@ -71,8 +71,9 @@ device loop (the served MoE combine) before a device loop without fixed addresse
 not compile.
 
 Both entries refuse a call unless ``VLLM_NEURON_MLA_BLOCK_SHARED`` (``vllm_neuron/envs.py``)
-is set. They have no call site. ``mla_block_shared_serves`` and ``mla_block_shared_union_cap``
-answer a call site's trace-time questions and read no knob.
+is set; the DSA prefill calls them through ``model/glm5_next/dsa_block_shared.py``.
+``mla_block_shared_serves`` and ``mla_block_shared_union_cap`` answer its trace-time
+questions and read no knob.
 """
 
 from __future__ import annotations
