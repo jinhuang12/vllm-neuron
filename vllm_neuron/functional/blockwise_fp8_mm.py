@@ -1188,6 +1188,62 @@ def blockwise_fp8_mlp_prefill_kernel(
     loaded before the current chunk's down projection, so its transposing DMA
     runs under that work.
     """
+    return _mlp_prefill(
+        x, gate_weight, up_weight, down_weight, gate_scale, up_scale, down_scale,
+        swiglu_limit, None,
+    )
+
+
+@nki.jit
+def blockwise_fp8_mlp_prefill_add_kernel(
+    x,
+    gate_weight,
+    up_weight,
+    down_weight,
+    gate_scale,
+    up_scale,
+    down_scale,
+    swiglu_limit,
+    addend,
+):
+    """:func:`blockwise_fp8_mlp_prefill_kernel` plus ``addend``, rounded once to bf16.
+
+    ``(mlp(x) + addend).to(bf16)``: each 128-row tile's fp32 result and the same
+    rows of ``addend`` go through one Vector ``tensor_tensor`` add with a bf16
+    destination, and the tile is stored. That is the one rounding of the fp32
+    sum, so the output is the torch form's to the bit. The MoE layer adds its
+    routed sum here (``Glm5NextMoEBlock``), in place of a separate full-width add
+    and cast after the kernel.
+
+    Args:
+        x, gate_weight, up_weight, down_weight, gate_scale, up_scale,
+        down_scale, swiglu_limit: as :func:`blockwise_fp8_mlp_prefill_kernel`.
+        addend: ``[M, H]`` fp32.
+
+    Returns:
+        ``[M, H]`` bf16.
+
+    Launch: as :func:`blockwise_fp8_mlp_prefill_kernel`; each program adds and
+    stores its own token tiles.
+    """
+    return _mlp_prefill(
+        x, gate_weight, up_weight, down_weight, gate_scale, up_scale, down_scale,
+        swiglu_limit, addend,
+    )
+
+
+def _mlp_prefill(
+    x,
+    gate_weight,
+    up_weight,
+    down_weight,
+    gate_scale,
+    up_scale,
+    down_scale,
+    swiglu_limit,
+    addend,
+):
+    """The body of both prefill MLP kernels: ``addend`` is None or ``[M, H]`` fp32."""
     m_total, hidden = x.shape
     _, inter = gate_weight.shape
     kernel_assert(
@@ -1213,8 +1269,15 @@ def blockwise_fp8_mlp_prefill_kernel(
     row_lo = min(program * share, n_tiles) * TILE_SIZE
     row_hi = min(program * share + share, n_tiles) * TILE_SIZE
     kernel_assert(row_hi > row_lo, "every program owns at least one token tile")
+    kernel_assert(
+        addend is None or tuple(addend.shape) == (m_total, hidden), "addend must be [M, H]"
+    )
 
-    out = nl.ndarray((m_total, hidden), dtype=nl.float32, buffer=nl.shared_hbm)
+    out = nl.ndarray(
+        (m_total, hidden),
+        dtype=nl.float32 if addend is None else nl.bfloat16,
+        buffer=nl.shared_hbm,
+    )
 
     gate_sb = nl.ndarray((TILE_SIZE, kb_count, inter), dtype=gate_weight.dtype, buffer=nl.sbuf)
     _load_blocked_rows(gate_sb, gate_weight)
@@ -1306,13 +1369,19 @@ def blockwise_fp8_mlp_prefill_kernel(
                                 op1=nl.add,
                                 operand1=dst,
                             )
-            _static_dma(
-                dst=out.ap(
-                    pattern=[[hidden, TILE_SIZE], [1, hidden]],
-                    offset=(c0 + mt * TILE_SIZE) * hidden,
-                ),
-                src=res,
-            )
+            rows = [[hidden, TILE_SIZE], [1, hidden]]
+            row0 = (c0 + mt * TILE_SIZE) * hidden
+            if addend is not None:
+                # The add the MoE layer made after the kernel, here in one Vector
+                # pass: fp32 + fp32 into a bf16 tile, one rounding.
+                tile_add = nl.ndarray((TILE_SIZE, hidden), dtype=nl.float32, buffer=nl.sbuf)
+                _static_dma(dst=tile_add, src=addend.ap(pattern=rows, offset=row0))
+                summed = nl.ndarray((TILE_SIZE, hidden), dtype=nl.bfloat16, buffer=nl.sbuf)
+                nisa.tensor_tensor(
+                    dst=summed, data1=res, data2=tile_add, op=nl.add, engine=nisa.engine.vector
+                )
+                res = summed
+            _static_dma(dst=out.ap(pattern=rows, offset=row0), src=res)
     return out
 
 
@@ -1696,6 +1765,24 @@ def prefill_mlp_admissible(tokens: int, hidden: int, intermediate: int) -> bool:
     return intermediate <= MLP_PREFILL_MAX_INTERMEDIATE
 
 
+def prefill_mlp_takes(
+    x: Tensor, gate_weight: Tensor, up_weight: Tensor, down_weight: Tensor
+) -> bool:
+    """Does :func:`blockwise_fp8_mlp` run this call on the prefill MLP kernel?
+
+    The route condition itself, so a caller can ask before it passes an
+    ``addend``, which only that kernel takes.
+    """
+    tokens, hidden = int(x.shape[-2]), int(x.shape[-1])
+    return (
+        can_run_kernel(x)
+        and prefill_mlp_admissible(tokens, hidden, int(gate_weight.shape[-1]))
+        and all(
+            w.dtype == MLP_PREFILL_WEIGHT_DTYPE for w in (gate_weight, up_weight, down_weight)
+        )
+    )
+
+
 def mlp_prefill_launch_grid(tokens: int) -> tuple[int, ...]:
     """The launch grid of :func:`blockwise_fp8_mlp_prefill_kernel`.
 
@@ -1723,6 +1810,7 @@ def blockwise_fp8_mlp(
     *,
     swiglu_limit: float,
     prebuilt_scale_t: tuple[Tensor, Tensor, Tensor] | None = None,
+    addend: Tensor | None = None,
 ) -> Tensor:
     """The clamped SwiGLU MLP on blockwise fp8 weights, one fused kernel.
 
@@ -1737,15 +1825,23 @@ def blockwise_fp8_mlp(
         swiglu_limit: the checkpoint's clamp bound.
         prebuilt_scale_t: the three kernel scale operands, for the three-call
             route only (the fused kernel reads the public grids directly).
+        addend: ``[M, H]`` fp32 added to the result inside the prefill kernel
+            (:func:`blockwise_fp8_mlp_prefill_add_kernel`), or None. Only that
+            route takes it; ask :func:`prefill_mlp_takes` first.
 
     Returns:
-        ``[M, H]`` fp32.
+        ``[M, H]`` fp32, or with ``addend`` ``(mlp(x) + addend).to(bf16)``.
+
+    Raises:
+        ValueError: an ``addend`` on a call the prefill kernel does not run, or
+            one that is not ``[M, H]`` fp32.
 
     Route, with the NKI route available: ``1 <= M < 128`` runs one
     :func:`blockwise_fp8_mlp_small_m_kernel` call and never pads tokens, on the
     launch grid :func:`mlp_launch_grid` picks (both cores of an LNC2 core).
     Whole-tile prefill on :data:`MLP_PREFILL_WEIGHT_DTYPE` weights runs one
-    :func:`blockwise_fp8_mlp_prefill_kernel` call on the grid
+    :func:`blockwise_fp8_mlp_prefill_kernel` call (with ``addend``,
+    :func:`blockwise_fp8_mlp_prefill_add_kernel`) on the grid
     :func:`mlp_prefill_launch_grid` picks. Any other geometry (``I`` above the
     kernels' limits, ``H // 128 > MLP_PREFILL_MAX_KB``), whole-tile weights of
     another dtype, or no NKI route, runs the three :func:`blockwise_fp8_mm`
@@ -1755,6 +1851,19 @@ def blockwise_fp8_mlp(
 
     tokens, hidden = int(x.shape[-2]), int(x.shape[-1])
     intermediate = int(gate_weight.shape[-1])
+    if addend is not None:
+        if not prefill_mlp_takes(x, gate_weight, up_weight, down_weight):
+            raise ValueError(
+                f"blockwise_fp8_mlp: an addend needs the prefill MLP kernel, and a "
+                f"call of {tokens} rows at H={hidden}, I={intermediate} on "
+                f"{gate_weight.dtype} weights takes another route"
+            )
+        if tuple(addend.shape) != (tokens, hidden) or addend.dtype != torch.float32:
+            raise ValueError(
+                f"blockwise_fp8_mlp: the addend is {tuple(addend.shape)} "
+                f"{addend.dtype}; the prefill kernel adds a [{tokens}, {hidden}] "
+                f"fp32 tensor"
+            )
     nki = can_run_kernel(x)
     if nki and fused_mlp_admissible(tokens, hidden, intermediate):
         _count_mlp_fused()
@@ -1773,16 +1882,15 @@ def blockwise_fp8_mlp(
             down_scale=down_scale,
             swiglu_limit=float(swiglu_limit),
         )
-    weights = (gate_weight, up_weight, down_weight)
-    if (
-        nki
-        and prefill_mlp_admissible(tokens, hidden, intermediate)
-        and all(w.dtype == MLP_PREFILL_WEIGHT_DTYPE for w in weights)
-    ):
+    if prefill_mlp_takes(x, gate_weight, up_weight, down_weight):
         _count_mlp_fused()
         grid = mlp_prefill_launch_grid(tokens)
         _count_mlp_launch(grid[0] if grid else 1)
-        call = wrap_nki(blockwise_fp8_mlp_prefill_kernel)
+        call = wrap_nki(
+            blockwise_fp8_mlp_prefill_kernel
+            if addend is None
+            else blockwise_fp8_mlp_prefill_add_kernel
+        )
         if grid:
             call = call[grid]
         return call(
@@ -1794,6 +1902,7 @@ def blockwise_fp8_mlp(
             up_scale=up_scale,
             down_scale=down_scale,
             swiglu_limit=float(swiglu_limit),
+            **({} if addend is None else {"addend": addend.contiguous()}),
         )
     if not nki:
         _count_mlp_torch_fallback()
