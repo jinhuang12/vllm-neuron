@@ -1759,7 +1759,11 @@ class Glm5NextRoutedExperts(nn.Module):
                 epsilon, when the feed-forward mHC site's kernel computed it, or
                 None. Only the prefill router reads it
                 (``router_prefill.noaux_tc_router_prefill``), in place of its own
-                ``router_rms_scale``.
+                ``router_rms_scale``. Under the prefill sequence shard it can hold
+                more rows than ``hidden_states``: the site gathered the chunk's
+                scaled rows and left this rank's pre-norm rows where they were.
+                Those rows are then the call's rows, and ``hidden_states`` is not
+                read.
 
         Returns:
             ``(router_logits [T, E], expert_index [T, k] int32,
@@ -1778,6 +1782,24 @@ class Glm5NextRoutedExperts(nn.Module):
         # one number that belongs to the checkpoint.
         if eps is None:
             eps = float(text_config.rms_norm_eps)
+
+        from vllm_neuron.functional.moe import router_prefill
+
+        # A sequence-sharded prefill call: ``scaled`` holds the whole chunk and
+        # ``hidden_states`` one rank's share of its pre-norm rows. Only the prefill
+        # router reads ``scaled`` alone, so it is this call's route ahead of the decode
+        # branch, which would count this rank's rows as the call's; it refuses rows it
+        # does not admit. The feed-forward site asks for this form only when it does.
+        if scaled is not None and scaled.numel() != hidden_states.numel():
+            return router_prefill.noaux_tc_router_prefill_scaled(
+                scaled,
+                gamma,
+                self.router_weight,
+                self.router_bias,
+                top_k=int(text_config.num_experts_per_tok),
+                norm_topk_prob=bool(text_config.norm_topk_prob),
+                routed_scaling_factor=float(text_config.routed_scaling_factor),
+            )
 
         # Decode (T <= 64): RMSNorm, router GEMM and noaux_tc top-8 in one launch
         # on the real rows, no pad to 256 (router_decode.py). Same three outputs,
@@ -1803,8 +1825,6 @@ class Glm5NextRoutedExperts(nn.Module):
         # running as a per-token matmul loop; then the router GEMM and noaux_tc top-8
         # in one launch (router_prefill.py). Same three outputs, same seam counters;
         # any call it declines keeps the fused router below.
-        from vllm_neuron.functional.moe import router_prefill
-
         if router_prefill.prefill_route_admits(
             hidden_states, self.router_weight, int(text_config.num_experts_per_tok)
         ):
@@ -3143,7 +3163,9 @@ class Glm5NextMoEBlock(nn.Module):
                 int64 device tensor (one graph for every rank) or a python int.
             router_scaled: ``[T, H]`` the FFN norm of ``hidden_states`` without its
                 gain, when the feed-forward mHC site's kernel computed it, or None;
-                handed to ``route_tokens`` as ``scaled``.
+                handed to ``route_tokens`` as ``scaled``. Under the prefill sequence
+                shard the site gathers it and not ``hidden_states``, which is then one
+                rank's share of the rows and is not read.
 
         Returns:
             ``[T, H]`` in the kernels' own dtype. The residual dtype is the layer
@@ -3159,6 +3181,17 @@ class Glm5NextMoEBlock(nn.Module):
         # ``[1, T, H]`` here rather than reshaped inside the callee. Only the
         # affinities are consumed: the logits are the oracle's and the index set is
         # the affinities' own support.
+        # The router's rows are the experts' rows. Under the prefill sequence shard
+        # ``hidden_states`` is one rank's share and the scaled rows the chunk's, so the
+        # check is against ``normed_hidden_states``, gathered beside them.
+        if router_scaled is not None and tuple(router_scaled.shape) != tuple(
+            normed_hidden_states.shape
+        ):
+            raise Glm5NextBlockQuantRouteError(
+                f"router_scaled is {tuple(router_scaled.shape)} and the experts' "
+                f"normed rows are {tuple(normed_hidden_states.shape)}; the router "
+                f"must route the rows the experts run"
+            )
         _logits, _expert_index, expert_affinities = self.experts.route_tokens(
             hidden_states.unsqueeze(0),
             router_gamma,
