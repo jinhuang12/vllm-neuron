@@ -10283,6 +10283,7 @@ class Glm5NextModel(nn.Module):
         collected: list[torch.Tensor] = []
         taps: list[torch.Tensor] = []
         tap_layers = dump_tap_layers(layers) if collect_layer_streams else ()
+        from vllm_neuron import envs
         from vllm_neuron.functional.moe import router_prefill
 
         # The forward's leg, which decides whether the feed-forward sites ask for the
@@ -10314,15 +10315,19 @@ class Glm5NextModel(nn.Module):
             # whole gathered chunk, and the scale crosses the wire in place of the
             # pre-norm rows, so the router's full admission at the chunk's row count
             # decides: a call it declines keeps the pre-norm rows for the route that
-            # takes it.
+            # takes it. VLLM_NEURON_GLM5NEXT_PREFILL_SP_ROUTER_SCALE=0 keeps them for
+            # every sharded call, and the router scales the gathered rows itself.
             # ``streams`` is never ``None`` here, so this is a site or a refusal,
             # never the plain add.
             moe = isinstance(getattr(layer, "mlp", None), Glm5NextMoEBlock)
             if not (prefill_leg and moe):
                 router_scale = False
             elif sharded:
-                router_scale = layer.mlp.experts.prefill_router_admits(
-                    streams, int(streams.shape[0]) * shard.world, self.text_config
+                router_scale = (
+                    envs.VLLM_NEURON_GLM5NEXT_PREFILL_SP_ROUTER_SCALE
+                    and layer.mlp.experts.prefill_router_admits(
+                        streams, int(streams.shape[0]) * shard.world, self.text_config
+                    )
                 )
             else:
                 router_scale = router_prefill.prefill_route_takes_rows(streams.shape[0])
