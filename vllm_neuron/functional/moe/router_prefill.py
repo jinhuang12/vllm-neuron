@@ -60,7 +60,11 @@ already taken the decode router there, and :func:`prefill_route_admits` declines
 a call anyway; ``VLLM_NEURON_MOE_PREFILL_ROUTER=0`` declines everything (baseline
 ``moe_prefill_8aa22fa``'s route, the fused kernel). The launch counts into the
 ``noaux_tc`` router seam's family (``router.noaux_tc_dispatch_counters``), as the
-decode router does; the kernel name tells the two kernels apart.
+decode router does; the kernel name tells the two kernels apart. One call enters ahead
+of the decode branch: under the prefill sequence shard the feed-forward mHC site gathers
+the chunk's scaled rows and not its pre-norm rows, so ``route_tokens`` hands them to
+:func:`noaux_tc_router_prefill_scaled`, which refuses a call this router declines rather
+than leave it to a route that would read this rank's pre-norm rows as the chunk.
 
 Both LNC2 cores: yes. The launch is ``[2]``; each program takes ``T // 2`` rows
 (``router._noaux_tc_shard_range``) and runs every step on them.
@@ -111,13 +115,20 @@ def prefill_route_takes_rows(tokens: int) -> bool:
     return prefill_router_enabled() and int(tokens) > DECODE_ROUTE_MAX_TOKENS
 
 
-def prefill_route_admits(hidden_states, router_weights, top_k: int) -> bool:
+def prefill_route_admits(
+    hidden_states, router_weights, top_k: int, *, tokens: int | None = None
+) -> bool:
     """True when ``route_tokens`` routes this call here instead of the fused kernel.
 
     More than ``DECODE_ROUTE_MAX_TOKENS`` rows (prefill), bf16 activations and router
     weights, ``top_k == 8``, ``H`` in 128-row blocks, ``8 <= E <= 512``, on an NKI
     device or the simulator, with the switch on. Anything else keeps baseline
     ``moe_prefill_8aa22fa``'s route.
+
+    ``tokens`` is the call's row count when it is not ``hidden_states``' own: the
+    feed-forward mHC site asks for a whole sequence-sharded chunk while it holds one
+    rank's rows. The dtype, ``H`` and the device are read off ``hidden_states`` either
+    way.
     """
     if not isinstance(hidden_states, Tensor) or not isinstance(router_weights, Tensor):
         return False
@@ -126,7 +137,8 @@ def prefill_route_admits(hidden_states, router_weights, top_k: int) -> bool:
     hidden = int(hidden_states.shape[-1])
     if hidden <= 0:
         return False
-    tokens = hidden_states.numel() // hidden
+    if tokens is None:
+        tokens = hidden_states.numel() // hidden
     experts = int(router_weights.shape[1])
     return (
         prefill_route_takes_rows(tokens)
@@ -312,8 +324,56 @@ def noaux_tc_router_prefill(
             f"scaled is {tuple(scaled.shape)} {scaled.dtype}; the rows it scales are "
             f"{tuple(hidden_states.shape)} {rows.dtype}"
         )
-    else:
-        scaled = scaled.reshape(tokens, hidden)
+    return noaux_tc_router_prefill_scaled(
+        scaled,
+        gamma,
+        router_weights,
+        bias,
+        top_k=int(top_k),
+        norm_topk_prob=norm_topk_prob,
+        routed_scaling_factor=routed_scaling_factor,
+    )
+
+
+def noaux_tc_router_prefill_scaled(
+    scaled: Tensor,
+    gamma: Tensor,
+    router_weights: Tensor,
+    correction_bias: Tensor,
+    top_k: int = _router_seam.NOAUX_TC_MAX8_WIDTH,
+    norm_topk_prob: bool = True,
+    routed_scaling_factor: float = 1.0,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """:func:`noaux_tc_router_prefill` from its kernel's input on: route the scaled rows.
+
+    ``scaled`` is ``[T, H]`` (or ``[B, S, H]``) ``bf16(x * rstd)``, the router RMSNorm
+    without its gain, and the only rows this call reads. Under the prefill sequence
+    shard the MoE block holds one rank's pre-norm rows and the whole chunk's ``scaled``
+    rows, gathered by the feed-forward mHC site, so its router enters here: the decode
+    router and the fused kernel both read pre-norm rows, and a call this router declines
+    has no route.
+
+    Returns:
+        As :func:`noaux_tc_router_prefill`.
+
+    Raises:
+        NoauxTcRouterError: for a ``top_k`` or ``E`` the noaux_tc stage cannot serve,
+            or a correction bias that is not ``[E]`` / ``[1, E]``.
+        ValueError: when :func:`prefill_route_admits` declines the scaled rows.
+    """
+    hidden = int(scaled.shape[-1])
+    tokens = scaled.numel() // hidden
+    num_experts = int(router_weights.shape[1])
+    _router_seam._require_noaux_tc_extents(num_experts, int(top_k))
+    bias = _router_seam._legalize_correction_bias(correction_bias, num_experts)
+    if not prefill_route_admits(scaled, router_weights, int(top_k)):
+        raise ValueError(
+            f"the prefill router declines {tokens} scaled rows of {tuple(scaled.shape)} "
+            f"{scaled.dtype} (router weights {tuple(router_weights.shape)} "
+            f"{router_weights.dtype}, top_k {top_k}), and every other route reads the "
+            f"pre-norm rows instead"
+        )
+    scaled = scaled.reshape(tokens, hidden)
     # Whole 128-row tiles per core under the [2] launch. The pad repeats the last
     # real row (router._noaux_tc_pad_tokens), as baseline ``moe_prefill_8aa22fa`` pads
     # its pre-norm rows: the norm is per row, so this is the same padded tensor
