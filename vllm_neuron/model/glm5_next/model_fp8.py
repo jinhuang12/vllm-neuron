@@ -3236,6 +3236,7 @@ class Glm5NextMoEBlock(nn.Module):
         collector: list[torch.Tensor] | None = None,
         router_scaled: torch.Tensor | None = None,
         partial_dtype: torch.dtype | None = None,
+        prefill_step: bool = False,
     ) -> torch.Tensor:
         """One sparse layer's MLP: route, run this rank's experts, add the shared.
 
@@ -3263,8 +3264,13 @@ class Glm5NextMoEBlock(nn.Module):
             partial_dtype: the dtype the caller rounds this output to before its
                 row-parallel sum, or None when it sums in fp32. With bfloat16 the
                 routed-plus-shared add runs in the shared expert's prefill kernel,
-                where that kernel runs and the bank returns its fp32 sum: the same
-                one rounding, with no separate full-width pass.
+                on a prefill step where that kernel runs and the bank returns its
+                fp32 sum: the same one rounding, with no separate full-width pass.
+            prefill_step: whether the call is a prefill chunk, by the step rule the
+                caller's reduction reads (``collective_policy.StepRows``). Only a
+                prefill chunk reads the shared expert's operands before the bank
+                runs, to test the kernel's route; every other step reads them at the
+                add, so its graph keeps the input order it has without the move.
 
         Returns:
             ``[T, H]`` in the kernels' own dtype: fp32, or bf16 when the add ran in
@@ -3312,20 +3318,26 @@ class Glm5NextMoEBlock(nn.Module):
 
         from vllm_neuron.functional.blockwise_fp8_mm import prefill_mlp_takes
 
-        # The add moves into the shared kernel only where it is rounded to bf16 next
-        # anyway, that kernel runs, and no dump reads the two halves apart; the bank
-        # then keeps its fp32 sum, which the graph's own add reads unrounded too (the
-        # compiler drops the cast's round trip).
+        # The add moves into the shared kernel only on a prefill chunk where it is
+        # rounded to bf16 next anyway, that kernel runs, and no dump reads the two
+        # halves apart; the bank then keeps its fp32 sum, which the graph's own add
+        # reads unrounded too (the compiler drops the cast's round trip). The route
+        # test reads the shared operands, and a graph takes its inputs in the order
+        # it first reads them, so only such a chunk reads them before the bank; every
+        # other call reads them at the add below and keeps its graph's input order.
         shared_experts = getattr(self, "shared_experts", None)
-        shared_operands = (
-            () if shared_experts is None else shared_experts.scale_route_operands()
-        )
-        add_in_kernel = (
-            partial_dtype is torch.bfloat16
+        shared_operands = None
+        add_in_kernel = False
+        if (
+            prefill_step
+            and partial_dtype is torch.bfloat16
             and collector is None
             and shared_experts is not None
-            and prefill_mlp_takes(normed_hidden_states, *shared_operands[:3])
-        )
+        ):
+            shared_operands = shared_experts.scale_route_operands()
+            add_in_kernel = prefill_mlp_takes(
+                normed_hidden_states, *shared_operands[:3]
+            )
         routed_output = self.experts(
             normed_hidden_states,
             expert_affinities,
@@ -3343,6 +3355,8 @@ class Glm5NextMoEBlock(nn.Module):
 
         if shared_experts is None:
             return routed_output
+        if shared_operands is None:
+            shared_operands = shared_experts.scale_route_operands()
         return self.combine_routed_and_shared(
             routed_output,
             normed_hidden_states,
@@ -10042,7 +10056,8 @@ class Glm5NextModel(nn.Module):
         mlp = layer.mlp
         if isinstance(mlp, Glm5NextMoEBlock):
             # The reduction below rounds the sum's partial to its wire dtype first,
-            # so the block may hand it over already rounded once.
+            # so on a prefill chunk, by the step rule that reduction reads, the
+            # block may hand it over already rounded once.
             out = mlp(
                 hidden_states,
                 normed,
@@ -10056,6 +10071,7 @@ class Glm5NextModel(nn.Module):
                 expert_parallel_rank=expert_parallel_rank,
                 router_scaled=scaled,
                 partial_dtype=_row_parallel_wire_dtype(normed.shape[0], module=layer),
+                prefill_step=layer.step_rows.phase(int(normed.shape[0])) == "prefill",
             )
         elif isinstance(mlp, Glm5NextDenseMLP):
             out = mlp(normed, quant_config=quant_config)
