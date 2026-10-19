@@ -145,8 +145,8 @@ if TYPE_CHECKING:
     # The largest window, in pages, that the dense-masked route takes.
     VLLM_NEURON_MLA_DENSE_MASKED_MAX_PAGES: int = 2048
     # Let the dense-masked kernel contract its probabilities with the window rows as
-    # one bf16 pass instead of the hi/lo split. Off by default.
-    VLLM_NEURON_MLA_DENSE_MASKED_BF16_PROBS: bool = False
+    # one bf16 pass instead of the hi/lo split. On by default; 0 restores the split.
+    VLLM_NEURON_MLA_DENSE_MASKED_BF16_PROBS: bool = True
     # Let the GLM-5.3-Flash DSA prefill's sparse MLA body gather its rows from the
     # latent bank through the block table, with no staged window. On by default; 0
     # restores the staged window.
@@ -677,10 +677,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # larger window keeps the gather. The dense pass reads every row of the window and
     # the gather only each query's selected rows, so the pass gains less as the window
     # grows. 2,048 by default: the window of a 262,144-token context in 128-row pages.
-    # At 2,048 pages, kernel alone on trn2 with 1,024 queries, the pass took 8.1 ms and
-    # the 4-DMA gather (VLLM_NEURON_MLA_SPARSE_GATHER_SPLIT=4) 9.9 ms, with outputs
-    # equal within the fp32 rounding of the sums. Set 1500 to keep the windows above
-    # 1,500 pages on the gather. Read at trace time; a change needs a new compile.
+    # At 2,048 pages, kernel alone on trn2 with 1,024 queries, the 4-DMA gather
+    # (VLLM_NEURON_MLA_SPARSE_GATHER_SPLIT=4) took 9.9 ms and the pass 6.6 ms with its
+    # bf16 probabilities (VLLM_NEURON_MLA_DENSE_MASKED_BF16_PROBS), 8.1 ms with the
+    # hi/lo split, whose outputs equal the gather's within the fp32 rounding of the
+    # sums. Set 1500 to keep the windows above 1,500 pages on the gather. Read at trace
+    # time; a change needs a new compile.
     "VLLM_NEURON_MLA_DENSE_MASKED_MAX_PAGES": lambda: (
         2048
         if os.getenv("VLLM_NEURON_MLA_DENSE_MASKED_MAX_PAGES") is None
@@ -693,9 +695,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rounding (relative error up to 2 ** -8) instead of about 2 ** -16, so the output
     # is no longer value-equal to the split form: each element moves by at most 2 ** -8
     # of the softmax-weighted sum of |value| over the query's selected rows. Read at
-    # trace time by the kernel's entry; a change needs a new compile. Off by default.
+    # trace time by the kernel's entry; a change needs a new compile. On by default:
+    # kernel alone on trn2 with 1,024 queries, the pass took 18-25 % less time from 264
+    # to 2,048 pages. Set 0 for the split form.
     "VLLM_NEURON_MLA_DENSE_MASKED_BF16_PROBS": lambda: (
-        maybe_convert_bool(os.getenv("VLLM_NEURON_MLA_DENSE_MASKED_BF16_PROBS")) or False
+        maybe_convert_bool(os.getenv("VLLM_NEURON_MLA_DENSE_MASKED_BF16_PROBS"))
+        is not False
     ),
     # Let the sparse MLA prefill's low-precision row-tiled body
     # (``functional/attention/mla_sparse.py``) gather each query's selected rows
