@@ -25,7 +25,11 @@ Pinned:
    131072 = 65536) its draft iterations take the ownership slots and clamp at 131071;
 3. the MTP k=3 form is refused by name, listing each capability the tree lacks, and is
    admitted when all four are present; then a verify step of ``1 + k`` rows per request
-   takes the T-row DCP operands at the attention.
+   takes the T-row DCP operands at the attention;
+4. the platform's check of both forms, in a fresh interpreter, imports none of the four
+   modules it reads and no package above them that was not imported before, maps no
+   more of the Neuron runtime (``libnrt``) than was mapped before it, and opens no
+   Neuron device.
 
 No test loads weights, starts a worker or touches a device.
 """
@@ -34,13 +38,18 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import json
+import os
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 import torch
 from vllm.engine.arg_utils import EngineArgs
 
+import vllm_neuron
 from vllm_neuron.utils import dcp_ownership
 
 from test.vllm_neuron.model.glm5_next import test_mtp_under_dcp as model_side
@@ -163,10 +172,12 @@ def test_the_served_shadow_draft_form_is_admitted_and_drafts_on_ownership_slots(
 # 3. MTP k=3.
 
 
-def test_the_served_mtp_form_is_refused_naming_every_missing_capability(monkeypatch, served_model):
+def test_the_served_mtp_form_is_refused_naming_every_missing_capability(
+    monkeypatch, tmp_path, served_model
+):
     _served_env(monkeypatch, mtp_async=True)
-    admission._speculative_tree(monkeypatch, attention=False, indexer=False, draft=False,
-                                slots=False)
+    admission._speculative_tree(monkeypatch, tmp_path / "probe", attention=False,
+                                indexer=False, draft=False, slots=False)
     with pytest.raises(ValueError) as refused:
         _engine_config(served_model, MTP)
     message = str(refused.value)
@@ -193,11 +204,11 @@ def test_the_served_mtp_form_on_this_tree_names_what_the_tree_lacks(monkeypatch,
 
 
 def test_the_served_mtp_form_is_admitted_and_its_verify_step_takes_the_t_row_path(
-    monkeypatch, served_model
+    monkeypatch, tmp_path, served_model
 ):
     _served_env(monkeypatch, mtp_async=True)
-    admission._speculative_tree(monkeypatch, attention=True, indexer=True, draft=True,
-                                slots=True)
+    admission._speculative_tree(monkeypatch, tmp_path / "probe", attention=True,
+                                indexer=True, draft=True, slots=True)
     config = _engine_config(served_model, MTP)
     dcp = int(config.parallel_config.decode_context_parallel_size)
     block = int(config.cache_config.block_size)
@@ -222,3 +233,81 @@ def test_the_served_mtp_form_is_admitted_and_its_verify_step_takes_the_t_row_pat
             at, rank, block_size=block, dcp_size=dcp
         ).tolist()
         assert int(call["topk_indices"].shape[0]) == rows
+
+
+# --------------------------------------------------------------------------- #
+# 4. the check imports nothing it reads.
+
+#: Run as ``python -I -B -c CHECK_CHILD <tree>``: ``-I`` drops PYTHONPATH and the working
+#: directory, so the child puts the tree first on its own path and proves where
+#: ``vllm_neuron`` came from. It then runs the platform's check of both forms at DCP 2 and
+#: prints, as JSON, the modules the check added and the ``libnrt`` lines of its maps.
+CHECK_CHILD = r"""
+import json, os, sys
+from types import SimpleNamespace
+
+tree = sys.argv[1]
+sys.path.insert(0, tree)
+import vllm_neuron
+
+assert vllm_neuron.__file__.startswith(tree + os.sep), vllm_neuron.__file__
+print("import origin", vllm_neuron.__file__, flush=True)
+from vllm_neuron.vllm.platform import NeuronPlatform
+
+
+def config(k):
+    speculative = None if k is None else SimpleNamespace(method="mtp", num_speculative_tokens=k)
+    return SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=2),
+        speculative_config=speculative,
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["Glm5NextForConditionalGeneration"])),
+    )
+
+
+def runtime_lines():
+    with open("/proc/self/maps") as maps:
+        return sum("libnrt" in line for line in maps)
+
+
+def device_fds():
+    fds = (os.path.join("/proc/self/fd", fd) for fd in os.listdir("/proc/self/fd"))
+    return sum(os.path.realpath(fd).startswith("/dev/neuron") for fd in fds)
+
+
+before, lines_before = set(sys.modules), runtime_lines()
+verdicts = []
+for k in (3, None):
+    try:
+        NeuronPlatform._refuse_speculative_decoding_under_dcp(config(k))
+        verdicts.append("admitted")
+    except ValueError as refused:
+        verdicts.append(f"refused: {refused}")
+print(json.dumps({"added": sorted(set(sys.modules) - before), "verdicts": verdicts,
+                  "libnrt_lines": [lines_before, runtime_lines()],
+                  "device_fds": device_fds()}), flush=True)
+"""
+
+
+def test_the_check_imports_none_of_the_modules_it_reads():
+    tree = Path(vllm_neuron.__file__).resolve().parents[1]
+    watched = {
+        ".".join(module.split(".")[:depth])
+        for module, _attribute in admission.SPECULATIVE
+        for depth in range(2, module.count(".") + 2)
+    }
+    env = {**os.environ, admission.ASYNC_KNOB: "1", admission.KNOB: "3"}
+    child = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", CHECK_CHILD, str(tree)],
+        env=env, capture_output=True, text=True, timeout=900, check=False,
+    )
+    assert child.returncode == 0, child.stderr[-4000:]
+    origin, report = child.stdout.splitlines()[-2:]
+    print(origin)
+    assert origin == f"import origin {tree / 'vllm_neuron' / '__init__.py'}"
+    record = json.loads(report)
+    print(record["verdicts"], f"{len(record['added'])} modules added")
+    assert sorted(watched & set(record["added"])) == []
+    lines_before, lines_after = record["libnrt_lines"]
+    assert lines_after == lines_before
+    assert record["device_fds"] == 0

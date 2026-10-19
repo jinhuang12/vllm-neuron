@@ -26,23 +26,27 @@ it returned before the knob was seen. These tests pin, in the platform's DCP val
    refused with the speculative message, naming the capability, when one of them is
    False; the async drafter's latent slots are not counted without the async drafter.
 
-No test constructs an engine, loads a checkpoint or touches a device.
+The platform reads each capability from its module's source without importing it; every
+test here points that reader at a source file of its own under ``tmp_path`` (the spec
+tests' ``_sources``). No test constructs an engine, loads a checkpoint or touches a device.
 """
 
 from __future__ import annotations
 
-import importlib
 from types import SimpleNamespace
 
 import pytest
 
 from vllm_neuron.vllm.platform import NeuronPlatform
 
+from test.vllm_neuron.vllm.test_platform_dcp_spec import _sources
+
 KNOB = "VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT"
 GLM5_NEXT_ARCH = "Glm5NextForConditionalGeneration"
 OTHER_ARCH = "LlamaForCausalLM"
 DCP_SIZES = (2, 4, 8)
 SPECULATIVE_REFUSAL = "Speculative decoding is not supported with decode_context_parallel_size > 1"
+DRAFT_SLOTS_MODULE = "vllm_neuron.model.glm5_next.mtp"
 ASYNC_KNOB = "VLLM_NEURON_GLM5NEXT_MTP_ASYNC"
 #: The capabilities the platform admits a speculative config on under DCP: (module,
 #: attribute, counted only with the async drafter).
@@ -73,23 +77,22 @@ def _config(
 
 @pytest.mark.parametrize("draft_k", [1, 3])
 @pytest.mark.parametrize("dcp", DCP_SIZES)
-def test_shadow_draft_under_dcp_is_refused_by_name(monkeypatch, dcp, draft_k):
-    from vllm_neuron.model.glm5_next import mtp
-
+def test_shadow_draft_under_dcp_is_refused_by_name(monkeypatch, tmp_path, dcp, draft_k):
     monkeypatch.setenv(KNOB, str(draft_k))
-    monkeypatch.setattr(mtp, "DCP_DRAFT_SLOTS", False)
+    _sources(monkeypatch, tmp_path, {DRAFT_SLOTS_MODULE: "DCP_DRAFT_SLOTS = False\n"})
     with pytest.raises(ValueError) as refused:
         NeuronPlatform._refuse_speculative_decoding_under_dcp(_config(dcp))
     message = str(refused.value)
     assert f"{KNOB}={draft_k}" in message
     assert f"decode_context_parallel_size={dcp}" in message
+    assert f"{DRAFT_SLOTS_MODULE}.DCP_DRAFT_SLOTS" in message
 
 
-def test_shadow_draft_under_dcp_is_admitted_when_its_slots_follow_ownership(monkeypatch):
-    from vllm_neuron.model.glm5_next import mtp
-
+def test_shadow_draft_under_dcp_is_admitted_when_its_slots_follow_ownership(
+    monkeypatch, tmp_path
+):
     monkeypatch.setenv(KNOB, "3")
-    monkeypatch.setattr(mtp, "DCP_DRAFT_SLOTS", True)
+    _sources(monkeypatch, tmp_path, {DRAFT_SLOTS_MODULE: "DCP_DRAFT_SLOTS = True\n"})
     assert NeuronPlatform._refuse_speculative_decoding_under_dcp(_config(2)) is None
 
 
@@ -121,21 +124,24 @@ def _env(monkeypatch, name: str, value: str | None) -> None:
         monkeypatch.setenv(name, value)
 
 
-def _capabilities(monkeypatch, missing: int | None = None) -> None:
-    """Every speculative capability True, but the one at index ``missing`` False."""
-    for index, (module, attribute, _async_only) in enumerate(SPECULATIVE_CAPABILITIES):
-        monkeypatch.setattr(importlib.import_module(module), attribute, index != missing)
+def _capabilities(monkeypatch, tmp_path, missing: int | None = None) -> None:
+    """Every speculative capability's source sets it True, but the one at index
+    ``missing`` sets it False."""
+    _sources(monkeypatch, tmp_path, {
+        module: f"{attribute} = {index != missing}\n"
+        for index, (module, attribute, _async_only) in enumerate(SPECULATIVE_CAPABILITIES)
+    })
 
 
 @pytest.mark.parametrize("mtp_async", [None, "1"])
 @pytest.mark.parametrize("value", [None, "3"])
 @pytest.mark.parametrize("dcp", DCP_SIZES)
 def test_speculative_decoding_under_dcp_is_admitted_on_every_capability(
-    monkeypatch, dcp, value, mtp_async
+    monkeypatch, tmp_path, dcp, value, mtp_async
 ):
     _env(monkeypatch, KNOB, value)
     _env(monkeypatch, ASYNC_KNOB, mtp_async)
-    _capabilities(monkeypatch)
+    _capabilities(monkeypatch, tmp_path)
     assert NeuronPlatform._refuse_speculative_decoding_under_dcp(_config(dcp, 3)) is None
 
 
@@ -144,11 +150,11 @@ def test_speculative_decoding_under_dcp_is_admitted_on_every_capability(
 @pytest.mark.parametrize("value", [None, "3"])
 @pytest.mark.parametrize("dcp", DCP_SIZES)
 def test_speculative_decoding_under_dcp_stays_refused_without_a_capability(
-    monkeypatch, dcp, value, mtp_async, missing
+    monkeypatch, tmp_path, dcp, value, mtp_async, missing
 ):
     _env(monkeypatch, KNOB, value)
     _env(monkeypatch, ASYNC_KNOB, mtp_async)
-    _capabilities(monkeypatch, missing)
+    _capabilities(monkeypatch, tmp_path, missing)
     module, attribute, async_only = SPECULATIVE_CAPABILITIES[missing]
     if async_only and mtp_async is None:
         # Without the async drafter its latent slots are not counted.
