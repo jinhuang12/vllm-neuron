@@ -1738,6 +1738,30 @@ class Glm5NextRoutedExperts(nn.Module):
     # onto this rank's ``expert_partition`` slice is the dispatch step, and it
     # belongs to :meth:`block_quant_expert_mm`.
 
+    def prefill_router_admits(
+        self, like: torch.Tensor, rows: int, text_config: Glm5NextTextConfig
+    ) -> bool:
+        """Does a prefill call of ``rows`` rows take the prefill router?
+
+        Asked by the feed-forward mHC site at trace time, before the rows exist: under
+        the prefill sequence shard it gathers the router's scaled rows in place of the
+        pre-norm rows only for a call :meth:`route_tokens` routes there.
+
+        Args:
+            like: a tensor with the call's activation dtype, hidden extent and device
+                (this rank's streams).
+            rows: the call's row count, the whole chunk's.
+            text_config: the decoder config ``num_experts_per_tok`` lives on.
+        """
+        from vllm_neuron.functional.moe import router_prefill
+
+        return router_prefill.prefill_route_admits(
+            like,
+            self.router_weight,
+            int(text_config.num_experts_per_tok),
+            tokens=int(rows),
+        )
+
     def route_tokens(
         self,
         hidden_states: torch.Tensor,
@@ -10205,9 +10229,22 @@ class Glm5NextModel(nn.Module):
             # asks the kernel for that norm without its gain, the router's input
             # (``scaled``); every other call is the site call it was. The leg, not the
             # row count, keeps the verify step out: its ``B * (1 + k)`` rows can exceed
-            # the prefill router's floor too.
+            # the prefill router's floor too. Under the sequence shard the call is the
+            # whole gathered chunk, and the scale crosses the wire in place of the
+            # pre-norm rows, so the router's full admission at the chunk's row count
+            # decides: a call it declines keeps the pre-norm rows for the route that
+            # takes it.
             # ``streams`` is never ``None`` here, so this is a site or a refusal,
             # never the plain add.
+            moe = isinstance(getattr(layer, "mlp", None), Glm5NextMoEBlock)
+            if not (prefill_leg and moe):
+                router_scale = False
+            elif sharded:
+                router_scale = layer.mlp.experts.prefill_router_admits(
+                    streams, int(streams.shape[0]) * shard.world, self.text_config
+                )
+            else:
+                router_scale = router_prefill.prefill_route_takes_rows(streams.shape[0])
             site = _mhc_ffn_site(layer, streams)
             streams = site.forward(
                 streams,
@@ -10231,21 +10268,11 @@ class Glm5NextModel(nn.Module):
                     layer.post_attention_layernorm_weight,
                     float(self.text_config.rms_norm_eps),
                 ),
-                # A MoE layer's router reads the pre-norm stream; a dense MLP only
+                # A MoE layer's router reads the pre-norm stream, or under the
+                # sequence shard the kernel's scale in its place; a dense MLP only
                 # ``normed``. Under the sequence shard the site gathers what is read.
-                reads_layer_input=isinstance(
-                    getattr(layer, "mlp", None), Glm5NextMoEBlock
-                ),
-                # Under the sequence shard the router scales the gathered rows itself,
-                # so the site gathers two tensors and asks its kernel for no scale.
-                **(
-                    {"router_scale": True}
-                    if prefill_leg
-                    and not sharded
-                    and isinstance(getattr(layer, "mlp", None), Glm5NextMoEBlock)
-                    and router_prefill.prefill_route_takes_rows(streams.shape[0])
-                    else {}
-                ),
+                reads_layer_input=moe and not (sharded and router_scale),
+                **({"router_scale": True} if router_scale else {}),
             )
             if collect_layer_streams and index < DUMP_STREAM_LAYERS:
                 collected.append(streams)
