@@ -135,9 +135,9 @@ EMPTY_LSE = MASKED_SCORE
 #: exp underflows to 0.0 under the _MAX_FLOOR floor). Anything at or above this is live.
 _LIVE_TOTAL = 0.5
 #: The capability: :func:`mla_decode_partial_attention` serves ``T >= 2`` query rows per
-#: request under DCP (per-row ``position`` / ``owner``, :func:`dcp_step_rows`). A caller
-#: that gates the speculative verify step under DCP on it reads
-#: ``getattr(mla_decode, "DCP_SPECULATIVE_ROWS", False)``, so a tree without it refuses.
+#: request under DCP (per-row ``position`` / ``owner``, :func:`dcp_step_rows`). The
+#: platform's speculative-decoding check under DCP reads it from this file's source, as a
+#: module-level literal ``True``, so a tree without it refuses.
 DCP_SPECULATIVE_ROWS = True
 
 
