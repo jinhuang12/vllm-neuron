@@ -24,6 +24,8 @@ no checkpoint weights; that belongs to the tower.
 """
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
 
@@ -70,6 +72,24 @@ class Glm5NextVisionRMSNorm(nn.Module):
         return self.weight * hidden_states.to(input_dtype)
 
 
+class Glm5NextVisionErfGELU(nn.Module):
+    """Exact GELU, ``0.5 * x * (1 + erf(x / sqrt(2)))``, in a form the Neuron graph capture lowers.
+
+    ``nn.GELU()`` computes the same function, but the capture backend fails on it: dynamo records
+    ``torch._C._nn.gelu(x, approximate='none')``, and libtorch_neuronx_lite's override of that op
+    (``xla_impl/ops.py:328``, class ``Gelu``) passes ``approximate`` as a keyword to
+    ``torch.autograd.Function.apply``, which takes no keyword arguments. The Qwen3-VL tower writes its
+    GELU out for the same reason (``vllm_neuron/model/qwen3_vl/vision_encoder_bf16.py:54-57``).
+
+    The formula runs in float32 and the result is cast back to the input dtype, as the CPU kernel of
+    ``nn.GELU`` computes a bf16 input, so the two agree up to the last rounding of the output.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        wide = x.float()
+        return (0.5 * wide * (1.0 + torch.erf(wide / math.sqrt(2.0)))).to(x.dtype)
+
+
 class Glm5NextVisionMergerMLP(nn.Module):
     """The merger MLP, matching the reference ``Glm5NextVisionPatchMerger``.
 
@@ -110,7 +130,7 @@ class Glm5NextVisionMergerMLP(nn.Module):
         self.gate_proj = nn.Linear(dim, context_dim, bias=False, dtype=dtype)
         self.up_proj = nn.Linear(dim, context_dim, bias=False, dtype=dtype)
         self.down_proj = nn.Linear(context_dim, dim, bias=False, dtype=dtype)
-        self.act1 = nn.GELU()
+        self.act1 = Glm5NextVisionErfGELU()
         self.act_fn = _ACTIVATIONS[hidden_act]()
         self.swiglu_limit = float(swiglu_limit)
 

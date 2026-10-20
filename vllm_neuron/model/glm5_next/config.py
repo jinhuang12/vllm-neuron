@@ -347,7 +347,24 @@ class Glm5NextVisionConfig:
     # would silently change what the tower computes.
     rms_norm_eps: float = 1e-05
 
+    # -- The block-norm epsilon: the reference's value, not the checkpoint's -----
+    # ``norm1`` and ``norm2`` of every block read this field; q_norm, k_norm and
+    # ``post_layernorm`` read ``rms_norm_eps``. The parity reference for this tower
+    # is upstream vLLM on GPU, and upstream forces 1e-6 for these two norms over the
+    # checkpoint's 1e-05 (``vllm/models/glm5next/common/model.py``,
+    # ``_VISION_RMS_NORM_EPS``: the tower was trained with 1e-6, and 1e-05 degrades
+    # image descriptions). Upstream keeps 1e-05 for the other three norms, as this
+    # config does. The checkpoint has no key of this name, so the default applies;
+    # ``--hf-overrides '{"vision_config": {"block_norm_eps": 1e-05}}'`` restores the
+    # checkpoint's value.
+    block_norm_eps: float = 1e-06
+
     neuron_config: VisionNeuronConfig | None = None
+
+    @property
+    def patch_dim(self) -> int:
+        """Values per patch row: every channel of every temporal slice of one patch."""
+        return self.in_channels * self.temporal_patch_size * self.patch_size**2
 
     @classmethod
     def from_hf_config(cls, hf_vision_config, neuron_config: VisionNeuronConfig = None):

@@ -16,10 +16,19 @@ from dataclasses import dataclass
 
 import torch.nn as nn
 from transformers import PretrainedConfig
+from vllm.model_executor.models.interfaces import SupportsMultiModal
 
+from vllm_neuron.model.interfaces import SupportsSpatialMerge
 from vllm_neuron.model.neuron_config import NeuronConfig, VisionNeuronConfig
 
 from .config import Glm5NextExpertConfigError
+
+#: The prompt text of one image and of one video: the checkpoint chat template's
+#: ``emit_image`` and ``emit_video`` macros, and the strings upstream vLLM's
+#: ``Glm4vForConditionalGeneration.get_placeholder_str`` returns for its
+#: GLM-5.3-Flash class, which inherits that method.
+IMAGE_PLACEHOLDER = "<|begin_of_image|><|image|><|end_of_image|>"
+VIDEO_PLACEHOLDER = "<|begin_of_video|><|video|><|end_of_video|>"
 
 # ---------------------------------------------------------------------------
 # Expert sharding.
@@ -239,10 +248,44 @@ def require_uniform_expert_partition(
     )
 
 
-class Glm5NextForConditionalGeneration(nn.Module):
+def _serves_images(vision_neuron_config: VisionNeuronConfig | None) -> bool:
+    """Whether this server admits images, and so needs the implementation with the vision tower.
+
+    The test is vLLM's own, ``MultiModalRegistry.supports_multimodal_inputs``, which the model
+    runner also uses to build the encoder cache and to gather image rows. A server whose every
+    modality limit is 0 (``--limit-mm-per-prompt '{"image": 0}'`` or ``--language-model-only``)
+    runs text-only. A language-only pool (``mm_language_model_only``) builds no tower either,
+    by the plugin's construction-role rule. Outside a server, where no vLLM config is set, no
+    image limit admits an image, so the text implementation is built. A vision neuron config
+    alone is no signal: the platform resolves one for every config with a ``vision_config``.
+
+    Raises:
+        ValueError: an encoder-only pool (``mm_encoder_only``); this model has none.
+    """
+    if vision_neuron_config is None or vision_neuron_config.mm_language_model_only:
+        return False
+    if vision_neuron_config.mm_encoder_only:
+        raise ValueError(
+            "glm-5.3-Flash has no encoder-only pool (mm_encoder_only): its implementations "
+            "always hold the decoder"
+        )
+    from vllm.config import get_current_vllm_config_or_none
+    from vllm.multimodal import MULTIMODAL_REGISTRY
+
+    vllm_config = get_current_vllm_config_or_none()
+    if vllm_config is None:
+        return False
+    return MULTIMODAL_REGISTRY.supports_multimodal_inputs(vllm_config.model_config)
+
+
+class Glm5NextForConditionalGeneration(
+    nn.Module, SupportsMultiModal, SupportsSpatialMerge
+):
     """Factory that selects the glm-5.3-Flash implementation.
 
-    Extends nn.Module to satisfy vLLM's ModelRegistry requirements.
+    Extends nn.Module to satisfy vLLM's ModelRegistry requirements. vLLM reads the
+    multimodal interface off this class, the one it registers: the flag, the placeholder
+    text and the merge factor. The selected implementation encodes the images.
 
     The model runner passes ``text_neuron_config`` and ``vision_neuron_config``
     separately because the text decoder and the vision encoder carry their own
@@ -307,6 +350,43 @@ class Glm5NextForConditionalGeneration(nn.Module):
             "compute_logits belongs to the selected implementation."
         )
 
+    def embed_multimodal(self, **kwargs):
+        """Present for the multimodal interface; same contract as ``embed_input_ids``.
+
+        The image implementation (``model_image.py``) encodes images, and the model runner
+        calls it there.
+        """
+        raise NotImplementedError(
+            "Glm5NextForConditionalGeneration is a selection factory; "
+            "embed_multimodal belongs to the selected implementation."
+        )
+
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        """The prompt text of one item of ``modality``, as upstream gives it.
+
+        A video gets its text too, as upstream: whether video input is served is decided
+        where the processor validates the items, not here.
+        """
+        if modality.startswith("image"):
+            return IMAGE_PLACEHOLDER
+        if modality.startswith("video"):
+            return VIDEO_PLACEHOLDER
+        raise ValueError(f"glm-5.3-Flash takes image or video items, not {modality!r}")
+
+    @classmethod
+    def get_vision_token_merge_factor(cls, hf_config: PretrainedConfig) -> int:
+        """Patch rows per embedding row: the tower merges a square of patches into one.
+
+        The checkpoint's own config class holds ``vision_config`` as a sub-config; a generic
+        ``PretrainedConfig`` built from the same JSON keeps it a dict. Both are read, as
+        ``Glm5NextConfig.from_configs`` reads both.
+        """
+        vision = hf_config.vision_config
+        if isinstance(vision, dict):
+            return vision["spatial_merge_size"] ** 2
+        return vision.spatial_merge_size**2
+
     @classmethod
     def from_configs(
         cls,
@@ -326,10 +406,14 @@ class Glm5NextForConditionalGeneration(nn.Module):
         vision_neuron_config: VisionNeuronConfig | None,
     ) -> nn.Module:
         # Blockwise-FP8 is the only weight format in scope for this checkpoint,
-        # so there is a single implementation module and no format branch here.
-        # The import stays local so that registration and arch lookup work
-        # without importing model code or allocating weights.
-        from .model_fp8 import Glm5NextForConditionalGeneration as Model
+        # so there is no format branch here. The one branch is whether the server
+        # admits images: the image implementation adds the vision tower. The
+        # imports stay local so that registration and arch lookup work without
+        # importing model code or allocating weights.
+        if _serves_images(vision_neuron_config):
+            from .model_image import Glm5NextImageForConditionalGeneration as Model
+        else:
+            from .model_fp8 import Glm5NextForConditionalGeneration as Model
 
         return Model.from_configs(
             hf_config,
