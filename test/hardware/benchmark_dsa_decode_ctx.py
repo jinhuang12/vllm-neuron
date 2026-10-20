@@ -573,9 +573,9 @@ def cmd_run(args) -> None:
 
 
 #: ``select`` cases, ``B:C``: the selection's request-major tiles of 2 to 8 requests, the
-#: segment path (C > 16384) with one to eight requests a GpSimd call, nine segments, and
-#: the widest axis. 16:32768 is where the segment lists were first seen read back
-#: as zeros on the device.
+#: chunk walk (C > 16384) from two to 32 chunks a row, a short last chunk (20480, 65537),
+#: and the widest axis. 16:32768 is where the lists of the segment merge the walk replaced
+#: were first seen read back as zeros on the device.
 SELECT_CASES = ("1:2048", "4:2048", "64:2048", "4:8192", "16:16384", "64:16384",
                 "4:20480", "8:32768", "16:32768", "64:32768", "4:65536", "8:65536",
                 "64:65536", "4:65537", "2:131072", "1:262144", "1:524288")
@@ -630,7 +630,7 @@ def cmd_select(args) -> None:
                            for i in range(args.layers) for r in range(batch)))
         row = {"case": spec, "batch": batch, "candidates": width,
                "programs": DS.decode_select_programs(batch),
-               "fold_cap": DS.select_fold_cap(width), "segments": DS.segments(width)[0],
+               "fold_cap": DS.select_fold_cap(width), "row_chunks": DS.row_chunks(width),
                "mismatched_rows_per_run": bad, "exact": not any(bad)}
         report["cases"].append(row)
         args.output.write_text(json.dumps(report, indent=2) + "\n")

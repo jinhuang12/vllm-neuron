@@ -67,20 +67,26 @@ depends on the layout.
 
 The compaction needs a row on one partition of a GpSimd core (partitions
 ``0, 16, ..., 112``), so the mask goes through an HBM scratch on its way there. A row of
-up to :data:`WHOLE_ROW_COLUMNS` candidates is compacted whole. A wider row is cut into ``S`` segments of at most :data:`SEGMENT_COLUMNS`: each
-segment is compacted on its own (its ids shifted by the segment's first candidate) and
-truncated to ``k`` columns, which loses nothing because the whole row selects at most
-``k``. The segment lists stay on the request's GpSimd partition, side by side in segment
-order, and merge :data:`MERGE_LISTS` at a time: ``nonzero_with_count`` over "is an id"
-gives the positions of the ids in order, ``nc_n_gather`` reads them, and the result is
-again one list of at most ``k`` ids in ascending order, the first list of the next merge.
-Every shape is static; no step depends on how many pools a segment selected.
+up to :data:`WHOLE_ROW_COLUMNS` candidates is compacted whole. A wider row is walked in
+``S = ceil(C / WHOLE_ROW_COLUMNS)`` chunks of that width (:func:`row_chunks`), its mask
+padded to ``S`` whole chunks (:func:`mask_span`; the pad scores are ``BOUND_FILL``, never
+selected). One ``nonzero_with_count`` compacts eight (request, chunk) rows, so the chunks
+of one request run on ``S`` GpSimd cores at once. A chunk's list needs only ``k`` columns:
+the whole row selects at most ``k``. The lists are joined without a gather. Chunk ``c``'s
+list goes to an HBM row behind ``k`` pad columns, and one DMA reads ``k`` columns of that
+row from column ``k - p``, where ``p`` is the number of ids in the request's lower chunks
+(an offset the DMA reads from SBUF when it runs). That window holds the chunk's ids at
+their places in the joined list and pads at every other place, so the ``S`` windows, each
+id shifted by its chunk's first candidate, join by an element-wise maximum (a pad is below
+every id). Every shape is static and no control flow depends on a value: only the window
+offsets do.
 
-The decode indexer serves the whole-row path only (:data:`MAX_DECODE_INDEX_CANDIDATES`):
-the segment merge returned wrong rows on trn2 in ways that depended on the graph around
-the kernel and that the compiled-program ordering check does not see, so a model whose
-``max_model_len`` needs a wider candidate axis is refused when the runner starts
-(:func:`check_decode_index_context`). The merge stays for the work that lifts the ceiling.
+The decode indexer serves candidate axes up to :data:`MAX_DECODE_INDEX_CANDIDATES` and
+refuses a longer ``max_model_len`` when the runner starts
+(:func:`check_decode_index_context`). A runner that batches more than one decode request
+is served up to :data:`MAX_BATCHED_DECODE_INDEX_CANDIDATES`, one whole row. Decode context
+parallelism selects with :func:`dsa_decode_select_pools`, on the whole-row path only, up to
+:data:`MAX_DECODE_POOLS_CANDIDATES` per rank (:func:`check_decode_pools_context`).
 
 Both physical cores of an LNC2 core split the requests (``[2]`` grid at ``B >= 2``).
 
@@ -139,13 +145,10 @@ FOLD_COLUMNS = 2048
 #: partition (``C > 128 * FOLD_COLUMNS``): the SBUF a partition offers (224 KiB on trn2)
 #: holds seven fold tiles and the compaction tiles up to this width.
 FOLD_COLUMNS_LIMIT = 4096
-#: The widest row compacted whole (``[P, W]`` fp32 mask plus ``[P, W + 1]`` int32 ids). Up
-#: to it one ``nonzero_with_count`` per eight requests is cheaper on the device than
-#: segments and a merge (a second compaction and a gather per eight requests).
+#: The widest row one ``nonzero_with_count`` compacts (``[P, W]`` fp32 mask plus
+#: ``[P, W + 1]`` int32 ids, about half of a partition's SBUF). A wider row is compacted in
+#: chunks of this width and the chunk lists joined (module docstring).
 WHOLE_ROW_COLUMNS = 16384
-#: The widest segment of a wider row, which is compacted in segments and merged: room for
-#: the fold tiles of the widest axis (:data:`FOLD_COLUMNS_LIMIT`) beside it.
-SEGMENT_COLUMNS = 8192
 #: Up to this many candidates a request folds over at most :data:`SMALL_AXIS_FOLD`
 #: partitions, past it over every one: the faster fold on the device. On a short axis the
 #: 32 bit steps cost the same cross-partition sum whatever the fold, and a 16-partition
@@ -153,17 +156,29 @@ SEGMENT_COLUMNS = 8192
 #: dominates and every partition shortens it.
 SMALL_AXIS_COLUMNS = 2048
 SMALL_AXIS_FOLD = 16
-#: Lists merged at once: ``MERGE_LISTS * k`` ids side by side on one partition, the first
-#: list the merge of the segments before them.
-MERGE_LISTS = 8
 #: The widest candidate axis served: a lone request folds over 128 partitions of
 #: :data:`FOLD_COLUMNS_LIMIT` columns. A physical (SBUF) bound, not a policy.
 MAX_SELECT_CANDIDATES = PARTITIONS * FOLD_COLUMNS_LIMIT
-#: The widest candidate axis the decode indexer serves: the whole-row path, 16384 pools
-#: (a 64k context at four tokens a pool). Wider rows go through the segment merge, whose
-#: device results are not yet trusted (module docstring); the runner refuses a
-#: ``max_model_len`` past it (:func:`check_decode_index_context`).
-MAX_DECODE_INDEX_CANDIDATES = WHOLE_ROW_COLUMNS
+#: What a chunk list holds where it holds no id. It stays negative when shifted by any
+#: chunk's first candidate (below ``MAX_SELECT_CANDIDATES``), so the join's maximum never
+#: takes it over an id. A power of two, exact as an immediate.
+_LIST_PAD = -MAX_SELECT_CANDIDATES
+#: The whole-row chunks of the widest candidate axis whose chunk walk has run on trn2 in a
+#: decode graph: the capture build of the served graph (the same nodes plus copies of the
+#: selection), at one request per step, selected the torch oracle's ids on every DSA layer
+#: and rank. The walk is also checked against the torch oracle in the NKI simulator.
+DEVICE_CHECKED_ROW_CHUNKS = 4
+#: The widest candidate axis the decode indexer serves at one request per decode step; the
+#: runner refuses a ``max_model_len`` past it (:func:`check_decode_index_context`).
+MAX_DECODE_INDEX_CANDIDATES = DEVICE_CHECKED_ROW_CHUNKS * WHOLE_ROW_COLUMNS
+#: The widest candidate axis the decode indexer serves when a decode step batches more
+#: than one request (``max_num_seqs > 1``): the whole-row width. The chunk walk has run on
+#: trn2 at one request per step only.
+MAX_BATCHED_DECODE_INDEX_CANDIDATES = WHOLE_ROW_COLUMNS
+#: The widest per-rank candidate axis decode context parallelism serves
+#: (:func:`dsa_decode_select_pools`, :func:`check_decode_pools_context`): the whole-row
+#: width, the only path that reads each selected id's score.
+MAX_DECODE_POOLS_CANDIDATES = WHOLE_ROW_COLUMNS
 #: The longest chunk (columns per partition) whose ``k``-th search takes four-bit digits;
 #: a longer one takes single bits (module docstring, step 1). A digit step counts 15
 #: trials where a bit step counts one, and both end in one cross-partition sum: on a
@@ -242,14 +257,18 @@ def fold_layout(n: int, width: int, fold_cap: int) -> tuple[int, int, bool]:
     return fold, chunk, per_request < chunks_used
 
 
-def segments(width: int) -> tuple[int, int]:
-    """``(S, W)``: a ``width``-wide mask row compacts in ``S`` segments of ``W`` columns
-    (the last one ``width - (S - 1) * W``); one segment, the whole row, up to
-    :data:`WHOLE_ROW_COLUMNS`."""
-    if int(width) <= WHOLE_ROW_COLUMNS:
-        return 1, int(width)
-    count = _ceil_div(int(width), SEGMENT_COLUMNS)
-    return count, _ceil_div(int(width), count)
+def row_chunks(width: int) -> int:
+    """Chunks of :data:`WHOLE_ROW_COLUMNS` columns a ``width``-wide mask row is compacted
+    in: one, the whole row, up to that width."""
+    return _ceil_div(int(width), WHOLE_ROW_COLUMNS)
+
+
+def mask_span(width: int) -> int:
+    """The selection mask's width for a ``width``-wide candidate axis: the axis up to
+    :data:`WHOLE_ROW_COLUMNS`, past it :func:`row_chunks` whole chunks (the scores past the
+    axis are ``BOUND_FILL``, never selected)."""
+    chunks = row_chunks(width)
+    return int(width) if chunks == 1 else chunks * WHOLE_ROW_COLUMNS
 
 
 # ---------------------------------------------------------------------------------------
@@ -522,81 +541,90 @@ def _compact_whole_rows(mask_hbm, ids_hbm, r0, n, width, select_k):
         _gpsimd_copy(found, ids_hbm, row0, m, select_k, select_k, 0, False)
 
 
-def _merge_slots(slots, span, select_k):
-    """The first ``k`` ids of ``slots`` in order: ``[P, k]`` int32, ``-1`` past the ids,
-    rows ``[0, span)`` written.
+def _compact_row_chunks(mask_hbm, ids_hbm, lists_hbm, counts_hbm, r0, n, chunks, select_k):
+    """Each request's mask row compacted in ``chunks`` chunks of :data:`WHOLE_ROW_COLUMNS`
+    and the chunk lists joined: its ids to row ``r`` of ``ids_hbm``, ``-1`` after them.
 
-    ``slots`` is ``[P, MERGE_LISTS * k + 1]`` int32: on partition ``16 i`` up to
-    :data:`MERGE_LISTS` lists side by side, each its ids (``>= 0``) first and a negative
-    pad after them, and a last column of ``-1``. ``nonzero_with_count`` over "is an id"
-    gives the positions of the ids in order and ``nc_n_gather`` reads them.
+    Row ``q = r * chunks + c`` (``r`` counted from ``r0``) is chunk ``c`` of request ``r``
+    in each scratch: ``mask_hbm`` read as rows of :data:`WHOLE_ROW_COLUMNS`, ``lists_hbm``
+    (``[N, 1]`` int32, so that a window offset counts single ids) as rows of ``2 k``, and
+    ``counts_hbm`` (``[N, 1]`` int32).
+
+    1. One ``nonzero_with_count`` per eight rows, on partitions ``16 i``. Its first ``k``
+       columns go to the second half of the row's list, behind ``k`` columns of
+       :data:`_LIST_PAD` written for every row by one DMA, and its count to ``counts_hbm``.
+       One DMA per row (:func:`_gpsimd_copy`).
+    2. On partition 0: ``start[q] = k - p``, ``p`` the ids of the request's chunks below
+       ``c``. A request selects at most ``k``, so ``0 <= start <= k``.
+    3. One DMA per row reads ``k`` columns of its list from column ``start[q]``, an SBUF
+       offset read when the DMA runs, into columns ``[c k, (c + 1) k)`` of the request's
+       partition. The chunk's ids land at their places in the joined list (``p`` onward);
+       the rest of the window is pad, the prefix's or the list's own.
+    4. Each window is shifted by its chunk's first candidate (a pad stays negative) and
+       the windows join by an element-wise maximum; a place that no chunk fills becomes
+       ``-1``.
     """
-    wide = MERGE_LISTS * select_k
-    out = _gpsimd_dst((PARTITIONS, select_k), nl.int32)
-    valid = _sb((PARTITIONS, wide), nl.float32)
-    nisa.tensor_scalar(dst=valid, data=slots[:, 0:wide], op0=nl.greater_equal, operand0=0.0)
-    # Positions of the ids in order; past them, the always-(-1) last column.
-    # nonzero_with_count writes partitions 16 i only and a compute instruction may not
-    # start on one of them, so one gather spans them all, the partitions between
-    # gathering column 0.
-    found = _gpsimd_dst((PARTITIONS, wide + 1), nl.int32)
-    nisa.memset(dst=found[0:span, 0:select_k], value=0)
-    nisa.nonzero_with_count(dst=found, src=valid, index_offset=0, padding_val=wide)
-    nisa.nc_n_gather(dst=out[0:span, 0:select_k], data=slots[0:span, 0:wide + 1],
-                     indices=found[0:span, 0:select_k].view(nl.uint32))
-    return out
+    chunk_cols = WHOLE_ROW_COLUMNS
+    list_cols = 2 * select_k
+    rows_n = n * chunks
+    row0 = r0 * chunks
 
+    # ---- 1. chunk lists behind a pad prefix, and their counts ---------------------------
+    prefix = _sb((rows_n, select_k), nl.int32)
+    nisa.memset(dst=prefix, value=_LIST_PAD)
+    nisa.dma_copy(dst=lists_hbm.ap(pattern=[[list_cols, rows_n], [1, select_k]],
+                                   offset=row0 * list_cols), src=prefix)
+    for g in range(_ceil_div(rows_n, COMPACT_ROWS)):
+        m = min(COMPACT_ROWS, rows_n - g * COMPACT_ROWS)
+        group_row = row0 + g * COMPACT_ROWS
+        found = _gpsimd_dst((PARTITIONS, chunk_cols + 1), nl.int32)
+        rows = _sb((PARTITIONS, chunk_cols), nl.float32)
+        _gpsimd_copy(rows, mask_hbm, group_row, m, chunk_cols, chunk_cols, 0, True)
+        nisa.nonzero_with_count(dst=found, src=rows, index_offset=0, padding_val=_LIST_PAD)
+        _gpsimd_copy(found, lists_hbm, group_row, m, select_k, list_cols, select_k, False)
+        for i in range(m):
+            part = GPSIMD_STRIDE * i
+            nisa.dma_copy(dst=counts_hbm.ap(pattern=[[1, 1], [1, 1]], offset=group_row + i),
+                          src=found[part:part + 1, chunk_cols:chunk_cols + 1])
 
-def _compact_segments(mask_hbm, ids_hbm, zeros_hbm, r0, n, width, select_k):
-    """Each request's mask row in ``S`` segments, compacted and merged on the request's
-    own GpSimd partition; its ids to row ``r`` of ``ids_hbm``.
+    # ---- 2. each window's start: k minus the ids of the request's lower chunks ---------
+    counts = _sb((1, rows_n), nl.int32)
+    nisa.dma_copy(dst=counts, src=counts_hbm.ap(pattern=[[rows_n, 1], [1, rows_n]],
+                                                offset=row0))
+    held = _sb((1, rows_n), nl.float32)  # a count of at most k: exact
+    nisa.tensor_copy(dst=held, src=counts)
+    start_f = _sb((1, rows_n), nl.float32)
+    nisa.memset(dst=start_f, value=float(select_k))
+    held_rc = held.reshape((1, n, chunks))
+    start_rc = start_f.reshape((1, n, chunks))
+    for c in range(1, chunks):
+        nisa.tensor_tensor(dst=start_rc[0:1, 0:n, c:c + 1],
+                           data1=start_rc[0:1, 0:n, c - 1:c],
+                           data2=held_rc[0:1, 0:n, c - 1:c], op=nl.subtract)
+    start = _sb((1, rows_n), nl.int32)
+    nisa.tensor_copy(dst=start, src=start_f)
 
-    One ``nonzero_with_count`` compacts segment ``s`` of eight requests, so its
-    ``index_offset`` (the segment's first candidate) turns positions into candidate ids;
-    its first ``k`` columns go to the next free slot of the requests' slot tile
-    (:func:`_merge_slots`) by a copy on the same partitions. A full tile merges into its
-    first slot and the next segment takes the second. The lists never go through HBM:
-    written to an HBM scratch and read back for the merge, a request's lists past the
-    first came back as zeros on the device (``B = 16``, 32768 candidates; the simulator
-    was exact). A short last segment's pad columns are zeroed
-    by a DMA from ``zeros_hbm``: a compute instruction may not start on partition
-    ``16 i``.
-    """
-    count, seg = segments(width)
-    wide = MERGE_LISTS * select_k
-    for g in range(_ceil_div(n, COMPACT_ROWS)):
-        m = min(COMPACT_ROWS, n - g * COMPACT_ROWS)
-        row0 = r0 + g * COMPACT_ROWS
-        # Partitions 0 .. 16 (m - 1): every compute instruction here starts on partition 0.
-        span = GPSIMD_STRIDE * (m - 1) + 1
-        slots = _sb((PARTITIONS, wide + 1), nl.int32)
-        nisa.memset(dst=slots, value=-1)
-        used = 0
-        for s in range(count):
-            if used == MERGE_LISTS:
-                merged = _merge_slots(slots, span, select_k)
-                slots = _sb((PARTITIONS, wide + 1), nl.int32)
-                nisa.memset(dst=slots, value=-1)
-                nisa.tensor_copy(dst=slots[0:span, 0:select_k],
-                                 src=merged[0:span, 0:select_k])
-                used = 1
-            first = s * seg
-            cols = min(seg, width - first)
-            found = _gpsimd_dst((PARTITIONS, seg + 1), nl.int32)
-            rows = _sb((PARTITIONS, seg), nl.float32)
-            _gpsimd_copy(rows, mask_hbm, row0, m, cols, width, first, True)
-            for i in range(m if cols < seg else 0):
-                part = GPSIMD_STRIDE * i
-                nisa.dma_copy(dst=rows[part:part + 1, cols:seg],
-                              src=zeros_hbm.ap(pattern=[[seg - cols, 1], [1, seg - cols]],
-                                               offset=0))
-            nisa.nonzero_with_count(dst=found, src=rows, index_offset=first,
-                                    padding_val=SENTINEL)
-            nisa.tensor_copy(dst=slots[0:span, used * select_k:(used + 1) * select_k],
-                             src=found[0:span, 0:select_k])
-            used += 1
-        _gpsimd_copy(_merge_slots(slots, span, select_k), ids_hbm, row0, m, select_k, select_k,
-                     0, False)
+    # ---- 3. the windows: each chunk's ids at their places in the joined list -----------
+    windows = _sb((n, chunks * select_k), nl.int32)
+    for r in range(n):
+        for c in range(chunks):
+            q = r * chunks + c
+            nisa.dma_copy(dst=windows[r:r + 1, c * select_k:(c + 1) * select_k],
+                          src=lists_hbm.ap(pattern=[[list_cols, 1], [1, select_k]],
+                                           offset=(row0 + q) * list_cols,
+                                           scalar_offset=start[0:1, q:q + 1],
+                                           indirect_dim=0))
+
+    # ---- 4. the join: candidate ids, the largest of the windows at each place ----------
+    ids = _sb((n, select_k), nl.int32)
+    nisa.tensor_copy(dst=ids, src=windows[0:n, 0:select_k])
+    for c in range(1, chunks):
+        nisa.scalar_tensor_tensor(dst=ids, data=windows[0:n, c * select_k:(c + 1) * select_k],
+                                  op0=nl.add, operand0=float(c * chunk_cols), op1=nl.maximum,
+                                  operand1=ids)
+    nisa.tensor_scalar(dst=ids, data=ids, op0=nl.maximum, operand0=-1)
+    nisa.dma_copy(dst=ids_hbm.ap(pattern=[[select_k, n], [1, select_k]], offset=r0 * select_k),
+                  src=ids)
 
 
 def _rows_past_pad(tile, hbm, row0, m, cols):
@@ -676,25 +704,27 @@ def _select_rows(bounded_hbm, mask_hbm, r0, n, select_k, fold_cap, span):
     _fold_copy(mask_hbm, mask, r0, n, span, chunk, fold, request_major, False)
 
 
-def _select_tile(bounded_hbm, lens_hbm, out_hbm, mask_hbm, ids_hbm, zeros_hbm, tok_hbm,
-                 r0, n, select_k, pool_size, out_cols, fold_cap, span, values_hbm):
+def _select_tile(bounded_hbm, lens_hbm, out_hbm, mask_hbm, ids_hbm, lists_hbm, counts_hbm,
+                 tok_hbm, r0, n, select_k, pool_size, out_cols, fold_cap, span, values_hbm):
     """Requests ``r0 .. r0 + n - 1``: select (into the scratch), compact, expand.
 
-    ``span``: the mask width, the candidate axis or (:func:`dsa_decode_select_pools` on an
-    axis of at most ``k`` pools) wider, the columns past the axis at ``BOUND_FILL``.
+    ``span``: the mask width, wider than the candidate axis where the columns past it are
+    ``BOUND_FILL``: :func:`mask_span`, or (:func:`dsa_decode_select_pools` on an axis of at
+    most ``k`` pools) :func:`select_span`. ``lists_hbm`` / ``counts_hbm``: the chunk walk's
+    scratches (:func:`_compact_row_chunks`), ``None`` on the whole-row path.
     ``values_hbm``: ``None``, or where the selected scores go beside the ids
     (:func:`_compact_pool_rows`, the whole-row path only).
     """
     _select_rows(bounded_hbm, mask_hbm, r0, n, select_k, fold_cap, span)
 
     # ---- compaction: rows on the GpSimd cores' first partitions -------------------------
-    count, _seg = segments(span)
+    chunks = row_chunks(span)
     if values_hbm is not None:
         _compact_pool_rows(mask_hbm, bounded_hbm, ids_hbm, values_hbm, r0, n, span, select_k)
-    elif count == 1:
+    elif chunks == 1:
         _compact_whole_rows(mask_hbm, ids_hbm, r0, n, span, select_k)
     else:
-        _compact_segments(mask_hbm, ids_hbm, zeros_hbm, r0, n, span, select_k)
+        _compact_row_chunks(mask_hbm, ids_hbm, lists_hbm, counts_hbm, r0, n, chunks, select_k)
 
     # ---- expansion: pool p -> tokens p * pool + t; -1 stays -1 --------------------------
     spread = 1
@@ -780,27 +810,27 @@ def dsa_decode_select_kernel(bounded_hbm, lens_hbm, select_k, pool_size, out_col
     in tiles of up to :func:`tile_requests` requests.
     """
     batch = bounded_hbm.shape[0]
-    width = bounded_hbm.shape[1]
+    span = mask_span(bounded_hbm.shape[1])
+    chunks = row_chunks(span)
     out_hbm = nl.ndarray((batch, out_cols), dtype=nl.int32, buffer=nl.shared_hbm)
-    mask_hbm = nl.ndarray((batch, width), dtype=nl.float32, buffer=nl.private_hbm)
+    mask_hbm = nl.ndarray((batch, span), dtype=nl.float32, buffer=nl.private_hbm)
     ids_hbm = nl.ndarray((batch, select_k), dtype=nl.int32, buffer=nl.private_hbm)
-    count, _seg = segments(width)
     tok_hbm = nl.ndarray((batch, select_k * pool_size), dtype=nl.int32,
                          buffer=nl.private_hbm)
-    # Zeros for a short last segment's pad columns (one row of SEGMENT_COLUMNS).
-    zeros_hbm = nl.ndarray((1, SEGMENT_COLUMNS), dtype=nl.float32, buffer=nl.private_hbm)
-    if count > 1 and width % count != 0:
-        zero_cols = SEGMENT_COLUMNS // PARTITIONS
-        zero_sb = _sb((PARTITIONS, zero_cols), nl.float32)
-        nisa.memset(dst=zero_sb, value=0.0)
-        nisa.dma_copy(dst=zeros_hbm.ap(pattern=[[zero_cols, PARTITIONS], [1, zero_cols]],
-                                       offset=0), src=zero_sb)
-    lo, hi, per_tile, n_tiles = _program_share(batch, width)
+    lists_hbm = None
+    counts_hbm = None
+    if chunks > 1:
+        # The chunk walk's scratches (_compact_row_chunks): a list row of 2 k ids and a
+        # count per (request, chunk), one column each so that an offset counts single ids.
+        lists_hbm = nl.ndarray((batch * chunks * 2 * select_k, 1), dtype=nl.int32,
+                               buffer=nl.private_hbm)
+        counts_hbm = nl.ndarray((batch * chunks, 1), dtype=nl.int32, buffer=nl.private_hbm)
+    lo, hi, per_tile, n_tiles = _program_share(batch, span)
     for t in range(n_tiles):
         r0 = lo + t * per_tile
         n = min(per_tile, hi - r0)
-        _select_tile(bounded_hbm, lens_hbm, out_hbm, mask_hbm, ids_hbm, zeros_hbm, tok_hbm,
-                     r0, n, select_k, pool_size, out_cols, fold_cap, width, None)
+        _select_tile(bounded_hbm, lens_hbm, out_hbm, mask_hbm, ids_hbm, lists_hbm, counts_hbm,
+                     tok_hbm, r0, n, select_k, pool_size, out_cols, fold_cap, span, None)
     return out_hbm
 
 
@@ -850,9 +880,9 @@ def dsa_decode_select_pools_kernel(bounded_hbm, lens_hbm, select_k, pool_size, o
     for t in range(n_tiles):
         r0 = lo + t * per_tile
         n = min(per_tile, hi - r0)
-        # No segment scratch: the whole-row path only.
-        _select_tile(bounded_hbm, lens_hbm, out_hbm, mask_hbm, pool_ids_hbm, None, tok_hbm,
-                     r0, n, select_k, pool_size, out_cols, fold_cap, span, values_hbm)
+        # No chunk walk scratches: the whole-row path only.
+        _select_tile(bounded_hbm, lens_hbm, out_hbm, mask_hbm, pool_ids_hbm, None, None,
+                     tok_hbm, r0, n, select_k, pool_size, out_cols, fold_cap, span, values_hbm)
     return out_hbm, values_hbm, pool_ids_hbm
 
 
@@ -868,30 +898,60 @@ def decode_select_programs(batch: int) -> int:
     return 1
 
 
-def check_decode_index_context(max_model_len: int, pool_size: int | None) -> None:
+def check_decode_index_context(max_model_len: int, pool_size: int | None,
+                               max_num_seqs: int) -> None:
     """Refuse a ``max_model_len`` whose decode candidate axis is past the served width.
 
     Args:
         max_model_len: the longest context the runner serves.
         pool_size: the model's tokens per pool (``index_kpool``); ``None`` for a model
             with no DSA indexer, which is not checked.
+        max_num_seqs: the most requests one decode step batches.
 
     Raises:
         DecodeSelectError: ``max_model_len // pool_size`` (the candidate axis of the
-            ``max_model_len`` decode graph) is above :data:`MAX_DECODE_INDEX_CANDIDATES`.
+            ``max_model_len`` decode graph) is above :data:`MAX_DECODE_INDEX_CANDIDATES`,
+            or above :data:`MAX_BATCHED_DECODE_INDEX_CANDIDATES` at ``max_num_seqs > 1``.
     """
+    if int(max_num_seqs) > 1:
+        _check_context(max_model_len, pool_size, MAX_BATCHED_DECODE_INDEX_CANDIDATES,
+                       "MAX_BATCHED_DECODE_INDEX_CANDIDATES",
+                       f"the DSA decode indexer at max_num_seqs={max_num_seqs}",
+                       "Lower max_model_len or set max_num_seqs=1.")
+    _check_context(max_model_len, pool_size, MAX_DECODE_INDEX_CANDIDATES,
+                   "MAX_DECODE_INDEX_CANDIDATES", "the DSA decode indexer")
+
+
+def check_decode_pools_context(rank_context: int, pool_size: int | None) -> None:
+    """Refuse a decode context parallel rank whose candidate axis is past the width
+    :func:`dsa_decode_select_pools` serves.
+
+    Args:
+        rank_context: the tokens one rank's decode indexer covers.
+        pool_size: as :func:`check_decode_index_context`.
+
+    Raises:
+        DecodeSelectError: ``rank_context // pool_size`` is above
+            :data:`MAX_DECODE_POOLS_CANDIDATES`.
+    """
+    _check_context(rank_context, pool_size, MAX_DECODE_POOLS_CANDIDATES,
+                   "MAX_DECODE_POOLS_CANDIDATES", "the decode context parallel selection")
+
+
+def _check_context(context, pool_size, limit, limit_name, selection,
+                   remedy="Lower max_model_len."):
+    """Raise :class:`DecodeSelectError` when ``context // pool_size`` candidates exceed
+    ``limit`` (named ``limit_name``, served by ``selection``; the message ends with
+    ``remedy``); no check at ``pool_size`` ``None``."""
     if pool_size is None:
         return
-    candidates = int(max_model_len) // int(pool_size)
-    if candidates > MAX_DECODE_INDEX_CANDIDATES:
-        longest = (MAX_DECODE_INDEX_CANDIDATES + 1) * int(pool_size) - 1
+    candidates = int(context) // int(pool_size)
+    if candidates > limit:
+        longest = (limit + 1) * int(pool_size) - 1
         raise DecodeSelectError(
-            f"max_model_len={max_model_len} needs {candidates} decode index candidates "
-            f"(index_kpool={pool_size}); the DSA decode indexer serves up to "
-            f"MAX_DECODE_INDEX_CANDIDATES={MAX_DECODE_INDEX_CANDIDATES} (max_model_len <= "
-            f"{longest}). Past that width the selection merges row segments, which returned "
-            f"wrong rows on trn2 in ways that depend on the surrounding graph (an open "
-            f"defect, indexer report section 4.3). Lower max_model_len.")
+            f"max_model_len={context} needs {candidates} decode index candidates "
+            f"(index_kpool={pool_size}); {selection} serves up to {limit_name}={limit} "
+            f"(max_model_len <= {longest}). {remedy}")
 
 
 def _validate_scores(bounded: Tensor, select_k) -> tuple[int, int]:
@@ -985,9 +1045,19 @@ def dsa_decode_select(bounded: Tensor, seq_lens: Tensor, *, select_k: int,
     call = wrap_nki(dsa_decode_select_kernel)
     if programs == 2:
         call = call[2]
-    return call(bounded.contiguous(), seq_lens.reshape(batch, 1).to(torch.int32).contiguous(),
-                int(select_k), int(pool_size), out_cols, int(select_fold_cap(width)),
-                SOURCE_DIGEST)
+    tokens = call(bounded.contiguous(), seq_lens.reshape(batch, 1).to(torch.int32).contiguous(),
+                  int(select_k), int(pool_size), out_cols, int(select_fold_cap(width)),
+                  SOURCE_DIGEST)
+    # Under a tensor-capture config the kernel's inputs and output become graph outputs,
+    # to compare with dsa_decode_select_torch_oracle offline; without one these calls
+    # trace nothing. A local import, as in functional/sampling.py: debug code that the
+    # kernel module's importers do not need.
+    from vllm_neuron.accuracy.tensor_capture import capture_tensor
+
+    capture_tensor("dsa_decode_select.bounded", bounded)
+    capture_tensor("dsa_decode_select.seq_lens", seq_lens)
+    capture_tensor("dsa_decode_select.tokens", tokens)
+    return tokens
 
 
 # ---------------------------------------------------------------------------------------
@@ -1015,11 +1085,11 @@ def _validate_pools(bounded: Tensor, seq_lens: Tensor, select_k, pool_size) -> t
         raise DecodeSelectError(f"pool_size must be a power-of-two python int; got "
                                 f"{pool_size!r}")
     span = select_span(width, select_k)
-    if span > MAX_DECODE_INDEX_CANDIDATES:
+    if span > MAX_DECODE_POOLS_CANDIDATES:
         raise DecodeSelectError(
-            f"a {width}-wide candidate axis is past MAX_DECODE_INDEX_CANDIDATES="
-            f"{MAX_DECODE_INDEX_CANDIDATES}, the whole-row width; wider rows take the segment "
-            f"merge, an open defect on trn2 (module docstring)")
+            f"a {width}-wide candidate axis is past MAX_DECODE_POOLS_CANDIDATES="
+            f"{MAX_DECODE_POOLS_CANDIDATES}, the whole-row width: the only path that reads "
+            f"each selected id's score")
     if seq_lens.ndim != 1 or int(seq_lens.shape[0]) != batch:
         raise DecodeSelectError(f"seq_lens must be [B] = [{batch}]; got "
                                 f"{tuple(seq_lens.shape)}")
