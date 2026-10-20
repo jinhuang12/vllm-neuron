@@ -28,6 +28,7 @@ from transformers import PretrainedConfig
 from vllm_neuron.model.glm5_next.collective_policy import (
     RowParallelSite,
     StepRows,
+    allreduce_wire_dtype,
     gather_sequence,
     reduce_row_parallel,
     scatter_row_parallel,
@@ -475,6 +476,20 @@ def _row_parallel_sum(
     if shard is not None and shard.shards(int(partial.shape[0])):
         return scatter_row_parallel(partial, site=site, group=group, steps=steps)
     return reduce_row_parallel(partial, site=site, group=group, steps=steps)
+
+
+def _row_parallel_wire_dtype(rows: int, *, module: nn.Module) -> torch.dtype | None:
+    """The dtype :func:`_row_parallel_sum` rounds a ``rows``-row fp32 partial to, or None.
+
+    None when the partial crosses no wire (world size one) or crosses it in fp32: there
+    a producer that rounded early would change the sum. Either collective reads the same
+    rule, ``collective_policy.allreduce_wire_dtype`` at ``module.step_rows``'s phase for
+    the whole chunk's row count, so a producer can ask before it computes the partial.
+    """
+    if _resolve_tp_group() is None:
+        return None
+    wire = allreduce_wire_dtype(module.step_rows.phase(int(rows)))
+    return None if wire is torch.float32 else wire
 
 
 def _resolve_dcp_size() -> int | None:
@@ -1923,6 +1938,7 @@ class Glm5NextRoutedExperts(nn.Module):
         packed_weights: torch.Tensor | None = None,
         packed_scales: torch.Tensor | None = None,
         collector: list[torch.Tensor] | None = None,
+        keep_fp32_sum: bool = False,
     ) -> torch.Tensor:
         """Route, compute and combine this rank's block-quant expert outputs.
 
@@ -1973,6 +1989,11 @@ class Glm5NextRoutedExperts(nn.Module):
             collector: when given, receives the mapping's token-position tensor and,
                 on the packed route, the combine's count of routed pairs the
                 emission does not hold (``_token_gather_combine``).
+            keep_fp32_sum: on the packed route, return the combine's fp32 sum
+                without the cast to the activation dtype, for a caller that adds it
+                to another fp32 value before one rounding
+                (:meth:`Glm5NextMoEBlock.forward`). The other route returns its
+                kernels' dtype either way.
 
         Returns:
             ``[T, H]`` -- the padding-token row is sliced off. The dtype is the
@@ -2262,14 +2283,15 @@ class Glm5NextRoutedExperts(nn.Module):
             # scatter-adding every emitted row: the emission is sized for the worst
             # case and is mostly padding, and a device ``index_add`` over it runs as a
             # serial GpSimd accumulate.
-            return _token_gather_combine(
+            combined = _token_gather_combine(
                 contribution,
                 expert_affinities,
                 block,
                 rows,
                 int(self.num_experts_per_tok),
                 collector,
-            ).to(hidden_states.dtype)
+            )
+            return combined if keep_fp32_sum else combined.to(hidden_states.dtype)
         else:
             # ---- The padding-token slot, appended after the mapping. ----- #
             # these kernels read a ``-1`` token position as the last row of
@@ -2497,6 +2519,7 @@ class Glm5NextRoutedExperts(nn.Module):
         tp_degree: int = 1,
         expert_parallel_rank: int | torch.Tensor = 0,
         collector: list[torch.Tensor] | None = None,
+        keep_fp32_sum: bool = False,
     ) -> torch.Tensor:
         """Run this rank's routed experts over ``[T, H]`` tokens.
 
@@ -2511,9 +2534,11 @@ class Glm5NextRoutedExperts(nn.Module):
             tp_degree: ranks sharding each expert's intermediate dimension.
             expert_parallel_rank: which rank's expert slice to select, as an
                 int64 device tensor (one graph for every rank) or a python int.
+            keep_fp32_sum: forwarded to :meth:`block_quant_expert_mm`.
 
         Returns:
-            ``[T, H]`` in the kernel's own dtype.
+            ``[T, H]`` in the kernel's own dtype, or the fp32 sum with
+            ``keep_fp32_sum`` on the packed route.
 
         Raises:
             Glm5NextBlockQuantRouteError: if the load-time prep has not run, and
@@ -2536,6 +2561,7 @@ class Glm5NextRoutedExperts(nn.Module):
             packed_weights=self._prepared_kernel_operand("packed_weights"),
             packed_scales=self._prepared_kernel_operand("packed_scales"),
             collector=collector,
+            keep_fp32_sum=keep_fp32_sum,
         )
 
 
@@ -2757,6 +2783,7 @@ class Glm5NextSharedExperts(nn.Module):
         up_proj_scale: torch.Tensor,
         down_proj_scale: torch.Tensor,
         quant_config: Glm5NextQuantConfig,
+        addend: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run the always-on shared expert through the dense block gemm.
 
@@ -2787,6 +2814,10 @@ class Glm5NextSharedExperts(nn.Module):
             down_proj_scale: ``[I//128, H//128]`` fp32, for ``down_proj_weight``.
             quant_config: the resolved per-model quantisation policy, and the
                 route selector.
+            addend: ``[T, H]`` fp32 added inside the prefill MLP kernel before its
+                one rounding to bf16, or None. Only that kernel takes it
+                (``blockwise_fp8_mlp``, which refuses it on any other route), so
+                ``T`` is a whole number of tiles and nothing is padded.
 
         The SwiGLU bound is not an argument. It is ``self.swiglu_limit``,
         resolved from ``text_config.swiglu_limit`` in ``__init__``, so this method
@@ -2795,7 +2826,8 @@ class Glm5NextSharedExperts(nn.Module):
 
         Returns:
             ``[T, H]`` fp32 -- the kernel's own return dtype, not re-cast here.
-            The layer forward decides the residual dtype.
+            The layer forward decides the residual dtype. With ``addend``,
+            ``(shared + addend).to(bf16)``.
 
         Raises:
             Glm5NextSharedExpertRouteError: when ``quant_config`` resolved no
@@ -2888,6 +2920,7 @@ class Glm5NextSharedExperts(nn.Module):
                     self._prepared_scale_operand("up_proj"),
                     self._prepared_scale_operand("down_proj"),
                 ),
+                addend=addend,
             ),
             tokens,
         )
@@ -3050,6 +3083,7 @@ class Glm5NextMoEBlock(nn.Module):
         down_proj_scale: torch.Tensor,
         quant_config: Glm5NextQuantConfig,
         collector: list[torch.Tensor] | None = None,
+        add_in_kernel: bool = False,
     ) -> torch.Tensor:
         """``routed_output + shared_expert(hidden_states)`` -- the layer output.
 
@@ -3070,14 +3104,21 @@ class Glm5NextMoEBlock(nn.Module):
             quant_config: as above.
             collector: when given, the shared half's own result is appended to it
                 on the way through, for the layer dump. Nothing else changes.
+            add_in_kernel: hand ``routed_output`` (fp32) to the shared expert's
+                prefill kernel as its addend, so the sum is rounded to bf16 once in
+                the kernel's store and no separate add runs. The caller asks only
+                where that kernel runs and the sum is rounded to bf16 next anyway
+                (:meth:`forward`). Not with ``collector``: the dump keeps the
+                shared half on its own.
 
         The SwiGLU bound is neither an argument here nor forwarded: the shared
         expert this class built holds it, so the bound reaches the clamp without
         passing through this method at all.
 
         Returns:
-            ``[T, H]`` fp32 -- the sum, in the shared half's fp32 kernel dtype.
-            The residual dtype for the decoder layer is the layer forward's.
+            ``[T, H]`` fp32 -- the sum, in the shared half's fp32 kernel dtype; with
+            ``add_in_kernel``, the same sum rounded once to bf16. The residual dtype
+            for the decoder layer is the layer forward's.
 
         Raises:
             Glm5NextSharedExpertRouteError: when this class declares no shared
@@ -3097,6 +3138,34 @@ class Glm5NextMoEBlock(nn.Module):
                 "no shared expert (n_shared_experts == 0), so there is no shared "
                 "contribution to add. The routed output is already the layer "
                 "output on such a block and calling this method is the bug."
+            )
+
+        if add_in_kernel:
+            if collector is not None or routed_output.dtype != torch.float32:
+                raise Glm5NextSharedExpertRouteError(
+                    f"add_in_kernel adds an fp32 routed sum inside the shared "
+                    f"expert's kernel and keeps no shared half for a dump; got "
+                    f"{routed_output.dtype} with a collector "
+                    f"{'given' if collector is not None else 'absent'}"
+                )
+            # The extent check of the add below, before the kernel reads the rows.
+            if tuple(routed_output.shape) != tuple(hidden_states.shape):
+                raise Glm5NextSharedExpertRouteError(
+                    f"routed_output has shape {tuple(routed_output.shape)} and the "
+                    f"shared expert's rows {tuple(hidden_states.shape)}; the kernel "
+                    f"adds them row for row"
+                )
+            # The one add, in the shared kernel's store.
+            return shared_experts.shared_expert_mm(
+                hidden_states,
+                gate_proj_weight,
+                up_proj_weight,
+                down_proj_weight,
+                gate_proj_scale,
+                up_proj_scale,
+                down_proj_scale,
+                quant_config,
+                addend=routed_output,
             )
 
         # The one call to the shared path.
@@ -3166,6 +3235,8 @@ class Glm5NextMoEBlock(nn.Module):
         expert_parallel_rank: int | torch.Tensor = 0,
         collector: list[torch.Tensor] | None = None,
         router_scaled: torch.Tensor | None = None,
+        partial_dtype: torch.dtype | None = None,
+        prefill_step: bool = False,
     ) -> torch.Tensor:
         """One sparse layer's MLP: route, run this rank's experts, add the shared.
 
@@ -3190,10 +3261,21 @@ class Glm5NextMoEBlock(nn.Module):
                 handed to ``route_tokens`` as ``scaled``. Under the prefill sequence
                 shard the site gathers it and not ``hidden_states``, which is then one
                 rank's share of the rows and is not read.
+            partial_dtype: the dtype the caller rounds this output to before its
+                row-parallel sum, or None when it sums in fp32. With bfloat16 the
+                routed-plus-shared add runs in the shared expert's prefill kernel,
+                on a prefill step where that kernel runs and the bank returns its
+                fp32 sum: the same one rounding, with no separate full-width pass.
+            prefill_step: whether the call is a prefill chunk, by the step rule the
+                caller's reduction reads (``collective_policy.StepRows``). Only a
+                prefill chunk reads the shared expert's operands before the bank
+                runs, to test the kernel's route; every other step reads them at the
+                add, so its graph keeps the input order it has without the move.
 
         Returns:
-            ``[T, H]`` in the kernels' own dtype. The residual dtype is the layer
-            forward's decision, not this method's.
+            ``[T, H]`` in the kernels' own dtype: fp32, or bf16 when the add ran in
+            the shared kernel. The residual dtype is the layer forward's decision,
+            not this method's.
 
         Raises:
             Glm5NextBlockQuantRouteError: whatever the bank refuses.
@@ -3234,6 +3316,28 @@ class Glm5NextMoEBlock(nn.Module):
                 expert_affinities,
             ]
 
+        from vllm_neuron.functional.blockwise_fp8_mm import prefill_mlp_takes
+
+        # The add moves into the shared kernel only on a prefill chunk where it is
+        # rounded to bf16 next anyway, that kernel runs, and no dump reads the two
+        # halves apart; the bank then keeps its fp32 sum, which the graph's own add
+        # reads unrounded too (the compiler drops the cast's round trip). The route
+        # test reads the shared operands, and a graph takes its inputs in the order
+        # it first reads them, so only such a chunk reads them before the bank; every
+        # other call reads them at the add below and keeps its graph's input order.
+        shared_experts = getattr(self, "shared_experts", None)
+        shared_operands = None
+        add_in_kernel = False
+        if (
+            prefill_step
+            and partial_dtype is torch.bfloat16
+            and collector is None
+            and shared_experts is not None
+        ):
+            shared_operands = shared_experts.scale_route_operands()
+            add_in_kernel = prefill_mlp_takes(
+                normed_hidden_states, *shared_operands[:3]
+            )
         routed_output = self.experts(
             normed_hidden_states,
             expert_affinities,
@@ -3243,20 +3347,23 @@ class Glm5NextMoEBlock(nn.Module):
             tp_degree=tp_degree,
             expert_parallel_rank=expert_parallel_rank,
             **({"collector": collector} if collector is not None else {}),
+            **({"keep_fp32_sum": True} if add_in_kernel else {}),
         )
 
         if collector is not None:
             collector.append(routed_output)
 
-        shared_experts = getattr(self, "shared_experts", None)
         if shared_experts is None:
             return routed_output
+        if shared_operands is None:
+            shared_operands = shared_experts.scale_route_operands()
         return self.combine_routed_and_shared(
             routed_output,
             normed_hidden_states,
-            *shared_experts.scale_route_operands(),
+            *shared_operands,
             quant_config,
             collector=collector,
+            add_in_kernel=add_in_kernel and routed_output.dtype == torch.float32,
         )
 
 
@@ -9948,6 +10055,9 @@ class Glm5NextModel(nn.Module):
             collector.append(normed)
         mlp = layer.mlp
         if isinstance(mlp, Glm5NextMoEBlock):
+            # The reduction below rounds the sum's partial to its wire dtype first,
+            # so on a prefill chunk, by the step rule that reduction reads, the
+            # block may hand it over already rounded once.
             out = mlp(
                 hidden_states,
                 normed,
@@ -9960,6 +10070,8 @@ class Glm5NextModel(nn.Module):
                 tp_degree=tp_degree,
                 expert_parallel_rank=expert_parallel_rank,
                 router_scaled=scaled,
+                partial_dtype=_row_parallel_wire_dtype(normed.shape[0], module=layer),
+                prefill_step=layer.step_rows.phase(int(normed.shape[0])) == "prefill",
             )
         elif isinstance(mlp, Glm5NextDenseMLP):
             out = mlp(normed, quant_config=quant_config)
