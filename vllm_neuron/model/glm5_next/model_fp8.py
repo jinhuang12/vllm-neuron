@@ -6609,8 +6609,8 @@ class Glm5NextDSAIndexer(nn.Module):
         the second ``[tokens, candidates / 8]`` uint8. Only a selecting prefill call
         without DCP has a table to make, and any other call refuses the flag.
 
-        Indices alone is deliberate: the ``-1`` mask stays inside the sparse
-        kernel, so no per-row valid length leaves this class -- returning one would
+        No per-row valid length is returned, with the indices or with the keep table:
+        the ``-1`` mask stays inside the sparse kernel, and a returned length would
         give a caller a second, contradictory way to bound the same kernel.
         :meth:`expand_indices` states why.
 

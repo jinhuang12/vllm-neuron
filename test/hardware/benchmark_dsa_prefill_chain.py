@@ -3,7 +3,7 @@
 
 Two subcommands.
 
-``run`` (device; through the lease, which pins the cores and the LNC -- this script
+``run`` (device; the caller pins the cores and the LNC -- this script
 selects none). One process times ONE graph: ``--layers`` (default 11, the model's DSA
 layer count) layers of the prefill indexer chain at ``--cands`` candidate pools, as
 ``Glm5NextDSAIndexer`` runs it on one rank after the row cut, with every operand drawn
@@ -230,7 +230,7 @@ def cmd_run(args) -> None:
     if os.environ.get("VLLM_NEURON_CPU_MODE") == "1" or os.environ.get("NKI_SIMULATOR"):
         raise ValueError("Hardware benchmark cannot run in CPU mode or the NKI simulator")
     if not os.environ.get("NEURON_RT_VISIBLE_CORES"):
-        raise ValueError("Run under the device lease, which pins NEURON_RT_VISIBLE_CORES")
+        raise ValueError("Set NEURON_RT_VISIBLE_CORES to the cores this run may use")
     if not args.use_compile_cache:
         # The graph cache key ignores kernel bodies, so an edited kernel could otherwise be
         # timed from a stale NEFF.

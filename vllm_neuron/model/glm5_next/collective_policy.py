@@ -27,8 +27,9 @@ which on the device is trace time:
     8 MiB bf16 operation takes 156.57 us against 261.58 us for the fused 16 MiB fp32
     one, so the 90 sites of a 1024-token chunk save 9.45 ms, about 2.42 s at 262,127
     tokens; against the compiler's tiled fp32 form, the served model's per-piece
-    transfer times give 3.61 s. The cast is not counted. The user approved the
-    numerics tolerance on 2026-10-14.
+    transfer times give 3.61 s. The cast is not counted. The bf16 sums are not bitwise
+    the ``fp32`` wire's, so this switch is held to a numerics tolerance, not to bit
+    equality: the served model's GSM8K strict-match score must hold.
 
 ``VLLM_NEURON_TP_ALLREDUCE_DTYPE_PHASES`` = ``prefill`` (default) | ``all`` | a comma list
     The steps that reduce in the wire dtype: ``all``, or any of ``prefill``, ``decode``
@@ -48,10 +49,10 @@ which on the device is trace time:
     per site moves the same bytes in fewer operations; its sums are not bitwise
     those of the tiled form. ``0`` keeps the compiler's tiles.
 
-    Measured on the lever-A build (3417e57c) with the fp32 wire at 262,127 tokens: TTFT
-    -1,199.8 ms against an arm-0 restart spread of 27.5 ms (the collectives -4.52 ms
-    per chunk); GSM8K strict-match 199 against 198 / 198 at n = 200, one discordant
-    question, McNemar p = 1. The user approved the tolerance on 2026-10-14.
+    Measured with the fp32 wire at 262,127 tokens: TTFT -1,199.8 ms against a spread of
+    27.5 ms between two restarts of the unfused server (the collectives -4.52 ms per
+    chunk); GSM8K strict-match 199 against 198 / 198 at n = 200, one discordant
+    question, McNemar p = 1. It is held to the same tolerance: the score, not the bits.
 
 At world size 1 there is no coordinator and nothing happens in any setting: no
 collective and no cast, so a single-rank run is bitwise unchanged.

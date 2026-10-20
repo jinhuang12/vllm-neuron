@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""``mhc_post`` on bf16 streams against 0a08ff4's ``mhc_post`` at decode batches.
+"""``mhc_post`` on bf16 streams against the baseline snapshot at decode batches.
 
-0a08ff4 casts ``x`` and the streams to fp32, runs the combine kernel in fp32 and
+The snapshot casts ``x`` and the streams to fp32, runs the combine kernel in fp32 and
 casts the fp32 result back to the streams' bf16. This tree hands the combine the bf16
 operands: up to 32 tokens the kernel upcasts them on chip (bf16 -> fp32 is exact),
 does the same fp32 products and adds in the same order, and rounds the last add to
-bf16 once, which is the cast 0a08ff4 does after the kernel. So the result is asserted
+bf16 once, the cast the snapshot does after the kernel. So the result is asserted
 bit for bit, with the hidden axis on the partitions and under one and two programs,
 at the decode batches B in {1, 4}. Above 32 tokens bf16 operands take the
 tensor-engine form, which is held to a tolerance instead.

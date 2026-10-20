@@ -1692,15 +1692,15 @@ def _attention_body_row_tiled(q_lift_hbm, c_kv_hbm, topk_hbm, softmax_scale, out
 #   (Clamped onto row 0 alone, every sentinel column of a mostly-empty index row --
 #   the start of a prompt -- reads that one row, and the gather is slower.) The
 #   gather never skips an offset: a gather-transpose with ``oob_mode.skip`` over an
-#   out-of-bounds offset aborted the DMA queues on device (``reports/mla_sparse.md``).
+#   out-of-bounds offset aborted the DMA queues on device.
 # * MM2's operand, the same rows with the keys on partitions, is made from that tile by
 #   PE transposes, which are bit-exact from NeuronCore-v3 on, rather than gathered a
 #   second time: the second gather is one indirect DMA per 128-row chunk, and the
 #   software descriptor generator that issues every indirect DMA is the body's busiest
 #   engine.
 # * The software DGE starts a gather only once every DMA before it on its queue has
-#   completed, so the gathers run one at a time and set the body's pace
-#   (``reports/mla_sparse.md``). Nothing else should hold one back. A gather waits on
+#   completed, so the gathers run one at a time and set the body's pace.
+#   Nothing else should hold one back. A gather waits on
 #   its offsets, and the Vector engine reaches the offsets placed after a group's MM1
 #   only once the MM2 of the group before it is done, so they are the offsets of the
 #   group :data:`OFFSET_GROUPS_AHEAD` groups on, across blocks. A gather waits on its
@@ -1982,7 +1982,7 @@ def _lowp_mm2_matmuls(out_t, chunks, p_hl, qi: int, r: int, group: int, n_chunks
     two PSUM columns over the chunks, in chunk order; one fp32 add sums them. Each latent
     tile accumulates in a PSUM tile of its own: on device, matmuls accumulating into
     different column ranges of one 3D PSUM tile give wrong sums, which the simulator does
-    not show (``reports/mla_sparse.md``).
+    not show.
 
     The staged form issues the next query's turns before these matmuls, into the other
     chunk set, so ``chunks`` keeps this query's rows until its matmuls have read them. That

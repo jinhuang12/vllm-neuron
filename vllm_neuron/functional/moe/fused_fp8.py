@@ -70,7 +70,7 @@ def fused_fp8_experts(hidden, packed, row_ids, expert_ids, affinity, bounds,
     matching compensated scales once, then transfer the packed bank to device.
     """
     if hidden.ndim != 2 or hidden.shape[0] < 1 or hidden.shape[1] < 1 or hidden.shape[1] % 128 or hidden.dtype != torch.bfloat16:
-        raise ValueError("hidden must be BF16 [T,H], positive H multiple of128")
+        raise ValueError("hidden must be BF16 [T,H], positive H multiple of 128")
     if row_ids.ndim != 2 or row_ids.shape[0] < 1 or row_ids.shape[1] < 1:
         raise ValueError("row_ids must have positive shape [blocks,q]")
     blocks, _ = row_ids.shape

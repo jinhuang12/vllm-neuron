@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The KDA input projections in one NKI launch, at decode and at prefill.
 
-Baseline ``glue_0a08ff4`` (``Glm5NextKDAAttention.forward``, and
+The torch route (``Glm5NextKDAAttention.forward``, and
 ``_fused_decode_requests``) computes, with ``x = hidden_states.float()``::
 
     q_in, k_in, v_in = x @ q_w.float().t(), x @ k_w.float().t(), x @ v_w.float().t()
@@ -636,7 +636,7 @@ def kda_projections_admits(hidden_states: Tensor, attn, phase: str | None = None
 
 
 def kda_projections_torch(hidden_states: Tensor, attn) -> tuple[Tensor, ...]:
-    """Baseline ``glue_0a08ff4``'s torch expressions, verbatim: the route when the kernel declines."""
+    """The torch route's expressions, verbatim: the route when the kernel declines."""
     x = hidden_states.to(torch.float32)
 
     def project(weight: Tensor) -> Tensor:

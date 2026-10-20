@@ -479,8 +479,8 @@ The tile allocator places SBUF buffers by their live ranges in program order, no
 engines run. Issued one sweep late, a sweep's rectified scores are still live when the next
 sweep's are written, so the two get separate SBUF and the scalar engine rectifies one sweep while
 the vector engine sums the other. Issued in sweep order, the allocator gave both the same
-address, and every rectify waited for the previous sweep's last add (MEASURED, profile
-operands): the sweep ran at about 1.5 times the vector engine's busy time. Two sweeps of
+address, and every rectify waited for the previous sweep's last add (seen in a device
+profile): the sweep ran at about 1.5 times the vector engine's busy time. Two sweeps of
 ``_SWEEP_ELEMENTS`` fp32 take 128 KiB of a partition's SBUF."""
 
 _STORE_LAG = 3

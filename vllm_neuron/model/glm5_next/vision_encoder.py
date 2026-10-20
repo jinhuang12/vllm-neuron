@@ -253,6 +253,7 @@ class Glm5NextVisionHeadRMSNorm(Glm5NextVisionRMSNorm):
     """
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """``[seq, heads, head_dim]`` in and out: each head's RMSNorm times ``weight``."""
         input_dtype = hidden_states.dtype
         h = hidden_states.to(torch.float32)
         seq, heads, head_dim = h.shape

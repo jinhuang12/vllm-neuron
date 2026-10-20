@@ -86,6 +86,7 @@ class Glm5NextVisionErfGELU(nn.Module):
     """
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """``x`` in, its exact GELU out in ``x``'s dtype, computed in float32."""
         wide = x.float()
         return (0.5 * wide * (1.0 + torch.erf(wide / math.sqrt(2.0)))).to(x.dtype)
 

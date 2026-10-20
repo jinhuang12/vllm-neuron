@@ -189,7 +189,7 @@ def hyper_connection_kernel(x, residual, post_layer_mix, comb_res_mix):
         ``out_j = post_layer_mix_j * x + sum_i comb_ij * res_i``, computed in fp32
         and rounded once. ``x`` and ``residual`` may be fp32 or bf16.
 
-    On the vector engine the arithmetic is that of baseline ``mhc_5938748``, in its
+    On the vector engine the arithmetic is the baseline kernel's, in its
     order and rounding: ``acc = post_j * x`` and then ``acc = acc + comb_ij * res_i``
     for ``i = 0..S-1``, each product rounded to fp32 before its add. The form is
     picked at trace time from ``T`` and the dtypes:

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """KDA output: gated RMSNorm and ``o_proj`` in one NKI launch, at decode and at prefill.
 
-Baseline ``glue_0a08ff4``'s ``Glm5NextKDAAttention._gated_output`` computes, all in fp32::
+The torch route, ``Glm5NextKDAAttention._gated_output``, computes, all in fp32::
 
     shaped = core.view(T, heads, kdim)
     shaped = shaped * rsqrt(shaped.pow(2).mean(-1) + eps) * o_norm * sigmoid(out_gate)
@@ -406,7 +406,7 @@ def kda_gated_projection_admits(core: Tensor, out_gate: Tensor, attn,
 
 
 def kda_gated_projection_torch(core: Tensor, out_gate: Tensor, attn) -> Tensor:
-    """Baseline ``glue_0a08ff4``'s ``_gated_output`` up to the reduction, verbatim: ``[T, H]`` fp32."""
+    """The torch route's ``_gated_output`` up to the reduction, verbatim: ``[T, H]`` fp32."""
     tokens = int(core.shape[0])
     heads = int(attn.num_kv_heads_per_rank)
     kdim = int(attn.head_dim)
