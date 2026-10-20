@@ -4971,6 +4971,7 @@ class Glm5NextDSAIndexer(nn.Module):
     def project_stage(
         self, hidden_states: torch.Tensor, q_latent: torch.Tensor,
         query_side: bool = True, *, rotate_query: bool = True,
+        query_rows: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """The indexer's four projections, its key norm and its query rotation.
 
@@ -4986,6 +4987,15 @@ class Glm5NextDSAIndexer(nn.Module):
         ``q_latent`` is the normalised query latent, which upstream's indexer also
         takes as an argument rather than computing. Here it comes from
         ``Glm5NextMLAAttention.project_query_latent``.
+
+        ``query_rows`` is ``(hidden_states rows, q_latent rows)``: some rows of the two
+        inputs, the rank's rows of a row-sharded prefill selection
+        (:func:`~vllm_neuron.functional.dsa.indexer_shard.take_query_rows`). The query and
+        the weights are then projected on those rows alone and have their row count; the
+        key and the gate keep every row. They are the bits of the same rows projected
+        with every row, because the projection kernel computes each element with the
+        same products in the same order at any row count, and the cast and the rotation
+        work per row.
 
         Five kernel calls: four to ``mla_projection``, one per site in
         :meth:`projection_widths`, and one to ``dsa_hadamard128`` for the
@@ -5031,26 +5041,41 @@ class Glm5NextDSAIndexer(nn.Module):
                 f"{(tokens, self.q_lora_rank)} to pair with these hidden "
                 f"states; got {tuple(q_latent.shape)}"
             )
+        # The query side's inputs and row count. Read off ``query_rows`` in place, not
+        # bound to new names: dynamo names a node after the first local it is stored
+        # in, so binding the inputs here could rename them in a graph that passes no
+        # ``query_rows``, and re-key it (step 1's note).
+        rows = tokens
+        if query_rows is not None:
+            rows = int(query_rows[1].shape[0])
+            shapes = (tuple(query_rows[0].shape), tuple(query_rows[1].shape))
+            if shapes != ((rows, self.hidden_size), (rows, self.q_lora_rank)):
+                raise Glm5NextDSAIndexerError(
+                    f"query_rows must be [rows, hidden_size] and [rows, q_lora_rank] "
+                    f"rows of the two inputs; got {shapes}"
+                )
 
         # 1. The query. Upstream views the projection to ``[-1, n_head, head_dim]``;
         #    the rotation kernel takes a 2-D ``[rows, 128]``, so the view is flat
         #    for the call and restored after it. ``query_side=False`` is the decode
         #    step whose selection is a no-op: nothing reads the query or the weights.
-        #    The rotating branch keeps the statements it had before ``rotate_query``:
-        #    a compiled graph's cache key reads its FX text, node names included, so
-        #    another spelling would re-key every graph whose indexer rotates here.
+        #    The rotating branch keeps the statements it had before ``rotate_query``,
+        #    at the query side's row count: a compiled graph's cache key reads its FX text,
+        #    node names included (a tensor takes the name it is stored under), so
+        #    another spelling would re-key every graph whose indexer rotates here. A
+        #    row count is a python int and leaves no node of its own.
         query = weights = None
         if query_side:
-            query = project(q_latent, "wq_b")
+            query = project(q_latent if query_rows is None else query_rows[1], "wq_b")
             if rotate_query:
                 query = dsa_hadamard128(
-                    query.reshape(tokens * self.index_n_heads, self.index_head_dim).to(
+                    query.reshape(rows * self.index_n_heads, self.index_head_dim).to(
                         torch.bfloat16
                     )
-                ).reshape(tokens, self.index_n_heads, self.index_head_dim)
+                ).reshape(rows, self.index_n_heads, self.index_head_dim)
             else:
                 query = query.reshape(
-                    tokens, self.index_n_heads, self.index_head_dim
+                    rows, self.index_n_heads, self.index_head_dim
                 ).to(torch.bfloat16)
 
         # 2. The key, then its LayerNorm. The cast to bf16 happens before the norm
@@ -5066,7 +5091,9 @@ class Glm5NextDSAIndexer(nn.Module):
         # 3. The weights, with the single constant folded in. float32 all the way:
         #    ``dsa_score_gemm`` requires it and applies no scale of its own.
         if query_side:
-            weights = project(hidden_states, "weights_proj") * self.projection_scale()
+            weights = project(
+                hidden_states if query_rows is None else query_rows[0], "weights_proj"
+            ) * self.projection_scale()
 
         # 4. The kpool gate: upstream's
         #    ``F.linear(hidden_states, index_kpool_compress_gate)``, which is why
@@ -5110,11 +5137,98 @@ class Glm5NextDSAIndexer(nn.Module):
         caller could do it, because the key and the gate for those positions exist
         only inside this class's forward.
 
-        One kernel call, on ``dsa_kpool_hadamard``. The sliding window is index
-        arithmetic and carries no call of its own.
+        One kernel call, on ``dsa_kpool_hadamard``. The window route
+        (``dsa_kpool_window``, on by default) hands it ``key`` and ``gate_score`` with
+        ``windows=True``, and its kernel reads each sliding window in place; the gather
+        route builds the windows as copies, ``key[windows]``, and hands it those. The
+        pooled keys are the same bits on both routes.
         """
-        from vllm_neuron.functional.dsa.kpool_hadamard import dsa_kpool_hadamard
+        from vllm_neuron.functional.dsa.kpool_hadamard import (
+            dsa_kpool_hadamard,
+            sliding_windows,
+        )
+        from vllm_neuron.model.glm5_next import dsa_kpool_window
 
+        ape = self._pool_operands(key, gate_score, slot_mapping)
+        tokens = int(key.shape[0])
+        pool = self.index_kpool
+        pos = torch.arange(tokens, device=key.device)
+        write_mask = (slot_mapping >= 0) & (pos >= pool - 1)
+
+        # The ape is float32 for the kernel's inner contract even though the
+        # checkpoint leaf is bf16; it is [4, 128], so the cast is free and is
+        # done here rather than cached, unlike the projection weights.
+        ape = ape.to(torch.float32)
+        if dsa_kpool_window.prefill_reads_windows():
+            pooled = dsa_kpool_hadamard(key, gate_score, ape, windows=True)
+        else:
+            window = sliding_windows(tokens, pool, key.device)
+            pooled = dsa_kpool_hadamard(key[window], gate_score[window], ape)
+        return pooled, write_mask
+
+    def store_pools(
+        self,
+        key: torch.Tensor,
+        gate_score: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        pool_cache: torch.Tensor,
+        trash: int,
+    ) -> torch.Tensor:
+        """Pool this chunk's complete pools and write them into ``pool_cache``. The prefill
+        leg's store. Returns the written pool cache.
+
+        The rows written are :meth:`pool_window`'s: row ``slot_mapping[p]`` of ``pool_cache``
+        gets position ``p``'s pooled key wherever ``write_mask[p]`` holds, and every other
+        position writes the trash row ``trash``, which no candidate gather reads. A slot at or
+        past ``trash`` writes the trash row too: every destination is then a row of the cache,
+        which the kernel route needs (an out-of-range dynamic offset drops a whole tile under
+        LNC2).
+
+        One kernel call on the store route (``dsa_kpool_store``, on by default):
+        ``dsa_kpool_hadamard_store`` pools the windows in place and writes each pooled row
+        straight to its cache row, so the pooled keys never go to HBM and back and the graph
+        holds no scatter. Otherwise :meth:`pool_window` pools and ``index_copy_`` writes, the
+        same rows. The return is the kernel's result on the store route, which the backend
+        hands to every later operation on ``pool_cache``; the caller reads the cache through
+        it.
+        """
+        from vllm_neuron.functional.dsa.kpool_hadamard import dsa_kpool_hadamard_store
+        from vllm_neuron.model.glm5_next import dsa_kpool_store
+
+        if not dsa_kpool_store.prefill_stores_pools():
+            pooled, write_mask = self.pool_window(key, gate_score, slot_mapping)
+            destination = torch.where(
+                write_mask,
+                slot_mapping.to(torch.int64),
+                pool_cache.new_full((), trash, dtype=torch.int64),
+            )
+            pool_cache.index_copy_(0, destination, pooled.to(pool_cache.dtype))
+            return pool_cache
+
+        ape = self._pool_operands(key, gate_score, slot_mapping)
+        pos = torch.arange(int(key.shape[0]), device=key.device)
+        writes = (
+            (slot_mapping >= 0) & (pos >= self.index_kpool - 1) & (slot_mapping < trash)
+        )
+        destination = torch.where(
+            writes,
+            slot_mapping.to(torch.int32),
+            pool_cache.new_full((), trash, dtype=torch.int32),
+        )
+        return dsa_kpool_hadamard_store(
+            key, gate_score, ape.to(torch.float32), pool_cache, destination
+        )
+
+    def _pool_operands(
+        self,
+        key: torch.Tensor,
+        gate_score: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> torch.Tensor:
+        """Check the prefill pooling's operands. Returns the ape leaf, as stored.
+
+        Shared by :meth:`pool_window` and :meth:`store_pools`, which pool the same operands.
+        """
         if key.ndim != 2 or int(key.shape[1]) != self.index_head_dim:
             raise Glm5NextDSAIndexerError(
                 f"key must be [tokens, {self.index_head_dim}]; got "
@@ -5152,19 +5266,7 @@ class Glm5NextDSAIndexer(nn.Module):
                 f"index_head_dim] = {(pool, self.index_head_dim)}; got "
                 f"{tuple(ape.shape)}"
             )
-
-        pos = torch.arange(tokens, device=key.device)
-        offsets = torch.arange(pool, device=key.device)
-        window = (pos - (pool - 1)).clamp_min(0)[:, None] + offsets[None, :]
-        write_mask = (slot_mapping >= 0) & (pos >= pool - 1)
-
-        # The ape is float32 for the kernel's inner contract even though the
-        # checkpoint leaf is bf16; it is [4, 128], so the cast is free and is
-        # done here rather than cached, unlike the projection weights.
-        pooled = dsa_kpool_hadamard(
-            key[window], gate_score[window], ape.to(torch.float32)
-        )
-        return pooled, write_mask
+        return ape
 
     def tail_step(
         self,
@@ -5571,9 +5673,11 @@ class Glm5NextDSAIndexer(nn.Module):
         return indices.to(torch.int32)
 
     def select_bounded_pools(
-        self, scores: torch.Tensor, seq_lens: torch.Tensor
+        self, scores: torch.Tensor, seq_lens: torch.Tensor, *, ordered: bool = True
     ) -> torch.Tensor:
         """Bound each row to its own position, select, sentinelise.
+
+        ``ordered`` is :meth:`_select_bounded`'s.
 
         The one site for the causal bound, and both entry points route through it
         for the reason :meth:`_require_serviceable` gives for itself: ``forward``
@@ -5618,20 +5722,28 @@ class Glm5NextDSAIndexer(nn.Module):
         bounded = dsa_causal_bound(
             scores, seq_lens.to(torch.int32).reshape(-1, 1), self.index_kpool
         )
-        return self._select_bounded(bounded)
+        return self._select_bounded(bounded, ordered=ordered)
 
-    def _select_bounded(self, bounded: torch.Tensor) -> torch.Tensor:
+    def _select_bounded(self, bounded: torch.Tensor, *, ordered: bool = True) -> torch.Tensor:
         """Select on scores the causal bound has already filled, sentinelise, order.
 
         The tail of :meth:`select_bounded_pools`, shared with :meth:`forward_requests`,
         whose score kernel applies each request's bound itself.
+
+        ``ordered=False`` returns each row's pool ids as a set: the top-k skips its sort
+        and :meth:`_canonical_sentinel_order` is not called. The ids and sentinels are
+        the same, in an order that depends on the kernel's stages. Only a caller whose
+        attention reads the selection as a set passes it
+        (``model/glm5_next/dsa_set_selection.py``).
         """
         from vllm_neuron.functional.dsa.causal_bound import dsa_causal_sentinel
         from vllm_neuron.functional.dsa.topk_select import dsa_topk_select
 
-        values, indices = dsa_topk_select(bounded, self.select_k())
+        values, indices = dsa_topk_select(bounded, self.select_k(), ordered=ordered)
         pool_ids = indices.to(torch.int32)
         sentinelised = dsa_causal_sentinel(values, pool_ids, int(bounded.shape[1]))
+        if not ordered:
+            return sentinelised
         return self._canonical_sentinel_order(sentinelised)
 
     def _select_pool_ids(
@@ -5642,38 +5754,62 @@ class Glm5NextDSAIndexer(nn.Module):
         seq_lens: torch.Tensor,
         *,
         shardable: bool,
+        ordered: bool = True,
+        rank_rows: tuple | None = None,
     ) -> torch.Tensor:
         """``[T, select_k]`` int32 pool ids for a selecting call: replicated or row-sharded.
 
         Every row runs :meth:`score_pools` then :meth:`select_bounded_pools` against the
-        whole candidate axis. Sharded when the call may shard (the prefill leg of
-        :meth:`forward`), a rank operand is bound, a tensor-parallel group exists and
-        :func:`~vllm_neuron.functional.dsa.indexer_shard.shard_degree` says the chunk
-        spans more than one row tile with the switch on: each rank then runs that chain on
-        its own rows (:func:`~vllm_neuron.functional.dsa.indexer_shard.select_local_rows`)
-        and one all-gather returns every row to every rank. Otherwise every rank selects
-        every row, as built.
+        whole candidate axis. Sharded when :meth:`_row_shard_plan` gives a plan: each rank
+        then runs that chain on its own rows
+        (:func:`~vllm_neuron.functional.dsa.indexer_shard.select_local_rows`) and one
+        all-gather returns every row to every rank. Otherwise every rank selects every
+        row, as built. ``ordered`` is :meth:`_select_bounded`'s; the all-gather moves whole
+        rows, so it keeps each row's order, whatever that is.
+
+        ``rank_rows`` is ``(plan, seq_lens rows)`` when :meth:`forward` has cut this
+        rank's rows before the projections (the query row cut): ``query`` and ``weights``
+        are then the rank's rows already, ``seq_lens rows`` their lengths, and only the
+        selection on them and the all-gather remain.
         """
         from vllm_neuron.functional.dsa.indexer_shard import (
             gather_rows,
-            row_shard,
             select_local_rows,
-            shard_degree,
         )
 
         def select(rows_query, rows_weights, rows_seq_lens):
             scores = self.score_pools(rows_query, candidate_keys, rows_weights)
-            return self.select_bounded_pools(scores, rows_seq_lens)
+            return self.select_bounded_pools(scores, rows_seq_lens, ordered=ordered)
 
-        tokens = int(query.shape[0])
+        if rank_rows is not None:
+            (group, shard, _rank), rows_seq_lens = rank_rows
+            return gather_rows(select(query, weights, rows_seq_lens), group, shard)
+        plan = self._row_shard_plan(int(query.shape[0]), shardable)
+        if plan is None:
+            return select(query, weights, seq_lens)
+        group, shard, rank = plan
+        local = select_local_rows(select, query, weights, seq_lens, shard, rank)
+        return gather_rows(local, group, shard)
+
+    def _row_shard_plan(self, tokens: int, shardable: bool) -> tuple | None:
+        """``(group, shard, rank)`` when a selecting call's ``tokens`` rows divide over the
+        ranks, else None.
+
+        A plan exists when the call may shard (the prefill leg of :meth:`forward`), a rank
+        operand is bound, a tensor-parallel group exists and
+        :func:`~vllm_neuron.functional.dsa.indexer_shard.shard_degree` says the chunk spans
+        more than one row tile with the switch on. ``group`` is that group, ``shard`` the
+        :class:`~vllm_neuron.functional.dsa.indexer_shard.RowShard` and ``rank`` the bound
+        rank operand.
+        """
+        from vllm_neuron.functional.dsa.indexer_shard import row_shard, shard_degree
+
         rank = getattr(self, self.SHARD_RANK_ATTR, None)
         group = _resolve_tp_group() if shardable and rank is not None else None
         degree = 1 if group is None else shard_degree(tokens, int(group.world_size))
         if degree <= 1:
-            return select(query, weights, seq_lens)
-        shard = row_shard(tokens, degree)
-        local = select_local_rows(select, query, weights, seq_lens, shard, rank)
-        return gather_rows(local, group, shard)
+            return None
+        return group, row_shard(tokens, degree), rank
 
     def _dcp_select_pool_ids(
         self,
@@ -6012,18 +6148,26 @@ class Glm5NextDSAIndexer(nn.Module):
         prefill_start_position: torch.Tensor | int | None = None,
         indices_wanted: bool = True,
         projected: tuple | None = None,
+        ordered: bool = True,
     ) -> torch.Tensor | None:
         """The whole indexer chain. Returns ``topk_indices`` and nothing else.
 
         ``projected`` is :meth:`project_stage`'s four outputs for these rows, computed
         by the caller: a decode step of several requests projects them all in one
         call and hands each request its own row, since every request's write stage
-        and selection read its own caches. Absent, the projection runs here.
+        and selection read its own caches. Absent, the projection runs here, its
+        query side on this rank's rows alone when the prefill selection shards
+        (:meth:`_query_row_cut`).
 
         ``indices_wanted=False`` is the caller saying it attends the causal prefix
         itself when selection is a no-op: the write stage still runs, the query side
         is skipped, and None is returned instead of the causal fill. It changes
         nothing while ``max_seq_len`` selects.
+
+        ``ordered=False`` is the caller saying its attention reads each row's selection
+        as a set (``model/glm5_next/dsa_set_selection.py``): the selection without DCP
+        then skips the top-k's sort and the sentinel order (:meth:`_select_bounded`). The
+        DCP selection keeps its order, because its merge reads it.
 
         Indices alone is deliberate: the ``-1`` mask stays inside the sparse
         kernel, so no per-row valid length leaves this class -- returning one would
@@ -6086,12 +6230,16 @@ class Glm5NextDSAIndexer(nn.Module):
 
         What is torch here is orchestration, and it is named so a reader can check
         it: shape validation, index arithmetic for the gather and for the two write
-        addresses, one ``index_copy_`` per leg, one ring copy on the decode leg, and
+        addresses, one ``index_copy_`` on the decode leg (the prefill leg's write is in
+        its pooling kernel, :meth:`store_pools`, on the store route and an
+        ``index_copy_`` otherwise), one ring copy on the decode leg, and
         one ring copy on the prefill leg -- masked over the whole ring when the
         chunk's end arrives as a tensor. When the prefill selection shards, an NKI row
-        cut (``shard_rows``) takes this rank's rows of each operand and one int32
-        all-gather returns the pool ids (:meth:`_select_pool_ids`). No torch path
-        computes an indexer value.
+        cut (``shard_rows``) takes this rank's rows of the query side's two inputs and
+        of the lengths before the projections (:meth:`_query_row_cut`; with
+        ``VLLM_NEURON_DSA_QUERY_ROW_CUT=0``, of the query, the weights and the lengths
+        after them), and one int32 all-gather returns the pool ids
+        (:meth:`_select_pool_ids`). No torch path computes an indexer value.
         """
         from vllm_neuron.functional.dsa.decode_tail_update import decode_pool_address
 
@@ -6131,6 +6279,18 @@ class Glm5NextDSAIndexer(nn.Module):
                 "seeding the ring needs the sequence length after this chunk; got "
                 "a prefill_tail with no prefill_end_position"
             )
+        # The query row cut: when the prefill selection shards, this rank's rows of the
+        # query side's inputs, so the query and the weights project those rows alone
+        # (``indexer_shard.take_query_rows``); the key and the gate project every row.
+        cut = rank_rows = None
+        if projected is None and selects and not is_decode and self.dcp_size == 1:
+            cut = self._query_row_cut(hidden_states, q_latent, seq_lens)
+        if cut is not None:
+            plan, hidden_rows, latent_rows, rows_seq_lens = cut
+            projected = self.project_stage(
+                hidden_states, q_latent, query_rows=(hidden_rows, latent_rows)
+            )
+            rank_rows = (plan, rows_seq_lens)
         if projected is None:
             projected = self.project_stage(
                 hidden_states, q_latent, query_side=selects or indices_wanted
@@ -6182,13 +6342,7 @@ class Glm5NextDSAIndexer(nn.Module):
                 )
                 pool_cache.index_copy_(0, pool_slot, pooled.to(pool_cache.dtype))
         else:
-            pooled, write_mask = self.pool_window(key, gate_score, slot_mapping)
-            destination = torch.where(
-                write_mask,
-                slot_mapping.to(torch.int64),
-                pool_cache.new_full((), trash, dtype=torch.int64),
-            )
-            pool_cache.index_copy_(0, destination, pooled.to(pool_cache.dtype))
+            pool_cache = self.store_pools(key, gate_score, slot_mapping, pool_cache, trash)
             if prefill_tail is not None:
                 # The remainder is this leg's to persist: the pooled store took the
                 # complete pools above, and the open pool's rows exist only here.
@@ -6228,9 +6382,35 @@ class Glm5NextDSAIndexer(nn.Module):
         # rows may divide over the ranks (``_select_pool_ids``); the expansion below runs
         # on every row either way, with each row's own length.
         pool_ids = self._select_pool_ids(
-            query, candidate_keys, weights, seq_lens, shardable=not is_decode
+            query, candidate_keys, weights, seq_lens, shardable=not is_decode,
+            ordered=ordered, rank_rows=rank_rows,
         )
         return self.expand_indices(pool_ids, seq_lens)
+
+    def _query_row_cut(
+        self, hidden_states: torch.Tensor, q_latent: torch.Tensor, seq_lens: torch.Tensor
+    ) -> tuple | None:
+        """``(plan, hidden_states rows, q_latent rows, seq_lens rows)`` for a prefill
+        selection that shards with the query row cut on, else None.
+
+        ``plan`` is :meth:`_row_shard_plan`'s for the chunk's rows, and the three tensors
+        are this rank's rows of each operand, cut in one launch
+        (:func:`~vllm_neuron.functional.dsa.indexer_shard.take_query_rows`). The caller
+        has already required a selecting prefill call without DCP: the DCP selection needs
+        every row on every rank.
+        """
+        from vllm_neuron.functional.dsa.indexer_shard import (
+            query_row_cut_enabled,
+            take_query_rows,
+        )
+
+        if not query_row_cut_enabled():
+            return None
+        plan = self._row_shard_plan(int(hidden_states.shape[0]), shardable=True)
+        if plan is None:
+            return None
+        _group, shard, rank = plan
+        return (plan, *take_query_rows(hidden_states, q_latent, seq_lens, shard, rank))
 
     def forward_requests(
         self,
@@ -7544,6 +7724,46 @@ class Glm5NextMLAAttention(nn.Module):
     # come from the DSA indexer and the scale is the layer's, so neither is derived
     # here.
 
+    def _require_masked_reader(
+        self,
+        q_lift: torch.Tensor,
+        c_kv: torch.Tensor,
+        topk_indices: torch.Tensor,
+        window: int,
+        *,
+        dense: bool,
+        dense_window: bool,
+        active_mla_query_rows: int | None,
+    ) -> None:
+        """Refuse a set selection that a reader of its order would get.
+
+        :meth:`forward` lets the indexer return each row's pool ids in no stated order
+        only where ``mla_sparse_attention`` hands them to the masked-window kernel
+        (``dsa_set_selection.py``). This asks that seam's predicate again, with the
+        operands it will be handed, so a decision taken on other shapes cannot reach
+        the gather or the DCP merge, which read the order. A trace-time check: every
+        input is a shape, a dtype or a python value.
+        """
+        from vllm_neuron.functional.attention.mla_dense_window import masked_window_serves
+
+        rows = int(q_lift.shape[0]) if active_mla_query_rows is None else active_mla_query_rows
+        if (
+            self.dcp_size > 1
+            or dense
+            or dense_window
+            or not masked_window_serves(
+                rows, int(q_lift.shape[1]), int(q_lift.shape[2]), int(window),
+                int(self.indexer.index_kpool), int(topk_indices.shape[1]),
+                q_lift.dtype, c_kv.dtype,
+            )
+        ):
+            raise Glm5NextMLADecodeError(
+                f"the selection is a set, which only the masked-window kernel reads; this "
+                f"call ({rows} rows, a {window}-row window, {int(topk_indices.shape[1])} "
+                f"index columns, decode_context_parallel_size={self.dcp_size}, "
+                f"dense={dense}, dense_window={dense_window}) would hand it to another body"
+            )
+
     def attend(
         self,
         hidden_states: torch.Tensor,
@@ -7562,6 +7782,7 @@ class Glm5NextMLAAttention(nn.Module):
         dense: bool = False,
         dense_window_seq_lens: torch.Tensor | None = None,
         q_latent: torch.Tensor | None = None,
+        selection_is_a_set: bool = False,
     ) -> torch.Tensor:
         """One layer's MLA attention. Returns ``[tokens, hidden_size]``.
 
@@ -7573,6 +7794,11 @@ class Glm5NextMLAAttention(nn.Module):
         (``dsa_dense_window.py``): each query row ``i`` attends window rows
         ``0 .. seq_lens[i] - 1`` through ``mla_dense_window_attention`` and
         ``topk_indices`` is not read (pass None).
+
+        ``selection_is_a_set=True`` says ``topk_indices`` holds each row's selection in
+        no stated order (``dsa_set_selection.py``). Only the masked-window kernel may read
+        it, so this asks the seam's predicate (``masked_window_serves``) with the operands
+        handed to the seam and refuses the call where another body would read it.
 
         ``hidden_states`` is ``[tokens, hidden_size]``: a prefill passes all its
         tokens at once and a decode step passes one. ``latent_cache`` is the whole
@@ -7814,6 +8040,12 @@ class Glm5NextMLAAttention(nn.Module):
             raise Glm5NextMLADecodeError(
                 f"absorb-in produced a width of {int(q_lift.shape[2])}; the "
                 f"sparse seam contracts {latent}"
+            )
+        if selection_is_a_set:
+            self._require_masked_reader(
+                q_lift, c_kv, topk_indices, window, dense=dense,
+                dense_window=dense_window_seq_lens is not None,
+                active_mla_query_rows=active_mla_query_rows,
             )
 
         if self.dcp_size > 1:
@@ -8730,6 +8962,31 @@ class Glm5NextMLAAttention(nn.Module):
         )
         window_scans = window_selects and window_pools >= MAX8_WIDTH
         scan = bound if no_select or window_scans else int(max_seq_len)
+        # A selection that only the masked-window attention reads comes back as a set
+        # (dsa_set_selection.py). The seam's own predicate decides, asked with the
+        # operands attend() hands the seam; attend() asks it again with the real ones.
+        # A collecting forward (the layer-stream dump) keeps the order: the dump hands
+        # the index rows on as the indexer emitted them.
+        from vllm_neuron.model.glm5_next.dsa_set_selection import prefill_selects_a_set
+
+        selects_a_set = (
+            not no_select
+            and self.dcp_size == 1
+            and collector is None
+            and prefill_selects_a_set(
+                rows=(
+                    int(normed_hidden_states.shape[0])
+                    if active_mla_query_rows is None else int(active_mla_query_rows)
+                ),
+                heads=self._heads_per_rank(),
+                latent=self.kv_lora_rank,
+                window_rows=int(block_table_row.shape[0]) * int(page_size),
+                pool_size=self.indexer.index_kpool,
+                index_cols=self.indexer.bypass_width(),
+                q_dtype=normed_hidden_states.dtype,
+                kv_dtype=latent_cache.dtype,
+            )
+        )
         q_latent = self.project_query_latent(normed_hidden_states)
         topk_indices = self.indexer(
             normed_hidden_states,
@@ -8747,6 +9004,7 @@ class Glm5NextMLAAttention(nn.Module):
             prefill_start_position=(
                 None if prefill_end_position is None else start_position
             ),
+            ordered=not selects_a_set,
         )
         if collector is not None:
                 # The first five rows only, and as the indexer emitted them: a static
@@ -8768,6 +9026,7 @@ class Glm5NextMLAAttention(nn.Module):
             page_size=int(page_size),
             dense=dense,
             dense_window_seq_lens=seq_lens if dense_window else None,
+            selection_is_a_set=selects_a_set,
             **(
                 {"active_mla_query_rows": active_mla_query_rows}
                 if active_mla_query_rows is not None else {}

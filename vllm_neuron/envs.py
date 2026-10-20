@@ -129,6 +129,20 @@ if TYPE_CHECKING:
     # Divide the GLM-5.3-Flash DSA prefill selection's query rows over the
     # tensor-parallel ranks. On by default; 0 restores the replicated selection.
     VLLM_NEURON_DSA_INDEXER_SHARD: bool = True
+    # Under that shard, project the indexer's query side (query, rotation, head
+    # weights) on each rank's own rows only. On by default; 0 projects every row
+    # and cuts the projections.
+    VLLM_NEURON_DSA_QUERY_ROW_CUT: bool = True
+    # Let a GLM-5.3-Flash DSA prefill selection that only the masked-window attention
+    # reads come back as a set: no top-k sort, no sentinel order. On by default; 0
+    # restores the ordered selection.
+    VLLM_NEURON_DSA_SET_SELECTION: bool = True
+    # Let the GLM-5.3-Flash DSA prefill key pooling read each position's window
+    # from the keys in place, with no gather. On by default; 0 gathers the windows.
+    VLLM_NEURON_DSA_KPOOL_WINDOW_READ: bool = True
+    # Let that window kernel write the pooled keys into the pool cache itself,
+    # with no scatter after it. On by default; 0 scatters with index_copy_.
+    VLLM_NEURON_DSA_KPOOL_STORE: bool = True
     # GLM-5.3-Flash fused glue kernels (``vllm_neuron/functional/glue``): which
     # kernel serves which call, and how the KDA kernels load their weights.
     VLLM_NEURON_GLUE_FUSED: str = "1"
@@ -592,6 +606,44 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the replicated selection on every rank.
     "VLLM_NEURON_DSA_INDEXER_SHARD": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_DSA_INDEXER_SHARD", "1"))
+    ),
+    # Under the shard above, cut each rank's rows of the indexer's two query-side
+    # inputs (``q_latent`` and ``hidden_states``) before its query projection, query
+    # rotation and head-weight projection, so they run on the rank's rows only; the
+    # key and the kpool gate still project every row, for the pool write
+    # (``functional/dsa/indexer_shard.py``). Read at trace time; a change needs a new
+    # compile. On by default; 0 projects the query side on every row and cuts its
+    # outputs.
+    "VLLM_NEURON_DSA_QUERY_ROW_CUT": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_DSA_QUERY_ROW_CUT")) is not False
+    ),
+    # Skip the top-k's sort and the sentinel order on a DSA prefill selection whose
+    # only reader is the masked-window attention, which counts each row's pool ids as
+    # a set (``functional/attention/mla_dense_window.py``), so their order cannot
+    # reach the layer's output. Read at trace time by
+    # ``model/glm5_next/dsa_set_selection.py``; a change needs a new compile. On by
+    # default; 0 keeps the ordered selection on every route.
+    "VLLM_NEURON_DSA_SET_SELECTION": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_DSA_SET_SELECTION")) is not False
+    ),
+    # Pool the DSA prefill indexer's sliding windows (each position's ``index_kpool``
+    # keys and gate scores, ending at it) with a kernel that reads them from the keys
+    # in place, instead of gathering them first; the pooled keys are the same bits
+    # (``functional/dsa/kpool_hadamard.py``). Read at trace time by
+    # ``model/glm5_next/dsa_kpool_window.py``; a change needs a new compile. On by
+    # default; 0 gathers the windows.
+    "VLLM_NEURON_DSA_KPOOL_WINDOW_READ": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_DSA_KPOOL_WINDOW_READ")) is not False
+    ),
+    # Write the DSA prefill indexer's pooled keys into the layer's pool cache from
+    # the window kernel itself, by indirect DMA to each position's cache row, instead
+    # of storing them and scattering them with ``index_copy_``; the written rows are
+    # the same bits (``functional/dsa/kpool_hadamard.py``,
+    # ``dsa_kpool_hadamard_store``). Only on the window route above. Read at trace
+    # time by ``model/glm5_next/dsa_kpool_store.py``; a change needs a new compile.
+    # On by default; 0 scatters with ``index_copy_``.
+    "VLLM_NEURON_DSA_KPOOL_STORE": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_DSA_KPOOL_STORE")) is not False
     ),
     # ================== GLM-5.3-Flash Fused Glue Kernels ==================
     # Which fused glue kernel (``vllm_neuron/functional/glue``) serves which call.
