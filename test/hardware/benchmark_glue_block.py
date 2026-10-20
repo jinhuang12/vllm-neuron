@@ -241,8 +241,11 @@ class _OneRankGroup:
     work that depends on no reduced value can run under them. ``--ar-chain A F`` issues
     ``A`` (attention site) or ``F`` (FFN site) dependent one-rank all-reduces in a row,
     each the identity on the values, so the wait lasts about as long as the served one
-    while the compute engines stay free.
+    while the compute engines stay free. ``rank_in_group`` is the one-rank world's: the
+    DSA indexer binds its shard rank from it at load.
     """
+
+    rank_in_group = 0
 
     def all_reduce(self, tensor):
         import torch.distributed as dist
@@ -267,7 +270,9 @@ def init_one_rank_world() -> None:
     ports = []
     for _ in range(2):
         with socket.socket() as sock:
-            sock.bind(("127.0.0.1", 0))
+            # torch's TCPStore binds every address, so probe every address: a port
+            # another process holds on the host address is free on loopback alone.
+            sock.bind(("", 0))
             ports.append(sock.getsockname()[1])
     os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(ports[0]),
                       NEURON_RT_ROOT_COMM_ID=f"127.0.0.1:{ports[1]}")
