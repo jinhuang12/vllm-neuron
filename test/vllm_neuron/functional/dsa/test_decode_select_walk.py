@@ -23,14 +23,17 @@ gives that list on a rank axis of up to ``WHOLE_ROW_COLUMNS`` (16384) pools;
 * **The route**: the indexer's DCP branch takes the walk past one compaction row and the
   whole-row entry up to it, and hands the merge the oracle's lists.
 * **The device compile** at the a8 and a4 shapes: the NEFF builds, every access is ordered
-  (``sbuf_order``), the dependency checker's verdicts are CLEAN, and the build prints its
-  SBUF allocation.
+  (``sbuf_order``), the dependency checker's verdicts are CLEAN, no SB spill, and each
+  core's SBUF allocation, every location live at once, is within ``SBUF_BYTES_PER_PARTITION``
+  and outside the runtime's reservations (all printed).
 """
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import glob
+import json
 import os
 import pathlib
 import re
@@ -53,7 +56,7 @@ from vllm_neuron.functional.dsa import kpool_hadamard as KH
 from vllm_neuron.functional.dsa.causal_bound import BOUND_FILL, BOUND_FILL_MARK, SENTINEL
 from vllm_neuron.source_digest import source_digest
 from vllm_neuron.utils import dcp_ownership as OWN
-from vllm_neuron.utils.neuron_utils import can_run_kernel
+from vllm_neuron.utils.neuron_utils import SBUF_BYTES_PER_PARTITION, can_run_kernel
 
 _CFG = decode_config()
 POOL = int(_CFG.index_kpool)
@@ -576,8 +579,8 @@ _needs_compiler = pytest.mark.skipif(
 #: ``(R, candidates)``: a8 at 1M (two chunks per rank) and a4 at 1M (four), one row (a
 #: decode or draft step) and a verify step's four rows on both programs.
 COMPILE_SHAPES = ((1, 2 * ROW), (4, 2 * ROW), (1, 4 * ROW), (4, 4 * ROW))
-#: The compiler's SBUF allocation lines, printed beside each build's verdicts.
-_ALLOCATION = re.compile(r"sbuf|SB usage|allocat", re.IGNORECASE)
+#: The SB allocator's spill count in the compiler log.
+_SB_SPILLS = re.compile(r"SB spills = (\d+) tensors")
 
 
 def _depcheck(dump: str) -> tuple[str, str]:
@@ -595,14 +598,56 @@ def _depcheck(dump: str) -> tuple[str, str]:
     return one_pass[0], loop_carried[0]
 
 
-def _allocation_lines(art: str) -> list[str]:
-    """Every line of the build's compiler logs that reports SBUF use or allocation."""
-    out = []
-    for log in sorted(glob.glob(f"{art}/**/log-neuron-cc*.txt", recursive=True)):
-        rel = pathlib.Path(log).relative_to(art)
-        out += [f"{rel}: {line.strip()}" for line in pathlib.Path(log).read_text(
-            errors="replace").splitlines() if _ALLOCATION.search(line)]
-    return out
+#: The runtime's two SBUF reservations as the dump names them (``neuron_utils``
+#: ``SBUF_DYNAMIC_DMA_SCRATCH_BYTES`` and ``SBUF_EVAL_ACCEL_RESERVED_BYTES``).
+_SB_RESERVED = ("DynamicDMAScratchLoc", "EvalAccelReservedLoc")
+
+
+@dataclasses.dataclass(frozen=True)
+class _SbufAllocation:
+    """One core's SB allocation, in bytes per partition (a location's ``dims[1]``)."""
+
+    #: Every location's bytes, the compiler's own included: the peak if all were live at once.
+    total: int
+    #: The addresses at least one location covers (live ranges that do not meet share them).
+    covered: int
+    #: Locations that meet a reservation (``(addr, end, name)``).
+    in_reserved: list[tuple[int, int, str]]
+    #: The three widest locations, ``(bytes, addr, name)``.
+    widest: list[tuple[int, int, str]]
+
+
+def _sbuf_allocation(dump: str) -> _SbufAllocation:
+    """One core's SB allocation from its ``lower_sync`` dump: every SB memory location but
+    the two reservations, each ``addr`` to ``addr + dims[1]``."""
+    with open(dump) as f:
+        function = json.load(f)["functions"][0]
+    sb = [(loc["addr"], loc["addr"] + loc["dims"][1], loc["name"])
+          for alloc in function["allocations"] for loc in alloc.get("memorylocations", [])
+          if loc["type"] == "SB"]
+    reserved = [(start, end) for start, end, name in sb if name in _SB_RESERVED]
+    assert len(reserved) == len(_SB_RESERVED), (dump, reserved)
+    tiles = sorted(loc for loc in sb if loc[2] not in _SB_RESERVED)
+    covered, run_start, run_end = 0, None, None
+    for start, end, _name in tiles:
+        if run_end is None or start > run_end:
+            covered += 0 if run_end is None else run_end - run_start
+            run_start, run_end = start, end
+        else:
+            run_end = max(run_end, end)
+    covered += 0 if run_end is None else run_end - run_start
+    return _SbufAllocation(
+        total=sum(end - start for start, end, _name in tiles), covered=covered,
+        in_reserved=[loc for loc in tiles
+                     if any(loc[0] < r_end and r_start < loc[1] for r_start, r_end in reserved)],
+        widest=sorted(((end - start, start, name) for start, end, name in tiles),
+                      reverse=True)[:3])
+
+
+def _sb_spills(art: str) -> list[int]:
+    """The SB allocator's spill counts, one per allocation pass, over the build's logs."""
+    return [int(n) for log in sorted(glob.glob(f"{art}/**/log-neuron-cc*.txt", recursive=True))
+            for n in _SB_SPILLS.findall(pathlib.Path(log).read_text(errors="replace"))]
 
 
 def _compile_walk(batch: int, candidates: int):
@@ -628,20 +673,28 @@ def _compile_walk(batch: int, candidates: int):
         assert len(dumps) == programs, (batch, candidates, dumps)
         out = []
         for dump in dumps:
-            out.append((pathlib.Path(dump).relative_to(art).parts[0],
+            out.append((pathlib.Path(dump).relative_to(art).parts[0], _sbuf_allocation(dump),
                         sbuf_order.check_dump(dump), *_depcheck(dump)))
-        return out, _allocation_lines(art)
+        return out, _sb_spills(art)
 
 
 @_needs_compiler
 @pytest.mark.parametrize("batch, candidates", COMPILE_SHAPES,
                          ids=[f"R{b}-C{c}" for b, c in COMPILE_SHAPES])
 def test_the_walk_kernel_compiles_with_every_access_ordered(batch, candidates):
-    builds, allocation = _compile_walk(batch, candidates)
+    builds, spills = _compile_walk(batch, candidates)
     label = f"walk R={batch} candidates={candidates}"
-    for line in allocation:
-        print(f"{label} allocation: {line}")
-    for core, order, one_pass, loop_carried in builds:
+    print(f"{label}: SB allocator spills {spills}")
+    assert spills and max(spills) == 0, (label, spills)
+    for core, sbuf, order, one_pass, loop_carried in builds:
+        bound = SBUF_BYTES_PER_PARTITION
+        print(f"{label} {core}: SBUF allocation {sbuf.total} B per partition (every location "
+              f"live at once; {sbuf.covered} B of addresses covered), bound "
+              f"SBUF_BYTES_PER_PARTITION {bound}, max(value - bound) {sbuf.total - bound}; "
+              f"locations in a reservation {len(sbuf.in_reserved)}; widest locations "
+              f"(B per partition, addr, name) {sbuf.widest}")
+        assert not sbuf.in_reserved, (label, core, sbuf.in_reserved[:4])
+        assert sbuf.total <= bound, (label, core, sbuf.total, bound)
         print(f"{label} {core}: {order.summary()}")
         print(f"{label} {core}: {one_pass}")
         print(f"{label} {core}: {loop_carried}")
