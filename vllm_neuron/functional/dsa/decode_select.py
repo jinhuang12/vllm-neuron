@@ -84,9 +84,9 @@ offsets do.
 The decode indexer serves candidate axes up to :data:`MAX_DECODE_INDEX_CANDIDATES` and
 refuses a longer ``max_model_len`` when the runner starts
 (:func:`check_decode_index_context`). A runner that batches more than one decode request
-is served up to :data:`MAX_BATCHED_DECODE_INDEX_CANDIDATES`, one whole row. Decode context
-parallelism selects with :func:`dsa_decode_select_pools`, on the whole-row path only, up to
-:data:`MAX_DECODE_POOLS_CANDIDATES` per rank (:func:`check_decode_pools_context`).
+is served up to :data:`MAX_BATCHED_DECODE_INDEX_CANDIDATES`, one whole row. Under decode
+context parallelism :func:`dsa_decode_select_pools` serves a rank axis of one whole row
+(:data:`MAX_DECODE_POOLS_CANDIDATES`); ``decode_select_walk`` serves a wider one.
 
 Both physical cores of an LNC2 core split the requests (``[2]`` grid at ``B >= 2``).
 
@@ -94,9 +94,9 @@ Decode context parallelism (DCP): each rank of a group selects over its own pool
 group merges the ranks' lists (trn2-2's item 3). :func:`dsa_decode_select_pools` is this
 selection with, beside the tokens, the local top-``k`` before the expansion: the selected
 pool ids in ascending order and their scores, the pads (:data:`POOL_PAD_ID`,
-:data:`POOL_PAD_VALUE`) after them. The ids are local; the DCP ownership map
-(``vllm_neuron.utils.dcp_ownership``) maps them to the global pool axis and the merged ids
-back to the rank's own bank rows.
+:data:`POOL_PAD_VALUE`) after them; ``decode_select_walk`` gives the same two past one row.
+The ids are local; the DCP ownership map (``vllm_neuron.utils.dcp_ownership``) maps them
+to the global pool axis and the merged ids back to the rank's own bank rows.
 
 Dispatches count in ``decode_batch``'s family (``decode_batch_dispatch_counters`` and the
 fourth entry of ``decode_batch_route_counts``): this is the batched decode indexer's third
@@ -175,9 +175,9 @@ MAX_DECODE_INDEX_CANDIDATES = DEVICE_CHECKED_ROW_CHUNKS * WHOLE_ROW_COLUMNS
 #: than one request (``max_num_seqs > 1``): the whole-row width. The chunk walk has run on
 #: trn2 at one request per step only.
 MAX_BATCHED_DECODE_INDEX_CANDIDATES = WHOLE_ROW_COLUMNS
-#: The widest per-rank candidate axis decode context parallelism serves
-#: (:func:`dsa_decode_select_pools`, :func:`check_decode_pools_context`): the whole-row
-#: width, the only path that reads each selected id's score.
+#: The widest per-rank candidate axis :func:`dsa_decode_select_pools` serves under decode
+#: context parallelism (:func:`check_decode_pools_context`): the whole-row width. A wider
+#: rank axis takes ``decode_select_walk``, at one request per step.
 MAX_DECODE_POOLS_CANDIDATES = WHOLE_ROW_COLUMNS
 #: The longest chunk (columns per partition) whose ``k``-th search takes four-bit digits;
 #: a longer one takes single bits (module docstring, step 1). A digit step counts 15

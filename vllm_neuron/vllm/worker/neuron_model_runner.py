@@ -562,19 +562,22 @@ def check_dcp_decode_index_context(vllm_config: Any, index_kpool: int | None) ->
     """Refuse a DCP run whose per-rank decode candidate axis is past the served width.
 
     Under DCP each rank's decode indexer scores only its own pools. So
-    :func:`~vllm_neuron.functional.dsa.decode_select.check_decode_pools_context`
+    :func:`~vllm_neuron.functional.dsa.decode_select_walk.check_decode_pools_walk_context`
     reads the context that rank covers (:func:`indexer_context_per_rank`), not
-    ``max_model_len``. A refusal names both lengths, followed by the check's own
-    message.
+    ``max_model_len``, and the most requests a decode step batches
+    (``scheduler_config.max_num_seqs``): the chunk walk's bound at one, the whole-row
+    bound above it. A refusal names both lengths, followed by the check's own message.
     """
-    from vllm_neuron.functional.dsa.decode_select import (
-        DecodeSelectError,
-        check_decode_pools_context,
+    from vllm_neuron.functional.dsa.decode_select import DecodeSelectError
+    from vllm_neuron.functional.dsa.decode_select_walk import (
+        check_decode_pools_walk_context,
     )
 
     per_rank = indexer_context_per_rank(vllm_config)
     try:
-        check_decode_pools_context(per_rank, index_kpool)
+        check_decode_pools_walk_context(
+            per_rank, index_kpool, int(vllm_config.scheduler_config.max_num_seqs)
+        )
     except DecodeSelectError as exc:
         raise DecodeSelectError(
             f"decode_context_parallel_size="
