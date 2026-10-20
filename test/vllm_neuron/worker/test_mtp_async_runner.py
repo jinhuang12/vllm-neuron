@@ -557,6 +557,7 @@ def test_the_translator_uses_the_device_correction_not_the_host_formulas(monkeyp
     # The runner hands its launch with every correction; on the host there is none.
     assert kwargs == {
         "prev_width": 1, "width": T, "page_size": translator.PAGE, "padding": 0, "launch": None,
+        "dcp_size": 1, "cp_rank": 0,
     }
 
 

@@ -7066,11 +7066,19 @@ class Glm5NextDSAIndexer(nn.Module):
                 f"by KV block, so the decode step needs page_size, the latent bank's "
                 f"block; got none"
             )
-        if self.dcp_size > 1 and rows > 1:
+        if self.dcp_size > 1 and pool_scores:
             raise Glm5NextDSAIndexerError(
-                f"decode_context_parallel_size={self.dcp_size} stores one row per request "
-                f"(the platform refuses speculative decoding at DCP > 1); got {rows} rows"
+                f"decode_context_parallel_size={self.dcp_size} selects over the group: "
+                f"each rank's pool scores cover only its own pools, and the selection is "
+                f"the merge of every rank's (token indices); pool scores are a one-rank "
+                f"form (mla_decode_masked)"
             )
+        # Under DCP a step of T rows takes each row at its own position, so the rows may
+        # lie in two ranks' blocks: the ring stays replicated (absolute positions), each
+        # row's closed pool is stored by its block's owner at its local id and every
+        # other row writes the trash row, and every rank scores and selects every row
+        # at its owned length (decode_trow's per-row form) before the group's merge.
+        # The DCP refusals left are by name above: no page_size, and pool scores.
         # Row b * rows + t sits at position[b] + t and writes through slots[b]: O(B * T)
         # index bookkeeping, no kernel. At one row per request the rows are the
         # requests, so the row positions are position and the row slots are slots; that
@@ -7114,12 +7122,6 @@ class Glm5NextDSAIndexer(nn.Module):
         query, key, weights, gate_score = projected
 
         one_token = rows == 1 and depth == pool
-        if self.dcp_size > 1 and not one_token:
-            raise Glm5NextDSAIndexerError(
-                f"decode_context_parallel_size={self.dcp_size} scores one token per request "
-                f"on a ring of index_kpool={pool} rows (the platform refuses speculative "
-                f"decoding at DCP > 1); got a ring of depth {depth}"
-            )
         if one_token:
             pooled, rings = dsa_decode_ring_step(
                 tail_bank, slots, key, gate_score, ape.to(torch.float32), position
@@ -7130,11 +7132,11 @@ class Glm5NextDSAIndexer(nn.Module):
             )
         if self.dcp_size > 1:
             # Under DCP each closed pool is its block owner's to store, at its local
-            # id; every other rank writes its trash row.
-            # One row per request here (the guard above), so row_positions == position.
-            local, owned = self._dcp_owned_position(position, int(page_size))
+            # id (the row's local row there); every other rank writes its trash row.
+            local, owned = self._dcp_owned_position(row_positions, int(page_size))
             slot_index, row = decode_pool_destinations(
-                slots, local, rows=int(pool_bank.shape[1]), pool_size=pool
+                slots if rows == 1 else slots.repeat_interleave(rows), local,
+                rows=int(pool_bank.shape[1]), pool_size=pool,
             )
             trash = torch.full_like(row, int(pool_bank.shape[1]) - 1)
             row = torch.where(owned, row, trash)
@@ -7144,14 +7146,15 @@ class Glm5NextDSAIndexer(nn.Module):
                 rows=int(pool_bank.shape[1]), pool_size=pool,
             )
         if self.dcp_size > 1:
-            # From here on the step is this rank's (5b's two operands): each request is
-            # bounded at its owned length, and the pool this step closes stands in at the
-            # step's local row. That row closes a pool only where this rank owns the step;
-            # elsewhere it is the owned length before the step's block, a whole block, and
-            # stands nothing in. The ring step and the pool destinations above read the
-            # absolute position and are done.
+            # From here on the step is this rank's (5b's two operands): each row is
+            # bounded at its owned length, and a pool this step closes stands in at its
+            # row's local row. A row closes a pool only where this rank owns it;
+            # elsewhere its position is the owned length before its block, whole blocks,
+            # and stands nothing in. At T > 1 the positions are per row ([B * T]), the
+            # score kernel's per-row form. The ring step and the pool destinations above
+            # read the absolute positions and are done.
             seq_lens = self._dcp_owned_lengths(seq_lens, int(page_size))
-            position = self._dcp_owned_lengths(position, int(page_size))
+            position = self._dcp_owned_lengths(row_positions, int(page_size))
         bounded = None
         if selects:
             if one_token:
@@ -9000,14 +9003,18 @@ class Glm5NextMLAAttention(nn.Module):
         *,
         topk_indices: torch.Tensor | None,
     ) -> torch.Tensor:
-        """One decode token per request under DCP: ``[B, H, L]`` bf16.
+        """``T`` decode rows per request under DCP: ``[B * T, H, L]`` bf16.
 
-        ``mla_decode_partial_attention`` (5a) over this rank's window: ``position`` is
-        handed as the step's owned length on this rank (its local row where the rank
-        owns the step, else the rows it holds before the step's block) and ``owner``
-        as whether it owns the step, so the own row in ``written`` counts on its owner
-        only. ``block_table`` is ``[B, pages]``; ``topk_indices`` the indexer's rows of
-        this rank's window, or None for the dense prefix.
+        ``mla_decode_partial_attention`` (5a) over this rank's window. Row ``t`` of
+        request ``b`` (row ``b * T + t`` of ``q_lift`` and ``written``) sits at position
+        ``position[b] + t``; ``T`` is ``q_lift``'s rows over the requests, 1 on the plain
+        decode step and ``1 + k`` on a speculative verify step. Each row's position is
+        handed as its owned length on this rank (its local row where the rank owns it,
+        else the rows the rank holds before it) and ``owner`` as whether the rank owns
+        it, so each own row in ``written`` counts on its owner only. At ``T = 1`` both
+        are ``[B]`` and read ``position`` directly. ``block_table`` is ``[B, pages]``;
+        ``topk_indices`` the indexer's rows of this rank's window, one per query row, or
+        None for the dense prefix.
 
         The key-split kernel cuts its window into 128-row chunks shared evenly by the
         two programs of an LNC2 pair (``mla_decode._split_serves``), and the served
@@ -9034,8 +9041,19 @@ class Glm5NextMLAAttention(nn.Module):
             pad = -int(topk_indices.shape[1]) % (2 * page_size)
             if pad:
                 topk_indices = torch.cat(
-                    (topk_indices, topk_indices.new_full((batch, pad), SENTINEL)), dim=1
+                    (
+                        topk_indices,
+                        topk_indices.new_full((int(topk_indices.shape[0]), pad), SENTINEL),
+                    ),
+                    dim=1,
                 )
+        # ``position`` is read before ``q_lift``: dynamo orders a graph's inputs by their
+        # first read, so the one-row graph keeps its input order.
+        requests = int(position.shape[0])
+        rows = int(q_lift.shape[0]) // requests
+        if rows > 1:
+            offsets = torch.arange(rows, device=position.device, dtype=torch.int64)
+            position = (position.to(torch.int64)[:, None] + offsets[None, :]).reshape(-1)
         owner = token_owner(
             position.to(torch.int64), block_size=page_size, dcp_size=self.dcp_size
         ) == rank
@@ -9194,7 +9212,8 @@ class Glm5NextMLAAttention(nn.Module):
         # draft head's carrier hands the selection to later iterations as token
         # indices, so it keeps them.
         masked = (
-            not dense
+            self.dcp_size == 1
+            and not dense
             and index_share is None
             and batch == 1
             and rows > 1

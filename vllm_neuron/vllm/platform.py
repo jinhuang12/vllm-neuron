@@ -6,10 +6,12 @@ This module provides the NeuronPlatform class that integrates vLLM Neuron with v
 platform plug-in system.
 """
 
+import ast
 import logging
 import os
 import sys
 import time as _time
+from importlib.machinery import PathFinder, SourceFileLoader
 from multiprocessing.process import BaseProcess
 from typing import TYPE_CHECKING
 
@@ -118,6 +120,78 @@ def _apply_dcp_patch(ModelConfig):
 
     _patched_verify._neuron_dcp_patched = True
     ModelConfig.verify_with_parallel_config = _patched_verify
+
+
+def _module_binding(tree: ast.Module, name: str) -> tuple[bool | None, int]:
+    """The last module-scope binding of ``name`` in the parsed module ``tree``.
+
+    ``(True, line)`` when the last top-level statement that binds ``name`` is
+    ``name = True`` (``a = name = True`` and ``name: <annotation> = True`` count),
+    ``(False, line)`` when it is any other statement, ``(None, 0)`` when no top-level
+    statement binds ``name``; ``line`` is that statement's first line.
+
+    A statement binds ``name`` when a node in it, outside the body of a ``def``,
+    ``lambda`` or ``class``, stores or deletes ``name`` (any assignment, a ``for``,
+    ``with ... as`` or walrus target; one under ``if`` or ``try`` included), imports
+    it (a star import counts), defines a function or class of that name, or captures
+    it in ``except ... as`` or a ``match`` pattern. ``name: <annotation>`` with no
+    value binds nothing, and a comprehension's loop variable is the comprehension's
+    own.
+    """
+    scopes = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+    named = (
+        ast.FunctionDef,
+        ast.AsyncFunctionDef,
+        ast.ClassDef,
+        ast.ExceptHandler,
+        ast.MatchAs,
+        ast.MatchStar,
+    )
+
+    def binds(node: ast.AST) -> bool:
+        if isinstance(node, ast.Name):
+            return node.id == name and not isinstance(node.ctx, ast.Load)
+        if isinstance(node, ast.alias):
+            bound = node.asname or node.name.partition(".")[0]
+            return node.name == "*" or bound == name
+        if isinstance(node, named) and node.name == name:
+            return True
+        if isinstance(node, ast.MatchMapping) and node.rest == name:
+            return True
+        for field, value in ast.iter_fields(node):
+            if field == "body" and isinstance(node, scopes):
+                continue  # another scope's
+            if field == "target" and (
+                isinstance(node, ast.comprehension)
+                or (isinstance(node, ast.AnnAssign) and node.value is None)
+            ):
+                continue  # the comprehension's own, or an annotation only
+            for child in value if isinstance(value, list) else [value]:
+                if isinstance(child, ast.AST) and binds(child):
+                    return True
+        return False
+
+    def sets_true(statement: ast.stmt) -> bool:
+        if isinstance(statement, ast.Assign):
+            targets = statement.targets
+        elif isinstance(statement, ast.AnnAssign) and statement.value is not None:
+            targets = [statement.target]
+        else:
+            return False
+        return (
+            isinstance(statement.value, ast.Constant)
+            and statement.value.value is True
+            and all(isinstance(target, ast.Name) for target in targets)
+            and any(target.id == name for target in targets)
+        )
+
+    binding: tuple[bool | None, int] = (None, 0)
+    for statement in tree.body:
+        if sets_true(statement):
+            binding = (True, statement.lineno)
+        elif binds(statement):
+            binding = (False, statement.lineno)
+    return binding
 
 
 class NeuronPlatform(Platform):
@@ -1276,52 +1350,194 @@ class NeuronPlatform(Platform):
             f"return {expected}, or serve text only with --language-model-only."
         )
 
+    #: The paths a speculative step of GLM-5.3-Flash needs under decode context
+    #: parallelism, each vouched for by a module constant that the module's source
+    #: sets to True where the path is in the tree (read without importing the module,
+    #: :meth:`_missing_capability`): (what it is, module, attribute, needed only with
+    #: the async drafter, ``VLLM_NEURON_GLM5NEXT_MTP_ASYNC``).
+    _DCP_SPECULATIVE_CAPABILITIES = (
+        (
+            "the T-row DCP partial-attention entry",
+            "vllm_neuron.functional.attention.mla_decode",
+            "DCP_SPECULATIVE_ROWS",
+            False,
+        ),
+        (
+            "the DSA indexer's T rows under DCP",
+            "vllm_neuron.functional.dsa.decode_trow",
+            "DCP_SPECULATIVE_ROWS",
+            False,
+        ),
+        (
+            "the draft head's DCP ownership slots",
+            "vllm_neuron.model.glm5_next.mtp",
+            "DCP_DRAFT_SLOTS",
+            False,
+        ),
+        (
+            "the async drafter's DCP latent slots",
+            "vllm_neuron.functional.mtp.async_step",
+            "DCP_LATENT_SLOTS",
+            True,
+        ),
+    )
+    #: The shadow draft's path under decode context parallelism: draft slots from the
+    #: DCP ownership map.
+    _DCP_DRAFT_SLOTS = ("vllm_neuron.model.glm5_next.mtp", "DCP_DRAFT_SLOTS")
+
+    @staticmethod
+    def _capability_source(module: str) -> str | None:
+        """The Python source file ``module`` would be imported from, found without
+        importing it or any package above it; None when there is none.
+
+        The dotted name is walked one level at a time with
+        ``importlib.machinery.PathFinder.find_spec``, which finds a spec and runs no
+        module code. A package above ``module`` that is already imported gives its own
+        ``__path__``, as the import system reads it; one that is not gives its spec's
+        search locations, so a namespace package resolves. None when a level is not
+        found, when a level above ``module`` is a module rather than a package, or when
+        ``module`` has no source file of its own (a sourceless ``.pyc`` or an extension
+        module).
+        """
+        parts = module.split(".")
+        search = None  # sys.path, for the top level
+        for depth in range(1, len(parts)):
+            package = ".".join(parts[:depth])
+            locations = getattr(sys.modules.get(package), "__path__", None)
+            if locations is None:
+                spec = PathFinder.find_spec(package, search)
+                locations = None if spec is None else spec.submodule_search_locations
+            if locations is None:
+                return None
+            search = list(locations)
+        spec = PathFinder.find_spec(module, search)
+        if spec is None or not isinstance(spec.loader, SourceFileLoader):
+            return None
+        return spec.origin
+
+    @classmethod
+    def _missing_capability(cls, module: str, attribute: str) -> str | None:
+        """Why ``module`` does not vouch for its path, naming the file read; None when
+        it does.
+
+        ``module`` vouches when the last module-scope binding of ``attribute`` in its
+        source is ``attribute = True`` (:func:`_module_binding`), the value an import
+        of it would leave. The source is found by :meth:`_capability_source` and
+        parsed with :mod:`ast`; nothing is imported or run, so validating a config
+        imports no kernel module (an ``nki.jit`` kernel module calls into the Neuron
+        runtime as it is imported). A file that cannot be found, read or parsed does
+        not vouch.
+        """
+        path = cls._capability_source(module)
+        if path is None:
+            return f"no Python source file for {module} on the import path"
+        try:
+            with open(path, "rb") as source:
+                tree = ast.parse(source.read(), filename=path)
+        except OSError as error:
+            return f"{path} cannot be read ({error.strerror or error})"
+        except (SyntaxError, ValueError) as error:
+            line = getattr(error, "lineno", None)
+            where = f", line {line}" if line else ""
+            detail = getattr(error, "msg", None) or error
+            return f"{path} does not parse ({detail}{where})"
+        value, line = _module_binding(tree, attribute)
+        if value is None:
+            return f"{path} does not set {attribute} = True at module level"
+        if not value:
+            return (
+                f"{path} binds {attribute} other than to True at module level "
+                f"(line {line})"
+            )
+        return None
+
     @classmethod
     def _refuse_speculative_decoding_under_dcp(cls, vllm_config) -> None:
-        """Refuse speculative decoding and the shadow draft under decode context parallelism.
+        """Refuse speculative decoding and the shadow draft under decode context
+        parallelism unless the paths they need are in the tree.
 
-        The DCP partial-attention kernel entry refuses more than one query row
-        per request, and a verify step carries ``1 + num_speculative_tokens``
-        rows. The multi-row DCP attention entry (item 5a, T > 1 follow-up)
-        lifts this refusal. Callers check ``dcp_size > 1`` first.
+        A verify step carries ``1 + num_speculative_tokens`` rows per request, and those
+        rows can fall in two ranks' blocks. A speculative config is admitted for
+        GLM-5.3-Flash with method "mtp" when every capability in
+        :attr:`_DCP_SPECULATIVE_CAPABILITIES` that the server needs is present: the T-row
+        DCP partial-attention entry, the DSA indexer's T rows under DCP, the draft head's
+        DCP ownership slots (its iterations past the first take them) and, with the async
+        drafter, its DCP latent slots. Otherwise it is refused with the message
+        below, which names what is missing and the file each was read from. Callers
+        check ``dcp_size > 1`` first.
 
-        With no speculative config, ``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT`` >= 1
-        still runs the GLM-5.3-Flash MTP head's draft iterations, so for that
-        architecture it is refused here by name. A draft iteration past the
-        first computes the MTP layer's KV slot from the sequence's page index
-        over the rank's block table, and under DCP that table lists only the
-        rank's own pages. No other architecture reads the knob.
+        With no speculative config, ``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT`` >= 1 still runs
+        the GLM-5.3-Flash MTP head's draft iterations. A draft iteration past the first
+        computes the MTP layer's KV slot for a position no step has slotted, and under
+        DCP the rank's block table lists only its own pages, so the slot must come from
+        the DCP ownership map. The knob is admitted where the head says it does
+        (``mtp.DCP_DRAFT_SLOTS``) and refused by name otherwise. No other architecture
+        reads the knob.
+
+        Each capability is read from its module's source by
+        :meth:`_missing_capability`, which imports none of the modules: this check runs
+        in the engine process at config validation, before any model is built.
         """
+        dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+        architectures = (
+            getattr(vllm_config.model_config.hf_config, "architectures", None) or ()
+        )
+        glm5_next = "Glm5NextForConditionalGeneration" in architectures
         speculative_config = vllm_config.speculative_config
         if speculative_config is None:
-            architectures = (
-                getattr(vllm_config.model_config.hf_config, "architectures", None) or ()
-            )
-            if "Glm5NextForConditionalGeneration" in architectures:
+            if glm5_next:
                 shadow_draft = int(envs.VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT)
+                module, attribute = cls._DCP_DRAFT_SLOTS
+                reason = None
                 if shadow_draft >= 1:
+                    reason = cls._missing_capability(module, attribute)
+                if reason is not None:
                     raise ValueError(
-                        f"VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT={shadow_draft} is not "
-                        "supported with decode_context_parallel_size="
-                        f"{vllm_config.parallel_config.decode_context_parallel_size}: "
+                        f"VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT={shadow_draft} "
+                        "is not supported with decode_context_parallel_size="
+                        f"{dcp_size}: "
                         "from its second draft iteration on, the shadow draft "
                         "computes the MTP layer's KV slots from the sequence's page "
                         "index, and a decode context parallel rank holds only its "
                         "own pages. Unset VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT or set "
-                        "decode_context_parallel_size=1."
+                        "decode_context_parallel_size=1. This tree lacks the draft "
+                        f"head's DCP ownership slots ({module}.{attribute}: {reason})."
                     )
             return
         num_speculative_tokens = speculative_config.num_speculative_tokens
-        if num_speculative_tokens > 0:
-            raise ValueError(
-                "Speculative decoding is not supported with "
-                "decode_context_parallel_size > 1 "
-                f"(dcp={vllm_config.parallel_config.decode_context_parallel_size}, "
-                f"num_speculative_tokens={num_speculative_tokens}): "
-                "spec decode under DCP (item 5a T > 1 follow-up) is not "
-                "implemented. Disable speculative decoding or set "
-                "decode_context_parallel_size=1."
+        if num_speculative_tokens <= 0:
+            return
+        method = getattr(speculative_config, "method", None)
+        if not glm5_next or method != "mtp":
+            served = ", ".join(architectures) or "an unnamed architecture"
+            missing = (
+                f"Under decode context parallelism only speculative method 'mtp' on "
+                f"Glm5NextForConditionalGeneration has a multi-row decode path; this "
+                f"server asks for method '{method}' on {served}."
             )
+        else:
+            mtp_async = bool(envs.VLLM_NEURON_GLM5NEXT_MTP_ASYNC)
+            lacking = []
+            for label, module, attribute, async_only in (
+                cls._DCP_SPECULATIVE_CAPABILITIES
+            ):
+                if async_only and not mtp_async:
+                    continue
+                reason = cls._missing_capability(module, attribute)
+                if reason is not None:
+                    lacking.append(f"{label} ({module}.{attribute}: {reason})")
+            if not lacking:
+                return
+            missing = f"This tree lacks {', '.join(lacking)}."
+        raise ValueError(
+            "Speculative decoding "
+            "is not supported with decode_context_parallel_size > 1 "
+            f"(dcp={dcp_size}, "
+            f"num_speculative_tokens={num_speculative_tokens}): "
+            "spec decode under DCP (item 5a T > 1 follow-up) is not "
+            "implemented. Disable speculative decoding or set "
+            f"decode_context_parallel_size=1. {missing}"
+        )
 
     @classmethod
     def _refuse_multimodal_input_under_dcp(cls, vllm_config) -> None:

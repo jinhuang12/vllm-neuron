@@ -21,6 +21,16 @@ multiply by ``H_128`` per row with the scale applied while the product leaves PS
 are the products, the contraction axis and the single rounding of
 :func:`kpool_hadamard.dsa_hadamard128`; on the simulator the scores equal the scores of
 the query that kernel rotates, bit for bit. The step then launches no rotation kernel.
+
+Under decode context parallelism (DCP) a step's rows can lie in two ranks' 128-token
+blocks, so on one rank they are not consecutive local rows. The kernel then takes each
+row's own position (``position`` ``[B * T]``, the per-row form): on rank ``rank`` row
+``b * T + t`` is at ``dcp_ownership.owned_length(p_b + t, rank)``, its local row where the
+rank holds it and the whole blocks the rank holds before it elsewhere. No owner flag is
+needed. A row the rank does not hold sits at a multiple of the pool size, so it closes no
+pool and stands nothing in, and its bound at ``position + 1`` keeps the same complete pools
+as one at ``position``, its owned length. Fed ``p_b + t``, the per-row form is the
+per-request form bit for bit.
 """
 
 from __future__ import annotations
@@ -63,6 +73,12 @@ _LINE = 8
 SOURCE_DIGEST = source_digest(__file__, _kpool_hadamard.__file__)
 """A digest of this file and of ``kpool_hadamard.py`` (whose rotation size and scale the
 on-chip rotation reads), passed to the kernel so the kernel cache keys on both."""
+
+#: The DSA indexer scores a ``T``-row step under DCP: :func:`dsa_decode_scores_rows`
+#: takes the per-row position form and ``Glm5NextDSAIndexer.forward_requests`` runs ``T``
+#: rows and the speculative ring at ``dcp_size > 1``. The platform's speculative-decoding
+#: refusal under DCP reads it.
+DCP_SPECULATIVE_ROWS = True
 
 
 class DecodeTrowError(ValueError):
@@ -193,12 +209,14 @@ def dsa_decode_scores_rows_kernel(q_hbm, w_hbm, bank_hbm, slots_hbm, pos_hbm, po
             when ``rotate``.
         w_hbm: ``[B * rows, heads]`` fp32, the head weights, every scale folded in.
         bank_hbm: ``[slots, store_rows, head_dim]`` bf16, the pooled-key bank.
-        slots_hbm / pos_hbm: ``[B, 1]`` int32, each request's slot and the position of
-            its row 0.
+        slots_hbm: ``[B, 1]`` int32, each request's slot.
+        pos_hbm: ``[B, 1]`` int32, the position of each request's row 0, row ``t`` at
+            ``pos[b] + t``; or ``[B * rows, 1]`` int32, each row's own position (the
+            per-row form, read when ``rows > 1``). Below, ``pos(b, t)`` is row ``t``'s.
         pooled_hbm: ``[B * rows, head_dim]`` bf16, the pool each row closes (the ring
             step's output); row ``b * rows + t`` stands in at candidate
-            ``(pos[b] + t) // pool_size`` for every row ``t'' >= t`` of request ``b``
-            where position ``pos[b] + t`` closes a pool.
+            ``pos(b, t) // pool_size`` for every row ``t'' >= t`` of request ``b``
+            where position ``pos(b, t)`` closes a pool.
         candidates: python int, the candidate axis (``max_seq_len // pool_size``).
         pool_size: python int, a power of two.
         rows: python int, query rows per request.
@@ -208,7 +226,7 @@ def dsa_decode_scores_rows_kernel(q_hbm, w_hbm, bank_hbm, slots_hbm, pos_hbm, po
 
     Returns:
         ``[B * rows, candidates]`` fp32: row ``b * rows + t`` is ``sum_h w[h] * relu(q[h]
-        . k[c])`` where pool ``c`` is complete at length ``pos[b] + t + 1``
+        . k[c])`` where pool ``c`` is complete at length ``pos(b, t) + 1``
         (``(c + 1) * pool_size <= length``) and ``BOUND_FILL`` where it is not.
 
     Request ``b`` reads rows ``slot[b] * store_rows + [0, candidates)`` of the bank once
@@ -247,6 +265,9 @@ def dsa_decode_scores_rows_kernel(q_hbm, w_hbm, bank_hbm, slots_hbm, pos_hbm, po
     if rotate:
         signs = _hadamard_signs(q_hbm.dtype)
 
+    # The per-row form: one position per row (``[B * rows, 1]``) instead of row 0's.
+    per_row = pos_hbm.shape[0] != batch
+
     n_prgs = nl.num_programs(axes=0)
     prg = nl.program_id(0)
     for b in nl.affine_range(prg, batch, n_prgs):
@@ -254,17 +275,23 @@ def dsa_decode_scores_rows_kernel(q_hbm, w_hbm, bank_hbm, slots_hbm, pos_hbm, po
         slot_t = _sb((1, _LINE), nl.int32)
         nisa.dma_copy(dst=slot_t[0:1, 0:1], src=slots_hbm.ap(pattern=[[1, 1], [1, 1]],
                                                              offset=b))
-        pos_i = _col(PARTITIONS, nl.int32)
-        nisa.dma_copy(dst=pos_i, src=pos_hbm.ap(pattern=[[0, PARTITIONS], [1, 1]], offset=b))
-        pos_f = _col(PARTITIONS, nl.float32)
-        nisa.tensor_copy(dst=pos_f, src=pos_i)
+        if not per_row:
+            pos_i = _col(PARTITIONS, nl.int32)
+            nisa.dma_copy(dst=pos_i, src=pos_hbm.ap(pattern=[[0, PARTITIONS], [1, 1]],
+                                                    offset=b))
+            pos_f = _col(PARTITIONS, nl.float32)
+            nisa.tensor_copy(dst=pos_f, src=pos_i)
         # Per row: the candidate its pool stands in at (position // pool_size where the
         # row closes a pool, else -1) and minus its length.
         stand_at = []
         neg_len = []
         for t in range(rows):
             pos_t = _col(PARTITIONS, nl.int32)
-            nisa.tensor_scalar(dst=pos_t, data=pos_i, op0=nl.add, operand0=t)
+            if per_row:
+                nisa.dma_copy(dst=pos_t, src=pos_hbm.ap(pattern=[[0, PARTITIONS], [1, 1]],
+                                                        offset=b * rows + t))
+            else:
+                nisa.tensor_scalar(dst=pos_t, data=pos_i, op0=nl.add, operand0=t)
             pool_i = _col(PARTITIONS, nl.int32)
             nisa.tensor_scalar(dst=pool_i, data=pos_t, op0=nl.right_shift, operand0=shift)
             ring_i = _col(PARTITIONS, nl.int32)
@@ -283,8 +310,14 @@ def dsa_decode_scores_rows_kernel(q_hbm, w_hbm, bank_hbm, slots_hbm, pos_hbm, po
             nisa.tensor_scalar(dst=at_f, data=at_f, op0=nl.add, operand0=-1.0)
             stand_at.append(at_f)
             minus = _col(PARTITIONS, nl.float32)
-            nisa.tensor_scalar(dst=minus, data=pos_f, op0=nl.add, operand0=float(t + 1),
-                               op1=nl.multiply, operand1=-1.0)
+            if per_row:
+                row_f = _col(PARTITIONS, nl.float32)
+                nisa.tensor_copy(dst=row_f, src=pos_t)
+                nisa.tensor_scalar(dst=minus, data=row_f, op0=nl.add, operand0=1.0,
+                                   op1=nl.multiply, operand1=-1.0)
+            else:
+                nisa.tensor_scalar(dst=minus, data=pos_f, op0=nl.add, operand0=float(t + 1),
+                                   op1=nl.multiply, operand1=-1.0)
             neg_len.append(minus)
 
         # ---- the keys of this request's slot once, and its rows' pools as more tiles ---
@@ -453,9 +486,9 @@ def _require(query, weights, pool_bank, slots, position, pooled, candidates,
     if tuple(pooled.shape) != (total, head_dim):
         raise DecodeTrowError(f"pooled must be [B * rows, head_dim] = {(total, head_dim)}, "
                               f"one closed pool per query row; got {tuple(pooled.shape)}")
-    if not torch.is_tensor(position) or tuple(position.shape) != (batch,):
-        raise DecodeTrowError(f"position must be [{batch}], row 0's position per request; "
-                              f"got {position!r}")
+    if not torch.is_tensor(position) or tuple(position.shape) not in ((batch,), (total,)):
+        raise DecodeTrowError(f"position must be [{batch}], row 0's position per request, or "
+                              f"[{total}], each row's own; got {position!r}")
     for name, value in (("slots", slots), ("position", position)):
         if value.dtype not in (torch.int32, torch.int64):
             raise DecodeTrowError(f"{name} must be int32 or int64; got {value.dtype}")
@@ -474,11 +507,16 @@ def _require(query, weights, pool_bank, slots, position, pooled, candidates,
             f"rotate_query applies the {INDEX_HEAD_DIM}-point Hadamard rotation; the query's "
             f"head_dim is {head_dim}")
     if values_are_readable(position):
+        # A row at the axis end (candidates * pool) closes no pool on the axis and keeps
+        # every pool, which is where a DCP rank whose window is full holds a row another
+        # rank owns; past it a row's pool would stand in nowhere.
         lo, hi = int(position.min()), int(position.max())
-        if lo < 0 or hi + rows - 1 >= cands * pool:
+        later = rows - 1 if int(position.shape[0]) == batch else 0
+        if lo < 0 or hi + later > cands * pool:
             raise DecodeTrowError(
-                f"each request's {rows} rows must lie inside the window of {cands} pools x "
-                f"{pool} tokens: positions [{lo}, {hi}] + {rows - 1}")
+                f"every row's position must lie in the window [0, candidates * pool_size] "
+                f"= [0, {cands * pool}] ({cands} pools x {pool} tokens): positions [{lo}, "
+                f"{hi}] + {later}")
     return batch, rows
 
 
@@ -494,7 +532,10 @@ def dsa_decode_scores_rows(query: Tensor, weights: Tensor, pool_bank: Tensor, sl
         pool_bank: ``[slots, store_rows, head_dim]`` bf16, read at ``slots`` only,
             candidates ``0 .. candidates - 1`` of each.
         slots: ``[B]`` int, each request's slot.
-        position: ``[B]`` int, each request's position of row 0.
+        position: ``[B]`` int, each request's position of row 0 (row ``t`` at
+            ``position[b] + t``), or ``[B * rows]`` int, each row's own position (the
+            per-row form of a DCP rank, module docstring). Every row's position lies in
+            ``[0, candidates * pool_size]``.
         pooled: ``[B * rows, head_dim]`` bf16, the ring step's output: the pool each row
             closes (meaningless where it closes none; not read there).
         candidates: the candidate axis (``max_seq_len // pool_size``), below the bank's
@@ -506,7 +547,7 @@ def dsa_decode_scores_rows(query: Tensor, weights: Tensor, pool_bank: Tensor, sl
 
     Returns:
         ``[B * rows, candidates]`` fp32, row ``b * rows + t`` the scores of request
-        ``b``'s row ``t``, ``BOUND_FILL`` past its length ``position[b] + t + 1``.
+        ``b``'s row ``t``, ``BOUND_FILL`` past its length, its position plus one.
     """
     batch, rows = _require(query, weights, pool_bank, slots, position, pooled, candidates,
                            pool_size, rotate_query)
@@ -522,9 +563,10 @@ def dsa_decode_scores_rows(query: Tensor, weights: Tensor, pool_bank: Tensor, sl
     call = wrap_nki(dsa_decode_scores_rows_kernel)
     if programs == 2:
         call = call[2]
+    positions = int(position.shape[0])
     return call(query.contiguous(), weights.to(torch.float32).contiguous(),
                 pool_bank.contiguous(), slots.reshape(batch, 1).to(torch.int32).contiguous(),
-                position.reshape(batch, 1).to(torch.int32).contiguous(), pooled.contiguous(),
+                position.reshape(positions, 1).to(torch.int32).contiguous(), pooled.contiguous(),
                 int(candidates), int(pool_size), rows, bool(rotate_query), SOURCE_DIGEST)
 
 
@@ -542,11 +584,11 @@ def dsa_decode_scores_rows_torch_oracle(query, weights, pool_bank, slots, positi
     cands, pool = int(candidates), int(pool_size)
     out = torch.empty(batch * rows, cands, dtype=torch.float32)
     column = torch.arange(cands)
+    per_row = int(position.shape[0]) != batch
     for b in range(batch):
         keys = pool_bank[int(slots[b]), :cands].float().clone()
-        start = int(position[b])
         for t in range(rows):
-            pos = start + t
+            pos = int(position[b * rows + t]) if per_row else int(position[b]) + t
             if pos % pool == pool - 1:
                 keys[pos // pool] = pooled[b * rows + t].float()
             per_head = (query[b * rows + t].float() @ keys.t()).clamp(min=0.0)

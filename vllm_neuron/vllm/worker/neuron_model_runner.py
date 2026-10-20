@@ -617,9 +617,9 @@ def _dcp_owned_latent_slots(
             any rank.
     """
     from vllm_neuron.utils.dcp_ownership import (
+        owned_latent_slots,
         ownership_stride,
         token_local_row,
-        token_owner,
     )
 
     local = token_local_row(positions, block_size=block_size, dcp_size=dcp_size)
@@ -632,10 +632,16 @@ def _dcp_owned_latent_slots(
             f"decode_context_parallel_size={dcp_size} one entry covers {stride} "
             f"positions, and a position outside the row has no slot"
         )
-    owned = token_owner(positions, block_size=block_size, dcp_size=dcp_size) == cp_rank
-    slots = torch.tensor(row, dtype=torch.int64)[pages] * block_size + local % block_size
-    return torch.where(
-        owned, slots, torch.full_like(slots, NULL_BLOCK_ID * block_size)
+    # One column per position, all of them this request's row.
+    table = torch.tensor(row, dtype=torch.int64).reshape(-1, 1)
+    table = table.expand(-1, positions.numel())
+    return owned_latent_slots(
+        table,
+        positions,
+        cp_rank,
+        block_size=block_size,
+        dcp_size=dcp_size,
+        null_block=NULL_BLOCK_ID,
     ).tolist()
 
 
@@ -7283,7 +7289,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         a stack with no sparse bank gets no slots), and the returned
         :class:`~vllm_neuron.functional.mtp.async_step.StepCorrection` is what every
         layer's carrier takes as its position-derived operands. The carry is consumed:
-        the next step needs its own.
+        the next step needs its own. Under decode context parallelism the correction is
+        handed this rank's group size and index, so its slots are the owner-gated ones
+        the synchronous translator writes (``_dcp_owned_latent_slots``).
 
         Returns:
             ``(correction, column)``: the column is the ``[pages, R]`` int32 table the
@@ -7342,6 +7350,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         ).to(device)
         from vllm_neuron.functional.mtp import async_step as mtp_async
 
+        # This rank's DCP geometry, as the translator reads it for the host-built slots.
+        dcp_size = int(getattr(self, "_dcp_size", 1))
+        cp_rank = int(self.cp_rank) if dcp_size > 1 else 0
         # The carry whole: its first ``requests`` rows are this step's requests, read
         # inside the launch (no slice of a device tensor outside it).
         correction = mtp_async.mtp_async_correct(
@@ -7352,6 +7363,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             width=int(width),
             page_size=page_size,
             padding=int(padding),
+            dcp_size=dcp_size,
+            cp_rank=cp_rank,
             launch=self._glm5next_async_launch(),
         )
         self._glm5next_async_carry = None
@@ -7471,8 +7484,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     break
             # A start the correction can pull back at every pair: the warmup take kept
             # one row, so a previous step ``1 + k`` wide rejected ``k`` rows. The take's
-            # rows go whole, as a served step hands its carry.
+            # rows go whole, as a served step hands its carry, and the DCP geometry is the
+            # served step's (``_glm5next_async_correction``), part of the graph's signature.
             starts = torch.full((1,), k, dtype=torch.int32).to(sampled.device)
+            dcp_size = int(getattr(self, "_dcp_size", 1))
+            cp_rank = int(self.cp_rank) if dcp_size > 1 else 0
             for prev_width, width in ((1 + k, 1 + k), (1, 1 + k), (1 + k, 1), (1, 1)):
                 correction = mtp_async.mtp_async_correct(
                     take.checkpoint_rows,
@@ -7482,6 +7498,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     width=width,
                     page_size=page_size if page_size is not None else 1,
                     padding=padding,
+                    dcp_size=dcp_size,
+                    cp_rank=cp_rank,
                     launch=launch,
                 )
                 self._materialize_warmup_output(
