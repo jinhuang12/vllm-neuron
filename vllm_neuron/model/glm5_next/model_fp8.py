@@ -1357,16 +1357,19 @@ def _token_gather_combine(
     block: int,
     rows: int,
     top_k: int,
+    collector: list[torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Sum each token's rows of the fused expert emission, in fp32.
 
     The emission ``[blocks * rows, H]`` holds expert ``e``'s tokens in token order
     from row ``first_block[e] * rows``, which is the layout ``build_blockwise_mapping``
-    hands the kernel once each block is cut to its first ``rows`` rows. A token
-    selects at most ``top_k`` of this rank's experts, so its rows follow from the
-    routing mask alone and are gathered into ``top_k`` slots in expert order, the
-    order the scatter-add met them in. The kernel defines only routed rows and row 0,
-    so every gathered index is a routed row or row 0.
+    hands the kernel once each block is cut to its first ``rows`` rows. The mapping
+    sizes the emission for ``top_k`` selections per token and places a (token,
+    expert) pair only if its row is inside the emission; the rows follow from the
+    routing mask alone, and ``combine_slots`` gathers exactly the placed pairs into
+    ``top_k`` slots in expert order, the order the scatter-add met them in. The
+    kernel defines only routed rows and row 0, so every gathered index is a placed
+    row or row 0, at any routing.
 
     Args:
         contribution: ``[blocks * rows, H]`` fp32 kernel emission.
@@ -1374,6 +1377,9 @@ def _token_gather_combine(
         block: tokens per block in the mapping.
         rows: rows the kernel keeps per block, ``min(T, block)``.
         top_k: experts each token selects.
+        collector: when given, receives the ``[1, 1]`` fp32 count of routed pairs the
+            emission does not hold: 0 unless a token has more than ``top_k`` non-zero
+            affinities (a non-finite router row is non-zero at every expert).
 
     Returns:
         ``[T, H]`` fp32.
@@ -1381,7 +1387,11 @@ def _token_gather_combine(
     from vllm_neuron.functional.moe.combine_slots import combine_slots
     from vllm_neuron.functional.moe.token_gather_combine import token_gather_combine
 
-    index, valid = combine_slots(expert_affinities, block, rows, top_k)  # [T, k] each
+    index, valid, dropped = combine_slots(  # [T, k], [T, k], [1, 1]
+        expert_affinities, block, rows, top_k, int(contribution.shape[0])
+    )
+    if collector is not None:
+        collector.append(dropped)
     # An invalid slot reads row 0 and weighs it 0. The kernel leaves padding rows
     # undefined but always writes row 0, as a routed row or a zero row, so it is finite.
     return token_gather_combine(contribution, index, valid)
@@ -1674,7 +1684,9 @@ class Glm5NextRoutedExperts(nn.Module):
             packed_scales: matching fp32 scales ``[E, 3*(I/128), H/128]``. Supply
                 both packed banks or neither; they replace the four legacy
                 operands.
-            collector: when given, receives the mapping's token-position tensor.
+            collector: when given, receives the mapping's token-position tensor and,
+                on the packed route, the combine's count of routed pairs the
+                emission does not hold (``_token_gather_combine``).
 
         Returns:
             ``[T, H]`` -- the padding-token row is sliced off. The dtype is the
@@ -1970,6 +1982,7 @@ class Glm5NextRoutedExperts(nn.Module):
                 block,
                 rows,
                 int(self.num_experts_per_tok),
+                collector,
             ).to(hidden_states.dtype)
         else:
             # ---- The padding-token slot, appended after the mapping. ----- #
@@ -8982,6 +8995,8 @@ DUMP_DSA_TAP_NAMES = (
 #: ``routed_output`` and ``shared_output`` are each half's own result before the
 #: layer reduces them, so they read as partials on a sharded run; ``mlp_output``
 #: and ``attention_output`` are taken after the reduction and are whole.
+#: ``combine_dropped`` is the rank's count of routed pairs its expert emission does
+#: not hold (``_token_gather_combine``; the packed route appends it).
 DUMP_TAP_NAMES = (
     "attention_output",
     "mlp_input1",
@@ -8990,6 +9005,7 @@ DUMP_TAP_NAMES = (
     "router_topk_weights",
     "router_affinities",
     "token_position_to_id",
+    "combine_dropped",
     "routed_output",
     "shared_output",
     "mlp_output",

@@ -1,21 +1,33 @@
 # SPDX-License-Identifier: Apache-2.0
 """The MoE combine's slot build as an NKI kernel: each token's rows of the fused expert emission.
 
-``combine_slots(expert_affinities, block, rows, top_k)`` returns ``(index, valid)``, the
-``[T, K]`` operands of ``token_gather_combine``, ``K = min(top_k, E)``::
+``combine_slots(expert_affinities, block, rows, top_k, total_rows)`` returns
+``(index, valid, dropped)``: the ``[T, K]`` operands of ``token_gather_combine``,
+``K = min(top_k, E)``, and the routed pairs the emission does not hold::
 
-    mask[t, e]  = affinities[t, e] != 0
-    place[t, e] = #{t' <= t : mask[t', e]} - 1        token t's place among expert e's tokens
-    blocks[e]   = ceil(#{t : mask[t, e]} / block)     expert e's blocks in the mapping
-    first[e]    = sum of blocks[e'] over e' < e       expert e's first block
-    row[t, e]   = first[e] * rows + place[t, e]       token t's emission row for expert e
-    slot j of token t: its j-th selected expert e in expert order
+    mask[t, e]   = affinities[t, e] != 0
+    place[t, e]  = #{t' <= t : mask[t', e]} - 1        token t's place among expert e's tokens
+    blocks[e]    = ceil(#{t : mask[t, e]} / block)     expert e's blocks in the mapping
+    first[e]     = sum of blocks[e'] over e' < e       expert e's first block
+    row[t, e]    = first[e] * rows + place[t, e]       token t's emission row for expert e
+    placed[t, e] = mask[t, e] and row[t, e] < total_rows       the mapping placed the pair
+    slot j of token t: its j-th placed expert e in expert order
     valid[t, j] = 1 and index[t, j] = row[t, e] for a filled slot, both 0 for an empty one
+    dropped     = #{(t, e) : mask[t, e] and not placed[t, e]}
 
 The emission is ``build_blockwise_mapping``'s layout with each block cut to its first
 ``rows`` rows, so expert ``e``'s tokens start at row ``first[e] * rows`` in token order. The
 slots follow expert order, the order a scatter-add over the emission meets them in; an empty
 slot reads row 0 with weight 0.
+
+The bound. The mapping sizes the emission (``total_rows``, its block count times ``rows``)
+for at most ``top_k`` selections per token and cuts its token positions there, so a pair whose
+row is at or past ``total_rows`` has no emission row. ``row`` counts the same blocks without
+the cut: a token with more than ``top_k`` non-zero affinities (a non-finite router row is
+non-zero at every expert) can push later experts' rows past the emission, and a gather of
+such a row reads past its end. ``placed`` keeps exactly the pairs the mapping places, so
+every index is below ``total_rows`` at any routing, and ``dropped`` counts the pairs the cut
+lost: 0 unless the routing broke the ``top_k`` premise.
 
 Why a kernel. In torch the slots are a ``[T, E, K]`` one-hot summed over ``E``, which
 neuronx-cc lowers as reduces over a middle axis; at ``T`` = 1024, ``E`` = 18, ``K`` = 8 the slot
@@ -30,15 +42,17 @@ one strictly lower-triangular ``[128, 128]`` product with each partition's total
 engine). ``blocks`` counts thresholds instead of dividing,
 ``ceil(c / block) = #{m >= 0 : m * block < c}`` with ``m < ceil(T / block)``, and one product
 with a strictly upper-triangular ``[E, E]`` takes ``first`` to every partition. The slots need
-no one-hot: each selected expert gets the key ``(E - e) * scale + row[t, e]`` (unselected: 0),
+no one-hot: each placed expert gets the key ``(E - e) * scale + row[t, e]`` (otherwise 0),
 with ``scale`` (:func:`key_scale`) a power of two above every row, and the vector engine's
-``max8`` returns each token's 8 largest keys in descending order: its selected experts in
+``max8`` returns each token's 8 largest keys in descending order: its placed experts in
 expert order, then zeros. So ``valid = key != 0`` and ``index = key mod scale``, an integer
-``and``.
+``and``. ``dropped`` is each token's unplaced pairs summed over ``E``, then over the tokens by
+one product with a ones column.
 
-Numerics. Every value is an integer below ``2**24``. The three products take bf16 operands
+Numerics. Every value is an integer below ``2**24``. The four products take bf16 operands
 that are all integers of at most 256 (0/1 masks and triangles, counts of at most ``per``
-tokens, block counts of at most ``ceil(T / block)``), which bf16 holds exactly, and sum them in
+tokens, block counts of at most ``ceil(T / block)``, a token's unplaced pairs, at most
+``E``), which bf16 holds exactly, and sum them in
 fp32 PSUM; every other step runs in fp32 or int32. So each step is exact and the outputs are
 bit-equal to the torch construction (:func:`combine_slots_torch`) in any summation order.
 
@@ -94,6 +108,12 @@ def _triangle(size, strict, dtype):
     return tri
 
 
+def _each_token(tile, per):
+    """``[p, E]`` SBUF ``tile`` read as ``[p, per, E]``: the same row for each of a partition's
+    ``per`` tokens."""
+    return tile.ap(pattern=[[tile.shape[1], tile.shape[0]], [0, per], [1, tile.shape[1]]])
+
+
 def _load_by_partition(sbuf, hbm, per):
     """``sbuf[q, i, :] = hbm[q * per + i, :]``: one DMA for the whole partitions, one for the
     last partition's remaining tokens."""
@@ -133,8 +153,9 @@ def key_scale(tokens: int, experts: int, block: int, rows: int) -> int:
 
 
 @nki.jit
-def combine_slots_kernel(affinities_hbm, block, rows, slots, scale):
-    """``[T, E]`` affinities -> ``([T, K]`` int32 ``index``, ``[T, K]`` fp32 ``valid)``.
+def combine_slots_kernel(affinities_hbm, block, rows, slots, scale, total_rows):
+    """``[T, E]`` affinities -> ``([T, K]`` int32 ``index``, ``[T, K]`` fp32 ``valid``,
+    ``[1, 1]`` fp32 ``dropped)``.
 
     Args:
         affinities_hbm: ``[T, E]`` local router scores, zero where unselected, any float
@@ -144,6 +165,7 @@ def combine_slots_kernel(affinities_hbm, block, rows, slots, scale):
         slots: ``K``, slots per token (trace-time int, ``1 <= K <= 8``).
         scale: :func:`key_scale` of the shapes (trace-time int; the kernel language has no
             ``int.bit_length``).
+        total_rows: the emission's rows, the mapping's blocks times ``rows`` (trace-time int).
     """
     tokens, experts = affinities_hbm.shape
     p = TOKEN_TILE
@@ -158,6 +180,7 @@ def combine_slots_kernel(affinities_hbm, block, rows, slots, scale):
                   "every product operand is exact in bf16")
     index_out = nl.ndarray((tokens, slots), dtype=nl.int32, buffer=nl.shared_hbm)
     valid_out = nl.ndarray((tokens, slots), dtype=nl.float32, buffer=nl.shared_hbm)
+    dropped_out = nl.ndarray((1, 1), dtype=nl.float32, buffer=nl.shared_hbm)
 
     # ---- Constants. -------------------------------------------------------- #
     ones = _tile(p, p, nl.bfloat16)
@@ -206,18 +229,33 @@ def combine_slots_kernel(affinities_hbm, block, rows, slots, scale):
     prior_ps = nl.ndarray((p, experts), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_matmul(dst=prior_ps, stationary=earlier, moving=held, is_stationary_onezero=True,
                    accumulate=False)
-    # base = order + first * rows - 1 + prior, so a key is (base + counted) * mask.
+    # base = first * rows - 1 + prior, so a row is base + counted.
     base = nl.ndarray((p, experts), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_scalar(dst=base, data=first_ps, op0=nl.multiply, operand0=float(rows),
                        op1=nl.add, operand1=-1.0)
-    nisa.tensor_tensor(dst=base, data1=base, data2=order, op=nl.add)
     nisa.tensor_tensor(dst=base, data1=base, data2=prior_ps, op=nl.add)
 
+    # ---- Rows, the mapping's pairs, and the pairs it dropped. --------------- #
+    row = nl.ndarray((p, per, experts), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=row, data1=counted, data2=_each_token(base, per), op=nl.add)
+    placed = nl.ndarray((p, per, experts), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.scalar_tensor_tensor(dst=placed, data=row, op0=nl.less, operand0=float(total_rows),
+                              op1=nl.multiply, operand1=mask)
+    lost = nl.ndarray((p, per, experts), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=lost, data1=mask, data2=placed, op=nl.subtract)
+    lost_per_token = _tile(p, per, nl.bfloat16)
+    nisa.tensor_reduce(dst=lost_per_token, op=nl.add, data=lost, axis=2)
+    lost_ps = nl.ndarray((1, per), dtype=nl.float32, buffer=nl.psum)
+    nisa.nc_matmul(dst=lost_ps, stationary=ones[:, 0:1], moving=lost_per_token,
+                   is_stationary_onezero=True, accumulate=False)
+    dropped = _tile(1, 1)
+    nisa.tensor_reduce(dst=dropped, op=nl.add, data=lost_ps, axis=1)
+
     # ---- Keys, and each token's 8 largest. ---------------------------------- #
+    # key = (order + row) * placed: (E - e) * scale + row for a placed pair, 0 otherwise.
     key = nl.ndarray((p, per, experts), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_tensor(dst=key, data1=counted, data2=base.ap(
-        pattern=[[experts, p], [0, per], [1, experts]]), op=nl.add)
-    nisa.tensor_tensor(dst=key, data1=key, data2=mask, op=nl.multiply)
+    nisa.tensor_tensor(dst=key, data1=row, data2=_each_token(order, per), op=nl.add)
+    nisa.tensor_tensor(dst=key, data1=key, data2=placed, op=nl.multiply)
     top = nl.ndarray((p, per, MAX8_WIDTH), dtype=nl.float32, buffer=nl.sbuf)
     for i in range(per):
         nisa.max8(dst=top[:, i, :], src=key[:, i, :])
@@ -231,11 +269,12 @@ def combine_slots_kernel(affinities_hbm, block, rows, slots, scale):
     nisa.tensor_scalar(dst=index, data=whole, op0=nl.bitwise_and, operand0=scale - 1)
     _store_by_partition(valid_out, valid, per)
     _store_by_partition(index_out, index, per)
-    return index_out, valid_out
+    nisa.dma_copy(dst=dropped_out, src=dropped)
+    return index_out, valid_out, dropped_out
 
 
-def combine_slots_torch(expert_affinities: Tensor, block: int, rows: int,
-                        top_k: int) -> tuple[Tensor, Tensor]:
+def combine_slots_torch(expert_affinities: Tensor, block: int, rows: int, top_k: int,
+                        total_rows: int) -> tuple[Tensor, Tensor, Tensor]:
     """The slot build in torch: the reference, and the route where the kernel does not run."""
     from vllm_neuron.functional.moe.moe_blockwise import _cumsum_matmul
 
@@ -247,17 +286,20 @@ def combine_slots_torch(expert_affinities: Tensor, block: int, rows: int,
     blocks = torch.ceil(mask.sum(dim=0) / block)
     first_block = _cumsum_matmul(blocks.unsqueeze(1)).squeeze(1) - blocks
     row = first_block.unsqueeze(0) * rows + place  # [T, E], exact in fp32
-    # Token t's j-th selected expert, one-hot over E for each slot j.
+    # The pairs the mapping placed: its emission ends at total_rows.
+    placed = mask * (row < total_rows).to(torch.float32)
+    dropped = (mask - placed).sum().reshape(1, 1)
+    # Token t's j-th placed expert, one-hot over E for each slot j.
     upper = torch.triu(
         torch.ones(experts, experts, dtype=torch.float32, device=device)
     )
-    rank = torch.matmul(mask, upper) - 1.0  # [T, E]
+    rank = torch.matmul(placed, upper) - 1.0  # [T, E]
     slots = min(top_k, experts)
     slot_ids = torch.arange(slots, dtype=torch.float32, device=device)
-    pick = mask.unsqueeze(2) * (rank.unsqueeze(2) == slot_ids).to(torch.float32)
+    pick = placed.unsqueeze(2) * (rank.unsqueeze(2) == slot_ids).to(torch.float32)
     valid = pick.sum(dim=1)  # [T, k], 0/1
     index = (pick * row.unsqueeze(2)).sum(dim=1).to(torch.int32)  # [T, k]
-    return index, valid
+    return index, valid, dropped
 
 
 def can_run_combine_slots(expert_affinities: Tensor, block: int, rows: int, top_k: int) -> bool:
@@ -276,19 +318,21 @@ def can_run_combine_slots(expert_affinities: Tensor, block: int, rows: int, top_
     )
 
 
-def combine_slots(expert_affinities: Tensor, block: int, rows: int,
-                  top_k: int) -> tuple[Tensor, Tensor]:
-    """``(index [T, K] int32, valid [T, K] fp32)``: each token's emission rows, ``K = min(top_k, E)``.
+def combine_slots(expert_affinities: Tensor, block: int, rows: int, top_k: int,
+                  total_rows: int) -> tuple[Tensor, Tensor, Tensor]:
+    """``(index [T, K] int32, valid [T, K] fp32, dropped [1, 1] fp32)``: each token's emission
+    rows, ``K = min(top_k, E)``, and the routed pairs the emission does not hold.
 
     Args:
         expert_affinities: ``[T, E]`` local router scores, zero where unselected.
         block: tokens per block in the mapping.
         rows: emission rows kept per block, ``min(T, block)``.
         top_k: experts each token selects.
+        total_rows: the emission's rows, the mapping's blocks times ``rows``.
     """
     if not can_run_combine_slots(expert_affinities, block, rows, top_k):
-        return combine_slots_torch(expert_affinities, block, rows, top_k)
+        return combine_slots_torch(expert_affinities, block, rows, top_k, int(total_rows))
     tokens, experts = (int(n) for n in expert_affinities.shape)
     return wrap_nki(combine_slots_kernel)(
         expert_affinities.contiguous(), int(block), int(rows), min(int(top_k), experts),
-        key_scale(tokens, experts, int(block), int(rows)))
+        key_scale(tokens, experts, int(block), int(rows)), int(total_rows))

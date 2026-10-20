@@ -2311,7 +2311,8 @@ def test_moe_path_decode_route_steps_aside_for_a_collector_and_wide_batches(
     collector: list = []
     with SimulatorCounter() as sim:
         _decode_route_call(bank, packed, hidden, affinities, rank, collector=collector)
-    assert "expert_decode_kernel" not in sim.kernels and len(collector) == 1
+    # The mapping route's token positions and the combine's dropped-pair count.
+    assert "expert_decode_kernel" not in sim.kernels and len(collector) == 2
     wide_hits = [[t % 18] if t % 13 == 0 else [] for t in range(65)]
     with SimulatorCounter() as sim:
         _decode_route_call(bank, packed, decode_hidden(65), routed_affinities(wide_hits),
