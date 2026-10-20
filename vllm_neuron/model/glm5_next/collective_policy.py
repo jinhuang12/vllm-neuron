@@ -37,11 +37,20 @@ which on the device is trace time:
 
 At world size 1 there is no coordinator and nothing happens in either setting: no
 collective and no cast, so a single-rank run is bitwise unchanged.
+
+The sequence-parallel prefill route uses two more entry points, called only when the
+model's sequence-parallel switch is on (the model code reads it; this module does not):
+:func:`scatter_row_parallel` replaces a site's all-reduce with a reduce-scatter over the
+token rows, so each rank keeps the summed rows it owns, and :func:`gather_sequence`
+all-gathers those row blocks back to every token before a sub-block that needs them.
+The reduce-scatter follows the same wire-dtype switch as the all-reduce. With the switch
+off neither is called, and the program is the all-reduce form above.
 """
 
 from __future__ import annotations
 
 import enum
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import torch
@@ -60,7 +69,9 @@ __all__ = [
     "allreduce_fuse_enabled",
     "allreduce_wire_dtype",
     "fuse_compiler_args",
+    "gather_sequence",
     "reduce_row_parallel",
+    "scatter_row_parallel",
 ]
 
 #: The wire-dtype switch (``vllm_neuron.envs``).
@@ -89,7 +100,8 @@ class CollectivePolicyError(ValueError):
 class RowParallelSite(str, enum.Enum):
     """Where a row-parallel partial comes from.
 
-    Every site hands :func:`reduce_row_parallel` this rank's partial sum at the full
+    Every site hands :func:`reduce_row_parallel` (or :func:`scatter_row_parallel`) this
+    rank's partial sum at the full
     output width, ``[tokens, hidden_size]``, freshly computed (never a view of a weight
     or of the caller's residual), in fp32 on the device. Every site follows the same
     policy today; the key lets a per-site policy change one site without touching the
@@ -175,15 +187,7 @@ def reduce_row_parallel(
             ``partial`` is neither fp32 nor bf16, or a switch holds a value this module
             does not define.
     """
-    # ``isinstance``, not ``RowParallelSite(site)``: the sites run inside a
-    # ``fullgraph=True`` capture, and dynamo cannot trace the enum's lookup by value.
-    if not isinstance(site, RowParallelSite):
-        raise CollectivePolicyError(f"{site!r} is not a RowParallelSite member")
-    if partial.dtype not in _PARTIAL_DTYPES:
-        raise CollectivePolicyError(
-            f"the {site.value} site handed a {partial.dtype} partial; a row-parallel "
-            f"partial is one of {[str(d) for d in _PARTIAL_DTYPES]}"
-        )
+    _check_partial(partial, site)
     if group is None:
         return partial
     wire_dtype = allreduce_wire_dtype()
@@ -193,3 +197,106 @@ def reduce_row_parallel(
     wire = partial.to(wire_dtype)
     group.all_reduce(wire)
     return wire
+
+
+def scatter_row_parallel(
+    partial: torch.Tensor, *, site: RowParallelSite, group: GroupCoordinator | None
+) -> torch.Tensor:
+    """Sum ``partial`` across ``group`` and keep only this rank's block of token rows.
+
+    The sequence-parallel form of :func:`reduce_row_parallel`: one reduce-scatter on
+    dim 0 in place of the all-reduce, so the sum crosses the wire once and each rank
+    receives ``rows / world_size`` rows of it. Rank ``r`` of ``W`` gets rows
+    ``[r * rows / W, (r + 1) * rows / W)`` of the summed ``[rows, ...]`` tensor, the
+    order :func:`gather_sequence` restores.
+
+    Args:
+        partial: this rank's partial sum, ``[tokens, hidden_size]``, fp32 or bf16,
+            fresh as :class:`RowParallelSite` states. Dim 0 is the token rows; its
+            size must divide by the group's world size.
+        site: the :class:`RowParallelSite` the partial comes from.
+        group: the tensor-parallel coordinator, or ``None`` at world size 1.
+
+    Returns:
+        ``partial`` itself when ``group`` is ``None``. Otherwise a new tensor, this
+        rank's ``[tokens / world_size, ...]`` block of the sum, in the wire dtype that
+        :func:`reduce_row_parallel` would use: ``partial``'s own dtype under ``fp32``,
+        bfloat16 under ``bf16``. Unlike :func:`reduce_row_parallel` the result is never
+        ``partial``, so the caller reads the return value. The caller casts it to its
+        carrier.
+
+    Raises:
+        CollectivePolicyError: ``site`` is not a :class:`RowParallelSite` member,
+            ``partial`` is neither fp32 nor bf16, its rows do not divide by the world
+            size, or a switch holds a value this module does not define.
+    """
+    _check_partial(partial, site)
+    if group is None:
+        return partial
+    if partial.dim() == 0 or partial.shape[0] % group.world_size != 0:
+        raise CollectivePolicyError(
+            f"the {site.value} site handed a partial of shape {tuple(partial.shape)}; "
+            f"a reduce-scatter over {group.world_size} ranks needs dim 0 (the token "
+            f"rows) to divide by {group.world_size}"
+        )
+    wire_dtype = allreduce_wire_dtype()
+    wire = partial if wire_dtype is torch.float32 else partial.to(wire_dtype)
+    return group.reduce_scatter(wire, dim=0)
+
+
+def gather_sequence(
+    tensors: Sequence[torch.Tensor], *, group: GroupCoordinator | None
+) -> tuple[torch.Tensor, ...]:
+    """All-gather each rank's block of token rows back to every row, in rank order.
+
+    The inverse of :func:`scatter_row_parallel`'s row split: rank ``r``'s rows land at
+    ``[r * rows, (r + 1) * rows)`` of each result. Several tensors cross the wire as
+    one collective: they are stacked on a new dim 1, gathered on dim 0 and split back.
+    No dtype changes.
+
+    Args:
+        tensors: one or more tensors of one dtype and one shape, ``[rows, ...]``, dim 0
+            this rank's token rows.
+        group: the tensor-parallel coordinator, or ``None`` at world size 1.
+
+    Returns:
+        One tensor per input, in input order, each ``[world_size * rows, ...]``. With
+        ``group`` ``None`` the inputs themselves. With two or more inputs the results
+        are views of one gathered buffer (each strided on dim 0 by the input count),
+        so a consumer that needs contiguous rows makes them contiguous itself.
+
+    Raises:
+        CollectivePolicyError: ``tensors`` is empty, or its tensors differ in dtype or
+            shape.
+    """
+    if len(tensors) == 0:
+        raise CollectivePolicyError("gather_sequence needs at least one tensor")
+    first = tensors[0]
+    for other in tensors[1:]:
+        if other.dtype != first.dtype or other.shape != first.shape:
+            raise CollectivePolicyError(
+                f"gather_sequence gathers tensors of one dtype and shape; got "
+                f"{first.dtype} {tuple(first.shape)} and {other.dtype} "
+                f"{tuple(other.shape)}"
+            )
+    if group is None:
+        return tuple(tensors)
+    if len(tensors) == 1:
+        # ``all_gather_into_tensor`` refuses a non-contiguous input; this is a no-op
+        # on the contiguous block a reduce-scatter returns.
+        return (group.all_gather(first.contiguous(), dim=0),)
+    gathered = group.all_gather(torch.stack(tuple(tensors), dim=1), dim=0)
+    return tuple(gathered.unbind(dim=1))
+
+
+def _check_partial(partial: torch.Tensor, site: RowParallelSite) -> None:
+    """Refuse a ``site`` that is not a member and a ``partial`` of another dtype."""
+    # ``isinstance``, not ``RowParallelSite(site)``: the sites run inside a
+    # ``fullgraph=True`` capture, and dynamo cannot trace the enum's lookup by value.
+    if not isinstance(site, RowParallelSite):
+        raise CollectivePolicyError(f"{site!r} is not a RowParallelSite member")
+    if partial.dtype not in _PARTIAL_DTYPES:
+        raise CollectivePolicyError(
+            f"the {site.value} site handed a {partial.dtype} partial; a row-parallel "
+            f"partial is one of {[str(d) for d in _PARTIAL_DTYPES]}"
+        )
