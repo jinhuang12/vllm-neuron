@@ -20,13 +20,20 @@ which on the device is trace time:
     reduced sum to bfloat16 once, and ``bf16`` adds the rounding of each rank's partial
     and of the reduction's intermediate sums.
 
-``VLLM_NEURON_TP_ALLREDUCE_FUSE`` = ``0`` (default) | ``1``
-    The model issues one collective per site. A device profile shows two per site at a
-    1024-token chunk because neuronx-cc's ``SimpleAllReduceTiling`` pass splits an
-    all-reduce larger than 8 MiB into up to four tiles. That is a compiler decision for
-    the whole graph, not one a call can make, so this switch only names the compiler
+``VLLM_NEURON_TP_ALLREDUCE_FUSE`` = ``1`` (default) | ``0``
+    The model issues one collective per site. Left alone, neuronx-cc's
+    ``SimpleAllReduceTiling`` pass splits an all-reduce larger than 8 MiB into up to
+    four tiles, two per site at a 1024-token chunk. That is a compiler decision for the
+    whole graph, not one a call can make, so this switch only names the compiler
     argument that turns the pass off (:func:`fuse_compiler_args`), and
-    ``NeuronModelRunner.load_model`` appends it to its ``compiler_args``.
+    ``NeuronModelRunner.load_model`` appends it to its ``compiler_args``. One collective
+    per site moves the same bytes in fewer operations; its sums are not bitwise
+    those of the tiled form. ``0`` keeps the compiler's tiles.
+
+    Measured on the lever-A build (3417e57c) at 262,127 tokens: TTFT -1,199.8 ms against
+    an arm-0 restart spread of 27.5 ms (the collectives -4.52 ms per chunk); GSM8K
+    strict-match 199 against 198 / 198 at n = 200, one discordant question, McNemar
+    p = 1. The user approved the tolerance on 2026-10-14.
 
 At world size 1 there is no coordinator and nothing happens in either setting: no
 collective and no cast, so a single-rank run is bitwise unchanged.
@@ -131,7 +138,7 @@ def allreduce_fuse_enabled() -> bool:
         return envs.VLLM_NEURON_TP_ALLREDUCE_FUSE
     except ValueError as error:
         raise CollectivePolicyError(
-            f"{FUSE_ENV} must be 0 or 1; unset it to keep the compiler's "
+            f"{FUSE_ENV} must be 0 or 1; set it to 0 to keep the compiler's "
             f"all-reduce tiling"
         ) from error
 

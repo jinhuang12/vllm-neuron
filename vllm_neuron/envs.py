@@ -117,11 +117,12 @@ if TYPE_CHECKING:
     # "rare_gen2" (gen-2 threshold 100000, no freeze), "off" (CPython's GC),
     # "freeze_rare_gen2" (freeze + gen-2 threshold 100000), or "freeze".
     VLLM_NEURON_GC_POLICY: str = "rare_gen2"
-    # GLM-5.3-Flash row-parallel all-reduce. Both defaults are the as-built path.
+    # GLM-5.3-Flash row-parallel all-reduce.
     # The dtype a row-parallel partial crosses the wire in: "fp32" or "bf16".
     VLLM_NEURON_TP_ALLREDUCE_DTYPE: str = "fp32"
     # Keep every all-reduce one collective instead of the compiler's 8 MiB tiles.
-    VLLM_NEURON_TP_ALLREDUCE_FUSE: bool = False
+    # On by default; 0 restores the tiles.
+    VLLM_NEURON_TP_ALLREDUCE_FUSE: bool = True
     # GLM-5.3-Flash DSA prefill: a chunk whose top-k selection provably keeps every
     # token attends its latent window densely (mla_dense_window.py) instead of
     # selecting and gathering. On by default; 0 restores the sparse path.
@@ -582,11 +583,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NEURON_TP_ALLREDUCE_DTYPE": lambda: (
         os.getenv("VLLM_NEURON_TP_ALLREDUCE_DTYPE", "fp32").strip().lower()
     ),
-    # "1" asks neuronx-cc to keep each all-reduce one collective. By default its
-    # SimpleAllReduceTiling pass splits an all-reduce larger than 8 MiB into up to
-    # four. Read by ``collective_policy.fuse_compiler_args``. Off by default.
+    # "1" (the default) asks neuronx-cc to keep each all-reduce one collective;
+    # "0" lets its SimpleAllReduceTiling pass split an all-reduce larger than 8 MiB
+    # into up to four. Read by ``collective_policy.fuse_compiler_args``.
     "VLLM_NEURON_TP_ALLREDUCE_FUSE": lambda: (
-        maybe_convert_bool(os.getenv("VLLM_NEURON_TP_ALLREDUCE_FUSE")) or False
+        maybe_convert_bool(os.getenv("VLLM_NEURON_TP_ALLREDUCE_FUSE")) is not False
     ),
     # ================== GLM-5.3-Flash DSA Prefill ==================
     # Attend a prefill chunk densely over its latent window when the bound its graph

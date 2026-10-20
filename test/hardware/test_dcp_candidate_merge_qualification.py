@@ -154,9 +154,9 @@ MULTI_CALLS = 4
 
 #: The model runner's neuronx-cc arguments for this checkpoint (``neuron_model_runner.py``,
 #: ``compile_options["compiler_args"]``): fp8 weights on trn2, the platform's default
-#: optimization level 1. Not included: the optional all-reduce fusion flag the runner appends
-#: from ``collective_policy.fuse_compiler_args()``, empty unless
-#: ``VLLM_NEURON_TP_ALLREDUCE_FUSE=1``.
+#: optimization level 1. Not included: the all-reduce fusion flag the runner appends from
+#: ``collective_policy.fuse_compiler_args()``, present by default and absent with
+#: ``VLLM_NEURON_TP_ALLREDUCE_FUSE=0``.
 RUNNER_COMPILER_ARGS = (
     "--auto-cast=none",
     "--verbose=35",
