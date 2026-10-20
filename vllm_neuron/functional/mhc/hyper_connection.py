@@ -52,16 +52,29 @@ the tokens go back on the partitions, where every DMA row is a long contiguous
 hidden run, and each multiply-add is one instruction: ``S * (1 + S)`` per tile
 where baseline ``mhc_5938748`` issued ``S * (1 + 2*S)``.
 
+With bf16 ``x`` and streams (the prefill form) those ``S * (1 + S)`` multiply-adds
+per output element are the whole cost on the vector engine, so the combine moves
+to the tensor engine. A group of ``G = 128 // (S + 1)`` tokens is one block-diagonal
+matmul: the contraction rows are the group's ``G * S`` stream rows and then its
+``G`` rows of ``x``, exactly as they lie in HBM, and the stationary operand holds
+token ``t``'s ``comb[t]`` and ``post[t]`` on its diagonal block, so the result rows
+are the output rows ``(t, j)`` in HBM order. The fp32 mixing weights are split into
+:data:`TENSOR_ENGINE_PIECES` bf16 pieces, one matmul pass each, accumulated in fp32
+PSUM: bf16 x bf16 products are exact, so only the order of the fp32 additions
+differs from the vector form (see :func:`_combine_on_tensor_engine`).
+
 Under an LNC2 launch (``NEURON_LOGICAL_NC_CONFIG=2``, the serving setting) the
 kernel runs as two SPMD programs, each on one contiguous half of the hidden axis,
 so both physical cores of the logical core work, in either layout.
 
 The kernel computes in fp32 and returns ``residual``'s dtype. ``x`` and the
-streams may be fp32 or bf16: bf16 tiles are upcast on chip (exact), so a bf16
-call does the fp32 products and adds of an fp32 call on the same values and rounds
-only the last add to bf16 -- bit for bit the fp32 call followed by ``.to(bf16)``,
-without the fp32 copies of the operands and the result in HBM. Upstream's
-``mhc_post`` also takes bf16 and returns ``residual.dtype``.
+streams may be fp32 or bf16. In the two vector forms bf16 tiles are upcast on chip
+(exact), so a bf16 call does the fp32 products and adds of an fp32 call on the same
+values and rounds only the last add to bf16 -- bit for bit the fp32 call followed by
+``.to(bf16)``, without the fp32 copies of the operands and the result in HBM. The
+tensor-engine form is not bit for bit that call; it keeps the bound stated in
+:func:`_combine_on_tensor_engine`. Upstream's ``mhc_post`` also takes bf16 and
+returns ``residual.dtype``.
 
 ``T`` is unbounded: the hidden layout walks it in chunks sized to a fixed SBUF
 budget (:data:`SBUF_CHUNK_ELEMS`), the token layout in tiles of 128 tokens.
@@ -111,6 +124,20 @@ HIDDEN_ON_PARTITIONS_MAX_TOKENS = 32
 #: DMA row is one 2 KiB contiguous run.
 TOKEN_LAYOUT_HIDDEN_SLICE = 512
 
+#: bf16 pieces per fp32 mixing weight in the tensor-engine form. A bf16 piece carries
+#: 8 significand bits, and each piece takes the rounding error of the ones before it,
+#: so three pieces sum to the fp32 weight exactly (24 bits) unless the last piece
+#: underflows; fewer would round the weights themselves.
+TENSOR_ENGINE_PIECES = 3
+
+#: Token groups whose stationary operands the tensor-engine form builds at once. A
+#: group's bf16 pieces take ``2 * TENSOR_ENGINE_PIECES * G * S`` bytes of each
+#: partition and two spans are live at once (the next span's pieces are built while
+#: the tensor engine runs the current one), so a bounded span keeps the kernel's SBUF
+#: use independent of ``T``, and the first span's build is all that runs before the
+#: first matmul.
+TENSOR_ENGINE_GROUP_SPAN = 16
+
 # `MHC_STREAMS` (the target's `hc_mult`) and `PARTITION_MAX` are imported from
 # `sinkhorn.py` rather than restated: both name the same quantity for both halves
 # of mHC, so a second copy would be a second thing that can drift.
@@ -120,6 +147,8 @@ __all__ = [
     "PARTITION_MAX",
     "HIDDEN_ON_PARTITIONS_MAX_TOKENS",
     "HyperConnectionError",
+    "TENSOR_ENGINE_GROUP_SPAN",
+    "TENSOR_ENGINE_PIECES",
     "TOKEN_LAYOUT_HIDDEN_SLICE",
     "can_run_hyper_connection",
     "dispatch_counters",
@@ -160,21 +189,27 @@ def hyper_connection_kernel(x, residual, post_layer_mix, comb_res_mix):
         ``out_j = post_layer_mix_j * x + sum_i comb_ij * res_i``, computed in fp32
         and rounded once. ``x`` and ``residual`` may be fp32 or bf16.
 
-    The arithmetic is that of baseline ``mhc_5938748``, in its order and rounding:
-    ``acc = post_j * x`` and then ``acc = acc + comb_ij * res_i`` for
-    ``i = 0..S-1``, each product rounded to fp32 before its add. What changed is
-    the layout, picked at trace time from ``T``:
+    On the vector engine the arithmetic is that of baseline ``mhc_5938748``, in its
+    order and rounding: ``acc = post_j * x`` and then ``acc = acc + comb_ij * res_i``
+    for ``i = 0..S-1``, each product rounded to fp32 before its add. The form is
+    picked at trace time from ``T`` and the dtypes:
 
     * ``T <= HIDDEN_ON_PARTITIONS_MAX_TOKENS`` (decode): hidden on the
       partitions, see :func:`_combine_hidden_on_partitions`. All 128 lanes work
       however few tokens there are, and a token chunk is ``1 + 2*S``
       instructions, where baseline ``mhc_5938748`` issued ``S * (1 + 2*S)`` per
       2048-wide hidden tile on ``T`` lanes (72 at decode, on 1 lane).
-    * Larger ``T`` (prefill, big batches): tokens on the partitions, see
-      :func:`_combine_tokens_on_partitions`. Every DMA moves long contiguous
-      hidden runs, which the hidden-on-partitions layout cannot (its run is
-      ``H / 128`` values, 64 bytes per program at ``H = 4096``), and a tile is
-      ``S * (1 + S)`` instructions. The switch point is measured; see
+    * Larger ``T`` with bf16 ``x`` and streams (prefill): the tensor engine, see
+      :func:`_combine_on_tensor_engine`. Its products are exact and its sums are
+      fp32, but added in the engine's order, so an output can differ from the
+      vector form: by one step of the output dtype where the fp32 value lies within
+      that order's rounding of a rounding boundary, and by more steps of its own
+      size where the terms cancel. Both forms keep the bound stated there.
+    * Larger ``T`` otherwise (fp32 operands: decode and verify batches): tokens on
+      the partitions, see :func:`_combine_tokens_on_partitions`. Every DMA moves
+      long contiguous hidden runs, which the hidden-on-partitions layout cannot
+      (its run is ``H / 128`` values, 64 bytes per program at ``H = 4096``), and a
+      tile is ``S * (1 + S)`` instructions. The switch point is measured; see
       :data:`HIDDEN_ON_PARTITIONS_MAX_TOKENS`.
 
     SPMD: under a 2-program launch each program takes one contiguous half of
@@ -198,6 +233,10 @@ def hyper_connection_kernel(x, residual, post_layer_mix, comb_res_mix):
 
     if t_extent <= HIDDEN_ON_PARTITIONS_MAX_TOKENS:
         _combine_hidden_on_partitions(
+            x, residual, post_layer_mix, comb_res_mix, out, h_lo, width
+        )
+    elif x.dtype == nl.bfloat16 and residual.dtype == nl.bfloat16:
+        _combine_on_tensor_engine(
             x, residual, post_layer_mix, comb_res_mix, out, h_lo, width
         )
     else:
@@ -469,7 +508,230 @@ def _combine_tokens_on_partitions(
             )
 
 
+def _combine_on_tensor_engine(
+    x, residual, post_layer_mix, comb_res_mix, out, h_lo, width
+) -> None:
+    """The combine over hidden ``[h_lo, h_lo + width)`` as block-diagonal matmuls.
 
+    Traced inside :func:`hyper_connection_kernel` for bf16 ``x`` and streams; writes
+    ``out``. Tokens are taken in groups of ``G = 128 // (S + 1)``. For a group the
+    moving operand is ``G * (S + 1)`` contraction rows: the group's ``G * S``
+    stream rows (``residual`` viewed as ``[T * S, H]``, row ``t * S + i``) and then
+    its ``G`` rows of ``x``, each one contiguous hidden run in HBM. The stationary
+    operand is ``[G * (S + 1), G * S]`` with ``comb[t, i, j]`` at row ``t * S + i``,
+    column ``t * S + j`` and ``post[t, j]`` at row ``G * S + t``, column
+    ``t * S + j``, zero elsewhere, so result row ``t * S + j`` is
+    ``post_j * x_t + sum_i comb_ij * res_ti``: output row ``(t, j)`` of ``out``
+    viewed as ``[T * S, H]``, stored as one contiguous run per row.
+
+    The stationaries are built :data:`TENSOR_ENGINE_GROUP_SPAN` groups at a time (see
+    :func:`_stationary_pieces`), each split into :data:`TENSOR_ENGINE_PIECES` bf16
+    pieces; the next span's pieces are issued before the current span's groups, so
+    they are built while the tensor engine runs the current span. Each piece is one
+    matmul pass into the group's fp32 PSUM banks (one per ``gemm_moving_fmax`` hidden
+    columns), largest piece first. A bf16 product is exact in fp32, and every result
+    element sums ``S + 1`` nonzero products per piece, so the result is the exact
+    ``post_j * x + sum_i comb_ij * res_i`` up to fp32 additions in the engine's
+    order, rounded once into the output dtype when the scalar engine copies the
+    banks out (the vector engine, which builds the pieces, is left out of the
+    per-group path).
+
+    A short last group zeroes its moving tile first, so rows past ``T`` contribute
+    exact zeros, and its rows past ``T`` are never stored.
+
+    The stream loads and the output stores use static DMA descriptors
+    (``dge_mode=nisa.dge_mode.none``): their descriptors are built before the launch,
+    not during the call by the software descriptor generator on the GpSimd engine,
+    which would otherwise build them for most of the call's bytes and pace the call.
+    This is correct for every shape the kernel takes, because each copy's offset and
+    access pattern are trace-time constants (``g``, ``tokens``, ``h_lo``, ``width`` and
+    the shapes are Python integers): a static descriptor moves the same bytes as a
+    generated one, and a copy does not change a value. A program issues one load and
+    one store per group, ``ceil(T / G)`` of each.
+
+    The bound. Let ``y`` be the exact ``post_j * x + sum_i comb_ij * res_i``,
+    ``m = |post_j * x| + sum_i |comb_ij * res_i|``, ``u = 2**-24`` and
+    ``g = (P * (S + 1) - 1) * u`` with ``P =`` :data:`TENSOR_ENGINE_PIECES`. This
+    form's fp32 sum and the vector forms' each lie within ``g * m`` of ``y``, so each
+    output lies within ``step(|y| + g * m) / 2 + g * m`` of ``y``, where ``step(v)``
+    is the output dtype's step at ``v``, and the two forms' outputs within twice
+    that of each other. Where the terms cancel (``|y|`` far below ``m``) the
+    ``g * m`` term spans many steps of ``|y|``.
+    """
+    t_extent, s_extent, h_extent = residual.shape
+    group = PARTITION_MAX // (s_extent + 1)
+    rows_out = group * s_extent
+    rows_in = rows_out + group
+    n_groups = (t_extent + group - 1) // group
+    bank = nl.tile_size.gemm_moving_fmax
+    n_banks = (width + bank - 1) // bank
+
+    # mask[k, u] = 1 where contraction row k is token u's: a stream row with
+    # 0 <= k - S*u <= S - 1, or the x row k = G*S + u.
+    ramp = nl.ndarray((rows_in, group), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.iota(dst=ramp, pattern=[[-s_extent, group]], offset=0, channel_multiplier=1)
+    above = nl.ndarray((rows_in, group), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=above, data=ramp, op0=nl.greater_equal, operand0=0.0)
+    below = nl.ndarray((rows_in, group), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=below, data=ramp, op0=nl.less_equal,
+                       operand0=float(s_extent - 1))
+    mask = nl.ndarray((rows_in, group), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=mask, data1=above, data2=below, op=nl.multiply)
+    x_ramp = nl.ndarray((rows_in, group), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.iota(dst=x_ramp, pattern=[[-1, group]], offset=-rows_out, channel_multiplier=1)
+    x_rows = nl.ndarray((rows_in, group), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=x_rows, data=x_ramp, op0=nl.equal, operand0=0.0)
+    nisa.tensor_tensor(dst=mask, data1=mask, data2=x_rows, op=nl.add)
+
+    first = n_groups
+    if first > TENSOR_ENGINE_GROUP_SPAN:
+        first = TENSOR_ENGINE_GROUP_SPAN
+    upcoming = _stationary_pieces(post_layer_mix, comb_res_mix, mask, 0, first)
+    for g0 in range(0, n_groups, TENSOR_ENGINE_GROUP_SPAN):
+        span = n_groups - g0
+        if span > TENSOR_ENGINE_GROUP_SPAN:
+            span = TENSOR_ENGINE_GROUP_SPAN
+        pieces = upcoming
+        # The next span's pieces, issued ahead of this span's groups.
+        g1 = g0 + TENSOR_ENGINE_GROUP_SPAN
+        if g1 < n_groups:
+            later = n_groups - g1
+            if later > TENSOR_ENGINE_GROUP_SPAN:
+                later = TENSOR_ENGINE_GROUP_SPAN
+            upcoming = _stationary_pieces(post_layer_mix, comb_res_mix, mask, g1, later)
+        for g in range(g0, g0 + span):
+            tokens = t_extent - g * group
+            if tokens > group:
+                tokens = group
+            moving = nl.ndarray((rows_in, width), dtype=residual.dtype, buffer=nl.sbuf)
+            if tokens < group:
+                nisa.memset(dst=moving, value=0.0)
+            nisa.dma_copy(
+                dge_mode=nisa.dge_mode.none,
+                dst=moving[0:tokens * s_extent, 0:width],
+                src=residual.ap(pattern=[[h_extent, tokens * s_extent], [1, width]],
+                                offset=g * rows_out * h_extent + h_lo),
+            )
+            nisa.dma_copy(
+                dst=moving[rows_out:rows_out + tokens, 0:width],
+                src=x.ap(pattern=[[h_extent, tokens], [1, width]],
+                         offset=g * group * h_extent + h_lo),
+            )
+            # One PSUM tile per bank, so each bank is its own accumulation group.
+            accs = []
+            for _ in range(n_banks):
+                accs.append(nl.ndarray((rows_out, bank), dtype=nl.float32,
+                                       buffer=nl.psum))
+            for n in range(TENSOR_ENGINE_PIECES):
+                for b in range(n_banks):
+                    w = width - b * bank
+                    if w > bank:
+                        w = bank
+                    nisa.nc_matmul(
+                        dst=accs[b][0:rows_out, 0:w],
+                        stationary=pieces[n][0:rows_in, g - g0, 0:rows_out],
+                        moving=moving[0:rows_in, b * bank:b * bank + w],
+                        accumulate=(n > 0),
+                    )
+            mixed = nl.ndarray((rows_out, width), dtype=out.dtype, buffer=nl.sbuf)
+            for b in range(n_banks):
+                w = width - b * bank
+                if w > bank:
+                    w = bank
+                nisa.activation(dst=mixed[0:rows_out, b * bank:b * bank + w],
+                                op=nl.copy, data=accs[b][0:rows_out, 0:w])
+            nisa.dma_copy(
+                dge_mode=nisa.dge_mode.none,
+                dst=out.ap(pattern=[[h_extent, tokens * s_extent], [1, width]],
+                           offset=g * rows_out * h_extent + h_lo),
+                src=mixed[0:tokens * s_extent, 0:width],
+            )
+
+
+def _stationary_pieces(post_layer_mix, comb_res_mix, mask, g0, span):
+    """The bf16 pieces of the stationary operands of token groups ``[g0, g0 + span)``.
+
+    Traced inside :func:`_combine_on_tensor_engine`, whose layout this follows;
+    ``mask`` is its ``[G * (S + 1), G]`` block mask. Returns
+    :data:`TENSOR_ENGINE_PIECES` tiles ``[G * (S + 1), span, G * S]``, largest first,
+    ``piece_n[k, g, t * S + j] = wpiece_n[k, g, j] * mask[k, t]``. ``weights[k, g, j]``
+    is ``comb[(g0 + g) * G + k // S, k % S, j]`` for ``k < G * S``, then
+    ``post[(g0 + g) * G + k - G * S, j]``, loaded with the contraction row on the
+    partition (a short last group's missing rows stay zero), and ``wpiece_n =
+    bf16(weights - sum of the earlier pieces)``, each difference exact in fp32. The
+    split runs on the ``S`` weights of a row, ``1 / G`` of the elements of the
+    ``G * S`` columns the mask then spreads them over; a product with a 0/1 mask is
+    exact, so the pieces are those of the masked weights.
+
+    The weight loads move one ``S``-value element per contraction row and group, and
+    their descriptors are built before the launch (``dge_mode.none``), off the queues
+    that carry the streams.
+    """
+    t_extent, s_extent, _ = comb_res_mix.shape
+    rows_in, group = mask.shape
+    rows_out = group * s_extent
+    first = g0 * group
+    full = (t_extent - first) // group
+    if full > span:
+        full = span
+    tail = t_extent - first - full * group
+    if full == span:
+        tail = 0
+
+    weights = nl.ndarray((rows_in, span, s_extent), dtype=nl.float32, buffer=nl.sbuf)
+    if tail > 0:
+        nisa.memset(dst=weights, value=0.0)
+    if full > 0:
+        nisa.dma_copy(
+            dge_mode=nisa.dge_mode.none,
+            dst=weights[0:rows_out, 0:full, 0:s_extent],
+            src=comb_res_mix.ap(
+                pattern=[[s_extent, rows_out], [rows_out * s_extent, full],
+                         [1, s_extent]],
+                offset=first * s_extent * s_extent,
+            ),
+        )
+        nisa.dma_copy(
+            dge_mode=nisa.dge_mode.none,
+            dst=weights[rows_out:rows_in, 0:full, 0:s_extent],
+            src=post_layer_mix.ap(
+                pattern=[[s_extent, group], [group * s_extent, full], [1, s_extent]],
+                offset=first * s_extent,
+            ),
+        )
+    if tail > 0:
+        last = first + full * group
+        nisa.dma_copy(
+            dge_mode=nisa.dge_mode.none,
+            dst=weights[0:tail * s_extent, full, 0:s_extent],
+            src=comb_res_mix.ap(pattern=[[s_extent, tail * s_extent], [1, s_extent]],
+                                offset=last * s_extent * s_extent),
+        )
+        nisa.dma_copy(
+            dge_mode=nisa.dge_mode.none,
+            dst=weights[rows_out:rows_out + tail, full, 0:s_extent],
+            src=post_layer_mix.ap(pattern=[[s_extent, tail], [1, s_extent]],
+                                  offset=last * s_extent),
+        )
+    spread = mask.expand_dim(1).expand_dim(3).broadcast(1, span).broadcast(3, s_extent)
+    pieces = []
+    rest = weights
+    for n in range(TENSOR_ENGINE_PIECES):
+        wpiece = nl.ndarray((rows_in, span, s_extent), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=wpiece, src=rest)
+        piece = nl.ndarray((rows_in, span, rows_out), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.tensor_tensor(
+            dst=piece.reshape((rows_in, span, group, s_extent)),
+            data1=wpiece.expand_dim(2).broadcast(2, group),
+            data2=spread,
+            op=nl.multiply,
+        )
+        pieces.append(piece)
+        if n < TENSOR_ENGINE_PIECES - 1:
+            left = nl.ndarray((rows_in, span, s_extent), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=left, data1=rest, data2=wpiece, op=nl.subtract)
+            rest = left
+    return pieces
 
 
 def _require_admissible(

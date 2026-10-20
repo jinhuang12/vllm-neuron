@@ -17,8 +17,11 @@ The switch is registered in :mod:`vllm_neuron.envs`. It names four sites
 * ``mhc_post``: the bf16 epilogue of ``functional/mhc/hyper_connection.py``. When it is
   selected, the mHC combine takes the bf16 streams as they are, not fp32 copies, and
   rounds its fp32 result to bf16 once in the kernel, not in an XLA convert after it.
-  The values are the same in the simulator; on the device the two roundings can
-  differ by one bf16 step in some elements.
+  Up to that file's ``HIDDEN_ON_PARTITIONS_MAX_TOKENS`` rows the values are the same
+  in the simulator; on the device the two roundings can differ by one bf16 step in
+  some elements. Above that many rows the combine runs on the tensor engine: it adds
+  the same exact products in another fp32 order, so its values can differ from the
+  fp32 route's, within the bound that ``hyper_connection.py`` states.
 
 Values:
 
