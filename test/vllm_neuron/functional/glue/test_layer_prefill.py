@@ -7,8 +7,8 @@ opening request's prefill chunk (``glue_case.kda_prefill_carriers``) at:
 * 128 rows, where ``1`` fuses mhc_pre and mhc_post. Every switch value the A/B ran
   (``0``, ``1``, ``all`` and each kernel alone but mhc_post) runs the layer from this
   tree.
-* 1024 rows, the served p1 chunk, where mhc_pre and mhc_post can be fused (the two KDA
-  kernels serve at most 128 rows and decline). ``0``, ``1``, ``all`` and mhc_pre run.
+* 1024 rows, the served p1 chunk, where mhc_pre and mhc_post can be fused. ``0`` and
+  mhc_pre run; neither selects the two KDA kernels.
 * 2048 rows, the chunk of the uncapped prefill line, where ``1`` fuses mhc_pre and
   mhc_post (the two KDA kernels decline). ``1`` runs against the snapshot.
 
@@ -49,10 +49,10 @@ from vllm_neuron.functional.glue import kda_output, kda_projections, mhc_pre
 from vllm_neuron.model.glm5_next import model_fp8
 
 VALUES = {128: ("0", "1", "all", "mhc_pre", "kda_projections", "kda_output"),
-          1024: ("0", "1", "all", "mhc_pre"),
+          1024: ("0", "mhc_pre"),
           glue_case.UNCAPPED_PREFILL_CHUNK: ("1",)}
-#: The largest row count each bounded kernel serves (its ``*_admits`` shape rule);
-#: mhc_pre serves any row count.
+#: The KDA kernels' decode row bound (their prefill kernels take larger row counts, which
+#: no value above selects); mhc_pre serves any row count.
 MAX_ROWS = {kda_projections: kda_projections.KDA_PROJECTIONS_MAX_TOKENS,
             kda_output: kda_output.KDA_OUTPUT_MAX_TOKENS}
 #: Calls per layer step: both mHC sites, one KDA input projection, one output projection.

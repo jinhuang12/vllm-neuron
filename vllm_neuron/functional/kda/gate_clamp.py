@@ -220,6 +220,54 @@ def kda_gate_clamp(
     )
 
 
+def kda_gate(raw_gate: Tensor, a_log: Tensor, *, lower: float, bias: Tensor) -> Tensor:
+    """The KDA gate of every head of ``raw_gate`` ``[T, heads * D]``; returns that shape, float32.
+
+    ``a_log`` holds one decay exponent per head, ``bias`` one value per key channel
+    (``heads * D``), and ``lower`` is the checkpoint's ``gate_lower_bound``. Head ``h``
+    takes columns ``h * D`` to ``(h + 1) * D``.
+
+    :func:`kda_gate_clamp` takes one head per call: it refuses an ``a_log`` holding more
+    than one value, because the decay rate is per head while the bias and the gate are
+    per key channel. It also refuses more than ``MAX_TILE`` tokens in one call, because
+    both of its axes pass through a transpose that serves that width. So a prompt longer
+    than one tile is handed over in tiles and reassembled here, rather than the kernel
+    growing a quiet fallback.
+
+    Tiling is exact, not approximate. The gate applies a per-channel bias, one scalar
+    decay rate and a sigmoid, with no reduction along the token axis, so tile boundaries
+    cannot move a value: a tiled call and a whole call agree bit for bit.
+    """
+    heads = a_log.numel()
+    tokens, width = (int(v) for v in raw_gate.shape)
+    if width % heads:
+        raise GateClampError(
+            f"raw_gate's {width} columns do not split into {heads} heads"
+        )
+    kdim = width // heads
+    decay = a_log.to(torch.float32).reshape(-1)
+    channel_bias = bias.to(torch.float32).reshape(-1)
+
+    def one_head(h: int) -> Tensor:
+        """One head's gate over the whole prompt, in tiles the kernel accepts."""
+        span = slice(h * kdim, (h + 1) * kdim)
+        tiles = [
+            kda_gate_clamp(
+                raw_gate[start : start + MAX_TILE, span].contiguous(),
+                decay[h],
+                bias=channel_bias[span],
+                lower=lower,
+            )
+            for start in range(0, tokens, MAX_TILE)
+        ]
+        # A prompt that already fits is returned as the single tile it is, so it still
+        # costs exactly one call and no concatenation.
+        return tiles[0] if len(tiles) == 1 else torch.cat(tiles, dim=0)
+
+    parts = [one_head(h) for h in range(heads)]
+    return parts[0] if heads == 1 else torch.cat(parts, dim=1)
+
+
 def gate_clamp_kernel_identity() -> tuple[str, str]:
     """``(module, qualname)`` of the gate kernel this module authors.
 

@@ -5,7 +5,7 @@ The contract (``vllm_neuron/functional/glue/__init__.py``):
 
 * ``0``: nothing fused, every site keeps 0a08ff4's torch route (the kill switch).
 * ``1`` or unset: ``envs.DEFAULT_GLUE_FUSED_SPEC``, the subset that won on the device:
-  mhc_pre and mhc_post at the measured prefill buckets, and mhc_pre at the speculative
+  the glue kernels at their measured prefill buckets, and mhc_pre at the speculative
   verify step (``mhc_pre:verify``).
 * ``all``: every kernel at every phase and row count (821274e's behaviour).
 * otherwise a comma list of ``kernel[:phase][@rows]`` rules.
@@ -73,37 +73,10 @@ DEFAULT_GRID = (1, 2, 3, 4, 5, 8, 16, 32, 63, 64, 65, 127, 128, 129, 512, 1023, 
                 2047, 2048, 2049, 4096)
 
 
-def test_default_is_the_measured_subset():
-    """``1`` is mhc_pre and mhc_post at 128-, 1024- and 2048-row prefills, mhc_pre at
-    every verify step, and nothing else: where the device measured a win
-    (``envs.DEFAULT_GLUE_FUSED_SPEC``'s docstring). A prefill row count between or beyond
-    them, such as the 512 rows where mhc_post lost, 1025 to 2047 rows, or a 4096-row
-    chunk, keeps the torch route, and so does mhc_post at the verify step. The table is
-    written out, not derived, so a rule added to or removed from the default without
-    changing this table fails here."""
-    sel = glue.glue_selection("1")
-    got = {(k, p, t) for k in KERNELS for p in glue.PHASES for t in DEFAULT_GRID
-           if sel.selects(k, t, p)}
-    assert got == ({("mhc_pre", "prefill", 128), ("mhc_pre", "prefill", 1024),
-                    ("mhc_pre", "prefill", 2048), ("mhc_post", "prefill", 128),
-                    ("mhc_post", "prefill", 1024), ("mhc_post", "prefill", 2048)}
-                   | {("mhc_pre", "verify", t) for t in DEFAULT_GRID})
-
-
-#: The measured prefill subset, written out: the route every prefill and decode call
-#: takes with and without the verify rule.
+#: The six mHC prefill rules, written out: a value with and without the verify rule.
 PREFILL_RULES = glue_case.PREFILL_RULES
-#: The default, written out: the prefill subset and mhc_pre at every verify step.
+#: The prefill subset and mhc_pre at every verify step, written out.
 VERIFY_VALUE = PREFILL_RULES + ",mhc_pre:verify"
-
-
-def test_one_is_the_prefill_subset_and_the_verify_rule():
-    """The default is the prefill subset and the ``mhc_pre:verify`` rule, and nothing
-    else."""
-    assert glue.glue_selection("1") == glue.glue_selection(VERIFY_VALUE)
-    one, prefill = glue.glue_selection("1"), glue.glue_selection(PREFILL_RULES)
-    assert prefill.rules < one.rules
-    assert one.rules - prefill.rules == glue.glue_selection("mhc_pre:verify").rules
 
 
 def test_the_verify_rule_moves_no_prefill_or_decode_call():

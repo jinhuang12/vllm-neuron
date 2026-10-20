@@ -251,6 +251,11 @@ DEFAULT_DEVICE_GRAPH_RESERVE_GIB = 5.0
 #: * ``mhc_pre:prefill@2048`` and ``mhc_post:prefill@2048``: both kernels at the
 #:   2048-row chunk of an uncapped prefill, measured together (not each alone),
 #:   faster in each repeat.
+#: * ``kda_projections:prefill@1024`` and ``kda_output:prefill@1024``: the KDA input
+#:   projections, with the layer's input RMSNorm computed inside the projection
+#:   kernel, and the KDA gated output projection, at the 1024-row chunk. Beside the
+#:   mHC rules, the projections alone and both together were faster in each repeat.
+#:   Without the norm in the kernel, both made that layer slower.
 #:
 #: ``mhc_pre:verify`` fuses the mHC pre-mix at the speculative verify step, whose row
 #: counts the mHC sites derive from the speculative config: each decode bucket times
@@ -258,8 +263,8 @@ DEFAULT_DEVICE_GRAPH_RESERVE_GIB = 5.0
 #: verify step, so the rule changes none of its graphs. At the verify step the mHC
 #: combine still widens its operands to fp32, as on its torch route, since the
 #: default's mhc_post rules are prefill rules; and the KDA layer, which calls the verify
-#: step decode, keeps its torch routes, since the default has no kda_projections or
-#: kda_output rule. At 4 rows (batch 1, 3 drafts)
+#: step decode, keeps its torch routes, since the default's kda_projections and
+#: kda_output rules are prefill rules. At 4 rows (batch 1, 3 drafts)
 #: the torch route runs its dots as 2-row pieces, and at the MoE feed-forward site the
 #: collapse that the router reads as a per-token loop, so the feed-forward sites' XLA
 #: before their consumer grows over the one-token step. On a TP=64 server the kernel
@@ -270,9 +275,9 @@ DEFAULT_DEVICE_GRAPH_RESERVE_GIB = 5.0
 #: with 3 drafts, with the synchronous drafter and with the asynchronous one, the rule
 #: shortened the inter-token latency and got wrong some benchmark answers that the same
 #: server without the rule got right. The default takes the time per token. To keep
-#: those answers instead, set the switch to the six prefill rules above without
+#: those answers instead, set the switch to the eight prefill rules above without
 #: ``mhc_pre:verify``:
-#: ``mhc_pre:prefill@128,mhc_pre:prefill@1024,mhc_pre:prefill@2048,mhc_post:prefill@128,mhc_post:prefill@1024,mhc_post:prefill@2048``.
+#: ``mhc_pre:prefill@128,mhc_pre:prefill@1024,mhc_pre:prefill@2048,mhc_post:prefill@128,mhc_post:prefill@1024,mhc_post:prefill@2048,kda_projections:prefill@1024,kda_output:prefill@1024``.
 #: The verify step then takes its torch route, and the prefill kernels stay. ``0``
 #: turns every fused glue kernel off.
 #:
@@ -283,7 +288,7 @@ DEFAULT_DEVICE_GRAPH_RESERVE_GIB = 5.0
 #: Two loads of one graph do not time the same, so a gain inside the spread between
 #: two loads is not a win. kda_projections was faster at 128 rows by less than that
 #: spread, and slower when the layer's two reductions were chains of 4 and 8
-#: all-reduces, so it is not in the default. kda_output was slower at 128 rows. No
+#: all-reduces, so it is not a default rule there. kda_output was slower at 128 rows. No
 #: kernel is selected at decode (one row per request): on a TP=64 server, ``all``
 #: made the batch-1 decode step longer, while the single-rank benchmark (no
 #: tensor-parallel collectives) measured it shorter. So every decode graph under ``1``,
@@ -295,7 +300,8 @@ DEFAULT_DEVICE_GRAPH_RESERVE_GIB = 5.0
 DEFAULT_GLUE_FUSED_SPEC = (
     "mhc_pre:prefill@128,mhc_pre:prefill@1024,mhc_pre:prefill@2048,"
     "mhc_post:prefill@128,mhc_post:prefill@1024,mhc_post:prefill@2048,"
-    "mhc_pre:verify")
+    "mhc_pre:verify,"
+    "kda_projections:prefill@1024,kda_output:prefill@1024")
 
 
 environment_variables: dict[str, Callable[[], Any]] = {

@@ -3418,6 +3418,8 @@ class Glm5NextKDAAttention(nn.Module):
         # counts); the state width per head does not shard.
         self.num_kv_heads_per_rank = _per_rank(self.num_heads, world_size)
         self.head_size = self.head_dim
+        # The input projections' contraction width, for ``projection_widths``.
+        self.hidden_size = int(text_config.hidden_size)
         self.cache_dtype = _resolve_kda_state_dtype(text_config)
         # The gate's lower bound is the checkpoint's, read through the same
         # checked accessor as the rest of ``linear_attn_config`` so a missing key
@@ -3505,6 +3507,71 @@ class Glm5NextKDAAttention(nn.Module):
             "dt_bias",
         )
 
+    def projection_widths(self) -> tuple[tuple[str, int, int], ...]:
+        """The eight input projections as ``(name, in_features, out_features)``, closed form.
+
+        The widths are this rank's. ``q``, ``k``, ``v`` and the two gate expansions
+        are this rank's heads times ``head_dim`` wide and ``b`` is one value per head.
+        The two gate bottlenecks are one head wide, ``hidden_size -> head_dim``, as the
+        reference model builds ``f_a_proj`` and ``g_a_proj``. They are replicated over
+        the ranks, not sharded.
+        """
+        width = self.num_kv_heads_per_rank * self.head_dim
+        rank = self.head_dim
+        return (
+            ("q_proj", self.hidden_size, width),
+            ("k_proj", self.hidden_size, width),
+            ("v_proj", self.hidden_size, width),
+            ("b_proj", self.hidden_size, self.num_kv_heads_per_rank),
+            ("f_a_proj", self.hidden_size, rank),
+            ("f_b_proj", rank, width),
+            ("g_a_proj", self.hidden_size, rank),
+            ("g_b_proj", rank, width),
+        )
+
+    def prepare_projection_weights(self) -> int:
+        """Lay the eight input projections out once for the prefill kernel. Returns how many.
+
+        The prefill projection kernel contracts ``hidden_size`` over the tensor
+        engine's partitions. So it reads the six first-stage weights contraction-major,
+        as one ``[hidden_size, C]`` operand, and the two expansions transposed side by
+        side. A checkpoint stores each weight ``[out_features, in_features]``. A weight
+        never changes, so this relayout is done here once, at load, and not per call
+        (:func:`~vllm_neuron.functional.glue.kda_projections.prefill_operands`).
+        The operands are stored under that module's ``PREFILL_OPERANDS_ATTR``. The
+        checkpoint tensors stay, because decode and the torch route read them.
+
+        Each weight is checked against the closed-form widths first. So a checkpoint
+        of another geometry fails here, with the site named.
+        """
+        from vllm_neuron.functional.glue.kda_projections import (
+            PREFILL_OPERANDS_ATTR,
+            prefill_operands,
+        )
+
+        weights: dict[str, torch.Tensor] = {}
+        for name, idim, odim in self.projection_widths():
+            weight = getattr(self, f"{name}_weight", None)
+            if weight is None:
+                raise ValueError(
+                    f"{name}_weight is declared but not materialised; load the "
+                    f"checkpoint before preparing the projection weights"
+                )
+            if tuple(weight.shape) != (odim, idim):
+                raise ValueError(
+                    f"{name}_weight is {tuple(weight.shape)}; this config's "
+                    f"closed form is [out_features, in_features] = "
+                    f"{(odim, idim)}"
+                )
+            weights[name] = weight
+        # The relayout is a transposed copy, which a device tensor refuses, so it is
+        # built on host copies and moved back in one step per operand.
+        device = weights["q_proj"].device
+        host = dict(zip(weights, _on_the_host(*weights.values())))
+        setattr(self, PREFILL_OPERANDS_ATTR,
+                _on_the_device(device, *prefill_operands(**host)))
+        return len(weights)
+
     # ── the conv carrier's extent order, handled in one place ─────────────
     def _conv_history(self, conv_state: torch.Tensor) -> torch.Tensor:
         """The carried conv rows as ``[kernel_size - 1, channels]``, float32.
@@ -3568,6 +3635,7 @@ class Glm5NextKDAAttention(nn.Module):
         state_slots: torch.Tensor | None = None,
         checkpoint_rows: torch.Tensor | int | None = None,
         state_checkpoints: int | None = None,
+        input_norm: tuple[torch.Tensor, float] | None = None,
     ) -> torch.Tensor:
         """One KDA layer's gated-delta linear attention over ``[T, hidden]``.
 
@@ -3631,6 +3699,10 @@ class Glm5NextKDAAttention(nn.Module):
                 host numbers are refused: the caller hands them as a tensor, because a
                 tensor built from python data on the traced path is real under graph
                 extraction.
+            input_norm: at a prefill, ``(gain, eps)`` of the layer's input RMSNorm
+                when ``hidden_states`` arrives un-normalised, else None. The
+                projections apply it, on chip when their kernel serves, beside its
+                own read of the rows. A decode step's input arrives normed.
 
         Returns:
             ``[T, hidden]`` at the input dtype.
@@ -3693,15 +3765,16 @@ class Glm5NextKDAAttention(nn.Module):
             fused_decode_enabled,
             kda_fused_decode,
         )
-        from vllm_neuron.functional.kda.gate_clamp import (
-            MAX_TILE as GATE_MAX_TILE,
-            kda_gate_clamp,
-        )
 
         if hidden_states.dim() != 2:
             raise ValueError(
                 f"hidden_states must be [tokens, hidden]; got shape "
                 f"{tuple(hidden_states.shape)}"
+            )
+        if input_norm is not None and not is_prefill:
+            # A decode's fused routes do not call the projections, which apply the norm.
+            raise ValueError(
+                "input_norm is a prefill argument: a decode step's input arrives normed"
             )
         if state_slots is not None:
             # The bank form: whole banks beside one slot per request, a decode only,
@@ -3890,8 +3963,12 @@ class Glm5NextKDAAttention(nn.Module):
         # selects the glue kernels here and at the output projection
         # (``VLLM_NEURON_GLUE_FUSED``, functional/glue).
         phase = "prefill" if is_prefill else "decode"
-        q_in, k_in, v_in, raw_gate, raw_beta, out_gate = kda_projections(
-            hidden_states, self, phase=phase)
+        # The fused decode launch applies the KDA gate in its own kernel, so it takes
+        # the projected gate. Every other step takes the gate itself from the
+        # projections, which apply it on chip when the prefill kernel serves them.
+        fused_step = not is_prefill and tokens == 1 and fused_decode_enabled()
+        q_in, k_in, v_in, gate, raw_beta, out_gate = kda_projections(
+            hidden_states, self, phase=phase, norm=input_norm, gate=not fused_step)
 
         # A sequence that has computed nothing enters with a zero state, and this is
         # the one predicate that says so. A sequence at position 0 carries no
@@ -3917,12 +3994,12 @@ class Glm5NextKDAAttention(nn.Module):
         # opening request from the same position. Its carriers come back as new
         # tensors and are written through the bank views here, as stages 1 and 5
         # below write them. VLLM_NEURON_KDA_FUSED_DECODE=0 restores the stages.
-        if not is_prefill and tokens == 1 and fused_decode_enabled():
+        if fused_step:
             fused = kda_fused_decode(
                 q_in,
                 k_in,
                 v_in,
-                raw_gate,
+                gate,
                 raw_beta,
                 conv_state=conv_state.unsqueeze(0),
                 recurrent_state=recurrent_state.unsqueeze(0),
@@ -3980,42 +4057,9 @@ class Glm5NextKDAAttention(nn.Module):
         history_index = torch.arange(state_rows, device=padded.device) + real_length
         self._store_conv_history(conv_state, padded.index_select(0, history_index))
 
-        # --- 2: the gate clamp, one call per head per token tile --------------
-        # The kernel takes one head per call: it refuses an ``a_log`` holding more
-        # than one value, because the decay rate is per head while the bias and the
-        # gate are per key channel.
-        #
-        # It also refuses more than ``GATE_MAX_TILE`` tokens in one call, because
-        # both of its axes pass through a transpose that serves that width. So a
-        # prompt longer than one tile is handed over in tiles and reassembled here,
-        # in the caller, rather than the kernel growing a quiet fallback.
-        #
-        # Tiling is exact here, not approximate. The gate applies a per-channel
-        # bias, one scalar decay rate and a sigmoid, with no reduction along the
-        # token axis, so tile boundaries cannot move a value: a tiled call and a
-        # whole call agree bit for bit.
-        a_log = self.A_log.to(torch.float32).reshape(-1)
-        dt_bias = self.dt_bias.to(torch.float32).reshape(-1)
-
-        def clamp_one_head(h: int) -> torch.Tensor:
-            """One head's gate over the whole prompt, in tiles the kernel accepts."""
-            span = slice(h * kdim, (h + 1) * kdim)
-            head_bias = dt_bias[span]
-            head_decay = a_log[h]
-            tiles = [
-                kda_gate_clamp(
-                    raw_gate[start : start + GATE_MAX_TILE, span].contiguous(),
-                    head_decay,
-                    bias=head_bias,
-                    lower=self.gate_lower_bound,
-                )
-                for start in range(0, tokens, GATE_MAX_TILE)
-            ]
-            # A prompt that already fits is returned as the single tile it is, so it
-            # still costs exactly one call and no concatenation.
-            return tiles[0] if len(tiles) == 1 else torch.cat(tiles, dim=0)
-
-        gate_parts = [clamp_one_head(h) for h in range(heads)]
+        # --- 2: the gate, per head -----------------------------------------
+        # The projections returned the gate itself (``gate=True`` above).
+        gate_parts = [gate[:, h * kdim : (h + 1) * kdim] for h in range(heads)]
         beta = torch.sigmoid(raw_beta)
         # The mask goes on after the clamp and after the sigmoid, on the two values
         # the recurrence reads per row: a zero log-decay is a decay of one and a zero
@@ -4397,13 +4441,14 @@ class Glm5NextKDALayer(nn.Module):
         """Pre-attention RMSNorm: ``x / sqrt(mean(x**2) + eps) * gain``.
 
         The epsilon is the checkpoint's ``rms_norm_eps``, resolved at
-        construction.
+        construction. The expression is
+        :func:`~vllm_neuron.functional.glue.kda_projections.input_rms_norm`. The
+        forward calls this method at a decode step. At a prefill it hands the gain
+        and the epsilon to the attention instead, whose projections apply the norm.
         """
-        x = hidden_states.to(torch.float32)
-        variance = x.pow(2).mean(dim=-1, keepdim=True)
-        normed = x * torch.rsqrt(variance + self.rms_norm_eps)
-        normed = normed * self.input_layernorm_weight.to(torch.float32)
-        return normed.to(hidden_states.dtype)
+        from vllm_neuron.functional.glue.kda_projections import input_rms_norm
+
+        return input_rms_norm(hidden_states, self.input_layernorm_weight, self.rms_norm_eps)
 
     def forward(
         self,
@@ -4466,8 +4511,13 @@ class Glm5NextKDALayer(nn.Module):
         """
 
         def attention_half(single_stream: torch.Tensor) -> torch.Tensor:
+            # At a prefill the input norm's gain and epsilon go to the attention,
+            # whose projection kernel computes the norm beside its read of the rows.
             attended = self.attention(
-                self._input_norm(single_stream),
+                single_stream if is_prefill else self._input_norm(single_stream),
+                input_norm=(
+                    (self.input_layernorm_weight, self.rms_norm_eps) if is_prefill else None
+                ),
                 conv_state=conv_state,
                 recurrent_state=recurrent_state,
                 is_prefill=is_prefill,
