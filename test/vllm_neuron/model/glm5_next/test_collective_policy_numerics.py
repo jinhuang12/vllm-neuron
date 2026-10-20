@@ -60,9 +60,9 @@ def test_the_bf16_wire_moves_the_dsa_logits_within_the_derived_bounds(monkeypatc
     sites: list[RowParallelSite] = []
     reduce = model_fp8.reduce_row_parallel
 
-    def recording(partial, *, site, group):
+    def recording(partial, *, site, group, steps):
         sites.append(RowParallelSite(site))
-        return reduce(partial, site=site, group=group)
+        return reduce(partial, site=site, group=group, steps=steps)
 
     monkeypatch.setattr(model_fp8, "reduce_row_parallel", recording)
     base = em.dsa_arm(BATCH, STEPS)

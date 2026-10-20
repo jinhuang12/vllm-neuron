@@ -118,8 +118,11 @@ if TYPE_CHECKING:
     # "freeze_rare_gen2" (freeze + gen-2 threshold 100000), or "freeze".
     VLLM_NEURON_GC_POLICY: str = "rare_gen2"
     # GLM-5.3-Flash row-parallel all-reduce.
-    # The dtype a row-parallel partial crosses the wire in: "fp32" or "bf16".
-    VLLM_NEURON_TP_ALLREDUCE_DTYPE: str = "fp32"
+    # The dtype a row-parallel partial crosses the wire in: "bf16" (default) or "fp32".
+    VLLM_NEURON_TP_ALLREDUCE_DTYPE: str = "bf16"
+    # The steps that use that dtype: "prefill" (default), "all", or a comma list of
+    # prefill, decode and verify; every other step reduces in fp32.
+    VLLM_NEURON_TP_ALLREDUCE_DTYPE_PHASES: str = "prefill"
     # Keep every all-reduce one collective instead of the compiler's 8 MiB tiles.
     # On by default; 0 restores the tiles.
     VLLM_NEURON_TP_ALLREDUCE_FUSE: bool = True
@@ -583,12 +586,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NEURON_GC_POLICY": lambda: os.getenv("VLLM_NEURON_GC_POLICY", "rare_gen2"),
     # ================== GLM-5.3-Flash Row-Parallel All-Reduce ==================
     # The wire dtype of the tensor-parallel all-reduce at GLM-5.3-Flash's
-    # row-parallel sites (``model/glm5_next/collective_policy.py``). "fp32" (the
-    # default) reduces each rank's fp32 partial as computed; "bf16" rounds it to
-    # bfloat16 first, which halves the bytes every rank moves. Case and spaces are
-    # ignored; any other value is refused where it is read.
+    # row-parallel sites (``model/glm5_next/collective_policy.py``). "bf16" (the
+    # default) rounds each rank's fp32 partial to bfloat16 first, which halves the
+    # bytes every rank moves; "fp32" reduces the partial as computed. Case and spaces
+    # are ignored; any other value is refused where it is read.
     "VLLM_NEURON_TP_ALLREDUCE_DTYPE": lambda: (
-        os.getenv("VLLM_NEURON_TP_ALLREDUCE_DTYPE", "fp32").strip().lower()
+        os.getenv("VLLM_NEURON_TP_ALLREDUCE_DTYPE", "bf16").strip().lower()
+    ),
+    # The steps whose partials cross the wire in that dtype: "prefill" (the default:
+    # the prefill chunks only), "all", or a comma list of "prefill", "decode" and
+    # "verify". Every other step reduces in fp32. A site tells its step by its row
+    # count (``collective_policy.StepRows``). Case and spaces are ignored; any other
+    # value is refused where it is read.
+    "VLLM_NEURON_TP_ALLREDUCE_DTYPE_PHASES": lambda: (
+        os.getenv("VLLM_NEURON_TP_ALLREDUCE_DTYPE_PHASES", "prefill").strip().lower()
     ),
     # "1" (the default) asks neuronx-cc to keep each all-reduce one collective;
     # "0" lets its SimpleAllReduceTiling pass split an all-reduce larger than 8 MiB

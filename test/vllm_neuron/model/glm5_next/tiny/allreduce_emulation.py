@@ -48,7 +48,7 @@ import sys
 
 import torch
 
-from vllm_neuron.model.glm5_next.collective_policy import DTYPE_ENV
+from vllm_neuron.model.glm5_next.collective_policy import DTYPE_ENV, DTYPE_PHASES_ENV
 
 #: The TP degree the GLM-5.3-Flash prefill runs at today.
 RANKS = 64
@@ -254,35 +254,40 @@ class EmulatedTPGroup:
 def injected(group, wire: str | None):
     """``group`` as the TP coordinator and ``wire`` as the policy, restored on exit.
 
-    The model's entry point is wrapped so an :class:`EmulatedTPGroup` sees each site's
-    fp32 partial before the policy rounds it (:attr:`EmulatedTPGroup.exact`).
+    ``wire`` holds at every step (``VLLM_NEURON_TP_ALLREDUCE_DTYPE_PHASES=all``): the
+    worlds prefill and decode, and every site is measured in the same wire. The model's
+    entry point is wrapped so an :class:`EmulatedTPGroup` sees each site's fp32 partial
+    before the policy rounds it (:attr:`EmulatedTPGroup.exact`).
     """
     from vllm_neuron.model.glm5_next import model_fp8
 
     saved_resolver = model_fp8._resolve_tp_group
     saved_reduce = model_fp8.reduce_row_parallel
-    saved_env = os.environ.get(DTYPE_ENV)
+    saved_env = {name: os.environ.get(name) for name in (DTYPE_ENV, DTYPE_PHASES_ENV)}
 
-    def reduce_with_the_exact_partial(partial, *, site, group):
+    def reduce_with_the_exact_partial(partial, *, site, group, steps):
         if isinstance(group, EmulatedTPGroup) and partial.dtype is torch.float32:
             group.exact = partial.detach().clone()
-        return saved_reduce(partial, site=site, group=group)
+        return saved_reduce(partial, site=site, group=group, steps=steps)
 
     model_fp8._resolve_tp_group = lambda: group
     model_fp8.reduce_row_parallel = reduce_with_the_exact_partial
     if wire is None:
-        os.environ.pop(DTYPE_ENV, None)
+        for name in saved_env:
+            os.environ.pop(name, None)
     else:
         os.environ[DTYPE_ENV] = wire
+        os.environ[DTYPE_PHASES_ENV] = "all"
     try:
         yield group
     finally:
         model_fp8._resolve_tp_group = saved_resolver
         model_fp8.reduce_row_parallel = saved_reduce
-        if saved_env is None:
-            os.environ.pop(DTYPE_ENV, None)
-        else:
-            os.environ[DTYPE_ENV] = saved_env
+        for name, value in saved_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 @contextlib.contextmanager

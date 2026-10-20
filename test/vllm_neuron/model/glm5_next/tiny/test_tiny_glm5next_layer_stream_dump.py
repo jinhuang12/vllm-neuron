@@ -638,8 +638,10 @@ def test_the_output_projection_taps_are_the_input_the_partial_and_the_whole(
 ):
     """The partial is this rank's own share, so a reduce that adds shows in one file only."""
     _require_cpu_mode()
-    # ``collective_policy``'s wire dtype, pinned so an exported switch does not decide.
+    # ``collective_policy``'s wire dtype, pinned so an exported switch does not decide,
+    # at every step: the tiny root carries no runner buckets, so no site knows its step.
     monkeypatch.setenv("VLLM_NEURON_TP_ALLREDUCE_DTYPE", wire)
+    monkeypatch.setenv("VLLM_NEURON_TP_ALLREDUCE_DTYPE_PHASES", "all")
     save_dir = tmp_path / "layer-streams"
     layers, tap, runner, root = _run_a_dumping_prefill(save_dir, monkeypatch)
     added = 7.0
