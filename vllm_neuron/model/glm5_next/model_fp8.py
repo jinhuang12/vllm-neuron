@@ -78,6 +78,8 @@ if TYPE_CHECKING:
     # Annotation only: this module imports no vllm symbol at runtime, so the
     # guard keeps the return type of ``_resolve_tp_group`` a real class name.
     from vllm.distributed.parallel_state import GroupCoordinator
+    # Annotation only: the kernel behind the keep-table route loads on first use.
+    from vllm_neuron.model.glm5_next.dsa_keep_table import KeepTableRoute
 
 # ---------------------------------------------------------------------------
 # Parameter declaration
@@ -6003,7 +6005,8 @@ class Glm5NextDSAIndexer(nn.Module):
         shardable: bool,
         ordered: bool = True,
         rank_rows: tuple | None = None,
-    ) -> torch.Tensor:
+        keep_bits: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """``[T, select_k]`` int32 pool ids for a selecting call: replicated or row-sharded.
 
         Every row runs :meth:`score_pools` then :meth:`select_bounded_pools` against the
@@ -6018,25 +6021,42 @@ class Glm5NextDSAIndexer(nn.Module):
         rank's rows before the projections (the query row cut): ``query`` and ``weights``
         are then the rank's rows already, ``seq_lens rows`` their lengths, and only the
         selection on them and the all-gather remain.
+
+        ``keep_bits`` also returns the selection's keep table, ``[T, P / 8]`` uint8 over
+        the ``P`` candidate pools (``functional/dsa/selection_keep.py``): ``(pool_ids,
+        keep_bits)``. Each rank makes the bits of the rows it selected, from their ids, and
+        a sharded call all-gathers them in the same row order as the ids.
         """
         from vllm_neuron.functional.dsa.indexer_shard import (
             gather_rows,
+            gather_selection_keep,
             select_local_rows,
         )
+        from vllm_neuron.functional.dsa.selection_keep import dsa_selection_keep
+
+        pools = int(candidate_keys.shape[0])
 
         def select(rows_query, rows_weights, rows_seq_lens):
             scores = self.score_pools(rows_query, candidate_keys, rows_weights)
             return self.select_bounded_pools(scores, rows_seq_lens, ordered=ordered)
 
+        def gathered(local, group, shard):
+            pool_ids = gather_rows(local, group, shard)
+            if not keep_bits:
+                return pool_ids
+            bits = dsa_selection_keep(local, pools)
+            return pool_ids, gather_selection_keep(bits, group, shard)
+
         if rank_rows is not None:
             (group, shard, _rank), rows_seq_lens = rank_rows
-            return gather_rows(select(query, weights, rows_seq_lens), group, shard)
+            return gathered(select(query, weights, rows_seq_lens), group, shard)
         plan = self._row_shard_plan(int(query.shape[0]), shardable)
         if plan is None:
-            return select(query, weights, seq_lens)
+            pool_ids = select(query, weights, seq_lens)
+            return (pool_ids, dsa_selection_keep(pool_ids, pools)) if keep_bits else pool_ids
         group, shard, rank = plan
         local = select_local_rows(select, query, weights, seq_lens, shard, rank)
-        return gather_rows(local, group, shard)
+        return gathered(local, group, shard)
 
     def _row_shard_plan(self, tokens: int, shardable: bool) -> tuple | None:
         """``(group, shard, rank)`` when a selecting call's ``tokens`` rows divide over the
@@ -6396,8 +6416,10 @@ class Glm5NextDSAIndexer(nn.Module):
         indices_wanted: bool = True,
         projected: tuple | None = None,
         ordered: bool = True,
-    ) -> torch.Tensor | None:
-        """The whole indexer chain. Returns ``topk_indices`` and nothing else.
+        keep_bits: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
+        """The whole indexer chain. Returns ``topk_indices`` and nothing else, unless the
+        caller asks for the keep table too (``keep_bits``).
 
         ``projected`` is :meth:`project_stage`'s four outputs for these rows, computed
         by the caller: a decode step of several requests projects them all in one
@@ -6415,6 +6437,13 @@ class Glm5NextDSAIndexer(nn.Module):
         as a set (``model/glm5_next/dsa_set_selection.py``): the selection without DCP
         then skips the top-k's sort and the sentinel order (:meth:`_select_bounded`). The
         DCP selection keeps its order, because its merge reads it.
+
+        ``keep_bits=True`` is the caller saying its attention reads the selection as a
+        keep table, the dense-masked pass (``model/glm5_next/dsa_keep_table.py``): one bit
+        per row and candidate pool, made from the same pool ids
+        (:meth:`_select_pool_ids`). The call then returns ``(topk_indices, keep_bits)``,
+        the second ``[tokens, candidates / 8]`` uint8. Only a selecting prefill call
+        without DCP has a table to make, and any other call refuses the flag.
 
         Indices alone is deliberate: the ``-1`` mask stays inside the sparse
         kernel, so no per-row valid length leaves this class -- returning one would
@@ -6526,6 +6555,11 @@ class Glm5NextDSAIndexer(nn.Module):
                 "seeding the ring needs the sequence length after this chunk; got "
                 "a prefill_tail with no prefill_end_position"
             )
+        if keep_bits and (is_decode or not selects or self.dcp_size > 1):
+            raise Glm5NextDSAIndexerError(
+                f"the keep table belongs to a selecting prefill call without DCP; got "
+                f"decode={is_decode}, selects={selects}, dcp_size={self.dcp_size}"
+            )
         # The query row cut: when the prefill selection shards, this rank's rows of the
         # query side's inputs, so the query and the weights project those rows alone
         # (``indexer_shard.take_query_rows``); the key and the gate project every row.
@@ -6628,11 +6662,17 @@ class Glm5NextDSAIndexer(nn.Module):
         # The score, the causal bound and the sentinel, at one site. The prefill leg's
         # rows may divide over the ranks (``_select_pool_ids``); the expansion below runs
         # on every row either way, with each row's own length.
-        pool_ids = self._select_pool_ids(
+        selection = self._select_pool_ids(
             query, candidate_keys, weights, seq_lens, shardable=not is_decode,
-            ordered=ordered, rank_rows=rank_rows,
+            ordered=ordered, rank_rows=rank_rows, keep_bits=keep_bits,
         )
-        return self.expand_indices(pool_ids, seq_lens)
+        if not keep_bits:
+            return self.expand_indices(selection, seq_lens)
+        pool_ids, bits = selection
+        # The ids are expanded beside the table: the attention seam checks their shape
+        # before it hands the call to the dense-masked pass, which reads only the table.
+        # So the expansion has no reader in those graphs, and their HLO holds none of it.
+        return self.expand_indices(pool_ids, seq_lens), bits
 
     def _query_row_cut(
         self, hidden_states: torch.Tensor, q_latent: torch.Tensor, seq_lens: torch.Tensor
@@ -8016,6 +8056,55 @@ class Glm5NextMLAAttention(nn.Module):
                 f"dense={dense}, dense_window={dense_window}) would hand it to another body"
             )
 
+    def _require_keep_reader(
+        self,
+        q_lift: torch.Tensor,
+        c_kv: torch.Tensor,
+        keep_bits: torch.Tensor,
+        keep_route: KeepTableRoute,
+        topk_indices: torch.Tensor,
+        block_table_row: torch.Tensor,
+        page: int,
+        *,
+        dense: bool,
+        dense_window: bool,
+        active_mla_query_rows: int | None,
+    ) -> None:
+        """Refuse a keep table that its route would not read.
+
+        :meth:`forward` makes the table only where ``prefill_keep_table_route``
+        (``dsa_keep_table.py``) names a reader. This asks it again, with the operands the
+        seam will be handed, so a table made on other shapes cannot reach a body that
+        ignores it. A trace-time check: every input is a shape, a dtype or a python value.
+        """
+        from vllm_neuron.model.glm5_next.dsa_keep_table import prefill_keep_table_route
+
+        rows = int(q_lift.shape[0])
+        full_width = active_mla_query_rows in (None, rows)
+        if (
+            self.dcp_size > 1
+            or dense
+            or dense_window
+            or not full_width
+            or prefill_keep_table_route(
+                rows=rows, heads=int(q_lift.shape[1]), latent=int(q_lift.shape[2]),
+                kv_latent=int(c_kv.shape[1]), bank_rows=int(c_kv.shape[0]),
+                window_pages=int(block_table_row.shape[0]), page_size=int(page),
+                pool_size=int(self.indexer.index_kpool),
+                candidates=int(keep_bits.shape[1]) * 8,
+                index_cols=int(topk_indices.shape[1]), q_dtype=q_lift.dtype,
+                kv_dtype=c_kv.dtype,
+            ) is not keep_route
+        ):
+            raise Glm5NextMLADecodeError(
+                f"the keep table is for the {keep_route} route, which attends a full-width "
+                f"selecting prefill chunk without DCP; this call ({rows} rows, "
+                f"active_mla_query_rows={active_mla_query_rows!r}, "
+                f"{int(block_table_row.shape[0])} pages, {int(keep_bits.shape[1])} keep "
+                f"bytes per row, decode_context_parallel_size={self.dcp_size}, "
+                f"dense={dense}, dense_window={dense_window}) would hand it elsewhere"
+            )
+
     def attend(
         self,
         hidden_states: torch.Tensor,
@@ -8035,6 +8124,8 @@ class Glm5NextMLAAttention(nn.Module):
         dense_window_seq_lens: torch.Tensor | None = None,
         q_latent: torch.Tensor | None = None,
         selection_is_a_set: bool = False,
+        keep_bits: torch.Tensor | None = None,
+        keep_route: KeepTableRoute | None = None,
     ) -> torch.Tensor:
         """One layer's MLA attention. Returns ``[tokens, hidden_size]``.
 
@@ -8051,6 +8142,13 @@ class Glm5NextMLAAttention(nn.Module):
         no stated order (``dsa_set_selection.py``). Only the masked-window kernel may read
         it, so this asks the seam's predicate (``masked_window_serves``) with the operands
         handed to the seam and refuses the call where another body would read it.
+
+        ``keep_bits`` is the chunk's keep table, ``[tokens, pools / 8]`` uint8, and
+        ``keep_route`` its reader, which the forward takes from ``prefill_keep_table_route``
+        (``dsa_keep_table.py``); the two travel together. ``DENSE_MASKED`` hands the
+        table to ``mla_sparse_attention``, whose seam gives the call to the dense-masked
+        pass. The table belongs to a full-width selecting prefill chunk without DCP, and
+        this asks the route again with the real operands and refuses any other call.
 
         ``hidden_states`` is ``[tokens, hidden_size]``: a prefill passes all its
         tokens at once and a decode step passes one. ``latent_cache`` is the whole
@@ -8302,6 +8400,18 @@ class Glm5NextMLAAttention(nn.Module):
                 dense_window=dense_window_seq_lens is not None,
                 active_mla_query_rows=active_mla_query_rows,
             )
+        if (keep_bits is None) != (keep_route is None):
+            raise Glm5NextMLADecodeError(
+                f"keep_bits and keep_route travel together; got keep_bits "
+                f"{'None' if keep_bits is None else tuple(keep_bits.shape)} and "
+                f"keep_route {keep_route}"
+            )
+        if keep_bits is not None:
+            self._require_keep_reader(
+                q_lift, c_kv, keep_bits, keep_route, topk_indices, block_table_row, page,
+                dense=dense, dense_window=dense_window_seq_lens is not None,
+                active_mla_query_rows=active_mla_query_rows,
+            )
 
         if self.dcp_size > 1:
             attended = self._dcp_attention(
@@ -8334,6 +8444,7 @@ class Glm5NextMLAAttention(nn.Module):
                 page_size=page, active_rows=active_mla_query_rows,
             )
         elif active_mla_query_rows is None or active_mla_query_rows == tokens:
+            # A DENSE_MASKED keep table rides along; the seam hands it to the dense pass.
             attended = mla_sparse_attention(
                 q_lift,
                 c_kv,
@@ -8345,6 +8456,7 @@ class Glm5NextMLAAttention(nn.Module):
                 page_size=page,
                 pool_size=self.indexer.index_kpool,
                 written_in_bank=True,
+                keep_bits=keep_bits,
             )
         else:
             attended = mla_sparse_attention(
@@ -9244,8 +9356,39 @@ class Glm5NextMLAAttention(nn.Module):
                 kv_dtype=latent_cache.dtype,
             )
         )
+        # A selecting chunk whose window the dense-masked pass attends (dsa_keep_table.py):
+        # the indexer then also returns the selection's keep table, and attend() hands it
+        # to that route. Asked once, here, so the table is made once and exists exactly
+        # where the attention reads it.
+        from vllm_neuron.model.glm5_next.dsa_keep_table import prefill_keep_table_route
+
+        keep_route = (
+            prefill_keep_table_route(
+                rows=int(normed_hidden_states.shape[0]),
+                heads=self._heads_per_rank(),
+                latent=self.kv_lora_rank,
+                kv_latent=int(latent_cache.shape[2]),
+                bank_rows=int(latent_cache.shape[0]),
+                window_pages=int(block_table_row.shape[0]),
+                page_size=int(page_size),
+                pool_size=self.indexer.index_kpool,
+                candidates=window_pools,
+                index_cols=self.indexer.bypass_width(),
+                q_dtype=normed_hidden_states.dtype,
+                kv_dtype=latent_cache.dtype,
+            )
+            if (
+                window_scans
+                and not no_select
+                and not selects_a_set
+                and self.dcp_size == 1
+                and tail is None
+                and active_mla_query_rows is None
+            )
+            else None
+        )
         q_latent = self.project_query_latent(normed_hidden_states)
-        topk_indices = self.indexer(
+        selection = self.indexer(
             normed_hidden_states,
             q_latent,
             pool_cache,
@@ -9262,7 +9405,9 @@ class Glm5NextMLAAttention(nn.Module):
                 None if prefill_end_position is None else start_position
             ),
             ordered=not selects_a_set,
+            keep_bits=keep_route is not None,
         )
+        topk_indices, keep_bits = selection if keep_route is not None else (selection, None)
         if collector is not None:
                 # The first five rows only, and as the indexer emitted them: a static
                 # slice inside the trace, no cast, so a -1 stays the sentinel it is
@@ -9284,6 +9429,8 @@ class Glm5NextMLAAttention(nn.Module):
             dense=dense,
             dense_window_seq_lens=seq_lens if dense_window else None,
             selection_is_a_set=selects_a_set,
+            keep_bits=keep_bits,
+            keep_route=keep_route,
             **(
                 {"active_mla_query_rows": active_mla_query_rows}
                 if active_mla_query_rows is not None else {}

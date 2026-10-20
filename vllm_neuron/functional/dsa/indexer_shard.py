@@ -34,7 +34,9 @@ them all. ``VLLM_NEURON_DSA_QUERY_ROW_CUT=0`` projects every row and cuts the pr
 The all-gather contract: the ids cross the collective as the selector's own int32, in the
 group's ``rank_in_group`` order. An all-gather only moves bytes, so no cast is needed on
 either side; when ``d * R == T`` the gathered block is the chunk as it stands, and only a
-padded plan takes the leading ``T`` rows, a view.
+padded plan takes the leading ``T`` rows, a view. The dense-masked attention's keep table
+(``selection_keep.py``) is built from the same rank rows and crosses the same way
+(:func:`gather_selection_keep`).
 
 ``VLLM_NEURON_DSA_INDEXER_SHARD=0`` (``vllm_neuron/envs.py``) restores the replicated path.
 """
@@ -216,6 +218,38 @@ def gather_rows(local: Tensor, group, shard: RowShard) -> Tensor:
             f"the gather moves the selector's {POOL_ID_DTYPE} ids; got {local.dtype}"
         )
     whole = group.all_gather(local, dim=0)
+    if shard.degree * shard.rows == shard.tokens:
+        return whole
+    return whole[: shard.tokens]
+
+
+#: The dtype of the selection keep bits a rank gathers beside its ids
+#: (``selection_keep.dsa_selection_keep``).
+KEEP_BITS_DTYPE = torch.uint8
+
+
+def gather_selection_keep(keep_bits: Tensor, group, shard: RowShard) -> Tensor:
+    """Every rank's keep bits, gathered like :func:`gather_rows`.
+
+    Args:
+        keep_bits: ``[R, P / 8]`` uint8, this rank's rows of the keep table.
+        group: the tensor-parallel ``GroupCoordinator`` the rows were cut in.
+        shard: the chunk's plan.
+
+    Returns:
+        ``[T, P / 8]`` uint8: the chunk's rows in the order of :func:`local_row_index`, by
+        one all-gather on ``dim=0`` that moves the bytes as they are; a padded plan keeps
+        the leading ``T`` rows, a view.
+    """
+    if keep_bits.dim() != 2 or int(keep_bits.shape[0]) != shard.rows:
+        raise IndexerShardError(
+            f"a rank gathers [{shard.rows}, P / 8] keep bits; got shape {tuple(keep_bits.shape)}"
+        )
+    if keep_bits.dtype != KEEP_BITS_DTYPE:
+        raise IndexerShardError(
+            f"the keep bits must be {KEEP_BITS_DTYPE}; got {keep_bits.dtype}"
+        )
+    whole = group.all_gather(keep_bits, dim=0)
     if shard.degree * shard.rows == shard.tokens:
         return whole
     return whole[: shard.tokens]
