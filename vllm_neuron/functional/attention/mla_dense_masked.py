@@ -16,16 +16,18 @@ transposes, with the latent on the partitions (MM1's). Each program owns a set o
 fp32 accumulator over the superblocks (an online softmax). A superblock's scores are
 taken out of PSUM by the predicate (an unselected row reads _UNSELECTED_SCORE, so its
 probability is exactly 0.0), exponentiated against the new running maximum, put on
-the key partitions by fp32 PE transposes, split bf16 hi/lo and contracted with the
-rows. The accumulator is rescaled by ``exp(scale * (old max - new max))`` before the
-superblock's sum is added, and divided by the row sum once, at the end.
+the key partitions by fp32 PE transposes, rounded to bf16 (or split bf16 hi/lo, below)
+and contracted with the rows. The accumulator is rescaled by
+``exp(scale * (old max - new max))`` before the superblock's sum is added, and divided
+by the row sum once, at the end.
 
 The engines run their instructions in program order, so the kernel issues the work of
 consecutive (tile, superblock) items interleaved: MM1 of the next item runs on the Tensor
 Engine while the softmax of the current one runs on the Vector and scalar engines, and the
 next superblock is loaded and transposed a piece at a time (``_dense_masked_body``).
 
-Arithmetic against the sparse low-precision body: the same MM1 products into fp32 PSUM
+Arithmetic against the sparse low-precision body, with the hi/lo split
+(``VLLM_NEURON_MLA_DENSE_MASKED_BF16_PROBS=0``): the same MM1 products into fp32 PSUM
 and the same hi/lo split against the stored cache, but the probabilities are split
 before they are normalised, the sums run over the window in row order, and the
 maximum is a running one. The answer is the sparse kernel's up to the order and the
@@ -38,7 +40,7 @@ nearest) in place of the split's 2 ** -16, while the row sum stays the fp32 sum 
 unrounded ``p``. Output element ``j`` of a query moves by at most 2 ** -8 times
 ``sum_i w_i |v_ij|`` (``w`` the softmax weights over its selected rows), and by about
 2 ** -8 / sqrt(3) times ``sqrt(sum_i w_i ** 2 v_ij ** 2)`` when the roundings are
-independent: a bf16-probability class, not value-equal. Off by default.
+independent: a bf16-probability class, not value-equal. On by default; 0 gives the split.
 
 Non-finite rows. MM1 keeps a non-finite row, so a query that selects it gets a
 non-finite score, as on the gather path; the predicate drops it for every other query.
@@ -68,7 +70,7 @@ each count through a stride-0 view against its ``R`` rows' ranks in the pool.
 
 The entry, :func:`mla_dense_masked_attention`, takes the keep table and the window row of
 the chunk's first query, and it refuses a call while ``VLLM_NEURON_MLA_DENSE_MASKED``
-(``vllm_neuron/envs.py``, off by default) is off. The sparse attention seam
+(``vllm_neuron/envs.py``, on by default) is off. The sparse attention seam
 (``mla_sparse.mla_sparse_attention``) calls it for a paged NoPE call whose caller passes
 the keep table and whose bank already holds the step's rows, wherever
 :func:`dense_masked_serves` says so; every other call keeps the gather.
@@ -113,6 +115,7 @@ _TRANSPOSES_PER_BANK = MOVING_MAX // ROW_TILE
 #: program). Each program also holds, per query tile, its rows of the keep table (``P / 8``
 #: bytes: 8 KiB at 2,048 pages) and its accumulators (2 KiB), and once its pool ranks and
 #: pool numbers (2 KiB each): about 160 KiB at 2,048 pages with four tiles per program.
+#: With bf16 probabilities an item holds hi alone, 4 KiB less.
 SUPERBLOCK_PAGES = 16
 #: The score an unselected row reads: a power of two so far below any score that
 #: ``exp(scale * (_UNSELECTED_SCORE - max))`` is exactly 0.0.
@@ -358,12 +361,12 @@ _P_LO = 1   # the same layout: bf16(p - hi)
 
 
 def _tile_probabilities(probs, kv_dtype, bf16_probabilities):
-    """The item's probabilities (``[128 queries, width]`` fp32) on the key partitions, split hi/lo.
+    """The item's probabilities (``[128 queries, width]`` fp32) on the key partitions, in bf16.
 
-    Fp32 PE transposes, four per PSUM bank; hi = bf16(p) on the scalar engine and lo =
-    bf16(p - hi) on the Vector engine (the difference is exact in fp32). Returns the
-    ``_P_*`` list: MM2's stationary operands. With ``bf16_probabilities`` the list holds
-    hi alone and the Vector engine does no work here (the module docstring).
+    Fp32 PE transposes, four per PSUM bank, and hi = bf16(p) on the scalar engine. Returns
+    the ``_P_*`` list, MM2's stationary operands: hi alone with ``bf16_probabilities``, so
+    the Vector engine does no work here (the module docstring); else hi and lo =
+    bf16(p - hi) on the Vector engine (the difference is exact in fp32).
     """
     width = probs.shape[1]
     split = []
@@ -388,11 +391,11 @@ def _tile_probabilities(probs, kv_dtype, bf16_probabilities):
 
 
 def _tile_values(split, rows, acc, alpha, bf16_probabilities):
-    """MM2 of one item into PSUM, chunk by chunk hi then lo, and ``acc = acc * alpha + pv``.
+    """MM2 of one item into PSUM, chunk by chunk, and ``acc = acc * alpha + pv``.
 
     ``split`` is :func:`_tile_probabilities`'s list, ``rows`` the superblock's
     :data:`_SB_ROWS` and ``acc`` (``[128, L]`` fp32) the tile's unnormalised output. With
-    ``bf16_probabilities`` each chunk is one matmul, of hi alone.
+    ``bf16_probabilities`` each chunk is one matmul, of hi alone; else two, hi then lo.
     """
     latent = rows.shape[2]
     pv_ps = nl.ndarray((ROW_TILE, latent), dtype=nl.float32, buffer=nl.psum)
@@ -695,13 +698,13 @@ def mla_dense_masked_attention(q_lift: Tensor, c_kv: Tensor, keep_bits: Tensor,
         page_size: rows per page, :data:`KEY_CHUNK`.
         superblock_pages: pages per superblock.
 
-    ``VLLM_NEURON_MLA_DENSE_MASKED_BF16_PROBS`` (read here, at trace time) selects the
-    bf16-probability form of MM2 (the module docstring).
+    ``VLLM_NEURON_MLA_DENSE_MASKED_BF16_PROBS`` (read here, at trace time; on by default)
+    selects the bf16-probability form of MM2, and 0 the hi/lo split (the module docstring).
 
     Returns:
-        ``[S, 1, L]`` fp32, the sparse kernel's answer up to the order and rounding of its
-        fp32 sums (a value-equal class, not bit-equal); with the bf16-probability form, up to
-        one bf16 rounding of each probability as well.
+        ``[S, 1, L]`` fp32, the sparse kernel's answer up to one bf16 rounding of each
+        probability and the order and rounding of its fp32 sums (a bf16-probability class);
+        with the hi/lo split, up to the fp32 sums alone (a value-equal class, not bit-equal).
 
     Raises:
         MlaDenseMaskedError: while ``VLLM_NEURON_MLA_DENSE_MASKED`` is off, or for a

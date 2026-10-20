@@ -134,20 +134,20 @@ if TYPE_CHECKING:
     # selecting and gathering. On by default; 0 restores the sparse path.
     VLLM_NEURON_MLA_DENSE_WINDOW: bool = True
     # GLM-5.3-Flash DSA prefill: let the sparse MLA seam give a paged NoPE call to
-    # the dense-masked kernel (mla_dense_masked.py). Off by default.
-    VLLM_NEURON_MLA_DENSE_MASKED: bool = False
+    # the dense-masked kernel (mla_dense_masked.py). On by default; 0 keeps the gather.
+    VLLM_NEURON_MLA_DENSE_MASKED: bool = True
     # The largest window, in pages, that the dense-masked route takes.
     VLLM_NEURON_MLA_DENSE_MASKED_MAX_PAGES: int = 2048
     # Let the dense-masked kernel contract its probabilities with the window rows as
-    # one bf16 pass instead of the hi/lo split. Off by default.
-    VLLM_NEURON_MLA_DENSE_MASKED_BF16_PROBS: bool = False
+    # one bf16 pass instead of the hi/lo split. On by default; 0 restores the split.
+    VLLM_NEURON_MLA_DENSE_MASKED_BF16_PROBS: bool = True
     # Let the GLM-5.3-Flash DSA prefill's sparse MLA body gather its rows from the
     # latent bank through the block table, with no staged window. On by default; 0
     # restores the staged window.
     VLLM_NEURON_MLA_SPARSE_BANK_ROWS: bool = True
     # The number of DMAs the sparse MLA prefill bank form issues per query's gather:
-    # 1, 2 or 4, each over an equal run of its latent tiles. 1 (one DMA) by default.
-    VLLM_NEURON_MLA_SPARSE_GATHER_SPLIT: int = 1
+    # 1, 2 or 4, each over an equal run of its latent tiles. 4 by default; 1 is one DMA.
+    VLLM_NEURON_MLA_SPARSE_GATHER_SPLIT: int = 4
     # Divide the GLM-5.3-Flash DSA prefill selection's query rows over the
     # tensor-parallel ranks. On by default; 0 restores the replicated selection.
     VLLM_NEURON_DSA_INDEXER_SHARD: bool = True
@@ -647,18 +647,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ``mla_dense_masked.dense_masked_serves`` accepts the shape and the window
     # (VLLM_NEURON_MLA_DENSE_MASKED_MAX_PAGES); every other call keeps the gather.
     # The entry refuses a call while this is off. Read at trace time; a change
-    # needs a new compile. Off by default.
+    # needs a new compile. On by default; set 0 to keep the gather for every window.
     "VLLM_NEURON_MLA_DENSE_MASKED": lambda: (
-        maybe_convert_bool(os.getenv("VLLM_NEURON_MLA_DENSE_MASKED")) or False
+        maybe_convert_bool(os.getenv("VLLM_NEURON_MLA_DENSE_MASKED")) is not False
     ),
     # The largest window, in block-table pages, that the dense-masked route takes; a
     # larger window keeps the gather. The dense pass reads every row of the window and
     # the gather only each query's selected rows, so the pass gains less as the window
     # grows. 2,048 by default: the window of a 262,144-token context in 128-row pages.
-    # At 2,048 pages, kernel alone on trn2 with 1,024 queries, the pass took 8.1 ms and
-    # the 4-DMA gather (VLLM_NEURON_MLA_SPARSE_GATHER_SPLIT=4) 9.9 ms, with outputs
-    # equal within the fp32 rounding of the sums. Set 1500 to keep the windows above
-    # 1,500 pages on the gather. Read at trace time; a change needs a new compile.
+    # At 2,048 pages, kernel alone on trn2 with 1,024 queries, the 4-DMA gather
+    # (VLLM_NEURON_MLA_SPARSE_GATHER_SPLIT=4) took 9.9 ms and the pass 6.6 ms with its
+    # bf16 probabilities (VLLM_NEURON_MLA_DENSE_MASKED_BF16_PROBS), 8.1 ms with the
+    # hi/lo split, whose outputs equal the gather's within the fp32 rounding of the
+    # sums. Set 1500 to keep the windows above 1,500 pages on the gather. Read at trace
+    # time; a change needs a new compile.
     "VLLM_NEURON_MLA_DENSE_MASKED_MAX_PAGES": lambda: (
         2048
         if os.getenv("VLLM_NEURON_MLA_DENSE_MASKED_MAX_PAGES") is None
@@ -671,9 +673,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # rounding (relative error up to 2 ** -8) instead of about 2 ** -16, so the output
     # is no longer value-equal to the split form: each element moves by at most 2 ** -8
     # of the softmax-weighted sum of |value| over the query's selected rows. Read at
-    # trace time by the kernel's entry; a change needs a new compile. Off by default.
+    # trace time by the kernel's entry; a change needs a new compile. On by default:
+    # kernel alone on trn2 with 1,024 queries, the pass took 18-25 % less time from 264
+    # to 2,048 pages. Set 0 for the split form.
     "VLLM_NEURON_MLA_DENSE_MASKED_BF16_PROBS": lambda: (
-        maybe_convert_bool(os.getenv("VLLM_NEURON_MLA_DENSE_MASKED_BF16_PROBS")) or False
+        maybe_convert_bool(os.getenv("VLLM_NEURON_MLA_DENSE_MASKED_BF16_PROBS"))
+        is not False
     ),
     # Let the sparse MLA prefill's low-precision row-tiled body
     # (``functional/attention/mla_sparse.py``) gather each query's selected rows
@@ -692,9 +697,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # each over an equal run of the latent tiles, instead of one. The same bits; the
     # queue issues each DMA without waiting for the one before it. 1, 2 or 4; the seam
     # refuses any other count (``mla_sparse.gather_split``). Read at trace time; a
-    # change needs a new compile. 1 by default.
+    # change needs a new compile. 4 by default (``mla_sparse._lowp_gather_split``
+    # gives the measured gain); set 1 for one DMA.
     "VLLM_NEURON_MLA_SPARSE_GATHER_SPLIT": lambda: (
-        maybe_convert_int(os.getenv("VLLM_NEURON_MLA_SPARSE_GATHER_SPLIT")) or 1
+        4
+        if os.getenv("VLLM_NEURON_MLA_SPARSE_GATHER_SPLIT") is None
+        else maybe_convert_int(os.getenv("VLLM_NEURON_MLA_SPARSE_GATHER_SPLIT"))
     ),
     # ================== GLM-5.3-Flash DSA Indexer ==================
     # Shard the DSA prefill selection (score GEMM, causal bound, top-k, sentinel
