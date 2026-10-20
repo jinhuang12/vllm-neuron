@@ -28,6 +28,13 @@ the gain multiply, the router GEMM in nkilib ``router_topk``'s contraction order
 the ``noaux_tc`` selection (``router._noaux_tc_select``) on the logits in PSUM, with
 no HBM round trip and no data shared between the two cores.
 
+Where the feed-forward mHC site's fused kernel serves the call
+(``functional/glue/mhc_pre.py``), that kernel also returns the scale, ``bf16(x * rstd)``
+from the ``rstd`` of its own ``normed`` output, and the model hands it to
+:func:`noaux_tc_router_prefill` as ``scaled``, so :func:`router_rms_scale` is not
+traced. The kernel sums ``x**2`` in its own order: the difference is of the class the
+next paragraph describes.
+
 Numerics. The fused kernel reads the collapse as bf16 rows from HBM; here the rows
 stay in the graph, and neuronx-cc folds the ``.to(float32)`` that reads them into the
 collapse's ``fp32 -> bf16`` convert, so :func:`router_rms_scale` first puts them back on
@@ -93,6 +100,17 @@ def prefill_router_enabled() -> bool:
     return os.environ.get(PREFILL_ROUTER_ENV, "1") != "0"
 
 
+def prefill_route_takes_rows(tokens: int) -> bool:
+    """True when a call of ``tokens`` rows can take this router: the switch is on and
+    the call has more than ``DECODE_ROUTE_MAX_TOKENS`` rows (prefill).
+
+    The row-count half of :func:`prefill_route_admits`. The feed-forward mHC site asks it
+    before the rows exist, to request the router's input scale from its kernel only for a
+    call that can use it.
+    """
+    return prefill_router_enabled() and int(tokens) > DECODE_ROUTE_MAX_TOKENS
+
+
 def prefill_route_admits(hidden_states, router_weights, top_k: int) -> bool:
     """True when ``route_tokens`` routes this call here instead of the fused kernel.
 
@@ -111,8 +129,7 @@ def prefill_route_admits(hidden_states, router_weights, top_k: int) -> bool:
     tokens = hidden_states.numel() // hidden
     experts = int(router_weights.shape[1])
     return (
-        prefill_router_enabled()
-        and tokens > DECODE_ROUTE_MAX_TOKENS
+        prefill_route_takes_rows(tokens)
         and int(top_k) == _router_seam.NOAUX_TC_MAX8_WIDTH
         and hidden_states.dtype == torch.bfloat16
         and router_weights.dtype == torch.bfloat16
@@ -245,6 +262,7 @@ def noaux_tc_router_prefill(
     eps: float = 1e-6,
     norm_topk_prob: bool = True,
     routed_scaling_factor: float = 1.0,
+    scaled: Tensor | None = None,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Route ``[T, H]`` (or ``[B, S, H]``) pre-norm prefill rows with ``noaux_tc``.
 
@@ -252,12 +270,20 @@ def noaux_tc_router_prefill(
     [T, E] fp32, expert_index [T, K] int32, expert_affinities [T, E] fp32)``, the
     affinities scattered (gate weight at each selected expert, zero elsewhere).
 
+    ``scaled`` is the router kernel's input, ``bf16(x * rstd)`` of these rows with this
+    ``eps``, when the feed-forward mHC site's kernel computed it (``mhc_pre_fused(...,
+    router_scale=True)``, from the ``rstd`` of its ``normed`` output); the call then skips
+    :func:`router_rms_scale`. None computes it here. It has the rows' shape and dtype. A
+    call that takes the fused route ignores it.
+
     A call :func:`prefill_route_admits` declines takes baseline ``moe_prefill_8aa22fa``'s
     route (``router.noaux_tc_rmsnorm_router_topk``), which has its own torch fallback.
 
     Raises:
         NoauxTcRouterError: for a ``top_k`` or ``E`` the noaux_tc stage cannot serve,
             or a correction bias that is not ``[E]`` / ``[1, E]``.
+        ValueError: for a ``scaled`` of another shape or dtype than the rows, on this
+            router's route.
     """
     hidden = int(hidden_states.shape[-1])
     tokens = hidden_states.numel() // hidden
@@ -279,7 +305,15 @@ def noaux_tc_router_prefill(
         )
         return logits, index, affinities
 
-    scaled = router_rms_scale(rows, eps)
+    if scaled is None:
+        scaled = router_rms_scale(rows, eps)
+    elif tuple(scaled.shape) != tuple(hidden_states.shape) or scaled.dtype != rows.dtype:
+        raise ValueError(
+            f"scaled is {tuple(scaled.shape)} {scaled.dtype}; the rows it scales are "
+            f"{tuple(hidden_states.shape)} {rows.dtype}"
+        )
+    else:
+        scaled = scaled.reshape(tokens, hidden)
     # Whole 128-row tiles per core under the [2] launch. The pad repeats the last
     # real row (router._noaux_tc_pad_tokens), as baseline ``moe_prefill_8aa22fa`` pads
     # its pre-norm rows: the norm is per row, so this is the same padded tensor

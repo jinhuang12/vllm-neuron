@@ -1103,7 +1103,8 @@ class Glm5NextHyperConnection(nn.Module):
         residual: torch.Tensor,
         norm_gain: torch.Tensor | None = None,
         norm_eps: float | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        router_scale: bool = False,
+    ) -> tuple[torch.Tensor | None, ...]:
         """:meth:`mhc_pre`, and the sub-block's input RMSNorm where the kernel has it.
 
         Args:
@@ -1111,19 +1112,28 @@ class Glm5NextHyperConnection(nn.Module):
             norm_gain: ``[H]`` gain of the RMSNorm the sub-block applies to
                 ``layer_input`` first, or None.
             norm_eps: that norm's epsilon, with ``norm_gain``.
+            router_scale: also return ``scaled`` (with ``norm_gain`` only).
 
         Returns:
             ``(post_mix, comb_mix, layer_input, normed)``: :meth:`mhc_pre`'s three,
             and ``layer_input * rsqrt(mean(layer_input**2) + norm_eps) * norm_gain``
             in ``layer_input``'s dtype when the fused kernel serves this call
             (``functional/glue/mhc_pre.py``). Otherwise ``normed`` is None, and the
-            sub-block normalises ``layer_input`` itself.
+            sub-block normalises ``layer_input`` itself. With ``router_scale`` a fifth
+            value follows, ``scaled``: the same norm without the gain, the MoE
+            router's input (``router_prefill.router_rms_scale``), from the same
+            launch, or None where ``normed`` is None.
 
         Raises:
-            As :meth:`mhc_pre`.
+            Glm5NextHyperConnectionError: on ``router_scale`` without ``norm_gain``.
+            Otherwise as :meth:`mhc_pre`.
         """
         from vllm_neuron.functional.mhc.sinkhorn import sinkhorn_normalise_blocks
 
+        if router_scale and norm_gain is None:
+            raise Glm5NextHyperConnectionError(
+                "router_scale is the norm without its gain; it needs norm_gain"
+            )
         tokens, streams, hidden = self._require_streams(residual)
 
         from vllm_neuron.functional.glue import mhc_pre as glue_mhc_pre
@@ -1131,12 +1141,12 @@ class Glm5NextHyperConnection(nn.Module):
         if glue_mhc_pre.mhc_pre_admits(residual, self.fn, self.hc_scale, self.hc_base,
                                        phase=self._glue_phase(tokens),
                                        norm_gain=norm_gain):
-            post_mix, comb_start, layer_input, normed = glue_mhc_pre.mhc_pre_fused(
+            post_mix, comb_start, layer_input, *norms = glue_mhc_pre.mhc_pre_fused(
                 residual, self.fn, self.hc_scale, self.hc_base, rms_eps=self.rms_eps,
                 hc_eps=self.hc_eps, post_mult=self.post_mult_value,
-                norm_gain=norm_gain, norm_eps=norm_eps)
+                norm_gain=norm_gain, norm_eps=norm_eps, router_scale=router_scale)
             comb_mix = sinkhorn_normalise_blocks(comb_start, iters=self.sinkhorn_iters)
-            return post_mix, comb_mix, layer_input, normed
+            return post_mix, comb_mix, layer_input, *norms
 
         flat = residual.reshape(tokens, streams * hidden).to(torch.float32)
         mixes = flat @ self.fn.to(torch.float32).t()
@@ -1202,6 +1212,7 @@ class Glm5NextHyperConnection(nn.Module):
             comb_mix,
             layer_input.to(residual.dtype),
             None,
+            *((None,) if router_scale else ()),
         )
 
     # ── mHC post: one combine call ────────────────────────────────────────
@@ -1259,6 +1270,7 @@ class Glm5NextHyperConnection(nn.Module):
         residual: torch.Tensor,
         sublayer: object,
         norm: tuple[torch.Tensor | None, float] | None = None,
+        router_scale: bool = False,
     ) -> torch.Tensor:
         """One mHC layer call: pre, then the sub-block, then post.
 
@@ -1271,6 +1283,9 @@ class Glm5NextHyperConnection(nn.Module):
                 first, or None. With it, ``sublayer`` is called as
                 ``sublayer(layer_input, normed)``, ``normed`` from
                 :meth:`mhc_pre_normed` (None when the sub-block must normalise).
+            router_scale: with ``norm``, call ``sublayer(layer_input, normed,
+                scaled=scaled)``, ``scaled`` from :meth:`mhc_pre_normed` (None when
+                the router must scale its input itself).
 
         Returns:
             ``[T, S, H]`` in the streams' own dtype -- the re-mixed streams,
@@ -1286,8 +1301,14 @@ class Glm5NextHyperConnection(nn.Module):
                 f"{type(sublayer).__name__}"
             )
         gain, eps = (None, None) if norm is None else norm
-        post_mix, comb_mix, layer_input, normed = self.mhc_pre_normed(residual, gain, eps)
-        x = sublayer(layer_input) if norm is None else sublayer(layer_input, normed)
+        post_mix, comb_mix, layer_input, normed, *scaled = self.mhc_pre_normed(
+            residual, gain, eps, router_scale)
+        if norm is None:
+            x = sublayer(layer_input)
+        elif router_scale:
+            x = sublayer(layer_input, normed, scaled=scaled[0])
+        else:
+            x = sublayer(layer_input, normed)
         if not isinstance(x, torch.Tensor) or tuple(x.shape) != tuple(
             layer_input.shape
         ):
@@ -1471,6 +1492,7 @@ class Glm5NextRoutedExperts(nn.Module):
         gamma: torch.Tensor,
         text_config: Glm5NextTextConfig,
         eps: float | None = None,
+        scaled: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Route ``[B, S, H]`` tokens to the top-``k`` experts with ``noaux_tc``.
 
@@ -1481,6 +1503,11 @@ class Glm5NextRoutedExperts(nn.Module):
             eps: RMSNorm epsilon. ``None``, the default, resolves it from
                 ``text_config.rms_norm_eps`` -- the checkpoint's ``1e-05``. Pass
                 a float to override it.
+            scaled: ``[B, S, H]`` ``bf16(x * rstd)`` of ``hidden_states`` with that
+                epsilon, when the feed-forward mHC site's kernel computed it, or
+                None. Only the prefill router reads it
+                (``router_prefill.noaux_tc_router_prefill``), in place of its own
+                ``router_rms_scale``.
 
         Returns:
             ``(router_logits [T, E], expert_index [T, k] int32,
@@ -1538,6 +1565,7 @@ class Glm5NextRoutedExperts(nn.Module):
                 eps=eps,
                 norm_topk_prob=bool(text_config.norm_topk_prob),
                 routed_scaling_factor=float(text_config.routed_scaling_factor),
+                scaled=scaled,
             )
 
         from vllm_neuron.functional.moe.router import (
@@ -2836,6 +2864,7 @@ class Glm5NextMoEBlock(nn.Module):
         tp_degree: int = 1,
         expert_parallel_rank: int | torch.Tensor = 0,
         collector: list[torch.Tensor] | None = None,
+        router_scaled: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """One sparse layer's MLP: route, run this rank's experts, add the shared.
 
@@ -2855,6 +2884,9 @@ class Glm5NextMoEBlock(nn.Module):
             tp_degree: ranks sharding each expert's intermediate dimension.
             expert_parallel_rank: which rank's expert slice to select, as an
                 int64 device tensor (one graph for every rank) or a python int.
+            router_scaled: ``[T, H]`` the FFN norm of ``hidden_states`` without its
+                gain, when the feed-forward mHC site's kernel computed it, or None;
+                handed to ``route_tokens`` as ``scaled``.
 
         Returns:
             ``[T, H]`` in the kernels' own dtype. The residual dtype is the layer
@@ -2871,7 +2903,10 @@ class Glm5NextMoEBlock(nn.Module):
         # affinities are consumed: the logits are the oracle's and the index set is
         # the affinities' own support.
         _logits, _expert_index, expert_affinities = self.experts.route_tokens(
-            hidden_states.unsqueeze(0), router_gamma, text_config
+            hidden_states.unsqueeze(0),
+            router_gamma,
+            text_config,
+            scaled=None if router_scaled is None else router_scaled.unsqueeze(0),
         )
         if collector is not None:
             # Both forms of the weights: the whole table as the bank returns it,
@@ -8987,6 +9022,7 @@ class Glm5NextModel(nn.Module):
         expert_parallel_rank: int | torch.Tensor,
         collector: list[torch.Tensor] | None = None,
         normed: torch.Tensor | None = None,
+        scaled: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """One layer's feed-forward contribution, without its residual add.
 
@@ -9033,6 +9069,9 @@ class Glm5NextModel(nn.Module):
         gain, the config's ``rms_norm_eps``) when the feed-forward mHC site fused it
         into its mhc_pre kernel, and None when this method must normalise, with
         :meth:`_rms_norm`. The site never hands a normed tensor on its torch route.
+        ``scaled`` is the same norm without the gain, the prefill router's input, when
+        the site's kernel computed it for a MoE layer (the site asks for it only
+        there), else None; the MoE branch hands it to its router.
 
         Returns:
             ``[T, H]`` in ``hidden_states``' dtype. Both routes return their own
@@ -9063,6 +9102,7 @@ class Glm5NextModel(nn.Module):
                 moe_group=moe_group,
                 tp_degree=tp_degree,
                 expert_parallel_rank=expert_parallel_rank,
+                router_scaled=scaled,
             )
         elif isinstance(mlp, Glm5NextDenseMLP):
             out = mlp(normed, quant_config=quant_config)
@@ -9246,6 +9286,14 @@ class Glm5NextModel(nn.Module):
         collected: list[torch.Tensor] = []
         taps: list[torch.Tensor] = []
         tap_layers = dump_tap_layers(layers) if collect_layer_streams else ()
+        from vllm_neuron.functional.moe import router_prefill
+
+        # The forward's leg, which decides whether the feed-forward sites ask for the
+        # router's input scale (below). The runner steps every layer of one forward on
+        # one leg and hands it to each linear-attention layer as ``is_prefill``; the
+        # sparse-attention carriers do not carry it. A forward with no linear-attention
+        # carrier names no leg, and its sites ask for nothing.
+        prefill_leg = any(bool(carrier.get("is_prefill", False)) for carrier in carriers)
         for index, (layer, carrier) in enumerate(zip(layers, carriers)):
             # One tensor, passed as both arguments on purpose. The streams are this
             # layer's input; the keyword is this tree's route selector and the
@@ -9260,7 +9308,12 @@ class Glm5NextModel(nn.Module):
             # The feed-forward site. The site collapses the streams, hands
             # ``_ffn_half`` the single ``[T, H]`` stream it has always taken, with that
             # stream's feed-forward RMSNorm when the fused mhc_pre kernel computed it
-            # (else ``_ffn_half`` normalises it), and mixes its return back.
+            # (else ``_ffn_half`` normalises it), and mixes its return back. On a MoE
+            # layer, on the prefill leg, for a call the prefill router can take, it also
+            # asks the kernel for that norm without its gain, the router's input
+            # (``scaled``); every other call is the site call it was. The leg, not the
+            # row count, keeps the verify step out: its ``B * (1 + k)`` rows can exceed
+            # the prefill router's floor too.
             # ``streams`` is never ``None`` here, so this is a site or a refusal,
             # never the plain add.
             site = _mhc_ffn_site(layer, streams)
@@ -9268,7 +9321,7 @@ class Glm5NextModel(nn.Module):
                 streams,
                 lambda single_stream, normed, layer=layer, collector=(
                     taps if index in tap_layers else None
-                ): self._ffn_half(
+                ), *, scaled=None: self._ffn_half(
                     layer,
                     single_stream,
                     text_config=self.text_config,
@@ -9280,10 +9333,18 @@ class Glm5NextModel(nn.Module):
                     expert_parallel_rank=expert_parallel_rank,
                     collector=collector,
                     normed=normed,
+                    **({"scaled": scaled} if scaled is not None else {}),
                 ),
                 norm=(
                     layer.post_attention_layernorm_weight,
                     float(self.text_config.rms_norm_eps),
+                ),
+                **(
+                    {"router_scale": True}
+                    if prefill_leg
+                    and isinstance(getattr(layer, "mlp", None), Glm5NextMoEBlock)
+                    and router_prefill.prefill_route_takes_rows(streams.shape[0])
+                    else {}
                 ),
             )
             if collect_layer_streams and index < DUMP_STREAM_LAYERS:
