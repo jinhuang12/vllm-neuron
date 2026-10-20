@@ -1738,6 +1738,30 @@ class Glm5NextRoutedExperts(nn.Module):
     # onto this rank's ``expert_partition`` slice is the dispatch step, and it
     # belongs to :meth:`block_quant_expert_mm`.
 
+    def prefill_router_admits(
+        self, like: torch.Tensor, rows: int, text_config: Glm5NextTextConfig
+    ) -> bool:
+        """Does a prefill call of ``rows`` rows take the prefill router?
+
+        Asked by the feed-forward mHC site at trace time, before the rows exist: under
+        the prefill sequence shard it gathers the router's scaled rows in place of the
+        pre-norm rows only for a call :meth:`route_tokens` routes there.
+
+        Args:
+            like: a tensor with the call's activation dtype, hidden extent and device
+                (this rank's streams).
+            rows: the call's row count, the whole chunk's.
+            text_config: the decoder config ``num_experts_per_tok`` lives on.
+        """
+        from vllm_neuron.functional.moe import router_prefill
+
+        return router_prefill.prefill_route_admits(
+            like,
+            self.router_weight,
+            int(text_config.num_experts_per_tok),
+            tokens=int(rows),
+        )
+
     def route_tokens(
         self,
         hidden_states: torch.Tensor,
@@ -1759,7 +1783,11 @@ class Glm5NextRoutedExperts(nn.Module):
                 epsilon, when the feed-forward mHC site's kernel computed it, or
                 None. Only the prefill router reads it
                 (``router_prefill.noaux_tc_router_prefill``), in place of its own
-                ``router_rms_scale``.
+                ``router_rms_scale``. Under the prefill sequence shard it can hold
+                more rows than ``hidden_states``: the site gathered the chunk's
+                scaled rows and left this rank's pre-norm rows where they were.
+                Those rows are then the call's rows, and ``hidden_states`` is not
+                read.
 
         Returns:
             ``(router_logits [T, E], expert_index [T, k] int32,
@@ -1778,6 +1806,24 @@ class Glm5NextRoutedExperts(nn.Module):
         # one number that belongs to the checkpoint.
         if eps is None:
             eps = float(text_config.rms_norm_eps)
+
+        from vllm_neuron.functional.moe import router_prefill
+
+        # A sequence-sharded prefill call: ``scaled`` holds the whole chunk and
+        # ``hidden_states`` one rank's share of its pre-norm rows. Only the prefill
+        # router reads ``scaled`` alone, so it is this call's route ahead of the decode
+        # branch, which would count this rank's rows as the call's; it refuses rows it
+        # does not admit. The feed-forward site asks for this form only when it does.
+        if scaled is not None and scaled.numel() != hidden_states.numel():
+            return router_prefill.noaux_tc_router_prefill_scaled(
+                scaled,
+                gamma,
+                self.router_weight,
+                self.router_bias,
+                top_k=int(text_config.num_experts_per_tok),
+                norm_topk_prob=bool(text_config.norm_topk_prob),
+                routed_scaling_factor=float(text_config.routed_scaling_factor),
+            )
 
         # Decode (T <= 64): RMSNorm, router GEMM and noaux_tc top-8 in one launch
         # on the real rows, no pad to 256 (router_decode.py). Same three outputs,
@@ -1803,8 +1849,6 @@ class Glm5NextRoutedExperts(nn.Module):
         # running as a per-token matmul loop; then the router GEMM and noaux_tc top-8
         # in one launch (router_prefill.py). Same three outputs, same seam counters;
         # any call it declines keeps the fused router below.
-        from vllm_neuron.functional.moe import router_prefill
-
         if router_prefill.prefill_route_admits(
             hidden_states, self.router_weight, int(text_config.num_experts_per_tok)
         ):
@@ -3143,7 +3187,9 @@ class Glm5NextMoEBlock(nn.Module):
                 int64 device tensor (one graph for every rank) or a python int.
             router_scaled: ``[T, H]`` the FFN norm of ``hidden_states`` without its
                 gain, when the feed-forward mHC site's kernel computed it, or None;
-                handed to ``route_tokens`` as ``scaled``.
+                handed to ``route_tokens`` as ``scaled``. Under the prefill sequence
+                shard the site gathers it and not ``hidden_states``, which is then one
+                rank's share of the rows and is not read.
 
         Returns:
             ``[T, H]`` in the kernels' own dtype. The residual dtype is the layer
@@ -3159,6 +3205,17 @@ class Glm5NextMoEBlock(nn.Module):
         # ``[1, T, H]`` here rather than reshaped inside the callee. Only the
         # affinities are consumed: the logits are the oracle's and the index set is
         # the affinities' own support.
+        # The router's rows are the experts' rows. Under the prefill sequence shard
+        # ``hidden_states`` is one rank's share and the scaled rows the chunk's, so the
+        # check is against ``normed_hidden_states``, gathered beside them.
+        if router_scaled is not None and tuple(router_scaled.shape) != tuple(
+            normed_hidden_states.shape
+        ):
+            raise Glm5NextBlockQuantRouteError(
+                f"router_scaled is {tuple(router_scaled.shape)} and the experts' "
+                f"normed rows are {tuple(normed_hidden_states.shape)}; the router "
+                f"must route the rows the experts run"
+            )
         _logits, _expert_index, expert_affinities = self.experts.route_tokens(
             hidden_states.unsqueeze(0),
             router_gamma,
@@ -10130,6 +10187,7 @@ class Glm5NextModel(nn.Module):
         collected: list[torch.Tensor] = []
         taps: list[torch.Tensor] = []
         tap_layers = dump_tap_layers(layers) if collect_layer_streams else ()
+        from vllm_neuron import envs
         from vllm_neuron.functional.moe import router_prefill
 
         # The forward's leg, which decides whether the feed-forward sites ask for the
@@ -10157,9 +10215,26 @@ class Glm5NextModel(nn.Module):
             # asks the kernel for that norm without its gain, the router's input
             # (``scaled``); every other call is the site call it was. The leg, not the
             # row count, keeps the verify step out: its ``B * (1 + k)`` rows can exceed
-            # the prefill router's floor too.
+            # the prefill router's floor too. Under the sequence shard the call is the
+            # whole gathered chunk, and the scale crosses the wire in place of the
+            # pre-norm rows, so the router's full admission at the chunk's row count
+            # decides: a call it declines keeps the pre-norm rows for the route that
+            # takes it. VLLM_NEURON_GLM5NEXT_PREFILL_SP_ROUTER_SCALE=0 keeps them for
+            # every sharded call, and the router scales the gathered rows itself.
             # ``streams`` is never ``None`` here, so this is a site or a refusal,
             # never the plain add.
+            moe = isinstance(getattr(layer, "mlp", None), Glm5NextMoEBlock)
+            if not (prefill_leg and moe):
+                router_scale = False
+            elif sharded:
+                router_scale = (
+                    envs.VLLM_NEURON_GLM5NEXT_PREFILL_SP_ROUTER_SCALE
+                    and layer.mlp.experts.prefill_router_admits(
+                        streams, int(streams.shape[0]) * shard.world, self.text_config
+                    )
+                )
+            else:
+                router_scale = router_prefill.prefill_route_takes_rows(streams.shape[0])
             site = _mhc_ffn_site(layer, streams)
             streams = site.forward(
                 streams,
@@ -10183,21 +10258,11 @@ class Glm5NextModel(nn.Module):
                     layer.post_attention_layernorm_weight,
                     float(self.text_config.rms_norm_eps),
                 ),
-                # A MoE layer's router reads the pre-norm stream; a dense MLP only
+                # A MoE layer's router reads the pre-norm stream, or under the
+                # sequence shard the kernel's scale in its place; a dense MLP only
                 # ``normed``. Under the sequence shard the site gathers what is read.
-                reads_layer_input=isinstance(
-                    getattr(layer, "mlp", None), Glm5NextMoEBlock
-                ),
-                # Under the sequence shard the router scales the gathered rows itself,
-                # so the site gathers two tensors and asks its kernel for no scale.
-                **(
-                    {"router_scale": True}
-                    if prefill_leg
-                    and not sharded
-                    and isinstance(getattr(layer, "mlp", None), Glm5NextMoEBlock)
-                    and router_prefill.prefill_route_takes_rows(streams.shape[0])
-                    else {}
-                ),
+                reads_layer_input=moe and not (sharded and router_scale),
+                **({"router_scale": True} if router_scale else {}),
             )
             if collect_layer_streams and index < DUMP_STREAM_LAYERS:
                 collected.append(streams)

@@ -129,6 +129,9 @@ if TYPE_CHECKING:
     # GLM-5.3-Flash prefill sequence parallelism: each rank runs the mHC site work of
     # its own rows of a prefill chunk. Off by default.
     VLLM_NEURON_GLM5NEXT_PREFILL_SP: bool = False
+    # Under that shard, a MoE layer's router takes its input scale from the mHC kernel
+    # on each rank's rows. On by default; 0 restores the scale of the gathered rows.
+    VLLM_NEURON_GLM5NEXT_PREFILL_SP_ROUTER_SCALE: bool = True
     # GLM-5.3-Flash DSA prefill: a chunk whose top-k selection provably keeps every
     # token attends its latent window densely (mla_dense_window.py) instead of
     # selecting and gathering. On by default; 0 restores the sparse path.
@@ -629,6 +632,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # default ("0").
     "VLLM_NEURON_GLM5NEXT_PREFILL_SP": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_GLM5NEXT_PREFILL_SP")) or False
+    ),
+    # "1" (the default): under the prefill sequence shard, a MoE layer's feed-forward
+    # mHC site asks its kernel for the router's input scale (the RMSNorm of the
+    # pre-norm rows without its gain) on this rank's rows, and gathers it in place of
+    # the pre-norm rows; the prefill router takes the gathered scale
+    # (``model/glm5_next/model_fp8.py``, ``Glm5NextModel.forward``). The kernel sums
+    # the squares in its own order, so an element can differ by one bf16 ulp from the
+    # scale the router computes on the gathered rows. "0" gathers the pre-norm rows
+    # and the router scales them. Read at trace time, only under
+    # VLLM_NEURON_GLM5NEXT_PREFILL_SP; a change needs a new compile.
+    "VLLM_NEURON_GLM5NEXT_PREFILL_SP_ROUTER_SCALE": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_GLM5NEXT_PREFILL_SP_ROUTER_SCALE"))
+        is not False
     ),
     # ================== GLM-5.3-Flash DSA Prefill ==================
     # Attend a prefill chunk densely over its latent window when the bound its graph
