@@ -14,10 +14,13 @@ stages pads its own input with a finite constant and moves selected values
 between partitions with a 0/1 permutation matmul, where ``0 * -inf`` is NaN. A
 row shorter than one pool completes nothing, so all of its columns are filled;
 what such a row means is the attention consumer's contract, not this module's.
-Both kernels walk the query-token axis in tiles of at most
-:data:`PARTITION_MAX` rows, the most one SBUF tile's partition axis holds. The bound
-also walks the candidate (column) axis in tiles of at most :data:`COLUMN_TILE`, so its
-SBUF use does not grow with the context.
+The sentinel walks the query-token axis in tiles of at most :data:`PARTITION_MAX`
+rows, the most one SBUF tile's partition axis holds. The bound does the same unless
+:func:`_bound_fold` folds the call: a call of at most half that many rows, over a width
+the fold divides, spreads each row over ``fold`` partitions instead
+(:func:`_causal_bound_folded_nki`). Either form of the bound walks the candidate
+(column) axis in tiles of at most :data:`COLUMN_TILE`, so its SBUF use does not grow
+with the context.
 """
 
 import logging
@@ -32,6 +35,7 @@ import nki.language as nl
 
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
+from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 from vllm_neuron.utils.neuron_utils import SBUF_BYTES_PER_PARTITION, SBUF_PARTITIONS, can_run_kernel
 
 logger = logging.getLogger(__name__)
@@ -74,6 +78,9 @@ sentinel; fp32 is what ``dsa_score_gemm`` hands the selector on this path."""
 _INDEX_DTYPES = (torch.int32,)
 """Index dtypes that take the NKI route. ``dsa_index_expand`` admits int32, so the sentinel writer
 keeps the selector's output in the dtype its consumer reads."""
+
+_LNC2_PROGRAMS = 2
+"""Programs on an LNC2 launch: one per physical core of the logical core."""
 
 PARTITION_MAX = SBUF_PARTITIONS
 """Query rows one SBUF tile can hold: the partition-axis bound, ``nl.tile_size.pmax``.
@@ -392,6 +399,113 @@ def _causal_bound_nki(scores_hbm, causal_len_hbm, pool_size):
     return out
 
 
+def _bound_fold(rows: int, width: int) -> int:
+    """Partitions each row of a bound call is folded over: the largest power of two ``fold`` with
+    ``rows * fold <= PARTITION_MAX`` that divides ``width``. 1 means no fold.
+
+    Written with ``while`` and integer arithmetic only, for the tracer (see
+    :func:`_row_tiles_unchecked`).
+    """
+    fold = 1
+    while rows * fold * 2 <= PARTITION_MAX and width % (fold * 2) == 0:
+        fold = fold * 2
+    return fold
+
+
+@nki.jit
+def _causal_bound_folded_nki(scores_hbm, causal_len_hbm, pool_size, fold):
+    """:func:`_causal_bound_nki` for fewer than :data:`PARTITION_MAX` rows, on ``rows * fold``
+    lanes.
+
+    Args:
+        scores_hbm, causal_len_hbm, pool_size: as :func:`_causal_bound_nki`; ``rows * fold <=
+            PARTITION_MAX``.
+        fold: python int (:func:`_bound_fold`), a power of two dividing ``width``.
+
+    Returns:
+        ``[rows, width]`` float32, the same bits as :func:`_causal_bound_nki`.
+
+    A row-major ``[rows, width]`` tensor is also ``[rows * fold, width / fold]``: partition
+    ``p = r * fold + j`` holds columns ``j * span .. (j + 1) * span - 1`` of row ``r``, with
+    ``span = width / fold``. At 16 rows the fold is 8, so the bound runs on 128 lanes instead of 16.
+    Pool ``n = j * span + c`` is incomplete for row ``r`` exactly when ``(c + 1) * pool_size >
+    causal_len[r] - j * span * pool_size``, so the per-row length becomes a per-partition
+    threshold, computed once per call, and the column ramp ``(c + 1) * pool_size`` is the same on
+    every partition. Every value is a whole number below ``width * pool_size``, exact in fp32.
+
+    Each column tile is loaded once, its bounded columns are overwritten by one predicated copy of
+    the fill, and it is stored: a kept column carries its loaded bits unchanged. The column ramp
+    is built once, on GpSimd; each tile's compare folds the tile's first column into an immediate
+    and runs on the vector engine, beside the predicated copy (GpSimd measured about 15 ns a
+    column per partition for the compare, the vector engine about 1).
+
+    Launch: plain, or on an SPMD grid of two (LNC2); the programs take the column tiles in turn,
+    each computing the thresholds for itself.
+    """
+    rows = scores_hbm.shape[0]
+    width = scores_hbm.shape[1]
+    parts = rows * fold
+    span = width // fold
+    programs = nl.num_programs(axes=0)
+    program = nl.program_id(0)
+
+    out = nl.ndarray((rows, width), dtype=nl.float32, buffer=nl.shared_hbm)
+
+    # Every row's length on every partition, then partition p keeps row p // fold's.
+    lens_i = nl.ndarray((parts, rows), dtype=nl.int32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=lens_i, src=causal_len_hbm.ap(pattern=[[0, parts], [1, rows]], offset=0))
+    lens = nl.ndarray((parts, rows), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=lens, src=lens_i)
+    # lane[p, r] = p - r * fold, which lies in [0, fold) exactly at r = p // fold, where it is j.
+    lane = nl.ndarray((parts, rows), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.iota(dst=lane, pattern=[[-fold, rows]], offset=0, channel_multiplier=1)
+    at_or_after = nl.ndarray((parts, rows), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=at_or_after, data=lane, op0=nl.greater_equal, operand0=0.0)
+    before_next = nl.ndarray((parts, rows), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=before_next, data=lane, op0=nl.less, operand0=float(fold))
+    own = nl.ndarray((parts, rows), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=own, data1=at_or_after, data2=before_next, op=nl.multiply)
+    # One nonzero term per partition, so each sum is that term exactly.
+    picked = nl.ndarray((parts, rows), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=picked, data1=lens, data2=own, op=nl.multiply)
+    own_len = nl.ndarray((parts, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_reduce(dst=own_len, op=nl.add, data=picked, axis=1)
+    nisa.tensor_tensor(dst=picked, data1=lane, data2=own, op=nl.multiply)
+    own_lane = nl.ndarray((parts, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_reduce(dst=own_lane, op=nl.add, data=picked, axis=1)
+    # -(causal_len[r] - j * span * pool_size): added to the ramp, > 0 exactly where bounded.
+    neg_len = nl.ndarray((parts, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=neg_len, data=own_len, op0=nl.multiply, operand0=-1.0)
+    shift = nl.ndarray((parts, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=shift, data=own_lane, op0=nl.multiply, operand0=float(span * pool_size))
+    neg_threshold = nl.ndarray((parts, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=neg_threshold, data1=shift, data2=neg_len, op=nl.add)
+
+    fill = nl.ndarray((parts, COLUMN_TILE), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.memset(dst=fill, value=BOUND_FILL)
+    # `c * pool_size` for a tile's column c; the tile's first column enters as an immediate below.
+    ramp = nl.ndarray((parts, COLUMN_TILE), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.iota(dst=ramp, pattern=[[pool_size, COLUMN_TILE]], offset=0, channel_multiplier=0)
+
+    columns = _column_tiles_unchecked(int(span))
+    column_count = _column_tile_count_unchecked(int(span))
+    for cidx in range(program, column_count, programs):
+        column_geom = columns[cidx]
+        c0 = column_geom[0]
+        cw = column_geom[1]
+        scores_sb = nl.ndarray((parts, cw), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.dma_copy(dst=scores_sb, src=scores_hbm.ap(pattern=[[span, parts], [1, cw]], offset=c0))
+        # Pool c0 + c is bounded when its end, `(c0 + c + 1) * pool_size`, passes the
+        # partition's threshold: `c * pool_size + neg_threshold > -(c0 + 1) * pool_size`.
+        bounded = nl.ndarray((parts, cw), dtype=nl.uint8, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=bounded, data=ramp[0:parts, 0:cw], op0=nl.add,
+                           operand0=neg_threshold, op1=nl.greater,
+                           operand1=float(-(c0 + 1) * pool_size), engine=nisa.vector_engine)
+        nisa.tensor_copy_predicated(src=fill[0:parts, 0:cw], predicate=bounded, dst=scores_sb)
+        nisa.dma_copy(dst=out.ap(pattern=[[span, parts], [1, cw]], offset=c0), src=scores_sb)
+    return out
+
+
 @nki.jit
 def _causal_sentinel_nki(values_hbm, indices_hbm, width):
     """``-1`` at every selection that reaches no pool the row may see -- by value or by index.
@@ -475,14 +589,25 @@ def _causal_sentinel_nki(values_hbm, indices_hbm, width):
 
 
 @torch._dynamo.assume_constant_result
-def _record_bound_dispatch(rows: int, width: int) -> None:
+def _record_bound_dispatch(rows: int, width: int, fold: int, programs: int) -> None:
     """Record which kernel the bound seam dispatched, and log it, off the compiled graph.
 
     A folded helper takes ints only: Dynamo runs it at trace time and refuses to reconstruct an
-    ``@nki.jit`` object, so the kernel is read as a module global instead of passed in.
+    ``@nki.jit`` object, so the kernel is read as a module global instead of passed in, chosen by
+    ``fold`` (1: :func:`_causal_bound_nki`).
     """
-    _BOUND.last_kernel = _kernel_identity_of(_causal_bound_nki)
-    logger.info("[dsa-causal-bound] kernel=nki rows=%d width=%d", rows, width)
+    kernel = _causal_bound_nki if fold == 1 else _causal_bound_folded_nki
+    _BOUND.last_kernel = _kernel_identity_of(kernel)
+    logger.info("[dsa-causal-bound] kernel=nki rows=%d width=%d fold=%d programs=%d", rows,
+                width, fold, programs)
+
+
+def _bound_programs(span: int) -> int:
+    """SPMD programs for a folded bound launch: two on an LNC2 runtime when there is a column
+    tile for each, else one."""
+    if lnc_pair() and _column_tile_count_unchecked(span) > 1:
+        return _LNC2_PROGRAMS
+    return 1
 
 
 @torch._dynamo.assume_constant_result
@@ -573,8 +698,16 @@ def dsa_causal_bound(scores: Tensor, causal_len: Tensor, pool_size: int) -> Tens
     clen_col = causal_len.reshape(rows, 1).contiguous()
 
     _count_bound_nki_dispatch()
-    _record_bound_dispatch(rows, int(scores.shape[1]))
-    return wrap_nki(_causal_bound_nki)(scores.contiguous(), clen_col, pool_size)
+    width = int(scores.shape[1])
+    fold = _bound_fold(rows, width)
+    programs = _bound_programs(width // fold) if fold > 1 else 1
+    _record_bound_dispatch(rows, width, fold, programs)
+    if fold == 1:
+        return wrap_nki(_causal_bound_nki)(scores.contiguous(), clen_col, pool_size)
+    launch = wrap_nki(_causal_bound_folded_nki)
+    if programs > 1:
+        launch = launch[programs]
+    return launch(scores.contiguous(), clen_col, pool_size, fold)
 
 
 def _validate_sentinel(values: Tensor, indices: Tensor, width: int) -> int:

@@ -5973,10 +5973,8 @@ class Glm5NextDSAIndexer(nn.Module):
 
         return dsa_causal_fill(seq_lens.to(torch.int32) - 1, self.bypass_width())
 
-    def _gather_candidates(
-        self, pool_cache: torch.Tensor, candidates: int, page_size: int
-    ) -> torch.Tensor:
-        """The candidate pooled keys. One call on ``dsa_paged_gather``.
+    def _candidate_keys(self, pool_cache: torch.Tensor, candidates: int) -> torch.Tensor:
+        """The candidate pooled keys: the store's first ``candidates`` rows, read in place.
 
         The candidate axis is every complete pool of the widest row, shared across
         the batch, which is upstream's own shape: a ``[tokens, max_seq_len_pooled]``
@@ -5985,19 +5983,17 @@ class Glm5NextDSAIndexer(nn.Module):
         from that row's own ``seq_len``.
 
         The page table is arithmetic rather than a lookup, and only because of the
-        serving constraint: at one sequence per call, pool ``j`` lives at a fixed
-        page and slot, which is the same contract ``attend()`` states. A batched
-        page table would be a real lookup.
+        serving constraint: at one sequence per call, pool ``j`` lives at page
+        ``j // page_size``, slot ``j % page_size``, which is row ``j`` of the
+        flattened store -- the same contract ``attend()`` states. The gather that
+        table names is the identity, so the keys are the prefix of the store, and
+        the score GEMM reads them where they lie instead of a row-per-descriptor
+        indirect DMA copying them first (``dsa_paged_gather``, 256 bytes a
+        descriptor). A batched page table would be a real lookup.
+        ``_require_serviceable`` has already proven ``candidates`` rows plus the
+        trash row exist.
         """
-        from vllm_neuron.functional.dsa.paged_gather import dsa_paged_gather
-
-        flat = torch.arange(candidates, device=pool_cache.device, dtype=torch.int32)
-        return dsa_paged_gather(
-            pool_cache,
-            torch.div(flat, int(page_size), rounding_mode="floor"),
-            torch.remainder(flat, int(page_size)),
-            int(page_size),
-        )
+        return pool_cache[:candidates]
 
     def forward(
         self,
@@ -6217,7 +6213,7 @@ class Glm5NextDSAIndexer(nn.Module):
                 )
             return self._bypass_indices(seq_lens)
 
-        candidate_keys = self._gather_candidates(pool_cache, candidates, int(page_size))
+        candidate_keys = self._candidate_keys(pool_cache, candidates)
         if self.dcp_size > 1:
             # This rank's pools, bounded and expanded at each row's owned length, merged
             # with the group's (:meth:`_dcp_select_pool_ids`). Every rank selects every
@@ -6756,7 +6752,7 @@ class Glm5NextDSAIndexer(nn.Module):
             # above.
             return self._bypass_indices(seq_lens)
 
-        candidate_keys = self._gather_candidates(pool_cache, candidates, int(page_size))
+        candidate_keys = self._candidate_keys(pool_cache, candidates)
         scores = self.score_pools(packed_query, candidate_keys, packed_weights)
         # The causal bound and the sentinel, at one site.
         pool_ids = self.select_bounded_pools(scores, seq_lens)
@@ -8721,13 +8717,26 @@ class Glm5NextMLAAttention(nn.Module):
             latent=self.kv_lora_rank,
         )
         no_select = dense or dense_window
+        # A selecting chunk scans the pools its window holds rather than every pool of the
+        # model length: no row of the chunk reaches past the window, so the selection is the
+        # same, and a graph compiled for a shorter window scans fewer candidates. A window that
+        # would not select keeps the model length, because the indexer would answer it with the
+        # short regime's causal order instead of the selection's order; so does a window of
+        # fewer pools than the narrowest axis the selector ranks (``MAX8_WIDTH``).
+        from vllm_neuron.functional.dsa.topk_select import MAX8_WIDTH
+
+        window_pools, _, window_selects = self.indexer._require_serviceable(
+            bound, int(page_size), pool_cache
+        )
+        window_scans = window_selects and window_pools >= MAX8_WIDTH
+        scan = bound if no_select or window_scans else int(max_seq_len)
         q_latent = self.project_query_latent(normed_hidden_states)
         topk_indices = self.indexer(
             normed_hidden_states,
             q_latent,
             pool_cache,
             seq_lens,
-            max_seq_len=bound if no_select else int(max_seq_len),
+            max_seq_len=scan,
             page_size=int(page_size),
             indices_wanted=not no_select,
             slot_mapping=slot_mapping,

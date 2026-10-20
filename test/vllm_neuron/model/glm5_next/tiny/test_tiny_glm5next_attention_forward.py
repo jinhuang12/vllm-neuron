@@ -129,7 +129,6 @@ def test_tiny_mla_attention_forward_matches_the_reference() -> None:
         "mla_absorb": 2,
         "mla_sparse": 1,
         "dsa_kpool_hadamard": 2,
-        "dsa_paged_gather": 1,
         "dsa_score_gemm": 1,
         "dsa_topk_select": 1,
         "dsa_index_expand": 1,

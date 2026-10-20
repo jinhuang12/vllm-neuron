@@ -7,10 +7,12 @@ axis is the candidate axis and returns the selected values and their indices, hi
 The selection itself is done by ``rotational_topk``, the vendored ``@nki.jit`` kernel; this
 module adds only a dispatch seam, a route gate and a torch reference.
 
-Which geometries the kernel serves is decided by its own config factories and never by a
-constant here. The kernel splits the candidate axis into stages and asserts a concatenated
-SBUF free dimension, and that bound is not monotonic in ``k``, so no static width or ``k``
-cap can express it; ``_config_builds`` dry-runs the factories instead.
+Which geometries the kernel serves is decided by its own config factories, not by a cap here.
+The kernel splits the candidate axis into stages and asserts a concatenated SBUF free
+dimension, and that bound is not monotonic in ``k``, so no static width or ``k`` cap can
+express it; ``_config_builds`` dry-runs the factories instead. Two conditions the kernel asserts
+in its body, where the dry-run does not reach, are checked here: ``k < width`` and a candidate
+axis at least :data:`MAX8_WIDTH` wide.
 
 A bfloat16 input is passed through rather than upcast, and that has a consequence a caller
 must know. bfloat16 collapses a score distribution onto few distinct values, so many
@@ -49,6 +51,11 @@ _NUM_PROGRAMS = 2
 # The dtypes the kernel is tested for. Its pad sentinel has no float16 branch, so float16
 # is refused here rather than handed to it.
 _SUPPORTED_DTYPES = (torch.bfloat16, torch.float32)
+
+MAX8_WIDTH = 8
+"""Values one ``max8`` instruction reads per partition: the narrowest candidate axis the kernel
+ranks. Its body asserts each stage at least this wide, which the factory dry-run does not reach,
+so a narrower axis takes the torch path."""
 
 
 class DsaTopkSelectError(ValueError):
@@ -179,10 +186,10 @@ def _record_nki_dispatch(n_rows: int, width: int, k: int) -> None:
 def can_run_dsa_topk_select(scores: Tensor, k: int) -> bool:
     """True when the NKI route is available and the kernel serves this geometry.
 
-    Four necessary conditions, then the factory dry-run: the runtime gate, the rank, the dtype,
-    and ``0 < k < width``. That last pre-filter is load-bearing -- the kernel refuses
-    ``k == width`` for sorted output from an assert in its body rather than in the factories, so
-    the dry-run cannot catch it.
+    Five necessary conditions, then the factory dry-run: the runtime gate, the rank, the dtype,
+    ``0 < k < width`` and ``width >= MAX8_WIDTH``. The last two pre-filters are load-bearing --
+    the kernel refuses ``k == width`` for sorted output, and a stage narrower than one ``max8``,
+    from asserts in its body rather than in the factories, so the dry-run cannot catch them.
     """
     if not can_run_kernel(scores):
         return False
@@ -191,7 +198,7 @@ def can_run_dsa_topk_select(scores: Tensor, k: int) -> bool:
     if scores.dtype not in _SUPPORTED_DTYPES:
         return False
     width = int(scores.shape[-1])
-    if not 0 < k < width:
+    if not 0 < k < width or width < MAX8_WIDTH:
         return False
     n_rows = 1
     for d in scores.shape[:-1]:

@@ -151,7 +151,7 @@ def test_bound_fills_exactly_the_incomplete_pools_and_leaves_kept_bits_alone() -
     assert int(got[4, 0].view(torch.int32)) == planted_bits
 
     identity = causal_bound_kernel_identity()
-    assert identity is not None and identity[1] == "_causal_bound_nki", identity
+    assert identity is not None and identity[1] == "_causal_bound_folded_nki", identity
     assert causal_bound_dispatch_counters() == (1, 0), causal_bound_dispatch_counters()
 
 

@@ -17,8 +17,8 @@ recomputing either.
 ``pool_size`` must be a power of two to take the NKI route: the kernel derives ``tail_start``
 as ``seq_len - (seq_len & (pool_size - 1))``, which is exact for a power of two and silently
 wrong for anything else. Callers must keep every non-negative pool id below
-``seq_len[row] // pool_size``; nothing here clamps an expanded index against the sequence
-length, and nothing masks the sentinel.
+``seq_len[row] // pool_size`` and every ``seq_len`` below ``EXACT_INDEX_LIMIT``; nothing here
+clamps an expanded index against the sequence length, and nothing masks the sentinel.
 """
 
 import logging
@@ -34,6 +34,7 @@ import nki.language as nl
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
 from vllm_neuron.functional.attention.mla_sparse import KEY_CHUNK
+from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,16 @@ INDEX_KPOOL = 4
 checkpoint configuration and matches upstream's ``compress_ratio == index_kpool``
 (``sparse_attn_indexer_kpool.py:551-554``).
 """
+
+EXACT_INDEX_LIMIT = 1 << 24
+"""Token indices the kernel computes exactly: float32 holds every whole number below 2**24.
+
+The kernel's arithmetic runs in float32 on the vector engine, so the caller precondition (every
+pool id below ``seq_len // pool_size``) holds the output exact for sequences shorter than this.
+"""
+
+_LNC2_PROGRAMS = 2
+"""Programs on an LNC2 launch: one per physical core of the logical core."""
 
 _SUPPORTED_DTYPES = (torch.int32,)
 """Index dtypes that take the NKI route. int32 is what the selector produces and what the gather reads;
@@ -235,19 +246,22 @@ def _index_expand_nki(pool_ids_hbm, seq_lens_hbm, pool_size, pool_mask):
     left undefined::
 
         [0, topk)            history, the strided loop below
-        [topk, raw_cols)     tail, one column per iteration, `pool_size - 1` of them
+        [topk, raw_cols)     tail, `pool_size - 1` columns written at once
         [raw_cols, out_cols) padding, one memset, all `-1`
 
     The history region is written one offset at a time: each iteration computes every group's
-    value for one offset on a full-width tile and copies it into the columns of stride
-    ``pool_size`` that own it, so the loop is ``pool_size`` long however many pools were
-    selected. Walking columns instead would be ``n_groups * pool_size`` iterations on tiles one
-    element wide -- roughly 4096 instructions at the production width, measured at several
-    times the emit cost of this form.
+    value for one offset and writes it straight into the columns of stride ``pool_size`` that
+    own it, so the loop is ``pool_size`` long however many pools were selected. Walking columns
+    instead would be ``n_groups * pool_size`` iterations on tiles one element wide.
+
+    The arithmetic runs on the vector engine in float32, which is exact here: every value is a
+    whole number of magnitude below :data:`EXACT_INDEX_LIMIT`, the token count of a sequence the
+    caller precondition admits. Integer tiles would route the multiply-add to GpSimd's address
+    arithmetic (``tensor_scalar_addr``), which measured several times the vector engine's cost.
 
     The query-row axis is walked in tiles of at most :data:`PARTITION_MAX` rows, each tile
-    reading only its own rows of both inputs. Without that bound a taller call dies inside the
-    vendor's assert at ``nki/isa/_copy.py:152``.
+    reading only its own rows of both inputs. Launch: plain, or on an SPMD grid of two (LNC2);
+    the programs take the row tiles in turn.
     """
     rows = pool_ids_hbm.shape[0]
     n_groups = pool_ids_hbm.shape[1]
@@ -256,6 +270,9 @@ def _index_expand_nki(pool_ids_hbm, seq_lens_hbm, pool_size, pool_mask):
     # constants rather than device arithmetic.
     raw_cols = index_expand_raw_width(n_groups, pool_size)
     out_cols = index_expand_width(n_groups, pool_size)
+    tail_cols = raw_cols - topk
+    programs = nl.num_programs(axes=0)
+    program = nl.program_id(0)
 
     out = nl.ndarray((rows, out_cols), dtype=nl.int32, buffer=nl.shared_hbm)
 
@@ -265,19 +282,23 @@ def _index_expand_nki(pool_ids_hbm, seq_lens_hbm, pool_size, pool_mask):
     tiles = _row_tiles_unchecked(int(rows))
     tile_count = _row_tile_count_unchecked(int(rows))
 
-    for idx in range(tile_count):
+    # The tail offsets 0 .. pool_size - 2 along the free axis, the same on every partition. A
+    # pool of one token has no tail.
+    if tail_cols > 0:
+        tail_offset = nl.ndarray((PARTITION_MAX, tail_cols), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.iota(dst=tail_offset, pattern=[[1, tail_cols]], offset=0, channel_multiplier=0)
+
+    for idx in range(program, tile_count, programs):
         tile_geom = tiles[idx]
         start = tile_geom[0]
         height = tile_geom[1]
 
         pid = nl.ndarray((height, n_groups), dtype=nl.int32, buffer=nl.sbuf)
-        nisa.tensor_copy(
-            dst=pid, src=nl.load(pool_ids_hbm[start:start + height, 0:n_groups])
-        )
+        nisa.dma_copy(dst=pid, src=pool_ids_hbm[start:start + height, 0:n_groups])
         # Re-loaded per tile: `seq_lens` is per-row, so hoisting this column out of the walk
         # would give every tile the first tile's lengths.
         seq = nl.ndarray((height, 1), dtype=nl.int32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=seq, src=nl.load(seq_lens_hbm[start:start + height, 0:1]))
+        nisa.dma_copy(dst=seq, src=seq_lens_hbm[start:start + height, 0:1])
 
         acc = nl.ndarray((height, out_cols), dtype=nl.int32, buffer=nl.sbuf)
 
@@ -287,45 +308,42 @@ def _index_expand_nki(pool_ids_hbm, seq_lens_hbm, pool_size, pool_mask):
         if out_cols > raw_cols:
             nisa.memset(acc[:, raw_cols:out_cols], -1)
 
-        # `max(pid * pool_size + o, -1)` replaces a compare and a select: the largest value
-        # any negative pool id can reach is exactly -1. This loop walks columns and is
-        # `pool_size` long; it is not the row tiling.
+        # `max(pid * pool_size, -1 - o) + o` is `pid * pool_size + o` for a pool id and -1 for
+        # the -1 sentinel, whose scaled value `-pool_size` is at most `-1 - o`.
+        scaled = nl.ndarray((height, n_groups), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=scaled, data=pid, op0=nl.multiply, operand0=float(pool_size),
+                           engine=nisa.vector_engine)
         for o in range(pool_size):
-            vals = nl.ndarray((height, n_groups), dtype=nl.int32, buffer=nl.sbuf)
-            nisa.tensor_scalar(dst=vals, data=pid,
-                               op0=nl.multiply, operand0=pool_size, op1=nl.add, operand1=o)
-            nisa.tensor_scalar(dst=vals, data=vals, op0=nl.maximum, operand0=-1)
-            nisa.tensor_copy(dst=acc[:, o:topk:pool_size], src=vals)
+            nisa.tensor_scalar(dst=acc[:, o:topk:pool_size], data=scaled,
+                               op0=nl.maximum, operand0=float(-1 - o),
+                               op1=nl.add, operand1=float(o), engine=nisa.vector_engine)
 
-        # `tail_start = seq_len - (seq_len & (pool_size - 1))`, exact for a power-of-two
-        # pool_size and the reason the gate refuses any other. `nl.mod` would express it
-        # directly but does not compile.
-        rem = nl.ndarray((height, 1), dtype=nl.int32, buffer=nl.sbuf)
-        nisa.tensor_scalar(dst=rem, data=seq, op0=nl.bitwise_and, operand0=pool_mask)
-        tail_start = nl.ndarray((height, 1), dtype=nl.int32, buffer=nl.sbuf)
-        nisa.tensor_tensor(dst=tail_start, data1=seq, data2=rem, op=nl.subtract)
+        if tail_cols > 0:
+            # `count = seq_len & (pool_size - 1)` tokens past the last complete pool, starting
+            # at `seq_len - count`; `nl.mod` would express it directly but does not compile.
+            # Column `t` of the tail holds `seq_len - count + t` while `t < count`, else -1:
+            # `(t + seq_len - count + 1) * (t < count) - 1`.
+            count_i = nl.ndarray((height, 1), dtype=nl.int32, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=count_i, data=seq, op0=nl.bitwise_and, operand0=pool_mask)
+            count = nl.ndarray((height, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_copy(dst=count, src=count_i, engine=nisa.vector_engine)
+            past = nl.ndarray((height, 1), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=past, data1=seq, data2=count, op=nl.subtract,
+                               engine=nisa.vector_engine)
+            inside = nl.ndarray((height, tail_cols), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=inside, data=tail_offset[0:height, 0:tail_cols],
+                               op0=nl.less, operand0=count, engine=nisa.vector_engine)
+            next_index = nl.ndarray((height, tail_cols), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_scalar(dst=next_index, data=tail_offset[0:height, 0:tail_cols],
+                               op0=nl.add, operand0=past, op1=nl.add, operand1=1.0,
+                               engine=nisa.vector_engine)
+            kept = nl.ndarray((height, tail_cols), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=kept, data1=next_index, data2=inside, op=nl.multiply,
+                               engine=nisa.vector_engine)
+            nisa.tensor_scalar(dst=acc[:, topk:raw_cols], data=kept, op0=nl.subtract,
+                               operand0=1.0, engine=nisa.vector_engine)
 
-        # The tail region, one column per possible tail token. `mask` is 1 exactly while
-        # `tail_start + t < seq_len`, so the value is `tail_start + t` there and -1 elsewhere.
-        # This loop walks columns too.
-        for t in range(pool_size - 1):
-            pos = nl.ndarray((height, 1), dtype=nl.int32, buffer=nl.sbuf)
-            nisa.tensor_scalar(dst=pos, data=tail_start, op0=nl.add, operand0=t)
-            clipped = nl.ndarray((height, 1), dtype=nl.int32, buffer=nl.sbuf)
-            nisa.tensor_tensor(dst=clipped, data1=pos, data2=seq, op=nl.minimum)
-            room = nl.ndarray((height, 1), dtype=nl.int32, buffer=nl.sbuf)
-            nisa.tensor_tensor(dst=room, data1=seq, data2=clipped, op=nl.subtract)
-            mask = nl.ndarray((height, 1), dtype=nl.int32, buffer=nl.sbuf)
-            nisa.tensor_scalar(dst=mask, data=room, op0=nl.maximum, operand0=0,
-                               op1=nl.minimum, operand1=1)
-            pos1 = nl.ndarray((height, 1), dtype=nl.int32, buffer=nl.sbuf)
-            nisa.tensor_scalar(dst=pos1, data=pos, op0=nl.add, operand0=1)
-            prod = nl.ndarray((height, 1), dtype=nl.int32, buffer=nl.sbuf)
-            nisa.tensor_tensor(dst=prod, data1=pos1, data2=mask, op=nl.multiply)
-            col = topk + t
-            nisa.tensor_scalar(dst=acc[:, col:col + 1], data=prod, op0=nl.subtract, operand0=1)
-
-        nl.store(out[start:start + height, 0:out_cols], value=acc)
+        nisa.dma_copy(dst=out[start:start + height, 0:out_cols], src=acc)
     return out
 
 
@@ -334,8 +352,16 @@ def _index_expand_nki(pool_ids_hbm, seq_lens_hbm, pool_size, pool_mask):
 # ---------------------------------------------------------------------------------------------
 
 
+def _expand_programs(rows: int) -> int:
+    """SPMD programs for a launch: two on an LNC2 runtime when there is a row tile for each."""
+    if lnc_pair() and _row_tile_count_unchecked(rows) > 1:
+        return _LNC2_PROGRAMS
+    return 1
+
+
 @torch._dynamo.assume_constant_result
-def _record_nki_dispatch(rows: int, n_groups: int, pool_size: int, out_cols: int) -> None:
+def _record_nki_dispatch(rows: int, n_groups: int, pool_size: int, out_cols: int,
+                         programs: int) -> None:
     """Record which kernel the seam dispatched, and log it, off the compiled graph.
 
     A folded helper may take ints only: Dynamo runs it at trace time and refuses to
@@ -346,12 +372,14 @@ def _record_nki_dispatch(rows: int, n_groups: int, pool_size: int, out_cols: int
     # Both widths are logged: a line carrying only the emitted width cannot tell meaningful
     # columns from sentinel padding.
     logger.info(
-        "[dsa-index-expand] kernel=nki rows=%d n_groups=%d pool_size=%d raw_cols=%d out_cols=%d",
+        "[dsa-index-expand] kernel=nki rows=%d n_groups=%d pool_size=%d raw_cols=%d out_cols=%d "
+        "programs=%d",
         rows,
         n_groups,
         pool_size,
         index_expand_raw_width(n_groups, pool_size),
         out_cols,
+        programs,
     )
 
 
@@ -438,12 +466,14 @@ def dsa_index_expand(pool_ids: Tensor, seq_lens: Tensor, pool_size: int = INDEX_
     seq_col = seq_lens.reshape(rows, 1).contiguous()
 
     _count_nki_dispatch()
+    programs = _expand_programs(rows)
     # The counter, the log and the identity read are folded off the traced graph: a counter
     # store inside the trace becomes a value guard that fails on the first call after warmup.
-    _record_nki_dispatch(rows, n_groups, pool_size, out_cols)
-    return wrap_nki(_index_expand_nki)(
-        pool_ids.contiguous(), seq_col, pool_size, pool_size - 1
-    )
+    _record_nki_dispatch(rows, n_groups, pool_size, out_cols, programs)
+    launch = wrap_nki(_index_expand_nki)
+    if programs > 1:
+        launch = launch[programs]
+    return launch(pool_ids.contiguous(), seq_col, pool_size, pool_size - 1)
 
 
 # ---------------------------------------------------------------------------------------------
