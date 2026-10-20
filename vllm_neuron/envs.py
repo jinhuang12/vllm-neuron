@@ -130,6 +130,10 @@ if TYPE_CHECKING:
     # token attends its latent window densely (mla_dense_window.py) instead of
     # selecting and gathering. On by default; 0 restores the sparse path.
     VLLM_NEURON_MLA_DENSE_WINDOW: bool = True
+    # Let the GLM-5.3-Flash DSA prefill's sparse MLA body gather its rows from the
+    # latent bank through the block table, with no staged window. On by default; 0
+    # restores the staged window.
+    VLLM_NEURON_MLA_SPARSE_BANK_ROWS: bool = True
     # Divide the GLM-5.3-Flash DSA prefill selection's query rows over the
     # tensor-parallel ranks. On by default; 0 restores the replicated selection.
     VLLM_NEURON_DSA_INDEXER_SHARD: bool = True
@@ -613,6 +617,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # compile. On by default; set 0 to restore the sparse path.
     "VLLM_NEURON_MLA_DENSE_WINDOW": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_MLA_DENSE_WINDOW")) is not False
+    ),
+    # Let the sparse MLA prefill's low-precision row-tiled body
+    # (``functional/attention/mla_sparse.py``) gather each query's selected rows
+    # straight from the latent bank, every window row translated to its bank row
+    # through the block table, instead of first copying the window into HBM page by
+    # page. Taken only where the caller states that the bank already holds this step's
+    # rows (``model/glm5_next/model_fp8.py``'s KV write, before the sparse call) and
+    # the page size is a power of two (``mla_sparse.bank_rows_serve``). Read at trace
+    # time; a change needs a new compile. On by default; set 0 to restore the staged
+    # window.
+    "VLLM_NEURON_MLA_SPARSE_BANK_ROWS": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_MLA_SPARSE_BANK_ROWS")) is not False
     ),
     # ================== GLM-5.3-Flash DSA Indexer ==================
     # Shard the DSA prefill selection (score GEMM, causal bound, top-k, sentinel

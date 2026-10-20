@@ -8258,7 +8258,10 @@ class Glm5NextMLAAttention(nn.Module):
         # the window it assembles. The view is taken after the write above, so it
         # holds those rows as well; the overlay dates from the view-form write, whose
         # rows a later view never saw (the device read the rows from before the
-        # write), and it gives the kernel the same values either way.
+        # write), and it gives the kernel the same values either way. The sparse calls
+        # below state that the bank holds them (``written_in_bank``), so the sparse
+        # kernel reads them from the bank, with no window or overlay, unless
+        # ``VLLM_NEURON_MLA_SPARSE_BANK_ROWS`` is 0 (``mla_sparse_attention``).
         c_kv = latent_cache[:, 0, :]
         at = start.reshape(1, 1).to(torch.int32)
         if collector is not None:
@@ -8328,6 +8331,7 @@ class Glm5NextMLAAttention(nn.Module):
                 write_offset=at,
                 page_size=page,
                 pool_size=self.indexer.index_kpool,
+                written_in_bank=True,
             )
         else:
             attended = mla_sparse_attention(
@@ -8340,6 +8344,7 @@ class Glm5NextMLAAttention(nn.Module):
                 write_offset=at,
                 page_size=page,
                 pool_size=self.indexer.index_kpool,
+                written_in_bank=True,
             )
             # The kernel returns float32, so the padding is restored in that dtype
             # before the model-dtype cast and absorb-out below.

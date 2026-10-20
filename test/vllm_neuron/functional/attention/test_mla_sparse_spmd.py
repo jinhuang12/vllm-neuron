@@ -65,8 +65,8 @@ def test_dual_pnc_preserves_uneven_query_blocks(seq, dtype):
 
 @pytest.mark.parametrize("seq", [33, 48])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_dual_pnc_paged_programs_keep_private_overlay_windows(seq, dtype):
-    """Independent window staging and tail-key loads produce one shared output."""
+def test_dual_pnc_paged_programs_share_one_staged_window(seq, dtype):
+    """A pair stages one shared window, alternate pages and overlay blocks each."""
     args, cache = _inputs(seq, dtype, True)
     call = wrap_nki(MS.mla_sparse_attention_nope_row_tiled_kernel)
     got = call[2](*args)
