@@ -9,18 +9,20 @@ and the block-table row from that segment) and the root, chunk by chunk of 1024 
 rows at the served KV page of 128 tokens.
 
 1. The standard line (``max_model_len`` 4096, ``kv_segment_size_buckets`` [1024, 2048,
-   4096], ``num_batched_tokens_buckets`` [1024]): prompts of 700, 1500, 3000 and 4095
-   tokens take the 1024 / 2048 / 4096 / 4096 segment, every chunk's window holds the
-   request, and 16 greedy tokens (one for 4095: the prompt and the generated tokens must
-   fit in max_model_len) are bit-identical to the single-segment [4096] config. On the
+   4096], ``num_batched_tokens_buckets`` [1024]): the chunks of prompts of 700, 1500, 3000
+   and 4095 tokens take the smallest segment that holds their start (1024 at starts 0 and
+   1024, 2048 at 2048, 4096 at 3072), every chunk's window holds the chunk, and 16 greedy
+   tokens (one for 4095: the prompt and the generated tokens must fit in max_model_len)
+   are bit-identical to the single-segment [4096] config. On the
    code before this change every chunk read ``buckets[0]`` = 1024, a 2048-token window,
    and the 3000- and 4095-token prompts stop at "a request longer than its bucket cannot be
    served by this window".
 2. The bs=64 line in the tiny model's clothes (``max_num_seqs`` 4, [1024, 8192],
    ``max_model_len`` 8192): requests of 900, 3000 and 7000 tokens admitted one after the
    other while the earlier ones decode, batched decode padded to the bucket of 4. Each
-   request's segment is 1024 / 8192 / 8192, and its tokens and its own cache state (latent
-   pages, side-cache slot) are those of the same request served alone.
+   request's chunks take 1024 at starts 0 and 1024 and 8192 after, and its tokens and its
+   own cache state (latent pages, side-cache slot) are those of the same request served
+   alone.
 
     NKI_SIMULATOR=1 VLLM_NEURON_CPU_MODE=1 PYTHONPATH=$PWD python -m pytest \\
         test/vllm_neuron/model/glm5_next/tiny/test_tiny_glm5next_prompt_window.py
@@ -113,6 +115,7 @@ class World:
         runner._is_synthetic_model = False
         runner.neuron_config = SimpleNamespace(
             kv_segment_size_buckets=list(segments),
+            _model_supports_windowed_prefill=True,
             num_batched_tokens_buckets=[QUERY],
             decode_context_length_buckets=None,
             enable_structured_outputs=False,
@@ -289,10 +292,12 @@ def _window_pages(segment: int, max_model_len: int) -> int:
 
 
 @pytest.mark.parametrize(
-    "prompt_len, segment", [(700, 1024), (1500, 2048), (3000, 4096), (4095, 4096)]
+    "prompt_len, segments",
+    [(700, [1024]), (1500, [1024, 1024]), (3000, [1024, 1024, 2048]),
+     (4095, [1024, 1024, 2048, 4096])],
 )
 def test_a_prompt_on_the_standard_line_takes_its_segment_and_matches_one_segment(
-    prompt_len, segment, caplog
+    prompt_len, segments, caplog
 ):
     """[1024, 2048, 4096] against [4096]: the same tokens and logits, from a smaller window."""
     generated = min(GENERATED, STANDARD_MAX - prompt_len)
@@ -306,8 +311,9 @@ def test_a_prompt_on_the_standard_line_takes_its_segment_and_matches_one_segment
     want = _generate(one, "req-one", 0, prompt, generated)
 
     # The segment the request took, logged once per chunk, and its window.
-    assert [chunk[2] for chunk in multi.chunks] == [segment] * chunks, multi.chunks
-    assert [chunk[3] for chunk in multi.chunks] == [_window_pages(segment, STANDARD_MAX)] * chunks
+    assert [chunk[2] for chunk in multi.chunks] == segments, multi.chunks
+    windows = [_window_pages(s, STANDARD_MAX) for s in segments]
+    assert [chunk[3] for chunk in multi.chunks] == windows, multi.chunks
     assert [chunk[2] for chunk in one.chunks] == [ONE_SEGMENT[0]] * chunks
     assert [chunk[3] for chunk in one.chunks] == [STANDARD_MAX // PAGE] * chunks
     # (caplog keeps the second world's lines too: the runner logger is at INFO already.)
@@ -316,10 +322,12 @@ def test_a_prompt_on_the_standard_line_takes_its_segment_and_matches_one_segment
         if "KV segment" in record.getMessage() and "req-multi" in record.getMessage()
     ]
     assert len(logged) == chunks, caplog.text
-    assert all(f"KV segment {segment} of {STANDARD_SEGMENTS}" in line for line in logged), logged
+    assert all(
+        f"KV segment {s} of {STANDARD_SEGMENTS}" in line for line, s in zip(logged, segments)
+    ), logged
     assert [int(line.split(": ")[1].split(" ")[0]) for line in logged] == list(range(0, prompt_len, QUERY))
     # The last chunk's pages fit the window (the converter refuses otherwise).
-    assert _cdiv(prompt_len, PAGE) <= _window_pages(segment, STANDARD_MAX)
+    assert _cdiv(prompt_len, PAGE) <= _window_pages(segments[-1], STANDARD_MAX)
 
     assert len(got.tokens) == generated == len(want.tokens)
     assert got.tokens == want.tokens, (got.tokens, want.tokens)
@@ -346,8 +354,9 @@ def _reference(req_id: str, prompt: torch.Tensor, generated: int) -> tuple[Run, 
 
 
 def test_mixed_length_requests_on_the_bs64_line_decode_together_as_each_does_alone():
-    """900, 3000 and 7000 tokens admitted one after the other: segments 1024 / 8192 / 8192,
-    and each request's tokens and own cache state are those of its single-request run."""
+    """900, 3000 and 7000 tokens admitted one after the other: 1024 at chunk starts 0 and 1024,
+    8192 after, and each request's tokens and own cache state are those of its single-request
+    run."""
     prompts = {name: _prompt(tokens, SEED + tokens) for name, tokens in BS64_PROMPTS.items()}
     world = World(BS64_SEGMENTS, max_model_len=BS64_MAX, slots=BS64_SLOTS)
     live: dict = {}
@@ -363,9 +372,9 @@ def test_mixed_length_requests_on_the_bs64_line_decode_together_as_each_does_alo
     _decode_steps(world, live, 4, buckets=BS64_BUCKETS)
 
     segments = {name: {chunk[2] for chunk in world.chunks if chunk[0] == name} for name in live}
-    assert segments == {"a": {1024}, "b": {8192}, "c": {8192}}, world.chunks
+    assert segments == {"a": {1024}, "b": {1024, 8192}, "c": {1024, 8192}}, world.chunks
     windows = {name: {chunk[3] for chunk in world.chunks if chunk[0] == name} for name in live}
-    assert windows == {"a": {16}, "b": {64}, "c": {64}}, world.chunks
+    assert windows == {"a": {16}, "b": {16, 64}, "c": {16, 64}}, world.chunks
     assert [chunk[1] for chunk in world.chunks if chunk[0] == "c"] == list(range(0, 7000, QUERY))
     slots = {name: world.runner._glm5next_request_slot_table[name] for name in live}
     assert sorted(slots.values()) == [0, 1, 2], slots

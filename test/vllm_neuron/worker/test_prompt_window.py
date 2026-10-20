@@ -13,8 +13,8 @@ answered HTTP 400 instead. These tests pin the replacement:
    pair and refuses at startup a list whose largest segment does not cover
    ``max_model_len`` (so no config that starts has a window below ``max_model_len``);
 2. a list the user did not set is completed with the covering segment;
-3. every chunk of a request carries the smallest segment at least as long as the
-   request, and a window that holds the chunk; a decode step keeps the first segment;
+3. every chunk of a windowed-prefill request carries the smallest segment that holds
+   its start, and a window that holds the chunk; a decode step keeps the first segment;
 4. warmup builds each (query, segment) graph with that segment's window.
 
     NKI_SIMULATOR=1 VLLM_NEURON_CPU_MODE=1 PYTHONPATH=$PWD python -m pytest \\
@@ -186,6 +186,7 @@ def _metadata_runner(names, segments, *, max_model_len=4096) -> NeuronModelRunne
     runner._is_synthetic_model = False
     runner.neuron_config = SimpleNamespace(
         kv_segment_size_buckets=list(segments),
+        _model_supports_windowed_prefill=True,
         num_batched_tokens_buckets=[QUERY],
         decode_context_length_buckets=None,
         enable_structured_outputs=False,
@@ -231,10 +232,12 @@ def _window_pages(segment: int, max_model_len: int = 4096) -> int:
 
 
 @pytest.mark.parametrize(
-    "prompt, segment", [(700, 1024), (1500, 2048), (3000, 4096), (4095, 4096)]
+    "prompt, segments",
+    [(700, [1024]), (1500, [1024, 1024]), (3000, [1024, 1024, 2048]),
+     (4095, [1024, 1024, 2048, 4096])],
 )
 def test_every_chunk_of_a_request_carries_its_segment_and_a_window_that_holds_it(
-    prompt, segment, caplog
+    prompt, segments, caplog
 ):
     names = ["layers.0.self_attn", "layers.1.self_attn"]
     runner = _metadata_runner(names, STANDARD["kv_segment_size_buckets"])
@@ -244,22 +247,26 @@ def test_every_chunk_of_a_request_carries_its_segment_and_a_window_that_holds_it
             metadata = _chunk_metadata(runner, cached=cached, real=real, total=prompt)
             assert sorted(metadata) == names
             chosen.append({entry["kv_segment_size"] for entry in metadata.values()})
-            # The chunk's pages fit the window the converter will size from the segment.
-            assert -(-(cached + real) // PAGE) <= _window_pages(segment)
-    assert chosen == [{segment}] * len(_chunks(prompt))
+            # The chunk's pages fit the window the converter will size from its segment.
+            assert -(-(cached + real) // PAGE) <= _window_pages(segments[len(chosen) - 1])
+    assert chosen == [{segment} for segment in segments]
     logged = [record.getMessage() for record in caplog.records if "KV segment" in record.getMessage()]
     assert logged, caplog.text
-    assert all(f"KV segment {segment}" in line and REQUEST in line for line in logged), logged
+    assert len(logged) == len(segments), logged
+    assert all(
+        f"KV segment {s}" in line and REQUEST in line for line, s in zip(logged, segments)
+    ), logged
 
 
 def test_a_request_longer_than_every_segment_takes_the_largest():
-    """[1024, 2048] at max_model_len 3072: a 3000-token request takes 2048, whose window
-    (2048 + 1024 = 3072) the validator proved covers the model."""
+    """[1024, 2048] at max_model_len 3072: a 3000-token request's chunks take 1024, 1024 and
+    2048; the last one's window (2048 + 1024 = 3072) is the one the validator proved covers
+    the model."""
     runner = _metadata_runner(["layers.0.self_attn"], [1024, 2048], max_model_len=3072)
-    for cached, real in _chunks(3000):
+    for (cached, real), segment in zip(_chunks(3000), (1024, 1024, 2048)):
         metadata = _chunk_metadata(runner, cached=cached, real=real, total=3000)
-        assert {entry["kv_segment_size"] for entry in metadata.values()} == {2048}
-        assert -(-(cached + real) // PAGE) <= _window_pages(2048, 3072)
+        assert {entry["kv_segment_size"] for entry in metadata.values()} == {segment}
+        assert -(-(cached + real) // PAGE) <= _window_pages(segment, 3072)
 
 
 def test_a_decode_step_keeps_the_first_segment():
@@ -272,15 +279,15 @@ def test_a_decode_step_keeps_the_first_segment():
 
 
 def test_a_batch_without_a_request_length_takes_the_chunks_padded_end():
-    """No ``num_tokens_no_spec``: the segment holds cached + the padded chunk, so the
-    window still holds the chunk (seg + query >= cached + query)."""
+    """No ``num_tokens_no_spec``: the chunk ends at cached + the padded chunk, and the
+    start's segment plus the query bucket still holds it (seg + query >= cached + query)."""
     runner = _metadata_runner(["layers.0.self_attn"], STANDARD["kv_segment_size_buckets"])
     del runner.input_batch.num_tokens_no_spec
     table = runner.input_batch.block_table[0]
     table.append_row(list(range(1, 1 + 24)), 0)
     runner.input_batch.num_computed_tokens_cpu_tensor[0] = 2048
     metadata = runner._build_attention_metadata(1, QUERY, QUERY, 0, 2048, host_only=True)
-    assert {entry["kv_segment_size"] for entry in metadata.values()} == {4096}
+    assert {entry["kv_segment_size"] for entry in metadata.values()} == {2048}
 
 
 def test_a_runner_without_segments_carries_zero():
