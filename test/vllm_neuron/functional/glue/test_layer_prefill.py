@@ -7,15 +7,17 @@ opening request's prefill chunk (``glue_case.kda_prefill_carriers``) at:
 * 128 rows, where ``1`` fuses mhc_pre and mhc_post. Every switch value the A/B ran
   (``0``, ``1``, ``all`` and each kernel alone but mhc_post) runs the layer from this
   tree.
-* 1024 rows, the served p1 chunk, where mhc_pre and mhc_post can be fused. ``0`` and
-  mhc_pre run; neither selects the two KDA kernels.
+* 1024 rows, the served p1 chunk, where mhc_pre and mhc_post can be fused. mhc_pre
+  runs; it does not select the two KDA kernels. ``0`` is not 0a08ff4 bit for bit
+  there: this tree's KDA layer runs its recurrence at chunk 32, 0a08ff4's at 16,
+  which sums in another order.
 * 2048 rows, the chunk of the uncapped prefill line, where ``1`` fuses mhc_pre and
   mhc_post (the two KDA kernels decline). ``1`` runs against the snapshot.
 
 The 0a08ff4 snapshot runs the same layer once per row count, with the same weights and
 operands. In the simulator:
 
-* ``0``, which fuses nothing, is 0a08ff4 bit for bit.
+* ``0``, which fuses nothing, is 0a08ff4 bit for bit at 128 rows.
 * every other value is within ``test_layer_glue.py``'s layer tolerances. It may
   also be bit for bit: kda_projections at 128 rows was with 4, 16 and 24 CPU threads and
   was not with 192 (torch's CPU matmul sums in an order that depends on the thread count).
@@ -49,7 +51,7 @@ from vllm_neuron.functional.glue import kda_output, kda_projections, mhc_pre
 from vllm_neuron.model.glm5_next import model_fp8
 
 VALUES = {128: ("0", "1", "all", "mhc_pre", "kda_projections", "kda_output"),
-          1024: ("0", "mhc_pre"),
+          1024: ("mhc_pre",),
           glue_case.UNCAPPED_PREFILL_CHUNK: ("1",)}
 #: The KDA kernels' decode row bound (their prefill kernels take larger row counts, which
 #: no value above selects); mhc_pre serves any row count.
