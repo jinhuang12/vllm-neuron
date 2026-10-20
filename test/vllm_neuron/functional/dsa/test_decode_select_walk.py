@@ -550,7 +550,9 @@ def test_the_dcp_branch_takes_the_walk_past_one_row(monkeypatch, local_candidate
     monkeypatch.setattr(DS, "dsa_decode_select_pools", pools_oracle)
     want = _dcp_step(ops, cp, monkeypatch)
     assert torch.equal(got, want)
-    assert int((got >= 0).sum()) > K * POOL // cp
+    # The one-rank group hands the merge this rank's list once per rank, so the merge keeps
+    # k / cp of this rank's pools; the request's last block is on rank 1 (no tail here).
+    assert int((got >= 0).sum()) == K * POOL // cp
 
 
 # ---------------------------------------------------------------------------------------
