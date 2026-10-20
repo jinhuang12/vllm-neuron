@@ -58,9 +58,9 @@ def fused_fp8_experts(hidden, packed, row_ids, expert_ids, affinity, bounds,
     """Compute routed expert contributions in the caller's block order.
 
     ``row_ids`` has shape [blocks,q], with real token IDs or -1. ``expert_ids``
-    has shape [blocks,1], and values in [0,E). Hidden states include a final
-    zero padding row. Affinities use token-major [T+1,E] layout with the final
-    row zero. ``bounds`` is FP32 [128,3], repeating gate upper, up lower, and
+    has shape [blocks,1], and values in [0,E). ``hidden`` is BF16 [T,H], one
+    row per token, and ``affinity`` FP32 [T,E], token-major; a -1 row reads
+    neither. ``bounds`` is FP32 [128,3], repeating gate upper, up lower, and
     up upper limits. Use infinities for an unbounded side.
 
     The returned FP32 [blocks*q,H] tensor defines only routed rows and row 0.
@@ -70,7 +70,7 @@ def fused_fp8_experts(hidden, packed, row_ids, expert_ids, affinity, bounds,
     matching compensated scales once, then transfer the packed bank to device.
     """
     if hidden.ndim != 2 or hidden.shape[0] < 1 or hidden.shape[1] < 1 or hidden.shape[1] % 128 or hidden.dtype != torch.bfloat16:
-        raise ValueError("hidden must be BF16 [T+1,H], positive H multiple of128")
+        raise ValueError("hidden must be BF16 [T,H], positive H multiple of128")
     if row_ids.ndim != 2 or row_ids.shape[0] < 1 or row_ids.shape[1] < 1:
         raise ValueError("row_ids must have positive shape [blocks,q]")
     blocks, _ = row_ids.shape
@@ -100,15 +100,19 @@ def fused_fp8_experts(hidden, packed, row_ids, expert_ids, affinity, bounds,
     _count_nki_dispatch()
     if (
         lnc_pair()
-        and tuple(hidden.shape) == (2, 4096)
+        and tuple(hidden.shape) == (1, 4096)
         and tuple(row_ids.shape) == (8, 1)
         and experts == 18
         and intermediate == 512
         and (tile_m, tile_n, tile_k) == (1, 4096, 4096)
     ):
+        # The compact kernel reads a -1 row as the row after the last token, so
+        # it takes one zero row of each operand.
+        padded_hidden = torch.cat([hidden, hidden.new_zeros(1, hidden.shape[1])])
+        padded_affinity = torch.cat([affinity, affinity.new_zeros(1, experts)])
         return _FUSED_DECODE_EXPERTS(
-            hidden, packed.weights, packed.scales, row_ids, expert_ids,
-            affinity.reshape(-1, 1), bounds,
+            padded_hidden, packed.weights, packed.scales, row_ids, expert_ids,
+            padded_affinity.reshape(-1, 1), bounds,
             BLOCK_N=tile_n, BLOCK_K=tile_k,
         ).reshape(-1, hidden.shape[1])
     return _FUSED_EXPERTS(

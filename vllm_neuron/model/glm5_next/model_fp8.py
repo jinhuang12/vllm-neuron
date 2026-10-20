@@ -1900,12 +1900,12 @@ class Glm5NextRoutedExperts(nn.Module):
             )
 
         # ---- The token-block mapping, over the real token count. --------- #
-        # the order is load-bearing. The kernel needs a padding-token slot, and
-        # appending it to the affinities before the mapping would make the mapping
-        # see ``T + 1`` tokens -- odd for every even real count -- while its two
-        # NKI subkernels need ``chunk_size % 128 == 0`` and
-        # ``total_tokens % f_len == 0``. Both fail on an odd count, so every call
-        # would fall to the torch mapping instead.
+        # the order is load-bearing. The blockwise kernels below need a
+        # padding-token slot, and appending it to the affinities before the
+        # mapping would make the mapping see ``T + 1`` tokens -- odd for every even
+        # real count -- while its two NKI subkernels need ``chunk_size % 128 == 0``
+        # and ``total_tokens % f_len == 0``. Both fail on an odd count, so every
+        # call would fall to the torch mapping instead.
         #
         # ``conditions`` is deliberately unconsumed: it feeds the ``*_hybrid``
         # dynamic-while variant of the vendor kernel, and this route calls the
@@ -1931,31 +1931,6 @@ class Glm5NextRoutedExperts(nn.Module):
             # blocked alongside it.
             collector.append(token_position_to_id)
 
-        # ---- The padding-token slot, appended after the mapping. --------- #
-        # the kernel reads a ``-1`` token position as the last row of
-        # ``hidden_states``, so the hidden tensor grows one zero row and the result
-        # is sliced back at the end.
-        #
-        # The affinities grow the same slot in their flat form, because that is
-        # what the mapping returns: ``expert_affinities_masked`` is
-        # ``[T * E_local, 1]`` and the layout is token-major, a ``view(-1, 1)`` of
-        # ``[T, E]``. Appending ``E_local`` zero entries to the flat tensor is
-        # therefore the same tensor as appending one zero row before the view.
-        # Only this order keeps ``total_tokens`` even.
-        pad_hidden = torch.zeros(
-            1, hidden, dtype=hidden_states.dtype, device=hidden_states.device
-        )
-        padded_hidden = torch.cat([hidden_states, pad_hidden], dim=0)
-        pad_masked = torch.zeros(
-            num_experts,
-            1,
-            dtype=expert_affinities_masked.dtype,
-            device=expert_affinities_masked.device,
-        )
-        expert_affinities_masked = torch.cat(
-            [expert_affinities_masked, pad_masked], dim=0
-        )
-
         # Both paths gather tokens and expert tiles on device, clamp gate from
         # above and up on both sides, then apply affinity after down projection.
         if using_packed:
@@ -1972,12 +1947,15 @@ class Glm5NextRoutedExperts(nn.Module):
             rows = min(tokens, block)
             kernel_row_ids = token_position_to_id.reshape(-1, block)[:, :rows].contiguous()
             token_position_to_id = kernel_row_ids.reshape(-1)
+            # The real rows, contiguous as the seam requires: the kernel resolves a
+            # ``-1`` token position one past the last row and reads nothing for it,
+            # so no padding-token slot is appended.
             contribution = fused_fp8_experts(
-                padded_hidden.to(torch.bfloat16),
+                hidden_states.to(torch.bfloat16).contiguous(),
                 PackedExperts(packed_weights, packed_scales),
                 kernel_row_ids,
                 block_to_expert.reshape(-1, 1),
-                expert_affinities_masked.reshape(tokens + 1, num_experts),
+                expert_affinities_masked.reshape(tokens, num_experts).contiguous(),
                 _swiglu_bound_operand(
                     self.swiglu_limit, self.swiglu_limit, hidden_states.device
                 ),
@@ -1994,6 +1972,30 @@ class Glm5NextRoutedExperts(nn.Module):
                 int(self.num_experts_per_tok),
             ).to(hidden_states.dtype)
         else:
+            # ---- The padding-token slot, appended after the mapping. ----- #
+            # these kernels read a ``-1`` token position as the last row of
+            # ``hidden_states``, so the hidden tensor grows one zero row and the
+            # result is sliced back at the end.
+            #
+            # The affinities grow the same slot in their flat form, because that
+            # is what the mapping returns: ``expert_affinities_masked`` is
+            # ``[T * E_local, 1]`` and the layout is token-major, a
+            # ``view(-1, 1)`` of ``[T, E]``. Appending ``E_local`` zero entries to
+            # the flat tensor is therefore the same tensor as appending one zero
+            # row before the view. Only this order keeps ``total_tokens`` even.
+            pad_hidden = torch.zeros(
+                1, hidden, dtype=hidden_states.dtype, device=hidden_states.device
+            )
+            padded_hidden = torch.cat([hidden_states, pad_hidden], dim=0)
+            pad_masked = torch.zeros(
+                num_experts,
+                1,
+                dtype=expert_affinities_masked.dtype,
+                device=expert_affinities_masked.device,
+            )
+            expert_affinities_masked = torch.cat(
+                [expert_affinities_masked, pad_masked], dim=0
+            )
             # Preserve the direct-call interface for the existing chain.
             pre_activation = moe_gate_up_blockwise_fp8(
                 padded_hidden,

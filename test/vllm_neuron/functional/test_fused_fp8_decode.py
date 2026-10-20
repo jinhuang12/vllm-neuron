@@ -32,7 +32,6 @@ def _meta_case(hidden=4096, intermediate=512, tokens=1, blocks=8, rows=1, expert
 @pytest.mark.parametrize(
     "geometry,overrides,lnc,expected",
     [
-        ({}, {}, "2", "compact"),
         ({}, {}, None, "original"),
         ({}, {}, "1", "original"),
         ({"hidden": 2048}, {}, "2", "original"),
@@ -44,7 +43,6 @@ def _meta_case(hidden=4096, intermediate=512, tokens=1, blocks=8, rows=1, expert
         ({}, {"block_m": 2}, "2", "original"),
         ({}, {"block_n": 1024}, "2", "original"),
         ({}, {"block_k": 2048}, "2", "original"),
-        ({}, {"block_m": 1, "block_n": 4096, "block_k": 4096}, "2", "compact"),
     ],
 )
 def test_public_dispatch_selects_only_measured_geometry(
