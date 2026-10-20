@@ -22,6 +22,13 @@ Every pass writes an accumulator slot that none of its operands occupies: each
 chain alternates between two slots of one tile, and the tile is allocated whole,
 so a destination never aliases a source by construction.
 
+:func:`depthwise_conv1d_rows_kernel` takes the same convolution's input token-major
+instead: the left-context rows and the channel blocks as separate ``[T, C_i]``
+tensors, which a producer that writes rows emits without a concatenation or a
+transpose in HBM. Its step 1 loads 128-row blocks and turns each onto the channel
+partitions with one PE transpose, which moves the values unchanged, so the window
+holds the same values as the image form's and steps 2 and 3 are shared.
+
 Under LNC2 the wrap launches two programs. Each takes a contiguous share of the
 output columns, which keeps all of a tile's partitions busy at any channel count
 and leaves every output element computed by the same instructions whichever
@@ -110,12 +117,10 @@ def _window(x, rows, tap, cn, stride_w):
     return x[0:rows, tap:tap + (cn - 1) * stride_w + 1:stride_w]
 
 
-def _conv_tile(img_rows, out_rows, weights, row0, rows, tile, c0, cn, taps, stride_w,
-               pad_left):
-    """Output columns ``[c0, c0 + cn)`` of image rows ``[row0, row0 + rows)``.
+def _image_window(img_rows, row0, rows, c0, cn, taps, stride_w, pad_left):
+    """The input window of output columns ``[c0, c0 + cn)``, image rows ``[row0, row0 + rows)``.
 
-    ``tile`` indexes the channel tile's taps in ``weights``; ``rows`` is
-    ``PARTITION_MAX`` except on a channel tail.
+    One static DMA loads the columns inside the image; columns in the padding are zero.
     """
     width = img_rows.shape[1]
     window = (cn - 1) * stride_w + taps
@@ -132,7 +137,52 @@ def _conv_tile(img_rows, out_rows, weights, row0, rows, tile, c0, cn, taps, stri
                       dge_mode=nisa.dge_mode.none)
     if lead + loaded < window:
         nisa.memset(dst=x[0:rows, lead + loaded:window], value=0.0)
+    return x
 
+
+def _rows_window(history, block, b_ch0, h_ch0, c0, cn, taps):
+    """The input window of output columns ``[c0, c0 + cn)`` of ``PARTITION_MAX`` channels.
+
+    The convolution's input row ``r`` is ``history[r]`` for ``r < taps - 1``, else
+    ``block[r - taps + 1]``; the channels are columns ``b_ch0 ..`` of ``block`` and
+    ``h_ch0 ..`` of ``history``. Each run of up to ``PARTITION_MAX`` window rows loads
+    token-major and one PE transpose puts it on the channel partitions; the Vector and
+    Scalar engines take turns copying it out of PSUM.
+    """
+    window = cn + taps - 1
+    lead = taps - 1
+    x = nl.ndarray((PARTITION_MAX, window), dtype=block.dtype, buffer=nl.sbuf)
+    for k in range(_div_ceil(window, PARTITION_MAX)):
+        b0 = k * PARTITION_MAX
+        nb = min(PARTITION_MAX, window - b0)
+        r0 = c0 + b0
+        from_history = max(0, min(lead - r0, nb))
+        rows = nl.ndarray((PARTITION_MAX, PARTITION_MAX), dtype=block.dtype, buffer=nl.sbuf)
+        if from_history > 0:
+            nisa.dma_copy(dst=rows[0:from_history, 0:PARTITION_MAX],
+                          src=history[r0:r0 + from_history, h_ch0:h_ch0 + PARTITION_MAX],
+                          dge_mode=nisa.dge_mode.none)
+        if nb > from_history:
+            s0 = r0 + from_history - lead
+            nisa.dma_copy(dst=rows[from_history:nb, 0:PARTITION_MAX],
+                          src=block[s0:s0 + nb - from_history, b_ch0:b_ch0 + PARTITION_MAX],
+                          dge_mode=nisa.dge_mode.none)
+        flipped = nl.ndarray((PARTITION_MAX, PARTITION_MAX), dtype=block.dtype,
+                             buffer=nl.psum)
+        nisa.nc_transpose(dst=flipped[0:PARTITION_MAX, 0:nb],
+                          data=rows[0:nb, 0:PARTITION_MAX], engine=nisa.engine.tensor)
+        nisa.tensor_copy(dst=x[0:PARTITION_MAX, b0:b0 + nb],
+                         src=flipped[0:PARTITION_MAX, 0:nb],
+                         engine=nisa.engine.vector if k % 2 == 0 else nisa.engine.scalar)
+    return x
+
+
+def _conv_tile(x, out_rows, weights, row0, rows, tile, c0, cn, taps, stride_w):
+    """Output columns ``[c0, c0 + cn)``, output rows ``[row0, row0 + rows)``, from window ``x``.
+
+    ``tile`` indexes the channel tile's taps in ``weights``; ``rows`` is
+    ``PARTITION_MAX`` except on a channel tail.
+    """
     acc = nl.ndarray((PARTITION_MAX, CHAINS * SLOTS_PER_CHAIN, cn), dtype=nl.float32,
                      buffer=nl.sbuf)
     chain_taps = _div_ceil(taps, CHAINS)
@@ -204,11 +254,66 @@ def depthwise_conv1d_kernel(img, filt, pad_left, pad_right, stride_w):
                 cn = min(span, first_column + owned - c0)
                 if full_tiles > 0:
                     for tile in nl.affine_range(full_tiles):
-                        _conv_tile(img_rows, out_rows, weights,
-                                   batch * channels + tile * PARTITION_MAX, PARTITION_MAX,
-                                   tile, c0, cn, taps, stride_w, pad_left)
+                        row0 = batch * channels + tile * PARTITION_MAX
+                        x = _image_window(img_rows, row0, PARTITION_MAX, c0, cn, taps,
+                                          stride_w, pad_left)
+                        _conv_tile(x, out_rows, weights, row0, PARTITION_MAX, tile, c0, cn,
+                                   taps, stride_w)
                 if tail_rows > 0:
-                    _conv_tile(img_rows, out_rows, weights,
-                               batch * channels + full_tiles * PARTITION_MAX, tail_rows,
-                               full_tiles, c0, cn, taps, stride_w, pad_left)
+                    row0 = batch * channels + full_tiles * PARTITION_MAX
+                    x = _image_window(img_rows, row0, tail_rows, c0, cn, taps, stride_w,
+                                      pad_left)
+                    _conv_tile(x, out_rows, weights, row0, tail_rows, full_tiles, c0, cn,
+                               taps, stride_w)
+    return out
+
+
+@nki.jit
+def depthwise_conv1d_rows_kernel(history, block_a, block_b, block_c, filt):
+    """Stride-1 depthwise conv1d of a token-major input given as left context and blocks.
+
+    The convolution is :func:`depthwise_conv1d_kernel`'s with no padding and
+    ``stride_w = 1`` on the image ``cat(history, cat(blocks, -1)).t()``, which this
+    kernel never builds.
+
+    Args:
+        history: ``[S - 1, C]`` in HBM, the input rows before the first output's.
+        block_a, block_b, block_c: ``[T, C_i]`` in HBM, the input's channel blocks in
+            channel order, ``C_a + C_b + C_c = C``, each a multiple of ``PARTITION_MAX``.
+        filt: ``[C, 1, 1, S]`` in HBM at the dtype of the blocks, one filter per channel.
+
+    Returns:
+        ``[1, C, 1, T]`` in HBM at the dtype of the blocks, as
+        :func:`depthwise_conv1d_kernel` returns for that image.
+
+    Notes:
+        The caller checks the geometry and dtypes. Programs split the output columns
+        as :func:`depthwise_conv1d_kernel`'s do.
+    """
+    blocks = (block_a, block_b, block_c)
+    tokens = block_a.shape[0]
+    channels = history.shape[1]
+    taps = filt.shape[3]
+    out = nl.ndarray((1, channels, 1, tokens), dtype=block_a.dtype, buffer=nl.shared_hbm)
+    out_rows = out.reshape((channels, tokens))
+    weights = _load_taps(filt, channels, taps)
+
+    share = _div_ceil(tokens, nl.num_programs(axes=0))
+    first_column = nl.program_id(axis=0) * share
+    owned = min(share, tokens - first_column)
+    if owned > 0:
+        n_col = _div_ceil(owned, column_tile_cap(taps, 1))
+        span = _div_ceil(owned, n_col)
+        for col in range(n_col):
+            c0 = first_column + col * span
+            cn = min(span, first_column + owned - c0)
+            tile = 0
+            for index in range(len(blocks)):
+                block = blocks[index]
+                for block_tile in range(block.shape[1] // PARTITION_MAX):
+                    x = _rows_window(history, block, block_tile * PARTITION_MAX,
+                                     tile * PARTITION_MAX, c0, cn, taps)
+                    _conv_tile(x, out_rows, weights, tile * PARTITION_MAX, PARTITION_MAX,
+                               tile, c0, cn, taps, 1)
+                    tile += 1
     return out

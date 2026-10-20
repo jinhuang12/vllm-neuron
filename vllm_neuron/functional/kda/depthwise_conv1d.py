@@ -11,6 +11,10 @@ Under ``NEURON_LOGICAL_NC_CONFIG=2`` the kernel launches on :data:`LNC_SHARDS`
 programs that split the output columns, at every admissible geometry; otherwise
 it launches on one.
 
+:func:`depthwise_conv1d_rows` is the same convolution, stride 1 and unpadded, of an
+input given token-major in pieces: the left-context rows and :data:`ROW_BLOCKS`
+channel blocks, as the KDA layer holds them, so the caller builds no image.
+
 A refused geometry raises; it never routes to the torch reference.
 """
 
@@ -25,8 +29,10 @@ from torch import Tensor
 
 from vllm_neuron.functional.dsa.launch_grid import lnc_pair
 from vllm_neuron.functional.kda.depthwise_conv1d_kernel import (
+    PARTITION_MAX,
     TAP_SLOTS_MAX,
     depthwise_conv1d_kernel,
+    depthwise_conv1d_rows_kernel,
     tap_slots,
 )
 from vllm_neuron.utils.neuron_utils import can_run_kernel
@@ -57,15 +63,22 @@ UNIT_DILATION = (1, 1)
 #: Dtypes the kernel loads and stores; it accumulates in float32 whichever it is.
 _KERNEL_DTYPES = (torch.float32, torch.bfloat16, torch.float16)
 
+#: Channel blocks :func:`depthwise_conv1d_rows` takes, in channel order: the KDA
+#: layer's q, k and v streams, which its input projections write as three tensors.
+ROW_BLOCKS = 3
+
 __all__ = [
     "LNC_SHARDS",
     "NO_PADDING",
+    "ROW_BLOCKS",
     "SINGLETON_H",
     "UNIT_DILATION",
     "UNIT_STRIDE",
     "KdaDepthwiseConv1dError",
     "can_run_depthwise_conv1d",
+    "carried_rows",
     "depthwise_conv1d",
+    "depthwise_conv1d_rows",
     "depthwise_conv1d_torch_reference",
     "dispatch_counters",
     "kernel_identity",
@@ -111,6 +124,32 @@ def output_width(
     return (padded - kernel_size) // stride_w + 1
 
 
+def _filter_problems(filt: Tensor, channels: int, dtype: torch.dtype) -> list[str]:
+    """What is wrong with a 4-D ``filt`` for ``channels`` inputs of ``dtype``."""
+    problems: list[str] = []
+    if int(filt.shape[0]) != channels:
+        problems.append(
+            f"filter channel extent {int(filt.shape[0])} does not match the "
+            f"img channel extent {channels}; a depthwise convolution carries "
+            f"one filter per channel"
+        )
+    if int(filt.shape[1]) != SINGLETON_H or int(filt.shape[2]) != SINGLETON_H:
+        problems.append(
+            f"filter must be [C, 1, 1, S], got {tuple(filt.shape)}"
+        )
+    if dtype != filt.dtype:
+        problems.append(
+            f"img dtype {dtype} and filter dtype {filt.dtype} differ; a call "
+            f"carries one precision, the output's"
+        )
+    if dtype not in _KERNEL_DTYPES:
+        problems.append(
+            f"dtype {dtype} is not one of {_KERNEL_DTYPES}, the dtypes the "
+            f"kernel loads and stores"
+        )
+    return problems
+
+
 def _require_admissible(
     img: Tensor,
     filt: Tensor,
@@ -150,26 +189,7 @@ def _require_admissible(
             f"img height extent is {int(img.shape[2])}, must be {SINGLETON_H}: "
             f"this is a 1-D convolution in a 2-D argument layout"
         )
-    if int(filt.shape[0]) != channels:
-        problems.append(
-            f"filter channel extent {int(filt.shape[0])} does not match the "
-            f"img channel extent {channels}; a depthwise convolution carries "
-            f"one filter per channel"
-        )
-    if int(filt.shape[1]) != SINGLETON_H or int(filt.shape[2]) != SINGLETON_H:
-        problems.append(
-            f"filter must be [C, 1, 1, S], got {tuple(filt.shape)}"
-        )
-    if img.dtype != filt.dtype:
-        problems.append(
-            f"img dtype {img.dtype} and filter dtype {filt.dtype} differ; a call "
-            f"carries one precision, the output's"
-        )
-    if img.dtype not in _KERNEL_DTYPES:
-        problems.append(
-            f"dtype {img.dtype} is not one of {_KERNEL_DTYPES}, the dtypes the "
-            f"kernel loads and stores"
-        )
+    problems += _filter_problems(filt, channels, img.dtype)
     if tuple(padding[0]) != (0, 0):
         problems.append(
             f"height padding {padding[0]} must be (0, 0): the height axis is a "
@@ -201,13 +221,13 @@ def _require_admissible(
     output_width(int(img.shape[3]), int(filt.shape[3]), padding, stride)
 
 
-def _require_capacity(img: Tensor, filt: Tensor) -> None:
+def _require_capacity(channels: int, taps: int) -> None:
     """The kernel holds every channel tile's taps in one SBUF tile; refuse more."""
-    slots = tap_slots(int(img.shape[1]), int(filt.shape[3]))
+    slots = tap_slots(channels, taps)
     if slots > TAP_SLOTS_MAX:
         raise KdaDepthwiseConv1dError(
-            f"kda depthwise conv1d refuses this call: C={int(img.shape[1])} channels "
-            f"of S={int(filt.shape[3])} taps need {slots} float32 tap slots per "
+            f"kda depthwise conv1d refuses this call: C={channels} channels "
+            f"of S={taps} taps need {slots} float32 tap slots per "
             f"partition, more than the kernel's weight tile holds "
             f"(TAP_SLOTS_MAX={TAP_SLOTS_MAX})"
         )
@@ -277,7 +297,7 @@ def can_run_depthwise_conv1d(
     _require_admissible(
         img, filt, padding, stride, rhs_dilation, lhs_dilation, batch_group_count
     )
-    _require_capacity(img, filt)
+    _require_capacity(int(img.shape[1]), int(filt.shape[3]))
     return can_run_kernel(img)
 
 
@@ -337,6 +357,141 @@ def depthwise_conv1d(
         call = call[LNC_SHARDS]
     pad_left, pad_right = padding[1]
     return call(img, filt, int(pad_left), int(pad_right), int(stride[1]))
+
+
+def _rows_image(history: Tensor, blocks: tuple[Tensor, ...]) -> Tensor:
+    """The ``[1, C, 1, S - 1 + T]`` image the token-major pieces stand for."""
+    padded = torch.cat((history, torch.cat(blocks, dim=-1)), dim=0)
+    return padded.t().contiguous().reshape(1, padded.shape[1], 1, padded.shape[0])
+
+
+def _require_rows_admissible(
+    history: Tensor, blocks: tuple[Tensor, ...], filt: Tensor
+) -> None:
+    """Every condition of the token-major form, checked in one place.
+
+    The convolution is :func:`depthwise_conv1d`'s at stride 1 with no padding, so
+    the filter's conditions are that form's. The kernel turns ``PARTITION_MAX``
+    channels of a block onto the partitions at a time, so every block is a whole
+    number of channel tiles.
+    """
+    problems: list[str] = []
+    if len(blocks) != ROW_BLOCKS:
+        raise KdaDepthwiseConv1dError(
+            f"kda depthwise conv1d refuses this call: {len(blocks)} channel blocks, "
+            f"the token-major form takes {ROW_BLOCKS}"
+        )
+    if history.dim() != 2 or any(block.dim() != 2 for block in blocks):
+        raise KdaDepthwiseConv1dError(
+            "kda depthwise conv1d refuses this call: history and blocks must be 2-D "
+            f"[rows, channels], got {tuple(history.shape)} and "
+            f"{[tuple(block.shape) for block in blocks]}"
+        )
+    if filt.dim() != 4:
+        raise KdaDepthwiseConv1dError(
+            f"kda depthwise conv1d refuses this call: filter must be 4-D "
+            f"[C, 1, 1, S], got {filt.dim()}-D {tuple(filt.shape)}"
+        )
+    tokens = int(blocks[0].shape[0])
+    if tokens < 1:
+        problems.append("the blocks hold no token")
+    for index, block in enumerate(blocks):
+        if int(block.shape[0]) != tokens:
+            problems.append(
+                f"block {index} has {int(block.shape[0])} tokens, block 0 {tokens}"
+            )
+        if int(block.shape[1]) % PARTITION_MAX:
+            problems.append(
+                f"block {index} has {int(block.shape[1])} channels, not a multiple "
+                f"of {PARTITION_MAX}"
+            )
+        if block.dtype != history.dtype:
+            problems.append(
+                f"block {index} dtype {block.dtype} differs from the history's "
+                f"{history.dtype}"
+            )
+    channels = sum(int(block.shape[1]) for block in blocks)
+    if int(history.shape[1]) != channels:
+        problems.append(
+            f"history has {int(history.shape[1])} channels, the blocks {channels}"
+        )
+    if int(history.shape[0]) != int(filt.shape[3]) - 1:
+        problems.append(
+            f"history has {int(history.shape[0])} rows, the S={int(filt.shape[3])} "
+            f"taps need S - 1"
+        )
+    problems += _filter_problems(filt, channels, history.dtype)
+    if problems:
+        raise KdaDepthwiseConv1dError(
+            "kda depthwise conv1d refuses this call: " + "; ".join(problems)
+        )
+    _require_capacity(channels, int(filt.shape[3]))
+
+
+def depthwise_conv1d_rows(
+    history: Tensor, blocks: tuple[Tensor, ...], filt: Tensor
+) -> Tensor:
+    """Stride-1 unpadded depthwise conv1d of a token-major input given in pieces.
+
+    The result is :func:`depthwise_conv1d`'s on the image
+    ``cat(history, cat(blocks, -1)).t()``, bit for bit: the kernel puts the same
+    values in the same window and runs the same passes on them. The image is never
+    built.
+
+    Args:
+        history: ``[S - 1, C]``, the input rows before the first output's.
+        blocks: :data:`ROW_BLOCKS` tensors ``[T, C_i]`` in channel order, each
+            ``C_i`` a multiple of ``PARTITION_MAX``, at the history's dtype.
+        filt: ``[C, 1, 1, S]`` depthwise taps, one filter per channel.
+
+    Returns:
+        ``[1, C, 1, T]`` at the input dtype.
+
+    Raises:
+        KdaDepthwiseConv1dError: on an inadmissible geometry or dtype.
+    """
+    blocks = tuple(blocks)
+    _require_rows_admissible(history, blocks, filt)
+    if not can_run_kernel(history):
+        _count_torch_fallback()
+        logger.debug(
+            "depthwise_conv1d_rows: NKI route unavailable, using the torch "
+            "reference (reference only, not the shipped path)"
+        )
+        return depthwise_conv1d_torch_reference(_rows_image(history, blocks), filt)
+
+    _count_nki_dispatch()
+    call = wrap_nki(depthwise_conv1d_rows_kernel)
+    if lnc_pair():
+        call = call[LNC_SHARDS]
+    return call(history, *blocks, filt)
+
+
+def carried_rows(
+    history: Tensor, blocks: tuple[Tensor, ...], real_length: Tensor
+) -> Tensor:
+    """Rows ``L .. L + S - 2`` of the input ``cat(history, cat(blocks, -1))``, unbuilt.
+
+    The left context the next step convolves with: the last ``S - 1`` rows of a
+    sequence whose real length in this step is ``L``. Row ``r`` of the input is
+    ``history[r]`` below ``S - 1`` and token ``r - S + 1`` of the blocks above it,
+    so a step of fewer than ``S - 1`` real rows keeps the older rows it still needs.
+
+    Args:
+        history: ``[S - 1, C]``, the input rows before the first token's.
+        blocks: ``[T, C_i]`` tensors in channel order, ``sum C_i = C``.
+        real_length: int64 scalar ``L``, ``0 <= L <= T``.
+
+    Returns:
+        ``[S - 1, C]``, selected rows only: the values are the input's bits.
+    """
+    lead = int(history.shape[0])
+    row = torch.arange(lead, device=history.device) + real_length
+    from_tokens = torch.cat(
+        [block.index_select(0, (row - lead).clamp(min=0)) for block in blocks], dim=-1
+    )
+    from_history = history.index_select(0, row.clamp(max=lead - 1))
+    return torch.where((row < lead).unsqueeze(-1), from_history, from_tokens)
 
 
 def depthwise_conv1d_torch_reference(
