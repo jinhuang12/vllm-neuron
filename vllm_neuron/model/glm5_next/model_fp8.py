@@ -3529,6 +3529,7 @@ class Glm5NextDenseMLP(nn.Module):
         hidden_states: torch.Tensor,
         *,
         quant_config: Glm5NextQuantConfig,
+        partial_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         """One dense layer's MLP: three projections and a clamped SwiGLU.
 
@@ -3558,10 +3559,15 @@ class Glm5NextDenseMLP(nn.Module):
             quant_config: the resolved per-model quantisation policy, and the
                 route selector. An argument rather than a field, because no module
                 in this file holds a policy.
+            partial_dtype: the dtype the caller rounds this output to before its
+                row-parallel sum, or None when it sums in fp32. With bfloat16 the
+                prefill kernel rounds in its store, the same one rounding, and stores
+                half the bytes (``blockwise_fp8_mlp``'s ``out_dtype``).
 
         Returns:
-            ``[T, H]`` fp32 -- the kernel's own return dtype, not re-cast here.
-            The layer forward decides the residual dtype.
+            ``[T, H]`` fp32 -- the kernel's own return dtype, not re-cast here --
+            or bf16 with ``partial_dtype`` bf16. The layer forward decides the
+            residual dtype.
 
         Raises:
             Glm5NextDenseMLPRouteError: when ``quant_config`` resolved no
@@ -3670,6 +3676,7 @@ class Glm5NextDenseMLP(nn.Module):
                 scale_grid("down_proj_weight"),
                 swiglu_limit=self.swiglu_limit,
                 prebuilt_scale_t=prebuilt_scale_t,
+                out_dtype=partial_dtype,
             ),
             tokens,
         )
@@ -4812,8 +4819,13 @@ class Glm5NextKDAAttention(nn.Module):
         # builds this half as a gated RMSNorm whose activation is sigmoid
         # (``kimi_gdn_linear_attn.py``), which is why the raw gate is passed
         # through a sigmoid here and not through a silu. On the fused kernel or
-        # the torch expressions (functional/glue/kda_output.py).
-        attn_out = kda_gated_projection(core, out_gate, self, phase=phase)
+        # the torch expressions (functional/glue/kda_output.py). Where the reduction
+        # below rounds the partial to its wire dtype first, the producer stores it in
+        # that dtype: the same one rounding, without a separate cast pass.
+        wire = _row_parallel_wire_dtype(int(core.shape[0]), module=self)
+        attn_out = kda_gated_projection(
+            core, out_gate, self, phase=phase, out_dtype=wire or torch.float32
+        )
         # ``o_proj_weight`` is row-parallel, so this is one rank's partial sum.
         # Reduce it before the cast below, in the wire dtype ``collective_policy``
         # names for this step: by default bf16 at a prefill chunk, which rounds each
@@ -8161,8 +8173,17 @@ class Glm5NextMLAAttention(nn.Module):
                 f"{self.v_head_dim}] or [tokens, {expected_width}]; got "
                 f"{tuple(attn_out.shape)}"
             )
+        # Where the reduction below rounds the partial to its wire dtype first, the
+        # projection stores it in that dtype: the same one rounding, without a separate
+        # cast pass. The layer-stream dump reads the fp32 partial, so a collecting
+        # forward keeps it.
+        wire = (
+            None if collector is not None
+            else _row_parallel_wire_dtype(int(x.shape[0]), module=self)
+        )
         projected = mla_projection_prepared(
-            x.contiguous(), self._prepared_weight("o_proj"), lowp
+            x.contiguous(), self._prepared_weight("o_proj"), lowp,
+            out_dtype=wire or torch.float32,
         )
         if collector is not None:
             # The partial is cloned and the input is not. On the fp32 wire the reduction
@@ -10134,7 +10155,12 @@ class Glm5NextModel(nn.Module):
                 prefill_step=layer.step_rows.phase(int(normed.shape[0])) == "prefill",
             )
         elif isinstance(mlp, Glm5NextDenseMLP):
-            out = mlp(normed, quant_config=quant_config)
+            # The same: the dense MLP stores its partial in the wire dtype.
+            out = mlp(
+                normed,
+                quant_config=quant_config,
+                partial_dtype=_row_parallel_wire_dtype(normed.shape[0], module=layer),
+            )
         else:
             raise ValueError(
                 f"layer {getattr(layer, 'layer_idx', '?')} holds an MLP of type "
@@ -10169,10 +10195,10 @@ class Glm5NextModel(nn.Module):
         # row-parallel site uses.
         #
         # Before the cast, and on the fp32 wire that ordering is the load-bearing part.
-        # ``out`` is the kernel's own dtype here (fp32 on the dense route), so the
-        # partial sums are added at the width they were computed in; reducing after the
-        # cast below would round each rank's fraction to the caller's dtype and add the
-        # rounded parts instead of rounding the whole.
+        # ``out`` is the kernel's own dtype here (fp32 on the dense route at an fp32
+        # wire), so the partial sums are added at the width they were computed in;
+        # reducing after the cast below would round each rank's fraction to the caller's
+        # dtype and add the rounded parts instead of rounding the whole.
         #
         # The fp32 wire reduces in place, which is safe against aliasing for the same
         # reason it is at ``project_output``: both branches return a freshly allocated
