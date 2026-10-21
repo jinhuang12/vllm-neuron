@@ -7782,7 +7782,7 @@ class Glm5NextMLAAttention(nn.Module):
     # way round would put a transpose back on the per-forward path, which is the one
     # cost this preparation exists to avoid.
 
-    #: Attribute the two absorb operands are cached on. A plain attribute for the
+    #: Attribute the absorb operands are cached on. A plain attribute for the
     #: same reason ``PREPARED_WEIGHTS_ATTR`` is one: a buffer enters
     #: ``state_dict()``, which would duplicate a 32 MB weight in every saved
     #: checkpoint.
@@ -7804,9 +7804,10 @@ class Glm5NextMLAAttention(nn.Module):
         width is a property of one head.
 
         With ``VLLM_NEURON_MLA_NATIVE_KV`` on, the same split also gives the native
-        K/V write its key projection, ``W_K``: the key half as it already stands,
-        ``[H, kv_lora_rank, qk_nope_head_dim]``, so ``key = latent @ W_K[h]``. Its
-        value projection is ``W_UV[h]`` itself.
+        K/V write its two projections, both contracting the latent: ``W_K``, the key
+        half as it already stands, ``[H, kv_lora_rank, qk_nope_head_dim]``, so
+        ``key = latent @ W_K[h]``, and ``W_V``, the value half, laid out as ``W_UV``,
+        so ``value = latent @ W_V[h]``.
         """
         from vllm_neuron import envs
 
@@ -7817,7 +7818,10 @@ class Glm5NextMLAAttention(nn.Module):
             ("W_UV", heads, latent, self.v_head_dim),
         )
         if envs.VLLM_NEURON_MLA_NATIVE_KV:
-            widths += (("W_K", heads, latent, self.qk_nope_head_dim),)
+            widths += (
+                ("W_K", heads, latent, self.qk_nope_head_dim),
+                ("W_V", heads, latent, self.v_head_dim),
+            )
         return widths
 
     def prepare_absorb_weights(self) -> int:
@@ -7835,8 +7839,11 @@ class Glm5NextMLAAttention(nn.Module):
         exactly the right shapes.
 
         The split is a rearrangement and nothing else. Every element of both
-        operands is an element of the prepared weight, in the prepared weight's own
-        dtype: no cast, no scale, no arithmetic.
+        absorb operands is an element of the prepared weight, in the prepared
+        weight's own dtype: no cast, no scale, no arithmetic. The native K/V write's
+        two operands are the one exception: each element is rounded once, here, to
+        the latent cache dtype, because the write multiplies 2-byte operands and a
+        cast in the graph would run on every prefill chunk.
 
         The head count below is this rank's, and every line after it -- the closed
         form, the reshape, the two permutes, the width comparison -- is already
@@ -7877,10 +7884,17 @@ class Glm5NextMLAAttention(nn.Module):
         }
         widths = self.absorb_widths()
         if any(name == "W_K" for name, *_ in widths):
-            # [latent, heads, nope] -> [heads, latent, nope]: the key half as it
-            # stands, because the native K/V write contracts the latent.
+            # [latent, heads, width] -> [heads, latent, width] for both halves, because
+            # the native K/V write contracts the latent, each rounded to the cache
+            # dtype the write's other operands hold.
+            cache_dtype = self.cache_dtype
             operands["W_K"] = _relaid_out_on_the_host(
-                per_head, lambda host: host[:, :, :nope].permute(1, 0, 2)
+                per_head,
+                lambda host: host[:, :, :nope].permute(1, 0, 2).to(cache_dtype),
+            )
+            operands["W_V"] = _relaid_out_on_the_host(
+                per_head,
+                lambda host: host[:, :, nope:].permute(1, 0, 2).to(cache_dtype),
             )
         for name, exp_heads, contraction, out_features in widths:
             got = tuple(operands[name].shape)
@@ -8303,11 +8317,12 @@ class Glm5NextMLAAttention(nn.Module):
 
         ``written`` is ``[tokens, kv_lora_rank]``, the chunk's latent rows as the bank
         received them (a padded row repeats the last real one). Each token's key is
-        ``written @ W_K[0]`` and its value ``written @ W_UV[0]``, the two halves of this
-        rank's ``kv_b_proj``, rounded once to the cache dtype; a non-finite value
-        element is stored as 0.0 (``mla_native_kv.mla_native_kv_write``). Page ``j`` of
-        the chunk lands in block ``native_kv_pages[j]``. The return is the kernel's
-        result, which the backend hands to every later operation on the cache.
+        ``written @ W_K[0]`` and its value ``written @ W_V[0]``, the two halves of this
+        rank's ``kv_b_proj`` in the cache dtype, each product accumulated in float32
+        and rounded once to the cache dtype; a non-finite value element is stored as
+        0.0 (``mla_native_kv.mla_native_kv_write``). Page ``j`` of the chunk lands in
+        block ``native_kv_pages[j]``. The return is the kernel's result, which the
+        backend hands to every later operation on the cache.
         """
         from vllm_neuron.functional.attention.mla_native_kv import mla_native_kv_write
 
@@ -8319,15 +8334,16 @@ class Glm5NextMLAAttention(nn.Module):
                 f"attention head per rank"
             )
         operands = getattr(self, self.ABSORB_WEIGHTS_ATTR, None) or {}
-        if "W_K" not in operands:
+        if "W_K" not in operands or "W_V" not in operands:
             raise Glm5NextMLADecodeError(
-                "the native K/V write needs W_K, which prepare_absorb_weights() splits "
-                "only with VLLM_NEURON_MLA_NATIVE_KV on at load time"
+                "the native K/V write needs W_K and W_V, which "
+                "prepare_absorb_weights() splits only with VLLM_NEURON_MLA_NATIVE_KV "
+                "on at load time"
             )
         return mla_native_kv_write(
             written,
             operands["W_K"][0],
-            self._absorb_weight("W_UV")[0],
+            operands["W_V"][0],
             native_kv_pages,
             native_kv_cache,
             int(page_size),
