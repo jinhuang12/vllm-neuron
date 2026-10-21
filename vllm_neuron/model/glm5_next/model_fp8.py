@@ -7807,7 +7807,8 @@ class Glm5NextMLAAttention(nn.Module):
         K/V write its two projections, both contracting the latent: ``W_K``, the key
         half as it already stands, ``[H, kv_lora_rank, qk_nope_head_dim]``, so
         ``key = latent @ W_K[h]``, and ``W_V``, the value half, laid out as ``W_UV``,
-        so ``value = latent @ W_V[h]``.
+        so ``value = latent @ W_V[h]``. Both are rounded once to the cache dtype at
+        load time (:meth:`prepare_absorb_weights`).
         """
         from vllm_neuron import envs
 
@@ -8318,11 +8319,11 @@ class Glm5NextMLAAttention(nn.Module):
         ``written`` is ``[tokens, kv_lora_rank]``, the chunk's latent rows as the bank
         received them (a padded row repeats the last real one). Each token's key is
         ``written @ W_K[0]`` and its value ``written @ W_V[0]``, the two halves of this
-        rank's ``kv_b_proj`` in the cache dtype, each product accumulated in float32
-        and rounded once to the cache dtype; a non-finite value element is stored as
-        0.0 (``mla_native_kv.mla_native_kv_write``). Page ``j`` of the chunk lands in
-        block ``native_kv_pages[j]``. The return is the kernel's result, which the
-        backend hands to every later operation on the cache.
+        rank's ``kv_b_proj`` rounded once to the cache dtype at load time, each product
+        accumulated in float32 and rounded once to the cache dtype; a non-finite value
+        element is stored as 0.0 (``mla_native_kv.mla_native_kv_write``). Page ``j`` of
+        the chunk lands in block ``native_kv_pages[j]``. The return is the kernel's
+        result, which the backend hands to every later operation on the cache.
         """
         from vllm_neuron.functional.attention.mla_native_kv import mla_native_kv_write
 

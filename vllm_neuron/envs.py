@@ -708,12 +708,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0.0, and a chunk the dense-masked route takes attends those pages at the head
     # width (``functional/attention/mla_native_kv.py``): no query lift and no value
     # projection, and the score and value matmuls at the key and value widths (256)
-    # in place of the latent width (512). Kernel alone on trn2 with 1,024 queries at
-    # 2,048 pages, the native call took 5.1 ms against the latent pass's 6.6 ms, and
-    # the write 57 us per layer and chunk. The cache costs the latent bank's bytes
+    # in place of the latent width (512). The cache costs the latent bank's bytes
     # again at one head per rank, which the KV budget counts beside the bank. Only
-    # prefill graphs change: decode reads the latent bank. The keys and values carry
-    # one rounding each where the latent form rounds the lifted query and its
+    # prefill graphs change: decode reads the latent bank. The write's two halves of
+    # kv_b_proj are rounded once to the cache dtype at load time and each stored key
+    # and value once more, where the latent form rounds the lifted query and its
     # latent-wide output, so the two forms are not value-equal (a bf16 K/V class).
     # Serves one attention head per rank, decode context parallelism 1, prefix caching
     # off and prefill chunks of whole pages; the runner refuses anything else. Read at
