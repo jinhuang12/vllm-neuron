@@ -6958,7 +6958,7 @@ class Glm5NextDSAIndexer(nn.Module):
             dsa_decode_ring_rows,
             max_rows_for,
         )
-        from vllm_neuron.functional.dsa.decode_trow import dsa_decode_scores_rows
+        from vllm_neuron.functional.dsa.decode_trow_wide import decode_scores_rows_for
         from vllm_neuron.functional.dsa.kpool_hadamard import dsa_hadamard128
         from vllm_neuron.functional.state_banks import shared_store_problem
         from vllm_neuron.utils.neuron_utils import values_are_readable
@@ -7167,7 +7167,9 @@ class Glm5NextDSAIndexer(nn.Module):
                     candidates=candidates, pool_size=pool,
                 )
             else:
-                bounded = dsa_decode_scores_rows(
+                # The T-row kernel of the static candidate axis: one output transpose
+                # up to 16384 candidates, groups of 128 tiles above (decode_trow_wide).
+                bounded = decode_scores_rows_for(candidates)(
                     query, weights, pool_bank, slots, position, pooled,
                     candidates=candidates, pool_size=pool,
                     rotate_query=not query_rotated,
