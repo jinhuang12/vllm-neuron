@@ -503,11 +503,8 @@ def _build_prefill_pair_group_ranks(
     so a rank's index in its pair group (0 in the first prefill group, 1 in the
     second) is also the position of its rows in the gathered tensor.
 
-    On one trn2 node at LNC2 (64 ranks, rank ``r`` on chip ``r // 4``, chips numbered
-    row by row on the 4 x 4 torus) the partner is ``r ^ 48``: chip ``c`` with chip
-    ``c ^ 12``, the same column of the mirrored torus row, which is a neighbouring row
-    (rows 0 and 3 meet across the wrap, rows 1 and 2 directly). The first prefill
-    group is torus rows 0 and 1, the second rows 2 and 3.
+    At 64 ranks the partner of rank ``r`` is ``r ^ 48``: at LNC2, with rank ``r`` on
+    chip ``r // 4``, chip ``c`` pairs with chip ``c ^ 12``.
 
     Example: world_size=8
       prefill groups: [[0,1,2,3], [4,5,6,7]]
