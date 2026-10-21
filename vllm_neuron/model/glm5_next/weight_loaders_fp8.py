@@ -3,13 +3,15 @@
 GLM-5.3-Flash (Glm5Next) weight loading
 =======================================
 
-Two layers, in this order:
+Three parts, in this order:
 
 * Host-side key routing -- the shard index, the ``{param_name: checkpoint_key}``
   mapping builder, and the coverage reconciliation over the two. Nothing here
   reads a tensor value.
 * Blockwise-FP8 numerics -- the scale loaders, the 240-max downscale, the
   expert-bank stackers -- below the seam marked further down this module.
+* The pair shard load -- :func:`load_pair_shards`, which reads a second rank's
+  shard through the loaders above, by the map in ``pair_shards.py``.
 
 Why the shard index is a per-shard key list, not a ``{key: shard}`` dict
 -----------------------------------------------------------------------
@@ -40,11 +42,16 @@ import json
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 from .config import DSA_LAYER_TYPE, Glm5NextTextConfig
 from .mtp import BLOCK_ATTR, shadow_draft_k
 from .quantization import keeps_bf16
+
+if TYPE_CHECKING:
+    from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
+
+    from .pair_shards import PairShardLoad, PartnerTensor
 
 #: The HF shard-index filename. Read for its ``weight_map`` object; see
 #: :meth:`Glm5NextShardIndex.from_weight_map` for why loading it is lossy.
@@ -2924,3 +2931,228 @@ def stacked_expert_scale_loader(
     return SafetensorsWeightLoader(
         transform=_stacked_bank_transform(layout, resolve, param_name, stack)
     )
+
+
+# --------------------------------------------------------------------------- #
+# The pair shard load.
+#
+# The chunk-pair prefill gives each rank a second tensor-parallel shard, its
+# partner's (``pair_shards.py`` holds the map). This is the load of that shard: the
+# same loaders as the own load, called at the partner's rank, attached beside the own
+# tensors under ``partner_`` names.
+# --------------------------------------------------------------------------- #
+
+
+def _partner_bank_placement(
+    owner: object,
+    rank: int,
+    world: int,
+    param_name: str,
+    placements: dict[int, Callable[[int], ExpertMeshPlacement]],
+) -> Callable[[int], ExpertMeshPlacement] | None:
+    """The mesh placement a partner bank is read with, checked once per degree.
+
+    ``None`` at expert-parallel degree 1, where no placement is read: every expert is
+    local and the column is the rank's own place in the world.
+
+    Above it, the mesh is first asked for ``rank`` -- this process's own rank -- and
+    the answer must equal what this process's groups say, through the same two
+    readers the own bank was loaded with. A mesh that disagrees with the groups would
+    place the partner's experts by a layout the own experts were not placed by, so
+    the load refuses before it reads a byte. Since the groups answer for this process,
+    the check also refuses a ``rank`` that is not this process's own.
+    """
+    ep_degree = int(getattr(owner, "ep_degree", 1))
+    if ep_degree <= 1:
+        return None
+    if ep_degree in placements:
+        return placements[ep_degree]
+    placement = expert_mesh_placement(world, ep_degree)
+    mesh = placement(rank)
+    groups = ExpertMeshPlacement(
+        partition=int(_expert_parallel_rank_map(owner, param_name)(rank)),
+        column=_expert_parallel_shard_column(
+            rank, world // ep_degree, ep_degree, param_name
+        ),
+    )
+    if mesh != groups:
+        _refuse(
+            param_name,
+            f"would have its partner read by the expert-parallel mesh, which places "
+            f"rank {rank} at partition {mesh.partition}, column {mesh.column}, while "
+            f"this process's groups place it at partition {groups.partition}, column "
+            f"{groups.column}. The partner's experts would then follow a layout the "
+            f"own experts do not, so the pair load is refused.",
+        )
+    placements[ep_degree] = placement
+    return placement
+
+
+def _load_partner_tensor(
+    entry: PartnerTensor,
+    slices: list,
+    partner: int,
+    placement: Callable[[int], ExpertMeshPlacement] | None,
+    block_size: tuple[int, int] | None,
+) -> torch.Tensor:
+    """Read one partner tensor on the host, by the loader the own tensor was read by.
+
+    Each form takes the own load's own route: a parameter the loader
+    :func:`loader_for_mapped_keys` attaches to its placeholder, then the cast the
+    pipelined reader makes to the placeholder dtype; a bank's grids
+    :func:`stacked_expert_scale_loader`; a weight's lone grid
+    :func:`sharded_scale_grid_loader` on its weight's geometry. The rank is the
+    partner's, which is the only argument that differs from the own load.
+    """
+    from .pair_shards import PARTNER_BANK_SCALE_GRID, PARTNER_PARAMETER
+
+    if entry.form == PARTNER_PARAMETER:
+        loader = loader_for_mapped_keys(
+            entry.checkpoint_keys,
+            param_name=entry.param_name,
+            owner=entry.module,
+            geometry=entry.geometry,
+            placement=placement,
+        )
+        tensor = (loader or SafetensorsWeightLoader()).load(slices, partner)
+        return tensor if tensor.dtype == entry.dtype else tensor.to(entry.dtype)
+    if entry.form == PARTNER_BANK_SCALE_GRID:
+        loader = stacked_expert_scale_loader(
+            entry.checkpoint_keys,
+            param_name=entry.param_name,
+            owner=entry.module,
+            geometry=entry.geometry,
+            block_size=block_size,
+            placement=placement,
+        )
+    else:
+        loader = sharded_scale_grid_loader(entry.geometry, entry.param_name, block_size)
+    return loader.load(slices, partner).to(dtype=entry.dtype)
+
+
+def load_pair_shards(
+    model: torch.nn.Module,
+    rank: int,
+    world: int,
+    *,
+    checkpoint: SafetensorsCheckpoint,
+    device: torch.device,
+) -> PairShardLoad:
+    """Attach the shard of ``rank``'s partner to ``model``, beside the own shard.
+
+    The seam the pair layout loads through. After it, every tensor whose shard differs
+    between ranks has a partner on the same module, named ``partner_<leaf>``, in the
+    form of its own counterpart -- a parameter beside a parameter, a plain attribute
+    beside an out-of-band scale grid -- in the same dtype, on ``device``. The partner
+    holds exactly the bytes today's load gives the partner rank for that tensor: the
+    same weight map, the same loaders, the same cast, called at rank
+    :func:`~vllm_neuron.model.glm5_next.pair_shards.partner_rank` instead of
+    ``rank``. The one input today's load reads elsewhere is a bank's expert
+    placement, which comes off this process's groups and so describes this process
+    alone; the partner's is read off the mesh those groups are built from.
+
+    The own tensors are untouched: no own tensor is read, replaced or moved, so the
+    call may come before or after the load-time preps. What the call reads off the
+    model is its structure -- the declared parameters, their dtypes, the owners'
+    shard and expert geometry -- which the preps leave as declared. Preparing the
+    partner tensors is the caller's, as preparing the own ones is ``load_weights``'s.
+    A replicated tensor gets no partner, since its bytes are the same on both ranks.
+
+    Args:
+        model: the root, built at ``world`` ranks, with its own shard loaded or about
+            to be.
+        rank: this process's rank.
+        world: the world size the model was built at.
+        checkpoint: the reader to read the partner shard through. The own load's
+            reader, or the shape-only reader of ``load_weights_lite``, under which every
+            partner tensor is a meta tensor of its real shape.
+        device: where the partner tensors are put, as ``load_weights`` puts the own.
+
+    Returns:
+        The record of what was attached, with the partner bytes.
+
+    Raises before attaching anything when the world is not the model's, the world or
+    rank has no partner map (``Glm5NextPairLayoutError``, from ``pair_shards.py``), a
+    partner name is already taken, a checkpoint key is absent, or the mesh and this
+    process's groups disagree about ``rank``'s expert placement.
+    """
+    from .pair_shards import (
+        PARTNER_PARAMETER,
+        LoadedPartner,
+        PairShardLoad,
+        partner_rank,
+        partner_tensor_plan,
+    )
+
+    built_at = int(getattr(model, "world_size", world))
+    if built_at != int(world):
+        raise Glm5NextWeightMapError(
+            f"the model was built at world size {built_at} and its own shard is cut "
+            f"for that world; a partner shard at world size {world} would be cut "
+            f"differently"
+        )
+    partner = partner_rank(rank, world)
+    plan = partner_tensor_plan(model, world)
+
+    # Every refusal comes before the first tensor is attached, as the materialiser
+    # orders its own, so a refused call leaves the tree as it was.
+    checkpoint._ensure_indexed()
+    placements: dict[int, Callable[[int], ExpertMeshPlacement]] = {}
+    planned = []
+    for entry in plan:
+        if hasattr(entry.module, entry.partner_leaf):
+            raise Glm5NextWeightMapError(
+                f"{entry.partner_path} already exists; the partner shard is loaded "
+                f"once, and an existing tensor of that name is not replaced"
+            )
+        absent = [
+            key
+            for key in entry.checkpoint_keys
+            if key not in checkpoint._tensor_name_to_file
+        ]
+        if absent:
+            raise Glm5NextWeightMapError(
+                f"{entry.partner_path} needs {len(absent)} checkpoint key(s) the "
+                f"checkpoint does not hold, first {absent[0]!r}"
+            )
+        placement = None
+        if entry.is_bank:
+            placement = _partner_bank_placement(
+                entry.module, rank, world, entry.param_name, placements
+            )
+        planned.append((entry, placement))
+    # Read off the config, and only when a grid is planned, as the own reader reads it.
+    block_size = None
+    if any(entry.form != PARTNER_PARAMETER for entry in plan):
+        block_size = model._checkpoint_block_size()
+
+    loaded: list[LoadedPartner] = []
+    for entry, placement in planned:
+        slices = [checkpoint._get_slice(key) for key in entry.checkpoint_keys]
+        tensor = _load_partner_tensor(entry, slices, partner, placement, block_size)
+        tensor = tensor.to(device)
+        if entry.form == PARTNER_PARAMETER:
+            entry.module.register_parameter(
+                entry.partner_leaf, torch.nn.Parameter(tensor, requires_grad=False)
+            )
+        else:
+            setattr(entry.module, entry.partner_leaf, tensor)
+        loaded.append(
+            LoadedPartner(
+                path=entry.partner_path,
+                shape=tuple(tensor.shape),
+                dtype=tensor.dtype,
+                nbytes=tensor.numel() * tensor.element_size(),
+            )
+        )
+
+    record = PairShardLoad(rank=int(rank), partner=partner, tensors=tuple(loaded))
+    logger.info(
+        "pair shards: rank %d holds the shard of partner rank %d beside its own: "
+        "%d tensors, %d bytes",
+        record.rank,
+        record.partner,
+        len(record.tensors),
+        record.partner_bytes,
+    )
+    return record
