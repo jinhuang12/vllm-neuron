@@ -72,6 +72,9 @@ if TYPE_CHECKING:
     # Force the STATIC FP8 (non-MX) attention path on TRN3 even when STATIC_MX
     # kernels are available. Used by FP8 model factories as an escape hatch.
     VLLM_NEURON_FORCE_STATIC_FP8: bool = False
+    # The token step of the KV-segment list a windowed-prefill model compiles when
+    # ``kv_segment_size_buckets`` is unset; 0 keeps the two-segment list.
+    VLLM_NEURON_KV_SEGMENT_STEP: int = 16384
     # Snapshot Capture Variables
     VLLM_NEURON_RUNTIME_INPUT_SNAPSHOT_ENABLE: bool = False
     VLLM_NEURON_RUNTIME_INPUT_SNAPSHOT_CAPTURE_AT_CALL: Optional[str] = None
@@ -497,6 +500,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kernels are available (FP8 model factory escape hatch).
     "VLLM_NEURON_FORCE_STATIC_FP8": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_FORCE_STATIC_FP8")) or False
+    ),
+    # ================== Windowed Prefill ==================
+    # The KV-segment step, in tokens, of a windowed-prefill model (GLM-5.3-Flash)
+    # whose user set no ``kv_segment_size_buckets``. The runner compiles one prefill
+    # graph per segment of ``step, 2 * step, ...``, up to the first whose window
+    # covers max_model_len (``bucket_utils.kv_segment_step_ladder``), and a chunk
+    # reads the window of the smallest segment that holds its start. The prefill
+    # attention reads and masks every row of that window, so a chunk pays for up to
+    # ``step`` rows past its own end: a smaller step pays less and compiles more
+    # graphs. 16,384 by default: 8 prefill graphs at a max_model_len of 131,072, 16
+    # at 262,144. Kernel alone on trn2 with 1,024 queries, the dense-masked attention
+    # of a chunk ending at 133,120 tokens took 3.5 ms through its 1,160-page window on
+    # this list and 6.6 ms through the whole 2,048-page table, the window of the top
+    # segment of a 32,768 / 65,536 / 131,072 / 262,144 list, with every output word
+    # equal. 32768 halves the graphs. 0 keeps the resolver's list instead: one
+    # segment of the token budget and one that covers max_model_len, whose window is
+    # the whole table from the second chunk on. A model length within one step's
+    # window keeps that list too. An explicit ``kv_segment_size_buckets`` overrides
+    # this. Read at start-up; a change needs a new compile.
+    "VLLM_NEURON_KV_SEGMENT_STEP": lambda: (
+        16384
+        if os.getenv("VLLM_NEURON_KV_SEGMENT_STEP") is None
+        else maybe_convert_int(os.getenv("VLLM_NEURON_KV_SEGMENT_STEP"))
     ),
     # ================== Snapshot Capture Variables ==================
     # Master switch for NRT-boundary input snapshot capture; off by default.

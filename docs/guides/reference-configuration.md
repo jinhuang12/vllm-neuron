@@ -47,7 +47,7 @@ For conceptual overview and trade-offs, see [Bucketing and dynamic shapes](featu
 | ---- | ---- | ---- | ---- |
 | `num_batched_tokens_buckets` | list[int] | Power-of-2 from 128 to `max_num_batched_tokens` | Compiled prefill token counts. Inputs padded to nearest bucket. Fewer = faster startup, more padding. Largest must equal `max_num_batched_tokens`. When segmented prefill is enabled, must match `kv_segment_size_buckets` unless the model supports independent query buckets (currently GLM-5.3-Flash). |
 | `num_seqs_buckets` | list[int] | Power-of-2 from 1 to `max_num_seqs` | Compiled decode batch sizes. Requests batched to smallest bucket >= current size. Largest must equal `max_num_seqs`. |
-| `kv_segment_size_buckets` | list[int] or null | null (disabled) | KV segment sizes for segmented attention kernel. Values must be in {512, 1024, 2048, 4096, 8192}, divisible by `block_size`. |
+| `kv_segment_size_buckets` | list[int] or null | null (disabled) | KV segment sizes for segmented attention kernel. Values must be in {512, 1024, 2048, 4096, 8192}, divisible by `block_size`. A windowed-prefill model (GLM-5.3-Flash) takes any positive size; left unset, it compiles a segment every `VLLM_NEURON_KV_SEGMENT_STEP` tokens (16,384 by default) up to the first that covers `max_model_len`. |
 | `decode_context_length_buckets` | list[int] or null | null (disabled) | Second decode bucketing dimension. Compiles smaller NEFFs sized to typical context lengths instead of `max_model_len`. Values must be ascending, < `max_model_len`, divisible by 128. |
 
 ## KV cache options
