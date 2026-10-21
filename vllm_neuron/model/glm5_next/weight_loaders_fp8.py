@@ -38,8 +38,9 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from typing import NamedTuple
 
 from .config import DSA_LAYER_TYPE, Glm5NextTextConfig
 from .mtp import BLOCK_ATTR, shadow_draft_k
@@ -2192,6 +2193,7 @@ def loader_for_mapped_keys(
     param_name: str | None = None,
     owner: object | None = None,
     geometry: AnyShardGeometry | None = None,
+    placement: Callable[[int], ExpertMeshPlacement] | None = None,
 ) -> SafetensorsWeightLoader | None:
     """The loader that serves one mapped parameter, or ``None`` for the default.
 
@@ -2242,6 +2244,10 @@ def loader_for_mapped_keys(
     time rather than here. Everything else in this function is rank-blind, which is
     why ``owner`` arrives for the bank and the geometry is read off the module rather
     than recomputed.
+
+    ``placement`` reaches the bank branch alone, as
+    :func:`stacked_expert_bank_loader` documents; every other kind shards on the
+    ``rank`` its transform is called with and needs no placement.
     """
     keys = _as_key_list(checkpoint_keys)
     kind = classify_mapped_keys(keys)
@@ -2277,7 +2283,11 @@ def loader_for_mapped_keys(
         # every rank. ``geometry`` is ``None`` only when one rank holds each group
         # whole: world size equal to the degree, or world size 1.
         return stacked_expert_bank_loader(
-            keys, param_name=param_name, owner=owner, geometry=geometry
+            keys,
+            param_name=param_name,
+            owner=owner,
+            geometry=geometry,
+            placement=placement,
         )
     if kind == MAPPED_KEY_QUANTISED_WEIGHT:
         if geometry is None:
@@ -2404,7 +2414,62 @@ def bank_layout(
     )
 
 
-def _expert_parallel_rank_map(owner: object | None, param_name: str | None):
+class ExpertMeshPlacement(NamedTuple):
+    """Where one global rank sits on the expert-parallel mesh.
+
+    ``partition`` is the rank's expert-parallel index -- which block of experts it
+    holds -- and ``column`` is its place inside its EP-TP group -- which slice of each
+    expert's intermediate width it holds. They are the two answers this process
+    otherwise reads off its own groups, ``get_neuron_ep_rank()`` and
+    ``get_neuron_ep_tp_group().rank_in_group``.
+    """
+
+    partition: int
+    column: int
+
+
+def expert_mesh_placement(
+    world_size: int, ep_degree: int
+) -> Callable[[int], ExpertMeshPlacement]:
+    """Read any global rank's placement off the rank lists the EP groups are built from.
+
+    A process's groups answer for that process alone. A load of another rank's bank
+    -- the partner shard of a pair layout -- needs that rank's answers, and the only
+    source that holds them for every rank is the mesh ``_build_ep_group_ranks``
+    returns: its rows are the EP-TP groups, so a rank's row index is its
+    expert-parallel index and its position in the row is its column. Reading the same
+    lists the groups are built from keeps one mesh, non-contiguous layout included,
+    rather than a second derivation from the rank number.
+
+    The import is function-local, as the group reads below are, so this module does
+    not import the parallel state at import time.
+    """
+    from vllm_neuron.parallel.neuron_parallel_state import _build_ep_group_ranks
+
+    rows, _columns = _build_ep_group_ranks(int(world_size), int(ep_degree))
+    table = {
+        rank: ExpertMeshPlacement(partition=index, column=row.index(rank))
+        for index, row in enumerate(rows)
+        for rank in row
+    }
+
+    def placement_of(rank: int) -> ExpertMeshPlacement:
+        if rank not in table:
+            raise Glm5NextExpertBankNotLoadableError(
+                f"global rank {rank} is in none of the {len(rows)} EP-TP rows the "
+                f"package builds for world {world_size} at expert-parallel degree "
+                f"{ep_degree}, so its expert placement cannot be read"
+            )
+        return table[rank]
+
+    return placement_of
+
+
+def _expert_parallel_rank_map(
+    owner: object | None,
+    param_name: str | None,
+    placement: Callable[[int], ExpertMeshPlacement] | None = None,
+):
     """The map from the load's global rank to the bank partition's rank.
 
     The bank's expert partition is built over ``ep_degree``, the expert-parallel
@@ -2428,6 +2493,11 @@ def _expert_parallel_rank_map(owner: object | None, param_name: str | None):
     An owner that declares no degrees is passed through unchanged, so a caller that
     supplies only ``local_expert_indices`` and ``num_routed_experts`` keeps working;
     the partition's own bound check is still the guard behind this map.
+
+    ``placement`` is given only by a load of a rank other than this process's own,
+    which its group cannot answer for: the index is then read off the mesh for the
+    rank the load is called with (:func:`expert_mesh_placement`). ``None`` reads the
+    group, as every load of a process's own bank does.
     """
     ep_degree = getattr(owner, "ep_degree", None)
     tp_degree = getattr(owner, "tp_degree", None)
@@ -2440,6 +2510,8 @@ def _expert_parallel_rank_map(owner: object | None, param_name: str | None):
         # One tensor-parallel rank means the only global rank is 0, which is also
         # its group index, so the identity is the read and not an assumption.
         return lambda rank: rank
+    if placement is not None:
+        return lambda rank: placement(rank).partition
 
     def read_expert_parallel_rank(rank: int) -> int:
         """This process's expert-parallel partition index, from the group.
@@ -2458,7 +2530,11 @@ def _expert_parallel_rank_map(owner: object | None, param_name: str | None):
 
 
 def _expert_parallel_shard_column(
-    rank: int, tp_per_ep: int, ep_degree: int, param_name: str | None
+    rank: int,
+    tp_per_ep: int,
+    ep_degree: int,
+    param_name: str | None,
+    placement: Callable[[int], ExpertMeshPlacement] | None = None,
 ) -> int:
     """This process's column inside its expert-parallel TP group, checked twice.
 
@@ -2485,36 +2561,45 @@ def _expert_parallel_shard_column(
     Above degree 1 an uninitialised group is refused by name rather than left to that
     assert, which would land as a bare ``AssertionError`` naming no parameter in the
     middle of a load.
+
+    ``placement`` stands in for the group when the load is of another rank's bank:
+    the column is then read off the mesh for ``rank`` (:func:`expert_mesh_placement`)
+    and checked against the consumer's derivation the same way.
     """
     from vllm_neuron.parallel.neuron_parallel_state import get_neuron_ep_tp_group
 
     if ep_degree <= 1:
         return rank % tp_per_ep
 
-    try:
-        group = get_neuron_ep_tp_group()
-    except AssertionError:
-        _refuse(
-            param_name,
-            f"is a routed expert bank whose owning module declares an "
-            f"expert-parallel degree above 1, so its columns are divided among "
-            f"{tp_per_ep} ranks inside one expert-parallel group -- but no EP-TP "
-            f"group is initialised, so there is no group to read the column from "
-            f"(parallel/neuron_parallel_state.py). Refusing rather than "
-            f"falling back to the global rank, which on this platform's mesh is a "
-            f"different column.",
-        )
-    column = int(group.rank_in_group)
+    if placement is not None:
+        column = int(placement(rank).column)
+        source = "The expert-parallel mesh"
+    else:
+        try:
+            group = get_neuron_ep_tp_group()
+        except AssertionError:
+            _refuse(
+                param_name,
+                f"is a routed expert bank whose owning module declares an "
+                f"expert-parallel degree above 1, so its columns are divided among "
+                f"{tp_per_ep} ranks inside one expert-parallel group -- but no EP-TP "
+                f"group is initialised, so there is no group to read the column from "
+                f"(parallel/neuron_parallel_state.py). Refusing rather than "
+                f"falling back to the global rank, which on this platform's mesh is a "
+                f"different column.",
+            )
+        column = int(group.rank_in_group)
+        source = "The initialised EP-TP group"
     derived = rank % tp_per_ep
     if column != derived:
         _refuse(
             param_name,
             f"would be placed on two different columns by the two answers this "
-            f"repository holds. The initialised EP-TP group puts global rank "
+            f"repository holds. {source} puts global rank "
             f"{rank} at column {column}; the consumer derives the column as rank % "
             f"tp_per_ep = {rank} % {tp_per_ep} = {derived} "
-            f"(functional/moe/moe_blockwise.py). The loader takes the "
-            f"group's answer, so at this degree it would write column {column} "
+            f"(functional/moe/moe_blockwise.py). The loader takes the first "
+            f"answer, so at this degree it would write column {column} "
             f"where the kernel reads column {derived} -- every shape would check "
             f"out and the model would compute the wrong function. This happens "
             f"when the mesh is non-contiguous "
@@ -2527,7 +2612,10 @@ def _expert_parallel_shard_column(
 
 
 def _bank_expert_indices(
-    owner: object | None, layout: BankLayout, param_name: str | None
+    owner: object | None,
+    layout: BankLayout,
+    param_name: str | None,
+    placement: Callable[[int], ExpertMeshPlacement] | None = None,
 ):
     """The owning module's local-expert resolver, or refuse by name.
 
@@ -2537,6 +2625,8 @@ def _bank_expert_indices(
 
     A bank whose owner carries no geometry cannot be placed: there is no answer to
     "which experts are mine", so stacking would be a guess.
+
+    ``placement`` is passed through to :func:`_expert_parallel_rank_map`.
     """
     resolve = getattr(owner, "local_expert_indices", None)
     if not callable(resolve):
@@ -2573,7 +2663,7 @@ def _bank_expert_indices(
     # is built here, at construction, because it depends only on the owner's degrees --
     # which keeps this file's rule that every bank refusal is raised before any
     # parameter is registered.
-    to_partition_rank = _expert_parallel_rank_map(owner, param_name)
+    to_partition_rank = _expert_parallel_rank_map(owner, param_name, placement)
     return lambda rank: resolve(to_partition_rank(rank))
 
 
@@ -2610,7 +2700,10 @@ def _stack_local_expert_scales(param_name: str | None):
 
 
 def _column_of_each_expert(
-    geometry: DeferredShardGeometry, param_name: str | None, stack_whole
+    geometry: DeferredShardGeometry,
+    param_name: str | None,
+    stack_whole,
+    placement: Callable[[int], ExpertMeshPlacement] | None = None,
 ):
     """Wrap a bank stacker so each expert contributes only this rank's column.
 
@@ -2631,6 +2724,8 @@ def _column_of_each_expert(
     weight to it gives one implementation of the extent and guarantees that a weight's
     columns and its grid's rows end in the same place, which two independent ceiling
     divisions would not.
+
+    ``placement`` is passed through to :func:`_expert_parallel_shard_column`.
     """
     from vllm_neuron.utils.weight_loader import shard_tensor_at_load_time
 
@@ -2640,6 +2735,7 @@ def _column_of_each_expert(
             geometry.num_shards,
             geometry.expert_parallel_degree,
             param_name,
+            placement,
         )
         whole = stack_whole(local_slices, rank)
         # The stacked result carries a leading expert axis, so the geometry's
@@ -2736,6 +2832,7 @@ def stacked_expert_bank_loader(
     param_name: str | None = None,
     owner: object | None = None,
     geometry: DeferredShardGeometry | None = None,
+    placement: Callable[[int], ExpertMeshPlacement] | None = None,
 ) -> SafetensorsWeightLoader:
     """Load a routed expert bank's weights as one stacked tensor.
 
@@ -2756,9 +2853,14 @@ def stacked_expert_bank_loader(
     before registering any parameter, so a refusal raised here leaves the module tree
     exactly as it arrived. Deferring one to transform time would land mid-load with
     half a tree registered.
+
+    ``placement`` is ``None`` for a load of this process's own bank, which reads its
+    expert-parallel index and column off its groups. A load of another rank's bank
+    passes :func:`expert_mesh_placement`, because the groups answer only for the
+    process that holds them.
     """
     layout = bank_layout(checkpoint_keys, param_name=param_name)
-    resolve = _bank_expert_indices(owner, layout, param_name)
+    resolve = _bank_expert_indices(owner, layout, param_name, placement)
     # ``geometry`` is ``None`` for a load that shards nothing, which is not the same
     # as expert-parallel degree 1: at degree 1 ``tp_per_ep`` is the whole world, so a
     # geometry does come back and the column path below runs. ``None`` arrives only at
@@ -2766,7 +2868,7 @@ def stacked_expert_bank_loader(
     # experts whole.
     stack = _stack_local_expert_weights
     if geometry is not None:
-        stack = _column_of_each_expert(geometry, param_name, stack)
+        stack = _column_of_each_expert(geometry, param_name, stack, placement)
     return wrap_with_blockwise_fp8_downscale(
         SafetensorsWeightLoader(
             transform=_stacked_bank_transform(layout, resolve, param_name, stack)
@@ -2781,6 +2883,7 @@ def stacked_expert_scale_loader(
     owner: object | None = None,
     geometry: DeferredShardGeometry | None = None,
     block_size: tuple[int, int] = DEFAULT_WEIGHT_BLOCK_SIZE,
+    placement: Callable[[int], ExpertMeshPlacement] | None = None,
 ) -> SafetensorsWeightLoader:
     """Load a routed expert bank's scale grids as one stacked tensor.
 
@@ -2799,9 +2902,11 @@ def stacked_expert_scale_loader(
     bank scale parameter and ``_add_moe_mlp`` writes map entries only for
     ``experts.router_weight`` and ``experts.<leaf>_weight``. It is called directly,
     against the checkpoint's own grids.
+
+    ``placement`` as for :func:`stacked_expert_bank_loader`.
     """
     layout = bank_layout(checkpoint_keys, param_name=param_name)
-    resolve = _bank_expert_indices(owner, layout, param_name)
+    resolve = _bank_expert_indices(owner, layout, param_name, placement)
     # A sharded bank's grids are sharded with its weights, for the same reason as the
     # dense MLP's: a whole grid beside a column of weights describes the wrong blocks,
     # and the dequantisation would scale real rows by another column's scale. The
@@ -2814,6 +2919,7 @@ def stacked_expert_scale_loader(
             shard_geometry_for_grid(geometry, param_name, block_size),
             param_name,
             stack,
+            placement,
         )
     return SafetensorsWeightLoader(
         transform=_stacked_bank_transform(layout, resolve, param_name, stack)
