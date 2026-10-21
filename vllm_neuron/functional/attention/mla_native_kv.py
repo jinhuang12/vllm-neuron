@@ -13,10 +13,10 @@ place of the latent width::
     out[q]       = softmax(scale * scores[q]) @ value
 
 which equals the latent form ``softmax(scale * (query @ w_key^T) . latent) @ latent @ w_value``
-in exact arithmetic. The selection (the keep table, the causal cut at each query's open
-pool) and the softmax are those of ``mla_dense_masked``, whose selection, score, exp,
-probability and accumulate stages this kernel runs unchanged; only the page layout, the
-operand widths and what is guarded where differ.
+in exact arithmetic; ``R`` is ``pool_rows`` and ``count[q, p]`` the number of rows query ``q``
+keeps in pool ``p``. The selection (the keep table, the causal cut at each query's open pool)
+and the softmax are ``mla_dense_masked``'s: without ``engine_balance`` this kernel runs its
+stages unchanged, and only the page layout, the operand widths and the guard's place differ.
 
 Page layout (the contract between the two kernels). A KV page holds ``page_size`` tokens in
 ``page_size * (key_width + value_width)`` elements of the cache dtype, keys first:
@@ -47,8 +47,8 @@ MM2 contracts every token of a superblock whatever its probability, and ``0 * Na
 so the write kernel stores every non-finite value element as 0.0: the attention kernel needs
 no guard of its own, and a non-finite token reaches exactly the queries that select it.
 
-Engine balance. With ``engine_balance`` the attention kernel runs ``mla_dense_masked``'s
-engine-balanced stages: the Scalar engine expands each pool count to its rows
+Engine balance. With ``engine_balance`` the attention kernel makes three changes, in this
+file's ``_balanced_*`` helpers: the Scalar engine expands each pool count to its rows
 (``relu(count - rank)``, one activation per rank in the pool) in place of one Vector compare
 over every row; the four 512-row selects of a superblock keep their running maximum in the
 Vector accumulator and read it out once; the exp writes ``bf16(p)`` itself and the Tensor
@@ -640,8 +640,8 @@ def mla_native_kv_write(latent: Tensor, w_key: Tensor, w_value: Tensor, page_ids
         latent: ``[T, L]`` bf16/fp16, the chunk's latent rows; ``T`` whole pages.
         w_key: ``[L, key_width]``, same dtype.
         w_value: ``[L, value_width]``, same dtype.
-        page_ids: ``[T / page_size]`` or ``[T / page_size, 1]`` int32, the pool page of each
-            page of the chunk; ids outside the pool are clamped onto it on the device.
+        page_ids: ``[T / page_size]`` or ``[T / page_size, 1]`` int32, the distinct pool
+            pages of the chunk's pages in order, each clamped onto the pool on the device.
         kv_pages: ``[pool pages, page_size, key_width + value_width]``, written in place.
         page_size: tokens per page, :data:`PAGE_ROWS`.
 
