@@ -8215,11 +8215,12 @@ class Glm5NextMLAAttention(nn.Module):
         """Refuse a set selection that a reader of its order would get.
 
         :meth:`forward` lets the indexer return each row's pool ids in no stated order
-        only where ``mla_sparse_attention`` hands them to the masked-window kernel
-        (``dsa_set_selection.py``). This asks that seam's predicate again, with the
-        operands it will be handed, so a decision taken on other shapes cannot reach
-        the gather or the DCP merge, which read the order. A trace-time check: every
-        input is a shape, a dtype or a python value.
+        where ``mla_sparse_attention`` hands them to the masked-window kernel
+        (``dsa_set_selection.py``); a set read through a keep table is
+        :meth:`_require_keep_reader`'s to check. This asks that seam's predicate again,
+        with the operands it will be handed, so a decision taken on other shapes cannot
+        reach the gather or the DCP merge, which read the order. A trace-time check:
+        every input is a shape, a dtype or a python value.
         """
         from vllm_neuron.functional.attention.mla_dense_window import masked_window_serves
 
@@ -8323,10 +8324,12 @@ class Glm5NextMLAAttention(nn.Module):
         ``0 .. seq_lens[i] - 1`` through ``mla_dense_window_attention`` and
         ``topk_indices`` is not read (pass None).
 
-        ``selection_is_a_set=True`` says ``topk_indices`` holds each row's selection in
-        no stated order (``dsa_set_selection.py``). Only the masked-window kernel may read
-        it, so this asks the seam's predicate (``masked_window_serves``) with the operands
-        handed to the seam and refuses the call where another body would read it.
+        ``selection_is_a_set=True`` says the selection holds each row's pool ids in no
+        stated order (``dsa_set_selection.py``). Only the masked-window kernel or a keep
+        table may read it. Without a keep table this asks the seam's predicate
+        (``masked_window_serves``) with the operands handed to the seam and refuses the
+        call where another body would read it; with one, the keep route's check below
+        stands for both.
 
         ``keep_bits`` is the chunk's keep table, ``[tokens, pools / 8]`` uint8, and
         ``keep_route`` its reader, which the forward takes from ``prefill_keep_table_route``
@@ -8591,7 +8594,7 @@ class Glm5NextMLAAttention(nn.Module):
                 f"absorb-in produced a width of {int(q_lift.shape[2])}; the "
                 f"sparse seam contracts {latent}"
             )
-        if selection_is_a_set:
+        if selection_is_a_set and keep_bits is None:
             self._require_masked_reader(
                 q_lift, c_kv, topk_indices, window, dense=dense,
                 dense_window=dense_window_seq_lens is not None,
@@ -9544,12 +9547,16 @@ class Glm5NextMLAAttention(nn.Module):
         )
         window_scans = window_selects and window_pools >= MAX8_WIDTH
         scan = bound if no_select or window_scans else int(max_seq_len)
-        # A selection that only the masked-window attention reads comes back as a set
-        # (dsa_set_selection.py). The seam's own predicate decides, asked with the
-        # operands attend() hands the seam; attend() asks it again with the real ones.
+        # A selection that only the masked-window attention or the keep table reads comes
+        # back as a set (dsa_set_selection.py). For the masked window the seam's own
+        # predicate decides, asked with the operands attend() hands the seam; for the keep
+        # table its route does, below. attend() asks both again with the real operands.
         # A collecting forward (the layer-stream dump) keeps the order: the dump hands
         # the index rows on as the indexer emitted them.
-        from vllm_neuron.model.glm5_next.dsa_set_selection import prefill_selects_a_set
+        from vllm_neuron.model.glm5_next.dsa_set_selection import (
+            keep_route_selects_a_set,
+            prefill_selects_a_set,
+        )
 
         selects_a_set = (
             not no_select
@@ -9600,6 +9607,9 @@ class Glm5NextMLAAttention(nn.Module):
                 and active_mla_query_rows is None
             )
             else None
+        )
+        selects_a_set = selects_a_set or (
+            collector is None and keep_route_selects_a_set(keep_route)
         )
         q_latent = self.project_query_latent(normed_hidden_states)
         selection = self.indexer(
