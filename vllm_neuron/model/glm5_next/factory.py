@@ -307,9 +307,11 @@ class Glm5NextForConditionalGeneration(
     #: ``bucket_utils.resolve_segmented_prefill_config`` and
     #: ``bucket_utils.validate_kv_segment_size_buckets``; the validator then also
     #: requires the largest segment + largest query bucket to cover max_model_len, and,
-    #: with independent prefill buckets, an auto-resolved list is completed with a
-    #: covering segment (``bucket_utils.complete_kv_segment_cover``). glm sets it: its
-    #: prefill attention gathers the window.
+    #: with independent prefill buckets, an auto-resolved list becomes a segment every
+    #: ``VLLM_NEURON_KV_SEGMENT_STEP`` tokens (``bucket_utils.kv_segment_step_ladder``)
+    #: or, when that ladder does not apply, is completed with a covering segment
+    #: (``bucket_utils.complete_kv_segment_cover``). glm sets it: its prefill attention
+    #: gathers the window.
     supports_windowed_prefill = True
 
     def __init__(
