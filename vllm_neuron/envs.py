@@ -145,6 +145,10 @@ if TYPE_CHECKING:
     # Let the dense-masked kernel contract its probabilities with the window rows as
     # one bf16 pass instead of the hi/lo split. On by default; 0 restores the split.
     VLLM_NEURON_MLA_DENSE_MASKED_BF16_PROBS: bool = True
+    # Keep a native key/value cache beside the GLM-5.3-Flash DSA latent bank, written
+    # by every prefill chunk, and attend a dense-masked chunk over it at the head
+    # width (mla_native_kv.py). Off by default; 1 allocates the cache.
+    VLLM_NEURON_MLA_NATIVE_KV: bool = False
     # Let the GLM-5.3-Flash DSA prefill's sparse MLA body gather its rows from the
     # latent bank through the block table, with no staged window. On by default; 0
     # restores the staged window.
@@ -696,6 +700,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NEURON_MLA_DENSE_MASKED_BF16_PROBS": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_MLA_DENSE_MASKED_BF16_PROBS"))
         is not False
+    ),
+    # Give every DSA layer a native key/value cache of its latent bank's blocks
+    # (``vllm/worker/neuron_model_runner.py``, ``native_kv_cache_shapes``): each prefill
+    # chunk stores its tokens' keys and values there once, ``latent @ kv_b_proj``
+    # rounded to the cache dtype with every non-finite element of a value stored as
+    # 0.0, and a chunk the dense-masked route takes attends those pages at the head
+    # width (``functional/attention/mla_native_kv.py``): no query lift and no value
+    # projection, and the score and value matmuls at the key and value widths (256)
+    # in place of the latent width (512). Kernel alone on trn2 with 1,024 queries at
+    # 2,048 pages, the native call took 5.1 ms against the latent pass's 6.6 ms, and
+    # the write 57 us per layer and chunk. The cache costs the latent bank's bytes
+    # again at one head per rank, which the KV budget counts beside the bank. Only
+    # prefill graphs change: decode reads the latent bank. The keys and values carry
+    # one rounding each where the latent form rounds the lifted query and its
+    # latent-wide output, so the two forms are not value-equal (a bf16 K/V class).
+    # Serves one attention head per rank, decode context parallelism 1, prefix caching
+    # off and prefill chunks of whole pages; the runner refuses anything else. Read at
+    # start-up and at trace time; a change needs a new compile. Off by default; set 1
+    # for the native route.
+    "VLLM_NEURON_MLA_NATIVE_KV": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_MLA_NATIVE_KV")) or False
     ),
     # Let the sparse MLA prefill's low-precision row-tiled body
     # (``functional/attention/mla_sparse.py``) gather each query's selected rows
