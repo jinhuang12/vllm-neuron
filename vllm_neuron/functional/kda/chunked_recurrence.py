@@ -98,8 +98,8 @@ blocks.
 
 On an LNC2 runtime the entry points launch two programs, one per physical core:
 the intra-chunk kernel splits the whole tiles between them
-(:func:`intra_chunk_grid`), the inter-chunk kernel the value columns of the
-state (:func:`inter_chunk_grid`).
+(:func:`intra_chunk_grid`), the inter-chunk kernel an even count of heads, or
+else the value columns of the state (:func:`inter_chunk_grid`).
 
 Heads
 -----
@@ -1900,17 +1900,19 @@ def kda_inter_chunk_kernel(
     ``kg^T @ v_new`` and the decayed sum; ``o``'s two products hang off it
     (:func:`_emit_inter_step`).
 
-    Each head is its own chain on its own operands. Value columns are
-    independent, so a launch of ``P`` programs gives each program ``V / P`` value
-    columns of every head (an LNC2 pair: ``V / 2`` each), the split a one-head
-    launch makes. Each head's chain in a program is then the one-head launch's
-    program on that head's operands, instruction for instruction and at the same
-    matmul widths, so a head's results do not depend on the heads beside it. Not
-    whole heads per program: a matmul's result columns can depend on the moving
-    operand's width (BIRSim rounds the last 8 columns of a 128-wide one
-    differently from a 64-wide one), so ``V`` columns per program would not be
-    the one-head launch's arithmetic. A program steps its heads' chains in turn,
-    chunk by chunk, so one chain's matmuls can fill the other's vector waits.
+    Each head is its own chain on its own operands. When ``HEADS > 1`` divides
+    by the program count ``P``, each program carries ``HEADS / P`` whole heads
+    with all ``V`` value columns; otherwise each program carries ``V / P`` value
+    columns of every head (one head on an LNC2 pair: ``V / 2`` each). Value
+    columns are independent, so both splits do the same arithmetic per column;
+    they differ only in the matmuls' moving width, ``V`` or ``V / P`` columns.
+    Whole heads need half the instructions per program, since each matmul
+    covers all of a head's columns. On the device the two widths give the same
+    bits for this kernel, so each head's results equal a one-head launch's.
+    BIRSim differs: it rounds the last 8 columns of a 128-wide matmul unlike a
+    64-wide one, so the simulator cannot check this split. A program that
+    carries several heads steps their chains in turn, chunk by chunk, so one
+    chain's matmuls can fill the other's vector waits.
 
     ``STATE_ONLY`` leaves out what only ``o`` needs: ``q``'s normalisation and
     gate, the transposes of ``qg`` and ``aqk``, each step's two output products,
@@ -1927,9 +1929,17 @@ def kda_inter_chunk_kernel(
     rows = n_chunks * chunk
     layout_rows = min(tile_rows(chunk), rows)
     tile_chunks = layout_rows // chunk
-    assert vdim % n_prog == 0, "the value width does not split over the programs"
-    vpart = vdim // n_prog
-    v0 = nl.program_id(0) * vpart
+    # ``program_id`` is a trace-time integer (one trace per program), so every
+    # offset below is static.
+    if HEADS > 1 and HEADS % n_prog == 0:
+        prog_heads = HEADS // n_prog
+        first_head = nl.program_id(0) * prog_heads
+        vpart, v0 = vdim, 0
+    else:
+        assert vdim % n_prog == 0, "the value width does not split over the programs"
+        prog_heads, first_head = HEADS, 0
+        vpart = vdim // n_prog
+        v0 = nl.program_id(0) * vpart
     with_output = not STATE_ONLY
 
     o_hbm = vnew_hbm = None
@@ -1951,7 +1961,7 @@ def kda_inter_chunk_kernel(
     # turned here, so the conversion is emitted on this engine rather than by
     # torch on the host.
     carried = []
-    for head in range(HEADS):
+    for head in range(first_head, first_head + prog_heads):
         entering = _sbuf(vpart, kdim)
         _dma(entering, state_init_hbm[nl.ds(head * vdim + v0, vpart), 0:kdim],
              nisa.engine.scalar)
@@ -1962,7 +1972,7 @@ def kda_inter_chunk_kernel(
     for g0 in range(0, n_chunks, tile_chunks):
         groups = min(tile_chunks, n_chunks - g0)
         per_head = []
-        for head in range(HEADS):
+        for head in range(first_head, first_head + prog_heads):
             c0 = head * n_chunks + g0
             operands = _emit_inter_operands(
                 sources, layout, c0, groups, chunk, kdim, v0, vpart, scale, with_output
@@ -1974,22 +1984,23 @@ def kda_inter_chunk_kernel(
                                  buffer=nl.sbuf)
             per_head.append((c0, operands, vnew_c, o_c))
         for g in range(groups):
-            for head in range(HEADS):
-                _, operands, vnew_c, o_c = per_head[head]
-                carried[head] = _emit_inter_step(
-                    carried[head], operands, g, vnew_c, o_c, chunk, kdim, vpart
+            for index in range(prog_heads):
+                _, operands, vnew_c, o_c = per_head[index]
+                carried[index] = _emit_inter_step(
+                    carried[index], operands, g, vnew_c, o_c, chunk, kdim, vpart
                 )
         if with_output:
-            for head in range(HEADS):
-                c0, _, vnew_c, o_c = per_head[head]
+            for index in range(prog_heads):
+                c0, _, vnew_c, o_c = per_head[index]
                 _dma(vnew_hbm[c0 : c0 + groups, 0:chunk, nl.ds(v0, vpart)]
                      .permute((1, 0, 2)), vnew_c, nisa.engine.sync)
                 _dma(o_hbm[c0 : c0 + groups, 0:chunk, nl.ds(v0, vpart)]
                      .permute((1, 0, 2)), o_c, nisa.engine.scalar)
 
-    for head in range(HEADS):
+    for index in range(prog_heads):
+        head = first_head + index
         leaving = _sbuf(vpart, kdim)
-        _emit_transpose(leaving, carried[head], kdim, vpart)
+        _emit_transpose(leaving, carried[index], kdim, vpart)
         _dma(state_hbm[nl.ds(head * vdim + v0, vpart), 0:kdim], leaving,
              nisa.engine.sync)
     if STATE_ONLY:
@@ -2047,16 +2058,20 @@ def _require_inter_admissible(
         )
 
 
-def inter_chunk_grid(vdim: int) -> tuple[int, ...]:
-    """The launch grid of :func:`kda_inter_chunk_kernel` for this value width.
+def inter_chunk_grid(vdim: int, heads: int = 1) -> tuple[int, ...]:
+    """The launch grid of :func:`kda_inter_chunk_kernel` for ``heads`` heads.
 
     ``(LNC2_PROGRAMS,)`` on an LNC2 runtime (``NEURON_LOGICAL_NC_CONFIG=2``) when
-    the value columns split evenly over the programs, else ``()``. Each program
-    carries its own value columns of the state through the same chain.
+    the work splits evenly over the programs, else ``()``: whole heads when there
+    are several and their count divides, otherwise the value columns of every
+    head, which is the kernel's own rule. Each program carries its share through
+    the same chains.
     """
-    if not lnc_pair() or vdim % LNC2_PROGRAMS:
+    if not lnc_pair():
         return ()
-    return (LNC2_PROGRAMS,)
+    if (heads > 1 and heads % LNC2_PROGRAMS == 0) or vdim % LNC2_PROGRAMS == 0:
+        return (LNC2_PROGRAMS,)
+    return ()
 
 
 def can_run_inter_chunk(
@@ -2119,8 +2134,8 @@ def kda_inter_chunk(
         :class:`InterChunkOutputs`, whose ``final_state`` is ``[V, K]``
         (``[H, V, K]`` with heads). With heads, head ``h`` of every field is what
         a one-head call on head ``h``'s operands returns: the heads are separate
-        chains, and each program runs each head's chain with the one-head call's
-        instructions (:func:`kda_inter_chunk_kernel`).
+        chains, and on the device their bits do not depend on how the kernel
+        splits them over the programs (:func:`kda_inter_chunk_kernel`).
 
     Raises:
         ChunkedRecurrenceError: on a rank mismatch, a shape disagreement, or an
@@ -2214,7 +2229,7 @@ def kda_inter_chunk(
         form["STATE_ONLY"] = True
     _count_inter_nki_dispatch()
     call = wrap_nki(kda_inter_chunk_kernel)
-    grid = inter_chunk_grid(vdim)
+    grid = inter_chunk_grid(vdim, heads)
     if grid:
         call = call[grid]
     produced = call(
