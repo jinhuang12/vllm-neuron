@@ -1589,7 +1589,7 @@ def classify_mapped_keys(checkpoint_keys: str | Sequence[str]) -> str:
     built differs -- so a placeholder typed against a different case than its own
     loader would make every load emit that warning. Two classifiers of the same
     cases can drift apart; one cannot. Adding a kind here therefore means teaching
-    ``model_fp8.py``'s ``_placeholder_dtype`` about it in the same change.
+    ``model_fp8.py``'s ``placeholder_dtype`` about it in the same change.
 
     "Is this key a scale?" is not re-decided here: :func:`scale_keys` answers it and
     is called rather than copied, so the suffix convention lives in one place.
