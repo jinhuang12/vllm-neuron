@@ -11930,8 +11930,8 @@ class PrefillPairs:
           the partner's;
         * the root's vocabulary head is joined the same way, into :attr:`head`.
 
-        The partner tensors then leave the tree, so its parameter list is the knob-off
-        one again.
+        The partner tensors then leave the tree and the views, so the tree's parameter
+        list is the knob-off one again and no view holds a partner name.
 
         Raises:
             Glm5NextPrefillPairsError: a module of another class holds a partner.
@@ -11978,6 +11978,11 @@ class PrefillPairs:
                 )
             for entry in entries:
                 delattr(module, entry.partner_leaf)
+                if key in self._views:
+                    # The view was copied with the partner leaf and reads the leaf it
+                    # rebound instead, so the name goes: kept, it would hold a second
+                    # device copy of each joined partner for the life of the process.
+                    delattr(self._views[key][1], entry.partner_leaf)
 
     def bind(self, root: Glm5NextForConditionalGeneration, device: torch.device) -> None:
         """Prepare the views, build the stack a pair step runs, bind the step's tensors.
