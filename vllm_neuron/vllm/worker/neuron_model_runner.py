@@ -1208,6 +1208,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             SUPPORTED_KV_SEGMENT_SIZES,
             complete_kv_segment_cover,
             get_default_num_seqs_buckets,
+            kv_segment_step_ladder,
             resolve_num_batched_tokens_buckets,
             resolve_segmented_prefill_config,
             validate_decode_context_length_buckets,
@@ -1359,12 +1360,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             )
             block_size = getattr(vllm_config.cache_config, "block_size", None)
             if windowed:
-                # The resolver picks one segment equal to the token budget, a window
-                # of twice the budget; a windowed model with a longer max_model_len
-                # gets the smallest supported segment that covers it appended (or one
-                # of max_model_len), so a user who set no list is not capped below
-                # max_model_len.
-                completed = complete_kv_segment_cover(
+                # A segment every VLLM_NEURON_KV_SEGMENT_STEP tokens up to the first
+                # that covers max_model_len, so a chunk's window ends at most one step
+                # past the chunk. Without that ladder (step 0, or a model length one
+                # step covers), the resolver's one segment equal to the token budget,
+                # a window of twice the budget, gets the smallest supported segment
+                # that covers max_model_len appended (or one of max_model_len), so a
+                # user who set no list is not capped below max_model_len.
+                completed = kv_segment_step_ladder(
+                    envs.VLLM_NEURON_KV_SEGMENT_STEP,
+                    self.neuron_config.num_batched_tokens_buckets,
+                    self.max_model_len,
+                    block_size,
+                ) or complete_kv_segment_cover(
                     auto_kv_segment_size_buckets,
                     self.neuron_config.num_batched_tokens_buckets,
                     self.max_model_len,
@@ -1373,7 +1381,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 )
                 if completed != auto_kv_segment_size_buckets:
                     logger.info(
-                        "Segmented prefill: kv_segment_size_buckets %s completed to %s "
+                        "Segmented prefill: kv_segment_size_buckets %s set to %s "
                         "so the prefill window covers max_model_len %s",
                         auto_kv_segment_size_buckets,
                         completed,

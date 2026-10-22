@@ -475,7 +475,8 @@ def complete_kv_segment_cover(
 ) -> list[int]:
     """Return the segment list with the covering segment appended when it falls short.
 
-    For the auto-enabled list (the user set no ``kv_segment_size_buckets``): the list
+    For the auto-enabled list (the user set no ``kv_segment_size_buckets``) when no
+    step ladder applies (:func:`kv_segment_step_ladder` returns ``None``): the list
     the resolver picks is one segment equal to the token budget, whose window is twice
     the budget. A windowed model with ``max_model_len`` above that would refuse every
     longer prompt, so the smallest supported segment whose window covers
@@ -507,6 +508,49 @@ def complete_kv_segment_cover(
             f"Lower max_model_len to {longest} or raise max_num_batched_tokens."
         )
     return segments + [cover] if cover > segments[-1] else sorted(set(segments) | {cover})
+
+
+def kv_segment_step_ladder(
+    step: int,
+    num_batched_tokens_buckets: list[int],
+    max_model_len: int,
+    block_size: int | None = None,
+) -> list[int] | None:
+    """Return a KV segment every ``step`` tokens up to one that covers max_model_len.
+
+    The segment list of a windowed-prefill model whose kernel takes the query length
+    independently, when the user set no ``kv_segment_size_buckets``: ``step``,
+    ``2 * step``, ... up to the first segment whose window
+    (:func:`prefill_window_tokens`) reaches ``max_model_len``. A chunk takes the
+    smallest segment that holds its start (:func:`select_kv_segment_size`), so it reads
+    at most ``step`` tokens of window past its own end, rounded up to a page. The
+    prefill attention reads and masks every row of the window, the rows past the
+    chunk's end included, so a smaller step leaves less of that work per chunk, at the
+    cost of one compiled prefill graph per segment.
+
+    ``None`` when ``step`` is 0 or when one step's window already covers
+    ``max_model_len``: the caller then keeps the resolver's list
+    (:func:`complete_kv_segment_cover`).
+
+    Raises:
+        ValueError: ``step`` is negative.
+
+    Example:
+        >>> kv_segment_step_ladder(32768, [1024], 131072, 128)
+        [32768, 65536, 98304, 131072]
+    """
+    if int(step) < 0:
+        raise ValueError(
+            f"KV segment step must be 0 or a positive token count, got {step}"
+        )
+    if int(step) == 0:
+        return None
+    segments = [int(step)]
+    while prefill_window_tokens(segments, num_batched_tokens_buckets, block_size) < int(
+        max_model_len
+    ):
+        segments.append(segments[-1] + int(step))
+    return segments if len(segments) > 1 else None
 
 
 def validate_kv_segment_size_buckets(
