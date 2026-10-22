@@ -4823,9 +4823,7 @@ class Glm5NextKDAAttention(nn.Module):
         # below rounds the partial to its wire dtype first, the producer stores it in
         # that dtype: the same one rounding, without a separate cast pass.
         wire = _row_parallel_wire_dtype(int(core.shape[0]), module=self)
-        attn_out = kda_gated_projection(
-            core, out_gate, self, phase=phase, out_dtype=wire or torch.float32
-        )
+        attn_out = kda_gated_projection(core, out_gate, self, phase=phase, out_dtype=wire)
         # ``o_proj_weight`` is row-parallel, so this is one rank's partial sum.
         # Reduce it before the cast below, in the wire dtype ``collective_policy``
         # names for this step: by default bf16 at a prefill chunk, which rounds each
@@ -8198,8 +8196,7 @@ class Glm5NextMLAAttention(nn.Module):
             else _row_parallel_wire_dtype(int(x.shape[0]), module=self)
         )
         projected = mla_projection_prepared(
-            x.contiguous(), self._prepared_weight("o_proj"), lowp,
-            out_dtype=wire or torch.float32,
+            x.contiguous(), self._prepared_weight("o_proj"), lowp, out_dtype=wire
         )
         if collector is not None:
             # The partial is cloned and the input is not. On the fp32 wire the reduction
