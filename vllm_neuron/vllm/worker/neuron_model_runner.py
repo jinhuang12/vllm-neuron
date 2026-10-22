@@ -168,6 +168,16 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
         # there. None with the knob off (every other model), so nothing else moves.
         claim = getattr(model_runner, "_glm5next_shadow_claim", None)
         self._glm5next_shadow = claim() if claim is not None else None
+        # Chunk-pair prefill: the settle launched behind this step, drained after this
+        # step's ids on the thread that reads them. None with the knob off.
+        claim = getattr(model_runner, "_glm5next_settle_claim", None)
+        self._glm5next_settle = claim() if claim is not None else None
+
+    def _glm5next_drain_settle(self) -> None:
+        """Read the settle behind this step back, once, to take it off the execution queue."""
+        settle, self._glm5next_settle = self._glm5next_settle, None
+        if settle is not None:
+            settle.cpu()
 
     def _discard_partial_prefill_samples(
         self, sampled_token_ids: list[list[int]]
@@ -229,6 +239,7 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
                     # ("Execution queue full").
                     sampled_token_ids.cpu()
                     self._glm5next_shadow_score(None)
+                    self._glm5next_drain_settle()
                     sampled_token_ids = [
                         [] for _ in range(len(self.model_runner_output.req_ids))
                     ]
@@ -266,6 +277,7 @@ class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
                     # Non-spec: [bs] of sampled tokens.
                     sampled_token_ids = [[x] for x in sampled_token_ids.cpu().tolist()]
                 self._glm5next_shadow_score(sampled_token_ids)
+                self._glm5next_drain_settle()
                 self._discard_partial_prefill_samples(sampled_token_ids)
                 # If this output was marked for skip-emit (e.g. the last
                 # spec step's bonus will be re-emitted by the following
@@ -668,14 +680,25 @@ def indexer_side_cache_bytes(
     and ``max_num_seqs``; ``speculative_tokens`` is the mtp server's ``k`` (0 otherwise),
     which deepens the two rings (``NeuronModelRunner._glm5next_indexer_ring_rows``). A
     model whose text config declares no indexer (``index_kpool`` and ``index_head_dim``)
-    has no side caches: 0.
+    has no side caches: 0. Under ``VLLM_NEURON_GLM5NEXT_PREFILL_PAIRS`` the sum holds
+    every recurrent layer's partner carriers too, in its spec's state shapes and dtypes.
     """
     index_kpool = getattr(text_config, "index_kpool", None)
     index_head_dim = getattr(text_config, "index_head_dim", None)
     if index_kpool is None or index_head_dim is None:
         return 0
     banks = [
-        {"family": "linear_attn"}
+        {
+            "family": "linear_attn",
+            # The bank's two states, position 0 the convolution (the spec's order):
+            # the shapes the partner carriers copy.
+            **{
+                key: torch.empty((0, *shape), dtype=dtype, device="meta")
+                for key, shape, dtype in zip(
+                    ("conv_state", "recurrent_state"), spec.shapes, spec.dtypes
+                )
+            },
+        }
         if isinstance(spec, MambaSpec)
         else {
             "family": "self_attn",
@@ -692,6 +715,7 @@ def indexer_side_cache_bytes(
         ring_rows=NeuronModelRunner._glm5next_indexer_ring_rows(
             int(index_kpool), int(speculative_tokens)
         ),
+        pair_carriers=envs.VLLM_NEURON_GLM5NEXT_PREFILL_PAIRS,
     )
     return sum(tensor.nbytes for entry in side for tensor in entry.values())
 
@@ -1390,6 +1414,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # hook and the mtp draft proposal; None until a step is converted and after
         # a synthetic one.
         self._glm5next_step_record = None
+        # Under the chunk-pair knob, the settle a prompt's last pair step leaves for
+        # ``_glm5next_settle_pairs``: (request slot, whether this rank takes); then,
+        # under async scheduling, its unread output until the step's async output
+        # claims it (``_glm5next_settle_claim``). None otherwise.
+        self._glm5next_pending_settle = None
+        self._glm5next_settle_inflight = None
         # The async drafter's carry between two steps (``functional/mtp/async_step.
         # StepCarry``): written by the state hook from the step's device output, read
         # once by the next step's translator and by its draft proposal. None on the
@@ -4945,6 +4975,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 query_bucket = max(
                     self.neuron_config.num_batched_tokens_buckets or [max_query_len]
                 )
+                if self._glm5next_prefill_pairs() is not None:
+                    # Nothing is widened under the chunk-pair knob: a step reads the
+                    # window of its own bucket, one chunk or two.
+                    query_bucket = int(max_query_len)
                 self._require_prefill_chunk_window(
                     kv_segment_size,
                     query_bucket,
@@ -5376,6 +5410,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         """
         if device is None:
             device = self.device
+        if (
+            self._glm5next_settles_with(bucket_size)
+            and not envs.VLLM_NEURON_DISABLE_PARALLEL_TRACE
+            and not envs.is_native_backend()
+        ):
+            # The parallel trace pool runs one job per bucket, and the settle behind a
+            # pair step has none there; the in-process extraction captures it beside the
+            # pair graph (``extract_prefill_graphs``).
+            raise ValueError(
+                "VLLM_NEURON_GLM5NEXT_PREFILL_PAIRS captures its settle graph in the "
+                "in-process prefill extraction; set VLLM_NEURON_DISABLE_PARALLEL_TRACE=1"
+            )
         cached_seq_len = 0
         num_reqs = 1
         num_tokens = bucket_size
@@ -5504,6 +5550,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 bucket_size,
                 kv_segment_size,
             )
+        if self._glm5next_settles_with(bucket_size):
+            # The settle runs behind a prompt's last pair step, so its graph is captured
+            # beside the pair graph's. It reads no window: each segment captures it again
+            # under the same key.
+            try:
+                _ = self.capture_backend_model(
+                    **self._glm5next_pair_settle_kwargs(
+                        slot=0, take=False, device=device or self.device
+                    )
+                )
+            except CaptureComplete:
+                logger.debug("Graph capture for the chunk-pair settle completed")
 
         # === Draft model graph capture (eagle only: the mtp draft is in the target) ===
         if isinstance(self.drafter, EagleProposer):
@@ -5574,6 +5632,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             self._glm5next_async_warmup(model_output, batch_size=1, is_prefill=True)
         if self.use_async_scheduling:
             self._materialize_warmup_output(model_output)
+        if self._glm5next_settles_with(bucket_size):
+            # Slot 0 belongs to no request yet, and a rank that does not take writes its
+            # own carriers back unchanged.
+            settled = self.model(
+                **self._glm5next_pair_settle_kwargs(slot=0, take=False, device=self.device)
+            )
+            if self.use_async_scheduling:
+                self._materialize_warmup_output(settled)
         if self._tensor_replacer is not None:
             set_active_context(None)
         compile_elapsed = time.perf_counter() - compile_start
@@ -6016,6 +6082,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         max_seq_len: int,
         request_slots: int,
         ring_rows: int | None = None,
+        pair_carriers: bool = False,
     ) -> list[dict]:
         """Allocate the two indexer caches no ``LayerSpec`` declares, one set per sparse layer.
 
@@ -6051,6 +6118,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         ``pad_tail`` is a scratch ring of the same shape. A decode step padded to its
         batch bucket serves each padding row from it, so a padding row's ring write
         never lands in a ring a request owns.
+
+        ``pair_carriers`` (``VLLM_NEURON_GLM5NEXT_PREFILL_PAIRS``): every recurrent bank
+        also gets this rank's carriers of its partner shard's heads, under the keys
+        ``model_fp8.KDA_PAIR_CARRIER_KEYS``, each ``[slots, *state]`` in the bank's own
+        shape and dtype. A pair step runs both shards' heads and writes both; no
+        ``LayerSpec`` declares them because decode never reads them.
         """
         pool = int(index_kpool)
         width = int(index_head_dim)
@@ -6074,10 +6147,24 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 f"a ring of {ring} row(s) cannot close a pool"
             )
         rows = int(max_seq_len) // pool + 1
+        partner_keys = ()
+        if pair_carriers:
+            from vllm_neuron.model.glm5_next.model_fp8 import KDA_PAIR_CARRIER_KEYS
+
+            partner_keys = tuple(zip(KDA_PAIR_CARRIER_KEYS, ("conv_state", "recurrent_state")))
         side: list[dict] = []
         for bank in banks:
             if bank["family"] != "self_attn":
-                side.append({})
+                side.append(
+                    {
+                        key: torch.zeros(
+                            (slots, *bank[own].shape[1:]),
+                            dtype=bank[own].dtype,
+                            device=bank[own].device,
+                        )
+                        for key, own in partner_keys
+                    }
+                )
                 continue
             reference = bank["latent_cache"]
             side.append(
@@ -6168,6 +6255,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             ring_rows=self._glm5next_indexer_ring_rows(
                 int(text_config.index_kpool), self._glm5next_speculative_tokens()
             ),
+            pair_carriers=self._glm5next_prefill_pairs() is not None,
         )
         self._glm5next_side_cache_set = live
         # A fresh set is owned by nobody: the slot table and position record refer
@@ -6391,7 +6479,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 if pending is not None:
                     pending.get_output()
             for side in side_caches or ():
-                if not side:
+                if "pool_cache" not in side:
                     continue
                 for key in ("pool_cache", "tail"):
                     empty_slot(side[key], free)
@@ -7613,6 +7701,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             [int(recorded.get(int(one_slot), 0)) for one_slot in slots],
         )
 
+    def _glm5next_prefill_pairs(self):
+        """The loaded root's chunk-pair plan (``model_fp8.PrefillPairs``), or None.
+
+        None with ``VLLM_NEURON_GLM5NEXT_PREFILL_PAIRS`` off, before the import, so a
+        server without the knob runs none of the pair code; with it on, the root's load
+        built the plan or refused the server by name.
+        """
+        if not envs.VLLM_NEURON_GLM5NEXT_PREFILL_PAIRS:
+            return None
+        from vllm_neuron.model.glm5_next.model_fp8 import PREFILL_PAIRS_ATTR
+
+        return getattr(getattr(self, "model", None), PREFILL_PAIRS_ATTR, None)
+
     def _glm5next_model_kwargs(self, kwargs: dict) -> dict:
         """Translate the generic model kwargs for the carrier-passing GLM-5.3-Flash family.
 
@@ -7677,8 +7778,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             bank["name"]: metadata_map[bank["name"]]
             for bank in banks if bank["name"] in metadata_map
         }
+        # Under the chunk-pair knob a prefill step is one chunk or two at its own
+        # bucket: the one-chunk step is the knob-off server's graph and the two-chunk
+        # step runs a chunk per rank, so neither is widened.
+        pairs = self._glm5next_prefill_pairs()
         if (
-            operator_rows > selected_query_rows
+            pairs is None
+            and operator_rows > selected_query_rows
             and any(bank["family"] == "self_attn" for bank in banks)
             and all(
                 int(metadata["max_query_len"])
@@ -7923,9 +8029,6 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             )
         is_prefill = legs.pop()
         request_starts = list(starts.pop())
-        # The scalar is the first request's, which is what a one-request step's
-        # sparse carrier reads; a decode step of several reads ``request_starts``.
-        start_position = request_starts[0]
         # Re-derived from the agreed cached lengths rather than from whichever group
         # the walk ended on; the derivation is a pure function of the builder's
         # array and the batch's width, so it agrees with every group's.
@@ -7948,6 +8051,24 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         synthetic_step = all(
             int(position) == 0 for position in request_starts
         ) and not self._glm5next_batch_request_ids()
+        # Under the chunk-pair knob, a two-chunk prefill step's chunks: this rank runs
+        # one and builds its partner's write addresses. None on every other step.
+        pair_chunks = None
+        if pairs is not None:
+            if self._glm5next_pending_settle is not None:
+                raise ValueError(
+                    "the previous step was a prompt's last chunk-pair step and its settle "
+                    "(_glm5next_settle_pairs) did not run; this step would read carriers "
+                    "the other prefill group does not hold"
+                )
+            if is_prefill:
+                pair_chunks = self._glm5next_pair_chunks(
+                    pairs,
+                    tokens=tokens,
+                    request_starts=request_starts,
+                    request_tokens=request_tokens,
+                    synthetic=synthetic_step,
+                )
         # The slot is settled here, not in the walk above, because whether the step
         # is synthetic is only known once the leg and the position are read.
         request_ids = self._glm5next_request_identities(
@@ -8057,13 +8178,21 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             async_correction, async_column = self._glm5next_async_correction(
                 banks, geometries, request_ids, request_starts, width=width, padding=padding,
             )
+        # The rows this rank's layers run: the step's, or a two-chunk step's own chunk.
+        # The step's numbers stay the request's: its slot, cursor and record below. The
+        # scalar start is the first request's, which a one-request step's sparse carrier
+        # reads; a decode step of several reads every request's.
+        layer_tokens, layer_starts, layer_reals = tokens, list(request_starts), list(request_tokens)
+        if pair_chunks is not None:
+            layer_tokens = pairs.chunk_rows
+            layer_starts, layer_reals = [pair_chunks.own_start], [pair_chunks.own_real]
         carriers = self._glm5next_layer_carriers(
             banks,
             side_caches,
             geometries=geometries,
             is_prefill=is_prefill,
-            tokens=tokens,
-            start_position=start_position,
+            tokens=layer_tokens,
+            start_position=layer_starts[0],
             softmax_scale=float(
                 (
                     int(text_config.qk_nope_head_dim)
@@ -8081,12 +8210,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             max_seq_len=self._glm5next_indexer_context(),
             index_kpool=int(text_config.index_kpool),
             requests=len(state_slots) + padding,
-            request_starts=list(request_starts) + [0] * padding,
+            request_starts=layer_starts + [0] * padding,
             # The first request's real length, for the sparse family: its ring and
             # pool mask stop where the sequence stops, not where the bucket does.
-            real_tokens=request_tokens[0],
+            real_tokens=layer_reals[0],
             # Every request's own length, for the per-row masks; padding has none.
-            request_real_tokens=list(request_tokens) + [0] * padding,
+            request_real_tokens=layer_reals + [0] * padding,
             active_mla_query_rows=active_mla_query_rows,
             padded_requests=padding,
             dcp_size=dcp_size,
@@ -8099,6 +8228,20 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             async_correction=async_correction,
             block_table_column=async_column,
         )
+        pair_kwargs: dict = {}
+        if pair_chunks is not None:
+            self._glm5next_add_pair_carriers(
+                carriers,
+                banks,
+                side_caches,
+                geometries,
+                chunks=pair_chunks,
+                chunk_rows=pairs.chunk_rows,
+                index_kpool=int(text_config.index_kpool),
+            )
+            pair_kwargs = self._glm5next_pair_step_kwargs(
+                kwargs, input_ids, chunks=pair_chunks, chunk_rows=pairs.chunk_rows
+            )
         # The cursor advances only once the carriers exist: the call above can still
         # refuse (paging disagreement, slot out of range), and a refused step must
         # leave no trace. A synthetic step takes no claim. Each request advances by
@@ -8129,10 +8272,21 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             self._glm5next_side_cache_cursor = (
                 int(request_starts[0]) + request_tokens[0]
             )
+        if pair_chunks is not None and not synthetic_step:
+            step_end = int(request_starts[0]) + int(request_tokens[0])
+            if pairs.settles_after(
+                step_end, self._prefill_request_tokens(request_starts[0], request_tokens[0])
+            ):
+                # The prompt's last pair step: the group that ran its first chunk takes
+                # the newest carriers before the request's next step reads its own.
+                self._glm5next_pending_settle = (int(state_slots[0]), not pair_chunks.second)
         return {
             "input_ids": input_ids,
             "layer_carriers": carriers,
             "sampling_positions": kwargs["sampling_positions"],
+            # A two-chunk step: this rank's chunk's ids and sampled row replace the two
+            # above, beside the role (``pair_second``); {} on every other step.
+            **pair_kwargs,
             # Present only when the runner and the root both sample on device.
             **device_sampling_kwargs(
                 kwargs,
@@ -8167,6 +8321,221 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # other step, so the decode and text-only signatures are unchanged.
             **self._glm5next_vision_kwargs(kwargs, rows=tokens),
         }
+
+    # ── Chunk-pair prefill (VLLM_NEURON_GLM5NEXT_PREFILL_PAIRS) ───────────
+    # A prefill step of two chunks runs one chunk on each prefill group
+    # (``model_fp8.PrefillPairs``). The translator above builds this rank's chunk's
+    # carriers as a one-chunk step's; the helpers below add the pair operands, and
+    # after a prompt's last pair step run the settle that hands the newest carriers
+    # to the group that does not hold them.
+
+    def _glm5next_pair_chunks(
+        self, pairs, *, tokens: int, request_starts, request_tokens, synthetic: bool
+    ):
+        """This rank's chunks of a two-chunk prefill step, or None on a one-chunk step.
+
+        A prompt of more than one chunk reaches the runner in pair steps from position
+        0, one request per step (the scheduler's one prefill and its two-chunk token
+        budget), and only its last step may hold one chunk. Both shapes are checked here,
+        while the positions are still host ints: the roles alternate by step number, and
+        a one-chunk step reads the own carriers, which hold the prompt only after a
+        settle. A synthetic step (warmup, capture) names no prompt and skips the second
+        check.
+
+        Raises:
+            ValueError: a step of more than one request, or a one-chunk step that does
+                not end its prompt.
+            Glm5NextPrefillPairsError: from ``PrefillPairs.step_chunks``.
+        """
+        if len(request_starts) != 1:
+            raise ValueError(
+                f"a chunk-pair server prefills one request per step; this step carries "
+                f"{len(request_starts)}"
+            )
+        start, real = int(request_starts[0]), int(request_tokens[0])
+        if int(tokens) == pairs.step_rows:
+            return pairs.step_chunks(start, real)
+        prompt_end = self._prefill_request_tokens(start, real)
+        if not synthetic and start + real != prompt_end:
+            raise ValueError(
+                f"under VLLM_NEURON_GLM5NEXT_PREFILL_PAIRS a one-chunk prefill step is its "
+                f"prompt's last: this one covers [{start}, {start + real}) of a prompt "
+                f"ending at {prompt_end}, and the next step would need the carriers both "
+                f"prefill groups write"
+            )
+        return None
+
+    def _glm5next_add_pair_carriers(
+        self,
+        carriers: list[dict],
+        banks,
+        side_caches,
+        geometries,
+        *,
+        chunks,
+        chunk_rows: int,
+        index_kpool: int,
+    ) -> None:
+        """Add a two-chunk step's pair keys to this rank's own-chunk carriers, in place.
+
+        Per recurrent layer, this rank's carriers of its partner shard's heads at the
+        request's slot (``model_fp8.KDA_PAIR_CARRIER_KEYS``, one-sequence views). Per
+        sparse layer, where the partner chunk's rows persist
+        (``model_fp8.DSA_PAIR_CARRIER_KEYS``): its latent slots and its pool slot
+        mapping, from the builders the own chunk's carrier used. As for the own chunk,
+        the latent slots are one tensor per layer and the slot mapping one per device,
+        so a served step aliases its inputs as the warmup step did.
+
+        Raises:
+            ValueError: a slot past a partner carrier's bank, or a partner chunk past
+                the request's pages.
+        """
+        from vllm_neuron.model.glm5_next.model_fp8 import (
+            DSA_PAIR_CARRIER_KEYS,
+            KDA_PAIR_CARRIER_KEYS,
+        )
+
+        slots_key, mapping_key = DSA_PAIR_CARRIER_KEYS
+        mappings: dict = {}
+        for bank, side, geometry, carrier in zip(banks, side_caches, geometries, carriers):
+            slot = int(geometry["state_slot"])
+            if bank["family"] != "self_attn":
+                for key in KDA_PAIR_CARRIER_KEYS:
+                    if not 0 <= slot < int(side[key].shape[0]):
+                        raise ValueError(
+                            f"KV layer '{bank['name']}' holds {int(side[key].shape[0])} "
+                            f"{key} slot(s) and this request was given slot {slot}"
+                        )
+                carrier.update({key: side[key][slot] for key in KDA_PAIR_CARRIER_KEYS})
+                continue
+            ids = [int(value) for value in geometry["block_ids"]]
+            block_size = int(bank["block_size"])
+            end = chunks.partner_start + chunks.partner_real
+            if end > len(ids) * block_size:
+                raise ValueError(
+                    f"KV layer '{bank['name']}' would write the partner chunk up to "
+                    f"position {end} through {len(ids)} block(s) of {block_size}; a write "
+                    f"past the request's pages lands on another sequence's rows"
+                )
+            device = bank["latent_cache"].device
+            if device not in mappings:
+                mappings[device] = self._glm5next_batch_pool_slot_mapping(
+                    [(chunk_rows, chunks.partner_start)],
+                    index_kpool=index_kpool,
+                    device=device,
+                    real_tokens=[chunks.partner_real],
+                    block_size=block_size,
+                )
+            carrier[slots_key] = self._glm5next_latent_slot_mapping(
+                rows=[ids],
+                starts=[chunks.partner_start],
+                tokens=chunk_rows,
+                block_size=block_size,
+                reals=[chunks.partner_real],
+                device=device,
+            )
+            carrier[mapping_key] = mappings[device]
+
+    @staticmethod
+    def _glm5next_pair_step_kwargs(
+        kwargs: dict, input_ids: torch.Tensor, *, chunks, chunk_rows: int
+    ) -> dict:
+        """A two-chunk step's own-chunk ids and sampled row, and its role, for the root.
+
+        ``input_ids`` is the step's ``[2C]`` row set; this rank's chunk is its first or
+        second half. The sampled row is the chunk's last real one: the step's last real
+        row is the second chunk's, and the root takes it from the rank that holds it.
+        The role crosses as ``pair_second``, ``[1]`` int32, so both groups trace one
+        graph.
+
+        Raises:
+            ValueError: a step sampling more than one row.
+        """
+        sampled = kwargs["sampling_positions"]
+        if int(sampled.numel()) != 1:
+            raise ValueError(
+                f"a chunk-pair step samples its one request's last row; this step samples "
+                f"{int(sampled.numel())}"
+            )
+        device = input_ids.device
+        return {
+            "input_ids": input_ids.narrow(0, chunk_rows * int(chunks.second), chunk_rows),
+            "sampling_positions": torch.tensor(
+                [chunks.own_real - 1], dtype=sampled.dtype
+            ).to(device),
+            "pair_second": torch.tensor([int(chunks.second)], dtype=torch.int32).to(device),
+        }
+
+    def _glm5next_pair_settle_kwargs(self, slot: int, take: bool, device) -> dict:
+        """The root's settle call for request slot ``slot`` (``PrefillPairs.settle``).
+
+        Per recurrent layer the slot's own carriers and its partner carriers; per sparse
+        layer the slot's indexer ring; and ``pair_settle_take``, ``[1]`` int32, nonzero
+        on the group that takes. One-sequence views of the banks, so the settle writes
+        them in place.
+        """
+        from vllm_neuron.model.glm5_next.model_fp8 import (
+            DSA_RING_CARRIER_KEY,
+            KDA_PAIR_CARRIER_KEYS,
+        )
+
+        banks = self.model.glm5next_layer_banks
+        carriers = []
+        for bank, side in zip(banks, self._glm5next_live_side_caches(banks)):
+            if bank["family"] == "self_attn":
+                carriers.append({DSA_RING_CARRIER_KEY: side["tail"][slot]})
+                continue
+            carriers.append(
+                {
+                    "conv_state": bank["conv_state"][slot],
+                    "recurrent_state": bank["recurrent_state"][slot],
+                    **{key: side[key][slot] for key in KDA_PAIR_CARRIER_KEYS},
+                }
+            )
+        return {
+            "input_ids": None,
+            "layer_carriers": carriers,
+            "sampling_positions": None,
+            "pair_settle_take": torch.tensor([int(take)], dtype=torch.int32).to(device),
+        }
+
+    def _glm5next_settle_pairs(self) -> None:
+        """Run the settle a prompt's last pair step left, right behind that step.
+
+        Launched after the step's forward and before the request's next step is built,
+        which refuses to run while one is pending. The output is drained, never read for
+        a value: an unread execution stays in the runtime's queue. Under async scheduling
+        it rides with the step's output and is read back on the thread that reads the
+        step's ids, after them (``AsyncNeuronModelRunnerOutput``), since a host read on
+        this thread between steps stalls the pipelined engine; a synchronous runner
+        reads it here, as it reads every step.
+        """
+        if self._glm5next_pending_settle is None:
+            return
+        slot, take = self._glm5next_pending_settle
+        with model_forward_context(self.vllm_config):
+            output = self.model(**self._glm5next_pair_settle_kwargs(slot, take, self.device))
+        self._glm5next_pending_settle = None
+        if self.use_async_scheduling:
+            self._glm5next_settle_inflight = output
+        else:
+            output.cpu()
+
+    def _glm5next_settles_with(self, bucket_size: int) -> bool:
+        """Whether the prefill graph of ``bucket_size`` rows is a pair step's, which a
+        settle follows: its extraction and warmup also capture and run the settle."""
+        pairs = self._glm5next_prefill_pairs()
+        return pairs is not None and int(bucket_size) == pairs.step_rows
+
+    def _glm5next_settle_claim(self):
+        """The settle launched behind the step whose async output is being built, or None.
+
+        Called once per output object, from its constructor, so the settle is drained
+        with the output of the step it follows.
+        """
+        output = self._glm5next_settle_inflight
+        self._glm5next_settle_inflight = None
+        return output
 
     def _glm5next_parallel_kwargs(self, device: torch.device | None = None) -> dict:
         """Return the root's three parallelism arguments, read from the parallel state.
@@ -10911,6 +11280,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         with self._snapshot_capture_context(positions, spec_decode_metadata):
             with model_forward_context(self.vllm_config):
                 model_output = self.model(**self._glm5next_model_kwargs(model_kwargs))
+        # A prompt's last chunk-pair step leaves a settle; nothing pends otherwise.
+        self._glm5next_settle_pairs()
         if self._tensor_replacer is not None:
             set_active_context(None)
         if self._target_tensor_capture is not None:
