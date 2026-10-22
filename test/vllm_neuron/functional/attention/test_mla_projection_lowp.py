@@ -166,3 +166,104 @@ def test_the_fp32_route_is_unchanged_without_a_low_precision_operand():
     got = MP.mla_projection_prepared(x, fp32_weight, None)
     assert MP.mla_projection_lowp_counts()[0] == 0
     assert torch.equal(got, MP.mla_projection(x.float(), fp32_weight))
+
+
+# ---- the bf16 store: a partial its bf16 wire rounds next ------------------------------
+
+
+@pytest.mark.parametrize("fp8", [True, False], ids=["fp8", "bf16"])
+@pytest.mark.parametrize("rows, lnc", [(4, "1"), (4, "2"), (256, "1"), (256, "2")],
+                         ids=["cols-1", "cols-2", "rows-1", "rows-2"])
+def test_a_bf16_store_holds_the_bf16_cast_of_the_fp32_result(rows, lnc, fp8, monkeypatch):
+    """``bf16_out`` rounds each sum once, to nearest even, in its copy out of PSUM, on
+    the column split (a decode batch) and the row split (a prefill chunk) alike."""
+    monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", lnc)
+    x, w_out_in, s_out_in = _operands(rows, 256, 1024, fp8, seed=31 + rows)
+    weight, scale = MP.prepare_lowp_projection(w_out_in, s_out_in)
+    assert MP.lowp_splits_rows(rows, 1, 256 * 2) == (rows == 256)
+    fp32 = MP.mla_projection_lowp(x, weight, scale)
+    bf16 = MP.mla_projection_lowp(x, weight, scale, out_dtype=torch.bfloat16)
+    assert fp32.dtype == torch.float32 and bf16.dtype == torch.bfloat16
+    assert torch.equal(bf16, fp32.to(torch.bfloat16))
+
+
+def test_the_fp32_route_casts_its_result_for_a_bf16_store():
+    x, w_out_in, _ = _operands(2, 256, 128, False, seed=23)
+    fp32_weight = w_out_in.float().t().contiguous()
+    got = MP.mla_projection_prepared(x, fp32_weight, None, out_dtype=torch.bfloat16)
+    want = MP.mla_projection(x.float(), fp32_weight)
+    assert got.dtype == torch.bfloat16 and torch.equal(got, want.to(torch.bfloat16))
+
+
+@pytest.mark.parametrize("out_dtype", [torch.float32, torch.float16], ids=str)
+def test_an_out_dtype_other_than_none_or_bf16_is_refused(out_dtype):
+    x, w_out_in, s_out_in = _operands(1, 256, 256, True, seed=19)
+    weight, scale = MP.prepare_lowp_projection(w_out_in, s_out_in)
+    with pytest.raises(MP.MlaProjectionError, match="None .* or torch.bfloat16"):
+        MP.mla_projection_lowp(x, weight, scale, out_dtype=out_dtype)
+    with pytest.raises(MP.MlaProjectionError, match="None .* or torch.bfloat16"):
+        MP.mla_projection_prepared(x, weight, (weight, scale), out_dtype=out_dtype)
+    with pytest.raises(MP.MlaProjectionError, match="None .* or torch.bfloat16"):
+        MP.mla_projection_prepared(x, weight.float(), None, out_dtype=out_dtype)
+
+
+# ---- traced: an fp32 call is the route's own graph ------------------------------------
+
+
+def _traced(fn, *args):
+    """``fn``'s graph as dynamo records it on ``args`` (no compile behind it)."""
+    seen = []
+
+    def record(gm, example_inputs):
+        seen.append(gm)
+        return gm.forward
+
+    torch._dynamo.reset()
+    try:
+        torch.compile(fn, backend=record, fullgraph=True, dynamic=False)(*args)
+    finally:
+        torch._dynamo.reset()
+    (gm,) = seen
+    return gm.graph
+
+
+def _computed(graph):
+    """Every node but the placeholders, whose order follows the route's first reads."""
+    return [(node.op, str(node.target), str(node.args), str(node.kwargs))
+            for node in graph.nodes if node.op != "placeholder"]
+
+
+def _returned(graph):
+    (output,) = [node for node in graph.nodes if node.op == "output"]
+    return output.args[0][0]
+
+
+@pytest.mark.parametrize("bf16_out", [False, True], ids=["fp32", "bf16"])
+@pytest.mark.parametrize("fp8", [True, False], ids=["fp8", "bf16"])
+def test_the_kernel_call_is_the_result_with_bf16_out_as_asked(fp8, bf16_out, monkeypatch):
+    """No cast after the call, and no local of the route renames its node (the compile
+    cache key holds node names); ``bf16_out`` True only for a bf16 store."""
+    monkeypatch.delenv("NEURON_LOGICAL_NC_CONFIG", raising=False)
+    meta = torch.device("meta")
+    x = torch.empty(4, 256, dtype=torch.bfloat16, device=meta)
+    weight = torch.empty(256, 1024, dtype=torch.float8_e4m3fn if fp8 else torch.bfloat16,
+                         device=meta)
+    scale = torch.empty(2, 8, dtype=torch.float32, device=meta) if fp8 else None
+    out_dtype = torch.bfloat16 if bf16_out else None
+    graph = _traced(lambda x, w, s: MP.mla_projection_lowp(x, w, s, out_dtype=out_dtype),
+                    x, weight, scale)
+    (call,) = [node for node in graph.nodes if "nki_kernel_wrapper" in str(node.target)]
+    assert _returned(graph) is call
+    assert call.name not in MP.mla_projection_lowp.__code__.co_varnames
+    assert list(call.kwargs["arg_names"]) == ["x_hbm", "w_hbm", "scale_hbm", "col_chunk",
+                                              "bf16_out"]
+    assert call.kwargs["args"][4] is bf16_out
+
+
+def test_without_an_out_dtype_the_fp32_route_traces_the_fp32_kernel():
+    meta = torch.device("meta")
+    x = torch.empty(4, 256, dtype=torch.bfloat16, device=meta)
+    weight = torch.empty(256, 1024, dtype=torch.float32, device=meta)
+    route = _traced(lambda x, w: MP.mla_projection_prepared(x, w, None), x, weight)
+    kernel = _traced(lambda x, w: MP.mla_projection(x.to(torch.float32), w), x, weight)
+    assert _computed(route) == _computed(kernel)

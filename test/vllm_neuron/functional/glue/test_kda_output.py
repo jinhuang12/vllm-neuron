@@ -145,3 +145,124 @@ def test_the_layer_hands_its_phase_to_the_output_kernel(pair, monkeypatch):
         fused.reset_dispatch_counters()
         live._gated_output(core, gate, hidden, phase=phase)
         assert fused.dispatch_counters() == counters, phase
+
+
+# ── the bf16 store: a partial its bf16 wire rounds next ─────────────────────────────
+
+
+def _prefill_operands(rows):
+    gen = torch.Generator().manual_seed(90 + rows)
+    return torch.randn(rows, 128, generator=gen) * 0.2, torch.randn(rows, 128, generator=gen) * 2.0
+
+
+@pytest.mark.parametrize("lnc", ("1", "2"))
+def test_the_prefill_kernel_stores_the_bf16_cast_of_its_fp32_sums(pair, lnc, monkeypatch):
+    """``BF16_OUT`` rounds each sum once, to nearest even, as it leaves PSUM: the bits
+    of a bf16 cast of the fp32 store, at half the bytes."""
+    monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", lnc)
+    live, _, _ = pair
+    core, gate = _prefill_operands(256)
+    fused.reset_dispatch_counters()
+    fp32 = fused.kda_gated_projection(core, gate, live, phase="prefill")
+    bf16 = fused.kda_gated_projection(core, gate, live, phase="prefill", out_dtype=torch.bfloat16)
+    assert fused.dispatch_counters() == (2, 0)
+    assert fp32.dtype == torch.float32 and bf16.dtype == torch.bfloat16
+    assert torch.equal(bf16, fp32.to(torch.bfloat16))
+
+
+@pytest.mark.parametrize("spec, counters", (("all", (1, 0)), ("0", (0, 1))),
+                         ids=("decode-kernel", "torch"))
+def test_the_decode_kernel_and_the_torch_route_cast_their_fp32_result(pair, spec, counters,
+                                                                      monkeypatch):
+    monkeypatch.setenv("VLLM_NEURON_GLUE_FUSED", spec)
+    live, _, _ = pair
+    core, gate, _ = _operands(4)
+    fp32 = fused.kda_gated_projection(core, gate, live, phase="decode")
+    fused.reset_dispatch_counters()
+    bf16 = fused.kda_gated_projection(core, gate, live, phase="decode", out_dtype=torch.bfloat16)
+    assert fused.dispatch_counters() == counters
+    assert bf16.dtype == torch.bfloat16 and torch.equal(bf16, fp32.to(torch.bfloat16))
+
+
+@pytest.mark.parametrize("out_dtype", (torch.float32, torch.float16), ids=str)
+def test_an_out_dtype_other_than_none_or_bf16_is_refused(pair, out_dtype):
+    live, _, _ = pair
+    core, gate, _ = _operands(4)
+    with pytest.raises(ValueError, match="None .* or torch.bfloat16"):
+        fused.kda_gated_projection(core, gate, live, phase="decode", out_dtype=out_dtype)
+
+
+# ── traced: an fp32 call is the route's own graph ───────────────────────────────────
+
+
+def _traced(fn, *args):
+    """``fn``'s graph as dynamo records it on ``args`` (no compile behind it)."""
+    seen = []
+
+    def record(gm, example_inputs):
+        seen.append(gm)
+        return gm.forward
+
+    torch._dynamo.reset()
+    try:
+        torch.compile(fn, backend=record, fullgraph=True, dynamic=False)(*args)
+    finally:
+        torch._dynamo.reset()
+    (gm,) = seen
+    return gm.graph
+
+
+def _meta_case(rows):
+    """Meta operands at the served per-rank KDA shape: one head of 128, ``H = 4096``."""
+    meta = torch.device("meta")
+    attn = SimpleNamespace(
+        o_proj_weight=torch.empty(4096, 128, dtype=torch.bfloat16, device=meta),
+        o_norm_weight=torch.empty(128, dtype=torch.bfloat16, device=meta),
+        num_kv_heads_per_rank=1, head_dim=128, rms_norm_eps=1e-6)
+    core = torch.empty(rows, 128, dtype=torch.float32, device=meta)
+    return core, torch.empty_like(core), attn
+
+
+def _computed(graph):
+    """Every node but the placeholders, whose order follows the route's first reads."""
+    return [(node.op, str(node.target), str(node.args), str(node.kwargs))
+            for node in graph.nodes if node.op != "placeholder"]
+
+
+def _returned(graph):
+    (output,) = [node for node in graph.nodes if node.op == "output"]
+    return output.args[0][0]
+
+
+def test_without_an_out_dtype_the_torch_route_traces_the_torch_expression(monkeypatch):
+    """No cast after the fp32 matmul: the graph a decode step traced before the bf16
+    store existed (the served default fuses ``kda_output`` at prefill only)."""
+    monkeypatch.setenv("VLLM_NEURON_GLUE_FUSED", "0")
+    core, gate, attn = _meta_case(4)
+    route = _traced(lambda c, g: fused.kda_gated_projection(c, g, attn, phase="decode"),
+                    core, gate)
+    expression = _traced(lambda c, g: fused.kda_gated_projection_torch(c, g, attn), core, gate)
+    assert _computed(route) == _computed(expression)
+
+
+@pytest.mark.parametrize("rows, phase, flag", ((4, "decode", None), (256, "prefill", False),
+                                               (256, "prefill", True)),
+                         ids=("decode", "prefill", "prefill-bf16"))
+def test_a_kernel_call_is_the_graphs_result_with_bf16_out_as_asked(rows, phase, flag,
+                                                                   monkeypatch):
+    """The decode kernel has no ``BF16_OUT``; the prefill call records it, True only for
+    a bf16 store (the wrapper records every parameter, defaults included). No local of
+    the route renames the call's node: the compile cache key holds node names."""
+    monkeypatch.setenv("NEURON_LOGICAL_NC_CONFIG", "2")
+    core, gate, attn = _meta_case(rows)
+    out_dtype = torch.bfloat16 if flag else None
+    graph = _traced(lambda c, g: fused.kda_gated_projection(c, g, attn, phase=phase,
+                                                            out_dtype=out_dtype), core, gate)
+    (call,) = [node for node in graph.nodes if "nki_kernel_wrapper" in str(node.target)]
+    assert _returned(graph) is call
+    assert call.name not in fused.kda_gated_projection.__code__.co_varnames
+    names = list(call.kwargs["arg_names"])
+    if flag is None:
+        assert "BF16_OUT" not in names
+    else:
+        assert call.kwargs["args"][names.index("BF16_OUT")] is flag
