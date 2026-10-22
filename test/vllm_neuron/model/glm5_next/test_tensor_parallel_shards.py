@@ -501,7 +501,7 @@ def test_shard_the_scale_grid_follows_its_weight_and_refuses_misalignment(
     assert dense, "the shard fixture built no dense MLP"
 
     for leaf, literal in zip(SHARD_DENSE_LEAVES, SHARD_GRID_ATTRIBUTES, strict=True):
-        from_model = whole._sibling_scale_grid_name(leaf)
+        from_model = whole.sibling_scale_grid_name(leaf)
         from_file = _scale_grid_attribute(leaf)
         assert from_model == literal, (
             f"the model derives {from_model!r} as {leaf}'s grid attribute; this "

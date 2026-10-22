@@ -165,7 +165,7 @@ def _fp8_bank(experts: int, out_features: int, in_features: int, gen) -> tuple[t
 
 
 def _grid_name(leaf: str) -> str:
-    return model_fp8.Glm5NextForConditionalGeneration._sibling_scale_grid_name(leaf)
+    return model_fp8.Glm5NextForConditionalGeneration.sibling_scale_grid_name(leaf)
 
 
 def _attach(module, leaf: str, weight: torch.Tensor, grid: torch.Tensor, device) -> None:

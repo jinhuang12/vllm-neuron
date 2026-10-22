@@ -220,7 +220,7 @@ def partner_tensor_plan(model: nn.Module, world_size: int) -> tuple[PartnerTenso
                     checkpoint_keys=tuple(_as_key_list(keys)),
                     geometry=geometry,
                     form=PARTNER_PARAMETER,
-                    dtype=model._placeholder_dtype(
+                    dtype=model.placeholder_dtype(
                         keys, param_name=name, mappings=mappings
                     ),
                     is_bank=kind == MAPPED_KEY_STACKED_BANK,
@@ -270,7 +270,7 @@ def _out_of_band_grid_plan(
         geometry = _shard_geometry_for(module, leaf, world_size)
         if not _differs_between_shards(kind, geometry, module):
             continue
-        attribute = model._sibling_scale_grid_name(leaf)
+        attribute = model.sibling_scale_grid_name(leaf)
         if not attribute:
             raise Glm5NextWeightMapError(
                 f"{param_name} carries scale keys but its leaf name is not a weight "

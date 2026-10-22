@@ -3124,7 +3124,7 @@ def load_pair_shards(
     # Read off the config, and only when a grid is planned, as the own reader reads it.
     block_size = None
     if any(entry.form != PARTNER_PARAMETER for entry in plan):
-        block_size = model._checkpoint_block_size()
+        block_size = model.checkpoint_block_size()
 
     loaded: list[LoadedPartner] = []
     for entry, placement in planned:

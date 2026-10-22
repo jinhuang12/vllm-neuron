@@ -422,7 +422,7 @@ def _dequantise(weight_fp8: torch.Tensor, block_scale: torch.Tensor) -> torch.Te
 
 def _scale_grid_attribute(leaf: str) -> str:
     """The attribute name the model stores a weight leaf's scale grid under."""
-    return _impl().Glm5NextForConditionalGeneration._sibling_scale_grid_name(leaf)
+    return _impl().Glm5NextForConditionalGeneration.sibling_scale_grid_name(leaf)
 
 
 def _attach(
