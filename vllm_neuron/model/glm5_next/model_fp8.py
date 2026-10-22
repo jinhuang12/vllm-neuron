@@ -11983,18 +11983,23 @@ class PrefillPairs:
         """Prepare the views, build the stack a pair step runs, bind the step's tensors.
 
         Called after the own preps. Each view from :meth:`take_partner_shards` runs the
-        preps of the module it copies
-        (:meth:`Glm5NextForConditionalGeneration._prepare_module`) on its own leaves;
-        an MLA view then reads the own module's operands of the replicated latent
-        projections, of which its prep built a second copy. The stack is copied layer
+        preps of the module it copies on its own leaves, through the own preps' body
+        (:meth:`Glm5NextForConditionalGeneration._run_load_time_preps`); an MLA view
+        then reads the own module's operands of the replicated latent projections, of
+        which its prep built a second copy. The stack is copied layer
         by layer, each copy holding the attention view, the feed-forward view and
         copies of its two mHC sites, all under :attr:`shard` and the prefill group.
         Every per-rank value a pair graph reads is a device tensor bound here: the
         prefill-group index, the partner's expert block and the vocabulary order.
         """
+        root._run_load_time_preps(
+            device,
+            modules=[
+                (f"{path} (chunk-pair view)", view) for path, view in self._views.values()
+            ],
+        )
         modules = {id(module): module for module in root.modules()}
-        for key, (path, view) in self._views.items():
-            root._prepare_module(f"{path} (chunk-pair view)", view, device)
+        for key, (_path, view) in self._views.items():
             if isinstance(view, Glm5NextMLAAttention):
                 self._share_replicated_operands(view, modules[key])
         self.prefill_rank = torch.full(
@@ -12916,10 +12921,19 @@ class Glm5NextForConditionalGeneration(nn.Module):
             read += 1
         return read
 
-    def _run_load_time_preps(self, device: torch.device) -> tuple[int, int]:
+    def _run_load_time_preps(
+        self,
+        device: torch.device,
+        modules: Sequence[tuple[str, nn.Module]] | None = None,
+    ) -> tuple[int, int]:
         """Call both load-time preps, each behind its own device pre-flight.
 
         Returns ``(projection prep calls, scale prep calls)``.
+
+        ``modules`` holds the ``(path, module)`` pairs to prepare, ``path`` naming a
+        module in a refusal. ``None`` walks the whole tree and then binds the prefill
+        sequence shard. The chunk-pair views (:class:`PrefillPairs`) pass their own, so
+        they are prepared by this one body after the tree.
 
         Once every prep on a module has run, the checkpoint tensors its class declares
         under ``RELEASED_AFTER_PREP`` are released: that class's forward reads the
@@ -12942,102 +12956,87 @@ class Glm5NextForConditionalGeneration(nn.Module):
         """
         projection_calls = 0
         scale_calls = 0
-        for path, module in self.named_modules():
-            projections, scales = self._prepare_module(path, module, device)
-            projection_calls += projections
-            scale_calls += scales
-        # The prefill sequence shard, after the walk because it binds on the mHC sites
-        # the walk bound. With its switch off it binds None and nothing reads it.
-        self.model.bind_prefill_sequence_shard(self.text_config.neuron_config, device)
-        return projection_calls, scale_calls
-
-    def _prepare_module(
-        self, path: str, module: nn.Module, device: torch.device
-    ) -> tuple[int, int]:
-        """Run every load-time prep ``module``'s class declares, in the walk's order.
-
-        Returns ``(projection prep calls, scale prep calls)`` for this module, each 0
-        or 1. One body for the walk of :meth:`_run_load_time_preps` and for the
-        chunk-pair views (:class:`PrefillPairs`), which prepare their own leaves the
-        same way. ``path`` names the module in a refusal.
-        """
-        projection_calls = 0
-        scale_calls = 0
-        if hasattr(type(module), "prepare_projection_weights"):
-            names = [n for n, _, _ in module.projection_widths()]
-            self._require_prep_operands_on_device(path, module, names, device)
-            module.prepare_projection_weights()
-            projection_calls += 1
-            # The absorb split reads the prepared ``kv_b_proj``, so it has to run
-            # after the prep that builds it -- here, immediately after, behind the
-            # same device pre-flight and inside the same single call site. A module
-            # that declares no absorb split is skipped by the same ``hasattr``
-            # test this method already uses on the two preps.
+        for path, module in self.named_modules() if modules is None else modules:
+            if hasattr(type(module), "prepare_projection_weights"):
+                names = [n for n, _, _ in module.projection_widths()]
+                self._require_prep_operands_on_device(path, module, names, device)
+                module.prepare_projection_weights()
+                projection_calls += 1
+                # The absorb split reads the prepared ``kv_b_proj``, so it has to run
+                # after the prep that builds it -- here, immediately after, behind the
+                # same device pre-flight and inside the same single call site. A module
+                # that declares no absorb split is skipped by the same ``hasattr``
+                # test this loop already uses on the two preps.
+                #
+                # It adds no return value on purpose: this method returns
+                # ``(projection calls, scale calls)`` and its callers read that pair,
+                # so a third element would change a working contract for a count that
+                # can be read straight off the module.
+                if hasattr(type(module), "prepare_absorb_weights"):
+                    module.prepare_absorb_weights()
+            # The checkpoint's grids are at 128-tile granularity and arrive in the
+            # loader's frame, so the frame bridge runs here -- on the load path, after
+            # the shards are attached and before the prep reads the grid two branches
+            # below. It used to bridge the granularity too, onto a 256 public grid;
+            # since the block narrowed, the prep consumes the checkpoint's own 128 grid
+            # and only the frame is bridged. Gated by the same ``hasattr`` test, so a
+            # module that declares no retile is skipped and the routed bank -- which
+            # retiles inside its own prep -- is untouched.
             #
-            # It adds no return value on purpose: this method returns
-            # ``(projection calls, scale calls)`` and its callers read that pair,
-            # so a third element would change a working contract for a count that
-            # can be read straight off the module.
-            if hasattr(type(module), "prepare_absorb_weights"):
-                module.prepare_absorb_weights()
-        # The checkpoint's grids are at 128-tile granularity and arrive in the
-        # loader's frame, so the frame bridge runs here -- on the load path, after
-        # the shards are attached and before the prep reads the grid two branches
-        # below. It used to bridge the granularity too, onto a 256 public grid;
-        # since the block narrowed, the prep consumes the checkpoint's own 128 grid
-        # and only the frame is bridged. Gated by the same ``hasattr`` test, so a
-        # module that declares no retile is skipped and the routed bank -- which
-        # retiles inside its own prep -- is untouched.
-        #
-        # It adds no return value either, for the reason recorded just above. What
-        # the retile did is on the module, in its own health record.
-        if hasattr(type(module), "retile_checkpoint_scale_grids"):
-            names = [
-                leaf[: -len(_WEIGHT_LEAF_SUFFIX)]
-                for leaf in _scale_prep_leaves(module)
-            ]
-            self._require_prep_operands_on_device(path, module, names, device)
-            module.retile_checkpoint_scale_grids()
-        if hasattr(type(module), "prepare_scale_operands"):
-            # The projection names come off the module's own declaration tuple, so
-            # this call cannot ask for a projection the shared expert does not
-            # have -- and, through ``_scale_prep_leaves``, only for one whose scale
-            # grid is present to be read two lines below. Passed by keyword: the
-            # prep takes six positional operands, and a silent reordering of three
-            # weights against three scales would compute a wrong answer at exactly
-            # the right shapes.
-            names = [
-                leaf[: -len(_WEIGHT_LEAF_SUFFIX)]
-                for leaf in _scale_prep_leaves(module)
-            ]
-            self._require_prep_operands_on_device(path, module, names, device)
-            operands = {}
-            for name in names:
-                leaf = f"{name}{_WEIGHT_LEAF_SUFFIX}"
-                operands[leaf] = getattr(module, leaf)
-                operands[f"{name}_scale"] = getattr(
-                    module, self._sibling_scale_grid_name(leaf)
-                )
-            module.prepare_scale_operands(**operands)
-            scale_calls += 1
-        # The release reads the class's own declaration and nothing else: a
-        # class whose forward still reads a loaded tensor declares nothing
-        # and keeps everything, whichever preps it defines.
-        released = getattr(type(module), "RELEASED_AFTER_PREP", ())
-        if released:
-            _release_replaced_parameters(module, *released)
-        # The mHC bind, on the same ``hasattr`` gate the three steps above use. It
-        # fires on the two decoder layer classes, and those two declare none of the
-        # three preps, so this branch adds a step to the walk without reordering
-        # one. It adds no return value, for the same reason the two steps above do
-        # not: what the bind did is on the layer, in its own record.
-        #
-        # ``self.text_config`` is passed because both site instances are sized from
-        # the config's own dials and a layer keeps no config of its own, and
-        # ``device`` is passed because the bind refuses an operand that is not where
-        # this load put it.
-        if hasattr(type(module), "bind_hyper_connection_sites"):
-            module.bind_hyper_connection_sites(self.text_config, device)
+            # It adds no return value either, for the reason recorded just above. What
+            # the retile did is on the module, in its own health record.
+            if hasattr(type(module), "retile_checkpoint_scale_grids"):
+                names = [
+                    leaf[: -len(_WEIGHT_LEAF_SUFFIX)]
+                    for leaf in _scale_prep_leaves(module)
+                ]
+                self._require_prep_operands_on_device(path, module, names, device)
+                module.retile_checkpoint_scale_grids()
+            if hasattr(type(module), "prepare_scale_operands"):
+                # The projection names come off the module's own declaration tuple, so
+                # this call cannot ask for a projection the shared expert does not
+                # have -- and, through ``_scale_prep_leaves``, only for one whose scale
+                # grid is present to be read two lines below. Passed by keyword: the
+                # prep takes six positional operands, and a silent reordering of three
+                # weights against three scales would compute a wrong answer at exactly
+                # the right shapes.
+                names = [
+                    leaf[: -len(_WEIGHT_LEAF_SUFFIX)]
+                    for leaf in _scale_prep_leaves(module)
+                ]
+                self._require_prep_operands_on_device(path, module, names, device)
+                operands = {}
+                for name in names:
+                    leaf = f"{name}{_WEIGHT_LEAF_SUFFIX}"
+                    operands[leaf] = getattr(module, leaf)
+                    operands[f"{name}_scale"] = getattr(
+                        module, self._sibling_scale_grid_name(leaf)
+                    )
+                module.prepare_scale_operands(**operands)
+                scale_calls += 1
+            # The release reads the class's own declaration and nothing else: a
+            # class whose forward still reads a loaded tensor declares nothing
+            # and keeps everything, whichever preps it defines.
+            released = getattr(type(module), "RELEASED_AFTER_PREP", ())
+            if released:
+                _release_replaced_parameters(module, *released)
+            # The mHC bind, on the same ``hasattr`` gate the three steps above use. It
+            # fires on the two decoder layer classes, and those two declare none of the
+            # three preps, so this branch adds a step to the walk without reordering
+            # one. It adds no return value, for the same reason the two steps above do
+            # not: what the bind did is on the layer, in its own record.
+            #
+            # ``self.text_config`` is passed because both site instances are sized from
+            # the config's own dials and a layer keeps no config of its own, and
+            # ``device`` is passed because the bind refuses an operand that is not where
+            # this load put it.
+            if hasattr(type(module), "bind_hyper_connection_sites"):
+                module.bind_hyper_connection_sites(self.text_config, device)
+        if modules is None:
+            # The prefill sequence shard, after the walk because it binds on the mHC
+            # sites the walk bound. With its switch off it binds None and nothing reads
+            # it.
+            self.model.bind_prefill_sequence_shard(self.text_config.neuron_config, device)
         return projection_calls, scale_calls
 
     def _require_prep_operands_on_device(
