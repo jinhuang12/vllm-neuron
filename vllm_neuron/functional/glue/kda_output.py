@@ -10,6 +10,9 @@ The torch route, ``Glm5NextKDAAttention._gated_output``, computes, all in fp32::
 then reduces ``attn_out`` over the TP group and casts it to the activations' dtype.
 The kernels return the same fp32 ``attn_out`` (the reduction and the cast stay at the
 call site, in that order), without the per-step fp32 copy and transpose of ``o_proj``.
+A caller whose reduction rounds the partial to bf16 first (its wire dtype) may ask for
+bf16: the prefill kernel then rounds each fp32 sum once, as it leaves PSUM, and stores
+half the bytes; every other route casts its fp32 result.
 
 Method (both kernels). The elementwise steps run with tokens on the partitions, in the
 torch expression's order, in fp32. The projection runs on the tensor engine as two bf16
@@ -29,9 +32,9 @@ The two kernels split the work over the LNC2 pair differently:
   ``o_proj``; no exchange is needed.
 * :func:`kda_output_prefill_kernel` (``T`` a multiple of 128 per program, above that
   bound): each program takes a contiguous half of the rows, all ``H`` columns of them,
-  and the whole ``o_proj^T``. At ``T = 1024`` the 16 MiB fp32 output dominates the
-  call, so each program loads ``o_proj^T`` one 512-column bank at a time and writes
-  each ``[128, 512]`` output block as soon as it is formed.
+  and the whole ``o_proj^T``. At ``T = 1024`` the 16 MiB fp32 output (8 MiB in bf16)
+  dominates the call, so each program loads ``o_proj^T`` one 512-column bank at a time
+  and writes each ``[128, 512]`` output block as soon as it is formed.
 """
 
 from __future__ import annotations
@@ -64,7 +67,8 @@ DMA_TRANSPOSE_ENV = "VLLM_NEURON_GLUE_KDA_DMA_TRANSPOSE"
 _P = 128
 _BANK = 512  # fp32 columns per PSUM bank
 #: PSUM banks per output store in the prefill kernel: each partition then writes one
-#: contiguous 4 x 512 fp32 = 8 KiB run per store instead of four 2 KiB runs.
+#: contiguous 4 x 512 fp32 = 8 KiB run per store instead of four 2 KiB runs (4 KiB
+#: runs when the kernel stores bf16).
 _STORE_BANKS = 4
 _DGE_ROWS = 16
 
@@ -229,8 +233,9 @@ def kda_output_kernel(core, out_gate, o_norm, o_proj, HEADS: int = 1, EPS: float
 
 @nki.jit
 def kda_output_prefill_kernel(core, out_gate, o_norm, o_proj, HEADS: int = 1,
-                              EPS: float = 1e-6, DMA_TRANSPOSE: bool = True):
-    """``attn_out [T, H]`` fp32, before the TP reduction (prefill shapes).
+                              EPS: float = 1e-6, DMA_TRANSPOSE: bool = True,
+                              BF16_OUT: bool = False):
+    """``attn_out [T, H]`` fp32 (bf16 with ``BF16_OUT``), before the TP reduction, at prefill.
 
     Each program takes ``T / programs`` contiguous rows in 128-row tiles: the gated
     RMSNorm of all its tiles at once (tokens on the partitions, the tiles side by side
@@ -250,6 +255,9 @@ def kda_output_prefill_kernel(core, out_gate, o_norm, o_proj, HEADS: int = 1,
         o_norm: ``[kdim]`` gain (bf16 or fp32).
         o_proj: ``[H, W]`` bf16, this rank's row-parallel slice.
         DMA_TRANSPOSE: load ``o_proj^T`` by DMA transpose (else tensor engine).
+        BF16_OUT: round each fp32 sum to bf16 in the copy that reads it out of PSUM, to
+            nearest even, and store bf16 (else store the fp32 sums). That is the one
+            rounding a bf16 cast of the fp32 output makes, so the bits are the same.
     """
     tokens, width = core.shape
     hidden, w2 = o_proj.shape
@@ -264,7 +272,8 @@ def kda_output_prefill_kernel(core, out_gate, o_norm, o_proj, HEADS: int = 1,
     rows = tokens // programs
     r0 = program * rows
     tiles = rows // _P
-    out = nl.ndarray((tokens, hidden), dtype=nl.float32, buffer=nl.shared_hbm)
+    out_dtype = nl.bfloat16 if BF16_OUT else nl.float32
+    out = nl.ndarray((tokens, hidden), dtype=out_dtype, buffer=nl.shared_hbm)
 
     # ---- Gated RMSNorm of this program's rows: c[p, i] = core[r0 + 128 i + p]. #
     c = nl.ndarray((_P, tiles * HEADS, kdim), dtype=nl.float32, buffer=nl.sbuf)
@@ -298,14 +307,15 @@ def kda_output_prefill_kernel(core, out_gate, o_norm, o_proj, HEADS: int = 1,
         for i in range(tiles):
             # Each bank's accumulator takes the same two passes in the same order as one
             # bank per store; only the store grouping changes, so every output bit is kept.
-            block = nl.ndarray((_P, group * _BANK), dtype=nl.float32, buffer=nl.sbuf)
+            block = nl.ndarray((_P, group * _BANK), dtype=out_dtype, buffer=nl.sbuf)
             for j in range(group):
                 acc = nl.ndarray((_P, _BANK), dtype=nl.float32, buffer=nl.psum)
                 for part in range(2):
                     nisa.nc_matmul(dst=acc, stationary=gt[:, i, part, :],
                                    moving=ot[:, j * _BANK:(j + 1) * _BANK],
                                    accumulate=(part > 0))
-                # The PSUM reads alternate Vector and Scalar, the two engines that read PSUM.
+                # The PSUM reads alternate Vector and Scalar, the two engines that read PSUM;
+                # a bf16 block takes its one rounding here.
                 nisa.tensor_copy(dst=block[:, j * _BANK:(j + 1) * _BANK], src=acc,
                                  engine=nisa.engine.vector
                                  if ((g0 + j) * tiles + i) % 2 == 0 else nisa.engine.scalar)
@@ -420,7 +430,8 @@ def kda_gated_projection_torch(core: Tensor, out_gate: Tensor, attn) -> Tensor:
 
 
 def kda_gated_projection(core: Tensor, out_gate: Tensor, attn,
-                         phase: str | None = None) -> Tensor:
+                         phase: str | None = None,
+                         out_dtype: torch.dtype = torch.float32) -> Tensor:
     """The gated RMSNorm of ``core`` and its output projection, on a kernel or in torch.
 
     Args:
@@ -428,20 +439,32 @@ def kda_gated_projection(core: Tensor, out_gate: Tensor, attn,
         out_gate: ``[T, W]`` fp32 output gate.
         attn: the KDA attention module.
         phase: the step's ``"prefill"`` or ``"decode"``, for ``VLLM_NEURON_GLUE_FUSED``.
+        out_dtype: ``torch.float32`` (the default), or ``torch.bfloat16`` for a caller
+            that rounds the partial to bf16 next. The prefill kernel then rounds in its
+            store (``BF16_OUT``); the decode kernel and the torch route cast their fp32
+            result. Either way the bits are those of a bf16 cast of the fp32 partial.
 
     Returns:
-        ``attn_out [T, H]`` fp32, this rank's partial sum before the TP reduction. When
-        :func:`kda_gated_projection_admits` says no, it is the torch expression
-        (:func:`kda_gated_projection_torch`).
+        ``attn_out [T, H]`` in ``out_dtype``, this rank's partial sum before the TP
+        reduction. When :func:`kda_gated_projection_admits` says no, it is the torch
+        expression (:func:`kda_gated_projection_torch`).
+
+    Raises:
+        ValueError: ``out_dtype`` is neither fp32 nor bf16.
     """
+    if out_dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError(f"kda_gated_projection stores fp32 or bf16; got {out_dtype}")
     if not kda_gated_projection_admits(core, out_gate, attn, phase):
-        return kda_gated_projection_torch(core, out_gate, attn)
+        return kda_gated_projection_torch(core, out_gate, attn).to(out_dtype)
     _count_nki_dispatch()
-    tokens = int(core.shape[0])
-    kernels = _KERNELS if tokens <= KDA_OUTPUT_MAX_TOKENS else _PREFILL_KERNELS
-    return kernels[launch_programs()](
-        core=core.contiguous(), out_gate=out_gate.contiguous(),
-        o_norm=attn.o_norm_weight.contiguous(), o_proj=attn.o_proj_weight.contiguous(),
-        HEADS=int(attn.num_kv_heads_per_rank), EPS=float(attn.rms_norm_eps),
-        DMA_TRANSPOSE=envs.VLLM_NEURON_GLUE_KDA_DMA_TRANSPOSE,
+    operands = {
+        "core": core.contiguous(), "out_gate": out_gate.contiguous(),
+        "o_norm": attn.o_norm_weight.contiguous(), "o_proj": attn.o_proj_weight.contiguous(),
+        "HEADS": int(attn.num_kv_heads_per_rank), "EPS": float(attn.rms_norm_eps),
+        "DMA_TRANSPOSE": envs.VLLM_NEURON_GLUE_KDA_DMA_TRANSPOSE,
+    }
+    if int(core.shape[0]) <= KDA_OUTPUT_MAX_TOKENS:
+        return _KERNELS[launch_programs()](**operands).to(out_dtype)
+    return _PREFILL_KERNELS[launch_programs()](
+        **operands, BF16_OUT=out_dtype is torch.bfloat16
     )

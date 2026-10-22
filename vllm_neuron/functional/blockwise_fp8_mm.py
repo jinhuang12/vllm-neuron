@@ -1144,6 +1144,7 @@ def blockwise_fp8_mlp_prefill_kernel(
     up_scale,
     down_scale,
     swiglu_limit,
+    bf16_out=False,
 ):
     """One fused blockwise-fp8 SwiGLU MLP for whole-tile prefill.
 
@@ -1158,9 +1159,13 @@ def blockwise_fp8_mlp_prefill_kernel(
         gate_scale, up_scale: ``[H // 128, I // 128]`` fp32 public grids.
         down_scale: ``[I // 128, H // 128]`` fp32 public grid.
         swiglu_limit: the checkpoint's clamp bound ``L``.
+        bf16_out: a trace-time bool. True makes the last contraction block's
+            multiply (or multiply-add) write bf16, rounding each fp32 result to
+            nearest even as it is formed, and stores bf16: the one rounding a bf16
+            cast of the fp32 output makes, so the bits are the same.
 
     Returns:
-        ``[M, H]`` fp32.
+        ``[M, H]`` fp32, or bf16 with ``bf16_out``.
 
     Launch: one program, or a ``[2]`` grid (:func:`mlp_prefill_launch_grid`)
     that gives each physical core of an LNC2 core one contiguous half of the
@@ -1190,7 +1195,7 @@ def blockwise_fp8_mlp_prefill_kernel(
     """
     return _mlp_prefill(
         x, gate_weight, up_weight, down_weight, gate_scale, up_scale, down_scale,
-        swiglu_limit, None,
+        swiglu_limit, None, bf16_out,
     )
 
 
@@ -1242,8 +1247,10 @@ def _mlp_prefill(
     down_scale,
     swiglu_limit,
     addend,
+    bf16_out=False,
 ):
-    """The body of both prefill MLP kernels: ``addend`` is None or ``[M, H]`` fp32."""
+    """The body of both prefill MLP kernels: ``addend`` is None or ``[M, H]`` fp32;
+    ``bf16_out`` (without an addend) rounds the result to bf16 in its last block's write."""
     m_total, hidden = x.shape
     _, inter = gate_weight.shape
     kernel_assert(
@@ -1272,10 +1279,13 @@ def _mlp_prefill(
     kernel_assert(
         addend is None or tuple(addend.shape) == (m_total, hidden), "addend must be [M, H]"
     )
+    kernel_assert(addend is None or not bf16_out, "an addend's sum is bf16 already")
+    # The last contraction block of the down projection writes the result rounded.
+    round_last = bool(bf16_out)
 
     out = nl.ndarray(
         (m_total, hidden),
-        dtype=nl.float32 if addend is None else nl.bfloat16,
+        dtype=nl.float32 if addend is None and not round_last else nl.bfloat16,
         buffer=nl.shared_hbm,
     )
 
@@ -1334,6 +1344,9 @@ def _mlp_prefill(
         # ---- down, tokens on partitions: out[m, h]. ----------------------- #
         for mt in range(m_rows // TILE_SIZE):
             res = nl.ndarray((TILE_SIZE, hidden), dtype=nl.float32, buffer=nl.sbuf)
+            rounded = None
+            if round_last:
+                rounded = nl.ndarray((TILE_SIZE, hidden), dtype=nl.bfloat16, buffer=nl.sbuf)
             for h0 in range(0, hidden, _PSUM_BANK_FP32):
                 n_cols = min(_PSUM_BANK_FP32, hidden - h0)
                 for ib in range(n_inter_blocks):
@@ -1346,7 +1359,12 @@ def _mlp_prefill(
                     )
                     for q in range(n_cols // TILE_SIZE):
                         col = ib * kb_count + h0 // TILE_SIZE + q
-                        dst = res[:, h0 + q * TILE_SIZE:h0 + (q + 1) * TILE_SIZE]
+                        cols = slice(h0 + q * TILE_SIZE, h0 + (q + 1) * TILE_SIZE)
+                        dst = res[:, cols]
+                        # The last block's write is the result's: rounded to bf16
+                        # there when the kernel stores bf16, else the accumulator.
+                        last = ib == n_inter_blocks - 1
+                        result = rounded[:, cols] if round_last and last else dst
                         block = part[:, q * TILE_SIZE:(q + 1) * TILE_SIZE]
                         if ib == 0:
                             # With one intermediate block every step is a
@@ -1354,7 +1372,7 @@ def _mlp_prefill(
                             # more, Vector runs the later blocks' adds.
                             on_vector = n_inter_blocks == 1 and q % 2 == 1
                             nisa.tensor_scalar(
-                                dst=dst,
+                                dst=result,
                                 data=block,
                                 op0=nl.multiply,
                                 operand0=down_grid[:, col:col + 1],
@@ -1362,13 +1380,15 @@ def _mlp_prefill(
                             )
                         else:
                             nisa.scalar_tensor_tensor(
-                                dst=dst,
+                                dst=result,
                                 data=block,
                                 op0=nl.multiply,
                                 operand0=down_grid[:, col:col + 1],
                                 op1=nl.add,
                                 operand1=dst,
                             )
+            if round_last:
+                res = rounded
             rows = [[hidden, TILE_SIZE], [1, hidden]]
             row0 = (c0 + mt * TILE_SIZE) * hidden
             if addend is not None:
@@ -1811,6 +1831,7 @@ def blockwise_fp8_mlp(
     swiglu_limit: float,
     prebuilt_scale_t: tuple[Tensor, Tensor, Tensor] | None = None,
     addend: Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
 ) -> Tensor:
     """The clamped SwiGLU MLP on blockwise fp8 weights, one fused kernel.
 
@@ -1828,13 +1849,19 @@ def blockwise_fp8_mlp(
         addend: ``[M, H]`` fp32 added to the result inside the prefill kernel
             (:func:`blockwise_fp8_mlp_prefill_add_kernel`), or None. Only that
             route takes it; ask :func:`prefill_mlp_takes` first.
+        out_dtype: None for the route's own dtype (below), or ``torch.bfloat16`` for
+            a caller that rounds the result to bf16 next: the prefill kernel then
+            rounds in its last block's write (``bf16_out``) and stores half the bytes,
+            and every other route casts its fp32 result. The bits are those of a bf16
+            cast of the fp32 result either way.
 
     Returns:
-        ``[M, H]`` fp32, or with ``addend`` ``(mlp(x) + addend).to(bf16)``.
+        ``[M, H]`` fp32, or with ``addend`` ``(mlp(x) + addend).to(bf16)``; bf16 with
+        ``out_dtype=torch.bfloat16``.
 
     Raises:
         ValueError: an ``addend`` on a call the prefill kernel does not run, or
-            one that is not ``[M, H]`` fp32.
+            one that is not ``[M, H]`` fp32; an ``out_dtype`` other than None or bf16.
 
     Route, with the NKI route available: ``1 <= M < 128`` runs one
     :func:`blockwise_fp8_mlp_small_m_kernel` call and never pads tokens, on the
@@ -1851,6 +1878,12 @@ def blockwise_fp8_mlp(
 
     tokens, hidden = int(x.shape[-2]), int(x.shape[-1])
     intermediate = int(gate_weight.shape[-1])
+    if out_dtype not in (None, torch.bfloat16):
+        raise ValueError(
+            f"blockwise_fp8_mlp: out_dtype is None (the route's own dtype) or "
+            f"torch.bfloat16; got {out_dtype}"
+        )
+    rounds = out_dtype is torch.bfloat16
     if addend is not None:
         if not prefill_mlp_takes(x, gate_weight, up_weight, down_weight):
             raise ValueError(
@@ -1872,7 +1905,7 @@ def blockwise_fp8_mlp(
         call = wrap_nki(blockwise_fp8_mlp_small_m_kernel)
         if grid:
             call = call[grid]
-        return call(
+        result = call(
             x=x,
             gate_weight=gate_weight,
             up_weight=up_weight,
@@ -1882,6 +1915,7 @@ def blockwise_fp8_mlp(
             down_scale=down_scale,
             swiglu_limit=float(swiglu_limit),
         )
+        return result.to(torch.bfloat16) if rounds else result
     if prefill_mlp_takes(x, gate_weight, up_weight, down_weight):
         _count_mlp_fused()
         grid = mlp_prefill_launch_grid(tokens)
@@ -1893,6 +1927,12 @@ def blockwise_fp8_mlp(
         )
         if grid:
             call = call[grid]
+        # The add kernel's sum is bf16 already; the plain kernel rounds when asked.
+        extra = {}
+        if addend is not None:
+            extra["addend"] = addend.contiguous()
+        elif rounds:
+            extra["bf16_out"] = True
         return call(
             x=x,
             gate_weight=gate_weight,
@@ -1902,7 +1942,7 @@ def blockwise_fp8_mlp(
             up_scale=up_scale,
             down_scale=down_scale,
             swiglu_limit=float(swiglu_limit),
-            **({} if addend is None else {"addend": addend.contiguous()}),
+            **extra,
         )
     if not nki:
         _count_mlp_torch_fallback()
@@ -1912,9 +1952,10 @@ def blockwise_fp8_mlp(
     gate = gate.clamp(min=None, max=swiglu_limit)
     up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
     activated = silu(gate) * up
-    return blockwise_fp8_mm(
+    result = blockwise_fp8_mm(
         activated.to(x.dtype), down_weight, down_scale, prebuilt_scale_t=down_t
     )
+    return result.to(torch.bfloat16) if rounds else result
 
 
 def blockwise_fp8_mm_torch_oracle(

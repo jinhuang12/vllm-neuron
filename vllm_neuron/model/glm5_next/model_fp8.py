@@ -3529,6 +3529,7 @@ class Glm5NextDenseMLP(nn.Module):
         hidden_states: torch.Tensor,
         *,
         quant_config: Glm5NextQuantConfig,
+        partial_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         """One dense layer's MLP: three projections and a clamped SwiGLU.
 
@@ -3558,10 +3559,15 @@ class Glm5NextDenseMLP(nn.Module):
             quant_config: the resolved per-model quantisation policy, and the
                 route selector. An argument rather than a field, because no module
                 in this file holds a policy.
+            partial_dtype: the dtype the caller rounds this output to before its
+                row-parallel sum, or None when it sums in fp32. With bfloat16 the
+                prefill kernel rounds in its store, the same one rounding, and stores
+                half the bytes (``blockwise_fp8_mlp``'s ``out_dtype``).
 
         Returns:
-            ``[T, H]`` fp32 -- the kernel's own return dtype, not re-cast here.
-            The layer forward decides the residual dtype.
+            ``[T, H]`` fp32 -- the kernel's own return dtype, not re-cast here --
+            or bf16 with ``partial_dtype`` bf16. The layer forward decides the
+            residual dtype.
 
         Raises:
             Glm5NextDenseMLPRouteError: when ``quant_config`` resolved no
@@ -3670,6 +3676,7 @@ class Glm5NextDenseMLP(nn.Module):
                 scale_grid("down_proj_weight"),
                 swiglu_limit=self.swiglu_limit,
                 prebuilt_scale_t=prebuilt_scale_t,
+                out_dtype=partial_dtype,
             ),
             tokens,
         )
@@ -4812,8 +4819,13 @@ class Glm5NextKDAAttention(nn.Module):
         # builds this half as a gated RMSNorm whose activation is sigmoid
         # (``kimi_gdn_linear_attn.py``), which is why the raw gate is passed
         # through a sigmoid here and not through a silu. On the fused kernel or
-        # the torch expressions (functional/glue/kda_output.py).
-        attn_out = kda_gated_projection(core, out_gate, self, phase=phase)
+        # the torch expressions (functional/glue/kda_output.py). Where the reduction
+        # below rounds the partial to its wire dtype first, the producer stores it in
+        # that dtype: the same one rounding, without a separate cast pass.
+        wire = _row_parallel_wire_dtype(int(core.shape[0]), module=self)
+        attn_out = kda_gated_projection(
+            core, out_gate, self, phase=phase, out_dtype=wire or torch.float32
+        )
         # ``o_proj_weight`` is row-parallel, so this is one rank's partial sum.
         # Reduce it before the cast below, in the wire dtype ``collective_policy``
         # names for this step: by default bf16 at a prefill chunk, which rounds each
@@ -6170,7 +6182,8 @@ class Glm5NextDSAIndexer(nn.Module):
         ordered: bool = True,
         rank_rows: tuple | None = None,
         keep_bits: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        ids_wanted: bool = True,
+    ) -> torch.Tensor | tuple[torch.Tensor | None, torch.Tensor]:
         """``[T, select_k]`` int32 pool ids for a selecting call: replicated or row-sharded.
 
         Every row runs :meth:`score_pools` then :meth:`select_bounded_pools` against the
@@ -6190,6 +6203,11 @@ class Glm5NextDSAIndexer(nn.Module):
         the ``P`` candidate pools (``functional/dsa/selection_keep.py``): ``(pool_ids,
         keep_bits)``. Each rank makes the bits of the rows it selected, from their ids, and
         a sharded call all-gathers them in the same row order as the ids.
+
+        ``ids_wanted=False`` (with ``keep_bits`` only) is the caller saying the keep table
+        is the selection's one reader. Each rank still selects its rows and makes their
+        bits from their ids, but the ids are not gathered: the call returns ``(None,
+        keep_bits)``, and a sharded chunk crosses the wire once, for the bits.
         """
         from vllm_neuron.functional.dsa.indexer_shard import (
             gather_rows,
@@ -6198,6 +6216,11 @@ class Glm5NextDSAIndexer(nn.Module):
         )
         from vllm_neuron.functional.dsa.selection_keep import dsa_selection_keep
 
+        if not (ids_wanted or keep_bits):
+            raise Glm5NextDSAIndexerError(
+                "a selection that returns neither its pool ids nor its keep table has no "
+                "reader; pass keep_bits=True or ids_wanted=True"
+            )
         pools = int(candidate_keys.shape[0])
 
         def select(rows_query, rows_weights, rows_seq_lens):
@@ -6205,7 +6228,7 @@ class Glm5NextDSAIndexer(nn.Module):
             return self.select_bounded_pools(scores, rows_seq_lens, ordered=ordered)
 
         def gathered(local, group, shard):
-            pool_ids = gather_rows(local, group, shard)
+            pool_ids = gather_rows(local, group, shard) if ids_wanted else None
             if not keep_bits:
                 return pool_ids
             bits = dsa_selection_keep(local, pools)
@@ -6217,7 +6240,9 @@ class Glm5NextDSAIndexer(nn.Module):
         plan = self._row_shard_plan(int(query.shape[0]), shardable)
         if plan is None:
             pool_ids = select(query, weights, seq_lens)
-            return (pool_ids, dsa_selection_keep(pool_ids, pools)) if keep_bits else pool_ids
+            if not keep_bits:
+                return pool_ids
+            return (pool_ids if ids_wanted else None), dsa_selection_keep(pool_ids, pools)
         group, shard, rank = plan
         local = select_local_rows(select, query, weights, seq_lens, shard, rank)
         return gathered(local, group, shard)
@@ -6581,7 +6606,7 @@ class Glm5NextDSAIndexer(nn.Module):
         projected: tuple | None = None,
         ordered: bool = True,
         keep_bits: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor] | None:
+    ) -> torch.Tensor | tuple[torch.Tensor | None, torch.Tensor] | None:
         """The whole indexer chain. Returns ``topk_indices`` and nothing else, unless the
         caller asks for the keep table too (``keep_bits``).
 
@@ -6594,8 +6619,8 @@ class Glm5NextDSAIndexer(nn.Module):
 
         ``indices_wanted=False`` is the caller saying it attends the causal prefix
         itself when selection is a no-op: the write stage still runs, the query side
-        is skipped, and None is returned instead of the causal fill. It changes
-        nothing while ``max_seq_len`` selects.
+        is skipped, and None is returned instead of the causal fill. While
+        ``max_seq_len`` selects it changes nothing, except beside ``keep_bits`` (below).
 
         ``ordered=False`` is the caller saying its attention reads each row's selection
         as a set (``model/glm5_next/dsa_set_selection.py``): the selection without DCP
@@ -6607,7 +6632,10 @@ class Glm5NextDSAIndexer(nn.Module):
         per row and candidate pool, made from the same pool ids
         (:meth:`_select_pool_ids`). The call then returns ``(topk_indices, keep_bits)``,
         the second ``[tokens, candidates / 8]`` uint8. Only a selecting prefill call
-        without DCP has a table to make, and any other call refuses the flag.
+        without DCP has a table to make, and any other call refuses the flag. With
+        ``indices_wanted=False`` beside it the table is the selection's one reader: the
+        ids stay on the rank that selected them, for their bits, no all-gather moves
+        them, and the call returns ``(None, keep_bits)``.
 
         No per-row valid length is returned, with the indices or with the keep table:
         the ``-1`` mask stays inside the sparse kernel, and a returned length would
@@ -6829,13 +6857,15 @@ class Glm5NextDSAIndexer(nn.Module):
         selection = self._select_pool_ids(
             query, candidate_keys, weights, seq_lens, shardable=not is_decode,
             ordered=ordered, rank_rows=rank_rows, keep_bits=keep_bits,
+            ids_wanted=indices_wanted or not keep_bits,
         )
         if not keep_bits:
             return self.expand_indices(selection, seq_lens)
         pool_ids, bits = selection
-        # The ids are expanded beside the table: the attention seam checks their shape
-        # before it hands the call to the dense-masked pass, which reads only the table.
-        # So the expansion has no reader in those graphs, and their HLO holds none of it.
+        if pool_ids is None:
+            return None, bits
+        # A caller that reads the ids beside the table (the layer-stream dump) gets them
+        # expanded, as the gather route would.
         return self.expand_indices(pool_ids, seq_lens), bits
 
     def _query_row_cut(
@@ -8159,8 +8189,17 @@ class Glm5NextMLAAttention(nn.Module):
                 f"{self.v_head_dim}] or [tokens, {expected_width}]; got "
                 f"{tuple(attn_out.shape)}"
             )
+        # Where the reduction below rounds the partial to its wire dtype first, the
+        # projection stores it in that dtype: the same one rounding, without a separate
+        # cast pass. The layer-stream dump reads the fp32 partial, so a collecting
+        # forward keeps it.
+        wire = (
+            None if collector is not None
+            else _row_parallel_wire_dtype(int(x.shape[0]), module=self)
+        )
         projected = mla_projection_prepared(
-            x.contiguous(), self._prepared_weight("o_proj"), lowp
+            x.contiguous(), self._prepared_weight("o_proj"), lowp,
+            out_dtype=wire or torch.float32,
         )
         if collector is not None:
             # The partial is cloned and the input is not. On the fp32 wire the reduction
@@ -8213,11 +8252,12 @@ class Glm5NextMLAAttention(nn.Module):
         """Refuse a set selection that a reader of its order would get.
 
         :meth:`forward` lets the indexer return each row's pool ids in no stated order
-        only where ``mla_sparse_attention`` hands them to the masked-window kernel
-        (``dsa_set_selection.py``). This asks that seam's predicate again, with the
-        operands it will be handed, so a decision taken on other shapes cannot reach
-        the gather or the DCP merge, which read the order. A trace-time check: every
-        input is a shape, a dtype or a python value.
+        where ``mla_sparse_attention`` hands them to the masked-window kernel
+        (``dsa_set_selection.py``); a set read through a keep table is
+        :meth:`_require_keep_reader`'s to check. This asks that seam's predicate again,
+        with the operands it will be handed, so a decision taken on other shapes cannot
+        reach the gather or the DCP merge, which read the order. A trace-time check:
+        every input is a shape, a dtype or a python value.
         """
         from vllm_neuron.functional.attention.mla_dense_window import masked_window_serves
 
@@ -8293,7 +8333,7 @@ class Glm5NextMLAAttention(nn.Module):
         hidden_states: torch.Tensor,
         latent_cache: torch.Tensor,
         start_position: torch.Tensor | int,
-        topk_indices: torch.Tensor,
+        topk_indices: torch.Tensor | None,
         softmax_scale: float,
         batch_size: int = 1,
         prefill_end_position: torch.Tensor | int | None = None,
@@ -8321,10 +8361,12 @@ class Glm5NextMLAAttention(nn.Module):
         ``0 .. seq_lens[i] - 1`` through ``mla_dense_window_attention`` and
         ``topk_indices`` is not read (pass None).
 
-        ``selection_is_a_set=True`` says ``topk_indices`` holds each row's selection in
-        no stated order (``dsa_set_selection.py``). Only the masked-window kernel may read
-        it, so this asks the seam's predicate (``masked_window_serves``) with the operands
-        handed to the seam and refuses the call where another body would read it.
+        ``selection_is_a_set=True`` says the selection holds each row's pool ids in no
+        stated order (``dsa_set_selection.py``). Only the masked-window kernel or a keep
+        table may read it. Without a keep table this asks the seam's predicate
+        (``masked_window_serves``) with the operands handed to the seam and refuses the
+        call where another body would read it; with one, the keep route's check below
+        stands for both.
 
         ``keep_bits`` is the chunk's keep table, ``[tokens, pools / 8]`` uint8, and
         ``keep_route`` its reader, which the forward takes from ``prefill_keep_table_route``
@@ -8332,6 +8374,10 @@ class Glm5NextMLAAttention(nn.Module):
         table to ``mla_sparse_attention``, whose seam gives the call to the dense-masked
         pass. The table belongs to a full-width selecting prefill chunk without DCP, and
         this asks the route again with the real operands and refuses any other call.
+        Beside a table ``topk_indices`` may be None: the indexer gathers no ids when the
+        table is their one reader. The seam reads the index operand's shape alone on that
+        route, so a ``-1`` fill of the selection's shape (every column selects no token)
+        stands in for it, and no kernel reads it.
 
         ``hidden_states`` is ``[tokens, hidden_size]``: a prefill passes all its
         tokens at once and a decode step passes one. ``latent_cache`` is the whole
@@ -8413,6 +8459,14 @@ class Glm5NextMLAAttention(nn.Module):
                 f"{tuple(hidden_states.shape)}"
             )
         tokens = int(hidden_states.shape[0])
+        if topk_indices is None and keep_bits is not None:
+            from vllm_neuron.functional.attention.mla_sparse import SENTINEL_INDEX
+
+            # The keep route's stand-in index operand (see the docstring): a fill, which
+            # no kernel reads and the compiler drops.
+            topk_indices = keep_bits.new_full(
+                (tokens, self.indexer.bypass_width()), SENTINEL_INDEX, dtype=torch.int32
+            )
         if active_mla_query_rows is not None:
             if type(active_mla_query_rows) is not int or not (
                 1 <= active_mla_query_rows <= tokens
@@ -8577,7 +8631,7 @@ class Glm5NextMLAAttention(nn.Module):
                 f"absorb-in produced a width of {int(q_lift.shape[2])}; the "
                 f"sparse seam contracts {latent}"
             )
-        if selection_is_a_set:
+        if selection_is_a_set and keep_bits is None:
             self._require_masked_reader(
                 q_lift, c_kv, topk_indices, window, dense=dense,
                 dense_window=dense_window_seq_lens is not None,
@@ -9530,12 +9584,16 @@ class Glm5NextMLAAttention(nn.Module):
         )
         window_scans = window_selects and window_pools >= MAX8_WIDTH
         scan = bound if no_select or window_scans else int(max_seq_len)
-        # A selection that only the masked-window attention reads comes back as a set
-        # (dsa_set_selection.py). The seam's own predicate decides, asked with the
-        # operands attend() hands the seam; attend() asks it again with the real ones.
+        # A selection that only the masked-window attention or the keep table reads comes
+        # back as a set (dsa_set_selection.py). For the masked window the seam's own
+        # predicate decides, asked with the operands attend() hands the seam; for the keep
+        # table its route does, below. attend() asks both again with the real operands.
         # A collecting forward (the layer-stream dump) keeps the order: the dump hands
         # the index rows on as the indexer emitted them.
-        from vllm_neuron.model.glm5_next.dsa_set_selection import prefill_selects_a_set
+        from vllm_neuron.model.glm5_next.dsa_set_selection import (
+            keep_route_selects_a_set,
+            prefill_selects_a_set,
+        )
 
         selects_a_set = (
             not no_select
@@ -9556,9 +9614,10 @@ class Glm5NextMLAAttention(nn.Module):
             )
         )
         # A selecting chunk whose window the dense-masked pass attends (dsa_keep_table.py):
-        # the indexer then also returns the selection's keep table, and attend() hands it
-        # to that route. Asked once, here, so the table is made once and exists exactly
-        # where the attention reads it.
+        # the indexer then returns the selection's keep table, and attend() hands it to
+        # that route. Asked once, here, so the table is made once and exists exactly where
+        # the attention reads it. The table is the ids' one reader there, so the indexer
+        # gathers no ids, unless the layer-stream dump reads them too.
         from vllm_neuron.model.glm5_next.dsa_keep_table import prefill_keep_table_route
 
         keep_route = (
@@ -9586,6 +9645,9 @@ class Glm5NextMLAAttention(nn.Module):
             )
             else None
         )
+        selects_a_set = selects_a_set or (
+            collector is None and keep_route_selects_a_set(keep_route)
+        )
         q_latent = self.project_query_latent(normed_hidden_states)
         selection = self.indexer(
             normed_hidden_states,
@@ -9594,7 +9656,7 @@ class Glm5NextMLAAttention(nn.Module):
             seq_lens,
             max_seq_len=scan,
             page_size=int(page_size),
-            indices_wanted=not no_select,
+            indices_wanted=not no_select and (keep_route is None or collector is not None),
             slot_mapping=slot_mapping,
             tail=tail,
             position=position,
@@ -10109,7 +10171,12 @@ class Glm5NextModel(nn.Module):
                 prefill_step=layer.step_rows.phase(int(normed.shape[0])) == "prefill",
             )
         elif isinstance(mlp, Glm5NextDenseMLP):
-            out = mlp(normed, quant_config=quant_config)
+            # The same: the dense MLP stores its partial in the wire dtype.
+            out = mlp(
+                normed,
+                quant_config=quant_config,
+                partial_dtype=_row_parallel_wire_dtype(normed.shape[0], module=layer),
+            )
         else:
             raise ValueError(
                 f"layer {getattr(layer, 'layer_idx', '?')} holds an MLP of type "
@@ -10144,10 +10211,10 @@ class Glm5NextModel(nn.Module):
         # row-parallel site uses.
         #
         # Before the cast, and on the fp32 wire that ordering is the load-bearing part.
-        # ``out`` is the kernel's own dtype here (fp32 on the dense route), so the
-        # partial sums are added at the width they were computed in; reducing after the
-        # cast below would round each rank's fraction to the caller's dtype and add the
-        # rounded parts instead of rounding the whole.
+        # ``out`` is the kernel's own dtype here (fp32 on the dense route at an fp32
+        # wire), so the partial sums are added at the width they were computed in;
+        # reducing after the cast below would round each rank's fraction to the caller's
+        # dtype and add the rounded parts instead of rounding the whole.
         #
         # The fp32 wire reduces in place, which is safe against aliasing for the same
         # reason it is at ``project_output``: both branches return a freshly allocated

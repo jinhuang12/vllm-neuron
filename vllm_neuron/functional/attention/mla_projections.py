@@ -306,7 +306,7 @@ def _count_lowp_dispatch(scaled: bool, programs: int) -> None:
 
 
 @nki.jit
-def mla_projection_lowp_kernel(x_hbm, w_hbm, scale_hbm=None, col_chunk=0):
+def mla_projection_lowp_kernel(x_hbm, w_hbm, scale_hbm=None, col_chunk=0, bf16_out=False):
     """``y[M, N] = x[M, K] @ dequant(w[K, N])`` with the weight read as stored.
 
     Args:
@@ -318,9 +318,12 @@ def mla_projection_lowp_kernel(x_hbm, w_hbm, scale_hbm=None, col_chunk=0):
         col_chunk: weight columns held in SBUF at once, a trace-time int; 0 holds
             the program's whole share (every column when the rows split). The seam
             sizes it to the SBUF budget.
+        bf16_out: a trace-time bool. True rounds each fp32 sum to bf16, to nearest
+            even, in the copy that takes it out of PSUM, and stores bf16: the one
+            rounding a bf16 cast of the fp32 output makes, so the bits are the same.
 
     Returns:
-        ``[M, N]`` fp32.
+        ``[M, N]`` fp32, or bf16 with ``bf16_out``.
 
     Rows split over the programs when :func:`lowp_splits_rows` says so
     (:func:`_lowp_project_rows`); else the output columns do, as below.
@@ -343,7 +346,8 @@ def mla_projection_lowp_kernel(x_hbm, w_hbm, scale_hbm=None, col_chunk=0):
         kernel_assert(scale_hbm.shape[0] == programs and scale_hbm.shape[1] == n_kb
                       and scale_hbm.shape[2] * LOWP_SCALE_BLOCK == width,
                       "the scale grid must be program-major for this launch grid")
-    out = nl.ndarray((m_ext, n_ext), dtype=nl.float32, buffer=nl.shared_hbm)
+    out = nl.ndarray((m_ext, n_ext), dtype=nl.bfloat16 if bf16_out else nl.float32,
+                     buffer=nl.shared_hbm)
     if lowp_splits_rows(m_ext, programs, _lowp_x_row_bytes(x_hbm)):
         _lowp_project_rows(x_hbm, w_hbm, scale_hbm, col_chunk, out)
         return out
@@ -419,7 +423,8 @@ def mla_projection_lowp_kernel(x_hbm, w_hbm, scale_hbm=None, col_chunk=0):
                               offset=r0 * n_kb),
                     src=t_ps,
                 )
-            res = nl.ndarray((mw, cw), dtype=nl.float32, buffer=nl.sbuf)
+            # The output's dtype: a bf16 result is rounded once, in its PSUM copy.
+            res = nl.ndarray((mw, cw), dtype=out.dtype, buffer=nl.sbuf)
             if scaled:
                 # xs[p, kb, nb, m] = xt[p, m, kb] * s[kb, nb]: the block multiplier
                 # folded into the stationary operand, one op for every block.
@@ -497,8 +502,9 @@ LOWP_SCALAR_FOLD_PERIOD = 3
 #: bound lies in between (``reports/mla_projection.md``, design measurements).
 LOWP_WEIGHT_STATIONARY_MIN_BLOCKS = 8
 
-#: SBUF bytes per partition of fp32 results one output DMA carries in the row-split
-#: path: 2 MiB a DMA. MEASURED per call against one DMA per PSUM bank (256 KiB to
+#: SBUF bytes per partition of results (fp32, or bf16 when the kernel stores bf16) one
+#: output DMA carries in the row-split path: 2 MiB a DMA. MEASURED on fp32 results per
+#: call against one DMA per PSUM bank (256 KiB to
 #: 1 MiB): wq_b 106 -> 92 us; against one DMA per row block (8 MiB for o_proj),
 #: o_proj 61 -> 38 us, its stores overlapping the matmuls (``reports/mla_projection.md``,
 #: design measurements).
@@ -655,16 +661,20 @@ def _lowp_rows_matmuls(xt, w_sb, s_sb, prog_nb: int, out, row0, col0: int, norm=
         block = LOWP_SCALE_BLOCK
         row_block = LOWP_ROW_BLOCK
     count = [0, 0]  # folds, PSUM evacuations: each alternates its engines
+    # Without a norm the results are copied out of PSUM in the output's dtype, so a bf16
+    # output is rounded once, there; the norm reads fp32 results and rounds after it.
+    res_dtype = out.dtype if norm is None else nl.float32
+    res_bytes = 2 if res_dtype == nl.bfloat16 else 4
     for r0 in range(0, rows, row_block):
         rw = min(row_block, rows - r0)
         n_mt = rw // SEQUENCE_TILE
         # One output DMA per span of whole banks, LOWP_RESULT_SBUF_BYTES a partition.
-        span = max(OUTPUT_TILE, LOWP_RESULT_SBUF_BYTES // (n_mt * 4) // OUTPUT_TILE
+        span = max(OUTPUT_TILE, LOWP_RESULT_SBUF_BYTES // (n_mt * res_bytes) // OUTPUT_TILE
                    * OUTPUT_TILE)
         for s0 in range(0, cw, span):
             sw = min(span, cw - s0)
             # res[m, mt, c]: row tile mt of the row block, the span's columns.
-            res = nl.ndarray((SEQUENCE_TILE, n_mt, sw), dtype=nl.float32, buffer=nl.sbuf)
+            res = nl.ndarray((SEQUENCE_TILE, n_mt, sw), dtype=res_dtype, buffer=nl.sbuf)
             if norm is None:
                 for g0 in range(0, sw, OUTPUT_TILE):
                     _lowp_rows_bank(xt, w_sb, s_sb, prog_nb, res, r0, rw, s0, g0, col0,
@@ -993,8 +1003,9 @@ def _require_lowp_admissible(x: Tensor, weight: Tensor, scale: Tensor | None,
             )
 
 
-def mla_projection_lowp(x: Tensor, weight: Tensor, scale: Tensor | None = None) -> Tensor:
-    """Project ``x [M, K]`` by a stored low-precision ``weight [K, N]``; ``[M, N]`` fp32.
+def mla_projection_lowp(x: Tensor, weight: Tensor, scale: Tensor | None = None,
+                        out_dtype: torch.dtype = torch.float32) -> Tensor:
+    """Project ``x [M, K]`` by a stored low-precision ``weight [K, N]``, into ``out_dtype``.
 
     ``weight`` is contraction-major. An fp8-e4m3 weight comes with ``scale``, its
     ``[K // 128, N // 128]`` fp32 dequant multipliers in the same orientation (or
@@ -1002,7 +1013,17 @@ def mla_projection_lowp(x: Tensor, weight: Tensor, scale: Tensor | None = None) 
     ``x`` is rounded to bf16 for the stationary operand, and an fp8 block's
     multiplier is folded into that bf16 operand: those two roundings are the
     numeric difference from the fp32 kernel.
+
+    ``out_dtype`` is ``torch.float32`` (the default) or ``torch.bfloat16``: with bf16
+    the kernel rounds each fp32 sum once as it leaves PSUM and stores half the bytes,
+    the bits of a bf16 cast of the fp32 result.
+
+    Raises:
+        MlaProjectionError: for an operand the route does not admit, or an
+            ``out_dtype`` that is neither fp32 nor bf16.
     """
+    if out_dtype not in (torch.float32, torch.bfloat16):
+        raise MlaProjectionError(f"the low-precision route stores fp32 or bf16; got {out_dtype}")
     scaled = scale is not None
     programs = _lowp_programs(int(weight.shape[1]) if weight.ndim == 2 else 0, scaled)
     _require_lowp_admissible(x, weight, scale, programs)
@@ -1020,10 +1041,11 @@ def mla_projection_lowp(x: Tensor, weight: Tensor, scale: Tensor | None = None) 
     call = wrap_nki(mla_projection_lowp_kernel)
     if programs == 2:
         call = call[2]
+    bf16_out = out_dtype is torch.bfloat16
     if scaled:
         return call(x.contiguous(), weight.contiguous(),
-                    scale.contiguous().to(torch.float32), chunk)
-    return call(x.contiguous(), weight.contiguous(), None, chunk)
+                    scale.contiguous().to(torch.float32), chunk, bf16_out)
+    return call(x.contiguous(), weight.contiguous(), None, chunk, bf16_out)
 
 
 def mla_latent_projection_admits(x: Tensor, weight: Tensor, scale: Tensor | None) -> bool:
@@ -1089,17 +1111,22 @@ def mla_latent_projection(x: Tensor, weight: Tensor, scale: Tensor | None, gain:
 
 
 def mla_projection_prepared(
-    x: Tensor, weight_fp32: Tensor, lowp: tuple[Tensor, Tensor | None] | None
+    x: Tensor, weight_fp32: Tensor, lowp: tuple[Tensor, Tensor | None] | None,
+    out_dtype: torch.dtype = torch.float32,
 ) -> Tensor:
-    """The route a load-time prep chose for one site. ``[M, N]`` float32 either way.
+    """The route a load-time prep chose for one site. ``[M, N]`` in ``out_dtype``.
 
     ``lowp`` is ``(weight, scale)`` from :func:`prepare_lowp_projection` when the
     checkpoint stored the weight as fp8-e4m3 or bf16, and None otherwise; then the
-    fp32 kernel runs on ``weight_fp32`` exactly as before.
+    fp32 kernel runs on ``weight_fp32`` exactly as before. ``out_dtype`` is fp32 (the
+    default) or bf16: the low-precision kernel rounds in its store, and the fp32
+    kernel's result is cast, the same bits either way.
     """
     if lowp is None:
-        return mla_projection(x.to(torch.float32), weight_fp32)
-    return mla_projection_lowp(x, lowp[0], lowp[1])
+        if out_dtype not in (torch.float32, torch.bfloat16):
+            raise MlaProjectionError(f"a projection stores fp32 or bf16; got {out_dtype}")
+        return mla_projection(x.to(torch.float32), weight_fp32).to(out_dtype)
+    return mla_projection_lowp(x, lowp[0], lowp[1], out_dtype=out_dtype)
 
 
 def lowp_projection_admits(weight_out_in: Tensor, scale_out_in: Tensor | None) -> bool:
