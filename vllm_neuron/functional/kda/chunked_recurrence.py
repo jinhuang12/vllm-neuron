@@ -1433,7 +1433,11 @@ def _intra_chunk_heads(
     """:func:`kda_intra_chunk` of operands with a leading heads axis.
 
     The heads' chunks are laid end to end on the chunk axis, head-major, and run
-    as one call's chunks; each output goes back to ``[H, NC, ...]``.
+    as one call's chunks; each output goes back to ``[H, NC, ...]``. That keeps
+    every head on the one-head call's packed tiles only when a head's rows fill
+    whole tiles (:func:`tile_rows`); otherwise a head would share a tile with the
+    next, and a tile's width sets the rounding of its matmuls, so each head then
+    runs as its own call.
     """
     ranks = (("q", q, 4), ("k", k, 4), ("v", v, 4), ("gk", gk, 4), ("beta", beta, 3))
     for name, tensor, rank in ranks:
@@ -1449,6 +1453,13 @@ def _intra_chunk_heads(
                 f"{name} {tuple(tensor.shape)} must lead with q's [heads, NC] {lead}"
             )
     heads, n_chunks = lead
+    chunk = int(q.shape[2])
+    if (n_chunks * chunk) % tile_rows(chunk):
+        per_head = [
+            kda_intra_chunk(q[h], k[h], v[h], beta[h], gk[h], gate_block=gate_block)
+            for h in range(heads)
+        ]
+        return IntraChunkOutputs(*(torch.stack(fields) for fields in zip(*per_head)))
     flat = kda_intra_chunk(
         *(t.reshape((heads * n_chunks,) + tuple(t.shape[2:])) for t in (q, k, v, beta, gk)),
         gate_block=gate_block,
