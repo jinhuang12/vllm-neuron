@@ -1454,7 +1454,8 @@ def _intra_chunk_heads(
             )
     heads, n_chunks = lead
     chunk = int(q.shape[2])
-    if (n_chunks * chunk) % tile_rows(chunk):
+    # A chunk outside [1, MAX_TILE] has no packed tile; the one call refuses it.
+    if 0 < chunk <= MAX_TILE and (n_chunks * chunk) % tile_rows(chunk):
         per_head = [
             kda_intra_chunk(q[h], k[h], v[h], beta[h], gk[h], gate_block=gate_block)
             for h in range(heads)
