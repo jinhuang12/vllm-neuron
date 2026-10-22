@@ -898,7 +898,7 @@ def _shard_geometry_for(
     declared = family.get(leaf)
     if declared is None and leaf.endswith(f"_{FP8_SCALE_SUFFIX}"):
         # ``q_b_proj_weight_scale_inv`` -> ``q_b_proj_weight``, the inverse of
-        # ``_sibling_scale_grid_name``. Only a grid whose weight the table names
+        # ``sibling_scale_grid_name``. Only a grid whose weight the table names
         # resolves; every other declared grid still answers ``None``.
         weight_leaf = (
             f"{leaf[: -len(f'_{FP8_SCALE_SUFFIX}')]}{_WEIGHT_LEAF_SUFFIX}"
@@ -2967,7 +2967,7 @@ class Glm5NextSharedExperts(nn.Module):
     # the declaration tuple names and the three grids the loader attached beside
     # them, and hands them over.
     #
-    # The grid names are derived through ``_sibling_scale_grid_name`` rather than
+    # The grid names are derived through ``sibling_scale_grid_name`` rather than
     # spelled, because that is the single definition of the convention the loader,
     # the prep loop and the grid publish all read.
     #
@@ -3032,14 +3032,14 @@ class Glm5NextSharedExperts(nn.Module):
         Raises:
             Glm5NextSharedExpertRouteError: when a scale grid the loader should
                 have attached is absent. The grid names are derived from the
-                weight leaves by ``_sibling_scale_grid_name``, which is the single
+                weight leaves by ``sibling_scale_grid_name``, which is the single
                 definition of that convention.
         """
         weights: list[torch.Tensor] = []
         grids: list[torch.Tensor] = []
         for leaf in self.SCALE_ROUTE_LEAVES:
             grid_name = (
-                Glm5NextForConditionalGeneration._sibling_scale_grid_name(leaf)
+                Glm5NextForConditionalGeneration.sibling_scale_grid_name(leaf)
             )
             grid = getattr(self, grid_name, None)
             if grid is None:
@@ -3650,7 +3650,7 @@ class Glm5NextDenseMLP(nn.Module):
             )
 
         # ---- The operands. The grid name is derived by the rule the prep loop
-        # uses (``_sibling_scale_grid_name``) rather than spelled out here, so the
+        # uses (``sibling_scale_grid_name``) rather than spelled out here, so the
         # two cannot drift. The grids are plain attributes the weight loader
         # attaches and not declared parameters, which is why this is a ``getattr``.
         def scale_grid(leaf: str) -> torch.Tensor:
@@ -10801,7 +10801,7 @@ def _scale_prep_leaves(module: nn.Module) -> list[str]:
         if leaf.endswith(_WEIGHT_LEAF_SUFFIX)
         and hasattr(
             module,
-            Glm5NextForConditionalGeneration._sibling_scale_grid_name(leaf),
+            Glm5NextForConditionalGeneration.sibling_scale_grid_name(leaf),
         )
     ]
 
@@ -10883,7 +10883,7 @@ def _publish_compute_frame_operands(
     health: dict[str, dict[str, object]] = {}
     published = 0
     for leaf in _scale_prep_leaves(module):
-        grid_name = Glm5NextForConditionalGeneration._sibling_scale_grid_name(leaf)
+        grid_name = Glm5NextForConditionalGeneration.sibling_scale_grid_name(leaf)
         weight = getattr(module, leaf)
         grid = getattr(module, grid_name)
         if weight.dim() != 2:
@@ -12388,7 +12388,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
     # ── weight loading ──────────────────────────────
 
-    def _checkpoint_block_size(self) -> tuple[int, int]:
+    def checkpoint_block_size(self) -> tuple[int, int]:
         """The quantisation block shape this checkpoint declares, as two ints.
 
         Read off ``quantization_config.weight_block_size``, which the config adapter
@@ -12414,7 +12414,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             )
         return (int(declared[0]), int(declared[1]))
 
-    def _placeholder_dtype(
+    def placeholder_dtype(
         self,
         checkpoint_keys: str | list[str],
         *,
@@ -12484,12 +12484,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
             # widens the bias to float32 before it corrects the scores, so a
             # narrowing placeholder spends the width before either one reads it.
             return torch.float32
-        if self._sibling_scale_grid_name(param_name) in mappings:
+        if self.sibling_scale_grid_name(param_name) in mappings:
             return _FP8_DTYPE
         return self.text_config.torch_dtype
 
     @staticmethod
-    def _sibling_scale_grid_name(param_name: str) -> str:
+    def sibling_scale_grid_name(param_name: str) -> str:
         """The scale-grid parameter that would accompany this weight, by name.
 
         Returns a name that is deliberately unmatchable for a parameter that is
@@ -12546,7 +12546,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 name = f"{module_path}.{leaf}" if module_path else leaf
                 checkpoint_keys = mappings.get(name, name)
                 placeholder = nn.parameter.UninitializedParameter(
-                    dtype=self._placeholder_dtype(
+                    dtype=self.placeholder_dtype(
                         checkpoint_keys, param_name=name, mappings=mappings
                     ),
                     device=device,
@@ -12823,7 +12823,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 # positionals; widening its signature to thread a rank through would
                 # move working code for a value ``_resolve_rank`` already owns.
                 module_path, _, leaf = param_name.rpartition(".")
-                attribute = self._sibling_scale_grid_name(leaf)
+                attribute = self.sibling_scale_grid_name(leaf)
                 if not attribute:
                     raise Glm5NextWeightLoadError(
                         f"{param_name} is a bank of "
@@ -12863,7 +12863,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     param_name=param_name,
                     owner=module,
                     geometry=bank_geometry,
-                    block_size=self._checkpoint_block_size(),
+                    block_size=self.checkpoint_block_size(),
                 ).load(
                     [checkpoint._get_slice(key) for key in key_list],
                     _resolve_rank(),
@@ -12880,7 +12880,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 # loads and compensates it.
                 continue
             module_path, _, leaf = param_name.rpartition(".")
-            attribute = self._sibling_scale_grid_name(leaf)
+            attribute = self.sibling_scale_grid_name(leaf)
             if not attribute:
                 raise Glm5NextWeightLoadError(
                     f"{param_name} carries the scale key {scales[0]!r} but its "
@@ -12915,7 +12915,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 # defaulted. Read here, inside the branch that already found a scale
                 # grid, so a checkpoint with no grids never has to declare one.
                 grid = sharded_scale_grid_loader(
-                    geometry, param_name, self._checkpoint_block_size()
+                    geometry, param_name, self.checkpoint_block_size()
                 ).load([checkpoint._get_slice(scales[0])], _resolve_rank())
             setattr(module, attribute, grid.to(dtype=torch.float32, device=device))
             read += 1
@@ -13010,7 +13010,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     leaf = f"{name}{_WEIGHT_LEAF_SUFFIX}"
                     operands[leaf] = getattr(module, leaf)
                     operands[f"{name}_scale"] = getattr(
-                        module, self._sibling_scale_grid_name(leaf)
+                        module, self.sibling_scale_grid_name(leaf)
                     )
                 module.prepare_scale_operands(**operands)
                 scale_calls += 1
@@ -13061,7 +13061,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         for name in names:
             for attribute in (
                 f"{name}{_WEIGHT_LEAF_SUFFIX}",
-                self._sibling_scale_grid_name(f"{name}{_WEIGHT_LEAF_SUFFIX}"),
+                self.sibling_scale_grid_name(f"{name}{_WEIGHT_LEAF_SUFFIX}"),
             ):
                 operand = getattr(module, attribute, None)
                 if operand is None:
