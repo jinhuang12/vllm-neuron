@@ -15,7 +15,9 @@ Routing, at trace time, per prefill chunk, in this order (:func:`prefill_keep_ta
 1. a window the masked-window kernel serves keeps it (``masked_window_serves``), and the
    chunk makes no keep table;
 2. a window the dense-masked pass serves (``dense_masked_serves``: its knob, its page cap and
-   its geometry) takes that pass;
+   its geometry; at two query heads per rank, ``dense_masked_heads_serves``, the same test
+   for the two-head pass in ``functional/attention/mla_dense_masked_heads.py``) takes that
+   pass;
 3. every other window keeps the gather, and the chunk makes no keep table.
 
 Route 2 needs the indexer's candidates to be the window's pools, because the table's
@@ -33,6 +35,7 @@ import enum
 import torch
 
 from vllm_neuron.functional.attention.mla_dense_masked import dense_masked_serves
+from vllm_neuron.functional.attention.mla_dense_masked_heads import dense_masked_heads_serves
 from vllm_neuron.functional.attention.mla_dense_window import masked_window_serves
 
 
@@ -65,8 +68,10 @@ def prefill_keep_table_route(*, rows: int, heads: int, latent: int, kv_latent: i
     if masked_window_serves(int(rows), int(heads), int(latent), window_rows, int(pool_size),
                             int(index_cols), q_dtype, kv_dtype):
         return None
-    if dense_masked_serves(int(rows), int(heads), int(latent), int(kv_latent), int(bank_rows),
-                           int(window_pages), int(page_size), int(pool_size), q_dtype,
-                           kv_dtype):
+    geometry = (int(rows), int(heads), int(latent), int(kv_latent), int(bank_rows),
+                int(window_pages), int(page_size), int(pool_size), q_dtype, kv_dtype)
+    # Each predicate admits its own head count (one, or the two-head pass's two), so at
+    # most one of them holds.
+    if dense_masked_serves(*geometry) or dense_masked_heads_serves(*geometry):
         return KeepTableRoute.DENSE_MASKED
     return None

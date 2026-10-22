@@ -2723,7 +2723,10 @@ def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
             NoPE call with ``written_in_bank`` that the masked window does not take may
             take ``mla_dense_masked.mla_dense_masked_attention``, one dense pass over the
             window read through the table with the keep table as its mask, wherever
-            ``mla_dense_masked.dense_masked_serves`` says so.
+            ``mla_dense_masked.dense_masked_serves`` says so; with two query heads,
+            ``mla_dense_masked_heads.mla_dense_masked_heads_attention``, the same pass
+            for both heads in one call, wherever
+            ``mla_dense_masked_heads.dense_masked_heads_serves`` says so.
 
     Returns:
         ``[S, H, L]`` float32.
@@ -2751,20 +2754,25 @@ def mla_sparse_attention(q_lift: Tensor, c_kv: Tensor, topk_indices: Tensor,
                 written=written, write_offset=write_offset, page_size=page_size,
                 pool_size=pool_size)
 
-        # Imported here for the same reason: mla_dense_masked reads this module's digest.
-        from vllm_neuron.functional.attention import mla_dense_masked
+        # Imported here for the same reason: mla_dense_masked and mla_dense_masked_heads read
+        # this module's digest.
+        from vllm_neuron.functional.attention import mla_dense_masked, mla_dense_masked_heads
 
-        if (
+        bank_call = (
             keep_bits is not None
             and rope == 0
             and bool(written_in_bank)
             and write_offset is not None
-            and mla_dense_masked.dense_masked_serves(
-                seq, heads, latent, int(c_kv.shape[1]), int(c_kv.shape[0]),
-                int(block_table_row.shape[0]), int(page_size), int(pool_size), q_lift.dtype,
-                c_kv.dtype)
-        ):
+        )
+        geometry = (seq, heads, latent, int(c_kv.shape[1]), int(c_kv.shape[0]),
+                    int(block_table_row.shape[0]), int(page_size), int(pool_size),
+                    q_lift.dtype, c_kv.dtype)
+        if bank_call and mla_dense_masked.dense_masked_serves(*geometry):
             return mla_dense_masked.mla_dense_masked_attention(
+                q_lift, c_kv, keep_bits, write_offset, softmax_scale, block_table_row,
+                int(pool_size), int(page_size))
+        if bank_call and mla_dense_masked_heads.dense_masked_heads_serves(*geometry):
+            return mla_dense_masked_heads.mla_dense_masked_heads_attention(
                 q_lift, c_kv, keep_bits, write_offset, softmax_scale, block_table_row,
                 int(pool_size), int(page_size))
 
