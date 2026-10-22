@@ -656,8 +656,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # its partner's (rank XOR 48), and the pair hands rows and KDA state across with
     # a two-rank exchange (``model/glm5_next/model_fp8.py``, ``PrefillPairs``). A step
     # of at most one chunk runs the TP=64 graph, and decode is unchanged. Read once at
-    # load; it needs the prefill sequence shard, 1024- and 2048-token buckets and no
-    # prefix cache or draft. Off by default ("0").
+    # load; it needs the prefill sequence shard, 1024- and 2048-token buckets, no
+    # prefix cache or draft, and outside the native backend
+    # VLLM_NEURON_DISABLE_PARALLEL_TRACE=1, since its settle graph is captured by the
+    # in-process prefill extraction. Off by default ("0").
     "VLLM_NEURON_GLM5NEXT_PREFILL_PAIRS": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_GLM5NEXT_PREFILL_PAIRS")) or False
     ),
