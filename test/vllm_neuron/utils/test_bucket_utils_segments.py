@@ -18,6 +18,10 @@ the cap:
    (``select_kv_segment_size``), or the largest one, whose window rule 2 proved covers it.
 4. The auto-enabled list (no ``kv_segment_size_buckets`` in the config) is completed
    with the smallest supported segment that covers ``max_model_len``.
+5. A windowed-prefill model with independent query buckets gets a segment every
+   ``VLLM_NEURON_KV_SEGMENT_STEP`` tokens instead (``kv_segment_step_ladder``), at
+   most ``VLLM_NEURON_KV_SEGMENT_MAX_SEGMENTS`` of them: past that count the step
+   becomes its smallest multiple whose ladder holds the bound.
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ from vllm_neuron.utils.bucket_utils import (
     SUPPORTED_KV_SEGMENT_SIZES,
     complete_kv_segment_cover,
     covering_kv_segment_size,
+    kv_segment_step_ladder,
     prefill_window_tokens,
     select_kv_segment_size,
     validate_kv_segment_size_buckets,
@@ -370,3 +375,80 @@ def test_a_completed_list_passes_the_validator():
         completed, [1024], allow_independent_query_buckets=True, windowed_prefill=True,
         block_size=PAGE, max_model_len=4096,
     ) == completed
+
+
+# ── the step ladder ─────────────────────────────────────────────────────────────────
+
+#: The defaults: ``VLLM_NEURON_KV_SEGMENT_STEP`` and ``VLLM_NEURON_KV_SEGMENT_MAX_SEGMENTS``.
+STEP, BOUND = 16384, 16
+QUERY = [1024]
+
+
+def _every(step: int, count: int) -> list[int]:
+    return [step * (index + 1) for index in range(count)]
+
+
+@pytest.mark.parametrize("max_model_len, count", [(131072, 8), (262144, 16), (1048576, 64)])
+def test_without_a_bound_the_ladder_steps_to_the_first_covering_segment(max_model_len, count):
+    assert kv_segment_step_ladder(STEP, QUERY, max_model_len, PAGE) == _every(STEP, count)
+
+
+@pytest.mark.parametrize(
+    "max_model_len, step, count",
+    [
+        (131072, 16384, 8),
+        (262144, 16384, 16),
+        (263168, 16384, 16),  # the last length one step's 16 segments cover
+        (263169, 32768, 9),
+        (393216, 32768, 12),
+        (524288, 32768, 16),
+        (1048576, 65536, 16),
+        (2097152, 131072, 16),
+    ],
+)
+def test_a_bound_scales_the_step_to_its_smallest_multiple_that_holds_it(
+    max_model_len, step, count
+):
+    assert kv_segment_step_ladder(STEP, QUERY, max_model_len, PAGE, BOUND) == _every(
+        step, count
+    )
+
+
+def test_a_bound_of_zero_leaves_the_ladder_unbounded():
+    assert kv_segment_step_ladder(STEP, QUERY, 1048576, PAGE, 0) == _every(STEP, 64)
+
+
+def test_a_bound_that_one_step_covers_gives_no_ladder():
+    """Bound 1 scales the step to cover max_model_len alone: the caller keeps its list."""
+    assert kv_segment_step_ladder(STEP, QUERY, 131072, PAGE, 1) is None
+
+
+@pytest.mark.parametrize("step, max_model_len", [(0, 131072), (131072, 131072), (16384, 16384)])
+def test_step_zero_or_one_covering_step_gives_no_ladder(step, max_model_len):
+    assert kv_segment_step_ladder(step, QUERY, max_model_len, PAGE, BOUND) is None
+
+
+@pytest.mark.parametrize(
+    "step, bound, match",
+    [(-1, BOUND, "KV segment step must be 0 or a positive"),
+     (STEP, -1, "KV segment bound must be 0 or a positive")],
+)
+def test_a_negative_step_or_bound_is_refused(step, bound, match):
+    with pytest.raises(ValueError, match=match):
+        kv_segment_step_ladder(step, QUERY, 131072, PAGE, bound)
+
+
+def test_without_a_page_the_window_is_the_exact_sum():
+    """``block_size=None``: segment + query bucket, unrounded; 1024 rows short of 131072."""
+    assert kv_segment_step_ladder(STEP, QUERY, 131072 + 1024, None) == _every(STEP, 8)
+    assert kv_segment_step_ladder(STEP, QUERY, 131072 + 1025, None) == _every(STEP, 9)
+
+
+@pytest.mark.parametrize("max_model_len", [131072, 262144, 263169, 1048576])
+def test_every_bounded_ladder_passes_the_validator(max_model_len):
+    ladder = kv_segment_step_ladder(STEP, QUERY, max_model_len, PAGE, BOUND)
+    assert len(ladder) <= BOUND
+    assert validate_kv_segment_size_buckets(
+        ladder, QUERY, allow_independent_query_buckets=True, windowed_prefill=True,
+        block_size=PAGE, max_model_len=max_model_len,
+    ) == ladder
