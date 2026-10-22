@@ -68,7 +68,7 @@ from vllm_neuron.vllm.patches.kv_spec_patch import (
     recurrent_spec_block_size,
     recurrent_state_slot_bytes,
 )
-from vllm_neuron.utils.neuron_utils import model_forward_context
+from vllm_neuron.utils.neuron_utils import SBUF_BYTES_PER_PARTITION, model_forward_context
 from vllm_neuron.vllm.worker.neuron_ec_connector_model_runner_mixin import (
     ECLoadFailure,
     NeuronECConnectorModelRunnerMixin,
@@ -562,19 +562,22 @@ def check_dcp_decode_index_context(vllm_config: Any, index_kpool: int | None) ->
     """Refuse a DCP run whose per-rank decode candidate axis is past the served width.
 
     Under DCP each rank's decode indexer scores only its own pools. So
-    :func:`~vllm_neuron.functional.dsa.decode_select.check_decode_pools_context`
+    :func:`~vllm_neuron.functional.dsa.decode_select_walk.check_decode_pools_walk_context`
     reads the context that rank covers (:func:`indexer_context_per_rank`), not
-    ``max_model_len``. A refusal names both lengths, followed by the check's own
-    message.
+    ``max_model_len``, and the most requests a decode step batches
+    (``scheduler_config.max_num_seqs``): the chunk walk's bound at one, the whole-row
+    bound above it. A refusal names both lengths, followed by the check's own message.
     """
-    from vllm_neuron.functional.dsa.decode_select import (
-        DecodeSelectError,
-        check_decode_pools_context,
+    from vllm_neuron.functional.dsa.decode_select import DecodeSelectError
+    from vllm_neuron.functional.dsa.decode_select_walk import (
+        check_decode_pools_walk_context,
     )
 
     per_rank = indexer_context_per_rank(vllm_config)
     try:
-        check_decode_pools_context(per_rank, index_kpool)
+        check_decode_pools_walk_context(
+            per_rank, index_kpool, int(vllm_config.scheduler_config.max_num_seqs)
+        )
     except DecodeSelectError as exc:
         raise DecodeSelectError(
             f"decode_context_parallel_size="
@@ -583,6 +586,100 @@ def check_dcp_decode_index_context(vllm_config: Any, index_kpool: int | None) ->
             f"tokens (whole blocks of {vllm_config.cache_config.block_size}), and the "
             f"rank's decode indexer covers those: {exc}"
         ) from exc
+
+
+#: The async drafter's position correction (``functional/mtp/async_step.py``,
+#: ``mtp_async_correct_kernel``) reads its block-table column, ``ceil(max_model_len /
+#: block_size)`` pages on every rank whatever the DCP size, into ``[R, pages]`` SBUF tiles
+#: of one 4-byte entry a page: the column (int32 and fp32), the page iota, and per step row
+#: an equality mask and the masked column. At ``W`` rows a step neuronx-cc 2.27.5334 keeps
+#: at most ``max(W + MTP_ASYNC_CORRECT_SHARED_TILES, MTP_ASYNC_CORRECT_MIN_TILES)`` of them
+#: live, and the per-row ``[R, W]`` tiles take at most ``MTP_ASYNC_CORRECT_FIXED_BYTES``:
+#: the 58 CPU builds of the call at W in {1, 2, 3, 4, 5, 8}, 4096 to 16384 pages and DCP 1
+#: to 8 cover at most that a partition (the largest remainder 88 B; 196660 B at 1M and
+#: W = 4). Above the bound the compiler keeps fewer tiles live and may still build; the
+#: start check holds the host rule.
+MTP_ASYNC_CORRECT_TILE_BYTES = 4
+MTP_ASYNC_CORRECT_SHARED_TILES = 2
+MTP_ASYNC_CORRECT_MIN_TILES = 4
+MTP_ASYNC_CORRECT_FIXED_BYTES = 128
+
+
+def mtp_async_correct_sbuf_bytes(pages: int, width: int) -> int:
+    """SBUF bytes a partition the async correction holds at ``pages`` column pages and
+    ``width`` rows a step (the bound the comment above derives)."""
+    tiles = max(int(width) + MTP_ASYNC_CORRECT_SHARED_TILES, MTP_ASYNC_CORRECT_MIN_TILES)
+    return MTP_ASYNC_CORRECT_TILE_BYTES * tiles * int(pages) + MTP_ASYNC_CORRECT_FIXED_BYTES
+
+
+def mtp_async_correct_max_pages(width: int) -> int:
+    """The most column pages the async correction holds within ``SBUF_BYTES_PER_PARTITION``
+    at ``width`` rows a step: 8847 at MTP k = 3 (width 4)."""
+    per_page = mtp_async_correct_sbuf_bytes(1, width) - MTP_ASYNC_CORRECT_FIXED_BYTES
+    return (SBUF_BYTES_PER_PARTITION - MTP_ASYNC_CORRECT_FIXED_BYTES) // per_page
+
+
+def check_mtp_decode_ceilings(
+    vllm_config: Any, index_kpool: int | None, *, async_drafter: bool
+) -> None:
+    """Refuse an MTP form whose decode kernels meet a ceiling, before any graph compiles.
+
+    A server that drafts ``k >= 1`` tokens by speculative method "mtp" verifies ``1 + k``
+    rows a step. Its DSA indexer scores them with the ``T``-row kernel, which takes at most
+    ``decode_trow_wide.MAX_DECODE_SCORES_ROWS_WIDE_CANDIDATES`` candidates of the context one
+    rank covers (:func:`indexer_context_per_rank`); a model without the indexer
+    (``index_kpool`` ``None``) scores nothing. Under the async drafter (``async_drafter``,
+    the proposer's ``async_steps``) the position correction also holds ``ceil(max_model_len
+    / block_size)`` column pages in SBUF, at most :func:`mtp_async_correct_max_pages` of
+    ``1 + k`` rows. A server that drafts nothing, or not by "mtp", is not checked.
+
+    Raises:
+        DecodeTrowError: the per-rank candidate axis is past the scores kernel's, naming
+            the DCP size, both lengths and the bound.
+        MtpAsyncStepError: the column is past the correction's pages, naming the form, the
+            kernel, the bytes, the bound and the fix.
+    """
+    speculative = getattr(vllm_config, "speculative_config", None)
+    if speculative is None or getattr(speculative, "method", None) != "mtp":
+        return
+    drafts = int(speculative.num_speculative_tokens or 0)
+    if drafts < 1:
+        return
+    from vllm_neuron.functional.dsa.decode_trow import DecodeTrowError
+    from vllm_neuron.functional.dsa.decode_trow_wide import check_decode_scores_rows_context
+
+    max_model_len = int(vllm_config.model_config.max_model_len)
+    block_size = int(vllm_config.cache_config.block_size)
+    per_rank = indexer_context_per_rank(vllm_config)
+    try:
+        check_decode_scores_rows_context(per_rank, index_kpool, drafts)
+    except DecodeTrowError as exc:
+        raise DecodeTrowError(
+            f"decode_context_parallel_size="
+            f"{vllm_config.parallel_config.decode_context_parallel_size} leaves each rank "
+            f"{per_rank} of max_model_len={max_model_len} tokens (whole blocks of "
+            f"{block_size}), and MTP verify steps of {1 + drafts} rows score them with the "
+            f"T-row kernel: {exc}"
+        ) from exc
+    if not async_drafter:
+        return
+    from vllm_neuron.functional.mtp import async_step
+
+    width = 1 + drafts
+    pages = -(-max_model_len // block_size)
+    most = mtp_async_correct_max_pages(width)
+    if pages > most:
+        per_page = mtp_async_correct_sbuf_bytes(1, width) - MTP_ASYNC_CORRECT_FIXED_BYTES
+        raise async_step.MtpAsyncStepError(
+            f"max_model_len={max_model_len} gives the async drafter's position correction a "
+            f"block-table column of {pages} pages of {block_size} tokens on every rank; its "
+            f"kernel, mtp_async_correct_kernel ({async_step.__file__}), keeps {per_page} B "
+            f"per page at width {width} (1 + num_speculative_tokens={drafts}) plus "
+            f"{MTP_ASYNC_CORRECT_FIXED_BYTES} B in SBUF, and SBUF_BYTES_PER_PARTITION="
+            f"{SBUF_BYTES_PER_PARTITION} holds {most} pages ({most * block_size} tokens); lower "
+            f"max_model_len to at most {most * block_size}, lower num_speculative_tokens, or "
+            f"serve without VLLM_NEURON_GLM5NEXT_MTP_ASYNC"
+        )
 
 
 def _dcp_owned_latent_slots(
@@ -1428,6 +1525,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 raise ValueError(
                     f"Unsupported speculative decoding method: {self.speculative_config.method}"
                 )
+        # An MTP form's verify-row scores and the async drafter's position correction
+        # have their own ceilings; refuse a form past them here, before any graph compiles.
+        check_mtp_decode_ceilings(
+            vllm_config,
+            getattr(getattr(hf_config, "text_config", hf_config), "index_kpool", None),
+            async_drafter=self._glm5next_async_drafter(),
+        )
 
         # InputBatch is initialized in initialize_kv_cache once KV cache groups are known
         self.input_batch = None

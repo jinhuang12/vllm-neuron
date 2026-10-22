@@ -48,13 +48,17 @@ SOURCE_DIGEST_FILES = {
     "functional/attention/dcp_merge.py": ("SOURCE_DIGEST",),
     "functional/attention/mla_decode.py": ("SOURCE_DIGEST",),
     "functional/attention/mla_decode_masked.py": ("SOURCE_DIGEST",),
+    "functional/attention/mla_dense_masked.py": ("SOURCE_DIGEST",),
     "functional/attention/mla_dense_window.py": ("SOURCE_DIGEST",),
     "functional/attention/mla_sparse.py": ("SOURCE_DIGEST",),
     "functional/dsa/dcp_candidate_merge.py": ("SOURCE_DIGEST",),
     "functional/dsa/decode_batch.py": ("SOURCE_DIGEST",),
     "functional/dsa/decode_select.py": ("SOURCE_DIGEST",),
+    "functional/dsa/decode_select_walk.py": ("SOURCE_DIGEST",),
     "functional/dsa/decode_tail_update.py": ("ROWS_SOURCE_DIGEST",),
     "functional/dsa/decode_trow.py": ("SOURCE_DIGEST",),
+    "functional/dsa/decode_trow_wide.py": ("SOURCE_DIGEST",),
+    "functional/dsa/selection_keep.py": ("SOURCE_DIGEST",),
     "functional/moe/expert_decode.py": ("_SOURCE_DIGEST",),
 }
 

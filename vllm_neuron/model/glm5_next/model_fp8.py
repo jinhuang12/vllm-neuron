@@ -6958,7 +6958,7 @@ class Glm5NextDSAIndexer(nn.Module):
             dsa_decode_ring_rows,
             max_rows_for,
         )
-        from vllm_neuron.functional.dsa.decode_trow import dsa_decode_scores_rows
+        from vllm_neuron.functional.dsa.decode_trow_wide import decode_scores_rows_for
         from vllm_neuron.functional.dsa.kpool_hadamard import dsa_hadamard128
         from vllm_neuron.functional.state_banks import shared_store_problem
         from vllm_neuron.utils.neuron_utils import values_are_readable
@@ -7167,7 +7167,9 @@ class Glm5NextDSAIndexer(nn.Module):
                     candidates=candidates, pool_size=pool,
                 )
             else:
-                bounded = dsa_decode_scores_rows(
+                # The T-row kernel of the static candidate axis: one output transpose
+                # up to 16384 candidates, groups of 128 tiles above (decode_trow_wide).
+                bounded = decode_scores_rows_for(candidates)(
                     query, weights, pool_bank, slots, position, pooled,
                     candidates=candidates, pool_size=pool,
                     rotate_query=not query_rotated,
@@ -7208,12 +7210,26 @@ class Glm5NextDSAIndexer(nn.Module):
         if self.dcp_size > 1:
             # This rank's top-k in pool order with its pads (5b), merged with the group's
             # (item 3), then expanded at the owned lengths: the selected pools this rank
-            # holds and, where it owns the step, the open pool's tail.
-            from vllm_neuron.functional.dsa.decode_select import dsa_decode_select_pools
-
-            _tokens, values, local_ids = dsa_decode_select_pools(
-                bounded, seq_lens, select_k=self.select_k(), pool_size=pool
+            # holds and, where it owns the step, the open pool's tail. A rank axis wider
+            # than one compaction row takes the chunk walk (decode_select_walk.py); the
+            # branch is on a static shape, so it adds no graph node.
+            from vllm_neuron.functional.dsa.decode_select import (
+                MAX_DECODE_POOLS_CANDIDATES,
+                dsa_decode_select_pools,
             )
+
+            if int(bounded.shape[1]) <= MAX_DECODE_POOLS_CANDIDATES:
+                _tokens, values, local_ids = dsa_decode_select_pools(
+                    bounded, seq_lens, select_k=self.select_k(), pool_size=pool
+                )
+            else:
+                from vllm_neuron.functional.dsa.decode_select_walk import (
+                    dsa_decode_select_pools_walk,
+                )
+
+                values, local_ids = dsa_decode_select_pools_walk(
+                    bounded, select_k=self.select_k()
+                )
             return self.expand_indices(
                 self._dcp_merge_selection(values, local_ids, int(page_size)), seq_lens
             )
