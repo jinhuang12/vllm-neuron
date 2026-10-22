@@ -65,6 +65,15 @@ all-gathers those row blocks back to every token before a sub-block that needs t
 The reduce-scatter follows the same wire-dtype rule as the all-reduce: the step its
 partial's row count names (:class:`StepRows`), then the two dtype switches above. With
 the switch off neither is called, and the program is the all-reduce form above.
+
+The chunk-pair prefill route (``neuron_parallel_state``, ``prefill_pairs``) splits the
+world into two prefill groups, each running one chunk of a pair. Its row-parallel sites
+call the entry points above with the prefill group in place of the tensor-parallel
+group; nothing in them depends on the group's size beyond its ``world_size``. What one
+chunk hands the other -- the latent rows, the pooled index keys, the recurrent state --
+crosses to the partner rank through :func:`exchange_with_partner`, a 2-rank all-gather
+that moves the tensor's bytes unchanged: no wire-dtype rule applies, so fp32 state
+crosses in fp32.
 """
 
 from __future__ import annotations
@@ -89,12 +98,14 @@ __all__ = [
     "DTYPE_PHASES_ENV",
     "FUSE_COMPILER_ARG",
     "FUSE_ENV",
+    "PAIR_RANKS",
     "CollectivePolicyError",
     "RowParallelSite",
     "StepRows",
     "allreduce_dtype_phases",
     "allreduce_fuse_enabled",
     "allreduce_wire_dtype",
+    "exchange_with_partner",
     "fuse_compiler_args",
     "gather_sequence",
     "reduce_row_parallel",
@@ -124,6 +135,9 @@ _EVERY_PHASE = "all"
 #: The partial dtypes a site may hand in: fp32 at every site on the device; bf16 where a
 #: CPU route returns its sum already rounded to bfloat16 (the routed experts).
 _PARTIAL_DTYPES = (torch.float32, torch.bfloat16)
+
+#: Ranks of a chunk-pair partner group: this rank and its partner.
+PAIR_RANKS = 2
 
 
 class CollectivePolicyError(ValueError):
@@ -416,6 +430,61 @@ def gather_sequence(
         return (group.all_gather(first.contiguous(), dim=0),)
     gathered = group.all_gather(torch.stack(tuple(tensors), dim=1), dim=0)
     return tuple(gathered.unbind(dim=1))
+
+
+def exchange_with_partner(
+    tensor: torch.Tensor, *, group: GroupCoordinator | None = None
+) -> torch.Tensor:
+    """Send ``tensor`` to this rank's chunk-pair partner and return the partner's.
+
+    One all-gather on dim 0 over the 2-rank pair group: each rank sends its tensor and
+    keeps the half the other rank sent. The gather copies bytes and casts nothing, so
+    the result is the partner's tensor bit for bit, in its own dtype.
+
+    The half is chosen by this rank's index in the pair, a python int, so the select
+    is a static view of the gathered buffer: no copy and no dynamic offset. The int is
+    a constant of the traced graph. That is correct because every rank traces its own
+    graph and caches it under a key of that graph's text and replica groups, so each
+    rank runs a graph that holds its own index (the decode context-parallel merge
+    takes its ``cp_rank`` the same way). It adds no compile in a pair step: the two
+    ranks of a pair are in different prefill groups, so their graphs differ in replica
+    groups in any case.
+
+    Args:
+        tensor: this rank's tensor, with at least one dim. The call is collective: the
+            partner makes it too, with a tensor of the same shape and dtype.
+        group: the pair group; ``None`` (the default) is this process's
+            ``neuron_parallel_state.get_neuron_pair_group()``. Unlike the entry points
+            above, ``None`` does not mean one rank: a pair always has two.
+
+    Returns:
+        The partner's tensor, of ``tensor``'s shape and dtype: a view into the gathered
+        buffer, contiguous.
+
+    Raises:
+        CollectivePolicyError: ``group`` is not :data:`PAIR_RANKS` ranks, or ``tensor``
+            has no dim to gather on.
+    """
+    if group is None:
+        # Imported here: this module keeps vllm.distributed out of its import, as its
+        # type-only GroupCoordinator import does.
+        from vllm_neuron.parallel.neuron_parallel_state import get_neuron_pair_group
+
+        group = get_neuron_pair_group()
+    if group.world_size != PAIR_RANKS:
+        raise CollectivePolicyError(
+            f"exchange_with_partner needs a group of {PAIR_RANKS} ranks, this rank and "
+            f"its partner; got {group.world_size} ranks"
+        )
+    if tensor.dim() == 0:
+        raise CollectivePolicyError(
+            "exchange_with_partner gathers on dim 0; got a tensor with no dims"
+        )
+    rows = int(tensor.shape[0])
+    # ``all_gather_into_tensor`` refuses a non-contiguous input.
+    gathered = group.all_gather(tensor.contiguous(), dim=0)
+    partner = PAIR_RANKS - 1 - group.rank_in_group
+    return gathered.narrow(0, partner * rows, rows)
 
 
 def _check_partial(partial: torch.Tensor, site: RowParallelSite) -> None:

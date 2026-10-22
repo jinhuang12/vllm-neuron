@@ -130,24 +130,27 @@ def _split_bf16(flat):
     return hi, lo
 
 
-def _load_o_proj_t(ot, o_proj, h0, use_dma):
-    """``ot[j, h] = o_proj[h0 + h, j]`` for the ``hp = ot.shape[1]`` rows from ``h0``.
+def _load_o_proj_t(ot, o_proj, h0, use_dma, j0=0):
+    """``ot[j, h] = o_proj[h0 + h, j0 + j]`` for the ``hp = ot.shape[1]`` rows from ``h0``.
 
-    ``use_dma``: one DMA transpose (bf16 only); else a plain DMA of the natural rows
-    and tensor-engine transposes, eight bf16 (four fp32) blocks per PSUM bank.
+    ``ot.shape[0]`` columns of ``o_proj`` from ``j0``: all of them unless the caller
+    contracts ``W`` in blocks. ``use_dma``: one DMA transpose (bf16 only); else a plain
+    DMA of the natural rows and tensor-engine transposes, eight bf16 (four fp32) blocks
+    per PSUM bank.
     """
     width, hp = ot.shape
+    stride = o_proj.shape[1]
     if use_dma:
-        # src[a, b, j] = o_proj[h0 + 16 b + a, j] -> dst[j, b, a]: one DMA.
+        # src[a, b, j] = o_proj[h0 + 16 b + a, j0 + j] -> dst[j, b, a]: one DMA.
         nisa.dma_transpose(
             dst=ot.reshape((width, hp // _DGE_ROWS, _DGE_ROWS)),
-            src=o_proj.ap(pattern=[[width, _DGE_ROWS], [_DGE_ROWS * width, hp // _DGE_ROWS],
-                                   [1, width]], offset=h0 * width))
+            src=o_proj.ap(pattern=[[stride, _DGE_ROWS], [_DGE_ROWS * stride, hp // _DGE_ROWS],
+                                   [1, width]], offset=h0 * stride + j0))
         return
     nblk = hp // _P
     natural = nl.ndarray((_P, nblk, width), dtype=o_proj.dtype, buffer=nl.sbuf)
     nisa.dma_copy(dst=natural, src=o_proj.ap(
-        pattern=[[width, _P], [_P * width, nblk], [1, width]], offset=h0 * width))
+        pattern=[[stride, _P], [_P * stride, nblk], [1, width]], offset=h0 * stride + j0))
     per = 4 if o_proj.dtype == nl.float32 else 8  # 128-column transposes per 2 KiB bank
     for g0 in range(0, nblk, per):
         gn = min(per, nblk - g0)
@@ -243,9 +246,15 @@ def kda_output_prefill_kernel(core, out_gate, o_norm, o_proj, HEADS: int = 1,
     for four banks), not one 2 KiB run per bank (with one bank per store, a profile
     reads 2 KiB DMA packets keeping all 16 DMA engines busy).
 
+    A ``W`` above 128 (a rank that holds several heads' shards) is contracted in blocks
+    of 128 rows, the partitions: each block takes its own two passes into its own PSUM
+    bank, and the blocks' sums are added in fp32, in block order, as they leave PSUM.
+    With 128-wide heads each block's sum is then the one a one-head call on that head
+    returns, and the output is the fp32 sum of those calls' outputs, head by head.
+
     Args:
-        core: ``[T, W]`` fp32 recurrence output, ``W = HEADS * kdim <= 128``, ``T`` a
-            multiple of ``128 * programs``.
+        core: ``[T, W]`` fp32 recurrence output, ``W = HEADS * kdim``, at most 128 or a
+            multiple of 128, ``T`` a multiple of ``128 * programs``.
         out_gate: ``[T, W]`` fp32.
         o_norm: ``[kdim]`` gain (bf16 or fp32).
         o_proj: ``[H, W]`` bf16, this rank's row-parallel slice.
@@ -258,12 +267,15 @@ def kda_output_prefill_kernel(core, out_gate, o_norm, o_proj, HEADS: int = 1,
     program = nl.program_id(0)
     kernel_assert(programs in (1, 2), "one or two programs")
     kernel_assert(tokens % (_P * programs) == 0, "T splits into 128-row tiles per program")
-    kernel_assert(w2 == width and width <= _P and kdim * HEADS == width, "W <= 128")
+    kernel_assert(w2 == width and kdim * HEADS == width and (width <= _P or width % _P == 0),
+                  "W <= 128 or W in 128-row blocks")
     kernel_assert(hidden % _BANK == 0, "H in 512-column PSUM banks")
     kernel_assert(o_proj.dtype == nl.bfloat16, "bf16 o_proj")
     rows = tokens // programs
     r0 = program * rows
     tiles = rows // _P
+    kblock = min(width, _P)  # contraction rows per block of W
+    kblocks = width // kblock
     out = nl.ndarray((tokens, hidden), dtype=nl.float32, buffer=nl.shared_hbm)
 
     # ---- Gated RMSNorm of this program's rows: c[p, i] = core[r0 + 128 i + p]. #
@@ -280,35 +292,53 @@ def kda_output_prefill_kernel(core, out_gate, o_norm, o_proj, HEADS: int = 1,
     shaped = _gated_rows(c, gate.reshape((_P, tiles * width)), gain, EPS)
     hi, lo = _split_bf16(shaped.reshape((_P, tiles * width)))
 
-    # g^T [W, tile, 2, 128]: each tile's hi and lo passes' stationaries.
-    gt = nl.ndarray((width, tiles, 2, _P), dtype=nl.bfloat16, buffer=nl.sbuf)
+    # g^T [kblock, tile, 2 * kblocks, 128]: per tile and block of W, the hi and lo
+    # passes' stationaries.
+    gt = nl.ndarray((kblock, tiles, 2 * kblocks, _P), dtype=nl.bfloat16, buffer=nl.sbuf)
     for i in range(tiles):
-        gt_ps = nl.ndarray((width, 2, _P), dtype=nl.bfloat16, buffer=nl.psum)
-        nisa.nc_transpose(dst=gt_ps[:, 0, :], data=hi[:, i * width:(i + 1) * width])
-        nisa.nc_transpose(dst=gt_ps[:, 1, :], data=lo[:, i * width:(i + 1) * width])
-        nisa.tensor_copy(dst=gt[:, i, :, :], src=gt_ps)
+        for b in range(kblocks):
+            k0 = i * width + b * kblock
+            gt_ps = nl.ndarray((kblock, 2, _P), dtype=nl.bfloat16, buffer=nl.psum)
+            nisa.nc_transpose(dst=gt_ps[:, 0, :], data=hi[:, k0:k0 + kblock])
+            nisa.nc_transpose(dst=gt_ps[:, 1, :], data=lo[:, k0:k0 + kblock])
+            nisa.tensor_copy(dst=gt[:, i, 2 * b:2 * b + 2, :], src=gt_ps)
 
     banks = hidden // _BANK
     group = math.gcd(banks, _STORE_BANKS)
     for g0 in range(0, banks, group):
         c0 = g0 * _BANK
-        # o_proj^T [W, 512 * group] for this group's output columns.
-        ot = nl.ndarray((width, group * _BANK), dtype=o_proj.dtype, buffer=nl.sbuf)
-        _load_o_proj_t(ot, o_proj, c0, DMA_TRANSPOSE)
+        # o_proj^T [kblock, 512 * group] per block of W, for this group's output columns.
+        ots = []
+        for b in range(kblocks):
+            ot = nl.ndarray((kblock, group * _BANK), dtype=o_proj.dtype, buffer=nl.sbuf)
+            _load_o_proj_t(ot, o_proj, c0, DMA_TRANSPOSE, j0=b * kblock)
+            ots.append(ot)
         for i in range(tiles):
             # Each bank's accumulator takes the same two passes in the same order as one
             # bank per store; only the store grouping changes, so every output bit is kept.
             block = nl.ndarray((_P, group * _BANK), dtype=nl.float32, buffer=nl.sbuf)
             for j in range(group):
-                acc = nl.ndarray((_P, _BANK), dtype=nl.float32, buffer=nl.psum)
-                for part in range(2):
-                    nisa.nc_matmul(dst=acc, stationary=gt[:, i, part, :],
-                                   moving=ot[:, j * _BANK:(j + 1) * _BANK],
-                                   accumulate=(part > 0))
-                # The PSUM reads alternate Vector and Scalar, the two engines that read PSUM.
-                nisa.tensor_copy(dst=block[:, j * _BANK:(j + 1) * _BANK], src=acc,
-                                 engine=nisa.engine.vector
-                                 if ((g0 + j) * tiles + i) % 2 == 0 else nisa.engine.scalar)
+                out_cols = block[:, j * _BANK:(j + 1) * _BANK]
+                # The running sum of the blocks before the last, when there are several.
+                partial = (nl.ndarray((_P, _BANK), dtype=nl.float32, buffer=nl.sbuf)
+                           if kblocks > 1 else None)
+                for b in range(kblocks):
+                    acc = nl.ndarray((_P, _BANK), dtype=nl.float32, buffer=nl.psum)
+                    for part in range(2):
+                        nisa.nc_matmul(dst=acc, stationary=gt[:, i, 2 * b + part, :],
+                                       moving=ots[b][:, j * _BANK:(j + 1) * _BANK],
+                                       accumulate=(part > 0))
+                    dst = out_cols if b == kblocks - 1 else partial
+                    if b == 0:
+                        # The PSUM reads alternate Vector and Scalar, the two engines that
+                        # read PSUM.
+                        nisa.tensor_copy(dst=dst, src=acc,
+                                         engine=nisa.engine.vector
+                                         if ((g0 + j) * tiles + i) % 2 == 0
+                                         else nisa.engine.scalar)
+                    else:
+                        nisa.tensor_tensor(dst=dst, data1=partial, data2=acc, op=nl.add,
+                                           engine=nisa.engine.vector)
             nisa.dma_copy(dst=out.ap(pattern=[[hidden, _P], [1, group * _BANK]],
                                      offset=(r0 + i * _P) * hidden + c0), src=block)
     return out
@@ -359,8 +389,10 @@ def launch_programs() -> int:
 
 def _serves_prefill(tokens: int, o_proj: Tensor) -> bool:
     """True when the prefill kernel takes a ``tokens``-row call (above the decode bound)."""
+    width = int(o_proj.shape[1])
     return (tokens > KDA_OUTPUT_MAX_TOKENS and tokens % (_P * launch_programs()) == 0
-            and o_proj.dtype == torch.bfloat16 and int(o_proj.shape[0]) % _BANK == 0)
+            and o_proj.dtype == torch.bfloat16 and int(o_proj.shape[0]) % _BANK == 0
+            and (width <= _P or width % _P == 0))
 
 
 def kda_gated_projection_admits(core: Tensor, out_gate: Tensor, attn,
@@ -374,13 +406,14 @@ def kda_gated_projection_admits(core: Tensor, out_gate: Tensor, attn,
         phase: the step's ``"prefill"`` or ``"decode"``; None when it is not known,
             and then only a rule without a phase selects the kernel.
 
-    Either kernel serves ``W <= 128``, ``K`` a power of two, bf16 or fp32 gain, on an
-    NKI device or the simulator, when ``VLLM_NEURON_GLUE_FUSED`` selects ``kda_output``
-    for this row count and phase. The decode kernel takes ``1 <= T <=
-    KDA_OUTPUT_MAX_TOKENS`` with bf16 or fp32 ``o_proj`` and ``H`` in 128-blocks per
-    program; the prefill kernel takes a larger ``T`` that splits into 128-row tiles per
-    program, with bf16 ``o_proj`` and ``H`` in 512-column banks. Anything else is
-    counted as declined.
+    Either kernel serves ``K`` a power of two, bf16 or fp32 gain, on an NKI device or
+    the simulator, when ``VLLM_NEURON_GLUE_FUSED`` selects ``kda_output`` for this row
+    count and phase. The decode kernel takes ``1 <= T <= KDA_OUTPUT_MAX_TOKENS`` with
+    ``W <= 128``, bf16 or fp32 ``o_proj`` and ``H`` in 128-blocks per program; the
+    prefill kernel takes a larger ``T`` that splits into 128-row tiles per program, with
+    ``W <= 128`` or ``W`` in 128-column blocks (a rank that holds several heads'
+    shards), bf16 ``o_proj`` and ``H`` in 512-column banks. Anything else is counted as
+    declined.
     """
     o_proj, gain = attn.o_proj_weight, attn.o_norm_weight
     heads, kdim = int(attn.num_kv_heads_per_rank), int(attn.head_dim)
@@ -394,8 +427,8 @@ def kda_gated_projection_admits(core: Tensor, out_gate: Tensor, attn,
         and gain.dtype in (torch.bfloat16, torch.float32)
         and tuple(gain.shape) == (kdim,) and kdim & (kdim - 1) == 0
         and tuple(core.shape) == tuple(out_gate.shape) == (tokens, width)
-        and width <= _P and int(o_proj.shape[1]) == width
-        and ((1 <= tokens <= KDA_OUTPUT_MAX_TOKENS
+        and int(o_proj.shape[1]) == width
+        and ((1 <= tokens <= KDA_OUTPUT_MAX_TOKENS and width <= _P
               and int(o_proj.shape[0]) % (_P * launch_programs()) == 0)
              or _serves_prefill(tokens, o_proj))
         and can_run_kernel(core)

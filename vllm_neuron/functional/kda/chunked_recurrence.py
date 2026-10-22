@@ -101,6 +101,13 @@ the intra-chunk kernel splits the whole tiles between them
 (:func:`intra_chunk_grid`), the inter-chunk kernel the value columns of the
 state (:func:`inter_chunk_grid`).
 
+Heads
+-----
+Both entry points take operands with a leading heads axis. Each head is its own
+sequence, and the heads share nothing but the launch: the intra-chunk kernel runs
+them as more chunks, and the inter-chunk kernel as more chains. A head's results
+are those of a one-head call on its operands.
+
 Gate blocks
 -----------
 The two chunk-local products factorise the gate difference as
@@ -1317,11 +1324,13 @@ def kda_intra_chunk(
     *,
     gate_block: int | None = None,
 ) -> IntraChunkOutputs:
-    """Stages 1 to 3 over every chunk, in one kernel dispatch.
+    """Stages 1 to 3 over every chunk of one head or of several, in one kernel dispatch.
 
     Args:
         q, k, gk: ``[NC, C, K]`` fp32. ``gk`` is the per-key-channel log gate,
-            not yet accumulated; the kernel forms the cumulative sum.
+            not yet accumulated; the kernel forms the cumulative sum. Every
+            operand may carry a leading heads axis instead, ``[H, NC, C, K]``
+            here and ``[H, NC, C]`` for ``beta``; then all of them do.
         v: ``[NC, C, V]`` fp32.
         beta: ``[NC, C]`` fp32, one scalar per token.
         gate_block: the tokens of one gate block, ``C`` or ``C / 2`` (module
@@ -1329,12 +1338,17 @@ def kda_intra_chunk(
             one block's gate sum, and ``C / 2`` also needs a non-positive gate.
 
     Returns:
-        :class:`IntraChunkOutputs`.
+        :class:`IntraChunkOutputs`, every field with the heads axis in front when
+        the operands carry one. Stages 1 to 3 are chunk-local, so the heads' chunks
+        run as the chunks of one call, and head ``h`` of every field is what a
+        one-head call on head ``h``'s operands returns.
 
     Raises:
         ChunkedRecurrenceError: on a rank mismatch, a shape disagreement, or an
             inadmissible geometry or gate range.
     """
+    if q.dim() == 4:
+        return _intra_chunk_heads(q, k, v, beta, gk, gate_block)
     ranks = (("q", q, 3), ("k", k, 3), ("v", v, 3), ("gk", gk, 3), ("beta", beta, 2))
     for name, tensor, rank in ranks:
         if tensor.dim() != rank:
@@ -1410,6 +1424,50 @@ def kda_intra_chunk(
         **blocked,
     )
     return IntraChunkOutputs(w=w, u=u, kg=kg, a_inv=a_inv, aqk=aqk)
+
+
+def _intra_chunk_heads(
+    q: Tensor, k: Tensor, v: Tensor, beta: Tensor, gk: Tensor,
+    gate_block: int | None,
+) -> IntraChunkOutputs:
+    """:func:`kda_intra_chunk` of operands with a leading heads axis.
+
+    The heads' chunks are laid end to end on the chunk axis, head-major, and run
+    as one call's chunks; each output goes back to ``[H, NC, ...]``. That keeps
+    every head on the one-head call's packed tiles only when a head's rows fill
+    whole tiles (:func:`tile_rows`); otherwise a head would share a tile with the
+    next, and a tile's width sets the rounding of its matmuls, so each head then
+    runs as its own call.
+    """
+    ranks = (("q", q, 4), ("k", k, 4), ("v", v, 4), ("gk", gk, 4), ("beta", beta, 3))
+    for name, tensor, rank in ranks:
+        if tensor.dim() != rank:
+            raise ChunkedRecurrenceError(
+                f"{name} must be {rank}-D with a heads axis like q, got shape "
+                f"{tuple(tensor.shape)}"
+            )
+    lead = tuple(int(x) for x in q.shape[:2])
+    for name, tensor in (("k", k), ("v", v), ("gk", gk), ("beta", beta)):
+        if tuple(tensor.shape)[:2] != lead:
+            raise ChunkedRecurrenceError(
+                f"{name} {tuple(tensor.shape)} must lead with q's [heads, NC] {lead}"
+            )
+    heads, n_chunks = lead
+    chunk = int(q.shape[2])
+    # A chunk outside [1, MAX_TILE] has no packed tile; the one call refuses it.
+    if 0 < chunk <= MAX_TILE and (n_chunks * chunk) % tile_rows(chunk):
+        per_head = [
+            kda_intra_chunk(q[h], k[h], v[h], beta[h], gk[h], gate_block=gate_block)
+            for h in range(heads)
+        ]
+        return IntraChunkOutputs(*(torch.stack(fields) for fields in zip(*per_head)))
+    flat = kda_intra_chunk(
+        *(t.reshape((heads * n_chunks,) + tuple(t.shape[2:])) for t in (q, k, v, beta, gk)),
+        gate_block=gate_block,
+    )
+    return IntraChunkOutputs(
+        *(field.reshape(lead + tuple(field.shape[1:])) for field in flat)
+    )
 
 
 def kda_intra_chunk_torch_oracle(
@@ -1523,6 +1581,11 @@ def stage3_kernel_identity() -> tuple[str, str]:
 # ``qg @ h_chunk`` plus the intra-chunk part ``Aqk @ v_new``. The two forms agree
 # numerically, so writing the kernel in the oracle's form would make the
 # comparison between them circular.
+#
+# One launch serves several heads: each head is its own chain over its own
+# operands, and the heads share nothing but the launch. A state-only launch runs
+# the same chains and leaves out what only the output reads, for a caller that
+# needs the state a sequence leaves before it needs that sequence's output.
 
 
 class InterChunkOutputs(NamedTuple):
@@ -1531,15 +1594,19 @@ class InterChunkOutputs(NamedTuple):
     ``final_state`` is ``[V, K]``, the sequential scan's own orientation, so a
     comparison against it needs no transpose on either side. The kernel carries
     the state transposed internally, for the reason given on
-    :func:`kda_inter_chunk_kernel`, and pays one transpose at the end.
+    :func:`kda_inter_chunk_kernel`, and pays one transpose at the end. A call
+    with a heads axis returns every field with that axis in front.
 
     ``v_new`` is a side output: nothing here consumes it, and it makes stage 4's
     derivation of it from ``u`` readable without reading the kernel body.
+
+    A state-only call (``kda_inter_chunk(..., state_only=True)``) computes
+    ``final_state`` alone, and ``o`` and ``v_new`` are ``None``.
     """
 
-    o: Tensor
+    o: Tensor | None
     final_state: Tensor
-    v_new: Tensor
+    v_new: Tensor | None
 
 
 class SequentialOutputs(NamedTuple):
@@ -1608,6 +1675,7 @@ def inter_chunk_constants(
     kdim: int,
     vdim: int,
     *,
+    heads: int = 1,
     device: torch.device | str = "cpu",
     dtype: torch.dtype = torch.float32,
 ) -> InterChunkConstants:
@@ -1621,17 +1689,18 @@ def inter_chunk_constants(
       ``[K, 1]`` column, which is the shape the per-key-channel state decay needs:
       one matmul, no transpose. That is why this constant is a column where the
       intra-chunk row selector is a full ``[C, C]`` tile.
-    * ``state_init``, the ``[V, K]`` zero entering state, built on the host and
-      loaded rather than zeroed on device. Being an argument, it is also how a
-      caller passes a non-zero entering state. It is stated in the orientation
-      :attr:`InterChunkOutputs.final_state` returns, so a caller can loop one
-      call's output into the next with no transpose of its own.
+    * ``state_init``, the zero entering state of ``heads`` heads, ``[heads * V, K]``
+      with head ``h`` in rows ``h * V`` onward (``[V, K]`` for one head), built on
+      the host and loaded rather than zeroed on device. Being an argument, it is
+      also how a caller passes a non-zero entering state. It is stated in the
+      orientation :attr:`InterChunkOutputs.final_state` returns, so a caller can
+      loop one call's output into the next with no transpose of its own.
     """
     idx = torch.arange(chunk, device=device)
     return InterChunkConstants(
         triu_ones=(idx.unsqueeze(1) <= idx.unsqueeze(0)).to(dtype),
         last_col=(idx == (chunk - 1)).to(dtype).unsqueeze(1).contiguous(),
-        state_init=torch.zeros(vdim, kdim, device=device, dtype=dtype),
+        state_init=torch.zeros(heads * vdim, kdim, device=device, dtype=dtype),
     )
 
 
@@ -1673,18 +1742,22 @@ def _emit_inter_layout(triu_hbm, last_col_hbm, rows, chunk):
     return _InterLayout(triu, last_sel)
 
 
-def _emit_inter_operands(sources, layout, g0, groups, chunk, kdim, v0, vpart, scale):
+def _emit_inter_operands(sources, layout, g0, groups, chunk, kdim, v0, vpart, scale,
+                         with_output):
     """The chain's per-chunk operands for the ``groups`` chunks starting at ``g0``.
 
     Everything here is off the carried state's critical path; the chain only
     reads it. The row-layout operands (``gk``, ``q``, ``w``, ``aqk``) are loaded
     one packed tile at a time; ``kg`` and this program's ``u`` columns are loaded
     chunk-local, ``[C, groups, *]``, because they enter the chain as the
-    partition-axis operands of chunk-sized matmuls.
+    partition-axis operands of chunk-sized matmuls. ``g0`` counts chunks over
+    every head's, so it also names the head.
 
     Returns ``(w_t, qg_t, aqk_t, decay, kg_c, u_c)``: per chunk ``g``, the
     stationary ``w^T``, ``qg^T`` and ``aqk^T`` at ``[:, g]``, and ``decay[:, g]``
-    the state decay column.
+    the state decay column. Without ``with_output`` only the chain's operands are
+    formed, ``q`` and ``aqk`` are not read, and ``qg_t`` and ``aqk_t`` are
+    ``None``.
     """
     kg_hbm, w_rows, u_hbm, gk_rows, q_rows, aqk_rows = sources
     r0 = g0 * chunk
@@ -1693,33 +1766,36 @@ def _emit_inter_operands(sources, layout, g0, groups, chunk, kdim, v0, vpart, sc
     gk_sb = _load_tiles(gk_rows, r0, 1, count, kdim, nisa.engine.sync)
     gc_sb = _sbuf(count, kdim)
     _emit_gate_cumsum(gc_sb, gk_sb, layout.triu[0:count, 0:count], count, kdim)
-    egc_sb = _sbuf(count, kdim)
-    nisa.activation(dst=egc_sb, data=gc_sb, op=nl.exp)
+    qg_t = aqk_t = None
+    if with_output:
+        egc_sb = _sbuf(count, kdim)
+        nisa.activation(dst=egc_sb, data=gc_sb, op=nl.exp)
 
-    # `q` arrives raw and is normalised and scaled here, as stage 2 does.
-    q_raw = _load_tiles(q_rows, r0, 1, count, kdim, nisa.engine.scalar)
-    q_norm = _sbuf(count, kdim)
-    _emit_l2_normalise(q_norm, q_raw, count, kdim)
-    q_sb = _sbuf(count, kdim)
-    nisa.tensor_scalar(dst=q_sb, data=q_norm, op0=nl.multiply, operand0=scale)
-    qg_sb = _sbuf(count, kdim)
-    nisa.tensor_tensor(dst=qg_sb, data1=q_sb, data2=egc_sb, op=nl.multiply)
+        # `q` arrives raw and is normalised and scaled here, as stage 2 does.
+        q_raw = _load_tiles(q_rows, r0, 1, count, kdim, nisa.engine.scalar)
+        q_norm = _sbuf(count, kdim)
+        _emit_l2_normalise(q_norm, q_raw, count, kdim)
+        q_sb = _sbuf(count, kdim)
+        nisa.tensor_scalar(dst=q_sb, data=q_norm, op0=nl.multiply, operand0=scale)
+        qg_sb = _sbuf(count, kdim)
+        nisa.tensor_tensor(dst=qg_sb, data1=q_sb, data2=egc_sb, op=nl.multiply)
 
     w_sb = _load_tiles(w_rows, r0, 1, count, kdim, nisa.engine.sync)
     w_t = nl.ndarray((kdim, groups, chunk), dtype=nl.float32, buffer=nl.sbuf)
     ps_w = _psum(kdim, count)
     nisa.nc_transpose(dst=ps_w, data=w_sb)
     nisa.tensor_copy(dst=w_t, src=ps_w.reshape((kdim, groups, chunk)))
-    qg_t = nl.ndarray((kdim, groups, chunk), dtype=nl.float32, buffer=nl.sbuf)
-    ps_q = _psum(kdim, count)
-    nisa.nc_transpose(dst=ps_q, data=qg_sb)
-    nisa.tensor_copy(dst=qg_t, src=ps_q.reshape((kdim, groups, chunk)))
+    if with_output:
+        qg_t = nl.ndarray((kdim, groups, chunk), dtype=nl.float32, buffer=nl.sbuf)
+        ps_q = _psum(kdim, count)
+        nisa.nc_transpose(dst=ps_q, data=qg_sb)
+        nisa.tensor_copy(dst=qg_t, src=ps_q.reshape((kdim, groups, chunk)))
 
-    aqk_sb = _load_tiles(aqk_rows, r0, 1, count, chunk, nisa.engine.scalar)
-    aqk_t = nl.ndarray((chunk, groups, chunk), dtype=nl.float32, buffer=nl.sbuf)
-    ps_a = _psum(chunk, count)
-    nisa.nc_transpose(dst=ps_a, data=aqk_sb)
-    nisa.tensor_copy(dst=aqk_t, src=ps_a.reshape((chunk, groups, chunk)))
+        aqk_sb = _load_tiles(aqk_rows, r0, 1, count, chunk, nisa.engine.scalar)
+        aqk_t = nl.ndarray((chunk, groups, chunk), dtype=nl.float32, buffer=nl.sbuf)
+        ps_a = _psum(chunk, count)
+        nisa.nc_transpose(dst=ps_a, data=aqk_sb)
+        nisa.tensor_copy(dst=aqk_t, src=ps_a.reshape((chunk, groups, chunk)))
 
     ps_d = _psum(kdim, groups)
     nisa.nc_matmul(
@@ -1746,7 +1822,8 @@ def _emit_inter_step(ht, operands, g, vnew_c, o_c, chunk, kdim, vpart):
     ``o``'s two products read the same entering state and ``v_new`` but feed
     nothing the chain reads, so they are separate matmuls issued after it: a
     product merged into the chain's matmul would put its stationary columns on
-    every step's weight load.
+    every step's weight load. ``o_c`` is ``None`` in a state-only launch, and the
+    step is then the chain alone.
     """
     w_t, qg_t, aqk_t, decay, kg_c, u_c = operands
 
@@ -1771,6 +1848,8 @@ def _emit_inter_step(ht, operands, g, vnew_c, o_c, chunk, kdim, vpart):
         dst=ht_next, data=ht, op0=nl.multiply, operand0=decay[0:kdim, g : g + 1],
         op1=nl.add, operand1=ps_h,
     )
+    if o_c is None:
+        return ht_next
 
     # Stage 5, off the chain: o = qg @ ht + aqk @ v_new, also on the entering
     # state, each product rounded on its own and then added. One addend leaves
@@ -1790,14 +1869,19 @@ def _emit_inter_step(ht, operands, g, vnew_c, o_c, chunk, kdim, vpart):
 @nki.jit
 def kda_inter_chunk_kernel(
     kg_hbm, w_hbm, u_hbm, gk_hbm, q_hbm, aqk_hbm, triu_hbm, last_col_hbm,
-    state_init_hbm,
+    state_init_hbm, HEADS: int = 1, STATE_ONLY: bool = False,
 ):
-    """Stages 4 and 5 for every chunk, in one dispatch.
+    """Stages 4 and 5 for every chunk of ``HEADS`` heads, in one dispatch.
 
-    ``kg``, ``w``, ``gk`` and ``q`` are ``[NC, C, K]``; ``u`` is ``[NC, C, V]``;
-    ``aqk`` is ``[NC, C, C]``; ``triu`` is ``[C, C]``; ``last_col`` is ``[C, 1]``;
-    ``state_init`` is ``[V, K]``; all float32. Returns ``o [NC, C, V]``,
-    ``final_state [V, K]`` and ``v_new [NC, C, V]``, float32.
+    ``kg``, ``w``, ``gk`` and ``q`` are ``[HEADS * NC, C, K]``; ``u`` is
+    ``[HEADS * NC, C, V]``; ``aqk`` is ``[HEADS * NC, C, C]``; head ``h`` owns
+    chunks ``h * NC`` to ``(h + 1) * NC - 1`` of each. ``triu`` is ``[C, C]``;
+    ``last_col`` is ``[C, 1]``; ``state_init`` is ``[HEADS * V, K]``, head ``h``'s
+    entering state in rows ``h * V`` onward; all float32. Returns
+    ``o [HEADS * NC, C, V]``, ``final_state [HEADS * V, K]`` and
+    ``v_new [HEADS * NC, C, V]``, float32, in the same head order. With
+    ``STATE_ONLY`` it returns ``final_state`` alone and reads neither ``q`` nor
+    ``aqk``. One head (``HEADS = 1``) is ``[NC, C, *]`` and ``[V, K]``.
 
     There is no raw ``v`` argument: ``v_new`` is derived from ``u`` inside stage 4.
 
@@ -1814,62 +1898,108 @@ def kda_inter_chunk_kernel(
     tile of ``MAX_TILE // C`` chunks (:func:`_emit_inter_operands`), so a chain
     step is four instructions on the state: ``w @ ht``, ``v_new``,
     ``kg^T @ v_new`` and the decayed sum; ``o``'s two products hang off it
-    (:func:`_emit_inter_step`). Value columns are independent, so a two-program
-    launch gives each program ``V / 2`` of them and the same chain.
+    (:func:`_emit_inter_step`).
+
+    Each head is its own chain on its own operands. Value columns are
+    independent, so a launch of ``P`` programs gives each program ``V / P`` value
+    columns of every head (an LNC2 pair: ``V / 2`` each), the split a one-head
+    launch makes. Each head's chain in a program is then the one-head launch's
+    program on that head's operands, instruction for instruction and at the same
+    matmul widths, so a head's results do not depend on the heads beside it. Not
+    whole heads per program: a matmul's result columns can depend on the moving
+    operand's width (BIRSim rounds the last 8 columns of a 128-wide one
+    differently from a 64-wide one), so ``V`` columns per program would not be
+    the one-head launch's arithmetic. A program steps its heads' chains in turn,
+    chunk by chunk, so one chain's matmuls can fill the other's vector waits.
+
+    ``STATE_ONLY`` leaves out what only ``o`` needs: ``q``'s normalisation and
+    gate, the transposes of ``qg`` and ``aqk``, each step's two output products,
+    and the ``o`` and ``v_new`` stores. The chain's own instructions do not
+    change, so its ``final_state`` is the full launch's.
     """
-    n_chunks, chunk, kdim = kg_hbm.shape
+    total_chunks, chunk, kdim = kg_hbm.shape
     vdim = u_hbm.shape[2]
     scale = float(kdim) ** -0.5
+    n_prog = nl.num_programs(0)
+    # The NKI front end admits ``assert`` and no ``raise``.
+    assert total_chunks % HEADS == 0, "every head holds the same number of chunks"
+    n_chunks = total_chunks // HEADS
     rows = n_chunks * chunk
     layout_rows = min(tile_rows(chunk), rows)
     tile_chunks = layout_rows // chunk
-    n_prog = nl.num_programs(0)
-    # The NKI front end admits ``assert`` and no ``raise``.
     assert vdim % n_prog == 0, "the value width does not split over the programs"
     vpart = vdim // n_prog
     v0 = nl.program_id(0) * vpart
+    with_output = not STATE_ONLY
 
-    o_hbm = nl.ndarray((n_chunks, chunk, vdim), dtype=nl.float32, buffer=nl.shared_hbm)
-    vnew_hbm = nl.ndarray(
-        (n_chunks, chunk, vdim), dtype=nl.float32, buffer=nl.shared_hbm
-    )
-    state_hbm = nl.ndarray((vdim, kdim), dtype=nl.float32, buffer=nl.shared_hbm)
+    o_hbm = vnew_hbm = None
+    if with_output:
+        o_hbm = nl.ndarray(
+            (total_chunks, chunk, vdim), dtype=nl.float32, buffer=nl.shared_hbm
+        )
+        vnew_hbm = nl.ndarray(
+            (total_chunks, chunk, vdim), dtype=nl.float32, buffer=nl.shared_hbm
+        )
+    state_hbm = nl.ndarray((HEADS * vdim, kdim), dtype=nl.float32, buffer=nl.shared_hbm)
     sources = (
         kg_hbm, _rows_view(w_hbm), u_hbm, _rows_view(gk_hbm), _rows_view(q_hbm),
         _rows_view(aqk_hbm),
     )
     layout = _emit_inter_layout(triu_hbm, last_col_hbm, layout_rows, chunk)
 
-    # The entering state arrives in the orientation this kernel returns and is
+    # The entering states arrive in the orientation this kernel returns and are
     # turned here, so the conversion is emitted on this engine rather than by
     # torch on the host.
-    entering = _sbuf(vpart, kdim)
-    _dma(entering, state_init_hbm[nl.ds(v0, vpart), 0:kdim], nisa.engine.scalar)
-    ht = _sbuf(kdim, vpart)
-    _emit_transpose(ht, entering, vpart, kdim)
+    carried = []
+    for head in range(HEADS):
+        entering = _sbuf(vpart, kdim)
+        _dma(entering, state_init_hbm[nl.ds(head * vdim + v0, vpart), 0:kdim],
+             nisa.engine.scalar)
+        ht = _sbuf(kdim, vpart)
+        _emit_transpose(ht, entering, vpart, kdim)
+        carried.append(ht)
 
     for g0 in range(0, n_chunks, tile_chunks):
         groups = min(tile_chunks, n_chunks - g0)
-        operands = _emit_inter_operands(
-            sources, layout, g0, groups, chunk, kdim, v0, vpart, scale
-        )
-        vnew_c = nl.ndarray((chunk, groups, vpart), dtype=nl.float32, buffer=nl.sbuf)
-        o_c = nl.ndarray((chunk, groups, vpart), dtype=nl.float32, buffer=nl.sbuf)
+        per_head = []
+        for head in range(HEADS):
+            c0 = head * n_chunks + g0
+            operands = _emit_inter_operands(
+                sources, layout, c0, groups, chunk, kdim, v0, vpart, scale, with_output
+            )
+            vnew_c = nl.ndarray((chunk, groups, vpart), dtype=nl.float32, buffer=nl.sbuf)
+            o_c = None
+            if with_output:
+                o_c = nl.ndarray((chunk, groups, vpart), dtype=nl.float32,
+                                 buffer=nl.sbuf)
+            per_head.append((c0, operands, vnew_c, o_c))
         for g in range(groups):
-            ht = _emit_inter_step(ht, operands, g, vnew_c, o_c, chunk, kdim, vpart)
-        _dma(vnew_hbm[g0 : g0 + groups, 0:chunk, nl.ds(v0, vpart)].permute((1, 0, 2)),
-             vnew_c, nisa.engine.sync)
-        _dma(o_hbm[g0 : g0 + groups, 0:chunk, nl.ds(v0, vpart)].permute((1, 0, 2)),
-             o_c, nisa.engine.scalar)
+            for head in range(HEADS):
+                _, operands, vnew_c, o_c = per_head[head]
+                carried[head] = _emit_inter_step(
+                    carried[head], operands, g, vnew_c, o_c, chunk, kdim, vpart
+                )
+        if with_output:
+            for head in range(HEADS):
+                c0, _, vnew_c, o_c = per_head[head]
+                _dma(vnew_hbm[c0 : c0 + groups, 0:chunk, nl.ds(v0, vpart)]
+                     .permute((1, 0, 2)), vnew_c, nisa.engine.sync)
+                _dma(o_hbm[c0 : c0 + groups, 0:chunk, nl.ds(v0, vpart)]
+                     .permute((1, 0, 2)), o_c, nisa.engine.scalar)
 
-    leaving = _sbuf(vpart, kdim)
-    _emit_transpose(leaving, ht, kdim, vpart)
-    _dma(state_hbm[nl.ds(v0, vpart), 0:kdim], leaving, nisa.engine.sync)
+    for head in range(HEADS):
+        leaving = _sbuf(vpart, kdim)
+        _emit_transpose(leaving, carried[head], kdim, vpart)
+        _dma(state_hbm[nl.ds(head * vdim + v0, vpart), 0:kdim], leaving,
+             nisa.engine.sync)
+    if STATE_ONLY:
+        return state_hbm
     return o_hbm, state_hbm, vnew_hbm
 
 
 def _require_inter_admissible(
-    n_chunks: int, chunk: int, kdim: int, vdim: int, gate_peak: float
+    n_chunks: int, chunk: int, kdim: int, vdim: int, gate_peak: float,
+    heads: int = 1,
 ) -> None:
     """Raise unless the inter-chunk kernel serves the input.
 
@@ -1882,9 +2012,11 @@ def _require_inter_admissible(
     :func:`kda_inter_chunk` for why that distinction keeps the state carry inside
     fp32. The size of a negative sum is not bounded: this kernel exponentiates the
     cumulative gate with one sign only, and a negative exponent goes toward zero,
-    which is the value it approximates.
+    which is the value it approximates. ``n_chunks`` counts one head's chunks.
     """
     problems: list[str] = []
+    if heads < 1:
+        problems.append(f"heads={heads} must be at least 1")
     if n_chunks < 1:
         problems.append(f"n_chunks={n_chunks} must be at least 1")
     if chunk < 2 or chunk > MAX_TILE:
@@ -1934,6 +2066,7 @@ def can_run_inter_chunk(
     kdim: int,
     vdim: int,
     gate_peak: float,
+    heads: int = 1,
 ) -> bool:
     """Is the NKI path available *and* admissible for this inter-chunk input?
 
@@ -1941,7 +2074,7 @@ def can_run_inter_chunk(
     simulator exists, :func:`_require_inter_admissible` whether this kernel
     accepts these extents and this gate range.
     """
-    _require_inter_admissible(n_chunks, chunk, kdim, vdim, gate_peak)
+    _require_inter_admissible(n_chunks, chunk, kdim, vdim, gate_peak, heads)
     return can_run_kernel(reference)
 
 
@@ -1954,14 +2087,17 @@ def kda_inter_chunk(
     aqk: Tensor,
     *,
     state: Tensor | None = None,
+    state_only: bool = False,
 ) -> InterChunkOutputs:
-    """Stages 4 and 5 over every chunk, in one kernel dispatch.
+    """Stages 4 and 5 over every chunk of one head or of several, in one kernel dispatch.
 
     ``kg``, ``w``, ``u`` and ``aqk`` are :func:`kda_intra_chunk`'s returns; ``gk``
     and ``q`` are the same raw inputs it took. There is no raw ``v``.
 
     Args:
-        kg: ``[NC, C, K]`` fp32, the gated key.
+        kg: ``[NC, C, K]`` fp32, the gated key. Every operand may carry a leading
+            heads axis instead, ``[H, NC, C, K]`` here; then all of them do, and
+            each head is its own sequence.
         w: ``[NC, C, K]`` fp32, the WY row factor.
         u: ``[NC, C, V]`` fp32, the WY value factor. ``v_new`` is derived from
             this inside stage 4.
@@ -1969,13 +2105,22 @@ def kda_inter_chunk(
             accumulated; the kernel forms the chunk-local cumulative sum.
         q: ``[NC, C, K]`` fp32, raw. Normalised and scaled inside the kernel.
         aqk: ``[NC, C, C]`` fp32, already carrying the scale and the causal mask.
-        state: ``[V, K]`` entering recurrent state, in ``final_state``'s own
-            orientation, or ``None`` for a zero entry. A caller whose tokens
-            arrive across several calls passes the state the previous call
-            returned.
+        state: ``[V, K]`` entering recurrent state (``[H, V, K]`` with heads), in
+            ``final_state``'s own orientation, or ``None`` for a zero entry. A
+            caller whose tokens arrive across several calls passes the state the
+            previous call returned.
+        state_only: compute the final state alone, for a caller that needs the
+            state a sequence leaves before it needs that sequence's output. The
+            chain is the full call's, so ``final_state`` is too; ``q`` and
+            ``aqk`` are checked but not read, and ``o`` and ``v_new`` are
+            ``None``.
 
     Returns:
-        :class:`InterChunkOutputs`, whose ``final_state`` is ``[V, K]``.
+        :class:`InterChunkOutputs`, whose ``final_state`` is ``[V, K]``
+        (``[H, V, K]`` with heads). With heads, head ``h`` of every field is what
+        a one-head call on head ``h``'s operands returns: the heads are separate
+        chains, and each program runs each head's chain with the one-head call's
+        instructions (:func:`kda_inter_chunk_kernel`).
 
     Raises:
         ChunkedRecurrenceError: on a rank mismatch, a shape disagreement, or an
@@ -1990,43 +2135,40 @@ def kda_inter_chunk(
     :data:`GATE_CUMSUM_ABS_LIMIT` is checked against exactly that quantity's
     largest value (:func:`_require_inter_admissible`).
     """
-    ranks = (
-        ("kg", kg, 3), ("w", w, 3), ("u", u, 3), ("gk", gk, 3), ("q", q, 3),
-        ("aqk", aqk, 3),
-    )
-    for name, tensor, rank in ranks:
+    with_heads = kg.dim() == 4
+    rank = 4 if with_heads else 3
+    ranks = (("kg", kg), ("w", w), ("u", u), ("gk", gk), ("q", q), ("aqk", aqk))
+    for name, tensor in ranks:
         if tensor.dim() != rank:
             raise ChunkedRecurrenceError(
-                f"{name} must be {rank}-D, got shape {tuple(tensor.shape)}"
+                f"{name} must be {rank}-D like kg, got shape {tuple(tensor.shape)}"
             )
-    n_chunks, chunk, kdim = (int(x) for x in kg.shape)
-    vdim = int(u.shape[2])
+    lead = (int(kg.shape[0]),) if with_heads else ()
+    heads = lead[0] if with_heads else 1
+    n_chunks, chunk, kdim = (int(x) for x in kg.shape[-3:])
+    vdim = int(u.shape[-1])
     for name, tensor in (("w", w), ("gk", gk), ("q", q)):
-        if tuple(tensor.shape) != (n_chunks, chunk, kdim):
+        if tuple(tensor.shape) != tuple(kg.shape):
             raise ChunkedRecurrenceError(
                 f"{name} {tuple(tensor.shape)} must match kg {tuple(kg.shape)}"
             )
-    if tuple(u.shape)[:2] != (n_chunks, chunk):
+    if tuple(u.shape)[:-1] != lead + (n_chunks, chunk):
         raise ChunkedRecurrenceError(
             f"u {tuple(u.shape)} must agree with kg's leading dimensions "
-            f"{(n_chunks, chunk)}"
+            f"{lead + (n_chunks, chunk)}"
         )
-    if tuple(aqk.shape) != (n_chunks, chunk, chunk):
+    if tuple(aqk.shape) != lead + (n_chunks, chunk, chunk):
         raise ChunkedRecurrenceError(
-            f"aqk {tuple(aqk.shape)} must be {(n_chunks, chunk, chunk)}"
+            f"aqk {tuple(aqk.shape)} must be {lead + (n_chunks, chunk, chunk)}"
         )
 
     # The entering state is refused on the same footing as every other operand,
     # and before the route is chosen, so a caller sees one contract whichever
     # path serves it.
     if state is not None:
-        if state.dim() != 2:
+        if tuple(state.shape) != lead + (vdim, kdim):
             raise ChunkedRecurrenceError(
-                f"state must be 2-D [V, K], got shape {tuple(state.shape)}"
-            )
-        if tuple(state.shape) != (vdim, kdim):
-            raise ChunkedRecurrenceError(
-                f"state {tuple(state.shape)} must be {(vdim, kdim)} -- the "
+                f"state {tuple(state.shape)} must be {lead + (vdim, kdim)} -- the "
                 f"orientation final_state is returned in"
             )
         if state.dtype != kg.dtype:
@@ -2038,25 +2180,44 @@ def kda_inter_chunk(
     # Read on an eager call and 0.0 under a graph build, for the reason
     # `kda_intra_chunk` gives above.
     gate_peak = (
-        float(gk.float().cumsum(dim=1).max().item())
+        float(gk.float().cumsum(dim=-2).max().item())
         if values_are_readable(gk)
         else 0.0
     )
-    if not can_run_inter_chunk(q, n_chunks, chunk, kdim, vdim, gate_peak):
+    if not can_run_inter_chunk(q, n_chunks, chunk, kdim, vdim, gate_peak, heads):
         _count_inter_torch_fallback()
         logger.debug(
             "kda_inter_chunk: NKI route unavailable, using the torch path "
             "(oracle only, never the shipped path)"
         )
-        return kda_inter_chunk_torch_oracle(kg, w, u, gk, q, aqk, state=state)
+        return kda_inter_chunk_torch_oracle(
+            kg, w, u, gk, q, aqk, state=state, state_only=state_only
+        )
 
-    consts = inter_chunk_constants(chunk, kdim, vdim, device=kg.device, dtype=kg.dtype)
+    def chunks_of_all_heads(tensor: Tensor) -> Tensor:
+        """The kernel's ``[H * NC, C, X]`` layout of a ``[H, NC, C, X]`` operand."""
+        return tensor.reshape((heads * n_chunks,) + tuple(tensor.shape[-2:]))
+
+    if with_heads:
+        kg, w, u, gk, q, aqk = (chunks_of_all_heads(t) for t in (kg, w, u, gk, q, aqk))
+        if state is not None:
+            state = state.reshape(heads * vdim, kdim)
+    consts = inter_chunk_constants(
+        chunk, kdim, vdim, heads=heads, device=kg.device, dtype=kg.dtype
+    )
+    # One head with every output passes neither keyword, so that call is the
+    # one-head call.
+    form = {}
+    if heads != 1:
+        form["HEADS"] = heads
+    if state_only:
+        form["STATE_ONLY"] = True
     _count_inter_nki_dispatch()
     call = wrap_nki(kda_inter_chunk_kernel)
     grid = inter_chunk_grid(vdim)
     if grid:
         call = call[grid]
-    o, final_state, v_new = call(
+    produced = call(
         kg_hbm=kg,
         w_hbm=w,
         u_hbm=u,
@@ -2066,7 +2227,18 @@ def kda_inter_chunk(
         triu_hbm=consts.triu_ones,
         last_col_hbm=consts.last_col,
         state_init_hbm=consts.state_init if state is None else state.contiguous(),
+        **form,
     )
+    o = v_new = None
+    if state_only:
+        final_state = produced
+    else:
+        o, final_state, v_new = produced
+    if with_heads:
+        final_state = final_state.reshape(heads, vdim, kdim)
+        if not state_only:
+            o = o.reshape(heads, n_chunks, chunk, vdim)
+            v_new = v_new.reshape(heads, n_chunks, chunk, vdim)
     return InterChunkOutputs(o=o, final_state=final_state, v_new=v_new)
 
 
@@ -2079,13 +2251,29 @@ def kda_inter_chunk_torch_oracle(
     aqk: Tensor,
     *,
     state: Tensor | None = None,
+    state_only: bool = False,
 ) -> InterChunkOutputs:
     """Stages 4 and 5 in torch: the fallback path, never the shipped one.
 
     Present so a host with no device or simulator can exercise this module's
     contract. It follows the same chunked formula the kernel does, so it is not an
-    independent reference; :func:`kda_sequential_torch_oracle` is.
+    independent reference; :func:`kda_sequential_torch_oracle` is. Operands with a
+    leading heads axis run head by head; ``state_only`` returns the final state
+    alone, as :func:`kda_inter_chunk` does.
     """
+    if kg.dim() == 4:
+        per_head = [
+            kda_inter_chunk_torch_oracle(
+                kg[h], w[h], u[h], gk[h], q[h], aqk[h],
+                state=None if state is None else state[h], state_only=state_only,
+            )
+            for h in range(int(kg.shape[0]))
+        ]
+        return InterChunkOutputs(
+            o=None if state_only else torch.stack([out.o for out in per_head]),
+            final_state=torch.stack([out.final_state for out in per_head]),
+            v_new=None if state_only else torch.stack([out.v_new for out in per_head]),
+        )
     kg32, w32, u32 = kg.float(), w.float(), u.float()
     gk32, q32, aqk32 = gk.float(), q.float(), aqk.float()
     n_chunks, chunk, kdim = kg32.shape
@@ -2109,7 +2297,10 @@ def kda_inter_chunk_torch_oracle(
         v_new[c] = vn
         o[c] = (qn[c] * torch.exp(gc[c])) @ ht + aqk32[c] @ vn
         ht = ht * torch.exp(gc[c, -1]).unsqueeze(1) + kg32[c].t() @ vn
-    return InterChunkOutputs(o=o, final_state=ht.t().contiguous(), v_new=v_new)
+    final_state = ht.t().contiguous()
+    if state_only:
+        return InterChunkOutputs(o=None, final_state=final_state, v_new=None)
+    return InterChunkOutputs(o=o, final_state=final_state, v_new=v_new)
 
 
 def kda_sequential_torch_oracle(
