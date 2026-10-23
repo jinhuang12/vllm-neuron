@@ -431,7 +431,7 @@ def kda_gated_projection_torch(core: Tensor, out_gate: Tensor, attn) -> Tensor:
 
 def kda_gated_projection(core: Tensor, out_gate: Tensor, attn,
                          phase: str | None = None,
-                         out_dtype: torch.dtype = torch.float32) -> Tensor:
+                         out_dtype: torch.dtype | None = None) -> Tensor:
     """The gated RMSNorm of ``core`` and its output projection, on a kernel or in torch.
 
     Args:
@@ -439,23 +439,28 @@ def kda_gated_projection(core: Tensor, out_gate: Tensor, attn,
         out_gate: ``[T, W]`` fp32 output gate.
         attn: the KDA attention module.
         phase: the step's ``"prefill"`` or ``"decode"``, for ``VLLM_NEURON_GLUE_FUSED``.
-        out_dtype: ``torch.float32`` (the default), or ``torch.bfloat16`` for a caller
-            that rounds the partial to bf16 next. The prefill kernel then rounds in its
-            store (``BF16_OUT``); the decode kernel and the torch route cast their fp32
-            result. Either way the bits are those of a bf16 cast of the fp32 partial.
+        out_dtype: None (the default) for the route's fp32 result as it is, or
+            ``torch.bfloat16`` for a caller that rounds the partial to bf16 next (its
+            wire dtype). The prefill kernel then rounds in its store (``BF16_OUT``);
+            the decode kernel and the torch route cast their fp32 result. Either way
+            the bits are those of a bf16 cast of the fp32 partial.
 
     Returns:
-        ``attn_out [T, H]`` in ``out_dtype``, this rank's partial sum before the TP
-        reduction. When :func:`kda_gated_projection_admits` says no, it is the torch
-        expression (:func:`kda_gated_projection_torch`).
+        ``attn_out [T, H]``, this rank's partial sum before the TP reduction: fp32, or
+        bf16 with ``out_dtype=torch.bfloat16``. When :func:`kda_gated_projection_admits`
+        says no, it is the torch expression (:func:`kda_gated_projection_torch`).
 
     Raises:
-        ValueError: ``out_dtype`` is neither fp32 nor bf16.
+        ValueError: ``out_dtype`` is neither None nor bf16.
     """
-    if out_dtype not in (torch.float32, torch.bfloat16):
-        raise ValueError(f"kda_gated_projection stores fp32 or bf16; got {out_dtype}")
+    if out_dtype not in (None, torch.bfloat16):
+        raise ValueError(
+            f"kda_gated_projection: out_dtype is None (the route's fp32 result) or "
+            f"torch.bfloat16; got {out_dtype}"
+        )
+    rounds = out_dtype is torch.bfloat16
     if not kda_gated_projection_admits(core, out_gate, attn, phase):
-        return kda_gated_projection_torch(core, out_gate, attn).to(out_dtype)
+        return _stored(kda_gated_projection_torch(core, out_gate, attn), rounds)
     _count_nki_dispatch()
     operands = {
         "core": core.contiguous(), "out_gate": out_gate.contiguous(),
@@ -464,7 +469,12 @@ def kda_gated_projection(core: Tensor, out_gate: Tensor, attn,
         "DMA_TRANSPOSE": envs.VLLM_NEURON_GLUE_KDA_DMA_TRANSPOSE,
     }
     if int(core.shape[0]) <= KDA_OUTPUT_MAX_TOKENS:
-        return _KERNELS[launch_programs()](**operands).to(out_dtype)
-    return _PREFILL_KERNELS[launch_programs()](
-        **operands, BF16_OUT=out_dtype is torch.bfloat16
-    )
+        return _stored(_KERNELS[launch_programs()](**operands), rounds)
+    return _PREFILL_KERNELS[launch_programs()](**operands, BF16_OUT=rounds)
+
+
+def _stored(partial: Tensor, rounds: bool) -> Tensor:
+    """The fp32 ``partial`` as the caller stores it: cast to bf16 when it rounds, else
+    the same tensor. A traced graph then holds no cast unless the caller rounds, and
+    the partial's node keeps the name of the expression that made it."""
+    return partial.to(torch.bfloat16) if rounds else partial

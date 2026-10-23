@@ -1905,17 +1905,19 @@ def blockwise_fp8_mlp(
         call = wrap_nki(blockwise_fp8_mlp_small_m_kernel)
         if grid:
             call = call[grid]
-        result = call(
-            x=x,
-            gate_weight=gate_weight,
-            up_weight=up_weight,
-            down_weight=down_weight,
-            gate_scale=gate_scale,
-            up_scale=up_scale,
-            down_scale=down_scale,
-            swiglu_limit=float(swiglu_limit),
+        return _stored(
+            call(
+                x=x,
+                gate_weight=gate_weight,
+                up_weight=up_weight,
+                down_weight=down_weight,
+                gate_scale=gate_scale,
+                up_scale=up_scale,
+                down_scale=down_scale,
+                swiglu_limit=float(swiglu_limit),
+            ),
+            rounds,
         )
-        return result.to(torch.bfloat16) if rounds else result
     if prefill_mlp_takes(x, gate_weight, up_weight, down_weight):
         _count_mlp_fused()
         grid = mlp_prefill_launch_grid(tokens)
@@ -1952,9 +1954,19 @@ def blockwise_fp8_mlp(
     gate = gate.clamp(min=None, max=swiglu_limit)
     up = up.clamp(min=-swiglu_limit, max=swiglu_limit)
     activated = silu(gate) * up
-    result = blockwise_fp8_mm(
-        activated.to(x.dtype), down_weight, down_scale, prebuilt_scale_t=down_t
+    return _stored(
+        blockwise_fp8_mm(
+            activated.to(x.dtype), down_weight, down_scale, prebuilt_scale_t=down_t
+        ),
+        rounds,
     )
+
+
+def _stored(result: Tensor, rounds: bool) -> Tensor:
+    """The fp32 ``result`` as the caller stores it: cast to bf16 when it rounds, else
+    the same tensor. The caller hands the call's value straight in, so the result's
+    node keeps the name of the call that made it (a local in the caller would rename
+    it, and the compile cache key holds node names)."""
     return result.to(torch.bfloat16) if rounds else result
 
 

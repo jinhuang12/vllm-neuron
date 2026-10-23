@@ -1004,7 +1004,7 @@ def _require_lowp_admissible(x: Tensor, weight: Tensor, scale: Tensor | None,
 
 
 def mla_projection_lowp(x: Tensor, weight: Tensor, scale: Tensor | None = None,
-                        out_dtype: torch.dtype = torch.float32) -> Tensor:
+                        out_dtype: torch.dtype | None = None) -> Tensor:
     """Project ``x [M, K]`` by a stored low-precision ``weight [K, N]``, into ``out_dtype``.
 
     ``weight`` is contraction-major. An fp8-e4m3 weight comes with ``scale``, its
@@ -1014,16 +1014,16 @@ def mla_projection_lowp(x: Tensor, weight: Tensor, scale: Tensor | None = None,
     multiplier is folded into that bf16 operand: those two roundings are the
     numeric difference from the fp32 kernel.
 
-    ``out_dtype`` is ``torch.float32`` (the default) or ``torch.bfloat16``: with bf16
-    the kernel rounds each fp32 sum once as it leaves PSUM and stores half the bytes,
-    the bits of a bf16 cast of the fp32 result.
+    ``out_dtype`` is None (the default) for the fp32 result, or ``torch.bfloat16`` for
+    a caller that rounds the result to bf16 next: the kernel then rounds each fp32 sum
+    once as it leaves PSUM (``bf16_out``) and stores half the bytes, the bits of a bf16
+    cast of the fp32 result.
 
     Raises:
         MlaProjectionError: for an operand the route does not admit, or an
-            ``out_dtype`` that is neither fp32 nor bf16.
+            ``out_dtype`` that is neither None nor bf16.
     """
-    if out_dtype not in (torch.float32, torch.bfloat16):
-        raise MlaProjectionError(f"the low-precision route stores fp32 or bf16; got {out_dtype}")
+    _require_out_dtype(out_dtype)
     scaled = scale is not None
     programs = _lowp_programs(int(weight.shape[1]) if weight.ndim == 2 else 0, scaled)
     _require_lowp_admissible(x, weight, scale, programs)
@@ -1112,21 +1112,41 @@ def mla_latent_projection(x: Tensor, weight: Tensor, scale: Tensor | None, gain:
 
 def mla_projection_prepared(
     x: Tensor, weight_fp32: Tensor, lowp: tuple[Tensor, Tensor | None] | None,
-    out_dtype: torch.dtype = torch.float32,
+    out_dtype: torch.dtype | None = None,
 ) -> Tensor:
-    """The route a load-time prep chose for one site. ``[M, N]`` in ``out_dtype``.
+    """The route a load-time prep chose for one site. ``[M, N]`` fp32, or bf16 when asked.
 
     ``lowp`` is ``(weight, scale)`` from :func:`prepare_lowp_projection` when the
     checkpoint stored the weight as fp8-e4m3 or bf16, and None otherwise; then the
-    fp32 kernel runs on ``weight_fp32`` exactly as before. ``out_dtype`` is fp32 (the
-    default) or bf16: the low-precision kernel rounds in its store, and the fp32
-    kernel's result is cast, the same bits either way.
+    fp32 kernel runs on ``weight_fp32`` exactly as before. ``out_dtype`` is None (the
+    default) for the fp32 result, or ``torch.bfloat16`` for a caller that rounds it to
+    bf16 next: the low-precision kernel rounds in its store, and the fp32 kernel's
+    result is cast, the same bits either way.
+
+    Raises:
+        MlaProjectionError: ``out_dtype`` is neither None nor bf16, or (on the
+            low-precision route) an operand the route does not admit.
     """
+    _require_out_dtype(out_dtype)
     if lowp is None:
-        if out_dtype not in (torch.float32, torch.bfloat16):
-            raise MlaProjectionError(f"a projection stores fp32 or bf16; got {out_dtype}")
-        return mla_projection(x.to(torch.float32), weight_fp32).to(out_dtype)
+        return _stored(mla_projection(x.to(torch.float32), weight_fp32), out_dtype)
     return mla_projection_lowp(x, lowp[0], lowp[1], out_dtype=out_dtype)
+
+
+def _stored(projected: Tensor, out_dtype: torch.dtype | None) -> Tensor:
+    """The fp32 ``projected`` as the caller stores it: cast to bf16 when asked, else the
+    same tensor. A traced graph then holds no cast unless the caller rounds, and the
+    projection's node keeps the name of the kernel call that made it."""
+    return projected.to(torch.bfloat16) if out_dtype is torch.bfloat16 else projected
+
+
+def _require_out_dtype(out_dtype: torch.dtype | None) -> None:
+    """Refuse a store dtype other than None (fp32, as computed) or bf16."""
+    if out_dtype not in (None, torch.bfloat16):
+        raise MlaProjectionError(
+            f"a projection's out_dtype is None (its fp32 result) or torch.bfloat16; "
+            f"got {out_dtype}"
+        )
 
 
 def lowp_projection_admits(weight_out_in: Tensor, scale_out_in: Tensor | None) -> bool:
