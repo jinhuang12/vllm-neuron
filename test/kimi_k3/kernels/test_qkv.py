@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Fused RMSNorm and projection at the Kimi K3 call shapes, against a float64 oracle.
 
-``qkv_proj`` runs its NKI kernel at each per-rank width K3 calls it with at TP 32. The
-oracle is the checkpoint's own ``KimiRMSNorm`` followed by ``nn.Linear``, in float64 on
-the CPU (the RMS statistic stays in float32, as the reference computes it). The
-checkpoint directory comes from ``KIMI_K3_CHECKPOINT_DIR``. With ``VLLM_NEURON_CPU_MODE=1``
-and ``NKI_SIMULATOR=1`` the kernel runs on the NKI simulator; otherwise on ``neuron:0``.
+``qkv_proj_fp32acc`` runs at each per-rank width K3 calls it with at TP 32. The 4-row
+regimes run twice: through the wrapper, which picks the decode kernel, and on the
+prefill kernel directly. The oracle is the checkpoint's own ``KimiRMSNorm`` followed by
+``nn.Linear``, in float64 on the CPU (the RMS statistic stays in float32, as the
+reference computes it). The checkpoint directory comes from ``KIMI_K3_CHECKPOINT_DIR``.
+With ``VLLM_NEURON_CPU_MODE=1`` and ``NKI_SIMULATOR=1`` the kernels run on the NKI
+simulator; otherwise on ``neuron:0``.
 """
 
 from __future__ import annotations
@@ -15,13 +17,16 @@ import json
 import os
 from pathlib import Path
 
+import nki
 import pytest
 import torch
 import torch.nn.functional as F
-from nkilib.core.utils.common_types import NormType
+from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 
 from vllm_neuron import envs
-from vllm_neuron.functional.attention import qkv
+from vllm_neuron.functional.attention.qkv_fp32acc import qkv_proj_fp32acc
+from vllm_neuron.functional.attention.qkv_fp32acc_cte import qkv_fp32acc_cte
+from vllm_neuron.utils.hardware_config import get_logical_nc_config
 
 CHECKPOINT_DIR = os.environ.get("KIMI_K3_CHECKPOINT_DIR")
 pytestmark = pytest.mark.skipif(
@@ -54,27 +59,30 @@ def reference():
     return text["hidden_size"], text["rms_norm_eps"], scope["KimiRMSNorm"]
 
 
-@pytest.fixture(autouse=True)
-def _kernel_only(monkeypatch):
-    """Refuse the torch fallback, so every case grades the kernel."""
-    def refuse(**_):
-        raise AssertionError("qkv_proj took its torch fallback")
-    monkeypatch.setattr(qkv, "_torch_qkv_impl", refuse)
+@nki.jit
+def _prefill_kernel(hidden, qkv_weights, norm_weights, eps: float):
+    return qkv_fp32acc_cte(hidden, qkv_weights, norm_weights, eps)
 
 
-def _project(hidden, weight, gamma, eps):
-    return qkv.qkv_proj(hidden, weight, norm_weights=gamma, eps=eps, norm_type=NormType.RMS_NORM)
+_PREFILL = wrap_nki(_prefill_kernel)
 
 
-_compiled = torch.compile(_project, backend=envs.get_compile_backend_name(),
-                          fullgraph=True, dynamic=False) if ON_DEVICE else None
+def _project_prefill(hidden, weight, gamma, eps):
+    return _PREFILL[get_logical_nc_config()](hidden=hidden, qkv_weights=weight,
+                                             norm_weights=gamma.reshape(1, -1), eps=eps)
 
 
-def _run(hidden, weight, gamma, eps):
+#: The wrapper's own choice, and the prefill kernel for inputs the wrapper sends to decode.
+PATHS = {"wrapper": qkv_proj_fp32acc, "prefill": _project_prefill}
+_compiled = {name: torch.compile(fn, backend=envs.get_compile_backend_name(), fullgraph=True,
+                                 dynamic=False) for name, fn in PATHS.items()} if ON_DEVICE else None
+
+
+def _run(hidden, weight, gamma, eps, path="wrapper"):
     if not ON_DEVICE:
-        return _project(hidden, weight, gamma, eps)
+        return PATHS[path](hidden, weight, gamma, eps)
     on = [t.to("neuron:0") for t in (hidden, weight, gamma)]
-    return _compiled(*on, eps).cpu()
+    return _compiled[path](*on, eps).cpu()
 
 
 def _normed(reference, hidden, gamma):
@@ -107,11 +115,11 @@ def _class_b(out, ref):
     return excess, F.cosine_similarity(out, ref, dim=-1).amin().item()
 
 
-def _check(reference, cases):
+def _check(reference, cases, path="wrapper"):
     """Run each (label, hidden, weight, gamma) case; report every miss of class B."""
     misses = []
     for label, hidden, weight, gamma in cases:
-        out = _run(hidden, weight, gamma, reference[1])
+        out = _run(hidden, weight, gamma, reference[1], path)
         excess, cosine = _class_b(out, _oracle(reference, hidden, weight, gamma))
         print(f"{label}: worst error / bound {excess:.3f}, lowest row cosine {cosine:.6f}")
         if not (excess <= 1.0 and cosine >= 0.9999):
@@ -119,7 +127,8 @@ def _check(reference, cases):
     assert not misses, f"outside class B: {misses}"
 
 
-def test_correlated_rows_with_one_large_channel(reference):
+@pytest.mark.parametrize("path", PATHS)
+def test_correlated_rows_with_one_large_channel(reference, path):
     size, gen = reference[0], torch.Generator().manual_seed(1)
     cases = []
     for width in DECODE_WIDTHS:
@@ -127,19 +136,21 @@ def test_correlated_rows_with_one_large_channel(reference):
             DECODE_TOKENS, 1, size, generator=gen)
         hidden[..., size // 3] *= 100
         cases.append((f"I {width}", hidden.bfloat16(), *_weights(size, width, gen)))
-    _check(reference, cases)
+    _check(reference, cases, path)
 
 
-def test_repeated_tokens(reference):
+@pytest.mark.parametrize("path", PATHS)
+def test_repeated_tokens(reference, path):
     size, gen = reference[0], torch.Generator().manual_seed(2)
     cases = []
     for width in DECODE_WIDTHS:
         hidden = torch.randn(1, 1, size, generator=gen).expand(DECODE_TOKENS, 1, size)
         cases.append((f"I {width}", hidden.bfloat16().contiguous(), *_weights(size, width, gen)))
-    _check(reference, cases)
+    _check(reference, cases, path)
 
 
-def test_gate_inputs_at_twelve(reference):
+@pytest.mark.parametrize("path", PATHS)
+def test_gate_inputs_at_twelve(reference, path):
     """Weights solved so every output, a sigmoid input downstream, is plus or minus 12."""
     size, gen = reference[0], torch.Generator().manual_seed(3)
     cases = []
@@ -153,7 +164,7 @@ def test_gate_inputs_at_twelve(reference):
         signs = torch.randint(0, 2, (DECODE_TOKENS, width), generator=gen).double() * 2 - 1
         weight = noise + rows.T @ torch.linalg.solve(gram, GATE_INPUT * signs)
         cases.append((f"I {width}", hidden, weight.bfloat16(), gamma))
-    _check(reference, cases)
+    _check(reference, cases, path)
 
 
 def test_prefill_chunk(reference):
@@ -165,16 +176,17 @@ def test_prefill_chunk(reference):
     _check(reference, cases)
 
 
-def test_nan_row_stays_in_its_row(reference):
+@pytest.mark.parametrize("path", PATHS)
+def test_nan_row_stays_in_its_row(reference, path):
     size, gen = reference[0], torch.Generator().manual_seed(5)
     misses = []
     for width in DECODE_WIDTHS:
         hidden = torch.randn(DECODE_TOKENS, 1, size, generator=gen).bfloat16()
         weight, gamma = _weights(size, width, gen)
-        clean = _run(hidden, weight, gamma, reference[1])
+        clean = _run(hidden, weight, gamma, reference[1], path)
         poisoned = hidden.clone()
         poisoned[NAN_ROW] = float("nan")
-        out = _run(poisoned, weight, gamma, reference[1])
+        out = _run(poisoned, weight, gamma, reference[1], path)
         others = [row for row in range(DECODE_TOKENS) if row != NAN_ROW]
         excess, cosine = _class_b(clean, _oracle(reference, hidden, weight, gamma))
         print(f"I {width}: clean worst error / bound {excess:.3f}, lowest row cosine {cosine:.6f}")
