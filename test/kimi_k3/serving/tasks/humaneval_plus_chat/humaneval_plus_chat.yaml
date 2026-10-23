@@ -1,0 +1,27 @@
+# Candidate (b), the smallest chat form: the humaneval_instruct instruction text, no gen_prefix,
+# no stop strings, and pass@1 on the first fenced code block of the reply. Works without prefill.
+task: humaneval_plus_chat
+dataset_path: evalplus/humanevalplus
+unsafe_code: true
+output_type: generate_until
+test_split: test
+doc_to_text: "Write a solution to the following problem and make sure that it passes the tests:\n```python\n{{ prompt }}\n```\n"
+doc_to_target: "{{test}}\ncheck({{entry_point}})"
+metric_list:
+  - metric: !function utils.pass_at_k
+    aggregation: mean
+    higher_is_better: true
+    k: [1]
+generation_kwargs:
+  until: []
+  max_gen_toks: 2048
+  do_sample: false
+repeats: 1
+num_fewshot: 0
+filter_list:
+  - name: "create_test"
+    filter:
+      - function: "custom"
+        filter_fn: !function utils.build_predictions_chat
+metadata:
+  version: 1.0
