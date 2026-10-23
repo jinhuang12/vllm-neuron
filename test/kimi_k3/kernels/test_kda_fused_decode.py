@@ -172,12 +172,16 @@ _compiled = torch.compile(_step, backend=envs.get_compile_backend_name(), fullgr
 
 
 def _run(ref, x, slots, conv_bank, state_bank):
-    """One kernel step; returns the core output and both banks, all on the CPU."""
-    if not ON_DEVICE:
-        return _step(x, slots, conv_bank, state_bank, ref.weights, ref.lower, ref.eps)
-    on = [t.to("neuron:0") for t in (x, slots, conv_bank, state_bank)]
-    weights = {name: t.to("neuron:0") for name, t in ref.weights.items()}
-    return tuple(t.cpu() for t in _compiled(*on, weights, ref.lower, ref.eps))
+    """One kernel step; returns the core output as [T, 384] and both banks, all on the CPU."""
+    if ON_DEVICE:
+        on = [t.to("neuron:0") for t in (x, slots, conv_bank, state_bank)]
+        weights = {name: t.to("neuron:0") for name, t in ref.weights.items()}
+        core, conv_bank, state_bank = (t.cpu() for t in _compiled(*on, weights, ref.lower, ref.eps))
+    else:
+        core, conv_bank, state_bank = _step(x, slots, conv_bank, state_bank, ref.weights, ref.lower, ref.eps)
+    tokens = x.shape[0]
+    assert core.shape == (DIM, tokens, HEADS, 1), f"core {tuple(core.shape)}, expected [128, T, 3, 1]"
+    return core[..., 0].permute(1, 2, 0).reshape(tokens, WIDTH), conv_bank, state_bank
 
 
 def _class_b(out, ref):

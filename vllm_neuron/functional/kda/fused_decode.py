@@ -16,6 +16,9 @@ the token's slot, and writes the advanced rows back to the same slot, so the
 banks are updated in place and returned. The (token, head) items split over
 the logical core's programs; a token shared by two programs has its rows
 written by each program for its own heads only.
+
+The output is [128, T, 3, 1], head dimension first: the input layout of the
+output projection's decode kernel.
 """
 
 import nki
@@ -78,7 +81,8 @@ def kda_fused_decode(
         o_norm_weight: [128] fp32.
 
     Returns:
-        core [T, 384] bf16, and conv_bank and state_bank with the token slots advanced.
+        core [128, T, 3, 1] bf16, element [d, t, h] the channel d of head h of token t,
+        and conv_bank and state_bank with the token slots advanced.
     """
     tokens = x.shape[0]
     assert x.shape == (tokens, COLUMNS) and x.dtype == torch.bfloat16, f"x {tuple(x.shape)} {x.dtype}"
@@ -107,7 +111,7 @@ def kda_fused_decode_kernel(x, slots, conv_bank, state_bank, q_w, k_w, v_w, a_lo
     """The decode step of :func:`kda_fused_decode`; the banks are written in place."""
     tokens = x.shape[0]
     kernel_assert(x.shape[1] == COLUMNS, f"x has {x.shape[1]} columns, expected {COLUMNS}")
-    core = nl.ndarray((tokens, WIDTH), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+    core = nl.ndarray((DIM, tokens, HEADS, 1), dtype=nl.bfloat16, buffer=nl.shared_hbm)
 
     programs = nl.num_programs(0)
     program = nl.program_id(0)
@@ -145,8 +149,8 @@ def _load_constants(q_w, k_w, v_w, a_log, dt_bias, f_b, o_w, ha, hb):
     nisa.dma_copy(dst=a_raw, src=a_log.ap(pattern=[[0, DIM], [1, nh]], offset=ha), dge_mode=STATIC)
     a_exp = nl.ndarray((DIM, 1, nh), dtype=nl.float32, buffer=nl.sbuf)
     nisa.activation(dst=a_exp, op=nl.exp, data=a_raw, engine=nisa.engine.gpsimd)
-    norm_w = nl.ndarray((DIM, DIM), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.dma_copy(dst=norm_w, src=o_w.ap(pattern=[[0, DIM], [1, DIM]], offset=0), dge_mode=STATIC)
+    norm_w = nl.ndarray((DIM, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=norm_w, src=o_w.ap(pattern=[[1, DIM], [1, 1]], offset=0), dge_mode=STATIC)
 
     # f_b rows of each head, turned so the contraction axis (rank) is on partitions.
     fb_rows = nl.ndarray((DIM, nh, DIM), dtype=nl.bfloat16, buffer=nl.sbuf)
@@ -167,9 +171,9 @@ def _load_constants(q_w, k_w, v_w, a_log, dt_bias, f_b, o_w, ha, hb):
     return taps, bias, a_exp, norm_w, fb_t, ones, neg_eye
 
 
-def _rows(dtype, n, width=DIM):
+def _rows(dtype, n):
     """Rows 0 .. n-1 of a full-partition SBUF tile, so every operand starts at partition 0."""
-    return nl.ndarray((DIM, width), dtype=dtype, buffer=nl.sbuf)[0:n]
+    return nl.ndarray((DIM, DIM), dtype=dtype, buffer=nl.sbuf)[0:n]
 
 
 def _step_tokens(x, idx, conv_bank, state_bank, core, consts, t0, nt, ha, hb, lo, hi,
@@ -211,11 +215,13 @@ def _step_tokens(x, idx, conv_bank, state_bank, core, consts, t0, nt, ha, hb, lo
                       src=x.ap(pattern=[[DIM, nh], [1, DIM]], offset=(t0 + u) * COLUMNS + GATE_COL + ha * DIM),
                       dge_mode=STATIC)
 
-    # Output gate times the norm weight, rows per cell.
-    gate_sig = _rows(nl.float32, cells)
-    nisa.activation(dst=gate_sig, op=nl.sigmoid, data=gate_rows)
-    gate_w = _rows(nl.float32, cells)
-    nisa.tensor_tensor(dst=gate_w, data1=gate_sig, data2=norm_w[0:cells], op=nl.multiply)
+    # Output gate times the norm weight, columns per cell.
+    gate_cols = nl.ndarray((DIM, cells), dtype=nl.bfloat16, buffer=nl.psum)
+    nisa.nc_transpose(dst=gate_cols, data=gate_rows)
+    gate_sig = nl.ndarray((DIM, cells), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(dst=gate_sig, op=nl.sigmoid, data=gate_cols)
+    gate_w = nl.ndarray((DIM, cells), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=gate_w, data=gate_sig, op0=nl.multiply, operand0=norm_w)
 
     # Forget gate: decay = exp(lower_bound * sigmoid(exp(A_log) * (f_b f_a + dt_bias))).
     # exp and rsqrt run on GpSimd, whose results are closer than Scalar's; their error
@@ -290,26 +296,27 @@ def _step_tokens(x, idx, conv_bank, state_bank, core, consts, t0, nt, ha, hb, lo
         nisa.nc_matmul(dst=out_ps[:, c:c + 1], stationary=updated[:, c, :], moving=qn[:, c:c + 1],
                        accumulate=False)
 
-    # Gated RMSNorm of the output, rows per cell.
-    out_cols = nl.ndarray((DIM, cells), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=out_cols, src=out_ps)
-    out_rows = nl.ndarray((cells, DIM), dtype=nl.float32, buffer=nl.psum)
-    nisa.nc_transpose(dst=out_rows, data=out_cols)
-    squared = _rows(nl.float32, cells)
-    sq_sum = _rows(nl.float32, cells, 1)
-    nisa.activation_reduce(dst=squared, op=nl.square, data=out_rows, reduce_op=nl.add, reduce_res=sq_sum)
-    rstd = _rows(nl.float32, cells, 1)
-    nisa.activation(dst=rstd, op=nl.rsqrt, data=sq_sum, scale=1.0 / DIM, bias=float(norm_eps),
+    # Gated RMSNorm of the output, columns per cell, summed over the head dimension by a ones matmul.
+    out_sq = nl.ndarray((DIM, cells), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(dst=out_sq, op=nl.square, data=out_ps)
+    out_ss_ps = nl.ndarray((DIM, cells), dtype=nl.float32, buffer=nl.psum)
+    nisa.nc_matmul(dst=out_ss_ps, stationary=ones, moving=out_sq)
+    out_ss = nl.ndarray((DIM, cells), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_copy(dst=out_ss, src=out_ss_ps)
+    rstd = nl.ndarray((DIM, cells), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.activation(dst=rstd, op=nl.rsqrt, data=out_ss, scale=1.0 / DIM, bias=float(norm_eps),
                     engine=nisa.engine.gpsimd)
-    y = _rows(nl.bfloat16, cells)
-    nisa.scalar_tensor_tensor(dst=y, data=out_rows, op0=nl.multiply, operand0=rstd, op1=nl.multiply,
-                              operand1=gate_w)
+    scale = nl.ndarray((DIM, cells), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=scale, data1=rstd, data2=gate_w, op=nl.multiply)
+    y = nl.ndarray((DIM, cells), dtype=nl.bfloat16, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=y, data1=out_ps, data2=scale, op=nl.multiply)
 
-    # Stores: the output rows, then each token's state and conv rows for its own heads only.
+    # Stores: the output columns, then each token's state and conv rows for its own heads only.
     item = [HEADS * (t0 + c // nh) + ha + c % nh for c in range(cells)]
     own = [c for c in range(cells) if lo <= item[c] < hi]
     c0, c1 = own[0], own[-1] + 1
-    nisa.dma_copy(dst=core.ap(pattern=[[DIM, c1 - c0], [1, DIM]], offset=item[c0] * DIM), src=y[c0:c1])
+    nisa.dma_copy(dst=core.ap(pattern=[[HEADS * tokens, DIM], [1, c1 - c0]], offset=item[c0]), src=y[:, c0:c1],
+                  dge_mode=STATIC)
     for u in range(nt):
         t = t0 + u
         hs, he = max(ha, lo - HEADS * t), min(hb, hi - HEADS * t)
