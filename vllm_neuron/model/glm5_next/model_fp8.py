@@ -3584,6 +3584,7 @@ class Glm5NextDenseMLP(nn.Module):
         *,
         quant_config: Glm5NextQuantConfig,
         partial_dtype: torch.dtype | None = None,
+        addend: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """One dense layer's MLP: three projections and a clamped SwiGLU.
 
@@ -3617,11 +3618,17 @@ class Glm5NextDenseMLP(nn.Module):
                 row-parallel sum, or None when it sums in fp32. With bfloat16 the
                 prefill kernel rounds in its store, the same one rounding, and stores
                 half the bytes (``blockwise_fp8_mlp``'s ``out_dtype``).
+            addend: ``[T, H]`` fp32 added inside the prefill MLP kernel before its
+                one rounding to bf16, or None. Only that kernel takes it
+                (``blockwise_fp8_mlp``, which refuses it on any other route), so
+                ``T`` is a whole number of tiles. The chunk-pair view
+                (:class:`_PairDenseMLP`) hands the own shard's sum to the partner's
+                call here.
 
         Returns:
             ``[T, H]`` fp32 -- the kernel's own return dtype, not re-cast here --
-            or bf16 with ``partial_dtype`` bf16. The layer forward decides the
-            residual dtype.
+            or bf16 with ``partial_dtype`` bf16 or with ``addend``. The layer
+            forward decides the residual dtype.
 
         Raises:
             Glm5NextDenseMLPRouteError: when ``quant_config`` resolved no
@@ -3731,6 +3738,7 @@ class Glm5NextDenseMLP(nn.Module):
                 swiglu_limit=self.swiglu_limit,
                 prebuilt_scale_t=prebuilt_scale_t,
                 out_dtype=partial_dtype,
+                addend=addend,
             ),
             tokens,
         )
@@ -11836,11 +11844,46 @@ class _PairDenseMLP(Glm5NextDenseMLP):
     ``partner``, a view holding the partner shard's."""
 
     def forward(
-        self, hidden_states: torch.Tensor, *, quant_config: Glm5NextQuantConfig
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        quant_config: Glm5NextQuantConfig,
+        partial_dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
-        """Both shards' partial sums, added in the kernels' fp32."""
+        """Both shards' partial sums, added in fp32 and stored once in ``partial_dtype``.
+
+        The own shard's sum stays the kernel's fp32. With ``partial_dtype`` bf16, on a
+        call the prefill MLP kernel runs, the partner's kernel takes it as its addend
+        and rounds the sum once in its store, as :class:`_PairMoEBlock` does with the
+        partner shared expert. On any other call the fp32 sum is stored in
+        ``partial_dtype`` by ``blockwise_fp8_mlp``'s own rule. The arguments and the
+        return are :meth:`Glm5NextDenseMLP.forward`'s, without ``addend``: the view
+        makes the step's one addend itself, and no caller hands a dense MLP one.
+
+        Raises:
+            Glm5NextDenseMLPRouteError: a ``partial_dtype`` other than None or bf16,
+                or whatever :meth:`Glm5NextDenseMLP.forward` refuses.
+        """
+        from vllm_neuron.functional.blockwise_fp8_mm import _stored, prefill_mlp_takes
+
+        if partial_dtype not in (None, torch.bfloat16):
+            raise Glm5NextDenseMLPRouteError(
+                f"the chunk-pair dense MLP stores its sum in fp32 (None) or bf16; got "
+                f"partial_dtype={partial_dtype}"
+            )
+        partner = self.partner
         own = super().forward(hidden_states, quant_config=quant_config)
-        return own + self.partner(hidden_states, quant_config=quant_config)
+        if partial_dtype is torch.bfloat16 and prefill_mlp_takes(
+            hidden_states,
+            partner.gate_proj_weight,
+            partner.up_proj_weight,
+            partner.down_proj_weight,
+        ):
+            return partner(hidden_states, quant_config=quant_config, addend=own)
+        return _stored(
+            own + partner(hidden_states, quant_config=quant_config),
+            partial_dtype is torch.bfloat16,
+        )
 
 
 class PrefillPairs:
