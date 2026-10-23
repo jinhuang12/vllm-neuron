@@ -307,7 +307,7 @@ def test_every_mtp_parameter_matches_the_header_dtype_and_its_sibling_shard_geom
         )
         header_dtypes = {real_headers[k][0] for k in carried}
         assert len(header_dtypes) == 1, (name, header_dtypes)
-        placeholder = root._placeholder_dtype(keys, param_name=name, mappings=mappings)
+        placeholder = root.placeholder_dtype(keys, param_name=name, mappings=mappings)
         assert placeholder == header_dtypes.pop(), name
 
         geometry = _shard_geometry_for(module, leaf, WORLD)

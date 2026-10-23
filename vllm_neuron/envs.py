@@ -139,6 +139,9 @@ if TYPE_CHECKING:
     # Under that shard, a MoE layer's router takes its input scale from the mHC kernel
     # on each rank's rows. On by default; 0 restores the scale of the gathered rows.
     VLLM_NEURON_GLM5NEXT_PREFILL_SP_ROUTER_SCALE: bool = True
+    # GLM-5.3-Flash chunk-pair prefill: two 32-rank groups each run one chunk of a
+    # two-chunk step on a TP=64 server. Off by default.
+    VLLM_NEURON_GLM5NEXT_PREFILL_PAIRS: bool = False
     # GLM-5.3-Flash DSA prefill: a chunk whose top-k selection provably keeps every
     # token attends its latent window densely (mla_dense_window.py) instead of
     # selecting and gathering. On by default; 0 restores the sparse path.
@@ -688,6 +691,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_NEURON_GLM5NEXT_PREFILL_SP_ROUTER_SCALE": lambda: (
         maybe_convert_bool(os.getenv("VLLM_NEURON_GLM5NEXT_PREFILL_SP_ROUTER_SCALE"))
         is not False
+    ),
+    # ================== GLM-5.3-Flash Chunk-Pair Prefill ==================
+    # "1" prefills two chunks per step on a TP=64 server: ranks 0-31 run one chunk
+    # and ranks 32-63 the next, each rank holding its own tensor-parallel shard and
+    # its partner's (rank XOR 48), and the pair hands rows and KDA state across with
+    # a two-rank exchange (``model/glm5_next/model_fp8.py``, ``PrefillPairs``). A step
+    # of at most one chunk runs the TP=64 graph, and decode is unchanged. Read once at
+    # load; it needs the prefill sequence shard, 1024- and 2048-token buckets, no
+    # prefix cache or draft, and outside the native backend
+    # VLLM_NEURON_DISABLE_PARALLEL_TRACE=1, since its settle graph is captured by the
+    # in-process prefill extraction. Off by default ("0").
+    "VLLM_NEURON_GLM5NEXT_PREFILL_PAIRS": lambda: (
+        maybe_convert_bool(os.getenv("VLLM_NEURON_GLM5NEXT_PREFILL_PAIRS")) or False
     ),
     # ================== GLM-5.3-Flash DSA Prefill ==================
     # Attend a prefill chunk densely over its latent window when the bound its graph

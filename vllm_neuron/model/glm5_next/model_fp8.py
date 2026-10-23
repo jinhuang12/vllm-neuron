@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 import torch.nn as nn
@@ -29,6 +29,7 @@ from vllm_neuron.model.glm5_next.collective_policy import (
     RowParallelSite,
     StepRows,
     allreduce_wire_dtype,
+    exchange_with_partner,
     gather_sequence,
     reduce_row_parallel,
     scatter_row_parallel,
@@ -54,6 +55,7 @@ from vllm_neuron.model.glm5_next.weight_loaders_fp8 import (
     DeferredShardGeometry,
     dense_consumer_block_quant_size,
     dequantise_blockwise,
+    load_pair_shards,
     loader_for_mapped_keys,
     report_floored_blocks,
     routed_bank_consumer_block_quant_size,
@@ -296,6 +298,22 @@ def _tp_group_if_initialized() -> GroupCoordinator | None:
     return _resolve_tp_group()
 
 
+#: Attribute a chunk-pair view (:class:`PrefillPairs`) binds the group its collectives
+#: run over on: the prefill group, half of the world. No module of the tree carries it,
+#: so every module of the tree reduces and gathers over the tensor-parallel group.
+COLLECTIVE_GROUP_ATTR = "_collective_group"
+
+
+def _module_group(module: object) -> GroupCoordinator | None:
+    """The group ``module``'s row-parallel sums and sequence gathers run over.
+
+    The group bound under :data:`COLLECTIVE_GROUP_ATTR`, or :func:`_resolve_tp_group`
+    where none is bound.
+    """
+    group = getattr(module, COLLECTIVE_GROUP_ATTR, None)
+    return _resolve_tp_group() if group is None else group
+
+
 #: Attribute :meth:`Glm5NextModel.bind_prefill_sequence_shard` binds the
 #: :class:`PrefillSequenceShard` on at load: the stack, each of its layers, each layer's
 #: attention module and both of its mHC sites. None, or no attribute at all (the draft
@@ -400,6 +418,21 @@ class PrefillSequenceShard:
                 f"num_batched_tokens_buckets={buckets or None}, "
                 f"num_seqs_buckets={decode_buckets or None}"
             )
+        return cls.of_chunks(world, buckets, decode_buckets)
+
+    @classmethod
+    def of_chunks(
+        cls, world: int, buckets: Sequence[int], decode_buckets: Sequence[int]
+    ) -> PrefillSequenceShard:
+        """The plan that splits chunks of ``buckets`` rows over ``world`` ranks.
+
+        :meth:`of_server`'s plan once it has its world and buckets, and the chunk-pair
+        prefill's (:class:`PrefillPairs`), whose chunks split over one prefill group.
+
+        Raises:
+            Glm5NextSequenceShardError: the refusals :meth:`of_server` lists for its
+                buckets.
+        """
         uneven = sorted(int(rows) for rows in buckets if int(rows) % world)
         if uneven:
             raise Glm5NextSequenceShardError(
@@ -468,10 +501,11 @@ def _row_parallel_sum(
     not at each site. Either collective takes its wire dtype from ``module.step_rows``
     (``collective_policy.StepRows``), the step rule the module was built with, so the
     reduce-scatter of a split chunk crosses the wire in the dtype the chunk's all-reduce
-    would.
+    would. Both run over :func:`_module_group`'s group: the tensor-parallel group, or the
+    prefill group a chunk-pair view binds.
     """
     shard = getattr(module, SEQUENCE_SHARD_ATTR, None)
-    group = _resolve_tp_group()
+    group = _module_group(module)
     steps = module.step_rows
     if shard is not None and shard.shards(int(partial.shape[0])):
         return scatter_row_parallel(partial, site=site, group=group, steps=steps)
@@ -486,7 +520,7 @@ def _row_parallel_wire_dtype(rows: int, *, module: nn.Module) -> torch.dtype | N
     rule, ``collective_policy.allreduce_wire_dtype`` at ``module.step_rows``'s phase for
     the whole chunk's row count, so a producer can ask before it computes the partial.
     """
-    if _resolve_tp_group() is None:
+    if _module_group(module) is None:
         return None
     wire = allreduce_wire_dtype(module.step_rows.phase(int(rows)))
     return None if wire is torch.float32 else wire
@@ -864,7 +898,7 @@ def _shard_geometry_for(
     declared = family.get(leaf)
     if declared is None and leaf.endswith(f"_{FP8_SCALE_SUFFIX}"):
         # ``q_b_proj_weight_scale_inv`` -> ``q_b_proj_weight``, the inverse of
-        # ``_sibling_scale_grid_name``. Only a grid whose weight the table names
+        # ``sibling_scale_grid_name``. Only a grid whose weight the table names
         # resolves; every other declared grid still answers ``None``.
         weight_leaf = (
             f"{leaf[: -len(f'_{FP8_SCALE_SUFFIX}')]}{_WEIGHT_LEAF_SUFFIX}"
@@ -1524,7 +1558,7 @@ class Glm5NextHyperConnection(nn.Module):
         shard = getattr(self, SEQUENCE_SHARD_ATTR, None)
         if shard is not None and shard.holds(extents[0]):
             layer_input, normed, scaled = self._gather_sub_block_inputs(
-                layer_input, normed, scaled, reads_layer_input
+                layer_input, normed, scaled, reads_layer_input, group=_module_group(self)
             )
         if norm is None:
             x = sublayer(layer_input)
@@ -1547,8 +1581,11 @@ class Glm5NextHyperConnection(nn.Module):
         normed: torch.Tensor | None,
         scaled: list[torch.Tensor | None],
         reads_layer_input: bool,
+        *,
+        group: GroupCoordinator | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor | None]]:
-        """The whole chunk's rows of what the sub-block reads, in one all-gather.
+        """The whole chunk's rows of what the sub-block reads, in one all-gather over
+        ``group``, the site's :func:`_module_group`.
 
         ``layer_input`` when there is no ``normed`` (the sub-block normalises it) or
         ``reads_layer_input`` holds, then ``normed`` and ``scaled`` where they exist. A
@@ -1566,9 +1603,7 @@ class Glm5NextHyperConnection(nn.Module):
         gathered = dict(
             zip(
                 (name for name, _ in named),
-                gather_sequence(
-                    [tensor for _, tensor in named], group=_resolve_tp_group()
-                ),
+                gather_sequence([tensor for _, tensor in named], group=group),
             )
         )
         return (
@@ -2932,7 +2967,7 @@ class Glm5NextSharedExperts(nn.Module):
     # the declaration tuple names and the three grids the loader attached beside
     # them, and hands them over.
     #
-    # The grid names are derived through ``_sibling_scale_grid_name`` rather than
+    # The grid names are derived through ``sibling_scale_grid_name`` rather than
     # spelled, because that is the single definition of the convention the loader,
     # the prep loop and the grid publish all read.
     #
@@ -2997,14 +3032,14 @@ class Glm5NextSharedExperts(nn.Module):
         Raises:
             Glm5NextSharedExpertRouteError: when a scale grid the loader should
                 have attached is absent. The grid names are derived from the
-                weight leaves by ``_sibling_scale_grid_name``, which is the single
+                weight leaves by ``sibling_scale_grid_name``, which is the single
                 definition of that convention.
         """
         weights: list[torch.Tensor] = []
         grids: list[torch.Tensor] = []
         for leaf in self.SCALE_ROUTE_LEAVES:
             grid_name = (
-                Glm5NextForConditionalGeneration._sibling_scale_grid_name(leaf)
+                Glm5NextForConditionalGeneration.sibling_scale_grid_name(leaf)
             )
             grid = getattr(self, grid_name, None)
             if grid is None:
@@ -3221,6 +3256,44 @@ class Glm5NextMoEBlock(nn.Module):
     # A block built with ``n_shared_experts == 0`` declares no shared module, and
     # :meth:`combine_routed_and_shared` refuses such a call by name, so this method
     # returns the routed half directly there rather than calling into a refusal.
+    def _route(
+        self,
+        hidden_states: torch.Tensor,
+        normed_hidden_states: torch.Tensor,
+        router_gamma: torch.Tensor,
+        text_config: Glm5NextTextConfig,
+        router_scaled: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``route_tokens``' logits, expert ids and scattered affinities for the rows
+        the experts run. :meth:`forward` documents the arguments.
+
+        Raises:
+            Glm5NextBlockQuantRouteError: ``router_scaled`` is not one row per expert
+                row.
+        """
+        # ``route_tokens`` declares ``[B, S, H]`` and the kernel flattens ``B`` and
+        # ``S`` into one token axis, so a 2-D activation tensor is spelled
+        # ``[1, T, H]`` here rather than reshaped inside the callee. Only the
+        # affinities are consumed: the logits are the oracle's and the index set is
+        # the affinities' own support.
+        # The router's rows are the experts' rows. Under the prefill sequence shard
+        # ``hidden_states`` is one rank's share and the scaled rows the chunk's, so the
+        # check is against ``normed_hidden_states``, gathered beside them.
+        if router_scaled is not None and tuple(router_scaled.shape) != tuple(
+            normed_hidden_states.shape
+        ):
+            raise Glm5NextBlockQuantRouteError(
+                f"router_scaled is {tuple(router_scaled.shape)} and the experts' "
+                f"normed rows are {tuple(normed_hidden_states.shape)}; the router "
+                f"must route the rows the experts run"
+            )
+        return self.experts.route_tokens(
+            hidden_states.unsqueeze(0),
+            router_gamma,
+            text_config,
+            scaled=None if router_scaled is None else router_scaled.unsqueeze(0),
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -3282,27 +3355,8 @@ class Glm5NextMoEBlock(nn.Module):
             Glm5NextSharedExpertRouteError: whatever the shared route refuses,
                 including the extent disagreement the add checks.
         """
-        # ``route_tokens`` declares ``[B, S, H]`` and the kernel flattens ``B`` and
-        # ``S`` into one token axis, so a 2-D activation tensor is spelled
-        # ``[1, T, H]`` here rather than reshaped inside the callee. Only the
-        # affinities are consumed: the logits are the oracle's and the index set is
-        # the affinities' own support.
-        # The router's rows are the experts' rows. Under the prefill sequence shard
-        # ``hidden_states`` is one rank's share and the scaled rows the chunk's, so the
-        # check is against ``normed_hidden_states``, gathered beside them.
-        if router_scaled is not None and tuple(router_scaled.shape) != tuple(
-            normed_hidden_states.shape
-        ):
-            raise Glm5NextBlockQuantRouteError(
-                f"router_scaled is {tuple(router_scaled.shape)} and the experts' "
-                f"normed rows are {tuple(normed_hidden_states.shape)}; the router "
-                f"must route the rows the experts run"
-            )
-        _logits, _expert_index, expert_affinities = self.experts.route_tokens(
-            hidden_states.unsqueeze(0),
-            router_gamma,
-            text_config,
-            scaled=None if router_scaled is None else router_scaled.unsqueeze(0),
+        _logits, _expert_index, expert_affinities = self._route(
+            hidden_states, normed_hidden_states, router_gamma, text_config, router_scaled
         )
         if collector is not None:
             # Both forms of the weights: the whole table as the bank returns it,
@@ -3602,7 +3656,7 @@ class Glm5NextDenseMLP(nn.Module):
             )
 
         # ---- The operands. The grid name is derived by the rule the prep loop
-        # uses (``_sibling_scale_grid_name``) rather than spelled out here, so the
+        # uses (``sibling_scale_grid_name``) rather than spelled out here, so the
         # two cannot drift. The grids are plain attributes the weight loader
         # attaches and not declared parameters, which is why this is a ``getattr``.
         def scale_grid(leaf: str) -> torch.Tensor:
@@ -4086,6 +4140,7 @@ class Glm5NextKDAAttention(nn.Module):
         checkpoint_rows: torch.Tensor | int | None = None,
         state_checkpoints: int | None = None,
         input_norm: tuple[torch.Tensor, float] | None = None,
+        pair: KDAPairStep | None = None,
     ) -> torch.Tensor:
         """One KDA layer's gated-delta linear attention over ``[T, hidden]``.
 
@@ -4153,6 +4208,9 @@ class Glm5NextKDAAttention(nn.Module):
                 when ``hidden_states`` arrives un-normalised, else None. The
                 projections apply it, on chip when their kernel serves, beside its
                 own read of the rows. A decode step's input arrives normed.
+            pair: a chunk-pair prefill step's operands (:class:`KDAPairStep`), on the
+                two-head view :class:`PrefillPairs` builds of this module; then
+                :meth:`_pair_forward` serves the call. None on every other step.
 
         Returns:
             ``[T, hidden]`` at the input dtype.
@@ -4223,6 +4281,15 @@ class Glm5NextKDAAttention(nn.Module):
             raise ValueError(
                 f"hidden_states must be [tokens, hidden]; got shape "
                 f"{tuple(hidden_states.shape)}"
+            )
+        if pair is not None and (
+            not is_prefill or state_slots is not None or state_checkpoints is not None
+        ):
+            raise ValueError(
+                "a chunk-pair step is a one-request prefill on one-row carriers; "
+                f"got is_prefill={is_prefill}, a bank form "
+                f"{state_slots is not None}, checkpoint carriers "
+                f"{state_checkpoints is not None}"
             )
         if input_norm is not None and not is_prefill:
             # A decode's fused routes do not call the projections, which apply the norm.
@@ -4355,6 +4422,19 @@ class Glm5NextKDAAttention(nn.Module):
             )
         conv_state, recurrent_state, start_position = (part[0] for part in states)
         real_tokens, row_mask = reals[0], masks[0]
+        if pair is not None:
+            # The one request's carriers, in their one-sequence form.
+            return self._pair_forward(
+                hidden_states,
+                pair=pair,
+                conv_state=conv_state,
+                recurrent_state=recurrent_state,
+                start_position=start_position,
+                chunk_size=chunk_size,
+                real_tokens=real_tokens,
+                row_mask=row_mask,
+                input_norm=input_norm,
+            )
         if state_checkpoints is not None:
             # The speculative form at one request: ``1 + k`` tokens on the slot's
             # ``[1 + k, ...]`` checkpoint carriers, the one-request case of the
@@ -4592,6 +4672,182 @@ class Glm5NextKDAAttention(nn.Module):
             recurrent_state[h] = state.to(recurrent_state.dtype)
 
         return self._gated_output(core, out_gate, hidden_states, phase=phase)
+
+    def _pair_forward(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        pair: KDAPairStep,
+        conv_state: torch.Tensor,
+        recurrent_state: torch.Tensor,
+        start_position: torch.Tensor | int,
+        chunk_size: int | None,
+        real_tokens: torch.Tensor | int | None,
+        row_mask: torch.Tensor | None,
+        input_norm: tuple[torch.Tensor, float] | None,
+    ) -> torch.Tensor:
+        """One chunk of a chunk-pair prefill step, on this rank's two head shards.
+
+        ``self`` is the view :class:`PrefillPairs` builds: the own shard's heads, then
+        the partner's, in every operand. The prefill groups run the step's two chunks
+        side by side, and the second chunk continues the recurrence the first leaves,
+        so the hand-off crosses to the partner rank, which holds the same two shards in
+        the other order:
+
+        1. the projections and the short convolution run on this rank's chunk. The
+           first chunk's history comes from the carriers; the second chunk's is the
+           last ``kernel_size - 1`` rows of the first chunk, which the partner sends;
+        2. the intra-chunk stage runs once for both heads;
+        3. the inter-chunk chain runs twice. The first run returns the state this chunk
+           leaves and nothing else, and the partner receives it. The second run enters
+           with the carriers' state on the first chunk and with the received state on
+           the second chunk;
+        4. the output projection contracts both heads in one call, and its partial is
+           reduce-scattered over the prefill group (the view's
+           :data:`COLLECTIVE_GROUP_ATTR`).
+
+        The step's role is ``pair.second``, a tensor, so one graph serves both
+        groups. Each rank writes the state and conv rows its own chunk leaves, own
+        heads to its own carriers and partner heads to the partner carriers. On the
+        next step the roles swap, so the group that ran the second chunk runs the
+        first one from its own carriers, and no state goes back. What crosses is
+        rounded to the carriers' dtypes first, so the second chunk reads what a step
+        that read the carriers would read.
+
+        A padding row is held out of the recurrence as :meth:`forward` holds it out,
+        by a zero log-decay and a zero rate, here with ``torch.where``.
+
+        Raises:
+            ValueError: when this module is not a two-shard view, a carrier is not the
+                one-head shape, the chunk does not divide into whole recurrence
+                chunks, or the call does not name its real rows.
+        """
+        from vllm_neuron.functional.glue.kda_projections import kda_projections
+        from vllm_neuron.functional.kda.chunked_recurrence import (
+            kda_inter_chunk,
+            kda_intra_chunk,
+        )
+        from vllm_neuron.functional.kda.depthwise_conv1d import (
+            carried_rows,
+            depthwise_conv1d_rows,
+        )
+
+        tokens = int(hidden_states.shape[0])
+        heads = int(self.num_kv_heads_per_rank)
+        kdim = int(self.head_dim)
+        width = heads * kdim
+        own_heads = heads // PAIR_SHARDS
+        if own_heads < 1 or heads % PAIR_SHARDS:
+            raise ValueError(
+                f"a chunk-pair step runs on a view holding {PAIR_SHARDS} head shards; "
+                f"this module holds {heads} head(s) per rank"
+            )
+        carriers = (
+            ("recurrent_state", recurrent_state, (own_heads, kdim, kdim)),
+            ("partner_recurrent_state", pair.partner_recurrent_state,
+             (own_heads, kdim, kdim)),
+            ("conv_state", conv_state, tuple(self.kda_conv_state_shape)),
+            ("partner_conv_state", pair.partner_conv_state,
+             tuple(self.kda_conv_state_shape)),
+        )
+        for name, carrier, shape in carriers:
+            if tuple(carrier.shape) != shape:
+                raise ValueError(
+                    f"{name} {tuple(carrier.shape)} must be {shape}, one head shard's "
+                    f"carrier"
+                )
+        if real_tokens is None or row_mask is None or tuple(row_mask.shape) != (tokens, 1):
+            raise ValueError(
+                f"a chunk-pair chunk names its real rows: real_tokens and a "
+                f"[{tokens}, 1] row_mask; got row_mask "
+                f"{None if row_mask is None else tuple(row_mask.shape)}"
+            )
+        chunk = self._resolve_chunk_size(chunk_size)
+        if tokens % chunk:
+            raise ValueError(
+                f"a chunk-pair chunk runs whole recurrence chunks; {tokens} rows do not "
+                f"divide into chunks of {chunk}"
+            )
+        n_chunks = tokens // chunk
+
+        q_in, k_in, v_in, gate, raw_beta, out_gate = kda_projections(
+            hidden_states, self, phase="prefill", norm=input_norm, gate=True)
+        streams = (q_in, k_in, v_in)
+        opening = _start_is_zero(start_position, conv_state.device)
+        second = (pair.second != 0).reshape(())
+
+        # --- 1: the short convolution, with the first chunk's rows as the second's
+        # history.
+        history = _pair_channels(
+            self._conv_history(conv_state),
+            self._conv_history(pair.partner_conv_state),
+            len(streams),
+        )
+        history = torch.where(opening, torch.zeros_like(history), history)
+        real_length = _int64_scalar(real_tokens, history.device)
+        halo = carried_rows(history, streams, real_length).to(conv_state.dtype)
+        handed_rows = exchange_with_partner(halo, group=pair.group).to(torch.float32)
+        history = torch.where(
+            second, _swap_pair_halves(handed_rows, len(streams)), history
+        )
+        filt = torch.cat(
+            (
+                self.q_conv1d_weight.to(torch.float32).reshape(width, 1, 1, -1),
+                self.k_conv1d_weight.to(torch.float32).reshape(width, 1, 1, -1),
+                self.v_conv1d_weight.to(torch.float32).reshape(width, 1, 1, -1),
+            ),
+            dim=0,
+        ).contiguous()
+        conv_out = depthwise_conv1d_rows(history, streams, filt)
+        conv_out = torch.nn.functional.silu(conv_out.reshape(len(streams) * width, tokens).t())
+        q_conv, k_conv, v_conv = conv_out.split(width, dim=-1)
+        own_rows, partner_rows = _split_pair_channels(
+            carried_rows(history, streams, real_length), len(streams)
+        )
+        self._store_conv_history(conv_state, own_rows)
+        self._store_conv_history(pair.partner_conv_state, partner_rows)
+
+        # --- 2: the gate and rate, padding rows held out -------------------
+        real_row = row_mask != 0
+        gate = torch.where(real_row, gate, torch.zeros_like(gate))
+        beta = torch.sigmoid(raw_beta)
+        beta = torch.where(real_row, beta, torch.zeros_like(beta))
+
+        # --- 3: the recurrence, both heads in each call ---------------------
+        def heads_first(rows: torch.Tensor) -> torch.Tensor:
+            return (
+                rows.reshape(tokens, heads, kdim)
+                .permute(1, 0, 2)
+                .reshape(heads, n_chunks, chunk, kdim)
+                .contiguous()
+            )
+
+        q_h, k_h, v_h, gk_h = (heads_first(rows) for rows in (q_conv, k_conv, v_conv, gate))
+        beta_h = beta.t().reshape(heads, n_chunks, chunk).contiguous()
+        intra = kda_intra_chunk(
+            q_h, k_h, v_h, beta_h, gk_h, gate_block=self._resolve_gate_block(chunk)
+        )
+        entering = torch.cat((recurrent_state, pair.partner_recurrent_state), dim=0)
+        entering = entering.to(torch.float32)
+        entering = torch.where(opening, torch.zeros_like(entering), entering)
+        left = kda_inter_chunk(
+            intra.kg, intra.w, intra.u, gk_h, q_h, intra.aqk, state=entering,
+            state_only=True,
+        )
+        handed_state = exchange_with_partner(
+            left.final_state.to(recurrent_state.dtype), group=pair.group
+        ).to(torch.float32)
+        state = torch.where(second, _swap_pair_halves(handed_state, 1, dim=0), entering)
+        inter = kda_inter_chunk(
+            intra.kg, intra.w, intra.u, gk_h, q_h, intra.aqk, state=state
+        )
+        core = inter.o.reshape(heads, tokens, kdim).permute(1, 0, 2).reshape(tokens, width)
+        final = inter.final_state.to(recurrent_state.dtype)
+        recurrent_state.copy_(final[:own_heads])
+        pair.partner_recurrent_state.copy_(final[own_heads:])
+
+        # --- 4: the output, reduce-scattered over the prefill group ---------
+        return self._gated_output(core, out_gate, hidden_states, phase="prefill")
 
     def _fused_decode_requests(
         self,
@@ -4926,6 +5182,7 @@ class Glm5NextKDALayer(nn.Module):
         state_slots: torch.Tensor | None = None,
         checkpoint_rows: torch.Tensor | int | None = None,
         state_checkpoints: int | None = None,
+        pair: KDAPairStep | None = None,
     ) -> torch.Tensor:
         """The linear-attention half, mixed either by mHC or by a plain add.
 
@@ -4991,6 +5248,7 @@ class Glm5NextKDALayer(nn.Module):
                     if state_checkpoints is not None
                     else {}
                 ),
+                **({"pair": pair} if pair is not None else {}),
             )
             if collector is not None:
                 collector.append(attended)
@@ -5642,6 +5900,36 @@ class Glm5NextDSAIndexer(nn.Module):
             key, gate_score, ape.to(torch.float32), pool_cache, destination
         )
 
+    def _pair_pool_rows(
+        self,
+        key: torch.Tensor,
+        gate_score: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        pair: DSAPairStep,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """:meth:`store_pools`' ``(key, gate_score, slot_mapping)`` for a chunk-pair step.
+
+        This chunk's rows, then the partner chunk's, which the partner rank sends in one
+        exchange (``key`` and ``gate_score`` side by side when they share a dtype). The
+        store pools a window of ``index_kpool`` rows ending at each completing position,
+        and both chunks start on a whole pool, so each window holds one chunk's rows;
+        the slot mapping keeps every other position on the trash row.
+        """
+        if key.dtype == gate_score.dtype:
+            width = int(key.shape[1])
+            handed = exchange_with_partner(
+                torch.cat((key, gate_score), dim=1), group=pair.group
+            )
+            partner_key, partner_gate = handed[:, :width], handed[:, width:]
+        else:
+            partner_key = exchange_with_partner(key, group=pair.group)
+            partner_gate = exchange_with_partner(gate_score, group=pair.group)
+        return (
+            torch.cat((key, partner_key), dim=0),
+            torch.cat((gate_score, partner_gate), dim=0),
+            torch.cat((slot_mapping, pair.partner_slot_mapping), dim=0),
+        )
+
     def _pool_operands(
         self,
         key: torch.Tensor,
@@ -6250,7 +6538,8 @@ class Glm5NextDSAIndexer(nn.Module):
         ranks, else None.
 
         A plan exists when the call may shard (the prefill leg of :meth:`forward`), a rank
-        operand is bound, a tensor-parallel group exists and
+        operand is bound, a group exists (:func:`_module_group`: the tensor-parallel
+        group, or the prefill group a chunk-pair view binds) and
         :func:`~vllm_neuron.functional.dsa.indexer_shard.shard_degree` says the chunk spans
         more than one row tile with the switch on. ``group`` is that group, ``shard`` the
         :class:`~vllm_neuron.functional.dsa.indexer_shard.RowShard` and ``rank`` the bound
@@ -6259,7 +6548,7 @@ class Glm5NextDSAIndexer(nn.Module):
         from vllm_neuron.functional.dsa.indexer_shard import row_shard, shard_degree
 
         rank = getattr(self, self.SHARD_RANK_ATTR, None)
-        group = _resolve_tp_group() if shardable and rank is not None else None
+        group = _module_group(self) if shardable and rank is not None else None
         degree = 1 if group is None else shard_degree(tokens, int(group.world_size))
         if degree <= 1:
             return None
@@ -6604,9 +6893,16 @@ class Glm5NextDSAIndexer(nn.Module):
         projected: tuple | None = None,
         ordered: bool = True,
         keep_bits: bool = False,
+        pair: DSAPairStep | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor | None, torch.Tensor] | None:
         """The whole indexer chain. Returns ``topk_indices`` and nothing else, unless the
         caller asks for the keep table too (``keep_bits``).
+
+        ``pair`` is a chunk-pair prefill step's :class:`DSAPairStep`: the pool store
+        then also pools the partner chunk's key and gate rows, received from the partner
+        rank, at ``pair.partner_slot_mapping``, in the same one store. Each chunk starts
+        on a whole pool, so no pool window spans the two chunks. The ring seed and the
+        selection are this chunk's.
 
         ``projected`` is :meth:`project_stage`'s four outputs for these rows, computed
         by the caller: a decode step of several requests projects them all in one
@@ -6750,6 +7046,12 @@ class Glm5NextDSAIndexer(nn.Module):
                 f"the keep table belongs to a selecting prefill call without DCP; got "
                 f"decode={is_decode}, selects={selects}, dcp_size={self.dcp_size}"
             )
+        if pair is not None and (is_decode or projected is not None or self.dcp_size > 1):
+            raise Glm5NextDSAIndexerError(
+                f"a chunk-pair step is a prefill call without DCP that projects its own "
+                f"rows; got decode={is_decode}, projected={projected is not None}, "
+                f"dcp_size={self.dcp_size}"
+            )
         # The query row cut: when the prefill selection shards, this rank's rows of the
         # query side's inputs, so the query and the weights project those rows alone
         # (``indexer_shard.take_query_rows``); the key and the gate project every row.
@@ -6813,7 +7115,10 @@ class Glm5NextDSAIndexer(nn.Module):
                 )
                 pool_cache.index_copy_(0, pool_slot, pooled.to(pool_cache.dtype))
         else:
-            pool_cache = self.store_pools(key, gate_score, slot_mapping, pool_cache, trash)
+            store = (key, gate_score, slot_mapping)
+            if pair is not None:
+                store = self._pair_pool_rows(key, gate_score, slot_mapping, pair)
+            pool_cache = self.store_pools(*store, pool_cache, trash)
             if prefill_tail is not None:
                 # The remainder is this leg's to persist: the pooled store took the
                 # complete pools above, and the open pool's rows exist only here.
@@ -8346,8 +8651,15 @@ class Glm5NextMLAAttention(nn.Module):
         selection_is_a_set: bool = False,
         keep_bits: torch.Tensor | None = None,
         keep_route: KeepTableRoute | None = None,
+        pair: DSAPairStep | None = None,
     ) -> torch.Tensor:
         """One layer's MLA attention. Returns ``[tokens, hidden_size]``.
+
+        ``pair`` (a chunk-pair prefill step's :class:`DSAPairStep`): the latent write
+        also persists the partner chunk's rows, received from the partner rank, at
+        ``pair.partner_latent_slots``, in the same one write. Every read below is this
+        chunk's, as on any prefill chunk: a query's causal bound keeps it off the rows
+        of a later chunk.
 
         ``dense=True`` is a decode step whose selection keeps every token: the
         causal prefix ``0 .. start_position`` is attended directly by
@@ -8591,7 +8903,15 @@ class Glm5NextMLAAttention(nn.Module):
         # writes in one graph only the last reaches the bank's aliased output. The
         # draft layer writes its bank ``1 + k`` times in one verify step (``populate``,
         # then one row per draft iteration); through a view it kept one draft row.
-        latent_cache.index_copy_(0, rows, written.unsqueeze(1))
+        # For the same reason a chunk-pair step writes the partner chunk's rows in this
+        # one write: the partner rank sends the rows it persists, in the bank's dtype.
+        persisted = written
+        if pair is not None:
+            persisted = torch.cat(
+                (written, exchange_with_partner(written, group=pair.group)), dim=0
+            )
+            rows = torch.cat((rows, pair.partner_latent_slots), dim=0)
+        latent_cache.index_copy_(0, rows, persisted.unsqueeze(1))
 
         # The cache read. The whole bank, as a view, with the block table beside it.
         # The kernel assembles the window the table names and no copy of it is made
@@ -9406,6 +9726,7 @@ class Glm5NextMLAAttention(nn.Module):
         active_mla_query_rows: int | None = None,
         state_slots: torch.Tensor | None = None,
         index_share: IndexShare | None = None,
+        pair: DSAPairStep | None = None,
     ) -> torch.Tensor:
         """This module's whole contribution to one layer: select, then attend.
 
@@ -9450,6 +9771,12 @@ class Glm5NextMLAAttention(nn.Module):
         are where this step's own rows are persisted. ``page_size`` is the same
         number for both readers -- the indexer's pool pages and the latent bank's
         blocks are one page size, which the runner refuses to let disagree.
+
+        ``pair`` is a chunk-pair prefill step's :class:`DSAPairStep`, on the two-head
+        view :class:`PrefillPairs` builds of this module. The indexer and
+        :meth:`attend` then write the partner chunk's rows beside this chunk's, so both
+        prefill groups hold the whole step in their caches; the composition is the
+        same.
         """
         from vllm_neuron.functional.dsa.decode_bypass import (
             selection_bound,
@@ -9457,6 +9784,17 @@ class Glm5NextMLAAttention(nn.Module):
         )
 
         _require_bound_dcp_size(self, Glm5NextMLADecodeError)
+        if pair is not None and (
+            slot_mapping is None
+            or tail is not None
+            or state_slots is not None
+            or active_mla_query_rows is not None
+            or collector is not None
+        ):
+            raise Glm5NextMLADecodeError(
+                "a chunk-pair step is one request's full-width prefill chunk, with a "
+                "slot_mapping and no ring, bank form, active row prefix or dump"
+            )
         if isinstance(tail, (tuple, list)) or state_slots is not None:
             # A decode step of several requests: one ring per request, or the whole
             # ring and pooled-store banks beside one slot per request.
@@ -9664,6 +10002,7 @@ class Glm5NextMLAAttention(nn.Module):
             ),
             ordered=not selects_a_set,
             keep_bits=keep_route is not None,
+            **({"pair": pair} if pair is not None else {}),
         )
         topk_indices, keep_bits = selection if keep_route is not None else (selection, None)
         if collector is not None:
@@ -9693,6 +10032,7 @@ class Glm5NextMLAAttention(nn.Module):
                 {"active_mla_query_rows": active_mla_query_rows}
                 if active_mla_query_rows is not None else {}
             ),
+            **({"pair": pair} if pair is not None else {}),
         )
 
 
@@ -9782,6 +10122,7 @@ class Glm5NextDSALayer(nn.Module):
         active_mla_query_rows: int | None = None,
         state_slots: torch.Tensor | None = None,
         index_share: IndexShare | None = None,
+        pair: DSAPairStep | None = None,
     ) -> torch.Tensor:
         """The sparse-attention half, mixed either by mHC or by a plain add.
 
@@ -9812,6 +10153,7 @@ class Glm5NextDSALayer(nn.Module):
         python int. ``block_table_row`` and ``latent_slots`` belong to the paged
         latent bank and are handed on unread: the attention half's callee owns both
         contracts, and a second reading here is a second authority on one extent.
+        ``pair`` (a chunk-pair step's :class:`DSAPairStep`) is handed on unread too.
 
         ``streams`` is ``[T, S, H]`` or ``None``; the return is ``[T, H]`` in the
         input dtype on the one-stream route and ``[T, S, H]`` in the streams' own
@@ -9859,6 +10201,7 @@ class Glm5NextDSALayer(nn.Module):
                 ),
                 **({"state_slots": state_slots} if state_slots is not None else {}),
                 **({"index_share": index_share} if index_share is not None else {}),
+                **({"pair": pair} if pair is not None else {}),
             )
             if collector is not None:
                 collector.append(attended)
@@ -10490,7 +10833,7 @@ class Glm5NextModel(nn.Module):
         if sharded:
             # The root selects and projects rows of the whole chunk, and the draft's
             # prefill leg reads every row: gather the ranks' rows back in order.
-            (normed,) = gather_sequence([normed], group=_resolve_tp_group())
+            (normed,) = gather_sequence([normed], group=_module_group(self))
         if collect_layer_streams:
             return normed, (*collected, *taps)
         return normed
@@ -10538,7 +10881,7 @@ def _scale_prep_leaves(module: nn.Module) -> list[str]:
         if leaf.endswith(_WEIGHT_LEAF_SUFFIX)
         and hasattr(
             module,
-            Glm5NextForConditionalGeneration._sibling_scale_grid_name(leaf),
+            Glm5NextForConditionalGeneration.sibling_scale_grid_name(leaf),
         )
     ]
 
@@ -10620,7 +10963,7 @@ def _publish_compute_frame_operands(
     health: dict[str, dict[str, object]] = {}
     published = 0
     for leaf in _scale_prep_leaves(module):
-        grid_name = Glm5NextForConditionalGeneration._sibling_scale_grid_name(leaf)
+        grid_name = Glm5NextForConditionalGeneration.sibling_scale_grid_name(leaf)
         weight = getattr(module, leaf)
         grid = getattr(module, grid_name)
         if weight.dim() != 2:
@@ -11247,6 +11590,786 @@ _SHARD_GEOMETRY["Glm5NextMultiTokenPredictor"] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# The chunk-pair prefill (``VLLM_NEURON_GLM5NEXT_PREFILL_PAIRS``).
+#
+# A prefill step of two chunks runs on two prefill groups of half the world, one chunk
+# each. Every rank holds its own tensor-parallel shard and its partner's
+# (``pair_shards.py``) and runs its chunk on views of the tree's modules that hold both.
+# A view is a shallow copy kept outside the module tree, so the tree, its parameter list
+# and every graph that is not a pair step's are those of a server without the knob.
+# ---------------------------------------------------------------------------
+
+#: Head shards a chunk-pair view holds: this rank's own shard, then its partner's.
+PAIR_SHARDS = 2
+
+#: The keys a chunk-pair step's runner adds to a KDA layer's carrier: this rank's
+#: carriers of the partner shard's heads, each one head shard's shape.
+KDA_PAIR_CARRIER_KEYS = ("partner_conv_state", "partner_recurrent_state")
+
+#: The keys it adds to a DSA layer's carrier: where the partner chunk's latent rows and
+#: pooled index rows persist, built as the chunk's own ``latent_slots`` and
+#: ``slot_mapping`` are.
+DSA_PAIR_CARRIER_KEYS = ("partner_latent_slots", "partner_slot_mapping")
+
+#: The DSA prefill carrier's indexer ring, the one DSA state the settle hands across.
+DSA_RING_CARRIER_KEY = "prefill_tail"
+
+#: The attribute the root keeps its :class:`PrefillPairs` on, None with the knob off. A
+#: plain attribute, so the views it holds stay outside the module tree.
+PREFILL_PAIRS_ATTR = "_prefill_pairs"
+
+
+class Glm5NextPrefillPairsError(ValueError):
+    """A chunk-pair prefill configuration or call that :class:`PrefillPairs` refuses."""
+
+
+class KDAPairStep(NamedTuple):
+    """One KDA layer's chunk-pair operands, beside the layer's own carriers.
+
+    ``second`` is ``[1]`` int32, nonzero on the prefill group that runs the step's
+    second chunk: a tensor, so one graph serves both roles. The two carriers are this
+    rank's state of the partner shard's heads. ``group`` is the pair group, this rank
+    and its partner.
+    """
+
+    second: torch.Tensor
+    partner_conv_state: torch.Tensor
+    partner_recurrent_state: torch.Tensor
+    group: GroupCoordinator
+
+
+class DSAPairStep(NamedTuple):
+    """One DSA layer's chunk-pair operands: where the partner chunk's rows persist.
+
+    The partner chunk's ``latent_slots`` and pool ``slot_mapping``, and the pair group.
+    """
+
+    partner_latent_slots: torch.Tensor
+    partner_slot_mapping: torch.Tensor
+    group: GroupCoordinator
+
+
+class PairChunks(NamedTuple):
+    """One rank's view of a pair step: which chunk it runs, and its partner's.
+
+    Positions and lengths are host ints, for the runner to build the two chunks'
+    carriers from; ``second`` reaches the graph only as the ``pair_second`` tensor.
+    """
+
+    second: bool
+    own_start: int
+    own_real: int
+    partner_start: int
+    partner_real: int
+
+
+def _pair_channels(own: torch.Tensor, partner: torch.Tensor, streams: int) -> torch.Tensor:
+    """Two shards' ``[rows, streams * W]`` channels as one ``[rows, streams * 2W]``.
+
+    Each stream's own channels, then its partner channels: the order a pair view's
+    projections produce, since its weights hold the own heads' rows, then the partner's.
+    """
+    rows = int(own.shape[0])
+    return torch.cat(
+        (own.reshape(rows, streams, -1), partner.reshape(rows, streams, -1)), dim=2
+    ).reshape(rows, -1)
+
+
+def _split_pair_channels(
+    channels: torch.Tensor, streams: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """:func:`_pair_channels` undone: the own shard's channels, then the partner's."""
+    rows = int(channels.shape[0])
+    shards = channels.reshape(rows, streams, PAIR_SHARDS, -1)
+    return shards[:, :, 0].reshape(rows, -1), shards[:, :, 1].reshape(rows, -1)
+
+
+def _swap_pair_halves(tensor: torch.Tensor, groups: int, *, dim: int = -1) -> torch.Tensor:
+    """``tensor`` with the two shard halves of each of ``groups`` blocks on ``dim`` swapped.
+
+    The partner rank sends what it holds in its own order, its own shard first, which
+    is this rank's partner shard; swapping the halves gives this rank's order.
+    """
+    dim = dim % tensor.dim()
+    shape = tuple(tensor.shape)
+    blocks = tensor.reshape(
+        *shape[:dim],
+        groups,
+        PAIR_SHARDS,
+        shape[dim] // (groups * PAIR_SHARDS),
+        *shape[dim + 1:],
+    )
+    swapped = torch.cat(
+        (blocks.narrow(dim + 1, 1, 1), blocks.narrow(dim + 1, 0, 1)), dim=dim + 1
+    )
+    return swapped.reshape(shape)
+
+
+def _module_view(module: nn.Module, cls: type[nn.Module] | None = None) -> nn.Module:
+    """A shallow copy of ``module`` that shares its tensors until the copy rebinds one.
+
+    The copy has its own attribute, parameter, buffer and submodule tables, so a leaf
+    rebound or an operand prepared on it leaves ``module`` as it was. ``cls``, a
+    subclass of ``module``'s class, is what the copy computes differently. Nothing
+    registers the copy in a module tree.
+    """
+    view = object.__new__(cls or type(module))
+    view.__dict__.update(module.__dict__)
+    for table in ("_parameters", "_buffers", "_modules"):
+        view.__dict__[table] = dict(module.__dict__[table])
+    view.__dict__["_non_persistent_buffers_set"] = set(module._non_persistent_buffers_set)
+    return view
+
+
+def _rebind_leaf(view: nn.Module, leaf: str, tensor: torch.Tensor) -> None:
+    """Point ``view``'s ``leaf`` at ``tensor``, in the form the original holds it."""
+    if leaf in view._parameters:
+        view._parameters[leaf] = (
+            tensor
+            if isinstance(tensor, nn.Parameter)
+            else nn.Parameter(tensor, requires_grad=False)
+        )
+    else:
+        view.__dict__[leaf] = tensor
+
+
+def _pair_cat(own: torch.Tensor, partner: torch.Tensor, dim: int) -> torch.Tensor:
+    """The two shards side by side on ``dim``, own first, joined on host copies.
+
+    The join is a copy the device refuses for some dtypes (fp8 bytes), so it runs on
+    the host and the result moves back in one step, the load-time preps' rule.
+    """
+    host_own, host_partner = _on_the_host(own.detach(), partner.detach())
+    (joined,) = _on_the_device(own.device, torch.cat((host_own, host_partner), dim=dim))
+    return joined
+
+
+class _MLAPairHeads(Glm5NextMLAAttention):
+    """A chunk-pair view of a :class:`Glm5NextMLAAttention`: the own heads, then the
+    partner's, in every head-sharded operand."""
+
+    def _heads_per_rank(self) -> int:
+        return PAIR_SHARDS * super()._heads_per_rank()
+
+
+class _PairMoEBlock(Glm5NextMoEBlock):
+    """A chunk-pair view of a :class:`Glm5NextMoEBlock`: both shards' experts.
+
+    ``experts`` and ``shared_experts`` are the rank's own modules. ``partner_experts``
+    and ``partner_shared_experts`` are views holding the partner shard's, and
+    ``partner_expert_parallel_rank`` (int64 ``[1]``) is the partner's block of experts.
+    """
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        normed_hidden_states: torch.Tensor,
+        *,
+        router_gamma: torch.Tensor,
+        text_config: Glm5NextTextConfig,
+        quant_config: Glm5NextQuantConfig,
+        block_size: int | None = None,
+        moe_group: object | None = None,
+        tp_degree: int = 1,
+        expert_parallel_rank: int | torch.Tensor = 0,
+        collector: list[torch.Tensor] | None = None,
+        router_scaled: torch.Tensor | None = None,
+        partial_dtype: torch.dtype | None = None,
+        prefill_step: bool = False,
+    ) -> torch.Tensor:
+        """Route once, run both banks and both shared experts, and sum in fp32.
+
+        The router is replicated, so one call scores every expert for both shards; each
+        bank keeps its fp32 sum. The partner shared expert takes the running sum as its
+        kernel's addend where :meth:`Glm5NextMoEBlock.forward` adds in that kernel, so
+        the sum is rounded once there too. The arguments are that method's.
+
+        Raises:
+            Glm5NextPrefillPairsError: a call that is not a prefill chunk, or that
+                carries a dump collector.
+        """
+        from vllm_neuron.functional.blockwise_fp8_mm import prefill_mlp_takes
+
+        if collector is not None or not prefill_step:
+            raise Glm5NextPrefillPairsError(
+                f"the chunk-pair feed-forward runs a prefill chunk without a dump; got "
+                f"prefill_step={prefill_step}, a collector "
+                f"{'given' if collector is not None else 'absent'}"
+            )
+        _logits, _expert_index, affinities = self._route(
+            hidden_states, normed_hidden_states, router_gamma, text_config, router_scaled
+        )
+        bank = {
+            "block_size": block_size,
+            "moe_group": moe_group,
+            "tp_degree": tp_degree,
+            "keep_fp32_sum": True,
+        }
+        total = self.experts(
+            normed_hidden_states, affinities, quant_config,
+            expert_parallel_rank=expert_parallel_rank, **bank,
+        ).to(torch.float32)
+        total = total + self.partner_experts(
+            normed_hidden_states, affinities, quant_config,
+            expert_parallel_rank=self.partner_expert_parallel_rank, **bank,
+        ).to(torch.float32)
+        shared = getattr(self, "shared_experts", None)
+        if shared is None:
+            return total
+        total = total + shared.shared_expert_mm(
+            normed_hidden_states, *shared.scale_route_operands(), quant_config
+        )
+        partner = self.partner_shared_experts
+        operands = partner.scale_route_operands()
+        if partial_dtype is torch.bfloat16 and prefill_mlp_takes(
+            normed_hidden_states, *operands[:3]
+        ):
+            return partner.shared_expert_mm(
+                normed_hidden_states, *operands, quant_config, addend=total
+            )
+        return total + partner.shared_expert_mm(normed_hidden_states, *operands, quant_config)
+
+
+class _PairDenseMLP(Glm5NextDenseMLP):
+    """A chunk-pair view of a :class:`Glm5NextDenseMLP`: the own shard, then
+    ``partner``, a view holding the partner shard's."""
+
+    def forward(
+        self, hidden_states: torch.Tensor, *, quant_config: Glm5NextQuantConfig
+    ) -> torch.Tensor:
+        """Both shards' partial sums, added in the kernels' fp32."""
+        own = super().forward(hidden_states, quant_config=quant_config)
+        return own + self.partner(hidden_states, quant_config=quant_config)
+
+
+class PrefillPairs:
+    """One rank's chunk-pair prefill: its groups, its views and its bound tensors.
+
+    Under ``VLLM_NEURON_GLM5NEXT_PREFILL_PAIRS`` a prefill step of two chunks of
+    :attr:`chunk_rows` rows runs on the two prefill groups, one chunk each; which group
+    runs the second chunk swaps every step, and the runner names it (``pair_second``).
+    Rank ``r`` holds its own shard and that of its partner ``pair_shards.partner_rank``,
+    in the other group, so each group holds the whole model. A step of one chunk and
+    every decode step run the tree, as without the knob.
+
+    The rank runs its chunk on views of the tree's modules (:func:`_module_view`): an
+    attention view holds both shards' heads side by side, own first; a feed-forward view
+    runs the own shard, then a view holding the partner's; and every view reduces and
+    gathers over the prefill group (:data:`COLLECTIVE_GROUP_ATTR`) under the group's
+    sequence shard, :attr:`shard`. The views live here and not in the tree, so the
+    tree's parameters, its graphs and its decode inputs are those of the knob-off server.
+
+    Built in three steps by :meth:`Glm5NextForConditionalGeneration.load_weights`:
+    :meth:`of_server` checks the server; after the own load and the partner load
+    (``weight_loaders_fp8.load_pair_shards``), :meth:`take_partner_shards` moves every
+    partner tensor off the tree into the views, before the own preps release the own
+    tensors a view joins; after the own preps, :meth:`bind` prepares the views and binds
+    the rest.
+    """
+
+    def __init__(
+        self,
+        *,
+        world: int,
+        rank: int,
+        partner: int,
+        chunk_rows: int,
+        vocab_size: int,
+        prefill_group: GroupCoordinator,
+        pair_group: GroupCoordinator,
+        shard: PrefillSequenceShard,
+    ) -> None:
+        self.world = world
+        self.rank = rank
+        self.partner = partner
+        #: The rows of one chunk of a pair: the server's one-chunk prefill bucket.
+        self.chunk_rows = chunk_rows
+        self.vocab_size = vocab_size
+        self.prefill_group = prefill_group
+        self.pair_group = pair_group
+        self.shard = shard
+        #: 0 on the prefill group holding rank 0, else 1: group ``k % 2`` runs the first
+        #: chunk of pair step ``k`` (:meth:`step_chunks`).
+        self.group_index = 0 if 0 in {int(member) for member in prefill_group.ranks} else 1
+        #: ``id(own module) -> (tree path, view)`` for every module holding a partner.
+        self._views: dict[int, tuple[str, nn.Module]] = {}
+        #: The vocabulary head of both shards, own rows first, or the whole head.
+        self.head: torch.Tensor | None = None
+        #: Where vocabulary block ``b`` sits in the prefill group's gathered logits, or
+        #: None when :attr:`head` is whole.
+        self.vocab_position: torch.Tensor | None = None
+        #: This rank's index in its prefill group, int32 ``[1]``.
+        self.prefill_rank: torch.Tensor | None = None
+        #: The stack of views a pair step runs.
+        self.stack: Glm5NextModel | None = None
+
+    @classmethod
+    def of_server(
+        cls, root: Glm5NextForConditionalGeneration, neuron_config: NeuronConfig | None
+    ) -> PrefillPairs | None:
+        """The plan for this rank, or None with the knob off. Called at load.
+
+        Raises:
+            Glm5NextPrefillPairsError: with the knob on, on a server the pair step does
+                not serve: a tensor-parallel group that is not the world; the prefill
+                sequence shard off; a draft head or a vision tower; decode context
+                parallel above 1; prefill buckets that are not one chunk and two chunks,
+                ``[C, 2C]``; or a pair group that does not join this rank to the
+                partner the shard map gives it.
+            Glm5NextSequenceShardError: from the prefill group's sequence shard
+                (:meth:`PrefillSequenceShard.of_chunks`).
+        """
+        from vllm_neuron import envs
+
+        if not envs.VLLM_NEURON_GLM5NEXT_PREFILL_PAIRS:
+            return None
+        from vllm_neuron.parallel.neuron_parallel_state import (
+            get_neuron_pair_group,
+            get_neuron_prefill_group,
+        )
+
+        from .collective_policy import PAIR_RANKS
+        from .pair_shards import partner_rank
+
+        world = int(root.world_size)
+        group = _tp_group_if_initialized()
+        if group is None or int(group.world_size) != world:
+            raise Glm5NextPrefillPairsError(
+                f"VLLM_NEURON_GLM5NEXT_PREFILL_PAIRS splits the tensor-parallel group in "
+                f"two, so the group must span the {world}-rank world; got "
+                f"{None if group is None else int(group.world_size)} ranks"
+            )
+        refused = {
+            "VLLM_NEURON_GLM5NEXT_PREFILL_SP off": not envs.VLLM_NEURON_GLM5NEXT_PREFILL_SP,
+            "a draft head": root.mtp is not None,
+            "a vision tower": root.visual is not None,
+            "decode context parallel": (_resolve_dcp_size() or 1) > 1,
+        }
+        if any(refused.values()):
+            raise Glm5NextPrefillPairsError(
+                f"VLLM_NEURON_GLM5NEXT_PREFILL_PAIRS does not serve "
+                f"{', '.join(name for name, hit in refused.items() if hit)}"
+            )
+        buckets = sorted(
+            int(rows) for rows in getattr(neuron_config, "num_batched_tokens_buckets", None) or ()
+        )
+        decode_buckets = tuple(getattr(neuron_config, "num_seqs_buckets", None) or ())
+        if (
+            len(buckets) != PAIR_SHARDS
+            or buckets[1] != PAIR_SHARDS * buckets[0]
+            or not decode_buckets
+        ):
+            raise Glm5NextPrefillPairsError(
+                f"VLLM_NEURON_GLM5NEXT_PREFILL_PAIRS runs a step of one chunk or of two, "
+                f"so the prefill buckets are [C, {PAIR_SHARDS}C], beside the decode "
+                f"buckets; got {buckets} and {list(decode_buckets)}"
+            )
+        rank = int(_resolve_rank())
+        partner = partner_rank(rank, world)
+        prefill_group = get_neuron_prefill_group()
+        pair_group = get_neuron_pair_group()
+        pair_ranks = sorted(int(member) for member in pair_group.ranks)
+        prefill_ranks = {int(member) for member in prefill_group.ranks}
+        if (
+            int(pair_group.world_size) != PAIR_RANKS
+            or pair_ranks != sorted((rank, partner))
+            or rank not in prefill_ranks
+            or partner in prefill_ranks
+        ):
+            raise Glm5NextPrefillPairsError(
+                f"rank {rank}'s pair group is {pair_ranks} and its prefill group "
+                f"{sorted(prefill_ranks)}; the pair shard map gives it partner {partner} "
+                f"in the other prefill group, and an exchange over these groups would "
+                f"hand its rows to another rank"
+            )
+        shard = PrefillSequenceShard.of_chunks(
+            int(prefill_group.world_size), (buckets[0],), decode_buckets
+        )
+        return cls(
+            world=world,
+            rank=rank,
+            partner=partner,
+            chunk_rows=buckets[0],
+            vocab_size=int(root.text_config.vocab_size),
+            prefill_group=prefill_group,
+            pair_group=pair_group,
+            shard=shard,
+        )
+
+    def take_partner_shards(self, root: Glm5NextForConditionalGeneration) -> None:
+        """Move every partner tensor off the tree into the view that runs it.
+
+        Called after the partner load and before the own preps, which release own
+        tensors a view joins. Per module holding partners
+        (``pair_shards.partner_tensor_plan``, the load's own list):
+
+        * a KDA or MLA attention module gets a view whose head-sharded leaves are the
+          own and the partner tensor joined on the shard dim, own first;
+        * a dense MLP, a shared expert or a routed bank gets a view whose leaves are
+          the partner's;
+        * the root's vocabulary head is joined the same way, into :attr:`head`.
+
+        The partner tensors then leave the tree and the views, so the tree's parameter
+        list is the knob-off one again and no view holds a partner name.
+
+        Raises:
+            Glm5NextPrefillPairsError: a module of another class holds a partner.
+        """
+        from .pair_shards import partner_tensor_plan
+
+        held: dict[int, tuple[str, nn.Module, list]] = {}
+        for entry in partner_tensor_plan(root, self.world):
+            _, _, entries = held.setdefault(
+                id(entry.module), (entry.module_path, entry.module, [])
+            )
+            entries.append(entry)
+        joined_classes = (Glm5NextKDAAttention, Glm5NextMLAAttention)
+        partner_classes = (Glm5NextDenseMLP, Glm5NextSharedExperts, Glm5NextRoutedExperts)
+        for key, (path, module, entries) in held.items():
+            if module is root:
+                (entry,) = entries
+                self.head = _pair_cat(
+                    getattr(root, entry.leaf),
+                    getattr(root, entry.partner_leaf),
+                    entry.geometry.shard_dim,
+                )
+            elif isinstance(module, joined_classes + partner_classes):
+                joins = isinstance(module, joined_classes)
+                view = _module_view(
+                    module, _MLAPairHeads if isinstance(module, Glm5NextMLAAttention) else None
+                )
+                for entry in entries:
+                    partner = getattr(module, entry.partner_leaf)
+                    _rebind_leaf(
+                        view,
+                        entry.leaf,
+                        _pair_cat(getattr(module, entry.leaf), partner, entry.geometry.shard_dim)
+                        if joins
+                        else partner,
+                    )
+                if isinstance(module, Glm5NextKDAAttention):
+                    view.num_kv_heads_per_rank = PAIR_SHARDS * int(module.num_kv_heads_per_rank)
+                self._views[key] = (path, view)
+            else:
+                raise Glm5NextPrefillPairsError(
+                    f"{path or 'the root'} ({type(module).__name__}) holds a partner shard "
+                    f"and the chunk-pair step has no view of that class"
+                )
+            for entry in entries:
+                delattr(module, entry.partner_leaf)
+                if key in self._views:
+                    # The view was copied with the partner leaf and reads the leaf it
+                    # rebound instead, so the name goes: kept, it would hold a second
+                    # device copy of each joined partner for the life of the process.
+                    delattr(self._views[key][1], entry.partner_leaf)
+
+    def bind(self, root: Glm5NextForConditionalGeneration, device: torch.device) -> None:
+        """Prepare the views, build the stack a pair step runs, bind the step's tensors.
+
+        Called after the own preps. Each view from :meth:`take_partner_shards` runs the
+        preps of the module it copies on its own leaves, through the own preps' body
+        (:meth:`Glm5NextForConditionalGeneration._run_load_time_preps`); an MLA view
+        then reads the own module's operands of the replicated latent projections, of
+        which its prep built a second copy. The stack is copied layer
+        by layer, each copy holding the attention view, the feed-forward view and
+        copies of its two mHC sites, all under :attr:`shard` and the prefill group.
+        Every per-rank value a pair graph reads is a device tensor bound here: the
+        prefill-group index, the partner's expert block and the vocabulary order.
+        """
+        root._run_load_time_preps(
+            device,
+            modules=[
+                (f"{path} (chunk-pair view)", view) for path, view in self._views.values()
+            ],
+        )
+        modules = {id(module): module for module in root.modules()}
+        for key, (_path, view) in self._views.items():
+            if isinstance(view, Glm5NextMLAAttention):
+                self._share_replicated_operands(view, modules[key])
+        self.prefill_rank = torch.full(
+            (1,), int(self.prefill_group.rank_in_group), dtype=torch.int32, device=device
+        )
+        partner_ranks: dict[int, torch.Tensor] = {}
+        stack = _module_view(root.model)
+        stack.layers = nn.ModuleList(
+            [self._layer_view(layer, partner_ranks, device) for layer in root.model.layers]
+        )
+        self._bind_route(stack)
+        setattr(stack, SEQUENCE_RANK_ATTR, self.prefill_rank)
+        self.stack = stack
+        if self.head is None:
+            self.head = root._head_weight()
+            return
+        from .pair_shards import partner_rank
+
+        order = [
+            block
+            for member in self.prefill_group.ranks
+            for block in (int(member), partner_rank(int(member), self.world))
+        ]
+        self.vocab_position = torch.tensor(
+            [order.index(block) for block in range(self.world)],
+            dtype=torch.int64,
+            device=device,
+        )
+
+    def _view_of(self, module: nn.Module) -> nn.Module:
+        """The view :meth:`take_partner_shards` built of ``module``."""
+        found = self._views.get(id(module))
+        if found is None:
+            raise Glm5NextPrefillPairsError(
+                f"{type(module).__name__} holds no partner shard, and the chunk-pair step "
+                f"runs both shards of every head- and width-sharded module"
+            )
+        return found[1]
+
+    def _bind_route(self, module: nn.Module) -> None:
+        """Bind the prefill group's sequence shard and group on a view."""
+        setattr(module, SEQUENCE_SHARD_ATTR, self.shard)
+        setattr(module, COLLECTIVE_GROUP_ATTR, self.prefill_group)
+
+    def _share_replicated_operands(self, view: nn.Module, own: nn.Module) -> None:
+        """Point an MLA view's prepared replicated projections at the own module's."""
+        for name, _, _ in own.projection_widths():
+            if _shard_geometry_for(own, f"{name}{_WEIGHT_LEAF_SUFFIX}", self.world) is not None:
+                continue
+            for attribute in (own.PREPARED_WEIGHTS_ATTR, own.LOWP_WEIGHTS_ATTR):
+                operands = getattr(own, attribute, {})
+                if name in operands:
+                    getattr(view, attribute)[name] = operands[name]
+
+    def _layer_view(
+        self, layer: nn.Module, partner_ranks: dict[int, torch.Tensor], device: torch.device
+    ) -> nn.Module:
+        """A decoder layer's pair copy: its attention, feed-forward and mHC site views."""
+        view = _module_view(layer)
+        attention = self._view_of(layer.attention)
+        if isinstance(attention, Glm5NextMLAAttention):
+            indexer = _module_view(layer.attention.indexer)
+            setattr(indexer, Glm5NextDSAIndexer.SHARD_RANK_ATTR, self.prefill_rank)
+            self._bind_route(indexer)
+            attention.indexer = indexer
+        self._bind_route(attention)
+        setattr(view, layer.ATTENTION_ATTR, attention)
+        view.mlp = self._mlp_view(layer.mlp, partner_ranks, device)
+        sites = {
+            name: _module_view(site) for name, site in getattr(layer, MHC_SITES_ATTR, {}).items()
+        }
+        for site in sites.values():
+            self._bind_route(site)
+        setattr(view, MHC_SITES_ATTR, sites)
+        self._bind_route(view)
+        return view
+
+    def _mlp_view(
+        self, mlp: nn.Module, partner_ranks: dict[int, torch.Tensor], device: torch.device
+    ) -> nn.Module:
+        """A feed-forward module's pair copy (:class:`_PairMoEBlock`, :class:`_PairDenseMLP`)."""
+        if isinstance(mlp, Glm5NextMoEBlock):
+            view = _module_view(mlp, _PairMoEBlock)
+            view.partner_experts = self._view_of(mlp.experts)
+            shared = getattr(mlp, "shared_experts", None)
+            if shared is not None:
+                view.partner_shared_experts = self._view_of(shared)
+            degree = int(mlp.experts.ep_degree)
+            if degree not in partner_ranks:
+                partner_ranks[degree] = self._partner_expert_block(degree, device)
+            view.partner_expert_parallel_rank = partner_ranks[degree]
+            return view
+        if isinstance(mlp, Glm5NextDenseMLP):
+            view = _module_view(mlp, _PairDenseMLP)
+            view.partner = self._view_of(mlp)
+            return view
+        raise Glm5NextPrefillPairsError(
+            f"the chunk-pair step has no feed-forward view of {type(mlp).__name__}"
+        )
+
+    def _partner_expert_block(self, ep_degree: int, device: torch.device) -> torch.Tensor:
+        """The partner's expert-parallel index, int64 ``[1]``, read off the mesh."""
+        from .weight_loaders_fp8 import expert_mesh_placement
+
+        index = 0
+        if ep_degree > 1:
+            index = expert_mesh_placement(self.world, ep_degree)(self.partner).partition
+        return torch.full((1,), int(index), dtype=torch.int64, device=device)
+
+    @property
+    def step_rows(self) -> int:
+        """The rows of a pair step: two chunks, the server's largest prefill bucket."""
+        return PAIR_SHARDS * self.chunk_rows
+
+    def step_chunks(self, start: int, real: int) -> PairChunks:
+        """This rank's chunk and its partner's in the pair step of ``real`` rows at ``start``.
+
+        Pair step ``k`` starts at ``k`` whole steps and covers the prompt from there; its
+        first chunk is full and runs on prefill group ``k % 2``, its second holds the
+        rest, from one row to a whole chunk. So the group that runs the second chunk
+        runs the first one on the next step, from the carriers it just wrote.
+
+        Raises:
+            Glm5NextPrefillPairsError: a start that is not a whole number of pair steps,
+                or a length that is not more than one chunk and at most two.
+        """
+        start, real, chunk = int(start), int(real), self.chunk_rows
+        if start % self.step_rows or not chunk < real <= self.step_rows:
+            raise Glm5NextPrefillPairsError(
+                f"a pair step starts at a multiple of {self.step_rows} rows and carries "
+                f"more than {chunk} and at most {self.step_rows} real rows; this one "
+                f"starts at {start} with {real}"
+            )
+        second = (start // self.step_rows) % PAIR_SHARDS != self.group_index
+        chunks = ((start, chunk), (start + chunk, real - chunk))
+        (own_start, own_real), (partner_start, partner_real) = (
+            chunks[::-1] if second else chunks
+        )
+        return PairChunks(second, own_start, own_real, partner_start, partner_real)
+
+    def settles_after(self, step_end: int, prompt_end: int) -> bool:
+        """Whether the pair step ending at ``step_end`` is its prompt's last one.
+
+        The rest of the prompt then fits one chunk or is empty, so the next step is a
+        one-chunk step or a decode step, both of which read the own carriers on every
+        rank, and :meth:`settle` must run first.
+        """
+        return int(prompt_end) - int(step_end) <= self.chunk_rows
+
+    def step_carriers(
+        self, layer_carriers: Sequence[dict], second: torch.Tensor
+    ) -> list[dict]:
+        """Each layer's carrier with its pair keys taken into a :class:`KDAPairStep` or
+        :class:`DSAPairStep` under ``pair``.
+
+        Raises:
+            Glm5NextPrefillPairsError: a carrier holds neither family's pair keys.
+        """
+        carriers = []
+        for index, carrier in enumerate(layer_carriers):
+            carrier = dict(carrier)
+            if all(key in carrier for key in KDA_PAIR_CARRIER_KEYS):
+                conv, recurrent = (carrier.pop(key) for key in KDA_PAIR_CARRIER_KEYS)
+                carrier["pair"] = KDAPairStep(second, conv, recurrent, self.pair_group)
+            elif all(key in carrier for key in DSA_PAIR_CARRIER_KEYS):
+                slots, mapping = (carrier.pop(key) for key in DSA_PAIR_CARRIER_KEYS)
+                carrier["pair"] = DSAPairStep(slots, mapping, self.pair_group)
+            else:
+                raise Glm5NextPrefillPairsError(
+                    f"layer {index}'s carrier holds neither {KDA_PAIR_CARRIER_KEYS} nor "
+                    f"{DSA_PAIR_CARRIER_KEYS}; a pair step's runner adds one set per layer"
+                )
+            carriers.append(carrier)
+        return carriers
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        layer_carriers: Sequence[dict],
+        sampling_positions: torch.Tensor,
+        second: torch.Tensor,
+        quant_config: Glm5NextQuantConfig,
+        block_size: int | None,
+        moe_group: object | None,
+        tp_degree: int,
+        expert_parallel_rank: int | torch.Tensor,
+    ) -> torch.Tensor:
+        """One pair step on this rank: its chunk through the views, then the logits.
+
+        ``input_ids`` and ``layer_carriers`` are this rank's chunk's, as a one-chunk
+        step's are, plus the pair keys; ``sampling_positions`` is the chunk's last real
+        row. The step's last real row is the second chunk's, so the group that runs the
+        first takes its partner's row. Both groups then project that row with their two
+        head shards and put the vocabulary blocks back in order.
+
+        Returns:
+            ``[1, vocab_size]`` logits, the same on every rank.
+        """
+        from vllm_neuron.functional.lm_head import vocab_parallel_logits
+
+        hidden = self.stack(
+            input_ids,
+            layer_carriers=self.step_carriers(layer_carriers, second),
+            quant_config=quant_config,
+            block_size=block_size,
+            moe_group=moe_group,
+            tp_degree=tp_degree,
+            expert_parallel_rank=expert_parallel_rank,
+        )
+        own = torch.index_select(hidden, dim=0, index=sampling_positions)
+        row = torch.where(
+            (second != 0).reshape(()), own, exchange_with_partner(own, group=self.pair_group)
+        )
+        logits = vocab_parallel_logits(
+            row, self.head, vocab_size=self.vocab_size, group=self.prefill_group
+        )
+        if self.vocab_position is None:
+            return logits
+        rows = int(logits.shape[0])
+        return (
+            logits.reshape(rows, self.world, -1)
+            .index_select(1, self.vocab_position)
+            .reshape(rows, -1)
+        )
+
+    def settle(self, layer_carriers: Sequence[dict], take: torch.Tensor) -> torch.Tensor:
+        """Hand a prompt's newest state to the group that does not hold it.
+
+        After a prompt's last pair step, the group that ran its second chunk holds the
+        newest KDA state and conv rows of both shards and the newest indexer rings; the
+        other group holds what it left after the first chunk. A one-chunk step and
+        decode read the own carriers on every rank. So each rank sends its partner
+        carriers and its rings, and a rank of the other group (``take`` nonzero, int32
+        ``[1]``) writes what it receives into its own carriers and rings: one exchange
+        per dtype, one write per carrier.
+
+        ``layer_carriers`` holds per KDA layer ``conv_state``, ``recurrent_state`` and
+        :data:`KDA_PAIR_CARRIER_KEYS`, and per DSA layer :data:`DSA_RING_CARRIER_KEY`.
+
+        Returns:
+            ``take != 0`` as int32 ``[1]``, the graph's one output.
+
+        Raises:
+            Glm5NextPrefillPairsError: a carrier holds neither family's settle keys, or
+                a partner carrier's shape or dtype is not the own one's.
+        """
+        sends: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for index, carrier in enumerate(layer_carriers):
+            if all(key in carrier for key in KDA_PAIR_CARRIER_KEYS):
+                sends += [
+                    (carrier["conv_state"], carrier["partner_conv_state"]),
+                    (carrier["recurrent_state"], carrier["partner_recurrent_state"]),
+                ]
+            elif DSA_RING_CARRIER_KEY in carrier:
+                ring = carrier[DSA_RING_CARRIER_KEY]
+                sends.append((ring, ring))
+            else:
+                raise Glm5NextPrefillPairsError(
+                    f"layer {index}'s settle carrier holds neither {KDA_PAIR_CARRIER_KEYS} "
+                    f"nor {DSA_RING_CARRIER_KEY!r}"
+                )
+        by_dtype: dict[torch.dtype, list[tuple[torch.Tensor, torch.Tensor]]] = {}
+        for own, sent in sends:
+            if tuple(own.shape) != tuple(sent.shape) or own.dtype != sent.dtype:
+                raise Glm5NextPrefillPairsError(
+                    f"a partner carrier {tuple(sent.shape)} {sent.dtype} must be the own "
+                    f"carrier's {tuple(own.shape)} {own.dtype}: it is the same state of "
+                    f"the partner shard"
+                )
+            by_dtype.setdefault(own.dtype, []).append((own, sent))
+        taking = (take != 0).reshape(())
+        for pairs in by_dtype.values():
+            received = exchange_with_partner(
+                torch.cat([sent.reshape(-1) for _, sent in pairs]), group=self.pair_group
+            )
+            offset = 0
+            for own, _ in pairs:
+                count = own.numel()
+                handed = received.narrow(0, offset, count).reshape(own.shape)
+                own.copy_(torch.where(taking, handed, own))
+                offset += count
+        return taking.to(torch.int32).reshape(1)
+
+
 class Glm5NextForConditionalGeneration(nn.Module):
     """The blockwise-FP8 glm-5.3-Flash implementation.
 
@@ -11304,6 +12427,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
         # (``model_image.py``), which the factory selects when the server admits
         # images, sets it after this constructor. ``load_weights`` loads it when set.
         self.visual: nn.Module | None = None
+        # The chunk-pair prefill, which ``load_weights`` builds under its knob
+        # (:class:`PrefillPairs`). None without it.
+        setattr(self, PREFILL_PAIRS_ATTR, None)
 
     # ── construction ─────────────────────────────────────────────────────
 
@@ -11347,7 +12473,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
     # ── weight loading ──────────────────────────────
 
-    def _checkpoint_block_size(self) -> tuple[int, int]:
+    def checkpoint_block_size(self) -> tuple[int, int]:
         """The quantisation block shape this checkpoint declares, as two ints.
 
         Read off ``quantization_config.weight_block_size``, which the config adapter
@@ -11373,7 +12499,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             )
         return (int(declared[0]), int(declared[1]))
 
-    def _placeholder_dtype(
+    def placeholder_dtype(
         self,
         checkpoint_keys: str | list[str],
         *,
@@ -11443,12 +12569,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
             # widens the bias to float32 before it corrects the scores, so a
             # narrowing placeholder spends the width before either one reads it.
             return torch.float32
-        if self._sibling_scale_grid_name(param_name) in mappings:
+        if self.sibling_scale_grid_name(param_name) in mappings:
             return _FP8_DTYPE
         return self.text_config.torch_dtype
 
     @staticmethod
-    def _sibling_scale_grid_name(param_name: str) -> str:
+    def sibling_scale_grid_name(param_name: str) -> str:
         """The scale-grid parameter that would accompany this weight, by name.
 
         Returns a name that is deliberately unmatchable for a parameter that is
@@ -11505,7 +12631,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 name = f"{module_path}.{leaf}" if module_path else leaf
                 checkpoint_keys = mappings.get(name, name)
                 placeholder = nn.parameter.UninitializedParameter(
-                    dtype=self._placeholder_dtype(
+                    dtype=self.placeholder_dtype(
                         checkpoint_keys, param_name=name, mappings=mappings
                     ),
                     device=device,
@@ -11690,7 +12816,19 @@ class Glm5NextForConditionalGeneration(nn.Module):
         # placeholder into a real on-device tensor, so a scale read or a prep placed
         # before it would work on placeholders.
         self._load_out_of_band_scales(checkpoint, mappings, device)
+        # The chunk-pair prefill, None and nothing loaded with its knob off. The partner
+        # shard loads beside the own one and moves into the pair views before the own
+        # preps, which release own tensors the views join; the views prepare after them.
+        pairs = PrefillPairs.of_server(self, self.text_config.neuron_config)
+        if pairs is not None:
+            load_pair_shards(
+                self, rank, self.world_size, checkpoint=checkpoint, device=device
+            )
+            pairs.take_partner_shards(self)
         self._run_load_time_preps(device)
+        if pairs is not None:
+            pairs.bind(self, device)
+        setattr(self, PREFILL_PAIRS_ATTR, pairs)
 
     def _load_out_of_band_scales(
         self,
@@ -11770,7 +12908,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 # positionals; widening its signature to thread a rank through would
                 # move working code for a value ``_resolve_rank`` already owns.
                 module_path, _, leaf = param_name.rpartition(".")
-                attribute = self._sibling_scale_grid_name(leaf)
+                attribute = self.sibling_scale_grid_name(leaf)
                 if not attribute:
                     raise Glm5NextWeightLoadError(
                         f"{param_name} is a bank of "
@@ -11810,7 +12948,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     param_name=param_name,
                     owner=module,
                     geometry=bank_geometry,
-                    block_size=self._checkpoint_block_size(),
+                    block_size=self.checkpoint_block_size(),
                 ).load(
                     [checkpoint._get_slice(key) for key in key_list],
                     _resolve_rank(),
@@ -11827,7 +12965,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 # loads and compensates it.
                 continue
             module_path, _, leaf = param_name.rpartition(".")
-            attribute = self._sibling_scale_grid_name(leaf)
+            attribute = self.sibling_scale_grid_name(leaf)
             if not attribute:
                 raise Glm5NextWeightLoadError(
                     f"{param_name} carries the scale key {scales[0]!r} but its "
@@ -11862,16 +13000,25 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 # defaulted. Read here, inside the branch that already found a scale
                 # grid, so a checkpoint with no grids never has to declare one.
                 grid = sharded_scale_grid_loader(
-                    geometry, param_name, self._checkpoint_block_size()
+                    geometry, param_name, self.checkpoint_block_size()
                 ).load([checkpoint._get_slice(scales[0])], _resolve_rank())
             setattr(module, attribute, grid.to(dtype=torch.float32, device=device))
             read += 1
         return read
 
-    def _run_load_time_preps(self, device: torch.device) -> tuple[int, int]:
+    def _run_load_time_preps(
+        self,
+        device: torch.device,
+        modules: Sequence[tuple[str, nn.Module]] | None = None,
+    ) -> tuple[int, int]:
         """Call both load-time preps, each behind its own device pre-flight.
 
         Returns ``(projection prep calls, scale prep calls)``.
+
+        ``modules`` holds the ``(path, module)`` pairs to prepare, ``path`` naming a
+        module in a refusal. ``None`` walks the whole tree and then binds the prefill
+        sequence shard. The chunk-pair views (:class:`PrefillPairs`) pass their own, so
+        they are prepared by this one body after the tree.
 
         Once every prep on a module has run, the checkpoint tensors its class declares
         under ``RELEASED_AFTER_PREP`` are released: that class's forward reads the
@@ -11894,7 +13041,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         """
         projection_calls = 0
         scale_calls = 0
-        for path, module in self.named_modules():
+        for path, module in self.named_modules() if modules is None else modules:
             if hasattr(type(module), "prepare_projection_weights"):
                 names = [n for n, _, _ in module.projection_widths()]
                 self._require_prep_operands_on_device(path, module, names, device)
@@ -11948,7 +13095,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     leaf = f"{name}{_WEIGHT_LEAF_SUFFIX}"
                     operands[leaf] = getattr(module, leaf)
                     operands[f"{name}_scale"] = getattr(
-                        module, self._sibling_scale_grid_name(leaf)
+                        module, self.sibling_scale_grid_name(leaf)
                     )
                 module.prepare_scale_operands(**operands)
                 scale_calls += 1
@@ -11970,9 +13117,11 @@ class Glm5NextForConditionalGeneration(nn.Module):
             # this load put it.
             if hasattr(type(module), "bind_hyper_connection_sites"):
                 module.bind_hyper_connection_sites(self.text_config, device)
-        # The prefill sequence shard, after the walk because it binds on the mHC sites
-        # the walk bound. With its switch off it binds None and nothing reads it.
-        self.model.bind_prefill_sequence_shard(self.text_config.neuron_config, device)
+        if modules is None:
+            # The prefill sequence shard, after the walk because it binds on the mHC
+            # sites the walk bound. With its switch off it binds None and nothing reads
+            # it.
+            self.model.bind_prefill_sequence_shard(self.text_config.neuron_config, device)
         return projection_calls, scale_calls
 
     def _require_prep_operands_on_device(
@@ -11997,7 +13146,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         for name in names:
             for attribute in (
                 f"{name}{_WEIGHT_LEAF_SUFFIX}",
-                self._sibling_scale_grid_name(f"{name}{_WEIGHT_LEAF_SUFFIX}"),
+                self.sibling_scale_grid_name(f"{name}{_WEIGHT_LEAF_SUFFIX}"),
             ):
                 operand = getattr(module, attribute, None)
                 if operand is None:
@@ -12355,10 +13504,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         *,
         layer_carriers: Sequence[dict],
-        sampling_positions: torch.Tensor,
+        sampling_positions: torch.Tensor | None,
         block_size: int | None = None,
         moe_group: object | None = None,
         tp_degree: int = 1,
@@ -12371,6 +13520,8 @@ class Glm5NextForConditionalGeneration(nn.Module):
         spec_decode_metadata: "SpecDecodeMetadata | None" = None,
         vision_embedding_blocks: tuple[torch.Tensor, ...] | None = None,
         vision_positions: torch.Tensor | None = None,
+        pair_second: torch.Tensor | None = None,
+        pair_settle_take: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Logits for the rows the caller wants sampled: stack, select, project.
 
@@ -12436,12 +13587,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
         :meth:`Glm5NextModel.forward` gives its own two mapped tensors.
 
         Args:
-            input_ids: ``[T]`` integer token ids.
+            input_ids: ``[T]`` integer token ids; ``None`` on the settle.
             layer_carriers: one mapping per layer, in stack order, forwarded unread to
                 :meth:`Glm5NextModel.forward`, which refuses a count that disagrees
                 with the stack.
             sampling_positions: row indices into the stack output to project, the
-                runner's ``logits_indices``.
+                runner's ``logits_indices``; ``None`` on the settle.
             block_size: tokens per block, forwarded to the expert bank unread.
             moe_group: the MoE ``GroupCoordinator``, forwarded unread.
             tp_degree: ranks sharding each expert's intermediate dimension.
@@ -12481,6 +13632,15 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 rows. ``None`` on every other step.
             vision_positions: the chunk row of every cached row of those blocks,
                 forwarded with them.
+            pair_second: a chunk-pair prefill step (:class:`PrefillPairs`): ``[1]``
+                int32, nonzero on the prefill group that runs the step's second chunk.
+                The carriers are this rank's chunk's plus the pair keys, and the step
+                runs on the pair views. ``None`` on every other step.
+            pair_settle_take: the settle after a prompt's last pair step
+                (:meth:`PrefillPairs.settle`): ``[1]`` int32, nonzero on the group that
+                takes the newest state. The carriers are the settle's, ``input_ids`` and
+                ``sampling_positions`` are not read, and the return is the settle's.
+                ``None`` on every other call.
 
         Shadow draft (``VLLM_NEURON_GLM5NEXT_SHADOW_DRAFT=k``, ``self.mtp`` built):
         ``layer_carriers`` then holds one more mapping than the stack has layers, the
@@ -12524,7 +13684,50 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 requests without ``spec_decode_metadata`` (a verify step that would be
                 drafted from as if each row were a request), or when the metadata's
                 width disagrees with the rows.
+            Glm5NextPrefillPairsError: a pair step or a settle on a root built without
+                the knob, both at once, or beside a key the pair step does not serve.
         """
+        if pair_second is not None or pair_settle_take is not None:
+            pairs = getattr(self, PREFILL_PAIRS_ATTR)
+            unserved = {
+                "collect_layer_streams": collect_layer_streams,
+                "shadow_boundary_ids": shadow_boundary_ids is not None,
+                "draft_k": draft_k is not None,
+                "spec_decode_metadata": spec_decode_metadata is not None,
+                "vision_embedding_blocks": vision_embedding_blocks is not None,
+                "vision_positions": vision_positions is not None,
+                "both pair_second and pair_settle_take": (
+                    pair_second is not None and pair_settle_take is not None
+                ),
+            }
+            if pairs is None or any(unserved.values()):
+                raise Glm5NextPrefillPairsError(
+                    f"a chunk-pair call needs a root loaded under "
+                    f"VLLM_NEURON_GLM5NEXT_PREFILL_PAIRS (loaded: {pairs is not None}) "
+                    f"and takes none of "
+                    f"{[name for name, given in unserved.items() if given]}"
+                )
+            if pair_settle_take is not None:
+                return pairs.settle(layer_carriers, pair_settle_take)
+            logits = pairs.forward(
+                input_ids,
+                layer_carriers=layer_carriers,
+                sampling_positions=sampling_positions,
+                second=pair_second,
+                quant_config=Glm5NextQuantConfig.from_model_config(self.config),
+                block_size=block_size,
+                moe_group=moe_group,
+                tp_degree=tp_degree,
+                expert_parallel_rank=expert_parallel_rank,
+            )
+            if device_sampling_params is None:
+                return logits
+            return sample_full_vocab(
+                logits,
+                device_sampling_params,
+                device_sampling_config(self.text_config),
+                device_logit_mask,
+            )
         head = self._head_weight()
         sampling_config = (
             None

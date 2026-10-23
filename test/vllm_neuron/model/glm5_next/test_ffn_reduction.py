@@ -98,7 +98,7 @@ def _per_regime(regimes: tuple[int, ...]) -> tuple[int, ...]:
 
 def _scale_grid_attribute(leaf: str) -> str:
     """The grid's attribute name, asked of its one definition rather than retyped."""
-    return _impl().Glm5NextForConditionalGeneration._sibling_scale_grid_name(leaf)
+    return _impl().Glm5NextForConditionalGeneration.sibling_scale_grid_name(leaf)
 
 
 def _attach(module, leaf: str, weight: torch.Tensor, grid: torch.Tensor) -> None:

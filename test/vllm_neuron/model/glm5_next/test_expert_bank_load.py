@@ -404,7 +404,7 @@ def test_a_well_formed_bank_gets_a_loader_and_malformed_entries_refuse(tmp_path)
 
     kind = classify_mapped_keys(keys)
     loader = loader_for_mapped_keys(keys, param_name=name, owner=owner)
-    dtype = model._placeholder_dtype(keys, param_name=name, mappings=mappings)
+    dtype = model.placeholder_dtype(keys, param_name=name, mappings=mappings)
     assert kind == MAPPED_KEY_STACKED_BANK, (
         f"a well-formed bank classifies {kind!r}, not {MAPPED_KEY_STACKED_BANK!r}"
     )
@@ -448,7 +448,7 @@ BANKSCALE_LEAVES = ("gate_proj_weight", "up_proj_weight", "down_proj_weight")
 
 def _scale_grid_attribute(leaf: str) -> str:
     """The attribute a weight leaf's scale grid arrives under, asked of the model's own naming rule."""
-    return Glm5NextForConditionalGeneration._sibling_scale_grid_name(leaf)
+    return Glm5NextForConditionalGeneration.sibling_scale_grid_name(leaf)
 
 
 def _alter_one_scale_slice(directory: Path, key: str) -> float:

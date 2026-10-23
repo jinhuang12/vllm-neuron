@@ -753,7 +753,7 @@ def test_the_scale_grids_stay_fp32(
     with monkeypatch.context() as knob_off:
         knob_off.delenv(MTP_KNOB, raising=False)
         control = _dense_model()
-        control._placeholder_dtype = (
+        control.placeholder_dtype = (
             lambda keys, *, param_name, mappings: control.text_config.torch_dtype
         )
         with _captured_cast_lines() as control_lines:

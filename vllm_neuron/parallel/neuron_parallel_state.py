@@ -12,6 +12,13 @@ Why this exists:
         EP group 0 TP: [0,1,2,3]
         EP group 1 TP: [4,5,6,7]
 
+    - Chunk-pair prefill (built only on request, ``prefill_pairs=True``): the
+      world splits into two tensor-parallel groups that each run one chunk of a
+      pair of consecutive prefill chunks, and every rank is joined to one partner
+      in the other group by a 2-rank group. With WS=64:
+        prefill groups: [0..31], [32..63]
+        pair groups:    [0,48], [1,49], ..., [15,63], [16,32], ..., [31,47]
+
     This module is the single entry point for ALL process group initialization on
     Neuron — both vLLM's groups and Neuron-specific groups.
 
@@ -79,6 +86,10 @@ _NEURON_VISION_DP: GroupCoordinator | None = None
 _NEURON_DCP_KV_GROUP: GroupCoordinator | None = None
 # DCP TP group (different heads, same tokens — SP and weight sharding here)
 _NEURON_DCP_TP_GROUP: GroupCoordinator | None = None
+# Chunk-pair prefill group (half of the world: the tensor-parallel group of one chunk)
+_NEURON_PREFILL_GROUP: GroupCoordinator | None = None
+# Chunk-pair partner group (this rank and its partner in the other prefill group)
+_NEURON_PAIR_GROUP: GroupCoordinator | None = None
 
 # Sampling DP groups
 _SAMPLING_ALL2ALL: GroupCoordinator | None = None
@@ -468,6 +479,59 @@ def _build_node_group_ranks(world_size: int, nnodes: int) -> list[list[int]]:
     ]
 
 
+#: Tensor-parallel groups of the chunk-pair prefill layout, one per chunk of a pair.
+PREFILL_PAIR_GROUPS = 2
+
+#: Contiguous rank blocks the partner rule mirrors: block ``b`` pairs with block
+#: ``PAIR_BLOCKS - 1 - b``. Blocks 0 and 1 make up the first prefill group and blocks 2
+#: and 3 the second, so every partner is in the other group.
+PAIR_BLOCKS = 4
+
+
+def _build_prefill_pair_group_ranks(
+    world_size: int,
+) -> tuple[list[list[int]], list[list[int]]]:
+    """Compute the chunk-pair prefill groups and the pair groups that join them.
+
+    The prefill groups are :data:`PREFILL_PAIR_GROUPS` contiguous halves of the world.
+    The pair groups join rank ``r`` to its partner: the world is cut into
+    :data:`PAIR_BLOCKS` contiguous blocks of ``B = world_size / 4`` ranks, and rank
+    ``b * B + o`` pairs with rank ``(3 - b) * B + o``, the same offset in the mirrored
+    block. Every pair holds one rank of each prefill group, and the pairs cover every
+    rank once. Each pair lists its lower rank first: torch orders a group's ranks
+    from low to high, and an all-gather over the group concatenates in that order,
+    so a rank's index in its pair group (0 in the first prefill group, 1 in the
+    second) is also the position of its rows in the gathered tensor.
+
+    At 64 ranks the partner of rank ``r`` is ``r ^ 48``: at LNC2, with rank ``r`` on
+    chip ``r // 4``, chip ``c`` pairs with chip ``c ^ 12``.
+
+    Example: world_size=8
+      prefill groups: [[0,1,2,3], [4,5,6,7]]
+      pair groups:    [[0,6], [1,7], [2,4], [3,5]]
+
+    Raises:
+        ValueError: ``world_size`` does not divide into :data:`PAIR_BLOCKS` blocks.
+    """
+    if world_size <= 0 or world_size % PAIR_BLOCKS != 0:
+        raise ValueError(
+            f"world_size ({world_size}) must be a positive multiple of {PAIR_BLOCKS} "
+            f"for the chunk-pair prefill groups"
+        )
+    group_size = world_size // PREFILL_PAIR_GROUPS
+    prefill_groups = [
+        list(range(g * group_size, (g + 1) * group_size))
+        for g in range(PREFILL_PAIR_GROUPS)
+    ]
+    block = world_size // PAIR_BLOCKS
+    pair_groups = []
+    for rank in range(world_size):
+        mirrored = (PAIR_BLOCKS - 1 - rank // block) * block + rank % block
+        if rank < mirrored:
+            pair_groups.append([rank, mirrored])
+    return prefill_groups, pair_groups
+
+
 # ---------------------------------------------------------------------------
 # Core: create Neuron-specific groups (assumes vLLM state exists)
 # ---------------------------------------------------------------------------
@@ -483,9 +547,11 @@ def _create_neuron_groups(
     vision_tp_size: int = 1,
     vision_dp_size: int = 1,
     nnodes: int = 1,
+    prefill_pairs: bool = False,
 ) -> None:
     """
-    Create Neuron-specific GroupCoordinators (EP, Sampling DP, attention DP, DCP KV).
+    Create Neuron-specific GroupCoordinators (EP, Sampling DP, attention DP, DCP KV,
+    and with ``prefill_pairs`` the chunk-pair prefill and pair groups).
 
     Assumes vLLM's ``_WORLD`` and ``_TP`` are already initialized.
     """
@@ -819,6 +885,47 @@ def _create_neuron_groups(
     else:
         _NEURON_VISION_DP = None
 
+    # --- Chunk-pair prefill groups ---
+    # Created last, and only on request. torch names each process group from a
+    # counter that every group creation advances, and a compiled graph carries the
+    # name of each collective's group (in its compile-cache key and in the
+    # collective's channel id): a new group created ahead of an existing one would
+    # rename the existing one and change every graph that uses it.
+    if prefill_pairs:
+        _create_prefill_pair_groups(world_size, tp_size, local_rank, backend)
+
+
+def _create_prefill_pair_groups(
+    world_size: int, tp_size: int, local_rank: int, backend: str
+) -> None:
+    """Create the chunk-pair prefill groups and the pair groups
+    (:func:`_build_prefill_pair_group_ranks`).
+
+    Raises:
+        ValueError: the tensor-parallel group is not the whole world (the prefill
+            groups split it), or the world does not divide into the pair blocks.
+    """
+    global _NEURON_PREFILL_GROUP, _NEURON_PAIR_GROUP
+
+    if tp_size != world_size:
+        raise ValueError(
+            f"the chunk-pair prefill groups split the tensor-parallel group, which "
+            f"must span the world; tp_size={tp_size}, world_size={world_size}"
+        )
+    prefill_group_ranks, pair_group_ranks = _build_prefill_pair_group_ranks(world_size)
+    _NEURON_PREFILL_GROUP = init_model_parallel_group(
+        prefill_group_ranks, local_rank, backend, group_name="neuron_prefill"
+    )
+    _NEURON_PAIR_GROUP = init_model_parallel_group(
+        pair_group_ranks, local_rank, backend, group_name="neuron_pair"
+    )
+    logger.debug(
+        "Initialized chunk-pair prefill GroupCoordinators: prefill_ranks=%s, "
+        "pair_ranks=%s",
+        _NEURON_PREFILL_GROUP.ranks,
+        _NEURON_PAIR_GROUP.ranks,
+    )
+
 
 def _patch_destroy() -> None:
     """Wrap vLLM's ``destroy_model_parallel`` to also destroy Neuron groups."""
@@ -858,6 +965,8 @@ def _patch_getters() -> None:
     vllm_parallel_state.get_wide_ep_group = get_wide_ep_group
     vllm_parallel_state.get_neuron_dcp_kv_group = get_neuron_dcp_kv_group
     vllm_parallel_state.get_neuron_dcp_tp_group = get_neuron_dcp_tp_group
+    vllm_parallel_state.get_neuron_prefill_group = get_neuron_prefill_group
+    vllm_parallel_state.get_neuron_pair_group = get_neuron_pair_group
     vllm_parallel_state.get_neuron_inter_node_positional_peer_group = (
         get_neuron_inter_node_positional_peer_group
     )
@@ -899,6 +1008,8 @@ def init_neuron_distributed_environment(
     vision_dp_size: int = 1,
     nnodes: int = 1,
     timeout: timedelta | None = None,
+    *,
+    prefill_pairs: bool = False,
 ) -> None:
     """
     Initialize all distributed state for Neuron in one call.
@@ -925,6 +1036,9 @@ def init_neuron_distributed_environment(
         vision_tp_size: Vision TP degree (default 1 means no vision TP).
         vision_dp_size: Vision DP degree (default 1 means no vision DP).
         nnodes: Number of nodes in the deployment.
+        prefill_pairs: Also build the chunk-pair prefill groups and pair groups
+            (``get_neuron_prefill_group``, ``get_neuron_pair_group``). Default False:
+            no group is added, and every other group is built exactly as without it.
     """
     # 1. vLLM distributed init (dist.init_process_group + _WORLD)
     init_distributed_environment(
@@ -956,6 +1070,7 @@ def init_neuron_distributed_environment(
         vision_tp_size,
         vision_dp_size,
         nnodes,
+        prefill_pairs=prefill_pairs,
     )
 
     # 4. Patch vLLM's module with getters and destroy wrapper
@@ -1080,6 +1195,7 @@ def initialize_neuron_parallel_state(
     *,
     tp_global_ranks: list[int] | None = None,
     local_rank: int | None = None,
+    prefill_pairs: bool = False,
 ) -> None:
     """
     Initialize all parallel state (vLLM + Neuron) in one shot.
@@ -1106,6 +1222,8 @@ def initialize_neuron_parallel_state(
         tp_global_ranks: Global ranks forming the TP group for this rank's
             DP replica. When provided, bootstraps vLLM's parallel state.
         local_rank: Local rank on this node.
+        prefill_pairs: Also build the chunk-pair prefill groups and pair groups,
+            as ``init_neuron_distributed_environment`` does.
     """
     if is_initialized():
         logger.warning("Neuron parallel state already initialized, skipping.")
@@ -1136,6 +1254,7 @@ def initialize_neuron_parallel_state(
         vision_tp_size,
         vision_dp_size,
         nnodes,
+        prefill_pairs=prefill_pairs,
     )
     _patch_getters()
     _patch_destroy()
@@ -1167,6 +1286,8 @@ def is_initialized() -> bool:
             _WIDE_EP,
             _NEURON_DCP_KV_GROUP,
             _NEURON_DCP_TP_GROUP,
+            _NEURON_PREFILL_GROUP,
+            _NEURON_PAIR_GROUP,
             _NEURON_INTER_NODE_POSITIONAL_PEER,
             _NEURON_INTRANODE_EP,
             _NEURON_INTERNODE_EP,
@@ -1280,6 +1401,34 @@ def get_neuron_dcp_tp_group() -> GroupCoordinator:
     """
     assert _NEURON_DCP_TP_GROUP is not None, "DCP TP group is not initialized."
     return _NEURON_DCP_TP_GROUP
+
+
+def get_neuron_prefill_group() -> GroupCoordinator:
+    """Return this rank's chunk-pair prefill group.
+
+    The tensor-parallel group of the half of the world that runs this rank's chunk
+    of a pair (size world/2): ranks 0..31 or 32..63 at 64 ranks. A pair step uses it
+    where a one-chunk step uses the TP group. Built only with ``prefill_pairs=True``.
+    """
+    assert _NEURON_PREFILL_GROUP is not None, (
+        "Chunk-pair prefill group is not initialized. "
+        "Call initialize_neuron_parallel_state() with prefill_pairs=True."
+    )
+    return _NEURON_PREFILL_GROUP
+
+
+def get_neuron_pair_group() -> GroupCoordinator:
+    """Return the 2-rank group of this rank and its partner in the other prefill group.
+
+    The lower rank of the pair comes first, so ``rank_in_group`` is 0 in the first
+    prefill group and 1 in the second. At 64 ranks the partner of rank ``r`` is
+    ``r ^ 48``. Built only with ``prefill_pairs=True``.
+    """
+    assert _NEURON_PAIR_GROUP is not None, (
+        "Chunk-pair partner group is not initialized. "
+        "Call initialize_neuron_parallel_state() with prefill_pairs=True."
+    )
+    return _NEURON_PAIR_GROUP
 
 
 def get_neuron_embedding_tp_group() -> GroupCoordinator:
@@ -1470,6 +1619,7 @@ def destroy_neuron_parallel_state() -> None:
     global _NEURON_VISION_TP, _NEURON_VISION_DP
     global _WIDE_EP
     global _NEURON_DCP_KV_GROUP, _NEURON_DCP_TP_GROUP
+    global _NEURON_PREFILL_GROUP, _NEURON_PAIR_GROUP
     global _NEURON_INTER_NODE_POSITIONAL_PEER
     global _NEURON_INTRANODE_EP
     global _NEURON_INTERNODE_EP
@@ -1496,6 +1646,8 @@ def destroy_neuron_parallel_state() -> None:
         _WIDE_EP,
         _NEURON_DCP_KV_GROUP,
         _NEURON_DCP_TP_GROUP,
+        _NEURON_PREFILL_GROUP,
+        _NEURON_PAIR_GROUP,
         _NEURON_INTER_NODE_POSITIONAL_PEER,
         _NEURON_INTRANODE_EP,
         _NEURON_INTERNODE_EP,
@@ -1521,6 +1673,8 @@ def destroy_neuron_parallel_state() -> None:
     _WIDE_EP = None
     _NEURON_DCP_KV_GROUP = None
     _NEURON_DCP_TP_GROUP = None
+    _NEURON_PREFILL_GROUP = None
+    _NEURON_PAIR_GROUP = None
     _NEURON_INTER_NODE_POSITIONAL_PEER = None
     _NEURON_INTRANODE_EP = None
     _NEURON_INTERNODE_EP = None
@@ -1555,6 +1709,8 @@ def destroy_neuron_parallel_state() -> None:
         "get_wide_ep_group",
         "get_neuron_dcp_kv_group",
         "get_neuron_dcp_tp_group",
+        "get_neuron_prefill_group",
+        "get_neuron_pair_group",
         "get_neuron_inter_node_positional_peer_group",
         "get_neuron_intranode_ep_group",
         "get_neuron_internode_ep_group",

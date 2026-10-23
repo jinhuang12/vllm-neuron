@@ -87,7 +87,7 @@ def test_the_kda_state_leaves_take_the_reference_dtype_and_per_rank_extent(
             for candidate in sorted(mappings)
             if candidate.rsplit(".", 1)[-1] == leaf
         )
-        typed[leaf] = model._placeholder_dtype(
+        typed[leaf] = model.placeholder_dtype(
             mappings[name], param_name=name, mappings=mappings
         )
     assert set(typed.values()) == {torch.float32}, (
@@ -101,7 +101,7 @@ def test_the_kda_state_leaves_take_the_reference_dtype_and_per_rank_extent(
         for candidate in sorted(mappings)
         if candidate.endswith(".o_norm_weight")
     )
-    control_dtype = model._placeholder_dtype(
+    control_dtype = model.placeholder_dtype(
         mappings[control_name], param_name=control_name, mappings=mappings
     )
     assert control_dtype is text_config.torch_dtype, (
@@ -129,7 +129,7 @@ def test_the_float32_mix_families_take_the_checkpoint_dtype(
             if name.rsplit(".", 1)[-1] == parameter_leaf
         ]
         assert names, f"no mapped parameter has the leaf {parameter_leaf}"
-        typed[parameter_leaf] = model._placeholder_dtype(
+        typed[parameter_leaf] = model.placeholder_dtype(
             mappings[names[0]], param_name=names[0], mappings=mappings
         )
 
@@ -228,7 +228,7 @@ def test_the_router_projection_still_takes_the_config_dtype(
     control_name = next(
         name for name in sorted(mappings) if name.endswith(".router_weight")
     )
-    control_dtype = model._placeholder_dtype(
+    control_dtype = model.placeholder_dtype(
         mappings[control_name], param_name=control_name, mappings=mappings
     )
     assert control_dtype is real_config.text_config.torch_dtype, (
@@ -256,7 +256,7 @@ def test_without_the_declared_leaves_the_mix_families_narrow_to_the_config_dtype
             for candidate in sorted(mappings)
             if candidate.rsplit(".", 1)[-1] == parameter_leaf
         )
-        narrowed = model._placeholder_dtype(
+        narrowed = model.placeholder_dtype(
             mappings[name], param_name=name, mappings=mappings
         )
         assert narrowed is config_dtype, (

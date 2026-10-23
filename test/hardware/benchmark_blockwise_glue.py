@@ -165,7 +165,7 @@ def build_tree(case: dict, ops: dict, text_config, quant_config, args):
     module = model_fp8.Glm5NextDenseMLP(text_config)
     for leaf, weight in weights.items():
         setattr(module, leaf, torch.nn.Parameter(weight, requires_grad=False))
-        grid_name = model_fp8.Glm5NextForConditionalGeneration._sibling_scale_grid_name(leaf)
+        grid_name = model_fp8.Glm5NextForConditionalGeneration.sibling_scale_grid_name(leaf)
         setattr(module, grid_name, grids[leaf.replace("_weight", "_scale")])
     module.prepare_scale_operands(**weights, **grids)
 

@@ -165,7 +165,7 @@ def _stand_in_root(model, layer, cfg):
     class _Root(torch.nn.Module):
         _run_load_time_preps = root_cls._run_load_time_preps
         _require_prep_operands_on_device = root_cls._require_prep_operands_on_device
-        _sibling_scale_grid_name = staticmethod(root_cls._sibling_scale_grid_name)
+        sibling_scale_grid_name = staticmethod(root_cls.sibling_scale_grid_name)
 
         def __init__(self):
             super().__init__()

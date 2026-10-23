@@ -113,7 +113,7 @@ def _operands() -> dict:
 
 def _scale_grid_attribute(leaf: str) -> str:
     """The grid's attribute name, asked of its one definition rather than retyped."""
-    return _impl().Glm5NextForConditionalGeneration._sibling_scale_grid_name(leaf)
+    return _impl().Glm5NextForConditionalGeneration.sibling_scale_grid_name(leaf)
 
 
 def _dense_module(operands: dict):

@@ -1503,6 +1503,7 @@ class NeuronWorker(WorkerBase):
             vision_tp_size=vision_tp_size,
             vision_dp_size=vision_dp_size,
             nnodes=parallel_config.nnodes,
+            prefill_pairs=envs.VLLM_NEURON_GLM5NEXT_PREFILL_PAIRS,
             timeout=(
                 timedelta(seconds=parallel_config.distributed_timeout_seconds)
                 if parallel_config.distributed_timeout_seconds is not None

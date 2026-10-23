@@ -134,7 +134,7 @@ def _attach_checkpoint_format(module, seed: int) -> dict[str, tuple]:
         raw_bytes, raw_grid = _checkpoint_tensors(rows, cols, seed + index)
         stored = _stored_bytes_through_the_real_loader(raw_bytes)
         weight_name = f"{leaf}_weight"
-        grid_name = _impl().Glm5NextForConditionalGeneration._sibling_scale_grid_name(
+        grid_name = _impl().Glm5NextForConditionalGeneration.sibling_scale_grid_name(
             weight_name
         )
         setattr(module, weight_name, torch.nn.Parameter(stored, requires_grad=False))
