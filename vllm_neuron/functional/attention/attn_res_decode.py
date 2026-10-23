@@ -6,7 +6,8 @@ from each source's RMS-normed dot with the score weight. Before the mix it can f
 the producer's tail into the stream: a bf16 residual add, or the fp32 MoE tail pack
 ``[up | shared | sum of squares]``, whose latent norm scale it applies. It can store
 the new stream as a bank row, and emit this rank's slice of the RMS-normed mix in fp32
-for a K-sharded projection, at its replica's rows of a buffer whose other rows are zero.
+for a K-sharded projection, at its replica's rows of a buffer whose other rows are zero,
+in the output projection's ``[D, rows, N, 1]`` input layout.
 
 The hidden dim lies on the partitions (``h = p * H / 128 + j``). One ones-matmul sums
 the per-partition dots and squares and broadcasts them to every partition, so the
@@ -19,6 +20,7 @@ import nki
 import nki.isa as nisa
 import nki.language as nl
 from nkilib.core.utils.kernel_assert import kernel_assert
+from nkilib.core.utils.kernel_helpers import div_ceil
 
 import torch
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
@@ -77,8 +79,10 @@ def attn_res_decode(
 
     Returns:
         The bf16 mix ``[T, H]``; the new stream (``stream`` itself with no tail);
-        the normed fp32 K slice ``[dp_size * T, H / tp_size]`` with the other
-        replicas' rows zero; and ``bank`` when ``bank_slot`` is set.
+        the normed fp32 K slice ``[D, dp_size * T, N, 1]``, whose element
+        ``(d, row, n)`` is column ``n * D + d`` of the row's ``H / tp_size``
+        columns, with ``N = ceil(H / tp_size / 128)`` and the other replicas'
+        rows zero; and ``bank`` when ``bank_slot`` is set.
     """
     tokens, slots, hidden = bank.shape
     assert bank.dtype == stream.dtype == torch.bfloat16, "bank and stream must be bf16"
@@ -170,7 +174,7 @@ def _attn_res_decode_kernel(bank, stream, score_weight, residual, moe_tail, norm
 
     n_prog = nl.num_programs(axes=0)
     prog = nl.program_id(axis=0)
-    per_core = (T + n_prog - 1) // n_prog
+    per_core = div_ceil(T, n_prog)
     t0 = prog * per_core
     tn = min(per_core, T - t0)
 
@@ -181,7 +185,10 @@ def _attn_res_decode_kernel(bank, stream, score_weight, residual, moe_tail, norm
         outs.append(new_stream)
     if has_norm:
         KW = H // tp_size
-        k_slice = nl.ndarray((dp_size * T, KW), dtype=nl.float32, buffer=nl.shared_hbm)
+        KN = div_ceil(KW, P)
+        KD = KW // KN
+        kernel_assert(KW % KN == 0, f"Expected the K slice width {KW} to split into {KN} equal blocks")
+        k_slice = nl.ndarray((KD, dp_size * T, KN, 1), dtype=nl.float32, buffer=nl.shared_hbm)
         outs.append(k_slice)
     if bank_slot is not None:
         outs.append(bank)
@@ -226,7 +233,7 @@ def _attn_res_decode_kernel(bank, stream, score_weight, residual, moe_tail, norm
 
     # The norm's inputs, ahead of the mix so none of them waits on it: the weight
     # slice and this rank's column offset, and for several replicas one select
-    # mask per replica, true only in this replica's block.
+    # mask per replica, true only in this replica's block, with D on the partitions.
     if has_norm:
         w = nl.ndarray((tn, KW), dtype=norm_weight.dtype, buffer=nl.sbuf)
         col = None
@@ -240,17 +247,17 @@ def _attn_res_decode_kernel(bank, stream, score_weight, residual, moe_tail, norm
             nisa.dma_copy(dst=w, src=norm_weight.ap(pattern=[[0, tn], [1, KW]], offset=0,
                                                     scalar_offset=col, indirect_dim=1), **_DYNAMIC)
         if dp_rank is not None:
-            rep_i = nl.ndarray((tn, 1), dtype=nl.int32, buffer=nl.sbuf)
-            _load(rep_i, dp_rank, [[0, tn], [1, 1]], 0)
-            rep = nl.ndarray((tn, 1), dtype=nl.float32, buffer=nl.sbuf)
+            rep_i = nl.ndarray((KD, 1), dtype=nl.int32, buffer=nl.sbuf)
+            _load(rep_i, dp_rank, [[0, KD], [1, 1]], 0)
+            rep = nl.ndarray((KD, 1), dtype=nl.float32, buffer=nl.sbuf)
             nisa.tensor_copy(dst=rep, src=rep_i, engine=nisa.gpsimd_engine)
             masks = []
             for r in range(dp_size):
-                mask = nl.ndarray((tn, KW), dtype=nl.uint8, buffer=nl.sbuf)
-                nisa.tensor_scalar(dst=mask, data=rep.ap(pattern=[[1, tn], [0, KW]], offset=0),
+                mask = nl.ndarray((KD, tn, KN), dtype=nl.uint8, buffer=nl.sbuf)
+                nisa.tensor_scalar(dst=mask, data=rep.ap(pattern=[[1, KD], [0, tn], [0, KN]], offset=0),
                                    op0=nl.equal, operand0=float(r), engine=nisa.gpsimd_engine)
                 masks.append(mask)
-            k_rows = nl.ndarray((tn, dp_size, KW), dtype=nl.float32, buffer=nl.sbuf)
+            k_rows = nl.ndarray((KD, dp_size, tn, KN), dtype=nl.float32, buffer=nl.sbuf)
             nisa.memset(dst=k_rows, value=0.0, engine=nisa.gpsimd_engine)
 
     # The prologue: the new stream, rounded once to bf16 as the reference's add.
@@ -356,12 +363,22 @@ def _attn_res_decode_kernel(bank, stream, score_weight, residual, moe_tail, norm
     ks = nl.ndarray((tn, KW), dtype=nl.float32, buffer=nl.sbuf)
     nisa.scalar_tensor_tensor(dst=ks, data=kx, op0=nl.multiply, operand0=rnorm,
                               op1=nl.multiply, operand1=w)
+    # D onto the partitions: one Tensor Engine transpose per block of D columns,
+    # bit-exact (non-finite values included), read back in (d, t, n) order.
+    kt = nl.ndarray((KD, KN, tn), dtype=nl.float32, buffer=nl.psum)
+    for n in range(KN):
+        nisa.nc_transpose(dst=kt[0:KD, n, 0:tn], data=ks[0:tn, n * KD:(n + 1) * KD],
+                          engine=nisa.engine.tensor)
+    by_row = kt.ap(pattern=[[KN * tn, KD], [1, tn], [tn, KN]], offset=0)
     if dp_rank is None:
-        _store(k_slice, ks, [[KW, tn], [1, KW]], t0 * KW)
+        kst = nl.ndarray((KD, tn, KN), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=kst, src=by_row)
+        _store(k_slice, kst, [[T * KN, KD], [1, tn * KN]], t0 * KN)
         return tuple(outs)
     # Each replica block is this rank's slice where its mask is true and the zero
     # fill elsewhere: a select, so a non-finite row never reaches another block.
     for r in range(dp_size):
-        nisa.tensor_copy_predicated(dst=k_rows[0:tn, r, 0:KW], src=ks, predicate=masks[r])
-    _store(k_slice, k_rows, [[KW, tn], [T * KW, dp_size], [1, KW]], t0 * KW)
+        nisa.tensor_copy_predicated(dst=k_rows[0:KD, r, 0:tn, 0:KN], src=by_row,
+                                    predicate=masks[r])
+    _store(k_slice, k_rows, [[dp_size * T * KN, KD], [T * KN, dp_size], [1, tn * KN]], t0 * KN)
     return tuple(outs)

@@ -8,7 +8,8 @@ made float64, on the CPU; the MoE tail is ``KimiRMSNorm`` on the latent rows, an
 ``nn.Linear`` up projection and the shared part, from which the test builds the fp32
 pack the kernel reads. The oracle rounds to bf16 only the two values the reference
 stores in bf16 and reads back, the MoE block output and the new stream. Each decoder call site is a variant: its source count, its
-tail, whether it stores a bank row and how many replica rows its K slice has. Every
+tail, whether it stores a bank row and how many replica rows its K slice has. The K
+slice is read in the output projection's input layout ``[D, rows, N, 1]``. Every
 output is graded as its own class B row set; the other replica's K-slice rows must be
 exactly zero. The checkpoint directory comes from ``KIMI_K3_CHECKPOINT_DIR``. With
 ``VLLM_NEURON_CPU_MODE=1`` and ``NKI_SIMULATOR=1`` the kernel runs on the NKI
@@ -19,6 +20,7 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -179,7 +181,17 @@ def _call(ref, site, x, ranks, poison=False):
         out = _compiled(C, tuple(sorted(site.items())))(args, kwargs)
     else:
         out = ard.attn_res_decode(**args, num_sources=C, **kwargs)
-    return [None if o is None else o.cpu() for o in out]
+    out = [None if o is None else o.cpu() for o in out]
+    if out[2] is not None:
+        out[2] = _token_major(out[2], site["replicas"] * DECODE_TOKENS, ref.hidden // TP_RANKS)
+    return out
+
+
+def _token_major(k_slice, rows, width):
+    """The K slice ``[D, rows, N, 1]``, ``N = ceil(width / 128)``, as ``[rows, N * D]`` rows."""
+    blocks = math.ceil(width / 128)
+    assert tuple(k_slice.shape) == (width // blocks, rows, blocks, 1), tuple(k_slice.shape)
+    return k_slice[..., 0].permute(1, 2, 0).reshape(rows, width)
 
 
 _COMPILED = {}
