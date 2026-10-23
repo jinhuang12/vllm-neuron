@@ -3,12 +3,16 @@
 
 One launch takes the all-reduced ``q_a`` and ``kv_a`` rows ``[T, 2112]`` fp32, the output
 gate projection ``[T, H * 128]`` before its sigmoid, and the paged latent cache. It returns
-the gated attention output ``[T, H * 128]`` bf16 for ``o_proj`` and the tokens' latent rows
-``[T, 576]`` bf16 for the cache write. Per token, as the checkpoint's ``KimiMLAAttention``:
-the ``q_a`` and ``kv_a`` RMS norms, ``q_b``, attention with no rotary stage, and the sigmoid
-gate. The query is absorbed into the latent: ``q_lift = [W_UK^T q_nope, q_rope]``, 576 wide
-in bf16, scores the latent rows directly, and ``W_UV`` applies once, in fp32, to the
-softmax-weighted sum of the rows.
+the gated attention output and the tokens' latent rows ``[T, 576]`` bf16 for the cache
+write. Decode writes the output head dimension first, ``[128, T, H, 1]`` bf16, the input
+layout of the output projection; prefill writes it ``[T, H * 128]`` bf16. Per token, as the
+checkpoint's ``KimiMLAAttention``: the ``q_a`` and ``kv_a`` RMS norms, ``q_b``, attention with
+no rotary stage, and the sigmoid gate. The query is absorbed into the latent:
+``q_lift = [W_UK^T q_nope, q_rope]``, 576 wide in bf16, scores the latent rows directly, and
+``W_UV`` applies once, in fp32, to the softmax-weighted sum of the rows. The normed q and
+``q_nope`` enter ``q_b`` and ``W_UK`` as bf16 high and low parts, and the fp32 softmax
+weights enter the weighted sum the same way, so ``q_lift`` is the only bf16 rounding on the
+query side.
 
 Cache pages are token-major ``[blocks, block_size, 576]`` bf16, ``block_size`` a multiple of
 128. PE transposes put the latent on the partitions for the scores; the pages themselves
@@ -47,6 +51,7 @@ _MAX_FLOOR = -1.0e20  # running-max floor: keys filled below it weigh exactly 0
 _FILL = -3.4028234663852886e38  # the fp32 minimum, range_select's only fill value
 _Q_GROUP = 4  # prefill query tiles that share one pass over the keys
 _KEYS_AHEAD = 3  # decode steps between a page's key transposes and its scores
+_DUP = 32  # decode: partition of the low-part copy of each group's query rows
 
 
 def _even(n):
@@ -118,34 +123,63 @@ def _slot(t, head, width, rows, by_token):
     return t[0:width, 0:rows, head] if by_token else t[0:width, head, 0:rows]
 
 
+def _split(src, rows):
+    """bf16 high and low parts of an fp32 tile's ``rows`` rows, each padded to an even row count."""
+    parts = []
+    for _ in range(2):
+        parts.append((_zeros if rows % 2 else _sb)((_even(rows), src.shape[1]), nl.bfloat16))
+    nisa.tensor_copy(dst=parts[0][0:rows, :], src=src[0:rows, :])
+    nisa.tensor_tensor(dst=parts[1][0:rows, :], data1=src[0:rows, :], data2=parts[0][0:rows, :],
+                       op=nl.subtract)
+    return parts
+
+
+def _sum_parts(dst, ps, rows):
+    """``dst = ps[:, :rows] + ps[:, rows:]``: a product's high-part and low-part columns summed."""
+    low = _sb((ps.shape[0], rows), nl.float32)  # one operand of an add may sit in PSUM
+    nisa.tensor_copy(dst=low, src=ps[:, rows:2 * rows])
+    nisa.tensor_tensor(dst=dst, data1=ps[:, 0:rows], data2=low, op=nl.add)
+
+
 def _absorbed_queries(ql, by_token, x, q_gain, wqb, wuk, eps, heads):
-    """``ql[i]``: ``q_lift^T`` of each head on latent tile ``i``, bf16, for the qkv_a rows ``x``."""
+    """``ql[i]``: ``q_lift^T`` of each head on latent tile ``i``, bf16, for the qkv_a rows ``x``.
+
+    The normed q and ``q_nope`` enter their products unrounded, as bf16 high and low parts
+    side by side in the moving operand, so each weight tile loads once; the parts' columns are
+    summed after the product.
+    """
     rows = x.shape[0]
-    qn = _zeros((_even(rows), _Q_LORA), nl.bfloat16)
-    _rms_rows(qn[0:rows, :], x[:, 0:_Q_LORA], q_gain, eps)
-    qnt = _sb((_P, _K_TILES, rows), nl.bfloat16)
-    for k0 in range(0, _K_TILES, 4):
-        tp = _ps((_P, 4, _even(rows)), nl.bfloat16)
-        for k in range(4):
-            nisa.nc_transpose(dst=tp[:, k, :], data=qn[:, (k0 + k) * _P:(k0 + k + 1) * _P])
-        nisa.tensor_copy(dst=qnt[:, k0:k0 + 4, :], src=tp[:, :, 0:rows])
+    n = 2 * rows
+    qn = _sb((rows, _Q_LORA), nl.float32)
+    _rms_rows(qn, x[:, 0:_Q_LORA], q_gain, eps)
+    qnt = _sb((_P, _K_TILES, n), nl.bfloat16)
+    for j, part in enumerate(_split(qn, rows)):
+        for k0 in range(0, _K_TILES, 4):
+            tp = _ps((_P, 4, _even(rows)), nl.bfloat16)
+            for k in range(4):
+                nisa.nc_transpose(dst=tp[:, k, :], data=part[:, (k0 + k) * _P:(k0 + k + 1) * _P])
+            nisa.tensor_copy(dst=qnt[:, k0:k0 + 4, j * rows:(j + 1) * rows], src=tp[:, :, 0:rows])
     for h in range(heads):
         base = h * (_NOPE + _ROPE)
-        qp = _ps((_NOPE, rows), nl.float32)
+        qp = _ps((_NOPE, n), nl.float32)
         for k in range(_K_TILES):
             nisa.nc_matmul(dst=qp, stationary=wqb[:, k, base:base + _NOPE], moving=qnt[:, k, :],
                            accumulate=k > 0)
-        qr = _ps((_ROPE, rows), nl.float32)
+        qr = _ps((_ROPE, n), nl.float32)
         for k in range(_K_TILES):
             nisa.nc_matmul(dst=qr, stationary=wqb[:, k, base + _NOPE:base + _NOPE + _ROPE],
                            moving=qnt[:, k, :], accumulate=k > 0)
-        q_nope = _sb((_NOPE, rows), nl.bfloat16)
-        nisa.tensor_copy(dst=q_nope, src=qp)
-        nisa.tensor_copy(dst=_slot(ql[4], h, _ROPE, rows, by_token), src=qr)
+        _sum_parts(_slot(ql[4], h, _ROPE, rows, by_token), qr, rows)
+        q_nope = _sb((_NOPE, rows), nl.float32)
+        _sum_parts(q_nope, qp, rows)
+        moving = _sb((_NOPE, n), nl.bfloat16)
+        nisa.tensor_copy(dst=moving[:, 0:rows], src=q_nope)
+        nisa.tensor_tensor(dst=moving[:, rows:n], data1=q_nope, data2=moving[:, 0:rows],
+                           op=nl.subtract)
         for i in range(4):
-            lp = _ps((_P, rows), nl.float32)
-            nisa.nc_matmul(dst=lp, stationary=wuk[:, h, i * _P:(i + 1) * _P], moving=q_nope)
-            nisa.tensor_copy(dst=_slot(ql[i], h, _P, rows, by_token), src=lp)
+            lp = _ps((_P, n), nl.float32)
+            nisa.nc_matmul(dst=lp, stationary=wuk[:, h, i * _P:(i + 1) * _P], moving=moving)
+            _sum_parts(_slot(ql[i], h, _P, rows, by_token), lp, rows)
 
 
 def _cache_keys(table_row, length, blocks, pages, window, positions):
@@ -235,28 +269,39 @@ def _scores(g, kind, kt, rows_k, key0, scale, zero):
         nisa.tensor_tensor(dst=m, data1=g["m"], data2=top, op=nl.maximum)
     neg = _sb((r, 1), nl.float32)
     nisa.tensor_scalar(dst=neg, data=m, op0=nl.multiply, operand0=-scale)
-    p = _sb((r, cols), nl.bfloat16)
+    p = _sb((r, cols), nl.float32)
     total = _sb((r, 1), nl.float32)
     nisa.activation(dst=p, op=nl.exp, data=s_sb, bias=neg, scale=scale, reduce_op=nl.add,
                     reduce_res=total, reduce_cmd=nisa.reduce_cmd.reset_reduce)
+    if g["split"] == "rows":
+        # Rows from _DUP repeat the group's queries: they carry the low part in the same tile.
+        hi = _sb((r, cols), nl.bfloat16)
+        nisa.tensor_copy(dst=hi, src=p)
+        nisa.tensor_tensor(dst=hi[_DUP:r, :], data1=p[_DUP:r, :], data2=hi[_DUP:r, :],
+                           op=nl.subtract)
+        parts = [hi]
+    else:
+        parts = _split(p, r)
     corr = None
     if g["m"] is not None:
         corr = _sb((r, 1), nl.float32)
         nisa.activation(dst=corr, op=nl.exp, data=g["m"], bias=neg, scale=scale)
     g["m"] = m
-    return {"g": g, "rows_k": rows_k[0:n_t], "p": p, "total": total, "corr": corr}
+    return {"g": g, "rows_k": rows_k[0:n_t], "parts": parts, "total": total, "corr": corr}
 
 
 def _weights_t(sc):
-    """``p^T`` by key tile, ``[128, n_t, rows]`` bf16, the stationary of the weighted sum."""
+    """``p^T`` of each bf16 part by key tile, ``[128, n_t, rows]``, the stationaries of the sum."""
     rows_k, r = sc["rows_k"], sc["g"]["rows"]
-    pt_ps = _ps((_P, len(rows_k), r), nl.bfloat16)
-    for t, k in enumerate(rows_k):
-        nisa.nc_transpose(dst=pt_ps[0:k, t, :], data=sc["p"][:, t * _P:t * _P + k])
-    pt = _sb((_P, len(rows_k), r), nl.bfloat16)
-    for t, k in enumerate(rows_k):
-        nisa.tensor_copy(dst=pt[0:k, t, :], src=pt_ps[0:k, t, :], engine=nisa.engine.scalar)
-    sc["pt"] = pt
+    sc["pt"] = []
+    for part in sc["parts"]:
+        pt_ps = _ps((_P, len(rows_k), r), nl.bfloat16)
+        for t, k in enumerate(rows_k):
+            nisa.nc_transpose(dst=pt_ps[0:k, t, :], data=part[0:r, t * _P:t * _P + k])
+        pt = _sb((_P, len(rows_k), r), nl.bfloat16)
+        for t, k in enumerate(rows_k):
+            nisa.tensor_copy(dst=pt[0:k, t, :], src=pt_ps[0:k, t, :], engine=nisa.engine.scalar)
+        sc["pt"].append(pt)
 
 
 def _accumulate(sc, tiles):
@@ -264,8 +309,9 @@ def _accumulate(sc, tiles):
     g, rows_k = sc["g"], sc["rows_k"]
     o_ps = _ps((g["rows"], _KV_LORA), nl.float32)
     for t, k in enumerate(rows_k):
-        nisa.nc_matmul(dst=o_ps, stationary=sc["pt"][0:k, t, :], moving=tiles[t][:, 0:_KV_LORA],
-                       accumulate=t > 0)
+        for j, pt in enumerate(sc["pt"]):
+            nisa.nc_matmul(dst=o_ps, stationary=pt[0:k, t, :], moving=tiles[t][:, 0:_KV_LORA],
+                           accumulate=t > 0 or j > 0)
     acc = _sb((g["rows"], _KV_LORA), nl.float32)
     if sc["corr"] is None:
         nisa.tensor_copy(dst=acc, src=o_ps)
@@ -364,6 +410,27 @@ def _gated_output(dst, o_t, wuv, sig, heads):
                            data2=sig[:, h * _V:(h + 1) * _V], op=nl.multiply)
 
 
+def _gated_output_t(dst, o_t, wuv, sig_t, heads):
+    """``dst[d, row, head] = (o @ W_UV^T)[row, d] * sigmoid(gate)``: the head dimension first."""
+    for h in range(heads):
+        op = _ps((_V, dst.shape[1]), nl.float32)
+        for t in range(_V_TILES):
+            nisa.nc_matmul(dst=op, stationary=wuv[:, t, h, :], moving=o_t[:, t, h, :],
+                           accumulate=t > 0)
+        nisa.tensor_tensor(dst=dst[:, :, h], data1=op, data2=sig_t[:, :, h], op=nl.multiply)
+
+
+def _gate_t(gate, row0, rows, heads):
+    """``sigmoid(gate)`` of ``rows`` rows from ``row0`` as ``[128 d, rows, heads]`` fp32."""
+    sig = _gate(gate, row0, rows, heads * _V)
+    sig_t = _sb((_V, rows, heads), nl.float32)
+    for h in range(heads):
+        tp = _ps((_V, rows), nl.float32)
+        nisa.nc_transpose(dst=tp, data=sig[:, h * _V:(h + 1) * _V])
+        nisa.tensor_copy(dst=sig_t[:, :, h], src=tp)
+    return sig_t
+
+
 def _gate(gate, row0, rows, width):
     """``sigmoid(gate)`` of ``rows`` rows from ``row0``, fp32."""
     g = _sb((rows, width), nl.float32)
@@ -400,8 +467,8 @@ def _check_common(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, cache):
 
 
 def mla_paged_decode_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, cache,
-                            block_table, context_lens, EPS: float = 1e-5):
-    """One decode step of ``T`` sequences: ``(out [T, H * 128] bf16, latent [T, 576] bf16)``.
+                            block_table, context_lens, EPS: float):
+    """One decode step of ``T`` sequences: ``(out [128, T, H, 1] bf16, latent [T, 576] bf16)``.
 
     Args:
         qkv_a: ``[T, 2112]`` fp32, each sequence's new token: ``q_a`` then ``kv_a``.
@@ -435,7 +502,7 @@ def mla_paged_decode_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, 
     prg = nl.program_id(0)
     kernel_assert(programs in (1, 2), "one or two programs")
     scale = float((_NOPE + _ROPE) ** -0.5)
-    out = nl.ndarray((tokens, width), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+    out = nl.ndarray((_V, tokens, heads, 1), dtype=nl.bfloat16, buffer=nl.shared_hbm)
     lat_out = nl.ndarray((tokens, _LATENT), dtype=nl.bfloat16, buffer=nl.shared_hbm)
 
     # A lone sequence splits its key blocks; otherwise each program takes whole sequences.
@@ -456,8 +523,9 @@ def mla_paged_decode_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, 
     nisa.dma_copy(dst=x, src=qkv_a[first:first + count, :])
     lat = _sb((count, _LATENT), nl.bfloat16)
     _latent_rows(lat, x, _gain(kv_norm, count), EPS)
-    # An even count of query rows per step; the pad head's zero query weighs nothing.
-    ql = [_zeros((_P, count, _even(heads)), nl.bfloat16) for _ in _C_TILES]
+    # Query rows 0.. and _DUP.. hold each head's query; the zero rows between weigh nothing.
+    rows_q = _DUP + _even(heads)
+    ql = [_zeros((_P, count, rows_q), nl.bfloat16) for _ in _C_TILES]
     q_gain = _gain(q_norm, count)
 
     positions = _sb((_P, n_tiles), nl.float32)
@@ -473,7 +541,7 @@ def mla_paged_decode_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, 
             block_table.ap(pattern=[[pages, 1], [1, pages]], offset=seq * pages),
             context_lens.ap(pattern=[[0, _P], [1, 1]], offset=seq),
             blocks, pages, window, positions)
-        group = {"rows": _even(heads),
+        group = {"rows": rows_q, "split": "rows",
                  "ql": [ql[i][0:w, s, :] for i, (_, w) in enumerate(_C_TILES)],
                  "cache": bound, "own": one, "own_tiles": lambda k: 1,
                  "m": None, "l": None, "acc": None}
@@ -498,39 +566,48 @@ def mla_paged_decode_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, 
     if own:
         steps += [(group, "own", 0, own_step(s)) for s, (group, _, _) in enumerate(seqs)]
     # The query chain is emitted after the first pages' loads and transposes, which do not need it.
-    _pipelined(steps, scale, zero,
-               lambda: _absorbed_queries(ql, True, x, q_gain, wqb, wuk, EPS, heads))
+    def queries():
+        _absorbed_queries(ql, True, x, q_gain, wqb, wuk, EPS, heads)
+        for i, (_, w) in enumerate(_C_TILES):
+            nisa.tensor_copy(dst=ql[i][0:w, :, _DUP:_DUP + heads], src=ql[i][0:w, :, 0:heads])
+
+    _pipelined(steps, scale, zero, queries)
 
     states = [(g["m"], g["l"], g["acc"]) for g, _, _ in seqs]
     if split:
         m, l, acc = states[0]
-        mine = _sb((heads, _KV_LORA + 8), nl.float32)
-        nisa.tensor_copy(dst=mine[:, 0:_KV_LORA], src=acc[0:heads, :])
-        nisa.tensor_copy(dst=mine[:, _KV_LORA:_KV_LORA + 1], src=m[0:heads, :])
-        nisa.tensor_copy(dst=mine[:, _KV_LORA + 1:_KV_LORA + 2], src=l[0:heads, :])
-        theirs = _sb((heads, _KV_LORA + 8), nl.float32)
+        mine = _sb((rows_q, _KV_LORA + 8), nl.float32)
+        nisa.tensor_copy(dst=mine[:, 0:_KV_LORA], src=acc[0:rows_q, :])
+        nisa.tensor_copy(dst=mine[:, _KV_LORA:_KV_LORA + 1], src=m[0:rows_q, :])
+        nisa.tensor_copy(dst=mine[:, _KV_LORA + 1:_KV_LORA + 2], src=l[0:rows_q, :])
+        theirs = _sb((rows_q, _KV_LORA + 8), nl.float32)
         nisa.sendrecv(src=mine, dst=theirs, send_to_rank=1 - prg, recv_from_rank=1 - prg,
                       pipe_id=0)
         a, b = (mine, theirs) if prg == 0 else (theirs, mine)
         states = [_merge((a[:, _KV_LORA:_KV_LORA + 1], a[:, _KV_LORA + 1:_KV_LORA + 2],
                           a[:, 0:_KV_LORA]),
                          (b[:, _KV_LORA:_KV_LORA + 1], b[:, _KV_LORA + 1:_KV_LORA + 2],
-                          b[:, 0:_KV_LORA]), scale, heads)]
+                          b[:, 0:_KV_LORA]), scale, rows_q)]
     if split and prg != 0:
         return out, lat_out
 
     o_t = _sb((_P, _V_TILES, heads, count), nl.float32)
     for s, (_, l, acc) in enumerate(states):
-        _transpose_into(o_t[:, :, :, s], _normalized(l, acc, heads), heads)
-    res = _sb((count, width), nl.bfloat16)
-    _gated_output(res, o_t, wuv, _gate(gate, first, count, width), heads)
-    nisa.dma_copy(dst=out[first:first + count, :], src=res)
+        both = _sb((_P, _V_TILES, rows_q), nl.float32)
+        _transpose_into(both, _normalized(l, acc, rows_q), rows_q)
+        # The high and low parts' sums, on partitions 0.. and _DUP.., meet in the free dimension.
+        nisa.tensor_tensor(dst=o_t[:, :, :, s], data1=both[:, :, 0:heads],
+                           data2=both[:, :, _DUP:_DUP + heads], op=nl.add)
+    res = _sb((_V, count, heads), nl.bfloat16)
+    _gated_output_t(res, o_t, wuv, _gate_t(gate, first, count, heads), heads)
+    nisa.dma_copy(dst=out.ap(pattern=[[tokens * heads, _V], [heads, count], [1, heads]],
+                             offset=first * heads), src=res)
     nisa.dma_copy(dst=lat_out[first:first + count, :], src=lat)
     return out, lat_out
 
 
 def mla_paged_prefill_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, cache,
-                             block_table, prefix_len, EPS: float = 1e-5):
+                             block_table, prefix_len, EPS: float):
     """One prefill chunk of one sequence: ``(out [T, H * 128] bf16, latent [T, 576] bf16)``.
 
     Args:
@@ -609,7 +686,7 @@ def mla_paged_prefill_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t,
             nisa.iota(dst=causal, pattern=[[0, 1]], offset=i * _P + 1, channel_multiplier=1)
             for h in range(heads):
                 groups.append({
-                    "rows": _even(rows), "tile": i, "head": h,
+                    "rows": _even(rows), "tile": i, "head": h, "split": "passes",
                     "ql": [ql[c][0:w, h, :] for c, (_, w) in enumerate(_C_TILES)],
                     "cache": bound, "own": causal,
                     "own_tiles": (lambda k, i=i: min(tiles_per_block, i + 1 - k // _P)),
@@ -676,7 +753,7 @@ def mla_paged_decode(qkv_a: torch.Tensor, gate: torch.Tensor, q_norm_weight: tor
                      kv_norm_weight: torch.Tensor, w_qb_t: torch.Tensor, w_uk: torch.Tensor,
                      w_uv_t: torch.Tensor, kv_cache: torch.Tensor, block_table: torch.Tensor,
                      context_lens: torch.Tensor, eps: float):
-    """Paged MLA decode step on the NKI kernel: ``(out [T, H * 128] bf16, latent [T, 576] bf16)``.
+    """Paged MLA decode step on the NKI kernel: ``(out [128, T, H, 1] bf16, latent [T, 576] bf16)``.
 
     Args:
         qkv_a: ``[T, 2112]`` fp32 all-reduced ``q_a`` and ``kv_a`` of each sequence's new token.

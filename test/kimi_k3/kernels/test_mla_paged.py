@@ -10,6 +10,9 @@ those rows as the cache holds them and the new positions unrounded. Pass rule, p
 row against the oracle: every element within 2^-7 of its value plus 2^-7 of the row RMS,
 and row cosine at least 0.9999.
 
+The decode output arrives head dimension first, ``[128, T, H, 1]``, the output projection's
+input layout; the checks read it back token-major.
+
 On a Neuron device the wrappers run under ``torch.compile`` on core 0 of
 ``NEURON_RT_VISIBLE_CORES``; the runtime needs ``NEURON_RT_ROOT_COMM_ID`` set to load the
 program. With ``VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1`` they run in the NKI simulator.
@@ -129,8 +132,10 @@ def _decode(weights, rows, gate, block_size, pages, gen):
     cache, table = _paged_cache([_latent(r[:-1], kv_norm) for r in rows], block_size, pages, gen)
     lens = torch.tensor([r.shape[0] - 1 for r in rows], dtype=torch.int32)
     new = torch.stack([r[-1] for r in rows]).float()
-    return _run(mla_paged_decode, new, gate, q_norm, kv_norm, *prepare_mla_weights(q_b, kv_b),
-                cache, table, lens, EPS)
+    out, latent = _run(mla_paged_decode, new, gate, q_norm, kv_norm,
+                       *prepare_mla_weights(q_b, kv_b), cache, table, lens, EPS)
+    assert tuple(out.shape) == (V_DIM, len(rows), HEADS, 1) and out.dtype == torch.bfloat16
+    return out[..., 0].permute(1, 2, 0).reshape(len(rows), HEADS * V_DIM), latent
 
 
 def _prefill(weights, rows, gate, queries, block_size, pages, gen):
@@ -186,8 +191,8 @@ def test_correlated_inputs():
     rows = [_correlated(gen, n + 1) for n in lens]
     gate = torch.randn(len(lens), HEADS * V_DIM, generator=gen).bfloat16()
     _check_decode(weights, rows, gate, 256, 6, gen)
-    gate = torch.randn(300, HEADS * V_DIM, generator=gen).bfloat16()
-    _check_prefill(weights, _correlated(gen, 700 + 300), gate, 300, 256, 4, gen)
+    gate = torch.randn(700, HEADS * V_DIM, generator=gen).bfloat16()
+    _check_prefill(weights, _correlated(gen, 700 + 700), gate, 700, 256, 4, gen)
 
 
 def test_repeated_tokens():
