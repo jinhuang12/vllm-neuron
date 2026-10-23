@@ -24,6 +24,7 @@ from vllm.distributed.parallel_state import get_tp_group, model_parallel_is_init
 from vllm_neuron.functional.attention.attn_res_prefill import attn_res_prefill
 from vllm_neuron.functional.embedding import embedding
 from vllm_neuron.functional.kda.output import kda_output_prefill
+from vllm_neuron.functional.moe.fused_tail import moe_fused_tail
 from vllm_neuron.model.neuron_config import NeuronConfig
 from vllm_neuron.nn.cpl import ColumnParallelLinear
 from vllm_neuron.nn.sampler import Sampler
@@ -57,7 +58,6 @@ depthwise_conv1d_silu = _optional_kernel("kda.depthwise_conv1d", "depthwise_conv
 mla_paged_attention = _optional_kernel("attention.mla_paged", "mla_paged_attention")
 routed_experts_mx = _optional_kernel("moe.routed_experts_mx", "routed_experts_mx")
 router_select = _optional_kernel("moe.routed_experts_mx", "router_select")
-moe_fused_tail = _optional_kernel("moe.fused_tail", "moe_fused_tail")
 
 
 def _require(kernel, op: str):
@@ -362,13 +362,21 @@ class KimiK3MoE(nn.Module):
         self.routed_expert_norm = KimiK3RMSNorm(latent, c.rms_norm_eps, dtype)
         self.register_buffer("down_router_weight", None, persistent=False)
         self.register_buffer("latent_norm_weight", None, persistent=False)
+        self.register_buffer("latent_up_weight", None, persistent=False)
+        self.register_buffer("shared_down_weight", None, persistent=False)
 
     def prepare_after_load(self) -> None:
-        """Stack latent down over the router in fp32; keep the latent norm as fp32 ``[D, 1]``."""
+        """Stack latent down over the router in fp32, and lay out the decode tail's weights.
+
+        The tail takes the latent norm as fp32 ``[D, 1]`` and the latent up and shared
+        down weights as contiguous ``[K, H]``, so each copy is made here once.
+        """
         self.down_router_weight = torch.cat(
             [self.routed_expert_down_proj.weight, self.gate.weight]
         ).float()
         self.latent_norm_weight = self.routed_expert_norm.weight.float().reshape(-1, 1)
+        self.latent_up_weight = self.routed_expert_up_proj.weight.t().contiguous()
+        self.shared_down_weight = self.shared_experts.down_proj.weight.t().contiguous()
 
     def _select_and_run(self, latent, logits, ids=None, weights=None) -> torch.Tensor:
         """Routed experts on the latent rows: fp32 ``[T, D]`` combined output."""
@@ -406,13 +414,17 @@ class KimiK3MoE(nn.Module):
         combined = self._select_and_run(latent, logits)
         shared = self.shared_experts
         weights = [shared.gate_proj.weight, shared.up_proj.weight]
-        gate_up = _project(mix, weights, norm_weight, self.eps)
-        return _require(moe_fused_tail, "MoE tail")(
+        return self.tail_decode(combined, _project(mix, weights, norm_weight, self.eps))
+
+    def tail_decode(self, combined, gate_up) -> torch.Tensor:
+        """The fused tail of fp32 ``[T, K]`` combined rows: the fp32 pack ``[T, 2H + 1]``."""
+        shared = self.shared_experts
+        return moe_fused_tail(
             combined,
             gate_up,
-            shared.down_proj.weight,
-            self.routed_expert_up_proj.weight,
             self.latent_norm_weight,
+            self.latent_up_weight,
+            self.shared_down_weight,
             beta=shared.beta,
             linear_beta=shared.linear_beta,
         )
