@@ -1,24 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""KDA prefill recurrence through the nkilib chunked delta-rule kernel.
+"""KDA prefill recurrence through its NKI kernel.
 
-The kernel takes the raw projections and applies the q and k L2 norms, the
-query scale, the beta sigmoid and the bounded gate
-``lower_bound * sigmoid(exp(a_log) * (g + dt_bias))`` itself. Tensors are
-head-major fp32, and the recurrent state is key-major ``[H, K, V]``: the
-transpose of the ``[H, V, K]`` layout that upstream vLLM stores.
+q, k and v come as the short conv stores them, bf16 channel-major ``[H * K, T]``.
+The kernel applies the q and k L2 norms, the query scale, the beta sigmoid and
+the bounded gate ``lower_bound * sigmoid(exp(a_log) * (g + dt_bias))`` itself.
+The recurrent state is fp32 key-major ``[H, K, V]``: the transpose of the
+``[H, V, K]`` layout that upstream vLLM stores.
 """
 
 from typing import Optional, Tuple
 
 import torch
-
-from nkilib.experimental.kimi_k3.kda.kda_prefill_nki import (
-    CHUNK,
-    SUB_CHUNK,
-    kda_prefill as _kda_prefill_kernel,
-)
-
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+
+from vllm_neuron.functional.kda.prefill_kernel import CHUNK, SUB_CHUNK, kda_prefill_kernel
 from vllm_neuron.utils.hardware_config import get_logical_nc_config
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
@@ -32,6 +27,7 @@ def kda_prefill(
     a_log: torch.Tensor,
     dt_bias: torch.Tensor,
     state: Optional[torch.Tensor] = None,
+    valid: Optional[torch.Tensor] = None,
     *,
     lower_bound: float,
     scale: Optional[float] = None,
@@ -39,34 +35,35 @@ def kda_prefill(
     """Run the KDA recurrence over one sequence and return its output and final state.
 
     Args:
-        q, k, g: ``[H, T, K]`` raw query, key and gate projections.
-        v: ``[H, T, V]`` values.
+        q, k, v: ``[H * K, T]`` bf16 channel-major query, key and value, head by head.
+        g: ``[H, T, K]`` raw gate projection.
         beta: ``[H, T]`` or ``[H, T, 1]`` beta logits.
         a_log: ``[H]`` or ``[H, 1]`` log gate scale.
         dt_bias: ``[H, K]`` gate bias.
-        state: ``[H, K, V]`` fp32 state carried from the previous chunk of the
-            same sequence, or None for a fresh sequence. A fresh sequence
-            starts from a zero-filled state, never from a reused buffer scaled
-            by zero, so a stale NaN cannot leak into it.
+        state: ``[H, K, K]`` fp32 state carried from the previous chunk of the
+            same sequence, or None for a fresh sequence, which starts from a
+            zero-filled state.
+        valid: ``[T]`` bool, False for a padding token, or None when every token
+            is real. A padding token adds nothing to the state and its output row
+            is 0. A token with a non-finite q, k, v, g or beta adds nothing to
+            the state either, but the output rows from it to the end of the
+            sequence, and the final state, are NaN.
         lower_bound: gate lower bound, in ``[-5, 0]``.
         scale: query scale; defaults to ``K ** -0.5``.
 
     Returns:
-        ``(out, final_state)``: ``[H, T, V]`` fp32 and ``[H, K, V]`` fp32. On
+        ``(out, final_state)``: ``[H, T, K]`` fp32 and ``[H, K, K]`` fp32. On
         the device the kernel writes the final state into ``state`` in place.
+        A ``T`` that is not a multiple of 128 is padded up with padding tokens.
     """
-    num_heads, num_tokens, head_k = q.shape
-    head_v = v.shape[-1]
-    assert k.shape == g.shape == q.shape, (
-        f"q {tuple(q.shape)}, k {tuple(k.shape)} and g {tuple(g.shape)} must match"
-    )
-    assert v.shape[:2] == (num_heads, num_tokens), (
-        f"v {tuple(v.shape)} must be [{num_heads}, {num_tokens}, V]"
-    )
-    assert num_tokens >= CHUNK and num_tokens % CHUNK == 0, (
-        f"T must be a positive multiple of {CHUNK}, got {num_tokens}"
-    )
-    assert head_k <= 128 and head_v <= 128, f"K {head_k} and V {head_v} must be <= 128"
+    num_heads, num_tokens, head_dim = g.shape
+    channels = num_heads * head_dim
+    for name, x in (("q", q), ("k", k), ("v", v)):
+        assert x.shape == (channels, num_tokens) and x.dtype == torch.bfloat16, (
+            f"{name} must be bf16 [{channels}, {num_tokens}], got {x.dtype} {tuple(x.shape)}"
+        )
+    assert num_tokens >= 1, "the sequence has no token"
+    assert head_dim <= 128, f"head dim {head_dim} must be <= 128"
     assert -5.0 <= lower_bound <= 0.0, f"lower_bound {lower_bound} must be in [-5, 0]"
     if not can_run_kernel(q):
         raise RuntimeError(
@@ -77,35 +74,43 @@ def kda_prefill(
     device = q.device
     fp32 = torch.float32
     if state is None:
-        state = torch.zeros(num_heads, head_k, head_v, dtype=fp32, device=device)
-    assert state.shape == (num_heads, head_k, head_v) and state.dtype == fp32, (
-        f"state must be fp32 [{num_heads}, {head_k}, {head_v}], got "
+        state = torch.zeros(num_heads, head_dim, head_dim, dtype=fp32, device=device)
+    assert state.shape == (num_heads, head_dim, head_dim) and state.dtype == fp32, (
+        f"state must be fp32 [{num_heads}, {head_dim}, {head_dim}], got "
         f"{state.dtype} {tuple(state.shape)}"
     )
+    valid = torch.ones(num_tokens, dtype=fp32, device=device) if valid is None else valid.to(fp32)
+    g = g.to(fp32)
+    beta = beta.reshape(num_heads, num_tokens).to(fp32)
+    extra = -num_tokens % CHUNK
+    if extra:
+        # Zero tokens marked padding: the kernel gives them gate 0, so they leave the state as it is.
+        q, k, v = (torch.nn.functional.pad(x, (0, extra)) for x in (q, k, v))
+        g = torch.nn.functional.pad(g, (0, 0, 0, extra))
+        beta, valid = torch.nn.functional.pad(beta, (0, extra)), torch.nn.functional.pad(valid, (0, extra))
+    padded = num_tokens + extra
     strict, inclusive, eye = _block_masks(device)
-    out = torch.empty(num_heads, num_tokens, head_v, dtype=fp32, device=device)
-    out, final_state = wrap_nki(_kda_prefill_kernel)[get_logical_nc_config()](
-        q_ref=q.to(fp32),
-        k_ref=k.to(fp32),
-        v_ref=v.to(fp32),
-        g_ref=g.to(fp32),
-        beta_ref=beta.reshape(num_heads, num_tokens, 1).to(fp32),
+    out = torch.empty(num_heads, padded, head_dim, dtype=fp32, device=device)
+    out, final_state = wrap_nki(kda_prefill_kernel)[get_logical_nc_config()](
+        q_ref=q,
+        k_ref=k,
+        v_ref=v,
+        g_ref=g,
+        beta_ref=beta.reshape(num_heads, padded, 1),
         a_log_ref=a_log.reshape(num_heads, 1).to(fp32),
         dt_bias_ref=dt_bias.to(fp32),
-        blockdiag_ref=strict,
-        blockdiag_incl_ref=inclusive,
+        valid_ref=valid.reshape(padded, 1),
+        strict_ref=strict,
+        incl_ref=inclusive,
         eye_ref=eye,
         out=out,
         state_ref=state,
-        # The seed always enters at scale 1: a zero scale would multiply a
-        # possibly non-finite buffer instead of starting from a filled one.
-        seed_scale_ref=torch.ones(1, 1, dtype=fp32, device=device),
         scale_ref=torch.full(
-            (1, 1), head_k**-0.5 if scale is None else scale, dtype=fp32, device=device
+            (1, 1), head_dim**-0.5 if scale is None else scale, dtype=fp32, device=device
         ),
         lower_bound_ref=torch.full((1, 1), lower_bound, dtype=fp32, device=device),
     )
-    return out, final_state
+    return out[:, :num_tokens], final_state
 
 
 def _block_masks(device: torch.device) -> Tuple[torch.Tensor, ...]:
