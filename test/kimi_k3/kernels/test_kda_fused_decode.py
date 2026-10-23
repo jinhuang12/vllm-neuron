@@ -7,7 +7,11 @@ the recurrent mode) with the three heads of one TP-32 rank. One-hot projections 
 the kernel's input columns through, and an identity ``o_proj`` returns the gated norm.
 The module's library calls (short convolution, gated delta rule, gated RMSNorm) are
 written out below in float64 from their upstream definitions. The small weights are
-layer 1, heads 0 to 2, of the checkpoint named by ``KIMI_K3_CHECKPOINT_DIR``.
+layer 1, heads 0 to 2, of the checkpoint.
+
+The test needs ``KIMI_K3_CHECKPOINT_DIR``: a Kimi K3 checkpoint directory with its
+``config.json``, ``modeling_kimi_linear.py``, ``model.safetensors.index.json`` and the
+one shard that holds layer 1's attention weights. Without it the test skips.
 
 With ``VLLM_NEURON_CPU_MODE=1`` and ``NKI_SIMULATOR=1`` the kernel runs on the NKI
 simulator; otherwise on ``neuron:0``.
