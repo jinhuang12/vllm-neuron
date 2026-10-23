@@ -42,6 +42,7 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MambaSpec,
     MLAAttentionSpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
@@ -11145,6 +11146,23 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     )
                     self._kv_cache_full_tensors[layer_name] = typed_tensor
 
+            # A state page holds the layer's states back to back (e.g. conv rows, then
+            # the recurrent state). Each state is a view whose block stride is the
+            # page, as in vLLM's MambaBase.bind_kv_cache.
+            elif isinstance(kv_cache_spec, MambaSpec):
+                page = kv_cache_spec.page_size_bytes
+                for layer_name in group.layer_names:
+                    raw_tensor = kv_cache_raw_tensors[layer_name]
+                    assert raw_tensor.numel() % page == 0
+                    pages = raw_tensor.view(-1, page)
+                    states, offset = [], 0
+                    for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
+                        nbytes = math.prod(shape) * dtype.itemsize
+                        state = pages[:, offset : offset + nbytes].view(dtype)
+                        states.append(state.view(-1, *shape))
+                        offset += nbytes
+                    kv_caches[layer_name] = states
+
             else:
                 raise NotImplementedError(
                     f"Unsupported Attention spec type: {type(kv_cache_spec)}"
@@ -11202,7 +11220,20 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # Use SlidingWindowSpec for SWA layers so HMA can create separate
             # KV cache groups. When --no-disable-hybrid-kv-cache-manager is set,
             # this enables block clipping in the NiXL connector.
-            if layer.key_only:
+            if layer.state_shapes is not None:
+                # A fixed-size state per sequence. The platform's hybrid alignment has
+                # set the state block size and padded the state page to the
+                # attention page, so all groups share one page size.
+                cache_config = self.vllm_config.cache_config
+                spec = MambaSpec(
+                    block_size=cache_config.mamba_block_size,
+                    shapes=layer.state_shapes,
+                    dtypes=layer.state_dtypes,
+                    page_size_padded=cache_config.mamba_page_size_padded,
+                    mamba_cache_mode=cache_config.mamba_cache_mode,
+                    num_speculative_blocks=self.vllm_config.num_speculative_tokens,
+                )
+            elif layer.key_only:
                 # Budgets ONE vector per token instead of FullAttentionSpec's 2x
                 # for a K/V pair, and keeps caches of different widths (e.g. MLA
                 # 576 vs indexer 128) in separate groups. See KeyOnlyAttentionSpec.

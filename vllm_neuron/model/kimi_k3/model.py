@@ -25,6 +25,7 @@ from vllm_neuron.functional.attention.attn_res_prefill import attn_res_prefill
 from vllm_neuron.functional.embedding import embedding
 from vllm_neuron.functional.kda.output import kda_output_prefill
 from vllm_neuron.functional.moe.fused_tail import moe_fused_tail
+from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.model.neuron_config import NeuronConfig
 from vllm_neuron.nn.cpl import ColumnParallelLinear
 from vllm_neuron.nn.sampler import Sampler
@@ -167,7 +168,8 @@ class KimiK3KDA(nn.Module):
         self.o_norm = _Weight((self.head_dim,), torch.float32)
         self.o_proj = _Weight((hidden, width), dtype)
         self.register_buffer("conv_weight", None, persistent=False)
-        # Per-sequence conv and recurrent state banks, bound with the KV caches.
+        # Per-sequence conv [slots, taps - 1, 3W] and recurrent [slots, heads, D, D]
+        # state banks, bound with the KV caches.
         self.conv_state = None
         self.recurrent_state = None
 
@@ -627,6 +629,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
         self.num_programs = get_logical_nc_config()
         self.model = KimiK3Model(text, self.num_programs)
         group = _tp_group()
+        self.tp_size = group.world_size if group is not None else 1
         device_group = group.device_group if group is not None else None
         self.lm_head = ColumnParallelLinear(
             text.hidden_size,
@@ -671,6 +674,45 @@ class KimiK3ForConditionalGeneration(nn.Module):
     def prepare_after_load(self) -> None:
         """Compute the fp32 AttnRes score weights and the kernels' stacked weights, once."""
         self.model.prepare_after_load()
+
+    def get_kv_spec(self) -> KVSpec:
+        """One cache spec per layer: an MLA latent cache, or a KDA layer's state per sequence."""
+        text = self.text_config
+        attn = text.linear_attn_config
+        heads, head_dim = text.kda_heads_per_rank(self.tp_size), int(attn["head_dim"])
+        # This rank's KDA state, as vLLM lays it out: the conv rows of q, k and v
+        # [taps - 1, 3 * heads * head_dim], then the fp32 recurrent state.
+        state_shapes = (
+            (int(attn["short_conv_kernel_size"]) - 1, 3 * heads * head_dim),
+            (heads, head_dim, head_dim),
+        )
+        state_dtypes = (text.torch_dtype, torch.float32)
+        latent = text.kv_lora_rank + text.qk_rope_head_dim
+        layers = []
+        for i, layer in enumerate(self.model.layers):
+            name = f"layers.{i}.self_attn"
+            if layer.is_kda:
+                spec = LayerSpec(
+                    name, 0, 0, text.torch_dtype,
+                    state_shapes=state_shapes, state_dtypes=state_dtypes,
+                )
+            else:
+                spec = LayerSpec(name, 1, latent, text.torch_dtype, key_only=True)
+            layers.append(spec)
+        return KVSpec(layers=layers)
+
+    def bind_kv_cache(self, kv_caches: dict[str, list[torch.Tensor]]) -> None:
+        """Bind each MLA layer's latent cache and each KDA layer's conv and recurrent state."""
+        for i, layer in enumerate(self.model.layers):
+            name = f"layers.{i}.self_attn"
+            if name not in kv_caches:
+                raise KeyError(f"KV cache for layer {name} not initialized")
+            attn = layer.self_attn
+            if layer.is_kda:
+                attn.conv_state, attn.recurrent_state = kv_caches[name]
+            else:
+                # [blocks, 1, block_size, D]: one latent head.
+                attn.kv_cache = kv_caches[name][0].squeeze(1)
 
     @torch.no_grad()
     def forward(
