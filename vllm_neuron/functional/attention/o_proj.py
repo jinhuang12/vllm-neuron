@@ -1,9 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
+"""Output projection functional APIs: the prefill CTE kernel and the decode TKG kernel."""
+
 from typing import Optional
+
+import torch
 from torch import Tensor
 
 from nkilib.core.output_projection.output_projection_cte import (
     output_projection_cte as output_projection,
+)
+from nkilib.core.output_projection.output_projection_tkg import (
+    output_projection_tkg,
 )
 from nkilib.core.utils.common_types import (
     DtypeMode,
@@ -278,4 +285,50 @@ def o_proj(
         input_scales=input_scales,
         weight_scales=weight_scales,
         attention_layout=attention_layout,
+    )
+
+
+def o_proj_tkg(attention: Tensor, weight: Tensor) -> Tensor:
+    """Project decode rows through the library TKG output-projection kernel.
+
+    Computes ``out[b * S + s, h] = sum over n, d of attention[d, b, n, s] *
+    weight[n * D + d, h]``. The kernel accumulates in fp32 and stores its
+    input dtype, and its matmul takes no mixed fp32 and bf16 operands, so an
+    fp32 output needs fp32 ``attention`` and ``weight``.
+
+    Args:
+        attention: [D, B, N, S], the kernel's decode layout with the head
+            dimension D on the partitions. D <= 128 and B * S <= 128.
+        weight: [N * D, H] in the dtype of ``attention``. H is even, because
+            the two logical cores each take half of the columns.
+
+    Returns:
+        Tensor: [B * S, H] in the dtype of ``attention``.
+    """
+    _validate_tkg_inputs(attention, weight)
+    if can_run_kernel(attention):
+        return wrap_nki(output_projection_tkg)[2](attention=attention, weight=weight)
+    D, B, N, S = attention.shape
+    out = torch.einsum(
+        "dbns,ndh->bsh", attention.float(), weight.view(N, D, -1).float()
+    )
+    return out.reshape(B * S, -1).to(attention.dtype)
+
+
+def _validate_tkg_inputs(attention: Tensor, weight: Tensor) -> None:
+    """Reject inputs the TKG kernel does not take, before it is traced."""
+    assert attention.dim() == 4 and weight.dim() == 2, (
+        f"o_proj_tkg takes attention [D, B, N, S] and weight [N * D, H], got "
+        f"{tuple(attention.shape)} and {tuple(weight.shape)}"
+    )
+    D, B, N, S = attention.shape
+    assert weight.shape[0] == N * D, (
+        f"weight rows {weight.shape[0]} must equal N * D = {N * D}"
+    )
+    assert D <= P_MAX and B * S <= P_MAX, (
+        f"o_proj_tkg needs D <= {P_MAX} and B * S <= {P_MAX}, got D={D}, B * S={B * S}"
+    )
+    assert weight.shape[1] % 2 == 0, f"H must be even, got {weight.shape[1]}"
+    assert attention.dtype == weight.dtype, (
+        f"attention and weight must share a dtype, got {attention.dtype} and {weight.dtype}"
     )
