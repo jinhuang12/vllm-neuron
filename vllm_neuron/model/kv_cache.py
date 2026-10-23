@@ -53,6 +53,12 @@ class LayerSpec:
     # [rope | compressed_kv] entry, and by key-only caches such as the DeepSeek
     # V3.2 sparse-attention indexer. bind_kv_cache receives a 1-element list.
     key_only: bool = False
+    # A fixed-size recurrent state per sequence instead of a per-token cache, set
+    # by linear-attention layers: one shape and dtype per state tensor (e.g. conv
+    # rows, then the recurrent state). The layer gets a vLLM MambaSpec, and
+    # bind_kv_cache receives one ``[num_blocks, *shape]`` view per state.
+    state_shapes: tuple[tuple[int, ...], ...] | None = None
+    state_dtypes: tuple[torch.dtype, ...] | None = None
 
 
 @dataclass

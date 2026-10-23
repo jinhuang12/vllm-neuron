@@ -24,6 +24,8 @@ from vllm.distributed.parallel_state import get_tp_group, model_parallel_is_init
 from vllm_neuron.functional.attention.attn_res_prefill import attn_res_prefill
 from vllm_neuron.functional.embedding import embedding
 from vllm_neuron.functional.kda.output import kda_output_prefill
+from vllm_neuron.functional.moe.fused_tail import moe_fused_tail
+from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.model.neuron_config import NeuronConfig
 from vllm_neuron.nn.cpl import ColumnParallelLinear
 from vllm_neuron.nn.sampler import Sampler
@@ -57,7 +59,6 @@ depthwise_conv1d_silu = _optional_kernel("kda.depthwise_conv1d", "depthwise_conv
 mla_paged_attention = _optional_kernel("attention.mla_paged", "mla_paged_attention")
 routed_experts_mx = _optional_kernel("moe.routed_experts_mx", "routed_experts_mx")
 router_select = _optional_kernel("moe.routed_experts_mx", "router_select")
-moe_fused_tail = _optional_kernel("moe.fused_tail", "moe_fused_tail")
 
 
 def _require(kernel, op: str):
@@ -167,7 +168,8 @@ class KimiK3KDA(nn.Module):
         self.o_norm = _Weight((self.head_dim,), torch.float32)
         self.o_proj = _Weight((hidden, width), dtype)
         self.register_buffer("conv_weight", None, persistent=False)
-        # Per-sequence conv and recurrent state banks, bound with the KV caches.
+        # Per-sequence conv [slots, taps - 1, 3W] and recurrent [slots, heads, D, D]
+        # state banks, bound with the KV caches.
         self.conv_state = None
         self.recurrent_state = None
 
@@ -362,13 +364,21 @@ class KimiK3MoE(nn.Module):
         self.routed_expert_norm = KimiK3RMSNorm(latent, c.rms_norm_eps, dtype)
         self.register_buffer("down_router_weight", None, persistent=False)
         self.register_buffer("latent_norm_weight", None, persistent=False)
+        self.register_buffer("latent_up_weight", None, persistent=False)
+        self.register_buffer("shared_down_weight", None, persistent=False)
 
     def prepare_after_load(self) -> None:
-        """Stack latent down over the router in fp32; keep the latent norm as fp32 ``[D, 1]``."""
+        """Stack latent down over the router in fp32, and lay out the decode tail's weights.
+
+        The tail takes the latent norm as fp32 ``[D, 1]`` and the latent up and shared
+        down weights as contiguous ``[K, H]``, so each copy is made here once.
+        """
         self.down_router_weight = torch.cat(
             [self.routed_expert_down_proj.weight, self.gate.weight]
         ).float()
         self.latent_norm_weight = self.routed_expert_norm.weight.float().reshape(-1, 1)
+        self.latent_up_weight = self.routed_expert_up_proj.weight.t().contiguous()
+        self.shared_down_weight = self.shared_experts.down_proj.weight.t().contiguous()
 
     def _select_and_run(self, latent, logits, ids=None, weights=None) -> torch.Tensor:
         """Routed experts on the latent rows: fp32 ``[T, D]`` combined output."""
@@ -406,13 +416,17 @@ class KimiK3MoE(nn.Module):
         combined = self._select_and_run(latent, logits)
         shared = self.shared_experts
         weights = [shared.gate_proj.weight, shared.up_proj.weight]
-        gate_up = _project(mix, weights, norm_weight, self.eps)
-        return _require(moe_fused_tail, "MoE tail")(
+        return self.tail_decode(combined, _project(mix, weights, norm_weight, self.eps))
+
+    def tail_decode(self, combined, gate_up) -> torch.Tensor:
+        """The fused tail of fp32 ``[T, K]`` combined rows: the fp32 pack ``[T, 2H + 1]``."""
+        shared = self.shared_experts
+        return moe_fused_tail(
             combined,
             gate_up,
-            shared.down_proj.weight,
-            self.routed_expert_up_proj.weight,
             self.latent_norm_weight,
+            self.latent_up_weight,
+            self.shared_down_weight,
             beta=shared.beta,
             linear_beta=shared.linear_beta,
         )
@@ -615,6 +629,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
         self.num_programs = get_logical_nc_config()
         self.model = KimiK3Model(text, self.num_programs)
         group = _tp_group()
+        self.tp_size = group.world_size if group is not None else 1
         device_group = group.device_group if group is not None else None
         self.lm_head = ColumnParallelLinear(
             text.hidden_size,
@@ -659,6 +674,45 @@ class KimiK3ForConditionalGeneration(nn.Module):
     def prepare_after_load(self) -> None:
         """Compute the fp32 AttnRes score weights and the kernels' stacked weights, once."""
         self.model.prepare_after_load()
+
+    def get_kv_spec(self) -> KVSpec:
+        """One cache spec per layer: an MLA latent cache, or a KDA layer's state per sequence."""
+        text = self.text_config
+        attn = text.linear_attn_config
+        heads, head_dim = text.kda_heads_per_rank(self.tp_size), int(attn["head_dim"])
+        # This rank's KDA state, as vLLM lays it out: the conv rows of q, k and v
+        # [taps - 1, 3 * heads * head_dim], then the fp32 recurrent state.
+        state_shapes = (
+            (int(attn["short_conv_kernel_size"]) - 1, 3 * heads * head_dim),
+            (heads, head_dim, head_dim),
+        )
+        state_dtypes = (text.torch_dtype, torch.float32)
+        latent = text.kv_lora_rank + text.qk_rope_head_dim
+        layers = []
+        for i, layer in enumerate(self.model.layers):
+            name = f"layers.{i}.self_attn"
+            if layer.is_kda:
+                spec = LayerSpec(
+                    name, 0, 0, text.torch_dtype,
+                    state_shapes=state_shapes, state_dtypes=state_dtypes,
+                )
+            else:
+                spec = LayerSpec(name, 1, latent, text.torch_dtype, key_only=True)
+            layers.append(spec)
+        return KVSpec(layers=layers)
+
+    def bind_kv_cache(self, kv_caches: dict[str, list[torch.Tensor]]) -> None:
+        """Bind each MLA layer's latent cache and each KDA layer's conv and recurrent state."""
+        for i, layer in enumerate(self.model.layers):
+            name = f"layers.{i}.self_attn"
+            if name not in kv_caches:
+                raise KeyError(f"KV cache for layer {name} not initialized")
+            attn = layer.self_attn
+            if layer.is_kda:
+                attn.conv_state, attn.recurrent_state = kv_caches[name]
+            else:
+                # [blocks, 1, block_size, D]: one latent head.
+                attn.kv_cache = kv_caches[name][0].squeeze(1)
 
     @torch.no_grad()
     def forward(

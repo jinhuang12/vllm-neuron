@@ -6,6 +6,8 @@ This module provides the NeuronPlatform class that integrates vLLM Neuron with v
 platform plug-in system.
 """
 
+import copy
+import dataclasses
 import logging
 import os
 import sys
@@ -45,6 +47,21 @@ SO_DISABLED_MESSAGE = (
     "structured-output requests. For this SO-off-only server, retry the "
     "request without structured_outputs."
 )
+
+
+def _config_fields_only(vllm_config: "VllmConfig") -> "VllmConfig":
+    """A shallow copy of ``vllm_config`` that holds its dataclass fields only.
+
+    Upstream copies a config field by field (``VllmConfig.with_hf_config``) and
+    raises on any other attribute, such as the optimization-level flag this
+    platform records on it. The copy shares every sub-config, so a change to
+    ``cache_config`` through it lands on ``vllm_config``.
+    """
+    fields = {f.name for f in dataclasses.fields(vllm_config)}
+    view = copy.copy(vllm_config)
+    for name in [name for name in vars(view) if name not in fields]:
+        del vars(view)[name]
+    return view
 
 
 # Relax DCP config validation for prefill-side DCP where TP <= num_kv_heads.
@@ -313,6 +330,16 @@ class NeuronPlatform(Platform):
         cache_config = vllm_config.cache_config
         if not cache_config.user_specified_block_size:
             cache_config.block_size = 32
+
+        # Hybrid attention and state models: upstream raises the block size until
+        # the attention page covers the state page, then pads the state page to it.
+        model_config = vllm_config.model_config
+        if model_config is not None and model_config.is_hybrid:
+            from vllm_neuron.vllm.attention.attn import NeuronAttentionBackend
+
+            cls._align_hybrid_block_size(
+                _config_fields_only(vllm_config), NeuronAttentionBackend
+            )
 
         parallel_config = vllm_config.parallel_config
         if (
