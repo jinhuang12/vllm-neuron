@@ -114,7 +114,7 @@ def text_config():
 
 @pytest.fixture(scope="module")
 def loaded_layer(text_config) -> nn.Module:
-    """Layer 1's F32 kinds and latent up weight, loaded through load_weights."""
+    """Layer 1's F32 kinds and latent norm and up weights, loaded through load_weights."""
     shapes = {
         f"model.layers.{LAYER}.self_attn.q_conv1d.weight": (12288, 1, 4),
         f"model.layers.{LAYER}.self_attn.k_conv1d.weight": (12288, 1, 4),
@@ -124,6 +124,7 @@ def loaded_layer(text_config) -> nn.Module:
         f"model.layers.{LAYER}.self_attn.o_norm.weight": (128,),
         f"{MOE}.gate.e_score_correction_bias": (text_config.num_experts,),
         UP: (text_config.hidden_size, text_config.routed_expert_hidden_size),
+        NORM: (text_config.routed_expert_hidden_size,),
     }
     model = _stub(shapes)
     load_weights(model, text_config, CHECKPOINT, torch.device("cpu"), pipelined=False)
@@ -184,10 +185,10 @@ def test_f32_kinds_load_as_f32(loaded_layer, text_config):
         assert torch.equal(param, expected), name
 
 
-def test_folded_latent_up_within_one_bf16_rounding(loaded_layer):
-    folded = dict(loaded_layer.named_parameters())[UP]
+def test_latent_norm_and_up_weights_load_as_stored(loaded_layer):
+    params = dict(loaded_layer.named_parameters())
     stored = _read([PREFIX + UP, PREFIX + NORM])
-    product = stored[PREFIX + UP].float() * stored[PREFIX + NORM].float()
-    assert folded.dtype == torch.bfloat16
-    over = (folded.float() - product).abs() > 2.0**-8 * product.abs()
-    assert int(over.sum()) == 0
+    for name in (UP, NORM):
+        expected = stored[PREFIX + name]
+        assert params[name].dtype == expected.dtype == torch.bfloat16, name
+        assert torch.equal(params[name].view(torch.int16), expected.view(torch.int16)), name

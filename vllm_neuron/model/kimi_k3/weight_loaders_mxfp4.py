@@ -1,15 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Kimi K3 checkpoint loading: MXFP4 expert repack and the latent norm fold.
+"""Kimi K3 checkpoint loading with the MXFP4 expert repack.
 
 Parameter names follow the checkpoint keys without the ``language_model.``
-prefix, with two exceptions:
-
-- ``model.layers.{i}.block_sparse_moe.experts.{part}`` holds the repacked
-  expert bank, one leading entry per loaded expert; ``part`` is one of
-  ``EXPERT_PARTS``.
-- ``model.layers.{i}.block_sparse_moe.routed_expert_up_proj.weight`` loads
-  with ``routed_expert_norm.weight`` folded into its input columns, so the
-  norm weight has no parameter.
+prefix, except ``model.layers.{i}.block_sparse_moe.experts.{part}``, which
+holds the repacked expert bank, one leading entry per loaded expert; ``part``
+is one of ``EXPERT_PARTS``. Every other tensor loads as stored.
 
 Repacked expert layout, per expert, for ``G`` programs (LNC), latent width
 ``D`` and expert width ``I``. Program ``g`` takes expert-width columns
@@ -71,8 +66,6 @@ F32_SUFFIXES = (
     "block_sparse_moe.gate.e_score_correction_bias",
 )
 
-_UP_SUFFIX = "block_sparse_moe.routed_expert_up_proj.weight"
-_NORM_SUFFIX = "block_sparse_moe.routed_expert_norm.weight"
 _A_LOG_SUFFIX = "self_attn.A_log"
 _EXPERTS = "block_sparse_moe.experts"
 
@@ -169,21 +162,6 @@ def expert_bank_loader(part: str, num_programs: int = 2) -> SafetensorsWeightLoa
     return SafetensorsWeightLoader(transform=transform)
 
 
-def fold_latent_norm(up_weight: torch.Tensor, norm_weight: torch.Tensor) -> torch.Tensor:
-    """Multiply the norm weight into the up weight's input columns in fp32, then cast to bf16."""
-    return (up_weight.float() * norm_weight.float()).to(torch.bfloat16)
-
-
-def folded_up_loader(inner: SafetensorsWeightLoader) -> SafetensorsWeightLoader:
-    """Return a loader that folds the norm weight, then applies ``inner``."""
-
-    def transform(slices: list, rank: int) -> torch.Tensor:
-        folded = fold_latent_norm(slices[0][:], slices[1][:])
-        return inner.load([SliceView(folded)], rank)
-
-    return SafetensorsWeightLoader(transform=transform)
-
-
 def a_log_loader(num_heads: int, inner: SafetensorsWeightLoader) -> SafetensorsWeightLoader:
     """Return a loader that keeps the first num_heads stored entries, then applies ``inner``."""
 
@@ -217,14 +195,6 @@ def checkpoint_mappings(
                 for src in _PART_SOURCES[leaf]
             ]
             set_weight_loader(param, expert_bank_loader(leaf, num_programs))
-        elif name.endswith(_UP_SUFFIX):
-            norm = name[: -len(_UP_SUFFIX)] + _NORM_SUFFIX
-            mappings[name] = [CHECKPOINT_PREFIX + name, CHECKPOINT_PREFIX + norm]
-            set_weight_loader(param, folded_up_loader(get_weight_loader(param)))
-        elif name.endswith(_NORM_SUFFIX):
-            raise ValueError(
-                f"{name} is folded into the latent up weight and must not be a parameter"
-            )
         else:
             mappings[name] = CHECKPOINT_PREFIX + name
             if name.endswith(_A_LOG_SUFFIX):
