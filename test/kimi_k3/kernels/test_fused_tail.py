@@ -7,8 +7,7 @@ fp32 pack ``[up | shared | sum of squares]``. The oracle is the checkpoint's own
 RMSNorm weight and an ``nn.Linear`` up projection for the up part, and the sum of
 squares of the combined rows, in float64 on the CPU (the SiTU stays in float32, as
 the reference computes it). The per-token norm scale is not in the pack: the
-consumer applies it after the tail all-reduce. The kernel takes the up weights with the
-norm weight folded in, as the loader stores them. Each pack section is graded as
+consumer applies it after the tail all-reduce. Each pack section is graded as
 its own class B row. The checkpoint directory comes from ``KIMI_K3_CHECKPOINT_DIR``.
 With ``VLLM_NEURON_CPU_MODE=1`` and ``NKI_SIMULATOR=1`` the kernel runs on the NKI
 simulator; otherwise on ``neuron:0``, where the runtime needs
@@ -67,8 +66,8 @@ def reference():
     )
 
 
-def _tail(combined, gate_up, up_weight, down_weight, beta, linear_beta):
-    return fused_tail.moe_fused_tail(combined, gate_up, up_weight, down_weight,
+def _tail(combined, gate_up, norm_weight, up_weight, down_weight, beta, linear_beta):
+    return fused_tail.moe_fused_tail(combined, gate_up, norm_weight, up_weight, down_weight,
                                      beta=beta, linear_beta=linear_beta)
 
 
@@ -85,13 +84,14 @@ def _weights(ref, gen):
 
 
 def _run(ref, combined, gate_up, weights):
-    """The kernel's pack, with the norm weight folded into the up weights in fp32."""
+    """The kernel's pack, with the weights in its [K, H] layout."""
     norm_weight, up_weight, down_weight = weights
-    folded = (norm_weight.float()[:, None] * up_weight.float().t()).bfloat16().contiguous()
+    norm = norm_weight.float()[:, None]
+    up = up_weight.t().contiguous()
     down = down_weight.t().contiguous()
     if not ON_DEVICE:
-        return _tail(combined, gate_up, folded, down, ref.beta, ref.linear_beta)
-    on = [t.to("neuron:0") for t in (combined, gate_up, folded, down)]
+        return _tail(combined, gate_up, norm, up, down, ref.beta, ref.linear_beta)
+    on = [t.to("neuron:0") for t in (combined, gate_up, norm, up, down)]
     return _compiled(*on, ref.beta, ref.linear_beta).cpu()
 
 

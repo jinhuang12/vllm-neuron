@@ -3,9 +3,10 @@
 projection and the latent sum of squares, written as one fp32 pack per token.
 
 A pack row is ``[up (H) | shared (H) | sum of squares (1)]``, each a partial over this
-rank's K shard. The tail all-reduce sums the packs across ranks, and the consumer
-applies the latent norm scale ``rsqrt(ss / D + eps)`` to the up part before adding the
-shared part. The latent up weights arrive with the latent norm weight folded in.
+rank's K shard. The kernel applies the latent RMSNorm weight to the fp32 rows before
+their one bf16 rounding; the tail all-reduce sums the packs across ranks, and the
+consumer applies the per-token norm scale ``rsqrt(ss / D + eps)`` to the up part before
+adding the shared part.
 """
 
 import nki
@@ -23,6 +24,7 @@ _COLUMN_TILE = 512
 def moe_fused_tail(
     combined: torch.Tensor,
     shared_gate_up: torch.Tensor,
+    latent_norm_weight: torch.Tensor,
     latent_up_weight: torch.Tensor,
     shared_down_weight: torch.Tensor,
     beta: float,
@@ -33,7 +35,8 @@ def moe_fused_tail(
     Args:
         combined: ``[T, K]`` fp32 combined latent rows of this rank's K shard.
         shared_gate_up: ``[T, 2I]`` bf16 shared-expert gate (first I) and up outputs.
-        latent_up_weight: ``[K, H]`` bf16 latent up weights, norm weight folded in.
+        latent_norm_weight: ``[K, 1]`` fp32 latent RMSNorm weight of this rank's K shard.
+        latent_up_weight: ``[K, H]`` bf16 latent up weights.
         shared_down_weight: ``[I, H]`` bf16 shared-expert down weights.
         beta: SiTU gate beta.
         linear_beta: SiTU linear beta of the up half.
@@ -58,12 +61,19 @@ def moe_fused_tail(
     assert tuple(latent_up_weight.shape) == (latent, hidden), (
         f"latent_up_weight {tuple(latent_up_weight.shape)} must be [{latent}, {hidden}]"
     )
+    assert latent_norm_weight.dtype == torch.float32, (
+        f"latent_norm_weight must be fp32, got {latent_norm_weight.dtype}"
+    )
+    assert tuple(latent_norm_weight.shape) == (latent, 1), (
+        f"latent_norm_weight {tuple(latent_norm_weight.shape)} must be [{latent}, 1]"
+    )
     assert shared_down_weight.shape[1] == hidden, (
         f"shared_down_weight {tuple(shared_down_weight.shape)} must have {hidden} columns"
     )
     return wrap_nki(_moe_fused_tail_kernel)[get_logical_nc_config()](
         combined=combined,
         shared_gate_up=shared_gate_up,
+        latent_norm_weight=latent_norm_weight,
         latent_up_weight=latent_up_weight,
         shared_down_weight=shared_down_weight,
         beta=beta,
@@ -73,7 +83,13 @@ def moe_fused_tail(
 
 @nki.jit
 def _moe_fused_tail_kernel(
-    combined, shared_gate_up, latent_up_weight, shared_down_weight, beta, linear_beta
+    combined,
+    shared_gate_up,
+    latent_norm_weight,
+    latent_up_weight,
+    shared_down_weight,
+    beta,
+    linear_beta,
 ):
     """Each core writes the pack columns of its half of H; core 0 writes the sum of squares."""
     T, KL = combined.shape
@@ -105,6 +121,8 @@ def _moe_fused_tail_kernel(
 
     rows = nl.ndarray((T, KL), dtype=nl.float32, buffer=nl.sbuf)
     nisa.dma_copy(dst=rows, src=combined)
+    norm_w = nl.ndarray((KL, 1), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.dma_copy(dst=norm_w, src=latent_norm_weight)
     gate_up = nl.ndarray((T, 2 * I), dtype=shared_gate_up.dtype, buffer=nl.sbuf)
     nisa.dma_copy(dst=gate_up, src=shared_gate_up)
 
@@ -126,11 +144,12 @@ def _moe_fused_tail_kernel(
     nisa.tensor_tensor(dst=situ, data1=situ, data2=sig, op=nl.multiply)
     nisa.tensor_tensor(dst=lin, data1=lin, data2=situ, op=nl.multiply)
 
-    # PE transposes put K on the partitions; activations stay stationary in bf16.
+    # PE transposes put K on the partitions; activations stay stationary in bf16. The
+    # norm weight scales the fp32 rows on their copy out of PSUM, the one bf16 rounding.
     rows_t_ps = nl.ndarray((KL, T), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_transpose(dst=rows_t_ps, data=rows)
     rows_t = nl.ndarray((KL, T), dtype=latent_up_weight.dtype, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=rows_t, src=rows_t_ps)
+    nisa.tensor_scalar(dst=rows_t, data=rows_t_ps, op0=nl.multiply, operand0=norm_w)
     situ_t = []
     for k0, kn in k_tiles:
         t_ps = nl.ndarray((kn, T), dtype=nl.float32, buffer=nl.psum)
