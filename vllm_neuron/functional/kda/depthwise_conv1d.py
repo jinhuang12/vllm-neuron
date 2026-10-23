@@ -49,6 +49,8 @@ def _problems(history, blocks, weight):
     if history.dtype != torch.bfloat16:
         problems.append(f"history is {history.dtype}, not torch.bfloat16")
     taps = history.shape[0] + 1
+    if taps < 2:
+        problems.append("history has no row; the kernel's two tap chains need 2 taps")
     if tuple(weight.shape) != (channels, taps):
         problems.append(
             f"weight is {tuple(weight.shape)}; {channels} channels with "
