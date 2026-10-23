@@ -215,7 +215,14 @@ class NeuronPlatform(Platform):
         "neuron_quant",
         "compressed-tensors",
         "modelopt",
+        "mxfp4",
     ]
+    # Architectures whose plugin loader reads MXFP4 checkpoint bytes. vLLM
+    # rewrites their compressed-tensors MXFP4 method to "mxfp4"; the plugin gate
+    # refuses that method for every other architecture.
+    _mxfp4_architectures: frozenset[str] = frozenset(
+        {"KimiK3ForConditionalGeneration"}
+    )
     # Neuron quantization paths that CPU-dequant compressed-tensors weights to
     # BF16 on the loader thread. On these paths the device only ever sees BF16
     # (the graph is identical to bf16), so an on-disk compressed-tensors weight/
@@ -878,6 +885,14 @@ class NeuronPlatform(Platform):
             return
         model_config = vllm_config.model_config
         quant_cfg = getattr(model_config.hf_config, "quantization_config", None)
+        if quant_cfg and quant_cfg.get("quant_method") == "mxfp4":
+            if model_config.architecture not in cls._mxfp4_architectures:
+                raise ValueError(
+                    f"mxfp4 weight quantization is supported only for "
+                    f"{sorted(cls._mxfp4_architectures)}, not "
+                    f"{model_config.architecture}."
+                )
+            return
         if not quant_cfg or quant_cfg.get("quant_method") != "compressed-tensors":
             return
         for group_name, group in quant_cfg.get("config_groups", {}).items():
