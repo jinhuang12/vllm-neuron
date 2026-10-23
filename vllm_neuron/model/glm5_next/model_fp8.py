@@ -8732,7 +8732,6 @@ class Glm5NextMLAAttention(nn.Module):
         dense: bool,
         dense_window: bool,
         active_mla_query_rows: int | None,
-        selection_is_a_set: bool,
         collector: list[torch.Tensor] | None,
     ) -> torch.Tensor:
         """The dense-masked chunk's attention over the native K/V pages.
@@ -8742,20 +8741,22 @@ class Glm5NextMLAAttention(nn.Module):
         ``native_kv_cache``, with the chunk's keep table as the selection, at the scale
         and the pool size the latent route uses. The keep table is checked as on the
         latent route (:meth:`_require_keep_reader`), at the latent geometry the forward
-        chose the route at. A layer-stream dump (``collector``) names the latent route's
-        tensors, which this route never forms, so it is refused here.
+        chose the route at. The table is the kernel's one selection operand and its
+        bytes are a function of each row's set of pool ids (``dsa_set_selection.py``),
+        so a selection held as a set attends as the ordered one does. A layer-stream
+        dump (``collector``) names the latent route's tensors, which this route never
+        forms, so it is refused here.
         """
         from vllm_neuron.functional.attention.mla_native_kv import (
             mla_native_kv_attention,
         )
 
-        if collector is not None or selection_is_a_set or keep_bits is None:
+        if collector is not None or keep_bits is None:
             raise Glm5NextMLADecodeError(
                 f"the native K/V route attends a dense-masked chunk from its keep "
                 f"table, with no layer-stream dump; got keep_bits "
-                f"{'None' if keep_bits is None else tuple(keep_bits.shape)}, "
-                f"selection_is_a_set={selection_is_a_set} and a collector "
-                f"{'absent' if collector is None else 'present'}"
+                f"{'None' if keep_bits is None else tuple(keep_bits.shape)} and a "
+                f"collector {'absent' if collector is None else 'present'}"
             )
         self._require_keep_reader(
             query, c_kv, keep_bits, keep_route, topk_indices, block_table_row,
@@ -9131,7 +9132,6 @@ class Glm5NextMLAAttention(nn.Module):
                 dense=dense,
                 dense_window=dense_window_seq_lens is not None,
                 active_mla_query_rows=active_mla_query_rows,
-                selection_is_a_set=selection_is_a_set,
                 collector=collector,
             )
             # Already at the head width ``project_output`` consumes: the value matmul
