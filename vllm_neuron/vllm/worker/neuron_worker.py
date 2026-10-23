@@ -253,6 +253,35 @@ def _dsa_pool_store_bytes(
     )
 
 
+def _native_kv_cache_bytes(
+    vllm_config, model_runner, need_bytes: int, kv_cache_config=None
+) -> int:
+    """Return the bytes of the native K/V caches the runner allocates at ``need_bytes``.
+
+    With ``VLLM_NEURON_MLA_NATIVE_KV`` on, every sparse-attention layer has a buffer for
+    its tokens' keys and values per KV block beside vLLM's KV cache tensors
+    (``NeuronModelRunner.native_kv_caches``), sized by the config's block count. The
+    bytes are read off the shapes the runner allocates from,
+    :func:`~vllm_neuron.vllm.worker.neuron_model_runner.native_kv_cache_shapes`, so the
+    price is the allocation. 0 with the knob off. ``kv_cache_config``, when given, is
+    vLLM's config at ``need_bytes`` (:func:`_kv_cache_config_at`), already built by the
+    caller; with the knob off none is built.
+    """
+    if not envs.VLLM_NEURON_MLA_NATIVE_KV:
+        return 0
+    from .neuron_model_runner import native_kv_cache_shapes
+
+    if kv_cache_config is None:
+        kv_cache_config = _kv_cache_config_at(vllm_config, model_runner, need_bytes)
+
+    shapes = native_kv_cache_shapes(
+        kv_cache_config, getattr(model_runner.model, "text_config", None), vllm_config
+    )
+    return sum(
+        math.prod(shape) * dtype.itemsize for shape, dtype in shapes.values()
+    )
+
+
 def pool_blocks_per_request(spec: KVCacheSpec, max_model_len: int, where: str) -> int:
     """Return the pool blocks a request holds at once in a KV cache group, at DCP 1.
 
@@ -1964,7 +1993,9 @@ class NeuronWorker(WorkerBase):
         indexer side caches every sparse-attention layer holds, which no KV cache
         spec declares (:func:`_indexer_side_cache_bytes`), plus, with prefix caching
         on, the DSA pool store sized by the same config's blocks
-        (:func:`_dsa_pool_store_bytes`). This total, not ``need_bytes``, is what has
+        (:func:`_dsa_pool_store_bytes`), plus, with ``VLLM_NEURON_MLA_NATIVE_KV`` on,
+        the native K/V caches sized by them too (:func:`_native_kv_cache_bytes`). This
+        total, not ``need_bytes``, is what has
         to fit the device: vLLM turns ``need_bytes`` into blocks, so the bytes
         outside its KV cache tensors are counted here and not there. No bank is
         grown beyond it: a latent layer reads only the pages its block table names,
@@ -1983,6 +2014,9 @@ class NeuronWorker(WorkerBase):
                 self.vllm_config, self.model_runner, kv_cache_spec
             )
             + _dsa_pool_store_bytes(
+                self.vllm_config, self.model_runner, need_bytes, kv_cache_config
+            )
+            + _native_kv_cache_bytes(
                 self.vllm_config, self.model_runner, need_bytes, kv_cache_config
             )
         )
@@ -2346,6 +2380,14 @@ class NeuronWorker(WorkerBase):
         if pool_store_bytes:
             outside_kv_tensors += f", DSA pool store {pool_store_gib:.3f} GiB"
             counted += f" and the DSA pool store {pool_store_gib:.3f} GiB"
+        # Named only with VLLM_NEURON_MLA_NATIVE_KV on, for the same reason.
+        native_kv_bytes = _native_kv_cache_bytes(
+            self.vllm_config, self.model_runner, need_bytes
+        )
+        if native_kv_bytes:
+            native_kv_gib = native_kv_bytes / (1024**3)
+            outside_kv_tensors += f", native K/V caches {native_kv_gib:.3f} GiB"
+            counted += f" and the native K/V caches {native_kv_gib:.3f} GiB"
         max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
         max_model_len = self.vllm_config.model_config.max_model_len
         admitted = footprint_bytes <= heuristic_bytes

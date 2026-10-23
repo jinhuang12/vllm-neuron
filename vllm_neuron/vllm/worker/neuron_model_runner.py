@@ -545,6 +545,67 @@ def dsa_pool_store_shapes(
     return shapes
 
 
+def native_kv_cache_shapes(
+    kv_cache_config: KVCacheConfig,
+    text_config: Any,
+    vllm_config: Any,
+) -> dict[str, tuple[tuple[int, int, int], torch.dtype]]:
+    """Return the shape and dtype of each sparse layer's native K/V cache, by name.
+
+    With ``VLLM_NEURON_MLA_NATIVE_KV`` on, a sparse (DSA) layer gets a cache beside its
+    latent bank for its tokens' keys and values (``mla_native_kv``'s page layout):
+    block ``b`` holds the ``block_size`` tokens of latent block ``b``,
+    ``qk_nope_head_dim + v_head_dim`` elements each, keys first. It is indexed by the
+    block id of the layer's latent group, so it has ``kv_cache_config.num_blocks``
+    blocks, in the layer's latent cache dtype. Every prefill chunk writes it and only a
+    prefill chunk reads it, so no ``KVCacheSpec`` declares it and vLLM's block count is
+    the latent bank's alone: it is allocated beside vLLM's KV cache tensors, and the
+    worker prices it from these shapes.
+
+    A layer gets a cache when its spec is not a ``MambaSpec``, the rule the pool store
+    follows (:func:`dsa_pool_store_shapes`). ``{}`` while the knob is off, or for a
+    model whose text config declares no key and value widths.
+
+    Raises:
+        ValueError: with the knob on, under decode context parallelism (a rank's latent
+            block then holds another stretch of positions than a prefill chunk's page)
+            or with prefix caching on (a hit block's keys and values were never
+            written by this request's prefill).
+    """
+    if not envs.VLLM_NEURON_MLA_NATIVE_KV:
+        return {}
+    key_width = getattr(text_config, "qk_nope_head_dim", None)
+    value_width = getattr(text_config, "v_head_dim", None)
+    if key_width is None or value_width is None:
+        return {}
+    dcp_size = int(vllm_config.parallel_config.decode_context_parallel_size)
+    if dcp_size > 1:
+        raise ValueError(
+            f"VLLM_NEURON_MLA_NATIVE_KV serves decode_context_parallel_size 1; got "
+            f"{dcp_size}, where a rank's latent block holds its share of "
+            f"block_size x {dcp_size} positions and no prefill chunk writes it whole"
+        )
+    if vllm_config.cache_config.enable_prefix_caching:
+        raise ValueError(
+            "VLLM_NEURON_MLA_NATIVE_KV serves prefix caching off: a prefix-cache hit's "
+            "blocks hold latent rows whose keys and values no prefill of the request "
+            "wrote; relaunch with --no-enable-prefix-caching"
+        )
+    shapes: dict[str, tuple[tuple[int, int, int], torch.dtype]] = {}
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        if isinstance(spec, MambaSpec):
+            continue
+        shape = (
+            int(kv_cache_config.num_blocks),
+            int(spec.block_size),
+            int(key_width) + int(value_width),
+        )
+        for name in group.layer_names:
+            shapes[name] = (shape, spec.dtype)
+    return shapes
+
+
 def indexer_context_per_rank(vllm_config: Any) -> int:
     """Return the context one rank's DSA indexer covers: its pooled-key rows and decode candidates.
 
@@ -6022,6 +6083,39 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # ``slot_mapping`` dtype.
         return torch.tensor(slots, dtype=torch.int64).to(device)
 
+    @staticmethod
+    def _glm5next_native_kv_pages(
+        *, row, start: int, tokens: int, real: int, block_size: int, device, name: str
+    ) -> torch.Tensor:
+        """Return ``[tokens / block_size]`` int32: the block each page of a prefill
+        chunk's keys and values is stored to (``mla_native_kv.mla_native_kv_write``).
+
+        The write stores whole pages, so the chunk must start on a block boundary and
+        span whole blocks; both are refused here by name, where the position is still a
+        number. Page ``j`` holds the chunk's tokens ``j * block_size ..``: a page that
+        holds a real token goes to the block the request's ``row`` names for it, and a
+        page of padding alone to vLLM's null block (``NULL_BLOCK_ID``), which the
+        allocator never gives to a request. A real page's rows past the real end hold
+        the last real token's keys and values (the layer clamps the padded rows to it);
+        they lie past the sequence, where no query selects.
+        """
+        if int(start) % int(block_size) or int(tokens) % int(block_size):
+            raise ValueError(
+                f"KV layer '{name}' stores whole {int(block_size)}-token pages of "
+                f"native keys and values (VLLM_NEURON_MLA_NATIVE_KV), and this prefill "
+                f"chunk of {int(tokens)} row(s) starts at position {int(start)}; a "
+                f"chunk must start on a block boundary and span whole blocks"
+            )
+        first = int(start) // int(block_size)
+        pages = [
+            int(row[first + page])
+            if page * int(block_size) < int(real)
+            else NULL_BLOCK_ID
+            for page in range(int(tokens) // int(block_size))
+        ]
+        # Built on the host and moved once; int32 is the write kernel's page-id dtype.
+        return torch.tensor(pages, dtype=torch.int32).to(device)
+
     @classmethod
     def _glm5next_batch_row_seq_lens(cls, requests, *, device) -> torch.Tensor:
         """Return ``[sum(tokens)]`` int32: every token's causal length, in batch order.
@@ -6921,8 +7015,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         checkpoint_rows=None,
         async_correction=None,
         block_table_column=None,
+        native_kv_caches=None,
     ) -> list[dict]:
         """Build one kwargs mapping per layer, in spec order, holding that layer's own state.
+
+        ``native_kv_caches`` (``VLLM_NEURON_MLA_NATIVE_KV``; layer name -> the layer's
+        native K/V cache, :func:`native_kv_cache_shapes`) adds ``native_kv_cache`` and
+        ``native_kv_pages`` (:meth:`_glm5next_native_kv_pages`) to a sparse layer's
+        prefill carrier; a decode carrier never holds them.
 
         ``async_correction`` (the async drafter, decode leg; a
         :class:`~vllm_neuron.functional.mtp.async_step.StepCorrection`) replaces every
@@ -7435,6 +7535,20 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 # slots past it hold no token of this sequence. A negative end is
                 # already rejected above, while the position is still a number.
                 carrier["prefill_tail"] = side["tail"][state_slot]
+                native_kv_cache = (native_kv_caches or {}).get(bank["name"])
+                if native_kv_cache is not None:
+                    # The whole cache, as the latent bank travels, and the block each
+                    # page of this chunk's keys and values lands in.
+                    carrier["native_kv_cache"] = native_kv_cache
+                    carrier["native_kv_pages"] = cls._glm5next_native_kv_pages(
+                        row=ids,
+                        start=int(start_position),
+                        tokens=int(tokens),
+                        real=real,
+                        block_size=block_size,
+                        device=device,
+                        name=bank["name"],
+                    )
             else:
                 # The decode position chooses the ring slot this token's key is
                 # written to, so it rides as a tensor for the same reason.
@@ -8344,6 +8458,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             checkpoint_rows=None if checkpoints is None else checkpoints[1],
             async_correction=async_correction,
             block_table_column=async_column,
+            native_kv_caches=getattr(self, "native_kv_caches", None),
         )
         pair_kwargs: dict = {}
         if pair_chunks is not None:
@@ -13360,6 +13475,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             if self.vllm_config.cache_config.enable_prefix_caching
             else {}
         )
+        # With VLLM_NEURON_MLA_NATIVE_KV on, each sparse layer's keys and values are
+        # kept per block as well, in a buffer of its own beside the KV cache tensors
+        # (the worker prices it from the same shapes). Zeros: a page no prefill has
+        # written holds finite keys and values, which the attention reads only as
+        # unselected rows.
+        self.native_kv_caches = {
+            name: torch.zeros(shape, dtype=dtype, device=self.device)
+            for name, (shape, dtype) in native_kv_cache_shapes(
+                kv_cache_config,
+                getattr(self.model, "text_config", None),
+                self.vllm_config,
+            ).items()
+        }
 
         # This binds the cache tensors to the model
         self.model.bind_kv_cache(kv_caches)

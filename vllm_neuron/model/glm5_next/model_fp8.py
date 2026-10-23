@@ -8139,7 +8139,7 @@ class Glm5NextMLAAttention(nn.Module):
     # way round would put a transpose back on the per-forward path, which is the one
     # cost this preparation exists to avoid.
 
-    #: Attribute the two absorb operands are cached on. A plain attribute for the
+    #: Attribute the absorb operands are cached on. A plain attribute for the
     #: same reason ``PREPARED_WEIGHTS_ATTR`` is one: a buffer enters
     #: ``state_dict()``, which would duplicate a 32 MB weight in every saved
     #: checkpoint.
@@ -8159,16 +8159,31 @@ class Glm5NextMLAAttention(nn.Module):
         ``qk_nope_head_dim`` and ``kv_lora_rank`` -- are not touched, because
         neither is per-head: the latent is replicated across ranks and the head
         width is a property of one head.
+
+        With ``VLLM_NEURON_MLA_NATIVE_KV`` on, the same split also gives the native
+        K/V write its two projections, both contracting the latent: ``W_K``, the key
+        half as it already stands, ``[H, kv_lora_rank, qk_nope_head_dim]``, so
+        ``key = latent @ W_K[h]``, and ``W_V``, the value half, laid out as ``W_UV``,
+        so ``value = latent @ W_V[h]``. Both are rounded once to the cache dtype at
+        load time (:meth:`prepare_absorb_weights`).
         """
+        from vllm_neuron import envs
+
         heads = self._heads_per_rank()
         latent = self.kv_lora_rank
-        return (
+        widths = (
             ("W_UK", heads, self.qk_nope_head_dim, latent),
             ("W_UV", heads, latent, self.v_head_dim),
         )
+        if envs.VLLM_NEURON_MLA_NATIVE_KV:
+            widths += (
+                ("W_K", heads, latent, self.qk_nope_head_dim),
+                ("W_V", heads, latent, self.v_head_dim),
+            )
+        return widths
 
     def prepare_absorb_weights(self) -> int:
-        """Split the prepared ``kv_b_proj`` into the two absorb operands, once.
+        """Split the prepared ``kv_b_proj`` into the absorb operands, once.
 
         Returns how many operands were built, so a caller can tell this ran from a
         call that had nothing to do.
@@ -8182,8 +8197,11 @@ class Glm5NextMLAAttention(nn.Module):
         exactly the right shapes.
 
         The split is a rearrangement and nothing else. Every element of both
-        operands is an element of the prepared weight, in the prepared weight's own
-        dtype: no cast, no scale, no arithmetic.
+        absorb operands is an element of the prepared weight, in the prepared
+        weight's own dtype: no cast, no scale, no arithmetic. The native K/V write's
+        two operands are the one exception: each element is rounded once, here, to
+        the latent cache dtype, because the write multiplies 2-byte operands and a
+        cast in the graph would run on every prefill chunk.
 
         The head count below is this rank's, and every line after it -- the closed
         form, the reshape, the two permutes, the width comparison -- is already
@@ -8222,7 +8240,21 @@ class Glm5NextMLAAttention(nn.Module):
                 per_head, lambda host: host[:, :, nope:].permute(1, 0, 2)
             ),
         }
-        for name, exp_heads, contraction, out_features in self.absorb_widths():
+        widths = self.absorb_widths()
+        if any(name == "W_K" for name, *_ in widths):
+            # [latent, heads, width] -> [heads, latent, width] for both halves, because
+            # the native K/V write contracts the latent, each rounded to the cache
+            # dtype the write's other operands hold.
+            cache_dtype = self.cache_dtype
+            operands["W_K"] = _relaid_out_on_the_host(
+                per_head,
+                lambda host: host[:, :, :nope].permute(1, 0, 2).to(cache_dtype),
+            )
+            operands["W_V"] = _relaid_out_on_the_host(
+                per_head,
+                lambda host: host[:, :, nope:].permute(1, 0, 2).to(cache_dtype),
+            )
+        for name, exp_heads, contraction, out_features in widths:
             got = tuple(operands[name].shape)
             want = (exp_heads, contraction, out_features)
             if got != want:
@@ -8591,7 +8623,7 @@ class Glm5NextMLAAttention(nn.Module):
 
     def _require_keep_reader(
         self,
-        q_lift: torch.Tensor,
+        query: torch.Tensor,
         c_kv: torch.Tensor,
         keep_bits: torch.Tensor,
         keep_route: KeepTableRoute,
@@ -8609,10 +8641,13 @@ class Glm5NextMLAAttention(nn.Module):
         (``dsa_keep_table.py``) names a reader. This asks it again, with the operands the
         seam will be handed, so a table made on other shapes cannot reach a body that
         ignores it. A trace-time check: every input is a shape, a dtype or a python value.
+        ``query`` is the lifted query, or the query itself on the native K/V route: its
+        rows, heads and dtype are read, and the route is asked at the latent width, as
+        :meth:`forward` asked it.
         """
         from vllm_neuron.model.glm5_next.dsa_keep_table import prefill_keep_table_route
 
-        rows = int(q_lift.shape[0])
+        rows = int(query.shape[0])
         full_width = active_mla_query_rows in (None, rows)
         if (
             self.dcp_size > 1
@@ -8620,12 +8655,12 @@ class Glm5NextMLAAttention(nn.Module):
             or dense_window
             or not full_width
             or prefill_keep_table_route(
-                rows=rows, heads=int(q_lift.shape[1]), latent=int(q_lift.shape[2]),
+                rows=rows, heads=int(query.shape[1]), latent=self.kv_lora_rank,
                 kv_latent=int(c_kv.shape[1]), bank_rows=int(c_kv.shape[0]),
                 window_pages=int(block_table_row.shape[0]), page_size=int(page),
                 pool_size=int(self.indexer.index_kpool),
                 candidates=int(keep_bits.shape[1]) * 8,
-                index_cols=int(topk_indices.shape[1]), q_dtype=q_lift.dtype,
+                index_cols=int(topk_indices.shape[1]), q_dtype=query.dtype,
                 kv_dtype=c_kv.dtype,
             ) is not keep_route
         ):
@@ -8637,6 +8672,106 @@ class Glm5NextMLAAttention(nn.Module):
                 f"bytes per row, decode_context_parallel_size={self.dcp_size}, "
                 f"dense={dense}, dense_window={dense_window}) would hand it elsewhere"
             )
+
+    def _write_native_kv(
+        self,
+        written: torch.Tensor,
+        native_kv_cache: torch.Tensor,
+        native_kv_pages: torch.Tensor,
+        page_size: int,
+    ) -> torch.Tensor:
+        """Store a prefill chunk's keys and values in the native K/V cache; return it.
+
+        ``written`` is ``[tokens, kv_lora_rank]``, the chunk's latent rows as the bank
+        received them (a padded row repeats the last real one). Each token's key is
+        ``written @ W_K[0]`` and its value ``written @ W_V[0]``, the two halves of this
+        rank's ``kv_b_proj`` rounded once to the cache dtype at load time, each product
+        accumulated in float32 and rounded once to the cache dtype; a non-finite value
+        element is stored as 0.0 (``mla_native_kv.mla_native_kv_write``). Page ``j`` of
+        the chunk lands in block ``native_kv_pages[j]``. The return is the kernel's
+        result, which the backend hands to every later operation on the cache.
+        """
+        from vllm_neuron.functional.attention.mla_native_kv import mla_native_kv_write
+
+        heads = self._heads_per_rank()
+        if heads != 1:
+            raise Glm5NextMLADecodeError(
+                f"the native K/V cache holds one head's keys and values per token and "
+                f"this rank holds {heads} heads; VLLM_NEURON_MLA_NATIVE_KV serves one "
+                f"attention head per rank"
+            )
+        operands = getattr(self, self.ABSORB_WEIGHTS_ATTR, None) or {}
+        if "W_K" not in operands or "W_V" not in operands:
+            raise Glm5NextMLADecodeError(
+                "the native K/V write needs W_K and W_V, which "
+                "prepare_absorb_weights() splits only with VLLM_NEURON_MLA_NATIVE_KV "
+                "on at load time"
+            )
+        return mla_native_kv_write(
+            written,
+            operands["W_K"][0],
+            operands["W_V"][0],
+            native_kv_pages,
+            native_kv_cache,
+            int(page_size),
+        )
+
+    def _attend_native_kv(
+        self,
+        query: torch.Tensor,
+        c_kv: torch.Tensor,
+        native_kv_cache: torch.Tensor,
+        keep_bits: torch.Tensor | None,
+        keep_route: KeepTableRoute,
+        topk_indices: torch.Tensor,
+        softmax_scale: float,
+        *,
+        block_table_row: torch.Tensor,
+        query_start: torch.Tensor,
+        page_size: int,
+        dense: bool,
+        dense_window: bool,
+        active_mla_query_rows: int | None,
+        selection_is_a_set: bool,
+        collector: list[torch.Tensor] | None,
+    ) -> torch.Tensor:
+        """The dense-masked chunk's attention over the native K/V pages.
+
+        ``[tokens, 1, v_head_dim]`` float32: ``mla_native_kv_attention`` of ``query``
+        (``[tokens, 1, qk_nope_head_dim]``, not lifted) over the window's pages of
+        ``native_kv_cache``, with the chunk's keep table as the selection, at the scale
+        and the pool size the latent route uses. The keep table is checked as on the
+        latent route (:meth:`_require_keep_reader`), at the latent geometry the forward
+        chose the route at. A layer-stream dump (``collector``) names the latent route's
+        tensors, which this route never forms, so it is refused here.
+        """
+        from vllm_neuron.functional.attention.mla_native_kv import (
+            mla_native_kv_attention,
+        )
+
+        if collector is not None or selection_is_a_set or keep_bits is None:
+            raise Glm5NextMLADecodeError(
+                f"the native K/V route attends a dense-masked chunk from its keep "
+                f"table, with no layer-stream dump; got keep_bits "
+                f"{'None' if keep_bits is None else tuple(keep_bits.shape)}, "
+                f"selection_is_a_set={selection_is_a_set} and a collector "
+                f"{'absent' if collector is None else 'present'}"
+            )
+        self._require_keep_reader(
+            query, c_kv, keep_bits, keep_route, topk_indices, block_table_row,
+            page_size, dense=dense, dense_window=dense_window,
+            active_mla_query_rows=active_mla_query_rows,
+        )
+        return mla_native_kv_attention(
+            query,
+            native_kv_cache,
+            keep_bits,
+            query_start,
+            softmax_scale,
+            block_table_row,
+            pool_rows=int(self.indexer.index_kpool),
+            page_size=int(page_size),
+        )
 
     def attend(
         self,
@@ -8660,6 +8795,8 @@ class Glm5NextMLAAttention(nn.Module):
         keep_bits: torch.Tensor | None = None,
         keep_route: KeepTableRoute | None = None,
         pair: DSAPairStep | None = None,
+        native_kv_cache: torch.Tensor | None = None,
+        native_kv_pages: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """One layer's MLA attention. Returns ``[tokens, hidden_size]``.
 
@@ -8695,6 +8832,19 @@ class Glm5NextMLAAttention(nn.Module):
         table is their one reader. The seam reads the index operand's shape alone on that
         route, so a ``-1`` fill of the selection's shape (every column selects no token)
         stands in for it, and no kernel reads it.
+
+        ``native_kv_cache`` is the layer's native K/V cache
+        (``VLLM_NEURON_MLA_NATIVE_KV``; the runner's ``native_kv_cache_shapes``):
+        ``[blocks, page_size, qk_nope_head_dim + v_head_dim]`` in the bank's dtype,
+        block ``b`` holding the keys and values of latent block ``b`` in
+        ``mla_native_kv``'s page layout. ``native_kv_pages`` (``[tokens / page_size]``
+        int32) names the block each page of this chunk's tokens goes to, the null block
+        for a page of padding alone. A prefill chunk of one request hands both. After
+        the latent write its keys and values are projected from the rows the bank
+        received and stored a whole page at a time, on every route, because a later
+        chunk's window holds them. The chunk the ``DENSE_MASKED`` keep table belongs to
+        then attends those pages with ``query`` itself (``mla_native_kv_attention``),
+        so neither absorb runs; every other chunk takes its route over the latent bank.
 
         ``hidden_states`` is ``[tokens, hidden_size]``: a prefill passes all its
         tokens at once and a decode step passes one. ``latent_cache`` is the whole
@@ -8752,6 +8902,17 @@ class Glm5NextMLAAttention(nn.Module):
             raise Glm5NextMLADecodeError(
                 f"batch_size counts the requests of this step and must be at least "
                 f"one; got batch_size={batch_size}"
+            )
+        if (native_kv_cache is None) != (native_kv_pages is None) or (
+            native_kv_cache is not None and int(batch_size) != 1
+        ):
+            raise Glm5NextMLADecodeError(
+                f"native_kv_cache and native_kv_pages travel together, with one "
+                f"request's prefill chunk; got native_kv_cache "
+                f"{None if native_kv_cache is None else tuple(native_kv_cache.shape)}, "
+                f"native_kv_pages "
+                f"{None if native_kv_pages is None else tuple(native_kv_pages.shape)} "
+                f"and batch_size={batch_size}"
             )
         if int(batch_size) > 1:
             return self._attend_requests(
@@ -8920,6 +9081,14 @@ class Glm5NextMLAAttention(nn.Module):
             )
             rows = torch.cat((rows, pair.partner_latent_slots), dim=0)
         latent_cache.index_copy_(0, rows, persisted.unsqueeze(1))
+        if native_kv_cache is not None:
+            # The same rows' keys and values, a whole page at a time. The kernel writes
+            # the caller's cache in place and its result is the cache every later read
+            # in this graph takes. A chunk-pair step is refused there: its view holds two
+            # heads per rank, and the cache one head's keys and values.
+            native_kv_cache = self._write_native_kv(
+                written, native_kv_cache, native_kv_pages, page
+            )
 
         # The cache read. The whole bank, as a view, with the block table beside it.
         # The kernel assembles the window the table names and no copy of it is made
@@ -8944,6 +9113,30 @@ class Glm5NextMLAAttention(nn.Module):
             # because the bank is the caller's and a later step writes into it: a view
             # would make the dump report the bank as it is when the files are written.
             collector.append(c_kv.detach().clone())
+
+        from vllm_neuron.model.glm5_next.dsa_keep_table import KeepTableRoute
+
+        if native_kv_cache is not None and keep_route is KeepTableRoute.DENSE_MASKED:
+            attended = self._attend_native_kv(
+                query,
+                c_kv,
+                native_kv_cache,
+                keep_bits,
+                keep_route,
+                topk_indices,
+                softmax_scale,
+                block_table_row=block_table_row,
+                query_start=at,
+                page_size=page,
+                dense=dense,
+                dense_window=dense_window_seq_lens is not None,
+                active_mla_query_rows=active_mla_query_rows,
+                selection_is_a_set=selection_is_a_set,
+                collector=collector,
+            )
+            # Already at the head width ``project_output`` consumes: the value matmul
+            # ran over the stored values, so no absorb-out follows.
+            return self.project_output(attended.to(hidden_states.dtype), collector)
 
         from vllm_neuron.functional.attention.mla_absorb import mla_absorb
         from vllm_neuron.functional.attention.mla_sparse import mla_sparse_attention
@@ -9735,6 +9928,8 @@ class Glm5NextMLAAttention(nn.Module):
         state_slots: torch.Tensor | None = None,
         index_share: IndexShare | None = None,
         pair: DSAPairStep | None = None,
+        native_kv_cache: torch.Tensor | None = None,
+        native_kv_pages: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """This module's whole contribution to one layer: select, then attend.
 
@@ -9785,6 +9980,9 @@ class Glm5NextMLAAttention(nn.Module):
         :meth:`attend` then write the partner chunk's rows beside this chunk's, so both
         prefill groups hold the whole step in their caches; the composition is the
         same.
+
+        ``native_kv_cache`` and ``native_kv_pages`` are :meth:`attend`'s, and a
+        prefill chunk's only: a decode step reads the latent bank alone.
         """
         from vllm_neuron.functional.dsa.decode_bypass import (
             selection_bound,
@@ -9802,6 +10000,11 @@ class Glm5NextMLAAttention(nn.Module):
             raise Glm5NextMLADecodeError(
                 "a chunk-pair step is one request's full-width prefill chunk, with a "
                 "slot_mapping and no ring, bank form, active row prefix or dump"
+            )
+        if native_kv_cache is not None and prefill_end_position is None:
+            raise Glm5NextMLADecodeError(
+                "native_kv_cache belongs to a prefill chunk, which carries "
+                "prefill_end_position; a decode step reads the latent bank alone"
             )
         if isinstance(tail, (tuple, list)) or state_slots is not None:
             # A decode step of several requests: one ring per request, or the whole
@@ -10036,6 +10239,8 @@ class Glm5NextMLAAttention(nn.Module):
             selection_is_a_set=selects_a_set,
             keep_bits=keep_bits,
             keep_route=keep_route,
+            native_kv_cache=native_kv_cache,
+            native_kv_pages=native_kv_pages,
             **(
                 {"active_mla_query_rows": active_mla_query_rows}
                 if active_mla_query_rows is not None else {}
@@ -10131,6 +10336,8 @@ class Glm5NextDSALayer(nn.Module):
         state_slots: torch.Tensor | None = None,
         index_share: IndexShare | None = None,
         pair: DSAPairStep | None = None,
+        native_kv_cache: torch.Tensor | None = None,
+        native_kv_pages: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """The sparse-attention half, mixed either by mHC or by a plain add.
 
@@ -10162,6 +10369,8 @@ class Glm5NextDSALayer(nn.Module):
         latent bank and are handed on unread: the attention half's callee owns both
         contracts, and a second reading here is a second authority on one extent.
         ``pair`` (a chunk-pair step's :class:`DSAPairStep`) is handed on unread too.
+        ``native_kv_cache`` and ``native_kv_pages`` (a prefill chunk's, with
+        ``VLLM_NEURON_MLA_NATIVE_KV`` on) are handed on unread for the same reason.
 
         ``streams`` is ``[T, S, H]`` or ``None``; the return is ``[T, H]`` in the
         input dtype on the one-stream route and ``[T, S, H]`` in the streams' own
@@ -10210,6 +10419,14 @@ class Glm5NextDSALayer(nn.Module):
                 **({"state_slots": state_slots} if state_slots is not None else {}),
                 **({"index_share": index_share} if index_share is not None else {}),
                 **({"pair": pair} if pair is not None else {}),
+                **(
+                    {
+                        "native_kv_cache": native_kv_cache,
+                        "native_kv_pages": native_kv_pages,
+                    }
+                    if native_kv_cache is not None
+                    else {}
+                ),
             )
             if collector is not None:
                 collector.append(attended)
