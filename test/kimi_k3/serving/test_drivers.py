@@ -312,13 +312,15 @@ def test_reducer_known_bad(tmp_path):
 
 
 def test_reducer_known_good(tmp_path):
-    """Item 9: flat 37.6 ms passes with or without a 4 s first gap; 42.22 fails; invalid; unstable."""
+    """Item 9: flat 37.6 ms passes, also with a 4 s first gap; 42.02 passes, 42.22 fails; invalid; unstable."""
     code, rec = _reduce(_cell(tmp_path / "flat", 37.6))
     assert (code, rec["guard_total"]) == (0, 0)
     assert rec["value_of_record_ms"] == pytest.approx(37.6)
     code, rec = _reduce(_cell(tmp_path / "first", 37.6, first_gap_ms=4000.0))
     assert code == 0 and rec["value_of_record_ms"] == pytest.approx(37.6)
     assert _reduce(_cell(tmp_path / "slow", 42.22))[0] == 1
+    code, rec = _reduce(_cell(tmp_path / "under", 42.02))
+    assert (code, rec["bar_ms"]) == (0, 42.12)
     assert _reduce(_cell(tmp_path / "failed", 37.6, failed_run=("B", 2)))[0] == 2
     code, rec = _reduce(_cell(tmp_path / "spread", 30.0, b_gap_ms=34.0))
     assert code == 3 and rec["spread"] == pytest.approx(4.0 / 32.0)
