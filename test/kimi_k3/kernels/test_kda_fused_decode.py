@@ -13,6 +13,10 @@ The test needs ``KIMI_K3_CHECKPOINT_DIR``: a Kimi K3 checkpoint directory with i
 ``config.json``, ``modeling_kimi_linear.py``, ``model.safetensors.index.json`` and the
 one shard that holds layer 1's attention weights. Without it the test skips.
 
+Each step runs on a page buffer laid out as the KV cache binds it: per slot one
+294,912-byte page with the conv rows from byte 0, then the recurrent state, then
+padding of fixed random bytes that the kernel must leave as it is.
+
 With ``VLLM_NEURON_CPU_MODE=1`` and ``NKI_SIMULATOR=1`` the kernel runs on the NKI
 simulator; otherwise on ``neuron:0``.
 """
@@ -48,6 +52,9 @@ DIM = 128
 WIDTH = HEADS * DIM
 COLUMNS = 4 * WIDTH + DIM + HEADS
 BANK_SLOTS = 9
+PAGE_BYTES = 294_912
+CONV_BYTES = 3 * 3 * WIDTH * 2
+STATE_END = CONV_BYTES + HEADS * DIM * DIM * 4
 SLOT_IDS = {4: (7, 2, 5, 0), 1: (6,)}
 LONG_STEPS = 8192
 NAN_ROW = 2
@@ -166,8 +173,8 @@ def _oracle(ref, x, conv_rows, states):
     return core, new_rows, cache.recurrent_states[LAYER].transpose(-1, -2)
 
 
-def _step(x, slots, conv_bank, state_bank, weights, lower_bound, norm_eps):
-    return fused_decode.kda_fused_decode(x, slots, conv_bank, state_bank, **weights,
+def _step(x, slots, pages, weights, lower_bound, norm_eps):
+    return fused_decode.kda_fused_decode(x, slots, pages, **weights,
                                          lower_bound=lower_bound, norm_eps=norm_eps)
 
 
@@ -175,17 +182,37 @@ _compiled = torch.compile(_step, backend=envs.get_compile_backend_name(), fullgr
                           dynamic=False) if ON_DEVICE else None
 
 
+def _pages(conv_bank, state_bank):
+    """The two banks in one int8 page buffer, one page per slot, with fixed padding bytes."""
+    slots = conv_bank.shape[0]
+    pages = torch.randint(-128, 128, (slots, PAGE_BYTES), dtype=torch.int8,
+                          generator=torch.Generator().manual_seed(0))
+    pages[:, :CONV_BYTES] = conv_bank.reshape(slots, -1).view(torch.int8)
+    pages[:, CONV_BYTES:STATE_END] = state_bank.reshape(slots, -1).view(torch.int8)
+    return pages
+
+
+def _banks_of(pages):
+    """The conv and state banks read back out of a page buffer."""
+    conv_bank = pages[:, :CONV_BYTES].contiguous().view(torch.bfloat16)
+    state_bank = pages[:, CONV_BYTES:STATE_END].contiguous().view(torch.float32)
+    return conv_bank.reshape(-1, 3, 3 * WIDTH), state_bank.reshape(-1, HEADS, DIM, DIM)
+
+
 def _run(ref, x, slots, conv_bank, state_bank):
     """One kernel step; returns the core output as [T, 384] and both banks, all on the CPU."""
+    pages = _pages(conv_bank, state_bank)
+    padding = pages[:, STATE_END:].clone()
     if ON_DEVICE:
-        on = [t.to("neuron:0") for t in (x, slots, conv_bank, state_bank)]
+        on = [t.to("neuron:0") for t in (x, slots, pages)]
         weights = {name: t.to("neuron:0") for name, t in ref.weights.items()}
-        core, conv_bank, state_bank = (t.cpu() for t in _compiled(*on, weights, ref.lower, ref.eps))
+        core, pages = (t.cpu() for t in _compiled(*on, weights, ref.lower, ref.eps))
     else:
-        core, conv_bank, state_bank = _step(x, slots, conv_bank, state_bank, ref.weights, ref.lower, ref.eps)
+        core, pages = _step(x, slots, pages, ref.weights, ref.lower, ref.eps)
     tokens = x.shape[0]
     assert core.shape == (DIM, tokens, HEADS, 1), f"core {tuple(core.shape)}, expected [128, T, 3, 1]"
-    return core[..., 0].permute(1, 2, 0).reshape(tokens, WIDTH), conv_bank, state_bank
+    assert torch.equal(pages[:, STATE_END:], padding), "the kernel wrote page padding"
+    return core[..., 0].permute(1, 2, 0).reshape(tokens, WIDTH), *_banks_of(pages)
 
 
 def _class_b(out, ref):

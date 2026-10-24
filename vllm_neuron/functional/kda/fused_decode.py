@@ -11,11 +11,12 @@ of the output::
     S       = decay * S;  S += k (sigmoid(b) * (v - S^T k))^T  # S is [K, V]
     core    = rmsnorm(S^T q) * o_norm_weight * sigmoid(g)
 
-The kernel reads each token's conv rows and recurrent state from the banks at
-the token's slot, and writes the advanced rows back to the same slot, so the
-banks are updated in place and returned. The tokens split over the logical
-core's programs, so each program writes whole rows: its tokens' bank rows and
-its tokens' runs of the output.
+The two states live in the KV cache's page buffer, one page per slot: the conv
+rows from the page's first byte, then the recurrent state. The kernel reads
+each token's rows from its slot's page and writes the advanced rows back to the
+same page, so the buffer is updated in place and returned. The tokens split
+over the logical core's programs, so each program writes whole rows: its
+tokens' pages and its tokens' runs of the output.
 
 The output is [128, T, 3, 1], head dimension first: the input layout of the
 output projection's decode kernel.
@@ -45,8 +46,10 @@ L2_EPS = 1e-6
 MAX_TOKENS = 32
 TOKENS_PER_PASS = 4
 CELLS_PER_BANK = 4
+CONV_BYTES = ROWS * CONV_WIDTH * 2
+STATE_BYTES = HEADS * DIM * DIM * 4
 # Fixed-address loads use descriptors built at compile time, which keeps them off the
-# GpSimd queue; a bank row's address comes from its slot, read at run time.
+# GpSimd queue; a page's address comes from its slot, read at run time.
 STATIC = nisa.dge_mode.none
 BY_SLOT = nisa.dge_mode.hwdge
 
@@ -54,8 +57,7 @@ BY_SLOT = nisa.dge_mode.hwdge
 def kda_fused_decode(
     x: torch.Tensor,
     slots: torch.Tensor,
-    conv_bank: torch.Tensor,
-    state_bank: torch.Tensor,
+    pages: torch.Tensor,
     q_conv_weight: torch.Tensor,
     k_conv_weight: torch.Tensor,
     v_conv_weight: torch.Tensor,
@@ -66,32 +68,34 @@ def kda_fused_decode(
     *,
     lower_bound: float,
     norm_eps: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run one decode step; returns the gated-norm output and the two updated banks.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run one decode step; returns the gated-norm output and the updated page buffer.
 
     Args:
         x: [T, 1667] bf16 projections per token, columns q, k, v, g (each 384),
             f_a (128) and the 3 beta logits.
-        slots: [T] int32 bank slot of each token. Slots are distinct, and every
-            slot is inside the banks; a padding token takes a slot of its own.
-        conv_bank: [slots, 3, 1152] bf16 conv rows, oldest first, channels q | k | v.
-        state_bank: [slots, 3, 128, 128] fp32 recurrent state per head, [K, V].
+        slots: [T] int32 page of each token. Slots are distinct, and every slot
+            is a page of the buffer; a padding token takes a slot of its own.
+        pages: [slots, page bytes] contiguous int8 page buffer, updated in place. A page
+            holds the conv rows [3, 1152] bf16 from byte 0, oldest first, channels q | k | v,
+            then the fp32 recurrent state [3, 128, 128] per head, [K, V]. No other byte is written.
         q_conv_weight, k_conv_weight, v_conv_weight: [384, 1, 4] fp32 taps.
         a_log: [3] fp32. dt_bias: [384] fp32. f_b_weight: [384, 128] bf16.
         o_norm_weight: [128] fp32.
 
     Returns:
         core [128, T, 3, 1] bf16, element [d, t, h] the channel d of head h of token t,
-        and conv_bank and state_bank with the token slots advanced.
+        and the page buffer with the token pages advanced.
     """
     tokens = x.shape[0]
     assert x.shape == (tokens, COLUMNS) and x.dtype == torch.bfloat16, f"x {tuple(x.shape)} {x.dtype}"
     assert 1 <= tokens <= MAX_TOKENS, f"{tokens} tokens; the kernel takes 1 to {MAX_TOKENS}"
     assert slots.shape == (tokens,) and slots.dtype == torch.int32, \
         f"slots {tuple(slots.shape)} {slots.dtype}"
-    assert conv_bank.shape[1:] == (ROWS, CONV_WIDTH) and conv_bank.dtype == torch.bfloat16
-    assert state_bank.shape[1:] == (HEADS, DIM, DIM) and state_bank.dtype == torch.float32
-    assert conv_bank.shape[0] == state_bank.shape[0]
+    assert pages.dim() == 2 and pages.dtype == torch.int8, f"pages {tuple(pages.shape)} {pages.dtype}"
+    assert pages.is_contiguous(), f"pages strides {pages.stride()}: pass the raw page buffer, not a view"
+    assert pages.shape[1] >= CONV_BYTES + STATE_BYTES and pages.shape[1] % 4 == 0, \
+        f"a {pages.shape[1]}-byte page cannot hold the states at fp32 alignment"
     for weight in (q_conv_weight, k_conv_weight, v_conv_weight):
         assert weight.shape == (WIDTH, 1, TAPS) and weight.dtype == torch.float32
     assert a_log.shape == (HEADS,) and dt_bias.shape == (WIDTH,) and o_norm_weight.shape == (DIM,)
@@ -99,19 +103,22 @@ def kda_fused_decode(
     if not can_run_kernel(x):
         raise RuntimeError("kda_fused_decode needs a Neuron device or the NKI simulator")
     kernel = wrap_nki(kda_fused_decode_kernel)[get_logical_nc_config()]
-    return kernel(x=x, slots=slots.reshape(1, tokens), conv_bank=conv_bank, state_bank=state_bank,
+    return kernel(x=x, slots=slots.reshape(1, tokens), pages=pages,
                   q_w=q_conv_weight, k_w=k_conv_weight, v_w=v_conv_weight, a_log=a_log,
                   dt_bias=dt_bias, f_b=f_b_weight, o_w=o_norm_weight,
                   lower_bound=float(lower_bound), norm_eps=float(norm_eps))
 
 
 @nki.jit
-def kda_fused_decode_kernel(x, slots, conv_bank, state_bank, q_w, k_w, v_w, a_log, dt_bias, f_b,
-                            o_w, lower_bound, norm_eps):
-    """The decode step of :func:`kda_fused_decode`; the banks are written in place."""
+def kda_fused_decode_kernel(x, slots, pages, q_w, k_w, v_w, a_log, dt_bias, f_b, o_w,
+                            lower_bound, norm_eps):
+    """The decode step of :func:`kda_fused_decode`; the page buffer is written in place."""
     tokens = x.shape[0]
     kernel_assert(x.shape[1] == COLUMNS, f"x has {x.shape[1]} columns, expected {COLUMNS}")
     core = nl.ndarray((DIM, tokens, HEADS, 1), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+    # One page per slot, read in each state's dtype: a slot step is one page.
+    conv_pages = pages.view(nl.bfloat16)
+    state_pages = pages.view(nl.float32)
 
     programs = nl.num_programs(0)
     program = nl.program_id(0)
@@ -124,8 +131,8 @@ def kda_fused_decode_kernel(x, slots, conv_bank, state_bank, q_w, k_w, v_w, a_lo
         nisa.dma_copy(dst=idx, src=slots, dge_mode=STATIC)
         for t0 in range(first, end, TOKENS_PER_PASS):
             nt = min(TOKENS_PER_PASS, end - t0)
-            _step_tokens(x, idx, conv_bank, state_bank, core, consts, t0, nt, lower_bound, norm_eps)
-    return core, conv_bank, state_bank
+            _step_tokens(x, idx, conv_pages, state_pages, core, consts, t0, nt, lower_bound, norm_eps)
+    return core, pages
 
 
 def _load_constants(q_w, k_w, v_w, a_log, dt_bias, f_b, o_w):
@@ -169,8 +176,8 @@ def _rows(dtype, n):
     return nl.ndarray((DIM, DIM), dtype=dtype, buffer=nl.sbuf)[0:n]
 
 
-def _step_tokens(x, idx, conv_bank, state_bank, core, consts, t0, nt, lower_bound, norm_eps):
-    """Step tokens t0 .. t0+nt-1 and store their output columns and bank rows."""
+def _step_tokens(x, idx, conv_pages, state_pages, core, consts, t0, nt, lower_bound, norm_eps):
+    """Step tokens t0 .. t0+nt-1 and store their output columns and page rows."""
     taps, bias, a_exp, norm_w, fb_t, ones, neg_eye = consts
     tokens = x.shape[0]
     nh = HEADS
@@ -178,23 +185,24 @@ def _step_tokens(x, idx, conv_bank, state_bank, core, consts, t0, nt, lower_boun
     blocks = 3 * nh
     slot = [idx.ap(pattern=[[tokens, 1], [1, 1]], offset=t0 + u) for u in range(nt)]
 
-    # Bank rows by slot: per token its 3 conv rows then its own row, and its state.
+    # Page rows by slot: per token its 3 conv rows then its own row, and its state.
     rows = nl.ndarray((DIM, 3, WIDTH), dtype=nl.bfloat16, buffer=nl.sbuf)
     state = nl.ndarray((DIM, cells, DIM), dtype=nl.float32, buffer=nl.sbuf)
     for u in range(nt):
         nisa.dma_copy(dst=rows[TAPS * u:TAPS * u + ROWS],
-                      src=conv_bank.ap(pattern=[[CONV_WIDTH, ROWS], [1, CONV_WIDTH]], offset=0,
-                                       scalar_offset=slot[u], indirect_dim=0),
-                      dge_mode=BY_SLOT)
+                      src=_conv_rows(conv_pages, slot[u]), dge_mode=BY_SLOT)
         nisa.dma_copy(dst=rows[TAPS * u + ROWS:TAPS * (u + 1)],
                       src=x.ap(pattern=[[COLUMNS, 1], [1, CONV_WIDTH]], offset=(t0 + u) * COLUMNS),
                       dge_mode=STATIC)
-        nisa.dma_copy(dst=state[:, u * nh:(u + 1) * nh, :],
-                      src=state_bank.ap(pattern=[[DIM, DIM], [DIM * DIM, nh], [1, DIM]], offset=0,
-                                        scalar_offset=slot[u], indirect_dim=0),
+        nisa.dma_copy(dst=state[:, u * nh:(u + 1) * nh, :], src=_state_rows(state_pages, slot[u]),
+                      dge_mode=BY_SLOT)
+    # Each token's 3 newest conv rows are ready once loaded. Stores into the one page buffer
+    # keep their program order, so these go first, ahead of the state stores.
+    for u in range(nt):
+        nisa.dma_copy(dst=_conv_rows(conv_pages, slot[u]), src=rows[TAPS * u + 1:TAPS * (u + 1)],
                       dge_mode=BY_SLOT)
 
-    # Token columns that do not depend on the banks.
+    # Token columns that do not depend on the pages.
     fa_t = nl.ndarray((DIM, nt), dtype=nl.bfloat16, buffer=nl.sbuf)
     nisa.dma_copy(dst=fa_t, src=x.ap(pattern=[[1, DIM], [COLUMNS, nt]], offset=t0 * COLUMNS + FA_COL),
                   dge_mode=STATIC)
@@ -304,13 +312,21 @@ def _step_tokens(x, idx, conv_bank, state_bank, core, consts, t0, nt, lower_boun
     nisa.tensor_tensor(dst=y, data1=out_ps, data2=scale, op=nl.multiply)
 
     # Stores: the output columns (cell c is item 3 t0 + c of the [128, 3T] layout), then each
-    # token's state and its 3 newest conv rows.
+    # token's state, into its page.
     nisa.dma_copy(dst=core.ap(pattern=[[HEADS * tokens, DIM], [1, cells]], offset=HEADS * t0), src=y,
                   dge_mode=STATIC)
     for u in range(nt):
-        nisa.dma_copy(dst=state_bank.ap(pattern=[[DIM, DIM], [DIM * DIM, nh], [1, DIM]], offset=0,
-                                        scalar_offset=slot[u], indirect_dim=0),
-                      src=updated[:, u * nh:(u + 1) * nh, :], dge_mode=BY_SLOT)
-        nisa.dma_copy(dst=conv_bank.ap(pattern=[[CONV_WIDTH, ROWS], [1, CONV_WIDTH]], offset=0,
-                                       scalar_offset=slot[u], indirect_dim=0),
-                      src=rows[TAPS * u + 1:TAPS * (u + 1)], dge_mode=BY_SLOT)
+        nisa.dma_copy(dst=_state_rows(state_pages, slot[u]), src=updated[:, u * nh:(u + 1) * nh, :],
+                      dge_mode=BY_SLOT)
+
+
+def _conv_rows(conv_pages, slot):
+    """The 3 conv rows [3, 1152] of the slot's page, from byte 0."""
+    return conv_pages.ap(pattern=[[CONV_WIDTH, ROWS], [1, CONV_WIDTH]], offset=0,
+                         scalar_offset=slot, indirect_dim=0)
+
+
+def _state_rows(state_pages, slot):
+    """The slot's recurrent state as [K, heads, V], right after its conv rows in the page."""
+    return state_pages.ap(pattern=[[DIM, DIM], [DIM * DIM, HEADS], [1, DIM]], offset=CONV_BYTES // 4,
+                          scalar_offset=slot, indirect_dim=0)
