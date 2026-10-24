@@ -190,7 +190,7 @@ def _state_slots(meta) -> torch.Tensor:
     """Each sequence's state slot: column 0 of its KDA group's block table.
 
     With prefix caching off a sequence holds one block per state group, and a padding
-    row holds the null block 0, which the bank has as a scratch slot.
+    row holds the null block 0: a scratch page that no request owns.
     """
     return meta["block_table_tensor"][:, 0].long()
 
@@ -225,9 +225,11 @@ class KimiK3KDA(nn.Module):
         self.register_buffer("forget_weight", None, persistent=False)
         self.register_buffer("output_weight", None, persistent=False)
         # Per-sequence conv [slots, taps - 1, 3W] and recurrent [slots, heads, D, D]
-        # state banks, bound with the KV caches.
+        # state banks, and the int8 [slots, page bytes] page buffer they are views of,
+        # bound with the KV caches.
         self.conv_state = None
         self.recurrent_state = None
+        self.pages = None
 
     def prepare_after_load(self) -> None:
         """Lay out the weights the kernels read, once.
@@ -295,18 +297,14 @@ class KimiK3KDA(nn.Module):
         return kda_output_prefill(core, gate, self.o_norm.weight, self.o_proj.weight, self.eps)
 
     def forward_decode(self, mix, k_slice, norm_weight, meta) -> torch.Tensor:
-        """One KDA decode step with state rows by slot; returns the ``[T, H]`` bf16 partial."""
+        """One KDA decode step on the page buffer by slot; returns the ``[T, H]`` bf16 partial."""
         proj = _project(mix, self.input_weight, norm_weight, self.eps)
-        # The kernel takes contiguous banks, and the bound banks are page-strided
-        # views. So the step runs on the tokens' rows, which then go back by slot.
-        slots = _state_slots(meta)
-        rows = torch.arange(slots.shape[0], dtype=torch.int32, device=slots.device)
-        # core: [128, T, heads, 1] bf16, the output projection's input layout.
-        core, conv, state = kda_fused_decode(
+        # core: [128, T, heads, 1] bf16, the output projection's input layout. The
+        # kernel writes each token's page in place, so the returned buffer is not kept.
+        core, _ = kda_fused_decode(
             proj,
-            rows,
-            self.conv_state.index_select(0, slots),
-            self.recurrent_state.index_select(0, slots),
+            _state_slots(meta).int(),
+            self.pages,
             self.q_conv1d.weight,
             self.k_conv1d.weight,
             self.v_conv1d.weight,
@@ -317,8 +315,6 @@ class KimiK3KDA(nn.Module):
             lower_bound=self.lower_bound,
             norm_eps=self.eps,
         )
-        self.conv_state.index_copy_(0, slots, conv)
-        self.recurrent_state.index_copy_(0, slots, state)
         return _output_projection(core, self.output_weight)
 
 
@@ -841,14 +837,14 @@ class KimiK3ForConditionalGeneration(nn.Module):
         return KVSpec(layers=layers)
 
     def bind_kv_cache(self, kv_caches: dict[str, list[torch.Tensor]]) -> None:
-        """Bind each MLA layer's latent cache and each KDA layer's conv and recurrent state."""
+        """Bind each MLA layer's latent cache, and each KDA layer's state views and page buffer."""
         for i, layer in enumerate(self.model.layers):
             name = f"layers.{i}.self_attn"
             if name not in kv_caches:
                 raise KeyError(f"KV cache for layer {name} not initialized")
             attn = layer.self_attn
             if layer.is_kda:
-                attn.conv_state, attn.recurrent_state = kv_caches[name]
+                attn.conv_state, attn.recurrent_state, attn.pages = kv_caches[name]
             else:
                 # [blocks, 1, block_size, D]: one latent head.
                 attn.kv_cache = kv_caches[name][0].squeeze(1)

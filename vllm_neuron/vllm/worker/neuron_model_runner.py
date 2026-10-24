@@ -11063,6 +11063,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 _kv_slices[key] = slices
             return slices
 
+        _page_views: dict[tuple[int, int], torch.Tensor] = {}
+
+        def _shared_page_view(raw: torch.Tensor, page: int) -> torch.Tensor:
+            """``[blocks, page]`` view of a state buffer, memoized like the slices."""
+            key = (id(raw), page)
+            view = _page_views.get(key)
+            if view is None:
+                view = raw.view(-1, page)
+                _page_views[key] = view
+            return view
+
         _packed_k_views: dict[tuple[int, tuple], torch.Tensor] = {}
 
         def _shared_packed_k(k_cache: torch.Tensor, shape: tuple) -> torch.Tensor:
@@ -11182,13 +11193,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
             # A state page holds the layer's states back to back (e.g. conv rows, then
             # the recurrent state). Each state is a view whose block stride is the
-            # page, as in vLLM's MambaBase.bind_kv_cache.
+            # page, as in vLLM's MambaBase.bind_kv_cache. The layer also gets the
+            # contiguous page buffer itself, for kernels that address pages by slot.
             elif isinstance(kv_cache_spec, MambaSpec):
                 page = kv_cache_spec.page_size_bytes
                 for layer_name in group.layer_names:
                     raw_tensor = kv_cache_raw_tensors[layer_name]
                     assert raw_tensor.numel() % page == 0
-                    pages = raw_tensor.view(-1, page)
+                    # One page view per buffer, shared by its layers, for the same
+                    # reason as the shared slices above.
+                    pages = _shared_page_view(raw_tensor, page)
                     self._state_pages[layer_name] = pages
                     states, offset = [], 0
                     for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
@@ -11196,7 +11210,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                         state = pages[:, offset : offset + nbytes].view(dtype)
                         states.append(state.view(-1, *shape))
                         offset += nbytes
-                    kv_caches[layer_name] = states
+                    kv_caches[layer_name] = [*states, pages]
 
             else:
                 raise NotImplementedError(
