@@ -24,6 +24,7 @@ from vllm.distributed.parallel_state import get_tp_group, model_parallel_is_init
 from vllm_neuron.functional.attention.attn_res_prefill import attn_res_prefill
 from vllm_neuron.functional.attention.o_proj import o_proj_tkg
 from vllm_neuron.functional.embedding import embedding
+from vllm_neuron.functional.kda.fused_decode import kda_fused_decode
 from vllm_neuron.functional.kda.output import kda_output_prefill
 from vllm_neuron.functional.moe.fused_tail import moe_fused_tail
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
@@ -53,7 +54,6 @@ def _optional_kernel(module: str, name: str):
 
 qkv_proj_fp32acc = _optional_kernel("attention.qkv_fp32acc", "qkv_proj_fp32acc")
 attn_res_decode = _optional_kernel("attention.attn_res_decode", "attn_res_decode")
-kda_fused_decode = _optional_kernel("kda.fused_decode", "kda_fused_decode")
 kda_prefill = _optional_kernel("kda.prefill", "kda_prefill")
 depthwise_conv1d_silu = _optional_kernel("kda.depthwise_conv1d", "depthwise_conv1d_silu")
 mla_paged_attention = _optional_kernel("attention.mla_paged", "mla_paged_attention")
@@ -224,20 +224,28 @@ class KimiK3KDA(nn.Module):
     def forward_decode(self, mix, k_slice, norm_weight, meta) -> torch.Tensor:
         """One KDA decode step with state rows by slot; returns the ``[T, H]`` bf16 partial."""
         proj = _project(mix, self._input_weights(), norm_weight, self.eps)
-        # [128, T, heads, 1] bf16: the output projection's input layout.
-        core = _require(kda_fused_decode, "KDA decode step")(
+        # The kernel takes contiguous banks, and the bound banks are page-strided
+        # views. So the step runs on the tokens' rows, which then go back by slot.
+        slots = meta["state_slots"].long()
+        rows = torch.arange(slots.shape[0], dtype=torch.int32, device=slots.device)
+        # core: [128, T, heads, 1] bf16, the output projection's input layout.
+        core, conv, state = kda_fused_decode(
             proj,
-            self.f_b_proj.weight,
-            self.conv_weight,
+            rows,
+            self.conv_state.index_select(0, slots),
+            self.recurrent_state.index_select(0, slots),
+            self.q_conv1d.weight,
+            self.k_conv1d.weight,
+            self.v_conv1d.weight,
             self.A_log,
             self.dt_bias,
+            self.f_b_proj.weight,
             self.o_norm.weight,
-            slots=meta["state_slots"],
-            conv_state=self.conv_state,
-            recurrent_state=self.recurrent_state,
-            eps=self.eps,
             lower_bound=self.lower_bound,
+            norm_eps=self.eps,
         )
+        self.conv_state.index_copy_(0, slots, conv)
+        self.recurrent_state.index_copy_(0, slots, state)
         return _output_projection(core, self.output_weight)
 
 
