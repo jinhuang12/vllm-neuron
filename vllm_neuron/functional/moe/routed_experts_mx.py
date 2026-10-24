@@ -481,22 +481,15 @@ def _latent_mx(groups, rows, latent):
     return quant, scale
 
 
-def _operand_tiles(nk, ni, nd, defined=False):
-    """SBUF tiles for one expert's operands on one program, allocated once.
-
-    With ``defined``, the scales start at 0, so a pass over the tiles before any load
-    reads finite values.
-    """
+def _operand_tiles(nk, ni, nd):
+    """SBUF tiles for one expert's operands on one program, allocated once."""
     gate_up = nl.ndarray((128, 2 * ni, nk * _KT), dtype=nl.float4_e2m1fn_x4, buffer=nl.sbuf)
     down = nl.ndarray((128, nd, ni * _KT), dtype=nl.float4_e2m1fn_x4, buffer=nl.sbuf)
     scales = []
     for blocks in (2 * ni * nk, nd * ni):
         scale = nl.ndarray((128, blocks // _SLOTS * _KT), dtype=nl.uint8, buffer=nl.sbuf)
-        if defined:
-            nisa.memset(dst=scale, value=0, engine=nisa.engine.gpsimd)
-        else:
-            # The products read only the 12 rows per quadrant that every load writes.
-            nisa.memset(dst=scale[0:1, 0:4], value=0, engine=nisa.engine.gpsimd)
+        # The products read only the 12 rows per quadrant that every load writes.
+        nisa.memset(dst=scale[0:1, 0:4], value=0, engine=nisa.engine.gpsimd)
         scales.append(scale)
     return gate_up, scales[0], down, scales[1]
 
@@ -507,14 +500,16 @@ def _scale_block(scale, block, blocks):
     return scale[4 * slot:, local * _KT:(local + 1) * _KT]
 
 
-def _load_operands(bank, expert, half, tiles, dge):
+def _load_operands(bank, expert, half, tiles, dge, spread=False):
     """DMA expert ``expert`` of ``bank`` for ``half``: ten DMAs.
 
-    ``expert`` is an int, a static address, or a [1, 1] uint32 tile read at run time.
-    All go on the queue of ``dge``. Run-time loads issue in program order, each weight
-    ahead of its scales, so the weight packets start first and the scale packets fill in
-    behind them; static loads are placed by the scheduler. A run-time id past the bank's
-    last expert moves nothing.
+    ``expert`` is an int (a static address), a [1, 1] uint32 tile read at run time, or a
+    register that holds the id. All go on the queue of ``dge``. Run-time loads issue in
+    program order, each weight ahead of its scales, so the weight packets start first and
+    the scale packets fill in behind them; static loads are placed by the scheduler. A
+    copy's rows go to the copy engines by row index, so a quadrant's 12 scale rows reach 12
+    of the 16; with ``spread`` each row goes in 4 parts, and the quadrant's 48 pieces reach
+    all 16, 3 each. A run-time id past the bank's last expert moves nothing.
     """
     gate_up_weight, gate_up_scale, down_weight, down_scale = bank
     gate_up, gate_up_s, down, down_s = tiles
@@ -522,6 +517,8 @@ def _load_operands(bank, expert, half, tiles, dge):
     with contextlib.nullcontext() if static else nl.no_reorder():
         if static:
             index, base = None, expert
+        elif isinstance(expert, nisa.VirtualRegister):
+            index, base = expert, 0
         else:
             index, base = nisa.register_alloc(), 0
             nisa.register_load(dst=index, src=expert)
@@ -537,10 +534,17 @@ def _load_operands(bank, expert, half, tiles, dge):
                                   scalar_offset=index, indirect_dim=0),
                 oob_mode=nisa.oob_mode.skip, **dge)
             quad_rows = slot_rows // 4
+            pattern = [[run, quad_rows], [1, run]]
+            if spread:
+                # Four parts per row, 32-byte aligned, each 128 bytes into the next, so the
+                # parts do not merge back into rows; the overlaps carry the same bytes.
+                part = (run // 128 - 1) * 32
+                pattern = [[run, quad_rows], [part, 4], [1, run - 3 * part]]
             for quad in range(4):
+                rows = scale_dst[32 * quad:32 * quad + quad_rows, :]
                 nisa.dma_copy(
-                    dst=scale_dst[32 * quad:32 * quad + quad_rows, :],
-                    src=scale_src.ap(pattern=[[run, quad_rows], [1, run]],
+                    dst=rows.ap(pattern=pattern) if spread else rows,
+                    src=scale_src.ap(pattern=pattern,
                                      offset=((base * halves + half) * slot_rows
                                              + quad * quad_rows) * run,
                                      scalar_offset=index, indirect_dim=0),
@@ -617,6 +621,18 @@ def _stage(table, p, dst, dge):
     return dst
 
 
+def _stage_pair(pairs, p, rows, dge):
+    """DMA pair ``p`` (a register) of the SBUF ``pairs [rows, n, 2]`` into a new [rows, 2] tile.
+
+    A full-height tile starts at partition 0, as the accumulator does.
+    """
+    _, n, two = pairs.shape
+    dst = nl.ndarray((128, two), dtype=pairs.dtype, buffer=nl.sbuf)[0:rows, :]
+    nisa.dma_copy(dst=dst, src=pairs.ap(pattern=[[n * two, rows], [1, two]], scalar_offset=p,
+                                        indirect_dim=1), **dge)
+    return dst
+
+
 def _code_sink(exposed, table, p, program, dge):
     """Stage the local expert in column ``p`` of ``table`` for the test mode's outputs.
 
@@ -644,12 +660,14 @@ def _visit_experts(chosen, affinity, stationary, stationary_scale, bank, program
                    beta, linear_beta, exposed=None):
     """Run each local expert with a chosen token once, ascending, next expert's loads in flight.
 
-    One hardware loop runs the items in pairs (2p, 2p + 1) on two operand buffers swapped
-    statically: item 2p + 1 loads while 2p computes, and 2p + 2 while 2p + 1 computes. Each
-    pass stages the next pass's first expert id before it ends, so that load starts at the
-    top of the pass. A load past the last item names no expert and moves nothing, so each of
-    the ``count`` items loads once. With an odd count the last pass also computes a padding item at
-    affinity 0 on the second buffer's resident data, and stores none of its codes.
+    One hardware loop runs the full pairs (2p, 2p + 1) on two operand buffers swapped
+    statically: item 2p + 1 loads while 2p computes, and 2p + 2 while 2p + 1 computes. The
+    loop's condition register holds item 2p + 1's expert id, so each pass reads the id of its
+    first load before the pass starts; past the last full pair it holds 0. The pass number
+    lives in SBUF. A load past the last item names no expert and moves nothing, so each of the
+    ``count`` items loads once. With an odd count a second loop of one pass computes the last
+    item from the first buffer, where the last pair pass loaded it; no item is computed that
+    was not chosen.
     ``exposed``, in the test mode, is the (codes, scales) HBM outputs indexed by local expert.
     """
     rows, local = chosen.shape
@@ -668,12 +686,22 @@ def _visit_experts(chosen, affinity, stationary, stationary_scale, bank, program
     nisa.tensor_copy(dst=hits, src=counts)
     visit = _tile(1, local + 1, nl.int32)
     nisa.nonzero_with_count(dst=visit, src=hits, index_offset=0, padding_val=local)
+
+    buffers = [_operand_tiles(nk, two_ni // 2, nd) for _ in range(2)]
+    loads = {}  # the compiler's descriptor queue, on the GpSimd engine
+    # The first expert's loads go out ahead of the tables below.
+    _load_operands(bank, visit[:, 0:1], program, buffers[0], loads, spread=True)
+
     count = _tile(1, 1, nl.uint32)
     nisa.tensor_copy(dst=count, src=visit[:, local:local + 1])
+    pairs_n = _tile(1, 1, nl.uint32)
+    nisa.tensor_scalar(dst=pairs_n, data=count, op0=nl.right_shift, operand0=1)
     rounded = _tile(1, 1, nl.uint32)
     nisa.tensor_scalar(dst=rounded, data=count, op0=nl.add, operand0=1)
     passes_n = _tile(1, 1, nl.uint32)
     nisa.tensor_scalar(dst=passes_n, data=rounded, op0=nl.right_shift, operand0=1)
+    full_pairs = nisa.register_alloc()
+    nisa.register_load(dst=full_pairs, src=pairs_n)
     passes = nisa.register_alloc()
     nisa.register_load(dst=passes, src=passes_n)
     flat = _tile(1, padded, nl.int32)
@@ -696,28 +724,31 @@ def _visit_experts(chosen, affinity, stationary, stationary_scale, bank, program
     item_aff = nl.ndarray((rows, padded), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_reduce(dst=item_aff, data=spread, op=nl.add, axis=(2,))
 
-    # Per pair position q: item 2p + q's expert (q < 4) and affinity column (q < 2) at
-    # loop register p.
-    expert_at, aff_at = [], []
-    for q in range(4):
+    # Per pair position q < 3: item 2p + q's expert at pass p. Items 2p and 2p + 1 have
+    # adjacent affinity columns, so one stage brings both.
+    expert_at = []
+    for q in range(3):
         e_q = _tile(1, pairs, nl.int32)
         nisa.tensor_copy(dst=e_q, src=flat.ap(pattern=[[padded, 1], [2, pairs]], offset=q))
         expert_at.append(e_q)
-    for q in range(2):
-        a_q = nl.ndarray((rows, pairs), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_copy(dst=a_q, src=item_aff.ap(pattern=[[padded, rows], [2, pairs]], offset=q))
-        aff_at.append(a_q)
+    pair_aff = item_aff.reshape((rows, padded // 2, 2))
+    # The loop condition at pass p: item 2p + 1's expert id where that item is real, else 0.
+    # A real item 2p + 1 follows item 2p in ascending order, so its id is at least 1.
+    odd = flat_f.ap(pattern=[[padded, 1], [2, pairs + 1]], offset=1)
+    condition = _tile(1, pairs + 1, nl.int32)
+    nisa.scalar_tensor_tensor(dst=condition, data=odd, op0=nl.less, operand0=float(local),
+                              op1=nl.multiply, operand1=odd)
+    next_condition = _tile(1, pairs, nl.int32)
+    nisa.tensor_copy(dst=next_condition, src=condition[:, 1:pairs + 1])
+    first_pair = nisa.register_alloc()
+    nisa.register_load(dst=first_pair, src=condition[:, 0:1])
+    step = _tile(1, 1, nl.uint32)
+    nisa.memset(dst=step, value=0)
 
-    buffers = [_operand_tiles(nk, two_ni // 2, nd, defined=b == 1) for b in range(2)]
-    loads = {}  # the compiler's descriptor queue, on the GpSimd engine
     # Table entries go on the Sync engine's hardware queue, so they wait behind no expert load.
     entries = dict(dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync)
-    first = _tile(1, 1, nl.uint32)
-    nisa.tensor_copy(dst=first, src=flat[:, 0:1])
-    _load_operands(bank, first, program, buffers[0], loads)
-    upcoming = _tile(1, 1, nl.uint32)
-    nisa.tensor_copy(dst=upcoming, src=flat[:, 1:2])
     held = _tile(1, 1, nl.uint32)
+    upcoming = _tile(1, 1, nl.uint32)
 
     def compute(q, p, column, tiles):
         sink = None if exposed is None else _code_sink(exposed, expert_at[q], p, program, entries)
@@ -725,21 +756,29 @@ def _visit_experts(chosen, affinity, stationary, stationary_scale, bank, program
         with nl.no_reorder():
             _expert_rows(stationary, stationary_scale, tiles, column, acc, beta, linear_beta, sink)
 
-    def run_pair(p):
+    def run_pair(expert):
         # The pass's table entries stage ahead of its expert loads: an entry staged after a
         # run-time load waits for that load to land, and the second item's products with it.
-        # A full-height tile starts at partition 0, as the accumulator does.
-        columns = [nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)[0:rows, :] for _ in range(2)]
-        for q in range(2):
-            _stage(aff_at[q], p, columns[q], entries)
-        _stage(expert_at[2], p, held, entries)
-        _load_operands(bank, upcoming, program, buffers[1], loads)
-        compute(0, p, columns[0], buffers[0])
-        _load_operands(bank, held, program, buffers[0], loads)
-        compute(1, p, columns[1], buffers[1])
-        _stage(expert_at[3], p, upcoming, entries)
+        columns = _stage_pair(pair_aff, step, rows, entries)
+        _stage(expert_at[2], step, held, entries)
+        _stage(next_condition, step, upcoming, entries)
+        _load_operands(bank, expert, program, buffers[1], loads, spread=True)
+        compute(0, step, columns[:, 0:1], buffers[0])
+        _load_operands(bank, held, program, buffers[0], loads, spread=True)
+        compute(1, step, columns[:, 1:2], buffers[1])
+        nisa.tensor_scalar(dst=step, data=step, op0=nl.add, operand0=1)
+        # Read before the pass ends, so the next pass's first load needs no read of its own.
+        following = nisa.register_alloc()
+        nisa.register_load(dst=following, src=upcoming)
+        return following
 
-    nl.fori_loop(0, passes, run_pair)
+    def run_last(p):
+        columns = _stage_pair(pair_aff, p, rows, entries)
+        compute(0, p, columns[:, 0:1], buffers[0])
+
+    nl.while_loop(first_pair, run_pair)
+    # Item 2p at p = count // 2, which exists only for an odd count.
+    nl.fori_loop(full_pairs, passes, run_last)
 
 
 @nki.jit
