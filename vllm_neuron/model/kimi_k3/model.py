@@ -230,10 +230,15 @@ class KimiK3KDA(nn.Module):
         conv = _require(depthwise_conv1d_silu, "KDA short conv")(
             history, q, k, v, self.conv_weight
         )
+        heads, dim, tokens = self.num_heads, self.head_dim, conv.shape[1]
+        # The recurrence takes head-major gates: g [heads, T, D], beta [heads, T].
+        gates = forget.float().view(tokens, heads, dim).transpose(0, 1).contiguous()
         core, state = _require(kda_prefill, "KDA recurrence")(
-            conv, forget, beta, self.A_log, self.dt_bias,
-            state=seed, valid=valid, lower_bound=self.lower_bound,
+            *conv.split(heads * dim), gates, beta.t(), self.A_log,
+            self.dt_bias.view(heads, dim), state=seed, valid=valid,
+            lower_bound=self.lower_bound,
         )
+        core = core.transpose(0, 1).reshape(tokens, heads * dim)
         # The next chunk's conv rows: the last taps - 1 rows up to the last real token.
         rows = torch.cat([history, torch.cat([q, k, v], dim=-1)])
         last = valid.sum() + torch.arange(history.shape[0], device=rows.device)
