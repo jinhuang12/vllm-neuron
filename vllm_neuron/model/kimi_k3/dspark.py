@@ -10,11 +10,13 @@ their input width (each output is then all-reduced), and the second Markov
 weight by vocabulary. The first Markov weight and the norms are whole.
 """
 
+import math
 from dataclasses import dataclass, fields
 
 import torch
 import torch.distributed as dist
 from torch import nn
+from torch.distributed._functional_collectives import all_reduce
 from transformers import PretrainedConfig
 
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
@@ -23,11 +25,24 @@ from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 from vllm_neuron.utils.weight_loader import set_weight_loader, sharding_weight_loader
 
 from .config import _as_dict
-from .model import KimiK3RMSNorm, _tp_group, _Weight
+from .model import (
+    KimiK3RMSNorm,
+    _optional_kernel,
+    _output_projection,
+    _require,
+    _tp_group,
+    _Weight,
+)
+
+o_proj = _optional_kernel("attention.o_proj", "o_proj")
 
 # Checkpoint tensors the drafter does not load: the training-only confidence head,
 # and the embedding and LM head, which come from the target.
 SKIPPED_PREFIXES = ("confidence_head.", "embed_tokens.", "lm_head.")
+
+# The output-projection kernels' partition count: the TKG kernel's row limit per
+# call, and the widest K block of its input layout.
+_PARTITIONS = 128
 
 
 @dataclass
@@ -48,6 +63,9 @@ class K3DSparkConfig:
     markov_rank: int
     target_hidden_size: int
     target_layer_ids: tuple[int, ...]
+    max_position_embeddings: int
+    rope_parameters: dict
+    rope_interleave: bool = True
     torch_dtype: torch.dtype = torch.bfloat16
     neuron_config: NeuronConfig | None = None
 
@@ -73,6 +91,58 @@ def _per_rank(size: int, tp_size: int, what: str) -> int:
     if size % tp_size:
         raise ValueError(f"{what} {size} does not divide over tensor-parallel size {tp_size}")
     return size // tp_size
+
+
+def _yarn_mscale(scale: float, mscale: float) -> float:
+    """YaRN's attention scale for a context extended ``scale`` times."""
+    return 1.0 if scale <= 1 else 0.1 * mscale * math.log(scale) + 1.0
+
+
+def yarn_rope_table(c: K3DSparkConfig, positions: int) -> torch.Tensor:
+    """The draft's YaRN rotary for positions 0 to ``positions - 1``: ``[P, rope]`` fp32, cos | sin.
+
+    Every entry is computed in fp64 and rounded once to fp32.
+    """
+    rope = c.rope_parameters
+    if rope.get("rope_type") != "yarn" or not c.rope_interleave:
+        raise ValueError(f"the DSpark drafter takes an interleaved YaRN rotary, got {rope}")
+    dim, base, factor = c.qk_rope_head_dim, float(rope["rope_theta"]), float(rope["factor"])
+    original = rope["original_max_position_embeddings"]
+
+    def correction_dim(rotations: float) -> float:
+        return dim * math.log(original / (rotations * 2 * math.pi)) / (2 * math.log(base))
+
+    low = max(math.floor(correction_dim(rope.get("beta_fast", 32))), 0)
+    high = min(math.ceil(correction_dim(rope.get("beta_slow", 1))), dim - 1)
+    if low == high:
+        high += 0.001
+    ramp = ((torch.arange(dim // 2, dtype=torch.float64) - low) / (high - low)).clamp(0, 1)
+    freqs = base ** (torch.arange(0, dim, 2, dtype=torch.float64) / dim)
+    inv_freq = ramp / (factor * freqs) + (1 - ramp) / freqs
+    mscale = (
+        _yarn_mscale(factor, rope.get("mscale", 1))
+        / _yarn_mscale(factor, rope.get("mscale_all_dim", 0))
+        * rope.get("attn_factor", 1)
+    )
+    angles = torch.arange(positions, dtype=torch.float64)[:, None] * inv_freq
+    return (torch.cat([angles.cos(), angles.sin()], -1) * mscale).float()
+
+
+def _rotate_interleaved(x: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    """Rotate each (even, odd) column pair of ``x`` ``[T, L, rope]`` by its row's cos | sin."""
+    cos, sin = table[:, None].chunk(2, -1)
+    even, odd = x[..., 0::2], x[..., 1::2]
+    return torch.stack((even * cos - odd * sin, odd * cos + even * sin), -1).flatten(-2)
+
+
+def _k_shard_matmul(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """``x @ weight`` for this rank's K slice ``x`` ``[T, K]`` and ``weight`` ``[K, N]``."""
+    rows, width = x.shape
+    if rows > _PARTITIONS:
+        return _require(o_proj, "output projection")(x[None], weight)[0]
+    blocks = -(-width // _PARTITIONS)
+    layout = x.reshape(rows, blocks, width // blocks).permute(2, 0, 1).unsqueeze(-1)
+    return _output_projection(layout, weight)
 
 
 class _ShardedWeight(_Weight):
@@ -149,12 +219,18 @@ class K3DSparkMarkovHead(nn.Module):
 class K3DSparkForCausalLM(nn.Module):
     """The DSpark drafter with the target's embedding and LM head."""
 
-    def __init__(self, config: K3DSparkConfig, start_layer_idx: int = 0):
+    def __init__(
+        self, config: K3DSparkConfig, start_layer_idx: int = 0, max_positions: int | None = None
+    ):
         super().__init__()
         c = config
         self.config = c
         group = _tp_group()
         self.tp_size = group.world_size if group is not None else 1
+        self.tp_rank = group.rank_in_group if group is not None else 0
+        self.tp_device_group = group.device_group if group is not None else None
+        # Rows of the rotary table: the longest sequence the drafter serves.
+        self.max_positions = max_positions or c.max_position_embeddings
         taps = len(c.target_layer_ids) * c.target_hidden_size
         self.context_proj = _ShardedWeight(
             (c.hidden_size, _per_rank(taps, self.tp_size, "tap width")),
@@ -173,6 +249,7 @@ class K3DSparkForCausalLM(nn.Module):
         self.embed_tokens = None
         self.lm_head = None
         self.register_buffer("context_kv_weight", None, persistent=False)
+        self.register_buffer("rope_table", None, persistent=False)
 
     @classmethod
     def from_configs(
@@ -180,9 +257,12 @@ class K3DSparkForCausalLM(nn.Module):
         config: PretrainedConfig | dict,
         start_layer_idx: int = 0,
         neuron_config: NeuronConfig | None = None,
+        max_positions: int | None = None,
     ) -> "K3DSparkForCausalLM":
         """Build the drafter from its HF config; its caches follow the target's layers."""
-        return cls(K3DSparkConfig.from_hf_config(config, neuron_config), start_layer_idx)
+        return cls(
+            K3DSparkConfig.from_hf_config(config, neuron_config), start_layer_idx, max_positions
+        )
 
     def load_weights(
         self, checkpoint_path: str, device: torch.device, cache_dir: str | None = None
@@ -206,10 +286,51 @@ class K3DSparkForCausalLM(nn.Module):
         self.prepare_after_load()
 
     def prepare_after_load(self) -> None:
-        """Stack the layers' kv_a slices in fp32: the context KV projection's weight."""
+        """Build the fp32 context KV weight from the kv_a slices, and the rotary table."""
         self.context_kv_weight = torch.cat(
             [layer.self_attn.kv_a_proj_with_mqa.weight for layer in self.layers]
         ).float()
+        table = yarn_rope_table(self.config, self.max_positions)
+        self.rope_table = table.to(self.context_kv_weight.device)
+
+    def _all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+        """Sum the ranks' partials over the tensor-parallel group."""
+        if self.tp_size == 1:
+            return x
+        return all_reduce(x, reduceOp="sum", group=self.tp_device_group)
+
+    def _rank_slice(self, x: torch.Tensor) -> torch.Tensor:
+        """This rank's share of the last dim of ``x``."""
+        width = x.shape[-1] // self.tp_size
+        return x[..., self.tp_rank * width : (self.tp_rank + 1) * width]
+
+    def precompute_and_store_context_kv(
+        self,
+        context_states: torch.Tensor,
+        context_positions: torch.Tensor,
+        context_slot_mapping: torch.Tensor,
+    ) -> None:
+        """Project the target's tapped rows into every draft layer's latent cache.
+
+        Args:
+            context_states: The target's taps concatenated, ``[T, taps * H]``, whole on
+                every rank.
+            context_positions: Position per row ``[T]``.
+            context_slot_mapping: This rank's cache slot per row ``[T]``. The runner maps
+                a row another rank owns to the null block.
+        """
+        c = self.config
+        partial = _k_shard_matmul(self._rank_slice(context_states), self.context_proj.weight.t())
+        hidden = self.context_norm(self._all_reduce(partial.float()).to(c.torch_dtype))
+        kv = _k_shard_matmul(self._rank_slice(hidden).float(), self.context_kv_weight.t())
+        kv = self._all_reduce(kv).view(len(context_states), len(self.layers), -1)
+        latent, rope = kv.split([c.kv_lora_rank, c.qk_rope_head_dim], -1)
+        rope = _rotate_interleaved(rope, self.rope_table[context_positions])
+        for i, layer in enumerate(self.layers):
+            attn = layer.self_attn
+            rows = torch.cat([attn.kv_a_layernorm(latent[:, i]), rope[:, i]], -1)
+            cache = attn.kv_cache.view(-1, rows.shape[-1])
+            cache.index_copy_(0, context_slot_mapping, rows.to(cache.dtype))
 
     def alias_target_head(self, target_model: nn.Module) -> None:
         """Use the target's embedding and LM head modules; no weight is copied."""
