@@ -5,8 +5,8 @@ Reads the ``--save-detailed`` result files of one cell, grouped by their ``proce
 and ``run`` metadata: two processes of three timed runs. Per request, the mean of
 ``itls`` with the first gap dropped; per run, the median over the requests; per
 process, the median of its runs; the value of record is the mean of the two process
-values, read against the bar of 3.0 x 13.38 ms. Guard: per request, the count of gaps
-after the first above 2x that request's median gap.
+values, read against the bar, ``--bar-ms`` (default the registered bar). Guard: per
+request, the count of gaps after the first above 2x that request's median gap.
 
 Standard library only. Prints one JSON record. Exit 0 pass, 1 fail, 2 invalid run,
 3 not adjudicable (a nonzero guard count, or a spread above 10%).
@@ -18,7 +18,7 @@ import statistics
 import sys
 from pathlib import Path
 
-BAR_MS = 3.0 * 13.38
+BAR_MS = 42.12
 OUTPUT_LEN = 128
 PROCESSES = 2
 RUNS = 3
@@ -66,9 +66,9 @@ def request_values(gaps_s):
     return statistics.fmean(steady), sum(1 for g in steady if g > 2.0 * median)
 
 
-def reduce(results):
-    """Return (exit code, record) for the result files of one cell."""
-    record = {"bar_ms": round(BAR_MS, 2)}
+def reduce(results, bar_ms=BAR_MS):
+    """Return (exit code, record) for the result files of one cell against bar_ms."""
+    record = {"bar_ms": round(bar_ms, 2)}
     runs = {}
     invalid = {}
     for name, r in results:
@@ -116,20 +116,22 @@ def reduce(results):
     if guard_total or spread > MAX_SPREAD:
         record["result"] = "not adjudicable"
         return NOT_ADJUDICABLE, record
-    record["result"] = "pass" if value <= BAR_MS else "fail"
-    return (PASS if value <= BAR_MS else FAIL), record
+    record["result"] = "pass" if value <= bar_ms else "fail"
+    return (PASS if value <= bar_ms else FAIL), record
 
 
 def main(argv=None):
     """Command-line entry point."""
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("paths", nargs="+", help="result files, or folders of *.json result files")
+    ap.add_argument("--bar-ms", type=float, default=BAR_MS,
+                    help=f"the bar in ms (default {BAR_MS}, the registered bar)")
     args = ap.parse_args(argv)
     files = []
     for p in map(Path, args.paths):
         files.extend(sorted(p.glob("*.json")) if p.is_dir() else [p])
     results = [(str(f), json.loads(f.read_text(encoding="utf-8"))) for f in files]
-    code, record = reduce(results)
+    code, record = reduce(results, args.bar_ms)
     print(json.dumps(record))
     return code
 
