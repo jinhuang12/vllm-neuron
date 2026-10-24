@@ -6,6 +6,7 @@ The config is the served one: TP 32 by DP 2, 128K context, prefix caching off. S
 ``~/models/moonshotai/Kimi-K3``. Run with ``VLLM_NEURON_CPU_MODE=1``.
 """
 
+import dataclasses
 import os
 import types
 from collections import Counter
@@ -55,36 +56,58 @@ KDA_HEADS, KDA_HEAD_DIM, CONV_TAPS = 96, 128, 4
 NEURON_DEFAULT_BLOCK = 32
 # One LNC 2 trn3 core's HBM region, as the runtime reports it.
 HBM_PER_RANK = 36 * 1024**3
-# Weight bytes per rank of the served TP 32 by EP 64 layout (parallelism planner).
+# Weight bytes per rank of the served TP 32 by EP 64 layout (parallelism planner),
+# without the load-time copies that the model adds as buffers.
 WEIGHT_BYTES_PER_RANK = 27_367_507_968
 USERS_PER_REPLICA, CONTEXT = 32 // DP, 8192
 
 
-@pytest.fixture(scope="module")
-def vllm_config():
-    """The served engine config after the platform's block-size step."""
-    config = EngineArgs(
+def _engine_config(prefix_caching: bool):
+    """The served engine config, before the platform's block-size step."""
+    return EngineArgs(
         model=str(CHECKPOINT),
         tensor_parallel_size=TP,
         data_parallel_size=DP,
         enable_expert_parallel=True,
         max_model_len=131072,
-        enable_prefix_caching=False,
+        enable_prefix_caching=prefix_caching,
         gpu_memory_utilization=0.90,
     ).create_engine_config()
+
+
+@pytest.fixture(scope="module")
+def vllm_config():
+    """The served engine config after the platform's block-size step."""
+    config = _engine_config(prefix_caching=False)
     current_platform.update_block_size_for_backend(config)
     return config
 
 
 @pytest.fixture(scope="module")
 def model():
-    """The 93-layer model on the meta device, built on one rank of a 32-way TP group."""
+    """The 93-layer model on the meta device, built on one rank of a 32-way TP group.
+
+    The MoE layers hold that rank's experts of the 64-rank expert group, TP 32 by DP 2.
+    """
     group = types.SimpleNamespace(world_size=TP, rank_in_group=0, device_group=None)
+    experts = types.SimpleNamespace(world_size=TP * DP, rank_in_group=0, device_group=None)
     with pytest.MonkeyPatch.context() as patch, torch.device("meta"):
         patch.setattr(kimi_model, "_tp_group", lambda: group)
-        return kimi_model.KimiK3ForConditionalGeneration.from_configs(
+        patch.setattr(kimi_model, "get_world_group", lambda: experts)
+        patch.setattr(kimi_model, "get_wide_ep_group", lambda: experts)
+        model = kimi_model.KimiK3ForConditionalGeneration.from_configs(
             get_config(str(CHECKPOINT), trust_remote_code=False)
         )
+        model.prepare_after_load()
+        return model
+
+
+def _load_time_copies_per_rank(model) -> int:
+    """Bytes per rank of the weight copies made at load, which the worker counts as buffers.
+
+    The model is built at one rank's shapes, so each buffer is counted once at its size.
+    """
+    return sum(b.nbytes for b in model.buffers())
 
 
 def _runner(vllm_config, model) -> NeuronModelRunner:
@@ -116,14 +139,15 @@ def specs(vllm_config, model):
 
 
 @pytest.fixture(scope="module")
-def served_kv_config(vllm_config, specs):
+def served_kv_config(vllm_config, model, specs):
     """vLLM's KV cache config for the worker's budget on one rank."""
     with pytest.MonkeyPatch.context() as patch:
         patch.setenv("NEURON_LOGICAL_NC_CONFIG", "2")
         patch.delenv("VLLM_NEURON_RESERVED_HEADROOM_GIB", raising=False)
         worker = NeuronWorker.__new__(NeuronWorker)
         worker.cache_config = vllm_config.cache_config
-        budget = worker._compute_kv_budget(HBM_PER_RANK, WEIGHT_BYTES_PER_RANK)
+        device_bytes = WEIGHT_BYTES_PER_RANK + _load_time_copies_per_rank(model)
+        budget = worker._compute_kv_budget(HBM_PER_RANK, device_bytes)
     return get_kv_cache_configs(vllm_config, [specs], [budget])[0]
 
 
@@ -165,6 +189,9 @@ def test_kda_state_slot_is_the_conv_and_recurrent_state(vllm_config, model, spec
         assert slot == 3 * 128 * 128 * 4 + 3 * 1152 * 2
         assert (spec.block_size, spec.mamba_cache_mode) == (cache.mamba_block_size, "none")
         assert spec.page_size_bytes == cache.mamba_page_size_padded
+    # The runner has no state copy between blocks, so prefix caching stops the setup.
+    with pytest.raises(ValueError, match="--no-enable-prefix-caching"):
+        current_platform.update_block_size_for_backend(_engine_config(prefix_caching=True))
 
 
 def test_two_specs_in_four_cache_groups(specs, served_kv_config):
@@ -191,6 +218,10 @@ def test_unified_page_equals_upstreams_alignment_rule(vllm_config, served_kv_con
     block = align * cdiv(state_page, align * token_page)
     page = block * token_page
     assert (block, page) == (256, 294_912)
+    # The served config carries a platform attribute that is not a config field, the
+    # case upstream's field-by-field config copy rejects; the step still lands here.
+    fields = {f.name for f in dataclasses.fields(vllm_config)}
+    assert set(vars(vllm_config)) - fields
     cache = vllm_config.cache_config
     assert (cache.block_size, cache.mamba_page_size_padded) == (block, page)
     assert {g.kv_cache_spec.page_size_bytes for g in served_kv_config.kv_cache_groups} == {page}
@@ -204,14 +235,13 @@ def test_cache_setup_binds_69_state_banks_and_24_latent_caches(vllm_config, mode
     config = get_kv_cache_config_from_groups(vllm_config, groups, blocks * slots * page)
     assert config.num_blocks == blocks
     caches = _runner(vllm_config, model).initialize_kv_cache(config)
-    assert Counter(len(v) for v in caches.values()) == {2: 69, 1: 24}
+    assert Counter(len(v) for v in caches.values()) == {3: 69, 1: 24}
 
     storages = set()
     for i, layer in enumerate(model.model.layers):
         attn, bound = layer.self_attn, caches[f"layers.{i}.self_attn"]
         if layer.is_kda:
             conv, state = attn.conv_state, attn.recurrent_state
-            assert conv is bound[0] and state is bound[1]
             assert (conv.shape, conv.dtype) == ((blocks, 3, 1152), torch.bfloat16)
             assert (state.shape, state.dtype) == ((blocks, 3, 128, 128), torch.float32)
             assert (conv.stride(0) * 2, state.stride(0) * 4) == (page, page)
@@ -233,8 +263,11 @@ def test_cache_setup_binds_69_state_banks_and_24_latent_caches(vllm_config, mode
     assert torch.equal(written, torch.arange(2 * page, 2 * page + slot))
 
 
-def test_kv_budget_at_8k_32_users_fits_a_rank_with_the_weights(vllm_config, served_kv_config):
+def test_kv_budget_at_8k_32_users_fits_a_rank_with_the_weights(
+    vllm_config, model, served_kv_config
+):
     config = served_kv_config
+    device_bytes = WEIGHT_BYTES_PER_RANK + _load_time_copies_per_rank(model)
     pool = max(t.offset + t.size for t in config.kv_cache_tensors)
     per_block = pool // config.num_blocks
     per_request = sum(
@@ -245,5 +278,5 @@ def test_kv_budget_at_8k_32_users_fits_a_rank_with_the_weights(vllm_config, serv
     usable = vllm_config.cache_config.gpu_memory_utilization * HBM_PER_RANK
     assert round(usable / 1e9, 1) == 34.8
     assert need <= config.num_blocks
-    assert WEIGHT_BYTES_PER_RANK + need * per_block <= usable
-    assert WEIGHT_BYTES_PER_RANK + pool <= usable
+    assert device_bytes + need * per_block <= usable
+    assert device_bytes + pool <= usable

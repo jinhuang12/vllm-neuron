@@ -10,20 +10,26 @@ Repacked expert layout, per expert, for ``G`` programs (LNC), latent width
 ``D`` and expert width ``I``. Program ``g`` takes expert-width columns
 ``g * I/G`` to ``(g + 1) * I/G``. A K tile is 512 contraction values. Each
 uint16 weight element is two stored bytes in their stored order, four fp4
-values; partition ``p`` of a K tile holds K values ``4p`` to ``4p + 3``. Scale
-row ``r`` of a K tile covers K values ``32r`` to ``32r + 31``.
+values; partition ``p`` of a K tile holds K values ``4p`` to ``4p + 3``.
+
+A scale part holds ``B`` blocks of 16 rows by 512 columns, one block per K tile
+and output chunk; row ``4q + j`` of a block covers K values ``32(4q + j)`` to
+``32(4q + j) + 31`` of its K tile, ``q`` the quadrant. Each quadrant's rows sit
+in 3 slots of 4 rows: block ``b`` goes to slot ``s`` at place ``l``, with
+``s, l = divmod(b, B/3)``, so its row ``4q + j``, column ``c`` is part row
+``12q + 4s + j``, column ``l * 512 + c``.
 
 - ``gate_up_weight`` ``[G, 2 * NI, 128, (D/512) * 512]``, ``NI = I/(512G)``:
   chunk ``n < NI``, column ``c`` is gate (w1) row ``g * I/G + n * 512 + c``;
   chunk ``n >= NI`` is up (w3) row ``g * I/G + (n - NI) * 512 + c``. Free index
   ``k * 512 + c`` is K tile ``k`` of the latent width.
-- ``gate_up_scale`` ``[G, 16, 2 * NI * (D/512) * 512]``: free index
-  ``(n * D/512 + k) * 512 + c``.
+- ``gate_up_scale`` ``[G, 48, 2 * NI * (D/512) * 512 / 3]``: block ``n * D/512
+  + k`` holds chunk ``n``, K tile ``k``.
 - ``down_weight`` ``[G, D/512, 128, NI * 512]``: chunk ``d``, column ``c`` is
   w2 row ``d * 512 + c``. Free index ``k * 512 + c`` is K tile ``k`` of the
   program's expert-width columns.
-- ``down_scale`` ``[G, 16, (D/512) * NI * 512]``: free index
-  ``(d * NI + k) * 512 + c``.
+- ``down_scale`` ``[G, 48, (D/512) * NI * 512 / 3]``: block ``d * NI + k``
+  holds chunk ``d``, K tile ``k``.
 """
 
 import logging
@@ -114,15 +120,22 @@ def _repack_down_scale(scale: torch.Tensor, g: int) -> torch.Tensor:
     return s.reshape(g, 16, -1).contiguous()
 
 
+def _slots(scale: torch.Tensor) -> torch.Tensor:
+    """Place the blocks of a ``[G, 16, B * 512]`` scale part in 3 slots per quadrant."""
+    g, _, width = scale.shape
+    blocks = scale.reshape(g, 4, 4, 3, width // 3 // 512, 512)  # [G, q, j, s, l, c]
+    return blocks.permute(0, 1, 3, 2, 4, 5).reshape(g, 48, width // 3).contiguous()
+
+
 def _repack_part(part: str, tensors: list[torch.Tensor], g: int) -> torch.Tensor:
     """Repack one expert's source tensors for one bank part."""
     if part == "gate_up_weight":
         return _repack_gate_up(tensors[0], tensors[1], g)
     if part == "gate_up_scale":
-        return _repack_gate_up_scale(tensors[0], tensors[1], g)
+        return _slots(_repack_gate_up_scale(tensors[0], tensors[1], g))
     if part == "down_weight":
         return _repack_down(tensors[0], g)
-    return _repack_down_scale(tensors[0], g)
+    return _slots(_repack_down_scale(tensors[0], g))
 
 
 def repack_expert(

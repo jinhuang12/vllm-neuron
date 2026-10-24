@@ -337,6 +337,13 @@ class NeuronPlatform(Platform):
         if model_config is not None and model_config.is_hybrid:
             from vllm_neuron.vllm.attention.attn import NeuronAttentionBackend
 
+            if cache_config.mamba_cache_mode != "none":
+                raise ValueError(
+                    "Neuron serves hybrid attention and state models with prefix caching "
+                    "off: the runner has no state copy between blocks. Got "
+                    f"mamba_cache_mode={cache_config.mamba_cache_mode!r}; pass "
+                    "--no-enable-prefix-caching."
+                )
             cls._align_hybrid_block_size(
                 _config_fields_only(vllm_config), NeuronAttentionBackend
             )
