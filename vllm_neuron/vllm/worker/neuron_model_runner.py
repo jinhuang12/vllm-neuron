@@ -1363,6 +1363,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self.kv_connector_output: KVConnectorOutput | None = None
         # Full (2, ...) KV cache tensors for DI connector registration
         self._kv_cache_full_tensors: dict[str, torch.Tensor] = {}
+        # Each state layer's cache as [num_blocks, page bytes], for zeroing a slot
+        self._state_pages: dict[str, torch.Tensor] = {}
 
         # Initialize vLLM Sampler for proper token sampling
         logprobs_mode = getattr(
@@ -2976,6 +2978,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # Add spec_token_ids to token_ids_cpu.
             self.input_batch.update_req_spec_token_ids(req_state, scheduled_spec_tokens)
 
+        self._zero_new_state_slots(reqs_to_add)
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
         for request in reqs_to_add:
@@ -3211,11 +3214,38 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         raw = getattr(buffer, "np", None)
         return raw if isinstance(raw, np.ndarray) else buffer.cpu.numpy()
 
+    def _is_state_group(self, group_id: int) -> bool:
+        """True for a KV-cache group of per-sequence state, whose block table holds state slots."""
+        config = getattr(self, "kv_cache_config", None)
+        return config is not None and isinstance(
+            config.kv_cache_groups[group_id].kv_cache_spec, MambaSpec
+        )
+
+    def _zero_new_state_slots(self, reqs: list[CachedRequestState]) -> None:
+        """Zero the state slot of each request that starts from its first token.
+
+        A freed block keeps its last owner's bytes, and a 1-token prompt's only step is a
+        decode step, which reads its slot as the prior state.
+        """
+        if not self._state_pages:
+            return
+        for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            if not self._is_state_group(group_id):
+                continue
+            slots = sorted({req.block_ids[group_id][0] for req in reqs
+                            if req.num_computed_tokens == 0 and req.block_ids[group_id]})
+            if not slots:
+                continue
+            index = torch.tensor(slots, dtype=torch.long, device=self.device)
+            for layer_name in group.layer_names:
+                self._state_pages[layer_name].index_fill_(0, index, 0)
+
     def _block_table_device_tensor(self, group_id: int, buffer: Any) -> torch.Tensor:
         """Return the device block table of one KV-cache group.
 
         Remaps the null block to the sentinel on the host and uploads the result, skipping both
-        when the raw host table has not changed since the last upload. The remap runs in numpy,
+        when the raw host table has not changed since the last upload. A state group keeps the
+        null block, because its table is read as state slots. The remap runs in numpy,
         because the earlier order of uploading the raw table and remapping on device with
         ``torch.where`` added a host round trip for a value the host already held.
 
@@ -3243,9 +3273,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         state.next_slot = (slot + 1) % _BLOCK_TABLE_STAGE_DEPTH
         stage, null_mask = state.stage[slot], state.null_mask[slot]
         np.copyto(stage, raw)
-        # Reuse the mask and pass ``out`` to keep the hot path free of allocations.
-        np.equal(stage, NULL_BLOCK_ID, out=null_mask)
-        np.copyto(stage, PAD_SLOT_ID, where=null_mask)
+        # A state group's table is read as state slots, and the null block is a slot
+        # every bank has. So padding rows keep it there, instead of the sentinel.
+        if not self._is_state_group(group_id):
+            # Reuse the mask and pass ``out`` to keep the hot path free of allocations.
+            np.equal(stage, NULL_BLOCK_ID, out=null_mask)
+            np.copyto(stage, PAD_SLOT_ID, where=null_mask)
 
         # Build a new device tensor for each upload. An in-place copy is unsafe, because
         # the NEFF of the previous step can still reference the old device tensor.
@@ -10901,6 +10934,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
+        self._state_pages = {}
 
         # TODO do we need to initialize attn_backend?
 
@@ -11029,6 +11063,17 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 _kv_slices[key] = slices
             return slices
 
+        _page_views: dict[tuple[int, int], torch.Tensor] = {}
+
+        def _shared_page_view(raw: torch.Tensor, page: int) -> torch.Tensor:
+            """``[blocks, page]`` view of a state buffer, memoized like the slices."""
+            key = (id(raw), page)
+            view = _page_views.get(key)
+            if view is None:
+                view = raw.view(-1, page)
+                _page_views[key] = view
+            return view
+
         _packed_k_views: dict[tuple[int, tuple], torch.Tensor] = {}
 
         def _shared_packed_k(k_cache: torch.Tensor, shape: tuple) -> torch.Tensor:
@@ -11148,20 +11193,24 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
             # A state page holds the layer's states back to back (e.g. conv rows, then
             # the recurrent state). Each state is a view whose block stride is the
-            # page, as in vLLM's MambaBase.bind_kv_cache.
+            # page, as in vLLM's MambaBase.bind_kv_cache. The layer also gets the
+            # contiguous page buffer itself, for kernels that address pages by slot.
             elif isinstance(kv_cache_spec, MambaSpec):
                 page = kv_cache_spec.page_size_bytes
                 for layer_name in group.layer_names:
                     raw_tensor = kv_cache_raw_tensors[layer_name]
                     assert raw_tensor.numel() % page == 0
-                    pages = raw_tensor.view(-1, page)
+                    # One page view per buffer, shared by its layers, for the same
+                    # reason as the shared slices above.
+                    pages = _shared_page_view(raw_tensor, page)
+                    self._state_pages[layer_name] = pages
                     states, offset = [], 0
                     for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
                         nbytes = math.prod(shape) * dtype.itemsize
                         state = pages[:, offset : offset + nbytes].view(dtype)
                         states.append(state.view(-1, *shape))
                         offset += nbytes
-                    kv_caches[layer_name] = states
+                    kv_caches[layer_name] = [*states, pages]
 
             else:
                 raise NotImplementedError(
