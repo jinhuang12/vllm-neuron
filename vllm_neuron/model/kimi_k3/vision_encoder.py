@@ -11,8 +11,13 @@ hand-off writes the merged rows into the encoder cache: one real block through
 one all-reduce over the encoder DP group and one copy, more real blocks through
 the DP all-gather and one index write.
 
-Each rank cuts its own group block on the host, so the tower takes one block's
-rows and no device select. The RoPE tables come from the worker's table cache;
+A lone image at the one-block bucket splits instead into one slice of whole
+windows per encoder DP group. Each layer gathers k and v of every slice over
+the DP group, so each query reads the whole image's keys in their unsplit
+order, and the hand-off gathers the projected slices into the image's rows.
+
+Each rank cuts its own group block or slice on the host, so the tower takes only
+those rows and no device select. The RoPE tables come from the worker's table cache;
 the tower scales them by the square root of the attention scale, so the
 attention runs at scale 1.0. Outside CPU mode the build refuses a QKV width the
 QKV kernel cannot run, and it refuses a vision config whose two layer counts differ.
@@ -50,7 +55,10 @@ from .config import KimiK3Config, KimiK3VisionConfig, _as_dict
 from .model import KimiK3ForConditionalGeneration
 from .vision_inputs import (
     HEAD_DIM,
+    Slice,
     TableCache,
+    block_slice,
+    cut,
     grid_tables,
     key_bounds,
     order_patches,
@@ -175,11 +183,19 @@ def corner_weights(grids, bucket: int) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 @functools.lru_cache(maxsize=GRID_INPUTS_CACHED)
-def grid_inputs(grids: tuple, bucket: int, device: torch.device) -> tuple[torch.Tensor, ...]:
-    """A block's per-grid inputs on ``device``: corner index and weight, key bounds."""
-    pos_index, pos_weight = corner_weights(grids, bucket)
-    bound_min, bound_max = key_bounds(grids, bucket)
-    return tuple(t.to(device) for t in (pos_index, pos_weight, bound_min, bound_max))
+def grid_inputs(
+    grids: tuple, bucket: int, device: torch.device, part: Slice | None = None
+) -> tuple[torch.Tensor, ...]:
+    """A block's per-grid inputs on ``device``: corner index and weight, key bounds.
+
+    With ``part``, each input holds that slice's rows; its pad rows have weight 0 and
+    an empty key range.
+    """
+    inputs = (*corner_weights(grids, bucket), *key_bounds(grids, bucket))
+    if part is not None:
+        # Corners are [4, bucket]; bounds are [bucket, 1].
+        inputs = tuple(cut(t, part, dim) for t, dim in zip(inputs, (1, 1, 0, 0)))
+    return tuple(t.to(device) for t in inputs)
 
 
 class KimiK3PatchEmbed(nn.Module):
@@ -222,8 +238,12 @@ class KimiK3VisionBlock(nn.Module):
         self.norm0 = _Weight((hidden,), dtype)
         self.norm1 = _Weight((hidden,), dtype)
 
-    def forward(self, x, cos, sin, bound_min, bound_max, tp_group):
-        """Return the layer's MLP output and its stored residual sum."""
+    def forward(self, x, cos, sin, bound_min, bound_max, tp_group, kv_group=None, slice_rows=0):
+        """Return the layer's MLP output and its stored residual sum.
+
+        With ``kv_group``, ``x`` is one slice of an image: the first ``slice_rows``
+        rows of k and v from every slice are gathered over ``kv_group`` as the keys.
+        """
         rows, hidden = x.shape
         qkv = qkv_proj(
             x.unsqueeze(0),
@@ -238,7 +258,13 @@ class KimiK3VisionBlock(nn.Module):
             num_q_heads=self.heads,
             num_kv_heads=self.heads,
         )
-        q, k, v = qkv.view(rows, 3, self.heads, HEAD_DIM).permute(1, 2, 0, 3).contiguous()
+        qkv = qkv.view(rows, 3, self.heads, HEAD_DIM)
+        if kv_group is None:
+            q, k, v = qkv.permute(1, 2, 0, 3).contiguous()
+        else:
+            kv = kv_group.all_gather(qkv[:slice_rows, 1:].contiguous(), dim=0)
+            q = qkv[:, 0].transpose(0, 1).contiguous()
+            k, v = kv.permute(1, 2, 0, 3).contiguous()
         attn = flash_attention(
             q, k, v, scale=1.0, causal_mask=False, tp_q=True, tp_k=True,
             bound_min=bound_min, bound_max=bound_max,
@@ -267,13 +293,17 @@ class KimiK3VisionEncoder(nn.Module):
         )
         self.final_layernorm = _Weight((config.hidden_size,), dtype)
 
-    def forward(self, x, cos, sin, bound_min, bound_max, tp_group) -> torch.Tensor:
-        """Return the final-normed rows."""
+    def forward(
+        self, x, cos, sin, bound_min, bound_max, tp_group, kv_group=None, slice_rows=0
+    ) -> torch.Tensor:
+        """Return the final-normed rows; a slice keeps only its first ``slice_rows``."""
         mix = total = None
         for block in self.blocks:
             if mix is not None:
                 x = total + mix
-            mix, total = block(x, cos, sin, bound_min, bound_max, tp_group)
+            mix, total = block(x, cos, sin, bound_min, bound_max, tp_group, kv_group, slice_rows)
+        if slice_rows:
+            mix, total = mix[:slice_rows], total[:slice_rows]
         normed, _ = rmsnorm_residual_prefill(
             mix, self.final_layernorm.weight, residual=total, eps=TOWER_EPS
         )
@@ -288,8 +318,11 @@ class KimiK3VisionTower(nn.Module):
         self.patch_embed = KimiK3PatchEmbed(config, dtype)
         self.encoder = KimiK3VisionEncoder(config, tp_size, dtype)
 
-    def forward(self, pixels, pos_index, pos_weight, cos, sin, bound_min, bound_max, tp_group):
-        """Return the final-normed rows [bucket, hidden]."""
+    def forward(
+        self, pixels, pos_index, pos_weight, cos, sin, bound_min, bound_max, tp_group,
+        kv_group=None, slice_rows=0,
+    ):
+        """Return the final-normed rows [bucket, hidden], or a slice's [slice_rows, hidden]."""
         x = self.patch_embed(pixels, pos_index, pos_weight)
         heads = self.encoder.blocks[0].heads
         # q and k leave the QKV call scaled by sqrt(1 / sqrt(d)) each, so the
@@ -299,7 +332,7 @@ class KimiK3VisionTower(nn.Module):
         sin = (sin * root_scale).to(x.dtype).unsqueeze(0)
         bound_min = bound_min.unsqueeze(0).repeat(heads, 1, 1)
         bound_max = bound_max.unsqueeze(0).repeat(heads, 1, 1)
-        return self.encoder(x, cos, sin, bound_min, bound_max, tp_group)
+        return self.encoder(x, cos, sin, bound_min, bound_max, tp_group, kv_group, slice_rows)
 
 
 class KimiK3Projector(nn.Module):
@@ -318,14 +351,20 @@ class KimiK3Projector(nn.Module):
         self.post_norm = _Weight((config.text_hidden_size,), dtype)
         self.eps = config.projector_ln_eps
 
-    def forward(self, merged: torch.Tensor, tp_group) -> torch.Tensor:
-        """Project this rank's share of the merged rows, then gather the shares."""
+    def forward(self, merged: torch.Tensor, tp_group, norm_gathered: bool = False) -> torch.Tensor:
+        """Project this rank's share of the merged rows, then gather the shares.
+
+        ``norm_gathered`` norms after the gather, for a slice whose shares are under
+        the norm kernel's 128 rows.
+        """
         if tp_group is not None:
             merged = shard_select(merged, 0, tp_group)
         first, act, second = self.proj
         x = act(merged @ first.weight) @ second.weight
+        if tp_group is not None and norm_gathered:
+            x = tp_group.all_gather(x, dim=0)
         x, _ = rmsnorm_residual_prefill(x, self.post_norm.weight, eps=self.eps)
-        if tp_group is not None:
+        if tp_group is not None and not norm_gathered:
             x = tp_group.all_gather(x, dim=0)
         return x
 
@@ -353,17 +392,20 @@ class KimiK3VisionModel(nn.Module):
         encoder_cache_buffer: torch.Tensor,
         write_block_ids: torch.Tensor,
         gather: bool = False,
+        slice_rows: int = 0,
     ) -> torch.Tensor:
-        """Encode the rank's group block and write the merged rows into the cache.
+        """Encode the rank's group block or slice and write the merged rows into the cache.
 
         Args:
-            pixel_values: ``[bucket, 3 * p * p]`` patches in window order.
+            pixel_values: ``[bucket, 3 * p * p]`` patches in window order, or a slice's.
             pos_index, pos_weight: ``[4, bucket]`` bilinear corners of each row.
             cos, sin: ``[bucket, head_dim]`` fp32 RoPE tables in split-half layout.
             bound_min, bound_max: ``[bucket, 1]`` int32 key range of each row.
             encoder_cache_buffer: ``[blocks, rows, text_hidden]``, written in place.
             write_block_ids: cache block of each written block, scratch for the rest.
             gather: True when more than one group block is real.
+            slice_rows: the slice's rows before its pad, when one image is split over
+                the encoder DP groups; 0 for a group block.
 
         Returns:
             ``encoder_cache_buffer``.
@@ -373,28 +415,39 @@ class KimiK3VisionModel(nn.Module):
             raise ValueError(
                 f"the tower's {rows} query rows are not a multiple of {ATTN_SEQ_ALIGN}"
             )
+        if slice_rows and self.dp_group is None:
+            raise ValueError("a split image needs the encoder DP group")
         merge = self.config.merge_factor
         x = self.vision_tower(
             pixel_values, pos_index, pos_weight, cos, sin, bound_min, bound_max,
-            self.tp_group,
+            self.tp_group, self.dp_group if slice_rows else None, slice_rows,
         )
+        rows = slice_rows or rows
         merged = x.reshape(rows // merge, merge * x.shape[1])
-        out = self.mm_projector(merged, self.tp_group)
+        out = self.mm_projector(merged, self.tp_group, norm_gathered=bool(slice_rows))
         # Pad rows go out as zeros, so a padding group adds nothing to the hand-off.
-        real = (bound_max > bound_min).reshape(-1, merge)[:, :1]
+        real = (bound_max[:rows] > bound_min[:rows]).reshape(-1, merge)[:, :1]
         out = torch.where(real, out, torch.zeros_like(out))
-        return self._hand_off(out, encoder_cache_buffer, write_block_ids, gather)
+        return self._hand_off(
+            out, encoder_cache_buffer, write_block_ids, gather, bool(slice_rows)
+        )
 
-    def _hand_off(self, out, buffer, write_block_ids, gather) -> torch.Tensor:
-        """Write the group block's merged rows, and the other groups' if ``gather``."""
+    def _hand_off(self, out, buffer, write_block_ids, gather, joined=False) -> torch.Tensor:
+        """Write the merged rows: the group block's, every group's if ``gather``.
+
+        ``joined`` first gathers every group's slice, in group order, into the image's rows.
+        """
+        if joined:
+            out = self.dp_group.all_gather(out, dim=0)
         block_rows = buffer.shape[1]
         per_block = math.ceil(out.shape[0] / block_rows)
         out = F.pad(out, (0, 0, 0, per_block * block_rows - out.shape[0]))
         blocks = out.reshape(per_block, block_rows, out.shape[1])
-        if self.dp_group is not None and gather:
-            blocks = self.dp_group.all_gather(blocks, dim=0)
-        elif self.dp_group is not None:
-            blocks = self.dp_group.all_reduce(blocks)
+        if self.dp_group is not None and not joined:
+            if gather:
+                blocks = self.dp_group.all_gather(blocks, dim=0)
+            else:
+                blocks = self.dp_group.all_reduce(blocks)
         buffer.index_put_((write_block_ids[: blocks.shape[0]],), blocks)
         return buffer
 
@@ -402,20 +455,33 @@ class KimiK3VisionModel(nn.Module):
 class _EncoderWarmup(nn.Module):
     """The tower as warmup calls it: once per hand-off form the host can pick at the bucket."""
 
-    def __init__(self, tower: nn.Module, forms):
+    def __init__(self, tower: nn.Module, forms, synthetic):
         super().__init__()
         self.tower = tower
         self.forms = forms
+        self.synthetic = synthetic
 
     def forward(self, **inputs) -> torch.Tensor:
-        """Run the tower at each hand-off form of the inputs' bucket."""
-        for gather in self.forms(inputs["pixel_values"].shape[0]):
-            out = self.tower(**inputs, gather=gather)
+        """Run the tower at each hand-off form of the inputs' bucket, a split at its slice's rows."""
+        pixels = inputs["pixel_values"]
+        for gather, slice_rows in self.forms(pixels.shape[0]):
+            call = dict(inputs)
+            if slice_rows:
+                call.update(self.synthetic(_padded(slice_rows), pixels.device))
+            out = self.tower(**call, gather=gather, slice_rows=slice_rows)
         return out
+
+
+def _padded(rows: int) -> int:
+    """``rows`` rounded up to the attention's query tile."""
+    return -(-rows // ATTN_SEQ_ALIGN) * ATTN_SEQ_ALIGN
 
 
 class KimiK3VisionForConditionalGeneration(KimiK3ForConditionalGeneration):
     """Kimi K3 with the vision tower as ``visual`` and the encoder hook and warmup."""
+
+    #: Split a lone image at the one-block bucket over the encoder DP groups.
+    split_lone_image = True
 
     def __init__(self, config: KimiK3Config, encoder_neuron_config: EncoderNeuronConfig):
         super().__init__(config)
@@ -438,7 +504,13 @@ class KimiK3VisionForConditionalGeneration(KimiK3ForConditionalGeneration):
 
     def get_encoder(self) -> nn.Module:
         """Return the vision tower as warmup calls it, at every hand-off form of each bucket."""
-        return _EncoderWarmup(self.visual, self._forms)
+        return _EncoderWarmup(
+            self.visual,
+            self._forms,
+            lambda rows, device: self.build_encoder_synthetic_inputs(
+                rows, self.encoder_neuron_config, device
+            ),
+        )
 
     def _packs(self, bucket: int) -> bool:
         """Report if a call at ``bucket`` holds one image per encoder DP group.
@@ -449,9 +521,32 @@ class KimiK3VisionForConditionalGeneration(KimiK3ForConditionalGeneration):
         config = self.encoder_neuron_config
         return config.dp_size > 1 and bucket <= config.encoder_attention_block_size
 
-    def _forms(self, bucket: int) -> tuple[bool, ...]:
-        """The hand-off forms a call at ``bucket`` can take, as the ``gather`` flag."""
-        return (False, True) if self._packs(bucket) else (False,)
+    def _slice_rows(self, bucket: int) -> int:
+        """Rows of each group's slice when a lone image at ``bucket`` splits, else 0.
+
+        Only the one-block bucket splits, so the joined slices fill the image's cache
+        blocks, and only into slices of whole windows that each TP rank's share of
+        merged rows divides evenly.
+        """
+        config = self.encoder_neuron_config
+        groups = config.dp_size
+        whole = groups * self.config.vision_config.merge_factor * config.tp_size
+        if (
+            not self.split_lone_image
+            or groups == 1
+            or bucket != config.encoder_attention_block_size
+            or bucket % whole
+        ):
+            return 0
+        return bucket // groups
+
+    def _forms(self, bucket: int) -> tuple[tuple[bool, int], ...]:
+        """The hand-off forms a call at ``bucket`` can take, as (``gather``, ``slice_rows``)."""
+        slice_rows = self._slice_rows(bucket)
+        if slice_rows:
+            # A lone image splits, so the one-block form is not reachable here.
+            return ((False, slice_rows), (True, 0))
+        return ((False, 0), (True, 0)) if self._packs(bucket) else ((False, 0),)
 
     def build_encoder_synthetic_inputs(
         self, bucket: int, encoder_neuron_config: EncoderNeuronConfig, device: torch.device
@@ -526,13 +621,18 @@ class KimiK3VisionForConditionalGeneration(KimiK3ForConditionalGeneration):
         return calls
 
     def _encode(self, bucket: int, images: list, cache) -> None:
-        """Run one tower call: this rank's group block, then the hand-off of every real block."""
+        """Run one tower call: this rank's group block or slice, then the hand-off."""
         config = self.encoder_neuron_config
         rank, _ = _dp_position()
         device = cache.buffer.device
         if self._tables is None:
             self._tables = TableCache(device)
-        if rank < len(images):
+        slice_rows = self._slice_rows(bucket) if len(images) == 1 else 0
+        if slice_rows:
+            pixels, grid, _ = images[0]
+            part = block_slice(bucket, config.dp_size, rank, ATTN_SEQ_ALIGN)
+            inputs = self._block_inputs(bucket, pixels, (grid,), device, part)
+        elif rank < len(images):
             pixels, grid, _ = images[rank]
             inputs = self._block_inputs(bucket, pixels, (grid,), device)
         else:
@@ -550,20 +650,24 @@ class KimiK3VisionForConditionalGeneration(KimiK3ForConditionalGeneration):
             encoder_cache_buffer=cache.buffer,
             write_block_ids=torch.tensor(ids, dtype=torch.int64, device=device),
             gather=len(images) > 1,
+            slice_rows=slice_rows,
         )
 
-    def _block_inputs(self, bucket: int, pixels: torch.Tensor, grids: tuple, device) -> dict:
-        """The tower inputs of one group block on ``device``; ``grids`` is empty for padding.
+    def _block_inputs(
+        self, bucket: int, pixels: torch.Tensor, grids: tuple, device, part: Slice | None = None
+    ) -> dict:
+        """The tower inputs of one group block, or of its slice ``part``, on ``device``.
 
-        Only the pixels cross from the host on each call; the per-grid inputs are cached.
+        ``grids`` is empty for padding. Only the pixels cross from the host on each
+        call; the per-grid inputs are cached.
         """
         if grids:
-            pixels = order_patches(pixels, grids, bucket).to(device)
-            cos, sin, _ = grid_tables(self._tables, grids, bucket)
+            pixels = order_patches(pixels, grids, bucket, part).to(device)
+            cos, sin, _ = grid_tables(self._tables, grids, bucket, part)
         else:
             pixels = torch.zeros((bucket, pixels.shape[1]), dtype=pixels.dtype, device=device)
             cos = sin = torch.zeros((bucket, HEAD_DIM), dtype=torch.float32, device=device)
-        pos_index, pos_weight, bound_min, bound_max = grid_inputs(grids, bucket, device)
+        pos_index, pos_weight, bound_min, bound_max = grid_inputs(grids, bucket, device, part)
         return {
             "pixel_values": pixels,
             "pos_index": pos_index,
