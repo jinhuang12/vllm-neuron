@@ -250,14 +250,17 @@ def test_nan_row_stays_in_its_sequence():
     pgate = torch.randn(256, HEADS * V_DIM, generator=gen).bfloat16()
     state = gen.get_state()
     clean_prefill = _prefill(weights, seq, pgate, 256, 256, 2, gen)
-    gen.set_state(state)
-    nan_row = 128
-    seq[400 + nan_row] = float("nan")
-    pout, platent = _prefill(weights, seq, pgate, 256, 256, 2, gen)
-    assert torch.isnan(pout[nan_row]).all() and torch.isnan(platent[nan_row]).all()
-    assert torch.equal(pout[:nan_row], clean_prefill[0][:nan_row])
-    kept = torch.arange(256) != nan_row
-    assert torch.equal(platent[kept], clean_prefill[1][kept])
+    # Inside a 128-row query tile and at its last row, so earlier queries of the same tile
+    # meet the NaN row as a masked key.
+    for nan_row in (200, 255):
+        gen.set_state(state)
+        poisoned = seq.clone()
+        poisoned[400 + nan_row] = float("nan")
+        pout, platent = _prefill(weights, poisoned, pgate, 256, 256, 2, gen)
+        assert torch.isnan(pout[nan_row]).all() and torch.isnan(platent[nan_row]).all()
+        assert torch.equal(pout[:nan_row], clean_prefill[0][:nan_row])
+        kept = torch.arange(256) != nan_row
+        assert torch.equal(platent[kept], clean_prefill[1][kept])
 
     for s in others.tolist():
         ref_out, ref_latent = _reference(rows[s], gate[s:s + 1], weights, 1)
