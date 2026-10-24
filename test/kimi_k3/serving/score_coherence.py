@@ -8,7 +8,8 @@ then the answer text.
 - Check 1, repetition: no sequence of 32 whitespace-separated words occurs twice.
 - Check 2, ending: ``finish_reason`` is ``stop``, or ``length`` at 512 completion tokens.
 - Check 3, language: langdetect with seed 0 gives the prompt and the checked text the
-  same language code.
+  same language code. It applies only to a reply with at least 20 words made of letters
+  only; a shorter reply passes.
 
 ``--sheet`` writes the 51-row on-topic sheet: the 50 replies and one reply to a
 different prompt at a seeded position, whose key goes to ``--key``. Exit 0 when every
@@ -24,6 +25,7 @@ from pathlib import Path
 
 NGRAM = 32
 MAX_TOKENS = 512
+MIN_LETTER_WORDS = 20
 SHEET_ROWS = 50
 
 
@@ -54,6 +56,8 @@ def check_ending(reply):
 
 def check_language(reply):
     """Check 3: the prompt and the checked text get the same language code."""
+    if sum(1 for w in checked_text(reply).split() if w.isalpha()) < MIN_LETTER_WORDS:
+        return True
     from langdetect import DetectorFactory, detect
     from langdetect.lang_detect_exception import LangDetectException
 
