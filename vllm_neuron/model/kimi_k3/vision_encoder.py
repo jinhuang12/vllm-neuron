@@ -16,6 +16,11 @@ windows per encoder DP group. Each layer gathers k and v of every slice over
 the DP group, so each query reads the whole image's keys in their unsplit
 order, and the hand-off gathers the projected slices into the image's rows.
 
+The tower takes the processor's uint8 patches. The checkpoint's normalize,
+``u / 127.5 - 1`` on each value, folds into the patch embed: one fp32 matmul on
+the raw values, scaled by ``1 / 127.5``, plus a bias of minus the patch weight's
+row sum, all before the one bf16 round.
+
 Each rank cuts its own group block or slice on the host, so the tower takes only
 those rows and no device select. The RoPE tables come from the worker's table cache;
 the tower scales them by the square root of the attention scale, so the
@@ -71,8 +76,10 @@ from .weight_loaders_vision import encoder_tp
 TOWER_EPS = float(torch.finfo(torch.float32).eps)
 #: The attention reads its key bounds in tiles of 128 query rows.
 ATTN_SEQ_ALIGN = 128
-#: Pixel dtype of the registered K3 processor.
-PIXEL_DTYPE = torch.bfloat16
+#: Pixel dtype of the registered K3 processor: the raw values, before any normalize.
+PIXEL_DTYPE = torch.uint8
+#: The checkpoint's normalize scale on a uint8 value, which the patch embed applies.
+PIXEL_SCALE = 1 / 127.5
 #: Each output row of a bilinear resize reads at most two input rows per axis.
 CORNERS = 4
 #: Grids whose corner and bound inputs a worker keeps on its device: 43 MB at most at the
@@ -199,7 +206,7 @@ def grid_inputs(
 
 
 class KimiK3PatchEmbed(nn.Module):
-    """Patch matmul plus the bilinear-resized position table, gathered by corner."""
+    """Patch matmul with the folded normalize, plus the bilinear-resized position table."""
 
     def __init__(self, config: KimiK3VisionConfig, dtype: torch.dtype):
         super().__init__()
@@ -209,15 +216,20 @@ class KimiK3PatchEmbed(nn.Module):
             (config.init_pos_emb_height, config.init_pos_emb_width, config.hidden_size),
             dtype,
         )
+        self.bias = nn.Parameter(
+            torch.empty(config.hidden_size, dtype=torch.float32), requires_grad=False
+        )
 
     def forward(self, pixels, pos_index, pos_weight) -> torch.Tensor:
-        """Return the embedded rows [bucket, hidden]."""
+        """Return the embedded rows [bucket, hidden] of uint8 patches."""
         weight = self.proj.weight
-        x = pixels.to(weight.dtype) @ weight
+        acc = self.bias.dtype
+        # The matmul output stays fp32: the bias cancels most of a flat patch's sum.
+        x = pixels.to(acc) @ weight.to(acc)
         table = self.pos_emb.weight.reshape(-1, weight.shape[1])
-        corners = F.embedding(pos_index.long(), table).float()
-        pos = (corners * pos_weight.unsqueeze(-1)).sum(0)
-        return x + pos.to(x.dtype)
+        corners = F.embedding(pos_index.long(), table).to(acc)
+        pos = (corners * pos_weight.to(acc).unsqueeze(-1)).sum(0)
+        return (x * PIXEL_SCALE + self.bias + pos).to(weight.dtype)
 
 
 class KimiK3VisionBlock(nn.Module):
@@ -397,7 +409,7 @@ class KimiK3VisionModel(nn.Module):
         """Encode the rank's group block or slice and write the merged rows into the cache.
 
         Args:
-            pixel_values: ``[bucket, 3 * p * p]`` patches in window order, or a slice's.
+            pixel_values: ``[bucket, 3 * p * p]`` uint8 patches in window order, or a slice's.
             pos_index, pos_weight: ``[4, bucket]`` bilinear corners of each row.
             cos, sin: ``[bucket, head_dim]`` fp32 RoPE tables in split-half layout.
             bound_min, bound_max: ``[bucket, 1]`` int32 key range of each row.
@@ -575,13 +587,18 @@ class KimiK3VisionForConditionalGeneration(KimiK3ForConditionalGeneration):
         """Encode the images and write their merged rows into the on-device encoder cache.
 
         Args:
-            pixel_values: ``[patches, 3, p, p]``, every image's patches in raster order.
+            pixel_values: ``[patches, 3, p, p]`` uint8, every image's patches in raster order.
             grid_thws: ``[images, 3]`` (1, height, width) patch grid of each image.
             encoder_cache: the runner's ``EncoderCacheBlocks``.
             mm_hashes: one identifier per image, for the cache allocation.
         """
         if pixel_values is None or grid_thws is None:
             raise ValueError("embed_multimodal needs pixel_values and grid_thws")
+        if pixel_values.dtype != PIXEL_DTYPE:
+            raise ValueError(
+                f"the patch embed folds the normalize and takes {PIXEL_DTYPE} pixels, "
+                f"not {pixel_values.dtype}"
+            )
         grids = []
         for t, h, w in grid_thws.tolist():
             if t != 1:

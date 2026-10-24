@@ -117,11 +117,13 @@ def test_worker_resolves_plugin_class_with_image_input(worker_view):
     from vllm.models.kimi_k3.common.mm_preprocess import KimiK3MultiModalProcessor
 
     from vllm_neuron.model.kimi_k3 import KimiK3ForConditionalGeneration
+    from vllm_neuron.model.kimi_k3.vision_processor import KimiK3Uint8Processor
 
     assert "error" not in worker_view, worker_view.get("error")
     assert worker_view["model_cls"] is KimiK3ForConditionalGeneration
     assert worker_view["image_input"] is True
-    assert worker_view["processor_cls"] is KimiK3MultiModalProcessor
+    assert worker_view["processor_cls"] is KimiK3Uint8Processor
+    assert issubclass(KimiK3Uint8Processor, KimiK3MultiModalProcessor)
 
 
 def test_protocols_at_the_served_bucket(model_config):

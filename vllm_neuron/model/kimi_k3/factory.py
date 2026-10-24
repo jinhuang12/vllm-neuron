@@ -30,10 +30,10 @@ def _dummy_inputs(info):
 
 
 def _processor(info, dummy_inputs, *, cache=None):
-    """Build upstream's K3 image processor."""
-    from vllm.models.kimi_k3.common.mm_preprocess import KimiK3MultiModalProcessor
+    """Build the K3 image processor that gives uint8 patches."""
+    from .vision_processor import KimiK3Uint8Processor
 
-    return KimiK3MultiModalProcessor(info, dummy_inputs, cache=cache)
+    return KimiK3Uint8Processor(info, dummy_inputs, cache=cache)
 
 
 @MULTIMODAL_REGISTRY.register_processor(

@@ -20,6 +20,12 @@ def apply_patches():
 
     apply_dp_load_balancer_patch()
 
+    from vllm_neuron.vllm.patches.kimi_k3_processor_patch import (
+        apply_kimi_k3_processor_patch,
+    )
+
+    apply_kimi_k3_processor_patch()
+
     # patches/jf_grammar_patch.py wraps a specific
     # StructuredOutputManager and is applied from NeuronScheduler.__init__.
 

@@ -2,9 +2,11 @@
 """Kimi K3 vision tower, projector and encoder hook in CPU mode.
 
 The tower is the checkpoint's first two blocks, its final norm and the projector.
-It encodes 16 x 16-patch images that the registered K3 processor gives. Items with
-more than one rank run each rank as a gloo process with the encoder groups built
-on top. The reference is the checkpoint's code transcribed to float64. Set
+It encodes 16 x 16-patch images that the registered K3 processor gives, as uint8
+values: a fresh process stands for a worker, registers the plugin's model classes
+and reads the model config the parent built. Items with more than one rank run
+each rank as a gloo process with the encoder groups built on top. The reference is
+the checkpoint's code transcribed to float64, its normalize included. Set
 ``KIMI_K3_CHECKPOINT`` to the checkpoint directory; the default is
 ``~/models/moonshotai/Kimi-K3``. Run with ``VLLM_NEURON_CPU_MODE=1`` and
 ``NKI_SIMULATOR=1``, so the kernels run on the NKI simulator.
@@ -16,6 +18,7 @@ import json
 import math
 import multiprocessing
 import os
+import pickle
 import socket
 import traceback
 from pathlib import Path
@@ -91,6 +94,11 @@ def reference_weights(layers: int = LAYERS) -> dict[str, torch.Tensor]:
     return {k: v.double() for k, v in read(keys).items()}
 
 
+def normalize(pixels) -> torch.Tensor:
+    """The checkpoint's normalize of uint8 pixels in float64: mean and std are 0.5, so x / 127.5 - 1."""
+    return pixels.double() / 127.5 - 1
+
+
 def rms_norm(x, weight, eps):
     """The checkpoint's RMSNorm in float64."""
     return x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps) * weight
@@ -117,7 +125,7 @@ def reference(pixels, grid, w, layers: int = LAYERS) -> torch.Tensor:
     h, wd = grid
     n = h * wd
     p = "vision_tower.encoder.blocks"
-    x = pixels.double().reshape(n, -1) @ w["vision_tower.patch_embed.proj.weight"].reshape(1024, -1).T
+    x = normalize(pixels).reshape(n, -1) @ w["vision_tower.patch_embed.proj.weight"].reshape(1024, -1).T
     table = w["vision_tower.patch_embed.pos_emb.weight"]
     if (h, wd) == tuple(table.shape[:2]):
         pos = table.flatten(0, 1)
@@ -155,25 +163,18 @@ def bound_reading(got, ref):
 # ---------------------------------------------------------------- inputs
 
 
-def _process(images, queue) -> None:
-    """Run the registered K3 processor on each image in a fresh process."""
+def _process(config_bytes, images, queue) -> None:
+    """Run the registered K3 processor on each image in a fresh process, as a worker builds it."""
     try:
         from PIL import Image
         from vllm import ModelRegistry
-        from vllm.config import ModelConfig
         from vllm.multimodal import MULTIMODAL_REGISTRY
         from vllm.multimodal.processing.context import TimingContext
         from vllm.multimodal.processing.inputs import ProcessorInputs
 
-        model_config = ModelConfig(
-            model=str(CHECKPOINT),
-            tokenizer=str(CHECKPOINT),
-            trust_remote_code=True,
-            max_model_len=131072,
-            limit_mm_per_prompt={"image": 7},
-        )
         from vllm_neuron.model import registry
 
+        model_config = pickle.loads(config_bytes)
         for arch, model_cls in registry.get_models():
             ModelRegistry.register_model(arch, model_cls)
         processor = MULTIMODAL_REGISTRY.create_processor(model_config)
@@ -201,9 +202,18 @@ def _process(images, queue) -> None:
 @pytest.fixture(scope="module")
 def processed() -> dict[str, dict[str, torch.Tensor]]:
     """Each item image as the processor gives it: pixel_values and grid_thws [1, 3]."""
+    from vllm.config import ModelConfig
+
+    model_config = ModelConfig(
+        model=str(CHECKPOINT),
+        tokenizer=str(CHECKPOINT),
+        trust_remote_code=True,
+        max_model_len=131072,
+        limit_mm_per_prompt={"image": 7},
+    )
     ctx = multiprocessing.get_context("spawn")
     queue = ctx.Queue()
-    child = ctx.Process(target=_process, args=(SOURCES, queue))
+    child = ctx.Process(target=_process, args=(pickle.dumps(model_config), SOURCES, queue))
     child.start()
     out = queue.get(timeout=900)
     child.join()
