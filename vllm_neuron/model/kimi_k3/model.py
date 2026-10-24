@@ -36,7 +36,7 @@ from vllm_neuron.functional.attention.mla_paged import (
 )
 from vllm_neuron.functional.attention import o_proj as output_projection
 from vllm_neuron.functional.attention.o_proj import o_proj, o_proj_tkg
-from vllm_neuron.functional.kda.fused_decode import kda_fused_decode
+from vllm_neuron.functional.kda.fused_decode import kda_fused_decode, kda_fused_verify
 from vllm_neuron.functional.kda.output import kda_output_prefill
 from vllm_neuron.functional.moe.fused_tail import moe_fused_tail
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
@@ -301,10 +301,24 @@ def _decode_layout(rows: torch.Tensor) -> torch.Tensor:
 def _state_slots(meta) -> torch.Tensor:
     """Each sequence's state slot: column 0 of its KDA group's block table.
 
-    With prefix caching off a sequence holds one block per state group, and a padding
-    row holds the null block 0: a scratch page that no request owns.
+    With prefix caching off a sequence holds one block per state group, or 1 + k under
+    speculation, and a padding row holds the null block 0: a scratch page that no
+    request owns.
     """
     return meta["block_table_tensor"][:, 0].long()
+
+
+def _window_pages(meta, window: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """A verify window's row pages ``[B, window]`` and each sequence's source page ``[B]``.
+
+    Row page j receives the state after the window's token j. A sequence starts from the
+    page of its previous step's accepted draft count, ``state_resume_rows``, which is 0
+    after prefill. The pick is a gather on the device, so no count reaches the host.
+    """
+    table = meta["block_table_tensor"]
+    resume = meta["state_resume_rows"].long().unsqueeze(1)
+    source = table.gather(1, resume).squeeze(1).to(torch.int32)
+    return table[:, :window].to(torch.int32).contiguous(), source
 
 
 def _page_layout(view: torch.Tensor, pages: torch.Tensor) -> tuple[int, torch.dtype, tuple]:
@@ -483,14 +497,14 @@ class KimiK3KDA(nn.Module):
         return kda_output_prefill(core, gate, self.o_norm.weight, self.o_proj.weight, self.eps)
 
     def forward_decode(self, mix, k_slice, norm_weight, meta) -> torch.Tensor:
-        """One KDA decode step on the page buffer by slot; returns the ``[T, H]`` bf16 partial."""
+        """One KDA decode or verify step on the page buffer; returns the ``[T, H]`` bf16 partial.
+
+        Under speculation the step's metadata carries each sequence's resume row, and the
+        tokens are a window per sequence: the verify mode reads the source page and
+        writes one row page per token. Otherwise each token steps its slot's page.
+        """
         proj = _project(mix, self.input_weight, norm_weight, self.eps)
-        # core: [128, T, heads, 1] bf16, the output projection's input layout. The
-        # kernel writes each token's page in place, so the returned buffer is not kept.
-        core, _ = kda_fused_decode(
-            proj,
-            _state_slots(meta).int(),
-            self.pages,
+        weights = (
             self.q_conv1d.weight,
             self.k_conv1d.weight,
             self.v_conv1d.weight,
@@ -498,9 +512,21 @@ class KimiK3KDA(nn.Module):
             self.dt_bias,
             self.f_b_proj.weight,
             self.o_norm.weight,
-            lower_bound=self.lower_bound,
-            norm_eps=self.eps,
         )
+        # core: [128, T, heads, 1] bf16, the output projection's input layout. The
+        # kernel writes the pages in place, so the returned buffer is not kept.
+        if "state_resume_rows" in meta:
+            window = proj.shape[0] // meta["block_table_tensor"].shape[0]
+            rows, source = _window_pages(meta, window)
+            core, _ = kda_fused_verify(
+                proj, source, rows, self.pages, *weights,
+                lower_bound=self.lower_bound, norm_eps=self.eps,
+            )
+        else:
+            core, _ = kda_fused_decode(
+                proj, _state_slots(meta).int(), self.pages, *weights,
+                lower_bound=self.lower_bound, norm_eps=self.eps,
+            )
         return _output_projection(core, self.output_weight)
 
 
