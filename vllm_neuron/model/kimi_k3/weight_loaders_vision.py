@@ -17,6 +17,9 @@ group of ``T`` holds ``h = heads / T`` attention heads of width ``d`` and a
   features ``r * I / T`` to ``(r + 1) * I / T - 1``.
 - ``patch_embed.proj`` ``[C * p * p, hidden]``: one row per patch value, in the
   (channel, row, column) order the processor flattens a patch in.
+- ``patch_embed.bias`` ``[hidden]``, fp32: no checkpoint tensor of its own. The
+  checkpoint's normalize, ``u / 127.5 - 1`` on each uint8 value ``u``, folds into
+  the patch embed, so this bias is minus the sum of the patch weight's rows.
 - ``mm_projector.proj.0`` and ``mm_projector.proj.2``: whole on every rank.
 - Norm weights and the position table: as stored.
 """
@@ -32,6 +35,9 @@ from vllm_neuron.utils.weight_loader import SafetensorsWeightLoader, set_weight_
 HEAD_DIM = 128
 
 _ROOTS = ("vision_tower", "mm_projector")
+
+_PATCH_WEIGHT = "vision_tower.patch_embed.proj.weight"
+_FOLDED_BIAS = "vision_tower.patch_embed.bias"
 
 
 def half_split_order(head_dim: int = HEAD_DIM) -> torch.Tensor:
@@ -117,6 +123,16 @@ def _patch_loader() -> SafetensorsWeightLoader:
     return SafetensorsWeightLoader(transform=transform)
 
 
+def _folded_bias_loader() -> SafetensorsWeightLoader:
+    """Return the loader of the folded patch bias, minus the patch weight's row sum, fp32."""
+
+    def transform(slices: list, _rank: int) -> torch.Tensor:
+        weight = slices[0][:].double()
+        return -weight.reshape(weight.shape[0], -1).sum(1).float()
+
+    return SafetensorsWeightLoader(transform=transform)
+
+
 def vision_weight_loader(
     key: str, rank: int, size: int, head_dim: int = HEAD_DIM
 ) -> SafetensorsWeightLoader:
@@ -127,8 +143,10 @@ def vision_weight_loader(
         return _sharded_loader(1, rank, size)
     if key.endswith(".mlp.fc0.weight"):
         return _sharded_loader(0, rank, size)
-    if key == "vision_tower.patch_embed.proj.weight":
+    if key == _PATCH_WEIGHT:
         return _patch_loader()
+    if key == _FOLDED_BIAS:
+        return _folded_bias_loader()
     if key.startswith("mm_projector.proj."):
         return SafetensorsWeightLoader(transform=lambda slices, _rank: slices[0][:].T)
     return SafetensorsWeightLoader()
@@ -152,6 +170,6 @@ def vision_checkpoint_mappings(
             continue
         if rank is None or size is None:
             rank, size = encoder_tp()
-        mappings[name] = key
+        mappings[name] = _PATCH_WEIGHT if key == _FOLDED_BIAS else key
         set_weight_loader(param, vision_weight_loader(key, rank, size, head_dim))
     return mappings
