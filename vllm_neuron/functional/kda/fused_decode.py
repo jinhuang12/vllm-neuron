@@ -76,10 +76,9 @@ def kda_fused_decode(
             f_a (128) and the 3 beta logits.
         slots: [T] int32 page of each token. Slots are distinct, and every slot
             is a page of the buffer; a padding token takes a slot of its own.
-        pages: [slots, page bytes] int8 page buffer; the second dimension is the
-            row stride. A page holds the conv rows [3, 1152] bf16 from byte 0,
-            oldest first, channels q | k | v, then the fp32 recurrent state
-            [3, 128, 128] per head, [K, V]. The kernel writes no other byte.
+        pages: [slots, page bytes] contiguous int8 page buffer, updated in place. A page
+            holds the conv rows [3, 1152] bf16 from byte 0, oldest first, channels q | k | v,
+            then the fp32 recurrent state [3, 128, 128] per head, [K, V]. No other byte is written.
         q_conv_weight, k_conv_weight, v_conv_weight: [384, 1, 4] fp32 taps.
         a_log: [3] fp32. dt_bias: [384] fp32. f_b_weight: [384, 128] bf16.
         o_norm_weight: [128] fp32.
@@ -94,6 +93,7 @@ def kda_fused_decode(
     assert slots.shape == (tokens,) and slots.dtype == torch.int32, \
         f"slots {tuple(slots.shape)} {slots.dtype}"
     assert pages.dim() == 2 and pages.dtype == torch.int8, f"pages {tuple(pages.shape)} {pages.dtype}"
+    assert pages.is_contiguous(), f"pages strides {pages.stride()}: pass the raw page buffer, not a view"
     assert pages.shape[1] >= CONV_BYTES + STATE_BYTES and pages.shape[1] % 4 == 0, \
         f"a {pages.shape[1]}-byte page cannot hold the states at fp32 alignment"
     for weight in (q_conv_weight, k_conv_weight, v_conv_weight):
