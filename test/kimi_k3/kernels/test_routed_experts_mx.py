@@ -56,16 +56,17 @@ LOGIT_STD = 2.0
 GATE_INPUT = 12.0
 NAN_ROW = 2
 KEY = "language_model.model.layers.{layer}.block_sparse_moe.{name}"
-#: The most intermediate codes per case that may differ from the oracle's, set from the
-#: device MX product noise measured on each case's own operands. None is not yet set.
+#: The largest share of a case's intermediate codes that may differ from the oracle's:
+#: three times the share an emulated correct kernel flips at the device MX product noise
+#: measured on that case's own operands. None is not yet set.
 CODE_LIMITS = {
-    "correlated rows, T 8": None,
-    "correlated rows, T 1": None,
-    "correlated rows, T 32": None,
-    "repeated tokens, T 8": None,
-    "sigmoid inputs at 12, T 8": None,
-    "small near-equal rows, T 8": None,
-    "clean rows, T 8": None,
+    "correlated rows, T 8": 3 * 0.010444164276123047,
+    "correlated rows, T 1": 3 * 0.02034069242931548,
+    "correlated rows, T 32": 3 * 0.016833941141764324,
+    "repeated tokens, T 8": 3 * 0.007101853688557942,
+    "sigmoid inputs at 12, T 8": 3 * 0.007426307314918155,
+    "small near-equal rows, T 8": 3 * 0.007470731382016782,
+    "clean rows, T 8": 3 * 0.007434279830367476,
     "expert tiles, T 128": None,
 }
 #: Prefill tiles: 6 experts with 128 gathered rows each, the last 16 of them padding.
@@ -324,10 +325,11 @@ def _class_m(ref, routed, bank, replicas):
 
 def _class_m_line(label, m):
     limit = CODE_LIMITS[label]
-    passed = limit is not None and m.differ <= limit and m.worst <= 1.0
+    passed = limit is not None and m.differ <= limit * m.codes and m.worst <= 1.0
+    shown = "None" if limit is None else f"{limit:.4%}"
     return passed, (f"{label}: {len(m.visited)} local experts; class M {m.differ} of {m.codes} "
-                    f"codes differ (limit {limit}), largest code step {m.step}, "
-                    f"partial worst / bound {m.worst:.4f}")
+                    f"codes differ ({m.differ / m.codes:.4%}, limit {shown}), largest code step "
+                    f"{m.step}, partial worst / bound {m.worst:.4f}")
 
 
 def _class_s(ref, logits, index, weight):
