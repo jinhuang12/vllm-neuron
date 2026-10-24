@@ -3,8 +3,9 @@
 
 ``routed_experts_mx`` runs selection and the distinct-expert MX loop for one rank's
 14 local experts of layer 1, read from the checkpoint and repacked to the bank layout
-in the kernel module's docstring. ``router_select`` runs the same selection alone, on the
-decode rows and on 128-token prefill tiles.
+in the kernel module's docstring, and on one token that chooses none or one of them.
+``router_select`` runs the same selection alone, on the decode rows and on 128-token
+prefill tiles.
 ``routed_expert_tiles_mx`` runs 6 of those experts on their gathered 128-row tiles.
 The oracle is the checkpoint's own ``KimiMoEGate`` (its float32 casts made float64)
 and ``KimiBlockSparseMLP`` with the stored fp4 weights in float64 (the SiTU stays in
@@ -70,6 +71,8 @@ CODE_LIMITS = {
     "clean rows, T 8": 3 * 0.007434279830367476,
     "expert tiles, T 128": 3 * 0.017904162406921387,
 }
+#: Its one expert and token are among the T 1 case's own operands.
+CODE_LIMITS["one local expert, T 1"] = CODE_LIMITS["correlated rows, T 1"]
 #: Prefill tiles: 6 experts with 128 gathered rows each, the last 16 of them padding.
 TILE_ITEMS, TILE_ROWS, TILE_PADDING = 6, 128, 16
 #: Rows averaged into each small row: its scale is 1 / sqrt of this.
@@ -477,6 +480,38 @@ def test_nan_row_stays_in_its_row(reference):
         weight[others].view(torch.int32), clean_weight[others].view(torch.int32)), \
         "the NaN row changed another row's selection"
     assert passed, "the clean run is outside class M (a limit of None is not set)"
+
+
+def local_expert_case(ref, count):
+    """The T 1 row of regime R1 with this rank's experts at -12, or with one it visits at +12."""
+    (routed,) = [r for label, r, _ in correlated_cases(ref) if label == "correlated rows, T 1"]
+    slot = _visited(_gate(ref, routed[:, ref.latent:])[0])[0]
+    first = ref.latent + RANK * LOCAL_EXPERTS
+    routed = routed.clone()
+    routed[:, first:first + LOCAL_EXPERTS] = -GATE_INPUT
+    if count:
+        routed[:, first + slot] = GATE_INPUT
+    return routed, slot
+
+
+def test_no_local_expert_leaves_the_partial_zero(reference):
+    routed, _ = local_expert_case(reference, 0)
+    logits = routed[:, reference.latent:]
+    assert _visited(_gate(reference, logits)[0]) == [], "the oracle chose a local expert"
+    partial = _rows(_kernel(reference, routed, _bank(reference.stored, reference.programs), 1))
+    index, weight = _select(reference, logits)
+    s_set, s_weight = _class_s(reference, logits, index, weight)
+    print(f"no local expert, T 1: {int((partial != 0).sum())} of {partial.numel()} partial elements "
+          f"not 0; class S set excess {s_set:.3f}, weight error / bound {s_weight:.4f}")
+    assert s_set <= 1.0 and s_weight <= 1.0, "the selection is outside class S"
+    assert (partial == 0).all(), "a partial element is not 0"
+
+
+def test_one_local_expert_within_class_m(reference):
+    routed, slot = local_expert_case(reference, 1)
+    assert _visited(_gate(reference, routed[:, reference.latent:])[0]) == [slot], \
+        "the oracle does not choose exactly the one local expert"
+    _check(reference, [("one local expert, T 1", routed, 1)])
 
 
 def _tile_kernel(ref, rows, weights, bank, expose_codes=False):
