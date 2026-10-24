@@ -47,6 +47,10 @@ GROUP = 16
 # gives it a value within this fraction of the row maximum: the base logits are bf16,
 # so two values near the top can each round by 2^-8 and swap.
 NEAR_TIE = 2 * 2**-8
+# The base logits against the reference: the normed rows and the output each round to
+# bf16, a move of at most 2^-8 of the value, and together they stay under 2^-7 of the
+# largest reference value. A final norm without its gain moves them past it.
+BASE_BAND = 2**-7
 # The planted ties: a token in rank 1's half takes the second Markov weight's row of
 # the top token in rank 0's half, and a token in rank 0's half takes it for rank 1's.
 TIE_IN_RANK_1, TIE_IN_RANK_0 = VOCAB // 2 + 17, 23
@@ -91,8 +95,18 @@ def _rank(rank: int, port: int, hidden, anchors, ties, out: str) -> None:
         lm_head.weight = torch.nn.Parameter(stored, requires_grad=False)
     target = types.SimpleNamespace(model=types.SimpleNamespace(embed_tokens=embed), lm_head=lm_head)
     draft.alias_target_head(target)
+    # Keep the base logits as the picks use them, one entry per call.
+    base, compute = [], draft.compute_logits
+
+    def keep(rows):
+        base.append(compute(rows))
+        return base[-1]
+
+    draft.compute_logits = keep
     groups = zip(hidden.split(GROUP), anchors.split(GROUP))
     state = {"picks": torch.cat([draft.sample_drafts(h, a) for h, a in groups])}
+    draft.compute_logits = compute
+    state["base"] = torch.cat(base)
     w2 = draft.markov_head.markov_w2.weight
     tie_picks = []
     for anchor, source, copy in ties:
@@ -203,6 +217,13 @@ def test_picks_equal_the_fp64_reference_with_whole_weights(ranks, inputs, markov
     rows = [base[:, i] + w1[previous[:, i]] @ w2.t() for i in range(STEPS)]
     differing, near_ties = _judge(drafts, rows)
     warnings.warn(f"{len(near_ties)} near-ties (block, step, gap): {near_ties}")
+    # The base logits of each rank's vocabulary part, over the largest reference value.
+    part, scale = VOCAB // TP, base.abs().max()
+    gaps = [
+        float((s["base"].double() - base[..., r * part : (r + 1) * part]).abs().max() / scale)
+        for r, s in enumerate(ranks)
+    ]
+    warnings.warn(f"base-logit gap by rank {gaps}, band {BASE_BAND}")
     assert differing == [], f"{len(differing)} differing picks: {differing}"
     # Known-bad input: block 0's first pick moved to the closest id outside the band.
     row = rows[0][0]
@@ -210,6 +231,7 @@ def test_picks_equal_the_fp64_reference_with_whole_weights(ranks, inputs, markov
     bad = drafts.clone()
     bad[0, 0] = outside.argmax()
     assert [d[:2] for d in _judge(bad, rows)[0]] == [(0, 0)]
+    assert max(gaps) <= BASE_BAND, f"base-logit gap by rank {gaps} is over {BASE_BAND}"
 
 
 def test_planted_ties_across_the_halves_go_to_the_lower_id_on_both_ranks(ranks, ties):
