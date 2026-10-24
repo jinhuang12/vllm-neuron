@@ -125,9 +125,9 @@ def expert_bank_shapes(
     ni, nk = i // (512 * g), d // 512
     return {
         "gate_up_weight": ((g, 2 * ni, 128, nk * 512), torch.uint16),
-        "gate_up_scale": ((g, 16, 2 * ni * nk * 512), torch.uint8),
+        "gate_up_scale": ((g, 48, 2 * ni * nk * 512 // 3), torch.uint8),
         "down_weight": ((g, nk, 128, ni * 512), torch.uint16),
-        "down_scale": ((g, 16, nk * ni * 512), torch.uint8),
+        "down_scale": ((g, 48, nk * ni * 512 // 3), torch.uint8),
     }
 
 

@@ -73,9 +73,26 @@ def _gather(packed: torch.Tensor, *index: torch.Tensor) -> torch.Tensor:
     return packed[index]
 
 
+def _scale_blocks(part: torch.Tensor) -> torch.Tensor:
+    """Read a scale part's ``B`` blocks ``[G, B, 16, 512]`` by the kernel's slot rule.
+
+    Quadrant ``q`` loads part rows ``12q`` to ``12q + 11``; block ``b`` is rows ``4s`` to
+    ``4s + 3`` of each quadrant's tile at columns ``l * 512`` on, ``s, l = divmod(b, B/3)``.
+    """
+    per_slot = part.shape[2] // 512
+    blocks = []
+    for b in range(3 * per_slot):
+        slot, local = divmod(b, per_slot)
+        tiles = [part[:, 12 * q : 12 * q + 12] for q in range(4)]
+        cols = slice(local * 512, (local + 1) * 512)
+        blocks.append(torch.cat([t[:, 4 * slot : 4 * slot + 4, cols] for t in tiles], dim=1))
+    return torch.stack(blocks, dim=1)
+
+
 def _unpack(parts: dict[str, torch.Tensor], i: int, d: int) -> dict[str, torch.Tensor]:
-    """Rebuild the six stored tensors from the documented repacked layout."""
-    ni, nk, kd = i // G // 512, d // 512, i // G // 512
+    """Rebuild the six stored tensors, reading each scale block by the kernel's slot rule."""
+    ni, nk = i // G // 512, d // 512
+    gate_up_scale, down_scale = (_scale_blocks(parts[p]) for p in ("gate_up_scale", "down_scale"))
     out = {}
     for name, proj in (("w1", 0), ("w3", 1)):
         r = torch.arange(i)[:, None]
@@ -85,9 +102,7 @@ def _unpack(parts: dict[str, torch.Tensor], i: int, d: int) -> dict[str, torch.T
             parts["gate_up_weight"], g, n, j % 128, (j // 128) * 512 + c
         ).reshape(i, d // 2)
         j = torch.arange(d // 32)[None, :]
-        out[f"{name}.weight_scale"] = _gather(
-            parts["gate_up_scale"], g, j % 16, (n * nk + j // 16) * 512 + c
-        )
+        out[f"{name}.weight_scale"] = gate_up_scale[g, n * nk + j // 16, j % 16, c]
     r = torch.arange(d)[:, None]
     dd, c = r // 512, r % 512
     j = torch.arange(i // 4)[None, :]
@@ -97,9 +112,7 @@ def _unpack(parts: dict[str, torch.Tensor], i: int, d: int) -> dict[str, torch.T
     ).reshape(d, i // 2)
     j = torch.arange(i // 32)[None, :]
     g, jj = j // (i // G // 32), j % (i // G // 32)
-    out["w2.weight_scale"] = _gather(
-        parts["down_scale"], g, jj % 16, (dd * kd + jj // 16) * 512 + c
-    )
+    out["w2.weight_scale"] = down_scale[g, dd * ni + jj // 16, jj % 16, c]
     return out
 
 
@@ -131,7 +144,8 @@ def loaded_layer(text_config) -> nn.Module:
     return model
 
 
-def test_unpack_of_repack_equals_stored_bytes(text_config):
+def test_unpack_by_the_slot_rule_equals_stored_bytes(text_config):
+    """Experts 0 and 1 of layer 1 unpack from their bank parts to all 12 stored tensors."""
     i, d = text_config.moe_intermediate_size, text_config.routed_expert_hidden_size
     mismatched, tensors = 0, 0
     for expert in (0, 1):
@@ -151,8 +165,8 @@ def test_unpack_of_repack_equals_stored_bytes(text_config):
             stored["w2.weight_scale"],
             num_programs=G,
         )
-        assert parts["gate_up_weight"].shape == (G, 6, 128, 7 * 512)
-        assert parts["down_weight"].shape == (G, 7, 128, 3 * 512)
+        assert parts["gate_up_scale"].shape == (G, 48, 14 * 512)
+        assert parts["down_scale"].shape == (G, 48, 7 * 512)
         for short, rebuilt in _unpack(parts, i, d).items():
             assert rebuilt.shape == stored[short].shape
             mismatched += int((rebuilt != stored[short]).sum())
