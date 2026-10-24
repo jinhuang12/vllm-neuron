@@ -17,10 +17,15 @@ import math
 
 import torch
 import torch.distributed as dist
+from nkilib.core.utils.common_types import OProjAttentionLayout
 from torch import nn
 from torch.distributed import _functional_collectives as funcol
 from transformers import PretrainedConfig
-from vllm.distributed.parallel_state import get_tp_group, model_parallel_is_initialized
+from vllm.distributed.parallel_state import (
+    get_tp_group,
+    get_world_group,
+    model_parallel_is_initialized,
+)
 
 from vllm_neuron.functional.attention.attn_res_decode import attn_res_decode, attn_res_score_weight
 from vllm_neuron.functional.attention.attn_res_prefill import attn_res_prefill
@@ -39,6 +44,7 @@ from vllm_neuron.model.neuron_config import NeuronConfig
 from vllm_neuron.nn.cpl import ColumnParallelLinear
 from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
 from vllm_neuron.nn.sampler import Sampler
+from vllm_neuron.parallel.neuron_parallel_state import get_wide_ep_group
 from vllm_neuron.utils.hardware_config import get_logical_nc_config
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 from vllm_neuron.utils.weight_loader import set_weight_loader, sharding_weight_loader
@@ -67,6 +73,7 @@ kda_prefill = _optional_kernel("kda.prefill", "kda_prefill")
 depthwise_conv1d_silu = _optional_kernel("kda.depthwise_conv1d", "depthwise_conv1d_silu")
 routed_experts_mx = _optional_kernel("moe.routed_experts_mx", "routed_experts_mx")
 router_select = _optional_kernel("moe.routed_experts_mx", "router_select")
+routed_expert_tiles_mx = _optional_kernel("moe.routed_experts_mx", "routed_expert_tiles_mx")
 
 
 def _require(kernel, op: str):
@@ -93,6 +100,55 @@ def _all_reduce(x: torch.Tensor) -> torch.Tensor:
     if group is None or group.world_size == 1:
         return x
     return _waited(funcol.all_reduce(x, "sum", group.device_group))
+
+
+def _expert_group():
+    """The group the MoE dispatch and combine span: every rank of every replica.
+
+    On one replica that is the tensor-parallel group; across replicas, the wide expert
+    group. None outside a distributed run.
+    """
+    group = _tp_group()
+    if group is None or get_world_group().world_size == group.world_size:
+        return group
+    return get_wide_ep_group()
+
+
+def _expert_rank(tp_rank: torch.Tensor | None) -> torch.Tensor | None:
+    """This rank's ``[1]`` int32 rank in the expert group, a graph input; None on one rank."""
+    group = _expert_group()
+    if group is None or group.world_size == 1:
+        return None
+    if group.world_size == _tp_group().world_size:
+        return tp_rank
+    return group.rank_in_group_tensor.reshape(1).to(torch.int32)
+
+
+def _replicas() -> int:
+    """The replicas the expert group spans."""
+    group = _expert_group()
+    return 1 if group is None else group.world_size // _tp_group().world_size
+
+
+def _replica_rank(tp_rank: torch.Tensor | None) -> torch.Tensor:
+    """This rank's ``[1]`` int32 replica in the expert group, a graph input."""
+    return torch.div(_expert_rank(tp_rank), _tp_group().world_size, rounding_mode="floor")
+
+
+def _expert_sum(x: torch.Tensor) -> torch.Tensor:
+    """Sum ``x`` over the expert group in its own dtype; ``x`` itself on one rank."""
+    group = _expert_group()
+    if group is None or group.world_size == 1:
+        return x
+    return _waited(funcol.all_reduce(x, "sum", group.device_group))
+
+
+def _expert_scatter(x: torch.Tensor) -> torch.Tensor:
+    """Sum ``x`` over the expert group and keep this rank's part of dim 0."""
+    group = _expert_group()
+    if group is None or group.world_size == 1:
+        return x
+    return _waited(funcol.reduce_scatter_tensor(x, "sum", 0, group.device_group))
 
 
 def _waited(x: torch.Tensor) -> torch.Tensor:
@@ -196,10 +252,12 @@ def _project(x, weight, norm_weight, eps):
     )[0]
 
 
-def _prefill_projection(x, weight):
+def _prefill_projection(x, weight, heads: bool = False):
     """``[T, K]`` rows times ``weight`` ``[K, N]`` on the library's prefill output projection.
 
-    The wrapper falls back to torch outside its kernel's limits, so this raises there instead.
+    With ``heads`` the rows go in as a free ``[1, T, K / d, d]`` view in the library's BSNd
+    layout; otherwise the wrapper transposes them to BNdS. The wrapper falls back to torch
+    outside its kernel's limits, so this raises there instead.
     """
     tokens, width = x.shape
     d = max(k for k in range(1, output_projection.P_MAX + 1) if width % k == 0)
@@ -218,6 +276,9 @@ def _prefill_projection(x, weight):
         raise ValueError(
             "Kimi K3 prefill projection outside its kernel's limits: " + "; ".join(failed)
         )
+    if heads:
+        view = x.view(1, tokens, width // d, d)
+        return o_proj(view, weight, attention_layout=OProjAttentionLayout.BSNd)[0]
     return o_proj(x.unsqueeze(0), weight)[0]
 
 
@@ -575,22 +636,31 @@ class KimiK3MLA(nn.Module):
 class KimiK3MLP(nn.Module):
     """Gated SiTU MLP: the dense layer and the shared experts.
 
-    With ``reduce``, each tensor-parallel rank holds a contiguous part of the intermediate
-    width and the down projection's partials sum over the group.
+    With ``split``, each tensor-parallel rank holds a contiguous part of the intermediate
+    width and returns its partial of the down projection; with ``reduce`` it also sums the
+    partials over the group. The shared experts split without a sum of their own: the MoE
+    block's one sum adds their partial to the routed one.
     """
 
-    def __init__(self, text_config: KimiK3TextConfig, intermediate_size: int, reduce: bool = False):
+    def __init__(
+        self,
+        text_config: KimiK3TextConfig,
+        intermediate_size: int,
+        reduce: bool = False,
+        split: bool = False,
+    ):
         super().__init__()
         hidden, dtype = text_config.hidden_size, text_config.torch_dtype
         _, tp_size = _tp_rank_and_size()
-        self.reduce = reduce and tp_size > 1
-        if self.reduce:
+        split = (split or reduce) and tp_size > 1
+        self.reduce = reduce and split
+        if split:
             if intermediate_size % tp_size:
                 raise ValueError(
                     f"MLP width {intermediate_size} does not split over {tp_size} ranks"
                 )
             intermediate_size //= tp_size
-        shard = (0, 1) if self.reduce else (None, None)
+        shard = (0, 1) if split else (None, None)
         self.eps = text_config.rms_norm_eps
         self.beta = text_config.activation_situ_beta or 1.0
         self.linear_beta = text_config.activation_situ_linear_beta
@@ -624,12 +694,14 @@ class KimiK3MLP(nn.Module):
 
 
 class KimiK3Router(nn.Module):
-    """Router weights: the expert score projection and the selection bias."""
+    """Router weights: the expert score projection on this rank's columns, and the bias."""
 
     def __init__(self, text_config: KimiK3TextConfig):
         super().__init__()
-        experts = text_config.num_experts
-        self.weight = _frozen((experts, text_config.hidden_size), text_config.torch_dtype)
+        experts, (_, tp_size) = text_config.num_experts, _tp_rank_and_size()
+        self.weight = _frozen(
+            (experts, text_config.hidden_size // tp_size), text_config.torch_dtype, shard_dim=1
+        )
         self.e_score_correction_bias = _frozen((experts,), torch.float32)
 
 
@@ -647,25 +719,46 @@ class KimiK3Experts(nn.Module):
 
 
 class KimiK3MoE(nn.Module):
-    """Latent MoE: down to the latent width, MXFP4 experts, normed latent up, shared experts."""
+    """Latent MoE over the expert group: latent down, MXFP4 experts by rank, combine, up, shared.
+
+    Each rank of each replica holds its own range of experts and its hidden columns of the
+    latent down and router weights. The dispatch all-reduce sums the ranks' K partials of
+    the latent and the router logits and gathers every replica's rows; the combine
+    reduce-scatter sums the experts' partials and gives each rank its replica's rows by its
+    latent columns. The block's output is this rank's fp32 pack ``[up | shared | sum of
+    squares]``, which one sum over the tensor-parallel group completes.
+    """
+
+    #: Rows per prefill call of the tile kernel, every local expert taking all of them.
+    sub_chunk = 512
 
     def __init__(self, text_config: KimiK3TextConfig, num_programs: int):
         super().__init__()
         c = text_config
         if not c.latent_moe_use_norm or c.moe_router_activation_func != "sigmoid":
             raise ValueError("Kimi K3 MoE layers use a latent norm and a sigmoid router")
+        if c.num_experts_per_token != 16 or not c.moe_renormalize:
+            raise ValueError("Kimi K3 MoE kernels choose 16 experts per token and renormalize")
         hidden, latent, dtype = c.hidden_size, c.routed_expert_hidden_size, c.torch_dtype
+        group, (_, tp_size) = _expert_group(), _tp_rank_and_size()
+        ranks = group.world_size if group is not None else 1
+        if c.num_experts % ranks or hidden % tp_size or latent % tp_size:
+            raise ValueError(
+                f"Kimi K3 MoE: {c.num_experts} experts, hidden {hidden} and latent {latent} "
+                f"must split over {ranks} expert ranks and {tp_size} tensor-parallel ranks"
+            )
         self.eps = c.rms_norm_eps
-        self.top_k = c.num_experts_per_token
-        self.renormalize = c.moe_renormalize
+        self.latent_size = latent
         self.scaling = c.routed_scaling_factor
+        self.local_experts = c.num_experts // ranks
         self.gate = KimiK3Router(c)
-        self.experts = KimiK3Experts(c, c.num_experts, num_programs)
-        self.shared_experts = KimiK3MLP(c, c.moe_intermediate_size * c.num_shared_experts)
-        self.routed_expert_down_proj = _Weight((latent, hidden), dtype)
-        self.routed_expert_up_proj = _Weight((hidden, latent), dtype)
+        self.experts = KimiK3Experts(c, self.local_experts, num_programs)
+        self.shared_experts = KimiK3MLP(
+            c, c.moe_intermediate_size * c.num_shared_experts, split=True
+        )
+        self.routed_expert_down_proj = _Weight((latent, hidden // tp_size), dtype, shard_dim=1)
+        self.routed_expert_up_proj = _Weight((hidden, latent // tp_size), dtype, shard_dim=1)
         self.routed_expert_norm = KimiK3RMSNorm(latent, c.rms_norm_eps, dtype)
-        self.register_parameter("input_weight", None)
         self.register_buffer("down_router_weight", None, persistent=False)
         self.register_buffer("latent_norm_weight", None, persistent=False)
         self.register_buffer("latent_up_weight", None, persistent=False)
@@ -674,54 +767,61 @@ class KimiK3MoE(nn.Module):
     def prepare_after_load(self) -> None:
         """Lay out the weights the kernels read, once.
 
-        Latent down and router go to fp32 ``[H, K + E]`` for decode, then stack as bf16
-        ``[H, K + E]`` for the fused projection. The tail takes the latent norm as fp32 ``[D, 1]`` and the latent up and shared
-        down weights as contiguous ``[K, H]``; the prefill projections read the same copies.
+        This rank's rows of the latent down and router weights go to one fp32
+        ``[H / TP, K + E]`` weight, which the decode and prefill projections both read; the
+        bf16 originals are freed. The tail takes this rank's latent columns of the norm
+        weight as fp32 ``[K / TP, 1]`` and the latent up and shared down weights as
+        contiguous ``[K / TP, H]`` and ``[I / TP, H]``.
         """
-        if self.input_weight is None:
+        if self.down_router_weight is None:
             down_router = torch.cat([self.routed_expert_down_proj.weight, self.gate.weight])
             self.down_router_weight = down_router.float().t().contiguous()
-            self.input_weight = _stack(self.routed_expert_down_proj, self.gate)
+            self.routed_expert_down_proj.weight = None
+            self.gate.weight = None
         self.shared_experts.prepare_after_load()
-        self.latent_norm_weight = self.routed_expert_norm.weight.float().reshape(-1, 1)
+        tp_rank, tp_size = _tp_rank_and_size()
+        norm = self.routed_expert_norm.weight.float().chunk(tp_size)[tp_rank]
+        self.latent_norm_weight = norm.reshape(-1, 1).contiguous()
         self.latent_up_weight = self.routed_expert_up_proj.weight.t().contiguous()
         self.shared_down_weight = self.shared_experts.down_weight
 
-    def _select_and_run(self, latent, logits, ids=None, weights=None) -> torch.Tensor:
-        """Routed experts on the latent rows: fp32 ``[T, D]`` combined output."""
+    def _expert_base(self, tp_rank) -> torch.Tensor:
+        """The ``[1, 1]`` int32 global id of this rank's first expert, a graph input."""
+        rank = _expert_rank(tp_rank)
+        if rank is None:
+            return torch.zeros(1, 1, dtype=torch.int32, device=self.down_router_weight.device)
+        return (rank * self.local_experts).reshape(1, 1).to(torch.int32)
+
+    def _select_and_run(self, routed, base) -> torch.Tensor:
+        """The local experts on fp32 ``[R T, K + E]`` decode rows: the partial in combine order."""
+        shared = self.shared_experts
         return _require(routed_experts_mx, "routed experts")(
-            latent,
-            logits,
+            routed,
             self.gate.e_score_correction_bias,
+            base,
             *self.experts.banks(),
-            ids=ids,
-            weights=weights,
-            top_k=self.top_k,
-            renormalize=self.renormalize,
+            beta=shared.beta,
+            linear_beta=shared.linear_beta,
             scaling=self.scaling,
+            replicas=_replicas(),
+            chunks=_tp_rank_and_size()[1],
         )
 
-    def forward_prefill(self, mix, norm_weight) -> torch.Tensor:
-        """The MoE block over a prefill chunk; returns this rank's ``[T, H]`` partial."""
-        latent_size = self.latent_up_weight.shape[0]
-        proj = _project(mix, self.input_weight, norm_weight, self.eps)
-        latent, logits = proj.split([latent_size, proj.shape[-1] - latent_size], -1)
-        ids, weights = _require(router_select, "router selection")(
-            logits.float(), self.gate.e_score_correction_bias, top_k=self.top_k,
-            renormalize=self.renormalize, scaling=self.scaling,
-        )
-        combined = self._select_and_run(latent, logits, ids, weights).to(mix.dtype)
-        up = _prefill_projection(self.routed_expert_norm(combined), self.latent_up_weight)
-        return up + self.shared_experts.forward_prefill(mix, norm_weight)
+    def _combine(self, partial) -> torch.Tensor:
+        """This rank's fp32 rows ``[T, K / C]`` of the summed partials ``[R, C, T, K / C]``."""
+        return _expert_scatter(partial.reshape(-1, partial.shape[-1]))
 
-    def forward_decode(self, mix, k_slice, norm_weight) -> torch.Tensor:
-        """The MoE block at decode; returns the fp32 tail pack ``[T, 2H + 1]``."""
-        latent_size = self.latent_up_weight.shape[0]
-        partial = _output_projection(k_slice, self.down_router_weight)
-        latent, logits = partial.split([latent_size, partial.shape[-1] - latent_size], -1)
-        combined = self._select_and_run(latent, logits)
+    def forward_decode(self, mix, k_slice, norm_weight, tp_rank=None) -> torch.Tensor:
+        """The MoE block at decode; returns the fp32 tail pack ``[T, 2H + 1]``, summed over TP.
+
+        ``k_slice`` holds this rank's hidden columns of every replica's rows, the other
+        replicas' rows zero, so one sum over the expert group adds the K partials and
+        gathers the replicas.
+        """
+        routed = _expert_sum(_output_projection(k_slice, self.down_router_weight))
+        combined = self._combine(self._select_and_run(routed, self._expert_base(tp_rank)))
         gate_up = _project(mix, self.shared_experts.gate_up_weight, norm_weight, self.eps)
-        return self.tail_decode(combined, gate_up)
+        return _all_reduce(self.tail_decode(combined, gate_up))
 
     def tail_decode(self, combined, gate_up) -> torch.Tensor:
         """The fused tail of fp32 ``[T, K]`` combined rows: the fp32 pack ``[T, 2H + 1]``."""
@@ -735,6 +835,88 @@ class KimiK3MoE(nn.Module):
             beta=shared.beta,
             linear_beta=shared.linear_beta,
         )
+
+    def forward_prefill(self, mix, norm_weight, tp_rank=None) -> torch.Tensor:
+        """The MoE block over a prefill chunk: this rank's fp32 pack ``[T, 2H + 1]``.
+
+        The caller sums the packs over the tensor-parallel group and finishes the block
+        with ``prefill_output``.
+        """
+        partial = self._down_router_prefill(mix, norm_weight, tp_rank)
+        routed = _expert_sum(self._replica_rows(partial, tp_rank))
+        rows = self._prefill_experts(routed, tp_rank)
+        replicas, tp_size = _replicas(), _tp_rank_and_size()[1]
+        order = rows.view(replicas, -1, tp_size, self.latent_size // tp_size).transpose(1, 2)
+        return self._prefill_pack(self._combine(order), mix, norm_weight)
+
+    def prefill_output(self, pack) -> torch.Tensor:
+        """The fp32 block output ``[T, H]`` of the summed pack: the scaled up part plus shared."""
+        hidden = (pack.shape[-1] - 1) // 2
+        up, shared, squares = pack.split([hidden, hidden, 1], -1)
+        return up * torch.rsqrt(squares / self.latent_size + self.eps) + shared
+
+    def _down_router_prefill(self, mix, norm_weight, tp_rank) -> torch.Tensor:
+        """This rank's fp32 K partial ``[T, K + E]`` of the latent and the router logits.
+
+        The 1/RMS comes from the whole row in fp32. The rank's bf16 hidden columns, picked
+        by the rank tensor, are scaled by it and by the gain in fp32, so the library
+        projection takes fp32 rows and keeps fp32 to its store.
+        """
+        tokens, hidden = mix.shape
+        tp_size = _tp_rank_and_size()[1]
+        inv = torch.rsqrt(mix.float().pow(2).mean(-1, keepdim=True) + self.eps)
+        cols, gain = mix, norm_weight.reshape(1, hidden)
+        if tp_size > 1:
+            width = hidden // tp_size
+            cols = mix.view(tokens, tp_size, width).index_select(1, tp_rank).reshape(tokens, width)
+            gain = norm_weight.view(tp_size, width).index_select(0, tp_rank).reshape(1, width)
+        k_slice = cols.float() * inv * gain.float()
+        return _prefill_projection(k_slice, self.down_router_weight, heads=True)
+
+    def _replica_rows(self, partial, tp_rank) -> torch.Tensor:
+        """``partial`` at this replica's rows of an fp32 ``[R T, W]`` buffer, the others zero."""
+        replicas = _replicas()
+        if replicas == 1:
+            return partial
+        mine = torch.arange(replicas, device=partial.device) == _replica_rank(tp_rank)
+        return torch.where(mine.view(replicas, 1, 1), partial, 0.0).reshape(-1, partial.shape[-1])
+
+    def _prefill_experts(self, routed, tp_rank) -> torch.Tensor:
+        """The local experts' fp32 partial ``[N, K]`` of ``N`` gathered prefill rows.
+
+        Selection runs on 128-row tiles. Each sub-chunk calls the tile kernel once with
+        every local expert as an item over all its rows, weighted by each row's affinity for
+        the expert and 0 where the row did not choose it, so no row can drop; the items sum
+        in fp32.
+        """
+        latent, logits = routed.split([self.latent_size, routed.shape[-1] - self.latent_size], -1)
+        select = _require(router_select, "router selection")
+        bias = self.gate.e_score_correction_bias
+        picks = [select(tile, bias, scaling=self.scaling) for tile in logits.split(128)]
+        ids, weights = (torch.cat(part) for part in zip(*picks))
+        experts = torch.arange(self.local_experts, dtype=torch.int32, device=ids.device)
+        chosen = ids.unsqueeze(-1) == (self._expert_base(tp_rank).reshape(1) + experts)
+        affinity = torch.where(chosen, weights.unsqueeze(-1), 0.0).sum(1)
+        tiles, shared = _require(routed_expert_tiles_mx, "routed expert tiles"), self.shared_experts
+        out = []
+        for rows, weight in zip(latent.split(self.sub_chunk), affinity.split(self.sub_chunk)):
+            items = rows.unsqueeze(0).expand(self.local_experts, -1, -1).contiguous()
+            out.append(tiles(items, weight.t().contiguous(), *self.experts.banks(),
+                             beta=shared.beta, linear_beta=shared.linear_beta).sum(0))
+        return torch.cat(out)
+
+    def _prefill_pack(self, combined, mix, norm_weight) -> torch.Tensor:
+        """This rank's fp32 pack ``[T, 2H + 1]`` at prefill, in the decode tail's form.
+
+        The up partial projects this rank's latent columns with the norm weight applied in
+        fp32 and one bf16 rounding; the shared partial is this rank's part of the shared
+        experts; the last column is the sum of squares of the combined columns.
+        """
+        rows = (combined * self.latent_norm_weight.t()).to(mix.dtype)
+        up = _prefill_projection(rows, self.latent_up_weight)
+        shared = self.shared_experts.forward_prefill(mix, norm_weight)
+        squares = combined.square().sum(-1, keepdim=True)
+        return torch.cat([up.float(), shared.float(), squares], -1)
 
 
 def _tail_args(tail: torch.Tensor | None, stream: torch.Tensor, latent_size: int) -> dict:
@@ -835,22 +1017,31 @@ class KimiK3DecoderLayer(nn.Module):
         """AttnRes mix at the MLP site, prefill form."""
         return attn_res_prefill(bank[:, : self.mlp_rows], stream, self.mlp_score_w, self.eps)
 
-    def forward_prefill(self, stream, bank, meta) -> torch.Tensor:
-        """One layer over a prefill chunk; returns the new stream."""
+    def forward_prefill(self, stream, bank, meta, tp_rank=None) -> torch.Tensor:
+        """One layer over a prefill chunk; returns the new stream.
+
+        ``tp_rank`` is the ``[1]`` int32 tensor-parallel rank, or None on one rank; the MoE
+        block's K slice and expert range follow it.
+        """
         mix, base = self.attention_mix(stream, bank)
         attn = self.self_attn.forward_prefill(mix, self.input_layernorm.weight, meta)
         attn = _all_reduce(attn).to(stream.dtype)
         stream = attn if base is None else base + attn
-        mix = self.mlp_mix(stream, bank)
-        out = self.feed_forward.forward_prefill(mix, self.post_attention_layernorm.weight)
+        mix, norm = self.mlp_mix(stream, bank), self.post_attention_layernorm.weight
+        if hasattr(self, "block_sparse_moe"):
+            moe = self.block_sparse_moe
+            out = moe.prefill_output(_all_reduce(moe.forward_prefill(mix, norm, tp_rank)))
+        else:
+            out = self.mlp.forward_prefill(mix, norm)
         return stream + out.to(stream.dtype)
 
     def _mix_decode(self, stream, tail, bank, site: str, tp_rank=None):
         """AttnRes mix at decode with the producer's tail as its prologue.
 
         Returns the mix, the new stream, the bank and, at the MLA attention site and
-        the MoE site, the normed fp32 K slice of the mix. At the MLA site the slice is
-        the columns of tensor-parallel rank ``tp_rank``; at the MoE site it is whole.
+        the MoE site, the normed fp32 K slice of the mix: the columns of tensor-parallel
+        rank ``tp_rank``. At the MoE site the slice holds every replica's rows, the other
+        replicas' rows zero.
         """
         attention = site == "attention"
         if attention and self.attention_rows == 0:
@@ -863,7 +1054,8 @@ class KimiK3DecoderLayer(nn.Module):
         emit_k_slice = (attention and not self.is_kda) or (
             not attention and hasattr(self, "block_sparse_moe")
         )
-        sliced = attention and emit_k_slice and tp_rank is not None
+        sliced = emit_k_slice and tp_rank is not None
+        replicas = _replicas() if emit_k_slice and not attention else 1
         mix, stream, k_slice, new_bank = attn_res_decode(
             bank,
             stream,
@@ -873,7 +1065,9 @@ class KimiK3DecoderLayer(nn.Module):
             bank_slot=self.layer_idx // self.block_size if attention and self.block_start else None,
             norm_weight=norm.weight if emit_k_slice else None,
             tp_rank=tp_rank if sliced else None,
-            tp_size=self.self_attn.tp_size if sliced else 1,
+            tp_size=_tp_rank_and_size()[1] if sliced else 1,
+            dp_rank=_replica_rank(tp_rank) if replicas > 1 else None,
+            dp_size=replicas,
             eps=self.eps,
         )
         return mix, stream, k_slice, bank if new_bank is None else new_bank
@@ -887,8 +1081,12 @@ class KimiK3DecoderLayer(nn.Module):
         mix, stream, k_slice, bank = self._mix_decode(stream, tail, bank, "attention", tp_rank)
         attn = self.self_attn.forward_decode(mix, k_slice, self.input_layernorm.weight, meta)
         attn = _all_reduce(attn)
-        mix, stream, k_slice, bank = self._mix_decode(stream, attn, bank, "mlp")
-        out = self.feed_forward.forward_decode(mix, k_slice, self.post_attention_layernorm.weight)
+        mix, stream, k_slice, bank = self._mix_decode(stream, attn, bank, "mlp", tp_rank)
+        norm = self.post_attention_layernorm.weight
+        if hasattr(self, "block_sparse_moe"):
+            out = self.block_sparse_moe.forward_decode(mix, k_slice, norm, tp_rank)
+        else:
+            out = self.mlp.forward_decode(mix, k_slice, norm)
         return stream, out, bank
 
 
@@ -951,11 +1149,11 @@ class KimiK3Model(nn.Module):
             _with_positions(attn_metadata.get(f"layers.{i}.self_attn"), positions)
             for i in range(len(self.layers))
         ]
+        tail, tp_rank = None, _rank_tensor(rank, tp_size)
         if is_prefill:
             for layer, meta in zip(self.layers, metas):
-                stream = layer.forward_prefill(stream, bank, meta)
+                stream = layer.forward_prefill(stream, bank, meta, tp_rank)
             return self.output_mix(stream, bank)
-        tail, tp_rank = None, _rank_tensor(rank, tp_size)
         for layer, meta in zip(self.layers, metas):
             stream, tail, bank = layer.forward_decode(stream, tail, bank, meta, tp_rank)
         return self.output_mix_decode(stream, tail, bank)
@@ -1014,6 +1212,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
             cache_dir,
             rank=group.rank_in_group if group is not None else 0,
             world_size=group.world_size if group is not None else 1,
+            expert_ids=self.local_expert_ids(),
             num_programs=self.num_programs,
             pipelined=dist.is_initialized(),
         )
@@ -1023,6 +1222,14 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 f"{len(unloaded)} Kimi K3 parameters were not loaded, first {unloaded[0]}"
             )
         self.prepare_after_load()
+
+    def local_expert_ids(self) -> list[int] | None:
+        """The global ids of the experts this rank holds, or None when it holds them all."""
+        group = _expert_group()
+        if group is None or group.world_size == 1:
+            return None
+        local = self.text_config.num_experts // group.world_size
+        return list(range(group.rank_in_group * local, (group.rank_in_group + 1) * local))
 
     def prepare_after_load(self) -> None:
         """Compute the fp32 AttnRes score weights and the kernels' stacked weights, once.
