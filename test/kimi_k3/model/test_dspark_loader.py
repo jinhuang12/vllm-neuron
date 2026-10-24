@@ -64,11 +64,20 @@ SHARDS = {
 
 @contextlib.contextmanager
 def _tp_rank(rank: int, size: int):
-    """Make the drafter see a tensor-parallel group of ``size`` with this ``rank``."""
+    """Make the drafter and the target see a tensor-parallel group of ``size`` with this ``rank``.
+
+    At size 32 the world is the served form, TP 32 by DP 2, and the wide expert group
+    spans its 64 ranks. At size 1 the world is that one rank, so the experts stay on the
+    tensor-parallel group.
+    """
     group = types.SimpleNamespace(world_size=size, rank_in_group=rank, device_group=None)
+    world_size = 2 * size if size > 1 else 1
+    world = types.SimpleNamespace(world_size=world_size, rank_in_group=rank, device_group=None)
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(dspark, "_tp_group", lambda: group)
         patch.setattr(kimi_model, "_tp_group", lambda: group)
+        patch.setattr(kimi_model, "get_world_group", lambda: world)
+        patch.setattr(kimi_model, "get_wide_ep_group", lambda: world)
         yield
 
 
