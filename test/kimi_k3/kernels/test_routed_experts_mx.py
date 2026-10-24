@@ -3,7 +3,8 @@
 
 ``routed_experts_mx`` runs selection and the distinct-expert MX loop for one rank's
 14 local experts of layer 1, read from the checkpoint and repacked to the bank layout
-in the kernel module's docstring. ``router_select`` runs the same selection alone.
+in the kernel module's docstring. ``router_select`` runs the same selection alone, on the
+decode rows and on 128-token prefill tiles.
 ``routed_expert_tiles_mx`` runs 6 of those experts on their gathered 128-row tiles.
 The oracle is the checkpoint's own ``KimiMoEGate`` (its float32 casts made float64)
 and ``KimiBlockSparseMLP`` with the stored fp4 weights in float64 (the SiTU stays in
@@ -73,6 +74,10 @@ CODE_LIMITS = {
 TILE_ITEMS, TILE_ROWS, TILE_PADDING = 6, 128, 16
 #: Rows averaged into each small row: its scale is 1 / sqrt of this.
 AVERAGED_ROWS = 131072
+#: Prefill selection runs on 128-token tiles; the poisoned row sits in the second program's half.
+SELECT_ROWS, SELECT_NAN_ROW = 128, 77
+SELECT_REGIMES = ("correlated rows", "repeated tokens", "sigmoid inputs at 12",
+                  "small near-equal rows", "NaN row")
 FP4_VALUES = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
                           dtype=torch.float64)
 
@@ -530,3 +535,44 @@ def test_expert_tiles_on_gathered_rows(reference):
     assert torch.equal(nan_out[others].view(torch.int32), served[others].view(torch.int32)), \
         "the NaN row changed another row's output"
     assert passed, f"{label} is outside class M (a limit of None is not set)"
+
+
+def select_tile_logits(ref, regime):
+    """One 128-token tile of router logits in the named regime."""
+    gen = torch.Generator().manual_seed(7 + SELECT_REGIMES.index(regime))
+    rows, experts = SELECT_ROWS, ref.experts
+    if regime == "correlated rows":
+        logits = LOGIT_STD * (0.9 * torch.randn(experts, generator=gen)
+                              + 0.1 * torch.randn(rows, experts, generator=gen))
+        logits[:, experts // 3] *= 100
+    elif regime == "repeated tokens":
+        logits = (LOGIT_STD * torch.randn(1, experts, generator=gen)).expand(rows, -1)
+    elif regime == "sigmoid inputs at 12":
+        logits = torch.full((rows, experts), -GATE_INPUT)
+        chosen = torch.rand(rows, experts, generator=gen).argsort(-1)[:, :rx.TOP_K]
+        logits.scatter_(1, chosen, GATE_INPUT)
+    elif regime == "small near-equal rows":
+        logits = LOGIT_STD * (torch.randn(experts, generator=gen)
+                              + 2 ** -6 * torch.randn(rows, experts, generator=gen)) / math.sqrt(AVERAGED_ROWS)
+    else:
+        logits = LOGIT_STD * torch.randn(rows, experts, generator=gen)
+    return logits.float().contiguous()
+
+
+@pytest.mark.parametrize("regime", SELECT_REGIMES)
+def test_selection_on_prefill_tiles(reference, regime):
+    logits = select_tile_logits(reference, regime)
+    index, weight = _select(reference, logits)
+    s_set, s_weight = _class_s(reference, logits, index, weight)
+    print(f"{regime}, T {SELECT_ROWS}: class S set excess {s_set:.3f}, weight error / bound {s_weight:.4f}")
+    assert s_set <= 1.0 and s_weight <= 1.0, f"{regime} is outside class S"
+    if regime == "NaN row":
+        poisoned = logits.clone()
+        poisoned[SELECT_NAN_ROW] = float("nan")
+        p_index, p_weight = _select(reference, poisoned)
+        others = [row for row in range(SELECT_ROWS) if row != SELECT_NAN_ROW]
+        assert ((p_index >= 0) & (p_index < reference.experts)).all(), "an index left its range"
+        assert torch.isnan(p_weight[SELECT_NAN_ROW]).all(), "the NaN row's weights are not NaN"
+        assert torch.equal(p_index[others], index[others]) and torch.equal(
+            p_weight[others].view(torch.int32), weight[others].view(torch.int32)), \
+            "the NaN row changed another row's selection"
