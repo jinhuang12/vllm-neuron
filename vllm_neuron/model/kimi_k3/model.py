@@ -22,6 +22,7 @@ from transformers import PretrainedConfig
 from vllm.distributed.parallel_state import get_tp_group, model_parallel_is_initialized
 
 from vllm_neuron.functional.attention.attn_res_prefill import attn_res_prefill
+from vllm_neuron.functional.attention.o_proj import o_proj_tkg
 from vllm_neuron.functional.embedding import embedding
 from vllm_neuron.functional.kda.output import kda_output_prefill
 from vllm_neuron.functional.moe.fused_tail import moe_fused_tail
@@ -51,7 +52,6 @@ def _optional_kernel(module: str, name: str):
 
 
 qkv_proj_fp32acc = _optional_kernel("attention.qkv_fp32acc", "qkv_proj_fp32acc")
-o_proj_tkg = _optional_kernel("attention.o_proj", "o_proj_tkg")
 attn_res_decode = _optional_kernel("attention.attn_res_decode", "attn_res_decode")
 kda_fused_decode = _optional_kernel("kda.fused_decode", "kda_fused_decode")
 kda_prefill = _optional_kernel("kda.prefill", "kda_prefill")
@@ -138,8 +138,19 @@ def _project(x, weights, norm_weight=None, eps=0.0):
 
 
 def _output_projection(x, weight):
-    """Decode rows of ``x`` times ``weight`` (``[N*D, H]``) through the TKG kernel."""
-    return _require(o_proj_tkg, "output projection")(x, weight)
+    """Decode rows of ``x`` (``[D, T, N, 1]``) times ``weight`` (``[N*D, H]``) through the TKG kernel."""
+    return o_proj_tkg(x, weight)
+
+
+def _decode_layout(rows: torch.Tensor) -> torch.Tensor:
+    """Copy token-major ``[T, N*D]`` rows into the decode projection's ``[D, T, N, 1]`` input.
+
+    D is the largest divisor of the width up to 128 partitions. Element ``(d, t, n)``
+    is column ``n * D + d`` of token t, so the move puts the columns on partitions.
+    """
+    tokens, width = rows.shape
+    d = max(k for k in range(1, 129) if width % k == 0)
+    return rows.reshape(tokens, width // d, d).permute(2, 0, 1).unsqueeze(-1).contiguous()
 
 
 class KimiK3KDA(nn.Module):
@@ -168,15 +179,17 @@ class KimiK3KDA(nn.Module):
         self.o_norm = _Weight((self.head_dim,), torch.float32)
         self.o_proj = _Weight((hidden, width), dtype)
         self.register_buffer("conv_weight", None, persistent=False)
+        self.register_buffer("output_weight", None, persistent=False)
         # Per-sequence conv [slots, taps - 1, 3W] and recurrent [slots, heads, D, D]
         # state banks, bound with the KV caches.
         self.conv_state = None
         self.recurrent_state = None
 
     def prepare_after_load(self) -> None:
-        """Stack the q, k and v conv taps as the short conv's ``[3W, taps]`` fp32 weight."""
+        """Stack the conv taps as ``[3W, taps]`` fp32, and lay out ``o_proj`` as ``[W, H]``."""
         taps = [m.weight.squeeze(1) for m in (self.q_conv1d, self.k_conv1d, self.v_conv1d)]
         self.conv_weight = torch.cat(taps).float()
+        self.output_weight = self.o_proj.weight.t().contiguous()
 
     def _input_weights(self) -> list[torch.Tensor]:
         """The fused input projection's weights in output order: q, k, v, g, f_a, b."""
@@ -225,7 +238,7 @@ class KimiK3KDA(nn.Module):
             eps=self.eps,
             lower_bound=self.lower_bound,
         )
-        return _output_projection(core, self.o_proj.weight.t())
+        return _output_projection(core, self.output_weight)
 
 
 class KimiK3MLA(nn.Module):
@@ -249,14 +262,16 @@ class KimiK3MLA(nn.Module):
         self.o_proj = _Weight((hidden, heads * c.v_head_dim), dtype)
         self.g_proj = _Weight((heads * c.v_head_dim, hidden), dtype)
         self.register_buffer("latent_weight", None, persistent=False)
+        self.register_buffer("output_weight", None, persistent=False)
         # Paged latent cache [blocks, block_size, kv_lora_rank + rope], bound with the KV caches.
         self.kv_cache = None
 
     def prepare_after_load(self) -> None:
-        """Stack q_a over kv_a in fp32, the latent projection's weight."""
-        self.latent_weight = torch.cat(
-            [self.q_a_proj.weight, self.kv_a_proj_with_mqa.weight]
-        ).float()
+        """Lay out the decode projections: q_a and kv_a as fp32 ``[H, Q + L]``, o_proj ``[HV, H]``."""
+        self.latent_weight = (
+            torch.cat([self.q_a_proj.weight, self.kv_a_proj_with_mqa.weight]).float().t().contiguous()
+        )
+        self.output_weight = self.o_proj.weight.t().contiguous()
 
     def _attend(self, latent, gate, meta):
         """Latent norms, q_b, absorb, paged attention and gate; stores the new latent rows."""
@@ -279,14 +294,14 @@ class KimiK3MLA(nn.Module):
         """MLA over a prefill chunk; returns this rank's ``[T, H]`` partial."""
         weights = [self.q_a_proj.weight, self.kv_a_proj_with_mqa.weight, self.g_proj.weight]
         proj = _project(mix, weights, norm_weight, self.eps)
-        latent, gate = proj.split([self.latent_weight.shape[0], self.g_proj.weight.shape[0]], -1)
+        latent, gate = proj.split([self.latent_weight.shape[1], self.g_proj.weight.shape[0]], -1)
         return _project(self._attend(latent, gate, meta), [self.o_proj.weight])
 
     def forward_decode(self, mix, k_slice, norm_weight, meta) -> torch.Tensor:
         """One MLA decode step; ``k_slice`` is the normed fp32 K slice of the mix."""
-        latent = _output_projection(k_slice, self.latent_weight.t())
+        latent = _output_projection(k_slice, self.latent_weight)
         gate = _project(mix, [self.g_proj.weight], norm_weight, self.eps)
-        return _output_projection(self._attend(latent, gate, meta), self.o_proj.weight.t())
+        return _output_projection(self._attend(latent, gate, meta), self.output_weight)
 
 
 class KimiK3MLP(nn.Module):
@@ -301,9 +316,11 @@ class KimiK3MLP(nn.Module):
         self.gate_proj = _Weight((intermediate_size, hidden), dtype)
         self.up_proj = _Weight((intermediate_size, hidden), dtype)
         self.down_proj = _Weight((hidden, intermediate_size), dtype)
+        self.register_buffer("down_weight", None, persistent=False)
 
     def prepare_after_load(self) -> None:
-        """Nothing to prepare."""
+        """Lay out ``down_proj`` as ``[I, H]`` for the decode projection (dense layers only)."""
+        self.down_weight = self.down_proj.weight.t().contiguous()
 
     def activation(self, mix, norm_weight) -> torch.Tensor:
         """RMSNorm of ``mix``, the gate and up projections, then SiTU-and-mul."""
@@ -317,7 +334,7 @@ class KimiK3MLP(nn.Module):
 
     def forward_decode(self, mix, k_slice, norm_weight) -> torch.Tensor:
         """The MLP at decode; returns the ``[T, H]`` bf16 partial."""
-        return _output_projection(self.activation(mix, norm_weight), self.down_proj.weight.t())
+        return _output_projection(_decode_layout(self.activation(mix, norm_weight)), self.down_weight)
 
 
 class KimiK3Router(nn.Module):
@@ -368,14 +385,14 @@ class KimiK3MoE(nn.Module):
         self.register_buffer("shared_down_weight", None, persistent=False)
 
     def prepare_after_load(self) -> None:
-        """Stack latent down over the router in fp32, and lay out the decode tail's weights.
+        """Lay out the decode weights once: latent down and router as fp32 ``[H, K + E]``.
 
         The tail takes the latent norm as fp32 ``[D, 1]`` and the latent up and shared
         down weights as contiguous ``[K, H]``, so each copy is made here once.
         """
-        self.down_router_weight = torch.cat(
-            [self.routed_expert_down_proj.weight, self.gate.weight]
-        ).float()
+        self.down_router_weight = (
+            torch.cat([self.routed_expert_down_proj.weight, self.gate.weight]).float().t().contiguous()
+        )
         self.latent_norm_weight = self.routed_expert_norm.weight.float().reshape(-1, 1)
         self.latent_up_weight = self.routed_expert_up_proj.weight.t().contiguous()
         self.shared_down_weight = self.shared_experts.down_proj.weight.t().contiguous()
@@ -411,7 +428,7 @@ class KimiK3MoE(nn.Module):
     def forward_decode(self, mix, k_slice, norm_weight) -> torch.Tensor:
         """The MoE block at decode; returns the fp32 tail pack ``[T, 2H + 1]``."""
         latent_size = self.routed_expert_down_proj.weight.shape[0]
-        partial = _output_projection(k_slice, self.down_router_weight.t())
+        partial = _output_projection(k_slice, self.down_router_weight)
         latent, logits = partial.split([latent_size, partial.shape[-1] - latent_size], -1)
         combined = self._select_and_run(latent, logits)
         shared = self.shared_experts
