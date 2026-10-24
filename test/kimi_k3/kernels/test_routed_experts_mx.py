@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Routed experts and router selection at the Kimi K3 decode shapes, against a float64 oracle.
+"""Routed experts and router selection at the Kimi K3 decode and prefill shapes, against a float64 oracle.
 
 ``routed_experts_mx`` runs selection and the distinct-expert MX loop for one rank's
 14 local experts of layer 1, read from the checkpoint and repacked to the bank layout
 in the kernel module's docstring. ``router_select`` runs the same selection alone.
+``routed_expert_tiles_mx`` runs 6 of those experts on their gathered 128-row tiles.
 The oracle is the checkpoint's own ``KimiMoEGate`` (its float32 casts made float64)
 and ``KimiBlockSparseMLP`` with the stored fp4 weights in float64 (the SiTU stays in
 float32, as the reference computes it), with the kernel's MXFP8 activation
@@ -65,7 +66,10 @@ CODE_LIMITS = {
     "sigmoid inputs at 12, T 8": None,
     "small near-equal rows, T 8": None,
     "clean rows, T 8": None,
+    "expert tiles, T 128": None,
 }
+#: Prefill tiles: 6 experts with 128 gathered rows each, the last 16 of them padding.
+TILE_ITEMS, TILE_ROWS, TILE_PADDING = 6, 128, 16
 #: Rows averaged into each small row: its scale is 1 / sqrt of this.
 AVERAGED_ROWS = 131072
 FP4_VALUES = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
@@ -124,6 +128,13 @@ def _dequant(packed, scale):
     return (values * torch.exp2(scale.double() - 127)[..., None]).reshape(packed.shape[0], -1)
 
 
+def _slotted(scale):
+    """Scale rows [..., 16, B*512] in 3 slots per quadrant: [..., 48, B/3*512]."""
+    *lead, rows, width = scale.shape
+    blocks = scale.reshape(*lead, 4, 4, 3, width // 3 // 512, 512)
+    return blocks.movedim(-3, -4).reshape(*lead, 48, width // 3)
+
+
 def _bank(stored, programs):
     """The bank layout of the kernel module docstring, built from the stored bytes."""
     def gate_up(e):
@@ -134,7 +145,7 @@ def _bank(stored, programs):
         s = torch.stack([e["w1.scale"], e["w3.scale"]])
         s = s.reshape(2, programs, width // programs // 512, 512, s.shape[-1] // 16, 16)
         s = s.permute(1, 5, 0, 2, 4, 3).reshape(programs, 16, -1)
-        return w, s
+        return w, _slotted(s)
 
     def down(e):
         w = e["w2.packed"].contiguous().view(torch.uint16)
@@ -142,7 +153,7 @@ def _bank(stored, programs):
         kd = i4 // programs // 128
         w = w.reshape(rows // 512, 512, programs, kd, 128).permute(2, 0, 4, 3, 1)
         s = e["w2.scale"].reshape(rows // 512, 512, programs, kd, 16).permute(2, 4, 0, 3, 1)
-        return w.reshape(programs, rows // 512, 128, kd * 512), s.reshape(programs, 16, -1)
+        return w.reshape(programs, rows // 512, 128, kd * 512), _slotted(s.reshape(programs, 16, -1))
 
     parts = [gate_up(e) + down(e) for e in stored]
     return [torch.stack([p[i] for p in parts]).contiguous() for i in range(4)]
@@ -273,6 +284,24 @@ def _ordinal(codes):
     return torch.where(u >= 128, 128 - u, u)
 
 
+def _code_rule(got, got_exp, want, want_exp):
+    """Codes that differ, a block at a different scale counting as 32 and a block of zeros
+    as none, and the largest code step."""
+    scale_same = got_exp == want_exp
+    differ = torch.where(scale_same, (got.double() != want.double()).sum(-1), 32)
+    zeros = (got.double() == 0).all(-1) & (want.double() == 0).all(-1)
+    differ = torch.where(zeros, 0, differ)
+    steps = (_ordinal(got) - _ordinal(want)).abs() * scale_same[..., None]
+    return int(differ.sum()), int(steps.amax())
+
+
+def _worst(partial, adopted):
+    """The partial's worst error over 2^-8 of the adopted oracle's row RMS."""
+    rms = adopted.square().mean(-1, keepdim=True).sqrt()
+    err = (partial.double() - adopted).abs()
+    return torch.where(err == 0, 0.0, err / (2 ** -8 * rms)).amax().item()
+
+
 def _class_m(ref, routed, bank, replicas):
     """One case's differing codes, all codes, largest code step, and the partial's worst error
     over the bound of the oracle that adopts the kernel's codes."""
@@ -286,19 +315,11 @@ def _class_m(ref, routed, bank, replicas):
         "the test mode changed the partial"
     got, got_exp = _kernel_codes(codes, scales, visited, tokens, ref.width)
     want, want_exp = _mx8_codes(_intermediates(ref, routed, visited))
-    scale_same = got_exp == want_exp
-    differ = torch.where(scale_same, (got.double() != want.double()).sum(-1), 32)
-    # A block of zeros has no scale to differ.
-    zeros = (got.double() == 0).all(-1) & (want.double() == 0).all(-1)
-    differ = torch.where(zeros, 0, differ)
-    steps = (_ordinal(got) - _ordinal(want)).abs() * scale_same[..., None]
+    differ, step = _code_rule(got, got_exp, want, want_exp)
     h = (got.double() * torch.exp2(got_exp)[..., None]).reshape(len(visited), tokens, -1)
     adopted = _adopted(ref, index, weight, visited, h)
-    rms = adopted.square().mean(-1, keepdim=True).sqrt()
-    err = (partial.double() - adopted).abs()
-    worst = torch.where(err == 0, 0.0, err / (2 ** -8 * rms)).amax().item()
-    return SimpleNamespace(differ=int(differ.sum()), codes=got.numel(), step=int(steps.amax()),
-                           worst=worst, visited=visited)
+    return SimpleNamespace(differ=differ, codes=got.numel(), step=step,
+                           worst=_worst(partial, adopted), visited=visited)
 
 
 def _class_m_line(label, m):
@@ -449,3 +470,61 @@ def test_nan_row_stays_in_its_row(reference):
         weight[others].view(torch.int32), clean_weight[others].view(torch.int32)), \
         "the NaN row changed another row's selection"
     assert passed, "the clean run is outside class M (a limit of None is not set)"
+
+
+def _tile_kernel(ref, rows, weights, bank, expose_codes=False):
+    situ = ref.scope["_get_situ_activation_params"](ref.config)
+
+    def run(rows_, weights_, *bank_):
+        return rx.routed_expert_tiles_mx(rows_, weights_, *bank_, beta=situ[0],
+                                         linear_beta=situ[1], expose_codes=expose_codes)
+
+    if not ON_DEVICE:
+        return run(rows, weights, *bank)
+    compiled = torch.compile(run, backend=envs.get_compile_backend_name(), fullgraph=True,
+                             dynamic=False)
+    out = compiled(*[t.to("neuron:0") for t in (rows, weights, *bank)])
+    return tuple(t.cpu() for t in out) if expose_codes else out.cpu()
+
+
+def tile_cases(ref):
+    """Regime R1 on prefill tiles: each expert's rows near one direction with one channel 100x."""
+    gen = torch.Generator().manual_seed(6)
+    rows = (0.9 * torch.randn(TILE_ITEMS, 1, ref.latent, generator=gen)
+            + 0.1 * torch.randn(TILE_ITEMS, TILE_ROWS, ref.latent, generator=gen))
+    rows[..., ref.latent // 3] *= 100
+    weights = 0.2 * torch.rand(TILE_ITEMS, TILE_ROWS, generator=gen)
+    weights[:, TILE_ROWS - TILE_PADDING:] = 0.0
+    return rows.float().contiguous(), weights.float().contiguous()
+
+
+def test_expert_tiles_on_gathered_rows(reference):
+    label = f"expert tiles, T {TILE_ROWS}"
+    rows, weights = tile_cases(reference)
+    bank = _bank(reference.stored, reference.programs)
+    items = list(range(TILE_ITEMS))
+    served = _tile_kernel(reference, rows, weights, bank)
+    out, codes, scales = _tile_kernel(reference, rows, weights, bank, expose_codes=True)
+    assert torch.equal(out.view(torch.int32), served.view(torch.int32)), \
+        "the test mode changed the output"
+    got, got_exp = _kernel_codes(codes, scales, items, TILE_ROWS, reference.width)
+    want, want_exp = _mx8_codes(torch.cat([_intermediates(reference, rows[n], [n]) for n in items]))
+    differ, step = _code_rule(got, got_exp, want, want_exp)
+    h = (got.double() * torch.exp2(got_exp)[..., None]).reshape(TILE_ITEMS, TILE_ROWS, -1)
+    adopted = torch.stack([
+        weights[n].double()[:, None] * (h[n] @ _dequant(reference.stored[n]["w2.packed"],
+                                                        reference.stored[n]["w2.scale"]).T)
+        for n in items])
+    m = SimpleNamespace(differ=differ, codes=got.numel(), step=step,
+                        worst=_worst(out.flatten(0, 1), adopted.flatten(0, 1)), visited=items)
+    passed, line = _class_m_line(label, m)
+    poisoned = rows.clone()
+    poisoned[NAN_ROW, 5] = float("nan")
+    nan_out = _tile_kernel(reference, poisoned, weights, bank)
+    print(line)
+    others = torch.ones(TILE_ITEMS, TILE_ROWS, dtype=torch.bool)
+    others[NAN_ROW, 5] = False
+    assert torch.isnan(nan_out[NAN_ROW, 5]).all(), "the NaN row's output is not NaN throughout"
+    assert torch.equal(nan_out[others].view(torch.int32), served[others].view(torch.int32)), \
+        "the NaN row changed another row's output"
+    assert passed, f"{label} is outside class M (a limit of None is not set)"

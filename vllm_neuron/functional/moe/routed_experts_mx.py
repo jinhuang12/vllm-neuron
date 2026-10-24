@@ -12,19 +12,29 @@ product is weighted and summed per token. Under LNC 2 each core takes half of
 the expert width and the halves meet in one send-receive. The partial is stored
 in the combine's chunk order ``[R, C, T/R, D/C]``.
 
-A token whose logits or latent row hold a non-finite value chooses no expert,
-streams as zeros, and gets a NaN output row; all three use selects.
+A token whose logits or latent row hold a non-finite value chooses no expert and
+gets a NaN output row; its non-finite latent values stream as zeros. All three use
+selects.
+
+At prefill a second kernel runs each local expert on the rows gathered for it, in
+128-row tiles, with every expert at a static address; under LNC 2 the programs take
+alternate experts, each the full expert width.
 
 Weight bank, per local expert ``e`` and program ``g`` of ``G`` (the loader's
 repack): ``gate_up_weight [E, G, 2NI, 128, NK*512]`` uint16, four fp4 values per
 element, partition ``p`` of a K tile holding K values ``4p`` to ``4p + 3``;
 chunk ``n < NI`` is gate rows ``g*I/G + n*512 + c``, chunk ``n >= NI`` the up
-rows; ``gate_up_scale [E, G, 16, 2NI*NK*512]`` uint8, scale row ``r`` covering K
-values ``32r`` to ``32r + 31`` at free index ``(n*NK + k)*512 + c``;
-``down_weight [E, G, D/512, 128, NI*512]`` and ``down_scale
-[E, G, 16, (D/512)*NI*512]`` likewise over the program's expert-width columns.
-``NK = D/512``, ``NI = I/(512G)``.
+rows; ``down_weight [E, G, D/512, 128, NI*512]`` likewise over the program's
+expert-width columns. The scales are E8M0 bytes, one per 32 contraction values, in
+3 slots per quadrant: ``gate_up_scale [E, G, 48, 2NI*NK*512/3]`` and ``down_scale
+[E, G, 48, (D/512)*NI*512/3]``. Block ``b`` of ``B`` (``b = n*NK + k`` for gate/up,
+``d*NI + k`` for down) sits in slot ``s`` at local block ``l``, ``s, l = divmod(b,
+B/3)``; row ``12q + 4s + r``, column ``l*512 + c`` holds the scale of output column
+``c`` over K values ``32(4q + r)`` to ``32(4q + r) + 31`` of that block. Each
+quadrant's 12 rows load in one copy. ``NK = D/512``, ``NI = I/(512G)``.
 """
+
+import contextlib
 
 import nki
 import nki.isa as nisa
@@ -40,6 +50,8 @@ TOP_K = 16
 RENORM_GUARD = 1e-20
 _KT = 512  # contraction values per MX K tile
 _Q = 4  # values per x4 element
+_SLOTS = 3  # scale blocks side by side in each quadrant's rows
+_GROUP = 16  # tokens per latent group: 16 tokens by 7 K tiles fill 112 partitions
 _MIN_FLOAT = -3.4028235e38
 _NAN = float("nan")
 
@@ -117,6 +129,9 @@ def routed_experts_mx(
     )
     assert gate_up_weight.dtype == down_weight.dtype == torch.uint16, "MXFP4 weights are uint16"
     assert gate_up_scale.dtype == down_scale.dtype == torch.uint8, "MX scales are uint8"
+    assert gate_up_scale.shape[2] == down_scale.shape[2] == 4 * 4 * _SLOTS, (
+        "MX scales hold 3 slots of 4 rows per quadrant"
+    )
     assert routed.shape[1] == latent + score_bias.shape[0], (
         f"routed {tuple(routed.shape)} must be [T, {latent} + {score_bias.shape[0]}]"
     )
@@ -147,6 +162,52 @@ def routed_experts_mx(
 # ---------------------------------------------------------------------------- #
 # Kernel pieces.
 # ---------------------------------------------------------------------------- #
+
+
+def routed_expert_tiles_mx(
+    rows: torch.Tensor,
+    weights: torch.Tensor,
+    gate_up_weight: torch.Tensor,
+    gate_up_scale: torch.Tensor,
+    down_weight: torch.Tensor,
+    down_scale: torch.Tensor,
+    beta: float,
+    linear_beta: float,
+    expose_codes: bool = False,
+):
+    """Weighted outputs ``[N, R, D]`` fp32 of local expert ``n`` on the rows gathered for it.
+
+    ``rows [N, R, D]`` fp32 holds expert ``n``'s gathered latent rows, ``R`` a multiple
+    of 128, and ``weights [N, R]`` fp32 their routing weights, 0 on padding rows. Each
+    item runs its expert at a static address, every bank half, in 128-row tiles; under
+    LNC 2 the programs take alternate items. A row with a non-finite latent value gets a
+    NaN output row. With ``expose_codes`` the call also returns the MXFP8 intermediate
+    codes ``[N, G, 128, NI*R]`` int32 and scales uint8, laid out as ``routed_experts_mx``
+    lays them out with ``R`` rows.
+    """
+    items, per_item, latent = rows.shape
+    experts, _, _, _, packed = gate_up_weight.shape
+    assert rows.dtype == weights.dtype == torch.float32, "rows and weights must be fp32"
+    assert tuple(weights.shape) == (items, per_item), f"weights must be [{items}, {per_item}]"
+    assert per_item % 128 == 0, f"R={per_item} must be a multiple of 128"
+    assert items <= experts and latent == packed, (
+        f"rows {tuple(rows.shape)} must be at most [{experts}, R, {packed}]")
+    assert gate_up_weight.dtype == down_weight.dtype == torch.uint16, "MXFP4 weights are uint16"
+    assert gate_up_scale.dtype == down_scale.dtype == torch.uint8, "MX scales are uint8"
+    assert gate_up_scale.shape[2] == down_scale.shape[2] == 4 * 4 * _SLOTS, (
+        "MX scales hold 3 slots of 4 rows per quadrant"
+    )
+    return wrap_nki(_routed_expert_tiles_kernel)[get_logical_nc_config()](
+        rows=rows,
+        weights=weights,
+        gate_up_weight=gate_up_weight,
+        gate_up_scale=gate_up_scale,
+        down_weight=down_weight,
+        down_scale=down_scale,
+        beta=beta,
+        linear_beta=linear_beta,
+        expose_codes=expose_codes,
+    )
 
 
 def _tile(rows, cols, dtype=nl.float32):
@@ -285,66 +346,205 @@ def _local_affinity(index, weights, keep, base, local):
     return affinity, chosen
 
 
-def _latent_mx(latent_bf16, rows, latent):
-    """MXFP8 stationaries ``[128, D/512, P]`` and scales of bf16 rows ``[P, D]``.
+def _latent_groups(routed, tokens, rows, latent):
+    """The latent of ``routed`` in bf16 groups of up to 16 rows, partition ``k*n + t`` holding K tile ``k`` of row ``t``.
+
+    Each K tile of a group lands in one DMA, ``n`` partitions of one 512-value run each,
+    so the loads and the checks spread over up to 112 partitions. A non-finite value has
+    its partition's tile zeroed, so no transpose carries it to another token. Rows past T
+    read as zeros. Returns the groups as (first row, row count ``n``, tile) and
+    ``bad [rows, 1]``, each row's count of non-finite values.
+    """
+    width = routed.shape[1]
+    tiles = latent // _KT
+    bad = nl.ndarray((rows, 1), dtype=nl.float32, buffer=nl.psum)
+    groups = []
+    for g, first in enumerate(range(0, rows, _GROUP)):
+        count = min(_GROUP, rows - first)
+        real = min(count, tokens - first)
+        parts = tiles * count
+        part = nl.ndarray((parts, _KT), dtype=nl.float32, buffer=nl.sbuf)
+        if real < count:
+            nisa.memset(dst=part, value=0.0)
+        for k in range(tiles):
+            nisa.dma_copy(dst=part[k * count:k * count + real, :], src=routed.ap(
+                pattern=[[width, real], [1, _KT]], offset=first * width + k * _KT),
+                dge_mode=nisa.dge_mode.hwdge,
+                engine=nisa.engine.sync if k % 2 == 0 else nisa.engine.scalar)
+        rounded = nl.ndarray((parts, _KT), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.tensor_copy(dst=rounded, src=part)
+        flags = _tile(parts, 1)
+        _nonfinite_count(rounded, _KT, flags)
+        clean = nl.ndarray((parts, _KT), dtype=nl.bfloat16, buffer=nl.sbuf)
+        nisa.memset(dst=clean, value=0.0)
+        finite = _tile(parts, 1, nl.uint8)
+        nisa.tensor_scalar(dst=finite, data=flags, op0=nl.equal, operand0=0.0)
+        nisa.tensor_copy_predicated(dst=clean, src=rounded, predicate=finite.ap(
+            pattern=[[1, parts], [0, _KT]]))
+        # owner[k*n + t, r] = 1 where r is row first + t, built transposed and flipped on the PE.
+        lag = _tile(rows, parts)
+        nisa.iota(dst=lag, pattern=[[0, tiles], [1, count]], offset=first, channel_multiplier=-1)
+        match = _tile(rows, parts)
+        nisa.tensor_scalar(dst=match, data=lag, op0=nl.equal, operand0=0.0)
+        flipped = nl.ndarray((parts, rows), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_transpose(dst=flipped, data=match)
+        owner = _tile(parts, rows)
+        nisa.tensor_copy(dst=owner, src=flipped)
+        nisa.nc_matmul(dst=bad, stationary=owner, moving=flags, accumulate=g > 0)
+        groups.append((first, count, clean))
+    return groups, bad
+
+
+def _flip(src, rows, tiles, natural=None):
+    """``natural [128, tiles, P, 4]`` bf16 of ``src [P, tiles*512]``: ``natural[p, k, t, q] = src[t, 512k + 4p + q]``.
+
+    PE transposes into PSUM tiles of at most 2 KB per partition.
+    """
+    if natural is None:
+        natural = nl.ndarray((128, tiles, rows, _Q), dtype=nl.bfloat16, buffer=nl.sbuf)
+    span = max(1, 1024 // (_Q * rows))
+    width = tiles * _KT
+    for k0 in range(0, tiles, span):
+        ks = min(span, tiles - k0)
+        flipped = nl.ndarray((128, ks, _Q, rows), dtype=nl.bfloat16, buffer=nl.psum)
+        for k in range(ks):
+            for q in range(_Q):
+                nisa.nc_transpose(dst=flipped[:, k, q, :], data=src.ap(
+                    pattern=[[width, rows], [_Q, 128]], offset=(k0 + k) * _KT + q))
+        nisa.tensor_copy(dst=natural[:, k0:k0 + ks, :, :], src=flipped.ap(
+            pattern=[[ks * _Q * rows, 128], [_Q * rows, ks], [1, rows], [rows, _Q]]))
+    return natural
+
+
+def _tile_work(latent):
+    """The working tiles one 128-row tile's quantization reuses: fp32 rows, bf16 rows, natural."""
+    return (_tile(128, latent), nl.ndarray((128, latent), dtype=nl.bfloat16, buffer=nl.sbuf),
+            nl.ndarray((128, latent // _KT, 128, _Q), dtype=nl.bfloat16, buffer=nl.sbuf))
+
+
+def _tile_state(latent):
+    """One 128-row tile's state across the bank halves: stationaries, scales, keep, weight, sum."""
+    tiles = latent // _KT
+    return (nl.ndarray((128, tiles, 128), dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf),
+            nl.ndarray((128, tiles, 128), dtype=nl.uint8, buffer=nl.sbuf),
+            _tile(128, 1, nl.uint8), _tile(128, 1), _tile(128, latent))
+
+
+def _tile_mx(rows, item, first, work, state):
+    """Quantize 128 rows of ``rows[item]`` into ``state``; zero its sum and read its weights.
+
+    A row with a non-finite value streams as zeros, so no transpose carries it to
+    another row; its keep entry is 0.
+    """
+    per_item, latent = rows.shape[1:]
+    part, rounded, natural = work
+    quant, scale, keep, _, acc = state
+    nisa.dma_copy(dst=part, src=rows.ap(pattern=[[latent, 128], [1, latent]],
+                                        offset=(item * per_item + first) * latent),
+                  dge_mode=nisa.dge_mode.hwdge)
+    nisa.tensor_copy(dst=rounded, src=part)
+    bad = _tile(128, 1)
+    _nonfinite_count(rounded, latent, bad)
+    nisa.tensor_scalar(dst=keep, data=bad, op0=nl.equal, operand0=0.0)
+    drop = _tile(128, 1, nl.uint8)
+    nisa.tensor_scalar(dst=drop, data=bad, op0=nl.not_equal, operand0=0.0)
+    zero = _tile(128, 1, nl.bfloat16)
+    nisa.memset(dst=zero, value=0.0)
+    nisa.tensor_copy_predicated(dst=rounded, src=zero.ap(pattern=[[1, 128], [0, latent]]),
+                                predicate=drop.ap(pattern=[[1, 128], [0, latent]]))
+    _flip(rounded, 128, latent // _KT, natural)
+    nisa.quantize_mx(dst=quant, src=natural, dst_scale=scale)
+    nisa.memset(dst=acc, value=0.0)
+
+
+def _latent_mx(groups, rows, latent):
+    """MXFP8 stationaries ``[128, D/512, P]`` and scales of the latent groups.
 
     Partition ``p`` of K tile ``k`` holds latent values ``k*512 + 4p .. + 3``; each
     group of 8 partitions by 4 values is one token's 32 consecutive values.
     """
     tiles = latent // _KT
-    flipped = nl.ndarray((128, tiles, _Q, rows), dtype=nl.bfloat16, buffer=nl.psum)
-    for k in range(tiles):
-        for q in range(_Q):
-            nisa.nc_transpose(dst=flipped[:, k, q, :], data=latent_bf16.ap(
-                pattern=[[latent, rows], [_Q, 128]], offset=k * _KT + q))
     natural = nl.ndarray((128, tiles, rows, _Q), dtype=nl.bfloat16, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=natural, src=flipped.ap(
-        pattern=[[tiles * _Q * rows, 128], [_Q * rows, tiles], [1, rows], [rows, _Q]]))
+    for first, count, clean in groups:
+        parts = tiles * count
+        flipped = nl.ndarray((128, _Q, parts), dtype=nl.bfloat16, buffer=nl.psum)
+        for q in range(_Q):
+            nisa.nc_transpose(dst=flipped[:, q, :], data=clean.ap(
+                pattern=[[_KT, parts], [_Q, 128]], offset=q))
+        nisa.tensor_copy(
+            dst=natural.ap(pattern=[[tiles * rows * _Q, 128], [rows * _Q, tiles], [_Q, count],
+                                    [1, _Q]], offset=first * _Q),
+            src=flipped.ap(pattern=[[_Q * parts, 128], [count, tiles], [1, count], [parts, _Q]]))
     quant = nl.ndarray((128, tiles, rows), dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
     scale = nl.ndarray((128, tiles, rows), dtype=nl.uint8, buffer=nl.sbuf)
     nisa.quantize_mx(dst=quant, src=natural, dst_scale=scale)
     return quant, scale
 
 
-def _operand_tiles(nk, ni, nd):
-    """SBUF tiles for one expert's operands on one program, allocated once."""
+def _operand_tiles(nk, ni, nd, defined=False):
+    """SBUF tiles for one expert's operands on one program, allocated once.
+
+    With ``defined``, the scales start at 0, so a pass over the tiles before any load
+    reads finite values.
+    """
     gate_up = nl.ndarray((128, 2 * ni, nk * _KT), dtype=nl.float4_e2m1fn_x4, buffer=nl.sbuf)
     down = nl.ndarray((128, nd, ni * _KT), dtype=nl.float4_e2m1fn_x4, buffer=nl.sbuf)
     scales = []
     for blocks in (2 * ni * nk, nd * ni):
-        scale = nl.ndarray((128, blocks * _KT), dtype=nl.uint8, buffer=nl.sbuf)
-        # The products read scales from partitions 32q to 32q + 3 only, which every load
-        # writes; a small memset defines the tile ahead of the loop.
-        nisa.memset(dst=scale[0:1, 0:4], value=0, engine=nisa.engine.gpsimd)
+        scale = nl.ndarray((128, blocks // _SLOTS * _KT), dtype=nl.uint8, buffer=nl.sbuf)
+        if defined:
+            nisa.memset(dst=scale, value=0, engine=nisa.engine.gpsimd)
+        else:
+            # The products read only the 12 rows per quadrant that every load writes.
+            nisa.memset(dst=scale[0:1, 0:4], value=0, engine=nisa.engine.gpsimd)
         scales.append(scale)
     return gate_up, scales[0], down, scales[1]
 
 
-def _load_operands(bank, staged, program, tiles, dge):
-    """DMA the expert in the [1, 1] uint32 tile ``staged`` of ``bank`` for ``program``: ten DMAs.
+def _scale_block(scale, block, blocks):
+    """The scale view of block ``block`` of ``blocks`` in a 3-slot scale tile."""
+    slot, local = divmod(block, blocks // _SLOTS)
+    return scale[4 * slot:, local * _KT:(local + 1) * _KT]
 
-    All go on the queue of ``dge`` in program order, each set of scales ahead of its weights.
+
+def _load_operands(bank, expert, half, tiles, dge):
+    """DMA expert ``expert`` of ``bank`` for ``half``: ten DMAs.
+
+    ``expert`` is an int, a static address, or a [1, 1] uint32 tile read at run time.
+    All go on the queue of ``dge``. Run-time loads issue in program order, each weight
+    ahead of its scales, so the weight packets start first and the scale packets fill in
+    behind them; static loads are placed by the scheduler. A run-time id past the bank's
+    last expert moves nothing.
     """
     gate_up_weight, gate_up_scale, down_weight, down_scale = bank
     gate_up, gate_up_s, down, down_s = tiles
-    _, programs, two_ni, _, gu_cols = gate_up_weight.shape
-    _, _, nd, _, dn_cols = down_weight.shape
-    with nl.no_reorder():
-        expert = nisa.register_alloc()
-        nisa.register_load(dst=expert, src=staged)
-        for scale_src, scale_dst, weight_src, weight_dst, count, cols in (
-                (gate_up_scale, gate_up_s, gate_up_weight, gate_up, two_ni, gu_cols),
-                (down_scale, down_s, down_weight, down, nd, dn_cols)):
-            scale_cols = scale_src.shape[3]
+    static = isinstance(expert, int)
+    with contextlib.nullcontext() if static else nl.no_reorder():
+        if static:
+            index, base = None, expert
+        else:
+            index, base = nisa.register_alloc(), 0
+            nisa.register_load(dst=index, src=expert)
+        for scale_src, scale_dst, weight_src, weight_dst in (
+                (gate_up_scale, gate_up_s, gate_up_weight, gate_up),
+                (down_scale, down_s, down_weight, down)):
+            _, halves, slot_rows, run = scale_src.shape
+            _, _, count, _, cols = weight_src.shape
+            nisa.dma_copy(
+                dst=weight_dst,
+                src=weight_src.ap(pattern=[[cols, 128], [128 * cols, count], [1, cols]],
+                                  offset=(base * halves + half) * count * 128 * cols,
+                                  scalar_offset=index, indirect_dim=0),
+                oob_mode=nisa.oob_mode.skip, **dge)
+            quad_rows = slot_rows // 4
             for quad in range(4):
-                nisa.dma_copy(dst=scale_dst[32 * quad:32 * quad + 4, :], src=scale_src.ap(
-                    pattern=[[scale_cols, 4], [1, scale_cols]],
-                    offset=(program * 16 + 4 * quad) * scale_cols, scalar_offset=expert,
-                    indirect_dim=0), **dge)
-            nisa.dma_copy(dst=weight_dst, src=weight_src.ap(
-                pattern=[[cols, 128], [128 * cols, count], [1, cols]],
-                offset=program * count * 128 * cols, scalar_offset=expert, indirect_dim=0),
-                **dge)
+                nisa.dma_copy(
+                    dst=scale_dst[32 * quad:32 * quad + quad_rows, :],
+                    src=scale_src.ap(pattern=[[run, quad_rows], [1, run]],
+                                     offset=((base * halves + half) * slot_rows
+                                             + quad * quad_rows) * run,
+                                     scalar_offset=index, indirect_dim=0),
+                    oob_mode=nisa.oob_mode.skip, **dge)
 
 
 def _expert_rows(stationary, stationary_scale, tiles, affinity, acc, beta, linear_beta, sink=None):
@@ -367,7 +567,7 @@ def _expert_rows(stationary, stationary_scale, tiles, affinity, acc, beta, linea
                 nisa.nc_matmul_mx(dst=product, stationary=stationary[:, k, :],
                                   moving=gate_up[:, n, k * _KT:(k + 1) * _KT],
                                   stationary_scale=stationary_scale[:, k, :],
-                                  moving_scale=gate_up_s[:, (n * nk + k) * _KT:(n * nk + k + 1) * _KT],
+                                  moving_scale=_scale_block(gate_up_s, n * nk + k, 2 * ni * nk),
                                   accumulate=(k > 0))
             products.append(product)
         gate, up = products
@@ -384,27 +584,22 @@ def _expert_rows(stationary, stationary_scale, tiles, affinity, acc, beta, linea
                                   op1=nl.multiply, operand1=sig_gate)
         nisa.scalar_tensor_tensor(dst=act[:, j, :], data=tanh_up, op0=nl.multiply,
                                   operand0=linear_beta, op1=nl.multiply, operand1=situ)
-    flipped = nl.ndarray((128, ni, _Q, rows), dtype=nl.bfloat16, buffer=nl.psum)
-    for j in range(ni):
-        for q in range(_Q):
-            nisa.nc_transpose(dst=flipped[:, j, q, :], data=act.ap(
-                pattern=[[ni * _KT, rows], [_Q, 128]], offset=j * _KT + q))
-    natural = nl.ndarray((128, ni, rows, _Q), dtype=nl.bfloat16, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=natural, src=flipped.ap(
-        pattern=[[ni * _Q * rows, 128], [_Q * rows, ni], [1, rows], [rows, _Q]]))
+    natural = _flip(act.reshape((rows, ni * _KT)), rows, ni)
     act_q = nl.ndarray((128, ni, rows), dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
     act_s = nl.ndarray((128, ni, rows), dtype=nl.uint8, buffer=nl.sbuf)
     nisa.quantize_mx(dst=act_q, src=natural, dst_scale=act_s)
     if sink is not None:
         codes_dst, scales_dst = sink
-        nisa.dma_copy(dst=codes_dst, src=act_q.view(nl.int32).reshape((128, ni * rows)))
-        nisa.dma_copy(dst=scales_dst, src=act_s.reshape((128, ni * rows)))
+        nisa.dma_copy(dst=codes_dst, src=act_q.view(nl.int32).reshape((128, ni * rows)),
+                      oob_mode=nisa.oob_mode.skip)
+        nisa.dma_copy(dst=scales_dst, src=act_s.reshape((128, ni * rows)),
+                      oob_mode=nisa.oob_mode.skip)
     for d in range(nd):
         out = nl.ndarray((rows, _KT), dtype=nl.float32, buffer=nl.psum)
         for k in range(ni):
             nisa.nc_matmul_mx(dst=out, stationary=act_q[:, k, :], moving=down[:, d, k * _KT:(k + 1) * _KT],
                               stationary_scale=act_s[:, k, :],
-                              moving_scale=down_s[:, (d * ni + k) * _KT:(d * ni + k + 1) * _KT],
+                              moving_scale=_scale_block(down_s, d * ni + k, nd * ni),
                               accumulate=(k > 0))
         span = acc[:, d * _KT:(d + 1) * _KT]
         nisa.scalar_tensor_tensor(dst=span, data=out, op0=nl.multiply, operand0=affinity,
@@ -440,10 +635,12 @@ def _visit_experts(chosen, affinity, stationary, stationary_scale, bank, program
                    beta, linear_beta, exposed=None):
     """Run each local expert with a chosen token once, ascending, next expert's loads in flight.
 
-    Items run in pairs (2p, 2p + 1) on two operand buffers swapped statically: item
-    2p + 1 loads while 2p computes, and 2p + 2 while 2p + 1 computes. With an even count
-    the last pair loads nothing after it; with an odd count the last item runs alone. Each
-    of the ``count`` items loads once; with no item, expert 0 loads and never computes.
+    One hardware loop runs the items in pairs (2p, 2p + 1) on two operand buffers swapped
+    statically: item 2p + 1 loads while 2p computes, and 2p + 2 while 2p + 1 computes. Each
+    pass stages the next pass's first expert id before it ends, so that load starts at the
+    top of the pass. A load past the last item names no expert and moves nothing, so each of the ``count``
+    items loads once. With an odd count the last pass also computes a padding item at
+    affinity 0 on the second buffer's resident data, and stores none of its codes.
     ``exposed``, in the test mode, is the (codes, scales) HBM outputs indexed by local expert.
     """
     rows, local = chosen.shape
@@ -453,37 +650,28 @@ def _visit_experts(chosen, affinity, stationary, stationary_scale, bank, program
     pairs = (local + 1) // 2
     padded = 2 * pairs + 2
 
-    # Experts with at least one chosen token, compacted, and their count.
+    # Experts with at least one chosen token, compacted; padding entries hold ``local``.
     ones = _tile(rows, 1)
     nisa.memset(dst=ones, value=1.0)
     counts = nl.ndarray((1, local), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_matmul(dst=counts, stationary=ones, moving=chosen)
-    load = _tile(1, local)
-    nisa.tensor_copy(dst=load, src=counts)
+    hits = _tile(1, local)
+    nisa.tensor_copy(dst=hits, src=counts)
     visit = _tile(1, local + 1, nl.int32)
-    nisa.nonzero_with_count(dst=visit, src=load, index_offset=0, padding_val=0)
-    # Loop counts, read from uint32 tiles: pairs that load the item after them, a last pair
-    # that loads nothing after it (an even count), and a last odd item.
+    nisa.nonzero_with_count(dst=visit, src=hits, index_offset=0, padding_val=local)
     count = _tile(1, 1, nl.uint32)
     nisa.tensor_copy(dst=count, src=visit[:, local:local + 1])
-    pairs_n = _tile(1, 1, nl.uint32)
-    nisa.tensor_scalar(dst=pairs_n, data=count, op0=nl.right_shift, operand0=1)
-    loops = _tile(1, 3, nl.uint32)
-    nisa.tensor_scalar(dst=loops[:, 2:3], data=count, op0=nl.bitwise_and, operand0=1)
-    even_tail = _tile(1, 2, nl.uint32)
-    nisa.tensor_scalar(dst=even_tail[:, 0:1], data=pairs_n, op0=nl.minimum, operand0=1)
-    nisa.tensor_scalar(dst=even_tail[:, 1:2], data=loops[:, 2:3], op0=nl.bitwise_xor, operand0=1)
-    nisa.tensor_tensor(dst=loops[:, 1:2], data1=even_tail[:, 0:1], data2=even_tail[:, 1:2],
-                       op=nl.bitwise_and)
-    nisa.tensor_tensor(dst=loops[:, 0:1], data1=pairs_n, data2=loops[:, 1:2], op=nl.subtract)
-    leading, last, odd = (nisa.register_alloc() for _ in range(3))
-    for i, reg in enumerate((leading, last, odd)):
-        nisa.register_load(dst=reg, src=loops[:, i:i + 1])
+    rounded = _tile(1, 1, nl.uint32)
+    nisa.tensor_scalar(dst=rounded, data=count, op0=nl.add, operand0=1)
+    passes_n = _tile(1, 1, nl.uint32)
+    nisa.tensor_scalar(dst=passes_n, data=rounded, op0=nl.right_shift, operand0=1)
+    passes = nisa.register_alloc()
+    nisa.register_load(dst=passes, src=passes_n)
     flat = _tile(1, padded, nl.int32)
-    nisa.memset(dst=flat, value=0)
+    nisa.memset(dst=flat, value=local)
     nisa.tensor_copy(dst=flat[:, 0:local], src=visit[:, 0:local])
 
-    # Item i's affinity column, aff[:, flat[i]], by a select and an exact sum.
+    # Item i's affinity column, aff[:, flat[i]], by a select and an exact sum; 0 for padding.
     flat_f = _tile(1, padded)
     nisa.tensor_copy(dst=flat_f, src=flat)
     item_expert = _row_broadcast(flat_f, rows, padded)
@@ -499,49 +687,50 @@ def _visit_experts(chosen, affinity, stationary, stationary_scale, bank, program
     item_aff = nl.ndarray((rows, padded), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_reduce(dst=item_aff, data=spread, op=nl.add, axis=(2,))
 
-    # Per pair position q: item 2p + q's expert and affinity column at loop register p.
+    # Per pair position q: item 2p + q's expert (q < 4) and affinity column (q < 2) at
+    # loop register p.
     expert_at, aff_at = [], []
-    for q in range(3):
+    for q in range(4):
         e_q = _tile(1, pairs, nl.int32)
         nisa.tensor_copy(dst=e_q, src=flat.ap(pattern=[[padded, 1], [2, pairs]], offset=q))
+        expert_at.append(e_q)
+    for q in range(2):
         a_q = nl.ndarray((rows, pairs), dtype=nl.float32, buffer=nl.sbuf)
         nisa.tensor_copy(dst=a_q, src=item_aff.ap(pattern=[[padded, rows], [2, pairs]], offset=q))
-        expert_at.append(e_q)
         aff_at.append(a_q)
 
-    buffers = [_operand_tiles(nk, two_ni // 2, nd) for _ in range(2)]
+    buffers = [_operand_tiles(nk, two_ni // 2, nd, defined=b == 1) for b in range(2)]
+    loads = {}  # the compiler's descriptor queue, on the GpSimd engine
+    # Table entries go on the Sync engine's hardware queue, so they wait behind no expert load.
+    entries = dict(dge_mode=nisa.dge_mode.hwdge, engine=nisa.engine.sync)
     first = _tile(1, 1, nl.uint32)
     nisa.tensor_copy(dst=first, src=flat[:, 0:1])
-    loads = dict(dge_mode=nisa.dge_mode.hwdge)
-    # Table entries go on the GpSimd queue, so they wait behind no expert load.
-    entries = dict(dge_mode=nisa.dge_mode.swdge)
     _load_operands(bank, first, program, buffers[0], loads)
-    held = [_tile(1, 1, nl.uint32), _tile(1, 1, nl.uint32)]
+    upcoming = _tile(1, 1, nl.uint32)
+    nisa.tensor_copy(dst=upcoming, src=flat[:, 1:2])
+    held = _tile(1, 1, nl.uint32)
 
-    def compute(q, p, tiles):
-        # A full-height tile starts at partition 0, as the accumulator does.
-        column = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)[0:rows, :]
-        _stage(aff_at[q], p, column, entries)
+    def compute(q, p, column, tiles):
         sink = None if exposed is None else _code_sink(exposed, expert_at[q], p, program, entries)
         # In program order, so no engine starts the next expert ahead of this one's products.
         with nl.no_reorder():
             _expert_rows(stationary, stationary_scale, tiles, column, acc, beta, linear_beta, sink)
 
     def run_pair(p):
-        _load_operands(bank, _stage(expert_at[1], p, held[1], entries), program, buffers[1], loads)
-        compute(0, p, buffers[0])
-        _load_operands(bank, _stage(expert_at[2], p, held[0], entries), program, buffers[0], loads)
-        compute(1, p, buffers[1])
+        # The pass's table entries stage ahead of its expert loads: an entry staged after a
+        # run-time load waits for that load to land, and the second item's products with it.
+        # A full-height tile starts at partition 0, as the accumulator does.
+        columns = [nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)[0:rows, :] for _ in range(2)]
+        for q in range(2):
+            _stage(aff_at[q], p, columns[q], entries)
+        _stage(expert_at[2], p, held, entries)
+        _load_operands(bank, upcoming, program, buffers[1], loads)
+        compute(0, p, columns[0], buffers[0])
+        _load_operands(bank, held, program, buffers[0], loads)
+        compute(1, p, columns[1], buffers[1])
+        _stage(expert_at[3], p, upcoming, entries)
 
-    def last_pair(_):
-        _load_operands(bank, _stage(expert_at[1], leading, held[1], entries), program, buffers[1],
-                       loads)
-        compute(0, leading, buffers[0])
-        compute(1, leading, buffers[1])
-
-    nl.fori_loop(0, leading, run_pair)
-    nl.fori_loop(0, last, last_pair)
-    nl.fori_loop(0, odd, lambda _: compute(0, leading, buffers[0]))
+    nl.fori_loop(0, passes, run_pair)
 
 
 @nki.jit
@@ -566,10 +755,6 @@ def _routed_experts_kernel(routed, score_bias, expert_base, gate_up_weight, gate
     if rows > tokens:
         nisa.memset(dst=logits, value=_NAN)
     nisa.dma_copy(dst=logits[0:tokens, :], src=routed[:, latent:width], dge_mode=nisa.dge_mode.hwdge)
-    hidden = nl.ndarray((rows, latent), dtype=nl.float32, buffer=nl.sbuf)
-    if rows > tokens:
-        nisa.memset(dst=hidden, value=0.0)
-    nisa.dma_copy(dst=hidden[0:tokens, :], src=routed[:, 0:latent], dge_mode=nisa.dge_mode.hwdge)
     bias = nl.ndarray((rows, experts), dtype=nl.float32, buffer=nl.sbuf)
     nisa.dma_copy(dst=bias, src=score_bias.ap(pattern=[[0, rows], [1, experts]], offset=0),
                   dge_mode=nisa.dge_mode.hwdge)
@@ -579,24 +764,16 @@ def _routed_experts_kernel(routed, score_bias, expert_base, gate_up_weight, gate
     base = _tile(rows, 1)
     nisa.tensor_copy(dst=base, src=base_i)
 
+    groups, bad_hidden = _latent_groups(routed, tokens, rows, latent)
     bad_logit = _tile(rows, 1)
     _nonfinite_count(logits, experts, bad_logit)
-    bad_hidden = _tile(rows, 1)
-    _nonfinite_count(hidden, latent, bad_hidden)
     bad = _tile(rows, 1)
     nisa.tensor_tensor(dst=bad, data1=bad_logit, data2=bad_hidden, op=nl.add)
     keep = _keep_rows(bad, rows)
 
     index, weights = _select(logits, bias, keep, scaling)
     affinity, chosen = _local_affinity(index, weights, keep, base, local)
-
-    rounded = nl.ndarray((rows, latent), dtype=nl.bfloat16, buffer=nl.sbuf)
-    nisa.tensor_copy(dst=rounded, src=hidden)
-    clean = nl.ndarray((rows, latent), dtype=nl.bfloat16, buffer=nl.sbuf)
-    nisa.memset(dst=clean, value=0.0)
-    nisa.tensor_copy_predicated(dst=clean, src=rounded, predicate=keep.ap(
-        pattern=[[keep.shape[1], rows], [0, latent]]))
-    stationary, stationary_scale = _latent_mx(clean, rows, latent)
+    stationary, stationary_scale = _latent_mx(groups, rows, latent)
 
     acc = nl.ndarray((rows, latent), dtype=nl.float32, buffer=nl.sbuf)
     nisa.memset(dst=acc, value=0.0)
@@ -634,6 +811,64 @@ def _routed_experts_kernel(routed, score_bias, expert_base, gate_up_weight, gate
                                 [1, width_c]],
                        offset=(r * chunks + program * own_chunks) * per_replica * width_c),
             src=marked[r * per_replica:(r + 1) * per_replica, :])
+    if expose_codes:
+        return out, exposed[0], exposed[1]
+    return out
+
+
+@nki.jit
+def _routed_expert_tiles_kernel(rows, weights, gate_up_weight, gate_up_scale, down_weight,
+                                down_scale, beta, linear_beta, expose_codes=False):
+    """Alternate items per program: each item's expert, every bank half, over its 128-row tiles."""
+    items, per_item, latent = rows.shape
+    _, halves, two_ni, _, _ = gate_up_weight.shape
+    nk = latent // _KT
+    ni = two_ni // 2
+    nd = down_weight.shape[2]
+    programs = nl.num_programs(0) if nl.program_ndim() != 0 else 1
+    program = nl.program_id(0) if programs > 1 else 0
+    bank = (gate_up_weight.view(nl.float4_e2m1fn_x4), gate_up_scale,
+            down_weight.view(nl.float4_e2m1fn_x4), down_scale)
+    out = nl.ndarray((items, per_item, latent), dtype=nl.float32, buffer=nl.shared_hbm)
+    code_cols = ni * per_item
+    exposed = None
+    if expose_codes:
+        exposed = tuple(nl.ndarray((items, halves, 128, code_cols), dtype=dtype, buffer=nl.shared_hbm)
+                        for dtype in (nl.int32, nl.uint8))
+    buffers = [_operand_tiles(nk, ni, nd) for _ in range(2)]
+    work = _tile_work(latent)
+    # Two items' state, so one item quantizes while the other computes.
+    states = [[_tile_state(latent) for _ in range(0, per_item, 128)] for _ in range(2)]
+    nan = _tile(128, 1)
+    nisa.memset(dst=nan, value=_NAN)
+    visit = 0
+    for slot, item in enumerate(range(program, items, programs)):
+        state = states[slot % 2]
+        for r, first in enumerate(range(0, per_item, 128)):
+            _tile_mx(rows, item, first, work, state[r])
+            nisa.dma_copy(dst=state[r][3], src=weights.ap(pattern=[[1, 128], [1, 1]],
+                                                          offset=item * per_item + first))
+        for half in range(halves):
+            tiles = buffers[visit % 2]
+            visit += 1
+            _load_operands(bank, item, half, tiles, {})
+            for r, first in enumerate(range(0, per_item, 128)):
+                stationary, stationary_scale, _, weight, acc = state[r]
+                sink = None
+                if expose_codes:
+                    sink = tuple(t.ap(pattern=[[code_cols, 128], [per_item, ni], [1, 128]],
+                                      offset=(item * halves + half) * 128 * code_cols + first)
+                                 for t in exposed)
+                _expert_rows(stationary, stationary_scale, tiles, weight, acc, beta, linear_beta,
+                             sink)
+        for r, first in enumerate(range(0, per_item, 128)):
+            _, _, keep, _, acc = state[r]
+            drop = _tile(128, 1, nl.uint8)
+            nisa.tensor_scalar(dst=drop, data=keep, op0=nl.equal, operand0=0)
+            nisa.tensor_copy_predicated(dst=acc, src=nan.ap(pattern=[[1, 128], [0, latent]]),
+                                        predicate=drop.ap(pattern=[[1, 128], [0, latent]]))
+            nisa.dma_copy(dst=out.ap(pattern=[[latent, 128], [1, latent]],
+                                     offset=(item * per_item + first) * latent), src=acc)
     if expose_codes:
         return out, exposed[0], exposed[1]
     return out
