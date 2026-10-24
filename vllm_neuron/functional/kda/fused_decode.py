@@ -83,8 +83,9 @@ def kda_fused_decode(
     Args:
         x: [T, 1667] bf16 projections per token, columns q, k, v, g (each 384),
             f_a (128) and the 3 beta logits.
-        slots: [T] int32 page of each token. Slots are distinct, and every slot
-            is a page of the buffer; a padding token takes a slot of its own.
+        slots: [T] int32 page of each token, every slot a page of the buffer. No two
+            request tokens share a slot. Padding tokens may share a scratch slot that no
+            request holds; that page then holds one of their writes.
         pages: [slots, page bytes] contiguous int8 page buffer, updated in place. A page
             holds the conv rows [3, 1152] bf16 from byte 0, oldest first, channels q | k | v,
             then the fp32 recurrent state [3, 128, 128] per head, [K, V]. No other byte is written.

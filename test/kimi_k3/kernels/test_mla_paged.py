@@ -5,10 +5,11 @@ The oracle transcribes ``KimiMLAAttention.forward`` from the checkpoint's
 ``modeling_kimi_linear.py`` to fp64, from the ``q_a`` and ``kv_a`` projections on: the two
 RMS norms, ``q_b`` and ``kv_b`` unabsorbed, NoPE attention with the additive causal mask
 and the sigmoid output gate. The kernels read the earlier positions as bf16 latent rows from
-a paged cache built here, its unused rows NaN and its table padded with -1; the oracle reads
-those rows as the cache holds them and the new positions unrounded. Pass rule, per output
-row against the oracle: every element within 2^-7 of its value plus 2^-7 of the row RMS,
-and row cosine at least 0.9999.
+an int8 page buffer built here, its unused rows NaN and its table padded with -1, and write
+the new tokens' latent rows into it at their slots; the oracle reads the cached rows as the
+buffer holds them and the new positions unrounded. Pass rule, per output row and per new
+latent row against the oracle: every element within 2^-7 of its value plus 2^-7 of the row
+RMS, and row cosine at least 0.9999.
 
 The decode output arrives head dimension first, ``[128, T, H, 1]``, the output projection's
 input layout; the checks read it back token-major.
@@ -39,6 +40,7 @@ NOPE = 128
 V_DIM = 128
 QKV = Q_LORA + KV_LORA + ROPE
 LATENT = KV_LORA + ROPE
+ROW_BYTES = LATENT * 2
 EPS = 1e-6
 SCALE = (NOPE + ROPE) ** -0.5
 ELEMENT_TOL = 2.0**-7
@@ -67,15 +69,16 @@ def _latent(rows, kv_norm):
                      dim=-1)
 
 
-def _reference(rows, gate, weights, queries):
+def _reference(rows, gate, weights, queries, cached=None):
     """fp64 attention output of the last ``queries`` of ``rows``, the qkv_a rows of one sequence,
-    the earlier rows' latent as the bf16 cache holds it."""
+    the earlier rows' latent as the bf16 cache holds it, or ``cached`` where given."""
     q_norm, kv_norm, q_b, kv_b = weights
     x = rows.double()
     length = x.shape[0]
     q = (_rms_norm(x[-queries:, :Q_LORA], q_norm) @ q_b.double().T).view(queries, HEADS, -1)
     c = _latent(rows, kv_norm)
-    c[:length - queries] = c[:length - queries].bfloat16().double()
+    held = c[:length - queries].bfloat16() if cached is None else cached
+    c[:length - queries] = held.double()
     kv = (c[:, :KV_LORA] @ kv_b.double().T).view(length, HEADS, NOPE + V_DIM)
     k_rot = c[:, KV_LORA:].unsqueeze(1).expand(length, HEADS, ROPE)
     key = torch.cat((kv[..., :NOPE], k_rot), dim=-1)
@@ -89,7 +92,8 @@ def _reference(rows, gate, weights, queries):
 
 
 def _paged_cache(prefixes, block_size, pages, gen):
-    """Cache ``[blocks, block_size, 576]`` bf16 and table ``[len(prefixes), pages]`` int32.
+    """Cache ``[blocks, block_size, 576]`` bf16, table ``[len(prefixes), pages]`` int32, each
+    sequence's count of filled blocks and the spare blocks.
 
     Each sequence's latent rows fill its blocks in order; its blocks are a random draw from
     a pool with spare blocks, every row no sequence owns is NaN, and the table's unused
@@ -108,7 +112,35 @@ def _paged_cache(prefixes, block_size, pages, gen):
             cache[block, :part.shape[0]] = part.bfloat16()
             table[s, j] = block
         first += used[s]
-    return cache, table
+    return cache, table, used, order[first:].tolist()
+
+
+def _as_pages(cache):
+    """The int8 page buffer ``[blocks, page bytes]`` of a cache, one latent block per page."""
+    return cache.view(torch.int8).reshape(cache.shape[0], -1)
+
+
+def _new_slots(table, used, spare, positions, block_size):
+    """Slots of new tokens at ``positions[s]`` of sequence ``s``: the row of the sequence's block
+    that holds the position, or of a spare block where the position starts a new block."""
+    spare, slots = list(spare), []
+    for s, pos in enumerate(positions):
+        fresh = {}
+        for p in pos:
+            j = p // block_size
+            if j >= used[s] and j not in fresh:
+                fresh[j] = spare.pop(0)
+            block = int(table[s, j]) if j < used[s] else fresh[j]
+            slots.append(block * block_size + p % block_size)
+    return torch.tensor(slots, dtype=torch.int32)
+
+
+def _rows_at(pages, slots, block_size, offset=0):
+    """Latent rows ``[len(slots), 576]`` bf16 at ``slots`` of a page buffer whose latent block
+    starts ``offset`` bytes into each page."""
+    rows = pages.view(torch.bfloat16).reshape(pages.shape[0], -1, LATENT)
+    s = slots.long()
+    return rows[s // block_size, offset // ROW_BYTES + s % block_size]
 
 
 _compiled = {}
@@ -127,25 +159,33 @@ def _run(fn, *args):
 
 
 def _decode(weights, rows, gate, block_size, pages, gen):
-    """Kernel decode outputs for sequences whose qkv_a rows are ``rows``, the last one new."""
+    """Kernel decode output and the new latent rows read back at their slots, for sequences
+    whose qkv_a rows are ``rows``, the last one new."""
     q_norm, kv_norm, q_b, kv_b = weights
-    cache, table = _paged_cache([_latent(r[:-1], kv_norm) for r in rows], block_size, pages, gen)
+    cache, table, used, spare = _paged_cache([_latent(r[:-1], kv_norm) for r in rows], block_size,
+                                             pages, gen)
     lens = torch.tensor([r.shape[0] - 1 for r in rows], dtype=torch.int32)
+    slots = _new_slots(table, used, spare, [[int(n)] for n in lens], block_size)
     new = torch.stack([r[-1] for r in rows]).float()
-    out, latent = _run(mla_paged_decode, new, gate, q_norm, kv_norm,
-                       *prepare_mla_weights(q_b, kv_b), cache, table, lens, EPS)
+    out, buf = _run(mla_paged_decode, new, gate, q_norm, kv_norm, *prepare_mla_weights(q_b, kv_b),
+                    _as_pages(cache), 0, block_size, table, lens, slots, EPS)
     assert tuple(out.shape) == (V_DIM, len(rows), HEADS, 1) and out.dtype == torch.bfloat16
-    return out[..., 0].permute(1, 2, 0).reshape(len(rows), HEADS * V_DIM), latent
+    out = out[..., 0].permute(1, 2, 0).reshape(len(rows), HEADS * V_DIM)
+    return out, _rows_at(buf, slots, block_size)
 
 
 def _prefill(weights, rows, gate, queries, block_size, pages, gen):
-    """Kernel prefill outputs for the last ``queries`` of one sequence's qkv_a ``rows``."""
+    """Kernel prefill output and the chunk's latent rows read back at their slots, for the last
+    ``queries`` of one sequence's qkv_a ``rows``."""
     q_norm, kv_norm, q_b, kv_b = weights
     prefix = rows.shape[0] - queries
-    cache, table = _paged_cache([_latent(rows[:prefix], kv_norm)], block_size, pages, gen)
-    return _run(mla_paged_prefill, rows[prefix:].float(), gate, q_norm, kv_norm,
-                *prepare_mla_weights(q_b, kv_b), cache, table[0],
-                torch.tensor([prefix], dtype=torch.int32), EPS)
+    cache, table, used, spare = _paged_cache([_latent(rows[:prefix], kv_norm)], block_size, pages,
+                                             gen)
+    slots = _new_slots(table, used, spare, [range(prefix, rows.shape[0])], block_size)
+    out, buf = _run(mla_paged_prefill, rows[prefix:].float(), gate, q_norm, kv_norm,
+                    *prepare_mla_weights(q_b, kv_b), _as_pages(cache), 0, block_size, table[0],
+                    torch.tensor([prefix], dtype=torch.int32), slots, EPS)
+    return out, _rows_at(buf, slots, block_size)
 
 
 def _assert_within_bf16_rule(out, ref):
@@ -266,3 +306,73 @@ def test_nan_row_stays_in_its_sequence():
         ref_out, ref_latent = _reference(rows[s], gate[s:s + 1], weights, 1)
         _assert_within_bf16_rule(out[s:s + 1], ref_out)
         _assert_within_bf16_rule(latent[s:s + 1], ref_latent)
+
+
+def _nan_pages(blocks, page_bytes, gen):
+    """An int8 page buffer whose every bf16 word is a NaN of random sign and payload."""
+    words = torch.randint(1, 128, (blocks, page_bytes // 2), generator=gen, dtype=torch.int32)
+    words |= 0x7F80 | (torch.randint(0, 2, words.shape, generator=gen, dtype=torch.int32) << 15)
+    return (words - (words >= 0x8000).int() * 0x10000).to(torch.int16).view(torch.int8)
+
+
+def _check_written(before, after, slots, ref_rows, block_size, offset):
+    """The rows at ``slots`` meet the oracle's rows, and no other byte of the buffer changed."""
+    _assert_within_bf16_rule(_rows_at(after, slots, block_size, offset), ref_rows)
+    rows = before.shape[1] // ROW_BYTES
+    s = slots.long()
+    keep = torch.ones(before.shape[0] * rows, dtype=torch.bool)
+    keep[(s // block_size) * rows + offset // ROW_BYTES + s % block_size] = False
+    assert torch.equal(after.reshape(-1, ROW_BYTES)[keep], before.reshape(-1, ROW_BYTES)[keep]), \
+        "the kernel wrote outside the new rows"
+
+
+def test_rows_written_in_place():
+    """A decode step, then a prefill chunk, on a NaN-filled page buffer whose latent block sits one
+    row into a wider page: each new row lands at its slot, a padding token's (-1) at block 0, and
+    no other byte changes."""
+    gen = torch.Generator().manual_seed(20261024)
+    weights = _weights(gen)
+    q_norm, kv_norm, q_b, kv_b = weights
+    layouts = prepare_mla_weights(q_b, kv_b)
+    block_size, offset, blocks = 256, ROW_BYTES, 12
+    buf = _nan_pages(blocks, (block_size + 2) * ROW_BYTES, gen)
+    page_rows = buf.view(torch.bfloat16).reshape(blocks, -1, LATENT)
+    order = (1 + torch.randperm(blocks - 1, generator=gen)).tolist()  # block 0 is the null block
+    lens = (300, 37, 511)
+    seqs = [torch.randn(n + 1, QKV, generator=gen) for n in lens]
+    table = torch.full((len(lens) + 1, 4), -1, dtype=torch.int32)  # the last row is padding
+    for s, rows in enumerate(seqs):
+        latent = _latent(rows[:-1], kv_norm).bfloat16()
+        for j in range(math.ceil(lens[s] / block_size)):
+            table[s, j] = order.pop(0)
+            part = latent[j * block_size:(j + 1) * block_size]
+            page_rows[int(table[s, j]), 1:1 + part.shape[0]] = part
+
+    def slot(s, p):
+        return int(table[s, p // block_size]) * block_size + p % block_size
+
+    new = torch.cat([torch.stack([r[-1] for r in seqs]), torch.randn(1, QKV, generator=gen)])
+    gate = torch.randn(len(lens) + 1, HEADS * V_DIM, generator=gen).bfloat16()
+    slots = torch.tensor([slot(s, n) for s, n in enumerate(lens)] + [-1], dtype=torch.int32)
+    before = buf.clone()
+    out, buf = _run(mla_paged_decode, new.float(), gate, q_norm, kv_norm, *layouts, buf, offset,
+                    block_size, table, torch.tensor(lens + (0,), dtype=torch.int32), slots, EPS)
+    out = out[..., 0].permute(1, 2, 0).reshape(len(lens) + 1, HEADS * V_DIM)
+    for s, rows in enumerate(seqs):
+        _assert_within_bf16_rule(out[s:s + 1], _reference(rows, gate[s:s + 1], weights, 1)[0])
+    _check_written(before, buf, slots.clamp(min=0), _latent(new, kv_norm), block_size, offset)
+
+    # The first sequence goes on with a 300-token chunk over its 301 cached rows, decode's included,
+    # into a new block, and one padding token.
+    prefix, chunk = len(seqs[0]), torch.randn(301, QKV, generator=gen)
+    table[0, 2] = order.pop(0)
+    slots = torch.tensor([slot(0, p) for p in range(prefix, prefix + 300)] + [-1],
+                         dtype=torch.int32)
+    cached = _rows_at(buf, torch.tensor([slot(0, p) for p in range(prefix)]), block_size, offset)
+    gate = torch.randn(301, HEADS * V_DIM, generator=gen).bfloat16()
+    before = buf.clone()
+    out, buf = _run(mla_paged_prefill, chunk.float(), gate, q_norm, kv_norm, *layouts, buf, offset,
+                    block_size, table[0], torch.tensor([prefix], dtype=torch.int32), slots, EPS)
+    ref = _reference(torch.cat([seqs[0], chunk[:300]]), gate[:300], weights, 300, cached)[0]
+    _assert_within_bf16_rule(out[:300], ref)
+    _check_written(before, buf, slots.clamp(min=0), _latent(chunk, kv_norm), block_size, offset)

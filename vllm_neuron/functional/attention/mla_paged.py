@@ -2,22 +2,26 @@
 """Paged MLA attention for Kimi K3 in NKI: decode steps and 128-row prefill tiles.
 
 One launch takes the all-reduced ``q_a`` and ``kv_a`` rows ``[T, 2112]`` fp32, the output
-gate projection ``[T, H * 128]`` before its sigmoid, and the paged latent cache. It returns
-the gated attention output and the tokens' latent rows ``[T, 576]`` bf16 for the cache
-write. Decode writes the output head dimension first, ``[128, T, H, 1]`` bf16, the input
-layout of the output projection; prefill writes it ``[T, H * 128]`` bf16. Per token, as the
-checkpoint's ``KimiMLAAttention``: the ``q_a`` and ``kv_a`` RMS norms, ``q_b``, attention with
-no rotary stage, and the sigmoid gate. The query is absorbed into the latent:
+gate projection ``[T, H * 128]`` before its sigmoid, and the KV cache's int8 page buffer. It
+writes the tokens' latent rows ``[T, 576]`` bf16 into the buffer at their slots and returns
+the gated attention output and the buffer. Decode writes the output head dimension first,
+``[128, T, H, 1]`` bf16, the input layout of the output projection; prefill writes it
+``[T, H * 128]`` bf16. Per token, as the checkpoint's ``KimiMLAAttention``: the ``q_a`` and
+``kv_a`` RMS norms, ``q_b``, attention with no rotary stage, and the sigmoid gate. The query
+is absorbed into the latent:
 ``q_lift = [W_UK^T q_nope, q_rope]``, 576 wide in bf16, scores the latent rows directly, and
 ``W_UV`` applies once, in fp32, to the softmax-weighted sum of the rows. The normed q and
 ``q_nope`` enter ``q_b`` and ``W_UK`` as bf16 high and low parts, and the fp32 softmax
 weights enter the weighted sum the same way, so ``q_lift`` is the only bf16 rounding on the
 query side.
 
-Cache pages are token-major ``[blocks, block_size, 576]`` bf16, ``block_size`` a multiple of
-128. PE transposes put the latent on the partitions for the scores; the pages themselves
-move for the weighted sum. The softmax runs online over 512-key blocks in fp32. Rows past a
-sequence's length are masked by fill: their scores become the fp32 minimum before the exp
+The buffer is ``[blocks, page bytes]`` int8, one page per block, shared with other layers'
+caches. Each page holds the layer's latent block ``[block_size, 576]`` bf16, token-major, from
+a byte offset; the kernels read it through a bf16 view, with no copy, and write only the new
+rows, so the buffer is updated in place. PE transposes put the latent on the partitions for
+the scores; the pages themselves move for the weighted sum. The softmax runs online over
+512-key blocks in fp32. Rows past a sequence's length are masked by fill: their scores
+become the fp32 minimum before the exp
 and their latent becomes zero before the weighted sum, so no row a sequence does not own
 reaches its output. A token's own latent row is one more key, computed in the launch.
 
@@ -43,6 +47,7 @@ _V = 128
 _Q_LORA = 1536
 _KV_LORA = 512
 _LATENT = _KV_LORA + _ROPE
+_ROW_BYTES = 2 * _LATENT
 _QKV = _Q_LORA + _LATENT
 _K_TILES = _Q_LORA // _P
 _C_TILES = ((0, 128), (128, 128), (256, 128), (384, 128), (512, _ROPE))  # (first, width)
@@ -200,9 +205,12 @@ def _cache_keys(table_row, length, blocks, pages, window, positions):
     return held, bound, invalid
 
 
-def _cache_pages(cache, held, first_tile, n_tiles):
-    """Window tiles ``first_tile ..`` of a sequence as one ``[128, n_tiles, 576]`` page tile."""
-    block_size = cache.shape[1]
+def _cache_pages(cache, held, first_tile, n_tiles, block_size, first):
+    """Window tiles ``first_tile ..`` of a sequence as one ``[128, n_tiles, 576]`` page tile.
+
+    ``cache`` is the bf16 view ``[blocks, page elements]`` of the page buffer, its latent
+    block from element ``first`` of each page.
+    """
     per = block_size // _P
     pages = _sb((_P, n_tiles, _LATENT), cache.dtype)
     t = 0
@@ -211,10 +219,54 @@ def _cache_pages(cache, held, first_tile, n_tiles):
         n = min(n_tiles - t, per - r)
         nisa.dma_copy(dst=pages[:, t:t + n, :],
                       src=cache.ap(pattern=[[_LATENT, _P], [_P * _LATENT, n], [1, _LATENT]],
-                                   offset=r * _P * _LATENT, scalar_offset=held[0:1, b:b + 1],
-                                   indirect_dim=0))
+                                   offset=first + r * _P * _LATENT,
+                                   scalar_offset=held[0:1, b:b + 1], indirect_dim=0))
         t += n
     return pages
+
+
+def _page_views(pages, latent_offset, block_size):
+    """The page buffer as bf16 ``[blocks, page elements]`` for the page reads and as bf16 rows
+    ``[blocks * page rows, 576]`` for the row writes, with the latent block's first element and
+    first row in a page."""
+    blocks, page_bytes = pages.shape
+    kernel_assert(pages.dtype == nl.int8, "the page buffer is int8")
+    kernel_assert(page_bytes % _ROW_BYTES == 0 and latent_offset % _ROW_BYTES == 0,
+                  "pages and the latent offset are whole 1152-byte rows")
+    kernel_assert(latent_offset + block_size * _ROW_BYTES <= page_bytes,
+                  "the latent block lies inside a page")
+    kernel_assert(block_size % _P == 0 and block_size & (block_size - 1) == 0,
+                  "block_size is a power of two, a multiple of 128")
+    by_page = pages.view(nl.bfloat16)
+    by_row = by_page.reshape((blocks * (page_bytes // _ROW_BYTES), _LATENT))
+    return by_page, by_row, latent_offset // 2, latent_offset // _ROW_BYTES
+
+
+def _row_index(slots, first, rows, blocks, block_size, page_rows, first_row):
+    """``[rows, 1]`` int32: the row of the row view that each of ``slots[first:first + rows]``
+    names. A slot outside the cache, as the -1 of a padding token, names block 0, row 0."""
+    s = _sb((rows, 1), nl.int32)
+    nisa.dma_copy(dst=s, src=slots.ap(pattern=[[1, rows], [1, 1]], offset=first))
+    high = _sb((rows, 1), nl.uint8)
+    nisa.tensor_scalar(dst=high, data=s, op0=nl.greater_equal, operand0=float(blocks * block_size))
+    outside = _sb((rows, 1), nl.uint8)
+    nisa.scalar_tensor_tensor(dst=outside, data=s, op0=nl.less, operand0=0.0, op1=nl.maximum,
+                              operand1=high)
+    nisa.tensor_copy_predicated(dst=s, src=0, predicate=outside)
+    # Row of slot s: (s // block_size) * page_rows + first_row + s % block_size.
+    skip = _sb((rows, 1), nl.int32)
+    nisa.tensor_scalar(dst=skip, data=s, op0=nl.right_shift, operand0=block_size.bit_length() - 1)
+    nisa.tensor_scalar(dst=skip, data=skip, op0=nl.multiply, operand0=page_rows - block_size,
+                       op1=nl.add, operand1=first_row)
+    idx = _sb((rows, 1), nl.int32)
+    nisa.tensor_tensor(dst=idx, data1=skip, data2=s, op=nl.add)
+    return idx
+
+
+def _write_rows(by_row, idx, lat, rows):
+    """Store the latent rows ``lat[:rows]`` at the rows of ``by_row`` that ``idx`` names."""
+    nisa.dma_copy(dst=by_row.ap(pattern=[[_LATENT, rows], [1, _LATENT]], offset=0,
+                                vector_offset=idx, indirect_dim=0), src=lat[0:rows, :])
 
 
 def _clear_unowned(pages, invalid, first_tile):
@@ -448,7 +500,7 @@ def _transpose_into(o_t, o, rows):
     nisa.tensor_copy(dst=o_t, src=tp)
 
 
-def _check_common(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, cache):
+def _check_common(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, slots):
     heads = w_uk.shape[0]
     kernel_assert(qkv_a.shape[1] == _QKV and qkv_a.dtype == nl.float32, "qkv_a is [T, 2112] fp32")
     kernel_assert(tuple(gate.shape) == (qkv_a.shape[0], heads * _V), "gate is [T, H * 128]")
@@ -460,15 +512,14 @@ def _check_common(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, cache):
     kernel_assert(tuple(w_uv_t.shape) == (heads, _KV_LORA, _V) and w_uv_t.dtype == nl.float32,
                   "W_UV^T is [H, 512, 128] fp32")
     kernel_assert(w_qb_t.dtype == nl.bfloat16 and w_uk.dtype == nl.bfloat16, "bf16 q_b and W_UK")
-    kernel_assert(cache.shape[2] == _LATENT and cache.dtype == nl.bfloat16,
-                  "cache is [blocks, block_size, 576] bf16")
-    kernel_assert(cache.shape[1] % _P == 0, "block_size is a multiple of 128")
+    kernel_assert(tuple(slots.shape) == (qkv_a.shape[0],), "slots is [T]")
     return heads
 
 
-def mla_paged_decode_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, cache,
-                            block_table, context_lens, EPS: float):
-    """One decode step of ``T`` sequences: ``(out [128, T, H, 1] bf16, latent [T, 576] bf16)``.
+def mla_paged_decode_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, pages,
+                            block_table, context_lens, slots, EPS: float, LATENT_OFFSET: int,
+                            BLOCK_SIZE: int):
+    """One decode step of ``T`` sequences: ``(out [128, T, H, 1] bf16, pages)``.
 
     Args:
         qkv_a: ``[T, 2112]`` fp32, each sequence's new token: ``q_a`` then ``kv_a``.
@@ -478,24 +529,31 @@ def mla_paged_decode_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, 
         w_qb_t: ``[1536, H * 192]`` bf16, the rank's ``q_b`` rows transposed.
         w_uk: ``[H, 128, 512]`` bf16, the ``k_nope`` rows of ``kv_b`` by head.
         w_uv_t: ``[H, 512, 128]`` fp32, the value rows of ``kv_b`` by head, transposed.
-        cache: ``[blocks, block_size, 576]`` bf16 latent pages.
+        pages: ``[blocks, page bytes]`` int8 page buffer, each page's latent block
+            ``[BLOCK_SIZE, 576]`` bf16 from byte ``LATENT_OFFSET``; the new rows are written
+            in place.
         block_table: ``[T, pages]`` int32 block ids; entries past a sequence's blocks are
             clamped into the cache and masked.
         context_lens: ``[T]`` int32 cached tokens per sequence; the new token follows them.
+        slots: ``[T]`` int32 slot of each new token, ``block * BLOCK_SIZE + row``; -1 for a
+            padding token, whose row goes to block 0.
         EPS: the norms' epsilon.
+        LATENT_OFFSET: byte offset of the latent block in a page, a multiple of 1152.
+        BLOCK_SIZE: tokens per block, a power of two and a multiple of 128.
 
     Returns:
-        The gated attention output and the new tokens' latent rows.
+        The gated attention output and the page buffer with the new rows.
     """
     tokens = qkv_a.shape[0]
-    heads = _check_common(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, cache)
-    blocks, block_size = cache.shape[0], cache.shape[1]
-    pages = block_table.shape[1]
-    kernel_assert(tuple(block_table.shape) == (tokens, pages)
+    heads = _check_common(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, slots)
+    cache, by_row, first_elem, first_row = _page_views(pages, LATENT_OFFSET, BLOCK_SIZE)
+    blocks, block_size = pages.shape[0], BLOCK_SIZE
+    page_rows = pages.shape[1] // _ROW_BYTES
+    n_pages = block_table.shape[1]
+    kernel_assert(tuple(block_table.shape) == (tokens, n_pages)
                   and tuple(context_lens.shape) == (tokens,),
                   "block_table is [T, pages] and context_lens is [T]")
-    width = heads * _V
-    window = pages * block_size
+    window = n_pages * block_size
     n_tiles = window // _P
     n_blocks = (window + _BLOCK - 1) // _BLOCK
     programs = nl.num_programs(0)
@@ -503,7 +561,6 @@ def mla_paged_decode_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, 
     kernel_assert(programs in (1, 2), "one or two programs")
     scale = float((_NOPE + _ROPE) ** -0.5)
     out = nl.ndarray((_V, tokens, heads, 1), dtype=nl.bfloat16, buffer=nl.shared_hbm)
-    lat_out = nl.ndarray((tokens, _LATENT), dtype=nl.bfloat16, buffer=nl.shared_hbm)
 
     # A lone sequence splits its key blocks; otherwise each program takes whole sequences.
     split = programs > tokens
@@ -523,6 +580,8 @@ def mla_paged_decode_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, 
     nisa.dma_copy(dst=x, src=qkv_a[first:first + count, :])
     lat = _sb((count, _LATENT), nl.bfloat16)
     _latent_rows(lat, x, _gain(kv_norm, count), EPS)
+    if own:
+        idx = _row_index(slots, first, count, blocks, block_size, page_rows, first_row)
     # Query rows 0.. and _DUP.. hold each head's query; the zero rows between weigh nothing.
     rows_q = _DUP + _even(heads)
     ql = [_zeros((_P, count, rows_q), nl.bfloat16) for _ in _C_TILES]
@@ -538,9 +597,9 @@ def mla_paged_decode_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, 
     for s in range(count):
         seq = first + s
         held, bound, invalid = _cache_keys(
-            block_table.ap(pattern=[[pages, 1], [1, pages]], offset=seq * pages),
+            block_table.ap(pattern=[[n_pages, 1], [1, n_pages]], offset=seq * n_pages),
             context_lens.ap(pattern=[[0, _P], [1, 1]], offset=seq),
-            blocks, pages, window, positions)
+            blocks, n_pages, window, positions)
         group = {"rows": rows_q, "split": "rows",
                  "ql": [ql[i][0:w, s, :] for i, (_, w) in enumerate(_C_TILES)],
                  "cache": bound, "own": one, "own_tiles": lambda k: 1,
@@ -550,8 +609,8 @@ def mla_paged_decode_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, 
         first_tile, n_t = b * (_BLOCK // _P), min(_BLOCK, window - b * _BLOCK) // _P
 
         def load():
-            pages = _cache_pages(cache, held, first_tile, n_t)
-            return lambda: _clear_unowned(pages, invalid, first_tile)
+            tiles = _cache_pages(cache, held, first_tile, n_t, block_size, first_elem)
+            return lambda: _clear_unowned(tiles, invalid, first_tile)
         return load
 
     def own_step(s):
@@ -589,7 +648,7 @@ def mla_paged_decode_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, 
                          (b[:, _KV_LORA:_KV_LORA + 1], b[:, _KV_LORA + 1:_KV_LORA + 2],
                           b[:, 0:_KV_LORA]), scale, rows_q)]
     if split and prg != 0:
-        return out, lat_out
+        return out, pages
 
     o_t = _sb((_P, _V_TILES, heads, count), nl.float32)
     for s, (_, l, acc) in enumerate(states):
@@ -602,8 +661,9 @@ def mla_paged_decode_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, 
     _gated_output_t(res, o_t, wuv, _gate_t(gate, first, count, heads), heads)
     nisa.dma_copy(dst=out.ap(pattern=[[tokens * heads, _V], [heads, count], [1, heads]],
                              offset=first * heads), src=res)
-    nisa.dma_copy(dst=lat_out[first:first + count, :], src=lat)
-    return out, lat_out
+    # The new rows sit at or past their sequences' lengths, so every read above masks them.
+    _write_rows(by_row, idx, lat, count)
+    return out, pages
 
 
 def _finite_values(lat):
@@ -622,28 +682,32 @@ def _finite_values(lat):
     return val
 
 
-def mla_paged_prefill_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, cache,
-                             block_table, prefix_len, EPS: float):
-    """One prefill chunk of one sequence: ``(out [T, H * 128] bf16, latent [T, 576] bf16)``.
+def mla_paged_prefill_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, pages,
+                             block_table, prefix_len, slots, EPS: float, LATENT_OFFSET: int,
+                             BLOCK_SIZE: int):
+    """One prefill chunk of one sequence: ``(out [T, H * 128] bf16, pages)``.
 
     Args:
         qkv_a: ``[T, 2112]`` fp32 rows of the chunk's tokens: ``q_a`` then ``kv_a``.
         gate: ``[T, H * 128]`` bf16 output-gate projection, before its sigmoid.
-        q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, cache: as ``mla_paged_decode_kernel``.
+        q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, pages: as ``mla_paged_decode_kernel``.
         block_table: ``[pages]`` int32 block ids of the sequence's cached prefix.
         prefix_len: ``[1]`` int32 cached tokens before the chunk.
-        EPS: the norms' epsilon.
+        slots: ``[T]`` int32 slot of each chunk token; -1 for a padding token.
+        EPS, LATENT_OFFSET, BLOCK_SIZE: as ``mla_paged_decode_kernel``.
 
     Returns:
-        The gated attention output and the chunk's latent rows.
+        The gated attention output and the page buffer with the chunk's rows.
     """
     tokens = qkv_a.shape[0]
-    heads = _check_common(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, cache)
-    blocks, block_size = cache.shape[0], cache.shape[1]
-    pages = block_table.shape[0]
+    heads = _check_common(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, slots)
+    cache, by_row, first_elem, first_row = _page_views(pages, LATENT_OFFSET, BLOCK_SIZE)
+    blocks, block_size = pages.shape[0], BLOCK_SIZE
+    page_rows = pages.shape[1] // _ROW_BYTES
+    n_pages = block_table.shape[0]
     kernel_assert(tuple(prefix_len.shape) == (1,), "prefix_len is [1]")
     width = heads * _V
-    window = pages * block_size
+    window = n_pages * block_size
     n_tiles = window // _P
     n_blocks = (window + _BLOCK - 1) // _BLOCK
     n_q = (tokens + _P - 1) // _P
@@ -652,12 +716,11 @@ def mla_paged_prefill_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t,
     kernel_assert(programs in (1, 2), "one or two programs")
     scale = float((_NOPE + _ROPE) ** -0.5)
     out = nl.ndarray((tokens, width), dtype=nl.bfloat16, buffer=nl.shared_hbm)
-    lat_out = nl.ndarray((tokens, _LATENT), dtype=nl.bfloat16, buffer=nl.shared_hbm)
 
     q_groups = [list(range(g, min(n_q, g + _Q_GROUP))) for g in range(0, n_q, _Q_GROUP)]
     mine = q_groups[prg::programs]
     if not mine:
-        return out, lat_out
+        return out, pages
     my_tiles = [i for grp in mine for i in grp]
 
     wqb, wuk, wuv = _load_weights(w_qb_t, w_uk, w_uv_t, heads)
@@ -673,22 +736,22 @@ def mla_paged_prefill_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t,
         return x
 
     # The chunk's latent rows, the causal keys, up to this program's last query tile.
-    lats = []
+    lats, idx = [], {}
     for i in range(my_tiles[-1] + 1):
         rows = rows_of(i)
         lat = (_zeros if rows % 2 else _sb)((_even(rows), _LATENT), nl.bfloat16)
         _latent_rows(lat, load_rows(i), kv_gain[0:rows, :], EPS)
         if i in my_tiles:
-            nisa.dma_copy(dst=lat_out[i * _P:i * _P + rows, :], src=lat[0:rows, :])
+            idx[i] = _row_index(slots, i * _P, rows, blocks, block_size, page_rows, first_row)
         lats.append(lat)
 
     positions = _sb((_P, n_tiles), nl.float32)
     nisa.iota(dst=positions, pattern=[[_P, n_tiles]], offset=0, channel_multiplier=1)
     zero = _sb((_P, 1), nl.float32)
     nisa.memset(dst=zero, value=0.0)
-    held, bound, invalid = _cache_keys(block_table.ap(pattern=[[pages, 1], [1, pages]], offset=0),
-                                       prefix_len.ap(pattern=[[0, _P], [1, 1]], offset=0),
-                                       blocks, pages, window, positions)
+    held, bound, invalid = _cache_keys(
+        block_table.ap(pattern=[[n_pages, 1], [1, n_pages]], offset=0),
+        prefix_len.ap(pattern=[[0, _P], [1, 1]], offset=0), blocks, n_pages, window, positions)
     tiles_per_block = _BLOCK // _P
 
     for grp in mine:
@@ -709,9 +772,14 @@ def mla_paged_prefill_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t,
                     "m": None, "l": None, "acc": None})
         for b in range(n_blocks):
             n_t = min(_BLOCK, window - b * _BLOCK) // _P
-            tiles = _clear_unowned(_cache_pages(cache, held, b * tiles_per_block, n_t), invalid,
-                                   b * tiles_per_block)
+            tiles = _clear_unowned(_cache_pages(cache, held, b * tiles_per_block, n_t, block_size,
+                                                first_elem), invalid, b * tiles_per_block)
             _attend(groups, "cache", tiles, b * _BLOCK, scale, zero)
+        if grp is mine[-1]:
+            # The chunk's rows sit past the prefix, so the reads mask them; they go out after
+            # the last page reads, under this group's causal steps.
+            for i in my_tiles:
+                _write_rows(by_row, idx[i], lats[i], rows_of(i))
         for c0 in range(0, grp[-1] + 1, tiles_per_block):
             c1 = min(grp[-1] + 1, c0 + tiles_per_block)
             # A query tile masks keys only in its own tile, so only there the sum needs finite rows.
@@ -728,7 +796,7 @@ def mla_paged_prefill_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t,
             res = _sb((rows, width), nl.bfloat16)
             _gated_output(res, o_t, wuv, _gate(gate, i * _P, rows, width), heads)
             nisa.dma_copy(dst=out[i * _P:i * _P + rows, :], src=res)
-    return out, lat_out
+    return out, pages
 
 
 _DECODE = wrap_nki(mla_paged_decode_kernel)
@@ -751,27 +819,37 @@ def prepare_mla_weights(q_b_weight: torch.Tensor, kv_b_weight: torch.Tensor):
             kv[:, _NOPE:].transpose(1, 2).float().contiguous())
 
 
-def _check_inputs(qkv_a, gate, kv_cache, w_uk, w_uv_t):
+def _check_inputs(qkv_a, gate, pages, latent_offset, block_size, slots, w_uk, w_uv_t):
     heads = w_uk.shape[0]
     if qkv_a.dim() != 2 or qkv_a.shape[1] != _QKV or qkv_a.dtype != torch.float32:
         raise ValueError(f"qkv_a must be [T, {_QKV}] fp32, got {tuple(qkv_a.shape)} {qkv_a.dtype}")
     if tuple(gate.shape) != (qkv_a.shape[0], heads * _V) or gate.dtype != torch.bfloat16:
         raise ValueError(f"gate must be [T, {heads * _V}] bf16, "
                          f"got {tuple(gate.shape)} {gate.dtype}")
-    if kv_cache.dim() != 3 or kv_cache.shape[2] != _LATENT or kv_cache.dtype != torch.bfloat16:
-        raise ValueError(f"kv_cache must be [blocks, block_size, {_LATENT}] bf16, got "
-                         f"{tuple(kv_cache.shape)} {kv_cache.dtype}")
-    if kv_cache.shape[1] % _P:
-        raise ValueError(f"block_size {kv_cache.shape[1]} must be a multiple of {_P}")
+    # The dispatch drops strides, so a strided view would reach the kernel as a copy.
+    if pages.dim() != 2 or pages.dtype != torch.int8 or not pages.is_contiguous():
+        raise ValueError(f"pages must be the contiguous int8 [blocks, page bytes] page buffer, "
+                         f"got {tuple(pages.shape)} {pages.dtype} strides {pages.stride()}")
+    if pages.shape[1] % _ROW_BYTES or latent_offset % _ROW_BYTES or latent_offset < 0:
+        raise ValueError(f"page bytes {pages.shape[1]} and latent offset {latent_offset} must be "
+                         f"whole {_ROW_BYTES}-byte rows")
+    if block_size % _P or block_size & (block_size - 1):
+        raise ValueError(f"block_size {block_size} must be a power of two, a multiple of {_P}")
+    if latent_offset + block_size * _ROW_BYTES > pages.shape[1]:
+        raise ValueError(f"a {block_size}-row latent block from byte {latent_offset} does not fit "
+                         f"a {pages.shape[1]}-byte page")
+    if slots.dim() != 1 or slots.shape[0] != qkv_a.shape[0]:
+        raise ValueError(f"slots must be [T], got {tuple(slots.shape)}")
     if w_uv_t.dtype != torch.float32:
         raise ValueError(f"w_uv_t must be fp32, got {w_uv_t.dtype}")
 
 
 def mla_paged_decode(qkv_a: torch.Tensor, gate: torch.Tensor, q_norm_weight: torch.Tensor,
                      kv_norm_weight: torch.Tensor, w_qb_t: torch.Tensor, w_uk: torch.Tensor,
-                     w_uv_t: torch.Tensor, kv_cache: torch.Tensor, block_table: torch.Tensor,
-                     context_lens: torch.Tensor, eps: float):
-    """Paged MLA decode step on the NKI kernel: ``(out [128, T, H, 1] bf16, latent [T, 576] bf16)``.
+                     w_uv_t: torch.Tensor, pages: torch.Tensor, latent_offset: int,
+                     block_size: int, block_table: torch.Tensor, context_lens: torch.Tensor,
+                     slots: torch.Tensor, eps: float):
+    """Paged MLA decode step on the NKI kernel: ``(out [128, T, H, 1] bf16, pages)``.
 
     Args:
         qkv_a: ``[T, 2112]`` fp32 all-reduced ``q_a`` and ``kv_a`` of each sequence's new token.
@@ -779,55 +857,65 @@ def mla_paged_decode(qkv_a: torch.Tensor, gate: torch.Tensor, q_norm_weight: tor
         q_norm_weight: ``[1536]`` ``q_a_layernorm`` gain.
         kv_norm_weight: ``[512]`` ``kv_a_layernorm`` gain.
         w_qb_t, w_uk, w_uv_t: the layouts from :func:`prepare_mla_weights`.
-        kv_cache: ``[blocks, block_size, 576]`` bf16 latent cache, ``block_size`` a multiple
-            of 128.
+        pages: ``[blocks, page bytes]`` contiguous int8 page buffer of the KV caches, updated in
+            place: each page's latent block ``[block_size, 576]`` bf16 starts at
+            ``latent_offset``.
+        latent_offset: byte offset of the latent block in a page, a multiple of 1152.
+        block_size: tokens per block, a power of two and a multiple of 128.
         block_table: ``[T, pages]`` int32 block ids per sequence.
         context_lens: ``[T]`` int32 tokens already cached per sequence.
+        slots: ``[T]`` slot of each new token; -1 for a padding token, which writes block 0.
         eps: the norms' epsilon.
 
     Returns:
-        The output for ``o_proj`` and the latent rows to write at each sequence's position.
+        The output for ``o_proj`` and the page buffer with each new token's latent row.
 
     Raises:
         ValueError: an input outside the kernel's contract.
     """
-    _check_inputs(qkv_a, gate, kv_cache, w_uk, w_uv_t)
+    _check_inputs(qkv_a, gate, pages, latent_offset, block_size, slots, w_uk, w_uv_t)
     if block_table.dim() != 2 or block_table.shape[0] != qkv_a.shape[0]:
         raise ValueError(f"block_table must be [T, pages], got {tuple(block_table.shape)}")
     return _DECODE[get_logical_nc_config()](
         qkv_a=qkv_a.contiguous(), gate=gate.contiguous(), q_norm=q_norm_weight.contiguous(),
         kv_norm=kv_norm_weight.contiguous(), w_qb_t=w_qb_t, w_uk=w_uk, w_uv_t=w_uv_t,
-        cache=kv_cache, block_table=block_table.to(torch.int32).contiguous(),
-        context_lens=context_lens.to(torch.int32).contiguous(), EPS=float(eps))
+        pages=pages, block_table=block_table.to(torch.int32).contiguous(),
+        context_lens=context_lens.to(torch.int32).contiguous(),
+        slots=slots.to(torch.int32).contiguous(), EPS=float(eps),
+        LATENT_OFFSET=int(latent_offset), BLOCK_SIZE=int(block_size))
 
 
 def mla_paged_prefill(qkv_a: torch.Tensor, gate: torch.Tensor, q_norm_weight: torch.Tensor,
                       kv_norm_weight: torch.Tensor, w_qb_t: torch.Tensor, w_uk: torch.Tensor,
-                      w_uv_t: torch.Tensor, kv_cache: torch.Tensor, block_table: torch.Tensor,
-                      prefix_len: torch.Tensor, eps: float):
+                      w_uv_t: torch.Tensor, pages: torch.Tensor, latent_offset: int,
+                      block_size: int, block_table: torch.Tensor, prefix_len: torch.Tensor,
+                      slots: torch.Tensor, eps: float):
     """Paged MLA prefill chunk of one sequence on the NKI kernel, in 128-row query tiles.
 
     Args:
         qkv_a: ``[T, 2112]`` fp32 all-reduced ``q_a`` and ``kv_a`` of the chunk's tokens.
         gate: ``[T, H * 128]`` bf16 output-gate projection, before its sigmoid.
-        q_norm_weight, kv_norm_weight, w_qb_t, w_uk, w_uv_t, kv_cache: as
-            :func:`mla_paged_decode`.
+        q_norm_weight, kv_norm_weight, w_qb_t, w_uk, w_uv_t, pages, latent_offset,
+            block_size: as :func:`mla_paged_decode`.
         block_table: ``[pages]`` int32 block ids of the cached prefix.
         prefix_len: ``[1]`` int32 tokens cached before the chunk.
+        slots: ``[T]`` slot of each chunk token; -1 for a padding token.
         eps: the norms' epsilon.
 
     Returns:
-        ``(out [T, H * 128] bf16, latent [T, 576] bf16)``.
+        ``(out [T, H * 128] bf16, pages)``, the buffer with the chunk's latent rows.
 
     Raises:
         ValueError: an input outside the kernel's contract.
     """
-    _check_inputs(qkv_a, gate, kv_cache, w_uk, w_uv_t)
+    _check_inputs(qkv_a, gate, pages, latent_offset, block_size, slots, w_uk, w_uv_t)
     if block_table.dim() != 1 or prefix_len.numel() != 1:
         raise ValueError(f"block_table must be [pages] and prefix_len [1], got "
                          f"{tuple(block_table.shape)} and {tuple(prefix_len.shape)}")
     return _PREFILL[get_logical_nc_config()](
         qkv_a=qkv_a.contiguous(), gate=gate.contiguous(), q_norm=q_norm_weight.contiguous(),
         kv_norm=kv_norm_weight.contiguous(), w_qb_t=w_qb_t, w_uk=w_uk, w_uv_t=w_uv_t,
-        cache=kv_cache, block_table=block_table.to(torch.int32).contiguous(),
-        prefix_len=prefix_len.to(torch.int32).reshape(1).contiguous(), EPS=float(eps))
+        pages=pages, block_table=block_table.to(torch.int32).contiguous(),
+        prefix_len=prefix_len.to(torch.int32).reshape(1).contiguous(),
+        slots=slots.to(torch.int32).contiguous(), EPS=float(eps),
+        LATENT_OFFSET=int(latent_offset), BLOCK_SIZE=int(block_size))
