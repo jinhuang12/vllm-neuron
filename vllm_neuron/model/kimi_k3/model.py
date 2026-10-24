@@ -34,7 +34,7 @@ from vllm_neuron.functional.embedding import embedding
 from vllm_neuron.functional.kda.fused_decode import kda_fused_decode
 from vllm_neuron.functional.kda.output import kda_output_prefill
 from vllm_neuron.functional.moe.fused_tail import moe_fused_tail
-from vllm_neuron.model.kv_cache import KVSpec, LayerSpec, paged_slot_indices
+from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.model.neuron_config import NeuronConfig
 from vllm_neuron.nn.cpl import ColumnParallelLinear
 from vllm_neuron.nn.sampler import Sampler
@@ -424,7 +424,10 @@ class KimiK3MLA(nn.Module):
 
     @property
     def kv_cache(self) -> torch.Tensor:
-        """Paged latent cache ``[blocks, block_size, kv_lora_rank + rope]`` bf16, a page view."""
+        """Paged latent cache ``[blocks, block_size, kv_lora_rank + rope]`` bf16, a page view.
+
+        The kernels read and write the page buffer itself; this view is for inspection only.
+        """
         return _typed_view(self.pages, self._cache_layout)
 
     def bind_pages(self, pages: torch.Tensor, cache: torch.Tensor) -> None:
@@ -461,9 +464,11 @@ class KimiK3MLA(nn.Module):
 
         A prefill chunk is one sequence's tokens after its cached prefix. A decode step is one
         token per sequence, at its position: the count of tokens its sequence has cached. The
-        kernels raise outside their limits.
+        kernels take the int8 page buffer with the latent cache's byte offset in a page, and
+        write each token's latent row at its slot in place, a padding token's (-1) in the null
+        block, so the returned buffer is not kept. They raise outside their limits.
         """
-        cache = self.kv_cache
+        start, _, (block_size, _) = self._cache_layout
         args = (
             latent.float(),
             gate,
@@ -472,18 +477,18 @@ class KimiK3MLA(nn.Module):
             self.w_qb_t,
             self.w_uk,
             self.w_uv_t,
-            cache,
+            self.pages,
+            start,
+            block_size,
         )
-        table = meta["block_table_tensor"]
+        table, slots = meta["block_table_tensor"], meta["slot_mapping"]
         if meta["max_query_len"] > meta["decode_token_threshold"]:
             if table.shape[0] != 1:
                 raise ValueError(f"Kimi K3 MLA prefill takes one sequence, got {table.shape[0]}")
             prefix = meta["cached_seq_len"].reshape(1)
-            out, rows = mla_paged_prefill(*args, table[0], prefix, MLA_NORM_EPS)
+            out, _ = mla_paged_prefill(*args, table[0], prefix, slots, MLA_NORM_EPS)
         else:
-            out, rows = mla_paged_decode(*args, table, meta["positions"], MLA_NORM_EPS)
-        blocks, offsets = paged_slot_indices(meta["slot_mapping"], cache.shape[1], cache.shape[0])
-        cache.index_put_((blocks, offsets), rows)
+            out, _ = mla_paged_decode(*args, table, meta["positions"], slots, MLA_NORM_EPS)
         return out
 
     def forward_prefill(self, mix, norm_weight, meta) -> torch.Tensor:

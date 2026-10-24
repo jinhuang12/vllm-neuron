@@ -5,14 +5,16 @@ A one-layer MLA model at one rank's widths takes the oracle's norm gains and ``q
 ``kv_b`` slices as checkpoint weights, lays them out at load, and binds a paged cache whose
 null block 0 and unowned rows are NaN. A decode step of two sequences and a padding row,
 and a prefill chunk of one sequence after its cached prefix with padding tokens after it,
-run through the call site on the kernels in the NKI simulator; prefill must take the full
-padded block table. The oracle and its pass rule are the kernel test's. Set
-``KIMI_K3_CHECKPOINT`` to the checkpoint directory (default ``~/models/moonshotai/Kimi-K3``);
-run with ``VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1``.
+run through the call site on the kernels in the NKI simulator, which write the new latent
+rows into the bound page buffer in place; prefill must take the full padded block table.
+The oracle and its pass rule are the kernel test's. Set ``KIMI_K3_CHECKPOINT`` to the
+checkpoint directory (default ``~/models/moonshotai/Kimi-K3``); run with
+``VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1``.
 """
 
 import copy
 import importlib.util
+import inspect
 import os
 from pathlib import Path
 
@@ -93,9 +95,11 @@ def _slot(blocks, position: int) -> int:
 def seen():
     """The block table and prefix length the prefill kernel first receives."""
     args, kernel = [], m.mla_paged_prefill
+    signature = inspect.signature(kernel)
 
     def call(*a):
-        args.append(a[-3:-1])
+        bound = signature.bind(*a).arguments
+        args.append((bound["block_table"], bound["prefix_len"]))
         return kernel(*a)
 
     with pytest.MonkeyPatch.context() as patch:
