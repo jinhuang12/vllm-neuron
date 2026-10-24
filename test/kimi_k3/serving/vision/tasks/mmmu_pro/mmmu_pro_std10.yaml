@@ -1,0 +1,32 @@
+# MMMU-Pro "standard (10 options)", test split, CoT prompt, for lm-eval 0.4.13 over a chat API.
+# Draft for the register step. Both sides use this file and utils.py byte for byte.
+task: mmmu_pro_std10
+dataset_path: MMMU/MMMU_Pro
+dataset_name: "standard (10 options)"
+dataset_kwargs:
+  revision: 0d7426df4ccb3d8704a992fe6850abee7c262127
+test_split: test
+output_type: generate_until
+doc_to_image: !function utils.doc_to_image
+doc_to_text: !function utils.doc_to_text
+doc_to_target: answer
+process_results: !function utils.process_results
+generation_kwargs:
+  until: []
+  max_gen_toks: 2048
+  temperature: 0.0
+  do_sample: false
+num_fewshot: 0
+repeats: 1
+metric_list:
+  - metric: acc
+    aggregation: mean
+    higher_is_better: true
+  - metric: invalid
+    aggregation: mean
+    higher_is_better: false
+  - metric: whole_reply
+    aggregation: mean
+    higher_is_better: false
+metadata:
+  version: 1.0
