@@ -326,14 +326,14 @@ def _accumulate(sc, tiles):
     g["acc"] = acc
 
 
-def _attend(groups, kind, tiles, key0, scale, zero):
-    """One online-softmax step of each query group over the key ``tiles`` ``[rows, 576]``."""
+def _attend(groups, kind, tiles, key0, scale, zero, values=None):
+    """One online-softmax step over the key ``tiles`` ``[rows, 576]``; the sum reads ``values``."""
     rows_k = [t.shape[0] for t in tiles]
     kt = _keys_t(tiles)
     for g in groups:
         sc = _scores(g, kind, kt, rows_k, key0, scale, zero)
         _weights_t(sc)
-        _accumulate(sc, tiles)
+        _accumulate(sc, tiles if values is None else values)
 
 
 def _pipelined(steps, scale, zero, queries):
@@ -606,6 +606,22 @@ def mla_paged_decode_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, 
     return out, lat_out
 
 
+def _finite_values(lat):
+    """The value columns of latent rows ``[rows, 512]``, each non-finite element set to 0.
+
+    A masked key weighs exactly 0 in the weighted sum, but 0 times a NaN value is NaN. The
+    scores still read the rows as they are, so a query that sees a non-finite key turns NaN.
+    """
+    rows = lat.shape[0]
+    bad = _sb((rows, _KV_LORA), nl.uint8)
+    nisa.tensor_scalar(dst=bad, data=lat[:, 0:_KV_LORA], op0=nl.multiply, operand0=0.0,
+                       op1=nl.not_equal, operand1=0.0)
+    val = _sb((rows, _KV_LORA), nl.bfloat16)
+    nisa.tensor_copy(dst=val, src=lat[:, 0:_KV_LORA])
+    nisa.tensor_copy_predicated(dst=val, src=0.0, predicate=bad)
+    return val
+
+
 def mla_paged_prefill_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, cache,
                              block_table, prefix_len, EPS: float):
     """One prefill chunk of one sequence: ``(out [T, H * 128] bf16, latent [T, 576] bf16)``.
@@ -698,8 +714,10 @@ def mla_paged_prefill_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t,
             _attend(groups, "cache", tiles, b * _BLOCK, scale, zero)
         for c0 in range(0, grp[-1] + 1, tiles_per_block):
             c1 = min(grp[-1] + 1, c0 + tiles_per_block)
+            # A query tile masks keys only in its own tile, so only there the sum needs finite rows.
+            values = [_finite_values(lats[j]) if j in grp else lats[j] for j in range(c0, c1)]
             _attend([g for g in groups if g["tile"] >= c0], "own", lats[c0:c1], c0 * _P,
-                    scale, zero)
+                    scale, zero, values)
         for i in grp:
             rows = rows_of(i)
             o_t = _sb((_P, _V_TILES, heads, rows), nl.float32)
