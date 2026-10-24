@@ -3,9 +3,11 @@
 
 Patches enter the tower in 2 x 2 window order, so the patch merger after the
 tower is a view. The RoPE tables follow the same order. A block packs one or
-more images in turn and pads with zero rows up to its bucket. Each worker
-builds its RoPE tables and window-order index from the grids and keeps them
-in a bounded cache of device tensors.
+more images in turn and pads with zero rows up to its bucket. A block can also
+split into equal slices of whole windows, one per encoder group, each padded
+with zero rows to the attention's query tile. Each worker builds its RoPE
+tables and window-order index from the grids and keeps them in a bounded
+cache of device tensors.
 """
 
 from collections import OrderedDict
@@ -22,6 +24,43 @@ POS_EMB_SIDE = 64
 TABLE_CACHE_BYTES = 64_000_000
 
 Grids = tuple[tuple[int, int], ...]
+
+
+class Slice(NamedTuple):
+    """One group's slice of a split block: ``rows`` rows from ``group * rows``, padded to ``padded``."""
+
+    groups: int
+    group: int
+    rows: int
+    padded: int
+
+    @property
+    def start(self) -> int:
+        """The block row where the slice starts."""
+        return self.group * self.rows
+
+
+def block_slice(bucket: int, groups: int, group: int, align: int) -> Slice:
+    """Group ``group``'s slice of a ``bucket``-row block split over ``groups`` groups.
+
+    Each slice holds whole 2 x 2 windows and pads with zero rows to a multiple of ``align``.
+    """
+    rows, rest = divmod(bucket, groups)
+    if rest or rows % (MERGE * MERGE):
+        raise ValueError(
+            f"a {bucket}-row block does not split into {groups} slices of whole windows"
+        )
+    if not 0 <= group < groups:
+        raise ValueError(f"group {group} is not one of {groups}")
+    return Slice(groups, group, rows, -(-rows // align) * align)
+
+
+def cut(tensor: torch.Tensor, part: Slice, dim: int = 0) -> torch.Tensor:
+    """``part``'s rows of a block tensor along ``dim``, zero rows up to the padded slice."""
+    rows = tensor.narrow(dim, part.start, part.rows)
+    shape = list(rows.shape)
+    shape[dim] = part.padded - part.rows
+    return torch.cat([rows, rows.new_zeros(shape)], dim)
 
 
 class GridTables(NamedTuple):
@@ -60,11 +99,15 @@ def _block_index(grids: Grids) -> torch.Tensor:
 
 
 def order_patches(
-    patches: torch.Tensor, grids: Sequence[Sequence[int]], bucket: int
+    patches: torch.Tensor,
+    grids: Sequence[Sequence[int]],
+    bucket: int,
+    part: Slice | None = None,
 ) -> torch.Tensor:
     """The block's patches in window order, images in turn, zero rows up to the bucket.
 
     ``patches`` holds each image's patches in raster order, the images concatenated.
+    With ``part``, only that slice's rows are gathered, zero rows up to its padded size.
     """
     grids = _as_grids(grids, bucket)
     index = _block_index(grids)
@@ -72,7 +115,11 @@ def order_patches(
         raise ValueError(
             f"{patches.shape[0]} patches for grids holding {index.numel()}"
         )
-    out = patches.new_zeros((bucket, *patches.shape[1:]))
+    rows = bucket
+    if part is not None:
+        index = index[part.start : part.start + part.rows]
+        rows = part.padded
+    out = patches.new_zeros((rows, *patches.shape[1:]))
     out[: index.numel()] = patches[index]
     return out
 
@@ -179,11 +226,25 @@ class TableCache:
 
 
 def grid_tables(
-    cache: TableCache, grids: Sequence[Sequence[int]], bucket: int
+    cache: TableCache,
+    grids: Sequence[Sequence[int]],
+    bucket: int,
+    part: Slice | None = None,
 ) -> GridTables:
-    """The block's worker tables from its grids, through the worker's cache."""
+    """The block's worker tables from its grids, through the worker's cache.
+
+    With ``part``, the tables hold that slice's rows and its patches' window-order index.
+    """
     grids = _as_grids(grids, bucket)
     # The form leads the key, so another layout of the same grids keeps its own entry.
-    return cache.get(
-        ("group", grids, bucket), lambda: build_grid_tables(grids, bucket)
-    )
+    if part is None:
+        return cache.get(
+            ("group", grids, bucket), lambda: build_grid_tables(grids, bucket)
+        )
+
+    def build() -> GridTables:
+        cos, sin, index = build_grid_tables(grids, bucket)
+        index = index[part.start : part.start + part.rows]
+        return GridTables(cut(cos, part), cut(sin, part), index)
+
+    return cache.get(("split", grids, bucket, part), build)

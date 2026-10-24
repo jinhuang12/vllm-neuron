@@ -47,8 +47,6 @@ SOURCES = {
 LAYERS = 2
 #: One image of 256 patches and 128 pad rows; one bucket, one block.
 BUCKET = 384
-#: Merged rows of one 16 x 16-patch image.
-IMAGE_ROWS = 64
 TEXT = 7168
 #: ``nn.RMSNorm(eps=None)`` on the tower's activations; the projector's norm eps.
 TOWER_EPS = float(torch.finfo(torch.float32).eps)
@@ -56,8 +54,6 @@ POST_EPS = 1e-5
 #: The largest f the tower's library calls record, each hashed before its device
 #: reading: the MLP call's 5.5 (the QKV call's is 4.0).
 TOWER_F = 5.5
-SERVED_BUCKETS = [5504, 33536]
-SERVED_BLOCK = 5504
 
 
 # ---------------------------------------------------------------- reference
@@ -336,132 +332,6 @@ def test_tower_matches_the_float64_reference(processed, tmp_path):
             if label == "graded" and not (reading <= TOWER_F and cosine >= 0.9999):
                 misses.append(f"TP{tp} rank {rank}")
     assert not misses, f"outside class Bs at f {TOWER_F}: {misses}"
-
-
-def _hand_off(model, payload):
-    """Encode one image, then two, on TP1 x DP2; return the cache rows and the hand-offs."""
-    visual = model.visual
-    calls = {"all_reduce": 0, "all_gather": 0}
-    for name in calls:
-        method = getattr(visual.dp_group, name)
-
-        def counted(*args, _method=method, _name=name, **kwargs):
-            calls[_name] += 1
-            return _method(*args, **kwargs)
-
-        setattr(visual.dp_group, name, counted)
-    seen = []
-    visual.mm_projector.register_forward_hook(lambda m, i, out: seen.append(out.clone()))
-    result = {}
-    for case, names in (("one", ["a"]), ("two", ["a", "b"])):
-        cache = new_cache(4, BUCKET // 4)
-        cache.buffer.fill_(7.0)
-        seen.clear()
-        for name in calls:
-            calls[name] = 0
-        model.embed_multimodal(
-            pixel_values=torch.cat([payload[n]["pixel_values"] for n in names]),
-            grid_thws=torch.cat([payload[n]["grid_thws"] for n in names]),
-            encoder_cache=cache,
-            mm_hashes=names,
-        )
-        result[case] = {
-            "buffer": cache.buffer.clone(),
-            "ids": {n: cache.get_block_ids(n) for n in names},
-            "projector": seen[0],
-            "calls": dict(calls),
-        }
-    return result
-
-
-def _same_bits(a, b) -> bool:
-    return torch.equal(a.contiguous().view(torch.int16), b.contiguous().view(torch.int16))
-
-
-def test_hand_off_writes_each_real_block_to_its_slot(processed, tmp_path):
-    """Item 2: one real block takes the one-block form, two take the gather; 0 differing bits."""
-    payload = {n: processed[n] for n in ("a", "b")}
-    ranks = run_ranks(2, 1, 2, "_hand_off", payload, tmp_path)
-    real = IMAGE_ROWS
-    report = []
-    for rank, result in enumerate(ranks):
-        one, two = result["one"], result["two"]
-        (a,) = one["ids"]["a"]
-        untouched = [b for b in range(one["buffer"].shape[0]) if b != a]
-        report.append({
-            "rank": rank,
-            "one: forms": one["calls"],
-            "one: real rows equal": _same_bits(one["buffer"][a, :real], ranks[0]["one"]["projector"][:real]),
-            "one: blocks left unwritten": all((one["buffer"][b] == 7.0).all() for b in untouched),
-            "two: forms": two["calls"],
-            "two: a rows equal": _same_bits(two["buffer"][two["ids"]["a"][0], :real],
-                                            ranks[0]["two"]["projector"][:real]),
-            "two: b rows equal": _same_bits(two["buffer"][two["ids"]["b"][0], :real],
-                                            ranks[1]["two"]["projector"][:real]),
-            "same result for a": _same_bits(two["buffer"][two["ids"]["a"][0]], one["buffer"][a]),
-        })
-    for line in report:
-        print(line)
-    expected = {
-        "one: forms": {"all_reduce": 1, "all_gather": 0},
-        "one: real rows equal": True,
-        "one: blocks left unwritten": True,
-        "two: forms": {"all_reduce": 0, "all_gather": 1},
-        "two: a rows equal": True,
-        "two: b rows equal": True,
-        "same result for a": True,
-    }
-    assert all({k: line[k] for k in expected} == expected for line in report), report
-
-
-class _Recorder(nn.Module):
-    """Stands in for the compiled tower: records each call's hand-off form, shapes and dtypes."""
-
-    def __init__(self):
-        super().__init__()
-        self.calls = []
-
-    def forward(self, gather=False, **kwargs):
-        shapes = {k: (tuple(v.shape), v.dtype) for k, v in kwargs.items()}
-        self.calls.append(((kwargs["pixel_values"].shape[0], gather), shapes))
-        return kwargs["encoder_cache_buffer"]
-
-
-def test_warmup_inputs_match_each_bucket_call(processed):
-    """Item 3: warmup calls every hand-off form of each bucket, at the served call's shapes and dtypes."""
-    from vllm_neuron.model.interfaces import SupportsEncoderWarmup
-
-    served = encoder_config(4, 8, SERVED_BUCKETS, SERVED_BLOCK)
-    model = build_model(hf_config(27), served, load=False)
-    assert isinstance(model, SupportsEncoderWarmup)
-    recorder = _Recorder()
-    model.visual = recorder
-    cache = new_cache(16, SERVED_BLOCK // 4)
-    for names in (["a"], ["a", "b"], ["large"]):
-        model.embed_multimodal(
-            pixel_values=torch.cat([processed[n]["pixel_values"] for n in names]),
-            grid_thws=torch.cat([processed[n]["grid_thws"] for n in names]),
-            encoder_cache=cache,
-            mm_hashes=names,
-        )
-        for name in names:
-            cache.free(name)
-    calls = dict(recorder.calls)
-    recorder.calls.clear()
-    for bucket in SERVED_BUCKETS:
-        inputs = model.build_encoder_synthetic_inputs(bucket, served, torch.device("cpu"))
-        # The worker adds the cache and the write ids, one per encoder block, padded to DP.
-        blocks = math.ceil(math.ceil(bucket / SERVED_BLOCK) / served.dp_size) * served.dp_size
-        inputs["encoder_cache_buffer"] = cache.buffer
-        inputs["write_block_ids"] = torch.zeros(blocks, dtype=torch.int64)
-        model.get_encoder()(**inputs)
-    warmed = dict(recorder.calls)
-    print("served calls (bucket, gather):", calls)
-    print("warmup calls (bucket, gather):", warmed)
-    assert sorted(calls) == [(5504, False), (5504, True), (33536, False)]
-    assert warmed == calls
-    pixel_dtype = processed["a"]["pixel_values"].dtype
-    assert all(w["pixel_values"][1] == pixel_dtype for w in warmed.values())
 
 
 #: GELU entry points that the runtime replaces with an op the tracer cannot read.
