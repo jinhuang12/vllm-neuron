@@ -318,20 +318,22 @@ def _image_rows(model, payload):
 
 
 def test_tower_matches_the_float64_reference(processed, tmp_path):
-    """Item 1: TP2 inside class Bs at f, row cosine at least 0.9999; TP1 printed beside."""
+    """Item 1: TP4 inside class Bs at f, row cosine at least 0.9999; TP2 and TP1 printed beside."""
     image = processed["a"]
     grid = tuple(image["grid_thws"][0, 1:].tolist())
     ref = reference(image["pixel_values"], grid, reference_weights())
     misses = []
-    # At TP1 the QKV width, 4,608, takes the wrapper's torch branch, so TP1 is not graded.
-    for tp, graded in ((2, True), (1, False)):
+    # TP4 is the served layout. TP2 is a repeat check. At TP1 the QKV width, 4,608,
+    # takes the wrapper's torch branch. Only TP4 is graded.
+    runs = ((4, "graded"), (2, "repeat check, printed"), (1, "QKV torch branch, printed"))
+    for tp, label in runs:
         rows = run_ranks(tp, tp, 1, "_image_rows", image, tmp_path)
         for rank, got in enumerate(rows):
             reading, cosine = bound_reading(got, ref)
-            print(f"TP{tp} rank {rank} ({'graded' if graded else 'QKV torch branch, printed'}): "
+            print(f"TP{tp} rank {rank} ({label}): "
                   f"worst error / class-B bound {reading:.3f}, f {TOWER_F}; "
                   f"lowest row cosine {cosine:.7f}")
-            if graded and not (reading <= TOWER_F and cosine >= 0.9999):
+            if label == "graded" and not (reading <= TOWER_F and cosine >= 0.9999):
                 misses.append(f"TP{tp} rank {rank}")
     assert not misses, f"outside class Bs at f {TOWER_F}: {misses}"
 
