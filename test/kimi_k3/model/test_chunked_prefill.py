@@ -69,9 +69,10 @@ def _first_layer() -> KimiK3ForConditionalGeneration:
         param = nn.Parameter(value.to(p.dtype), requires_grad=False)
         setattr(model.get_submodule(path), leaf, param)
     model.prepare_after_load()
-    kda = model.model.layers[0].self_attn
-    kda.conv_state = torch.zeros(3, 3, HEADS * 384, dtype=torch.bfloat16)
-    kda.recurrent_state = torch.zeros(3, HEADS, 128, 128)
+    pages = torch.zeros(3, 294_912, dtype=torch.int8)  # the runner's page layout, 3 slots
+    conv = pages[:, :6912].view(torch.bfloat16).view(3, 3, HEADS * 384)
+    state = pages[:, 6912:203_520].view(torch.float32).view(3, HEADS, 128, 128)
+    model.bind_kv_cache({"layers.0.self_attn": [conv, state, pages]})
     return model
 
 

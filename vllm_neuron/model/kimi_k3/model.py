@@ -23,13 +23,18 @@ from vllm.distributed.parallel_state import get_tp_group, model_parallel_is_init
 
 from vllm_neuron.functional.attention.attn_res_decode import attn_res_decode, attn_res_score_weight
 from vllm_neuron.functional.attention.attn_res_prefill import attn_res_prefill
+from vllm_neuron.functional.attention.mla_paged import (
+    mla_paged_decode,
+    mla_paged_prefill,
+    prepare_mla_weights,
+)
 from vllm_neuron.functional.attention import o_proj as output_projection
 from vllm_neuron.functional.attention.o_proj import o_proj, o_proj_tkg
 from vllm_neuron.functional.embedding import embedding
 from vllm_neuron.functional.kda.fused_decode import kda_fused_decode
 from vllm_neuron.functional.kda.output import kda_output_prefill
 from vllm_neuron.functional.moe.fused_tail import moe_fused_tail
-from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
+from vllm_neuron.model.kv_cache import KVSpec, LayerSpec, paged_slot_indices
 from vllm_neuron.model.neuron_config import NeuronConfig
 from vllm_neuron.nn.cpl import ColumnParallelLinear
 from vllm_neuron.nn.sampler import Sampler
@@ -58,7 +63,6 @@ def _optional_kernel(module: str, name: str):
 qkv_proj_fp32acc = _optional_kernel("attention.qkv_fp32acc", "qkv_proj_fp32acc")
 kda_prefill = _optional_kernel("kda.prefill", "kda_prefill")
 depthwise_conv1d_silu = _optional_kernel("kda.depthwise_conv1d", "depthwise_conv1d_silu")
-mla_paged_attention = _optional_kernel("attention.mla_paged", "mla_paged_attention")
 routed_experts_mx = _optional_kernel("moe.routed_experts_mx", "routed_experts_mx")
 router_select = _optional_kernel("moe.routed_experts_mx", "router_select")
 
@@ -195,6 +199,51 @@ def _state_slots(meta) -> torch.Tensor:
     return meta["block_table_tensor"][:, 0].long()
 
 
+def _page_layout(view: torch.Tensor, pages: torch.Tensor) -> tuple[int, torch.dtype, tuple]:
+    """Where a typed cache view sits in each page of its int8 ``[blocks, page bytes]`` buffer.
+
+    Returns the view's first byte in a page, its dtype and its shape per page.
+    """
+    start = view.data_ptr() - pages.data_ptr()
+    width = view[0].numel() * view.element_size()
+    if not (
+        view.untyped_storage().data_ptr() == pages.untyped_storage().data_ptr()
+        and view.shape[0] == pages.shape[0]
+        and view[0].is_contiguous()
+        and view.stride(0) * view.element_size() == pages.stride(0)
+        and 0 <= start <= pages.shape[1] - width
+    ):
+        raise ValueError("a cache view must lie inside each page of its page buffer")
+    return start, view.dtype, tuple(view.shape[1:])
+
+
+def _typed_view(pages: torch.Tensor, layout: tuple[int, torch.dtype, tuple]) -> torch.Tensor:
+    """The typed ``[blocks, ...]`` view of the page buffer that ``layout`` names."""
+    start, dtype, shape = layout
+    width = math.prod(shape) * dtype.itemsize
+    return pages[:, start : start + width].view(dtype).view(-1, *shape)
+
+
+def _with_parts(rows: torch.Tensor, parts) -> torch.Tensor:
+    """Page rows ``[n, page bytes]`` with each ``(layout, values)`` part's bytes in its place."""
+    for (start, dtype, shape), values in parts:
+        width = math.prod(shape) * dtype.itemsize
+        data = values.to(dtype).contiguous().view(torch.int8).reshape(rows.shape[0], width)
+        rows = torch.cat([rows[:, :start], data, rows[:, start + width :]], dim=1)
+    return rows
+
+
+def _int8_pages(cache: torch.Tensor) -> torch.Tensor:
+    """The int8 ``[blocks, page bytes]`` view of a cache tensor's buffer, one page per block."""
+    page = cache.stride(0) * cache.element_size()
+    return cache.view(torch.int8).as_strided((cache.shape[0], page), (page, 1))
+
+
+def _with_positions(meta: dict | None, positions: torch.Tensor | None) -> dict | None:
+    """A layer's metadata with the step's token positions added."""
+    return None if meta is None else {**meta, "positions": positions}
+
+
 class KimiK3KDA(nn.Module):
     """Kimi Delta Attention: projections, short conv, gated delta rule, gated output."""
 
@@ -224,12 +273,27 @@ class KimiK3KDA(nn.Module):
         self.register_buffer("conv_weight", None, persistent=False)
         self.register_buffer("forget_weight", None, persistent=False)
         self.register_buffer("output_weight", None, persistent=False)
-        # Per-sequence conv [slots, taps - 1, 3W] and recurrent [slots, heads, D, D]
-        # state banks, and the int8 [slots, page bytes] page buffer they are views of,
-        # bound with the KV caches.
-        self.conv_state = None
-        self.recurrent_state = None
+        # The int8 [slots, page bytes] page buffer of the KV caches, shared by the layers on
+        # it, and where the conv and state views sit in a page; bound with the KV caches.
         self.pages = None
+        self._conv_layout = None
+        self._state_layout = None
+
+    @property
+    def conv_state(self) -> torch.Tensor:
+        """Per-sequence conv rows ``[slots, taps - 1, 3W]`` bf16, a page buffer view."""
+        return _typed_view(self.pages, self._conv_layout)
+
+    @property
+    def recurrent_state(self) -> torch.Tensor:
+        """Per-sequence recurrent state ``[slots, heads, D, D]`` fp32, a page buffer view."""
+        return _typed_view(self.pages, self._state_layout)
+
+    def bind_pages(self, pages: torch.Tensor, conv: torch.Tensor, state: torch.Tensor) -> None:
+        """Bind the page buffer and keep where the conv and state views sit in a page."""
+        self.pages = pages
+        self._conv_layout = _page_layout(conv, pages)
+        self._state_layout = _page_layout(state, pages)
 
     def prepare_after_load(self) -> None:
         """Lay out the weights the kernels read, once.
@@ -288,9 +352,17 @@ class KimiK3KDA(nn.Module):
         # The next chunk's conv rows: the last taps - 1 rows up to the last real token.
         rows = torch.cat([history, torch.cat([q, k, v], dim=-1)])
         last = valid.sum() + torch.arange(history.shape[0], device=rows.device)
-        self.conv_state.index_copy_(0, slot, rows.index_select(0, last).unsqueeze(0))
-        self.recurrent_state.index_copy_(0, slot, state.unsqueeze(0))
+        self._store(slot, rows.index_select(0, last).unsqueeze(0), state.unsqueeze(0))
         return self.output_prefill(core, gate.float())
+
+    def _store(self, slot: torch.Tensor, conv: torch.Tensor, state: torch.Tensor) -> None:
+        """Write a slot's conv rows and state back as its whole page row of the buffer.
+
+        A compiled step then writes the page buffer itself. A write through the conv or
+        state view, a slice of every page, would rebuild the whole buffer.
+        """
+        parts = ((self._conv_layout, conv), (self._state_layout, state))
+        self.pages.index_copy_(0, slot, _with_parts(self.pages.index_select(0, slot), parts))
 
     def output_prefill(self, core: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         """Gated output norm and ``o_proj`` of fp32 ``[T, W]`` core and gate: ``[T, H]`` fp32."""
@@ -342,39 +414,77 @@ class KimiK3MLA(nn.Module):
         self.register_parameter("gate_weight", None)
         self.register_buffer("latent_weight", None, persistent=False)
         self.register_buffer("output_weight", None, persistent=False)
-        # Paged latent cache [blocks, block_size, kv_lora_rank + rope], bound with the KV caches.
-        self.kv_cache = None
+        self.register_parameter("w_qb_t", None)
+        self.register_parameter("w_uk", None)
+        self.register_buffer("w_uv_t", None, persistent=False)
+        # The int8 [blocks, page bytes] page buffer of the KV caches, shared by the layers on
+        # it, and where the latent cache view sits in a page; bound with the KV caches.
+        self.pages = None
+        self._cache_layout = None
+
+    @property
+    def kv_cache(self) -> torch.Tensor:
+        """Paged latent cache ``[blocks, block_size, kv_lora_rank + rope]`` bf16, a page view."""
+        return _typed_view(self.pages, self._cache_layout)
+
+    def bind_pages(self, pages: torch.Tensor, cache: torch.Tensor) -> None:
+        """Bind the page buffer and keep where the latent cache view sits in a page."""
+        self.pages = pages
+        self._cache_layout = _page_layout(cache, pages)
 
     def prepare_after_load(self) -> None:
         """Lay out the weights the kernels read, once.
 
         q_a and kv_a go to fp32 ``[H, Q + L]`` for decode, then stack as bf16 ``[H, Q + L]``;
         g stacks as ``[H, HV]``; ``o_proj`` as ``[HV, H]``. g is projected alone at decode,
-        so it is its own stack rather than a slice of q_a's.
+        so it is its own stack rather than a slice of q_a's. ``q_b`` and ``kv_b`` take the
+        attention kernels' layouts, which replace them: ``q_b`` transposed, the ``k_nope``
+        rows of ``kv_b`` by head, and its value rows by head, transposed, in fp32.
         """
         if self.input_weight is None:
             latent = torch.cat([self.q_a_proj.weight, self.kv_a_proj_with_mqa.weight])
             self.latent_weight = latent.float().t().contiguous()
             self.input_weight = _stack(self.q_a_proj, self.kv_a_proj_with_mqa)
             self.gate_weight = _stack(self.g_proj)
+        if self.w_uk is None:
+            w_qb_t, w_uk, self.w_uv_t = prepare_mla_weights(
+                self.q_b_proj.weight, self.kv_b_proj.weight
+            )
+            self.w_qb_t = nn.Parameter(w_qb_t, requires_grad=False)
+            self.w_uk = nn.Parameter(w_uk, requires_grad=False)
+            self.q_b_proj.weight = None
+            self.kv_b_proj.weight = None
         self.output_weight = self.o_proj.weight.t().contiguous()
 
     def _attend(self, latent, gate, meta):
-        """Latent norms, q_b, absorb, paged attention and gate; stores the new latent rows."""
-        attn, rows = _require(mla_paged_attention, "MLA attention")(
-            latent,
+        """Paged attention of the new tokens' ``q_a`` and ``kv_a`` rows; stores their latent rows.
+
+        A prefill chunk is one sequence's tokens after its cached prefix. A decode step is one
+        token per sequence, at its position: the count of tokens its sequence has cached. The
+        kernels raise outside their limits.
+        """
+        cache = self.kv_cache
+        args = (
+            latent.float(),
             gate,
             self.q_a_layernorm.weight,
             self.kv_a_layernorm.weight,
-            self.q_b_proj.weight,
-            self.kv_b_proj.weight,
-            cache=self.kv_cache,
-            meta=meta,
-            eps=MLA_NORM_EPS,
+            self.w_qb_t,
+            self.w_uk,
+            self.w_uv_t,
+            cache,
         )
-        cache = self.kv_cache.view(-1, rows.shape[-1])
-        cache.index_copy_(0, meta["slot_mapping"], rows.to(cache.dtype))
-        return attn
+        table = meta["block_table_tensor"]
+        if meta["max_query_len"] > meta["decode_token_threshold"]:
+            if table.shape[0] != 1:
+                raise ValueError(f"Kimi K3 MLA prefill takes one sequence, got {table.shape[0]}")
+            prefix = meta["cached_seq_len"].reshape(1)
+            out, rows = mla_paged_prefill(*args, table[0], prefix, MLA_NORM_EPS)
+        else:
+            out, rows = mla_paged_decode(*args, table, meta["positions"], MLA_NORM_EPS)
+        blocks, offsets = paged_slot_indices(meta["slot_mapping"], cache.shape[1], cache.shape[0])
+        cache.index_put_((blocks, offsets), rows)
+        return out
 
     def forward_prefill(self, mix, norm_weight, meta) -> torch.Tensor:
         """MLA over a prefill chunk; returns this rank's ``[T, H]`` partial."""
@@ -720,10 +830,16 @@ class KimiK3Model(nn.Module):
         """AttnRes mix of the last stream with every bank row, prefill form."""
         return attn_res_prefill(bank, stream, self.output_score_w, self.eps)
 
-    def forward(self, input_ids, attn_metadata, is_prefill: bool) -> torch.Tensor:
-        """Run every layer; returns the output mix ``[T, H]``, before the final norm."""
+    def forward(self, input_ids, attn_metadata, is_prefill: bool, positions=None) -> torch.Tensor:
+        """Run every layer; returns the output mix ``[T, H]``, before the final norm.
+
+        Each layer reads its cache group's metadata with the tokens' ``positions`` added.
+        """
         stream, bank = self.embed(input_ids)
-        metas = [attn_metadata.get(f"layers.{i}.self_attn") for i in range(len(self.layers))]
+        metas = [
+            _with_positions(attn_metadata.get(f"layers.{i}.self_attn"), positions)
+            for i in range(len(self.layers))
+        ]
         if is_prefill:
             for layer, meta in zip(self.layers, metas):
                 stream = layer.forward_prefill(stream, bank, meta)
@@ -837,17 +953,30 @@ class KimiK3ForConditionalGeneration(nn.Module):
         return KVSpec(layers=layers)
 
     def bind_kv_cache(self, kv_caches: dict[str, list[torch.Tensor]]) -> None:
-        """Bind each MLA layer's latent cache, and each KDA layer's state views and page buffer."""
-        for i, layer in enumerate(self.model.layers):
-            name = f"layers.{i}.self_attn"
+        """Bind every layer to the one int8 page view of its cache buffer.
+
+        A KDA layer gets its state views and their page buffer; an MLA layer gets its latent
+        cache. The layers on one buffer share one page view and make their typed views of it
+        in the graph, so a compiled step takes each buffer as one input.
+        """
+        names = [f"layers.{i}.self_attn" for i in range(len(self.model.layers))]
+        for name in names:
             if name not in kv_caches:
                 raise KeyError(f"KV cache for layer {name} not initialized")
-            attn = layer.self_attn
+        shared: dict[int, torch.Tensor] = {}
+        layers = list(zip(names, self.model.layers))
+        for name, layer in layers:
             if layer.is_kda:
-                attn.conv_state, attn.recurrent_state, attn.pages = kv_caches[name]
-            else:
+                conv, state, pages = kv_caches[name]
+                pages = shared.setdefault(pages.untyped_storage().data_ptr(), pages)
+                layer.self_attn.bind_pages(pages, conv, state)
+        for name, layer in layers:
+            if not layer.is_kda:
                 # [blocks, 1, block_size, D]: one latent head.
-                attn.kv_cache = kv_caches[name][0].squeeze(1)
+                cache = kv_caches[name][0].squeeze(1)
+                key = cache.untyped_storage().data_ptr()
+                pages = shared.setdefault(key, _int8_pages(cache))
+                layer.self_attn.bind_pages(pages, cache)
 
     @torch.no_grad()
     def forward(
@@ -867,7 +996,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
             raise NotImplementedError("Kimi K3 serves text prompts only")
         meta = next(iter(attn_metadata.values()))
         is_prefill = meta["max_query_len"] > meta["decode_token_threshold"]
-        hidden = self.model(input_ids, attn_metadata, is_prefill)
+        hidden = self.model(input_ids, attn_metadata, is_prefill, positions)
         if sampling_positions is not None and (
             is_prefill or hidden.shape[0] != sampling_positions.shape[0]
         ):

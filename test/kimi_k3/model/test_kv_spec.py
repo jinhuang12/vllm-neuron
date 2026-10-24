@@ -9,6 +9,7 @@ The config is the served one: TP 32 by DP 2, 128K context, prefix caching off. S
 import dataclasses
 import os
 import types
+from collections import Counter
 from math import prod
 from pathlib import Path
 
@@ -231,13 +232,13 @@ def test_cache_setup_binds_69_state_banks_and_24_latent_caches(vllm_config, mode
     config = get_kv_cache_config_from_groups(vllm_config, groups, blocks * slots * page)
     assert config.num_blocks == blocks
     caches = _runner(vllm_config, model).initialize_kv_cache(config)
+    assert Counter(len(v) for v in caches.values()) == {3: 69, 1: 24}
 
     storages = set()
     for i, layer in enumerate(model.model.layers):
         attn, bound = layer.self_attn, caches[f"layers.{i}.self_attn"]
         if layer.is_kda:
             conv, state = attn.conv_state, attn.recurrent_state
-            assert conv is bound[0] and state is bound[1]
             assert (conv.shape, conv.dtype) == ((blocks, 3, 1152), torch.bfloat16)
             assert (state.shape, state.dtype) == ((blocks, 3, 128, 128), torch.float32)
             assert (conv.stride(0) * 2, state.stride(0) * 4) == (page, page)

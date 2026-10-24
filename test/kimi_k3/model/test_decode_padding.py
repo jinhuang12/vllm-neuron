@@ -4,7 +4,7 @@
 The runner allocates and binds the cache, and its block table comes from vLLM's input
 batch after a request leaves. The decode step runs the landed kernels in the simulator on
 that table, padded from 2 requests to 4 rows, and again with the padding rows on free blocks
-of their own, the kernel's contract. Set ``KIMI_K3_CHECKPOINT`` to the checkpoint directory
+of their own. Set ``KIMI_K3_CHECKPOINT`` to the checkpoint directory
 (default ``~/models/moonshotai/Kimi-K3``); run with ``VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1``.
 """
 

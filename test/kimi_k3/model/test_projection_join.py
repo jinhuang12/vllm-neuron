@@ -5,7 +5,7 @@ The normed sites run the fused norm-and-projection kernel on weights stacked at 
 and the unnormed prefill sites run the library's prefill output projection. Two
 one-layer models run prefill to the logits: KDA with the dense MLP, and MLA with the
 MoE block, whose attention and routed experts are fixed rows here. The decode sites run
-on the same layers; the KDA decode step stops after its input projection. Set
+on the same layers; the KDA decode step runs the decode kernel on a bound page buffer. Set
 ``KIMI_K3_CHECKPOINT`` to the checkpoint directory (default ``~/models/moonshotai/Kimi-K3``);
 run with ``VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1``.
 """
@@ -32,6 +32,8 @@ pytestmark = pytest.mark.skipif(
 )
 
 TOKENS = 256
+# One state slot's page as the runner lays it: conv rows, then the recurrent state.
+PAGE, CONV_BYTES, STATE_END = 294_912, 6912, 203_520
 EPS = 1e-5  # the checkpoint's rms_norm_eps
 KDA_INPUTS = ("q_proj", "k_proj", "v_proj", "g_proj", "f_a_proj", "b_proj")
 ATTN, MLP, MOE = "input_layernorm", "post_attention_layernorm", "block_sparse_moe."
@@ -103,12 +105,12 @@ def _no_fallback(*args, **kwargs):
     raise AssertionError("the prefill output projection computed in torch")
 
 
-class _Stop(Exception):
-    """Ends a decode call at the kernel after its input projection."""
-
-
-def _stop(*args, **kwargs):
-    raise _Stop
+def _page_buffer(slots: int) -> list[torch.Tensor]:
+    """A zeroed state page buffer and its conv and state views, as the runner binds them."""
+    pages = torch.zeros(slots, PAGE, dtype=torch.int8)
+    conv = pages[:, :CONV_BYTES].view(torch.bfloat16).view(slots, 3, 1152)
+    state = pages[:, CONV_BYTES:STATE_END].view(torch.float32).view(slots, 3, 128, 128)
+    return [conv, state, pages]
 
 
 @pytest.fixture(scope="module")
@@ -131,7 +133,6 @@ def sites() -> dict:
         mp.setattr(m, "_project", record(m._project))
         mp.setattr(m, "_prefill_projection", record(m._prefill_projection))
         mp.setattr(m, "router_select", lambda logits, bias, **kwargs: (None, None))
-        mp.setattr(m, "kda_fused_decode", _stop)
         x = (0.5 * torch.randn(4, 7168, generator=gen)).bfloat16()
         gain = (1 + 0.1 * torch.randn(7168, generator=gen)).bfloat16()
         k_slice = torch.randn(128, 4, 56, 1, generator=gen)
@@ -140,13 +141,11 @@ def sites() -> dict:
         weights = {"kda": _fill(a, gen)}
         a.prepare_after_load()
         kda = a.model.layers[0].self_attn
-        kda.conv_state = torch.zeros(2, 3, 1152, dtype=torch.bfloat16)
-        kda.recurrent_state = torch.zeros(2, 3, 128, 128)
+        a.bind_kv_cache({"layers.0.self_attn": _page_buffer(2)})
         ids = torch.randint(0, 5120, (TOKENS,), generator=gen)
         logits = a(ids, None, {"layers.0.self_attn": _prefill_meta()})
         meta = {"block_table_tensor": torch.tensor([[1], [0], [0], [0]], dtype=torch.int32)}
-        with pytest.raises(_Stop):
-            kda.forward_decode(x, None, gain, meta)
+        kda.forward_decode(x, None, gain, meta)
         kda_calls = calls[:]
 
         calls.clear()
