@@ -19,6 +19,8 @@ from torch import nn
 from torch.distributed._functional_collectives import all_reduce
 from transformers import PretrainedConfig
 
+from vllm_neuron.functional.argmax import argmax as distributed_argmax
+from vllm_neuron.functional.embedding import embedding
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.model.neuron_config import NeuronConfig
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
@@ -30,6 +32,7 @@ from .model import (
     _optional_kernel,
     _output_projection,
     _require,
+    qkv_proj_fp32acc,
     _tp_group,
     _Weight,
 )
@@ -43,6 +46,9 @@ SKIPPED_PREFIXES = ("confidence_head.", "embed_tokens.", "lm_head.")
 # The output-projection kernels' partition count: the TKG kernel's row limit per
 # call, and the widest K block of its input layout.
 _PARTITIONS = 128
+# LM-head columns per fused norm-projection call: half of a rank's 5,120 at TP 32,
+# under the kernel's 3,072-column limit.
+_LOGIT_COLUMNS = 2560
 
 
 @dataclass
@@ -136,7 +142,7 @@ def _rotate_interleaved(x: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
 
 
 def _k_shard_matmul(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """``x @ weight`` for this rank's K slice ``x`` ``[T, K]`` and ``weight`` ``[K, N]``."""
+    """``x`` ``[T, K]`` times ``weight`` ``[K, N]`` through the output-projection kernels."""
     rows, width = x.shape
     if rows > _PARTITIONS:
         return _require(o_proj, "output projection")(x[None], weight)[0]
@@ -331,6 +337,40 @@ class K3DSparkForCausalLM(nn.Module):
             rows = torch.cat([attn.kv_a_layernorm(latent[:, i]), rope[:, i]], -1)
             cache = attn.kv_cache.view(-1, rows.shape[-1])
             cache.index_copy_(0, context_slot_mapping, rows.to(cache.dtype))
+
+    def compute_logits(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Final norm and the target's LM head on ``[B, S, H]`` rows: ``[B, S, V / TP]`` bf16."""
+        norm = self.final_norm
+        parts = self.lm_head.weight.split(_LOGIT_COLUMNS, dim=0)
+        project = _require(qkv_proj_fp32acc, "fused norm and projection")
+        return torch.cat([project(hidden, w.t(), norm.weight, norm.eps) for w in parts], -1)
+
+    def _pick(self, logits: torch.Tensor) -> torch.Tensor:
+        """The argmax over the whole vocabulary of this rank's ``[B, V / TP]`` logits."""
+        if self.tp_size == 1:
+            return torch.argmax(logits, dim=-1)
+        return distributed_argmax(logits, dim=-1, gather_dim=-1, process_group=self.tp_device_group)
+
+    def sample_drafts(self, hidden: torch.Tensor, anchors: torch.Tensor) -> torch.Tensor:
+        """Pick each sequence's drafts in order, every pick biased by the one before it.
+
+        Args:
+            hidden: The block's output rows ``[B, k, H]``, before the final norm.
+            anchors: Each sequence's anchor token ``[B]``, the pick before the first.
+
+        Returns:
+            The drafts ``[B, k]`` int32, the same on every rank. A tie goes to the
+            lowest token id.
+        """
+        base = self.compute_logits(hidden)
+        head = self.markov_head
+        prev, picks = anchors, []
+        for i in range(base.shape[1]):
+            embed = embedding(prev, head.markov_w1.weight)
+            bias = _k_shard_matmul(embed, head.markov_w2.weight.t())
+            prev = self._pick(base[:, i].float() + bias.float()).to(torch.int32)
+            picks.append(prev)
+        return torch.stack(picks, dim=1)
 
     def alias_target_head(self, target_model: nn.Module) -> None:
         """Use the target's embedding and LM head modules; no weight is copied."""
