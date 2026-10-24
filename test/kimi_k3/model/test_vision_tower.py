@@ -53,9 +53,9 @@ TEXT = 7168
 #: ``nn.RMSNorm(eps=None)`` on the tower's activations; the projector's norm eps.
 TOWER_EPS = float(torch.finfo(torch.float32).eps)
 POST_EPS = 1e-5
-#: Worst reading of the reference's declared bf16 stages alone over TP1 and TP2,
-#: rounded up to the next 0.5, recorded before the tower's reading.
-TOWER_F = 4.0
+#: The largest f the tower's library calls record, each hashed before its device
+#: reading: the MLP call's 5.5 (the QKV call's is 4.0).
+TOWER_F = 5.5
 SERVED_BUCKETS = [5504, 33536]
 SERVED_BLOCK = 5504
 
@@ -318,18 +318,20 @@ def _image_rows(model, payload):
 
 
 def test_tower_matches_the_float64_reference(processed, tmp_path):
-    """Item 1: TP1 and TP2 inside class Bs at f, row cosine at least 0.9999."""
+    """Item 1: TP2 inside class Bs at f, row cosine at least 0.9999; TP1 printed beside."""
     image = processed["a"]
     grid = tuple(image["grid_thws"][0, 1:].tolist())
     ref = reference(image["pixel_values"], grid, reference_weights())
     misses = []
-    for tp in (1, 2):
+    # At TP1 the QKV width, 4,608, takes the wrapper's torch branch, so TP1 is not graded.
+    for tp, graded in ((2, True), (1, False)):
         rows = run_ranks(tp, tp, 1, "_image_rows", image, tmp_path)
         for rank, got in enumerate(rows):
             reading, cosine = bound_reading(got, ref)
-            print(f"TP{tp} rank {rank}: worst error / class-B bound {reading:.3f}, "
-                  f"f {TOWER_F}; lowest row cosine {cosine:.7f}")
-            if not (reading <= TOWER_F and cosine >= 0.9999):
+            print(f"TP{tp} rank {rank} ({'graded' if graded else 'QKV torch branch, printed'}): "
+                  f"worst error / class-B bound {reading:.3f}, f {TOWER_F}; "
+                  f"lowest row cosine {cosine:.7f}")
+            if graded and not (reading <= TOWER_F and cosine >= 0.9999):
                 misses.append(f"TP{tp} rank {rank}")
     assert not misses, f"outside class Bs at f {TOWER_F}: {misses}"
 
@@ -499,3 +501,45 @@ def test_vision_tensors_are_finite():
     planted.view(-1)[0] = float("nan")
     print(f"{len(counts)} tensors, {sum(counts.values())} non-finite; planted copy reads {nonfinite(planted)}")
     assert (len(counts), sum(counts.values()), nonfinite(planted)) == (168, 0, 1)
+
+
+def _refusal(build) -> str | None:
+    """The message of the ValueError ``build()`` raises, or None when it builds."""
+    try:
+        build()
+    except ValueError as e:
+        return str(e)
+    return None
+
+
+def test_qkv_width_check_outside_cpu_mode(monkeypatch):
+    """Item 6: with CPU mode off the build raises at QKV width 4,608 and passes at 2,304 and 1,152."""
+    from vllm_neuron.model.kimi_k3.config import KimiK3VisionConfig
+    from vllm_neuron.model.kimi_k3.vision_encoder import KimiK3VisionBlock
+
+    vision = KimiK3VisionConfig()
+
+    def block(tp):
+        with torch.device("meta"):
+            KimiK3VisionBlock(vision, tp, torch.bfloat16)
+
+    result = {}
+    for mode in ("0", "1"):
+        monkeypatch.setenv("VLLM_NEURON_CPU_MODE", mode)
+        result[mode] = {3 * 1536 // tp: _refusal(lambda: block(tp)) is None for tp in (1, 2, 4)}
+    print("builds by QKV width, CPU mode off and on:", result)
+    assert result == {"0": {4608: False, 2304: True, 1152: True},
+                      "1": {4608: True, 2304: True, 1152: True}}
+
+
+def test_layer_count_names_must_agree():
+    """Item 7: the build raises at 27 and 2 layers under the two names; 27 and 27 builds 27."""
+    config = hf_config(27)
+    split = copy.deepcopy(config)
+    split["vision_config"]["num_hidden_layers"] = 2
+    refused = _refusal(lambda: build_model(split, encoder_config(1, 1), load=False))
+    model = build_model(config, encoder_config(1, 1), load=False)
+    layers = len(model.visual.vision_tower.encoder.blocks)
+    print(f"27 and 2: {refused}; 27 and 27: {layers} layers")
+    assert refused is not None and "layer counts differ" in refused
+    assert layers == 27

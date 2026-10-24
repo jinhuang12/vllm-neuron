@@ -14,7 +14,8 @@ the DP all-gather and one index write.
 Each rank cuts its own group block on the host, so the tower takes one block's
 rows and no device select. The RoPE tables come from the worker's table cache;
 the tower scales them by the square root of the attention scale, so the
-attention runs at scale 1.0.
+attention runs at scale 1.0. Outside CPU mode the build refuses a QKV width the
+QKV kernel cannot run, and it refuses a vision config whose two layer counts differ.
 """
 
 import functools
@@ -33,8 +34,10 @@ from nkilib.core.utils.common_types import (
 from transformers import PretrainedConfig
 from vllm.distributed.parallel_state import model_parallel_is_initialized
 
+from vllm_neuron import envs
 from vllm_neuron.functional import flash_attention, mlp, o_proj, qkv_proj
 from vllm_neuron.functional import rmsnorm_residual_prefill
+from vllm_neuron.functional.attention.qkv import _can_use_qkv_kernel
 from vllm_neuron.model.neuron_config import EncoderNeuronConfig, NeuronConfig
 from vllm_neuron.parallel.neuron_parallel_state import (
     get_neuron_encoder_dp_group,
@@ -43,7 +46,7 @@ from vllm_neuron.parallel.neuron_parallel_state import (
 )
 from vllm_neuron.utils.dynamo_graph import allow_in_graph_cacheable
 
-from .config import KimiK3Config, KimiK3VisionConfig
+from .config import KimiK3Config, KimiK3VisionConfig, _as_dict
 from .model import KimiK3ForConditionalGeneration
 from .vision_inputs import (
     HEAD_DIM,
@@ -67,6 +70,8 @@ CORNERS = 4
 #: Grids whose corner and bound inputs a worker keeps on its device: 43 MB at most at the
 #: 33,536-row bucket.
 GRID_INPUTS_CACHED = 32
+#: The vision config names the tower depth twice.
+LAYER_COUNT_NAMES = ("vt_num_hidden_layers", "num_hidden_layers")
 
 
 @allow_in_graph_cacheable
@@ -109,6 +114,40 @@ def _dp_position() -> tuple[int, int]:
 def _all_reduce(x: torch.Tensor, group) -> torch.Tensor:
     """Sum ``x`` over ``group``; no group means one rank."""
     return x if group is None else group.all_reduce(x)
+
+
+def _check_qkv_width(hidden: int, width: int) -> None:
+    """Raise outside CPU mode when the QKV wrapper would take its torch branch at ``width``."""
+    if envs.VLLM_NEURON_CPU_MODE:
+        return
+    # Meta tensors stand in for the device's: the check reads shapes and the device type.
+    ok = _can_use_qkv_kernel(
+        hidden=torch.empty((1, 1, hidden), dtype=torch.bfloat16, device="meta"),
+        qkv_weights=torch.empty((hidden, width), dtype=torch.bfloat16, device="meta"),
+        mlp_prev=None,
+        attn_prev=None,
+        d_head=HEAD_DIM,
+        output_layout=QKVOutputLayout.BSD,
+        norm_type=NormType.RMS_NORM,
+        norm_b=None,
+        fused_rope=True,
+    )
+    if not ok:
+        raise ValueError(
+            f"the tower's QKV width {width} takes the wrapper's torch branch; "
+            "pick an encoder TP size whose width the QKV kernel runs"
+        )
+
+
+def _check_layer_counts(hf_config) -> None:
+    """Raise when the vision config's two layer-count names differ."""
+    vision = _as_dict(hf_config).get("vision_config")
+    if vision is None:
+        return
+    vision = _as_dict(vision)
+    counts = {name: vision[name] for name in LAYER_COUNT_NAMES if name in vision}
+    if len(set(counts.values())) > 1:
+        raise ValueError(f"the vision config's layer counts differ: {counts}")
 
 
 def corner_weights(grids, bucket: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -174,6 +213,7 @@ class KimiK3VisionBlock(nn.Module):
         width = self.heads * config.head_dim
         hidden = config.hidden_size
         inter = config.intermediate_size // tp_size
+        _check_qkv_width(hidden, 3 * width)
         self.wqkv = _Weight((hidden, 3 * width), dtype)
         self.wo = _Weight((width, hidden), dtype)
         self.mlp = nn.Module()
@@ -393,6 +433,7 @@ class KimiK3VisionForConditionalGeneration(KimiK3ForConditionalGeneration):
         encoder_neuron_config: EncoderNeuronConfig | None = None,
     ) -> "KimiK3VisionForConditionalGeneration":
         """Build the model from the HF config and both NeuronConfigs."""
+        _check_layer_counts(hf_config)
         return cls(KimiK3Config.from_configs(hf_config, text_neuron_config), encoder_neuron_config)
 
     def get_encoder(self) -> nn.Module:
