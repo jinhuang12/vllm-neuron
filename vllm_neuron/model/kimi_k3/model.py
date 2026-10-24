@@ -148,6 +148,15 @@ def _decode_layout(rows: torch.Tensor) -> torch.Tensor:
     return rows.reshape(tokens, width // d, d).permute(2, 0, 1).unsqueeze(-1).contiguous()
 
 
+def _state_slots(meta) -> torch.Tensor:
+    """Each sequence's state slot: column 0 of its KDA group's block table.
+
+    With prefix caching off a sequence holds one block per state group, and a padding
+    row holds the null block 0, which the bank has as a scratch slot.
+    """
+    return meta["block_table_tensor"][:, 0].long()
+
+
 class KimiK3KDA(nn.Module):
     """Kimi Delta Attention: projections, short conv, gated delta rule, gated output."""
 
@@ -197,19 +206,39 @@ class KimiK3KDA(nn.Module):
         return proj.split([width] * 4 + [self.head_dim, self.num_heads], dim=-1)
 
     def forward_prefill(self, mix, norm_weight, meta) -> torch.Tensor:
-        """KDA over a fresh prefill chunk; returns this rank's ``[T, H]`` fp32 partial."""
+        """KDA over one sequence's prefill chunk; returns this rank's ``[T, H]`` fp32 partial.
+
+        The chunk starts from the conv rows and recurrent state in the sequence's slot
+        once an earlier chunk has run, and from zeros before. Its last conv rows and its
+        final state go back to the slot for the next chunk or the first decode step.
+        """
         q, k, v, gate, f_a, beta = self._split_input(
             _project(mix, self._input_weights(), norm_weight, self.eps)
         )
         forget = _project(f_a, [self.f_b_proj.weight])
-        history = q.new_zeros(self.conv_weight.shape[1] - 1, 3 * q.shape[1])
+        slot = _state_slots(meta)[:1]
+        # A fresh sequence's slot can hold an earlier owner's bytes, NaN included, so the
+        # seed selects zeros instead of scaling by 0.
+        carried = meta["cached_seq_len"].reshape(1, 1) > 0
+        bank_rows = self.conv_state.index_select(0, slot)[0]
+        history = torch.where(carried, bank_rows, torch.zeros_like(bank_rows))
+        bank_state = self.recurrent_state.index_select(0, slot)[0]
+        seed = torch.where(carried.unsqueeze(-1), bank_state, torch.zeros_like(bank_state))
+        # Padding tokens follow the real ones, and their slot is the null block's slot 0.
+        valid = meta["slot_mapping"] > 0
         # [3W, T] bf16, channel-major: the layout the recurrence reads.
         conv = _require(depthwise_conv1d_silu, "KDA short conv")(
             history, q, k, v, self.conv_weight
         )
-        core, _ = _require(kda_prefill, "KDA recurrence")(
-            conv, forget, beta, self.A_log, self.dt_bias, None, lower_bound=self.lower_bound
+        core, state = _require(kda_prefill, "KDA recurrence")(
+            conv, forget, beta, self.A_log, self.dt_bias,
+            state=seed, valid=valid, lower_bound=self.lower_bound,
         )
+        # The next chunk's conv rows: the last taps - 1 rows up to the last real token.
+        rows = torch.cat([history, torch.cat([q, k, v], dim=-1)])
+        last = valid.sum() + torch.arange(history.shape[0], device=rows.device)
+        self.conv_state.index_copy_(0, slot, rows.index_select(0, last).unsqueeze(0))
+        self.recurrent_state.index_copy_(0, slot, state.unsqueeze(0))
         return self.output_prefill(core, gate.float())
 
     def output_prefill(self, core: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
@@ -221,7 +250,7 @@ class KimiK3KDA(nn.Module):
         proj = _project(mix, self._input_weights(), norm_weight, self.eps)
         # The kernel takes contiguous banks, and the bound banks are page-strided
         # views. So the step runs on the tokens' rows, which then go back by slot.
-        slots = meta["state_slots"].long()
+        slots = _state_slots(meta)
         rows = torch.arange(slots.shape[0], dtype=torch.int32, device=slots.device)
         # core: [128, T, heads, 1] bf16, the output projection's input layout.
         core, conv, state = kda_fused_decode(

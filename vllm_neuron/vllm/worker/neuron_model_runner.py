@@ -3211,11 +3211,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         raw = getattr(buffer, "np", None)
         return raw if isinstance(raw, np.ndarray) else buffer.cpu.numpy()
 
+    def _is_state_group(self, group_id: int) -> bool:
+        """True for a KV-cache group of per-sequence state, whose block table holds state slots."""
+        config = getattr(self, "kv_cache_config", None)
+        return config is not None and isinstance(
+            config.kv_cache_groups[group_id].kv_cache_spec, MambaSpec
+        )
+
     def _block_table_device_tensor(self, group_id: int, buffer: Any) -> torch.Tensor:
         """Return the device block table of one KV-cache group.
 
         Remaps the null block to the sentinel on the host and uploads the result, skipping both
-        when the raw host table has not changed since the last upload. The remap runs in numpy,
+        when the raw host table has not changed since the last upload. A state group keeps the
+        null block, because its table is read as state slots. The remap runs in numpy,
         because the earlier order of uploading the raw table and remapping on device with
         ``torch.where`` added a host round trip for a value the host already held.
 
@@ -3243,9 +3251,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         state.next_slot = (slot + 1) % _BLOCK_TABLE_STAGE_DEPTH
         stage, null_mask = state.stage[slot], state.null_mask[slot]
         np.copyto(stage, raw)
-        # Reuse the mask and pass ``out`` to keep the hot path free of allocations.
-        np.equal(stage, NULL_BLOCK_ID, out=null_mask)
-        np.copyto(stage, PAD_SLOT_ID, where=null_mask)
+        # A state group's table is read as state slots, and the null block is a slot
+        # every bank has. So padding rows keep it there, instead of the sentinel.
+        if not self._is_state_group(group_id):
+            # Reuse the mask and pass ``out`` to keep the hot path free of allocations.
+            np.equal(stage, NULL_BLOCK_ID, out=null_mask)
+            np.copyto(stage, PAD_SLOT_ID, where=null_mask)
 
         # Build a new device tensor for each upload. An in-place copy is unsafe, because
         # the NEFF of the previous step can still reference the old device tensor.
