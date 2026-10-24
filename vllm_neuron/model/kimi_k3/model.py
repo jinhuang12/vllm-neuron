@@ -21,6 +21,7 @@ from torch import nn
 from transformers import PretrainedConfig
 from vllm.distributed.parallel_state import get_tp_group, model_parallel_is_initialized
 
+from vllm_neuron.functional.attention.attn_res_decode import attn_res_decode, attn_res_score_weight
 from vllm_neuron.functional.attention.attn_res_prefill import attn_res_prefill
 from vllm_neuron.functional.attention.o_proj import o_proj_tkg
 from vllm_neuron.functional.embedding import embedding
@@ -53,7 +54,6 @@ def _optional_kernel(module: str, name: str):
 
 
 qkv_proj_fp32acc = _optional_kernel("attention.qkv_fp32acc", "qkv_proj_fp32acc")
-attn_res_decode = _optional_kernel("attention.attn_res_decode", "attn_res_decode")
 kda_prefill = _optional_kernel("kda.prefill", "kda_prefill")
 depthwise_conv1d_silu = _optional_kernel("kda.depthwise_conv1d", "depthwise_conv1d_silu")
 mla_paged_attention = _optional_kernel("attention.mla_paged", "mla_paged_attention")
@@ -109,11 +109,6 @@ def situ_and_mul(
     if linear_beta is not None:
         u = linear_beta * torch.tanh(u / linear_beta)
     return (act * u).to(gate.dtype)
-
-
-def attn_res_score_weight(norm: _Weight, proj: _Weight) -> torch.Tensor:
-    """The AttnRes score weight, ``norm.weight * proj.weight`` in fp32, ``[H]``."""
-    return norm.weight.float() * proj.weight.squeeze(0).float()
 
 
 def expert_bank_shapes(
@@ -457,6 +452,19 @@ class KimiK3MoE(nn.Module):
         )
 
 
+def _tail_args(tail: torch.Tensor | None, stream: torch.Tensor, latent_size: int) -> dict:
+    """The AttnRes decode arguments that fold a producer's tail into the stream.
+
+    An MoE block's tail is the fp32 pack ``[T, 2H + 1]``, whose sum of squares covers
+    the ``latent_size`` latent columns; any other tail is a bf16 ``[T, H]`` partial.
+    """
+    if tail is None:
+        return {}
+    if tail.shape[-1] == 2 * stream.shape[-1] + 1:
+        return {"moe_tail": tail, "latent_size": latent_size}
+    return {"residual": tail}
+
+
 def _is_moe_layer(text_config: KimiK3TextConfig, layer_idx: int) -> bool:
     """True for the layers whose MLP is the MoE block."""
     c = text_config
@@ -476,6 +484,7 @@ class KimiK3DecoderLayer(nn.Module):
         hidden, dtype, eps = c.hidden_size, c.torch_dtype, c.rms_norm_eps
         self.layer_idx = layer_idx
         self.block_size = c.attn_res_block_size
+        self.latent_size = c.routed_expert_hidden_size
         self.eps = eps
         self.is_kda = c.layer_types[layer_idx] == KDA_LAYER_TYPE
         self.self_attn = KimiK3KDA(c) if self.is_kda else KimiK3MLA(c)
@@ -515,9 +524,9 @@ class KimiK3DecoderLayer(nn.Module):
     def prepare_after_load(self) -> None:
         """Compute both sites' fp32 score weights and the sublayers' stacked weights."""
         self.attention_score_w = attn_res_score_weight(
-            self.self_attention_res_norm, self.self_attention_res_proj
+            self.self_attention_res_norm.weight, self.self_attention_res_proj.weight
         )
-        self.mlp_score_w = attn_res_score_weight(self.mlp_res_norm, self.mlp_res_proj)
+        self.mlp_score_w = attn_res_score_weight(self.mlp_res_norm.weight, self.mlp_res_proj.weight)
         self.self_attn.prepare_after_load()
         self.feed_forward.prepare_after_load()
 
@@ -554,37 +563,39 @@ class KimiK3DecoderLayer(nn.Module):
     def _mix_decode(self, stream, tail, bank, site: str):
         """AttnRes mix at decode with the producer's tail as its prologue.
 
-        Returns the mix, the new stream and, at the MLA attention site and the MoE
-        site, the rank's normed fp32 K slice of the mix.
+        Returns the mix, the new stream, the bank and, at the MLA attention site and
+        the MoE site, the rank's normed fp32 K slice of the mix.
         """
         attention = site == "attention"
         if attention and self.attention_rows == 0:
             mix, _ = self.attention_mix(stream, bank)
-            return mix, stream, None
+            return mix, stream, None, bank
+        if not attention and self.block_start:
+            # The block's stream restarts from the attention output.
+            stream, tail = tail, None
         norm = self.input_layernorm if attention else self.post_attention_layernorm
         emit_k_slice = (attention and not self.is_kda) or (
             not attention and hasattr(self, "block_sparse_moe")
         )
-        store_row = self.layer_idx // self.block_size if attention and self.block_start else None
-        return _require(attn_res_decode, "AttnRes decode mix")(
+        mix, stream, k_slice, new_bank = attn_res_decode(
             bank,
             stream,
-            tail,
             self.attention_score_w if attention else self.mlp_score_w,
-            rows=self.attention_rows if attention else self.mlp_rows,
-            restart=not attention and self.block_start,
-            store_row=store_row,
+            (self.attention_rows if attention else self.mlp_rows) + 1,
+            **_tail_args(tail, stream, self.latent_size),
+            bank_slot=self.layer_idx // self.block_size if attention and self.block_start else None,
             norm_weight=norm.weight if emit_k_slice else None,
             eps=self.eps,
         )
+        return mix, stream, k_slice, bank if new_bank is None else new_bank
 
-    def forward_decode(self, stream, tail, bank, meta) -> tuple[torch.Tensor, torch.Tensor]:
-        """One decode layer; returns the stream and this layer's tail for the next mix."""
-        mix, stream, k_slice = self._mix_decode(stream, tail, bank, "attention")
+    def forward_decode(self, stream, tail, bank, meta):
+        """One decode layer; returns the stream, this layer's tail for the next mix, and the bank."""
+        mix, stream, k_slice, bank = self._mix_decode(stream, tail, bank, "attention")
         attn = self.self_attn.forward_decode(mix, k_slice, self.input_layernorm.weight, meta)
-        mix, stream, k_slice = self._mix_decode(stream, attn, bank, "mlp")
+        mix, stream, k_slice, bank = self._mix_decode(stream, attn, bank, "mlp")
         out = self.feed_forward.forward_decode(mix, k_slice, self.post_attention_layernorm.weight)
-        return stream, out
+        return stream, out, bank
 
 
 class KimiK3Model(nn.Module):
@@ -610,7 +621,7 @@ class KimiK3Model(nn.Module):
         for layer in self.layers:
             layer.prepare_after_load()
         self.output_score_w = attn_res_score_weight(
-            self.output_attn_res_norm, self.output_attn_res_proj
+            self.output_attn_res_norm.weight, self.output_attn_res_proj.weight
         )
 
     def embed(self, input_ids) -> tuple[torch.Tensor, torch.Tensor]:
@@ -633,12 +644,15 @@ class KimiK3Model(nn.Module):
             return self.output_mix(stream, bank)
         tail = None
         for layer, meta in zip(self.layers, metas):
-            stream, tail = layer.forward_decode(stream, tail, bank, meta)
-        mix, _, _ = _require(attn_res_decode, "AttnRes decode mix")(
-            bank, stream, tail, self.output_score_w, rows=self.num_bank_rows,
-            restart=False, store_row=None, norm_weight=None, eps=self.eps,
-        )
-        return mix
+            stream, tail, bank = layer.forward_decode(stream, tail, bank, meta)
+        return self.output_mix_decode(stream, tail, bank)
+
+    def output_mix_decode(self, stream, tail, bank) -> torch.Tensor:
+        """AttnRes mix of the last stream, with the last layer's tail, and every bank row."""
+        return attn_res_decode(
+            bank, stream, self.output_score_w, self.num_bank_rows + 1,
+            **_tail_args(tail, stream, self.layers[-1].latent_size), eps=self.eps,
+        ).mix
 
 
 class KimiK3ForConditionalGeneration(nn.Module):
