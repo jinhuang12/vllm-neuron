@@ -492,14 +492,13 @@ def _padded(rows: int) -> int:
 class KimiK3VisionForConditionalGeneration(KimiK3ForConditionalGeneration):
     """Kimi K3 with the vision tower as ``visual`` and the encoder hook and warmup."""
 
-    #: Split a lone image at the one-block bucket over the encoder DP groups.
-    split_lone_image = True
-
     def __init__(self, config: KimiK3Config, encoder_neuron_config: EncoderNeuronConfig):
         super().__init__(config)
         if config.vision_config is None:
             raise ValueError("an encoder config was given, but the checkpoint has no vision tower")
         self.encoder_neuron_config = encoder_neuron_config
+        #: Split a lone image at the one-block bucket over the encoder DP groups.
+        self.split_lone_image = encoder_neuron_config.split_lone_image
         self.visual = KimiK3VisionModel(config.vision_config, config.text_config.torch_dtype)
         self._tables: TableCache | None = None
 
