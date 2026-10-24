@@ -17,6 +17,7 @@ import math
 
 import torch
 import torch.distributed as dist
+import vllm.envs as envs
 from nkilib.core.utils.common_types import OProjAttentionLayout
 from torch import nn
 from torch.distributed import _functional_collectives as funcol
@@ -26,6 +27,7 @@ from vllm.distributed.parallel_state import (
     get_world_group,
     model_parallel_is_initialized,
 )
+from vllm.model_executor.models.interfaces import SupportsEagle3
 
 from vllm_neuron.functional.attention.attn_res_decode import attn_res_decode, attn_res_score_weight
 from vllm_neuron.functional.attention.attn_res_prefill import attn_res_prefill
@@ -36,7 +38,7 @@ from vllm_neuron.functional.attention.mla_paged import (
 )
 from vllm_neuron.functional.attention import o_proj as output_projection
 from vllm_neuron.functional.attention.o_proj import o_proj, o_proj_tkg
-from vllm_neuron.functional.kda.fused_decode import kda_fused_decode
+from vllm_neuron.functional.kda.fused_decode import kda_fused_decode, kda_fused_verify
 from vllm_neuron.functional.kda.output import kda_output_prefill
 from vllm_neuron.functional.moe.fused_tail import moe_fused_tail
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
@@ -301,10 +303,24 @@ def _decode_layout(rows: torch.Tensor) -> torch.Tensor:
 def _state_slots(meta) -> torch.Tensor:
     """Each sequence's state slot: column 0 of its KDA group's block table.
 
-    With prefix caching off a sequence holds one block per state group, and a padding
-    row holds the null block 0: a scratch page that no request owns.
+    With prefix caching off a sequence holds one block per state group, or 1 + k under
+    speculation, and a padding row holds the null block 0: a scratch page that no
+    request owns.
     """
     return meta["block_table_tensor"][:, 0].long()
+
+
+def _window_pages(meta, window: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """A verify window's row pages ``[B, window]`` and each sequence's source page ``[B]``.
+
+    Row page j receives the state after the window's token j. A sequence starts from the
+    page of its previous step's accepted draft count, ``state_resume_rows``, which is 0
+    after prefill. The pick is a gather on the device, so no count reaches the host.
+    """
+    table = meta["block_table_tensor"]
+    resume = meta["state_resume_rows"].long().unsqueeze(1)
+    source = table.gather(1, resume).squeeze(1).to(torch.int32)
+    return table[:, :window].to(torch.int32).contiguous(), source
 
 
 def _page_layout(view: torch.Tensor, pages: torch.Tensor) -> tuple[int, torch.dtype, tuple]:
@@ -483,14 +499,14 @@ class KimiK3KDA(nn.Module):
         return kda_output_prefill(core, gate, self.o_norm.weight, self.o_proj.weight, self.eps)
 
     def forward_decode(self, mix, k_slice, norm_weight, meta) -> torch.Tensor:
-        """One KDA decode step on the page buffer by slot; returns the ``[T, H]`` bf16 partial."""
+        """One KDA decode or verify step on the page buffer; returns the ``[T, H]`` bf16 partial.
+
+        Under speculation the step's metadata carries each sequence's resume row, and the
+        tokens are a window per sequence: the verify mode reads the source page and
+        writes one row page per token. Otherwise each token steps its slot's page.
+        """
         proj = _project(mix, self.input_weight, norm_weight, self.eps)
-        # core: [128, T, heads, 1] bf16, the output projection's input layout. The
-        # kernel writes each token's page in place, so the returned buffer is not kept.
-        core, _ = kda_fused_decode(
-            proj,
-            _state_slots(meta).int(),
-            self.pages,
+        weights = (
             self.q_conv1d.weight,
             self.k_conv1d.weight,
             self.v_conv1d.weight,
@@ -498,9 +514,21 @@ class KimiK3KDA(nn.Module):
             self.dt_bias,
             self.f_b_proj.weight,
             self.o_norm.weight,
-            lower_bound=self.lower_bound,
-            norm_eps=self.eps,
         )
+        # core: [128, T, heads, 1] bf16, the output projection's input layout. The
+        # kernel writes the pages in place, so the returned buffer is not kept.
+        if "state_resume_rows" in meta:
+            window = proj.shape[0] // meta["block_table_tensor"].shape[0]
+            rows, source = _window_pages(meta, window)
+            core, _ = kda_fused_verify(
+                proj, source, rows, self.pages, *weights,
+                lower_bound=self.lower_bound, norm_eps=self.eps,
+            )
+        else:
+            core, _ = kda_fused_decode(
+                proj, _state_slots(meta).int(), self.pages, *weights,
+                lower_bound=self.lower_bound, norm_eps=self.eps,
+            )
         return _output_projection(core, self.output_weight)
 
 
@@ -1072,22 +1100,24 @@ class KimiK3DecoderLayer(nn.Module):
         )
         return mix, stream, k_slice, bank if new_bank is None else new_bank
 
-    def forward_decode(self, stream, tail, bank, meta, tp_rank=None):
+    def forward_decode(self, stream, tail, bank, meta, tp_rank=None, return_tap: bool = False):
         """One decode layer; returns the stream, this layer's tail for the next mix, and the bank.
 
         ``tp_rank`` is the ``[1]`` int32 tensor-parallel rank, or None on one rank. The
-        attention output is summed over the group before the next mix folds it in.
+        attention output is summed over the group before the next mix folds it in. With
+        ``return_tap``, the stream the attention-site mix stores comes fourth: the stream
+        this layer reads, with the previous layer's tail folded in.
         """
-        mix, stream, k_slice, bank = self._mix_decode(stream, tail, bank, "attention", tp_rank)
+        mix, entering, k_slice, bank = self._mix_decode(stream, tail, bank, "attention", tp_rank)
         attn = self.self_attn.forward_decode(mix, k_slice, self.input_layernorm.weight, meta)
         attn = _all_reduce(attn)
-        mix, stream, k_slice, bank = self._mix_decode(stream, attn, bank, "mlp", tp_rank)
+        mix, stream, k_slice, bank = self._mix_decode(entering, attn, bank, "mlp", tp_rank)
         norm = self.post_attention_layernorm.weight
         if hasattr(self, "block_sparse_moe"):
             out = self.block_sparse_moe.forward_decode(mix, k_slice, norm, tp_rank)
         else:
             out = self.mlp.forward_decode(mix, k_slice, norm)
-        return stream, out, bank
+        return (stream, out, bank, entering) if return_tap else (stream, out, bank)
 
 
 class KimiK3Model(nn.Module):
@@ -1113,6 +1143,8 @@ class KimiK3Model(nn.Module):
         self.output_attn_res_proj = _Weight((1, hidden), dtype)
         self.num_bank_rows = math.ceil(c.num_hidden_layers / c.attn_res_block_size)
         self.register_buffer("output_score_w", None, persistent=False)
+        # Layers whose input stream the forward also returns.
+        self.aux_layers: tuple[int, ...] = ()
 
     def prepare_after_load(self) -> None:
         """Compute every layer's load-time products and the output site's score weight."""
@@ -1136,12 +1168,16 @@ class KimiK3Model(nn.Module):
         return attn_res_prefill(bank, stream, self.output_score_w, self.eps)
 
     def forward(
-        self, input_ids, attn_metadata, is_prefill: bool, positions=None, rank=None
-    ) -> torch.Tensor:
+        self, input_ids, attn_metadata, is_prefill: bool, positions=None, rank=None,
+        return_taps: bool = False,
+    ):
         """Run every layer; returns the output mix ``[T, H]``, before the final norm.
 
         Each layer reads its cache group's metadata with the tokens' ``positions`` added.
         ``rank`` is the tensor-parallel rank tensor, needed when the group has more than one rank.
+        With ``return_taps``, the taps come second, in layer order. The tap of aux layer
+        ``j`` is the stream layer ``j`` reads, with the previous layer's MLP output added:
+        the stream its attention-site mix stores.
         """
         tp_size = _tp_rank_and_size()[1]
         stream, bank = self.embed(input_ids, rank if tp_size > 1 else None)
@@ -1150,13 +1186,24 @@ class KimiK3Model(nn.Module):
             for i in range(len(self.layers))
         ]
         tail, tp_rank = None, _rank_tensor(rank, tp_size)
+        taps = []
         if is_prefill:
-            for layer, meta in zip(self.layers, metas):
+            for i, (layer, meta) in enumerate(zip(self.layers, metas)):
+                if return_taps and i in self.aux_layers:
+                    taps.append(stream)
                 stream = layer.forward_prefill(stream, bank, meta, tp_rank)
-            return self.output_mix(stream, bank)
-        for layer, meta in zip(self.layers, metas):
-            stream, tail, bank = layer.forward_decode(stream, tail, bank, meta, tp_rank)
-        return self.output_mix_decode(stream, tail, bank)
+            mix = self.output_mix(stream, bank)
+        else:
+            for i, (layer, meta) in enumerate(zip(self.layers, metas)):
+                if return_taps and i in self.aux_layers:
+                    stream, tail, bank, tap = layer.forward_decode(
+                        stream, tail, bank, meta, tp_rank, return_tap=True
+                    )
+                    taps.append(tap)
+                else:
+                    stream, tail, bank = layer.forward_decode(stream, tail, bank, meta, tp_rank)
+            mix = self.output_mix_decode(stream, tail, bank)
+        return (mix, taps) if return_taps else mix
 
     def output_mix_decode(self, stream, tail, bank) -> torch.Tensor:
         """AttnRes mix of the last stream, with the last layer's tail, and every bank row."""
@@ -1166,7 +1213,23 @@ class KimiK3Model(nn.Module):
         ).mix
 
 
-class KimiK3ForConditionalGeneration(nn.Module):
+def aux_layers_for_draft(draft_config, text_config: KimiK3TextConfig) -> tuple[int, ...]:
+    """The aux layers a draft reads: its ``target_layer_ids`` plus 1, checked on the target."""
+    ids = (
+        draft_config.get("target_layer_ids")
+        if isinstance(draft_config, dict)
+        else getattr(draft_config, "target_layer_ids", None)
+    )
+    if not ids:
+        raise ValueError("the draft config names no target_layer_ids")
+    count = text_config.num_hidden_layers
+    outside = [i for i in ids if not 0 <= i < count - 1]
+    if outside:
+        raise ValueError(f"draft target layers {outside} have no next layer among the {count}")
+    return tuple(i + 1 for i in ids)
+
+
+class KimiK3ForConditionalGeneration(nn.Module, SupportsEagle3):
     """Kimi K3 language model with its column-parallel LM head and on-device sampler."""
 
     def __init__(self, config: KimiK3Config):
@@ -1309,20 +1372,44 @@ class KimiK3ForConditionalGeneration(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs,
     ):
-        """Run the decoder; returns sampled tokens and no logits, or logits without a sampler."""
+        """Run the decoder; returns sampled tokens and no logits, or logits without a sampler.
+
+        With aux layers set, the joined taps come second: ``(tokens, taps, None)``, or
+        ``(logits, taps)`` without a sampler.
+        """
         if inputs_embeds is not None:
             raise NotImplementedError("Kimi K3 serves text prompts only")
         meta = next(iter(attn_metadata.values()))
         is_prefill = meta["max_query_len"] > meta["decode_token_threshold"]
-        hidden = self.model(input_ids, attn_metadata, is_prefill, positions, rank)
+        hidden, taps = self.model(
+            input_ids, attn_metadata, is_prefill, positions, rank, return_taps=True
+        )
         if sampling_positions is not None and (
             is_prefill or hidden.shape[0] != sampling_positions.shape[0]
         ):
             hidden = torch.index_select(hidden, 0, sampling_positions)
         logits = self.compute_logits(hidden)
+        # The taps leave the graph as one tensor [T, len(taps) * H], beside the output.
+        aux = (torch.cat(taps, dim=-1),) if taps else ()
         if self.sampler is None:
-            return logits
-        return self.sample(logits, sampling_params, logit_mask, rank), None
+            return (logits, *aux) if aux else logits
+        return self.sample(logits, sampling_params, logit_mask, rank), *aux, None
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        """Tap the stream each of ``layers`` reads; the forward then returns the taps."""
+        if envs.VLLM_KIMI_K3_AUX_ATTN_RES_STREAM:
+            raise ValueError(
+                "Kimi K3 taps the running stream only; unset VLLM_KIMI_K3_AUX_ATTN_RES_STREAM"
+            )
+        count = len(self.model.layers)
+        outside = [j for j in layers if not 0 <= j < count]
+        if outside:
+            raise ValueError(f"aux layers {outside} are not among the model's {count} layers")
+        self.model.aux_layers = tuple(layers)
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        """The tapped layers, or the interface default when none are set."""
+        return self.model.aux_layers or self.get_eagle3_default_aux_hidden_state_layers()
 
     def compute_logits(self, hidden: torch.Tensor) -> torch.Tensor:
         """Final norm and LM head on ``[R, H]`` rows: ``[R, V / TP]``, as two column halves."""

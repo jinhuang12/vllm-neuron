@@ -3225,10 +3225,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         """Zero the state slot of each request that starts from its first token.
 
         A freed block keeps its last owner's bytes, and a 1-token prompt's only step is a
-        decode step, which reads its slot as the prior state.
+        decode step, which reads its slot as the prior state. Under speculation the slot's
+        recorded draft count goes back to 0 as well, so that step starts from this page.
         """
         if not self._state_pages:
             return
+        resume = getattr(self, "_state_resume_table", None)
         for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
             if not self._is_state_group(group_id):
                 continue
@@ -3239,6 +3241,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             index = torch.tensor(slots, dtype=torch.long, device=self.device)
             for layer_name in group.layer_names:
                 self._state_pages[layer_name].index_fill_(0, index, 0)
+            if resume is not None:
+                resume.index_fill_(0, index, 0)
 
     def _block_table_device_tensor(self, group_id: int, buffer: Any) -> torch.Tensor:
         """Return the device block table of one KV-cache group.
@@ -5557,12 +5561,19 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         attn_metadata = {}
         decode_token_threshold = 1 + max_num_draft_tokens
         is_decode = max_query_len <= decode_token_threshold
+        resume_rows = None
 
         for kv_cache_group_id, kv_cache_group_spec in enumerate(
             self.kv_cache_config.kv_cache_groups
         ):
             spec = kv_cache_group_spec.kv_cache_spec
             block_size = spec.block_size
+            # A state group under speculation keeps all 1 + k page columns: a verify step
+            # writes each of them, so no context bucket trims them.
+            state_pages = (
+                getattr(self, "_state_resume_table", None) is not None
+                and self._is_state_group(kv_cache_group_id)
+            )
             blk_table = self.input_batch.block_table[kv_cache_group_id]
             blk_table_tensor = blk_table.get_device_tensor(padded_num_reqs)
             # Clone so ``full_blk_table_tensor`` is a distinct tensor object
@@ -5672,6 +5683,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             elif (
                 is_decode
                 and self.neuron_config.decode_context_length_buckets is not None
+                and not state_pages
             ):
                 bucket_blocks = self._decode_ctx_blocks_from_max_decode_ctx_len(
                     max_decode_ctx_len=max_decode_ctx_len,
@@ -5728,6 +5740,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 attn_metadata_i["raw_block_table_tensor"] = raw_blk_table_tensor
             if swa_kv_pos_offset is not None:
                 attn_metadata_i["swa_kv_pos_offset"] = swa_kv_pos_offset
+            if is_decode and state_pages:
+                if resume_rows is None:
+                    resume_rows = self._state_resume_rows(padded_num_reqs)
+                attn_metadata_i["state_resume_rows"] = resume_rows
 
             for layer_name in kv_cache_group_spec.layer_names:
                 attn_metadata[layer_name] = attn_metadata_i
@@ -5783,10 +5799,16 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             decode_token_threshold = 1 + num_spec_tokens
 
         is_prefill = (num_tokens // num_reqs) > decode_token_threshold
+        resume_rows = None
 
-        for _, kv_cache_group_spec in enumerate(self.kv_cache_config.kv_cache_groups):
+        for group_id, kv_cache_group_spec in enumerate(self.kv_cache_config.kv_cache_groups):
             spec = kv_cache_group_spec.kv_cache_spec
             block_size = spec.block_size
+            # A state group under speculation: as in _build_attention_metadata.
+            state_pages = (
+                getattr(self, "_state_resume_table", None) is not None
+                and self._is_state_group(group_id)
+            )
             # Block-table seq dim. Defaults to max_model_len; overridden by
             # ctx_bucket for decode_context_length_buckets warmup. SWA path below
             # may further reduce this for SWA groups.
@@ -5835,6 +5857,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             elif (
                 not is_prefill
                 and self.neuron_config.decode_context_length_buckets is not None
+                and not state_pages
             ):
                 # Trim to the DCP-aware bucket block count, matching the
                 # index_select trim that _build_attention_metadata applies at
@@ -5866,6 +5889,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 )
                 return base.unsqueeze(0).expand(num_reqs, -1).contiguous().to(device)
 
+            if state_pages:
+                # The runtime table of a state group is its 1 + k page columns, untrimmed.
+                max_num_blocks_per_req = full_max_blocks_per_req = (
+                    spec.max_num_blocks_per_req(self.vllm_config, self.max_model_len)
+                )
             block_table_tensor = _block_ids(max_num_blocks_per_req)
             # Always provide an untrimmed block_table with the full
             # ``max_model_len`` dim so the on-device spec-decode correction
@@ -5907,6 +5935,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             }
             if swa_kv_pos_offset is not None:
                 attn_metadata_i["swa_kv_pos_offset"] = swa_kv_pos_offset
+            if state_pages and not is_prefill:
+                # One tensor for every state group, as at run time.
+                if resume_rows is None:
+                    resume_rows = torch.zeros(num_reqs, dtype=torch.int32, device=device)
+                attn_metadata_i["state_resume_rows"] = resume_rows
 
             for layer_name in kv_cache_group_spec.layer_names:
                 attn_metadata[layer_name] = attn_metadata_i
@@ -10476,16 +10509,61 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
     def _update_states_after_model_execute(
         self,
+        sampled_token_ids: torch.Tensor | list[list[int]],
         scheduler_output: "SchedulerOutput",
-        sampled_token_ids: list[list[int]],
     ) -> None:
-        """Update the cached states after model execution.
+        """Record each request's accepted draft count after the step, for its state pages.
 
-        On GPU this handles MTP/EAGLE for hybrid models (linear attention
-        state shifting). Neuron does not support hybrid models yet, so this
-        is a no-op.
+        Under speculation a state layer writes one page per verify token, and the next step
+        starts from the page of the accepted count: the step's valid sampled ids less one,
+        0 after a prefill. The count is computed and stored on the device, so the
+        asynchronous path never reads it on the host. Without state pages this does nothing.
+        The parameter order is the caller's, as upstream's.
         """
-        pass
+        table = getattr(self, "_state_resume_table", None)
+        num_reqs = self.input_batch.num_reqs
+        if table is None or num_reqs == 0:
+            return
+        if isinstance(sampled_token_ids, torch.Tensor):
+            ids = sampled_token_ids[:num_reqs]
+            valid = ((ids != -1) & (ids < self.vocab_size)).sum(dim=1)
+        else:
+            valid = torch.tensor([len(row) for row in sampled_token_ids[:num_reqs]])
+        counts = (valid - 1).clamp(min=0).to(device=table.device, dtype=torch.int32)
+        keys = torch.from_numpy(self._state_page_keys(num_reqs)).to(table.device)
+        table.index_copy_(0, keys, counts)
+
+    def _state_page_keys(self, num_rows: int) -> np.ndarray:
+        """The first state page of each of the first ``num_rows`` batch rows: their count keys."""
+        group_id = next(
+            i for i in range(len(self.kv_cache_config.kv_cache_groups)) if self._is_state_group(i)
+        )
+        table = self._raw_block_table(self.input_batch.block_table[group_id].block_table)
+        return table[:num_rows, 0].astype(np.int64)
+
+    def _state_resume_rows(self, padded_num_reqs: int) -> torch.Tensor:
+        """Each batch row's resume row in its state pages, ``[padded_num_reqs]`` int32 on the device.
+
+        A gather of the recorded counts by the rows' first pages; a padding row reads the
+        null block's entry, and every page of a padding row is the null block. First checks
+        on the host that no request's state page is another request's or the null block: a
+        verify step reads each sequence's source page while the others write their pages.
+        """
+        num_reqs = self.input_batch.num_reqs
+        width = 1 + self.speculative_config.num_speculative_tokens
+        for group_id in range(len(self.kv_cache_config.kv_cache_groups)):
+            if not self._is_state_group(group_id):
+                continue
+            buffer = self.input_batch.block_table[group_id].block_table
+            pages = self._raw_block_table(buffer)[:num_reqs, :width]
+            if np.unique(pages).size != pages.size or (pages == NULL_BLOCK_ID).any():
+                raise ValueError(
+                    f"state group {group_id}: the requests' state pages {pages.tolist()} must "
+                    f"be distinct and none the null block {NULL_BLOCK_ID}"
+                )
+        keys = np.full(padded_num_reqs, NULL_BLOCK_ID, dtype=np.int64)
+        keys[:num_reqs] = self._state_page_keys(num_reqs)
+        return self._state_resume_table.index_select(0, torch.from_numpy(keys).to(self.device))
 
     def _update_batch_state_with_samples(
         self,
@@ -11216,6 +11294,24 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 raise NotImplementedError(
                     f"Unsupported Attention spec type: {type(kv_cache_spec)}"
                 )
+
+        # Under speculation a state group holds 1 + k pages per request: page j takes the
+        # state after a verify window's token j, and the next step starts from the page of
+        # the accepted draft count. The counts live on the device, one per block, keyed by
+        # the request's first page of the first state group, so they outlast batch reorders.
+        self._state_resume_table = None
+        num_spec = self.speculative_config.num_speculative_tokens if self.speculative_config else 0
+        state_groups = [i for i in range(len(block_sizes)) if self._is_state_group(i)]
+        if num_spec and state_groups:
+            short = [i for i in state_groups if max_num_blocks_per_req[i] != 1 + num_spec]
+            if short:
+                raise ValueError(
+                    f"state groups {short} hold {[max_num_blocks_per_req[i] for i in short]} "
+                    f"pages per request; a {num_spec}-draft verify step writes {1 + num_spec}"
+                )
+            self._state_resume_table = torch.zeros(
+                kv_cache_config.num_blocks, dtype=torch.int32, device=self.device
+            )
 
         # This binds the cache tensors to the model
         self.model.bind_kv_cache(kv_caches)
