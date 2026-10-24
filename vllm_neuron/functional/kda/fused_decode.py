@@ -196,6 +196,11 @@ def _step_tokens(x, idx, conv_pages, state_pages, core, consts, t0, nt, lower_bo
                       dge_mode=STATIC)
         nisa.dma_copy(dst=state[:, u * nh:(u + 1) * nh, :], src=_state_rows(state_pages, slot[u]),
                       dge_mode=BY_SLOT)
+    # Each token's 3 newest conv rows are ready once loaded. Stores into the one page buffer
+    # keep their program order, so these go first, ahead of the state stores.
+    for u in range(nt):
+        nisa.dma_copy(dst=_conv_rows(conv_pages, slot[u]), src=rows[TAPS * u + 1:TAPS * (u + 1)],
+                      dge_mode=BY_SLOT)
 
     # Token columns that do not depend on the pages.
     fa_t = nl.ndarray((DIM, nt), dtype=nl.bfloat16, buffer=nl.sbuf)
@@ -307,13 +312,11 @@ def _step_tokens(x, idx, conv_pages, state_pages, core, consts, t0, nt, lower_bo
     nisa.tensor_tensor(dst=y, data1=out_ps, data2=scale, op=nl.multiply)
 
     # Stores: the output columns (cell c is item 3 t0 + c of the [128, 3T] layout), then each
-    # token's state and its 3 newest conv rows, into its page.
+    # token's state, into its page.
     nisa.dma_copy(dst=core.ap(pattern=[[HEADS * tokens, DIM], [1, cells]], offset=HEADS * t0), src=y,
                   dge_mode=STATIC)
     for u in range(nt):
         nisa.dma_copy(dst=_state_rows(state_pages, slot[u]), src=updated[:, u * nh:(u + 1) * nh, :],
-                      dge_mode=BY_SLOT)
-        nisa.dma_copy(dst=_conv_rows(conv_pages, slot[u]), src=rows[TAPS * u + 1:TAPS * (u + 1)],
                       dge_mode=BY_SLOT)
 
 
