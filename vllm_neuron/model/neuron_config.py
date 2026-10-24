@@ -401,6 +401,8 @@ class EncoderNeuronConfig:
             allocated after write before it can be freed. Prevents premature
             reuse when a remote reader (DE/RDMA) hasn't finished pulling the
             data. None = auto (0 for monolithic, 100ms for EPD).
+        split_lone_image: Split a lone image at the one-block bucket over the
+            encoder DP groups, on a model that supports the split. Default True.
     """
 
     num_encoder_input_buckets: list[int] | None = None
@@ -418,6 +420,8 @@ class EncoderNeuronConfig:
     # we should not observe stall as well.
     encoder_cache_num_blocks: int | None = None
     encoder_cache_min_hold_time_ms: float | None = None
+
+    split_lone_image: bool = True
 
     # EPD construction-role flags (both False -> monolith: build both towers).
     mm_encoder_only: bool = False
@@ -536,6 +540,7 @@ class EncoderNeuronConfig:
             encoder_cache_min_hold_time_ms=config_dict.get(
                 "encoder_cache_min_hold_time_ms"
             ),
+            split_lone_image=config_dict.get("split_lone_image", True),
         )
 
     def set_construction_role(self, multimodal_config, additional_config: dict) -> None:
