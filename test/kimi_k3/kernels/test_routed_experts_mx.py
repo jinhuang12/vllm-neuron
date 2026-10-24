@@ -67,7 +67,7 @@ CODE_LIMITS = {
     "sigmoid inputs at 12, T 8": 3 * 0.007426307314918155,
     "small near-equal rows, T 8": 3 * 0.007470731382016782,
     "clean rows, T 8": 3 * 0.007434279830367476,
-    "expert tiles, T 128": None,
+    "expert tiles, T 128": 3 * 0.017904162406921387,
 }
 #: Prefill tiles: 6 experts with 128 gathered rows each, the last 16 of them padding.
 TILE_ITEMS, TILE_ROWS, TILE_PADDING = 6, 128, 16
