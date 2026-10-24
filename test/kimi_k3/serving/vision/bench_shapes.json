@@ -1,0 +1,78 @@
+{
+  "shapes": [
+    {
+      "name": "2K-1",
+      "S": 2048,
+      "input_len": 1920,
+      "output_len": 128,
+      "concurrency": 1,
+      "num_prompts": 8
+    },
+    {
+      "name": "2K-8",
+      "S": 2048,
+      "input_len": 1920,
+      "output_len": 128,
+      "concurrency": 8,
+      "num_prompts": 8
+    },
+    {
+      "name": "2K-32",
+      "S": 2048,
+      "input_len": 1920,
+      "output_len": 128,
+      "concurrency": 32,
+      "num_prompts": 32
+    },
+    {
+      "name": "8K-1",
+      "S": 8192,
+      "input_len": 8064,
+      "output_len": 128,
+      "concurrency": 1,
+      "num_prompts": 8
+    },
+    {
+      "name": "8K-8",
+      "S": 8192,
+      "input_len": 8064,
+      "output_len": 128,
+      "concurrency": 8,
+      "num_prompts": 8
+    },
+    {
+      "name": "8K-32",
+      "S": 8192,
+      "input_len": 8064,
+      "output_len": 128,
+      "concurrency": 32,
+      "num_prompts": 32
+    },
+    {
+      "name": "32K-1",
+      "S": 32768,
+      "input_len": 32640,
+      "output_len": 128,
+      "concurrency": 1,
+      "num_prompts": 8
+    },
+    {
+      "name": "32K-8",
+      "S": 32768,
+      "input_len": 32640,
+      "output_len": 128,
+      "concurrency": 8,
+      "num_prompts": 8
+    },
+    {
+      "name": "128K-1",
+      "S": 131072,
+      "input_len": 130944,
+      "output_len": 128,
+      "concurrency": 1,
+      "num_prompts": 8
+    }
+  ],
+  "client_timeout_s": 21600,
+  "run_deadline_s": 2700
+}
