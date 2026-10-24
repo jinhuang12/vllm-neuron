@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import functools
 from importlib.abc import Loader, MetaPathFinder
 from importlib.machinery import PathFinder
 import sys
@@ -27,6 +28,9 @@ NEURON_MAX_BATCH_QUEUE_DEPTH = 4
 # the queue only above 1, so depth 1 leaves async scheduling on while every step runs serially,
 # which is worse than the upstream default. Refuse it rather than serve it.
 NEURON_MIN_BATCH_QUEUE_DEPTH = 2
+
+# The V1 runner's unsupported-feature entry upstream adds for DSpark.
+_V1_DSPARK_UNSUPPORTED_ENTRY = "dspark speculative decoding"
 
 
 # Model architectures the V2 runner cannot serve, so they fall back to V1. This is a
@@ -673,8 +677,33 @@ def _apply_max_concurrent_batches(vllm_config_cls: type) -> None:
     )
 
 
+def _admit_dspark_on_v1_runner(vllm_config_cls: type) -> None:
+    """Drop DSpark from the V1 runner's unsupported features on the Neuron platform."""
+    original = vllm_config_cls.__dict__.get("_get_v1_model_runner_unsupported_features")
+    if original is None or getattr(original, "_neuron_dspark_admitted", False):
+        return
+
+    # Upstream lists DSpark as V2-only because only its V2 GPU runner has it. Neuron
+    # runs speculative decoding on V1, so only that entry goes. Every other entry,
+    # adaptive draft verification included, still refuses.
+    @functools.wraps(original)
+    def unsupported_features(vllm_config: "VllmConfig") -> list[str]:
+        from vllm.platforms import current_platform
+
+        from vllm_neuron.vllm.platform import NeuronPlatform
+
+        unsupported = original(vllm_config)
+        if not isinstance(current_platform, NeuronPlatform):
+            return unsupported
+        return [entry for entry in unsupported if entry != _V1_DSPARK_UNSUPPORTED_ENTRY]
+
+    unsupported_features._neuron_dspark_admitted = True  # type: ignore[attr-defined]
+    vllm_config_cls._get_v1_model_runner_unsupported_features = unsupported_features
+
+
 def _apply_neuron_policy_patch(vllm_config_cls: type) -> None:
     _apply_max_concurrent_batches(vllm_config_cls)
+    _admit_dspark_on_v1_runner(vllm_config_cls)
     use_model_runner_property = vllm_config_cls.__dict__["use_v2_model_runner"]
     if getattr(use_model_runner_property.fget, "_neuron_policy_patch", False):
         return
