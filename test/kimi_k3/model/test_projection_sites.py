@@ -4,10 +4,10 @@
 The normed sites run the fused norm-and-projection kernel on weights stacked at load,
 and the unnormed prefill sites run the library's prefill output projection. Two
 one-layer models run prefill to the logits: KDA with the dense MLP, and MLA with the
-MoE block, whose attention and routed experts are fixed rows here. The decode sites run
-on the same layers; the KDA decode step runs the decode kernel on a bound page buffer. Set
-``KIMI_K3_CHECKPOINT`` to the checkpoint directory (default ``~/models/moonshotai/Kimi-K3``);
-run with ``VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1``.
+MoE block, whose attention, latent-down partial and routed experts are fixed rows. The
+decode sites run on the same layers; the KDA decode step runs the decode kernel on a bound
+page buffer. Set ``KIMI_K3_CHECKPOINT`` to the checkpoint directory (default
+``~/models/moonshotai/Kimi-K3``); run with ``VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1``.
 """
 
 import copy
@@ -57,6 +57,13 @@ SITES = {
     "mla_gate_decode": ("mla", "decode", ["self_attn.g_proj"]),
     "shared_gate_up_decode": ("mla", "decode", SHARED),
 }
+# Sites that moved out of one rank's reach, with the reason.
+SUPERSEDED = {
+    "moe_down_router_prefill": "the MoE prefill latent-down projects the rank's fp32 K slice; "
+    "at one rank that slice is 7,168 wide, 56 column groups, past the kernel's 17; "
+    "test_ep.py checks it on four tensor-parallel ranks",
+}
+ACTIVE = [site for site in SITES if site not in SUPERSEDED]
 
 
 def _one_layer(hf_config: dict, kda: bool) -> m.KimiK3ForConditionalGeneration:
@@ -122,8 +129,8 @@ def sites() -> dict:
     gen, calls = torch.Generator().manual_seed(0), []
 
     def record(fn):
-        def wrapper(x, weight, *norm):
-            out = fn(x, weight, *norm)
+        def wrapper(x, weight, *norm, **kwargs):
+            out = fn(x, weight, *norm, **kwargs)
             calls.append((x, out))
             return out
         return wrapper
@@ -132,7 +139,6 @@ def sites() -> dict:
         mp.setattr(output_projection, "_torch_o_proj_impl", _no_fallback)
         mp.setattr(m, "_project", record(m._project))
         mp.setattr(m, "_prefill_projection", record(m._prefill_projection))
-        mp.setattr(m, "router_select", lambda logits, bias, **kwargs: (None, None))
         x = (0.5 * torch.randn(4, 7168, generator=gen)).bfloat16()
         gain = (1 + 0.1 * torch.randn(7168, generator=gen)).bfloat16()
         k_slice = torch.randn(128, 4, 56, 1, generator=gen)
@@ -156,7 +162,10 @@ def sites() -> dict:
         attended = (0.5 * torch.randn(TOKENS, 384, generator=gen)).bfloat16()
         mla._attend = lambda latent, gate, meta: attended[: latent.shape[0]]
         combined = torch.randn(TOKENS, 112, generator=gen)
-        moe._select_and_run = lambda latent, *args: combined[: latent.shape[0]]
+        partial = torch.randn(TOKENS, 112 + 64, generator=gen)
+        moe._down_router_prefill = lambda mix, norm, tp_rank: partial[: mix.shape[0]]
+        moe._prefill_experts = lambda routed, tp_rank: combined[: routed.shape[0]]
+        moe._select_and_run = lambda routed, base: combined[: routed.shape[0]]
         moe.tail_decode = lambda combined, gate_up: None
         b(ids, None, {"layers.0.self_attn": _prefill_meta()})
         mla._attend = lambda latent, gate, meta: m._decode_layout(attended[: gate.shape[0]])
@@ -167,13 +176,13 @@ def sites() -> dict:
     kda_in, forget, gate_up, down, head, _, kda_decode = kda_calls
     head = (head[0], logits)
     *mla_prefill, _, _, gate_decode, shared_decode = mla_calls
-    found = dict(zip(SITES, [kda_in, forget, gate_up, down, head, kda_decode, *mla_prefill,
-                             gate_decode, shared_decode], strict=True))
+    found = dict(zip(ACTIVE, [kda_in, forget, gate_up, down, head, kda_decode, *mla_prefill,
+                              gate_decode, shared_decode], strict=True))
     for loaded in weights.values():
         loaded["decode.weight"] = gain.double()
     return {site: (*found[site], norm and weights[model][f"{norm}.weight"],
                    [weights[model][f"{w}.weight"] for w in names])
-            for site, (model, norm, names) in SITES.items()}
+            for site, (model, norm, names) in SITES.items() if site in found}
 
 
 def _reference(x, gain, weights):
@@ -184,7 +193,9 @@ def _reference(x, gain, weights):
     return x @ torch.cat(weights).t()
 
 
-@pytest.mark.parametrize("site", SITES)
+@pytest.mark.parametrize("site", [
+    pytest.param(site, marks=pytest.mark.skip(reason=SUPERSEDED[site])) if site in SUPERSEDED
+    else site for site in SITES])
 def test_site_matches_fp64(sites, site):
     """Row cosines with fp64 are at least 0.9999; the largest error is at most 2^-6 of the peak."""
     x, out, gain, weights = sites[site]

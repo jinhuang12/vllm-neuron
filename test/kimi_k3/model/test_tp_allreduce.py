@@ -8,7 +8,7 @@ rank fits the kernels: the embedding; the MLA latent projection of the rank's K 
 the bf16 output partials of the attention and of the dense MLP, against one call over both
 ranks' inputs. The error is the largest difference over the largest one-rank magnitude.
 The Dynamo graph of one 4-layer decode step counts its all-reduces by call site. The MLA
-attention core and the routed experts are fixed rows. Set ``KIMI_K3_CHECKPOINT`` to the
+attention core and the routed experts' partial are fixed rows. Set ``KIMI_K3_CHECKPOINT`` to the
 checkpoint directory (default ``~/models/moonshotai/Kimi-K3``); run with
 ``VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1``.
 """
@@ -52,6 +52,7 @@ SITES = {
     "KimiK3MLA.forward_decode": "MLA latent",
     "VocabDimShardedEmbedding.forward": "embedding",
     "KimiK3MLP.forward_decode": "dense MLP",
+    "KimiK3MoE.forward_decode": "MoE",
 }
 
 
@@ -107,12 +108,12 @@ def _rows() -> dict[str, torch.Tensor]:
         "bank": (0.5 * torch.randn(T, 1, H, generator=gen)).bfloat16(),
         "tail": torch.cat([0.05 * torch.randn(T, 2 * H, generator=gen), sumsq], -1),
         "attended": (0.5 * torch.randn(T, 768, generator=gen)).bfloat16(),
-        "combined": torch.randn(T, 112, generator=gen),
+        "combined": torch.randn(1, TP, T, 56, generator=gen),
     }
 
 
 def _bind(model, rank: int, rows: dict) -> list:
-    """Bind KDA page buffers, fix the MLA core to the rank's heads and the routed experts."""
+    """Bind KDA page buffers, fix the MLA core to the rank's heads and the experts' partial."""
     layers, latents = model.model.layers, []
     for layer in layers[:3]:
         pages = torch.zeros(2, 294_912, dtype=torch.int8)
@@ -122,7 +123,7 @@ def _bind(model, rank: int, rows: dict) -> list:
     heads = m._decode_layout(rows["attended"][:, rank * 384:(rank + 1) * 384])
     layers[3].self_attn._attend = lambda latent, gate, meta: latents.append(latent) or heads
     for layer in layers[1:]:
-        layer.block_sparse_moe._select_and_run = lambda latent, *args: rows["combined"]
+        layer.block_sparse_moe._select_and_run = lambda routed, base: rows["combined"]
     return latents
 
 
@@ -277,9 +278,11 @@ def test_dense_seam(runs):
 
 
 def test_all_reduce_count(runs):
-    """The decode graph all-reduces 4 attention outputs, 1 MLA latent, 1 embedding, 1 dense."""
+    """The decode graph all-reduces 4 attention outputs, 1 MLA latent, 1 embedding, 1 dense,
+    and per MoE layer its dispatch and its tail pack."""
     for out in runs["ranks"]:
         sites = out["graph"]["sites"]
         named = {k: sites.get(k, 0) for k in ("attention", "MLA latent", "embedding")}
         assert named == {"attention": 4, "MLA latent": 1, "embedding": 1}
-        assert sites.get("dense MLP", 0) == 1 and sum(sites.values()) == 7
+        assert sites.get("dense MLP", 0) == 1 and sites.get("MoE", 0) == 6
+        assert sum(sites.values()) == 13

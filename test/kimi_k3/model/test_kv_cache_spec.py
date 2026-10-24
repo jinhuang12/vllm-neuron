@@ -85,10 +85,16 @@ def vllm_config():
 
 @pytest.fixture(scope="module")
 def model():
-    """The 93-layer model on the meta device, built on one rank of a 32-way TP group."""
+    """The 93-layer model on the meta device, built on one rank of a 32-way TP group.
+
+    The MoE layers hold that rank's experts of the 64-rank expert group, TP 32 by DP 2.
+    """
     group = types.SimpleNamespace(world_size=TP, rank_in_group=0, device_group=None)
+    experts = types.SimpleNamespace(world_size=TP * DP, rank_in_group=0, device_group=None)
     with pytest.MonkeyPatch.context() as patch, torch.device("meta"):
         patch.setattr(kimi_model, "_tp_group", lambda: group)
+        patch.setattr(kimi_model, "get_world_group", lambda: experts)
+        patch.setattr(kimi_model, "get_wide_ep_group", lambda: experts)
         model = kimi_model.KimiK3ForConditionalGeneration.from_configs(
             get_config(str(CHECKPOINT), trust_remote_code=False)
         )
@@ -99,12 +105,9 @@ def model():
 def _load_time_copies_per_rank(model) -> int:
     """Bytes per rank of the weight copies made at load, which the worker counts as buffers.
 
-    The fp32 AttnRes score weights span the hidden size on every rank; every other
-    copy is a slice of a TP-sharded weight.
+    The model is built at one rank's shapes, so each buffer is counted once at its size.
     """
-    buffers = dict(model.named_buffers())
-    replicated = sum(b.nbytes for n, b in buffers.items() if n.endswith("score_w"))
-    return replicated + sum(b.nbytes for n, b in buffers.items() if not n.endswith("score_w")) // TP
+    return sum(b.nbytes for b in model.buffers())
 
 
 def _runner(vllm_config, model) -> NeuronModelRunner:
