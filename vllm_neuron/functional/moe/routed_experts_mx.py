@@ -550,8 +550,8 @@ def _load_operands(bank, expert, half, tiles, dge):
 def _expert_rows(stationary, stationary_scale, tiles, affinity, acc, beta, linear_beta, sink=None):
     """``acc [P, D] += affinity [P, 1] * expert(rows)`` for one loaded expert's program half.
 
-    ``sink``, in the test mode, is the (codes, scales) HBM views that receive the
-    quantized intermediate.
+    ``sink``, in the test mode, returns the (codes, scales) HBM views that receive the
+    quantized intermediate; it is called where the stores issue.
     """
     gate_up, gate_up_s, down, down_s = tiles
     nk = stationary.shape[1]
@@ -589,7 +589,7 @@ def _expert_rows(stationary, stationary_scale, tiles, affinity, acc, beta, linea
     act_s = nl.ndarray((128, ni, rows), dtype=nl.uint8, buffer=nl.sbuf)
     nisa.quantize_mx(dst=act_q, src=natural, dst_scale=act_s)
     if sink is not None:
-        codes_dst, scales_dst = sink
+        codes_dst, scales_dst = sink()
         nisa.dma_copy(dst=codes_dst, src=act_q.view(nl.int32).reshape((128, ni * rows)),
                       oob_mode=nisa.oob_mode.skip)
         nisa.dma_copy(dst=scales_dst, src=act_s.reshape((128, ni * rows)),
@@ -618,16 +618,25 @@ def _stage(table, p, dst, dge):
 
 
 def _code_sink(exposed, table, p, program, dge):
-    """HBM views of the test mode's outputs at the local expert in column ``p`` of ``table``."""
+    """Stage the local expert in column ``p`` of ``table`` for the test mode's outputs.
+
+    Returns a function giving the outputs' HBM views at that expert. It loads the expert into
+    a register, so call it where the stores issue: the register and the stores that use it
+    must sit in one ordered block.
+    """
     expert_tile = _tile(1, 1, nl.uint32)
     _stage(table, p, expert_tile, dge)
-    expert = nisa.register_alloc()
-    nisa.register_load(dst=expert, src=expert_tile)
-    views = []
-    for out in exposed:
-        _, programs, parts, cols = out.shape
-        views.append(out.ap(pattern=[[cols, parts], [1, cols]], offset=program * parts * cols,
-                            scalar_offset=expert, indirect_dim=0))
+
+    def views():
+        expert = nisa.register_alloc()
+        nisa.register_load(dst=expert, src=expert_tile)
+        found = []
+        for out in exposed:
+            _, programs, parts, cols = out.shape
+            found.append(out.ap(pattern=[[cols, parts], [1, cols]], offset=program * parts * cols,
+                                scalar_offset=expert, indirect_dim=0))
+        return found
+
     return views
 
 
@@ -638,8 +647,8 @@ def _visit_experts(chosen, affinity, stationary, stationary_scale, bank, program
     One hardware loop runs the items in pairs (2p, 2p + 1) on two operand buffers swapped
     statically: item 2p + 1 loads while 2p computes, and 2p + 2 while 2p + 1 computes. Each
     pass stages the next pass's first expert id before it ends, so that load starts at the
-    top of the pass. A load past the last item names no expert and moves nothing, so each of the ``count``
-    items loads once. With an odd count the last pass also computes a padding item at
+    top of the pass. A load past the last item names no expert and moves nothing, so each of
+    the ``count`` items loads once. With an odd count the last pass also computes a padding item at
     affinity 0 on the second buffer's resident data, and stores none of its codes.
     ``exposed``, in the test mode, is the (codes, scales) HBM outputs indexed by local expert.
     """
@@ -856,9 +865,10 @@ def _routed_expert_tiles_kernel(rows, weights, gate_up_weight, gate_up_scale, do
                 stationary, stationary_scale, _, weight, acc = state[r]
                 sink = None
                 if expose_codes:
-                    sink = tuple(t.ap(pattern=[[code_cols, 128], [per_item, ni], [1, 128]],
-                                      offset=(item * halves + half) * 128 * code_cols + first)
-                                 for t in exposed)
+                    views = tuple(t.ap(pattern=[[code_cols, 128], [per_item, ni], [1, 128]],
+                                       offset=(item * halves + half) * 128 * code_cols + first)
+                                  for t in exposed)
+                    sink = lambda views=views: views
                 _expert_rows(stationary, stationary_scale, tiles, weight, acc, beta, linear_beta,
                              sink)
         for r, first in enumerate(range(0, per_item, 128)):
