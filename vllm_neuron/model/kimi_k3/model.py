@@ -23,7 +23,8 @@ from vllm.distributed.parallel_state import get_tp_group, model_parallel_is_init
 
 from vllm_neuron.functional.attention.attn_res_decode import attn_res_decode, attn_res_score_weight
 from vllm_neuron.functional.attention.attn_res_prefill import attn_res_prefill
-from vllm_neuron.functional.attention.o_proj import o_proj_tkg
+from vllm_neuron.functional.attention import o_proj as output_projection
+from vllm_neuron.functional.attention.o_proj import o_proj, o_proj_tkg
 from vllm_neuron.functional.embedding import embedding
 from vllm_neuron.functional.kda.fused_decode import kda_fused_decode
 from vllm_neuron.functional.kda.output import kda_output_prefill
@@ -33,6 +34,7 @@ from vllm_neuron.model.neuron_config import NeuronConfig
 from vllm_neuron.nn.cpl import ColumnParallelLinear
 from vllm_neuron.nn.sampler import Sampler
 from vllm_neuron.utils.hardware_config import get_logical_nc_config
+from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 from . import weight_loaders_mxfp4
 from .config import KDA_LAYER_TYPE, KimiK3Config, KimiK3TextConfig
@@ -125,11 +127,47 @@ def expert_bank_shapes(
     }
 
 
-def _project(x, weights, norm_weight=None, eps=0.0):
-    """``x`` (RMS-normed first when ``norm_weight`` is given) times the stacked ``weights``."""
+def _stack(*modules) -> nn.Parameter:
+    """The modules' ``[out, in]`` weights as one ``[in, sum of out]`` weight, which replaces them.
+
+    The fused projection reads this layout, so each original is freed once it is stacked.
+    """
+    stacked = torch.cat([m.weight for m in modules]).t().contiguous()
+    for m in modules:
+        m.weight = None
+    return nn.Parameter(stacked, requires_grad=False)
+
+
+def _project(x, weight, norm_weight, eps):
+    """RMSNorm of ``[T, H]`` rows with gain ``norm_weight``, times a stacked ``[H, I]`` weight."""
     return _require(qkv_proj_fp32acc, "fused norm and projection")(
-        x, weights, norm_weight=norm_weight, eps=eps
-    )
+        x.unsqueeze(0), weight, norm_weight.to(torch.bfloat16), eps
+    )[0]
+
+
+def _prefill_projection(x, weight):
+    """``[T, K]`` rows times ``weight`` ``[K, N]`` on the library's prefill output projection.
+
+    The wrapper falls back to torch outside its kernel's limits, so this raises there instead.
+    """
+    tokens, width = x.shape
+    d = max(k for k in range(1, output_projection.P_MAX + 1) if width % k == 0)
+    limits = {
+        "a device or the NKI simulator": can_run_kernel(x),
+        f"K {width} equal to the weight's rows {weight.shape[0]}": weight.shape[0] == width,
+        f"{width // d} column groups of {d}, at most {output_projection.MAX_VALIDATED_N_SIZE}":
+            width // d <= output_projection.MAX_VALIDATED_N_SIZE,
+        f"{tokens} tokens, at most {output_projection.MAX_VALIDATED_B_TIMES_S_SIZE}":
+            tokens <= output_projection.MAX_VALIDATED_B_TIMES_S_SIZE,
+        f"N {weight.shape[1]} even and at most {output_projection.MAX_VALIDATED_H_SIZE}":
+            weight.shape[1] % 2 == 0 and weight.shape[1] <= output_projection.MAX_VALIDATED_H_SIZE,
+    }
+    failed = [name for name, ok in limits.items() if not ok]
+    if failed:
+        raise ValueError(
+            "Kimi K3 prefill projection outside its kernel's limits: " + "; ".join(failed)
+        )
+    return o_proj(x.unsqueeze(0), weight)[0]
 
 
 def _output_projection(x, weight):
@@ -182,7 +220,9 @@ class KimiK3KDA(nn.Module):
         self.dt_bias = _frozen((width,), torch.float32)
         self.o_norm = _Weight((self.head_dim,), torch.float32)
         self.o_proj = _Weight((hidden, width), dtype)
+        self.register_parameter("input_weight", None)
         self.register_buffer("conv_weight", None, persistent=False)
+        self.register_buffer("forget_weight", None, persistent=False)
         self.register_buffer("output_weight", None, persistent=False)
         # Per-sequence conv [slots, taps - 1, 3W] and recurrent [slots, heads, D, D]
         # state banks, bound with the KV caches.
@@ -190,15 +230,19 @@ class KimiK3KDA(nn.Module):
         self.recurrent_state = None
 
     def prepare_after_load(self) -> None:
-        """Stack the conv taps as ``[3W, taps]`` fp32, and lay out ``o_proj`` as ``[W, H]``."""
+        """Lay out the weights the kernels read, once.
+
+        The input projections stack as ``[H, I]`` in q, k, v, g, f_a, b order; the conv
+        taps as fp32 ``[3W, taps]``; f_b as ``[D, W]``; and ``o_proj`` as ``[W, H]``.
+        """
+        if self.input_weight is None:
+            self.input_weight = _stack(
+                self.q_proj, self.k_proj, self.v_proj, self.g_proj, self.f_a_proj, self.b_proj
+            )
         taps = [m.weight.squeeze(1) for m in (self.q_conv1d, self.k_conv1d, self.v_conv1d)]
         self.conv_weight = torch.cat(taps).float()
+        self.forget_weight = self.f_b_proj.weight.t().contiguous()
         self.output_weight = self.o_proj.weight.t().contiguous()
-
-    def _input_weights(self) -> list[torch.Tensor]:
-        """The fused input projection's weights in output order: q, k, v, g, f_a, b."""
-        mods = (self.q_proj, self.k_proj, self.v_proj, self.g_proj, self.f_a_proj, self.b_proj)
-        return [m.weight for m in mods]
 
     def _split_input(self, proj: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """Split the fused projection into q, k, v, g, f_a and the beta logits."""
@@ -213,9 +257,9 @@ class KimiK3KDA(nn.Module):
         final state go back to the slot for the next chunk or the first decode step.
         """
         q, k, v, gate, f_a, beta = self._split_input(
-            _project(mix, self._input_weights(), norm_weight, self.eps)
+            _project(mix, self.input_weight, norm_weight, self.eps)
         )
-        forget = _project(f_a, [self.f_b_proj.weight])
+        forget = _prefill_projection(f_a, self.forget_weight)
         slot = _state_slots(meta)[:1]
         # A fresh sequence's slot can hold an earlier owner's bytes, NaN included, so the
         # seed selects zeros instead of scaling by 0.
@@ -252,7 +296,7 @@ class KimiK3KDA(nn.Module):
 
     def forward_decode(self, mix, k_slice, norm_weight, meta) -> torch.Tensor:
         """One KDA decode step with state rows by slot; returns the ``[T, H]`` bf16 partial."""
-        proj = _project(mix, self._input_weights(), norm_weight, self.eps)
+        proj = _project(mix, self.input_weight, norm_weight, self.eps)
         # The kernel takes contiguous banks, and the bound banks are page-strided
         # views. So the step runs on the tokens' rows, which then go back by slot.
         slots = _state_slots(meta)
@@ -298,16 +342,25 @@ class KimiK3MLA(nn.Module):
         self.kv_b_proj = _Weight((kv_b_rows, c.kv_lora_rank), dtype)
         self.o_proj = _Weight((hidden, heads * c.v_head_dim), dtype)
         self.g_proj = _Weight((heads * c.v_head_dim, hidden), dtype)
+        self.register_parameter("input_weight", None)
+        self.register_parameter("gate_weight", None)
         self.register_buffer("latent_weight", None, persistent=False)
         self.register_buffer("output_weight", None, persistent=False)
         # Paged latent cache [blocks, block_size, kv_lora_rank + rope], bound with the KV caches.
         self.kv_cache = None
 
     def prepare_after_load(self) -> None:
-        """Lay out the decode projections: q_a and kv_a as fp32 ``[H, Q + L]``, o_proj ``[HV, H]``."""
-        self.latent_weight = (
-            torch.cat([self.q_a_proj.weight, self.kv_a_proj_with_mqa.weight]).float().t().contiguous()
-        )
+        """Lay out the weights the kernels read, once.
+
+        q_a and kv_a go to fp32 ``[H, Q + L]`` for decode, then stack as bf16 ``[H, Q + L]``;
+        g stacks as ``[H, HV]``; ``o_proj`` as ``[HV, H]``. g is projected alone at decode,
+        so it is its own stack rather than a slice of q_a's.
+        """
+        if self.input_weight is None:
+            latent = torch.cat([self.q_a_proj.weight, self.kv_a_proj_with_mqa.weight])
+            self.latent_weight = latent.float().t().contiguous()
+            self.input_weight = _stack(self.q_a_proj, self.kv_a_proj_with_mqa)
+            self.gate_weight = _stack(self.g_proj)
         self.output_weight = self.o_proj.weight.t().contiguous()
 
     def _attend(self, latent, gate, meta):
@@ -329,15 +382,14 @@ class KimiK3MLA(nn.Module):
 
     def forward_prefill(self, mix, norm_weight, meta) -> torch.Tensor:
         """MLA over a prefill chunk; returns this rank's ``[T, H]`` partial."""
-        weights = [self.q_a_proj.weight, self.kv_a_proj_with_mqa.weight, self.g_proj.weight]
-        proj = _project(mix, weights, norm_weight, self.eps)
-        latent, gate = proj.split([self.latent_weight.shape[1], self.g_proj.weight.shape[0]], -1)
-        return _project(self._attend(latent, gate, meta), [self.o_proj.weight])
+        latent = _project(mix, self.input_weight, norm_weight, self.eps)
+        gate = _project(mix, self.gate_weight, norm_weight, self.eps)
+        return _prefill_projection(self._attend(latent, gate, meta), self.output_weight)
 
     def forward_decode(self, mix, k_slice, norm_weight, meta) -> torch.Tensor:
         """One MLA decode step; ``k_slice`` is the normed fp32 K slice of the mix."""
         latent = _output_projection(k_slice, self.latent_weight)
-        gate = _project(mix, [self.g_proj.weight], norm_weight, self.eps)
+        gate = _project(mix, self.gate_weight, norm_weight, self.eps)
         return _output_projection(self._attend(latent, gate, meta), self.output_weight)
 
 
@@ -353,21 +405,23 @@ class KimiK3MLP(nn.Module):
         self.gate_proj = _Weight((intermediate_size, hidden), dtype)
         self.up_proj = _Weight((intermediate_size, hidden), dtype)
         self.down_proj = _Weight((hidden, intermediate_size), dtype)
+        self.register_parameter("gate_up_weight", None)
         self.register_buffer("down_weight", None, persistent=False)
 
     def prepare_after_load(self) -> None:
-        """Lay out ``down_proj`` as ``[I, H]`` for the decode projection (dense layers only)."""
+        """Stack gate and up as ``[H, 2I]``, and lay out ``down_proj`` as ``[I, H]``."""
+        if self.gate_up_weight is None:
+            self.gate_up_weight = _stack(self.gate_proj, self.up_proj)
         self.down_weight = self.down_proj.weight.t().contiguous()
 
     def activation(self, mix, norm_weight) -> torch.Tensor:
         """RMSNorm of ``mix``, the gate and up projections, then SiTU-and-mul."""
-        weights = [self.gate_proj.weight, self.up_proj.weight]
-        gate, up = _project(mix, weights, norm_weight, self.eps).chunk(2, -1)
+        gate, up = _project(mix, self.gate_up_weight, norm_weight, self.eps).chunk(2, -1)
         return situ_and_mul(gate, up, self.beta, self.linear_beta)
 
     def forward_prefill(self, mix, norm_weight) -> torch.Tensor:
         """The MLP over a prefill chunk; returns this rank's ``[T, H]`` partial."""
-        return _project(self.activation(mix, norm_weight), [self.down_proj.weight])
+        return _prefill_projection(self.activation(mix, norm_weight), self.down_weight)
 
     def forward_decode(self, mix, k_slice, norm_weight) -> torch.Tensor:
         """The MLP at decode; returns the ``[T, H]`` bf16 partial."""
@@ -416,23 +470,27 @@ class KimiK3MoE(nn.Module):
         self.routed_expert_down_proj = _Weight((latent, hidden), dtype)
         self.routed_expert_up_proj = _Weight((hidden, latent), dtype)
         self.routed_expert_norm = KimiK3RMSNorm(latent, c.rms_norm_eps, dtype)
+        self.register_parameter("input_weight", None)
         self.register_buffer("down_router_weight", None, persistent=False)
         self.register_buffer("latent_norm_weight", None, persistent=False)
         self.register_buffer("latent_up_weight", None, persistent=False)
         self.register_buffer("shared_down_weight", None, persistent=False)
 
     def prepare_after_load(self) -> None:
-        """Lay out the decode weights once: latent down and router as fp32 ``[H, K + E]``.
+        """Lay out the weights the kernels read, once.
 
-        The tail takes the latent norm as fp32 ``[D, 1]`` and the latent up and shared
-        down weights as contiguous ``[K, H]``, so each copy is made here once.
+        Latent down and router go to fp32 ``[H, K + E]`` for decode, then stack as bf16
+        ``[H, K + E]`` for the fused projection. The tail takes the latent norm as fp32 ``[D, 1]`` and the latent up and shared
+        down weights as contiguous ``[K, H]``; the prefill projections read the same copies.
         """
-        self.down_router_weight = (
-            torch.cat([self.routed_expert_down_proj.weight, self.gate.weight]).float().t().contiguous()
-        )
+        if self.input_weight is None:
+            down_router = torch.cat([self.routed_expert_down_proj.weight, self.gate.weight])
+            self.down_router_weight = down_router.float().t().contiguous()
+            self.input_weight = _stack(self.routed_expert_down_proj, self.gate)
+        self.shared_experts.prepare_after_load()
         self.latent_norm_weight = self.routed_expert_norm.weight.float().reshape(-1, 1)
         self.latent_up_weight = self.routed_expert_up_proj.weight.t().contiguous()
-        self.shared_down_weight = self.shared_experts.down_proj.weight.t().contiguous()
+        self.shared_down_weight = self.shared_experts.down_weight
 
     def _select_and_run(self, latent, logits, ids=None, weights=None) -> torch.Tensor:
         """Routed experts on the latent rows: fp32 ``[T, D]`` combined output."""
@@ -450,27 +508,25 @@ class KimiK3MoE(nn.Module):
 
     def forward_prefill(self, mix, norm_weight) -> torch.Tensor:
         """The MoE block over a prefill chunk; returns this rank's ``[T, H]`` partial."""
-        latent_size = self.routed_expert_down_proj.weight.shape[0]
-        weights = [self.routed_expert_down_proj.weight, self.gate.weight]
-        proj = _project(mix, weights, norm_weight, self.eps)
+        latent_size = self.latent_up_weight.shape[0]
+        proj = _project(mix, self.input_weight, norm_weight, self.eps)
         latent, logits = proj.split([latent_size, proj.shape[-1] - latent_size], -1)
         ids, weights = _require(router_select, "router selection")(
             logits.float(), self.gate.e_score_correction_bias, top_k=self.top_k,
             renormalize=self.renormalize, scaling=self.scaling,
         )
         combined = self._select_and_run(latent, logits, ids, weights).to(mix.dtype)
-        up = _project(self.routed_expert_norm(combined), [self.routed_expert_up_proj.weight])
+        up = _prefill_projection(self.routed_expert_norm(combined), self.latent_up_weight)
         return up + self.shared_experts.forward_prefill(mix, norm_weight)
 
     def forward_decode(self, mix, k_slice, norm_weight) -> torch.Tensor:
         """The MoE block at decode; returns the fp32 tail pack ``[T, 2H + 1]``."""
-        latent_size = self.routed_expert_down_proj.weight.shape[0]
+        latent_size = self.latent_up_weight.shape[0]
         partial = _output_projection(k_slice, self.down_router_weight)
         latent, logits = partial.split([latent_size, partial.shape[-1] - latent_size], -1)
         combined = self._select_and_run(latent, logits)
-        shared = self.shared_experts
-        weights = [shared.gate_proj.weight, shared.up_proj.weight]
-        return self.tail_decode(combined, _project(mix, weights, norm_weight, self.eps))
+        gate_up = _project(mix, self.shared_experts.gate_up_weight, norm_weight, self.eps)
+        return self.tail_decode(combined, gate_up)
 
     def tail_decode(self, combined, gate_up) -> torch.Tensor:
         """The fused tail of fp32 ``[T, K]`` combined rows: the fp32 pack ``[T, 2H + 1]``."""
@@ -711,6 +767,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
             dtype=text.torch_dtype,
             tp_group=device_group,
         )
+        self.head_weights: nn.ParameterList | None = None
         sampling = text.neuron_config.on_device_sampling_config if text.neuron_config else None
         self.sampler = Sampler(sampling, process_group=device_group) if sampling else None
 
@@ -745,8 +802,17 @@ class KimiK3ForConditionalGeneration(nn.Module):
         self.prepare_after_load()
 
     def prepare_after_load(self) -> None:
-        """Compute the fp32 AttnRes score weights and the kernels' stacked weights, once."""
+        """Compute the fp32 AttnRes score weights and the kernels' stacked weights, once.
+
+        The LM head is stacked as two ``[H, V / 2TP]`` halves, one fused projection each.
+        """
         self.model.prepare_after_load()
+        if self.lm_head.weight is not None:
+            halves = self.lm_head.weight.chunk(2, dim=0)
+            self.head_weights = nn.ParameterList(
+                [nn.Parameter(h.t().contiguous(), requires_grad=False) for h in halves]
+            )
+            self.lm_head.weight = None
 
     def get_kv_spec(self) -> KVSpec:
         """One cache spec per layer: an MLA latent cache, or a KDA layer's state per sequence."""
@@ -817,9 +883,9 @@ class KimiK3ForConditionalGeneration(nn.Module):
 
     def compute_logits(self, hidden: torch.Tensor) -> torch.Tensor:
         """Final norm and LM head on ``[R, H]`` rows: ``[R, V / TP]``, as two column halves."""
-        halves = self.lm_head.weight.chunk(2, dim=0)
         norm = self.model.norm
-        return torch.cat([_project(hidden, [w], norm.weight, norm.eps) for w in halves], dim=-1)
+        halves = [_project(hidden, w, norm.weight, norm.eps) for w in self.head_weights]
+        return torch.cat(halves, dim=-1)
 
     def sample(self, logits, sampling_params=None, logit_mask=None, rank=None) -> torch.Tensor:
         """Sample one token per row with the on-device sampler."""
