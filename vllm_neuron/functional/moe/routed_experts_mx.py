@@ -81,7 +81,8 @@ def routed_experts_mx(
     scaling: float = 1.0,
     replicas: int = 2,
     chunks: int = 32,
-) -> torch.Tensor:
+    expose_codes: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return this rank's routed-expert partial of ``T`` decode tokens in combine order.
 
     Args:
@@ -94,10 +95,18 @@ def routed_experts_mx(
         scaling: routed scaling factor.
         replicas: token groups ``R`` in ``routed``, ``T/R`` rows each.
         chunks: column chunks ``C`` per replica in the combine.
+        expose_codes: a test mode that also returns each visited expert's MXFP8
+            intermediate, the input of its down product.
 
     Returns:
         ``[R, C, T/R, D/C]`` fp32: entry ``[r, c, t, j]`` is token ``r*T/R + t``,
-        latent column ``c*D/C + j``.
+        latent column ``c*D/C + j``. With ``expose_codes``, also the codes ``[E, G,
+        128, NI*P]`` int32 and the block scales ``[E, G, 128, NI*P]`` uint8 of each
+        local expert the loop visits (other experts' entries are undefined), ``P`` the
+        rows rounded up to even: byte ``j`` of code ``[e, g, p, k*P + t]`` is the e4m3
+        code of row ``t`` at intermediate index ``g*I/G + k*512 + 4p + j``, and scale
+        ``[e, g, 32q + r, k*P + t]`` is the E8M0 scale of that row's 32 values from
+        ``g*I/G + k*512 + 32(4q + r)``.
     """
     tokens = routed.shape[0]
     experts, programs, _, _, packed = gate_up_weight.shape
@@ -131,6 +140,7 @@ def routed_experts_mx(
         scaling=scaling,
         replicas=replicas,
         chunks=chunks,
+        expose_codes=expose_codes,
     )
 
 
@@ -337,8 +347,12 @@ def _load_operands(bank, staged, program, tiles, dge):
                 **dge)
 
 
-def _expert_rows(stationary, stationary_scale, tiles, affinity, acc, beta, linear_beta):
-    """``acc [P, D] += affinity [P, 1] * expert(rows)`` for one loaded expert's program half."""
+def _expert_rows(stationary, stationary_scale, tiles, affinity, acc, beta, linear_beta, sink=None):
+    """``acc [P, D] += affinity [P, 1] * expert(rows)`` for one loaded expert's program half.
+
+    ``sink``, in the test mode, is the (codes, scales) HBM views that receive the
+    quantized intermediate.
+    """
     gate_up, gate_up_s, down, down_s = tiles
     nk = stationary.shape[1]
     rows = stationary.shape[2]
@@ -381,6 +395,10 @@ def _expert_rows(stationary, stationary_scale, tiles, affinity, acc, beta, linea
     act_q = nl.ndarray((128, ni, rows), dtype=nl.float8_e4m3fn_x4, buffer=nl.sbuf)
     act_s = nl.ndarray((128, ni, rows), dtype=nl.uint8, buffer=nl.sbuf)
     nisa.quantize_mx(dst=act_q, src=natural, dst_scale=act_s)
+    if sink is not None:
+        codes_dst, scales_dst = sink
+        nisa.dma_copy(dst=codes_dst, src=act_q.view(nl.int32).reshape((128, ni * rows)))
+        nisa.dma_copy(dst=scales_dst, src=act_s.reshape((128, ni * rows)))
     for d in range(nd):
         out = nl.ndarray((rows, _KT), dtype=nl.float32, buffer=nl.psum)
         for k in range(ni):
@@ -404,14 +422,29 @@ def _stage(table, p, dst, dge):
     return dst
 
 
+def _code_sink(exposed, table, p, program, dge):
+    """HBM views of the test mode's outputs at the local expert in column ``p`` of ``table``."""
+    expert_tile = _tile(1, 1, nl.uint32)
+    _stage(table, p, expert_tile, dge)
+    expert = nisa.register_alloc()
+    nisa.register_load(dst=expert, src=expert_tile)
+    views = []
+    for out in exposed:
+        _, programs, parts, cols = out.shape
+        views.append(out.ap(pattern=[[cols, parts], [1, cols]], offset=program * parts * cols,
+                            scalar_offset=expert, indirect_dim=0))
+    return views
+
+
 def _visit_experts(chosen, affinity, stationary, stationary_scale, bank, program, acc,
-                   beta, linear_beta):
+                   beta, linear_beta, exposed=None):
     """Run each local expert with a chosen token once, ascending, next expert's loads in flight.
 
     Items run in pairs (2p, 2p + 1) on two operand buffers swapped statically: item
     2p + 1 loads while 2p computes, and 2p + 2 while 2p + 1 computes. With an even count
     the last pair loads nothing after it; with an odd count the last item runs alone. Each
     of the ``count`` items loads once; with no item, expert 0 loads and never computes.
+    ``exposed``, in the test mode, is the (codes, scales) HBM outputs indexed by local expert.
     """
     rows, local = chosen.shape
     nk = stationary.shape[1]
@@ -489,9 +522,10 @@ def _visit_experts(chosen, affinity, stationary, stationary_scale, bank, program
         # A full-height tile starts at partition 0, as the accumulator does.
         column = nl.ndarray((128, 1), dtype=nl.float32, buffer=nl.sbuf)[0:rows, :]
         _stage(aff_at[q], p, column, entries)
+        sink = None if exposed is None else _code_sink(exposed, expert_at[q], p, program, entries)
         # In program order, so no engine starts the next expert ahead of this one's products.
         with nl.no_reorder():
-            _expert_rows(stationary, stationary_scale, tiles, column, acc, beta, linear_beta)
+            _expert_rows(stationary, stationary_scale, tiles, column, acc, beta, linear_beta, sink)
 
     def run_pair(p):
         _load_operands(bank, _stage(expert_at[1], p, held[1], entries), program, buffers[1], loads)
@@ -512,7 +546,8 @@ def _visit_experts(chosen, affinity, stationary, stationary_scale, bank, program
 
 @nki.jit
 def _routed_experts_kernel(routed, score_bias, expert_base, gate_up_weight, gate_up_scale,
-                           down_weight, down_scale, beta, linear_beta, scaling, replicas, chunks):
+                           down_weight, down_scale, beta, linear_beta, scaling, replicas, chunks,
+                           expose_codes=False):
     """Selection, the distinct-expert loop, the LNC 2 merge and the combine-order store."""
     tokens, width = routed.shape
     local, programs, two_ni, _, gu_cols = gate_up_weight.shape
@@ -565,8 +600,13 @@ def _routed_experts_kernel(routed, score_bias, expert_base, gate_up_weight, gate
 
     acc = nl.ndarray((rows, latent), dtype=nl.float32, buffer=nl.sbuf)
     nisa.memset(dst=acc, value=0.0)
+    exposed = None
+    if expose_codes:
+        code_cols = two_ni // 2 * rows
+        exposed = tuple(nl.ndarray((local, programs, 128, code_cols), dtype=dtype, buffer=nl.shared_hbm)
+                        for dtype in (nl.int32, nl.uint8))
     _visit_experts(chosen, affinity, stationary, stationary_scale, bank, program, acc,
-                   beta, linear_beta)
+                   beta, linear_beta, exposed)
 
     own = latent // programs
     if programs == 2:
@@ -594,4 +634,6 @@ def _routed_experts_kernel(routed, score_bias, expert_base, gate_up_weight, gate
                                 [1, width_c]],
                        offset=(r * chunks + program * own_chunks) * per_replica * width_c),
             src=marked[r * per_replica:(r + 1) * per_replica, :])
+    if expose_codes:
+        return out, exposed[0], exposed[1]
     return out

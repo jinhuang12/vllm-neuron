@@ -8,9 +8,14 @@ The oracle is the checkpoint's own ``KimiMoEGate`` (its float32 casts made float
 and ``KimiBlockSparseMLP`` with the stored fp4 weights in float64 (the SiTU stays in
 float32, as the reference computes it), with the kernel's MXFP8 activation
 quantization applied to the expert input and to the SiTU output: bf16 rounding, then
-32 consecutive values per block scale ``2^(floor(log2 amax) - 7)``. The partial is
-graded as class M (per element error at most 2^-8 of the row RMS), the selection as
-class S (top-16 sets equal except ties within 2^-20; weights within 1e-6 relative).
+32 consecutive values per block scale ``2^(floor(log2 amax) - 7)``, then e4m3
+nearest-even. Class M grades the partial in two parts. The kernel's test mode exposes
+its MXFP8 intermediate codes: per case, at most the set limit of them differ from the
+oracle's, a block with a different scale counting as 32. The oracle then adopts the
+kernel's codes and scales and runs the exact down product, and every partial element
+is within 2^-8 of that oracle row's RMS. The test mode's partial equals the served
+partial bit for bit. Class S grades the selection: top-16 sets equal except ties
+within 2^-20, weights within 1e-6 relative.
 The checkpoint directory comes from ``KIMI_K3_CHECKPOINT_DIR``. With
 ``VLLM_NEURON_CPU_MODE=1`` and ``NKI_SIMULATOR=1`` the kernels run on the NKI
 simulator; otherwise on ``neuron:0``.
@@ -50,6 +55,19 @@ LOGIT_STD = 2.0
 GATE_INPUT = 12.0
 NAN_ROW = 2
 KEY = "language_model.model.layers.{layer}.block_sparse_moe.{name}"
+#: The most intermediate codes per case that may differ from the oracle's, set from the
+#: device MX product noise measured on each case's own operands. None is not yet set.
+CODE_LIMITS = {
+    "correlated rows, T 8": None,
+    "correlated rows, T 1": None,
+    "correlated rows, T 32": None,
+    "repeated tokens, T 8": None,
+    "sigmoid inputs at 12, T 8": None,
+    "small near-equal rows, T 8": None,
+    "clean rows, T 8": None,
+}
+#: Rows averaged into each small row: its scale is 1 / sqrt of this.
+AVERAGED_ROWS = 131072
 FP4_VALUES = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
                           dtype=torch.float64)
 
@@ -130,16 +148,21 @@ def _bank(stored, programs):
     return [torch.stack([p[i] for p in parts]).contiguous() for i in range(4)]
 
 
-def _mx8(values):
-    """bf16 rounding, then MXFP8 e4m3 over 32 consecutive values of the last dimension."""
+def _mx8_codes(values):
+    """bf16 rounding, then e4m3 codes [..., n/32, 32] and block exponents [..., n/32]."""
     v = values.to(torch.bfloat16).double()
     groups = v.reshape(*v.shape[:-1], -1, 32)
     amax = groups.abs().amax(-1, keepdim=True)
     exponent = torch.where(amax > 0, torch.floor(torch.log2(amax.clamp_min(1e-300))) - 7,
                            torch.zeros_like(amax))
-    step = torch.exp2(exponent)
-    codes = (groups / step).float().to(torch.float8_e4m3fn).double()
-    return (codes * step).reshape(v.shape)
+    codes = (groups / torch.exp2(exponent)).float().to(torch.float8_e4m3fn)
+    return codes, exponent.squeeze(-1)
+
+
+def _mx8(values):
+    """bf16 rounding, then MXFP8 e4m3 over 32 consecutive values of the last dimension."""
+    codes, exponent = _mx8_codes(values)
+    return (codes.double() * torch.exp2(exponent)[..., None]).reshape(values.shape)
 
 
 def _gate(ref, logits):
@@ -165,27 +188,40 @@ def _expert(ref, stored):
     return mlp
 
 
-def _oracle(ref, routed):
-    """The fp64 partial [T, D] of this rank's local experts, and the gate's indices."""
-    latent, logits = routed[:, :ref.latent].double(), routed[:, ref.latent:]
-    index, weight = _gate(ref, logits)
-    partial = torch.zeros(routed.shape[0], ref.latent, dtype=torch.float64)
+def _visited(index):
+    """The local experts that at least one token chose, ascending."""
     first = RANK * LOCAL_EXPERTS
+    return sorted({e - first for e in index.flatten().tolist() if 0 <= e - first < LOCAL_EXPERTS})
+
+
+def _intermediates(ref, routed, visited):
+    """Each visited expert's SiTU output [V, T, I] for every row, before its quantization."""
+    latent = _mx8(routed[:, :ref.latent].double())
+    out = []
     with torch.no_grad():
-        for slot in range(LOCAL_EXPERTS):
-            mask = index == first + slot
-            rows = mask.any(-1)
-            if rows.any():
-                y = _expert(ref, ref.stored[slot])(latent[rows])
-                partial[rows] += (weight * mask).sum(-1)[rows, None] * y
-    return partial, index
+        for slot in visited:
+            mlp = _expert(ref, ref.stored[slot])
+            gate_up = torch.cat([mlp.w1(latent), mlp.w3(latent)], dim=-1)
+            out.append(mlp.act_fn.forward(gate_up))
+    return torch.stack(out)
 
 
-def _kernel(ref, routed, bank, replicas):
+def _adopted(ref, index, weight, visited, h):
+    """The fp64 partial [T, D] with the visited experts' intermediates ``h`` [V, T, I]."""
+    partial = torch.zeros(h.shape[1], ref.latent, dtype=torch.float64)
+    for v, slot in enumerate(visited):
+        stored = ref.stored[slot]
+        down = _dequant(stored["w2.packed"], stored["w2.scale"])
+        mask = index == RANK * LOCAL_EXPERTS + slot
+        partial += (weight * mask).sum(-1)[:, None] * (h[v] @ down.T)
+    return partial
+
+
+def _kernel(ref, routed, bank, replicas, expose_codes=False):
     base = torch.tensor([[RANK * LOCAL_EXPERTS]], dtype=torch.int32)
     situ = ref.scope["_get_situ_activation_params"](ref.config)
     args = dict(beta=situ[0], linear_beta=situ[1], scaling=ref.config.routed_scaling_factor,
-                replicas=replicas)
+                replicas=replicas, expose_codes=expose_codes)
 
     def run(routed_, bias_, base_, *bank_):
         return rx.routed_experts_mx(routed_, bias_, base_, *bank_, **args)
@@ -194,7 +230,23 @@ def _kernel(ref, routed, bank, replicas):
         return run(routed, ref.bias, base, *bank)
     compiled = torch.compile(run, backend=envs.get_compile_backend_name(), fullgraph=True,
                              dynamic=False)
-    return compiled(*[t.to("neuron:0") for t in (routed, ref.bias, base, *bank)]).cpu()
+    out = compiled(*[t.to("neuron:0") for t in (routed, ref.bias, base, *bank)])
+    return tuple(t.cpu() for t in out) if expose_codes else out.cpu()
+
+
+def _kernel_codes(codes, scales, visited, tokens, width):
+    """The test mode's e4m3 codes [V, T, I/32, 32] and block exponents [V, T, I/32]."""
+    _, programs, _, cols = scales.shape
+    tiles = width // programs // 512
+    rows = cols // tiles
+    pick = torch.tensor(visited)
+    # Byte j of code [e, g, p, k*rows + t] is intermediate index g*I/G + k*512 + 4p + j.
+    raw = codes[pick].view(torch.uint8).reshape(len(visited), programs, 128, tiles, rows, 4)
+    raw = raw.permute(0, 4, 1, 3, 2, 5).reshape(len(visited), rows, width // 32, 32)
+    # Scale [e, g, 32q + r, k*rows + t] covers index g*I/G + k*512 + 32(4q + r) onward.
+    block = scales[pick].reshape(len(visited), programs, 4, 32, tiles, rows)[:, :, :, :4]
+    block = block.permute(0, 5, 1, 4, 2, 3).reshape(len(visited), rows, width // 32)
+    return raw[:, :tokens].view(torch.float8_e4m3fn), block[:, :tokens].double() - 127
 
 
 def _select(ref, logits):
@@ -215,11 +267,46 @@ def _rows(out):
     return out.permute(0, 2, 1, 3).reshape(replicas * per_replica, chunks * width)
 
 
-def _class_m(partial, oracle):
-    """Worst per element error over 2^-8 of the oracle row RMS (0 where both rows are 0)."""
-    rms = oracle.square().mean(-1, keepdim=True).sqrt()
-    err = (partial.double() - oracle).abs()
-    return torch.where(err == 0, 0.0, err / (2 ** -8 * rms)).amax().item()
+def _ordinal(codes):
+    """Each e4m3 code's signed position in value order; both zeros are 0."""
+    u = codes.view(torch.uint8).long()
+    return torch.where(u >= 128, 128 - u, u)
+
+
+def _class_m(ref, routed, bank, replicas):
+    """One case's differing codes, all codes, largest code step, and the partial's worst error
+    over the bound of the oracle that adopts the kernel's codes."""
+    tokens = routed.shape[0]
+    index, weight = _gate(ref, routed[:, ref.latent:])
+    visited = _visited(index)
+    served = _rows(_kernel(ref, routed, bank, replicas))
+    out, codes, scales = _kernel(ref, routed, bank, replicas, expose_codes=True)
+    partial = _rows(out)
+    assert torch.equal(partial.view(torch.int32), served.view(torch.int32)), \
+        "the test mode changed the partial"
+    got, got_exp = _kernel_codes(codes, scales, visited, tokens, ref.width)
+    want, want_exp = _mx8_codes(_intermediates(ref, routed, visited))
+    scale_same = got_exp == want_exp
+    differ = torch.where(scale_same, (got.double() != want.double()).sum(-1), 32)
+    # A block of zeros has no scale to differ.
+    zeros = (got.double() == 0).all(-1) & (want.double() == 0).all(-1)
+    differ = torch.where(zeros, 0, differ)
+    steps = (_ordinal(got) - _ordinal(want)).abs() * scale_same[..., None]
+    h = (got.double() * torch.exp2(got_exp)[..., None]).reshape(len(visited), tokens, -1)
+    adopted = _adopted(ref, index, weight, visited, h)
+    rms = adopted.square().mean(-1, keepdim=True).sqrt()
+    err = (partial.double() - adopted).abs()
+    worst = torch.where(err == 0, 0.0, err / (2 ** -8 * rms)).amax().item()
+    return SimpleNamespace(differ=int(differ.sum()), codes=got.numel(), step=int(steps.amax()),
+                           worst=worst, visited=visited)
+
+
+def _class_m_line(label, m):
+    limit = CODE_LIMITS[label]
+    passed = limit is not None and m.differ <= limit and m.worst <= 1.0
+    return passed, (f"{label}: {len(m.visited)} local experts; class M {m.differ} of {m.codes} "
+                    f"codes differ (limit {limit}), largest code step {m.step}, "
+                    f"partial worst / bound {m.worst:.4f}")
 
 
 def _class_s(ref, logits, index, weight):
@@ -238,21 +325,20 @@ def _class_s(ref, logits, index, weight):
 
 
 def _check(ref, cases):
-    """Run each (label, routed, replicas) case; report every miss of class M or class S."""
+    """Run each (label, routed, replicas) case; report every miss of class M and of class S."""
     bank = _bank(ref.stored, ref.programs)
-    misses = []
+    m_misses, s_misses = [], []
     for label, routed, replicas in cases:
-        oracle, gate_index = _oracle(ref, routed)
-        visited = sorted({e - RANK * LOCAL_EXPERTS for e in gate_index.flatten().tolist()
-                          if 0 <= e - RANK * LOCAL_EXPERTS < LOCAL_EXPERTS})
-        m = _class_m(_rows(_kernel(ref, routed, bank, replicas)), oracle)
+        passed, line = _class_m_line(label, _class_m(ref, routed, bank, replicas))
         index, weight = _select(ref, routed[:, ref.latent:])
         s_set, s_weight = _class_s(ref, routed[:, ref.latent:], index, weight)
-        print(f"{label}: {len(visited)} local experts; class M worst / bound {m:.4f}; "
-              f"class S set excess {s_set:.3f}, weight error / bound {s_weight:.4f}")
-        if not (m <= 1.0 and s_set <= 1.0 and s_weight <= 1.0):
-            misses.append(label)
-    assert not misses, f"outside class M or S: {misses}"
+        print(f"{line}; class S set excess {s_set:.3f}, weight error / bound {s_weight:.4f}")
+        if not passed:
+            m_misses.append(label)
+        if not (s_set <= 1.0 and s_weight <= 1.0):
+            s_misses.append(label)
+    assert not s_misses and not m_misses, (
+        f"outside class S: {s_misses}; outside class M (a limit of None is not set): {m_misses}")
 
 
 def _routed(ref, latent, logits):
@@ -277,7 +363,7 @@ def correlated_cases(ref):
         latent[:, ref.latent // 3] *= 100
         logits = LOGIT_STD * torch.randn(tokens, ref.experts, generator=gen)
         logits = _favour_local(logits, slice(0, tokens, 2), gen)
-        cases.append((f"T {tokens}", _routed(ref, latent, logits), replicas))
+        cases.append((f"correlated rows, T {tokens}", _routed(ref, latent, logits), replicas))
     return cases
 
 
@@ -288,7 +374,7 @@ def repeated_cases(ref):
     latent = torch.randn(1, ref.latent, generator=gen).expand(tokens, -1)
     logits = LOGIT_STD * torch.randn(1, ref.experts, generator=gen)
     logits = _favour_local(logits, slice(0, 1), gen).expand(tokens, -1)
-    return [(f"T {tokens}", _routed(ref, latent, logits), replicas)]
+    return [(f"repeated tokens, T {tokens}", _routed(ref, latent, logits), replicas)]
 
 
 def twelve_cases(ref):
@@ -300,7 +386,19 @@ def twelve_cases(ref):
     logits[:, RANK * LOCAL_EXPERTS:(RANK + 1) * LOCAL_EXPERTS] = GATE_INPUT
     others = torch.randperm(ref.experts - LOCAL_EXPERTS, generator=gen)[:2]
     logits[:, torch.where(others >= RANK * LOCAL_EXPERTS, others + LOCAL_EXPERTS, others)] = GATE_INPUT
-    return [(f"T {tokens}", _routed(ref, latent, logits), replicas)]
+    return [(f"sigmoid inputs at 12, T {tokens}", _routed(ref, latent, logits), replicas)]
+
+
+def small_rows_cases(ref):
+    """Regime R4: small, near-equal rows, as an average over many unit rows gives."""
+    gen = torch.Generator().manual_seed(4)
+    tokens, replicas = DECODE_ROWS[0]
+    shared = torch.randn(ref.latent, generator=gen)
+    latent = (shared + 2 ** -6 * torch.randn(tokens, ref.latent, generator=gen)) / math.sqrt(
+        AVERAGED_ROWS)
+    logits = _favour_local(LOGIT_STD * torch.randn(tokens, ref.experts, generator=gen),
+                           slice(0, tokens, 2), gen)
+    return [(f"small near-equal rows, T {tokens}", _routed(ref, latent, logits), replicas)]
 
 
 def nan_cases(ref):
@@ -310,7 +408,7 @@ def nan_cases(ref):
     latent = torch.randn(tokens, ref.latent, generator=gen)
     logits = _favour_local(LOGIT_STD * torch.randn(tokens, ref.experts, generator=gen),
                            slice(0, tokens), gen)
-    return [(f"T {tokens}", _routed(ref, latent, logits), replicas)]
+    return [(f"clean rows, T {tokens}", _routed(ref, latent, logits), replicas)]
 
 
 def test_correlated_rows_with_one_large_channel(reference):
@@ -325,8 +423,12 @@ def test_sigmoid_inputs_at_twelve(reference):
     _check(reference, twelve_cases(reference))
 
 
+def test_small_near_equal_rows(reference):
+    _check(reference, small_rows_cases(reference))
+
+
 def test_nan_row_stays_in_its_row(reference):
-    (_, routed, replicas), = nan_cases(reference)
+    (label, routed, replicas), = nan_cases(reference)
     tokens = routed.shape[0]
     poisoned = routed.clone()
     poisoned[NAN_ROW] = float("nan")
@@ -334,11 +436,10 @@ def test_nan_row_stays_in_its_row(reference):
     clean = _rows(_kernel(reference, routed, bank, replicas))
     out = _rows(_kernel(reference, poisoned, bank, replicas))
     others = [row for row in range(tokens) if row != NAN_ROW]
-    oracle, _ = _oracle(reference, routed)
-    m = _class_m(clean, oracle)
+    passed, line = _class_m_line(label, _class_m(reference, routed, bank, replicas))
     clean_index, clean_weight = _select(reference, routed[:, reference.latent:])
     index, weight = _select(reference, poisoned[:, reference.latent:])
-    print(f"T {tokens}: clean class M worst / bound {m:.4f}")
+    print(line)
     assert torch.isnan(out[NAN_ROW]).all(), "the NaN row's partial is not NaN throughout"
     assert torch.equal(out[others].view(torch.int32), clean[others].view(torch.int32)), \
         "the NaN row changed another row's partial"
@@ -347,4 +448,4 @@ def test_nan_row_stays_in_its_row(reference):
     assert torch.equal(index[others], clean_index[others]) and torch.equal(
         weight[others].view(torch.int32), clean_weight[others].view(torch.int32)), \
         "the NaN row changed another row's selection"
-    assert m <= 1.0, "the clean run is outside class M"
+    assert passed, "the clean run is outside class M (a limit of None is not set)"
