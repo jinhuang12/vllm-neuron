@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Kimi K3 decode forward on 8 CPU ranks against a float64 reference, by layer and by MoE layer.
+"""Kimi K3 decode forward on 8 CPU ranks against a float64 reference, by layer and by block.
 
 A 4-layer model at hidden 7,168 (a dense first layer of width 4,224, then MoE with latent
 512, expert width 3,072 and 64 experts; three KDA layers, then MLA; 12 heads, 3 per rank)
@@ -13,22 +13,30 @@ are written out below in float64 from their upstream definitions, and the cached
 enter it as the keys and values its ``kv_b`` projection makes of them.
 
 A reading is a cosine and an error, the largest difference over the reference's largest
-magnitude, per layer on each TP rank's copy of the graded rows. The join items run each
-reference layer on the port's own input to it (its stream, bank row and caches); the
-end-to-end items run the reference from the token ids. The bounds follow a precision model
-of the port's roundings (bf16 steps, fp32 sums, the experts' 8-bit inputs) grown through
-each layer by its activations' gains; the model holds while the reference's shares stay in
-the share item's limits. The routing items compare each row's 16 experts: they may differ
-only where the reference's 16th selection score less its 17th is under a tie gap, a factor
-times the RMS of the row's router logits. Such a row leaves the join reading at that layer
-and the end-to-end readings from that layer on; more than 2 such rows at a layer in the
-join, or 6 end to end, make the run not adjudicable. Set ``KIMI_K3_CHECKPOINT`` to the
-checkpoint directory (its config and Python files); run with ``VLLM_NEURON_CPU_MODE=1
-NKI_SIMULATOR=1``.
+magnitude, on each TP rank's copy of the graded rows. The join items run each reference
+layer on the port's own input to it (its stream, bank row and caches); the end-to-end items
+run the reference from the token ids; the block items run each reference attention block
+and MLP or MoE block on the port's own input to it, a MoE block on the experts the routing
+items read. The bounds follow a precision model of the port's roundings (bf16 steps, fp32
+sums, the experts' 8-bit inputs) grown by the activations' gains; the model holds while the
+reference's shares stay in the share item's limits.
+
+The routing items read the experts that the port's selection kernel picks on the logits and
+bias the port gave its decode expert call. They may differ from the reference's only where
+the reference's 16th selection score less its 17th is under a tie gap, a factor times the
+RMS of the row's router logits. Such a moved row leaves the join reading at its layer and
+the end-to-end readings from that layer on. More than 2 moved rows at a layer in the join,
+or 6 end to end, pass that part's cap, which withdraws that part only. An item with a
+reading that no cap withdraws fails naming it; an item whose only finding is a passed cap,
+or the share item outside its limits, fails with a reason that starts ``not adjudicable:``.
+
+Set ``KIMI_K3_CHECKPOINT`` to the checkpoint directory (its config and Python files); run
+with ``VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1``.
 """
 
 import ast
 import importlib.util
+import inspect
 import json
 import math
 import os
@@ -66,9 +74,11 @@ PREFIX, BLOCKS = [37, 300, 5, 200], [[1], [2, 3], [4], [5]]  # each sequence's M
 MOE_LAYERS, CHOSEN = (1, 2, 3), 16
 JOIN = [(0.99987, 2.2e-2), (0.99988, 2.1e-2), (0.99992, 1.8e-2), (0.99993, 1.6e-2)]
 END_TO_END = [(0.99987, 2.2e-2), (0.99955, 4.2e-2), (0.99887, 6.7e-2), (0.99788, 9.2e-2)]
+ATTENTION_BLOCK = [(0.99995, 1.3e-2), (0.99994, 1.5e-2), (0.99994, 1.5e-2), (0.99994, 1.5e-2)]
+MLP_BLOCK = [(0.99997, 1.1e-2), (0.99987, 2.3e-2), (0.99987, 2.3e-2), (0.99987, 2.3e-2)]
 TIE_JOIN, TIE_END_TO_END = 6.6e-3, {1: 2.8e-2, 2: 5.2e-2, 3: 7.5e-2}
 ATTENTION_SHARE, MLP_SHARE, ROUTED_SHARE = 0.1, {1: 0.75, 2: 0.5, 3: 0.4}, 0.05
-MOVED_JOIN, MOVED_END_TO_END = 2, 6  # more moved rows than these: not adjudicable
+MOVED_JOIN, MOVED_END_TO_END = 2, 6  # the caps: more moved rows than these
 WIDTHS = dict(num_hidden_layers=LAYERS, hidden_size=H, num_attention_heads=HEADS,
               num_key_value_heads=HEADS, num_experts=E, intermediate_size=1056 * TP,
               moe_intermediate_size=I, routed_expert_hidden_size=K, vocab_size=VOCAB,
@@ -163,8 +173,15 @@ def _inputs(replica: int) -> tuple:
     return torch.randint(0, VOCAB, (T,), generator=gen), torch.tensor(PREFIX), meta
 
 
+def _arguments(function, args: tuple, kwargs: dict) -> dict:
+    """A call's arguments by name, defaults included."""
+    bound = inspect.signature(function).bind(*args, **kwargs)
+    bound.apply_defaults()
+    return bound.arguments
+
+
 def _rank(rank: int, root: Path) -> None:
-    """One gloo rank of TP4 by DP2: every decode AttnRes mix and each MoE layer's dispatch sum."""
+    """One gloo rank of TP4 by DP2: every decode AttnRes mix and each decode expert call."""
     from vllm_neuron.parallel.neuron_parallel_state import (
         initialize_neuron_parallel_state, stamp_spmd_rank_tensors)
 
@@ -174,27 +191,31 @@ def _rank(rank: int, root: Path) -> None:
     initialize_neuron_parallel_state(ep_degree=TP * DP, dp_size=DP, local_rank=rank,
                                      tp_global_ranks=[replica * TP + i for i in range(TP)])
     stamped = stamp_spmd_rank_tensors("cpu")
-    model, calls, routed = _model(), [], []
+    model, calls, experts = _model(), [], []
     _load(model, torch.load(root / "weights.pt", mmap=True), torch.load(root / "experts.pt"), tp)
     model.bind_kv_cache(_caches(replica, tp))
     ids, positions, meta = _inputs(replica)
-    mix, total = m.attn_res_decode, m._expert_sum
+    mix, select = m.attn_res_decode, m.routed_experts_mx
 
-    def mixed(bank, stream, *args, **kwargs):
-        out = mix(bank, stream, *args, **kwargs)
-        calls.append({"bank": bank[:, :1].clone(), "new_stream": out.new_stream})
+    def mixed(*args, **kwargs):
+        a = _arguments(mix, args, kwargs)
+        seen = {"bank": a["bank"][:, :a["num_sources"] - 1].clone(),
+                "stream": a["stream"].clone(), "latent_size": a["latent_size"], "eps": a["eps"],
+                **{k: None if a[k] is None else a[k].clone() for k in ("residual", "moe_tail")}}
+        out = mix(*args, **kwargs)
+        calls.append(dict(seen, new_stream=out.new_stream.clone()))
         return out
 
-    def summed(x):
-        out = total(x)
-        routed.append(out.clone())
-        return out
+    def expert_call(*args, **kwargs):
+        a = _arguments(select, args, kwargs)
+        experts.append({"routed": a["routed"].clone(), "bias": a["score_bias"].clone()})
+        return select(*args, **kwargs)
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(m, "attn_res_decode", mixed)
-        patch.setattr(m, "_expert_sum", summed)
+        patch.setattr(m, "routed_experts_mx", expert_call)
         model.model(ids, meta, False, positions, torch.tensor(tp, dtype=torch.int32))
-    torch.save({"calls": calls, "routed": routed}, root / f"rank{rank}.pt")
+    torch.save({"calls": calls, "experts": experts}, root / f"rank{rank}.pt")
     del stamped
     dist.destroy_process_group()
 
@@ -211,6 +232,26 @@ def _port_layer(calls: list[dict], i: int) -> tuple[torch.Tensor, ...]:
     if i == 0:
         return calls[0]["bank"][:, 0], calls[0]["bank"][:, :0], out
     return calls[2 * i - 1]["new_stream"], calls[2 * i - 1]["bank"], out
+
+
+def _port_blocks(calls: list[dict], i: int) -> dict[str, tuple[torch.Tensor, ...]]:
+    """Layer ``i``'s attention and MLP blocks on one rank: each one's stream, bank and output.
+
+    The attention block reads the stream and bank of its site (the embedding and no bank at
+    layer 0); the MLP site's mix adds its output to the stream, or restarts the stream from
+    it at a block start. The MLP block reads its site's new stream and bank; the next mix
+    folds its output, a MoE tail pack as ``up * rsqrt(ss / latent + eps) + shared`` in bf16.
+    """
+    site, tail = calls[2 * i], calls[2 * i + 1]
+    attention_out = site["stream"] if site["residual"] is None else site["residual"]
+    attention_in = _port_layer(calls, i)[:2]
+    if tail["moe_tail"] is None:
+        mlp_out = tail["residual"]
+    else:
+        up, shared, ss = tail["moe_tail"].split([H, H, 1], -1)
+        mlp_out = (up * torch.rsqrt(ss / tail["latent_size"] + tail["eps"]) + shared).bfloat16()
+    return {"attention": (*attention_in, attention_out),
+            "mlp": (site["new_stream"], site["bank"], mlp_out)}
 
 
 class _Float64(ast.NodeTransformer):
@@ -272,8 +313,8 @@ def _dequant(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return (values * torch.exp2(scale.double() - 127)[..., None]).reshape(packed.shape[0], -1)
 
 
-def _reference_layers(weights: dict, experts: dict) -> list[nn.Module]:
-    """The checkpoint's decoder layers at the test widths in float64, on the test's weights."""
+def _reference_layers(weights: dict, experts: dict) -> tuple[list[nn.Module], typing.Callable]:
+    """The checkpoint's decoder layers in float64 on the test's weights, and its AttnRes mix."""
     spec = importlib.util.spec_from_file_location(
         "configuration_kimi_k3", CHECKPOINT / "configuration_kimi_k3.py")
     configuration = importlib.util.module_from_spec(spec)
@@ -306,7 +347,7 @@ def _reference_layers(weights: dict, experts: dict) -> list[nn.Module]:
                 value = weights[f"model.layers.{i}.{name}"].double().reshape(p.shape)
             setattr(layer.get_submodule(path), leaf, nn.Parameter(value, requires_grad=False))
         layer.eval()
-    return layers
+    return layers, scope["_apply_attn_res"]
 
 
 class _Past:
@@ -376,6 +417,53 @@ def _end_to_end(layers, embedding) -> list[list[dict]]:
     return rows
 
 
+def _chosen_by(gate, chosen: torch.Tensor):
+    """Hook ``gate`` to route to ``chosen``, weighted from its own scores as it weights its own."""
+    def route(_, args, __):
+        hidden = args[0].reshape(-1, args[0].shape[-1])
+        weight = F.linear(hidden, gate.weight).sigmoid().gather(1, chosen)
+        if gate.top_k > 1 and gate.moe_renormalize:
+            weight = weight / (weight.sum(-1, keepdim=True) + 1e-20)
+        return chosen, weight * gate.routed_scaling_factor
+    return gate.register_forward_hook(route)
+
+
+def _block(layer, mix, part: str, stream, bank, past, chosen=None) -> torch.Tensor:
+    """One reference block on one token's stream and bank rows at its site: its output."""
+    x = stream.double().view(1, H)
+    if part == "attention":
+        if bank.shape[1]:
+            x = mix(x, bank.double(), layer.self_attention_res_proj,
+                    layer.self_attention_res_norm)
+        cache = "cache_params" if layer.is_linear_attn else "past_key_values"
+        x = layer.input_layernorm(x.view(1, 1, H))
+        return layer.self_attn(hidden_states=x, **{cache: past}).reshape(-1)
+    x = mix(x, bank.double(), layer.mlp_res_proj, layer.mlp_res_norm)
+    x = layer.post_attention_layernorm(x.view(1, 1, H))
+    if not hasattr(layer, "block_sparse_moe"):
+        return layer.mlp(x).reshape(-1)
+    hook = _chosen_by(layer.block_sparse_moe.gate, chosen.view(1, -1))
+    try:
+        return layer.block_sparse_moe(x).reshape(-1)
+    finally:
+        hook.remove()
+
+
+def _blocks(layers, mix, records: list[dict], tp: int, chosen: dict) -> dict:
+    """Per block and layer, TP rank ``tp``'s outputs and the reference block's on its inputs."""
+    got, want = {}, {}
+    for i, layer in enumerate(layers):
+        for d in range(DP):
+            pasts = _pasts(layers, d)
+            for part, (stream, bank, out) in _port_blocks(records[d * TP + tp]["calls"], i).items():
+                got.setdefault((part, i), []).append(out)
+                for n in range(T):
+                    experts = chosen[i][d * T + n] if i in chosen else None
+                    want.setdefault((part, i), []).append(
+                        _block(layer, mix, part, stream[n], bank[n:n + 1], pasts[n], experts))
+    return {key: (torch.cat(got[key]), torch.stack(want[key])) for key in got}
+
+
 def _join(layers, records: list[dict], tp: int) -> list[list[dict]]:
     """Per layer, the 8 rows' reference taps on TP rank ``tp``'s own input to that layer."""
     rows = [[] for _ in range(LAYERS)]
@@ -413,6 +501,16 @@ def _reading(got: torch.Tensor, ref: torch.Tensor, rows: list[int]) -> tuple[flo
             ((got - ref).abs().max() / ref.abs().max()).item())
 
 
+def _chosen(records: list[dict], tp: int, n: int) -> torch.Tensor:
+    """The 8 rows' experts: the selection kernel on the inputs of each replica's expert call."""
+    rows = []
+    for d in range(DP):
+        call = records[d * TP + tp]["experts"][n]
+        picked = m.router_select(call["routed"][:, K:], call["bias"], scaling=1.0)[0]
+        rows.append(picked[d * T:(d + 1) * T])
+    return torch.cat(rows).long().sort(-1).values
+
+
 @pytest.fixture(scope="module")
 def world(tmp_path_factory) -> SimpleNamespace:
     """The port's records, the reference end to end and on each rank's own inputs, and routing."""
@@ -423,24 +521,22 @@ def world(tmp_path_factory) -> SimpleNamespace:
     mp.spawn(_rank, args=(root,), nprocs=TP * DP, join=True)
     records = [torch.load(root / f"rank{r}.pt") for r in range(TP * DP)]
     assert [len(r["calls"]) for r in records] == [2 * LAYERS] * (TP * DP)
-    assert [len(r["routed"]) for r in records] == [len(MOE_LAYERS)] * (TP * DP)
-    layers = _reference_layers(weights, experts)
-    with torch.no_grad():
-        ends, joins = _end_to_end(layers, weights["model.embed_tokens.weight"]), []
-        for tp in range(TP):
-            joins.append(_join(layers, records, tp))
+    assert [len(r["experts"]) for r in records] == [len(MOE_LAYERS)] * (TP * DP)
+    layers, mix = _reference_layers(weights, experts)
     ranks = []
-    for tp in range(TP):
-        rank = SimpleNamespace(join={}, end={})
-        rank.out = [torch.cat([_port_layer(records[d * TP + tp]["calls"], i)[2]
-                               for d in range(DP)]) for i in range(LAYERS)]
-        for n, j in enumerate(MOE_LAYERS):
-            bias = weights[f"model.layers.{j}.block_sparse_moe.gate.e_score_correction_bias"]
-            chosen = m.router_select(records[tp]["routed"][n][:, K:], bias, scaling=1.0)[0]
-            chosen = chosen.long().sort(-1).values
-            rank.join[j] = _routing(chosen, joins[tp][j], weights, j, TIE_JOIN)
-            rank.end[j] = _routing(chosen, ends[j], weights, j, TIE_END_TO_END[j])
-        ranks.append(rank)
+    with torch.no_grad():
+        ends = _end_to_end(layers, weights["model.embed_tokens.weight"])
+        joins = [_join(layers, records, tp) for tp in range(TP)]
+        for tp in range(TP):
+            rank = SimpleNamespace(join={}, end={}, chosen={})
+            rank.out = [torch.cat([_port_layer(records[d * TP + tp]["calls"], i)[2]
+                                   for d in range(DP)]) for i in range(LAYERS)]
+            for n, j in enumerate(MOE_LAYERS):
+                rank.chosen[j] = _chosen(records, tp, n)
+                rank.join[j] = _routing(rank.chosen[j], joins[tp][j], weights, j, TIE_JOIN)
+                rank.end[j] = _routing(rank.chosen[j], ends[j], weights, j, TIE_END_TO_END[j])
+            rank.blocks = _blocks(layers, mix, records, tp, rank.chosen)
+            ranks.append(rank)
     return SimpleNamespace(ends=ends, joins=joins, ranks=ranks)
 
 
@@ -456,6 +552,49 @@ def _end_rows(rank, i: int) -> list[int]:
     for j in (j for j in MOE_LAYERS if j <= i):
         rows = [r for r in rows if rank.end[j][0][r] != "moved"]
     return rows
+
+
+def _join_cap(rank, i: int) -> list[str]:
+    """The join's cap at layer ``i``, if more than 2 rows moved there."""
+    moved = rank.join[i][0].count("moved") if i in MOE_LAYERS else 0
+    if moved <= MOVED_JOIN:
+        return []
+    return [f"the join's cap passed at layer {i}: {moved} moved rows (at most {MOVED_JOIN})"]
+
+
+def _end_cap(rank, i: int) -> list[str]:
+    """The end-to-end cap at layer ``i``, if more than 6 rows left at or before it."""
+    for j in (j for j in MOE_LAYERS if j <= i):
+        out = DP * T - len(_end_rows(rank, j))
+        if out > MOVED_END_TO_END:
+            return [f"the end-to-end cap passed at layer {j}: {out} rows out "
+                    f"(at most {MOVED_END_TO_END})"]
+    return []
+
+
+def _grade(label: str, got, ref, rows: list[int], bounds: tuple, cap: list[str]) -> tuple:
+    """Print a reading beside its bounds; return its fails, and what a passed ``cap`` withdraws."""
+    cosine, error = bounds
+    if not rows:
+        print(f"{label}: no graded row; {'; '.join(cap)}")
+        return [], [f"{label}: no graded row; {'; '.join(cap) or 'no cap passed'}"]
+    cos, err = _reading(got, ref, rows)
+    inside = cos >= cosine and err <= error
+    print(f"{label}: {len(rows)} rows, cosine {cos:.7f} (at least {cosine}), error {err:.3e} "
+          f"(at most {error}){'' if inside else ', outside'}"
+          f"{'; withdrawn: ' + '; '.join(cap) if cap else ''}")
+    if cap:
+        return [], [f"{label}: {'; '.join(cap)}"]
+    return ([] if inside else [f"{label}: cosine {cos:.6f}, error {err:.2e}"]), []
+
+
+def _decide(item: str, fails: list[str], withdrawn: list[str]) -> None:
+    """Fail on a fail that no cap withdraws, naming any cap too; else fail on a passed cap."""
+    if fails:
+        caps = f"; caps passed: {'; '.join(withdrawn)}" if withdrawn else ""
+        pytest.fail(f"{item} fails: {'; '.join(fails)}{caps}")
+    if withdrawn:
+        pytest.fail(f"not adjudicable: {item}: {'; '.join(withdrawn)}")
 
 
 def test_reference_shares_inside_the_model(world):
@@ -476,45 +615,60 @@ def test_reference_shares_inside_the_model(world):
         print(f"layer {i} shares: " + ", ".join(f"{k} {v:.4f} (limit {b})"
                                                 for k, (v, b) in shares.items()))
         outside.update({(i, k): v for k, (v, b) in shares.items() if not v <= b})
-    assert not outside, f"not adjudicable, shares outside the model: {outside}"
+    if outside:
+        pytest.fail(f"not adjudicable: shares outside the model: {outside}")
 
 
 @pytest.mark.parametrize("layer", range(LAYERS))
 def test_join(world, layer):
     """Each rank's layer output on its own input matches the reference layer on that input."""
-    cosine, error = JOIN[layer]
-    over = {}
+    fails, withdrawn = [], []
     for tp, rank in enumerate(world.ranks):
         ref = torch.stack([tap["out"] for tap in world.joins[tp][layer]])
-        rows = _join_rows(rank, layer)
-        cos, err = _reading(rank.out[layer], ref, rows)
-        print(f"join layer {layer} TP rank {tp}: {len(rows)} rows, cosine {cos:.7f} (at least "
-              f"{cosine}), error {err:.3e} (at most {error})")
-        if not (cos >= cosine and err <= error):
-            over[tp] = f"cosine {cos:.6f}, error {err:.2e}"
-    assert not over, f"join layer {layer} outside its bounds, by TP rank: {over}"
+        f, w = _grade(f"join layer {layer} TP rank {tp}", rank.out[layer], ref,
+                      _join_rows(rank, layer), JOIN[layer], _join_cap(rank, layer))
+        fails, withdrawn = fails + f, withdrawn + w
+    _decide(f"join layer {layer}", fails, withdrawn)
 
 
 @pytest.mark.parametrize("layer", range(LAYERS))
 def test_end_to_end(world, layer):
     """Each rank's layer output matches the reference run end to end, on the rows still in."""
-    cosine, error = END_TO_END[layer]
     ref = torch.stack([tap["out"] for tap in world.ends[layer]])
-    over = {}
+    fails, withdrawn = [], []
     for tp, rank in enumerate(world.ranks):
-        rows = _end_rows(rank, layer)
-        cos, err = _reading(rank.out[layer], ref, rows)
-        print(f"end to end layer {layer} TP rank {tp}: {len(rows)} rows, cosine {cos:.7f} "
-              f"(at least {cosine}), error {err:.3e} (at most {error})")
-        if not (cos >= cosine and err <= error):
-            over[tp] = f"cosine {cos:.6f}, error {err:.2e}"
-    assert not over, f"end-to-end layer {layer} outside its bounds, by TP rank: {over}"
+        f, w = _grade(f"end to end layer {layer} TP rank {tp}", rank.out[layer], ref,
+                      _end_rows(rank, layer), END_TO_END[layer], _end_cap(rank, layer))
+        fails, withdrawn = fails + f, withdrawn + w
+    _decide(f"end to end layer {layer}", fails, withdrawn)
+
+
+def _block_item(world, part: str, layer: int, bounds: tuple) -> None:
+    """Grade one block on every rank's copy over the 8 rows; no cap reaches a block."""
+    fails = []
+    for tp, rank in enumerate(world.ranks):
+        got, ref = rank.blocks[(part, layer)]
+        fails += _grade(f"{part} block layer {layer} TP rank {tp}", got, ref,
+                        list(range(DP * T)), bounds, [])[0]
+    _decide(f"{part} block layer {layer}", fails, [])
+
+
+@pytest.mark.parametrize("layer", range(LAYERS))
+def test_attention_block(world, layer):
+    """Each rank's attention output on its own input matches the reference block's."""
+    _block_item(world, "attention", layer, ATTENTION_BLOCK[layer])
+
+
+@pytest.mark.parametrize("layer", range(LAYERS))
+def test_mlp_block(world, layer):
+    """Each rank's MLP or MoE output on its own input, on its experts, matches the reference's."""
+    _block_item(world, "mlp", layer, MLP_BLOCK[layer])
 
 
 @pytest.mark.parametrize("layer", MOE_LAYERS)
 def test_routing(world, layer):
     """Each row's 16 experts match the reference's unless its gap is under the tie gap."""
-    failed, capped = {}, {}
+    fails, withdrawn = [], []
     for tp, rank in enumerate(world.ranks):
         still = _end_rows(rank, layer - 1)
         for reading, (states, gaps, ties), rows in (("join", rank.join[layer], range(DP * T)),
@@ -522,13 +676,12 @@ def test_routing(world, layer):
             for r in rows:
                 print(f"routing layer {layer} TP rank {tp} {reading} row {r}: {states[r]}, "
                       f"gap {gaps[r]:.2e}, tie gap {ties[r]:.2e}")
-            failed.update({(tp, reading, r): f"gap {gaps[r]:.2e}, tie gap {ties[r]:.2e}"
-                           for r in rows if states[r] == "fail"})
-        moved_join = sum(state == "moved" for state in rank.join[layer][0])
+            fails += [f"TP rank {tp} {reading} row {r}: experts differ at gap {gaps[r]:.2e}, "
+                      f"tie gap {ties[r]:.2e}" for r in rows if states[r] == "fail"]
+        moved_join = rank.join[layer][0].count("moved")
         moved_end = DP * T - len(_end_rows(rank, layer))
         print(f"routing layer {layer} TP rank {tp}: moved rows {moved_join} in the join (at most "
               f"{MOVED_JOIN}), {moved_end} out of end to end (at most {MOVED_END_TO_END})")
-        if moved_join > MOVED_JOIN or moved_end > MOVED_END_TO_END:
-            capped[tp] = f"join {moved_join}, end to end {moved_end}"
-    assert not capped, f"not adjudicable, too many moved rows, by TP rank: {capped}"
-    assert not failed, f"experts differ at a gap past the tie gap: {failed}"
+        withdrawn += [f"TP rank {tp}: {cap}" for cap in
+                      _join_cap(rank, layer) + _end_cap(rank, layer)]
+    _decide(f"routing layer {layer}", fails, withdrawn)
