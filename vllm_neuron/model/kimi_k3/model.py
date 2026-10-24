@@ -18,6 +18,7 @@ import math
 import torch
 import torch.distributed as dist
 from torch import nn
+from torch.distributed import _functional_collectives as funcol
 from transformers import PretrainedConfig
 from vllm.distributed.parallel_state import get_tp_group, model_parallel_is_initialized
 
@@ -30,16 +31,17 @@ from vllm_neuron.functional.attention.mla_paged import (
 )
 from vllm_neuron.functional.attention import o_proj as output_projection
 from vllm_neuron.functional.attention.o_proj import o_proj, o_proj_tkg
-from vllm_neuron.functional.embedding import embedding
 from vllm_neuron.functional.kda.fused_decode import kda_fused_decode
 from vllm_neuron.functional.kda.output import kda_output_prefill
 from vllm_neuron.functional.moe.fused_tail import moe_fused_tail
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.model.neuron_config import NeuronConfig
 from vllm_neuron.nn.cpl import ColumnParallelLinear
+from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
 from vllm_neuron.nn.sampler import Sampler
 from vllm_neuron.utils.hardware_config import get_logical_nc_config
 from vllm_neuron.utils.neuron_utils import can_run_kernel
+from vllm_neuron.utils.weight_loader import set_weight_loader, sharding_weight_loader
 
 from . import weight_loaders_mxfp4
 from .config import KDA_LAYER_TYPE, KimiK3Config, KimiK3TextConfig
@@ -79,17 +81,62 @@ def _tp_group():
     return get_tp_group() if model_parallel_is_initialized() else None
 
 
-def _frozen(shape: tuple[int, ...], dtype: torch.dtype) -> nn.Parameter:
-    """An uninitialized parameter; the loader assigns the stored tensor."""
-    return nn.Parameter(torch.empty(shape, dtype=dtype), requires_grad=False)
+def _tp_rank_and_size() -> tuple[int, int]:
+    """This process's rank in the tensor-parallel group and the group's size."""
+    group = _tp_group()
+    return (group.rank_in_group, group.world_size) if group is not None else (0, 1)
+
+
+def _all_reduce(x: torch.Tensor) -> torch.Tensor:
+    """Sum ``x`` over the tensor-parallel group, in its own dtype; ``x`` itself on one rank."""
+    group = _tp_group()
+    if group is None or group.world_size == 1:
+        return x
+    return _waited(funcol.all_reduce(x, "sum", group.device_group))
+
+
+def _waited(x: torch.Tensor) -> torch.Tensor:
+    """``x`` as a plain tensor once its collective is done.
+
+    Run eagerly, a functional collective returns an async tensor, which the NKI kernels
+    cannot take; a traced graph never holds one.
+    """
+    return x.wait() if isinstance(x, funcol.AsyncCollectiveTensor) else x
+
+
+def _rank_tensor(rank: torch.Tensor | None, tp_size: int) -> torch.Tensor | None:
+    """The ``[1]`` int32 tensor-parallel rank the AttnRes kernel slices by, or None on one rank.
+
+    The rank is a graph input, so every rank traces the same graph.
+    """
+    if tp_size == 1:
+        return None
+    if rank is None:
+        raise ValueError(f"Kimi K3 at tensor-parallel size {tp_size} needs the rank tensor")
+    return rank.reshape(1).to(torch.int32)
+
+
+def _frozen(
+    shape: tuple[int, ...], dtype: torch.dtype, shard_dim: int | None = None
+) -> nn.Parameter:
+    """An uninitialized parameter; the loader assigns the stored tensor.
+
+    With ``shard_dim``, ``shape`` is this rank's shard and the loader reads the rank's
+    contiguous part of the stored tensor along that dim.
+    """
+    param = nn.Parameter(torch.empty(shape, dtype=dtype), requires_grad=False)
+    _, tp_size = _tp_rank_and_size()
+    if shard_dim is not None and tp_size > 1:
+        set_weight_loader(param, sharding_weight_loader(shard_dim, shape[shard_dim], tp_size))
+    return param
 
 
 class _Weight(nn.Module):
-    """A checkpoint module that holds one ``weight``."""
+    """A checkpoint module that holds one ``weight``, whole or this rank's shard."""
 
-    def __init__(self, shape: tuple[int, ...], dtype: torch.dtype):
+    def __init__(self, shape: tuple[int, ...], dtype: torch.dtype, shard_dim: int | None = None):
         super().__init__()
-        self.weight = _frozen(shape, dtype)
+        self.weight = _frozen(shape, dtype, shard_dim)
 
 
 class KimiK3RMSNorm(_Weight):
@@ -245,7 +292,11 @@ def _with_positions(meta: dict | None, positions: torch.Tensor | None) -> dict |
 
 
 class KimiK3KDA(nn.Module):
-    """Kimi Delta Attention: projections, short conv, gated delta rule, gated output."""
+    """Kimi Delta Attention: projections, short conv, gated delta rule, gated output.
+
+    Each tensor-parallel rank holds a contiguous group of heads, so ``o_proj`` gives
+    this rank's partial of the output.
+    """
 
     def __init__(self, text_config: KimiK3TextConfig):
         super().__init__()
@@ -253,22 +304,24 @@ class KimiK3KDA(nn.Module):
         if not cfg.get("use_full_rank_gate", False):
             raise ValueError("Kimi K3 KDA layers take a full-rank output gate")
         hidden, dtype = text_config.hidden_size, text_config.torch_dtype
-        self.num_heads, self.head_dim = int(cfg["num_heads"]), int(cfg["head_dim"])
+        _, tp_size = _tp_rank_and_size()
+        self.num_heads = text_config.kda_heads_per_rank(tp_size)
+        self.head_dim = int(cfg["head_dim"])
         width = self.num_heads * self.head_dim
         taps = int(cfg["short_conv_kernel_size"])
         self.eps = text_config.rms_norm_eps
         self.lower_bound = cfg.get("gate_lower_bound")
         for name in ("q_proj", "k_proj", "v_proj", "g_proj"):
-            setattr(self, name, _Weight((width, hidden), dtype))
+            setattr(self, name, _Weight((width, hidden), dtype, shard_dim=0))
         for name in ("q_conv1d", "k_conv1d", "v_conv1d"):
-            setattr(self, name, _Weight((width, 1, taps), torch.float32))
+            setattr(self, name, _Weight((width, 1, taps), torch.float32, shard_dim=0))
         self.f_a_proj = _Weight((self.head_dim, hidden), dtype)
-        self.f_b_proj = _Weight((width, self.head_dim), dtype)
-        self.b_proj = _Weight((self.num_heads, hidden), dtype)
-        self.A_log = _frozen((self.num_heads,), torch.float32)
-        self.dt_bias = _frozen((width,), torch.float32)
+        self.f_b_proj = _Weight((width, self.head_dim), dtype, shard_dim=0)
+        self.b_proj = _Weight((self.num_heads, hidden), dtype, shard_dim=0)
+        self.A_log = _frozen((self.num_heads,), torch.float32, shard_dim=0)
+        self.dt_bias = _frozen((width,), torch.float32, shard_dim=0)
         self.o_norm = _Weight((self.head_dim,), torch.float32)
-        self.o_proj = _Weight((hidden, width), dtype)
+        self.o_proj = _Weight((hidden, width), dtype, shard_dim=1)
         self.register_parameter("input_weight", None)
         self.register_buffer("conv_weight", None, persistent=False)
         self.register_buffer("forget_weight", None, persistent=False)
@@ -391,25 +444,33 @@ class KimiK3KDA(nn.Module):
 
 
 class KimiK3MLA(nn.Module):
-    """Multi-head latent attention without rotary (NoPE), with a sigmoid output gate."""
+    """Multi-head latent attention without rotary (NoPE), with a sigmoid output gate.
+
+    Each tensor-parallel rank holds a contiguous group of heads. ``q_a`` and ``kv_a`` load
+    whole: prefill projects the whole normed input with them, and decode projects the
+    rank's K slice with the rank's rows of them, then sums the partials over the group.
+    """
 
     def __init__(self, text_config: KimiK3TextConfig):
         super().__init__()
         c = text_config
         if not (c.mla_use_nope and c.mla_use_output_gate):
             raise ValueError("Kimi K3 MLA layers are NoPE with an output gate")
-        hidden, dtype, heads = c.hidden_size, c.torch_dtype, c.num_attention_heads
+        self.tp_rank, self.tp_size = _tp_rank_and_size()
+        hidden, dtype, heads = c.hidden_size, c.torch_dtype, c.mla_heads_per_rank(self.tp_size)
+        if hidden % self.tp_size:
+            raise ValueError(f"hidden size {hidden} does not split over {self.tp_size} ranks")
         q_head = c.qk_nope_head_dim + c.qk_rope_head_dim
         self.eps = c.rms_norm_eps
         self.q_a_proj = _Weight((c.q_lora_rank, hidden), dtype)
         self.q_a_layernorm = KimiK3RMSNorm(c.q_lora_rank, MLA_NORM_EPS, dtype)
-        self.q_b_proj = _Weight((heads * q_head, c.q_lora_rank), dtype)
+        self.q_b_proj = _Weight((heads * q_head, c.q_lora_rank), dtype, shard_dim=0)
         self.kv_a_proj_with_mqa = _Weight((c.kv_lora_rank + c.qk_rope_head_dim, hidden), dtype)
         self.kv_a_layernorm = KimiK3RMSNorm(c.kv_lora_rank, MLA_NORM_EPS, dtype)
         kv_b_rows = heads * (c.qk_nope_head_dim + c.v_head_dim)
-        self.kv_b_proj = _Weight((kv_b_rows, c.kv_lora_rank), dtype)
-        self.o_proj = _Weight((hidden, heads * c.v_head_dim), dtype)
-        self.g_proj = _Weight((heads * c.v_head_dim, hidden), dtype)
+        self.kv_b_proj = _Weight((kv_b_rows, c.kv_lora_rank), dtype, shard_dim=0)
+        self.o_proj = _Weight((hidden, heads * c.v_head_dim), dtype, shard_dim=1)
+        self.g_proj = _Weight((heads * c.v_head_dim, hidden), dtype, shard_dim=0)
         self.register_parameter("input_weight", None)
         self.register_parameter("gate_weight", None)
         self.register_buffer("latent_weight", None, persistent=False)
@@ -438,15 +499,18 @@ class KimiK3MLA(nn.Module):
     def prepare_after_load(self) -> None:
         """Lay out the weights the kernels read, once.
 
-        q_a and kv_a go to fp32 ``[H, Q + L]`` for decode, then stack as bf16 ``[H, Q + L]``;
-        g stacks as ``[H, HV]``; ``o_proj`` as ``[HV, H]``. g is projected alone at decode,
-        so it is its own stack rather than a slice of q_a's. ``q_b`` and ``kv_b`` take the
-        attention kernels' layouts, which replace them: ``q_b`` transposed, the ``k_nope``
-        rows of ``kv_b`` by head, and its value rows by head, transposed, in fp32.
+        The rank's K rows of q_a and kv_a go to fp32 ``[H / TP, Q + L]`` for decode, then the
+        whole weights stack as bf16 ``[H, Q + L]``; g stacks as ``[H, HV]``; ``o_proj`` as
+        ``[HV, H]``. g is projected alone at decode, so it is its own stack rather than a
+        slice of q_a's. ``q_b`` and ``kv_b`` take the attention kernels' layouts, which
+        replace them: ``q_b`` transposed, the ``k_nope`` rows of ``kv_b`` by head, and its
+        value rows by head, transposed, in fp32.
         """
         if self.input_weight is None:
             latent = torch.cat([self.q_a_proj.weight, self.kv_a_proj_with_mqa.weight])
-            self.latent_weight = latent.float().t().contiguous()
+            rows = latent.shape[1] // self.tp_size
+            k_rows = latent[:, self.tp_rank * rows : (self.tp_rank + 1) * rows]
+            self.latent_weight = k_rows.float().t().contiguous()
             self.input_weight = _stack(self.q_a_proj, self.kv_a_proj_with_mqa)
             self.gate_weight = _stack(self.g_proj)
         if self.w_uk is None:
@@ -498,24 +562,41 @@ class KimiK3MLA(nn.Module):
         return _prefill_projection(self._attend(latent, gate, meta), self.output_weight)
 
     def forward_decode(self, mix, k_slice, norm_weight, meta) -> torch.Tensor:
-        """One MLA decode step; ``k_slice`` is the normed fp32 K slice of the mix."""
-        latent = _output_projection(k_slice, self.latent_weight)
+        """One MLA decode step; returns this rank's ``[T, H]`` bf16 partial.
+
+        ``k_slice`` is the rank's normed fp32 K slice of the mix; the q_a and kv_a partials
+        sum over the tensor-parallel group in fp32.
+        """
+        latent = _all_reduce(_output_projection(k_slice, self.latent_weight))
         gate = _project(mix, self.gate_weight, norm_weight, self.eps)
         return _output_projection(self._attend(latent, gate, meta), self.output_weight)
 
 
 class KimiK3MLP(nn.Module):
-    """Gated SiTU MLP: the dense layer and the shared experts."""
+    """Gated SiTU MLP: the dense layer and the shared experts.
 
-    def __init__(self, text_config: KimiK3TextConfig, intermediate_size: int):
+    With ``reduce``, each tensor-parallel rank holds a contiguous part of the intermediate
+    width and the down projection's partials sum over the group.
+    """
+
+    def __init__(self, text_config: KimiK3TextConfig, intermediate_size: int, reduce: bool = False):
         super().__init__()
         hidden, dtype = text_config.hidden_size, text_config.torch_dtype
+        _, tp_size = _tp_rank_and_size()
+        self.reduce = reduce and tp_size > 1
+        if self.reduce:
+            if intermediate_size % tp_size:
+                raise ValueError(
+                    f"MLP width {intermediate_size} does not split over {tp_size} ranks"
+                )
+            intermediate_size //= tp_size
+        shard = (0, 1) if self.reduce else (None, None)
         self.eps = text_config.rms_norm_eps
         self.beta = text_config.activation_situ_beta or 1.0
         self.linear_beta = text_config.activation_situ_linear_beta
-        self.gate_proj = _Weight((intermediate_size, hidden), dtype)
-        self.up_proj = _Weight((intermediate_size, hidden), dtype)
-        self.down_proj = _Weight((hidden, intermediate_size), dtype)
+        self.gate_proj = _Weight((intermediate_size, hidden), dtype, shard_dim=shard[0])
+        self.up_proj = _Weight((intermediate_size, hidden), dtype, shard_dim=shard[0])
+        self.down_proj = _Weight((hidden, intermediate_size), dtype, shard_dim=shard[1])
         self.register_parameter("gate_up_weight", None)
         self.register_buffer("down_weight", None, persistent=False)
 
@@ -531,12 +612,15 @@ class KimiK3MLP(nn.Module):
         return situ_and_mul(gate, up, self.beta, self.linear_beta)
 
     def forward_prefill(self, mix, norm_weight) -> torch.Tensor:
-        """The MLP over a prefill chunk; returns this rank's ``[T, H]`` partial."""
-        return _prefill_projection(self.activation(mix, norm_weight), self.down_weight)
+        """The MLP over a prefill chunk: ``[T, H]``, summed over the group with ``reduce``."""
+        out = _prefill_projection(self.activation(mix, norm_weight), self.down_weight)
+        return _all_reduce(out) if self.reduce else out
 
     def forward_decode(self, mix, k_slice, norm_weight) -> torch.Tensor:
-        """The MLP at decode; returns the ``[T, H]`` bf16 partial."""
-        return _output_projection(_decode_layout(self.activation(mix, norm_weight)), self.down_weight)
+        """The MLP at decode: ``[T, H]`` bf16, summed over the group with ``reduce``."""
+        rows = _decode_layout(self.activation(mix, norm_weight))
+        out = _output_projection(rows, self.down_weight)
+        return _all_reduce(out) if self.reduce else out
 
 
 class KimiK3Router(nn.Module):
@@ -692,7 +776,7 @@ class KimiK3DecoderLayer(nn.Module):
         if _is_moe_layer(c, layer_idx):
             self.block_sparse_moe = KimiK3MoE(c, num_programs)
         else:
-            self.mlp = KimiK3MLP(c, c.intermediate_size)
+            self.mlp = KimiK3MLP(c, c.intermediate_size, reduce=True)
         self.input_layernorm = KimiK3RMSNorm(hidden, eps, dtype)
         self.post_attention_layernorm = KimiK3RMSNorm(hidden, eps, dtype)
         self.self_attention_res_norm = KimiK3RMSNorm(hidden, eps, dtype)
@@ -755,17 +839,18 @@ class KimiK3DecoderLayer(nn.Module):
         """One layer over a prefill chunk; returns the new stream."""
         mix, base = self.attention_mix(stream, bank)
         attn = self.self_attn.forward_prefill(mix, self.input_layernorm.weight, meta)
-        attn = attn.to(stream.dtype)
+        attn = _all_reduce(attn).to(stream.dtype)
         stream = attn if base is None else base + attn
         mix = self.mlp_mix(stream, bank)
         out = self.feed_forward.forward_prefill(mix, self.post_attention_layernorm.weight)
         return stream + out.to(stream.dtype)
 
-    def _mix_decode(self, stream, tail, bank, site: str):
+    def _mix_decode(self, stream, tail, bank, site: str, tp_rank=None):
         """AttnRes mix at decode with the producer's tail as its prologue.
 
         Returns the mix, the new stream, the bank and, at the MLA attention site and
-        the MoE site, the rank's normed fp32 K slice of the mix.
+        the MoE site, the normed fp32 K slice of the mix. At the MLA site the slice is
+        the columns of tensor-parallel rank ``tp_rank``; at the MoE site it is whole.
         """
         attention = site == "attention"
         if attention and self.attention_rows == 0:
@@ -778,6 +863,7 @@ class KimiK3DecoderLayer(nn.Module):
         emit_k_slice = (attention and not self.is_kda) or (
             not attention and hasattr(self, "block_sparse_moe")
         )
+        sliced = attention and emit_k_slice and tp_rank is not None
         mix, stream, k_slice, new_bank = attn_res_decode(
             bank,
             stream,
@@ -786,14 +872,21 @@ class KimiK3DecoderLayer(nn.Module):
             **_tail_args(tail, stream, self.latent_size),
             bank_slot=self.layer_idx // self.block_size if attention and self.block_start else None,
             norm_weight=norm.weight if emit_k_slice else None,
+            tp_rank=tp_rank if sliced else None,
+            tp_size=self.self_attn.tp_size if sliced else 1,
             eps=self.eps,
         )
         return mix, stream, k_slice, bank if new_bank is None else new_bank
 
-    def forward_decode(self, stream, tail, bank, meta):
-        """One decode layer; returns the stream, this layer's tail for the next mix, and the bank."""
-        mix, stream, k_slice, bank = self._mix_decode(stream, tail, bank, "attention")
+    def forward_decode(self, stream, tail, bank, meta, tp_rank=None):
+        """One decode layer; returns the stream, this layer's tail for the next mix, and the bank.
+
+        ``tp_rank`` is the ``[1]`` int32 tensor-parallel rank, or None on one rank. The
+        attention output is summed over the group before the next mix folds it in.
+        """
+        mix, stream, k_slice, bank = self._mix_decode(stream, tail, bank, "attention", tp_rank)
         attn = self.self_attn.forward_decode(mix, k_slice, self.input_layernorm.weight, meta)
+        attn = _all_reduce(attn)
         mix, stream, k_slice, bank = self._mix_decode(stream, attn, bank, "mlp")
         out = self.feed_forward.forward_decode(mix, k_slice, self.post_attention_layernorm.weight)
         return stream, out, bank
@@ -807,7 +900,13 @@ class KimiK3Model(nn.Module):
         c = text_config
         hidden, dtype, eps = c.hidden_size, c.torch_dtype, c.rms_norm_eps
         self.eps = eps
-        self.embed_tokens = _Weight((c.vocab_size, hidden), dtype)
+        group = _tp_group()
+        # Each rank holds a contiguous part of the vocabulary; the rows sum over the group.
+        self.embed_tokens = VocabDimShardedEmbedding(
+            c.vocab_size, hidden, dtype=dtype,
+            tp_group=group.device_group if group is not None else None,
+        )
+        self.embed_tokens.weight.requires_grad_(False)
         self.layers = nn.ModuleList(
             [KimiK3DecoderLayer(c, i, num_programs) for i in range(c.num_hidden_layers)]
         )
@@ -825,9 +924,12 @@ class KimiK3Model(nn.Module):
             self.output_attn_res_norm.weight, self.output_attn_res_proj.weight
         )
 
-    def embed(self, input_ids) -> tuple[torch.Tensor, torch.Tensor]:
-        """Embed ``[T]`` token ids: the stream ``[T, H]`` and an unwritten bank ``[T, R, H]``."""
-        stream = embedding(input_ids, self.embed_tokens.weight)
+    def embed(self, input_ids, rank=None) -> tuple[torch.Tensor, torch.Tensor]:
+        """Embed ``[T]`` token ids: the stream ``[T, H]`` and an unwritten bank ``[T, R, H]``.
+
+        ``rank`` is the tensor-parallel rank tensor that picks this rank's vocabulary rows.
+        """
+        stream = _waited(self.embed_tokens(input_ids, scatter_tokens=False, rank=rank))
         bank = stream.new_empty((stream.shape[0], self.num_bank_rows, stream.shape[1]))
         return stream, bank
 
@@ -835,12 +937,16 @@ class KimiK3Model(nn.Module):
         """AttnRes mix of the last stream with every bank row, prefill form."""
         return attn_res_prefill(bank, stream, self.output_score_w, self.eps)
 
-    def forward(self, input_ids, attn_metadata, is_prefill: bool, positions=None) -> torch.Tensor:
+    def forward(
+        self, input_ids, attn_metadata, is_prefill: bool, positions=None, rank=None
+    ) -> torch.Tensor:
         """Run every layer; returns the output mix ``[T, H]``, before the final norm.
 
         Each layer reads its cache group's metadata with the tokens' ``positions`` added.
+        ``rank`` is the tensor-parallel rank tensor, needed when the group has more than one rank.
         """
-        stream, bank = self.embed(input_ids)
+        tp_size = _tp_rank_and_size()[1]
+        stream, bank = self.embed(input_ids, rank if tp_size > 1 else None)
         metas = [
             _with_positions(attn_metadata.get(f"layers.{i}.self_attn"), positions)
             for i in range(len(self.layers))
@@ -849,9 +955,9 @@ class KimiK3Model(nn.Module):
             for layer, meta in zip(self.layers, metas):
                 stream = layer.forward_prefill(stream, bank, meta)
             return self.output_mix(stream, bank)
-        tail = None
+        tail, tp_rank = None, _rank_tensor(rank, tp_size)
         for layer, meta in zip(self.layers, metas):
-            stream, tail, bank = layer.forward_decode(stream, tail, bank, meta)
+            stream, tail, bank = layer.forward_decode(stream, tail, bank, meta, tp_rank)
         return self.output_mix_decode(stream, tail, bank)
 
     def output_mix_decode(self, stream, tail, bank) -> torch.Tensor:
@@ -1001,7 +1107,7 @@ class KimiK3ForConditionalGeneration(nn.Module):
             raise NotImplementedError("Kimi K3 serves text prompts only")
         meta = next(iter(attn_metadata.values()))
         is_prefill = meta["max_query_len"] > meta["decode_token_threshold"]
-        hidden = self.model(input_ids, attn_metadata, is_prefill, positions)
+        hidden = self.model(input_ids, attn_metadata, is_prefill, positions, rank)
         if sampling_positions is not None and (
             is_prefill or hidden.shape[0] != sampling_positions.shape[0]
         ):
