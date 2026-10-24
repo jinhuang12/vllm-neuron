@@ -84,10 +84,14 @@ class KimiK3ForConditionalGeneration(
         text_neuron_config: NeuronConfig | None,
         encoder_neuron_config: EncoderNeuronConfig | None,
     ) -> nn.Module:
-        """Build the language model implementation."""
-        from .model import KimiK3ForConditionalGeneration as Model
+        """Build the language model, with the vision tower when an encoder config is given."""
+        if encoder_neuron_config is None:
+            from .model import KimiK3ForConditionalGeneration as Model
 
-        return Model.from_configs(hf_config, text_neuron_config)
+            return Model.from_configs(hf_config, text_neuron_config)
+        from .vision_encoder import KimiK3VisionForConditionalGeneration as Model
+
+        return Model.from_configs(hf_config, text_neuron_config, encoder_neuron_config)
 
     @classmethod
     def get_vision_token_merge_factor(cls, hf_config: PretrainedConfig) -> int:
