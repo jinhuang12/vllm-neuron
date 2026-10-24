@@ -1363,6 +1363,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self.kv_connector_output: KVConnectorOutput | None = None
         # Full (2, ...) KV cache tensors for DI connector registration
         self._kv_cache_full_tensors: dict[str, torch.Tensor] = {}
+        # Each state layer's cache as [num_blocks, page bytes], for zeroing a slot
+        self._state_pages: dict[str, torch.Tensor] = {}
 
         # Initialize vLLM Sampler for proper token sampling
         logprobs_mode = getattr(
@@ -2976,6 +2978,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # Add spec_token_ids to token_ids_cpu.
             self.input_batch.update_req_spec_token_ids(req_state, scheduled_spec_tokens)
 
+        self._zero_new_state_slots(reqs_to_add)
         # Add the new or resumed requests to the persistent batch.
         # The smaller empty indices are filled first.
         for request in reqs_to_add:
@@ -3217,6 +3220,25 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         return config is not None and isinstance(
             config.kv_cache_groups[group_id].kv_cache_spec, MambaSpec
         )
+
+    def _zero_new_state_slots(self, reqs: list[CachedRequestState]) -> None:
+        """Zero the state slot of each request that starts from its first token.
+
+        A freed block keeps its last owner's bytes, and a 1-token prompt's only step is a
+        decode step, which reads its slot as the prior state.
+        """
+        if not self._state_pages:
+            return
+        for group_id, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            if not self._is_state_group(group_id):
+                continue
+            slots = sorted({req.block_ids[group_id][0] for req in reqs
+                            if req.num_computed_tokens == 0 and req.block_ids[group_id]})
+            if not slots:
+                continue
+            index = torch.tensor(slots, dtype=torch.long, device=self.device)
+            for layer_name in group.layer_names:
+                self._state_pages[layer_name].index_fill_(0, index, 0)
 
     def _block_table_device_tensor(self, group_id: int, buffer: Any) -> torch.Tensor:
         """Return the device block table of one KV-cache group.
@@ -10912,6 +10934,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
+        self._state_pages = {}
 
         # TODO do we need to initialize attn_backend?
 
@@ -11166,6 +11189,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     raw_tensor = kv_cache_raw_tensors[layer_name]
                     assert raw_tensor.numel() % page == 0
                     pages = raw_tensor.view(-1, page)
+                    self._state_pages[layer_name] = pages
                     states, offset = [], 0
                     for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
                         nbytes = math.prod(shape) * dtype.itemsize
