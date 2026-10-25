@@ -136,8 +136,10 @@ def run_mlp(hidden, add, w):
 def bound_reading(out, ref):
     """Worst error over the bf16 element bound with its row and column, elements over it, lowest row cosine."""
     out, ref = out.double().reshape(-1, ref.shape[-1]), ref.reshape(-1, ref.shape[-1])
+    diff = out - ref
+    assert torch.isfinite(diff).all(), f"{int((~torch.isfinite(diff)).sum())} differences are not finite"
     rms = ref.square().mean(-1, keepdim=True).sqrt()
-    excess = ((out - ref).abs() / (2 ** -7 * (ref.abs() + rms))).flatten()
+    excess = (diff.abs() / (2 ** -7 * (ref.abs() + rms))).flatten()
     worst = int(excess.argmax())
     cosine = F.cosine_similarity(out, ref, dim=-1).amin().item()
     return excess[worst].item(), divmod(worst, ref.shape[-1]), int((excess > 1.0).sum()), cosine

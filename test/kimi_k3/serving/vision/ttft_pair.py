@@ -452,6 +452,10 @@ def reduce(logs, windows, text_ttft, accepted_ttft):
         invalid["text TTFT"] = [f"{len(text_ttft)} text TTFT medians for {n_proc} processes"]
     if n_proc == 4 and not text_ttft:
         invalid["text TTFT"] = ["the extension holds no 8K, 1-user text run"]
+    if not all(math.isfinite(s) for _, s in windows):
+        invalid.setdefault("text term", []).append("a text-window merge sum is not finite")
+    if not all(math.isfinite(t) for t in (*text_ttft, *accepted_ttft)):
+        invalid.setdefault("text TTFT", []).append("a text TTFT median is not finite")
     rec.update(liveness=liveness, first_image_cost_ms=first_image,
                process_medians_ms=medians,
                text_windows=[{"calls": c, "sum_ms": s} for c, s in windows],
