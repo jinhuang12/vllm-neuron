@@ -219,10 +219,15 @@ def test_picks_equal_the_fp64_reference_with_whole_weights(ranks, inputs, markov
     warnings.warn(f"{len(near_ties)} near-ties (block, step, gap): {near_ties}")
     # The base logits of each rank's vocabulary part, over the largest reference value.
     part, scale = VOCAB // TP, base.abs().max()
-    gaps = [
-        float((s["base"].double() - base[..., r * part : (r + 1) * part]).abs().max() / scale)
-        for r, s in enumerate(ranks)
-    ]
+    gaps = []
+    for r, s in enumerate(ranks):
+        got, want = s["base"].double(), base[..., r * part : (r + 1) * part]
+        # Python's max over the ranks drops a NaN gap, so a non-finite logit fails here.
+        assert torch.equal(~torch.isfinite(got), ~torch.isfinite(want)), (
+            f"rank {r}: the base logits are non-finite where the reference is not, or the reverse"
+        )
+        finite = torch.isfinite(got) & torch.isfinite(want)
+        gaps.append(float((got - want).abs()[finite].max() / scale))
     warnings.warn(f"base-logit gap by rank {gaps}, band {BASE_BAND}")
     assert differing == [], f"{len(differing)} differing picks: {differing}"
     # Known-bad input: block 0's first pick moved to the closest id outside the band.

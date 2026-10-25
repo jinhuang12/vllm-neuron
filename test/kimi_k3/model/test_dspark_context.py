@@ -200,7 +200,14 @@ def test_rotary_table_equals_upstream_yarn_at_four_positions(ranks):
     for rank, state in enumerate(ranks):
         table = state["table"]
         assert (table.dtype, tuple(table.shape)) == (torch.float32, (4, ROPE)), rank
-        excess = (table.double() - expected).abs() - 2**-20 * expected.abs()
+        # NaN > 0 is false, so a non-finite entry fails here rather than count as inside.
+        differ = (~torch.isfinite(table) != ~torch.isfinite(expected)).any(-1)
+        positions = TABLE_POSITIONS[differ].tolist()
+        assert positions == [], (
+            rank, f"positions {positions}: non-finite where the reference is not, or the reverse"
+        )
+        finite = torch.isfinite(table) & torch.isfinite(expected)
+        excess = ((table.double() - expected).abs() - 2**-20 * expected.abs())[finite]
         assert int((excess > 0).sum()) == 0, (rank, excess.amax().item())
 
 
