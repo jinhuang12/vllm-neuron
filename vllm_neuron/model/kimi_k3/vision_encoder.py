@@ -682,7 +682,9 @@ class KimiK3VisionForConditionalGeneration(KimiK3ForConditionalGeneration):
             cos, sin, _ = grid_tables(self._tables, grids, bucket, part)
         else:
             pixels = torch.zeros((bucket, pixels.shape[1]), dtype=pixels.dtype, device=device)
-            cos = sin = torch.zeros((bucket, HEAD_DIM), dtype=torch.float32, device=device)
+            # Two allocations, as the warmup builds them: shared inputs trace a new program.
+            cos = torch.zeros((bucket, HEAD_DIM), dtype=torch.float32, device=device)
+            sin = torch.zeros((bucket, HEAD_DIM), dtype=torch.float32, device=device)
         pos_index, pos_weight, bound_min, bound_max = grid_inputs(grids, bucket, device, part)
         return {
             "pixel_values": pixels,
