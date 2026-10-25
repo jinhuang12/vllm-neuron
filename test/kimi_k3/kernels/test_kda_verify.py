@@ -392,7 +392,12 @@ def test_long_carried_state(reference):
             core, pages = step(x.to(device), source.to(device), rows, pages, weights, reference.lower,
                                reference.eps)
             want, kept_rows, kept_states = _oracle(reference, x.view(batch, WINDOW, COLUMNS), conv_rows, states)
-            excess, cos = _class_b(core.cpu()[..., 0].permute(1, 2, 0), want.reshape(-1, WIDTH))
+            out, ref = core.cpu()[..., 0].permute(1, 2, 0).reshape(-1, WIDTH), want.reshape(-1, WIDTH)
+            # Python's max and min below drop a NaN, so a non-finite output fails here.
+            assert torch.equal(~torch.isfinite(out), ~torch.isfinite(ref)), \
+                f"B {batch}, window {w}: the output is non-finite where the oracle is not, or the reverse"
+            finite = (torch.isfinite(out) & torch.isfinite(ref)).all(-1)
+            excess, cos = _class_b(out[finite], ref[finite])
             worst, cosine = max(worst, excess), min(cosine, cos)
             if w < CARRY_WINDOWS:
                 last = counts[:, w] - 1
