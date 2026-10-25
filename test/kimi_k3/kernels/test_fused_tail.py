@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -107,14 +108,29 @@ def _oracle(ref, combined, gate_up, weights):
                           rows.square().sum(-1, keepdim=True)], dim=-1)
 
 
-def _class_b(out, ref, hidden):
-    """Worst error over its class-B bound, and the lowest row cosine, per pack section."""
+def _class_b(out, ref, hidden, sections=3):
+    """Worst error over its class-B bound, and the lowest row cosine, per output section.
+
+    An output element that is non-finite where the oracle's is finite, or the reverse,
+    reads as a miss; the finite elements are graded.
+    """
     excess, cosine = 0.0, 1.0
-    for lo, hi in ((0, hidden), (hidden, 2 * hidden), (2 * hidden, 2 * hidden + 1)):
+    bounds = ((0, hidden), (hidden, 2 * hidden), (2 * hidden, 2 * hidden + 1))[:sections]
+    for lo, hi in bounds:
         o, r = out[:, lo:hi].double(), ref[:, lo:hi]
-        rms = r.square().mean(-1, keepdim=True).sqrt()
-        excess = max(excess, ((o - r).abs() / (2 ** -7 * (r.abs() + rms))).amax().item())
-        cosine = min(cosine, F.cosine_similarity(o, r, dim=-1).amin().item())
+        finite = torch.isfinite(r)
+        if not torch.equal(torch.isfinite(o), finite):
+            return math.inf, -1.0
+        o, r = o.where(finite, 0.0), r.where(finite, 0.0)
+        count = finite.sum(-1, keepdim=True).clamp(min=1)
+        rms = (r.square().sum(-1, keepdim=True) / count).sqrt()
+        error = ((o - r).abs() / (2 ** -7 * (r.abs() + rms))).where(finite, 0.0)
+        worst = error.amax().item()
+        rows = finite.any(-1)
+        lowest = F.cosine_similarity(o[rows], r[rows], dim=-1).amin().item() if rows.any() else 1.0
+        # A NaN reads as a miss: Python's max and min would drop it.
+        excess = max(excess, math.inf if math.isnan(worst) else worst)
+        cosine = min(cosine, -1.0 if math.isnan(lowest) else lowest)
     return excess, cosine
 
 

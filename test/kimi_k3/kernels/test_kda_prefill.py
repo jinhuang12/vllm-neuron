@@ -91,9 +91,15 @@ def _rounded(inputs):
 
 
 def _assert_class_f(got, want):
-    err = {name: [float(np.linalg.norm(a[h] - b[h]) / np.linalg.norm(b[h])) for h in range(H)]
+    """Each output is non-finite where the oracle is, and its finite elements are in class F per head."""
+    for name, a, b in zip(("out", "state"), got, want):
+        assert np.array_equal(np.isfinite(a), np.isfinite(b)), \
+            f"{name}: non-finite where the oracle is finite, or the reverse"
+    err = {name: [float(np.linalg.norm(np.where(np.isfinite(b[h]), a[h] - b[h], 0.0))
+                        / np.linalg.norm(np.where(np.isfinite(b[h]), b[h], 0.0))) for h in range(H)]
            for name, a, b in zip(("out", "state"), got, want)}
-    assert max(max(e) for e in err.values()) <= TOLERANCE, f"relative Frobenius error per head {err}"
+    # np.max keeps a NaN, which Python's max would drop.
+    assert np.max(list(err.values())) <= TOLERANCE, f"relative Frobenius error per head {err}"
 
 
 def test_correlated_rows_with_one_dominant_channel():
