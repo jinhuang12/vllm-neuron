@@ -251,9 +251,10 @@ class K3DSparkForCausalLM(nn.Module):
         )
         self.final_norm = KimiK3RMSNorm(c.hidden_size, c.rms_norm_eps, c.torch_dtype)
         self.markov_head = K3DSparkMarkovHead(c, self.tp_size)
-        # The target's modules, set by alias_target_head; none is allocated here.
+        # The target's embedding and stacked LM head, set by alias_target_head; none is
+        # allocated here.
         self.embed_tokens = None
-        self.lm_head = None
+        self.head_weights = None
         self.register_buffer("context_kv_weight", None, persistent=False)
         self.register_buffer("rope_table", None, persistent=False)
 
@@ -339,11 +340,14 @@ class K3DSparkForCausalLM(nn.Module):
             cache.index_copy_(0, context_slot_mapping, rows.to(cache.dtype))
 
     def compute_logits(self, hidden: torch.Tensor) -> torch.Tensor:
-        """Final norm and the target's LM head on ``[B, S, H]`` rows: ``[B, S, V / TP]`` bf16."""
+        """Final norm and the target's LM head on ``[B, S, H]`` rows: ``[B, S, V / TP]`` bf16.
+
+        Each stacked ``[H, V / 2TP]`` half is read in column parts of at most 2,560, in order.
+        """
         norm = self.final_norm
-        parts = self.lm_head.weight.split(_LOGIT_COLUMNS, dim=0)
+        parts = [part for half in self.head_weights for part in half.split(_LOGIT_COLUMNS, 1)]
         project = _require(qkv_proj_fp32acc, "fused norm and projection")
-        return torch.cat([project(hidden, w.t(), norm.weight, norm.eps) for w in parts], -1)
+        return torch.cat([project(hidden, w, norm.weight, norm.eps) for w in parts], -1)
 
     def _pick(self, logits: torch.Tensor) -> torch.Tensor:
         """The argmax over the whole vocabulary of this rank's ``[B, V / TP]`` logits."""
@@ -373,20 +377,23 @@ class K3DSparkForCausalLM(nn.Module):
         return torch.stack(picks, dim=1)
 
     def alias_target_head(self, target_model: nn.Module) -> None:
-        """Use the target's embedding and LM head modules; no weight is copied."""
-        embed, lm_head = target_model.model.embed_tokens, target_model.lm_head
-        c = self.config
-        vocab_rows = c.vocab_size // self.tp_size
-        if embed.weight.shape[-1] != c.hidden_size or tuple(lm_head.weight.shape) != (
-            vocab_rows, c.hidden_size
-        ):
+        """Use the target's embedding and its two stacked LM-head halves; no weight is copied."""
+        embed, halves = target_model.model.embed_tokens, target_model.head_weights
+        if halves is None:
             raise ValueError(
-                f"target embedding {tuple(embed.weight.shape)} and LM head "
-                f"{tuple(lm_head.weight.shape)} do not fit the drafter's hidden size "
-                f"{c.hidden_size} and vocabulary slice of {vocab_rows} rows"
+                "the target's LM head is not stacked yet: run its prepare_after_load first"
+            )
+        c = self.config
+        half = (c.hidden_size, c.vocab_size // self.tp_size // 2)
+        shapes = [tuple(w.shape) for w in halves]
+        if embed.weight.shape[-1] != c.hidden_size or shapes != [half, half]:
+            raise ValueError(
+                f"target embedding {tuple(embed.weight.shape)} and LM-head halves {shapes} "
+                f"do not fit the drafter's hidden size {c.hidden_size} and two {half} "
+                "halves of its vocabulary slice"
             )
         self.embed_tokens = embed
-        self.lm_head = lm_head
+        self.head_weights = halves
 
     def get_kv_spec(self) -> KVSpec:
         """One key-only latent cache per draft layer, as the target's MLA layers hold."""

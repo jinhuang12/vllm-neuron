@@ -161,18 +161,24 @@ def test_alias_makes_the_target_embedding_and_lm_head_the_drafters(draft_config)
         target = kimi_model.KimiK3ForConditionalGeneration.from_configs(
             get_config(str(TARGET), trust_remote_code=False)
         )
-    # Real storage for the two shared tensors only; untouched, so no page is written.
+    # Real storage for the embedding and the LM head only; the load step stacks the head.
     embed, head = target.model.embed_tokens, target.lm_head
     for module in (embed, head):
         shape = module.weight.shape
         module.weight = torch.nn.Parameter(torch.empty(shape, dtype=torch.bfloat16), False)
     draft = _draft(draft_config, size=1)
-    assert draft.embed_tokens is None and draft.lm_head is None
+    with pytest.raises(ValueError, match="prepare_after_load"):
+        draft.alias_target_head(target)
+    assert draft.embed_tokens is None and draft.head_weights is None
+    with _tp_rank(0, 1):
+        target.prepare_after_load()
+    halves = list(target.head_weights)
     draft.alias_target_head(target)
-    assert draft.embed_tokens.weight is embed.weight and draft.lm_head.weight is head.weight
+    assert draft.embed_tokens.weight is embed.weight
+    assert [id(w) for w in draft.head_weights] == [id(w) for w in halves]
     allocated = [t for t in draft.state_dict(keep_vars=True).values() if not t.is_meta]
     ptrs = sorted(t.untyped_storage().data_ptr() for t in allocated)
-    assert ptrs == sorted(t.untyped_storage().data_ptr() for t in (embed.weight, head.weight))
+    assert ptrs == sorted(t.untyped_storage().data_ptr() for t in (embed.weight, *halves))
 
 
 @pytest.fixture(scope="module")
