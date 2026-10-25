@@ -169,11 +169,71 @@ class KimiK3TextConfig:
         return cls(**kwargs)
 
 
+# The checkpoint's vision_config keys that the vision config renames.
+_VISION_CHECKPOINT_KEYS = {
+    "vt_hidden_size": "hidden_size",
+    "vt_intermediate_size": "intermediate_size",
+    "vt_num_attention_heads": "num_attention_heads",
+    "vt_num_hidden_layers": "num_hidden_layers",
+    "activation_func": "hidden_act",
+}
+
+
+@dataclass
+class KimiK3VisionConfig:
+    """Vision tower and projector config read from ``hf_config.vision_config``.
+
+    Field names follow the tower's terms; ``from_hf_config`` maps the
+    checkpoint's key names onto them. Defaults are the checkpoint's values.
+    """
+
+    patch_size: int = 14
+    merge_kernel_size: tuple[int, int] = (2, 2)
+    hidden_size: int = 1024
+    qkv_hidden_size: int = 1536
+    intermediate_size: int = 4096
+    num_attention_heads: int = 12
+    num_hidden_layers: int = 27
+    init_pos_emb_height: int = 64
+    init_pos_emb_width: int = 64
+    hidden_act: str = "gelu_pytorch_tanh"
+    projector_hidden_act: str = "gelu"
+    projector_ln_eps: float = 1e-5
+    text_hidden_size: int = 7168
+
+    @property
+    def merge_factor(self) -> int:
+        """Return how many patches the projector merges into one token."""
+        return math.prod(self.merge_kernel_size)
+
+    @property
+    def head_dim(self) -> int:
+        """Return the width of one attention head."""
+        return self.qkv_hidden_size // self.num_attention_heads
+
+    @classmethod
+    def from_hf_config(
+        cls, hf_vision_config: PretrainedConfig | dict
+    ) -> "KimiK3VisionConfig":
+        """Build the vision config from the HF ``vision_config`` sub-object."""
+        config_dict = _as_dict(hf_vision_config)
+        names = {f.name for f in fields(cls)}
+        kwargs = {}
+        for key, value in config_dict.items():
+            name = _VISION_CHECKPOINT_KEYS.get(key, key)
+            if name in names:
+                kwargs[name] = value
+        if "merge_kernel_size" in kwargs:
+            kwargs["merge_kernel_size"] = tuple(kwargs["merge_kernel_size"])
+        return cls(**kwargs)
+
+
 @dataclass
 class KimiK3Config:
-    """Top-level Kimi K3 config; only the language model is built."""
+    """Top-level Kimi K3 config: the language model and, when present, the vision tower."""
 
     text_config: KimiK3TextConfig
+    vision_config: KimiK3VisionConfig | None = None
     media_placeholder_token_id: int | None = None
     tie_word_embeddings: bool = False
 
@@ -200,8 +260,12 @@ class KimiK3Config:
         )
         tie = bool(top.get("tie_word_embeddings", text_config.tie_word_embeddings))
         text_config.tie_word_embeddings = tie
+        vision = top.get("vision_config")
         return cls(
             text_config=text_config,
+            vision_config=(
+                KimiK3VisionConfig.from_hf_config(vision) if vision is not None else None
+            ),
             media_placeholder_token_id=top.get("media_placeholder_token_id"),
             tie_word_embeddings=tie,
         )
