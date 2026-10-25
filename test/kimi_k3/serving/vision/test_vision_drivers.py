@@ -236,7 +236,8 @@ def test_eval_launch_print_only(tmp_path):
     assert tok["mmmu_pro_std10:check"] == [
         py, str(VISION / ".." / "check_samples.py"), "--candidate", "/runs/out/mmmu_pro_std10",
         "--reference", "/ref/seed-0/out"]
-    assert tok["serve"] == ["--gpu-memory-utilization", "0.90", "--max-model-len", "131072",
+    assert tok["serve"] == ["--trust-remote-code",
+                            "--gpu-memory-utilization", "0.90", "--max-model-len", "131072",
                             "--reasoning-parser", "kimi_k3", "--no-enable-prefix-caching",
                             "--served-model-name", NAME, "--limit-mm-per-prompt",
                             '{"image": 7}']

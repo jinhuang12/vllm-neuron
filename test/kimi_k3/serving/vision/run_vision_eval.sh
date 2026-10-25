@@ -77,7 +77,8 @@ REF_DIR=${REFERENCE_RUNS:-<reference run folder>}
 MA="model=$NAME,base_url=$BASE_URL/v1/chat/completions,tokenized_requests=False,tokenizer_backend=None,num_concurrent=8,timeout=7200,max_length=16384,max_retries=10,max_images=7"
 GK="max_gen_toks=2048,temperature=0,do_sample=false,reasoning_effort=none"
 SEED=0,1234,1234,1234
-SERVE=(--gpu-memory-utilization 0.90 --max-model-len 131072 --reasoning-parser kimi_k3
+SERVE=(--trust-remote-code
+       --gpu-memory-utilization 0.90 --max-model-len 131072 --reasoning-parser kimi_k3
        --no-enable-prefix-caching --served-model-name "$NAME" --limit-mm-per-prompt
        '{"image": 7}')
 CMD=(env "HF_HOME=${HF_HOME_DIR:-<offline cache>}" HF_DATASETS_OFFLINE=1 HF_HUB_OFFLINE=1
