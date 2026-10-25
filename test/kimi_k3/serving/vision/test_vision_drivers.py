@@ -304,7 +304,7 @@ def test_reducer_known_good(tmp_path):
 
 
 def test_reducer_known_bad(tmp_path):
-    """Item 8: all images first, a failed request, one image twice, no warm-ups: exit 2."""
+    """Item 8: all images first, a failed request, one image twice, no warm-ups, a NaN text sum or median: exit 2."""
     b = _log(tmp_path / "b.jsonl", "B")
     cases = {"image first": {"image_first": True}, "failed request": {"failed_pair": 10},
              "image twice": {"repeat_image": True}, "no warm-ups": {"drop": (1, 2, 3)}}
@@ -312,6 +312,12 @@ def test_reducer_known_bad(tmp_path):
         code, rec = _reduce(_log(tmp_path / f"{name}.jsonl", "A", **kw), b)
         assert (code, rec["result"]) == (2, "invalid run"), name
         assert list(rec["invalid"]) == ["A"], name
+    a = _log(tmp_path / "a.jsonl", "A")
+    for key, window, text in (("text term", "14:nan", 1000.0), ("text TTFT", "14:1.30", "nan")):
+        r = _run("ttft_pair.py", "--reduce", a, b, "--text-window", "14:1.31", "--text-window", window,
+                 "--text-ttft-ms", 1000.0, text, "--accepted-ttft-ms", 1000.0, 1000.0)
+        rec = json.loads(r.stdout)
+        assert (r.returncode, rec["result"], list(rec["invalid"])) == (2, "invalid run", [key]), key
 
 
 # vLLM's own chat renderer and image processor, as the server runs them.

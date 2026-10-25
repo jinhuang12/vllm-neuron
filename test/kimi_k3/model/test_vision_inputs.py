@@ -34,7 +34,9 @@ def _reference_order(h: int, w: int) -> torch.Tensor:
 def _ulps(got: torch.Tensor, want: torch.Tensor) -> float:
     """Largest error in units of the last place of the reference value."""
     spacing = torch.nextafter(want.abs(), torch.tensor(float("inf"))) - want.abs()
-    return ((got - want).abs() / spacing).max().item()
+    diff = got - want
+    assert torch.isfinite(diff).all(), f"{int((~torch.isfinite(diff)).sum())} differences are not finite"
+    return (diff.abs() / spacing).max().item()
 
 
 def _resize_error(wh, ww, table, grid) -> float:
@@ -44,7 +46,9 @@ def _resize_error(wh, ww, table, grid) -> float:
     )
     want = want.squeeze(0).permute(1, 2, 0)
     got = torch.einsum("ah,hwd,bw->abd", wh, table, ww)
-    return (got - want).abs().max().item()
+    diff = got - want
+    assert torch.isfinite(diff).all(), f"{int((~torch.isfinite(diff)).sum())} differences are not finite"
+    return diff.abs().max().item()
 
 
 def _fp64_weights(n: int) -> torch.Tensor:

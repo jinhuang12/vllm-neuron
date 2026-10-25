@@ -154,8 +154,10 @@ def reference(pixels, grid, w, layers: int = LAYERS) -> torch.Tensor:
 def bound_reading(got, ref):
     """Worst |got - ref| over 2^-7 (|ref| + row RMS of ref), and the lowest row cosine."""
     got, ref = got.double(), ref.double()
+    diff = got - ref
+    assert torch.isfinite(diff).all(), f"{int((~torch.isfinite(diff)).sum())} differences are not finite"
     rms = ref.square().mean(-1, keepdim=True).sqrt()
-    reading = ((got - ref).abs() / (2**-7 * (ref.abs() + rms))).max().item()
+    reading = (diff.abs() / (2**-7 * (ref.abs() + rms))).max().item()
     cosine = F.cosine_similarity(got, ref, dim=-1).min().item()
     return reading, cosine
 

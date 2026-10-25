@@ -207,7 +207,9 @@ def _split_half_rope(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
 
 def _relative_error(ours: torch.Tensor, ref: torch.Tensor) -> float:
     """Largest absolute difference over the reference's largest magnitude."""
-    return ((ours - ref).abs().max() / ref.abs().max()).item()
+    diff = ours - ref
+    assert torch.isfinite(diff).all(), f"{int((~torch.isfinite(diff)).sum())} differences are not finite"
+    return (diff.abs().max() / ref.abs().max()).item()
 
 
 def test_split_half_scores_equal_the_interleaved_reference(ranks):

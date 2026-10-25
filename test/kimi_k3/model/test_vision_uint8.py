@@ -321,8 +321,11 @@ def test_folded_patch_embed_matches_the_original_in_fp64(processed, tower_inputs
         normalized = ref["pixel_values"].double().reshape(n, -1)[_window(h, w)]
         corners = table[call["pos_index"][:, :n].long()]
         original = normalized @ weight + (corners * call["pos_weight"][:, :n].double().unsqueeze(-1)).sum(0)
+        diff = folded - original
+        assert torch.isfinite(diff).all(), (
+            f"grid {h} x {w}: {int((~torch.isfinite(diff)).sum())} differences are not finite")
         # The largest difference over the original's largest value, on the image's real rows.
-        errors.append(((folded - original).abs().max() / original.abs().max()).item())
+        errors.append((diff.abs().max() / original.abs().max()).item())
         print(f"grid {h} x {w}: {folded.dtype}, max relative error {errors[-1]:.3e}")
     assert max(errors) <= 1e-6, errors
 
