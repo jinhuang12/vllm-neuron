@@ -92,8 +92,14 @@ def _rank(rank: int, port: int, hidden, anchors, ties, out: str) -> None:
     rows = VOCAB // TP
     with safe_open(_head_file(), framework="pt") as f:
         stored = f.get_slice(LM_HEAD)[rank * rows : (rank + 1) * rows]
-        lm_head.weight = torch.nn.Parameter(stored, requires_grad=False)
-    target = types.SimpleNamespace(model=types.SimpleNamespace(embed_tokens=embed), lm_head=lm_head)
+    # The target as its load step leaves it: the head stacked as two [H, V / 2TP] halves.
+    halves = [torch.nn.Parameter(h.t().contiguous(), requires_grad=False) for h in stored.chunk(2)]
+    lm_head.weight = None
+    target = types.SimpleNamespace(
+        model=types.SimpleNamespace(embed_tokens=embed),
+        lm_head=lm_head,
+        head_weights=torch.nn.ParameterList(halves),
+    )
     draft.alias_target_head(target)
     # Keep the base logits as the picks use them, one entry per call.
     base, compute = [], draft.compute_logits
