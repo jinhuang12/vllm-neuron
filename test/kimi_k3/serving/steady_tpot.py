@@ -9,11 +9,12 @@ values, read against the bar, ``--bar-ms`` (default the registered bar). Guard: 
 request, the count of gaps after the first above 2x that request's median gap.
 
 Standard library only. Prints one JSON record. Exit 0 pass, 1 fail, 2 invalid run,
-3 not adjudicable (a nonzero guard count, or a spread above 10%).
+3 not adjudicable (a NaN or infinite timing, a nonzero guard count, or a spread above 10%).
 """
 
 import argparse
 import json
+import math
 import statistics
 import sys
 from pathlib import Path
@@ -59,6 +60,18 @@ def validity(result):
     return reasons
 
 
+def non_finite(runs):
+    """Return one entry per run, field and request that holds a NaN or infinite timing."""
+    found = []
+    for (p, k), (_, r) in sorted(runs.items()):
+        for field in ("itls", "ttfts"):
+            for i, row in enumerate(r.get(field, [])):
+                count = sum(not math.isfinite(g) for g in (row if field == "itls" else [row]))
+                if count:
+                    found.append({"run": f"{p}/{k}", "field": field, "request": i, "count": count})
+    return found
+
+
 def request_values(gaps_s):
     """Return (steady mean in ms, guard count) of one request's ITL list in seconds."""
     steady = [g * 1000.0 for g in gaps_s[1:]]
@@ -87,6 +100,10 @@ def reduce(results, bar_ms=BAR_MS):
     if invalid:
         record.update(result="invalid run", invalid=invalid)
         return INVALID, record
+    bad = non_finite(runs)
+    if bad:
+        record.update(result="not adjudicable", non_finite=bad)
+        return NOT_ADJUDICABLE, record
 
     per_run, guards, diagnostics = {}, {}, {}
     for (p, k), (name, r) in sorted(runs.items()):

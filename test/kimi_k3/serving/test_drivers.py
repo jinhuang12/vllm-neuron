@@ -332,6 +332,25 @@ def test_reducer_known_good(tmp_path):
     assert code == 3 and rec["spread"] == pytest.approx(4.0 / 32.0)
 
 
+def test_reducer_non_finite(tmp_path):
+    """A NaN gap or an infinite first-token time is not adjudicable, exit 3, naming the run
+    and the request; an invalid run stays exit 2."""
+    nan_gap = (("A", 1), (2, 3, float("nan")))
+    code, rec = _reduce(_cell(tmp_path / "gap", 37.6, spike=nan_gap))
+    assert (code, rec["result"]) == (3, "not adjudicable")
+    assert [(e["run"], e["field"], e["request"]) for e in rec["non_finite"]] == [
+        ("A/1", "itls", 2)]
+    cell = _cell(tmp_path / "ttft", 37.6)
+    result = json.loads((cell / "B-2.json").read_text())
+    result["ttfts"][4] = float("inf")
+    (cell / "B-2.json").write_text(json.dumps(result))
+    code, rec = _reduce(cell)
+    assert (code, rec["result"]) == (3, "not adjudicable")
+    assert [(e["run"], e["field"], e["request"]) for e in rec["non_finite"]] == [
+        ("B/2", "ttfts", 4)]
+    assert _reduce(_cell(tmp_path / "bad", 37.6, spike=nan_gap, failed_run=("B", 2)))[0] == 2
+
+
 def _samples(root, n_docs, flex):
     log = Path(root) / NAME
     log.mkdir(parents=True)
