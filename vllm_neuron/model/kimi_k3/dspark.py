@@ -23,6 +23,11 @@ from vllm_neuron.functional.argmax import argmax as distributed_argmax
 from vllm_neuron.functional.embedding import embedding
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.model.neuron_config import NeuronConfig
+from vllm_neuron.model.qwen3.dflash_model import (
+    _correct_target_positions_for_async,
+    _current_seq_lens,
+    _paged_slots,
+)
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
 from vllm_neuron.utils.weight_loader import set_weight_loader, sharding_weight_loader
 
@@ -34,6 +39,7 @@ from .model import (
     _require,
     qkv_proj_fp32acc,
     _tp_group,
+    _waited,
     _Weight,
 )
 
@@ -338,6 +344,81 @@ class K3DSparkForCausalLM(nn.Module):
             rows = torch.cat([attn.kv_a_layernorm(latent[:, i]), rope[:, i]], -1)
             cache = attn.kv_cache.view(-1, rows.shape[-1])
             cache.index_copy_(0, context_slot_mapping, rows.to(cache.dtype))
+
+    @torch.no_grad()
+    def forward(
+        self,
+        target_positions: torch.Tensor,
+        target_hidden_states: torch.Tensor,
+        last_token_indices: torch.Tensor,
+        attn_metadata: dict,
+        raw_sampled_token_ids: torch.Tensor,
+        prev_sampled_token_ids: torch.Tensor,
+        prev_num_draft_tokens: torch.Tensor,
+        req_indices_per_token: torch.Tensor,
+        cur_num_draft_tokens: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """One draft round after a target step: context write, block pass, then the picks.
+
+        Each target row's taps become context rows at its position. The block is the
+        anchor, the target's last accepted token, then mask tokens, at positions p to
+        p + k - 1, p being the context length; every row is picked, row j predicting
+        position p + j + 1. The proposer sets k, ``num_speculative_tokens``, and the
+        checkpoint's ``mask_token_id``.
+
+        Returns:
+            The anchor with the drafts ``[B, 1 + k]`` int32, and the drafts ``[B, k]``.
+        """
+        c, k = self.config, self.num_speculative_tokens
+        batch, device = last_token_indices.shape[0], target_hidden_states.device
+        valid = (raw_sampled_token_ids != -1) & (raw_sampled_token_ids < c.vocab_size)
+        valid_count = valid.sum(dim=1)
+        positions = _correct_target_positions_for_async(
+            target_positions, prev_sampled_token_ids, prev_num_draft_tokens,
+            req_indices_per_token, c.vocab_size,
+        )
+        context_lens = _current_seq_lens(
+            positions[last_token_indices], raw_sampled_token_ids, prev_sampled_token_ids,
+            prev_num_draft_tokens, cur_num_draft_tokens, c.vocab_size, k,
+            valid_per_req=valid_count,
+        )
+        block_positions = (context_lens[:, None] + torch.arange(k, device=device)).reshape(-1)
+
+        meta = attn_metadata[self.layers[0].cache_name]
+        table = meta["block_table_tensor"][:batch].to(torch.int32)
+        block_size, max_blocks = meta["block_size"], int(meta["max_blocks_per_seq"])
+        # Each target row's sequence, from the sequences' last-row boundaries; rows past
+        # the last one are padding and write the null block.
+        rows = torch.arange(target_hidden_states.shape[0], device=device)
+        row_seq = (rows[:, None] > last_token_indices[None, :]).sum(dim=1)
+        is_pad = row_seq >= batch
+        row_seq = row_seq.clamp(max=batch - 1)
+        slots = _paged_slots(positions, row_seq, table, block_size, max_blocks)
+        self.precompute_and_store_context_kv(
+            target_hidden_states, positions, torch.where(is_pad, 0, slots)
+        )
+
+        block_seq = torch.arange(batch * k, device=device) // k
+        block_meta = {
+            "slot_mapping": _paged_slots(block_positions, block_seq, table, block_size, max_blocks),
+            "block_size": block_size,
+            "block_table_tensor": table,
+            "max_blocks_per_seq": max_blocks,
+            "context_lens": context_lens.to(torch.int32),
+            "is_causal": True,
+        }
+        last = (valid_count - 1).clamp(min=0).unsqueeze(1).long()
+        anchors = raw_sampled_token_ids.gather(1, last).squeeze(1).to(torch.int32)
+        anchors = torch.where(valid_count > 0, anchors, torch.zeros_like(anchors))
+        masks = torch.full((batch, k - 1), self.mask_token_id, dtype=torch.int32, device=device)
+        ids = torch.cat([anchors[:, None], masks], dim=1)
+        rank = _tp_group().rank_in_group_tensor.reshape(1) if self.tp_size > 1 else None
+        embedded = _waited(self.embed_tokens(ids.reshape(-1), scatter_tokens=False, rank=rank))
+        hidden = self.block_pass(
+            embedded, block_positions, {layer.cache_name: block_meta for layer in self.layers}
+        )
+        drafts = self.sample_drafts(hidden, anchors)
+        return torch.cat([anchors[:, None], drafts], dim=1), drafts
 
     def compute_logits(self, hidden: torch.Tensor) -> torch.Tensor:
         """Final norm and the target's LM head on ``[B, S, H]`` rows: ``[B, S, V / TP]`` bf16.

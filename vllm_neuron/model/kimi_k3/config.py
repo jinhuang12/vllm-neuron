@@ -177,6 +177,16 @@ class KimiK3Config:
     media_placeholder_token_id: int | None = None
     tie_word_embeddings: bool = False
 
+    @property
+    def vocab_size(self) -> int:
+        """The language model's vocabulary size."""
+        return self.text_config.vocab_size
+
+    @property
+    def hidden_size(self) -> int:
+        """The language model's hidden size."""
+        return self.text_config.hidden_size
+
     @classmethod
     def from_configs(
         cls,

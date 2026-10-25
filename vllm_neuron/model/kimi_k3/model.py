@@ -45,11 +45,13 @@ from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.model.neuron_config import NeuronConfig
 from vllm_neuron.nn.cpl import ColumnParallelLinear
 from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
+from vllm_neuron.nn.rejection_sampler import rejection_sampler
 from vllm_neuron.nn.sampler import Sampler
 from vllm_neuron.parallel.neuron_parallel_state import get_wide_ep_group
 from vllm_neuron.utils.hardware_config import get_logical_nc_config
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 from vllm_neuron.utils.weight_loader import set_weight_loader, sharding_weight_loader
+from vllm_neuron.vllm.spec_decode.decorator import async_speculative_decoding
 
 from . import weight_loaders_mxfp4
 from .config import KDA_LAYER_TYPE, KimiK3Config, KimiK3TextConfig
@@ -1229,6 +1231,7 @@ def aux_layers_for_draft(draft_config, text_config: KimiK3TextConfig) -> tuple[i
     return tuple(i + 1 for i in ids)
 
 
+@async_speculative_decoding
 class KimiK3ForConditionalGeneration(nn.Module, SupportsEagle3):
     """Kimi K3 language model with its column-parallel LM head and on-device sampler."""
 
@@ -1367,6 +1370,7 @@ class KimiK3ForConditionalGeneration(nn.Module, SupportsEagle3):
         attn_metadata: dict | None = None,
         sampling_positions: torch.Tensor | None = None,
         sampling_params: torch.Tensor | None = None,
+        spec_decode_metadata=None,
         logit_mask: torch.Tensor | None = None,
         rank: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -1375,7 +1379,8 @@ class KimiK3ForConditionalGeneration(nn.Module, SupportsEagle3):
         """Run the decoder; returns sampled tokens and no logits, or logits without a sampler.
 
         With aux layers set, the joined taps come second: ``(tokens, taps, None)``, or
-        ``(logits, taps)`` without a sampler.
+        ``(logits, taps)`` without a sampler. At a verify step the tokens are the greedy
+        acceptance of the drafts, ``[B, k + 1]`` with -1 after each sequence's bonus token.
         """
         if inputs_embeds is not None:
             raise NotImplementedError("Kimi K3 serves text prompts only")
@@ -1393,7 +1398,10 @@ class KimiK3ForConditionalGeneration(nn.Module, SupportsEagle3):
         aux = (torch.cat(taps, dim=-1),) if taps else ()
         if self.sampler is None:
             return (logits, *aux) if aux else logits
-        return self.sample(logits, sampling_params, logit_mask, rank), *aux, None
+        tokens = self.sample(logits, sampling_params, logit_mask, rank)
+        if spec_decode_metadata is not None:
+            tokens = rejection_sampler(spec_decode_metadata, tokens)
+        return tokens, *aux, None
 
     def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         """Tap the stream each of ``layers`` reads; the forward then returns the taps."""
