@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import ast
 import json
+import math
 import os
 import typing
 from pathlib import Path
@@ -316,8 +317,19 @@ def test_long_carried_state(reference):
             x = _inputs(gen, tokens)
             core, conv_bank, state_bank = _run(reference, x, slots, conv_bank, state_bank)
             want, rows, states = _oracle(reference, x, rows, states)
-            excess, cos = _class_b(core, want)
-            worst, cosine = max(worst, excess), min(cosine, cos)
+            o, r = core.double(), want
+            finite = torch.isfinite(r)
+            if torch.equal(torch.isfinite(o), finite):
+                o, r = o.where(finite, 0.0), r.where(finite, 0.0)
+                rms = (r.square().sum(-1, keepdim=True) / finite.sum(-1, keepdim=True).clamp(min=1)).sqrt()
+                excess = ((o - r).abs() / (2 ** -7 * (r.abs() + rms))).where(finite, 0.0).amax().item()
+                graded = finite.any(-1)
+                cos = F.cosine_similarity(o[graded], r[graded], dim=-1).amin().item() if graded.any() else 1.0
+            else:
+                excess, cos = math.inf, -1.0
+            # A NaN reads as a miss: Python's max and min would drop it.
+            worst = max(worst, math.inf if math.isnan(excess) else excess)
+            cosine = min(cosine, -1.0 if math.isnan(cos) else cos)
         state_error = _class_f(state_bank[slots.long()], states)
         rows_exact = torch.equal(conv_bank[slots.long()].double(), rows)
         print(f"T {tokens}, {LONG_STEPS} steps: worst error / bound {worst:.3f}, lowest row "
