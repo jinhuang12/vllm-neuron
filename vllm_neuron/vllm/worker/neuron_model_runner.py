@@ -96,6 +96,7 @@ from vllm_neuron.model.neuron_config import (
 from libtorch_neuronx_lite.compile.capture_backend import CaptureComplete
 from vllm_neuron.vllm.sample.rejection_sampler import RejectionSampler
 from vllm_neuron.vllm.spec_decode.dflash import DFlashProposer
+from vllm_neuron.vllm.spec_decode.dspark import DSparkProposer
 from vllm_neuron.vllm.spec_decode.eagle import EagleProposer
 from vllm_neuron.vllm.platform import SO_DISABLED_MESSAGE
 from vllm_neuron.utils.bucket_utils import (
@@ -1220,6 +1221,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self.drafter: EagleProposer | DFlashProposer | None = None
         self.is_eagle3_spec = False
         self.is_dflash_spec = False
+        self.is_dspark_spec = False
         self._draft_token_ids = None
         # Async speculative decoding drafts rows by req_id. Only used at
         # batch-composition changes (e.g. prefills merging into bs-wide decode).
@@ -1238,6 +1240,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             elif self.speculative_config.method == "dflash":
                 self.is_dflash_spec = True
                 self.drafter = DFlashProposer(
+                    self.vllm_config, self.device, self.on_device_sampling
+                )
+            elif self.speculative_config.method == "dspark":
+                self.is_dspark_spec = True
+                self.drafter = DSparkProposer(
                     self.vllm_config, self.device, self.on_device_sampling
                 )
             else:
@@ -1537,7 +1544,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
     @property
     def is_spec_decode(self) -> bool:
-        return self.is_eagle3_spec or self.is_dflash_spec
+        return self.is_eagle3_spec or self.is_dflash_spec or self.is_dspark_spec
 
     @property
     def cp_rank(self) -> int:
@@ -1986,7 +1993,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         if self.is_spec_decode:
             if _supports_aux_hidden_states(self.model):
-                if self.is_dflash_spec:
+                if self.is_dspark_spec:
+                    assert isinstance(self.drafter, DSparkProposer)
+                    aux_layers = self.drafter.get_target_aux_hidden_state_layers()
+                    logger.info("Using DSpark auxiliary layers: %s", aux_layers)
+                elif self.is_dflash_spec:
                     assert isinstance(self.drafter, DFlashProposer)
                     aux_layers = self.drafter.get_target_aux_hidden_state_layers()
                     logger.info("Using DFlash auxiliary layers: %s", aux_layers)
@@ -5499,9 +5510,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         from vllm_neuron.utils.bucket_utils import get_bucket_for_count
 
         # Eagle uses 1 + k target positions followed by k - 1 recurrent
-        # draft positions. DFlash follows the target with a k + 1 query block.
+        # draft positions. DFlash follows the target with a k + 1 query block;
+        # DSpark's k-row block takes the same headroom.
         speculative_headroom = 2 * max_num_draft_tokens
-        if self.is_dflash_spec and max_num_draft_tokens > 0:
+        if (self.is_dflash_spec or self.is_dspark_spec) and max_num_draft_tokens > 0:
             speculative_headroom += 2
         needed_seq = max_decode_ctx_len + max(1, speculative_headroom)
         return get_bucket_for_count(
@@ -10781,7 +10793,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 dtype=torch.int32,
                 device=self.device,
             )
-            if self.is_dflash_spec:
+            if self.is_dflash_spec or self.is_dspark_spec:
                 async_spec_kwargs["cur_num_draft_tokens"] = cur_num_draft_tokens
             elif "prev_num_draft_tokens" not in async_spec_kwargs:
                 async_spec_kwargs["prev_num_draft_tokens"] = cur_num_draft_tokens
@@ -11416,7 +11428,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             drafter_kv_spec = self.drafter.model.get_kv_spec()
             for layer in drafter_kv_spec.layers:
                 layer_name = layer.name
-                all_kv_cache_specs[layer_name] = FullAttentionSpec(
+                # A key-only draft cache takes the target's key-only spec, so vLLM
+                # groups it with the target's layers of that width.
+                spec_cls = KeyOnlyAttentionSpec if layer.key_only else FullAttentionSpec
+                all_kv_cache_specs[layer_name] = spec_cls(
                     block_size=block_size,
                     num_kv_heads=layer.num_kv_heads,
                     head_size=layer.head_size,
