@@ -302,17 +302,18 @@ def test_replicated_experts_have_two_homes_and_one_map(world):
     """At 1 slot each replicated expert sits in exactly 2 ranks' banks, by one map on every rank."""
     slots, ranks = 1, world["ranks"]
     expected = _expected_banks(TP, LOCAL, slots)
-    want = {(k, i, e) for k, row in enumerate(expected) for i, e in enumerate(row)}
+    layout = {(k, i, e) for k, row in enumerate(expected) for i, e in enumerate(row)}
     differences, homes = 0, {}
     for rank, out in enumerate(ranks):
-        differences += len(want ^ {(k, i, e) for k, row in enumerate(out["map"])
-                                   for i, e in enumerate(row)})
+        differences += len(layout ^ {(k, i, e) for k, row in enumerate(out["map"])
+                                     for i, e in enumerate(row)})
         differences += sum(ids != expected[rank] for ids in out["bank"].values())
         for e in out["bank"]["gate_up_weight"]:
             homes.setdefault(e, []).append(rank)
-    replicated = {k * LOCAL + j for k in range(TP) for j in range(slots)}
-    wrong = {e: homes.get(e, []) for e in range(E)
-             if len(homes.get(e, [])) != (2 if e in replicated else 1)}
+    replicated = {k * LOCAL + j: _second_home(k, j, TP, slots)
+                  for k in range(TP) for j in range(slots)}
+    want = {e: sorted({e // LOCAL, replicated.get(e, e // LOCAL)}) for e in range(E)}
+    wrong = {e: sorted(homes.get(e, [])) for e in range(E) if sorted(homes.get(e, [])) != want[e]}
     assert (len(replicated), differences, wrong) == (TP * slots, 0, {})
 
 
