@@ -197,6 +197,9 @@ class NeuronConfig:
     gpt_oss_tail_hops: tuple[int, ...] = (8, 16)
     # Decode SP: all-reduce -> reduce-scatter + all-gather on token shards; Qwen3-32B MXFP8, tokens % TP == 0 only.
     enable_decode_sequence_parallel: bool = False
+    # Kimi K3 MoE: replica slots per expert rank, 0 to 4. Slot j holds a second copy of
+    # expert j of another rank, and decode runs each chosen expert on one of its homes.
+    expert_replica_slots: int = 0
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> "NeuronConfig":
@@ -283,6 +286,7 @@ class NeuronConfig:
             enable_decode_sequence_parallel=config_dict.get(
                 "enable_decode_sequence_parallel", False
             ),
+            expert_replica_slots=config_dict.get("expert_replica_slots", 0),
         )
 
     def __post_init__(self):
@@ -323,6 +327,14 @@ class NeuronConfig:
             raise ValueError(
                 "enable_decode_sequence_parallel must be a boolean, "
                 f"got {self.enable_decode_sequence_parallel}"
+            )
+        if (
+            not isinstance(self.expert_replica_slots, int)
+            or not 0 <= self.expert_replica_slots <= 4
+        ):
+            raise ValueError(
+                "expert_replica_slots must be an int from 0 to 4, "
+                f"got {self.expert_replica_slots}"
             )
         if (
             not isinstance(self.max_jump_forward_tokens, int)

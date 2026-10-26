@@ -74,6 +74,7 @@ depthwise_conv1d_silu = _optional_kernel("kda.depthwise_conv1d", "depthwise_conv
 routed_experts_mx = _optional_kernel("moe.routed_experts_mx", "routed_experts_mx")
 router_select = _optional_kernel("moe.routed_experts_mx", "router_select")
 routed_expert_tiles_mx = _optional_kernel("moe.routed_experts_mx", "routed_expert_tiles_mx")
+replica_experts = _optional_kernel("moe.routed_experts_mx", "replica_experts")
 
 
 def _require(kernel, op: str):
@@ -706,12 +707,20 @@ class KimiK3Router(nn.Module):
 
 
 class KimiK3Experts(nn.Module):
-    """The routed experts' repacked MXFP4 banks, one leading entry per expert."""
+    """The routed experts' repacked MXFP4 banks, one leading entry per expert.
 
-    def __init__(self, text_config: KimiK3TextConfig, num_experts: int, num_programs: int):
+    The banks hold this rank's ``num_experts`` own experts, then the experts whose global
+    ids are in ``replicas``.
+    """
+
+    def __init__(
+        self, text_config: KimiK3TextConfig, num_experts: int, num_programs: int, replicas=()
+    ):
         super().__init__()
+        self.replicas = list(replicas)
+        entries = num_experts + len(self.replicas)
         for part, (shape, dtype) in expert_bank_shapes(text_config, num_programs).items():
-            self.register_parameter(part, _frozen((num_experts, *shape), dtype))
+            self.register_parameter(part, _frozen((entries, *shape), dtype))
 
     def banks(self) -> list[torch.Tensor]:
         """The four bank parts in the loader's order."""
@@ -727,6 +736,10 @@ class KimiK3MoE(nn.Module):
     reduce-scatter sums the experts' partials and gives each rank its replica's rows by its
     latent columns. The block's output is this rank's fp32 pack ``[up | shared | sum of
     squares]``, which one sum over the tensor-parallel group completes.
+
+    With ``r`` replica slots (``NeuronConfig.expert_replica_slots``) each rank's bank also
+    holds a second copy of expert ``j < r`` of another rank, and at decode the expert kernel
+    runs each chosen expert on one of its two homes.
     """
 
     #: Rows per prefill call of the tile kernel, every local expert taking all of them.
@@ -750,9 +763,24 @@ class KimiK3MoE(nn.Module):
         self.eps = c.rms_norm_eps
         self.latent_size = latent
         self.scaling = c.routed_scaling_factor
-        self.local_experts = c.num_experts // ranks
+        self.local_experts = local = c.num_experts // ranks
+        slots = c.neuron_config.expert_replica_slots if c.neuron_config is not None else 0
+        if slots and not slots < min(ranks, local):
+            raise ValueError(
+                f"Kimi K3 MoE: {slots} replica slots need more than {slots} expert ranks "
+                f"and experts per rank, got {ranks} and {local}"
+            )
+        self.replica_slots = slots
+        #: The global expert ids of each expert rank's bank, the same on every rank: its own
+        #: experts, then its replicas.
+        self.replica_map = [list(range(k * local, (k + 1) * local)) for k in range(ranks)]
+        if slots:
+            place = _require(replica_experts, "routed experts")
+            for k, ids in enumerate(self.replica_map):
+                ids += place(k, ranks, local, slots)
+        rank = group.rank_in_group if group is not None else 0
         self.gate = KimiK3Router(c)
-        self.experts = KimiK3Experts(c, self.local_experts, num_programs)
+        self.experts = KimiK3Experts(c, local, num_programs, self.replica_map[rank][local:])
         self.shared_experts = KimiK3MLP(
             c, c.moe_intermediate_size * c.num_shared_experts, split=True
         )
@@ -805,6 +833,7 @@ class KimiK3MoE(nn.Module):
             scaling=self.scaling,
             replicas=_replicas(),
             chunks=_tp_rank_and_size()[1],
+            replica_slots=self.replica_slots,
         )
 
     def _combine(self, partial) -> torch.Tensor:
