@@ -67,10 +67,9 @@ GATE_INPUT = 12.0
 LIFT = 8.0
 NAN_ROW = 6
 KEY = "language_model.model.layers.{layer}.block_sparse_moe.{name}"
-#: The largest share of a case's intermediate codes that may differ from the oracle's:
-#: three times the share an emulated correct kernel flips at the device MX product noise
-#: measured on that case's own operands. None is not yet set.
-CODE_LIMITS = {
+#: p per case, as filed: the share of its intermediate codes an emulated correct kernel flips
+#: at the device MX product noise measured on that case's own operands. None is not yet filed.
+CODE_NOISE = {
     "correlated rows, T 1, 3 slots": None,
     "correlated rows, T 8, 3 slots": None,
     "correlated rows, T 32, 3 slots": None,
@@ -81,6 +80,8 @@ CODE_LIMITS = {
     "small near-equal rows, T 8, 3 slots": None,
     "clean rows, T 8, 3 slots": None,
 }
+#: R per case: the largest share of its intermediate codes that may differ from the oracle's.
+CODE_LIMITS = {label: None if p is None else 3 * p for label, p in CODE_NOISE.items()}
 #: Rows averaged into each small row: its scale is 1 / sqrt of this.
 AVERAGED_ROWS = 131072
 FP4_VALUES = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
