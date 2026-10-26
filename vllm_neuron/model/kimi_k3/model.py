@@ -13,6 +13,7 @@ its MLP output (the tail) to the next layer's first mix instead of adding it its
 """
 
 import importlib
+import inspect
 import math
 
 import torch
@@ -1231,6 +1232,37 @@ def aux_layers_for_draft(draft_config, text_config: KimiK3TextConfig) -> tuple[i
     return tuple(i + 1 for i in ids)
 
 
+def _positional_arguments(cls: type) -> type:
+    """Let the async-decorated forward take the original forward's arguments by position.
+
+    The decorator's wrapper takes ``positions`` and ``attn_metadata`` by keyword only, so a
+    positional call would pass them twice. This binds each positional argument to its name
+    in the original signature, then calls the wrapper with keywords only.
+    """
+    names = tuple(
+        name
+        for name, param in inspect.signature(cls._original_forward).parameters.items()
+        if param.kind is param.POSITIONAL_OR_KEYWORD
+    )[1:]
+    decorated = cls.forward
+
+    def forward(self, *args, **kwargs):
+        if len(args) > len(names):
+            raise TypeError(f"forward() takes {len(names)} positional arguments, {len(args)} given")
+        for name, value in zip(names, args):
+            if name in kwargs:
+                raise TypeError(f"forward() got multiple values for argument '{name}'")
+            kwargs[name] = value
+        return decorated(self, **kwargs)
+
+    forward.__doc__ = decorated.__doc__
+    forward.__qualname__ = f"{cls.__qualname__}.forward"
+    forward.__wrapped__ = decorated
+    cls.forward = forward
+    return cls
+
+
+@_positional_arguments
 @async_speculative_decoding
 class KimiK3ForConditionalGeneration(nn.Module, SupportsEagle3):
     """Kimi K3 language model with its column-parallel LM head and on-device sampler."""
@@ -1370,10 +1402,11 @@ class KimiK3ForConditionalGeneration(nn.Module, SupportsEagle3):
         attn_metadata: dict | None = None,
         sampling_positions: torch.Tensor | None = None,
         sampling_params: torch.Tensor | None = None,
-        spec_decode_metadata=None,
         logit_mask: torch.Tensor | None = None,
         rank: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        *,
+        spec_decode_metadata=None,
         **kwargs,
     ):
         """Run the decoder; returns sampled tokens and no logits, or logits without a sampler.
