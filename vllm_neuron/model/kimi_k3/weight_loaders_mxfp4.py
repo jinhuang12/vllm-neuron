@@ -196,16 +196,18 @@ def checkpoint_mappings(
 
     Returns the mappings and the F32 dtype overrides. ``expert_ids`` names the
     experts each bank holds, in order; the default is the first ``E`` experts,
-    where ``E`` is the bank's leading size.
+    where ``E`` is the bank's leading size less its replicas. A bank module's
+    ``replicas`` attribute names the experts it holds after those, in order.
     """
     mappings: dict[str, str | list[str]] = {}
     for name, param in model.named_parameters():
         prefix, _, leaf = name.rpartition(".")
         if prefix.endswith(_EXPERTS) and leaf in EXPERT_PARTS:
-            ids = expert_ids if expert_ids is not None else range(param.shape[0])
+            replicas = list(getattr(model.get_submodule(prefix), "replicas", ()))
+            own = expert_ids if expert_ids is not None else range(param.shape[0] - len(replicas))
             mappings[name] = [
                 f"{CHECKPOINT_PREFIX}{prefix}.{e}.{src}"
-                for e in ids
+                for e in [*own, *replicas]
                 for src in _PART_SOURCES[leaf]
             ]
             set_weight_loader(param, expert_bank_loader(leaf, num_programs))

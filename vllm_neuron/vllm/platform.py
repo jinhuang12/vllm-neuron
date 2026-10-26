@@ -1055,8 +1055,13 @@ class NeuronPlatform(Platform):
             return
 
         tp_size = vllm_config.parallel_config.tensor_parallel_size
-        num_kv_heads = vllm_config.model_config.get_total_num_kv_heads()
-        num_q_heads = vllm_config.model_config.hf_config.num_attention_heads
+        model_config = vllm_config.model_config
+        # MLA decode is MQA: every query head attends the one shared latent.
+        num_kv_heads = (
+            1 if model_config.use_mla else model_config.get_total_num_kv_heads()
+        )
+        # The text config's count; a multimodal top-level config may not set it.
+        num_q_heads = model_config.model_arch_config.total_num_attention_heads
 
         block_size = vllm_config.cache_config.block_size
         long_prefill_token_threshold = (

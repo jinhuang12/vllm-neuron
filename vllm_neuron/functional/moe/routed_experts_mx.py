@@ -16,6 +16,17 @@ A token whose logits or latent row hold a non-finite value chooses no expert and
 gets a NaN output row; its non-finite latent values stream as zeros. All three use
 selects.
 
+With ``r`` replica slots the bank holds the rank's own experts, then ``r`` replicas:
+slot ``j`` of rank ``k``'s experts has a second home on rank ``k + 1 + j*(R // (r +
+1))`` mod ``R``, ``R`` the expert ranks. Every rank holds every token's logits, so
+every rank makes the same choice. A chosen expert with no replica runs on its home.
+The chosen experts with a replica are taken slot by slot, then by bit ``v`` of the
+home rank (``2^v`` the largest power of two dividing the slot's rank offset), then
+by rank, and each runs on whichever of its two homes has run fewer chosen experts
+so far, its own home on a tie. Within one slot and bit no two experts share a home,
+so the kernel takes each such group at once. The loop then visits the bank entries
+this rank runs. Where the kernel cannot run, a torch branch computes the same partial.
+
 At prefill a second kernel runs each local expert on the rows gathered for it, in
 128-row tiles, with every expert at a static address; under LNC 2 the programs take
 alternate experts, each the full expert width.
@@ -44,6 +55,7 @@ from nkilib.core.utils.kernel_assert import kernel_assert
 import torch
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 from vllm_neuron.utils.hardware_config import get_logical_nc_config
+from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 TOP_K = 16
 #: Added to the sum of the chosen scores before the renormalizing division.
@@ -80,6 +92,24 @@ def router_select(
         logits=logits, score_bias=score_bias, scaling=scaling)
 
 
+def replica_shifts(ranks: int, slots: int) -> tuple[int, ...]:
+    """Rank offset of each replica slot: slot ``j`` of rank ``k`` is also on rank ``k + shift[j]`` mod ``ranks``."""
+    return tuple((1 + j * (ranks // (slots + 1))) % ranks for j in range(slots))
+
+
+def replica_experts(rank: int, ranks: int, own: int, slots: int) -> list[int]:
+    """Global ids of the experts in ``rank``'s replica slots, in bank order after its own experts."""
+    return [own * ((rank - shift) % ranks) + j for j, shift in enumerate(replica_shifts(ranks, slots))]
+
+
+def _replica_groups(ranks: int, slots: int):
+    """The choice order as groups ``(slot, shift, bit, side)``: the ranks whose bit ``bit`` is ``side``, ascending."""
+    for j, shift in enumerate(replica_shifts(ranks, slots)):
+        bit = (shift & -shift).bit_length() - 1
+        for side in (0, 1):
+            yield j, shift, bit, side
+
+
 def routed_experts_mx(
     routed: torch.Tensor,
     score_bias: torch.Tensor,
@@ -94,14 +124,16 @@ def routed_experts_mx(
     replicas: int = 2,
     chunks: int = 32,
     expose_codes: bool = False,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    replica_slots: int = 0,
+) -> torch.Tensor | tuple[torch.Tensor, ...]:
     """Return this rank's routed-expert partial of ``T`` decode tokens in combine order.
 
     Args:
         routed: ``[T, D + E]`` fp32: the latent rows, then the router logits.
         score_bias: ``[E]`` fp32 score correction bias.
-        expert_base: ``[1, 1]`` int32 global id of this rank's first local expert.
-        gate_up_weight, gate_up_scale, down_weight, down_scale: the local bank.
+        expert_base: ``[1, 1]`` int32 global id of this rank's first own expert.
+        gate_up_weight, gate_up_scale, down_weight, down_scale: the local bank: the own
+            experts, then the ``replica_slots`` replicas of :func:`replica_experts`.
         beta: SiTU gate beta.
         linear_beta: SiTU up beta.
         scaling: routed scaling factor.
@@ -109,6 +141,8 @@ def routed_experts_mx(
         chunks: column chunks ``C`` per replica in the combine.
         expose_codes: a test mode that also returns each visited expert's MXFP8
             intermediate, the input of its down product.
+        replica_slots: replicas ``r`` at the end of the bank; the expert ranks are
+            ``E / (bank entries - r)``, a power of two above ``r``.
 
     Returns:
         ``[R, C, T/R, D/C]`` fp32: entry ``[r, c, t, j]`` is token ``r*T/R + t``,
@@ -118,11 +152,25 @@ def routed_experts_mx(
         rows rounded up to even: byte ``j`` of code ``[e, g, p, k*P + t]`` is the e4m3
         code of row ``t`` at intermediate index ``g*I/G + k*512 + 4p + j``, and scale
         ``[e, g, 32q + r, k*P + t]`` is the E8M0 scale of that row's 32 values from
-        ``g*I/G + k*512 + 32(4q + r)``.
+        ``g*I/G + k*512 + 32(4q + r)``. With replica slots the test mode also returns
+        ``[1, E]`` fp32, nonzero at each bank entry the loop visits, and the whole choice,
+        ``[1, 2rR]`` fp32: entry ``j*R + k`` is 1 where expert ``j`` of rank ``k`` is chosen
+        and runs on rank ``k``, entry ``(r + j)*R + k`` 1 where it runs on its other home.
     """
     tokens = routed.shape[0]
     experts, programs, _, _, packed = gate_up_weight.shape
     latent = packed
+    own = experts - replica_slots
+    ranks = score_bias.shape[0] // max(own, 1)
+    assert 0 <= replica_slots < own and own * ranks == score_bias.shape[0], (
+        f"{experts} bank entries less {replica_slots} replicas must divide {score_bias.shape[0]} experts")
+    assert not replica_slots or replica_slots < ranks, f"{replica_slots} replicas need more ranks than {ranks}"
+    if not can_run_kernel(routed):
+        assert not expose_codes, "the test mode reads the kernel's codes"
+        return _torch_routed_experts(routed, score_bias, expert_base, gate_up_weight, gate_up_scale,
+                                     down_weight, down_scale, beta, linear_beta, scaling, replicas,
+                                     chunks, replica_slots)
+    assert not replica_slots or ranks & (ranks - 1) == 0, f"the kernel needs a power of two ranks, got {ranks}"
     assert routed.dtype == score_bias.dtype == torch.float32, "routed and score_bias must be fp32"
     assert expert_base.dtype == torch.int32 and tuple(expert_base.shape) == (1, 1), (
         "expert_base must be [1, 1] int32"
@@ -156,7 +204,96 @@ def routed_experts_mx(
         replicas=replicas,
         chunks=chunks,
         expose_codes=expose_codes,
+        replica_slots=replica_slots,
     )
+
+
+def _mx8_torch(values: torch.Tensor) -> torch.Tensor:
+    """bf16 rounding, then MXFP8 e4m3 over 32 consecutive values of the last dimension, back to fp32."""
+    groups = values.bfloat16().float().reshape(*values.shape[:-1], -1, 32)
+    amax = groups.abs().amax(-1, keepdim=True)
+    exponent = torch.where(amax > 0, torch.floor(torch.log2(amax.clamp_min(1e-30))) - 7, 0.0)
+    codes = (groups / torch.exp2(exponent)).to(torch.float8_e4m3fn).float()
+    return (codes * torch.exp2(exponent)).reshape(values.shape)
+
+
+def _fp4_values(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """uint16 ``[out, in/4]`` MXFP4 (low nibble first) and E8M0 scales ``[out, in/32]`` as fp32 ``[out, in]``."""
+    table = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6])
+    raw = packed.contiguous().view(torch.uint8)
+    nibbles = torch.stack([raw & 15, raw >> 4], dim=-1).reshape(raw.shape[0], -1, 32).long()
+    return (table[nibbles] * torch.exp2(scale.float() - 127)[..., None]).reshape(raw.shape[0], -1)
+
+
+def _unslot(scale: torch.Tensor) -> torch.Tensor:
+    """A 3-slot scale tile ``[G, 48, B/3*512]`` as ``[G, 16, B, 512]``."""
+    programs, _, width = scale.shape
+    return scale.view(programs, 4, 3, 4, width // 512, 512).permute(0, 1, 3, 2, 4, 5).reshape(
+        programs, 16, -1, 512)
+
+
+def _expert_weights(bank, e):
+    """Bank entry ``e`` as fp32 gate and up ``[I, D]`` and down ``[D, I]``, the inverse of the loader's repack."""
+    gate_up_weight, gate_up_scale, down_weight, down_scale = bank
+    programs, two_ni, _, cols = gate_up_weight.shape[1:]
+    ni, nk, nd = two_ni // 2, cols // _KT, down_weight.shape[2]
+    width, latent = programs * ni * _KT, nk * _KT
+    gu = gate_up_weight[e].view(programs, 2, ni, 128, nk, _KT).permute(1, 0, 2, 5, 4, 3)
+    gu_s = _unslot(gate_up_scale[e]).view(programs, 16, 2, ni, nk, _KT).permute(2, 0, 3, 5, 4, 1)
+    gate_up = _fp4_values(gu.reshape(2 * width, latent // 4), gu_s.reshape(2 * width, latent // 32))
+    dw = down_weight[e].view(programs, nd, 128, ni, _KT).permute(1, 4, 0, 3, 2)
+    dw_s = _unslot(down_scale[e]).view(programs, 16, nd, ni, _KT).permute(2, 4, 0, 3, 1)
+    down = _fp4_values(dw.reshape(latent, width // 4), dw_s.reshape(latent, width // 32))
+    return gate_up[:width], gate_up[width:], down
+
+
+def _replica_runs(hit: list[bool], rank: int, own: int, slots: int) -> list[bool]:
+    """Which bank entries ``rank`` runs, by the replica choice over the chosen experts ``hit``."""
+    ranks = len(hit) // own
+    load = [sum(hit[k * own + s] for s in range(slots, own)) for k in range(ranks)]
+    stays = {}
+    for j, shift, bit, side in _replica_groups(ranks, slots):
+        for k in range(ranks):
+            e = k * own + j
+            if (k >> bit) & 1 == side and hit[e]:
+                other = (k + shift) % ranks
+                stays[e] = load[k] <= load[other]
+                load[k if stays[e] else other] += 1
+    runs = [stays.get(rank * own + s, True) for s in range(slots)] + [True] * (own - slots)
+    return runs + [not stays.get(e, True) for e in replica_experts(rank, ranks, own, slots)]
+
+
+def _torch_routed_experts(routed, score_bias, expert_base, gate_up_weight, gate_up_scale, down_weight,
+                          down_scale, beta, linear_beta, scaling, replicas, chunks, replica_slots):
+    """The routed-expert partial in torch, for the CPU venue where the kernel does not run."""
+    tokens, latent = routed.shape[0], gate_up_weight.shape[-1]
+    local, own = gate_up_weight.shape[0], gate_up_weight.shape[0] - replica_slots
+    keep = torch.isfinite(routed.float()).all(-1)
+    x = _mx8_torch(torch.where(keep[:, None], routed[:, :latent].float(), 0.0))
+    scores = torch.sigmoid(routed[:, latent:].float())
+    choice = torch.where(keep[:, None], scores + score_bias.float(), 0.0)
+    index = choice.topk(TOP_K, dim=-1).indices
+    chosen = scores.gather(1, index)
+    weights = torch.where(keep[:, None], chosen / (chosen.sum(-1, keepdim=True) + RENORM_GUARD) * scaling, 0.0)
+    hit = torch.zeros(score_bias.shape[0], dtype=torch.bool)
+    hit[index[keep].flatten()] = True
+    rank = int(expert_base.reshape(-1)[0]) // own
+    ids = [rank * own + s for s in range(own)] + replica_experts(rank, len(hit) // own, own, replica_slots)
+    runs = _replica_runs(hit.tolist(), rank, own, replica_slots)
+    bank = (gate_up_weight, gate_up_scale, down_weight, down_scale)
+    partial = torch.zeros(tokens, latent)
+    for e in range(local):
+        if not (runs[e] and hit[ids[e]]):
+            continue
+        affinity = torch.where(index == ids[e], weights, 0.0).sum(-1)
+        gate_w, up_w, down_w = _expert_weights(bank, e)
+        gate, up = x @ gate_w.T, x @ up_w.T
+        situ = beta * torch.tanh(gate / beta) * torch.sigmoid(gate) * (
+            linear_beta * torch.tanh(up / linear_beta))
+        partial += affinity[:, None] * (_mx8_torch(situ) @ down_w.T)
+    partial = torch.where(keep[:, None], partial, float("nan"))
+    per = tokens // replicas
+    return partial.view(replicas, per, chunks, latent // chunks).permute(0, 2, 1, 3).contiguous()
 
 
 # ---------------------------------------------------------------------------- #
@@ -235,10 +372,11 @@ def _nonfinite_count(rows, width, dst):
     nisa.tensor_reduce(dst=dst, data=flags, op=nl.add, axis=(1,))
 
 
-def _select(logits, bias, keep, scaling):
+def _select(logits, bias, keep, scaling, matched=False):
     """Top-k of ``logits [P, E]`` by sigmoid score plus ``bias``; rows with ``keep`` 0 choose zeros.
 
-    Returns (indices ``[P, 16]`` uint32, weights ``[P, 16]`` fp32).
+    Returns (indices ``[P, 16]`` uint32, weights ``[P, 16]`` fp32); with ``matched`` also
+    ``[P, E]`` fp32 holding ``_MIN_FLOAT`` exactly at each row's chosen experts.
     """
     rows, experts = logits.shape
     scores = nl.ndarray((rows, experts), dtype=nl.float32, buffer=nl.sbuf)
@@ -272,6 +410,8 @@ def _select(logits, bias, keep, scaling):
     else:
         nisa.tensor_scalar(dst=weights, data=chosen, op0=nl.multiply, operand0=inverse,
                            op1=nl.multiply, operand1=scaling)
+    if matched:
+        return index, weights, second
     return index, weights
 
 
@@ -316,15 +456,21 @@ def _router_select_kernel(logits, score_bias, scaling):
     return index_out, weight_out
 
 
-def _local_affinity(index, weights, keep, base, local):
-    """Dense ``[P, local]`` affinities and 0/1 choices of the experts ``base .. base + local - 1``."""
+def _local_affinity(index, weights, keep, base, local, ids=None):
+    """Dense ``[P, local]`` affinities and 0/1 choices of the experts ``base .. base + local - 1``.
+
+    With ``ids [P, local]`` fp32, of the experts whose global ids it holds instead.
+    """
     rows = index.shape[0]
     index_f = nl.ndarray((rows, TOP_K), dtype=nl.float32, buffer=nl.sbuf)
     nisa.tensor_copy(dst=index_f, src=index)
-    offset = nl.ndarray((rows, TOP_K), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_scalar(dst=offset, data=index_f, op0=nl.subtract, operand0=base)
-    slot = nl.ndarray((rows, local), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.iota(dst=slot, pattern=[[1, local]], offset=0)
+    if ids is None:
+        offset = nl.ndarray((rows, TOP_K), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=offset, data=index_f, op0=nl.subtract, operand0=base)
+        slot = nl.ndarray((rows, local), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.iota(dst=slot, pattern=[[1, local]], offset=0)
+    else:
+        offset, slot = index_f, ids
     hit = nl.ndarray((rows, local, TOP_K), dtype=nl.uint8, buffer=nl.sbuf)
     nisa.tensor_tensor(dst=hit, data1=offset.ap(pattern=[[TOP_K, rows], [0, local], [1, TOP_K]]),
                        data2=slot.ap(pattern=[[local, rows], [1, local], [0, TOP_K]]), op=nl.equal)
@@ -344,6 +490,106 @@ def _local_affinity(index, weights, keep, base, local):
         nisa.tensor_copy_predicated(dst=dst, src=src, predicate=keep.ap(
             pattern=[[keep.shape[1], rows], [0, local]]))
     return affinity, chosen
+
+
+def _bank_ids(base, rows, own, slots, experts):
+    """``[rows, own + slots]`` fp32 global id of each bank entry: the own experts, then the replicas."""
+    step = experts // own // (slots + 1)
+    ids = _tile(rows, own + slots)
+    nisa.iota(dst=ids[:, 0:own], pattern=[[1, own]], offset=0)
+    # Replica j holds expert own*(rank - 1 - j*step) + j, before the wrap past expert 0.
+    nisa.iota(dst=ids[:, own:], pattern=[[1 - own * step, slots]], offset=-own)
+    nisa.tensor_scalar(dst=ids, data=ids, op0=nl.add, operand0=base)
+    wrap = _tile(rows, slots)
+    nisa.tensor_scalar(dst=wrap, data=ids[:, own:], op0=nl.less, operand0=0.0,
+                       op1=nl.multiply, operand1=float(experts))
+    nisa.tensor_tensor(dst=ids[:, own:], data1=ids[:, own:], data2=wrap, op=nl.add)
+    return ids
+
+
+def _choose_replicas(matched, keep, base, own, slots, experts):
+    """``[1, own + slots]`` fp32, 1 at each bank entry this rank runs under the replica choice,
+    and the whole choice as ``stays`` and ``moved`` (see :func:`_choice_record`).
+
+    The loads are counts of chosen experts, so every step is exact in fp32.
+    """
+    rows = matched.shape[0]
+    ranks, step, local = experts // own, experts // own // (slots + 1), own + slots
+    picked = nl.ndarray((rows, experts), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_scalar(dst=picked, data=matched, op0=nl.equal, operand0=_MIN_FLOAT)
+    keep_f = _tile(rows, 1)
+    nisa.tensor_copy(dst=keep_f, src=keep)
+    # hits[e] = 1 where a kept token chose expert e.
+    hits = _tile(1, experts)
+    for first in range(0, experts, 512):
+        width = min(512, experts - first)
+        counts = nl.ndarray((1, width), dtype=nl.float32, buffer=nl.psum)
+        nisa.nc_matmul(dst=counts, stationary=keep_f, moving=picked[:, first:first + width])
+        nisa.tensor_scalar(dst=hits[:, first:first + width], data=counts, op0=nl.greater, operand0=0.0)
+    # Each rank's load, held twice so a rank offset reads one span: first its chosen experts
+    # with no replica.
+    loads = _tile(1, 2 * ranks)
+    nisa.tensor_reduce(dst=loads[:, 0:ranks], data=hits.ap(
+        pattern=[[experts, 1], [own, ranks], [1, own - slots]], offset=slots), op=nl.add, axis=(2,))
+    nisa.tensor_copy(dst=loads[:, ranks:], src=loads[:, 0:ranks])
+    # stays[j*R + k]: expert own*k + j is chosen and runs on rank k. moved[g*2R + k], at both
+    # copies of k: the group's expert of rank k is chosen and runs on rank k + shift.
+    stays = _tile(1, slots * ranks)
+    moved = _tile(1, 4 * slots * ranks)
+    nisa.memset(dst=moved, value=0.0)
+    for g, (j, shift, bit, side) in enumerate(_replica_groups(ranks, slots)):
+        block = 1 << bit
+        span = [[2 * block, ranks // (2 * block)], [1, block]]
+        first = side * block
+        homes = loads.ap(pattern=[[2 * ranks, 1], *span], offset=first)
+        others = loads.ap(pattern=[[2 * ranks, 1], *span], offset=first + shift)
+        stay = stays.ap(pattern=[[slots * ranks, 1], *span], offset=j * ranks + first)
+        stay2 = stays.ap(pattern=[[slots * ranks, 1], [0, 2], *span], offset=j * ranks + first)
+        chosen = [[2 * block * own, ranks // (2 * block)], [own, block]]
+        nisa.tensor_tensor(dst=stay, data1=homes, data2=others, op=nl.less_equal)
+        nisa.tensor_tensor(dst=stay, data1=stay, data2=hits.ap(
+            pattern=[[experts, 1], *chosen], offset=own * first + j), op=nl.multiply)
+        nisa.tensor_tensor(dst=moved.ap(pattern=[[4 * slots * ranks, 1], [ranks, 2], *span],
+                                        offset=2 * g * ranks + first),
+                           data1=hits.ap(pattern=[[experts, 1], [0, 2], *chosen], offset=own * first + j),
+                           data2=stay2, op=nl.subtract)
+        both = loads.ap(pattern=[[2 * ranks, 1], [ranks, 2], *span], offset=first)
+        nisa.tensor_tensor(dst=both, data1=both, data2=stay2, op=nl.add)
+        nisa.tensor_tensor(dst=loads, data1=loads, data2=moved.ap(
+            pattern=[[4 * slots * ranks, 1], [0, 2], [1, ranks]], offset=2 * g * ranks + ranks - shift),
+            op=nl.add)
+    # This rank's entries: its own experts j < r where they stay, its replicas where they moved.
+    rank_ids = _tile(1, ranks)
+    nisa.iota(dst=rank_ids, pattern=[[own, ranks]], offset=0)
+    mine = _tile(1, ranks)
+    nisa.tensor_scalar(dst=mine, data=rank_ids, op0=nl.equal, operand0=base[0:1, 0:1])
+    runs = _tile(1, local)
+    nisa.memset(dst=runs, value=1.0)
+    kept = nl.ndarray((1, slots, ranks), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=kept, data1=stays.ap(pattern=[[slots * ranks, 1], [ranks, slots], [1, ranks]]),
+                       data2=mine.ap(pattern=[[ranks, 1], [0, slots], [1, ranks]]), op=nl.multiply)
+    nisa.tensor_reduce(dst=runs[:, 0:slots], data=kept, op=nl.add, axis=(2,))
+    # Replica j is expert own*(rank - shift_j) + j; shift_j = 1 + j*step.
+    taken = nl.ndarray((1, slots, 2, ranks), dtype=nl.float32, buffer=nl.sbuf)
+    nisa.tensor_tensor(dst=taken, data1=moved.ap(
+        pattern=[[4 * slots * ranks, 1], [4 * ranks - step, slots], [2 * ranks, 2], [1, ranks]],
+        offset=ranks - 1), data2=mine.ap(pattern=[[ranks, 1], [0, slots], [0, 2], [1, ranks]]),
+        op=nl.multiply)
+    nisa.tensor_reduce(dst=runs[:, own:local], data=taken, op=nl.add, axis=(2, 3))
+    return runs, stays, moved
+
+
+def _choice_record(stays, moved, slots, ranks):
+    """``[1, 2*slots*ranks]`` fp32 for the test mode: ``[j*R + k]`` is 1 where expert ``own*k + j``
+    is chosen and runs on rank ``k``, ``[(slots + j)*R + k]`` 1 where it runs on its other home."""
+    record = _tile(1, 2 * slots * ranks)
+    nisa.tensor_copy(dst=record[:, 0:slots * ranks], src=stays)
+    # Group (j, side) holds its ranks at 4jR + 2R*side + k and zeros elsewhere.
+    sides = [moved.ap(pattern=[[4 * slots * ranks, 1], [4 * ranks, slots], [1, ranks]], offset=2 * ranks * side)
+             for side in (0, 1)]
+    nisa.tensor_tensor(dst=record.ap(pattern=[[2 * slots * ranks, 1], [ranks, slots], [1, ranks]],
+                                     offset=slots * ranks), data1=sides[0], data2=sides[1], op=nl.add)
+    return record
 
 
 def _latent_groups(routed, tokens, rows, latent):
@@ -657,7 +903,7 @@ def _code_sink(exposed, table, p, program, dge):
 
 
 def _visit_experts(chosen, affinity, stationary, stationary_scale, bank, program, acc,
-                   beta, linear_beta, exposed=None):
+                   beta, linear_beta, exposed=None, runs=None, visits=None):
     """Run each local expert with a chosen token once, ascending, next expert's loads in flight.
 
     One hardware loop runs the full pairs (2p, 2p + 1) on two operand buffers swapped
@@ -669,6 +915,8 @@ def _visit_experts(chosen, affinity, stationary, stationary_scale, bank, program
     item from the first buffer, where the last pair pass loaded it; no item is computed that
     was not chosen.
     ``exposed``, in the test mode, is the (codes, scales) HBM outputs indexed by local expert.
+    ``runs [1, local]``, with replica slots, is 0 at the entries this rank leaves to their other
+    home; ``visits``, in the test mode, receives the entries' visit counts.
     """
     rows, local = chosen.shape
     nk = stationary.shape[1]
@@ -683,7 +931,12 @@ def _visit_experts(chosen, affinity, stationary, stationary_scale, bank, program
     counts = nl.ndarray((1, local), dtype=nl.float32, buffer=nl.psum)
     nisa.nc_matmul(dst=counts, stationary=ones, moving=chosen)
     hits = _tile(1, local)
-    nisa.tensor_copy(dst=hits, src=counts)
+    if runs is None:
+        nisa.tensor_copy(dst=hits, src=counts)
+    else:
+        nisa.tensor_tensor(dst=hits, data1=counts, data2=runs, op=nl.multiply)
+    if visits is not None:
+        nisa.dma_copy(dst=visits, src=hits)
     visit = _tile(1, local + 1, nl.int32)
     nisa.nonzero_with_count(dst=visit, src=hits, index_offset=0, padding_val=local)
 
@@ -784,8 +1037,8 @@ def _visit_experts(chosen, affinity, stationary, stationary_scale, bank, program
 @nki.jit
 def _routed_experts_kernel(routed, score_bias, expert_base, gate_up_weight, gate_up_scale,
                            down_weight, down_scale, beta, linear_beta, scaling, replicas, chunks,
-                           expose_codes=False):
-    """Selection, the distinct-expert loop, the LNC 2 merge and the combine-order store."""
+                           expose_codes=False, replica_slots=0):
+    """Selection, the replica choice, the distinct-expert loop, the LNC 2 merge and the store."""
     tokens, width = routed.shape
     local, programs, two_ni, _, gu_cols = gate_up_weight.shape
     latent = gu_cols
@@ -819,8 +1072,18 @@ def _routed_experts_kernel(routed, score_bias, expert_base, gate_up_weight, gate
     nisa.tensor_tensor(dst=bad, data1=bad_logit, data2=bad_hidden, op=nl.add)
     keep = _keep_rows(bad, rows)
 
-    index, weights = _select(logits, bias, keep, scaling)
-    affinity, chosen = _local_affinity(index, weights, keep, base, local)
+    runs = visits = None
+    if replica_slots:
+        own = local - replica_slots
+        kernel_assert(experts % own == 0 and (experts // own) & (experts // own - 1) == 0,
+                      "replica slots need a power of two expert ranks")
+        index, weights, matched = _select(logits, bias, keep, scaling, matched=True)
+        ids = _bank_ids(base, rows, own, replica_slots, experts)
+        affinity, chosen = _local_affinity(index, weights, keep, base, local, ids)
+        runs, stays, moved = _choose_replicas(matched, keep, base, own, replica_slots, experts)
+    else:
+        index, weights = _select(logits, bias, keep, scaling)
+        affinity, chosen = _local_affinity(index, weights, keep, base, local)
     stationary, stationary_scale = _latent_mx(groups, rows, latent)
 
     acc = nl.ndarray((rows, latent), dtype=nl.float32, buffer=nl.sbuf)
@@ -830,8 +1093,13 @@ def _routed_experts_kernel(routed, score_bias, expert_base, gate_up_weight, gate
         code_cols = two_ni // 2 * rows
         exposed = tuple(nl.ndarray((local, programs, 128, code_cols), dtype=dtype, buffer=nl.shared_hbm)
                         for dtype in (nl.int32, nl.uint8))
+        if replica_slots:
+            visits = nl.ndarray((1, local), dtype=nl.float32, buffer=nl.shared_hbm)
+            ranks = experts // (local - replica_slots)
+            choice = nl.ndarray((1, 2 * replica_slots * ranks), dtype=nl.float32, buffer=nl.shared_hbm)
+            nisa.dma_copy(dst=choice, src=_choice_record(stays, moved, replica_slots, ranks))
     _visit_experts(chosen, affinity, stationary, stationary_scale, bank, program, acc,
-                   beta, linear_beta, exposed)
+                   beta, linear_beta, exposed, runs, visits)
 
     own = latent // programs
     if programs == 2:
@@ -859,6 +1127,8 @@ def _routed_experts_kernel(routed, score_bias, expert_base, gate_up_weight, gate
                                 [1, width_c]],
                        offset=(r * chunks + program * own_chunks) * per_replica * width_c),
             src=marked[r * per_replica:(r + 1) * per_replica, :])
+    if visits is not None:
+        return out, exposed[0], exposed[1], visits, choice
     if expose_codes:
         return out, exposed[0], exposed[1]
     return out
