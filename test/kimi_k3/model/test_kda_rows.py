@@ -173,6 +173,7 @@ def _runner(config, model):
         max_num_batched_tokens=config.scheduler_config.max_num_batched_tokens,
         device=torch.device("cpu"), vocab_size=model.text_config.vocab_size, is_pooling_model=False,
         cp_world_size=1, cp_rank=0, _dcp_size=1, is_dflash_spec=False, _is_synthetic_model=False,
+        is_dspark_spec=False,
         _kv_snapshot_enabled=False,
         _kv_cache_full_tensors={}, _block_table_groups={}, _swa_groups={}, _constant_tensors={},
     )
