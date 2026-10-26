@@ -287,6 +287,8 @@ def _kernel(ref, routed, bank, replicas, slots, expose_codes=False):
 
     if not ON_DEVICE:
         return run(routed, ref.bias, base, *bank)
+    # Every call compiles one variant; they share one code object and its recompile limit.
+    torch._dynamo.reset()
     compiled = torch.compile(run, backend=envs.get_compile_backend_name(), fullgraph=True,
                              dynamic=False)
     out = compiled(*[t.to("neuron:0") for t in (routed, ref.bias, base, *bank)])
