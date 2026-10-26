@@ -47,6 +47,7 @@ from vllm_neuron.utils.weight_loader import (
 )
 
 from .config import CHECKPOINT_PREFIX, KimiK3TextConfig
+from .weight_loaders_vision import vision_checkpoint_mappings
 
 logger = logging.getLogger(__name__)
 
@@ -213,6 +214,7 @@ def checkpoint_mappings(
             if name.endswith(_A_LOG_SUFFIX):
                 inner = get_weight_loader(param)
                 set_weight_loader(param, a_log_loader(text_config.kda_num_heads, inner))
+    mappings.update(vision_checkpoint_mappings(model))
     dtype_override = {
         name: torch.float32 for name in mappings if name.endswith(F32_SUFFIXES)
     }

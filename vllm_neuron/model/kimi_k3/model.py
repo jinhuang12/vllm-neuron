@@ -41,6 +41,7 @@ from vllm_neuron.functional.attention import o_proj as output_projection
 from vllm_neuron.functional.attention.o_proj import o_proj, o_proj_tkg
 from vllm_neuron.functional.kda.fused_decode import kda_fused_decode, kda_fused_verify
 from vllm_neuron.functional.kda.output import kda_output_prefill
+from vllm_neuron.functional.merge_image_rows import merge_image_rows
 from vllm_neuron.functional.moe.fused_tail import moe_fused_tail
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.model.neuron_config import NeuronConfig
@@ -1157,12 +1158,17 @@ class KimiK3Model(nn.Module):
             self.output_attn_res_norm.weight, self.output_attn_res_proj.weight
         )
 
-    def embed(self, input_ids, rank=None) -> tuple[torch.Tensor, torch.Tensor]:
+    def embed(self, input_ids, rank=None, image_rows=None) -> tuple[torch.Tensor, torch.Tensor]:
         """Embed ``[T]`` token ids: the stream ``[T, H]`` and an unwritten bank ``[T, R, H]``.
 
         ``rank`` is the tensor-parallel rank tensor that picks this rank's vocabulary rows.
+        ``image_rows`` is the encoder cache buffer, block ids and positions of a prefill step;
+        the cache rows replace the embedded rows at their positions.
         """
         stream = _waited(self.embed_tokens(input_ids, scatter_tokens=False, rank=rank))
+        if image_rows is not None:
+            # Every rank holds the whole chunk, so the merge's shard rank is 0.
+            stream = merge_image_rows(stream, *image_rows, stream.new_zeros(1, dtype=torch.int32))
         bank = stream.new_empty((stream.shape[0], self.num_bank_rows, stream.shape[1]))
         return stream, bank
 
@@ -1172,7 +1178,7 @@ class KimiK3Model(nn.Module):
 
     def forward(
         self, input_ids, attn_metadata, is_prefill: bool, positions=None, rank=None,
-        return_taps: bool = False,
+        return_taps: bool = False, image_rows=None,
     ):
         """Run every layer; returns the output mix ``[T, H]``, before the final norm.
 
@@ -1181,9 +1187,12 @@ class KimiK3Model(nn.Module):
         With ``return_taps``, the taps come second, in layer order. The tap of aux layer
         ``j`` is the stream layer ``j`` reads, with the previous layer's MLP output added:
         the stream its attention-site mix stores.
+        ``image_rows`` are merged after the embed of a prefill step, as ``embed`` takes them.
         """
         tp_size = _tp_rank_and_size()[1]
-        stream, bank = self.embed(input_ids, rank if tp_size > 1 else None)
+        stream, bank = self.embed(
+            input_ids, rank if tp_size > 1 else None, image_rows if is_prefill else None
+        )
         metas = [
             _with_positions(attn_metadata.get(f"layers.{i}.self_attn"), positions)
             for i in range(len(self.layers))
@@ -1405,6 +1414,9 @@ class KimiK3ForConditionalGeneration(nn.Module, SupportsEagle3):
         logit_mask: torch.Tensor | None = None,
         rank: torch.Tensor | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        encoder_embedding_buffer: torch.Tensor | None = None,
+        encoder_block_ids: torch.Tensor | None = None,
+        encoder_positions: torch.Tensor | None = None,
         *,
         spec_decode_metadata=None,
         **kwargs,
@@ -1414,13 +1426,20 @@ class KimiK3ForConditionalGeneration(nn.Module, SupportsEagle3):
         With aux layers set, the joined taps come second: ``(tokens, taps, None)``, or
         ``(logits, taps)`` without a sampler. At a verify step the tokens are the greedy
         acceptance of the drafts, ``[B, k + 1]`` with -1 after each sequence's bonus token.
+
+        A multimodal prefill step also passes the encoder cache buffer, the cache block ids
+        and each block row's stream position; those rows replace the image tokens' embeds.
         """
         if inputs_embeds is not None:
             raise NotImplementedError("Kimi K3 serves text prompts only")
         meta = next(iter(attn_metadata.values()))
         is_prefill = meta["max_query_len"] > meta["decode_token_threshold"]
+        image_rows = (encoder_embedding_buffer, encoder_block_ids, encoder_positions)
+        if any(t is None for t in image_rows):
+            image_rows = None
         hidden, taps = self.model(
-            input_ids, attn_metadata, is_prefill, positions, rank, return_taps=True
+            input_ids, attn_metadata, is_prefill, positions, rank, return_taps=True,
+            image_rows=image_rows,
         )
         if sampling_positions is not None and (
             is_prefill or hidden.shape[0] != sampling_positions.shape[0]
