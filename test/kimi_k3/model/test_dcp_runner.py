@@ -112,6 +112,7 @@ def _runner(config, model, dcp: int) -> NeuronModelRunner:
     runner = NeuronModelRunner.__new__(NeuronModelRunner)
     runner.vllm_config, runner.model, runner.speculative_config = config, model, None
     runner.drafter, runner.neuron_config, runner.is_dflash_spec = None, NeuronConfig(), False
+    runner.is_dspark_spec = False
     runner.max_num_reqs, runner.max_model_len = 2, config.model_config.max_model_len
     runner.max_num_batched_tokens = config.scheduler_config.max_num_batched_tokens
     runner.device, runner.vocab_size, runner.is_pooling_model = torch.device("cpu"), 10240, False
