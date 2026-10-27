@@ -12,6 +12,12 @@ product is weighted and summed per token. Under LNC 2 each core takes half of
 the expert width and the halves meet in one send-receive. The partial is stored
 in the combine's chunk order ``[R, C, T/R, D/C]``.
 
+Past 128 tokens the rows run in token tiles of at most 128 rows. Selection, the latent
+quantization and the products run per tile; the counts behind the visited experts and
+the replica choice sum over the tiles. Each expert visit loads the weights once and runs
+every tile on them. A token's row never meets another token's in a sum, so the tiles
+change no value: at 128 tokens or fewer the call is one tile.
+
 A token whose logits or latent row hold a non-finite value chooses no expert and
 gets a NaN output row; its non-finite latent values stream as zeros. All three use
 selects.
@@ -64,6 +70,10 @@ _KT = 512  # contraction values per MX K tile
 _Q = 4  # values per x4 element
 _SLOTS = 3  # scale blocks side by side in each quadrant's rows
 _GROUP = 16  # tokens per latent group: 16 tokens by 7 K tiles fill 112 partitions
+#: Rows per token tile of the decode kernel.
+TOKEN_TILE = 128
+#: Tokens per decode call: two full token tiles.
+MAX_TOKENS = 256
 _MIN_FLOAT = -3.4028235e38
 _NAN = float("nan")
 
@@ -125,6 +135,7 @@ def routed_experts_mx(
     chunks: int = 32,
     expose_codes: bool = False,
     replica_slots: int = 0,
+    token_tile: int = TOKEN_TILE,
 ) -> torch.Tensor | tuple[torch.Tensor, ...]:
     """Return this rank's routed-expert partial of ``T`` decode tokens in combine order.
 
@@ -143,6 +154,8 @@ def routed_experts_mx(
             intermediate, the input of its down product.
         replica_slots: replicas ``r`` at the end of the bank; the expert ranks are
             ``E / (bank entries - r)``, a power of two above ``r``.
+        token_tile: rows per token tile, even and at most 128; ``T`` up to
+            ``MAX_TOKENS`` runs in tiles of this many rows, the last one shorter.
 
     Returns:
         ``[R, C, T/R, D/C]`` fp32: entry ``[r, c, t, j]`` is token ``r*T/R + t``,
@@ -183,9 +196,10 @@ def routed_experts_mx(
     assert routed.shape[1] == latent + score_bias.shape[0], (
         f"routed {tuple(routed.shape)} must be [T, {latent} + {score_bias.shape[0]}]"
     )
-    assert 1 <= tokens <= 64 and tokens % replicas == 0, (
-        f"T={tokens} must be in [1, 64] and divide into {replicas} replicas"
+    assert 1 <= tokens <= MAX_TOKENS and tokens % replicas == 0, (
+        f"T={tokens} must be in [1, {MAX_TOKENS}] and divide into {replicas} replicas"
     )
+    assert 2 <= token_tile <= 128 and token_tile % 2 == 0, f"token_tile={token_tile} must be even, 2 to 128"
     assert latent % (chunks * programs) == 0, f"D={latent} must split into {chunks} chunks per core"
     assert programs == get_logical_nc_config(), (
         f"the bank is repacked for {programs} programs, LNC is {get_logical_nc_config()}"
@@ -205,6 +219,7 @@ def routed_experts_mx(
         chunks=chunks,
         expose_codes=expose_codes,
         replica_slots=replica_slots,
+        token_tile=token_tile,
     )
 
 
@@ -350,6 +365,22 @@ def routed_expert_tiles_mx(
 def _tile(rows, cols, dtype=nl.float32):
     """An SBUF tile of shape (rows, cols)."""
     return nl.ndarray((rows, cols), dtype=dtype, buffer=nl.sbuf)
+
+
+def _head(t, rows):
+    """The first ``rows`` partitions of ``t``."""
+    if t.shape[0] == rows:
+        return t
+    return t[(slice(0, rows),) + (slice(None),) * (len(t.shape) - 1)]
+
+
+def _token_tiles(tokens, tile):
+    """(first row, rows, real rows) of each token tile of ``tile`` rows; the last tile's rows round up to even."""
+    spans = []
+    for first in range(0, tokens, tile):
+        real = min(tile, tokens - first)
+        spans.append((first, real + real % 2, real))
+    return spans
 
 
 def _row_broadcast(src, rows, cols):
@@ -511,20 +542,26 @@ def _choose_replicas(matched, keep, base, own, slots, experts):
     """``[1, own + slots]`` fp32, 1 at each bank entry this rank runs under the replica choice,
     and the whole choice as ``stays`` and ``moved`` (see :func:`_choice_record`).
 
-    The loads are counts of chosen experts, so every step is exact in fp32.
+    ``matched`` and ``keep`` hold one entry per token tile. The loads are counts of chosen
+    experts, so every step is exact in fp32.
     """
-    rows = matched.shape[0]
     ranks, step, local = experts // own, experts // own // (slots + 1), own + slots
-    picked = nl.ndarray((rows, experts), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_scalar(dst=picked, data=matched, op0=nl.equal, operand0=_MIN_FLOAT)
-    keep_f = _tile(rows, 1)
-    nisa.tensor_copy(dst=keep_f, src=keep)
-    # hits[e] = 1 where a kept token chose expert e.
+    tiles = []
+    for tile_matched, tile_keep in zip(matched, keep):
+        rows = tile_matched.shape[0]
+        picked = nl.ndarray((rows, experts), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_scalar(dst=picked, data=tile_matched, op0=nl.equal, operand0=_MIN_FLOAT)
+        keep_f = _tile(rows, 1)
+        nisa.tensor_copy(dst=keep_f, src=tile_keep)
+        tiles.append((picked, keep_f))
+    # hits[e] = 1 where a kept token of any tile chose expert e.
     hits = _tile(1, experts)
     for first in range(0, experts, 512):
         width = min(512, experts - first)
         counts = nl.ndarray((1, width), dtype=nl.float32, buffer=nl.psum)
-        nisa.nc_matmul(dst=counts, stationary=keep_f, moving=picked[:, first:first + width])
+        # The compiler sets the accumulate flags: the first tile writes, the others add.
+        for picked, keep_f in tiles:
+            nisa.nc_matmul(dst=counts, stationary=keep_f, moving=picked[:, first:first + width])
         nisa.tensor_scalar(dst=hits[:, first:first + width], data=counts, op0=nl.greater, operand0=0.0)
     # Each rank's load, held twice so a rank offset reads one span: first its chosen experts
     # with no replica.
@@ -592,14 +629,15 @@ def _choice_record(stays, moved, slots, ranks):
     return record
 
 
-def _latent_groups(routed, tokens, rows, latent):
-    """The latent of ``routed`` in bf16 groups of up to 16 rows, partition ``k*n + t`` holding K tile ``k`` of row ``t``.
+def _latent_groups(routed, start, tokens, rows, latent):
+    """The latent of ``routed`` from row ``start`` in bf16 groups of up to 16 rows.
 
-    Each K tile of a group lands in one DMA, ``n`` partitions of one 512-value run each,
-    so the loads and the checks spread over up to 112 partitions. A non-finite value has
-    its partition's tile zeroed, so no transpose carries it to another token. Rows past T
-    read as zeros. Returns the groups as (first row, row count ``n``, tile) and
-    ``bad [rows, 1]``, each row's count of non-finite values.
+    Partition ``k*n + t`` of a group holds K tile ``k`` of its row ``t``. Each K tile of a
+    group lands in one DMA, ``n`` partitions of one 512-value run each, so the loads and the
+    checks spread over up to 112 partitions. A non-finite value has
+    its partition's tile zeroed, so no transpose carries it to another token. Rows past
+    ``tokens`` read as zeros. Returns the groups as (first row, row count ``n``, tile), rows
+    counted from ``start``, and ``bad [rows, 1]``, each row's count of non-finite values.
     """
     width = routed.shape[1]
     tiles = latent // _KT
@@ -614,7 +652,7 @@ def _latent_groups(routed, tokens, rows, latent):
             nisa.memset(dst=part, value=0.0)
         for k in range(tiles):
             nisa.dma_copy(dst=part[k * count:k * count + real, :], src=routed.ap(
-                pattern=[[width, real], [1, _KT]], offset=first * width + k * _KT),
+                pattern=[[width, real], [1, _KT]], offset=(start + first) * width + k * _KT),
                 dge_mode=nisa.dge_mode.hwdge,
                 engine=nisa.engine.sync if k % 2 == 0 else nisa.engine.scalar)
         rounded = nl.ndarray((parts, _KT), dtype=nl.bfloat16, buffer=nl.sbuf)
@@ -879,31 +917,44 @@ def _stage_pair(pairs, p, rows, dge):
     return dst
 
 
-def _code_sink(exposed, table, p, program, dge):
+def _code_sink(exposed, table, p, program, dge, rows):
     """Stage the local expert in column ``p`` of ``table`` for the test mode's outputs.
 
-    Returns a function giving the outputs' HBM views at that expert. It loads the expert into
-    a register, so call it where the stores issue: the register and the stores that use it
-    must sit in one ordered block.
+    Returns a function of a token tile's first row and row count, of ``rows`` in all, giving
+    the outputs' HBM views at that expert and tile. It loads the expert into a register, so
+    call it where the stores issue: the register and the stores that use it must sit in one
+    ordered block.
     """
     expert_tile = _tile(1, 1, nl.uint32)
     _stage(table, p, expert_tile, dge)
 
-    def views():
+    def views(first, count):
         expert = nisa.register_alloc()
         nisa.register_load(dst=expert, src=expert_tile)
         found = []
         for out in exposed:
             _, programs, parts, cols = out.shape
-            found.append(out.ap(pattern=[[cols, parts], [1, cols]], offset=program * parts * cols,
+            pattern = [[cols, parts], [1, cols]]
+            if count < rows:
+                pattern = [[cols, parts], [rows, cols // rows], [1, count]]
+            found.append(out.ap(pattern=pattern, offset=program * parts * cols + first,
                                 scalar_offset=expert, indirect_dim=0))
         return found
 
     return views
 
 
-def _visit_experts(chosen, affinity, stationary, stationary_scale, bank, program, acc,
-                   beta, linear_beta, exposed=None, runs=None, visits=None):
+class _TokenTile:
+    """One token tile's operands in the expert loop: its first row, chosen experts, affinities,
+    MXFP8 stationaries and scales, accumulator and keep flags."""
+
+    def __init__(self, first, chosen, affinity, stationary, stationary_scale, acc, keep):
+        self.first, self.rows = first, chosen.shape[0]
+        self.chosen, self.affinity, self.acc, self.keep = chosen, affinity, acc, keep
+        self.stationary, self.stationary_scale = stationary, stationary_scale
+
+
+def _visit_experts(tiles, bank, program, beta, linear_beta, exposed=None, runs=None, visits=None):
     """Run each local expert with a chosen token once, ascending, next expert's loads in flight.
 
     One hardware loop runs the full pairs (2p, 2p + 1) on two operand buffers swapped
@@ -913,23 +964,26 @@ def _visit_experts(chosen, affinity, stationary, stationary_scale, bank, program
     lives in SBUF. A load past the last item names no expert and moves nothing, so each of the
     ``count`` items loads once. With an odd count a second loop of one pass computes the last
     item from the first buffer, where the last pair pass loaded it; no item is computed that
-    was not chosen.
+    was not chosen. Each item runs every token tile of ``tiles`` (:class:`_TokenTile`) on its
+    loaded weights, the tiles in order.
     ``exposed``, in the test mode, is the (codes, scales) HBM outputs indexed by local expert.
     ``runs [1, local]``, with replica slots, is 0 at the entries this rank leaves to their other
     home; ``visits``, in the test mode, receives the entries' visit counts.
     """
-    rows, local = chosen.shape
-    nk = stationary.shape[1]
+    rows, local = tiles[0].chosen.shape
+    total = sum(t.rows for t in tiles)
+    nk = tiles[0].stationary.shape[1]
     two_ni = bank[0].shape[2]
     nd = bank[2].shape[2]
     pairs = (local + 1) // 2
     padded = 2 * pairs + 2
 
-    # Experts with at least one chosen token, compacted; padding entries hold ``local``.
+    # Experts with at least one chosen token in any tile, compacted; padding entries hold ``local``.
     ones = _tile(rows, 1)
     nisa.memset(dst=ones, value=1.0)
     counts = nl.ndarray((1, local), dtype=nl.float32, buffer=nl.psum)
-    nisa.nc_matmul(dst=counts, stationary=ones, moving=chosen)
+    for tile in tiles:
+        nisa.nc_matmul(dst=counts, stationary=_head(ones, tile.rows), moving=tile.chosen)
     hits = _tile(1, local)
     if runs is None:
         nisa.tensor_copy(dst=hits, src=counts)
@@ -962,6 +1016,7 @@ def _visit_experts(chosen, affinity, stationary, stationary_scale, bank, program
     nisa.tensor_copy(dst=flat[:, 0:local], src=visit[:, 0:local])
 
     # Item i's affinity column, aff[:, flat[i]], by a select and an exact sum; 0 for padding.
+    # The select pattern is the same on every row, so the tiles share the first tile's.
     flat_f = _tile(1, padded)
     nisa.tensor_copy(dst=flat_f, src=flat)
     item_expert = _row_broadcast(flat_f, rows, padded)
@@ -970,21 +1025,24 @@ def _visit_experts(chosen, affinity, stationary, stationary_scale, bank, program
     match = nl.ndarray((rows, padded, local), dtype=nl.uint8, buffer=nl.sbuf)
     nisa.tensor_tensor(dst=match, data1=item_expert.ap(pattern=[[padded, rows], [1, padded], [0, local]]),
                        data2=slot.ap(pattern=[[local, rows], [0, padded], [1, local]]), op=nl.equal)
-    spread = nl.ndarray((rows, padded, local), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.memset(dst=spread, value=0.0)
-    nisa.tensor_copy_predicated(dst=spread, src=affinity.ap(
-        pattern=[[local, rows], [0, padded], [1, local]]), predicate=match)
-    item_aff = nl.ndarray((rows, padded), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.tensor_reduce(dst=item_aff, data=spread, op=nl.add, axis=(2,))
+    pair_affs = []
+    for tile in tiles:
+        n = tile.rows
+        spread = nl.ndarray((n, padded, local), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.memset(dst=spread, value=0.0)
+        nisa.tensor_copy_predicated(dst=spread, src=tile.affinity.ap(
+            pattern=[[local, n], [0, padded], [1, local]]), predicate=_head(match, n))
+        item_aff = nl.ndarray((n, padded), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.tensor_reduce(dst=item_aff, data=spread, op=nl.add, axis=(2,))
+        # Items 2p and 2p + 1 have adjacent affinity columns, so one stage brings both.
+        pair_affs.append(item_aff.reshape((n, padded // 2, 2)))
 
-    # Per pair position q < 3: item 2p + q's expert at pass p. Items 2p and 2p + 1 have
-    # adjacent affinity columns, so one stage brings both.
+    # Per pair position q < 3: item 2p + q's expert at pass p.
     expert_at = []
     for q in range(3):
         e_q = _tile(1, pairs, nl.int32)
         nisa.tensor_copy(dst=e_q, src=flat.ap(pattern=[[padded, 1], [2, pairs]], offset=q))
         expert_at.append(e_q)
-    pair_aff = item_aff.reshape((rows, padded // 2, 2))
     # The loop condition at pass p: item 2p + 1's expert id where that item is real, else 0.
     # A real item 2p + 1 follows item 2p in ascending order, so its id is at least 1.
     odd = flat_f.ap(pattern=[[padded, 1], [2, pairs + 1]], offset=1)
@@ -1003,22 +1061,25 @@ def _visit_experts(chosen, affinity, stationary, stationary_scale, bank, program
     held = _tile(1, 1, nl.uint32)
     upcoming = _tile(1, 1, nl.uint32)
 
-    def compute(q, p, column, tiles):
-        sink = None if exposed is None else _code_sink(exposed, expert_at[q], p, program, entries)
-        # In program order, so no engine starts the next expert ahead of this one's products.
+    def compute(q, p, columns, operands):
+        sink = None if exposed is None else _code_sink(exposed, expert_at[q], p, program, entries, total)
+        # In program order, so no engine starts the next expert or tile ahead of this one's products.
         with nl.no_reorder():
-            _expert_rows(stationary, stationary_scale, tiles, column, acc, beta, linear_beta, sink)
+            for tile, column in zip(tiles, columns):
+                tile_sink = None if sink is None else (lambda tile=tile: sink(tile.first, tile.rows))
+                _expert_rows(tile.stationary, tile.stationary_scale, operands, column, tile.acc, beta,
+                             linear_beta, tile_sink)
 
     def run_pair(expert):
         # The pass's table entries stage ahead of its expert loads: an entry staged after a
         # run-time load waits for that load to land, and the second item's products with it.
-        columns = _stage_pair(pair_aff, step, rows, entries)
+        columns = [_stage_pair(pair_aff, step, tile.rows, entries) for pair_aff, tile in zip(pair_affs, tiles)]
         _stage(expert_at[2], step, held, entries)
         _stage(next_condition, step, upcoming, entries)
         _load_operands(bank, expert, program, buffers[1], loads, spread=True)
-        compute(0, step, columns[:, 0:1], buffers[0])
+        compute(0, step, [c[:, 0:1] for c in columns], buffers[0])
         _load_operands(bank, held, program, buffers[0], loads, spread=True)
-        compute(1, step, columns[:, 1:2], buffers[1])
+        compute(1, step, [c[:, 1:2] for c in columns], buffers[1])
         nisa.tensor_scalar(dst=step, data=step, op0=nl.add, operand0=1)
         # Read before the pass ends, so the next pass's first load needs no read of its own.
         following = nisa.register_alloc()
@@ -1026,8 +1087,8 @@ def _visit_experts(chosen, affinity, stationary, stationary_scale, bank, program
         return following
 
     def run_last(p):
-        columns = _stage_pair(pair_aff, p, rows, entries)
-        compute(0, p, columns[:, 0:1], buffers[0])
+        columns = [_stage_pair(pair_aff, p, tile.rows, entries) for pair_aff, tile in zip(pair_affs, tiles)]
+        compute(0, p, [c[:, 0:1] for c in columns], buffers[0])
 
     nl.while_loop(first_pair, run_pair)
     # Item 2p at p = count // 2, which exists only for an odd count.
@@ -1037,8 +1098,8 @@ def _visit_experts(chosen, affinity, stationary, stationary_scale, bank, program
 @nki.jit
 def _routed_experts_kernel(routed, score_bias, expert_base, gate_up_weight, gate_up_scale,
                            down_weight, down_scale, beta, linear_beta, scaling, replicas, chunks,
-                           expose_codes=False, replica_slots=0):
-    """Selection, the replica choice, the distinct-expert loop, the LNC 2 merge and the store."""
+                           expose_codes=False, replica_slots=0, token_tile=TOKEN_TILE):
+    """Selection per token tile, the replica choice, the distinct-expert loop, the LNC 2 merge and the store."""
     tokens, width = routed.shape
     local, programs, two_ni, _, gu_cols = gate_up_weight.shape
     latent = gu_cols
@@ -1047,86 +1108,107 @@ def _routed_experts_kernel(routed, score_bias, expert_base, gate_up_weight, gate
     kernel_assert(programs == (nl.num_programs(0) if nl.program_ndim() != 0 else 1),
                   "one program per bank half")
     program = nl.program_id(0) if programs > 1 else 0
-    rows = tokens + tokens % 2  # the stationary free size must be even
+    spans = _token_tiles(tokens, token_tile)
+    rows = spans[0][1]  # the first tile's rows: the tables every tile reads have this many
+    total = sum(n for _, n, _ in spans)  # the stationary free size of each tile must be even
     bank = (gate_up_weight.view(nl.float4_e2m1fn_x4), gate_up_scale,
             down_weight.view(nl.float4_e2m1fn_x4), down_scale)
+    own = local - replica_slots
+    if replica_slots:
+        kernel_assert(experts % own == 0 and (experts // own) & (experts // own - 1) == 0,
+                      "replica slots need a power of two expert ranks")
 
-    # Rows past T read as NaN logits, so they choose nothing and stream as zeros.
-    logits = nl.ndarray((rows, experts), dtype=nl.float32, buffer=nl.sbuf)
-    if rows > tokens:
-        nisa.memset(dst=logits, value=_NAN)
-    nisa.dma_copy(dst=logits[0:tokens, :], src=routed[:, latent:width], dge_mode=nisa.dge_mode.hwdge)
-    bias = nl.ndarray((rows, experts), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.dma_copy(dst=bias, src=score_bias.ap(pattern=[[0, rows], [1, experts]], offset=0),
-                  dge_mode=nisa.dge_mode.hwdge)
-    base_i = _tile(rows, 1, nl.int32)
-    nisa.dma_copy(dst=base_i, src=expert_base.ap(pattern=[[0, rows], [1, 1]], offset=0),
-                  dge_mode=nisa.dge_mode.hwdge)
-    base = _tile(rows, 1)
-    nisa.tensor_copy(dst=base, src=base_i)
+    picks = []
+    for t, (first, n, real) in enumerate(spans):
+        # Rows past T read as NaN logits, so they choose nothing and stream as zeros.
+        logits = nl.ndarray((n, experts), dtype=nl.float32, buffer=nl.sbuf)
+        if n > real:
+            nisa.memset(dst=logits, value=_NAN)
+        nisa.dma_copy(dst=logits[0:real, :], src=routed[first:first + real, latent:width],
+                      dge_mode=nisa.dge_mode.hwdge)
+        if t == 0:
+            bias = nl.ndarray((rows, experts), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.dma_copy(dst=bias, src=score_bias.ap(pattern=[[0, rows], [1, experts]], offset=0),
+                          dge_mode=nisa.dge_mode.hwdge)
+            base_i = _tile(rows, 1, nl.int32)
+            nisa.dma_copy(dst=base_i, src=expert_base.ap(pattern=[[0, rows], [1, 1]], offset=0),
+                          dge_mode=nisa.dge_mode.hwdge)
+            base = _tile(rows, 1)
+            nisa.tensor_copy(dst=base, src=base_i)
 
-    groups, bad_hidden = _latent_groups(routed, tokens, rows, latent)
-    bad_logit = _tile(rows, 1)
-    _nonfinite_count(logits, experts, bad_logit)
-    bad = _tile(rows, 1)
-    nisa.tensor_tensor(dst=bad, data1=bad_logit, data2=bad_hidden, op=nl.add)
-    keep = _keep_rows(bad, rows)
+        groups, bad_hidden = _latent_groups(routed, first, real, n, latent)
+        bad_logit = _tile(n, 1)
+        _nonfinite_count(logits, experts, bad_logit)
+        bad = _tile(n, 1)
+        nisa.tensor_tensor(dst=bad, data1=bad_logit, data2=bad_hidden, op=nl.add)
+        keep = _keep_rows(bad, n)
+
+        matched = None
+        if replica_slots:
+            index, weights, matched = _select(logits, _head(bias, n), keep, scaling, matched=True)
+            if t == 0:
+                ids = _bank_ids(base, rows, own, replica_slots, experts)
+            affinity, chosen = _local_affinity(index, weights, keep, _head(base, n), local, _head(ids, n))
+        else:
+            index, weights = _select(logits, _head(bias, n), keep, scaling)
+            affinity, chosen = _local_affinity(index, weights, keep, _head(base, n), local)
+        picks.append((first, groups, keep, matched, affinity, chosen))
 
     runs = visits = None
     if replica_slots:
-        own = local - replica_slots
-        kernel_assert(experts % own == 0 and (experts // own) & (experts // own - 1) == 0,
-                      "replica slots need a power of two expert ranks")
-        index, weights, matched = _select(logits, bias, keep, scaling, matched=True)
-        ids = _bank_ids(base, rows, own, replica_slots, experts)
-        affinity, chosen = _local_affinity(index, weights, keep, base, local, ids)
-        runs, stays, moved = _choose_replicas(matched, keep, base, own, replica_slots, experts)
-    else:
-        index, weights = _select(logits, bias, keep, scaling)
-        affinity, chosen = _local_affinity(index, weights, keep, base, local)
-    stationary, stationary_scale = _latent_mx(groups, rows, latent)
+        runs, stays, moved = _choose_replicas([p[3] for p in picks], [p[2] for p in picks], base, own,
+                                              replica_slots, experts)
+    tiles = []
+    for first, groups, keep, _, affinity, chosen in picks:
+        n = chosen.shape[0]
+        stationary, stationary_scale = _latent_mx(groups, n, latent)
+        acc = nl.ndarray((n, latent), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.memset(dst=acc, value=0.0)
+        tiles.append(_TokenTile(first, chosen, affinity, stationary, stationary_scale, acc, keep))
 
-    acc = nl.ndarray((rows, latent), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.memset(dst=acc, value=0.0)
     exposed = None
     if expose_codes:
-        code_cols = two_ni // 2 * rows
+        code_cols = two_ni // 2 * total
         exposed = tuple(nl.ndarray((local, programs, 128, code_cols), dtype=dtype, buffer=nl.shared_hbm)
                         for dtype in (nl.int32, nl.uint8))
         if replica_slots:
             visits = nl.ndarray((1, local), dtype=nl.float32, buffer=nl.shared_hbm)
-            ranks = experts // (local - replica_slots)
+            ranks = experts // own
             choice = nl.ndarray((1, 2 * replica_slots * ranks), dtype=nl.float32, buffer=nl.shared_hbm)
             nisa.dma_copy(dst=choice, src=_choice_record(stays, moved, replica_slots, ranks))
-    _visit_experts(chosen, affinity, stationary, stationary_scale, bank, program, acc,
-                   beta, linear_beta, exposed, runs, visits)
+    _visit_experts(tiles, bank, program, beta, linear_beta, exposed, runs, visits)
 
-    own = latent // programs
-    if programs == 2:
-        other = 1 - program
-        theirs = nl.ndarray((rows, own), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.sendrecv(src=acc[:, other * own:(other + 1) * own], dst=theirs,
-                      send_to_rank=other, recv_from_rank=other, pipe_id=0)
-        total = nl.ndarray((rows, own), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.tensor_tensor(dst=total, data1=acc[:, program * own:(program + 1) * own],
-                           data2=theirs, op=nl.add)
-    else:
-        total = acc
-    marked = nl.ndarray((rows, own), dtype=nl.float32, buffer=nl.sbuf)
-    nisa.memset(dst=marked, value=_NAN)
-    nisa.tensor_copy_predicated(dst=marked, src=total, predicate=keep.ap(
-        pattern=[[keep.shape[1], rows], [0, own]]))
-
+    half = latent // programs
     width_c = latent // chunks
     own_chunks = chunks // programs
     out = nl.ndarray((replicas, chunks, per_replica, width_c), dtype=nl.float32,
                      buffer=nl.shared_hbm)
-    for r in range(replicas):
-        nisa.dma_copy(
-            dst=out.ap(pattern=[[width_c, per_replica], [per_replica * width_c, own_chunks],
-                                [1, width_c]],
-                       offset=(r * chunks + program * own_chunks) * per_replica * width_c),
-            src=marked[r * per_replica:(r + 1) * per_replica, :])
+    for tile, (first, n, real) in zip(tiles, spans):
+        if programs == 2:
+            other = 1 - program
+            theirs = nl.ndarray((n, half), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.sendrecv(src=tile.acc[:, other * half:(other + 1) * half], dst=theirs,
+                          send_to_rank=other, recv_from_rank=other, pipe_id=0)
+            summed = nl.ndarray((n, half), dtype=nl.float32, buffer=nl.sbuf)
+            nisa.tensor_tensor(dst=summed, data1=tile.acc[:, program * half:(program + 1) * half],
+                               data2=theirs, op=nl.add)
+        else:
+            summed = tile.acc
+        marked = nl.ndarray((n, half), dtype=nl.float32, buffer=nl.sbuf)
+        nisa.memset(dst=marked, value=_NAN)
+        nisa.tensor_copy_predicated(dst=marked, src=summed, predicate=tile.keep.ap(
+            pattern=[[tile.keep.shape[1], n], [0, half]]))
+        # Each replica's rows in this tile, at their place in the combine order.
+        for r in range(replicas):
+            lo, hi = max(first, r * per_replica), min(first + real, (r + 1) * per_replica)
+            if lo >= hi:
+                continue
+            nisa.dma_copy(
+                dst=out.ap(pattern=[[width_c, hi - lo], [per_replica * width_c, own_chunks],
+                                    [1, width_c]],
+                           offset=(r * chunks + program * own_chunks) * per_replica * width_c
+                           + (lo - r * per_replica) * width_c),
+                src=marked[lo - first:hi - first, :])
     if visits is not None:
         return out, exposed[0], exposed[1], visits, choice
     if expose_codes:
