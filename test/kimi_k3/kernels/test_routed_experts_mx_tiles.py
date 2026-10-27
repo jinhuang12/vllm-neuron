@@ -297,6 +297,8 @@ def test_tiles_equal_one_tile(reference, split):
     print(f"Vm {tokens}, {slots} slots, tiles of {tile}: {len(visited)} entries visited")
     assert torch.equal(served[0].view(torch.int32), served[1].view(torch.int32)), "the partials differ"
     assert torch.equal(one[0].view(torch.int32), tiled[0].view(torch.int32)), "the test-mode partials differ"
-    for name, n in (("codes", 1), ("scales", 2)):
-        assert torch.equal(one[n][visited], tiled[n][visited]), f"the visited experts' {name} differ"
+    assert torch.equal(one[1][visited], tiled[1][visited]), "the visited experts' codes differ"
+    # The test mode stores whole scale tiles, but quantization writes only the rows read here.
+    exponents = [_kernel_codes(out[1], out[2], visited, tokens, reference.width)[1] for out in (one, tiled)]
+    assert torch.equal(*exponents), "the visited experts' scales differ"
     assert torch.equal(one[3], tiled[3]) and torch.equal(one[4], tiled[4]), "the visits or the choice differ"
