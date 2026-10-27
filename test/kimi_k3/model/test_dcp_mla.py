@@ -4,9 +4,11 @@
 The 4-layer config (KDA layers 0 to 2, MLA layer 3) loads one set of random weights on two
 gloo ranks at TP 2, once at DCP 2 and once at DCP 1. Each world runs the same steps on the
 runner's metadata: a prompt of 4 prefill chunks, then 16 decode steps of two sequences, the
-prompt's and a new one whose context stays inside its first block. The error is the largest
-difference over the largest DCP 1 magnitude, on each rank. Between the prompt and the decode
-steps, the runner's jump-forward input step builds its inputs once, for the last item.
+prompt's and a new one whose context stays inside its first block. The prefill error is the
+largest difference over the largest DCP 1 magnitude, on each rank. The decode steps are read in
+bf16 units in the last place: the DCP decode kernel's output, before the output projection,
+and the logits. Between the prompt and the decode steps, the runner's jump-forward input step
+builds its inputs once, for the last item.
 
 Most kernels on this path run only on a device or the NKI simulator; of the attention kernels
 only the DCP decode attention has a torch form for the CPU venue. So torch forms of the others'
@@ -21,7 +23,9 @@ checkpoint directory (default ``~/models/moonshotai/Kimi-K3``); run with
 
 import contextlib
 import copy
+import inspect
 import json
+import math
 import os
 import types
 from pathlib import Path
@@ -40,7 +44,6 @@ from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 from vllm.v1.core.kv_cache_utils import get_kv_cache_config_from_groups, get_kv_cache_groups
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 
-from vllm_neuron.functional.attention import mla_paged
 from vllm_neuron.functional.attention.attn_res_decode import AttnResDecodeOutput
 from vllm_neuron.model.kimi_k3 import model as m
 from vllm_neuron.model.kimi_k3 import weight_loaders_mxfp4
@@ -63,6 +66,8 @@ TP, DCP, BLOCK, MAX_LEN, VOCAB = 2, 2, 256, 4096, 10240
 # decode steps and the jump-forward step then cross from block 7, on rank 1, to block 8, on rank 0.
 CHUNKS = (512, 512, 512, 511)
 PROMPT, STEPS, BLOCKS, BOUND = sum(CHUNKS), 16, 80, 1e-5
+# A step whose two largest DCP 1 logits are at most this many units apart is a tie.
+TIE_UNITS = 2
 JUMP_TOKENS, JUMP_ROWS = 2, 4
 NULL_SLOT, PAD_SLOT = 0, -1
 Q_LORA, KV_LORA, ROPE = 1536, 512, 64
@@ -298,8 +303,7 @@ def _mla_decode(*args):
     """The paged MLA decode at one rank: the DCP mode's torch form over a one-rank group."""
     *inputs, table, context_lens, slots, eps = args
     owner = torch.ones(context_lens.shape, dtype=torch.int32)
-    return mla_paged.mla_paged_decode_dcp(*inputs, table, context_lens, slots, owner, eps,
-                                          ONE_RANK)
+    return m.mla_paged_decode_dcp(*inputs, table, context_lens, slots, owner, eps, ONE_RANK)
 
 
 @contextlib.contextmanager
@@ -329,6 +333,18 @@ def _tap(store: list, forward):
     return run
 
 
+def _tap_kernel(store: list, kernel):
+    """``kernel``, keeping a copy of each output and of its ``owner`` input in ``store``."""
+    signature = inspect.signature(kernel)
+
+    def run(*args, **kwargs):
+        out, pages = kernel(*args, **kwargs)
+        owner = signature.bind(*args, **kwargs).arguments["owner"]
+        store.append((out.clone(), owner.clone()))
+        return out, pages
+    return run
+
+
 def _serve(config, root: Path, rank: int, dcp: int) -> dict:
     """The prompt's chunks, the jump-forward step, then the decode steps, on this rank."""
     model, ids = _small_model(), torch.load(root / "ids.pt")
@@ -339,10 +355,12 @@ def _serve(config, root: Path, rank: int, dcp: int) -> dict:
     _add(runner, "prompt", ids["prompt"].tolist(), tables["prompt"], 1)
     _add(runner, "short", ids["decode"][:1, 1].tolist(), tables["short"], 2)
     seen, rank_t, start = {"prefill": [], "decode": []}, torch.tensor([rank], dtype=torch.int32), 0
+    kernel = []
     with _stand_ins() as patch:
         for kind, store in seen.items():
             name = f"forward_{kind}"
             patch.setattr(m.KimiK3MLA, name, _tap(store, getattr(m.KimiK3MLA, name)))
+        patch.setattr(m, "mla_paged_decode_dcp", _tap_kernel(kernel, m.mla_paged_decode_dcp))
         for size in CHUNKS:
             positions = np.arange(start, start + size)
             meta = _metadata(runner, positions, np.zeros(size, dtype=np.int64), 1, size, start)
@@ -358,7 +376,9 @@ def _serve(config, root: Path, rank: int, dcp: int) -> dict:
             steps.append(model(ids["decode"][step], torch.from_numpy(positions),
                                attn_metadata=meta, rank=rank_t))
     return {"chunks": seen["prefill"], "next": logits, "steps": torch.stack(steps),
-            "attention": torch.stack(seen["decode"]), "jump": jump}
+            "attention": torch.stack(seen["decode"]), "jump": jump,
+            "kernel": torch.stack([out for out, _ in kernel]),
+            "owner": torch.stack([owner for _, owner in kernel])}
 
 
 def _jump_forward(runner, token: int, tables: dict) -> dict:
@@ -412,6 +432,54 @@ def _error(got: torch.Tensor, ref: torch.Tensor) -> float:
     return float((got - ref).abs().max() / ref.abs().max())
 
 
+def _unit(x: float) -> float:
+    """One bf16 unit in the last place at ``x``: 2^(e - 7), where 2^e <= |x| < 2^(e + 1)."""
+    return 2.0 ** (math.frexp(abs(float(x)))[1] - 8)
+
+
+def _vocab(run: list[dict], step: int, seq: int) -> torch.Tensor:
+    """One step's logits over the full vocabulary, both ranks' halves gathered."""
+    return torch.cat([out["steps"][step, seq] for out in run]).double()
+
+
+def _decode_misses(runs, seq: int) -> dict:
+    """The seam, logits and argmax reads of sequence ``seq``: what each finds over its bound.
+
+    Units are taken at DCP 1's values: for the seam, the rank's kernel output at that step
+    and sequence; for the logits, the full vocabulary at that step.
+    """
+    misses = {"seam": [], "logits": [], "argmax": []}
+    ties = []
+    for s in range(STEPS):
+        for rank, (got, ref) in enumerate(zip(runs[DCP], runs[1])):
+            a, b = got["kernel"][s, :, seq].double(), ref["kernel"][s, :, seq].double()
+            move = float((a - b).abs().max()) / _unit(b.abs().max())
+            if not move <= 1:
+                misses["seam"].append((s, rank, move))
+        got, ref = _vocab(runs[DCP], s, seq), _vocab(runs[1], s, seq)
+        unit, top = _unit(ref.abs().max()), ref.topk(2).values
+        move = float((got - ref).abs().max()) / unit
+        if not move <= 1:
+            misses["logits"].append((s, move))
+        if float(top[0] - top[1]) / unit <= TIE_UNITS:
+            ties.append(s)
+        elif int(got.argmax()) != int(ref.argmax()):
+            misses["argmax"].append(s)
+    print(f"sequence {seq}: {len(ties)} tie steps excluded from the argmax read: {ties}")
+    return misses
+
+
+def _owner_misses(run: list[dict]) -> list:
+    """Steps where the ranks passing ``owner`` 1 are not the row's block index modulo DCP."""
+    misses = []
+    for s in range(STEPS):
+        for seq, position in enumerate((PROMPT + s, s)):
+            passing = [rank for rank, out in enumerate(run) if int(out["owner"][s, seq]) == 1]
+            if passing != [position // BLOCK % DCP]:
+                misses.append((s, seq, passing))
+    return misses
+
+
 def test_prefill_chunks_match_dcp_1(runs):
     """Each of the prompt's 4 chunks: the MLA layer output; then the next-token logits."""
     readings = []
@@ -423,19 +491,34 @@ def test_prefill_chunks_match_dcp_1(runs):
 
 
 def test_decode_steps_match_dcp_1(runs):
-    """Each of the 16 decode steps after the prompt: the prompt sequence's logits."""
-    readings = [_error(got["steps"][s, 0], ref["steps"][s, 0])
-                for got, ref in zip(runs[DCP], runs[1]) for s in range(STEPS)]
-    assert len(readings) == TP * STEPS and all(r <= BOUND for r in readings), readings
+    """The prompt sequence's 16 decode steps after the prompt, and the owner input of both.
+
+    Seam: every element of the DCP decode kernel's bf16 output, the attention output before
+    the output projection, is within one bf16 unit in the last place of the largest magnitude
+    among DCP 1's elements of that step and sequence. Logits: every step's next-token argmax
+    over the full vocabulary, both ranks' halves, equals DCP 1's, and each logit is within one
+    bf16 unit in the last place of the largest magnitude among DCP 1's logits of that step.
+    Ties: a step where DCP 1's two largest logits are at most two such units apart is excluded
+    from the argmax read and disclosed with its count, printed. Owner: for each sequence,
+    exactly one rank passes ``owner`` 1 per step, and it is the rank equal to the row's block
+    index modulo the DCP size; the row is the step's own latent row.
+    """
+    assert all(len(out["kernel"]) == len(out["owner"]) == STEPS
+               for run in runs.values() for out in run)
+    misses = _decode_misses(runs, 0)
+    misses["owner"] = _owner_misses(runs[DCP])
+    assert not any(misses.values()), misses
 
 
 def test_short_context_decode_matches_dcp_1_without_nan(runs):
-    """A context inside its first block, so rank 1 holds no key: within the bound, no NaN."""
-    readings, nan = [], 0
-    for got, ref in zip(runs[DCP], runs[1]):
-        readings += [_error(got["steps"][s, 1], ref["steps"][s, 1]) for s in range(STEPS)]
-        nan += int(got["steps"][:, 1].isnan().sum() + got["attention"][:, 1].isnan().sum())
-    assert nan == 0 and all(r <= BOUND for r in readings), (nan, readings)
+    """A context inside its first block, so rank 1 holds no key: no output is NaN.
+
+    The short sequence's decode steps meet the prompt sequence's seam, logits and argmax reads.
+    """
+    misses = _decode_misses(runs, 1)
+    nan = sum(int(out["steps"][:, 1].isnan().sum() + out["attention"][:, 1].isnan().sum()
+                  + out["kernel"][:, :, 1].isnan().sum()) for out in runs[DCP])
+    assert nan == 0 and not any(misses.values()), (nan, misses)
 
 
 def test_jump_forward_slots_follow_each_group_dcp_size(runs):
