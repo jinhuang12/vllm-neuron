@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Reduce the timed ``vllm bench serve`` result files of the 8K, 8-user cell to the steady TPOT.
+"""Reduce the timed ``vllm bench serve`` result files of one cell to the steady TPOT.
 
 Reads the ``--save-detailed`` result files of one cell, grouped by their ``process``
 and ``run`` metadata: two processes of three timed runs. Per request, the mean of
 ``itls`` with the first gap dropped; per run, the median over the requests; per
 process, the median of its runs; the value of record is the mean of the two process
-values, read against the bar, ``--bar-ms`` (default the registered bar). Guard: per
+values, read against the bar: with ``--cell``, that cell's limit of record in
+``cells.json``; else ``--bar-ms`` (default the 8K, 8-user bar). Guard: per
 request, the count of gaps after the first above 2x that request's median gap.
 
 Standard library only. Prints one JSON record. Exit 0 pass, 1 fail, 2 invalid run,
@@ -20,6 +21,7 @@ import sys
 from pathlib import Path
 
 BAR_MS = 42.12
+CELLS = Path(__file__).resolve().parent / "cells.json"
 OUTPUT_LEN = 128
 PROCESSES = 2
 RUNS = 3
@@ -137,18 +139,34 @@ def reduce(results, bar_ms=BAR_MS):
     return (PASS if value <= bar_ms else FAIL), record
 
 
+def limit_of_record(cell, cells=CELLS):
+    """Return the limit of record in ms of the named cell of a cells file, or None."""
+    doc = json.loads(Path(cells).read_text(encoding="utf-8"))
+    return next((c["limit_of_record_ms"] for c in doc["cells"] if c["name"] == cell), None)
+
+
 def main(argv=None):
     """Command-line entry point."""
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("paths", nargs="+", help="result files, or folders of *.json result files")
-    ap.add_argument("--bar-ms", type=float, default=BAR_MS,
-                    help=f"the bar in ms (default {BAR_MS}, the registered bar)")
+    bar = ap.add_mutually_exclusive_group()
+    bar.add_argument("--bar-ms", type=float, default=BAR_MS,
+                     help=f"the bar in ms (default {BAR_MS}, the registered bar)")
+    bar.add_argument("--cell", help="a cell of the cells file; its limit of record is the bar")
+    ap.add_argument("--cells", type=Path, default=CELLS, help="the cells file (default: cells.json)")
     args = ap.parse_args(argv)
+    bar_ms = args.bar_ms
+    if args.cell is not None:
+        bar_ms = limit_of_record(args.cell, args.cells)
+        if bar_ms is None:
+            ap.error(f"no cell {args.cell!r} in {args.cells}")
     files = []
     for p in map(Path, args.paths):
         files.extend(sorted(p.glob("*.json")) if p.is_dir() else [p])
     results = [(str(f), json.loads(f.read_text(encoding="utf-8"))) for f in files]
-    code, record = reduce(results, args.bar_ms)
+    code, record = reduce(results, bar_ms)
+    if args.cell is not None:
+        record = {"cell": args.cell, "limit_of_record_ms": bar_ms, **record}
     print(json.dumps(record))
     return code
 

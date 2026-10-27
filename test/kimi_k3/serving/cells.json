@@ -1,0 +1,90 @@
+{
+  "description": "The 12 measured decode shapes of the Kimi K3 serving drivers. Each cell names the form that serves it, its planner floor, its floor-based limit (2.75 times the floor) and its TPOT limit of record in ms per step, which steady_tpot.py reads with --cell. Each form is one server: its DCP size, expert replica slots, max-model-len, decode buckets (max-model-len is the fallback bucket), KV segment size and serve flags.",
+  "placeholders": {"{checkpoint}": "the checkpoint directory", "{measurements}": "the measurement folder; the profiler writes under profiles/dcp<d>"},
+  "limits_of_record": "PROVISIONAL, filed 2026-10-25T07:12:30Z, until the user ratifies them",
+  "forms": {
+    "dcp4": {
+      "decode_context_parallel_size": 4,
+      "expert_replica_slots": 3,
+      "max_model_len": 32768,
+      "decode_context_length_buckets": [2048, 8192, 16384, 28672],
+      "kv_segment_size": 8192,
+      "server_flags": [
+        "--tensor-parallel-size", "32",
+        "--data-parallel-size", "2",
+        "--enable-expert-parallel",
+        "--decode-context-parallel-size", "4",
+        "--trust-remote-code",
+        "--gpu-memory-utilization", "0.90",
+        "--max-model-len", "32768",
+        "--max-num-batched-tokens", "8192",
+        "--long-prefill-token-threshold", "8192",
+        "--reasoning-parser", "kimi_k3",
+        "--no-enable-prefix-caching",
+        "--served-model-name", "us.moonshotai.kimi-k3", "{checkpoint}",
+        "--profiler-config", "{\"profiler\": \"cuda\", \"delay_iterations\": 0, \"max_iterations\": 5}",
+        "--additional-config", "{\"neuron_config\": {\"expert_replica_slots\": 3, \"decode_context_length_buckets\": [2048, 8192, 16384, 28672]}, \"neuron_profiler\": {\"activities\": [\"device_profile\", \"system_profile\"], \"neuron_cores\": [0], \"output_dir\": \"{measurements}/profiles/dcp4\", \"sys_trace_max_events_per_nc\": null}}"
+      ]
+    },
+    "dcp16": {
+      "decode_context_parallel_size": 16,
+      "expert_replica_slots": 3,
+      "max_model_len": 131072,
+      "decode_context_length_buckets": [2048, 8192, 16384, 28672, 45056, 77824],
+      "kv_segment_size": 8192,
+      "server_flags": [
+        "--tensor-parallel-size", "32",
+        "--data-parallel-size", "2",
+        "--enable-expert-parallel",
+        "--decode-context-parallel-size", "16",
+        "--trust-remote-code",
+        "--gpu-memory-utilization", "0.90",
+        "--max-model-len", "131072",
+        "--max-num-batched-tokens", "8192",
+        "--long-prefill-token-threshold", "8192",
+        "--reasoning-parser", "kimi_k3",
+        "--no-enable-prefix-caching",
+        "--served-model-name", "us.moonshotai.kimi-k3", "{checkpoint}",
+        "--profiler-config", "{\"profiler\": \"cuda\", \"delay_iterations\": 0, \"max_iterations\": 5}",
+        "--additional-config", "{\"neuron_config\": {\"expert_replica_slots\": 3, \"decode_context_length_buckets\": [2048, 8192, 16384, 28672, 45056, 77824]}, \"neuron_profiler\": {\"activities\": [\"device_profile\", \"system_profile\"], \"neuron_cores\": [0], \"output_dir\": \"{measurements}/profiles/dcp16\", \"sys_trace_max_events_per_nc\": null}}"
+      ]
+    },
+    "dcp32": {
+      "decode_context_parallel_size": 32,
+      "expert_replica_slots": 2,
+      "max_model_len": 131072,
+      "decode_context_length_buckets": [2048, 8192, 16384, 28672, 45056, 77824],
+      "kv_segment_size": 8192,
+      "server_flags": [
+        "--tensor-parallel-size", "32",
+        "--data-parallel-size", "2",
+        "--enable-expert-parallel",
+        "--decode-context-parallel-size", "32",
+        "--trust-remote-code",
+        "--gpu-memory-utilization", "0.90",
+        "--max-model-len", "131072",
+        "--max-num-batched-tokens", "8192",
+        "--long-prefill-token-threshold", "8192",
+        "--reasoning-parser", "kimi_k3",
+        "--no-enable-prefix-caching",
+        "--served-model-name", "us.moonshotai.kimi-k3", "{checkpoint}",
+        "--profiler-config", "{\"profiler\": \"cuda\", \"delay_iterations\": 0, \"max_iterations\": 5}",
+        "--additional-config", "{\"neuron_config\": {\"expert_replica_slots\": 2, \"decode_context_length_buckets\": [2048, 8192, 16384, 28672, 45056, 77824]}, \"neuron_profiler\": {\"activities\": [\"device_profile\", \"system_profile\"], \"neuron_cores\": [0], \"output_dir\": \"{measurements}/profiles/dcp32\", \"sys_trace_max_events_per_nc\": null}}"
+      ]
+    }
+  },
+  "cells": [
+    {"name": "2K-1", "S": 2048, "concurrency": 1, "form": "dcp4", "floor_ms": 10.057642072826582, "floor_based_limit_ms": 27.6585157002731, "limit_of_record_ms": 29.453169},
+    {"name": "2K-8", "S": 2048, "concurrency": 8, "form": "dcp4", "floor_ms": 12.76335368548424, "floor_based_limit_ms": 35.09922263508166, "limit_of_record_ms": 38.161503},
+    {"name": "2K-32", "S": 2048, "concurrency": 32, "form": "dcp4", "floor_ms": 20.94573977857752, "floor_based_limit_ms": 57.600784391088176, "limit_of_record_ms": 57.744174},
+    {"name": "8K-1", "S": 8192, "concurrency": 1, "form": "dcp4", "floor_ms": 10.212279589440143, "floor_based_limit_ms": 28.083768870960395, "limit_of_record_ms": 29.453169},
+    {"name": "8K-8", "S": 8192, "concurrency": 8, "form": "dcp4", "floor_ms": 13.197153685484242, "floor_based_limit_ms": 36.29217263508166, "limit_of_record_ms": 38.850552},
+    {"name": "8K-32", "S": 8192, "concurrency": 32, "form": "dcp16", "floor_ms": 21.564289845031773, "floor_based_limit_ms": 59.30179707383738, "limit_of_record_ms": 59.351055},
+    {"name": "32K-1", "S": 32768, "concurrency": 1, "form": "dcp4", "floor_ms": 10.646079589440145, "floor_based_limit_ms": 29.276718870960398, "limit_of_record_ms": 30.181218},
+    {"name": "32K-8", "S": 32768, "concurrency": 8, "form": "dcp16", "floor_ms": 13.815703751938496, "floor_based_limit_ms": 37.993185317830864, "limit_of_record_ms": 39.926703},
+    {"name": "32K-32", "S": 32768, "concurrency": 32, "form": "dcp32", "floor_ms": 22.417212245031774, "floor_based_limit_ms": 61.64733367383738, "limit_of_record_ms": 62.199086},
+    {"name": "128K-1", "S": 131072, "concurrency": 1, "form": "dcp16", "floor_ms": 11.264629655894403, "floor_based_limit_ms": 30.97773155370961, "limit_of_record_ms": 31.154334},
+    {"name": "128K-8", "S": 131072, "concurrency": 8, "form": "dcp32", "floor_ms": 14.504265351938496, "floor_based_limit_ms": 39.88672971783087, "limit_of_record_ms": 42.109845},
+    {"name": "128K-32", "S": 131072, "concurrency": 32, "form": "dcp32", "floor_ms": 24.224633266970784, "floor_based_limit_ms": 66.61774148416966, "limit_of_record_ms": 67.947465}
+  ]
+}

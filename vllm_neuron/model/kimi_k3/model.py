@@ -24,6 +24,7 @@ from torch import nn
 from torch.distributed import _functional_collectives as funcol
 from transformers import PretrainedConfig
 from vllm.distributed.parallel_state import (
+    get_dcp_group,
     get_tp_group,
     get_world_group,
     model_parallel_is_initialized,
@@ -34,6 +35,7 @@ from vllm_neuron.functional.attention.attn_res_decode import attn_res_decode, at
 from vllm_neuron.functional.attention.attn_res_prefill import attn_res_prefill
 from vllm_neuron.functional.attention.mla_paged import (
     mla_paged_decode,
+    mla_paged_decode_dcp,
     mla_paged_prefill,
     prepare_mla_weights,
 )
@@ -99,6 +101,18 @@ def _tp_rank_and_size() -> tuple[int, int]:
     """This process's rank in the tensor-parallel group and the group's size."""
     group = _tp_group()
     return (group.rank_in_group, group.world_size) if group is not None else (0, 1)
+
+
+def _dcp_group():
+    """vLLM's decode context parallel group, or None at one rank or outside a distributed run.
+
+    Its ranks are consecutive ranks of the tensor-parallel group, each with its own heads,
+    and rank ``r`` of it holds every sequence block ``j`` with ``j % size == r``.
+    """
+    if not model_parallel_is_initialized():
+        return None
+    group = get_dcp_group()
+    return group if group.world_size > 1 else None
 
 
 def _all_reduce(x: torch.Tensor) -> torch.Tensor:
@@ -543,6 +557,10 @@ class KimiK3MLA(nn.Module):
     Each tensor-parallel rank holds a contiguous group of heads. ``q_a`` and ``kv_a`` load
     whole: prefill projects the whole normed input with them, and decode projects the
     rank's K slice with the rank's rows of them, then sums the partials over the group.
+
+    Under decode context parallelism each rank of the DCP group caches every DCP-th block
+    of a sequence. A decode step attends the rank's own blocks and merges the partials over
+    the group; a prefill chunk gathers the whole cached prefix first.
     """
 
     def __init__(self, text_config: KimiK3TextConfig):
@@ -551,6 +569,7 @@ class KimiK3MLA(nn.Module):
         if not (c.mla_use_nope and c.mla_use_output_gate):
             raise ValueError("Kimi K3 MLA layers are NoPE with an output gate")
         self.tp_rank, self.tp_size = _tp_rank_and_size()
+        self.dcp_group = _dcp_group()
         hidden, dtype, heads = c.hidden_size, c.torch_dtype, c.mla_heads_per_rank(self.tp_size)
         if hidden % self.tp_size:
             raise ValueError(f"hidden size {hidden} does not split over {self.tp_size} ranks")
@@ -644,9 +663,64 @@ class KimiK3MLA(nn.Module):
             if table.shape[0] != 1:
                 raise ValueError(f"Kimi K3 MLA prefill takes one sequence, got {table.shape[0]}")
             prefix = meta["cached_seq_len"].reshape(1)
+            if self.dcp_group is not None:
+                return self._prefill_dcp(args, table[0], prefix, slots)
             out, _ = mla_paged_prefill(*args, table[0], prefix, slots, MLA_NORM_EPS)
+        elif self.dcp_group is not None:
+            out = self._decode_dcp(args, table, meta["positions"], slots)
         else:
             out, _ = mla_paged_decode(*args, table, meta["positions"], slots, MLA_NORM_EPS)
+        return out
+
+    def _decode_dcp(self, args, table, positions, slots):
+        """One decode step on this rank's blocks, its partials merged over the DCP group.
+
+        Of a sequence's ``n`` cached tokens the rank holds its block of each full turn of the
+        group and its part of the last turn. The step's own latent row is a key on its owner
+        rank only, the rank whose block caches it, so the merge counts it once.
+        """
+        group, block_size = self.dcp_group, args[-1]
+        size, rank = group.world_size, group.rank_in_group_tensor.reshape(1)
+        turn = block_size * size
+        last = (positions % turn - rank * block_size).clamp(0, block_size)
+        held = positions // turn * block_size + last
+        owner = (positions // block_size % size == rank).to(torch.int32)
+        out, _ = mla_paged_decode_dcp(*args, table, held, slots, owner, MLA_NORM_EPS, group)
+        return out
+
+    def _prefill_dcp(self, args, table, prefix, slots):
+        """A prefill chunk under DCP, over the whole cached prefix of its sequence.
+
+        One all-gather over the DCP group brings each rank's blocks of the sequence's table into
+        a workspace, rank by rank, and the prefill kernel reads it through the table remapped
+        to sequence order, so no block is moved twice. The kernel writes the chunk's latent rows
+        into the workspace past the prefix, where its reads mask them. Each row then goes to its
+        slot of the cache: a real slot on its owner rank, the null block on the others.
+        """
+        group, pages, start, block_size = self.dcp_group, *args[7:]
+        _, dtype, (_, width) = self._cache_layout
+        size, blocks, row = group.world_size, table.shape[0], width * dtype.itemsize
+        ids = table.long().clamp(0, pages.shape[0] - 1)
+        workspace = group.all_gather(
+            pages[:, start : start + block_size * row].index_select(0, ids), dim=0
+        )
+
+        def place(block):
+            """The workspace block of sequence block ``block``: its rank's part, then its turn."""
+            return block % size * blocks + block // size
+
+        order = place(torch.arange(size * blocks, device=table.device)).to(torch.int32)
+        tokens = torch.arange(slots.shape[0], device=slots.device)
+        pos = (prefix.long() + tokens).clamp(max=size * blocks * block_size - 1)
+        local = place(pos // block_size) * block_size + pos % block_size
+        out, _ = mla_paged_prefill(
+            *args[:7], workspace, 0, block_size, order, prefix, local, MLA_NORM_EPS
+        )
+        rows = workspace.view(dtype).view(-1, width).index_select(0, local)
+        s = slots.long()
+        s = torch.where((s < 0) | (s >= pages.shape[0] * block_size), 0, s)
+        target = s // block_size * (pages.shape[1] // row) + start // row + s % block_size
+        pages.view(dtype).view(-1, width).index_copy_(0, target, rows)
         return out
 
     def forward_prefill(self, mix, norm_weight, meta) -> torch.Tensor:
