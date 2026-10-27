@@ -66,10 +66,16 @@ NAN_ROWS = {160: (6, 150), 129: (6, 128)}
 #: p per case, as filed: the share of its intermediate codes an emulated correct kernel flips
 #: at the device MX product noise measured on that case's own operands. None is not yet filed.
 CODE_NOISE = {
-    f"{regime}, Vm {tokens}, {SLOTS} slots": None
-    for tokens, _ in SHAPES
-    for regime in ("correlated rows", "repeated tokens", "sigmoid inputs at 12", "small near-equal rows",
-                   "clean rows")
+    "correlated rows, Vm 160, 2 slots": 0.020699280958909255,
+    "repeated tokens, Vm 160, 2 slots": 0.007823340098063153,
+    "sigmoid inputs at 12, Vm 160, 2 slots": 0.0073085572984483505,
+    "small near-equal rows, Vm 160, 2 slots": 0.0072318924797905824,
+    "clean rows, Vm 160, 2 slots": 0.007301862312085701,
+    "correlated rows, Vm 129, 2 slots": 0.01807727534436235,
+    "repeated tokens, Vm 129, 2 slots": 0.006493738455365794,
+    "sigmoid inputs at 12, Vm 129, 2 slots": 0.00729209775045758,
+    "small near-equal rows, Vm 129, 2 slots": 0.007517757578792735,
+    "clean rows, Vm 129, 2 slots": 0.007289751760924714,
 }
 #: R per case: the largest share of its intermediate codes that may differ from the oracle's.
 CODE_LIMITS = {label: None if p is None else 3 * p for label, p in CODE_NOISE.items()}
