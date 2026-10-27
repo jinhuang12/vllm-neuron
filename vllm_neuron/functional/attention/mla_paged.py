@@ -231,12 +231,11 @@ def _cache_keys(table_row, length, blocks, pages, window, positions):
     return held, bound, invalid
 
 
-def _cache_pages(cache, held, first_tile, n_tiles, block_size, first, queue=None, after=None):
+def _cache_pages(cache, held, first_tile, n_tiles, block_size, first, queue=None):
     """Window tiles ``first_tile ..`` of a sequence as one ``[128, n_tiles, 576]`` page tile.
 
     ``cache`` is the bf16 view ``[blocks, page elements]`` of the page buffer, its latent
-    block from element ``first`` of each page. ``queue`` names the loads' DMA options, and
-    ``after`` an instruction they are scheduled after.
+    block from element ``first`` of each page. ``queue`` names the loads' DMA options.
     """
     per = block_size // _P
     pages = _sb((_P, n_tiles, _LATENT), cache.dtype)
@@ -244,12 +243,11 @@ def _cache_pages(cache, held, first_tile, n_tiles, block_size, first, queue=None
     while t < n_tiles:
         b, r = (first_tile + t) // per, (first_tile + t) % per
         n = min(n_tiles - t, per - r)
-        load = nisa.dma_copy(dst=pages[:, t:t + n, :],
-                             src=cache.ap(pattern=[[_LATENT, _P], [_P * _LATENT, n], [1, _LATENT]],
-                                          offset=first + r * _P * _LATENT,
-                                          scalar_offset=held[0:1, b:b + 1], indirect_dim=0),
-                             **(queue or {}))
-        _after(load, after)
+        nisa.dma_copy(dst=pages[:, t:t + n, :],
+                      src=cache.ap(pattern=[[_LATENT, _P], [_P * _LATENT, n], [1, _LATENT]],
+                                   offset=first + r * _P * _LATENT,
+                                   scalar_offset=held[0:1, b:b + 1], indirect_dim=0),
+                      **(queue or {}))
         t += n
     return pages
 
@@ -427,7 +425,7 @@ def _attend(groups, kind, tiles, key0, scale, zero, values=None):
         _accumulate(sc, tiles if values is None else values)
 
 
-def _pipelined(steps, scale, zero, queries, query_first=False):
+def _pipelined(steps, scale, zero, queries):
     """Run single-group steps with each engine's work for later steps emitted ahead.
 
     A step is ``(group, kind, key0, load)``; ``load()`` issues its page DMA and returns a
@@ -436,31 +434,52 @@ def _pipelined(steps, scale, zero, queries, query_first=False):
     transposes three ahead, scores one ahead, then this step's sum, so each engine has
     independent work queued while the dependent chain of a step completes. ``queries()``
     fills the groups' queries and is emitted just before the first scores.
-
-    With ``query_first``, ``queries()`` is emitted after the first loads instead and returns
-    an instruction; the clears and key transposes of the steps up to the first scores are
-    scheduled after it, so the query chain has the engines first.
     """
     n, st, k = len(steps), [dict() for _ in steps], _KEYS_AHEAD
-    early, gate = (min(n, k + 2) if query_first else 0), None
-    for i in range(early):
-        st[i]["finish"] = steps[i][3]()
-    if query_first:
-        gate = queries()
-
-    def after(i):
-        return gate if i <= k else None
     for t in range(-k - 2, n):
-        if t == -1 and not query_first:
+        if t == -1:
             queries()
-        if early <= t + k + 2 < n:
+        if t + k + 2 < n:
             st[t + k + 2]["finish"] = steps[t + k + 2][3]()
         if 0 <= t + k + 1 < n:
-            st[t + k + 1]["tiles"] = st[t + k + 1].pop("finish")(after(t + k + 1))
+            st[t + k + 1]["tiles"] = st[t + k + 1].pop("finish")()
         if 0 <= t < n:
             _weights_t(st[t]["sc"])
         if 0 <= t + k < n:
-            st[t + k]["kt"] = _keys_t(st[t + k]["tiles"], after(t + k))
+            st[t + k]["kt"] = _keys_t(st[t + k]["tiles"])
+        if 0 <= t + 1 < n:
+            g, kind, key0, _ = steps[t + 1]
+            rows_k = [x.shape[0] for x in st[t + 1]["tiles"]]
+            st[t + 1]["sc"] = _scores(g, kind, st[t + 1].pop("kt"), rows_k, key0, scale, zero)
+        if 0 <= t < n:
+            _accumulate(st[t]["sc"], st[t]["tiles"])
+            st[t].clear()
+
+
+def _gated_pipeline(steps, scale, zero, gate, free, queries):
+    """``_pipelined`` for steps whose page loads are issued, with queries from an all-gather.
+
+    A step is ``(group, kind, key0, finish)``, ``finish(gate)`` the finisher of its load. The
+    first ``free`` steps' clears and key transposes are emitted first, free of the gather, so
+    they run as their pages land. ``queries()`` then fills the groups' queries from the gather,
+    and the first scores follow. Every later step's clears and key transposes are scheduled
+    after ``gate``, the gather, four and three steps ahead of their scores as in ``_pipelined``.
+    """
+    n, st, k = len(steps), [dict() for _ in steps], _KEYS_AHEAD
+    free = n if n <= k + 1 else min(n, max(free, k + 1))  # the first scores' keys are free
+    for i in range(-1, free):
+        if i + 1 < free:
+            st[i + 1]["tiles"] = steps[i + 1][3]()
+        if i >= 0:
+            st[i]["kt"] = _keys_t(st[i]["tiles"])
+    queries()
+    for t in range(-1, n):
+        if free <= t + k + 1 < n:
+            st[t + k + 1]["tiles"] = steps[t + k + 1][3](gate)
+        if 0 <= t < n:
+            _weights_t(st[t]["sc"])
+        if free <= t + k < n:
+            st[t + k]["kt"] = _keys_t(st[t + k]["tiles"], gate)
         if 0 <= t + 1 < n:
             g, kind, key0, _ = steps[t + 1]
             rows_k = [x.shape[0] for x in st[t + 1]["tiles"]]
@@ -567,14 +586,13 @@ def _check_common(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, slots):
     return heads
 
 
-def _cache_step(cache, held, invalid, b, window, block_size, first_elem, queue=None,
-                after=None):
+def _cache_step(cache, held, invalid, b, window, block_size, first_elem, queue=None):
     """The page load of a sequence's key block ``b``; its finisher clears the unowned rows,
     scheduled after the instruction it is given."""
     first_tile, n_t = b * (_BLOCK // _P), min(_BLOCK, window - b * _BLOCK) // _P
 
     def load():
-        tiles = _cache_pages(cache, held, first_tile, n_t, block_size, first_elem, queue, after)
+        tiles = _cache_pages(cache, held, first_tile, n_t, block_size, first_elem, queue)
         return lambda gate=None: _clear_unowned(tiles, invalid, first_tile, gate)
     return load
 
@@ -741,17 +759,19 @@ def _shared(shape, dtype, name):
     return nl.ndarray(shape, dtype=dtype, buffer=nl.shared_hbm, name=name)
 
 
-# DMA queues of the DCP mode: the query chain's loads and stores first, then the metadata, then
-# the pages. A lower priority number is served first.
+# DMA queues of the DCP mode: the query chain's loads and stores first, then the pages. A lower
+# priority number is served first.
 _QUERY_QUEUE = {"dge_mode": nisa.dge_mode.hwdge, "engine": nisa.engine.scalar, "priority": 0}
-_META_QUEUE = {"dge_mode": nisa.dge_mode.hwdge, "engine": nisa.engine.sync, "priority": 1}
 _PAGE_QUEUE = {"dge_mode": nisa.dge_mode.hwdge, "engine": nisa.engine.sync, "priority": 2}
 _QB_CHUNK = 3  # K tiles of q_b per load
+# Keys per program whose pages land, cleared and transposed, while the query chain runs: the
+# page loads issue about 1.2 us apart, and the transposes and clears share the engines with it.
+_FREE_KEYS = 2560
 
 
-def _load_weights_first(w_qb_t, w_uk, w_uv_t, heads):
-    """``_load_weights`` with ``q_b`` and ``W_UK`` on the query queue, ``q_b`` in chunks of K
-    tiles, and ``W_UV`` on the page queue after them; also the last ``q_b`` or ``W_UK`` load."""
+def _load_weights_first(w_qb_t, w_uk, heads):
+    """``q_b^T`` by K tile and ``W_UK`` by head on the query queue, ``q_b`` in chunks of K tiles;
+    also the ``W_UK`` load."""
     width = heads * (_NOPE + _ROPE)
     wqb = _sb((_P, _K_TILES, width), w_qb_t.dtype)
     for k0 in range(0, _K_TILES, _QB_CHUNK):
@@ -761,16 +781,21 @@ def _load_weights_first(w_qb_t, w_uk, w_uv_t, heads):
     wuk = _sb((_P, heads, _KV_LORA), w_uk.dtype)
     last = nisa.dma_copy(dst=wuk, src=w_uk.ap(pattern=[[_KV_LORA, _P], [_P * _KV_LORA, heads],
                                                        [1, _KV_LORA]], offset=0), **_QUERY_QUEUE)
+    return wqb, wuk, last
+
+
+def _load_values(w_uv_t, heads, after):
+    """``W_UV^T`` by latent tile on the page queue, scheduled after the instruction ``after``."""
     wuv = _sb((_P, _V_TILES, heads, _V), w_uv_t.dtype)
     _after(nisa.dma_copy(dst=wuv, src=w_uv_t.ap(pattern=[[_V, _P], [_P * _V, _V_TILES],
                                                          [_KV_LORA * _V, heads], [1, _V]],
-                                                offset=0), **_PAGE_QUEUE), last)
-    return wqb, wuk, wuv, last
+                                                offset=0), **_PAGE_QUEUE), after)
+    return wuv
 
 
 def _gather_queries(qloc, first, count, tokens, heads, group, ranks, write):
-    """Every rank's ``q_lift`` for this program's tokens, ``[128, 5, ranks, count * heads]``
-    bf16, and the all-gather.
+    """The all-gather of every rank's ``q_lift`` for this program's tokens, and a function that
+    reads it back, ``[128, 5, ranks, count * heads]`` bf16.
 
     ``qloc [128, 5, count, heads]`` holds the rank's own heads by latent tile. Each rank's
     chunk of the all-gather is its ``[128, 4, T, heads]`` nope tiles, then its rope tile.
@@ -788,14 +813,18 @@ def _gather_queries(qloc, first, count, tokens, heads, group, ranks, write):
                                  offset=nope + first * heads),
                       src=qloc[0:_ROPE, _V_TILES, :, :], **_QUERY_QUEUE)
     gather = ncc.all_gather(srcs=[src], dsts=[dst], replica_group=group, collective_dim=0)
-    q = _sb((_P, len(_C_TILES), ranks, count * heads), nl.bfloat16)
-    nisa.dma_copy(dst=q[:, 0:_V_TILES, :, :],
-                  src=dst.ap(pattern=[[_V_TILES * per, _P], [per, _V_TILES], [size, ranks],
-                                      [1, count * heads]], offset=first * heads), **_QUERY_QUEUE)
-    nisa.dma_copy(dst=q[0:_ROPE, _V_TILES, :, :],
-                  src=dst.ap(pattern=[[per, _ROPE], [size, ranks], [1, count * heads]],
-                             offset=nope + first * heads), **_QUERY_QUEUE)
-    return q, gather
+
+    def read():
+        q = _sb((_P, len(_C_TILES), ranks, count * heads), nl.bfloat16)
+        nisa.dma_copy(dst=q[:, 0:_V_TILES, :, :],
+                      src=dst.ap(pattern=[[_V_TILES * per, _P], [per, _V_TILES], [size, ranks],
+                                          [1, count * heads]], offset=first * heads),
+                      **_QUERY_QUEUE)
+        nisa.dma_copy(dst=q[0:_ROPE, _V_TILES, :, :],
+                      src=dst.ap(pattern=[[per, _ROPE], [size, ranks], [1, count * heads]],
+                                 offset=nope + first * heads), **_QUERY_QUEUE)
+        return q
+    return gather, read
 
 
 def _group_weights(lse, first, count, tokens, gathered, dup, group, ranks, write):
@@ -979,72 +1008,77 @@ def mla_paged_decode_dcp_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv
         count = base + (1 if prg < extra else 0)
         b0, b1, lead = 0, n_blocks, True
 
-    wqb, wuk, wuv, last = _load_weights_first(w_qb_t, w_uk, w_uv_t, heads)
+    # The input, the gains and the metadata load first, ahead of the weights, so the query
+    # chain starts while the weights land.
     x = _sb((count, _QKV), nl.float32)
     nisa.dma_copy(dst=x, src=qkv_a[first:first + count, :])
-    lat = _sb((count, _LATENT), nl.bfloat16)
-    _latent_rows(lat, x, _gain(kv_norm, count), EPS)
+    raw = _sb((1, count * n_pages), nl.int32)
+    nisa.dma_copy(dst=raw, src=block_table.ap(pattern=[[count * n_pages, 1], [1, count * n_pages]],
+                                              offset=first * n_pages))
+    q_gain = _gain(q_norm, count)
+    held_n = _sb((_P, count), nl.int32)
+    nisa.dma_copy(dst=held_n, src=context_lens.ap(pattern=[[0, _P], [1, count]], offset=first))
+    flag = _sb((_P, count), nl.int32)
+    nisa.dma_copy(dst=flag, src=owner.ap(pattern=[[0, _P], [1, count]], offset=first))
+    kv_gain = _gain(kv_norm, count)
+    wqb, wuk, last = _load_weights_first(w_qb_t, w_uk, heads)
+    # The program's sequences' block ids, clamped into the cache. The slots load before the
+    # pages, since each page load holds its engine about 1.2 us.
+    ids = _sb((1, count * n_pages), nl.int32)
+    nisa.tensor_scalar(dst=ids, data=raw, op0=nl.maximum, operand0=0, op1=nl.minimum,
+                       operand1=blocks - 1)
     if lead:
         idx = _row_index(slots, first, count, blocks, block_size, page_rows, first_row)
-    q_gain = _gain(q_norm, count)
     # Query rows 0.. hold the gathered heads in rank order, and rows dup.. again where both fit.
     dup = _dup_row(gathered)
     rows_q = gathered if dup is None else dup + gathered
     qloc = _sb((_P, len(_C_TILES), count, heads), nl.bfloat16)
     ql = [_sb((_P, count, rows_q), nl.bfloat16) for _ in _C_TILES]
+    # own[:, s] is 1 where the new row is a key here; dead[:, s] where the rank has no key;
+    # invalid[r, j] where window row 128 j + r lies at or past the rank's cached length.
+    own = _sb((_P, count), nl.float32)
+    bound = _sb((_P, count), nl.float32)
+    seqs = []
+    for s in range(count):
+        group_s = {"rows": rows_q, "split": "passes" if dup is None else "rows", "dup": dup,
+                   "ql": [ql[i][0:w, s, :] for i, (_, w) in enumerate(_C_TILES)],
+                   "cache": bound[:, s:s + 1], "own": own[:, s:s + 1], "own_tiles": lambda k: 1,
+                   "m": None, "l": None, "acc": None}
+        seqs.append((group_s, ids[0:1, s * n_pages:(s + 1) * n_pages],
+                     _sb((_P, n_tiles), nl.uint8)))
+    steps = [(g, "cache", b * _BLOCK,
+              _cache_step(cache, held, invalid, b, window, block_size, first_elem, _PAGE_QUEUE)())
+             for b in range(b0, b1) for g, held, invalid in seqs]
+    step_keys = [min(_BLOCK, window - b * _BLOCK) for b in range(b0, b1) for _ in seqs]
+    wuv = _load_values(w_uv_t, heads, last)
 
+    _absorbed_queries([qloc[:, i, :, :] for i in range(len(_C_TILES))], True, x, q_gain, wqb, wuk,
+                      EPS, heads, k_outer=True)
+    lat = _sb((count, _LATENT), nl.bfloat16)
+    _latent_rows(lat, x, kv_gain, EPS)
     positions = _sb((_P, n_tiles), nl.float32)
     nisa.iota(dst=positions, pattern=[[_P, n_tiles]], offset=0, channel_multiplier=1)
     zero = _sb((_P, 1), nl.float32)
     nisa.memset(dst=zero, value=0.0)
-    # own[:, s] is 1 where the new row is a key here; dead[:, s] where the rank has no key.
-    flag = _sb((_P, count), nl.int32)
-    nisa.dma_copy(dst=flag, src=owner.ap(pattern=[[0, _P], [1, count]], offset=first),
-                  **_META_QUEUE)
-    own = _sb((_P, count), nl.float32)
     nisa.tensor_scalar(dst=own, data=flag, op0=nl.maximum, operand0=0.0, op1=nl.minimum,
                        operand1=1.0)
-    held_n = _sb((_P, count), nl.int32)
-    nisa.dma_copy(dst=held_n, src=context_lens.ap(pattern=[[0, _P], [1, count]], offset=first),
-                  **_META_QUEUE)
     keys = _sb((_P, count), nl.float32)
     nisa.scalar_tensor_tensor(dst=keys, data=held_n, op0=nl.maximum, operand0=0.0, op1=nl.add,
                               operand1=own)
     dead = _sb((_P, count), nl.uint8)
     nisa.tensor_scalar(dst=dead, data=keys, op0=nl.less, operand0=0.5)
-    # The program's sequences' block ids in one load, clamped into the cache, and each one's
-    # cached length as a bound: invalid[r, j] where window row 128 j + r lies at or past it.
-    raw = _sb((1, count * n_pages), nl.int32)
-    nisa.dma_copy(dst=raw, src=block_table.ap(pattern=[[count * n_pages, 1], [1, count * n_pages]],
-                                              offset=first * n_pages), **_META_QUEUE)
-    ids = _sb((1, count * n_pages), nl.int32)
-    nisa.tensor_scalar(dst=ids, data=raw, op0=nl.maximum, operand0=0, op1=nl.minimum,
-                       operand1=blocks - 1)
-    bound = _sb((_P, count), nl.float32)
     nisa.tensor_scalar(dst=bound, data=held_n, op0=nl.maximum, operand0=0.0, op1=nl.minimum,
                        operand1=float(window))
-    seqs = []
-    for s in range(count):
-        invalid = _sb((_P, n_tiles), nl.uint8)
+    for s, (_, _, invalid) in enumerate(seqs):
         nisa.tensor_scalar(dst=invalid, data=positions, op0=nl.greater_equal,
                            operand0=bound[:, s:s + 1])
-        group_s = {"rows": rows_q, "split": "passes" if dup is None else "rows", "dup": dup,
-                   "ql": [ql[i][0:w, s, :] for i, (_, w) in enumerate(_C_TILES)],
-                   "cache": bound[:, s:s + 1], "own": own[:, s:s + 1], "own_tiles": lambda k: 1,
-                   "m": None, "l": None, "acc": None}
-        seqs.append((group_s, ids[0:1, s * n_pages:(s + 1) * n_pages], invalid))
-    # The page loads follow the query chain's weights, on their own queue.
-    steps = [(g, "cache", b * _BLOCK,
-              _cache_step(cache, held, invalid, b, window, block_size, first_elem, _PAGE_QUEUE,
-                          last))
-             for b in range(b0, b1) for g, held, invalid in seqs]
     if lead:
-        steps += [(g, "own", 0, _own_step(lat, s)) for s, (g, _, _) in enumerate(seqs)]
+        steps += [(g, "own", 0, _own_step(lat, s)()) for s, (g, _, _) in enumerate(seqs)]
+        step_keys += [1] * count
+    gather, read = _gather_queries(qloc, first, count, tokens, heads, group, ranks, lead)
 
     def queries():
-        _absorbed_queries([qloc[:, i, :, :] for i in range(len(_C_TILES))], True, x, q_gain, wqb,
-                          wuk, EPS, heads, k_outer=True)
-        q, gather = _gather_queries(qloc, first, count, tokens, heads, group, ranks, lead)
+        q = read()
         for i, (_, w) in enumerate(_C_TILES):
             mine = ql[i][0:w, :, 0:gathered].reshape_dim(2, (ranks, heads))
             nisa.tensor_copy(dst=mine, src=q[0:w, i, :, :].reshape_dim(2, (count, heads))
@@ -1052,9 +1086,11 @@ def mla_paged_decode_dcp_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv
             if dup is not None:
                 nisa.memset(dst=ql[i][0:w, :, gathered:dup], value=0.0)
                 nisa.tensor_copy(dst=ql[i][0:w, :, dup:rows_q], src=ql[i][0:w, :, 0:gathered])
-        return gather
 
-    _pipelined(steps, scale, zero, queries, query_first=True)
+    free = 0
+    while free < len(steps) and sum(step_keys[:free + 1]) <= _FREE_KEYS:
+        free += 1
+    _gated_pipeline(steps, scale, zero, gather, free, queries)
 
     states = [(g["m"], g["l"], g["acc"]) for g, _, _ in seqs]
     if split:
