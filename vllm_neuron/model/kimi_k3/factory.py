@@ -65,6 +65,23 @@ class KimiK3ForConditionalGeneration(
         """Delegate the forward pass to the selected implementation."""
         return self._model(*args, **kwargs)
 
+    # Upstream's hybrid block-size step reads the state shapes and dtypes from
+    # the registered class; this class gives vLLM's own Kimi K3 values. vLLM's
+    # class is imported on first use, so the registry lookup stays model-free.
+    @classmethod
+    def get_mamba_state_shape_from_config(cls, vllm_config):
+        """Return vLLM's Kimi K3 state shapes for the config."""
+        from vllm.models.kimi_k3 import KimiK3ForConditionalGeneration as Upstream
+
+        return Upstream.get_mamba_state_shape_from_config(vllm_config)
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(cls, vllm_config):
+        """Return vLLM's Kimi K3 state dtypes for the config."""
+        from vllm.models.kimi_k3 import KimiK3ForConditionalGeneration as Upstream
+
+        return Upstream.get_mamba_state_dtype_from_config(vllm_config)
+
     @classmethod
     def from_configs(
         cls,
