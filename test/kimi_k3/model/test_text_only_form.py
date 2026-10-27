@@ -3,15 +3,17 @@
 
 The served checkpoint's config carries a vision part. The DCP 4 form's serve flags, from
 ``test/kimi_k3/serving/cells.json``, build the engine config through ``vllm serve``'s parser and
-the platform's config step. On 4 gloo CPU ranks, one replica at TP 4 with DCP 4, the real
-NeuronWorker then creates the model runner and loads the model on the meta device. That is the
-smallest world in which the form's 3 expert replica slots build; the served world of 64 ranks
-does not fit one host's CPU test. The load stops at the weight read, so no weight is read. Set
+the platform's config step. On 4 gloo CPU ranks, one replica at TP 4 with DCP 4, vLLM's worker
+wrapper then starts the NeuronWorker, which creates the model runner and loads the model on the
+meta device. That is the smallest world in which the form's 3 expert replica slots build; the
+served world of 64 ranks does not fit one host's CPU test. The load stops at the weight read, so
+no weight is read. Set
 ``KIMI_K3_CHECKPOINT`` to the checkpoint directory (its config and tokenizer only); run with
 ``VLLM_NEURON_CPU_MODE=1``.
 """
 
 import json
+import multiprocessing
 import os
 from pathlib import Path
 
@@ -26,6 +28,7 @@ from vllm.multimodal.inputs import PlaceholderRange
 from vllm.platforms import current_platform
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 from vllm_neuron.model.kimi_k3 import model as kimi_k3_model
 from vllm_neuron.parallel.neuron_parallel_state import init_neuron_distributed_environment
@@ -56,7 +59,7 @@ def served_config(tmp_path_factory):
 
 
 def _rank(rank: int, config, root: Path) -> None:
-    """One rank: the worker creates the runner and loads the model up to the weight read."""
+    """One rank, started as the executor starts it, loads the model up to the weight read."""
 
     def groups(self, *args, **kwargs):
         self._patch_in_same_node_as_function()
@@ -71,13 +74,14 @@ def _rank(rank: int, config, root: Path) -> None:
 
     NeuronWorker._init_neuron_distributed_environment_and_runtime = groups
     kimi_k3_model.KimiK3ForConditionalGeneration.load_weights = weight_read
-    worker = NeuronWorker(vllm_config=config, local_rank=rank, rank=rank,
-                          distributed_init_method="unused")
-    with set_current_vllm_config(config):
-        worker.init_device()
+    wrapper = WorkerWrapperBase(rpc_rank=0, global_rank=rank)
+    wrapper.init_worker([{"vllm_config": config, "local_rank": rank, "rank": rank,
+                          "distributed_init_method": "unused", "is_driver_worker": rank == 0,
+                          "shared_worker_lock": multiprocessing.Lock()}])
+    wrapper.init_device()
     with pytest.raises(_WeightRead):
-        worker.load_model()
-    runner = worker.model_runner
+        wrapper.load_model()
+    runner = wrapper.worker.model_runner
     cache = runner.encoder_cache
     (root / f"rank{rank}.json").write_text(json.dumps({
         "model": f"{type(runner.model).__module__}.{type(runner.model).__qualname__}",
