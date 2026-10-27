@@ -240,6 +240,16 @@ class NeuronPlatform(Platform):
     _mxfp4_architectures: frozenset[str] = frozenset(
         {"KimiK3ForConditionalGeneration"}
     )
+    # Architectures whose checkpoint config carries a vision part but whose
+    # Neuron model serves text only. The platform builds no encoder config for
+    # them, so the runner takes its text path and sets up no encoder cache, and
+    # validate_request refuses multimodal items.
+    _text_only_architectures: frozenset[str] = frozenset(
+        {"KimiK3ForConditionalGeneration"}
+    )
+    # The served architecture when it is in _text_only_architectures, else None.
+    # Set in check_and_update_config.
+    _text_only_architecture: str | None = None
     # Architectures whose DCP attention takes an owner flag per query token, so a
     # verify window of k + 1 tokens can span blocks held by different DCP ranks.
     # DCP with speculative decoding is refused for every other architecture.
@@ -807,7 +817,9 @@ class NeuronPlatform(Platform):
         # max_num_batched_tokens. The encoder budget cap in NeuronScheduler
         # already prevents overflow without needing this flag.
 
-        if hasattr(model_config.hf_config, "vision_config"):
+        text_only = model_config.architecture in cls._text_only_architectures
+        cls._text_only_architecture = model_config.architecture if text_only else None
+        if hasattr(model_config.hf_config, "vision_config") and not text_only:
             cls._resolve_vision_auto_config(vllm_config, model_config)
 
         # Compute the per-item embed limit for request validation.
@@ -887,6 +899,15 @@ class NeuronPlatform(Platform):
             and getattr(params, "structured_outputs", None) is not None
         ):
             raise ValueError(SO_DISABLED_MESSAGE)
+
+        if cls._text_only_architecture is not None and processed_inputs.get(
+            "mm_placeholders"
+        ):
+            raise ValueError(
+                f"This Neuron server serves {cls._text_only_architecture} as text "
+                "only. Vision input is out of the scope of this served form. Send "
+                "the request without image or video items."
+            )
 
         if cls._max_embeds_per_image is None:
             return
