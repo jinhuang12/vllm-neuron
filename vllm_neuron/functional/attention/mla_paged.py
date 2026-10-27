@@ -37,6 +37,15 @@ rank with no key writes partial 0 and LSE -3.0e38 by select. The merge weighs ea
 by ``exp(LSE - group LSE)`` and returns each rank its own heads: an all-to-all of partials
 and LSEs at 4 to 15 ranks, otherwise an all-gather of the LSEs and a reduce-scatter of the
 weighted partials. The collectives run inside the kernel, on shared HBM.
+
+The window mode runs a few causal queries per sequence in DCP mode: the verify window of the
+target, gated and with no rotary, and the draft block, with the interleaved rotary on the 64
+rope columns of each query and window row and no gate. Each sequence's ``Q`` window rows are its
+queries, and its window latent rows are keys from the launch's own tile, never read back from
+the cache: query ``i`` sees the rank's cached rows and the window rows ``j <= i`` that the rank
+holds, by select before the exp. The gather, the merge and ``W_UV`` are the DCP mode's, with
+each query row of a head one merged row. A non-finite window row is set to zero by select before
+it enters a product, and every query at or after it in its sequence is set to NaN by select.
 """
 
 import nki
@@ -128,11 +137,31 @@ def _rms_rows(dst, x, gain, eps):
                               operand1=gain)
 
 
-def _latent_rows(lat, x, kv_gain, eps):
-    """``lat[:T] = [norm(kv_a[:512]) * gain, kv_a[512:]]`` in bf16 for the T qkv_a rows ``x``."""
+def _latent_rows(lat, x, kv_gain, eps, rope=None):
+    """``lat[:T] = [norm(kv_a[:512]) * gain, kv_a[512:]]`` in bf16 for the T qkv_a rows ``x``;
+    with ``rope``, each row's cos | sin ``[T, 64]`` fp32, its rope columns rotated in fp32."""
     rows = x.shape[0]
     _rms_rows(lat[0:rows, 0:_KV_LORA], x[:, _Q_LORA:_Q_LORA + _KV_LORA], kv_gain, eps)
-    nisa.tensor_copy(dst=lat[0:rows, _KV_LORA:_LATENT], src=x[:, _Q_LORA + _KV_LORA:_QKV])
+    if rope is None:
+        nisa.tensor_copy(dst=lat[0:rows, _KV_LORA:_LATENT], src=x[:, _Q_LORA + _KV_LORA:_QKV])
+    else:
+        _rotary(lat[0:rows, _KV_LORA:_LATENT].expand_dim(1),
+                x[:, _Q_LORA + _KV_LORA:_QKV].expand_dim(1), rope)
+
+
+def _rotary(dst, src, cs):
+    """``dst = src [rows, n, 64]`` with each (even, odd) column pair rotated by its row's cos |
+    sin ``cs [rows, 64]``: ``(e cos - o sin, o cos + e sin)``, in fp32."""
+    rows, n, half = src.shape[0], src.shape[1], _ROPE // 2
+    cos = cs[:, 0:half].expand_dim(1).broadcast(1, n)
+    sin = cs[:, half:_ROPE].expand_dim(1).broadcast(1, n)
+    even, odd = src.slice(2, 0, _ROPE, 2), src.slice(2, 1, _ROPE, 2)
+    terms = [_sb((rows, n, half), nl.float32) for _ in range(4)]
+    for t, (a, b) in zip(terms, ((even, cos), (odd, sin), (odd, cos), (even, sin))):
+        nisa.tensor_tensor(dst=t, data1=a, data2=b, op=nl.multiply)
+    nisa.tensor_tensor(dst=dst.slice(2, 0, _ROPE, 2), data1=terms[0], data2=terms[1],
+                       op=nl.subtract)
+    nisa.tensor_tensor(dst=dst.slice(2, 1, _ROPE, 2), data1=terms[2], data2=terms[3], op=nl.add)
 
 
 def _slot(t, head, width, rows, by_token):
@@ -158,13 +187,16 @@ def _sum_parts(dst, ps, rows):
     nisa.tensor_tensor(dst=dst, data1=ps[:, 0:rows], data2=low, op=nl.add)
 
 
-def _absorbed_queries(ql, by_token, x, q_gain, wqb, wuk, eps, heads, k_outer=False):
+def _absorbed_queries(ql, by_token, x, q_gain, wqb, wuk, eps, heads, k_outer=False, rope=None):
     """``ql[i]``: ``q_lift^T`` of each head on latent tile ``i``, bf16, for the qkv_a rows ``x``.
 
     The normed q and ``q_nope`` enter their products unrounded, as bf16 high and low parts
     side by side in the moving operand, so each weight tile loads once; the parts' columns are
     summed after the product. With ``k_outer`` the ``q_b`` products run K tile by K tile over
-    all heads, so each tile's products start when that tile of ``q_b`` lands.
+    all heads, so each tile's products start when that tile of ``q_b`` lands. With ``rope``,
+    each row's cos | sin ``[rows, 64]`` fp32 (``k_outer`` only), the rope columns of all heads
+    are one product with the rows on partitions, both parts summed in PSUM, rotated in fp32 and
+    transposed into ``ql[4]``.
     """
     rows = x.shape[0]
     n = 2 * rows
@@ -177,16 +209,35 @@ def _absorbed_queries(ql, by_token, x, q_gain, wqb, wuk, eps, heads, k_outer=Fal
             for k in range(4):
                 nisa.nc_transpose(dst=tp[:, k, :], data=part[:, (k0 + k) * _P:(k0 + k + 1) * _P])
             nisa.tensor_copy(dst=qnt[:, k0:k0 + 4, j * rows:(j + 1) * rows], src=tp[:, :, 0:rows])
+    kernel_assert(rope is None or k_outer, "the rotary runs with the K-tile-first products")
+    if rope is not None:
+        rp = _ps((rows, heads, _ROPE), nl.float32)
+        by_head = wqb.reshape_dim(2, (heads, _NOPE + _ROPE))
     if k_outer:
-        products = [(_ps((_NOPE, n), nl.float32), _ps((_ROPE, n), nl.float32))
+        products = [(_ps((_NOPE, n), nl.float32),
+                     _ps((_ROPE, n), nl.float32) if rope is None else None)
                     for _ in range(heads)]
         for k in range(_K_TILES):
             for h, (qp, qr) in enumerate(products):
                 base = h * (_NOPE + _ROPE)
                 nisa.nc_matmul(dst=qp, stationary=wqb[:, k, base:base + _NOPE],
                                moving=qnt[:, k, :], accumulate=k > 0)
-                nisa.nc_matmul(dst=qr, stationary=wqb[:, k, base + _NOPE:base + _NOPE + _ROPE],
-                               moving=qnt[:, k, :], accumulate=k > 0)
+                if qr is not None:
+                    nisa.nc_matmul(dst=qr,
+                                   stationary=wqb[:, k, base + _NOPE:base + _NOPE + _ROPE],
+                                   moving=qnt[:, k, :], accumulate=k > 0)
+            if rope is not None:
+                for j in range(2):
+                    nisa.nc_matmul(dst=rp, stationary=qnt[:, k, j * rows:(j + 1) * rows],
+                                   moving=by_head[:, k, :, _NOPE:_NOPE + _ROPE],
+                                   accumulate=k > 0 or j > 0)
+    if rope is not None:
+        turned = _sb((rows, heads, _ROPE), nl.float32)
+        _rotary(turned, rp, rope)
+        for h in range(heads):
+            tp = _ps((_ROPE, rows), nl.float32)
+            nisa.nc_transpose(dst=tp, data=turned[:, h, :])
+            nisa.tensor_copy(dst=_slot(ql[4], h, _ROPE, rows, by_token), src=tp)
     for h in range(heads):
         base = h * (_NOPE + _ROPE)
         if k_outer:
@@ -200,7 +251,8 @@ def _absorbed_queries(ql, by_token, x, q_gain, wqb, wuk, eps, heads, k_outer=Fal
             for k in range(_K_TILES):
                 nisa.nc_matmul(dst=qr, stationary=wqb[:, k, base + _NOPE:base + _NOPE + _ROPE],
                                moving=qnt[:, k, :], accumulate=k > 0)
-        _sum_parts(_slot(ql[4], h, _ROPE, rows, by_token), qr, rows)
+        if rope is None:
+            _sum_parts(_slot(ql[4], h, _ROPE, rows, by_token), qr, rows)
         q_nope = _sb((_NOPE, rows), nl.float32)
         _sum_parts(q_nope, qp, rows)
         moving = _sb((_NOPE, n), nl.bfloat16)
@@ -337,6 +389,7 @@ def _scores(g, kind, kt, rows_k, key0, scale, zero):
 
     Keys ``key0 + 128 t + r`` lie on row ``r`` of tile ``t``; the group's queries take the keys
     in ``[0, g[kind])``, and with ``kind == "own"`` only the first ``g["own_tiles"](key0)`` tiles.
+    A group with ``g["visible"]`` takes its own keys where that ``[rows, keys]`` predicate is set.
     """
     n_t = len(rows_k) if kind == "cache" else g["own_tiles"](key0)
     cols = _P * (n_t - 1) + rows_k[n_t - 1]
@@ -346,10 +399,16 @@ def _scores(g, kind, kt, rows_k, key0, scale, zero):
         nisa.nc_matmul(dst=s_ps, stationary=g["ql"][i], moving=kt[i][:, 0:cols], accumulate=i > 0)
     s_sb = _sb((r, cols), nl.float32)
     top = _sb((r, 1), nl.float32)
-    nisa.range_select(dst=s_sb, on_true_tile=s_ps, comp_op0=nl.greater_equal,
-                      comp_op1=nl.less, bound0=zero[0:r, :], bound1=g[kind][0:r, :],
-                      reduce_cmd=nisa.reduce_cmd.reset_reduce, reduce_res=top,
-                      reduce_op=nl.maximum, range_start=key0, on_false_value=_FILL)
+    if kind == "own" and g.get("visible") is not None:
+        # Window keys: each query row's own causal and owner flags.
+        nisa.select_reduce(dst=s_sb, predicate=g["visible"][0:r, 0:cols], on_true=s_ps,
+                           on_false=_FILL, reduce_res=top,
+                           reduce_cmd=nisa.reduce_cmd.reset_reduce, reduce_op=nl.maximum)
+    else:
+        nisa.range_select(dst=s_sb, on_true_tile=s_ps, comp_op0=nl.greater_equal,
+                          comp_op1=nl.less, bound0=zero[0:r, :], bound1=g[kind][0:r, :],
+                          reduce_cmd=nisa.reduce_cmd.reset_reduce, reduce_res=top,
+                          reduce_op=nl.maximum, range_start=key0, on_false_value=_FILL)
     m = _sb((r, 1), nl.float32)
     if g["m"] is None:
         nisa.tensor_scalar(dst=m, data=top, op0=nl.maximum, operand0=_MAX_FLOOR)
@@ -459,7 +518,8 @@ def _pipelined(steps, scale, zero, queries):
 def _gated_pipeline(steps, scale, zero, gate, free, queries):
     """``_pipelined`` for steps whose page loads are issued, with queries from an all-gather.
 
-    A step is ``(group, kind, key0, finish)``, ``finish(gate)`` the finisher of its load. The
+    A step is ``(group, kind, key0, finish)``, ``finish(gate)`` the finisher of its load; the
+    group may be a list of groups that share the step's keys. The
     first ``free`` steps' clears and key transposes are emitted first, free of the gather, so
     they run as their pages land. ``queries()`` then fills the groups' queries from the gather,
     and the first scores follow. Every later step's clears and key transposes are scheduled
@@ -477,15 +537,19 @@ def _gated_pipeline(steps, scale, zero, gate, free, queries):
         if free <= t + k + 1 < n:
             st[t + k + 1]["tiles"] = steps[t + k + 1][3](gate)
         if 0 <= t < n:
-            _weights_t(st[t]["sc"])
+            for sc in st[t]["sc"]:
+                _weights_t(sc)
         if free <= t + k < n:
             st[t + k]["kt"] = _keys_t(st[t + k]["tiles"], gate)
         if 0 <= t + 1 < n:
             g, kind, key0, _ = steps[t + 1]
             rows_k = [x.shape[0] for x in st[t + 1]["tiles"]]
-            st[t + 1]["sc"] = _scores(g, kind, st[t + 1].pop("kt"), rows_k, key0, scale, zero)
+            kt = st[t + 1].pop("kt")
+            st[t + 1]["sc"] = [_scores(x, kind, kt, rows_k, key0, scale, zero)
+                               for x in (g if isinstance(g, list) else [g])]
         if 0 <= t < n:
-            _accumulate(st[t]["sc"], st[t]["tiles"])
+            for sc in st[t]["sc"]:
+                _accumulate(sc, st[t]["tiles"])
             st[t].clear()
 
 
@@ -573,7 +637,8 @@ def _transpose_into(o_t, o, rows):
 def _check_common(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, slots):
     heads = w_uk.shape[0]
     kernel_assert(qkv_a.shape[1] == _QKV and qkv_a.dtype == nl.float32, "qkv_a is [T, 2112] fp32")
-    kernel_assert(tuple(gate.shape) == (qkv_a.shape[0], heads * _V), "gate is [T, H * 128]")
+    kernel_assert(gate is None or tuple(gate.shape) == (qkv_a.shape[0], heads * _V),
+                  "gate is [T, H * 128]")
     kernel_assert(tuple(q_norm.shape) == (_Q_LORA,) and tuple(kv_norm.shape) == (_KV_LORA,),
                   "norm gains are [1536] and [512]")
     kernel_assert(tuple(w_qb_t.shape) == (_Q_LORA, heads * (_NOPE + _ROPE)),
@@ -606,7 +671,7 @@ def _own_step(lat, s):
     return load
 
 
-def _merge_programs(state, prg, scale, rows):
+def _merge_programs(state, prg, scale, rows, pipe=0):
     """A lone sequence's states from the two programs' key halves, merged over ``sendrecv``."""
     m, l, acc = state
     mine = _sb((rows, _KV_LORA + 8), nl.float32)
@@ -615,7 +680,7 @@ def _merge_programs(state, prg, scale, rows):
     nisa.tensor_copy(dst=mine[:, _KV_LORA + 1:_KV_LORA + 2], src=l[0:rows, :])
     theirs = _sb((rows, _KV_LORA + 8), nl.float32)
     nisa.sendrecv(src=mine, dst=theirs, send_to_rank=1 - prg, recv_from_rank=1 - prg,
-                  pipe_id=0)
+                  pipe_id=pipe)
     a, b = (mine, theirs) if prg == 0 else (theirs, mine)
     return _merge((a[:, _KV_LORA:_KV_LORA + 1], a[:, _KV_LORA + 1:_KV_LORA + 2], a[:, 0:_KV_LORA]),
                   (b[:, _KV_LORA:_KV_LORA + 1], b[:, _KV_LORA + 1:_KV_LORA + 2], b[:, 0:_KV_LORA]),
@@ -844,6 +909,13 @@ def _group_weights(lse, first, count, tokens, gathered, dup, group, ranks, write
         nisa.dma_copy(dst=every[row0:row0 + gathered, :, :],
                       src=dst.ap(pattern=[[tokens, gathered], [gathered * tokens, ranks],
                                           [1, count]], offset=first))
+    return _lse_weights(every, lse)
+
+
+def _lse_weights(every, lse):
+    """``exp(lse - group LSE)`` ``[rows, count]`` fp32 from every rank's LSE
+    ``every [rows, ranks, count]``."""
+    rows, ranks, count = every.shape
     top = _sb((rows, count), nl.float32)
     nisa.tensor_reduce(dst=top, op=nl.maximum, data=every.permute((0, 2, 1)), axis=2)
     shifted = _sb((rows, ranks, count), nl.float32)
@@ -1132,6 +1204,387 @@ def mla_paged_decode_dcp_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv
     return out, pages
 
 
+def _rope_rows(rope, positions, row0, rows):
+    """Each window row's cos | sin ``[rows, 64]`` fp32, gathered from the table by its position;
+    a position outside the table reads the table's nearest row."""
+    pos = _sb((rows, 1), nl.int32)
+    nisa.dma_copy(dst=pos, src=positions.ap(pattern=[[1, rows], [1, 1]], offset=row0))
+    nisa.tensor_scalar(dst=pos, data=pos, op0=nl.maximum, operand0=0, op1=nl.minimum,
+                       operand1=rope.shape[0] - 1)
+    cs = _sb((rows, _ROPE), nl.float32)
+    nisa.dma_copy(dst=cs, src=rope.ap(pattern=[[_ROPE, rows], [1, _ROPE]], offset=0,
+                                      vector_offset=pos, indirect_dim=0))
+    return cs
+
+
+def _window_visible(visible, dead, own, held_n, q, heads, nr, dup):
+    """Fill each query row's window keys and its dead flag.
+
+    Query row ``(rank, i, head)`` of a row group sees window key ``j`` where ``j <= i`` and the
+    rank holds row ``j``, ``own [qe, count]`` 1: ``visible [rows, count, qe]`` uint8, from an
+    exact 0/1 product on the PE. ``dead [rows, count]`` is set where the row has no key on the
+    rank, neither a cached row (``held_n``) nor a window row.
+    """
+    qe, count = own.shape
+    rows_q, n = visible.shape[0], nr * q * heads
+    # at[j, row] = 1 where the row's query index is at least j; rows between the copies stay 0.
+    step = _sb((qe, n), nl.float32)
+    nisa.iota(dst=step, pattern=[[0, nr], [1, q], [0, heads]], offset=0, channel_multiplier=-1)
+    at = _zeros((qe, rows_q), nl.bfloat16)
+    nisa.tensor_scalar(dst=at[:, 0:n], data=step, op0=nl.greater_equal, operand0=0.0)
+    if dup is not None:
+        nisa.tensor_copy(dst=at[:, dup:dup + n], src=at[:, 0:n])
+    eye = _sb((qe, qe), nl.float32)
+    nisa.iota(dst=eye, pattern=[[1, qe]], offset=0, channel_multiplier=-1)
+    nisa.tensor_scalar(dst=eye, data=eye, op0=nl.equal, operand0=0.0)
+    owned = _sb((qe, count, qe), nl.bfloat16)
+    nisa.tensor_tensor(dst=owned, data1=own.expand_dim(2).broadcast(2, qe),
+                       data2=eye.expand_dim(1).broadcast(1, count), op=nl.multiply)
+    vis = _ps((rows_q, count * qe), nl.float32)
+    nisa.nc_matmul(dst=vis, stationary=at, moving=owned.flatten_dims(1, 2))
+    nisa.tensor_scalar(dst=visible.flatten_dims(1, 2), data=vis, op0=nl.greater, operand0=0.5)
+    seen = _sb((rows_q, count), nl.float32)
+    nisa.tensor_reduce(dst=seen, op=nl.add, data=vis.reshape_dim(1, (count, qe)), axis=2)
+    keys = _sb((rows_q, count), nl.float32)
+    nisa.scalar_tensor_tensor(dst=keys, data=held_n[0:rows_q, :], op0=nl.maximum, operand0=0.0,
+                              op1=nl.add, operand1=seen)
+    nisa.tensor_scalar(dst=dead, data=keys, op0=nl.less, operand0=0.5)
+
+
+def _window_keys(lat, q, count):
+    """Each sequence's window latent rows as keys, ``[qe, count, 576]`` bf16 with row ``Q`` 0
+    for an odd ``Q``, and ``forced [128, count, Q]`` uint8: the queries at or after a non-finite
+    row of their sequence. A non-finite row is set to zero by select before any product."""
+    qe = _even(q)
+    win = _zeros((qe, count, _LATENT), nl.bfloat16)
+    for s in range(count):
+        nisa.dma_copy(dst=win[0:q, s, :], src=lat[s * q:(s + 1) * q, :])
+    flag = _sb((qe, count, _LATENT), nl.float32)
+    nisa.tensor_scalar(dst=flag, data=win, op0=nl.multiply, operand0=0.0, op1=nl.not_equal,
+                       operand1=0.0)
+    bad = _sb((qe, count), nl.float32)
+    nisa.tensor_reduce(dst=bad, op=nl.maximum, data=flag, axis=2)
+    bad_u = _sb((qe, count), nl.uint8)
+    nisa.tensor_scalar(dst=bad_u, data=bad, op0=nl.greater, operand0=0.5)
+    nisa.tensor_copy_predicated(dst=win, src=0.0,
+                                predicate=bad_u.expand_dim(2).broadcast(2, _LATENT))
+    # later[j, s, i] = 1 where row j of sequence s is non-finite and i >= j; summed over j on
+    # every partition by a product with ones.
+    tri = _sb((qe, q), nl.float32)
+    nisa.iota(dst=tri, pattern=[[1, q]], offset=0, channel_multiplier=-1)
+    nisa.tensor_scalar(dst=tri, data=tri, op0=nl.greater_equal, operand0=0.0)
+    later = _sb((qe, count, q), nl.bfloat16)
+    nisa.tensor_tensor(dst=later, data1=bad.expand_dim(2).broadcast(2, q),
+                       data2=tri.expand_dim(1).broadcast(1, count), op=nl.multiply)
+    ones = _sb((qe, _P), nl.bfloat16)
+    nisa.memset(dst=ones, value=1.0)
+    hits = _ps((_P, count * q), nl.float32)
+    nisa.nc_matmul(dst=hits, stationary=ones, moving=later.flatten_dims(1, 2))
+    forced = _sb((_P, count, q), nl.uint8)
+    nisa.tensor_scalar(dst=forced.flatten_dims(1, 2), data=hits, op0=nl.greater, operand0=0.5)
+    return win, forced
+
+
+def _window_weights(lse, first, count, tokens, n, n_groups, dup, group, ranks, write):
+    """``exp(lse - group LSE)`` ``[rows, count]`` fp32 of each row group, from one all-gather of
+    every rank's LSE ``[groups * n, T]``; ``lse`` is ``[rows, groups * count]``."""
+    rows, width = lse.shape[0], n_groups * n
+    src = _shared((1, width * tokens), nl.float32, "lse_gather_src")
+    dst = _shared((ranks, width * tokens), nl.float32, "lse_gather_dst")
+    if write:
+        for g in range(n_groups):
+            nisa.dma_copy(dst=src.ap(pattern=[[tokens, n], [1, count]],
+                                     offset=g * n * tokens + first),
+                          src=lse[0:n, g * count:(g + 1) * count])
+    ncc.all_gather(srcs=[src], dsts=[dst], replica_group=group, collective_dim=0)
+    weights = []
+    for g in range(n_groups):
+        every = _sb((rows, ranks, count), nl.float32)
+        nisa.memset(dst=every, value=0.0)  # the rows between the two copies stay finite
+        for row0 in (0,) if dup is None else (0, dup):
+            nisa.dma_copy(dst=every[row0:row0 + n, :, :],
+                          src=dst.ap(pattern=[[tokens, n], [width * tokens, ranks], [1, count]],
+                                     offset=g * n * tokens + first))
+        weights.append(_lse_weights(every, lse[:, g * count:(g + 1) * count]))
+    return weights
+
+
+def _window_partials(states, factor, dead, ranks, nr, hq, dup, count):
+    """Each state's partial ``acc * factor`` with the latent on partitions, ``[128, ranks,
+    count, 4, Q H]`` fp32; state ``g count + s`` is row group ``g`` of sequence ``s``. A query
+    row with no key on the rank is 0, by select."""
+    rows, n = states[0][2].shape[0], nr * hq
+    parts = _sb((_P, ranks, count, _V_TILES, hq), nl.float32)
+    for c, (_, _, acc) in enumerate(states):
+        g, s = c // count, c % count
+        o = _sb((rows, _KV_LORA), nl.float32)
+        nisa.tensor_scalar(dst=o, data=acc[0:rows, :], op0=nl.multiply, operand0=factor[:, c:c + 1])
+        nisa.tensor_copy_predicated(dst=o, src=0.0,
+                                    predicate=dead[:, s:s + 1].broadcast(1, _KV_LORA))
+        tp = _ps((_P, _V_TILES, rows), nl.float32)
+        for t in range(_V_TILES):
+            nisa.nc_transpose(dst=tp[:, t, :], data=o[:, t * _P:(t + 1) * _P])
+        dst = parts[:, g * nr:(g + 1) * nr, s, :, :]
+        hi = tp[:, :, 0:n].reshape_dim(2, (nr, hq)).permute((0, 2, 1, 3))
+        if dup is None:
+            nisa.tensor_copy(dst=dst, src=hi)
+        else:
+            # The high and low parts' sums, on rows 0.. and dup.., meet in the free dimension.
+            lo = _sb((_P, _V_TILES, n), nl.float32)
+            nisa.tensor_copy(dst=lo, src=tp[:, :, dup:dup + n])
+            nisa.tensor_tensor(dst=dst, data1=hi, op=nl.add,
+                               data2=lo.reshape_dim(2, (nr, hq)).permute((0, 2, 1, 3)))
+    return parts
+
+
+def _window_output(dst, o, wuv, sig, heads, q):
+    """``dst[d, s, i, head] = (o @ W_UV^T)[d]`` from the merged ``o [128, count, 4, Q H]``,
+    times ``sig [128, count, Q, heads]``, the gate's sigmoid, when it is given."""
+    count = o.shape[1]
+    by_head = o.reshape_dim(3, (q, heads))
+    for h in range(heads):
+        op = _ps((_V, count, q), nl.float32)
+        for t in range(_V_TILES):
+            nisa.nc_matmul(dst=op, stationary=wuv[:, t, h, :], moving=by_head[:, :, t, :, h],
+                           accumulate=t > 0)
+        if sig is None:
+            nisa.tensor_copy(dst=dst[:, :, :, h], src=op)
+        else:
+            nisa.tensor_tensor(dst=dst[:, :, :, h], data1=op, data2=sig[:, :, :, h],
+                               op=nl.multiply)
+
+
+def _window_dcp(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, pages, block_table,
+                context_lens, slots, owner, rope, positions, EPS, LATENT_OFFSET, BLOCK_SIZE,
+                DCP_RANKS, MERGE):
+    """The window mode on one rank of a DCP group: the verify call with ``gate`` and no
+    ``rope``, the draft call with ``rope`` and ``positions`` and no gate."""
+    tokens = qkv_a.shape[0]
+    heads = _check_common(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, slots)
+    cache, by_row, first_elem, first_row = _page_views(pages, LATENT_OFFSET, BLOCK_SIZE)
+    blocks, block_size = pages.shape[0], BLOCK_SIZE
+    page_rows = pages.shape[1] // _ROW_BYTES
+    seqs, n_pages = block_table.shape
+    q = owner.shape[1]
+    kernel_assert(tuple(owner.shape) == (seqs, q) and seqs * q == tokens
+                  and tuple(context_lens.shape) == (seqs,),
+                  "owner is [B, Q] with B Q = T; block_table is [B, pages]; context_lens is [B]")
+    kernel_assert(rope is None or (tuple(rope.shape[1:]) == (_ROPE,) and rope.dtype == nl.float32
+                                   and tuple(positions.shape) == (tokens,)),
+                  "the rotary table is [positions, 64] fp32 and positions is [T]")
+    ranks, hq = len(DCP_RANKS), q * heads
+    kernel_assert(ranks >= 2 and hq <= _P, "2 or more ranks; at most 128 query rows per rank")
+    # Row groups of whole ranks, as few as fit the partitions; row (rank, i, head) of a group.
+    n_groups = next(g for g in range(1, ranks + 1) if ranks % g == 0 and ranks // g * hq <= _P)
+    nr = ranks // n_groups
+    n = nr * hq
+    kernel_assert(MERGE == "reduce_scatter" or (MERGE == "all_to_all" and n_groups == 1),
+                  "MERGE names a merge collective; the all-to-all takes one row group")
+    group = ncc.ReplicaGroup([list(DCP_RANKS)])
+    window = n_pages * block_size
+    n_tiles = window // _P
+    n_blocks = (window + _BLOCK - 1) // _BLOCK
+    programs = nl.num_programs(0)
+    prg = nl.program_id(0)
+    kernel_assert(programs in (1, 2), "one or two programs")
+    scale = float((_NOPE + _ROPE) ** -0.5)
+    out = nl.ndarray((_V, tokens, heads, 1), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+
+    split = programs > seqs
+    if split:
+        first, count = 0, seqs
+        b0 = prg * (n_blocks // 2)
+        b1 = n_blocks // 2 if prg == 0 else n_blocks
+        lead = prg == 0
+    else:
+        base, extra = seqs // programs, seqs % programs
+        first = prg * base + min(prg, extra)
+        count = base + (1 if prg < extra else 0)
+        b0, b1, lead = 0, n_blocks, True
+    row0, rows = first * q, count * q
+    kernel_assert(rows <= _P, "at most 128 window rows per program")
+    qe = _even(q)
+
+    x = _sb((rows, _QKV), nl.float32)
+    nisa.dma_copy(dst=x, src=qkv_a[row0:row0 + rows, :])
+    raw = _sb((1, count * n_pages), nl.int32)
+    nisa.dma_copy(dst=raw, src=block_table.ap(pattern=[[count * n_pages, 1], [1, count * n_pages]],
+                                              offset=first * n_pages), **_META_QUEUE)
+    q_gain = _gain(q_norm, rows)
+    held_n = _sb((_P, count), nl.int32)
+    nisa.dma_copy(dst=held_n, src=context_lens.ap(pattern=[[0, _P], [1, count]], offset=first),
+                  **_META_QUEUE)
+    flag = _sb((qe, count), nl.int32)
+    nisa.memset(dst=flag, value=0)
+    nisa.dma_copy(dst=flag[0:q, :], src=owner.ap(pattern=[[1, q], [q, count]], offset=first * q),
+                  **_META_QUEUE)
+    kv_gain = _gain(kv_norm, rows)
+    cs = None if rope is None else _rope_rows(rope, positions, row0, rows)
+    wqb, wuk, last = _load_weights_first(w_qb_t, w_uk, heads)
+    ids = _sb((1, count * n_pages), nl.int32)
+    nisa.tensor_scalar(dst=ids, data=raw, op0=nl.maximum, operand0=0, op1=nl.minimum,
+                       operand1=blocks - 1)
+    if lead:
+        idx = _row_index(slots, row0, rows, blocks, block_size, page_rows, first_row)
+    # Query rows 0.. hold a row group in order (rank, i, head), and rows dup.. again where both fit.
+    dup = _dup_row(n)
+    rows_q = n if dup is None else dup + n
+    qloc = _sb((_P, len(_C_TILES), rows, heads), nl.bfloat16)
+    ql = [[_sb((_P, count, rows_q), nl.bfloat16) for _ in _C_TILES] for _ in range(n_groups)]
+    bound = _sb((_P, count), nl.float32)
+    visible = _sb((rows_q, count, qe), nl.uint8)
+    dead = _sb((rows_q, count), nl.uint8)
+    seq_groups = []
+    for s in range(count):
+        groups = [{"rows": rows_q, "split": "passes" if dup is None else "rows", "dup": dup,
+                   "ql": [ql[g][i][0:w, s, :] for i, (_, w) in enumerate(_C_TILES)],
+                   "cache": bound[:, s:s + 1], "own": None, "visible": visible[:, s, :],
+                   "own_tiles": lambda k: 1, "m": None, "l": None, "acc": None}
+                  for g in range(n_groups)]
+        seq_groups.append((groups, ids[0:1, s * n_pages:(s + 1) * n_pages],
+                           _sb((_P, n_tiles), nl.uint8)))
+    steps = [(gs, "cache", b * _BLOCK,
+              _cache_step(cache, held, invalid, b, window, block_size, first_elem, _PAGE_QUEUE)())
+             for b in range(b0, b1) for gs, held, invalid in seq_groups]
+    step_keys = [min(_BLOCK, window - b * _BLOCK) for b in range(b0, b1) for _ in seq_groups]
+    wuv = _load_values(w_uv_t, heads, last)
+
+    _absorbed_queries([qloc[:, i, :, :] for i in range(len(_C_TILES))], True, x, q_gain, wqb, wuk,
+                      EPS, heads, k_outer=True, rope=cs)
+    lat = _sb((rows, _LATENT), nl.bfloat16)
+    _latent_rows(lat, x, kv_gain, EPS, cs)
+    key_rows = _sb((_P, n_tiles), nl.float32)
+    nisa.iota(dst=key_rows, pattern=[[_P, n_tiles]], offset=0, channel_multiplier=1)
+    zero = _sb((_P, 1), nl.float32)
+    nisa.memset(dst=zero, value=0.0)
+    own = _sb((qe, count), nl.float32)
+    nisa.tensor_scalar(dst=own, data=flag, op0=nl.maximum, operand0=0.0, op1=nl.minimum,
+                       operand1=1.0)
+    _window_visible(visible, dead, own, held_n, q, heads, nr, dup)
+    nisa.tensor_scalar(dst=bound, data=held_n, op0=nl.maximum, operand0=0.0, op1=nl.minimum,
+                       operand1=float(window))
+    for s, (_, _, invalid) in enumerate(seq_groups):
+        nisa.tensor_scalar(dst=invalid, data=key_rows, op0=nl.greater_equal,
+                           operand0=bound[:, s:s + 1])
+    if lead:
+        win, forced = _window_keys(lat, q, count)
+        steps += [(gs, "own", 0, lambda gate=None, t=win[:, s, :]: [t])
+                  for s, (gs, _, _) in enumerate(seq_groups)]
+        step_keys += [qe] * count
+    gather, read = _gather_queries(qloc, row0, rows, tokens, heads, group, ranks, lead)
+
+    def queries():
+        got = read()
+        for g in range(n_groups):
+            for i, (_, w) in enumerate(_C_TILES):
+                mine = ql[g][i][0:w, :, 0:n].reshape_dim(2, (nr, hq))
+                nisa.tensor_copy(dst=mine, src=got[0:w, i, g * nr:(g + 1) * nr, :]
+                                 .reshape_dim(2, (count, hq)).permute((0, 2, 1, 3)))
+                if dup is not None:
+                    nisa.memset(dst=ql[g][i][0:w, :, n:dup], value=0.0)
+                    nisa.tensor_copy(dst=ql[g][i][0:w, :, dup:rows_q], src=ql[g][i][0:w, :, 0:n])
+
+    free = 0
+    while free < len(steps) and sum(step_keys[:free + 1]) <= _FREE_KEYS:
+        free += 1
+    _gated_pipeline(steps, scale, zero, gather, free, queries)
+
+    states = [(gs[g]["m"], gs[g]["l"], gs[g]["acc"]) for g in range(n_groups)
+              for gs, _, _ in seq_groups]
+    if split:
+        states = [_merge_programs(st, prg, scale, rows_q, pipe=c) for c, st in enumerate(states)]
+    # LSE = scale m + ln l per query row; a row with no key takes the dead LSE and sum 1.
+    n_sg = n_groups * count
+    stats = _sb((rows_q, 2, n_sg), nl.float32)
+    for c, (m, l, _) in enumerate(states):
+        nisa.tensor_copy(dst=stats[:, 0, c:c + 1], src=m[0:rows_q, :])
+        nisa.tensor_copy(dst=stats[:, 1, c:c + 1], src=l[0:rows_q, :])
+    lse = _sb((rows_q, n_sg), nl.float32)
+    nisa.activation(dst=lse, op=nl.log, data=stats[:, 1, :])
+    nisa.scalar_tensor_tensor(dst=lse, data=stats[:, 0, :], op0=nl.multiply, operand0=scale,
+                              op1=nl.add, operand1=lse)
+    by_group = dead.expand_dim(1).broadcast(1, n_groups)
+    nisa.tensor_copy_predicated(dst=lse.reshape_dim(1, (n_groups, count)), src=_DEAD_LSE,
+                                predicate=by_group)
+    total = stats[:, 1, :]
+    nisa.tensor_copy_predicated(dst=total.reshape_dim(1, (n_groups, count)), src=1.0,
+                                predicate=by_group)
+    factor = _sb((rows_q, n_sg), nl.float32)
+    nisa.reciprocal(dst=factor, data=total)
+    if MERGE == "reduce_scatter":
+        weights = _window_weights(lse, first, count, seqs, n, n_groups, dup, group, ranks, lead)
+        for g, w in enumerate(weights):
+            mine = factor[:, g * count:(g + 1) * count]
+            nisa.tensor_tensor(dst=mine, data1=mine, data2=w, op=nl.multiply)
+    parts = _window_partials(states, factor, dead, ranks, nr, hq, dup, count)
+    if MERGE == "reduce_scatter":
+        o = _reduce_scatter(parts, first, count, seqs, hq, group, ranks, lead)
+    else:
+        o = _all_to_all(parts, lse, first, count, seqs, hq, group, ranks, lead)
+    if split and prg != 0:
+        return out, pages
+
+    res = _sb((_V, count, q, heads), nl.bfloat16)
+    sig = None if gate is None else _gate_t(gate, row0, rows, heads).reshape_dim(1, (count, q))
+    _window_output(res, o, wuv, sig, heads, q)
+    nisa.tensor_copy_predicated(dst=res, src=float("nan"),
+                                predicate=forced.expand_dim(3).broadcast(3, heads))
+    nisa.dma_copy(dst=out.ap(pattern=[[tokens * heads, _V], [heads, rows], [1, heads]],
+                             offset=row0 * heads), src=res.flatten_dims(1, 2))
+    # The window rows are keys from the launch's own tile, so no read above sees these writes.
+    _write_rows(by_row, idx, lat, rows)
+    return out, pages
+
+
+def mla_paged_window_dcp_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, pages,
+                                block_table, context_lens, slots, owner, EPS: float,
+                                LATENT_OFFSET: int, BLOCK_SIZE: int, DCP_RANKS: tuple,
+                                MERGE: str):
+    """The verify window on one rank of a DCP group: ``(out [128, B Q, H, 1] bf16, pages)``.
+
+    Args:
+        qkv_a: ``[B * Q, 2112]`` fp32, each sequence's ``Q`` window rows in order.
+        gate: ``[B * Q, H * 128]`` bf16 output-gate projection, before its sigmoid.
+        q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, pages, EPS, LATENT_OFFSET, BLOCK_SIZE: as
+            ``mla_paged_decode_kernel``, for the rank's ``H`` heads.
+        block_table: ``[B, pages]`` int32 ids of the rank's own blocks of each sequence.
+        context_lens: ``[B]`` int32 cached rows of each sequence that the rank holds, all before
+            the window.
+        slots: ``[B * Q]`` int32 slot of each window row on this rank; -1 where another rank
+            holds it.
+        owner: ``[B, Q]`` int32, 1 where the rank holds window row ``i`` of the sequence.
+        DCP_RANKS, MERGE: as ``mla_paged_decode_dcp_kernel``; the all-to-all takes at most 128
+            query rows over the group.
+
+    Returns:
+        The gated attention output of the rank's heads and the page buffer with the window rows.
+    """
+    return _window_dcp(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, pages, block_table,
+                       context_lens, slots, owner, None, None, EPS, LATENT_OFFSET, BLOCK_SIZE,
+                       DCP_RANKS, MERGE)
+
+
+def mla_paged_draft_dcp_kernel(qkv_a, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, pages, block_table,
+                               context_lens, slots, owner, rope, positions, EPS: float,
+                               LATENT_OFFSET: int, BLOCK_SIZE: int, DCP_RANKS: tuple,
+                               MERGE: str):
+    """The draft block on one rank of a DCP group: ``(out [128, B Q, H, 1] bf16, pages)``.
+
+    Args:
+        qkv_a, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, pages, block_table, context_lens, slots,
+            owner, EPS, LATENT_OFFSET, BLOCK_SIZE, DCP_RANKS, MERGE: as
+            ``mla_paged_window_dcp_kernel``.
+        rope: ``[positions, 64]`` fp32 cos | sin of the interleaved rotary by position.
+        positions: ``[B * Q]`` int32 position of each window row.
+
+    Returns:
+        The attention output of the rank's heads and the page buffer with the window rows.
+    """
+    return _window_dcp(qkv_a, None, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, pages, block_table,
+                       context_lens, slots, owner, rope, positions, EPS, LATENT_OFFSET,
+                       BLOCK_SIZE, DCP_RANKS, MERGE)
+
+
 def _finite_values(lat):
     """The value columns of latent rows ``[rows, 512]``, each non-finite element set to 0.
 
@@ -1268,6 +1721,8 @@ def mla_paged_prefill_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t,
 _DECODE = wrap_nki(mla_paged_decode_kernel)
 _DECODE_DCP = wrap_nki(mla_paged_decode_dcp_kernel)
 _PREFILL = wrap_nki(mla_paged_prefill_kernel)
+_WINDOW_DCP = wrap_nki(mla_paged_window_dcp_kernel)
+_DRAFT_DCP = wrap_nki(mla_paged_draft_dcp_kernel)
 
 
 def prepare_mla_weights(q_b_weight: torch.Tensor, kv_b_weight: torch.Tensor):
@@ -1290,7 +1745,8 @@ def _check_inputs(qkv_a, gate, pages, latent_offset, block_size, slots, w_uk, w_
     heads = w_uk.shape[0]
     if qkv_a.dim() != 2 or qkv_a.shape[1] != _QKV or qkv_a.dtype != torch.float32:
         raise ValueError(f"qkv_a must be [T, {_QKV}] fp32, got {tuple(qkv_a.shape)} {qkv_a.dtype}")
-    if tuple(gate.shape) != (qkv_a.shape[0], heads * _V) or gate.dtype != torch.bfloat16:
+    if gate is not None and (tuple(gate.shape) != (qkv_a.shape[0], heads * _V)
+                             or gate.dtype != torch.bfloat16):
         raise ValueError(f"gate must be [T, {heads * _V}] bf16, "
                          f"got {tuple(gate.shape)} {gate.dtype}")
     # The dispatch drops strides, so a strided view would reach the kernel as a copy.
@@ -1478,3 +1934,139 @@ def mla_paged_decode_dcp(qkv_a: torch.Tensor, gate: torch.Tensor, q_norm_weight:
         slots=slots.to(torch.int32).contiguous(), owner=owner.to(torch.int32).contiguous(),
         EPS=float(eps), LATENT_OFFSET=int(latent_offset), BLOCK_SIZE=int(block_size),
         DCP_RANKS=ranks, MERGE=merge)
+
+
+def _torch_window_dcp(qkv_a, gate, q_norm_weight, kv_norm_weight, w_qb_t, w_uk, w_uv_t, pages,
+                      latent_offset, block_size, block_table, context_lens, slots, owner, eps,
+                      dcp_group, rope_table, positions):
+    """The window mode in torch, for the CPU venue where the kernel does not run."""
+    tokens, heads = qkv_a.shape[0], w_uk.shape[0]
+    seqs, q = owner.shape
+    x = qkv_a.float()
+
+    def norm(v, weight):
+        return v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + eps) * weight.float()
+
+    def turn(v):
+        if rope_table is None:
+            return v
+        cs = rope_table[positions.long().clamp(0, rope_table.shape[0] - 1)].float()[:, None]
+        cos, sin = cs[..., :_ROPE // 2], cs[..., _ROPE // 2:]
+        even, odd = v[..., 0::2], v[..., 1::2]
+        return torch.stack((even * cos - odd * sin, odd * cos + even * sin), -1).flatten(-2)
+
+    qv = (norm(x[:, :_Q_LORA], q_norm_weight) @ w_qb_t.float()).view(tokens, heads, -1)
+    q_lift = torch.cat((torch.einsum("thn,hnl->thl", qv[..., :_NOPE], w_uk.float()),
+                        turn(qv[..., _NOPE:])), dim=-1).bfloat16()
+    lat = torch.cat((norm(x[:, _Q_LORA:_Q_LORA + _KV_LORA], kv_norm_weight),
+                     turn(x[:, None, _Q_LORA + _KV_LORA:])[:, 0]), dim=-1).bfloat16()
+    bad = ~torch.isfinite(lat.float()).all(-1)
+    win = torch.where(bad[:, None], torch.zeros_like(lat), lat)
+    queries = dcp_group.all_gather(q_lift.contiguous(), dim=1).float()
+    rows = pages.view(torch.bfloat16).view(pages.shape[0], -1, _LATENT)
+    first = latent_offset // _ROW_BYTES
+    part = queries.new_zeros(tokens, queries.shape[1], _KV_LORA)
+    lse = queries.new_full(queries.shape[:2], _DEAD_LSE)
+    for s in range(seqs):
+        blocks = block_table[s].long().clamp(0, pages.shape[0] - 1)
+        cached = rows[blocks, first:first + block_size].reshape(-1, _LATENT)[:int(context_lens[s])]
+        for i in range(q):
+            t = s * q + i
+            mine = [j for j in range(i + 1) if int(owner[s, j]) > 0]
+            keys = torch.cat((cached, win[[s * q + j for j in mine]]))
+            if keys.shape[0]:
+                scores = queries[t] @ keys.float().T * (_NOPE + _ROPE) ** -0.5
+                lse[t] = torch.logsumexp(scores, dim=-1)
+                part[t] = torch.softmax(scores, dim=-1) @ keys[:, :_KV_LORA].float()
+    group_lse = torch.logsumexp(dcp_group.all_gather(lse.contiguous(), dim=0)
+                                .view(-1, *lse.shape), dim=0)
+    o = dcp_group.reduce_scatter((part * torch.exp(lse - group_lse)[..., None]).contiguous(),
+                                 dim=1)
+    out = torch.einsum("thl,hlv->thv", o, w_uv_t)
+    if gate is not None:
+        out = out * torch.sigmoid(gate.float()).view(tokens, heads, _V)
+    later = bad.view(seqs, q).int().cummax(dim=1).values.view(-1).bool()
+    out[later] = float("nan")
+    s = slots.long()
+    s = torch.where((s < 0) | (s >= pages.shape[0] * block_size), 0, s)
+    rows[s // block_size, first + s % block_size] = lat
+    return out.permute(2, 0, 1).unsqueeze(-1).bfloat16().contiguous(), pages
+
+
+def mla_paged_window_dcp(qkv_a: torch.Tensor, gate, q_norm_weight: torch.Tensor,
+                         kv_norm_weight: torch.Tensor, w_qb_t: torch.Tensor, w_uk: torch.Tensor,
+                         w_uv_t: torch.Tensor, pages: torch.Tensor, latent_offset: int,
+                         block_size: int, block_table: torch.Tensor, context_lens: torch.Tensor,
+                         slots: torch.Tensor, owner: torch.Tensor, eps: float, dcp_group,
+                         rope_table=None, positions=None):
+    """Paged MLA attention of ``Q`` causal queries per sequence on one rank of a DCP group:
+    ``(out [128, B Q, H, 1] bf16, pages)``.
+
+    The verify window passes ``gate`` and no rotary; the draft block passes ``gate=None``, the
+    rotary table and the rows' positions. Query ``i`` of a sequence sees the sequence's cached
+    rows and its window rows ``j <= i``; each rank scores the rows it holds, and the merge
+    returns the rank's ``H`` heads, as :func:`mla_paged_decode_dcp`. The window rows are keys
+    from the launch, and each one's latent row is written at its slot on the rank that holds it.
+
+    Args:
+        qkv_a: ``[B * Q, 2112]`` fp32 all-reduced ``q_a`` and ``kv_a``, each sequence's ``Q``
+            window rows in order.
+        gate: ``[B * Q, H * 128]`` bf16 output-gate projection before its sigmoid, or None.
+        q_norm_weight, kv_norm_weight, w_qb_t, w_uk, w_uv_t, pages, latent_offset, block_size,
+            eps: as :func:`mla_paged_decode`, for the rank's heads.
+        block_table: ``[B, pages]`` int32 ids of the rank's own blocks per sequence.
+        context_lens: ``[B]`` int32 cached rows of each sequence that the rank holds, all
+            before the window.
+        slots: ``[B * Q]`` slot of each window row on this rank, or a slot of the null block
+            where another rank holds it.
+        owner: ``[B, Q]`` int32, 1 where the rank holds window row ``i``, else 0.
+        dcp_group: as :func:`mla_paged_decode_dcp`.
+        rope_table: ``[positions, 64]`` fp32 cos | sin of the interleaved rotary, or None.
+        positions: ``[B * Q]`` int32 position of each window row, with ``rope_table``.
+
+    Returns:
+        The output for ``o_proj`` and the page buffer with each window row's latent row.
+
+    Raises:
+        ValueError: an input outside the kernel's contract.
+    """
+    _check_inputs(qkv_a, gate, pages, latent_offset, block_size, slots, w_uk, w_uv_t)
+    tokens, heads = qkv_a.shape[0], w_uk.shape[0]
+    if owner.dim() != 2 or owner.shape[0] * owner.shape[1] != tokens:
+        raise ValueError(f"owner must be [B, Q] with B Q = {tokens}, got {tuple(owner.shape)}")
+    seqs, q = owner.shape
+    if block_table.dim() != 2 or block_table.shape[0] != seqs:
+        raise ValueError(f"block_table must be [{seqs}, pages], got {tuple(block_table.shape)}")
+    if tuple(context_lens.shape) != (seqs,):
+        raise ValueError(f"context_lens must be [{seqs}], got {tuple(context_lens.shape)}")
+    if (gate is None) == (rope_table is None):
+        raise ValueError("pass the gate for the verify window or the rotary for the draft block")
+    if rope_table is not None and (rope_table.dim() != 2 or rope_table.shape[1] != _ROPE
+                                   or rope_table.dtype != torch.float32 or positions is None
+                                   or tuple(positions.shape) != (tokens,)):
+        raise ValueError(f"rope_table must be [positions, {_ROPE}] fp32 with positions [T]")
+    ranks = tuple(int(r) for r in dcp_group.ranks)
+    if not can_run_kernel(qkv_a):
+        return _torch_window_dcp(qkv_a, gate, q_norm_weight, kv_norm_weight, w_qb_t, w_uk,
+                                 w_uv_t, pages, latent_offset, block_size, block_table,
+                                 context_lens, slots, owner, eps, dcp_group, rope_table,
+                                 positions)
+    programs = get_logical_nc_config()
+    if len(ranks) < 2 or heads * q > _P or -(-seqs // min(programs, seqs)) * q > _P:
+        raise ValueError(f"{len(ranks)} ranks and {seqs} sequences of {q} queries at {heads} "
+                         f"heads are outside the kernel's contract")
+    # All-to-all needs 4 ranks, fails at 16 or more, and takes one 128-row group.
+    one_group = len(ranks) * heads * q <= _P
+    merge = "all_to_all" if 4 <= len(ranks) < 16 and one_group else "reduce_scatter"
+    common = dict(qkv_a=qkv_a.contiguous(), q_norm=q_norm_weight.contiguous(),
+                  kv_norm=kv_norm_weight.contiguous(), w_qb_t=w_qb_t, w_uk=w_uk, w_uv_t=w_uv_t,
+                  pages=pages, block_table=block_table.to(torch.int32).contiguous(),
+                  context_lens=context_lens.to(torch.int32).contiguous(),
+                  slots=slots.to(torch.int32).contiguous(),
+                  owner=owner.to(torch.int32).contiguous(), EPS=float(eps),
+                  LATENT_OFFSET=int(latent_offset), BLOCK_SIZE=int(block_size),
+                  DCP_RANKS=ranks, MERGE=merge)
+    if gate is not None:
+        return _WINDOW_DCP[programs](gate=gate.contiguous(), **common)
+    return _DRAFT_DCP[programs](rope=rope_table.contiguous(),
+                                positions=positions.to(torch.int32).contiguous(), **common)
