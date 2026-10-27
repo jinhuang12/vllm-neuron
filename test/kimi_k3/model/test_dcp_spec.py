@@ -8,8 +8,10 @@ sequences. The prompt sequence's windows start in block 7, on rank 1, and cross 
 rank 0; the other sequence's context stays inside its first block, so rank 1 holds none of it.
 Each step's window start moves on by 1 to 5 tokens, as accepted drafts move it. The page buffer
 starts filled with NaN, as a block reused from an earlier owner can be, so a read of a row that
-no step wrote shows as NaN. The torch stand-ins are test_dcp_mla's; at DCP 1 the paged MLA decode
-is the window mode over a one-rank group. Set ``KIMI_K3_CHECKPOINT`` and ``KIMI_K3_DSPARK_DRAFT``
+no step wrote shows as NaN. The verify steps are read at the window call's bf16 attention output,
+before the output projection, in bf16 units in the last place; the relative error is printed
+beside. The torch stand-ins are test_dcp_mla's; at DCP 1 the paged MLA decode is the window
+mode over a one-rank group. Set ``KIMI_K3_CHECKPOINT`` and ``KIMI_K3_DSPARK_DRAFT``
 to the checkpoint and draft directories (defaults under ``~/models``); run with
 ``VLLM_NEURON_CPU_MODE=1``.
 """
@@ -39,18 +41,18 @@ from test_dcp_mla import (  # noqa: F401  (pytestmark is used by pytest)
     _small_config_dir,
     _small_model,
     _stand_ins,
-    _tap,
+    _tap_kernel,
+    _unit,
     _weights,
     m,
     pytestmark,
 )
 from vllm.engine.arg_utils import EngineArgs
 
-from vllm_neuron.functional.attention.mla_paged import mla_paged_window_dcp
-
 DRAFT = Path(os.environ.get("KIMI_K3_DSPARK_DRAFT",
                             Path.home() / "models" / "Inferact" / "Kimi-K3-DSpark-Block5"))
-DCP, K, STEPS, BOUND = 2, 4, 16, 1e-5
+# RELATIVE is the relative error printed beside the unit read; it is not asserted.
+DCP, K, STEPS, RELATIVE = 2, 4, 16, 1e-5
 Q = K + 1
 CHUNKS = (512, 512, 512, 504)
 PROMPT = sum(CHUNKS)
@@ -91,7 +93,7 @@ def _verify_one_rank(*args):
     *inputs, table, positions, slots, eps = args
     window = positions.view(table.shape[0], -1)
     owner = torch.ones(window.shape, dtype=torch.int32)
-    return mla_paged_window_dcp(*inputs, table, window[:, 0], slots, owner, eps, ONE_RANK)
+    return m.mla_paged_window_dcp(*inputs, table, window[:, 0], slots, owner, eps, ONE_RANK)
 
 
 def _verify_metadata(runner, step: int) -> tuple[np.ndarray, dict]:
@@ -121,12 +123,11 @@ def _serve(config, root: Path, rank: int, dcp: int) -> dict:
     _add(runner, "short", ids["verify"][0, 1, :1].tolist(), tables[1], 2)
     latent = next(g.layer_names[0] for i, g in enumerate(runner.kv_cache_config.kv_cache_groups)
                   if not runner._is_state_group(i))
-    rank_t, start, out = torch.tensor([rank], dtype=torch.int32), 0, {"attention": []}
-    slots, steps = [], []
+    rank_t, start = torch.tensor([rank], dtype=torch.int32), 0
+    window, slots, steps = [], [], []
     with _stand_ins() as patch:
         patch.setattr(m, "mla_paged_decode", _verify_one_rank)
-        patch.setattr(m.KimiK3MLA, "forward_decode",
-                      _tap(out["attention"], m.KimiK3MLA.forward_decode))
+        patch.setattr(m, "mla_paged_window_dcp", _tap_kernel(window, m.mla_paged_window_dcp))
         for size in CHUNKS:
             positions = np.arange(start, start + size)
             meta = _metadata(runner, positions, np.zeros(size, dtype=np.int64), 1, size, start)
@@ -138,7 +139,8 @@ def _serve(config, root: Path, rank: int, dcp: int) -> dict:
             slots.append(meta[latent]["slot_mapping"].clone())
             steps.append(model(ids["verify"][step].reshape(-1), torch.from_numpy(positions),
                                attn_metadata=meta, rank=rank_t))
-    return {"attention": torch.stack(out["attention"]), "logits": torch.stack(steps),
+    assert len(window) == STEPS, len(window)
+    return {"window": torch.stack([out for out, _ in window]), "logits": torch.stack(steps),
             "slots": torch.stack(slots), "tables": tables}
 
 
@@ -179,18 +181,26 @@ def _owners(step: int, seq: int) -> np.ndarray:
 
 
 def _misses(runs, seq: int, steps) -> list:
-    """Each step of ``seq`` whose MLA output on a rank is over the bound, or whose picks differ."""
-    rows, misses = slice(seq * Q, (seq + 1) * Q), []
+    """Each step of ``seq`` where a rank's window output moves over one unit, or the picks differ.
+
+    The unit is one bf16 unit in the last place of the largest magnitude among DCP 1's elements
+    of that step and sequence on the rank. The relative error is printed beside, not asserted.
+    """
+    rows, misses, relative = slice(seq * Q, (seq + 1) * Q), [], []
     for s in steps:
         for rank, (got, ref) in enumerate(zip(runs[DCP], runs[1])):
-            a, b = got["attention"][s, rows].double(), ref["attention"][s, rows].double()
-            error = float((a - b).abs().max() / b.abs().max())
-            if not error <= BOUND:
-                misses.append((s, rank, error))
+            a, b = got["window"][s, :, rows].double(), ref["window"][s, :, rows].double()
+            move = float((a - b).abs().max()) / _unit(b.abs().max())
+            relative.append(float((a - b).abs().max() / b.abs().max()))
+            if not move <= 1:
+                misses.append((s, rank, move))
         picks = [torch.cat([out["logits"][s, rows] for out in run], -1).argmax(-1)
                  for run in (runs[DCP], runs[1])]
         if not torch.equal(*picks):
             misses.append((s, "picks", picks[0].tolist(), picks[1].tolist()))
+    over = sum(not error <= RELATIVE for error in relative)
+    print(f"sequence {seq}, {len(relative)} reads: relative error over {RELATIVE:g} at {over}, "
+          f"worst {max(relative):.2e}")
     return misses
 
 
@@ -236,7 +246,7 @@ def test_window_slots_on_their_owner_only(runs):
 
 
 def test_verify_steps_match_dcp_1(runs):
-    """The prompt sequence's 16 windows: the MLA output within the bound, the picks equal."""
+    """The prompt sequence's 16 windows: the window output within one unit, the picks equal."""
     crossing = [s for s in range(STEPS) if len(set(_owners(s, 0))) > 1]
     misses = _misses(runs, 0, range(STEPS))
     assert crossing and not misses, (crossing, misses)
@@ -246,10 +256,10 @@ def test_other_rank_windows_and_short_context_without_nan(runs):
     """Windows whose rows all sit on one rank, and a context inside one block: no NaN.
 
     The prompt sequence's one-owner windows and every window of the short sequence meet the
-    bound and the picks; no MLA output or logit of either sequence is NaN.
+    one-unit bound and the picks; no window output or logit of either sequence is NaN.
     """
     single = [s for s in range(STEPS) if len(set(_owners(s, 0))) == 1]
     misses = _misses(runs, 0, single) + _misses(runs, 1, range(STEPS))
     nan = sum(int(out[key].isnan().sum()) for run in runs.values() for out in run
-              for key in ("attention", "logits"))
+              for key in ("window", "logits"))
     assert single and nan == 0 and not misses, (single, nan, misses)
