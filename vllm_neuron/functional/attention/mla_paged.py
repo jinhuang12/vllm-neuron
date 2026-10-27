@@ -759,9 +759,10 @@ def _shared(shape, dtype, name):
     return nl.ndarray(shape, dtype=dtype, buffer=nl.shared_hbm, name=name)
 
 
-# DMA queues of the DCP mode: the query chain's loads and stores first, then the pages. A lower
-# priority number is served first.
+# DMA queues of the DCP mode: the query chain's loads and stores first, then the metadata, then
+# the pages. A lower priority number is served first.
 _QUERY_QUEUE = {"dge_mode": nisa.dge_mode.hwdge, "engine": nisa.engine.scalar, "priority": 0}
+_META_QUEUE = {"dge_mode": nisa.dge_mode.hwdge, "engine": nisa.engine.sync, "priority": 1}
 _PAGE_QUEUE = {"dge_mode": nisa.dge_mode.hwdge, "engine": nisa.engine.sync, "priority": 2}
 _QB_CHUNK = 3  # K tiles of q_b per load
 # Keys per program whose pages land, cleared and transposed, while the query chain runs: the
@@ -1014,12 +1015,14 @@ def mla_paged_decode_dcp_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv
     nisa.dma_copy(dst=x, src=qkv_a[first:first + count, :])
     raw = _sb((1, count * n_pages), nl.int32)
     nisa.dma_copy(dst=raw, src=block_table.ap(pattern=[[count * n_pages, 1], [1, count * n_pages]],
-                                              offset=first * n_pages))
+                                              offset=first * n_pages), **_META_QUEUE)
     q_gain = _gain(q_norm, count)
     held_n = _sb((_P, count), nl.int32)
-    nisa.dma_copy(dst=held_n, src=context_lens.ap(pattern=[[0, _P], [1, count]], offset=first))
+    nisa.dma_copy(dst=held_n, src=context_lens.ap(pattern=[[0, _P], [1, count]], offset=first),
+                  **_META_QUEUE)
     flag = _sb((_P, count), nl.int32)
-    nisa.dma_copy(dst=flag, src=owner.ap(pattern=[[0, _P], [1, count]], offset=first))
+    nisa.dma_copy(dst=flag, src=owner.ap(pattern=[[0, _P], [1, count]], offset=first),
+                  **_META_QUEUE)
     kv_gain = _gain(kv_norm, count)
     wqb, wuk, last = _load_weights_first(w_qb_t, w_uk, heads)
     # The program's sequences' block ids, clamped into the cache. The slots load before the
