@@ -178,6 +178,24 @@ def _owned_rows(context_lens, positions, block_size: int, group):
     return held.to(torch.int32), owner.to(torch.int32)
 
 
+def _owned_slots(positions, seqs, table, block_size: int, max_blocks: int, group):
+    """Each row's cache slot on this rank ``[R]``: real where the rank holds its block, else 0.
+
+    At one rank this is the shared paged rule. Under decode context parallelism, table column
+    ``c`` names this rank's block for sequence blocks ``c * n`` to ``c * n + n - 1``, so the row's
+    owner rank writes at column ``position // (block_size * n)``, and the others write the null
+    block, as the runner maps the target's rows.
+    """
+    size = group.world_size
+    if size == 1:
+        return _paged_slots(positions, seqs, table, block_size, max_blocks)
+    rank = group.rank_in_group_tensor.reshape(1)
+    column = torch.clamp(positions // (block_size * size), max=max_blocks - 1)
+    ids = torch.index_select(table.contiguous().reshape(-1), 0, seqs * max_blocks + column)
+    slot = torch.where(ids < 0, 0, ids * block_size + positions % block_size)
+    return torch.where(positions // block_size % size == rank, slot, 0)
+
+
 class _ShardedWeight(_Weight):
     """A checkpoint module holding this rank's slice of its stored ``weight`` along ``dim``."""
 
@@ -378,8 +396,8 @@ class K3DSparkForCausalLM(nn.Module):
             context_states: The target's taps concatenated, ``[T, taps * H]``, whole on
                 every rank.
             context_positions: Position per row ``[T]``.
-            context_slot_mapping: This rank's cache slot per row ``[T]``. The runner maps
-                a row another rank owns to the null block.
+            context_slot_mapping: This rank's cache slot per row ``[T]``; a row another
+                rank owns maps to the null block.
         """
         c = self.config
         partial = _k_shard_matmul(self._rank_slice(context_states), self.context_proj.weight.t())
@@ -442,14 +460,17 @@ class K3DSparkForCausalLM(nn.Module):
         row_seq = (rows[:, None] > last_token_indices[None, :]).sum(dim=1)
         is_pad = row_seq >= batch
         row_seq = row_seq.clamp(max=batch - 1)
-        slots = _paged_slots(positions, row_seq, table, block_size, max_blocks)
+        group = get_dcp_group()
+        slots = _owned_slots(positions, row_seq, table, block_size, max_blocks, group)
         self.precompute_and_store_context_kv(
             target_hidden_states, positions, torch.where(is_pad, 0, slots)
         )
 
         block_seq = torch.arange(batch * k, device=device) // k
         block_meta = {
-            "slot_mapping": _paged_slots(block_positions, block_seq, table, block_size, max_blocks),
+            "slot_mapping": _owned_slots(
+                block_positions, block_seq, table, block_size, max_blocks, group
+            ),
             "block_size": block_size,
             "block_table_tensor": table,
             "max_blocks_per_seq": max_blocks,

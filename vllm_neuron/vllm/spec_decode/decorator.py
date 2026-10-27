@@ -18,6 +18,9 @@ Model author contract:
   ``**kwargs``.
 * Return the original (non-async) shapes from ``forward()`` -- the
   decorator's epilogue appends ``last_accepted_token``.
+* A model whose caches shard over the decode context parallel (DCP) group
+  sets ``dcp_cache_layers``, each such layer's metadata name to the group;
+  the prologue then keeps each of those layers' slots on its owner rank.
 
 The runner injects ``prev_sampled_token_ids`` / ``prev_num_draft_tokens``
 / ``req_indices_per_token`` only when async spec correction is needed
@@ -60,6 +63,17 @@ def _extract_last_accepted_token(
         .squeeze(1)
         .to(torch.int32)
     )
+
+
+def _dcp_ranks(model) -> dict[str, tuple[int, torch.Tensor]] | None:
+    """Each DCP-sharded cache layer's group size and rank tensor, or None."""
+    layers = getattr(model, "dcp_cache_layers", None)
+    if not layers:
+        return None
+    return {
+        name: (group.world_size, group.rank_in_group_tensor.reshape(1))
+        for name, group in layers.items()
+    }
 
 
 def async_speculative_decoding(cls: type) -> type:
@@ -106,6 +120,7 @@ def async_speculative_decoding(cls: type) -> type:
                     prev_num_draft_tokens,
                     req_indices_per_token,
                     self.config.vocab_size,
+                    dcp_ranks=_dcp_ranks(self),
                 )
             )
 
