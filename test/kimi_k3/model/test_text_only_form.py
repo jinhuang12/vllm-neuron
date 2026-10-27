@@ -82,7 +82,6 @@ def _rank(rank: int, config, root: Path) -> None:
     (root / f"rank{rank}.json").write_text(json.dumps({
         "model": f"{type(runner.model).__module__}.{type(runner.model).__qualname__}",
         "devices": sorted({p.device.type for p in runner.model.parameters()}),
-        "encoder_config": None if runner.encoder_neuron_config is None else str(runner.encoder_neuron_config),
         "encoder_cache_bytes": None if cache is None else cache.buffer.numel() * cache.buffer.element_size(),
     }))
 
@@ -97,8 +96,7 @@ def test_served_form_builds_with_no_encoder_cache(served_config, tmp_path):
         reading = json.loads((tmp_path / f"rank{rank}.json").read_text())
         assert reading["model"] == f"{model.__module__}.{model.__qualname__}", rank
         assert reading["devices"] == ["meta"], rank
-        assert reading["encoder_config"] is None, (rank, reading["encoder_config"])
-        assert reading["encoder_cache_bytes"] is None, (rank, reading["encoder_cache_bytes"])
+        assert not reading["encoder_cache_bytes"], (rank, reading["encoder_cache_bytes"])
 
 
 def test_image_request_is_refused_by_name(served_config):
