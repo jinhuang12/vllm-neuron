@@ -5,8 +5,8 @@ The 4-layer config (KDA layers 0 to 2, MLA layer 3) loads one set of random weig
 gloo ranks at TP 2, once at DCP 2 and once at DCP 1. Each world runs the same steps on the
 runner's metadata: a prompt of 4 prefill chunks, then 16 decode steps of two sequences, the
 prompt's and a new one whose context stays inside its first block. The error is the largest
-difference over the largest DCP 1 magnitude, on each rank. The last item runs the runner's
-jump-forward input step alone.
+difference over the largest DCP 1 magnitude, on each rank. Between the prompt and the decode
+steps, the runner's jump-forward input step builds its inputs once, for the last item.
 
 Most kernels on this path run only on a device or the NKI simulator; of the attention kernels
 only the DCP decode attention has a torch form for the CPU venue. So torch forms of the others'
@@ -14,8 +14,9 @@ math stand in, the same in both worlds: the fused norm and projection, the prefi
 projections, the AttnRes mixes, the MoE tail and the paged MLA prefill, and at DCP 1 the paged
 MLA decode, as the DCP mode over a one-rank group. The expert banks are zero, so the routed
 partial is zero. The KDA layers are not under test: a stateless map, their gated v columns
-through ``o_proj``, stands in for their token mixer. Set ``KIMI_K3_CHECKPOINT`` to the checkpoint directory (default
-``~/models/moonshotai/Kimi-K3``); run with ``VLLM_NEURON_CPU_MODE=1``.
+through ``o_proj``, stands in for their token mixer. Set ``KIMI_K3_CHECKPOINT`` to the
+checkpoint directory (default ``~/models/moonshotai/Kimi-K3``); run with
+``VLLM_NEURON_CPU_MODE=1``.
 """
 
 import contextlib
@@ -58,12 +59,11 @@ pytestmark = pytest.mark.skipif(
 )
 
 TP, DCP, BLOCK, MAX_LEN, VOCAB = 2, 2, 256, 4096, 10240
-# Each chunk after the first starts at a multiple of DCP blocks, as the runner requires; the
-# decode steps then cross from block 7, on rank 1, to block 8, on rank 0.
-CHUNKS = (512, 512, 512, 504)
+# Each chunk after the first starts at a multiple of DCP blocks, as the runner requires. The
+# decode steps and the jump-forward step then cross from block 7, on rank 1, to block 8, on rank 0.
+CHUNKS = (512, 512, 512, 511)
 PROMPT, STEPS, BLOCKS, BOUND = sum(CHUNKS), 16, 80, 1e-5
-# The jump-forward step: each request's cached tokens; its 3 tokens cross a block boundary.
-JUMPS, JUMP_TOKENS, JUMP_ROWS = {"a": 2046, "b": 255}, 2, 4
+JUMP_TOKENS, JUMP_ROWS = 2, 4
 NULL_SLOT, PAD_SLOT = 0, -1
 Q_LORA, KV_LORA, ROPE = 1536, 512, 64
 LATENT, SCALE = KV_LORA + ROPE, (128 + ROPE) ** -0.5
@@ -158,13 +158,12 @@ def _runner(config, model, dcp: int) -> NeuronModelRunner:
     return runner
 
 
-def _add(runner, req_id: str, prompt: list, output: list, cached: int, latent: list,
-         state: int) -> None:
-    """Add a request with ``cached`` tokens computed, its latent block ids and its state block."""
+def _add(runner, req_id: str, prompt: list, latent: list, state: int) -> None:
+    """Add a new request with its latent block ids and its state block."""
     groups = range(len(runner.kv_cache_config.kv_cache_groups))
     runner.input_batch.add_request(CachedRequestState(
         req_id=req_id, prompt_token_ids=prompt, mm_features=[], sampling_params=SamplingParams(),
-        generator=None, num_computed_tokens=cached, output_token_ids=output,
+        generator=None, num_computed_tokens=0, output_token_ids=[],
         block_ids=tuple([state] if runner._is_state_group(g) else latent for g in groups)))
 
 
@@ -331,13 +330,14 @@ def _tap(store: list, forward):
 
 
 def _serve(config, root: Path, rank: int, dcp: int) -> dict:
-    """The prompt's chunks, then the decode steps: the MLA layer outputs and the logits."""
+    """The prompt's chunks, the jump-forward step, then the decode steps, on this rank."""
     model, ids = _small_model(), torch.load(root / "ids.pt")
     _load(model, torch.load(root / "weights.pt", mmap=True), rank)
     runner = _runner(config, model, dcp)
     per_rank = MAX_LEN // (BLOCK * dcp)
-    _add(runner, "prompt", ids["prompt"].tolist(), [], 0, list(range(3, 3 + per_rank)), 1)
-    _add(runner, "short", ids["decode"][:1, 1].tolist(), [], 0, [3 + per_rank], 2)
+    tables = {"prompt": list(range(3, 3 + per_rank)), "short": [3 + per_rank]}
+    _add(runner, "prompt", ids["prompt"].tolist(), tables["prompt"], 1)
+    _add(runner, "short", ids["decode"][:1, 1].tolist(), tables["short"], 2)
     seen, rank_t, start = {"prefill": [], "decode": []}, torch.tensor([rank], dtype=torch.int32), 0
     with _stand_ins() as patch:
         for kind, store in seen.items():
@@ -350,6 +350,7 @@ def _serve(config, root: Path, rank: int, dcp: int) -> dict:
                            attn_metadata=meta, sampling_positions=torch.tensor([size - 1]),
                            rank=rank_t)
             start += size
+        jump = _jump_forward(runner, int(ids["decode"][0, 0]), tables)
         steps = []
         for step in range(STEPS):
             positions = np.array([PROMPT + step, step])
@@ -357,20 +358,17 @@ def _serve(config, root: Path, rank: int, dcp: int) -> dict:
             steps.append(model(ids["decode"][step], torch.from_numpy(positions),
                                attn_metadata=meta, rank=rank_t))
     return {"chunks": seen["prefill"], "next": logits, "steps": torch.stack(steps),
-            "attention": torch.stack(seen["decode"])}
+            "attention": torch.stack(seen["decode"]), "jump": jump}
 
 
-def _jump_forward(config, dcp: int) -> dict:
-    """The jump-forward input step of two requests on a fresh runner: each group's slots."""
-    runner = _runner(config, _small_model(), dcp)
+def _jump_forward(runner, token: int, tables: dict) -> dict:
+    """The runner's jump-forward input step after the prompt, 2 tokens per request: the slots."""
+    # The prompt is computed and its first token sampled, as the runner's state update leaves them.
+    runner.input_batch.num_computed_tokens_cpu[0] = PROMPT
+    runner.input_batch.token_ids_cpu[0, PROMPT] = token
     runner.neuron_config.max_jump_forward_tokens = JUMP_TOKENS
-    per_rank, tables = MAX_LEN // (BLOCK * dcp), {}
-    for i, (req, cached) in enumerate(JUMPS.items()):
-        tables[req] = list(range(3 + i * per_rank, 3 + (i + 1) * per_rank))
-        _add(runner, req, list(range(1, cached + 1)), [cached + 1], cached, tables[req], 1 + i)
-    jumps = {req: [5, 6] for req in JUMPS}
     _, positions, _, meta, *_ = runner._prepare_jf_model_input(
-        None, jumps, JUMP_ROWS, max(JUMPS.values()) + 1 + JUMP_TOKENS)
+        None, {req: [5, 6] for req in tables}, JUMP_ROWS, PROMPT + 1 + JUMP_TOKENS)
     groups = runner.kv_cache_config.kv_cache_groups
     return {"positions": positions.clone(), "tables": tables,
             "state": [runner._is_state_group(g) for g in range(len(groups))],
@@ -378,7 +376,7 @@ def _jump_forward(config, dcp: int) -> dict:
 
 
 def _rank(rank: int, root: Path, model_dir: Path, dcp: int) -> None:
-    """One gloo rank at TP 2 and ``dcp``: the served steps, then the jump-forward step."""
+    """One gloo rank at TP 2 and ``dcp``: the prompt, the jump-forward step, the decode steps."""
     from vllm_neuron.parallel.neuron_parallel_state import (
         initialize_neuron_parallel_state, stamp_spmd_rank_tensors)
 
@@ -387,10 +385,8 @@ def _rank(rank: int, root: Path, model_dir: Path, dcp: int) -> None:
     initialize_neuron_parallel_state(tp_global_ranks=list(range(TP)), local_rank=rank,
                                      dcp_size=dcp)
     stamped = stamp_spmd_rank_tensors("cpu")
-    config = _engine_config(model_dir, dcp)
-    out = _serve(config, root, rank, dcp)
-    out["jump"] = _jump_forward(config, dcp)
-    torch.save(out, root / f"dcp{dcp}-rank{rank}.pt")
+    torch.save(_serve(_engine_config(model_dir, dcp), root, rank, dcp),
+               root / f"dcp{dcp}-rank{rank}.pt")
     del stamped
     dist.destroy_process_group()
 
@@ -450,7 +446,7 @@ def test_jump_forward_slots_follow_each_group_dcp_size(runs):
         for g, slots in enumerate(jump["slots"]):
             slots = slots.view(JUMP_ROWS, -1)
             want = torch.full_like(slots, PAD_SLOT)
-            for row, req in enumerate(JUMPS):
+            for row, req in enumerate(jump["tables"]):
                 if jump["state"][g]:
                     want[row] = ref["jump"]["slots"][g].view(JUMP_ROWS, -1)[row]
                     continue
