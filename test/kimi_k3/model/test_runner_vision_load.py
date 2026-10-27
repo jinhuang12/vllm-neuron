@@ -4,9 +4,12 @@
 The world is ``test_dspark_proposer.py``'s, read from that file so the two cannot drift: the
 target's config cut to 4 layers by the same override, DSpark with 4 drafts on the checkpoint's
 draft, TP 2 over gloo, one thread per rank, and the same stand-ins and seeded random weight
-load. Here the platform's encoder config for the vision section stays, and the text-only flag
-is not set. The runner's ``load_model`` then builds the image-enabled model: the vision tower's
-class, with the runner's encoder config, and the runner's neuron config in its text config.
+load. The text-only flag is not set. The platform serves Kimi K3 as text only, so it gives no
+encoder config and the runner's ``load_model`` builds the text model, with no encoder cache.
+With Kimi K3 taken out of the platform's text-only set, in each rank's own process, the
+platform gives the vision section's encoder config and the runner builds the image-enabled
+model: the vision tower's class, with the runner's encoder config, and the runner's neuron
+config in its text config.
 
 Set ``KIMI_K3_CHECKPOINT`` and ``KIMI_K3_DSPARK_CHECKPOINT`` as that file reads them. Run with
 ``VLLM_NEURON_CPU_MODE=1``.
@@ -31,11 +34,13 @@ _spec.loader.exec_module(proposer)
 pytestmark = proposer.pytestmark
 
 TP = proposer.TP
+ARCH = "KimiK3ForConditionalGeneration"
+TEXT_CLASS = "vllm_neuron.model.kimi_k3.model.KimiK3ForConditionalGeneration"
 VISION_CLASS = "vllm_neuron.model.kimi_k3.vision_encoder.KimiK3VisionForConditionalGeneration"
 
 
 def _engine_config():
-    """The proposer test's DSpark engine config, with the encoder config the platform gives."""
+    """The proposer test's DSpark engine config; the platform decides its encoder config."""
     from vllm.engine.arg_utils import EngineArgs
     from vllm.platforms import current_platform
 
@@ -52,7 +57,7 @@ def _engine_config():
     return config
 
 
-def _rank(rank: int, port: int, root: str) -> None:
+def _rank(rank: int, port: int, root: str, gate_lifted: bool) -> None:
     """One TP rank: the runner's load, then what it built, or the error it raised."""
     import torch.distributed as dist
     from vllm import ModelRegistry
@@ -60,13 +65,18 @@ def _rank(rank: int, port: int, root: str) -> None:
 
     from vllm_neuron.model import registry
     from vllm_neuron.parallel.neuron_parallel_state import initialize_neuron_parallel_state
+    from vllm_neuron.vllm.platform import NeuronPlatform
     from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
 
     torch.set_num_threads(1)
     dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank,
                             world_size=TP)
     initialize_neuron_parallel_state(tp_global_ranks=list(range(TP)), local_rank=rank)
-    config = _engine_config()
+    with pytest.MonkeyPatch.context() as gate:
+        if gate_lifted:
+            gate.setattr(NeuronPlatform, "_text_only_architectures",
+                         NeuronPlatform._text_only_architectures - {ARCH})
+        config = _engine_config()
     for arch, model_cls in registry.get_models():
         ModelRegistry.register_model(arch, model_cls)
     out = {"encoder_config": config.additional_config.get("encoder_neuron_config"),
@@ -86,6 +96,7 @@ def _rank(rank: int, port: int, root: str) -> None:
             model = getattr(runner.model, "_orig_mod", runner.model)
             out.update(
                 model_class=f"{type(model).__module__}.{type(model).__qualname__}",
+                runner_has_encoder_cache=runner.encoder_cache is not None,
                 encoder_config_is_the_runners=runner.encoder_neuron_config is not None
                 and getattr(model, "encoder_neuron_config", None) is runner.encoder_neuron_config,
                 neuron_config_is_the_runners=model.text_config.neuron_config
@@ -95,9 +106,8 @@ def _rank(rank: int, port: int, root: str) -> None:
     dist.destroy_process_group()
 
 
-@pytest.fixture(scope="module")
-def loads(tmp_path_factory) -> list[dict]:
-    """Each rank's readings from one two-rank load."""
+def _loads(tmp_path_factory, gate_lifted: bool) -> list[dict]:
+    """Each rank's readings from one two-rank load, the text-only gate lifted or as landed."""
     root = tmp_path_factory.mktemp("vision_load")
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -107,7 +117,7 @@ def loads(tmp_path_factory) -> list[dict]:
     os.environ["VLLM_RPC_BASE_PATH"] = "."
     os.chdir(root)
     try:
-        mp.spawn(_rank, args=(port, str(root)), nprocs=TP, join=True)
+        mp.spawn(_rank, args=(port, str(root), gate_lifted), nprocs=TP, join=True)
     finally:
         os.chdir(cwd)
         if saved is None:
@@ -117,16 +127,43 @@ def loads(tmp_path_factory) -> list[dict]:
     return [torch.load(root / f"rank{r}.pt", weights_only=False) for r in range(TP)]
 
 
-def test_runner_builds_the_vision_model_from_the_checkpoint_config(loads):
+@pytest.fixture(scope="module")
+def gated_loads(tmp_path_factory) -> list[dict]:
+    """The load with the platform's text-only gate as landed."""
+    return _loads(tmp_path_factory, gate_lifted=False)
+
+
+@pytest.fixture(scope="module")
+def lifted_loads(tmp_path_factory) -> list[dict]:
+    """The load with Kimi K3 out of the platform's text-only set."""
+    return _loads(tmp_path_factory, gate_lifted=True)
+
+
+def test_runner_builds_the_text_model_under_the_text_only_gate(gated_loads):
+    """The runner builds the text model: no encoder config, no encoder cache, no error."""
+    for rank, out in enumerate(gated_loads):
+        print(f"rank {rank}: {out}")
+    errors = [f"rank {rank}: {out['error']}" for rank, out in enumerate(gated_loads)
+              if out["error"]]
+    assert errors == [], errors
+    for rank, out in enumerate(gated_loads):
+        assert out["encoder_config"] is None, f"rank {rank}: the platform gave an encoder config"
+        assert not out["runner_has_encoder_config"], f"rank {rank}: runner encoder config"
+        assert not out["runner_has_encoder_cache"], f"rank {rank}: runner encoder cache"
+        assert out["model_class"] == TEXT_CLASS, (rank, out["model_class"])
+
+
+def test_runner_builds_the_vision_model_with_the_gate_lifted(lifted_loads):
     """The runner builds the image-enabled model from both configs, with no error."""
-    for rank, out in enumerate(loads):
+    for rank, out in enumerate(lifted_loads):
         print(f"rank {rank}: {out}")
     given = [out["encoder_config"] is not None and out.get("runner_has_encoder_config", False)
-             for out in loads]
+             for out in lifted_loads]
     assert all(given), f"the platform gave no encoder config on some rank: {given}"
-    errors = [f"rank {rank}: {out['error']}" for rank, out in enumerate(loads) if out["error"]]
+    errors = [f"rank {rank}: {out['error']}" for rank, out in enumerate(lifted_loads)
+              if out["error"]]
     assert errors == [], errors
-    for rank, out in enumerate(loads):
+    for rank, out in enumerate(lifted_loads):
         assert out["model_class"] == VISION_CLASS, (rank, out["model_class"])
         assert out["encoder_config_is_the_runners"], f"rank {rank}: not the runner's encoder config"
         assert out["neuron_config_is_the_runners"], f"rank {rank}: not the runner's neuron config"
