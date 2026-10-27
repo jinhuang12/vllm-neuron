@@ -6,8 +6,8 @@ latent caches are bf16, the dtype the attention kernel's window mode reads. Each
 sequences writes 64 context rows, then one block pass runs 4 rows per sequence: the embedding
 rows of a random anchor and of 3 mask tokens. The fused norm-projection kernel has no CPU path,
 so an fp32 torch form stands in for it. The rows after each layer are read against upstream's
-draft forward in fp64, rounded to bf16 where the attention kernel rounds, with a bound of one
-bf16 unit. Each rank runs on one thread. Set
+draft forward in fp64, rounded to bf16 where the attention kernel rounds, within 1e-3 of each
+sequence's largest value. Each rank runs on one thread. Set
 ``KIMI_K3_DSPARK_CHECKPOINT`` to the draft directory (default
 ``~/models/Inferact/Kimi-K3-DSpark-Block5``). Run with ``VLLM_NEURON_CPU_MODE=1``.
 """
@@ -272,7 +272,7 @@ def _bf16_unit(magnitude: float) -> float:
     return 2.0 ** (math.frexp(magnitude)[1] - 8)
 
 
-def test_block_rows_stay_within_one_bf16_unit_of_the_reference_after_each_layer(ranks, reference):
+def test_block_rows_stay_within_1e_3_of_the_reference_after_each_layer(ranks, reference):
     units, relative = {}, {}
     for rank, state in enumerate(ranks):
         for layer, (got, ref) in enumerate(zip(state["layers"], reference), 1):
@@ -281,11 +281,12 @@ def test_block_rows_stay_within_one_bf16_unit_of_the_reference_after_each_layer(
             peak = ref.abs().amax((1, 2))
             units[(rank, layer)] = [float(e) / _bf16_unit(float(p)) for e, p in zip(error, peak)]
             relative[(rank, layer)] = [float(e / p) for e, p in zip(error, peak)]
-    warnings.warn(f"relative error by rank and layer, recorded, not graded: {relative}")
-    warnings.warn(f"worst element in bf16 units by rank and layer: {units}")
-    assert sorted(units) == [(r, layer) for r in range(TP) for layer in (1, 2, 3)], sorted(units)
-    # NaN <= 1 is false, so a non-finite row fails here.
-    assert all(u <= 1 for row in units.values() for u in row), units
+    warnings.warn(f"worst element in bf16 units by rank and layer, printed, not graded: {units}")
+    warnings.warn(f"relative error by rank and layer: {relative}")
+    read = [(r, layer) for r in range(TP) for layer in (1, 2, 3)]
+    assert sorted(relative) == read, sorted(relative)
+    # NaN <= 1e-3 is false, so a non-finite row fails here.
+    assert all(e <= 1e-3 for row in relative.values() for e in row), relative
 
 
 def test_changing_block_row_j_changes_no_earlier_row(ranks):
