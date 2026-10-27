@@ -6,6 +6,11 @@ A fresh process stands for a spawned worker: it registers the plugin's model
 classes as the worker does, then reads the config the engine built. Set
 ``KIMI_K3_CHECKPOINT`` to the checkpoint directory; the default is
 ``~/models/moonshotai/Kimi-K3``.
+
+The platform serves Kimi K3 as text only, so its request check refuses an image
+over the largest bucket with the text-only message, before it counts the image's
+embedding tokens. The bucket check is read with Kimi K3 taken out of the
+platform's text-only set, in this process only.
 """
 
 import multiprocessing
@@ -30,6 +35,7 @@ pytestmark = pytest.mark.skipif(
 # The served encoder: one bucket per registered image size, block size 5,504.
 SERVED_BLOCK = 5504
 REGISTERED_BUCKETS = [5504, 33536]
+ARCH = "KimiK3ForConditionalGeneration"
 
 
 def _image(size: int):
@@ -158,11 +164,27 @@ def test_one_1024_image_expands_to_1369_pads(worker_view):
     }
 
 
-def test_image_over_largest_bucket_is_refused(model_config):
+def _oversize_image_outcome(model_config, monkeypatch, gate_lifted: bool):
+    """Send one image over the largest bucket through the engine's input step.
+
+    Return the refusal messages and the count of requests admitted. The config
+    step sets the platform's request-check state on the class, so each item
+    patches that state first and gets it back at its end.
+    """
     from vllm.config import VllmConfig
     from vllm.sampling_params import SamplingParams
     from vllm.v1.engine.input_processor import InputProcessor
 
+    from vllm_neuron.vllm.platform import NeuronPlatform
+
+    for name in ("_text_only_architecture", "_max_embeds_per_image"):
+        monkeypatch.setattr(NeuronPlatform, name, getattr(NeuronPlatform, name))
+    if gate_lifted:
+        monkeypatch.setattr(
+            NeuronPlatform,
+            "_text_only_architectures",
+            NeuronPlatform._text_only_architectures - {ARCH},
+        )
     vllm_config = VllmConfig(
         model_config=model_config,
         additional_config={
@@ -187,6 +209,26 @@ def test_image_over_largest_bucket_is_refused(model_config):
         admitted += 1
     except ValueError as error:
         refused.append(str(error))
+    return refused, admitted
+
+
+def test_image_over_largest_bucket_is_refused_by_the_text_only_gate(
+    model_config, monkeypatch
+):
+    refused, admitted = _oversize_image_outcome(
+        model_config, monkeypatch, gate_lifted=False
+    )
+    assert (len(refused), admitted) == (1, 0)
+    assert f"serves {ARCH} as text only" in refused[0]
+    assert "produces 10000 embedding tokens" not in refused[0]
+
+
+def test_image_over_largest_bucket_is_refused_with_the_gate_lifted(
+    model_config, monkeypatch
+):
+    refused, admitted = _oversize_image_outcome(
+        model_config, monkeypatch, gate_lifted=True
+    )
     assert (len(refused), admitted) == (1, 0)
     assert "produces 10000 embedding tokens" in refused[0]
     assert "the compiled encoder supports (8384)" in refused[0]
