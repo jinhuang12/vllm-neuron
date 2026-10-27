@@ -5,7 +5,9 @@ Each rank loads its TP 2 slices of the draft checkpoint and upcasts the drafter 
 latent caches are bf16, the dtype the attention kernel's window mode reads. Each of 4
 sequences writes 64 context rows, then one block pass runs 4 rows per sequence: the embedding
 rows of a random anchor and of 3 mask tokens. The fused norm-projection kernel has no CPU path,
-so an fp32 torch form stands in for it. Each rank runs on one thread. Set
+so an fp32 torch form stands in for it. The rows after each layer are read against upstream's
+draft forward in fp64, rounded to bf16 where the attention kernel rounds, with a bound of one
+bf16 unit. Each rank runs on one thread. Set
 ``KIMI_K3_DSPARK_CHECKPOINT`` to the draft directory (default
 ``~/models/Inferact/Kimi-K3-DSpark-Block5``). Run with ``VLLM_NEURON_CPU_MODE=1``.
 """
@@ -71,7 +73,7 @@ def _norm_projection(hidden, weight, norm_weight, eps):
 
 
 def _rank(rank: int, port: int, inputs: dict, out: str) -> None:
-    """One TP rank: the block pass on the clean rows, then with row j changed for j = 1 to 3."""
+    """One TP rank: the block pass on the clean rows after each layer, then with row j changed."""
     import torch.distributed as dist
 
     from vllm_neuron.model.kimi_k3 import dspark
@@ -112,9 +114,19 @@ def _rank(rank: int, port: int, inputs: dict, out: str) -> None:
             embedded, BLOCK_POSITIONS, {layer.cache_name: meta for layer in draft.layers}
         )
 
+    seen, attend = [], dspark.K3DSparkForCausalLM._attention
+
+    def attention(self, layer, x, *args):
+        seen.append(x)
+        return attend(self, layer, x, *args)
+
     with pytest.MonkeyPatch.context() as patch, torch.no_grad():
         patch.setattr(dspark, "qkv_proj_fp32acc", _norm_projection)
-        state = {"clean": block_pass(inputs["embedded"]), "changed": {}}
+        patch.setattr(dspark.K3DSparkForCausalLM, "_attention", attention)
+        clean = block_pass(inputs["embedded"])
+        # Layer k's output is layer k + 1's attention input.
+        layers = [x.view(clean.shape) for x in seen[1 : len(draft.layers)]] + [clean]
+        state = {"clean": clean, "layers": layers, "changed": {}}
         for j in range(1, ROWS):
             rows = inputs["embedded"].clone()
             rows[j::ROWS] = inputs["replacements"]
@@ -192,36 +204,42 @@ def _rms_norm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return x * torch.rsqrt((x * x).mean(-1, keepdim=True) + _config()["rms_norm_eps"]) * weight
 
 
+def _bf16(x: torch.Tensor) -> torch.Tensor:
+    """``x`` rounded to bf16, back in fp64."""
+    return x.to(torch.bfloat16).double()
+
+
 def _attention(w, prefix: str, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-    """Upstream's MLA of one draft layer, unabsorbed: keys and values from ``kv_b``."""
+    """Upstream's MLA of one draft layer, absorbed, in fp64 but where the attention kernel rounds.
+
+    The kernel holds the query lift, the cached rows, the window rows and its output in bf16.
+    """
     attn = f"{prefix}.self_attn"
     h = _rms_norm(x, w(f"{prefix}.input_layernorm.weight"))
     q = _rms_norm(h @ w(f"{attn}.q_a_proj.weight").t(), w(f"{attn}.q_a_layernorm.weight"))
     q = (q @ w(f"{attn}.q_b_proj.weight").t()).view(len(x), HEADS, -1)
-    q = torch.cat([q[..., :NOPE], _rotate(q[..., NOPE:], BLOCK_POSITIONS)], -1)
+    kv_b = w(f"{attn}.kv_b_proj.weight").view(HEADS, -1, LATENT)
+    lift = _bf16(torch.cat([torch.einsum("thn,hnl->thl", q[..., :NOPE], kv_b[:, :NOPE]),
+                            _rotate(q[..., NOPE:], BLOCK_POSITIONS)], -1))
 
     def latent_rows(rows, positions):
         kv = rows @ w(f"{attn}.kv_a_proj_with_mqa.weight").t()
         normed = _rms_norm(kv[:, :LATENT], w(f"{attn}.kv_a_layernorm.weight"))
-        return normed, _rotate(kv[:, LATENT:], positions)
+        return _bf16(torch.cat([normed, _rotate(kv[:, LATENT:], positions)], -1))
 
-    rows = [latent_rows(context, CONTEXT_POSITIONS), latent_rows(h, BLOCK_POSITIONS)]
-    kv_b = w(f"{attn}.kv_b_proj.weight").view(HEADS, -1, LATENT)
+    cached = latent_rows(context, CONTEXT_POSITIONS).view(SEQS, CONTEXT, -1)
+    window = latent_rows(h, BLOCK_POSITIONS).view(SEQS, ROWS, -1)
     rope = _config()["rope_parameters"]
     mscale = 0.1 * rope["mscale_all_dim"] * math.log(rope["factor"]) + 1.0
-    scale = q.shape[-1] ** -0.5 * mscale * mscale
+    scale = (NOPE + ROPE) ** -0.5 * mscale * mscale
     causal = torch.ones(ROWS, CONTEXT + ROWS, dtype=torch.bool).tril(CONTEXT)
     out = []
     for s in range(SEQS):
-        latent = torch.cat([r[0].view(SEQS, -1, LATENT)[s] for r in rows])
-        k_pe = torch.cat([r[1].view(SEQS, -1, ROPE)[s] for r in rows])
-        keys = torch.einsum("nl,hdl->hnd", latent, kv_b)
-        k_nope, v = keys[..., :NOPE], keys[..., NOPE:]
-        qs = q[s * ROWS : (s + 1) * ROWS]
-        scores = (torch.einsum("ihd,hnd->hin", qs[..., :NOPE], k_nope)
-                  + torch.einsum("ihd,nd->hin", qs[..., NOPE:], k_pe)) * scale
+        keys = torch.cat([cached[s], window[s]])
+        scores = torch.einsum("ihl,nl->hin", lift[s * ROWS : (s + 1) * ROWS], keys) * scale
         probs = scores.masked_fill(~causal, float("-inf")).softmax(-1)
-        out.append(torch.einsum("hin,hnd->ihd", probs, v).reshape(ROWS, -1))
+        latent = torch.einsum("hin,nl->ihl", probs, keys[:, :LATENT])
+        out.append(_bf16(torch.einsum("ihl,hvl->ihv", latent, kv_b[:, NOPE:])).reshape(ROWS, -1))
     return torch.cat(out) @ w(f"{attn}.o_proj.weight").t()
 
 
@@ -233,31 +251,41 @@ def _mlp(w, prefix: str, x: torch.Tensor) -> torch.Tensor:
 
 
 @pytest.fixture(scope="module")
-def reference(inputs) -> torch.Tensor:
-    """Upstream's draft forward in fp64 from the whole stored weights: ``[B, 4, H]``."""
+def reference(inputs) -> list[torch.Tensor]:
+    """Upstream's draft forward from the whole stored weights, after each layer: ``[B, 4, H]``."""
     with safe_open(WEIGHTS, framework="pt") as f:
         def w(name):
             return f.get_tensor(name).double()
 
         context = _rms_norm(inputs["taps"].double() @ w("context_proj.weight").t(),
                             w("context_norm.weight"))
-        x = inputs["embedded"].double()
+        x, layers = inputs["embedded"].double(), []
         for i in range(_config()["num_hidden_layers"]):
             x = x + _attention(w, f"layers.{i}", x, context)
             x = x + _mlp(w, f"layers.{i}", x)
-    return x.view(SEQS, ROWS, HIDDEN)
+            layers.append(x.view(SEQS, ROWS, HIDDEN))
+    return layers
 
 
-def test_block_rows_equal_the_fp64_reference_of_upstreams_draft_forward(ranks, reference):
-    errors = {}
+def _bf16_unit(magnitude: float) -> float:
+    """One bf16 unit in the last place at ``magnitude``."""
+    return 2.0 ** (math.frexp(magnitude)[1] - 8)
+
+
+def test_block_rows_stay_within_one_bf16_unit_of_the_reference_after_each_layer(ranks, reference):
+    units, relative = {}, {}
     for rank, state in enumerate(ranks):
-        got = state["clean"].double()
-        assert tuple(got.shape) == (SEQS, ROWS, HIDDEN), (rank, tuple(got.shape))
-        error = (got - reference).abs().amax((1, 2)) / reference.abs().amax((1, 2))
-        errors[rank] = [float(e) for e in error]
-    warnings.warn(f"block pass relative error by rank and sequence: {errors}")
-    # NaN <= 1e-5 is false, so a non-finite row fails here.
-    assert all(e <= 1e-5 for rank in errors.values() for e in rank), errors
+        for layer, (got, ref) in enumerate(zip(state["layers"], reference), 1):
+            assert tuple(got.shape) == (SEQS, ROWS, HIDDEN), (rank, layer, tuple(got.shape))
+            error = (got.double() - ref).abs().amax((1, 2))
+            peak = ref.abs().amax((1, 2))
+            units[(rank, layer)] = [float(e) / _bf16_unit(float(p)) for e, p in zip(error, peak)]
+            relative[(rank, layer)] = [float(e / p) for e, p in zip(error, peak)]
+    warnings.warn(f"relative error by rank and layer, recorded, not graded: {relative}")
+    warnings.warn(f"worst element in bf16 units by rank and layer: {units}")
+    assert sorted(units) == [(r, layer) for r in range(TP) for layer in (1, 2, 3)], sorted(units)
+    # NaN <= 1 is false, so a non-finite row fails here.
+    assert all(u <= 1 for row in units.values() for u in row), units
 
 
 def test_changing_block_row_j_changes_no_earlier_row(ranks):
