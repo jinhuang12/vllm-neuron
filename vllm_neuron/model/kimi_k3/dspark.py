@@ -7,7 +7,9 @@ picks its drafts in order with a Markov head. Its embedding and LM head are the
 target's. Every weight is split over the tensor-parallel group: q_b, kv_b and
 o_proj by head, the MLP by its width, q_a, kv_a and the context projection by
 their input width (each output is then all-reduced), and the second Markov
-weight by vocabulary. The first Markov weight and the norms are whole.
+weight by vocabulary. The first Markov weight and the norms are whole. Each
+layer's attention is one call of the paged MLA kernel's window mode, with the
+rotary on and no output gate.
 """
 
 import math
@@ -15,11 +17,14 @@ from dataclasses import dataclass, fields
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch import nn
 from torch.distributed._functional_collectives import all_reduce
 from transformers import PretrainedConfig
+from vllm.distributed.parallel_state import get_dcp_group
 
 from vllm_neuron.functional.argmax import argmax as distributed_argmax
+from vllm_neuron.functional.attention.mla_paged import mla_paged_window_dcp, prepare_mla_weights
 from vllm_neuron.functional.embedding import embedding
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.model.neuron_config import NeuronConfig
@@ -34,8 +39,10 @@ from vllm_neuron.utils.weight_loader import set_weight_loader, sharding_weight_l
 from .config import _as_dict
 from .model import (
     KimiK3RMSNorm,
+    _int8_pages,
     _optional_kernel,
     _output_projection,
+    _page_layout,
     _require,
     qkv_proj_fp32acc,
     _tp_group,
@@ -157,6 +164,20 @@ def _k_shard_matmul(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return _output_projection(layout, weight)
 
 
+def _owned_rows(context_lens, positions, block_size: int, group):
+    """The cached rows of each sequence this rank holds ``[B]``, and which block rows ``[B, k]``.
+
+    Rank r of a decode context group of n ranks holds sequence block j where j % n == r.
+    """
+    size = group.world_size
+    rank = group.rank_in_group_tensor.reshape(1) if size > 1 else 0
+    turn = block_size * size
+    last = (context_lens % turn - rank * block_size).clamp(0, block_size)
+    held = context_lens // turn * block_size + last
+    owner = positions // block_size % size == rank
+    return held.to(torch.int32), owner.to(torch.int32)
+
+
 class _ShardedWeight(_Weight):
     """A checkpoint module holding this rank's slice of its stored ``weight`` along ``dim``."""
 
@@ -183,8 +204,24 @@ class K3DSparkMLA(nn.Module):
         kv_b_rows = heads * (c.qk_nope_head_dim + c.v_head_dim)
         self.kv_b_proj = _ShardedWeight((kv_b_rows, c.kv_lora_rank), dtype, 0, tp_size)
         self.o_proj = _ShardedWeight((c.hidden_size, heads * c.v_head_dim), dtype, 1, tp_size)
-        # Paged latent cache [blocks, block_size, kv_lora_rank + rope], bound with the KV caches.
+        # Load-time layouts: the rank's K rows of q_a and kv_a in fp32 [K, Q + L], o_proj as
+        # [heads * V, H], and the attention kernel's q_b and kv_b layouts.
+        for name in ("latent_weight", "output_weight", "w_qb_t", "w_uk", "w_uv_t"):
+            self.register_buffer(name, None, persistent=False)
+        # Paged latent cache [blocks, block_size, kv_lora_rank + rope], bound with the KV caches,
+        # its int8 [blocks, page bytes] page buffer and where the cache sits in a page.
         self.kv_cache = None
+        self.pages = None
+        self.cache_layout = None
+
+    def prepare_after_load(self) -> None:
+        """Lay out the weights the block pass reads, once; the loaded weights stay."""
+        latent = torch.cat([self.q_a_proj.weight, self.kv_a_proj_with_mqa.weight])
+        self.latent_weight = latent.float().t().contiguous()
+        self.output_weight = self.o_proj.weight.t().contiguous()
+        self.w_qb_t, self.w_uk, self.w_uv_t = prepare_mla_weights(
+            self.q_b_proj.weight, self.kv_b_proj.weight
+        )
 
 
 class K3DSparkMLP(nn.Module):
@@ -197,6 +234,15 @@ class K3DSparkMLP(nn.Module):
         self.gate_proj = _ShardedWeight((width, c.hidden_size), dtype, 0, tp_size)
         self.up_proj = _ShardedWeight((width, c.hidden_size), dtype, 0, tp_size)
         self.down_proj = _ShardedWeight((c.hidden_size, width), dtype, 1, tp_size)
+        # Load-time layouts: gate and up stacked as [H, 2 * width], down as [width, H].
+        self.register_buffer("gate_up_weight", None, persistent=False)
+        self.register_buffer("down_weight", None, persistent=False)
+
+    def prepare_after_load(self) -> None:
+        """Lay out the weights the block pass reads, once; the loaded weights stay."""
+        gate_up = torch.cat([self.gate_proj.weight, self.up_proj.weight])
+        self.gate_up_weight = gate_up.t().contiguous()
+        self.down_weight = self.down_proj.weight.t().contiguous()
 
 
 class K3DSparkDecoderLayer(nn.Module):
@@ -299,12 +345,15 @@ class K3DSparkForCausalLM(nn.Module):
         self.prepare_after_load()
 
     def prepare_after_load(self) -> None:
-        """Build the fp32 context KV weight from the kv_a slices, and the rotary table."""
+        """Build the fp32 context KV weight, the rotary table and each layer's layouts."""
         self.context_kv_weight = torch.cat(
             [layer.self_attn.kv_a_proj_with_mqa.weight for layer in self.layers]
         ).float()
         table = yarn_rope_table(self.config, self.max_positions)
         self.rope_table = table.to(self.context_kv_weight.device)
+        for layer in self.layers:
+            layer.self_attn.prepare_after_load()
+            layer.mlp.prepare_after_load()
 
     def _all_reduce(self, x: torch.Tensor) -> torch.Tensor:
         """Sum the ranks' partials over the tensor-parallel group."""
@@ -420,6 +469,59 @@ class K3DSparkForCausalLM(nn.Module):
         drafts = self.sample_drafts(hidden, anchors)
         return torch.cat([anchors[:, None], drafts], dim=1), drafts
 
+    def block_pass(
+        self, embedded: torch.Tensor, positions: torch.Tensor, attn_metadata: dict
+    ) -> torch.Tensor:
+        """The three draft layers over the block's rows: ``[B, k, H]``, before the final norm.
+
+        Args:
+            embedded: The block's embedded rows ``[B * k, H]``, each sequence's k rows in order.
+            positions: Position per row ``[B * k]``.
+            attn_metadata: Per draft layer's cache name: ``block_table_tensor`` ``[B, pages]``,
+                ``block_size``, ``context_lens`` ``[B]`` (the rows before the block) and
+                ``slot_mapping`` ``[B * k]``, this rank's slot of each row.
+        """
+        if any(layer.self_attn.kv_cache.dtype != torch.bfloat16 for layer in self.layers):
+            raise ValueError("the block pass reads bf16 latent caches")
+        batch = attn_metadata[self.layers[0].cache_name]["block_table_tensor"].shape[0]
+        x = embedded
+        for layer in self.layers:
+            meta = attn_metadata[layer.cache_name]
+            x = x + self._attention(layer, x, positions, meta).to(x.dtype)
+            x = x + self._mlp(layer, x).to(x.dtype)
+        return x.view(batch, -1, x.shape[-1])
+
+    def _attention(self, layer, x, positions, meta) -> torch.Tensor:
+        """One layer's MLA over the block rows: the all-reduced output projection ``[R, H]``.
+
+        The q_a and kv_a partials of the normed rows' K slice sum in fp32. The window mode then
+        attends each row to its sequence's cached rows and to the block rows up to its own,
+        and writes the block rows' latent rows at their slots.
+        """
+        attn = layer.self_attn
+        normed = self._rank_slice(layer.input_layernorm(x)).float()
+        latent = _waited(self._all_reduce(_k_shard_matmul(normed, attn.latent_weight)))
+        table, block_size = meta["block_table_tensor"], meta["block_size"]
+        group = get_dcp_group()
+        held, owner = _owned_rows(meta["context_lens"], positions.view(table.shape[0], -1),
+                                  block_size, group)
+        out, _ = mla_paged_window_dcp(
+            latent, None, attn.q_a_layernorm.weight, attn.kv_a_layernorm.weight, attn.w_qb_t,
+            attn.w_uk, attn.w_uv_t, attn.pages, attn.cache_layout[0], block_size, table, held,
+            meta["slot_mapping"], owner, self.config.rms_norm_eps, group,
+            rope_table=self.rope_table, positions=positions,
+        )
+        weight = attn.output_weight
+        return _waited(self._all_reduce(_output_projection(out.to(weight.dtype), weight)))
+
+    def _mlp(self, layer, x) -> torch.Tensor:
+        """One layer's dense SiLU MLP on the block rows: the all-reduced down projection."""
+        mlp, norm = layer.mlp, layer.post_attention_layernorm
+        project = _require(qkv_proj_fp32acc, "fused norm and projection")
+        gate, up = project(x[None], mlp.gate_up_weight, norm.weight, norm.eps)[0].chunk(2, -1)
+        act = (F.silu(gate.float()) * up.float()).to(x.dtype)
+        return _waited(self._all_reduce(_k_shard_matmul(act, mlp.down_weight)))
+
     def compute_logits(self, hidden: torch.Tensor) -> torch.Tensor:
         """Final norm and the target's LM head on ``[B, S, H]`` rows: ``[B, S, V / TP]`` bf16.
 
@@ -488,9 +590,12 @@ class K3DSparkForCausalLM(nn.Module):
         )
 
     def bind_kv_cache(self, kv_caches: dict[str, list[torch.Tensor]]) -> None:
-        """Bind each draft layer's latent cache."""
+        """Bind each draft layer's latent cache and the int8 page view of its buffer."""
         for layer in self.layers:
             if layer.cache_name not in kv_caches:
                 raise KeyError(f"KV cache for layer {layer.cache_name} not initialized")
             # [blocks, 1, block_size, D]: one latent head.
-            layer.self_attn.kv_cache = kv_caches[layer.cache_name][0].squeeze(1)
+            attn = layer.self_attn
+            attn.kv_cache = kv_caches[layer.cache_name][0].squeeze(1)
+            attn.pages = _int8_pages(attn.kv_cache)
+            attn.cache_layout = _page_layout(attn.kv_cache, attn.pages)
