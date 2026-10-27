@@ -28,9 +28,19 @@ reaches its output. A token's own latent row is one more key, computed in the la
 At LNC 2 decode splits the sequences over the two programs, or the keys of a lone sequence,
 merged over ``sendrecv``. Prefill takes one sequence: groups of 128-row query tiles
 alternate between the programs, each over the paged prefix and the causal chunk.
+
+Decode also runs in DCP mode, on one rank of a decode context parallel group that holds
+every group-size-th block of each sequence's cache. The rank's heads' ``q_lift`` is
+all-gathered over the group in bf16. The rank attends its own pages, with the new row a
+key on its owner rank only, to an fp32 partial divided by its own sum and an fp32 LSE; a
+rank with no key writes partial 0 and LSE -3.0e38 by select. The merge weighs each partial
+by ``exp(LSE - group LSE)`` and returns each rank its own heads: an all-to-all of partials
+and LSEs at 4 to 15 ranks, otherwise an all-gather of the LSEs and a reduce-scatter of the
+weighted partials. The collectives run inside the kernel, on shared HBM.
 """
 
 import nki
+import nki.collectives as ncc
 import nki.isa as nisa
 import nki.language as nl
 from nkilib.core.utils.kernel_assert import kernel_assert
@@ -38,6 +48,7 @@ from nkilib.core.utils.kernel_assert import kernel_assert
 import torch
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 from vllm_neuron.utils.hardware_config import get_logical_nc_config
+from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 _P = 128
 _BLOCK = 512  # keys per online-softmax step: one fp32 PSUM bank of scores
@@ -57,6 +68,7 @@ _FILL = -3.4028234663852886e38  # the fp32 minimum, range_select's only fill val
 _Q_GROUP = 4  # prefill query tiles that share one pass over the keys
 _KEYS_AHEAD = 3  # decode steps between a page's key transposes and its scores
 _DUP = 32  # decode: partition of the low-part copy of each group's query rows
+_DEAD_LSE = -3.0e38  # LSE of a rank with no key: its merge weight underflows to exactly 0
 
 
 def _even(n):
@@ -146,12 +158,13 @@ def _sum_parts(dst, ps, rows):
     nisa.tensor_tensor(dst=dst, data1=ps[:, 0:rows], data2=low, op=nl.add)
 
 
-def _absorbed_queries(ql, by_token, x, q_gain, wqb, wuk, eps, heads):
+def _absorbed_queries(ql, by_token, x, q_gain, wqb, wuk, eps, heads, k_outer=False):
     """``ql[i]``: ``q_lift^T`` of each head on latent tile ``i``, bf16, for the qkv_a rows ``x``.
 
     The normed q and ``q_nope`` enter their products unrounded, as bf16 high and low parts
     side by side in the moving operand, so each weight tile loads once; the parts' columns are
-    summed after the product.
+    summed after the product. With ``k_outer`` the ``q_b`` products run K tile by K tile over
+    all heads, so each tile's products start when that tile of ``q_b`` lands.
     """
     rows = x.shape[0]
     n = 2 * rows
@@ -164,16 +177,29 @@ def _absorbed_queries(ql, by_token, x, q_gain, wqb, wuk, eps, heads):
             for k in range(4):
                 nisa.nc_transpose(dst=tp[:, k, :], data=part[:, (k0 + k) * _P:(k0 + k + 1) * _P])
             nisa.tensor_copy(dst=qnt[:, k0:k0 + 4, j * rows:(j + 1) * rows], src=tp[:, :, 0:rows])
+    if k_outer:
+        products = [(_ps((_NOPE, n), nl.float32), _ps((_ROPE, n), nl.float32))
+                    for _ in range(heads)]
+        for k in range(_K_TILES):
+            for h, (qp, qr) in enumerate(products):
+                base = h * (_NOPE + _ROPE)
+                nisa.nc_matmul(dst=qp, stationary=wqb[:, k, base:base + _NOPE],
+                               moving=qnt[:, k, :], accumulate=k > 0)
+                nisa.nc_matmul(dst=qr, stationary=wqb[:, k, base + _NOPE:base + _NOPE + _ROPE],
+                               moving=qnt[:, k, :], accumulate=k > 0)
     for h in range(heads):
         base = h * (_NOPE + _ROPE)
-        qp = _ps((_NOPE, n), nl.float32)
-        for k in range(_K_TILES):
-            nisa.nc_matmul(dst=qp, stationary=wqb[:, k, base:base + _NOPE], moving=qnt[:, k, :],
-                           accumulate=k > 0)
-        qr = _ps((_ROPE, n), nl.float32)
-        for k in range(_K_TILES):
-            nisa.nc_matmul(dst=qr, stationary=wqb[:, k, base + _NOPE:base + _NOPE + _ROPE],
-                           moving=qnt[:, k, :], accumulate=k > 0)
+        if k_outer:
+            qp, qr = products[h]
+        else:
+            qp = _ps((_NOPE, n), nl.float32)
+            for k in range(_K_TILES):
+                nisa.nc_matmul(dst=qp, stationary=wqb[:, k, base:base + _NOPE],
+                               moving=qnt[:, k, :], accumulate=k > 0)
+            qr = _ps((_ROPE, n), nl.float32)
+            for k in range(_K_TILES):
+                nisa.nc_matmul(dst=qr, stationary=wqb[:, k, base + _NOPE:base + _NOPE + _ROPE],
+                               moving=qnt[:, k, :], accumulate=k > 0)
         _sum_parts(_slot(ql[4], h, _ROPE, rows, by_token), qr, rows)
         q_nope = _sb((_NOPE, rows), nl.float32)
         _sum_parts(q_nope, qp, rows)
@@ -205,11 +231,12 @@ def _cache_keys(table_row, length, blocks, pages, window, positions):
     return held, bound, invalid
 
 
-def _cache_pages(cache, held, first_tile, n_tiles, block_size, first):
+def _cache_pages(cache, held, first_tile, n_tiles, block_size, first, queue=None, after=None):
     """Window tiles ``first_tile ..`` of a sequence as one ``[128, n_tiles, 576]`` page tile.
 
     ``cache`` is the bf16 view ``[blocks, page elements]`` of the page buffer, its latent
-    block from element ``first`` of each page.
+    block from element ``first`` of each page. ``queue`` names the loads' DMA options, and
+    ``after`` an instruction they are scheduled after.
     """
     per = block_size // _P
     pages = _sb((_P, n_tiles, _LATENT), cache.dtype)
@@ -217,12 +244,21 @@ def _cache_pages(cache, held, first_tile, n_tiles, block_size, first):
     while t < n_tiles:
         b, r = (first_tile + t) // per, (first_tile + t) % per
         n = min(n_tiles - t, per - r)
-        nisa.dma_copy(dst=pages[:, t:t + n, :],
-                      src=cache.ap(pattern=[[_LATENT, _P], [_P * _LATENT, n], [1, _LATENT]],
-                                   offset=first + r * _P * _LATENT,
-                                   scalar_offset=held[0:1, b:b + 1], indirect_dim=0))
+        load = nisa.dma_copy(dst=pages[:, t:t + n, :],
+                             src=cache.ap(pattern=[[_LATENT, _P], [_P * _LATENT, n], [1, _LATENT]],
+                                          offset=first + r * _P * _LATENT,
+                                          scalar_offset=held[0:1, b:b + 1], indirect_dim=0),
+                             **(queue or {}))
+        _after(load, after)
         t += n
     return pages
+
+
+def _after(inst, producer):
+    """Schedule ``inst`` after ``producer``, with no hardware wait; no change when it is None."""
+    if producer is not None:
+        inst.depends_on(producer, kind=nisa.dependency.schedule)
+    return inst
 
 
 def _page_views(pages, latent_offset, block_size):
@@ -269,18 +305,19 @@ def _write_rows(by_row, idx, lat, rows):
                                 vector_offset=idx, indirect_dim=0), src=lat[0:rows, :])
 
 
-def _clear_unowned(pages, invalid, first_tile):
+def _clear_unowned(pages, invalid, first_tile, after=None):
     """Zero the latent of rows the sequence does not own, so the weighted sum reads finite rows."""
     tiles = []
     for t in range(pages.shape[1]):
         j = first_tile + t
-        nisa.tensor_copy_predicated(dst=pages[:, t, 0:_KV_LORA], src=0.0,
-                                    predicate=invalid[:, j:j + 1].broadcast(1, _KV_LORA))
+        _after(nisa.tensor_copy_predicated(dst=pages[:, t, 0:_KV_LORA], src=0.0,
+                                           predicate=invalid[:, j:j + 1].broadcast(1, _KV_LORA)),
+               after)
         tiles.append(pages[:, t, :])
     return tiles
 
 
-def _keys_t(tiles):
+def _keys_t(tiles, after=None):
     """The key pages with the latent on partitions: ``kt[i] [w_i, keys]`` bf16, by PE transposes."""
     rows_k = [t.shape[0] for t in tiles]
     width = _P * (len(tiles) - 1) + rows_k[-1]
@@ -288,7 +325,8 @@ def _keys_t(tiles):
     for i, (c0, w) in enumerate(_C_TILES):
         tp = _ps((w, width), nl.bfloat16)
         for t, page in enumerate(tiles):
-            nisa.nc_transpose(dst=tp[:, t * _P:t * _P + rows_k[t]], data=page[:, c0:c0 + w])
+            _after(nisa.nc_transpose(dst=tp[:, t * _P:t * _P + rows_k[t]], data=page[:, c0:c0 + w]),
+                   after)
         k_sb = _sb((w, width), nl.bfloat16)
         nisa.tensor_copy(dst=k_sb, src=tp,
                          engine=nisa.engine.scalar if i % 2 == 0 else nisa.engine.vector)
@@ -326,10 +364,11 @@ def _scores(g, kind, kt, rows_k, key0, scale, zero):
     nisa.activation(dst=p, op=nl.exp, data=s_sb, bias=neg, scale=scale, reduce_op=nl.add,
                     reduce_res=total, reduce_cmd=nisa.reduce_cmd.reset_reduce)
     if g["split"] == "rows":
-        # Rows from _DUP repeat the group's queries: they carry the low part in the same tile.
+        # Rows from g["dup"] repeat the group's queries: they carry the low part in the same tile.
+        dup = g["dup"]
         hi = _sb((r, cols), nl.bfloat16)
         nisa.tensor_copy(dst=hi, src=p)
-        nisa.tensor_tensor(dst=hi[_DUP:r, :], data1=p[_DUP:r, :], data2=hi[_DUP:r, :],
+        nisa.tensor_tensor(dst=hi[dup:r, :], data1=p[dup:r, :], data2=hi[dup:r, :],
                            op=nl.subtract)
         parts = [hi]
     else:
@@ -388,7 +427,7 @@ def _attend(groups, kind, tiles, key0, scale, zero, values=None):
         _accumulate(sc, tiles if values is None else values)
 
 
-def _pipelined(steps, scale, zero, queries):
+def _pipelined(steps, scale, zero, queries, query_first=False):
     """Run single-group steps with each engine's work for later steps emitted ahead.
 
     A step is ``(group, kind, key0, load)``; ``load()`` issues its page DMA and returns a
@@ -397,19 +436,31 @@ def _pipelined(steps, scale, zero, queries):
     transposes three ahead, scores one ahead, then this step's sum, so each engine has
     independent work queued while the dependent chain of a step completes. ``queries()``
     fills the groups' queries and is emitted just before the first scores.
+
+    With ``query_first``, ``queries()`` is emitted after the first loads instead and returns
+    an instruction; the clears and key transposes of the steps up to the first scores are
+    scheduled after it, so the query chain has the engines first.
     """
     n, st, k = len(steps), [dict() for _ in steps], _KEYS_AHEAD
+    early, gate = (min(n, k + 2) if query_first else 0), None
+    for i in range(early):
+        st[i]["finish"] = steps[i][3]()
+    if query_first:
+        gate = queries()
+
+    def after(i):
+        return gate if i <= k else None
     for t in range(-k - 2, n):
-        if t == -1:
+        if t == -1 and not query_first:
             queries()
-        if t + k + 2 < n:
+        if early <= t + k + 2 < n:
             st[t + k + 2]["finish"] = steps[t + k + 2][3]()
         if 0 <= t + k + 1 < n:
-            st[t + k + 1]["tiles"] = st[t + k + 1].pop("finish")()
+            st[t + k + 1]["tiles"] = st[t + k + 1].pop("finish")(after(t + k + 1))
         if 0 <= t < n:
             _weights_t(st[t]["sc"])
         if 0 <= t + k < n:
-            st[t + k]["kt"] = _keys_t(st[t + k]["tiles"])
+            st[t + k]["kt"] = _keys_t(st[t + k]["tiles"], after(t + k))
         if 0 <= t + 1 < n:
             g, kind, key0, _ = steps[t + 1]
             rows_k = [x.shape[0] for x in st[t + 1]["tiles"]]
@@ -516,6 +567,43 @@ def _check_common(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, slots):
     return heads
 
 
+def _cache_step(cache, held, invalid, b, window, block_size, first_elem, queue=None,
+                after=None):
+    """The page load of a sequence's key block ``b``; its finisher clears the unowned rows,
+    scheduled after the instruction it is given."""
+    first_tile, n_t = b * (_BLOCK // _P), min(_BLOCK, window - b * _BLOCK) // _P
+
+    def load():
+        tiles = _cache_pages(cache, held, first_tile, n_t, block_size, first_elem, queue, after)
+        return lambda gate=None: _clear_unowned(tiles, invalid, first_tile, gate)
+    return load
+
+
+def _own_step(lat, s):
+    """The load of token ``s``'s own latent row as a one-key step."""
+    def load():
+        row = _zeros((2, _LATENT), nl.bfloat16)  # key 1 is past the bound and zero
+        nisa.dma_copy(dst=row[0:1, :], src=lat[s:s + 1, :])
+        return lambda gate=None: [row]
+    return load
+
+
+def _merge_programs(state, prg, scale, rows):
+    """A lone sequence's states from the two programs' key halves, merged over ``sendrecv``."""
+    m, l, acc = state
+    mine = _sb((rows, _KV_LORA + 8), nl.float32)
+    nisa.tensor_copy(dst=mine[:, 0:_KV_LORA], src=acc[0:rows, :])
+    nisa.tensor_copy(dst=mine[:, _KV_LORA:_KV_LORA + 1], src=m[0:rows, :])
+    nisa.tensor_copy(dst=mine[:, _KV_LORA + 1:_KV_LORA + 2], src=l[0:rows, :])
+    theirs = _sb((rows, _KV_LORA + 8), nl.float32)
+    nisa.sendrecv(src=mine, dst=theirs, send_to_rank=1 - prg, recv_from_rank=1 - prg,
+                  pipe_id=0)
+    a, b = (mine, theirs) if prg == 0 else (theirs, mine)
+    return _merge((a[:, _KV_LORA:_KV_LORA + 1], a[:, _KV_LORA + 1:_KV_LORA + 2], a[:, 0:_KV_LORA]),
+                  (b[:, _KV_LORA:_KV_LORA + 1], b[:, _KV_LORA + 1:_KV_LORA + 2], b[:, 0:_KV_LORA]),
+                  scale, rows)
+
+
 def mla_paged_decode_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, pages,
                             block_table, context_lens, slots, EPS: float, LATENT_OFFSET: int,
                             BLOCK_SIZE: int):
@@ -600,30 +688,16 @@ def mla_paged_decode_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, 
             block_table.ap(pattern=[[n_pages, 1], [1, n_pages]], offset=seq * n_pages),
             context_lens.ap(pattern=[[0, _P], [1, 1]], offset=seq),
             blocks, n_pages, window, positions)
-        group = {"rows": rows_q, "split": "rows",
+        group = {"rows": rows_q, "split": "rows", "dup": _DUP,
                  "ql": [ql[i][0:w, s, :] for i, (_, w) in enumerate(_C_TILES)],
                  "cache": bound, "own": one, "own_tiles": lambda k: 1,
                  "m": None, "l": None, "acc": None}
         seqs.append((group, held, invalid))
-    def cache_step(held, invalid, b):
-        first_tile, n_t = b * (_BLOCK // _P), min(_BLOCK, window - b * _BLOCK) // _P
-
-        def load():
-            tiles = _cache_pages(cache, held, first_tile, n_t, block_size, first_elem)
-            return lambda: _clear_unowned(tiles, invalid, first_tile)
-        return load
-
-    def own_step(s):
-        def load():
-            row = _zeros((2, _LATENT), nl.bfloat16)  # key 1 is past the bound and zero
-            nisa.dma_copy(dst=row[0:1, :], src=lat[s:s + 1, :])
-            return lambda: [row]
-        return load
-
-    steps = [(group, "cache", b * _BLOCK, cache_step(held, invalid, b))
+    steps = [(group, "cache", b * _BLOCK,
+              _cache_step(cache, held, invalid, b, window, block_size, first_elem))
              for b in range(b0, b1) for group, held, invalid in seqs]
     if own:
-        steps += [(group, "own", 0, own_step(s)) for s, (group, _, _) in enumerate(seqs)]
+        steps += [(group, "own", 0, _own_step(lat, s)) for s, (group, _, _) in enumerate(seqs)]
     # The query chain is emitted after the first pages' loads and transposes, which do not need it.
     def queries():
         _absorbed_queries(ql, True, x, q_gain, wqb, wuk, EPS, heads)
@@ -634,19 +708,7 @@ def mla_paged_decode_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, 
 
     states = [(g["m"], g["l"], g["acc"]) for g, _, _ in seqs]
     if split:
-        m, l, acc = states[0]
-        mine = _sb((rows_q, _KV_LORA + 8), nl.float32)
-        nisa.tensor_copy(dst=mine[:, 0:_KV_LORA], src=acc[0:rows_q, :])
-        nisa.tensor_copy(dst=mine[:, _KV_LORA:_KV_LORA + 1], src=m[0:rows_q, :])
-        nisa.tensor_copy(dst=mine[:, _KV_LORA + 1:_KV_LORA + 2], src=l[0:rows_q, :])
-        theirs = _sb((rows_q, _KV_LORA + 8), nl.float32)
-        nisa.sendrecv(src=mine, dst=theirs, send_to_rank=1 - prg, recv_from_rank=1 - prg,
-                      pipe_id=0)
-        a, b = (mine, theirs) if prg == 0 else (theirs, mine)
-        states = [_merge((a[:, _KV_LORA:_KV_LORA + 1], a[:, _KV_LORA + 1:_KV_LORA + 2],
-                          a[:, 0:_KV_LORA]),
-                         (b[:, _KV_LORA:_KV_LORA + 1], b[:, _KV_LORA + 1:_KV_LORA + 2],
-                          b[:, 0:_KV_LORA]), scale, rows_q)]
+        states = [_merge_programs(states[0], prg, scale, rows_q)]
     if split and prg != 0:
         return out, pages
 
@@ -662,6 +724,371 @@ def mla_paged_decode_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, 
     nisa.dma_copy(dst=out.ap(pattern=[[tokens * heads, _V], [heads, count], [1, heads]],
                              offset=first * heads), src=res)
     # The new rows sit at or past their sequences' lengths, so every read above masks them.
+    _write_rows(by_row, idx, lat, count)
+    return out, pages
+
+
+def _dup_row(rows):
+    """First partition of the low-part copy of ``rows`` query rows, on a 32-row bound; None when
+    two copies do not fit the 128 partitions."""
+    dup = 32 * ((rows + 31) // 32)
+    return dup if dup + rows <= _P else None
+
+
+def _shared(shape, dtype, name):
+    """A kernel-internal HBM tensor both programs share, under a fixed name: the programs'
+    traces differ when their work does, and an unnamed tensor then gets one copy per program."""
+    return nl.ndarray(shape, dtype=dtype, buffer=nl.shared_hbm, name=name)
+
+
+# DMA queues of the DCP mode: the query chain's loads and stores first, then the metadata, then
+# the pages. A lower priority number is served first.
+_QUERY_QUEUE = {"dge_mode": nisa.dge_mode.hwdge, "engine": nisa.engine.scalar, "priority": 0}
+_META_QUEUE = {"dge_mode": nisa.dge_mode.hwdge, "engine": nisa.engine.sync, "priority": 1}
+_PAGE_QUEUE = {"dge_mode": nisa.dge_mode.hwdge, "engine": nisa.engine.sync, "priority": 2}
+_QB_CHUNK = 3  # K tiles of q_b per load
+
+
+def _load_weights_first(w_qb_t, w_uk, w_uv_t, heads):
+    """``_load_weights`` with ``q_b`` and ``W_UK`` on the query queue, ``q_b`` in chunks of K
+    tiles, and ``W_UV`` on the page queue after them; also the last ``q_b`` or ``W_UK`` load."""
+    width = heads * (_NOPE + _ROPE)
+    wqb = _sb((_P, _K_TILES, width), w_qb_t.dtype)
+    for k0 in range(0, _K_TILES, _QB_CHUNK):
+        nisa.dma_copy(dst=wqb[:, k0:k0 + _QB_CHUNK, :],
+                      src=w_qb_t.ap(pattern=[[width, _P], [_P * width, _QB_CHUNK], [1, width]],
+                                    offset=k0 * _P * width), **_QUERY_QUEUE)
+    wuk = _sb((_P, heads, _KV_LORA), w_uk.dtype)
+    last = nisa.dma_copy(dst=wuk, src=w_uk.ap(pattern=[[_KV_LORA, _P], [_P * _KV_LORA, heads],
+                                                       [1, _KV_LORA]], offset=0), **_QUERY_QUEUE)
+    wuv = _sb((_P, _V_TILES, heads, _V), w_uv_t.dtype)
+    _after(nisa.dma_copy(dst=wuv, src=w_uv_t.ap(pattern=[[_V, _P], [_P * _V, _V_TILES],
+                                                         [_KV_LORA * _V, heads], [1, _V]],
+                                                offset=0), **_PAGE_QUEUE), last)
+    return wqb, wuk, wuv, last
+
+
+def _gather_queries(qloc, first, count, tokens, heads, group, ranks, write):
+    """Every rank's ``q_lift`` for this program's tokens, ``[128, 5, ranks, count * heads]``
+    bf16, and the all-gather.
+
+    ``qloc [128, 5, count, heads]`` holds the rank's own heads by latent tile. Each rank's
+    chunk of the all-gather is its ``[128, 4, T, heads]`` nope tiles, then its rope tile.
+    """
+    per = tokens * heads
+    nope = _V_TILES * _P * per
+    size = nope + _ROPE * per
+    src = _shared((1, size), nl.bfloat16, "query_gather_src")
+    dst = _shared((ranks, size), nl.bfloat16, "query_gather_dst")
+    if write:
+        nisa.dma_copy(dst=src.ap(pattern=[[_V_TILES * per, _P], [per, _V_TILES], [heads, count],
+                                          [1, heads]], offset=first * heads),
+                      src=qloc[:, 0:_V_TILES, :, :], **_QUERY_QUEUE)
+        nisa.dma_copy(dst=src.ap(pattern=[[per, _ROPE], [heads, count], [1, heads]],
+                                 offset=nope + first * heads),
+                      src=qloc[0:_ROPE, _V_TILES, :, :], **_QUERY_QUEUE)
+    gather = ncc.all_gather(srcs=[src], dsts=[dst], replica_group=group, collective_dim=0)
+    q = _sb((_P, len(_C_TILES), ranks, count * heads), nl.bfloat16)
+    nisa.dma_copy(dst=q[:, 0:_V_TILES, :, :],
+                  src=dst.ap(pattern=[[_V_TILES * per, _P], [per, _V_TILES], [size, ranks],
+                                      [1, count * heads]], offset=first * heads), **_QUERY_QUEUE)
+    nisa.dma_copy(dst=q[0:_ROPE, _V_TILES, :, :],
+                  src=dst.ap(pattern=[[per, _ROPE], [size, ranks], [1, count * heads]],
+                             offset=nope + first * heads), **_QUERY_QUEUE)
+    return q, gather
+
+
+def _group_weights(lse, first, count, tokens, gathered, dup, group, ranks, write):
+    """``exp(lse - group LSE)`` per query row and sequence, ``[rows, count]`` fp32, from an
+    all-gather of every rank's LSE ``[gathered heads, T]``."""
+    rows = lse.shape[0]
+    src = _shared((1, gathered * tokens), nl.float32, "lse_gather_src")
+    dst = _shared((ranks, gathered * tokens), nl.float32, "lse_gather_dst")
+    if write:
+        nisa.dma_copy(dst=src.ap(pattern=[[tokens, gathered], [1, count]], offset=first),
+                      src=lse[0:gathered, :])
+    ncc.all_gather(srcs=[src], dsts=[dst], replica_group=group, collective_dim=0)
+    every = _sb((rows, ranks, count), nl.float32)
+    nisa.memset(dst=every, value=0.0)  # the rows between the two copies stay finite
+    for row0 in (0,) if dup is None else (0, dup):
+        nisa.dma_copy(dst=every[row0:row0 + gathered, :, :],
+                      src=dst.ap(pattern=[[tokens, gathered], [gathered * tokens, ranks],
+                                          [1, count]], offset=first))
+    top = _sb((rows, count), nl.float32)
+    nisa.tensor_reduce(dst=top, op=nl.maximum, data=every.permute((0, 2, 1)), axis=2)
+    shifted = _sb((rows, ranks, count), nl.float32)
+    nisa.tensor_tensor(dst=shifted, data1=every, data2=top.expand_dim(1).broadcast(1, ranks),
+                       op=nl.subtract)
+    nisa.activation(dst=shifted, op=nl.exp, data=shifted)
+    total = _sb((rows, count), nl.float32)
+    nisa.tensor_reduce(dst=total, op=nl.add, data=shifted.permute((0, 2, 1)), axis=2)
+    recip = _sb((rows, count), nl.float32)
+    nisa.reciprocal(dst=recip, data=total)
+    w = _sb((rows, count), nl.float32)
+    nisa.tensor_tensor(dst=w, data1=lse, data2=top, op=nl.subtract)
+    nisa.activation(dst=w, op=nl.exp, data=w)
+    nisa.tensor_tensor(dst=w, data1=w, data2=recip, op=nl.multiply)
+    return w
+
+
+def _partials(states, factor, dead, ranks, heads, dup):
+    """Each sequence's partial ``acc * factor`` with the latent on partitions,
+    ``[128, ranks, count, 4, heads]`` fp32; a sequence with no key on the rank is 0, by select."""
+    count, rows = len(states), states[0][2].shape[0]
+    gathered = ranks * heads
+    parts = _sb((_P, ranks, count, _V_TILES, heads), nl.float32)
+    for s, (_, _, acc) in enumerate(states):
+        o = _sb((rows, _KV_LORA), nl.float32)
+        nisa.tensor_scalar(dst=o, data=acc[0:rows, :], op0=nl.multiply, operand0=factor[:, s:s + 1])
+        tp = _ps((_P, _V_TILES, rows), nl.float32)
+        for t in range(_V_TILES):
+            nisa.nc_transpose(dst=tp[:, t, :], data=o[:, t * _P:(t + 1) * _P])
+        dst = parts[:, :, s, :, :]
+        hi = tp[:, :, 0:gathered].reshape_dim(2, (ranks, heads)).permute((0, 2, 1, 3))
+        if dup is None:
+            nisa.tensor_copy(dst=dst, src=hi)
+        else:
+            # The high and low parts' sums, on rows 0.. and dup.., meet in the free dimension.
+            lo = _sb((_P, _V_TILES, gathered), nl.float32)
+            nisa.tensor_copy(dst=lo, src=tp[:, :, dup:dup + gathered])
+            nisa.tensor_tensor(dst=dst, data1=hi, op=nl.add,
+                               data2=lo.reshape_dim(2, (ranks, heads)).permute((0, 2, 1, 3)))
+        nisa.tensor_copy_predicated(
+            dst=dst, src=0.0, predicate=dead[:, s:s + 1].broadcast(1, ranks * _V_TILES * heads)
+            .reshape_dim(1, (ranks, _V_TILES, heads)))
+    return parts
+
+
+def _reduce_scatter(parts, first, count, tokens, heads, group, ranks, write):
+    """The group's sum of the weighted partials of this rank's heads, ``[128, count, 4, heads]``.
+
+    Rank ``r``'s chunk of the reduce-scatter is ``[128, T, 4, heads]`` for its heads."""
+    per = _V_TILES * heads
+    chunk = _P * tokens * per
+    src = _shared((ranks, chunk), nl.float32, "partial_scatter_src")
+    dst = _shared((1, chunk), nl.float32, "partial_scatter_dst")
+    if write:
+        nisa.dma_copy(dst=src.ap(pattern=[[tokens * per, _P], [chunk, ranks], [1, count * per]],
+                                 offset=first * per), src=parts.flatten_dims(2, 4))
+    ncc.reduce_scatter(srcs=[src], dsts=[dst], replica_group=group, collective_dim=0, op=nl.add)
+    o = _sb((_P, count, _V_TILES, heads), nl.float32)
+    nisa.dma_copy(dst=o.flatten_dims(1, 3),
+                  src=dst.ap(pattern=[[tokens * per, _P], [1, count * per]], offset=first * per))
+    return o
+
+
+def _all_to_all(parts, lse, first, count, tokens, heads, group, ranks, write):
+    """This rank's heads over the group: every rank's normalized partial weighed by
+    ``exp(LSE - group LSE)`` and summed, ``[128, count, 4, heads]`` fp32.
+
+    Rank ``r``'s chunk of the all-to-all is the partial ``[128, T, 4, heads]`` of its heads,
+    then their LSE ``[T, heads]``."""
+    per = _V_TILES * heads
+    body = _P * tokens * per
+    chunk = body + tokens * heads
+    src = _shared((ranks, chunk), nl.float32, "partial_exchange_src")
+    dst = _shared((ranks, chunk), nl.float32, "partial_exchange_dst")
+    if write:
+        nisa.dma_copy(dst=src.ap(pattern=[[tokens * per, _P], [chunk, ranks], [1, count * per]],
+                                 offset=first * per), src=parts.flatten_dims(2, 4))
+        for r in range(ranks):
+            nisa.dma_copy(dst=src.ap(pattern=[[1, heads], [heads, count]],
+                                     offset=r * chunk + body + first * heads),
+                          src=lse[r * heads:(r + 1) * heads, :])
+    ncc.all_to_all(srcs=[src], dsts=[dst], replica_group=group, collective_dim=0)
+    got = _sb((_P, ranks, count * per), nl.float32)
+    nisa.dma_copy(dst=got, src=dst.ap(pattern=[[tokens * per, _P], [chunk, ranks],
+                                               [1, count * per]], offset=first * per))
+    every = _sb((_P, ranks, count * heads), nl.float32)  # each rank's LSE on every partition
+    nisa.dma_copy(dst=every, src=dst.ap(pattern=[[0, _P], [chunk, ranks], [1, count * heads]],
+                                        offset=body + first * heads))
+    top = _sb((_P, count * heads), nl.float32)
+    nisa.tensor_reduce(dst=top, op=nl.maximum, data=every.permute((0, 2, 1)), axis=2)
+    nisa.tensor_tensor(dst=every, data1=every, data2=top.expand_dim(1).broadcast(1, ranks),
+                       op=nl.subtract)
+    nisa.activation(dst=every, op=nl.exp, data=every)
+    total = _sb((_P, count * heads), nl.float32)
+    nisa.tensor_reduce(dst=total, op=nl.add, data=every.permute((0, 2, 1)), axis=2)
+    recip = _sb((_P, count * heads), nl.float32)
+    nisa.reciprocal(dst=recip, data=total)
+
+    def by_tile(t):  # [P, count * heads] as [P, count, 4, heads], the same for each latent tile
+        return t.reshape_dim(1, (count, 1, heads)).broadcast(2, _V_TILES)
+    o = _sb((_P, count, _V_TILES, heads), nl.float32)
+    term = _sb((_P, count, _V_TILES, heads), nl.float32)
+    for r in range(ranks):
+        part = got[:, r, :].reshape_dim(1, (count, _V_TILES, heads))
+        nisa.tensor_tensor(dst=o if r == 0 else term, data1=part, data2=by_tile(every[:, r, :]),
+                           op=nl.multiply)
+        if r > 0:
+            nisa.tensor_tensor(dst=o, data1=o, data2=term, op=nl.add)
+    nisa.tensor_tensor(dst=o, data1=o, data2=by_tile(recip), op=nl.multiply)
+    return o
+
+
+def mla_paged_decode_dcp_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, pages,
+                                block_table, context_lens, slots, owner, EPS: float,
+                                LATENT_OFFSET: int, BLOCK_SIZE: int, DCP_RANKS: tuple,
+                                MERGE: str):
+    """One decode step on one rank of a DCP group: ``(out [128, T, H, 1] bf16, pages)``.
+
+    Args:
+        qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, pages, slots, EPS, LATENT_OFFSET,
+            BLOCK_SIZE: as ``mla_paged_decode_kernel``, for the rank's ``H`` heads.
+        block_table: ``[T, pages]`` int32 ids of the rank's own blocks of each sequence.
+        context_lens: ``[T]`` int32 cached tokens of each sequence that the rank holds.
+        owner: ``[T]`` int32, 1 where the rank holds the new token's row, else 0.
+        DCP_RANKS: the group's ranks; rank ``r``'s heads are gathered heads ``r H ..``.
+        MERGE: ``"all_to_all"`` or ``"reduce_scatter"``.
+
+    Returns:
+        The gated attention output of the rank's heads and the page buffer with the new rows.
+    """
+    tokens = qkv_a.shape[0]
+    heads = _check_common(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, slots)
+    cache, by_row, first_elem, first_row = _page_views(pages, LATENT_OFFSET, BLOCK_SIZE)
+    blocks, block_size = pages.shape[0], BLOCK_SIZE
+    page_rows = pages.shape[1] // _ROW_BYTES
+    n_pages = block_table.shape[1]
+    kernel_assert(tuple(block_table.shape) == (tokens, n_pages)
+                  and tuple(context_lens.shape) == (tokens,) and tuple(owner.shape) == (tokens,),
+                  "block_table is [T, pages]; context_lens and owner are [T]")
+    ranks = len(DCP_RANKS)
+    gathered = ranks * heads
+    kernel_assert(ranks >= 2 and gathered <= _P, "2 or more ranks, at most 128 gathered heads")
+    kernel_assert(MERGE in ("all_to_all", "reduce_scatter"), "MERGE names a merge collective")
+    group = ncc.ReplicaGroup([list(DCP_RANKS)])
+    window = n_pages * block_size
+    n_tiles = window // _P
+    n_blocks = (window + _BLOCK - 1) // _BLOCK
+    programs = nl.num_programs(0)
+    prg = nl.program_id(0)
+    kernel_assert(programs in (1, 2), "one or two programs")
+    scale = float((_NOPE + _ROPE) ** -0.5)
+    out = nl.ndarray((_V, tokens, heads, 1), dtype=nl.bfloat16, buffer=nl.shared_hbm)
+
+    split = programs > tokens
+    if split:
+        first, count = 0, tokens
+        b0 = prg * (n_blocks // 2)
+        b1 = n_blocks // 2 if prg == 0 else n_blocks
+        lead = prg == 0
+    else:
+        base, extra = tokens // programs, tokens % programs
+        first = prg * base + min(prg, extra)
+        count = base + (1 if prg < extra else 0)
+        b0, b1, lead = 0, n_blocks, True
+
+    wqb, wuk, wuv, last = _load_weights_first(w_qb_t, w_uk, w_uv_t, heads)
+    x = _sb((count, _QKV), nl.float32)
+    nisa.dma_copy(dst=x, src=qkv_a[first:first + count, :])
+    lat = _sb((count, _LATENT), nl.bfloat16)
+    _latent_rows(lat, x, _gain(kv_norm, count), EPS)
+    if lead:
+        idx = _row_index(slots, first, count, blocks, block_size, page_rows, first_row)
+    q_gain = _gain(q_norm, count)
+    # Query rows 0.. hold the gathered heads in rank order, and rows dup.. again where both fit.
+    dup = _dup_row(gathered)
+    rows_q = gathered if dup is None else dup + gathered
+    qloc = _sb((_P, len(_C_TILES), count, heads), nl.bfloat16)
+    ql = [_sb((_P, count, rows_q), nl.bfloat16) for _ in _C_TILES]
+
+    positions = _sb((_P, n_tiles), nl.float32)
+    nisa.iota(dst=positions, pattern=[[_P, n_tiles]], offset=0, channel_multiplier=1)
+    zero = _sb((_P, 1), nl.float32)
+    nisa.memset(dst=zero, value=0.0)
+    # own[:, s] is 1 where the new row is a key here; dead[:, s] where the rank has no key.
+    flag = _sb((_P, count), nl.int32)
+    nisa.dma_copy(dst=flag, src=owner.ap(pattern=[[0, _P], [1, count]], offset=first),
+                  **_META_QUEUE)
+    own = _sb((_P, count), nl.float32)
+    nisa.tensor_scalar(dst=own, data=flag, op0=nl.maximum, operand0=0.0, op1=nl.minimum,
+                       operand1=1.0)
+    held_n = _sb((_P, count), nl.int32)
+    nisa.dma_copy(dst=held_n, src=context_lens.ap(pattern=[[0, _P], [1, count]], offset=first),
+                  **_META_QUEUE)
+    keys = _sb((_P, count), nl.float32)
+    nisa.scalar_tensor_tensor(dst=keys, data=held_n, op0=nl.maximum, operand0=0.0, op1=nl.add,
+                              operand1=own)
+    dead = _sb((_P, count), nl.uint8)
+    nisa.tensor_scalar(dst=dead, data=keys, op0=nl.less, operand0=0.5)
+    # The program's sequences' block ids in one load, clamped into the cache, and each one's
+    # cached length as a bound: invalid[r, j] where window row 128 j + r lies at or past it.
+    raw = _sb((1, count * n_pages), nl.int32)
+    nisa.dma_copy(dst=raw, src=block_table.ap(pattern=[[count * n_pages, 1], [1, count * n_pages]],
+                                              offset=first * n_pages), **_META_QUEUE)
+    ids = _sb((1, count * n_pages), nl.int32)
+    nisa.tensor_scalar(dst=ids, data=raw, op0=nl.maximum, operand0=0, op1=nl.minimum,
+                       operand1=blocks - 1)
+    bound = _sb((_P, count), nl.float32)
+    nisa.tensor_scalar(dst=bound, data=held_n, op0=nl.maximum, operand0=0.0, op1=nl.minimum,
+                       operand1=float(window))
+    seqs = []
+    for s in range(count):
+        invalid = _sb((_P, n_tiles), nl.uint8)
+        nisa.tensor_scalar(dst=invalid, data=positions, op0=nl.greater_equal,
+                           operand0=bound[:, s:s + 1])
+        group_s = {"rows": rows_q, "split": "passes" if dup is None else "rows", "dup": dup,
+                   "ql": [ql[i][0:w, s, :] for i, (_, w) in enumerate(_C_TILES)],
+                   "cache": bound[:, s:s + 1], "own": own[:, s:s + 1], "own_tiles": lambda k: 1,
+                   "m": None, "l": None, "acc": None}
+        seqs.append((group_s, ids[0:1, s * n_pages:(s + 1) * n_pages], invalid))
+    # The page loads follow the query chain's weights, on their own queue.
+    steps = [(g, "cache", b * _BLOCK,
+              _cache_step(cache, held, invalid, b, window, block_size, first_elem, _PAGE_QUEUE,
+                          last))
+             for b in range(b0, b1) for g, held, invalid in seqs]
+    if lead:
+        steps += [(g, "own", 0, _own_step(lat, s)) for s, (g, _, _) in enumerate(seqs)]
+
+    def queries():
+        _absorbed_queries([qloc[:, i, :, :] for i in range(len(_C_TILES))], True, x, q_gain, wqb,
+                          wuk, EPS, heads, k_outer=True)
+        q, gather = _gather_queries(qloc, first, count, tokens, heads, group, ranks, lead)
+        for i, (_, w) in enumerate(_C_TILES):
+            mine = ql[i][0:w, :, 0:gathered].reshape_dim(2, (ranks, heads))
+            nisa.tensor_copy(dst=mine, src=q[0:w, i, :, :].reshape_dim(2, (count, heads))
+                             .permute((0, 2, 1, 3)))
+            if dup is not None:
+                nisa.memset(dst=ql[i][0:w, :, gathered:dup], value=0.0)
+                nisa.tensor_copy(dst=ql[i][0:w, :, dup:rows_q], src=ql[i][0:w, :, 0:gathered])
+        return gather
+
+    _pipelined(steps, scale, zero, queries, query_first=True)
+
+    states = [(g["m"], g["l"], g["acc"]) for g, _, _ in seqs]
+    if split:
+        states = [_merge_programs(states[0], prg, scale, rows_q)]
+    # LSE = scale m + ln l per query row; a rank with no key takes the dead LSE and sum 1.
+    stats = _sb((rows_q, 2, count), nl.float32)
+    for s, (m, l, _) in enumerate(states):
+        nisa.tensor_copy(dst=stats[:, 0, s:s + 1], src=m[0:rows_q, :])
+        nisa.tensor_copy(dst=stats[:, 1, s:s + 1], src=l[0:rows_q, :])
+    lse = _sb((rows_q, count), nl.float32)
+    nisa.activation(dst=lse, op=nl.log, data=stats[:, 1, :])
+    nisa.scalar_tensor_tensor(dst=lse, data=stats[:, 0, :], op0=nl.multiply, operand0=scale,
+                              op1=nl.add, operand1=lse)
+    nisa.tensor_copy_predicated(dst=lse, src=_DEAD_LSE, predicate=dead[0:rows_q, :])
+    total = stats[:, 1, :]
+    nisa.tensor_copy_predicated(dst=total, src=1.0, predicate=dead[0:rows_q, :])
+    factor = _sb((rows_q, count), nl.float32)
+    nisa.reciprocal(dst=factor, data=total)
+    if MERGE == "reduce_scatter":
+        w = _group_weights(lse, first, count, tokens, gathered, dup, group, ranks, lead)
+        nisa.tensor_tensor(dst=factor, data1=factor, data2=w, op=nl.multiply)
+    parts = _partials(states, factor, dead, ranks, heads, dup)
+    if MERGE == "reduce_scatter":
+        o = _reduce_scatter(parts, first, count, tokens, heads, group, ranks, lead)
+    else:
+        o = _all_to_all(parts, lse, first, count, tokens, heads, group, ranks, lead)
+    if split and prg != 0:
+        return out, pages
+
+    res = _sb((_V, count, heads), nl.bfloat16)
+    _gated_output_t(res, o.permute((0, 2, 3, 1)), wuv, _gate_t(gate, first, count, heads), heads)
+    nisa.dma_copy(dst=out.ap(pattern=[[tokens * heads, _V], [heads, count], [1, heads]],
+                             offset=first * heads), src=res)
+    # The new rows sit at or past the rank's cached rows, so every read above masks them.
     _write_rows(by_row, idx, lat, count)
     return out, pages
 
@@ -800,6 +1227,7 @@ def mla_paged_prefill_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t,
 
 
 _DECODE = wrap_nki(mla_paged_decode_kernel)
+_DECODE_DCP = wrap_nki(mla_paged_decode_dcp_kernel)
 _PREFILL = wrap_nki(mla_paged_prefill_kernel)
 
 
@@ -919,3 +1347,95 @@ def mla_paged_prefill(qkv_a: torch.Tensor, gate: torch.Tensor, q_norm_weight: to
         prefix_len=prefix_len.to(torch.int32).reshape(1).contiguous(),
         slots=slots.to(torch.int32).contiguous(), EPS=float(eps),
         LATENT_OFFSET=int(latent_offset), BLOCK_SIZE=int(block_size))
+
+
+def _torch_decode_dcp(qkv_a, gate, q_norm_weight, kv_norm_weight, w_qb_t, w_uk, w_uv_t, pages,
+                      latent_offset, block_size, block_table, context_lens, slots, owner, eps,
+                      dcp_group):
+    """The DCP decode step in torch, for the CPU venue where the kernel does not run."""
+    tokens, heads = qkv_a.shape[0], w_uk.shape[0]
+    x = qkv_a.float()
+
+    def norm(v, weight):
+        return v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + eps) * weight.float()
+
+    q = (norm(x[:, :_Q_LORA], q_norm_weight) @ w_qb_t.float()).view(tokens, heads, -1)
+    q_lift = torch.cat((torch.einsum("thn,hnl->thl", q[..., :_NOPE], w_uk.float()),
+                        q[..., _NOPE:]), dim=-1).bfloat16()
+    lat = torch.cat((norm(x[:, _Q_LORA:_Q_LORA + _KV_LORA], kv_norm_weight),
+                     x[:, _Q_LORA + _KV_LORA:]), dim=-1).bfloat16()
+    queries = dcp_group.all_gather(q_lift.contiguous(), dim=1).float()
+    rows = pages.view(torch.bfloat16).view(pages.shape[0], -1, _LATENT)
+    first = latent_offset // _ROW_BYTES
+    part = queries.new_zeros(tokens, queries.shape[1], _KV_LORA)
+    lse = queries.new_full(queries.shape[:2], _DEAD_LSE)
+    for t in range(tokens):
+        blocks = block_table[t].long().clamp(0, pages.shape[0] - 1)
+        keys = rows[blocks, first:first + block_size].reshape(-1, _LATENT)[:int(context_lens[t])]
+        if int(owner[t]) > 0:
+            keys = torch.cat((keys, lat[t:t + 1]))
+        if keys.shape[0]:
+            scores = queries[t] @ keys.float().T * (_NOPE + _ROPE) ** -0.5
+            lse[t] = torch.logsumexp(scores, dim=-1)
+            part[t] = torch.softmax(scores, dim=-1) @ keys[:, :_KV_LORA].float()
+    group_lse = torch.logsumexp(dcp_group.all_gather(lse.contiguous(), dim=0)
+                                .view(-1, *lse.shape), dim=0)
+    o = dcp_group.reduce_scatter((part * torch.exp(lse - group_lse)[..., None]).contiguous(),
+                                 dim=1)
+    out = torch.einsum("thl,hlv->thv", o, w_uv_t) * torch.sigmoid(gate.float()).view(o.shape[0],
+                                                                                   heads, _V)
+    s = slots.long()
+    s = torch.where((s < 0) | (s >= pages.shape[0] * block_size), 0, s)
+    rows[s // block_size, first + s % block_size] = lat
+    return out.permute(2, 0, 1).unsqueeze(-1).bfloat16().contiguous(), pages
+
+
+def mla_paged_decode_dcp(qkv_a: torch.Tensor, gate: torch.Tensor, q_norm_weight: torch.Tensor,
+                         kv_norm_weight: torch.Tensor, w_qb_t: torch.Tensor, w_uk: torch.Tensor,
+                         w_uv_t: torch.Tensor, pages: torch.Tensor, latent_offset: int,
+                         block_size: int, block_table: torch.Tensor, context_lens: torch.Tensor,
+                         slots: torch.Tensor, owner: torch.Tensor, eps: float, dcp_group):
+    """Paged MLA decode step of one rank of a DCP group: ``(out [128, T, H, 1] bf16, pages)``.
+
+    The rank holds every group-size-th block of each sequence's cache. The merge returns the
+    rank's ``H`` heads over the whole cache: an all-to-all from 4 to 15 ranks, otherwise an
+    all-gather of the LSEs and a reduce-scatter of the partials.
+
+    Args:
+        qkv_a, gate, q_norm_weight, kv_norm_weight, w_qb_t, w_uk, w_uv_t, pages, latent_offset,
+            block_size, slots, eps: as :func:`mla_paged_decode`, for the rank's heads; ``slots``
+            names the rank's own slot of the new row, or a slot of the null block.
+        block_table: ``[T, pages]`` int32 ids of the rank's own blocks per sequence.
+        context_lens: ``[T]`` int32 tokens of each sequence that the rank holds.
+        owner: ``[T]`` int32, 1 where the rank holds the new token's row, else 0.
+        dcp_group: the DCP group coordinator; the kernel reads its ``ranks``, and the CPU venue
+            its ``all_gather`` and ``reduce_scatter``.
+
+    Returns:
+        The output for ``o_proj`` and the page buffer with each new token's latent row.
+
+    Raises:
+        ValueError: an input outside the kernel's contract.
+    """
+    _check_inputs(qkv_a, gate, pages, latent_offset, block_size, slots, w_uk, w_uv_t)
+    tokens = qkv_a.shape[0]
+    if block_table.dim() != 2 or block_table.shape[0] != tokens:
+        raise ValueError(f"block_table must be [T, pages], got {tuple(block_table.shape)}")
+    if tuple(owner.shape) != (tokens,) or tuple(context_lens.shape) != (tokens,):
+        raise ValueError(f"owner and context_lens must be [T], got {tuple(owner.shape)} and "
+                         f"{tuple(context_lens.shape)}")
+    ranks = tuple(int(r) for r in dcp_group.ranks)
+    if not can_run_kernel(qkv_a):
+        return _torch_decode_dcp(qkv_a, gate, q_norm_weight, kv_norm_weight, w_qb_t, w_uk,
+                                 w_uv_t, pages, latent_offset, block_size, block_table,
+                                 context_lens, slots, owner, eps, dcp_group)
+    # All-to-all needs 4 ranks and fails at 16 or more.
+    merge = "all_to_all" if 4 <= len(ranks) < 16 else "reduce_scatter"
+    return _DECODE_DCP[get_logical_nc_config()](
+        qkv_a=qkv_a.contiguous(), gate=gate.contiguous(), q_norm=q_norm_weight.contiguous(),
+        kv_norm=kv_norm_weight.contiguous(), w_qb_t=w_qb_t, w_uk=w_uk, w_uv_t=w_uv_t,
+        pages=pages, block_table=block_table.to(torch.int32).contiguous(),
+        context_lens=context_lens.to(torch.int32).contiguous(),
+        slots=slots.to(torch.int32).contiguous(), owner=owner.to(torch.int32).contiguous(),
+        EPS=float(eps), LATENT_OFFSET=int(latent_offset), BLOCK_SIZE=int(block_size),
+        DCP_RANKS=ranks, MERGE=merge)
