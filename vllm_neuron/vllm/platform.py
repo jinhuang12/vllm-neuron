@@ -250,6 +250,12 @@ class NeuronPlatform(Platform):
     # The served architecture when it is in _text_only_architectures, else None.
     # Set in check_and_update_config.
     _text_only_architecture: str | None = None
+    # Architectures whose DCP attention takes an owner flag per query token, so a
+    # verify window of k + 1 tokens can span blocks held by different DCP ranks.
+    # DCP with speculative decoding is refused for every other architecture.
+    _dcp_spec_architectures: frozenset[str] = frozenset(
+        {"KimiK3ForConditionalGeneration"}
+    )
     # Neuron quantization paths that CPU-dequant compressed-tensors weights to
     # BF16 on the loader thread. On these paths the device only ever sees BF16
     # (the graph is identical to bf16), so an on-disk compressed-tensors weight/
@@ -1155,10 +1161,13 @@ class NeuronPlatform(Platform):
                 "default it to block_size, or set it to match --block-size."
             )
 
-        # TEMPORARY: DCP ownership is computed from one active position per request.
-        # Lifting this needs that math generalized to a token span, not just this
-        # gate deleted (with test_dcp_with_speculative_decoding_rejected).
-        if vllm_config.speculative_config is not None:
+        # Most models compute DCP ownership from one active position per request.
+        # Lifting this for one needs that math generalized to a token span, not
+        # just this gate deleted.
+        if (
+            vllm_config.speculative_config is not None
+            and model_config.architecture not in cls._dcp_spec_architectures
+        ):
             raise ValueError(
                 "DCP does not support speculative decoding. Disable speculative "
                 "decoding or set decode_context_parallel_size=1."
