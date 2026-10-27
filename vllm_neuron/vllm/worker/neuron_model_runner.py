@@ -3232,6 +3232,32 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             config.kv_cache_groups[group_id].kv_cache_spec, MambaSpec
         )
 
+    def _group_dcp_size(self, group_id: int) -> int:
+        """The DCP size of a KV-cache group; a state group is whole on every rank, so it keeps 1."""
+        return 1 if self._is_state_group(group_id) else self._dcp_size
+
+    def _compute_slot_mappings(
+        self, positions: np.ndarray, req_indices: np.ndarray
+    ) -> None:
+        """Fill each KV-cache group's slot mapping at the group's own DCP size."""
+        for group_id, block_table in enumerate(
+            self.input_batch.block_table.block_tables
+        ):
+            # Hybrid KV manager scales block_size per KV group. We need
+            # to always use an interleave size equal to block_size
+            _compute_slot_mapping_cpu(
+                # Pass the numpy view. The gather below indexes with a numpy index
+                # array, and a torch source sends it through torch dispatch instead.
+                self._raw_block_table(block_table.block_table),
+                block_table.slot_mapping.np,
+                positions,
+                req_indices,
+                block_table.block_size,
+                cp_world_size=self._group_dcp_size(group_id),
+                cp_rank=self.cp_rank,
+                cp_kv_cache_interleave_size=block_table.block_size,
+            )
+
     def _zero_new_state_slots(self, reqs: list[CachedRequestState]) -> None:
         """Zero the state slot of each request that starts from its first token.
 
@@ -3892,7 +3918,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 positions_np,
                 req_indices_np,
                 block_size,
-                cp_world_size=self.cp_world_size,
+                cp_world_size=self._group_dcp_size(kv_cache_group_id),
                 cp_rank=self.cp_rank,
                 cp_kv_cache_interleave_size=block_size,
             )
@@ -4212,21 +4238,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             padded_req_indices = req_indices
             slot_positions = positions_np
 
-        for block_table in self.input_batch.block_table.block_tables:
-            # Hybrid KV manager scales block_size per KV group. We need
-            # to always use an interleave size equal to block_size
-            _compute_slot_mapping_cpu(
-                # Pass the numpy view. The gather below indexes with a numpy index
-                # array, and a torch source sends it through torch dispatch instead.
-                self._raw_block_table(block_table.block_table),
-                block_table.slot_mapping.np,
-                slot_positions,
-                padded_req_indices,
-                block_table.block_size,
-                cp_world_size=self.cp_world_size,
-                cp_rank=self.cp_rank,
-                cp_kv_cache_interleave_size=block_table.block_size,
-            )
+        self._compute_slot_mappings(slot_positions, padded_req_indices)
         # Redirect padding writes to the reserved null block.
         if padding_map:
             # Calculate padding token indices
@@ -5526,8 +5538,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         max_decode_ctx_len: int,
         block_size: int,
         max_num_draft_tokens: int,
+        dcp_size: int | None = None,
     ) -> int:
         """Pick max_blocks_per_seq for a non-SWA decode group from a max ctx length.
+
+        ``dcp_size`` is the group's DCP size and defaults to the process's.
 
         Composes the boundary picker
         (`_decode_ctx_bucket_from_max_decode_ctx_len`) with the
@@ -5540,7 +5555,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             max_decode_ctx_len, max_num_draft_tokens
         )
         # With DCP, each rank stores only ctx_for_blocks / dcp_size tokens.
-        dcp_block_size = block_size * max(self._dcp_size, 1)
+        dcp_block_size = block_size * max(
+            self._dcp_size if dcp_size is None else dcp_size, 1
+        )
         ctx_for_blocks = ctx_bucket if ctx_bucket is not None else self.max_model_len
         return (ctx_for_blocks + dcp_block_size - 1) // dcp_block_size
 
@@ -5612,9 +5629,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             ):
                 blk_table.slot_mapping.gpu = slot_mapping_cpu.to(self.device)
             slot_mapping = blk_table.slot_mapping.gpu[:total_num_scheduled_tokens]
-            if not is_decode and self.cp_world_size > 1:
+            group_dcp_size = self._group_dcp_size(kv_cache_group_id)
+            if not is_decode and group_dcp_size > 1:
                 I = block_size
-                W = self.cp_world_size
+                W = group_dcp_size
                 ownership_stride = W * I
                 if cached_seq_len % ownership_stride != 0:
                     raise ValueError(
@@ -5701,6 +5719,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     max_decode_ctx_len=max_decode_ctx_len,
                     block_size=block_size,
                     max_num_draft_tokens=max_num_draft_tokens,
+                    dcp_size=group_dcp_size,
                 )
                 if bucket_blocks < blk_table_tensor.shape[1]:
                     # index_select rather than a slice: dynamo guards check
@@ -5813,7 +5832,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         is_prefill = (num_tokens // num_reqs) > decode_token_threshold
         resume_rows = None
 
-        for group_id, kv_cache_group_spec in enumerate(self.kv_cache_config.kv_cache_groups):
+        for group_id, kv_cache_group_spec in enumerate(
+            self.kv_cache_config.kv_cache_groups
+        ):
             spec = kv_cache_group_spec.kv_cache_spec
             block_size = spec.block_size
             # A state group under speculation: as in _build_attention_metadata.
@@ -5829,7 +5850,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             ctx_for_blocks = (
                 ctx_bucket if ctx_bucket is not None else self.max_model_len
             )
-            dcp_block_size = block_size * max(self._dcp_size, 1)
+            dcp_block_size = block_size * max(self._group_dcp_size(group_id), 1)
             max_num_blocks_per_req = (
                 ctx_for_blocks + dcp_block_size - 1
             ) // dcp_block_size

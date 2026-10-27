@@ -224,7 +224,7 @@ def _tiles(rows, weights, *banks, beta, linear_beta, expose_codes=False):
 
 
 def _experts(routed, score_bias, expert_base, *banks, beta, linear_beta, scaling=1.0,
-             replicas=2, chunks=32, expose_codes=False):
+             replicas=2, chunks=32, expose_codes=False, replica_slots=None):
     """Stand-in decode experts: the local experts' partial in combine order."""
     latent_size = routed.shape[1] - score_bias.shape[0]
     latent, logits = routed.split([latent_size, score_bias.shape[0]], -1)
