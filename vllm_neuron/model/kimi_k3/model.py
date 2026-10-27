@@ -37,6 +37,7 @@ from vllm_neuron.functional.attention.mla_paged import (
     mla_paged_decode,
     mla_paged_decode_dcp,
     mla_paged_prefill,
+    mla_paged_window_dcp,
     prepare_mla_weights,
 )
 from vllm_neuron.functional.attention import o_proj as output_projection
@@ -673,19 +674,27 @@ class KimiK3MLA(nn.Module):
         return out
 
     def _decode_dcp(self, args, table, positions, slots):
-        """One decode step on this rank's blocks, its partials merged over the DCP group.
+        """One decode or verify step on this rank's blocks, its partials merged over the group.
 
-        Of a sequence's ``n`` cached tokens the rank holds its block of each full turn of the
-        group and its part of the last turn. The step's own latent row is a key on its owner
-        rank only, the rank whose block caches it, so the merge counts it once.
+        Each sequence's tokens are a window of ``Q`` positions from its cached length ``n``: one
+        token at decode, ``k + 1`` at verify. Of the ``n`` cached tokens the rank holds its block
+        of each full turn of the group and its part of the last turn. Each window row is a key on
+        its owner rank only, the rank whose block caches it, so the merge counts it once.
         """
         group, block_size = self.dcp_group, args[-1]
         size, rank = group.world_size, group.rank_in_group_tensor.reshape(1)
         turn = block_size * size
-        last = (positions % turn - rank * block_size).clamp(0, block_size)
-        held = positions // turn * block_size + last
-        owner = (positions // block_size % size == rank).to(torch.int32)
-        out, _ = mla_paged_decode_dcp(*args, table, held, slots, owner, MLA_NORM_EPS, group)
+        window = positions.view(table.shape[0], -1)
+        first = window[:, 0]
+        last = (first % turn - rank * block_size).clamp(0, block_size)
+        held = first // turn * block_size + last
+        owner = (window // block_size % size == rank).to(torch.int32)
+        if window.shape[1] == 1:
+            out, _ = mla_paged_decode_dcp(
+                *args, table, held, slots, owner.view(-1), MLA_NORM_EPS, group
+            )
+        else:
+            out, _ = mla_paged_window_dcp(*args, table, held, slots, owner, MLA_NORM_EPS, group)
         return out
 
     def _prefill_dcp(self, args, table, prefix, slots):
