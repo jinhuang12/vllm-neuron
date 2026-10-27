@@ -1397,6 +1397,14 @@ class KimiK3ForConditionalGeneration(nn.Module, SupportsEagle3):
         self.text_config = text
         self.num_programs = get_logical_nc_config()
         self.model = KimiK3Model(text, self.num_programs)
+        # The MLA layers' caches shard over the DCP group, so the async prologue keeps their
+        # slots on the owner rank; the KDA layers' states are whole on every rank.
+        dcp = _dcp_group()
+        self.dcp_cache_layers = {
+            f"layers.{i}.self_attn": dcp
+            for i, layer in enumerate(self.model.layers)
+            if dcp is not None and not layer.is_kda
+        }
         group = _tp_group()
         self.tp_size = group.world_size if group is not None else 1
         device_group = group.device_group if group is not None else None

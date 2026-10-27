@@ -7,7 +7,9 @@ CPU-built ``positions`` passed to the target verify NEFF reflect this
 optimism. This module provides a functional helper that reads the previous
 step's rejection sampler output on device, computes the per-request
 rejection count, and subtracts it from ``positions`` for the matching
-tokens. It then recomputes ``slot_mapping`` from the corrected positions.
+tokens. It then recomputes ``slot_mapping`` from the corrected positions:
+on every rank for an unsharded cache, and on the owner rank only for a cache
+sharded over the decode context parallel (DCP) group, as the host does.
 
 Runs inside the compile boundary, so no CPU sync is needed — the caller can
 dispatch the target NEFF while the previous step's output is still in
@@ -19,6 +21,9 @@ from __future__ import annotations
 
 import torch
 
+# The slot a rank writes for a row another rank caches: the null block's first slot.
+_NULL_SLOT = 0
+
 
 def correct_spec_decode_positions_and_slot_mapping(
     positions: torch.Tensor,
@@ -27,6 +32,7 @@ def correct_spec_decode_positions_and_slot_mapping(
     prev_num_draft_tokens: torch.Tensor,
     req_indices_per_token: torch.Tensor,
     vocab_size: int,
+    dcp_ranks: dict[str, tuple[int, torch.Tensor]] | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """Correct positions and slot_mapping on device for async spec decode.
 
@@ -47,6 +53,11 @@ def correct_spec_decode_positions_and_slot_mapping(
             which request it belongs to ``[total_scheduled]`` int64.
         vocab_size: Model vocabulary size. Matches the validity criterion
             used by the rejection sampler.
+        dcp_ranks: For each layer whose cache is sharded over a DCP group,
+            the group's size and this rank's ``[1]`` int32 rank tensor. Such
+            a layer's slot is real on the rank that caches the position's
+            block and the null block on the others. A layer not named keeps
+            the one-rank rule.
 
     Returns:
         ``(corrected_positions, attn_metadata)`` — positions shape is the
@@ -81,6 +92,7 @@ def correct_spec_decode_positions_and_slot_mapping(
     # recompute per layer — layers in the same KV cache group share the
     # same block_table_tensor object and would produce identical
     # slot_mapping; torch.compile's CSE should elide the redundant work.
+    dcp_ranks = dcp_ranks or {}
     new_attn_metadata = {}
     for layer_name, meta in attn_metadata.items():
         # Use the untrimmed block table when present (SWA models). The
@@ -92,9 +104,20 @@ def correct_spec_decode_positions_and_slot_mapping(
             "full_block_table_tensor", meta["block_table_tensor"]
         )
         block_size = meta["block_size"]
-        slot_mapping = _compute_slot_mapping_per_token(
-            positions, block_table_tensor, req_indices_per_token, block_size
-        )
+        dcp_size, dcp_rank = dcp_ranks.get(layer_name, (1, None))
+        if dcp_size > 1:
+            slot_mapping = _compute_slot_mapping_dcp(
+                positions,
+                block_table_tensor,
+                req_indices_per_token,
+                block_size,
+                dcp_size,
+                dcp_rank,
+            )
+        else:
+            slot_mapping = _compute_slot_mapping_per_token(
+                positions, block_table_tensor, req_indices_per_token, block_size
+            )
         new_meta = dict(meta)
         new_meta["slot_mapping"] = slot_mapping
         new_attn_metadata[layer_name] = new_meta
@@ -137,3 +160,47 @@ def _compute_slot_mapping_per_token(
         positions.to(torch.int64) % block_size
     )
     return torch.where(block_ids < 0, torch.full_like(slot, -1), slot)
+
+
+def _compute_slot_mapping_dcp(
+    positions: torch.Tensor,
+    block_table_tensor: torch.Tensor,
+    req_indices_per_token: torch.Tensor,
+    block_size: int,
+    dcp_size: int,
+    dcp_rank: torch.Tensor,
+) -> torch.Tensor:
+    """Compute slot_mapping on-device for a cache sharded over a DCP group.
+
+    Rank ``r`` of the group caches every sequence block ``j`` with
+    ``j % dcp_size == r``, and block table column ``c`` names the rank's
+    block for sequence blocks ``c * dcp_size`` to ``c * dcp_size + dcp_size - 1``.
+    So the owner rank writes:
+        slot = block_id * block_size + (position % block_size)
+    where ``block_id = block_table[req_idx, position // (block_size * dcp_size)]``,
+    and the other ranks write the null block. This is the host's rule with an
+    interleave of one block.
+
+    Args:
+        positions: Token positions ``[total_scheduled]`` int32/int64.
+        block_table_tensor: ``[bs, max_blocks_per_seq]`` int32.
+        req_indices_per_token: Request index per token ``[total_scheduled]``
+            int64.
+        block_size: Number of slots per block.
+        dcp_size: Number of ranks in the DCP group.
+        dcp_rank: This rank's ``[1]`` int32 rank tensor, a graph input, so
+            every rank runs one graph.
+
+    Returns:
+        Slot indices ``[total_scheduled]`` int64: ``0`` on a rank that does
+        not cache the position, ``-1`` on the owner where the looked-up block
+        is the inactive-block sentinel (``-1``).
+    """
+    positions = positions.to(torch.int64)
+    max_blocks = block_table_tensor.shape[1]
+    flat_idx = req_indices_per_token * max_blocks + positions // (block_size * dcp_size)
+    block_ids = block_table_tensor.view(-1)[flat_idx]
+    slot = block_ids.to(torch.int64) * block_size + positions % block_size
+    slot = torch.where(block_ids < 0, torch.full_like(slot, -1), slot)
+    owner = positions // block_size % dcp_size == dcp_rank.to(torch.int64)
+    return torch.where(owner, slot, torch.full_like(slot, _NULL_SLOT))
