@@ -1362,7 +1362,7 @@ def _window_output(dst, o, wuv, sig, heads, q):
 
 def _window_dcp(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, pages, block_table,
                 context_lens, slots, owner, rope, positions, EPS, LATENT_OFFSET, BLOCK_SIZE,
-                DCP_RANKS, MERGE):
+                DCP_GROUPS, MERGE):
     """The window mode on one rank of a DCP group: the verify call with ``gate`` and no
     ``rope``, the draft call with ``rope`` and ``positions`` and no gate."""
     tokens = qkv_a.shape[0]
@@ -1378,7 +1378,10 @@ def _window_dcp(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, pages, block
     kernel_assert(rope is None or (tuple(rope.shape[1:]) == (_ROPE,) and rope.dtype == nl.float32
                                    and tuple(positions.shape) == (tokens,)),
                   "the rotary table is [positions, 64] fp32 and positions is [T]")
-    ranks, hq = len(DCP_RANKS), q * heads
+    dcp_groups = [list(members) for members in DCP_GROUPS]
+    ranks, hq = len(dcp_groups[0]), q * heads
+    kernel_assert(all(len(members) == ranks for members in dcp_groups),
+                  "every DCP group has the same size")
     kernel_assert(ranks >= 2 and hq <= _P, "2 or more ranks; at most 128 query rows per rank")
     # Row groups of whole ranks, as few as fit the partitions; row (rank, i, head) of a group.
     n_groups = next(g for g in range(1, ranks + 1) if ranks % g == 0 and ranks // g * hq <= _P)
@@ -1386,7 +1389,7 @@ def _window_dcp(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, pages, block
     n = nr * hq
     kernel_assert(MERGE == "reduce_scatter" or (MERGE == "all_to_all" and n_groups == 1),
                   "MERGE names a merge collective; the all-to-all takes one row group")
-    group = ncc.ReplicaGroup([list(DCP_RANKS)])
+    group = ncc.ReplicaGroup(dcp_groups)
     window = n_pages * block_size
     n_tiles = window // _P
     n_blocks = (window + _BLOCK - 1) // _BLOCK
@@ -1544,7 +1547,7 @@ def _window_dcp(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, pages, block
 
 def mla_paged_window_dcp_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, pages,
                                 block_table, context_lens, slots, owner, EPS: float,
-                                LATENT_OFFSET: int, BLOCK_SIZE: int, DCP_RANKS: tuple,
+                                LATENT_OFFSET: int, BLOCK_SIZE: int, DCP_GROUPS: tuple,
                                 MERGE: str):
     """The verify window on one rank of a DCP group: ``(out [128, B Q, H, 1] bf16, pages)``.
 
@@ -1559,7 +1562,7 @@ def mla_paged_window_dcp_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv
         slots: ``[B * Q]`` int32 slot of each window row on this rank; -1 where another rank
             holds it.
         owner: ``[B, Q]`` int32, 1 where the rank holds window row ``i`` of the sequence.
-        DCP_RANKS, MERGE: as ``mla_paged_decode_dcp_kernel``; the all-to-all takes at most 128
+        DCP_GROUPS, MERGE: as ``mla_paged_decode_dcp_kernel``; the all-to-all takes at most 128
             query rows over the group.
 
     Returns:
@@ -1567,18 +1570,18 @@ def mla_paged_window_dcp_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv
     """
     return _window_dcp(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, pages, block_table,
                        context_lens, slots, owner, None, None, EPS, LATENT_OFFSET, BLOCK_SIZE,
-                       DCP_RANKS, MERGE)
+                       DCP_GROUPS, MERGE)
 
 
 def mla_paged_draft_dcp_kernel(qkv_a, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, pages, block_table,
                                context_lens, slots, owner, rope, positions, EPS: float,
-                               LATENT_OFFSET: int, BLOCK_SIZE: int, DCP_RANKS: tuple,
+                               LATENT_OFFSET: int, BLOCK_SIZE: int, DCP_GROUPS: tuple,
                                MERGE: str):
     """The draft block on one rank of a DCP group: ``(out [128, B Q, H, 1] bf16, pages)``.
 
     Args:
         qkv_a, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, pages, block_table, context_lens, slots,
-            owner, EPS, LATENT_OFFSET, BLOCK_SIZE, DCP_RANKS, MERGE: as
+            owner, EPS, LATENT_OFFSET, BLOCK_SIZE, DCP_GROUPS, MERGE: as
             ``mla_paged_window_dcp_kernel``.
         rope: ``[positions, 64]`` fp32 cos | sin of the interleaved rotary by position.
         positions: ``[B * Q]`` int32 position of each window row.
@@ -1588,7 +1591,7 @@ def mla_paged_draft_dcp_kernel(qkv_a, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, pag
     """
     return _window_dcp(qkv_a, None, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, pages, block_table,
                        context_lens, slots, owner, rope, positions, EPS, LATENT_OFFSET,
-                       BLOCK_SIZE, DCP_RANKS, MERGE)
+                       BLOCK_SIZE, DCP_GROUPS, MERGE)
 
 
 def _finite_values(lat):
@@ -2044,7 +2047,8 @@ def mla_paged_window_dcp(qkv_a: torch.Tensor, gate, q_norm_weight: torch.Tensor,
         The output for ``o_proj`` and the page buffer with each window row's latent row.
 
     Raises:
-        ValueError: an input outside the kernel's contract.
+        ValueError: an input outside the kernel's contract, or a DCP mesh that does not split
+            the world into groups of the group's size.
     """
     _check_inputs(qkv_a, gate, pages, latent_offset, block_size, slots, w_uk, w_uv_t)
     tokens, heads = qkv_a.shape[0], w_uk.shape[0]
@@ -2067,6 +2071,15 @@ def mla_paged_window_dcp(qkv_a: torch.Tensor, gate, q_norm_weight: torch.Tensor,
                                  w_uv_t, pages, latent_offset, block_size, block_table,
                                  context_lens, slots, owner, eps, dcp_group, rope_table,
                                  positions)
+    # Every group's ranks, the same on every rank, so all groups lower one graph.
+    dcp_groups = tuple(tuple(int(r) for r in g) for g in resolve_full_mesh(dcp_group))
+    flat = sorted([r for g in dcp_groups for r in g])
+    # With no process group, as in a one-process test, the world is the mesh's own ranks.
+    world = dist.get_world_size() if dist.is_initialized() else len(flat)
+    if (ranks not in dcp_groups or any(len(g) != len(ranks) for g in dcp_groups)
+            or flat != list(range(world))):
+        raise ValueError(f"the DCP mesh {dcp_groups} must hold the group's ranks {ranks} and "
+                         f"cover the world's {world} ranks once, in groups of one size")
     programs = get_logical_nc_config()
     if len(ranks) < 2 or heads * q > _P or -(-seqs // min(programs, seqs)) * q > _P:
         raise ValueError(f"{len(ranks)} ranks and {seqs} sequences of {q} queries at {heads} "
@@ -2081,7 +2094,7 @@ def mla_paged_window_dcp(qkv_a: torch.Tensor, gate, q_norm_weight: torch.Tensor,
                   slots=slots.to(torch.int32).contiguous(),
                   owner=owner.to(torch.int32).contiguous(), EPS=float(eps),
                   LATENT_OFFSET=int(latent_offset), BLOCK_SIZE=int(block_size),
-                  DCP_RANKS=ranks, MERGE=merge)
+                  DCP_GROUPS=dcp_groups, MERGE=merge)
     if gate is not None:
         return _WINDOW_DCP[programs](gate=gate.contiguous(), **common)
     return _DRAFT_DCP[programs](rope=rope_table.contiguous(),
