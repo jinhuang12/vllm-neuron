@@ -43,6 +43,8 @@ def _build(**speculative):
         tensor_parallel_size=TP,
         data_parallel_size=DP,
         enable_expert_parallel=True,
+        # Sequence cap: the platform refuses more sequences than the KDA kernels take.
+        max_num_seqs=16,
         speculative_config={
             "method": "dspark",
             "model": str(DRAFT),

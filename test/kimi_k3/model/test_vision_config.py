@@ -171,7 +171,7 @@ def _oversize_image_outcome(model_config, monkeypatch, gate_lifted: bool):
     step sets the platform's request-check state on the class, so each item
     patches that state first and gets it back at its end.
     """
-    from vllm.config import VllmConfig
+    from vllm.config import SchedulerConfig, VllmConfig
     from vllm.sampling_params import SamplingParams
     from vllm.v1.engine.input_processor import InputProcessor
 
@@ -187,6 +187,8 @@ def _oversize_image_outcome(model_config, monkeypatch, gate_lifted: bool):
         )
     vllm_config = VllmConfig(
         model_config=model_config,
+        # Sequence cap: the platform refuses more sequences than the KDA kernels take.
+        scheduler_config=SchedulerConfig.default_factory(max_num_seqs=16),
         additional_config={
             "encoder_neuron_config": {
                 "encoder_attention_block_size": SERVED_BLOCK,

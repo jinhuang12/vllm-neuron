@@ -190,6 +190,8 @@ def served_config():
         data_parallel_size=2,
         enable_expert_parallel=True,
         max_model_len=131072,
+        # Sequence cap: the platform refuses more sequences than the KDA kernels take.
+        max_num_seqs=16,
         enable_prefix_caching=False,
         gpu_memory_utilization=0.90,
     ).create_engine_config()
