@@ -17,11 +17,17 @@ NKI_SIMULATOR=1`` the ranks are gloo processes on the CPU and the kernel runs in
 simulator, which carries the kernel's collectives over gloo. On a Neuron device the group runs
 through ``MPExecutor`` on the first ``d`` cores of ``NEURON_RT_VISIBLE_CORES``, each rank's
 call under ``torch.compile``; a case whose group needs more cores than that is skipped.
+``--dcp-groups g`` runs ``g`` groups side by side, ``g d`` ranks, each group on its own
+inputs from its own seed and checked against its own reference. Three more items check the
+groups: ranks of different groups give the kernel the same compile-time arguments and lower
+the same StableHLO on the device-free compile, and a mesh that leaves out a group raises.
 """
 
 import functools
 import math
 import os
+import re
+from collections import defaultdict
 from types import SimpleNamespace
 
 import pytest
@@ -30,7 +36,10 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
+from libtorch_neuronx_lite.parallel.replica_mesh import register_mesh
+
 from vllm_neuron import envs
+from vllm_neuron.functional.attention import mla_paged
 from vllm_neuron.functional.attention.mla_paged import mla_paged_decode_dcp, prepare_mla_weights
 
 HEADS = 3
@@ -46,6 +55,7 @@ SCALE = (NOPE + ROPE) ** -0.5
 ELEMENT_TOL = 2.0**-7
 ROW_RMS_TOL = 2.0**-7
 MIN_ROW_COSINE = 0.9999
+MESH = "mla-dcp-test-mesh"  # the name the test registers its groups under
 
 
 def _weights(gen, ranks):
@@ -139,10 +149,19 @@ def _read(call, out, pages):
             rows[slots // block_size, slots % block_size])
 
 
-def _rank(rank, root, ranks):
+def _mesh_group(ranks, groups, rank):
+    """The group of ``rank`` among ``groups`` consecutive DCP groups of ``ranks`` ranks, its
+    mesh registered as the platform registers a group's."""
+    mesh = [list(range(g * ranks, (g + 1) * ranks)) for g in range(groups)]
+    register_mesh(MESH, mesh)
+    return SimpleNamespace(ranks=mesh[rank // ranks], device_group=SimpleNamespace(group_name=MESH))
+
+
+def _rank(rank, root, ranks, groups):
     """One gloo rank: each call's output and new rows."""
-    dist.init_process_group("gloo", init_method=f"file://{root}/rdzv", rank=rank, world_size=ranks)
-    group = SimpleNamespace(ranks=range(ranks))
+    dist.init_process_group("gloo", init_method=f"file://{root}/rdzv", rank=rank,
+                            world_size=groups * ranks)
+    group = _mesh_group(ranks, groups, rank)
     results = [_read(call, *mla_paged_decode_dcp(*call, dcp_group=group))
                for call in torch.load(root / f"calls{rank}.pt")]
     torch.save(results, root / f"out{rank}.pt")
@@ -180,19 +199,24 @@ def _compiled_dcp():
     """The DCP wrapper under ``torch.compile`` over this worker's DCP KV group."""
     from vllm_neuron.parallel.neuron_parallel_state import get_neuron_dcp_kv_group
 
-    group = SimpleNamespace(ranks=tuple(get_neuron_dcp_kv_group().ranks))
+    kv = get_neuron_dcp_kv_group()
+    group = SimpleNamespace(ranks=tuple(kv.ranks),
+                            device_group=SimpleNamespace(group_name=kv.device_group.group_name))
     compiled = torch.compile(functools.partial(mla_paged_decode_dcp, dcp_group=group),
                              backend=envs.get_compile_backend_name(), fullgraph=True)
     return lambda *args: compiled(*map(_on_device, args))
 
 
 def _run_on_device(ranks, calls):
-    """Run each call on the first ``ranks`` visible cores, one worker per rank."""
-    if _visible_cores() < ranks:
-        pytest.skip(f"a group of {ranks} ranks needs {ranks} cores in NEURON_RT_VISIBLE_CORES")
+    """Run each call on its world's first visible cores, one worker per rank, in groups of
+    ``ranks`` ranks."""
+    world = len(calls[0])
+    if _visible_cores() < world:
+        pytest.skip(f"{world // ranks} groups of {ranks} ranks need {world} cores in "
+                    "NEURON_RT_VISIBLE_CORES")
     from vllm_neuron.utils.executor import MPExecutor
 
-    executor = MPExecutor(world_size=ranks, model_load=_compiled_dcp, dcp_size=ranks,
+    executor = MPExecutor(world_size=world, model_load=_compiled_dcp, dcp_size=ranks,
                           load_timeout=3600)
     try:
         results = []
@@ -206,14 +230,16 @@ def _run_on_device(ranks, calls):
 
 
 def _run(root, ranks, calls):
-    """Run each rank's calls over the group; per call, every rank's outputs and new rows."""
+    """Run each call, one entry per rank of the world, in groups of ``ranks`` ranks; per call,
+    every rank's outputs and new rows."""
     if not envs.VLLM_NEURON_CPU_MODE:
         return _run_on_device(ranks, calls)
-    for rank in range(ranks):
+    world = len(calls[0])
+    for rank in range(world):
         torch.save([c[rank] for c in calls], root / f"calls{rank}.pt")
     (root / "rdzv").unlink(missing_ok=True)
-    mp.spawn(_rank, args=(root, ranks), nprocs=ranks, join=True)
-    results = [torch.load(root / f"out{rank}.pt") for rank in range(ranks)]
+    mp.spawn(_rank, args=(root, ranks, world // ranks), nprocs=world, join=True)
+    results = [torch.load(root / f"out{rank}.pt") for rank in range(world)]
     return [[r[i] for r in results] for i in range(len(calls))]
 
 
@@ -255,89 +281,217 @@ def _case(gen, ranks, rows, gate, block_size=256):
     return weights, _shard(rows, gate, weights, ranks, block_size, gen)
 
 
+@pytest.fixture
+def groups(request):
+    """The DCP groups an item runs side by side: ``--dcp-groups``, 1 by default."""
+    return request.config.getoption("--dcp-groups", default=1)
+
+
+def _run_groups(root, ranks, groups, build):
+    """Run ``groups`` groups side by side, each on its own case, and check each group's ranks
+    on their own: ``build(gen)`` gives one group's calls per run and the check of its results,
+    with ``gen`` seeded 20261025 + g for group g."""
+    cases = [build(torch.Generator().manual_seed(20261025 + g)) for g in range(groups)]
+    calls = [[c for runs, _ in cases for c in runs[i]] for i in range(len(cases[0][0]))]
+    results = _run(root, ranks, calls)
+    for g, (_, check) in enumerate(cases):
+        check([r[g * ranks:(g + 1) * ranks] for r in results])
+
+
 @pytest.mark.parametrize("ranks, lens", [(4, (8192, 5000, 1, 2700)),
                                          (16, tuple(8192 - 397 * s for s in range(15)) + (300,))],
                          ids=["4", "16"])
-def test_correlated_inputs(tmp_path, ranks, lens):
+def test_correlated_inputs(tmp_path, groups, ranks, lens):
     """At 4 ranks, 4 sequences to 8K, merged by all-to-all; at 16, 16 sequences, merged by an
     LSE all-gather and a reduce-scatter."""
-    gen = torch.Generator().manual_seed(20261025)
-    rows = [_correlated(gen, n + 1) for n in lens]
-    gate = torch.randn(len(lens), HEADS * ranks * V_DIM, generator=gen).bfloat16()
-    weights, calls = _case(gen, ranks, rows, gate)
-    (result,) = _run(tmp_path, ranks, [calls])
-    _check(rows, gate, weights, ranks, 256, result)
+    def build(gen):
+        rows = [_correlated(gen, n + 1) for n in lens]
+        gate = torch.randn(len(lens), HEADS * ranks * V_DIM, generator=gen).bfloat16()
+        weights, calls = _case(gen, ranks, rows, gate)
+        return [calls], lambda results: _check(rows, gate, weights, ranks, 256, results[0])
+    _run_groups(tmp_path, ranks, groups, build)
 
 
-def test_repeated_tokens(tmp_path):
-    gen = torch.Generator().manual_seed(20261025)
-    ranks, token = 4, torch.randn(1, QKV, generator=gen)
-    rows = [token.expand(2049, -1) for _ in range(16)]
-    gate = torch.randn(1, HEADS * ranks * V_DIM, generator=gen).expand(16, -1).bfloat16()
-    weights, calls = _case(gen, ranks, rows, gate)
-    (result,) = _run(tmp_path, ranks, [calls])
-    _check(rows, gate, weights, ranks, 256, result)
-
-
-def test_near_one_gates(tmp_path):
-    """One 32K sequence at 4 ranks, its keys split between the two programs of each rank."""
-    gen = torch.Generator().manual_seed(20261025)
+def test_repeated_tokens(tmp_path, groups):
     ranks = 4
-    rows = [torch.randn(32768 + 1, QKV, generator=gen)]
-    sign = torch.where(torch.rand(1, HEADS * ranks * V_DIM, generator=gen) < 0.5, -12.0, 12.0)
-    weights, calls = _case(gen, ranks, rows, sign.bfloat16())
-    (result,) = _run(tmp_path, ranks, [calls])
-    _check(rows, sign.bfloat16(), weights, ranks, 256, result)
+
+    def build(gen):
+        token = torch.randn(1, QKV, generator=gen)
+        rows = [token.expand(2049, -1) for _ in range(16)]
+        gate = torch.randn(1, HEADS * ranks * V_DIM, generator=gen).expand(16, -1).bfloat16()
+        weights, calls = _case(gen, ranks, rows, gate)
+        return [calls], lambda results: _check(rows, gate, weights, ranks, 256, results[0])
+    _run_groups(tmp_path, ranks, groups, build)
+
+
+def test_near_one_gates(tmp_path, groups):
+    """One 32K sequence at 4 ranks, its keys split between the two programs of each rank."""
+    ranks = 4
+
+    def build(gen):
+        rows = [torch.randn(32768 + 1, QKV, generator=gen)]
+        sign = torch.where(torch.rand(1, HEADS * ranks * V_DIM, generator=gen) < 0.5, -12.0, 12.0)
+        gate = sign.bfloat16()
+        weights, calls = _case(gen, ranks, rows, gate)
+        return [calls], lambda results: _check(rows, gate, weights, ranks, 256, results[0])
+    _run_groups(tmp_path, ranks, groups, build)
 
 
 @pytest.mark.parametrize("ranks", [16, 32])
-def test_long_context(tmp_path, ranks):
-    gen = torch.Generator().manual_seed(20261025)
-    rows = [torch.randn(131072, QKV, generator=gen)]
-    gate = torch.randn(1, HEADS * ranks * V_DIM, generator=gen).bfloat16()
-    weights, calls = _case(gen, ranks, rows, gate)
-    (result,) = _run(tmp_path, ranks, [calls])
-    _check(rows, gate, weights, ranks, 256, result)
+def test_long_context(tmp_path, groups, ranks):
+    def build(gen):
+        rows = [torch.randn(131072, QKV, generator=gen)]
+        gate = torch.randn(1, HEADS * ranks * V_DIM, generator=gen).bfloat16()
+        weights, calls = _case(gen, ranks, rows, gate)
+        return [calls], lambda results: _check(rows, gate, weights, ranks, 256, results[0])
+    _run_groups(tmp_path, ranks, groups, build)
 
 
-def test_nan_row_stays_in_its_sequence(tmp_path):
+def test_nan_row_stays_in_its_sequence(tmp_path, groups):
     """A NaN new row and gate in sequence 2 of 5: its heads are NaN on every rank, its latent
     row NaN on its owner, and every other sequence's output and row equal the clean run's."""
-    gen = torch.Generator().manual_seed(20261025)
     ranks, lens, bad = 4, (900, 1200, 640, 33, 2000), 2
-    rows = [torch.randn(n + 1, QKV, generator=gen) for n in lens]
-    gate = torch.randn(len(lens), HEADS * ranks * V_DIM, generator=gen).bfloat16()
-    weights, clean = _case(gen, ranks, rows, gate)
-    poisoned = []
-    for call in clean:
-        new, nan_gate = call[0].clone(), call[1].clone()
-        new[bad], nan_gate[bad] = float("nan"), float("nan")
-        poisoned.append((new, nan_gate) + call[2:7] + (call[7].clone(),) + call[8:])
-    clean_result, result = _run(tmp_path, ranks, [clean, poisoned])
     others = torch.tensor([s for s in range(len(lens)) if s != bad])
-    for rank, ((out, latent), (clean_out, clean_latent)) in enumerate(zip(result, clean_result)):
-        assert torch.isnan(out[bad]).all()
-        assert torch.equal(out[others], clean_out[others])
-        # A row's slot names the null block on every rank but its owner.
-        owned = torch.tensor([s for s in range(len(lens)) if (lens[s] // 256) % ranks == rank],
-                             dtype=torch.long)
-        kept = owned[owned != bad]
-        assert torch.equal(latent[kept], clean_latent[kept])
-        if bad in owned:
-            assert torch.isnan(latent[bad]).all()
-    _check(rows, gate, weights, ranks, 256, clean_result)
+
+    def build(gen):
+        rows = [torch.randn(n + 1, QKV, generator=gen) for n in lens]
+        gate = torch.randn(len(lens), HEADS * ranks * V_DIM, generator=gen).bfloat16()
+        weights, clean = _case(gen, ranks, rows, gate)
+        poisoned = []
+        for call in clean:
+            new, nan_gate = call[0].clone(), call[1].clone()
+            new[bad], nan_gate[bad] = float("nan"), float("nan")
+            poisoned.append((new, nan_gate) + call[2:7] + (call[7].clone(),) + call[8:])
+
+        def check(results):
+            clean_result, result = results
+            for rank, ((out, latent), (clean_out, clean_latent)) in enumerate(
+                    zip(result, clean_result)):
+                assert torch.isnan(out[bad]).all()
+                assert torch.equal(out[others], clean_out[others])
+                # A row's slot names the null block on every rank but its owner.
+                owned = torch.tensor([s for s in range(len(lens))
+                                      if (lens[s] // 256) % ranks == rank], dtype=torch.long)
+                kept = owned[owned != bad]
+                assert torch.equal(latent[kept], clean_latent[kept])
+                if bad in owned:
+                    assert torch.isnan(latent[bad]).all()
+            _check(rows, gate, weights, ranks, 256, clean_result)
+        return [clean, poisoned], check
+    _run_groups(tmp_path, ranks, groups, build)
 
 
-def test_ranks_with_no_key(tmp_path):
+def test_ranks_with_no_key(tmp_path, groups):
     """At 16 ranks, sequences of 37 and 256 cached tokens: 15 and 14 ranks hold no key, and
     the 256-token sequence's new row is the only key on rank 1; then the 37-token one alone."""
-    gen = torch.Generator().manual_seed(20261025)
     ranks = 16
-    rows = [torch.randn(n + 1, QKV, generator=gen) for n in (37, 256)]
-    gate = torch.randn(2, HEADS * ranks * V_DIM, generator=gen).bfloat16()
-    weights = _weights(gen, ranks)
-    both = _shard(rows, gate, weights, ranks, 256, gen)
-    alone = _shard(rows[:1], gate[:1], weights, ranks, 256, gen)
-    result_both, result_alone = _run(tmp_path, ranks, [both, alone])
-    _check(rows, gate, weights, ranks, 256, result_both)
-    _check(rows[:1], gate[:1], weights, ranks, 256, result_alone)
+
+    def build(gen):
+        rows = [torch.randn(n + 1, QKV, generator=gen) for n in (37, 256)]
+        gate = torch.randn(2, HEADS * ranks * V_DIM, generator=gen).bfloat16()
+        weights = _weights(gen, ranks)
+        both = _shard(rows, gate, weights, ranks, 256, gen)
+        alone = _shard(rows[:1], gate[:1], weights, ranks, 256, gen)
+
+        def check(results):
+            _check(rows, gate, weights, ranks, 256, results[0])
+            _check(rows[:1], gate[:1], weights, ranks, 256, results[1])
+        return [both, alone], check
+    _run_groups(tmp_path, ranks, groups, build)
+
+
+def test_kernel_takes_every_group(monkeypatch):
+    """Ranks 1 and 5 of two 4-rank groups hand the kernel the same compile-time arguments, which
+    hold both groups in the platform's order."""
+    calls = []
+    monkeypatch.setattr(mla_paged, "can_run_kernel", lambda x: True)
+    monkeypatch.setattr(mla_paged, "_DECODE_DCP",
+                        defaultdict(lambda: lambda **kw: calls.append(kw) or (None, None)))
+    gen = torch.Generator().manual_seed(20261025)
+    rows = [torch.randn(701, QKV, generator=gen)]
+    gate = torch.randn(1, HEADS * 4 * V_DIM, generator=gen).bfloat16()
+    _, shards = _case(gen, 4, rows, gate)
+    for rank in (1, 5):
+        mla_paged_decode_dcp(*shards[rank % 4], dcp_group=_mesh_group(4, 2, rank))
+    constants = [{k: v for k, v in kw.items() if not isinstance(v, torch.Tensor)} for kw in calls]
+    assert constants[0]["DCP_GROUPS"] == ((0, 1, 2, 3), (4, 5, 6, 7))
+    assert constants[0] == constants[1]
+
+
+def test_mesh_must_cover_the_world(monkeypatch):
+    """In a world of two 4-rank groups, a group whose registered mesh holds only its own ranks
+    raises on both groups' ranks."""
+    monkeypatch.setattr(mla_paged, "can_run_kernel", lambda x: True)
+    monkeypatch.setattr(mla_paged, "_DECODE_DCP", defaultdict(lambda: lambda **kw: (None, None)))
+    monkeypatch.setattr(mla_paged, "dist", SimpleNamespace(is_initialized=lambda: True,
+                                                          get_world_size=lambda: 8))
+    gen = torch.Generator().manual_seed(20261025)
+    rows = [torch.randn(701, QKV, generator=gen)]
+    gate = torch.randn(1, HEADS * 4 * V_DIM, generator=gen).bfloat16()
+    _, shards = _case(gen, 4, rows, gate)
+    for rank in (1, 5):
+        own = list(range(rank // 4 * 4, rank // 4 * 4 + 4))
+        register_mesh("mla-dcp-one-cell-mesh", [own])
+        group = SimpleNamespace(ranks=own,
+                                device_group=SimpleNamespace(group_name="mla-dcp-one-cell-mesh"))
+        with pytest.raises(ValueError, match="cover the world"):
+            mla_paged_decode_dcp(*shards[rank % 4], dcp_group=group)
+
+
+class _Lowered(Exception):
+    """Raised where the device-free compile would start the NEFF stage."""
+
+
+def _lower(_, rank, root):
+    """Rank ``rank`` of two 4-rank groups: its wrapper call on meta under ``torch.compile`` on
+    the device-free compile path, lowered to StableHLO; no NEFF is built."""
+    from libtorch_neuronx_lite._compiler.neuron_dynamo_backend import backend
+
+    def stop(*args, **kwargs):
+        raise _Lowered
+    backend._lower_stablehlo_to_neff = stop
+    call = [a.to("meta") if isinstance(a, torch.Tensor) else a
+            for a in torch.load(root / f"call{rank % 4}.pt")]
+    compiled = torch.compile(
+        functools.partial(mla_paged_decode_dcp, dcp_group=_mesh_group(4, 2, rank)),
+        backend=envs.get_compile_backend_name(), fullgraph=True)
+    try:
+        compiled(*call)
+    except Exception as e:  # dynamo wraps the backend's exception
+        cause = e
+        while cause is not None and not isinstance(cause, _Lowered):
+            cause = cause.__cause__ or cause.__context__
+        if cause is None:
+            raise
+
+
+def _stablehlo(debug):
+    """The one StableHLO text lowered under ``debug``, its debug dump path removed."""
+    (path,) = debug.glob("**/stablehlo/*.mlir")
+    return re.sub(rb'debug_dump_path = "[^"]*"', b"", path.read_bytes())
+
+
+def test_two_groups_lower_one_graph(tmp_path, monkeypatch):
+    """Ranks 1 and 5 of two 4-rank groups lower byte-equal StableHLO for the same shapes, on
+    CPU by the device-free compile, with the debug dump path removed."""
+    gen = torch.Generator().manual_seed(20261025)
+    rows = [torch.randn(701, QKV, generator=gen), torch.randn(2, QKV, generator=gen)]
+    gate = torch.randn(2, HEADS * 4 * V_DIM, generator=gen).bfloat16()
+    _, shards = _case(gen, 4, rows, gate)
+    for place, call in enumerate(shards):
+        torch.save(call, tmp_path / f"call{place}.pt")
+    for name in ("VLLM_NEURON_CPU_MODE", "NKI_SIMULATOR"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("VLLM_NEURON_CPU_COMPILE", "1")
+    monkeypatch.setenv("TORCH_NEURONX_PRESERVE_COMPILATION_ARTIFACTS", "1")
+    # One kernel cache for both ranks, as on a host; every cache under the test's own folder.
+    for name, sub in (("NEURON_LIBTORCH_CACHE_ROOT", "libtorch"), ("NKI_COMPILE_CACHE_URL", "nki"),
+                      ("NKI_TRACE_CACHE_URL", "nki-trace"),
+                      ("TORCHINDUCTOR_CACHE_DIR", "inductor")):
+        monkeypatch.setenv(name, str(tmp_path / sub))
+    texts = []
+    for rank in (1, 5):
+        monkeypatch.setenv("TORCH_NEURONX_DEBUG_DIR", str(tmp_path / f"debug{rank}"))
+        mp.spawn(_lower, args=(rank, tmp_path), nprocs=1, join=True)
+        texts.append(_stablehlo(tmp_path / f"debug{rank}"))
+    assert b"stablehlo.custom_call" in texts[0] and texts[0] == texts[1]

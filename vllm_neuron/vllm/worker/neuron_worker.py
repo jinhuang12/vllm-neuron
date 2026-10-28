@@ -1845,6 +1845,7 @@ class NeuronWorker(WorkerBase):
                 self._build_trace_job(
                     model_input,
                     native_compile_only=native_compile_only,
+                    graph_type="prefill",
                 )
             )
         return jobs

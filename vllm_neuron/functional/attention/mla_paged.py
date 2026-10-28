@@ -55,7 +55,9 @@ import nki.language as nl
 from nkilib.core.utils.kernel_assert import kernel_assert
 
 import torch
+import torch.distributed as dist
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
+from libtorch_neuronx_lite.parallel.replica_mesh import resolve_full_mesh
 from vllm_neuron.utils.hardware_config import get_logical_nc_config
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 
@@ -1030,7 +1032,7 @@ def _all_to_all(parts, lse, first, count, tokens, heads, group, ranks, write):
 
 def mla_paged_decode_dcp_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, pages,
                                 block_table, context_lens, slots, owner, EPS: float,
-                                LATENT_OFFSET: int, BLOCK_SIZE: int, DCP_RANKS: tuple,
+                                LATENT_OFFSET: int, BLOCK_SIZE: int, DCP_GROUPS: tuple,
                                 MERGE: str):
     """One decode step on one rank of a DCP group: ``(out [128, T, H, 1] bf16, pages)``.
 
@@ -1040,7 +1042,9 @@ def mla_paged_decode_dcp_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv
         block_table: ``[T, pages]`` int32 ids of the rank's own blocks of each sequence.
         context_lens: ``[T]`` int32 cached tokens of each sequence that the rank holds.
         owner: ``[T]`` int32, 1 where the rank holds the new token's row, else 0.
-        DCP_RANKS: the group's ranks; rank ``r``'s heads are gathered heads ``r H ..``.
+        DCP_GROUPS: every DCP group's ranks, the same on every rank, so all groups share one
+            graph; the collectives run within each group, and the rank at place ``r`` of its
+            group holds gathered heads ``r H ..``.
         MERGE: ``"all_to_all"`` or ``"reduce_scatter"``.
 
     Returns:
@@ -1055,11 +1059,13 @@ def mla_paged_decode_dcp_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv
     kernel_assert(tuple(block_table.shape) == (tokens, n_pages)
                   and tuple(context_lens.shape) == (tokens,) and tuple(owner.shape) == (tokens,),
                   "block_table is [T, pages]; context_lens and owner are [T]")
-    ranks = len(DCP_RANKS)
+    groups = [list(g) for g in DCP_GROUPS]
+    ranks = len(groups[0])
     gathered = ranks * heads
+    kernel_assert(all(len(g) == ranks for g in groups), "every DCP group has the same size")
     kernel_assert(ranks >= 2 and gathered <= _P, "2 or more ranks, at most 128 gathered heads")
     kernel_assert(MERGE in ("all_to_all", "reduce_scatter"), "MERGE names a merge collective")
-    group = ncc.ReplicaGroup([list(DCP_RANKS)])
+    group = ncc.ReplicaGroup(groups)
     window = n_pages * block_size
     n_tiles = window // _P
     n_blocks = (window + _BLOCK - 1) // _BLOCK
@@ -1903,14 +1909,15 @@ def mla_paged_decode_dcp(qkv_a: torch.Tensor, gate: torch.Tensor, q_norm_weight:
         block_table: ``[T, pages]`` int32 ids of the rank's own blocks per sequence.
         context_lens: ``[T]`` int32 tokens of each sequence that the rank holds.
         owner: ``[T]`` int32, 1 where the rank holds the new token's row, else 0.
-        dcp_group: the DCP group coordinator; the kernel reads its ``ranks``, and the CPU venue
-            its ``all_gather`` and ``reduce_scatter``.
+        dcp_group: the DCP group coordinator; the kernel reads its ``ranks`` and every group of
+            its mesh, and the CPU venue its ``all_gather`` and ``reduce_scatter``.
 
     Returns:
         The output for ``o_proj`` and the page buffer with each new token's latent row.
 
     Raises:
-        ValueError: an input outside the kernel's contract.
+        ValueError: an input outside the kernel's contract, or a DCP mesh that does not split
+            the world into groups of the group's size.
     """
     _check_inputs(qkv_a, gate, pages, latent_offset, block_size, slots, w_uk, w_uv_t)
     tokens = qkv_a.shape[0]
@@ -1924,6 +1931,15 @@ def mla_paged_decode_dcp(qkv_a: torch.Tensor, gate: torch.Tensor, q_norm_weight:
         return _torch_decode_dcp(qkv_a, gate, q_norm_weight, kv_norm_weight, w_qb_t, w_uk,
                                  w_uv_t, pages, latent_offset, block_size, block_table,
                                  context_lens, slots, owner, eps, dcp_group)
+    # Every group's ranks, the same on every rank, so all groups lower one graph.
+    groups = tuple(tuple(int(r) for r in g) for g in resolve_full_mesh(dcp_group))
+    flat = sorted([r for g in groups for r in g])
+    # With no process group, as in a one-process test, the world is the mesh's own ranks.
+    world = dist.get_world_size() if dist.is_initialized() else len(flat)
+    if (ranks not in groups or any(len(g) != len(ranks) for g in groups)
+            or flat != list(range(world))):
+        raise ValueError(f"the DCP mesh {groups} must hold the group's ranks {ranks} and cover "
+                         f"the world's {world} ranks once, in groups of one size")
     # All-to-all needs 4 ranks and fails at 16 or more.
     merge = "all_to_all" if 4 <= len(ranks) < 16 else "reduce_scatter"
     return _DECODE_DCP[get_logical_nc_config()](
@@ -1933,7 +1949,7 @@ def mla_paged_decode_dcp(qkv_a: torch.Tensor, gate: torch.Tensor, q_norm_weight:
         context_lens=context_lens.to(torch.int32).contiguous(),
         slots=slots.to(torch.int32).contiguous(), owner=owner.to(torch.int32).contiguous(),
         EPS=float(eps), LATENT_OFFSET=int(latent_offset), BLOCK_SIZE=int(block_size),
-        DCP_RANKS=ranks, MERGE=merge)
+        DCP_GROUPS=groups, MERGE=merge)
 
 
 def _torch_window_dcp(qkv_a, gate, q_norm_weight, kv_norm_weight, w_qb_t, w_uk, w_uv_t, pages,
