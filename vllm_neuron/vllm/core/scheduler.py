@@ -37,6 +37,7 @@ from vllm_neuron.utils.bucket_utils import (
 from vllm_neuron.vllm.patches.jf_grammar_patch import (
     apply_jf_grammar_rollback_patch,
 )
+from vllm_neuron.vllm.platform import NeuronPlatform
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -255,10 +256,7 @@ class NeuronScheduler(Scheduler):
             else None
         )
 
-        dcp_size = vllm_config.parallel_config.decode_context_parallel_size
-        dcp_stride = (
-            dcp_size * vllm_config.cache_config.block_size if dcp_size > 1 else 1
-        )
+        dcp_stride = NeuronPlatform.dcp_prefill_stride(vllm_config)
         self.num_batched_tokens_buckets = resolve_num_batched_tokens_buckets(
             max_num_batched_tokens,
             configured_buckets=neuron_config.get("num_batched_tokens_buckets"),

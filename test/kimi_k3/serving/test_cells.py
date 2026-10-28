@@ -15,6 +15,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.launchers.cli_args import make_arg_parser, validate_parsed_serve_args
 from vllm.platforms import current_platform
@@ -137,18 +138,31 @@ def _form_reading(form, measurements):
         "decode_context_length_buckets": validate_decode_context_length_buckets(
             neuron["decode_context_length_buckets"], max_len),
         "kv_segment_size_buckets": segments,
-        "threshold_divides": threshold > 0 and threshold % (dcp * config.cache_config.block_size) == 0,
+        "threshold_on_stride": threshold > 0
+        and threshold % current_platform.dcp_prefill_stride(config) == 0,
     }
 
 
-def test_each_form_builds_a_valid_config(tmp_path):
+def _at_chunk(form, chunk):
+    """The form with its prefill chunk, long-prefill threshold and KV segment at ``chunk``."""
+    flags = list(form["server_flags"])
+    for name in ("--max-num-batched-tokens", "--long-prefill-token-threshold"):
+        flags[flags.index(name) + 1] = str(chunk)
+    return {**form, "server_flags": flags, "kv_segment_size": chunk}
+
+
+@pytest.mark.parametrize("chunk", [None, 512, 1024, 2048])
+def test_each_form_builds_a_valid_config(tmp_path, chunk):
     """Item 2: each form's serve flags build a config in CPU mode, with no workers, that passes
     the DCP check and the bucket validator, with remote code trusted, the form's slots,
     max-model-len and buckets, segmented prefill on and the prefill threshold a multiple of
-    DCP times the block size: 0 raised errors over the 3 forms."""
+    the platform's DCP prefill stride: 0 raised errors over the 3 forms as they stand, and
+    over dcp16 and dcp32 with their prefill chunk at ``chunk``."""
     doc = _cells()
+    forms = doc["forms"] if chunk is None else {
+        name: _at_chunk(doc["forms"][name], chunk) for name in ("dcp16", "dcp32")}
     errors = {}
-    for name, form in doc["forms"].items():
+    for name, form in forms.items():
         want = {
             "trust_remote_code": True,
             "decode_context_parallel_size": form["decode_context_parallel_size"],
@@ -156,7 +170,7 @@ def test_each_form_builds_a_valid_config(tmp_path):
             "max_model_len": form["max_model_len"],
             "decode_context_length_buckets": form["decode_context_length_buckets"],
             "kv_segment_size_buckets": [form["kv_segment_size"]],
-            "threshold_divides": True,
+            "threshold_on_stride": True,
         }
         try:
             got = _form_reading(form, tmp_path)
