@@ -139,7 +139,14 @@ class DSparkProposer(DFlashProposer):
                 sum(p.nbytes for p in model.parameters())
             )
         else:
-            logger.info("CPU compilation is enabled. Skipping DSpark weight loading.")
+            if hasattr(model, "load_weights_lite"):
+                model.load_weights_lite(
+                    self.speculative_config.model,
+                    torch.device("cpu"),
+                    self.vllm_config.load_config.download_dir,
+                )
+                logger.info("Light weight loading complete for DSpark CPU compilation.")
+            logger.info("CPU compilation is enabled. Skipping full DSpark weight loading.")
             model = model.to("meta")
 
         compile_kwargs: dict = {"fullgraph": not envs.VLLM_NEURON_DEBUG_MODE}
