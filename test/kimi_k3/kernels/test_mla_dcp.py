@@ -419,8 +419,8 @@ def test_kernel_takes_every_group(monkeypatch):
 
 
 def test_mesh_must_cover_the_world(monkeypatch):
-    """In a world of two 4-rank groups, a group whose mesh is only its own ranks, as the
-    resolver gives for a group with no registered mesh, raises on both groups' ranks."""
+    """In a world of two 4-rank groups, a group whose registered mesh holds only its own ranks
+    raises on both groups' ranks."""
     monkeypatch.setattr(mla_paged, "can_run_kernel", lambda x: True)
     monkeypatch.setattr(mla_paged, "_DECODE_DCP", defaultdict(lambda: lambda **kw: (None, None)))
     monkeypatch.setattr(mla_paged, "dist", SimpleNamespace(is_initialized=lambda: True,
@@ -430,9 +430,12 @@ def test_mesh_must_cover_the_world(monkeypatch):
     gate = torch.randn(1, HEADS * 4 * V_DIM, generator=gen).bfloat16()
     _, shards = _case(gen, 4, rows, gate)
     for rank in (1, 5):
-        own = SimpleNamespace(ranks=tuple(range(rank // 4 * 4, rank // 4 * 4 + 4)))
+        own = list(range(rank // 4 * 4, rank // 4 * 4 + 4))
+        register_mesh("mla-dcp-one-cell-mesh", [own])
+        group = SimpleNamespace(ranks=own,
+                                device_group=SimpleNamespace(group_name="mla-dcp-one-cell-mesh"))
         with pytest.raises(ValueError, match="cover the world"):
-            mla_paged_decode_dcp(*shards[rank % 4], dcp_group=own)
+            mla_paged_decode_dcp(*shards[rank % 4], dcp_group=group)
 
 
 class _Lowered(Exception):
