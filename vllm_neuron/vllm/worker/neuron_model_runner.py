@@ -2074,8 +2074,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         #   1. Explicit --optimization-level from the caller (CLI or offline API)
         #   2. A model's compiler_args_for(graph_type, example_inputs, base)
         #   3. The neuronx-cc default (O1 on Neuron)
-        # The base args use the caller level. Prefill, jump-forward, and the
-        # spec-verify target use these. A model's compiler_args_for can
+        # The base args use the caller level. Jump-forward and the spec-verify
+        # target use these. A model's compiler_args_for can
         # override the args per graph, for example a higher -O for the plain
         # decode graph and the vision graph. -O3 disables neuronx-cc modular
         # flow, which improves the latency of these graphs.
@@ -2195,8 +2195,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # A single torch.compile per backend. The plain single-token decode
         # graph compiles with the "decode" graph type (see _plain_decode_forward
         # / _plain_decode_capture). The model compiler_args_for maps that type
-        # to its arguments. The encoder graph uses the "encoder" type. Prefill
-        # and JF keep the base args on self.model.
+        # to its arguments. The encoder graph uses the "encoder" type and the
+        # prefill graph the "prefill" type at its warmup and capture sites. JF
+        # keeps the base args on self.model.
         if eager_mode or cpu_mode or debug_mode or skip_graph_capture_backend:
             logger.debug("Graph capture and parallel compilation is disabled.")
             self.capture_backend_model = None
@@ -6124,7 +6125,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             bucket_size, kv_segment_size, device=device
         )
         try:
-            _ = self.capture_backend_model(**kwargs)
+            with scoped_compiler_args(self.resolve_graph_compiler_args("prefill")):
+                _ = self.capture_backend_model(**kwargs)
         except CaptureComplete:
             logger.debug(
                 "Graph capture for prefill completed: bucket_size=%s, kv_segment_size=%s",
@@ -6218,7 +6220,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             set_active_context(
                 self._tensor_replacer.warmup_context(bucket_size, self.device)
             )
-        model_output = self.model(**warmup_kwargs)
+        # The prefill trace job resolves the same "prefill" arguments, so the
+        # NEFF it compiled matches this warmup's cache key.
+        with scoped_compiler_args(self.resolve_graph_compiler_args("prefill")):
+            model_output = self.model(**warmup_kwargs)
         if self.use_async_scheduling:
             self._materialize_warmup_output(model_output)
         if self._tensor_replacer is not None:

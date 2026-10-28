@@ -47,6 +47,7 @@ from vllm_neuron.nn.cpl import ColumnParallelLinear
 from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
 from vllm_neuron.nn.sampler import Sampler
 from vllm_neuron.parallel.neuron_parallel_state import get_wide_ep_group
+from vllm_neuron.utils.compiler_args_ctx import with_hlo2tensorizer_option
 from vllm_neuron.utils.hardware_config import get_logical_nc_config
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 from vllm_neuron.utils.weight_loader import set_weight_loader, sharding_weight_loader
@@ -1432,6 +1433,17 @@ class KimiK3ForConditionalGeneration(nn.Module):
                 key = cache.untyped_storage().data_ptr()
                 pages = shared.setdefault(key, _int8_pages(cache))
                 layer.self_attn.bind_pages(pages, cache)
+
+    def compiler_args_for(self, graph_type, example_inputs, base):
+        """Return the prefill graph's compiler arguments, or None to keep ``base``."""
+        if graph_type != "prefill":
+            return None
+        # The prefill loop calls each of the 93 layers through a named method, so the
+        # compiler sees no module border to cut the graph at. Its fallback splitter keeps
+        # two repeat runs and leaves most layers in one part, which the instruction-count
+        # verifier stops (NCC_EVRF007): 23,116,982 instructions at the served shapes
+        # against its 10,000,000 limit. With sixteen repeat runs it cuts small parts.
+        return with_hlo2tensorizer_option(base, "--partitioner-max-disj-runs=16")
 
     @torch.no_grad()
     def forward(
