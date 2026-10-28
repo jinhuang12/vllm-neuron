@@ -146,3 +146,13 @@ def test_registered_forms_fit_the_verification_row_limit():
                 too_few_seqs.append((cell["name"], share, seqs))
     assert too_many_rows == []
     assert too_few_seqs == []
+
+
+def test_registered_forms_fit_the_verify_kernel():
+    """Each form's sequence cap is within the KDA verify kernel's sequence limit."""
+    from vllm_neuron.functional.kda.fused_decode import MAX_SEQUENCES
+
+    forms = json.loads(CELLS.read_text())["forms"]
+    caps = {name: _max_num_seqs(form) for name, form in forms.items()}
+    over = {name: cap for name, cap in caps.items() if cap > MAX_SEQUENCES}
+    assert not over, f"sequence cap above the verify kernel's {MAX_SEQUENCES}: {over}"
