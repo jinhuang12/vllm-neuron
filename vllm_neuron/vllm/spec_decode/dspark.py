@@ -38,7 +38,8 @@ class DSparkProposer(DFlashProposer):
 
     Each round writes the verify rows' taps into the draft's context cache, runs one
     causal block pass over the anchor and k - 1 mask tokens, and picks the k drafts in
-    order with the draft's Markov head. Warm-up and graph extraction are DFlash's.
+    order with the draft's Markov head. Graph extraction is DFlash's, and so is warm-up
+    but for its readback, which skips meta outputs.
     """
 
     def __init__(
@@ -175,6 +176,26 @@ class DSparkProposer(DFlashProposer):
             self.vllm_config.model_config.hf_text_config
         )
         return aux_layers_for_draft(self.draft_model_config.hf_config, text_config)
+
+    def warmup(
+        self, num_tokens: int, num_reqs: int, attn_metadata: AttentionMetadata
+    ) -> None:
+        """Warm up the proposal path; read back only outputs that are not meta.
+
+        The device-free compile runs each warm-up on the meta device, where an output
+        has no data to copy. On a device the readback consumes the async result.
+        """
+        assert self.model is not None
+        logger.info("DSpark warmup: num_tokens=%d, num_reqs=%d", num_tokens, num_reqs)
+        draft_output = self.propose(
+            attn_metadata=attn_metadata,
+            is_warmup=True,
+            **self._build_synthetic_inputs(num_tokens, num_reqs),
+        )
+        if self.vllm_config.scheduler_config.async_scheduling:
+            for out in draft_output:
+                if torch.is_tensor(out) and out.device.type != "meta":
+                    out.cpu()
 
     def propose(
         self,
