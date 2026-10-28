@@ -52,20 +52,19 @@ BLOCK, CHUNK, BUCKET = 256, 4 * 256, 8192
 NULL_BLOCK = 0
 
 SERVED_TP, SERVED_DP = 32, 2
-# One LNC 2 trn3 core's HBM region, the weight bytes per rank of the TP 32 by EP 64 layout
-# without the load-time copies, and the bytes of one expert replica slot.
+# One LNC 2 trn3 core's HBM region, the model's own parameter bytes per rank of the TP 32 by
+# EP 64 layout (the embedding and the LM head at their TP 32 shards, the load-time copies not
+# counted), and the bytes of one expert replica slot.
 HBM_PER_RANK = 36 * 1024**3
-WEIGHT_BYTES = 27_367_507_968
+WEIGHT_BYTES = 26_789_456_700
 SLOT_BYTES = 1_614_348_288
 # Per served form: DCP size, max-model-len, replica slots, users per replica and context of the
-# largest cell, then the worker's KV budget (GB) and the headroom (GB) at that cell. The
-# planner's byte counts give the last two. The worker reads 0.03 to 0.05 GB lower: it counts
-# whole blocks and the null block, and the model's load-time copies are 0.03 GB above the
-# planner's 1.35 GB.
+# largest cell, then the worker's KV budget (GB) and the headroom (GB) at that cell, as the
+# worker's budget function gives them at the weight bytes above.
 FORMS = {
-    4: (32768, 3, 16, 2048, 1.23, 0.68),
-    16: (131072, 3, 16, 8192, 1.23, 0.68),
-    32: (131072, 2, 16, 131072, 2.84, 0.71),
+    4: (32768, 3, 16, 2048, 1.78, 1.21),
+    16: (131072, 3, 16, 8192, 1.78, 1.21),
+    32: (131072, 2, 16, 131072, 3.40, 1.24),
 }
 
 
@@ -249,7 +248,9 @@ def test_block_table_widths_at_the_8k_bucket(runs):
 def model():
     """The 93-layer model on the meta device, built on one rank of a 32-way TP group.
 
-    The MoE layers hold that rank's experts of the 64-rank expert group, TP 32 by DP 2.
+    The MoE layers hold that rank's experts of the 64-rank expert group, TP 32 by DP 2. The
+    embedding and the LM head take their shard size from torch.distributed, which is not
+    initialized here, so its size queries answer with the group size.
     """
     group = types.SimpleNamespace(world_size=SERVED_TP, rank_in_group=0, device_group=None)
     experts = types.SimpleNamespace(world_size=SERVED_TP * SERVED_DP, rank_in_group=0,
@@ -258,6 +259,9 @@ def model():
         patch.setattr(kimi_model, "_tp_group", lambda: group)
         patch.setattr(kimi_model, "get_world_group", lambda: experts)
         patch.setattr(kimi_model, "get_wide_ep_group", lambda: experts)
+        patch.setattr(dist, "is_initialized", lambda: True)
+        patch.setattr(dist, "get_world_size", lambda group=None: SERVED_TP)
+        patch.setattr(dist, "get_rank", lambda group=None: 0)
         built = kimi_model.KimiK3ForConditionalGeneration.from_configs(
             get_config(str(CHECKPOINT), trust_remote_code=False))
         built.prepare_after_load()
@@ -300,6 +304,12 @@ def _worker_budget(config, device_bytes: int) -> int:
         worker = NeuronWorker.__new__(NeuronWorker)
         worker.cache_config = config.cache_config
         return worker._compute_kv_budget(HBM_PER_RANK, device_bytes)
+
+
+def test_weight_bytes_are_the_models_own_parameter_bytes_at_tp_32(model):
+    """One rank's parameters, the embedding and LM head at TP 32 shards, are WEIGHT_BYTES."""
+    own = sum(p.nbytes for p in model.parameters())
+    assert own == WEIGHT_BYTES, f"the model holds {own} bytes, WEIGHT_BYTES is {WEIGHT_BYTES}"
 
 
 def test_each_served_form_holds_its_cells_inside_the_rank_memory(model):
