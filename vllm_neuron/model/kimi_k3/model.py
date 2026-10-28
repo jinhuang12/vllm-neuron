@@ -1418,6 +1418,8 @@ class KimiK3ForConditionalGeneration(nn.Module, SupportsEagle3):
         self.head_weights: nn.ParameterList | None = None
         sampling = text.neuron_config.on_device_sampling_config if text.neuron_config else None
         self.sampler = Sampler(sampling, process_group=device_group) if sampling else None
+        # The unloaded tree's tensors by name, kept aside by load_weights_lite.
+        self._unloaded: dict[str, torch.Tensor] | None = None
 
     @classmethod
     def from_configs(
@@ -1430,6 +1432,7 @@ class KimiK3ForConditionalGeneration(nn.Module, SupportsEagle3):
         self, checkpoint_path: str, device: torch.device, cache_dir: str | None = None
     ) -> None:
         """Load the checkpoint, then compute the load-time products the forward reads."""
+        self._restore_unloaded()
         group = _tp_group()
         weight_loaders_mxfp4.load_weights(
             self,
@@ -1449,6 +1452,37 @@ class KimiK3ForConditionalGeneration(nn.Module, SupportsEagle3):
                 f"{len(unloaded)} Kimi K3 parameters were not loaded, first {unloaded[0]}"
             )
         self.prepare_after_load()
+
+    def load_weights_lite(
+        self, checkpoint_path: str, device: torch.device, cache_dir: str | None
+    ) -> None:
+        """Lay out the kernels' weights on the unloaded tree, for the device-free compile.
+
+        It reads nothing from the checkpoint: each layout takes its shape and dtype from the
+        meta parameters, and frees what a full load frees, so the worker counts the same bytes
+        and sizes the same KV cache. The unloaded tensors stay aside for a later load.
+        """
+        self._unloaded = dict(self.named_parameters(remove_duplicate=False))
+        self._unloaded.update(self.named_buffers(remove_duplicate=False))
+        self.prepare_after_load()
+
+    def _restore_unloaded(self) -> None:
+        """Undo a lite load: drop the layouts it added and put back the tensors it freed."""
+        if self._unloaded is None:
+            return
+        kept, self._unloaded = self._unloaded, None
+
+        def assign(name: str, value: torch.Tensor | None) -> None:
+            path, _, leaf = name.rpartition(".")
+            setattr(self.get_submodule(path), leaf, value)
+
+        self.head_weights = None
+        tensors = [*self.named_parameters(remove_duplicate=False),
+                   *self.named_buffers(remove_duplicate=False)]
+        for name in [name for name, _ in tensors if name not in kept]:
+            assign(name, None)
+        for name, tensor in kept.items():
+            assign(name, tensor)
 
     def local_expert_ids(self) -> list[int] | None:
         """The global ids of the experts this rank holds, or None when it holds them all."""
