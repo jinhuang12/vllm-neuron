@@ -46,6 +46,7 @@ import nki.language as nl
 from nkilib.core.utils.kernel_assert import kernel_assert
 
 import torch
+import torch.distributed as dist
 from libtorch_neuronx_lite.nki.nki_hop import wrap_nki
 from libtorch_neuronx_lite.parallel.replica_mesh import resolve_full_mesh
 from vllm_neuron.utils.hardware_config import get_logical_nc_config
@@ -1459,7 +1460,8 @@ def mla_paged_decode_dcp(qkv_a: torch.Tensor, gate: torch.Tensor, q_norm_weight:
         The output for ``o_proj`` and the page buffer with each new token's latent row.
 
     Raises:
-        ValueError: an input outside the kernel's contract.
+        ValueError: an input outside the kernel's contract, or a DCP mesh that does not split
+            the world into groups of the group's size.
     """
     _check_inputs(qkv_a, gate, pages, latent_offset, block_size, slots, w_uk, w_uv_t)
     tokens = qkv_a.shape[0]
@@ -1475,8 +1477,13 @@ def mla_paged_decode_dcp(qkv_a: torch.Tensor, gate: torch.Tensor, q_norm_weight:
                                  context_lens, slots, owner, eps, dcp_group)
     # Every group's ranks, the same on every rank, so all groups lower one graph.
     groups = tuple(tuple(int(r) for r in g) for g in resolve_full_mesh(dcp_group))
-    if ranks not in groups:
-        raise ValueError(f"the DCP group's ranks {ranks} are not a group of its mesh {groups}")
+    flat = sorted([r for g in groups for r in g])
+    # With no process group, as in a one-process test, the world is the mesh's own ranks.
+    world = dist.get_world_size() if dist.is_initialized() else len(flat)
+    if (ranks not in groups or any(len(g) != len(ranks) for g in groups)
+            or flat != list(range(world))):
+        raise ValueError(f"the DCP mesh {groups} must hold the group's ranks {ranks} and cover "
+                         f"the world's {world} ranks once, in groups of one size")
     # All-to-all needs 4 ranks and fails at 16 or more.
     merge = "all_to_all" if 4 <= len(ranks) < 16 else "reduce_scatter"
     return _DECODE_DCP[get_logical_nc_config()](

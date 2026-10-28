@@ -17,7 +17,7 @@ NKI_SIMULATOR=1`` the ranks are gloo processes on the CPU and the kernel runs in
 simulator, which carries the kernel's collectives over gloo. On a Neuron device the group runs
 through ``MPExecutor`` on the first ``d`` cores of ``NEURON_RT_VISIBLE_CORES``, each rank's
 call under ``torch.compile``; a case whose group needs more cores than that is skipped.
-``MLA_DCP_GROUPS=g`` runs ``g`` groups side by side, ``g d`` ranks with the same calls in
+``--dcp-groups g`` runs ``g`` groups side by side, ``g d`` ranks with the same calls in
 each group, and checks every group. Two more items check that ranks of different groups build
 one graph: the kernel's compile-time arguments, and the StableHLO the device-free compile lowers.
 """
@@ -54,7 +54,6 @@ SCALE = (NOPE + ROPE) ** -0.5
 ELEMENT_TOL = 2.0**-7
 ROW_RMS_TOL = 2.0**-7
 MIN_ROW_COSINE = 0.9999
-GROUPS = int(os.environ.get("MLA_DCP_GROUPS", "1"))  # DCP groups in the world
 MESH = "mla-dcp-test-mesh"  # the name the test registers its groups under
 
 
@@ -157,11 +156,11 @@ def _mesh_group(ranks, groups, rank):
     return SimpleNamespace(ranks=mesh[rank // ranks], device_group=SimpleNamespace(group_name=MESH))
 
 
-def _rank(rank, root, ranks):
+def _rank(rank, root, ranks, groups):
     """One gloo rank: each call's output and new rows."""
     dist.init_process_group("gloo", init_method=f"file://{root}/rdzv", rank=rank,
-                            world_size=GROUPS * ranks)
-    group = _mesh_group(ranks, GROUPS, rank)
+                            world_size=groups * ranks)
+    group = _mesh_group(ranks, groups, rank)
     results = [_read(call, *mla_paged_decode_dcp(*call, dcp_group=group))
                for call in torch.load(root / f"calls{rank}.pt")]
     torch.save(results, root / f"out{rank}.pt")
@@ -207,11 +206,11 @@ def _compiled_dcp():
     return lambda *args: compiled(*map(_on_device, args))
 
 
-def _run_on_device(ranks, calls):
-    """Run each call on the first ``GROUPS * ranks`` visible cores, one worker per rank."""
-    world = GROUPS * ranks
+def _run_on_device(ranks, groups, calls):
+    """Run each call on the first ``groups * ranks`` visible cores, one worker per rank."""
+    world = groups * ranks
     if _visible_cores() < world:
-        pytest.skip(f"{GROUPS} groups of {ranks} ranks need {world} cores in "
+        pytest.skip(f"{groups} groups of {ranks} ranks need {world} cores in "
                     "NEURON_RT_VISIBLE_CORES")
     from vllm_neuron.utils.executor import MPExecutor
 
@@ -229,15 +228,16 @@ def _run_on_device(ranks, calls):
         executor.shutdown()
 
 
-def _run(root, ranks, calls):
-    """Run each rank's calls over the group; per call, every rank's outputs and new rows."""
+def _run(root, ranks, groups, calls):
+    """Run each rank's calls over ``groups`` groups; per call, every rank's outputs and new
+    rows."""
     if not envs.VLLM_NEURON_CPU_MODE:
-        return _run_on_device(ranks, calls)
-    world = GROUPS * ranks
+        return _run_on_device(ranks, groups, calls)
+    world = groups * ranks
     for rank in range(world):
         torch.save([c[rank % ranks] for c in calls], root / f"calls{rank}.pt")
     (root / "rdzv").unlink(missing_ok=True)
-    mp.spawn(_rank, args=(root, ranks), nprocs=world, join=True)
+    mp.spawn(_rank, args=(root, ranks, groups), nprocs=world, join=True)
     results = [torch.load(root / f"out{rank}.pt") for rank in range(world)]
     return [[r[i] for r in results] for i in range(len(calls))]
 
@@ -281,52 +281,58 @@ def _case(gen, ranks, rows, gate, block_size=256):
     return weights, _shard(rows, gate, weights, ranks, block_size, gen)
 
 
+@pytest.fixture
+def groups(request):
+    """The DCP groups an item runs side by side: ``--dcp-groups``, 1 by default."""
+    return request.config.getoption("--dcp-groups", default=1)
+
+
 @pytest.mark.parametrize("ranks, lens", [(4, (8192, 5000, 1, 2700)),
                                          (16, tuple(8192 - 397 * s for s in range(15)) + (300,))],
                          ids=["4", "16"])
-def test_correlated_inputs(tmp_path, ranks, lens):
+def test_correlated_inputs(tmp_path, groups, ranks, lens):
     """At 4 ranks, 4 sequences to 8K, merged by all-to-all; at 16, 16 sequences, merged by an
     LSE all-gather and a reduce-scatter."""
     gen = torch.Generator().manual_seed(20261025)
     rows = [_correlated(gen, n + 1) for n in lens]
     gate = torch.randn(len(lens), HEADS * ranks * V_DIM, generator=gen).bfloat16()
     weights, calls = _case(gen, ranks, rows, gate)
-    (result,) = _run(tmp_path, ranks, [calls])
+    (result,) = _run(tmp_path, ranks, groups, [calls])
     _check(rows, gate, weights, ranks, 256, result)
 
 
-def test_repeated_tokens(tmp_path):
+def test_repeated_tokens(tmp_path, groups):
     gen = torch.Generator().manual_seed(20261025)
     ranks, token = 4, torch.randn(1, QKV, generator=gen)
     rows = [token.expand(2049, -1) for _ in range(16)]
     gate = torch.randn(1, HEADS * ranks * V_DIM, generator=gen).expand(16, -1).bfloat16()
     weights, calls = _case(gen, ranks, rows, gate)
-    (result,) = _run(tmp_path, ranks, [calls])
+    (result,) = _run(tmp_path, ranks, groups, [calls])
     _check(rows, gate, weights, ranks, 256, result)
 
 
-def test_near_one_gates(tmp_path):
+def test_near_one_gates(tmp_path, groups):
     """One 32K sequence at 4 ranks, its keys split between the two programs of each rank."""
     gen = torch.Generator().manual_seed(20261025)
     ranks = 4
     rows = [torch.randn(32768 + 1, QKV, generator=gen)]
     sign = torch.where(torch.rand(1, HEADS * ranks * V_DIM, generator=gen) < 0.5, -12.0, 12.0)
     weights, calls = _case(gen, ranks, rows, sign.bfloat16())
-    (result,) = _run(tmp_path, ranks, [calls])
+    (result,) = _run(tmp_path, ranks, groups, [calls])
     _check(rows, sign.bfloat16(), weights, ranks, 256, result)
 
 
 @pytest.mark.parametrize("ranks", [16, 32])
-def test_long_context(tmp_path, ranks):
+def test_long_context(tmp_path, groups, ranks):
     gen = torch.Generator().manual_seed(20261025)
     rows = [torch.randn(131072, QKV, generator=gen)]
     gate = torch.randn(1, HEADS * ranks * V_DIM, generator=gen).bfloat16()
     weights, calls = _case(gen, ranks, rows, gate)
-    (result,) = _run(tmp_path, ranks, [calls])
+    (result,) = _run(tmp_path, ranks, groups, [calls])
     _check(rows, gate, weights, ranks, 256, result)
 
 
-def test_nan_row_stays_in_its_sequence(tmp_path):
+def test_nan_row_stays_in_its_sequence(tmp_path, groups):
     """A NaN new row and gate in sequence 2 of 5: its heads are NaN on every rank, its latent
     row NaN on its owner, and every other sequence's output and row equal the clean run's."""
     gen = torch.Generator().manual_seed(20261025)
@@ -339,7 +345,7 @@ def test_nan_row_stays_in_its_sequence(tmp_path):
         new, nan_gate = call[0].clone(), call[1].clone()
         new[bad], nan_gate[bad] = float("nan"), float("nan")
         poisoned.append((new, nan_gate) + call[2:7] + (call[7].clone(),) + call[8:])
-    clean_result, result = _run(tmp_path, ranks, [clean, poisoned])
+    clean_result, result = _run(tmp_path, ranks, groups, [clean, poisoned])
     others = torch.tensor([s for s in range(len(lens)) if s != bad])
     for rank, ((out, latent), (clean_out, clean_latent)) in enumerate(zip(result, clean_result)):
         assert torch.isnan(out[bad]).all()
@@ -354,7 +360,7 @@ def test_nan_row_stays_in_its_sequence(tmp_path):
     _check(rows, gate, weights, ranks, 256, clean_result)
 
 
-def test_ranks_with_no_key(tmp_path):
+def test_ranks_with_no_key(tmp_path, groups):
     """At 16 ranks, sequences of 37 and 256 cached tokens: 15 and 14 ranks hold no key, and
     the 256-token sequence's new row is the only key on rank 1; then the 37-token one alone."""
     gen = torch.Generator().manual_seed(20261025)
@@ -364,7 +370,7 @@ def test_ranks_with_no_key(tmp_path):
     weights = _weights(gen, ranks)
     both = _shard(rows, gate, weights, ranks, 256, gen)
     alone = _shard(rows[:1], gate[:1], weights, ranks, 256, gen)
-    result_both, result_alone = _run(tmp_path, ranks, [both, alone])
+    result_both, result_alone = _run(tmp_path, ranks, groups, [both, alone])
     _check(rows, gate, weights, ranks, 256, result_both)
     _check(rows[:1], gate[:1], weights, ranks, 256, result_alone)
 
