@@ -5893,10 +5893,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # Untrimmed block-table seq dim — used by the on-device
             # ``correct_spec_decode_positions_and_slot_mapping`` correction
             # which needs to compute slot indices into the *full* KV cache,
-            # not the SWA-windowed view. Always sized at max_model_len.
+            # not the SWA-windowed view. Sized at max_model_len over the same
+            # DCP-aware block size as the table above, the width the input
+            # batch holds at run time.
             full_max_blocks_per_req = (
-                self.max_model_len + block_size - 1
-            ) // block_size
+                self.max_model_len + dcp_block_size - 1
+            ) // dcp_block_size
 
             swa_kv_pos_offset = None
             # For SWA decode, warmup must match the trimmed shape that
@@ -10671,9 +10673,11 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         Under speculation a state layer writes one page per verify token, and the next step
         starts from the page of the accepted count: the step's valid sampled ids less one,
-        0 after a prefill. The count is computed and stored on the device, so the
-        asynchronous path never reads it on the host. Without state pages this does nothing.
-        The parameter order is the caller's, as upstream's.
+        0 after a prefill. The ids come in one of three forms: a 1-D tensor with one id per
+        request (a prefill), a 2-D tensor with one row of verify tokens per request, or a
+        list of each request's accepted ids. The count is computed and stored on the device,
+        so the asynchronous path never reads it on the host. Without state pages this does
+        nothing. The parameter order is the caller's, as upstream's.
         """
         table = getattr(self, "_state_resume_table", None)
         num_reqs = self.input_batch.num_reqs
@@ -10681,7 +10685,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             return
         if isinstance(sampled_token_ids, torch.Tensor):
             ids = sampled_token_ids[:num_reqs]
-            valid = ((ids != -1) & (ids < self.vocab_size)).sum(dim=1)
+            valid = (ids != -1) & (ids < self.vocab_size)
+            valid = valid.to(torch.int64) if ids.dim() == 1 else valid.sum(dim=1)
         else:
             valid = torch.tensor([len(row) for row in sampled_token_ids[:num_reqs]])
         counts = (valid - 1).clamp(min=0).to(device=table.device, dtype=torch.int32)
