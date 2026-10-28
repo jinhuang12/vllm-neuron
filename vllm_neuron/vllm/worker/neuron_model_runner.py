@@ -5893,12 +5893,12 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # Untrimmed block-table seq dim — used by the on-device
             # ``correct_spec_decode_positions_and_slot_mapping`` correction
             # which needs to compute slot indices into the *full* KV cache,
-            # not the SWA-windowed view. At run time this table is the input
-            # batch's, so take its width from the source the input batch reads:
-            # max_model_len over the block size and, for a sharded cache, DCP.
-            full_max_blocks_per_req = spec.max_num_blocks_per_req(
-                self.vllm_config, self.max_model_len
-            )
+            # not the SWA-windowed view. Sized at max_model_len over the same
+            # DCP-aware block size as the table above, the width the input
+            # batch holds at run time.
+            full_max_blocks_per_req = (
+                self.max_model_len + dcp_block_size - 1
+            ) // dcp_block_size
 
             swa_kv_pos_offset = None
             # For SWA decode, warmup must match the trimmed shape that
