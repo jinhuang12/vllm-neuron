@@ -9,12 +9,18 @@ pages and a prefill chunk. The first MoE layer takes the same input in both worl
 combined rows and tail pack differ only by sum order. Past it, a bf16 cast and the expert
 kernel's 8-bit input rounding let the prefill outputs drift, so those are not compared. In the
 8-rank world one replica decodes while the idle one runs the runner's dummy batch on pages of
-random values. The error is the largest difference over the largest magnitude of the
-one-replica run. Set ``KIMI_K3_CHECKPOINT`` to the checkpoint directory (its config only);
-run with ``VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1``.
+random values. Two more 8-rank worlds take one step in which replica 0 prefills while replica
+1 has no request or decodes, and a third one in which both decode, each replica through the
+runner's DP vote and its own forward entry: the dummy batch, or the forward of a real batch.
+Every rank records its votes, its expert-group collectives and its forwards, with the bytes
+each forward changed outside page 0. The error is the largest difference over the largest
+magnitude of the one-replica run. Set ``KIMI_K3_CHECKPOINT`` to the
+checkpoint directory (its config only); run with ``VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1``.
 """
 
+import inspect
 import os
+import time
 import types
 from pathlib import Path
 
@@ -46,6 +52,11 @@ PAGE = BLOCK * ROW * 2
 PREFIX, BLOCKS = [37, 300, 5, 200], [[1], [2, 3], [4], [5]]  # each request's cache
 DUMMY_BATCHES = (16, 32)  # the KDA decode kernel takes at most 32 tokens
 SEAM, LOGITS = 8e-6, 1e-5
+STEPS = {"prefill-idle": ("prefill", "idle"), "prefill-decode": ("prefill", "decode"),
+         "decode-decode": ("decode", "decode")}
+PHASES = ("prefill", "decode")  # the order every rank runs a step's forwards in
+SEQ_BUCKETS = [1, 2, 4, 8, 16, 32]  # the served request buckets, to the KDA decode kernel's 32
+STEP_WALL = 30 * 60  # seconds a one-step world may run before it counts as hung
 
 
 def _model() -> m.KimiK3ForConditionalGeneration:
@@ -108,6 +119,11 @@ def _views(pages: torch.Tensor, kda: bool) -> list[torch.Tensor]:
     return [pages.view(torch.bfloat16).view(n, 1, BLOCK, ROW)]
 
 
+def _page_bytes(views: list[torch.Tensor]) -> torch.Tensor:
+    """A layer's pages as bytes, one row per page, sharing the cache's storage."""
+    return views[-1].view(torch.int8).reshape(views[-1].shape[0], -1)
+
+
 def _caches(replica: int, tp: int, phase: str, lengths=PREFIX, blocks=BLOCKS) -> dict:
     """Each layer's own pages: random states and cached rows at decode, empty at prefill."""
     caches, n = {}, len(lengths)
@@ -146,8 +162,8 @@ def _inputs(replica: int, phase: str, lengths=PREFIX, blocks=BLOCKS) -> tuple:
     return torch.randint(0, VOCAB, (n,), generator=gen), positions, meta
 
 
-def _dummy_inputs(batch: int, rank: torch.Tensor) -> dict:
-    """The decode inputs the runner's dummy batch builds for ``batch`` requests."""
+def _runner(rank: torch.Tensor, **fields):
+    """A runner with the state its dummy batch reads, and ``fields`` over it."""
     from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
 
     spec = types.SimpleNamespace(block_size=BLOCK)
@@ -161,26 +177,76 @@ def _dummy_inputs(batch: int, rank: torch.Tensor) -> dict:
                                             enable_structured_outputs=False),
         speculative_config=None, uses_mrope=False, on_device_sampling=False,
         enable_prompt_embeds=False, encoder_neuron_config=None, use_async_scheduling=False,
-        model=None, _use_async_reorder=lambda: False)
-    return runner._build_decode_synthetic_inputs(batch, decode_token_threshold=1,
-                                                 ctx_bucket=CONTEXT)
+        supports_mm_inputs=False, model=None, _use_async_reorder=lambda: False)
+    runner.__dict__.update(fields)
+    return runner
+
+
+def _dummy_inputs(batch: int, rank: torch.Tensor) -> dict:
+    """The decode inputs the runner's dummy batch builds for ``batch`` requests."""
+    return _runner(rank)._build_decode_synthetic_inputs(batch, decode_token_threshold=1,
+                                                        ctx_bucket=CONTEXT)
+
+
+def _dp_runner(rank: torch.Tensor, replica: int, model):
+    """One replica's runner in the 8-rank world, with the state its DP vote and forward read."""
+    parallel = types.SimpleNamespace(data_parallel_size=DP, enable_expert_parallel=True,
+                                     data_parallel_rank=replica)
+    return _runner(
+        rank, model=model, max_model_len=CONTEXT, is_dflash_spec=False, is_eagle3_spec=False,
+        _pure_consumer=False, _dp_identity_resolved=False, _per_graph_compiler_args=False,
+        _async_reorder_kwargs=None, _tensor_replacer=None, _target_tensor_capture=None,
+        _debug_logits_dir=None, input_batch=types.SimpleNamespace(num_reqs=0),
+        vllm_config=types.SimpleNamespace(
+            parallel_config=parallel,
+            model_config=types.SimpleNamespace(enforce_eager=True, model="kimi-k3")),
+        neuron_config=types.SimpleNamespace(
+            decode_context_length_buckets=[CONTEXT], enable_structured_outputs=False,
+            num_seqs_buckets=SEQ_BUCKETS, max_jump_forward_tokens=0, kv_segment_size_buckets=None))
+
+
+def _vote(runner, phase: str) -> None:
+    """A busy replica's DP vote, with the inputs the runner's input preparation gives it.
+
+    The prefill token count goes in only where the vote takes it.
+    """
+    decode, extra = phase == "decode", {}
+    if "local_prefill_tokens" in inspect.signature(runner._get_dp_padding).parameters:
+        extra["local_prefill_tokens"] = 0 if decode else P
+    runner._get_dp_padding(len(PREFIX) if decode else 1, max(PREFIX) if decode else 0,
+                           local_is_decode_shaped=decode, **extra)
+
+
+def _idle_step(runner, rank: int, bound: list) -> list[torch.Tensor]:
+    """The runner's dummy batch over pages of random values: each layer's changed bytes.
+
+    ``bound`` takes the pages, for the forward tap.
+    """
+    gen = torch.Generator().manual_seed(rank)
+    pages = [(0.5 * torch.randn(CONTEXT // BLOCK, PAGE // 2, generator=gen)).bfloat16()
+             .view(torch.int8) for _ in range(4)]
+    before, bound[:] = [p.clone() for p in pages], pages
+    runner.model.bind_kv_cache({f"layers.{i}.self_attn": _views(pages[i], i < 3)
+                                for i in range(4)})
+    runner.execute_dummy_batch()
+    return [(p != b).sum(-1) for p, b in zip(pages, before)]
 
 
 def _rank(rank: int, root: Path, world: str) -> None:
-    """One gloo rank of ``dp2`` or ``dp1``: each step's seams, and the idle replica's bytes."""
+    """One gloo rank of ``dp2``, ``dp1`` or a ``STEPS`` world: its seams, and idle bytes."""
     from vllm_neuron.parallel.neuron_parallel_state import (
         initialize_neuron_parallel_state, stamp_spmd_rank_tensors)
 
-    size, (replica, tp) = (TP * DP if world == "dp2" else TP), divmod(rank, TP)
+    size, (replica, tp) = (TP if world == "dp1" else TP * DP), divmod(rank, TP)
     dist.init_process_group("gloo", init_method=f"file://{root}/rdzv-{world}", rank=rank,
                             world_size=size)
-    if world == "dp2":
+    if world != "dp1":
         initialize_neuron_parallel_state(ep_degree=size, dp_size=DP, local_rank=rank,
                                          tp_global_ranks=[replica * TP + i for i in range(TP)])
     else:
         initialize_neuron_parallel_state(tp_global_ranks=list(range(TP)), local_rank=rank)
     stamped = stamp_spmd_rank_tensors("cpu")
-    model, seen, out = _model(), {}, {}
+    model, seen, out, bound, current = _model(), {}, {}, [], [None]
     _load(model, torch.load(root / "weights.pt", mmap=True), torch.load(root / "experts.pt"), tp)
     rank_t = torch.tensor(tp, dtype=torch.int32)
 
@@ -191,27 +257,78 @@ def _rank(rank: int, root: Path, world: str) -> None:
         seen.setdefault("pack", []).append(pack.clone())
         return output(self, pack)
 
-    output = m.KimiK3MoE.prefill_output
+    def combined(key, fn):
+        return lambda self, rows, *a: seen.setdefault(key, []).append(rows) or fn(self, rows, *a)
+
+    def collective(name, fn):
+        """``fn`` recording (phase, collective, rows) on every call."""
+        def run(x):
+            seen.setdefault("order", []).append((current[0], name, x.shape[0]))
+            return fn(x)
+        return run
+
+    def forward(fn):
+        """``fn`` recording each forward's phase and the bytes it changed outside page 0."""
+        def run(self, *args, **kwargs):
+            meta = next(iter(kwargs["attn_metadata"].values()))
+            current[0] = ("decode" if meta["max_query_len"] <= meta["decode_token_threshold"]
+                        else "prefill")
+            before = [p.clone() for p in bound]
+            result = fn(self, *args, **kwargs)
+            seen.setdefault("forwards", []).append(
+                (current[0], [int((p != b)[1:].sum()) for p, b in zip(bound, before)]))
+            return result
+        return run
+
+    output, moe = m.KimiK3MoE.prefill_output, m.KimiK3MoE
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(m, "_expert_sum", tap("routed", m._expert_sum))
-        patch.setattr(m.KimiK3MoE, "_combine", tap("combined", m.KimiK3MoE._combine))
+        patch.setattr(m, "_expert_sum", tap("routed", collective("sum", m._expert_sum)))
+        patch.setattr(m, "_expert_scatter", collective("scatter", m._expert_scatter))
+        patch.setattr(m.KimiK3ForConditionalGeneration, "forward",
+                      forward(m.KimiK3ForConditionalGeneration.forward))
+        if world in STEPS:
+            from vllm.distributed.parallel_state import get_dp_group
+            dp_group, reduce = get_dp_group().cpu_group, dist.all_reduce
+
+            def counted(tensor, *args, **kwargs):
+                if kwargs.get("group") is dp_group:
+                    seen.setdefault("votes", []).append(tensor.numel())
+                return reduce(tensor, *args, **kwargs)
+            patch.setattr(dist, "all_reduce", counted)
+        patch.setattr(moe, "tail_decode", combined("decode-combined", moe.tail_decode))
+        patch.setattr(moe, "_prefill_pack", combined("prefill-combined", moe._prefill_pack))
         patch.setattr(m.KimiK3MoE, "prefill_output", packed)
         for name in ("forward_decode", "forward_prefill"):
             layer = m.KimiK3DecoderLayer
-            patch.setattr(layer, name, tap("layer", getattr(layer, name)))
-        for d in [replica] if world == "dp2" else range(DP):
-            for phase in ("decode", "prefill"):
-                model.bind_kv_cache(_caches(d, tp, phase))
-                ids, positions, meta = _inputs(d, phase)
-                seen.clear()
+            patch.setattr(layer, name, tap(name, getattr(layer, name)))
+        plan = {"dp2": [(replica, p) for p in ("decode", "prefill")],
+                "dp1": [(d, p) for d in range(DP) for p in ("decode", "prefill")]}
+        for d, phase in plan.get(world) or [(replica, STEPS[world][replica])]:
+            runner = _dp_runner(rank_t, replica, model) if world in STEPS else None
+            seen.clear()
+            if phase == "idle":
+                out[(d, phase)] = _idle_step(runner, rank, bound)
+                out["step"] = {key: seen.get(key, []) for key in ("order", "forwards", "votes")}
+                continue
+            caches = _caches(d, tp, phase)
+            model.bind_kv_cache(caches)
+            bound[:] = [_page_bytes(views) for views in caches.values()]
+            ids, positions, meta = _inputs(d, phase)
+            if runner is None:
                 hidden = model.model(ids, meta, phase == "prefill", positions, rank_t)
-                steps = seen["layer"]
-                out[(d, phase)] = {
-                    "combined": seen["combined"][0],
-                    "pack": steps[1][1] if phase == "decode" else seen["pack"][0],
-                    "streams": [s if phase == "prefill" else s[0] for s in steps],
-                    "routed": seen["routed"],
-                    "logits": model.compute_logits(hidden if phase == "decode" else hidden[-1:])}
+                logits = model.compute_logits(hidden if phase == "decode" else hidden[-1:])
+            else:
+                _vote(runner, phase)
+                rows = torch.arange(len(ids)) if phase == "decode" else torch.tensor([len(ids) - 1])
+                logits = runner._execute_model_forward(ids, positions, rows, meta)[0]
+            steps = seen[f"forward_{phase}"]
+            out[(d, phase)] = {
+                "combined": seen[f"{phase}-combined"][0],
+                "pack": steps[1][1] if phase == "decode" else seen["pack"][0],
+                "streams": [s if phase == "prefill" else s[0] for s in steps],
+                "routed": seen["routed"],
+                "logits": logits}
+            out["step"] = {key: seen.get(key, []) for key in ("order", "forwards", "votes")}
         out["dummy"] = {}
         for batch in DUMMY_BATCHES if world == "dp2" else ():
             lengths = [37 * r % 250 + 1 for r in range(batch)]
@@ -278,3 +395,71 @@ def test_two_replicas_match_one(worlds):
                 _error(two[(d, "decode")]["logits"], one[(d, "decode")]["logits"]), LOGITS)
     over = {key: f"{value:.2e}" for key, (value, bound) in readings.items() if not value <= bound}
     assert not over, f"over the bound, by phase, seam, replica and rank: {over}"
+
+
+def _step_world(root: Path, world: str):
+    """A ``STEPS`` world's rank records, or the error that stopped its step."""
+    ranks, start = mp.spawn(_rank, args=(root, world), nprocs=TP * DP, join=False), \
+        time.monotonic()
+    try:
+        while not ranks.join(timeout=10):
+            if time.monotonic() - start > STEP_WALL:
+                raise TimeoutError(f"the step still ran after {STEP_WALL} s")
+    except Exception as error:  # the item reports it
+        for process in ranks.processes:
+            process.terminate()
+            process.join()
+        return f"{type(error).__name__}: {error}"
+    return [torch.load(root / f"{world}-rank{r}.pt") for r in range(TP * DP)]
+
+
+@pytest.fixture(scope="module")
+def phase_steps(tmp_path_factory):
+    """A ``STEPS`` world's records by name, each world run on first use."""
+    root, runs = tmp_path_factory.mktemp("steps"), {}
+    torch.save(_weights(_model()), root / "weights.pt")
+    torch.save(_experts(), root / "experts.pt")
+    return lambda world: runs[world] if world in runs else runs.setdefault(
+        world, _step_world(root, world))
+
+
+@pytest.mark.parametrize("step", ("prefill-idle", "prefill-decode"))
+def test_step_with_one_replica_prefilling_matches_one(phase_steps, step, request):
+    """A step in which replica 0 prefills while replica 1 is idle or decodes completes. Every
+    rank votes once and runs the same collectives, prefill-shaped first, and a both-decode step
+    runs no prefill; every dummy forward changes no byte outside page 0, the idle replica's whole
+    step neither; and each busy replica's seams match DP1."""
+    both = phase_steps("decode-decode")
+    assert not isinstance(both, str), f"the both-decode step did not complete: {both}"
+    prefill = {rank: r["step"]["order"] for rank, r in enumerate(both)
+               if any(shape != "decode" for shape, _, _ in r["step"]["order"])}
+    assert not prefill and all(len(r["step"]["votes"]) == 1 for r in both), \
+        f"the both-decode step ran a prefill-shaped collective or not one vote: {prefill}"
+    run = phase_steps(step)
+    assert not isinstance(run, str), f"the step did not complete: {run}"
+    orders = {rank: tuple(run[rank]["step"]["order"]) for rank in range(TP * DP)}
+    assert len(set(orders.values())) == 1, f"the ranks' collectives differ: {orders}"
+    shapes = [shape for shape, _, _ in orders[0]]
+    assert set(shapes) == set(PHASES) and shapes == sorted(shapes, key=PHASES.index), \
+        f"the collectives are not prefill-shaped first, then decode-shaped: {orders[0]}"
+    votes = {rank: run[rank]["step"]["votes"] for rank in range(TP * DP)}
+    assert all(len(v) == 1 for v in votes.values()), f"votes by rank: {votes}"
+    forwards = {rank: run[rank]["step"]["forwards"] for rank in range(TP * DP)}
+    unordered = {rank: f for rank, f in forwards.items() if [p for p, _ in f] != list(PHASES)}
+    assert not unordered, f"forwards not a prefill, then a decode, by rank: {unordered}"
+    dummy = {(rank, shape): writes for rank, f in forwards.items() for shape, writes in f
+             if shape != STEPS[step][rank // TP] and any(writes)}
+    assert not dummy, f"a dummy forward changed bytes outside page 0, by rank and phase: {dummy}"
+    written = {(rank, layer): int(pages[1:].sum()) for rank in range(TP, TP * DP)
+               for layer, pages in enumerate(run[rank].get((1, "idle"), ())) if pages[1:].any()}
+    assert not written, f"bytes changed outside page 0, by rank and layer: {written}"
+    one, readings = request.getfixturevalue("worlds")["dp1"], {}
+    for d, phase in enumerate(STEPS[step]):
+        seams = {"idle": (), "decode": ("combined", "pack", "logits")}.get(phase)
+        for tp in range(TP):
+            for seam in ("combined", "pack") if seams is None else seams:
+                two, ref = run[d * TP + tp][(d, phase)][seam], one[tp][(d, phase)][seam]
+                readings[(d, phase, seam, tp)] = (_error(two, ref),
+                                                  LOGITS if seam == "logits" else SEAM)
+    over = {key: f"{value:.2e}" for key, (value, bound) in readings.items() if not value <= bound}
+    assert not over, f"over the bound, by replica, phase, seam and rank: {over}"

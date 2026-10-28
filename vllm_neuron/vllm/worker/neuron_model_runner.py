@@ -371,6 +371,22 @@ class ExecuteModelState(NamedTuple):
     attn_metadata: dict | None = None
 
 
+class DPStepShape(NamedTuple):
+    """The DP group's step shape from one ``_get_dp_padding`` reduce.
+
+    ``prefill_tokens`` is the largest prefill token count of any rank, 0 when no rank
+    prefills. ``decode_rows`` is the largest decode batch of any decoding or idle rank, 0
+    when every rank prefills. The other fields are the group's decode-graph choice.
+    """
+
+    prefill_tokens: int
+    decode_rows: int
+    max_decode_ctx_len: int
+    any_rank_spec: bool
+    group_force_nonspec: bool
+    any_rank_jf: bool
+
+
 class AsyncNeuronModelRunnerOutput(AsyncModelRunnerOutput):
     """Wraps a ModelRunnerOutput whose sampled_token_ids is still a device
     tensor future.  Exactly one instance is created per step in
@@ -1202,6 +1218,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # without a device->host copy. Superseded on each dummy batch. See
             # execute_dummy_batch.
             self._dummy_output_keepalive = None
+            # The same for the most recent prefill-shaped dummy. See _dispatch_prefill_dummy.
+            self._prefill_dummy_keepalive = None
             # Counters for observability: track how many forward steps used
             # the async path vs sync fallback. Logged periodically and useful
             # for tests to verify async scheduling is actually engaged.
@@ -1291,6 +1309,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self._dp_padding_cache: (
             tuple[tuple[int, int, bool], int, int, bool, bool, bool] | None
         ) = None
+        # The group's step shape from the current step's reduce, or None. The step's one
+        # forward reads and clears it (_take_dp_step_shape), so no step reads an older vote.
+        self._dp_step_shape: DPStepShape | None = None
         # Per-step draft-lockstep state, set during input prep and read in
         # sample_tokens: whether the DP group speculates this step, the
         # DP-padded request count, and the DP-synced decode ctx length. Used to
@@ -4036,6 +4057,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             )
             is_spec_decode_step = bool(scheduler_output.scheduled_spec_decode_tokens)
             local_jf = jf_possible and bool(jf_tokens)
+            decode_shaped = pre_strip_max_query_len <= self._decode_token_threshold()
             (
                 dp_pad,
                 max_decode_ctx_len,
@@ -4052,8 +4074,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 local_is_real=True,
                 # A prefill-shape step does not bucket the batch size, so the identity
                 # fast path cannot hold. Give the shape, and let the method decide.
-                local_is_decode_shaped=(
-                    pre_strip_max_query_len <= self._decode_token_threshold()
+                local_is_decode_shaped=decode_shaped,
+                local_prefill_tokens=(
+                    0
+                    if decode_shaped
+                    else sum(
+                        scheduler_output.num_scheduled_tokens_padded[req_id]
+                        for req_id in self.input_batch.req_ids
+                    )
                 ),
             )
             # Cache the (strip-invariant) batch size + reduced outputs so the
@@ -5939,6 +5967,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         bucket_size: int,
         kv_segment_size: int,
         device: torch.device | None = None,
+        null_kv: bool = False,
     ) -> dict:
         """Build synthetic inputs for prefill warmup.
 
@@ -5947,6 +5976,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             kv_segment_size: Size of each KV segment bucket
             device: Override device for synthetic tensors. Defaults to
                 ``self.device``.
+            null_kv: Put every slot and block entry on the null block, so the
+                forward writes no live request's cache. The prefill dummy uses it.
 
         Returns:
             dict: Keyword arguments for self.model() forward call
@@ -5981,6 +6012,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             # (matches _build_attention_metadata where max_num_draft_tokens=0).
             decode_token_threshold=1,
             device=device,
+            null_kv=null_kv,
             kv_segment_size=kv_segment_size,
         )
 
@@ -8954,6 +8986,18 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 positions,
             )
 
+        # Under DP with EP the MoE collectives span every replica, so every rank runs the
+        # group's prefill-shaped forward first and its decode-shaped forward second. A rank
+        # with no real work of a phase runs a dummy of it. See _get_dp_padding.
+        step_shape = self._take_dp_step_shape()
+        local_meta = next(iter(attn_metadata.values())) if attn_metadata else None
+        local_prefill = (
+            local_meta is not None
+            and local_meta["max_query_len"] > local_meta["decode_token_threshold"]
+        )
+        if step_shape is not None and step_shape.prefill_tokens and not local_prefill:
+            self._dispatch_prefill_dummy(step_shape.prefill_tokens)
+
         # Move inputs to Neuron device
         input_ids = input_ids.to(self.device)
         positions = positions.to(self.device)
@@ -9217,6 +9261,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         if not self.use_async_scheduling:
             model_output_tensor = model_output_tensor.to("cpu")
 
+        if step_shape is not None and step_shape.decode_rows and local_prefill:
+            self._dispatch_decode_dummy(
+                step_shape.decode_rows,
+                step_shape.max_decode_ctx_len,
+                step_shape.any_rank_spec,
+                step_shape.group_force_nonspec,
+                step_shape.any_rank_jf,
+            )
+
         return model_output_tensor, aux_hidden_states, last_accepted_token
 
     def _has_component_dp(self) -> bool:
@@ -9402,6 +9455,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         local_jf: bool = False,
         local_is_real: bool = True,
         local_is_decode_shaped: bool = False,
+        local_prefill_tokens: int = 0,
     ) -> tuple[int, int, bool, bool, bool, bool]:
         """Synchronize per-step shape inputs across DP ranks in one all-reduce.
 
@@ -9509,6 +9563,14 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 ``max_query_len <= decode_token_threshold``. The identity fast path
                 needs this, because the batch size is bucketed on a decode-shape step
                 only. The default is False, so a new call site keeps the reduce.
+            local_prefill_tokens: This rank's padded prefill token count, or 0 on a
+                decode or idle step. When the MoE collectives span the replicas, every
+                rank must run the same forwards in the same order: the group's
+                prefill-shaped forward first, then its decode-shaped forward, with a
+                dummy for a phase it has no work of. A prefill rank sends 0 in the batch
+                channel and gets a pad of 0, so no decode batch pads its prefill. The
+                reduce records the group's shape for the step's forward to read (see
+                ``DPStepShape`` and ``_take_dp_step_shape``).
 
         Returns:
             `(num_pad_tokens, max_decode_ctx_len, any_rank_spec_decode,
@@ -9575,12 +9637,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         group = get_dp_group().cpu_group
         t = torch.tensor(
             [
-                num_tokens,
+                0 if local_prefill_tokens else num_tokens,
                 local_max_decode_ctx_len,
                 int(is_spec_decode),
                 int(local_force_nonspec),
                 int(local_jf),
                 int(local_is_real),
+                local_prefill_tokens,
             ],
             device="cpu",
             dtype=torch.int32,
@@ -9601,7 +9664,15 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             bool(t[4]),
             bool(t[5]),
         )
-        num_pad = max_tokens_across_dp - num_tokens
+        self._dp_step_shape = DPStepShape(
+            prefill_tokens=int(t[6]),
+            decode_rows=max_tokens_across_dp,
+            max_decode_ctx_len=max_decode_ctx_len,
+            any_rank_spec=any_rank_spec,
+            group_force_nonspec=group_force_nonspec,
+            any_rank_jf=any_rank_jf,
+        )
+        num_pad = 0 if local_prefill_tokens else max_tokens_across_dp - num_tokens
 
         logger.debug(
             "DP coord: rank=%s local_tokens=%s max_tokens_across_dp=%s num_pad=%s "
@@ -9958,7 +10029,9 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         All tensor shapes must exactly match what execute_model produces for
         a real decode batch of the same size, otherwise torch.compile traces
-        a different graph and the collectives across DP ranks deadlock.
+        a different graph and the collectives across DP ranks deadlock. When a
+        peer prefills, a prefill-shaped dummy on the null block runs first, as
+        on every rank of the group (see _get_dp_padding).
         """
         logger.debug("Executing dummy batch for DP synchronization")
 
@@ -10012,13 +10085,53 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         # Additionally, an all-dummy group has no real rank to pace submission
         # against device completion, so the async execution queue free-runs and
         # can overflow (status=7 Execution Queue Full).
+        step_shape = self._take_dp_step_shape()
         if not any_rank_real:
             logger.debug("Dummy batch skipped: no busy DP rank this step")
             return
 
+        # A peer prefills, so every rank runs the group's prefill-shaped forward first.
+        if step_shape is not None and step_shape.prefill_tokens:
+            self._dispatch_prefill_dummy(step_shape.prefill_tokens)
+
         if num_pad > 0:
             batch_size = batch_size + num_pad
 
+        spec_decode_enabled, ctx_bucket = self._dispatch_decode_dummy(
+            batch_size,
+            max_decode_ctx_len,
+            any_rank_spec,
+            group_force_nonspec,
+            any_rank_jf,
+        )
+
+        # >>> PARALLELISM: Draft DP lockstep. When a peer is speculating and the
+        # Eagle3 draft shards its embedding/lm_head vocab weights over the
+        # enlarged TP group, the draft NEFF runs cross-DP collectives. An idle
+        # rank runs the target dummy above, but it must also run a dummy draft
+        # proposal, or the busy ranks' draft collectives never complete and time
+        # out (NRT_TIMEOUT). Mirror the startup draft warmup so the dummy draft
+        # NEFF shape matches the busy ranks (batch_size is already DP-padded). <<<
+        if spec_decode_enabled:
+            self._dispatch_dummy_draft(batch_size, ctx_bucket)
+
+        logger.debug("Dummy batch execution completed")
+
+    def _dispatch_decode_dummy(
+        self,
+        batch_size: int,
+        max_decode_ctx_len: int,
+        any_rank_spec: bool,
+        group_force_nonspec: bool,
+        any_rank_jf: bool,
+    ) -> tuple[bool, int | None]:
+        """Run the decode-shaped dummy forward at the group's batch, context bucket and graph.
+
+        The idle path and a prefilling rank of a group with decode rows both call it.
+
+        Returns:
+            Whether the group speculates, and the context bucket, for the draft dummy.
+        """
         # Match the busy ranks' NEFF choice exactly. A busy rank votes its
         # PRE-strip spec flag into any_rank_spec but its strip decision into
         # group_force_nonspec, so on a step where a speculating rank is pulled
@@ -10093,18 +10206,27 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 self._dummy_output_keepalive = model_output
             else:
                 self._drain_previous_dummy_output(model_output)
+        return spec_decode_enabled, ctx_bucket
 
-        # >>> PARALLELISM: Draft DP lockstep. When a peer is speculating and the
-        # Eagle3 draft shards its embedding/lm_head vocab weights over the
-        # enlarged TP group, the draft NEFF runs cross-DP collectives. An idle
-        # rank runs the target dummy above, but it must also run a dummy draft
-        # proposal, or the busy ranks' draft collectives never complete and time
-        # out (NRT_TIMEOUT). Mirror the startup draft warmup so the dummy draft
-        # NEFF shape matches the busy ranks (batch_size is already DP-padded). <<<
-        if spec_decode_enabled:
-            self._dispatch_dummy_draft(batch_size, ctx_bucket)
+    def _dispatch_prefill_dummy(self, num_tokens: int) -> None:
+        """Run a prefill-shaped dummy forward of ``num_tokens`` on the null block.
 
-        logger.debug("Dummy batch execution completed")
+        It pairs a peer's prefill in the cross-DP MoE collectives and writes no live
+        request's cache. It takes the first segment size: warmup compiles every pair of
+        token bucket and segment size, so the graph exists.
+        """
+        segment = (self.neuron_config.kv_segment_size_buckets or [0])[0]
+        kwargs = self._build_prefill_synthetic_inputs(num_tokens, segment, null_kv=True)
+        with model_forward_context(self.vllm_config):
+            model_output = self.model(**kwargs)
+        if self.use_async_scheduling:
+            # Hold the output as the decode dummy does, so its in-flight inputs stay alive.
+            self._prefill_dummy_keepalive = model_output
+
+    def _take_dp_step_shape(self) -> DPStepShape | None:
+        """Return the group's step shape from this step's reduce, once."""
+        step_shape, self._dp_step_shape = self._dp_step_shape, None
+        return step_shape
 
     def _generate_model_runner_output(
         self,
