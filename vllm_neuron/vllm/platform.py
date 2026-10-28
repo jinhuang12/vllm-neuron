@@ -40,6 +40,20 @@ logger = logging.getLogger(__name__)
 # defaulting in update_block_size_for_backend and _validate_dcp_config.
 _UPSTREAM_DCP_INTERLEAVE_DEFAULT = 1
 
+
+def __getattr__(name: str):
+    """``KDA_DECODE_MAX_SEQS``: the KDA decode kernel's token cap; a decode step spends one per sequence.
+
+    The kernel package reads ``current_platform`` as it imports, so a top-level import here
+    would resolve the platform before this module has defined it.
+    """
+    if name == "KDA_DECODE_MAX_SEQS":
+        from vllm_neuron.functional.kda.fused_decode import MAX_TOKENS
+
+        return MAX_TOKENS
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 SO_DISABLED_MESSAGE = (
     "Structured outputs were requested, but this Neuron server was started "
     "with additional_config.neuron_config.enable_structured_outputs=false. "
@@ -245,6 +259,10 @@ class NeuronPlatform(Platform):
     # them, so the runner takes its text path and sets up no encoder cache, and
     # validate_request refuses multimodal items.
     _text_only_architectures: frozenset[str] = frozenset(
+        {"KimiK3ForConditionalGeneration"}
+    )
+    # Architectures whose decode step runs the KDA decode kernel.
+    _kda_decode_architectures: frozenset[str] = frozenset(
         {"KimiK3ForConditionalGeneration"}
     )
     # The served architecture when it is in _text_only_architectures, else None.
@@ -770,6 +788,7 @@ class NeuronPlatform(Platform):
         cls._maybe_enable_moe_for_component_dp(vllm_config)
 
         cls._validate_dcp_config(vllm_config)
+        cls._validate_kda_decode_seqs(vllm_config)
         cls._auto_set_neuron_connector_module_path(vllm_config)
         cls._auto_set_neuron_ec_connector_module_path(vllm_config)
         cls._validate_quantization_config(vllm_config)
@@ -1066,6 +1085,19 @@ class NeuronPlatform(Platform):
                 f"Component DP ({active}) requires --data-parallel-size >= 2. "
                 f"Component DP shards modules across DP replicas and needs "
                 f"multiple DP ranks to function."
+            )
+
+    @classmethod
+    def _validate_kda_decode_seqs(cls, vllm_config) -> None:
+        """Refuse a KDA model whose engine holds more sequences than the decode kernel takes."""
+        if vllm_config.model_config.architecture not in cls._kda_decode_architectures:
+            return
+        limit = __getattr__("KDA_DECODE_MAX_SEQS")
+        max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        if max_num_seqs > limit:
+            raise ValueError(
+                f"The KDA decode kernel takes at most {limit} sequences per engine; "
+                f"got max_num_seqs={max_num_seqs}. Pass --max-num-seqs {limit} or lower."
             )
 
     @classmethod

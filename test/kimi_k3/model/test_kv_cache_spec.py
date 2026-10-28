@@ -70,6 +70,7 @@ def _engine_config(prefix_caching: bool):
         data_parallel_size=DP,
         enable_expert_parallel=True,
         max_model_len=131072,
+        max_num_seqs=32,
         enable_prefix_caching=prefix_caching,
         gpu_memory_utilization=0.90,
     ).create_engine_config()

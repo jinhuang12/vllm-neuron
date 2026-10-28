@@ -179,7 +179,7 @@ def test_config_build_passes_quantization_check_and_plugin_gate():
     from vllm.platforms import current_platform
 
     vllm_config = EngineArgs(
-        model=str(CHECKPOINT), max_model_len=4096
+        model=str(CHECKPOINT), max_model_len=4096, max_num_seqs=32
     ).create_engine_config()
     assert vllm_config.model_config.quantization == "mxfp4"
     current_platform._validate_quantization_config(vllm_config)
