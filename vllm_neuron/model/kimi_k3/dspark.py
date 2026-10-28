@@ -327,6 +327,8 @@ class K3DSparkForCausalLM(nn.Module):
         self.head_weights = None
         self.register_buffer("context_kv_weight", None, persistent=False)
         self.register_buffer("rope_table", None, persistent=False)
+        # The unloaded tree's tensors by name, kept aside by load_weights_lite.
+        self._unloaded: dict[str, torch.Tensor] | None = None
 
     @classmethod
     def from_configs(
@@ -345,6 +347,7 @@ class K3DSparkForCausalLM(nn.Module):
         self, checkpoint_path: str, device: torch.device, cache_dir: str | None = None
     ) -> None:
         """Load this rank's slice of every draft weight, then build the load-time products."""
+        self._restore_unloaded()
         group = _tp_group()
         rank = group.rank_in_group if group is not None else 0
         checkpoint = SafetensorsCheckpoint(str(checkpoint_path), cache_dir)
@@ -361,6 +364,36 @@ class K3DSparkForCausalLM(nn.Module):
             )
         self.load_state_dict(result.state_dict, strict=False, assign=True)
         self.prepare_after_load()
+
+    def load_weights_lite(
+        self, checkpoint_path: str, device: torch.device, cache_dir: str | None
+    ) -> None:
+        """Lay out the draft's weights on the unloaded tree, for the device-free compile.
+
+        It reads nothing from the checkpoint: each layout takes its shape and dtype from the
+        meta parameters, so the tree holds the tensors a full load holds and the worker sizes
+        the same KV cache. The unloaded tensors stay aside for a later load.
+        """
+        self._unloaded = dict(self.named_parameters(remove_duplicate=False))
+        self._unloaded.update(self.named_buffers(remove_duplicate=False))
+        self.prepare_after_load()
+
+    def _restore_unloaded(self) -> None:
+        """Undo a lite load: drop the layouts it added and put back the tensors it kept."""
+        if self._unloaded is None:
+            return
+        kept, self._unloaded = self._unloaded, None
+
+        def assign(name: str, value: torch.Tensor | None) -> None:
+            path, _, leaf = name.rpartition(".")
+            setattr(self.get_submodule(path), leaf, value)
+
+        tensors = [*self.named_parameters(remove_duplicate=False),
+                   *self.named_buffers(remove_duplicate=False)]
+        for name in [name for name, _ in tensors if name not in kept]:
+            assign(name, None)
+        for name, tensor in kept.items():
+            assign(name, tensor)
 
     def prepare_after_load(self) -> None:
         """Build the fp32 context KV weight, the rotary table and each layer's layouts."""
