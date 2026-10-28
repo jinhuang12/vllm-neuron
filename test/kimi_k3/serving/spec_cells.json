@@ -28,6 +28,8 @@
         "/home/ubuntu/models/moonshotai/Kimi-K3",
         "--trust-remote-code",
         "--async-scheduling",
+        "--max-num-seqs",
+        "32",
         "--profiler-config",
         "{\"profiler\": \"cuda\", \"delay_iterations\": 0, \"max_iterations\": 5}"
       ],
@@ -75,6 +77,8 @@
         "/home/ubuntu/models/moonshotai/Kimi-K3",
         "--trust-remote-code",
         "--async-scheduling",
+        "--max-num-seqs",
+        "32",
         "--profiler-config",
         "{\"profiler\": \"cuda\", \"delay_iterations\": 0, \"max_iterations\": 5}"
       ],

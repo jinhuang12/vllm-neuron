@@ -29,6 +29,9 @@ from vllm_neuron.vllm.spec_decode.dflash import DFlashProposer
 
 logger = logging.getLogger(__name__)
 
+# The distributed argmax kernel takes at most this many verification rows.
+DSPARK_MAX_VERIFY_ROWS = 256
+
 
 class DSparkProposer(DFlashProposer):
     """DSpark proposer: the DFlash flow with an anchor-first block and in-order picks.
@@ -61,8 +64,7 @@ class DSparkProposer(DFlashProposer):
 
         max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
         num_verify_tokens = max_num_seqs * (self.num_speculative_tokens + 1)
-        # The distributed argmax kernel takes at most 256 verification rows.
-        if num_verify_tokens > 256:
+        if num_verify_tokens > DSPARK_MAX_VERIFY_ROWS:
             raise ValueError(
                 "DSpark supports at most 256 verification tokens; "
                 f"max_num_seqs={max_num_seqs} with "

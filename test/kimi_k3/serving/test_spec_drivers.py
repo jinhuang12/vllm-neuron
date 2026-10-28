@@ -49,6 +49,7 @@ def _form(d, max_len, buckets):
                             "--reasoning-parser", "kimi_k3", "--no-enable-prefix-caching",
                             "--served-model-name", "us.moonshotai.kimi-k3", CKPT,
                             "--trust-remote-code", "--async-scheduling",
+                            "--max-num-seqs", "32",
                             "--profiler-config", PROFILER],
             "neuron_profiler": {"activities": ["device_profile", "system_profile"],
                                 "neuron_cores": [0],

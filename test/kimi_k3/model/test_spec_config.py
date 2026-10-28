@@ -6,6 +6,7 @@ The build is the served one with no workers: TP 32 by DP 2, 4 draft tokens. Set
 directories; the defaults are under ``~/models``. Run with ``VLLM_NEURON_CPU_MODE=1``.
 """
 
+import json
 import multiprocessing
 import os
 from pathlib import Path
@@ -30,6 +31,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 TP, DP, NUM_DRAFT_TOKENS = 32, 2, 4
+CELLS = Path(__file__).resolve().parents[1] / "serving" / "spec_cells.json"
 
 
 def _build(**speculative):
@@ -105,3 +107,40 @@ def test_dspark_builds_in_fresh_process_with_one_wrap():
     child.join(timeout=60)
     assert child.exitcode == 0
     assert report == {"error": None, "method": "dspark", "marked": True, "depth": 1}
+
+
+def _flag_value(flags, name):
+    """The value after ``name`` in a flag list, or None."""
+    return flags[flags.index(name) + 1] if name in flags else None
+
+
+def _max_num_seqs(form):
+    """The form's per-replica sequence cap: its flag, else the API server's default."""
+    value = _flag_value(form["serve_flags"], "--max-num-seqs")
+    if value is not None:
+        return int(value)
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.usage.usage_lib import UsageContext
+
+    _, defaults = EngineArgs.get_batch_defaults(form["tensor_parallel_size"])
+    return defaults[UsageContext.OPENAI_API_SERVER]
+
+
+def test_registered_forms_fit_the_verification_row_limit():
+    """Each form's sequence cap fits the proposer's rows and every cell's share."""
+    from vllm_neuron.vllm.spec_decode.dspark import DSPARK_MAX_VERIFY_ROWS
+
+    doc = json.loads(CELLS.read_text())
+    too_many_rows, too_few_seqs = [], []
+    for name, form in doc["forms"].items():
+        seqs = _max_num_seqs(form)
+        speculative = _flag_value(form["speculative_flags"], "--speculative-config")
+        k = json.loads(speculative)["num_speculative_tokens"]
+        if seqs * (k + 1) > DSPARK_MAX_VERIFY_ROWS:
+            too_many_rows.append((name, seqs, k, seqs * (k + 1)))
+        for cell in doc["cells"]:
+            share = -(-cell["concurrency"] // form["data_parallel_size"])
+            if cell["form"] == name and share > seqs:
+                too_few_seqs.append((cell["name"], share, seqs))
+    assert too_many_rows == []
+    assert too_few_seqs == []
