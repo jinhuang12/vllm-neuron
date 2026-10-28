@@ -14,8 +14,10 @@ from typing import TYPE_CHECKING
 
 
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.request import Request, RequestStatus
 
 from vllm_neuron import envs
@@ -330,9 +332,11 @@ class NeuronScheduler(Scheduler):
             logger.warning(
                 "max_num_seqs (%d) exceeds worst-case KV cache capacity (%d "
                 "concurrent requests at max_model_len=%d, assuming no prefix "
-                "cache hits). Effective concurrency will be capped at %d to "
-                "prevent KV cache exhaustion and request preemption. To "
-                "increase concurrency, %s",
+                "cache hits). Admission reserves each request's own worst "
+                "case, its prompt plus its output limit, so more than %d "
+                "shorter requests can run at once; a request whose blocks do "
+                "not fit waits and is never preempted. To increase "
+                "concurrency, %s",
                 self.max_num_seqs,
                 max_concurrent,
                 self.max_model_len,
@@ -651,10 +655,59 @@ class NeuronScheduler(Scheduler):
         return request.num_computed_tokens < request.num_prompt_tokens
 
     def _kv_in_use(self) -> int:
-        """Requests currently pinning KV blocks against the worst-case cap
-        (_max_kv_concurrent): those in the running batch plus any producers
-        parked in the send-lane awaiting their NIXL handoff."""
+        """Requests currently pinning KV blocks: those in the running batch
+        plus any producers parked in the send-lane awaiting their NIXL
+        handoff."""
         return len(self.running) + len(self._pending_kv_send)
+
+    def _kv_blocks_reserved(self, request: Request) -> int:
+        """Return the KV blocks a request takes at its own worst-case length."""
+        length = min(
+            request.num_prompt_tokens + request.max_tokens + self.num_lookahead_tokens,
+            self.max_model_len,
+        )
+        dcp_size = self.vllm_config.parallel_config.decode_context_parallel_size
+        blocks = 0
+        for group in self.kv_cache_config.kv_cache_groups:
+            spec = group.kv_cache_spec
+            if isinstance(spec, FullAttentionSpec):
+                # Each DCP rank holds its share of the tokens.
+                blocks += cdiv(cdiv(length, dcp_size), spec.block_size)
+            else:
+                blocks += cdiv(
+                    spec.max_memory_usage_bytes(self.vllm_config),
+                    spec.page_size_bytes,
+                )
+        return blocks
+
+    def _kv_blocks_held(self, hidden: list[Request] | None = None) -> int:
+        """Return the KV blocks reserved by the requests holding KV, with ``hidden``
+        running requests that schedule() has taken out of the batch."""
+        lane = (self.requests.get(req_id) for req_id in self._pending_kv_send)
+        holders = self.running + (hidden or []) + [r for r in lane if r is not None]
+        return sum(self._kv_blocks_reserved(req) for req in holders)
+
+    def _kv_fits(self, request: Request, hidden: list[Request] | None = None) -> bool:
+        """Return whether a request's worst case fits beside those holding KV."""
+        # The block pool keeps one block back as the null block.
+        return (
+            self._kv_blocks_reserved(request) + self._kv_blocks_held(hidden)
+            <= self.kv_cache_config.num_blocks - 1
+        )
+
+    def _first_grammar_waiter(self) -> Request:
+        """Return the policy-first structured-output grammar waiter."""
+        return next(
+            req
+            for req in self.skipped_waiting
+            if self._is_structured_output_grammar_waiter(req)
+        )
+
+    def _prefill_head(self) -> Request:
+        """Return the request the next prefill step starts with."""
+        if self.waiting:
+            return self.waiting.peek_request()
+        return self._first_grammar_waiter()
 
     def _is_dispatched_producer(self, request: Request) -> bool:
         """A do_remote_decode producer past its (final) prefill chunk and safe to
@@ -800,7 +853,7 @@ class NeuronScheduler(Scheduler):
         - Scheduler state
         - Decode batch capacity
         - Prefill batch capacity (max 1 prefill at a time)
-        - KV cache concurrency cap (worst-case max_model_len per request)
+        - KV cache blocks (each request's own worst case)
 
         Note: We don't check bucket fit here because chunked prefill allows
         long prompts to be processed in multiple iterations. Each chunk will
@@ -824,28 +877,30 @@ class NeuronScheduler(Scheduler):
         if len(self.waiting) >= self.max_prefills_per_batch:
             return False
 
-        # Prevent livelock: don't admit a new prefill if running requests
-        # already saturate KV cache capacity at worst-case (max_model_len).
+        # Prevent livelock: don't admit a new prefill unless its worst case
+        # fits beside the worst case of every request already holding KV.
         # This is conservative — it doesn't account for prefix cache sharing
         # — but guarantees no decode-decode preemption.
-        if self._kv_in_use() >= self._max_kv_concurrent:
+        if not self._kv_fits(request):
             if not self._kv_exhaustion_warned:
                 logger.warning(
-                    "Prefill deferred: %d requests already holding KV at the "
-                    "cache concurrency limit (%d, assuming max_model_len=%d "
-                    "per request). Waiting for decode requests to complete. "
-                    "To increase concurrency, %s",
+                    "Prefill deferred: the request needs %d KV blocks at its "
+                    "worst case, and %d requests holding KV reserve %d of %d "
+                    "blocks. Waiting for decode requests to complete. To "
+                    "increase concurrency, %s",
+                    self._kv_blocks_reserved(request),
                     self._kv_in_use(),
-                    self._max_kv_concurrent,
-                    self.max_model_len,
+                    self._kv_blocks_held(),
+                    self.kv_cache_config.num_blocks - 1,
                     _kv_capacity_guidance(),
                 )
                 self._kv_exhaustion_warned = True
             else:
                 logger.debug(
-                    "Prefill deferred: %d holding KV >= limit %d.",
-                    self._kv_in_use(),
-                    self._max_kv_concurrent,
+                    "Prefill deferred: %d blocks needed, %d of %d reserved.",
+                    self._kv_blocks_reserved(request),
+                    self._kv_blocks_held(),
+                    self.kv_cache_config.num_blocks - 1,
                 )
             return False
 
@@ -1124,7 +1179,7 @@ class NeuronScheduler(Scheduler):
             has_prefill_waiting
             and not self.at_capacity
             and not self.has_prefill_in_running
-            and self._kv_in_use() < self._max_kv_concurrent
+            and self._kv_fits(self._prefill_head())
         )
         running_holdback: list[Request] = []
         max_num_running_reqs_override: int | None = None
@@ -1227,7 +1282,7 @@ class NeuronScheduler(Scheduler):
                 and len(self.waiting) < self.max_prefills_per_batch
                 and not self.at_capacity
                 and not self.has_prefill_in_running
-                and len(self.running) < self._max_kv_concurrent
+                and self._kv_fits(self._first_grammar_waiter(), running_holdback)
             )
             kept_one = False
             deferred: list[Request] = []
