@@ -69,6 +69,8 @@ def _target_config(dcp: int):
         model=str(CHECKPOINT), tensor_parallel_size=32, data_parallel_size=2,
         decode_context_parallel_size=dcp, enable_expert_parallel=True,
         max_model_len=SERVED_LEN[dcp], enable_prefix_caching=False, gpu_memory_utilization=0.90,
+        # Sequence cap: the platform refuses more sequences than the KDA kernels take.
+        max_num_seqs=16,
         speculative_config={"method": "dspark", "model": str(DRAFT), "num_speculative_tokens": K},
     ).create_engine_config()
 

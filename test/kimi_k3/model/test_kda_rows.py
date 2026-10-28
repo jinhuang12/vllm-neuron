@@ -127,7 +127,9 @@ def _engine_config():
     text = {"num_hidden_layers": 4, "linear_attn_config": {**attn, "num_heads": 6, **kept}}
     spec = {"method": "ngram", "num_speculative_tokens": DRAFTS, "prompt_lookup_max": 4,
             "prompt_lookup_min": 2}
+    # Sequence cap: the platform refuses more sequences than the KDA kernels take.
     config = EngineArgs(model=str(CHECKPOINT), tensor_parallel_size=TP, max_model_len=4096,
+                        max_num_seqs=16,
                         enable_prefix_caching=False, hf_overrides={"text_config": text},
                         speculative_config=spec, gpu_memory_utilization=0.9).create_engine_config()
     current_platform.update_block_size_for_backend(config)
