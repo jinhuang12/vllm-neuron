@@ -5,7 +5,8 @@ The reference is the checkpoint's own projection modules, built at one TP32
 rank's slice from ``modeling_kimi_linear.py`` under ``KIMI_K3_MODEL_PATH``:
 KDA ``o_proj`` (3 heads, K 384, bf16), MLA ``q_a_proj`` with
 ``kv_a_proj_with_mqa`` (K 224, fp32), and the latent MoE
-``routed_expert_down_proj`` with the router logits (K 224, 8 rows, fp32).
+``routed_expert_down_proj`` with the router logits (K 224, fp32): 8 rows, and
+160 rows for two replicas' rows in one call, past the kernel's 128-row tile.
 
 The kernel runs on a Neuron device through the native compile backend, or on
 the host under ``VLLM_NEURON_CPU_MODE=1 NKI_SIMULATOR=1``.
@@ -34,7 +35,9 @@ SHAPES = {
     "k384_n7168_b4_bf16": ("kda_o_proj", 384, 128, 4, 4, torch.bfloat16),
     "k224_n4480_b8_fp32": ("latent_down_router", 224, 112, 8, 4, torch.float32),
     "k224_n2112_b4_fp32": ("mla_q_a_kv_a", 224, 112, 4, 4, torch.float32),
+    "k224_n4480_b160_fp32": ("latent_down_router", 224, 112, 160, 80, torch.float32),
 }
+TILED = "k224_n4480_b160_fp32"
 
 
 class _Unavailable(nn.Module):
@@ -166,16 +169,20 @@ def _kernel(attention, weight):
     return compiled(attention.to(device), weight.to(device)).cpu()
 
 
+def _operands(reference, shape, x):
+    """The kernel's attention [D, rows, N, 1] and weight [K, H] for token-major rows ``x``."""
+    name, K, D, _, _, dtype = SHAPES[shape]
+    weight = torch.cat([w.detach() for w in reference[name][0]], dim=0).t().to(dtype).contiguous()
+    attention = x.to(dtype).view(len(x), K // D, D).permute(2, 0, 1).unsqueeze(-1).contiguous()
+    return attention, weight
+
+
 def _project(reference, shape, x):
     """Kernel output and fp64 oracle for token-major rows ``x`` [rows, K]."""
-    name, K, D, rows, _, dtype = SHAPES[shape]
-    weights, module = reference[name]
-    weight = torch.cat([w.detach() for w in weights], dim=0).t().to(dtype).contiguous()
-    xq = x.to(dtype)
-    attention = xq.view(rows, K // D, D).permute(2, 0, 1).unsqueeze(-1).contiguous()
-    out = _kernel(attention, weight)
+    name, _, _, _, _, dtype = SHAPES[shape]
+    out = _kernel(*_operands(reference, shape, x))
     with torch.no_grad():
-        ref = module(xq.double())
+        ref = reference[name][1](x.to(dtype).double())
     return out, ref
 
 
@@ -191,11 +198,11 @@ def _assert_class_b(out, ref):
     assert float(cosine.min()) >= 0.9999, f"row cosine {float(cosine.min())}"
 
 
-def _rows(shape, live_rows):
-    """Pad live rows with the other replica's zero rows."""
+def _rows(shape, live_rows, replica=0):
+    """Place live rows at a replica's rows; the other replica's rows are zero."""
     _, K, _, rows, live, _ = SHAPES[shape]
     x = torch.zeros(rows, K, dtype=torch.float64)
-    x[:live] = live_rows
+    x[replica * live:(replica + 1) * live] = live_rows
     return x
 
 
@@ -258,3 +265,27 @@ def test_one_nan_row(reference, shape):
     assert bool(torch.isnan(out_nan[1]).all()), "the NaN row's output is not all NaN"
     assert torch.equal(out_nan[others], out_clean[others]), "a NaN row changed another row"
     assert int((out_nan[live:] != 0).sum()) == 0, "a zero row's output is not zero"
+
+
+def _second_replica_rows():
+    """160 rows whose live rows are the second replica's, so both 128-row tiles hold live rows."""
+    _, K, _, _, live, _ = SHAPES[TILED]
+    g = _generator(TILED, 6)
+    return _rows(TILED, torch.randn(live, K, generator=g, dtype=torch.float64), replica=1)
+
+
+def test_zero_rows_stay_zero(reference):
+    """Past one 128-row tile, the other replica's zero rows project to exactly zero."""
+    live = SHAPES[TILED][4]
+    out, _ = _project(reference, TILED, _second_replica_rows())
+    assert int((out[:live] != 0).sum()) == 0, "a zero row's output is not zero"
+
+
+def test_live_rows_match_rows_alone(reference):
+    """Past one 128-row tile, the live rows equal bit for bit the same rows projected alone."""
+    live = SHAPES[TILED][4]
+    x = _second_replica_rows()
+    out, _ = _project(reference, TILED, x)
+    attention, weight = _operands(reference, TILED, x[live:])
+    alone = _kernel(attention, weight)
+    assert torch.equal(out[live:], alone), "a live row differs from its row projected alone"

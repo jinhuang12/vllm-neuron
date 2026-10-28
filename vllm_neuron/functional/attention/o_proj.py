@@ -298,7 +298,8 @@ def o_proj_tkg(attention: Tensor, weight: Tensor) -> Tensor:
 
     Args:
         attention: [D, B, N, S], the kernel's decode layout with the head
-            dimension D on the partitions. D <= 128 and B * S <= 128.
+            dimension D on the partitions. D <= 128. B * S may pass 128: the
+            library kernel tiles the rows by 128.
         weight: [N * D, H] in the dtype of ``attention``. H is even, because
             the two logical cores each take half of the columns.
 
@@ -316,7 +317,10 @@ def o_proj_tkg(attention: Tensor, weight: Tensor) -> Tensor:
 
 
 def _validate_tkg_inputs(attention: Tensor, weight: Tensor) -> None:
-    """Reject inputs the TKG kernel does not take, before it is traced."""
+    """Reject inputs the TKG kernel does not take, before it is traced.
+
+    Any B * S passes, as the library kernel tiles the rows by 128.
+    """
     assert attention.dim() == 4 and weight.dim() == 2, (
         f"o_proj_tkg takes attention [D, B, N, S] and weight [N * D, H], got "
         f"{tuple(attention.shape)} and {tuple(weight.shape)}"
@@ -325,8 +329,9 @@ def _validate_tkg_inputs(attention: Tensor, weight: Tensor) -> None:
     assert weight.shape[0] == N * D, (
         f"weight rows {weight.shape[0]} must equal N * D = {N * D}"
     )
-    assert D <= P_MAX and B * S <= P_MAX, (
-        f"o_proj_tkg needs D <= {P_MAX} and B * S <= {P_MAX}, got D={D}, B * S={B * S}"
+    assert D <= P_MAX, (
+        f"o_proj_tkg needs D <= {P_MAX}, got D={D}; B * S={B * S} may pass {P_MAX}, "
+        f"as the library kernel tiles the rows by {P_MAX}"
     )
     assert weight.shape[1] % 2 == 0, f"H must be even, got {weight.shape[1]}"
     assert attention.dtype == weight.dtype, (
