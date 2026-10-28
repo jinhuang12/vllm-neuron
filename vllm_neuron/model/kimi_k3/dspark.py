@@ -196,6 +196,18 @@ def _owned_slots(positions, seqs, table, block_size: int, max_blocks: int, group
     return torch.where(positions // block_size % size == rank, slot, 0)
 
 
+def _page_view(cache: torch.Tensor) -> torch.Tensor:
+    """The int8 ``[blocks, page bytes]`` view of a ``[blocks, block_size, D]`` latent cache.
+
+    The compiled graph takes the typed cache alone, as two aliased inputs of different dtypes
+    do not trace; plain views, not ``as_strided``, keep the kernel's in-place write traceable.
+    """
+    if not (cache[0].is_contiguous() and cache.stride(0) == cache[0].numel()):
+        raise ValueError(f"the latent cache {tuple(cache.shape)} with strides {cache.stride()} "
+                         "does not fill each page of its buffer")
+    return cache.view(torch.int8).view(cache.shape[0], -1)
+
+
 class _ShardedWeight(_Weight):
     """A checkpoint module holding this rank's slice of its stored ``weight`` along ``dim``."""
 
@@ -561,8 +573,8 @@ class K3DSparkForCausalLM(nn.Module):
                                   block_size, group)
         out, _ = mla_paged_window_dcp(
             latent, None, attn.q_a_layernorm.weight, attn.kv_a_layernorm.weight, attn.w_qb_t,
-            attn.w_uk, attn.w_uv_t, attn.pages, attn.cache_layout[0], block_size, table, held,
-            meta["slot_mapping"], owner, self.config.rms_norm_eps, group,
+            attn.w_uk, attn.w_uv_t, _page_view(attn.kv_cache), attn.cache_layout[0], block_size,
+            table, held, meta["slot_mapping"], owner, self.config.rms_norm_eps, group,
             rope_table=self.rope_table, positions=positions,
         )
         weight = attn.output_weight
