@@ -194,6 +194,7 @@ def _dp_runner(rank: torch.Tensor, replica: int, model):
                                      data_parallel_rank=replica)
     return _runner(
         rank, model=model, max_model_len=CONTEXT, is_dflash_spec=False, is_eagle3_spec=False,
+        is_dspark_spec=False,
         _pure_consumer=False, _dp_identity_resolved=False, _per_graph_compiler_args=False,
         _async_reorder_kwargs=None, _tensor_replacer=None, _target_tensor_capture=None,
         _debug_logits_dir=None, input_batch=types.SimpleNamespace(num_reqs=0),
