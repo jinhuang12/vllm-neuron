@@ -165,6 +165,7 @@ def _rank0_create_store(host: str, port: int, world_size: int, timeout: timedelt
         port=actual_port,
         world_size=world_size,
         is_master=True,
+        timeout=timeout,
         master_listen_fd=fd,
         use_libuv=False,
     )
