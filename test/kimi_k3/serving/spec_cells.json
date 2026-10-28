@@ -29,7 +29,7 @@
         "--trust-remote-code",
         "--async-scheduling",
         "--max-num-seqs",
-        "32",
+        "16",
         "--profiler-config",
         "{\"profiler\": \"cuda\", \"delay_iterations\": 0, \"max_iterations\": 5}"
       ],
@@ -78,7 +78,7 @@
         "--trust-remote-code",
         "--async-scheduling",
         "--max-num-seqs",
-        "32",
+        "16",
         "--profiler-config",
         "{\"profiler\": \"cuda\", \"delay_iterations\": 0, \"max_iterations\": 5}"
       ],
