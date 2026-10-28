@@ -101,8 +101,8 @@ def _engine_config(model: Path, tp: int, dp: int, dcp: int, max_len: int, **kwar
     """An engine config after the platform's block-size step."""
     config = EngineArgs(
         model=str(model), tensor_parallel_size=tp, data_parallel_size=dp,
-        decode_context_parallel_size=dcp, max_model_len=max_len, enable_prefix_caching=False,
-        gpu_memory_utilization=0.90, **kwargs).create_engine_config()
+        decode_context_parallel_size=dcp, max_model_len=max_len, max_num_seqs=32,
+        enable_prefix_caching=False, gpu_memory_utilization=0.90, **kwargs).create_engine_config()
     current_platform.update_block_size_for_backend(config)
     return config
 
