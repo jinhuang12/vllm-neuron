@@ -133,8 +133,8 @@ def _engine_config(model_dir: Path, dcp: int):
     """The engine config at TP 2 and ``dcp``, after the platform's block-size step."""
     config = EngineArgs(
         model=str(model_dir), tensor_parallel_size=TP, decode_context_parallel_size=dcp,
-        max_model_len=MAX_LEN, enable_prefix_caching=False, gpu_memory_utilization=0.90,
-        skip_tokenizer_init=True).create_engine_config()
+        max_model_len=MAX_LEN, max_num_seqs=32, enable_prefix_caching=False,
+        gpu_memory_utilization=0.90, skip_tokenizer_init=True).create_engine_config()
     current_platform.update_block_size_for_backend(config)
     return config
 
