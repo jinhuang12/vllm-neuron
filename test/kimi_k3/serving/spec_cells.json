@@ -13,6 +13,8 @@
         16384,
         28672
       ],
+      "kv_segment_size": 1024,
+      "prefill_reserve_gib": 5.31,
       "serve_flags": [
         "--decode-context-parallel-size",
         "4",
@@ -30,8 +32,14 @@
         "--async-scheduling",
         "--max-num-seqs",
         "16",
+        "--max-num-batched-tokens",
+        "1024",
+        "--long-prefill-token-threshold",
+        "1024",
         "--profiler-config",
-        "{\"profiler\": \"cuda\", \"delay_iterations\": 0, \"max_iterations\": 5}"
+        "{\"profiler\": \"cuda\", \"delay_iterations\": 0, \"max_iterations\": 5}",
+        "--additional-config",
+        "{\"neuron_config\": {\"prefill_reserve_gib\": 5.31}}"
       ],
       "neuron_profiler": {
         "activities": [
@@ -62,6 +70,8 @@
         45056,
         77824
       ],
+      "kv_segment_size": 1024,
+      "prefill_reserve_gib": 5.43,
       "serve_flags": [
         "--decode-context-parallel-size",
         "16",
@@ -79,8 +89,14 @@
         "--async-scheduling",
         "--max-num-seqs",
         "16",
+        "--max-num-batched-tokens",
+        "1024",
+        "--long-prefill-token-threshold",
+        "1024",
         "--profiler-config",
-        "{\"profiler\": \"cuda\", \"delay_iterations\": 0, \"max_iterations\": 5}"
+        "{\"profiler\": \"cuda\", \"delay_iterations\": 0, \"max_iterations\": 5}",
+        "--additional-config",
+        "{\"neuron_config\": {\"prefill_reserve_gib\": 5.43}}"
       ],
       "neuron_profiler": {
         "activities": [
