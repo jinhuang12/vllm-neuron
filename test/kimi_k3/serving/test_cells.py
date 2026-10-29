@@ -13,21 +13,40 @@ import os
 import re
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 import pytest
+import torch
 from vllm.engine.arg_utils import AsyncEngineArgs
 from vllm.entrypoints.launchers.cli_args import make_arg_parser, validate_parsed_serve_args
+from vllm.model_executor.layers.mamba.mamba_utils import (
+    MambaStateDtypeCalculator,
+    MambaStateShapeCalculator,
+)
 from vllm.platforms import current_platform
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
+from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+from vllm.v1.core.kv_cache_utils import (
+    get_kv_cache_config_from_groups,
+    get_kv_cache_groups,
+    resolve_kv_cache_block_sizes,
+)
+from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.structured_output import StructuredOutputManager
 
+from vllm_neuron.model.kv_cache import KeyOnlyAttentionSpec
 from vllm_neuron.model.neuron_config import NeuronConfig
 from vllm_neuron.utils.bucket_utils import (
     get_default_kv_segment_size_buckets,
     validate_decode_context_length_buckets,
     validate_kv_segment_size_buckets,
 )
+from vllm_neuron.vllm.core.scheduler import NeuronScheduler
+from vllm_neuron.vllm.worker import neuron_model_runner
+from vllm_neuron.vllm.worker.neuron_model_runner import NeuronModelRunner
+from vllm_neuron.vllm.worker.neuron_worker import NeuronWorker
 
 SERVING = Path(__file__).resolve().parent
 CHECKPOINT = Path(
@@ -35,6 +54,10 @@ CHECKPOINT = Path(
 )
 CONTEXTS = (2048, 8192, 32768, 131072)
 USERS = (1, 8, 32)
+# Per served form: prefill chunk, prefill reserve (GiB), KV floor (GiB) and the decode context
+# buckets the cells use. Both forms compile the batch buckets the cells use.
+SERVED = {"dcp4": (1024, 5.31, 0.54, [2048, 8192]), "dcp16": (1024, 5.43, 0.54, [8192, 45056])}
+SERVED_BATCHES = [1, 4, 16, 32]
 
 
 def _cells():
@@ -178,6 +201,84 @@ def test_each_form_builds_a_valid_config(tmp_path, chunk):
         except Exception as error:
             errors[name] = f"{type(error).__name__}: {error}"
     assert sorted(doc["forms"]) == ["dcp16", "dcp32", "dcp4"] and errors == {}
+
+
+def _kv_cache_config(config):
+    """vLLM's KV cache config of 64 blocks over the form's layers: one latent group, three state."""
+    cache, text = config.cache_config, config.model_config.hf_text_config
+    kda = text.linear_attn_config
+    shapes = MambaStateShapeCalculator.kda_state_shape(
+        config.parallel_config.tensor_parallel_size, kda["num_heads"], kda["head_dim"],
+        conv_kernel_size=kda["short_conv_kernel_size"])
+    dtypes = MambaStateDtypeCalculator.kda_state_dtype(torch.bfloat16, cache.mamba_cache_dtype)
+    state = MambaSpec(block_size=cache.mamba_block_size, shapes=tuple(shapes),
+                      dtypes=tuple(dtypes), page_size_padded=cache.mamba_page_size_padded,
+                      mamba_cache_mode=cache.mamba_cache_mode)
+    latent = KeyOnlyAttentionSpec(block_size=cache.block_size, num_kv_heads=1,
+                                  head_size=text.kv_lora_rank + text.qk_rope_head_dim,
+                                  dtype=torch.bfloat16)
+    specs = {f"layers.{i}.self_attn": state if i + 1 in kda["kda_layers"] else latent
+             for i in range(text.num_hidden_layers)}
+    layouts = NeuronWorker.__new__(NeuronWorker).get_supported_kv_cache_layouts()
+    resolve_kv_cache_layout(config, [layouts], list(specs.values()))
+    groups = get_kv_cache_groups(config, specs)
+    slots = max(len(g.layer_names) for g in groups)
+    return get_kv_cache_config_from_groups(config, groups, 64 * slots * latent.page_size_bytes)
+
+
+def _served_reading(form, measurements):
+    """What the scheduler, the model runner and the worker select from the form's serve flags,
+    in one process with no workers."""
+    flags = [f.replace("{checkpoint}", str(CHECKPOINT)).replace("{measurements}", str(measurements))
+             for f in form["server_flags"]]
+    config = _engine_config(flags)
+    current_platform._validate_dcp_config(config)
+    kv_config = _kv_cache_config(config)
+    config.cache_config.num_gpu_blocks = kv_config.num_blocks
+    scheduler = NeuronScheduler(config, kv_config, StructuredOutputManager(config),
+                                block_size=resolve_kv_cache_block_sizes(kv_config, config)[0])
+    with pytest.MonkeyPatch.context() as patch:
+        tp_group = types.SimpleNamespace(rank_in_group=0, world_size=32)
+        patch.setattr(neuron_model_runner, "get_tp_group", lambda: tp_group)
+        runner = NeuronModelRunner(config, torch.device("cpu"))
+    worker = NeuronWorker.__new__(NeuronWorker)
+    worker.model_runner = runner
+    groups = kv_config.kv_cache_groups
+    state = sum(isinstance(g.kv_cache_spec, MambaSpec) for g in groups)
+    return {
+        "latent and state groups": (len(groups) - state, state),
+        "prefill buckets": scheduler.num_batched_tokens_buckets,
+        "kv segment buckets": runner.neuron_config.kv_segment_size_buckets,
+        "long-prefill threshold": config.scheduler_config.long_prefill_token_threshold,
+        "prefill reserve": runner.neuron_config.prefill_reserve_gib,
+        "kv floor": runner.neuron_config.min_kv_budget_gib,
+        "decode targets": worker._decode_compile_targets(),
+    }
+
+
+def test_served_forms_select_their_chunk_reserve_and_decode_programs(tmp_path):
+    """Item 4: DCP 4's and DCP 16's serve flags at their chunk C build a config in CPU mode
+    with no workers. The scheduler selects prefill buckets [C], the runner the KV segment
+    [C], the threshold is C, the reserve and floor are the form's, and the worker lists 12
+    decode targets, the cells' batch buckets by their context buckets: 0 differ."""
+    forms = _cells()["forms"]
+    differ = {}
+    for name, (chunk, reserve, floor, contexts) in SERVED.items():
+        want = {
+            "latent and state groups": (1, 3),
+            "prefill buckets": [chunk],
+            "kv segment buckets": [chunk],
+            "long-prefill threshold": chunk,
+            "prefill reserve": reserve,
+            "kv floor": floor,
+            "decode targets": [(b, s) for b in SERVED_BATCHES
+                               for s in contexts + [forms[name]["max_model_len"]]],
+        }
+        got = _served_reading(forms[name], tmp_path)
+        bad = {k: got[k] for k in want if got[k] != want[k]}
+        if bad:
+            differ[name] = bad
+    assert differ == {}
 
 
 def _runs(dst, cell, gap_ms, non_finite=None):
