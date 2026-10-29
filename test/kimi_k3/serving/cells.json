@@ -5,10 +5,10 @@
   "forms": {
     "dcp4": {
       "decode_context_parallel_size": 4,
-      "expert_replica_slots": 3,
+      "expert_replica_slots": 2,
       "max_model_len": 32768,
-      "decode_context_length_buckets": [2048, 8192, 16384, 28672],
-      "kv_segment_size": 8192,
+      "decode_context_length_buckets": [2048, 8192],
+      "kv_segment_size": 1024,
       "server_flags": [
         "--tensor-parallel-size", "32",
         "--data-parallel-size", "2",
@@ -17,22 +17,22 @@
         "--trust-remote-code",
         "--gpu-memory-utilization", "0.90",
         "--max-model-len", "32768",
-        "--max-num-batched-tokens", "8192",
+        "--max-num-batched-tokens", "1024",
         "--max-num-seqs", "32",
-        "--long-prefill-token-threshold", "8192",
+        "--long-prefill-token-threshold", "1024",
         "--reasoning-parser", "kimi_k3",
         "--no-enable-prefix-caching",
         "--served-model-name", "us.moonshotai.kimi-k3", "{checkpoint}",
         "--profiler-config", "{\"profiler\": \"cuda\", \"delay_iterations\": 0, \"max_iterations\": 5}",
-        "--additional-config", "{\"neuron_config\": {\"expert_replica_slots\": 3, \"decode_context_length_buckets\": [2048, 8192, 16384, 28672]}, \"neuron_profiler\": {\"activities\": [\"device_profile\", \"system_profile\"], \"neuron_cores\": [0], \"output_dir\": \"{measurements}/profiles/dcp4\", \"sys_trace_max_events_per_nc\": null}}"
+        "--additional-config", "{\"neuron_config\": {\"expert_replica_slots\": 2, \"decode_context_length_buckets\": [2048, 8192], \"num_seqs_buckets\": [1, 4, 16, 32], \"prefill_reserve_gib\": 5.31, \"min_kv_budget_gib\": 0.54}, \"neuron_profiler\": {\"activities\": [\"device_profile\", \"system_profile\"], \"neuron_cores\": [0], \"output_dir\": \"{measurements}/profiles/dcp4\", \"sys_trace_max_events_per_nc\": null}}"
       ]
     },
     "dcp16": {
       "decode_context_parallel_size": 16,
-      "expert_replica_slots": 3,
+      "expert_replica_slots": 2,
       "max_model_len": 131072,
-      "decode_context_length_buckets": [2048, 8192, 16384, 28672, 45056, 77824],
-      "kv_segment_size": 8192,
+      "decode_context_length_buckets": [8192, 45056],
+      "kv_segment_size": 1024,
       "server_flags": [
         "--tensor-parallel-size", "32",
         "--data-parallel-size", "2",
@@ -41,14 +41,14 @@
         "--trust-remote-code",
         "--gpu-memory-utilization", "0.90",
         "--max-model-len", "131072",
-        "--max-num-batched-tokens", "8192",
+        "--max-num-batched-tokens", "1024",
         "--max-num-seqs", "32",
-        "--long-prefill-token-threshold", "8192",
+        "--long-prefill-token-threshold", "1024",
         "--reasoning-parser", "kimi_k3",
         "--no-enable-prefix-caching",
         "--served-model-name", "us.moonshotai.kimi-k3", "{checkpoint}",
         "--profiler-config", "{\"profiler\": \"cuda\", \"delay_iterations\": 0, \"max_iterations\": 5}",
-        "--additional-config", "{\"neuron_config\": {\"expert_replica_slots\": 3, \"decode_context_length_buckets\": [2048, 8192, 16384, 28672, 45056, 77824]}, \"neuron_profiler\": {\"activities\": [\"device_profile\", \"system_profile\"], \"neuron_cores\": [0], \"output_dir\": \"{measurements}/profiles/dcp16\", \"sys_trace_max_events_per_nc\": null}}"
+        "--additional-config", "{\"neuron_config\": {\"expert_replica_slots\": 2, \"decode_context_length_buckets\": [8192, 45056], \"num_seqs_buckets\": [1, 4, 16, 32], \"prefill_reserve_gib\": 5.43, \"min_kv_budget_gib\": 0.54}, \"neuron_profiler\": {\"activities\": [\"device_profile\", \"system_profile\"], \"neuron_cores\": [0], \"output_dir\": \"{measurements}/profiles/dcp16\", \"sys_trace_max_events_per_nc\": null}}"
       ]
     },
     "dcp32": {

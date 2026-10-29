@@ -200,6 +200,12 @@ class NeuronConfig:
     # Kimi K3 MoE: replica slots per expert rank, 0 to 4. Slot j holds a second copy of
     # expert j of another rank, and decode runs each chosen expert on one of its homes.
     expert_replica_slots: int = 0
+    # HBM in GiB that the KV cache leaves free for program scratch and code. The default KV
+    # budget never exceeds logical-core HBM less the weights and this reserve.
+    prefill_reserve_gib: float = 0.0
+    # The smallest KV budget in GiB the worker starts with. None reads
+    # VLLM_NEURON_MIN_KV_BUDGET_GIB.
+    min_kv_budget_gib: float | None = None
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> "NeuronConfig":
@@ -287,6 +293,8 @@ class NeuronConfig:
                 "enable_decode_sequence_parallel", False
             ),
             expert_replica_slots=config_dict.get("expert_replica_slots", 0),
+            prefill_reserve_gib=config_dict.get("prefill_reserve_gib", 0.0),
+            min_kv_budget_gib=config_dict.get("min_kv_budget_gib"),
         )
 
     def __post_init__(self):
@@ -336,6 +344,19 @@ class NeuronConfig:
                 "expert_replica_slots must be an int from 0 to 4, "
                 f"got {self.expert_replica_slots}"
             )
+        gib_fields = {"prefill_reserve_gib": self.prefill_reserve_gib}
+        if self.min_kv_budget_gib is not None:
+            gib_fields["min_kv_budget_gib"] = self.min_kv_budget_gib
+        for name, value in gib_fields.items():
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+            ):
+                raise ValueError(
+                    f"{name} must be a finite number of GiB, at least 0, got {value}"
+                )
         if (
             not isinstance(self.max_jump_forward_tokens, int)
             or self.max_jump_forward_tokens < 0
