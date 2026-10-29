@@ -58,7 +58,7 @@ NEURON_DEFAULT_BLOCK = 32
 HBM_PER_RANK = 36 * 1024**3
 # Weight bytes per rank of the served TP 32 by EP 64 layout (parallelism planner),
 # without the load-time copies that the model adds as buffers.
-WEIGHT_BYTES_PER_RANK = 27_367_507_968
+WEIGHT_BYTES_PER_RANK = 26_789_456_700
 USERS_PER_REPLICA, CONTEXT = 32 // DP, 8192
 
 

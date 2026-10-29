@@ -1267,7 +1267,7 @@ class NeuronWorker(WorkerBase):
         budget_formula: str,
     ) -> None:
         """Fail early when the computed KV budget is below the configured minimum."""
-        min_kv_gib = envs.VLLM_NEURON_MIN_KV_BUDGET_GIB
+        min_kv_gib, min_kv_source = self._min_kv_budget()
         if min_kv_gib <= 0:
             return
 
@@ -1279,11 +1279,11 @@ class NeuronWorker(WorkerBase):
             raise RuntimeError(
                 "Computed KV cache budget is below minimum threshold. "
                 f"effective={available_bytes / (1024**3):.2f} GiB, "
-                f"minimum={min_kv_gib:.2f} GiB.\n"
+                f"minimum={min_kv_gib:.2f} GiB ({min_kv_source}).\n"
                 f"KV budget = {budget_formula}.\n"
                 "Increase --gpu-memory-utilization or "
                 "VLLM_NEURON_KV_GMU_BUDGET_CAP_FRACTION, or lower "
-                "VLLM_NEURON_MIN_KV_BUDGET_GIB."
+                f"{min_kv_source}."
             )
 
         max_headroom_gib = max(
@@ -1293,24 +1293,39 @@ class NeuronWorker(WorkerBase):
         raise RuntimeError(
             "Computed KV cache budget is below minimum threshold. "
             f"effective={available_bytes / (1024**3):.2f} GiB, "
-            f"minimum={min_kv_gib:.2f} GiB.\n"
+            f"minimum={min_kv_gib:.2f} GiB ({min_kv_source}).\n"
             f"KV budget = max({budget_formula}, 0).\n"
             f"Do not increase {self._active_headroom_env()}; increasing "
             "headroom makes the KV cache budget smaller.\n"
             f"Set {self._active_headroom_env()} to at most "
-            f"{max_headroom_gib:.2f}, or lower "
-            "VLLM_NEURON_MIN_KV_BUDGET_GIB."
+            f"{max_headroom_gib:.2f}, or lower {min_kv_source}."
         )
+
+    def _min_kv_budget(self) -> tuple[float, str]:
+        """Return the KV budget floor in GiB and the setting it came from."""
+        # A worker without a runner reads the environment.
+        runner = getattr(self, "model_runner", None)
+        floor = getattr(getattr(runner, "neuron_config", None), "min_kv_budget_gib", None)
+        if floor is not None:
+            return floor, "min_kv_budget_gib"
+        return envs.VLLM_NEURON_MIN_KV_BUDGET_GIB, "VLLM_NEURON_MIN_KV_BUDGET_GIB"
+
+    def _prefill_reserve_bytes(self) -> int:
+        """Return the runner's prefill reserve in bytes."""
+        return int(self.model_runner.neuron_config.prefill_reserve_gib * (1024**3))
 
     def _compute_kv_budget(
         self,
         total_hbm_bytes: int,
         model_weight_bytes: int,
+        reserve_bytes: int = 0,
     ) -> int:
         """Compute the Neuron HBM KV budget.
 
         Scale HBM to the logical-core share. Default sizing applies memory
-        utilization and the fractional cap. Explicit headroom selects reserve sizing.
+        utilization, the fractional cap and the prefill reserve: the budget never
+        exceeds the HBM less the weights and ``reserve_bytes``. Explicit headroom
+        selects reserve sizing.
 
         Both callers report the memory of a full HBM stack. At LNC 2 one logical
         core owns the stack. At LNC 1 two logical cores share it, so each must
@@ -1335,15 +1350,17 @@ class NeuronWorker(WorkerBase):
             user_budget = max(total_budget - model_weight_bytes, 0)
             cap_fraction = self._get_kv_cap_fraction()
             heuristic_cap = int(total_budget * cap_fraction)
-            available = max(min(user_budget, heuristic_cap), 0)
+            reserve_cap = total_hbm_bytes - model_weight_bytes - reserve_bytes
+            available = max(min(user_budget, heuristic_cap, reserve_cap), 0)
             logger.info(
                 "KV cache fractional budget: %.2f GiB logical-core HBM "
                 "with gpu_memory_utilization=%.2f, %.2f GiB model weights, "
-                "and cap_fraction=%.2f = %.2f GiB",
+                "cap_fraction=%.2f and %.2f GiB prefill reserve = %.2f GiB",
                 total_hbm_bytes / (1024**3),
                 self.cache_config.gpu_memory_utilization,
                 model_weight_bytes / (1024**3),
                 cap_fraction,
+                reserve_bytes / (1024**3),
                 available / (1024**3),
             )
             self._validate_min_kv_budget(
@@ -1354,7 +1371,8 @@ class NeuronWorker(WorkerBase):
                 budget_formula=(
                     "min(max(logical_core_hbm * gpu_memory_utilization "
                     "- model_weight_bytes, 0), "
-                    "logical_core_hbm * gpu_memory_utilization * cap_fraction)"
+                    "logical_core_hbm * gpu_memory_utilization * cap_fraction, "
+                    "logical_core_hbm - model_weight_bytes - prefill_reserve_bytes)"
                 ),
             )
             return available
@@ -1407,7 +1425,9 @@ class NeuronWorker(WorkerBase):
 
         total_hbm_bytes = int(get_total_available_memory() * 1024 * 1024 * 1024)
         model_weight_bytes = self._get_byte_used_from_model()
-        return self._compute_kv_budget(total_hbm_bytes, model_weight_bytes)
+        return self._compute_kv_budget(
+            total_hbm_bytes, model_weight_bytes, self._prefill_reserve_bytes()
+        )
 
     def _determine_available_memory_neuron(self) -> int:
         """
@@ -1425,7 +1445,9 @@ class NeuronWorker(WorkerBase):
         runtime_bytes_used, bytes_free = self._query_runtime_memory_stats()
         total_hbm_bytes = runtime_bytes_used + bytes_free
         model_weight_bytes = self._get_byte_used_from_model()
-        return self._compute_kv_budget(total_hbm_bytes, model_weight_bytes)
+        return self._compute_kv_budget(
+            total_hbm_bytes, model_weight_bytes, self._prefill_reserve_bytes()
+        )
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
