@@ -433,9 +433,13 @@ class K3DSparkForCausalLM(nn.Module):
         return all_reduce(x, reduceOp="sum", group=self.tp_device_group)
 
     def _rank_slice(self, x: torch.Tensor) -> torch.Tensor:
-        """This rank's share of the last dim of ``x``."""
+        """This rank's share of the last dim of ``x``, picked by the rank tensor."""
+        if self.tp_size == 1:
+            return x
         width = x.shape[-1] // self.tp_size
-        return x[..., self.tp_rank * width : (self.tp_rank + 1) * width]
+        rank = _tp_group().rank_in_group_tensor.reshape(1)
+        picked = x.reshape(-1, self.tp_size, width).index_select(1, rank)
+        return picked.reshape(*x.shape[:-1], width)
 
     def precompute_and_store_context_kv(
         self,
