@@ -244,6 +244,8 @@ def test_forms_build_their_prefill_chunk_and_reserve(tmp_path):
                      "prefill reserve": form["prefill_reserve_gib"]}
         bad = {k: got[k] for k in expected
                if got[k] != expected[k] or got[k] != form_says.get(k, got[k])}
-        if bad or flags.count("--additional-config") != 1:
-            differ[name] = {**bad, "additional-config flags": flags.count("--additional-config")}
+        if flags.count("--additional-config") != 1:
+            bad["additional-config flags"] = flags.count("--additional-config")
+        if bad:
+            differ[name] = bad
     assert sorted(doc["forms"]) == sorted(RESERVE_GIB) and differ == {}
