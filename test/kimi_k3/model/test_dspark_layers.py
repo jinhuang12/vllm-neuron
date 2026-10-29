@@ -77,11 +77,15 @@ def _rank(rank: int, port: int, inputs: dict, out: str) -> None:
     import torch.distributed as dist
 
     from vllm_neuron.model.kimi_k3 import dspark
-    from vllm_neuron.parallel.neuron_parallel_state import initialize_neuron_parallel_state
+    from vllm_neuron.parallel.neuron_parallel_state import (
+        initialize_neuron_parallel_state,
+        stamp_spmd_rank_tensors,
+    )
 
     torch.set_num_threads(1)
     dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=TP)
     initialize_neuron_parallel_state(tp_global_ranks=list(range(TP)), local_rank=rank)
+    stamp_spmd_rank_tensors("cpu")
     with torch.device("meta"):
         draft = dspark.K3DSparkForCausalLM.from_configs(
             config=_config(), start_layer_idx=93, max_positions=CONTEXT + ROWS
