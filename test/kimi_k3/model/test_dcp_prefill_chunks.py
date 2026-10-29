@@ -80,15 +80,19 @@ def _wide_config_dir(root: Path) -> Path:
 
 
 def _recording_prefill(reads: list):
-    """The prefill kernel's cache reads and writes: the prefix through the table, kept in
-    ``reads``, then each chunk row at its slot; the row is the kernel's first input."""
+    """The DCP prefill kernel's cache reads and writes: the prefix through the window table,
+    kept in ``reads``, then each chunk row at its slot of the rank's cache, a slot outside it
+    at the null block's first row; the row is the kernel's first input."""
     def run(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, pages, offset, block_size,
-            table, prefix, slots, eps):
-        rows = pages.view(torch.bfloat16).view(pages.shape[0], -1, LATENT)
-        first, ids = offset // (2 * LATENT), table.long().clamp(0, pages.shape[0] - 1)
-        reads.append(rows[ids, first : first + block_size].reshape(-1, LATENT)[: int(prefix)])
+            window, table, prefix, slots, eps):
+        rows = window.view(torch.bfloat16).view(window.shape[0], -1, LATENT)
+        ids = table.long().clamp(0, window.shape[0] - 1)
+        reads.append(rows[ids, :block_size].reshape(-1, LATENT)[: int(prefix)])
         s = slots.long()
-        rows[s // block_size, first + s % block_size] = qkv_a.bfloat16()
+        s = torch.where((s < 0) | (s >= pages.shape[0] * block_size), 0, s)
+        row = 2 * LATENT
+        target = s // block_size * (pages.shape[1] // row) + offset // row + s % block_size
+        pages.view(torch.bfloat16).view(-1, LATENT).index_copy_(0, target, qkv_a.bfloat16())
         return qkv_a.new_zeros(qkv_a.shape[0], 1), pages
     return run
 
@@ -136,7 +140,7 @@ def _wide_rank(rank: int, root: Path, model_dir: Path) -> None:
             if size == WIDE_CHUNK:
                 reads = []
                 with pytest.MonkeyPatch.context() as patch:
-                    patch.setattr(m, "mla_paged_prefill", _recording_prefill(reads))
+                    patch.setattr(m, "mla_paged_prefill_dcp", _recording_prefill(reads))
                     model.model.layers[3].self_attn._attend(rows[start : start + size], None,
                                                             meta[name])
                 want = rows[:start].bfloat16()

@@ -34,6 +34,7 @@ from vllm_neuron.functional.attention.mla_paged import (
     mla_paged_decode,
     mla_paged_decode_dcp,
     mla_paged_prefill,
+    mla_paged_prefill_dcp,
     prepare_mla_weights,
 )
 from vllm_neuron.functional.attention import o_proj as output_projection
@@ -668,9 +669,9 @@ class KimiK3MLA(nn.Module):
 
         One all-gather over the DCP group brings each rank's blocks of the sequence's table into
         a workspace, rank by rank, and the prefill kernel reads it through the table remapped
-        to sequence order, so no block is moved twice. The kernel writes the chunk's latent rows
-        into the workspace past the prefix, where its reads mask them. Each row then goes to its
-        slot of the cache: a real slot on its owner rank, the null block on the others.
+        to sequence order, so no block is moved twice. The kernel stores each of the chunk's
+        latent rows at its slot of this rank's cache: a real slot on its owner rank, the null
+        block on the others.
         """
         group, pages, start, block_size = self.dcp_group, *args[7:]
         _, dtype, (_, width) = self._cache_layout
@@ -685,17 +686,7 @@ class KimiK3MLA(nn.Module):
             return block % size * blocks + block // size
 
         order = place(torch.arange(size * blocks, device=table.device)).to(torch.int32)
-        tokens = torch.arange(slots.shape[0], device=slots.device)
-        pos = (prefix.long() + tokens).clamp(max=size * blocks * block_size - 1)
-        local = place(pos // block_size) * block_size + pos % block_size
-        out, _ = mla_paged_prefill(
-            *args[:7], workspace, 0, block_size, order, prefix, local, MLA_NORM_EPS
-        )
-        rows = workspace.view(dtype).view(-1, width).index_select(0, local)
-        s = slots.long()
-        s = torch.where((s < 0) | (s >= pages.shape[0] * block_size), 0, s)
-        target = s // block_size * (pages.shape[1] // row) + start // row + s % block_size
-        pages.view(dtype).view(-1, width).index_copy_(0, target, rows)
+        out, _ = mla_paged_prefill_dcp(*args, workspace, order, prefix, slots, MLA_NORM_EPS)
         return out
 
     def forward_prefill(self, mix, norm_weight, meta) -> torch.Tensor:
