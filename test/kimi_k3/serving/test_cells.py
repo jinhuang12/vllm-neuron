@@ -56,7 +56,7 @@ CONTEXTS = (2048, 8192, 32768, 131072)
 USERS = (1, 8, 32)
 # Per served form: prefill chunk, prefill reserve (GiB), KV floor (GiB) and the decode context
 # buckets the cells use. Both forms compile the batch buckets the cells use.
-SERVED = {"dcp4": (1024, 5.31, 0.54, [2048, 8192]), "dcp16": (1024, 5.42, 0.54, [8192, 45056])}
+SERVED = {"dcp4": (1024, 5.31, 0.54, [2048, 8192]), "dcp16": (1024, 5.43, 0.54, [8192, 45056])}
 SERVED_BATCHES = [1, 4, 16, 32]
 
 
