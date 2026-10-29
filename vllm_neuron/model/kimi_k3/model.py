@@ -455,11 +455,9 @@ class KimiK3KDA(nn.Module):
         # A fresh sequence's slot can hold an earlier owner's bytes, NaN included, so the
         # seed selects zeros instead of scaling by 0.
         carried = meta["cached_seq_len"].reshape(1, 1) > 0
-        # The slot's whole page row, read once; the conv rows and the state are its bytes.
-        page = self.pages[slot]
-        bank_rows = _typed_view(page, self._conv_layout)[0]
+        bank_rows = self.conv_state.index_select(0, slot)[0]
         history = torch.where(carried, bank_rows, torch.zeros_like(bank_rows))
-        bank_state = _typed_view(page, self._state_layout)[0]
+        bank_state = self.recurrent_state.index_select(0, slot)[0]
         seed = torch.where(carried.unsqueeze(-1), bank_state, torch.zeros_like(bank_state))
         # Padding tokens follow the real ones, and their slot is the null block's slot 0.
         valid = meta["slot_mapping"] > 0
