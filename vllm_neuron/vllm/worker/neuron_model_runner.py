@@ -1382,6 +1382,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         self._kv_cache_full_tensors: dict[str, torch.Tensor] = {}
         # Each state layer's cache as [num_blocks, page bytes], for zeroing a slot
         self._state_pages: dict[str, torch.Tensor] = {}
+        # Host zero rows per (dtype, row width), the source of the zeroing copies
+        self._state_zero_rows: dict[tuple[torch.dtype, int], torch.Tensor] = {}
 
         # Initialize vLLM Sampler for proper token sampling
         logprobs_mode = getattr(
@@ -3269,7 +3271,8 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         """Zero the state slot of each request that starts from its first token.
 
         A freed block keeps its last owner's bytes, and a 1-token prompt's only step is a
-        decode step, which reads its slot as the prior state.
+        decode step, which reads its slot as the prior state. Each run of consecutive slots is
+        one copy of host zeros into a contiguous row view, so only those rows move.
         """
         if not self._state_pages:
             return
@@ -3280,9 +3283,27 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                             if req.num_computed_tokens == 0 and req.block_ids[group_id]})
             if not slots:
                 continue
-            index = torch.tensor(slots, dtype=torch.long, device=self.device)
+            runs = [[slots[0], slots[0] + 1]]
+            for slot in slots[1:]:
+                if slot == runs[-1][1]:
+                    runs[-1][1] += 1
+                else:
+                    runs.append([slot, slot + 1])
+            longest = max(b - a for a, b in runs)
             for layer_name in group.layer_names:
-                self._state_pages[layer_name].index_fill_(0, index, 0)
+                pages = self._state_pages[layer_name]
+                zero = self._host_zero_rows(pages, longest)
+                for a, b in runs:
+                    pages[a:b].copy_(zero[: b - a])
+
+    def _host_zero_rows(self, pages: torch.Tensor, rows: int) -> torch.Tensor:
+        """Host zeros of the dtype and row width of ``pages``, at least ``rows`` rows, kept."""
+        key = (pages.dtype, pages.shape[1])
+        zero = self._state_zero_rows.get(key)
+        if zero is None or zero.shape[0] < rows:
+            zero = torch.zeros(rows, pages.shape[1], dtype=pages.dtype, device="cpu")
+            self._state_zero_rows[key] = zero
+        return zero
 
     def _block_table_device_tensor(self, group_id: int, buffer: Any) -> torch.Tensor:
         """Return the device block table of one KV-cache group.
@@ -11078,6 +11099,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
         self._state_pages = {}
+        self._state_zero_rows = {}
 
         # TODO do we need to initialize attn_backend?
 
