@@ -49,6 +49,7 @@ from vllm_neuron.nn.embedding import VocabDimShardedEmbedding
 from vllm_neuron.nn.sampler import Sampler
 from vllm_neuron.parallel.neuron_parallel_state import get_wide_ep_group
 from vllm_neuron.utils.compiler_args_ctx import with_hlo2tensorizer_option
+from vllm_neuron.utils.derived_weights import derive_on_host
 from vllm_neuron.utils.hardware_config import get_logical_nc_config
 from vllm_neuron.utils.neuron_utils import can_run_kernel
 from vllm_neuron.utils.weight_loader import set_weight_loader, sharding_weight_loader
@@ -256,7 +257,9 @@ def _stack(*modules) -> nn.Parameter:
 
     The fused projection reads this layout, so each original is freed once it is stacked.
     """
-    stacked = torch.cat([m.weight for m in modules]).t().contiguous()
+    stacked = derive_on_host(
+        lambda *weights: torch.cat(weights).t().contiguous(), *(m.weight for m in modules)
+    )
     for m in modules:
         m.weight = None
     return nn.Parameter(stacked, requires_grad=False)
@@ -430,10 +433,14 @@ class KimiK3KDA(nn.Module):
             self.input_weight = _stack(
                 self.q_proj, self.k_proj, self.v_proj, self.g_proj, self.f_a_proj, self.b_proj
             )
-        taps = [m.weight.squeeze(1) for m in (self.q_conv1d, self.k_conv1d, self.v_conv1d)]
-        self.conv_weight = torch.cat(taps).float()
-        self.forget_weight = self.f_b_proj.weight.t().contiguous()
-        self.output_weight = self.o_proj.weight.t().contiguous()
+        self.conv_weight = derive_on_host(
+            lambda *taps: torch.cat([w.squeeze(1) for w in taps]).float(),
+            self.q_conv1d.weight,
+            self.k_conv1d.weight,
+            self.v_conv1d.weight,
+        )
+        self.forget_weight = derive_on_host(lambda w: w.t().contiguous(), self.f_b_proj.weight)
+        self.output_weight = derive_on_host(lambda w: w.t().contiguous(), self.o_proj.weight)
 
     def _split_input(self, proj: torch.Tensor) -> tuple[torch.Tensor, ...]:
         """Split the fused projection into q, k, v, g, f_a and the beta logits."""
@@ -584,21 +591,25 @@ class KimiK3MLA(nn.Module):
         value rows by head, transposed, in fp32.
         """
         if self.input_weight is None:
-            latent = torch.cat([self.q_a_proj.weight, self.kv_a_proj_with_mqa.weight])
-            rows = latent.shape[1] // self.tp_size
-            k_rows = latent[:, self.tp_rank * rows : (self.tp_rank + 1) * rows]
-            self.latent_weight = k_rows.float().t().contiguous()
+            _, hidden = self.q_a_proj.weight.shape
+            rows = hidden // self.tp_size
+            first = self.tp_rank * rows
+            self.latent_weight = derive_on_host(
+                lambda *w: torch.cat(w)[:, first : first + rows].float().t().contiguous(),
+                self.q_a_proj.weight,
+                self.kv_a_proj_with_mqa.weight,
+            )
             self.input_weight = _stack(self.q_a_proj, self.kv_a_proj_with_mqa)
             self.gate_weight = _stack(self.g_proj)
         if self.w_uk is None:
-            w_qb_t, w_uk, self.w_uv_t = prepare_mla_weights(
-                self.q_b_proj.weight, self.kv_b_proj.weight
+            w_qb_t, w_uk, self.w_uv_t = derive_on_host(
+                prepare_mla_weights, self.q_b_proj.weight, self.kv_b_proj.weight
             )
             self.w_qb_t = nn.Parameter(w_qb_t, requires_grad=False)
             self.w_uk = nn.Parameter(w_uk, requires_grad=False)
             self.q_b_proj.weight = None
             self.kv_b_proj.weight = None
-        self.output_weight = self.o_proj.weight.t().contiguous()
+        self.output_weight = derive_on_host(lambda w: w.t().contiguous(), self.o_proj.weight)
 
     def _attend(self, latent, gate, meta):
         """Paged attention of the new tokens' ``q_a`` and ``kv_a`` rows; stores their latent rows.
@@ -745,7 +756,7 @@ class KimiK3MLP(nn.Module):
         """Stack gate and up as ``[H, 2I]``, and lay out ``down_proj`` as ``[I, H]``."""
         if self.gate_up_weight is None:
             self.gate_up_weight = _stack(self.gate_proj, self.up_proj)
-        self.down_weight = self.down_proj.weight.t().contiguous()
+        self.down_weight = derive_on_host(lambda w: w.t().contiguous(), self.down_proj.weight)
 
     def activation(self, mix, norm_weight) -> torch.Tensor:
         """RMSNorm of ``mix``, the gate and up projections, then SiTU-and-mul."""
@@ -872,15 +883,22 @@ class KimiK3MoE(nn.Module):
         contiguous ``[K / TP, H]`` and ``[I / TP, H]``.
         """
         if self.down_router_weight is None:
-            down_router = torch.cat([self.routed_expert_down_proj.weight, self.gate.weight])
-            self.down_router_weight = down_router.float().t().contiguous()
+            self.down_router_weight = derive_on_host(
+                lambda down, router: torch.cat([down, router]).float().t().contiguous(),
+                self.routed_expert_down_proj.weight,
+                self.gate.weight,
+            )
             self.routed_expert_down_proj.weight = None
             self.gate.weight = None
         self.shared_experts.prepare_after_load()
         tp_rank, tp_size = _tp_rank_and_size()
-        norm = self.routed_expert_norm.weight.float().chunk(tp_size)[tp_rank]
-        self.latent_norm_weight = norm.reshape(-1, 1).contiguous()
-        self.latent_up_weight = self.routed_expert_up_proj.weight.t().contiguous()
+        self.latent_norm_weight = derive_on_host(
+            lambda w: w.float().chunk(tp_size)[tp_rank].reshape(-1, 1).contiguous(),
+            self.routed_expert_norm.weight,
+        )
+        self.latent_up_weight = derive_on_host(
+            lambda w: w.t().contiguous(), self.routed_expert_up_proj.weight
+        )
         self.shared_down_weight = self.shared_experts.down_weight
 
     def _expert_base(self, tp_rank) -> torch.Tensor:
@@ -1089,10 +1107,14 @@ class KimiK3DecoderLayer(nn.Module):
 
     def prepare_after_load(self) -> None:
         """Compute both sites' fp32 score weights and the sublayers' stacked weights."""
-        self.attention_score_w = attn_res_score_weight(
-            self.self_attention_res_norm.weight, self.self_attention_res_proj.weight
+        self.attention_score_w = derive_on_host(
+            attn_res_score_weight,
+            self.self_attention_res_norm.weight,
+            self.self_attention_res_proj.weight,
         )
-        self.mlp_score_w = attn_res_score_weight(self.mlp_res_norm.weight, self.mlp_res_proj.weight)
+        self.mlp_score_w = derive_on_host(
+            attn_res_score_weight, self.mlp_res_norm.weight, self.mlp_res_proj.weight
+        )
         self.self_attn.prepare_after_load()
         self.feed_forward.prepare_after_load()
 
@@ -1217,8 +1239,10 @@ class KimiK3Model(nn.Module):
         """Compute every layer's load-time products and the output site's score weight."""
         for layer in self.layers:
             layer.prepare_after_load()
-        self.output_score_w = attn_res_score_weight(
-            self.output_attn_res_norm.weight, self.output_attn_res_proj.weight
+        self.output_score_w = derive_on_host(
+            attn_res_score_weight,
+            self.output_attn_res_norm.weight,
+            self.output_attn_res_proj.weight,
         )
 
     def embed(self, input_ids, rank=None) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1371,9 +1395,12 @@ class KimiK3ForConditionalGeneration(nn.Module):
         """
         self.model.prepare_after_load()
         if self.lm_head.weight is not None:
-            halves = self.lm_head.weight.chunk(2, dim=0)
+            halves = derive_on_host(
+                lambda w: tuple(h.t().contiguous() for h in w.chunk(2, dim=0)),
+                self.lm_head.weight,
+            )
             self.head_weights = nn.ParameterList(
-                [nn.Parameter(h.t().contiguous(), requires_grad=False) for h in halves]
+                [nn.Parameter(h, requires_grad=False) for h in halves]
             )
             self.lm_head.weight = None
 
