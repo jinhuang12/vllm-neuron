@@ -40,6 +40,7 @@ from vllm_neuron.functional.attention import o_proj as output_projection
 from vllm_neuron.functional.attention.o_proj import o_proj, o_proj_tkg
 from vllm_neuron.functional.kda.fused_decode import kda_fused_decode
 from vllm_neuron.functional.kda.output import kda_output_prefill
+from vllm_neuron.functional.kda.page_row_write import kda_page_row_write
 from vllm_neuron.functional.moe.fused_tail import moe_fused_tail
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.model.neuron_config import NeuronConfig
@@ -348,13 +349,7 @@ def _typed_view(pages: torch.Tensor, layout: tuple[int, torch.dtype, tuple]) -> 
     return pages[:, start : start + width].view(dtype).view(-1, *shape)
 
 
-def _with_parts(rows: torch.Tensor, parts) -> torch.Tensor:
-    """Page rows ``[n, page bytes]`` with each ``(layout, values)`` part's bytes in its place."""
-    for (start, dtype, shape), values in parts:
-        width = math.prod(shape) * dtype.itemsize
-        data = values.to(dtype).contiguous().view(torch.int8).reshape(rows.shape[0], width)
-        rows = torch.cat([rows[:, :start], data, rows[:, start + width :]], dim=1)
-    return rows
+from vllm_neuron.functional.kda.page_row_write import _with_parts as _with_parts
 
 
 def _int8_pages(cache: torch.Tensor) -> torch.Tensor:
@@ -486,13 +481,13 @@ class KimiK3KDA(nn.Module):
         return self.output_prefill(core, gate.float())
 
     def _store(self, slot: torch.Tensor, conv: torch.Tensor, state: torch.Tensor) -> None:
-        """Write a slot's conv rows and state back as its whole page row of the buffer.
+        """Write a slot's conv rows and state into its page row of the buffer, in place.
 
-        A compiled step then writes the page buffer itself. A write through the conv or
-        state view, a slice of every page, would rebuild the whole buffer.
+        The kernel writes each part at its place in the slot's page and no other byte, so
+        a compiled step builds no row and writes the page buffer itself. It returns the
+        buffer, which is not kept, as in ``forward_decode``.
         """
-        parts = ((self._conv_layout, conv), (self._state_layout, state))
-        self.pages.index_copy_(0, slot, _with_parts(self.pages.index_select(0, slot), parts))
+        kda_page_row_write(self.pages, slot, conv, state)
 
     def output_prefill(self, core: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         """Gated output norm and ``o_proj`` of fp32 ``[T, W]`` core and gate: ``[T, H]`` fp32."""
