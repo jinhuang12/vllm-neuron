@@ -34,6 +34,7 @@ from vllm_neuron.model.qwen3.dflash_model import (
     _paged_slots,
 )
 from vllm_neuron.utils.checkpoints import SafetensorsCheckpoint
+from vllm_neuron.utils.derived_weights import derive_on_host
 from vllm_neuron.utils.weight_loader import set_weight_loader, sharding_weight_loader
 
 from .config import _as_dict
@@ -246,11 +247,14 @@ class K3DSparkMLA(nn.Module):
 
     def prepare_after_load(self) -> None:
         """Lay out the weights the block pass reads, once; the loaded weights stay."""
-        latent = torch.cat([self.q_a_proj.weight, self.kv_a_proj_with_mqa.weight])
-        self.latent_weight = latent.float().t().contiguous()
-        self.output_weight = self.o_proj.weight.t().contiguous()
-        self.w_qb_t, self.w_uk, self.w_uv_t = prepare_mla_weights(
-            self.q_b_proj.weight, self.kv_b_proj.weight
+        self.latent_weight = derive_on_host(
+            lambda q_a, kv_a: torch.cat([q_a, kv_a]).float().t().contiguous(),
+            self.q_a_proj.weight,
+            self.kv_a_proj_with_mqa.weight,
+        )
+        self.output_weight = derive_on_host(lambda w: w.t().contiguous(), self.o_proj.weight)
+        self.w_qb_t, self.w_uk, self.w_uv_t = derive_on_host(
+            prepare_mla_weights, self.q_b_proj.weight, self.kv_b_proj.weight
         )
 
 
@@ -270,9 +274,12 @@ class K3DSparkMLP(nn.Module):
 
     def prepare_after_load(self) -> None:
         """Lay out the weights the block pass reads, once; the loaded weights stay."""
-        gate_up = torch.cat([self.gate_proj.weight, self.up_proj.weight])
-        self.gate_up_weight = gate_up.t().contiguous()
-        self.down_weight = self.down_proj.weight.t().contiguous()
+        self.gate_up_weight = derive_on_host(
+            lambda gate, up: torch.cat([gate, up]).t().contiguous(),
+            self.gate_proj.weight,
+            self.up_proj.weight,
+        )
+        self.down_weight = derive_on_host(lambda w: w.t().contiguous(), self.down_proj.weight)
 
 
 class K3DSparkDecoderLayer(nn.Module):
@@ -409,9 +416,10 @@ class K3DSparkForCausalLM(nn.Module):
 
     def prepare_after_load(self) -> None:
         """Build the fp32 context KV weight, the rotary table and each layer's layouts."""
-        self.context_kv_weight = torch.cat(
-            [layer.self_attn.kv_a_proj_with_mqa.weight for layer in self.layers]
-        ).float()
+        self.context_kv_weight = derive_on_host(
+            lambda *kv_a: torch.cat(kv_a).float(),
+            *(layer.self_attn.kv_a_proj_with_mqa.weight for layer in self.layers),
+        )
         table = yarn_rope_table(self.config, self.max_positions)
         self.rope_table = table.to(self.context_kv_weight.device)
         for layer in self.layers:
