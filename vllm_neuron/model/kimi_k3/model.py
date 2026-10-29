@@ -40,6 +40,7 @@ from vllm_neuron.functional.attention import o_proj as output_projection
 from vllm_neuron.functional.attention.o_proj import o_proj, o_proj_tkg
 from vllm_neuron.functional.kda.fused_decode import kda_fused_decode
 from vllm_neuron.functional.kda.output import kda_output_prefill
+from vllm_neuron.functional.kda.page_row_write import kda_page_row_write
 from vllm_neuron.functional.moe.fused_tail import moe_fused_tail
 from vllm_neuron.model.kv_cache import KVSpec, LayerSpec
 from vllm_neuron.model.neuron_config import NeuronConfig
@@ -460,9 +461,11 @@ class KimiK3KDA(nn.Module):
         # A fresh sequence's slot can hold an earlier owner's bytes, NaN included, so the
         # seed selects zeros instead of scaling by 0.
         carried = meta["cached_seq_len"].reshape(1, 1) > 0
-        bank_rows = self.conv_state.index_select(0, slot)[0]
+        # The slot's whole page row, read once; the conv rows and the state are its bytes.
+        page = self.pages[slot]
+        bank_rows = _typed_view(page, self._conv_layout)[0]
         history = torch.where(carried, bank_rows, torch.zeros_like(bank_rows))
-        bank_state = self.recurrent_state.index_select(0, slot)[0]
+        bank_state = _typed_view(page, self._state_layout)[0]
         seed = torch.where(carried.unsqueeze(-1), bank_state, torch.zeros_like(bank_state))
         # Padding tokens follow the real ones, and their slot is the null block's slot 0.
         valid = meta["slot_mapping"] > 0
@@ -486,13 +489,13 @@ class KimiK3KDA(nn.Module):
         return self.output_prefill(core, gate.float())
 
     def _store(self, slot: torch.Tensor, conv: torch.Tensor, state: torch.Tensor) -> None:
-        """Write a slot's conv rows and state back as its whole page row of the buffer.
+        """Write a slot's conv rows and state into its page row of the buffer, in place.
 
-        A compiled step then writes the page buffer itself. A write through the conv or
-        state view, a slice of every page, would rebuild the whole buffer.
+        The kernel writes each part at its place in the slot's page and no other byte, so
+        a compiled step builds no row and writes the page buffer itself. It returns the
+        buffer, which is not kept, as in ``forward_decode``.
         """
-        parts = ((self._conv_layout, conv), (self._state_layout, state))
-        self.pages.index_copy_(0, slot, _with_parts(self.pages.index_select(0, slot), parts))
+        kda_page_row_write(self.pages, slot, conv, state)
 
     def output_prefill(self, core: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         """Gated output norm and ``o_proj`` of fp32 ``[T, W]`` core and gate: ``[T, H]`` fp32."""
