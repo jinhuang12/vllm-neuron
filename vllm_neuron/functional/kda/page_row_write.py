@@ -10,6 +10,8 @@ Neuron device or the NKI simulator, the same bytes go in by an ``index_copy_`` o
 the slot's whole page.
 """
 
+import math
+
 import nki
 import nki.isa as nisa
 import nki.language as nl
@@ -30,6 +32,9 @@ from vllm_neuron.functional.kda.fused_decode import (
 )
 from vllm_neuron.utils.hardware_config import get_logical_nc_config
 from vllm_neuron.utils.neuron_utils import can_run_kernel
+
+# Each part's first byte in a page, its dtype and its shape per page.
+PARTS = ((0, torch.bfloat16, (ROWS, CONV_WIDTH)), (CONV_BYTES, torch.float32, (HEADS, DIM, DIM)))
 
 
 def kda_page_row_write(
@@ -87,6 +92,14 @@ def kda_page_row_write_kernel(pages, slot, conv, state):
 def _index_copy_write(pages, slot, conv, state):
     """The kernel's bytes by an ``index_copy_`` of the slot's whole page."""
     index = slot.reshape(1).long()
-    parts = [part.contiguous().view(torch.int8).reshape(1, -1) for part in (conv, state)]
-    tail = pages.index_select(0, index)[:, CONV_BYTES + STATE_BYTES:]
-    return pages.index_copy_(0, index, torch.cat([*parts, tail], dim=1))
+    rows = _with_parts(pages.index_select(0, index), zip(PARTS, (conv, state)))
+    return pages.index_copy_(0, index, rows)
+
+
+def _with_parts(rows: torch.Tensor, parts) -> torch.Tensor:
+    """Page rows ``[n, page bytes]`` with each ``(layout, values)`` part's bytes in its place."""
+    for (start, dtype, shape), values in parts:
+        width = math.prod(shape) * dtype.itemsize
+        data = values.to(dtype).contiguous().view(torch.int8).reshape(rows.shape[0], width)
+        rows = torch.cat([rows[:, :start], data, rows[:, start + width :]], dim=1)
+    return rows

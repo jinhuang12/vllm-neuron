@@ -349,13 +349,7 @@ def _typed_view(pages: torch.Tensor, layout: tuple[int, torch.dtype, tuple]) -> 
     return pages[:, start : start + width].view(dtype).view(-1, *shape)
 
 
-def _with_parts(rows: torch.Tensor, parts) -> torch.Tensor:
-    """Page rows ``[n, page bytes]`` with each ``(layout, values)`` part's bytes in its place."""
-    for (start, dtype, shape), values in parts:
-        width = math.prod(shape) * dtype.itemsize
-        data = values.to(dtype).contiguous().view(torch.int8).reshape(rows.shape[0], width)
-        rows = torch.cat([rows[:, :start], data, rows[:, start + width :]], dim=1)
-    return rows
+from vllm_neuron.functional.kda.page_row_write import _with_parts as _with_parts
 
 
 def _int8_pages(cache: torch.Tensor) -> torch.Tensor:
