@@ -14,6 +14,7 @@
         28672
       ],
       "kv_segment_size": 1024,
+      "prefill_reserve_gib": 5.31,
       "serve_flags": [
         "--decode-context-parallel-size",
         "4",
@@ -70,6 +71,7 @@
         77824
       ],
       "kv_segment_size": 1024,
+      "prefill_reserve_gib": 5.43,
       "serve_flags": [
         "--decode-context-parallel-size",
         "16",

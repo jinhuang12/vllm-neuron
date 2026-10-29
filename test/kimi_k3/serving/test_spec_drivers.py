@@ -46,6 +46,7 @@ def _form(d, max_len, buckets, reserve):
     return {"tensor_parallel_size": 32, "data_parallel_size": 2,
             "decode_context_parallel_size": d, "max_model_len": max_len,
             "decode_context_length_buckets": buckets, "kv_segment_size": CHUNK,
+            "prefill_reserve_gib": reserve,
             "serve_flags": ["--decode-context-parallel-size", str(d), "--max-model-len",
                             str(max_len), "--gpu-memory-utilization", "0.90",
                             "--reasoning-parser", "kimi_k3", "--no-enable-prefix-caching",
@@ -222,9 +223,11 @@ def test_agreement_scorer(tmp_path):
 
 
 def test_forms_build_their_prefill_chunk_and_reserve(tmp_path):
-    """Item 6: each form's flags, with its parallel sizes, build an engine config in CPU mode
-    with no workers. The scheduler selects prefill buckets [1024], the runner the KV segment
-    [1024], the long-prefill threshold is 1024 and the reserve is the form's: 0 differ."""
+    """Item 6: each form's flags, with its parallel sizes, hold one ``--additional-config`` and
+    build an engine config in CPU mode with no workers. The scheduler selects prefill buckets
+    [1024], the runner the KV segment [1024], the long-prefill threshold is 1024 and the
+    reserve is the form's, and the form's own ``kv_segment_size`` and ``prefill_reserve_gib``
+    agree with what the engine read: 0 differ."""
     import test_cells  # reads the served config the way the decode cells test does
 
     doc = json.loads((SERVING / "spec_cells.json").read_text())
@@ -237,7 +240,10 @@ def test_forms_build_their_prefill_chunk_and_reserve(tmp_path):
                  "--enable-expert-parallel", *form["serve_flags"], *form["speculative_flags"]]
         got = test_cells._served_reading({"server_flags": flags}, tmp_path)
         expected = {**want, "prefill reserve": RESERVE_GIB[name]}
-        bad = {k: got[k] for k in expected if got[k] != expected[k]}
-        if bad:
-            differ[name] = bad
+        form_says = {"kv segment buckets": [form["kv_segment_size"]],
+                     "prefill reserve": form["prefill_reserve_gib"]}
+        bad = {k: got[k] for k in expected
+               if got[k] != expected[k] or got[k] != form_says.get(k, got[k])}
+        if bad or flags.count("--additional-config") != 1:
+            differ[name] = {**bad, "additional-config flags": flags.count("--additional-config")}
     assert sorted(doc["forms"]) == sorted(RESERVE_GIB) and differ == {}
