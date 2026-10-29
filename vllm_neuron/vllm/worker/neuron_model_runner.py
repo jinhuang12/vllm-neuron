@@ -98,7 +98,7 @@ from vllm_neuron.vllm.sample.rejection_sampler import RejectionSampler
 from vllm_neuron.vllm.spec_decode.dflash import DFlashProposer
 from vllm_neuron.vllm.spec_decode.dspark import DSparkProposer
 from vllm_neuron.vllm.spec_decode.eagle import EagleProposer
-from vllm_neuron.vllm.platform import SO_DISABLED_MESSAGE
+from vllm_neuron.vllm.platform import SO_DISABLED_MESSAGE, NeuronPlatform
 from vllm_neuron.utils.bucket_utils import (
     SUPPORTED_KV_SEGMENT_SIZES,
     get_max_num_batched_tokens,
@@ -1002,11 +1002,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             else None
         )
 
-        dcp_stride = (
-            self._dcp_size * vllm_config.cache_config.block_size
-            if self._dcp_size > 1
-            else 1
-        )
+        dcp_stride = NeuronPlatform.dcp_prefill_stride(vllm_config)
         self.neuron_config.num_batched_tokens_buckets = (
             resolve_num_batched_tokens_buckets(
                 self.max_num_batched_tokens,
@@ -5660,14 +5656,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
             slot_mapping = blk_table.slot_mapping.gpu[:total_num_scheduled_tokens]
             group_dcp_size = self._group_dcp_size(kv_cache_group_id)
             if not is_decode and group_dcp_size > 1:
-                I = block_size
-                W = group_dcp_size
-                ownership_stride = W * I
-                if cached_seq_len % ownership_stride != 0:
+                stride = NeuronPlatform.dcp_prefill_stride(self.vllm_config, block_size)
+                if cached_seq_len % stride != 0:
                     raise ValueError(
-                        "DCP prefill requires cached_seq_len to be divisible by "
-                        "decode_context_parallel_size * block_size "
-                        f"({W} * {I} = {ownership_stride}); got {cached_seq_len}."
+                        "DCP prefill requires cached_seq_len to be divisible by the DCP "
+                        f"prefill stride ({stride}, at decode_context_parallel_size "
+                        f"{group_dcp_size} and block_size {block_size}); got "
+                        f"{cached_seq_len}."
                     )
             # Do not cache this tensor. ``cached_seq_len`` is the largest computed-token
             # count in the batch, and it increases on each decode step. A cache therefore

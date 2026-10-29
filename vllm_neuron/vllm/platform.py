@@ -265,6 +265,12 @@ class NeuronPlatform(Platform):
     _kda_decode_architectures: frozenset[str] = frozenset(
         {"KimiK3ForConditionalGeneration"}
     )
+    # Architectures whose DCP prefill runs every token of the chunk on every rank. Their
+    # prefill stride is the block size. The segmented prefill gives each rank its share of
+    # every round of DCP blocks, so for every other architecture it is DCP x block size.
+    _dcp_whole_chunk_prefill_architectures: frozenset[str] = frozenset(
+        {"KimiK3ForConditionalGeneration"}
+    )
     # The served architecture when it is in _text_only_architectures, else None.
     # Set in check_and_update_config.
     _text_only_architecture: str | None = None
@@ -1107,6 +1113,19 @@ class NeuronPlatform(Platform):
             )
 
     @classmethod
+    def dcp_prefill_stride(cls, vllm_config, block_size: int | None = None) -> int:
+        """The token multiple of DCP prefill buckets, thresholds and prefixes; 1 without DCP."""
+        dcp_size = vllm_config.parallel_config.decode_context_parallel_size
+        if dcp_size <= 1:
+            return 1
+        if block_size is None:
+            block_size = vllm_config.cache_config.block_size
+        whole_chunk = cls._dcp_whole_chunk_prefill_architectures
+        if vllm_config.model_config.architecture in whole_chunk:
+            return block_size
+        return dcp_size * block_size
+
+    @classmethod
     def _validate_dcp_config(cls, vllm_config) -> None:
         """Validate all constraints for decode_context_parallel_size > 1."""
         dcp_size = vllm_config.parallel_config.decode_context_parallel_size
@@ -1126,15 +1145,12 @@ class NeuronPlatform(Platform):
         long_prefill_token_threshold = (
             vllm_config.scheduler_config.long_prefill_token_threshold
         )
-        ownership_stride = dcp_size * block_size
-        if (
-            long_prefill_token_threshold > 0
-            and long_prefill_token_threshold % ownership_stride != 0
-        ):
+        stride = cls.dcp_prefill_stride(vllm_config)
+        if long_prefill_token_threshold > 0 and long_prefill_token_threshold % stride != 0:
             raise ValueError(
-                "DCP requires long_prefill_token_threshold to be divisible by "
-                "decode_context_parallel_size * block_size "
-                f"({dcp_size} * {block_size} = {ownership_stride}); got "
+                "DCP requires long_prefill_token_threshold to be divisible by the "
+                f"DCP prefill stride ({stride}, at decode_context_parallel_size "
+                f"{dcp_size} and block_size {block_size}); got "
                 f"{long_prefill_token_threshold}."
             )
 
