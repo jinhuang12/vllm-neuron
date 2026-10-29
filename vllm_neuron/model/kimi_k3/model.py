@@ -335,7 +335,7 @@ def _page_layout(view: torch.Tensor, pages: torch.Tensor) -> tuple[int, torch.dt
     start = view.data_ptr() - pages.data_ptr()
     width = view[0].numel() * view.element_size()
     if not (
-        view.untyped_storage().data_ptr() == pages.untyped_storage().data_ptr()
+        view.untyped_storage()._cdata == pages.untyped_storage()._cdata
         and view.shape[0] == pages.shape[0]
         and view[0].is_contiguous()
         and view.stride(0) * view.element_size() == pages.stride(0)
@@ -1441,18 +1441,19 @@ class KimiK3ForConditionalGeneration(nn.Module):
         for name in names:
             if name not in kv_caches:
                 raise KeyError(f"KV cache for layer {name} not initialized")
+        # Key each buffer by its storage itself: on the meta device every data pointer is 0.
         shared: dict[int, torch.Tensor] = {}
         layers = list(zip(names, self.model.layers))
         for name, layer in layers:
             if layer.is_kda:
                 conv, state, pages = kv_caches[name]
-                pages = shared.setdefault(pages.untyped_storage().data_ptr(), pages)
+                pages = shared.setdefault(pages.untyped_storage()._cdata, pages)
                 layer.self_attn.bind_pages(pages, conv, state)
         for name, layer in layers:
             if not layer.is_kda:
                 # [blocks, 1, block_size, D]: one latent head.
                 cache = kv_caches[name][0].squeeze(1)
-                key = cache.untyped_storage().data_ptr()
+                key = cache.untyped_storage()._cdata
                 pages = shared.setdefault(key, _int8_pages(cache))
                 layer.self_attn.bind_pages(pages, cache)
 
