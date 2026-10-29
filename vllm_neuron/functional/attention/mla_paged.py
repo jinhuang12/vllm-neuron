@@ -37,6 +37,10 @@ rank with no key writes partial 0 and LSE -3.0e38 by select. The merge weighs ea
 by ``exp(LSE - group LSE)`` and returns each rank its own heads: an all-to-all of partials
 and LSEs at 4 to 15 ranks, otherwise an all-gather of the LSEs and a reduce-scatter of the
 weighted partials. The collectives run inside the kernel, on shared HBM.
+
+Prefill in DCP mode reads the cached prefix from a second buffer, the sequence's blocks
+gathered over the group, and stores each chunk row at its slot of the rank's own buffer, so
+the rank's buffer is the one it returns.
 """
 
 import nki
@@ -1154,26 +1158,14 @@ def _finite_values(lat):
     return val
 
 
-def mla_paged_prefill_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, pages,
-                             block_table, prefix_len, slots, EPS: float, LATENT_OFFSET: int,
-                             BLOCK_SIZE: int):
-    """One prefill chunk of one sequence: ``(out [T, H * 128] bf16, pages)``.
-
-    Args:
-        qkv_a: ``[T, 2112]`` fp32 rows of the chunk's tokens: ``q_a`` then ``kv_a``.
-        gate: ``[T, H * 128]`` bf16 output-gate projection, before its sigmoid.
-        q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, pages: as ``mla_paged_decode_kernel``.
-        block_table: ``[pages]`` int32 block ids of the sequence's cached prefix.
-        prefix_len: ``[1]`` int32 cached tokens before the chunk.
-        slots: ``[T]`` int32 slot of each chunk token; -1 for a padding token.
-        EPS, LATENT_OFFSET, BLOCK_SIZE: as ``mla_paged_decode_kernel``.
-
-    Returns:
-        The gated attention output and the page buffer with the chunk's rows.
-    """
+def _prefill_chunk(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, source, source_offset,
+                   pages, block_table, prefix_len, slots, EPS, LATENT_OFFSET, BLOCK_SIZE):
+    """One prefill chunk that reads its cached prefix from the page buffer ``source`` and stores
+    its latent rows at their slots of the page buffer ``pages``: ``(out, pages)``."""
     tokens = qkv_a.shape[0]
     heads = _check_common(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, slots)
-    cache, by_row, first_elem, first_row = _page_views(pages, LATENT_OFFSET, BLOCK_SIZE)
+    cache, _, first_elem, _ = _page_views(source, source_offset, BLOCK_SIZE)
+    _, by_row, _, first_row = _page_views(pages, LATENT_OFFSET, BLOCK_SIZE)
     blocks, block_size = pages.shape[0], BLOCK_SIZE
     page_rows = pages.shape[1] // _ROW_BYTES
     n_pages = block_table.shape[0]
@@ -1223,7 +1215,8 @@ def mla_paged_prefill_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t,
     nisa.memset(dst=zero, value=0.0)
     held, bound, invalid = _cache_keys(
         block_table.ap(pattern=[[n_pages, 1], [1, n_pages]], offset=0),
-        prefix_len.ap(pattern=[[0, _P], [1, 1]], offset=0), blocks, n_pages, window, positions)
+        prefix_len.ap(pattern=[[0, _P], [1, 1]], offset=0), source.shape[0], n_pages, window,
+        positions)
     tiles_per_block = _BLOCK // _P
 
     for grp in mine:
@@ -1271,9 +1264,53 @@ def mla_paged_prefill_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t,
     return out, pages
 
 
+def mla_paged_prefill_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, pages,
+                             block_table, prefix_len, slots, EPS: float, LATENT_OFFSET: int,
+                             BLOCK_SIZE: int):
+    """One prefill chunk of one sequence: ``(out [T, H * 128] bf16, pages)``.
+
+    Args:
+        qkv_a: ``[T, 2112]`` fp32 rows of the chunk's tokens: ``q_a`` then ``kv_a``.
+        gate: ``[T, H * 128]`` bf16 output-gate projection, before its sigmoid.
+        q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, pages: as ``mla_paged_decode_kernel``.
+        block_table: ``[pages]`` int32 block ids of the sequence's cached prefix.
+        prefix_len: ``[1]`` int32 cached tokens before the chunk.
+        slots: ``[T]`` int32 slot of each chunk token; -1 for a padding token.
+        EPS, LATENT_OFFSET, BLOCK_SIZE: as ``mla_paged_decode_kernel``.
+
+    Returns:
+        The gated attention output and the page buffer with the chunk's rows.
+    """
+    return _prefill_chunk(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, pages,
+                          LATENT_OFFSET, pages, block_table, prefix_len, slots, EPS,
+                          LATENT_OFFSET, BLOCK_SIZE)
+
+
+def mla_paged_prefill_dcp_kernel(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, pages,
+                                 window, window_table, prefix_len, slots, EPS: float,
+                                 LATENT_OFFSET: int, BLOCK_SIZE: int):
+    """One prefill chunk of one sequence on one rank of a DCP group: ``(out, pages)``.
+
+    Args:
+        pages: the rank's own page buffer, as ``mla_paged_decode_kernel``'s; the chunk's rows
+            go to their slots in it.
+        window: ``[window blocks, BLOCK_SIZE * 1152]`` int8, the sequence's latent blocks
+            gathered over the group, from byte 0 of each page; read only.
+        window_table: ``[window blocks]`` int32 window block of each block of the sequence.
+        slots: ``[T]`` int32 slot of each chunk token in ``pages``.
+        Others: as ``mla_paged_prefill_kernel``.
+
+    Returns:
+        The gated attention output and the rank's page buffer with the chunk's rows.
+    """
+    return _prefill_chunk(qkv_a, gate, q_norm, kv_norm, w_qb_t, w_uk, w_uv_t, window, 0, pages,
+                          window_table, prefix_len, slots, EPS, LATENT_OFFSET, BLOCK_SIZE)
+
+
 _DECODE = wrap_nki(mla_paged_decode_kernel)
 _DECODE_DCP = wrap_nki(mla_paged_decode_dcp_kernel)
 _PREFILL = wrap_nki(mla_paged_prefill_kernel)
+_PREFILL_DCP = wrap_nki(mla_paged_prefill_dcp_kernel)
 
 
 def prepare_mla_weights(q_b_weight: torch.Tensor, kv_b_weight: torch.Tensor):
@@ -1292,16 +1329,10 @@ def prepare_mla_weights(q_b_weight: torch.Tensor, kv_b_weight: torch.Tensor):
             kv[:, _NOPE:].transpose(1, 2).float().contiguous())
 
 
-def _check_inputs(qkv_a, gate, pages, latent_offset, block_size, slots, w_uk, w_uv_t):
-    heads = w_uk.shape[0]
-    if qkv_a.dim() != 2 or qkv_a.shape[1] != _QKV or qkv_a.dtype != torch.float32:
-        raise ValueError(f"qkv_a must be [T, {_QKV}] fp32, got {tuple(qkv_a.shape)} {qkv_a.dtype}")
-    if tuple(gate.shape) != (qkv_a.shape[0], heads * _V) or gate.dtype != torch.bfloat16:
-        raise ValueError(f"gate must be [T, {heads * _V}] bf16, "
-                         f"got {tuple(gate.shape)} {gate.dtype}")
+def _check_pages(pages, latent_offset, block_size, name="pages"):
     # The dispatch drops strides, so a strided view would reach the kernel as a copy.
     if pages.dim() != 2 or pages.dtype != torch.int8 or not pages.is_contiguous():
-        raise ValueError(f"pages must be the contiguous int8 [blocks, page bytes] page buffer, "
+        raise ValueError(f"{name} must be the contiguous int8 [blocks, page bytes] page buffer, "
                          f"got {tuple(pages.shape)} {pages.dtype} strides {pages.stride()}")
     if pages.shape[1] % _ROW_BYTES or latent_offset % _ROW_BYTES or latent_offset < 0:
         raise ValueError(f"page bytes {pages.shape[1]} and latent offset {latent_offset} must be "
@@ -1311,6 +1342,16 @@ def _check_inputs(qkv_a, gate, pages, latent_offset, block_size, slots, w_uk, w_
     if latent_offset + block_size * _ROW_BYTES > pages.shape[1]:
         raise ValueError(f"a {block_size}-row latent block from byte {latent_offset} does not fit "
                          f"a {pages.shape[1]}-byte page")
+
+
+def _check_inputs(qkv_a, gate, pages, latent_offset, block_size, slots, w_uk, w_uv_t):
+    heads = w_uk.shape[0]
+    if qkv_a.dim() != 2 or qkv_a.shape[1] != _QKV or qkv_a.dtype != torch.float32:
+        raise ValueError(f"qkv_a must be [T, {_QKV}] fp32, got {tuple(qkv_a.shape)} {qkv_a.dtype}")
+    if tuple(gate.shape) != (qkv_a.shape[0], heads * _V) or gate.dtype != torch.bfloat16:
+        raise ValueError(f"gate must be [T, {heads * _V}] bf16, "
+                         f"got {tuple(gate.shape)} {gate.dtype}")
+    _check_pages(pages, latent_offset, block_size)
     if slots.dim() != 1 or slots.shape[0] != qkv_a.shape[0]:
         raise ValueError(f"slots must be [T], got {tuple(slots.shape)}")
     if w_uv_t.dtype != torch.float32:
@@ -1389,6 +1430,82 @@ def mla_paged_prefill(qkv_a: torch.Tensor, gate: torch.Tensor, q_norm_weight: to
         qkv_a=qkv_a.contiguous(), gate=gate.contiguous(), q_norm=q_norm_weight.contiguous(),
         kv_norm=kv_norm_weight.contiguous(), w_qb_t=w_qb_t, w_uk=w_uk, w_uv_t=w_uv_t,
         pages=pages, block_table=block_table.to(torch.int32).contiguous(),
+        prefix_len=prefix_len.to(torch.int32).reshape(1).contiguous(),
+        slots=slots.to(torch.int32).contiguous(), EPS=float(eps),
+        LATENT_OFFSET=int(latent_offset), BLOCK_SIZE=int(block_size))
+
+
+def _torch_prefill_dcp(qkv_a, gate, q_norm_weight, kv_norm_weight, w_qb_t, w_uk, w_uv_t, pages,
+                       latent_offset, block_size, window, window_table, prefix_len, slots, eps):
+    """The DCP prefill chunk in torch, for the CPU venue where the kernel does not run."""
+    tokens, heads = qkv_a.shape[0], w_uk.shape[0]
+    x = qkv_a.float()
+
+    def norm(v, weight):
+        return v * torch.rsqrt(v.square().mean(-1, keepdim=True) + eps) * weight.float()
+
+    q = (norm(x[:, :_Q_LORA], q_norm_weight) @ w_qb_t.float()).view(tokens, heads, -1)
+    q_lift = torch.cat((torch.einsum("thn,hnl->thl", q[..., :_NOPE], w_uk.float()),
+                        q[..., _NOPE:]), dim=-1).bfloat16()
+    lat = torch.cat((norm(x[:, _Q_LORA:_Q_LORA + _KV_LORA], kv_norm_weight),
+                     x[:, _Q_LORA + _KV_LORA:]), dim=-1).bfloat16()
+    prefix = int(prefix_len)
+    ids = window_table.long().clamp(0, window.shape[0] - 1)
+    cached = window.view(torch.bfloat16).view(window.shape[0], -1, _LATENT)[ids, :block_size]
+    keys = torch.cat((cached.reshape(-1, _LATENT)[:prefix], lat)).float()
+    scores = torch.einsum("thl,kl->thk", q_lift.float(), keys) * (_NOPE + _ROPE) ** -0.5
+    seen = torch.arange(keys.shape[0]) <= prefix + torch.arange(tokens).unsqueeze(1)
+    weights = scores.masked_fill(~seen.unsqueeze(1), float("-inf")).softmax(-1)
+    o = torch.einsum("thk,kl->thl", weights, keys[:, :_KV_LORA])
+    out = torch.einsum("thl,hlv->thv", o, w_uv_t.float())
+    out = out * torch.sigmoid(gate.float()).view(tokens, heads, _V)
+    s = slots.long()
+    s = torch.where((s < 0) | (s >= pages.shape[0] * block_size), 0, s)
+    first = latent_offset // _ROW_BYTES
+    target = s // block_size * (pages.shape[1] // _ROW_BYTES) + first + s % block_size
+    pages.view(torch.bfloat16).view(-1, _LATENT)[target] = lat
+    return out.reshape(tokens, -1).bfloat16(), pages
+
+
+def mla_paged_prefill_dcp(qkv_a: torch.Tensor, gate: torch.Tensor, q_norm_weight: torch.Tensor,
+                          kv_norm_weight: torch.Tensor, w_qb_t: torch.Tensor, w_uk: torch.Tensor,
+                          w_uv_t: torch.Tensor, pages: torch.Tensor, latent_offset: int,
+                          block_size: int, window: torch.Tensor, window_table: torch.Tensor,
+                          prefix_len: torch.Tensor, slots: torch.Tensor, eps: float):
+    """Paged MLA prefill chunk on one rank of a DCP group: ``(out [T, H * 128] bf16, pages)``.
+
+    The chunk attends its cached prefix in ``window`` and its own rows, as
+    :func:`mla_paged_prefill`, and stores each of its latent rows at its slot of ``pages``.
+
+    Args:
+        qkv_a, gate, q_norm_weight, kv_norm_weight, w_qb_t, w_uk, w_uv_t, pages, latent_offset,
+            block_size, eps: as :func:`mla_paged_prefill`; ``pages`` is the rank's own buffer.
+        window: ``[blocks, block_size * 1152]`` contiguous int8, the sequence's latent blocks
+            gathered over the group, rank by rank; read only.
+        window_table: ``[blocks]`` int32 window block of each block of the sequence.
+        prefix_len: ``[1]`` int32 tokens cached before the chunk.
+        slots: ``[T]`` slot of each chunk token in ``pages``: its own slot on the rank that
+            holds it, the null block on the others, -1 for a padding token.
+
+    Returns:
+        The output for ``o_proj`` and the rank's page buffer with the chunk's latent rows.
+
+    Raises:
+        ValueError: an input outside the kernel's contract.
+    """
+    _check_inputs(qkv_a, gate, pages, latent_offset, block_size, slots, w_uk, w_uv_t)
+    _check_pages(window, 0, block_size, "window")
+    if window_table.dim() != 1 or prefix_len.numel() != 1:
+        raise ValueError(f"window_table must be [blocks] and prefix_len [1], got "
+                         f"{tuple(window_table.shape)} and {tuple(prefix_len.shape)}")
+    if not can_run_kernel(qkv_a):
+        return _torch_prefill_dcp(qkv_a, gate, q_norm_weight, kv_norm_weight, w_qb_t, w_uk,
+                                  w_uv_t, pages, latent_offset, block_size, window, window_table,
+                                  prefix_len, slots, eps)
+    return _PREFILL_DCP[get_logical_nc_config()](
+        qkv_a=qkv_a.contiguous(), gate=gate.contiguous(), q_norm=q_norm_weight.contiguous(),
+        kv_norm=kv_norm_weight.contiguous(), w_qb_t=w_qb_t, w_uk=w_uk, w_uv_t=w_uv_t,
+        pages=pages, window=window, window_table=window_table.to(torch.int32).contiguous(),
         prefix_len=prefix_len.to(torch.int32).reshape(1).contiguous(),
         slots=slots.to(torch.int32).contiguous(), EPS=float(eps),
         LATENT_OFFSET=int(latent_offset), BLOCK_SIZE=int(block_size))
