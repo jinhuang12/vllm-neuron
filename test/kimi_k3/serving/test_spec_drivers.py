@@ -28,6 +28,8 @@ CKPT = "/home/ubuntu/models/moonshotai/Kimi-K3"
 DRAFT_CONFIG = ('{"method": "dspark", "model": "/home/ubuntu/models/Inferact/Kimi-K3-DSpark-Block5", '
                 '"num_speculative_tokens": 4, "draft_sample_method": "greedy"}')
 PROFILER = '{"profiler": "cuda", "delay_iterations": 0, "max_iterations": 5}'
+CHUNK = 1024
+RESERVE_GIB = {"DCP 4": 5.31, "DCP 16": 5.43}
 
 
 def _run(script, *args):
@@ -40,17 +42,21 @@ def _jsonl(path):
             if line.strip()]
 
 
-def _form(d, max_len, buckets):
+def _form(d, max_len, buckets, reserve):
     return {"tensor_parallel_size": 32, "data_parallel_size": 2,
             "decode_context_parallel_size": d, "max_model_len": max_len,
-            "decode_context_length_buckets": buckets,
+            "decode_context_length_buckets": buckets, "kv_segment_size": CHUNK,
             "serve_flags": ["--decode-context-parallel-size", str(d), "--max-model-len",
                             str(max_len), "--gpu-memory-utilization", "0.90",
                             "--reasoning-parser", "kimi_k3", "--no-enable-prefix-caching",
                             "--served-model-name", "us.moonshotai.kimi-k3", CKPT,
                             "--trust-remote-code", "--async-scheduling",
                             "--max-num-seqs", "16",
-                            "--profiler-config", PROFILER],
+                            "--max-num-batched-tokens", str(CHUNK),
+                            "--long-prefill-token-threshold", str(CHUNK),
+                            "--profiler-config", PROFILER,
+                            "--additional-config",
+                            json.dumps({"neuron_config": {"prefill_reserve_gib": reserve}})],
             "neuron_profiler": {"activities": ["device_profile", "system_profile"],
                                 "neuron_cores": [0],
                                 "output_dir": f"<measurements folder>/profiles/dcp{d}",
@@ -59,8 +65,9 @@ def _form(d, max_len, buckets):
 
 
 def test_cells_and_gates():
-    """Item 1: 3 cells with their gates, forms, lengths, temperature 0 and serve flags; each
-    cell's input + output + 2(k + 1) fits the 8,192 bucket."""
+    """Item 1: 3 cells with their gates, forms, lengths, temperature 0 and serve flags, the
+    prefill chunk, KV segment and prefill reserve among them; each cell's input + output +
+    2(k + 1) fits the 8,192 bucket."""
     doc = json.loads((SERVING / "spec_cells.json").read_text())
     faster = {"metric": "tpot", "rule": "comparator_over_candidate_at_least", "value": 1.3}
     accepted = {"metric": "accepted_tokens_per_step", "rule": "at_least", "value": 2.3}
@@ -71,8 +78,9 @@ def test_cells_and_gates():
     cells = [{"name": n, "context": 8192, "concurrency": c, "num_prompts": p, "form": f,
               "slots": s, "comparator_slots": cs, "k": 4, "input_len": 8048, "output_len": 128,
               "temperature": 0, "gates": g} for n, c, p, f, s, cs, g in expected]
-    forms = {"DCP 4": _form(4, 32768, [2048, 8192, 16384, 28672]),
-             "DCP 16": _form(16, 131072, [2048, 8192, 16384, 28672, 45056, 77824])}
+    forms = {"DCP 4": _form(4, 32768, [2048, 8192, 16384, 28672], RESERVE_GIB["DCP 4"]),
+             "DCP 16": _form(16, 131072, [2048, 8192, 16384, 28672, 45056, 77824],
+                             RESERVE_GIB["DCP 16"])}
     assert [c for c, e in zip(doc["cells"], cells) if c != e] == [] and len(doc["cells"]) == 3
     assert [name for name in forms if doc["forms"].get(name) != forms[name]] == []
     assert sorted(doc["forms"]) == sorted(forms)
@@ -211,3 +219,25 @@ def test_agreement_scorer(tmp_path):
     r = _run("agreement.py", seed0, shuffled)
     assert r.returncode == 2, r.stdout
     assert "second log entry" in json.loads(r.stdout)["reason"]
+
+
+def test_forms_build_their_prefill_chunk_and_reserve(tmp_path):
+    """Item 6: each form's flags, with its parallel sizes, build an engine config in CPU mode
+    with no workers. The scheduler selects prefill buckets [1024], the runner the KV segment
+    [1024], the long-prefill threshold is 1024 and the reserve is the form's: 0 differ."""
+    import test_cells  # reads the served config the way the decode cells test does
+
+    doc = json.loads((SERVING / "spec_cells.json").read_text())
+    want = {"prefill buckets": [CHUNK], "kv segment buckets": [CHUNK],
+            "long-prefill threshold": CHUNK}
+    differ = {}
+    for name, form in doc["forms"].items():
+        flags = ["--tensor-parallel-size", str(form["tensor_parallel_size"]),
+                 "--data-parallel-size", str(form["data_parallel_size"]),
+                 "--enable-expert-parallel", *form["serve_flags"], *form["speculative_flags"]]
+        got = test_cells._served_reading({"server_flags": flags}, tmp_path)
+        expected = {**want, "prefill reserve": RESERVE_GIB[name]}
+        bad = {k: got[k] for k in expected if got[k] != expected[k]}
+        if bad:
+            differ[name] = bad
+    assert sorted(doc["forms"]) == sorted(RESERVE_GIB) and differ == {}
