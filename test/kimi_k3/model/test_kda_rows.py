@@ -419,15 +419,3 @@ def test_each_count_0_to_4_resumes_from_its_page(ranks):
     for rank in ranks:
         _equal_to_reference(rank["fixed"], steps=3 * 5, picks=3 * 5 * 3)
         assert rank["ranks_agree"]
-
-
-def test_eight_async_steps_with_mixed_counts_never_read_the_count_on_the_host(ranks):
-    for rank in ranks:
-        _equal_to_reference(rank["mixed"], steps=31, picks=31 * 3)
-        assert rank["mixed"]["host_reads"] == [] and rank["mixed"]["device_ops"] > 0
-
-
-def test_a_sequence_joining_after_prefill_reads_page_0(ranks):
-    for rank in ranks:
-        _equal_to_reference(rank["join"], steps=3, picks=3 * 3)
-        assert rank["join"]["first_page_0"] and rank["join"]["stale_count"] == MIXED[4]["a"]

@@ -3285,8 +3285,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         decode step, which reads its slot as the prior state. Each run of consecutive slots is
         one copy of host zeros into a contiguous row view, so only those rows move.
         Under speculation the slot's recorded draft count goes back to 0 as well, so that
-        step starts from this page.
+        step starts from this page. A pending count record applies first, so a page that a
+        finished request freed keeps the new request's 0.
         """
+        self._flush_state_resume()
         if not self._state_pages:
             return
         resume = getattr(self, "_state_resume_table", None)
@@ -3310,8 +3312,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 for a, b in runs:
                     pages[a:b].copy_(zero[: b - a])
             if resume is not None:
-                index = torch.tensor(slots, dtype=torch.long, device=self.device)
-                resume.index_fill_(0, index, 0)
+                resume[slots] = 0
 
     def _host_zero_rows(self, pages: torch.Tensor, rows: int) -> torch.Tensor:
         """Host zeros of the dtype and row width of ``pages``, at least ``rows`` rows, kept."""
@@ -10698,23 +10699,39 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
         starts from the page of the accepted count: the step's valid sampled ids less one,
         0 after a prefill. The ids come in one of three forms: a 1-D tensor with one id per
         request (a prefill), a 2-D tensor with one row of verify tokens per request, or a
-        list of each request's accepted ids. The count is computed and stored on the device,
-        so the asynchronous path never reads it on the host. Without state pages this does
-        nothing. The parameter order is the caller's, as upstream's.
+        list of each request's accepted ids. The record waits, and the host reads the ids at
+        the next flush, so the draft launch does not wait for the verify step. The record
+        before it applies first. Without state pages this does nothing. The parameter order
+        is the caller's, as upstream's.
         """
+        self._flush_state_resume()
         table = getattr(self, "_state_resume_table", None)
         num_reqs = self.input_batch.num_reqs
         if table is None or num_reqs == 0:
             return
-        if isinstance(sampled_token_ids, torch.Tensor):
-            ids = sampled_token_ids[:num_reqs]
+        if not isinstance(sampled_token_ids, torch.Tensor):
+            sampled_token_ids = [len(row) for row in sampled_token_ids[:num_reqs]]
+        self._state_resume_pending = (sampled_token_ids, num_reqs, self._state_page_keys(num_reqs))
+
+    def _flush_state_resume(self) -> None:
+        """Apply the pending count record to the host count table, and clear it.
+
+        A tensor of ids is read to the host whole, as the device refuses a host read of a
+        view, and sliced there. Every reader and writer of the table calls this first.
+        """
+        pending = getattr(self, "_state_resume_pending", None)
+        table = getattr(self, "_state_resume_table", None)
+        if pending is None or table is None:
+            return
+        self._state_resume_pending = None
+        sampled, num_reqs, keys = pending
+        if isinstance(sampled, torch.Tensor):
+            ids = sampled.cpu()[:num_reqs]
             valid = (ids != -1) & (ids < self.vocab_size)
             valid = valid.to(torch.int64) if ids.dim() == 1 else valid.sum(dim=1)
         else:
-            valid = torch.tensor([len(row) for row in sampled_token_ids[:num_reqs]])
-        counts = (valid - 1).clamp(min=0).to(device=table.device, dtype=torch.int32)
-        keys = torch.from_numpy(self._state_page_keys(num_reqs)).to(table.device)
-        table.index_copy_(0, keys, counts)
+            valid = torch.tensor(sampled, dtype=torch.int64)
+        table[torch.from_numpy(keys)] = (valid - 1).clamp(min=0).to(torch.int32)
 
     def _state_page_keys(self, num_rows: int) -> np.ndarray:
         """The first state page of each of the first ``num_rows`` batch rows: their count keys."""
@@ -10727,11 +10744,13 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
     def _state_resume_rows(self, padded_num_reqs: int) -> torch.Tensor:
         """Each batch row's resume row in its state pages, ``[padded_num_reqs]`` int32 on the device.
 
-        A gather of the recorded counts by the rows' first pages; a padding row reads the
-        null block's entry, and every page of a padding row is the null block. First checks
-        on the host that no request's state page is another request's or the null block: a
-        verify step reads each sequence's source page while the others write their pages.
+        A host gather of the recorded counts by the rows' first pages, placed as a new device
+        tensor; a padding row reads the null block's entry, and every page of a padding row
+        is the null block. First checks on the host that no request's state page is another
+        request's or the null block: a verify step reads each sequence's source page while
+        the others write their pages.
         """
+        self._flush_state_resume()
         num_reqs = self.input_batch.num_reqs
         width = 1 + self.speculative_config.num_speculative_tokens
         for group_id in range(len(self.kv_cache_config.kv_cache_groups)):
@@ -10746,7 +10765,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                 )
         keys = np.full(padded_num_reqs, NULL_BLOCK_ID, dtype=np.int64)
         keys[:num_reqs] = self._state_page_keys(num_reqs)
-        return self._state_resume_table.index_select(0, torch.from_numpy(keys).to(self.device))
+        return self._state_resume_table[torch.from_numpy(keys)].to(self.device)
 
     def _update_batch_state_with_samples(
         self,
@@ -11481,9 +11500,10 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
 
         # Under speculation a state group holds 1 + k pages per request: page j takes the
         # state after a verify window's token j, and the next step starts from the page of
-        # the accepted draft count. The counts live on the device, one per block, keyed by
-        # the request's first page of the first state group, so they outlast batch reorders.
+        # the accepted draft count. The counts live on the host, one per block, keyed by the
+        # request's first page of the first state group, so they outlast batch reorders.
         self._state_resume_table = None
+        self._state_resume_pending = None
         num_spec = self.speculative_config.num_speculative_tokens if self.speculative_config else 0
         state_groups = [i for i in range(len(block_sizes)) if self._is_state_group(i)]
         if num_spec and state_groups:
@@ -11493,9 +11513,7 @@ class NeuronModelRunner(KVConnectorModelRunnerMixin, NeuronECConnectorModelRunne
                     f"state groups {short} hold {[max_num_blocks_per_req[i] for i in short]} "
                     f"pages per request; a {num_spec}-draft verify step writes {1 + num_spec}"
                 )
-            self._state_resume_table = torch.zeros(
-                kv_cache_config.num_blocks, dtype=torch.int32, device=self.device
-            )
+            self._state_resume_table = torch.zeros(kv_cache_config.num_blocks, dtype=torch.int32)
 
         # This binds the cache tensors to the model
         self.model.bind_kv_cache(kv_caches)
