@@ -433,15 +433,13 @@ def test_long_context(tmp_path, groups, form):
 @pytest.mark.parametrize("value", ["nan", "inf"])
 @pytest.mark.parametrize("form", FORMS)
 def test_nonfinite_window_row(tmp_path, groups, form, value):
-    """A non-finite window row, row 2 of sequence 2 of 5: its sequence's queries 2 and later are
-    NaN on every rank, its latent row is non-finite on its owner, and every other query and
-    latent row equals the clean run's."""
+    """A non-finite window row: its sequence's queries from that row on are NaN on every rank,
+    its latent row is non-finite on its owner, and every other query and latent row equals the
+    clean run's. The first group's row is row 2 of sequence 2 of 5; each later group draws its
+    row from its own seed, in a sequence no earlier group took, so a value crossing groups shows."""
     form = FORMS[form]
-    ranks, lens, bad, j, q = 4, (900, 1200, 640, 33, 2000), 2, 2, form.q
-    later = torch.arange(bad * q + j, (bad + 1) * q)
-    kept = torch.tensor([t for t in range(len(lens) * q) if t not in later.tolist()],
-                        dtype=torch.long)
-    owner = ((lens[bad] + j) // BLOCK) % ranks
+    ranks, lens, q = 4, (900, 1200, 640, 33, 2000), form.q
+    taken = []
 
     def build(gen):
         rows = [torch.randn(n + q, QKV, generator=gen) for n in lens]
@@ -449,6 +447,16 @@ def test_nonfinite_window_row(tmp_path, groups, form, value):
         table = _table(rows, form)
         weights = _weights(gen, ranks)
         clean = _shard(rows, gate, weights, ranks, form, table, gen)
+        bad, j = 2, 2
+        if taken:
+            free = [s for s in range(len(lens)) if s not in taken]
+            bad = free[int(torch.randint(len(free), (1,), generator=gen))]
+            j = int(torch.randint(q, (1,), generator=gen))
+        taken.append(bad)
+        later = torch.arange(bad * q + j, (bad + 1) * q)
+        kept = torch.tensor([t for t in range(len(lens) * q) if t not in later.tolist()],
+                            dtype=torch.long)
+        owner = ((lens[bad] + j) // BLOCK) % ranks
         poisoned = []
         for call in clean:
             window, call_gate = call[0].clone(), call[1]
