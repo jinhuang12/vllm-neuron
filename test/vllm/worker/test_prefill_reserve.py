@@ -59,27 +59,27 @@ def _callers(worker) -> dict:
 
 
 def _form_reserves() -> dict:
-    """Each Kimi K3 form's prefill reserve, from its serve flags."""
+    """Each Kimi K3 form's prefill reserve and KV floor, from its serve flags."""
     reserves = {}
     for name, form in json.loads(CELLS.read_text(encoding="utf-8"))["forms"].items():
         flags = form["server_flags"]
         neuron = json.loads(flags[flags.index("--additional-config") + 1])["neuron_config"]
         if "prefill_reserve_gib" in neuron:
-            reserves[name] = neuron["prefill_reserve_gib"]
+            reserves[name] = (neuron["prefill_reserve_gib"], neuron.get("min_kv_budget_gib"))
     return reserves
 
 
 def test_reserve_caps_the_default_budget_on_both_paths(lnc2):
     """Item 1: at 36 GiB and 28 GiB of weights, a 5 GiB reserve gives 3.00 GiB where the rule
-    without it gives 4.40, and a 2 GiB reserve 4.40. At each form's device bytes and reserve
-    R, 2 slots: min(3.16, 6.76 - R) GiB. Both callers at every point: 0 differ."""
-    points = [(28 * GIB, 0.0, 4.40), (28 * GIB, 5.0, 3.00), (28 * GIB, 2.0, 4.40)]
+    without it gives 4.40, and a 2 GiB reserve 4.40. At each form's device bytes, reserve R
+    and KV floor, 2 slots: min(3.16, 6.76 - R) GiB. Both callers at every point: 0 differ."""
+    points = [(28 * GIB, 0.0, None, 4.40), (28 * GIB, 5.0, None, 3.00), (28 * GIB, 2.0, None, 4.40)]
     reserves = _form_reserves()
     assert sorted(reserves) == ["dcp16", "dcp4"]
-    points += [(FORM_DEVICE_BYTES, r, min(3.16, 6.76 - r)) for r in reserves.values()]
+    points += [(FORM_DEVICE_BYTES, r, floor, min(3.16, 6.76 - r)) for r, floor in reserves.values()]
     differ = []
-    for weights, reserve, want in points:
-        worker = _worker(lnc2, weights, prefill_reserve_gib=reserve)
+    for weights, reserve, floor, want in points:
+        worker = _worker(lnc2, weights, prefill_reserve_gib=reserve, min_kv_budget_gib=floor)
         got = {name: run() / GIB for name, run in _callers(worker).items()}
         if any(round(gib, 2) != round(want, 2) for gib in got.values()):
             differ.append((weights / GIB, reserve, want, got))
