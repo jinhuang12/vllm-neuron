@@ -24,7 +24,7 @@
         "--no-enable-prefix-caching",
         "--served-model-name", "us.moonshotai.kimi-k3", "{checkpoint}",
         "--profiler-config", "{\"profiler\": \"cuda\", \"delay_iterations\": 0, \"max_iterations\": 5}",
-        "--additional-config", "{\"neuron_config\": {\"expert_replica_slots\": 2, \"decode_context_length_buckets\": [2048, 8192], \"num_seqs_buckets\": [1, 4, 16, 32], \"prefill_reserve_gib\": 5.31, \"min_kv_budget_gib\": 0.54}, \"neuron_profiler\": {\"activities\": [\"device_profile\", \"system_profile\"], \"neuron_cores\": [0], \"output_dir\": \"{measurements}/profiles/dcp4\", \"sys_trace_max_events_per_nc\": null}}"
+        "--additional-config", "{\"neuron_config\": {\"expert_replica_slots\": 2, \"decode_context_length_buckets\": [2048, 8192], \"num_seqs_buckets\": [1, 4, 16, 32], \"prefill_reserve_gib\": 5.93, \"min_kv_budget_gib\": 0.54}, \"neuron_profiler\": {\"activities\": [\"device_profile\", \"system_profile\"], \"neuron_cores\": [0], \"output_dir\": \"{measurements}/profiles/dcp4\", \"sys_trace_max_events_per_nc\": null}}"
       ]
     },
     "dcp16": {
@@ -48,7 +48,7 @@
         "--no-enable-prefix-caching",
         "--served-model-name", "us.moonshotai.kimi-k3", "{checkpoint}",
         "--profiler-config", "{\"profiler\": \"cuda\", \"delay_iterations\": 0, \"max_iterations\": 5}",
-        "--additional-config", "{\"neuron_config\": {\"expert_replica_slots\": 2, \"decode_context_length_buckets\": [8192, 45056], \"num_seqs_buckets\": [1, 4, 16, 32], \"prefill_reserve_gib\": 5.43, \"min_kv_budget_gib\": 0.54}, \"neuron_profiler\": {\"activities\": [\"device_profile\", \"system_profile\"], \"neuron_cores\": [0], \"output_dir\": \"{measurements}/profiles/dcp16\", \"sys_trace_max_events_per_nc\": null}}"
+        "--additional-config", "{\"neuron_config\": {\"expert_replica_slots\": 2, \"decode_context_length_buckets\": [8192, 45056], \"num_seqs_buckets\": [1, 4, 16, 32], \"prefill_reserve_gib\": 6.03, \"min_kv_budget_gib\": 0.54}, \"neuron_profiler\": {\"activities\": [\"device_profile\", \"system_profile\"], \"neuron_cores\": [0], \"output_dir\": \"{measurements}/profiles/dcp16\", \"sys_trace_max_events_per_nc\": null}}"
       ]
     },
     "dcp32": {
